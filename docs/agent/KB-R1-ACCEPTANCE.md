@@ -26,12 +26,14 @@
   - 调用者 shell 里以 `A24_`、`AGENT24` 开头的变量全部清掉。`AGENT24D_BIN` 也在其中，否则 CLI 拉起的会是别处的 daemon，反面对照就失真了。
   - Z1 检查 `~/.agent24` 在运行期间没有变化。
   - `--work` 不能在 `~/.agent24` 下面，并且要么不存在、要么为空。
+  - `--work` 不能在另一次运行的工作目录里面。脚本在工作目录里放一个 `.kb-r1-accept` 标记，任何上级目录里有这个标记就拒绝运行，否则外层运行的 reap 会把里层运行的 daemon 当成自己的杀掉。并发运行时，各自的 `--work` 也不要互相嵌套。
   - `--work` 解析后的路径必须是可打印 ASCII，否则在创建任何东西之前就拒绝运行。原因是 reap 按 lsof 打出的工作目录认进程，而 lsof 会把其他字节转义（C locale 下连非 ASCII 字符也转义），这样的路径永远匹配不上，残留的 daemon 就会被放过。
 - **不留进程**：
   - 宿主 daemon 靠关闭 stdin 来停：父进程租约结束，daemon 自己退出。legacy 方式拉起的发 SIGTERM。15 秒内没有退出就杀掉。
   - CLI 起的 daemon 用 `agent24 daemon stop` 停。
   - 兜底：`agent24 daemon start` 等不到 ready 就放弃时，daemon 不会随 CLI 退出，而且可能还没写出状态文件。所以运行开始时先记下已有的 `<--old 或 --new>/agent24d serve` 进程；每条用例结束后，以及脚本退出时，查之后新出现的这类进程，只杀工作目录落在 `--work` 下的。脚本让每个 daemon 和每次 CLI 调用都在各自的数据目录里启动，daemon 和 CLI 都不切换目录，所以这次运行起的 daemon 都在 `--work` 下面。别的运行或用户自己从同一个目录起的 daemon 不碰，读不到工作目录的也不碰，只打一行提示。工作目录在 Linux 上读 `/proc/<pid>/cwd`，在 macOS 上用 `lsof -d cwd`（macOS 的 `ps -E` 读不到别的进程的环境变量）。不按状态文件里的 pid 杀，免得误杀。
   - 每个 daemon 都在 `try` 里构造，构造中途出错也会被清理。
+- **泄漏扫描**：W1c 和 W2e 在 daemon 停下之后才扫，停机时写出的内容也在范围内。只读普通文件（socket、FIFO 里没有可泄漏的字节）；读不了的普通文件不算「没找到」，检查直接判 FAIL。
 - **依赖**：python3，只用标准库，以 `-I` 运行；macOS 上还要 `lsof`（系统自带）。
 
 ## 用例
@@ -40,12 +42,12 @@
 |---|---|---|---|
 | W1a | 桌面托管 daemon | 按桌面的参数和管道拉起发布 head 的 `agent24d` | ready 行 `auth_mode` 为 `capabilities`，带 `port` 和 `product_host_token` |
 | W1b | 同上 | 带、不带宿主凭据各调一次 `GET /api/v1/models` | 带凭据 200，不带 401 |
-| W1c | 同上 | 在数据目录和 daemon 日志里找宿主凭据 | 找不到。凭据只走 ready 管道 |
+| W1c | 同上 | daemon 停下之后，在数据目录和 daemon 日志里找宿主凭据 | 找不到，凭据只走 ready 管道；不能有读不了的文件 |
 | W2a | run 指名 binding | 宿主 `POST /api/v1/runs`，不带 `knowledge_binding_id` | 202，`input` 里有 `knowledge_binding_id` 这个键（OpenAPI 定为必填），值为 null |
 | W2b | 同上 | 指名一个没激活的 binding | 409 `knowledge_binding_inactive` |
 | W2c | 宿主接口 | `PUT …/bindings/kb-accept?seq=1` 激活，再建 run 指名它，然后 `GET /api/v1/runs/{id}` | 激活 204，建 run 202，读回的 `knowledge_binding_id` 为 `kb-accept` |
 | W2d | 同上 | 再发一次 `seq=1` | 409 `stale_sequence`：先发出、后到达的变更不能覆盖更新的 |
-| W2e | 同上 | `PUT …/credential?seq=2` 推送一个随机凭据，再建 run | 推送 204，建 run 202；所有应答、数据目录和 daemon 日志里都没有这个凭据 |
+| W2e | 同上 | `PUT …/credential?seq=2` 推送一个随机凭据，再建 run | 推送 204，建 run 202。从推送起的所有应答（包括 W2f 的两次）里都没有这个凭据；daemon 停下之后，数据目录和日志里也没有；不能有读不了的文件 |
 | W2f | 同上 | `DELETE …/bindings/kb-accept?seq=3` 停用，再指名 | 停用 204，指名 409 `knowledge_binding_inactive` |
 | W2r | 反面对照 | 用 main 的 `agent24d` 做 W2c 的激活，并指名一个没激活的 binding 建 run | 激活不是 204（main 没有这个接口），建 run 202（main 不查）。说明 W2b–W2f 的检查是这次加的 |
 | W3a | 非宿主调用方 | 发布 head 的 `agent24 daemon start` 起 daemon，用它的凭据指名 binding 建 run | 403 `host_authority_required` |
@@ -58,7 +60,7 @@
 | W4r | 反面对照 | 按 main 上桌面的方式拉起 main 的 `agent24d`，再跑 main 的 `daemon status`、`models`、`daemon stop`。跑 `models` 时把 `AGENT24D_BIN` 指向一个不存在的文件：附着失败时 CLI 会另起一个临时 daemon，这样能堵住这条退路 | 都退出 0，`status` 说出这个 pid，`stop` 之后 daemon 退出。说明 W4 的变化是这次带来的 |
 | W5a | 保留路径段 `host` | 用 W3 的 daemon，`POST /api/v1/attached` 注册名为 `host` 的 attached 模块；再注册一个叫 `kbacceptmod` 的作对照 | `host` 得 400 `invalid_manifest`，消息里有 `reserved`；`kbacceptmod` 得 201 |
 | W5r | 反面对照 | 用 W3r 的 main daemon 注册 `host` | 201（main 不保留这个名字） |
-| Z1 | 不碰用户数据 | 对比运行前后的 `~/.agent24` | 没有变化 |
+| Z1 | 不碰用户数据 | 对比运行前后的 `~/.agent24`，包括它本身是否存在、它的 mtime | 没有变化：原来不存在的，不能被建出来，空目录也不行 |
 
 **整体反面对照**：把 `--new` 也指向 main 的二进制再跑一遍，下面这些应当 FAIL：
 
