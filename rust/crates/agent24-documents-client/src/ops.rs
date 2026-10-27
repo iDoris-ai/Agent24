@@ -64,12 +64,13 @@ fn key_ok(k: &str) -> bool {
 }
 
 /// What a routed operation answers with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Answer {
     /// A JSON resource or the error envelope ([`to_response`]).
     Json,
-    /// A rendered page: PNG bytes and their scale ([`to_page`]).
-    Png,
+    /// A rendered page: PNG bytes and their scale ([`to_page`]), at most
+    /// the one asked for (1 when none was).
+    Png { asked: f64 },
 }
 
 /// The request's optional keys, each `None` when present but malformed.
@@ -215,10 +216,12 @@ fn routed(req: &Value) -> Option<(Request, Answer)> {
             let scale = |v: &Value| {
                 v.as_f64()
                     .filter(|s| (0.25..=4.0).contains(s))
-                    .map(|_| v.to_string())
+                    .map(|s| (s, v.to_string()))
             };
-            if let Some(s) = k.optional("scale", scale)? {
-                query.push(format!("scale={s}"));
+            let mut asked = 1.0;
+            if let Some((s, written)) = k.optional("scale", scale)? {
+                asked = s;
+                query.push(format!("scale={written}"));
             }
             if let Some(r) = k.optional("region", |v| v.as_str().filter(|r| region_ok(r)))? {
                 // `+` in a query is a space: an exponent's sign is sent encoded.
@@ -226,7 +229,7 @@ fn routed(req: &Value) -> Option<(Request, Answer)> {
             }
             let path = format!("{BASE}/documents/{document}/revisions/{revision}/pages/{page}");
             let (method, path, body, headers, _) = get(with_query(path, &query));
-            (method, path, body, headers, Answer::Png)
+            (method, path, body, headers, Answer::Png { asked })
         }
         op @ ("job" | "cancelJob" | "retryJob") => {
             let job = k.id("jobId", "job_")?;
@@ -261,9 +264,10 @@ fn post(path: String) -> (Method, String, Option<Value>, Vec<(String, String)>, 
 
 /// A rendered page as one JSON resource: `{media_type, bytes, scale, png}`,
 /// the PNG in standard base64 and `scale` the one the OS used
-/// (`Documents-Render-Scale`, 0.25–4). A 2xx that is not a PNG with its
-/// scale is `invalid_response`; an error is read as [`to_response`] reads it.
-fn to_page(reply: Reply) -> Response {
+/// (`Documents-Render-Scale`, 0.25 up to the `asked` scale). A 2xx that is
+/// not a PNG with such a scale is `invalid_response`; an error is read as
+/// [`to_response`] reads it.
+fn to_page(reply: Reply, asked: f64) -> Response {
     let Reply::Http {
         status,
         headers,
@@ -290,10 +294,12 @@ fn to_page(reply: Reply) -> Response {
             t.trim_matches([' ', '\t'])
                 .eq_ignore_ascii_case("image/png")
         })
-        && body.starts_with(b"\x89PNG\r\n\x1a\n");
+        // The signature, then the header chunk every PNG starts with (its
+        // 13-byte length and type): not just eight bytes that look like one.
+        && body.starts_with(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR");
     let scale = header("documents-render-scale")
         .and_then(|s| s.trim_matches([' ', '\t']).parse::<f64>().ok())
-        .filter(|s| (0.25..=4.0).contains(s));
+        .filter(|s| (0.25..=asked).contains(s));
     match (*status, png, scale) {
         (200, true, Some(scale)) => Response::Ok {
             status: 200,
@@ -321,7 +327,7 @@ pub fn refused() -> Response {
 pub async fn call<T: Transport + Sync>(req: &Value, transport: &T) -> Response {
     match routed(req) {
         Some((request, Answer::Json)) => to_response(transport.send(request).await),
-        Some((request, Answer::Png)) => to_page(transport.send(request).await),
+        Some((request, Answer::Png { asked })) => to_page(transport.send(request).await, asked),
         None => refused(),
     }
 }

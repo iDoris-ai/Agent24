@@ -483,6 +483,24 @@ async fn a_rendered_page_comes_back_as_json_with_its_png_and_scale() {
             ],
             PNG,
         ),
+        // No scale asked is 1: the OS may lower it, never raise it.
+        (
+            200,
+            vec![
+                ("content-type", "image/png"),
+                ("documents-render-scale", "2"),
+            ],
+            PNG,
+        ),
+        // The signature alone is not a PNG: its header chunk comes next.
+        (
+            200,
+            vec![
+                ("content-type", "image/png"),
+                ("documents-render-scale", "1"),
+            ],
+            &PNG[..8],
+        ),
         (
             200,
             vec![
@@ -515,6 +533,24 @@ async fn a_rendered_page_comes_back_as_json_with_its_png_and_scale() {
         br#"{"error":{"code":"not_found","message":"no such page"}}"#,
     ));
     assert_eq!(call(&render, &missing).await.code(), Some("not_found"));
+    // A scale asked for bounds the one the OS answers with.
+    let refused = |asked: f64, used: &str| {
+        let req = json!({"op": "renderPage", "documentId": DOC, "revision": 1, "page": 1, "scale": asked});
+        let reply = page_reply(
+            200,
+            &[
+                ("content-type", "image/png"),
+                ("documents-render-scale", used),
+            ],
+            PNG,
+        );
+        async move { call(&req, &Answers(reply)).await.code() == Some("invalid_response") }
+    };
+    assert!(!refused(0.25, "0.25").await);
+    assert!(!refused(4.0, "4").await);
+    assert!(!refused(2.0, "1.5").await);
+    assert!(refused(0.25, "0.5").await);
+    assert!(refused(2.0, "2.5").await);
     // A JSON operation never takes a PNG for its resource.
     let get = call(&json!({"op": "get", "documentId": DOC}), &ok).await;
     assert_eq!(get.code(), Some("invalid_response"));
