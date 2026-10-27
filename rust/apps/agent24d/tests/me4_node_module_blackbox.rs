@@ -83,7 +83,7 @@ fn get(port: u16, token: &str, path: &str) -> Option<(u16, String)> {
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     write!(
         s,
-        "GET {path} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {token}\r\nconnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nauthorization: Bearer {token}\r\nconnection: close\r\n\r\n"
     )
     .ok()?;
     let mut raw = String::new();

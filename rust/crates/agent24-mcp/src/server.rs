@@ -47,6 +47,19 @@ use serde_json::{Map, Value, json};
 const RUN_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 /// Poll cadence while waiting for a run to finish.
 const RUN_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Env override (whole seconds) for the total `agent24_run` time limit. Read
+/// by the `agent24 mcp` command (the CLI), which hands the result to
+/// [`Agent24Server::with_run_timeout`] — this crate itself reads no env.
+pub const RUN_TIMEOUT_ENV: &str = "AGENT24_MCP_RUN_TIMEOUT_SECS";
+
+/// Parse the override: a positive integer number of seconds; anything else
+/// (absent, zero, negative, junk) falls back to the 600s default.
+#[must_use]
+pub fn parse_run_timeout(raw: Option<&str>) -> Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map_or(RUN_WAIT_TIMEOUT, Duration::from_secs)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum McpServerError {
@@ -60,6 +73,7 @@ pub struct Agent24Server {
     base: String,
     token: String,
     http: reqwest::Client,
+    run_timeout: Duration,
 }
 
 impl Agent24Server {
@@ -67,8 +81,16 @@ impl Agent24Server {
         Self {
             base,
             token,
-            http: reqwest::Client::new(),
+            http: agent24_protocol::client::loopback_client(Duration::from_secs(2)),
+            run_timeout: RUN_WAIT_TIMEOUT,
         }
+    }
+
+    /// Total time limit for one `agent24_run` call (default 600s).
+    #[must_use]
+    pub fn with_run_timeout(mut self, limit: Duration) -> Self {
+        self.run_timeout = limit;
+        self
     }
 
     /// Serve this proxy over stdio until the client disconnects.
@@ -146,6 +168,23 @@ impl Agent24Server {
         } else {
             Err(format!("daemon returned {status}: {body}"))
         }
+    }
+
+    /// [`Self::run`] under a hard total time limit: a daemon that accepts the
+    /// connection but never answers must not hang the MCP caller forever.
+    async fn run_bounded(
+        &self,
+        args: &Map<String, Value>,
+        limit: Duration,
+    ) -> Result<String, String> {
+        tokio::time::timeout(limit, self.run(args))
+            .await
+            .unwrap_or_else(|_| {
+                Err(format!(
+                    "agent24_run did not complete within {limit:?} (the run may still be \
+                     going on the daemon; check with agent24_list_runs)"
+                ))
+            })
     }
 
     /// Start a run and wait (bounded) for it to finish, returning its output.
@@ -228,7 +267,7 @@ impl Agent24Server {
 impl Agent24Server {
     async fn dispatch(&self, tool: &str, args: &Map<String, Value>) -> Result<String, String> {
         match tool {
-            "agent24_run" => self.run(args).await,
+            "agent24_run" => self.run_bounded(args, self.run_timeout).await,
             "agent24_list_tools" => self.get("/api/v1/tools").await,
             "agent24_list_runs" => self.get("/api/v1/peer/runs").await,
             other => Err(format!("unknown tool: {other}")),
@@ -291,6 +330,41 @@ mod tests {
         // The dangerous builtins must NOT be exposed as MCP tools — the only way
         // to run them is inside a gated `agent24_run`.
         assert!(!names.iter().any(|n| n == "shell_exec" || n == "fs_write"));
+    }
+
+    #[test]
+    fn run_timeout_defaults_to_600s_and_is_overridable() {
+        assert_eq!(parse_run_timeout(None), Duration::from_secs(600));
+        assert_eq!(parse_run_timeout(Some("30")), Duration::from_secs(30));
+        assert_eq!(parse_run_timeout(Some(" 7 ")), Duration::from_secs(7));
+        for bad in ["0", "-1", "abc", ""] {
+            assert_eq!(
+                parse_run_timeout(Some(bad)),
+                Duration::from_secs(600),
+                "{bad}"
+            );
+        }
+    }
+
+    /// C-04: a daemon that accepts the connection and never answers must not
+    /// hang `agent24_run` — the total limit fires.
+    #[tokio::test]
+    async fn run_is_bounded_when_the_daemon_never_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock); // accept, then say nothing
+            }
+        });
+        let server = Agent24Server::new(format!("http://127.0.0.1:{port}"), "t".to_owned());
+        let args = json!({ "prompt": "hi" }).as_object().cloned().unwrap();
+        let err = server
+            .run_bounded(&args, Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert!(err.contains("did not complete within"), "{err}");
     }
 
     #[test]
