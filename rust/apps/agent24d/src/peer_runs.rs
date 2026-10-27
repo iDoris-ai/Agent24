@@ -710,8 +710,9 @@ mod tests {
     /// on an approved fs_write whose turn also holds an http_fetch under the
     /// same id must not settle both on resume: the fetch would run with no row
     /// of its own, its refusal (which names the address a lookup resolved)
-    /// untagged, and the run relayed. The same run with the fs_write alone is
-    /// relayed, so the fixture would show a leak.
+    /// untagged, and the run relayed. Such a turn is not resumed at all (N1).
+    /// The same run with the fs_write alone is relayed, so the fixture would
+    /// show a leak.
     #[tokio::test]
     async fn a_resumed_turn_that_repeats_a_call_id_is_still_withheld() {
         for repeated in [false, true] {
@@ -854,11 +855,16 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
             let settled = settled.expect("the resumed run never settled");
-            assert!(note.exists(), "the approved write ran: {settled:?}");
             let (view, body) = peer_run(&state, "run_dup").await;
             if repeated {
+                // The turn cannot say which call was approved, so the run
+                // does not resume (#1349 N1): nothing runs, and it stays
+                // withheld.
+                assert_eq!(settled.status, RunStatus::Cancelled, "{body}");
+                assert!(!note.exists(), "nothing ran");
                 assert_withheld(&view, &body);
             } else {
+                assert!(note.exists(), "the approved write ran: {settled:?}");
                 assert_eq!(settled.status, RunStatus::Completed, "{body}");
                 assert!(!view.withheld, "{body}");
             }

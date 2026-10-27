@@ -80,6 +80,11 @@ fn requested_call_ids(msg: &RunMessage) -> Vec<String> {
 ///    (a `Running` crash left no pending human; the orphan-run sweep lands it).
 /// 2. the thread's LAST tool-calling assistant turn has at least one call with
 ///    no answering `tool` message after it.
+/// 3. every call of that turn has an id of its own. Answers and the approval
+///    are tied to a call only by its id, so a turn that repeats one (or leaves
+///    one out) cannot say which call was approved: a call answered under the
+///    shared id would hide the parked one, and the approval could settle a
+///    different tool given the same arguments (K1-6b.5f-3, #1349 N1).
 ///
 /// Anything else is `NotResumable` with a reason (the caller aborts + logs).
 pub fn plan_resume(status: RunStatus, thread: &[RunMessage]) -> ResumePlan {
@@ -105,6 +110,17 @@ pub fn plan_resume(status: RunStatus, thread: &[RunMessage]) -> ResumePlan {
         );
     };
     let requested = requested_call_ids(assistant);
+    let calls = assistant.tool_calls.as_array().map_or(0, Vec::len);
+    let distinct: std::collections::HashSet<&str> = requested
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !id.is_empty())
+        .collect();
+    if distinct.len() != calls {
+        return ResumePlan::not_resumable(
+            "the parked turn does not give each tool call an id of its own",
+        );
+    }
 
     // Which of that turn's calls already have an answering `tool` message AFTER
     // it? A turn can fan out several calls and be answered partially before a
@@ -318,6 +334,58 @@ mod tests {
             tool_calls: json!([]),
             tool_call_id: Some(call_id.to_owned()),
             created_at: "t".to_owned(),
+        }
+    }
+
+    /// #1349 N1: `fs_read` answered under `call_x`, `fs_write` parked under
+    /// the same id, `shell_exec` after it. Answers are matched by id, so the
+    /// parked write would look answered and the approval would settle the
+    /// shell call instead. A turn that repeats an id, leaves one empty or
+    /// leaves one out is not resumable; the same turn with distinct ids is.
+    #[test]
+    fn a_turn_without_an_id_of_its_own_for_each_call_is_not_resumable() {
+        let turn = |calls: serde_json::Value| RunMessage {
+            tool_calls: calls,
+            ..assistant_calls(1, &[])
+        };
+        let call = |id: &str, name: &str| json!({ "id": id, "name": name, "arguments": "{}" });
+        let thread = |calls| [user(0, "go"), turn(calls), tool_answer(2, "call_x")];
+        let distinct = thread(json!([
+            call("call_x", "fs_read"),
+            call("call_w", "fs_write"),
+            call("call_y", "shell_exec"),
+        ]));
+        assert_eq!(
+            plan_resume(RunStatus::AwaitingApproval, &distinct),
+            ResumePlan::AwaitingToolApproval {
+                assistant_seq: 1,
+                tool_call_id: "call_w".to_owned(),
+            }
+        );
+        for calls in [
+            json!([
+                call("call_x", "fs_read"),
+                call("call_x", "fs_write"),
+                call("call_y", "shell_exec"),
+            ]),
+            json!([
+                call("call_x", "fs_read"),
+                call("", "fs_write"),
+                call("", "shell_exec")
+            ]),
+            json!([
+                call("call_x", "fs_read"),
+                json!({ "name": "fs_write", "arguments": "{}" }),
+                call("call_y", "shell_exec"),
+            ]),
+        ] {
+            assert!(
+                matches!(
+                    plan_resume(RunStatus::AwaitingApproval, &thread(calls.clone())),
+                    ResumePlan::NotResumable { .. }
+                ),
+                "{calls}"
+            );
         }
     }
 
