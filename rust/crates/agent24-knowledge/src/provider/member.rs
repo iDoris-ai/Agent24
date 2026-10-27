@@ -155,10 +155,26 @@ impl<I: Ids> Member<I> {
         }
     }
 
-    /// `attempt`'s binding was not written: `dependency`, by backoff (S2.5).
+    /// `attempt`'s binding was not written, as
+    /// [`super::placeholder::Placeholder::creation_failed`].
     pub fn creation_failed(&mut self, attempt: Attempt) {
         if let Slot::Placeholder(placeholder) = self.profile.slot_mut() {
             placeholder.creation_failed(attempt);
+        }
+    }
+
+    /// As [`super::placeholder::Placeholder::take_leaving`].
+    pub fn take_leaving(&mut self) -> Option<PlaceholderFailure> {
+        match self.profile.slot_mut() {
+            Slot::Placeholder(placeholder) => placeholder.take_leaving(),
+            Slot::Bound(_) => None,
+        }
+    }
+
+    /// As [`super::placeholder::Placeholder::left`].
+    pub fn left(&mut self, failure: PlaceholderFailure) {
+        if let Slot::Placeholder(placeholder) = self.profile.slot_mut() {
+            placeholder.left(failure);
         }
     }
 

@@ -40,6 +40,10 @@ pub struct Placeholder {
     /// The attempt whose binding is being persisted (S2.5, S3.5).
     creating: Option<Attempt>,
     next: u64,
+    /// A `dependency` waits to take the place of the written reason.
+    leaving: bool,
+    /// The written reason whose clearing is being written for it.
+    clearing: Option<PlaceholderFailure>,
 }
 
 impl Placeholder {
@@ -68,11 +72,43 @@ impl Placeholder {
 
     /// The identity it was trying changed, or a logout: the attempt in
     /// flight, and any binding it was creating, no longer count. With
-    /// `retry`, one that was dropped is tried again by backoff (`dependency`,
-    /// S3.5, S2.5).
+    /// `retry`, one that was dropped is tried again by backoff, as `depend`
+    /// says (S3.5, S2.5).
     pub fn cancel(&mut self, retry: bool) {
         let dropped = self.attempt.take().is_some() | self.creating.take().is_some();
         if retry && dropped {
+            self.depend();
+        }
+    }
+
+    /// `dependency` (S2.5). A reason that waits for a manual retry stays
+    /// until its clearing is written, a loosening (S1.10): `dependency` itself
+    /// is never written. See [`Placeholder::take_leaving`].
+    fn depend(&mut self) {
+        match self.failure {
+            None | Some(PlaceholderFailure::Dependency) => {
+                self.failure = Some(PlaceholderFailure::Dependency);
+            }
+            Some(_) => self.leaving = true,
+        }
+    }
+
+    /// The written reason a `dependency` waits to take the place of, once;
+    /// the caller writes its clearing and reports it with
+    /// [`Placeholder::left`].
+    pub fn take_leaving(&mut self) -> Option<PlaceholderFailure> {
+        if !std::mem::take(&mut self.leaving) {
+            return None;
+        }
+        self.clearing = self.failure;
+        self.clearing
+    }
+
+    /// The clearing of `failure` is confirmed persisted: `dependency` takes
+    /// its place, unless a reason written since did.
+    pub fn left(&mut self, failure: PlaceholderFailure) {
+        if self.clearing == Some(failure) && self.failure == Some(failure) {
+            self.clearing = None;
             self.failure = Some(PlaceholderFailure::Dependency);
         }
     }
@@ -111,22 +147,27 @@ impl Placeholder {
                 self.creating = Some(attempt);
                 return Settled::Create;
             }
-            Attempted::Unreachable => PlaceholderFailure::Dependency,
+            Attempted::Unreachable => {
+                self.depend();
+                return Settled::Failed(PlaceholderFailure::Dependency);
+            }
             Attempted::Rejected => PlaceholderFailure::CredentialRejected,
             Attempted::Unidentified => PlaceholderFailure::InstanceUnidentified,
         };
         self.failure = Some(failure);
+        self.leaving = false;
+        self.clearing = None;
         Settled::Failed(failure)
     }
 
     /// The new binding of `attempt`, or the retirement it waits for (S3.5),
-    /// could not be persisted: the binding is dropped and `dependency` is
-    /// recorded. Ignored once a later attempt started or the identity
-    /// changed: a late failure never overwrites a newer reason.
+    /// could not be persisted: the binding is dropped and `dependency`
+    /// recorded as `depend` says. Ignored once a later attempt started or the
+    /// identity changed: a late failure never overwrites a newer reason.
     pub fn creation_failed(&mut self, attempt: Attempt) {
         if self.creating == Some(attempt) {
             self.creating = None;
-            self.failure = Some(PlaceholderFailure::Dependency);
+            self.depend();
         }
     }
 

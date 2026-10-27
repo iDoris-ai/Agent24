@@ -21,6 +21,7 @@ use super::member::{Left, Member};
 use super::profile::Profile;
 use super::record::{Change, Ids, Of};
 use super::replay::Record;
+use super::state::PlaceholderFailure;
 
 mod create;
 mod identity;
@@ -69,6 +70,12 @@ enum Then<I: Ids> {
     },
     /// A new binding, in [`Host::creations`].
     Create { ticket: Loosening },
+    /// The clearing of a written reason, for a `dependency` to take its place.
+    Leave {
+        ticket: Loosening,
+        id: I::Profile,
+        failure: PlaceholderFailure,
+    },
 }
 
 #[derive(Debug)]
@@ -274,7 +281,7 @@ impl<I: Ids> Host<I> {
         let mut out = Output::default();
         match self.journal.written(attempt, outcome) {
             Report::Ignored | Report::Failed(Then::Loose { .. }) => return out,
-            Report::Failed(Then::Create { .. }) => return out,
+            Report::Failed(Then::Create { .. } | Then::Leave { .. }) => return out,
             Report::Failed(Then::Tight { ticket, .. }) => {
                 let ticket = *ticket;
                 self.ledger.record_failed(ticket);
@@ -300,6 +307,16 @@ impl<I: Ids> Host<I> {
                 }
             }
             Report::Durable(Then::Create { ticket }) => self.created(ticket, &mut out),
+            Report::Durable(Then::Leave {
+                ticket,
+                id,
+                failure,
+            }) => {
+                let applied = self.ledger.loosening_durable(ticket) == Confirmed::Applied;
+                if let Some(m) = self.member(&id).filter(|_| applied) {
+                    m.left(failure);
+                }
+            }
         }
         // A tightening on the way may have deleted it: no rebuild yet.
         out.seal = self.ledger.reseal().map(SealWrite::Rebuild).or(out.seal);

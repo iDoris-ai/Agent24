@@ -416,3 +416,36 @@ fn another_profiles_creation_does_not_hold_the_reason_back() {
     assert_eq!(replayed.profiles.get("b").unwrap().failure, Some(rejected));
     assert_eq!(failure(&host, "b"), Some(rejected));
 }
+
+/// S1.10, S2.5: a manual retry that comes back unreachable clears the
+/// written reason first, then retries by backoff; a reason written meanwhile
+/// stands, in memory as a restart reads it.
+#[test]
+fn an_unreachable_retry_clears_the_written_reason_first() {
+    let rejected = PlaceholderFailure::CredentialRejected;
+    let mut log = Vec::new();
+    let mut host = host_after(Attempted::Rejected);
+    step(&mut host, &mut log);
+    let attempt = host.attempt(&"b").unwrap();
+    host.attempt_failed("b", attempt, Attempted::Unreachable);
+    assert_eq!(failure(&host, "b"), Some(rejected));
+    let attempt = host.attempt(&"b").unwrap();
+    host.attempt_failed("b", attempt, Attempted::Rejected);
+    let cleared = C::PlaceholderCleared {
+        profile: "b",
+        failure: rejected,
+    };
+    assert_eq!(step(&mut host, &mut log), vec![cleared]);
+    step(&mut host, &mut log);
+    assert_eq!(failure(&host, "b"), Some(rejected));
+    assert_eq!(
+        replay(10, log.clone()).unwrap().profiles["b"].failure,
+        Some(rejected)
+    );
+
+    let attempt = host.attempt(&"b").unwrap();
+    host.attempt_failed("b", attempt, Attempted::Unreachable);
+    step(&mut host, &mut log);
+    assert_eq!(failure(&host, "b"), Some(PlaceholderFailure::Dependency));
+    assert_eq!(replay(10, log).unwrap().profiles["b"].failure, None);
+}

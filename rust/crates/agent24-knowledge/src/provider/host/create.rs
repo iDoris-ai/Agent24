@@ -77,7 +77,8 @@ impl<I: Ids> Host<I> {
             let tightening = self.ledger.tighten(Scope::profile(id.clone()));
             self.tightened(tightening, Left::new(change), &mut out);
         }
-        self.write_creation(id, attempt, created);
+        self.write_creation(id.clone(), attempt, created);
+        self.leave_reason(&id);
         out
     }
 
@@ -143,10 +144,33 @@ impl<I: Ids> Host<I> {
                 profile: id.clone(),
                 failure,
             };
-            let tightening = self.ledger.tighten(Scope::profile(id));
+            let tightening = self.ledger.tighten(Scope::profile(id.clone()));
             self.tightened(tightening, Left::new(change), &mut out);
         }
+        self.leave_reason(&id);
         out
+    }
+
+    /// A `dependency` waiting to take the place of a written reason: its
+    /// clearing is written first, a loosening (S1.10, I1); refused, the
+    /// reason stays until the next manual retry.
+    pub(super) fn leave_reason(&mut self, id: &I::Profile) {
+        let Some(failure) = self.member(id).and_then(|m| m.take_leaving()) else {
+            return;
+        };
+        let scope = Scope::profile(id.clone());
+        let Ok(ticket) = self.ledger.loosen(scope, None, self.off) else {
+            return;
+        };
+        let profile = id.clone();
+        let change = Change::PlaceholderCleared { profile, failure };
+        let id = id.clone();
+        let then = Then::Leave {
+            ticket,
+            id,
+            failure,
+        };
+        self.journal.push(vec![change], then);
     }
 
     /// A new binding's write is confirmed: it binds and connects, or, its

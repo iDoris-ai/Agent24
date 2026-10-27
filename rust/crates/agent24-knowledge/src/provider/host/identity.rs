@@ -42,6 +42,7 @@ impl<I: Ids> Host<I> {
         };
         let awaited_before = m.profile().confirmation();
         let Some((mut left, create)) = m.change_identity(change) else {
+            self.leave_reason(&id);
             return out;
         };
         if awaited_before.is_none()
@@ -66,6 +67,7 @@ impl<I: Ids> Host<I> {
                 if let Some(m) = self.member(&id) {
                     m.creation_failed(attempt);
                 }
+                self.leave_reason(&id);
             }
             (None, _) => {}
         }
@@ -86,6 +88,7 @@ impl<I: Ids> Host<I> {
         let unsaved = m.profile().confirmation() == Some(Confirmation::UnsavedSettings);
         if written == Written::Failed || unsaved || !m.creates(d.attempt) {
             m.creation_failed(d.attempt);
+            self.leave_reason(&d.id);
             return;
         }
         self.write_creation(d.id, d.attempt, d.created);
