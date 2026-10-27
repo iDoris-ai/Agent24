@@ -36,8 +36,9 @@ kernel（K1 第二次发布）、documenting、weknora（Knowledge）、memory-p
 | weknora | knowledge（新库 `knowledge.db`，目录 `rust/apps/agent24d/knowledge_migrations/`） | `0001_log`（Provider 日志与 seal，#1336）；新库，不影响既有库 |
 | memory-p1（#1341） | memory | `0019_retract_quota_exempt`、`0020_write_rejections` |
 | memory-p1（#1341） | store | `0027_run_message_origins`、`0028_run_message_origin_kinds`、`0029_run_message_origin_host_system` |
+| main（P-13，#1381） | store | `0030_schedules_tick_index`（日程 tick 的两个部分索引，只建索引不改数据） |
 
-合入后迁移目录连续：store `0001–0029`，memory `0001–0020`，documents `0001–0008`。
+合入后迁移目录连续：store `0001–0030`，memory `0001–0020`，documents `0001–0008`。
 
 **升级注意：开发机需要重置本地库的情形**
 - 跑过 **memory-p1 改号（#1298）之前** 的 `ab/memory-p1` 开发版的机器，库里记着旧编号

@@ -33,7 +33,7 @@ Linux、Intel mac 不在本次预发布范围。dmg 文件名以实际构建输�
       ```
       必须无输出。四条线里新增的 crate（`agent24-knowledge`、`agent24-documents-client` 等）按各自分支的
       写法会带着 `0.5.1` 进来，要在吸收 main 之后补升到 `0.6.0`，再 `cd rust && cargo update -w`。
-- [ ] 迁移目录连续：store `0001–0029`、memory `0001–0020`、documents `0001–0008`，且
+- [ ] 迁移目录连续：store `0001–0030`、memory `0001–0020`、documents `0001–0008`，且
       `agent24d/knowledge_migrations/0001_log.sql` 存在。
       ```bash
       ls rust/crates/agent24-store/migrations | tail -3   # 0027–0029

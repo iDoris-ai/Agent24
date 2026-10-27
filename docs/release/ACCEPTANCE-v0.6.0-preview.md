@@ -538,7 +538,7 @@ ic() { curl -s -m 20 -o $WORK/ir.json -w '%{http_code}' -H "Authorization: Beare
 
 | 库 | preview 的最高号 | 新版应有 | 新增 |
 |---|---|---|---|
-| store（`agent24.db`） | 0017 | 0001–0029，连续 | 0018（main）、0019–0026（kernel）、0027–0029（memory-p1） |
+| store（`agent24.db`） | 0017 | 0001–0030，连续 | 0018（main）、0019–0026（kernel）、0027–0029（memory-p1）、0030（P-13 #1381） |
 | memory（`memory.db`） | 0017 | 0001–0020，连续 | 0018（kernel `assertion_source_ref`）、0019–0020（memory-p1） |
 
 **X-01 升级后两个库按顺序迁移成功**
