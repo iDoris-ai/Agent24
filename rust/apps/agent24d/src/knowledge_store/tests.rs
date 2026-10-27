@@ -258,7 +258,7 @@ async fn text_that_is_not_utf8_is_damaged() {
     exec(
         &db,
         r#"INSERT INTO records VALUES (1, 'changes',
-           '{"version":1,"changes":[{"vanish":"' || CAST(x'ff' AS TEXT) || '"}]}')"#,
+           '{"version":1,"changes":[{"enable":"' || CAST(x'ff' AS TEXT) || '"}]}')"#,
     )
     .await;
     assert_eq!(log(&db).await, Some(Err(Damaged)));
