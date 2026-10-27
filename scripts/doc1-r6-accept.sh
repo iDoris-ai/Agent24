@@ -364,8 +364,8 @@ if [ -n "$NEXT" ]; then
   # lines OUT: how many lines a --json run printed (its result is the only
   # one), a last line with no newline counted too.
   lines() { awk 'END { print NR }' "$1"; }
-  # dims PNG: its pixel size as WxH ("" for no file, "<nil>x<nil>" for one
-  # that is no image): only ever compared with a size.
+  # dims PNG: its pixel size as WxH; for anything that is not an image, what
+  # sips makes of it ("" or "<nil>x<nil>"): only ever compared with a size.
   dims() { sips -g pixelWidth -g pixelHeight "$1" 2>/dev/null | awk '/pixel/ { print $2 }' | paste -sd x -; }
   png() { [ "$(head -c 8 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = 89504e470d0a1a0a ] && echo y; }
   full=$(last "$WORK/o6.out" '[.data.blocks[:4][].block_id] | join(",")')
@@ -447,7 +447,8 @@ if [ -n "$NEXT" ]; then
 
   printf 'fields: issued_by\n' > "$WORK/ask.txt"
   a24 documents extract "$DOC1" 1 --schema "$WORK/ask.txt" --json > "$WORK/r14.out" 2>/dev/null; rc=$?
-  # That it is not sent is the CLI's unit test's to show
+  # That it is not sent is the CLI's unit test's to show: extract_request
+  # refuses it, so no request is made
   # (a_schema_is_any_json_from_its_file_and_anything_else_is_refused_unsent).
   check R14 "extract with a schema that is not JSON: refused" \
     "$(is "$rc/$(lines "$WORK/r14.out")/$(last "$WORK/r14.out" '"\(.type)/\(.status)/\(.error.message)"')" "1/1/result/400/the schema is not JSON")" "rc=$rc"

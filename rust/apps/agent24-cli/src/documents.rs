@@ -439,11 +439,12 @@ fn extract_request(
 /// place of a file, the new one is readable only by its owner until it is
 /// written and then takes that file's permissions; with no file there, it is
 /// made as the umask allows from the start, as writing in place would. A
-/// link is written through to its target. `file_unwritable` when the new
-/// file cannot be made beside it (a directory that cannot be written, as
-/// `/dev` for `/dev/null`), when a link leads nowhere (it cannot be
-/// resolved), or when the rename fails (a directory at `path`). A file there
-/// is replaced, a named pipe too; another hard link keeps the old page.
+/// link is written through to its target. Any step that fails is
+/// `file_unwritable`; among them, the new file cannot be made beside it (a
+/// directory that cannot be written, as `/dev` for `/dev/null`), a link leads
+/// nowhere (it cannot be resolved), or the rename fails (a directory at
+/// `path`). A file there is replaced, a named pipe too; another hard link
+/// keeps the old page.
 fn write_page(data: &Value, path: &Path) -> Result<(), Response> {
     use base64::Engine as _;
     let png = data
@@ -772,9 +773,12 @@ mod tests {
         );
         let text = dir.path().join("ask.txt");
         std::fs::write(&text, "fields: date").unwrap();
+        let not_json = Response::fail(400, "invalid_request", "the schema is not JSON");
+        assert_eq!(read_schema(&text).unwrap_err(), not_json);
+        // Refused by extract_request, so there is no request to send.
         assert_eq!(
-            read_schema(&text).unwrap_err(),
-            Response::fail(400, "invalid_request", "the schema is not JSON")
+            extract_request("doc_x".into(), 1, &text, false, None).unwrap_err(),
+            not_json
         );
         let big = dir.path().join("big.json");
         std::fs::write(&big, format!("\"{}\"", "x".repeat(1024 * 1024))).unwrap();
