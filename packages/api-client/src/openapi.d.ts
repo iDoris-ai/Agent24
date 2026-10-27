@@ -78,12 +78,39 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        post?: never;
+        /**
+         * Write the user's decision on a module tool's card
+         * @description The card's `fingerprint`, `module_version` and `artifact` must still be what the tool is checked against when the decision is written, and the module enabled and running (K1-6a-G §2.1). Replaces any earlier decision for the tool.
+         */
+        post: operations["decideModuleToolConsent"];
         /**
          * Revoke one module tool authorization
          * @description Persists revocation and broadcasts the 6a.3 revocation notice.
          */
         delete: operations["revokeModuleToolConsent"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/module-consents/modules/{module}/tools/{tool}/card": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                module: string;
+                tool: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * What a grant of one module tool would cover
+         * @description Built by the host from the tool's manifest declaration (risk, output privacy, resource kinds, reversible draft); the module's own description text is not shown. `reversible_draft` is what the manifest declares, and the declaration relaxes nothing: a module tool's dispatch is gated with no draft exception. `fingerprint`, `module_version` and `artifact` are what a grant must repeat, and what dispatch compares it with (K1-6a-G §2.1).
+         */
+        get: operations["getModuleToolCard"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -418,6 +445,51 @@ export interface paths {
          *     effect within 1s (see TASKS C2 acceptance).
          */
         post: operations["cancelRun"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/peer/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List runs as a peer bridge may relay them
+         * @description K1-6b.5c-2 (ADR-K1-02 §2.4). The MCP server and the ACP bridge read
+         *     runs here instead of /runs. A run's prompt, output and error appear
+         *     only when every source tagged on it is ordinary, it has ended, and —
+         *     while tool results carry no source tags — it cannot have taken one in:
+         *     it called no tool, recalled no memory, was not started by a
+         *     kernel-created schedule, and has no session context (no session, or it
+         *     ran, and the daemon runs, without session memory). Any other run
+         *     carries only its id,
+         *     status and a fixed notice.
+         */
+        get: operations["listPeerRuns"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/peer/runs/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one run as a peer bridge may relay it */
+        get: operations["getPeerRun"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1385,7 +1457,7 @@ export interface components {
              */
             memory_receipt?: "saved" | "paused_not_saved" | "failed" | "not_saved" | "partial";
             /**
-             * @description P1-02c: why the memory write failed. Present exactly when `memory_receipt` is "failed", "not_saved" or "partial". A closed code, never text: no partition key, no storage error message. `memory_disk_low` is reserved (nothing emits it yet).
+             * @description P1-02c: why the memory write failed. Present exactly when `memory_receipt` is "failed", "not_saved" or "partial". A closed code, never text: no partition key, no storage error message. `memory_disk_low` is emitted by the c4 pre-write disk gate.
              * @enum {string}
              */
             memory_error_code?: "memory_quota_rows" | "memory_quota_bytes" | "memory_disk_low" | "memory_disk_full" | "memory_reserved_kind" | "memory_retract_id_too_long" | "memory_internal";
@@ -1463,6 +1535,31 @@ export interface components {
             started_at: string | null;
             /** Format: date-time */
             ended_at: string | null;
+        };
+        /**
+         * @description K1-6b.5c-2: an allowlisted view of a run for peer bridges, never a
+         *     filtered Run, so a field added to Run later is not relayed by default.
+         */
+        PeerRun: {
+            id: string;
+            status: components["schemas"]["RunStatus"];
+            /**
+             * @description True unless every source tagged on the run so far is ordinary and
+             *     the run called no tool, recalled no memory, was not started by a
+             *     kernel-created schedule and has no session context. Sources are
+             *     tagged before the first model call, so afterwards the value only
+             *     changes when the run starts a tool or the daemon restarts with
+             *     session memory turned on or off.
+             */
+            withheld: boolean;
+            /** @description Present only for an ended run that is not withheld */
+            prompt: string | null;
+            /** @description Present only for a completed run that is not withheld */
+            output: components["schemas"]["RunOutput"] | null;
+            /** @description Present only for a failed run that is not withheld */
+            error: components["schemas"]["ErrorBody"] | null;
+            /** @description Fixed explanation, present exactly when withheld is true */
+            notice: string | null;
         };
         RunCreate: {
             /** @description Omit/null to create a transient run */
@@ -2425,12 +2522,50 @@ export interface components {
             expires_at: string;
             /** @enum {string} */
             status: "granted" | "denied" | "revoked" | "expired" | "stale" | "not_granted";
+            /**
+             * @description Only for a revoked one, or an expired grant: whether the module said it stopped the work the grant started when told it ended (K1-6a-G §2.5). `unconfirmed` also when no answer was recorded, as for a revocation made outside this daemon or an expiry not yet told.
+             * @enum {string}
+             */
+            stop?: "confirmed" | "unconfirmed" | "not_running";
+        };
+        ModuleToolCard: {
+            module: string;
+            tool: string;
+            module_version: string;
+            scope_summary: {
+                readable: string | null;
+                writable: string | null;
+                external: string | null;
+            };
+            /** @enum {string} */
+            host_risk: "low" | "medium" | "high";
+            /** @enum {string} */
+            source: "first_party" | "manual_install";
+            reversible_draft: boolean;
+            resource_kinds: string[];
+            fingerprint: string;
+            artifact: string;
+        };
+        ModuleToolDecision: {
+            /** @enum {string} */
+            decision: "granted" | "denied";
+            fingerprint: string;
+            module_version: string;
+            artifact: string;
+            resources?: string[];
+            /** Format: date-time */
+            expires_at: string;
         };
         ModuleAuthorizationRevocation: {
             module: string;
             tool: string | null;
             /** @constant */
             status: "revoked";
+            /**
+             * @description What the module answered when told (K1-6a-G §2.5): `confirmed`, it stopped the work the grants started; `unconfirmed`, no 2xx within the bound, so that work may still run; `not_running`, it had no run. The revocation stands in every case.
+             * @enum {string}
+             */
+            stop: "confirmed" | "unconfirmed" | "not_running";
         };
         /**
          * @description A batch of atomic ops. `status` MUST be `pending` on submit — the server
@@ -2753,6 +2888,123 @@ export interface operations {
             };
         };
     };
+    decideModuleToolConsent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                module: string;
+                tool: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModuleToolDecision"];
+            };
+        };
+        responses: {
+            /** @description The decision as written */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModuleAuthorization"];
+                };
+            };
+            /** @description `invalid_request`: the body is not JSON */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Missing or invalid host token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Host authority required; or `grants_closed`: the host has not opened decisions (`A24_MODULE_TOOL_GRANTS=1`), or the daemon is ephemeral */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description No such module tool */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `protocol_too_old` or `no_package_identity`, as for the card; `card_changed`: the fingerprint, version or package identity is no longer the current one; `module_disabled` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `invalid_request`: the body is larger than the daemon accepts */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `invalid_request`: the body is not sent as `application/json` */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `invalid_request`: the body is not a decision (`decision`, `fingerprint`, `module_version` or `artifact` missing, a field of another type, or one not defined). `invalid_decision`: `expires_at` missing, null or not an RFC 3339 instant, an expiry already past or past the host's bound (`A24_MODULE_GRANT_MAX_DAYS`, 30 days unless set, at most 90), more than 256 resources, a resource that is not `<kind>:<id>` of a kind the tool declares, or a denial naming resources */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Whether the module is enabled could not be read */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Authorization storage is temporarily unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     revokeModuleToolConsent: {
         parameters: {
             query?: never;
@@ -2776,6 +3028,65 @@ export interface operations {
             };
             /** @description Authorization storage is temporarily unavailable */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getModuleToolCard: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                module: string;
+                tool: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tool's card */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModuleToolCard"];
+                };
+            };
+            /** @description Missing or invalid host token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Host authority required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description No such module tool */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `protocol_too_old`: the module does not require the grants protocol, so it cannot be told its grants were revoked (§2.6). `no_package_identity`: no running package identity to grant against (not running, not yet observed by this daemon start, or an ephemeral daemon). */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3456,6 +3767,51 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Run"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listPeerRuns: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Peer run list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        runs: components["schemas"]["PeerRun"][];
+                    };
+                };
+            };
+        };
+    };
+    getPeerRun: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Peer run */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PeerRun"];
                 };
             };
             404: components["responses"]["NotFound"];

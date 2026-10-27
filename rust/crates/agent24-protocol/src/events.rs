@@ -243,7 +243,7 @@ pub enum MemoryFailureCode {
     QuotaRows,
     #[serde(rename = "memory_quota_bytes")]
     QuotaBytes,
-    // Reserved for the pre-write disk check; nothing emits it yet.
+    // Emitted by the c4 pre-write disk gate.
     #[serde(rename = "memory_disk_low")]
     DiskLow,
     #[serde(rename = "memory_disk_full")]

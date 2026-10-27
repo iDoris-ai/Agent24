@@ -21,7 +21,7 @@ use agent24_memory::{KvStore, session::Summarizer};
 use agent24_models::Msg;
 use agent24_models::router::ModelRouter;
 use agent24_protocol::EventBody;
-use agent24_store::Store;
+use agent24_store::{AssertionSourceRef, SourceClassification, Store};
 use agent24_tools::ToolRegistry;
 use async_trait::async_trait;
 use sqlx::sqlite::SqliteConnectOptions;
@@ -76,9 +76,31 @@ async fn kinds(kv: &KvStore, kind: &str) -> Vec<String> {
         .collect()
 }
 
-async fn remember(m: &RunManager, answer: &str) -> MemoryWriteOutcome {
-    m.chat_remember_turn(SESSION, "remember espresso", answer)
+fn source(class: SourceClassification) -> AssertionSourceRef {
+    AssertionSourceRef::from_sources([("user_input:h02".to_owned(), class)])
+}
+
+async fn remember_with(
+    m: &RunManager,
+    answer: &str,
+    class: SourceClassification,
+) -> MemoryWriteOutcome {
+    m.chat_remember_turn(SESSION, "remember espresso", answer, source(class))
         .await
+}
+
+async fn remember(m: &RunManager, answer: &str) -> MemoryWriteOutcome {
+    remember_with(m, answer, SourceClassification::Ordinary).await
+}
+
+async fn stored_class(kv: &KvStore) -> SourceClassification {
+    let beliefs = kv
+        .assertions()
+        .beliefs_as_of(&BeliefQuery::owner(OWNER))
+        .await
+        .unwrap();
+    assert_eq!(beliefs.len(), 1);
+    AssertionSourceRef::classification_of(beliefs[0].source_ref.as_ref())
 }
 
 async fn forget_active(kv: &KvStore) {
@@ -175,4 +197,74 @@ async fn chat_remember_accepts_a_legacy_reassert_chain_missing_the_current_commi
         "compat path must not backfill or duplicate audits"
     );
     assert_eq!(active_ids(&kv).await.len(), 1);
+}
+
+/// Merge-of-lines combination (H02 audit proof x K1-6b.4b `source_ref`): ONE
+/// idempotent re-assert while the memory is active must both (a) be accepted
+/// only because the commit audit proves the original write (no new audit
+/// events, `Saved`), and (b) tighten the stored classification, never lower it.
+#[tokio::test]
+async fn audited_reassert_is_idempotent_and_tightens_source_ref_but_never_lowers_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("mem.db")).await.unwrap();
+    let m = manager(Store::open_memory().await.unwrap(), kv.clone());
+
+    assert_eq!(remember(&m, "1").await, MemoryWriteOutcome::Saved);
+    assert_eq!(stored_class(&kv).await, SourceClassification::Ordinary);
+    let audits = kinds(&kv, "mem.write_decision").await;
+
+    assert_eq!(
+        remember_with(&m, "2", SourceClassification::Restricted).await,
+        MemoryWriteOutcome::Saved
+    );
+    assert_eq!(stored_class(&kv).await, SourceClassification::Restricted);
+    assert_eq!(
+        kinds(&kv, "mem.write_decision").await,
+        audits,
+        "the audited re-assert is idempotent: no new audit"
+    );
+
+    assert_eq!(
+        remember_with(&m, "3", SourceClassification::Ordinary).await,
+        MemoryWriteOutcome::Saved
+    );
+    assert_eq!(
+        stored_class(&kv).await,
+        SourceClassification::Restricted,
+        "a later ordinary re-assert never lowers the stored classification"
+    );
+    assert_eq!(kinds(&kv, "mem.write_decision").await, audits);
+}
+
+/// Same invariant through the legacy-chain compatibility branch (#1154): the
+/// bounded legacy proof is accepted AND a stricter classification still lands.
+#[tokio::test]
+async fn legacy_chain_reassert_also_tightens_source_ref() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mem.db");
+    let kv = KvStore::open(&path).await.unwrap();
+    let m = manager(Store::open_memory().await.unwrap(), kv.clone());
+
+    assert_eq!(remember(&m, "1").await, MemoryWriteOutcome::Saved);
+    forget_active(&kv).await;
+    assert_eq!(remember(&m, "2").await, MemoryWriteOutcome::Saved);
+    let proof = kinds(&kv, "mem.write_decision").await.pop().unwrap();
+    let mut side = SqliteConnectOptions::new()
+        .filename(&path)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM mem_events WHERE id = ?")
+        .bind(&proof)
+        .execute(&mut side)
+        .await
+        .unwrap();
+    side.close().await.unwrap();
+
+    assert_eq!(
+        remember_with(&m, "3", SourceClassification::Restricted).await,
+        MemoryWriteOutcome::Saved
+    );
+    assert_eq!(stored_class(&kv).await, SourceClassification::Restricted);
+    assert_eq!(kinds(&kv, "mem.write_decision").await.len(), 1);
 }
