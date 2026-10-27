@@ -1223,6 +1223,7 @@ mod tests {
                     workspace_id: None,
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
+                    knowledge_binding_id: None,
                 },
                 output: None,
                 error: None,

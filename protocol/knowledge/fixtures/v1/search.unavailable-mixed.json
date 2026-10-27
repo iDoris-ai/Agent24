@@ -1,0 +1,9 @@
+{ "$comment": "R3.4: no branch succeeded and the causes are mixed, so the least retryable one wins; details carry partial_failures.",
+  "op": "knowledge.search",
+  "request": { "protocol_version": 1, "request_id": "01JB3U0A1B2C3D4E5F6G7H8J9K", "generation": 12,
+    "query": "差旅标准", "scope": { "knowledge_base_ids": ["kb-a", "kb-c"] },
+    "budget": { "deadline_ms": 5000, "max_results": 10, "max_concurrency": 2 } },
+  "response": { "status": 503, "body": { "error": { "code": "unavailable", "message": "Knowledge search is unavailable.",
+    "details": { "retryable": false, "reason": "index_failed", "request_id": "01JB3U0A1B2C3D4E5F6G7H8J9K", "generation": 12,
+      "partial_failures": [ { "knowledge_base_id": "kb-a", "code": "timeout", "reason": "timeout", "retryable": true },
+        { "knowledge_base_id": "kb-c", "code": "unavailable", "reason": "index_failed", "retryable": false } ] } } } } }

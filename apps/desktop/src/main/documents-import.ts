@@ -3,14 +3,14 @@
 // sees the path, and the public API only ever gets the base name (ADR-001).
 
 import type { DocumentsImportProgress, DocumentsResponse } from '../shared/ipc-types'
-import type { BackendEndpoint } from './backend-manager'
+import type { CliEndpoint } from './backend-manager'
 import { cliBinary, runDocumentsCli, spawnCli, type Spawner } from './documents-cli'
 
 /** Imports the file at `path` into the daemon at `endpoint()`; on success
  * the answer is the import job. */
 export function importFile(
   path: string,
-  endpoint: () => BackendEndpoint | null,
+  endpoint: () => CliEndpoint | null,
   onProgress: (p: DocumentsImportProgress) => void = () => {},
   run: Spawner = spawnCli,
   bin: string = cliBinary(),

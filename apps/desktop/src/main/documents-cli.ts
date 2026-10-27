@@ -7,7 +7,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process'
 import type { DocumentsError, DocumentsImportProgress, DocumentsResponse } from '../shared/ipc-types'
-import { resolveBundledRustBinary, type BackendEndpoint } from './backend-manager'
+import { resolveBundledRustBinary, type CliEndpoint } from './backend-manager'
 
 /** Starts the CLI with these arguments, stdin, stdout and stderr piped. */
 export type Spawner = (bin: string, args: string[]) => ChildProcess
@@ -42,7 +42,7 @@ export const spawnCli: Spawner = (bin, args) => spawn(bin, args, { stdio: ['pipe
 export function runDocumentsCli(
   args: string[],
   input: Record<string, unknown>,
-  endpoint: () => BackendEndpoint | null,
+  endpoint: () => CliEndpoint | null,
   onProgress: (p: DocumentsImportProgress) => void = () => {},
   run: Spawner = spawnCli,
   bin: string = cliBinary(),

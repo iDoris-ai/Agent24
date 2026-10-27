@@ -71,6 +71,7 @@ async fn paused_snapshot_notice_is_host_system_and_neighbors_are_present() {
             prompt: "记住 我喜欢喝茶".into(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -168,6 +169,7 @@ async fn recall_snapshot_stores_sorted_assertion_id_array() {
             prompt: "花生 烤鸭".into(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();

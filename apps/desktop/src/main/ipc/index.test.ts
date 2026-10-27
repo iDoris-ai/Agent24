@@ -28,11 +28,15 @@ vi.mock('node:child_process', async (orig) => ({
 }))
 
 const endpoint = { port: 0, token: 'daemon-secret' }
-vi.mock('../backend-manager', () => ({ getBackendEndpoint: () => endpoint }))
+vi.mock('../backend-manager', () => ({
+  getBackendEndpoint: () => ({ port: endpoint.port }),
+  daemonConnection: () => ({ port: endpoint.port, authHeaders: { Authorization: `Bearer ${endpoint.token}` } }),
+  daemonCliEndpoint: () => ({ port: endpoint.port, token: endpoint.token }),
+}))
 
 import { IpcChannels } from '../../shared/ipc-types'
 import { createIpcGuard } from './guard'
-import { registerIpcHandlers } from './index'
+import { reachesHostInterface, registerIpcHandlers } from './index'
 
 const APP_URL = 'file:///app/renderer/index.html'
 const mainFrame = { url: APP_URL }
@@ -382,5 +386,38 @@ describe('A5 node-daemon module IPC is retired', () => {
     const res = await call(channel, ...(args as unknown[]))
     expect(res).toEqual(notSupported)
     expect(seen).toHaveLength(0)
+  })
+})
+
+describe('backend:endpoint hands the renderer the port only (KB-HOST-01 PR-A1)', () => {
+  it('returns exactly {port}, with no credential, while main holds one', async () => {
+    const result = await call(IpcChannels.BackendEndpoint)
+    expect(result).toEqual({ port: endpoint.port })
+    expect(JSON.stringify(result)).not.toContain(endpoint.token)
+  })
+})
+
+describe('the generic backend proxy never reaches the host interface (KB-HOST-01 PR-B1a)', () => {
+  it.each([
+    '/api/v1/host/knowledge/bindings/b1?seq=1',
+    '/api/v1/host',
+    '/API/v1/Host/knowledge/bindings/b1',
+    '/api/v1/./host/knowledge/bindings/b1',
+    '/api/v1/models/../host/knowledge/bindings/b1',
+    '/api/v1//host/knowledge/bindings/b1',
+    '/api/v1/%68ost/knowledge/bindings/b1',
+    '/api/v1/host%2Fknowledge',
+    '/api/v1\\host/knowledge/bindings/b1',
+    // Encoded `/` and `..` inside the id: the daemon routes the raw path.
+    '/api/v1/host/knowledge/bindings/..%2F..%2F..%2Fx?seq=1',
+  ])('refuses %s without sending it', async (path) => {
+    const res = await call(IpcChannels.BackendProxy, { method: 'PUT', path })
+    expect(res.status).toBe(403)
+    expect(JSON.stringify(res.data)).toContain('host_interface_private')
+    expect(seen).toHaveLength(0)
+  })
+
+  it.each(['/api/v1/hosts', '/api/v1/sessions?next=/api/v1/host/x', '/api/v1/tool-overrides/foo%'])('still proxies %s', async (path) => {
+    expect(reachesHostInterface(path)).toBe(false)
   })
 })

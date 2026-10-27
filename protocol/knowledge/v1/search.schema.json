@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/iDoris-ai/Agent24/protocol/knowledge/v1/search.schema.json",
+  "title": "Agent24 Knowledge v1 — knowledge.search",
+  "description": "Search request ($defs/request) and success response ($defs/response), CONTRACT-READONLY-v1 §3. Errors use error.schema.json. partial is a success state (R6.5).",
+  "$defs": {
+    "budget": {
+      "description": "R3.3. Values above the server limits are clamped, not rejected; applied_budget reports what was used.",
+      "type": "object", "required": ["deadline_ms", "max_results", "max_concurrency"], "additionalProperties": false,
+      "properties": {
+        "deadline_ms": { "$ref": "common.schema.json#/$defs/positive_int" },
+        "max_results": { "$ref": "common.schema.json#/$defs/positive_int" },
+        "max_concurrency": { "$ref": "common.schema.json#/$defs/positive_int" }
+      }
+    },
+    "request": {
+      "type": "object", "required": ["protocol_version", "request_id", "generation", "query", "scope", "budget"], "additionalProperties": false,
+      "properties": {
+        "protocol_version": { "$ref": "common.schema.json#/$defs/protocol_version" },
+        "request_id": { "$ref": "common.schema.json#/$defs/request_id" },
+        "generation": { "$ref": "common.schema.json#/$defs/generation" },
+        "query": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "scope": { "$ref": "common.schema.json#/$defs/request_scope" },
+        "budget": { "$ref": "#/$defs/budget" }
+      }
+    },
+    "locator": {
+      "description": "R3.10: reserved for future exact location; offsets only when valid. end > start cannot be expressed here and must be checked in code.",
+      "oneOf": [
+        { "type": "object", "required": ["valid", "start", "end"], "additionalProperties": false,
+          "properties": { "valid": { "const": true }, "start": { "type": "integer", "minimum": 0 }, "end": { "type": "integer", "minimum": 1 } } },
+        { "type": "object", "required": ["valid"], "additionalProperties": false, "properties": { "valid": { "const": false } } }
+      ]
+    },
+    "hit": {
+      "description": "R3.8. A hit is a retrieval match only, never context-expansion output.",
+      "type": "object", "additionalProperties": false,
+      "required": ["rank", "knowledge_base_id", "knowledge_id", "chunk_id", "chunk_type", "revision", "locator", "index_state", "score", "score_space", "snippet"],
+      "properties": {
+        "rank": { "$ref": "common.schema.json#/$defs/positive_int" },
+        "knowledge_base_id": { "$ref": "common.schema.json#/$defs/id" },
+        "knowledge_id": { "$ref": "common.schema.json#/$defs/id" },
+        "chunk_id": { "$ref": "common.schema.json#/$defs/id" },
+        "chunk_type": { "$ref": "common.schema.json#/$defs/chunk_type" },
+        "revision": {
+          "type": "object", "required": ["source_revision", "index_build_id", "chunk_revision", "content_tag"], "additionalProperties": false,
+          "properties": {
+            "source_revision": { "$ref": "common.schema.json#/$defs/id" },
+            "index_build_id": { "$ref": "common.schema.json#/$defs/id" },
+            "chunk_revision": { "oneOf": [{ "$ref": "common.schema.json#/$defs/chunk_revision" }, { "type": "null" }] },
+            "content_tag": { "$ref": "common.schema.json#/$defs/content_tag" }
+          }
+        },
+        "locator": { "$ref": "#/$defs/locator" },
+        "index_state": { "enum": ["fresh", "stale", "unknown"] },
+        "score": { "description": "Comparable only within one response (R3.6).", "type": "number" },
+        "score_space": { "$ref": "common.schema.json#/$defs/id" },
+        "snippet": {
+          "type": "object", "required": ["text", "truncated"], "additionalProperties": false,
+          "properties": { "text": { "type": "string" }, "truncated": { "type": "boolean" } }
+        },
+        "display": { "$ref": "common.schema.json#/$defs/display" }
+      },
+      "allOf": [
+        { "description": "R3.9: unknown chunk revision means index_state unknown.",
+          "if": { "properties": { "revision": { "properties": { "chunk_revision": { "type": "null" } } } } },
+          "then": { "properties": { "index_state": { "const": "unknown" } } } },
+        { "description": "R3.10: a valid locator requires an unedited chunk.",
+          "if": { "properties": { "locator": { "properties": { "valid": { "const": true } } } } },
+          "then": { "properties": { "revision": { "properties": { "chunk_revision": { "const": 0 } } } } } }
+      ]
+    },
+    "response": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "request_id", "generation", "completeness", "effective_scope", "applied_budget", "hits"],
+      "properties": {
+        "protocol_version": { "$ref": "common.schema.json#/$defs/protocol_version" },
+        "request_id": { "$ref": "common.schema.json#/$defs/request_id" },
+        "generation": { "$ref": "common.schema.json#/$defs/generation" },
+        "completeness": { "enum": ["complete", "partial"] },
+        "effective_scope": { "$ref": "common.schema.json#/$defs/effective_scope" },
+        "applied_budget": { "$ref": "#/$defs/budget" },
+        "hits": { "type": "array", "items": { "$ref": "#/$defs/hit" } },
+        "partial_failures": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/partial_failure" } }
+      },
+      "if": { "properties": { "completeness": { "const": "partial" } } },
+      "then": { "required": ["partial_failures"], "properties": { "partial_failures": { "minItems": 1 } } },
+      "else": { "not": { "required": ["partial_failures"] } }
+    }
+  }
+}

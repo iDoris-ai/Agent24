@@ -145,6 +145,7 @@ async fn run(rig: &Rig, session: &str, prompt: &str) -> Run {
             prompt: prompt.to_owned(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -376,6 +377,7 @@ async fn a_failed_legacy_import_fails_the_run_typed_and_a_retry_recovers_the_his
             prompt: "再问".to_owned(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();

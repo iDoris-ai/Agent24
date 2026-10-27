@@ -5,7 +5,7 @@ import http from 'node:http'
 import https from 'node:https'
 import { execFile, type ChildProcess } from 'node:child_process'
 import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron'
-import { getBackendEndpoint } from '../backend-manager'
+import { daemonCliEndpoint, daemonConnection, getBackendEndpoint } from '../backend-manager'
 import { findAllowedRoute, proxyError, proxyRequest, timeoutFor } from '../backend-proxy'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
 import type { IpcGuard } from './guard'
@@ -109,16 +109,36 @@ function fetchOmlxModels(url: unknown, apiKey: string): Promise<string[]> {
 // file:// or other dangerous schemes.
 const EXTERNAL_URL_ALLOWLIST = ['https://', 'http://'] as const
 
+// The daemon's private host interface (`/api/v1/host/…`, KB-HOST-01) belongs
+// to main alone: the renderer's generic proxy never reaches it, or the page
+// would act with the product host's authority (UI-BRIDGE U1.5). The daemon
+// routes on the raw path, so that is what decides; a decoded and normalized
+// form that lands there is refused as well, and one that does not decode
+// falls back to the raw verdict.
+const HOST_INTERFACE = /^\/api\/v1\/host(\/|$)/i
+
+export function reachesHostInterface(requestPath: string): boolean {
+  const raw = requestPath.split(/[?#]/, 1)[0] ?? ''
+  const hits = (path: string) => HOST_INTERFACE.test(path.replace(/\/{2,}/g, '/'))
+  if (hits(raw)) return true
+  try {
+    return hits(new URL(decodeURIComponent(raw), 'http://daemon').pathname)
+  } catch {
+    return false
+  }
+}
+
 /** Ready-to-use daemon access for main-process code (not allowlisted: callers
  *  here build their own fixed paths). */
 function proxyToBackend(req: BackendProxyRequest, timeoutMs?: number): Promise<BackendProxyResponse> {
-  // Endpoint comes from the backend's ready line (dynamic port + token for
-  // agent24d; fixed 8765 + empty token for the node mock)
-  const endpoint = getBackendEndpoint()
-  if (!endpoint) {
-    return Promise.resolve(proxyError('backend_not_ready', 'Backend daemon has not announced readiness yet'))
+  // Port and credential come from the backend's ready line (dynamic port +
+  // token for agent24d; fixed 8765 and no credential for the node mock).
+  // Without a usable credential nothing is sent.
+  const conn = daemonConnection()
+  if (!conn) {
+    return Promise.resolve(proxyError('backend_not_ready', 'Backend daemon is not ready (no announced port or credential)'))
   }
-  return proxyRequest(endpoint, req, { host: BACKEND_HOST, ...(timeoutMs === undefined ? {} : { timeoutMs }) })
+  return proxyRequest(conn, req, { host: BACKEND_HOST, ...(timeoutMs === undefined ? {} : { timeoutMs }) })
 }
 
 function isBackendProxyRequest(req: unknown): req is BackendProxyRequest {
@@ -321,7 +341,7 @@ export function registerIpcHandlers(options: {
     return endpoint ? { port: endpoint.port } : null
   })
   handle(IpcChannels.DocumentsRequest, (_event, req: unknown) =>
-    documentsCall(req, getBackendEndpoint),
+    documentsCall(req, daemonCliEndpoint),
   )
   handle(IpcChannels.DocumentsImportFile, async (event) => {
     const window = BrowserWindow.fromWebContents(event.sender)
@@ -337,13 +357,20 @@ export function registerIpcHandlers(options: {
     }
     const path = picked.filePaths[0]
     if (picked.canceled || !path) return null
-    return importFile(path, getBackendEndpoint, (p) => {
+    return importFile(path, daemonCliEndpoint, (p) => {
       if (!event.sender.isDestroyed()) event.sender.send(IpcChannels.DocumentsImportProgress, p)
     })
   })
   handle(IpcChannels.BackendProxy, (_event, req: unknown) => {
     if (!isBackendProxyRequest(req)) {
       return proxyError('forbidden', 'valid method and absolute path required')
+    }
+    if (reachesHostInterface(req.path)) {
+      return {
+        ok: false,
+        status: 403,
+        data: { error: { code: 'host_interface_private', message: 'The host interface is not reachable from the renderer' } },
+      }
     }
     // A1: only allowlisted (method, path-template) pairs are forwarded.
     const route = findAllowedRoute(req.method, req.path)
