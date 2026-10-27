@@ -20,8 +20,8 @@ use super::state::{ConnectionPhase, PlaceholderFailure, Switches};
 pub struct Member<I: Ids> {
     id: I::Profile,
     profile: Profile<I::Kb>,
-    /// The id of the profile's binding, while it has one.
-    binding: Option<I::Binding>,
+    /// The id and identity (S2.4) of the profile's binding, while it has one.
+    binding: Option<(I::Binding, I::Identity)>,
     disabled: bool,
     /// The principal last confirmed (S1.13).
     confirmed: Option<I::Principal>,
@@ -51,11 +51,12 @@ impl<I: Ids> Left<I> {
 }
 
 impl<I: Ids> Member<I> {
-    /// As restored or configured; `binding` names the bound slot's binding.
+    /// As restored or configured; `binding` names the bound slot's binding
+    /// and its identity.
     pub fn new(
         id: I::Profile,
         profile: Profile<I::Kb>,
-        binding: Option<I::Binding>,
+        binding: Option<(I::Binding, I::Identity)>,
         disabled: bool,
     ) -> Self {
         debug_assert_eq!(binding.is_some(), matches!(profile.slot(), Slot::Bound(_)));
@@ -81,6 +82,25 @@ impl<I: Ids> Member<I> {
         &self.id
     }
 
+    /// The profile's binding, while it has one.
+    pub fn of(&self) -> Option<Of<I>> {
+        let (binding, _) = self.binding.as_ref()?;
+        Some(Of {
+            profile: self.id.clone(),
+            binding: binding.clone(),
+        })
+    }
+
+    /// Its binding's identity (S2.4), while it has one.
+    pub fn identity(&self) -> Option<&I::Identity> {
+        self.binding.as_ref().map(|(_, identity)| identity)
+    }
+
+    /// Whether `of` is this member's binding.
+    fn holds(&self, of: &Of<I>) -> bool {
+        of.profile == self.id && self.binding.as_ref().is_some_and(|(b, _)| *b == of.binding)
+    }
+
     pub fn profile(&self) -> &Profile<I::Kb> {
         &self.profile
     }
@@ -104,14 +124,9 @@ impl<I: Ids> Member<I> {
             value: effects,
             rule,
         } = self.profile.leave(event);
-        let Some(binding) = &self.binding else {
-            return;
-        };
-        let of = Of {
-            profile: self.id.clone(),
-            binding: binding.clone(),
-        };
-        record(of, effects, rule, left);
+        if let Some(of) = self.of() {
+            record(of, effects, rule, left);
+        }
     }
 
     /// S3.5: the binding is retired for `change`, with its placeholder rule
@@ -123,7 +138,7 @@ impl<I: Ids> Member<I> {
         change: IdentityChange,
     ) -> Option<(Left<I>, Option<Attempt>)> {
         let retired = self.profile.change_identity(change)?;
-        let binding = self.binding.take()?;
+        let (binding, _) = self.binding.take()?;
         let of = Of {
             profile: self.id.clone(),
             binding,
@@ -136,13 +151,9 @@ impl<I: Ids> Member<I> {
     /// A `loading` round's issuance, as [`super::binding::BindingState::issue`],
     /// with the binding it is for.
     pub fn issue(&mut self) -> Option<(Of<I>, Issuance)> {
-        let binding = self.binding.clone()?;
+        let of = self.of()?;
         let Slot::Bound(state) = self.profile.slot_mut() else {
             return None;
-        };
-        let of = Of {
-            profile: self.id.clone(),
-            binding,
         };
         Some((of, state.issue()?))
     }
@@ -162,7 +173,7 @@ impl<I: Ids> Member<I> {
         now: Instant,
         left: &mut Left<I>,
     ) -> bool {
-        if of.profile != self.id || self.binding.as_ref() != Some(&of.binding) {
+        if !self.holds(&of) {
             return false;
         }
         let Slot::Bound(state) = self.profile.slot_mut() else {
@@ -250,7 +261,7 @@ impl<I: Ids> Member<I> {
     pub fn bind(
         &mut self,
         attempt: Attempt,
-        binding: I::Binding,
+        binding: (I::Binding, I::Identity),
         value: u64,
         confirmed: Option<I::Principal>,
     ) -> bool {
@@ -286,7 +297,7 @@ impl<I: Ids> Member<I> {
     /// The generation `value` written for `of` is confirmed persisted. Not
     /// this member's binding any more: nothing moves.
     pub fn confirm_generation(&mut self, of: &Of<I>, value: u64) -> Option<Round> {
-        if of.profile != self.id || self.binding.as_ref() != Some(&of.binding) {
+        if !self.holds(of) {
             return None;
         }
         match self.profile.slot_mut() {

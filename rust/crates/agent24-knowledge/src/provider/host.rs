@@ -8,7 +8,8 @@
 //!
 //! The caller runs the writes as [`super::journal`] orders them and reports
 //! each back. New bindings are in `create`, identity changes in `identity`,
-//! issuances in `issue`; calls and the start follow in later slices.
+//! issuances in `issue`, runs' binding sets in `run`; calls and the start
+//! follow in later slices.
 
 use std::collections::HashMap;
 
@@ -25,8 +26,10 @@ use super::replay::Record;
 mod create;
 mod identity;
 mod issue;
+mod run;
 
 pub use create::Created;
+pub use run::RunCall;
 
 /// What an event or a report asks of the caller.
 #[derive(Debug, PartialEq, Eq)]
@@ -72,6 +75,14 @@ enum Then<I: Ids> {
     Create { ticket: Loosening },
     /// The clearing of a written reason, for a `dependency` to take its place.
     Leave { ticket: Loosening, id: I::Profile },
+    /// A run's binding set (S4.7).
+    Run { ticket: Loosening, run: I::Run },
+    /// The binding an empty run set is backfilled with.
+    Backfill {
+        ticket: Loosening,
+        run: I::Run,
+        of: Of<I>,
+    },
 }
 
 #[derive(Debug)]
@@ -89,6 +100,7 @@ pub struct Host<I: Ids> {
     creations: Vec<create::Creation<I>>,
     /// New bindings waiting for a retirement (S3.5).
     deferred: Vec<identity::Deferred<I>>,
+    runs: Vec<run::Run<I>>,
 }
 
 impl<I: Ids> Host<I> {
@@ -104,6 +116,7 @@ impl<I: Ids> Host<I> {
             highest,
             creations: Vec::new(),
             deferred: Vec::new(),
+            runs: Vec::new(),
         }
     }
 
@@ -277,7 +290,9 @@ impl<I: Ids> Host<I> {
         let mut out = Output::default();
         match self.journal.written(attempt, outcome) {
             Report::Ignored | Report::Failed(Then::Loose { .. }) => return out,
-            Report::Failed(Then::Create { .. } | Then::Leave { .. }) => return out,
+            Report::Failed(
+                Then::Create { .. } | Then::Leave { .. } | Then::Run { .. } | Then::Backfill { .. },
+            ) => return out,
             Report::Failed(Then::Tight { ticket, .. }) => {
                 let ticket = *ticket;
                 self.ledger.record_failed(ticket);
@@ -309,6 +324,10 @@ impl<I: Ids> Host<I> {
                 if let Some(placeholder) = member.and_then(|m| m.placeholder_mut()) {
                     placeholder.left(ticket);
                 }
+            }
+            Report::Durable(Then::Run { ticket, run }) => self.run_written(run, ticket),
+            Report::Durable(Then::Backfill { ticket, run, of }) => {
+                self.backfilled(run, ticket, of);
             }
         }
         // A tightening on the way may have deleted it: no rebuild yet.

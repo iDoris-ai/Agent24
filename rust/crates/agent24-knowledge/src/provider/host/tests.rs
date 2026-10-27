@@ -31,7 +31,7 @@ pub(super) fn of(profile: &'static str, binding: u32) -> Of<T> {
 }
 
 /// A selected profile whose binding (generation 1) is `loading`.
-fn loading() -> Profile<&'static str> {
+pub(super) fn loading() -> Profile<&'static str> {
     let mut binding = BindingState::new(
         Connection::new(Gate::new(1), true),
         Credentials::new(false),
@@ -49,7 +49,7 @@ fn loading() -> Profile<&'static str> {
 /// off and the seal present. The log's next record is 10.
 pub(super) fn host() -> H {
     let mut host = H::new(false, true, 10, 1);
-    host.insert(Member::new("a", loading(), Some(7), false));
+    host.insert(Member::new("a", loading(), Some((7, "id")), false));
     let placeholder = Slot::Placeholder(Placeholder::new(None));
     let b = Profile::new(placeholder, true, None);
     host.insert(Member::new("b", b, None, false));
@@ -172,7 +172,7 @@ fn an_unconfirmed_tightening_refuses_the_loosenings_it_covers() {
     );
 
     let mut host = H::new(true, true, 1, 1);
-    host.insert(Member::new("a", loading(), Some(7), true));
+    host.insert(Member::new("a", loading(), Some((7, "id")), true));
     host.disable("x");
     host.turn_off();
     assert!(host.take_write().is_none(), "unknown profile; Off already");
@@ -299,7 +299,7 @@ fn off_aborts_the_calls_in_flight() {
     };
     let (call, _) = binding.connection_mut().open_call().unwrap();
     let mut host = H::new(false, true, 1, 1);
-    host.insert(Member::new("a", profile, Some(7), false));
+    host.insert(Member::new("a", profile, Some((7, "id")), false));
     assert_eq!(host.turn_off().aborted, [(of("a", 7), call)]);
 }
 
@@ -448,7 +448,7 @@ fn a_selection_awaiting_confirmation_does_not_activate() {
     let awaited = Some(Confirmation::PrincipalChanged);
     let profile = Profile::new(Slot::Bound(Box::new(binding)), false, awaited);
     let mut host = H::new(false, true, 1, 1);
-    host.insert(Member::new("a", profile, Some(7), false));
+    host.insert(Member::new("a", profile, Some((7, "id")), false));
     host.select("a").unwrap();
     assert!(durable(&mut host).loading.is_empty());
     let profile = host.profile(&"a").unwrap();

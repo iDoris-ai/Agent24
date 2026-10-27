@@ -31,6 +31,7 @@ pub(super) struct Creation<I: Ids> {
     ticket: Loosening,
     attempt: Attempt,
     of: Of<I>,
+    identity: I::Identity,
     value: u64,
     confirmed: Option<I::Principal>,
     /// The placeholder's reason the write clears.
@@ -103,7 +104,7 @@ impl<I: Ids> Host<I> {
         };
         let mut changes = vec![Change::Bind {
             of: of.clone(),
-            identity: created.identity,
+            identity: created.identity.clone(),
             generation: value,
             confirmed: confirmed.clone(),
         }];
@@ -120,6 +121,7 @@ impl<I: Ids> Host<I> {
             ticket,
             attempt,
             of,
+            identity: created.identity,
             value,
             confirmed,
             cleared,
@@ -187,7 +189,7 @@ impl<I: Ids> Host<I> {
             return;
         }
         let off = self.off;
-        let binding = c.of.binding.clone();
+        let binding = (c.of.binding.clone(), c.identity);
         if let Some(m) = self.member(&c.of.profile)
             && m.bind(c.attempt, binding, c.value, c.confirmed.clone())
         {

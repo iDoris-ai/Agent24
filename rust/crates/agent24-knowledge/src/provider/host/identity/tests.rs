@@ -302,7 +302,7 @@ fn awaiting(confirmation: Option<Confirmation>) -> H {
     let slot = Slot::Bound(Box::new(binding));
     let profile = Profile::new(slot, true, confirmation);
     let mut host = H::new(false, true, 10, 1);
-    host.insert(Member::new("a", profile, Some(7), false));
+    host.insert(Member::new("a", profile, Some((7, "id")), false));
     host
 }
 

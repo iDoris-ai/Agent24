@@ -75,7 +75,7 @@ fn never_servable() -> H {
     assert!(binding.connect(clear).is_some());
     let profile = Profile::new(Slot::Bound(Box::new(binding)), true, None);
     let mut host = H::new(false, true, 10, 1);
-    host.insert(Member::new("a", profile, Some(7), false));
+    host.insert(Member::new("a", profile, Some((7, "id")), false));
     host
 }
 

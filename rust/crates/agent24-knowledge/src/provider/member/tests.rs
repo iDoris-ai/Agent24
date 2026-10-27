@@ -37,7 +37,7 @@ fn bound(of: &Of<T>, generation: u64) -> M {
         true,
     );
     let profile = Profile::new(Slot::Bound(Box::new(binding)), true, None);
-    let mut member = M::new(of.profile, profile, Some(of.binding), false);
+    let mut member = M::new(of.profile, profile, Some((of.binding, "id")), false);
     assert!(member.connect(false).is_some());
     member
 }
@@ -227,5 +227,10 @@ fn a_bound_slot_needs_its_binding_id() {
 #[should_panic]
 fn a_placeholder_has_no_binding_id() {
     let placeholder = Slot::Placeholder(Placeholder::new(None));
-    let _ = M::new("b", Profile::new(placeholder, true, None), Some(8), false);
+    let _ = M::new(
+        "b",
+        Profile::new(placeholder, true, None),
+        Some((8, "id")),
+        false,
+    );
 }
