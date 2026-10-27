@@ -1,6 +1,6 @@
 # v0.6.0-preview.20261028.1 完整用例验收清单
 
-- **日期**：2026-10-27 起草。**状态**：草稿，待发布负责人（David）确认。
+- **日期**：2026-10-27 起草，同日在发布候选上实跑。**状态**：已执行（结果见下），真机项由 jason 在发布后按 `MANUAL-TESTS-jason-v0.6.0-preview.md` 完成。
 - **依据**：#1293（`DOC-1-40`，AGENTS.md「release PR 的合并门槛」由 jason 真机验收改为完整用例验收，**合并前需 jason 同意，见 #1159**）。
 - **范围**：五条线合并后的 `v0.6.0-preview.20261028.1`。合入顺序：kernel → memory-p1 → documenting → weknora → idoris（iDoris 最后；截止 2026-10-28 12:00 Asia/Bangkok，赶不上则整条 iDoris 线移出本版，配对改下一个 preview，见 #1370）：
   - kernel：**已合并 main（`03bf1e17`）**。release PR #1280（`release/kernel-k1-r2-20261026`，迁移 store 0019–0026 + memory 0018）；
@@ -9,7 +9,7 @@
   - weknora：**已合并 main（KB-R1，#1396，`3659317d`）**。`ab/weknora`（KB-C1 / KB-HOST-01）；
   - 另：P-13（#1381，`bb3fb6d8`）已合并 main（store 0030）。
   - idoris（第五线，#1370）：release PR #1405 已合并，合并提交 `956e9009`（`ab/idoris`；Agent24 经 iDoris 网关调用本地模型，与 iDoris v0.3.1 联合发布）。ID-8 真机发现的提示问题由 #1420 修复。
-- **本清单没有实跑过**：起草时只读了各集成分支的代码、协议文件和测试，命令和断言依据代码核对，没有在五线合并后的 head 上执行（那个 head 还不存在）。第一次执行时，凡是 FAIL 先判断是用例写错还是产品错，用例写错就改本文件。「待核实」「缺口」两节列出起草时已经看到的疑点。
+- **2026-10-27 已实跑**：在发布候选 `21f484c6`（= #1405 head = 五线合并后的代码）上跑了第 6 节一键脚本，脚本原始分类：PASS 39、FAIL 0、KNOWN 1（M-14s，缺口 G-M1）、SKIP 18。18 条 SKIP 包括：4 条 BLOCKED（K-02 对应 G-K1，M-16 对应 G-M5，D-11/D-13 对应 G-D1/G-D2，处置见第 7 节缺口表）；9 条真机项；4 条是没加 `--idoris` 的 ID-1/2/3/5（iDoris 部分由 ID-8 真机覆盖）；1 条 X-07（脚本里标为手工）。X-07 另外手工执行并通过，所以执行记录合计 PASS 40。本节之后对 X-04、K-00、D-03 断言的收紧（见 PR #1421 第二轮）只做了反例核验，没有重跑完整脚本。原样脚本的 FAIL 全部是脚本自身问题，已修进第 6 节：D 系列取 `.data.job_id`、bash 3.2 下的 `case`、D-03 改导第二个 PDF、D-06 跳过页头、ID-4 的 `idk_` 桩 key 和 `/health` 字段、X-01/05 的 `seq`、X-04 的 memory 降级、M-09～11 内存盘挂载点、ID-2 先读后写。X-07 手工跑通过（documents 6→8，store 14→30，memory 17→20），**必须用隔离 HOME**：旧 RC 的 agent24d 不认 `AGENT24_DATA_DIR`。ID-8 另外在真机上用 CLI 跑通（见 #1370 / release PR）。
 
 ## 0. 规则对照（#1293）
 
@@ -93,7 +93,7 @@ a() { curl -s -m 20 -w '\n[%{http_code}]\n' -H "Authorization: Bearer $TOKEN" -H
 
 ### 4.1 kernel（#1280）
 
-**K-00 引用 #1294 的 25 个用例**（`docs/agent/K1-R2-ACCEPTANCE.md`，`scripts/k1-r2-accept.sh`，**不重写**，下表只做对应）。脚本取 `d50c319c`（#1314 合并点，已按 #1294 评审收紧）这一版：它只用 HTTP、`os install`、MCP、ACP，**不依赖 `agent24 runs/schedules`**（那些是 #1311/#1324，不在 #1280 里）；`ab/kernel` 现在的版本（K-77 之后）用到了发布 head 没有的 CLI，**不要用**。
+**K-00 引用 #1294 的 25 个用例**（`docs/agent/K1-R2-ACCEPTANCE.md`，`scripts/k1-r2-accept.sh`，**不重写**，下表只做对应）。脚本取 `d50c319c`（#1314 合并点，已按 #1294 评审收紧）这一版。**10-27 实跑校正**：① `--main` 要用 kernel 合并前的 main 二进制（`982725e2`，即 `03bf1e17` 的第一父提交），不是现在的 main，否则会出 8 个假 FAIL；② 借用脚本第 181 行 U3 的迁移期望值已过时，应改为 store `19..30` / memory `20`，改后结果是 25 passed、1 known（G1）、0 failed。该脚本的特点是：它只用 HTTP、`os install`、MCP、ACP，**不依赖 `agent24 runs/schedules`**（那些是 #1311/#1324，不在 #1280 里）；`ab/kernel` 现在的版本（K-77 之后）用到了发布 head 没有的 CLI，**不要用**。
 
 | 主题 | #1294 的用例 | 说明 |
 |---|---|---|
@@ -551,7 +551,7 @@ ic() { curl -s -m 20 -o $WORK/ir.json -w '%{http_code}' -H "Authorization: Beare
   sqlite3 agent24.db "SELECT group_concat(version) FROM (SELECT version FROM _sqlx_migrations WHERE success=1 ORDER BY version)"   # = 1,2,...,30
   sqlite3 memory.db  "SELECT group_concat(version) FROM (SELECT version FROM _sqlx_migrations WHERE success=1 ORDER BY version)"   # = 1,2,...,20
   ```
-  与 `seq -s, 1 30`、`seq -s, 1 20` 比较。
+  与 `seq 1 30 | paste -sd, -`、`seq 1 20 | paste -sd, -` 比较（macOS 的 `seq -s,` 末尾会多一个逗号）。
 - PR：#1280、#1341、#1298（改号）。执行方式：脚本。
 
 **X-02 升级后数据不丢，新功能可用**
@@ -566,7 +566,7 @@ ic() { curl -s -m 20 -o $WORK/ir.json -w '%{http_code}' -H "Authorization: Beare
 - 判定：daemon 起不来（退出码 ≠ 0）；日志 grep；哈希相等。
 - 说明：用户不能降级，release notes 要写明；与 #1294 的 D1 同一性质。执行方式：脚本。
 
-**X-04 开发机跑过旧编号的迁移：必须得到明确报错**
+**X-04 开发机跑过旧编号的迁移：store 拒绝启动，memory 降级关闭**
 - 背景：memory-p1 在 #1298 改了编号（memory 0018→0019、store 0021–0023→0027–0029），kernel 占用了 memory 0018 和 store 0019–0026。跑过 `ab/memory-p1` 旧开发版的机器，库里 memory 的 18 号和 store 的 21–23 号是**另一份迁移**。
 - 模拟：对 X-01 升级后的目录复制两份，分别执行
   ```sql
@@ -576,7 +576,8 @@ ic() { curl -s -m 20 -o $WORK/ir.json -w '%{http_code}' -H "Authorization: Beare
   UPDATE _sqlx_migrations SET description='run_message_origin_kinds', checksum=zeroblob(48) WHERE version=22;
   ```
 - 步骤：`$NEW/agent24d serve` 分别打开两份。
-- 期望：启动失败（退出码 ≠ 0）；日志里点名迁移号（形如 `migration 18 was previously applied but has been modified`，措辞以 sqlx 为准）；库的 dump 哈希不变，没有半截迁移。
+- 期望：**agent24.db（store）**：启动失败（退出码 ≠ 0），日志里点名迁移号（形如 `migration 22 was previously applied but has been modified`，措辞以 sqlx 为准）。**memory.db**：daemon 照常启动，但关闭记忆并打一条 WARN 点名迁移号（`server.rs` 的有意降级，10-27 实跑确认）。两份库的 dump 哈希都不变，没有半截迁移。
+- 已知问题（10-27 实跑）：memory 这一路用户只能看到记忆不可用，界面上没有明确报错。已写进 Release Notes 的「升级注意」；后续在 `/health` 暴露 degraded（REV-02）。
 - 判定：日志 `grep -E 'migration (18|22)'`；哈希相等。
 - 疑问：代码里没有为这种情况写专门的报错或重置指引（缺口 G-X1）。是否算「清楚的重置步骤」取决于 release notes 写不写下面 X-05 的步骤；这条用例的第二半（步骤是否清楚）靠 X-05 的执行结果判定。执行方式：脚本。
 
@@ -622,6 +623,10 @@ awk '/^```bash accept-v0.6.0.sh$/{f=1;next} /^```$/{f=0} f' docs/release/ACCEPTA
 
 # 一次完整执行（macOS；慢用例和内存盘用例各自开关）
 git show d50c319c9454ffa79f8ccd5de2b4b8955fab4a87:scripts/k1-r2-accept.sh > scripts/k1-r2-accept.sh && chmod +x scripts/k1-r2-accept.sh
+# U3 的迁移期望在借来的脚本里已过时（kernel 之后又进了 memory-p1 与 P-13）：改成本版的 store 19..30 / memory 20，并确认替换生效
+sed -i '' 's|"19,20,21,22,23,24,25,26/18"|"19,20,21,22,23,24,25,26,27,28,29,30/20"|' scripts/k1-r2-accept.sh
+grep -q '"19,20,21,22,23,24,25,26,27,28,29,30/20"' scripts/k1-r2-accept.sh || { echo "U3 patch failed" >&2; exit 1; }
+# --main 用 kernel 合并前的 main 二进制：git worktree add /tmp/main-pre-k1 982725e2 后构建（982725e2 = 03bf1e17^1）
 /tmp/accept-v0.6.0.sh --new "$NEW" --preview "$PREVIEW" --main "$MAIN" \
     --k1-script scripts/k1-r2-accept.sh --documents-pkg /tmp/documents-pkg \
     --work "$HOME/v060-accept" --slow --disk
@@ -918,25 +923,31 @@ run_Mdisk() {
   A=$(jr '[.assertions[] | select(.text | contains("茶"))][0].id // empty'); B=$(jr '[.assertions[] | select(.text | contains("咖啡"))][0].id // empty')
   stop_daemon
   RAMDEV=$(hdiutil attach -nomount ram://524288 | awk '{print $1}')
-  if [ -z "$RAMDEV" ] || ! diskutil erasevolume HFS+ a24acc "$RAMDEV" > /dev/null 2>&1; then
+  local RAMVOL="a24acc$$"
+  if [ -z "$RAMDEV" ] || ! diskutil erasevolume HFS+ "$RAMVOL" "$RAMDEV" > /dev/null 2>&1; then
     detach_disk; check M-09 "disk gate" skip "could not create the RAM disk"; return
   fi
-  cp -R "$WORK/seed" /Volumes/a24acc/data && cp -R "$WORK/seed.pk" /Volumes/a24acc/data.pk 2> /dev/null
-  start_daemon "$NEW" /Volumes/a24acc/data || { check M-09 "disk gate" fail "/Volumes/a24acc/data.serve.log"; detach_disk; return; }
+  # the real mount point of OUR device (a same-named volume would make it "/Volumes/<name> 1")
+  RAMMNT=$(diskutil info "$RAMDEV" 2> /dev/null | sed -n 's/^ *Mount Point: *//p')
+  if [ -z "$RAMMNT" ] || [ ! -d "$RAMMNT" ] || [ "$(df -k "$RAMMNT" | awk 'NR==2{print $1}' | sed 's/s[0-9]*$//')" != "$RAMDEV" ]; then
+    detach_disk; check M-09 "disk gate" fail "cannot resolve the mount point of $RAMDEV (got '$RAMMNT')"; return
+  fi
+  cp -R "$WORK/seed" "$RAMMNT/data" && cp -R "$WORK/seed.pk" "$RAMMNT/data.pk" 2> /dev/null
+  start_daemon "$NEW" "$RAMMNT/data" || { check M-09 "disk gate" fail "$RAMMNT/data.serve.log"; detach_disk; return; }
   chat "$(newsess)" "记住我喜欢乌龙茶"; local m1; m1=$(receipt)
   chat "$(newsess)" "你好"; local m2; m2=$(receipt)
   check M-09 "low free space: explicit remember failed, ordinary turn not_saved, both memory_disk_low" "$(is "$m1/$m2" "failed/memory_disk_low/not_saved/memory_disk_low")" "$m1 $m2"
   sleep 6
   api DELETE "/api/v1/memory/assertions/$A"; local e1=$CODE
-  local free; free=$(df -k /Volumes/a24acc | awk 'NR==2{print int($4 / 1024)}')
-  dd if=/dev/zero of=/Volumes/a24acc/fill bs=1m count=$((free - 8)) > /dev/null 2>&1
+  local free; free=$(df -k "$RAMMNT" | awk 'NR==2{print int($4 / 1024)}')
+  dd if=/dev/zero of="$RAMMNT/fill" bs=1m count=$((free - 8)) > /dev/null 2>&1
   sleep 6
   api DELETE "/api/v1/memory/assertions/$B"; local e2=$CODE e2c; e2c=$(jr '.error.code'); local leak; grep -q 'usr:local' "$WORK/r.json" && leak=leak || leak=clean
-  rm -f /Volumes/a24acc/fill; sleep 6
+  rm -f "$RAMMNT/fill"; sleep 6
   api DELETE "/api/v1/memory/assertions/$B"; local e3=$CODE
   check M-10 "retract floor: 204 with room, 507 memory_disk_low under 16 MiB, 204 after freeing" "$(is "$e1/$e2/$e2c/$leak/$e3" "204/507/memory_disk_low/clean/204")" "$e1/$e2/$e2c/$leak/$e3 (free ${free} MiB before filling)"
   sleep 3
-  local rej; rej=$(sqlite3 "/Volumes/a24acc/data/memory.db" "SELECT count(*) FROM mem_write_rejections WHERE code = 'memory_disk_low' AND rejected_kind = 'assertion.retracted' AND owner_kind = 'personal'")
+  local rej; rej=$(sqlite3 "$RAMMNT/data/memory.db" "SELECT count(*) FROM mem_write_rejections WHERE code = 'memory_disk_low' AND rejected_kind = 'assertion.retracted' AND owner_kind = 'personal'")
   check M-11 "the refused retract left a trace row" "$( [ "${rej:-0}" -ge 1 ] && echo ok || echo fail)" "rows $rej"
   stop_daemon; detach_disk
 }
@@ -965,13 +976,13 @@ run_D() {
   # D-02 import, CLI and the desktop's --host-stdin path
   cli documents import "$PDF" --json > "$WORK/d2.out" 2> "$WORK/d2.err"; local rc=$?
   local res; res=$(jq -c 'select(.type == "result")' "$WORK/d2.out" | tail -n 1)
-  local JOB; JOB=$(printf '%s' "$res" | jq -r '.data.id // empty')
+  local JOB; JOB=$(printf '%s' "$res" | jq -r '.data.job_id // empty')
   local acc; acc=$(printf '%s' "$res" | jq -r '.status')
   doc_wait "$JOB" succeeded 120; local waited=$?
   local DOC; DOC=$(cli documents job "$JOB" --json 2> /dev/null | jq -r 'select(.type == "result") | .data.document_id // empty' | tail -n 1)
-  jq -nc --arg base "http://127.0.0.1:$PORT" --arg token "$TOKEN" --arg path "$PDF" '{base: $base, token: $token, path: $path}' \
+  jq -nc --arg base "http://127.0.0.1:$PORT" --arg token "$TOKEN" --arg path "$(dirname "$(dirname "$PDF")")/s01-02-en-epa-boil-water/source.pdf" '{base: $base, token: $token, path: $path}' \
     | cli documents import --host-stdin --json > "$WORK/d2b.out" 2> /dev/null; local rc2=$?
-  local JOB2; JOB2=$(jq -c 'select(.type == "result")' "$WORK/d2b.out" | tail -n 1 | jq -r '.data.id // empty')
+  local JOB2; JOB2=$(jq -c 'select(.type == "result")' "$WORK/d2b.out" | tail -n 1 | jq -r '.data.job_id // empty')
   doc_wait "$JOB2" succeeded 120; local waited2=$?
   check D-02 "import via CLI and via the desktop's --host-stdin path, both succeed" "$( [ $rc = 0 ] && [ $rc2 = 0 ] && [ "$acc" = 202 ] && [ $waited = 0 ] && [ $waited2 = 0 ] && [ -n "$DOC" ] && echo ok || echo fail)" "rc $rc/$rc2; accepted $acc; jobs $JOB $JOB2; doc $DOC"
   # D-03 list and paging
@@ -979,8 +990,8 @@ run_D() {
   local has; has=$(jq --arg d "$DOC" '[.data.documents[] | select(.document_id == $d)] | length' "$WORK/d3.json")
   cli documents list --limit 1 --json | jq -c 'select(.type == "result")' > "$WORK/d3a.json"
   local cur; cur=$(jq -r '.data.next_cursor // empty' "$WORK/d3a.json"); local first; first=$(jq -r '.data.documents[0].document_id' "$WORK/d3a.json")
-  local second=""; [ -n "$cur" ] && second=$(cli documents list --limit 1 --cursor "$cur" --json | jq -r 'select(.type == "result") | .data.documents[0].document_id')
-  check D-03 "list holds the document; --limit 1 pages to a different one" "$( [ "$has" = 1 ] && [ "$(jq '.data.documents | length' "$WORK/d3a.json")" = 1 ] && [ -n "$cur" ] && [ -n "$second" ] && [ "$first" != "$second" ] && echo ok || echo fail)" "listed $has; page1 $first; page2 $second"
+  local second="" n2=""; if [ -n "$cur" ]; then cli documents list --limit 1 --cursor "$cur" --json | jq -c 'select(.type == "result")' > "$WORK/d3b.json"; n2=$(jq '.data.documents | length' "$WORK/d3b.json" 2> /dev/null); second=$(jq -r '.data.documents[0].document_id // empty' "$WORK/d3b.json" 2> /dev/null); fi
+  check D-03 "list holds the document; --limit 1 pages to a different one" "$( [ "$has" = 1 ] && [ "$(jq '.data.documents | length' "$WORK/d3a.json")" = 1 ] && [ -n "$cur" ] && [ "$n2" = 1 ] && [[ "$second" =~ ^[A-Za-z0-9_-]+$ ]] && [[ "$first" =~ ^[A-Za-z0-9_-]+$ ]] && [ "$first" != "$second" ] && echo ok || echo fail)" "listed $has; page1 $first; page2 ($n2) $second"
   # D-04 get
   cli documents get "$DOC" --json | jq -c 'select(.type == "result")' > "$WORK/d4.json"
   local sha; sha=$(shasum -a 256 "$PDF" | cut -d' ' -f1)
@@ -998,7 +1009,7 @@ run_D() {
 import sys
 for line in open(sys.argv[1], encoding='utf-8'):
     s = ''.join(line.split())
-    if s:
+    if s and not s.startswith('==='):
         print(s[:4]); break
 PY
 )
@@ -1029,7 +1040,7 @@ PY
   cli documents job "$EJ" --json | jq -c 'select(.type == "result")' > "$WORK/d8.json"
   local att; att=$(jq -r '.data.attempt' "$WORK/d8.json"); local st8; st8=$(jq -r '.data.status' "$WORK/d8.json")
   cli documents cancel "$EJ" --json > /dev/null 2>&1; doc_wait "$EJ" cancelled 90
-  check D-08 "extraction job: cancel -> cancelled, retry -> attempt 2 and waiting again" "$( [ "$sub" = 202 ] && [ $cx = 0 ] && [ "$att" = 2 ] && case $st8 in queued | running) true ;; *) false ;; esac && echo ok || echo fail)" "submit $sub; cancelled $cx; attempt $att; status after retry $st8"
+  check D-08 "extraction job: cancel -> cancelled, retry -> attempt 2 and waiting again" "$( [ "$sub" = 202 ] && [ $cx = 0 ] && [ "$att" = 2 ] && [[ $st8 == queued || $st8 == running ]] && echo ok || echo fail)" "submit $sub; cancelled $cx; attempt $att; status after retry $st8"
   # D-09 cooldown (slow)
   if [ "$SLOW" = 1 ]; then
     api POST "/api/v1/documents/documents/$DOC/extractions" '{"revision":1,"schema":{"fields":[{"key":"k2","description":"另一个字段","type":"text"}]}}'; local CJ; CJ=$(jr '.job_id // .id')
@@ -1096,7 +1107,7 @@ class H(BaseHTTPRequestHandler):
         for k, v in extra: self.send_header(k, v)
         self.send_header('content-length', str(len(b))); self.end_headers(); self.wfile.write(b)
     def do_GET(self):
-        self._send({"service": "idoris", "version": "0.3.1", "contract_version": "1.0.1", "status": "ok"})
+        self._send({"service": "idoris", "version": "0.3.1", "contract_version": "1.0.1", "status": "ok", "instance_id": "stub", "dev_no_key_enabled": False})
     def do_POST(self):
         n = int(self.headers.get('content-length') or 0)
         body = self.rfile.read(n).decode()
@@ -1113,7 +1124,7 @@ PY
   python3 -I "$WORK/idoris-stub.py" "$IPORT" "$WORK/idoris-mode" "$WORK/idoris-stub.log" &
   local STUB=$!
   for _ in $(seq 1 20); do curl -s -m 1 "http://127.0.0.1:$IPORT/health" > /dev/null && break; sleep 0.3; done
-  start_daemon "$NEW" "$WORK/i4" IDORIS_URL="http://127.0.0.1:$IPORT" IDORIS_API_KEY=stub-key \
+  start_daemon "$NEW" "$WORK/i4" IDORIS_URL="http://127.0.0.1:$IPORT" IDORIS_API_KEY=idk_stub-key \
     || { check ID-4 "daemon starts with IDORIS_URL (stub)" fail "$WORK/i4.serve.log"; kill "$STUB" 2> /dev/null; return; }
   S=$(newsess)
   chat "$S" "ping"
@@ -1205,7 +1216,8 @@ PY
   python3 -I - "$card" <<'PY'
 import sys
 p = sys.argv[1]
-open(p, 'w').write(''.join(l for l in open(p) if l.strip() != 'daily: fixture-chat'))
+lines = open(p).readlines()
+open(p, 'w').write(''.join(l for l in lines if l.strip() != 'daily: fixture-chat'))
 PY
   if iserve IDORIS_X=1; then
     local n0 n1 c6; n0=$(wc -l < "$WORK/fb.log"); c6=$(ic "$KEY" idoris/daily); n1=$(wc -l < "$WORK/fb.log")
@@ -1241,7 +1253,7 @@ run_X() {
   start_daemon "$NEW" "$WORK/x" || { check X-01 "new daemon opens the preview data" fail "$WORK/x.serve.log"; return; }
   local sv mvr; sv=$(vers "$WORK/x/agent24.db"); mvr=$(vers "$WORK/x/memory.db")
   api GET /api/v1/health; local h=$CODE
-  check X-01 "both libraries migrate in order: store 1..30, memory 1..20" "$( [ "$h" = 200 ] && [ "$sv" = "$(seq -s, 1 30)" ] && [ "$mvr" = "$(seq -s, 1 20)" ] && echo ok || echo fail)" "before $pv; after store ${sv##*,} memory ${mvr##*,}; health $h"
+  check X-01 "both libraries migrate in order: store 1..30, memory 1..20" "$( [ "$h" = 200 ] && [ "$sv" = "$(seq 1 30 | paste -sd, -)" ] && [ "$mvr" = "$(seq 1 20 | paste -sd, -)" ] && echo ok || echo fail)" "before $pv; after store ${sv##*,} memory ${mvr##*,}; health $h"
   api GET '/api/v1/memory/assertions?limit=50'
   local same; same=$(jq --arg id "$AID" --arg t "$TEXT" '[.assertions[] | select(.id == $id and .text == $t)] | length' "$WORK/r.json")
   api GET "/api/v1/sessions/$S"; local sc=$CODE
@@ -1264,10 +1276,21 @@ run_X() {
     cp -R "$WORK/x" "$d"; rm -f "$d/daemon.json"
     sqlite3 "$d/$file" "UPDATE _sqlx_migrations SET description = 'old_numbering', checksum = zeroblob(48) WHERE version = $ver"
     before=$(dump_hash "$d/$file")
-    if start_daemon "$NEW" "$d"; then opened=yes; stop_daemon; else opened=no; fi
+    local hc="" mc="" mcode=""
+    if start_daemon "$NEW" "$d"; then
+      opened=yes
+      api GET /api/v1/health; hc=$CODE
+      api GET /api/v1/memory/assertions; mc=$CODE; mcode=$(jr '.error.code // empty')
+      stop_daemon
+    else opened=no; fi
     after=$(dump_hash "$d/$file")
     line=$(grep -m1 -E "migration $ver" "$d.serve.log" | cut -c1-140)
-    check "X-04/$ver" "old numbering in $file: start is refused, the error names migration $ver, library unchanged" "$( [ $opened = no ] && [ -n "$line" ] && [ "$before" = "$after" ] && echo ok || echo fail)" "opened $opened; '$line'; unchanged: $( [ "$before" = "$after" ] && echo yes || echo no)"
+    if [ $file = memory.db ]; then
+      # memory: deliberate degrade (server.rs) -- daemon serves, memory is off, WARN names the migration
+      check "X-04/$ver" "old numbering in $file: daemon starts with memory off (health 200, memory 503 memory_unavailable), WARN names migration $ver, library unchanged" "$( [ $opened = yes ] && [ "$hc" = 200 ] && [ "$mc" = 503 ] && [ "$mcode" = memory_unavailable ] && [ -n "$line" ] && [ "$before" = "$after" ] && echo ok || echo fail)" "opened $opened; health $hc; memory $mc $mcode; '$line'; unchanged: $( [ "$before" = "$after" ] && echo yes || echo no)"
+    else
+      check "X-04/$ver" "old numbering in $file: start is refused, the error names migration $ver, library unchanged" "$( [ $opened = no ] && [ -n "$line" ] && [ "$before" = "$after" ] && echo ok || echo fail)" "opened $opened; '$line'; unchanged: $( [ "$before" = "$after" ] && echo yes || echo no)"
+    fi
   done
   # X-05 the documented reset
   local d="$WORK/x-old-18" bk="$WORK/x-old-18.backup"
@@ -1277,7 +1300,7 @@ run_X() {
     api GET /api/v1/health; local rh=$CODE
     local rstore rmem; rstore=$(vers "$d/agent24.db"); rmem=$(vers "$d/memory.db")
     stop_daemon
-    check X-05 "reset (move the data directory aside, restart): healthy, 30/20, backup untouched" "$( [ "$rh" = 200 ] && [ "$rstore" = "$(seq -s, 1 30)" ] && [ "$rmem" = "$(seq -s, 1 20)" ] && [ "$(dump_hash "$bk/memory.db")" = "$keep" ] && echo ok || echo fail)" "health $rh; store ${rstore##*,}; memory ${rmem##*,}"
+    check X-05 "reset (move the data directory aside, restart): healthy, 30/20, backup untouched" "$( [ "$rh" = 200 ] && [ "$rstore" = "$(seq 1 30 | paste -sd, -)" ] && [ "$rmem" = "$(seq 1 20 | paste -sd, -)" ] && [ "$(dump_hash "$bk/memory.db")" = "$keep" ] && echo ok || echo fail)" "health $rh; store ${rstore##*,}; memory ${rmem##*,}"
   else
     check X-05 "reset steps" fail "$d.serve.log"
   fi

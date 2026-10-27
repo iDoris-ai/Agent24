@@ -36,7 +36,7 @@ Linux、Intel mac 不在本次预发布范围。dmg 文件名以实际构建输�
 - [ ] 迁移目录连续：store `0001–0030`、memory `0001–0020`、documents `0001–0008`，且
       `agent24d/knowledge_migrations/0001_log.sql` 存在。
       ```bash
-      ls rust/crates/agent24-store/migrations | tail -3   # 0027–0029
+      ls rust/crates/agent24-store/migrations | tail -3   # 0028–0030
       ls rust/crates/agent24-memory/migrations | tail -2  # 0019–0020
       ls rust/apps/agent24-documents/migrations | tail -2 # 0007–0008
       ```
@@ -122,7 +122,7 @@ scripts/verify-mac-signing.sh <dmg>
 - [ ] 该文件已存在于待发布的 HEAD 上，且逐条跑过：全新数据目录、真实 daemon、通过 CLI 按用户操作顺序走。
 - [ ] 跑过的用例、命令和结果贴进发布 PR 正文；缺口（用户看不到的改动、纯界面展示）逐项写明。
 - [ ] **升级路径**至少跑一次：用 `v0.5.1-preview.20261016.2` 留下的真实库（schema 17）复制到干净 HOME 启动，
-      不设 `AGENT24_DATA_DIR`，`/api/v1/health` 返回 200，迁移走到 store `0029` / memory `0020`。
+      不设 `AGENT24_DATA_DIR`，`/api/v1/health` 返回 200，迁移走到 store `0030` / memory `0020`。
 - [ ] 验收机若跑过 `ab/kernel` 或 `ab/memory-p1` 的开发版，先清库或用 `AGENT24_DATA_DIR` 隔开（见 CHANGELOG
       「升级注意」）。
 
