@@ -11,6 +11,7 @@ import {
   readExternalDaemonState,
   BackendManager,
   getBackendEndpoint,
+  daemonCliEndpoint,
   daemonConnection,
   selectedAuthMode,
   type DaemonAuthMode,
@@ -371,6 +372,7 @@ describe('daemon credential stays out of the endpoint (KB-HOST-01 PR-A1)', () =>
     const manager = await startWith({ port: 4100, token: 'secret' })
     expect(getBackendEndpoint()).toEqual({ port: 4100 })
     expect(daemonConnection()).toEqual({ port: 4100, authHeaders: { Authorization: 'Bearer secret' } })
+    expect(daemonCliEndpoint()).toEqual({ port: 4100, token: 'secret' })
     manager.stop()
   })
 
@@ -379,6 +381,7 @@ describe('daemon credential stays out of the endpoint (KB-HOST-01 PR-A1)', () =>
     const manager = await startWith({ port: 4101 })
     expect(getBackendEndpoint()).toEqual({ port: 4101 })
     expect(daemonConnection()).toBeNull()
+    expect(daemonCliEndpoint()).toBeNull()
     manager.stop()
   })
 
@@ -454,6 +457,7 @@ describe('daemon credential stays out of the endpoint (KB-HOST-01 PR-A1)', () =>
     process.env['AGENT24_BACKEND'] = 'node'
     const manager = await startWith({ port: 8765 })
     expect(daemonConnection()).toEqual({ port: 8765, authHeaders: {} })
+    expect(daemonCliEndpoint()).toEqual({ port: 8765, token: '' })
     manager.stop()
   })
 

@@ -31,6 +31,7 @@ const endpoint = { port: 0, token: 'daemon-secret' }
 vi.mock('../backend-manager', () => ({
   getBackendEndpoint: () => ({ port: endpoint.port }),
   daemonConnection: () => ({ port: endpoint.port, authHeaders: { Authorization: `Bearer ${endpoint.token}` } }),
+  daemonCliEndpoint: () => ({ port: endpoint.port, token: endpoint.token }),
 }))
 
 import { IpcChannels } from '../../shared/ipc-types'

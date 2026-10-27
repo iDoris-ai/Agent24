@@ -158,9 +158,11 @@ jobs:
             exit 1
           fi
 
-      - name: Build agent24d (release)
+      # agent24 ships too: the desktop's document import runs
+      # `agent24 documents import` (apps/desktop/src/main/documents-import.ts).
+      - name: Build agent24d and agent24 (release)
         working-directory: rust
-        run: cargo build --release --bin agent24d
+        run: cargo build --release --bin agent24d --bin agent24
 
       - name: Build node-daemon
         run: pnpm --filter @agent24/node-daemon build
@@ -430,7 +432,7 @@ jobs:
           kill "$SIDECAR_PID" 2>/dev/null || true
           kill "$LAUNCHER_PID" 2>/dev/null || true
 
-      - name: Smoke test — deb installs and contains agent24d
+      - name: Smoke test — deb installs and contains agent24d and agent24
         working-directory: apps/desktop
         shell: bash
         run: |
@@ -443,6 +445,11 @@ jobs:
           dpkg -L "$PKG" | tee "$RUNNER_TEMP/deb-contents.txt"
           if ! grep -q 'agent24d$' "$RUNNER_TEMP/deb-contents.txt"; then
             echo "::error::agent24d binary not found in installed deb contents"
+            sudo dpkg -r "$PKG" || true
+            exit 1
+          fi
+          if ! grep -q '/backend/agent24$' "$RUNNER_TEMP/deb-contents.txt"; then
+            echo "::error::agent24 binary not found in installed deb contents"
             sudo dpkg -r "$PKG" || true
             exit 1
           fi
