@@ -54,6 +54,17 @@ beforeAll(async () => {
         res.end(JSON.stringify({
           id: 'ap_1', kind: 'exec', summary: 'REAL: rm -rf /tmp/real', run_id: 'run_real',
           payload: { argv: ['rm', '-rf', '/tmp/real'] }, status: 'pending',
+          available_decisions: ['approve', 'approve_for_session', 'deny', 'abort'],
+        }))
+      } else if (req.method === 'GET' && req.url === '/api/v1/approvals/ap_tgt') {
+        res.end(JSON.stringify({
+          id: 'ap_tgt', kind: 'network', summary: 'external tool', run_id: 'r', payload: {}, status: 'pending',
+          available_decisions: ['approve', 'approve_for_target', 'deny', 'abort'],
+        }))
+      } else if (req.method === 'GET' && req.url === '/api/v1/approvals/ap_long') {
+        res.end(JSON.stringify({
+          id: 'ap_long', kind: 'exec', summary: 'S'.repeat(500), run_id: 'r',
+          payload: { cmd: 'P'.repeat(2000) }, status: 'pending',
         }))
       } else if (req.method === 'GET' && req.url === '/api/v1/approvals/ap_done') {
         res.end(JSON.stringify({ id: 'ap_done', kind: 'exec', summary: 's', status: 'approved' }))
@@ -155,6 +166,27 @@ describe('A1 backendProxy allowlist', () => {
       expect(opts.detail).toContain('/tmp/real')
       expect(opts.detail).toContain('页面备注（仅供参考）：harmless readme tweak')
     })
+    it('approve_for_target (offered by the daemon) goes through: one dialog, one POST', async () => {
+      showMessageBox.mockResolvedValue({ response: 0 })
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_tgt', { type: 'approve_for_target' })
+      expect(res.ok).toBe(true)
+      expect(showMessageBox).toHaveBeenCalledTimes(1)
+      expect(seen).toHaveLength(1)
+      expect(JSON.parse(seen[0]!.body)).toEqual({ type: 'approve_for_target' })
+    })
+    it('a decision the record does not offer is refused before any dialog', async () => {
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve_for_target' })
+      expect(res.data.error.code).toBe('invalid_request')
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(seen).toHaveLength(0)
+    })
+    it('long fields are cut with an explicit truncation note giving the full length', async () => {
+      showMessageBox.mockResolvedValue({ response: 1 })
+      await call(IpcChannels.ApprovalDecide, 'ap_long', { type: 'approve' })
+      const opts = showMessageBox.mock.calls[0]!.at(-1) as { detail: string }
+      expect(opts.detail).toContain('（已截断，共 500 字符）')
+      expect(opts.detail).toMatch(/（已截断，共 \d{4} 字符）/)
+    })
     it('daemon 404 -> refused without any dialog or POST', async () => {
       const res = await call(IpcChannels.ApprovalDecide, 'ap_missing', { type: 'approve' })
       expect(res.ok).toBe(false)
@@ -194,6 +226,8 @@ describe('A1 backendProxy allowlist', () => {
       expect(opts.message).toContain('sin90')
       expect(opts.message).toContain('停用 改为 启用')
       expect(opts.detail).toContain('0.5.0')
+      expect(opts.detail).toContain('立即生效')
+      expect(opts.detail).not.toContain('重启后生效')
     })
     it('a module the daemon does not list is refused without a dialog', async () => {
       const res = await call(IpcChannels.OsModuleSetEnabled, 'ghost', true)
@@ -284,6 +318,12 @@ describe('A4 oMLX IPC hardening', () => {
     expect(res.ok).toBe(false)
     expect(res.error).toMatch(/invalid url/)
   })
+  it('OmlxModels with a CRLF api key resolves forbidden instead of throwing', async () => {
+    const res = await call(IpcChannels.OmlxModels, `http://127.0.0.1:${endpoint.port}`, 'k\r\nX-Evil: 1')
+    expect(res.ok).toBe(false)
+    expect(res.error).toMatch(/forbidden/)
+    expect(seen).toHaveLength(0)
+  })
   it('OmlxModels accepts loopback and still reaches it with the key', async () => {
     const res = await call(IpcChannels.OmlxModels, `http://127.0.0.1:${endpoint.port}`, 'k')
     expect(res.ok).toBe(true)
@@ -315,6 +355,19 @@ describe('A4 oMLX IPC hardening', () => {
     } catch { /* grep exit 1 = no match */ }
     // This test file builds the needle by concatenation, so it never matches itself.
     expect(out).toBe('')
+  })
+})
+
+describe('ModulesEnable/Disable id validation', () => {
+  it.each(['..', 'a/../b', '', 'x y', '.'])('%j is refused without touching the daemon', async (id) => {
+    for (const ch of [IpcChannels.ModulesEnable, IpcChannels.ModulesDisable]) {
+      expect(await call(ch, id)).toEqual({ ok: false })
+    }
+    expect(seen).toHaveLength(0)
+  })
+  it('an ordinary id is forwarded', async () => {
+    await call(IpcChannels.ModulesEnable, 'hello-1.2')
+    expect(seen[0]?.url).toBe('/api/modules/hello-1.2/enable')
   })
 })
 

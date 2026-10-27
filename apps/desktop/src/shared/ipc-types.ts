@@ -79,10 +79,10 @@ export interface BackendProxyResponse {
   data: unknown
 }
 
-/** A1: the decisions `POST /api/v1/approvals/{id}` accepts. */
-export const APPROVAL_DECISION_TYPES = ['approve', 'approve_for_session', 'deny', 'abort'] as const
+/** A1: a decision for `POST /api/v1/approvals/{id}`. The daemon offers the valid
+ *  set per approval (`available_decisions`), so `type` is an open string here. */
 export interface ApprovalDecisionInput {
-  type: (typeof APPROVAL_DECISION_TYPES)[number]
+  type: string
   reason?: string
 }
 

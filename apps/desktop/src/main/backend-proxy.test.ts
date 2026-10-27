@@ -201,6 +201,18 @@ describe('A2 proxyRequest', () => {
     await new Promise((r) => setTimeout(r, 120))
   })
 
+  it('a body JSON cannot serialize (BigInt, cycle) resolves invalid_request instead of rejecting', async () => {
+    const ep = await serve((_q, res) => res.end('{}'))
+    const cyc: Record<string, unknown> = {}
+    cyc['self'] = cyc
+    for (const body of [{ x: 1n }, cyc]) {
+      const out = await proxyRequest(ep, { method: 'POST', path: '/x', body })
+      expect(out.ok).toBe(false)
+      expect(out.status).toBe(400)
+      expect((out.data as { error: { code: string } }).error.code).toBe('invalid_request')
+    }
+  })
+
   it('sends the bearer token and JSON body', async () => {
     let seen: { auth?: string; body: string } = { body: '' }
     const ep = await serve((req, res) => {

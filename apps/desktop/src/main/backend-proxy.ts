@@ -19,7 +19,7 @@ export const CHAT_TIMEOUT_MS = 10 * 60_000
 export interface ProxyRoute {
   method: HttpMethod
   /** Same syntax as the daemon's axum `MatchedPath` templates in
-   *  `rust/apps/agent24d/src/capabilities/route_policy.rs` (POLICIES): one
+   *  `rust/apps/agent24d/src/capabilities/route_policy.rs` (POLICIES; that file lives on the `ab/core` branch and is not in main yet): one
    *  `{param}` = exactly one non-empty path segment. */
   template: string
   timeoutMs?: number
@@ -58,29 +58,34 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('POST', '/api/v1/runs/{id}/cancel'),
   // schedules
   r('GET', '/api/v1/schedules'),
-  r('POST', '/api/v1/schedules'),
-  r('PATCH', '/api/v1/schedules/{id}'),
-  r('DELETE', '/api/v1/schedules/{id}'),
-  r('POST', '/api/v1/schedules/{id}/run_now'),
+  // ELEVATED in route_policy.rs but deliberately still proxied (rows marked
+  // [E] below): these are routine, user-initiated page actions, and a native
+  // dialog per click would make the schedule / communication pages unusable.
+  // Presence proof for elevated operations is done once, from the policy's
+  // level metadata, by CORE-2d + CORE-7c; these rows are closed there.
+  r('POST', '/api/v1/schedules'), // [E]
+  r('PATCH', '/api/v1/schedules/{id}'), // [E]
+  r('DELETE', '/api/v1/schedules/{id}'), // [E]
+  r('POST', '/api/v1/schedules/{id}/run_now'), // [E]
   // approvals: read only (the decision goes through ApprovalDecide)
   r('GET', '/api/v1/approvals'),
   // domain OS / attached modules: read, plus module commands (speak, stop_playback)
   r('GET', '/api/v1/os'),
-  r('POST', '/api/v1/os/{name}/commands/{command}'),
+  r('POST', '/api/v1/os/{name}/commands/{command}'), // [E]
   r('GET', '/api/v1/attached'),
   // memory
   r('GET', '/api/v1/memory/assertions'),
   r('DELETE', '/api/v1/memory/assertions/{id}'),
   r('GET', '/api/v1/memory/settings'),
-  r('PUT', '/api/v1/memory/settings'),
+  r('PUT', '/api/v1/memory/settings'), // [E]
   // communication (Hyphae)
   r('GET', '/api/v1/comm/identity'),
   r('GET', '/api/v1/comm/contact'),
   r('GET', '/api/v1/comm/relay'),
   r('GET', '/api/v1/comm/daemon'),
-  r('POST', '/api/v1/comm/daemon/start'),
-  r('POST', '/api/v1/comm/daemon/stop'),
-  r('POST', '/api/v1/comm/unlock'),
+  r('POST', '/api/v1/comm/daemon/start'), // [E]
+  r('POST', '/api/v1/comm/daemon/stop'), // [E]
+  r('POST', '/api/v1/comm/unlock'), // [E]
 ]
 
 /** A path segment value a `{param}` may bind: no traversal, no separators,
@@ -133,9 +138,15 @@ export function isAllowedProxyRoute(method: string, requestPath: string): boolea
 }
 
 export type ProxyErrorCode =
-  'forbidden' | 'timeout' | 'payload_too_large' | 'proxy_failed' | 'backend_not_ready'
+  | 'invalid_request'
+  | 'forbidden'
+  | 'timeout'
+  | 'payload_too_large'
+  | 'proxy_failed'
+  | 'backend_not_ready'
 
 const ERROR_STATUS: Record<ProxyErrorCode, number> = {
+  invalid_request: 400,
   forbidden: 403,
   timeout: 504,
   payload_too_large: 502,
@@ -168,7 +179,19 @@ export function proxyRequest(
   const timeoutMs = opts.timeoutMs ?? PROXY_TIMEOUT_MS
   const maxBytes = opts.maxBytes ?? PROXY_MAX_BODY_BYTES
   return new Promise((resolve) => {
-    const body = req.body !== undefined ? JSON.stringify(req.body) : undefined
+    let body: string | undefined
+    try {
+      body = req.body !== undefined ? JSON.stringify(req.body) : undefined
+    } catch (err) {
+      // BigInt, cycles, throwing toJSON: refuse before any timer or socket exists.
+      resolve(
+        proxyError(
+          'invalid_request',
+          `request body is not JSON-serializable: ${(err as Error).message}`,
+        ),
+      )
+      return
+    }
     let settled = false
     // Hard overall deadline (a daemon dripping one byte at a time would defeat
     // a socket-idle timeout alone). `onTimeout` is hoisted; it only runs later.

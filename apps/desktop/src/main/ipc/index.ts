@@ -11,7 +11,7 @@ import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
 import type { IpcGuard } from './guard'
 import { documentsCall, httpSender } from '../documents'
 import { importFile } from '../documents-import'
-import { APPROVAL_DECISION_TYPES, IpcChannels } from '../../shared/ipc-types'
+import { IpcChannels } from '../../shared/ipc-types'
 import type {
   BackendEndpointResult,
   BackendProxyRequest,
@@ -83,6 +83,7 @@ function fetchOmlxModels(url: unknown, apiKey: string): Promise<string[]> {
     if (!base) { resolve([]); return }
     const headers: Record<string, string> = { 'Accept': 'application/json' }
     if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
+    try {
     loopbackRequest(
       base,
       '/v1/models',
@@ -99,6 +100,7 @@ function fetchOmlxModels(url: unknown, apiKey: string): Promise<string[]> {
       },
       () => resolve([]),
     )
+    } catch { resolve([]) }
   })
 }
 
@@ -159,7 +161,14 @@ async function confirmNative(event: IpcMainInvokeEvent, message: string, detail:
   }
 }
 
-const clip = (text: string, max: number): string => (text.length > max ? `${text.slice(0, max)}…` : text)
+/** Shortens text for the native dialog, and says so (with the full length) when it did. */
+const clip = (text: string, max: number): string =>
+  text.length > max ? `${text.slice(0, max)}…（已截断，共 ${text.length} 字符）` : text
+
+// eslint-disable-next-line no-control-regex
+const hasControlChars = (text: string): boolean => /[\u0000-\u001f\u007f]/.test(text)
+const SAFE_MODULE_ID = /^[A-Za-z0-9._-]+$/
+const DECISION_SHAPE = /^[a-z_]{1,64}$/
 
 // Sensitive IPCs share one in-flight slot: a script that fires them in a loop
 // must not be able to stack native dialogs. Busy => immediate refusal, no queue.
@@ -199,6 +208,7 @@ export function registerIpcHandlers(options: {
   // oMLX: list models from given url+key (url must be loopback http(s))
   handle(IpcChannels.OmlxModels, async (_event, url: unknown, apiKey: unknown): Promise<OmlxModelsResult> => {
     if (!parseLoopbackUrl(url)) return { ok: false, models: [], error: 'invalid url (loopback http/https only)' }
+    if (typeof apiKey === 'string' && hasControlChars(apiKey)) return { ok: false, models: [], error: 'forbidden: invalid api key' }
     const models = await fetchOmlxModels(url, typeof apiKey === 'string' ? apiKey : '')
     return models.length > 0 ? { ok: true, models } : { ok: false, models: [], error: 'no response or no models' }
   })
@@ -225,6 +235,7 @@ export function registerIpcHandlers(options: {
     const base = parseLoopbackUrl(url)
     if (!base) return { model: modelId, ok: false, error: 'invalid url (loopback http/https only)' }
     const key = typeof apiKey === 'string' ? apiKey : ''
+    if (hasControlChars(key)) return { model: modelId, ok: false, error: 'forbidden: invalid api key' }
     return new Promise((resolve) => {
       const body = JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 })
       const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(body)) }
@@ -263,13 +274,13 @@ export function registerIpcHandlers(options: {
 
   // modules:enable / modules:disable — toggle module state via backend
   handle(IpcChannels.ModulesEnable, async (_event, id: unknown): Promise<{ ok: boolean }> => {
-    if (typeof id !== 'string') return { ok: false }
+    if (typeof id !== 'string' || !SAFE_MODULE_ID.test(id) || id === '.' || id.includes('..')) return { ok: false }
     const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/enable` })
     return { ok: res.ok }
   })
 
   handle(IpcChannels.ModulesDisable, async (_event, id: unknown): Promise<{ ok: boolean }> => {
-    if (typeof id !== 'string') return { ok: false }
+    if (typeof id !== 'string' || !SAFE_MODULE_ID.test(id) || id === '.' || id.includes('..')) return { ok: false }
     const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/disable` })
     return { ok: res.ok }
   })
@@ -351,7 +362,9 @@ export function registerIpcHandlers(options: {
     exclusive(async () => {
       const d = decision as { type?: unknown; reason?: unknown } | null
       if (typeof id !== 'string' || !SAFE_ID.test(id) || id === '.' || id === '..') return invalidRequest('invalid approval id')
-      if (typeof d !== 'object' || d === null || !(APPROVAL_DECISION_TYPES as readonly unknown[]).includes(d.type)) {
+      // Shape only: which decisions are valid is the daemon's call (it offers
+      // approve_for_target etc. per approval); checked against the record below.
+      if (typeof d !== 'object' || d === null || typeof d.type !== 'string' || !DECISION_SHAPE.test(d.type)) {
         return invalidRequest('invalid decision')
       }
       if (d.reason !== undefined && typeof d.reason !== 'string') return invalidRequest('invalid reason')
@@ -360,9 +373,15 @@ export function registerIpcHandlers(options: {
       if (!rec.ok || typeof rec.data !== 'object' || rec.data === null) {
         return { ok: false, status: rec.status === 404 ? 404 : 502, data: { error: { code: 'approval_unavailable', message: '读不到该审批的真实记录，已拒绝操作' } } }
       }
-      const a = rec.data as { kind?: unknown; summary?: unknown; payload?: unknown; run_id?: unknown; status?: unknown }
+      const a = rec.data as {
+        kind?: unknown; summary?: unknown; payload?: unknown; run_id?: unknown; status?: unknown; available_decisions?: unknown
+      }
       if (a.status !== undefined && a.status !== 'pending') {
         return { ok: false, status: 409, data: { error: { code: 'not_pending', message: `审批已处于 ${String(a.status)} 状态` } } }
+      }
+      // The record's own decision list wins when it has one.
+      if (Array.isArray(a.available_decisions) && !a.available_decisions.includes(d.type)) {
+        return invalidRequest('decision not offered for this approval')
       }
       const label: Record<string, string> = { approve: '批准', approve_for_session: '本会话内一律批准', deny: '拒绝', abort: '中止' }
       const payload = clip(JSON.stringify(a.payload ?? {}), 600)
@@ -374,7 +393,7 @@ export function registerIpcHandlers(options: {
         typeof d.reason === 'string' && d.reason ? `页面备注（仅供参考）：${clip(d.reason, 200)}` : '',
         '此决定会立即生效，且可能无法撤销。',
       ].filter(Boolean).join('\n')
-      const ok = await confirmNative(event, `确认对审批 ${id} 做出「${label[d.type as string]}」决定？`, detail)
+      const ok = await confirmNative(event, `确认对审批 ${id} 做出「${label[d.type as string] ?? d.type}」决定？`, detail)
       if (!ok) return cancelled()
       return proxyToBackend({
         method: 'POST',
@@ -399,7 +418,7 @@ export function registerIpcHandlers(options: {
       const ok = await confirmNative(
         event,
         `确认将领域模块「${name}」${mod.enabled === true ? '由 启用 改为' : mod.enabled === false ? '由 停用 改为' : '改为'} ${enabled ? '启用' : '停用'}？`,
-        `版本：${clip(String(mod.version ?? '?'), 40)}\n变更写入配置，守护进程重启后生效。`,
+        `版本：${clip(String(mod.version ?? '?'), 40)}\n立即生效：停用会立刻撤销该模块的 consent 并停止它。`,
       )
       if (!ok) return cancelled()
       return proxyToBackend({ method: 'PATCH', path: `/api/v1/os/${encodeURIComponent(name)}`, body: { enabled } })
