@@ -16,6 +16,9 @@ pub const SOCKET_NAME: &str = "enroll.sock";
 /// One JSON line per frame, at most this many bytes (D5).
 const MAX_FRAME: u64 = 16 * 1024;
 const FRAME_DEADLINE: Duration = Duration::from_secs(5);
+/// Connections served at once; further ones are closed unanswered so a slow
+/// or hostile peer cannot pile up tasks or exhaust descriptors.
+const MAX_CONCURRENT: usize = 8;
 const UNAVAILABLE: &[u8] =
     b"{\"error\":\"enroll_unavailable\",\"reason\":\"2c_not_implemented\"}\n";
 
@@ -39,6 +42,7 @@ impl EnrollEndpoint {
         let Some(listener) = self.listener.take() else {
             return;
         };
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT));
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -46,15 +50,26 @@ impl EnrollEndpoint {
                     () = stop.cancelled() => break,
                     accepted = listener.accept() => match accepted {
                         Ok((stream, _)) => {
+                            let Ok(permit) = permits.clone().try_acquire_owned() else {
+                                continue; // over the cap: drop = close
+                            };
                             let stop = stop.clone();
                             tokio::spawn(async move {
+                                let _permit = permit;
                                 tokio::select! {
                                     () = stop.cancelled() => {}
                                     () = answer(stream) => {}
                                 }
                             });
                         }
-                        Err(err) => tracing::warn!("enroll endpoint accept failed: {err}"),
+                        Err(err) => {
+                            // e.g. EMFILE: back off instead of spinning.
+                            tracing::warn!("enroll endpoint accept failed: {err}");
+                            tokio::select! {
+                                () = stop.cancelled() => break,
+                                () = tokio::time::sleep(Duration::from_millis(200)) => {}
+                            }
+                        }
                     },
                 }
             }
@@ -90,25 +105,30 @@ async fn answer(stream: tokio::net::UnixStream) {
 }
 
 /// Verify `dir` is a real directory of ours and make it 0700. Refuses a
-/// symlink or a directory owned by someone else; tightens the mode (the data
-/// directory is ours and `daemon.json` writing already forces 0700).
+/// symlink or a directory owned by someone else. The directory is opened once
+/// (`O_NOFOLLOW | O_DIRECTORY`) and checked and chmod-ed through that fd, so
+/// nothing can be swapped in between the check and the chmod.
 #[cfg(unix)]
 fn private_dir(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let meta = std::fs::symlink_metadata(dir)?;
-    if !meta.is_dir() {
-        return Err(io::Error::other(format!(
-            "{} is not a directory (or is a symlink)",
-            dir.display()
-        )));
-    }
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)
+        .map_err(|err| {
+            io::Error::other(format!(
+                "{} is not a plain directory (or is a symlink): {err}",
+                dir.display()
+            ))
+        })?;
+    let meta = handle.metadata()?;
     if meta.uid() != rustix::process::geteuid().as_raw() {
         return Err(io::Error::other(format!(
             "{} is not owned by this user",
             dir.display()
         )));
     }
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    handle.set_permissions(std::fs::Permissions::from_mode(0o700))
 }
 
 /// Bind `<dir>/enroll.sock`. The caller must hold the singleton lock: a node
@@ -126,13 +146,25 @@ pub fn bind(dir: &Path) -> io::Result<EnrollEndpoint> {
                 path.display()
             )));
         }
-        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
-            return Err(io::Error::other(format!(
-                "{} is already accepting connections",
-                path.display()
-            )));
+        // Only a definite "nobody is listening" proves a corpse. Any other
+        // outcome (accepted, would-block, permission...) leaves it alone.
+        match std::os::unix::net::UnixStream::connect(&path) {
+            Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => {
+                std::fs::remove_file(&path)?;
+            }
+            Err(err) => {
+                return Err(io::Error::other(format!(
+                    "{} cannot be proven stale ({err}); not removing it",
+                    path.display()
+                )));
+            }
+            Ok(_) => {
+                return Err(io::Error::other(format!(
+                    "{} is already accepting connections",
+                    path.display()
+                )));
+            }
         }
-        std::fs::remove_file(&path)?;
     }
     let listener = tokio::net::UnixListener::bind(&path)?;
     // From here Drop owns the node, so a failure below still cleans up.

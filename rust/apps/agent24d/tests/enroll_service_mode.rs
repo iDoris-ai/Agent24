@@ -294,3 +294,27 @@ fn endpoint_answers_unavailable_and_never_a_token() {
     big.push(b'\n');
     assert_eq!(ask(&sock(&data), &big), "");
 }
+
+#[test]
+fn endpoint_caps_concurrent_connections_and_recovers() {
+    let (_root, data) = data_dir();
+    let _d = start_ok(&data, SERVICE);
+    // Eight idle peers fill the cap (they send nothing and just sit there).
+    let idle: Vec<UnixStream> = (0..8)
+        .map(|_| UnixStream::connect(sock(&data)).unwrap())
+        .collect();
+    std::thread::sleep(Duration::from_millis(300));
+    // The ninth is closed unanswered, promptly (not after the 5 s deadline).
+    let started = Instant::now();
+    let mut over = UnixStream::connect(sock(&data)).unwrap();
+    over.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let _ = over.write_all(b"{}\n");
+    let mut out = String::new();
+    let _ = over.read_to_string(&mut out);
+    assert_eq!(out, "", "over-cap connection must get no reply");
+    assert!(started.elapsed() < Duration::from_secs(3));
+    // Freeing the slots restores service.
+    drop(idle);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(ask(&sock(&data), b"{}\n").contains("enroll_unavailable"));
+}
