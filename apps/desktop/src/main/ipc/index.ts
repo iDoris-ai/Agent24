@@ -2,23 +2,22 @@
 // register their own handlers here via the module loader (later M1 task).
 
 import http from 'node:http'
+import https from 'node:https'
 import { execFile, type ChildProcess } from 'node:child_process'
-import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron'
 import { getBackendEndpoint } from '../backend-manager'
+import { findAllowedRoute, proxyError, proxyRequest, timeoutFor } from '../backend-proxy'
+import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
+import type { IpcGuard } from './guard'
 import { documentsCall, httpSender } from '../documents'
 import { importFile } from '../documents-import'
-import { IpcChannels } from '../../shared/ipc-types'
+import { APPROVAL_DECISION_TYPES, IpcChannels } from '../../shared/ipc-types'
 import type {
   BackendEndpointResult,
   BackendProxyRequest,
   BackendProxyResponse,
-  DiscoverFilter,
-  DiscoveredModule,
   LlmStatusResult,
   IdorisStatusResult,
-  ModuleInfo,
-  ModuleInstallResult,
-  ModuleUninstallResult,
   OmlxDetectResult,
   OmlxModelsResult,
   OmlxStartResult,
@@ -30,39 +29,76 @@ const BACKEND_HOST = '127.0.0.1'
 
 // oMLX server management
 let omlxProcess: ChildProcess | null = null
-const OMLX_PROBE_CANDIDATES = [
-  { url: 'http://127.0.0.1:8088', apiKey: 'xiaobao8088' },
-  { url: 'http://127.0.0.1:8000', apiKey: '' },
-  { url: 'http://127.0.0.1:8001', apiKey: '' },
-  { url: 'http://localhost:8088', apiKey: 'xiaobao8088' },
-]
 
-function fetchOmlxModels(url: string, apiKey: string): Promise<string[]> {
+/** oMLX API key the user configured for THIS app (env `OMLX_API_KEY`, the same
+ *  variable oMLX itself reads). Empty = none: probes that need a key are
+ *  skipped rather than guessed with a built-in default. */
+function configuredOmlxKey(): string {
+  return (process.env['OMLX_API_KEY'] ?? '').trim()
+}
+
+function omlxProbeCandidates(): { url: string; apiKey: string }[] {
+  const key = configuredOmlxKey()
+  return [
+    // Keyed probe only when a key is configured.
+    ...(key ? [{ url: 'http://127.0.0.1:8088', apiKey: key }] : []),
+    // Keyless probes: a keyed server just answers 401, which reads as "no models".
+    { url: 'http://127.0.0.1:8088', apiKey: '' },
+    { url: 'http://127.0.0.1:8000', apiKey: '' },
+    { url: 'http://127.0.0.1:8001', apiKey: '' },
+  ]
+}
+
+/** Loopback-only request to an oMLX/Ollama-style server. `base` must already
+ *  have passed parseLoopbackUrl. */
+function loopbackRequest(
+  base: URL,
+  suffix: string,
+  init: { method: string; headers: Record<string, string>; timeout: number; body?: string },
+  onResponse: (res: http.IncomingMessage) => void,
+  onFail: (err: Error) => void,
+): void {
+  const target = omlxEndpoint(base, suffix)
+  const mod = target.protocol === 'https:' ? https : http
+  const req = mod.request(
+    {
+      hostname: target.hostname.replace(/^\[|\]$/g, ''),
+      port: target.port || (target.protocol === 'https:' ? 443 : 80),
+      path: target.pathname,
+      method: init.method,
+      headers: init.headers,
+      timeout: init.timeout,
+    },
+    onResponse,
+  )
+  req.on('error', onFail)
+  req.on('timeout', () => { req.destroy(); onFail(new Error('timeout')) })
+  if (init.body !== undefined) req.write(init.body)
+  req.end()
+}
+
+function fetchOmlxModels(url: unknown, apiKey: string): Promise<string[]> {
   return new Promise((resolve) => {
+    const base = parseLoopbackUrl(url)
+    if (!base) { resolve([]); return }
     const headers: Record<string, string> = { 'Accept': 'application/json' }
     if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
-    const parsedUrl = new URL(`${url}/v1/models`)
-    const options: http.RequestOptions = {
-      hostname: parsedUrl.hostname,
-      port: parsedUrl.port || 80,
-      path: parsedUrl.pathname,
-      method: 'GET',
-      headers,
-      timeout: 2000,
-    }
-    const req = http.request(options, (res) => {
-      const chunks: Buffer[] = []
-      res.on('data', (c: Buffer) => chunks.push(c))
-      res.on('end', () => {
-        try {
-          const body = JSON.parse(Buffer.concat(chunks).toString()) as { data?: { id: string }[] }
-          resolve((body.data ?? []).map((m) => m.id))
-        } catch { resolve([]) }
-      })
-    })
-    req.on('error', () => resolve([]))
-    req.on('timeout', () => { req.destroy(); resolve([]) })
-    req.end()
+    loopbackRequest(
+      base,
+      '/v1/models',
+      { method: 'GET', headers, timeout: 2000 },
+      (res) => {
+        const chunks: Buffer[] = []
+        res.on('data', (c: Buffer) => chunks.push(c))
+        res.on('end', () => {
+          try {
+            const body = JSON.parse(Buffer.concat(chunks).toString()) as { data?: { id: string }[] }
+            resolve((body.data ?? []).map((m) => m.id))
+          } catch { resolve([]) }
+        })
+      },
+      () => resolve([]),
+    )
   })
 }
 
@@ -71,49 +107,16 @@ function fetchOmlxModels(url: string, apiKey: string): Promise<string[]> {
 // file:// or other dangerous schemes.
 const EXTERNAL_URL_ALLOWLIST = ['https://', 'http://'] as const
 
-function proxyToBackend(req: BackendProxyRequest): Promise<BackendProxyResponse> {
-  return new Promise((resolve) => {
-    const body = req.body !== undefined ? JSON.stringify(req.body) : undefined
-    // Endpoint comes from the backend's ready line (dynamic port + token for
-    // agent24d; fixed 8765 + empty token for the node mock)
-    const endpoint = getBackendEndpoint()
-    if (!endpoint) {
-      resolve({
-        ok: false,
-        status: 503,
-        data: { error: { code: 'backend_not_ready', message: 'Backend daemon has not announced readiness yet' } },
-      })
-      return
-    }
-    const options: http.RequestOptions = {
-      host: BACKEND_HOST,
-      port: endpoint.port,
-      path: req.path,
-      method: req.method,
-      headers: {
-        'Content-Type': 'application/json',
-        ...(endpoint.token ? { 'Authorization': 'Bearer ' + endpoint.token } : {}),
-        ...(body ? { 'Content-Length': Buffer.byteLength(body) } : {}),
-      },
-    }
-
-    const outReq = http.request(options, (res) => {
-      const chunks: Buffer[] = []
-      res.on('data', (chunk: Buffer) => chunks.push(chunk))
-      res.on('end', () => {
-        let data: unknown = null
-        try { data = JSON.parse(Buffer.concat(chunks).toString()) } catch { data = null }
-        resolve({ ok: (res.statusCode ?? 500) < 400, status: res.statusCode ?? 500, data })
-      })
-    })
-
-    outReq.on('error', (err) => {
-      resolve({ ok: false, status: 503, data: { error: (err as Error).message } })
-    })
-
-    if (body) outReq.write(body)
-    outReq.end()
-  })
+/** Ready-to-use daemon access for main-process code (not allowlisted: callers
+ *  here build their own fixed paths). */
+function proxyToBackend(req: BackendProxyRequest, timeoutMs?: number): Promise<BackendProxyResponse> {
+  // Endpoint comes from the backend's ready line (dynamic port + token for
+  // agent24d; fixed 8765 + empty token for the node mock)
+  const endpoint = getBackendEndpoint()
+  if (!endpoint) {
+    return Promise.resolve(proxyError('backend_not_ready', 'Backend daemon has not announced readiness yet'))
+  }
+  return proxyRequest(endpoint, req, { host: BACKEND_HOST, ...(timeoutMs === undefined ? {} : { timeoutMs }) })
 }
 
 function isBackendProxyRequest(req: unknown): req is BackendProxyRequest {
@@ -133,54 +136,97 @@ function isBackendProxyRequest(req: unknown): req is BackendProxyRequest {
   )
 }
 
-export function registerIpcHandlers(options: { idorisStatus?: () => Promise<IdorisStatusResult> } = {}): void {
+const SAFE_ID = /^[A-Za-z0-9_.:-]{1,128}$/
+
+/** Native yes/no for an elevated operation. The text is built here, in main,
+ *  so a compromised renderer cannot dress the prompt up. */
+async function confirmNative(event: IpcMainInvokeEvent, message: string, detail: string): Promise<boolean> {
+  const win = BrowserWindow.fromWebContents(event.sender)
+  const opts: Electron.MessageBoxOptions = {
+    type: 'warning',
+    buttons: ['确认', '取消'],
+    defaultId: 1,
+    cancelId: 1,
+    message,
+    detail,
+    noLink: true,
+  }
+  try {
+    const result = win ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts)
+    return result.response === 0
+  } catch {
+    return false
+  }
+}
+
+const cancelled = (): BackendProxyResponse =>
+  ({ ok: false, status: 499, data: { error: { code: 'cancelled', message: '操作已取消' } } })
+const invalidRequest = (message: string): BackendProxyResponse =>
+  ({ ok: false, status: 400, data: { error: { code: 'invalid_request', message } } })
+
+export function registerIpcHandlers(options: {
+  idorisStatus?: () => Promise<IdorisStatusResult>
+  /** A3: every handler below is registered through this (sender validation). */
+  guard: IpcGuard
+}): void {
+  const handle: typeof ipcMain.handle = (channel, listener) => ipcMain.handle(channel, options.guard(listener))
   // oMLX: auto-detect running server
-  ipcMain.handle(IpcChannels.OmlxDetect, async (): Promise<OmlxDetectResult | null> => {
-    for (const candidate of OMLX_PROBE_CANDIDATES) {
+  handle(IpcChannels.OmlxDetect, async (): Promise<OmlxDetectResult | null> => {
+    for (const candidate of omlxProbeCandidates()) {
       const models = await fetchOmlxModels(candidate.url, candidate.apiKey)
       if (models.length > 0) return { ...candidate, models }
     }
     return null
   })
 
-  // oMLX: list models from given url+key
-  ipcMain.handle(IpcChannels.OmlxModels, async (_event, url: unknown, apiKey: unknown): Promise<OmlxModelsResult> => {
-    if (typeof url !== 'string') return { ok: false, models: [], error: 'invalid url' }
+  // oMLX: list models from given url+key (url must be loopback http(s))
+  handle(IpcChannels.OmlxModels, async (_event, url: unknown, apiKey: unknown): Promise<OmlxModelsResult> => {
+    if (!parseLoopbackUrl(url)) return { ok: false, models: [], error: 'invalid url (loopback http/https only)' }
     const models = await fetchOmlxModels(url, typeof apiKey === 'string' ? apiKey : '')
     return models.length > 0 ? { ok: true, models } : { ok: false, models: [], error: 'no response or no models' }
   })
 
   // oMLX: start server via `omlx serve`
-  ipcMain.handle(IpcChannels.OmlxStart, (_event, port: unknown, apiKey: unknown): OmlxStartResult => {
-    if (omlxProcess) return { ok: true, url: `http://127.0.0.1:${port ?? 8000}` }
-    const args = ['serve', '--port', String(port ?? 8000)]
-    if (typeof apiKey === 'string' && apiKey) args.push('--api-key', apiKey)
-    omlxProcess = execFile('omlx', args, { env: { ...process.env } })
+  handle(IpcChannels.OmlxStart, (_event, port: unknown, apiKey: unknown): OmlxStartResult => {
+    const p = port === undefined ? 8000 : parsePort(port)
+    if (p === null) return { ok: false, url: '', error: 'invalid port (integer 1-65535)' }
+    if (omlxProcess) return { ok: true, url: `http://127.0.0.1:${p}` }
+    // The key goes to the child through its environment, never argv (argv is
+    // world-readable via `ps`). oMLX reads OMLX_API_KEY — verified in
+    // oMLX.app/Contents/Resources/omlx/settings.py (`os.getenv("OMLX_API_KEY")`
+    // -> auth.api_key), so no `--api-key` flag is needed.
+    const env: NodeJS.ProcessEnv = { ...process.env }
+    if (typeof apiKey === 'string' && apiKey) env['OMLX_API_KEY'] = apiKey
+    omlxProcess = execFile('omlx', ['serve', '--port', String(p)], { env })
     omlxProcess.on('exit', () => { omlxProcess = null })
-    return { ok: true, url: `http://127.0.0.1:${port ?? 8000}` }
+    return { ok: true, url: `http://127.0.0.1:${p}` }
   })
 
   // oMLX: warmup a model by sending a minimal chat request (triggers LLM load into memory)
-  ipcMain.handle(IpcChannels.OmlxWarmup, async (_event, url: unknown, apiKey: unknown, modelId: unknown): Promise<OmlxWarmupResult> => {
-    if (typeof url !== 'string' || typeof modelId !== 'string') return { model: String(modelId), ok: false, error: 'invalid args' }
+  handle(IpcChannels.OmlxWarmup, async (_event, url: unknown, apiKey: unknown, modelId: unknown): Promise<OmlxWarmupResult> => {
+    if (typeof modelId !== 'string') return { model: String(modelId), ok: false, error: 'invalid args' }
+    const base = parseLoopbackUrl(url)
+    if (!base) return { model: modelId, ok: false, error: 'invalid url (loopback http/https only)' }
     const key = typeof apiKey === 'string' ? apiKey : ''
     return new Promise((resolve) => {
       const body = JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 })
-      const parsed = new URL(`${url}/v1/chat/completions`)
       const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(body)) }
       if (key) headers['Authorization'] = `Bearer ${key}`
-      const req = http.request({ hostname: parsed.hostname, port: parsed.port || 80, path: parsed.pathname, method: 'POST', headers, timeout: 60000 }, (res) => {
-        res.resume()
-        resolve({ model: modelId, ok: (res.statusCode ?? 500) < 400 })
-      })
-      req.on('error', (e) => resolve({ model: modelId, ok: false, error: (e as Error).message }))
-      req.write(body)
-      req.end()
+      loopbackRequest(
+        base,
+        '/v1/chat/completions',
+        { method: 'POST', headers, timeout: 60000, body },
+        (res) => {
+          res.resume()
+          resolve({ model: modelId, ok: (res.statusCode ?? 500) < 400 })
+        },
+        (e) => resolve({ model: modelId, ok: false, error: e.message }),
+      )
     })
   })
 
   // oMLX: stop server — kills both app-spawned and externally-started processes
-  ipcMain.handle(IpcChannels.OmlxStop, (): OmlxStopResult => {
+  handle(IpcChannels.OmlxStop, (): OmlxStopResult => {
     if (omlxProcess) { omlxProcess.kill('SIGTERM'); omlxProcess = null }
     // pkill is macOS/Linux only; on Windows this is a no-op (omlx is not supported there yet)
     if (process.platform !== 'win32') {
@@ -188,78 +234,33 @@ export function registerIpcHandlers(options: { idorisStatus?: () => Promise<Idor
     }
     return { ok: true }
   })
-  // modules:list — returns manifests + enabled state of all registered capability modules
-  ipcMain.handle(IpcChannels.ModulesList, async (): Promise<ModuleInfo[]> => {
-    try {
-      const res = await proxyToBackend({ method: 'GET', path: '/api/modules' })
-      if (res.ok) return res.data as ModuleInfo[]
-    } catch { /* daemon may not be ready yet */ }
-    return []
-  })
-
-  // modules:discover — M4 marketplace browse: query installable modules from the
-  // npm registry, tagged with trust tier + installed flag. Filters are optional
-  // and forwarded as query params; the daemon (module-discovery.ts) applies them.
-  ipcMain.handle(IpcChannels.ModulesDiscover, async (_event, filter: unknown): Promise<DiscoveredModule[]> => {
-    const f = (filter ?? {}) as DiscoverFilter
-    const params = new URLSearchParams()
-    if (typeof f.query === 'string' && f.query.trim()) params.set('q', f.query.trim())
-    if (typeof f.trustTier === 'string') params.set('tier', f.trustTier)
-    if (typeof f.installed === 'boolean') params.set('installed', String(f.installed))
-    const qs = params.toString()
-    try {
-      const res = await proxyToBackend({ method: 'GET', path: `/api/modules/discover${qs ? `?${qs}` : ''}` })
-      if (res.ok) return res.data as DiscoveredModule[]
-    } catch { /* daemon may not be ready yet */ }
-    return []
-  })
+  // modules:* — node-daemon era (npm community modules). The Rust daemon has
+  // no `/api/modules*`; list/discover/install/uninstall are retired (A5) and
+  // answer with a fixed envelope. The pages stay until REV-01 deletes them.
+  const modulesNotSupported = (): { error: { code: string; message: string } } =>
+    ({ error: { code: 'not_supported', message: 'node-daemon only' } })
+  handle(IpcChannels.ModulesList, modulesNotSupported)
+  handle(IpcChannels.ModulesDiscover, modulesNotSupported)
+  handle(IpcChannels.ModulesInstall, modulesNotSupported)
+  handle(IpcChannels.ModulesUninstall, modulesNotSupported)
 
   // modules:enable / modules:disable — toggle module state via backend
-  ipcMain.handle(IpcChannels.ModulesEnable, async (_event, id: unknown): Promise<{ ok: boolean }> => {
+  handle(IpcChannels.ModulesEnable, async (_event, id: unknown): Promise<{ ok: boolean }> => {
     if (typeof id !== 'string') return { ok: false }
-    try {
-      const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/enable` })
-      return { ok: res.ok }
-    } catch { return { ok: false } }
+    const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/enable` })
+    return { ok: res.ok }
   })
 
-  ipcMain.handle(IpcChannels.ModulesDisable, async (_event, id: unknown): Promise<{ ok: boolean }> => {
+  handle(IpcChannels.ModulesDisable, async (_event, id: unknown): Promise<{ ok: boolean }> => {
     if (typeof id !== 'string') return { ok: false }
-    try {
-      const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/disable` })
-      return { ok: res.ok }
-    } catch { return { ok: false } }
-  })
-
-  // modules:install — install a community module from npm
-  ipcMain.handle(IpcChannels.ModulesInstall, async (_event, packageName: unknown): Promise<ModuleInstallResult> => {
-    if (typeof packageName !== 'string' || !packageName) return { ok: false, error: 'packageName required' }
-    try {
-      const res = await proxyToBackend({ method: 'POST', path: '/api/modules/install', body: { packageName } })
-      if (res.ok) {
-        const data = res.data as { ok: boolean; id?: string }
-        return { ok: true, id: data.id }
-      }
-      const data = res.data as { error?: string }
-      return { ok: false, error: data?.error ?? 'Install failed' }
-    } catch { return { ok: false, error: 'Backend unreachable' } }
-  })
-
-  // modules:uninstall — remove a community module
-  ipcMain.handle(IpcChannels.ModulesUninstall, async (_event, packageName: unknown, id: unknown): Promise<ModuleUninstallResult> => {
-    if (typeof packageName !== 'string' || !packageName) return { ok: false, error: 'packageName required' }
-    try {
-      const body: Record<string, string> = { packageName }
-      if (typeof id === 'string') body.id = id
-      const res = await proxyToBackend({ method: 'POST', path: '/api/modules/uninstall', body })
-      return { ok: res.ok, error: res.ok ? undefined : (res.data as { error?: string })?.error }
-    } catch { return { ok: false, error: 'Backend unreachable' } }
+    const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/disable` })
+    return { ok: res.ok }
   })
 
   // llm:status — current active LLM provider + model
-  ipcMain.handle(IpcChannels.LlmStatus, async (): Promise<LlmStatusResult> => {
+  handle(IpcChannels.LlmStatus, async (): Promise<LlmStatusResult> => {
     // Try oMLX first
-    const omlxModels = await fetchOmlxModels('http://127.0.0.1:8088', 'xiaobao8088')
+    const omlxModels = await fetchOmlxModels('http://127.0.0.1:8088', configuredOmlxKey())
     if (omlxModels.length > 0) {
       return { provider: 'omlx', url: 'http://127.0.0.1:8088', model: omlxModels[0] }
     }
@@ -271,13 +272,13 @@ export function registerIpcHandlers(options: { idorisStatus?: () => Promise<Idor
     return { provider: 'none', url: '', model: '' }
   })
 
-  ipcMain.handle(IpcChannels.IdorisStatus, (): Promise<IdorisStatusResult> =>
+  handle(IpcChannels.IdorisStatus, (): Promise<IdorisStatusResult> =>
     options.idorisStatus?.() ?? Promise.resolve({ state: 'unavailable', reason: 'handoff-missing' }),
   )
 
-  ipcMain.handle(IpcChannels.AppPing, () => 'pong')
-  ipcMain.handle(IpcChannels.AppVersion, () => app.getVersion())
-  ipcMain.handle(IpcChannels.ShellOpenExternal, (_event, url: unknown) => {
+  handle(IpcChannels.AppPing, () => 'pong')
+  handle(IpcChannels.AppVersion, () => app.getVersion())
+  handle(IpcChannels.ShellOpenExternal, (_event, url: unknown) => {
     if (typeof url !== 'string') return
     const allowed = EXTERNAL_URL_ALLOWLIST.some((prefix) => url.startsWith(prefix))
     if (allowed) {
@@ -287,15 +288,15 @@ export function registerIpcHandlers(options: { idorisStatus?: () => Promise<Idor
   // backend:endpoint — the daemon's actual port (FU-93: the sidebar used to
   // show a hardcoded `:8765`, but agent24d is spawned with `--port 0` and
   // gets whatever the OS hands it).
-  ipcMain.handle(IpcChannels.BackendEndpoint, (): BackendEndpointResult | null => {
+  handle(IpcChannels.BackendEndpoint, (): BackendEndpointResult | null => {
     const endpoint = getBackendEndpoint()
     return endpoint ? { port: endpoint.port } : null
   })
   const sendToDocuments = httpSender(getBackendEndpoint, BACKEND_HOST)
-  ipcMain.handle(IpcChannels.DocumentsRequest, (_event, req: unknown) =>
+  handle(IpcChannels.DocumentsRequest, (_event, req: unknown) =>
     documentsCall(req, sendToDocuments),
   )
-  ipcMain.handle(IpcChannels.DocumentsImportFile, async (event) => {
+  handle(IpcChannels.DocumentsImportFile, async (event) => {
     const window = BrowserWindow.fromWebContents(event.sender)
     const options: Electron.OpenDialogOptions = {
       properties: ['openFile'],
@@ -313,14 +314,51 @@ export function registerIpcHandlers(options: { idorisStatus?: () => Promise<Idor
       if (!event.sender.isDestroyed()) event.sender.send(IpcChannels.DocumentsImportProgress, p)
     })
   })
-  ipcMain.handle(IpcChannels.BackendProxy, (_event, req: unknown) => {
+  handle(IpcChannels.BackendProxy, (_event, req: unknown) => {
     if (!isBackendProxyRequest(req)) {
-      return {
-        ok: false,
-        status: 400,
-        data: { error: 'valid method and absolute path required' },
-      } satisfies BackendProxyResponse
+      return proxyError('forbidden', 'valid method and absolute path required')
     }
-    return proxyToBackend(req)
+    // A1: only allowlisted (method, path-template) pairs are forwarded.
+    const route = findAllowedRoute(req.method, req.path)
+    if (!route) {
+      return proxyError('forbidden', `${req.method} ${req.path.split('?')[0]} is not available through the renderer proxy`)
+    }
+    return proxyToBackend(req, timeoutFor(route))
+  })
+
+  // A1: POST /api/v1/approvals/{id} — an elevated operation, so it is not on
+  // the generic proxy. The user confirms in a native dialog built here.
+  handle(IpcChannels.ApprovalDecide, async (event, id: unknown, decision: unknown): Promise<BackendProxyResponse> => {
+    const d = decision as { type?: unknown; reason?: unknown } | null
+    if (typeof id !== 'string' || !SAFE_ID.test(id) || id === '.' || id === '..') return invalidRequest('invalid approval id')
+    if (typeof d !== 'object' || d === null || !(APPROVAL_DECISION_TYPES as readonly unknown[]).includes(d.type)) {
+      return invalidRequest('invalid decision')
+    }
+    if (d.reason !== undefined && typeof d.reason !== 'string') return invalidRequest('invalid reason')
+    const label: Record<string, string> = { approve: '批准', approve_for_session: '本会话内一律批准', deny: '拒绝', abort: '中止' }
+    const ok = await confirmNative(
+      event,
+      `确认对审批 ${id} 做出「${label[d.type as string]}」决定？`,
+      typeof d.reason === 'string' && d.reason ? `原因：${d.reason}` : '此决定会立即生效，且可能无法撤销。',
+    )
+    if (!ok) return cancelled()
+    return proxyToBackend({
+      method: 'POST',
+      path: `/api/v1/approvals/${id}`,
+      body: { type: d.type, ...(typeof d.reason === 'string' ? { reason: d.reason } : {}) },
+    })
+  })
+
+  // A1: PATCH /api/v1/os/{name} — enables/disables a domain OS module.
+  handle(IpcChannels.OsModuleSetEnabled, async (event, name: unknown, enabled: unknown): Promise<BackendProxyResponse> => {
+    if (typeof name !== 'string' || !SAFE_ID.test(name) || name === '.' || name === '..') return invalidRequest('invalid module name')
+    if (typeof enabled !== 'boolean') return invalidRequest('enabled must be a boolean')
+    const ok = await confirmNative(
+      event,
+      `确认${enabled ? '启用' : '停用'}领域模块「${name}」？`,
+      '变更写入配置，守护进程重启后生效。',
+    )
+    if (!ok) return cancelled()
+    return proxyToBackend({ method: 'PATCH', path: `/api/v1/os/${encodeURIComponent(name)}`, body: { enabled } })
   })
 }

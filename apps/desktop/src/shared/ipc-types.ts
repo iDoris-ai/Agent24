@@ -7,6 +7,11 @@ export const IpcChannels = {
   ShellOpenExternal: 'shell:open-external',
   BackendProxy: 'backend:proxy',
   BackendEndpoint: 'backend:endpoint',
+  // A1: elevated daemon operations the generic `backendProxy` no longer
+  // forwards. Each asks the user through a native dialog in the main process
+  // before sending anything.
+  ApprovalDecide: 'approval:decide',
+  OsModuleSetEnabled: 'os-module:set-enabled',
   CreativeShow: 'creative:show',
   CreativeRestart: 'creative:restart',
   CreativeBounds: 'creative:bounds',
@@ -72,6 +77,13 @@ export interface BackendProxyResponse {
   ok: boolean
   status: number
   data: unknown
+}
+
+/** A1: the decisions `POST /api/v1/approvals/{id}` accepts. */
+export const APPROVAL_DECISION_TYPES = ['approve', 'approve_for_session', 'deny', 'abort'] as const
+export interface ApprovalDecisionInput {
+  type: (typeof APPROVAL_DECISION_TYPES)[number]
+  reason?: string
 }
 
 /** FU-93: the backend daemon's actual (dynamic) port, so the sidebar can show
