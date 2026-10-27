@@ -216,6 +216,29 @@ impl SourceRef {
         }
     }
 
+    /// Results from `origin` that an earlier turn of `session_id` took in
+    /// (K1-6b.5f-2), entering this run through session context. Always
+    /// `Unknown`: only non-ordinary origins are recorded
+    /// ([`Store::tag_tool_result`]). The id keeps the
+    /// `tool_result:{origin}:` prefix, so the same-source exception still
+    /// recognises a module's own results.
+    pub fn session_tool_result(
+        origin: &str,
+        session_id: &str,
+        created_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_id: format!("{TOOL_RESULT_PREFIX}{origin}:session:{session_id}"),
+            kind: SourceKind::ToolResult,
+            classification: SourceClassification::Unknown,
+            revision_digest: None,
+            mode: SourceMode::LocalOnly,
+            policy_version: 0,
+            authorization_ref: None,
+            created_at: created_at.into(),
+        }
+    }
+
     /// A recalled assertion entering a run's context. Its classification is
     /// the one stored with the assertion ([`AssertionSourceRef::classification_of`]);
     /// the tag kind only names the retrieval path (ADR-K1-02 §6 item 4).
@@ -503,24 +526,52 @@ impl Store {
         tag: &SourceRef,
         now: &str,
     ) -> Result<()> {
-        let tag_json = serde_json::to_string(tag)?;
-        sqlx::query(
-            "INSERT INTO run_source_tags (run_id, seq, source_id, schema_version, tag_json, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(run_id, seq, source_id) DO UPDATE SET \
-                schema_version = excluded.schema_version, \
-                tag_json = excluded.tag_json, \
-                created_at = excluded.created_at",
-        )
-        .bind(run_id)
-        .bind(seq)
-        .bind(&tag.source_id)
-        .bind(SOURCE_TAG_SCHEMA_VERSION)
-        .bind(&tag_json)
-        .bind(now)
-        .execute(self.pool())
-        .await?;
+        let mut conn = self.pool().acquire().await?;
+        insert_run_source_tag(&mut conn, run_id, seq, tag, now).await
+    }
+
+    /// K1-6b.5f-2: persist the tag of a tool result and, for a run in a
+    /// session, the result's origin as one of the session's
+    /// ([`Self::session_tool_result_origins`]) when it is not ordinary.
+    /// `session` is `(session_id, origin)`. One transaction, so a later turn
+    /// never misses an origin whose result this run's model saw.
+    pub async fn tag_tool_result(
+        &self,
+        run_id: &str,
+        seq: i64,
+        tag: &SourceRef,
+        session: Option<(&str, &str)>,
+        now: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool().begin().await?;
+        insert_run_source_tag(&mut tx, run_id, seq, tag, now).await?;
+        if let Some((session_id, origin)) = session
+            && tag.classification != SourceClassification::Ordinary
+        {
+            sqlx::query(
+                "INSERT INTO session_tool_result_origins (session_id, origin, created_at) \
+                 VALUES (?, ?, ?) ON CONFLICT(session_id, origin) DO NOTHING",
+            )
+            .bind(session_id)
+            .bind(origin)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
+    }
+
+    /// Every origin of a non-ordinary tool result that some turn of
+    /// `session_id` took in (K1-6b.5f-2), in name order. Empty for a session
+    /// with none.
+    pub async fn session_tool_result_origins(&self, session_id: &str) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT origin FROM session_tool_result_origins WHERE session_id = ? ORDER BY origin",
+        )
+        .bind(session_id)
+        .fetch_all(self.pool())
+        .await?)
     }
 
     /// Every tag persisted against a run, in `(seq, source_id)` order.
@@ -628,6 +679,33 @@ impl Store {
             tags.into_iter().map(|tag| tag.source).collect(),
         ))
     }
+}
+
+async fn insert_run_source_tag(
+    conn: &mut sqlx::SqliteConnection,
+    run_id: &str,
+    seq: i64,
+    tag: &SourceRef,
+    now: &str,
+) -> Result<()> {
+    let tag_json = serde_json::to_string(tag)?;
+    sqlx::query(
+        "INSERT INTO run_source_tags (run_id, seq, source_id, schema_version, tag_json, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(run_id, seq, source_id) DO UPDATE SET \
+            schema_version = excluded.schema_version, \
+            tag_json = excluded.tag_json, \
+            created_at = excluded.created_at",
+    )
+    .bind(run_id)
+    .bind(seq)
+    .bind(&tag.source_id)
+    .bind(SOURCE_TAG_SCHEMA_VERSION)
+    .bind(&tag_json)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1049,6 +1127,139 @@ mod tests {
         let tags = store.list_run_source_tags("run_floor").await.unwrap();
         assert_eq!(tags[0].source, tag);
         assert_eq!(tags[0].source.kind, SourceKind::SessionContext);
+    }
+
+    /// K1-6b.5f-2: a session records the origins of the non-ordinary tool
+    /// results its runs took in, once each; a result outside a session, or an
+    /// ordinary one, records nothing.
+    #[tokio::test]
+    async fn a_session_records_the_origins_of_its_non_ordinary_tool_results() {
+        use SourceClassification::{Ordinary, Unknown};
+        let store = store_with_run("run_tools").await;
+        for (seq, origin, classification, session) in [
+            (1, "tool:shell_exec", Unknown, Some("s1")),
+            (2, "tool:shell_exec", Unknown, Some("s1")),
+            (3, "module:docs", Unknown, Some("s1")),
+            (4, "tool:fs_read", Ordinary, Some("s1")),
+            (5, "tool:mcp_x", Unknown, None),
+        ] {
+            let tag = SourceRef::tool_result(origin, &format!("tc_{seq}"), classification, "t");
+            store
+                .tag_tool_result(
+                    "run_tools",
+                    seq,
+                    &tag,
+                    session.map(|sid| (sid, origin)),
+                    "t",
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.list_run_source_tags("run_tools").await.unwrap().len(),
+            5
+        );
+        assert_eq!(
+            store.session_tool_result_origins("s1").await.unwrap(),
+            ["module:docs", "tool:shell_exec"]
+        );
+        assert!(
+            store
+                .session_tool_result_origins("s2")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let inherited = SourceRef::session_tool_result("module:docs", "s1", "t");
+        assert_eq!(inherited.source_id, "tool_result:module:docs:session:s1");
+        assert_eq!(inherited.classification, Unknown);
+        assert_eq!(inherited.kind, SourceKind::ToolResult);
+    }
+
+    /// Codex 6b.5f-2 r1 C1: a session whose runs called tools before 0027
+    /// carries one legacy origin; a session without tool calls, and a tool
+    /// call outside any session, record none.
+    #[tokio::test]
+    async fn a_session_that_called_tools_before_0027_carries_a_legacy_origin() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.migrations = std::borrow::Cow::Owned(
+            migrator
+                .migrations
+                .iter()
+                .filter(|m| m.version <= 26)
+                .cloned()
+                .collect(),
+        );
+        migrator.run(&pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO sessions (id, title, channel, created_at, updated_at) VALUES \
+                ('s_tools', 't', 'api', 't', 't'), ('s_quiet', 't', 'api', 't', 't'); \
+             INSERT INTO runs (id, session_id, status, input, usage, created_at) VALUES \
+                ('r1', 's_tools', 'completed', '{}', '{}', 't'), \
+                ('r2', 's_tools', 'completed', '{}', '{}', 't'), \
+                ('r3', 's_quiet', 'completed', '{}', '{}', 't'), \
+                ('r4', NULL, 'completed', '{}', '{}', 't'); \
+             INSERT INTO tool_calls (id, run_id, tool, input, status, started_at) VALUES \
+                ('tc1', 'r1', 'shell_exec', '{}', 'ok', 't'), \
+                ('tc2', 'r2', 'docs.find', '{}', 'ok', 't'), \
+                ('tc3', 'r4', 'shell_exec', '{}', 'ok', 't');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let store = crate::test_hooks::from_pool(pool);
+        assert_eq!(
+            store.session_tool_result_origins("s_tools").await.unwrap(),
+            ["tool:legacy"]
+        );
+        assert!(
+            store
+                .session_tool_result_origins("s_quiet")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// K1-6b.5f-2: the tag and the session's origin are written together or
+    /// not at all, so a later turn never misses an origin whose result was
+    /// tagged.
+    #[tokio::test]
+    async fn a_tool_result_tag_is_not_kept_without_its_session_origin() {
+        let store = store_with_run("run_tools").await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER no_origin BEFORE INSERT ON session_tool_result_origins \
+             BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let tag = SourceRef::tool_result(
+            "tool:shell_exec",
+            "tc_1",
+            SourceClassification::Unknown,
+            "t",
+        );
+        assert!(
+            store
+                .tag_tool_result("run_tools", 1, &tag, Some(("s1", "tool:shell_exec")), "t")
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .list_run_source_tags("run_tools")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

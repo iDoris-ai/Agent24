@@ -2873,6 +2873,14 @@ mod tests {
         EgressResource::local_only(tag.source_id, "unrevisioned")
     }
 
+    /// What `origin` returned in an earlier turn of a session, as that
+    /// session's later turns carry it (K1-6b.5f-2).
+    fn earlier_turn_result_of(origin: &str) -> EgressResource {
+        let tag =
+            agent24_store::SourceRef::session_tool_result(origin, "sess_1", "2026-10-26T00:00:00Z");
+        EgressResource::local_only(tag.source_id, "unrevisioned")
+    }
+
     /// K1-6b.5f (David 2026-10-26, same source): a module may be sent back
     /// what it returned itself, and only that. The run has no egress gate,
     /// as production builds it, so any other source refuses.
@@ -2896,6 +2904,7 @@ mod tests {
         call(vec![
             result_of("fake_module", "tc_1"),
             result_of("fake_module", "tc_2"),
+            earlier_turn_result_of("module:fake_module"),
         ])
         .await
         .unwrap();
@@ -2919,6 +2928,17 @@ mod tests {
                     "tool_result:tool:shell_exec:tc_3",
                     "r",
                 )],
+            ),
+            (
+                "another module's result from an earlier turn",
+                vec![earlier_turn_result_of("module:other_module")],
+            ),
+            (
+                "a tool's result from an earlier turn",
+                vec![
+                    earlier_turn_result_of("module:fake_module"),
+                    earlier_turn_result_of("tool:shell_exec"),
+                ],
             ),
             (
                 "restricted material",
