@@ -105,7 +105,8 @@
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
       "binaries": [
-        "Contents/Resources/backend/agent24d"
+        "Contents/Resources/backend/agent24d",
+        "Contents/Resources/backend/agent24"
       ],
       "notarize": false
     },
