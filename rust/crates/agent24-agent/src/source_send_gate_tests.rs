@@ -71,6 +71,7 @@ async fn present_prompt_without_recall_or_pause_still_forms_a_provider_request()
             prompt: "plain question".into(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -209,6 +210,7 @@ async fn pause_notice_completes_the_run_and_keeps_snapshot_rows() {
             prompt: "记住 我喜欢喝茶".into(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -266,6 +268,7 @@ async fn paused_remember_run_completes_and_provider_gets_notice() {
             prompt: "记住 X".into(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();

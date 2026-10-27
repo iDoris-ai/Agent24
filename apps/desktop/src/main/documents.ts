@@ -4,7 +4,7 @@
 // to a fixed route under /api/v1/documents and every id is checked against
 // its pattern first; it does not go through the generic `backendProxy`.
 
-import type { BackendEndpoint } from './backend-manager'
+import type { CliEndpoint } from './backend-manager'
 import type { ModuleEvent } from './agentear-events'
 import type { DocumentsEvent, DocumentsResponse } from '../shared/ipc-types'
 import { cliBinary, fail, runDocumentsCli, spawnCli, type Spawner } from './documents-cli'
@@ -17,7 +17,7 @@ const JOB_ID = /^job_[0-7][0-9A-HJKMNP-TV-Z]{25}$/
  * for a request that is not even JSON. */
 export function documentsCall(
   req: unknown,
-  endpoint: () => BackendEndpoint | null,
+  endpoint: () => CliEndpoint | null,
   run: Spawner = spawnCli,
   bin: string = cliBinary(),
 ): Promise<DocumentsResponse> {

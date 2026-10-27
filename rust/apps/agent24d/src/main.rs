@@ -29,6 +29,9 @@ mod grant_expiry;
 mod hardware;
 #[cfg(unix)]
 mod host_bootstrap;
+mod knowledge_host;
+#[allow(dead_code)] // Wired at start (KB-C1-04 6c-4) and by the private interface (6d-2).
+mod knowledge_store;
 #[cfg(not(unix))]
 mod host_bootstrap {
     #![allow(

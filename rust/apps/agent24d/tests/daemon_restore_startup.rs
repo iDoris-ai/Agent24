@@ -47,6 +47,7 @@ async fn startup_restores_unexpired_pending_approval_and_keeps_snapshot_byte_ide
                 workspace_id: None,
                 model_override: None,
                 mode: RunMode::Normal,
+                knowledge_binding_id: None,
             },
             output: None,
             error: None,
