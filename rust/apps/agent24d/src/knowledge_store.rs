@@ -106,7 +106,9 @@ impl KnowledgeDb {
     /// transaction. SQLite checks a column's type when writing, not when
     /// reading: a number that is not an integer reads as `NULL` here, the
     /// seal then missing and the log damaged, never as zero. Text is read as
-    /// bytes, so text that is not UTF-8 is damaged, not an error.
+    /// bytes, so text that is not UTF-8 is damaged, not an error; a kind that
+    /// is not text reads as `NULL`, a body neither text nor `NULL` as empty,
+    /// neither ever a record.
     pub async fn read<I: StoredIds>(&self) -> Result<Found<I>, StoreError> {
         let mut tx = self.pool.begin().await?;
         let next: Option<i64> =
@@ -125,7 +127,10 @@ impl KnowledgeDb {
         .await?;
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT CASE typeof(seq) WHEN 'integer' THEN seq END, \
-             CAST(kind AS BLOB), CAST(body AS BLOB) FROM records ORDER BY seq, kind",
+             CASE typeof(kind) WHEN 'text' THEN CAST(kind AS BLOB) END, \
+             CASE typeof(body) WHEN 'text' THEN CAST(body AS BLOB) \
+             WHEN 'null' THEN NULL ELSE x'' END \
+             FROM records ORDER BY seq, kind",
         )
         .fetch_all(&mut *tx)
         .await?;

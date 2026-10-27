@@ -229,8 +229,9 @@ async fn a_number_that_is_not_an_integer_reads_as_unreadable() {
     }
 }
 
-/// Without its `CHECK`s, a damaged file may hold any kind with any body:
-/// only `changes` with a body and `void` without one read as records.
+/// Without its `CHECK`s, a damaged file may hold any kind with any body, of
+/// any type: only text `changes` with a text body and text `void` without
+/// one read as records.
 #[tokio::test]
 async fn a_kind_and_body_that_do_not_match_are_damaged() {
     for row in [
@@ -239,6 +240,10 @@ async fn a_kind_and_body_that_do_not_match_are_damaged() {
         "'weird', NULL",
         r#"'weird', '{"version":1,"changes":["on"]}'"#,
         "NULL, NULL",
+        "CAST('void' AS BLOB), NULL",
+        r#"'changes', CAST('{"version":1,"changes":["on"]}' AS BLOB)"#,
+        "'void', x''",
+        "'void', 7",
     ] {
         let (_dir, db) = open().await;
         db.begin(1).await.unwrap();
