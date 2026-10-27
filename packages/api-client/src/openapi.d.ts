@@ -1457,7 +1457,7 @@ export interface components {
              */
             memory_receipt?: "saved" | "paused_not_saved" | "failed" | "not_saved" | "partial";
             /**
-             * @description P1-02c: why the memory write failed. Present exactly when `memory_receipt` is "failed", "not_saved" or "partial". A closed code, never text: no partition key, no storage error message. `memory_disk_low` is reserved (nothing emits it yet).
+             * @description P1-02c: why the memory write failed. Present exactly when `memory_receipt` is "failed", "not_saved" or "partial". A closed code, never text: no partition key, no storage error message. `memory_disk_low` is emitted by the c4 pre-write disk gate.
              * @enum {string}
              */
             memory_error_code?: "memory_quota_rows" | "memory_quota_bytes" | "memory_disk_low" | "memory_disk_full" | "memory_reserved_kind" | "memory_retract_id_too_long" | "memory_internal";
