@@ -547,7 +547,7 @@ ic() { curl -s -m 20 -o $WORK/ir.json -w '%{http_code}' -H "Authorization: Beare
 - 期望：正常 ready，`/api/v1/health` 200；两个库的 `_sqlx_migrations` 都是连续序列、全部 `success=1`，分别到 29 和 20。
 - 判定：
   ```bash
-  sqlite3 agent24.db "SELECT group_concat(version) FROM (SELECT version FROM _sqlx_migrations WHERE success=1 ORDER BY version)"   # = 1,2,...,29
+  sqlite3 agent24.db "SELECT group_concat(version) FROM (SELECT version FROM _sqlx_migrations WHERE success=1 ORDER BY version)"   # = 1,2,...,30
   sqlite3 memory.db  "SELECT group_concat(version) FROM (SELECT version FROM _sqlx_migrations WHERE success=1 ORDER BY version)"   # = 1,2,...,20
   ```
   与 `seq -s, 1 29`、`seq -s, 1 20` 比较。
@@ -586,7 +586,7 @@ ic() { curl -s -m 20 -o $WORK/ir.json -w '%{http_code}' -H "Authorization: Beare
   3. 重新启动，daemon 会用新编号重建；
   4. 想留着旧数据继续用旧版：用 `AGENT24_DATA_DIR=<另一个目录>` 让新旧版互不干扰（`docs/Deployment/README.md`）。
 - 步骤：对 X-04 失败的目录执行 1–3。
-- 期望：重新启动成功，两个库迁移到 29 / 20，健康检查 200，备份目录里的原库字节未变。
+- 期望：重新启动成功，两个库迁移到 30 / 20，健康检查 200，备份目录里的原库字节未变。
 - 判定：`/api/v1/health` 200；迁移序列；备份目录里 `agent24.db` 的哈希等于挪开前。
 - 注意：「David 决定的不做兼容、清库」只写在 K1-06b 矩阵 §6 第 4 条（针对 ab/kernel 中间版本）；memory-p1 旧编号这一类没有同等文字，需要 David 确认同样口径。执行方式：脚本。
 
@@ -1240,7 +1240,7 @@ run_X() {
   start_daemon "$NEW" "$WORK/x" || { check X-01 "new daemon opens the preview data" fail "$WORK/x.serve.log"; return; }
   local sv mvr; sv=$(vers "$WORK/x/agent24.db"); mvr=$(vers "$WORK/x/memory.db")
   api GET /api/v1/health; local h=$CODE
-  check X-01 "both libraries migrate in order: store 1..29, memory 1..20" "$( [ "$h" = 200 ] && [ "$sv" = "$(seq -s, 1 29)" ] && [ "$mvr" = "$(seq -s, 1 20)" ] && echo ok || echo fail)" "before $pv; after store ${sv##*,} memory ${mvr##*,}; health $h"
+  check X-01 "both libraries migrate in order: store 1..30, memory 1..20" "$( [ "$h" = 200 ] && [ "$sv" = "$(seq -s, 1 30)" ] && [ "$mvr" = "$(seq -s, 1 20)" ] && echo ok || echo fail)" "before $pv; after store ${sv##*,} memory ${mvr##*,}; health $h"
   api GET '/api/v1/memory/assertions?limit=50'
   local same; same=$(jq --arg id "$AID" --arg t "$TEXT" '[.assertions[] | select(.id == $id and .text == $t)] | length' "$WORK/r.json")
   api GET "/api/v1/sessions/$S"; local sc=$CODE
@@ -1276,7 +1276,7 @@ run_X() {
     api GET /api/v1/health; local rh=$CODE
     local rstore rmem; rstore=$(vers "$d/agent24.db"); rmem=$(vers "$d/memory.db")
     stop_daemon
-    check X-05 "reset (move the data directory aside, restart): healthy, 29/20, backup untouched" "$( [ "$rh" = 200 ] && [ "$rstore" = "$(seq -s, 1 29)" ] && [ "$rmem" = "$(seq -s, 1 20)" ] && [ "$(dump_hash "$bk/memory.db")" = "$keep" ] && echo ok || echo fail)" "health $rh; store ${rstore##*,}; memory ${rmem##*,}"
+    check X-05 "reset (move the data directory aside, restart): healthy, 30/20, backup untouched" "$( [ "$rh" = 200 ] && [ "$rstore" = "$(seq -s, 1 30)" ] && [ "$rmem" = "$(seq -s, 1 20)" ] && [ "$(dump_hash "$bk/memory.db")" = "$keep" ] && echo ok || echo fail)" "health $rh; store ${rstore##*,}; memory ${rmem##*,}"
   else
     check X-05 "reset steps" fail "$d.serve.log"
   fi
