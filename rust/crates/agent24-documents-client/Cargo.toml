@@ -16,11 +16,11 @@ serde_json = { workspace = true, features = ["float_roundtrip"] }
 # Plain HTTP to 127.0.0.1 only: no TLS, no proxy (http.rs).
 reqwest = { version = "0.12", default-features = false }
 sha2 = "0.10"
-tokio = { version = "1", features = ["fs", "io-util"] }
+tokio = { version = "1", features = ["fs", "io-util", "time"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "sync", "net", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "sync", "net", "time", "test-util"] }
 
 [lints]
 workspace = true
