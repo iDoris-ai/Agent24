@@ -175,10 +175,10 @@ pub fn write_last_success(
 /// `Ok(None)` when absent (legacy install); corrupt or unknown => `Invalid`.
 pub fn read_last_success(data_dir: &Path) -> Result<Option<LastSuccess>, StateError> {
     let p = data_dir.join(LAST_SUCCESS_FILE);
-    if !p.exists() {
+    let Some(bytes) = read_optional(&p)? else {
         return Ok(None);
-    }
-    let v: LastSuccess = read_json(&p)?;
+    };
+    let v: LastSuccess = parse_json(&bytes)?;
     check_version(v.format_version)?;
     Ok(Some(v))
 }
@@ -199,6 +199,38 @@ pub(super) fn write_json<T: Serialize>(
 ) -> Result<(), StateError> {
     let bytes = serde_json::to_vec_pretty(v).map_err(|e| StateError::Invalid(e.to_string()))?;
     atomic_write(ops, data_dir, path, &bytes).map_err(StateError::Io)
+}
+
+/// `Ok(None)` only when `path` is genuinely absent. Any other failure to read
+/// it (EISDIR, EACCES, I/O error, dangling symlink) is `Invalid`, i.e. dock
+/// class: unreadable guard state must never be mistaken for "no state".
+/// `Path::exists()` is deliberately not used: it maps every error to false.
+pub(super) fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, StateError> {
+    match fs::read(path) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // A dangling symlink also reads as NotFound; it is present state.
+            match fs::symlink_metadata(path) {
+                Err(m) if m.kind() == io::ErrorKind::NotFound => Ok(None),
+                Ok(_) => Err(StateError::Invalid(format!(
+                    "{} is a dangling symlink",
+                    path.display()
+                ))),
+                Err(m) => Err(StateError::Invalid(format!(
+                    "cannot stat {}: {m}",
+                    path.display()
+                ))),
+            }
+        }
+        Err(e) => Err(StateError::Invalid(format!(
+            "cannot read {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+pub(super) fn parse_json<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, StateError> {
+    serde_json::from_slice(bytes).map_err(|e| StateError::Invalid(e.to_string()))
 }
 
 pub(super) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, StateError> {
@@ -347,5 +379,33 @@ mod tests {
         let (len, h) = sha256_file(&p).unwrap();
         assert_eq!(len, 3);
         assert!(h.starts_with("ba7816bf"));
+    }
+
+    #[test]
+    fn unreadable_last_success_is_invalid_not_absent() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let td = tempfile::tempdir().unwrap();
+        symlink(td.path().join("nowhere"), td.path().join(LAST_SUCCESS_FILE)).unwrap();
+        let r = read_last_success(td.path());
+        assert!(matches!(r, Err(StateError::Invalid(_))), "dangling: {r:?}");
+
+        let td = tempfile::tempdir().unwrap();
+        fs::create_dir(td.path().join(LAST_SUCCESS_FILE)).unwrap();
+        let r = read_last_success(td.path());
+        assert!(matches!(r, Err(StateError::Invalid(_))), "dir: {r:?}");
+
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path().join("d");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join(LAST_SUCCESS_FILE), b"{trunc").unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        // root ignores mode bits: skip this case rather than test nothing
+        if fs::read_dir(&dir).is_err() {
+            let r = read_last_success(&dir);
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(matches!(r, Err(StateError::Invalid(_))), "eacces: {r:?}");
+        } else {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
     }
 }
