@@ -58,8 +58,6 @@ use async_trait::async_trait;
 /// The literal is `documents`, the identity ADR-DOC-01 adopted for the
 /// Documenting domain OS (`rust/apps/agent24-documents/domain-os.yml`); the
 /// earlier `documenting` spelling is **not** a document-class module.
-/// `agent24d::module_tool_runtime::is_document_class_module` is the kernel-side
-/// check of the same identity.
 pub const DRAFT_EXEMPTION_MODULE: &str = "documents";
 
 /// One call's identity plus the policy placeholders the task spec calls

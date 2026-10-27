@@ -237,8 +237,8 @@ pub enum ModelAccess {
     /// Every call is routed with `Privacy::LocalOnly` — on-device tiers only.
     #[default]
     LocalOnly,
-    /// Calls are routed with `Privacy::Any`; the kernel still chooses the
-    /// provider (the module only states a complexity preference).
+    /// Declared and confirmed as before, but since K1-6b.5g every callback
+    /// is still routed with `Privacy::LocalOnly` (egress matrix §6 item 2).
     RemoteAllowed,
 }
 

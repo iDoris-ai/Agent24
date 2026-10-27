@@ -1659,13 +1659,6 @@ pub async fn serve(
     let advert_view = crate::module_tool_runtime::AgentModuleToolAdvertView::new(
         StdArc::clone(&module_tool_runtime),
         module_authorizations.clone(),
-        {
-            // Read per call (K1-6a-G §2.4), from this one router instance,
-            // which is never replaced today; a replaceable router must make
-            // the probe read the current instance (#1130 L2).
-            let router = Arc::clone(&router);
-            StdArc::new(move || Some(router.has_remote_tier()))
-        },
     );
     let advert_view_dyn: StdArc<dyn agent24_domain::tool::ModuleToolAdvertView> = advert_view;
     crate::module_tool_runtime::register_module_tools(

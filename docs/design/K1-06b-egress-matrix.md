@@ -39,7 +39,7 @@
 
 | 消费方 | (a) | (b) | (c) | (d) |
 |---|---|---|---|---|
-| **Router** | `router.rs` `local_only_never_falls_back_to_remote`、`local_only_with_cooled_down_local_still_never_uses_remote`、`local_only_uses_lora_as_a_local_tier`、`local_only_never_reaches_remote_even_when_the_gate_grants_it`（6b.5e 前置，放行 gate 加云授权） | `router.rs` `remote_provider_is_not_called_without_a_host_egress_gate`、`denied_remote_falls_back_to_healthy_local_provider`、`tier_parse_defaults_unknown_to_remote`、`a_remote_provider_that_cannot_name_its_destination_is_never_called`（6b.5b） | 正例：`router.rs` `complex_task_prefers_remote`（放行 gate）。负例只在 domain 层：`egress.rs` `cloud_grant_must_match_resource_purpose_destination_and_generation`（没有换 `resource_id`、`authorization_ref`、`policy_version`）、`an_authorized_request_is_rechecked_against_the_live_gate_after_revocation`；router 层：`an_exact_grant_lets_the_remote_provider_serve_only_that_request`（6b.5b，精确匹配 gate：正例，以及资源、修订、授权引用、政策版本、代次、目的地、用途逐项不匹配的负例） | `router.rs` `simple_task_prefers_local`、`tier_order_respects_privacy_and_complexity` |
+| **Router** | `router.rs` `local_only_never_falls_back_to_remote`、`local_only_with_cooled_down_local_still_never_uses_remote`、`local_only_uses_lora_as_a_local_tier`、`a_granting_gate_never_serves_local_only_from_a_lone_remote`、`a_granting_gate_never_serves_local_only_when_local_fails`、`a_granting_gate_never_serves_local_only_while_local_cools_down`（6b.5e 前置，放行 gate 加云授权） | `router.rs` `remote_provider_is_not_called_without_a_host_egress_gate`、`denied_remote_falls_back_to_healthy_local_provider`、`tier_parse_defaults_unknown_to_remote`、`a_remote_provider_that_cannot_name_its_destination_is_never_called`（6b.5b） | 正例：`router.rs` `complex_task_prefers_remote`（放行 gate）。负例只在 domain 层：`egress.rs` `cloud_grant_must_match_resource_purpose_destination_and_generation`（没有换 `resource_id`、`authorization_ref`、`policy_version`）、`an_authorized_request_is_rechecked_against_the_live_gate_after_revocation`；router 层：`an_exact_grant_lets_the_remote_provider_serve_only_that_request`（6b.5b，精确匹配 gate：正例，以及资源、修订、授权引用、政策版本、代次、目的地、用途逐项不匹配的负例） | `router.rs` `simple_task_prefers_local`、`tier_order_respects_privacy_and_complexity` |
 | **run_loop**（`RunManager::execute`） | `lib.rs` `resumed_thread_cannot_rebuild_remote_permission_from_default_profile`（远端桩，唯一一条） | `lib.rs` `source_tag_write_failure_stops_before_any_model_call`、`a_recall_tag_that_cannot_be_written_stops_the_run_before_the_model`、`a_session_floor_that_cannot_be_written_stops_the_run_before_the_model`、`a_schedule_origin_that_cannot_be_read_stops_the_run_before_the_model`、`a_run_whose_own_sources_cannot_be_read_stops_before_the_model`（都用本地 provider）；`a_run_whose_sources_cannot_be_read_is_routed_local_only`（6b.5b，远端桩） | 不适用：只调 `router.complete` | `lib.rs` `run_completes_with_full_event_sequence`、`ordinary_sources_of_any_kind_do_not_restrict_tool_egress` |
 | **REST /api/v1/chat** | `routes.rs` `post_chat_never_reaches_a_remote_only_provider`（6b.5b） | `session_memory/chat.rs` `a_chat_turn_whose_session_floor_cannot_be_written_fails_before_the_model`；`lib.rs` `a_chat_prelude_whose_floor_cannot_be_written_fails` | 不适用 | `routes.rs` `post_chat_records_a_timing_row_on_success`；`chat.rs` `explicit_remember_over_chat_stores_a_qualified_assertion` |
 | **子 agent（explore）** | `subagent.rs` `delegated_call_inherits_persisted_local_only_policy` | `subagent.rs` `a_delegated_call_whose_parent_policy_cannot_be_read_stays_local_only`、`a_delegated_call_without_a_policy_store_stays_local_only`（6b.5b） | 不适用 | `subagent.rs` `a_direct_answer_returns_immediately`、`it_reads_a_file_then_answers` |
@@ -51,7 +51,7 @@
 **(a) 列证明的是什么**（#1209 PR-Daemon 的 Gate，2026-10-25 实测）：把 `TaskProfile::tier_order` 里 LocalOnly 对远端的排除去掉（LocalOnly 也排上 Remote），结果如下。
 - 仍然通过：6b.5b 之前的 (a) 测试，即 router 的三条、`delegated_call_inherits_persisted_local_only_policy`、`local_only_run_compaction_never_falls_back_to_remote`、`resumed_thread_cannot_rebuild_remote_permission_from_default_profile`。生产 gate 是 `deny_all`，远端本来就被拒，所以这些测试只证明「远端零调用」，不证明 LocalOnly 排除在起作用。
 - 变红：6b.5b 断言提示里含 `local-only` 的五条（`a_run_whose_sources_cannot_be_read_is_routed_local_only`、子 agent 两条、`the_model_assessor_never_sends_a_payload_to_a_remote_model`、`post_chat_never_reaches_a_remote_only_provider`），加上原有的 `tier_order_respects_privacy_and_complexity`。这段提示只出现在「LocalOnly 且没有本地 provider」那个分支，排除一去掉，就变成 gate 拒绝的提示。
-- **撤门（6b.5e）的前置，已补**：`local_only_never_reaches_remote_even_when_the_gate_grants_it` 用放行一切的 gate 加有效的云授权资源，LocalOnly 任务在只有远端、本地失败、本地冷却三种情况下远端都零调用；同样的 gate 和授权下 Any 任务能到远端（对照）。这里 LocalOnly 排除是唯一挡住远端的一层。把排除去掉后，这条和 `tier_order_respects_privacy_and_complexity` 变红，上面三条老的 (a) 测试仍绿。
+- **撤门（6b.5e）的前置，已补**：`a_granting_gate_never_serves_local_only_*` 三条用放行一切的 gate 加有效的云授权资源，LocalOnly 任务在只有远端、本地失败、本地冷却三种情况下远端都零调用，一种情况一条；同样的 gate 和授权下 Any 任务能到远端（对照，在只有远端那条里）。这里 LocalOnly 排除是唯一挡住远端的一层。把排除去掉后，这三条和 `tier_order_respects_privacy_and_complexity` 变红，上面三条老的 (a) 测试仍绿。
 
 ## 3. 网络类
 
@@ -73,13 +73,7 @@
 | **shell_exec** | `local.rs` `shell_exec_fails_closed_when_child_network_use_cannot_be_bounded`、`local_only_shell_exec_is_denied_even_by_permissive_egress_gate`（6b.5d 起改用 `touch`，断言子进程没跑） | `local.rs` `shell_exec_is_denied_when_source_policy_lookup_failed`（同样断言零副作用）；`lib.rs` `restricted_or_unknown_sources_of_any_kind_restrict_tool_egress`、`a_run_with_no_readable_sources_restricts_tool_egress`（经 `tool_context_for`：没有标签、标签读失败；6b.5d） | `local.rs` `cloud_authorized_shell_exec_is_denied_because_its_destination_is_unknown`（授权齐全的 CloudAuthorized 加放行 gate 仍被拒，子进程没跑；6b.5d）；`domain/egress.rs` `a_permissive_gate_cannot_allow_what_the_invariants_refuse`（非远端、空目的地、没有资源） | `local.rs` `shell_exec_runs_for_ordinary_run_without_egress_policy`、`ordinary_shell_exec_runs_after_approval_without_egress_gate`；`lib.rs` `approved_shell_exec_actually_executes` |
 | **模块进程自身出网** | 没有网络沙箱。**已知限制**：只靠调用前的出口门（受限 run 一律拒） | — | — | — |
 
-`has_remote` 过渡门（`module_tool_runtime.rs` 的 `blocked_by_remote_tier_guard`）现有测试：
-- `a_withheld_tool_called_by_name_is_refused_and_audited`
-- `the_guard_refuses_before_authorization_is_looked_up`
-- `a_remote_tier_added_while_running_refuses_the_next_call`
-- `the_production_view_reads_the_tier_on_every_check`（tier 读不出来按远端计）
-
-撤门见 6b.5e。
+`has_remote` 过渡门（`module_tool_runtime.rs` 的 `blocked_by_remote_tier_guard`，只挡 `documents` 模块）已在 6b.5e 撤除，它的 4 条测试随门删掉。文档工具从此只受上表这一行和 §2 的逐 run 门约束：调用前的出口门（(a)(b)(c) 三列），结果进模型前打来源标签（6b.5f），run 自己的模型调用按来源取 LocalOnly（§2），模块自己的模型回调一律 LocalOnly（6b.5g）。
 
 ## 5. 存储外流与生命周期
 
@@ -150,4 +144,4 @@
 | 6b.5d 模块、进程、生命周期 | 模块工具 (b)(c)；shell_exec 零副作用、CloudAuthorized 仍被拒、`tool_context_for` 两个分支；恢复时受限来源的出口测试；模型 override 测试 |
 | 6b.5f 工具结果打标签 | 按 §6 第 4 条 David 10-26 的两项决定。5f-1：run 内打标签（结果进模型之前，写失败就结束 run）和模块的同源回送。5f-2：来源模块跨轮次传到会话后面的轮次。5f-3：放宽 6b.5c-2 的 peer 视图规则，改成按标签逐条对账（§6 第 4 条 10-27 的决定），并用 0028 回填存量缺口 |
 | 6b.5g 模块模型回调 | 回调一律 LocalOnly（§6 第 2 条，David 10-27 选 C）；测试 `every_grant_routes_local_only_whatever_its_manifest_declares`，以及 `me4_model_blackbox.rs` 场景 3 改写说明 |
-| 6b.5e 撤 `has_remote` 过渡门 | 前提：本表全绿、§2 末尾那条 LocalOnly 排除测试已补、§6 第 2 条已落实（6b.5g：回调一律 LocalOnly）、6b.5f 已合入、K1-6a 已验收；附 #708 macOS 证据。**撤门要 David 确认** |
+| 6b.5e 撤 `has_remote` 过渡门 | **已撤**（见 §4 末尾）。前提：本表全绿、§2 末尾那条 LocalOnly 排除测试已补、§6 第 2 条已落实（6b.5g：回调一律 LocalOnly）、6b.5f 已合入、K1-6a 已验收；附 #708 macOS 证据。**撤门要 David 确认** |
