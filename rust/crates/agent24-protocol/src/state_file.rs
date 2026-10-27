@@ -198,11 +198,17 @@ pub fn write(state: &DaemonState) -> std::io::Result<()> {
 /// (two CLIs both deciding "nothing running" and both spawning).
 /// Returns Ok(None) when another daemon already holds the lock.
 pub fn try_acquire_singleton() -> std::io::Result<Option<std::fs::File>> {
-    use fs2::FileExt;
     let Some(dir) = state_dir() else {
         return Err(std::io::Error::other("HOME not set"));
     };
-    std::fs::create_dir_all(&dir)?;
+    try_acquire_singleton_in(&dir)
+}
+
+/// `<dir>/daemon.singleton.lock`, the same non-blocking `fs2` lock.
+/// `Ok(None)` means it is already held. The file releases the lock on drop.
+pub fn try_acquire_singleton_in(dir: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
+    use fs2::FileExt;
+    std::fs::create_dir_all(dir)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
