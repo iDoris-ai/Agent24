@@ -139,7 +139,7 @@ R 组用 U1 导入的文档（EPA 煮沸通知，第 1 页 17 个块，「boil�
 | R11 | `extract <doc> 1 --schema ask.json`，再 `cancel` 这个作业 | 打出 `extract job job_… (queued 或 running)`；作业的 `kind` 是 `extract`；取消后作业停在 `cancelled`。不需要模型：判的是作业建出来和取消后的结局，不判抽取出的值（本机没有模型时，作业一直停在 `running` 等模型，实测 40 秒以上） |
 | R12 | `extract --rerun`，不带 `--key` | 退出 1，stdout 只有一行 result，400，`the Idempotency-Key header is required` |
 | R13 | `extract --key k1`，不带 `--rerun` | 退出 1，400 `invalid_request`，`--key names a rerun; give --rerun with it`（不会被静默忽略） |
-| R14 | `extract --schema` 一个不是 JSON 的文件 | 退出 1，一行 result，400 `the schema is not JSON`。请求没有发出这一点，脚本看不到，由 CLI 的单测 `a_schema_is_any_json_from_its_file_and_anything_else_is_refused_unsent` 覆盖 |
+| R14 | `extract --schema` 一个不是 JSON 的文件 | 退出 1，一行 result，400 `the schema is not JSON`。请求没有发出这一点，脚本看不到：`extract_request` 读不出 schema 就返回错误，请求根本没有构造出来；由 CLI 的单测 `a_schema_is_any_json_from_its_file_and_anything_else_is_refused_unsent` 经 `extract_request` 覆盖 |
 | R15 | `extraction ext_000…` | 退出 1，404 `no such extraction` |
 | R16 | 按桌面端的传法 `request --host-stdin --json` 发 `find` | 一行 result，`matches` 是数组，个数与 R4 相同（R4 少于 2 个时判失败） |
 | R17 | 按桌面端的传法发 `renderPage`（scale 0.25） | 一行 result，`image/png`，`scale` 0.25；`png` 解码后是 153×198 的 PNG |
