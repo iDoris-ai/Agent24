@@ -514,7 +514,7 @@ ic() { curl -s -m 20 -o $WORK/ir.json -w '%{http_code}' -H "Authorization: Beare
 - PR/issue：#1370（ID-6）。执行方式：脚本。
 
 **ID-8 真机**
-- 机器：jason 笔记本（M1 Max）。iDoris 侧已用 v0.3.1 候选二进制（main 21b3f74 + #581 release 构建）在此机预演通过（`idoris/daily` → `Qwen3-0.6B-4bit`，200，locality=loopback，越权 `idoris/vision` 403）。本期验收仍要用正式 v0.3.1 归档（已校验 sha256）再跑一遍。
+- 机器：jason 笔记本（M1 Max）。iDoris 侧已用 v0.3.1 候选二进制（main 21b3f74 + #581 release 构建）在此机预演通过（`idoris/daily` → `Qwen3-0.6B-4bit`，200，locality=loopback，越权 `idoris/vision` 403）。本期验收仍要用正式 v0.3.1 归档再跑一遍：tag `v0.3.1` = `8e3a216`，资产 `idoris-v0.3.1-aarch64-apple-darwin.tar.gz`，sha256 `1125301fc32f9e44d4d06e5127137ba14196a32f9274b7416a345e690b2ffea1`（解包前 `shasum -a 256` 比对）。iDoris main 已到 `05fa85c`（含 #583），**不要用**，本期锁 v0.3.1。
 - 前置（本机与样例不同的三处，照此执行）：
   1. **隔离 HOME**：不复用本机现有 iDoris/Agent24 状态。每个要跑的终端先 `export HOME=$(mktemp -d)`（或用全新 macOS 用户），再起 iDoris 和 Agent24；数据库、`~/.agent24` 都落在这个临时 HOME 里。
   2. **oMLX 端口是 8088（不是卡片默认的 8000），且开了认证**。启动 iDoris 前在**当前 shell**设 `IDORIS_OMLX_API_KEY`，值取本机 oMLX 的 API key：oMLX.app 的 Settings 里的 API key，或配置文件 `~/.omlx/settings.json` 的 `auth.api_key`。**注意先于换 HOME 之前读出**（或直接用真实 HOME 的绝对路径读）：
