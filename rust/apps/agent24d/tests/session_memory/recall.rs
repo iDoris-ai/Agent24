@@ -151,7 +151,8 @@ async fn approval_app(
         workspace_service: None,
         token: "test".into(),
         router,
-        tools: agent24_tools::ToolRegistry::builtin(path.to_path_buf()),
+        tools: agent24_tools::ToolRegistry::builtin(path.to_path_buf())
+            .with_egress_gate(<dyn agent24_domain::EgressGate>::deny_all()),
         store,
         shutdown: Shutdown::new(cancel),
         guardian: None,
