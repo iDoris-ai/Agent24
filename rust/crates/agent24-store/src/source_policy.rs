@@ -1228,6 +1228,97 @@ mod tests {
         );
     }
 
+    /// K1-6b.5f-3 (David 2026-10-27, B): every session run present at the
+    /// upgrade that carries no session floor gets an `unknown` one, which
+    /// reads back as the session-context tag the kernel itself would write.
+    #[tokio::test]
+    async fn a_session_run_without_a_floor_before_0028_gets_an_unknown_one() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.migrations = std::borrow::Cow::Owned(
+            migrator
+                .migrations
+                .iter()
+                .filter(|m| m.version <= 27)
+                .cloned()
+                .collect(),
+        );
+        migrator.run(&pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO sessions (id, title, channel, created_at, updated_at) VALUES \
+                ('s1', 't', 'api', 't', 't'); \
+             INSERT INTO runs (id, session_id, status, input, usage, created_at) VALUES \
+                ('r_gap', 's1', 'completed', '{}', '{}', 't'), \
+                ('r_untagged', 's1', 'completed', '{}', '{}', 't'), \
+                ('r_floor', 's1', 'completed', '{}', '{}', 't'), \
+                ('r_alone', NULL, 'completed', '{}', '{}', 't');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = crate::test_hooks::from_pool(pool);
+        for run in ["r_gap", "r_floor", "r_alone"] {
+            store
+                .tag_run_source(run, 0, &SourceRef::user_input(run, "t"), "t")
+                .await
+                .unwrap();
+        }
+        let floor = SourceRef::session_floor("s1", SourceClassification::Ordinary, "t");
+        store
+            .tag_run_source("r_floor", 1, &floor, "t")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations")
+            .run(store.pool())
+            .await
+            .unwrap();
+
+        for run in ["r_gap", "r_untagged"] {
+            let floors: Vec<_> = store
+                .list_run_source_tags(run)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|tag| tag.source.kind == SourceKind::SessionContext)
+                .collect();
+            let [backfilled] = floors.as_slice() else {
+                panic!("{run}: one session floor expected, got {floors:?}");
+            };
+            assert_eq!(
+                backfilled.source,
+                SourceRef::session_floor(
+                    "s1",
+                    SourceClassification::Unknown,
+                    backfilled.source.created_at.clone()
+                ),
+                "{run}"
+            );
+        }
+        // A floor the kernel wrote is kept as it was; a run without a
+        // session has none to miss.
+        let kept: Vec<_> = store
+            .list_run_source_tags("r_floor")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|tag| tag.source)
+            .filter(|source| source.kind == SourceKind::SessionContext)
+            .collect();
+        assert_eq!(kept, [floor]);
+        assert!(
+            store
+                .list_run_source_tags("r_alone")
+                .await
+                .unwrap()
+                .iter()
+                .all(|tag| tag.source.kind != SourceKind::SessionContext)
+        );
+    }
+
     /// K1-6b.5f-2: the tag and the session's origin are written together or
     /// not at all, so a later turn never misses an origin whose result was
     /// tagged.
