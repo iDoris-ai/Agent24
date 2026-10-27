@@ -11,6 +11,7 @@ import {
   readExternalDaemonState,
   BackendManager,
   selectedBackend,
+  resolveNodeEntryFrom,
   resolveRustBinary,
   getBackendEndpoint,
   type ExternalDaemonSource,
@@ -612,6 +613,20 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
     } finally {
       manager.stop()
     }
+  })
+})
+
+describe('resolveNodeEntryFrom (REV-01: path depth, no injection)', () => {
+  const want = path.resolve('/R/packages/node-daemon/dist/server.js')
+  it.each(['/R/apps/desktop/dist/main', '/R/apps/desktop/src/main'])('%s → <repo>/packages/node-daemon/dist/server.js', (dir) => {
+    expect(resolveNodeEntryFrom(dir, () => true)).toBe(want)
+  })
+  it('throws with a build hint when the file is absent', () => {
+    expect(() => resolveNodeEntryFrom('/R/apps/desktop/dist/main', () => false)).toThrow(/node-daemon build/)
+  })
+  it('the real __dirname (src/main) resolves to this checkout\'s packages/node-daemon', () => {
+    expect(resolveNodeEntryFrom(__dirname, () => true)).toBe(path.resolve(__dirname, '../../../../packages/node-daemon/dist/server.js'))
+    expect(fs.existsSync(path.resolve(__dirname, '../../../../packages/node-daemon/package.json'))).toBe(true)
   })
 })
 

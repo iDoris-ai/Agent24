@@ -50,6 +50,11 @@ pub struct DaemonState {
     /// is incompatible ([`crate::protocol_compatibility`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<u32>,
+    /// Path of the enrolment socket (`<data_dir>/enroll.sock`), published by
+    /// capability daemons that run the endpoint (CORE-2e). A path, never a
+    /// credential; absent for legacy daemons and for older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enroll_endpoint: Option<String>,
 }
 
 impl DaemonState {
@@ -69,6 +74,7 @@ impl DaemonState {
             generation: generation.into(),
             auth_mode: AuthMode::LegacySingleToken,
             protocol_version: Some(crate::PROTOCOL_VERSION),
+            enroll_endpoint: None,
         };
         state.validate().map(|()| state)
     }
@@ -89,12 +95,24 @@ impl DaemonState {
             generation: generation.into(),
             auth_mode: AuthMode::Capabilities,
             protocol_version: Some(crate::PROTOCOL_VERSION),
+            enroll_endpoint: None,
         };
         state.validate().map(|()| state)
     }
 
+    /// Advertise the enrolment socket. Only capability records may carry it
+    /// ([`Self::validate`] rejects it elsewhere).
+    #[must_use]
+    pub fn with_enroll_endpoint(mut self, path: impl Into<String>) -> Self {
+        self.enroll_endpoint = Some(path.into());
+        self
+    }
+
     /// Check the mutually-exclusive credential contract.
     pub fn validate(&self) -> Result<(), String> {
+        if self.enroll_endpoint.is_some() && self.auth_mode != AuthMode::Capabilities {
+            return Err("enroll_endpoint is valid only in capabilities auth mode".to_owned());
+        }
         match self.auth_mode {
             AuthMode::LegacySingleToken => {
                 if self.token.is_empty() {
@@ -334,6 +352,7 @@ mod tests {
             generation: "gen".into(),
             auth_mode: AuthMode::Capabilities,
             protocol_version: Some(crate::PROTOCOL_VERSION),
+            enroll_endpoint: None,
         };
         assert!(with_token.validate().is_err());
         let without_token = DaemonState {
@@ -344,7 +363,26 @@ mod tests {
             generation: "gen".into(),
             auth_mode: AuthMode::LegacySingleToken,
             protocol_version: None,
+            enroll_endpoint: None,
         };
         assert!(without_token.validate().is_err());
+    }
+
+    #[test]
+    fn enroll_endpoint_is_a_capability_only_path_with_no_token() {
+        let state = DaemonState::new_capabilities(1, 2, "v", "g")
+            .unwrap()
+            .with_enroll_endpoint("/d/enroll.sock");
+        state.validate().unwrap();
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["enroll_endpoint"], "/d/enroll.sock");
+        assert!(json.get("token").is_none());
+        let mut legacy = DaemonState::new_legacy(1, "t", 2, "v", "g").unwrap();
+        legacy.enroll_endpoint = Some("/d/enroll.sock".to_owned());
+        assert!(legacy.validate().is_err());
+        // Old files without the field still parse.
+        let old: DaemonState =
+            serde_json::from_str(r#"{"port":1,"token":"t","pid":2,"version":"v"}"#).unwrap();
+        assert_eq!(old.enroll_endpoint, None);
     }
 }

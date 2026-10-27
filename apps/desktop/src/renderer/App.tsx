@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
 import type { Agent24API } from '../main/preload'
-import type { ModuleInfo } from '../shared/ipc-types'
 
 declare global {
   interface Window { agent24: Agent24API }
@@ -11,9 +10,7 @@ import WorkbenchPage from './pages/Workbench'
 import ModelsPage from './pages/Models'
 import SettingsPage from './pages/Settings'
 import ModulesManagerPage from './pages/ModulesManager'
-import HelloModule from './pages/modules/HelloModule'
-import CodeSandboxPage from './pages/CodeSandbox'
-import ServiceBoxDemoPage from './pages/ServiceBoxDemo'
+import { listOsModules } from './pages/agent/api'
 import RunsPage from './pages/Runs'
 import SchedulesPage from './pages/Schedules'
 import CommunicationPage from './pages/comm/Communication'
@@ -25,13 +22,6 @@ import DocumentsPage from './pages/documents/Documents'
 import logoSidebar from './assets/logo-sidebar.png'
 import { useT } from './i18n'
 import { appMessages } from './App.i18n'
-
-// Static module route map — M2 will replace this with dynamic import()
-const MODULE_PAGES: Record<string, React.ComponentType> = {
-  '/modules/hello': HelloModule,
-  'codebox': CodeSandboxPage,
-  'service-box': ServiceBoxDemoPage,
-}
 
 type BuiltinPage =
   | 'home'
@@ -48,7 +38,7 @@ type BuiltinPage =
   | 'memory'
   | 'settings'
   | 'modules-manager'
-type Page = BuiltinPage | string  // string = module route
+type Page = BuiltinPage | string  // string: Home passes station page ids through
 
 const BUILTIN_NAV: { id: BuiltinPage; icon: string }[] = [
   // The landing page: an isometric machine showing how one run moves through the components.
@@ -118,7 +108,8 @@ export function App(): JSX.Element {
   const [version, setVersion] = useState<string>('')
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [darkMode, setDarkMode] = useState(true)
-  const [modules, setModules] = useState<ModuleInfo[]>([])
+  // Domain-OS modules actually mounted (state==='mounted') in the daemon (`GET /api/v1/os`) — the Home card.
+  const [osModuleCount, setOsModuleCount] = useState(0)
   // Renamed from `llmLabel`: this is now only the oMLX-derived FALLBACK,
   // used when the daemon has no `default_model` to report. The topbar's
   // actual displayed label is the `llmLabel` derived value below.
@@ -146,13 +137,15 @@ export function App(): JSX.Element {
 
     void window.agent24.getAppVersion().then(setVersion)
 
-    // Backend health + module list polling
+    // Backend health + domain-OS module count polling
     const checkBackend = () => {
       window.agent24.backendProxy({ method: 'GET', path: '/api/v1/health' })
         .then((res) => {
           setBackendOk(res.ok)
           if (res.ok) {
-            void window.agent24.modulesList().then(setModules)
+            void listOsModules()
+              .then((l) => setOsModuleCount(Array.isArray(l.modules) ? l.modules.filter((m) => m.state === 'mounted').length : 0))
+              .catch(() => { /* keep the last count */ })
             // FU-93: show the daemon's real port, not a hardcoded guess.
             void window.agent24.backendEndpoint().then((e) => setBackendPort(e?.port ?? null))
             // ME4-desktop-model-ui: ask the daemon what its OWN default
@@ -200,15 +193,8 @@ export function App(): JSX.Element {
     return () => clearInterval(backendTimer)
   }, [])
 
-  // UI modules with navItem get injected into sidebar
-  const moduleNavItems = modules.filter(
-    (m) => (m.type === 'ui' || m.type === 'hybrid') && m.navItem,
-  )
-
   const isBuiltin = BUILTIN_NAV.some((n) => n.id === page)
-  const pageTitle = (isBuiltin ? t(`title.${page as BuiltinPage}`) : undefined)
-    ?? modules.find((m) => m.navItem?.route === page)?.name
-    ?? page
+  const pageTitle = (isBuiltin ? t(`title.${page as BuiltinPage}`) : undefined) ?? page
 
   return (
     <div className={`app${darkMode ? '' : ' light'}`}>
@@ -238,37 +224,6 @@ export function App(): JSX.Element {
               <span>{t(`nav.${item.id}`)}</span>
             </button>
           ))}
-
-          {/* Dynamically injected UI module nav items */}
-          {moduleNavItems.length > 0 && (
-            <>
-              <div className="nav-section">{t('nav.section.modules')}</div>
-              {moduleNavItems.map((m) => (
-                <button
-                  key={m.id}
-                  className={`nav-item ${page === m.navItem!.route ? 'active' : ''}`}
-                  onClick={() => setPage(m.navItem!.route)}
-                >
-                  <span className="icon">{m.navItem!.icon}</span>
-                  <span>{m.navItem!.label}</span>
-                </button>
-              ))}
-            </>
-          )}
-
-          {moduleNavItems.length === 0 && (
-            <>
-              <div className="nav-section">{t('nav.section.modules')}</div>
-              <button
-                className="nav-item"
-                onClick={() => setPage('modules-manager')}
-                style={{ opacity: 0.7 }}
-              >
-                <span className="icon">➕</span>
-                <span>{t('nav.installModule')}</span>
-              </button>
-            </>
-          )}
         </nav>
 
         <div className="sidebar-footer">
@@ -321,7 +276,7 @@ export function App(): JSX.Element {
           <HomePage
             backendOk={backendOk}
             backendPort={backendPort}
-            moduleCount={modules.length}
+            moduleCount={osModuleCount}
             onNavigate={setPage}
           />
         )}
@@ -337,19 +292,6 @@ export function App(): JSX.Element {
         {page === 'modules-manager'  && <ModulesManagerPage />}
         {page === 'memory'           && <MemoryPage />}
         {page === 'settings'         && <SettingsPage />}
-        {/* Module UI pages — static map in M1, dynamic import() in M2 */}
-        {moduleNavItems.map((m) => {
-          if (page !== m.navItem!.route) return null
-          const ModulePage = MODULE_PAGES[m.navItem!.route]
-          return ModulePage
-            ? <ModulePage key={m.id} />
-            : (
-              <div key={m.id} className="content">
-                <div className="page-title">{m.name}</div>
-                <p style={{ color: 'var(--muted)', fontSize: 13 }}>{t('module.notRegistered')}</p>
-              </div>
-            )
-        })}
       </div>
     </div>
   )
