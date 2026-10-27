@@ -219,6 +219,11 @@ fn the_read_extract_and_render_operations_map_to_their_fixed_routes() {
             json!({"op": "readText", "documentId": DOC, "revision": 1, "block": "p2/b10", "limit": 5, "requireComplete": true}),
             get(format!("{text}?block=p2/b10&limit=5&require_complete=true")),
         ),
+        // A page is a u32: ten digits.
+        (
+            json!({"op": "readText", "documentId": DOC, "revision": 1, "block": "p4294967295/b12"}),
+            get(format!("{text}?block=p4294967295/b12")),
+        ),
         (
             json!({"op": "readText", "documentId": DOC, "revision": 1, "requireComplete": false}),
             get(format!("{text}?require_complete=false")),
@@ -246,6 +251,11 @@ fn the_read_extract_and_render_operations_map_to_their_fixed_routes() {
         (
             json!({"op": "renderPage", "documentId": DOC, "revision": 2, "page": 3, "scale": 0.25, "region": "0,1.5,1e+2,2E-1"}),
             get(format!("{page}?scale=0.25&region=0,1.5,1e%2B2,2E-1")),
+        ),
+        // As long as the pattern allows: the OS parses it.
+        (
+            json!({"op": "renderPage", "documentId": DOC, "revision": 2, "page": 3, "region": format!("0.{},0,1,1", "0".repeat(400))}),
+            get(format!("{page}?region=0.{},0,1,1", "0".repeat(400))),
         ),
         (
             json!({"op": "renderPage", "documentId": DOC, "revision": 2, "page": 3, "scale": 4}),
@@ -410,6 +420,25 @@ async fn a_rendered_page_comes_back_as_json_with_its_png_and_scale() {
             br#"{"a":1}"#.as_slice(),
         ),
         (200, vec![("content-type", "image/png")], PNG),
+        // Two scales, or two types: which one is meant is not known.
+        (
+            200,
+            vec![
+                ("content-type", "image/png"),
+                ("documents-render-scale", "1"),
+                ("Documents-Render-Scale", "8"),
+            ],
+            PNG,
+        ),
+        (
+            200,
+            vec![
+                ("content-type", "image/png"),
+                ("content-type", "text/plain"),
+                ("documents-render-scale", "1"),
+            ],
+            PNG,
+        ),
         (
             200,
             vec![

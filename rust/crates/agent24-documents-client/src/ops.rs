@@ -24,9 +24,9 @@ fn cursor_ok(c: &str) -> bool {
     (1..=4096).contains(&c.len()) && c.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'z'))
 }
 
-/// `1` to `999999999`, no leading zero.
+/// A positive whole number, no leading zero; up to 20 digits, a `u64`'s.
 fn ordinal(s: &str) -> bool {
-    (1..=9).contains(&s.len()) && !s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit())
+    (1..=20).contains(&s.len()) && !s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// A text layer's block id: `p<page>/b<n>` (`text_layer.rs`).
@@ -53,9 +53,9 @@ fn coordinate_ok(c: &str) -> bool {
     mantissa_ok && exponent_ok
 }
 
-/// `x0,y0,x1,y1`, at most 400 characters.
+/// `x0,y0,x1,y1`.
 fn region_ok(r: &str) -> bool {
-    r.len() <= 400 && r.split(',').count() == 4 && r.split(',').all(coordinate_ok)
+    r.split(',').count() == 4 && r.split(',').all(coordinate_ok)
 }
 
 /// An `Idempotency-Key`: 1–200 visible ASCII characters, no spaces.
@@ -275,11 +275,13 @@ fn to_page(reply: Reply) -> Response {
     if !(200..300).contains(status) {
         return to_response(reply);
     }
+    // Exactly one of each: a repeated header could say two things.
     let header = |name: &str| {
-        headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+        let mut values = headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case(name));
+        match (values.next(), values.next()) {
+            (Some((_, v)), None) => Some(v.as_str()),
+            _ => None,
+        }
     };
     let png = header("content-type")
         .and_then(|t| t.split(';').next())

@@ -180,3 +180,20 @@ async fn a_path_that_does_not_start_with_a_slash_is_never_sent() {
     assert_eq!(reply, failed(400, "invalid_request", "not a daemon path"));
     task.abort();
 }
+
+#[tokio::test]
+async fn a_header_that_is_not_text_is_kept_not_dropped() {
+    // Dropped, it could hide a second Documents-Render-Scale (ops.rs).
+    let mut reply =
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\nDocuments-Render-Scale: "
+            .to_vec();
+    reply.extend_from_slice(b"\xff\r\n\r\n");
+    let (base, task) = serve(Some(reply)).await;
+    let t = HttpTransport::new(&base, Some("tok".to_owned())).unwrap();
+    let Reply::Http { headers, .. } = t.send(post("/api/v1/documents/x", b"{}")).await else {
+        panic!("expected a reply");
+    };
+    let header = ("documents-render-scale".to_owned(), "\u{fffd}".to_owned());
+    assert!(headers.contains(&header), "{headers:?}");
+    task.await.unwrap();
+}

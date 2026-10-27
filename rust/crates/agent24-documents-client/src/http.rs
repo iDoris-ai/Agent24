@@ -109,8 +109,10 @@ impl Transport for HttpTransport {
         let headers = response
             .headers()
             .iter()
-            .filter_map(|(name, value)| {
-                Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
+            // Every value, lossily: one that is not text still counts as there.
+            .map(|(name, value)| {
+                let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
+                (name.as_str().to_owned(), value)
             })
             .collect();
         let mut body = Vec::new();

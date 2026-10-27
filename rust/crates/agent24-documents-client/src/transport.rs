@@ -26,8 +26,9 @@ pub struct Request {
 /// `invalid_response` (a reply too large).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reply {
-    /// `headers` are the reply's, names in lower case; only a rendered page
-    /// reads them (its content type and scale).
+    /// `headers` are the reply's, every one, names in lower case and values
+    /// decoded lossily; only a rendered page reads them (its content type
+    /// and scale).
     Http {
         status: u16,
         headers: Vec<(String, String)>,
