@@ -20,6 +20,7 @@
 //! them apart — only `RunStatus` can (`cancelled` vs `awaiting_approval`). So
 //! the status gate comes first and is load-bearing, not a formality.
 
+use agent24_models::ToolCallRequest;
 use agent24_protocol::RunStatus;
 use agent24_store::RunMessage;
 use serde_json::{Map, Value};
@@ -53,21 +54,16 @@ impl ResumePlan {
     }
 }
 
-/// Extract the tool_call ids requested by an assistant message row. Empty for
-/// any non-assistant row, a text-only assistant turn, or a malformed
-/// `tool_calls` value (treated as "no calls" rather than erroring — a row we
-/// cannot parse must not be mistaken for a resumable suspension point).
-fn requested_call_ids(msg: &RunMessage) -> Vec<String> {
-    if msg.role != "assistant" {
-        return Vec::new();
-    }
-    let Some(calls) = msg.tool_calls.as_array() else {
-        return Vec::new();
-    };
-    calls
-        .iter()
-        .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(str::to_owned))
-        .collect()
+/// Whether `msg` is an assistant turn that requested tool calls: anything in
+/// `tool_calls` but `[]` (or `null`). A malformed value counts, so the turn is
+/// checked and refused rather than passed over for an earlier one (#1379 L1).
+fn requests_tool_calls(msg: &RunMessage) -> bool {
+    msg.role == "assistant"
+        && !msg.tool_calls.is_null()
+        && msg
+            .tool_calls
+            .as_array()
+            .is_none_or(|calls| !calls.is_empty())
 }
 
 /// Decide how (or whether) to resume a run from its persisted thread.
@@ -80,7 +76,8 @@ fn requested_call_ids(msg: &RunMessage) -> Vec<String> {
 ///    (a `Running` crash left no pending human; the orphan-run sweep lands it).
 /// 2. the thread's LAST tool-calling assistant turn has at least one call with
 ///    no answering `tool` message after it.
-/// 3. every call of that turn has an id of its own. Answers and the approval
+/// 3. that turn reads as tool calls the way the resumed loop reads it, and
+///    every call of it has an id of its own. Answers and the approval
 ///    are tied to a call only by its id, so a turn that repeats one (or leaves
 ///    one out) cannot say which call was approved: a call answered under the
 ///    shared id would hide the parked one, and the approval could settle a
@@ -103,20 +100,25 @@ pub fn plan_resume(status: RunStatus, thread: &[RunMessage]) -> ResumePlan {
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, m)| !requested_call_ids(m).is_empty())
+        .find(|(_, m)| requests_tool_calls(m))
     else {
         return ResumePlan::not_resumable(
             "awaiting_approval but no tool-calling assistant turn on disk (inconsistent thread)",
         );
     };
-    let requested = requested_call_ids(assistant);
-    let calls = assistant.tool_calls.as_array().map_or(0, Vec::len);
+    // (3) Read as the resumed loop reads it (`Msg::tool_calls`), so a turn it
+    // would take for "no calls" cannot send it to an earlier turn instead.
+    let Ok(calls) = serde_json::from_value::<Vec<ToolCallRequest>>(assistant.tool_calls.clone())
+    else {
+        return ResumePlan::not_resumable("the parked turn's tool calls cannot be read");
+    };
+    let requested: Vec<&str> = calls.iter().map(|call| call.id.as_str()).collect();
     let distinct: std::collections::HashSet<&str> = requested
         .iter()
-        .map(String::as_str)
+        .copied()
         .filter(|id| !id.is_empty())
         .collect();
-    if distinct.len() != calls {
+    if distinct.len() != calls.len() {
         return ResumePlan::not_resumable(
             "the parked turn does not give each tool call an id of its own",
         );
@@ -131,10 +133,10 @@ pub fn plan_resume(status: RunStatus, thread: &[RunMessage]) -> ResumePlan {
         .filter_map(|m| m.tool_call_id.as_deref())
         .collect();
 
-    match requested.iter().find(|id| !answered.contains(id.as_str())) {
+    match requested.iter().find(|id| !answered.contains(*id)) {
         Some(unanswered) => ResumePlan::AwaitingToolApproval {
             assistant_seq: assistant.seq,
-            tool_call_id: unanswered.clone(),
+            tool_call_id: (*unanswered).to_owned(),
         },
         // Every requested call already has an answer, yet the run is parked
         // awaiting approval: the thread and the status disagree. Fail closed —
@@ -209,6 +211,10 @@ fn find_requested_call<'a>(
 /// 3. the input rebuilt from the thread still equals what was approved — the
 ///    payload-integrity property ("refuse to run B for an approval of A"), and
 ///    ALSO what ties this approval to this parked call across the id namespaces;
+///    and the call names the tool the approval was asked for (`approved_tool`,
+///    from the approval's own `tool_calls` row): an earlier call whose answer
+///    was never written can share the parked call's arguments, and would
+///    otherwise be settled with its approval (#1379 review);
 /// 4. the approval is not older than the resume TTL (`created_at >= ttl_cutoff`;
 ///    both fixed-width UTC, so the lexical compare is chronological).
 ///
@@ -216,6 +222,7 @@ fn find_requested_call<'a>(
 /// `ttl_cutoff` from the clock ([`agent24_core::util::iso8601_before`]).
 pub fn assess_restore(
     approved_payload: &Map<String, Value>,
+    approved_tool: &str,
     created_at: &str,
     run_status: RunStatus,
     thread: &[RunMessage],
@@ -237,6 +244,14 @@ pub fn assess_restore(
     if !tool_exists(name) {
         return RestoreDecision::Abort {
             reason: format!("tool `{name}` is no longer registered — cannot resume its call"),
+        };
+    }
+    if name != approved_tool {
+        return RestoreDecision::Abort {
+            reason: format!(
+                "tool_call {tool_call_id} is a `{name}` call, but the approval was asked for \
+                 `{approved_tool}`"
+            ),
         };
     }
 
@@ -375,6 +390,11 @@ mod tests {
             ]),
             json!([
                 call("call_x", "fs_read"),
+                call("", "fs_write"),
+                call("call_y", "shell_exec"),
+            ]),
+            json!([
+                call("call_x", "fs_read"),
                 json!({ "name": "fs_write", "arguments": "{}" }),
                 call("call_y", "shell_exec"),
             ]),
@@ -385,6 +405,58 @@ mod tests {
                     ResumePlan::NotResumable { .. }
                 ),
                 "{calls}"
+            );
+        }
+    }
+
+    /// #1379 L1: the last turn that asked for tools is the one checked, even
+    /// when none of its calls has an id, or it does not read as tool calls the
+    /// way the resumed loop reads it; it is never passed over for an earlier
+    /// turn whose call is still unanswered.
+    #[test]
+    fn a_last_turn_the_loop_cannot_read_is_not_passed_over() {
+        let earlier = assistant_calls(1, &["call_x"]);
+        let last = |calls: serde_json::Value| RunMessage {
+            tool_calls: calls,
+            ..assistant_calls(2, &[])
+        };
+        let control = [
+            user(0, "go"),
+            earlier.clone(),
+            assistant_calls(2, &["call_w"]),
+        ];
+        assert_eq!(
+            plan_resume(RunStatus::AwaitingApproval, &control),
+            ResumePlan::AwaitingToolApproval {
+                assistant_seq: 2,
+                tool_call_id: "call_w".to_owned(),
+            }
+        );
+        for calls in [
+            json!([{ "name": "fs_write", "arguments": "{}" }]),
+            json!([{ "id": 7, "name": "fs_write", "arguments": "{}" }]),
+            json!([{ "id": "call_w", "name": 7, "arguments": "{}" }]),
+            json!([{ "id": "call_w", "name": "fs_write" }]),
+            json!([null]),
+            json!({ "id": "call_w", "name": "fs_write", "arguments": "{}" }),
+        ] {
+            let thread = [user(0, "go"), earlier.clone(), last(calls.clone())];
+            assert!(
+                matches!(
+                    plan_resume(RunStatus::AwaitingApproval, &thread),
+                    ResumePlan::NotResumable { .. }
+                ),
+                "{calls}"
+            );
+        }
+        for empty in [json!([]), serde_json::Value::Null] {
+            let thread = [user(0, "go"), earlier.clone(), last(empty)];
+            assert_eq!(
+                plan_resume(RunStatus::AwaitingApproval, &thread),
+                ResumePlan::AwaitingToolApproval {
+                    assistant_seq: 1,
+                    tool_call_id: "call_x".to_owned(),
+                }
             );
         }
     }
@@ -534,6 +606,7 @@ mod tests {
         assert_eq!(
             assess_restore(
                 &Map::new(),
+                "shell_exec",
                 FRESH,
                 RunStatus::AwaitingApproval,
                 &thread,
@@ -562,6 +635,7 @@ mod tests {
         assert_eq!(
             assess_restore(
                 &obj(json!({ "argv": ["x"] })),
+                "shell_exec",
                 FRESH,
                 RunStatus::AwaitingApproval,
                 &thread,
@@ -583,6 +657,7 @@ mod tests {
         assert_eq!(
             assess_restore(
                 &Map::new(),
+                "fs_write",
                 FRESH,
                 RunStatus::AwaitingApproval,
                 &thread,
@@ -604,6 +679,7 @@ mod tests {
         // Registry no longer has this tool (e.g. its MCP server went offline).
         let decision = assess_restore(
             &Map::new(),
+            "mcp_slack_post",
             FRESH,
             RunStatus::AwaitingApproval,
             &thread,
@@ -612,6 +688,45 @@ mod tests {
         );
         assert!(
             matches!(decision, RestoreDecision::Abort { ref reason } if reason.contains("no longer registered")),
+            "{decision:?}"
+        );
+    }
+
+    /// #1379 review: `fs_read` ran under `call_r` but its answer was never
+    /// written; `fs_write` under `call_w`, with the same arguments, is the
+    /// call the approval was asked for. The thread points at `call_r`, so
+    /// the approval must not settle it.
+    #[test]
+    fn an_approval_for_another_tool_aborts() {
+        let args = r#"{"path":"/tmp/x"}"#;
+        let call = |id: &str, name: &str| json!({ "id": id, "name": name, "arguments": args });
+        let thread = [
+            user(0, "go"),
+            RunMessage {
+                tool_calls: json!([call("call_r", "fs_read"), call("call_w", "fs_write")]),
+                ..assistant_calls(1, &[])
+            },
+        ];
+        let assess = |tool: &str| {
+            assess_restore(
+                &obj(json!({ "path": "/tmp/x" })),
+                tool,
+                FRESH,
+                RunStatus::AwaitingApproval,
+                &thread,
+                |_| true,
+                CUTOFF,
+            )
+        };
+        assert_eq!(
+            assess("fs_read"),
+            RestoreDecision::Restore {
+                tool_call_id: "call_r".to_owned()
+            }
+        );
+        let decision = assess("fs_write");
+        assert!(
+            matches!(&decision, RestoreDecision::Abort { reason } if reason.contains("fs_write")),
             "{decision:?}"
         );
     }
@@ -627,6 +742,7 @@ mod tests {
         ];
         let decision = assess_restore(
             &obj(json!({ "a": 2 })),
+            "shell_exec",
             FRESH,
             RunStatus::AwaitingApproval,
             &thread,
@@ -647,6 +763,7 @@ mod tests {
         ];
         let decision = assess_restore(
             &Map::new(),
+            "shell_exec",
             STALE,
             RunStatus::AwaitingApproval,
             &thread,
@@ -668,6 +785,7 @@ mod tests {
         assert!(matches!(
             assess_restore(
                 &Map::new(),
+                "shell_exec",
                 FRESH,
                 RunStatus::Cancelled,
                 &thread,

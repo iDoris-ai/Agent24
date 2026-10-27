@@ -1270,9 +1270,12 @@ impl RunManager {
             };
             // NB: the approval's `tool_call_id` (an internal `tc_` id) is
             // deliberately NOT passed — the suspension point is derived from the
-            // thread's provider ids, and the approval is matched by payload.
+            // thread's provider ids, and the approval is matched by payload and
+            // by the tool its own `tool_calls` row names.
+            let approved_tool = self.approved_tool(&approval).await?;
             match crate::resume::assess_restore(
                 &approval.payload,
+                &approved_tool,
                 &approval.created_at,
                 run.status,
                 &thread,
@@ -1404,6 +1407,20 @@ impl RunManager {
         Ok(())
     }
 
+    /// The tool `approval` was asked for: the one its `tool_calls` row names,
+    /// written before the call parked. Empty when that row is missing, which
+    /// matches no call, so the restore aborts.
+    async fn approved_tool(&self, approval: &Approval) -> Result<String, AgentError> {
+        Ok(self
+            .store
+            .list_tool_calls(&approval.run_id)
+            .await?
+            .into_iter()
+            .find(|call| call.id == approval.tool_call_id)
+            .map(|call| call.tool)
+            .unwrap_or_default())
+    }
+
     /// Body of a resume: re-validate, reconstruct, settle the parked turn's
     /// unanswered calls, then hand off to the shared loop.
     async fn drive_resume(
@@ -1422,8 +1439,17 @@ impl RunManager {
         // assess_restore. Done BEFORE any state change, so an unrestorable run
         // never emits a spurious RunStarted→Cancelled pair.
         let cutoff = agent24_core::util::iso8601_before(RESUME_TTL);
+        let approved_tool = match self.approved_tool(&approval).await {
+            Ok(tool) => tool,
+            Err(err) => {
+                tracing::warn!("run {run_id}: resume aborted — approval's call unreadable: {err}");
+                self.finish_cancelled(&run_id).await;
+                return;
+            }
+        };
         let tool_call_id = match crate::resume::assess_restore(
             &approval.payload,
+            &approved_tool,
             &approval.created_at,
             run.status,
             &thread,
@@ -6490,7 +6516,7 @@ mod approval_tests {
                 created_at: now_iso8601(),
                 decided_at: None,
             };
-            h.store.insert_approval(&approval).await.unwrap();
+            insert_parked(&h.store, &approval, "shell_exec").await;
 
             // The human answers — no in-memory waiter is woken (the task is gone).
             h.broker
@@ -6620,7 +6646,7 @@ mod approval_tests {
                 "tc_internal_1",
                 args.as_object().unwrap().clone(),
             );
-            h.store.insert_approval(&approval).await.unwrap();
+            insert_parked(&h.store, &approval, "shell_exec").await;
 
             assert_eq!(h.manager.restore_pending_approvals().await.unwrap(), (1, 0));
             h.broker
@@ -6744,7 +6770,7 @@ mod approval_tests {
             created_at: now_iso8601(),
             decided_at: None,
         };
-        h.store.insert_approval(&approval).await.unwrap();
+        insert_parked(&h.store, &approval, "doc.write").await;
         h.broker
             .resolve("apr_1", decision("approve", None))
             .await
@@ -6899,9 +6925,9 @@ mod approval_tests {
         sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,?,'g1','unix',?,?)").bind(WS).bind(&now).bind(expires.as_str()).bind(root.to_str().unwrap()).bind(rm.dev().to_le_bytes().to_vec()).bind(rm.ino().to_le_bytes().to_vec()).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
         sqlx::query("INSERT INTO workspace_allocations (allocation_id,workspace_id,root_generation,relative_name,parent_identity_kind,parent_unix_device,parent_unix_inode,root_identity_kind,root_unix_device,root_unix_inode,phase,created_at) VALUES ('wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5',?,'g1',?,'unix',?,?,'unix',?,?,'committed',?)").bind(WS).bind(&locator).bind(pm.dev().to_le_bytes().to_vec()).bind(pm.ino().to_le_bytes().to_vec()).bind(rm.dev().to_le_bytes().to_vec()).bind(rm.ino().to_le_bytes().to_vec()).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
         let wid=agent24_protocol::WorkspaceId::parse(WS).unwrap(); h.store.insert_session(&agent24_protocol::Session{id:"sess_1".into(),title:"s".into(),channel:"desktop".into(),workspace_id:Some(wid.clone()),created_at:now.clone(),updated_at:now.clone()}).await.unwrap(); let input=RunInput{prompt:"two".into(),workspace_id:Some(wid),model_override:None,mode:RunMode::Normal}; sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'awaiting_approval',?,?,?,?)").bind(WS).bind(serde_json::to_string(&input).unwrap()).bind(serde_json::to_string(&zero_usage()).unwrap()).bind(&now).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap(); sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','run_1','run',?)").bind(LEASE).bind(WS).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
-        h.store.append_run_message("run_1","user",Some("two"),&serde_json::json!([]),None,&now_iso8601()).await.unwrap(); let a1=serde_json::json!({"argv":["/bin/echo","first"]}); let a2=serde_json::json!({"argv":["/bin/echo","must-not-run"]}); let calls=serde_json::json!([{"id":"call_provider_1","name":"shell_exec","arguments":a1.to_string()},{"id":"call_provider_2","name":"shell_exec","arguments":a2.to_string()}]); h.store.append_run_message("run_1","assistant",None,&calls,None,&now_iso8601()).await.unwrap(); let approval=seed_approval("apr_1","run_1","tc_internal_1",a1.as_object().unwrap().clone()); h.store.insert_approval(&approval).await.unwrap(); h.broker.resolve("apr_1",decision("approve",None)).await.unwrap();
+        h.store.append_run_message("run_1","user",Some("two"),&serde_json::json!([]),None,&now_iso8601()).await.unwrap(); let a1=serde_json::json!({"argv":["/bin/echo","first"]}); let a2=serde_json::json!({"argv":["/bin/echo","must-not-run"]}); let calls=serde_json::json!([{"id":"call_provider_1","name":"shell_exec","arguments":a1.to_string()},{"id":"call_provider_2","name":"shell_exec","arguments":a2.to_string()}]); h.store.append_run_message("run_1","assistant",None,&calls,None,&now_iso8601()).await.unwrap(); let approval=seed_approval("apr_1","run_1","tc_internal_1",a1.as_object().unwrap().clone()); insert_parked(&h.store, &approval, "shell_exec").await; h.broker.resolve("apr_1",decision("approve",None)).await.unwrap();
         let run=h.store.get_run("run_1").await.unwrap().unwrap(); assert!(h.manager.tool_context_for(&run,"preflight").await.is_ok()); sqlx::raw_sql(&format!("CREATE TRIGGER lose_resume_authority AFTER INSERT ON run_messages WHEN NEW.run_id='run_1' AND NEW.role='tool' AND NEW.tool_call_id='call_provider_1' BEGIN UPDATE workspace_leases SET released_at='{now}' WHERE lease_id='{LEASE}'; END;")).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap(); h.manager.resume_run("run_1".into(),"apr_1".into()).await.unwrap(); assert_eq!(wait_terminal(&h.store,"run_1").await.status,RunStatus::Cancelled);
-        assert_eq!(h.store.list_tool_calls("run_1").await.unwrap().len(),0); let thread=h.store.list_run_messages("run_1").await.unwrap(); assert!(thread.iter().any(|m|m.role=="tool"&&m.tool_call_id.as_deref()==Some("call_provider_1"))); assert!(!thread.iter().any(|m|m.role=="tool"&&m.tool_call_id.as_deref()==Some("call_provider_2"))); assert_eq!(h.events.lock().unwrap().iter().filter(|e|e.as_str()=="run.cancelled").count(),1);
+        assert_eq!(h.store.list_tool_calls("run_1").await.unwrap().iter().map(|c|c.id.as_str()).collect::<Vec<_>>(),["tc_internal_1"]); let thread=h.store.list_run_messages("run_1").await.unwrap(); assert!(thread.iter().any(|m|m.role=="tool"&&m.tool_call_id.as_deref()==Some("call_provider_1"))); assert!(!thread.iter().any(|m|m.role=="tool"&&m.tool_call_id.as_deref()==Some("call_provider_2"))); assert_eq!(h.events.lock().unwrap().iter().filter(|e|e.as_str()=="run.cancelled").count(),1);
     }
 
     #[tokio::test]
@@ -6949,7 +6975,7 @@ mod approval_tests {
         approval
             .available_decisions
             .insert(1, "approve_for_session".to_owned());
-        h.store.insert_approval(&approval).await.unwrap();
+        insert_parked(&h.store, &approval, "shell_exec").await;
 
         h.broker
             .resolve("apr_1", decision("approve_for_session", None))
@@ -7077,7 +7103,7 @@ mod approval_tests {
             created_at: now_iso8601(),
             decided_at: None,
         };
-        h.store.insert_approval(&approval).await.unwrap();
+        insert_parked(&h.store, &approval, "shell_exec").await;
 
         h.broker
             .resolve("apr_1", decision("deny", Some("not this time")))
@@ -7127,6 +7153,26 @@ mod approval_tests {
     }
 
     /// A pending approval row.
+    /// Inserts `approval` after the `tool_calls` row of the `tool` call it was
+    /// asked for, in the order `run_tool_call` writes them: a restore checks
+    /// the parked call against that row's tool.
+    async fn insert_parked(store: &Store, approval: &Approval, tool: &str) {
+        store
+            .insert_tool_call(&ToolCall {
+                id: approval.tool_call_id.clone(),
+                run_id: approval.run_id.clone(),
+                tool: tool.to_owned(),
+                input: approval.payload.clone(),
+                status: ToolCallStatus::Running,
+                output_summary: None,
+                started_at: now_iso8601(),
+                ended_at: None,
+            })
+            .await
+            .unwrap();
+        store.insert_approval(approval).await.unwrap();
+    }
+
     fn seed_approval(
         id: &str,
         run_id: &str,
@@ -7209,7 +7255,7 @@ mod approval_tests {
             args.as_object().unwrap().clone(),
         );
         approval.expires_at = "2020-01-01T00:00:00Z".to_owned();
-        h.store.insert_approval(&approval).await.unwrap();
+        insert_parked(&h.store, &approval, "shell_exec").await;
 
         // Prove this fixture would be re-broadcast if startup restore ran
         // before expiry reconciliation; otherwise the regression is vacuous.
@@ -7297,17 +7343,19 @@ mod approval_tests {
             .append_run_message("run_ok", "assistant", None, &call, None, &now_iso8601())
             .await
             .unwrap();
-        h.store
-            .insert_approval(&seed_approval(
+        insert_parked(
+            &h.store,
+            &seed_approval(
                 "apr_ok",
                 "run_ok",
                 // tc_ namespace — deliberately DIFFERENT from the thread's
                 // provider id (call_provider_1); correspondence is by payload.
                 "tc_internal_1",
                 args.as_object().unwrap().clone(),
-            ))
-            .await
-            .unwrap();
+            ),
+            "shell_exec",
+        )
+        .await;
 
         // Non-restorable: a pending approval whose run already COMPLETED — the
         // status gate in plan_resume refuses it, so the sweep aborts it.
@@ -7609,15 +7657,17 @@ mod approval_tests {
             .append_run_message("run_db", "assistant", None, &calls, None, &now_iso8601())
             .await
             .unwrap();
-        h.store
-            .insert_approval(&seed_approval(
+        insert_parked(
+            &h.store,
+            &seed_approval(
                 "apr_db",
                 "run_db",
                 "tc_internal_1",
                 args.as_object().unwrap().clone(),
-            ))
-            .await
-            .unwrap();
+            ),
+            "shell_exec",
+        )
+        .await;
         sqlx::query("DROP TABLE workspace_leases")
             .execute(agent24_store::test_hooks::pool(&h.store))
             .await
