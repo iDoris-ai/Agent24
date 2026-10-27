@@ -76,9 +76,13 @@ impl FakeDaemon {
                 let (head, body) = read_request(&mut reader);
                 let line = head.lines().next().unwrap_or("").to_owned();
                 lines.lock().unwrap().push(line.clone());
-                let bearer = head
-                    .lines()
-                    .any(|l| l.eq_ignore_ascii_case("authorization: Bearer t"));
+                // As the daemon checks it: any case for the header name, the
+                // scheme and token exactly.
+                let bearer = head.lines().any(|l| {
+                    l.split_once(':').is_some_and(|(name, value)| {
+                        name.eq_ignore_ascii_case("authorization") && value.trim() == "Bearer t"
+                    })
+                });
                 let (status, reply) = if line.starts_with("GET /api/v1/health ") {
                     ("200 OK", r#"{"status":"ok"}"#.to_owned())
                 } else if !bearer {
@@ -285,15 +289,14 @@ fn runs_lists_what_the_resident_daemon_has() {
 #[test]
 fn a_state_file_with_nothing_on_its_port_is_no_daemon() {
     let home = tmp_home();
-    let closed = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // Held, never accepted: the port stays ours (nothing else can answer
+    // health on it) and the CLI's health check times out.
+    let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = silent.local_addr().unwrap().port();
     write_state(
         home.path(),
         serde_json::json!({
-            "port": closed, "token": "t", "pid": std::process::id(),
+            "port": port, "token": "t", "pid": std::process::id(),
             "version": "0.0.0", "generation": "g",
         }),
     );
