@@ -559,8 +559,9 @@ async fn a_rendered_page_comes_back_as_json_with_its_png_and_scale() {
     ));
     assert_eq!(call(&render, &missing).await.code(), Some("not_found"));
     // A scale asked for bounds the one the OS answers with, from 0.25 up;
-    // none asked is 1. The page is a whole file: more than its header.
-    let body = [PNG, b"\0\0\0\x01rest of the page"].concat();
+    // none asked is 1. The page is a whole file: more than its header, with
+    // bytes whose base64 has a `+` and a `/` (the standard alphabet's own).
+    let body = [PNG, b"\0\0\0\x01rest of the page\xfb\xff"].concat();
     let answer = |asked: Option<f64>, used: &str| {
         let mut req = json!({"op": "renderPage", "documentId": DOC, "revision": 1, "page": 1});
         if let Some(asked) = asked {
