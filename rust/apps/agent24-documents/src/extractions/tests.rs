@@ -522,3 +522,35 @@ async fn values_go_out_as_stored_and_are_counted_as_sent() {
         json!([100.0, 100.0, 100.0, 100.0])
     );
 }
+
+/// Below REST's budget (a tool's), a first value that does not fit is judged
+/// by the body it would go in, alone with its real cursor: taken at exactly
+/// that size although the estimate's reserve is over it, refused one byte
+/// under it. The tool route checks its whole answer again afterwards, so only
+/// a budget given here shows this check on its own (#1386).
+#[tokio::test]
+async fn under_a_tool_budget_a_first_value_is_judged_by_its_exact_body() {
+    let s = store().await;
+    put(
+        &s.storage,
+        &extraction(vec![unsourced("a", 4 * 1024), missing("b")]),
+    )
+    .await
+    .unwrap();
+    // Its exact body: what one value a page answers with.
+    let alone = super::get(&s.storage, EXT, None, 1, PAGE_BYTES - 1)
+        .await
+        .unwrap();
+    assert_eq!(alone.next_cursor.as_deref(), Some("v1"));
+    let exact = serde_json::to_vec(&alone).unwrap().len();
+    let taken = super::get(&s.storage, EXT, None, 50, exact).await.unwrap();
+    assert_eq!(serde_json::to_vec(&taken).unwrap().len(), exact);
+    assert_eq!(
+        (taken.values.len(), taken.next_cursor.as_deref()),
+        (1, Some("v1"))
+    );
+    let Err(refused) = super::get(&s.storage, EXT, None, 50, exact - 1).await else {
+        panic!("taken one byte over its budget");
+    };
+    assert_eq!(refused.code(), "payload_too_large");
+}
