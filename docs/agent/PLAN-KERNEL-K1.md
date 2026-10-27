@@ -18,7 +18,7 @@
 
 ### 既有法律与边界
 
-- 必须符合 [`APPROVAL.md`](../laws/APPROVAL.md) L-APPR-1..7：风险判断不能放宽用户权限；批准仍走统一门禁；`External` 不提供宽泛 session grant；常驻授权按确切目标收窄；读权限不上存储。模块声明和第一方签名不构成宿主授权。
+- 必须符合 [`APPROVAL.md`](../laws/APPROVAL.md) L-APPR-1..8：风险判断不能放宽用户权限；批准仍走统一门禁；`External` 不提供宽泛 session grant；常驻授权按确切目标收窄；读权限不上存储。模块声明和第一方签名不构成宿主授权。
 - 必须符合 [`MEMORY.md`](../laws/MEMORY.md) L-MEM-1..7：不得向模块暴露原始 store、调用方不得自报 owner/scope、不得夸大隔离保证。新数据流标记须内核注入，不给模块任意改写授权身份的字段。
 - 必须符合 [`CONTEXT.md`](../laws/CONTEXT.md) L-CTX-1..4：会进入上下文的数据来源应可点名、可审计；运行记录不是完成证据。
 - K1 ADR 若确立新的长期隐私/外传不变量，先提议独立新增 `docs/laws/PRIVACY.md`（或获批的合并位置），按 laws README 单独闭环；不得在实现 PR 中顺手改法律。

@@ -814,7 +814,11 @@ async fn windows_and_batches_each_answer_and_merge_per_field() {
 /// J14 (ME4-S2a §2.6): no local model to answer is asked again after the
 /// router's longest cooldown, for up to three of them; the wait ends when the
 /// job is cancelled.
-#[tokio::test]
+// Paused tokio clock: the waits (100 ms cooldowns, a 5 s one) are tokio sleeps,
+// so they auto-advance in virtual time. The `elapsed < 2 * budget` and
+// `< 2 s` upper bounds were wall-clock bounds that a loaded macOS runner
+// overshoots; on the virtual clock they are exact and cost no real time.
+#[tokio::test(start_paused = true)]
 async fn no_local_model_is_asked_again_after_the_longest_cooldown() {
     let l = layer(1, 0);
     let none = || {
@@ -825,7 +829,7 @@ async fn no_local_model_is_asked_again_after_the_longest_cooldown() {
     };
     // Once, then an answer: the extraction goes on, after the wait.
     let m = Script::new(vec![none(), reply(answer(vec![missing("a")]))]);
-    let start = std::time::Instant::now();
+    let start = tokio::time::Instant::now();
     let out = paced(
         FAST,
         &Steps::default(),
@@ -860,7 +864,7 @@ async fn no_local_model_is_asked_again_after_the_longest_cooldown() {
     assert_eq!(m.asked.lock().unwrap().len(), 4);
     // Past the budget: no local model is a failure of the engine.
     let m = Script::new(vec![none(), none(), none(), none()]);
-    let start = std::time::Instant::now();
+    let start = tokio::time::Instant::now();
     let out = paced(
         FAST,
         &Steps::default(),
@@ -889,7 +893,7 @@ async fn no_local_model_is_asked_again_after_the_longest_cooldown() {
         no_provider_max: Duration::from_secs(15),
         ..FAST
     };
-    let start = std::time::Instant::now();
+    let start = tokio::time::Instant::now();
     let out = paced(long, &job, &m, &source(&l), &[field("a")], false, MAX).await;
     assert_eq!(out, Err(Failure::Cancelled));
     assert_eq!(m.asked.lock().unwrap().len(), 1);

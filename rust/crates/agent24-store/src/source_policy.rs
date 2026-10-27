@@ -45,7 +45,7 @@ use crate::{Result, Store};
 /// Current on-disk shape version for a [`SourceRef`] row. A reader that
 /// finds a different value treats the row as unreadable and degrades it to
 /// `LocalOnly` WITHOUT attempting to parse `tag_json` — see module docs.
-pub const SOURCE_TAG_SCHEMA_VERSION: i64 = 1;
+pub const SOURCE_TAG_SCHEMA_VERSION: i64 = 2;
 
 /// What kind of content entering the run this tag describes. Informational
 /// only in this slice (nothing branches on it yet); an unrecognized value on
@@ -61,6 +61,26 @@ pub enum SourceKind {
     /// yet (ID-2 is unimplemented) — modeled ahead of that wiring so the
     /// contract does not need to change shape when it lands.
     SelectedMaterial,
+    /// A recalled assertion. This identifies the retrieval path; it is not
+    /// itself a sensitivity classification.
+    MemoryRecall,
+    /// Earlier turns of the run's session (K1-6b.4c), classified by the
+    /// session's source floor.
+    SessionContext,
+    /// A prompt a kernel-created schedule (a self-wake) carries from the
+    /// run that created it (K1-6b.4d).
+    ScheduleOrigin,
+}
+
+/// Sensitivity classification is independent from processing mode and source
+/// kind. Missing/invalid persisted classifications are never assumed ordinary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceClassification {
+    Ordinary,
+    Restricted,
+    #[default]
+    Unknown,
 }
 
 /// Processing mode. `LocalOnly` is the only mode [`SourceRef::user_input`]
@@ -90,6 +110,9 @@ pub struct SourceRef {
     /// same underlying source.
     pub source_id: String,
     pub kind: SourceKind,
+    /// `Unknown` is the safe default for old or incomplete persisted tags.
+    #[serde(default)]
+    pub classification: SourceClassification,
     /// Revision/content digest, when the source has one. `None` for a
     /// source with no meaningful revision concept (e.g. a one-shot prompt).
     pub revision_digest: Option<String>,
@@ -108,14 +131,90 @@ pub struct SourceRef {
 }
 
 impl SourceRef {
+    /// A persisted-memory hit with no usable provenance. Its stable marker is
+    /// a category, not an assertion identifier, and folds to LocalOnly.
+    pub fn unknown_memory(created_at: impl Into<String>) -> Self {
+        Self {
+            source_id: "unknown:memory".to_owned(),
+            kind: SourceKind::MemoryRecall,
+            classification: SourceClassification::Unknown,
+            revision_digest: None,
+            mode: SourceMode::LocalOnly,
+            policy_version: 0,
+            authorization_ref: None,
+            created_at: created_at.into(),
+        }
+    }
+
+    /// Earlier turns of a session entering a run's context. Its
+    /// classification is the session's floor as returned by
+    /// [`Store::merge_session_floor`].
+    pub fn session_floor(
+        session_id: &str,
+        classification: SourceClassification,
+        created_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_id: format!("session_floor:{session_id}"),
+            kind: SourceKind::SessionContext,
+            classification,
+            revision_digest: None,
+            mode: SourceMode::LocalOnly,
+            policy_version: 0,
+            authorization_ref: None,
+            created_at: created_at.into(),
+        }
+    }
+
+    /// The prompt of a run started by a kernel-created schedule. Its
+    /// classification is the one recorded when the schedule was created
+    /// ([`Store::record_schedule_origin`]).
+    pub fn schedule_origin(
+        schedule_id: &str,
+        classification: SourceClassification,
+        created_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_id: format!("schedule_origin:{schedule_id}"),
+            kind: SourceKind::ScheduleOrigin,
+            classification,
+            revision_digest: None,
+            mode: SourceMode::LocalOnly,
+            policy_version: 0,
+            authorization_ref: None,
+            created_at: created_at.into(),
+        }
+    }
+
+    /// A recalled assertion entering a run's context. Its classification is
+    /// the one stored with the assertion ([`AssertionSourceRef::classification_of`]);
+    /// the tag kind only names the retrieval path (ADR-K1-02 §6 item 4).
+    pub fn recalled_memory(
+        assertion_id: &str,
+        classification: SourceClassification,
+        created_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_id: format!("memory_assertion:{assertion_id}"),
+            kind: SourceKind::MemoryRecall,
+            classification,
+            revision_digest: None,
+            mode: SourceMode::LocalOnly,
+            policy_version: 0,
+            authorization_ref: None,
+            created_at: created_at.into(),
+        }
+    }
+
     /// A fresh, unclassified tag for user input at run entry. Always
-    /// `LocalOnly`: nothing upstream of this call classifies or authorizes
-    /// user input for cloud processing, so the only safe default is the
-    /// fail-closed one (ADR-K1-02 §0).
+    /// `LocalOnly` for the model routing default, and `Ordinary` as the separate
+    /// sensitivity classification (ADR-K1-02 §2.1.1). Local routing does not
+    /// label ordinary user input as restricted.
     pub fn user_input(run_id: &str, created_at: impl Into<String>) -> Self {
         SourceRef {
             source_id: format!("user_input:{run_id}"),
             kind: SourceKind::UserInput,
+            classification: SourceClassification::Ordinary,
             revision_digest: None,
             mode: SourceMode::LocalOnly,
             policy_version: 0,
@@ -136,6 +235,7 @@ impl SourceRef {
         SourceRef {
             source_id: format!("selected_material:{material_id}"),
             kind: SourceKind::SelectedMaterial,
+            classification: SourceClassification::Unknown,
             revision_digest,
             mode: SourceMode::LocalOnly,
             policy_version: 0,
@@ -153,7 +253,8 @@ impl SourceRef {
     fn fail_closed_unknown(source_id: String, created_at: String) -> Self {
         SourceRef {
             source_id,
-            kind: SourceKind::SelectedMaterial,
+            kind: SourceKind::MemoryRecall,
+            classification: SourceClassification::Unknown,
             revision_digest: None,
             mode: SourceMode::LocalOnly,
             policy_version: 0,
@@ -164,8 +265,8 @@ impl SourceRef {
 }
 
 /// A run's effective source policy, folded from every tag persisted against
-/// it (ADR-K1-02 §2.1: "会话由宿主汇总消息和被引用资料的标签，生成 run 的
-/// 有效政策"). Model consumers use `effective_mode` to constrain routing.
+/// it. `effective_mode` is the upper bound for model context routing; it is
+/// not the payload/source set for an arbitrary action (ADR-K1-02 §2.1/§2.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicySnapshot {
     pub schema_version: i64,
@@ -197,7 +298,12 @@ impl PolicySnapshot {
     /// 所有输入...中最严格者". An empty set is [`Self::fail_closed`], not an
     /// unrestricted snapshot.
     pub fn from_tags(sources: Vec<SourceRef>) -> Self {
-        if sources.is_empty() || sources.iter().any(|s| s.mode == SourceMode::LocalOnly) {
+        if sources.is_empty()
+            || sources.iter().any(|s| {
+                s.mode == SourceMode::LocalOnly
+                    || s.classification != SourceClassification::Ordinary
+            })
+        {
             return PolicySnapshot {
                 schema_version: SOURCE_TAG_SCHEMA_VERSION,
                 effective_mode: SourceMode::LocalOnly,
@@ -258,6 +364,104 @@ fn fail_closed_tag(seq: i64, source_id: String, created_at: String) -> StoredSou
     }
 }
 
+/// Current shape of [`AssertionSourceRef`] in `mem_assertions.source_ref`.
+/// A stored value with any other version reads as `Unknown`.
+pub const ASSERTION_SOURCE_REF_SCHEMA_VERSION: i64 = 1;
+
+/// The provenance a memory assertion is written with (ADR-K1-02 §5 item 10),
+/// stored in the same row and transaction as its body. Only the host's
+/// retain path builds one; recall reads its classification back.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssertionSourceRef {
+    pub schema_version: i64,
+    /// The strictest classification among the sources of the context the
+    /// assertion was written from.
+    pub classification: SourceClassification,
+    /// Those sources' ids, for audit only; nothing decides on them.
+    pub source_ids: Vec<String>,
+}
+
+impl AssertionSourceRef {
+    /// Fold the writing context's sources as `(source_id, classification)`.
+    /// No sources is no evidence, so the result is `Unknown` (ADR-K1-02
+    /// §2.1.1 item 4).
+    pub fn from_sources(sources: impl IntoIterator<Item = (String, SourceClassification)>) -> Self {
+        let (source_ids, classifications): (Vec<_>, Vec<_>) = sources.into_iter().unzip();
+        AssertionSourceRef {
+            schema_version: ASSERTION_SOURCE_REF_SCHEMA_VERSION,
+            classification: strictest_classification(classifications),
+            source_ids,
+        }
+    }
+
+    /// This provenance, raised to at least `floor` (never lowered).
+    #[must_use]
+    pub fn at_least(&self, floor: SourceClassification) -> Self {
+        Self {
+            classification: strictest_classification([self.classification, floor]),
+            ..self.clone()
+        }
+    }
+
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": self.schema_version,
+            "classification": self.classification,
+            "source_ids": self.source_ids,
+        })
+    }
+
+    /// The classification of a stored `source_ref`. NULL, a value that does
+    /// not parse as the current shape, or another schema version reads as
+    /// `Unknown`, never `Ordinary`.
+    pub fn classification_of(stored: Option<&serde_json::Value>) -> SourceClassification {
+        stored
+            .and_then(|value| serde_json::from_value::<Self>(value.clone()).ok())
+            .filter(|parsed| parsed.schema_version == ASSERTION_SOURCE_REF_SCHEMA_VERSION)
+            .map_or(SourceClassification::Unknown, |parsed| {
+                parsed.classification
+            })
+    }
+}
+
+fn classification_column(classification: SourceClassification) -> &'static str {
+    match classification {
+        SourceClassification::Ordinary => "ordinary",
+        SourceClassification::Unknown => "unknown",
+        SourceClassification::Restricted => "restricted",
+    }
+}
+
+/// A stored floor this crate does not recognize reads as `Unknown`.
+fn classification_from_column(raw: &str) -> SourceClassification {
+    match raw {
+        "ordinary" => SourceClassification::Ordinary,
+        "restricted" => SourceClassification::Restricted,
+        _ => SourceClassification::Unknown,
+    }
+}
+
+/// Strictest classification: `Restricted` over `Unknown` over `Ordinary`;
+/// an empty input is `Unknown`.
+pub fn strictest_classification(
+    classifications: impl IntoIterator<Item = SourceClassification>,
+) -> SourceClassification {
+    let mut strictest = None;
+    for classification in classifications {
+        strictest = Some(match (strictest, classification) {
+            (_, SourceClassification::Restricted) | (Some(SourceClassification::Restricted), _) => {
+                SourceClassification::Restricted
+            }
+            (_, SourceClassification::Unknown) | (Some(SourceClassification::Unknown), _) => {
+                SourceClassification::Unknown
+            }
+            _ => SourceClassification::Ordinary,
+        });
+    }
+    strictest.unwrap_or(SourceClassification::Unknown)
+}
+
 impl Store {
     /// Persist (or replace) one source tag for a run's message. Idempotent
     /// by `(run_id, seq, source_id)` — re-tagging the same source on the
@@ -294,6 +498,9 @@ impl Store {
     /// use [`Store::run_policy_snapshot`] instead of treating an empty
     /// result as "unrestricted".
     pub async fn list_run_source_tags(&self, run_id: &str) -> Result<Vec<StoredSourceTag>> {
+        if crate::test_hooks::source_tag_reads_fail(self) {
+            return Err(sqlx::Error::Protocol("injected source tag read failure".into()).into());
+        }
         let rows = sqlx::query(
             "SELECT seq, source_id, schema_version, tag_json, created_at \
              FROM run_source_tags WHERE run_id = ? ORDER BY seq ASC, source_id ASC",
@@ -302,6 +509,85 @@ impl Store {
         .fetch_all(self.pool())
         .await?;
         Ok(rows.iter().map(decode_tag_row).collect())
+    }
+
+    /// K1-6b.4c (ADR-K1-02 §2.2): merge one turn's own classification into
+    /// its session's floor and return the floor after the merge. Read and
+    /// write share one `BEGIN IMMEDIATE` transaction, so concurrent turns can
+    /// never lower it. A turn with prior context but no stored floor counts
+    /// that context as `Unknown`.
+    pub async fn merge_session_floor(
+        &self,
+        session_id: &str,
+        own: SourceClassification,
+        has_prior_context: bool,
+        now: &str,
+    ) -> Result<SourceClassification> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT classification FROM session_source_floor WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let prior = match stored.as_deref() {
+            Some(raw) => Some(classification_from_column(raw)),
+            None => has_prior_context.then_some(SourceClassification::Unknown),
+        };
+        let merged = strictest_classification(prior.into_iter().chain([own]));
+        sqlx::query(
+            "INSERT INTO session_source_floor (session_id, classification, updated_at) \
+             VALUES (?, ?, ?) \
+             ON CONFLICT(session_id) DO UPDATE SET \
+                classification = excluded.classification, \
+                updated_at = excluded.updated_at",
+        )
+        .bind(session_id)
+        .bind(classification_column(merged))
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(merged)
+    }
+
+    /// K1-6b.4d (ADR-K1-02 §2.2): record, before the schedule itself is
+    /// written, the classification a kernel-created schedule carries from the
+    /// run that created it.
+    pub async fn record_schedule_origin(
+        &self,
+        schedule_id: &str,
+        origin_run_id: &str,
+        classification: SourceClassification,
+        now: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO schedule_source_origin (schedule_id, origin_run_id, classification, created_at) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(schedule_id)
+        .bind(origin_run_id)
+        .bind(classification_column(classification))
+        .bind(now)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// The classification recorded for a kernel-created schedule; `None` for
+    /// a schedule the user created. A self-wake from before 0024 reads as
+    /// `Unknown` (migration 0026).
+    pub async fn schedule_origin_classification(
+        &self,
+        schedule_id: &str,
+    ) -> Result<Option<SourceClassification>> {
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT classification FROM schedule_source_origin WHERE schedule_id = ?",
+        )
+        .bind(schedule_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(stored.as_deref().map(classification_from_column))
     }
 
     /// The run's fail-closed effective policy (ADR-K1-02 §2.1), folded from
@@ -348,12 +634,27 @@ mod tests {
         let json = serde_json::to_string(&material).unwrap();
         let back: SourceRef = serde_json::from_str(&json).unwrap();
         assert_eq!(material, back);
+        assert_eq!(tag.classification, SourceClassification::Ordinary);
+        assert_eq!(material.classification, SourceClassification::Unknown);
+    }
+
+    #[test]
+    fn user_input_is_ordinary_while_legacy_classification_is_unknown() {
+        let current = serde_json::to_value(SourceRef::user_input("run_1", "t")).unwrap();
+        assert_eq!(current["classification"], "ordinary");
+
+        let mut legacy = current;
+        legacy.as_object_mut().unwrap().remove("classification");
+        let decoded: SourceRef = serde_json::from_value(legacy).unwrap();
+        let decoded = serde_json::to_value(decoded).unwrap();
+        assert_eq!(decoded["classification"], "unknown");
     }
 
     #[test]
     fn policy_snapshot_fold_is_strictest_wins() {
         let local = SourceRef::user_input("run_1", "t");
         let mut cloud = SourceRef::selected_material("doc_1", None, "t");
+        cloud.classification = SourceClassification::Ordinary;
         cloud.mode = SourceMode::CloudAuthorized;
 
         // All-cloud folds to cloud.
@@ -364,6 +665,14 @@ mod tests {
         // with a cloud-authorized one.
         let snap = PolicySnapshot::from_tags(vec![cloud, local]);
         assert_eq!(snap.effective_mode, SourceMode::LocalOnly);
+
+        let mut unknown = SourceRef::selected_material("legacy", None, "t");
+        unknown.mode = SourceMode::CloudAuthorized;
+        assert_eq!(
+            PolicySnapshot::from_tags(vec![unknown]).effective_mode,
+            SourceMode::LocalOnly,
+            "unknown classification must keep model context local"
+        );
     }
 
     #[tokio::test]
@@ -425,6 +734,7 @@ mod tests {
         let tags = store.list_run_source_tags("run_old_schema").await.unwrap();
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].source.mode, SourceMode::LocalOnly);
+        assert_eq!(tags[0].source.classification, SourceClassification::Unknown);
         assert_eq!(tags[0].source.source_id, "doc_legacy");
 
         let snap = store.run_policy_snapshot("run_old_schema").await.unwrap();
@@ -447,6 +757,7 @@ mod tests {
         let tags = store.list_run_source_tags("run_malformed").await.unwrap();
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].source.mode, SourceMode::LocalOnly);
+        assert_eq!(tags[0].source.classification, SourceClassification::Unknown);
     }
 
     #[tokio::test]
@@ -464,6 +775,29 @@ mod tests {
         let tags = store.list_run_source_tags("run_bad_columns").await.unwrap();
         assert_eq!(tags[0].seq, 7);
         assert_eq!(tags[0].source.mode, SourceMode::LocalOnly);
+        assert_eq!(tags[0].source.classification, SourceClassification::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_tag_whose_payload_names_another_source_is_unknown() {
+        // Reverse: without the source_id cross-check, a row could carry an
+        // `Ordinary` payload copied from another source and be trusted.
+        let store = store_with_run("run_mismatch").await;
+        let ordinary = SourceRef::user_input("run_mismatch", "2026-10-08T00:00:00Z");
+        sqlx::query(
+            "INSERT INTO run_source_tags (run_id, seq, source_id, schema_version, tag_json, created_at) \
+             VALUES (?, 0, 'memory_assertion:a1', ?, ?, '2026-10-08T00:00:00Z')",
+        )
+        .bind("run_mismatch")
+        .bind(SOURCE_TAG_SCHEMA_VERSION)
+        .bind(serde_json::to_string(&ordinary).unwrap())
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let tags = store.list_run_source_tags("run_mismatch").await.unwrap();
+        assert_eq!(tags[0].source.source_id, "memory_assertion:a1");
+        assert_eq!(tags[0].source.classification, SourceClassification::Unknown);
     }
 
     #[tokio::test]
@@ -498,5 +832,316 @@ mod tests {
         assert_eq!(tags[0].source, tag);
         let snap = reopened.run_policy_snapshot("run_restart").await.unwrap();
         assert_eq!(snap.effective_mode, SourceMode::LocalOnly);
+    }
+
+    #[test]
+    fn strictest_classification_orders_restricted_over_unknown_over_ordinary() {
+        use SourceClassification::{Ordinary, Restricted, Unknown};
+        assert_eq!(strictest_classification([]), Unknown);
+        assert_eq!(strictest_classification([Ordinary]), Ordinary);
+        assert_eq!(strictest_classification([Ordinary, Ordinary]), Ordinary);
+        assert_eq!(strictest_classification([Ordinary, Unknown]), Unknown);
+        assert_eq!(
+            strictest_classification([Unknown, Restricted, Ordinary]),
+            Restricted
+        );
+        assert_eq!(strictest_classification([Restricted, Unknown]), Restricted);
+    }
+
+    #[test]
+    fn assertion_source_ref_folds_its_writing_context() {
+        use SourceClassification::{Ordinary, Restricted, Unknown};
+        let none = AssertionSourceRef::from_sources([]);
+        assert_eq!(none.classification, Unknown);
+        assert!(none.source_ids.is_empty());
+        let ordinary = AssertionSourceRef::from_sources([("user_input:r".to_owned(), Ordinary)]);
+        assert_eq!(ordinary.classification, Ordinary);
+        assert_eq!(ordinary.source_ids, vec!["user_input:r".to_owned()]);
+        assert_eq!(ordinary.schema_version, ASSERTION_SOURCE_REF_SCHEMA_VERSION);
+        let mixed = AssertionSourceRef::from_sources([
+            ("user_input:r".to_owned(), Ordinary),
+            ("memory_assertion:a".to_owned(), Restricted),
+        ]);
+        assert_eq!(mixed.classification, Restricted);
+    }
+
+    #[test]
+    fn assertion_source_ref_round_trips_through_its_stored_value() {
+        use SourceClassification::{Ordinary, Restricted};
+        for classification in [Ordinary, Restricted, SourceClassification::Unknown] {
+            let written = AssertionSourceRef::from_sources([("s".to_owned(), classification)]);
+            let stored = written.to_value();
+            assert_eq!(
+                serde_json::from_value::<AssertionSourceRef>(stored.clone()).unwrap(),
+                written
+            );
+            assert_eq!(
+                AssertionSourceRef::classification_of(Some(&stored)),
+                classification
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_assertion_source_refs_are_unknown_never_ordinary() {
+        let unknown = SourceClassification::Unknown;
+        let ordinary_v1 =
+            AssertionSourceRef::from_sources([("s".to_owned(), SourceClassification::Ordinary)])
+                .to_value();
+        let mut other_version = ordinary_v1.clone();
+        other_version["schema_version"] =
+            serde_json::json!(ASSERTION_SOURCE_REF_SCHEMA_VERSION + 1);
+        let mut extra_field = ordinary_v1.clone();
+        extra_field["trusted"] = serde_json::json!(true);
+        let mut bad_classification = ordinary_v1.clone();
+        bad_classification["classification"] = serde_json::json!("public");
+        for stored in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("ordinary")),
+            // The shape P1a's writer test used: no schema version.
+            Some(serde_json::json!({"classification": "ordinary"})),
+            Some(other_version),
+            Some(extra_field),
+            Some(bad_classification),
+        ] {
+            assert_eq!(
+                AssertionSourceRef::classification_of(stored.as_ref()),
+                unknown,
+                "{stored:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recalled_memory_tag_carries_the_stored_classification() {
+        for classification in [
+            SourceClassification::Ordinary,
+            SourceClassification::Restricted,
+            SourceClassification::Unknown,
+        ] {
+            let tag = SourceRef::recalled_memory("a-1", classification, "t");
+            assert_eq!(tag.classification, classification);
+            assert_eq!(tag.kind, SourceKind::MemoryRecall);
+            assert_eq!(tag.mode, SourceMode::LocalOnly);
+            assert_eq!(tag.source_id, "memory_assertion:a-1");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_floor_starts_at_its_first_turn_and_never_lowers() {
+        use SourceClassification::{Ordinary, Restricted, Unknown};
+        let store = Store::open_memory().await.unwrap();
+        let now = "2026-10-25T00:00:00Z";
+        let merge = |own, prior| store.merge_session_floor("s1", own, prior, now);
+        assert_eq!(merge(Ordinary, false).await.unwrap(), Ordinary);
+        assert_eq!(merge(Ordinary, true).await.unwrap(), Ordinary);
+        assert_eq!(merge(Restricted, true).await.unwrap(), Restricted);
+        // Reverse: an ordinary later turn, with or without prior context.
+        assert_eq!(merge(Ordinary, true).await.unwrap(), Restricted);
+        assert_eq!(merge(Ordinary, false).await.unwrap(), Restricted);
+        assert_eq!(merge(Unknown, true).await.unwrap(), Restricted);
+        // Another session is unaffected.
+        let other = store
+            .merge_session_floor("s2", Ordinary, false, now)
+            .await
+            .unwrap();
+        assert_eq!(other, Ordinary);
+    }
+
+    #[tokio::test]
+    async fn prior_context_without_a_stored_floor_is_unknown() {
+        let store = Store::open_memory().await.unwrap();
+        let floor = store
+            .merge_session_floor("legacy", SourceClassification::Ordinary, true, "t")
+            .await
+            .unwrap();
+        assert_eq!(floor, SourceClassification::Unknown);
+    }
+
+    #[tokio::test]
+    async fn concurrent_floor_merges_never_lose_the_strictest() {
+        // A file database: `open_memory` has one connection, which would
+        // serialize the merges and hide a missing write lock.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("floor.db")).await.unwrap();
+        let merges = (0..64).map(|i| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                let own = if i == 7 {
+                    SourceClassification::Restricted
+                } else {
+                    SourceClassification::Ordinary
+                };
+                store
+                    .merge_session_floor("s", own, false, "t")
+                    .await
+                    .unwrap()
+            })
+        });
+        for merge in merges.collect::<Vec<_>>() {
+            merge.await.unwrap();
+        }
+        let floor = store
+            .merge_session_floor("s", SourceClassification::Ordinary, true, "t")
+            .await
+            .unwrap();
+        assert_eq!(floor, SourceClassification::Restricted);
+    }
+
+    #[test]
+    fn an_unrecognized_stored_floor_reads_as_unknown() {
+        assert_eq!(
+            classification_from_column("ORDINARY"),
+            SourceClassification::Unknown
+        );
+        assert_eq!(
+            classification_from_column(""),
+            SourceClassification::Unknown
+        );
+        for c in [
+            SourceClassification::Ordinary,
+            SourceClassification::Unknown,
+            SourceClassification::Restricted,
+        ] {
+            assert_eq!(classification_from_column(classification_column(c)), c);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_floor_tag_round_trips_with_its_classification() {
+        let store = store_with_run("run_floor").await;
+        let tag = SourceRef::session_floor("s1", SourceClassification::Restricted, "t");
+        store
+            .tag_run_source("run_floor", 2, &tag, "t")
+            .await
+            .unwrap();
+        let tags = store.list_run_source_tags("run_floor").await.unwrap();
+        assert_eq!(tags[0].source, tag);
+        assert_eq!(tags[0].source.kind, SourceKind::SessionContext);
+    }
+
+    #[tokio::test]
+    async fn a_schedule_origin_round_trips_and_user_schedules_have_none() {
+        let store = Store::open_memory().await.unwrap();
+        store
+            .record_schedule_origin("wake_1", "run_1", SourceClassification::Restricted, "t")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .schedule_origin_classification("wake_1")
+                .await
+                .unwrap(),
+            Some(SourceClassification::Restricted)
+        );
+        assert_eq!(
+            store
+                .schedule_origin_classification("user_sched")
+                .await
+                .unwrap(),
+            None
+        );
+        // An origin is recorded once; a second write for the same schedule is
+        // an error rather than a silent overwrite.
+        assert!(
+            store
+                .record_schedule_origin("wake_1", "run_2", SourceClassification::Ordinary, "t")
+                .await
+                .is_err()
+        );
+    }
+
+    /// A self-wake left from before 0024 carries `unknown`, not "created by
+    /// the user" (0026), and so does one deleted since whose run is left; a
+    /// user's schedule still has no origin, and one recorded between 0024
+    /// and 0026 keeps its own.
+    #[tokio::test]
+    async fn a_self_wake_from_before_0024_reads_as_unknown() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let up_to = |version: i64| {
+            let mut migrator = sqlx::migrate!("./migrations");
+            migrator.migrations = std::borrow::Cow::Owned(
+                migrator
+                    .migrations
+                    .iter()
+                    .filter(|m| m.version <= version)
+                    .cloned()
+                    .collect(),
+            );
+            migrator
+        };
+        let schedule = |id: &'static str, name: &'static str| {
+            sqlx::query(
+                "INSERT INTO schedules (id, name, enabled, spec, action, delivery) \
+                 VALUES (?, ?, 1, '{}', '{}', '[]')",
+            )
+            .bind(id)
+            .bind(name)
+        };
+        up_to(18).run(&pool).await.unwrap();
+        schedule("wake_old", "self-wake")
+            .execute(&pool)
+            .await
+            .unwrap();
+        schedule("sch_user", "self-wake")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A self-wake that fired and was then deleted: only its run is left.
+        sqlx::query(
+            "INSERT INTO runs (id, status, input, usage, created_at, schedule_id) \
+             VALUES ('run_gone', 'completed', '{}', '{}', '2026-10-08T00:00:00Z', 'wake_gone')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        up_to(25).run(&pool).await.unwrap();
+        schedule("wake_new", "self-wake")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO schedule_source_origin (schedule_id, origin_run_id, classification, created_at) \
+             VALUES ('wake_new', 'run_1', 'restricted', 't')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let store = crate::test_hooks::from_pool(pool);
+        let origin = |id: &'static str| store.schedule_origin_classification(id);
+        assert_eq!(
+            origin("wake_old").await.unwrap(),
+            Some(SourceClassification::Unknown)
+        );
+        assert_eq!(
+            origin("wake_gone").await.unwrap(),
+            Some(SourceClassification::Unknown)
+        );
+        assert_eq!(origin("sch_user").await.unwrap(), None);
+        assert_eq!(
+            origin("wake_new").await.unwrap(),
+            Some(SourceClassification::Restricted)
+        );
+    }
+
+    #[test]
+    fn at_least_raises_but_never_lowers_a_classification() {
+        use SourceClassification::{Ordinary, Restricted, Unknown};
+        let ordinary = AssertionSourceRef::from_sources([("s".to_owned(), Ordinary)]);
+        assert_eq!(ordinary.at_least(Restricted).classification, Restricted);
+        assert_eq!(ordinary.at_least(Unknown).classification, Unknown);
+        assert_eq!(ordinary.at_least(Ordinary).classification, Ordinary);
+        let restricted = AssertionSourceRef::from_sources([("s".to_owned(), Restricted)]);
+        assert_eq!(restricted.at_least(Ordinary).classification, Restricted);
+        assert_eq!(
+            restricted.at_least(Ordinary).source_ids,
+            restricted.source_ids
+        );
     }
 }

@@ -299,6 +299,27 @@ pub async fn send_kernel_request(
         })
 }
 
+/// [`send_kernel_request`] that its caller can give up on: `cancel` ends the
+/// exchange through the commit point like any other end, so a 2xx head
+/// already read still stands (v2, L2), and otherwise it is
+/// [`KernelCallError::Cancelled`].
+///
+/// # Errors
+/// See [`KernelCallError`].
+pub async fn send_kernel_request_until(
+    generation: &Arc<Generation>,
+    ids: &KernelRequestIds,
+    request: KernelRequest,
+    limits: KernelLimits,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<KernelResponse, KernelCallError> {
+    send_kernel_request_inner(generation, ids, request, limits, None, Some(cancel), false)
+        .await
+        .map(|response| KernelResponse {
+            status: response.status,
+        })
+}
+
 pub async fn send_module_tool_request(
     generation: &Arc<Generation>,
     ids: &KernelRequestIds,

@@ -698,10 +698,10 @@ async fn joint_round1() {
     });
     assert_eq!(
         exit,
-        ExitClass::OtherError,
-        "invalid npub in contact add should be other_error"
+        ExitClass::UserError,
+        "invalid npub in contact add should be user_error"
     );
-    assert_eq!(error, "other_error");
+    assert_eq!(error, "user_error");
 
     let envelope = a_run(
         &runner,
@@ -739,13 +739,11 @@ async fn joint_round1() {
     assert_eq!(
         exit,
         ExitClass::UserError,
-        "`agent msg --to <invalid npub>` should be user_error (exit 1), matching Hyphae's \
-         documented claim for the send path (distinct from contact add's other_error)"
+        "`agent msg --to <invalid npub>` should be user_error (exit 1), matching the locked Hyphae build"
     );
     assert_eq!(error, "user_error");
     println!(
-        "confirmed: `agent msg --to <invalid npub>` returns user_error (exit 1), \
-         matching Hyphae's documented claim (distinct from contact add's other_error)"
+        "confirmed: `agent msg --to <invalid npub>` returns user_error (exit 1) on the locked Hyphae build"
     );
 
     // ======================================================================
