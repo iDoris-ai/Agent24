@@ -17,6 +17,7 @@ import os
 import secrets
 import select
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -51,7 +52,18 @@ if not all(" " <= c <= "~" for c in WORK):
     sys.exit(f"--work must be a printable ASCII path: {WORK!r}")
 if os.path.exists(WORK) and os.listdir(WORK):
     sys.exit(f"--work must be new or empty: {WORK}")
+# reap() takes every daemon running under WORK for this run's, so a run nested
+# inside another run's work dir would have its daemons killed by the outer one.
+MARK = ".kb-r1-accept"
+up = os.path.dirname(WORK)
+while True:
+    if os.path.exists(os.path.join(up, MARK)):
+        sys.exit(f"--work must not be inside another run's work dir: {up}")
+    if up == os.path.dirname(up):
+        break
+    up = os.path.dirname(up)
 os.makedirs(WORK, exist_ok=True)
+open(os.path.join(WORK, MARK), "w").close()
 HOME = os.path.join(WORK, "home")
 os.makedirs(HOME, exist_ok=True)
 
@@ -75,8 +87,12 @@ def check(cid, what, ok, evidence):
 
 
 def snapshot(top):
-    """Every path under `top` with its size and mtime; empty if absent."""
-    out = {}
+    """`top` itself (absent, or its mtime) and every path under it with its
+    size and mtime: a directory created empty shows up too."""
+    try:
+        out = {top: ("dir", os.lstat(top).st_mtime_ns)}
+    except FileNotFoundError:
+        out = {top: ("absent", 0)}
     for root, dirs, files in os.walk(top):
         for name in dirs + files:
             path = os.path.join(root, name)
@@ -147,7 +163,7 @@ def env_for(data):
 
 def call(port, method, path, token=None, body=None):
     """(status, json or None, raw text). Host is 127.0.0.1:port, as the daemon's
-    Host guard expects. Never raises: no answer is status 0."""
+    Host guard expects. Never raises: no answer, or a broken one, is status 0."""
     headers = {}
     data = None
     if token is not None:
@@ -161,8 +177,8 @@ def call(port, method, path, token=None, body=None):
         res = conn.getresponse()
         raw = res.read().decode("utf-8", "replace")
         conn.close()
-    except OSError as err:
-        return 0, None, f"no answer: {err}"
+    except (OSError, http.client.HTTPException) as err:
+        return 0, None, f"no answer: {err!r}"
     try:
         parsed = json.loads(raw) if raw else None
     except ValueError:
@@ -287,18 +303,34 @@ def attach(port, token, name):
 
 
 def files_containing(top, extra, needle):
-    hits = []
+    """(files that contain `needle`, files that could not be read). Only
+    regular files are read. A file that cannot be read is not a miss: the
+    check that asked must fail."""
+    hits, unread = [], []
     paths = list(extra)
-    for root, _, files in os.walk(top):
+    for root, _, files in os.walk(top, onerror=lambda e: unread.append(str(e.filename))):
         paths += [os.path.join(root, f) for f in files]
     for path in paths:
         try:
+            # Sockets and FIFOs hold no bytes to leak; opening one would fail.
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                continue
             with open(path, "rb") as f:
                 if needle.encode() in f.read():
                     hits.append(os.path.relpath(path, WORK))
+        except FileNotFoundError:
+            pass  # gone between listing and reading: nothing left to leak
         except OSError:
-            pass
-    return hits
+            unread.append(os.path.relpath(path, WORK))
+    return hits, unread
+
+
+def leak_check(cid, what, data, log, needle, ok=True, before=""):
+    """Run once the daemon has stopped, so what it writes on the way out is
+    scanned too."""
+    hits, unread = files_containing(data, [log], needle)
+    check(cid, what, ok and not hits and not unread,
+          f"{before}停机后扫描：落盘 {hits or '无'}，读不了的文件 {unread or '无'}")
 
 
 def binding_of(run):
@@ -327,16 +359,16 @@ def case_w1():
         s2, p2, _ = call(host.port, "GET", "/api/v1/models")
         check("W1b", "宿主凭据能调 API，无凭据被拒", s1 == 200 and s2 == 401,
               f"带凭据 {s1}，不带 {s2} {code_of(p2)}")
-        leaked = files_containing(host.data, [host.log_path], host.token)
-        check("W1c", "宿主凭据只在 ready 管道里，不落盘、不进日志", not leaked,
-              "数据目录和日志里都没有" if not leaked else f"出现在 {leaked}")
     finally:
         if host:
             host.stop()
+    if host and host.token:
+        leak_check("W1c", "宿主凭据只在 ready 管道里，不落盘、不进日志", host.data, host.log_path, host.token)
 
 
 def case_w2():
     host = None
+    secret, answers, pushed = None, [], None
     try:
         host = SpawnedDaemon(NEW, os.path.join(WORK, "w2"))
         if not host.port:
@@ -361,20 +393,28 @@ def case_w2():
         check("W2d", "过期的序号不能覆盖新的变更", s == 409 and code_of(body) == "stale_sequence",
               f"{s} {code_of(body)}")
         secret = "kbr1-" + secrets.token_hex(16)
-        s1, _, raw1 = host_change(p, t, "PUT", 2, "/credential",
-                                  {"kind": "bearer", "value": secret, "expires_at": int(time.time()) + 600})
-        s2, _, raw2 = start_run(p, t, BINDING)
-        leaked = files_containing(host.data, [host.log_path], secret)
-        in_answers = secret in raw1 or secret in raw2
-        check("W2e", "推送凭据后，应答、数据目录和日志里都没有它", s1 == 204 and s2 == 202 and not leaked and not in_answers,
-              f"推送 {s1}，再建 run {s2}，落盘 {leaked or '无'}，应答里 {'有' if in_answers else '无'}")
-        s1, _, _ = host_change(p, t, "DELETE", 3)
-        s2, body, _ = start_run(p, t, BINDING)
+        # Every answer from the push on is checked for the secret (W2e).
+        s1, _, raw = host_change(p, t, "PUT", 2, "/credential",
+                                 {"kind": "bearer", "value": secret, "expires_at": int(time.time()) + 600})
+        answers.append(raw)
+        s2, _, raw = start_run(p, t, BINDING)
+        answers.append(raw)
+        pushed = (s1, s2)
+        s1, _, raw = host_change(p, t, "DELETE", 3)
+        answers.append(raw)
+        s2, body, raw = start_run(p, t, BINDING)
+        answers.append(raw)
         check("W2f", "停用后再指名被拒", s1 == 204 and s2 == 409 and code_of(body) == "knowledge_binding_inactive",
               f"停用 {s1}，建 run {s2} {code_of(body)}")
     finally:
         if host:
             host.stop()
+    if secret is not None:
+        in_answers = any(secret in a for a in answers)
+        leak_check("W2e", "推送凭据后，所有应答、数据目录和日志里都没有它", host.data, host.log_path, secret,
+                   ok=pushed == (204, 202) and not in_answers,
+                   before=f"推送 {pushed[0] if pushed else None}，再建 run {pushed[1] if pushed else None}，"
+                          f"{len(answers)} 个应答里{'有' if in_answers else '无'}；")
     # Reverse control: main's daemon has no host interface and no check.
     old = None
     try:
