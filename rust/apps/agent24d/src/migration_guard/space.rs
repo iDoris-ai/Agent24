@@ -27,7 +27,7 @@ pub const DEFAULT_G: GDecl = GDecl::MultipleOfS(2);
 
 /// G declaration table: (database, migration version, G). Entries for the
 /// rewrite/FTS migrations are conservative multiples, NOT yet measured on a
-/// large-database fixture; replace with measured peaks when available.
+/// large-database fixture: 待大库夹具实测替换 (replace with measured peaks).
 pub const G_DECLARATIONS: &[(&str, i64, GDecl)] = &[
     ("memory.db", 5, GDecl::MultipleOfS(2)), // FTS backfill from mem_assertions
     ("memory.db", 10, GDecl::MultipleOfS(2)), // table rewrite
@@ -143,7 +143,9 @@ pub trait FreeSpace {
     fn available(&self, dir: &Path) -> io::Result<u64>;
 }
 
-/// `statvfs` on the filesystem holding the directory (`f_bavail * f_frsize`).
+/// `statvfs` on the filesystem holding the directory. Uses `f_bavail` (blocks
+/// available to unprivileged processes), not `f_bfree` (which includes the
+/// root-reserved blocks we cannot actually use).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StatvfsFree;
 
@@ -212,7 +214,10 @@ impl Reservation {
 
 /// Allocate `bytes` of real blocks at `path` (0600, exclusive). Linux uses
 /// `fallocate`; elsewhere (no safe preallocate API under `forbid(unsafe)`)
-/// real zero bytes are written, which also allocate blocks.
+/// real zero bytes are written, which also allocate blocks. Known cost: on
+/// macOS this writes `bytes` of zeros (seconds per few GB at disk speed), so
+/// a very large S delays the pre-migration step; there is no safe-Rust
+/// `F_PREALLOCATE`.
 pub fn reserve(path: &Path, bytes: u64) -> io::Result<Reservation> {
     let mut f = OpenOptions::new()
         .write(true)
