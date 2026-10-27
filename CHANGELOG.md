@@ -5,6 +5,11 @@ All notable changes to Agent24 are documented here. This project adheres to
 
 ## [Unreleased]
 
+- **iDoris v0.3.2 的 `502 upstream_auth_failed` 映射为终态（ID-ERR-1）**：`IdorisClient::send()` 对 502
+  可取消地读至多 4 KiB body，仅看 `error.reason_code`/`error.type`；等于 `upstream_auth_failed` 时返回
+  `ModelError::Rejected { status: 502 }`（不重试、不换 provider），文案指向 iDoris 运营方的上游密钥或 provider
+  权限，不回显 body、不带任何 key；其它 502 仍为可重试的 `Unavailable`。503/502 共用同一个读 body 的 helper。
+
 - **DOC-1 第 1 片骨架（Documenting，`docs/documenting/`，ADR-DOC-01 / ADR-DOC-02）**：新增
   `agent24-documents` crate —— 第一方进程外 domain OS `documents`（`domain-os.yml`：
   `events` + `models`，`model_access: local_only`，不申请 `memory`），目前只有

@@ -1686,6 +1686,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_502_upstream_auth_failed_does_not_fall_through() {
+        struct AuthFailed;
+        #[async_trait]
+        impl ModelProvider for AuthFailed {
+            fn name(&self) -> &str {
+                "idoris"
+            }
+            async fn complete(
+                &self,
+                _req: &CompletionRequest,
+                _cancel: &CancellationToken,
+            ) -> Result<CompletionResponse, ModelError> {
+                Err(ModelError::Rejected {
+                    status: 502,
+                    message: "upstream_auth_failed".to_owned(),
+                })
+            }
+            async fn models(
+                &self,
+                _cancel: &CancellationToken,
+            ) -> Result<Vec<crate::Model>, ModelError> {
+                Ok(vec![])
+            }
+        }
+        let fallback = StubProvider::ok("remote");
+        let r = router(vec![
+            (Arc::new(AuthFailed), Tier::Local),
+            (fallback.clone(), Tier::Remote),
+        ]);
+        let err = r
+            .complete(TaskProfile::default(), &req(), &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ModelError::Rejected { status: 502, .. }),
+            "{err}"
+        );
+        assert_eq!(fallback.calls(), 0, "Rejected must not fall through");
+    }
+
+    #[tokio::test]
     async fn provider_error_does_not_fall_through() {
         struct BadProvider;
         #[async_trait]
