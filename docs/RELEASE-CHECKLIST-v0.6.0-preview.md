@@ -84,37 +84,29 @@ shasum -a 256 -- *.dmg *.tar.gz > SHA256SUMS.20261028.1 && shasum -a 256 -c SHA2
 要多平台 CLI 产物时，可在 main 上手动触发 `release.yml`（`workflow_dispatch`，`dry_run=true` 只上传
 artifact、不建 Release）作为交叉验证，但本次预发布的发布物以人工构建的 arm64 为准。
 
-## 3. 签名与公证（待 jason 裁决）
+## 3. 签名与公证（已裁决：签名 + 公证，走仓库内流水线）
 
-**现状**：仓库里没有可重复的签名、公证、entitlements 和内嵌 daemon 签名流水线（ADR-037 决策 5 的订正，
-`docs/decision.md`；`.github/workflows` 里没有 `codesign` / `notarytool`；DEP-B1–B5 仍是 `BLOCKED`）。
-前两个预发布（`v0.5.1-preview.20261014.1`、`v0.5.1-preview.20261016.2`）的说明声称已 Developer ID 签名
-并公证，是在 jason 本机用 Developer ID 手工做的，**没有可复现的脚本**。
+jason 2026-10-27 拍板：预览版也必须 Developer ID 签名并公证。流水线由 DEP-B2/B3 补齐（PR #1353，分支
+`ci/dep-b-sign-notarize`，本机 arm64 已真跑通过：dmg 公证 submission `dbf61f9f-dee9-4356-81d5-92d7e6a677f9`
+Accepted；CLI zip 公证 `015302f0-9e66-4adf-836f-eaa2c92f2f93` Accepted）。**#1353 必须先合入 main，本节才能执行。**
 
-**规则**：#1293（release PR 改为完整用例验收）管的是验收门槛，不管签名；它目前还是 OPEN。仓库里没有
-「预发布必须签名」或「未签名不得发预发布」的规则。先例有两种：
+本机前置（已核实存在）：
+- 签名身份 `Developer ID Application: Huifeng Jiao (HYAP444FN9)`（`security find-identity -v -p codesigning`）
+- notarytool keychain profile `apple-notary-HYAP444FN9`（`xcrun notarytool history --keychain-profile apple-notary-HYAP444FN9` 能列出历史）
 
-- 先例 A：手工签名 + 公证（`v0.5.1-preview.20261016.2`，说明里附 submission id 和 `spctl` / `codesign`
-  实测输出）。
-- 先例 B：未签名 dmg 也正常发布（记忆里 2026-10-05 的裁决；`v0.5.1` 正式版则干脆不发 macOS 桌面包，
-  见 `docs/RELEASE-CHECKLIST-v0.5.1.md` §1）。
+执行（细节见 `docs/Deployment/MACOS-SIGNING.md`）：
+```bash
+# 桌面 dmg：build:rust(release) → build → electron-builder --mac arm64 → notarytool → staple → 验证
+apps/desktop/scripts/release-mac.sh            # AGENT24_SIGN_IDENTITY / AGENT24_NOTARY_PROFILE 可覆盖默认
+# CLI：签名 agent24 / agent24d → zip → 公证 → SHA256SUMS
+scripts/sign-cli-mac.sh
+# 独立验证（挂载只读副本 → 复制 → 卸载 → codesign/spctl/lipo）
+scripts/verify-mac-signing.sh <dmg>
+```
 
-**本次处理方式，两选一，由 jason 定，未定之前不打 tag**：
-
-1. **沿用先例 A**（jason 本机手工签名 + 公证）。每一项都要实测后才能写进 Release Notes，不能照抄上一版：
-   ```bash
-   codesign --verify --deep --strict --verbose=1 /path/to/Agent24.app   # 含内嵌 backend/agent24d
-   xcrun notarytool submit <dmg> --wait                                  # 记 submission id
-   xcrun stapler staple <dmg> && xcrun stapler validate <dmg>
-   spctl -a -t open --context context:primary-signature -v <dmg>        # accepted, source=Notarized Developer ID
-   ```
-   CLI tar.gz 里的 `agent24`、`agent24d` 同样要签名（目前没有流水线，DEP-B3），做不到就在说明里写明
-   「CLI 包未签名」。
-2. **沿用先例 B**（未签名发预发布）。Release Notes 必须写明：未签名、未公证；首次打开需右键打开或
-   `xattr -d com.apple.quarantine`；不要声称「已签名」或「已公证」。
-
-无论选哪个：不得在 Release Notes 里写没有实测过的签名结论。这条规则缺口本身（没有可重复流水线）
-不在本次范围，仍归 DEP-B。
+- [ ] `verify-mac-signing.sh` 输出 `accepted` 且 `source=Notarized Developer ID`；`codesign -dv` 可见内嵌 `backend/agent24d` 已签且 Hardened Runtime；`lipo -archs` 为 arm64。
+- [ ] dmg 与 CLI 的 submission id、`spctl`/`codesign` 实测输出贴进 Release Notes，不照抄上一版。
+- [ ] 已知限制写进 Release Notes：CLI 裸二进制不能 staple，离线机器首次运行需联网核验；Intel（x64）未实测、本次不发；GitHub Actions 侧签名仍需 DEP-B1 的 Secrets（本次在 jason 本机出包）。
 
 ## 4. 用例验收
 
@@ -132,7 +124,7 @@ artifact、不建 Release）作为交叉验证，但本次预发布的发布物�
 
 ## 5. 打 tag 与 GitHub 预发布
 
-只有第 1–4 节全部勾完、第 3 节签名方式已由 jason 裁决之后才执行。
+只有第 1–4 节全部勾完、第 3 节签名验证通过之后才执行。
 
 ```bash
 # 1) tag 打在已审批 SHA 上
@@ -165,6 +157,13 @@ mkdir -p /tmp/a24-pre-verify && gh release download v0.6.0-preview.20261028.1 -R
 - **数据库升级不可回退**：迁移无 `.down.sql`，旧二进制遇到已记录的新迁移会拒开；升级前自行复制
   `agent24.db` / 各记忆库。开发机若跑过 memory-p1 改号前的版本，需要重置本地库。
 - 未验收项：不要把没跑的东西写成已通过。
+
+### 5.1 发布后的跨仓库动作（联合发布）
+
+- [ ] **AgentEar 联合发布（issue #1347）**：宿主侧 vendored 契约须已重钉到 AgentEar v0.28.0（`0b6409ba`，PR `chore/agentear-vendor-v0.28.0`）并随本版进 main。发布后在 #1347 回帖：本版 tag、main 提交 SHA、dmg 与 CLI 包的 sha256。在此之前不把任何版本称为联合发布的宿主侧。
+- [ ] **Hyphae（issue #1346）**：若 #1352（锁升到 v0.27.0）随本版进 main，发布后通知 Hyphae 更新 `.github/joint-ci-baseline.json`（先例 Hyphae #281），并核对其交接文档里标「待确认」的三项（Agent24 实际锁、内部文件布局、daemon 生命周期）。
+- [ ] **Brood**：`orgs/auraai/INTERFACES.md` 里 Hyphae 版本（现写 v0.25.0）与 Agent24 版本行更新为本版。
+- [ ] `docs/PROGRESS-2026-10-26.md`（跟踪文档分支）补发布记录。
 
 ## 6. 回滚
 
