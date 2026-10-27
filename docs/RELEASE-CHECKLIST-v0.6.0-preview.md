@@ -1,7 +1,7 @@
 # Release checklist — v0.6.0-preview.20261028.1（预发布）
 
 > 只管这一次预发布。结构沿用 `docs/RELEASE-CHECKLIST-v0.5.1.md`。四条线（kernel、documenting、
-> weknora、memory-p1）的内容和迁移见 `CHANGELOG.md` 的 `[0.6.0-preview.20261028.1]`。
+> weknora、memory-p1；第五条 iDoris 线见 #1370，可能不赶版）的内容和迁移见 `CHANGELOG.md` 的 `[0.6.0-preview.20261028.1]`。
 > 通用流程（安装器、"mother test"）见 `docs/RELEASE-CHECKLIST.md`。
 >
 > **这是预发布，不是 0.6.0 正式版。** 清单里的版本号是 `0.6.0`；`-preview.20261028.1` 只出现在
@@ -23,8 +23,10 @@ Linux、Intel mac 不在本次预发布范围。dmg 文件名以实际构建输�
 
 ## 1. 前置条件（任一不满足就不往下走）
 
-- [ ] 四条线都已合入 main，顺序为 kernel #1280、documenting、weknora、memory-p1 #1341。
+- [ ] 四条线都已合入 main，顺序为 kernel #1280 → memory-p1 #1341 → documenting → weknora。
       `gh pr list -R iDoris-ai/Agent24 --state merged --base main --limit 20` 能看到这四个 release PR。
+- [ ] `ab/idoris` 已进 main（第五线，排在最后；截止 2026-10-28 12:00 Asia/Bangkok，见 #1370）。**赶不上则本版不含 iDoris，
+      配对改下一个 preview**，不等；此时第 4 节的 iDoris 用例组（ID-1…ID-8）、第 5.1 节的 iDoris 项和 Release Notes 的 iDoris 项一并划掉。
 - [ ] 本分支（`chore/release-0.6.0-preview-prep`）已吸收 main，**合并后重新核对版本号**：
       ```bash
       git grep -n '^version = "0.5.1"' -- '*Cargo.toml'; git grep -n '"version": "0.5.1"' -- '*package.json'
@@ -156,11 +158,13 @@ mkdir -p /tmp/a24-pre-verify && gh release download v0.6.0-preview.20261028.1 -R
   旧授予按 Stale 拒绝、已知局限 #1290）。
 - **数据库升级不可回退**：迁移无 `.down.sql`，旧二进制遇到已记录的新迁移会拒开；升级前自行复制
   `agent24.db` / 各记忆库。开发机若跑过 memory-p1 改号前的版本，需要重置本地库。
+- **iDoris：temperature 透传行为变化（见 #1370）**：调用方设置了 `temperature` 时也会发给 iDoris 网关，默认不设就不发。同时写明本期不做项（共同 launcher / Admin token FD 交接、自动安装模型、`idoris-any`、流式），不得宣称。
 - 未验收项：不要把没跑的东西写成已通过。
 
 ### 5.1 发布后的跨仓库动作（联合发布）
 
 - [ ] **AgentEar 联合发布（issue #1347）**：宿主侧 vendored 契约须已重钉到 AgentEar v0.28.0（`0b6409ba`，PR `chore/agentear-vendor-v0.28.0`）并随本版进 main。发布后在 #1347 回帖：本版 tag、main 提交 SHA、dmg 与 CLI 包的 sha256。在此之前不把任何版本称为联合发布的宿主侧。
+- [ ] **iDoris 联合发布（issue #1370）**：发布后在 #1370 回帖 tag、main 提交 SHA、dmg 与 CLI 包的 sha256；Release Notes 引用 iDoris v0.3.1 的 tar sha256（`idoris-v0.3.1-aarch64-apple-darwin.tar.gz`，以 #1370 回填为准）；双方 Release 说明互相链接。
 - [ ] **Hyphae（issue #1346）**：若 #1352（锁升到 v0.27.0）随本版进 main，发布后通知 Hyphae 更新 `.github/joint-ci-baseline.json`（先例 Hyphae #281），并核对其交接文档里标「待确认」的三项（Agent24 实际锁、内部文件布局、daemon 生命周期）。
 - [ ] **Brood**：`orgs/auraai/INTERFACES.md` 里 Hyphae 版本（现写 v0.25.0）与 Agent24 版本行更新为本版。
 - [ ] `docs/PROGRESS-2026-10-26.md`（跟踪文档分支）补发布记录。

@@ -2,12 +2,13 @@
 
 - **日期**：2026-10-27 起草。**状态**：草稿，待发布负责人（David）确认。
 - **依据**：#1293（`DOC-1-40`，AGENTS.md「release PR 的合并门槛」由 jason 真机验收改为完整用例验收，**合并前需 jason 同意，见 #1159**）。
-- **范围**：四条线合并后的 `v0.6.0-preview.20261028.1`：
+- **范围**：五条线合并后的 `v0.6.0-preview.20261028.1`。合入顺序：kernel → memory-p1 → documenting → weknora → idoris（iDoris 最后；截止 2026-10-28 12:00 Asia/Bangkok，赶不上则整条 iDoris 线移出本版，配对改下一个 preview，见 #1370）：
   - kernel：release PR #1280（`release/kernel-k1-r2-20261026`，迁移 store 0019–0026 + memory 0018）；
   - memory-p1：release PR #1341（`ab/memory-p1`，迁移 memory 0019–0020 + store 0027–0029，**待 #1280 先合，再吸收 main**）；
   - documenting：`ab/documenting`（#1293 的 base；store 无迁移，documents 模块自己的库 0007–0008）；
-  - weknora：`ab/weknora`（KB-C1 / KB-HOST-01）。
-- **本清单没有实跑过**：起草时只读了各集成分支的代码、协议文件和测试，命令和断言依据代码核对，没有在四线合并后的 head 上执行（那个 head 还不存在）。第一次执行时，凡是 FAIL 先判断是用例写错还是产品错，用例写错就改本文件。「待核实」「缺口」两节列出起草时已经看到的疑点。
+  - weknora：`ab/weknora`（KB-C1 / KB-HOST-01）；
+  - idoris（第五线，#1370）：`ab/idoris`（Agent24 经 iDoris 网关调用本地模型；与 iDoris v0.3.1 联合发布，**待吸收 main 第二次并开 release PR**）。
+- **本清单没有实跑过**：起草时只读了各集成分支的代码、协议文件和测试，命令和断言依据代码核对，没有在五线合并后的 head 上执行（那个 head 还不存在）。第一次执行时，凡是 FAIL 先判断是用例写错还是产品错，用例写错就改本文件。「待核实」「缺口」两节列出起草时已经看到的疑点。
 
 ## 0. 规则对照（#1293）
 
@@ -35,7 +36,7 @@
 ## 2. 公共准备
 
 ```bash
-cd <四线合并后的 release head checkout>           # 本文简称 $REPO
+cd <五线合并后的 release head checkout>           # 本文简称 $REPO
 (cd rust && cargo build -p agent24d -p agent24-cli -p agent24-documents)
 NEW=$REPO/rust/target/debug                       # 发布 head 的二进制
 # main 的二进制（给 kernel 的 #1294 脚本当 --old）：在 main 的 checkout 里同样编一份，记为 $MAIN
@@ -52,6 +53,16 @@ mkdir -p /tmp/documents-pkg/bin
 cp rust/apps/agent24-documents/domain-os.yml /tmp/documents-pkg/
 cp "$NEW/agent24-documents" /tmp/documents-pkg/bin/
 rust/apps/agent24-documents/engines/pdfkit/build.sh /tmp/documents-pkg/bin    # 仅 macOS，PDF 的读/渲染引擎
+```
+
+- iDoris 线（I 组）用的真实 iDoris v0.3.1 归档（#1370 回填的 sha256 以那里为准，**先校验再解**）：
+
+```bash
+IDORIS_TAR=idoris-v0.3.1-aarch64-apple-darwin.tar.gz
+gh release download v0.3.1 -R iDoris-ai/iDoris -p "$IDORIS_TAR" -D $WORK/idoris-dl
+echo "<#1370 回填的 sha256>  $WORK/idoris-dl/$IDORIS_TAR" | shasum -a 256 -c      # 必须 OK，否则停
+mkdir -p $WORK/idoris && tar -xzf $WORK/idoris-dl/$IDORIS_TAR -C $WORK/idoris     # 一个 idoris 二进制 + 4 份配置；不含推理后端和模型权重
+IDORIS=$WORK/idoris/idoris                                                       # 以解出的实际路径为准
 ```
 
 - 手工跑单个用例时的小助手（一键脚本里有等价实现）：
@@ -71,10 +82,11 @@ a() { curl -s -m 20 -w '\n[%{http_code}]\n' -H "Authorization: Bearer $TOKEN" -H
 | memory-p1 | 16 | 13（M-12 需 `--slow`，M-09～M-11 需 macOS 且 `--disk`） | 0 | 2（M-14、M-15） | 1（M-16） |
 | documenting | 13 | 10（D-09 需 `--slow`） | 0 | 1（D-12） | 2（D-11、D-13） |
 | weknora | 4 | 2 | 0 | 2（W-03、W-04） | 0 |
+| idoris（#1370） | 8 | 2（ID-4、ID-6） | 4（ID-1、ID-2、ID-3、ID-5） | 1（ID-8） | 1（ID-7） |
 | 跨线升级 | 8 | 5 | 1（X-07） | 2（X-06、X-08） | 0 |
-| 合计 | 69 | 56 | 1 | 8 | 4 |
+| 合计 | 77 | 58 | 5 | 9 | 5 |
 
-真机清单：K-03、M-14、M-15、D-12、W-03、W-04、X-06、X-08。阻塞清单：K-02、M-16、D-11、D-13。
+真机清单：K-03、M-14、M-15、D-12、W-03、W-04、ID-8、X-06、X-08。阻塞清单：K-02、M-16、D-11、D-13、ID-7。
 
 ## 4. 各线用例
 
@@ -389,6 +401,100 @@ documents 模块**不随安装包分发、不默认安装**（`rust/apps/agent24
 - `knowledge.db` 的日志与 seal 编码（#1327、#1336，`knowledge_migrations/0001_log.sql`）：daemon 不打开它；等接入时再加升级用例。
 - schema、夹具、契约测试（#1054–#1065、`packages/contract-tests/src/knowledge-v1.test.ts`）、契约与设计文档（#1044、#1113–#1115、#1171–#1174、#1255）。
 
+### 4.5 idoris（第五线，#1370）
+
+先说结论：这条线是 Agent24 经 iDoris 网关（`idoris-local`）调本地模型。配置 `IDORIS_URL`（loopback）和 `IDORIS_API_KEY`（iDoris 签发的只含 `local_only` 的数据 key，与 Admin token、`OMLX_API_KEY`、daemon token 分开，不进日志、不进 renderer）之后，Agent24 **独占** `idoris-local`：不保留 oMLX/Ollama 直连回退，只发约定的 role 与 `X-iDoris-Privacy` / `X-iDoris-Complexity` / `X-iDoris-Request-Id` 三个头，不流式，云端补位默认关。接口唯一的权威是 iDoris 仓库《iDoris × Agent24 分工边界与接口规范》修订 1.2 的 §3。
+
+**本期明确不做（release notes 不得宣称）**：共同 launcher 与 Admin token FD 交接（R9 OD-1）、推荐 → 同意 → 自动安装模型（OD-2，Download 按钮不能冒充「已安装」）、fast/daily 角色重标（OD-3）、`idoris-any` 远程 provider 与第二把 key、流式、动态额度 HTTP API、Admin 写接口。
+
+**行为变化（release PR 正文单独列出）**：调用方设置了 `temperature` 时，这个参数也会发给 iDoris 网关；默认不设就不发（#1365 吸收 main 带来的）。
+
+共同前置（ID-1、ID-2、ID-3、ID-5）：真实 iDoris v0.3.1 归档已按第 2 节校验 sha256 并解出；后端是本地确定性 HTTP 假后端（OpenAI 兼容，记录每个请求体，永远回固定内容；不是 oMLX、不是 Ollama）；iDoris 的 HTTP 后端卡在 `extensions.idoris_role_models` 里把 role 绑到假后端上的真实模型 ID。端口：数据面 `127.0.0.1:8740`，只读 Admin `127.0.0.1:8741/admin/`。用户自己启动 iDoris（共同 launcher 本期不做）。
+
+**ID-1 bootstrap**
+- 前置：新数据目录；iDoris 已启动（`IDORIS_ALLOCATED_BUDGET_BYTES` 不设），假后端在跑。
+- 步骤：
+  ```bash
+  curl -s http://127.0.0.1:8740/health | jq .         # service == "idoris"，contract_version == "1.0.1"，version == "0.3.1"
+  KEY=$("$IDORIS" key issue --spec-stdin < $WORK/key-spec.json)    # 只含 local_only 的 key；spec 写法见缺口 G-I4
+  # 好路径
+  start_daemon IDORIS_URL=http://127.0.0.1:8740 IDORIS_API_KEY="$KEY"      # 手工：见第 2 节小助手
+  a POST /api/v1/chat '{"messages":[{"role":"user","content":"ping"}]}'
+  # 负对照：无 key / 错 key / 越权 role
+  #   无 key：不设 IDORIS_API_KEY 起 daemon，再 chat
+  #   错 key：IDORIS_API_KEY=wrong
+  #   越权 role：用只授权某 role 的 key，请求另一个 role
+  ```
+- 期望：好路径 200，`/health` 身份检查通过；无 key、错 key 明确失败（401/403，提示指向 key 问题）；越权 role 明确失败（403）；三种失败都不回落到 oMLX/Ollama。`/health` 的 `service`、`contract_version` 不符时，Agent24 启动即明确报错，不猜测兼容。
+- 判定：好路径 `$CODE = 200`；三个负对照 `$CODE` 属 401/403 且响应里没有模型内容；`mock.log`（oMLX 的 mock）行数不增。
+- PR/issue：#1370（联合验收 ID-1）、#982、#1364。执行方式：CLI（未入脚本：需真实 iDoris 与 key spec，见 G-I4）。
+
+**ID-2 local_only 零外呼**
+- 前置：同 ID-1，但假后端**停掉**（本地没有模型）；另起一个远程 stub 并配成 iDoris 的远程 provider 候选，两者各有请求计数。
+- 步骤：好 key 下 `a POST /api/v1/chat ...`；再 `curl` 数 stub 和假后端的请求计数。
+- 期望：fail-closed，返回 503（`local_only_unavailable` 或 `no_eligible_candidate`），界面/CLI 提示「本地没有可用模型」；**远程 stub 计数 = 0，假后端（直连后端）计数 = 0**。402 是终态：不重试、不换 provider（这一条由 iDoris 侧用例覆盖，Agent24 侧只确认 402 不触发重试）。另设 `IDORIS_REMOTE_KILL_SWITCH=1` 重启 iDoris 再试一次，结果相同。
+- 判定：`$CODE = 503`；两个计数都为 0；响应不含模型内容。
+- PR/issue：#1370（ID-2）；iDoris 闸一隐私检查。执行方式：CLI（未入脚本，需真实 iDoris）。
+
+**ID-3 角色到真实模型**
+- 前置：同 ID-1，`idoris_role_models` 把两个 role 绑到假后端上两个不同的真实模型 ID。
+- 步骤：
+  ```bash
+  # 1) 不指定模型，按任务的 role 走
+  a POST /api/v1/chat '{"messages":[{"role":"user","content":"ping"}]}'
+  # 2) 在 Settings 里（或 PUT 对应设置）改选另一个模型或 role，再发 chat
+  # 3) 抓假后端的请求日志，看上游请求里的 model
+  ```
+- 期望：假后端收到的上游请求 `model` 等于该 role 绑定的真实模型 ID；Settings 的改动**真的进入 chat 请求**（改选后上游 `model` 变化），不只是改高亮；`response.model` 是真实模型 ID；响应带 `X-iDoris-Record-Id` 与 `X-iDoris-Served-Locality: loopback`；界面显示真实 `response.model`、Record-Id 与 locality（这一项界面部分「人看」，见 ID-8 的真机）。缺绑定或模型不可用时 503，不跨角色猜测。
+- 判定：`jq -r .model` 与假后端日志里最后一个请求的 `model` 一致，且与绑定表一致；改选前后两次不同。
+- PR/issue：#1370（ID-3）。执行方式：CLI（未入脚本，需真实 iDoris）；Settings 显示部分并入 ID-8。
+
+**ID-4 locality 负对照**
+- 前置：一个 iDoris 的**桩网关**（脚本内置，不是真 iDoris）：`/health` 回 `{"service":"idoris","contract_version":"1.0.1"}`，`/v1/chat/completions` 回固定内容 `idoris-pong`，`X-iDoris-Served-Locality` 头按模式文件取值；daemon 用 `IDORIS_URL=<桩>`、`IDORIS_API_KEY=x` 起。
+- 步骤：模式依次为 `loopback`（正对照）、缺头、`lan`、`remote`，每种发一次 chat。
+- 期望：`loopback` 返回 200 且带 `idoris-pong`（正对照，证明桩与链路本身是通的）；缺头、`lan`、`remote` 一律按错误处理，**结果不交给调用者**（响应里没有 `idoris-pong`，状态非 200）。
+- 判定：见脚本 ID-4；`idoris-local` 只接受 `loopback`。
+- PR/issue：#1370（ID-4）；`idoris.rs` 的 locality 绊线。执行方式：脚本。
+
+**ID-5 额度**
+- 前置：真实 iDoris；用 `agent24 hw idoris-env --core-reserved-bytes <N>` 算出要交给 iDoris 的值（Agent24 侧；手动启动 iDoris 时的写法见 `docs/agent/IDORIS-MANUAL-BUDGET.md`）。
+- 步骤：iDoris 分别以三种方式启动，每次取推荐结果并尝试加载一个超出额度的模型：
+  ```bash
+  agent24 hw idoris-env --core-reserved-bytes 1073741824          # 打印 IDORIS_ALLOCATED_BUDGET_BYTES=<字节>；非整数/负数/小数应被拒
+  # a) 不设 IDORIS_ALLOCATED_BUDGET_BYTES（独立模式）
+  # b) IDORIS_ALLOCATED_BUDGET_BYTES=0（真零）
+  # c) IDORIS_ALLOCATED_BUDGET_BYTES=<小额度，小于被测模型>
+  # d) IDORIS_ALLOCATED_BUDGET_BYTES=1.5（格式不合法）
+  ```
+- 期望：a) 推荐不受额度限制；b) 推荐里没有任何需要内存的候选，任何加载都被拒；c) 推荐只含放得下的模型，强制指定超额的模型被拒绝生效；d) iDoris 拒绝启动。推荐结果和**实际加载准入**都与设定一致。
+- 判定：逐种比对推荐列表和加载结果；d) 进程退出码非 0 且打出明确原因。
+- PR/issue：#982、#1370（ID-5）；iDoris#579 库层的 `TempChoice` / `BlockedChoice.degraded_alternative` **本期不经 HTTP 暴露**，不在此验。执行方式：CLI（未入脚本，需真实 iDoris 与不同大小的假后端模型）。
+
+**ID-6 零回归**
+- 前置：新数据目录，**不**设 `IDORIS_URL`；oMLX 指向 mock。
+- 步骤：`chat` 发一句话；看 mock 的请求日志。
+- 期望：200，内容 `pong`；请求打到 oMLX 的 mock（`mock.log` 增 1 行）；没有任何对 iDoris 的访问；原有 `agent24 daemon start/stop`、Settings 页行为不变。
+- 判定：`$CODE = 200`；`grep -c pong r.json` ≥ 1；`mock.log` 行数增加。
+- PR/issue：#1370（ID-6）。执行方式：脚本。
+
+**ID-7 temperature**（阻塞）
+- 要验的：调用方设置了 `temperature` 时这个参数发给 iDoris 网关；不设就不发（行为变化，release PR 正文要单独列出）。
+- **阻塞原因**：`temperature` 目前只出现在 daemon 的模块推理回调（`model_callback.rs`，范围 0..=2，可选）里，REST 聊天与 CLI 都没有设置它的入口；仓库里的示例模块也不带 `temperature`。没有用户可达的入口就无法按 #1293 写成 CLI 用例。见缺口 G-I3。
+- 可执行的替代（若补了会设置 `temperature` 的示例模块）：模块经回调带 `temperature: 0.7` 调一次，再不带调一次；桩网关日志里第一次请求体含 `"temperature":0.7`，第二次不含 `temperature` 键。
+- 判定：`grep -c '"temperature"' <桩日志>`，第一次 1、第二次 0。
+- PR/issue：#1365、#1370（ID-7）。执行方式：阻塞。
+
+**ID-8 真机**
+- 前置：干净的 macOS arm64（无历史 `~/.agent24`）；真实 iDoris v0.3.1 归档（已校验 sha256）；一个已缓存的小模型和对应的本地推理后端（用户按安装指南准备，不是 Agent24 下载）；断网（飞行模式）。
+- 步骤：启动 iDoris（`agent24 hw idoris-env` 算出的额度），桌面端或 CLI 配 `IDORIS_URL` 与 key，Settings 里选这个小模型，发一次 chat；看界面。
+- 期望（人看）：离线下得到一次真实的成功回复（**fixture 不能代替这一项**）；界面显示真实 `response.model`、Record-Id 和 locality=`loopback`；401/403 提示指向 key，503 提示「本地没有可用模型」。
+- PR/issue：#1370（ID-8）。执行方式：真机。
+
+**不跑用例的改动（逐项）**
+- key 和 `IDORIS_URL` 不进日志、不进 renderer：由 `model_callback.rs`、`service.rs` 的单测覆盖（`capture_env()` 不含 `IDORIS_API_KEY`），用户看不到。
+- 推荐器库层的两个用户选项（`TempChoice`、`BlockedChoice.degraded_alternative`、`headroom_breach_option`）：iDoris v0.3.1 不经 HTTP 暴露，Agent24 的展示和选择下一期做。
+- 共同 launcher / Admin token FD 交接、`idoris-any`、流式：本期不做，不在 release notes 里宣称。
+
 ## 5. 跨线升级
 
 目标：用 `v0.5.1-preview.20261016.2` 的数据目录升到新版，两个库按顺序迁移成功，数据不丢。两个库指 `agent24.db`（store）和 `memory.db`（memory）；documents 模块有自己的库，见 X-07。预期迁移范围（以合并后的代码为准，不符先查合并）：
@@ -484,7 +590,7 @@ git show d50c319c9454ffa79f8ccd5de2b4b8955fab4a87:scripts/k1-r2-accept.sh > scri
 rm scripts/k1-r2-accept.sh        # 脚本是借来的，不提交
 ```
 
-- 只跑某几组：`--only K,M`（组名 K、M、D、W、X）。缺参数的组里对应用例记 SKIP。
+- 只跑某几组：`--only K,M`（组名 K、M、D、W、I、X；I 是 iDoris 线，脚本只跑 ID-4、ID-6，其余记 SKIP 并交代原因）。缺参数的组里对应用例记 SKIP。
 - 依赖：curl、jq、sqlite3、python3、shasum；`--disk` 需要 macOS 的 `hdiutil`、`diskutil`。
 
 ```bash accept-v0.6.0.sh
@@ -492,14 +598,14 @@ rm scripts/k1-r2-accept.sh        # 脚本是借来的，不提交
 # v0.6.0-preview.20261028.1 acceptance: docs/release/ACCEPTANCE-v0.6.0-preview.md
 #   accept-v0.6.0.sh --new BIN [--preview BIN] [--main BIN] [--k1-script PATH]
 #                    [--documents-pkg DIR] [--pdf FILE] [--work DIR]
-#                    [--only K,M,D,W,X] [--slow] [--disk]
+#                    [--only K,M,D,W,I,X] [--slow] [--disk]
 # BIN = a directory holding agent24d and agent24.
 set -uo pipefail
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)" || exit 2
 REPO=$(pwd)
 
-NEW="" PREVIEW="" MAIN="" K1="" DOCPKG="" PDF="" WORK="" ONLY="K M D W X" SLOW=0 DISK=0
+NEW="" PREVIEW="" MAIN="" K1="" DOCPKG="" PDF="" WORK="" ONLY="K M D W I X" SLOW=0 DISK=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --new) NEW=$2; shift 2 ;;
@@ -530,7 +636,7 @@ case "$WORK/" in "$REAL"/*) echo "--work must not be inside $REAL" >&2; exit 2 ;
 mkdir -p "$WORK" || exit 2
 [ -s "$REAL/daemon.json" ] && kill -0 "$(jq -r .pid "$REAL/daemon.json")" 2> /dev/null \
   && { echo "a daemon is running on $REAL: stop it first (agent24 daemon stop)" >&2; exit 2; }
-for v in $(env | grep -oE '^(A24|AGENT24|OMLX|OLLAMA)_[A-Z0-9_]+|^DEFAULT_MODEL'); do unset "$v"; done
+for v in $(env | grep -oE '^(A24|AGENT24|OMLX|OLLAMA|IDORIS)_[A-Z0-9_]+|^DEFAULT_MODEL'); do unset "$v"; done
 touch "$WORK/.start"
 [ -e "$REAL" ] && REAL_BEFORE=present || REAL_BEFORE=absent
 
@@ -928,6 +1034,67 @@ run_W() {
   check W-04 "host channel round trip on a real desktop" skip "real machine; no user entry yet (gap G-W1)"
 }
 
+# ============================== I: idoris (ID-4, ID-6; others need a real iDoris, see section 4.5) ==============================
+run_I() {
+  # ID-6: no IDORIS_URL -> the old route is unchanged (oMLX mock answers).
+  start_daemon "$NEW" "$WORK/i6" || { check ID-6 "daemon starts without IDORIS_URL" fail "$WORK/i6.serve.log"; return; }
+  local before after S; before=$(wc -l < "$WORK/mock.log"); S=$(newsess)
+  chat "$S" "ping"
+  after=$(wc -l < "$WORK/mock.log")
+  check ID-6 "no IDORIS_URL: chat 200 via the old route (oMLX mock hit)" "$( [ "$CODE" = 200 ] && grep -q pong "$WORK/r.json" && [ "$after" -gt "$before" ] && echo ok || echo fail)" "status $CODE mock.log $before->$after"
+  stop_daemon
+
+  # ID-4: stub iDoris gateway, locality header per mode file.
+  cat > "$WORK/idoris-stub.py" <<'PY'
+import json, sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+MODE_FILE, LOG = sys.argv[2], sys.argv[3]
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def _send(self, obj, extra=()):
+        b = json.dumps(obj).encode()
+        self.send_response(200); self.send_header('content-type', 'application/json')
+        for k, v in extra: self.send_header(k, v)
+        self.send_header('content-length', str(len(b))); self.end_headers(); self.wfile.write(b)
+    def do_GET(self):
+        self._send({"service": "idoris", "version": "0.3.1", "contract_version": "1.0.1", "status": "ok"})
+    def do_POST(self):
+        n = int(self.headers.get('content-length') or 0)
+        body = self.rfile.read(n).decode()
+        with open(LOG, 'a') as f: f.write(body.replace("\n", " ") + "\n")
+        mode = open(MODE_FILE).read().strip()
+        extra = [("X-iDoris-Record-Id", "rec_stub_1")]
+        if mode != "missing": extra.append(("X-iDoris-Served-Locality", mode))
+        self._send({"model": "stub-real-model", "choices": [{"index": 0, "message": {"role": "assistant", "content": "idoris-pong"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}, extra)
+ThreadingHTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
+PY
+  local IPORT; IPORT=$(python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+  echo loopback > "$WORK/idoris-mode"; : > "$WORK/idoris-stub.log"
+  python3 -I "$WORK/idoris-stub.py" "$IPORT" "$WORK/idoris-mode" "$WORK/idoris-stub.log" &
+  local STUB=$!
+  for _ in $(seq 1 20); do curl -s -m 1 "http://127.0.0.1:$IPORT/health" > /dev/null && break; sleep 0.3; done
+  start_daemon "$NEW" "$WORK/i4" IDORIS_URL="http://127.0.0.1:$IPORT" IDORIS_API_KEY=stub-key \
+    || { check ID-4 "daemon starts with IDORIS_URL (stub)" fail "$WORK/i4.serve.log"; kill "$STUB" 2> /dev/null; return; }
+  S=$(newsess)
+  chat "$S" "ping"
+  check ID-4a "locality=loopback is the positive control (200 + stub content)" "$( [ "$CODE" = 200 ] && grep -q idoris-pong "$WORK/r.json" && echo ok || echo fail)" "status $CODE"
+  local m bad=""
+  for m in missing lan remote; do
+    echo "$m" > "$WORK/idoris-mode"
+    chat "$S" "ping $m"
+    if [ "$CODE" = 200 ] || grep -q idoris-pong "$WORK/r.json"; then bad="$bad $m(status $CODE)"; fi
+  done
+  check ID-4 "missing / lan / remote locality is an error and the result is not handed to the caller" "$( [ -z "$bad" ] && echo ok || echo fail)" "leaked:${bad:- none}"
+  stop_daemon; kill "$STUB" 2> /dev/null
+  check ID-1 "bootstrap with a real iDoris key" skip "needs the real iDoris v0.3.1 archive; manual (section 4.5)"
+  check ID-2 "local_only zero egress" skip "needs the real iDoris v0.3.1 archive; manual (section 4.5)"
+  check ID-3 "role to real model" skip "needs the real iDoris v0.3.1 archive; manual (section 4.5)"
+  check ID-5 "budget" skip "needs the real iDoris v0.3.1 archive; manual (section 4.5)"
+  check ID-7 "temperature passthrough" skip "BLOCKED: no user-reachable entry for temperature (gap G-I3)"
+  check ID-8 "offline success on a clean macOS arm64" skip "real machine"
+}
+
 # ============================== X: cross-line upgrade ==============================
 run_X() {
   if [ -z "$PREVIEW" ] || [ ! -x "$PREVIEW/agent24d" ]; then check X-01 "upgrade from v0.5.1-preview.20261016.2" skip "needs --preview"; return; fi
@@ -991,6 +1158,7 @@ want K && run_K
 want M && { run_M; run_Mdisk; }
 want D && run_D
 want W && run_W
+want I && run_I
 want X && run_X
 
 # Z1: ~/.agent24 untouched
@@ -1032,6 +1200,12 @@ echo "report: $WORK/report.md"
 | G-W1 | weknora | Provider 全部没接入 daemon；`knowledge.db` 不会被打开；Knowledge 工具没接入；host 通道没有用户入口 | 这条线的用户可见面几乎为零，W-04 无法写出可执行的用例 | 建议 David 判为「用户看不到」并逐项写进正文；接入 daemon 的那次发布再补用例（含 `knowledge.db` 的升级用例） |
 | G-X1 | 跨线 | 代码里没有为「旧编号迁移」写专门的报错或重置指引，用户看到的只是 sqlx 的 `migration N was previously applied but has been modified / is missing`；`docs/Deployment/README.md` 只讲了用 `AGENT24_DATA_DIR` 隔离 | 需求是「明确报错且有清楚的重置步骤」 | X-05 的四步要写进 release notes 和 CHANGELOG；更好的做法是 daemon 在这类错误后追加一行指向该步骤的提示。另需要 David 确认：memory-p1 旧编号的开发库也按 K1-06b 矩阵 §6 第 4 条「不做兼容、清库」处理 |
 | G-X2 | 跨线 | 起草时四线还没有合并，迁移号（store 29、memory 20）、文件名、`1..29` 连续性都来自各分支的 `ls-tree`，没在合并结果上验证 | 如果 #1341 吸收 main 或 #1280 重切时有改号，X-01 的期望值要改 | 合并后第一件事：跑 X-01 看连续性 |
+| G-I1 | idoris | `ab/idoris` 还没有第二次吸收 main：#1365 先吸收一次，要等 #1358/#1364/#1368/#1366 进 main 后再吸收一次；`ab/idoris` → main 的 release PR 还没开 | 截止 2026-10-28 12:00（Asia/Bangkok）前要拿到 PR-Daemon APPROVE 并可合并；iDoris 合入顺序最后 | 前四线合入后立即吸收 main、开 release PR；赶不上则整条 I 组、第 8 节 idoris 一行和 checklist 的 iDoris 项一并移出本版 |
+| G-I2 | idoris | 真实 iDoris v0.3.1 归档的 tag 指向提交、sha256、字节数在 #1370 里仍是「待回填」 | ID-1/2/3/5/8 要先校验 sha256 再用；Release Notes 要引用该 tar 的 sha256 | iDoris 打 tag 后回填 #1370；本文第 2 节的校验命令和 release notes 都按回填值写，**不要用占位值跑** |
+| G-I3 | idoris | `temperature` 只在 daemon 的模块推理回调里可设，REST 聊天、CLI 都没有入口；示例模块也不带 | ID-7 无法按 #1293 写成用户路径的用例；而这是本版唯一的行为变化 | 补一个会设置 `temperature` 的示例模块并加用例；或 David 判为「用户看不到」并在 release PR 正文逐项写明（含行为变化的那一段） |
+| G-I4 | idoris | `idoris key issue --spec-stdin` 的 spec 格式和 `extensions.idoris_role_models` 的后端卡写法，#1370 与本文起草时都没有样例 | ID-1/2/3/5 无法写成可复制的命令，只写了步骤骨架 | 请 iDoris 侧给一份 key spec 样例和后端卡样例，放进本文第 4.5 节；这四条才能入脚本 |
+| G-I5 | idoris | ID-8 需要干净的 macOS arm64、已缓存的小模型和本地推理后端；iDoris 归档不含推理后端与权重 | fixture 不能代替这一项；没有真机就不能算已验 | 指定谁在哪台机器上做；做不了的记 SKIP 并在 release PR 正文交代 |
+| G-I6 | idoris | 一键脚本的 ID-4 用桩网关，模拟的是 `/health` 与 `/v1/chat/completions` 的最小形状（`service`、`contract_version`、两个头），没有对着真实 iDoris 响应核对；daemon 端对 chat 路由到 `idoris-local` 的触发条件（是否需要 role/模型设置）起草时没有跑 | 桩与真实形状有出入时 ID-4a 的正对照会先红，应先修桩 | 第一次执行以 ID-4a 的结果判断桩是否可用；真实形状以 ID-3 抓到的响应为准 |
 
 ## 8. release PR 正文模板
 
@@ -1040,8 +1214,9 @@ echo "report: $WORK/report.md"
 - 环境：<机器、系统>，二进制 <head>，数据目录 <WORK>，不碰 ~/.agent24（Z-01）
 - 命令：scripts 见 docs/release/ACCEPTANCE-v0.6.0-preview.md 第 6 节；完整报告 <report.md 贴在评论>
 - 结果：N 项 PASS，M 项 KNOWN（逐条写编号和原因），K 项 SKIP（逐条写原因）
-- 真机项：K-03、M-14、M-15、D-12、W-03、W-04、X-06、X-08：<谁在哪台机器上做的、结果>
-- 阻塞项（不能算已验）：K-02、M-16、D-11、D-13：<逐条写：为什么用户现在够不着，或为什么判为用户看不到，David 的决定>
+- 真机项：K-03、M-14、M-15、D-12、W-03、W-04、ID-8、X-06、X-08：<谁在哪台机器上做的、结果>
+- 阻塞项（不能算已验）：K-02、M-16、D-11、D-13、ID-7：<逐条写：为什么用户现在够不着，或为什么判为用户看不到，David 的决定>
+- idoris（#1370）：使用真实 iDoris v0.3.1 归档，sha256 <回填值，已校验>；ID-1…ID-8 逐条结果 <PASS/KNOWN/SKIP>；**行为变化：调用方设置了 `temperature` 时也会发给 iDoris 网关，默认不设就不发**；本期不做项（launcher/Admin FD 交接、自动安装、`idoris-any`、流式）不得宣称
 - 不跑用例的改动：见清单各线「不跑用例的改动（逐项）」
 - 桌面端需补用例的缺口（CLI 入口未补齐）：W-03（托管 daemon）、D-12 里的界面部分
 ```
