@@ -17,6 +17,7 @@ use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::{Tool, ToolContext, ToolError, truncate};
+use agent24_domain::{EgressDestination, EgressPurpose};
 
 const MAX_READ_BYTES: usize = 256 * 1024;
 const MAX_STREAM_BYTES: usize = 16 * 1024;
@@ -79,9 +80,24 @@ pub(crate) fn approved_parent(input: &Map<String, Value>) -> Option<Arc<crate::P
 pub(crate) fn pin_outside_dir(
     parent: PathBuf,
 ) -> Result<Arc<crate::PinnedOutsideDir>, std::io::Error> {
+    // `parent` was canonical when it was resolved, but opening it resolves it
+    // again: a component swapped for a symlink in between would leave the
+    // handle on another directory under the approved name. Opened without
+    // following a symlink at any level, the handle is the directory that is
+    // at this very name, or the open fails.
     // Directory open fails immediately on a FIFO or regular file. `File::open`
     // would block on a FIFO and stall the caller before any approval exists.
-    let dir = cap_std::fs::Dir::open_ambient_dir(&parent, cap_std::ambient_authority())?;
+    if !parent.is_absolute()
+        || parent
+            .components()
+            .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a canonical absolute path",
+        ));
+    }
+    let dir = open_dir_through_no_symlink(&parent)?;
     let meta = dir.dir_metadata()?;
     Ok(Arc::new(crate::PinnedOutsideDir {
         path: parent,
@@ -89,6 +105,63 @@ pub(crate) fn pin_outside_dir(
         dev: cap_fs_ext::MetadataExt::dev(&meta),
         ino: cap_fs_ext::MetadataExt::ino(&meta),
     }))
+}
+
+/// macOS 11 (Darwin 20) and later: one open of the whole path that fails on
+/// a symlink at any level (`O_NOFOLLOW_ANY`). Like a plain open, ancestors
+/// need only search permission. Older kernels ignore the flag without an
+/// error, so there the path is walked as elsewhere (each level then needs
+/// read permission: an approved write under an unreadable ancestor fails).
+#[cfg(target_os = "macos")]
+fn open_dir_through_no_symlink(path: &Path) -> Result<cap_std::fs::Dir, std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if !nofollow_any_is_honoured() {
+        return walk_without_following(path);
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW_ANY)
+        .open(path)?;
+    Ok(cap_std::fs::Dir::from_std_file(file))
+}
+
+/// Whether this kernel is Darwin 20 (macOS 11) or later, read once. An
+/// unreadable release counts as older: the walk is the closed direction.
+#[cfg(target_os = "macos")]
+fn nofollow_any_is_honoured() -> bool {
+    static HONOURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HONOURED.get_or_init(|| darwin_major().is_some_and(|major| major >= 20))
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_major() -> Option<u32> {
+    let name = rustix::system::uname();
+    name.release()
+        .to_str()
+        .ok()?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Elsewhere: walked from the root, no level followed. cap-std opens each
+/// with `O_PATH` where there is one (Linux), so ancestors need only search
+/// permission there too.
+#[cfg(not(target_os = "macos"))]
+fn open_dir_through_no_symlink(path: &Path) -> Result<cap_std::fs::Dir, std::io::Error> {
+    walk_without_following(path)
+}
+
+/// The canonical path opened level by level from the root, following none.
+fn walk_without_following(path: &Path) -> Result<cap_std::fs::Dir, std::io::Error> {
+    let mut dir = cap_std::fs::Dir::open_ambient_dir("/", cap_std::ambient_authority())?;
+    for component in path.components() {
+        if let Component::Normal(name) = component {
+            dir = cap_fs_ext::DirExt::open_dir_nofollow(&dir, name)?;
+        }
+    }
+    Ok(dir)
 }
 
 /// Lexically fold `.` / `..` (no filesystem access). `None` when `..` would
@@ -165,6 +238,10 @@ impl FsReadTool {
 
 #[async_trait]
 impl Tool for FsReadTool {
+    fn requires_outbound_policy(&self) -> bool {
+        false
+    }
+
     fn info(&self) -> ToolInfo {
         ToolInfo::new(
             "fs_read",
@@ -245,6 +322,10 @@ impl FsWriteTool {
 
 #[async_trait]
 impl Tool for FsWriteTool {
+    fn requires_outbound_policy(&self) -> bool {
+        false
+    }
+
     fn info(&self) -> ToolInfo {
         ToolInfo::new(
             "fs_write",
@@ -264,6 +345,32 @@ impl Tool for FsWriteTool {
             "required": ["path", "content"],
             "additionalProperties": false
         })
+    }
+
+    /// An outside write's approval is for the directory captured before the
+    /// gate (L-APPR-8). The durable-resume path captured none, and which one
+    /// the human saw is not recorded, so the call is asked again
+    /// (`ApprovalStale`, as for a module call), not refused by the whitelist.
+    async fn call_with_invocation(
+        &self,
+        ctx: &ToolContext,
+        invocation: &crate::ToolInvocation,
+        input: &Map<String, Value>,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolError> {
+        let outside_unpinned = || {
+            str_arg(input, "path").is_some_and(|raw| {
+                Path::new(raw).is_absolute() && resolve_in_roots(raw, &self.roots).is_err()
+            })
+        };
+        if matches!(invocation.approval, crate::ApprovalBinding::Unbound)
+            && ctx.workspace_authority().is_none()
+            && ctx.pinned_outside_directory().is_none()
+            && outside_unpinned()
+        {
+            return Err(ToolError::ApprovalStale);
+        }
+        self.call(ctx, input, cancel).await
     }
 
     async fn call(
@@ -401,6 +508,13 @@ impl ShellExecTool {
 
 #[async_trait]
 impl Tool for ShellExecTool {
+    fn requires_outbound_policy(&self) -> bool {
+        // The check is per-run: ordinary runs retain the approval flow, while
+        // restricted runs are rejected at call time because the destination
+        // of an arbitrary child process cannot be bounded.
+        false
+    }
+
     fn info(&self) -> ToolInfo {
         ToolInfo::new(
             "shell_exec",
@@ -437,6 +551,15 @@ impl Tool for ShellExecTool {
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
+        // Child processes are not network-isolated by the host. Restricted
+        // source policies therefore fail closed before spawn (including the
+        // already-approved resume path). Ordinary runs have no source egress
+        // resources and retain the pre-gate approval behavior.
+        ctx.authorize_egress_if_restricted(
+            EgressPurpose::ProcessExecution,
+            EgressDestination::unknown(),
+        )
+        .await?;
         let argv: Vec<String> = input
             .get("argv")
             .and_then(Value::as_array)
@@ -563,6 +686,28 @@ mod tests {
             .collect()
     }
 
+    /// shell_exec input whose only effect is creating `marker`, so a refused
+    /// call can be shown to have spawned nothing.
+    fn touch(marker: &std::path::Path) -> Map<String, Value> {
+        let mut input = Map::new();
+        input.insert(
+            "argv".to_owned(),
+            serde_json::json!(["/usr/bin/touch", marker]),
+        );
+        input
+    }
+
+    struct AllowEgress;
+    #[async_trait]
+    impl agent24_domain::EgressGate for AllowEgress {
+        async fn check(
+            &self,
+            _request: &agent24_domain::EgressRequest,
+        ) -> Result<(), agent24_domain::EgressDecision> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn an_approved_outside_directory_can_be_written_and_a_sibling_cannot() {
         let dir = tempfile::tempdir().unwrap();
@@ -609,6 +754,116 @@ mod tests {
             .unwrap_err();
         assert!(matches!(wrong, ToolError::Denied(_)), "{wrong:?}");
         assert!(!other.exists());
+    }
+
+    /// The name `approved_parent` resolved is opened again without following
+    /// any symlink: a level swapped for one after it was resolved, last or
+    /// in between, is not pinned (#1254 Codex C1); a real directory is.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_now_goes_through_a_symlink_is_not_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (safe, secret) = (root.join("safe"), root.join("secret"));
+        std::fs::create_dir_all(safe.join("sub")).unwrap();
+        std::fs::create_dir_all(secret.join("sub")).unwrap();
+        let pinned = pin_outside_dir(safe.clone()).unwrap();
+        let meta = std::fs::metadata(&safe).unwrap();
+        assert_eq!(
+            (pinned.dev(), pinned.ino()),
+            (
+                std::os::unix::fs::MetadataExt::dev(&meta),
+                std::os::unix::fs::MetadataExt::ino(&meta)
+            )
+        );
+        // `safe` resolved, then swapped for a symlink to `secret`.
+        std::fs::rename(&safe, root.join("safe-moved")).unwrap();
+        std::os::unix::fs::symlink(&secret, &safe).unwrap();
+        assert!(pin_outside_dir(safe.clone()).is_err(), "the last level");
+        assert!(
+            pin_outside_dir(safe.join("sub")).is_err(),
+            "a level in between"
+        );
+        assert!(pin_outside_dir(PathBuf::from("relative")).is_err());
+    }
+
+    /// The walk used where `O_NOFOLLOW_ANY` is not honoured refuses a
+    /// symlink at any level as well (#1254 Codex round 3).
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_refuses_a_symlink_at_any_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (real, link) = (root.join("real"), root.join("link"));
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(walk_without_following(&real.join("sub")).is_ok());
+        assert!(walk_without_following(&link).is_err(), "the last level");
+        assert!(
+            walk_without_following(&link.join("sub")).is_err(),
+            "a level in between"
+        );
+    }
+
+    /// A name with `..` is refused before any open: the walk skips it, so
+    /// `safe/../secret` would pin `safe/secret` (#1270 PR-Daemon N1). Both
+    /// directories exist, so only that check refuses it.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_with_a_parent_level_is_not_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("safe/secret")).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        assert!(pin_outside_dir(root.join("safe/../secret")).is_err());
+    }
+
+    /// An ancestor the user may search but not read does not stop the pin,
+    /// as it did not stop the plain open before (#1254 Codex round 2) —
+    /// except where macOS ignores `O_NOFOLLOW_ANY` (Darwin < 20) and the
+    /// walk needs read permission: there it fails, closed.
+    #[cfg(unix)]
+    #[test]
+    fn an_ancestor_that_can_only_be_searched_still_pins() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (shared, target) = (root.join("shared"), root.join("shared/target"));
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let pinned = pin_outside_dir(target.clone());
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        #[cfg(target_os = "macos")]
+        let pins = nofollow_any_is_honoured();
+        #[cfg(not(target_os = "macos"))]
+        let pins = true;
+        assert_eq!(pinned.is_ok(), pins, "{:?}", pinned.err());
+    }
+
+    /// The durable-resume path captured no outside directory: the call is
+    /// asked again, not run and not refused (#1254 Codex C2). Inside the
+    /// workspace it runs as approved.
+    #[tokio::test]
+    async fn a_resumed_outside_write_is_asked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, outside) = (dir.path().join("ws"), dir.path().join("outside"));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let reg = ToolRegistry::builtin(ws.clone());
+        let file = outside.join("a.txt");
+        let input = sinput(&[("path", file.to_str().unwrap()), ("content", "x")]);
+        let err = reg
+            .execute_preapproved("fs_write", &ctx(), &input, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ApprovalStale), "{err:?}");
+        assert!(!file.exists());
+        let inside = ws.join("b.txt");
+        let input = sinput(&[("path", inside.to_str().unwrap()), ("content", "y")]);
+        reg.execute_preapproved("fs_write", &ctx(), &input, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&inside).unwrap(), "y");
     }
 
     struct SwapGate {
@@ -823,20 +1078,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_exec_runs_argv_without_shell_interpretation() {
+    async fn shell_exec_fails_closed_when_child_network_use_cannot_be_bounded() {
         let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-ran");
         let tool = ShellExecTool::new(dir.path().to_path_buf());
-        let cancel = CancellationToken::new();
+        let input = touch(&marker);
+        let restricted = ctx().with_egress_policy(
+            <dyn agent24_domain::EgressGate>::deny_all(),
+            vec![agent24_domain::EgressResource::local_only(
+                "selected_material:private",
+                "rev-1",
+            )],
+            0,
+        );
+        let err = tool
+            .call(&restricted, &input, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
+        assert!(!marker.exists(), "a refused shell_exec must not spawn");
+    }
+
+    #[tokio::test]
+    async fn shell_exec_runs_for_ordinary_run_without_egress_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-ran");
+        let tool = ShellExecTool::new(dir.path().to_path_buf());
         let mut input = Map::new();
-        // `$HOME` must NOT be expanded — argv goes straight to exec
         input.insert(
             "argv".to_owned(),
-            serde_json::json!(["/bin/echo", "$HOME", "two words"]),
+            serde_json::json!(["/usr/bin/touch", marker]),
         );
-        let out = tool.call(&ctx(), &input, &cancel).await.unwrap();
+        let out = tool
+            .call(&ctx(), &input, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(out.contains("\"exit_code\":0"), "{out}");
+        assert!(marker.exists(), "ordinary shell command should spawn");
+    }
+
+    #[tokio::test]
+    async fn shell_exec_runs_argv_without_shell_interpretation_for_ordinary_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ShellExecTool::new(dir.path().to_path_buf());
+        let mut input = Map::new();
+        input.insert(
+            "argv".to_owned(),
+            serde_json::json!(["/usr/bin/printf", "[%s]", "$HOME", "two words", "a;b"]),
+        );
+        let out = tool
+            .call(&ctx(), &input, &CancellationToken::new())
+            .await
+            .unwrap();
         let parsed: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["exit_code"], 0);
-        assert_eq!(parsed["stdout"], "$HOME two words\n");
+        // Each argv entry arrives as exactly one argument, unexpanded. Output
+        // alone cannot tell direct exec from a shell with perfect quoting;
+        // direct exec is `Command::new(program).args(args)` in `call`.
+        assert_eq!(parsed["stdout"], "[$HOME][two words][a;b]");
     }
 
     /// FU-103/J-6, end-to-end through `ShellExecTool::call` (not just the
@@ -878,34 +1177,31 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let tool = ShellExecTool::new(dir.path().to_path_buf());
-        let cancel = CancellationToken::new();
         let mut input = Map::new();
         input.insert("argv".to_owned(), serde_json::json!(["printenv"]));
-        let out = tool.call(&ctx(), &input, &cancel).await.unwrap();
-        let parsed: Value = serde_json::from_str(&out).unwrap();
-        let stdout = parsed["stdout"].as_str().unwrap();
+        let output = tool
+            .call(&ctx(), &input, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!output.contains("leaked-if-this-appears-in-child-stdout"));
+        // An empty child environment would also pass the line above.
         assert!(
-            !stdout.contains("secret_test_key"),
-            "secret leaked into shell_exec's child:\n{stdout}"
-        );
-        assert!(
-            stdout.contains("PATH="),
-            "PATH must still reach shell_exec's child:\n{stdout}"
+            output.contains("PATH="),
+            "PATH must reach the child: {output}"
         );
     }
 
     #[tokio::test]
-    async fn shell_exec_reports_nonzero_exit() {
+    async fn shell_exec_reports_nonzero_exit_for_ordinary_run() {
         let dir = tempfile::tempdir().unwrap();
         let tool = ShellExecTool::new(dir.path().to_path_buf());
         let mut input = Map::new();
         input.insert("argv".to_owned(), serde_json::json!(["/usr/bin/false"]));
-        let out = tool
+        let output = tool
             .call(&ctx(), &input, &CancellationToken::new())
             .await
             .unwrap();
-        let parsed: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["exit_code"], 1);
+        assert!(output.contains("\"exit_code\":1"), "{output}");
     }
 
     #[tokio::test]
@@ -917,6 +1213,10 @@ mod tests {
         struct NoApproval(ShellExecTool);
         #[async_trait]
         impl Tool for NoApproval {
+            fn requires_outbound_policy(&self) -> bool {
+                false
+            }
+
             fn info(&self) -> ToolInfo {
                 // Re-declared as Read purely to skip the gate for this budget
                 // test; the real ShellExecTool is Exec and always gated.
@@ -951,5 +1251,97 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::Timeout(_)), "{err}");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn ordinary_shell_exec_runs_after_approval_without_egress_gate() {
+        struct AllowApproval;
+        #[async_trait]
+        impl crate::ApprovalGate for AllowApproval {
+            async fn check(
+                &self,
+                _info: &ToolInfo,
+                _ctx: &ToolContext,
+                _input: &Map<String, Value>,
+                _standing_target: Option<&str>,
+                _cancel: &CancellationToken,
+            ) -> crate::GateDecision {
+                crate::GateDecision::Allow
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ToolRegistry::new()
+            .with_gate(Arc::new(AllowApproval))
+            .with(Arc::new(ShellExecTool::new(dir.path().to_path_buf())));
+        let input = serde_json::json!({"argv":["/bin/echo", "ordinary"]})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let output = registry
+            .dispatch("shell_exec", &ctx(), &input, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(output.contains("ordinary"));
+    }
+
+    #[tokio::test]
+    async fn local_only_shell_exec_is_denied_even_by_permissive_egress_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-ran");
+        let tool = ShellExecTool::new(dir.path().to_path_buf());
+        let input = touch(&marker);
+        let restricted = ctx().with_egress_policy(
+            Arc::new(AllowEgress),
+            vec![agent24_domain::EgressResource::local_only(
+                "selected_material:secret",
+                "rev-1",
+            )],
+            0,
+        );
+        let err = tool
+            .call(&restricted, &input, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
+        assert!(!marker.exists(), "a refused shell_exec must not spawn");
+    }
+
+    /// K1-6b.5d: a fully granted CloudAuthorized source and a gate that allows
+    /// everything still cannot run a child. Where a child process sends data
+    /// is unknown, and an unknown destination is refused before any gate.
+    #[tokio::test]
+    async fn cloud_authorized_shell_exec_is_denied_because_its_destination_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-ran");
+        let tool = ShellExecTool::new(dir.path().to_path_buf());
+        let granted = ctx().with_egress_policy(
+            Arc::new(AllowEgress),
+            vec![
+                agent24_domain::EgressResource::cloud_authorized("doc-1", "rev-1", 3)
+                    .with_authorization_ref("grant-1"),
+            ],
+            7,
+        );
+        let err = tool
+            .call(&granted, &touch(&marker), &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
+        assert!(!marker.exists(), "a refused shell_exec must not spawn");
+    }
+
+    #[tokio::test]
+    async fn shell_exec_is_denied_when_source_policy_lookup_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-ran");
+        let tool = ShellExecTool::new(dir.path().to_path_buf());
+        let unavailable = ctx().with_egress_policy_unavailable();
+        let err = tool
+            .call(&unavailable, &touch(&marker), &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
+        assert!(!marker.exists(), "a refused shell_exec must not spawn");
     }
 }
