@@ -313,7 +313,9 @@ def files_containing(top, extra, needle):
     for path in paths:
         try:
             # Sockets and FIFOs hold no bytes to leak; opening one would fail.
-            if not stat.S_ISREG(os.lstat(path).st_mode):
+            # stat, not lstat: a symlink to a regular file is read through, so
+            # a secret behind a link (perhaps outside the data dir) is found.
+            if not stat.S_ISREG(os.stat(path).st_mode):
                 continue
             with open(path, "rb") as f:
                 if needle.encode() in f.read():
