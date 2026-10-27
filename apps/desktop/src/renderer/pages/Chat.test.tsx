@@ -154,7 +154,7 @@ describe('ChatPage', () => {
       data: {
         error: {
           code: 'backend_not_ready',
-          message: 'Backend daemon has not announced readiness yet',
+          message: 'Backend daemon is not ready (no announced port or credential)',
         },
       },
     })

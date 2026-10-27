@@ -6,12 +6,13 @@ use agent24_protocol::{RunCreate, RunStatus, Session, SessionCreate};
 use agent24_store::{RunAdmissionDenial, StoreError, WorkspaceStoreError};
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::routes::read_body_or_response;
 
+use crate::capabilities::Authorization;
 use crate::server::{AppState, error_response};
 
 fn map_agent_error(err: AgentError) -> Response {
@@ -160,7 +161,11 @@ pub async fn get_session(State(state): State<AppState>, Path(id): Path<String>) 
 
 // ── runs ─────────────────────────────────────────────────────────────────────
 
-pub async fn create_run(State(state): State<AppState>, req: Request<Body>) -> Response {
+pub async fn create_run(
+    State(state): State<AppState>,
+    authorization: Option<Extension<Authorization>>,
+    req: Request<Body>,
+) -> Response {
     let body = match read_body_or_response(req).await {
         Ok(b) => b,
         Err(resp) => return resp,
@@ -182,7 +187,25 @@ pub async fn create_run(State(state): State<AppState>, req: Request<Body>) -> Re
             "prompt is required",
         );
     }
-    match state.runs.start_run(create).await {
+    // Checked before the run exists, pinned once it is stored and before it
+    // executes, so its first Knowledge tool call already finds the pin.
+    let binding = match create.knowledge_binding_id.as_deref() {
+        None => None,
+        Some(id) => match crate::knowledge_host::bind_run(&state, authorization, id) {
+            Ok(binding) => Some(binding),
+            Err(refused) => return refused.into_response(),
+        },
+    };
+    let pins = &state.knowledge_host;
+    let started = state
+        .runs
+        .start_run_then(create, |run| {
+            if let Some(binding) = binding {
+                pins.pin_run(&run.id, binding);
+            }
+        })
+        .await;
+    match started {
         Ok(run) => (StatusCode::ACCEPTED, Json(run)).into_response(),
         Err(err) => map_agent_error(err),
     }

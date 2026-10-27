@@ -189,6 +189,7 @@ mod tests {
                 workspace_id: None,
                 model_override: None,
                 mode: RunMode::Normal,
+                knowledge_binding_id: None,
             },
             output: (status == RunStatus::Completed).then(|| RunOutput {
                 text: format!("output {SECRET}"),

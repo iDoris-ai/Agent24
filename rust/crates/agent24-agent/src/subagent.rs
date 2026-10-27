@@ -95,9 +95,11 @@ impl ExplorerSubagent {
         }
     }
 
+    /// A sub-run names no Knowledge binding, so it is offered no tool that
+    /// needs one.
     async fn specs_of(tools: &ToolRegistry) -> Vec<ToolSpec> {
         tools
-            .live_adverts()
+            .live_adverts(false)
             .await
             .into_iter()
             .map(|a| ToolSpec {
@@ -336,6 +338,40 @@ mod tests {
     use agent24_protocol::Usage;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct KnowledgeOnlyTool;
+
+    #[async_trait]
+    impl Tool for KnowledgeOnlyTool {
+        fn requires_outbound_policy(&self) -> bool {
+            false
+        }
+        fn info(&self) -> ToolInfo {
+            ToolInfo::new("kb_read", "builtin", "reads Knowledge", RiskClass::Read)
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn needs_knowledge_binding(&self) -> bool {
+            true
+        }
+        async fn call(
+            &self,
+            _ctx: &ToolContext,
+            _input: &Map<String, Value>,
+            _cancel: &CancellationToken,
+        ) -> Result<String, ToolError> {
+            Ok("ok".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sub_run_is_not_offered_a_tool_that_needs_a_knowledge_binding() {
+        let tools = ToolRegistry::new().with(Arc::new(KnowledgeOnlyTool));
+        assert!(ExplorerSubagent::specs_of(&tools).await.is_empty());
+        // Hidden for the binding alone: a bound run is offered it.
+        assert_eq!(tools.live_adverts(true).await.len(), 1);
+    }
 
     /// A provider whose turns are scripted; when the script runs out it answers
     /// with a plain final message so a loop can always terminate.

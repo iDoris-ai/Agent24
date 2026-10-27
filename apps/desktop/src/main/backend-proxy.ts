@@ -158,9 +158,12 @@ export function proxyError(code: ProxyErrorCode, message: string): BackendProxyR
   return { ok: false, status: ERROR_STATUS[code], data: { error: { code, message } } }
 }
 
+/** The daemon's port and the headers that authenticate main to it (the shape
+ *  of backend-manager's `DaemonConnection`; the credential never travels as a
+ *  bare token). */
 export interface ProxyEndpoint {
   port: number
-  token: string
+  authHeaders: Record<string, string>
 }
 
 export interface ProxyOptions {
@@ -213,7 +216,7 @@ export function proxyRequest(
           method: req.method,
           headers: {
             'Content-Type': 'application/json',
-            ...(endpoint.token ? { Authorization: 'Bearer ' + endpoint.token } : {}),
+            ...endpoint.authHeaders,
             ...(body ? { 'Content-Length': Buffer.byteLength(body) } : {}),
           },
         },

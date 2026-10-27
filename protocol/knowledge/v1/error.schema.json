@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/iDoris-ai/Agent24/protocol/knowledge/v1/error.schema.json",
+  "title": "Agent24 Knowledge v1 — wire error envelope",
+  "description": "CONTRACT-READONLY-v1 §6. code is a closed set; clients branch on code, not on HTTP status. cancelled is client-local and not part of this schema (see local-cancelled.schema.json). retryable, the allowed reasons (required, conditional, optional or forbidden) and details are fixed per code by the table in §6.",
+  "type": "object", "required": ["error"], "additionalProperties": false,
+  "properties": {
+    "error": {
+      "type": "object", "required": ["code", "message", "details"], "additionalProperties": false,
+      "properties": {
+        "code": { "enum": ["invalid_request", "unauthorized", "forbidden", "not_found", "stale", "timeout", "unavailable", "internal"] },
+        "message": { "description": "Fixed generic text (R6.3).", "type": "string", "minLength": 1, "maxLength": 512 },
+        "hint": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "details": { "type": "object" }
+      },
+      "allOf": [
+        { "if": { "properties": { "code": { "const": "invalid_request" } } }, "then": { "properties": { "details": { "$ref": "#/$defs/invalid_request" } } } },
+        { "if": { "properties": { "code": { "const": "unauthorized" } } }, "then": { "properties": { "details": { "$ref": "#/$defs/unauthorized" } } } },
+        { "if": { "properties": { "code": { "const": "forbidden" } } }, "then": { "properties": { "details": { "$ref": "#/$defs/forbidden" } } } },
+        { "if": { "properties": { "code": { "const": "not_found" } } }, "then": { "properties": { "details": { "$ref": "#/$defs/not_found" } } } },
+        { "if": { "properties": { "code": { "const": "stale" } } }, "then": { "properties": { "details": { "$ref": "#/$defs/stale" } } } },
+        { "if": { "properties": { "code": { "const": "timeout" } } }, "then": { "properties": { "details": { "$ref": "#/$defs/timeout" } } } },
+        { "if": { "properties": { "code": { "const": "unavailable" } } }, "then": { "properties": { "details": { "$ref": "#/$defs/unavailable" } } } },
+        { "if": { "properties": { "code": { "const": "internal" } } }, "then": { "properties": { "details": { "$ref": "#/$defs/internal" } } } },
+        { "description": "R6.1, R6.4: null echoes only for unauthorized, internal, and an invalid_request other than mixed_score_space (protocol_version is checked first, so unsupported_protocol_version may echo null; mixed_score_space comes after E, so the ids were parsed). The envelope cannot see the request; the fixture tests check every echo against its own request.",
+          "if": { "not": { "anyOf": [{ "properties": { "code": { "enum": ["unauthorized", "internal"] } } }, { "properties": { "code": { "const": "invalid_request" }, "details": { "not": { "required": ["reason"], "properties": { "reason": { "const": "mixed_score_space" } } } } } }] } },
+          "then": { "properties": { "details": { "properties": { "request_id": { "type": "string" }, "generation": { "type": "integer" } } } } } }
+      ]
+    }
+  },
+  "$defs": {
+    "base": {
+      "description": "R6.1: echoes may be null only for an unparseable body (invalid_request) or a failure before the body is parsed (unauthorized, internal); the error-level allOf enforces this per code.",
+      "type": "object", "required": ["retryable", "request_id", "generation"],
+      "properties": {
+        "retryable": { "type": "boolean" },
+        "request_id": { "oneOf": [{ "$ref": "common.schema.json#/$defs/request_id" }, { "type": "null" }] },
+        "generation": { "oneOf": [{ "$ref": "common.schema.json#/$defs/generation" }, { "type": "null" }] }
+      }
+    },
+    "invalid_request": {
+      "$ref": "#/$defs/base", "unevaluatedProperties": false,
+      "properties": {
+        "retryable": { "const": false },
+        "reason": { "enum": ["mixed_score_space", "unsupported_protocol_version"] },
+        "groups": {
+          "description": "R3.6: only KBs inside E.", "type": "array", "minItems": 2,
+          "items": { "type": "object", "required": ["score_space", "knowledge_base_ids"], "additionalProperties": false,
+            "properties": { "score_space": { "$ref": "common.schema.json#/$defs/id" },
+              "knowledge_base_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "common.schema.json#/$defs/id" } } } }
+        },
+        "supported": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "common.schema.json#/$defs/positive_int" } }
+      },
+      "allOf": [
+        { "if": { "required": ["reason"], "properties": { "reason": { "const": "mixed_score_space" } } }, "then": { "required": ["groups"] }, "else": { "not": { "required": ["groups"] } } },
+        { "if": { "required": ["reason"], "properties": { "reason": { "const": "unsupported_protocol_version" } } }, "then": { "required": ["supported"] }, "else": { "not": { "required": ["supported"] } } }
+      ]
+    },
+    "unauthorized": {
+      "$ref": "#/$defs/base", "unevaluatedProperties": false, "required": ["reason"],
+      "properties": { "retryable": { "const": false }, "reason": { "enum": ["credential_missing", "credential_invalid", "credential_expired", "credential_revoked"] } }
+    },
+    "forbidden": {
+      "$ref": "#/$defs/base", "unevaluatedProperties": false, "required": ["reason"],
+      "properties": { "retryable": { "const": false }, "reason": { "enum": ["empty_scope", "operation_not_allowed", "operation_disabled", "policy_denied"] } }
+    },
+    "not_found": {
+      "description": "R2.6: identical for missing, deleted and out-of-scope documents; no reason.",
+      "$ref": "#/$defs/base", "unevaluatedProperties": false,
+      "properties": { "retryable": { "const": false } }
+    },
+    "stale": {
+      "description": "R4.4 (r9): current_chunk_revision and current_content_tag together, only when the chunk is servable but its content_tag differs; never with anchor_missing.",
+      "$ref": "#/$defs/base", "unevaluatedProperties": false, "required": ["current_revision"],
+      "properties": {
+        "retryable": { "const": false },
+        "reason": { "const": "anchor_missing" },
+        "current_revision": {
+          "type": "object", "required": ["source_revision", "index_build_id"], "additionalProperties": false,
+          "properties": {
+            "source_revision": { "$ref": "common.schema.json#/$defs/id" },
+            "index_build_id": { "oneOf": [{ "$ref": "common.schema.json#/$defs/id" }, { "type": "null" }] }
+          }
+        },
+        "current_chunk_revision": { "$ref": "common.schema.json#/$defs/chunk_revision" },
+        "current_content_tag": { "$ref": "common.schema.json#/$defs/content_tag" }
+      },
+      "dependentRequired": { "current_chunk_revision": ["current_content_tag"], "current_content_tag": ["current_chunk_revision"] },
+      "allOf": [
+        { "if": { "required": ["reason"] }, "then": { "not": { "anyOf": [{ "required": ["current_chunk_revision"] }, { "required": ["current_content_tag"] }] } } },
+        { "description": "current_chunk_revision means the chunk is servable, so the document has a build.",
+          "if": { "required": ["current_chunk_revision"] }, "then": { "properties": { "current_revision": { "properties": { "index_build_id": { "type": "string" } } } } } }
+      ]
+    },
+    "timeout": {
+      "description": "R3.4: no branch succeeded and every failure hit the deadline; or a read missed deadline_ms.",
+      "$ref": "#/$defs/base", "unevaluatedProperties": false,
+      "properties": {
+        "retryable": { "const": true },
+        "reason": { "const": "timeout" },
+        "partial_failures": { "type": "array", "minItems": 1, "items": { "allOf": [{ "$ref": "common.schema.json#/$defs/partial_failure" }, { "properties": { "code": { "const": "timeout" } } }] } }
+      }
+    },
+    "unavailable": {
+      "description": "R3.4/R4.4/R8, §6: a non-retryable partial failure makes the error non-retryable and vice versa; a non-retryable error names its non-retryable reason, which a listed partial failure must carry; an absent reason means dependency (retryable).",
+      "$ref": "#/$defs/base", "unevaluatedProperties": false,
+      "properties": {
+        "reason": { "enum": ["not_ready", "dependency", "overloaded", "index_building", "unsupported_kb_type", "index_failed", "index_pending"] },
+        "retry_after_ms": { "type": "integer", "minimum": 0 },
+        "partial_failures": { "type": "array", "minItems": 1, "items": { "$ref": "common.schema.json#/$defs/partial_failure" },
+          "contains": { "properties": { "code": { "const": "unavailable" } } } }
+      },
+      "allOf": [
+        { "if": { "required": ["partial_failures"], "properties": { "partial_failures": { "contains": { "properties": { "retryable": { "const": false } } } } } },
+          "then": { "properties": { "retryable": { "const": false } } } },
+        { "if": { "properties": { "retryable": { "const": false } } },
+          "then": { "required": ["reason"], "properties": { "reason": { "enum": ["unsupported_kb_type", "index_failed"] } } } },
+        { "if": { "required": ["reason"], "properties": { "reason": { "enum": ["unsupported_kb_type", "index_failed"] } } },
+          "then": { "properties": { "retryable": { "const": false } } } },
+        { "if": { "required": ["partial_failures"], "properties": { "retryable": { "const": false } } },
+          "then": { "properties": { "partial_failures": { "contains": { "properties": { "retryable": { "const": false } } } } } } },
+        { "if": { "required": ["reason"], "properties": { "reason": { "const": "index_failed" } } }, "then": { "properties": { "partial_failures":
+          { "contains": { "properties": { "reason": { "const": "index_failed" }, "retryable": { "const": false } } } } } } },
+        { "if": { "required": ["reason"], "properties": { "reason": { "const": "unsupported_kb_type" } } }, "then": { "properties": { "partial_failures":
+          { "contains": { "properties": { "reason": { "const": "unsupported_kb_type" }, "retryable": { "const": false } } } } } } },
+        { "description": "index_pending is document-level read only (R4.4).",
+          "if": { "required": ["reason"], "properties": { "reason": { "const": "index_pending" } } }, "then": { "not": { "required": ["partial_failures"] } } }
+      ]
+    },
+    "internal": {
+      "$ref": "#/$defs/base", "unevaluatedProperties": false,
+      "properties": { "retryable": { "const": false } }
+    }
+  }
+}
