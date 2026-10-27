@@ -202,6 +202,16 @@ fn new_generation_replaces_a_stale_socket() {
     first.child.kill().unwrap();
     first.child.wait().unwrap();
     assert!(sock(&data).exists(), "SIGKILL should leave a stale socket");
+    // Pin the old inode with a second link: filesystems (tmpfs/ext4 on
+    // Linux) recycle a freed inode number at once, so without this a genuine
+    // unlink + re-create can show the same number.
+    std::fs::hard_link(sock(&data), data.join("stale.pin")).unwrap();
+    assert_eq!(
+        std::fs::symlink_metadata(data.join("stale.pin"))
+            .unwrap()
+            .ino(),
+        old
+    );
 
     let second = start_ok(&data, SERVICE);
     let meta = std::fs::symlink_metadata(sock(&data)).unwrap();
