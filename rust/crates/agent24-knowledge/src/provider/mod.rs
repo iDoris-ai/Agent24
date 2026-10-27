@@ -8,8 +8,8 @@
 //! when, with the seal that tells a restart whether it can trust that
 //! (`ledger`), the records it is persisted as (`record`), how they are read
 //! back (`replay`) and what a restart makes of them (`recover`), with the
-//! order its writes run in (`journal`); and the budgets calls run under
-//! (`budget`).
+//! order its writes run in (`journal`); the budgets calls run under
+//! (`budget`); and one profile as the host holds it (`member`).
 
 pub mod binding;
 pub mod budget;
@@ -19,6 +19,7 @@ pub mod evidence;
 pub mod gate;
 pub mod journal;
 pub mod ledger;
+pub mod member;
 pub mod placeholder;
 pub mod profile;
 pub mod record;

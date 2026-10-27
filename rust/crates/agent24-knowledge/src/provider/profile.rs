@@ -90,6 +90,10 @@ impl<K: Ord + Clone> Profile<K> {
         &mut self.slot
     }
 
+    pub fn selected(&self) -> bool {
+        self.selected
+    }
+
     pub fn confirmation(&self) -> Option<Confirmation> {
         self.confirmation
     }
