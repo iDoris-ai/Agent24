@@ -117,7 +117,7 @@ pub fn render_plist(
 /// Config the daemon reads from the environment. launchd gives a LaunchAgent
 /// NONE of the login shell's environment, so without capturing these the 24/7
 /// daemon silently behaves differently from a manually started one.
-pub const PASSTHROUGH_VARS: [&str; 19] = [
+pub const PASSTHROUGH_VARS: [&str; 21] = [
     // MAINT-03: the data root (`daemon.json`, `agent24.db`, `logs/`, the tool
     // workspace). Without it a LaunchAgent-started daemon keeps using
     // `~/.agent24` while the CLI that ran `service install` and the desktop app
@@ -141,6 +141,10 @@ pub const PASSTHROUGH_VARS: [&str; 19] = [
     "A24_HW_BUDGET_CAP_GB",
     "A24_APPROVAL_TIMEOUT_SECS",
     "A24_SCHEDULER_TICK_SECS",
+    // K1-6a-A4b: the host's switch for module tool decisions and their
+    // bound. A service started without them takes no decisions.
+    "A24_MODULE_TOOL_GRANTS",
+    "A24_MODULE_GRANT_MAX_DAYS",
     // ME-3a. Missing it meant `agent24 os install` wrote to the override
     // directory while the launchd-started daemon kept scanning
     // `~/.agent24/packages` — and the CLI still printed "it takes effect at the

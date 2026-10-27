@@ -215,6 +215,12 @@ pub enum ModelError {
 pub trait ModelProvider: Send + Sync {
     fn name(&self) -> &str;
 
+    /// Exact configured receiving endpoint for outbound authorization.
+    /// Providers that cannot report it are treated as unknown and denied remotely.
+    fn outbound_destination(&self) -> Option<String> {
+        None
+    }
+
     async fn complete(
         &self,
         req: &CompletionRequest,
@@ -805,6 +811,15 @@ fn went_away(kind: std::io::ErrorKind) -> bool {
 impl ModelProvider for OpenAiCompatProvider {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn outbound_destination(&self) -> Option<String> {
+        let mut endpoint = reqwest::Url::parse(&self.base_url).ok()?;
+        endpoint.set_username("").ok()?;
+        endpoint.set_password(None).ok()?;
+        endpoint.set_query(None);
+        endpoint.set_fragment(None);
+        Some(endpoint.to_string().trim_end_matches('/').to_owned())
     }
 
     async fn complete(
