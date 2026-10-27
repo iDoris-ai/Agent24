@@ -94,7 +94,7 @@ async fn watermark(c: &mut SqliteConnection) -> Result<i64, sqlx::Error> {
 /// (EACCES, ...) and a dangling symlink are `Io`: a database we cannot see
 /// must never be recorded as "did not exist". Same stance as
 /// `manifest::read_optional`.
-fn exists_strict(path: &Path) -> Result<bool, SnapshotError> {
+pub(super) fn exists_strict(path: &Path) -> Result<bool, SnapshotError> {
     match fs::symlink_metadata(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(SnapshotError::Io(e)),

@@ -23,6 +23,17 @@ pub trait FileOps {
     }
     fn fsync_dir(&self, dir: &Path) -> io::Result<()>;
     fn remove_file(&self, path: &Path) -> io::Result<()>;
+    /// Stream `from` into a new `O_EXCL` 0600 file `to` and fsync it (5e staging).
+    fn copy_new_synced(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let mut src = File::open(from)?;
+        let mut dst = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(to)?;
+        io::copy(&mut src, &mut dst)?;
+        dst.sync_all()
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
