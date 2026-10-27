@@ -243,6 +243,7 @@ async fn send_copy_keeps_user_prompt_shaped_like_recall() {
             prompt: shaped.clone(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -287,6 +288,7 @@ async fn send_copy_keeps_session_history_shaped_like_recall() {
             prompt: "next".into(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -318,6 +320,7 @@ async fn send_copy_trims_revoked_ids_from_real_host_recall() {
             prompt: "peanuts".into(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -647,6 +650,7 @@ async fn seed_parked_run(store: &Store, rows: Vec<OriginatedRunMessage>) {
             workspace_id: None,
             model_override: None,
             mode: agent24_protocol::RunMode::Normal,
+            knowledge_binding_id: None,
         },
         output: None,
         error: None,
