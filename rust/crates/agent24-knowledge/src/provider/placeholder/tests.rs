@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use super::*;
 use PlaceholderFailure as F;
 
@@ -136,9 +138,62 @@ fn a_cancel_that_retries_records_dependency_for_what_it_dropped() {
     placeholder.attempt();
     placeholder.cancel(true);
     assert_eq!(placeholder.failure(), Some(F::Dependency));
-    let mut placeholder = Placeholder::new(Some(F::CredentialRejected));
+    let mut placeholder = Placeholder::new(None);
     let created = placeholder.creating();
     placeholder.cancel(true);
     assert!(!placeholder.creates(created));
     assert_eq!(placeholder.failure(), Some(F::Dependency));
+}
+
+/// S1.10, S2.5: `dependency` is not written, so it takes the place of a
+/// reason that waits for a manual retry only once that one's clearing is.
+#[test]
+fn dependency_takes_the_place_of_a_written_reason_once_it_is_cleared() {
+    for failure in [F::CredentialRejected, F::InstanceUnidentified] {
+        let mut placeholder = Placeholder::new(Some(failure));
+        let attempt = placeholder.attempt();
+        assert_eq!(
+            placeholder.settle(attempt, Attempted::Unreachable),
+            Settled::Failed(F::Dependency)
+        );
+        let created = placeholder.attempt();
+        placeholder.settle(created, Attempted::Identified);
+        placeholder.creation_failed(created);
+        placeholder.attempt();
+        placeholder.cancel(true);
+        assert_eq!(placeholder.failure(), Some(failure));
+        assert!(!placeholder.retries_by_itself(CLEAR, true, false));
+        // Its clearing written, `dependency` takes its place, once.
+        assert_eq!(placeholder.take_leaving(), Some(failure));
+        assert_eq!(placeholder.take_leaving(), None);
+        let [ticket, other] = tickets();
+        placeholder.clearing(ticket);
+        assert!(placeholder.clears());
+        placeholder.left(other);
+        assert_eq!(placeholder.failure(), Some(failure));
+        placeholder.left(ticket);
+        assert!(!placeholder.clears());
+        assert_eq!(placeholder.failure(), Some(F::Dependency));
+        assert!(placeholder.retries_by_itself(CLEAR, true, false));
+    }
+    // A reason written while its clearing is on the way stays.
+    let mut placeholder = Placeholder::new(Some(F::CredentialRejected));
+    let attempt = placeholder.attempt();
+    placeholder.settle(attempt, Attempted::Unreachable);
+    assert_eq!(placeholder.take_leaving(), Some(F::CredentialRejected));
+    let [ticket, _] = tickets();
+    placeholder.clearing(ticket);
+    let attempt = placeholder.attempt();
+    placeholder.settle(attempt, Attempted::Rejected);
+    placeholder.left(ticket);
+    assert_eq!(placeholder.failure(), Some(F::CredentialRejected));
+    // Nothing waits: nothing to clear.
+    assert_eq!(Placeholder::new(None).take_leaving(), None);
+}
+
+/// Two loosenings' tickets, as the ledger hands them out.
+fn tickets() -> [crate::provider::ledger::Loosening; 2] {
+    use crate::provider::ledger::{Ledger, Scope};
+    let mut ledger = Ledger::new(true);
+    [(); 2].map(|()| ledger.loosen(Scope::profile("p"), None, false).unwrap())
 }

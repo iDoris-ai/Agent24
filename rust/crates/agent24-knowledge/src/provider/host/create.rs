@@ -66,6 +66,7 @@ impl<I: Ids> Host<I> {
         let awaited = m.profile().confirmation();
         if awaited == Some(Confirmation::UnsavedSettings) {
             m.creation_failed(attempt);
+            self.leave_reason(&id);
             return out;
         }
         if awaited.is_none() && m.confirmed().is_some_and(|c| *c != created.principal) {
@@ -77,7 +78,8 @@ impl<I: Ids> Host<I> {
             let tightening = self.ledger.tighten(Scope::profile(id.clone()));
             self.tightened(tightening, Left::new(change), &mut out);
         }
-        self.write_creation(id, attempt, created);
+        self.write_creation(id.clone(), attempt, created);
+        self.leave_reason(&id);
         out
     }
 
@@ -143,10 +145,32 @@ impl<I: Ids> Host<I> {
                 profile: id.clone(),
                 failure,
             };
-            let tightening = self.ledger.tighten(Scope::profile(id));
+            let tightening = self.ledger.tighten(Scope::profile(id.clone()));
             self.tightened(tightening, Left::new(change), &mut out);
         }
+        self.leave_reason(&id);
         out
+    }
+
+    /// A `dependency` waiting to take the place of a written reason: its
+    /// clearing is written first, a loosening (S1.10, I1); refused, the
+    /// reason stays until the next manual retry.
+    pub(super) fn leave_reason(&mut self, id: &I::Profile) {
+        let member = self.member(id).and_then(|m| m.placeholder_mut());
+        let Some(failure) = member.and_then(|p| p.take_leaving()) else {
+            return;
+        };
+        let scope = Scope::profile(id.clone());
+        let Ok(ticket) = self.ledger.loosen(scope, None, self.off) else {
+            return;
+        };
+        if let Some(p) = self.member(id).and_then(|m| m.placeholder_mut()) {
+            p.clearing(ticket);
+        }
+        let profile = id.clone();
+        let change = Change::PlaceholderCleared { profile, failure };
+        let id = id.clone();
+        self.journal.push(vec![change], Then::Leave { ticket, id });
     }
 
     /// A new binding's write is confirmed: it binds and connects, or, its
@@ -178,7 +202,9 @@ impl<I: Ids> Host<I> {
         let mut left = Left::new(Change::Retire(c.of));
         if let Some(m) = self.member(&profile) {
             m.confirm_principal(c.confirmed);
-            let held = |f: &PlaceholderFailure| !later && m.failure() == Some(*f);
+            // Not while a clearing of it is on its way, written after this.
+            let clears = m.placeholder_mut().is_some_and(|p| p.clears());
+            let held = |f: &PlaceholderFailure| !later && !clears && m.failure() == Some(*f);
             if let Some(failure) = c.cleared.filter(held) {
                 let profile = profile.clone();
                 left.changes

@@ -51,6 +51,7 @@ impl<I: Ids> Host<I> {
         };
         let awaited_before = m.profile().confirmation();
         let Some((mut left, create)) = m.change_identity(change) else {
+            self.leave_reason(&id);
             return out;
         };
         if awaited_before.is_none()

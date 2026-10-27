@@ -7,7 +7,7 @@ use crate::provider::credential::{Effects, Issued, Outcome};
 use crate::provider::journal::{SealWrite, Written};
 use crate::provider::member::Member;
 use crate::provider::placeholder::Placeholder;
-use crate::provider::profile::{Profile, Slot};
+use crate::provider::profile::{IdentityChange, Profile, Slot};
 use crate::provider::replay::{Record, replay};
 use crate::provider::state::{ConnectionPhase, Probe, UnavailableCause};
 use std::time::Instant;
@@ -452,4 +452,143 @@ fn another_profiles_creation_does_not_hold_the_reason_back() {
     let replayed = replay(10, log).unwrap();
     assert_eq!(replayed.profiles.get("b").unwrap().failure, Some(rejected));
     assert_eq!(failure(&host, "b"), Some(rejected));
+}
+
+/// S1.10, S2.5: a manual retry that comes back unreachable clears the
+/// written reason first, then retries by backoff; a reason written meanwhile
+/// stands, in memory as a restart reads it.
+#[test]
+fn an_unreachable_retry_clears_the_written_reason_first() {
+    let rejected = PlaceholderFailure::CredentialRejected;
+    let mut log = Vec::new();
+    let mut host = host_after(Attempted::Rejected);
+    step(&mut host, &mut log);
+    let attempt = host.attempt(&"b").unwrap();
+    host.attempt_failed("b", attempt, Attempted::Unreachable);
+    assert_eq!(failure(&host, "b"), Some(rejected));
+    let attempt = host.attempt(&"b").unwrap();
+    host.attempt_failed("b", attempt, Attempted::Rejected);
+    let cleared = C::PlaceholderCleared {
+        profile: "b",
+        failure: rejected,
+    };
+    assert_eq!(step(&mut host, &mut log), vec![cleared]);
+    step(&mut host, &mut log);
+    assert_eq!(failure(&host, "b"), Some(rejected));
+    assert_eq!(
+        replay(10, log.clone()).unwrap().profiles["b"].failure,
+        Some(rejected)
+    );
+
+    let attempt = host.attempt(&"b").unwrap();
+    host.attempt_failed("b", attempt, Attempted::Unreachable);
+    step(&mut host, &mut log);
+    assert_eq!(failure(&host, "b"), Some(PlaceholderFailure::Dependency));
+    assert_eq!(replay(10, log).unwrap().profiles["b"].failure, None);
+}
+
+/// #1337 F1: a written reason, then an unreachable retry, then a binding:
+/// the reason is gone as a restart reads it, the clearing confirmed before
+/// the binding or not.
+#[test]
+fn a_binding_after_an_unreachable_retry_leaves_no_written_reason() {
+    for settled in [true, false] {
+        let mut log = Vec::new();
+        let mut host = host_after(Attempted::Rejected);
+        step(&mut host, &mut log);
+        let attempt = host.attempt(&"b").unwrap();
+        host.attempt_failed("b", attempt, Attempted::Unreachable);
+        if settled {
+            step(&mut host, &mut log);
+        }
+        let attempt = host.attempt(&"b").unwrap();
+        host.identified("b", attempt, created(8, "alice"));
+        while let Some((attempt, record)) = host.take_write() {
+            log.push(record);
+            host.written(attempt, Written::Durable);
+        }
+        assert!(bound(&host, "b"), "{settled}");
+        let replayed = replay(10, log).unwrap();
+        assert_eq!(replayed.profiles["b"].failure, None, "{settled}");
+    }
+}
+
+/// "b" alone, a selected placeholder with `credential_rejected` written and
+/// `confirmation` awaited; the log holds values up to `highest`.
+fn rejected(highest: u64, confirmation: Option<Confirmation>) -> H {
+    let mut host = H::new(false, true, 1, highest);
+    let failure = Some(PlaceholderFailure::CredentialRejected);
+    let slot = Slot::Placeholder(Placeholder::new(failure));
+    let b = Profile::new(slot, true, confirmation);
+    host.insert(Member::new("b", b, None, false));
+    host
+}
+
+fn cleared() -> C {
+    C::PlaceholderCleared {
+        profile: "b",
+        failure: PlaceholderFailure::CredentialRejected,
+    }
+}
+
+/// A.5, S1.10: a binding dropped while its write is on the way, once its
+/// placeholder's written reason began to clear, writes no reason back: the
+/// clearing lands after it, as in memory.
+#[test]
+fn a_dropped_binding_writes_back_no_reason_being_cleared() {
+    let mut log = Vec::new();
+    let mut host = host_after(Attempted::Rejected);
+    step(&mut host, &mut log);
+    let attempt = host.attempt(&"b").unwrap();
+    host.identified("b", attempt, created(8, "alice"));
+    let change = IdentityChange::Instance;
+    host.identity_changed("b", change, Some(created(9, "alice")));
+    step(&mut host, &mut log);
+    step(&mut host, &mut log);
+    assert_eq!(step(&mut host, &mut log), vec![C::Retire(of("b", 8))]);
+    assert_eq!(failure(&host, "b"), Some(PlaceholderFailure::Dependency));
+    assert_eq!(replay(10, log).unwrap().profiles["b"].failure, None);
+}
+
+/// I1: a clearing refused gives an earlier one's confirmation nothing to
+/// take: the reason written since stands, in memory as a restart reads it.
+#[test]
+fn a_refused_clearing_leaves_the_reason_written_since() {
+    let mut log = Vec::new();
+    let mut host = host_after(Attempted::Rejected);
+    step(&mut host, &mut log);
+    for attempted in [
+        Attempted::Unreachable,
+        Attempted::Rejected,
+        Attempted::Unreachable,
+    ] {
+        let attempt = host.attempt(&"b").unwrap();
+        host.attempt_failed("b", attempt, attempted);
+    }
+    step(&mut host, &mut log);
+    step(&mut host, &mut log);
+    assert!(host.take_write().is_none());
+    let rejected = Some(PlaceholderFailure::CredentialRejected);
+    assert_eq!(failure(&host, "b"), rejected);
+    assert_eq!(replay(10, log).unwrap().profiles["b"].failure, rejected);
+}
+
+/// S1.10, S2.5: a binding the login created but that was not written clears
+/// the written reason first, under `unsaved_settings` too; nothing waits on
+/// for a later event.
+#[test]
+fn a_binding_not_written_clears_the_written_reason_first() {
+    for mut host in [
+        rejected(u64::MAX, None),
+        rejected(1, Some(Confirmation::UnsavedSettings)),
+    ] {
+        let attempt = host.attempt(&"b").unwrap();
+        host.identified("b", attempt, created(8, "alice"));
+        assert_eq!(confirmed(&mut host).0, vec![cleared()]);
+        assert_eq!(failure(&host, "b"), Some(PlaceholderFailure::Dependency));
+        let stale = host.attempt(&"b").unwrap();
+        host.attempt(&"b").unwrap();
+        host.attempt_failed("b", stale, Attempted::Unreachable);
+        assert!(host.take_write().is_none());
+    }
 }

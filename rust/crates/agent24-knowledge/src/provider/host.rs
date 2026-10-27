@@ -69,6 +69,8 @@ enum Then<I: Ids> {
     },
     /// A new binding, in [`Host::creations`].
     Create { ticket: Loosening },
+    /// The clearing of a written reason, for a `dependency` to take its place.
+    Leave { ticket: Loosening, id: I::Profile },
 }
 
 #[derive(Debug)]
@@ -274,7 +276,7 @@ impl<I: Ids> Host<I> {
         let mut out = Output::default();
         match self.journal.written(attempt, outcome) {
             Report::Ignored | Report::Failed(Then::Loose { .. }) => return out,
-            Report::Failed(Then::Create { .. }) => return out,
+            Report::Failed(Then::Create { .. } | Then::Leave { .. }) => return out,
             Report::Failed(Then::Tight { ticket, .. }) => {
                 let ticket = *ticket;
                 self.ledger.record_failed(ticket);
@@ -300,6 +302,13 @@ impl<I: Ids> Host<I> {
                 }
             }
             Report::Durable(Then::Create { ticket }) => self.created(ticket, &mut out),
+            Report::Durable(Then::Leave { ticket, id }) => {
+                let applied = self.ledger.loosening_durable(ticket) == Confirmed::Applied;
+                let member = self.member(&id).filter(|_| applied);
+                if let Some(placeholder) = member.and_then(|m| m.placeholder_mut()) {
+                    placeholder.left(ticket);
+                }
+            }
         }
         // A tightening on the way may have deleted it: no rebuild yet.
         out.seal = self.ledger.reseal().map(SealWrite::Rebuild).or(out.seal);

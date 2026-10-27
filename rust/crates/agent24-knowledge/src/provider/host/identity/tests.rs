@@ -346,3 +346,38 @@ fn another_write_does_not_release_the_waiting_binding() {
     assert_eq!(confirmed(&mut host).0, vec![bind(9, 3, Some("alice"))]);
     assert!(bound(&host));
 }
+
+/// S1.10, S2.5: an identity change during a manual retry drops it; the
+/// written reason gives way to `dependency` once its clearing is written, as
+/// a restart reads it.
+#[test]
+fn a_dropped_manual_retry_clears_the_written_reason_first() {
+    let rejected = PlaceholderFailure::CredentialRejected;
+    let mut log = vec![Record {
+        seq: 9,
+        entry: Entry::Changes(vec![C::PlaceholderFailed {
+            profile: "a",
+            failure: rejected,
+        }]),
+    }];
+    let mut host = H::new(false, true, 10, 1);
+    let slot = Slot::Placeholder(crate::provider::placeholder::Placeholder::new(Some(
+        rejected,
+    )));
+    host.insert(Member::new(
+        "a",
+        Profile::new(slot, true, None),
+        None,
+        false,
+    ));
+    host.attempt(&"a").unwrap();
+    host.identity_changed("a", IdentityChange::Instance, Some(created(9, "alice")));
+    assert_eq!(failure(&host), Some(rejected));
+    let cleared = C::PlaceholderCleared {
+        profile: "a",
+        failure: rejected,
+    };
+    assert_eq!(step(&mut host, &mut log), vec![cleared]);
+    assert_eq!(failure(&host), Some(PlaceholderFailure::Dependency));
+    assert_eq!(replay(9, log).unwrap().profiles["a"].failure, None);
+}

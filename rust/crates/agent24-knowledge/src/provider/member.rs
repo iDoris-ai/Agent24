@@ -9,7 +9,7 @@ use super::connection::{Connection, Round};
 use super::credential::{Credentials, Effects};
 use super::evidence::Rule;
 use super::gate::{CallId, Gate};
-use super::placeholder::{Attempt, Attempted, Settled};
+use super::placeholder::{Attempt, Attempted, Placeholder, Settled};
 use super::profile::{IdentityChange, Profile, Slot};
 use super::record::{Change, Ids, Of};
 use super::state::{PlaceholderFailure, Switches};
@@ -155,10 +155,18 @@ impl<I: Ids> Member<I> {
         }
     }
 
-    /// `attempt`'s binding was not written: `dependency`, by backoff (S2.5).
+    /// `attempt`'s binding was not written, as
+    /// [`super::placeholder::Placeholder::creation_failed`].
     pub fn creation_failed(&mut self, attempt: Attempt) {
         if let Slot::Placeholder(placeholder) = self.profile.slot_mut() {
             placeholder.creation_failed(attempt);
+        }
+    }
+
+    pub fn placeholder_mut(&mut self) -> Option<&mut Placeholder> {
+        match self.profile.slot_mut() {
+            Slot::Placeholder(placeholder) => Some(placeholder),
+            Slot::Bound(_) => None,
         }
     }
 
