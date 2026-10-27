@@ -53,6 +53,27 @@ fn get(port: u16, token: &str, path: &str) -> (u16, String) {
     (status, body)
 }
 
+/// Like [`get`] but with the caller's own header lines (so a test can send a
+/// foreign `Host` or a browser `Origin`).
+fn raw_get(port: u16, token: &str, path: &str, headers: &[&str]) -> (u16, String) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let extra = headers.join("\r\n");
+    write!(
+        s,
+        "GET {path} HTTP/1.1\r\n{extra}\r\nauthorization: Bearer {token}\r\nconnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).unwrap();
+    let status = raw.split(' ').nth(1).unwrap().parse().unwrap();
+    let body = raw
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_owned())
+        .unwrap_or_default();
+    (status, body)
+}
+
 /// Spawns `agent24d serve --port 0` with a fresh `$HOME` and `env_clear`'d
 /// otherwise, plus whatever `extra_env` adds on top. Returns the guard (kill
 /// it by dropping it), the bound port, the bearer token, and a background
@@ -139,6 +160,32 @@ fn comm_routes_are_mounted_and_report_not_configured_without_a_binary() {
     let (status, body) = get(port, &token, "/api/v1/comm/identity");
     assert_eq!(status, 409, "{body}");
     assert!(body.contains("not_configured"), "{body}");
+
+    // COMM-G1: the groupchat routes sit under the same Host/Origin guard and
+    // are reachable through it (a good Host reaches the handler; a foreign
+    // Host or a browser Origin is refused before it).
+    let (status, body) = get(port, &token, "/api/v1/comm/groupchat");
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("not_configured"), "{body}");
+    let (status, body) = raw_get(
+        port,
+        &token,
+        "/api/v1/comm/groupchat",
+        &["host: evil.example:80"],
+    );
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("bad_host"), "{body}");
+    let (status, body) = raw_get(
+        port,
+        &token,
+        "/api/v1/comm/groupchat",
+        &[
+            &format!("host: 127.0.0.1:{port}"),
+            "origin: http://evil.example",
+        ],
+    );
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("forbidden_origin"), "{body}");
 }
 
 /// `A24_COMM_PASSWORD_STORE=memory`: the daemon stays healthy, comm still
