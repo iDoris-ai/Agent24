@@ -276,7 +276,7 @@ async fn bad_input_is_rejected_before_hyphae_runs() {
         (
             "POST",
             format!("/groupchat/{G}/messages"),
-            Some(json!({"nope": 1})),
+            Some(json!({"body": "x", "nope": 1})),
         ),
     ];
     for (method, uri, body) in cases {
