@@ -167,7 +167,9 @@ pub fn verify_complete(
                     rec.sha256.clone().unwrap_or_default(),
                 )
         } else {
-            !p.exists()
+            // Only a confirmed NotFound proves "absent"; EACCES or a dangling
+            // symlink is present-but-unreadable state, not absence.
+            matches!(fs::symlink_metadata(&p), Err(e) if e.kind() == io::ErrorKind::NotFound)
         };
         if !ok {
             return Err(StateError::Invalid(format!(
@@ -421,5 +423,17 @@ mod tests {
         } else {
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         }
+    }
+
+    /// A snapshot file recorded as absent must really be NotFound: a dangling
+    /// symlink (or an unreadable path) is not proof of absence.
+    #[test]
+    fn verify_complete_dangling_symlink_is_not_absent() {
+        let td = tempfile::tempdir().unwrap();
+        let id = test_empty_snapshot(td.path(), "a1");
+        assert!(verify_complete(td.path(), &id, "a1").is_ok());
+        let dir = snapshot_dir(td.path(), &id);
+        std::os::unix::fs::symlink(td.path().join("nowhere"), dir.join(STORE_FILE)).unwrap();
+        assert!(verify_complete(td.path(), &id, "a1").is_err());
     }
 }

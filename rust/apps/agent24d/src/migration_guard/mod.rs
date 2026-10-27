@@ -8,5 +8,6 @@
 pub mod atomic;
 pub mod guard_log;
 pub mod manifest;
+pub mod restore;
 pub mod snapshot;
 pub mod space;
