@@ -82,6 +82,11 @@ impl Response {
 /// body that is not JSON, an error without its envelope) is
 /// `invalid_response` with the reply's status and the message
 /// `unexpected <status> reply from the daemon`.
+///
+/// Known differences from the desktop's `JSON.parse`, reached only by an OS
+/// that breaks its contract: an unpaired surrogate escape (`\ud800`),
+/// nesting past 128 levels or bytes that are not UTF-8 make the whole body
+/// not JSON here, so such an error body is `invalid_response`.
 pub fn to_response(reply: Reply) -> Response {
     fn envelope(value: &Value) -> Option<ApiError> {
         let obj = value.as_object()?;

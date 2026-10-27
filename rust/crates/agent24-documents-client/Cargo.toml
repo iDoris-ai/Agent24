@@ -8,7 +8,9 @@ description = "Client side of the Documenting OS routes, shared by the agent24 C
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
+# float_roundtrip: numbers parse exactly, as JSON.parse does (an offset or a
+# limit written as 10.000000000000001 is not 10).
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 # Plain HTTP to 127.0.0.1 only: no TLS, no proxy (http.rs).
 reqwest = { version = "0.12", default-features = false }
 sha2 = "0.10"

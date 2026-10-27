@@ -3,6 +3,11 @@
 //! `documentsCall`). A request names an operation, never a path: each one
 //! maps to a fixed route under `/api/v1/documents`, and every id, cursor and
 //! limit is checked against its pattern before anything is sent.
+//!
+//! One known difference: the desktop ignored keys it did not read, whatever
+//! they held; a request that is not valid JSON as a whole (an unpaired
+//! surrogate escape such as `\ud800` in any key) never reaches [`route`]
+//! here, and the CLI refuses it as 400 `invalid_request`.
 
 use serde_json::Value;
 
