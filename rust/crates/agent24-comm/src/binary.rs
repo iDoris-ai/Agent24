@@ -280,11 +280,11 @@ mod tests {
     #[test]
     fn embedded_lock_parses_and_resolves_baseline_platform() {
         let lock = HyphaeLock::embedded().unwrap();
-        assert_eq!(lock.source_sha, "9126147e8eb5e497e3055f9eda27473fefbb91b2");
+        assert_eq!(lock.source_sha, "859d8fb7e79c67beb3c7a5a5d6d58c36baac7d0f");
         let expected = lock.expected_for("darwin-arm64").unwrap();
         assert_eq!(
             expected.to_hex(),
-            "6b7969a3d4e9767e65927ebd0c2830d272c4b567f05e740a985291b9e462a01a"
+            "da109e22b7790a89b49dea7aa920b9a47f1813df4a3bbb063a37f5287fae3a9d"
         );
     }
 
