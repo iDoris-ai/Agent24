@@ -48,6 +48,12 @@ kernel（K1 第二次发布）、memory-p1、documenting、weknora（Knowledge�
   David 决定不做兼容，清库）。
 - 从 `v0.5.1` 或 `v0.5.1-preview.20261016.2` 升上来的库正常迁移，无需重置。
 
+**本版已知缺口（按验收第 7 节逐条处置；这些能力本版不对用户宣称）**
+- **模块工具授予（kernel，G-K1）**：授予 POST 默认关闭（要设 `A24_MODULE_TOOL_GRANTS=1`），桌面和 CLI 都没有授予入口，仓库里也没有协议 4 的示例模块。相关行为只有 CI 测试覆盖。
+- **run 路径的记忆回执（memory，G-M5）**：配额满时 run 照常 `completed`，桌面和 TUI 都不提示记忆没写进去（P1-03，下一期）。
+- **普通轮次记忆写失败（memory，G-M1）**：桌面 Chat 不显示「本轮未保存到记忆」。
+- **文档的对话入口（documenting，G-D1/G-D2）**：七个文档工具已实现，但 `domain-os.yml` 还没声明 `tools:`（协议仍为 2），agent 调不到；文档导入、操作、预览经 CLI 和桌面照常可用。
+
 ### kernel —— K1 内核第二次发布（#1280；上次进 main 是 #1022，2026-10-16）
 
 固定在 `release/kernel-k1-r2-20261026`（`27acdd72`，#1278 之后）。#1277、K1-6b.5f 系列不在本次。

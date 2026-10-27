@@ -519,7 +519,7 @@ ic() { curl -s -m 20 -o $WORK/ir.json -w '%{http_code}' -H "Authorization: Beare
 - 前置（本机与样例不同的三处，照此执行）：
   1. **隔离 HOME**：不复用本机现有 iDoris/Agent24 状态。每个要跑的终端先 `export HOME=$(mktemp -d)`（或用全新 macOS 用户），再起 iDoris 和 Agent24；数据库、`~/.agent24` 都落在这个临时 HOME 里。
   2. **oMLX 端口是 8088（不是卡片默认的 8000），且开了认证**。启动 iDoris 前在**当前 shell**设 `IDORIS_OMLX_API_KEY`，值取本机 oMLX 的 API key：oMLX.app 的 Settings 里的 API key，或配置文件 `~/.omlx/settings.json` 的 `auth.api_key`。**注意先于换 HOME 之前读出**（或直接用真实 HOME 的绝对路径读）：
-     `export IDORIS_OMLX_API_KEY="$(python3 -c 'import json,os;print(json.load(open("/Users/jason/.omlx/settings.json"))["auth"]["api_key"])')"`
+     `export IDORIS_OMLX_API_KEY="$(python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.omlx/settings.json")))["auth"]["api_key"])')"`
      只放当前 shell 环境，**不写进文档、脚本、日志、shell 历史里的明文**，不落盘。
   3. **角色卡保持默认 `mode: on_demand`，不要改成 `resident`**（resident 对开了认证的 oMLX 不带 key，结果 401，见 iDoris#582，计划 v0.3.2 修）。卡片在打包的 `config/components/omlx.yaml` 基础上只改两处：`endpoint: "http://127.0.0.1:8088"`；追加 `extensions.idoris_role_models.daily: Qwen3-0.6B-4bit`（连同必填的 `_degradation`）。卡片放进 `IDORIS_COMPONENTS_DIR` 指向的目录。
   - 其余：oMLX 0.6.4 已在运行；已缓存小模型 `Qwen3-0.6B-4bit`（用户按安装指南准备，不是 Agent24 下载）；`IDORIS_ALLOCATED_BUDGET_BYTES=8000000000`（或用 `agent24 hw idoris-env` 算出的额度）；数据面默认 8740、Admin 8741，需空闲（有冲突可用 `IDORIS_PORT=18740 IDORIS_ADMIN_PORT=18741`，Agent24 的 `IDORIS_URL` 随之改）；断网（飞行模式）。
@@ -1337,24 +1337,24 @@ echo "report: $WORK/report.md"
 [ "$FAILS" = 0 ]
 ```
 
-## 7. 缺口与疑问（起草时看到的，需要 David 或各线负责人回答）
+## 7. 缺口与疑问（起草时看到的；10-28 已逐条处置，见各行「10-28 处置」）
 
 | 编号 | 线 | 现象 | 为什么要紧 | 建议 |
 |---|---|---|---|---|
-| G-K1 | kernel | 仓库里没有声明协议 4 的示例模块；授予 POST、确认卡片、按引用停、结束通知、启用纪元都只有 CI 测试（#1294 自己列为「不在这里验」） | 按 #1293「对外功能缺用例就不合并」，这块是 #1280 的头号对外功能 | 补一个协议 4 的示例模块（node-module 的协议 4 版）并加用例 K-02；或 David 明确判为「用户看不到」并在 release PR 正文逐项写明 |
+| G-K1 | kernel | 仓库里没有声明协议 4 的示例模块；授予 POST、确认卡片、按引用停、结束通知、启用纪元都只有 CI 测试（#1294 自己列为「不在这里验」） | 按 #1293「对外功能缺用例就不合并」，这块是 #1280 的头号对外功能 | 补一个协议 4 的示例模块（node-module 的协议 4 版）并加用例 K-02；或 David 明确判为「用户看不到」并在 release PR 正文逐项写明<br>**10-28 处置**：判为「用户够不着」：授予 POST 默认关闭（要设 `A24_MODULE_TOOL_GRANTS=1`），桌面和 CLI 都没有授予入口，仓库里也没有协议 4 的示例模块。本版不对用户宣称这项能力，CHANGELOG「已知缺口」写明；K-02/K-03 记为 BLOCKED，留待补协议 4 示例模块时补用例。由 kernel 线负责人 jason（发版协调代行）决定。 |
 | G-K2 | kernel | #1280 正文写 head 为 27acdd72，现在是 2983d164（合了 main）；#1294 的验收报告也是在 27acdd72 上跑的。另外 `ab/kernel` 比 release 分支多 57 个提交，其中有 store 迁移 `0027_session_tool_result_origins`（#1309） | 若发布改为从新的 ab/kernel 重切（`K1-R2-ACCEPTANCE.md` 的 `ab/kernel` 版本写的就是「按 #1293 从新的 ab/kernel head 重切」），store 0027 会与 memory-p1 的 `0027_run_message_origins` **撞号**，X-01 的「连续 1..29」也要变 | 先定 kernel 的发布范围；若重切，memory-p1 要再改号一次（#1298 的做法），本清单的迁移号和 K-00 的脚本版本（改用 K-77 之后的版本）都要跟着改 |
 | G-M1 | memory | 桌面 `Chat.tsx` 的 `MemoryReceipt` 类型和 `Chat.i18n.ts` 没有 `not_saved`；后端对普通轮次写入失败发 `not_saved`，界面什么都不显示（设计 D2 W1 要求显示「本轮未保存到记忆」） | 配额满或磁盘低时，用户的普通对话悄悄没存，违反「失败必须显式显示」 | 补 `not_saved` 类型、三种语言的文案和显示；M-14s 现在记 KNOWN |
 | G-M2 | memory | 没有改配额的产品入口（设计 D8 / c6 依赖 CORE-2 在场证明，不在本次）；用例要直接改 `mem_owner_quota` | 只能直接改库来造「满额」 | 可接受（与 #1294 造旧授予同类），但 release PR 正文要写明 |
 | G-M3 | memory | `protocol/openapi.yaml` 的 `memory_error_code` 描述仍写「`memory_disk_low` is reserved (nothing emits it yet)」，c4（#1296）已经会发 | 协议文档与行为不符 | 改文案，重新 `pnpm gen:api` |
 | G-M4 | memory | `memory_disk_full`（真的写满）没有可稳定复现的用例，只有单元测试 | 类型化错误码里这一个靠不到 CLI 验 | 记为「可接受不跑」并在正文写明，或用 macOS 内存盘填满再试（不稳定，没放进脚本） |
-| G-M5 | memory | run 路径的 `memory_persisted:false` 和 `memory.write_failed` 桌面、TUI 都没消费（P1-03 未做） | 配额满时 run 路径照常 `completed`，用户看不到记忆没写进去 | #1341 已声明 P1-03 在范围外；release PR 正文要写明这一条是已知缺口 |
-| G-D1 | documenting | `domain-os.yml` 没有 `tools:` 声明（设计 DOC-1-06b 片 E 未做），七个文档工具已实现、已登记但调不到；#1126（按 `authorized_resources` 校验）、#1213/#1234（按引用停）都只能靠测试 | agent 用文档的对话入口这次不可用；撤销授权的停止行为没有用户可达的验证 | 按设计是预期（「K1-6a 与 K1-6b 验收前文档工具不授予」）；release PR 正文写明「文档对话入口不在本次」 |
-| G-D2 | documenting | `domain-os.yml` 的 `min_daemon_protocol: 2`，而 kernel 规定只有协议 4 的模块才能拿授予（`protocol_too_old`） | 将来补上 `tools:` 时必须同时把协议提到 4，否则永远拿不到授予 | 补 `tools:` 的 PR 里一并改，并加一条用例 |
+| G-M5 | memory | run 路径的 `memory_persisted:false` 和 `memory.write_failed` 桌面、TUI 都没消费（P1-03 未做） | 配额满时 run 路径照常 `completed`，用户看不到记忆没写进去 | #1341 已声明 P1-03 在范围外；release PR 正文要写明这一条是已知缺口<br>**10-28 处置**：已知缺口：P1-03 不在 #1341 范围内。CHANGELOG「已知缺口」写明：配额满时，run 路径照常 completed，桌面和 TUI 都不提示记忆没写进去。M-16 记为 BLOCKED。 |
+| G-D1 | documenting | `domain-os.yml` 没有 `tools:` 声明（设计 DOC-1-06b 片 E 未做），七个文档工具已实现、已登记但调不到；#1126（按 `authorized_resources` 校验）、#1213/#1234（按引用停）都只能靠测试 | agent 用文档的对话入口这次不可用；撤销授权的停止行为没有用户可达的验证 | 按设计是预期（「K1-6a 与 K1-6b 验收前文档工具不授予」）；release PR 正文写明「文档对话入口不在本次」<br>**10-28 处置**：已知缺口：文档的对话入口（agent 调用文档工具）不在本次，CHANGELOG「已知缺口」写明；D-11/D-13 记为 BLOCKED。这是按设计的预期，David 在 #1386 的 r6 发布说明里已把文档模块工具列为「本次不对外」。 |
+| G-D2 | documenting | `domain-os.yml` 的 `min_daemon_protocol: 2`，而 kernel 规定只有协议 4 的模块才能拿授予（`protocol_too_old`） | 将来补上 `tools:` 时必须同时把协议提到 4，否则永远拿不到授予 | 补 `tools:` 的 PR 里一并改，并加一条用例<br>**10-28 处置**：和 G-D1 一起延后：将来补 `tools:` 的 PR 要同时把 `min_daemon_protocol` 提到 4，并补一条用例。本版没有影响。 |
 | G-D3 | documenting | documents 模块不随安装包分发、不默认安装，PDF 引擎只有 macOS | 「导入文档」对绝大多数用户这次不是开箱可用的功能；桌面文档页在没装模块时显示什么没有核实 | 发布说明写明手工安装；X-06 / D-12 时看一眼没装模块时的页面 |
 | G-D4 | documenting | `find` 在 CLI 和桌面都没有入口（`ops.rs` 白名单没有），D-06 只能直接调 HTTP | #1293 要求 CLI 与桌面共用逻辑；这里两边都没有，属于只有 agent 工具和 REST | 可接受，但在 release PR 正文写明 |
 | G-W1 | weknora | Provider 全部没接入 daemon；`knowledge.db` 不会被打开；Knowledge 工具没接入；host 通道没有用户入口 | 这条线的用户可见面几乎为零，W-04 无法写出可执行的用例 | 建议 David 判为「用户看不到」并逐项写进正文；接入 daemon 的那次发布再补用例（含 `knowledge.db` 的升级用例） |
 | G-X1 | 跨线 | 代码里没有为「旧编号迁移」写专门的报错或重置指引，用户看到的只是 sqlx 的 `migration N was previously applied but has been modified / is missing`；`docs/Deployment/README.md` 只讲了用 `AGENT24_DATA_DIR` 隔离 | 需求是「明确报错且有清楚的重置步骤」 | X-05 的四步要写进 release notes 和 CHANGELOG；更好的做法是 daemon 在这类错误后追加一行指向该步骤的提示。另需要 David 确认：memory-p1 旧编号的开发库也按 K1-06b 矩阵 §6 第 4 条「不做兼容、清库」处理 |
-| G-X2 | 跨线 | 起草时四线还没有合并，迁移号（store 29、memory 20）、文件名、`1..29` 连续性都来自各分支的 `ls-tree`，没在合并结果上验证 | 如果 #1341 吸收 main 或 #1280 重切时有改号，X-01 的期望值要改 | 合并后第一件事：跑 X-01 看连续性 |
+| G-X2 | 跨线 | 起草时四线还没有合并，迁移号（store 29、memory 20）、文件名、`1..29` 连续性都来自各分支的 `ls-tree`，没在合并结果上验证 | 如果 #1341 吸收 main 或 #1280 重切时有改号，X-01 的期望值要改 | 合并后第一件事：跑 X-01 看连续性<br>**10-28 处置**：已解决：10-27 在合并结果上实跑，X-01/X-05 期望值已改成 store 1..30、memory 1..20，结果 PASS。 |
 | G-I1 | idoris | `ab/idoris` 还没有第二次吸收 main：#1365 先吸收一次，要等 #1358/#1364/#1368/#1366 进 main 后再吸收一次；`ab/idoris` → main 的 release PR 还没开 | 截止 2026-10-28 12:00（Asia/Bangkok）前要拿到 PR-Daemon APPROVE 并可合并；iDoris 合入顺序最后 | 前四线合入后立即吸收 main、开 release PR；赶不上则整条 I 组、第 8 节 idoris 一行和 checklist 的 iDoris 项一并移出本版 |
 | G-I2 | idoris | 真实 iDoris v0.3.1 归档的 tag 指向提交、sha256、字节数在 #1370 里仍是「待回填」 | ID-1/2/3/5/8 要先校验 sha256 再用；Release Notes 要引用该 tar 的 sha256 | iDoris 打 tag 后回填 #1370；本文第 2 节的校验命令和 release notes 都按回填值写，**不要用占位值跑** |
 | G-I3 | idoris | 已解决（改写）：`temperature` 只在模块推理回调里可设、没有用户入口，且 iDoris 生命周期路径的请求字段是白名单（`temperature` 会 400 `unsupported_parameter`）。结论：#1365 改为 iDoris 网关路径不发 `temperature`，其它 provider 照 main；ID-7 移出用户路径，改单测/抓上游请求证明，Release Notes 写「已知限制：iDoris 网关当前忽略 temperature」 | 剩余：**#1365 的修复（含单元测试）要先进 `ab/idoris`**，否则带 temperature 的模块调用在 iDoris 路径上会直接失败 | iDoris 侧在 #1365 单独提交修复；本表在它合入后关闭 |

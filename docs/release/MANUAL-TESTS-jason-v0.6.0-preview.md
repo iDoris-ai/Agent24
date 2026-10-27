@@ -1,6 +1,6 @@
 # v0.6.0-preview.20261028.1 —— jason 人工测试清单
 
-> 发布后由 jason 在真机上做。脚本、CLI、HTTP 能验的都已由 Claude 在 10-27 跑过：一键脚本 PASS 40 / FAIL 0；ID-8 用 CLI 在真机跑通。结果见 release PR #1421 和 `ACCEPTANCE-v0.6.0-preview.md`。这里只留**需要人眼看界面**和**需要断网**的项。
+> 发布后由 jason 在真机上做。脚本、CLI、HTTP 能验的都已由 Claude 在 10-27 跑过：一键脚本 PASS 39 / FAIL 0 / KNOWN 1 / SKIP 18，加上手工 X-07 PASS，合计 PASS 40；ID-8 用 CLI 在真机跑通。结果见 release PR #1421 和 `ACCEPTANCE-v0.6.0-preview.md`。这里只留**需要人眼看界面**和**需要断网**的项。
 > 用例编号对应 `docs/release/ACCEPTANCE-v0.6.0-preview.md`。每项打 ✅ / ❌，❌ 时截图，贴到 release 的 issue，或直接发给 Claude。
 > 安装包：GitHub Release `v0.6.0-preview.20261028.1` 的 `Agent24-0.6.0-preview.20261028.1-arm64.dmg`。装之前先 `shasum -a 256` 和 Release 页的 SHA256SUMS 比对。
 
