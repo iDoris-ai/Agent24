@@ -11,6 +11,7 @@
 
 mod budget;
 mod disks;
+mod legacy_disk;
 mod parse;
 mod probe;
 
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 pub use budget::{APP_OVERHEAD_BYTES, BUDGET_CAP_ENV, Budget, HwLevel, usable_for_ram};
 pub use disks::{disk_for_path, free_bytes_for_path, is_user_visible_volume};
+pub use legacy_disk::legacy_cwd_free_bytes;
 pub use parse::{
     PowerSupply, on_battery_from_power_supplies, parse_brand_string, parse_nvidia_smi,
     parse_pmset_batt, parse_product_version, parse_wired_limit_mb,

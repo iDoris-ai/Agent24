@@ -11,7 +11,8 @@
 //! A valid module consent is necessary to call any module tool, but does not
 //! by itself waive per-call approval. `Allow` therefore carries
 //! `per_call_approval`: `Read` is false; `WriteLocal` is true except for the
-//! narrowly qualified, host-verified reversible-draft case in L-APPR-5;
+//! narrowly qualified, host-verified reversible-draft case in L-APPR-5, which
+//! also requires the matched consent row itself to carry that attribute;
 //! `Exec` is always true, and `External` is also true because module consent
 //! is not the required `tool → exact target` standing-grant shape. Only policy
 //! or consent failures deny the call here. The module-tool adapter carries this
@@ -46,6 +47,21 @@ use agent24_protocol::RiskClass;
 use agent24_store::{ConsentLookup, ConsentSource, ModuleConsentRecord, Store};
 use async_trait::async_trait;
 
+/// The only module the reversible-draft exemption is scoped to.
+///
+/// L-APPR-5 was narrowed on 2026-10-16 to the first-party **Documenting**
+/// module (ADR-K1-03 addendum, `docs/laws/APPROVAL.md`): the recorded
+/// authorization covers that module and nothing wider, so every other module —
+/// first-party or not, no matter which draft facts it supplies — keeps ordinary
+/// per-call approval.
+///
+/// The literal is `documents`, the identity ADR-DOC-01 adopted for the
+/// Documenting domain OS (`rust/apps/agent24-documents/domain-os.yml`); the
+/// earlier `documenting` spelling is **not** a document-class module.
+/// `agent24d::module_tool_runtime::is_document_class_module` is the kernel-side
+/// check of the same identity.
+pub const DRAFT_EXEMPTION_MODULE: &str = "documents";
+
 /// One call's identity plus the policy placeholders the task spec calls
 /// "调用上下文中的来源与组织限制占位" — kept as two separate booleans (rather
 /// than one combined flag) so a future audit view can tell which stricter
@@ -68,7 +84,9 @@ pub struct ConsentGateRequest {
     /// declaration. `HostRiskLevel` is the enablement-time rating, a different axis.
     pub risk: RiskClass,
     /// Untrusted manifest declaration, copied from the validated tool entry.
-    /// It is only a claim; exemption also requires host verification below.
+    /// Necessary for the draft exemption, and not sufficient: the matched
+    /// consent row must also have recorded `reversible_draft`, and the host
+    /// verification below must qualify.
     pub reversible_draft_declared: bool,
     /// Facts determined by the host from the registered tool and its execution
     /// boundary. Missing evidence is intentionally ineligible.
@@ -354,15 +372,27 @@ impl ConsentGate for StoreConsentGate {
                 reason: ConsentDenyReason::Revoked(record),
             },
             ConsentLookup::Granted(record) => {
-                // The only WriteLocal exception is a narrow reversible draft:
-                // the validated manifest marker is merely a claim, while the
-                // host supplies verified operation/path semantics. Source and
-                // consent fingerprint come from the matched host consent row.
-                // Every uncertain or missing fact falls back to ordinary
+                // The only WriteLocal exception is a narrow reversible draft.
+                // `reversible_draft_declared` is the request's claim and is
+                // required. The authorization for that attribute is the
+                // matched consent row's `reversible_draft`, recorded from the
+                // summary the user accepted — a fingerprint match against a
+                // non-draft summary does not supply it. Source comes from
+                // that same row; path and operation facts come from host
+                // verification. Either the claim or the consented attribute
+                // missing, or any other fact uncertain, keeps ordinary
                 // per-call approval.
+                //
+                // Scope: L-APPR-5 was narrowed on 2026-10-16 to the first-party
+                // **Documenting** module only (ADR-K1-03 addendum), because the
+                // recorded authorization covers that module and nothing wider.
+                // Any other module — however first-party and however many draft
+                // facts it supplies — stays on ordinary per-call approval.
                 let reversible_draft = request.risk == RiskClass::WriteLocal
                     && request.reversible_draft_declared
+                    && record.reversible_draft
                     && record.source == ConsentSource::FirstParty
+                    && record.module == DRAFT_EXEMPTION_MODULE
                     && request
                         .draft_verification
                         .as_ref()
@@ -388,8 +418,18 @@ mod tests {
     }
 
     fn summary(source: ConsentSource, risk: HostRiskLevel) -> ToolPermissionSummary {
+        // The Documenting module's real identity: the draft exemption is
+        // scoped to it (see `DRAFT_EXEMPTION_MODULE`).
+        summary_for_module(DRAFT_EXEMPTION_MODULE, source, risk)
+    }
+
+    fn summary_for_module(
+        module: &str,
+        source: ConsentSource,
+        risk: HostRiskLevel,
+    ) -> ToolPermissionSummary {
         ToolPermissionSummary::new(
-            "documenting",
+            module,
             "read_doc",
             "1.0.0",
             source,
@@ -398,6 +438,26 @@ mod tests {
             None,
             risk,
         )
+    }
+
+    /// Same summary as [`summary`], with the consented reversible-draft
+    /// attribute set. Tests that isolate some other exemption condition use
+    /// this so a missing consent attribute cannot make them pass on its own.
+    fn summary_with_consented_draft(
+        source: ConsentSource,
+        risk: HostRiskLevel,
+    ) -> ToolPermissionSummary {
+        summary_with_consented_draft_for_module(DRAFT_EXEMPTION_MODULE, source, risk)
+    }
+
+    fn summary_with_consented_draft_for_module(
+        module: &str,
+        source: ConsentSource,
+        risk: HostRiskLevel,
+    ) -> ToolPermissionSummary {
+        let mut summary = summary_for_module(module, source, risk);
+        summary.reversible_draft = true;
+        summary
     }
 
     fn request_for(summary: &ToolPermissionSummary, risk: RiskClass) -> ConsentGateRequest {
@@ -521,7 +581,7 @@ mod tests {
                     grant_ref,
                     per_call_approval,
                 } => {
-                    assert_eq!(grant_ref.module, "documenting");
+                    assert_eq!(grant_ref.module, DRAFT_EXEMPTION_MODULE);
                     assert_eq!(grant_ref.op, "read_doc");
                     assert_eq!(
                         grant_ref.scope_fingerprint,
@@ -540,16 +600,45 @@ mod tests {
         }
     }
 
+    // L-APPR-5 scope (2026-10-16): the exemption belongs to the first-party
+    // Documenting module. A first-party module outside it may record the same
+    // consented draft attribute and still must keep per-call approval.
+    #[tokio::test]
+    async fn consented_draft_on_another_first_party_module_keeps_per_call_approval() {
+        let store = store().await;
+        let s = summary_with_consented_draft_for_module(
+            "comm",
+            ConsentSource::FirstParty,
+            HostRiskLevel::Low,
+        );
+        let granted = store
+            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        assert!(granted.reversible_draft);
+        let decision = StoreConsentGate::new(store)
+            .authorize(&eligible_draft_request(&s), "2026-10-08T00:00:01Z")
+            .await;
+        assert!(matches!(
+            decision,
+            ConsentGateDecision::Allow {
+                per_call_approval: true,
+                ..
+            }
+        ));
+    }
+
     // K1-6a.5: only the host-verified, first-party, consent-matched,
     // reversible draft subset may skip per-call approval.
     #[tokio::test]
     async fn eligible_reversible_draft_skips_per_call_approval() {
         let store = store().await;
-        let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
-        store
+        let s = summary_with_consented_draft(ConsentSource::FirstParty, HostRiskLevel::Low);
+        let granted = store
             .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
             .await
             .unwrap();
+        assert!(granted.reversible_draft);
         let decision = StoreConsentGate::new(store)
             .authorize(&eligible_draft_request(&s), "2026-10-08T00:00:01Z")
             .await;
@@ -562,9 +651,42 @@ mod tests {
         ));
     }
 
+    // L-APPR-5 condition 1: the request declaring itself a reversible draft does
+    // not mean the user consented to that attribute. `ToolPermissionSummary::new`
+    // defaults `reversible_draft` to false. A grant of that summary must keep
+    // per-call approval even when the request declares a draft and host
+    // verification otherwise qualifies.
+    #[tokio::test]
+    async fn declared_draft_without_consented_draft_attribute_keeps_per_call_approval() {
+        let store = store().await;
+        let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
+        assert!(
+            !s.reversible_draft,
+            "ToolPermissionSummary::new must default reversible_draft to false"
+        );
+        let granted = store
+            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        assert!(!granted.reversible_draft);
+        let decision = StoreConsentGate::new(store)
+            .authorize(&eligible_draft_request(&s), "2026-10-08T00:00:01Z")
+            .await;
+        assert!(
+            matches!(
+                decision,
+                ConsentGateDecision::Allow {
+                    per_call_approval: true,
+                    ..
+                }
+            ),
+            "a non-draft consent must keep per-call approval when the request declares a draft, got {decision:?}"
+        );
+    }
+
     #[tokio::test]
     async fn eligible_draft_without_enablement_consent_is_denied() {
-        let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
+        let s = summary_with_consented_draft(ConsentSource::FirstParty, HostRiskLevel::Low);
         let decision = StoreConsentGate::new(store().await)
             .authorize(&eligible_draft_request(&s), "2026-10-08T00:00:01Z")
             .await;
@@ -579,11 +701,12 @@ mod tests {
     #[tokio::test]
     async fn draft_exemption_requires_first_party_source() {
         let store = store().await;
-        let s = summary(ConsentSource::ManualInstall, HostRiskLevel::High);
-        store
+        let s = summary_with_consented_draft(ConsentSource::ManualInstall, HostRiskLevel::High);
+        let granted = store
             .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
             .await
             .unwrap();
+        assert!(granted.reversible_draft);
         let decision = StoreConsentGate::new(store)
             .authorize(&eligible_draft_request(&s), "2026-10-08T00:00:01Z")
             .await;
@@ -599,12 +722,18 @@ mod tests {
     #[tokio::test]
     async fn draft_exemption_requires_current_matching_consent_fingerprint() {
         let store = store().await;
-        let granted = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
-        store
-            .grant_module_consent(&granted, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+        let granted_summary =
+            summary_with_consented_draft(ConsentSource::FirstParty, HostRiskLevel::Low);
+        let granted = store
+            .grant_module_consent(
+                &granted_summary,
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
             .await
             .unwrap();
-        let mut changed = eligible_draft_request(&granted);
+        assert!(granted.reversible_draft);
+        let mut changed = eligible_draft_request(&granted_summary);
         changed.current_scope_fingerprint.push_str("-changed");
         let decision = StoreConsentGate::new(store)
             .authorize(&changed, "2026-10-08T00:00:01Z")
@@ -654,11 +783,12 @@ mod tests {
         ];
         for (name, mutate) in cases {
             let store = store().await;
-            let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
-            store
+            let s = summary_with_consented_draft(ConsentSource::FirstParty, HostRiskLevel::Low);
+            let granted = store
                 .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
                 .await
                 .unwrap();
+            assert!(granted.reversible_draft);
             let mut request = eligible_draft_request(&s);
             mutate(&mut request);
             let decision = StoreConsentGate::new(store)
@@ -680,11 +810,12 @@ mod tests {
     #[tokio::test]
     async fn external_risk_never_uses_draft_exemption() {
         let store = store().await;
-        let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
-        store
+        let s = summary_with_consented_draft(ConsentSource::FirstParty, HostRiskLevel::Low);
+        let granted = store
             .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
             .await
             .unwrap();
+        assert!(granted.reversible_draft);
         let mut request = eligible_draft_request(&s);
         request.risk = RiskClass::External;
         let decision = StoreConsentGate::new(store)
@@ -946,6 +1077,7 @@ mod tests {
             readable: None,
             writable: None,
             external: None,
+            reversible_draft: false,
             decision: agent24_store::ConsentDecision::Granted,
             decided_at: "2026-10-08T00:00:00.000Z".to_owned(),
             expires_at: "2026-11-08T00:00:00.000Z".to_owned(),

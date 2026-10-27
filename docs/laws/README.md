@@ -76,7 +76,7 @@ F1 与 F8 加起来二十余轮对抗复审，抓到的几乎全是同一类问�
 - ✅ `docs/agent/architecture.md`「不可动摇的边界」六条 → [`MEMORY.md`](MEMORY.md) `L-MEM-1..6`
 - ✅ `docs/specs/SPEC-ME-FOLLOWUPS.md` F1「不得声称的话」→ [`MEMORY.md`](MEMORY.md) `L-MEM-7`（附「不得声称」对照表）
 - ✅ H2 的 inviolable → [`APPROVAL.md`](APPROVAL.md) `L-APPR-1..3`
-- ✅ H4 → [`APPROVAL.md`](APPROVAL.md) `L-APPR-4..7`
+- ✅ H4 → [`APPROVAL.md`](APPROVAL.md) `L-APPR-4..7`；工作区写入见 `L-APPR-8`
 
 **仍未建**（等对应功能出现再立）：T13/T14 的 SDK 与非 Rust 参考实现会引入进程边界，届时需要一份
 `WIRE.md`；Cos72（T10）会引入项目根与工作区，`CONTEXT.md` 的 L-CTX-1/2 到那时才第一次有真实代码路径。
