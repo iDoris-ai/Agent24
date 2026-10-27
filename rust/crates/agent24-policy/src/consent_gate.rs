@@ -98,6 +98,10 @@ pub struct ConsentGateRequest {
     /// kept separate from `org_restricted` for future audit distinction.
     /// `true` denies regardless of consent state.
     pub source_restricted: bool,
+    /// The artifact identity of the module as it runs now (K1-6a-G §2.2);
+    /// a grant holds only for the identity it was given for. `None` (not
+    /// running, or no identity) matches no grant.
+    pub current_artifact: Option<String>,
 }
 
 /// Host-verified facts required to classify a `WriteLocal` call as a reversible
@@ -179,6 +183,14 @@ pub struct GrantRef {
     pub scope_fingerprint: String,
     pub decided_at: String,
     pub expires_at: String,
+    /// The record's resource set as stored (K1-6a-G §2.2); a dispatch
+    /// checks it before the module sees it.
+    pub resources: Vec<String>,
+    /// [`ModuleConsentRecord::authorization_ref`]: `ga1:` and a digest that
+    /// changes with every replacement of the grant.
+    pub authorization_ref: String,
+    /// The artifact identity the grant was given for (K1-6a-G §2.2).
+    pub artifact: Option<String>,
 }
 
 impl From<&ModuleConsentRecord> for GrantRef {
@@ -189,6 +201,9 @@ impl From<&ModuleConsentRecord> for GrantRef {
             scope_fingerprint: record.scope_fingerprint.clone(),
             decided_at: record.decided_at.clone(),
             expires_at: record.expires_at.clone(),
+            resources: record.resources.clone(),
+            authorization_ref: record.authorization_ref(),
+            artifact: record.artifact.clone(),
         }
     }
 }
@@ -218,10 +233,17 @@ impl ConsentGateDecision {
     }
 }
 
+/// Reads a module's current artifact identity (K1-6a-G §2.2), per lookup.
+pub type ArtifactSource = std::sync::Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
 pub struct ModuleConsentAuthorization {
     gate: std::sync::Arc<dyn ConsentGate>,
     request: ConsentGateRequest,
     now: std::sync::Arc<dyn Fn() -> String + Send + Sync>,
+    /// Where committed consent changes are announced (K1-6a-G §2.5).
+    changes: Option<Store>,
+    /// Where the running module's identity is read; none reads as `None`.
+    artifact: Option<ArtifactSource>,
 }
 
 impl ModuleConsentAuthorization {
@@ -231,16 +253,42 @@ impl ModuleConsentAuthorization {
         request: ConsentGateRequest,
         now: std::sync::Arc<dyn Fn() -> String + Send + Sync>,
     ) -> Self {
-        Self { gate, request, now }
+        Self {
+            gate,
+            request,
+            now,
+            changes: None,
+            artifact: None,
+        }
     }
 
-    async fn decision(&self, module: &str, operation: &str) -> ConsentGateDecision {
+    /// Each lookup compares the grant's artifact identity with what
+    /// `source` reads for the module at that moment (K1-6a-G §2.2).
+    #[must_use]
+    pub fn with_artifact_source(mut self, source: ArtifactSource) -> Self {
+        self.artifact = Some(source);
+        self
+    }
+
+    /// In-flight calls watch `store`'s consent changes and stop when their
+    /// grant is no longer current (K1-6a-G §2.5).
+    #[must_use]
+    pub fn with_consent_changes(mut self, store: Store) -> Self {
+        self.changes = Some(store);
+        self
+    }
+
+    async fn decision(&self, module: &str, operation: &str, now: &str) -> ConsentGateDecision {
         if self.request.module != module || self.request.op != operation {
             return ConsentGateDecision::Deny {
                 reason: ConsentDenyReason::NotGranted,
             };
         }
-        self.gate.authorize(&self.request, &(self.now)()).await
+        let request = ConsentGateRequest {
+            current_artifact: self.artifact.as_ref().and_then(|source| source(module)),
+            ..self.request.clone()
+        };
+        self.gate.authorize(&request, now).await
     }
 }
 
@@ -254,17 +302,20 @@ impl agent24_tools::ModuleToolAuthorization for ModuleConsentAuthorization {
     ) -> Result<agent24_tools::ModuleToolGrantContext, agent24_domain::tool::ModuleToolCallError>
     {
         use agent24_domain::tool::{ModuleToolCallError, ModuleToolErrorCode};
-        match self.decision(module, operation).await {
+        // One instant for the lookup and the remaining validity, so the two
+        // agree.
+        let now = (self.now)();
+        match self.decision(module, operation, &now).await {
             ConsentGateDecision::Allow {
                 grant_ref,
                 per_call_approval,
             } => Ok(agent24_tools::ModuleToolGrantContext {
-                authorized_resources: Vec::new(),
-                authorization_ref: format!(
-                    "{}:{}",
-                    grant_ref.scope_fingerprint, grant_ref.decided_at
-                ),
+                // As recorded: the dispatch validates the set, never trims it.
+                authorized_resources: grant_ref.resources,
+                authorization_ref: grant_ref.authorization_ref,
                 per_call_approval,
+                valid_for: Some(valid_for(&now, &grant_ref.expires_at)),
+                artifact: grant_ref.artifact,
             }),
             ConsentGateDecision::Deny { reason } => {
                 let details = matches!(reason, ConsentDenyReason::Revoked(_))
@@ -281,9 +332,32 @@ impl agent24_tools::ModuleToolAuthorization for ModuleConsentAuthorization {
 
     async fn has_current_consent(&self, module: &str, operation: &str) -> bool {
         matches!(
-            self.decision(module, operation).await,
+            self.decision(module, operation, &(self.now)()).await,
             ConsentGateDecision::Allow { .. }
         )
+    }
+
+    fn consent_changes(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<agent24_store::ModuleConsentChange>> {
+        self.changes
+            .as_ref()
+            .map(Store::subscribe_module_consent_changes)
+    }
+}
+
+/// How long a grant expiring at `expires_at` stays valid after `now` (both
+/// RFC 3339). Zero when it has passed, or when either does not parse: a
+/// grant whose end cannot be read ends at once (K1-6a-G §2.5).
+fn valid_for(now: &str, expires_at: &str) -> std::time::Duration {
+    match (
+        agent24_store::consent_instant_millis(now),
+        agent24_store::consent_instant_millis(expires_at),
+    ) {
+        (Some(now), Some(end)) if end > now => {
+            std::time::Duration::from_millis(u64::try_from(end - now).unwrap_or(0))
+        }
+        _ => std::time::Duration::ZERO,
     }
 }
 
@@ -371,6 +445,15 @@ impl ConsentGate for StoreConsentGate {
             ConsentLookup::Revoked(record) => ConsentGateDecision::Deny {
                 reason: ConsentDenyReason::Revoked(record),
             },
+            // K1-6a-G §2.2: a grant holds only for the package the user
+            // confirmed; another, or none on either side, is stale.
+            ConsentLookup::Granted(record)
+                if record.artifact.is_none() || record.artifact != request.current_artifact =>
+            {
+                ConsentGateDecision::Deny {
+                    reason: ConsentDenyReason::Stale(record),
+                }
+            }
             ConsentLookup::Granted(record) => {
                 // The only WriteLocal exception is a narrow reversible draft.
                 // `reversible_draft_declared` is the request's claim and is
@@ -417,6 +500,209 @@ mod tests {
         Store::open_memory().await.unwrap()
     }
 
+    /// K1-6a-G §2.5: in-flight calls hear the store's consent writes only
+    /// once the authorization is given that store.
+    #[tokio::test]
+    async fn consent_changes_come_from_the_store_it_was_given() {
+        use agent24_tools::ModuleToolAuthorization;
+        let store = store().await;
+        let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
+        let gate = std::sync::Arc::new(StoreConsentGate::new(store.clone()));
+        let clock = std::sync::Arc::new(|| "2026-10-08T00:00:01Z".to_owned());
+        let unwired = ModuleConsentAuthorization::new(
+            gate.clone(),
+            request_for(&s, RiskClass::Read),
+            clock.clone(),
+        );
+        assert!(unwired.consent_changes().is_none());
+        let wired = ModuleConsentAuthorization::new(gate, request_for(&s, RiskClass::Read), clock)
+            .with_consent_changes(store.clone());
+        let mut changes = wired.consent_changes().expect("wired to the store");
+        store
+            .grant_module_consent_scoped(
+                &s,
+                &artifact_scope(),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            changes.try_recv().unwrap(),
+            agent24_store::ModuleConsentChange {
+                module: s.module.clone(),
+                op: Some(s.op.clone()),
+            }
+        );
+    }
+
+    /// K1-6a-G §2.2, §4 case 9: an allowed call carries the grant's resource
+    /// set as recorded and its `ga1:` reference; a grant without resources
+    /// gives an empty list, and a new grant a new reference.
+    #[tokio::test]
+    async fn an_allowed_call_carries_the_recorded_resources_and_ref() {
+        use agent24_tools::ModuleToolAuthorization;
+        let store = store().await;
+        let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
+        let authorization = ModuleConsentAuthorization::new(
+            std::sync::Arc::new(StoreConsentGate::new(store.clone())),
+            request_for(&s, RiskClass::Read),
+            std::sync::Arc::new(|| "2026-10-08T00:00:01Z".to_owned()),
+        )
+        .with_artifact_source(running_test_package());
+        let ctx = agent24_tools::ToolContext::legacy("run", None, None, "call");
+        let plain = store
+            .grant_module_consent_scoped(
+                &s,
+                &artifact_scope(),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let grant = authorization
+            .authorize(&s.module, &s.op, &ctx)
+            .await
+            .unwrap();
+        assert!(grant.authorized_resources.is_empty());
+        assert_eq!(grant.authorization_ref, plain.authorization_ref());
+
+        let scoped = store
+            .grant_module_consent_scoped(
+                &s,
+                &agent24_store::GrantScope {
+                    resources: vec!["doc:b".to_owned(), "doc:a".to_owned()],
+                    artifact: Some(TEST_ARTIFACT.to_owned()),
+                },
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let grant = authorization
+            .authorize(&s.module, &s.op, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(grant.authorized_resources, ["doc:a", "doc:b"]);
+        assert_eq!(grant.authorization_ref, scoped.authorization_ref());
+        assert_ne!(scoped.authorization_ref(), plain.authorization_ref());
+        assert!(grant.authorization_ref.starts_with("ga1:"));
+    }
+
+    /// K1-6a-G §2.2, §4 case 6: a grant holds only while the package the
+    /// user confirmed is the one running. Another package (same version),
+    /// none running, or a grant that names none is stale.
+    #[tokio::test]
+    async fn a_grant_holds_only_for_the_package_it_was_given_for() {
+        use agent24_tools::ModuleToolAuthorization;
+        let store = store().await;
+        let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
+        let running = std::sync::Arc::new(std::sync::Mutex::new(Some(TEST_ARTIFACT.to_owned())));
+        let source: ArtifactSource = {
+            let running = std::sync::Arc::clone(&running);
+            std::sync::Arc::new(move |_: &str| running.lock().unwrap().clone())
+        };
+        let authorization = ModuleConsentAuthorization::new(
+            std::sync::Arc::new(StoreConsentGate::new(store.clone())),
+            ConsentGateRequest {
+                current_artifact: None,
+                ..request_for(&s, RiskClass::Read)
+            },
+            std::sync::Arc::new(|| "2026-10-08T00:00:01Z".to_owned()),
+        )
+        .with_artifact_source(source);
+        let ctx = agent24_tools::ToolContext::legacy("run", None, None, "call");
+        let lookup = || authorization.authorize(&s.module, &s.op, &ctx);
+        let stale = |result: Result<_, agent24_domain::tool::ModuleToolCallError>| {
+            assert!(result.is_err());
+        };
+
+        store
+            .grant_module_consent_scoped(
+                &s,
+                &artifact_scope(),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let grant = lookup().await.unwrap();
+        assert_eq!(grant.artifact.as_deref(), Some(TEST_ARTIFACT));
+        assert!(authorization.has_current_consent(&s.module, &s.op).await);
+
+        *running.lock().unwrap() = Some("sha256:another-package".to_owned());
+        stale(lookup().await);
+        assert!(!authorization.has_current_consent(&s.module, &s.op).await);
+        *running.lock().unwrap() = None;
+        stale(lookup().await);
+
+        // A grant that names no package matches nothing, not even no package.
+        store
+            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        stale(lookup().await);
+        *running.lock().unwrap() = Some(TEST_ARTIFACT.to_owned());
+        stale(lookup().await);
+    }
+
+    /// The gate itself: a matching grant for another package is `Stale`,
+    /// with the record, and a refusal stays a refusal whatever runs.
+    #[tokio::test]
+    async fn the_gate_calls_a_grant_for_another_package_stale() {
+        let store = store().await;
+        let gate = StoreConsentGate::new(store.clone());
+        let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
+        store
+            .grant_module_consent_scoped(
+                &s,
+                &artifact_scope(),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let elsewhere = ConsentGateRequest {
+            current_artifact: Some("sha256:another-package".to_owned()),
+            ..request_for(&s, RiskClass::Read)
+        };
+        let decision = gate.authorize(&elsewhere, "2026-10-08T00:00:01Z").await;
+        assert!(matches!(
+            decision,
+            ConsentGateDecision::Deny {
+                reason: ConsentDenyReason::Stale(_)
+            }
+        ));
+        store
+            .deny_module_consent(&s, "2026-10-08T00:00:02Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        let decision = gate.authorize(&elsewhere, "2026-10-08T00:00:03Z").await;
+        assert!(matches!(
+            decision,
+            ConsentGateDecision::Deny {
+                reason: ConsentDenyReason::Denied(_)
+            }
+        ));
+    }
+
+    /// K1-6a-G §2.5: what remains of a grant, by the authorization's clock;
+    /// past or unreadable is nothing.
+    #[test]
+    fn valid_for_is_what_remains_and_nothing_once_unreadable() {
+        use std::time::Duration;
+        let now = "2026-10-08T00:00:01Z";
+        assert_eq!(
+            valid_for(now, "2026-10-08T00:00:03.500Z"),
+            Duration::from_millis(2_500)
+        );
+        assert_eq!(valid_for(now, "2026-10-08T02:00:01+02:00"), Duration::ZERO);
+        assert_eq!(valid_for(now, now), Duration::ZERO);
+        assert_eq!(valid_for(now, "2026-10-08T00:00:00Z"), Duration::ZERO);
+        assert_eq!(valid_for(now, "never"), Duration::ZERO);
+        assert_eq!(valid_for("now", "2026-10-08T00:00:03Z"), Duration::ZERO);
+    }
+
     fn summary(source: ConsentSource, risk: HostRiskLevel) -> ToolPermissionSummary {
         // The Documenting module's real identity: the draft exemption is
         // scoped to it (see `DRAFT_EXEMPTION_MODULE`).
@@ -438,6 +724,20 @@ mod tests {
             None,
             risk,
         )
+    }
+
+    /// The package every test grant was given for, and the one running.
+    const TEST_ARTIFACT: &str = "sha256:test-package";
+
+    fn artifact_scope() -> agent24_store::GrantScope {
+        agent24_store::GrantScope {
+            resources: Vec::new(),
+            artifact: Some(TEST_ARTIFACT.to_owned()),
+        }
+    }
+
+    fn running_test_package() -> ArtifactSource {
+        std::sync::Arc::new(|_: &str| Some(TEST_ARTIFACT.to_owned()))
     }
 
     /// Same summary as [`summary`], with the consented reversible-draft
@@ -471,6 +771,7 @@ mod tests {
             draft_verification: None,
             org_restricted: false,
             source_restricted: false,
+            current_artifact: Some(TEST_ARTIFACT.to_owned()),
         }
     }
 
@@ -565,8 +866,9 @@ mod tests {
             let granted_store = store().await;
             let granted_summary = summary(ConsentSource::FirstParty, HostRiskLevel::High);
             granted_store
-                .grant_module_consent(
+                .grant_module_consent_scoped(
                     &granted_summary,
+                    &artifact_scope(),
                     "2026-10-08T00:00:00Z",
                     "2026-11-08T00:00:00Z",
                 )
@@ -612,7 +914,12 @@ mod tests {
             HostRiskLevel::Low,
         );
         let granted = store
-            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .grant_module_consent_scoped(
+                &s,
+                &artifact_scope(),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
             .await
             .unwrap();
         assert!(granted.reversible_draft);
@@ -635,7 +942,12 @@ mod tests {
         let store = store().await;
         let s = summary_with_consented_draft(ConsentSource::FirstParty, HostRiskLevel::Low);
         let granted = store
-            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .grant_module_consent_scoped(
+                &s,
+                &artifact_scope(),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
             .await
             .unwrap();
         assert!(granted.reversible_draft);
@@ -665,7 +977,12 @@ mod tests {
             "ToolPermissionSummary::new must default reversible_draft to false"
         );
         let granted = store
-            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .grant_module_consent_scoped(
+                &s,
+                &artifact_scope(),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
             .await
             .unwrap();
         assert!(!granted.reversible_draft);
@@ -703,7 +1020,12 @@ mod tests {
         let store = store().await;
         let s = summary_with_consented_draft(ConsentSource::ManualInstall, HostRiskLevel::High);
         let granted = store
-            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .grant_module_consent_scoped(
+                &s,
+                &artifact_scope(),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
             .await
             .unwrap();
         assert!(granted.reversible_draft);
@@ -725,8 +1047,9 @@ mod tests {
         let granted_summary =
             summary_with_consented_draft(ConsentSource::FirstParty, HostRiskLevel::Low);
         let granted = store
-            .grant_module_consent(
+            .grant_module_consent_scoped(
                 &granted_summary,
+                &artifact_scope(),
                 "2026-10-08T00:00:00Z",
                 "2026-11-08T00:00:00Z",
             )
@@ -785,7 +1108,12 @@ mod tests {
             let store = store().await;
             let s = summary_with_consented_draft(ConsentSource::FirstParty, HostRiskLevel::Low);
             let granted = store
-                .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+                .grant_module_consent_scoped(
+                    &s,
+                    &artifact_scope(),
+                    "2026-10-08T00:00:00Z",
+                    "2026-11-08T00:00:00Z",
+                )
                 .await
                 .unwrap();
             assert!(granted.reversible_draft);
@@ -812,7 +1140,12 @@ mod tests {
         let store = store().await;
         let s = summary_with_consented_draft(ConsentSource::FirstParty, HostRiskLevel::Low);
         let granted = store
-            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .grant_module_consent_scoped(
+                &s,
+                &artifact_scope(),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
             .await
             .unwrap();
         assert!(granted.reversible_draft);
@@ -837,7 +1170,12 @@ mod tests {
         let store = store().await;
         let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
         store
-            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .grant_module_consent_scoped(
+                &s,
+                &artifact_scope(),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
             .await
             .unwrap();
         let gate = StoreConsentGate::new(store);
@@ -859,7 +1197,12 @@ mod tests {
         let store = store().await;
         let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
         store
-            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .grant_module_consent_scoped(
+                &s,
+                &artifact_scope(),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
             .await
             .unwrap();
         let gate = StoreConsentGate::new(store);
@@ -883,7 +1226,12 @@ mod tests {
         let store = store().await;
         let old = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
         store
-            .grant_module_consent(&old, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .grant_module_consent_scoped(
+                &old,
+                &artifact_scope(),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
             .await
             .unwrap();
         let gate = StoreConsentGate::new(store);
@@ -917,7 +1265,12 @@ mod tests {
         let store = store().await;
         let old = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
         store
-            .grant_module_consent(&old, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .grant_module_consent_scoped(
+                &old,
+                &artifact_scope(),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
             .await
             .unwrap();
         let gate = StoreConsentGate::new(store);
@@ -950,7 +1303,12 @@ mod tests {
         let store = store().await;
         let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
         store
-            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-10-08T00:00:00Z")
+            .grant_module_consent_scoped(
+                &s,
+                &artifact_scope(),
+                "2026-10-08T00:00:00Z",
+                "2026-10-08T00:00:00Z",
+            )
             .await
             .unwrap();
         let gate = StoreConsentGate::new(store);
@@ -971,7 +1329,12 @@ mod tests {
         let store = store().await;
         let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
         store
-            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .grant_module_consent_scoped(
+                &s,
+                &artifact_scope(),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
             .await
             .unwrap();
         store
@@ -1020,7 +1383,12 @@ mod tests {
         let store = store().await;
         let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
         store
-            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .grant_module_consent_scoped(
+                &s,
+                &artifact_scope(),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
             .await
             .unwrap();
 
@@ -1081,6 +1449,9 @@ mod tests {
             decision: agent24_store::ConsentDecision::Granted,
             decided_at: "2026-10-08T00:00:00.000Z".to_owned(),
             expires_at: "2026-11-08T00:00:00.000Z".to_owned(),
+            resources: Vec::new(),
+            artifact: None,
+            generation: 1,
         };
         assert_eq!(ConsentDenyReason::NotGranted.reason_code(), "not_granted");
         assert_eq!(
