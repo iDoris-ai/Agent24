@@ -17,9 +17,11 @@ use crate::response::{Response, to_response};
 use crate::transport::{Method, Reply, Request, Transport};
 
 /// What the list, text, find and extraction routes take as a cursor: 1–4096
-/// lower-case hex.
+/// lower-case letters and digits. The OS's are opaque (`DocumentsCursor`):
+/// hex for list, text and find, `v<n>` for an extraction's values; nothing
+/// that could end the parameter (`&`, `=`, `%`, `#`, a space) gets through.
 fn cursor_ok(c: &str) -> bool {
-    (1..=4096).contains(&c.len()) && c.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    (1..=4096).contains(&c.len()) && c.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'z'))
 }
 
 /// `1` to `999999999`, no leading zero.

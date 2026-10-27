@@ -233,6 +233,11 @@ fn the_read_extract_and_render_operations_map_to_their_fixed_routes() {
                 "/api/v1/documents/extractions/{EXT}?cursor=ab12&limit=200"
             )),
         ),
+        // An extraction's own cursors are `v<n>` (extractions.rs).
+        (
+            json!({"op": "getExtraction", "extractionId": EXT, "cursor": "v12"}),
+            get(format!("/api/v1/documents/extractions/{EXT}?cursor=v12")),
+        ),
         (
             json!({"op": "renderPage", "documentId": DOC, "revision": 2, "page": 3}),
             get(page.clone()),
@@ -335,6 +340,9 @@ fn malformed_read_extract_and_render_requests_are_refused() {
         json!({"op": "extract", "documentId": DOC, "revision": 1, "schema": schema, "idempotencyKey": "键"}),
         json!({"op": "getExtraction", "extractionId": DOC}),
         json!({"op": "getExtraction", "extractionId": EXT, "limit": 201}),
+        json!({"op": "getExtraction", "extractionId": EXT, "cursor": "v1#x"}),
+        json!({"op": "getExtraction", "extractionId": EXT, "cursor": "V1"}),
+        json!({"op": "getExtraction", "extractionId": EXT, "cursor": "v1%26limit=1"}),
         json!({"op": "renderPage", "documentId": DOC, "revision": 1}),
         json!({"op": "renderPage", "documentId": DOC, "revision": 1, "page": 0}),
         json!({"op": "renderPage", "documentId": DOC, "revision": 1, "page": 1, "scale": 0.2}),
