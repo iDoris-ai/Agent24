@@ -483,7 +483,9 @@ async fn upload<T: Transport + Sync>(
 
 /// Imports the file at `path`; on success the answer is the import job
 /// (`/imports`' reply). A file that cannot be read is 400 `file_unreadable`
-/// ("the file could not be read"), never the I/O error's text.
+/// ("the file could not be read"), never the I/O error's text. It needs a
+/// tokio runtime with the timer on: a retryable refusal waits before the next
+/// send.
 pub async fn import_file<T: Transport + Sync>(
     path: &Path,
     transport: &T,
