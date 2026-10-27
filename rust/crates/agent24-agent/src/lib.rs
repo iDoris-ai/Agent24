@@ -5210,6 +5210,10 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl agent24_tools::Tool for KnowledgeOnlyTool {
+        fn requires_outbound_policy(&self) -> bool {
+            false
+        }
+
         fn info(&self) -> agent24_protocol::ToolInfo {
             agent24_protocol::ToolInfo::new(
                 "kb_read",

@@ -2364,6 +2364,10 @@ mod tests {
 
     #[async_trait]
     impl Tool for NeedsBinding {
+        fn requires_outbound_policy(&self) -> bool {
+            false
+        }
+
         fn info(&self) -> ToolInfo {
             ToolInfo::new(self.0, "builtin", "needs a binding", self.1)
         }
