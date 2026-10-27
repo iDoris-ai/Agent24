@@ -69,6 +69,8 @@ mod memory_routes;
     reason = "CORE-5b coordinator stays unwired; production startup still uses Store::open"
 )]
 mod migration_coordinator;
+#[allow(dead_code, reason = "CORE-5c building blocks stay unwired until 5d-5f")]
+mod migration_guard;
 mod model_callback;
 mod module_approval_broker;
 mod module_approvals;
