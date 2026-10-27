@@ -140,25 +140,27 @@ fn another_instance_retires_the_binding_and_binds_after_it() {
 
 /// S3.5, S1.13: another principal awaits the user's confirmation, written
 /// with the retirement; the new binding waits unconfirmed and inactive, in
-/// memory as a restart reads it.
+/// memory as a restart reads it. Another instance bringing another principal
+/// is one too.
 #[test]
 fn another_principal_awaits_confirmation_and_its_binding_waits() {
-    let mut log = before();
-    let mut host = restored();
-    let change = IdentityChange::Principal;
-    host.identity_changed("a", change, Some(created(9, "bob")));
-    let awaited = C::Await {
-        profile: "a",
-        awaited: Confirmation::PrincipalChanged,
-    };
-    assert!(step(&mut host, &mut log).contains(&awaited));
-    assert_eq!(step(&mut host, &mut log), vec![bind(9, 3, None)]);
-    assert!(bound(&host));
-    assert_eq!(phase(&host, "a"), None);
+    for change in [IdentityChange::Principal, IdentityChange::Instance] {
+        let mut log = before();
+        let mut host = restored();
+        host.identity_changed("a", change, Some(created(9, "bob")));
+        let awaited = C::Await {
+            profile: "a",
+            awaited: Confirmation::PrincipalChanged,
+        };
+        assert!(step(&mut host, &mut log).contains(&awaited), "{change:?}");
+        assert_eq!(step(&mut host, &mut log), vec![bind(9, 3, None)]);
+        assert!(bound(&host));
+        assert_eq!(phase(&host, "a"), None);
 
-    let awaiting = Some(Confirmation::PrincipalChanged);
-    assert_eq!(host.profile(&"a").unwrap().confirmation(), awaiting);
-    agree(&host, log);
+        let awaiting = Some(Confirmation::PrincipalChanged);
+        assert_eq!(host.profile(&"a").unwrap().confirmation(), awaiting);
+        agree(&host, log);
+    }
 }
 
 /// S3.5: another endpoint or tenant leaves the placeholder, to log in again.
