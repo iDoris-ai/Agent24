@@ -12,7 +12,9 @@ type DetectError = { key: keyof typeof settingsMessages.en } | { raw: string } |
 
 const CATEGORIES_KEY = 'agent24:model-categories'
 const AUTO_START_PORT = 8088
-const AUTO_START_KEY = 'xiaobao8088'
+// No built-in API key: an auto-started oMLX runs keyless on loopback; a key is
+// only used if the user types one into the field below.
+const AUTO_START_KEY = ''
 
 function loadCategories(): Record<string, ModelCategory> {
   try { return JSON.parse(localStorage.getItem(CATEGORIES_KEY) ?? '{}') } catch { return {} }

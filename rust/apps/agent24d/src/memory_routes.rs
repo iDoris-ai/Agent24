@@ -15,6 +15,7 @@
 
 use agent24_core::util::now_iso8601;
 use agent24_memory::KvStore;
+use agent24_memory::MemoryErrorCode;
 use agent24_memory::assertion::{Assertion, AssertionStore, BeliefQuery, Forget};
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
@@ -219,12 +220,41 @@ pub async fn delete_assertion(State(state): State<AppState>, Path(id): Path<Stri
             error_response(StatusCode::NOT_FOUND, "not_found", "no such assertion")
         }
         Err(err) => {
-            tracing::error!("retracting assertion {id}: {err}");
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "could not retract the assertion",
-            )
+            // The body carries the stable code and a fixed sentence only: never
+            // the partition key, never `err`'s Display (P1-02c T6). The detail
+            // goes to the log.
+            let code = err.code();
+            tracing::error!(code = code.as_str(), "retracting assertion {id}: {err}");
+            kv.queued_rejections()
+                .enqueue(&agent24_memory::rejections::Rejection {
+                    owner_kind: agent24_memory::rejections::OwnerKind::Personal,
+                    owner_key: &owner,
+                    code,
+                    rejected_kind: Some("assertion.retracted"),
+                    count_at: None,
+                });
+            match code {
+                MemoryErrorCode::DiskFull => error_response(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    code.as_str(),
+                    "the disk is full; free some space and retry the retraction",
+                ),
+                MemoryErrorCode::DiskLow => error_response(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    code.as_str(),
+                    "free disk space is below the retraction floor; free some space and retry",
+                ),
+                MemoryErrorCode::RetractIdTooLong => error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    code.as_str(),
+                    "the assertion id is too long to retract while memory is full",
+                ),
+                _ => error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    "could not retract the assertion",
+                ),
+            }
         }
     }
 }
@@ -753,7 +783,7 @@ mod tests {
         })
     }
 
-    async fn run_in_session(state: &AppState, session_id: &str, prompt: &str) {
+    async fn finish_run(state: &AppState, session_id: &str, prompt: &str) -> agent24_protocol::Run {
         let response = crate::runs::create_run(
             State(state.clone()),
             None,
@@ -777,14 +807,18 @@ mod tests {
             loop {
                 let current = state.store.get_run(&created.id).await.unwrap().unwrap();
                 if !matches!(current.status, RunStatus::Running | RunStatus::Queued) {
-                    assert_eq!(current.status, RunStatus::Completed);
-                    break;
+                    return current;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("run must finish");
+        .expect("run must finish")
+    }
+
+    async fn run_in_session(state: &AppState, session_id: &str, prompt: &str) {
+        let current = finish_run(state, session_id, prompt).await;
+        assert_eq!(current.status, RunStatus::Completed);
     }
 
     fn last_messages_mention(provider: &RecordingProvider, needle: &str) -> bool {
@@ -860,7 +894,12 @@ mod tests {
         assert_eq!(put.status(), StatusCode::OK);
 
         let mut events = state.events.subscribe();
-        run_in_session(&state, E2E_WRITE_SESSION, "记住我对花生过敏").await;
+        let paused = finish_run(&state, E2E_WRITE_SESSION, "记住我对花生过敏").await;
+        assert_eq!(paused.status, RunStatus::Completed);
+        assert!(
+            last_messages_mention(&provider, "记忆已暂停"),
+            "provider must receive the pause notice"
+        );
 
         // H1: no new assertion — the write gate still independently refuses it.
         let rows = kv
@@ -869,14 +908,6 @@ mod tests {
             .await
             .unwrap();
         assert!(rows.is_empty(), "paused memory must reject the write");
-
-        // H1: the MODEL was told, so it cannot claim to have remembered it.
-        // Content-only check (no role/prefix assumption — T07.1 may reshape
-        // how this is framed).
-        assert!(
-            last_messages_mention(&provider, "记忆已暂停"),
-            "the model must be told memory is paused for this prompt"
-        );
 
         // H1: `memory.write_skipped{reason:"paused"}` was emitted.
         let skipped: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
@@ -986,5 +1017,216 @@ mod tests {
             !last_messages_mention(&provider2, "花生过敏"),
             "still paused after a simulated restart — recall must not resume"
         );
+    }
+
+    // ── P1-02c c2a: typed failures of the retraction route (T5/T6) ──────────
+
+    /// A daemon state over a FILE database, so a second connection can play the
+    /// operator (pin quotas, plant a failing trigger). The owner key is shaped
+    /// like a real partition key (NUL-separated) so a leak would show up as
+    /// `\u0000` in a response body.
+    const NUL_OWNER: &str = "v2\u{0}5\u{0}org-1\u{0}9\u{0}usr:local";
+
+    async fn file_state(dir: &std::path::Path) -> (AppState, KvStore, sqlx::SqlitePool) {
+        let path = dir.join("memory.sqlite");
+        let kv = KvStore::open(&path).await.unwrap();
+        let admin = sqlx::SqlitePool::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        let org = kv.ensure_org_for_user("local").await.unwrap();
+        kv.record_personal_partition(agent24_memory::OsPartitionIdentity {
+            owner_key: NUL_OWNER,
+            key_version: "v2",
+            org_id: &org,
+            space_id: "usr:local",
+            user: "local",
+            module: "@agent",
+        })
+        .await
+        .unwrap();
+        let mut state = crate::server::tests::state().await;
+        state.memory_kv = Some(kv.clone());
+        state.memory_owner = Some(NUL_OWNER.to_owned());
+        (state, kv, admin)
+    }
+
+    async fn pin_rows_to_current(admin: &sqlx::SqlitePool) {
+        let (rows,): (i64,) = sqlx::query_as("SELECT row_count FROM mem_owner_usage WHERE owner=?")
+            .bind(NUL_OWNER)
+            .fetch_one(admin)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO mem_owner_quota(owner, max_rows, max_bytes) VALUES(?, ?, 1000000000)
+             ON CONFLICT(owner) DO UPDATE SET max_rows=excluded.max_rows",
+        )
+        .bind(NUL_OWNER)
+        .bind(rows)
+        .execute(admin)
+        .await
+        .unwrap();
+    }
+
+    /// The retraction response must say nothing but a code and a fixed sentence.
+    fn assert_no_internals(raw: &str) {
+        assert!(!raw.contains("\\u0000"), "NUL leaked: {raw}");
+        assert!(!raw.contains('\u{0}'), "NUL leaked: {raw}");
+        assert!(!raw.contains("org-1"), "partition key leaked: {raw}");
+        assert!(!raw.contains("usr:local"), "partition key leaked: {raw}");
+        assert!(
+            !raw.contains("quota exceeded for owner"),
+            "Display leaked: {raw}"
+        );
+        assert!(
+            !raw.contains("database or disk is full"),
+            "driver text leaked: {raw}"
+        );
+    }
+
+    async fn retract_response(state: &AppState, id: &str) -> (StatusCode, Value, String) {
+        let r = delete_assertion(State(state.clone()), Path(id.to_owned())).await;
+        let status = r.status();
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let raw = String::from_utf8_lossy(&bytes).into_owned();
+        let v = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, v, raw)
+    }
+
+    #[tokio::test]
+    async fn retract_on_a_full_personal_partition_is_204_not_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, kv, admin) = file_state(dir.path()).await;
+        add_assertion(&kv, NUL_OWNER, "a-ok", "s", "t", vec!["e".into()]).await;
+        pin_rows_to_current(&admin).await;
+        let (status, ..) = retract_response(&state, "a-ok").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn retract_with_an_overlong_id_on_a_full_partition_is_422_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, kv, admin) = file_state(dir.path()).await;
+        let id = "i".repeat(260);
+        add_assertion(&kv, NUL_OWNER, &id, "s", "t", vec!["e".into()]).await;
+        pin_rows_to_current(&admin).await;
+        let (status, v, raw) = retract_response(&state, &id).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{raw}");
+        assert_eq!(v["error"]["code"], "memory_retract_id_too_long");
+        assert_no_internals(&raw);
+        assert!(!raw.contains(&id), "the id must not be echoed: {raw}");
+    }
+
+    #[tokio::test]
+    async fn retract_on_a_full_disk_is_507_memory_disk_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, kv, admin) = file_state(dir.path()).await;
+        add_assertion(&kv, NUL_OWNER, "a-disk", "s", "t", vec!["e".into()]).await;
+        // Stand in for SQLITE_FULL at the retraction insert only.
+        sqlx::query(
+            "CREATE TRIGGER fake_full BEFORE INSERT ON mem_events
+             WHEN new.kind = 'assertion.retracted'
+             BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END",
+        )
+        .execute(&admin)
+        .await
+        .unwrap();
+        let (status, v, raw) = retract_response(&state, "a-disk").await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{raw}");
+        assert_eq!(v["error"]["code"], "memory_disk_full");
+        assert_no_internals(&raw);
+        // c3: the failed retraction left an audit row (written in the background).
+        let mut rows = Vec::new();
+        for _ in 0..200 {
+            rows = kv.rejections().list(NUL_OWNER).await.unwrap();
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].code, "memory_disk_full");
+        assert_eq!(
+            rows[0].rejected_kind.as_deref(),
+            Some("assertion.retracted")
+        );
+    }
+
+    struct FixedProbe(u64);
+    impl agent24_memory::disk_gate::DiskProbe for FixedProbe {
+        fn sample(
+            &self,
+            _db: &std::path::Path,
+        ) -> std::io::Result<agent24_memory::disk_gate::DiskSample> {
+            Ok(agent24_memory::disk_gate::DiskSample {
+                free_bytes: self.0,
+                wal_bytes: 0,
+            })
+        }
+    }
+    struct ZeroClock;
+    impl agent24_memory::disk_gate::GateClock for ZeroClock {
+        fn now(&self) -> std::time::Duration {
+            std::time::Duration::ZERO
+        }
+    }
+
+    /// Make the memory volume pretend to have `free` bytes left (applied AFTER
+    /// seeding, since seeding is itself a content write the gate would refuse).
+    fn pretend_free(state: &mut AppState, kv: &KvStore, dir: &std::path::Path, free: u64) {
+        state.memory_kv = Some(kv.clone().with_disk_gate(
+            agent24_memory::disk_gate::DiskGate::with_probe(
+                &dir.join("memory.sqlite"),
+                std::sync::Arc::new(FixedProbe(free)),
+                std::sync::Arc::new(ZeroClock),
+            ),
+        ));
+    }
+
+    #[tokio::test]
+    async fn retract_with_20_mib_free_still_succeeds_204() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, kv, _admin) = file_state(dir.path()).await;
+        add_assertion(&kv, NUL_OWNER, "a-low", "s", "t", vec!["e".into()]).await;
+        pretend_free(&mut state, &kv, dir.path(), 20 * 1024 * 1024);
+        let (status, ..) = retract_response(&state, "a-low").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn retract_under_16_mib_free_is_507_memory_disk_low() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, kv, _admin) = file_state(dir.path()).await;
+        add_assertion(&kv, NUL_OWNER, "a-low", "s", "t", vec!["e".into()]).await;
+        pretend_free(&mut state, &kv, dir.path(), 15 * 1024 * 1024);
+        let (status, v, raw) = retract_response(&state, "a-low").await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{raw}");
+        assert_eq!(v["error"]["code"], "memory_disk_low");
+        assert_no_internals(&raw);
+    }
+
+    #[tokio::test]
+    async fn retract_with_any_other_storage_error_stays_500_internal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, kv, admin) = file_state(dir.path()).await;
+        add_assertion(&kv, NUL_OWNER, "a-boom", "s", "t", vec!["e".into()]).await;
+        sqlx::query(
+            "CREATE TRIGGER boom BEFORE INSERT ON mem_events
+             WHEN new.kind = 'assertion.retracted'
+             BEGIN SELECT RAISE(ABORT, 'boom'); END",
+        )
+        .execute(&admin)
+        .await
+        .unwrap();
+        let (status, v, raw) = retract_response(&state, "a-boom").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{raw}");
+        assert_eq!(v["error"]["code"], "internal");
+        assert_no_internals(&raw);
+        assert!(!raw.contains("boom"), "{raw}");
     }
 }

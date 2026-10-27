@@ -21,14 +21,13 @@ let posted: Array<{ path: string; body?: unknown }> = []
 
 function mount(list: unknown[]) {
   posted = []
-  const proxy = vi.fn((req: { method: string; path: string; body?: unknown }) => {
-    if (req.method === 'GET') {
-      return Promise.resolve({ ok: true, status: 200, data: { approvals: list } })
-    }
-    posted.push({ path: req.path, body: req.body })
+  const proxy = vi.fn(() => Promise.resolve({ ok: true, status: 200, data: { approvals: list } }))
+  // A1: the decision is a dedicated IPC (native confirm lives in main).
+  const approvalDecide = vi.fn((id: string, body: unknown) => {
+    posted.push({ path: `/api/v1/approvals/${id}`, body })
     return Promise.resolve({ ok: true, status: 200, data: {} })
   })
-  window.agent24 = { backendProxy: proxy } as never
+  window.agent24 = { backendProxy: proxy, approvalDecide } as never
   return proxy
 }
 
@@ -92,6 +91,19 @@ describe('ApprovalsPage', () => {
     expect(spy).toHaveBeenCalledWith('需要审批', expect.objectContaining({ tag: 'apr_1' }))
   })
 
+  it('declining the native confirmation sends nothing and keeps the card (A1)', async () => {
+    const proxy = vi.fn(() => Promise.resolve({ ok: true, status: 200, data: { approvals: [APPROVAL] } }))
+    const approvalDecide = vi.fn(() =>
+      Promise.resolve({ ok: false, status: 499, data: { error: { code: 'cancelled', message: '操作已取消' } } }))
+    window.agent24 = { backendProxy: proxy, approvalDecide } as never
+    render(<ApprovalsPage />)
+    await waitFor(() => screen.getByText('run rm -rf /tmp/x'))
+    fireEvent.click(screen.getByRole('button', { name: '批准' }))
+    await waitFor(() => expect(approvalDecide).toHaveBeenCalledTimes(1))
+    expect(screen.queryByText('操作已取消')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '批准' })).toBeInTheDocument()
+  })
+
   it('shows empty state when nothing pending', async () => {
     mount([])
     render(<ApprovalsPage />)
@@ -99,11 +111,9 @@ describe('ApprovalsPage', () => {
   })
 
   it('surfaces a decide error', async () => {
-    const proxy = vi.fn((req: { method: string; path: string }) => {
-      if (req.method === 'GET') return Promise.resolve({ ok: true, status: 200, data: { approvals: [APPROVAL] } })
-      return Promise.resolve({ ok: false, status: 400, data: { error: { message: 'rejected' } } })
-    })
-    window.agent24 = { backendProxy: proxy } as never
+    const proxy = vi.fn(() => Promise.resolve({ ok: true, status: 200, data: { approvals: [APPROVAL] } }))
+    const approvalDecide = vi.fn(() => Promise.resolve({ ok: false, status: 400, data: { error: { message: 'rejected' } } }))
+    window.agent24 = { backendProxy: proxy, approvalDecide } as never
     render(<ApprovalsPage />)
     await waitFor(() => screen.getByText('run rm -rf /tmp/x'))
     fireEvent.click(screen.getByRole('button', { name: '批准' }))

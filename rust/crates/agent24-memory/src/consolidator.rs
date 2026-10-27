@@ -89,11 +89,22 @@ pub trait Consolidator: Send + Sync {
 pub struct EventConsolidator<S: InsightSynth + Clone> {
     pool: SqlitePool,
     synth: S,
+    gate: crate::disk_gate::DiskGate,
 }
 
 impl<S: InsightSynth + Clone> EventConsolidator<S> {
     pub(crate) fn new(pool: SqlitePool, synth: S) -> Self {
-        Self { pool, synth }
+        Self {
+            pool,
+            synth,
+            gate: crate::disk_gate::DiskGate::disabled(),
+        }
+    }
+
+    /// Attach the pre-write disk check (P1-02c c4).
+    pub(crate) fn with_gate(mut self, gate: crate::disk_gate::DiskGate) -> Self {
+        self.gate = gate;
+        self
     }
 
     fn events(&self) -> EventLog {
@@ -130,6 +141,7 @@ impl<S: InsightSynth + Clone> EventConsolidator<S> {
 #[async_trait]
 impl<S: InsightSynth + Clone> Consolidator for EventConsolidator<S> {
     async fn run_once(&self, owner: &str) -> Result<usize> {
+        self.gate.check(crate::disk_gate::WriteClass::Content)?;
         // Recompute from ALL of the owner's events (paged, never truncated), so
         // the result depends only on what exists — never on batching (incremental
         // == full) or on how many times we have run (idempotent).

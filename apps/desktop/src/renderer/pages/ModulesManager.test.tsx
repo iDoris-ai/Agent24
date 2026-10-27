@@ -27,13 +27,12 @@ function mount(opts: {
     if (req.method === 'GET' && req.path === '/api/v1/os') {
       return Promise.resolve({ ok: true, status: 200, data: opts.osList ?? EMPTY_OS_LIST })
     }
-    if (req.method === 'PATCH' && req.path.startsWith('/api/v1/os/')) {
-      const name = decodeURIComponent(req.path.slice('/api/v1/os/'.length))
-      const enabled = (req.body as { enabled: boolean }).enabled
-      const data = opts.onOsPatch ? opts.onOsPatch(name, enabled) : EMPTY_OS_LIST
-      return Promise.resolve({ ok: true, status: 200, data })
-    }
     return Promise.resolve({ ok: true, status: 200, data: {} })
+  })
+  // A1: PATCH /api/v1/os/{name} moved to a dedicated IPC.
+  const osModuleSetEnabled = vi.fn((name: string, enabled: boolean) => {
+    const data = opts.onOsPatch ? opts.onOsPatch(name, enabled) : EMPTY_OS_LIST
+    return Promise.resolve({ ok: true, status: 200, data })
   })
   window.agent24 = {
     modulesList: vi.fn(() => Promise.resolve([])),
@@ -46,9 +45,10 @@ function mount(opts: {
     modulesDisable: vi.fn(),
     modulesUninstall: vi.fn(),
     backendProxy,
+    osModuleSetEnabled,
   } as never
   render(<ModulesManagerPage />)
-  return { install, backendProxy }
+  return { install, backendProxy, osModuleSetEnabled }
 }
 
 const SIN90: DomainOsView = {
@@ -151,16 +151,14 @@ describe('ModulesManagerPage — OS 模块 (FU-90)', () => {
   })
 
   it('clicking 停用 PATCHes enabled:false for that module and refreshes from the response', async () => {
-    const { backendProxy } = mount({
+    const { osModuleSetEnabled } = mount({
       osList: { modules: [SIN90] },
       onOsPatch: (name, enabled) => ({ modules: [{ ...SIN90, name, enabled, state: enabled ? 'mounted' : 'disabled' }] }),
     })
     await waitFor(() => expect(screen.getByRole('button', { name: '停用' })).toBeInTheDocument())
     fireEvent.click(screen.getByRole('button', { name: '停用' }))
     await waitFor(() => expect(screen.getByText('已停用')).toBeInTheDocument())
-    expect(backendProxy).toHaveBeenCalledWith({
-      method: 'PATCH', path: '/api/v1/os/sin90', body: { enabled: false },
-    })
+    expect(osModuleSetEnabled).toHaveBeenCalledWith('sin90', false)
     expect(screen.getByRole('button', { name: '启用' })).toBeInTheDocument()
   })
 })

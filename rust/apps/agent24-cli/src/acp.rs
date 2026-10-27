@@ -449,6 +449,7 @@ mod tests {
                 total_tokens: 3,
                 cost_usd: 0.0,
             },
+            memory_persisted: None,
         }))
     }
 

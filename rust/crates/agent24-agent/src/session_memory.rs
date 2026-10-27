@@ -273,16 +273,25 @@ impl SessionMemory {
         }
         // Recover only what the legacy blob still contains at first import;
         // already-compacted history cannot be reconstructed, and downgrade is unsupported.
-        if let Some(legacy) = CanonicalSession::load(&self.kv, sid).await? {
-            if legacy.session_id != sid {
-                return Err(MemoryError::Io(format!(
-                    "legacy session id {} does not match requested session {sid}",
-                    legacy.session_id
-                )));
+        //
+        // The import is ONE transaction: a failure leaves the session with no
+        // events, so the next call retries it from scratch. Say so in the type
+        // (`SessionImportIncomplete`) rather than letting the caller read "no
+        // history" as "an empty session".
+        let imported = async {
+            if let Some(legacy) = CanonicalSession::load(&self.kv, sid).await? {
+                if legacy.session_id != sid {
+                    return Err(MemoryError::Io(format!(
+                        "legacy session id {} does not match requested session {sid}",
+                        legacy.session_id
+                    )));
+                }
+                self.log.import_legacy(&self.owner, &legacy).await?;
             }
-            self.log.import_legacy(&self.owner, &legacy).await?;
+            Ok::<(), MemoryError>(())
         }
-        Ok(())
+        .await;
+        imported.map_err(|err| MemoryError::SessionImportIncomplete(Box::new(err)))
     }
 
     pub(crate) async fn context(&self, sid: &str) -> agent24_memory::Result<Vec<Msg>> {
@@ -326,7 +335,7 @@ impl SessionMemory {
         answer: &str,
         prompt_origin: Origin,
         source_ref: agent24_store::AssertionSourceRef,
-    ) -> agent24_memory::Result<crate::retain::RetainOutcome> {
+    ) -> Result<RememberReport, RememberFailure> {
         self.check_owner()?;
         let deadline = tokio::time::Instant::now() + super::MEMORY_WRITE_BUDGET;
         // This budget bounds lock acquisition and the work needed to prepare a
@@ -342,9 +351,7 @@ impl SessionMemory {
         {
             Ok(result) => result?,
             Err(_) => {
-                return Err(MemoryError::Io(
-                    "session memory preparation timed out".into(),
-                ));
+                return Err(MemoryError::Io("session memory preparation timed out".into()).into());
             }
         };
         // Once append starts, its transaction must outlive cancellation of the
@@ -429,22 +436,45 @@ impl SessionMemory {
         let (append_result, retain_result, guard) = joined
             .map_err(|err| MemoryError::Io(format!("session memory append task failed: {err}")))?;
         append_result?;
+        // From here on the turn's messages are durable. A retain failure is
+        // therefore a PARTIAL write (conversation saved, assertion not), which
+        // the caller reports differently from "nothing was saved".
+        let finish = |retain: agent24_memory::Result<crate::retain::RetainOutcome>,
+                      compaction_failure: Option<MemoryError>| match retain {
+            Ok(retain) => Ok(RememberReport {
+                retain,
+                compaction_failure,
+            }),
+            Err(error) => Err(RememberFailure {
+                error,
+                turn_saved: true,
+                // Independent of the assertion failure: both get reported.
+                compaction_failure,
+            }),
+        };
         // append_turn is the durable boundary. Any compaction error or timeout
         // is best-effort and leaves every source message in the event log.
         // If confirmation consumed the budget, do not start database work only
         // to cancel its connection acquisition immediately.
         if tokio::time::Instant::now() >= deadline {
-            return retain_result;
+            return finish(retain_result, None);
         }
+        let mut compaction_failure = None;
         match tokio::time::timeout_at(deadline, self.compact(sid)).await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
-                tracing::error!("session {sid} compaction failed; originals retained: {err}")
+                tracing::error!("session {sid} compaction failed; originals retained: {err}");
+                // W2: a summary that could not be WRITTEN is observable, not just
+                // logged. A summariser (model) failure is not a write failure and
+                // stays log-only, as does a timeout.
+                if !matches!(err, MemoryError::Summarizer(_)) {
+                    compaction_failure = Some(err);
+                }
             }
             Err(_) => tracing::error!("session {sid} compaction timed out; originals retained"),
         }
         drop(guard);
-        retain_result
+        finish(retain_result, compaction_failure)
     }
 
     async fn count_user_messages(&self, sid: &str) -> agent24_memory::Result<usize> {
@@ -530,6 +560,35 @@ fn cap_summary(summary: String, max: usize) -> String {
     }
     let kept: String = summary.chars().take(max.saturating_sub(1)).collect();
     format!("{kept}…")
+}
+
+/// What a completed [`SessionMemory::remember`] reports besides the retain
+/// verdict: a compaction summary that failed to WRITE (W2). The turn itself is
+/// durable whenever this is returned.
+pub(crate) struct RememberReport {
+    pub(crate) retain: crate::retain::RetainOutcome,
+    pub(crate) compaction_failure: Option<MemoryError>,
+}
+
+/// A failed [`SessionMemory::remember`]. `turn_saved` is true when
+/// `append_turn` committed and only the explicit-remember assertion failed
+/// (the PARTIAL case); false when nothing of this turn was written.
+pub(crate) struct RememberFailure {
+    pub(crate) error: MemoryError,
+    pub(crate) turn_saved: bool,
+    /// A compaction summary that also failed to WRITE in the same call (the
+    /// assertion and the summary can fail independently; each is reported).
+    pub(crate) compaction_failure: Option<MemoryError>,
+}
+
+impl From<MemoryError> for RememberFailure {
+    fn from(error: MemoryError) -> Self {
+        Self {
+            error,
+            turn_saved: false,
+            compaction_failure: None,
+        }
+    }
 }
 
 /// M1-T07.1 M2: strips every control character (this is what actually
