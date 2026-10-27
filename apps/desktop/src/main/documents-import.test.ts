@@ -5,7 +5,7 @@
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import type { ChildProcess } from 'node:child_process'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { importFile, type Spawner } from './documents-import'
 
 const EP = { port: 4321, token: 'tok-secret' }
@@ -96,9 +96,38 @@ describe('importFile through agent24 documents import', () => {
   it('an exit with no result, or a result that does not fit, is invalid_response; stderr is never shown', async () => {
     const none = await importFile('/a.pdf', () => EP, () => {}, fakeCli([progress(0, 5)], { stderr: '/Users/me/a.pdf' }).spawn, 'agent24')
     expect(none).toEqual({ ok: false, status: 502, error: { code: 'invalid_response', message: 'the documents tool ended without a result' } })
-    for (const bad of [{ ok: true, status: 200 }, { ok: false, status: 409, error: { code: 1 } }, { ok: false, status: 409 }]) {
+    for (const bad of [
+      { ok: true, status: 200 },
+      { ok: true, status: 500, data: false },
+      { ok: true, status: 200, data: 'job' },
+      { ok: true, status: 302, data: JOB },
+      { ok: false, status: 200, error: { code: 'x', message: 'y' } },
+      { ok: false, status: 409, error: { code: 1 } },
+      { ok: false, status: 409 },
+    ]) {
       const res = await importFile('/a.pdf', () => EP, () => {}, fakeCli([result(bad)]).spawn, 'agent24')
       expect(res).toEqual({ ok: false, status: 502, error: { code: 'invalid_response', message: 'the documents tool gave a result that does not fit' } })
+    }
+  })
+
+  it('a progress listener that throws loses neither the result nor the next progress', async () => {
+    let calls = 0
+    const cli = fakeCli([progress(0, 10), progress(10, 10), result({ ok: true, status: 202, data: JOB })])
+    const throwing = (): void => {
+      calls += 1
+      throw new Error('window gone')
+    }
+    expect(await importFile('/a.pdf', () => EP, throwing, cli.spawn, 'agent24')).toEqual({ ok: true, status: 202, data: JOB })
+    expect(calls).toBe(2)
+  })
+
+  it('stderr goes to no log either', async () => {
+    const spies = (['log', 'info', 'warn', 'error', 'debug'] as const).map((m) => vi.spyOn(console, m).mockImplementation(() => {}))
+    try {
+      await importFile('/a.pdf', () => EP, () => {}, fakeCli([], { stderr: '/Users/me/secret.pdf\n' }).spawn, 'agent24')
+      for (const spy of spies) expect(spy).not.toHaveBeenCalled()
+    } finally {
+      for (const spy of spies) spy.mockRestore()
     }
   })
 

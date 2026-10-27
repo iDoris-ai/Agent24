@@ -67,10 +67,18 @@ export function runDocumentsCli(
       if (parsed === null || typeof parsed !== 'object') return
       const { type, sent, total, ok, status, data, error } = parsed as Record<string, unknown>
       if (type === 'progress' && Number.isSafeInteger(sent) && Number.isSafeInteger(total)) {
-        onProgress({ sent: sent as number, total: total as number })
+        // A throwing listener must not lose the result line still to come.
+        try {
+          onProgress({ sent: sent as number, total: total as number })
+        } catch {
+          /* the next progress line tries again */
+        }
       } else if (type === 'result' && typeof ok === 'boolean' && Number.isInteger(status)) {
-        if (ok && data !== undefined && data !== null) result = { ok: true, status: status as number, data: data as never }
-        else if (!ok && isError(error)) result = { ok: false, status: status as number, error }
+        const code = status as number
+        // A resource is a JSON object with a 2xx; an error, its envelope with a 4xx or 5xx.
+        if (ok && code >= 200 && code < 300 && typeof data === 'object' && data !== null) {
+          result = { ok: true, status: code, data: data as never }
+        } else if (!ok && code >= 400 && code < 600 && isError(error)) result = { ok: false, status: code, error }
         else result = fail(502, 'invalid_response', 'the documents tool gave a result that does not fit')
       }
     }
