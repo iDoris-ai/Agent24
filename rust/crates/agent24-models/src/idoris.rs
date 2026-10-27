@@ -55,6 +55,27 @@ fn response_error(error: ModelError) -> ModelError {
     }
 }
 
+/// Reads at most 4 KiB of a 503 body; only the fixed `reason_code` is consulted,
+/// nothing else from the body is ever surfaced.
+async fn local_only_unavailable(mut response: reqwest::Response) -> bool {
+    let mut body = Vec::new();
+    while body.len() < 4096 {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    body.truncate(4096);
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return false;
+    };
+    value
+        .pointer("/error/reason_code")
+        .or_else(|| value.get("reason_code"))
+        .and_then(|v| v.as_str())
+        == Some("local_only_unavailable")
+}
+
 impl IdorisClient {
     pub(crate) fn from_env() -> Result<Self, String> {
         let raw = std::env::var("IDORIS_URL").map_err(|_| "invalid IDORIS_URL")?;
@@ -102,15 +123,25 @@ impl IdorisClient {
         };
         let status = response.status();
         if !status.is_success() {
-            if status.is_server_error() || status.as_u16() == 429 {
+            let code = status.as_u16();
+            if code == 503 && local_only_unavailable(response).await {
+                return Err(ModelError::Unavailable(
+                    "no local model available in iDoris (local_only_unavailable)".into(),
+                ));
+            }
+            if status.is_server_error() || code == 429 {
                 return Err(ModelError::Unavailable(format!(
-                    "iDoris unavailable (HTTP {})",
-                    status.as_u16()
+                    "iDoris unavailable (HTTP {code})"
                 )));
             }
+            let message = match code {
+                401 => "iDoris rejected the data key (HTTP 401): check IDORIS_API_KEY".to_string(),
+                403 => "iDoris refused this role for the data key (HTTP 403): check the key's role scope or IDORIS_API_KEY".to_string(),
+                _ => format!("iDoris refused the request (HTTP {code})"),
+            };
             return Err(ModelError::Rejected {
-                status: status.as_u16(),
-                message: format!("iDoris refused the request (HTTP {})", status.as_u16()),
+                status: code,
+                message,
             });
         }
         Ok(response)
@@ -436,6 +467,85 @@ mod tests {
         }
         for control in ["bad\u{0000}id", "bad\u{007F}id", "bad\u{0085}id", "a\nb"] {
             assert_eq!(correlation_trace_id(control), None, "{control:?}");
+        }
+    }
+
+    async fn status_server(status: u16, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0_u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(format!("HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+            }
+        });
+        url
+    }
+
+    async fn error_for(status: u16, body: &'static str) -> ModelError {
+        let url = status_server(status, body).await;
+        let gateway = IdorisClient {
+            base: reqwest::Url::parse(&url).unwrap(),
+            key: HeaderValue::from_static("Bearer idk_secret_fixture_key"),
+            client: base_client_builder().no_proxy().build().unwrap(),
+            request_timeout: Duration::from_secs(5),
+        };
+        let request = gateway.client.get(&url);
+        gateway
+            .send(request, &CancellationToken::new())
+            .await
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn status_401_points_at_the_data_key() {
+        match error_for(401, "{}").await {
+            ModelError::Rejected { status, message } => {
+                assert_eq!(status, 401);
+                assert!(message.contains("IDORIS_API_KEY"), "{message}");
+                assert!(!message.contains("idk_"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn status_403_points_at_the_role() {
+        match error_for(403, r#"{"error":{"code":"VIRTUAL_KEY_ROLE_FORBIDDEN"}}"#).await {
+            ModelError::Rejected { status, message } => {
+                assert_eq!(status, 403);
+                assert!(message.contains("role"), "{message}");
+                assert!(!message.contains("idk_"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn status_503_local_only_unavailable_names_missing_local_model() {
+        match error_for(
+            503,
+            r#"{"error":{"reason_code":"local_only_unavailable","detail":"LEAK"}}"#,
+        )
+        .await
+        {
+            ModelError::Unavailable(message) => {
+                assert!(message.contains("no local model"), "{message}");
+                assert!(!message.contains("LEAK"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        for body in [
+            r#"{"error":{"reason_code":"other","detail":"LEAK"}}"#,
+            "not json",
+        ] {
+            match error_for(503, body).await {
+                ModelError::Unavailable(message) => {
+                    assert_eq!(message, "iDoris unavailable (HTTP 503)")
+                }
+                other => panic!("{other:?}"),
+            }
         }
     }
 
