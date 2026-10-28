@@ -3,8 +3,11 @@
 //! The public surface is re-exported here so callers continue to use
 //! `crate::capabilities` while the implementation is organized by concern.
 
+pub mod delegation;
+pub mod first_party;
 mod mint;
 mod operations;
+pub mod presence;
 mod revoke;
 mod route_policy;
 mod store;
