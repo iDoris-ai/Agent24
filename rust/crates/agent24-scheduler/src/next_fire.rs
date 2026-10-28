@@ -15,6 +15,8 @@ pub const MAX_EVERY_SECS: u32 = 86_400;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SpecError {
+    #[error("at timestamp is more than 60 seconds in the past")]
+    PastAt,
     #[error("invalid schedule: {0}")]
     Invalid(String),
 }
@@ -75,6 +77,28 @@ pub fn validate(spec: &ScheduleSpec) -> Result<(), SpecError> {
     }
 }
 
+/// Shared by REST CRUD and self_wake; allow at most 60 seconds of clock skew.
+pub fn validate_at_time(spec: &ScheduleSpec, now: DateTime<Utc>) -> Result<(), SpecError> {
+    if let ScheduleSpec::At { ts } = spec
+        && parse_iso(ts)? < now - chrono::Duration::seconds(60)
+    {
+        return Err(SpecError::PastAt);
+    }
+    Ok(())
+}
+
+/// Initial slots within the skew allowance must remain runnable.
+pub fn initial_fire(
+    spec: &ScheduleSpec,
+    now: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>, SpecError> {
+    validate_at_time(spec, now)?;
+    match spec {
+        ScheduleSpec::At { ts } => Ok(Some(parse_iso(ts)?.max(now))),
+        _ => next_fire(spec, now),
+    }
+}
+
 /// The next firing strictly after `after`, or `None` when the spec will never
 /// fire again (a one-shot `at` already in the past). `after` is the reference
 /// instant — passing "now" gives skip-missed semantics (a schedule that lay
@@ -125,6 +149,24 @@ mod tests {
 
     fn utc(s: &str) -> DateTime<Utc> {
         parse_iso(s).unwrap()
+    }
+
+    #[test]
+    fn at_time_skew_boundary_and_initial_slot() {
+        let now = utc("2026-07-24T10:00:00Z");
+        for ts in [
+            "2026-07-24T09:59:00Z",
+            "2026-07-24T11:59:00+02:00",
+            "2026-07-24T10:00:00Z",
+        ] {
+            let spec = ScheduleSpec::At { ts: ts.into() };
+            assert!(validate_at_time(&spec, now).is_ok());
+            assert_eq!(initial_fire(&spec, now).unwrap(), Some(now));
+        }
+        let old = ScheduleSpec::At {
+            ts: "2026-07-24T09:58:59Z".into(),
+        };
+        assert_eq!(validate_at_time(&old, now), Err(SpecError::PastAt));
     }
 
     #[test]

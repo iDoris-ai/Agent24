@@ -157,4 +157,15 @@ describe('COMM typed backend API', () => {
     await expect(unlockComm(password)).rejects.toThrow('Unlock request failed')
     expect(proxy).toHaveBeenCalledTimes(1)
   })
+
+  it('real daemon error shape {ok:false,error:code,message} keeps both the code and the message', async () => {
+    setProxy(() => ({
+      ok: false,
+      status: 409,
+      data: { ok: false, error: 'not_configured', message: 'no Hyphae binary is configured; set A24_HYPHAE_BIN' },
+    }))
+    const failure = await listCommIdentities().catch((e: unknown) => e)
+    expect(failure).toBeInstanceOf(CommApiError)
+    expect(failure).toMatchObject({ code: 'not_configured', message: 'no Hyphae binary is configured; set A24_HYPHAE_BIN', status: 409 })
+  })
 })
