@@ -2,6 +2,7 @@
 
 pub mod download;
 pub mod install;
+pub mod supervisor;
 
 use semver::Version;
 use serde::Deserialize;

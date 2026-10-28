@@ -14,12 +14,20 @@ url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 sha2 = "0.10"
 subtle = "2"
-tokio = { version = "1", features = ["macros", "rt", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "time", "process", "io-util", "sync"] }
 tokio-util = "0.7"
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
 fs2 = "0.4"
 tempfile = "3"
+zeroize = "1"
+nix = { version = "0.31", features = ["signal", "process", "user"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = "0.14"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "test-util"] }
 
 [lints]
 workspace = true
