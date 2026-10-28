@@ -42,7 +42,7 @@
 | P2 | CI-HYB | CI 没有设 `HYPHAE_TEST_BIN`，`groupchat_real_binary` 在 CI 里被跳过；改为用 `Reproduce Hyphae linux-x64` 产物跑 | #1431 R4 | COMM | S |
 | P1 | AE-PAIR | AgentEar 在桌面端开着时配对失败：capabilities 模式下 daemon.json 没有 bearer，CLI attach 报 host authority unavailable。jason 10-28 拍板：不做临时修复，走 CORE-2 每客户端 enroll（ab/core）进 main 解决 | 10-28 人工测试 | ab/core CORE-2 | M |
 | P2 | SW-1 | `self_wake` 工具接受过去时间（模型常编 2026-07-28），导致立刻触发；上限只数未触发行，已触发 at 行永不回收（本机 200 条）。拒绝过去时间或钳到 now+ε；daemon 侧对已触发 at 行做保留期回收 | #1434 调查 | ab/core | S |
-| P1 | ID-HR | iDoris v0.4.0：503 必须先看 reason_code，`headroom_confirmation_required` 时去问用户并带 `X-iDoris-Headroom-Breach: confirmed` 重发，不得当普通 Unavailable 重试或换 provider；/capabilities 1.1 字段（degraded_alternative(s)、headroom_breach_option 含 quant、备选含 capability） | idoris-25 10-28 | ab/idoris | M |
+| P1 | ID-HR | iDoris v0.4.0：503 必须先看 reason_code，`headroom_confirmation_required` 时去问用户并带 `X-iDoris-Headroom-Breach: confirmed` 重发，不得当普通 Unavailable 重试或换 provider；/capabilities 1.1 字段（degraded_alternative(s)、headroom_breach_option 含 quant、备选含 capability）；另：503 `supervisor_busy` = 同模型正以不同余量确认加载中，稍后用同一请求头重试、不问用户；`headroom_breach_option` 按「哪个条目带该字段」定位，不按 resident:true 找，快照内最多一次（iDoris#586/#587） | idoris-25 10-28 | ab/idoris | M |
 | P2 | G-API-3b | `ApiErrorCode` 枚举统一 Rust/OpenAPI/桌面三处错误码清单 | C-07 | ab/core | M |
 | P2 | REV-05 | 记忆性能：FTS 重建离开 ready 路径、`content=''` 外部内容表、撤回删 FTS 行、`active_ids` 部分索引、`run_messages` 不再复制会话尾部、进程内走准入信号量 | R7 / P-04–07、P-12 | ab/memory-p1（c3b 之后） | L |
 | P2 | REV-06 | `serve()` 按启动阶段拆分，结构性测试改为阶段函数单测；MCP 与模块并行挂载 | R8 / A-01 / C-10 / P-09 | 随 CORE-5f/2e | L |
