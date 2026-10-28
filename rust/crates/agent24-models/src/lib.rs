@@ -19,7 +19,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 mod idoris;
-pub use idoris::IdorisEvidence;
+pub use idoris::{ConnectionVerification, IdorisEvidence, IdorisGateway};
 pub mod router;
 mod stream;
 

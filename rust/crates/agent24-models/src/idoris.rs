@@ -2,6 +2,7 @@
 use super::*;
 use crate::router::{Complexity, Served, TaskProfile, Tier};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdorisEvidence {
@@ -11,11 +12,19 @@ pub struct IdorisEvidence {
     pub origin_record_id: Option<String>,
 }
 
-pub(crate) struct IdorisClient {
+/// Validated, memory-only credentials and transport for a loopback iDoris origin.
+pub struct IdorisGateway {
     base: reqwest::Url,
     key: HeaderValue,
     client: reqwest::Client,
     request_timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionVerification {
+    pub model_id: String,
+    pub record_id: String,
+    pub locality: String,
 }
 
 #[derive(Deserialize)]
@@ -106,10 +115,16 @@ async fn error_fields(
     })
 }
 
-impl IdorisClient {
+impl IdorisGateway {
     pub(crate) fn from_env() -> Result<Self, String> {
         let raw = std::env::var("IDORIS_URL").map_err(|_| "invalid IDORIS_URL")?;
-        let base = reqwest::Url::parse(&raw).map_err(|_| "invalid IDORIS_URL")?;
+        let secret = std::env::var("IDORIS_API_KEY").map_err(|_| "missing iDoris data key")?;
+        Self::from_credentials(&raw, Zeroizing::new(secret))
+    }
+
+    /// Construct an exclusive loopback gateway without modifying process state.
+    pub fn from_credentials(url: &str, secret: Zeroizing<String>) -> Result<Self, String> {
+        let base = reqwest::Url::parse(url).map_err(|_| "invalid IDORIS_URL")?;
         if !crate::router::is_loopback_url(base.as_str())
             || !base.username().is_empty()
             || base.password().is_some()
@@ -119,12 +134,12 @@ impl IdorisClient {
         {
             return Err("IDORIS_URL must be a loopback HTTP(S) origin".into());
         }
-        let secret = std::env::var("IDORIS_API_KEY").map_err(|_| "missing iDoris data key")?;
         if !secret.starts_with("idk_") || secret.len() <= 4 {
             return Err("iDoris requires a virtual data key, not an Admin token".into());
         }
-        let mut key = HeaderValue::from_str(&format!("Bearer {secret}"))
-            .map_err(|_| "invalid iDoris data key")?;
+        let bearer = Zeroizing::new(format!("Bearer {}", secret.as_str()));
+        let mut key =
+            HeaderValue::from_str(bearer.as_str()).map_err(|_| "invalid iDoris data key")?;
         key.set_sensitive(true);
         let client = base_client_builder()
             .no_proxy()
@@ -213,7 +228,7 @@ impl IdorisClient {
         url
     }
 
-    async fn identity(&self, cancel: &CancellationToken) -> Result<(), ModelError> {
+    pub async fn check_health(&self, cancel: &CancellationToken) -> Result<(), ModelError> {
         let response = self
             .send(
                 self.client
@@ -242,6 +257,40 @@ impl IdorisClient {
         Ok(())
     }
 
+    /// Perform a real daily chat and return only validated inference evidence.
+    /// Headroom confirmation applies to this probe only and is never retained.
+    pub async fn verify_connection(
+        &self,
+        headroom_confirmed: bool,
+        cancel: &CancellationToken,
+    ) -> Result<ConnectionVerification, ModelError> {
+        let request = CompletionRequest {
+            messages: vec![Msg::user("Hi")],
+            model: None,
+            tools: vec![],
+            response_format: None,
+            max_tokens: std::num::NonZeroU32::new(1),
+            disable_thinking: true,
+            idoris_headroom_confirmed: headroom_confirmed,
+            temperature: None,
+            progress: None,
+        };
+        let served = self
+            .complete(TaskProfile::default(), &request, cancel, None)
+            .await?;
+        let evidence = served
+            .idoris
+            .ok_or_else(|| invalid("missing iDoris evidence"))?;
+        Ok(ConnectionVerification {
+            model_id: served
+                .response
+                .model_id
+                .ok_or_else(|| invalid("missing iDoris model"))?,
+            record_id: evidence.record_id,
+            locality: evidence.served_locality,
+        })
+    }
+
     pub(crate) async fn complete(
         &self,
         profile: TaskProfile,
@@ -264,7 +313,7 @@ impl IdorisClient {
         cancel: &CancellationToken,
         request_id: Option<&str>,
     ) -> Result<Served, ModelError> {
-        self.identity(cancel).await?;
+        self.check_health(cancel).await?;
         let (complexity, role) = match profile.complexity {
             Complexity::Simple => ("simple", "idoris/daily"),
             Complexity::Complex => ("complex", "idoris/deep"),
@@ -380,7 +429,7 @@ impl IdorisClient {
         &self,
         cancel: &CancellationToken,
     ) -> Result<Vec<Model>, ModelError> {
-        self.identity(cancel).await?;
+        self.check_health(cancel).await?;
         let response = self
             .send(
                 self.client
@@ -453,7 +502,7 @@ mod tests {
     async fn hanging_gateway(
         busy: bool,
     ) -> (
-        IdorisClient,
+        IdorisGateway,
         tokio::sync::oneshot::Receiver<()>,
         tokio::task::JoinHandle<()>,
     ) {
@@ -502,7 +551,7 @@ mod tests {
                 socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
             }
         });
-        let gateway = IdorisClient {
+        let gateway = IdorisGateway {
             base,
             key: HeaderValue::from_static("Bearer idk_fixture"),
             client: base_client_builder()
@@ -517,7 +566,7 @@ mod tests {
 
     async fn pending_call(
         cancel: CancellationToken,
-        gateway: IdorisClient,
+        gateway: IdorisGateway,
     ) -> Result<Served, ModelError> {
         let request = CompletionRequest {
             messages: vec![Msg::user("fixture")],
@@ -611,7 +660,7 @@ mod tests {
 
     async fn error_for(status: u16, body: &'static str) -> ModelError {
         let url = status_server(status, body).await;
-        let gateway = IdorisClient {
+        let gateway = IdorisGateway {
             base: reqwest::Url::parse(&url).unwrap(),
             key: HeaderValue::from_static("Bearer idk_secret_fixture_key"),
             client: base_client_builder().no_proxy().build().unwrap(),
@@ -698,7 +747,7 @@ mod tests {
                 .unwrap();
             std::future::pending::<()>().await;
         });
-        let gateway = IdorisClient {
+        let gateway = IdorisGateway {
             base: reqwest::Url::parse(&url).unwrap(),
             key: HeaderValue::from_static("Bearer idk_fixture"),
             client: base_client_builder().no_proxy().build().unwrap(),
@@ -776,7 +825,7 @@ mod tests {
                 .unwrap();
             std::future::pending::<()>().await;
         });
-        let gateway = IdorisClient {
+        let gateway = IdorisGateway {
             base: reqwest::Url::parse(&url).unwrap(),
             key: HeaderValue::from_static("Bearer idk_fixture"),
             client: base_client_builder().no_proxy().build().unwrap(),
