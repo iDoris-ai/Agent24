@@ -13,7 +13,9 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 pub const TOKEN_TTL: u64 = 3600;
 const GRANT_TTL: u64 = 60;
@@ -30,12 +32,12 @@ struct Grant {
     challenge_id: String,
     token_id: String,
     target: Target,
-    expires_at: UnixSeconds,
+    expires_at: Instant,
 }
 struct AttachedSummary {
     target: Target,
     summary: String,
-    expires_at: UnixSeconds,
+    expires_at: Instant,
 }
 
 pub struct FirstPartyAuthority {
@@ -57,7 +59,12 @@ impl FirstPartyAuthority {
     }
     /// Derive display context from the rejected HTTP request itself. The
     /// frozen UDS frame carries only a hash, never the body or a trusted name.
-    pub fn remember_attached_request(&self, token_id: &str, bytes: &[u8]) {
+    pub fn remember_attached_request(
+        &self,
+        token_id: &str,
+        bytes: &[u8],
+        registrations: &[agent24_protocol::AttachedView],
+    ) {
         let Ok(body) = serde_json::from_slice::<agent24_protocol::AttachedAddRequest>(bytes) else {
             return;
         };
@@ -67,7 +74,7 @@ impl FirstPartyAuthority {
         let Ok(mut summaries) = self.attached_summaries.lock() else {
             return;
         };
-        let now = unix_now();
+        let now = Instant::now();
         summaries.retain(|_, s| s.expires_at > now);
         if summaries.len() >= 128
             && let Some(oldest) = summaries
@@ -88,12 +95,14 @@ impl FirstPartyAuthority {
                     body_sha256: body_digest(bytes),
                 },
                 summary: format!(
-                    "register attached module '{}'; model_access: {}; kernel_capabilities: [{}]; host_commands: [{}]",
-                    manifest.name(), manifest.model_access().as_str(),
+                    "register attached module '{}'; {}; allow_relax: {}; model_access: {}; kernel_capabilities: [{}]; host_commands: [{}]",
+                    manifest.name(),
+                    if registrations.iter().any(|r| r.name == manifest.name()) { "replace existing registration" } else { "new registration" },
+                    body.allow_relax, manifest.model_access().as_str(),
                     manifest.kernel_capabilities().iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", "),
                     manifest.host_commands().join(", "),
                 ),
-                expires_at: now + GRANT_TTL,
+                expires_at: now + Duration::from_secs(GRANT_TTL),
             },
         );
     }
@@ -109,7 +118,7 @@ impl FirstPartyAuthority {
                 .lock()
                 .ok()?
                 .get(token_id)
-                .filter(|s| s.expires_at > unix_now() && s.target == *target)
+                .filter(|s| s.expires_at > Instant::now() && s.target == *target)
                 .map(|s| s.summary.clone());
         }
         if target.body_sha256 != body_digest(b"") {
@@ -159,7 +168,7 @@ impl FirstPartyAuthority {
             return Err(EnrollErrorCode::NotEnrolled);
         }
         if record.revoked
-            || record.claims.expires_at <= unix_now()
+            || record.expired(unix_now())
             || record.claims.daemon_generation != self.store.daemon_generation()
             || !peer_live(peer)
         {
@@ -192,7 +201,7 @@ impl FirstPartyAuthority {
                 .get(&digest)
                 .ok_or(EnrollErrorCode::NotEnrolled)?;
             if record.revoked
-                || record.claims.expires_at <= unix_now()
+                || record.expired(unix_now())
                 || record.claims.first_party.as_ref().map(|c| &c.peer) != Some(peer)
             {
                 return Err(EnrollErrorCode::NotEnrolled);
@@ -219,6 +228,7 @@ impl FirstPartyAuthority {
                     first_party: Some(FirstPartyClaims {
                         peer: peer.clone(),
                         tier: FirstPartyTier::Daily,
+                        deadline: Instant::now() + Duration::from_secs(TOKEN_TTL),
                     }),
                     workspace_id: None,
                     attachment_id: None,
@@ -254,7 +264,7 @@ impl FirstPartyAuthority {
         );
         Ok(IssuedToken {
             token_id,
-            secret,
+            secret: Zeroizing::new(secret),
             expires_in: TOKEN_TTL,
         })
     }
@@ -264,7 +274,7 @@ impl FirstPartyAuthority {
         };
         // Linearize token liveness and grant consumption with revocation and
         // renewal. HTTP's earlier check alone leaves a revocation race.
-        let Ok(state) = self.store.shared.state.lock() else {
+        let Ok(mut state) = self.store.shared.state.lock() else {
             return false;
         };
         let Some(record) = state
@@ -274,12 +284,21 @@ impl FirstPartyAuthority {
         else {
             return false;
         };
+        if record
+            .claims
+            .first_party
+            .as_ref()
+            .is_some_and(|c| !peer_live(&c.peer))
+        {
+            if let Some(key) = state.ids.remove(token_id) {
+                state.records.remove(&key);
+            }
+            state.epoch = state.epoch.wrapping_add(1);
+            let _ = self.store.shared.changed.send(state.epoch);
+            return false;
+        }
         if record.claims.audience != Audience::FirstPartyShell
-            || !record
-                .claims
-                .first_party
-                .as_ref()
-                .is_some_and(|claims| peer_live(&claims.peer))
+            || record.claims.first_party.is_none()
             || self
                 .store
                 .validate_record(
@@ -296,7 +315,7 @@ impl FirstPartyAuthority {
         let Ok(mut grants) = self.grants.lock() else {
             return false;
         };
-        grants.retain(|_, grant| grant.expires_at > now);
+        grants.retain(|_, grant| grant.expires_at > Instant::now());
         let key = digest(&token);
         let valid = grants
             .get(&key)
@@ -309,8 +328,17 @@ impl FirstPartyAuthority {
         valid
     }
 }
-fn peer_live(peer: &EnrolledPeer) -> bool {
-    agent24_os_proc::is_alive(peer.pid)
+pub(crate) fn peer_live(peer: &EnrolledPeer) -> bool {
+    let audit_live = match peer.identity.audit_token {
+        Some(token) => {
+            token.pid() == peer.pid
+                && token.euid() == peer.uid
+                && agent24_os_proc::audit_token_is_live(token)
+        }
+        None => cfg!(test),
+    };
+    audit_live
+        && agent24_os_proc::is_alive(peer.pid)
         && agent24_os_proc::start_time(peer.pid)
             .is_ok_and(|s| s.sec == peer.start.sec && s.usec == peer.start.usec)
 }
@@ -359,6 +387,21 @@ impl EnrollAuthority for FirstPartyAuthority {
     fn issue(&self, peer: &EnrolledPeer) -> Result<IssuedToken, EnrollErrorCode> {
         self.mint(peer, None)
     }
+    fn revoke(&self, peer: &EnrolledPeer, id: &str) {
+        if let Ok(mut state) = self.store.shared.state.lock()
+            && let Some(key) = state.ids.get(id).copied()
+            && state
+                .records
+                .get(&key)
+                .and_then(|r| r.claims.first_party.as_ref())
+                .is_some_and(|c| &c.peer == peer)
+        {
+            state.ids.remove(id);
+            state.records.remove(&key);
+            state.epoch = state.epoch.wrapping_add(1);
+            let _ = self.store.shared.changed.send(state.epoch);
+        }
+    }
     fn renew(&self, peer: &EnrolledPeer, id: &str) -> Result<IssuedToken, EnrollErrorCode> {
         self.mint(peer, Some(id))
     }
@@ -374,6 +417,7 @@ impl EnrollAuthority for FirstPartyAuthority {
         let target = resolve_target(&request)?;
         let challenge_id = random_capability_id()[..16].to_owned();
         let expires_at = unix_now() + GRANT_TTL;
+        let deadline = Instant::now() + Duration::from_secs(GRANT_TTL);
         let details = self
             .target_summary(id, &target)
             .ok_or(EnrollErrorCode::NotElevatedOperation)?;
@@ -413,12 +457,12 @@ impl EnrollAuthority for FirstPartyAuthority {
             PresenceOutcome::Unavailable => return Err(EnrollErrorCode::PresenceUnavailable),
             PresenceOutcome::TimedOut => return Err(EnrollErrorCode::PresenceTimeout),
         }
-        if unix_now() >= expires_at {
+        if Instant::now() >= deadline {
             return Err(EnrollErrorCode::PresenceTimeout);
         }
         self.live_peer(peer, id)?;
         let secret = CapabilityToken::random();
-        let now = unix_now();
+        let now = Instant::now();
         let mut grants = self.grants.lock().map_err(|_| EnrollErrorCode::Internal)?;
         grants.retain(|_, g| g.expires_at > now);
         grants.insert(
@@ -427,12 +471,12 @@ impl EnrollAuthority for FirstPartyAuthority {
                 challenge_id: challenge_id.clone(),
                 token_id: id.to_owned(),
                 target,
-                expires_at: now + GRANT_TTL,
+                expires_at: now + Duration::from_secs(GRANT_TTL),
             },
         );
         Ok(ElevationGrant {
             challenge_id,
-            secret: secret.bearer(),
+            secret: Zeroizing::new(secret.bearer()),
             expires_in: GRANT_TTL,
         })
     }
@@ -464,6 +508,7 @@ pub(crate) fn test_peer(generation: &str) -> EnrolledPeer {
             identifier: "agent24".into(),
             team_id: "HYAP444FN9".into(),
             executable: std::env::current_exe().unwrap_or_default(),
+            audit_token: None,
         },
         generation: generation.into(),
     }
@@ -502,15 +547,84 @@ mod tests {
         peer: &EnrolledPeer,
         id: &str,
     ) -> ElevationGrant {
-        authority.remember_attached_request(id, &attached_body());
+        authority.remember_attached_request(id, &attached_body(), &[]);
         let (tx, _rx) = tokio::sync::oneshot::channel();
         authority
             .elevate(peer, id, request(), tx, CancellationToken::new())
             .await
             .unwrap()
     }
+    #[tokio::test(start_paused = true)]
+    async fn daily_token_ttl_ignores_wall_clock_jumps() {
+        let store = CapabilityStore::new("g");
+        let authority = FirstPartyAuthority::new(store.clone());
+        let token = authority.issue(&test_peer("g")).unwrap();
+        assert!(
+            store
+                .require_live_bearer(&token.secret, unix_now() + TOKEN_TTL * 100)
+                .is_ok()
+        );
+        assert!(
+            store
+                .validate_bearer(
+                    &token.secret,
+                    Operation::ModelsRead,
+                    &Resource::global(),
+                    unix_now() + TOKEN_TTL * 100
+                )
+                .is_ok()
+        );
+        tokio::time::advance(Duration::from_secs(TOKEN_TTL)).await;
+        assert!(store.require_live_bearer(&token.secret, 0).is_err());
+        assert!(
+            store
+                .validate_bearer(&token.secret, Operation::ModelsRead, &Resource::global(), 0)
+                .is_err()
+        );
+        assert!(authority.renew(&test_peer("g"), &token.token_id).is_err());
+    }
     #[test]
-    fn daily_claims_ttl_scope_and_atomic_renewal() {
+    fn attached_summary_discloses_relax_and_registration_kind() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let mut body: serde_json::Value = serde_json::from_slice(&attached_body()).unwrap();
+        for allow in [false, true] {
+            body["allow_relax"] = allow.into();
+            let bytes = serde_json::to_vec(&body).unwrap();
+            authority.remember_attached_request("id", &bytes, &[]);
+            let mut req = request();
+            req.body_sha256 = body_digest(&bytes);
+            let summary = authority
+                .target_summary("id", &resolve_target(&req).unwrap())
+                .unwrap();
+            assert!(
+                summary.contains(&format!("allow_relax: {allow}")),
+                "{summary}"
+            );
+            assert!(summary.contains("new registration"), "{summary}");
+            let registered = agent24_protocol::AttachedView {
+                name: "agentear".into(),
+                manifest_digest: String::new(),
+                token_id: String::new(),
+                created_at: String::new(),
+                attach_status: "detached".into(),
+                generation: None,
+            };
+            authority.remember_attached_request("id", &bytes, &[registered]);
+            let summary = authority
+                .target_summary("id", &resolve_target(&req).unwrap())
+                .unwrap();
+            assert!(
+                summary.contains("replace existing registration"),
+                "{summary}"
+            );
+            assert!(
+                summary.contains(&format!("allow_relax: {allow}")),
+                "{summary}"
+            );
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn daily_claims_ttl_scope_and_atomic_renewal() {
         let store = CapabilityStore::new("g");
         let authority = FirstPartyAuthority::new(store.clone());
         let peer = test_peer("g");
@@ -529,16 +643,6 @@ mod tests {
             FirstPartyTier::Daily
         );
         assert_eq!(auth.claims.expires_at - auth.claims.created_at, 3600);
-        assert!(
-            store
-                .validate_bearer(
-                    &old.secret,
-                    Operation::ModelsRead,
-                    &Resource::global(),
-                    auth.claims.expires_at
-                )
-                .is_err()
-        );
         assert!(
             store
                 .validate_bearer(
@@ -648,7 +752,7 @@ mod tests {
                 .contains_key(&token.token_id)
         );
     }
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn grants_bind_every_target_field_expire_and_consume_once() {
         let store = CapabilityStore::new("g");
         let authority = Arc::new(FirstPartyAuthority::new(store));
@@ -681,7 +785,27 @@ mod tests {
         let two = std::thread::spawn(move || b.consume(&secret, &id, &t, unix_now()));
         assert_ne!(one.join().unwrap(), two.join().unwrap());
         let expired = self::grant(&authority, &peer, &token.token_id).await;
-        assert!(!authority.consume(&expired.secret, &token.token_id, &target, unix_now() + 60));
+        tokio::time::advance(Duration::from_secs(GRANT_TTL)).await;
+        assert!(!authority.consume(&expired.secret, &token.token_id, &target, 0));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn grant_ttl_ignores_wall_clock_jumps() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        authority.set_provider(Some(Arc::new(Provider(PresenceOutcome::Allowed))));
+        let peer = test_peer("g");
+        let token = authority.issue(&peer).unwrap();
+        let first = grant(&authority, &peer, &token.token_id).await;
+        let target = resolve_target(&request()).unwrap();
+        assert_eq!(first.expires_in, GRANT_TTL);
+        assert!(authority.consume(
+            &first.secret,
+            &token.token_id,
+            &target,
+            unix_now() + TOKEN_TTL * 100
+        ));
+        let expired = grant(&authority, &peer, &token.token_id).await;
+        tokio::time::advance(Duration::from_secs(GRANT_TTL)).await;
+        assert!(!authority.consume(&expired.secret, &token.token_id, &target, 0));
     }
     #[tokio::test]
     async fn revoked_tokens_cannot_consume_grants() {
@@ -705,7 +829,7 @@ mod tests {
         let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
         let peer = test_peer("g");
         let token = authority.issue(&peer).unwrap();
-        authority.remember_attached_request(&token.token_id, &attached_body());
+        authority.remember_attached_request(&token.token_id, &attached_body(), &[]);
         for (outcome, code) in [
             (PresenceOutcome::Denied, EnrollErrorCode::PresenceDenied),
             (

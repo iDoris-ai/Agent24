@@ -72,19 +72,19 @@ Unix 端点固定为 `<data_dir>/enroll.sock`，socket 权限明确设为 0600�
 
 握手采用 UDS 上的独立版本化协议，不占 HTTP 路由。建议一行 JSON 一帧，上限 16 KiB，普通握手阶段超时 5 秒。只有等待人工配对码的阶段可延长到 5 分钟。未知版本、超长帧、断线、超时均关闭连接，不发令牌。
 
-1. accept 后用 tokio `peer_cred()` 取 uid 与 `UCred::pid()`。uid 必须等于 daemon 的 euid，pid 缺失即拒绝，不能采信客户端 JSON 里的 pid。
+1. accept 后用 tokio `peer_cred()` 取 uid 与 `UCred::pid()`；macOS 同时用 `getsockopt(fd, SOL_LOCAL, LOCAL_PEERTOKEN)` 捕获 audit token（含 pidversion），核对其 uid/pid 与凭据一致。uid 必须等于 daemon 的 euid，pid 缺失即拒绝，不能采信客户端 JSON 里的 pid。
 2. daemon 读取进程启动时间，生成连接 id 与随机挑战。响应包含协议版本、generation 和挑战。客户端核对发现文件 generation，禁止跨代继续握手。
 3. daemon 解析可执行路径并校验身份，生成身份摘要。校验来源包括以下平台分支或一次性退路，摘要记录采用哪一种。
-4. 发令牌前再读启动时间并复核身份。pid 与启动时间必须与初次观察一致。登记绑定此连接和 `(pid, start_time)`。2b 在该连接返回一方令牌。
+4. 发令牌前再读启动时间，并用 accept 时捕获的同一 audit token 复核身份。pid、启动时间与 pidversion 必须与初次观察一致。登记绑定此连接、audit token 和 `(pid, start_time)`。2b 在该连接返回一方令牌。
 5. 登记通道可承载续期、提升挑战和确认消息。连接断开不等于进程退出，也不停止 daemon；重连必须重新核验，不能凭旧连接 id 恢复权限。
 
-macOS 路径解析固定用 `proc_pidpath`。仿照 `agent24-os-fd` 新建独立小 crate，默认 deny unsafe，只在这个调用的窄封装允许 unsafe。其他 crate 保持 forbid。签名校验直接声明 `security-framework` 依赖，按 pid 构造 `SecCode`，执行 requirement：
+macOS 路径解析固定用 `proc_pidpath`。仿照 `agent24-os-fd` 新建独立小 crate，默认 deny unsafe，只在这个调用的窄封装允许 unsafe。其他 crate 保持 forbid。签名校验直接声明 `security-framework` 依赖，用 `kSecGuestAttributeAudit` 按原 audit token 构造 `SecCode`，执行 requirement：
 
 ```text
 anchor apple generic and certificate leaf[subject.OU] = "HYAP444FN9"
 ```
 
-并检查签名 identifier 在白名单内：桌面 `ai.auraai.agent24`、`agent24`、`agent24d`。这是签名 identifier，不是文件名匹配。路径与 SecCode 指向的对象必须一致。文件改名、处于安装目录或同 Team ID 的其他程序均不足以登记。发布产物的实际 identifier 要由 DEP-B 验证，不能反向扩大白名单。
+同时要求运行进程的签名 flags 含 `CS_RUNTIME`，并检查签名 identifier 在白名单内：桌面 `ai.auraai.agent24`、`agent24`、`agent24d`。这是签名 identifier，不是文件名匹配。路径与 SecCode 指向的对象必须一致。文件改名、处于安装目录或同 Team ID 的其他程序均不足以登记。发布产物的实际 identifier 要由 DEP-B 验证，不能反向扩大白名单。
 
 Linux 读取 `/proc/<pid>/exe`，对所指对象计算哈希，比较安装包附带的签名哈希清单。先验证清单签名与可信签发者，再比较二进制哈希。只有路径属主正确不够。清单验签与可信公钥部署属于发布依赖，不从待校验清单自取信任根。Windows 的 Authenticode、命名管道和 PID→SID 留给 PLT-WIN，不用 Unix 桩宣称已支持。
 
@@ -97,9 +97,9 @@ FD 格式依据 facts §2.4；这里交付的是登记权，不是 iDoris Admin 
 
 ### D6 一方令牌与 ProductHost 修订
 
-新增 `Audience::FirstPartyShell`。claims 增加 pid、start_time、身份摘要和基础等级。身份摘要包括平台验证结果或退路类型，不包含配对码。令牌 TTL 为 1 小时，可续期，内存只存摘要，不落普通文件，不进 argv、env、ready stdout、日志或 renderer。
+新增 `Audience::FirstPartyShell`。claims 增加 pid、start_time、audit token（macOS 含 pidversion）、身份摘要和基础等级。身份摘要包括平台验证结果或退路类型，不包含配对码。令牌 TTL 为 1 小时，以单调时钟判定，可续期，内存只存摘要，不落普通文件，不进 argv、env、ready stdout、日志或 renderer。
 
-FirstPartyShell 必须检查 allowed_operations 与资源，不能沿用 ProductHost 跳过这两项检查的分支。允许某个 Operation 只表示可以请求该操作，提升级仍须 D4 授权。每次请求和续期都检查绑定进程仍存活且启动时间一致，无法确认就拒绝。进程退出后令牌无效，不等到 TTL。续期前重验身份，签发新令牌并原子撤销旧令牌，旧提升授权随之失效；续期不能提升基础等级。事件流每次发送前的复验和断开仍由 G-API-4 交付。
+FirstPartyShell 必须检查 allowed_operations 与资源，不能沿用 ProductHost 跳过这两项检查的分支。允许某个 Operation 只表示可以请求该操作，提升级仍须 D4 授权。每次请求和续期都检查绑定进程仍存活（排除僵尸）、启动时间一致，并复核原 audit token 的 pidversion，无法确认就拒绝。进程退出或 exec 后拒绝并删除令牌，不等到 TTL。续期前重验身份，签发新令牌并原子撤销旧令牌，旧提升授权随之失效；续期不能提升基础等级。事件流每次发送前的复验和断开仍由 G-API-4 交付。
 
 进程绑定约束令牌的有效生命周期。现有回环 HTTP bearer 不能证明当前发送者就是绑定 pid，不能把这个字段宣传为防转交机制，见 §4。身份变化检测也不等于无竞态的进程隔离。
 
@@ -258,7 +258,7 @@ ModuleRoute 是新增的模块专用兜底，不复用 ModelsAdmin 或 ModuleRea
 |---|---|---|
 | 同 UID 恶意程序读日志、注入进程或伪造界面输入 | 不放共享 token 文件；独立证明；连接绑定与限频 | 配对码日志可读，bearer 可被窃取或转交，原生确认可被输入自动化攻击；真正防护需 OS 隔离 |
 | PID 复用 | 握手前后读启动时间，请求与续期检查 pid、start_time | 读取与使用之间仍有窗口；时间分辨率不足会削弱检查，2c 不可使用模糊时间字符串充当可靠标识 |
-| exec 竞态 | 发令牌前复核身份；续期重验 | exec 通常不改变进程启动时间，前后时间相同不能排除中间 exec；tokio 未给 audit token，不能声称彻底解决 TOCTOU（facts §3.4） |
+| fork + exec 换壳 | accept 后用 `getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN)` 读取 audit token；SecCode 用 `kSecGuestAttributeAudit` 校验，并要求 hardened runtime。连接与令牌绑定同一 token（含 pidversion），首次校验、recheck、renew、elevate 和每次 HTTP 请求均复核 | exec 改变 pidversion 后拒绝并删除令牌。此攻击可由调用方控制步骤顺序，不是无法控制的竞态。bearer 仍可转交，不声称隔离同 UID 程序。见 #1448 评审 M1 与 §10 R6 |
 | 插件调用合法 CLI | CLI 只自动取得日常级，审批等逐次要求证明，不看 TTY | 插件仍可读记忆、建 run、取消 run；这正是 ADR-037 已接受的残余，不宣传成所有第三方只能用开发者令牌 |
 | 开发或未签名构建 | FD 登记权或人工配对，只给日常级 | 可信启动者和人工确认承担身份判断；不能拿自动路径失败当作自动放行 |
 | 模块 HTTP 副作用 | 暂按日常级，工具调用仍走 consent | 不经工具入口的模块路由可能无 consent，Q1 必须外审 |
@@ -327,7 +327,7 @@ ModuleRoute 是新增的模块专用兜底，不复用 ModelsAdmin 或 ModuleRea
 | Q5 | ADR-037 服务无 bootstrap，但没定义 enroll 与 bootstrap 同开、legacy 带 enroll 的参数组合 | 本稿建议 D8 矩阵拒绝歧义组合。子进程 capability 自动开登记端点，不能要求同时开启服务模式开关 |
 | Q6 | D4 每次提升操作都证明；ADR-037 同时允许开发者令牌含高权作用域，写的是签发时单独确认，未说每次使用如何证明 | D4 对一方外壳逐次执行固定不变。开发者高权调用是否也需独立逐次证明，或是另一种明确委托语义，须在高权开发者令牌实现前裁决，不能借它绕开 D4 |
 | Q7 | 本分支 ADR-037 仍标「提议」；决策5声称签名公证流程已跑通，facts §4 未发现可重复流水线，也未确认内嵌 daemon 签名 | 按任务给定 #1249 已接受使用 ADR，保留状态与签名事实差异。DEP-B 必须补流水线及白名单实际 identifier 证据；协调者决定何处订正 ADR 状态和原文 |
-| Q8 | `(pid,start_time)` 不能识别同进程 exec，HTTP bearer 也不带发送者 PID。facts §3.4 明示缺 audit token | 保留前后启动时间核验和进程退出失效。不声称消灭 exec 竞态或防令牌转交；若要求更强绑定，须另裁 OS 隔离或通道证明方案 |
+| Q8 | `(pid,start_time)` 不能识别同进程 exec；#1448 评审 M1 确认 fork + exec 可稳定冒充一方客户端，且 `LOCAL_PEERTOKEN` 可直接取得 audit token | 改为 audit token 绑定，SecCode 使用 `kSecGuestAttributeAudit`；exec 改变 pidversion 即失效。§9 Q8 的接受结论由 §10 R6 更正。HTTP bearer 仍不证明发送者 PID，不声称防令牌转交 |
 
 ## 9. 协调者裁决（2026-10-26，Opus）
 
@@ -340,7 +340,7 @@ ModuleRoute 是新增的模块专用兜底，不复用 ModelsAdmin 或 ModuleRea
 | Q5 | 采纳 D8 矩阵：capabilities 模式下 bootstrap 与 enroll 同时开启时拒绝启动，legacy 模式下带 enroll 时拒绝启动。capability 子进程模式自动开登记端点，不需要另外的开关。 |
 | Q6 | 开发者高权令牌按「签发时证明、使用时委托」处理：签发和扩权走 D4 的一次性提升授权；使用时不逐次证明。补偿措施有三条：高权作用域的令牌 TTL 上限 24 小时，不能无限续期；可以列出、可以吊销；每次高权调用都写入审计。一方外壳的 D4 逐次证明保持不变，开发者令牌不能用来替一方外壳绕过 D4。 |
 | Q7 | ADR-037 的状态行和决策 5 的签名表述由 DOCS-2 单独订正（PR 进 main）。本稿保留差异说明。DEP-B 仍是 macOS 身份校验投产的前置。 |
-| Q8 | 接受 §4 列出的残余风险，不追加 OS 隔离或通道证明。日后如需更强的进程绑定，另立 ADR。 |
+| Q8 | 原接受结论已由 §10 R6（#1448 评审 M1）更正：audit token 可得，必须绑定并复核 pidversion。bearer 转交与 OS 隔离仍不在本片范围。 |
 
 本稿评审至多一轮，之后冻结。评审意见中的真问题在本文订正，其余登记到实现片。
 
@@ -353,5 +353,6 @@ ModuleRoute 是新增的模块专用兜底，不复用 ModelsAdmin 或 ModuleRea
 | R3 | Grok Medium | Q6 没有禁止开发者令牌带签发权限，24 小时上限可以被无证明续签绕过 | 开发者令牌的作用域**不得包含** `CapabilityMint`、`CapabilityRevoke` 或任何令牌治理 Operation。签发端点只接受带当次 D4 授权的 `FirstPartyShell`。补负例：开发者令牌调用签发返回拒绝；带签发作用域的签发请求被拒绝 |
 | R4 | Grok Medium | Q3 的登记权没有核对目标确实是申请者的子进程；续期只检查进程还活着，转交出去的 bearer 也能拿来续期，并把原令牌顶掉 | 登记权兑换时，daemon 用 `peer_cred` 取目标 pid，核对它的父进程 pid 就是申请者绑定的 pid，并且两边的启动时间一致，不一致就拒绝；登记权换到的令牌只有日常级。续期只能在原 UDS 登记连接上进行，并核对 `peer_cred` 的 pid 与令牌绑定一致；HTTP 上不提供续期。T10、T12 各补一个负例 |
 | R5 | Grok Medium | 分片中间态会放大权限：2a 先把 Creative 白名单里的 Session、Run、Cancel、Events 接到新路由，而收紧要到 2b；2e 先开服务模式，但永不过期的 ProductHost 要到 2b 才禁止 | 2a 新接的路由对 Creative **一律不放行**，白名单维持现状，扩充留到 G-API 设计。2e 的服务模式在启动时就不铸 ProductHost；`--enroll-endpoint` 之下，ready 行和 daemon.json 都不含任何秘密。T17 的「服务不铸宿主」断言提前到 2e |
+| R6 | #1448 PR-Daemon 评审 M1（2026-10-28） | fork 后由子进程保留连接、父进程 exec 真签名程序，可稳定绕过按 PID 的校验；「无法控制的竞态」「拿不到 audit token」两个前提均不成立 | accept 后通过 `getsockopt(fd, SOL_LOCAL, LOCAL_PEERTOKEN)` 捕获 `audit_token_t`，SecCode 使用 `kSecGuestAttributeAudit` 并要求签名 flags 含 runtime。连接与令牌保存同一 audit token（含 pidversion）。首次校验、recheck、renew、elevate 及 HTTP 每次请求的存活检查都复核，exec 或进程退出（含僵尸）即拒绝并删除令牌。补 fork + exec 登记拒绝和已登记进程 exec 后 HTTP 拒绝的负向测试。此条覆盖 §4、§8 Q8 与 §9 Q8 的旧结论；不改变 bearer 可转交的边界 |
 
-修订后 §9 的 Q1、Q2 以本节为准，Q3、Q6 按本节收紧。本稿到此冻结，后续意见登记到实现片。
+修订后 §9 的 Q1、Q2、Q8 以本节为准，Q3、Q6 按本节收紧。本稿到此冻结，后续意见登记到实现片。

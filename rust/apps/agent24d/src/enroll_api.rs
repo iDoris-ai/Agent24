@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 /// Process start time as the kernel reports it; `(pid, start)` names one
-/// process for its whole life (design D5 step 2/4).
+/// process for its whole life, but does not distinguish exec. The identity's
+/// audit token binds the executable instance (design D5, §10 R6).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcStart {
     pub sec: u64,
@@ -30,6 +31,9 @@ pub struct VerifiedIdentity {
     pub identifier: String,
     pub team_id: String,
     pub executable: std::path::PathBuf,
+    /// Captured by the daemon at accept; never supplied on the wire.
+    /// None is unsupported and cannot establish a production identity.
+    pub audit_token: Option<agent24_os_proc::AuditToken>,
 }
 
 /// A peer that passed the handshake on one enrolment connection.
@@ -47,7 +51,7 @@ pub struct EnrolledPeer {
 /// once, in the `enrolled` frame; the authority keeps only its digest.
 pub struct IssuedToken {
     pub token_id: String,
-    pub secret: String,
+    pub secret: zeroize::Zeroizing<String>,
     pub expires_in: u64,
 }
 
@@ -74,7 +78,7 @@ pub struct ElevateRequest {
 
 pub struct ElevationGrant {
     pub challenge_id: String,
-    pub secret: String,
+    pub secret: zeroize::Zeroizing<String>,
     pub expires_in: u64,
 }
 
@@ -125,10 +129,12 @@ impl EnrollErrorCode {
 }
 
 /// Implemented by S2. S1 calls it only after the identity check and the
-/// second `(pid, start)` read both passed.
+/// second `(pid, start)` read and original audit token recheck all passed.
 #[async_trait]
 pub trait EnrollAuthority: Send + Sync {
     fn issue(&self, peer: &EnrolledPeer) -> Result<IssuedToken, EnrollErrorCode>;
+    /// Remove this connection's token after a failed identity recheck.
+    fn revoke(&self, peer: &EnrolledPeer, token_id: &str);
     /// Renew on the original connection only (design §10 R4): the old token
     /// is revoked atomically with the new mint.
     fn renew(&self, peer: &EnrolledPeer, token_id: &str) -> Result<IssuedToken, EnrollErrorCode>;
