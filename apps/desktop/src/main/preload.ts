@@ -3,6 +3,7 @@
 // contextBridge. Capability modules will extend this surface in M1+.
 
 import { contextBridge, ipcRenderer } from 'electron'
+import type { NavPrefs } from '../renderer/capabilities/types'
 import {
   IpcChannels,
   type BackendEndpointResult,
@@ -35,6 +36,8 @@ import {
 } from '../shared/ipc-types'
 
 const api = {
+  getNavPrefs: (): Promise<NavPrefs> => ipcRenderer.invoke(IpcChannels.NavPrefsGet),
+  setNavPrefs: (prefs: NavPrefs): Promise<void> => ipcRenderer.invoke(IpcChannels.NavPrefsSet, prefs),
   onCliToolSettings: (cb: () => void): (() => void) => {
     ipcRenderer.on(IpcChannels.CliToolOpenSettings, cb)
     return () => ipcRenderer.removeListener(IpcChannels.CliToolOpenSettings, cb)

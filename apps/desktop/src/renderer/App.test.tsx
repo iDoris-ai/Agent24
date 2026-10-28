@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react'
 import { App, pickChatModel, extractDaemonDefaultModel } from './App'
 import { LOCALE_STORAGE_KEY, setLocale } from './i18n'
 
@@ -39,12 +39,28 @@ describe('App', () => {
   // These assertions predate i18n and are written against the zh copy.
   beforeEach(() => { setLocale('zh') })
 
-  it('renders built-in sidebar nav items', async () => {
+  it('renders the fixed sidebar and default pins without Workbench', async () => {
     await act(async () => { render(<App />) })
-    expect(screen.getAllByText('对话').length).toBeGreaterThan(0)
-    expect(screen.getByText('工作台')).toBeInTheDocument()
-    expect(screen.getByText('模型')).toBeInTheDocument()
+    expect(screen.getAllByText('助手').length).toBeGreaterThan(0)
+    expect(screen.queryByText('工作台')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '能力中心' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '本地模型' })).not.toBeInTheDocument()
     expect(screen.getAllByText('设置').length).toBeGreaterThan(0)
+  })
+
+  it('opens a full capability page, shows the center breadcrumb and clears it on sidebar navigation', async () => {
+    await act(async () => { render(<App />) })
+    fireEvent.click(screen.getByRole('button', { name: '能力中心' }))
+    fireEvent.click(within(screen.getByRole('main')).getByRole('button', { name: '创作' }))
+    expect(screen.getByRole('status')).toHaveTextContent('尚未设置')
+    expect(screen.getByText('安装并连接视频创作服务，即可开始创作。')).toBeInTheDocument()
+    const breadcrumb = screen.getByRole('navigation', { name: '面包屑' })
+    expect(breadcrumb).toHaveTextContent('能力中心›创作')
+    fireEvent.click(within(breadcrumb).getByRole('button'))
+    expect(screen.getByRole('main')).toHaveTextContent('领域 OS')
+    fireEvent.click(within(screen.getByRole('navigation', { name: '主导航' })).getByRole('button', { name: '创作' }))
+    expect(screen.queryByRole('navigation', { name: '面包屑' })).not.toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent('尚未设置')
   })
 
   it('shows backend status after health check', async () => {
@@ -266,14 +282,14 @@ describe('App', () => {
     )?.[0].body.session_id
     expect(firstSessionId).toBeTruthy()
 
-    // Navigate to 记忆 and back to 对话. ChatPage stays MOUNTED the whole
+    // Navigate to Capabilities and back to Assistant. ChatPage stays mounted the whole
     // time (just hidden) — `hello there` is still findable in the DOM, so
     // the real assertion is on visibility, not presence.
-    fireEvent.click(screen.getAllByText('记忆')[0])
+    fireEvent.click(screen.getByRole('button', { name: '能力中心' }))
     await waitFor(() => {
       expect(screen.getByText('hello there')).not.toBeVisible()
     })
-    fireEvent.click(screen.getAllByText('对话')[0])
+    fireEvent.click(within(screen.getByRole('navigation', { name: '主导航' })).getByRole('button', { name: '助手' }))
 
     // The message list and session id must be exactly as they were.
     await waitFor(() => {
@@ -299,8 +315,8 @@ describe('App', () => {
 describe('App language', () => {
   it('defaults to English when nothing is persisted', async () => {
     await act(async () => { render(<App />) })
-    expect(screen.getAllByText('Chat').length).toBeGreaterThan(0)
-    expect(screen.getByText('Workbench')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Assistant' })).toBeInTheDocument()
+    expect(screen.queryByText('Workbench')).not.toBeInTheDocument()
     await waitFor(() => expect(screen.getByText(/Backend running/)).toBeInTheDocument())
     expect(document.documentElement.lang).toBe('en')
   })
@@ -311,7 +327,7 @@ describe('App language', () => {
     await act(async () => {
       fireEvent.change(screen.getByLabelText('Language'), { target: { value: 'th' } })
     })
-    expect(screen.getByText('โต๊ะทำงาน')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'ผู้ช่วย' })).toBeInTheDocument()
     expect(screen.getAllByText('ตั้งค่า').length).toBeGreaterThan(0)
     expect(window.localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('th')
     expect(document.documentElement.lang).toBe('th')
