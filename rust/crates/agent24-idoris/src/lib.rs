@@ -7,6 +7,8 @@ pub mod omlx_probe;
 mod storage;
 #[cfg(unix)]
 pub mod setup;
+pub mod keychain;
+pub mod keys;
 
 use semver::Version;
 use serde::Deserialize;
