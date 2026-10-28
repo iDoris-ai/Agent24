@@ -26,10 +26,114 @@ pub enum IdentityError {
     Io(io::Error),
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 pub fn is_alive(pid: i32) -> bool {
     rustix::process::Pid::from_raw(pid)
         .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok())
+}
+
+#[cfg(target_os = "macos")]
+pub fn is_alive(pid: i32) -> bool {
+    process_info(pid).is_ok_and(|info| info.pbi_status != libc::SZOMB)
+}
+
+#[cfg(target_os = "linux")]
+pub fn is_alive(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(')')
+            .and_then(|(_, tail)| tail.split_whitespace().next())
+            .is_some_and(|state| !matches!(state, "Z" | "X"))
+    })
+}
+
+/// Kernel-supplied connection identity, including the exec-sensitive pidversion.
+/// There is deliberately no constructor from a PID or client-supplied bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuditToken([u32; 8]);
+
+impl AuditToken {
+    pub fn pid(self) -> i32 {
+        self.0[5] as i32
+    }
+    pub fn euid(self) -> u32 {
+        self.0[1]
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub fn peer_audit_token(socket: &impl std::os::fd::AsRawFd) -> io::Result<AuditToken> {
+    let mut token = AuditToken([0; 8]);
+    let mut size = std::mem::size_of_val(&token.0) as libc::socklen_t;
+    // SAFETY: the borrowed socket remains open; token and size are writable
+    // buffers with exactly the size supplied to getsockopt.
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERTOKEN,
+            token.0.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if size as usize != std::mem::size_of_val(&token.0) || token.pid() <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid peer audit token",
+        ));
+    }
+    Ok(token)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn peer_audit_token(_socket: &impl std::os::fd::AsRawFd) -> io::Result<AuditToken> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "peer audit token unavailable",
+    ))
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn audit_status(token: AuditToken) -> io::Result<u32> {
+    unsafe extern "C" {
+        fn csops_audittoken(
+            pid: libc::pid_t,
+            ops: libc::c_uint,
+            address: *mut libc::c_void,
+            size: libc::size_t,
+            token: *const u32,
+        ) -> libc::c_int;
+    }
+    let mut flags = 0u32;
+    // SAFETY: CS_OPS_STATUS (0) writes one u32; the audit token points to
+    // eight initialized native u32s. The kernel rejects a stale pidversion.
+    let result = unsafe {
+        csops_audittoken(
+            token.pid(),
+            0,
+            (&mut flags as *mut u32).cast(),
+            std::mem::size_of_val(&flags),
+            token.0.as_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags)
+}
+
+#[cfg(target_os = "macos")]
+pub fn audit_token_is_live(token: AuditToken) -> bool {
+    audit_status(token).is_ok() && is_alive(token.pid())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn audit_token_is_live(_token: AuditToken) -> bool {
+    false
 }
 
 #[cfg(not(unix))]
@@ -77,8 +181,17 @@ pub fn executable_path(pid: i32) -> io::Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
 pub fn start_time(pid: i32) -> io::Result<ProcStart> {
+    let info = process_info(pid)?;
+    Ok(ProcStart {
+        sec: info.pbi_start_tvsec,
+        usec: info.pbi_start_tvusec,
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn process_info(pid: i32) -> io::Result<libc::proc_bsdinfo> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let size = std::mem::size_of::<libc::proc_bsdinfo>();
     // SAFETY: info points to a correctly sized output structure; it is read only
@@ -97,10 +210,7 @@ pub fn start_time(pid: i32) -> io::Result<ProcStart> {
     }
     // SAFETY: the complete output was initialized above.
     let info = unsafe { info.assume_init() };
-    Ok(ProcStart {
-        sec: info.pbi_start_tvsec,
-        usec: info.pbi_start_tvusec,
-    })
+    Ok(info)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -120,7 +230,7 @@ pub fn start_time(_pid: i32) -> io::Result<ProcStart> {
 
 #[cfg(not(target_os = "macos"))]
 pub fn verify_code_identity(
-    _pid: i32,
+    _token: AuditToken,
     _team_id: &str,
     _allowed_identifiers: &[&str],
 ) -> Result<CodeIdentity, IdentityError> {
@@ -129,7 +239,7 @@ pub fn verify_code_identity(
 
 #[cfg(target_os = "macos")]
 pub fn verify_code_identity(
-    pid: i32,
+    token: AuditToken,
     team_id: &str,
     allowed_identifiers: &[&str],
 ) -> Result<CodeIdentity, IdentityError> {
@@ -140,7 +250,10 @@ pub fn verify_code_identity(
         return Err(IdentityError::RequirementFailed);
     }
     let mut attributes = GuestAttributes::new();
-    attributes.set_pid(pid);
+    use core_foundation::{base::TCFType, data::CFData};
+    let bytes: Vec<u8> = token.0.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let data = CFData::from_buffer(&bytes);
+    attributes.set_audit_token(data.as_concrete_TypeRef());
     let code = SecCode::copy_guest_with_attribues(None, &attributes, Flags::NONE)
         .map_err(|_| IdentityError::SignatureInvalid)?;
     let requirement: SecRequirement =
@@ -156,17 +269,32 @@ pub fn verify_code_identity(
             _ => IdentityError::SignatureInvalid,
         })?;
     let (identifier, signed_team, signed_path) = signing_information(&code)?;
-    let executable = executable_path(pid)
+    // CS_RUNTIME is part of the running code's signature flags.
+    require_hardened_runtime(audit_status(token).map_err(IdentityError::Io)?)?;
+    let executable = executable_path(token.pid())
         .and_then(|p| p.canonicalize())
         .map_err(IdentityError::Io)?;
-    check_identity_fields(
+    let identity = check_identity_fields(
         identifier,
         signed_team,
         signed_path,
         team_id,
         allowed_identifiers,
         executable,
-    )
+    )?;
+    if !audit_token_is_live(token) {
+        return Err(IdentityError::SignatureInvalid);
+    }
+    Ok(identity)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn require_hardened_runtime(flags: u32) -> Result<(), IdentityError> {
+    const CS_RUNTIME: u32 = 0x10000;
+    if flags & CS_RUNTIME == 0 {
+        return Err(IdentityError::RequirementFailed);
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -263,6 +391,40 @@ mod tests {
             std::env::current_exe().unwrap().canonicalize().unwrap()
         );
     }
+    #[cfg(unix)]
+    #[test]
+    fn zombie_process_is_not_alive() {
+        use std::io::Read;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_end(&mut Vec::new())
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while is_alive(child.id() as i32) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let alive = is_alive(child.id() as i32);
+        child.wait().unwrap();
+        assert!(!alive, "an unreaped zombie must not keep credentials alive");
+    }
+    #[test]
+    fn hardened_runtime_flag_is_required() {
+        for flags in [0, 1, 0x2000, 0xffff] {
+            assert!(matches!(
+                require_hardened_runtime(flags),
+                Err(IdentityError::RequirementFailed)
+            ));
+        }
+        assert!(require_hardened_runtime(0x10000).is_ok());
+        assert!(require_hardened_runtime(0x10001).is_ok());
+    }
     #[test]
     fn signed_identifier_team_and_canonical_path_must_all_match() {
         let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
@@ -300,7 +462,7 @@ mod tests {
     #[test]
     fn code_identity_is_unsupported() {
         assert!(matches!(
-            verify_code_identity(std::process::id() as i32, "HYAP444FN9", &["agent24"]),
+            verify_code_identity(AuditToken([0; 8]), "HYAP444FN9", &["agent24"]),
             Err(IdentityError::Unsupported)
         ));
     }

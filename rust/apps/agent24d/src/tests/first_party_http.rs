@@ -56,7 +56,7 @@ async fn grant(
     method: &str,
     path: &str,
     body: &str,
-) -> String {
+) -> zeroize::Zeroizing<String> {
     let (tx, _rx) = tokio::sync::oneshot::channel();
     state
         .first_party
@@ -602,4 +602,77 @@ async fn product_host_module_writes_do_not_need_delegation() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn http_rejects_and_deletes_token_after_peer_exec() {
+    use tokio::io::AsyncWriteExt;
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let socket = dir.path().join("peer.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let mut child = tokio::process::Command::new("python3")
+        .args(["-c", include_str!("fixtures/exec_peer.py")])
+        .arg(&socket)
+        .arg("plain")
+        .stdin(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    let (state, _) = setup().await;
+    let mut peer = test_peer("daemon-test");
+    peer.pid = child.id().unwrap() as i32;
+    let start = agent24_os_proc::start_time(peer.pid).unwrap();
+    peer.start = crate::enroll_api::ProcStart {
+        sec: start.sec,
+        usec: start.usec,
+    };
+    let audit_token = agent24_os_proc::peer_audit_token(&stream).unwrap();
+    peer.uid = audit_token.euid();
+    peer.identity.audit_token = Some(audit_token);
+    let token = state.first_party.as_ref().unwrap().issue(&peer).unwrap();
+    let store = state.capabilities.as_ref().unwrap().clone();
+    let router = build_router(state);
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(request(&token.secret, "GET", "/api/v1/models", "", None))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    child.stdin.take().unwrap().write_all(b"e").await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while agent24_os_proc::executable_path(peer.pid)
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            != std::path::Path::new("/bin/sleep").canonicalize().unwrap()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(agent24_os_proc::start_time(peer.pid).unwrap(), start);
+    assert_eq!(
+        router
+            .oneshot(request(&token.secret, "GET", "/api/v1/models", "", None))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(
+        !store
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .ids
+            .contains_key(&token.token_id)
+    );
+    drop(stream);
 }

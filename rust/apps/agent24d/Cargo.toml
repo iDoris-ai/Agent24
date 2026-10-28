@@ -36,6 +36,7 @@ clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 http-body-util = "0.1"
 rand = "0.9"
+zeroize = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 # ME4-4.2.3b (design §6.5): `GET /api/v1/usage?module=` reads the raw query

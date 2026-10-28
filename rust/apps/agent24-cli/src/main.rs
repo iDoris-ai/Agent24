@@ -289,8 +289,9 @@ enum OsAction {
         action: OsAttachAction,
     },
     /// Let first-party clients write to a module's current HTTP routes
-    /// (capabilities mode; asks for approval in the Agent24 app). A new module
-    /// version or route set needs a new delegation.
+    /// (capabilities mode). ProductHost executes directly; first-party clients
+    /// require approval in the Agent24 app. A new module version or route set
+    /// needs a new delegation.
     Delegate {
         /// Module name, e.g. documents
         name: String,

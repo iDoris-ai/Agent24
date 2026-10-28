@@ -1175,10 +1175,14 @@ async fn authorize(
                                 );
                             }
                         };
-                        if let Some(authority) = &state.first_party {
+                        if let Some(authority) = &state.first_party
+                            && let Some(path) = crate::attached::config_path()
+                            && let Ok(registrations) = crate::attached::list(&path)
+                        {
                             authority.remember_attached_request(
                                 &authorization.claims.capability_id,
                                 &bytes,
+                                &registrations,
                             );
                         }
                     }
