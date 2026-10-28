@@ -405,6 +405,7 @@ function refreshTray(): void {
   if (!tray) return
   const view = buildTrayView({
     status: backendManager.status(),
+    detail: backendManager.statusDetail(),
     external: backendManager.isExternalDaemon(),
     externalPid: backendManager.externalDaemonPid() ?? null,
     foreignPid: backendManager.foreignDaemonPid(),
