@@ -16,7 +16,7 @@
 | A4 | 预算只从 usable 扣显式 core 预留，零值有效：`rust/apps/agent24-cli/src/main.rs:1135` 至 `:1149`、`docs/agent/IDORIS-MANUAL-BUDGET.md:5` 至 `:20`。底层算法：`rust/crates/agent24-hw/src/budget.rs:120` 至 `:129`。 |
 | A5 | 现有数据 key 来自环境；禁代理与重定向、限制 loopback，严格校验契约 1.0.1，简单和复杂请求映射 daily 与 deep：`rust/crates/agent24-models/src/idoris.rs:92` 至 `:117`、`:183` 至 `:201`、`:228` 至 `:244`。 |
 | A6 | 网关独占、失败不回退：`rust/crates/agent24-models/src/router.rs:326` 至 `:330`、`:534` 至 `:539`、`:642` 至 `:655`。回执要求本地推理并保留真实模型：`rust/crates/agent24-models/src/idoris.rs:264` 至 `:310`。 |
-| A7 | Desktop 的 FD 选择器、65 字节解析和直接读取 Admin：`apps/desktop/src/main/idoris-admin.ts:11` 至 `:21`、`:29` 至 `:37`、`:71` 至 `:102`、`:241` 至 `:276`。 |
+| A7 | 桌面 FD 选择器、65 字节解析和直接读取 Admin 的旧路径已移除（IL-13），`idoris-admin.ts` 与 `--idoris-admin-token-fd` 不再存在。桌面经 `backendProxy` 调用 daemon 的 `/api/v1/idoris/*`，由 daemon 持有并管理 Admin token，桌面不再持有。入口见 `apps/desktop/src/renderer/components/idoris/api.ts` 和 `apps/desktop/src/main/backend-proxy.ts`。 |
 | A8 | Hyphae 固定锁、只构造已校验对象、重验已有文件：`rust/crates/agent24-comm/hyphae.lock.json:1` 至 `:11`、`rust/crates/agent24-comm/src/binary.rs:126` 至 `:161`、`:175` 至 `:234`。 |
 | A9 | 大组件不打包而按需下载；重定向逐跳限制 HTTPS 和主机：`apps/desktop/src/main/open-design-component.ts:1` 至 `:9`、`:38` 至 `:40`。 |
 | A10 | 候选端口 8088、8000、8001：`apps/desktop/src/main/ipc/index.ts:33` 至 `:49`。真实认证配置在 `auth.api_key`：`docs/release/ACCEPTANCE-v0.6.0-preview.md:519` 至 `:527`。 |
@@ -148,7 +148,7 @@ daemon 自身异常退出后，重新启动时先核对非敏感运行记录中�
 轮换流程为“签发最小权限新 key → 钥匙串暂存 → 新 key 真实请求验证 → 切换引用与网关 → 等旧请求完成或取消 → revoke 旧 key → 删除旧钥匙串条目”。失败时保留可用旧 key 并吊销新 key；旧 key 吊销失败显示“新 key 已生效，旧 key 待吊销”，持久保存待处理 key_id，不在重试时重复签发。[L3]
 跨崩溃补偿用非敏感操作记录与 L3 list 对账，key_id 是删除和吊销依据，禁止只凭 owner=`agent24` 批量吊销，避免影响其他实例。签发成功但结果未收到的归属识别仍需 L3 schema 与操作关联机制支持，未解决前将列为待清理授权，不宣称事务完全成功。
 L4 与 L3 的并发关系尚不明确。设计不要求 key 子命令绕过 serve 锁：若不支持在线 key 操作，则暂停请求、按 L1 停 serve、执行 key 子命令后再启动。在线无停机轮换只有在 iDoris 明确支持并完成测试后才开放。[L1、L3、L4]
-`idoris-admin.ts` 的 TOKEN_ARG 是桌面侧 FD 选择器，绝不是 iDoris 参数；两者不是把字符串替换一下就能互通。[A7；#588 §1「Admin token 交接」第 1 条] 迁移后由 daemon 持有 Admin token 并查询只读 Admin，桌面 consumer 改为 daemon 状态适配器；移除旧 FD 读取和启动交接调用点，不传 `--idoris-admin-token-fd` 给 iDoris，也不向桌面转发 token。CLI 复用同一投影结果。
+旧 `idoris-admin.ts` 的 TOKEN_ARG 曾是桌面侧 FD 选择器，不是 iDoris 参数；该模块、`--idoris-admin-token-fd`、FD 读取和启动交接调用点均已移除（IL-13）。[A7；#588 §1「Admin token 交接」第 1 条] 现在桌面经 `backendProxy` 调用 daemon 的 `/api/v1/idoris/*`，展示 daemon 的状态与操作快照。Admin token 由 daemon 持有并管理，不向桌面转发，桌面不再持有。CLI 复用同一 daemon API。
 
 ## 8. oMLX 探测与角色模型选择
 
