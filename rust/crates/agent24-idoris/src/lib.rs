@@ -6,6 +6,8 @@ pub mod keychain;
 pub mod keys;
 #[cfg(unix)]
 pub mod omlx_probe;
+#[cfg(unix)]
+pub mod setup;
 mod storage;
 
 use semver::Version;

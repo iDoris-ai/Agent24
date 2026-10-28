@@ -76,6 +76,11 @@ pub struct InstalledVersion {
     directory: PathBuf,
 }
 impl InstalledVersion {
+    #[cfg(test)]
+    pub(crate) fn from_test_directory(directory: PathBuf) -> Self {
+        Self { directory }
+    }
+
     pub fn directory(&self) -> &Path {
         &self.directory
     }
