@@ -5,6 +5,7 @@ All notable changes to Agent24 are documented here. This project adheres to
 
 ## [Unreleased]
 
+- **iDoris 契约版本检查放宽为 1.x 且 ≥1.0.1**（`agent24-models`）：原先要求 `contract_version` 恰为 `1.0.1`，现解析为三个整数，接受 major==1 且 ≥1.0.1，为 iDoris v0.4.0（契约 1.1.0，仅在 `/capabilities` 加可选字段）做准备；major≠1、低于 1.0.1、解析失败与预发布后缀仍拒绝，错误消息带收到的版本与期望范围（不含 key）。
 - **iDoris v0.3.2 的 `502 upstream_auth_failed` 映射为终态（ID-ERR-1）**：`IdorisClient::send()` 对 502
   可取消地读至多 4 KiB body，仅看 `error.reason_code`/`error.type`；等于 `upstream_auth_failed` 时返回
   `ModelError::Rejected { status: 502 }`（不重试、不换 provider），文案指向 iDoris 运营方的上游密钥或 provider
