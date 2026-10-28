@@ -1322,6 +1322,7 @@ pub fn build_router(state: AppState) -> Router {
 pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
     if let Some(authority) = &state.first_party {
         authority.set_provider(state.presence_provider.clone());
+        authority.set_module_surfaces(state.module_surfaces.clone());
     }
     let kernel = Router::new()
         .route("/api/v1/health", get(health))

@@ -112,6 +112,7 @@ async fn daily_http_and_unknown_routes_and_no_http_renewal() {
 #[tokio::test]
 async fn elevation_blocks_handler_and_binds_path_body_method_and_token() {
     let (state, token) = setup().await;
+    let body = serde_json::json!({"manifest":"name: agentear\nversion: '1'\nroute_namespace: /api/v1/agentear\nevent_module: agentear\ndata_dir: ~/.agent24/os/agentear/\nimpl_kind: attached_process\n"}).to_string();
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
     // Use the production auth middleware and its real fixed route mapping;
@@ -143,7 +144,7 @@ async fn elevation_blocks_handler_and_binds_path_body_method_and_token() {
             &token.secret,
             "POST",
             "/api/v1/attached",
-            "body",
+            &body,
             None,
         ))
         .await
@@ -151,10 +152,10 @@ async fn elevation_blocks_handler_and_binds_path_body_method_and_token() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(error_code(response).await, "presence_required");
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    let secret = grant(&state, &token, "POST", "/api/v1/attached", "body").await;
+    let secret = grant(&state, &token, "POST", "/api/v1/attached", &body).await;
     for (method, path, body) in [
         ("POST", "/api/v1/attached", "changed"),
-        ("DELETE", "/api/v1/attached/other", "body"),
+        ("DELETE", "/api/v1/attached/other", &body),
     ] {
         let response = router
             .clone()
@@ -177,7 +178,7 @@ async fn elevation_blocks_handler_and_binds_path_body_method_and_token() {
                     &other.secret,
                     "POST",
                     "/api/v1/attached",
-                    "body",
+                    &body,
                     Some(&secret)
                 ))
                 .await
@@ -209,14 +210,14 @@ async fn elevation_blocks_handler_and_binds_path_body_method_and_token() {
             &token.secret,
             "POST",
             "/api/v1/attached",
-            "body",
+            &body,
             Some(&secret)
         )),
         router.clone().oneshot(request(
             &token.secret,
             "POST",
             "/api/v1/attached",
-            "body",
+            &body,
             Some(&secret)
         ))
     );
@@ -229,15 +230,21 @@ async fn elevation_blocks_handler_and_binds_path_body_method_and_token() {
         1
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    let failed = grant(&state, &token, "DELETE", "/api/v1/attached/fail", "").await;
+    let failed_router = Router::new()
+        .route(
+            "/api/v1/attached",
+            axum::routing::post(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth));
+    let failed = grant(&state, &token, "POST", "/api/v1/attached", &body).await;
     assert_eq!(
-        router
+        failed_router
             .clone()
             .oneshot(request(
                 &token.secret,
-                "DELETE",
-                "/api/v1/attached/fail",
-                "",
+                "POST",
+                "/api/v1/attached",
+                &body,
                 Some(&failed)
             ))
             .await
@@ -247,13 +254,12 @@ async fn elevation_blocks_handler_and_binds_path_body_method_and_token() {
     );
     assert_eq!(
         error_code(
-            router
-                .clone()
+            failed_router
                 .oneshot(request(
                     &token.secret,
-                    "DELETE",
-                    "/api/v1/attached/fail",
-                    "",
+                    "POST",
+                    "/api/v1/attached",
+                    &body,
                     Some(&failed)
                 ))
                 .await
@@ -263,7 +269,7 @@ async fn elevation_blocks_handler_and_binds_path_body_method_and_token() {
         "elevation_invalid"
     );
     // Renewal revokes both old token access and grants tied to that token id.
-    let old_grant = grant(&state, &token, "POST", "/api/v1/attached", "body").await;
+    let old_grant = grant(&state, &token, "POST", "/api/v1/attached", &body).await;
     let renewed = state
         .first_party
         .as_ref()
@@ -277,7 +283,7 @@ async fn elevation_blocks_handler_and_binds_path_body_method_and_token() {
                 &token.secret,
                 "POST",
                 "/api/v1/attached",
-                "body",
+                &body,
                 Some(&old_grant)
             ))
             .await
@@ -292,7 +298,7 @@ async fn elevation_blocks_handler_and_binds_path_body_method_and_token() {
                     &renewed.secret,
                     "POST",
                     "/api/v1/attached",
-                    "body",
+                    &body,
                     Some(&old_grant)
                 ))
                 .await
@@ -464,18 +470,105 @@ async fn attached_summary_uses_daemon_parsed_body_bound_to_token_and_hash() {
         "presence_required"
     );
     grant(&state, &token, "POST", "/api/v1/attached", &body).await;
-    grant(&state, &token, "POST", "/api/v1/attached", "changed").await;
     let other = state
         .first_party
         .as_ref()
         .unwrap()
         .issue(&test_peer("daemon-test"))
         .unwrap();
-    grant(&state, &other, "POST", "/api/v1/attached", &body).await;
+    for (id, method, path, bytes) in [
+        (&token.token_id, "POST", "/api/v1/attached", "changed"),
+        (&other.token_id, "POST", "/api/v1/attached", body.as_str()),
+        (&token.token_id, "PUT", "/api/v1/memory/settings", ""),
+        (&token.token_id, "POST", "/api/v1/os/missing/delegation", ""),
+    ] {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let result = state
+            .first_party
+            .as_ref()
+            .unwrap()
+            .elevate(
+                &test_peer("daemon-test"),
+                id,
+                ElevateRequest {
+                    method: method.into(),
+                    path: path.into(),
+                    body_sha256: body_digest(bytes.as_bytes()),
+                    client_summary: "fake".into(),
+                },
+                tx,
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            result.err(),
+            Some(crate::enroll_api::EnrollErrorCode::NotElevatedOperation)
+        );
+    }
+    assert_eq!(capture.0.lock().unwrap().len(), 1);
+    for invalid in ["{}", r#"{"manifest":"invalid"}"#] {
+        let router = build_router(state.clone());
+        router
+            .oneshot(request(
+                &token.secret,
+                "POST",
+                "/api/v1/attached",
+                invalid,
+                None,
+            ))
+            .await
+            .unwrap();
+        let (tx, _) = tokio::sync::oneshot::channel();
+        assert!(
+            state
+                .first_party
+                .as_ref()
+                .unwrap()
+                .elevate(
+                    &test_peer("daemon-test"),
+                    &token.token_id,
+                    ElevateRequest {
+                        method: "POST".into(),
+                        path: "/api/v1/attached".into(),
+                        body_sha256: body_digest(invalid.as_bytes()),
+                        client_summary: "fake".into()
+                    },
+                    tx,
+                    CancellationToken::new()
+                )
+                .await
+                .is_err()
+        );
+    }
+    let mut remote: serde_json::Value = serde_json::from_str(&body).unwrap();
+    remote["manifest"] = serde_json::Value::String(format!(
+        "{}model_access: remote_allowed\nkernel_capabilities: [models, events]\nhost_commands: [open]\n",
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["manifest"]
+            .as_str()
+            .unwrap()
+    ));
+    let remote = remote.to_string();
+    build_router(state.clone())
+        .oneshot(request(
+            &token.secret,
+            "POST",
+            "/api/v1/attached",
+            &remote,
+            None,
+        ))
+        .await
+        .unwrap();
+    grant(&state, &token, "POST", "/api/v1/attached", &remote).await;
     let summaries = capture.0.lock().unwrap();
-    assert!(summaries[0].contains("'agentear'"), "{}", summaries[0]);
-    assert!(!summaries[1].contains("agentear"));
-    assert!(!summaries[2].contains("agentear"));
+    assert_eq!(summaries.len(), 2);
+    assert!(summaries[0].contains("'agentear'"));
+    assert!(summaries[0].contains("model_access: local_only"));
+    assert!(summaries[0].contains("kernel_capabilities: []"));
+    assert!(summaries[0].contains("host_commands: []"));
+    assert!(summaries[1].contains("model_access: remote_allowed"));
+    assert!(summaries[1].contains("models") && summaries[1].contains("events"));
+    assert!(summaries[1].contains("host_commands: [open]"));
+    assert_ne!(summaries[0], summaries[1]);
 }
 
 #[tokio::test]

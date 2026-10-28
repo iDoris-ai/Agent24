@@ -19,7 +19,10 @@ pub struct CodeIdentity {
 #[derive(Debug)]
 pub enum IdentityError {
     Unsupported,
-    Rejected,
+    SignatureInvalid,
+    RequirementFailed,
+    IdentifierNotAllowed,
+    PathMismatch,
     Io(io::Error),
 }
 
@@ -134,18 +137,24 @@ pub fn verify_code_identity(
         Flags, GuestAttributes, SecCode, SecRequirement,
     };
     if !team_id.bytes().all(|b| b.is_ascii_alphanumeric()) || team_id.is_empty() {
-        return Err(IdentityError::Rejected);
+        return Err(IdentityError::RequirementFailed);
     }
     let mut attributes = GuestAttributes::new();
     attributes.set_pid(pid);
     let code = SecCode::copy_guest_with_attribues(None, &attributes, Flags::NONE)
-        .map_err(|_| IdentityError::Rejected)?;
+        .map_err(|_| IdentityError::SignatureInvalid)?;
     let requirement: SecRequirement =
         format!("anchor apple generic and certificate leaf[subject.OU] = \"{team_id}\"")
             .parse()
-            .map_err(|_| IdentityError::Rejected)?;
+            .map_err(|_| IdentityError::RequirementFailed)?;
+    // SecCode validates both the signature and the requirement before we read
+    // identifier/path metadata. A failed certificate trust requirement does
+    // not mean that the executable is unsigned or its signature is corrupt.
     code.check_validity(Flags::NONE, &requirement)
-        .map_err(|_| IdentityError::Rejected)?;
+        .map_err(|error| match error.code() {
+            -67050 | -2147409622 => IdentityError::RequirementFailed, // errSecCSReqFailed / CSSMERR_TP_NOT_TRUSTED
+            _ => IdentityError::SignatureInvalid,
+        })?;
     let (identifier, signed_team, signed_path) = signing_information(&code)?;
     let executable = executable_path(pid)
         .and_then(|p| p.canonicalize())
@@ -169,11 +178,14 @@ fn check_identity_fields(
     allowed: &[&str],
     executable: PathBuf,
 ) -> Result<CodeIdentity, IdentityError> {
-    if signed_team != expected_team
-        || !allowed.contains(&identifier.as_str())
-        || signed_path.canonicalize().map_err(IdentityError::Io)? != executable
-    {
-        return Err(IdentityError::Rejected);
+    if signed_team != expected_team {
+        return Err(IdentityError::RequirementFailed);
+    }
+    if !allowed.contains(&identifier.as_str()) {
+        return Err(IdentityError::IdentifierNotAllowed);
+    }
+    if signed_path.canonicalize().map_err(IdentityError::Io)? != executable {
+        return Err(IdentityError::PathMismatch);
     }
     Ok(CodeIdentity {
         identifier,
@@ -210,7 +222,7 @@ fn signing_information(
     if unsafe { SecCodeCopySigningInformation(code.as_CFTypeRef(), 1 << 1, &mut raw) } != 0
         || raw.is_null()
     {
-        return Err(IdentityError::Rejected);
+        return Err(IdentityError::SignatureInvalid);
     }
     // SAFETY: successful Copy returned a retained dictionary of CF values.
     let info: CFDictionary<CFString, CFType> = unsafe { CFDictionary::wrap_under_create_rule(raw) };
@@ -226,7 +238,7 @@ fn signing_information(
         info.find(key)
             .and_then(|v| v.downcast::<CFString>())
             .map(|s| s.to_string())
-            .ok_or(IdentityError::Rejected)
+            .ok_or(IdentityError::SignatureInvalid)
     };
     let identifier = string(identifier_key)?;
     let team = string(team_key)?;
@@ -234,7 +246,7 @@ fn signing_information(
         .find(executable_key)
         .and_then(|v| v.downcast::<CFURL>())
         .and_then(|url| url.to_path())
-        .ok_or(IdentityError::Rejected)?;
+        .ok_or(IdentityError::SignatureInvalid)?;
     Ok((identifier, team, executable))
 }
 

@@ -195,7 +195,16 @@ async fn send<W: tokio::io::AsyncWrite + Unpin>(
 }
 async fn send_error<W: tokio::io::AsyncWrite + Unpin>(write: &mut W, code: EnrollErrorCode) {
     tracing::info!(event = "enroll_rejected", code = code.as_code());
-    let _ = send(write, serde_json::json!({"v":1,"op":"error","code":code.as_code(),"message":"Enrollment rejected"})).await;
+    let message = if code == EnrollErrorCode::NotElevatedOperation {
+        "elevation for this operation is not available yet"
+    } else {
+        "Enrollment rejected"
+    };
+    let _ = send(
+        write,
+        serde_json::json!({"v":1,"op":"error","code":code.as_code(),"message":message}),
+    )
+    .await;
 }
 async fn enrolled<W: tokio::io::AsyncWrite + Unpin>(
     write: &mut W,
@@ -796,7 +805,25 @@ mod handshake_tests {
             .as_str()
             .unwrap()
             .to_owned();
-        let frame = serde_json::json!({"v":1,"op":"elevate","method":"POST","path":"/api/v1/attached","body_sha256":crate::capabilities::first_party::body_digest(b""),"summary":"ignored"});
+        // No rejected HTTP body has been cached yet: fail before pending/provider.
+        let body = serde_json::to_vec(&serde_json::json!({"manifest":"name: agentear\nversion: '1'\nroute_namespace: /api/v1/agentear\nevent_module: agentear\ndata_dir: ~/.agent24/os/agentear/\nimpl_kind: attached_process\n"})).unwrap();
+        let frame = serde_json::json!({"v":1,"op":"elevate","method":"POST","path":"/api/v1/attached","body_sha256":crate::capabilities::first_party::body_digest(&body),"summary":"ignored"});
+        send(client.get_mut(), frame.clone()).await.unwrap();
+        let rejected = line(&mut client).await;
+        assert_eq!(rejected["code"], "not_elevated_operation");
+        assert_eq!(
+            rejected["message"],
+            "elevation for this operation is not available yet"
+        );
+        let authorization = store
+            .validate_bearer(
+                &old,
+                crate::capabilities::Operation::ModelsRead,
+                &crate::capabilities::Resource::global(),
+                crate::capabilities::unix_now(),
+            )
+            .unwrap();
+        authority.remember_attached_request(&authorization.claims.capability_id, &body);
         send(client.get_mut(), frame.clone()).await.unwrap();
         assert_eq!(line(&mut client).await["op"], "elevation_pending");
         assert_eq!(line(&mut client).await["code"], "presence_unavailable");

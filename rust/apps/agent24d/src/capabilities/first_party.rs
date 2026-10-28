@@ -33,8 +33,8 @@ struct Grant {
     expires_at: UnixSeconds,
 }
 struct AttachedSummary {
-    body_sha256: String,
-    name: String,
+    target: Target,
+    summary: String,
     expires_at: UnixSeconds,
 }
 
@@ -43,6 +43,7 @@ pub struct FirstPartyAuthority {
     provider: Mutex<Option<Arc<dyn PresenceProvider>>>,
     grants: Mutex<HashMap<[u8; 32], Grant>>,
     attached_summaries: Mutex<HashMap<String, AttachedSummary>>,
+    module_surfaces: Mutex<Arc<Vec<super::delegation::ModuleSurface>>>,
 }
 impl FirstPartyAuthority {
     pub fn new(store: CapabilityStore) -> Self {
@@ -51,6 +52,7 @@ impl FirstPartyAuthority {
             provider: Mutex::new(None),
             grants: Mutex::new(HashMap::new()),
             attached_summaries: Mutex::new(HashMap::new()),
+            module_surfaces: Mutex::new(Arc::new(Vec::new())),
         }
     }
     /// Derive display context from the rejected HTTP request itself. The
@@ -78,19 +80,59 @@ impl FirstPartyAuthority {
         summaries.insert(
             token_id.to_owned(),
             AttachedSummary {
-                body_sha256: body_digest(bytes),
-                name: manifest.name().to_owned(),
+                target: Target {
+                    operation: Operation::ModuleAdmin,
+                    method: "POST".into(),
+                    template: "/api/v1/attached".into(),
+                    path: "/api/v1/attached".into(),
+                    body_sha256: body_digest(bytes),
+                },
+                summary: format!(
+                    "register attached module '{}'; model_access: {}; kernel_capabilities: [{}]; host_commands: [{}]",
+                    manifest.name(), manifest.model_access().as_str(),
+                    manifest.kernel_capabilities().iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", "),
+                    manifest.host_commands().join(", "),
+                ),
                 expires_at: now + GRANT_TTL,
             },
         );
     }
-    fn attached_name(&self, token_id: &str, body_sha256: &str) -> Option<String> {
-        self.attached_summaries
-            .lock()
-            .ok()?
-            .get(token_id)
-            .filter(|s| s.expires_at > unix_now() && s.body_sha256 == body_sha256)
-            .map(|s| s.name.clone())
+    pub fn set_module_surfaces(&self, surfaces: Arc<Vec<super::delegation::ModuleSurface>>) {
+        if let Ok(mut slot) = self.module_surfaces.lock() {
+            *slot = surfaces;
+        }
+    }
+    fn target_summary(&self, token_id: &str, target: &Target) -> Option<String> {
+        if target.template == "/api/v1/attached" {
+            return self
+                .attached_summaries
+                .lock()
+                .ok()?
+                .get(token_id)
+                .filter(|s| s.expires_at > unix_now() && s.target == *target)
+                .map(|s| s.summary.clone());
+        }
+        if target.body_sha256 != body_digest(b"") {
+            return None;
+        }
+        let name = target
+            .path
+            .strip_prefix("/api/v1/os/")?
+            .strip_suffix("/delegation")?;
+        let surfaces = self.module_surfaces.lock().ok()?;
+        let surface = surfaces.iter().find(|s| s.name == name)?;
+        if surface.routes_sha256.len() != 64
+            || !surface.routes_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        Some(format!(
+            "delegate module '{}'; version: {}; namespace: {}; routes_sha256: {}",
+            surface.name,
+            surface.version,
+            surface.namespace,
+            &surface.routes_sha256[..12]
+        ))
     }
     pub fn set_provider(&self, provider: Option<Arc<dyn PresenceProvider>>) {
         if let Ok(mut slot) = self.provider.lock() {
@@ -285,7 +327,15 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
         .iter()
         .find(|p| p.method == method.as_str() && template_matches(p.template, &request.path))
         .ok_or(EnrollErrorCode::UnknownRoute)?;
-    if policy.level != AssuranceLevel::Elevated {
+    // Full CORE-2 will enable elevated operations individually; each must first
+    // have a daemon-generated summary derived from its actual request body.
+    let supported = policy.operation == Operation::ModuleAdmin
+        && method == Method::POST
+        && matches!(
+            policy.template,
+            "/api/v1/attached" | "/api/v1/os/{name}/delegation"
+        );
+    if policy.level != AssuranceLevel::Elevated || !supported {
         return Err(EnrollErrorCode::NotElevatedOperation);
     }
     Ok(Target {
@@ -324,18 +374,12 @@ impl EnrollAuthority for FirstPartyAuthority {
         let target = resolve_target(&request)?;
         let challenge_id = random_capability_id()[..16].to_owned();
         let expires_at = unix_now() + GRANT_TTL;
+        let details = self
+            .target_summary(id, &target)
+            .ok_or(EnrollErrorCode::NotElevatedOperation)?;
         let summary = format!(
             "{} (pid {}) wants to: {}",
-            peer.identity.identifier,
-            peer.pid,
-            if target.method == "POST" && target.path == "/api/v1/attached" {
-                self.attached_name(id, &target.body_sha256).map_or_else(
-                    || "register attached module".to_owned(),
-                    |name| format!("register attached module '{name}'"),
-                )
-            } else {
-                format!("{} {}", target.method, target.path)
-            }
+            peer.identity.identifier, peer.pid, details
         );
         let req = PresenceRequest {
             challenge_id: challenge_id.clone(),
@@ -442,11 +486,14 @@ mod tests {
             self.0
         }
     }
+    fn attached_body() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({"manifest": "name: agentear\nversion: '1'\nroute_namespace: /api/v1/agentear\nevent_module: agentear\ndata_dir: ~/.agent24/os/agentear/\nimpl_kind: attached_process\n"})).unwrap()
+    }
     fn request() -> ElevateRequest {
         ElevateRequest {
             method: "POST".into(),
             path: "/api/v1/attached".into(),
-            body_sha256: body_digest(b"body"),
+            body_sha256: body_digest(&attached_body()),
             client_summary: "CLIENT SECRET".into(),
         }
     }
@@ -455,6 +502,7 @@ mod tests {
         peer: &EnrolledPeer,
         id: &str,
     ) -> ElevationGrant {
+        authority.remember_attached_request(id, &attached_body());
         let (tx, _rx) = tokio::sync::oneshot::channel();
         authority
             .elevate(peer, id, request(), tx, CancellationToken::new())
@@ -657,6 +705,7 @@ mod tests {
         let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
         let peer = test_peer("g");
         let token = authority.issue(&peer).unwrap();
+        authority.remember_attached_request(&token.token_id, &attached_body());
         for (outcome, code) in [
             (PresenceOutcome::Denied, EnrollErrorCode::PresenceDenied),
             (
@@ -683,6 +732,89 @@ mod tests {
         }
         assert!(authority.grants.lock().unwrap().is_empty());
     }
+    #[tokio::test]
+    async fn delegation_summary_requires_registered_routes_and_empty_body() {
+        struct Capture(Mutex<Vec<PresenceRequest>>);
+        #[async_trait]
+        impl PresenceProvider for Capture {
+            async fn confirm(&self, req: PresenceRequest, _: CancellationToken) -> PresenceOutcome {
+                self.0.lock().unwrap().push(req);
+                PresenceOutcome::Allowed
+            }
+        }
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let peer = test_peer("g");
+        let token = authority.issue(&peer).unwrap();
+        let capture = Arc::new(Capture(Mutex::new(Vec::new())));
+        authority.set_provider(Some(capture.clone()));
+        let mut req = request();
+        req.path = "/api/v1/os/probe/delegation".into();
+        req.body_sha256 = body_digest(b"");
+        let surface = super::super::delegation::ModuleSurface {
+            name: "probe".into(),
+            version: "2.3".into(),
+            namespace: "/api/v1/probe".into(),
+            routes_sha256: body_digest(b"POST /write"),
+        };
+        for surfaces in [
+            vec![],
+            vec![super::super::delegation::ModuleSurface {
+                routes_sha256: String::new(),
+                ..surface.clone()
+            }],
+        ] {
+            authority.set_module_surfaces(Arc::new(surfaces));
+            let (tx, _) = tokio::sync::oneshot::channel();
+            assert_eq!(
+                authority
+                    .elevate(
+                        &peer,
+                        &token.token_id,
+                        req.clone(),
+                        tx,
+                        CancellationToken::new()
+                    )
+                    .await
+                    .err(),
+                Some(EnrollErrorCode::NotElevatedOperation)
+            );
+        }
+        authority.set_module_surfaces(Arc::new(vec![surface.clone()]));
+        let mut nonempty = req.clone();
+        nonempty.body_sha256 = body_digest(b"body");
+        let (tx, _) = tokio::sync::oneshot::channel();
+        assert_eq!(
+            authority
+                .elevate(
+                    &peer,
+                    &token.token_id,
+                    nonempty,
+                    tx,
+                    CancellationToken::new()
+                )
+                .await
+                .err(),
+            Some(EnrollErrorCode::NotElevatedOperation)
+        );
+        assert!(capture.0.lock().unwrap().is_empty());
+        assert!(authority.grants.lock().unwrap().is_empty());
+        let (tx, _) = tokio::sync::oneshot::channel();
+        authority
+            .elevate(&peer, &token.token_id, req, tx, CancellationToken::new())
+            .await
+            .unwrap();
+        let calls = capture.0.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        for detail in [
+            "'probe'",
+            "version: 2.3",
+            "namespace: /api/v1/probe",
+            &surface.routes_sha256[..12],
+        ] {
+            assert!(calls[0].summary.contains(detail), "{}", calls[0].summary);
+        }
+    }
+
     #[test]
     fn daemon_resolves_routes_and_levels() {
         let mut r = request();
