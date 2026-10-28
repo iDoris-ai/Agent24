@@ -14,12 +14,17 @@ impl IdentityVerifier for UnsignedIdentity {
         SystemIdentityVerifier.start_time(pid)
     }
 
-    fn verify(&self, _pid: i32) -> Result<VerifiedIdentity, EnrollErrorCode> {
+    fn verify(
+        &self,
+        _pid: i32,
+        audit_token: Option<agent24_os_proc::AuditToken>,
+    ) -> Result<VerifiedIdentity, EnrollErrorCode> {
         Ok(VerifiedIdentity {
             kind: IdentityKind::MacosSecCode,
             identifier: "agent24".into(),
             team_id: "HYAP444FN9".into(),
             executable: std::env::current_exe().map_err(|_| EnrollErrorCode::IdentityRejected)?,
+            audit_token,
         })
     }
 }
