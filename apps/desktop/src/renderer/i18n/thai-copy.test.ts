@@ -72,11 +72,17 @@ const RULES: Array<{ name: string; bad: RegExp }> = [
   // Round 2 (Arm): the background service is บริการเบื้องหลัง; no เดมอน, no English "daemon" in Thai text.
   { name: '"daemon" must be บริการเบื้องหลัง, not เดมอน', bad: /เดมอน/ },
   { name: 'no English word "daemon" in Thai text', bad: /daemon/i },
-  // Round 2 (Arm): "schedule" is กำหนดการ, not ตารางเวลา or กำหนดเวลา. No exemptions.
+  // Round 2 (Arm): "schedule" is กำหนดการ, not ตารางเวลา. (กำหนดเวลา is a normal word for "deadline", so it is not banned.)
   // Round 2 (Arm, 24 Oct): the "please" word is โปรด, not กรุณา.
   { name: '"please" must be โปรด, not กรุณา', bad: /กรุณา/ },
   { name: '"schedule" must be กำหนดการ, not ตารางเวลา', bad: /ตารางเวลา/ },
-  { name: '"schedule" must be กำหนดการ, not กำหนดเวลา', bad: /กำหนดเวลา/ },
+  // Round 3 (Arm, from real Thai localizations, audit-2): memory feature, restart, ๆ, run, approval, stale.
+  { name: 'memory feature must be ความทรงจำ, not ความจำ (หน่วยความจำ = RAM is fine)', bad: /(?<!หน่วย)(?<!ทรง)ความจำ/ },
+  { name: '"restart" must be รีสตาร์ท, not รีสตาร์ต', bad: /รีสตาร์ต/ },
+  { name: 'no whitespace before ๆ (write ทุกๆ, not ทุก ๆ)', bad: /\sๆ/ },
+  { name: '"run" as a verb must be เรียกใช้, not รัน (รันไทม์ = runtime is fine)', bad: /รัน(?!ไทม์)/ },
+  { name: '"awaiting approval" must be รอการอนุมัติ, not รออนุมัติ', bad: /รออนุมัติ/ },
+  { name: '"stale data" must be ล้าสมัย, not ไม่เป็นปัจจุบัน', bad: /ไม่เป็นปัจจุบัน/ },
 ]
 
 describe('Thai UI copy', () => {

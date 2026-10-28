@@ -25,7 +25,7 @@ export const approvalsMessages = defineMessages({
     'page.title': 'รอการอนุมัติ ({count})',
     'page.subtitle': 'อนุมัติการใช้เครื่องมือ · รีเฟรชทุก 2 วินาที · แจ้งเตือนเมื่อมีรายการใหม่',
     'notification.title': 'ต้องอนุมัติ',
-    'empty': 'ไม่มีรายการรออนุมัติ',
+    'empty': 'ไม่มีรายการรอการอนุมัติ',
     'decision.approve': 'อนุมัติ', 'decision.approveForSession': 'อนุมัติตลอดเซสชัน',
     'decision.deny': 'ปฏิเสธ', 'decision.abort': 'ยกเลิกงาน',
     'deny.reason': 'เหตุผลที่ปฏิเสธ', 'deny.placeholder': 'เหตุผลที่ปฏิเสธ (จำเป็น)',
