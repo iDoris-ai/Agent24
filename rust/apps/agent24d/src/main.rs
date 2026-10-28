@@ -23,6 +23,8 @@ mod comm_routes;
 mod consent_routes;
 mod decide_routes;
 mod domain;
+#[allow(dead_code, reason = "frozen CORE-2 slice seam; wired by S1/S2")]
+mod enroll_api;
 mod enroll_endpoint;
 mod events;
 mod events_emit;
