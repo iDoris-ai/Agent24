@@ -414,12 +414,15 @@ async fn forced_stop_is_reported_and_does_not_leave_a_process() {
 async fn restore_replays_no_completed_operation_and_honors_stop_intent() {
     let f = Fixture::new().await;
     f.install().await;
+    let start = f.host.submit(Action::Start, None).await.unwrap();
+    assert_eq!(f.complete(&start).await.result, Some(Outcome::Succeeded));
+    let attempts = fs::read(f.host.root.join("data/state/attempts.jsonl")).unwrap();
     let stop = f
         .host
         .submit(Action::Stop, Some("persistent-stop"))
         .await
         .unwrap();
-    assert_eq!(stop.result, Some(Outcome::Succeeded));
+    assert_eq!(f.complete(&stop).await.result, Some(Outcome::Succeeded));
     let restored = IdorisHost::open(
         f.host.root.clone(),
         f.host.managed.clone(),
@@ -429,7 +432,12 @@ async fn restore_replays_no_completed_operation_and_honors_stop_intent() {
     )
     .unwrap();
     restored.restore().await.unwrap();
+    assert!(restored.inner.lock().await.active.is_none());
     assert_eq!(restored.status().await.state, State::Stopped);
+    assert_eq!(
+        fs::read(f.host.root.join("data/state/attempts.jsonl")).unwrap(),
+        attempts
+    );
     assert_eq!(
         restored.operation(&stop.operation_id).await.unwrap().result,
         Some(Outcome::Succeeded)
@@ -446,22 +454,29 @@ async fn restore_replays_no_completed_operation_and_honors_stop_intent() {
 
 #[tokio::test]
 async fn leftover_identity_conflict_is_preserved_without_spawning() {
-    let f = Fixture::new().await;
-    f.install().await;
-    let path = f.host.root.join("data/state/managed-process.json");
-    fs::write(
-        &path,
-        serde_json::to_vec(&json!({"pid": std::process::id(), "start_time": 0,
-        "executable": std::env::current_exe().unwrap(), "uid": 0}))
-        .unwrap(),
+    let owner = Fixture::new().await;
+    owner.install().await;
+    let started = owner.host.submit(Action::Start, None).await.unwrap();
+    assert_eq!(
+        owner.complete(&started).await.result,
+        Some(Outcome::Succeeded)
+    );
+    let mut record: serde_json::Value = serde_json::from_slice(
+        &fs::read(owner.host.root.join("data/state/managed-process.json")).unwrap(),
     )
     .unwrap();
+    let f = Fixture::new().await;
+    f.install().await;
+    // Keep the real live PID, start time and UID. A fabricated start time
+    // represents a reused PID, which IL-07 now safely clears as stale.
+    record["executable"] = json!(f.record.release_dir.join("foreign-idoris"));
+    let path = f.host.root.join("data/state/managed-process.json");
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
     mode(&path, 0o600);
     let op = f.host.submit(Action::Start, None).await.unwrap();
-    assert_eq!(
-        f.complete(&op).await.error_code,
-        Some(Code::InstanceConflict)
-    );
+    let completed = f.complete(&op).await;
+    owner.host.shutdown().await.unwrap();
+    assert_eq!(completed.error_code, Some(Code::InstanceConflict));
     assert_eq!(f.host.status().await.state, State::InstanceConflict);
     assert!(path.exists());
     assert!(!f.host.root.join("data/state/attempts.jsonl").exists());
@@ -885,3 +900,298 @@ async fn cancel_interrupts_a_pending_keychain_read_before_spawn() {
 }
 
 mod provision;
+
+#[tokio::test]
+async fn concurrent_submits_admit_exactly_one_start() {
+    let f = Fixture::new().await;
+    f.install().await;
+    f.runtime.gate.store(true, Ordering::SeqCst);
+    let barrier = Arc::new(tokio::sync::Barrier::new(33));
+    let mut tasks = Vec::new();
+    for _ in 0..32 {
+        let host = f.host.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            host.submit(Action::Start, None).await
+        }));
+    }
+    barrier.wait().await;
+    let mut admitted = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(_) => admitted += 1,
+            Err(Code::Busy) => {}
+            Err(code) => panic!("unexpected admission error: {code:?}"),
+        }
+    }
+    f.host.shutdown().await.unwrap();
+    assert_eq!(admitted, 1);
+}
+
+#[tokio::test]
+async fn rejected_start_does_not_persist_running_intent() {
+    let f = Fixture::new().await;
+    let mut record = f.record.clone();
+    record.desired_running = false;
+    f.host.record_installation(record).await.unwrap();
+    // The operations destination fails after installation.json is writable.
+    let path = f.host.root.join("operations.json");
+    fs::create_dir(&path).unwrap();
+    assert!(matches!(
+        f.host.submit(Action::Start, None).await,
+        Err(Code::PersistenceFailed)
+    ));
+    fs::remove_dir(path).unwrap();
+    let restored = IdorisHost::open(
+        f.host.root.clone(),
+        f.host.managed.clone(),
+        f.host.router.clone(),
+        f.runtime.clone(),
+        f.host.secrets.clone(),
+    )
+    .unwrap();
+    restored.restore().await.unwrap();
+    let launched = restored.inner.lock().await.active.is_some();
+    restored.shutdown().await.unwrap();
+    let record: Installation =
+        serde_json::from_slice(&fs::read(f.host.root.join("installation.json")).unwrap()).unwrap();
+    assert!(
+        !record.desired_running,
+        "rejected start left a running intent on disk"
+    );
+    assert!(!launched, "restore admitted a rejected start");
+    assert!(
+        !f.host
+            .inner
+            .lock()
+            .await
+            .installation
+            .as_ref()
+            .unwrap()
+            .desired_running
+    );
+}
+
+#[tokio::test]
+async fn stale_closed_monitor_cannot_take_the_next_supervisor_or_block_status() {
+    let f = Fixture::new().await;
+    f.install().await;
+    let start = f.host.submit(Action::Start, None).await.unwrap();
+    let old_cancel = f.host.inner.lock().await.active.as_ref().unwrap().1.clone();
+    assert_eq!(f.complete(&start).await.result, Some(Outcome::Succeeded));
+    let old_generation = start.operation_id.clone();
+    let stop = f.host.submit(Action::Stop, None).await.unwrap();
+    assert_eq!(f.complete(&stop).await.result, Some(Outcome::Succeeded));
+    assert!(old_cancel.is_cancelled());
+    let start = f.host.submit(Action::Start, None).await.unwrap();
+    let new_stop = f.host.inner.lock().await.active.as_ref().unwrap().1.clone();
+    assert_eq!(f.complete(&start).await.result, Some(Outcome::Succeeded));
+    let inner = f.host.inner.lock().await;
+    let (sender, signal) = watch::channel(true);
+    drop(sender);
+    // Wake A's closed-channel monitor only after B has been installed.
+    f.host.monitor(
+        signal,
+        f.record.clone(),
+        old_generation,
+        old_cancel,
+        Arc::new(SyncMutex::new(None)),
+    );
+    tokio::task::yield_now().await;
+    drop(inner);
+    let status = tokio::time::timeout(Duration::from_millis(300), f.host.status()).await;
+    // B must be stopped even when the regression holds inner across B.wait().
+    new_stop.cancel();
+    f.host.shutdown().await.unwrap();
+    assert!(
+        status.is_ok(),
+        "stale monitor blocked status on the new supervisor"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn stop_after_reopen_reaps_a_live_leftover_without_starting() {
+    let f = Fixture::new().await;
+    f.install().await;
+    let executable = fs::canonicalize("/bin/sleep").unwrap();
+    fs::remove_file(f.record.release_dir.join("idoris")).unwrap();
+    std::os::unix::fs::symlink(&executable, f.record.release_dir.join("idoris")).unwrap();
+    let mut command = tokio::process::Command::new(&executable);
+    command.arg("60").process_group(0).kill_on_drop(true);
+    let mut child = command.spawn().unwrap();
+    let pid = child.id().unwrap();
+    let info =
+        libproc::libproc::proc_pid::pidinfo::<libproc::libproc::bsd_info::BSDInfo>(pid as i32, 0)
+            .unwrap();
+    let record = json!({"pid":pid, "uid":info.pbi_uid,
+        "start_time":info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+        "executable":executable});
+    write_json(
+        &f.host.root.join("data/state/managed-process.json"),
+        &record,
+    )
+    .unwrap();
+    // Model SIGKILL after the stop intent is durable, before any worker runs.
+    let mut stopped = f.record.clone();
+    stopped.desired_running = false;
+    write_json(&f.host.root.join("installation.json"), &stopped).unwrap();
+    let restored = IdorisHost::open(
+        f.host.root.clone(),
+        f.host.managed.clone(),
+        f.host.router.clone(),
+        f.runtime.clone(),
+        f.host.secrets.clone(),
+    )
+    .unwrap();
+    let mut reaper = tokio::spawn(async move { child.wait().await.unwrap() });
+    restored.restore().await.unwrap();
+    let stop = restored.submit(Action::Stop, None).await.unwrap();
+    let completed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let op = restored.operation(&stop.operation_id).await.unwrap();
+            if op.result.is_some() {
+                break op;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let exited = tokio::time::timeout(Duration::from_millis(500), &mut reaper)
+        .await
+        .is_ok();
+    if !exited {
+        reaper.abort();
+        let _ = reaper.await;
+    }
+    assert!(exited, "Stop left the recorded child alive");
+    assert_eq!(completed.result, Some(Outcome::Succeeded));
+    f.assert_clean();
+    assert!(!f.host.root.join("data/state/attempts.jsonl").exists());
+}
+
+#[tokio::test]
+async fn stopped_generation_cannot_publish_a_gateway_after_prepare() {
+    let f = Fixture::new().await;
+    f.install().await;
+    let start = f.host.submit(Action::Start, None).await.unwrap();
+    assert_eq!(f.complete(&start).await.result, Some(Outcome::Succeeded));
+    let mut inner = f.host.inner.lock().await;
+    let supervisor = inner.supervisor.take().unwrap();
+    inner.generation = None;
+    f.host.block_gateway();
+    let (sender, signal) = watch::channel(false);
+    f.host.monitor(
+        signal,
+        f.record.clone(),
+        start.operation_id,
+        CancellationToken::new(),
+        Arc::new(SyncMutex::new(None)),
+    );
+    sender.send(true).unwrap();
+    // Keep stop's lock until preparation has queued the final generation check.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            drop(inner);
+            match f.host.inner.try_lock() {
+                Ok(reacquired) => inner = reacquired,
+                Err(_) => break,
+            }
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), sender.closed())
+        .await
+        .unwrap();
+    let blocked = f.host.router.idoris_gateway().is_err();
+    supervisor.stop().await.unwrap();
+    f.host.shutdown().await.unwrap();
+    assert!(blocked, "monitor published its prepared gateway after stop");
+}
+
+#[tokio::test]
+async fn stale_monitor_generation_is_rejected_even_without_cancellation() {
+    let f = Fixture::new().await;
+    f.install().await;
+    let start = f.host.submit(Action::Start, None).await.unwrap();
+    let stop_token = f.host.inner.lock().await.active.as_ref().unwrap().1.clone();
+    assert_eq!(f.complete(&start).await.result, Some(Outcome::Succeeded));
+    let inner = f.host.inner.lock().await;
+    let (sender, signal) = watch::channel(true);
+    drop(sender);
+    f.host.monitor(
+        signal,
+        f.record.clone(),
+        "retired-generation".into(),
+        CancellationToken::new(),
+        Arc::new(SyncMutex::new(None)),
+    );
+    tokio::task::yield_now().await;
+    drop(inner);
+    let status = tokio::time::timeout(Duration::from_millis(300), f.host.status()).await;
+    stop_token.cancel();
+    f.host.shutdown().await.unwrap();
+    assert!(status.is_ok(), "monitor ignored its generation identity");
+}
+
+#[tokio::test]
+async fn rejected_start_when_intent_write_fails_is_not_admitted_or_restored() {
+    let f = Fixture::new().await;
+    let mut record = f.record.clone();
+    record.desired_running = false;
+    f.host.record_installation(record.clone()).await.unwrap();
+    let path = f.host.root.join("installation.json");
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    assert!(matches!(
+        f.host.submit(Action::Start, Some("rejected")).await,
+        Err(Code::PersistenceFailed)
+    ));
+    assert!(f.host.inner.lock().await.active.is_none());
+    assert!(f.host.inner.lock().await.operations.is_empty());
+    fs::remove_dir(&path).unwrap();
+    write_json(&path, &record).unwrap();
+    let restored = IdorisHost::open(
+        f.host.root.clone(),
+        f.host.managed.clone(),
+        f.host.router.clone(),
+        f.runtime.clone(),
+        f.host.secrets.clone(),
+    )
+    .unwrap();
+    restored.restore().await.unwrap();
+    assert!(restored.inner.lock().await.active.is_none());
+    assert!(!f.host.root.join("data/state/attempts.jsonl").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn stop_preserves_an_unverified_live_leftover_without_signalling() {
+    let owner = Fixture::new().await;
+    owner.install().await;
+    let start = owner.host.submit(Action::Start, None).await.unwrap();
+    assert_eq!(
+        owner.complete(&start).await.result,
+        Some(Outcome::Succeeded)
+    );
+    let f = Fixture::new().await;
+    f.install().await;
+    let mut record: serde_json::Value = serde_json::from_slice(
+        &fs::read(owner.host.root.join("data/state/managed-process.json")).unwrap(),
+    )
+    .unwrap();
+    record["uid"] = json!(record["uid"].as_u64().unwrap() + 1);
+    let path = f.host.root.join("data/state/managed-process.json");
+    write_json(&path, &record).unwrap();
+    let stop = f.host.submit(Action::Stop, None).await.unwrap();
+    let completed = f.complete(&stop).await;
+    assert_eq!(completed.error_code, Some(Code::InstanceConflict));
+    assert!(path.exists());
+    assert_eq!(owner.host.status().await.state, State::Running);
+    assert!(owner.host.router.idoris_gateway().is_ok());
+    owner.host.shutdown().await.unwrap();
+}

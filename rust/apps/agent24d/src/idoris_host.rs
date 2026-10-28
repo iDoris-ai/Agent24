@@ -431,6 +431,7 @@ struct Inner {
     operations: BTreeMap<String, Operation>,
     active: Option<(String, CancellationToken)>,
     supervisor: Option<Supervisor>,
+    generation: Option<String>,
     closing: bool,
 }
 pub struct IdorisHost {
@@ -539,6 +540,7 @@ impl IdorisHost {
                 operations,
                 active: None,
                 supervisor: None,
+                generation: None,
                 closing: false,
             }),
         }))
@@ -643,14 +645,14 @@ impl IdorisHost {
             }
         }
         let guard = self.coordinator_lock()?;
-        if let Some(r) = i.installation.as_mut() {
-            let mut updated = r.clone();
-            updated.desired_running = action == Action::Start;
-            write_json(&self.root.join("installation.json"), &updated)?;
-            *r = updated;
-        }
         let noop = (action == Action::Start && i.state == State::Running)
-            || (action == Action::Stop && i.supervisor.is_none());
+            || (action == Action::Stop
+                && i.supervisor.is_none()
+                && !self
+                    .root
+                    .join("data/state/managed-process.json")
+                    .try_exists()
+                    .map_err(|_| Code::PersistenceFailed)?);
         let op = Operation {
             operation_id: uuid::Uuid::new_v4().to_string(),
             action,
@@ -670,6 +672,18 @@ impl IdorisHost {
         if let Err(e) = write_json(&self.root.join("operations.json"), &i.operations) {
             i.operations.remove(&op.operation_id);
             return Err(e);
+        }
+        // Commit the operation before the intent: a rejected start must never
+        // leave an autostart intent for the next daemon. An interrupted queued
+        // operation is cancelled by open().
+        if let Some(r) = i.installation.as_mut() {
+            let mut updated = r.clone();
+            updated.desired_running = action == Action::Start;
+            if let Err(error) = write_json(&self.root.join("installation.json"), &updated) {
+                i.operations.remove(&op.operation_id);
+                return Err(error);
+            }
+            *r = updated;
         }
         if noop {
             if action == Action::Stop {
@@ -714,25 +728,22 @@ impl IdorisHost {
         }
         self.router.block_idoris("managed iDoris not ready");
     }
-    async fn connect_gateway(
+    async fn prepare_gateway(
         &self,
         record: &Installation,
         cancel: &CancellationToken,
-    ) -> Result<(), Code> {
+    ) -> Result<(ManagedConfig, IdorisGateway), Code> {
         let secrets = ClassifiedSecrets {
             source: self.secrets.as_ref(),
             failure: SyncMutex::new(None),
         };
-        self.managed
-            .connect(
-                ManagedConfig {
-                    url: format!("http://127.0.0.1:{}", record.data_port),
-                    key_id: record.key_id.clone().ok_or(Code::NotConfigured)?,
-                },
-                &secrets,
-                cancel,
-            )
+        let config = ManagedConfig {
+            url: format!("http://127.0.0.1:{}", record.data_port),
+            key_id: record.key_id.clone().ok_or(Code::NotConfigured)?,
+        };
+        ManagedIdoris::prepare(&config, &secrets, cancel)
             .await
+            .map(|gateway| (config, gateway))
             .map_err(|_| {
                 if cancel.is_cancelled() {
                     Code::Cancelled
@@ -745,6 +756,19 @@ impl IdorisHost {
                 }
             })
     }
+    async fn connect_gateway(
+        &self,
+        record: &Installation,
+        cancel: &CancellationToken,
+    ) -> Result<(), Code> {
+        let (config, gateway) = self.prepare_gateway(record, cancel).await?;
+        if cancel.is_cancelled() {
+            return Err(Code::Cancelled);
+        }
+        self.managed.persist_config(&config)?;
+        self.router.replace_idoris(gateway);
+        Ok(())
+    }
     async fn execute(
         self: &Arc<Self>,
         action: Action,
@@ -754,12 +778,27 @@ impl IdorisHost {
         if action == Action::Stop {
             self.phase(id, Phase::Stopping).await;
             self.block_gateway();
-            let supervisor = self.inner.lock().await.supervisor.take();
+            let (supervisor, record) = {
+                let mut i = self.inner.lock().await;
+                i.generation = None;
+                (i.supervisor.take(), i.installation.clone())
+            };
             if let Some(s) = supervisor {
                 let report = s.stop().await.map_err(Code::from)?;
                 if report.forced || report.drain_timed_out {
                     return Err(Code::StopTimeout);
                 }
+            } else {
+                let record = record.ok_or(Code::InstanceConflict)?;
+                Supervisor::recover_leftover(
+                    DataPaths {
+                        db: self.root.join("data/idoris.sqlite3"),
+                        state: self.root.join("data/state"),
+                    },
+                    &record.release_dir.join("idoris"),
+                )
+                .await
+                .map_err(Code::from)?;
             }
             return Ok(());
         }
@@ -771,8 +810,18 @@ impl IdorisHost {
         };
         let (supervisor, ready, refresh_failure) =
             self.start_record(&record, id, cancel, true, None).await?;
-        self.inner.lock().await.supervisor = Some(supervisor);
-        self.monitor(ready, record, cancel.clone(), refresh_failure);
+        {
+            let mut i = self.inner.lock().await;
+            i.supervisor = Some(supervisor);
+            i.generation = Some(id.to_owned());
+        }
+        self.monitor(
+            ready,
+            record,
+            id.to_owned(),
+            cancel.clone(),
+            refresh_failure,
+        );
         Ok(())
     }
     async fn start_record(
@@ -896,6 +945,7 @@ impl IdorisHost {
         self: &Arc<Self>,
         mut signal: watch::Receiver<bool>,
         record: Installation,
+        generation: String,
         cancel: CancellationToken,
         refresh_failure: Arc<SyncMutex<Option<Code>>>,
     ) {
@@ -906,33 +956,20 @@ impl IdorisHost {
                 let Some(host) = host.upgrade() else {
                     return;
                 };
-                if host
-                    .inner
-                    .lock()
-                    .await
-                    .supervisor
-                    .as_ref()
-                    .is_none_or(|s| !s.accepting_requests().same_channel(&signal))
-                {
-                    return;
-                }
                 if changed.is_err() {
                     loop {
                         let notified = host.changed.notified();
                         let mut i = host.inner.lock().await;
-                        if i.closing {
+                        if i.closing
+                            || cancel.is_cancelled()
+                            || i.generation.as_deref() != Some(&generation)
+                        {
                             return;
                         }
                         if i.active.is_some() {
                             drop(i);
                             notified.await;
                             continue;
-                        }
-                        if i.supervisor
-                            .as_ref()
-                            .is_none_or(|s| !s.accepting_requests().same_channel(&signal))
-                        {
-                            return;
                         }
                         if let Some(supervisor) = i.supervisor.take() {
                             // The readiness sender has closed: the supervisor has
@@ -956,20 +993,33 @@ impl IdorisHost {
                     }
                 }
                 if !*signal.borrow_and_update() {
-                    host.block_gateway();
                     let mut i = host.inner.lock().await;
-                    if !i.closing && !cancel.is_cancelled() && i.supervisor.is_some() {
+                    if !i.closing
+                        && !cancel.is_cancelled()
+                        && i.generation.as_deref() == Some(&generation)
+                        && i.supervisor.is_some()
+                    {
+                        host.block_gateway();
                         i.state = State::Starting;
                     }
                 } else {
                     if cancel.is_cancelled() {
                         return;
                     }
-                    let result = host.connect_gateway(&record, &cancel).await;
+                    let prepared = host.prepare_gateway(&record, &cancel).await;
                     let mut i = host.inner.lock().await;
-                    if i.closing || cancel.is_cancelled() || i.supervisor.is_none() {
+                    if i.closing
+                        || cancel.is_cancelled()
+                        || i.generation.as_deref() != Some(&generation)
+                        || i.supervisor.is_none()
+                    {
                         return;
                     }
+                    let result = prepared.and_then(|(config, gateway)| {
+                        host.managed.persist_config(&config)?;
+                        host.router.replace_idoris(gateway);
+                        Ok(())
+                    });
                     if result.is_ok() {
                         i.state = State::Running;
                     } else {

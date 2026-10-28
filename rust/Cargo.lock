@@ -529,6 +529,7 @@ dependencies = [
  "http-body-util",
  "jsonschema",
  "libc",
+ "libproc",
  "rand 0.9.5",
  "rustix 0.38.44",
  "serde",

@@ -54,6 +54,22 @@ struct Fixture {
     _root: tempfile::TempDir,
     root: PathBuf,
 }
+
+/// The fixture child must own its listeners (F3), so a test proxy cannot hold
+/// them. Ports come from 20000-29999, below every kernel ephemeral range, so
+/// no concurrent `bind(0)` can be handed one; each port is issued once per
+/// test process, and a per-process offset separates parallel worktrees.
+fn reserve_port() -> u16 {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let offset = std::process::id() as usize * 397;
+    loop {
+        let port = 20_000 + (offset + NEXT.fetch_add(1, Ordering::SeqCst)) % 10_000;
+        let port = port as u16;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+}
 impl Fixture {
     fn new(scenario: serde_json::Value) -> Self {
         let temp = tempfile::tempdir().unwrap();
@@ -79,6 +95,9 @@ impl Fixture {
             1,
         );
         fs::write(root.join("release/idoris"), script).unwrap();
+        for name in ["catalog.yaml", "routing-policy.yaml"] {
+            fs::write(root.join("release/config").join(name), "fixture: true\n").unwrap();
+        }
         fs::set_permissions(
             root.join("release/idoris"),
             fs::Permissions::from_mode(0o700),
@@ -96,7 +115,7 @@ impl Fixture {
     }
     async fn config(&self) -> StartConfig {
         let components = ComponentsDir::new(&self.root, &self.root.join("components")).unwrap();
-        let installed = InstalledVersion::fixture(self.root.join("release"));
+        let installed = InstalledVersion::fixture(self.root.join("release")).unwrap();
         let data = DataPaths {
             db: self.root.join("db.sqlite3"),
             state: self.root.join("state"),
@@ -105,10 +124,14 @@ impl Fixture {
         config.log_dir = self.root.join("logs");
         config.diagnostic_output = true;
         config.ports = Ports {
-            data: free_port().await,
-            admin: free_port().await,
+            data: reserve_port(),
+            admin: reserve_port(),
         };
-        config.timings.ready = Duration::from_secs(3);
+        // Tests that expect readiness must not depend on scheduling: a fresh
+        // fixture executable can take seconds to start on a loaded host (the
+        // F8 reproductions saw load average 51 with XProtect scanning). Tests
+        // about the deadline itself set their own short bound.
+        config.timings.ready = Duration::from_secs(20);
         config.timings.poll = Duration::from_millis(10);
         config.timings.terminate = Duration::from_millis(70);
         config.timings.restart_delays = [
@@ -129,13 +152,10 @@ impl Fixture {
         self.root.join("state/managed-process.json")
     }
 }
-async fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+impl Fixture {
+    fn release_exit(&self) {
+        fs::write(self.root.join("state/release-exit"), "exit").unwrap();
+    }
 }
 async fn inputs() -> Result<LaunchInputs, SupervisorError> {
     Ok(LaunchInputs {
@@ -288,7 +308,8 @@ async fn health_invalid_or_missing_fields_stop_child_and_never_retry() {
         .await;
         assert!(
             matches!(result, Err(SupervisorError::Contract)),
-            "missing {field}"
+            "missing {field}: {:?}",
+            result.as_ref().err()
         );
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert!(!fixture.record().exists());
@@ -307,7 +328,8 @@ async fn health_invalid_or_missing_fields_stop_child_and_never_retry() {
         let result = Supervisor::start(fixture.config().await, inputs, || async {}).await;
         assert!(
             matches!(result, Err(SupervisorError::Contract)),
-            "invalid {field}"
+            "invalid {field}: {:?}",
+            result.as_ref().err()
         );
         assert!(!fixture.record().exists());
     }
@@ -394,8 +416,9 @@ async fn crash_restarts_three_times_with_fresh_inputs_and_tokens() {
 #[tokio::test]
 async fn no_restart_for_l4_config_auth_budget_contract_or_user_stop() {
     for error_code in [1, 3] {
-        let fixture =
-            Fixture::new(serde_json::json!({"mode": "exit_after_ready", "code": error_code}));
+        let fixture = Fixture::new(
+            serde_json::json!({"mode": "exit_after_ready", "code": error_code, "wait_for_exit": true, "after": 0.0}),
+        );
         let count = Arc::new(AtomicUsize::new(0));
         let calls = count.clone();
         let supervisor = Supervisor::start(
@@ -408,6 +431,7 @@ async fn no_restart_for_l4_config_auth_budget_contract_or_user_stop() {
         )
         .await
         .unwrap();
+        fixture.release_exit();
         assert!(supervisor.wait().await.is_err());
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
@@ -418,7 +442,8 @@ async fn no_restart_for_l4_config_auth_budget_contract_or_user_stop() {
         SupervisorError::Contract,
         SupervisorError::InstanceConflict,
     ] {
-        let fixture = Fixture::new(serde_json::json!({"mode": "crash"}));
+        let fixture =
+            Fixture::new(serde_json::json!({"mode": "crash", "wait_for_exit": true, "after": 0.0}));
         let mut next_error = Some(error);
         let mut called = false;
         let supervisor = Supervisor::start(
@@ -439,6 +464,7 @@ async fn no_restart_for_l4_config_auth_budget_contract_or_user_stop() {
         )
         .await
         .unwrap();
+        fixture.release_exit();
         assert!(supervisor.wait().await.is_err());
         assert_eq!(fixture.attempts().len(), 1);
     }
@@ -481,7 +507,10 @@ async fn leftover_four_fields_must_match_before_any_signal() {
     for field in ["pid", "start_time", "executable", "uid"] {
         let mut bad = record.clone();
         match field {
-            "pid" => bad.pid = std::process::id(),
+            "pid" => {
+                bad.pid = std::process::id();
+                bad.start_time = ProcessRecord::capture(bad.pid).unwrap().start_time;
+            }
             "start_time" => bad.start_time += 1,
             "executable" => bad.executable = PathBuf::from("/different-program"),
             "uid" => bad.uid += 1,
@@ -491,10 +520,18 @@ async fn leftover_four_fields_must_match_before_any_signal() {
         let result = lease
             .recover(&timings, &CancellationToken::new(), &record.executable)
             .await;
-        assert!(
-            matches!(result, Err(SupervisorError::InstanceConflict)),
-            "{field}"
-        );
+        if field == "start_time" {
+            // A reused PID belongs to a new process. The recorded process is
+            // gone, so clear the stale record without signalling its new owner.
+            assert!(result.is_ok(), "{result:?}");
+            assert!(!fixture.record().exists());
+        } else {
+            assert!(
+                matches!(result, Err(SupervisorError::InstanceConflict)),
+                "{field}"
+            );
+            assert!(fixture.record().exists());
+        }
         assert!(
             child.try_wait().unwrap().is_none(),
             "sent a signal on {field} mismatch"
@@ -525,7 +562,8 @@ async fn real_v040_ready_then_stop() {
     .unwrap();
     fs::remove_file(fixture.root.join("components/scenario.json")).unwrap();
     let mut config = fixture.config().await;
-    config.installed = InstalledVersion::fixture(fs::canonicalize(release).unwrap());
+    config.installed = InstalledVersion::fixture(fs::canonicalize(release).unwrap()).unwrap();
+    config.ports = Ports::default();
     config.timings = Timings::default();
     config.diagnostic_output = false;
     let supervisor = Supervisor::start(
@@ -611,7 +649,14 @@ async fn pre_cancel_and_token_deadline_fail_without_downgrade() {
     config.timings.token_write = Duration::ZERO;
     let result = Supervisor::start(config, inputs, || async {}).await;
     assert!(matches!(result, Err(SupervisorError::TokenHandoff)));
-    assert!(fixture.attempts().is_empty());
+    // The child is already spawned when the handoff deadline fails, and the
+    // 50 ms early-exit wait (kept for exit-code fidelity) lets a fast
+    // interpreter read EOF before SIGTERM lands. That attempt is legitimate;
+    // the invariant is that no attempt ever received a token.
+    for attempt in fixture.attempts() {
+        assert_eq!(attempt["length"], 0, "token reached the child: {attempt}");
+        assert_eq!(attempt["valid_frame"], false);
+    }
     assert!(!fixture.record().exists());
 }
 
@@ -684,4 +729,607 @@ async fn blocked_or_closed_stdin_fails_handoff_within_deadline() {
     )
     .await;
     assert!(matches!(error, Err(SupervisorError::TokenHandoff)));
+}
+
+#[tokio::test]
+async fn dead_leftover_is_cleared_on_repeated_recovery() {
+    let fixture = Fixture::new(serde_json::json!({}));
+    let mut child = Command::new("/bin/sleep")
+        .arg("60")
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let record = ProcessRecord::capture(child.id().unwrap()).unwrap();
+    child.kill().await.unwrap();
+    let lease = Lease::acquire(&fixture.root.join("state")).unwrap();
+    lease.write(&record).unwrap();
+    for _ in 0..2 {
+        let result = lease
+            .recover(
+                &Timings::default(),
+                &CancellationToken::new(),
+                &record.executable,
+            )
+            .await;
+        assert!(result.is_ok(), "dead record blocks recovery: {result:?}");
+        assert!(!fixture.record().exists());
+    }
+}
+
+#[tokio::test]
+async fn reused_pid_is_cleared_without_signalling_new_owner() {
+    let fixture = Fixture::new(serde_json::json!({}));
+    let mut child = Command::new("/bin/sleep")
+        .arg("60")
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut record = ProcessRecord::capture(child.id().unwrap()).unwrap();
+    record.start_time += 1;
+    let lease = Lease::acquire(&fixture.root.join("state")).unwrap();
+    lease.write(&record).unwrap();
+    let result = lease
+        .recover(
+            &Timings::default(),
+            &CancellationToken::new(),
+            &record.executable,
+        )
+        .await;
+    let untouched = child.try_wait().unwrap().is_none();
+    child.kill().await.unwrap();
+    assert!(result.is_ok(), "reused PID blocks recovery: {result:?}");
+    assert!(!fixture.record().exists());
+    assert!(untouched, "signalled the new PID owner");
+}
+
+#[tokio::test]
+async fn foreign_health_without_child_admin_never_becomes_ready() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture = Fixture::new(serde_json::json!({"mode": "no_read"}));
+    let mut config = fixture.config().await;
+    config.ports.data = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            let body = healthy().to_string();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let result = Supervisor::start(config, inputs, || async {}).await;
+    server.abort();
+    // The foreign data listener is now identified as a port conflict (L4).
+    let rejected = matches!(result, Err(SupervisorError::InstanceConflict));
+    if let Ok(supervisor) = result {
+        supervisor.stop().await.unwrap();
+    }
+    assert!(
+        rejected,
+        "foreign /health admitted a child that never bound"
+    );
+    assert!(!fixture.record().exists());
+}
+
+#[tokio::test]
+async fn modified_installed_files_are_rejected_before_spawn() {
+    for name in [
+        "idoris",
+        "config/catalog.yaml",
+        "config/routing-policy.yaml",
+    ] {
+        let fixture = Fixture::new(serde_json::json!({}));
+        let config = fixture.config().await;
+        let path = fixture.root.join("release").join(name);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&path, bytes).unwrap();
+        assert!(
+            serve_command(&config, &Budget { allocated_bytes: 0 }, None).is_err(),
+            "accepted changed {name}"
+        );
+        assert!(fixture.attempts().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn reaped_leader_does_not_signal_recycled_group() {
+    let fixture = Fixture::new(serde_json::json!({}));
+    let config = Arc::new(fixture.config().await);
+    let lease = Lease::acquire(&config.data.state).unwrap();
+    let mut process = ManagedProcess::start(config, inputs().await.unwrap(), &lease)
+        .await
+        .unwrap();
+    // Reap through the production path: observe the exit, then snapshot.
+    process.child.start_kill().unwrap();
+    process.child.wait().await.unwrap();
+    process.adopt_survivors().unwrap();
+    let mut foreign = Command::new("/bin/sleep")
+        .arg("60")
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    // Model a cached PGID that now names an unrelated process group.
+    process.group = Some(Pid::from_raw(foreign.id().unwrap() as i32));
+    // An unproven group is neither signalled nor restarted beside.
+    assert!(matches!(
+        process.finish().await,
+        Err(SupervisorError::InstanceConflict)
+    ));
+    sleep(Duration::from_millis(20)).await;
+    let untouched = foreign.try_wait().unwrap().is_none();
+    if untouched {
+        foreign.kill().await.unwrap();
+    }
+    assert!(
+        untouched,
+        "signalled a cached PGID after reaping its leader"
+    );
+}
+
+#[tokio::test]
+async fn symlinked_installed_files_are_rejected_before_spawn() {
+    for name in [
+        "idoris",
+        "config/catalog.yaml",
+        "config/routing-policy.yaml",
+    ] {
+        let fixture = Fixture::new(serde_json::json!({}));
+        let config = fixture.config().await;
+        let path = fixture.root.join("release").join(name);
+        let target = path.with_extension("original");
+        fs::rename(&path, &target).unwrap();
+        std::os::unix::fs::symlink(target, path).unwrap();
+        assert!(
+            serve_command(&config, &Budget { allocated_bytes: 0 }, None).is_err(),
+            "followed {name} symlink"
+        );
+        assert!(fixture.attempts().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn modified_binary_is_rejected_on_crash_restart() {
+    let fixture =
+        Fixture::new(serde_json::json!({"mode": "crash", "wait_for_exit": true, "after": 0.0}));
+    let supervisor = Supervisor::start(fixture.config().await, inputs, || async {})
+        .await
+        .unwrap();
+    let path = fixture.root.join("release/idoris");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes.extend_from_slice(b"\n# changed after first readiness\n");
+    fs::write(path, bytes).unwrap();
+    fixture.release_exit();
+    let result = timeout(Duration::from_secs(3), supervisor.wait())
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, Err(SupervisorError::Installation(crate::install::InstallError::HashMismatch(ref name))) if name == "idoris"),
+        "{result:?}"
+    );
+    assert_eq!(fixture.attempts().len(), 1);
+    assert!(!fixture.record().exists());
+}
+
+#[tokio::test]
+async fn admin_requires_exactly_200_and_never_restarts() {
+    for status in [204, 302, 401, 403, 500] {
+        let fixture = Fixture::new(serde_json::json!({"admin_status": status}));
+        let result = Supervisor::start(fixture.config().await, inputs, || async {}).await;
+        if matches!(status, 401 | 403) {
+            assert!(matches!(result, Err(SupervisorError::Authentication)));
+        } else {
+            assert!(matches!(result, Err(SupervisorError::Contract)));
+        }
+        assert_eq!(fixture.attempts().len(), 1);
+        assert!(!fixture.record().exists());
+    }
+}
+
+#[tokio::test]
+async fn concurrent_starts_admit_only_one_owner() {
+    let fixture = Fixture::new(serde_json::json!({}));
+    let first = fixture.config().await;
+    let second = fixture.config().await;
+    let (a, b) = tokio::join!(
+        Supervisor::start(first, inputs, || async {}),
+        Supervisor::start(second, inputs, || async {})
+    );
+    let owner = match (a, b) {
+        (Ok(owner), Err(SupervisorError::InstanceConflict))
+        | (Err(SupervisorError::InstanceConflict), Ok(owner)) => owner,
+        _ => panic!("concurrent starts did not elect exactly one owner"),
+    };
+    assert_eq!(fixture.attempts().len(), 1);
+    owner.stop().await.unwrap();
+    assert!(!fixture.record().exists());
+}
+
+#[tokio::test]
+async fn recovery_waits_for_reaping_before_checking_group() {
+    let fixture = Fixture::new(serde_json::json!({}));
+    let mut child = Command::new("/bin/sleep")
+        .arg("60")
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let record = ProcessRecord::capture(child.id().unwrap()).unwrap();
+    let lease = Lease::acquire(&fixture.root.join("state")).unwrap();
+    lease.write(&record).unwrap();
+    let reaper = tokio::spawn(async move {
+        sleep(Duration::from_millis(60)).await;
+        child.wait().await.unwrap()
+    });
+    let result = lease
+        .recover(
+            &Timings::default(),
+            &CancellationToken::new(),
+            &record.executable,
+        )
+        .await;
+    reaper.await.unwrap();
+    assert!(result.is_ok(), "zombie group blocked recovery: {result:?}");
+    assert!(!fixture.record().exists());
+}
+
+/// Serves every request with `status` and `body`, recording any bearer token.
+fn foreign_server(
+    listener: TcpListener,
+    status: u16,
+    body: String,
+    saw_bearer: Arc<std::sync::atomic::AtomicBool>,
+) -> JoinHandle<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = vec![0; 4096];
+            let read = socket.read(&mut request).await.unwrap_or(0);
+            let text = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            if text.contains("authorization: bearer") {
+                saw_bearer.store(true, Ordering::SeqCst);
+            }
+            let _ = socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        }
+    })
+}
+
+async fn foreign_ports(
+    config: &mut StartConfig,
+) -> (Arc<std::sync::atomic::AtomicBool>, [JoinHandle<()>; 2]) {
+    let data = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    config.ports = Ports {
+        data: data.local_addr().unwrap().port(),
+        admin: admin.local_addr().unwrap().port(),
+    };
+    let saw_bearer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let servers = [
+        foreign_server(data, 200, healthy().to_string(), saw_bearer.clone()),
+        // Accepts any token: a status code cannot authenticate the server.
+        foreign_server(admin, 200, "{}".into(), saw_bearer.clone()),
+    ];
+    (saw_bearer, servers)
+}
+
+#[tokio::test]
+async fn probe_foreign_data_and_admin_listeners_admit_unbound_child() {
+    let fixture = Fixture::new(serde_json::json!({"mode": "no_read"}));
+    let mut config = fixture.config().await;
+    let (_, servers) = foreign_ports(&mut config).await;
+    let result = Supervisor::start(config, inputs, || async {}).await;
+    servers.iter().for_each(JoinHandle::abort);
+    let admitted = result.is_ok();
+    if let Ok(supervisor) = result {
+        supervisor.stop().await.unwrap();
+    }
+    assert!(
+        !admitted,
+        "foreign data+admin listeners admitted a child that never bound"
+    );
+    assert!(!fixture.record().exists());
+}
+
+#[tokio::test]
+async fn admin_token_is_never_sent_to_an_unowned_listener() {
+    let fixture = Fixture::new(serde_json::json!({"mode": "no_read"}));
+    let mut config = fixture.config().await;
+    let (saw_bearer, servers) = foreign_ports(&mut config).await;
+    let result = Supervisor::start(config, inputs, || async {}).await;
+    servers.iter().for_each(JoinHandle::abort);
+    if let Ok(supervisor) = result {
+        supervisor.stop().await.unwrap();
+    }
+    assert!(
+        !saw_bearer.load(Ordering::SeqCst),
+        "Admin token sent before listener ownership was proven"
+    );
+}
+
+fn workers(fixture: &Fixture) -> Vec<u32> {
+    fs::read_to_string(fixture.root.join("state/workers.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            value["pid"].as_u64().unwrap() as u32
+        })
+        .collect()
+}
+
+/// A reclaimed worker is gone (or an unreaped zombie) within the bound.
+async fn all_dead(pids: &[u32]) -> bool {
+    let live =
+        |pid: u32| ProcessRecord::capture(pid).is_ok_and(|record| record.alive().unwrap_or(true));
+    timeout(Duration::from_secs(2), async {
+        while pids.iter().any(|pid| live(*pid)) {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+fn kill_leftovers(pids: &[u32]) {
+    for pid in pids {
+        if ProcessRecord::capture(*pid).is_ok_and(|record| record.alive().unwrap_or(false)) {
+            let _ = nix::sys::signal::kill(Pid::from_raw(*pid as i32), Signal::SIGKILL);
+        }
+    }
+}
+
+#[tokio::test]
+async fn worker_forked_after_ready_is_reclaimed_when_leader_crashes() {
+    let fixture = Fixture::new(
+        serde_json::json!({"mode": "late_worker", "wait_for_exit": true, "after": 0.0}),
+    );
+    let supervisor = Supervisor::start(fixture.config().await, inputs, || async {})
+        .await
+        .unwrap();
+    fixture.release_exit();
+    // The crash restarts; the next generation waits for a fresh release.
+    timeout(Duration::from_secs(5), async {
+        while fixture.attempts().len() < 2 && !supervisor_done(&supervisor) {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let late = workers(&fixture);
+    assert_eq!(late.len(), 1);
+    let reclaimed = all_dead(&late).await;
+    kill_leftovers(&late);
+    let _ = supervisor.stop().await;
+    assert!(
+        reclaimed,
+        "worker forked after ready survived the leader crash"
+    );
+}
+
+fn supervisor_done(supervisor: &Supervisor) -> bool {
+    supervisor.task.as_ref().is_none_or(JoinHandle::is_finished)
+}
+
+#[tokio::test]
+async fn readiness_crash_reclaims_worker_before_any_retry() {
+    let fixture = Fixture::new(serde_json::json!({"mode": "worker_then_crash_before_ready"}));
+    let config = Arc::new(fixture.config().await);
+    let lease = Lease::acquire(&config.data.state).unwrap();
+    let result = ManagedProcess::start(config, inputs().await.unwrap(), &lease).await;
+    assert!(
+        matches!(result, Err(SupervisorError::Failed { code: None })),
+        "{:?}",
+        result.as_ref().err()
+    );
+    let survivors = workers(&fixture);
+    assert_eq!(survivors.len(), 1);
+    let reclaimed = all_dead(&survivors).await;
+    kill_leftovers(&survivors);
+    assert!(reclaimed, "readiness-phase stop left the worker running");
+}
+
+#[tokio::test]
+async fn stop_reports_forced_only_after_killing_survivors() {
+    let fixture = Fixture::new(
+        serde_json::json!({"mode": "late_worker", "wait_for_exit": true, "after": 0.0}),
+    );
+    let config = Arc::new(fixture.config().await);
+    let lease = Lease::acquire(&config.data.state).unwrap();
+    let mut process = ManagedProcess::start(config, inputs().await.unwrap(), &lease)
+        .await
+        .unwrap();
+    fixture.release_exit();
+    timeout(Duration::from_secs(3), async {
+        while workers(&fixture).is_empty() {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let survivors = workers(&fixture);
+    let forced = process.stop().await;
+    let reclaimed = all_dead(&survivors).await;
+    kill_leftovers(&survivors);
+    assert!(matches!(forced, Ok(true)), "{forced:?}");
+    assert!(reclaimed, "stop reported forced=true but killed nothing");
+}
+
+#[tokio::test]
+async fn dead_leader_with_live_group_keeps_record() {
+    let fixture = Fixture::new(serde_json::json!({}));
+    // sh leads the group; its background sleep stays in it after sh exits.
+    let mut leader = Command::new("/bin/sh")
+        .args(["-c", "sleep 60 & read line"])
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = leader.id().unwrap();
+    let group = Pid::from_raw(pid as i32);
+    timeout(Duration::from_secs(2), async {
+        while ProcessRecord::group_members(group).unwrap().len() < 2 {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let record = ProcessRecord::capture(pid).unwrap();
+    drop(leader.stdin.take());
+    leader.wait().await.unwrap();
+    let lease = Lease::acquire(&fixture.root.join("state")).unwrap();
+    lease.write(&record).unwrap();
+    let timings = Timings {
+        terminate: Duration::from_millis(100),
+        ..Timings::default()
+    };
+    let result = lease
+        .recover(&timings, &CancellationToken::new(), &record.executable)
+        .await;
+    let survived = group_exists(group).unwrap();
+    let _ = killpg(group, Signal::SIGKILL);
+    assert!(survived, "fixture group vanished early");
+    assert!(
+        matches!(result, Err(SupervisorError::InstanceConflict)),
+        "{result:?}"
+    );
+    assert!(
+        fixture.record().exists(),
+        "cleared a record whose group lives"
+    );
+}
+
+#[test]
+fn zombie_only_group_is_signalled_and_gone() {
+    use std::os::unix::process::CommandExt;
+    // An exited, unreaped leader leaves a group that holds only a zombie.
+    let mut child = std::process::Command::new("/usr/bin/true")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let group = Pid::from_raw(child.id() as i32);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while identity::group_has_live_member(group).unwrap() {
+        assert!(std::time::Instant::now() < deadline, "leader never exited");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // This is the state F7 hit: macOS refuses even signal 0 with EPERM.
+    // Linux delivers signals to zombies, so killpg succeeds there and the
+    // group reads as existing until it is reaped; EPERM is never reached.
+    #[cfg(target_os = "macos")]
+    assert_eq!(killpg(group, None), Err(nix::errno::Errno::EPERM));
+    let signalled = signal_group(group, Signal::SIGKILL);
+    let before_reap = group_exists(group);
+    child.wait().unwrap();
+    let after_reap = group_exists(group);
+    assert!(signalled.is_ok(), "{signalled:?}");
+    #[cfg(target_os = "macos")]
+    assert!(matches!(before_reap, Ok(false)), "{before_reap:?}");
+    #[cfg(target_os = "linux")]
+    assert!(matches!(before_reap, Ok(true)), "{before_reap:?}");
+    assert!(matches!(after_reap, Ok(false)), "{after_reap:?}");
+}
+
+#[test]
+fn eperm_is_harmless_only_without_a_live_member() {
+    use nix::errno::Errno;
+    let unreachable = || -> io::Result<bool> { panic!("only EPERM consults membership") };
+    assert_eq!(
+        killpg_outcome(Ok(()), unreachable).unwrap(),
+        KillOutcome::Delivered
+    );
+    assert_eq!(
+        killpg_outcome(Err(Errno::ESRCH), unreachable).unwrap(),
+        KillOutcome::NoGroup
+    );
+    assert_eq!(
+        killpg_outcome(Err(Errno::EPERM), || Ok(false)).unwrap(),
+        KillOutcome::ZombieOnly
+    );
+    // A live member we may not signal (e.g. another UID) stays an error at
+    // both call sites, which share this classification.
+    let live = killpg_outcome(Err(Errno::EPERM), || Ok(true));
+    assert_eq!(live.unwrap_err().raw_os_error(), Some(Errno::EPERM as i32));
+    assert!(killpg_outcome(Err(Errno::EPERM), || Err(io::Error::other("scan failed"))).is_err());
+    assert!(killpg_outcome(Err(Errno::EINVAL), unreachable).is_err());
+}
+
+#[test]
+fn live_member_keeps_eperm_an_error() {
+    use std::os::unix::process::CommandExt;
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("60")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let group = Pid::from_raw(child.id() as i32);
+    let live = identity::group_has_live_member(group);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(matches!(live, Ok(true)), "{live:?}");
+}
+
+#[test]
+fn only_a_confirmed_foreign_listener_is_a_conflict() {
+    let group = Pid::from_raw(4242);
+    let listening = |pids: Vec<u32>, unattributed| Ok(identity::Listeners { pids, unattributed });
+    let pgid = |pid: u32| match pid {
+        1 => Some(Pid::from_raw(4242)),
+        2 => Some(Pid::from_raw(7)),
+        _ => None,
+    };
+    // Query failure or timeout: not ready yet, retried until the deadline.
+    assert!(matches!(
+        judge_listeners(Err(io::Error::other("lsof timed out")), group, pgid),
+        Ok(false)
+    ));
+    assert!(matches!(
+        judge_listeners(listening(vec![], false), group, pgid),
+        Ok(false)
+    ));
+    assert!(matches!(
+        judge_listeners(listening(vec![1], true), group, pgid),
+        Ok(false)
+    ));
+    // Holder exited before its PGID was read: unconfirmed, keep waiting.
+    assert!(matches!(
+        judge_listeners(listening(vec![1, 3], false), group, pgid),
+        Ok(false)
+    ));
+    assert!(matches!(
+        judge_listeners(listening(vec![1, 2], false), group, pgid),
+        Err(SupervisorError::InstanceConflict)
+    ));
+    assert!(matches!(
+        judge_listeners(listening(vec![2], false), group, pgid),
+        Err(SupervisorError::InstanceConflict)
+    ));
+    assert!(matches!(
+        judge_listeners(listening(vec![1], false), group, pgid),
+        Ok(true)
+    ));
 }

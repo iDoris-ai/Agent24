@@ -60,6 +60,8 @@ pub enum SupervisorError {
     RestartLimit,
     #[error("iDoris supervisor I/O failed: {0}")]
     Io(#[from] io::Error),
+    #[error("installed iDoris verification failed: {0}")]
+    Installation(#[from] crate::install::InstallError),
 }
 
 /// IL-05 returns this after setup; canonicalization rejects symlink escapes.
@@ -214,16 +216,16 @@ pub struct Supervisor {
     task: Option<JoinHandle<Result<StopReport, SupervisorError>>>,
 }
 impl Supervisor {
-    /// Reclaim a crashed host's recorded generation without starting a replacement.
-    /// The same PID/start-time/executable/UID checks used by start fail closed.
-    pub async fn recover_existing(
-        installed: &InstalledVersion,
-        state: &Path,
-        cancel: &CancellationToken,
+    /// Reap a recorded orphan without launching a replacement. The lease and
+    /// kernel PID/start-time/executable/UID checks are shared with start().
+    pub async fn recover_leftover(
+        data: DataPaths,
+        executable: &Path,
     ) -> Result<(), SupervisorError> {
-        let lease = Lease::acquire(state)?;
+        let data = data.canonical()?;
+        let lease = Lease::acquire(&data.state)?;
         lease
-            .recover(&Timings::default(), cancel, &installed.binary())
+            .recover(&Timings::default(), &CancellationToken::new(), executable)
             .await
     }
     pub async fn start<F, Fut, D, Drain>(
@@ -359,6 +361,9 @@ where
             },
         };
         accepting.send_replace(false);
+        // Snapshot surviving workers at the reap itself, before the PGID
+        // could be recycled; finish() then kills them with the group.
+        process.adopt_survivors()?;
         process
             .output
             .event(&format!("exited code={:?}", status.code()));
@@ -437,6 +442,9 @@ fn exit_error(status: ExitStatus) -> SupervisorError {
 struct ManagedProcess {
     child: Child,
     group: Option<Pid>,
+    members: Vec<ProcessRecord>,
+    // Set once the leader's reap was observed and its survivors snapshotted.
+    adopted: bool,
     config: Arc<StartConfig>,
     output: logs::Output,
     // Retained only in zeroizing memory for this generation and log redaction.
@@ -470,6 +478,8 @@ impl ManagedProcess {
         let mut process = Self {
             child,
             group: Some(Pid::from_raw(pid as i32)),
+            members: Vec::new(),
+            adopted: false,
             config,
             output,
             _admin: token,
@@ -492,7 +502,9 @@ impl ManagedProcess {
                     && let Ok(status) =
                         timeout(Duration::from_millis(50), process.child.wait()).await
                 {
-                    return Err(exit_error(status?));
+                    let status = status?;
+                    process.adopt_survivors()?;
+                    return Err(exit_error(status));
                 }
                 return Err(error);
             }
@@ -507,13 +519,19 @@ impl ManagedProcess {
                     if let Ok(status) =
                         timeout(Duration::from_millis(50), process.child.wait()).await
                     {
-                        return Err(exit_error(status?));
+                        let status = status?;
+                        process.adopt_survivors()?;
+                        return Err(exit_error(status));
                     }
                     return Err(error.into());
                 }
             };
             lease.write(&record)?;
-            process.ready(spawned + process.config.timings.ready).await
+            process
+                .ready(spawned + process.config.timings.ready)
+                .await?;
+            process.remember_members()?;
+            Ok(())
         }
         .await;
         if let Err(error) = result {
@@ -534,6 +552,55 @@ impl ManagedProcess {
         }
         process.output.event("ready");
         Ok(process)
+    }
+
+    fn remember_members(&mut self) -> io::Result<()> {
+        if self.child.try_wait()?.is_some() {
+            return self.adopt_survivors();
+        }
+        if let Some(group) = self.group {
+            self.members = ProcessRecord::group_members(group)?;
+        }
+        Ok(())
+    }
+
+    /// Call right after any wait observes the leader's exit. tokio reaps only
+    /// inside our own wait/try_wait calls, so the first observation is the
+    /// reap. A PID that still names a process group is never reallocated, so
+    /// members found now are this generation's workers (forked after ready,
+    /// hence missing from the readiness snapshot). Later calls add nothing:
+    /// once the group empties, its PGID may name an unrelated group.
+    fn adopt_survivors(&mut self) -> io::Result<()> {
+        if self.adopted {
+            return Ok(());
+        }
+        self.adopted = true;
+        if let Some(group) = self.group {
+            for member in ProcessRecord::group_members(group)? {
+                if !self.members.contains(&member) {
+                    self.members.push(member);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns whether the signal was sent to a group proven to be ours.
+    fn signal_owned_group(&mut self, signal: Signal) -> io::Result<bool> {
+        let exited = self.child.try_wait()?.is_some();
+        if exited {
+            self.adopt_survivors()?;
+        }
+        if let Some(group) = self.group {
+            // Once reaped, the numeric PGID alone proves no ownership. Only an
+            // observed member with unchanged kernel identity can authorize
+            // group cleanup. Unknown descendants are left alone.
+            if !exited || self.members.iter().any(|member| member.in_group(group)) {
+                signal_group(group, signal)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn ready(&mut self, deadline: Instant) -> Result<(), SupervisorError> {
@@ -563,7 +630,26 @@ impl ManagedProcess {
                             body.extend_from_slice(&chunk);
                         }
                         validate_health(&body, self.config.lock)?;
-                        return Ok(true);
+                        if !listeners_owned(&self.config, self.group).await? {
+                            return Ok(false);
+                        }
+                        let admin_url = format!(
+                            "http://127.0.0.1:{}/admin/api/v1/status",
+                            self.config.ports.admin
+                        );
+                        if let Ok(response) = client
+                            .get(admin_url)
+                            .bearer_auth(self._admin.as_str())
+                            .send()
+                            .await
+                        {
+                            return match response.status().as_u16() {
+                                200 => Ok(true),
+                                401 | 403 => Err(SupervisorError::Authentication),
+                                _ => Err(SupervisorError::Contract),
+                            };
+                        }
+                        return Ok(false);
                     }
                     if response.status().is_redirection() || response.status().is_client_error() {
                         return Err(SupervisorError::Contract);
@@ -574,85 +660,193 @@ impl ManagedProcess {
             let ready = tokio::select! {
                 biased;
                 _ = self.config.shutdown.cancelled() => return Err(SupervisorError::Stopped),
-                status = self.child.wait() => return Err(exit_error(status?)),
+                status = self.child.wait() => Err(status?),
                 _ = tokio::time::sleep_until(deadline) => return Err(SupervisorError::StartupTimeout),
-                value = check => value?,
+                value = check => Ok(value?),
+            };
+            let ready = match ready {
+                Ok(ready) => ready,
+                Err(status) => {
+                    self.adopt_survivors()?;
+                    return Err(exit_error(status));
+                }
             };
             if ready {
                 if let Some(status) = self.child.try_wait()? {
+                    self.adopt_survivors()?;
                     return Err(exit_error(status));
                 }
                 return Ok(());
             }
-            tokio::select! {
+            let exited = tokio::select! {
                 biased;
                 _ = self.config.shutdown.cancelled() => return Err(SupervisorError::Stopped),
-                status = self.child.wait() => return Err(exit_error(status?)),
+                status = self.child.wait() => Some(status?),
                 _ = tokio::time::sleep_until(deadline) => return Err(SupervisorError::StartupTimeout),
-                _ = sleep(self.config.timings.poll) => {},
+                _ = sleep(self.config.timings.poll) => None,
+            };
+            if let Some(status) = exited {
+                self.adopt_survivors()?;
+                return Err(exit_error(status));
             }
         }
     }
 
+    /// `forced` is true only when SIGKILL was actually delivered to a group
+    /// proven to be ours; a group we cannot prove is ours fails closed.
     async fn stop(&mut self) -> Result<bool, SupervisorError> {
         let group = self.group.ok_or(SupervisorError::Stopped)?;
         self.output.event("stopping");
-        signal_group(group, Signal::SIGTERM)?;
-        let graceful = async {
-            self.child.wait().await?;
-            // The leader may exit before its runtime descendants. Their
-            // grace period is part of the same 17 seconds, not a new budget.
-            while group_exists(group)? {
-                sleep(Duration::from_millis(10)).await;
+        self.remember_members()?;
+        self.signal_owned_group(Signal::SIGTERM)?;
+        // The leader may exit before its runtime descendants. Their grace
+        // period is part of the same 17 seconds, not a new budget.
+        let deadline = Instant::now() + self.config.timings.terminate;
+        let graceful = match tokio::time::timeout_at(deadline, self.child.wait()).await {
+            Ok(status) => {
+                status?;
+                self.adopt_survivors()?;
+                tokio::time::timeout_at(deadline, wait_group_gone(group))
+                    .await
+                    .map_or(Ok(false), |done| done.map(|()| true))?
             }
-            Ok::<_, io::Error>(())
+            Err(_) => false,
         };
-        let forced = match timeout(self.config.timings.terminate, graceful).await {
-            Ok(result) => {
-                result?;
-                false
-            }
-            Err(_) => true,
-        };
-        if forced {
+        if !graceful {
             self.output.event("forced stop");
-            signal_group(group, Signal::SIGKILL)?;
+            if !self.signal_owned_group(Signal::SIGKILL)? {
+                // Nothing provably ours to kill: report it, never forced=true.
+                self.output.event("failed: unowned group survives");
+                return Err(SupervisorError::InstanceConflict);
+            }
+            self.child.wait().await?;
+            self.adopt_survivors()?;
+            self.reclaimed(group).await?;
         }
-        self.child.wait().await?;
         self.group = None;
         self.output.finish().await;
-        Ok(forced)
+        Ok(!graceful)
     }
+    /// Crash path: the leader is already reaped and its survivors adopted.
     async fn finish(&mut self) -> Result<(), SupervisorError> {
         if let Some(group) = self.group {
-            signal_group(group, Signal::SIGKILL)?;
-            self.group = None;
+            if self.signal_owned_group(Signal::SIGKILL)? {
+                self.reclaimed(group).await?;
+            } else if group_exists(group)? {
+                // A group with no proven member must not be signalled, and
+                // must not be restarted beside either. Keep the record.
+                return Err(SupervisorError::InstanceConflict);
+            }
         }
+        self.group = None;
         self.output.finish().await;
+        Ok(())
+    }
+    /// SIGKILL'd members linger only until reaped by their new parent.
+    async fn reclaimed(&self, group: Pid) -> Result<(), SupervisorError> {
+        timeout(Duration::from_secs(5), wait_group_gone(group))
+            .await
+            .map_err(|_| SupervisorError::InstanceConflict)??;
         Ok(())
     }
 }
 
+async fn wait_group_gone(group: Pid) -> io::Result<()> {
+    while group_exists(group)? {
+        sleep(Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
+/// F3/N1: loopback has no peer identity, so a 200 from a port proves
+/// nothing. Before the Admin token leaves this process, every visible
+/// LISTEN socket on both ports must be held by this generation's group.
+async fn listeners_owned(
+    config: &StartConfig,
+    group: Option<Pid>,
+) -> Result<bool, SupervisorError> {
+    let group = group.ok_or(SupervisorError::InstanceConflict)?;
+    for port in [config.ports.data, config.ports.admin] {
+        let found = identity::listeners(port, config.timings.health_request).await;
+        if !judge_listeners(found, group, |pid| {
+            nix::unistd::getpgid(Some(Pid::from_raw(i32::try_from(pid).ok()?))).ok()
+        })? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Only a listener confirmed to sit in another process group is a port
+/// conflict (L4, never retried). A failed or timed-out query, a socket whose
+/// holder is not visible, or a holder gone before its PGID was read proves
+/// nothing either way: not ready yet, retried until the readiness deadline,
+/// and the Admin token is still withheld.
+fn judge_listeners(
+    found: io::Result<identity::Listeners>,
+    group: Pid,
+    pgid_of: impl Fn(u32) -> Option<Pid>,
+) -> Result<bool, SupervisorError> {
+    let Ok(found) = found else {
+        return Ok(false);
+    };
+    let mut proven = !found.unattributed && !found.pids.is_empty();
+    for pid in found.pids {
+        match pgid_of(pid) {
+            Some(pgid) if pgid == group => {}
+            Some(_) => return Err(SupervisorError::InstanceConflict),
+            None => proven = false,
+        }
+    }
+    Ok(proven)
+}
+
+/// A zombie-only group holds no ports, files or CPU and cannot be signalled
+/// further, so it counts as gone; it vanishes once its parent reaps it.
 fn group_exists(group: Pid) -> io::Result<bool> {
-    match killpg(group, None) {
-        Ok(()) => Ok(true),
-        Err(nix::errno::Errno::ESRCH) => Ok(false),
+    let outcome = killpg_outcome(killpg(group, None), || {
+        identity::group_has_live_member(group)
+    })?;
+    Ok(outcome == KillOutcome::Delivered)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KillOutcome {
+    Delivered,
+    NoGroup,
+    /// macOS only: every member is an unreaped zombie, so killpg (even with
+    /// signal 0) fails with EPERM. Linux delivers to zombies and never gets
+    /// here; there a zombie-only group reads as Delivered until reaped.
+    ZombieOnly,
+}
+
+/// The one place EPERM is classified, shared by signal_group and
+/// group_exists. EPERM is harmless only when no live member remains;
+/// otherwise a member we may not signal survives, which stays an error.
+fn killpg_outcome(
+    result: nix::Result<()>,
+    live_member: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<KillOutcome> {
+    match result {
+        Ok(()) => Ok(KillOutcome::Delivered),
+        Err(nix::errno::Errno::ESRCH) => Ok(KillOutcome::NoGroup),
+        Err(nix::errno::Errno::EPERM) if !live_member()? => Ok(KillOutcome::ZombieOnly),
         Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
     }
 }
 impl Drop for ManagedProcess {
     fn drop(&mut self) {
-        if let Some(group) = self.group.take() {
-            let _ = signal_group(group, Signal::SIGKILL);
-        }
+        let _ = self.signal_owned_group(Signal::SIGKILL);
     }
 }
 
+/// A zombie-only group has nothing left to signal; callers then wait for it
+/// to be reaped.
 fn signal_group(group: Pid, signal: Signal) -> io::Result<()> {
-    match killpg(group, signal) {
-        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
-        Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
-    }
+    killpg_outcome(killpg(group, signal), || {
+        identity::group_has_live_member(group)
+    })?;
+    Ok(())
 }
 
 fn serve_command(
@@ -660,6 +854,9 @@ fn serve_command(
     budget: &Budget,
     key: Option<&str>,
 ) -> Result<Command, SupervisorError> {
+    // macOS has no fexecve: verify the installed bytes immediately before each
+    // spawn, accepting the remaining same-UID path-swap race after this check.
+    config.installed.verify_for_launch()?;
     let binary = fs::canonicalize(config.installed.binary())?;
     let directory = fs::canonicalize(config.installed.directory())?;
     if !binary.starts_with(&directory) {
