@@ -127,7 +127,11 @@ impl Fixture {
             data: reserve_port(),
             admin: reserve_port(),
         };
-        config.timings.ready = Duration::from_secs(3);
+        // Tests that expect readiness must not depend on scheduling: a fresh
+        // fixture executable can take seconds to start on a loaded host (the
+        // F8 reproductions saw load average 51 with XProtect scanning). Tests
+        // about the deadline itself set their own short bound.
+        config.timings.ready = Duration::from_secs(20);
         config.timings.poll = Duration::from_millis(10);
         config.timings.terminate = Duration::from_millis(70);
         config.timings.restart_delays = [
@@ -645,7 +649,14 @@ async fn pre_cancel_and_token_deadline_fail_without_downgrade() {
     config.timings.token_write = Duration::ZERO;
     let result = Supervisor::start(config, inputs, || async {}).await;
     assert!(matches!(result, Err(SupervisorError::TokenHandoff)));
-    assert!(fixture.attempts().is_empty());
+    // The child is already spawned when the handoff deadline fails, and the
+    // 50 ms early-exit wait (kept for exit-code fidelity) lets a fast
+    // interpreter read EOF before SIGTERM lands. That attempt is legitimate;
+    // the invariant is that no attempt ever received a token.
+    for attempt in fixture.attempts() {
+        assert_eq!(attempt["length"], 0, "token reached the child: {attempt}");
+        assert_eq!(attempt["valid_frame"], false);
+    }
     assert!(!fixture.record().exists());
 }
 
@@ -780,7 +791,6 @@ async fn foreign_health_without_child_admin_never_becomes_ready() {
     let fixture = Fixture::new(serde_json::json!({"mode": "no_read"}));
     let mut config = fixture.config().await;
     config.ports.data = listener.local_addr().unwrap().port();
-    config.timings.ready = Duration::from_millis(200);
     let server = tokio::spawn(async move {
         loop {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -1030,7 +1040,6 @@ async fn foreign_ports(
 async fn probe_foreign_data_and_admin_listeners_admit_unbound_child() {
     let fixture = Fixture::new(serde_json::json!({"mode": "no_read"}));
     let mut config = fixture.config().await;
-    config.timings.ready = Duration::from_millis(500);
     let (_, servers) = foreign_ports(&mut config).await;
     let result = Supervisor::start(config, inputs, || async {}).await;
     servers.iter().for_each(JoinHandle::abort);
@@ -1049,7 +1058,6 @@ async fn probe_foreign_data_and_admin_listeners_admit_unbound_child() {
 async fn admin_token_is_never_sent_to_an_unowned_listener() {
     let fixture = Fixture::new(serde_json::json!({"mode": "no_read"}));
     let mut config = fixture.config().await;
-    config.timings.ready = Duration::from_millis(500);
     let (saw_bearer, servers) = foreign_ports(&mut config).await;
     let result = Supervisor::start(config, inputs, || async {}).await;
     servers.iter().for_each(JoinHandle::abort);
@@ -1213,4 +1221,84 @@ async fn dead_leader_with_live_group_keeps_record() {
         fixture.record().exists(),
         "cleared a record whose group lives"
     );
+}
+
+#[test]
+fn zombie_only_group_is_signalled_and_gone() {
+    use std::os::unix::process::CommandExt;
+    // An exited, unreaped leader leaves a group that holds only a zombie.
+    let mut child = std::process::Command::new("/usr/bin/true")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let group = Pid::from_raw(child.id() as i32);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while identity::group_has_live_member(group).unwrap() {
+        assert!(std::time::Instant::now() < deadline, "leader never exited");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // This is the state F7 hit: macOS refuses even signal 0 with EPERM.
+    #[cfg(target_os = "macos")]
+    assert_eq!(killpg(group, None), Err(nix::errno::Errno::EPERM));
+    let signalled = signal_group(group, Signal::SIGKILL);
+    let exists = group_exists(group);
+    child.wait().unwrap();
+    assert!(signalled.is_ok(), "{signalled:?}");
+    assert!(matches!(exists, Ok(false)), "{exists:?}");
+}
+
+#[test]
+fn live_member_keeps_eperm_an_error() {
+    use std::os::unix::process::CommandExt;
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("60")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let group = Pid::from_raw(child.id() as i32);
+    let live = identity::group_has_live_member(group);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(matches!(live, Ok(true)), "{live:?}");
+}
+
+#[test]
+fn only_a_confirmed_foreign_listener_is_a_conflict() {
+    let group = Pid::from_raw(4242);
+    let listening = |pids: Vec<u32>, unattributed| Ok(identity::Listeners { pids, unattributed });
+    let pgid = |pid: u32| match pid {
+        1 => Some(Pid::from_raw(4242)),
+        2 => Some(Pid::from_raw(7)),
+        _ => None,
+    };
+    // Query failure or timeout: not ready yet, retried until the deadline.
+    assert!(matches!(
+        judge_listeners(Err(io::Error::other("lsof timed out")), group, pgid),
+        Ok(false)
+    ));
+    assert!(matches!(
+        judge_listeners(listening(vec![], false), group, pgid),
+        Ok(false)
+    ));
+    assert!(matches!(
+        judge_listeners(listening(vec![1], true), group, pgid),
+        Ok(false)
+    ));
+    // Holder exited before its PGID was read: unconfirmed, keep waiting.
+    assert!(matches!(
+        judge_listeners(listening(vec![1, 3], false), group, pgid),
+        Ok(false)
+    ));
+    assert!(matches!(
+        judge_listeners(listening(vec![1, 2], false), group, pgid),
+        Err(SupervisorError::InstanceConflict)
+    ));
+    assert!(matches!(
+        judge_listeners(listening(vec![2], false), group, pgid),
+        Err(SupervisorError::InstanceConflict)
+    ));
+    assert!(matches!(
+        judge_listeners(listening(vec![1], false), group, pgid),
+        Ok(true)
+    ));
 }

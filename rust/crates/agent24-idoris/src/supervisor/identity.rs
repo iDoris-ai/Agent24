@@ -343,6 +343,68 @@ async fn wait_group_gone(pid: u32, bound: Duration) -> Result<(), SupervisorErro
     Ok(())
 }
 
+/// Whether `group` still has a member that is not a zombie. macOS killpg
+/// returns EPERM (even for signal 0) when every member is an unreaped zombie;
+/// this tells that harmless case apart from a live member we may not signal.
+#[cfg(target_os = "macos")]
+pub(super) fn group_has_live_member(group: Pid) -> io::Result<bool> {
+    use libproc::{
+        libproc::{bsd_info::BSDInfo, proc_pid::pidinfo},
+        processes::{ProcFilter, pids_by_type},
+    };
+    let pgrpid = u32::try_from(group.as_raw()).map_err(io::Error::other)?;
+    for pid in pids_by_type(ProcFilter::ByProgramGroup { pgrpid })? {
+        let Ok(raw) = i32::try_from(pid) else {
+            return Ok(true);
+        };
+        match pidinfo::<BSDInfo>(raw, 0) {
+            // 5 is SZOMB.
+            Ok(info) if info.pbi_pgid == pgrpid => {
+                if info.pbi_status != 5 {
+                    return Ok(true);
+                }
+            }
+            Ok(_) => {}
+            // pidinfo can fail for an unreaped zombie. A same-UID zombie
+            // still accepts signal 0; EPERM here means a live foreign member.
+            Err(_) => match nix::sys::signal::kill(Pid::from_raw(raw), None) {
+                Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                Err(_) => return Ok(true),
+            },
+        }
+    }
+    Ok(false)
+}
+#[cfg(target_os = "linux")]
+pub(super) fn group_has_live_member(group: Pid) -> io::Result<bool> {
+    for entry in fs::read_dir("/proc")? {
+        let Some(pid) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let fields: Vec<_> = stat
+            .rsplit_once(')')
+            .map(|(_, rest)| rest.split_whitespace().collect())
+            .unwrap_or_default();
+        if fields.get(2).and_then(|pgrp| pgrp.parse::<i32>().ok()) == Some(group.as_raw())
+            && fields.first().is_some_and(|state| *state != "Z")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(super) fn group_has_live_member(_group: Pid) -> io::Result<bool> {
+    Ok(true)
+}
+
 /// Every process visibly holding a TCP LISTEN socket on `port`, on any local
 /// address. `unattributed` reports a listener whose holder is not visible.
 pub(super) struct Listeners {

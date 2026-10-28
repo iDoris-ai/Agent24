@@ -755,30 +755,47 @@ async fn listeners_owned(
 ) -> Result<bool, SupervisorError> {
     let group = group.ok_or(SupervisorError::InstanceConflict)?;
     for port in [config.ports.data, config.ports.admin] {
-        let found = identity::listeners(port, config.timings.health_request)
-            .await
-            .map_err(|_| SupervisorError::InstanceConflict)?;
-        if found.unattributed
-            || found.pids.iter().any(|pid| {
-                i32::try_from(*pid).map_or(true, |pid| {
-                    nix::unistd::getpgid(Some(Pid::from_raw(pid))) != Ok(group)
-                })
-            })
-        {
-            // A foreign listener is a port conflict (L4), never retried.
-            return Err(SupervisorError::InstanceConflict);
-        }
-        if found.pids.is_empty() {
+        let found = identity::listeners(port, config.timings.health_request).await;
+        if !judge_listeners(found, group, |pid| {
+            nix::unistd::getpgid(Some(Pid::from_raw(i32::try_from(pid).ok()?))).ok()
+        })? {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
+/// Only a listener confirmed to sit in another process group is a port
+/// conflict (L4, never retried). A failed or timed-out query, a socket whose
+/// holder is not visible, or a holder gone before its PGID was read proves
+/// nothing either way: not ready yet, retried until the readiness deadline,
+/// and the Admin token is still withheld.
+fn judge_listeners(
+    found: io::Result<identity::Listeners>,
+    group: Pid,
+    pgid_of: impl Fn(u32) -> Option<Pid>,
+) -> Result<bool, SupervisorError> {
+    let Ok(found) = found else {
+        return Ok(false);
+    };
+    let mut proven = !found.unattributed && !found.pids.is_empty();
+    for pid in found.pids {
+        match pgid_of(pid) {
+            Some(pgid) if pgid == group => {}
+            Some(_) => return Err(SupervisorError::InstanceConflict),
+            None => proven = false,
+        }
+    }
+    Ok(proven)
+}
+
+/// A zombie-only group holds no ports, files or CPU and cannot be signalled
+/// further, so it counts as gone; it vanishes once its parent reaps it.
 fn group_exists(group: Pid) -> io::Result<bool> {
     match killpg(group, None) {
         Ok(()) => Ok(true),
         Err(nix::errno::Errno::ESRCH) => Ok(false),
+        Err(nix::errno::Errno::EPERM) if !identity::group_has_live_member(group)? => Ok(false),
         Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
     }
 }
@@ -791,6 +808,9 @@ impl Drop for ManagedProcess {
 fn signal_group(group: Pid, signal: Signal) -> io::Result<()> {
     match killpg(group, signal) {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        // macOS: every member already an unreaped zombie. Nothing is left to
+        // signal; callers then wait for the group to be reaped.
+        Err(nix::errno::Errno::EPERM) if !identity::group_has_live_member(group)? => Ok(()),
         Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
     }
 }
