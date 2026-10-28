@@ -159,10 +159,27 @@ async fn partial_fanout_exit_four_keeps_the_report_as_502_partial() {
 
 #[tokio::test]
 async fn exit_four_without_data_is_502_upstream() {
-    let (app, _t) = stub_app(4, "", &failure("other_error", "group is not active", None)).await;
+    // v0.27.2: storage/protocol errors stay `other_error` / exit 4.
+    let (app, _t) = stub_app(
+        4,
+        "",
+        &failure("other_error", "sqlite: disk I/O error", None),
+    )
+    .await;
     let (status, body) = call(&app, "GET", &format!("/groupchat/{G}/members"), None).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(body["error"], "upstream");
+}
+
+/// Hyphae v0.27.2 (Hyphae#295) moved caller-input errors (group not active,
+/// unknown logical id, invite/identity not found, ...) from `other_error`
+/// (exit 4) to `user_error` (exit 1): they now surface as 400 `invalid`.
+#[tokio::test]
+async fn exit_one_user_error_group_not_active_is_400_invalid() {
+    let (app, _t) = stub_app(1, "", &failure("user_error", "group is not active", None)).await;
+    let (status, body) = call(&app, "GET", &format!("/groupchat/{G}/members"), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid");
 }
 
 #[tokio::test]
