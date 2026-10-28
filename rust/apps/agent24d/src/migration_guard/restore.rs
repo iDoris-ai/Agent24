@@ -246,8 +246,15 @@ fn restore_one(
                     .map_err(|x| e("quarantine dir", x))?;
             }
             moved = true;
-            let dest = free_name(q, &format!("{name}{sfx}"))?;
-            ops.rename(&src, &dest).map_err(|x| e("quarantine", x))?;
+            let dest = evidence_name(q, &format!("{name}{sfx}"), &src)?;
+            if same_inode(&src, &dest) {
+                // rename(2) of one inode onto its own other name is a silent
+                // no-op that keeps `src`; the evidence name already holds the
+                // inode (crash after the move, before the db dir fsync).
+                ops.remove_file(&src).map_err(|x| e("unlink moved", x))?;
+            } else {
+                ops.rename(&src, &dest).map_err(|x| e("quarantine", x))?;
+            }
         }
     }
     if moved {
@@ -258,6 +265,39 @@ fn restore_one(
         ops.rename(&staging, path).map_err(|x| e("install", x))?;
     }
     fsync_chain(ops, data_dir, parent).map_err(|x| e("fsync install", x))
+}
+
+fn same_inode(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+/// Where to move `src` in `q`: a name already holding the very same bytes
+/// is reused (a crash between the quarantine move and the db-directory fsync
+/// leaves both names; re-moving must not burn a new suffix on every restart),
+/// otherwise the first unused name.
+fn evidence_name(q: &Path, base: &str, src: &Path) -> R<PathBuf> {
+    let mut want = None;
+    for i in 0..1000 {
+        let p = q.join(if i == 0 {
+            base.to_owned()
+        } else {
+            format!("{base}.{i}")
+        });
+        if !present(&p)? {
+            return Ok(p);
+        }
+        if want.is_none() {
+            want = Some(sha256_file(src).map_err(|x| e("evidence hash", x))?);
+        }
+        if sha256_file(&p).is_ok_and(|h| Some(h) == want) {
+            return Ok(p); // identical bytes: replacing it loses nothing
+        }
+    }
+    Err(format!("no free quarantine name for {base}"))
 }
 
 /// First unused name in `q`: earlier evidence is never overwritten.
@@ -779,6 +819,56 @@ mod tests {
         assert_eq!(fs::read(q.join(STORE_FILE)).unwrap(), b"old evidence");
         assert_eq!(fs::read(q.join("agent24.db.1")).unwrap(), failed);
         assert_restored(&fx);
+    }
+
+    /// Review (Codex, 5e-2): repeated crashes after the quarantine move must
+    /// not burn a new suffix each time; different bytes still get a new name.
+    #[tokio::test]
+    async fn identical_evidence_name_is_reused_not_suffixed() {
+        let mut fx = fixture(true).await;
+        let q = fx.root.join(QUARANTINE_DIR).join("a1");
+        fs::create_dir_all(&q).unwrap();
+        fs::copy(&fx.s, q.join(STORE_FILE)).unwrap(); // the same failed bytes
+        fx.go(&RealOps).unwrap();
+        assert!(q.join(STORE_FILE).exists() && !q.join("agent24.db.1").exists());
+        assert_restored(&fx);
+    }
+
+    /// Review (Codex, 5e-2): after a crash the failed file can be a hard link
+    /// of its own quarantined name; the move must still take it out of the db
+    /// directory.
+    #[tokio::test]
+    async fn aliased_quarantine_name_still_leaves_the_db_directory() {
+        let mut fx = fixture(true).await;
+        let q = fx.root.join(QUARANTINE_DIR).join("a1");
+        fs::create_dir_all(&q).unwrap();
+        fs::hard_link(&fx.s, q.join(STORE_FILE)).unwrap();
+        fx.go(&RealOps).unwrap();
+        assert_restored(&fx);
+        assert!(q.join(STORE_FILE).exists());
+    }
+
+    #[test]
+    fn evidence_name_cap_holds_only_for_distinct_bytes() {
+        let td = tempfile::tempdir().unwrap();
+        let q = td.path().join("q");
+        fs::create_dir(&q).unwrap();
+        let src = td.path().join("src");
+        fs::write(&src, b"same").unwrap();
+        for i in 0..1000 {
+            let n = if i == 0 {
+                "x".to_owned()
+            } else {
+                format!("x.{i}")
+            };
+            fs::write(q.join(n), format!("other{i}")).unwrap();
+        }
+        assert!(
+            evidence_name(&q, "x", &src).is_err(),
+            "all taken, all different"
+        );
+        fs::write(q.join("x.999"), b"same").unwrap();
+        assert_eq!(evidence_name(&q, "x", &src).unwrap(), q.join("x.999"));
     }
 
     #[test]
