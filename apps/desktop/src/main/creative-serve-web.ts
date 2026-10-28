@@ -15,6 +15,10 @@ export interface CreativeServeWebStatus {
    * declared download size, surfaced from the baked manifest, so the
    * renderer can show "~N MB" without a round trip of its own. */
   size?: number
+  /** Set with state 'failed' when no Open Design runtime exists at all (no
+   * downloadable component for this build, no local checkout). `error` keeps
+   * the technical detail for logs; the UI shows a neutral not-installed note. */
+  notInstalled?: boolean
 }
 
 /** The subset of OpenDesignComponentInstaller's surface CreativeServeWeb
@@ -334,6 +338,7 @@ export class CreativeServeWeb {
       this.current = {
         state: 'failed',
         error: 'Open Design runtime not found; set A24_OPEN_DESIGN_DIR or package resources/open-design',
+        notInstalled: true,
       }
       return this.status()
     }

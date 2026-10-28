@@ -3,6 +3,7 @@
 // every call goes through the IPC proxy — never a direct fetch.
 
 import type { components } from '@agent24/api-client'
+import type { ApprovalDecisionInput } from '../../../shared/ipc-types'
 
 export type RunStatus =
   | 'queued'
@@ -60,6 +61,7 @@ export interface Schedule {
   last_run_at: string | null
   next_run_at: string | null
   consecutive_failures: number
+  completed?: components['schemas']['Schedule']['completed']
   // The next five fields are new in daemon protocol v3 (ME4-1.2.2). They are
   // optional here — not because the current daemon omits them, but so this
   // desktop build keeps working against an older daemon that predates them
@@ -136,12 +138,18 @@ export const createSchedule = async (body: {
   return res.data as Schedule
 }
 
-export const deleteSchedule = async (id: string): Promise<void> => {
+export class ScheduleDeleteError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message)
+  }
+}
+
+export const deleteSchedule = async (id: string, options?: { onlyIfCompleted: boolean }): Promise<void> => {
   const res = await window.agent24.backendProxy({
     method: 'DELETE',
-    path: `/api/v1/schedules/${id}`,
+    path: `/api/v1/schedules/${id}${options?.onlyIfCompleted ? '?only_if_completed=true' : ''}`,
   })
-  if (!res.ok) throw new Error(errorMessage(res))
+  if (!res.ok) throw new ScheduleDeleteError(res.status, errorMessage(res))
 }
 
 export const updateSchedule = async (
@@ -173,20 +181,22 @@ export const runScheduleNow = async (id: string): Promise<string> => {
 export const listPendingApprovals = (): Promise<Approval[]> =>
   get<Approval[]>('/api/v1/approvals?status=pending', 'approvals')
 
-export const decideApproval = async (id: string, decision: Decision): Promise<void> => {
+/** Resolves `true` once the decision was sent, `false` if the user declined
+ *  the native confirmation dialog (nothing was sent). */
+export const decideApproval = async (id: string, decision: Decision): Promise<boolean> => {
   // Fail-closed at the API boundary: SPEC-002 requires a non-empty reason for
   // deny, and the daemon 400s an empty one. Enforce here so no caller (not
   // just the current UI) can send an invalid deny.
   if (decision.type === 'deny' && (decision.reason ?? '').trim() === '') {
     throw new Error('拒绝需要填写原因')
   }
-  const res = await window.agent24.backendProxy({
-    method: 'POST',
-    path: `/api/v1/approvals/${id}`,
-    body: decision,
-  })
+  // A1: the decision is an elevated operation, no longer on the generic proxy.
+  // The main process asks the user in a native dialog before it sends.
+  const res = await window.agent24.approvalDecide(id, decision as ApprovalDecisionInput)
+  if ((res.data as { error?: { code?: string } } | null)?.error?.code === 'cancelled') return false
   // 409 (already resolved) is not fatal — a concurrent resolution won
   if (!res.ok && res.status !== 409) throw new Error(errorMessage(res))
+  return true
 }
 
 // ── FU-90: domain-OS modules (`GET`/`PATCH /api/v1/os`) ─────────────────────
@@ -229,11 +239,9 @@ export const listOsModules = async (): Promise<DomainOsList> => {
 // PATCH returns the whole refreshed list (server.rs `patch_os`), not just the
 // one module, so the caller sees the new `restart_required` state too.
 export const setOsModuleEnabled = async (name: string, enabled: boolean): Promise<DomainOsList> => {
-  const res = await window.agent24.backendProxy({
-    method: 'PATCH',
-    path: `/api/v1/os/${encodeURIComponent(name)}`,
-    body: { enabled },
-  })
+  // A1: elevated; dedicated IPC with a native confirmation in main.
+  const res = await window.agent24.osModuleSetEnabled(name, enabled)
+  if ((res.data as { error?: { code?: string } } | null)?.error?.code === 'cancelled') return listOsModules()
   if (!res.ok) throw new Error(errorMessage(res))
   return res.data as DomainOsList
 }

@@ -321,6 +321,10 @@ pub struct ChatResponse {
     /// play at all).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_receipt: Option<MemoryReceipt>,
+    /// P1-02c: why the write failed, whenever `memory_receipt` is `failed`,
+    /// `not_saved` or `partial`. The closed `memory_*` code set; never text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_error_code: Option<crate::events::MemoryFailureCode>,
 }
 
 /// M1-T14: the deterministic outcome of an explicit "记住…" turn on
@@ -338,6 +342,12 @@ pub enum MemoryReceipt {
     /// The prompt matched an explicit remember and memory is active, but the
     /// write itself failed.
     Failed,
+    /// P1-02c: an ordinary (not explicit-remember) turn whose conversation
+    /// write failed — this turn is not in the session history.
+    NotSaved,
+    /// P1-02c: an explicit remember whose conversation turn WAS saved but whose
+    /// assertion was not — the conversation is kept, the memory is not.
+    Partial,
 }
 
 // ── Session ──────────────────────────────────────────────────────────────────
@@ -411,6 +421,10 @@ pub struct RunInput {
     pub model_override: Option<String>,
     #[serde(default)]
     pub mode: RunMode,
+    /// The Knowledge binding copied from the run request; null when the run
+    /// has none. Absent in runs stored before it existed, which read as null.
+    #[schemars(required)]
+    pub knowledge_binding_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -454,6 +468,41 @@ pub struct RunCreate {
     /// H8: `plan` starts the run read-only until a submitted plan is approved.
     #[serde(default)]
     pub mode: RunMode,
+    /// KB-HOST-01: a Knowledge binding the product host activated over its
+    /// private interface. A selector, not an authority; omit/null for none.
+    #[serde(default)]
+    pub knowledge_binding_id: Option<String>,
+}
+
+/// K1-6b.5c-2 (ADR-K1-02 §2.4): a run as a peer bridge (the MCP server, the
+/// ACP bridge) may relay it. Content is present only when `withheld` is false
+/// and the run has ended. Any other run — a source that is not Ordinary,
+/// sources that cannot be read, or, while tool results carry no source tags,
+/// a run that may have taken one in (it called a tool, recalled a memory, was
+/// started by a kernel-created schedule, or has session context) — carries
+/// only its id, status and `notice`.
+/// An allowlist, not a filtered [`Run`]: a field added to `Run` later never
+/// reaches a peer by default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PeerRun {
+    pub id: String,
+    pub status: RunStatus,
+    /// True unless every source tagged on the run so far is Ordinary and the
+    /// run has called no tool, recalled no memory, was not started by a
+    /// kernel-created schedule and has no session context (no session, or it
+    /// ran — and the daemon runs — without session memory). Sources are tagged
+    /// before the first model call, so afterwards the value only changes when
+    /// the run starts a tool or the daemon restarts with session memory turned
+    /// on or off.
+    pub withheld: bool,
+    /// Present only for an ended run that is not withheld
+    pub prompt: Option<String>,
+    /// Present only for a completed run that is not withheld
+    pub output: Option<RunOutput>,
+    /// Present only for a failed run that is not withheld
+    pub error: Option<ErrorBody>,
+    /// Fixed explanation, present exactly when `withheld` is true
+    pub notice: Option<String>,
 }
 
 // ── ToolCall ─────────────────────────────────────────────────────────────────

@@ -1,9 +1,13 @@
 // Agent24 main process entry — M2: integrates BackendManager daemon.
 
-import { app, BrowserWindow, Menu, Tray, WebContentsView, nativeImage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, Menu, Tray, WebContentsView, nativeImage, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
-import { BackendManager, type BackendStatus } from './backend-manager'
+import { registerCliTool } from './ipc/cli-tool'
+import { initMainLocale, onMainLocaleChange } from './main-i18n'
+import { buildTrayView, type TrayAction } from './tray-menu'
+import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
+import { BackendManager } from './backend-manager'
 import { AgentEarEventBridge } from './agentear-events'
 import { documentsEvent } from './documents'
 import { AgentEarEventLog } from './agentear-log'
@@ -19,6 +23,8 @@ import {
 } from './creative-serve-web'
 import { OpenDesignComponentInstaller } from './open-design-component'
 import { createIdorisStatusProvider } from './idoris-admin'
+import { KnowledgeHost } from './knowledge-host'
+import { KnowledgeLoginStore } from './knowledge-logins'
 
 const isDev = process.env.NODE_ENV === 'development'
 const backendManager = new BackendManager()
@@ -58,15 +64,31 @@ const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL ?? 'http://localhost:5173
 const DEV_SERVER_ORIGIN = new URL(DEV_SERVER_URL).origin
 const DEV_SERVER_WS_ORIGIN = DEV_SERVER_ORIGIN.replace(/^http/, 'ws')
 
+// A3: what counts as "the app's own page" for IPC sender checks and the main
+// window's navigation guard — the vite dev server in dev, exactly the bundled
+// renderer index.html when packaged.
+const isAppUrl = createAppUrlPolicy({
+  ...(isDev ? { devServerUrl: DEV_SERVER_URL } : {}),
+  rendererIndexPath: path.join(__dirname, '../renderer/index.html'),
+})
+
 // Keep tray reference alive — GC would destroy it otherwise
 let tray: Tray | null = null
 // Mutable reference so tray handlers always point to the current window
 let mainWin: BrowserWindow | null = null
+// A3: wraps every ipcMain.handle — the call must come from mainWin's main frame
+// while it shows the app's own page. The Creative WebContentsView (a different
+// WebContents, remote content) therefore can never reach these handlers.
+const guard = createIpcGuard({ getMainWindow: () => mainWin, isTrustedUrl: isAppUrl })
 // Set to true by before-quit so win.on('close') guard is skipped on app exit
 let isQuitting = false
 // F1b: periodic tray refresh so the menu-bar reflects live daemon status
 let trayTimer: NodeJS.Timeout | null = null
+let cliTool: ReturnType<typeof registerCliTool> | null = null
+let cliCheckTicks = 0
 let creativeServeWeb: CreativeServeWeb | null = null
+// KB-HOST-01: Knowledge logins and the daemon's private Knowledge interface.
+let knowledgeHost: KnowledgeHost | null = null
 let openDesignComponent: OpenDesignComponentInstaller | null = null
 let creativeView: WebContentsView | null = null
 let creativeOrigin: string | null = null
@@ -103,6 +125,9 @@ async function showCreativeView(
   if (!creativeViewFence.isCurrent(requestGeneration)) return { ok: false, error: 'Creative view request superseded' }
   if (status.state === 'needs-download') {
     return { ok: false, needsDownload: true, size: status.size }
+  }
+  if (status.state === 'failed' && status.notInstalled) {
+    return { ok: false, notInstalled: true, error: status.error }
   }
   if (status.state !== 'ready' || !status.origin) {
     return { ok: false, error: status.error ?? 'Open Design did not become ready' }
@@ -176,6 +201,12 @@ function createMainWindow(): BrowserWindow {
 
   win.once('ready-to-show', () => win.show())
 
+  // A3: the main window only ever shows the app itself. Navigation elsewhere is
+  // blocked; http(s) targets open in the system browser, window.open is denied.
+  installNavigationGuards(win.webContents, isAppUrl, (url) => {
+    shell.openExternal(url).catch((err) => console.error('openExternal failed', err))
+  })
+
   // While the tray is active and app is not quitting, intercept close → hide.
   // isQuitting is set in before-quit so Cmd+Q / app-menu Quit work normally.
   win.on('close', (e) => {
@@ -214,7 +245,24 @@ process.on('unhandledRejection', (reason) => {
   console.error('[main] unhandledRejection', reason)
 })
 
+// One desktop per user. Its daemon runs in capability mode, so a second copy
+// could neither share that daemon nor start its own while the first holds the
+// daemon's singleton lock; a second launch brings the first window forward.
+const isPrimaryInstance = app.requestSingleInstanceLock()
+if (!isPrimaryInstance) app.quit()
+// Until whenReady below has created the first window (after the CSP hook and
+// IPC handlers are in place), a second launch has nothing to bring forward and
+// must not create a window of its own.
+app.on('second-instance', () => {
+  if (mainWin) showOrCreateWindow()
+})
+
 app.whenReady().then(async () => {
+  if (!isPrimaryInstance) return
+  // UI language for the tray and native dialogs: English unless the user chose
+  // otherwise (the renderer reports its setting; the system locale is ignored).
+  initMainLocale(app.getPath('userData'))
+  onMainLocaleChange(() => refreshTray())
   const idorisStatus = await idorisStatusProviderPromise
   // Owner decision 2026-10-05: Open Design is downloaded on demand (see
   // open-design-component.ts) instead of being bundled in the installer.
@@ -253,6 +301,11 @@ app.whenReady().then(async () => {
   // read `backendManager.status()` / `getBackendEndpoint()` live, so this
   // resolving a beat later than the old synchronous spawn is harmless.
   void backendManager.start()
+  // safeStorage needs the app ready. The logins load once, here, before
+  // anything can change them; the reason is logged, never the contents.
+  knowledgeHost = new KnowledgeHost(new KnowledgeLoginStore(app.getPath('userData'), safeStorage))
+  const knowledgeLogins = knowledgeHost.start()
+  if (!knowledgeLogins.ok) console.warn(`[knowledge] logins unavailable: ${knowledgeLogins.reason}`)
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     callback({
       responseHeaders: {
@@ -269,24 +322,35 @@ app.whenReady().then(async () => {
     })
   })
 
-  registerIpcHandlers({ idorisStatus })
+  registerIpcHandlers({ idorisStatus, guard })
+  cliTool = registerCliTool({
+    guard, executable: process.execPath, resources: process.resourcesPath, packaged: app.isPackaged,
+    changed: refreshTray,
+    openSettings: () => {
+      showOrCreateWindow()
+      const contents = mainWin?.webContents
+      if (contents?.isLoading()) contents.once('did-finish-load', () => contents.send(IpcChannels.CliToolOpenSettings))
+      else contents?.send(IpcChannels.CliToolOpenSettings)
+    },
+  })
+  void cliTool.refresh()
   mainWin = createMainWindow()
-  ipcMain.handle(IpcChannels.CreativeShow, (_event, bounds: CreativeViewBounds) => showCreativeView(bounds))
-  ipcMain.handle(IpcChannels.CreativeRestart, (_event, bounds: CreativeViewBounds) => restartCreativeView(bounds))
-  ipcMain.handle(IpcChannels.CreativeBounds, (_event, bounds: CreativeViewBounds) => {
+  ipcMain.handle(IpcChannels.CreativeShow, guard((_event, bounds: CreativeViewBounds) => showCreativeView(bounds)))
+  ipcMain.handle(IpcChannels.CreativeRestart, guard((_event, bounds: CreativeViewBounds) => restartCreativeView(bounds)))
+  ipcMain.handle(IpcChannels.CreativeBounds, guard((_event, bounds: CreativeViewBounds) => {
     if (creativeViewFence.wantsVisible() && creativeOrigin && creativeView && !creativeView.webContents.isDestroyed()) {
       creativeView.setBounds(normalizedBounds(bounds))
     }
-  })
-  ipcMain.handle(IpcChannels.CreativeHide, () => hideCreativeView())
-  ipcMain.handle(IpcChannels.OpenDesignComponentStatus, () => openDesignComponent?.status()
-    ?? { state: 'unavailable', reason: 'Open Design component installer is unavailable' })
-  ipcMain.handle(IpcChannels.OpenDesignComponentInstall, () => openDesignComponent?.install()
-    ?? Promise.resolve({ state: 'unavailable', reason: 'Open Design component installer is unavailable' }))
-  ipcMain.handle(IpcChannels.OpenDesignComponentPause, () => {
+  }))
+  ipcMain.handle(IpcChannels.CreativeHide, guard(() => hideCreativeView()))
+  ipcMain.handle(IpcChannels.OpenDesignComponentStatus, guard(() => openDesignComponent?.status()
+    ?? { state: 'unavailable', reason: 'Open Design component installer is unavailable' }))
+  ipcMain.handle(IpcChannels.OpenDesignComponentInstall, guard(() => openDesignComponent?.install()
+    ?? Promise.resolve({ state: 'unavailable', reason: 'Open Design component installer is unavailable' })))
+  ipcMain.handle(IpcChannels.OpenDesignComponentPause, guard(() => {
     openDesignComponent?.pause()
     return openDesignComponent?.status() ?? { state: 'unavailable', reason: 'Open Design component installer is unavailable' }
-  })
+  }))
   openDesignComponent?.onProgress((status) => {
     if (mainWin && !mainWin.isDestroyed()) {
       mainWin.webContents.send(IpcChannels.OpenDesignComponentProgress, status)
@@ -297,7 +361,7 @@ app.whenReady().then(async () => {
   // A3-4 review M5: pull (snapshot on mount) + push (ongoing) for the voice
   // panel's log. Registered once here — the log itself is process-lifetime,
   // not per-window, so no cleanup needed on window recreation.
-  ipcMain.handle(IpcChannels.AgentEarSnapshot, () => agentEarLog.snapshot())
+  ipcMain.handle(IpcChannels.AgentEarSnapshot, guard(() => agentEarLog.snapshot()))
   agentEarLog.subscribe((envelope) => {
     if (mainWin && !mainWin.isDestroyed()) {
       mainWin.webContents.send(IpcChannels.AgentEarEvent, envelope)
@@ -305,7 +369,7 @@ app.whenReady().then(async () => {
   })
 
   // ME4-desktop-model-ui: same pull+push pair, for model-call-log.ts.
-  ipcMain.handle(IpcChannels.ModelCallSnapshot, () => modelCallLog.snapshot())
+  ipcMain.handle(IpcChannels.ModelCallSnapshot, guard(() => modelCallLog.snapshot()))
   modelCallLog.subscribe((call) => {
     if (mainWin && !mainWin.isDestroyed()) {
       mainWin.webContents.send(IpcChannels.ModelCallEvent, call)
@@ -320,65 +384,52 @@ app.whenReady().then(async () => {
   refreshTray()
   // Poll so the menu-bar title/tooltip and menu track the daemon as it starts,
   // crashes, or is toggled from the menu itself.
-  trayTimer = setInterval(refreshTray, 4_000)
+  trayTimer = setInterval(() => {
+    refreshTray()
+    if (++cliCheckTicks % 15 === 0) void cliTool?.refresh()
+    // Replays the wanted Knowledge bindings on a restarted daemon and retries
+    // changes that did not land.
+    knowledgeHost?.sync()
+  }, 4_000)
   // ─────────────────────────────────────────────────────────────────────────
 
   // macOS: re-open window when dock icon clicked with no windows open
   app.on('activate', () => showOrCreateWindow())
 })
 
-// F1b: labels/glyphs for the current daemon status.
-const STATUS_META: Record<BackendStatus, { title: string; label: string }> = {
-  running: { title: '⚡A24', label: '● daemon：运行中' },
-  starting: { title: '…A24', label: '○ daemon：启动中…' },
-  stopped: { title: '⚠️A24', label: '✕ daemon：已停止' },
-}
-
-// Rebuild the tray title, tooltip, and context menu from the live daemon status.
-// Cheap and idempotent — safe to call on a timer.
+// Rebuild the tray title, tooltip, and context menu from the live daemon status
+// and the current UI language. Cheap and idempotent — safe to call on a timer,
+// and called again whenever the language changes.
 function refreshTray(): void {
   if (!tray) return
-  const status = backendManager.status()
-  const external = backendManager.isExternalDaemon()
-  const meta = STATUS_META[status]
-  // DEP-A5: an external daemon (reused from `agent24 daemon start`, not
-  // spawned by this app) gets a visibly different label — the whole point of
-  // requirement #2 is that the user can tell them apart before hitting stop.
-  const label = external ? `${meta.label}（外部 daemon · pid ${backendManager.externalDaemonPid() ?? '?'}）` : meta.label
-  if (process.platform === 'darwin') tray.setTitle(meta.title)
-  tray.setToolTip(`Agent24 — ${label.replace(/^[●○✕]\s*/, '')}（${backendManager.backendKind()}）`)
+  const view = buildTrayView({
+    status: backendManager.status(),
+    external: backendManager.isExternalDaemon(),
+    externalPid: backendManager.externalDaemonPid() ?? null,
+    foreignPid: backendManager.foreignDaemonPid(),
+    backendKind: backendManager.backendKind(),
+    cliTool: cliTool?.status(),
+  })
+  if (process.platform === 'darwin') tray.setTitle(view.title)
+  tray.setToolTip(view.tooltip)
 
-  // DEP-A5 requirement #2: stop/restart must only ever act on a daemon this
-  // app spawned. BackendManager.stopDaemon()/restart() already guard against
-  // killing an external daemon at the method level (see backend-manager.ts),
-  // but the external case also gets its own menu wording here — "断开" instead
-  // of "停止/重启" — so the tray itself never implies a kill that won't happen.
-  const daemonItems: MenuItemConstructorOptions[] =
-    status === 'stopped'
-      ? [{ label: '启动 daemon', click: () => { backendManager.startDaemon(); refreshTray() } }]
-      : external
-        ? [{ label: '断开外部 daemon（不会终止它）', click: () => { backendManager.stopDaemon(); refreshTray() } }]
-        : [
-            { label: '重启 daemon', click: () => { backendManager.restart(); refreshTray() } },
-            { label: '停止 daemon', click: () => { backendManager.stopDaemon(); refreshTray() } },
-          ]
-
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label, enabled: false },
-    { type: 'separator' },
-    { label: '显示窗口', click: () => showOrCreateWindow() },
-    { type: 'separator' },
-    ...daemonItems,
-    { type: 'separator' },
-    {
-      label: '退出 Agent24',
-      click: () => {
-        // Clear tray ref so win.on('close') guard is skipped and app can quit
-        tray = null
-        app.quit()
-      },
+  const actions: Record<TrayAction, () => void> = {
+    'cli-settings': () => cliTool?.openSettings(),
+    start: () => { backendManager.startDaemon(); refreshTray() },
+    disconnect: () => { backendManager.stopDaemon(); refreshTray() },
+    restart: () => { backendManager.restart(); refreshTray() },
+    stop: () => { backendManager.stopDaemon(); refreshTray() },
+    show: () => showOrCreateWindow(),
+    quit: () => {
+      // Clear tray ref so win.on('close') guard is skipped and app can quit
+      tray = null
+      app.quit()
     },
-  ]))
+  }
+  tray.setContextMenu(Menu.buildFromTemplate(view.items.map((item): MenuItemConstructorOptions =>
+    'type' in item ? { type: 'separator' }
+      : 'action' in item ? { label: item.label, click: actions[item.action] }
+        : { label: item.label, enabled: false })))
 }
 
 app.on('before-quit', () => {

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/iDoris-ai/Agent24/protocol/knowledge/v1/capabilities.schema.json",
+  "title": "Agent24 Knowledge v1 — /system/capabilities integration extension",
+  "description": "CONTRACT-READONLY-v1 §9. Validates the data layer of /system/capabilities (outer {code, msg, data} stays upstream's). Only integration.agent24_knowledge is constrained; upstream keys (edition, capabilities, ...) pass through. Capabilities state what is supported, never health or readiness (R9.3).",
+  "type": "object", "required": ["integration"],
+  "properties": {
+    "integration": {
+      "type": "object", "required": ["agent24_knowledge"],
+      "properties": {
+        "agent24_knowledge": {
+          "description": "Closed on purpose: R9.2's 'at least' obliges clients to tolerate extra keys (§0.3); a v1 producer sends exactly these five, and a later key is added to this schema in the same PR as the contract.",
+          "type": "object", "additionalProperties": false,
+          "required": ["protocol_versions", "mode", "supported_operations", "server_version", "limits"],
+          "properties": {
+            "protocol_versions": { "description": "Supported contract major versions (R9.4).", "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "common.schema.json#/$defs/positive_int" } },
+            "mode": { "description": "Only integration is compatible (R9.4).", "enum": ["integration", "standalone"] },
+            "supported_operations": { "type": "array", "uniqueItems": true, "items": { "enum": ["search", "read"] } },
+            "server_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "limits": {
+              "description": "Server upper bounds that requests are clamped to (R3.3, R4.5).",
+              "type": "object", "additionalProperties": false,
+              "required": ["max_results", "max_concurrency", "max_deadline_ms", "max_read_bytes", "max_page_limit", "max_snippet_bytes"],
+              "properties": {
+                "max_results": { "$ref": "common.schema.json#/$defs/positive_int" },
+                "max_concurrency": { "$ref": "common.schema.json#/$defs/positive_int" },
+                "max_deadline_ms": { "$ref": "common.schema.json#/$defs/positive_int" },
+                "max_read_bytes": { "$ref": "common.schema.json#/$defs/positive_int" },
+                "max_page_limit": { "$ref": "common.schema.json#/$defs/positive_int" },
+                "max_snippet_bytes": { "$ref": "common.schema.json#/$defs/positive_int" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

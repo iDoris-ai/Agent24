@@ -117,11 +117,21 @@ pub trait KnowledgeBase: Send + Sync {
 #[derive(Clone)]
 pub struct InstructionStore {
     pool: SqlitePool,
+    gate: crate::disk_gate::DiskGate,
 }
 
 impl InstructionStore {
     pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            gate: crate::disk_gate::DiskGate::disabled(),
+        }
+    }
+
+    /// Attach the pre-write disk check (P1-02c c4).
+    pub(crate) fn with_gate(mut self, gate: crate::disk_gate::DiskGate) -> Self {
+        self.gate = gate;
+        self
     }
 
     /// Triggers, trimmed with blanks dropped: a whitespace-only trigger is a
@@ -144,6 +154,7 @@ impl InstructionStore {
         status: InstructionStatus,
         only_when_pending: bool,
     ) -> Result<u64> {
+        self.gate.check(crate::disk_gate::WriteClass::Content)?;
         let triggers = serde_json::to_string(&Self::clean_triggers(&i.triggers))?;
         let sql = if only_when_pending {
             "INSERT INTO mem_instructions
@@ -263,6 +274,7 @@ impl KnowledgeBase for InstructionStore {
     }
 
     async fn approve(&self, id: &str, owner: &str, layer: &str, priority: i64) -> Result<bool> {
+        self.gate.check(crate::disk_gate::WriteClass::Content)?;
         let res = sqlx::query(
             "UPDATE mem_instructions SET status = 'active', layer = ?, priority = ?
              WHERE id = ? AND scope_owner = ? AND status = 'pending'",

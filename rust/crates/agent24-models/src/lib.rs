@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+mod idoris;
+pub use idoris::IdorisEvidence;
 pub mod router;
 mod stream;
 
@@ -215,6 +217,12 @@ pub enum ModelError {
 pub trait ModelProvider: Send + Sync {
     fn name(&self) -> &str;
 
+    /// Exact configured receiving endpoint for outbound authorization.
+    /// Providers that cannot report it are treated as unknown and denied remotely.
+    fn outbound_destination(&self) -> Option<String> {
+        None
+    }
+
     async fn complete(
         &self,
         req: &CompletionRequest,
@@ -342,16 +350,7 @@ impl OpenAiCompatProvider {
 
     /// A whole (non-streamed) answer as a response.
     fn answer(&self, parsed: OaChatResponse) -> Result<CompletionResponse, ModelError> {
-        let model_id = parsed.model.filter(|m| !m.is_empty());
-        let choice =
-            parsed.choices.into_iter().next().ok_or_else(|| {
-                ModelError::Provider(format!("{} returned no choices", self.name))
-            })?;
-        Ok(CompletionResponse {
-            message: choice.message.into(),
-            usage: usage_of(parsed.usage),
-            model_id,
-        })
+        completion_response(parsed, &self.name)
     }
 
     /// ME4-S2a §2.3: the answer read as it is written, under `p`'s timers. No
@@ -756,6 +755,80 @@ fn classify(err: &reqwest::Error) -> ModelError {
     }
 }
 
+fn completion_body(
+    req: &CompletionRequest,
+    default_model: &str,
+    supports_chat_template_kwargs: bool,
+    supports_reasoning_effort: bool,
+) -> Value {
+    let messages: Vec<OaMessage> = req.messages.iter().map(OaMessage::from).collect();
+    let mut body = serde_json::json!({
+        "model": req.model.as_deref().unwrap_or(default_model),
+        "messages": messages,
+        "stream": false,
+    });
+    if !req.tools.is_empty() {
+        body["tools"] = Value::Array(
+            req.tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        }
+                    })
+                })
+                .collect(),
+        );
+    }
+    if let Some(rf) = &req.response_format {
+        body["response_format"] = rf.to_wire();
+    }
+    // ME4-4.2.2a: only when set — an absent key keeps /chat's body unchanged.
+    if let Some(n) = req.max_tokens {
+        body["max_tokens"] = Value::from(n.get());
+    }
+    // ME4-S2b: the same "only when set" rule.
+    if let Some(t) = req.temperature {
+        body["temperature"] = Value::from(t);
+    }
+    // ME4-S2-thinking / review H2: same "only when set" rule — an unset
+    // flag, OR a provider that never opted into this oMLX-specific
+    // extension, keeps the body byte-for-byte unchanged. Gating on
+    // `supports_chat_template_kwargs` (not `self.tier`) means a
+    // hosted/managed OpenAI-compatible endpoint — even one some future
+    // config mislabels `local` — never receives a field outside the
+    // OpenAI contract it actually speaks.
+    if req.disable_thinking && supports_chat_template_kwargs {
+        body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": false });
+    }
+    // ME4-S2c §4: the same gate, for Ollama.
+    if req.disable_thinking && supports_reasoning_effort {
+        body["reasoning_effort"] = Value::from("none");
+    }
+    body
+}
+
+fn completion_response(
+    parsed: OaChatResponse,
+    name: &str,
+) -> Result<CompletionResponse, ModelError> {
+    let model_id = parsed.model.filter(|m| !m.is_empty());
+    let choice = parsed
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| ModelError::Provider(format!("{} returned no choices", name)))?;
+    Ok(CompletionResponse {
+        message: choice.message.into(),
+        usage: usage_of(parsed.usage),
+        model_id,
+    })
+}
+
 /// A backend that hangs up after the request went out (Ollama stopped while
 /// it reads the prompt, or an idle pooled connection it had closed) is going
 /// away, like one that cannot be reached. An answer that is not HTTP is not
@@ -807,59 +880,26 @@ impl ModelProvider for OpenAiCompatProvider {
         &self.name
     }
 
+    fn outbound_destination(&self) -> Option<String> {
+        let mut endpoint = reqwest::Url::parse(&self.base_url).ok()?;
+        endpoint.set_username("").ok()?;
+        endpoint.set_password(None).ok()?;
+        endpoint.set_query(None);
+        endpoint.set_fragment(None);
+        Some(endpoint.to_string().trim_end_matches('/').to_owned())
+    }
+
     async fn complete(
         &self,
         req: &CompletionRequest,
         cancel: &CancellationToken,
     ) -> Result<CompletionResponse, ModelError> {
-        let messages: Vec<OaMessage> = req.messages.iter().map(OaMessage::from).collect();
-        let mut body = serde_json::json!({
-            "model": req.model.as_deref().unwrap_or(&self.default_model),
-            "messages": messages,
-            "stream": false,
-        });
-        if !req.tools.is_empty() {
-            body["tools"] = Value::Array(
-                req.tools
-                    .iter()
-                    .map(|t| {
-                        serde_json::json!({
-                            "type": "function",
-                            "function": {
-                                "name": t.name,
-                                "description": t.description,
-                                "parameters": t.parameters,
-                            }
-                        })
-                    })
-                    .collect(),
-            );
-        }
-        if let Some(rf) = &req.response_format {
-            body["response_format"] = rf.to_wire();
-        }
-        // ME4-4.2.2a: only when set — an absent key keeps /chat's body unchanged.
-        if let Some(n) = req.max_tokens {
-            body["max_tokens"] = Value::from(n.get());
-        }
-        // ME4-S2b: the same "only when set" rule.
-        if let Some(t) = req.temperature {
-            body["temperature"] = Value::from(t);
-        }
-        // ME4-S2-thinking / review H2: same "only when set" rule — an unset
-        // flag, OR a provider that never opted into this oMLX-specific
-        // extension, keeps the body byte-for-byte unchanged. Gating on
-        // `self.supports_chat_template_kwargs` (not `self.tier`) means a
-        // hosted/managed OpenAI-compatible endpoint — even one some future
-        // config mislabels `local` — never receives a field outside the
-        // OpenAI contract it actually speaks.
-        if req.disable_thinking && self.supports_chat_template_kwargs {
-            body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": false });
-        }
-        // ME4-S2c §4: the same gate, for Ollama.
-        if req.disable_thinking && self.supports_reasoning_effort {
-            body["reasoning_effort"] = Value::from("none");
-        }
+        let mut body = completion_body(
+            req,
+            &self.default_model,
+            self.supports_chat_template_kwargs,
+            self.supports_reasoning_effort,
+        );
         if req.progress.is_some() {
             if !req.tools.is_empty() {
                 return Err(ModelError::Provider(format!(

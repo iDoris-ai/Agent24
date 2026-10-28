@@ -71,7 +71,8 @@ export default function ApprovalsPage() {
 
   const decide = async (id: string, type: string, denyReason?: string) => {
     try {
-      await decideApproval(id, { type, reason: denyReason })
+      // false = the user declined the native confirmation: keep the form as is.
+      if (!(await decideApproval(id, { type, reason: denyReason }))) return
       setDenyingId(null)
       setReason('')
       refresh()

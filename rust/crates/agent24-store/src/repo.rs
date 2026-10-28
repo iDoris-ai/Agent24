@@ -17,6 +17,24 @@ use sqlx::{Sqlite, Transaction};
 
 use crate::{Result, Store, StoreError};
 
+/// A schedule and its completion evidence, read in the same SQL snapshot.
+#[derive(serde::Serialize)]
+pub struct ScheduleStatus {
+    #[serde(flatten)]
+    pub schedule: Schedule,
+    pub completed: bool,
+}
+
+// Run status describes execution, not trigger acceptance. A persisted run in
+// ANY state proves acceptance; last_run_at only proves a pre-advance attempt.
+// Runs store created_at at second precision, so truncate at.ts to seconds too.
+const SCHEDULE_STATUS_SELECT: &str = "SELECT schedules.*,
+    (owner_module IS NULL AND json_extract(spec, '$.type') = 'at'
+     AND next_run_at IS NULL AND EXISTS (
+        SELECT 1 FROM runs WHERE runs.schedule_id = schedules.id
+        AND julianday(runs.created_at) >= julianday(strftime('%Y-%m-%dT%H:%M:%S', json_extract(schedules.spec, '$.ts')))
+     )) AS completed FROM schedules";
+
 pub(crate) fn status_str(s: RunStatus) -> &'static str {
     match s {
         RunStatus::Queued => "queued",
@@ -949,6 +967,29 @@ impl Store {
         rows.iter().map(Self::row_to_schedule).collect()
     }
 
+    pub async fn get_schedule_status(&self, id: &str) -> Result<Option<ScheduleStatus>> {
+        let row = sqlx::query(&format!("{SCHEDULE_STATUS_SELECT} WHERE schedules.id = ?"))
+            .bind(id)
+            .fetch_optional(self.pool())
+            .await?;
+        row.as_ref().map(Self::row_to_schedule_status).transpose()
+    }
+
+    /// Completion evidence for the entire list is fetched in ONE statement.
+    pub async fn list_schedule_statuses(&self) -> Result<Vec<ScheduleStatus>> {
+        let rows = sqlx::query(&format!("{SCHEDULE_STATUS_SELECT} ORDER BY name ASC"))
+            .fetch_all(self.pool())
+            .await?;
+        rows.iter().map(Self::row_to_schedule_status).collect()
+    }
+
+    fn row_to_schedule_status(row: &SqliteRow) -> Result<ScheduleStatus> {
+        Ok(ScheduleStatus {
+            schedule: Self::row_to_schedule(row)?,
+            completed: row.get("completed"),
+        })
+    }
+
     /// Delete a schedule AND every standing grant it owns, in one transaction.
     ///
     /// The cascade is the point, not housekeeping: a grant means "this
@@ -956,7 +997,41 @@ impl Store {
     /// is gone and the grant outlives it, a later schedule that happens to be
     /// issued the same id would inherit an authorisation nobody granted it.
     pub async fn delete_schedule(&self, id: &str) -> Result<bool> {
+        self.delete_schedule_conditionally(id, false).await
+    }
+
+    /// The write lock covers rechecking completion and deleting grants/row.
+    pub async fn delete_schedule_conditionally(
+        &self,
+        id: &str,
+        only_if_completed: bool,
+    ) -> Result<bool> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        if only_if_completed {
+            let row = sqlx::query(&format!("{SCHEDULE_STATUS_SELECT} WHERE schedules.id = ?"))
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            match row {
+                None => return Ok(false),
+                Some(row) if !row.get::<bool, _>("completed") => {
+                    return Err(StoreError::Conflict("schedule is not completed".into()));
+                }
+                Some(_) => {}
+            }
+            // Completion proves trigger acceptance, not that execution ended.
+            // Keep grants for queued/running/approval-waiting runs as well.
+            let has_active_run: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM runs WHERE schedule_id = ? \
+                 AND status IN ('queued', 'running', 'awaiting_approval'))",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if has_active_run {
+                return Err(StoreError::Conflict("schedule has active runs".into()));
+            }
+        }
         let result = sqlx::query("DELETE FROM schedules WHERE id = ?")
             .bind(id)
             .execute(&mut *tx)

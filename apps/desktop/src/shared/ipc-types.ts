@@ -2,11 +2,21 @@
 // Capability modules will extend this in M1+.
 
 export const IpcChannels = {
+  CliToolOpenSettings: 'cli-tool:open-settings',
+  CliToolStatus: 'cli-tool:status',
+  CliToolInstall: 'cli-tool:install',
+  AppLocale: 'app:locale',
   AppPing: 'app:ping',
   AppVersion: 'app:version',
+  AppSetLocale: 'app:set-locale',
   ShellOpenExternal: 'shell:open-external',
   BackendProxy: 'backend:proxy',
   BackendEndpoint: 'backend:endpoint',
+  // A1: elevated daemon operations the generic `backendProxy` no longer
+  // forwards. Each asks the user through a native dialog in the main process
+  // before sending anything.
+  ApprovalDecide: 'approval:decide',
+  OsModuleSetEnabled: 'os-module:set-enabled',
   CreativeShow: 'creative:show',
   CreativeRestart: 'creative:restart',
   CreativeBounds: 'creative:bounds',
@@ -74,6 +84,13 @@ export interface BackendProxyResponse {
   data: unknown
 }
 
+/** A1: a decision for `POST /api/v1/approvals/{id}`. The daemon offers the valid
+ *  set per approval (`available_decisions`), so `type` is an open string here. */
+export interface ApprovalDecisionInput {
+  type: string
+  reason?: string
+}
+
 /** FU-93: the backend daemon's actual (dynamic) port, so the sidebar can show
  * it instead of a hardcoded guess. `null` while the daemon has not announced
  * its ready line yet. */
@@ -96,6 +113,10 @@ export interface CreativeViewResult {
    * component is not installed yet — the renderer should show the download
    * card (driven by the OpenDesignComponent* IPC) rather than an error. */
   needsDownload?: boolean
+  /** Set instead of an error when this build neither bakes a downloadable
+   * Open Design component manifest nor finds a local runtime: the optional
+   * component is simply not available, which is a state, not a failure. */
+  notInstalled?: boolean
   size?: number
 }
 
@@ -124,10 +145,19 @@ export interface OmlxDetectResult {
   models: string[]
 }
 
+/** A server answered on this address but demands an API key (401/403). The
+ * renderer should point the user at the API key field, not say "disconnected". */
+export interface OmlxAuthRequiredResult {
+  authRequired: true
+  url: string
+}
+
 export interface OmlxModelsResult {
   ok: boolean
   models: string[]
   error?: string
+  /** The server answered 401/403: it is running but needs an API key. */
+  authRequired?: boolean
 }
 
 export interface OmlxStartResult {
@@ -352,6 +382,7 @@ export type DocumentsRequest =
   | { op: 'capabilities' }
   | { op: 'list'; cursor?: ListQuery['cursor']; limit?: ListQuery['limit'] }
   | { op: 'get'; documentId: DocSchemas['DocumentIdString'] }
+  | { op: 'readText'; documentId: DocSchemas['DocumentIdString']; revision: number; cursor?: string }
   | { op: 'job'; jobId: DocSchemas['JobIdString'] }
   | { op: 'cancelJob'; jobId: DocSchemas['JobIdString'] }
   | { op: 'retryJob'; jobId: DocSchemas['JobIdString'] }
@@ -361,6 +392,7 @@ export interface DocumentsResults {
   capabilities: DocSchemas['DocumentsCapabilities']
   list: DocSchemas['DocumentList']
   get: DocSchemas['DocumentDetail']
+  readText: DocSchemas['DocumentsTextPage']
   job: DocSchemas['DocumentsJob']
   cancelJob: DocSchemas['DocumentsJob']
   retryJob: DocSchemas['DocumentsJob']
@@ -389,3 +421,14 @@ export interface DocumentsImportProgress {
   sent: number
   total: number
 }
+
+export interface CliToolStatus {
+  state: 'missing' | 'outdated' | 'current' | 'newer' | 'unknown' | 'unavailable'
+  path: string | null
+  version: string | null
+  bundledVersion: string | null
+}
+
+export type CliInstallResult =
+  | { state: 'installed'; backup: string | null }
+  | { state: 'cancelled' | 'failed' | 'move-app' }

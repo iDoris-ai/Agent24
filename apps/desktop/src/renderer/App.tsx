@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
 import type { Agent24API } from '../main/preload'
-import type { ModuleInfo } from '../shared/ipc-types'
 
 declare global {
   interface Window { agent24: Agent24API }
@@ -10,10 +9,6 @@ import HomePage from './pages/Home'
 import WorkbenchPage from './pages/Workbench'
 import ModelsPage from './pages/Models'
 import SettingsPage from './pages/Settings'
-import ModulesManagerPage from './pages/ModulesManager'
-import HelloModule from './pages/modules/HelloModule'
-import CodeSandboxPage from './pages/CodeSandbox'
-import ServiceBoxDemoPage from './pages/ServiceBoxDemo'
 import RunsPage from './pages/Runs'
 import SchedulesPage from './pages/Schedules'
 import CommunicationPage from './pages/comm/Communication'
@@ -25,13 +20,6 @@ import DocumentsPage from './pages/documents/Documents'
 import logoSidebar from './assets/logo-sidebar.png'
 import { useT } from './i18n'
 import { appMessages } from './App.i18n'
-
-// Static module route map — M2 will replace this with dynamic import()
-const MODULE_PAGES: Record<string, React.ComponentType> = {
-  '/modules/hello': HelloModule,
-  'codebox': CodeSandboxPage,
-  'service-box': ServiceBoxDemoPage,
-}
 
 type BuiltinPage =
   | 'home'
@@ -47,8 +35,7 @@ type BuiltinPage =
   | 'models'
   | 'memory'
   | 'settings'
-  | 'modules-manager'
-type Page = BuiltinPage | string  // string = module route
+type Page = BuiltinPage
 
 const BUILTIN_NAV: { id: BuiltinPage; icon: string }[] = [
   // The landing page: an isometric machine showing how one run moves through the components.
@@ -64,7 +51,6 @@ const BUILTIN_NAV: { id: BuiltinPage; icon: string }[] = [
   { id: 'voice',           icon: '🎙️' },
   { id: 'creative',        icon: '🎨' },
   { id: 'models',          icon: '🤖' },
-  { id: 'modules-manager', icon: '🧩' },
   // M1-T11: 记忆页紧挨设置，和它共享"这是你对 Agent24 的控制面"这同一个位置。
   { id: 'memory',          icon: '🧠' },
   { id: 'settings',        icon: '⚙️' },
@@ -99,6 +85,7 @@ export function pickChatModel(models: string[]): string | undefined {
 const LLM_DETECTING = '\u0000detecting'
 const LLM_NO_RUNTIME = '\u0000no-runtime'
 const NO_CHAT_MODEL_LABEL = '\u0000no-chat-model'
+const LLM_NEEDS_KEY = '\u0000needs-key'
 
 /** ME4-desktop-model-ui: `GET /api/v1/models`'s `default_model` field
  * (`rust/apps/agent24d/src/routes.rs`) — the daemon's own `DEFAULT_MODEL`
@@ -114,11 +101,11 @@ export function extractDaemonDefaultModel(res: { ok: boolean; data: unknown }): 
 
 export function App(): JSX.Element {
   const [page, setPage] = useState<Page>('home')
+  useEffect(() => window.agent24.onCliToolSettings?.(() => setPage('settings')), [])
   const [backendOk, setBackendOk] = useState<boolean | null>(null)
   const [version, setVersion] = useState<string>('')
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [darkMode, setDarkMode] = useState(true)
-  const [modules, setModules] = useState<ModuleInfo[]>([])
   // Renamed from `llmLabel`: this is now only the oMLX-derived FALLBACK,
   // used when the daemon has no `default_model` to report. The topbar's
   // actual displayed label is the `llmLabel` derived value below.
@@ -134,7 +121,7 @@ export function App(): JSX.Element {
   // label only when the daemon has none to report (e.g. an older daemon
   // build, or the router was never built via `from_env`).
   const t = useT(appMessages)
-  const FALLBACK_KEYS = { [LLM_DETECTING]: 'llm.detecting', [LLM_NO_RUNTIME]: 'llm.noRuntime', [NO_CHAT_MODEL_LABEL]: 'llm.noChatModel' } as const
+  const FALLBACK_KEYS = { [LLM_DETECTING]: 'llm.detecting', [LLM_NO_RUNTIME]: 'llm.noRuntime', [NO_CHAT_MODEL_LABEL]: 'llm.noChatModel', [LLM_NEEDS_KEY]: 'llm.needsKey' } as const
   const fallbackKey = FALLBACK_KEYS[fallbackLlmLabel as keyof typeof FALLBACK_KEYS]
   const llmLabel = daemonDefaultModel
     ? t('llm.daemonDefault', { model: daemonDefaultModel })
@@ -146,13 +133,12 @@ export function App(): JSX.Element {
 
     void window.agent24.getAppVersion().then(setVersion)
 
-    // Backend health + module list polling
+    // Backend health polling
     const checkBackend = () => {
       window.agent24.backendProxy({ method: 'GET', path: '/api/v1/health' })
         .then((res) => {
           setBackendOk(res.ok)
           if (res.ok) {
-            void window.agent24.modulesList().then(setModules)
             // FU-93: show the daemon's real port, not a hardcoded guess.
             void window.agent24.backendEndpoint().then((e) => setBackendPort(e?.port ?? null))
             // ME4-desktop-model-ui: ask the daemon what its OWN default
@@ -174,18 +160,24 @@ export function App(): JSX.Element {
     // oMLX auto-detect on startup
     void (async () => {
       const detected = await window.agent24.omlxDetect()
+      if (detected && 'authRequired' in detected) {
+        // oMLX is running but wants an API key: starting another one would
+        // only collide with it. Say so; Settings has the key field.
+        setFallbackLlmLabel(LLM_NEEDS_KEY)
+        return
+      }
       if (detected) {
         const chatModel = pickChatModel(detected.models)
         setFallbackLlmLabel(chatModel ? `${chatModel} · oMLX` : NO_CHAT_MODEL_LABEL)
         return
       }
       // Try to start oMLX
-      const started = await window.agent24.omlxStart(8088, 'xiaobao8088')
+      const started = await window.agent24.omlxStart(8088, '')
       if (started.ok) {
         // Poll until ready
         for (let i = 0; i < 5; i++) {
           await new Promise((r) => setTimeout(r, 2000))
-          const r = await window.agent24.omlxModels(started.url, 'xiaobao8088')
+          const r = await window.agent24.omlxModels(started.url, '')
           if (r.ok && r.models.length > 0) {
             const chatModel = pickChatModel(r.models)
             setFallbackLlmLabel(chatModel ? `${chatModel} · oMLX` : NO_CHAT_MODEL_LABEL)
@@ -200,15 +192,7 @@ export function App(): JSX.Element {
     return () => clearInterval(backendTimer)
   }, [])
 
-  // UI modules with navItem get injected into sidebar
-  const moduleNavItems = modules.filter(
-    (m) => (m.type === 'ui' || m.type === 'hybrid') && m.navItem,
-  )
-
-  const isBuiltin = BUILTIN_NAV.some((n) => n.id === page)
-  const pageTitle = (isBuiltin ? t(`title.${page as BuiltinPage}`) : undefined)
-    ?? modules.find((m) => m.navItem?.route === page)?.name
-    ?? page
+  const pageTitle = t(`title.${page}`)
 
   return (
     <div className={`app${darkMode ? '' : ' light'}`}>
@@ -238,37 +222,6 @@ export function App(): JSX.Element {
               <span>{t(`nav.${item.id}`)}</span>
             </button>
           ))}
-
-          {/* Dynamically injected UI module nav items */}
-          {moduleNavItems.length > 0 && (
-            <>
-              <div className="nav-section">{t('nav.section.modules')}</div>
-              {moduleNavItems.map((m) => (
-                <button
-                  key={m.id}
-                  className={`nav-item ${page === m.navItem!.route ? 'active' : ''}`}
-                  onClick={() => setPage(m.navItem!.route)}
-                >
-                  <span className="icon">{m.navItem!.icon}</span>
-                  <span>{m.navItem!.label}</span>
-                </button>
-              ))}
-            </>
-          )}
-
-          {moduleNavItems.length === 0 && (
-            <>
-              <div className="nav-section">{t('nav.section.modules')}</div>
-              <button
-                className="nav-item"
-                onClick={() => setPage('modules-manager')}
-                style={{ opacity: 0.7 }}
-              >
-                <span className="icon">➕</span>
-                <span>{t('nav.installModule')}</span>
-              </button>
-            </>
-          )}
         </nav>
 
         <div className="sidebar-footer">
@@ -321,8 +274,10 @@ export function App(): JSX.Element {
           <HomePage
             backendOk={backendOk}
             backendPort={backendPort}
-            moduleCount={modules.length}
-            onNavigate={setPage}
+            moduleCount={0}
+            onNavigate={(target) => {
+              if (BUILTIN_NAV.some((n) => n.id === target)) setPage(target as BuiltinPage)
+            }}
           />
         )}
         {page === 'workbench'        && <WorkbenchPage />}
@@ -334,22 +289,8 @@ export function App(): JSX.Element {
         {page === 'voice'            && <VoicePanel />}
         {page === 'creative'         && <CreativePage />}
         {page === 'models'           && <ModelsPage />}
-        {page === 'modules-manager'  && <ModulesManagerPage />}
         {page === 'memory'           && <MemoryPage />}
         {page === 'settings'         && <SettingsPage />}
-        {/* Module UI pages — static map in M1, dynamic import() in M2 */}
-        {moduleNavItems.map((m) => {
-          if (page !== m.navItem!.route) return null
-          const ModulePage = MODULE_PAGES[m.navItem!.route]
-          return ModulePage
-            ? <ModulePage key={m.id} />
-            : (
-              <div key={m.id} className="content">
-                <div className="page-title">{m.name}</div>
-                <p style={{ color: 'var(--muted)', fontSize: 13 }}>{t('module.notRegistered')}</p>
-              </div>
-            )
-        })}
       </div>
     </div>
   )

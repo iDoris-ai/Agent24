@@ -775,7 +775,13 @@ async fn a_backend_that_hangs_up_while_a_large_prompt_is_written_is_unavailable(
         ..req(None)
     };
     let streamed = CompletionRequest {
-        progress: Some(progress(1000, 1000, 5000)),
+        // The write is what is under test, so the timers must not be able to
+        // end the call first. A 16 MiB body is serialized and written inside
+        // the first-chunk timer, which takes longer than a 1s limit in a debug
+        // build (every run failed with `no output within 1s`, #1158). A minute
+        // is out of reach for the hang-up, which is certain: the server has
+        // already closed, so the write is reset.
+        progress: Some(progress(60_000, 60_000, 120_000)),
         ..big.clone()
     };
     let p = provider(url);

@@ -46,9 +46,9 @@ v0.5.1 的范围：CLI 覆盖 macOS arm64/x64、Linux x64/arm64；桌面端只�
 
 | ID | 任务 | 依赖 | 执行 | 规模 | 状态 |
 |---|---|---|---|---|---|
-| DEP-B1 | 证书与密钥：导出 Developer ID Application 证书（p12）和 App Store Connect API key，存入仓库 Secrets | 账号 | **用户** | S | `BLOCKED`（账号申请中） |
-| DEP-B2 | macOS 桌面端 dmg：在 arm64 和 Intel runner 上分别构建；开启 hardened runtime + entitlements；在 `mac.binaries` 里显式列出 `agent24d`；notarytool 公证 + staple | B1, A5 | Sonnet | M | `BLOCKED` |
-| DEP-B3 | CLI 和模块二进制签名 + 公证：`agent24`/`agent24d`、`bin/sin90`、`bin/cos72` 用 codesign 签名，打成 zip 送公证，接入 A3/A4 的流水线 | B1, A3, A4 | Sonnet | M | `BLOCKED` |
+| DEP-B1 | 证书与密钥：导出 Developer ID Application 证书（p12）和 App Store Connect API key，存入仓库 Secrets | 账号 | **用户** | S | `PARTIAL`（账号已就绪，Developer ID 在本机 keychain、notary profile `apple-notary-HYAP444FN9` 可用；p12/API key 进仓库 Secrets 仅 CI 接入时才需要，未做） |
+| DEP-B2 | macOS 桌面端 dmg：在 arm64 和 Intel runner 上分别构建；开启 hardened runtime + entitlements；在 `mac.binaries` 里显式列出 `agent24d`；notarytool 公证 + staple | B1, A5 | Sonnet | M | `DONE`（本机流水线：`apps/desktop/scripts/release-mac.sh`，说明见 [MACOS-SIGNING.md](MACOS-SIGNING.md)；arm64 已实测（10-27，公证 Accepted），x64 与 CI 未做） |
+| DEP-B3 | CLI 和模块二进制签名 + 公证：`agent24`/`agent24d`、`bin/sin90`、`bin/cos72` 用 codesign 签名，打成 zip 送公证，接入 A3/A4 的流水线 | B1, A3, A4 | Sonnet | M | `DONE（本机脚本）`：`scripts/sign-cli-mac.sh`；裸二进制无法 staple；接入 release.yml 的 CI 部分未做 |
 | DEP-B5 | v0.5.2 发布：签名的 dmg 和 CLI；用**浏览器下载**（带 quarantine 标记）做干净机器验收 | B2, B3 | Opus + Sonnet | S | `BLOCKED` |
 
 **验收标准**

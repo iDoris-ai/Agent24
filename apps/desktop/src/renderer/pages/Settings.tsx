@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { LOCALES, isLocale, setLocale, useLocale, useT } from '../i18n'
 import { settingsMessages } from './Settings.i18n'
+import { CliToolSettings } from './settings/CliToolSettings'
 
 type OmlxStatus = 'detecting' | 'connected' | 'disconnected' | 'starting' | 'stopping'
 type ModelCategory = 'resident' | 'ondemand'
@@ -12,7 +13,9 @@ type DetectError = { key: keyof typeof settingsMessages.en } | { raw: string } |
 
 const CATEGORIES_KEY = 'agent24:model-categories'
 const AUTO_START_PORT = 8088
-const AUTO_START_KEY = 'xiaobao8088'
+// No built-in API key: an auto-started oMLX runs keyless on loopback; a key is
+// only used if the user types one into the field below.
+const AUTO_START_KEY = ''
 
 function loadCategories(): Record<string, ModelCategory> {
   try { return JSON.parse(localStorage.getItem(CATEGORIES_KEY) ?? '{}') } catch { return {} }
@@ -35,6 +38,8 @@ export default function SettingsPage() {
   const [testResult, setTestResult] = useState<TestResult>(null)
   const testTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const initDone = useRef(false)
+  const apiKeyInput = useRef<HTMLInputElement>(null)
+  const [keyNeeded, setKeyNeeded] = useState(false)
   const locale = useLocale()
   const t = useT(settingsMessages)
 
@@ -47,7 +52,14 @@ export default function SettingsPage() {
   async function initialize() {
     setOmlxStatus('detecting')
     setDetectError(null)
-    let detected = await window.agent24.omlxDetect()
+    const probed = await window.agent24.omlxDetect()
+    if (probed && 'authRequired' in probed) {
+      // Running, but it wants an API key: do not auto-start a second one.
+      setOmlxUrl(probed.url)
+      needsKey()
+      return
+    }
+    let detected = probed
     if (!detected) {
       // Auto-start oMLX
       setOmlxStatus('starting')
@@ -72,7 +84,17 @@ export default function SettingsPage() {
     }
   }
 
+  /** oMLX answered 401/403: running, but the key is missing or wrong. Say
+   *  that, and put the cursor in the key field. */
+  function needsKey() {
+    setOmlxStatus('disconnected')
+    setKeyNeeded(true)
+    setDetectError({ key: 'error.authRequired' })
+    apiKeyInput.current?.focus()
+  }
+
   function applyDetected(url: string, key: string, models: string[]) {
+    setKeyNeeded(false)
     setOmlxModels(models)
     setOmlxActiveModel((m) => m || models[0] || '')
     setOmlxStatus('connected')
@@ -104,7 +126,10 @@ export default function SettingsPage() {
     setOmlxStatus('detecting')
     setDetectError(null)
     const result = await window.agent24.omlxDetect()
-    if (result) {
+    if (result && 'authRequired' in result) {
+      setOmlxUrl(result.url)
+      needsKey()
+    } else if (result) {
       setOmlxUrl(result.url)
       setOmlxApiKey(result.apiKey)
       applyDetected(result.url, result.apiKey, result.models)
@@ -122,6 +147,8 @@ export default function SettingsPage() {
     if (result.ok) {
       applyDetected(omlxUrl, omlxApiKey, result.models)
       showTestResult({ ok: true, msg: t('result.connected', { count: result.models.length }) })
+    } else if (result.authRequired) {
+      needsKey()
     } else {
       setOmlxStatus('disconnected')
       showTestResult({ ok: false, msg: result.error ?? t('error.connectionFailed') })
@@ -184,6 +211,8 @@ export default function SettingsPage() {
     <div className="content">
       <div className="page-title">{t('page.title')}</div>
       <div className="page-sub">{t('page.subtitle')}</div>
+
+      <CliToolSettings />
 
       {/* ── AI Model Service ── */}
       <div className="settings-section">
@@ -249,8 +278,10 @@ export default function SettingsPage() {
         <div className="setting-row">
           <div><label>{t('service.apiKey')}</label><p>{t('service.apiKeyHint')}</p></div>
           <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-            <input type={showApiKey ? 'text' : 'password'} value={omlxApiKey}
-              onChange={(e) => setOmlxApiKey(e.target.value)} style={{ width: 180 }} placeholder={t('service.optional')} />
+            <input ref={apiKeyInput} type={showApiKey ? 'text' : 'password'} value={omlxApiKey}
+              aria-invalid={keyNeeded} aria-label={t('service.apiKey')}
+              onChange={(e) => setOmlxApiKey(e.target.value)}
+              style={{ width: 180, ...(keyNeeded ? { borderColor: '#f44336' } : {}) }} placeholder={t('service.optional')} />
             <button onClick={() => setShowApiKey((v) => !v)}
               style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--muted)', fontSize: 15, padding: '2px 4px', lineHeight: 1 }}
               title={showApiKey ? t('action.hide') : t('action.show')}>

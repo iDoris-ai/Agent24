@@ -19,6 +19,7 @@ use std::time::Duration;
 use serde_json::Value;
 use sqlx::{Sqlite, SqliteConnection, Transaction};
 
+use crate::authorization::ENDED;
 use crate::events::Events;
 use crate::jobs::snapshot;
 use crate::state::Storage;
@@ -184,6 +185,12 @@ impl Claim {
         &self.attempt.job_id
     }
 
+    /// Which attempt of the job this is.
+    #[must_use]
+    pub fn attempt(&self) -> i64 {
+        self.attempt.attempt
+    }
+
     /// The job's input, as written when the job was created.
     #[must_use]
     pub fn input(&self) -> Option<&Value> {
@@ -342,7 +349,10 @@ async fn settle(
                 status = CASE WHEN status = 'cancelling' THEN 'cancelled'
                               WHEN ?1 IS NULL THEN 'interrupted' ELSE 'failed' END,
                 error = CASE WHEN status = 'cancelling'
-                             THEN json_object('code', 'cancelled', 'message', 'cancelled by the user')
+                             THEN json_object('code', 'cancelled', 'message',
+                                  CASE WHEN EXISTS (SELECT 1 FROM job_revocations r
+                                                    WHERE r.job_id = jobs.id AND r.attempt = jobs.attempt)
+                                       THEN '{ENDED}' ELSE 'cancelled by the user' END)
                              WHEN ?1 IS NULL THEN NULL
                              ELSE json_object('code', ?1, 'message', ?2) END
          WHERE id = ?3 AND attempt = ?4 AND status IN {states}"

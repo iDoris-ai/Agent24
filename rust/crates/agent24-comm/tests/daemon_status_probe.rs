@@ -12,6 +12,8 @@
 //!   -> [`catch_up_state_is_never_literally_complete_through_the_rest_route`]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,9 +71,7 @@ async fn install(dir: &Path) -> VerifiedBinary {
     tokio::fs::write(&source, SCRIPT).await.unwrap();
     let bytes = tokio::fs::read(&source).await.unwrap();
     let expected = sha256_of(&bytes);
-    VerifiedBinary::install(&source, expected, &dir.join("bin"))
-        .await
-        .unwrap()
+    common::install_verified(&source, expected, &dir.join("bin")).await
 }
 
 /// Builds a full `router(CommState)` app with a real [`HyphaeDaemonSupervisor`]

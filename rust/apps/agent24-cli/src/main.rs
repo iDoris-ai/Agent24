@@ -21,6 +21,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use zeroize::{Zeroize, Zeroizing};
 
 mod acp;
+mod documents;
 mod service;
 mod tui;
 
@@ -64,6 +65,11 @@ enum Command {
         #[command(subcommand)]
         action: OsAction,
     },
+    /// The Documenting OS: import files (the same code the desktop runs)
+    Documents {
+        #[command(subcommand)]
+        action: documents::DocumentsAction,
+    },
     /// Manage the embedded Hyphae-based agent communication layer:
     /// identities, contacts, and relays (COMM-HYPHAE.md §4). A REST client
     /// of `/api/v1/comm/*`, same shape as `agent24 os`.
@@ -98,6 +104,14 @@ enum HwAction {
     /// Probe this machine now and print JSON: profile, level, usable_bytes,
     /// reasons. `A24_HW_BUDGET_CAP_GB=<n>` simulates a smaller machine.
     Probe,
+    /// Print a nonsecret environment assignment for an independently started
+    /// iDoris. Core reservations are explicit; no daemon is started or owned.
+    IdorisEnv {
+        /// Bytes reserved for voice, decision, embedding and other core models.
+        /// Use the actual allocation; zero must be chosen explicitly.
+        #[arg(long)]
+        core_reserved_bytes: u64,
+    },
 }
 
 /// `agent24 decide …` (D0-2).
@@ -501,17 +515,7 @@ fn shutdown_lines(r: &agent24_protocol::ShutdownReport) -> Vec<String> {
 /// itself never redirects, so a 3xx means something else is impersonating it;
 /// following it would hand over the bearer token to that impersonator.
 fn client() -> reqwest::Client {
-    #[expect(
-        clippy::expect_used,
-        reason = "unwrap_or_default() here would silently rebuild the proxy-reading, \
-                  redirect-following client FU-74 exists to rule out; fail closed instead"
-    )]
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("building the loopback-only daemon HTTP client failed")
+    agent24_protocol::client::loopback_client(Duration::from_secs(2))
 }
 
 async fn health_ok(base: &str, token: &str) -> bool {
@@ -691,7 +695,14 @@ async fn attach_only() -> Option<Endpoint> {
 /// to it. Runs until the MCP client closes stdin.
 async fn cmd_mcp() -> Result<(), String> {
     let ep = connect().await?;
+    // C-04: `agent24_run` gets a total time limit (default 600s).
+    let run_timeout = agent24_mcp::server::parse_run_timeout(
+        std::env::var(agent24_mcp::server::RUN_TIMEOUT_ENV)
+            .ok()
+            .as_deref(),
+    );
     let result = agent24_mcp::server::Agent24Server::new(ep.base.clone(), ep.token.clone())
+        .with_run_timeout(run_timeout)
         .serve_stdio()
         .await
         .map_err(|e| e.to_string());
@@ -734,9 +745,17 @@ async fn cmd_chat(message: String, model: Option<String>) -> Result<(), String> 
         .await;
     let out = match result {
         Ok(res) if res.status().is_success() => {
+            let gateway_record_id = res
+                .headers()
+                .get("x-idoris-record-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let body: ChatResponse = res.json().await.map_err(|e| e.to_string())?;
             println!("{}", body.message.content);
             println!("· {} tokens", body.usage.total_tokens);
+            if let Some(record_id) = gateway_record_id {
+                println!("· iDoris record {record_id}");
+            }
             Ok(())
         }
         Ok(res) => {
@@ -831,31 +850,38 @@ async fn os_local(action: &OsAction) -> Option<Result<(), String>> {
         OsAction::Install { path } => {
             Some(match agent24_os_packages::install::install(path, &root) {
                 Ok(dest) => {
-                    // Package replacement revokes earlier consent. A failure
-                    // is reported (and makes the command fail) only after the
-                    // lines below, which stay true either way: the files ARE
-                    // installed.
+                    // Grants from an earlier install of this name end now,
+                    // or this install does not stand (K1-6a-G §2.1 F1):
+                    // undone, so running it again retries the revocation.
                     let revoked = match dest.file_name().and_then(|n| n.to_str()) {
-                        Some(module) => invalidate_module_consents(module).await,
-                        None => Err(format!(
-                            "could not revoke module consent: {} has no usable module name",
-                            dest.display()
-                        )),
+                        Some(module) => match revoke_module_consents(module).await {
+                            Ok(()) => Ok(()),
+                            Err(e) => {
+                                let undone = agent24_os_packages::install::uninstall(module, &root);
+                                Err(match undone {
+                                    Ok(_) => format!("{e}; the install was undone"),
+                                    Err(u) => format!("{e}; the install could not be undone: {u}"),
+                                })
+                            }
+                        },
+                        None => Ok(()),
                     };
-                    println!("installed {}", dest.display());
-                    println!(
-                        "  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start"
-                    );
-                    // Said out loud because the isolation is deliberate and
-                    // therefore permanent: an ephemeral daemon (`agent24 chat`
-                    // with nothing running) resolves a different packages root
-                    // and will never see this package. Without this line the two
-                    // lines above are, for that user, a promise that never comes
-                    // true.
-                    println!(
-                        "  (a daemon started implicitly by `agent24 chat` does NOT read installed packages)"
-                    );
-                    revoked.map_err(|e| consent_revocation_failed_message(&e))
+                    if revoked.is_ok() {
+                        println!("installed {}", dest.display());
+                        println!(
+                            "  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start"
+                        );
+                        // Said out loud because the isolation is deliberate and
+                        // therefore permanent: an ephemeral daemon (`agent24 chat`
+                        // with nothing running) resolves a different packages root
+                        // and will never see this package. Without this line the two
+                        // lines above are, for that user, a promise that never comes
+                        // true.
+                        println!(
+                            "  (a daemon started implicitly by `agent24 chat` does NOT read installed packages)"
+                        );
+                    }
+                    revoked
                 }
                 Err(e) => Err(e.to_string()),
             })
@@ -886,59 +912,50 @@ async fn cmd_uninstall(name: &str) -> Result<(), String> {
             // Not an error: the end state the operator asked for is the one
             // they have. Saying so beats a failure they must decide to
             // ignore. Idempotent: nothing NEW was removed, so there is
-            // nothing for a hot-stop to respond to.
+            // nothing for a hot-stop to respond to. Its grants are ended
+            // again all the same: an earlier run may have removed the files
+            // and failed to (K1-6a-G §2.1 F1).
             println!("{name} was not installed; nothing to remove");
-            Ok(())
+            revoke_module_consents(name).await
         }
         Ok(true) => {
             println!("removed {name}");
             println!("  it takes effect at the next daemon start");
-            let revoked = invalidate_module_consents(name).await;
-            // Still tried when the revocation failed: the module must stop
-            // serving either way.
+            let revoked = revoke_module_consents(name).await;
             hot_disable_best_effort(name).await;
-            revoked.map_err(|e| consent_revocation_failed_message(&e))
+            revoked
         }
     }
 }
 
-/// Revoke persisted enablement consent after a package lifecycle change.
-/// Fail-closed (ADR-K1-03 §3): every way this can fail — no state directory
-/// at all, a store that will not open, a write that does not land — is an
-/// `Err` the caller turns into a visible, non-zero result. Never a silent
-/// skip.
-async fn invalidate_module_consents(name: &str) -> Result<(), String> {
-    invalidate_module_consents_in(state_file::state_dir().as_deref(), name).await
+/// End `name`'s module tool grants after a package lifecycle change. A
+/// store that cannot record it fails the command (K1-6a-G §2.1 F1): whether
+/// a grant still holds is what the store says, not what this printed. An
+/// install is undone and an uninstall finds nothing left to remove, so
+/// running either again retries this. Without HOME no store can be
+/// reached (a daemon does not start without one either): the command
+/// stands, and says the grants, if any, were not revoked.
+async fn revoke_module_consents(name: &str) -> Result<(), String> {
+    revoke_module_consents_in(state_file::state_dir().as_deref(), name).await
 }
 
-async fn invalidate_module_consents_in(
+async fn revoke_module_consents_in(
     state_dir: Option<&std::path::Path>,
     name: &str,
 ) -> Result<(), String> {
     let Some(dir) = state_dir else {
-        return Err(format!(
-            "could not revoke {name} module consent: no state directory (set HOME)"
-        ));
+        eprintln!(
+            "  HOME is not set: cannot reach a consent store, so any grants of {name} were not revoked"
+        );
+        return Ok(());
     };
     let store = agent24_store::Store::open(&dir.join("agent24.db"))
         .await
-        .map_err(|e| {
-            format!("could not open the consent store to revoke {name} module consent: {e}")
-        })?;
+        .map_err(|e| format!("could not open the consent store to revoke {name}'s grants: {e}"))?;
     store
         .invalidate_module_consents(name)
         .await
-        .map_err(|e| format!("could not revoke {name} module consent: {e}"))
-}
-
-/// The error a package lifecycle command ends with when its consent
-/// revocation did not land: the file change already happened (and was
-/// printed), but the command must not report success.
-fn consent_revocation_failed_message(why: &str) -> String {
-    format!(
-        "{why}\n  the package change above was made, but an earlier consent for this module may \
-         still be recorded; fix the state store and re-run the command"
-    )
+        .map_err(|e| format!("could not revoke {name}'s module grants: {e}"))
 }
 
 /// Render a daemon error envelope the way every call site here should
@@ -1116,11 +1133,20 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
 /// for a local CLI tool SQLite-via-`agent24-store` IS the implementation,
 /// today and for the foreseeable future.
 fn cmd_hw(action: HwAction) -> Result<(), String> {
+    let report = agent24_hw::HardwareReport::from_env(&agent24_hw::SystemProbe::new());
     match action {
         HwAction::Probe => {
-            let report = agent24_hw::HardwareReport::from_env(&agent24_hw::SystemProbe::new());
             let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
             println!("{json}");
+            Ok(())
+        }
+        HwAction::IdorisEnv {
+            core_reserved_bytes,
+        } => {
+            // usable_bytes already accounts for OS and App overhead. Deduct
+            // only the explicit core allocation, and preserve a real zero.
+            let bytes = report.usable_bytes.saturating_sub(core_reserved_bytes);
+            println!("IDORIS_ALLOCATED_BUDGET_BYTES={bytes}");
             Ok(())
         }
     }
@@ -2240,6 +2266,12 @@ fn cmd_service(action: ServiceAction) -> Result<(), String> {
             println!("loaded:    {}", if loaded { "yes" } else { "no" });
             if let Some(p) = plist {
                 println!("plist:     {}", p.display());
+                if installed && !service::plist_has_ready_omit_token(&p) {
+                    println!(
+                        "note:      this LaunchAgent predates --ready-omit-token and still \
+                         logs the daemon bearer token; run `agent24 service install` to update it"
+                    );
+                }
             }
             match state_file::read_live() {
                 Some(st) => println!("daemon:    running (pid {}, port {})", st.pid, st.port),
@@ -2260,6 +2292,7 @@ async fn main() -> std::process::ExitCode {
         Command::Service { action } => cmd_service(action),
         Command::Tui => cmd_tui().await,
         Command::Os { action } => cmd_os(action).await,
+        Command::Documents { action } => documents::cmd_documents(action).await,
         Command::Comm { action } => cmd_comm(action).await,
         Command::Mcp => cmd_mcp().await,
         Command::Acp => cmd_acp().await,
@@ -2281,13 +2314,14 @@ mod tests {
 
     use super::*;
 
+    /// No HOME, no store to reach: the command stands (review G3; the
+    /// `A24_OS_PACKAGES` install the CLI documents for containers), and
+    /// says the grants, if any, were not revoked.
     #[tokio::test]
-    async fn consent_revocation_without_state_dir_is_an_error_not_a_silent_skip() {
-        let err = invalidate_module_consents_in(None, "consent-mod")
+    async fn consent_revocation_without_state_dir_stands() {
+        revoke_module_consents_in(None, "consent-mod")
             .await
-            .unwrap_err();
-        assert!(err.contains("no state directory"), "{err}");
-        assert!(consent_revocation_failed_message(&err).contains("may"));
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2295,7 +2329,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A directory where the database file should be: opening it fails.
         std::fs::create_dir(dir.path().join("agent24.db")).unwrap();
-        let err = invalidate_module_consents_in(Some(dir.path()), "consent-mod")
+        let err = revoke_module_consents_in(Some(dir.path()), "consent-mod")
             .await
             .unwrap_err();
         assert!(err.contains("consent-mod"), "{err}");
@@ -2304,7 +2338,7 @@ mod tests {
     #[tokio::test]
     async fn consent_revocation_succeeds_with_a_writable_store() {
         let dir = tempfile::tempdir().unwrap();
-        invalidate_module_consents_in(Some(dir.path()), "consent-mod")
+        revoke_module_consents_in(Some(dir.path()), "consent-mod")
             .await
             .unwrap();
     }

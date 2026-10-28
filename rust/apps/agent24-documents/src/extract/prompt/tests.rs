@@ -75,7 +75,8 @@ fn the_document_and_the_fields_are_data_after_a_fixed_instruction() {
 /// weighed above another (told a wrong `present` was worse, qwen2.5:7b
 /// answered `missing` for values its blocks state: S01 J9, 2026-10-17).
 /// The wording was frozen before it was measured: a change is measured
-/// again, so this holds it word for word, as §5.3 quotes it.
+/// again, so this holds it word for word, as §5.3 quotes it, and pins the
+/// version it was measured as.
 #[test]
 fn a_window_is_told_to_answer_what_its_blocks_state() {
     assert_eq!(
@@ -86,6 +87,11 @@ field: when blocks here state it, answer `present` with the value as written and
 `conflict` if they state different values. Answer `missing` with reason `not_in_document` only \
 when no block here states it; never guess what another part says. Never answer with a value \
 about another item, row, fee or date because it looks similar."
+    );
+    assert_eq!(
+        crate::extract::EXTRACTOR_VERSION,
+        "6",
+        "this wording was measured as version 6; a new wording is measured again under a new version"
     );
     for term in ["`present`", "`conflict`", "`missing`", "`not_in_document`"] {
         assert!(INSTRUCTION.contains(term), "{term}");

@@ -24,3 +24,6 @@ vendor/Proma/
 
 # Local copy of third-party listmonk (newsletter service, deployed separately)
 listmonk/
+
+# docs/release/ 是发布验收文档，不是构建产物（apps/desktop/release 才是）
+!docs/release/

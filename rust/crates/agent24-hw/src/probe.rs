@@ -233,6 +233,14 @@ fn resolve_existing_prefix(path: &Path) -> PathBuf {
 /// failure (missing binary, non-zero exit, timeout) is `None`.
 fn run_with_timeout(program: &str, args: &[&str]) -> Option<String> {
     let mut child = Command::new(program)
+        // Hardware commands need executable lookup and stable parseable output,
+        // never gateway/backend credentials inherited from the daemon.
+        .env_clear()
+        .env(
+            "PATH",
+            std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".into()),
+        )
+        .env("LC_ALL", "C")
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -286,6 +294,43 @@ mod tests {
         let mut p = SystemProbe::new().probe();
         p.on_battery = Some(true);
         assert_eq!(FakeHardwareProbe(p.clone()).probe(), p);
+    }
+
+    #[test]
+    fn hardware_commands_do_not_inherit_daemon_secrets() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = "nonsecret-hardware-probe-fixture";
+        if std::env::vars_os().any(|(k, v)| k == "IDORIS_API_KEY" && v == fixture) {
+            let output = run_with_timeout(
+                "sh",
+                &[
+                    "-c",
+                    "test -z \"${IDORIS_API_KEY:-}\" && test -z \"${UNRELATED_FIXTURE_SECRET:-}\" && test -n \"$PATH\" && test \"$LC_ALL\" = C && printf isolated",
+                ],
+            );
+            assert_eq!(output.as_deref(), Some("isolated"));
+            return Ok(());
+        }
+        for missing_path in [false, true] {
+            let mut command = Command::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "probe::tests::hardware_commands_do_not_inherit_daemon_secrets",
+                    "--nocapture",
+                ])
+                .env("IDORIS_API_KEY", fixture)
+                .env("UNRELATED_FIXTURE_SECRET", fixture);
+            if missing_path {
+                command.env_remove("PATH");
+            }
+            let child = command.output()?;
+            assert!(
+                child.status.success(),
+                "{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+        }
+        Ok(())
     }
 
     #[test]

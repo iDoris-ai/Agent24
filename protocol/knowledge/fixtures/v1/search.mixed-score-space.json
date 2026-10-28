@@ -1,0 +1,8 @@
+{ "$comment": "R3.6: E spans two score spaces; groups list only KBs inside E (kb-z is outside and omitted).",
+  "op": "knowledge.search",
+  "request": { "protocol_version": 1, "request_id": "01JB3T0A1B2C3D4E5F6G7H8J9K", "generation": 9,
+    "query": "差旅标准", "scope": { "knowledge_base_ids": ["kb-a", "kb-b", "kb-z"] },
+    "budget": { "deadline_ms": 5000, "max_results": 10, "max_concurrency": 2 } },
+  "response": { "status": 400, "body": { "error": { "code": "invalid_request", "message": "The request is not valid.",
+    "details": { "retryable": false, "reason": "mixed_score_space", "request_id": "01JB3T0A1B2C3D4E5F6G7H8J9K", "generation": 9,
+      "groups": [ { "score_space": "emb-g1", "knowledge_base_ids": ["kb-a"] }, { "score_space": "emb-g2", "knowledge_base_ids": ["kb-b"] } ] } } } } }

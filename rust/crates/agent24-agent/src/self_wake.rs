@@ -112,6 +112,10 @@ fn is_iso8601_utc(s: &str) -> bool {
 
 #[async_trait]
 impl Tool for SelfWakeTool {
+    fn requires_outbound_policy(&self) -> bool {
+        false
+    }
+
     fn info(&self) -> ToolInfo {
         ToolInfo::new(
             "self_wake",
@@ -165,6 +169,12 @@ impl Tool for SelfWakeTool {
             .ok_or_else(|| ToolError::Invalid("prompt is required".to_owned()))?
             .to_owned();
         let ts = Self::wake_time(input)?;
+        let spec = ScheduleSpec::At { ts: ts.clone() };
+        let now = agent24_scheduler::next_fire::parse_iso(&agent24_core::util::now_iso8601())
+            .map_err(|e| ToolError::Invalid(e.to_string()))?;
+        let next_run_at = agent24_scheduler::next_fire::initial_fire(&spec, now)
+            .map_err(|e| ToolError::Invalid(e.to_string()))?
+            .map(agent24_scheduler::next_fire::fmt_iso);
 
         // Bound outstanding self-wakes so a loop can't flood the schedule table.
         // Fail-closed on a store error (don't create under uncertainty).
@@ -201,11 +211,36 @@ impl Tool for SelfWakeTool {
             )));
         }
 
+        let schedule_id = format!("wake_{}", ulid());
+        // K1-6b.4d (ADR-K1-02 §2.2): the prompt is written from this run's
+        // context, so the woken run carries this run's strictest source
+        // classification, recorded before the schedule exists. No wake is
+        // created if it cannot be recorded.
+        let classification = self
+            .store
+            .run_policy_snapshot(ctx.run_id())
+            .await
+            .map(|snapshot| {
+                agent24_store::strictest_classification(
+                    snapshot.sources.iter().map(|source| source.classification),
+                )
+            })
+            .map_err(|e| ToolError::Failed(format!("could not read this run's sources: {e}")))?;
+        self.store
+            .record_schedule_origin(
+                &schedule_id,
+                ctx.run_id(),
+                classification,
+                &agent24_core::util::now_iso8601(),
+            )
+            .await
+            .map_err(|e| ToolError::Failed(format!("could not record the wake's sources: {e}")))?;
+
         let schedule = Schedule {
-            id: format!("wake_{}", ulid()),
+            id: schedule_id,
             name: SELF_WAKE_NAME.to_owned(),
             enabled: true,
-            spec: ScheduleSpec::At { ts: ts.clone() },
+            spec,
             action: Some(ScheduleAction::AgentRun {
                 prompt,
                 // Deliver into THIS session so the woken run continues the
@@ -216,7 +251,7 @@ impl Tool for SelfWakeTool {
             delivery: vec![],
             last_run_at: None,
             // One-shot: fire once at `ts`, then the scheduler clears this.
-            next_run_at: Some(ts.clone()),
+            next_run_at,
             consecutive_failures: 0,
             // A self-wake is always a plain user (AgentRun) row.
             owner: None,
@@ -243,6 +278,7 @@ mod tests {
 
     use super::*;
     use agent24_store::ModuleScheduleDesired;
+    use std::sync::Arc;
 
     fn ctx(session: Option<&str>) -> ToolContext {
         ToolContext::legacy("run_1", session.map(str::to_owned), None, "tc_1")
@@ -251,6 +287,76 @@ mod tests {
     async fn tool() -> (SelfWakeTool, Store) {
         let store = Store::open_memory().await.unwrap();
         (SelfWakeTool::new(store.clone()), store)
+    }
+
+    async fn seed_run(store: &Store, sources: &[agent24_store::SourceRef]) {
+        sqlx::query(
+            "INSERT INTO runs (id, status, input, usage, created_at) \
+             VALUES ('run_1', 'running', '{}', '{}', '2026-10-25T00:00:00Z')",
+        )
+        .execute(agent24_store::test_hooks::pool(store))
+        .await
+        .unwrap();
+        for (seq, source) in sources.iter().enumerate() {
+            store
+                .tag_run_source("run_1", seq as i64, source, "t")
+                .await
+                .unwrap();
+        }
+    }
+
+    fn wake_input() -> Map<String, Value> {
+        let mut input = Map::new();
+        input.insert("prompt".to_owned(), json!("check the build"));
+        input.insert("after_secs".to_owned(), json!(600));
+        input
+    }
+
+    #[tokio::test]
+    async fn a_wake_records_the_strictest_source_of_the_run_that_created_it() {
+        use agent24_store::{SourceClassification, SourceRef};
+        let (tool, store) = tool().await;
+        seed_run(
+            &store,
+            &[
+                SourceRef::user_input("run_1", "t"),
+                SourceRef::recalled_memory("a1", SourceClassification::Restricted, "t"),
+            ],
+        )
+        .await;
+        tool.call(&ctx(None), &wake_input(), &CancellationToken::new())
+            .await
+            .unwrap();
+        let schedules = store.list_schedules_lenient().await.unwrap();
+        assert_eq!(
+            store
+                .schedule_origin_classification(&schedules[0].id)
+                .await
+                .unwrap(),
+            Some(SourceClassification::Restricted)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wake_whose_sources_cannot_be_recorded_is_not_created() {
+        let (tool, store) = tool().await;
+        seed_run(
+            &store,
+            &[agent24_store::SourceRef::user_input("run_1", "t")],
+        )
+        .await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER no_origin BEFORE INSERT ON schedule_source_origin \
+             BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        let result = tool
+            .call(&ctx(None), &wake_input(), &CancellationToken::new())
+            .await;
+        assert!(matches!(result, Err(ToolError::Failed(_))), "{result:?}");
+        assert!(store.list_schedules_lenient().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -284,11 +390,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn self_wake_is_dispatchable_without_an_egress_service() {
+        let (tool, store) = tool().await;
+        let registry = agent24_tools::ToolRegistry::new().with(Arc::new(tool));
+        assert!(
+            registry
+                .adverts()
+                .iter()
+                .any(|advert| advert.name == "self_wake")
+        );
+        let mut input = Map::new();
+        input.insert("prompt".to_owned(), json!("check later"));
+        input.insert("after_secs".to_owned(), json!(60));
+        registry
+            .dispatch(
+                "self_wake",
+                &ctx(Some("sess_1")),
+                &input,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.list_schedules_lenient().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn at_accepts_a_well_formed_utc_timestamp() {
         let (tool, store) = tool().await;
         let mut input = Map::new();
         input.insert("prompt".to_owned(), json!("nightly recap"));
-        input.insert("at".to_owned(), json!("2026-07-28T18:00:00Z"));
+        input.insert("at".to_owned(), json!("2099-07-28T18:00:00Z"));
         tool.call(&ctx(None), &input, &CancellationToken::new())
             .await
             .unwrap();
@@ -296,8 +427,42 @@ mod tests {
             store.list_schedules_lenient().await.unwrap()[0]
                 .next_run_at
                 .as_deref(),
-            Some("2026-07-28T18:00:00Z")
+            Some("2099-07-28T18:00:00Z")
         );
+    }
+
+    #[tokio::test]
+    async fn past_at_is_rejected_without_creating_a_wake() {
+        let (tool, store) = tool().await;
+        let mut input = Map::new();
+        input.insert("prompt".into(), json!("too late"));
+        input.insert("at".into(), json!("2000-01-01T00:00:00Z"));
+        let err = tool
+            .call(&ctx(None), &input, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Invalid(_)), "{err}");
+        assert!(err.to_string().contains("60 seconds"));
+        assert!(store.list_schedules().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn at_within_skew_is_scheduled_for_now() {
+        let (tool, store) = tool().await;
+        let now =
+            agent24_scheduler::next_fire::parse_iso(&agent24_core::util::now_iso8601()).unwrap();
+        let recent =
+            agent24_scheduler::next_fire::fmt_iso(now - std::time::Duration::from_secs(30));
+        let mut input = Map::new();
+        input.insert("prompt".into(), json!("recent"));
+        input.insert("at".into(), json!(recent));
+        tool.call(&ctx(None), &input, &CancellationToken::new())
+            .await
+            .unwrap();
+        let row = store.list_schedules().await.unwrap().remove(0);
+        let next =
+            agent24_scheduler::next_fire::parse_iso(row.next_run_at.as_deref().unwrap()).unwrap();
+        assert!(next >= now);
     }
 
     #[tokio::test]

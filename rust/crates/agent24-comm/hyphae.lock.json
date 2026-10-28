@@ -1,11 +1,11 @@
 {
   "schema": 1,
-  "source_sha": "144555ca6b043be77225786ddbf4e6bce5ad3228",
+  "source_sha": "076a5205f0f45539082538c8f10ea3db69b7a8f1",
   "go": "go1.26.4",
   "recipe": "GOTOOLCHAIN=go1.26.4 CGO_ENABLED=0 GOOS=<os> GOARCH=<arch> go build -trimpath -buildvcs=false -ldflags='-buildid=' -o hyphae ./cmd/hyphae",
   "binaries": {
-    "darwin-arm64": "545636015d027fa4614ad48361829ff5a5116683a5553f8e2d08fb65ae14261c",
-    "linux-x64": "d741fb9461a6b16d92d471eb103536295808e4dc22a3874b193e12937ee8b99b",
+    "darwin-arm64": "9bfa2e3e3cd68738654cd54112c696f94ecbb9707a211cc80f5aafc92784523f",
+    "linux-x64": "0152a7e9e146f3f8d7c1de39bf98d2ac4f32e65d17acd680aeb8506ae5c2ab60",
     "darwin-x64": null,
     "linux-arm64": null
   }

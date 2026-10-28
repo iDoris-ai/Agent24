@@ -219,6 +219,7 @@ pub(super) async fn persist(
     object: &str,
     evidence: EventId,
     origin: Origin,
+    source_ref: &agent24_store::AssertionSourceRef,
 ) -> agent24_memory::Result<RetainOutcome> {
     // Only a direct user run can authorize a qualified personal assertion.
     // Validate the propagated origin here so future callers cannot
@@ -245,6 +246,11 @@ pub(super) async fn persist(
         origin,
     )
     .with_evidence(vec![evidence])
+    // K1-6b.4b (ADR-K1-02 §5 item 10): the classification commits in the
+    // same row and transaction as the body. The id is content-addressed, so
+    // remembering identical text again lands on the same assertion, and the
+    // write gate keeps the stricter classification of the two.
+    .with_source_ref(source_ref.to_value())
     .remember();
 
     let decisions = kv.write_gate().propose(vec![candidate]).await?;
@@ -280,6 +286,13 @@ mod tests {
         KvStore,
         assertion::{AssertionStore, BeliefQuery},
     };
+
+    fn ordinary_context() -> agent24_store::AssertionSourceRef {
+        agent24_store::AssertionSourceRef::from_sources([(
+            "user_input:run".to_owned(),
+            agent24_store::SourceClassification::Ordinary,
+        )])
+    }
 
     #[test]
     fn recognizes_only_the_supported_leading_forms() {
@@ -329,6 +342,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisting_identical_text_never_lowers_its_stored_classification() {
+        use agent24_store::{AssertionSourceRef, SourceClassification};
+        let kv = KvStore::open_memory().await.unwrap();
+        let user = || Origin {
+            source: "test".into(),
+            trust: Trust::UserSaid,
+        };
+        let restricted =
+            AssertionSourceRef::from_sources([("s".to_owned(), SourceClassification::Restricted)]);
+        for (evidence, source_ref) in [("event-1", restricted), ("event-2", ordinary_context())] {
+            let outcome = persist(
+                &kv,
+                "owner",
+                "I like tea",
+                evidence.into(),
+                user(),
+                &source_ref,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, RetainOutcome::Saved);
+        }
+        let beliefs = kv
+            .assertions()
+            .beliefs_as_of(&BeliefQuery::owner("owner"))
+            .await
+            .unwrap();
+        assert_eq!(beliefs.len(), 1);
+        assert_eq!(
+            AssertionSourceRef::classification_of(beliefs[0].source_ref.as_ref()),
+            SourceClassification::Restricted
+        );
+    }
+
+    #[tokio::test]
     async fn model_origin_cannot_persist_a_qualified_remember_assertion() {
         let kv = KvStore::open_memory().await.unwrap();
         let outcome = persist(
@@ -340,6 +388,7 @@ mod tests {
                 source: "scheduler".into(),
                 trust: Trust::Model,
             },
+            &ordinary_context(),
         )
         .await
         .unwrap();
@@ -370,6 +419,7 @@ mod tests {
                 source: "test".into(),
                 trust: Trust::UserSaid,
             },
+            &ordinary_context(),
         )
         .await
         .unwrap();
@@ -398,6 +448,7 @@ mod tests {
                 source: "test".into(),
                 trust: Trust::UserSaid,
             },
+            &ordinary_context(),
         )
         .await
         .unwrap();
