@@ -14,6 +14,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   Object.defineProperty(window, 'agent24', {
     value: {
+      cliToolStatus: vi.fn().mockResolvedValue({ state: 'outdated', path: '/usr/local/bin/agent24', version: '0.3.0', bundledVersion: '0.6.0' }),
       omlxDetect: mockOmlxDetect,
       omlxStart: mockOmlxStart,
       omlxModels: mockOmlxModels,
@@ -26,6 +27,13 @@ beforeEach(() => {
 })
 
 describe('SettingsPage', () => {
+  it('exposes the bundled CLI installer when an older CLI is on PATH', async () => {
+    mockOmlxDetect.mockResolvedValue({ url: 'http://localhost:8088', apiKey: '', models: [] })
+    await act(async () => { render(<SettingsPage />) })
+    expect(await screen.findByText('Command line tool is outdated (0.3.0) — Update')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Install / Update `agent24` command' })).toBeEnabled()
+  })
+
   it('renders settings title', async () => {
     mockOmlxDetect.mockResolvedValue(null)
     mockOmlxStart.mockResolvedValue({ ok: false, url: '', error: 'not found' })

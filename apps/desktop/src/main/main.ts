@@ -3,6 +3,7 @@
 import { app, BrowserWindow, Menu, Tray, WebContentsView, nativeImage, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
+import { registerCliTool } from './ipc/cli-tool'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, type BackendStatus } from './backend-manager'
 import { AgentEarEventBridge } from './agentear-events'
@@ -81,6 +82,8 @@ const guard = createIpcGuard({ getMainWindow: () => mainWin, isTrustedUrl: isApp
 let isQuitting = false
 // F1b: periodic tray refresh so the menu-bar reflects live daemon status
 let trayTimer: NodeJS.Timeout | null = null
+let cliTool: ReturnType<typeof registerCliTool> | null = null
+let cliCheckTicks = 0
 let creativeServeWeb: CreativeServeWeb | null = null
 // KB-HOST-01: Knowledge logins and the daemon's private Knowledge interface.
 let knowledgeHost: KnowledgeHost | null = null
@@ -311,6 +314,17 @@ app.whenReady().then(async () => {
   })
 
   registerIpcHandlers({ idorisStatus, guard })
+  cliTool = registerCliTool({
+    guard, executable: process.execPath, resources: process.resourcesPath, packaged: app.isPackaged,
+    changed: refreshTray,
+    openSettings: () => {
+      showOrCreateWindow()
+      const contents = mainWin?.webContents
+      if (contents?.isLoading()) contents.once('did-finish-load', () => contents.send(IpcChannels.CliToolOpenSettings))
+      else contents?.send(IpcChannels.CliToolOpenSettings)
+    },
+  })
+  void cliTool.refresh()
   mainWin = createMainWindow()
   ipcMain.handle(IpcChannels.CreativeShow, guard((_event, bounds: CreativeViewBounds) => showCreativeView(bounds)))
   ipcMain.handle(IpcChannels.CreativeRestart, guard((_event, bounds: CreativeViewBounds) => restartCreativeView(bounds)))
@@ -363,6 +377,7 @@ app.whenReady().then(async () => {
   // crashes, or is toggled from the menu itself.
   trayTimer = setInterval(() => {
     refreshTray()
+    if (++cliCheckTicks % 15 === 0) void cliTool?.refresh()
     // Replays the wanted Knowledge bindings on a restarted daemon and retries
     // changes that did not land.
     knowledgeHost?.sync()
@@ -413,7 +428,10 @@ function refreshTray(): void {
             { label: '停止 daemon', click: () => { backendManager.stopDaemon(); refreshTray() } },
           ]
 
+  const cliItem = cliTool?.trayItem()
+  const cliItems: MenuItemConstructorOptions[] = cliItem ? [cliItem, { type: 'separator' }] : []
   tray.setContextMenu(Menu.buildFromTemplate([
+    ...cliItems,
     { label, enabled: false },
     { type: 'separator' },
     { label: '显示窗口', click: () => showOrCreateWindow() },

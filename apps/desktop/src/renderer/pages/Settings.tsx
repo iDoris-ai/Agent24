@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { LOCALES, isLocale, setLocale, useLocale, useT } from '../i18n'
 import { settingsMessages } from './Settings.i18n'
+import { CliToolSettings } from './settings/CliToolSettings'
 
 type OmlxStatus = 'detecting' | 'connected' | 'disconnected' | 'starting' | 'stopping'
 type ModelCategory = 'resident' | 'ondemand'
@@ -186,6 +187,8 @@ export default function SettingsPage() {
     <div className="content">
       <div className="page-title">{t('page.title')}</div>
       <div className="page-sub">{t('page.subtitle')}</div>
+
+      <CliToolSettings />
 
       {/* ── AI Model Service ── */}
       <div className="settings-section">
