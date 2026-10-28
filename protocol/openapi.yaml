@@ -1193,6 +1193,12 @@ paths:
                 $ref: "#/components/schemas/Schedule"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "422":
+          description: at 时间早于当前时间超过 60 秒（invalid_request），不写入任何变更。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
     get:
       operationId: listSchedules
       x-milestone: M-C
@@ -1263,6 +1269,12 @@ paths:
                 $ref: "#/components/schemas/Schedule"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "422":
+          description: at 时间早于当前时间超过 60 秒（invalid_request），不写入任何变更。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -1298,9 +1310,24 @@ paths:
       summary: Delete a schedule
       parameters:
         - $ref: "#/components/parameters/PathId"
+        - name: only_if_completed
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: 在同一写事务内重新判定 completed；不满足时返回 409，保留调度。
       responses:
         "204":
           description: Deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: 调度当前未完成（schedule_not_completed）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "404":
           $ref: "#/components/responses/NotFound"
 
@@ -4385,7 +4412,10 @@ components:
         - title: at
           type: object
           required: [type, ts]
-          description: One-shot
+          description: |
+            一次性调度。创建或 PATCH 显式设置 spec 时，早于当前时间超过
+            60 秒会被拒绝（422 invalid_request）；容差内的过去时间安排在当前时刻。
+            仅切换 enabled 不重新校验已存储的 spec，也不清零失败计数。
           properties:
             type:
               type: string
@@ -4447,7 +4477,7 @@ components:
       type: object
       required:
         [id, name, enabled, spec, action, delivery,
-         last_run_at, next_run_at, consecutive_failures,
+         last_run_at, next_run_at, consecutive_failures, completed,
          owner, user_suspended, system_disabled_reason,
          effective_enabled, disabled_by]
       properties:
@@ -4479,6 +4509,14 @@ components:
           type: [string, "null"]
           format: date-time
           description: Null when disabled or one-shot already fired
+        completed:
+          type: boolean
+          readOnly: true
+          description: |
+            当前用户 at 调度的 next_run_at 为空，且 runs 表中存在 schedule_id
+            匹配、created_at 不早于当前 spec.ts 的运行（按时间点比较）。
+            表示成功创建过运行，不表示运行执行成功；所有 run 状态均可作为证据。
+            last_run_at 和 consecutive_failures 不作为完成证据。模块调度始终为 false。
         consecutive_failures:
           type: integer
           description: Auto-disables the schedule at 5 (emits schedule.disabled)
