@@ -26,6 +26,13 @@ mod domain;
 #[allow(dead_code, reason = "frozen CORE-2 slice seam; wired by S1/S2")]
 mod enroll_api;
 mod enroll_endpoint;
+// The feature trusts unsigned binaries and auto-answers presence: it must
+// never reach a release build (#1446 F2). The e2e builds it in debug.
+#[cfg(all(feature = "test-enrollment", not(debug_assertions)))]
+compile_error!("the `test-enrollment` feature is for debug test builds only");
+#[cfg(feature = "test-enrollment")]
+#[path = "../tests/support/enroll.rs"]
+mod enroll_test_support;
 mod events;
 mod events_emit;
 mod grant_expiry;

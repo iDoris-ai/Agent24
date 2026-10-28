@@ -214,7 +214,7 @@ async fn daemon() -> Result<HttpTransport, Response> {
         .await
         .map_err(|why| Response::fail(503, "backend_incompatible", &why))?
         .ok_or_else(|| Response::fail(503, "backend_not_ready", NO_DAEMON))?;
-    HttpTransport::new(&ep.base, Some(ep.token.clone())).map_err(invalid)
+    HttpTransport::new(&ep.base, Some(ep.token().to_owned())).map_err(invalid)
 }
 
 /// Where to send and what: from stdin (the desktop) or from the argument and

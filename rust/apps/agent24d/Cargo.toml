@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "Agent24 Rust daemon — v1 protocol server (B2: skeleton — health, auth handshake, graceful shutdown)"
 
+[features]
+# Unsigned binaries and automatic presence are exclusively for integration tests.
+test-enrollment = []
+
 [dependencies]
 agent24-os-proc = { path = "../../crates/agent24-os-proc" }
 agent24-agent = { path = "../../crates/agent24-agent" }

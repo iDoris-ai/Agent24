@@ -22,6 +22,7 @@ use zeroize::{Zeroize, Zeroizing};
 mod acp;
 mod comm_groups;
 mod documents;
+mod enroll;
 mod module_tools;
 mod offline_db;
 mod query;
@@ -541,9 +542,24 @@ enum ServiceAction {
 
 struct Endpoint {
     base: String,
+    /// The bearer in legacy / ephemeral mode. Empty in capabilities mode:
+    /// there the enrolled token stays in the session's `Zeroizing` buffer and
+    /// is read through [`Endpoint::token`], so no plain copy is kept (#1446 F4).
     token: String,
     /// Ephemeral child to terminate when the CLI exits (standalone mode)
     child: Option<tokio::process::Child>,
+    /// Capabilities-mode enrolment (CORE-2 S4): holds the live enrolment
+    /// connection that `elevate` needs. `None` in legacy/ephemeral mode.
+    session: Option<Box<enroll::Session>>,
+}
+
+impl Endpoint {
+    /// The bearer to send: the enrolled session's token, else `token`.
+    fn token(&self) -> &str {
+        self.session
+            .as_deref()
+            .map_or(self.token.as_str(), enroll::Session::token)
+    }
 }
 
 const HOST_AUTHORITY_UNAVAILABLE: &str = "host authority unavailable";
@@ -639,6 +655,7 @@ fn endpoint_from_state(state: DaemonState) -> Result<Endpoint, String> {
         base: format!("http://127.0.0.1:{}", state.port),
         token,
         child: None,
+        session: None,
     })
 }
 
@@ -744,6 +761,9 @@ enum DiscoveredAttach {
     /// Protocol mismatch, or a capability daemon that still has no host bearer.
     /// `connect` returns this to the user and does not spawn another daemon.
     Incompatible(String),
+    /// Capabilities-mode enrolment was attempted and refused (CORE-2 S4).
+    /// Kept apart from `Incompatible` so `--json` can print the daemon's code.
+    EnrollFailed(enroll::EnrollError),
     /// Nothing answered. `connect` may spawn an ephemeral daemon.
     Unreachable,
 }
@@ -815,6 +835,13 @@ fn incompatible_daemon_error(daemon: Option<u32>, client: u32, recorded: Option<
 }
 
 async fn attach_discovered(state: &DaemonState) -> DiscoveredAttach {
+    attach_discovered_with(state, true).await
+}
+
+/// `enroll_if_possible = false` keeps the pre-S4 answer for capabilities mode
+/// (`host authority unavailable`): best-effort callers such as the uninstall
+/// hot-stop must not pop an approval prompt or enrol just to probe.
+async fn attach_discovered_with(state: &DaemonState, enroll_if_possible: bool) -> DiscoveredAttach {
     let client_version = agent24_protocol::PROTOCOL_VERSION;
     // Probe first. A leftover daemon.json with no protocol_version, or a
     // record that names another version, must not refuse a port that is
@@ -840,6 +867,21 @@ async fn attach_discovered(state: &DaemonState) -> DiscoveredAttach {
         ));
     }
     if state.auth_mode.is_capabilities() {
+        if let (true, Some(socket)) = (enroll_if_possible, state.enroll_endpoint.as_deref()) {
+            // The session's `enrolled` frame must name `state.port`, or the
+            // token would go to whoever listens there (#1446 F1).
+            let enrolled =
+                enroll::enroll(std::path::Path::new(socket), &state.generation, state.port).await;
+            return match enrolled {
+                Ok(session) => DiscoveredAttach::Ready(Endpoint {
+                    base,
+                    token: String::new(),
+                    child: None,
+                    session: Some(Box::new(session)),
+                }),
+                Err(err) => DiscoveredAttach::EnrollFailed(err),
+            };
+        }
         return DiscoveredAttach::Incompatible(HOST_AUTHORITY_UNAVAILABLE.to_owned());
     }
     match endpoint_from_state(state.clone()) {
@@ -852,19 +894,31 @@ async fn attach_discovered(state: &DaemonState) -> DiscoveredAttach {
 /// An incompatible daemon is an error: do not attach, and do not spawn another.
 /// Standalone (ephemeral) only when nothing is there to attach to.
 async fn connect() -> Result<Endpoint, String> {
+    connect_detailed().await.map_err(|e| e.message)
+}
+
+/// Like [`connect`], but keeps the machine-readable error code for `--json`
+/// callers (`daemon_unavailable` unless enrolment itself said otherwise).
+async fn connect_detailed() -> Result<Endpoint, enroll::EnrollError> {
+    let unavailable = |message: String| enroll::EnrollError {
+        code: "daemon_unavailable".to_owned(),
+        message,
+    };
     if let Some(state) = state_file::read_live() {
         match attach_discovered(&state).await {
             DiscoveredAttach::Ready(endpoint) => return Ok(endpoint),
-            DiscoveredAttach::Incompatible(err) => return Err(err),
+            DiscoveredAttach::Incompatible(err) => return Err(unavailable(err)),
+            DiscoveredAttach::EnrollFailed(err) => return Err(err),
             DiscoveredAttach::Unreachable => {}
         }
     }
-    let (state, child) = spawn_daemon(true).await?;
+    let (state, child) = spawn_daemon(true).await.map_err(unavailable)?;
     let base = format!("http://127.0.0.1:{}", state.port);
     Ok(Endpoint {
         base,
-        token: host_token(&state)?.to_owned(),
+        token: host_token(&state).map_err(unavailable)?.to_owned(),
         child: Some(child),
+        session: None,
     })
 }
 
@@ -882,16 +936,20 @@ async fn finish(mut ep: Endpoint) {
 /// `Ok(None)` if no live daemon is discoverable or healthy. `Err` is a daemon
 /// that is up but must not be used; callers keep that error and do not send.
 async fn attach_only() -> Result<Option<Endpoint>, String> {
+    attach_only_with_enrollment(false).await
+}
+
+async fn attach_only_with_enrollment(enroll: bool) -> Result<Option<Endpoint>, String> {
     match state_file::read_live() {
-        Some(state) => attach_only_from(&state).await,
+        Some(state) => attach_only_from(&state, enroll).await,
         None => Ok(None),
     }
 }
 
-async fn attach_only_from(state: &DaemonState) -> Result<Option<Endpoint>, String> {
+async fn attach_only_from(state: &DaemonState, enroll: bool) -> Result<Option<Endpoint>, String> {
     // Same checks as `connect`: probe `/health` first, then the live
     // advertisement. `Ok(None)` only when there is nothing to attach to.
-    match attach_discovered(state).await {
+    match attach_discovered_with(state, enroll).await {
         DiscoveredAttach::Ready(endpoint) => Ok(Some(endpoint)),
         DiscoveredAttach::Unreachable => Ok(None),
         // Capability discovery has no host bearer. Callers already treat that
@@ -899,6 +957,7 @@ async fn attach_only_from(state: &DaemonState) -> Result<Option<Endpoint>, Strin
         // so os enable/disable and the uninstall hot-stop do not send.
         DiscoveredAttach::Incompatible(err) if err == HOST_AUTHORITY_UNAVAILABLE => Ok(None),
         DiscoveredAttach::Incompatible(err) => Err(err),
+        DiscoveredAttach::EnrollFailed(err) => Err(err.message),
     }
 }
 
@@ -913,7 +972,7 @@ async fn cmd_mcp() -> Result<(), String> {
             .ok()
             .as_deref(),
     );
-    let result = agent24_mcp::server::Agent24Server::new(ep.base.clone(), ep.token.clone())
+    let result = agent24_mcp::server::Agent24Server::new(ep.base.clone(), ep.token().to_owned())
         .with_run_timeout(run_timeout)
         .serve_stdio()
         .await
@@ -933,11 +992,129 @@ async fn cmd_acp() -> Result<(), String> {
 }
 
 fn bearer(ep: &Endpoint, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    if ep.token.is_empty() {
+    if ep.token().is_empty() {
         rb
     } else {
-        rb.bearer_auth(&ep.token)
+        rb.bearer_auth(ep.token())
     }
+}
+
+/// Legacy replies retain reqwest's decoding and body-read error semantics.
+/// Capabilities replies are buffered to inspect the presence_required code.
+struct Reply {
+    status: reqwest::StatusCode,
+    body: ReplyBody,
+}
+
+enum ReplyBody {
+    Legacy(reqwest::Response),
+    Buffered(Vec<u8>),
+}
+
+impl Reply {
+    async fn json<T: serde::de::DeserializeOwned>(self) -> Result<T, String> {
+        match self.body {
+            ReplyBody::Legacy(res) => res.json().await.map_err(|e| e.to_string()),
+            ReplyBody::Buffered(body) => serde_json::from_slice(&body).map_err(|e| e.to_string()),
+        }
+    }
+
+    async fn json_value(self) -> serde_json::Value {
+        self.json().await.unwrap_or_default()
+    }
+
+    fn presence_required(&self) -> bool {
+        self.status == reqwest::StatusCode::FORBIDDEN
+            && match &self.body {
+                ReplyBody::Buffered(body) => serde_json::from_slice::<serde_json::Value>(body)
+                    .is_ok_and(|value| value["error"]["code"] == "presence_required"),
+                ReplyBody::Legacy(_) => false,
+            }
+    }
+}
+
+/// Why [`send_elevating`] produced no reply.
+enum SendError {
+    Http(reqwest::Error),
+    /// Enrolment/elevation failed; carries the `--json` error code.
+    Enroll(enroll::EnrollError),
+}
+
+impl SendError {
+    /// `(code, message)` for the A3 §3.6 failure shape.
+    fn parts(self) -> (String, String) {
+        match self {
+            Self::Http(e) => ("daemon_unavailable".to_owned(), e.to_string()),
+            Self::Enroll(e) => (e.code, e.message),
+        }
+    }
+}
+
+/// `{"error":{"code","message"}}` with an explicit code.
+fn error_envelope(code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({"error": {"code": code, "message": message}})
+}
+
+/// Send one daemon request. In capabilities mode (an enrolled session), a
+/// `403 presence_required` is answered by one `elevate` round on the same
+/// enrolment connection, then ONE retry carrying `X-Agent24-Elevation`. In
+/// legacy mode there is no session and this is exactly one plain request.
+/// `body`, when present, is the exact JSON bytes sent (and hashed).
+async fn send_elevating(
+    ep: &Endpoint,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Vec<u8>>,
+    timeout: Duration,
+    json_content: bool,
+) -> Result<Reply, SendError> {
+    let url = format!("{}{path}", ep.base);
+    let build = |grant: Option<&str>| {
+        let mut rb = bearer(ep, client().request(method.clone(), &url)).timeout(timeout);
+        if let Some(bytes) = &body {
+            if json_content {
+                rb = rb.header(reqwest::header::CONTENT_TYPE, "application/json");
+            }
+            rb = rb.body(bytes.clone());
+        }
+        if let Some(grant) = grant
+            && let Ok(mut value) = reqwest::header::HeaderValue::from_str(grant)
+        {
+            value.set_sensitive(true);
+            rb = rb.header("X-Agent24-Elevation", value);
+        }
+        rb
+    };
+    let response = build(None).send().await.map_err(SendError::Http)?;
+    let Some(session) = &ep.session else {
+        return Ok(Reply {
+            status: response.status(),
+            body: ReplyBody::Legacy(response),
+        });
+    };
+    let first = read_reply(Ok(response)).await.map_err(SendError::Http)?;
+    if !first.presence_required() {
+        return Ok(first);
+    }
+    let grant = session
+        .elevate(method.as_str(), path, body.as_deref().unwrap_or_default())
+        .await
+        .map_err(SendError::Enroll)?;
+    read_reply(build(Some(grant.as_str())).send().await)
+        .await
+        .map_err(SendError::Http)
+}
+
+async fn read_reply(
+    sent: Result<reqwest::Response, reqwest::Error>,
+) -> Result<Reply, reqwest::Error> {
+    let res = sent?;
+    let status = res.status();
+    let body = res.bytes().await?.to_vec();
+    Ok(Reply {
+        status,
+        body: ReplyBody::Buffered(body),
+    })
 }
 
 async fn cmd_chat(message: String, model: Option<String>) -> Result<(), String> {
@@ -2054,35 +2231,37 @@ fn resolve_allow_relax(allow_remote: bool) -> bool {
 /// `agent24 os delegate <name>` (CORE-2 §10 R1). Only a resident daemon holds
 /// delegation records, so this never starts an ephemeral one.
 async fn cmd_os_delegate(name: &str) -> Result<(), String> {
-    let ep = match attach_only().await {
+    let ep = match attach_only_with_enrollment(true).await {
         Ok(Some(ep)) => ep,
         Err(err) => return Err(err),
         Ok(None) => {
             return Err("daemon not running; start it with `agent24 daemon start`".to_owned());
         }
     };
-    let sent = bearer(
+    let sent = send_elevating(
         &ep,
-        client().post(format!("{}/api/v1/os/{name}/delegation", ep.base)),
+        reqwest::Method::POST,
+        &format!("/api/v1/os/{name}/delegation"),
+        None,
+        Duration::from_secs(10),
+        false,
     )
-    .timeout(Duration::from_secs(10))
-    .send()
     .await;
     let out = match sent {
-        Ok(res) if res.status().is_success() => {
+        Ok(res) if res.status.is_success() => {
             println!("delegated {name}: first-party clients may now write to its current routes");
             Ok(())
         }
         Ok(res) => {
-            let status = res.status();
-            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            let status = res.status;
+            let body: serde_json::Value = res.json_value().await;
             Err(if body["error"]["message"].as_str().is_some() {
                 daemon_error_line(&body)
             } else {
                 format!("daemon returned {status}")
             })
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(e.parts().1),
     };
     finish(ep).await;
     out
@@ -2118,23 +2297,34 @@ async fn cmd_attach_add(
     // Resolved BEFORE contacting the daemon: a TTY prompt after an ephemeral
     // daemon has already been spawned would be a strange place to block.
     let allow_relax = resolve_allow_relax(allow_remote);
-    let ep = match connect().await {
+    let ep = match connect_detailed().await {
         Ok(ep) => ep,
         Err(e) => {
             if json {
-                println!("{}", daemon_unavailable_envelope(&e));
+                println!("{}", error_envelope(&e.code, &e.message));
             }
-            return Err(e);
+            return Err(e.message);
         }
     };
-    let sent = bearer(&ep, client().post(format!("{}/api/v1/attached", ep.base)))
-        .json(&AttachedAddRequest {
-            manifest,
-            allow_relax,
-        })
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await;
+    let request_body = match serde_json::to_vec(&AttachedAddRequest {
+        manifest,
+        allow_relax,
+    }) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            finish(ep).await;
+            return Err(e.to_string());
+        }
+    };
+    let sent = send_elevating(
+        &ep,
+        reqwest::Method::POST,
+        "/api/v1/attached",
+        Some(request_body),
+        Duration::from_secs(10),
+        true,
+    )
+    .await;
     // No `?` below: any early return here would skip `finish(ep)` (the
     // ephemeral daemon it may have spawned would never be reaped), and under
     // `--json` a 2xx with an unreadable/unresizable body must still print
@@ -2142,7 +2332,7 @@ async fn cmd_attach_add(
     // already comes from returning `Err` below, `main` maps that to
     // `ExitCode::FAILURE`.
     let out = match sent {
-        Ok(res) if res.status().is_success() => match res.json::<AttachedAddResponse>().await {
+        Ok(res) if res.status.is_success() => match res.json::<AttachedAddResponse>().await {
             Ok(body) => match serde_json::to_string(&body) {
                 Ok(text) => {
                     if json {
@@ -2174,8 +2364,8 @@ async fn cmd_attach_add(
             }
         },
         Ok(res) => {
-            let status = res.status();
-            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            let status = res.status;
+            let body = res.json_value().await;
             if json {
                 println!("{}", error_envelope_or(status, &body));
             }
@@ -2186,10 +2376,11 @@ async fn cmd_attach_add(
             })
         }
         Err(e) => {
+            let (code, message) = e.parts();
             if json {
-                println!("{}", daemon_unavailable_envelope(&e.to_string()));
+                println!("{}", error_envelope(&code, &message));
             }
-            Err(e.to_string())
+            Err(message)
         }
     };
     finish(ep).await;
@@ -2211,24 +2402,29 @@ fn print_attached(list: &AttachedList) {
 }
 
 async fn cmd_attach_list(json: bool) -> Result<(), String> {
-    let ep = match connect().await {
+    let ep = match connect_detailed().await {
         Ok(ep) => ep,
         Err(e) => {
             if json {
-                println!("{}", daemon_unavailable_envelope(&e));
+                println!("{}", error_envelope(&e.code, &e.message));
             }
-            return Err(e);
+            return Err(e.message);
         }
     };
-    let sent = bearer(&ep, client().get(format!("{}/api/v1/attached", ep.base)))
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await;
+    let sent = send_elevating(
+        &ep,
+        reqwest::Method::GET,
+        "/api/v1/attached",
+        None,
+        Duration::from_secs(10),
+        false,
+    )
+    .await;
     // See `cmd_attach_add`'s comment: no `?` here either, for the same two
     // reasons (must not skip `finish(ep)`; `--json` must still emit exactly
     // one JSON object even on an unreadable/unresizable 2xx body).
     let out = match sent {
-        Ok(res) if res.status().is_success() => match res.json::<AttachedList>().await {
+        Ok(res) if res.status.is_success() => match res.json::<AttachedList>().await {
             Ok(body) => match serde_json::to_string(&body) {
                 Ok(text) => {
                     if json {
@@ -2255,8 +2451,8 @@ async fn cmd_attach_list(json: bool) -> Result<(), String> {
             }
         },
         Ok(res) => {
-            let status = res.status();
-            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            let status = res.status;
+            let body = res.json_value().await;
             if json {
                 println!("{}", error_envelope_or(status, &body));
             }
@@ -2267,10 +2463,11 @@ async fn cmd_attach_list(json: bool) -> Result<(), String> {
             })
         }
         Err(e) => {
+            let (code, message) = e.parts();
             if json {
-                println!("{}", daemon_unavailable_envelope(&e.to_string()));
+                println!("{}", error_envelope(&code, &message));
             }
-            Err(e.to_string())
+            Err(message)
         }
     };
     finish(ep).await;
@@ -2278,24 +2475,26 @@ async fn cmd_attach_list(json: bool) -> Result<(), String> {
 }
 
 async fn cmd_attach_remove(name: &str, json: bool) -> Result<(), String> {
-    let ep = match connect().await {
+    let ep = match connect_detailed().await {
         Ok(ep) => ep,
         Err(e) => {
             if json {
-                println!("{}", daemon_unavailable_envelope(&e));
+                println!("{}", error_envelope(&e.code, &e.message));
             }
-            return Err(e);
+            return Err(e.message);
         }
     };
-    let sent = bearer(
+    let sent = send_elevating(
         &ep,
-        client().delete(format!("{}/api/v1/attached/{name}", ep.base)),
+        reqwest::Method::DELETE,
+        &format!("/api/v1/attached/{name}"),
+        None,
+        Duration::from_secs(10),
+        false,
     )
-    .timeout(Duration::from_secs(10))
-    .send()
     .await;
     let out = match sent {
-        Ok(res) if res.status() == reqwest::StatusCode::NO_CONTENT => {
+        Ok(res) if res.status == reqwest::StatusCode::NO_CONTENT => {
             if json {
                 println!("{}", serde_json::json!({"removed": name}));
             } else {
@@ -2304,8 +2503,8 @@ async fn cmd_attach_remove(name: &str, json: bool) -> Result<(), String> {
             Ok(())
         }
         Ok(res) => {
-            let status = res.status();
-            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            let status = res.status;
+            let body = res.json_value().await;
             if json {
                 println!("{}", error_envelope_or(status, &body));
             }
@@ -2316,10 +2515,11 @@ async fn cmd_attach_remove(name: &str, json: bool) -> Result<(), String> {
             })
         }
         Err(e) => {
+            let (code, message) = e.parts();
             if json {
-                println!("{}", daemon_unavailable_envelope(&e.to_string()));
+                println!("{}", error_envelope(&code, &message));
             }
-            Err(e.to_string())
+            Err(message)
         }
     };
     finish(ep).await;
@@ -2618,7 +2818,7 @@ async fn cmd_tui() -> Result<(), String> {
     let ep = connect().await?;
     let conn = tui::Conn {
         base: ep.base.clone(),
-        token: ep.token.clone(),
+        token: ep.token().to_owned(),
     };
     let result = tui::run(conn).await;
     finish(ep).await;
@@ -3678,7 +3878,9 @@ mod tests {
             DiscoveredAttach::Incompatible(err) => {
                 panic!("a dead port must be unreachable, not incompatible: {err}")
             }
-            DiscoveredAttach::Ready(_) => panic!("a dead port must not attach"),
+            DiscoveredAttach::Ready(_) | DiscoveredAttach::EnrollFailed(_) => {
+                panic!("a dead port must not attach")
+            }
         }
     }
 
@@ -3758,7 +3960,9 @@ mod tests {
             DiscoveredAttach::Unreachable => {
                 panic!("a 200 is a live peer, not an absent daemon")
             }
-            DiscoveredAttach::Ready(_) => panic!("a non-JSON 200 must not be attached"),
+            DiscoveredAttach::Ready(_) | DiscoveredAttach::EnrollFailed(_) => {
+                panic!("a non-JSON 200 must not be attached")
+            }
         }
     }
 
@@ -3785,7 +3989,7 @@ mod tests {
         let (port, _) = thread_stub(json_reply(body));
         let state =
             DaemonState::new_legacy(port, "tok", std::process::id(), "9.9.9", "gen").unwrap();
-        match attach_only_from(&state).await {
+        match attach_only_from(&state, false).await {
             Err(err) => {
                 assert!(err.contains("协议版本不兼容"), "{err}");
                 assert!(err.contains("daemon 协议版本 2"), "{err}");
@@ -3809,7 +4013,7 @@ mod tests {
         let (port, _) = thread_stub(json_reply(&body));
         let state =
             DaemonState::new_legacy(port, "tok", std::process::id(), "0.5.1", "gen").unwrap();
-        let endpoint = attach_only_from(&state)
+        let endpoint = attach_only_from(&state, false)
             .await
             .expect("a matching daemon is not an error")
             .expect("a matching daemon is attached");

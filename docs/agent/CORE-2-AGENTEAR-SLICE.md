@@ -36,7 +36,7 @@ capabilities 仍非默认模式（D1）。legacy 行为一字不改。
 |---|---|---|
 | S→C | `{"v":1,"op":"challenge","conn_id":"<hex16>","nonce":"<hex32>"}` | **服务端先发**（设计 §10 R8）。accept 后、读任何字节前先查入队字节，已有字节 → `error{code:"identity_rejected"}` 并关闭，不发 challenge |
 | C→S | `{"v":1,"op":"hello","generation":"<daemon.json generation>","nonce":"<challenge 的 nonce>"}` | 必须在收到 challenge 之后发，且原样回显 nonce；缺失或不符 → `identity_rejected`；generation 不符 → `error{code:"generation_mismatch"}` 并关闭。该帧照常逐帧复核 audit token |
-| S→C | `{"v":1,"op":"enrolled","token":"<opaque>","expires_in":3600,"tier":"daily","identity":{"kind":"macos_seccode","identifier":"agent24"}}` | 身份通过；token 只出现这一次 |
+| S→C | `{"v":1,"op":"enrolled","token":"<opaque>","expires_in":3600,"tier":"daily","identity":{"kind":"macos_seccode","identifier":"agent24"},"http_port":<daemon 实际监听的 HTTP 端口>}` | 身份通过；token 只出现这一次。`http_port` 每次 `enrolled`（含续期）都带；客户端必须核对它等于 `daemon.json` 的 `port`，不等（或缺失）即报 `endpoint_mismatch`，令牌一个字节都不发出（#1446 F1） |
 | S→C | `{"v":1,"op":"error","code":"identity_rejected"\|"generation_mismatch"\|"unsupported_version"\|"bad_frame"\|"timeout","message":"…"}` | 随后关闭 |
 | C→S | `{"v":1,"op":"elevate","method":"POST","path":"/api/v1/attached","body_sha256":"<hex64>","summary":"<≤200 字符，仅供参考>"}` | 只能在已 enrolled 的连接上发 |
 | S→C | `{"v":1,"op":"elevation_pending","challenge_id":"<hex16>"}` | 立即回；之后等提供者 |
@@ -48,6 +48,7 @@ capabilities 仍非默认模式（D1）。legacy 行为一字不改。
 - **破坏性变更（#1448 复审 M1′-b，2026-10-28）**：原 v1 为客户端先发 `hello`、challenge 的 nonce 不校验；现改为服务端先发 challenge，`hello` 必须回显 nonce。`v` 仍为 1：该协议尚无已发布客户端（只有测试夹具），旧顺序的客户端无论哪条路径都会确定地得到 `identity_rejected`（字节已入队则在 challenge 前被拒；晚到则缺 nonce 被拒），不会误登记。若此后已有客户端发布，再改协议必须升 `v`。
 - 非 macOS 没有按写入者求值的 peer token，逐帧复核无从比较，一律按失败处理：每一帧都回 `identity_rejected`（登记本就只支持 macOS）。
 - 连接断开：不撤销已签令牌（冻结稿 D5 第 5 条）；令牌仍受进程存活与 TTL 约束。
+- **HTTP 端口绑定（#1446 评审 F1，2026-10-29）**：令牌经 UDS（有 audit token 闸门）签发，却以 Bearer 发往 `daemon.json` 的 `port`；而 `daemon.json` 同 UID 可改，`/health` 匿名，`generation` 可原样保留。若不核对，同 UID 的未签名进程只要改 `port` 就能截获 Everyday 令牌（以及随后的 grant），绕过登记闸门。因此 daemon 在 `enrolled` 帧里报告自己实际监听的端口，CLI 核对一致后才发令牌。daemon 占着真实端口，攻击者无法在其上监听。新增字段对旧客户端是可选的（多出的字段被忽略），对 CLI 是必填的；`v` 仍为 1，理由同上（尚无已发布客户端）。**剩余风险**：(1) 同 UID 进程仍可整体冒充 daemon（伪造 `enroll_endpoint` 和 HTTP 两端），向 CLI 返回伪造的响应（例如 `os attach add` 的 socket_path 与 attach token）；这只能让它拿到自己签发的假令牌，拿不到真 daemon 的凭据，但 CLI 不认证 daemon 本身。(2) 端口核对只在登记时做一次；daemon 重启后 generation 变化，旧会话的令牌随进程失效。
 - daemon 侧 `summary` 由 daemon **自己**根据 method/path/body 生成后交给提供者展示；客户端的 summary 只记日志（D4 第 1 条：客户端自报摘要不能替代 daemon 摘要）。
 
 2026-10-28，#1448 M1/L6 修订内部 `enroll_api.rs`，UDS 和 HTTP 的 wire 字段与 JSON 形状不变。

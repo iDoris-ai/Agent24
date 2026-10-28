@@ -71,6 +71,9 @@ pub struct EnrollEndpoint {
     path: PathBuf,
     identity: (u64, u64),
     listener: Option<tokio::net::UnixListener>,
+    /// The daemon's HTTP port, echoed in every `enrolled` frame so the CLI can
+    /// refuse a `daemon.json` whose port is not this daemon's (#1446 F1).
+    http_port: u16,
 }
 
 #[cfg(unix)]
@@ -79,13 +82,26 @@ impl EnrollEndpoint {
         &self.path
     }
 
-    /// Start accepting. The task ends when `stop` fires.
+    /// Start accepting. The task ends when `stop` fires. `http_port` is the
+    /// port this daemon's HTTP API actually listens on.
     pub fn serve(
         &mut self,
         stop: CancellationToken,
         generation: String,
+        http_port: u16,
         authority: Arc<dyn EnrollAuthority>,
     ) {
+        self.http_port = http_port;
+        #[cfg(feature = "test-enrollment")]
+        if crate::enroll_test_support::enabled() {
+            self.serve_with_identity(
+                stop,
+                generation,
+                authority,
+                Arc::new(crate::enroll_test_support::UnsignedIdentity),
+            );
+            return;
+        }
         self.serve_with_identity(
             stop,
             generation,
@@ -105,6 +121,7 @@ impl EnrollEndpoint {
             return;
         };
         let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT));
+        let http_port = self.http_port;
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -130,7 +147,7 @@ impl EnrollEndpoint {
                                 let permit = Arc::new(permit);
                                 tokio::select! {
                                     () = stop.cancelled() => {}
-                                    () = answer(stream, audit_token, generation, authority, verifier, stop.clone(), permit) => {}
+                                    () = serve_connection(stream, audit_token, generation, http_port, authority, verifier, stop.clone(), permit) => {}
                                 }
                             });
                         }
@@ -233,6 +250,7 @@ async fn enrolled<W: tokio::io::AsyncWrite + Unpin>(
     write: &mut W,
     token: &IssuedToken,
     peer: &EnrolledPeer,
+    http_port: u16,
 ) -> io::Result<()> {
     #[derive(serde::Serialize)]
     struct Identity<'a> {
@@ -247,6 +265,7 @@ async fn enrolled<W: tokio::io::AsyncWrite + Unpin>(
         expires_in: u64,
         tier: &'a str,
         identity: Identity<'a>,
+        http_port: u16,
     }
     send(
         write,
@@ -260,6 +279,7 @@ async fn enrolled<W: tokio::io::AsyncWrite + Unpin>(
                 kind: "macos_seccode",
                 identifier: &peer.identity.identifier,
             },
+            http_port,
         },
     )
     .await
@@ -360,11 +380,38 @@ async fn next_frame(
     frame
 }
 
-#[cfg(unix)]
+/// Test entry point with no HTTP port to advertise (the `enrolled` frame then
+/// carries `http_port: 0`, which no CLI accepts).
+#[cfg(all(test, unix))]
 async fn answer(
     stream: tokio::net::UnixStream,
     audit_token: Option<agent24_os_proc::AuditToken>,
     generation: String,
+    authority: Arc<dyn EnrollAuthority>,
+    verifier: Arc<dyn IdentityVerifier>,
+    cancel: CancellationToken,
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+) {
+    serve_connection(
+        stream,
+        audit_token,
+        generation,
+        0,
+        authority,
+        verifier,
+        cancel,
+        permit,
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn serve_connection(
+    stream: tokio::net::UnixStream,
+    audit_token: Option<agent24_os_proc::AuditToken>,
+    generation: String,
+    http_port: u16,
     authority: Arc<dyn EnrollAuthority>,
     verifier: Arc<dyn IdentityVerifier>,
     cancel: CancellationToken,
@@ -477,7 +524,10 @@ async fn answer(
         send_error(&mut write, EnrollErrorCode::IdentityRejected).await;
         return;
     }
-    if enrolled(&mut write, &token, &peer).await.is_err() {
+    if enrolled(&mut write, &token, &peer, http_port)
+        .await
+        .is_err()
+    {
         return;
     }
     let mut token_id = token.token_id;
@@ -651,7 +701,7 @@ async fn answer(
                     send_error(&mut write, EnrollErrorCode::IdentityRejected).await;
                     return;
                 }
-                if enrolled(&mut write, &new, &peer).await.is_err() {
+                if enrolled(&mut write, &new, &peer, http_port).await.is_err() {
                     return;
                 }
                 token_id = new.token_id;
@@ -745,6 +795,7 @@ pub fn bind(dir: &Path) -> io::Result<EnrollEndpoint> {
         path: path.clone(),
         identity,
         listener: Some(listener),
+        http_port: 0,
     };
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     Ok(endpoint)
@@ -762,6 +813,7 @@ impl EnrollEndpoint {
         &mut self,
         _stop: CancellationToken,
         _generation: String,
+        _http_port: u16,
         _authority: Arc<dyn EnrollAuthority>,
     ) {
     }
@@ -915,6 +967,7 @@ pub(crate) mod handshake_tests {
             Err(err) => panic!("spawning python3: {err}"),
         }
     }
+    const TEST_HTTP_PORT: u16 = 47_123;
     async fn connect(
         reject: bool,
         changed_start: bool,
@@ -928,6 +981,7 @@ pub(crate) mod handshake_tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let mut endpoint = bind(dir.path()).unwrap();
+        endpoint.http_port = TEST_HTTP_PORT;
         let stop = CancellationToken::new();
         let authority = Arc::new(Authority::default());
         endpoint.serve_with_identity(
@@ -952,13 +1006,18 @@ pub(crate) mod handshake_tests {
     async fn hello_challenge_enrolled_and_renew_use_original_connection() {
         let (_dir, _endpoint, stop, authority, mut client) = connect(false, false, false).await;
         hello(&mut client, "generation").await;
-        assert_eq!(line(&mut client).await["token"], "test-token");
+        let enrolled = line(&mut client).await;
+        assert_eq!(enrolled["token"], "test-token");
+        // The CLI refuses to send the token unless this is daemon.json's port.
+        assert_eq!(enrolled["http_port"], TEST_HTTP_PORT);
         client
             .get_mut()
             .write_all(b"{\"v\":1,\"op\":\"renew\"}\n")
             .await
             .unwrap();
-        assert_eq!(line(&mut client).await["op"], "enrolled");
+        let renewed = line(&mut client).await;
+        assert_eq!(renewed["op"], "enrolled");
+        assert_eq!(renewed["http_port"], TEST_HTTP_PORT);
         assert_eq!(authority.0.load(Ordering::SeqCst), 2);
         stop.cancel();
     }

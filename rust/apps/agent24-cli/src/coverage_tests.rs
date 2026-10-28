@@ -42,6 +42,7 @@ mod tests {
                 base: format!("http://127.0.0.1:{port}"),
                 token: "test-host".into(),
                 child: None,
+                session: None,
             },
             hit,
         )

@@ -2182,6 +2182,10 @@ pub async fn serve(
         mcp_servers,
         packages_root: Arc::clone(&packages_root),
     });
+    #[cfg(feature = "test-enrollment")]
+    if crate::enroll_test_support::enabled() {
+        state.presence_provider = Some(Arc::new(crate::enroll_test_support::TestPresence));
+    }
     if let Some(capability_store) = capability_store {
         state.enable_capability_auth(capability_store);
         if mode == StartupMode::HostChild {
@@ -3031,7 +3035,12 @@ pub async fn serve(
     if let Some(endpoint) = enroll.as_mut()
         && let Some(authority) = enroll_authority
     {
-        endpoint.serve(cancel.clone(), daemon_generation.clone(), authority);
+        endpoint.serve(
+            cancel.clone(),
+            daemon_generation.clone(),
+            local.port(),
+            authority,
+        );
     }
 
     // The state file is written; now readiness and a shutdown request race
