@@ -11,13 +11,15 @@
 //! | `Migrating`          | restore the whole pair from the manifest | `Restored`         |
 //! | `Restoring`          | resume the restore                       | `Restored`         |
 //! | `Restored`           | final check only (no rebuild)            | `Restored`         |
+//! | `RollbackFailed`     | nothing (evidence is kept, never retried) | `Docked(RollbackFailed)` |
 //! | corrupt / unreadable | nothing is touched                       | `Docked(GuardUnusable)` |
 //!
 //! `Restored` is NOT "go": the upgrade failed and the pair is back at the
 //! snapshot. 5f must still publish the `migration_failed` marker and dock;
-//! only `Proceed` may continue startup. There is no `rollback_failed` phase
-//! yet (5f): it is `Restoring` + `last_error`, surfaced as
-//! [`Dock::RollbackFailed`].
+//! only `Proceed` may continue startup. A failed restore is the
+//! `RollbackFailed` phase (a legacy `Restoring` + `last_error` log reads as
+//! the same); it is surfaced as [`Dock::RollbackFailed`] without touching
+//! any file. [`ReplayOutcome::verdict`] maps every outcome to go / dock.
 //!
 //! Caller contract (5g wiring):
 //! - run it inside `spawn_blocking` (hashing and copying whole databases) and
@@ -76,6 +78,10 @@ pub fn startup_replay(ops: &dyn FileOps, req: &RestoreRequest<'_>) -> ReplayOutc
     match from {
         Phase::Committed => ReplayOutcome::Proceed,
         Phase::Preparing | Phase::Snapshotted => ReplayOutcome::Docked(Dock::Interrupted(from)),
+        Phase::RollbackFailed => ReplayOutcome::Docked(Dock::RollbackFailed {
+            reason: log.last_error.unwrap_or_default(),
+            persisted: true,
+        }),
         Phase::Migrating | Phase::Restoring | Phase::Restored => {
             match restore(ops, req, &mut log) {
                 Ok(leftover_cleanup) => ReplayOutcome::Restored {

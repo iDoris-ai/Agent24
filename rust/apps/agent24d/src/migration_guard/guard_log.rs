@@ -22,6 +22,10 @@ pub enum Phase {
     Snapshotted,
     Migrating,
     Restoring,
+    /// The restore itself failed (D4): both databases stay disabled, snapshot,
+    /// quarantine and progress are kept. Only the installer/manual path may
+    /// leave it; startup never resumes it on its own.
+    RollbackFailed,
     Restored,
     Committed,
 }
@@ -78,7 +82,9 @@ impl GuardError {
 
 #[must_use]
 pub fn is_legal(from: Phase, to: Phase) -> bool {
-    use Phase::{Committed, Migrating, Preparing, Restored, Restoring, Snapshotted};
+    use Phase::{
+        Committed, Migrating, Preparing, Restored, Restoring, RollbackFailed, Snapshotted,
+    };
     matches!(
         (from, to),
         (Preparing, Snapshotted)
@@ -87,6 +93,7 @@ pub fn is_legal(from: Phase, to: Phase) -> bool {
             | (Migrating, Restoring)
             | (Restoring, Restoring) // resumed / per-db progress update
             | (Restoring, Restored)
+            | (Restoring, RollbackFailed)
     )
 }
 
@@ -126,7 +133,31 @@ impl GuardLog {
                 "Restored requires both store_restore and memory_restore Done".into(),
             ));
         }
+        if self.phase == Phase::RollbackFailed && self.last_error.is_none() {
+            return Err(GuardError::Invalid(
+                "RollbackFailed without last_error".into(),
+            ));
+        }
         Ok(())
+    }
+
+    /// Record a failed restore: `Restoring` -> `RollbackFailed` with the error.
+    /// Legal only from `Restoring`; the caller persists it.
+    pub fn failed_restore(&self, reason: String) -> Result<Self, GuardError> {
+        let mut next = self.step(Phase::RollbackFailed)?;
+        next.last_error = Some(reason);
+        Ok(next)
+    }
+
+    /// Pre-5f logs spelled a failed restore as `Restoring` + `last_error`
+    /// (#1425). That is the same fact as `RollbackFailed`; map it so the old
+    /// file is neither "corrupt" nor "no log", and so it docks rather than
+    /// resuming a restore that already failed once.
+    fn migrate_legacy(mut self) -> Self {
+        if self.phase == Phase::Restoring && self.last_error.is_some() {
+            self.phase = Phase::RollbackFailed;
+        }
+        self
     }
 
     fn step(&self, to: Phase) -> Result<Self, GuardError> {
@@ -188,7 +219,7 @@ pub fn read(data_dir: &Path) -> Result<Option<GuardLog>, GuardError> {
     };
     let log: GuardLog = parse_json(&bytes)?;
     log.validate()?;
-    Ok(Some(log))
+    Ok(Some(log.migrate_legacy()))
 }
 
 #[cfg(test)]
@@ -243,6 +274,7 @@ mod tests {
             Snapshotted,
             Migrating,
             Restoring,
+            RollbackFailed,
             Restored,
             Committed,
         ];
@@ -253,6 +285,7 @@ mod tests {
             (Migrating, Restoring),
             (Restoring, Restoring),
             (Restoring, Restored),
+            (Restoring, RollbackFailed),
         ];
         for f in all {
             for t in all {
@@ -384,6 +417,67 @@ mod tests {
                 matches!(&r, Err(e) if e.must_dock())
             },
             GUARD_FILE,
+        );
+    }
+
+    fn raw(phase: &str, last_error: &str) -> String {
+        format!(
+            r#"{{"format_version":1,"attempt_id":"a1","snapshot_id":"s","target":{{"version":"1","sha256":"x"}},"phase":"{phase}","store_restore":"pending","memory_restore":"pending","last_error":{last_error}}}"#
+        )
+    }
+
+    /// Pre-5f logs (#1425): `Restoring` + `last_error` is a failed restore.
+    /// It must read (not corrupt, not absent) and must not resume.
+    #[test]
+    fn legacy_restoring_with_last_error_reads_as_rollback_failed() {
+        let td = tempfile::tempdir().unwrap();
+        fs::write(guard_path(td.path()), raw("restoring", r#""boom""#)).unwrap();
+        let g = read(td.path()).unwrap().unwrap();
+        assert_eq!(g.phase, Phase::RollbackFailed);
+        assert_eq!(g.last_error.as_deref(), Some("boom"));
+        // Interrupted restore without an error is still resumable.
+        fs::write(guard_path(td.path()), raw("restoring", "null")).unwrap();
+        assert_eq!(read(td.path()).unwrap().unwrap().phase, Phase::Restoring);
+        // New spelling reads as is, and must carry its error.
+        fs::write(guard_path(td.path()), raw("rollback_failed", r#""boom""#)).unwrap();
+        assert_eq!(
+            read(td.path()).unwrap().unwrap().phase,
+            Phase::RollbackFailed
+        );
+        fs::write(guard_path(td.path()), raw("rollback_failed", "null")).unwrap();
+        assert!(read(td.path()).unwrap_err().must_dock());
+    }
+
+    #[test]
+    fn failed_restore_is_legal_only_from_restoring() {
+        let mut g = fresh();
+        g.snapshot_id = Some("s".into());
+        for p in [
+            Phase::Preparing,
+            Phase::Snapshotted,
+            Phase::Migrating,
+            Phase::Restored,
+            Phase::Committed,
+            Phase::RollbackFailed,
+        ] {
+            g.phase = p;
+            assert!(
+                matches!(
+                    g.failed_restore("x".into()),
+                    Err(GuardError::IllegalTransition { .. })
+                ),
+                "{p:?}"
+            );
+        }
+        g.phase = Phase::Restoring;
+        let n = g.failed_restore("x".into()).unwrap();
+        assert_eq!(
+            (n.phase, n.last_error.as_deref()),
+            (Phase::RollbackFailed, Some("x"))
+        );
+        assert_eq!(
+            serde_json::to_string(&Phase::RollbackFailed).unwrap(),
+            r#""rollback_failed""#
         );
     }
 
