@@ -26,12 +26,19 @@ impl Drop for OfflineLock {
 }
 
 impl OfflineDb {
-    pub(crate) async fn close(self) {
+    pub(crate) async fn close(self) -> Result<(), String> {
         match self {
-            Self::Absent(lock) => drop(lock),
-            Self::Ready(store, lock) => {
-                store.close().await;
+            Self::Absent(lock) => {
                 drop(lock);
+                Ok(())
+            }
+            Self::Ready(store, lock) => {
+                let result = store
+                    .close()
+                    .await
+                    .map_err(|err| format!("could not close the offline store: {err}"));
+                drop(lock);
+                result
             }
         }
     }
@@ -175,7 +182,7 @@ mod tests {
                 .await
                 .unwrap();
             reopened.export_decision_log(None, None).await.unwrap();
-            reopened.close().await;
+            reopened.close().await.unwrap();
             result
         })
         .await
@@ -193,7 +200,7 @@ mod tests {
             .await
             .unwrap();
         }
-        store.close().await;
+        store.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -201,8 +208,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         database(dir.path(), false).await;
         assert_close_order(dir.path(), async {
-            super::open_offline_store(dir.path()).await?.close().await;
-            Ok(())
+            super::open_offline_store(dir.path()).await?.close().await
         })
         .await
         .unwrap();
@@ -268,7 +274,8 @@ mod tests {
                     .await
                     .unwrap()
                     .close()
-                    .await;
+                    .await
+                    .unwrap();
             }
             let db = super::open_offline_store(dir.path()).await.unwrap();
             let inherited = match &db {
