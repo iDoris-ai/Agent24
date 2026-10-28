@@ -728,25 +728,22 @@ impl IdorisHost {
         }
         self.router.block_idoris("managed iDoris not ready");
     }
-    async fn connect_gateway(
+    async fn prepare_gateway(
         &self,
         record: &Installation,
         cancel: &CancellationToken,
-    ) -> Result<(), Code> {
+    ) -> Result<(ManagedConfig, IdorisGateway), Code> {
         let secrets = ClassifiedSecrets {
             source: self.secrets.as_ref(),
             failure: SyncMutex::new(None),
         };
-        self.managed
-            .connect(
-                ManagedConfig {
-                    url: format!("http://127.0.0.1:{}", record.data_port),
-                    key_id: record.key_id.clone().ok_or(Code::NotConfigured)?,
-                },
-                &secrets,
-                cancel,
-            )
+        let config = ManagedConfig {
+            url: format!("http://127.0.0.1:{}", record.data_port),
+            key_id: record.key_id.clone().ok_or(Code::NotConfigured)?,
+        };
+        ManagedIdoris::prepare(&config, &secrets, cancel)
             .await
+            .map(|gateway| (config, gateway))
             .map_err(|_| {
                 if cancel.is_cancelled() {
                     Code::Cancelled
@@ -758,6 +755,19 @@ impl IdorisHost {
                         .unwrap_or(Code::StartFailed)
                 }
             })
+    }
+    async fn connect_gateway(
+        &self,
+        record: &Installation,
+        cancel: &CancellationToken,
+    ) -> Result<(), Code> {
+        let (config, gateway) = self.prepare_gateway(record, cancel).await?;
+        if cancel.is_cancelled() {
+            return Err(Code::Cancelled);
+        }
+        self.managed.persist_config(&config)?;
+        self.router.replace_idoris(gateway);
+        Ok(())
     }
     async fn execute(
         self: &Arc<Self>,
@@ -996,16 +1006,20 @@ impl IdorisHost {
                     if cancel.is_cancelled() {
                         return;
                     }
-                    let result = host.connect_gateway(&record, &cancel).await;
+                    let prepared = host.prepare_gateway(&record, &cancel).await;
                     let mut i = host.inner.lock().await;
                     if i.closing
                         || cancel.is_cancelled()
                         || i.generation.as_deref() != Some(&generation)
                         || i.supervisor.is_none()
                     {
-                        host.block_gateway();
                         return;
                     }
+                    let result = prepared.and_then(|(config, gateway)| {
+                        host.managed.persist_config(&config)?;
+                        host.router.replace_idoris(gateway);
+                        Ok(())
+                    });
                     if result.is_ok() {
                         i.state = State::Running;
                     } else {

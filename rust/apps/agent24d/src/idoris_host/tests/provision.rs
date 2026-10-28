@@ -1,12 +1,14 @@
 use super::*;
 use crate::idoris_host::provision::*;
-use agent24_idoris::setup::SetupBudget;
+use agent24_idoris::{keys::Keys, setup::SetupBudget};
 use std::sync::atomic::AtomicUsize;
 
 #[derive(Default)]
 struct Store {
     entries: SyncMutex<BTreeMap<String, Zeroizing<String>>>,
     fail_put: AtomicBool,
+    missing_delete_is_error: AtomicBool,
+    missing_deletes: AtomicUsize,
     lock_after_first_read: AtomicBool,
     reads: AtomicUsize,
 }
@@ -35,7 +37,12 @@ impl Keychain for Store {
         Ok(())
     }
     fn delete(&self, id: &str) -> Result<(), KeychainError> {
-        self.entries.lock().unwrap().remove(id);
+        if self.entries.lock().unwrap().remove(id).is_none()
+            && self.missing_delete_is_error.load(Ordering::SeqCst)
+        {
+            self.missing_deletes.fetch_add(1, Ordering::SeqCst);
+            return Err(KeychainError::NotFound);
+        }
         Ok(())
     }
 }
@@ -531,6 +538,279 @@ async fn failed_revocation_is_durable_and_recovery_mints_no_second_key() {
     assert!(!x.f.host.root.join("pending-connect.json").exists());
     assert!(x.data.entries.lock().unwrap().is_empty());
     x.assert_safe();
+}
+
+#[tokio::test]
+async fn restore_finishes_committed_replace_after_old_key_revoke_failure() {
+    let x = ConnectedFixture::new().await;
+    x.installed().await;
+    let first = x.f.host.connect(x.request(), Some("first")).await.unwrap();
+    assert_eq!(x.f.complete(&first).await.result, Some(Outcome::Succeeded));
+    x.scenario(json!({"revoke_fail":true}));
+    let mut request = x.request();
+    request.replace = true;
+    let op = x.f.host.connect(request, Some("replace")).await.unwrap();
+    assert_eq!(
+        x.f.complete(&op).await.error_code,
+        Some(Code::KeyUnavailable)
+    );
+    let pending = x.f.host.root.join("pending-connect.json");
+    assert!(pending.exists());
+    assert_eq!(x.keys()[0]["status"], "active");
+    assert!(
+        !x.f.host
+            .root
+            .join("data/idoris.key-operation.json")
+            .exists()
+    );
+    x.scenario(json!({}));
+    let restored = x.f.host.restore().await;
+    // Always reap the running replacement before a regression assertion can panic.
+    let cleared = !pending.exists();
+    let keys = x.keys();
+    let next = x.f.host.connect(x.request(), Some("next")).await;
+    x.f.host.shutdown().await.unwrap();
+    assert_eq!(restored, Ok(()));
+    assert!(cleared);
+    assert_eq!(keys[0]["status"], "revoked");
+    assert_eq!(keys[1]["status"], "active");
+    assert!(matches!(next, Err(Code::ReplaceRequired)));
+    assert_eq!(
+        x.f.host.operation(&op.operation_id).await.unwrap().result,
+        Some(Outcome::Succeeded)
+    );
+    x.f.assert_clean();
+    x.assert_safe();
+}
+
+#[tokio::test]
+async fn restore_after_crash_between_commit_issue_and_connect_journal_removal() {
+    let mut x = ConnectedFixture::new().await;
+    x.installed().await;
+    let first = x.f.host.connect(x.request(), Some("first")).await.unwrap();
+    assert_eq!(x.f.complete(&first).await.result, Some(Outcome::Succeeded));
+    let previous = x.f.host.inner.lock().await.installation.clone().unwrap();
+    x.f.host.shutdown().await.unwrap();
+    let installed = x.provision.verify(&previous).await.unwrap();
+    let keys = Keys::new(
+        &installed,
+        &x.f.host.root.join("data/idoris.sqlite3"),
+        x.data.clone(),
+    )
+    .unwrap();
+    let issued = keys.issue_pending("managed", &["daily"]).await.unwrap();
+    let mut candidate = previous.clone();
+    candidate.key_id = Some(issued.key_id);
+    let pending = json!({"previous": previous, "candidate": candidate, "committed": true, "operation_id": "crashed-replace"});
+    write_json(&x.f.host.root.join("installation.json"), &candidate).unwrap();
+    x.f.host
+        .managed
+        .persist_config(&ManagedConfig {
+            url: format!("http://127.0.0.1:{}", candidate.data_port),
+            key_id: candidate.key_id.clone().unwrap(),
+        })
+        .unwrap();
+    write_json(&x.f.host.root.join("pending-connect.json"), &pending).unwrap();
+    keys.commit_issue().unwrap();
+    // Reopen only the durable state left by a crash at this exact cleanup boundary.
+    x.f.host = IdorisHost::open(
+        x.f.host.root.clone(),
+        x.f.host.managed.clone(),
+        x.f.host.router.clone(),
+        x.f.runtime.clone(),
+        x.f.host.secrets.clone(),
+    )
+    .unwrap()
+    .with_provisioner(x.provision.clone(), x.data.clone(), x.upstream.clone())
+    .unwrap();
+    let restored = x.f.host.restore().await;
+    if restored.is_ok()
+        && let Some(id) = x.f.host.status().await.current_operation
+    {
+        let start = x.f.host.operation(&id).await.unwrap();
+        assert_eq!(x.f.complete(&start).await.result, Some(Outcome::Succeeded));
+    }
+    let next = x.f.host.connect(x.request(), Some("next")).await;
+    x.f.host.shutdown().await.unwrap();
+    assert_eq!(restored, Ok(()));
+    assert!(matches!(next, Err(Code::ReplaceRequired)));
+    assert!(!x.f.host.root.join("pending-connect.json").exists());
+    assert_eq!(x.keys()[0]["status"], "revoked");
+    assert_eq!(x.keys()[1]["status"], "active");
+    x.f.assert_clean();
+    x.assert_safe();
+}
+
+#[tokio::test]
+async fn rollback_accepts_data_key_already_deleted_by_compensation() {
+    let x = ConnectedFixture::new().await;
+    x.installed().await;
+    x.data.missing_delete_is_error.store(true, Ordering::SeqCst);
+    x.scenario(json!({"serve":{"verify_status":500}}));
+    let op =
+        x.f.host
+            .connect(x.request(), Some("rollback-missing"))
+            .await
+            .unwrap();
+    assert_eq!(x.f.complete(&op).await.error_code, Some(Code::VerifyFailed));
+    assert_eq!(x.data.missing_deletes.load(Ordering::SeqCst), 1);
+    assert!(!x.f.host.root.join("pending-connect.json").exists());
+    assert!(x.keys().iter().all(|key| key["status"] == "revoked"));
+    x.f.assert_clean();
+}
+
+#[tokio::test]
+async fn cancellation_while_waiting_for_commit_lock_rolls_back() {
+    let x = ConnectedFixture::new().await;
+    x.installed().await;
+    let before = fs::read(x.f.host.root.join("installation.json")).unwrap();
+    x.scenario(json!({"serve":{"verify_wait":true}}));
+    let op =
+        x.f.host
+            .connect(x.request(), Some("cancel-at-commit"))
+            .await
+            .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while x.f.host.operation(&op.operation_id).await.unwrap().phase
+            != Phase::VerifyingConnection
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut guard = x.f.host.inner.lock().await;
+    let cancel = guard.active.as_ref().unwrap().1.clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            drop(guard);
+            // Tokio reserves the released permit for the queued commit waiter.
+            // Cancel synchronously before yielding to that waiter.
+            match x.f.host.inner.try_lock() {
+                Ok(reacquired) => guard = reacquired,
+                Err(_) => {
+                    cancel.cancel();
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let done = x.f.complete(&op).await;
+    x.f.host.shutdown().await.unwrap();
+    assert_eq!(done.result, Some(Outcome::Cancelled));
+    assert_eq!(
+        fs::read(x.f.host.root.join("installation.json")).unwrap(),
+        before
+    );
+    assert!(!x.f.host.root.join("connection.json").exists());
+    assert!(!x.f.host.root.join("pending-connect.json").exists());
+    assert!(x.keys().iter().all(|key| key["status"] == "revoked"));
+    x.f.assert_clean();
+}
+
+#[tokio::test]
+async fn connect_distinguishes_explicit_zero_core_reservation_from_omission() {
+    for core in [None, Some(0)] {
+        let x = ConnectedFixture::new().await;
+        x.installed().await;
+        let mut record = x.f.host.inner.lock().await.installation.clone().unwrap();
+        record.core_reserved_bytes = None;
+        x.f.host.record_installation(record).await.unwrap();
+        let mut body = serde_json::to_value(x.request()).unwrap();
+        body.as_object_mut().unwrap().remove("core_reserved_bytes");
+        if let Some(core) = core {
+            body["core_reserved_bytes"] = json!(core);
+        }
+        let op =
+            x.f.host
+                .connect(
+                    serde_json::from_value(body).unwrap(),
+                    Some("core-reservation"),
+                )
+                .await
+                .unwrap();
+        let done = x.f.complete(&op).await;
+        x.f.host.shutdown().await.unwrap();
+        if core.is_some() {
+            assert_eq!(done.result, Some(Outcome::Succeeded));
+            let receipt: Installation =
+                serde_json::from_slice(&fs::read(x.f.host.root.join("installation.json")).unwrap())
+                    .unwrap();
+            assert_eq!(receipt.core_reserved_bytes, Some(0));
+        } else {
+            assert_eq!(done.error_code, Some(Code::NotConfigured));
+            assert!(x.keys().is_empty());
+        }
+        x.f.assert_clean();
+    }
+}
+
+#[tokio::test]
+async fn stale_generation_monitor_cannot_withdraw_replacement_gateway() {
+    let x = ConnectedFixture::new().await;
+    x.installed().await;
+    let first =
+        x.f.host
+            .connect(x.request(), Some("generation-a"))
+            .await
+            .unwrap();
+    assert_eq!(x.f.complete(&first).await.result, Some(Outcome::Succeeded));
+    let record = x.f.host.inner.lock().await.installation.clone().unwrap();
+    let mut request = x.request();
+    request.replace = true;
+    let second =
+        x.f.host
+            .connect(request, Some("generation-b"))
+            .await
+            .unwrap();
+    assert_eq!(x.f.complete(&second).await.result, Some(Outcome::Succeeded));
+    assert!(x.f.host.router.idoris_gateway().is_ok());
+    let mut available = Vec::new();
+    for ready in [false, true] {
+        let (sender, signal) = watch::channel(!ready);
+        let failure = Arc::new(SyncMutex::new(None));
+        x.f.host.monitor(
+            signal,
+            record.clone(),
+            first.operation_id.clone(),
+            CancellationToken::new(),
+            failure.clone(),
+        );
+        // Cancellation remains unset: generation identity alone must protect B
+        // against A's not-ready, ready and closed notifications.
+        sender.send(ready).unwrap();
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&failure) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        available.push(x.f.host.router.idoris_gateway().is_ok());
+    }
+    let state = x.f.host.status().await.state;
+    x.f.host.shutdown().await.unwrap();
+    assert_eq!(available, vec![true, true]);
+    assert_eq!(state, State::Running);
+    x.f.assert_clean();
+}
+
+#[tokio::test]
+async fn submit_rejects_install_and_connect_actions() {
+    let x = ConnectedFixture::new().await;
+    for action in [Action::Install, Action::Connect] {
+        assert!(matches!(
+            x.f.host.submit(action, Some("wrong-entrypoint")).await,
+            Err(Code::InvalidRequest)
+        ));
+    }
+    assert!(x.f.host.inner.lock().await.operations.is_empty());
+    assert!(!x.f.host.root.join("operations.json").exists());
+    assert!(x.keys().is_empty());
 }
 
 #[tokio::test]

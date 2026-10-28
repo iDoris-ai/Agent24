@@ -216,18 +216,6 @@ pub struct Supervisor {
     task: Option<JoinHandle<Result<StopReport, SupervisorError>>>,
 }
 impl Supervisor {
-    /// Reclaim a crashed host's recorded generation without starting a replacement.
-    /// The same PID/start-time/executable/UID checks used by start fail closed.
-    pub async fn recover_existing(
-        installed: &InstalledVersion,
-        state: &Path,
-        cancel: &CancellationToken,
-    ) -> Result<(), SupervisorError> {
-        let lease = Lease::acquire(state)?;
-        lease
-            .recover(&Timings::default(), cancel, &installed.binary())
-            .await
-    }
     /// Reap a recorded orphan without launching a replacement. The lease and
     /// kernel PID/start-time/executable/UID checks are shared with start().
     pub async fn recover_leftover(

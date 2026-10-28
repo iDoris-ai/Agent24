@@ -1073,7 +1073,7 @@ async fn stop_after_reopen_reaps_a_live_leftover_without_starting() {
 }
 
 #[tokio::test]
-async fn stopped_generation_withdraws_a_gateway_published_during_connect() {
+async fn stopped_generation_cannot_publish_a_gateway_after_prepare() {
     let f = Fixture::new().await;
     f.install().await;
     let start = f.host.submit(Action::Start, None).await.unwrap();
@@ -1091,21 +1091,26 @@ async fn stopped_generation_withdraws_a_gateway_published_during_connect() {
         Arc::new(SyncMutex::new(None)),
     );
     sender.send(true).unwrap();
-    // Keep stop's lock until connect has published and queued its final check.
+    // Keep stop's lock until preparation has queued the final generation check.
     tokio::time::timeout(Duration::from_secs(2), async {
-        while f.host.router.idoris_gateway().is_err() {
-            tokio::task::yield_now().await;
+        loop {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            drop(inner);
+            match f.host.inner.try_lock() {
+                Ok(reacquired) => inner = reacquired,
+                Err(_) => break,
+            }
         }
     })
     .await
     .unwrap();
-    tokio::task::yield_now().await;
-    drop(inner);
-    f.host.status().await;
+    tokio::time::timeout(Duration::from_secs(2), sender.closed())
+        .await
+        .unwrap();
     let blocked = f.host.router.idoris_gateway().is_err();
     supervisor.stop().await.unwrap();
     f.host.shutdown().await.unwrap();
-    assert!(blocked, "connect left its snapshot published after stop");
+    assert!(blocked, "monitor published its prepared gateway after stop");
 }
 
 #[tokio::test]

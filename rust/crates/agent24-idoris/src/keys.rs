@@ -452,7 +452,11 @@ impl Keys {
 
     fn clear_operation(&self) -> Result<(), KeyError> {
         let path = self.operation_path();
-        fs::remove_file(&path).map_err(|_| KeyError::Record)?;
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(KeyError::Record),
+        }
         sync_directory(path.parent().ok_or(KeyError::Record)?)
     }
 }
