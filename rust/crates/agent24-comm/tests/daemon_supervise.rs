@@ -6,6 +6,8 @@
 
 use std::future::Future;
 use std::ops::Deref;
+mod common;
+
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -220,9 +222,7 @@ async fn install(dir: &Path, script: &str) -> VerifiedBinary {
     tokio::fs::write(&source, script).await.unwrap();
     let bytes = tokio::fs::read(&source).await.unwrap();
     let expected = sha256_of(&bytes);
-    VerifiedBinary::install(&source, expected, &dir.join("bin"))
-        .await
-        .unwrap()
+    common::install_verified(&source, expected, &dir.join("bin")).await
 }
 
 async fn make_ctx(dir: &Path) -> DaemonCtx {
