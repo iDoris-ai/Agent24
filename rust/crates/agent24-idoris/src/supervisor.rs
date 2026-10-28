@@ -792,10 +792,33 @@ fn judge_listeners(
 /// A zombie-only group holds no ports, files or CPU and cannot be signalled
 /// further, so it counts as gone; it vanishes once its parent reaps it.
 fn group_exists(group: Pid) -> io::Result<bool> {
-    match killpg(group, None) {
-        Ok(()) => Ok(true),
-        Err(nix::errno::Errno::ESRCH) => Ok(false),
-        Err(nix::errno::Errno::EPERM) if !identity::group_has_live_member(group)? => Ok(false),
+    let outcome = killpg_outcome(killpg(group, None), || {
+        identity::group_has_live_member(group)
+    })?;
+    Ok(outcome == KillOutcome::Delivered)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KillOutcome {
+    Delivered,
+    NoGroup,
+    /// macOS only: every member is an unreaped zombie, so killpg (even with
+    /// signal 0) fails with EPERM. Linux delivers to zombies and never gets
+    /// here; there a zombie-only group reads as Delivered until reaped.
+    ZombieOnly,
+}
+
+/// The one place EPERM is classified, shared by signal_group and
+/// group_exists. EPERM is harmless only when no live member remains;
+/// otherwise a member we may not signal survives, which stays an error.
+fn killpg_outcome(
+    result: nix::Result<()>,
+    live_member: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<KillOutcome> {
+    match result {
+        Ok(()) => Ok(KillOutcome::Delivered),
+        Err(nix::errno::Errno::ESRCH) => Ok(KillOutcome::NoGroup),
+        Err(nix::errno::Errno::EPERM) if !live_member()? => Ok(KillOutcome::ZombieOnly),
         Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
     }
 }
@@ -805,14 +828,13 @@ impl Drop for ManagedProcess {
     }
 }
 
+/// A zombie-only group has nothing left to signal; callers then wait for it
+/// to be reaped.
 fn signal_group(group: Pid, signal: Signal) -> io::Result<()> {
-    match killpg(group, signal) {
-        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
-        // macOS: every member already an unreaped zombie. Nothing is left to
-        // signal; callers then wait for the group to be reaped.
-        Err(nix::errno::Errno::EPERM) if !identity::group_has_live_member(group)? => Ok(()),
-        Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
-    }
+    killpg_outcome(killpg(group, signal), || {
+        identity::group_has_live_member(group)
+    })?;
+    Ok(())
 }
 
 fn serve_command(

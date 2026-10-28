@@ -1238,13 +1238,44 @@ fn zombie_only_group_is_signalled_and_gone() {
         std::thread::sleep(Duration::from_millis(5));
     }
     // This is the state F7 hit: macOS refuses even signal 0 with EPERM.
+    // Linux delivers signals to zombies, so killpg succeeds there and the
+    // group reads as existing until it is reaped; EPERM is never reached.
     #[cfg(target_os = "macos")]
     assert_eq!(killpg(group, None), Err(nix::errno::Errno::EPERM));
     let signalled = signal_group(group, Signal::SIGKILL);
-    let exists = group_exists(group);
+    let before_reap = group_exists(group);
     child.wait().unwrap();
+    let after_reap = group_exists(group);
     assert!(signalled.is_ok(), "{signalled:?}");
-    assert!(matches!(exists, Ok(false)), "{exists:?}");
+    #[cfg(target_os = "macos")]
+    assert!(matches!(before_reap, Ok(false)), "{before_reap:?}");
+    #[cfg(target_os = "linux")]
+    assert!(matches!(before_reap, Ok(true)), "{before_reap:?}");
+    assert!(matches!(after_reap, Ok(false)), "{after_reap:?}");
+}
+
+#[test]
+fn eperm_is_harmless_only_without_a_live_member() {
+    use nix::errno::Errno;
+    let unreachable = || -> io::Result<bool> { panic!("only EPERM consults membership") };
+    assert_eq!(
+        killpg_outcome(Ok(()), unreachable).unwrap(),
+        KillOutcome::Delivered
+    );
+    assert_eq!(
+        killpg_outcome(Err(Errno::ESRCH), unreachable).unwrap(),
+        KillOutcome::NoGroup
+    );
+    assert_eq!(
+        killpg_outcome(Err(Errno::EPERM), || Ok(false)).unwrap(),
+        KillOutcome::ZombieOnly
+    );
+    // A live member we may not signal (e.g. another UID) stays an error at
+    // both call sites, which share this classification.
+    let live = killpg_outcome(Err(Errno::EPERM), || Ok(true));
+    assert_eq!(live.unwrap_err().raw_os_error(), Some(Errno::EPERM as i32));
+    assert!(killpg_outcome(Err(Errno::EPERM), || Err(io::Error::other("scan failed"))).is_err());
+    assert!(killpg_outcome(Err(Errno::EINVAL), unreachable).is_err());
 }
 
 #[test]
