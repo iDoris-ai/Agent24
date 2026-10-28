@@ -5,6 +5,8 @@ All notable changes to Agent24 are documented here. This project adheres to
 
 ## [Unreleased]
 
+- **iDoris v0.4.0 余量确认（行为变化提示）**：设置了 `IDORIS_ALLOCATED_BUDGET_BYTES` 且额度紧张时，以前能直接加载的模型可能返回 503 `headroom_confirmation_required`，需要用户确认后带 `X-iDoris-Headroom-Breach: confirmed` 重发。Agent24 的确认交互登记为 ID-HR，在此之前这类请求会显示为 iDoris 不可用。
+
 - **iDoris 契约版本检查放宽为 1.x 且 ≥1.0.1**（`agent24-models`）：原先要求 `contract_version` 恰为 `1.0.1`，现解析为三个整数，接受 major==1 且 ≥1.0.1，为 iDoris v0.4.0（契约 1.1.0，仅在 `/capabilities` 加可选字段）做准备；major≠1、低于 1.0.1、解析失败与预发布后缀仍拒绝，错误消息带收到的版本与期望范围（不含 key）。
 - **iDoris v0.3.2 的 `502 upstream_auth_failed` 映射为终态（ID-ERR-1）**：`IdorisClient::send()` 对 502
   可取消地读至多 4 KiB body，仅看 `error.reason_code`/`error.type`；等于 `upstream_auth_failed` 时返回
