@@ -163,6 +163,7 @@ fn error_from_frame(frame: &Value) -> EnrollError {
             "Approval requires the Agent24 desktop app to be open: open Agent24 and try again."
                 .to_owned()
         }
+        "not_elevated_operation" => "This action can't be approved from the CLI yet".to_owned(),
         "presence_denied" => "The request was denied in the Agent24 app.".to_owned(),
         "presence_timeout" => "Timed out waiting for approval in the Agent24 app.".to_owned(),
         "generation_mismatch" => {
@@ -319,6 +320,17 @@ impl Session {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn not_elevated_operation_keeps_code_and_explains_cli_limit() {
+        let err =
+            error_from_frame(&json!({"code":"not_elevated_operation","message":"daemon text"}));
+        assert_eq!(err.code, "not_elevated_operation");
+        assert_eq!(
+            err.message,
+            "This action can't be approved from the CLI yet"
+        );
+    }
 
     async fn reject_elevation_frames(frames: Vec<Value>) {
         let (client, server) = UnixStream::pair().unwrap();

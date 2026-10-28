@@ -71,6 +71,16 @@ impl EnrollEndpoint {
         generation: String,
         authority: Arc<dyn EnrollAuthority>,
     ) {
+        #[cfg(feature = "test-enrollment")]
+        if crate::enroll_test_support::enabled() {
+            self.serve_with_identity(
+                stop,
+                generation,
+                authority,
+                Arc::new(crate::enroll_test_support::UnsignedIdentity),
+            );
+            return;
+        }
         self.serve_with_identity(
             stop,
             generation,

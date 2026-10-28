@@ -2153,6 +2153,10 @@ pub async fn serve(
         mcp_servers,
         packages_root: Arc::clone(&packages_root),
     });
+    #[cfg(feature = "test-enrollment")]
+    if crate::enroll_test_support::enabled() {
+        state.presence_provider = Some(Arc::new(crate::enroll_test_support::TestPresence));
+    }
     if let Some(capability_store) = capability_store {
         state.enable_capability_auth(capability_store);
         state.delegations = Arc::new(crate::capabilities::delegation::Delegations::open(

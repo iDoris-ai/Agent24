@@ -26,6 +26,9 @@ mod domain;
 #[allow(dead_code, reason = "frozen CORE-2 slice seam; wired by S1/S2")]
 mod enroll_api;
 mod enroll_endpoint;
+#[cfg(feature = "test-enrollment")]
+#[path = "../tests/support/enroll.rs"]
+mod enroll_test_support;
 mod events;
 mod events_emit;
 mod grant_expiry;

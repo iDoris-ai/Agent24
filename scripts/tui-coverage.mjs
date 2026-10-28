@@ -176,7 +176,9 @@ function selfTest() {
   const m1 = check({ openapi, exemptions, cliFiles: mutated });
   expect('removing /health call turns red (getHealth uncovered)', m1.errors.some((e) => e.includes('uncovered: getHealth')));
   // method sensitivity: GET /attached -> POST-only must flag listAttachedModules
-  const m2 = cliFiles.map((s) => s.replace(/client\(\)\.get\(format!\("\{\}\/api\/v1\/attached"/g, 'client().head(format!("{}/api/v1/attached"'));
+  const m2 = cliFiles.map((s) => s
+    .replace(/client\(\)\.get\(format!\("\{\}\/api\/v1\/attached"/g, 'client().head(format!("{}/api/v1/attached"')
+    .replace(/Method::GET,(\s*)"\/api\/v1\/attached"/g, 'Method::POST,$1"/api/v1/attached"'));
   const m2r = check({ openapi, exemptions, cliFiles: m2 });
   expect('method mismatch turns red (listAttachedModules)', m2r.errors.some((e) => e.includes('uncovered: listAttachedModules')));
   // new operation: red, then exempt -> green

@@ -103,7 +103,11 @@ fn spawn_http(mode: HttpMode, posts: Arc<Mutex<Vec<HttpSeen>>>) -> u16 {
                 );
                 continue;
             }
-            assert!(line.starts_with("POST /api/v1/attached "), "{line}");
+            assert!(
+                line.starts_with("POST /api/v1/attached ")
+                    || line.starts_with("POST /api/v1/os/agentear/delegation "),
+                "{line}"
+            );
             posts.lock().unwrap().push(HttpSeen {
                 headers: headers.clone(),
                 body,
@@ -727,4 +731,43 @@ fn legacy_truncated_body_bytes_snapshot() {
     assert!(!ok);
     assert_eq!(stdout.as_bytes(), b"{\"error\":{\"code\":\"daemon_unavailable\",\"message\":\"daemon returned 403 Forbidden\"}}\n");
     assert_eq!(stderr.as_bytes(), b"error: daemon returned 403 Forbidden\n");
+}
+
+#[test]
+fn not_elevated_operation_preserves_json_code_and_explains_limit() {
+    assert_presence_failure(
+        "not_elevated_operation",
+        Some("This action can't be approved from the CLI yet"),
+    );
+}
+
+#[test]
+fn capabilities_delegate_elevates_on_enrolled_connection() {
+    let home = tmp_home();
+    let fake = start(
+        HttpMode::ElevateThenCreate,
+        script(pending_then(elevated())),
+        home.path(),
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_agent24"))
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home.path())
+        .args(["os", "delegate", "agentear"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let posts = fake.posts.lock().unwrap();
+    assert_eq!(posts.len(), 2);
+    assert!(posts[0].body.is_empty());
+    assert_eq!(posts[0].body, posts[1].body);
+    assert_eq!(posts[1].headers["x-agent24-elevation"], GRANT);
+    let frames = fake.frames.lock().unwrap();
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[1]["path"], "/api/v1/os/agentear/delegation");
+    assert_eq!(frames[1]["body_sha256"], sha256_hex(b""));
 }

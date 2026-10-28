@@ -919,16 +919,20 @@ async fn finish(mut ep: Endpoint) {
 /// `Ok(None)` if no live daemon is discoverable or healthy. `Err` is a daemon
 /// that is up but must not be used; callers keep that error and do not send.
 async fn attach_only() -> Result<Option<Endpoint>, String> {
+    attach_only_with_enrollment(false).await
+}
+
+async fn attach_only_with_enrollment(enroll: bool) -> Result<Option<Endpoint>, String> {
     match state_file::read_live() {
-        Some(state) => attach_only_from(&state).await,
+        Some(state) => attach_only_from(&state, enroll).await,
         None => Ok(None),
     }
 }
 
-async fn attach_only_from(state: &DaemonState) -> Result<Option<Endpoint>, String> {
+async fn attach_only_from(state: &DaemonState, enroll: bool) -> Result<Option<Endpoint>, String> {
     // Same checks as `connect`: probe `/health` first, then the live
     // advertisement. `Ok(None)` only when there is nothing to attach to.
-    match attach_discovered_with(state, false).await {
+    match attach_discovered_with(state, enroll).await {
         DiscoveredAttach::Ready(endpoint) => Ok(Some(endpoint)),
         DiscoveredAttach::Unreachable => Ok(None),
         // Capability discovery has no host bearer. Callers already treat that
@@ -2201,35 +2205,37 @@ fn resolve_allow_relax(allow_remote: bool) -> bool {
 /// `agent24 os delegate <name>` (CORE-2 §10 R1). Only a resident daemon holds
 /// delegation records, so this never starts an ephemeral one.
 async fn cmd_os_delegate(name: &str) -> Result<(), String> {
-    let ep = match attach_only().await {
+    let ep = match attach_only_with_enrollment(true).await {
         Ok(Some(ep)) => ep,
         Err(err) => return Err(err),
         Ok(None) => {
             return Err("daemon not running; start it with `agent24 daemon start`".to_owned());
         }
     };
-    let sent = bearer(
+    let sent = send_elevating(
         &ep,
-        client().post(format!("{}/api/v1/os/{name}/delegation", ep.base)),
+        reqwest::Method::POST,
+        &format!("/api/v1/os/{name}/delegation"),
+        None,
+        Duration::from_secs(10),
+        false,
     )
-    .timeout(Duration::from_secs(10))
-    .send()
     .await;
     let out = match sent {
-        Ok(res) if res.status().is_success() => {
+        Ok(res) if res.status.is_success() => {
             println!("delegated {name}: first-party clients may now write to its current routes");
             Ok(())
         }
         Ok(res) => {
-            let status = res.status();
-            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            let status = res.status;
+            let body: serde_json::Value = res.json_value().await;
             Err(if body["error"]["message"].as_str().is_some() {
                 daemon_error_line(&body)
             } else {
                 format!("daemon returned {status}")
             })
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(e.parts().1),
     };
     finish(ep).await;
     out
@@ -3947,7 +3953,7 @@ mod tests {
         let (port, _) = thread_stub(json_reply(body));
         let state =
             DaemonState::new_legacy(port, "tok", std::process::id(), "9.9.9", "gen").unwrap();
-        match attach_only_from(&state).await {
+        match attach_only_from(&state, false).await {
             Err(err) => {
                 assert!(err.contains("协议版本不兼容"), "{err}");
                 assert!(err.contains("daemon 协议版本 2"), "{err}");
@@ -3971,7 +3977,7 @@ mod tests {
         let (port, _) = thread_stub(json_reply(&body));
         let state =
             DaemonState::new_legacy(port, "tok", std::process::id(), "0.5.1", "gen").unwrap();
-        let endpoint = attach_only_from(&state)
+        let endpoint = attach_only_from(&state, false)
             .await
             .expect("a matching daemon is not an error")
             .expect("a matching daemon is attached");
