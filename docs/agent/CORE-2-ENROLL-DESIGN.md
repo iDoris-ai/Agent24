@@ -236,6 +236,8 @@ ADR-037 决策 5 写「签名加公证流程已跑通」。facts §4 只证实�
 | GET | /comm/groupchat/{group_id}/messages/{logical_id} | CommRead | 日常 |
 | POST | /comm/groupchat/{group_id}/messages/{logical_id}/retry | CommWrite | 提升 |
 | POST | /comm/groupchat/invites/{invite_id}/accept | CommWrite | 提升 |
+| GET | /presence/challenges/next | PresenceRead | 日常（仅 ProductHost；AgentEar 纵切 §3.4） |
+| POST | /presence/challenges/{id} | PresenceDecide | 日常（仅 ProductHost；AgentEar 纵切 §3.4） |
 | PUT | /host/knowledge/bindings/{binding_id} | KnowledgeHost | 提升 |
 | DELETE | /host/knowledge/bindings/{binding_id} | KnowledgeHost | 提升 |
 | PUT | /host/knowledge/bindings/{binding_id}/credential | KnowledgeHost | 提升 |

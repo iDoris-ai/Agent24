@@ -113,6 +113,8 @@ const POLICIES: &[RoutePolicy] = &[
     row("DELETE", "/api/v1/host/knowledge/bindings/{binding_id}", Operation::KnowledgeHost, AssuranceLevel::Elevated),
     row("PUT", "/api/v1/host/knowledge/bindings/{binding_id}/credential", Operation::KnowledgeHost, AssuranceLevel::Elevated),
     row("DELETE", "/api/v1/host/knowledge/bindings/{binding_id}/credential", Operation::KnowledgeHost, AssuranceLevel::Elevated),
+    row("GET", "/api/v1/presence/challenges/next", Operation::PresenceRead, AssuranceLevel::Everyday),
+    row("POST", "/api/v1/presence/challenges/{id}", Operation::PresenceDecide, AssuranceLevel::Everyday),
     row("GET", "/api/v1/shutdown", Operation::ConfigRead, AssuranceLevel::Everyday),
     row("POST", "/api/v1/sessions", Operation::SessionCreate, AssuranceLevel::Everyday),
     row("GET", "/api/v1/sessions", Operation::SessionRead, AssuranceLevel::Everyday),

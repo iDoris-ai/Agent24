@@ -1,10 +1,11 @@
 // Agent24 main process entry — M2: integrates BackendManager daemon.
 
-import { app, BrowserWindow, Menu, Tray, WebContentsView, nativeImage, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, dialog, Menu, Tray, WebContentsView, nativeImage, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
-import { BackendManager, setBundledPackaged, type BackendStatus } from './backend-manager'
+import { BackendManager, daemonConnection, setBundledPackaged, type BackendStatus } from './backend-manager'
+import { PresencePoller, defaultPresenceDeps } from './presence-poller'
 import { AgentEarEventBridge } from './agentear-events'
 import { documentsEvent } from './documents'
 import { AgentEarEventLog } from './agentear-log'
@@ -85,6 +86,8 @@ let trayTimer: NodeJS.Timeout | null = null
 let creativeServeWeb: CreativeServeWeb | null = null
 // KB-HOST-01: Knowledge logins and the daemon's private Knowledge interface.
 let knowledgeHost: KnowledgeHost | null = null
+// CORE-2 AgentEar S3: long-polls the daemon for native confirmation challenges.
+let presencePoller: PresencePoller | null = null
 let openDesignComponent: OpenDesignComponentInstaller | null = null
 let creativeView: WebContentsView | null = null
 let creativeOrigin: string | null = null
@@ -290,6 +293,21 @@ app.whenReady().then(async () => {
   // read `backendManager.status()` / `getBackendEndpoint()` live, so this
   // resolving a beat later than the old synchronous spawn is harmless.
   void backendManager.start()
+  // CORE-2 AgentEar S3: native confirmation for elevated operations. Idle until
+  // the daemon runs in capabilities mode (main then holds the ProductHost
+  // token); a daemon without the routes answers 404 and is re-checked rarely.
+  presencePoller = new PresencePoller(defaultPresenceDeps({
+    connection: daemonConnection,
+    // Parent to the main window only while it is on screen: a sheet on a
+    // hidden window (app living in the tray) would never be seen.
+    showDialog: (opts, signal) => {
+      const parent = mainWin && !mainWin.isDestroyed() && mainWin.isVisible() ? mainWin : null
+      return parent
+        ? dialog.showMessageBox(parent, { ...opts, signal })
+        : dialog.showMessageBox({ ...opts, signal })
+    },
+  }))
+  presencePoller.start()
   // safeStorage needs the app ready. The logins load once, here, before
   // anything can change them; the reason is logged, never the contents.
   knowledgeHost = new KnowledgeHost(new KnowledgeLoginStore(app.getPath('userData'), safeStorage))
@@ -445,6 +463,9 @@ app.on('before-quit', () => {
   // M5: cancel an in-flight Open Design component download rather than
   // leaving it (and its partial files) orphaned past app exit.
   openDesignComponent?.abort('Agent24 is quitting')
+  // Stop answering challenges before the daemon goes away; not awaited (a
+  // dialog that cannot be closed must not hold up quit).
+  void presencePoller?.stop()
 })
 
 app.on('will-quit', () => {

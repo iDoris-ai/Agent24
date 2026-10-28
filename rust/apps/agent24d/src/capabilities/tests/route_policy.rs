@@ -79,7 +79,7 @@ fn method(name: &str) -> Method {
 #[test]
 fn section_3_rows_match_operation_and_level() {
     let (fixed, module) = design_tables();
-    assert_eq!(fixed.len(), 91);
+    assert_eq!(fixed.len(), 93);
     assert_eq!(module.len(), 2);
 
     let mut catalog = BTreeSet::new();

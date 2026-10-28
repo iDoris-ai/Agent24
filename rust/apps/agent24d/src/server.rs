@@ -44,6 +44,9 @@ pub struct AppState {
     /// KB-HOST-01: the Knowledge bindings the product host activated, in
     /// memory only (see `crate::knowledge_host`).
     pub knowledge_host: Arc<crate::knowledge_host::KnowledgeHostRegistry>,
+    /// CORE-2 AgentEar S3: the desktop confirmation queue behind
+    /// `/api/v1/presence/challenges/*`.
+    pub presence_desktop: Arc<crate::presence_desktop::DesktopPresence>,
     /// D2 router: every model call goes through tier routing + health/cooldown,
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
@@ -677,6 +680,7 @@ impl AppState {
             auth_mode: AuthMode::LegacySingleToken,
             capabilities: None,
             knowledge_host: Arc::new(crate::knowledge_host::KnowledgeHostRegistry::default()),
+            presence_desktop: Arc::new(crate::presence_desktop::DesktopPresence::new()),
             mcp_servers: Arc::new(mcp_servers),
             router,
             tools,
@@ -1184,6 +1188,16 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             "/api/v1/host/knowledge/bindings/{binding_id}/credential",
             axum::routing::put(crate::knowledge_host::push_credential)
                 .delete(crate::knowledge_host::revoke_credential),
+        )
+        // CORE-2 AgentEar S3: the desktop main process long-polls challenges and
+        // answers them. ProductHost only; absent (404) in legacy mode.
+        .route(
+            "/api/v1/presence/challenges/next",
+            get(crate::presence_desktop::get_next),
+        )
+        .route(
+            "/api/v1/presence/challenges/{id}",
+            post(crate::presence_desktop::post_decision),
         )
         .route("/api/v1/usage", get(crate::routes::get_usage))
         .route("/api/v1/timings", get(crate::routes::get_timings))
@@ -3606,6 +3620,10 @@ pub(crate) mod tests {
         // KB-HOST-01: the desktop host's private interface (UI-BRIDGE U1.5), not a client contract.
         "/host/knowledge/bindings/{binding_id}",
         "/host/knowledge/bindings/{binding_id}/credential",
+        // CORE-2 AgentEar S3: the desktop main process's confirmation channel, ProductHost
+        // only (slice §3.4) — private to the desktop, not a client contract.
+        "/presence/challenges/next",
+        "/presence/challenges/{id}",
     ];
 
     // Module-owned contract paths appear in OpenAPI but are not literal routes
