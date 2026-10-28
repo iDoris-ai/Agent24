@@ -274,7 +274,8 @@ async fn send_then_status_reports_each_recipient_as_queued() {
     assert_eq!(s, StatusCode::OK, "{b}");
     assert_eq!(b["data"]["partial"], false);
     assert_eq!(b["data"]["recipients"].as_array().unwrap().len(), 2);
-    // a logical id Hyphae never saw is an upstream error, not a 500
+    // a logical id Hyphae never saw is a caller error (user_error, exit 1 since
+    // Hyphae v0.27.2), not a 500 and no longer an upstream 502
     let (s, _) = call(
         &fx.app,
         "GET",
@@ -282,7 +283,7 @@ async fn send_then_status_reports_each_recipient_as_queued() {
         None,
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_GATEWAY);
+    assert_eq!(s, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
