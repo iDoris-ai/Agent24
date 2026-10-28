@@ -53,7 +53,22 @@ use tokio::net::TcpListener;
 struct Fixture {
     _root: tempfile::TempDir,
     root: PathBuf,
-    proxies: std::sync::Mutex<Vec<JoinHandle<()>>>,
+}
+
+/// The fixture child must own its listeners (F3), so a test proxy cannot hold
+/// them. Ports come from 20000-29999, below every kernel ephemeral range, so
+/// no concurrent `bind(0)` can be handed one; each port is issued once per
+/// test process, and a per-process offset separates parallel worktrees.
+fn reserve_port() -> u16 {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let offset = std::process::id() as usize * 397;
+    loop {
+        let port = 20_000 + (offset + NEXT.fetch_add(1, Ordering::SeqCst)) % 10_000;
+        let port = port as u16;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 impl Fixture {
     fn new(scenario: serde_json::Value) -> Self {
@@ -89,11 +104,7 @@ impl Fixture {
         )
         .unwrap();
         fs::write(root.join("components/scenario.json"), scenario.to_string()).unwrap();
-        Self {
-            _root: temp,
-            root,
-            proxies: std::sync::Mutex::new(Vec::new()),
-        }
+        Self { _root: temp, root }
     }
     fn scenario(&self, scenario: serde_json::Value) {
         fs::write(
@@ -113,8 +124,8 @@ impl Fixture {
         config.log_dir = self.root.join("logs");
         config.diagnostic_output = true;
         config.ports = Ports {
-            data: self.proxy("data").await,
-            admin: self.proxy("admin").await,
+            data: reserve_port(),
+            admin: reserve_port(),
         };
         config.timings.ready = Duration::from_secs(3);
         config.timings.poll = Duration::from_millis(10);
@@ -137,50 +148,7 @@ impl Fixture {
         self.root.join("state/managed-process.json")
     }
 }
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        for task in self.proxies.get_mut().unwrap().drain(..) {
-            task.abort();
-        }
-    }
-}
 impl Fixture {
-    async fn proxy(&self, kind: &'static str) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let state = self.root.join("state");
-        let task = tokio::spawn(async move {
-            let mut connections = tokio::task::JoinSet::new();
-            loop {
-                let (mut downstream, _) = listener.accept().await.unwrap();
-                let state = state.clone();
-                connections.spawn(async move {
-                    // Resolve the report through the current durable PID, so
-                    // a prior generation's recycled port is never forwarded.
-                    let port =
-                        fs::read(state.join("managed-process.json"))
-                            .ok()
-                            .and_then(|bytes| {
-                                let record: ProcessRecord = serde_json::from_slice(&bytes).ok()?;
-                                let bytes =
-                                    fs::read(state.join(format!("ports-{}.json", record.pid)))
-                                        .ok()?;
-                                serde_json::from_slice::<serde_json::Value>(&bytes).ok()?[kind]
-                                    .as_u64()
-                            });
-                    if let Some(port) = port
-                        && let Ok(mut upstream) =
-                            tokio::net::TcpStream::connect(("127.0.0.1", port as u16)).await
-                    {
-                        let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
-                    }
-                });
-                while connections.try_join_next().is_some() {}
-            }
-        });
-        self.proxies.lock().unwrap().push(task);
-        port
-    }
     fn release_exit(&self) {
         fs::write(self.root.join("state/release-exit"), "exit").unwrap();
     }
@@ -833,7 +801,8 @@ async fn foreign_health_without_child_admin_never_becomes_ready() {
     });
     let result = Supervisor::start(config, inputs, || async {}).await;
     server.abort();
-    let rejected = matches!(result, Err(SupervisorError::StartupTimeout));
+    // The foreign data listener is now identified as a port conflict (L4).
+    let rejected = matches!(result, Err(SupervisorError::InstanceConflict));
     if let Ok(supervisor) = result {
         supervisor.stop().await.unwrap();
     }
@@ -873,7 +842,10 @@ async fn reaped_leader_does_not_signal_recycled_group() {
     let mut process = ManagedProcess::start(config, inputs().await.unwrap(), &lease)
         .await
         .unwrap();
-    process.child.kill().await.unwrap();
+    // Reap through the production path: observe the exit, then snapshot.
+    process.child.start_kill().unwrap();
+    process.child.wait().await.unwrap();
+    process.adopt_survivors().unwrap();
     let mut foreign = Command::new("/bin/sleep")
         .arg("60")
         .process_group(0)
@@ -882,7 +854,11 @@ async fn reaped_leader_does_not_signal_recycled_group() {
         .unwrap();
     // Model a cached PGID that now names an unrelated process group.
     process.group = Some(Pid::from_raw(foreign.id().unwrap() as i32));
-    process.finish().await.unwrap();
+    // An unproven group is neither signalled nor restarted beside.
+    assert!(matches!(
+        process.finish().await,
+        Err(SupervisorError::InstanceConflict)
+    ));
     sleep(Duration::from_millis(20)).await;
     let untouched = foreign.try_wait().unwrap().is_none();
     if untouched {
@@ -998,4 +974,243 @@ async fn recovery_waits_for_reaping_before_checking_group() {
     reaper.await.unwrap();
     assert!(result.is_ok(), "zombie group blocked recovery: {result:?}");
     assert!(!fixture.record().exists());
+}
+
+/// Serves every request with `status` and `body`, recording any bearer token.
+fn foreign_server(
+    listener: TcpListener,
+    status: u16,
+    body: String,
+    saw_bearer: Arc<std::sync::atomic::AtomicBool>,
+) -> JoinHandle<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = vec![0; 4096];
+            let read = socket.read(&mut request).await.unwrap_or(0);
+            let text = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            if text.contains("authorization: bearer") {
+                saw_bearer.store(true, Ordering::SeqCst);
+            }
+            let _ = socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        }
+    })
+}
+
+async fn foreign_ports(
+    config: &mut StartConfig,
+) -> (Arc<std::sync::atomic::AtomicBool>, [JoinHandle<()>; 2]) {
+    let data = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    config.ports = Ports {
+        data: data.local_addr().unwrap().port(),
+        admin: admin.local_addr().unwrap().port(),
+    };
+    let saw_bearer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let servers = [
+        foreign_server(data, 200, healthy().to_string(), saw_bearer.clone()),
+        // Accepts any token: a status code cannot authenticate the server.
+        foreign_server(admin, 200, "{}".into(), saw_bearer.clone()),
+    ];
+    (saw_bearer, servers)
+}
+
+#[tokio::test]
+async fn probe_foreign_data_and_admin_listeners_admit_unbound_child() {
+    let fixture = Fixture::new(serde_json::json!({"mode": "no_read"}));
+    let mut config = fixture.config().await;
+    config.timings.ready = Duration::from_millis(500);
+    let (_, servers) = foreign_ports(&mut config).await;
+    let result = Supervisor::start(config, inputs, || async {}).await;
+    servers.iter().for_each(JoinHandle::abort);
+    let admitted = result.is_ok();
+    if let Ok(supervisor) = result {
+        supervisor.stop().await.unwrap();
+    }
+    assert!(
+        !admitted,
+        "foreign data+admin listeners admitted a child that never bound"
+    );
+    assert!(!fixture.record().exists());
+}
+
+#[tokio::test]
+async fn admin_token_is_never_sent_to_an_unowned_listener() {
+    let fixture = Fixture::new(serde_json::json!({"mode": "no_read"}));
+    let mut config = fixture.config().await;
+    config.timings.ready = Duration::from_millis(500);
+    let (saw_bearer, servers) = foreign_ports(&mut config).await;
+    let result = Supervisor::start(config, inputs, || async {}).await;
+    servers.iter().for_each(JoinHandle::abort);
+    if let Ok(supervisor) = result {
+        supervisor.stop().await.unwrap();
+    }
+    assert!(
+        !saw_bearer.load(Ordering::SeqCst),
+        "Admin token sent before listener ownership was proven"
+    );
+}
+
+fn workers(fixture: &Fixture) -> Vec<u32> {
+    fs::read_to_string(fixture.root.join("state/workers.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            value["pid"].as_u64().unwrap() as u32
+        })
+        .collect()
+}
+
+/// A reclaimed worker is gone (or an unreaped zombie) within the bound.
+async fn all_dead(pids: &[u32]) -> bool {
+    let live =
+        |pid: u32| ProcessRecord::capture(pid).is_ok_and(|record| record.alive().unwrap_or(true));
+    timeout(Duration::from_secs(2), async {
+        while pids.iter().any(|pid| live(*pid)) {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+fn kill_leftovers(pids: &[u32]) {
+    for pid in pids {
+        if ProcessRecord::capture(*pid).is_ok_and(|record| record.alive().unwrap_or(false)) {
+            let _ = nix::sys::signal::kill(Pid::from_raw(*pid as i32), Signal::SIGKILL);
+        }
+    }
+}
+
+#[tokio::test]
+async fn worker_forked_after_ready_is_reclaimed_when_leader_crashes() {
+    let fixture = Fixture::new(
+        serde_json::json!({"mode": "late_worker", "wait_for_exit": true, "after": 0.0}),
+    );
+    let supervisor = Supervisor::start(fixture.config().await, inputs, || async {})
+        .await
+        .unwrap();
+    fixture.release_exit();
+    // The crash restarts; the next generation waits for a fresh release.
+    timeout(Duration::from_secs(5), async {
+        while fixture.attempts().len() < 2 && !supervisor_done(&supervisor) {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let late = workers(&fixture);
+    assert_eq!(late.len(), 1);
+    let reclaimed = all_dead(&late).await;
+    kill_leftovers(&late);
+    let _ = supervisor.stop().await;
+    assert!(
+        reclaimed,
+        "worker forked after ready survived the leader crash"
+    );
+}
+
+fn supervisor_done(supervisor: &Supervisor) -> bool {
+    supervisor.task.as_ref().is_none_or(JoinHandle::is_finished)
+}
+
+#[tokio::test]
+async fn readiness_crash_reclaims_worker_before_any_retry() {
+    let fixture = Fixture::new(serde_json::json!({"mode": "worker_then_crash_before_ready"}));
+    let config = Arc::new(fixture.config().await);
+    let lease = Lease::acquire(&config.data.state).unwrap();
+    let result = ManagedProcess::start(config, inputs().await.unwrap(), &lease).await;
+    assert!(
+        matches!(result, Err(SupervisorError::Failed { code: None })),
+        "{:?}",
+        result.as_ref().err()
+    );
+    let survivors = workers(&fixture);
+    assert_eq!(survivors.len(), 1);
+    let reclaimed = all_dead(&survivors).await;
+    kill_leftovers(&survivors);
+    assert!(reclaimed, "readiness-phase stop left the worker running");
+}
+
+#[tokio::test]
+async fn stop_reports_forced_only_after_killing_survivors() {
+    let fixture = Fixture::new(
+        serde_json::json!({"mode": "late_worker", "wait_for_exit": true, "after": 0.0}),
+    );
+    let config = Arc::new(fixture.config().await);
+    let lease = Lease::acquire(&config.data.state).unwrap();
+    let mut process = ManagedProcess::start(config, inputs().await.unwrap(), &lease)
+        .await
+        .unwrap();
+    fixture.release_exit();
+    timeout(Duration::from_secs(3), async {
+        while workers(&fixture).is_empty() {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let survivors = workers(&fixture);
+    let forced = process.stop().await;
+    let reclaimed = all_dead(&survivors).await;
+    kill_leftovers(&survivors);
+    assert!(matches!(forced, Ok(true)), "{forced:?}");
+    assert!(reclaimed, "stop reported forced=true but killed nothing");
+}
+
+#[tokio::test]
+async fn dead_leader_with_live_group_keeps_record() {
+    let fixture = Fixture::new(serde_json::json!({}));
+    // sh leads the group; its background sleep stays in it after sh exits.
+    let mut leader = Command::new("/bin/sh")
+        .args(["-c", "sleep 60 & read line"])
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = leader.id().unwrap();
+    let group = Pid::from_raw(pid as i32);
+    timeout(Duration::from_secs(2), async {
+        while ProcessRecord::group_members(group).unwrap().len() < 2 {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let record = ProcessRecord::capture(pid).unwrap();
+    drop(leader.stdin.take());
+    leader.wait().await.unwrap();
+    let lease = Lease::acquire(&fixture.root.join("state")).unwrap();
+    lease.write(&record).unwrap();
+    let timings = Timings {
+        terminate: Duration::from_millis(100),
+        ..Timings::default()
+    };
+    let result = lease
+        .recover(&timings, &CancellationToken::new(), &record.executable)
+        .await;
+    let survived = group_exists(group).unwrap();
+    let _ = killpg(group, Signal::SIGKILL);
+    assert!(survived, "fixture group vanished early");
+    assert!(
+        matches!(result, Err(SupervisorError::InstanceConflict)),
+        "{result:?}"
+    );
+    assert!(
+        fixture.record().exists(),
+        "cleared a record whose group lives"
+    );
 }

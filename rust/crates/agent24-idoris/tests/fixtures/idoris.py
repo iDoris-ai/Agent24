@@ -62,6 +62,32 @@ if mode == 'stubborn_descendant':
     os.close(read_fd)
     (state / 'descendant.json').write_text(json.dumps({'pid': descendant}))
 
+def fork_worker():
+    """A TERM-ignoring worker in the leader's group, recorded by PID."""
+    read_fd, write_fd = os.pipe()
+    worker = os.fork()
+    if worker == 0:
+        os.close(read_fd)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        # Keep inherited listeners (as a real runtime worker would), but not
+        # the log pipes, so a surviving worker cannot stall log draining.
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        os.write(write_fd, b'1')
+        os.close(write_fd)
+        while True:
+            time.sleep(1)
+    os.close(write_fd)
+    os.read(read_fd, 1)
+    os.close(read_fd)
+    with (state / 'workers.jsonl').open('a') as output:
+        output.write(json.dumps({'leader': os.getpid(), 'pid': worker}) + '\n')
+
+if mode == 'worker_then_crash_before_ready':
+    fork_worker()
+    os.kill(os.getpid(), signal.SIGKILL)
+
 health = {
     'status': 'ok', 'service': 'idoris', 'version': '0.4.0',
     'contract_version': scenario.get('contract', '1.3.0'),
@@ -70,6 +96,9 @@ health = {
 health.update(scenario.get('health', {}))
 for field in scenario.get('missing', []):
     health.pop(field, None)
+
+# Set once the supervisor's authorized Admin probe got its 200, i.e. readiness.
+ready = threading.Event()
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -86,30 +115,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+        if self.server.is_admin and authorized and status == 200:
+            ready.set()
     def log_message(self, *_):
         pass
 
 class Server(http.server.HTTPServer):
     allow_reuse_address = True
 
-# Bind ephemeral ports directly. Rust keeps stable proxy listeners reserved
-# throughout each fixture's lifetime, forwarding only to these reported ports.
-server = Server(('127.0.0.1', 0), Handler)
+# Bind the configured ports directly, as the real serve does: the supervisor
+# must find this process group holding both listeners before readiness.
+server = Server(('127.0.0.1', int(os.environ['IDORIS_PORT'])), Handler)
 server.is_admin = False
-admin = Server(('127.0.0.1', 0), Handler)
+admin = Server(('127.0.0.1', int(os.environ['IDORIS_ADMIN_PORT'])), Handler)
 admin.is_admin = True
-ports = state / 'ports.tmp'
-ports.write_text(json.dumps({'data': server.server_port, 'admin': admin.server_port}))
-ports.replace(state / f'ports-{os.getpid()}.json')
 threading.Thread(target=admin.serve_forever, daemon=True).start()
 
 def exit_when_requested(action):
+    # Timed exits count from readiness, not process start, so a slower
+    # readiness check cannot turn an after-ready crash into a startup one.
+    ready.wait()
     if scenario.get('wait_for_exit'):
         while not (state / 'release-exit').exists():
             time.sleep(0.005)
     time.sleep(scenario.get('after', 0.15))
     action()
 
+def late_worker_then_crash():
+    # Consume the release so the next generation waits for a new one.
+    (state / 'release-exit').unlink()
+    fork_worker()
+    os.kill(os.getpid(), signal.SIGKILL)
+
+if mode == 'late_worker':
+    threading.Thread(target=exit_when_requested, args=(late_worker_then_crash,), daemon=True).start()
 if mode == 'crash':
     threading.Thread(target=exit_when_requested, args=(lambda: os.kill(os.getpid(), signal.SIGKILL),), daemon=True).start()
 if mode == 'exit_after_ready':

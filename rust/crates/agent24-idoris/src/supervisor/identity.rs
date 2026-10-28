@@ -294,6 +294,15 @@ impl Lease {
         // ESRCH or a different start time means the recorded process is gone.
         // Never signal the new owner of a recycled PID, even if its path matches.
         if !record.alive()? {
+            // A dead leader does not prove a dead group: a TERM-ignoring
+            // worker keeps the PGID. Kernels never hand out a PID that still
+            // names a process group, so a reused PID proves the group emptied.
+            // Otherwise wait briefly for reaping, then keep the record.
+            let reused = ProcessRecord::capture(record.pid)
+                .is_ok_and(|current| current.start_time != record.start_time);
+            if !reused {
+                wait_group_gone(record.pid, timings.terminate.min(Duration::from_secs(5))).await?;
+            }
             self.clear()?;
             return Ok(());
         }
@@ -312,21 +321,133 @@ impl Lease {
                 return Err(SupervisorError::InstanceConflict);
             }
         }
-        let group_deadline = Instant::now() + Duration::from_secs(5);
-        while super::group_exists(Pid::from_raw(record.pid as i32))
-            .map_err(|_| SupervisorError::InstanceConflict)?
-        {
-            // A zombie leader retains its group until its parent reaps it.
-            // Allow reaping to complete without sending any further signals.
-            if Instant::now() >= group_deadline {
-                // Unknown descendants cannot authorize group signalling.
-                return Err(SupervisorError::InstanceConflict);
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
+        // A zombie leader retains its group until its parent reaps it.
+        // Allow reaping to complete without sending any further signals.
+        wait_group_gone(record.pid, Duration::from_secs(5)).await?;
         self.clear()?;
         Ok(())
     }
+}
+
+/// Unknown descendants cannot authorize group signalling: a group that
+/// outlives the bound keeps the record and fails closed.
+async fn wait_group_gone(pid: u32, bound: Duration) -> Result<(), SupervisorError> {
+    let group = Pid::from_raw(i32::try_from(pid).map_err(|_| SupervisorError::InstanceConflict)?);
+    let deadline = Instant::now() + bound;
+    while super::group_exists(group).map_err(|_| SupervisorError::InstanceConflict)? {
+        if Instant::now() >= deadline {
+            return Err(SupervisorError::InstanceConflict);
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+/// Every process visibly holding a TCP LISTEN socket on `port`, on any local
+/// address. `unattributed` reports a listener whose holder is not visible.
+pub(super) struct Listeners {
+    pub pids: Vec<u32>,
+    pub unattributed: bool,
+}
+
+/// macOS: `unsafe_code` is forbidden in this crate, and libproc exposes the
+/// socket port only through a C union, so the SIP-protected lsof does the
+/// per-PID socket walk. It cannot see other users' descriptors.
+#[cfg(target_os = "macos")]
+pub(super) async fn listeners(port: u16, bound: Duration) -> io::Result<Listeners> {
+    let output = tokio::time::timeout(
+        bound,
+        tokio::process::Command::new("/usr/sbin/lsof")
+            .env_clear()
+            .args(["-nP", "-w", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fp"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| io::Error::other("listener query timed out"))??;
+    // Exit 1 with no output is lsof's "no matching file"; anything else
+    // unexplained cannot prove ownership.
+    let none =
+        output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty();
+    if !output.status.success() && !none {
+        return Err(io::Error::other("listener query failed"));
+    }
+    let text = std::str::from_utf8(&output.stdout).map_err(io::Error::other)?;
+    let mut pids = Vec::new();
+    for line in text.lines() {
+        if let Some(pid) = line.strip_prefix('p') {
+            pids.push(pid.parse().map_err(io::Error::other)?);
+        }
+    }
+    Ok(Listeners {
+        pids,
+        unattributed: false,
+    })
+}
+#[cfg(target_os = "linux")]
+pub(super) async fn listeners(port: u16, _bound: Duration) -> io::Result<Listeners> {
+    let mut sockets = std::collections::BTreeSet::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let text = match fs::read_to_string(table) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for line in text.lines().skip(1) {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let (Some(local), Some(state), Some(inode)) =
+                (fields.get(1), fields.get(3), fields.get(9))
+            else {
+                return Err(io::Error::other("invalid socket table"));
+            };
+            let local_port = local
+                .rsplit_once(':')
+                .and_then(|(_, hex)| u16::from_str_radix(hex, 16).ok());
+            // 0A is TCP_LISTEN.
+            if *state == "0A" && local_port == Some(port) {
+                sockets.insert(format!("socket:[{inode}]"));
+            }
+        }
+    }
+    let mut pids = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    if !sockets.is_empty() {
+        for entry in fs::read_dir("/proc")? {
+            let Some(pid) = entry?
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(descriptors) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+                continue;
+            };
+            let mut holds = false;
+            for descriptor in descriptors.flatten() {
+                if let Ok(target) = fs::read_link(descriptor.path())
+                    && let Some(target) = target.to_str()
+                    && sockets.contains(target)
+                {
+                    seen.insert(target.to_owned());
+                    holds = true;
+                }
+            }
+            if holds {
+                pids.push(pid);
+            }
+        }
+    }
+    Ok(Listeners {
+        pids,
+        unattributed: seen.len() != sockets.len(),
+    })
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(super) async fn listeners(_port: u16, _bound: Duration) -> io::Result<Listeners> {
+    Err(io::Error::other("unsupported listener ownership platform"))
 }
 use std::time::Duration;
 
