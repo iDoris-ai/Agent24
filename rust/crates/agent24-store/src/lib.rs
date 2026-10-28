@@ -171,6 +171,12 @@ pub struct Store {
 }
 
 impl Store {
+    /// Shut down this pool and await its connections, including pooled clones.
+    /// Offline callers must keep their singleton lock until this completes.
+    pub async fn close(self) {
+        self.pool.close().await;
+    }
+
     /// Open (creating if needed) a database file and run migrations.
     pub async fn open(path: &Path) -> Result<Self> {
         StoreConn::migrate(path, PhaseFault::none())
