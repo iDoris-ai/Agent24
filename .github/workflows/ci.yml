@@ -13,6 +13,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  hyphae-linux-x64:
+    uses: ./.github/workflows/hyphae-lock-verify.yml
+
+  hyphae-darwin-arm64:
+    uses: ./.github/workflows/hyphae-lock-verify.yml
+    with:
+      platform: darwin-arm64
+
   typecheck-test:
     name: Typecheck + Test
     runs-on: ubuntu-latest
@@ -50,6 +58,7 @@ jobs:
 
   rust:
     name: Rust (fmt + clippy + test)
+    needs: hyphae-linux-x64
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -79,9 +88,28 @@ jobs:
         working-directory: rust
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Download verified Hyphae linux-x64
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: hyphae-linux-x64
+          path: ${{ runner.temp }}/hyphae-linux-x64
+
+      - name: Verify and enable Hyphae integration tests
+        run: |
+          set -euo pipefail
+          expected=$(jq -er '.binaries["linux-x64"]' rust/crates/agent24-comm/hyphae.lock.json)
+          bin="$RUNNER_TEMP/hyphae-linux-x64/hyphae"
+          printf '%s  %s\n' "$expected" "$bin" | shasum -a 256 --check
+          chmod +x "$bin"
+          echo "HYPHAE_TEST_BIN=$bin" >> "$GITHUB_ENV"
+
       - name: test
         working-directory: rust
-        run: cargo test --workspace
+        run: cargo test --workspace -- --show-output
+
+      - name: Real Hyphae unlock
+        working-directory: rust
+        run: cargo test -p agent24-comm --test unlock_real_binary -- --ignored --nocapture
 
       - name: Events schema drift (Rust is the generation source since B4)
         working-directory: rust
@@ -99,6 +127,7 @@ jobs:
 
   rust-macos:
     name: Rust macOS (clippy + test)
+    needs: hyphae-darwin-arm64
     runs-on: macos-latest
     timeout-minutes: 30
 
@@ -126,9 +155,28 @@ jobs:
         working-directory: rust
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Download verified Hyphae darwin-arm64
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: hyphae-darwin-arm64
+          path: ${{ runner.temp }}/hyphae-darwin-arm64
+
+      - name: Verify and enable Hyphae integration tests
+        run: |
+          set -euo pipefail
+          expected=$(jq -er '.binaries["darwin-arm64"]' rust/crates/agent24-comm/hyphae.lock.json)
+          bin="$RUNNER_TEMP/hyphae-darwin-arm64/hyphae"
+          printf '%s  %s\n' "$expected" "$bin" | shasum -a 256 --check
+          chmod +x "$bin"
+          echo "HYPHAE_TEST_BIN=$bin" >> "$GITHUB_ENV"
+
       - name: test
         working-directory: rust
-        run: cargo test --workspace
+        run: cargo test --workspace -- --show-output
+
+      - name: Real Hyphae unlock
+        working-directory: rust
+        run: cargo test -p agent24-comm --test unlock_real_binary -- --ignored --nocapture
 
   contract:
     name: Contract Tests + Codegen Drift
