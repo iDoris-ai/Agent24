@@ -111,15 +111,14 @@ async fn read_frame(r: &mut BufReader<OwnedReadHalf>) -> Result<Value, EnrollErr
             "the daemon closed the enrolment connection",
         ));
     }
+    if n > MAX_FRAME_BYTES {
+        return Err(EnrollError::new("bad_frame", "daemon frame exceeds 16 KiB"));
+    }
     if line.last() != Some(&b'\n') {
-        return Err(if line.len() > MAX_FRAME_BYTES {
-            EnrollError::new("bad_frame", "daemon frame exceeds 16 KiB")
-        } else {
-            EnrollError::new(
-                "daemon_unavailable",
-                "the daemon closed the enrolment connection mid-frame",
-            )
-        });
+        return Err(EnrollError::new(
+            "daemon_unavailable",
+            "the daemon closed the enrolment connection mid-frame",
+        ));
     }
     line.pop();
     let frame: Value = serde_json::from_slice(&line)
@@ -272,14 +271,25 @@ impl Session {
             .await?;
             match frame["op"].as_str() {
                 Some("elevation_pending") => {
-                    pending_id = frame["challenge_id"].as_str().map(str::to_owned);
+                    if pending_id.is_some() {
+                        return Err(EnrollError::new(
+                            "bad_frame",
+                            "duplicate elevation_pending frame",
+                        ));
+                    }
+                    let id = frame["challenge_id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .ok_or_else(|| {
+                            EnrollError::new("bad_frame", "pending frame carries no challenge id")
+                        })?;
+                    pending_id = Some(id.to_owned());
                 }
                 Some("elevated") => {
-                    // When the daemon announced a challenge id, the grant must
-                    // belong to it.
-                    if let (Some(p), Some(g)) = (&pending_id, frame["challenge_id"].as_str())
-                        && p != g
-                    {
+                    let matches_pending = pending_id
+                        .as_deref()
+                        .is_some_and(|id| frame["challenge_id"].as_str() == Some(id));
+                    if !matches_pending {
                         return Err(EnrollError::new(
                             "bad_frame",
                             "elevated frame does not match the pending challenge",
@@ -306,8 +316,105 @@ impl Session {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    async fn reject_elevation_frames(frames: Vec<Value>) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (read, write) = client.into_split();
+        let session = Session {
+            token: Zeroizing::new("test-token".to_owned()),
+            conn: tokio::sync::Mutex::new(Conn {
+                reader: BufReader::new(read),
+                writer: write,
+            }),
+        };
+        let (read, mut write) = server.into_split();
+        let peer = tokio::spawn(async move {
+            let mut request = String::new();
+            BufReader::new(read).read_line(&mut request).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&request).unwrap()["op"],
+                "elevate"
+            );
+            for frame in frames {
+                let _ = write.write_all(format!("{frame}\n").as_bytes()).await;
+            }
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            session.elevate("POST", "/api/v1/attached", b"{}"),
+        )
+        .await
+        .unwrap();
+        peer.await.unwrap();
+        assert_eq!(result.unwrap_err().code, "bad_frame");
+    }
+
+    fn pending(id: Value) -> Value {
+        json!({"v":1,"op":"elevation_pending","challenge_id":id})
+    }
+    fn granted(id: Value) -> Value {
+        json!({"v":1,"op":"elevated","challenge_id":id,"grant":"test-grant"})
+    }
+
+    #[tokio::test]
+    async fn elevated_requires_pending() {
+        reject_elevation_frames(vec![granted(json!("a"))]).await;
+    }
+    #[tokio::test]
+    async fn pending_requires_id() {
+        reject_elevation_frames(vec![pending(Value::Null), granted(json!("a"))]).await;
+    }
+    #[tokio::test]
+    async fn elevated_requires_id() {
+        reject_elevation_frames(vec![pending(json!("a")), granted(Value::Null)]).await;
+    }
+    #[tokio::test]
+    async fn pending_cannot_be_replaced() {
+        reject_elevation_frames(vec![
+            pending(json!("a")),
+            pending(json!("b")),
+            granted(json!("b")),
+        ])
+        .await;
+    }
+    #[tokio::test]
+    async fn elevated_requires_matching_id() {
+        reject_elevation_frames(vec![pending(json!("a")), granted(json!("b"))]).await;
+    }
+
+    async fn sized_frame(size: usize) -> Result<Value, EnrollError> {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (read, _) = client.into_split();
+        let mut bytes = br#"{"v":1,"padding":""}"#.to_vec();
+        bytes.splice(
+            bytes.len() - 2..bytes.len() - 2,
+            std::iter::repeat_n(b'x', size - bytes.len() - 1),
+        );
+        bytes.push(b'\n');
+        assert_eq!(bytes.len(), size);
+        let writer = tokio::spawn(async move {
+            server.write_all(&bytes).await.unwrap();
+        });
+        let result = read_frame(&mut BufReader::new(read)).await;
+        writer.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn frame_including_newline_at_limit_is_accepted() {
+        assert!(sized_frame(MAX_FRAME_BYTES).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn frame_including_newline_over_limit_is_rejected() {
+        assert_eq!(
+            sized_frame(MAX_FRAME_BYTES + 1).await.unwrap_err().code,
+            "bad_frame"
+        );
+    }
 
     #[test]
     fn body_hash_is_lowercase_hex_of_exact_bytes() {

@@ -971,20 +971,37 @@ fn bearer(ep: &Endpoint, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder
     }
 }
 
-/// A buffered daemon reply (status plus the whole body), so the elevation
-/// logic can inspect a 403 body and still hand the reply to the caller.
+/// Legacy replies retain reqwest's decoding and body-read error semantics.
+/// Capabilities replies are buffered to inspect the presence_required code.
 struct Reply {
     status: reqwest::StatusCode,
-    body: Vec<u8>,
+    body: ReplyBody,
+}
+
+enum ReplyBody {
+    Legacy(reqwest::Response),
+    Buffered(Vec<u8>),
 }
 
 impl Reply {
-    fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
-        serde_json::from_slice(&self.body)
+    async fn json<T: serde::de::DeserializeOwned>(self) -> Result<T, String> {
+        match self.body {
+            ReplyBody::Legacy(res) => res.json().await.map_err(|e| e.to_string()),
+            ReplyBody::Buffered(body) => serde_json::from_slice(&body).map_err(|e| e.to_string()),
+        }
     }
 
-    fn json_value(&self) -> serde_json::Value {
-        serde_json::from_slice(&self.body).unwrap_or_default()
+    async fn json_value(self) -> serde_json::Value {
+        self.json().await.unwrap_or_default()
+    }
+
+    fn presence_required(&self) -> bool {
+        self.status == reqwest::StatusCode::FORBIDDEN
+            && match &self.body {
+                ReplyBody::Buffered(body) => serde_json::from_slice::<serde_json::Value>(body)
+                    .is_ok_and(|value| value["error"]["code"] == "presence_required"),
+                ReplyBody::Legacy(_) => false,
+            }
     }
 }
 
@@ -1040,15 +1057,15 @@ async fn send_elevating(
         }
         rb
     };
-    let first = read_reply(build(None).send().await)
-        .await
-        .map_err(SendError::Http)?;
+    let response = build(None).send().await.map_err(SendError::Http)?;
     let Some(session) = &ep.session else {
-        return Ok(first);
+        return Ok(Reply {
+            status: response.status(),
+            body: ReplyBody::Legacy(response),
+        });
     };
-    let presence_required = first.status == reqwest::StatusCode::FORBIDDEN
-        && first.json_value()["error"]["code"] == "presence_required";
-    if !presence_required {
+    let first = read_reply(Ok(response)).await.map_err(SendError::Http)?;
+    if !first.presence_required() {
         return Ok(first);
     }
     let grant = session
@@ -1066,7 +1083,10 @@ async fn read_reply(
     let res = sent?;
     let status = res.status();
     let body = res.bytes().await?.to_vec();
-    Ok(Reply { status, body })
+    Ok(Reply {
+        status,
+        body: ReplyBody::Buffered(body),
+    })
 }
 
 async fn cmd_chat(message: String, model: Option<String>) -> Result<(), String> {
@@ -2233,7 +2253,7 @@ async fn cmd_attach_add(
     // already comes from returning `Err` below, `main` maps that to
     // `ExitCode::FAILURE`.
     let out = match sent {
-        Ok(res) if res.status.is_success() => match res.json::<AttachedAddResponse>() {
+        Ok(res) if res.status.is_success() => match res.json::<AttachedAddResponse>().await {
             Ok(body) => match serde_json::to_string(&body) {
                 Ok(text) => {
                     if json {
@@ -2266,7 +2286,7 @@ async fn cmd_attach_add(
         },
         Ok(res) => {
             let status = res.status;
-            let body = res.json_value();
+            let body = res.json_value().await;
             if json {
                 println!("{}", error_envelope_or(status, &body));
             }
@@ -2325,7 +2345,7 @@ async fn cmd_attach_list(json: bool) -> Result<(), String> {
     // reasons (must not skip `finish(ep)`; `--json` must still emit exactly
     // one JSON object even on an unreadable/unresizable 2xx body).
     let out = match sent {
-        Ok(res) if res.status.is_success() => match res.json::<AttachedList>() {
+        Ok(res) if res.status.is_success() => match res.json::<AttachedList>().await {
             Ok(body) => match serde_json::to_string(&body) {
                 Ok(text) => {
                     if json {
@@ -2353,7 +2373,7 @@ async fn cmd_attach_list(json: bool) -> Result<(), String> {
         },
         Ok(res) => {
             let status = res.status;
-            let body = res.json_value();
+            let body = res.json_value().await;
             if json {
                 println!("{}", error_envelope_or(status, &body));
             }
@@ -2405,7 +2425,7 @@ async fn cmd_attach_remove(name: &str, json: bool) -> Result<(), String> {
         }
         Ok(res) => {
             let status = res.status;
-            let body = res.json_value();
+            let body = res.json_value().await;
             if json {
                 println!("{}", error_envelope_or(status, &body));
             }

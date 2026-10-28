@@ -41,6 +41,7 @@ enum HttpMode {
     AlwaysInvalid,
     /// 403 with a code that is not presence_required.
     OtherForbidden,
+    AlwaysPresenceRequired,
 }
 
 struct Fake {
@@ -290,8 +291,22 @@ fn run_add(home: &Path) -> (bool, String, String) {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
         .unwrap();
+    let mut child = out;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("CLI exceeded the 10 second test deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let out = child.wait_with_output().unwrap();
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -587,4 +602,129 @@ fn legacy_mode_is_unchanged_single_request_with_daemon_json_bearer() {
         stderr.is_empty(),
         "legacy prints nothing to stderr: {stderr}"
     );
+}
+
+#[test]
+fn second_presence_required_stops_after_one_elevation() {
+    let home = tmp_home();
+    let fake = start(
+        HttpMode::AlwaysPresenceRequired,
+        script(pending_then(elevated())),
+        home.path(),
+    );
+    let (ok, stdout, stderr) = run_add(home.path());
+    assert!(!ok);
+    assert_eq!(error_body(&stdout)["error"]["code"], "presence_required");
+    assert_eq!(fake.posts.lock().unwrap().len(), 2);
+    assert_eq!(
+        fake.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| f["op"] == "elevate")
+            .count(),
+        1
+    );
+    assert_no_secret(&stdout, &stderr);
+}
+
+fn assert_bad_elevation(replies: Vec<Value>) {
+    let home = tmp_home();
+    let fake = start(HttpMode::ElevateThenCreate, script(replies), home.path());
+    let (ok, stdout, stderr) = run_add(home.path());
+    assert!(!ok, "{stdout} {stderr}");
+    assert_eq!(error_body(&stdout)["error"]["code"], "bad_frame");
+    assert_eq!(fake.posts.lock().unwrap().len(), 1);
+    assert_no_secret(&stdout, &stderr);
+}
+
+#[test]
+fn elevated_without_pending_is_rejected() {
+    assert_bad_elevation(vec![elevated()]);
+}
+#[test]
+fn pending_without_id_is_rejected() {
+    assert_bad_elevation(vec![json!({"v":1,"op":"elevation_pending"}), elevated()]);
+}
+#[test]
+fn elevated_without_id_is_rejected() {
+    let mut frame = elevated();
+    frame.as_object_mut().unwrap().remove("challenge_id");
+    assert_bad_elevation(pending_then(frame));
+}
+#[test]
+fn duplicate_pending_cannot_replace_challenge() {
+    let mut replies = pending_then(elevated());
+    replies.insert(
+        0,
+        json!({"v":1,"op":"elevation_pending","challenge_id":"different"}),
+    );
+    assert_bad_elevation(replies);
+}
+#[test]
+fn mismatched_challenge_is_rejected() {
+    let mut frame = elevated();
+    frame["challenge_id"] = json!("different");
+    assert_bad_elevation(pending_then(frame));
+}
+
+fn legacy_snapshot(status: &str, body: &str, declared_len: usize) -> (bool, String, String) {
+    let home = tmp_home();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {declared_len}\r\nConnection: close\r\n\r\n{body}"
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let (line, _, _) = read_http(&mut stream).unwrap();
+            if line.starts_with("GET /api/v1/health") {
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    &json!({"protocol_version":agent24_protocol::PROTOCOL_VERSION}),
+                );
+            } else {
+                stream.write_all(response.as_bytes()).unwrap();
+                break;
+            }
+        }
+    });
+    write_daemon_json(
+        home.path(),
+        &json!({"port":port,"token":"legacy-bearer","pid":std::process::id(),"version":"9.9.9","generation":GENERATION,"protocol_version":agent24_protocol::PROTOCOL_VERSION}),
+    );
+    run_add(home.path())
+}
+
+#[test]
+fn legacy_success_bytes_snapshot() {
+    let body = format!(
+        r#"{{"name":"agentear","manifest_digest":"sha256:{}","token":"{ATTACH_TOKEN}","socket_path":"/x/attach/agent24d.sock","token_id":"tok_00000000"}}"#,
+        "0".repeat(64)
+    );
+    let (ok, stdout, stderr) = legacy_snapshot("201 Created", &body, body.len());
+    assert!(ok);
+    assert_eq!(stdout.as_bytes(), format!("{body}\n").as_bytes());
+    assert_eq!(stderr.as_bytes(), b"");
+}
+
+#[test]
+fn legacy_invalid_json_bytes_snapshot() {
+    let (ok, stdout, stderr) = legacy_snapshot("201 Created", "!", 1);
+    assert!(!ok);
+    assert_eq!(stdout.as_bytes(), b"{\"error\":{\"code\":\"daemon_unavailable\",\"message\":\"daemon returned an unreadable response: error decoding response body\"}}\n");
+    assert_eq!(
+        stderr.as_bytes(),
+        b"error: daemon returned an unreadable response: error decoding response body\n"
+    );
+}
+
+#[test]
+fn legacy_truncated_body_bytes_snapshot() {
+    let (ok, stdout, stderr) = legacy_snapshot("403 Forbidden", "{", 100);
+    assert!(!ok);
+    assert_eq!(stdout.as_bytes(), b"{\"error\":{\"code\":\"daemon_unavailable\",\"message\":\"daemon returned 403 Forbidden\"}}\n");
+    assert_eq!(stderr.as_bytes(), b"error: daemon returned 403 Forbidden\n");
 }
