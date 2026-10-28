@@ -144,10 +144,10 @@ export class ScheduleDeleteError extends Error {
   }
 }
 
-export const deleteSchedule = async (id: string): Promise<void> => {
+export const deleteSchedule = async (id: string, options?: { onlyIfCompleted: boolean }): Promise<void> => {
   const res = await window.agent24.backendProxy({
     method: 'DELETE',
-    path: `/api/v1/schedules/${id}`,
+    path: `/api/v1/schedules/${id}${options?.onlyIfCompleted ? '?only_if_completed=true' : ''}`,
   })
   if (!res.ok) throw new ScheduleDeleteError(res.status, errorMessage(res))
 }

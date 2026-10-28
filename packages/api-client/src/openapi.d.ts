@@ -2248,10 +2248,10 @@ export interface components {
              */
             next_run_at: string | null;
             /**
-             * @description The current at spec has successfully triggered and has no next fire:
-             *     next_run_at is null, consecutive_failures is zero, and the current
-             *     spec timestamp is no later than last_run_at (compared as instants).
-             *     A future spec PATCH followed by disabling is not completed.
+             * @description 当前用户 at 调度的 next_run_at 为空，且 runs 表中存在 schedule_id
+             *     匹配、created_at 不早于当前 spec.ts 的运行（按时间点比较）。
+             *     表示成功创建过运行，不表示运行执行成功；所有 run 状态均可作为证据。
+             *     last_run_at 和 consecutive_failures 不作为完成证据。模块调度始终为 false。
              */
             readonly completed: boolean;
             /** @description Auto-disables the schedule at 5 (emits schedule.disabled) */
@@ -4699,6 +4699,15 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            /** @description at 时间早于当前时间超过 60 秒（invalid_request），不写入任何变更。 */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     getSchedule: {
@@ -4726,7 +4735,10 @@ export interface operations {
     };
     deleteSchedule: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description 在同一写事务内重新判定 completed；不满足时返回 409，保留调度。 */
+                only_if_completed?: boolean;
+            };
             header?: never;
             path: {
                 id: components["parameters"]["PathId"];
@@ -4742,7 +4754,17 @@ export interface operations {
                 };
                 content?: never;
             };
+            400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            /** @description 调度当前未完成（schedule_not_completed） */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     updateSchedule: {
@@ -4777,6 +4799,15 @@ export interface operations {
              *     after 3 retries (`schedule_conflict`).
              */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description at 时间早于当前时间超过 60 秒（invalid_request），不写入任何变更。 */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

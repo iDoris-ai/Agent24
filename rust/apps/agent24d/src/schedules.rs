@@ -13,20 +13,14 @@ use chrono::Utc;
 use crate::routes::read_body_or_response;
 use crate::server::{AppState, error_response, error_response_with_hint};
 
-#[derive(serde::Serialize)]
-struct ScheduleResponse {
-    #[serde(flatten)]
+async fn schedule_response(
+    state: &AppState,
     schedule: agent24_protocol::Schedule,
-    completed: bool,
-}
-
-impl From<agent24_protocol::Schedule> for ScheduleResponse {
-    fn from(schedule: agent24_protocol::Schedule) -> Self {
-        let completed = agent24_scheduler::is_completed(&schedule);
-        Self {
-            schedule,
-            completed,
-        }
+    status: StatusCode,
+) -> Response {
+    match state.scheduler.status(&schedule.id).await {
+        Ok(view) => (status, Json(view)).into_response(),
+        Err(err) => map_error(err),
     }
 }
 
@@ -40,6 +34,16 @@ fn map_error(err: ScheduleError) -> Response {
         ScheduleError::Invalid(msg) => {
             error_response(StatusCode::BAD_REQUEST, "invalid_request", &msg)
         }
+        ScheduleError::PastAt => error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_request",
+            "at timestamp is more than 60 seconds in the past",
+        ),
+        ScheduleError::NotCompleted(id) => error_response(
+            StatusCode::CONFLICT,
+            "schedule_not_completed",
+            &format!("schedule {id} is not completed"),
+        ),
         ScheduleError::Store(err) => {
             tracing::error!("schedule store error: {err}");
             error_response(
@@ -98,26 +102,21 @@ pub async fn create_schedule(State(state): State<AppState>, req: Request<Body>) 
         }
     };
     match state.scheduler.create(create, Utc::now()).await {
-        Ok(schedule) => {
-            (StatusCode::CREATED, Json(ScheduleResponse::from(schedule))).into_response()
-        }
+        Ok(schedule) => schedule_response(&state, schedule, StatusCode::CREATED).await,
         Err(err) => map_error(err),
     }
 }
 
 pub async fn list_schedules(State(state): State<AppState>) -> Response {
-    match state.scheduler.list().await {
-        Ok(schedules) => {
-            let schedules: Vec<_> = schedules.into_iter().map(ScheduleResponse::from).collect();
-            Json(serde_json::json!({ "schedules": schedules })).into_response()
-        }
+    match state.scheduler.statuses().await {
+        Ok(schedules) => Json(serde_json::json!({ "schedules": schedules })).into_response(),
         Err(err) => map_error(err),
     }
 }
 
 pub async fn get_schedule(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     match state.scheduler.get(&id).await {
-        Ok(schedule) => Json(ScheduleResponse::from(schedule)).into_response(),
+        Ok(schedule) => schedule_response(&state, schedule, StatusCode::OK).await,
         Err(err) => map_error(err),
     }
 }
@@ -146,13 +145,35 @@ pub async fn update_schedule(State(state): State<AppState>, req: Request<Body>) 
         );
     }
     match state.scheduler.update(&id, update, Utc::now()).await {
-        Ok(schedule) => Json(ScheduleResponse::from(schedule)).into_response(),
+        Ok(schedule) => schedule_response(&state, schedule, StatusCode::OK).await,
         Err(err) => map_error(err),
     }
 }
 
-pub async fn delete_schedule(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    match state.scheduler.delete(&id).await {
+#[derive(serde::Deserialize, Default)]
+struct DeleteScheduleQuery {
+    #[serde(default)]
+    only_if_completed: bool,
+}
+
+pub async fn delete_schedule(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let id = path_id(&req);
+    let query = match axum::extract::Query::<DeleteScheduleQuery>::try_from_uri(req.uri()) {
+        Ok(query) => query.0,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "invalid schedule delete query",
+            );
+        }
+    };
+    let result = if query.only_if_completed {
+        state.scheduler.delete_completed(&id).await
+    } else {
+        state.scheduler.delete(&id).await
+    };
+    match result {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => map_error(err),
     }
@@ -187,7 +208,7 @@ pub async fn run_now(State(state): State<AppState>, Path(id): Path<String>) -> R
 /// idempotent, `200 Schedule`; `409 not_a_module_schedule` on a user row.
 pub async fn suspend_schedule(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     match state.scheduler.suspend(&id, Utc::now()).await {
-        Ok(schedule) => Json(ScheduleResponse::from(schedule)).into_response(),
+        Ok(schedule) => schedule_response(&state, schedule, StatusCode::OK).await,
         Err(err) => map_error(err),
     }
 }
@@ -196,7 +217,7 @@ pub async fn suspend_schedule(State(state): State<AppState>, Path(id): Path<Stri
 /// idempotent, `200 Schedule`; `409 not_a_module_schedule` on a user row.
 pub async fn resume_schedule(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     match state.scheduler.resume(&id, Utc::now()).await {
-        Ok(schedule) => Json(ScheduleResponse::from(schedule)).into_response(),
+        Ok(schedule) => schedule_response(&state, schedule, StatusCode::OK).await,
         Err(err) => map_error(err),
     }
 }
@@ -303,6 +324,7 @@ mod schedules_rest_guard {
         row.last_run_at = Some("2026-07-24T10:01:00Z".into());
         row.next_run_at = None;
         state.store.upsert_schedule(&row).await.unwrap();
+        state.scheduler.run_now(id, Utc::now()).await.unwrap();
         let (_, list) = body_json(list_schedules(State(state.clone())).await).await;
         assert_eq!(list["schedules"][0]["completed"], true);
         let (status, patched) = body_json(update_schedule(State(state.clone()), req_json(
@@ -314,6 +336,163 @@ mod schedules_rest_guard {
         assert_eq!(patched["completed"], false);
         let (_, list) = body_json(list_schedules(State(state)).await).await;
         assert_eq!(list["schedules"][0]["completed"], false);
+    }
+
+    #[tokio::test]
+    async fn failed_one_time_toggle_retry_and_conditional_cleanup_real_chain() {
+        let state = crate::server::tests::state().await;
+        let due = Utc::now() - chrono::Duration::seconds(5);
+        let (status, created) = body_json(
+            create_schedule(
+                State(state.clone()),
+                req_json(
+                    "POST",
+                    "/api/v1/schedules",
+                    serde_json::json!({
+                        "name": "retry", "spec": {"type": "at", "ts": due.to_rfc3339()},
+                        "action": {"type": "agent_run", "prompt": "hi", "session_id": "missing"}
+                    }),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"].as_str().unwrap();
+        state.scheduler.tick(Utc::now()).await.unwrap();
+        let (_, failed) =
+            body_json(get_schedule(State(state.clone()), Path(id.into())).await).await;
+        assert_eq!(failed["consecutive_failures"], 1);
+        assert_eq!(failed["completed"], false);
+        for enabled in [false, true] {
+            let (status, patched) = body_json(
+                update_schedule(
+                    State(state.clone()),
+                    req_json(
+                        "PATCH",
+                        &format!("/api/v1/schedules/{id}"),
+                        serde_json::json!({"enabled": enabled}),
+                    ),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(patched["completed"], false);
+            assert_eq!(patched["consecutive_failures"], 1);
+        }
+        let uri = format!("/api/v1/schedules/{id}?only_if_completed=true");
+        let (status, body) = body_json(
+            delete_schedule(
+                State(state.clone()),
+                req_json("DELETE", &uri, serde_json::Value::Null),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "schedule_not_completed");
+        assert!(state.store.get_schedule(id).await.unwrap().is_some());
+        update_schedule(
+            State(state.clone()),
+            req_json(
+                "PATCH",
+                &format!("/api/v1/schedules/{id}"),
+                serde_json::json!({"action":{"type":"agent_run","prompt":"hi"}}),
+            ),
+        )
+        .await;
+        state
+            .scheduler
+            .tick(Utc::now() + chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        let (_, stopped) = body_json(
+            update_schedule(
+                State(state.clone()),
+                req_json(
+                    "PATCH",
+                    &format!("/api/v1/schedules/{id}"),
+                    serde_json::json!({"enabled":false}),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(stopped["completed"], true, "{stopped}");
+        let (_, listed) = body_json(list_schedules(State(state.clone())).await).await;
+        assert_eq!(listed["schedules"][0]["completed"], true);
+        // A second client changes the spec after the UI's completed snapshot.
+        update_schedule(
+            State(state.clone()),
+            req_json(
+                "PATCH",
+                &format!("/api/v1/schedules/{id}"),
+                serde_json::json!({"spec":{"type":"at","ts":"2099-01-01T00:00:00Z"}}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            delete_schedule(
+                State(state.clone()),
+                req_json("DELETE", &uri, serde_json::Value::Null)
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        // Restore the completed spec to exercise successful conditional cleanup.
+        let mut row = state.store.get_schedule(id).await.unwrap().unwrap();
+        row.spec = agent24_protocol::ScheduleSpec::At {
+            ts: due.to_rfc3339(),
+        };
+        row.next_run_at = None;
+        state.store.upsert_schedule(&row).await.unwrap();
+        assert_eq!(
+            delete_schedule(
+                State(state.clone()),
+                req_json("DELETE", &uri, serde_json::Value::Null)
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            delete_schedule(
+                State(state),
+                req_json("DELETE", &uri, serde_json::Value::Null)
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn past_at_create_and_patch_are_422_even_when_disabled() {
+        let state = crate::server::tests::state().await;
+        let created = create_user_row(&state, "unchanged").await;
+        let id = created["id"].as_str().unwrap();
+        let spec = serde_json::json!({"type":"at", "ts":"2000-01-01T00:00:00Z"});
+        let (status, body) = body_json(create_schedule(State(state.clone()), req_json("POST", "/api/v1/schedules",
+            serde_json::json!({"name":"past", "enabled":false, "spec":spec, "action":{"type":"agent_run","prompt":"hi"}}))).await).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], "invalid_request");
+        let (status, body) = body_json(
+            update_schedule(
+                State(state.clone()),
+                req_json(
+                    "PATCH",
+                    &format!("/api/v1/schedules/{id}"),
+                    serde_json::json!({"spec":spec,"enabled":false}),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert_eq!(state.scheduler.get(id).await.unwrap().name, "unchanged");
     }
 
     // ── C2.1: REST can never construct a module row ─────────────────────────
@@ -567,7 +746,15 @@ mod schedules_rest_guard {
         assert_eq!(run_status, StatusCode::ACCEPTED, "{run_body}");
         assert!(run_body["run_id"].as_str().is_some(), "{run_body}");
 
-        let del = delete_schedule(State(state.clone()), Path(id)).await;
+        let del = delete_schedule(
+            State(state.clone()),
+            req_json(
+                "DELETE",
+                &format!("/api/v1/schedules/{id}"),
+                serde_json::Value::Null,
+            ),
+        )
+        .await;
         assert_eq!(del.status(), StatusCode::NO_CONTENT);
     }
 }

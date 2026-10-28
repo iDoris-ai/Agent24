@@ -79,20 +79,6 @@ use tokio_util::sync::CancellationToken;
 
 pub use fire::FireId;
 
-/// Whether the current one-shot spec has fired successfully with no next slot.
-/// PATCH preserves last_run_at, so compare instants against the current spec.
-pub fn is_completed(schedule: &Schedule) -> bool {
-    let agent24_protocol::ScheduleSpec::At { ts } = &schedule.spec else {
-        return false;
-    };
-    schedule.next_run_at.is_none()
-        && schedule.consecutive_failures == 0
-        && schedule.last_run_at.as_deref().is_some_and(|last| {
-            matches!((next_fire::parse_iso(ts), next_fire::parse_iso(last)),
-                (Ok(due), Ok(fired)) if due <= fired)
-        })
-}
-
 pub use installed_owners::InstalledOwners;
 pub use invocation::{
     DeferReason, FireOutcome, FireTrigger, InvocationTarget, ModuleScheduleKey, RunNowOutcome,
@@ -107,6 +93,10 @@ pub enum ScheduleError {
     NotFound(String),
     #[error("{0}")]
     Invalid(String),
+    #[error("at timestamp is more than 60 seconds in the past")]
+    PastAt,
+    #[error("schedule {0} is not completed")]
+    NotCompleted(String),
     #[error(transparent)]
     Store(#[from] StoreError),
     /// Design §8.2/§8.3: a module-owned row was sent a PATCH that touched
@@ -138,7 +128,10 @@ pub enum ScheduleError {
 
 impl From<SpecError> for ScheduleError {
     fn from(err: SpecError) -> Self {
-        ScheduleError::Invalid(err.to_string())
+        match err {
+            SpecError::PastAt => ScheduleError::PastAt,
+            SpecError::Invalid(_) => ScheduleError::Invalid(err.to_string()),
+        }
     }
 }
 
@@ -280,16 +273,16 @@ impl Scheduler {
 
     // ── CRUD ─────────────────────────────────────────────────────────────────
 
-    /// Create a schedule; `next_run_at` is computed from `now` (None if the
-    /// spec is a one-shot already in the past, or the schedule is disabled).
+    /// Create a schedule, rejecting at specs beyond the clock-skew allowance.
     pub async fn create(
         &self,
         create: ScheduleCreate,
         now: DateTime<Utc>,
     ) -> Result<Schedule, ScheduleError> {
         validate(&create.spec)?;
+        next_fire::validate_at_time(&create.spec, now)?;
         let next_run_at = if create.enabled {
-            next_fire(&create.spec, now)?.map(fmt_iso)
+            next_fire::initial_fire(&create.spec, now)?.map(fmt_iso)
         } else {
             None
         };
@@ -330,6 +323,26 @@ impl Scheduler {
 
     pub async fn list(&self) -> Result<Vec<Schedule>, ScheduleError> {
         Ok(self.store.list_schedules().await?)
+    }
+
+    pub async fn status(&self, id: &str) -> Result<agent24_store::ScheduleStatus, ScheduleError> {
+        self.store
+            .get_schedule_status(id)
+            .await?
+            .ok_or_else(|| ScheduleError::NotFound(id.to_owned()))
+    }
+
+    pub async fn statuses(&self) -> Result<Vec<agent24_store::ScheduleStatus>, ScheduleError> {
+        Ok(self.store.list_schedule_statuses().await?)
+    }
+
+    pub async fn delete_completed(&self, id: &str) -> Result<(), ScheduleError> {
+        match self.store.delete_schedule_conditionally(id, true).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ScheduleError::NotFound(id.to_owned())),
+            Err(StoreError::Conflict(_)) => Err(ScheduleError::NotCompleted(id.to_owned())),
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// Apply a partial update (design §2.4/§8.2, ME4-1.2.2c).
@@ -461,6 +474,7 @@ impl Scheduler {
         }
         if let Some(spec) = &update.spec {
             validate(spec)?;
+            next_fire::validate_at_time(spec, now)?;
             schedule.spec = spec.clone();
             recompute = true;
         }
@@ -480,12 +494,23 @@ impl Scheduler {
         schedule.disabled_by = (!schedule.enabled).then_some(agent24_protocol::DisabledBy::User);
         if recompute {
             schedule.next_run_at = if schedule.enabled {
-                next_fire(&schedule.spec, now)?.map(fmt_iso)
+                if update.spec.is_some() {
+                    next_fire::initial_fire(&schedule.spec, now)?.map(fmt_iso)
+                } else if matches!(schedule.spec, agent24_protocol::ScheduleSpec::At { .. })
+                    && schedule.consecutive_failures > 0
+                {
+                    // Re-enabling a failed one-shot retries it, preserving the
+                    // failure signal until a trigger actually succeeds.
+                    Some(fmt_iso(now))
+                } else {
+                    next_fire(&schedule.spec, now)?.map(fmt_iso)
+                }
             } else {
                 None
             };
-            // A manual re-enable / spec change is a fresh start
-            schedule.consecutive_failures = 0;
+            if update.spec.is_some() {
+                schedule.consecutive_failures = 0;
+            }
         }
         Ok(schedule)
     }
@@ -1156,17 +1181,22 @@ mod tests {
 
     #[tokio::test]
     async fn completed_at_survives_reads_but_not_future_disabled_patch() {
-        let (sched, _, _) = scheduler_with(RecordingTrigger::new()).await;
+        let (sched, _, store) = scheduler_with(RecordingTrigger::new()).await;
         let now = utc("2026-07-24T10:00:00Z");
         let mut create = every_create(60);
         create.spec = ScheduleSpec::At {
             ts: "2026-07-24T10:01:00Z".into(),
         };
         let created = sched.create(create, now).await.unwrap();
-        assert!(!is_completed(&created));
+        assert!(!sched.status(&created.id).await.unwrap().completed);
         sched.tick(utc("2026-07-24T10:01:05Z")).await.unwrap();
         let fired = sched.list().await.unwrap().remove(0);
-        assert!(is_completed(&fired));
+        assert!(
+            !sched.status(&fired.id).await.unwrap().completed,
+            "pre-advance alone is not evidence"
+        );
+        insert_completion_run(&store, &fired.id, "2026-07-24T10:01:05Z").await;
+        assert!(sched.status(&fired.id).await.unwrap().completed);
         let patched = sched
             .update(
                 &created.id,
@@ -1183,7 +1213,7 @@ mod tests {
             .unwrap();
         assert_eq!(patched.last_run_at, fired.last_run_at);
         assert!(patched.next_run_at.is_none());
-        assert!(!is_completed(&sched.list().await.unwrap().remove(0)));
+        assert!(!sched.statuses().await.unwrap().remove(0).completed);
     }
 
     #[tokio::test]
@@ -1200,35 +1230,92 @@ mod tests {
         sched.tick(utc("2026-07-24T10:01:05Z")).await.unwrap();
         let failed = sched.list().await.unwrap().remove(0);
         assert_eq!(failed.consecutive_failures, 1);
-        assert!(!is_completed(&failed));
+        assert!(!sched.status(&failed.id).await.unwrap().completed);
+        for enabled in [false, true] {
+            let patched = sched
+                .update(
+                    &failed.id,
+                    ScheduleUpdate {
+                        enabled: Some(enabled),
+                        ..Default::default()
+                    },
+                    utc("2026-07-24T10:02:00Z"),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !sched.status(&patched.id).await.unwrap().completed,
+                "失败后切换 enabled={enabled} 不能变成已完成"
+            );
+            assert_eq!(patched.consecutive_failures, 1, "切换不能抹掉失败信号");
+        }
+    }
+
+    async fn insert_completion_run(store: &Store, id: &str, created: &str) {
+        let run = agent24_protocol::Run {
+            id: format!("run_{id}_{created}"),
+            schedule_id: Some(id.into()),
+            status: agent24_protocol::RunStatus::Failed,
+            session_id: None,
+            workspace_id: None,
+            input: agent24_protocol::RunInput {
+                prompt: "test".into(),
+                workspace_id: None,
+                model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
+            },
+            output: None,
+            error: None,
+            usage: Default::default(),
+            created_at: created.into(),
+            started_at: None,
+            ended_at: None,
+        };
+        store.insert_run(&run).await.unwrap();
     }
 
     #[tokio::test]
-    async fn completed_requires_each_runtime_clause() {
-        let (sched, _, _) = scheduler_with(RecordingTrigger::new()).await;
+    async fn completed_requires_run_for_current_spec_compared_as_instants() {
+        let (sched, _, store) = scheduler_with(RecordingTrigger::new()).await;
         let mut s = sched
             .create(every_create(60), utc("2026-07-24T10:00:00Z"))
             .await
             .unwrap();
         s.spec = ScheduleSpec::At {
-            ts: "2026-07-24T10:00:00+00:00".into(),
+            ts: "2026-07-24T11:00:00+02:00".into(),
         };
         s.next_run_at = None;
         s.last_run_at = Some("2026-07-24T10:00:00Z".into());
-        assert!(is_completed(&s));
-        let mut candidate = s.clone();
-        candidate.spec = ScheduleSpec::Every { secs: 60 };
-        candidate.enabled = false;
-        assert!(!is_completed(&candidate), "every");
-        candidate = s.clone();
-        candidate.next_run_at = Some("2026-07-25T10:00:00Z".into());
-        assert!(!is_completed(&candidate), "next_run_at");
-        candidate = s.clone();
-        candidate.consecutive_failures = 1;
-        assert!(!is_completed(&candidate), "failures");
-        candidate = s;
-        candidate.last_run_at = None;
-        assert!(!is_completed(&candidate), "last_run_at");
+        store.upsert_schedule(&s).await.unwrap();
+        assert!(!sched.status(&s.id).await.unwrap().completed, "no run");
+        insert_completion_run(&store, "different_schedule", "2026-07-24T10:00:00Z").await;
+        assert!(
+            !sched.status(&s.id).await.unwrap().completed,
+            "different schedule"
+        );
+        insert_completion_run(&store, &s.id, "2026-07-24T10:00:00Z").await;
+        // A failed run still proves the trigger was accepted. PATCH resets or
+        // missing last_run_at do not erase this independent evidence.
+        s.last_run_at = None;
+        s.consecutive_failures = 2;
+        store.upsert_schedule(&s).await.unwrap();
+        assert!(sched.statuses().await.unwrap().remove(0).completed);
+        for (spec, next) in [
+            (ScheduleSpec::Every { secs: 60 }, None),
+            (s.spec.clone(), Some("2026-07-25T10:00:00Z".into())),
+            (
+                ScheduleSpec::At {
+                    ts: "2026-07-24T12:00:00+01:00".into(),
+                },
+                None,
+            ),
+        ] {
+            s.spec = spec;
+            s.next_run_at = next;
+            store.upsert_schedule(&s).await.unwrap();
+            assert!(!sched.status(&s.id).await.unwrap().completed);
+        }
     }
 
     #[tokio::test]

@@ -31,6 +31,7 @@ export default function SchedulesPage() {
   const [operationError, setOperationError] = useState<string | null>(null)
   const [refreshError, setRefreshError] = useState<string | null>(null)
   const [clearing, setClearing] = useState(false)
+  const [confirmingClear, setConfirmingClear] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const [showFired, setShowFired] = useState(false)
 
@@ -141,12 +142,12 @@ export default function SchedulesPage() {
   }
 
   const onClearFired = async (ids: string[]) => {
-    if (!window.confirm(t('fired.confirm', { n: ids.length }))) return
+    if (clearing) return
     setOperationError(null)
     setNotice(null)
     setClearing(true)
     const results = await Promise.allSettled(ids.map(async (id) => {
-      await deleteSchedule(id)
+      await deleteSchedule(id, { onlyIfCompleted: true })
       ++reqSeq.current
       setSchedules((rows) => rows.filter((row) => row.id !== id))
     }))
@@ -154,6 +155,7 @@ export default function SchedulesPage() {
     if (failed.length > 0) {
       const reasons = [...new Set(failed.map(({ reason }: { reason: unknown }) => {
         if (reason instanceof ScheduleDeleteError) {
+          if (reason.status === 409) return t('error.notCompleted')
           if (reason.status === 404) return t('error.notFound')
           if (reason.status === 401 || reason.status === 403) return t('error.permission')
           return t('error.service')
@@ -165,6 +167,7 @@ export default function SchedulesPage() {
       setNotice(t('notice.cleared', { n: ids.length }))
     }
     setClearing(false)
+    setConfirmingClear(false)
     refresh()
   }
 
@@ -369,11 +372,22 @@ export default function SchedulesPage() {
               className="btn"
               style={{ fontSize: 11 }}
               disabled={clearing}
-              onClick={() => onClearFired(fired.map((f) => f.id))}
+              onClick={() => setConfirmingClear(true)}
             >
               {t('fired.clear')}
             </button>
           </div>
+          {confirmingClear && (
+            <div style={{ marginTop: 8, padding: 8, background: 'var(--surface2)', borderRadius: 6 }}>
+              <div style={{ fontSize: 12, marginBottom: 6 }}>{t('fired.confirm', { n: fired.length })}</div>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button className="btn btn-primary" disabled={clearing} onClick={() => onClearFired(fired.map((f) => f.id))}>
+                  {t('fired.confirmAction')}
+                </button>
+                <button className="btn" disabled={clearing} onClick={() => setConfirmingClear(false)}>{t('fired.cancel')}</button>
+              </div>
+            </div>
+          )}
           {showFired && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
               {fired.map(renderRow)}
