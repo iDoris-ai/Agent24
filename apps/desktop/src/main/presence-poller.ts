@@ -77,6 +77,8 @@ export const BACKOFF_MAX_MS = 30_000
 /** The daemon has no presence routes (legacy mode, older daemon): check rarely. */
 export const NOT_SUPPORTED_MS = 5 * 60_000
 const FAST_EMPTY_POLL_MS = 200
+/** A hung daemon must not hold the dialog chain: give up on an answer after this. */
+export const ANSWER_TIMEOUT_MS = 10_000
 const MAX_FIELD = 500
 
 const PRESENCE_BASE = '/api/v1/presence/challenges'
@@ -260,7 +262,19 @@ export class PresencePoller {
     await this.answer(challenge.challenge_id, response === 0 ? 'allow' : 'deny', conn)
   }
 
+  /**
+   * POST the decision. Bounded by `ANSWER_TIMEOUT_MS` and cancelled by
+   * `stop()`, so a hung daemon cannot stall later dialogs (#1447 F2). An
+   * aborted answer is simply not delivered: the challenge then times out on
+   * the daemon side, which is a denial.
+   */
   private async answer(id: string, decision: 'allow' | 'deny', conn: DaemonConnection): Promise<void> {
+    const ctl = new AbortController()
+    const cancelTimer = this.deps.setTimer(() => ctl.abort(), ANSWER_TIMEOUT_MS)
+    const stopSignal = this.abort?.signal
+    const onStop = (): void => ctl.abort()
+    if (stopSignal?.aborted || this.stopped) ctl.abort()
+    stopSignal?.addEventListener('abort', onStop)
     try {
       const res = await this.deps.fetch(
         `http://127.0.0.1:${conn.port}${PRESENCE_BASE}/${encodeURIComponent(id)}`,
@@ -268,11 +282,15 @@ export class PresencePoller {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...conn.authHeaders },
           body: JSON.stringify({ decision }),
+          signal: ctl.signal,
         },
       )
       if (!res.ok) this.deps.log(`decision for ${id} answered ${res.status}`)
     } catch (err) {
       this.deps.log(`decision for ${id} failed: ${(err as Error).message}`)
+    } finally {
+      cancelTimer()
+      stopSignal?.removeEventListener('abort', onStop)
     }
   }
 }

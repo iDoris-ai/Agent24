@@ -35,8 +35,10 @@ use crate::server::{AppState, error_response};
 pub const POLLER_FRESH_FOR: Duration = Duration::from_secs(30);
 /// Longest long-poll the route honours; the query `wait` is clamped to it.
 pub const MAX_WAIT_SECONDS: u64 = 25;
-/// Decided / expired challenges stay as tombstones this long past their
-/// deadline so a late second answer is 409 / 410 rather than "unknown".
+/// Decided challenges stay as tombstones this long past their deadline so a
+/// late second answer is 409 rather than 410. Expired, cancelled or dropped
+/// ones are removed at once (a late answer is 410 either way), so a peer
+/// that elevates and disconnects cannot fill `MAX_RECORDS` (#1447 F4).
 const TOMBSTONE_FOR: Duration = Duration::from_secs(120);
 /// Queue bound: a runaway requester cannot grow it without limit.
 const MAX_PENDING: usize = 64;
@@ -155,7 +157,10 @@ impl DesktopPresence {
                 entry.phase = Phase::Expired;
                 entry.tx = None;
             }
-            entry.deadline + TOMBSTONE_FOR > now
+            match entry.phase {
+                Phase::Expired => false,
+                Phase::Waiting | Phase::Decided => entry.deadline + TOMBSTONE_FOR > now,
+            }
         });
         let entries = &inner.entries;
         inner.order.retain(|id| entries.contains_key(id));
@@ -224,6 +229,7 @@ impl DesktopPresence {
         if entry.expired(now, unix_now()) {
             entry.phase = Phase::Expired;
             entry.tx = None;
+            Self::prune(&mut inner, now);
             return Err(DecideError::Gone);
         }
         entry.phase = Phase::Decided;
@@ -256,6 +262,7 @@ impl DesktopPresence {
             }
             entry.tx = None;
         }
+        Self::prune(&mut inner, Instant::now());
         match late {
             Some(d) if honour_late => outcome(d),
             _ => PresenceOutcome::TimedOut,
@@ -458,6 +465,7 @@ mod tests {
 
     use super::*;
     use crate::capabilities::Operation;
+    use crate::enroll_api::EnrollAuthority;
     use crate::server::build_router;
 
     fn request(id: &str, ttl: u64) -> PresenceRequest {
@@ -627,10 +635,9 @@ mod tests {
         let mut inner = presence.lock();
         let now = Instant::now() + Duration::from_secs(61);
         DesktopPresence::prune(&mut inner, now);
-        assert!(!matches!(
-            inner.entries["expired-waiting"].phase,
-            Phase::Waiting
-        ));
+        // Expired: removed outright, no tombstone (F4).
+        assert!(!inner.entries.contains_key("expired-waiting"));
+        assert!(inner.order.is_empty());
         drop(inner);
         task.abort();
     }
@@ -655,6 +662,41 @@ mod tests {
         tokio::time::advance(Duration::from_secs(181)).await;
         presence.next(Duration::ZERO).await;
         assert!(presence.lock().entries.is_empty());
+    }
+
+    /// #1447 F4: cancelled or dropped confirmations leave no record, so a
+    /// peer that elevates and disconnects over and over cannot make `confirm`
+    /// answer `Unavailable` for everyone.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_and_dropped_confirmations_free_their_records() {
+        let presence = connected().await;
+        for n in 0..(MAX_RECORDS * 2) {
+            let id = format!("gone-{n}");
+            let cancel = CancellationToken::new();
+            let task = spawn_confirm(&presence, request(&id, 60), cancel.clone());
+            presence.next(Duration::from_secs(1)).await.unwrap();
+            if n % 2 == 0 {
+                cancel.cancel();
+                assert_eq!(task.await.unwrap(), PresenceOutcome::TimedOut);
+            } else {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            }
+            assert_eq!(presence.decide(&id, true), Err(DecideError::Gone));
+        }
+        assert!(presence.lock().entries.is_empty());
+        // No time has passed, yet a fresh challenge is still accepted.
+        let task = spawn_confirm(&presence, request("fresh", 60), CancellationToken::new());
+        assert_eq!(
+            presence
+                .next(Duration::from_secs(1))
+                .await
+                .unwrap()
+                .challenge_id,
+            "fresh"
+        );
+        presence.decide("fresh", true).unwrap();
+        assert_eq!(task.await.unwrap(), PresenceOutcome::Allowed);
     }
 
     #[tokio::test]
@@ -727,6 +769,33 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
         let (status, _) = call(&router, Method::POST, DECIDE, &host, Some(ALLOW)).await;
         assert_eq!(status, StatusCode::GONE);
+    }
+
+    /// #1447 F1, second layer: `gate` refuses a real first-party shell
+    /// authorization on its own, independent of the operation filter.
+    #[tokio::test]
+    async fn gate_refuses_a_first_party_authorization() {
+        let (state, _, _) = crate::server::tests::capability_state().await;
+        let token = state
+            .first_party
+            .as_ref()
+            .unwrap()
+            .issue(&crate::capabilities::first_party::test_peer("daemon-test"))
+            .unwrap();
+        let auth = state
+            .capabilities
+            .as_ref()
+            .unwrap()
+            .validate_bearer(
+                &token.secret,
+                Operation::ConfigRead,
+                &crate::capabilities::Resource::global(),
+                unix_now(),
+            )
+            .unwrap();
+        assert_eq!(auth.claims.audience, Audience::FirstPartyShell);
+        let refused = gate(&state, Some(Extension(auth))).unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

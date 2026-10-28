@@ -51,6 +51,12 @@ pub enum ResourceScope {
 }
 
 impl Operation {
+    /// The desktop confirmation channel (CORE-2 AgentEar S3): ProductHost
+    /// only, never granted to a first-party shell token.
+    pub fn is_presence_channel(self) -> bool {
+        matches!(self, Self::PresenceRead | Self::PresenceDecide)
+    }
+
     pub fn scope(self) -> ResourceScope {
         match self {
             Self::ModelsRead => ResourceScope::Global,

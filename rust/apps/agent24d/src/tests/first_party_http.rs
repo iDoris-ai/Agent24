@@ -605,6 +605,65 @@ async fn product_host_module_writes_do_not_need_delegation() {
     assert_eq!(response.status(), StatusCode::CREATED);
 }
 
+/// #1447 F1, first layer: an enrolled first-party token is never granted the
+/// presence operations, so the middleware refuses it before any handler.
+#[tokio::test]
+async fn first_party_token_is_not_granted_presence_operations() {
+    let (state, token) = setup().await;
+    let store = state.capabilities.as_ref().unwrap();
+    for operation in [
+        crate::capabilities::Operation::PresenceRead,
+        crate::capabilities::Operation::PresenceDecide,
+    ] {
+        assert!(
+            store
+                .validate_bearer(
+                    &token.secret,
+                    operation,
+                    &crate::capabilities::Resource::global(),
+                    crate::capabilities::unix_now(),
+                )
+                .is_err(),
+            "{operation:?}"
+        );
+    }
+    // Control: the same token validates for an everyday operation.
+    assert!(
+        store
+            .validate_bearer(
+                &token.secret,
+                crate::capabilities::Operation::ConfigRead,
+                &crate::capabilities::Resource::global(),
+                crate::capabilities::unix_now(),
+            )
+            .is_ok()
+    );
+}
+
+/// #1447 F1, end to end: an enrolled CLI cannot read or answer challenges,
+/// so it cannot approve its own elevation.
+#[tokio::test]
+async fn first_party_token_cannot_reach_presence_routes() {
+    let (state, token) = setup().await;
+    assert!(state.presence_desktop.is_some());
+    let router = build_router(state);
+    for (method, path, body) in [
+        ("GET", "/api/v1/presence/challenges/next?wait=0", ""),
+        (
+            "POST",
+            "/api/v1/presence/challenges/abc",
+            r#"{"decision":"allow"}"#,
+        ),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(request(&token.secret, method, path, body, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+}
+
 // Keep HTTP in-process and use a socket pair for the real enrolment handshake.
 // Only the registry path is injected; no test writes the user's attached.json.
 // macOS only: off macOS the daemon has no per-writer peer token and rejects

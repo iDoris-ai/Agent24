@@ -89,7 +89,6 @@ mod os_memory_page;
 mod os_routes;
 mod overrides;
 mod peer_runs;
-#[allow(dead_code, reason = "S3: provider is wired into serve by the S2 merge")]
 mod presence_desktop;
 mod routes;
 mod runs;

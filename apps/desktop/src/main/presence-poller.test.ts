@@ -3,6 +3,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  ANSWER_TIMEOUT_MS,
   BACKOFF_MAX_MS,
   BACKOFF_START_MS,
   IDLE_MS,
@@ -40,6 +41,8 @@ function harness(opts: {
   polls: Array<() => Response | Promise<Response>>
   dialog?: (o: PresenceDialogOptions, s: AbortSignal) => Promise<{ response: number }>
   connection?: PresencePollerDeps['connection']
+  /** The daemon never answers decision POSTs (they park until aborted). */
+  hangPosts?: boolean
 }) {
   const calls: Call[] = []
   const posts: Array<{ url: string; body: unknown; headers: Record<string, string> }> = []
@@ -56,6 +59,11 @@ function harness(opts: {
         body: JSON.parse(String(init.body)),
         headers: init.headers as Record<string, string>,
       })
+      if (opts.hangPosts) {
+        return new Promise<Response>((_, reject) => {
+          init.signal?.addEventListener('abort', () => reject(new Error('aborted')))
+        })
+      }
       return json({ state: 'decided' })
     }
     const next = opts.polls[pollIndex++]
@@ -224,6 +232,34 @@ describe('presence poller', () => {
     await new Promise((r) => setTimeout(r, 20))
     expect(h.posts).toEqual([])
     expect(h.calls.length).toBe(before)
+  })
+
+  it('stop() cancels a decision POST the daemon never answers', async () => {
+    const h = harness({ polls: [() => json(challenge())], dialog: async () => ({ response: 0 }), hangPosts: true })
+    h.poller.start()
+    await until(() => h.posts.length === 1)
+    const post = h.calls.find((c) => c.init?.method === 'POST')
+    expect(post?.init?.signal?.aborted).toBe(false)
+    await h.poller.stop()
+    expect(post?.init?.signal?.aborted).toBe(true)
+  })
+
+  it('gives up on a hung decision POST after ANSWER_TIMEOUT_MS and asks the next challenge', async () => {
+    const h = harness({
+      polls: [() => json(challenge({ challenge_id: 'a' })), () => json(challenge({ challenge_id: 'b' }))],
+      dialog: async () => ({ response: 0 }),
+      hangPosts: true,
+    })
+    h.poller.start()
+    await until(() => h.posts.length === 1)
+    const timer = h.timers.find((t) => t.ms === ANSWER_TIMEOUT_MS && !t.cancelled)
+    expect(timer).toBeDefined()
+    timer!.fn() // the answer deadline passes
+    const first = h.calls.find((c) => c.init?.method === 'POST')
+    expect(first?.init?.signal?.aborted).toBe(true)
+    await until(() => h.posts.length === 2)
+    expect(h.posts.map((p) => p.url.split('/').pop())).toEqual(['a', 'b'])
+    await h.poller.stop()
   })
 
   it('keeps polling while the user is still deciding', async () => {
