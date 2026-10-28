@@ -11,6 +11,14 @@ serde_json.workspace = true
 thiserror = "2"
 semver = "1"
 url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+tokio-util = "0.7"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

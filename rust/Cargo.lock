@@ -167,10 +167,16 @@ dependencies = [
 name = "agent24-idoris"
 version = "0.1.0"
 dependencies = [
+ "reqwest",
  "semver",
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
  "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
  "url",
 ]
 
