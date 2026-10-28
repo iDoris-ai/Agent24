@@ -321,3 +321,51 @@ describe('SchedulesPage', () => {
     await waitFor(() => expect(screen.getByText('已投递给模块（fire_id fire_xyz789）')).toBeInTheDocument())
   })
 })
+
+describe('SchedulesPage fired one-time rows', () => {
+  beforeEach(() => { setLocale('zh') })
+
+  const FIRED = (id: string) => ({
+    ...SCHEDULE,
+    id,
+    name: 'self-wake',
+    spec: { type: 'at', ts: '2026-07-28T18:00:00Z' },
+    next_run_at: null,
+    last_run_at: '2026-09-09T15:38:48Z',
+  })
+
+  it('folds fired one-time rows out of the main list into a collapsed 已完成 group', async () => {
+    mount([SCHEDULE, FIRED('wake_1'), FIRED('wake_2')])
+    render(<SchedulesPage />)
+    await waitFor(() => expect(screen.getByText('每日晨报')).toBeInTheDocument())
+    expect(screen.getByText('已完成 2 条')).toBeInTheDocument()
+    // collapsed by default: no self-wake card, no per-row Run now for them
+    expect(screen.queryByText('self-wake')).not.toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: '立即运行' })).toHaveLength(1)
+    // expanding reveals the audit rows
+    fireEvent.click(screen.getByRole('button', { name: '展开' }))
+    expect(screen.getAllByText('self-wake')).toHaveLength(2)
+  })
+
+  it('a not-yet-fired one-time row and a failed-before-fire row stay in the main list', async () => {
+    mount([
+      { ...FIRED('pending'), name: 'pending-once', next_run_at: '2099-01-01T00:00:00Z', last_run_at: null },
+      { ...FIRED('never'), name: 'never-fired', last_run_at: null },
+    ])
+    render(<SchedulesPage />)
+    await waitFor(() => expect(screen.getByText('pending-once')).toBeInTheDocument())
+    expect(screen.getByText('never-fired')).toBeInTheDocument()
+    expect(screen.queryByText(/已完成/)).not.toBeInTheDocument()
+  })
+
+  it('清理已完成 deletes exactly the fired one-time rows and nothing else', async () => {
+    const proxy = mount([SCHEDULE, FIRED('wake_1'), FIRED('wake_2')])
+    render(<SchedulesPage />)
+    await waitFor(() => expect(screen.getByText('已完成 2 条')).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', { name: '清理已完成' }))
+    await waitFor(() => {
+      const dels = proxy.mock.calls.map((c) => c[0]).filter((r) => r.method === 'DELETE').map((r) => r.path)
+      expect(dels.sort()).toEqual(['/api/v1/schedules/wake_1', '/api/v1/schedules/wake_2'])
+    })
+  })
+})
