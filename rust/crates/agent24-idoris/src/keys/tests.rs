@@ -68,7 +68,7 @@ if command == 'issue':
         print((root / 'issue-reply').read_text())
         sys.exit(0)
     if mode == 'timeout':
-        time.sleep(2)
+        time.sleep(30)
     if mode in ['lost', 'list-fails']:
         print('idk_' + 'a' * 64)
     elif mode == 'oversized':
@@ -172,7 +172,9 @@ async fn lost_issue_result_lists_exact_owner_and_revokes_only_its_key() {
     for mode in ["lost", "unknown", "exit-failure", "oversized", "timeout"] {
         let mut f = Fixture::new(mode, false);
         if mode == "timeout" {
-            f.keys.timeout = Duration::from_millis(300);
+            // One timeout covers issue, list and revoke, and a fresh script can take
+            // over a second to start under load, so keep it well above that.
+            f.keys.timeout = Duration::from_secs(5);
         }
         let error = f.keys.issue("installation", &[]).await.unwrap_err();
         let calls = f.calls();
