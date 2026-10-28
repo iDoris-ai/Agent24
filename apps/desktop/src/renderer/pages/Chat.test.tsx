@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import ChatPage from './Chat'
 import { setLocale } from '../i18n'
+import { chatMessages } from './Chat.i18n'
 
 const mockBackendProxy = vi.fn()
 
@@ -295,5 +296,82 @@ describe('ChatPage English default', () => {
   it('shows the English welcome copy', () => {
     render(<ChatPage />)
     expect(screen.getByText('Your local AI assistant. Your data stays on this device.')).toBeInTheDocument()
+  })
+})
+
+describe('ID-HR-2 chat confirmation', () => {
+  const headroom = { ok: false, status: 503, data: { error: { code: 'idoris_headroom_confirmation_required', message: 'reserved memory' } } }
+  const submit = (text: string) => {
+    const input = screen.getByRole('textbox')
+    fireEvent.change(input, { target: { value: text } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+  }
+
+  it('shows an inline confirmation instead of an ordinary error without automatically retrying', async () => {
+    mockBackendProxy.mockResolvedValue(headroom)
+    render(<ChatPage />)
+    submit('original prompt')
+    expect(await screen.findByRole('button', { name: 'Load anyway' })).toBeInTheDocument()
+    expect(screen.getByText(/iDoris needs to use memory reserved for the system/).closest('.message')).toHaveTextContent('original prompt')
+    expect(screen.queryByText(/chat request failed/)).not.toBeInTheDocument()
+    expect(mockBackendProxy).toHaveBeenCalledTimes(1)
+    expect(mockBackendProxy.mock.calls[0][0].body).not.toHaveProperty('idoris_headroom_confirmed')
+  })
+
+  it('confirms exactly once with the same request and asks again for the next message', async () => {
+    mockBackendProxy.mockResolvedValueOnce(headroom)
+      .mockResolvedValueOnce({ ok: true, status: 200, data: { message: { content: 'Loaded.' } } })
+      .mockResolvedValueOnce(headroom)
+    render(<ChatPage />)
+    submit('original\nprompt')
+    const confirm = await screen.findByRole('button', { name: 'Load anyway' })
+    fireEvent.click(confirm)
+    fireEvent.click(confirm)
+    expect(await screen.findByText('Loaded.')).toBeInTheDocument()
+    expect(mockBackendProxy).toHaveBeenCalledTimes(2)
+    expect(mockBackendProxy.mock.calls[1][0]).toEqual({ ...mockBackendProxy.mock.calls[0][0], body: { ...mockBackendProxy.mock.calls[0][0].body, idoris_headroom_confirmed: true } })
+    expect(screen.getAllByText(/original/)).toHaveLength(1)
+    submit('next prompt')
+    expect(await screen.findByRole('button', { name: 'Load anyway' })).toBeInTheDocument()
+    expect(mockBackendProxy).toHaveBeenCalledTimes(3)
+    expect(mockBackendProxy.mock.calls[2][0].body).not.toHaveProperty('idoris_headroom_confirmed')
+  })
+
+  it('marks cancellation as not sent and excludes it from later requests', async () => {
+    mockBackendProxy.mockResolvedValueOnce(headroom)
+      .mockResolvedValue({ ok: true, status: 200, data: { message: { content: 'Done.' } } })
+    render(<ChatPage />)
+    submit('cancelled prompt')
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }))
+    expect(screen.getByText('Not sent')).toBeInTheDocument()
+    expect(mockBackendProxy).toHaveBeenCalledTimes(1)
+    submit('next prompt')
+    expect(await screen.findByText('Done.')).toBeInTheDocument()
+    expect(mockBackendProxy.mock.calls[1][0].body.messages).toEqual([{ role: 'user', content: 'next prompt' }])
+  })
+
+  it('does not automatically retry a confirmed request that still requires confirmation', async () => {
+    mockBackendProxy.mockResolvedValue(headroom)
+    render(<ChatPage />)
+    submit('prompt')
+    fireEvent.click(await screen.findByRole('button', { name: 'Load anyway' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Load anyway' })).toBeDisabled())
+    expect(mockBackendProxy).toHaveBeenCalledTimes(2)
+    expect(screen.queryByText(/chat request failed/)).not.toBeInTheDocument()
+  })
+
+  it('shows supervisor busy as retryable without a confirmation card', async () => {
+    mockBackendProxy.mockResolvedValue({ ok: false, status: 503, data: { error: { code: 'idoris_supervisor_busy', message: 'busy' } } })
+    render(<ChatPage />)
+    submit('prompt')
+    expect(await screen.findByText(/iDoris is busy.*try again/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Load anyway' })).not.toBeInTheDocument()
+    expect(mockBackendProxy).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['en', 'zh', 'th'] as const)('has complete nonempty confirmation translations in %s', locale => {
+    for (const key of ['headroom.explanation', 'headroom.confirm', 'headroom.cancel', 'status.notSent', 'reply.supervisorBusy']) {
+      expect(chatMessages[locale]).toHaveProperty([key], expect.stringMatching(/\S/))
+    }
   })
 })

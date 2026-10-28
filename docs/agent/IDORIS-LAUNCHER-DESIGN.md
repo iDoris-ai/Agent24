@@ -16,7 +16,7 @@
 | A4 | 预算只从 usable 扣显式 core 预留，零值有效：`rust/apps/agent24-cli/src/main.rs:1135` 至 `:1149`、`docs/agent/IDORIS-MANUAL-BUDGET.md:5` 至 `:20`。底层算法：`rust/crates/agent24-hw/src/budget.rs:120` 至 `:129`。 |
 | A5 | 现有数据 key 来自环境；禁代理与重定向、限制 loopback，严格校验契约 1.0.1，简单和复杂请求映射 daily 与 deep：`rust/crates/agent24-models/src/idoris.rs:92` 至 `:117`、`:183` 至 `:201`、`:228` 至 `:244`。 |
 | A6 | 网关独占、失败不回退：`rust/crates/agent24-models/src/router.rs:326` 至 `:330`、`:534` 至 `:539`、`:642` 至 `:655`。回执要求本地推理并保留真实模型：`rust/crates/agent24-models/src/idoris.rs:264` 至 `:310`。 |
-| A7 | Desktop 的 FD 选择器、65 字节解析和直接读取 Admin：`apps/desktop/src/main/idoris-admin.ts:11` 至 `:21`、`:29` 至 `:37`、`:71` 至 `:102`、`:241` 至 `:276`。 |
+| A7 | 桌面 FD 选择器、65 字节解析和直接读取 Admin 的旧路径已移除（IL-13），`idoris-admin.ts` 与 `--idoris-admin-token-fd` 不再存在。桌面经 `backendProxy` 调用 daemon 的 `/api/v1/idoris/*`，由 daemon 持有并管理 Admin token，桌面不再持有。入口见 `apps/desktop/src/renderer/components/idoris/api.ts` 和 `apps/desktop/src/main/backend-proxy.ts`。 |
 | A8 | Hyphae 固定锁、只构造已校验对象、重验已有文件：`rust/crates/agent24-comm/hyphae.lock.json:1` 至 `:11`、`rust/crates/agent24-comm/src/binary.rs:126` 至 `:161`、`:175` 至 `:234`。 |
 | A9 | 大组件不打包而按需下载；重定向逐跳限制 HTTPS 和主机：`apps/desktop/src/main/open-design-component.ts:1` 至 `:9`、`:38` 至 `:40`。 |
 | A10 | 候选端口 8088、8000、8001：`apps/desktop/src/main/ipc/index.ts:33` 至 `:49`。真实认证配置在 `auth.api_key`：`docs/release/ACCEPTANCE-v0.6.0-preview.md:519` 至 `:527`。 |
@@ -148,7 +148,7 @@ daemon 自身异常退出后，重新启动时先核对非敏感运行记录中�
 轮换流程为“签发最小权限新 key → 钥匙串暂存 → 新 key 真实请求验证 → 切换引用与网关 → 等旧请求完成或取消 → revoke 旧 key → 删除旧钥匙串条目”。失败时保留可用旧 key 并吊销新 key；旧 key 吊销失败显示“新 key 已生效，旧 key 待吊销”，持久保存待处理 key_id，不在重试时重复签发。[L3]
 跨崩溃补偿用非敏感操作记录与 L3 list 对账，key_id 是删除和吊销依据，禁止只凭 owner=`agent24` 批量吊销，避免影响其他实例。签发成功但结果未收到的归属识别仍需 L3 schema 与操作关联机制支持，未解决前将列为待清理授权，不宣称事务完全成功。
 L4 与 L3 的并发关系尚不明确。设计不要求 key 子命令绕过 serve 锁：若不支持在线 key 操作，则暂停请求、按 L1 停 serve、执行 key 子命令后再启动。在线无停机轮换只有在 iDoris 明确支持并完成测试后才开放。[L1、L3、L4]
-`idoris-admin.ts` 的 TOKEN_ARG 是桌面侧 FD 选择器，绝不是 iDoris 参数；两者不是把字符串替换一下就能互通。[A7；#588 §1「Admin token 交接」第 1 条] 迁移后由 daemon 持有 Admin token 并查询只读 Admin，桌面 consumer 改为 daemon 状态适配器；移除旧 FD 读取和启动交接调用点，不传 `--idoris-admin-token-fd` 给 iDoris，也不向桌面转发 token。CLI 复用同一投影结果。
+旧 `idoris-admin.ts` 的 TOKEN_ARG 曾是桌面侧 FD 选择器，不是 iDoris 参数；该模块、`--idoris-admin-token-fd`、FD 读取和启动交接调用点均已移除（IL-13）。[A7；#588 §1「Admin token 交接」第 1 条] 现在桌面经 `backendProxy` 调用 daemon 的 `/api/v1/idoris/*`，展示 daemon 的状态与操作快照。Admin token 由 daemon 持有并管理，不向桌面转发，桌面不再持有。CLI 复用同一 daemon API。
 
 ## 8. oMLX 探测与角色模型选择
 
@@ -308,7 +308,7 @@ iDoris 侧 PR：#586（capabilities）、#587（运行时 headroom）、#589（k
 | IL-04 oMLX 探测 | 端口、认证分类、同用户设置读取与安全输入 | 03；L2。 |
 | IL-05 组件配置 | 调 setup、验证目录与绑定；预算复用 hw idoris-env 逻辑 | 04；L2。 |
 | IL-06 数据凭据 | key issue、钥匙串存取、失败吊销及最小角色 | 05；L3、L4 并发约定。 |
-| IL-07 启动就绪 | Admin stdin、环境白名单、共享契约校验与 health | 06；L4、L5。 |
+| IL-07 启动就绪 | Admin stdin、环境白名单、共享契约校验与 health；就绪前证明两个端口的监听者属于子进程组，之后才发 Admin token；每次 spawn 前复核安装哈希（闸门见下） | 06；L4、L5。 |
 | IL-08 停止恢复 | SIGTERM 时限、SIGKILL、有界重启、遗留进程安全处置 | 07；L1、L4。 |
 | IL-09 网关连接 | 内存凭据入口、原子配置、服务重启恢复及首次真实 chat | 08；L5，保留现有安全证据。 |
 | IL-10 生命周期 API | OpenAPI 的 status/start/stop、权限与操作查询 | 09；L1、L4、L5。 |
@@ -320,6 +320,11 @@ iDoris 侧 PR：#586（capabilities）、#587（运行时 headroom）、#589（k
 | IL-16 卸载 | 保留或明确清除数据、吊销补偿，API 与 CLI | 15；L1、L3。 |
 | IL-17 管理界面 | 桌面升级、卸载、凭据管理按钮，共用上述 API | 16；继承相关 L。 |
 | IL-18 发布验收 | 跑完 IL-1 至 IL-9 与完整用户异常流程，整理精确证据 | 17；L1–L5，记录 L6 状态。 |
+
+**IL-07 闸门：已接受的残余风险**（#1468 评审 F2/F3）
+
+- **同 UID 路径替换竞态（已接受）**：macOS 没有 `fexecve`，监督器只能在每次 spawn（含崩溃重启）前用 `O_NOFOLLOW` + 同一 fd 复核安装文件哈希，再按路径 exec。复核与 exec 之间，同 UID 进程仍可替换该路径。同 UID 恶意进程本就在信任边界内（见 §10），这一竞态作为残余风险接受，不再加防护。
+- **监听者归属**：loopback 不提供对端身份，状态码也认证不了服务端。就绪判定在发出 Admin token 之前，要求数据口与 Admin 口上所有可见的 LISTEN socket 都由子进程组持有；出现组外持有者按端口冲突（L4）失败，不重试。macOS 上本 crate 禁止 `unsafe`，而 libproc 只能经 C union 读出 socket 端口，所以改由系统自带的 `/usr/sbin/lsof` 逐进程查询；Linux 读 `/proc`。剩余风险：查询看不到其他 UID 进程的描述符；其他 UID 借 `SO_REUSEPORT` 共享端口的情形不在本闸门覆盖范围内。
 
 ### 14.1 协调者裁决：首个里程碑只做 IL-01 至 IL-13
 

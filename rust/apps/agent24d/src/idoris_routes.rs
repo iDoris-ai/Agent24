@@ -22,12 +22,16 @@ pub async fn status(State(state): State<AppState>) -> Response {
     let status = match state.idoris_host {
         Some(host) => host.status().await,
         None => Status {
-            state: LifecycleState::NotInstalled,
+            state: if state.idoris_unavailable {
+                LifecycleState::Failed
+            } else {
+                LifecycleState::NotInstalled
+            },
             version: None,
             data_port: None,
             admin_port: None,
             roles: Vec::new(),
-            last_error: None,
+            last_error: state.idoris_unavailable.then_some(Code::PersistenceFailed),
             current_operation: None,
             verification: None,
             budget_suggestion: None,
@@ -38,7 +42,11 @@ pub async fn status(State(state): State<AppState>) -> Response {
 }
 async fn submit(state: AppState, headers: HeaderMap, action: Action) -> Response {
     let Some(host) = state.idoris_host else {
-        return failure(Code::NotInstalled);
+        return failure(if state.idoris_unavailable {
+            Code::PersistenceFailed
+        } else {
+            Code::NotInstalled
+        });
     };
     let key = match headers
         .get("Idempotency-Key")

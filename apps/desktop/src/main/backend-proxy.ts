@@ -63,6 +63,7 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('GET', '/api/v1/usage'),
   // runs
   r('GET', '/api/v1/runs'),
+  r('POST', '/api/v1/runs'),
   r('GET', '/api/v1/runs/{id}'),
   r('POST', '/api/v1/runs/{id}/cancel'),
   // schedules
