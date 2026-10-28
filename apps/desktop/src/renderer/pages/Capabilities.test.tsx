@@ -10,19 +10,19 @@ import {
 import { setLocale } from '../i18n'
 import CapabilitiesPage from './Capabilities'
 import { capabilitiesMessages } from './Capabilities.i18n'
+import { CAPABILITIES } from '../capabilities/registry'
+import { registerDynamicMessages } from '../capabilities/capabilities.i18n'
 
 // Shuffled on purpose: group order must follow CAPABILITY_GROUPS, and order
 // inside a group must follow the defs array, not a sort by name.
-const DEFS: CapabilityDef[] = [
-  { id: 'schedules', group: 'services', nameKey: 'Schedules', descKey: 'Run work later', builtin: true, page: 'schedules' },
-  { id: 'design', group: 'creative', nameKey: 'Design', descKey: 'Open Design', builtin: false, page: 'design' },
-  { id: 'assistant', group: 'office', nameKey: 'Assistant', descKey: 'Talk to Agent24', builtin: true, fixed: true, page: 'assistant' },
-  { id: 'translate', group: 'tools', nameKey: 'Translate', descKey: 'Translate text', builtin: false, page: 'translate' },
-  { id: 'kb', group: 'knowledge', nameKey: 'Knowledge Base', descKey: 'Notes and files', builtin: false, page: 'kb' },
-  { id: 'sin90', group: 'domainOs', nameKey: 'Sin90', descKey: 'A domain module', builtin: false, page: 'sin90' },
-  { id: 'documents', group: 'office', nameKey: 'Documents', descKey: 'Write and import', builtin: true, page: 'documents' },
-  { id: 'approvals', group: 'services', nameKey: 'Approvals', descKey: 'Decide tool calls', builtin: true, page: 'approvals' },
-]
+const translateKeys = registerDynamicMessages('translate', 'Translate', 'Translate text')
+const DEFS: CapabilityDef[] = ['schedules', 'design', 'assistant', 'translate', 'knowledgeBase', 'sin90', 'documents', 'approvals'].map(id => {
+  if (id === 'translate') return { id, group: 'tools', ...translateKeys, builtin: false, page: 'translate' }
+  const def = CAPABILITIES.find(def => def.id === id)
+  if (!def) throw new Error(`Missing capability ${id}`)
+  return def
+})
+
 
 const GROUP_TITLES = ['Office', 'Knowledge', 'Creative', 'Domain OS', 'Tools', 'Services']
 const GROUP_BLURBS = [
@@ -84,7 +84,7 @@ describe('CapabilitiesPage', () => {
       'Assistant',
       'Documents',
     ])
-    expect(within(row('Assistant')).getByText('Talk to Agent24')).toBeInTheDocument()
+    expect(within(row('Assistant')).getByText('Talk with your built-in AI assistant.')).toBeInTheDocument()
   })
 
   it('opens a capability from its name and from the Open button', () => {
@@ -191,10 +191,12 @@ describe('CapabilitiesPage', () => {
     act(() => setLocale('zh'))
     expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('能力中心')
     expect(screen.getByText('内置在 Agent24 里')).toBeInTheDocument()
+    expect(within(row('文档')).getByText('导入、阅读和处理文档。')).toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: '在侧边栏显示总览' })).toBeInTheDocument()
     act(() => setLocale('th'))
     expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('ความสามารถ')
     expect(screen.getByText('มากับ Agent24')).toBeInTheDocument()
+    expect(within(row('เอกสาร')).getByText('นำเข้า อ่าน และทำงานกับเอกสารของคุณ')).toBeInTheDocument()
     act(() => setLocale('en'))
   })
 })

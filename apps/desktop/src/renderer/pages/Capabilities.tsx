@@ -10,6 +10,7 @@ import {
 } from '../capabilities/types'
 import { useT } from '../i18n'
 import { capabilitiesMessages } from './Capabilities.i18n'
+import { capabilitiesMessages as catalogMessages } from '../capabilities/capabilities.i18n'
 
 /** Row that shows the pending-approval count. Matches the capability id. */
 const APPROVALS_ID = 'approvals'
@@ -43,6 +44,7 @@ export default function CapabilitiesPage({ statusFor, onOpenSettings }: Capabili
   const { defs, open, approvalsWaiting } = useContext(CapabilitiesContext)
   const { prefs, setPrefs } = useContext(NavPrefsContext)
   const t = useT(capabilitiesMessages)
+  const c = useT(catalogMessages)
   const baseId = useId()
   const slotsFull = prefs.pinned.length >= prefs.slotCount
 
@@ -82,7 +84,7 @@ export default function CapabilitiesPage({ statusFor, onOpenSettings }: Capabili
     .filter((group) => group.items.length > 0)
 
   return (
-    <div className="content">
+    <main className="content">
       <h1 className="page-title">{t('page.title')}</h1>
       <p className="page-sub">{t('page.subtitle')}</p>
 
@@ -122,9 +124,7 @@ export default function CapabilitiesPage({ statusFor, onOpenSettings }: Capabili
               <p className="cap-blurb">{t(copy.blurb)}</p>
               <ul className="cap-list">
                 {items.map((def) => {
-                  // D1 owns the catalog (capabilities.i18n.ts). This page does
-                  // not import it, so an unresolved key is the label.
-                  const name = def.nameKey
+                  const name = c(def.nameKey)
                   const pin = pinOf(def)
                   return (
                     <li key={def.id} className="cap-row" aria-label={name}>
@@ -139,7 +139,7 @@ export default function CapabilitiesPage({ statusFor, onOpenSettings }: Capabili
                             </span>
                           )}
                         </div>
-                        <p className="cap-desc">{def.descKey}</p>
+                        <p className="cap-desc">{c(def.descKey)}</p>
                       </div>
                       <div className="cap-actions">
                         <span className="tag cap-status">{statusText(def)}</span>
@@ -168,6 +168,6 @@ export default function CapabilitiesPage({ statusFor, onOpenSettings }: Capabili
           )
         })}
       </div>
-    </div>
+    </main>
   )
 }

@@ -11,14 +11,18 @@ const mockOmlxDetect = vi.fn()
 const mockOmlxStart = vi.fn()
 const mockOmlxModels = vi.fn()
 const mockBackendEndpoint = vi.fn()
+const mockSetNavPrefs = vi.fn()
+const mockIdorisStatus = vi.fn()
 
 beforeEach(() => {
   vi.clearAllMocks()
   mockGetAppVersion.mockResolvedValue('1.0.0')
-  mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { status: 'ok', ts: Date.now() } })
+  mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { status: 'ok', ts: Date.now(), schedules: [] } })
   mockModulesList.mockResolvedValue([])
   mockOmlxDetect.mockResolvedValue({ ok: true, models: ['Qwen3-8B-4bit'] })
   mockBackendEndpoint.mockResolvedValue({ port: 60128 })
+  mockSetNavPrefs.mockResolvedValue(undefined)
+  mockIdorisStatus.mockResolvedValue({ state: 'unavailable', reason: 'handoff-missing' })
 
   Object.defineProperty(window, 'agent24', {
     value: {
@@ -29,6 +33,16 @@ beforeEach(() => {
       omlxStart: mockOmlxStart,
       omlxModels: mockOmlxModels,
       backendEndpoint: mockBackendEndpoint,
+      getNavPrefs: vi.fn().mockResolvedValue({ pinned: ['documents', 'design', 'create'], slotCount: 3, showOverview: true }),
+      setNavPrefs: mockSetNavPrefs,
+      idorisStatus: mockIdorisStatus,
+      documents: {
+        request: vi.fn(({ op }: { op: string }) => Promise.resolve({ ok: true, status: 200, data:
+          op === 'list' ? { documents: [], next_cursor: null } : { storage: { state: 'ready' } },
+        })),
+        onImportProgress: () => () => {},
+        onEvent: () => () => {},
+      },
     },
     writable: true,
     configurable: true,
@@ -147,7 +161,7 @@ describe('App', () => {
           data: { models: [], default_model: 'Qwen3.6-35B-A3B-MLX-8bit' },
         })
       }
-      return Promise.resolve({ ok: true, status: 200, data: { status: 'ok', ts: Date.now() } })
+      return Promise.resolve({ ok: true, status: 200, data: { status: 'ok', ts: Date.now(), schedules: [] } })
     })
     await act(async () => { render(<App />) })
     await waitFor(() => {
@@ -266,7 +280,7 @@ describe('App', () => {
       if (req.path === '/api/v1/chat') {
         return Promise.resolve({ ok: true, status: 200, data: { message: { content: 'ack' } } })
       }
-      return Promise.resolve({ ok: true, status: 200, data: { status: 'ok', ts: Date.now() } })
+      return Promise.resolve({ ok: true, status: 200, data: { status: 'ok', ts: Date.now(), schedules: [] } })
     })
 
     await act(async () => { render(<App />) })
@@ -309,6 +323,97 @@ describe('App', () => {
       (c) => c[0].path === '/api/v1/chat',
     )?.[0].body.session_id
     expect(secondSessionId).toBe(firstSessionId)
+  })
+})
+
+describe('App navigation integration', () => {
+  function nav() { return within(screen.getByRole('navigation', { name: 'Main navigation' })) }
+  function center() { fireEvent.click(nav().getByRole('button', { name: /Capabilities/ })) }
+  function row(name: string) { return within(screen.getByRole('listitem', { name })) }
+  async function switchTo(query: string) {
+    fireEvent.keyDown(window, { key: 'k', metaKey: true })
+    expect(screen.getAllByRole('dialog')).toHaveLength(1)
+    const input = within(screen.getByRole('dialog')).getByRole('combobox')
+    fireEvent.change(input, { target: { value: query } })
+    await act(async () => { fireEvent.keyDown(input, { key: 'Enter' }) })
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  }
+
+  it('replaces Create with Schedules in the three pinned slots and persists both changes through IPC', async () => {
+    await act(async () => { render(<App />) })
+    expect(nav().getAllByRole('button').map(button => button.textContent)).toEqual([
+      'Overview', 'Assistant', 'Documents', 'Design', 'Create', 'Capabilities', 'Settings',
+    ])
+    expect(nav().getByText('Pinned 3/3')).toBeInTheDocument()
+    center()
+    expect(row('Schedules').getByText('Manage recurring and scheduled tasks.')).toBeInTheDocument()
+    expect(row('Schedules').getByRole('button', { name: 'Slots full Schedules' })).toBeDisabled()
+    fireEvent.click(row('Create').getByRole('button', { name: 'Pinned Create' }))
+    await waitFor(() => expect(row('Schedules').getByRole('button', { name: 'Pin Schedules' })).toBeEnabled())
+    expect(nav().queryByRole('button', { name: 'Create' })).not.toBeInTheDocument()
+    fireEvent.click(row('Schedules').getByRole('button', { name: 'Pin Schedules' }))
+    await waitFor(() => expect(nav().getByRole('button', { name: 'Schedules' })).toBeInTheDocument())
+    expect(mockSetNavPrefs.mock.calls).toEqual([
+      [{ pinned: ['documents', 'design'], slotCount: 3, showOverview: true }],
+      [{ pinned: ['documents', 'design', 'schedules'], slotCount: 3, showOverview: true }],
+    ])
+  })
+
+  it('opens Schedules with cmd-K sch Enter without a breadcrumb, and returns from Documents to the center', async () => {
+    await act(async () => { render(<App />) })
+    await switchTo('sch')
+    expect(screen.getByText('Schedules', { selector: '.page-title' })).toBeInTheDocument()
+    expect(screen.queryByRole('navigation', { name: 'Breadcrumb' })).not.toBeInTheDocument()
+    center()
+    for (const button of ['Documents', 'Open']) {
+      await act(async () => { fireEvent.click(row('Documents').getByRole('button', { name: button })) })
+      expect(screen.getByText('No documents yet.')).toBeInTheDocument()
+      const breadcrumb = screen.getByRole('navigation', { name: 'Breadcrumb' })
+      expect(breadcrumb).toHaveTextContent('Capabilities›Documents')
+      fireEvent.click(within(breadcrumb).getByRole('button', { name: 'Capabilities' }))
+      expect(screen.getByRole('heading', { level: 1, name: 'Capabilities' })).toBeInTheDocument()
+    }
+    await act(async () => { fireEvent.click(nav().getByRole('button', { name: 'Documents' })) })
+    expect(screen.queryByRole('navigation', { name: 'Breadcrumb' })).not.toBeInTheDocument()
+  })
+
+  it('opens Settings from both switcher actions and the full-slots link, and opens Capabilities from the switcher', async () => {
+    await act(async () => { render(<App />) })
+    for (const target of ['settings/activity', 'settings/general']) {
+      await switchTo(target)
+      expect(screen.getByText('Settings', { selector: '.page-title' })).toBeInTheDocument()
+      expect(screen.queryByRole('navigation', { name: 'Breadcrumb' })).not.toBeInTheDocument()
+    }
+    await switchTo('capabilities')
+    expect(screen.getByRole('heading', { level: 1, name: 'Capabilities' })).toBeInTheDocument()
+    await act(async () => { fireEvent.click(screen.getByRole('link', { name: 'Settings › General' })) })
+    expect(screen.getByText('Settings', { selector: '.page-title' })).toBeInTheDocument()
+  })
+
+  it('keeps default status labels when iDoris and Hyphae status cannot be obtained', async () => {
+    mockIdorisStatus.mockRejectedValue(new Error('offline'))
+    mockBackendProxy.mockResolvedValue({ ok: false, status: 503, data: null })
+    await act(async () => { render(<App />) })
+    await act(async () => { center() })
+    for (const name of ['Local models', 'Communication']) {
+      expect(row(name).getByText('Open', { selector: '.cap-status' })).toBeInTheDocument()
+    }
+  })
+
+  it('shows approval badges and known iDoris and Hyphae status in the center', async () => {
+    mockBackendProxy.mockImplementation(({ path }: { path: string }) => Promise.resolve({ ok: true, status: 200, data:
+      path.includes('/approvals?') ? { approvals: [{ id: 'one' }, { id: 'two' }] }
+        : path === '/api/v1/comm/daemon' ? { ok: true, data: {
+          process: { state: 'running', generation: 1, consecutive_failures: 0, reason: null },
+          relay_probe: null, catch_up: { state: 'unknown', last_incomplete_at_ms: null },
+        } } : { status: 'ok' },
+    }))
+    await act(async () => { render(<App />) })
+    expect(nav().getByRole('button', { name: /Capabilities\s*2/ })).toHaveTextContent('2')
+    center()
+    expect(row('Approvals').getByRole('status', { name: '2 waiting' })).toHaveTextContent('2')
+    await waitFor(() => expect(row('Local models').getByText('iDoris not connected (optional)')).toBeInTheDocument())
+    expect(row('Communication').getByText('Running')).toBeInTheDocument()
   })
 })
 

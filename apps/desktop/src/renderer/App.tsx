@@ -21,7 +21,8 @@ import HelloModule from './pages/modules/HelloModule'
 import { Sidebar } from './capabilities/Sidebar'
 import { Breadcrumb } from './capabilities/Breadcrumb'
 import { CapabilityPage } from './capabilities/CapabilityPage'
-import { CapabilitiesPage } from './capabilities/CapabilitiesPage'
+import CapabilitiesPage from './pages/Capabilities'
+import { useCapabilityStatus } from './capabilities/useCapabilityStatus'
 import { CapabilitiesProvider, NavPrefsProvider, useCapabilityRoute } from './capabilities/providers'
 import { CapabilitiesContext, NavPrefsContext } from './capabilities/types'
 import { capabilitiesMessages } from './capabilities/capabilities.i18n'
@@ -84,6 +85,7 @@ function AppShell(): JSX.Element {
   const selected = route.kind === 'capability' ? defs.find(d => d.id === route.id) : undefined
   const page = route.kind === 'page' ? route.page : selected?.page
   const c = useT(capabilitiesMessages)
+  const statusFor = useCapabilityStatus(page === 'capabilities')
   useEffect(() => window.agent24.onCliToolSettings?.(() => navigate('settings')), [navigate])
   useEffect(() => {
     if (!prefs.showOverview && route.kind === 'page' && route.page === 'home') open('assistant', 'other')
@@ -275,8 +277,8 @@ function AppShell(): JSX.Element {
         {page === 'creative'         && <CreativePage />}
         {page === 'models'           && <ModelsPage />}
         {page === 'memory'           && <MemoryPage />}
-        {page === 'settings'         && <SettingsPage />}
-        {page === 'capabilities'     && <CapabilitiesPage />}
+        {page === 'settings'         && <SettingsPage initialTab={route.kind === 'page' ? route.initialTab : undefined} />}
+        {page === 'capabilities'     && <CapabilitiesPage statusFor={statusFor} onOpenSettings={() => open('settings/general', 'capabilities')} />}
         {page === 'modules-manager'  && <ModulesManagerPage />}
         {page === 'module:hello'     && <HelloModule />}
         {selected && !['chat', 'documents', 'schedules', 'communication', 'approvals', 'voice', 'creative', 'models', 'memory', 'modules-manager', 'module:hello'].includes(selected.page)

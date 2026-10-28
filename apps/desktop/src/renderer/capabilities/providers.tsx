@@ -5,7 +5,7 @@ import {
 } from './types'
 import { CAPABILITIES, withDynamicCapabilities } from './registry'
 
-type Route = { kind: 'page'; page: string } | { kind: 'capability'; id: CapabilityId; origin: OpenOrigin }
+type Route = { kind: 'page'; page: string; initialTab?: 'general' | 'activity' } | { kind: 'capability'; id: CapabilityId; origin: OpenOrigin }
 const RouteContext = createContext<{ route: Route; navigate: (page: string) => void }>({
   route: { kind: 'page', page: 'home' }, navigate: () => {},
 })
@@ -17,7 +17,11 @@ export function CapabilitiesProvider({ children }: { children: ReactNode }) {
   const [approvalsWaiting, setApprovalsWaiting] = useState(0)
   const navigate = useCallback((page: string) => setRoute({ kind: 'page', page }), [])
   const open = useCallback((id: CapabilityId, origin: OpenOrigin) => {
-    if (defs.some(d => d.id === id)) setRoute({ kind: 'capability', id, origin })
+    if (id === 'settings/general' || id === 'settings/activity') {
+      setRoute({ kind: 'page', page: 'settings', initialTab: id === 'settings/general' ? 'general' : 'activity' })
+    } else if (id === 'capabilities') {
+      setRoute({ kind: 'page', page: 'capabilities' })
+    } else if (defs.some(d => d.id === id)) setRoute({ kind: 'capability', id, origin })
   }, [defs])
   useEffect(() => {
     if (route.kind === 'capability' && !defs.some(d => d.id === route.id)) navigate('capabilities')

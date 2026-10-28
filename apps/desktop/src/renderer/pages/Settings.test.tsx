@@ -27,6 +27,13 @@ beforeEach(() => {
 })
 
 describe('SettingsPage', () => {
+  it.each(['general', 'activity', 'unknown'])('accepts initialTab %s while preserving the current Settings page', async initialTab => {
+    mockOmlxDetect.mockResolvedValue({ url: 'http://localhost:8088', apiKey: '', models: [] })
+    await act(async () => { render(<SettingsPage initialTab={initialTab} />) })
+    expect(screen.getByText('Settings', { selector: '.page-title' })).toBeInTheDocument()
+    expect(screen.getByLabelText('Language')).toBeInTheDocument()
+  })
+
   it('exposes the bundled CLI installer when an older CLI is on PATH', async () => {
     mockOmlxDetect.mockResolvedValue({ url: 'http://localhost:8088', apiKey: '', models: [] })
     await act(async () => { render(<SettingsPage />) })

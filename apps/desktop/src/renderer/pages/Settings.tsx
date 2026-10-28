@@ -24,7 +24,8 @@ function saveCategories(c: Record<string, ModelCategory>) {
   localStorage.setItem(CATEGORIES_KEY, JSON.stringify(c))
 }
 
-export default function SettingsPage() {
+// Reserved for D3's tabs. Until then, all values preserve the existing page.
+export default function SettingsPage(_props: { initialTab?: string } = {}) {
   const [omlxStatus, setOmlxStatus] = useState<OmlxStatus>('detecting')
   const [omlxUrl, setOmlxUrl] = useState(`http://127.0.0.1:${AUTO_START_PORT}`)
   const [omlxApiKey, setOmlxApiKey] = useState(AUTO_START_KEY)

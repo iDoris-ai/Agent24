@@ -7,7 +7,7 @@ import { Breadcrumb } from './Breadcrumb'
 import { CapabilitiesProvider, NavPrefsProvider, useCapabilityRoute } from './providers'
 import { CapabilitiesContext, NavPrefsContext, NAV_PREFS_DEFAULT, type NavPrefs, type NavPrefsApi } from './types'
 import { CAPABILITIES } from './registry'
-import { CapabilitiesPage } from './CapabilitiesPage'
+import CapabilitiesPage from '../pages/Capabilities'
 
 describe('Sidebar', () => {
   it('renders fixed entries, ordered pins, empty slots, hidden Overview and approval badges', () => {
@@ -52,19 +52,26 @@ function RouteView() {
 }
 
 describe('capability routing', () => {
-  it('shows a breadcrumb only when opened from the capability center and can return', async () => {
-    window.agent24 = { backendProxy: vi.fn().mockResolvedValue({ ok: true, data: [] }) } as unknown as Window['agent24']
-    render(<CapabilitiesProvider><NavPrefsProvider><RouteView /></NavPrefsProvider></CapabilitiesProvider>)
-    fireEvent.click(screen.getByRole('button', { name: 'Capabilities' }))
-    fireEvent.click(within(screen.getByRole('main')).getByRole('button', { name: 'Documents' }))
-    expect(screen.getByRole('navigation', { name: 'Breadcrumb' })).toHaveTextContent('Capabilities›Documents')
-    fireEvent.click(within(screen.getByRole('navigation', { name: 'Breadcrumb' })).getByRole('button'))
-    expect(screen.getByRole('main')).toBeInTheDocument()
-    fireEvent.click(within(screen.getByRole('navigation', { name: 'Main navigation' })).getByRole('button', { name: 'Documents' }))
-    expect(screen.queryByRole('navigation', { name: 'Breadcrumb' })).not.toBeInTheDocument()
-    fireEvent.click(screen.getByText('Switch'))
-    expect(screen.queryByRole('navigation', { name: 'Breadcrumb' })).not.toBeInTheDocument()
-    await act(async () => {})
+  it('routes switcher actions to Settings with the requested initialTab and ignores unknown targets', () => {
+    function Actions() {
+      const { open } = useContext(CapabilitiesContext)
+      const { route } = useCapabilityRoute()
+      return <>
+        {['settings/general', 'settings/activity', 'settings/unknown', 'capabilities'].map(id =>
+          <button key={id} onClick={() => open(id, 'switcher')}>{id}</button>)}
+        <output aria-label="Route">{JSON.stringify(route)}</output>
+      </>
+    }
+    window.agent24 = { backendProxy: vi.fn().mockResolvedValue({ ok: false }) } as unknown as Window['agent24']
+    render(<CapabilitiesProvider><Actions /></CapabilitiesProvider>)
+    for (const initialTab of ['general', 'activity']) {
+      fireEvent.click(screen.getByRole('button', { name: `settings/${initialTab}` }))
+      expect(screen.getByLabelText('Route')).toHaveTextContent(JSON.stringify({ kind: 'page', page: 'settings', initialTab }))
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'settings/unknown' }))
+    expect(screen.getByLabelText('Route')).toHaveTextContent('"initialTab":"activity"')
+    fireEvent.click(screen.getByRole('button', { name: 'capabilities' }))
+    expect(screen.getByLabelText('Route')).toHaveTextContent(JSON.stringify({ kind: 'page', page: 'capabilities' }))
   })
 
   it('polls manifests through backendProxy, lists dynamic UI in domainOs and never auto-pins it', async () => {
