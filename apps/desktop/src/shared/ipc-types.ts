@@ -2,6 +2,8 @@
 // Capability modules will extend this in M1+.
 
 export const IpcChannels = {
+  NavPrefsGet: 'nav-prefs:get',
+  NavPrefsSet: 'nav-prefs:set',
   CliToolOpenSettings: 'cli-tool:open-settings',
   CliToolStatus: 'cli-tool:status',
   CliToolInstall: 'cli-tool:install',

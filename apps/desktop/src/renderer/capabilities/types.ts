@@ -57,19 +57,26 @@ export const NAV_PREFS_DEFAULT: NavPrefs = {
  * Normalise stored prefs: clamp the slot count, drop unknown, fixed and
  * duplicate ids, and unpin whatever no longer fits. `dropped` lists the ids
  * that were unpinned because of the slot limit, so the UI can say so.
+ * With preserveUnknown, storage normalization reserves slots for hidden
+ * saved ids until removal is confirmed; display normalization hides them.
  */
 export function clampPrefs(
   prefs: NavPrefs,
   defs: readonly CapabilityDef[],
+  preserveUnknown = false,
 ): { prefs: NavPrefs; dropped: CapabilityId[] } {
+  const known = new Set(defs.map(d => d.id))
   const pinnable = new Set(defs.filter((d) => !d.fixed).map((d) => d.id))
   const raw = Number.isFinite(prefs.slotCount) ? Math.round(prefs.slotCount) : NAV_PREFS_DEFAULT.slotCount
-  const slotCount = Math.min(SLOT_MAX, Math.max(SLOT_MIN, raw))
   const seen = new Set<CapabilityId>()
-  const valid = prefs.pinned.filter((id) => pinnable.has(id) && !seen.has(id) && seen.add(id) !== undefined)
+  const valid = prefs.pinned.filter((id) => (pinnable.has(id) || (preserveUnknown && !known.has(id))) && !seen.has(id) && seen.add(id) !== undefined)
+  const hiddenCount = valid.filter(id => !known.has(id)).length
+  const slotCount = Math.min(SLOT_MAX, Math.max(SLOT_MIN, raw, hiddenCount))
+  let visibleSlots = slotCount - hiddenCount
+  const pinned = valid.filter(id => !known.has(id) || visibleSlots-- > 0).slice(0, slotCount)
   return {
-    prefs: { pinned: valid.slice(0, slotCount), slotCount, showOverview: prefs.showOverview !== false },
-    dropped: valid.slice(slotCount),
+    prefs: { pinned, slotCount, showOverview: prefs.showOverview !== false },
+    dropped: valid.filter(id => !pinned.includes(id)),
   }
 }
 
@@ -81,12 +88,25 @@ export interface CapabilitiesApi {
   open: (id: CapabilityId, origin: OpenOrigin) => void
   /** Pending approvals count, shown as a badge on Capabilities and Overview. */
   approvalsWaiting: number
+  /** Stays true after the first successful manifest load, including while offline. */
+  manifestsLoaded?: boolean
+  /** Raw module ids before display filtering, from the latest two successful reads. */
+  moduleInventory?: {
+    ids: ReadonlySet<CapabilityId>
+    disabledIds: ReadonlySet<CapabilityId>
+    previousIds?: ReadonlySet<CapabilityId>
+  }
 }
 
 export interface NavPrefsApi {
   prefs: NavPrefs
-  /** Persists through the main process; resolves with ids unpinned by the limit. */
-  setPrefs: (next: NavPrefs) => Promise<CapabilityId[]>
+  /** Includes saved pins whose manifests are temporarily unavailable. */
+  pinnedCount?: number
+  /** Full ordered list for Settings, including unavailable pins counted above. */
+  allPinned?: readonly CapabilityId[]
+  /** Updaters run against the latest saved prefs, including hidden ids, after startup reading.
+   * Persists through the main process; resolves with ids unpinned by the limit or removal. */
+  setPrefs: (next: NavPrefs | ((prev: NavPrefs) => NavPrefs)) => Promise<CapabilityId[]>
 }
 
 export const CapabilitiesContext = createContext<CapabilitiesApi>({
