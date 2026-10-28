@@ -232,6 +232,26 @@ export interface paths {
         patch: operations["updateDomainOs"];
         trace?: never;
     };
+    "/os/{name}/delegation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Delegate the current registered module HTTP surface
+         * @description Requires capabilities mode and ModuleAdmin authority. FirstPartyShell requests require a single-use elevation grant bound to this request.
+         */
+        post: operations["delegateDomainOs"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/os/{name}/stop": {
         parameters: {
             query?: never;
@@ -3916,6 +3936,62 @@ export interface operations {
             };
             /** @description registry_invalid or disable_pending */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    delegateDomainOs: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Agent24-Elevation"?: string;
+            };
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Delegation durably records the module version and registered route digest */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @enum {boolean} */
+                        delegated: true;
+                        name: string;
+                    };
+                };
+            };
+            /** @description Missing or invalid bearer token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Presence confirmation is required or the elevation grant is invalid */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description The delegation record could not be persisted */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };

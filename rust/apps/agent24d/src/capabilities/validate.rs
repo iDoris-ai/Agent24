@@ -12,11 +12,21 @@ impl CapabilityStore {
         now: UnixSeconds,
     ) -> Result<Authorization, CapabilityError> {
         let digest = digest(token);
-        let state = self
+        let mut state = self
             .shared
             .state
             .lock()
             .map_err(|_| CapabilityError::Unauthorized)?;
+        let record = state
+            .records
+            .get(&digest)
+            .ok_or(CapabilityError::Unauthorized)?;
+        if !process_live(record) {
+            let id = record.claims.capability_id.clone();
+            state.records.remove(&digest);
+            state.ids.remove(&id);
+            return Err(CapabilityError::Unauthorized);
+        }
         let record = state
             .records
             .get(&digest)
@@ -49,11 +59,21 @@ impl CapabilityStore {
     ) -> Result<(), CapabilityError> {
         let token = CapabilityToken::parse_bearer(bearer)?;
         let digest = digest(&token);
-        let state = self
+        let mut state = self
             .shared
             .state
             .lock()
             .map_err(|_| CapabilityError::Unauthorized)?;
+        let record = state
+            .records
+            .get(&digest)
+            .ok_or(CapabilityError::Unauthorized)?;
+        if !process_live(record) {
+            let id = record.claims.capability_id.clone();
+            state.records.remove(&digest);
+            state.ids.remove(&id);
+            return Err(CapabilityError::Unauthorized);
+        }
         let record = state
             .records
             .get(&digest)
@@ -118,12 +138,12 @@ impl CapabilityStore {
         if now >= record.claims.expires_at {
             return Err(CapabilityError::Expired);
         }
-        if record.claims.audience == super::Audience::CreativeRuntime
+        if record.claims.audience != super::Audience::ProductHost
             && !record.claims.allowed_operations.contains(&operation)
         {
             return Err(CapabilityError::OperationDenied);
         }
-        if record.claims.audience == super::Audience::CreativeRuntime {
+        if record.claims.audience != super::Audience::ProductHost {
             let exact = match operation.scope() {
                 ResourceScope::Global => resource == &Resource::global(),
                 ResourceScope::Principal => {
@@ -139,4 +159,13 @@ impl CapabilityStore {
         }
         Ok(())
     }
+}
+
+fn process_live(record: &Record) -> bool {
+    record.claims.first_party.as_ref().is_none_or(|claims| {
+        let peer = &claims.peer;
+        agent24_os_proc::is_alive(peer.pid)
+            && agent24_os_proc::start_time(peer.pid)
+                .is_ok_and(|s| s.sec == peer.start.sec && s.usec == peer.start.usec)
+    })
 }
