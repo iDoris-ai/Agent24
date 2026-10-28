@@ -57,11 +57,12 @@ fn response_error(error: ModelError) -> ModelError {
 
 #[derive(Default)]
 struct GatewayError {
+    error_type: Option<String>,
     reason_code: Option<String>,
     remediation: Option<String>,
 }
 
-/// Read only the reason and confirmation guidance from a capped, cancellable body.
+/// Read the wire type, reason and guidance from a capped, cancellable body.
 async fn error_fields(
     mut response: reqwest::Response,
     cancel: &CancellationToken,
@@ -93,6 +94,10 @@ async fn error_fields(
         .and_then(|v| v.as_str())
         .map(str::to_owned);
     Ok(GatewayError {
+        error_type: value
+            .pointer("/error/type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
         reason_code,
         remediation: value
             .pointer("/error/remediation")
@@ -152,24 +157,30 @@ impl IdorisClient {
             let code = status.as_u16();
             if code == 503 || code == 502 {
                 let fields = error_fields(response, cancel).await?;
-                match (code, fields.reason_code.as_deref()) {
-                    (503, Some("headroom_confirmation_required")) => {
+                // iDoris wire contract §2.8: confirmation is a type; lifecycle
+                // contention is a reason. Remediation is display guidance only.
+                match (
+                    code,
+                    fields.error_type.as_deref(),
+                    fields.reason_code.as_deref(),
+                ) {
+                    (503, Some("headroom_confirmation_required"), _) => {
                         return Err(ModelError::IdorisHeadroomConfirmationRequired {
                             role: role.to_owned(),
                             remediation: fields.remediation,
                         });
                     }
-                    (503, Some("supervisor_busy")) => {
+                    (503, Some("local_only_unavailable"), Some("supervisor_busy")) => {
                         return Err(ModelError::IdorisSupervisorBusy);
                     }
-                    (503, Some("local_only_unavailable")) => {
+                    (503, _, Some("local_only_unavailable")) => {
                         return Err(ModelError::Unavailable(
                             "no local model available in iDoris (local_only_unavailable)".into(),
                         ));
                     }
                     // Terminal: iDoris's own upstream credential or access was
                     // refused. Retrying or switching provider cannot fix it.
-                    (502, Some("upstream_auth_failed")) => {
+                    (502, _, Some("upstream_auth_failed")) => {
                         return Err(ModelError::Rejected {
                             status: 502,
                             message: "iDoris's upstream provider rejected authentication or access (upstream_auth_failed): check the iDoris operator's upstream key (e.g. IDORIS_OMLX_API_KEY) or the provider's permissions".into(),
@@ -479,7 +490,7 @@ mod tests {
                 }
                 if data.starts_with(b"POST ") {
                     if busy {
-                        let body = r#"{"error":{"reason_code":"supervisor_busy"}}"#;
+                        let body = r#"{"error":{"type":"local_only_unavailable","reason_code":"supervisor_busy"}}"#;
                         socket.write_all(format!("HTTP/1.1 503 X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
                         sent.take().unwrap().send(()).unwrap();
                         continue;

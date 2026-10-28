@@ -631,7 +631,7 @@ pub fn map_model_error(module: &str, e: &ModelError) -> RpcError {
         }
         ModelError::IdorisSupervisorBusy => unavailable(
             UnavailableCause::NoProvider,
-            "the model is loading; retry later",
+            "the model lifecycle is busy; retry later",
         ),
         ModelError::IdorisHeadroomConfirmationRequired { .. } => unavailable(
             UnavailableCause::RequestRejected,

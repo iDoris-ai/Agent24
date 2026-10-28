@@ -215,7 +215,7 @@ pub enum ModelError {
         remediation: Option<String>,
     },
     /// Transient lifecycle contention; the gateway's bounded retries are exhausted.
-    #[error("idoris_supervisor_busy: iDoris is loading the model; retry later")]
+    #[error("idoris_supervisor_busy: iDoris model lifecycle is busy; retry later")]
     IdorisSupervisorBusy,
     #[error("cancelled")]
     Cancelled,

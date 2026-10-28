@@ -74,14 +74,35 @@ async fn endpoint_with_redirect(
                 }
                 let busy =
                     content.starts_with("busy-") && (content != "busy-success" || attempt <= 2);
-                if !health && (content == "headroom" || busy) {
+                if !health
+                    && (content.starts_with("headroom")
+                        || content.starts_with("allocation-")
+                        || content == "wrong-busy-type"
+                        || busy)
+                {
                     let reason = if busy {
                         "supervisor_busy"
                     } else {
                         "headroom_confirmation_required"
                     };
-                    body = serde_json::json!({"error": {"type":"local_only_unavailable", "reason_code":reason,
+                    let error_type = if content.starts_with("headroom") {
+                        "headroom_confirmation_required"
+                    } else if content == "wrong-busy-type" {
+                        "other"
+                    } else {
+                        "local_only_unavailable"
+                    };
+                    let reason = match content {
+                        "allocation-exceeded" => "future_allocation_reason",
+                        "allocation-reason-only" => "headroom_confirmation_required",
+                        "wrong-busy-type" => "supervisor_busy",
+                        _ => reason,
+                    };
+                    body = serde_json::json!({"error": {"type":error_type, "reason_code":reason,
                         "rule_id":null, "evidence":null, "remediation":"Ask the user to confirm reserved memory headroom."}});
+                    if content == "headroom-type-only" {
+                        body["error"].as_object_mut().unwrap().remove("reason_code");
+                    }
                 }
                 let body = body.to_string();
                 let record = if content == "missing-record" {
@@ -114,7 +135,12 @@ async fn endpoint_with_redirect(
                 };
                 let status = if content == "redirect" && !health {
                     "307 Temporary Redirect"
-                } else if !health && (content == "headroom" || busy) {
+                } else if !health
+                    && (content.starts_with("headroom")
+                        || content.starts_with("allocation-")
+                        || content == "wrong-busy-type"
+                        || busy)
+                {
                     "503 Unavailable"
                 } else if health {
                     "200 OK"
@@ -179,9 +205,13 @@ async fn configured_gateway_is_the_only_http_target() {
                 &cancel,
             )
             .await;
-        if case == "headroom" || case.starts_with("busy-") {
+        if case.starts_with("headroom")
+            || case.starts_with("busy-")
+            || case.starts_with("allocation-")
+            || case == "wrong-busy-type"
+        {
             match case.as_str() {
-                "headroom" => match result.unwrap_err() {
+                "headroom" | "headroom-type-only" => match result.unwrap_err() {
                     agent24_models::ModelError::IdorisHeadroomConfirmationRequired {
                         role,
                         remediation,
@@ -194,6 +224,10 @@ async fn configured_gateway_is_the_only_http_target() {
                     }
                     other => panic!("{other:?}"),
                 },
+                "allocation-exceeded" | "allocation-reason-only" | "wrong-busy-type" => assert!(
+                    matches!(result, Err(agent24_models::ModelError::Unavailable(_))),
+                    "{result:?}"
+                ),
                 "busy-exhausted" => assert!(matches!(
                     result,
                     Err(agent24_models::ModelError::IdorisSupervisorBusy)
@@ -438,6 +472,11 @@ async fn headroom_gateway_contract() {
     for (case, confirmed, expected_calls) in [
         ("headroom", false, 1),
         ("headroom", true, 1),
+        ("headroom-type-only", false, 1),
+        ("allocation-exceeded", false, 1),
+        ("allocation-exceeded", true, 1),
+        ("allocation-reason-only", false, 1),
+        ("wrong-busy-type", false, 1),
         ("", true, 1),
         ("busy-success", false, 3),
         ("busy-success", true, 3),
@@ -474,6 +513,7 @@ async fn headroom_gateway_contract() {
         assert_eq!(posts.len(), expected_calls, "{case}");
         assert!(bypassed.lock().unwrap().is_empty(), "{case}");
         for post in &posts {
+            assert!(post.starts_with("POST /v1/chat/completions "), "{post}");
             assert_eq!(
                 post.to_ascii_lowercase()
                     .contains("x-idoris-headroom-breach: confirmed\r\n"),
