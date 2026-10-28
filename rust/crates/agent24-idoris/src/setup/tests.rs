@@ -20,7 +20,7 @@ impl Fixture {
         fs::write(version.join("idoris"), script).unwrap();
         fs::set_permissions(version.join("idoris"), fs::Permissions::from_mode(0o700)).unwrap();
         Self {
-            installed: InstalledVersion::fixture(version),
+            installed: InstalledVersion::from_test_directory(version),
             dir,
             probe: ProbeResult {
                 endpoint: Endpoint::parse("http://127.0.0.1:8088").unwrap(),

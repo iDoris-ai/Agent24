@@ -18,17 +18,27 @@ impl Drop for CapabilityDaemon {
 }
 
 fn start(home: &std::path::Path) -> (CapabilityDaemon, u16, String) {
-    let child = Command::new(env!("CARGO_BIN_EXE_agent24d"))
+    start_with_mode(home, true)
+}
+
+fn start_with_mode(home: &std::path::Path, ephemeral: bool) -> (CapabilityDaemon, u16, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent24d"));
+    command
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", home)
-        .args([
-            "serve",
-            "--ephemeral",
-            "--auth-mode",
-            "capabilities",
-            "--host-bootstrap-stdio",
-        ])
+        .env("HOME", home);
+    command.args([
+        "serve",
+        "--port",
+        "0",
+        "--auth-mode",
+        "capabilities",
+        "--host-bootstrap-stdio",
+    ]);
+    if ephemeral {
+        command.arg("--ephemeral");
+    }
+    let child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -57,6 +67,21 @@ fn start(home: &std::path::Path) -> (CapabilityDaemon, u16, String) {
 }
 
 fn status(port: u16, method: &str, path: &str, bearer: Option<&str>, body: Option<&str>) -> u16 {
+    response(port, method, path, bearer, body)
+        .split_whitespace()
+        .nth(1)
+        .expect("HTTP status")
+        .parse()
+        .expect("numeric HTTP status")
+}
+
+fn response(
+    port: u16,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    body: Option<&str>,
+) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("capability listener");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -88,11 +113,6 @@ fn status(port: u16, method: &str, path: &str, bearer: Option<&str>, body: Optio
         .read_to_string(&mut response)
         .expect("capability response");
     response
-        .split_whitespace()
-        .nth(1)
-        .expect("HTTP status")
-        .parse()
-        .expect("numeric HTTP status")
 }
 
 fn upgrade_status(port: u16, bearer: Option<&str>) -> u16 {
@@ -203,5 +223,76 @@ fn desktop_event_stream_accepts_the_host_bearer_in_capability_mode() {
         without, 401,
         "GET /api/v1/events without bearer returned {without}"
     );
+    stop(daemon);
+}
+
+#[test]
+fn idoris_corrupt_operations_do_not_prevent_daemon_startup() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home
+        .path()
+        .join("Library/Application Support/Agent24/idoris");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("operations.json"), "invalid json").unwrap();
+    let (daemon, port, bearer) = start_with_mode(home.path(), false);
+    assert_eq!(
+        status(port, "GET", "/api/v1/models", Some(&bearer), None),
+        200
+    );
+    assert_eq!(
+        status(port, "POST", "/api/v1/idoris/start", Some(&bearer), None),
+        500
+    );
+    let reply = response(port, "GET", "/api/v1/idoris/status", Some(&bearer), None);
+    let (_, body) = reply.split_once("\r\n\r\n").unwrap();
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(body["state"], "failed");
+    assert_eq!(body["last_error"], "persistence_failed");
+    stop(daemon);
+}
+
+#[test]
+fn idoris_restore_persistence_failure_does_not_prevent_daemon_startup() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let root = home
+        .path()
+        .join("Library/Application Support/Agent24/idoris");
+    std::fs::create_dir_all(&root).unwrap();
+    let record = agent24d::idoris_host::Installation {
+        version: "0.4.0".into(),
+        release_dir: root.join("release"),
+        archive_path: root.join("archive.tar.gz"),
+        components_dir: Some(root.join("components")),
+        key_id: Some("vk_fixture".into()),
+        data_port: 8740,
+        admin_port: 8741,
+        roles: vec![],
+        core_reserved_bytes: Some(0),
+        omlx_url: None,
+        omlx_key_id: None,
+        desired_running: true,
+    };
+    std::fs::write(
+        root.join("installation.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let (daemon, port, bearer) = start_with_mode(home.path(), false);
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        status(port, "GET", "/api/v1/models", Some(&bearer), None),
+        200
+    );
+    assert_eq!(
+        status(port, "POST", "/api/v1/idoris/start", Some(&bearer), None),
+        500
+    );
+    let reply = response(port, "GET", "/api/v1/idoris/status", Some(&bearer), None);
+    let (_, body) = reply.split_once("\r\n\r\n").unwrap();
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(body["state"], "failed");
+    assert_eq!(body["last_error"], "persistence_failed");
     stop(daemon);
 }

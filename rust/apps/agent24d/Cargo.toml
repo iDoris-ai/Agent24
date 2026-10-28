@@ -107,5 +107,8 @@ tokio = { version = "1", features = ["test-util"] }
 # version/feature set `agent24-cli`'s TUI already uses as a client.
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libproc = "0.14"
+
 [lints]
 workspace = true

@@ -2,6 +2,10 @@ import { defineMessages } from '../i18n'
 
 export const runsMessages = defineMessages({
   en: {
+    'headroom.explanation': 'iDoris needs to use memory reserved for the system to load this model. This may slow down your computer.',
+    'headroom.confirm': 'Rerun and confirm',
+    'headroom.hostOnly': 'This run is bound to a Knowledge host. Restart it from the original host so its Knowledge access can be preserved.',
+    'error.supervisorBusy': 'iDoris is busy loading this model. Please try again shortly.',
     'title': 'Runs', 'subtitle': 'Agent run history · Refreshes every 3 seconds',
     'status.queued': 'Queued', 'status.running': 'Running', 'status.awaitingApproval': 'Awaiting approval',
     'status.completed': 'Completed', 'status.failed': 'Failed', 'status.cancelled': 'Cancelled',
@@ -12,6 +16,10 @@ export const runsMessages = defineMessages({
     'usage.short': '{count} tok', 'usage.full': '{count} tokens',
   },
   zh: {
+    'headroom.explanation': 'iDoris 需要占用为系统保留的内存余量才能加载这个模型，可能让电脑变慢。',
+    'headroom.confirm': '重新运行并确认',
+    'headroom.hostOnly': '此任务绑定了 Knowledge 宿主，请从原宿主重新发起，以保留其知识访问权限。',
+    'error.supervisorBusy': 'iDoris 正在加载这个模型，请稍后重试。',
     'title': '运行任务', 'subtitle': 'Agent 运行历史 · 每 3 秒刷新',
     'status.queued': '排队', 'status.running': '运行中', 'status.awaitingApproval': '待审批',
     'status.completed': '已完成', 'status.failed': '失败', 'status.cancelled': '已取消',
@@ -22,6 +30,10 @@ export const runsMessages = defineMessages({
     'usage.short': '{count} tok', 'usage.full': '{count} tokens',
   },
   th: {
+    'headroom.explanation': 'iDoris ต้องใช้หน่วยความจำที่สำรองไว้สำหรับระบบเพื่อโหลดโมเดลนี้ ซึ่งอาจทำให้คอมพิวเตอร์ของคุณช้าลง',
+    'headroom.confirm': 'รันอีกครั้งและยืนยัน',
+    'headroom.hostOnly': 'งานนี้ผูกกับโฮสต์ Knowledge โปรดเริ่มใหม่จากโฮสต์เดิมเพื่อคงสิทธิ์เข้าถึงความรู้',
+    'error.supervisorBusy': 'iDoris กำลังโหลดโมเดลนี้ โปรดลองอีกครั้งในอีกสักครู่',
     'title': 'งานที่รัน', 'subtitle': 'ประวัติการทำงานของ Agent · อัปเดตทุก 3 วินาที',
     'status.queued': 'รอคิว', 'status.running': 'กำลังทำงาน', 'status.awaitingApproval': 'รออนุมัติ',
     'status.completed': 'เสร็จแล้ว', 'status.failed': 'ล้มเหลว', 'status.cancelled': 'ยกเลิกแล้ว',

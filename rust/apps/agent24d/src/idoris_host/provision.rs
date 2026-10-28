@@ -648,8 +648,15 @@ impl IdorisHost {
             self.router.replace_idoris(gateway);
             i.installation = Some(pending.candidate.clone());
             i.supervisor = new_supervisor.take();
+            i.generation = Some(id.to_owned());
             drop(i);
-            self.monitor(ready, pending.candidate.clone(), cancel.clone(), failure);
+            self.monitor(
+                ready,
+                pending.candidate.clone(),
+                id.to_owned(),
+                cancel.clone(),
+                failure,
+            );
             Ok(())
         }
         .await;
