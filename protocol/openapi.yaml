@@ -2882,11 +2882,64 @@ paths:
         "504":
           $ref: "#/components/responses/CommTimeout"
 
+  /comm/install:
+    post:
+      operationId: installCommComponent
+      tags: [comm]
+      summary: Download and set up the pinned Hyphae release
+      x-comm-tier: ComponentInstall
+      x-operation-level: elevated
+      x-cli: agent24 comm install --json
+      description: >-
+        Host-only elevated operation: downloads and installs executable code. No request body or URL overrides.
+        HTTPS redirects are host allowlisted and SHA-256 comes from the embedded upstream lock.
+        Repeated installs reverify existing bytes. The daemon rebuilds comm state without restarting.
+        CLI `agent24 comm install --json` prints the data object from this envelope to stdout;
+        progress is suppressed in JSON mode. Otherwise progress is written to stderr.
+        If restart_required is true, reason explains why communication could not be rebuilt.
+      responses:
+        "200":
+          description: Hyphae installed and comm state rebuilt
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, data]
+                properties:
+                  ok:
+                    type: boolean
+                    const: true
+                  data:
+                    $ref: "#/components/schemas/CommInstallResult"
+        "409":
+          description: hyphae_unsupported_platform (including null lock digests)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommError"
+        "422":
+          description: hyphae_hash_mismatch (downloaded or installed bytes rejected)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommError"
+        "502":
+          description: hyphae_download_failed (network, cancellation, storage or shutdown)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommError"
+
   /comm/daemon:
     get:
       operationId: getCommDaemon
       tags: [comm]
       summary: Hyphae daemon status (process, relay probe, catch-up)
+      description: >-
+        Always returns 200 when comm is not configured, with process.state not_configured.
+        data.installable indicates a platform with both release asset and non-null lock hash.
+        data.installed_version is the component tag (v0.27.2) after full hash revalidation,
+        or null when absent or rejected. Developer and sibling binaries do not count as installed components.
       responses:
         "200":
           description: Hyphae envelope `{ok:true,data}`
@@ -3708,6 +3761,22 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/ModuleProxyError" }
   schemas:
+    CommInstallResult:
+      type: object
+      additionalProperties: false
+      required: [installed_version, path, restart_required, reason]
+      properties:
+        installed_version:
+          type: string
+          example: v0.27.2
+        path:
+          type: string
+          description: Absolute installed component path
+        restart_required:
+          type: boolean
+        reason:
+          type: [string, "null"]
+
     DomainOsView:
       type: object
       required: [name, namespace, version, enabled, state, granted, missing_models, resources, restart_required]
@@ -6011,7 +6080,7 @@ components:
     CommErrorCode:
       type: string
       description: Closed set (COMM-HYPHAE.md section 4).
-      enum: [binary_rejected, unsupported_platform, locked, not_configured, invalid, not_found, confirm_required, conflict, network, partial, timeout, upstream]
+      enum: [hyphae_unsupported_platform, hyphae_download_failed, hyphae_hash_mismatch, binary_rejected, unsupported_platform, locked, not_configured, invalid, not_found, confirm_required, conflict, network, partial, timeout, upstream]
     CommError:
       type: object
       description: >-

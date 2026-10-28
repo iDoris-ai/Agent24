@@ -448,6 +448,15 @@ export function registerIpcHandlers(options: {
     return proxyToBackend(req, timeoutFor(route))
   })
 
+  // Executable installation is elevated and must never use the generic proxy.
+  handle(IpcChannels.CommInstall, (event): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      const ok = await confirmNative(event, mt('comm.install'), mt('comm.installDetail'))
+      if (!ok) return cancelled()
+      return proxyToBackend({ method: 'POST', path: '/api/v1/comm/install' }, 360_000)
+    }),
+  )
+
   // A1: POST /api/v1/approvals/{id} — an elevated operation, so it is not on
   // the generic proxy. The native dialog shows the daemon's OWN record of the
   // approval (read here, by id), never text supplied by the page; the page's

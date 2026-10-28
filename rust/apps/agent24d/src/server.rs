@@ -792,6 +792,7 @@ fn operation_name(operation: crate::capabilities::Operation) -> &'static str {
     use crate::capabilities::Operation;
     match operation {
         Operation::ModelsAdmin => "models.admin",
+        Operation::ComponentInstall => "component.install",
         Operation::WorkspaceCreate => "workspace.create",
         Operation::WorkspaceRelease => "workspace.release",
         Operation::HostLease => "host.lease",
@@ -1040,6 +1041,10 @@ pub(crate) fn required_operation(method: &Method, path: &str) -> crate::capabili
         && path.ends_with("/revoke")
     {
         Operation::CapabilityRevoke
+    } else if method == Method::POST && path == "/api/v1/comm/install" {
+        // HY-1: downloads and installs an executable. Host-only here; the
+        // CORE-2 route table (ab/core) lists it as Elevated when the lines meet.
+        Operation::ComponentInstall
     } else if path.starts_with("/api/v1/host/knowledge/") {
         // Host-only, and never in the Creative allow-list; the handlers also
         // refuse legacy mode and any non-host audience (crate::knowledge_host).
@@ -3447,7 +3452,7 @@ pub(crate) mod tests {
     // COMM routes are mounted by server::serve, outside the scanned builder, so
     // their literals are scanned from the agent24-comm sources instead
     // (`comm_route_literals`); they are covered by the same gate, no exemption.
-    const COMM_ROUTE_SOURCES: [(&str, &str); 2] = [
+    const COMM_ROUTE_SOURCES: [(&str, &str); 3] = [
         (
             include_str!("../../../crates/agent24-comm/src/router.rs"),
             "pub fn router(",
@@ -3456,6 +3461,7 @@ pub(crate) mod tests {
             include_str!("../../../crates/agent24-comm/src/groupchat.rs"),
             "pub(crate) fn routes(",
         ),
+        (include_str!("comm_routes.rs"), "fn runtime_router("),
     ];
 
     /// `.route("<path>"` literals inside the function starting at `anchor`.
@@ -3788,6 +3794,34 @@ pub(crate) mod tests {
         let (creative_bearer, _, _) = creative.into_bearer_parts();
         state.enable_capability_auth(store);
         (state, host_bearer, creative_bearer)
+    }
+
+    #[tokio::test]
+    async fn component_install_requires_host_authority_before_dispatch() {
+        let (state, host, creative) = capability_state().await;
+        let modules = Router::new().route(
+            "/api/v1/comm/install",
+            axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+        );
+        let app = build_router_with_modules(state, modules);
+        for (bearer, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some(creative), StatusCode::FORBIDDEN),
+            (Some(host), StatusCode::NO_CONTENT),
+        ] {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/comm/install");
+            if let Some(bearer) = bearer {
+                req = req.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+            }
+            let res = app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), expected);
+        }
     }
 
     #[tokio::test]

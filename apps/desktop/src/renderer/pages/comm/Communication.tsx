@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   CommApiError,
   getCommStatus,
+  installComm,
   listCommContacts,
   listCommIdentities,
   listCommRelays,
@@ -17,7 +18,7 @@ import { translate, useT } from '../../i18n'
 import { communicationMessages } from './Communication.i18n'
 import './communication.css'
 
-type WriteAction = 'start' | 'stop' | 'unlock'
+type WriteAction = 'start' | 'stop' | 'unlock' | 'install'
 
 function messageOf(error: unknown, secret = ''): string {
   const text = error instanceof Error ? error.message : String(error)
@@ -140,7 +141,12 @@ export default function CommunicationPage() {
     const submittedPassword = action === 'unlock' ? password : ''
     if (action === 'unlock') setPassword('')
     try {
-      if (action === 'start') {
+      if (action === 'install') {
+        const result = await installComm()
+        if (mounted.current && token === sequence.current) {
+          setNotice(result.restart_required ? t('notice.restart', { reason: result.reason ?? '' }) : t('notice.installed'))
+        }
+      } else if (action === 'start') {
         await startCommDaemon()
         if (mounted.current && token === sequence.current) setNotice(t('notice.start'))
       } else if (action === 'stop') {
@@ -155,7 +161,7 @@ export default function CommunicationPage() {
     } catch (error) {
       if (mounted.current && token === sequence.current) {
         const code = typeof error === 'object' && error !== null && 'code' in error
-          ? (error as { code?: unknown }).code : undefined
+          ? error.code : undefined
         const knownCodes = ['binary_rejected', 'not_configured', 'locked', 'password_rejected', 'keychain_unavailable']
         const reason = typeof code === 'string' && knownCodes.includes(code)
           ? t('error.reasonPrefix', { code, reason: reasonLabel(code) }) : ''
@@ -183,6 +189,7 @@ export default function CommunicationPage() {
 
       {loadError && <div role="alert" className="comm-alert">{loadError}</div>}
       {actionError && <div role="alert" className="comm-alert">{t('error.action', { message: actionError })}</div>}
+      {pending === 'install' && <p role="status">{t('action.installing')}</p>}
       {notice && <div role="status" className="comm-notice">{notice}</div>}
 
       {notConfigured && (
@@ -190,7 +197,10 @@ export default function CommunicationPage() {
           <h2>{t(notConfigured.kind === 'config' ? 'setup.configTitle' : 'setup.title')}</h2>
           {notConfigured.kind === 'config' ? <p className="comm-muted">{t('setup.configGuide')}</p> : notConfigured.kind === 'binary' ? <>
             <p className="comm-muted">{t('setup.binaryGuide')}</p>
-            <p><code>{t('setup.binaryCommand')}</code></p>
+            {daemon?.installable === true ? <button type="button" disabled={pending !== null}
+              onClick={() => void runAction('install')}>
+              {pending === 'install' ? t('action.installing') : t('action.install')}
+            </button> : <p className="comm-muted">{t('setup.unsupported')}</p>}
           </> : <>
             <p className="comm-muted">{t('setup.guide')}</p>
             <p><code>{t('setup.command')}</code></p>
