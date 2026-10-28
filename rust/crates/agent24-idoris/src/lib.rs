@@ -1,5 +1,6 @@
 //! Pinned iDoris release metadata and launcher contract compatibility.
 
+pub mod download;
 #[cfg(unix)]
 pub mod omlx_probe;
 
