@@ -77,10 +77,10 @@ const RULES: Array<{ name: string; bad: RegExp }> = [
   { name: '"please" must be โปรด, not กรุณา', bad: /กรุณา/ },
   { name: '"schedule" must be กำหนดการ, not ตารางเวลา', bad: /ตารางเวลา/ },
   // Round 3 (Arm, from real Thai localizations, audit-2): memory feature, restart, ๆ, run, approval, stale.
-  { name: 'memory feature must be ความทรงจำ, not ความจำ (หน่วยความจำ = RAM is fine)', bad: /(?<!หน่วย)(?<!ทรง)ความจำ/ },
+  { name: 'memory feature must be ความทรงจำ, not ความจำ (หน่วยความจำ = RAM is fine)', bad: /(?<!หน่วย)(?<!ทรง)ความจำ(?!เป็น)/ },
   { name: '"restart" must be รีสตาร์ท, not รีสตาร์ต', bad: /รีสตาร์ต/ },
   { name: 'no whitespace before ๆ (write ทุกๆ, not ทุก ๆ)', bad: /\sๆ/ },
-  { name: '"run" as a verb must be เรียกใช้, not รัน (รันไทม์ = runtime is fine)', bad: /รัน(?!ไทม์)/ },
+  { name: '"run" as a verb must be เรียกใช้, not รัน (รันไทม์ = runtime is fine)', bad: /(?:^|[\s“"'▶(]|กำลัง|ที่|เพื่อ|จะ|ให้|ได้|แล้ว)รัน(?!ไทม์)/ },
   { name: '"awaiting approval" must be รอการอนุมัติ, not รออนุมัติ', bad: /รออนุมัติ/ },
   { name: '"stale data" must be ล้าสมัย, not ไม่เป็นปัจจุบัน', bad: /ไม่เป็นปัจจุบัน/ },
 ]
@@ -105,6 +105,17 @@ describe('Thai UI copy', () => {
       expect(hits).toEqual([])
     })
   }
+
+  // The ban rules must not hit normal Thai words (answers review of #1440, Low L1).
+  it('memory and run rules do not hit ความจำเป็น / การันตี, but hit the banned uses', () => {
+    const rule = (part: string) => RULES.find((r) => r.name.includes(part))!.bad
+    const memory = rule('memory feature')
+    const run = rule('"run" as a verb')
+    for (const ok of ['ความจำเป็น', 'หน่วยความจำ']) expect(memory.test(ok), ok).toBe(false)
+    for (const bad of ['ความจำ', 'ค้นหาความจำ']) expect(memory.test(bad), bad).toBe(true)
+    for (const ok of ['การันตี', 'รันไทม์']) expect(run.test(ok), ok).toBe(false)
+    for (const bad of ['▶ รัน', 'กำลังรัน…', 'งานที่รัน', 'เพื่อรันโค้ด', 'รันทันที', 'ทุกครั้งที่รัน']) expect(run.test(bad), bad).toBe(true)
+  })
 
   // The parser must not silently skip entries (OA-M1-07, answers review of #1175, Low 2).
   it('parser reads dash and colon keys and single, double and backtick values', () => {
