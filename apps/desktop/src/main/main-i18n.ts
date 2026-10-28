@@ -21,6 +21,11 @@ export function isMainLocale(v: unknown): v is MainLocale {
 }
 
 const en = {
+  'presence.title': 'Confirm on this computer',
+  'presence.message': '{requester} (pid {pid}) is asking for permission: {operation}',
+  'presence.detail': '{summary}\n\nOnly allow this if you started it yourself.',
+  'presence.allow': 'Allow',
+  'presence.deny': 'Deny',
   'tray.running': '● daemon: running',
   'tray.starting': '○ daemon: starting…',
   'tray.stopped': '✕ daemon: stopped',
@@ -69,6 +74,11 @@ const en = {
 export type MainMessageKey = keyof typeof en
 
 const zh: Record<MainMessageKey, string> = {
+  'presence.title': '请在本机确认',
+  'presence.message': '{requester}（pid {pid}）请求授权：{operation}',
+  'presence.detail': '{summary}\n\n只有确定是你自己发起的操作，才选择允许。',
+  'presence.allow': '允许',
+  'presence.deny': '拒绝',
   'tray.running': '● daemon：运行中',
   'tray.starting': '○ daemon：启动中…',
   'tray.stopped': '✕ daemon：已停止',
@@ -115,6 +125,11 @@ const zh: Record<MainMessageKey, string> = {
 }
 
 const th: Record<MainMessageKey, string> = {
+  'presence.title': 'ยืนยันบนเครื่องนี้',
+  'presence.message': '{requester} (pid {pid}) ขออนุญาต: {operation}',
+  'presence.detail': '{summary}\n\nอนุญาตเฉพาะเมื่อคุณเป็นผู้เริ่มการดำเนินการนี้เอง',
+  'presence.allow': 'อนุญาต',
+  'presence.deny': 'ปฏิเสธ',
   'tray.running': '● daemon: กำลังทำงาน',
   'tray.starting': '○ daemon: กำลังเริ่ม…',
   'tray.stopped': '✕ daemon: หยุดแล้ว',

@@ -48,6 +48,9 @@ pub struct AppState {
     /// KB-HOST-01: the Knowledge bindings the product host activated, in
     /// memory only (see `crate::knowledge_host`).
     pub knowledge_host: Arc<crate::knowledge_host::KnowledgeHostRegistry>,
+    /// CORE-2 AgentEar S3: the desktop confirmation queue behind
+    /// `/api/v1/presence/challenges/*`.
+    pub presence_desktop: Option<Arc<crate::presence_desktop::DesktopPresence>>,
     /// D2 router: every model call goes through tier routing + health/cooldown,
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
@@ -685,6 +688,7 @@ impl AppState {
             module_surfaces: Arc::new(Vec::new()),
             delegations: Arc::new(crate::capabilities::delegation::Delegations::default()),
             knowledge_host: Arc::new(crate::knowledge_host::KnowledgeHostRegistry::default()),
+            presence_desktop: None,
             mcp_servers: Arc::new(mcp_servers),
             router,
             tools,
@@ -735,6 +739,13 @@ impl AppState {
             crate::capabilities::first_party::FirstPartyAuthority::new(store.clone()),
         ));
         self.capabilities = Some(store);
+    }
+
+    /// Share one queue between enrolment confirmation and ProductHost HTTP.
+    fn enable_desktop_presence(&mut self) {
+        let presence = Arc::new(crate::presence_desktop::DesktopPresence::new());
+        self.presence_provider = Some(presence.clone());
+        self.presence_desktop = Some(presence);
     }
 
     /// Re-read the override set after the user changed it.
@@ -1513,11 +1524,25 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             "/api/v1/peer/runs/{id}",
             get(crate::peer_runs::get_peer_run),
         )
-        .fallback(fallback)
-        .with_state(state.clone());
+        .fallback(fallback);
+
+    let kernel = if state.auth_mode == AuthMode::Capabilities {
+        kernel
+            .route(
+                "/api/v1/presence/challenges/next",
+                get(crate::presence_desktop::get_next),
+            )
+            .route(
+                "/api/v1/presence/challenges/{id}",
+                post(crate::presence_desktop::post_decision),
+            )
+    } else {
+        kernel
+    };
 
     // Modules first, auth last — see the doc comment above.
     kernel
+        .with_state(state.clone())
         .merge(modules)
         .layer(middleware::from_fn_with_state(state, auth))
 }
@@ -2159,6 +2184,9 @@ pub async fn serve(
     });
     if let Some(capability_store) = capability_store {
         state.enable_capability_auth(capability_store);
+        if mode == StartupMode::HostChild {
+            state.enable_desktop_presence();
+        }
         state.delegations = Arc::new(crate::capabilities::delegation::Delegations::open(
             &state_dir,
         )?);
@@ -3818,6 +3846,10 @@ pub(crate) mod tests {
         // KB-HOST-01: the desktop host's private interface (UI-BRIDGE U1.5), not a client contract.
         "/host/knowledge/bindings/{binding_id}",
         "/host/knowledge/bindings/{binding_id}/credential",
+        // CORE-2 AgentEar S3: the desktop main process's confirmation channel, ProductHost
+        // only (slice §3.4) — private to the desktop, not a client contract.
+        "/presence/challenges/next",
+        "/presence/challenges/{id}",
     ];
 
     // Module-owned contract paths appear in OpenAPI but are not literal routes
@@ -4190,6 +4222,7 @@ pub(crate) mod tests {
             .unwrap();
         let (creative_bearer, _, _) = creative.into_bearer_parts();
         state.enable_capability_auth(store);
+        state.enable_desktop_presence();
         (state, host_bearer, creative_bearer)
     }
 
@@ -6869,7 +6902,7 @@ pub fn build_router_with_modules() {
             );
         }
 
-        let state = state().await;
+        let (state, host, _) = capability_state().await;
         let router = router_with_comm(state);
         let trace = Method::from_bytes(b"TRACE").unwrap();
         let mut templates = BTreeSet::new();
@@ -6883,7 +6916,7 @@ pub fn build_router_with_modules() {
                     Request::builder()
                         .method(trace.clone())
                         .uri(concrete_path(&template))
-                        .header(header::AUTHORIZATION, "Bearer testtoken")
+                        .header(header::AUTHORIZATION, format!("Bearer {host}"))
                         .body(Body::empty())
                         .unwrap(),
                 )

@@ -164,8 +164,23 @@ const EXTERNAL_URL_ALLOWLIST = ['https://', 'http://'] as const
 const HOST_INTERFACE = /^\/api\/v1\/host(\/|$)/i
 
 export function reachesHostInterface(requestPath: string): boolean {
+  return reachesPrefix(HOST_INTERFACE, requestPath)
+}
+
+// CORE-2 AgentEar S3: the daemon's desktop confirmation channel
+// (`/api/v1/presence/challenges/…`) belongs to main alone. If the renderer
+// could read or answer a challenge it could approve its own elevation, so the
+// proxy refuses the whole `/presence` subtree on top of the allowlist, by the
+// same raw / decoded / normalized rule as the host interface.
+const PRESENCE_CHANNEL = /^(\/api\/v1)?\/presence(\/|$)/i
+
+export function reachesPresenceChannel(requestPath: string): boolean {
+  return reachesPrefix(PRESENCE_CHANNEL, requestPath)
+}
+
+function reachesPrefix(prefix: RegExp, requestPath: string): boolean {
   const raw = requestPath.split(/[?#]/, 1)[0] ?? ''
-  const hits = (path: string) => HOST_INTERFACE.test(path.replace(/\/{2,}/g, '/'))
+  const hits = (path: string) => prefix.test(path.replace(/\/{2,}/g, '/'))
   if (hits(raw)) return true
   try {
     return hits(new URL(decodeURIComponent(raw), 'http://daemon').pathname)
@@ -414,6 +429,13 @@ export function registerIpcHandlers(options: {
         ok: false,
         status: 403,
         data: { error: { code: 'host_interface_private', message: 'The host interface is not reachable from the renderer' } },
+      }
+    }
+    if (reachesPresenceChannel(req.path)) {
+      return {
+        ok: false,
+        status: 403,
+        data: { error: { code: 'presence_channel_private', message: 'The presence channel is not reachable from the renderer' } },
       }
     }
     // A1: only allowlisted (method, path-template) pairs are forwarded.

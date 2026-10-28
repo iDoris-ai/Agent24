@@ -804,7 +804,7 @@ mod tests {
 }
 
 #[cfg(all(test, unix))]
-mod handshake_tests {
+pub(crate) mod handshake_tests {
     #![allow(clippy::unwrap_used)]
     // Off macOS there is no peer token, so every frame fails closed and the
     // tests that need a successful handshake are macOS-only.
@@ -1135,6 +1135,38 @@ mod handshake_tests {
             })
         }
     }
+    /// Exercise the real handshake without binding a listening socket.
+    pub(crate) async fn desktop_enrollment(
+        authority: Arc<dyn EnrollAuthority>,
+    ) -> (BufReader<tokio::net::UnixStream>, CancellationToken) {
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        #[cfg(target_os = "macos")]
+        let audit_token = Some(agent24_os_proc::peer_audit_token(&server).unwrap());
+        #[cfg(not(target_os = "macos"))]
+        let audit_token = None;
+        let stop = CancellationToken::new();
+        let cancel = stop.clone();
+        let permit = Arc::new(
+            Arc::new(tokio::sync::Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .unwrap(),
+        );
+        tokio::spawn(answer(
+            server,
+            audit_token,
+            "daemon-test".into(),
+            authority,
+            Arc::new(KernelStartVerifier),
+            cancel,
+            permit,
+        ));
+        let mut client = BufReader::new(client);
+        // Server first (design §10 R8): read the challenge, echo its nonce.
+        hello(&mut client, "daemon-test").await;
+        (client, stop)
+    }
+
     #[cfg(target_os = "macos")]
     struct HeldPeer {
         child: tokio::process::Child,

@@ -3,7 +3,7 @@ use super::{Operation, UnixSeconds};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequesterIdentity {
     pub identifier: String,
     pub pid: i32,

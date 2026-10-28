@@ -39,6 +39,9 @@ pub enum Operation {
     ConfigRead,
     ConsentRevoke,
     ModuleRoute,
+    // CORE-2 AgentEar S3: desktop confirmation channel (ProductHost only).
+    PresenceRead,
+    PresenceDecide,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +51,12 @@ pub enum ResourceScope {
 }
 
 impl Operation {
+    /// The desktop confirmation channel (CORE-2 AgentEar S3): ProductHost
+    /// only, never granted to a first-party shell token.
+    pub fn is_presence_channel(self) -> bool {
+        matches!(self, Self::PresenceRead | Self::PresenceDecide)
+    }
+
     pub fn scope(self) -> ResourceScope {
         match self {
             Self::ModelsRead => ResourceScope::Global,
@@ -112,6 +121,8 @@ impl Operation {
             Self::ConfigRead => "config.read",
             Self::ConsentRevoke => "consent.revoke",
             Self::ModuleRoute => "module.route",
+            Self::PresenceRead => "presence.read",
+            Self::PresenceDecide => "presence.decide",
         }
     }
 
@@ -154,6 +165,8 @@ impl Operation {
             "comm.write" => Self::CommWrite,
             "module.read" => Self::ModuleRead,
             "module.route" => Self::ModuleRoute,
+            "presence.read" => Self::PresenceRead,
+            "presence.decide" => Self::PresenceDecide,
             "schedule.read" => Self::ScheduleRead,
             "usage.read" => Self::UsageRead,
             "config.read" => Self::ConfigRead,
