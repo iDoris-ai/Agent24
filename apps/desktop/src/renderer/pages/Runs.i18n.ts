@@ -22,10 +22,10 @@ export const runsMessages = defineMessages({
     'usage.short': '{count} tok', 'usage.full': '{count} tokens',
   },
   th: {
-    'title': 'งานที่รัน', 'subtitle': 'ประวัติการทำงานของ Agent · อัปเดตทุก 3 วินาที',
-    'status.queued': 'รอคิว', 'status.running': 'กำลังทำงาน', 'status.awaitingApproval': 'รออนุมัติ',
+    'title': 'งาน', 'subtitle': 'ประวัติการทำงานของ Agent · อัปเดตทุก 3 วินาที',
+    'status.queued': 'รอคิว', 'status.running': 'กำลังทำงาน', 'status.awaitingApproval': 'รอการอนุมัติ',
     'status.completed': 'เสร็จแล้ว', 'status.failed': 'ไม่สำเร็จ', 'status.cancelled': 'ยกเลิกแล้ว',
-    'list.empty': 'ยังไม่มีงานที่รัน', 'list.scheduled': 'เริ่มจากกำหนดการ',
+    'list.empty': 'ยังไม่มีงาน', 'list.scheduled': 'เริ่มจากกำหนดการ',
     'detail.select': 'เลือกงานเพื่อดูรายละเอียด', 'detail.cancel': 'ยกเลิก',
     'detail.prompt': 'คำสั่ง:', 'detail.output': 'ผลลัพธ์:', 'detail.error': 'ข้อผิดพลาด [{code}]:',
     'detail.created': 'สร้างเมื่อ {date}', 'detail.ended': 'สิ้นสุดเมื่อ {date}',

@@ -73,7 +73,7 @@ export const settingsMessages = defineMessages({
     'service.apiKey': 'คีย์ API', 'service.apiKeyHint': 'เว้นว่างไว้หากไม่ต้องยืนยันตัวตน',
     'service.optional': 'ไม่บังคับ', 'action.hide': 'ซ่อน', 'action.show': 'แสดง',
     'service.port': 'พอร์ตสำหรับเริ่ม oMLX', 'service.portHint': 'พอร์ตที่ใช้เมื่อคลิก “เริ่ม oMLX”',
-    'models.heading': 'โมเดล — แอปจะจำประเภทที่เลือกไว้ แม้รีสตาร์ต',
+    'models.heading': 'โมเดล — แอปจะจำประเภทที่เลือกไว้ แม้รีสตาร์ท',
     'models.loading': 'กำลังโหลด…', 'models.resident': 'ประจำ', 'models.onDemand': 'ตามต้องการ',
     'models.residentHint': 'โหลดอัตโนมัติเมื่อเริ่มบริการและเก็บไว้ในหน่วยความจำ',
     'models.onDemandHint': 'โหลดเมื่อใช้ครั้งแรก และ oMLX จะปิดเมื่อไม่ได้ใช้',
