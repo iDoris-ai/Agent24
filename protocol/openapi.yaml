@@ -408,6 +408,12 @@ paths:
                 $ref: "#/components/schemas/ChatResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "409":
+          description: iDoris needs user confirmation (idoris_headroom_confirmation_required); resend this request with idoris_headroom_confirmed set to true after confirming.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "503":
           $ref: "#/components/responses/ProviderUnavailable"
 
@@ -3606,7 +3612,7 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     ProviderUnavailable:
-      description: No LLM provider reachable
+      description: No LLM provider reachable, or iDoris lifecycle contention exhausted bounded retries (idoris_supervisor_busy); retry later.
       content:
         application/json:
           schema:
@@ -3929,6 +3935,9 @@ components:
       type: object
       required: [messages]
       properties:
+        idoris_headroom_confirmed:
+          type: boolean
+          description: User confirmed spending iDoris's reserved memory headroom for this request only. Omitted means false.
         messages:
           type: array
           minItems: 1
@@ -4168,6 +4177,9 @@ components:
       type: object
       required: [prompt]
       properties:
+        idoris_headroom_confirmed:
+          type: boolean
+          description: User confirmed spending iDoris's reserved memory headroom for the first model call only; never persisted or inherited by later calls or resumed runs. Omitted means false.
         session_id:
           type: [string, "null"]
           description: Omit/null to create a transient run

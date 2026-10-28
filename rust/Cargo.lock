@@ -167,7 +167,10 @@ dependencies = [
 name = "agent24-idoris"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "nix 0.29.0",
  "reqwest",
+ "rustix 0.38.44",
  "semver",
  "serde",
  "serde_json",
@@ -178,6 +181,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -248,6 +252,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -520,6 +525,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

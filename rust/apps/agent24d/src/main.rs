@@ -194,6 +194,7 @@ fn run_serve(
         host_bootstrap_stdio,
         ready_omit_token,
         cancel,
+        None,
     ));
     // Bounded, not the default `Drop`, which waits for every blocking task:
     // a supervisor walking a large package tree in `spawn_blocking` when the
