@@ -2872,12 +2872,15 @@ fn secure_fallback_dir(path: &std::path::Path) -> Result<(), String> {
 /// If `root` is too long AND its fallback directory is not safe to use (see
 /// [`secure_fallback_dir`]). Does not retry at any other path.
 fn callback_root(root: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    let projected = root
+    // CallbackDir canonicalizes before binding. Measure that same path: on
+    // macOS /var and /tmp expand to /private/var and /private/tmp.
+    let resolved = root.canonicalize().unwrap_or_else(|_| root.to_owned());
+    let projected = resolved
         .join("run")
         .join(std::process::id().to_string())
         .join(format!("{}.sock", u64::MAX));
     if projected.as_os_str().len() <= agent24_os_proto::endpoint::MAX_SOCKET_PATH {
-        return Ok(root.to_owned());
+        return Ok(resolved);
     }
     let fallback =
         std::path::PathBuf::from("/tmp").join(format!("a24-run-{:016x}", fallback_dir_hash(root)));
@@ -6163,6 +6166,24 @@ pub(crate) mod tests {
     /// — never asserted on for its OWN sake.
     fn hashed_fallback_path(root: &std::path::Path) -> std::path::PathBuf {
         std::path::PathBuf::from("/tmp").join(format!("a24-run-{:016x}", fallback_dir_hash(root)))
+    }
+
+    #[tokio::test]
+    async fn callback_root_accounts_for_symlink_expansion_before_choosing_a_socket_path() {
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        let real = base.path().join("x".repeat(100));
+        std::fs::create_dir(&real).unwrap();
+        let alias = base.path().join("short");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let fallback = hashed_fallback_path(&alias);
+
+        // Exercise the real directory creation and bind, not only the length check.
+        let host = process_host(&alias, Duration::from_secs(1)).unwrap();
+        let listener = host.callback_dir.listen_next().unwrap();
+        assert!(listener.path().as_os_str().len() <= agent24_os_proto::endpoint::MAX_SOCKET_PATH);
+        drop(listener);
+        drop(host);
+        std::fs::remove_dir_all(fallback).unwrap();
     }
 
     /// Codex ME4-CODEX-DEBT-10 (#528 High): golden value locking
