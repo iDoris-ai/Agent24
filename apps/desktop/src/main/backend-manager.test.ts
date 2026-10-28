@@ -172,6 +172,24 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
     return ee
   }
 
+  it('退出发生在无 daemon 记录的启动 await 期间，不再 spawn 或启动健康轮询', async () => {
+    vi.useFakeTimers()
+    const spawnProcess = vi.fn(() => fakeChild(111))
+    const external = withProbe({ read: () => null, checkHealth: vi.fn().mockResolvedValue(false) })
+    const manager = new BackendManager({ external, spawnProcess })
+    try {
+      const starting = manager.start()
+      manager.stop()
+      await starting
+      await vi.advanceTimersByTimeAsync(25_000)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      manager.stop()
+      vi.useRealTimers()
+    }
+  })
+
   it('daemon.json present and healthy → reuses it, never spawns', async () => {
     const spawnProcess = vi.fn(() => fakeChild(111))
     const external: ExternalDaemonSource = {

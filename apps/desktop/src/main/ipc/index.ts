@@ -187,7 +187,6 @@ const clip = (text: string, max: number): string =>
 
 // eslint-disable-next-line no-control-regex
 const hasControlChars = (text: string): boolean => /[\u0000-\u001f\u007f]/.test(text)
-const SAFE_MODULE_ID = /^[A-Za-z0-9._-]+$/
 const DECISION_SHAPE = /^[a-z_]{1,64}$/
 
 // Sensitive IPCs share one in-flight slot: a script that fires them in a loop

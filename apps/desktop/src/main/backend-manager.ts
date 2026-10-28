@@ -435,8 +435,9 @@ export class BackendManager {
     // Only "nothing to reuse" may spawn. An incompatible or foreign daemon
     // already holds the singleton lock; spawning fails and the health loop
     // would retry forever.
-    if ((await this.tryReuseExternal()) === 'absent') this.spawnChild()
+    const reuse = await this.tryReuseExternal()
     if (this.disposed) return
+    if (reuse === 'absent') this.spawnChild()
     this.healthTimer = setInterval(() => { void this.tick() }, HEALTH_INTERVAL_MS)
   }
 
