@@ -10,7 +10,7 @@
 
 | 能力 | 状态 | 证据或剩余工作 |
 | --- | --- | --- |
-| Desktop main 只读 Admin consumer | 已实现于main | #772/#789及apps/desktop/src/main/idoris-admin；不等于已有共同launcher或可写Admin。 |
+| Desktop main 只读 Admin consumer | 已移除（IL-13） | #772/#789 的 `idoris-admin.ts` 与 `--idoris-admin-token-fd` 旧路径已删除。桌面改为经 `backendProxy` 调用 daemon 的 `/api/v1/idoris/*`，由 daemon 持有并管理 Admin token，桌面不再持有。入口见 `apps/desktop/src/renderer/components/idoris/api.ts`。 |
 | HW事实/能力快照 | 已实现部分 | [#964](https://github.com/iDoris-ai/Agent24/pull/964)、[#966](https://github.com/iDoris-ai/Agent24/pull/966)已合并；HardwareReport和启动保存hardware.json不等于预算sender。 |
 | iDoris数据面provider与独占配置 | 已实现于ab/idoris | IDORIS-02a/02-04：设 `IDORIS_URL` 时 `ModelRouter` 只走 idoris-local 网关，网关失败原样返回、不回落 omlx/ollama/云端（`router.rs` complete/models 两处早返回）；网关请求不带 temperature（#1365）。 |
 | 数据key与LocalOnly响应验证 | 已实现于ab/idoris | IDORIS-03：`/health` 身份校验（`service`、`contract_version`=1.0.1、非 dev 无 key），每个响应校验 `X-iDoris-Served-Locality`=loopback，Record-Id 形状校验；硬件探测子进程不继承凭据（IDORIS-04b）；Admin token 不是数据key。 |

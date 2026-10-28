@@ -20,7 +20,6 @@ import {
   type DiscoverFilter,
   type DiscoveredModule,
   type LlmStatusResult,
-  type IdorisStatusResult,
   type ModuleInfo,
   type ModuleInstallResult,
   type ModuleUninstallResult,
@@ -99,8 +98,6 @@ const api = {
     ipcRenderer.invoke(IpcChannels.ModulesUninstall, packageName, id),
   llmStatus: (): Promise<LlmStatusResult> =>
     ipcRenderer.invoke(IpcChannels.LlmStatus),
-  idorisStatus: (): Promise<IdorisStatusResult> =>
-    ipcRenderer.invoke(IpcChannels.IdorisStatus),
   // A3-4: subscribe to agentear.event/1 envelopes pushed from main
   // (agentear-events.ts / agentear-log.ts). Returns an unsubscribe function
   // so React effects can clean up on unmount without leaking listeners
