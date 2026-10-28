@@ -1,12 +1,17 @@
 //! Download pinned archives without making them executable.
 
-use crate::IdorisLock;
+use crate::{
+    IdorisLock,
+    install::{OperationLock, operation_lock},
+    storage::{open_regular, prepare_cache},
+};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
     future::Future,
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 use subtle::ConstantTimeEq;
@@ -45,7 +50,7 @@ impl Default for DownloadOptions {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VerifiedArchive {
     pub path: PathBuf,
     pub sha256: String,
@@ -67,10 +72,11 @@ pub enum DownloadError {
     Io(#[from] io::Error),
     #[error("iDoris is unavailable for this platform")]
     UnsupportedPlatform,
+    #[error("iDoris installation is already in progress")]
+    Busy,
 }
 
-/// Fetch or reverify a locked archive. Callers must serialize operations using
-/// the same cache directory, as required by the launcher's installation lock.
+/// Fetch or reverify an archive while holding the managed launcher operation lock.
 pub async fn download_locked_asset(
     lock: &IdorisLock,
     triple: &str,
@@ -79,23 +85,74 @@ pub async fn download_locked_asset(
     cancel: &CancellationToken,
 ) -> Result<VerifiedArchive, DownloadError> {
     download_with(lock, triple, cache_dir, opts, cancel, |url| async move {
-        let client = reqwest::Client::builder()
-            .https_only(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(opts.connect_timeout)
-            .build()
-            .map_err(|_| DownloadError::Network("client initialization"))?;
-        fetch_response(&client, url).await
+        let policy = FetchPolicy::default();
+        let client = fetch_client(opts, &policy)?;
+        fetch_response(&client, url, &policy).await
     })
     .await
+}
+
+#[derive(Default)]
+struct FetchPolicy {
+    // The HTTP exception exists only in unit tests and is restricted to their
+    // exact local origin. Redirects to any other HTTP origin remain forbidden.
+    #[cfg(test)]
+    http_origin: Option<Url>,
+}
+impl FetchPolicy {
+    fn validate(&self, url: &Url) -> Result<(), DownloadError> {
+        #[cfg(test)]
+        if self
+            .http_origin
+            .as_ref()
+            .is_some_and(|origin| origin.origin() == url.origin())
+            && url.username().is_empty()
+            && url.password().is_none()
+        {
+            return Ok(());
+        }
+        validate_url(url)
+    }
+}
+fn fetch_client(
+    opts: &DownloadOptions,
+    policy: &FetchPolicy,
+) -> Result<reqwest::Client, DownloadError> {
+    let https_only = true;
+    #[cfg(test)]
+    let https_only = https_only && policy.http_origin.is_none();
+    let _ = policy;
+    let builder = reqwest::Client::builder();
+    #[cfg(test)]
+    let builder = if let Some(origin) = &policy.http_origin {
+        let address = std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            origin
+                .port()
+                .ok_or(DownloadError::Network("missing local test port"))?,
+        ));
+        builder
+            .no_proxy()
+            .resolve("github.com", address)
+            .resolve("localhost", address)
+    } else {
+        builder
+    };
+    builder
+        .https_only(https_only)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(opts.connect_timeout)
+        .build()
+        .map_err(|_| DownloadError::Network("client initialization"))
 }
 
 async fn fetch_response(
     client: &reqwest::Client,
     mut url: Url,
+    policy: &FetchPolicy,
 ) -> Result<reqwest::Response, DownloadError> {
     for _ in 0..=10 {
-        validate_url(&url)?;
+        policy.validate(&url)?;
         // Never retain reqwest errors: their Display and Debug may contain
         // signed redirect queries. Only static network diagnostics escape.
         let response = client
@@ -112,7 +169,7 @@ async fn fetch_response(
             url = url
                 .join(location)
                 .map_err(|_| DownloadError::Network("invalid redirect location"))?;
-            validate_url(&url)?;
+            policy.validate(&url)?;
         } else if response.status().is_success() {
             return Ok(response);
         } else {
@@ -164,36 +221,60 @@ async fn download_with<S: Source, F: Future<Output = Result<S, DownloadError>>>(
     let url = Url::parse(&lock.asset_url(asset))
         .map_err(|_| DownloadError::Network("invalid locked URL"))?;
     validate_url(&url)?;
-    prepare_cache(cache_dir)?;
-    let part = PartialArchive(cache_dir.join(format!("{}.part", asset.name)));
-    // No resume: resumed bytes would also require a complete hash pass. Discard
-    // partial files to keep this first implementation simple and correct.
-    remove_if_exists(&part.0)?;
-    let verified = cache_dir.join(format!("{}.verified", asset.name));
+    let cache_dir = cache_dir.to_path_buf();
+    let name = asset.name.clone();
+    let state = blocking(move || {
+        let root = prepare_cache(&cache_dir)?;
+        let lock = operation_lock(&root).map_err(|e| match e {
+            crate::install::InstallError::Busy => DownloadError::Busy,
+            _ => io::Error::other(e).into(),
+        })?;
+        let part = cache_dir.join(format!("{name}.part"));
+        remove_if_exists(&part)?;
+        Ok(Arc::new(PartialArchive {
+            path: part,
+            _lock: lock,
+        }))
+    })
+    .await?;
+    let verified = state.path.with_extension("verified");
     let limit = opts.max_bytes.min(MAX_ARCHIVE_BYTES);
+    let worker_cancel = cancel.child_token();
+    let _cancel_on_drop = worker_cancel.clone().drop_guard();
     let operation = async {
-        if let Some(sha256) = cached_hash(&verified, limit).await? {
+        let cached_path = verified.clone();
+        let token = worker_cancel.clone();
+        if let Some(sha256) = disk(state.clone(), move |_| {
+            cached_hash(&cached_path, limit, &token)
+        })
+        .await?
+        {
             if hash_matches(&sha256, &asset.sha256) {
                 return Ok(VerifiedArchive {
                     path: verified,
                     sha256,
                 });
             }
-            remove_if_exists(&verified)?;
+            let path = verified.clone();
+            disk(state.clone(), move |_| Ok(remove_if_exists(&path)?)).await?;
         }
         let mut source = fetch(url).await?;
         if source.content_length().is_some_and(|length| length > limit) {
             return Err(DownloadError::TooLarge);
         }
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&part.0)?;
-        private_file(&file)?;
+        let mut file = disk(state.clone(), |state| {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let file = options.open(&state.path)?;
+            private_file(&file)?;
+            Ok(file)
+        })
+        .await?;
         let mut hash = Sha256::new();
         let mut size = 0u64;
         while let Some(chunk) = source.next_chunk().await? {
@@ -201,36 +282,63 @@ async fn download_with<S: Source, F: Future<Output = Result<S, DownloadError>>>(
                 return Err(DownloadError::TooLarge);
             }
             size += chunk.len() as u64;
-            file.write_all(&chunk)?;
-            hash.update(&chunk);
-            // Yield between bounded file operations so cache hashing and busy
-            // streams remain cancellable on a single-threaded runtime too.
-            tokio::task::yield_now().await;
+            let token = worker_cancel.clone();
+            (file, hash) = disk(state.clone(), move |_| {
+                check_cancel(&token)?;
+                file.write_all(&chunk)?;
+                hash.update(&chunk);
+                Ok((file, hash))
+            })
+            .await?;
         }
         let sha256 = format!("{:x}", hash.finalize());
         if !hash_matches(&sha256, &asset.sha256) {
             return Err(DownloadError::HashMismatch);
         }
-        if cancel.is_cancelled() {
-            return Err(DownloadError::Cancelled);
-        }
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&part.0, &verified)?;
-        Ok(VerifiedArchive {
-            path: verified,
-            sha256,
+        let token = worker_cancel.clone();
+        disk(state.clone(), move |state| {
+            check_cancel(&token)?;
+            file.sync_all()?;
+            drop(file);
+            check_cancel(&token)?;
+            fs::rename(&state.path, &verified)?;
+            Ok(VerifiedArchive {
+                path: verified,
+                sha256,
+            })
         })
+        .await
     };
-    let result = tokio::select! {
+    tokio::select! {
         biased;
         _ = cancel.cancelled() => Err(DownloadError::Cancelled),
         result = tokio::time::timeout(opts.total_timeout, operation) => {
             result.unwrap_or(Err(DownloadError::Network("total timeout")))
         }
-    };
-    remove_if_exists(&part.0)?;
-    result
+    }
+}
+
+fn check_cancel(cancel: &CancellationToken) -> Result<(), DownloadError> {
+    if cancel.is_cancelled() {
+        Err(DownloadError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, DownloadError> + Send + 'static,
+) -> Result<T, DownloadError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))?
+}
+async fn disk<T: Send + 'static>(
+    state: Arc<PartialArchive>,
+    work: impl FnOnce(&PartialArchive) -> Result<T, DownloadError> + Send + 'static,
+) -> Result<T, DownloadError> {
+    // An aborted future cannot release the lock or remove the partial file
+    // until its in-flight disk operation has finished.
+    blocking(move || work(&state)).await
 }
 
 fn validate_url(url: &Url) -> Result<(), DownloadError> {
@@ -247,31 +355,8 @@ fn validate_url(url: &Url) -> Result<(), DownloadError> {
     }
 }
 
-fn hash_matches(actual: &str, expected: &str) -> bool {
+pub(crate) fn hash_matches(actual: &str, expected: &str) -> bool {
     bool::from(actual.as_bytes().ct_eq(expected.as_bytes()))
-}
-
-fn prepare_cache(path: &Path) -> io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(path)?;
-    if !fs::symlink_metadata(path)?.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "cache must be a directory",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
 }
 
 fn private_file(file: &fs::File) -> io::Result<()> {
@@ -283,22 +368,33 @@ fn private_file(file: &fs::File) -> io::Result<()> {
     Ok(())
 }
 
-async fn cached_hash(path: &Path, limit: u64) -> Result<Option<String>, DownloadError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+fn cached_hash(
+    path: &Path,
+    limit: u64,
+    cancel: &CancellationToken,
+) -> Result<Option<String>, DownloadError> {
+    let mut file = match open_regular(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e)
+            if e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error())
+                || e.kind() == io::ErrorKind::InvalidInput =>
+        {
+            remove_if_exists(path)?;
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
     };
-    if !metadata.is_file() || metadata.len() > limit {
+    if file.metadata()?.len() > limit {
         remove_if_exists(path)?;
         return Ok(None);
     }
-    let mut file = fs::File::open(path)?;
     private_file(&file)?;
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     let mut size = 0u64;
     loop {
+        check_cancel(cancel)?;
         let count = file.read(&mut buffer)?;
         if count == 0 {
             break;
@@ -309,7 +405,6 @@ async fn cached_hash(path: &Path, limit: u64) -> Result<Option<String>, Download
             return Ok(None);
         }
         hash.update(&buffer[..count]);
-        tokio::task::yield_now().await;
     }
     Ok(Some(format!("{:x}", hash.finalize())))
 }
@@ -321,12 +416,15 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
-struct PartialArchive(PathBuf);
+struct PartialArchive {
+    path: PathBuf,
+    _lock: OperationLock,
+}
 
 impl Drop for PartialArchive {
     fn drop(&mut self) {
         // Also clean up when the caller drops/aborts the download future.
-        let _ = remove_if_exists(&self.0);
+        let _ = remove_if_exists(&self.path);
     }
 }
 
