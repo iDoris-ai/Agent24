@@ -23,6 +23,8 @@ export const CAPABILITIES: readonly CapabilityDef[] = [
   capability('communication', 'services'),
 ]
 
+const RESERVED_IDS = new Set(['capabilities', 'settings', 'home', ...CAPABILITIES.map(d => d.id)])
+
 /** Accept only display metadata; manifests cannot add privileged routes or replace builtins. */
 export function withDynamicCapabilities(manifests: unknown): readonly CapabilityDef[] {
   const defs = [...CAPABILITIES]
@@ -32,11 +34,17 @@ export function withDynamicCapabilities(manifests: unknown): readonly Capability
     const m: unknown = value
     if (!m || typeof m !== 'object' || !('id' in m) || typeof m.id !== 'string' || !m.id
       || !('name' in m) || typeof m.name !== 'string' || !m.name || ('enabled' in m && m.enabled === false)
-      || !('type' in m) || (m.type !== 'ui' && m.type !== 'hybrid') || seen.has(m.id)) continue
+      || !('type' in m) || (m.type !== 'ui' && m.type !== 'hybrid')) continue
+    if (RESERVED_IDS.has(m.id) || m.id.startsWith('settings/')) {
+      console.warn('Ignoring reserved capability manifest', { id: m.id })
+      continue
+    }
+    if (seen.has(m.id)) continue
     seen.add(m.id)
     defs.push({
       id: m.id, group: 'domainOs', builtin: false, page: `module:${m.id}`,
-      ...registerDynamicMessages(m.id, m.name, 'description' in m && typeof m.description === 'string' ? m.description : undefined),
+      ...registerDynamicMessages(m.id, Array.from(m.name).slice(0, 64).join(''),
+        'description' in m && typeof m.description === 'string' ? Array.from(m.description).slice(0, 200).join('') : undefined),
     })
   }
   return defs

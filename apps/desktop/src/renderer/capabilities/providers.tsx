@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   CapabilitiesContext, NavPrefsContext, NAV_PREFS_DEFAULT, clampPrefs,
-  type CapabilityId, type NavPrefs, type OpenOrigin,
+  type CapabilityId, type NavPrefsApi, type OpenOrigin,
 } from './types'
 import { CAPABILITIES, withDynamicCapabilities } from './registry'
 
@@ -61,28 +61,41 @@ export function CapabilitiesProvider({ children }: { children: ReactNode }) {
 
 export function NavPrefsProvider({ children }: { children: ReactNode }) {
   const { defs } = useContext(CapabilitiesContext)
-  // Keep raw ids until manifests arrive, so startup cannot discard a pinned dynamic module.
   const [stored, setStored] = useState(NAV_PREFS_DEFAULT)
-  const revision = useRef(0)
+  const latest = useRef(NAV_PREFS_DEFAULT)
   const writes = useRef<Promise<void>>(Promise.resolve())
   useEffect(() => {
     let disposed = false
-    const initialRevision = revision.current
-    void window.agent24.getNavPrefs?.().then(value => {
-      if (!disposed && revision.current === initialRevision) setStored(value)
+    writes.current = Promise.resolve().then(() => window.agent24.getNavPrefs?.()).then(value => {
+      if (!disposed && value) {
+        latest.current = value
+        setStored(value)
+      }
     }).catch(() => { /* Main supplies defaults for damaged files; IPC failure uses defaults too. */ })
     return () => { disposed = true }
   }, [])
 
-  const setPrefs = (next: NavPrefs): Promise<CapabilityId[]> => {
-    const normalized = clampPrefs(next, defs)
-    ++revision.current
+  const setPrefs: NavPrefsApi['setPrefs'] = (next) => {
     const write = writes.current.catch(() => {}).then(async () => {
+      const prev = latest.current
+      const requested = typeof next === 'function' ? next({ ...prev, pinned: [...prev.pinned] }) : { ...next, pinned: [...next.pinned] }
+      if (typeof next !== 'function') {
+        // A displayed snapshot cannot explicitly remove a hidden pin.
+        const known = new Set(defs.map(d => d.id))
+        prev.pinned.forEach((id, index) => {
+          if (!known.has(id) && !requested.pinned.includes(id)) requested.pinned.splice(index, 0, id)
+        })
+      }
+      requested.pinned = requested.pinned.filter(id => prev.pinned.includes(id) || defs.some(d => d.id === id))
+      const normalized = clampPrefs(requested, defs, true)
       await window.agent24.setNavPrefs(normalized.prefs)
+      latest.current = normalized.prefs
       setStored(normalized.prefs)
+      return normalized.dropped
     })
-    writes.current = write
-    return write.then(() => normalized.dropped)
+    writes.current = write.then(() => {}, () => {})
+    return write
   }
-  return <NavPrefsContext.Provider value={{ prefs: clampPrefs(stored, defs).prefs, setPrefs }}>{children}</NavPrefsContext.Provider>
+  const raw = clampPrefs(stored, defs, true).prefs
+  return <NavPrefsContext.Provider value={{ prefs: clampPrefs(raw, defs).prefs, pinnedCount: raw.pinned.length, setPrefs }}>{children}</NavPrefsContext.Provider>
 }

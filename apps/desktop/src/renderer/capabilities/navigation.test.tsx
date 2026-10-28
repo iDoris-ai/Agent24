@@ -8,6 +8,7 @@ import { CapabilitiesProvider, NavPrefsProvider, useCapabilityRoute } from './pr
 import { CapabilitiesContext, NavPrefsContext, NAV_PREFS_DEFAULT, type NavPrefs, type NavPrefsApi } from './types'
 import { CAPABILITIES } from './registry'
 import CapabilitiesPage from '../pages/Capabilities'
+import { SidebarPrefs } from '../pages/settings/SidebarPrefs'
 
 describe('Sidebar', () => {
   it('renders fixed entries, ordered pins, empty slots, hidden Overview and approval badges', () => {
@@ -136,12 +137,139 @@ describe('capability routing', () => {
 
 function PrefsEditor() {
   const { prefs, setPrefs } = useContext(NavPrefsContext)
-  return <><output>{JSON.stringify(prefs)}</output><button onClick={() => void setPrefs({ pinned: ['assistant', 'voice', 'voice', 'memory', 'unknown'], slotCount: 1, showOverview: false }).then(ids => {
+  return <><output aria-label="Preferences">{JSON.stringify(prefs)}</output><button onClick={() => void setPrefs({ pinned: ['assistant', 'voice', 'voice', 'memory', 'unknown'], slotCount: 1, showOverview: false }).then(ids => {
     document.title = ids.join(',')
   })}>Save</button></>
 }
 
 describe('NavPrefsProvider', () => {
+  function renderEditor(children = <CapabilitiesPage />) {
+    return render(<CapabilitiesProvider><NavPrefsProvider>{children}<PrefsEditor /></NavPrefsProvider></CapabilitiesProvider>)
+  }
+
+  function installPrefs(getNavPrefs: () => Promise<NavPrefs>, setNavPrefs = vi.fn().mockResolvedValue(undefined), backendProxy = vi.fn().mockResolvedValue({ ok: false })) {
+    Object.defineProperty(window, 'agent24', { configurable: true, writable: true, value: {
+      getNavPrefs, setNavPrefs, backendProxy,
+    } })
+    return setNavPrefs
+  }
+
+  it.each(['capabilities', 'settings'])('preserves offline dynamic pins when %s toggles Overview', async page => {
+    const setNavPrefs = installPrefs(async () => ({ pinned: ['documents', 'acme'], slotCount: 3, showOverview: true }))
+    renderEditor(page === 'settings' ? <SidebarPrefs /> : <CapabilitiesPage />)
+    await waitFor(() => expect(screen.getByLabelText('Preferences')).toHaveTextContent('"pinned":["documents"]'))
+    fireEvent.click(screen.getByRole(page === 'settings' ? 'switch' : 'checkbox', { name: 'Show Overview in sidebar' }))
+    await waitFor(() => expect(setNavPrefs).toHaveBeenCalledWith({ pinned: ['documents', 'acme'], slotCount: 3, showOverview: false }))
+  })
+
+  it('keeps hidden pins in order and counts them against slots when adding a pin', async () => {
+    const setNavPrefs = installPrefs(async () => ({ pinned: ['acme', 'documents'], slotCount: 3, showOverview: true }))
+    renderEditor()
+    await waitFor(() => expect(screen.getByLabelText('Preferences')).toHaveTextContent('"pinned":["documents"]'))
+    fireEvent.click(screen.getByRole('button', { name: 'Pin Design' }))
+    await waitFor(() => expect(setNavPrefs).toHaveBeenCalledWith({ pinned: ['acme', 'documents', 'design'], slotCount: 3, showOverview: true }))
+    fireEvent.click(screen.getByRole('button', { name: /(?:Pin|Slots full) Create/ }))
+    await act(async () => {})
+    expect(setNavPrefs).toHaveBeenCalledTimes(1)
+    fireEvent.click(screen.getByRole('button', { name: 'Pinned Documents' }))
+    await waitFor(() => expect(setNavPrefs).toHaveBeenLastCalledWith({ pinned: ['acme', 'design'], slotCount: 3, showOverview: true }))
+  })
+
+  it('merges hidden pins into value snapshots and lets an updater explicitly unpin them', async () => {
+    const setNavPrefs = installPrefs(async () => ({ pinned: ['acme', 'documents'], slotCount: 3, showOverview: true }))
+    function Editor() {
+      const { prefs, setPrefs } = useContext(NavPrefsContext)
+      return <>
+        <button onClick={() => void setPrefs({ ...prefs, showOverview: false })}>Snapshot</button>
+        <button onClick={() => void setPrefs(prev => ({ ...prev, pinned: prev.pinned.filter(id => id !== 'acme') }))}>Unpin acme</button>
+      </>
+    }
+    renderEditor(<Editor />)
+    await waitFor(() => expect(screen.getByLabelText('Preferences')).toHaveTextContent('"pinned":["documents"]'))
+    fireEvent.click(screen.getByRole('button', { name: 'Snapshot' }))
+    await waitFor(() => expect(setNavPrefs).toHaveBeenLastCalledWith({ pinned: ['acme', 'documents'], slotCount: 3, showOverview: false }))
+    fireEvent.click(screen.getByRole('button', { name: 'Unpin acme' }))
+    await waitFor(() => expect(setNavPrefs).toHaveBeenLastCalledWith({ pinned: ['documents'], slotCount: 3, showOverview: false }))
+  })
+
+  it('retains hidden pins when reducing slots and reports the visible pins removed', async () => {
+    const setNavPrefs = installPrefs(async () => ({ pinned: ['documents', 'acme', 'design'], slotCount: 3, showOverview: true }))
+    renderEditor(<SidebarPrefs />)
+    await waitFor(() => expect(screen.getByLabelText('Preferences')).toHaveTextContent('"pinned":["documents","design"]'))
+    fireEvent.click(screen.getByRole('button', { name: 'Fewer pinned slots' }))
+    await waitFor(() => expect(setNavPrefs).toHaveBeenLastCalledWith({ pinned: ['documents', 'acme'], slotCount: 2, showOverview: true }))
+    expect(screen.getByText('Unpinned Design. They are still in Capabilities.')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Fewer pinned slots' }))
+    await waitFor(() => expect(setNavPrefs).toHaveBeenLastCalledWith({ pinned: ['acme'], slotCount: 1, showOverview: true }))
+    expect(screen.getByText('Unpinned Documents. They are still in Capabilities.')).toBeInTheDocument()
+  })
+
+  it('shows the saved dynamic pin again when its manifest recovers after an offline edit', async () => {
+    vi.useFakeTimers()
+    let online = false
+    const backendProxy = vi.fn().mockImplementation(({ path }: { path: string }) => Promise.resolve({ ok: online,
+      data: path === '/api/modules' ? [{ id: 'acme', type: 'ui', name: 'Acme' }] : { approvals: [] },
+    }))
+    const setNavPrefs = installPrefs(async () => ({ pinned: ['documents', 'acme'], slotCount: 3, showOverview: true }), vi.fn().mockResolvedValue(undefined), backendProxy)
+    const view = renderEditor()
+    try {
+      await act(async () => {})
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Show Overview in sidebar' }))
+      await act(async () => {})
+      expect(setNavPrefs).toHaveBeenCalledWith({ pinned: ['documents', 'acme'], slotCount: 3, showOverview: false })
+      online = true
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(screen.getByLabelText('Preferences')).toHaveTextContent('"pinned":["documents","acme"]')
+      expect(screen.getByRole('button', { name: 'Pinned Acme' })).toBeInTheDocument()
+    } finally {
+      view.unmount()
+      vi.useRealTimers()
+    }
+  })
+
+  it('retains both rapid Pin Design and Pin Create edits while the first write is pending', async () => {
+    let finishWrite = () => {}
+    const write = new Promise<void>(resolve => { finishWrite = resolve })
+    const setNavPrefs = installPrefs(async () => ({ pinned: ['documents'], slotCount: 3, showOverview: true }),
+      vi.fn().mockReturnValueOnce(write).mockResolvedValue(undefined))
+    renderEditor()
+    await waitFor(() => expect(screen.getByLabelText('Preferences')).toHaveTextContent('"pinned":["documents"]'))
+    fireEvent.click(screen.getByRole('button', { name: 'Pin Design' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Pin Create' }))
+    await waitFor(() => expect(setNavPrefs).toHaveBeenCalledTimes(1))
+    await act(async () => { finishWrite() })
+    expect(setNavPrefs.mock.calls.map(([prefs]) => prefs.pinned)).toEqual([
+      ['documents', 'design'], ['documents', 'design', 'create'],
+    ])
+    expect(screen.getByLabelText('Preferences')).toHaveTextContent('"pinned":["documents","design","create"]')
+  })
+
+  it('queues early edits until the initial read and applies them to saved preferences', async () => {
+    let finishRead: (prefs: NavPrefs) => void = () => {}
+    const read = new Promise<NavPrefs>(resolve => { finishRead = resolve })
+    const setNavPrefs = installPrefs(() => read)
+    renderEditor()
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Show Overview in sidebar' }))
+    await act(async () => {})
+    expect(setNavPrefs).not.toHaveBeenCalled()
+    await act(async () => { finishRead({ pinned: ['memory'], slotCount: 5, showOverview: true }) })
+    expect(setNavPrefs).toHaveBeenCalledWith({ pinned: ['memory'], slotCount: 5, showOverview: false })
+  })
+
+  it('uses defaults and permits queued and subsequent edits after an initial read failure', async () => {
+    let failRead: (error: Error) => void = () => {}
+    const read = new Promise<NavPrefs>((_resolve, reject) => { failRead = reject })
+    const setNavPrefs = installPrefs(() => read)
+    renderEditor()
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Show Overview in sidebar' }))
+    await act(async () => {})
+    expect(setNavPrefs).not.toHaveBeenCalled()
+    await act(async () => { failRead(new Error('IPC unavailable')) })
+    expect(setNavPrefs).toHaveBeenCalledWith({ ...NAV_PREFS_DEFAULT, showOverview: false })
+    fireEvent.click(screen.getByRole('button', { name: 'Pinned Design' }))
+    await waitFor(() => expect(setNavPrefs).toHaveBeenLastCalledWith({ pinned: ['documents', 'create'], slotCount: 3, showOverview: false }))
+  })
+
   it('loads persisted preferences and clamps before saving, returning the unpinned ids', async () => {
     const setNavPrefs = vi.fn().mockResolvedValue(undefined)
     window.agent24 = { getNavPrefs: vi.fn().mockResolvedValue({ pinned: ['memory'], slotCount: 4, showOverview: true }), setNavPrefs } as unknown as Window['agent24']
@@ -167,7 +295,7 @@ describe('NavPrefsProvider', () => {
     expect(screen.getByRole('status')).toHaveTextContent('"pinned":["hello","voice"]')
   })
 
-  it('ignores a stale startup read and retains the last successful write if a queued write fails', async () => {
+  it('waits for startup preferences and retains the last successful write if a queued write fails', async () => {
     let resolveRead: (value: NavPrefs) => void = () => {}
     const read = new Promise<NavPrefs>(resolve => { resolveRead = resolve })
     const setNavPrefs = vi.fn().mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('disk full'))
@@ -183,9 +311,10 @@ describe('NavPrefsProvider', () => {
     await act(async () => {
       const first = editor.setPrefs({ pinned: ['voice'], slotCount: 1, showOverview: false })
       const second = editor.setPrefs({ pinned: ['memory'], slotCount: 1, showOverview: false })
+      expect(setNavPrefs).not.toHaveBeenCalled()
+      resolveRead(NAV_PREFS_DEFAULT)
       await first
       await expect(second).rejects.toThrow('disk full')
-      resolveRead(NAV_PREFS_DEFAULT)
     })
     expect(setNavPrefs.mock.calls.map(([prefs]) => prefs.pinned)).toEqual([['voice'], ['memory']])
     expect(screen.getByRole('status')).toHaveTextContent('"pinned":["voice"]')

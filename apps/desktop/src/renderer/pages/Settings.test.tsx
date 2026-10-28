@@ -84,7 +84,7 @@ function PrefsHarness({
     <NavPrefsContext.Provider value={{
       prefs,
       setPrefs: async (next) => {
-        const result = apply(next)
+        const result = apply(typeof next === 'function' ? next(prefs) : next)
         setPrefs(result.prefs)
         return result.dropped
       },

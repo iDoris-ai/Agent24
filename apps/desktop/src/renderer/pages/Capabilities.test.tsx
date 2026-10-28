@@ -45,12 +45,12 @@ function renderPage(opts: {
 } = {}) {
   cleanup()
   const open = vi.fn()
-  const setPrefs = vi.fn(() => Promise.resolve([] as string[]))
+  const setPrefs = vi.fn((_next: NavPrefs) => Promise.resolve([] as string[]))
   const onOpenSettings = opts.onOpenSettings ?? vi.fn()
   const prefs = opts.prefs ?? ROOMY
   render(
     <CapabilitiesContext.Provider value={{ defs: opts.defs ?? DEFS, open, approvalsWaiting: opts.approvalsWaiting ?? 0 }}>
-      <NavPrefsContext.Provider value={{ prefs, setPrefs }}>
+      <NavPrefsContext.Provider value={{ prefs, setPrefs: next => setPrefs(typeof next === 'function' ? next(prefs) : next) }}>
         <CapabilitiesPage statusFor={opts.statusFor} onOpenSettings={onOpenSettings} />
       </NavPrefsContext.Provider>
     </CapabilitiesContext.Provider>,

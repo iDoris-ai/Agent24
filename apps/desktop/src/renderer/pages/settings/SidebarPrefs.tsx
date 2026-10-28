@@ -1,5 +1,5 @@
 import { useContext, useRef, useState } from 'react'
-import { CapabilitiesContext, NavPrefsContext, SLOT_MAX, SLOT_MIN, type CapabilityId, type NavPrefs } from '../../capabilities/types'
+import { CapabilitiesContext, NavPrefsContext, SLOT_MAX, SLOT_MIN, type CapabilityId, type NavPrefsApi } from '../../capabilities/types'
 import { capabilitiesMessages } from '../../capabilities/capabilities.i18n'
 import { useT } from '../../i18n'
 import { settingsMessages } from '../Settings.i18n'
@@ -20,7 +20,7 @@ export function SidebarPrefs() {
     return def ? c(def.nameKey) : id
   }
 
-  async function commit(next: NavPrefs) {
+  async function commit(next: Parameters<NavPrefsApi['setPrefs']>[0]) {
     if (savingRef.current) return
     savingRef.current = true
     setSaving(true)
@@ -37,18 +37,22 @@ export function SidebarPrefs() {
   }
 
   function stepSlots(delta: number) {
-    const slotCount = Math.min(SLOT_MAX, Math.max(SLOT_MIN, prefs.slotCount + delta))
-    if (slotCount === prefs.slotCount) return
-    void commit({ ...prefs, slotCount })
+    void commit(prev => ({ ...prev, slotCount: Math.min(SLOT_MAX, Math.max(SLOT_MIN, prev.slotCount + delta)) }))
   }
 
   function move(index: number, dir: -1 | 1) {
     const target = index + dir
     if (target < 0 || target >= prefs.pinned.length) return
-    const pinned = prefs.pinned.slice()
-    const [item] = pinned.splice(index, 1)
-    pinned.splice(target, 0, item)
-    void commit({ ...prefs, pinned })
+    const id = prefs.pinned[index]
+    const neighbor = prefs.pinned[target]
+    void commit(prev => {
+      const pinned = prev.pinned.slice()
+      const source = pinned.indexOf(id)
+      const destination = pinned.indexOf(neighbor)
+      if (source < 0 || destination < 0) return prev
+      ;[pinned[source], pinned[destination]] = [pinned[destination], pinned[source]]
+      return { ...prev, pinned }
+    })
   }
 
   return (
@@ -98,7 +102,7 @@ export function SidebarPrefs() {
         </div>
         <button type="button" className="settings-switch" role="switch"
           aria-labelledby="settings-show-overview" aria-checked={prefs.showOverview}
-          disabled={saving} onClick={() => { void commit({ ...prefs, showOverview: !prefs.showOverview }) }}>
+          disabled={saving} onClick={() => { void commit(prev => ({ ...prev, showOverview: !prev.showOverview })) }}>
           <span className="settings-switch-knob" />
         </button>
       </div>

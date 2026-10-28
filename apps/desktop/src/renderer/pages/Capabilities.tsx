@@ -6,7 +6,7 @@ import {
   type CapabilityDef,
   type CapabilityGroup,
   type CapabilityId,
-  type NavPrefs,
+  type NavPrefsApi,
 } from '../capabilities/types'
 import { useT } from '../i18n'
 import { capabilitiesMessages } from './Capabilities.i18n'
@@ -42,13 +42,13 @@ export interface CapabilitiesPageProps {
 
 export default function CapabilitiesPage({ statusFor, onOpenSettings }: CapabilitiesPageProps) {
   const { defs, open, approvalsWaiting } = useContext(CapabilitiesContext)
-  const { prefs, setPrefs } = useContext(NavPrefsContext)
+  const { prefs, pinnedCount = prefs.pinned.length, setPrefs } = useContext(NavPrefsContext)
   const t = useT(capabilitiesMessages)
   const c = useT(catalogMessages)
   const baseId = useId()
-  const slotsFull = prefs.pinned.length >= prefs.slotCount
+  const slotsFull = pinnedCount >= prefs.slotCount
 
-  function commit(next: NavPrefs): void {
+  function commit(next: Parameters<NavPrefsApi['setPrefs']>[0]): void {
     void Promise.resolve(setPrefs(next)).catch(() => {
       // Persistence and any error surface belong to the context owner.
     })
@@ -60,14 +60,14 @@ export default function CapabilitiesPage({ statusFor, onOpenSettings }: Capabili
     return def.builtin ? t('status.builtin') : t('status.open')
   }
 
-  function pinOf(def: CapabilityDef): { label: string; pressed: boolean; disabled: boolean; next: NavPrefs | null } {
+  function pinOf(def: CapabilityDef): { label: string; pressed: boolean; disabled: boolean; next: Parameters<NavPrefsApi['setPrefs']>[0] | null } {
     if (def.fixed) return { label: t('pin.fixed'), pressed: false, disabled: true, next: null }
     if (prefs.pinned.includes(def.id)) {
       return {
         label: t('pin.pinned'),
         pressed: true,
         disabled: false,
-        next: { ...prefs, pinned: prefs.pinned.filter((id) => id !== def.id) },
+        next: prev => ({ ...prev, pinned: prev.pinned.filter((id) => id !== def.id) }),
       }
     }
     if (slotsFull) return { label: t('pin.full'), pressed: false, disabled: true, next: null }
@@ -75,7 +75,8 @@ export default function CapabilitiesPage({ statusFor, onOpenSettings }: Capabili
       label: t('pin.pin'),
       pressed: false,
       disabled: false,
-      next: { ...prefs, pinned: [...prefs.pinned, def.id] },
+      next: prev => prev.pinned.includes(def.id) || prev.pinned.length >= prev.slotCount
+        ? prev : { ...prev, pinned: [...prev.pinned, def.id] },
     }
   }
 
@@ -94,7 +95,10 @@ export default function CapabilitiesPage({ statusFor, onOpenSettings }: Capabili
           id={`${baseId}-overview`}
           type="checkbox"
           checked={prefs.showOverview}
-          onChange={(event) => commit({ ...prefs, showOverview: event.target.checked })}
+          onChange={(event) => {
+            const showOverview = event.target.checked
+            commit(prev => ({ ...prev, showOverview }))
+          }}
         />
       </div>
 
