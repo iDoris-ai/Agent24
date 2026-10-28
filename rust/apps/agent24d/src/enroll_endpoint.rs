@@ -1097,8 +1097,11 @@ mod handshake_tests {
             ),
         )
         .await;
+        // Read one line, not to EOF: Linux resets a Unix socket closed with
+        // unread input (our queued hello), so a later read can fail with
+        // ECONNRESET after the reply has already arrived.
         let mut output = String::new();
-        client.read_to_string(&mut output).await.unwrap();
+        client.read_line(&mut output).await.unwrap();
         assert_eq!(authority.0.load(Ordering::SeqCst), 0, "{output}");
         let reply: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
         assert_eq!(reply["code"], "identity_rejected", "{output}");
