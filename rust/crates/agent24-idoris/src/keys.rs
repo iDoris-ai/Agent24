@@ -111,6 +111,14 @@ pub struct Keys {
     timeout: Duration,
 }
 
+struct KeyOperationLock(File);
+impl Drop for KeyOperationLock {
+    fn drop(&mut self) {
+        // Concurrent forks can retain this open file description until exec.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 /// Issue and immediately persist to the dedicated macOS keychain namespace.
 /// Only `daily` and an explicitly requested `deep` are accepted.
 pub async fn issue(
@@ -465,11 +473,3 @@ fn sync_directory(path: &Path) -> Result<(), KeyError> {
 
 #[cfg(all(test, unix))]
 mod tests;
-
-// Explicit unlock also releases descriptors briefly inherited by concurrent forks.
-struct KeyOperationLock(File);
-impl Drop for KeyOperationLock {
-    fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.0);
-    }
-}

@@ -439,22 +439,29 @@ async fn restore_replays_no_completed_operation_and_honors_stop_intent() {
 
 #[tokio::test]
 async fn leftover_identity_conflict_is_preserved_without_spawning() {
-    let f = Fixture::new().await;
-    f.install().await;
-    let path = f.host.root.join("data/state/managed-process.json");
-    fs::write(
-        &path,
-        serde_json::to_vec(&json!({"pid": std::process::id(), "start_time": 0,
-        "executable": std::env::current_exe().unwrap(), "uid": 0}))
-        .unwrap(),
+    let owner = Fixture::new().await;
+    owner.install().await;
+    let started = owner.host.submit(Action::Start, None).await.unwrap();
+    assert_eq!(
+        owner.complete(&started).await.result,
+        Some(Outcome::Succeeded)
+    );
+    let mut record: serde_json::Value = serde_json::from_slice(
+        &fs::read(owner.host.root.join("data/state/managed-process.json")).unwrap(),
     )
     .unwrap();
+    let f = Fixture::new().await;
+    f.install().await;
+    // Keep the real live PID, start time and UID. A fabricated start time
+    // represents a reused PID, which IL-07 now safely clears as stale.
+    record["executable"] = json!(f.record.release_dir.join("foreign-idoris"));
+    let path = f.host.root.join("data/state/managed-process.json");
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
     mode(&path, 0o600);
     let op = f.host.submit(Action::Start, None).await.unwrap();
-    assert_eq!(
-        f.complete(&op).await.error_code,
-        Some(Code::InstanceConflict)
-    );
+    let completed = f.complete(&op).await;
+    owner.host.shutdown().await.unwrap();
+    assert_eq!(completed.error_code, Some(Code::InstanceConflict));
     assert_eq!(f.host.status().await.state, State::InstanceConflict);
     assert!(path.exists());
     assert!(!f.host.root.join("data/state/attempts.jsonl").exists());
