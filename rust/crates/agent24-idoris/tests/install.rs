@@ -4,12 +4,39 @@
 use agent24_idoris::{
     IdorisLock,
     download::VerifiedArchive,
-    install::{InstallError, InstallOptions, SignatureVerifier, install_locked_asset},
+    install::{
+        InstallError, InstallOptions, SignatureVerifier, install_locked_asset as install_async,
+    },
 };
 use flate2::{Compression, write::GzEncoder};
 use sha2::{Digest, Sha256};
-use std::{fs, io, os::unix::fs::PermissionsExt, path::Path};
+use std::{
+    fs, io,
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
+    path::Path,
+};
 use tempfile::TempDir;
+
+fn install_locked_asset(
+    lock: &IdorisLock,
+    triple: &str,
+    archive: &VerifiedArchive,
+    opts: &InstallOptions,
+    signature: impl SignatureVerifier + Send + 'static,
+) -> Result<agent24_idoris::install::InstalledVersion, InstallError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(install_async(
+            lock,
+            triple,
+            archive,
+            opts,
+            signature,
+            &tokio_util::sync::CancellationToken::new(),
+        ))
+}
 
 const TRIPLE: &str = "aarch64-apple-darwin";
 struct Signature(bool);
@@ -79,7 +106,7 @@ impl Fixture {
             TRIPLE,
             &self.archive,
             &self.opts,
-            &Signature(signature),
+            Signature(signature),
         )
         .map(|installed| installed.directory().to_owned())
     }
@@ -175,20 +202,23 @@ fn child_request(
         io::Write,
         process::{Command, Stdio},
     };
-    let request = serde_json::json!({ "archive": fs::canonicalize(&f.archive.path).unwrap(),
-        "sha256": f.archive.sha256, "staging": fs::canonicalize(staging).unwrap(), "files": files, "limit": limit });
+    let request = serde_json::json!({ "sha256": f.archive.sha256, "staging": fs::canonicalize(staging).unwrap(), "files": files, "limit": limit });
     let mut child = Command::new(env!("CARGO_BIN_EXE_idoris-install-child"))
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(request.to_string().as_bytes())
+    let request = request.to_string();
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(&(request.len() as u32).to_be_bytes())
         .unwrap();
+    input.write_all(request.as_bytes()).unwrap();
+    input
+        .write_all(&fs::read(&f.archive.path).unwrap())
+        .unwrap();
+    drop(input);
     child.wait_with_output().unwrap()
 }
 macro_rules! rejected_tar {
@@ -246,7 +276,10 @@ fn child_failure_cleans_staging() {
 #[test]
 fn operation_lock_is_busy_for_second_installer() {
     let f = Fixture::new(None);
-    fs::create_dir(&f.opts.root).unwrap();
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&f.opts.root)
+        .unwrap();
     let lock = fs::File::create(f.opts.root.join(".operation.lock")).unwrap();
     fs2::FileExt::lock_exclusive(&lock).unwrap();
     assert!(matches!(f.install(true), Err(InstallError::Busy)));
@@ -283,19 +316,37 @@ async fn real_v0_4_0_download_install_and_l6() {
     let archive = download_locked_asset(
         lock,
         TRIPLE,
-        &dir.path().join("cache"),
+        &dir.path().join("idoris/cache"),
         &DownloadOptions::default(),
         &CancellationToken::new(),
     )
     .await
     .unwrap();
     let opts = InstallOptions::new(
-        dir.path().join("install"),
+        dir.path().join("idoris"),
         env!("CARGO_BIN_EXE_idoris-install-child"),
     );
-    let installed = install_locked_asset(lock, TRIPLE, &archive, &opts, &Codesign).unwrap();
+    let installed = install_async(
+        lock,
+        TRIPLE,
+        &archive,
+        &opts,
+        Codesign,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     Codesign.verify(&installed.binary(), &lock.team_id).unwrap();
-    let again = install_locked_asset(lock, TRIPLE, &archive, &opts, &Codesign).unwrap();
+    let again = install_async(
+        lock,
+        TRIPLE,
+        &archive,
+        &opts,
+        Codesign,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(again.directory(), installed.directory());
     eprintln!(
         "PASS: v0.4.0 archive {}, five files installed, strict requirement + TeamIdentifier={}, existing version reverified",
@@ -437,7 +488,7 @@ fn unsupported_platform_fails_before_creating_install_root() {
     }
     let f = Fixture::new(None);
     assert!(matches!(
-        install_locked_asset(&f.lock, TRIPLE, &f.archive, &f.opts, &Unsupported),
+        install_locked_asset(&f.lock, TRIPLE, &f.archive, &f.opts, Unsupported),
         Err(InstallError::UnsupportedPlatform)
     ));
     assert!(!f.opts.root.exists());
@@ -467,7 +518,7 @@ fn concurrent_second_installer_gets_busy() {
                 TRIPLE,
                 &f.archive,
                 &f.opts,
-                &BlockingSignature {
+                BlockingSignature {
                     ready: ready_tx,
                     release: release_rx,
                 },
@@ -519,4 +570,174 @@ fn forged_child_manifest_is_rejected() {
         Err(InstallError::HashMismatch(_))
     ));
     f.clean();
+}
+
+#[test]
+fn archive_symlink_is_rejected_without_following_target() {
+    let mut f = Fixture::new(None);
+    let link = f.dir.path().join("archive-link");
+    std::os::unix::fs::symlink(&f.archive.path, &link).unwrap();
+    f.archive.path = link;
+    assert!(f.install(true).is_err());
+    f.clean();
+}
+
+#[test]
+fn replacing_archive_path_after_open_does_not_change_installed_bytes() {
+    let mut f = Fixture::new(None);
+    f.opts.available_space = |root| {
+        let archive = root.parent().unwrap().join("archive.tar.gz");
+        fs::rename(&archive, archive.with_extension("old"))?;
+        fs::write(archive, b"replacement bytes")?;
+        Ok(u64::MAX)
+    };
+    let installed = f.install(true).unwrap();
+    assert_eq!(
+        fs::read(installed.join("idoris")).unwrap(),
+        b"#!/bin/sh\nexit 0\n"
+    );
+}
+
+#[test]
+fn modifying_archive_inode_after_verification_does_not_change_pipe_bytes() {
+    let mut f = Fixture::new(None);
+    f.opts.available_space = |root| {
+        fs::write(
+            root.parent().unwrap().join("archive.tar.gz"),
+            b"in-place replacement",
+        )?;
+        Ok(u64::MAX)
+    };
+    let installed = f.install(true).unwrap();
+    assert_eq!(
+        fs::read(installed.join("idoris")).unwrap(),
+        b"#!/bin/sh\nexit 0\n"
+    );
+}
+
+#[tokio::test]
+async fn install_disk_work_keeps_runtime_responsive_and_cancellation_releases_lock() {
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+    let mut f = Fixture::new(None);
+    f.opts.available_space = wait_for_space_release;
+    let cancel = CancellationToken::new();
+    let install = install_async(
+        &f.lock,
+        TRIPLE,
+        &f.archive,
+        &f.opts,
+        Signature(true),
+        &cancel,
+    );
+    tokio::pin!(install);
+    let started = async {
+        while !f.opts.root.join("space-started").exists() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    };
+    tokio::select! {
+        _ = tokio::time::timeout(Duration::from_secs(2), started) => (),
+        result = &mut install => panic!("installation completed before runtime could cancel: {result:?}"),
+    }
+    assert!(f.opts.root.join("space-started").exists());
+    cancel.cancel();
+    fs::write(f.opts.root.join("space-release"), b"").unwrap();
+    assert!(matches!(install.await, Err(InstallError::Cancelled)));
+    f.clean();
+    let held = fs::File::open(f.opts.root.join(".operation.lock")).unwrap();
+    fs2::FileExt::try_lock_exclusive(&held).unwrap();
+}
+
+fn wait_for_space_release(root: &Path) -> io::Result<u64> {
+    use std::time::{Duration, Instant};
+    fs::write(root.join("space-started"), b"")?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !root.join("space-release").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    Ok(u64::MAX)
+}
+
+#[tokio::test]
+async fn dropped_install_future_holds_lock_until_disk_worker_cleans_up() {
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+    let mut f = Fixture::new(None);
+    f.opts.available_space = wait_for_space_release;
+    let cancel = CancellationToken::new();
+    let mut install = Box::pin(install_async(
+        &f.lock,
+        TRIPLE,
+        &f.archive,
+        &f.opts,
+        Signature(true),
+        &cancel,
+    ));
+    let started = async {
+        while !f.opts.root.join("space-started").exists() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    };
+    tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(2), started) => result.unwrap(),
+        result = &mut install => panic!("installation returned early: {result:?}"),
+    }
+    drop(install);
+    let lock = fs::File::open(f.opts.root.join(".operation.lock")).unwrap();
+    assert!(fs2::FileExt::try_lock_exclusive(&lock).is_err());
+    fs::write(f.opts.root.join("space-release"), b"").unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.clean();
+    assert!(
+        !cancel.is_cancelled(),
+        "dropping the operation must not cancel its caller"
+    );
+}
+
+#[tokio::test]
+async fn cancellation_reaps_an_unresponsive_install_child_and_removes_staging() {
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+    let mut f = Fixture::new(None);
+    f.opts.child_program = "/bin/sh".into();
+    f.opts.child_args = vec![
+        "-c".into(),
+        "printf ready > ../child-ready; while test ! -f ../child-release; do :; done".into(),
+    ];
+    let cancel = CancellationToken::new();
+    let install = install_async(
+        &f.lock,
+        TRIPLE,
+        &f.archive,
+        &f.opts,
+        Signature(true),
+        &cancel,
+    );
+    tokio::pin!(install);
+    let ready = async {
+        while !f.opts.root.join("child-ready").exists() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    };
+    tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(2), ready) => result.unwrap(),
+        result = &mut install => panic!("child did not wait: {result:?}"),
+    }
+    cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(2), &mut install).await;
+    if result.is_err() {
+        fs::write(f.opts.root.join("child-release"), b"").unwrap();
+        let _ = (&mut install).await;
+    }
+    assert!(matches!(result, Ok(Err(InstallError::Cancelled))));
+    f.clean();
+    let lock = fs::File::open(f.opts.root.join(".operation.lock")).unwrap();
+    fs2::FileExt::try_lock_exclusive(&lock).unwrap();
 }

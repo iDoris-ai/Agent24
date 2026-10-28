@@ -1878,6 +1878,8 @@ export interface components {
             content: string;
         };
         ChatRequest: {
+            /** @description User confirmed spending iDoris's reserved memory headroom for this request only. Omitted means false. */
+            idoris_headroom_confirmed?: boolean;
             messages: components["schemas"]["ChatMessage"][];
             /** @description Model id override; null/omitted = daemon default */
             model?: string | null;
@@ -2006,6 +2008,8 @@ export interface components {
             notice: string | null;
         };
         RunCreate: {
+            /** @description User confirmed spending iDoris's reserved memory headroom for the first model call only; never persisted or inherited by later calls or resumed runs. Omitted means false. */
+            idoris_headroom_confirmed?: boolean;
             /** @description Omit/null to create a transient run */
             session_id?: string | null;
             /** @description Omit/null for legacy-compatible runs; admission is separate. */
@@ -3287,7 +3291,7 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description No LLM provider reachable */
+        /** @description No LLM provider reachable, or iDoris lifecycle contention exhausted bounded retries (idoris_supervisor_busy); retry later. */
         ProviderUnavailable: {
             headers: {
                 [name: string]: unknown;
@@ -3793,6 +3797,15 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            /** @description iDoris needs user confirmation (idoris_headroom_confirmation_required); resend this request with idoris_headroom_confirmed set to true after confirming. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             503: components["responses"]["ProviderUnavailable"];
         };
     };

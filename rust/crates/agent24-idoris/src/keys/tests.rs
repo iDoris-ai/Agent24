@@ -264,14 +264,29 @@ async fn failed_owner_reconciliation_survives_restart_without_reissuing() {
 #[tokio::test]
 async fn cancelled_issuance_keeps_owner_for_startup_compensation() {
     let f = Fixture::new("timeout", false);
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(300),
-            f.keys.issue("installation", &[])
-        )
-        .await
-        .is_err()
-    );
+    {
+        let issue = f.keys.issue("installation", &[]);
+        tokio::pin!(issue);
+        // Cancel only after the child has received the issuance request.
+        let ready = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !f.dir.path().join("spec").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        };
+        tokio::select! {
+            result = &mut issue => panic!("issuance completed before cancellation: {result:?}"),
+            () = ready => {}
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), issue)
+                .await
+                .is_err()
+        );
+    }
     assert!(f.dir.path().join("spec").exists());
     f.mode("ok");
     f.keys.retry_pending().await.unwrap();
@@ -301,6 +316,17 @@ async fn corrupt_or_public_operation_record_blocks_issuance() {
         Err(KeyError::Record)
     ));
     assert!(!f.dir.path().join("calls").exists());
+}
+
+#[test]
+fn operation_lock_release_does_not_wait_for_inherited_descriptors() {
+    let f = Fixture::new("ok", false);
+    let first = f.keys.operation_lock().unwrap();
+    assert!(matches!(f.keys.operation_lock(), Err(KeyError::Busy)));
+    let inherited = first.0.try_clone().unwrap();
+    drop(first);
+    assert!(f.keys.operation_lock().is_ok());
+    drop(inherited);
 }
 
 #[tokio::test]

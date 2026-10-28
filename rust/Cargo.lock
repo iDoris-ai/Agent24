@@ -173,11 +173,14 @@ dependencies = [
 name = "agent24-idoris"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "flate2",
  "fs2",
  "keyring",
  "libc",
+ "nix 0.29.0",
  "reqwest",
+ "rustix 1.1.4",
  "semver",
  "serde",
  "serde_json",
@@ -261,6 +264,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -533,6 +537,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

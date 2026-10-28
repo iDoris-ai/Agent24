@@ -111,6 +111,14 @@ pub struct Keys {
     timeout: Duration,
 }
 
+struct KeyOperationLock(File);
+impl Drop for KeyOperationLock {
+    fn drop(&mut self) {
+        // Concurrent forks can retain this open file description until exec.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 /// Issue and immediately persist to the dedicated macOS keychain namespace.
 /// Only `daily` and an explicitly requested `deep` are accepted.
 pub async fn issue(
@@ -357,10 +365,10 @@ impl Keys {
         self.db_path.with_extension("key-operation.json")
     }
 
-    fn operation_lock(&self) -> Result<File, KeyError> {
+    fn operation_lock(&self) -> Result<KeyOperationLock, KeyError> {
         let lock = private_open(&self.db_path.with_extension("key-operation.lock"), true)?;
         fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| KeyError::Busy)?;
-        Ok(lock)
+        Ok(KeyOperationLock(lock))
     }
 
     fn read_operation(&self) -> Result<Option<Operation>, KeyError> {
