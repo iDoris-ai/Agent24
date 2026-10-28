@@ -2247,6 +2247,13 @@ export interface components {
              * @description Null when disabled or one-shot already fired
              */
             next_run_at: string | null;
+            /**
+             * @description The current at spec has successfully triggered and has no next fire:
+             *     next_run_at is null, consecutive_failures is zero, and the current
+             *     spec timestamp is no later than last_run_at (compared as instants).
+             *     A future spec PATCH followed by disabling is not completed.
+             */
+            readonly completed: boolean;
             /** @description Auto-disables the schedule at 5 (emits schedule.disabled) */
             consecutive_failures: number;
             /** @description Non-null exactly for a module row (§8.1). */

@@ -78,6 +78,21 @@ use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
 
 pub use fire::FireId;
+
+/// Whether the current one-shot spec has fired successfully with no next slot.
+/// PATCH preserves last_run_at, so compare instants against the current spec.
+pub fn is_completed(schedule: &Schedule) -> bool {
+    let agent24_protocol::ScheduleSpec::At { ts } = &schedule.spec else {
+        return false;
+    };
+    schedule.next_run_at.is_none()
+        && schedule.consecutive_failures == 0
+        && schedule.last_run_at.as_deref().is_some_and(|last| {
+            matches!((next_fire::parse_iso(ts), next_fire::parse_iso(last)),
+                (Ok(due), Ok(fired)) if due <= fired)
+        })
+}
+
 pub use installed_owners::InstalledOwners;
 pub use invocation::{
     DeferReason, FireOutcome, FireTrigger, InvocationTarget, ModuleScheduleKey, RunNowOutcome,
@@ -1137,6 +1152,83 @@ mod tests {
             enabled: true,
             label: "k".to_owned(),
         }
+    }
+
+    #[tokio::test]
+    async fn completed_at_survives_reads_but_not_future_disabled_patch() {
+        let (sched, _, _) = scheduler_with(RecordingTrigger::new()).await;
+        let now = utc("2026-07-24T10:00:00Z");
+        let mut create = every_create(60);
+        create.spec = ScheduleSpec::At {
+            ts: "2026-07-24T10:01:00Z".into(),
+        };
+        let created = sched.create(create, now).await.unwrap();
+        assert!(!is_completed(&created));
+        sched.tick(utc("2026-07-24T10:01:05Z")).await.unwrap();
+        let fired = sched.list().await.unwrap().remove(0);
+        assert!(is_completed(&fired));
+        let patched = sched
+            .update(
+                &created.id,
+                ScheduleUpdate {
+                    spec: Some(ScheduleSpec::At {
+                        ts: "2026-07-25T10:00:00Z".into(),
+                    }),
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+                utc("2026-07-24T10:02:00Z"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(patched.last_run_at, fired.last_run_at);
+        assert!(patched.next_run_at.is_none());
+        assert!(!is_completed(&sched.list().await.unwrap().remove(0)));
+    }
+
+    #[tokio::test]
+    async fn completed_excludes_failed_at_trigger() {
+        let (sched, _, _) = scheduler_with(RecordingTrigger::always_failing()).await;
+        let mut create = every_create(60);
+        create.spec = ScheduleSpec::At {
+            ts: "2026-07-24T10:01:00Z".into(),
+        };
+        sched
+            .create(create, utc("2026-07-24T10:00:00Z"))
+            .await
+            .unwrap();
+        sched.tick(utc("2026-07-24T10:01:05Z")).await.unwrap();
+        let failed = sched.list().await.unwrap().remove(0);
+        assert_eq!(failed.consecutive_failures, 1);
+        assert!(!is_completed(&failed));
+    }
+
+    #[tokio::test]
+    async fn completed_requires_each_runtime_clause() {
+        let (sched, _, _) = scheduler_with(RecordingTrigger::new()).await;
+        let mut s = sched
+            .create(every_create(60), utc("2026-07-24T10:00:00Z"))
+            .await
+            .unwrap();
+        s.spec = ScheduleSpec::At {
+            ts: "2026-07-24T10:00:00+00:00".into(),
+        };
+        s.next_run_at = None;
+        s.last_run_at = Some("2026-07-24T10:00:00Z".into());
+        assert!(is_completed(&s));
+        let mut candidate = s.clone();
+        candidate.spec = ScheduleSpec::Every { secs: 60 };
+        candidate.enabled = false;
+        assert!(!is_completed(&candidate), "every");
+        candidate = s.clone();
+        candidate.next_run_at = Some("2026-07-25T10:00:00Z".into());
+        assert!(!is_completed(&candidate), "next_run_at");
+        candidate = s.clone();
+        candidate.consecutive_failures = 1;
+        assert!(!is_completed(&candidate), "failures");
+        candidate = s;
+        candidate.last_run_at = None;
+        assert!(!is_completed(&candidate), "last_run_at");
     }
 
     #[tokio::test]

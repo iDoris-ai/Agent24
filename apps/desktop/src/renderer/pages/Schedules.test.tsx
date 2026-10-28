@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react'
 import SchedulesPage from './Schedules'
 import { setLocale } from '../i18n'
 
@@ -323,12 +323,14 @@ describe('SchedulesPage', () => {
 })
 
 describe('SchedulesPage fired one-time rows', () => {
-  beforeEach(() => { setLocale('zh') })
+  beforeEach(() => { setLocale('zh'); vi.spyOn(window, 'confirm').mockReturnValue(true) })
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks() })
 
   const FIRED = (id: string) => ({
     ...SCHEDULE,
     id,
     name: 'self-wake',
+    completed: true,
     spec: { type: 'at', ts: '2026-07-28T18:00:00Z' },
     next_run_at: null,
     last_run_at: '2026-09-09T15:38:48Z',
@@ -349,8 +351,8 @@ describe('SchedulesPage fired one-time rows', () => {
 
   it('a not-yet-fired one-time row and a failed-before-fire row stay in the main list', async () => {
     mount([
-      { ...FIRED('pending'), name: 'pending-once', next_run_at: '2099-01-01T00:00:00Z', last_run_at: null },
-      { ...FIRED('never'), name: 'never-fired', last_run_at: null },
+      { ...FIRED('pending'), name: 'pending-once', completed: false, next_run_at: '2099-01-01T00:00:00Z', last_run_at: null },
+      { ...FIRED('never'), name: 'never-fired', completed: false, last_run_at: null },
     ])
     render(<SchedulesPage />)
     await waitFor(() => expect(screen.getByText('pending-once')).toBeInTheDocument())
@@ -368,4 +370,69 @@ describe('SchedulesPage fired one-time rows', () => {
       expect(dels.sort()).toEqual(['/api/v1/schedules/wake_1', '/api/v1/schedules/wake_2'])
     })
   })
+  it.each([
+    ['模块行', { owner: { module: 'weather', key: 'once' }, action: null }],
+    ['every 停用行', { spec: { type: 'every', secs: 60 }, enabled: false, completed: false }],
+    ['仍有下次触发', { next_run_at: '2099-01-01T00:00:00Z', completed: false }],
+    ['触发失败', { consecutive_failures: 2, completed: false }],
+    ['PATCH 到未来并停用', { spec: { type: 'at', ts: '2099-01-01T00:00:00Z' }, enabled: false, completed: false }],
+  ])('%s 留在主列表且不会被清理', async (name, fields) => {
+    const proxy = mount([FIRED('done'), { ...FIRED('keep'), name, ...fields }])
+    render(<SchedulesPage />)
+    await screen.findByText(name)
+    expect(screen.getByText('已完成 1 条')).toBeInTheDocument()
+    if (name === '触发失败') expect(screen.getByText('连续失败 2')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '清理已完成' }))
+    await waitFor(() => expect(proxy.mock.calls.filter(([r]) => r.method === 'DELETE').map(([r]) => r.path))
+      .toEqual(['/api/v1/schedules/done']))
+  })
+
+  it('全部完成时主列表显示空态，清理需确认且取消不会删除', async () => {
+    const proxy = mount([FIRED('done')])
+    vi.mocked(window.confirm).mockReturnValue(false)
+    render(<SchedulesPage />)
+    await screen.findByText('已完成 1 条')
+    expect(screen.getByText('暂无进行中的调度')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '清理已完成' }))
+    expect(window.confirm).toHaveBeenCalledWith('确定清理 1 条已完成调度？运行记录会保留。')
+    expect(proxy.mock.calls.some(([r]) => r.method === 'DELETE')).toBe(false)
+  })
+
+  it('部分清理失败立即移除成功行，操作错误经刷新和轮询仍保留且可关闭', async () => {
+    let rows = [FIRED('ok'), FIRED('bad')]
+    let holdRefresh = false
+    let unblockRefresh = () => {}
+    const refreshGate = new Promise<void>((resolve) => { unblockRefresh = resolve })
+    const proxy = vi.fn(async (r: { method: string; path: string }) => {
+      if (r.method === 'GET') {
+        if (holdRefresh) await refreshGate
+        return { ok: true, status: 200, data: { schedules: rows } }
+      }
+      if (r.path.endsWith('/bad')) return { ok: false, status: 500, data: { error: { code: 'internal', message: 'storage error /private/secret/db.sqlite' } } }
+      holdRefresh = true
+      rows = rows.filter((row) => row.id !== 'ok')
+      return { ok: true, status: 204, data: null }
+    })
+    window.agent24 = { backendProxy: proxy } as never
+    vi.useFakeTimers()
+    await act(async () => { render(<SchedulesPage />) })
+    expect(screen.getByText('已完成 2 条')).toBeInTheDocument()
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '清理已完成' })) })
+    const error = () => screen.getByRole('alert')
+    expect(error()).toHaveTextContent('1 条清理失败')
+    expect(error()).toHaveTextContent('服务暂时不可用，请稍后重试')
+    expect(error()).not.toHaveTextContent('/private/')
+    expect(screen.getByText('已完成 1 条')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '展开' }))
+    expect(screen.getAllByText('self-wake')).toHaveLength(1)
+    await act(async () => { holdRefresh = false; unblockRefresh() })
+    expect(error()).toHaveTextContent('1 条清理失败')
+    const gets = proxy.mock.calls.filter(([r]) => r.method === 'GET').length
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+    expect(proxy.mock.calls.filter(([r]) => r.method === 'GET')).toHaveLength(gets + 1)
+    expect(error()).toHaveTextContent('1 条清理失败')
+    fireEvent.click(within(error()).getByRole('button', { name: '关闭' }))
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
 })

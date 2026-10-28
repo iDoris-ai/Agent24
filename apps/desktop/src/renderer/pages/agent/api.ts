@@ -61,6 +61,7 @@ export interface Schedule {
   last_run_at: string | null
   next_run_at: string | null
   consecutive_failures: number
+  completed?: components['schemas']['Schedule']['completed']
   // The next five fields are new in daemon protocol v3 (ME4-1.2.2). They are
   // optional here — not because the current daemon omits them, but so this
   // desktop build keeps working against an older daemon that predates them
@@ -137,12 +138,18 @@ export const createSchedule = async (body: {
   return res.data as Schedule
 }
 
+export class ScheduleDeleteError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message)
+  }
+}
+
 export const deleteSchedule = async (id: string): Promise<void> => {
   const res = await window.agent24.backendProxy({
     method: 'DELETE',
     path: `/api/v1/schedules/${id}`,
   })
-  if (!res.ok) throw new Error(errorMessage(res))
+  if (!res.ok) throw new ScheduleDeleteError(res.status, errorMessage(res))
 }
 
 export const updateSchedule = async (

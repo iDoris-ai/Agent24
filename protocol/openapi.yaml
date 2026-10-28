@@ -4447,7 +4447,7 @@ components:
       type: object
       required:
         [id, name, enabled, spec, action, delivery,
-         last_run_at, next_run_at, consecutive_failures,
+         last_run_at, next_run_at, consecutive_failures, completed,
          owner, user_suspended, system_disabled_reason,
          effective_enabled, disabled_by]
       properties:
@@ -4479,6 +4479,14 @@ components:
           type: [string, "null"]
           format: date-time
           description: Null when disabled or one-shot already fired
+        completed:
+          type: boolean
+          readOnly: true
+          description: |
+            The current at spec has successfully triggered and has no next fire:
+            next_run_at is null, consecutive_failures is zero, and the current
+            spec timestamp is no later than last_run_at (compared as instants).
+            A future spec PATCH followed by disabling is not completed.
         consecutive_failures:
           type: integer
           description: Auto-disables the schedule at 5 (emits schedule.disabled)

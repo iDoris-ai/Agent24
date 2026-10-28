@@ -3,6 +3,7 @@ import {
   listSchedules,
   createSchedule,
   deleteSchedule,
+  ScheduleDeleteError,
   updateSchedule,
   runScheduleNow,
   type Schedule,
@@ -27,7 +28,9 @@ export default function SchedulesPage() {
   const t = useT(schedulesMessages)
   const locale = useLocale()
   const [schedules, setSchedules] = useState<Schedule[]>([])
-  const [error, setError] = useState<string | null>(null)
+  const [operationError, setOperationError] = useState<string | null>(null)
+  const [refreshError, setRefreshError] = useState<string | null>(null)
+  const [clearing, setClearing] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const [showFired, setShowFired] = useState(false)
 
@@ -49,11 +52,11 @@ export default function SchedulesPage() {
       .then((s) => {
         if (seq !== reqSeq.current) return // a newer refresh superseded this one
         setSchedules(s)
-        setError(null)
+        setRefreshError(null)
       })
       .catch((e: unknown) => {
         if (seq !== reqSeq.current) return
-        setError(e instanceof Error ? e.message : String(e))
+        setRefreshError(e instanceof Error ? e.message : String(e))
       })
   }, [])
 
@@ -85,12 +88,14 @@ export default function SchedulesPage() {
   }, [specType, expr, tz, secs, ts, nowTick, locale])
 
   const onCreate = async () => {
+    setOperationError(null)
+    setNotice(null)
     if (name.trim() === '' || prompt.trim() === '') {
-      setError(t('error.required'))
+      setOperationError(t('error.required'))
       return
     }
     if (preview.isError) {
-      setError(t('error.invalidSpec', { msg: preview.message ?? '' }))
+      setOperationError(t('error.invalidSpec', { msg: preview.message ?? '' }))
       return
     }
     try {
@@ -101,15 +106,17 @@ export default function SchedulesPage() {
       })
       setName('')
       setPrompt('')
-      setError(null)
+      setOperationError(null)
       setNotice(t('notice.created'))
       refresh()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setOperationError(e instanceof Error ? e.message : String(e))
     }
   }
 
   const onToggle = async (s: Schedule) => {
+    setOperationError(null)
+    setNotice(null)
     try {
       // `effective_enabled` reflects module suspend/system-disable on top of
       // `enabled`; older daemons never send it, so `?? enabled` keeps this
@@ -118,35 +125,52 @@ export default function SchedulesPage() {
       await updateSchedule(s.id, { enabled: !eff })
       refresh()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setOperationError(e instanceof Error ? e.message : String(e))
     }
   }
 
   const onDelete = async (id: string) => {
+    setOperationError(null)
+    setNotice(null)
     try {
       await deleteSchedule(id)
       refresh()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setOperationError(e instanceof Error ? e.message : String(e))
     }
   }
 
-  // Bulk-remove the fired one-time rows. Uses the existing per-id DELETE (no
-  // new API); allSettled so one failure doesn't strand the rest.
   const onClearFired = async (ids: string[]) => {
-    const results = await Promise.allSettled(ids.map((id) => deleteSchedule(id)))
+    if (!window.confirm(t('fired.confirm', { n: ids.length }))) return
+    setOperationError(null)
+    setNotice(null)
+    setClearing(true)
+    const results = await Promise.allSettled(ids.map(async (id) => {
+      await deleteSchedule(id)
+      ++reqSeq.current
+      setSchedules((rows) => rows.filter((row) => row.id !== id))
+    }))
     const failed = results.filter((r) => r.status === 'rejected')
     if (failed.length > 0) {
-      const first = (failed[0] as PromiseRejectedResult).reason
-      setError(first instanceof Error ? first.message : String(first))
+      const reasons = [...new Set(failed.map(({ reason }: { reason: unknown }) => {
+        if (reason instanceof ScheduleDeleteError) {
+          if (reason.status === 404) return t('error.notFound')
+          if (reason.status === 401 || reason.status === 403) return t('error.permission')
+          return t('error.service')
+        }
+        return t('error.connection')
+      }))]
+      setOperationError(t('error.clearFailed', { n: failed.length, reasons: reasons.join('；') }))
     } else {
-      setError(null)
       setNotice(t('notice.cleared', { n: ids.length }))
     }
+    setClearing(false)
     refresh()
   }
 
   const onRunNow = async (id: string) => {
+    setOperationError(null)
+    setNotice(null)
     try {
       // A module row's run_now returns a fire_id (delivered to the module,
       // no AgentRun happens), not a run_id — tell them apart by prefix
@@ -157,7 +181,7 @@ export default function SchedulesPage() {
       )
       refresh()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setOperationError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -228,7 +252,11 @@ export default function SchedulesPage() {
       <div className="page-title">{t('title')}</div>
       <div className="page-sub">{t('sub')}</div>
 
-      {error && <div style={{ color: '#e05050', fontSize: 12, marginBottom: 8 }}>{error}</div>}
+      {operationError && <div role="alert" style={{ color: '#e05050', fontSize: 12, marginBottom: 8 }}>
+        {operationError}
+        <button className="btn" onClick={() => setOperationError(null)}>{t('error.close')}</button>
+      </div>}
+      {refreshError && <div role="alert" style={{ color: '#e05050', fontSize: 12, marginBottom: 8 }}>{refreshError}</div>}
       {notice && <div style={{ color: '#4caf50', fontSize: 12, marginBottom: 8 }}>{notice}</div>}
 
       {/* Create form */}
@@ -322,8 +350,8 @@ export default function SchedulesPage() {
 
       {/* List */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-        {schedules.length === 0 && (
-          <div style={{ fontSize: 12, color: 'var(--muted)' }}>{t('list.empty')}</div>
+        {active.length === 0 && (
+          <div style={{ fontSize: 12, color: 'var(--muted)' }}>{t(schedules.length ? 'list.noActive' : 'list.empty')}</div>
         )}
         {active.map(renderRow)}
       </div>
@@ -340,6 +368,7 @@ export default function SchedulesPage() {
             <button
               className="btn"
               style={{ fontSize: 11 }}
+              disabled={clearing}
               onClick={() => onClearFired(fired.map((f) => f.id))}
             >
               {t('fired.clear')}
@@ -356,11 +385,9 @@ export default function SchedulesPage() {
   )
 }
 
-/** A one-time (`at`) user schedule that has already fired: nothing left to run
- *  (`next_run_at` cleared) and `last_run_at` proves it fired. Module-owned rows
- *  are never folded away; a one-time row that never fired stays visible. */
+/** Older daemons without completed leave rows visible for safety. */
 export function isFiredOneTime(s: Schedule): boolean {
-  return !s.owner && s.spec.type === 'at' && !s.next_run_at && !!s.last_run_at
+  return !s.owner && s.completed === true
 }
 
 function disabledReasonText(by: DisabledBy | undefined, t: T<SchedKey>): string | null {
