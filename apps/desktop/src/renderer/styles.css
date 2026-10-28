@@ -269,3 +269,33 @@ button { cursor: pointer; font-family: var(--font); }
 .voice-row-note { flex: 0 0 auto; font-size: 10px; color: var(--muted); }
 .voice-row-error { border-color: #e05050; }
 .voice-row-error .voice-row-badge { color: #e05050; }
+
+/* ── Capabilities page ── */
+.cap-overview { margin-bottom: 14px; }
+.cap-banner {
+  font-size: 13px; line-height: 1.5; background: var(--accent-dim);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 10px 14px; margin-bottom: 18px;
+}
+.cap-groups { display: flex; flex-direction: column; gap: 22px; }
+.cap-group h2 {
+  font-size: 13px; font-weight: 700; letter-spacing: 0.6px;
+  text-transform: uppercase; color: var(--muted); margin-bottom: 4px;
+}
+.cap-blurb { font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+.cap-list { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+.cap-row {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 12px 16px; display: flex; align-items: center; gap: 14px;
+}
+.cap-copy { flex: 1; min-width: 0; }
+.cap-titleline { display: flex; align-items: center; gap: 8px; }
+.cap-name {
+  background: none; border: none; padding: 0; font-size: 13.5px; font-weight: 600;
+  color: var(--text); text-align: left;
+}
+.cap-name:hover { color: var(--accent); }
+.cap-desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.cap-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.cap-actions .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.cap-count { font-weight: 700; color: var(--text); }
