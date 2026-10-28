@@ -172,10 +172,13 @@ fn map_err(err: StepError) -> PhaseError {
 
 fn store_from_pool(pool: SqlitePool) -> Store {
     let (module_consent_revocations, _) = tokio::sync::broadcast::channel(128);
+    let (module_consent_changes, _) = tokio::sync::broadcast::channel(128);
     Store {
         pool,
         module_consent_revocations,
+        module_consent_changes,
         terminal_commit_ack_gate: std::sync::Arc::default(),
+        fail_source_tag_reads: std::sync::Arc::default(),
     }
 }
 

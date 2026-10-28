@@ -74,6 +74,7 @@ async fn run_completed(manager: &Arc<RunManager>, store: &Store, session: &str, 
             prompt: prompt.to_owned(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();

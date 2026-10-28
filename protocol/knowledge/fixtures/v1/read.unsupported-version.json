@@ -1,0 +1,7 @@
+{ "$comment": "R6.4: the server does not support the requested protocol_version; the request is not a v1 request.",
+  "op": "knowledge.read",
+  "request": { "protocol_version": 2, "request_id": "01JB3R5F6G7H8J9K0M1N2P3Q4R", "generation": 15,
+    "scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-7" },
+  "response": { "status": 400, "body": { "error": { "code": "invalid_request", "message": "The request is not valid.",
+    "details": { "retryable": false, "reason": "unsupported_protocol_version", "supported": [1],
+      "request_id": "01JB3R5F6G7H8J9K0M1N2P3Q4R", "generation": 15 } } } } }

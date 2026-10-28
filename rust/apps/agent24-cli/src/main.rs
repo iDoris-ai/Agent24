@@ -20,6 +20,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use zeroize::{Zeroize, Zeroizing};
 
 mod acp;
+mod comm_groups;
+mod documents;
+mod module_tools;
 mod offline_db;
 mod query;
 mod service;
@@ -65,12 +68,20 @@ enum Command {
         #[command(subcommand)]
         action: OsAction,
     },
+    /// The Documenting OS: import files (the same code the desktop runs)
+    Documents {
+        #[command(subcommand)]
+        action: documents::DocumentsAction,
+    },
     /// Manage the embedded Hyphae-based agent communication layer:
     /// identities, contacts, and relays (COMM-HYPHAE.md §4). A REST client
     /// of `/api/v1/comm/*`, same shape as `agent24 os`.
     Comm {
         #[command(subcommand)]
         action: CommAction,
+        /// 原样输出完整 JSON 响应
+        #[arg(long, global = true)]
+        json: bool,
     },
     /// Serve agent24d as an MCP server over stdio, so an external MCP client
     /// (Claude Desktop, another agent) can run tasks on it and introspect it.
@@ -97,7 +108,8 @@ enum Command {
         #[command(subcommand)]
         action: query::SessionAction,
     },
-    /// 读取一条 run（只读）
+    /// 读取 run 或列出 peer 可见的 run（只读）
+    #[command(alias = "runs")]
     Run {
         #[command(subcommand)]
         action: query::RunAction,
@@ -139,6 +151,11 @@ enum Command {
         #[command(subcommand)]
         action: query::ConsentAction,
     },
+    /// 模块工具授权卡片与决定
+    ModuleConsents {
+        #[command(subcommand)]
+        action: module_tools::Action,
+    },
     /// 模块审批（只读）
     Approval {
         #[command(subcommand)]
@@ -157,6 +174,14 @@ enum HwAction {
     /// Probe this machine now and print JSON: profile, level, usable_bytes,
     /// reasons. `A24_HW_BUDGET_CAP_GB=<n>` simulates a smaller machine.
     Probe,
+    /// Print a nonsecret environment assignment for an independently started
+    /// iDoris. Core reservations are explicit; no daemon is started or owned.
+    IdorisEnv {
+        /// Bytes reserved for voice, decision, embedding and other core models.
+        /// Use the actual allocation; zero must be chosen explicitly.
+        #[arg(long)]
+        core_reserved_bytes: u64,
+    },
 }
 
 /// `agent24 decide …` (D0-2).
@@ -311,6 +336,11 @@ enum OsAttachAction {
 /// `agent24 comm …` (COMM-2a/2b; COMM-HYPHAE.md §4's CLI/REST 1:1 mapping).
 #[derive(Subcommand)]
 enum CommAction {
+    /// 群聊管理与消息投递
+    Groups {
+        #[command(subcommand)]
+        action: comm_groups::GroupsAction,
+    },
     /// Manage Hyphae identities
     Identity {
         #[command(subcommand)]
@@ -565,17 +595,7 @@ fn shutdown_lines(r: &agent24_protocol::ShutdownReport) -> Vec<String> {
 /// itself never redirects, so a 3xx means something else is impersonating it;
 /// following it would hand over the bearer token to that impersonator.
 fn client() -> reqwest::Client {
-    #[expect(
-        clippy::expect_used,
-        reason = "unwrap_or_default() here would silently rebuild the proxy-reading, \
-                  redirect-following client FU-74 exists to rule out; fail closed instead"
-    )]
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("building the loopback-only daemon HTTP client failed")
+    agent24_protocol::client::loopback_client(Duration::from_secs(2))
 }
 
 async fn health_ok(base: &str, token: &str) -> bool {
@@ -879,7 +899,14 @@ async fn attach_only_from(state: &DaemonState) -> Result<Option<Endpoint>, Strin
 /// to it. Runs until the MCP client closes stdin.
 async fn cmd_mcp() -> Result<(), String> {
     let ep = connect().await?;
+    // C-04: `agent24_run` gets a total time limit (default 600s).
+    let run_timeout = agent24_mcp::server::parse_run_timeout(
+        std::env::var(agent24_mcp::server::RUN_TIMEOUT_ENV)
+            .ok()
+            .as_deref(),
+    );
     let result = agent24_mcp::server::Agent24Server::new(ep.base.clone(), ep.token.clone())
+        .with_run_timeout(run_timeout)
         .serve_stdio()
         .await
         .map_err(|e| e.to_string());
@@ -922,9 +949,17 @@ async fn cmd_chat(message: String, model: Option<String>) -> Result<(), String> 
         .await;
     let out = match result {
         Ok(res) if res.status().is_success() => {
+            let gateway_record_id = res
+                .headers()
+                .get("x-idoris-record-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let body: ChatResponse = res.json().await.map_err(|e| e.to_string())?;
             println!("{}", body.message.content);
             println!("· {} tokens", body.usage.total_tokens);
+            if let Some(record_id) = gateway_record_id {
+                println!("· iDoris record {record_id}");
+            }
             Ok(())
         }
         Ok(res) => {
@@ -1179,10 +1214,15 @@ async fn invalidate_module_consents_in(
     state_dir: Option<&std::path::Path>,
     name: &str,
 ) -> Result<(), String> {
+    // ADR-K1-03 §3: the one exception to fail-closed. Without HOME no consent
+    // store can be reached (a daemon does not start without one either), so the
+    // command stands and says so, rather than breaking the documented
+    // `A24_OS_PACKAGES` container install (review G3, David 2026-10-26).
     let Some(dir) = state_dir else {
-        return Err(format!(
-            "could not revoke {name} module consent: no state directory (set HOME)"
-        ));
+        eprintln!(
+            "  HOME is not set: cannot reach a consent store, so any grants of {name} were not revoked"
+        );
+        return Ok(());
     };
     // `_lock` must outlive the query: dropping it releases the singleton lock.
     // No database file means there is no consent row to revoke, and this must
@@ -1372,11 +1412,20 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
 }
 
 fn cmd_hw(action: HwAction) -> Result<(), String> {
+    let report = agent24_hw::HardwareReport::from_env(&agent24_hw::SystemProbe::new());
     match action {
         HwAction::Probe => {
-            let report = agent24_hw::HardwareReport::from_env(&agent24_hw::SystemProbe::new());
             let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
             println!("{json}");
+            Ok(())
+        }
+        HwAction::IdorisEnv {
+            core_reserved_bytes,
+        } => {
+            // usable_bytes already accounts for OS and App overhead. Deduct
+            // only the explicit core allocation, and preserve a real zero.
+            let bytes = report.usable_bytes.saturating_sub(core_reserved_bytes);
+            println!("IDORIS_ALLOCATED_BUDGET_BYTES={bytes}");
             Ok(())
         }
     }
@@ -1587,7 +1636,7 @@ fn format_comm_error(body: &serde_json::Value) -> String {
     out
 }
 
-async fn cmd_comm(action: CommAction) -> Result<(), String> {
+async fn cmd_comm(action: CommAction, json: bool) -> Result<(), String> {
     // Import's server-side work (copy + verify + a Hyphae-side password
     // check) is real file and subprocess I/O, not a quick REST round trip —
     // give it a much longer client-side timeout than every other comm
@@ -1602,7 +1651,8 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
         Duration::from_secs(120)
     } else if matches!(
         action,
-        CommAction::Send { .. }
+        CommAction::Groups { .. }
+            | CommAction::Send { .. }
             | CommAction::Outbox {
                 action: CommOutboxAction::Retry { .. },
             }
@@ -1611,7 +1661,23 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
     } else {
         Duration::from_secs(15)
     };
-    let (method, path, body) = match action {
+    let (method, path, body) = comm_request(action)?;
+    let mut body = CommRequestBody(body);
+
+    let ep = connect().await.map_err(|e| {
+        format!("{e}\n  `agent24 comm` always goes through the daemon — there is no offline path")
+    })?;
+    let result = execute_comm(&ep, method, &path, &mut body, timeout, json).await;
+    finish(ep).await;
+    println!("{}", result?);
+    Ok(())
+}
+
+fn comm_request(
+    action: CommAction,
+) -> Result<(reqwest::Method, String, Option<serde_json::Value>), String> {
+    Ok(match action {
+        CommAction::Groups { action } => comm_groups::request(action),
         CommAction::Import { from, yes, dry_run } => {
             let password = if dry_run {
                 None
@@ -1713,35 +1779,35 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
                 "to": to, "content": content, "from": from, "encrypt": !no_encrypt
             })),
         ),
-        CommAction::History { as_, limit } => {
-            let mut qs: Vec<String> = Vec::new();
-            if let Some(a) = &as_ {
-                qs.push(format!("as={}", qs_encode(a)));
-            }
-            if let Some(l) = limit {
-                qs.push(format!("limit={l}"));
-            }
-            let path = if qs.is_empty() {
-                "/api/v1/comm/history".to_owned()
-            } else {
-                format!("/api/v1/comm/history?{}", qs.join("&"))
-            };
-            (reqwest::Method::GET, path, None)
-        }
+        CommAction::History { as_, limit } => (
+            reqwest::Method::GET,
+            {
+                let mut path = "/api/v1/comm/history".to_owned();
+                if let Some(a) = as_ {
+                    comm_groups::append_query(&mut path, "as", &a);
+                }
+                if let Some(limit) = limit {
+                    comm_groups::append_query(&mut path, "limit", &limit.to_string());
+                }
+                path
+            },
+            None,
+        ),
         CommAction::Pull { as_ } => (
             reqwest::Method::POST,
             "/api/v1/comm/inbox/pull".to_owned(),
             Some(serde_json::json!({"as": as_})),
         ),
         CommAction::Outbox { action } => match action {
-            CommOutboxAction::List { failed_only } => {
-                let path = if failed_only {
+            CommOutboxAction::List { failed_only } => (
+                reqwest::Method::GET,
+                if failed_only {
                     "/api/v1/comm/outbox?failed_only=true".to_owned()
                 } else {
                     "/api/v1/comm/outbox".to_owned()
-                };
-                (reqwest::Method::GET, path, None)
-            }
+                },
+                None,
+            ),
             CommOutboxAction::Retry { event_id } => (
                 reqwest::Method::POST,
                 format!("/api/v1/comm/outbox/{}/retry", qs_encode(&event_id)),
@@ -1756,36 +1822,36 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
                 Some(serde_json::json!({"confirm": confirm, "min_failures": min_failures})),
             ),
         },
-    };
-    let mut body = CommRequestBody(body);
+    })
+}
 
-    let ep = connect().await.map_err(|e| {
-        format!("{e}\n  `agent24 comm` always goes through the daemon — there is no offline path")
-    })?;
-    let mut req = bearer(&ep, client().request(method, format!("{}{path}", ep.base)));
+async fn execute_comm(
+    ep: &Endpoint,
+    method: reqwest::Method,
+    path: &str,
+    body: &mut CommRequestBody,
+    timeout: Duration,
+    json: bool,
+) -> Result<String, String> {
+    let mut req = bearer(ep, client().request(method, format!("{}{path}", ep.base)));
     if let Some(body) = &body.0 {
         req = req.json(body);
     }
     let result = req.timeout(timeout).send().await;
     body.zeroize_password();
-    let out = match result {
-        Ok(res) => {
-            let status = res.status();
-            let body: serde_json::Value = res.json().await.unwrap_or_default();
-            if status.is_success() {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&body["data"]).unwrap_or_default()
-                );
-                Ok(())
-            } else {
-                Err(format_comm_error(&body))
-            }
-        }
-        Err(e) => Err(e.to_string()),
-    };
-    finish(ep).await;
-    out
+    let response = result.map_err(|e| e.to_string())?;
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+    let body: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("daemon returned {status} but the body is not JSON: {e}"))?;
+    if !status.is_success() {
+        return Err(format_comm_error(&body));
+    }
+    if json {
+        Ok(text)
+    } else {
+        serde_json::to_string_pretty(&body["data"]).map_err(|e| e.to_string())
+    }
 }
 
 /// A comm JSON body can contain a password for import/unlock. Clear that
@@ -2542,6 +2608,12 @@ fn cmd_service(action: ServiceAction) -> Result<(), String> {
             println!("loaded:    {}", if loaded { "yes" } else { "no" });
             if let Some(p) = plist {
                 println!("plist:     {}", p.display());
+                if installed && !service::plist_has_ready_omit_token(&p) {
+                    println!(
+                        "note:      this LaunchAgent predates --ready-omit-token and still \
+                         logs the daemon bearer token; run `agent24 service install` to update it"
+                    );
+                }
             }
             match state_file::read_live() {
                 Some(st) => println!("daemon:    running (pid {}, port {})", st.pid, st.port),
@@ -2562,7 +2634,9 @@ async fn main() -> std::process::ExitCode {
         Command::Service { action } => cmd_service(action),
         Command::Tui => cmd_tui().await,
         Command::Os { action } => cmd_os(action).await,
-        Command::Comm { action } => cmd_comm(action).await,
+        Command::Documents { action } => documents::cmd_documents(action).await,
+        Command::Comm { action, json } => cmd_comm(action, json).await,
+        Command::ModuleConsents { action } => module_tools::run(action).await,
         Command::Mcp => cmd_mcp().await,
         Command::Acp => cmd_acp().await,
         Command::Decide { action } => cmd_decide(action).await,
@@ -2593,18 +2667,29 @@ async fn main() -> std::process::ExitCode {
 }
 
 #[cfg(test)]
+mod coverage_tests;
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
 
+    /// No HOME, no store to reach: the command stands (ADR-K1-03 §3, review
+    /// G3; the `A24_OS_PACKAGES` install the CLI documents for containers),
+    /// and says the grants, if any, were not revoked.
     #[tokio::test]
-    async fn consent_revocation_without_state_dir_is_an_error_not_a_silent_skip() {
-        let err = invalidate_module_consents_in(None, "consent-mod")
+    async fn consent_revocation_without_state_dir_stands() {
+        invalidate_module_consents_in(None, "consent-mod")
             .await
-            .unwrap_err();
-        assert!(err.contains("no state directory"), "{err}");
-        assert!(consent_revocation_failed_message(&err).contains("may"));
+            .unwrap();
+    }
+
+    #[test]
+    fn consent_revocation_failure_message_says_files_were_not_changed() {
+        let msg = consent_revocation_failed_message("boom");
+        assert!(msg.contains("may"), "{msg}");
+        assert!(msg.contains("were not changed"), "{msg}");
     }
 
     #[tokio::test]
@@ -3195,7 +3280,8 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Comm {
-                action: CommAction::Unlock { remember: true }
+                action: CommAction::Unlock { remember: true },
+                ..
             }
         ));
     }

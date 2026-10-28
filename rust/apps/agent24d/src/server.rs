@@ -41,6 +41,9 @@ pub struct AppState {
     /// router is built.
     pub auth_mode: AuthMode,
     pub capabilities: Option<crate::capabilities::CapabilityStore>,
+    /// KB-HOST-01: the Knowledge bindings the product host activated, in
+    /// memory only (see `crate::knowledge_host`).
+    pub knowledge_host: Arc<crate::knowledge_host::KnowledgeHostRegistry>,
     /// D2 router: every model call goes through tier routing + health/cooldown,
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
@@ -105,10 +108,18 @@ pub struct AppState {
     /// the daemon runs (SUP-5). `None` when out-of-process modules cannot be
     /// started at all.
     pub supervisors: Option<Arc<crate::domain::Supervisors>>,
+    /// What a module tool's card is made from (K1-6a-G §2.1); `None`
+    /// until `serve` assembles the module tools.
+    pub module_tool_cards: Option<crate::consent_routes::ModuleToolCards>,
+    /// How module tool decisions are taken; `None` (the default, and always
+    /// on an ephemeral daemon) answers every decision 403.
+    pub module_grants: Option<crate::consent_routes::GrantSettings>,
     /// Held across the config write and the hand-off of a hot disable's stop
     /// in `PATCH /api/v1/os/{name}` — not across the wait that follows — so
     /// concurrent toggles are applied in one order (SUP-5). The list a PATCH
-    /// answers with is rendered after, and shows the state then.
+    /// answers with is rendered after, and shows the state then. A module
+    /// tool decision holds it from its checks to its write, and a stop for
+    /// the whole stop, so neither lands inside the other (K1-6a-G §2.1 F7).
     pub os_control: Arc<tokio::sync::Mutex<()>>,
     /// What `GET /api/v1/shutdown` answers — fixed at start-up (SHUT-1c).
     pub shutdown_report: Arc<agent24_protocol::ShutdownReport>,
@@ -390,6 +401,7 @@ impl agent24_scheduler::RunTrigger for KernelTrigger {
                     // to approve the plan, so a fired schedule always runs
                     // Normal.
                     mode: agent24_protocol::RunMode::Normal,
+                    knowledge_binding_id: None,
                 };
                 match self
                     .runs
@@ -664,6 +676,7 @@ impl AppState {
             token: Arc::new(token),
             auth_mode: AuthMode::LegacySingleToken,
             capabilities: None,
+            knowledge_host: Arc::new(crate::knowledge_host::KnowledgeHostRegistry::default()),
             mcp_servers: Arc::new(mcp_servers),
             router,
             tools,
@@ -687,6 +700,8 @@ impl AppState {
             package_dirs: Arc::new(std::collections::HashMap::new()),
             module_status: Arc::new(std::collections::HashMap::new()),
             supervisors: None,
+            module_tool_cards: None,
+            module_grants: None,
             os_control: Arc::new(tokio::sync::Mutex::new(())),
             shutdown_report: Arc::new(crate::lifecycle::report(
                 &crate::lifecycle::Params::default(),
@@ -1158,6 +1173,18 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             "/api/v1/capabilities/{capability_id}/revoke",
             post(revoke_capability),
         )
+        // The desktop's generic proxy refuses these by their raw path
+        // (`reachesHostInterface`); that holds only while routing matches the
+        // raw path, so never decode or normalize the path before routing.
+        .route(
+            "/api/v1/host/knowledge/bindings/{binding_id}",
+            axum::routing::put(crate::knowledge_host::change).delete(crate::knowledge_host::change),
+        )
+        .route(
+            "/api/v1/host/knowledge/bindings/{binding_id}/credential",
+            axum::routing::put(crate::knowledge_host::push_credential)
+                .delete(crate::knowledge_host::revoke_credential),
+        )
         .route("/api/v1/usage", get(crate::routes::get_usage))
         .route("/api/v1/timings", get(crate::routes::get_timings))
         .route(
@@ -1176,7 +1203,12 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         )
         .route(
             "/api/v1/module-consents/modules/{module}/tools/{tool}",
-            axum::routing::delete(crate::consent_routes::revoke_tool),
+            axum::routing::delete(crate::consent_routes::revoke_tool)
+                .post(crate::consent_routes::decide),
+        )
+        .route(
+            "/api/v1/module-consents/modules/{module}/tools/{tool}/card",
+            get(crate::consent_routes::card),
         )
         .route(
             "/api/v1/tool-overrides",
@@ -1300,6 +1332,12 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         )
         .route("/api/v1/runs/{id}", get(crate::runs::get_run))
         .route("/api/v1/runs/{id}/cancel", post(crate::runs::cancel_run))
+        // K1-6b.5c-2: the redacted views the MCP server and ACP bridge relay.
+        .route("/api/v1/peer/runs", get(crate::peer_runs::list_peer_runs))
+        .route(
+            "/api/v1/peer/runs/{id}",
+            get(crate::peer_runs::get_peer_run),
+        )
         .fallback(fallback)
         .with_state(state.clone());
 
@@ -1307,6 +1345,94 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
     kernel
         .merge(modules)
         .layer(middleware::from_fn_with_state(state, auth))
+}
+
+/// The legacy-mode `ready` line. With `omit_token` (B3 / S-04: the LaunchAgent
+/// persists stdout to a log file) the bearer is left out — it is still in the
+/// 0600 `daemon.json`, which is where the CLI of a service-run daemon reads it.
+fn legacy_ready_line(
+    port: u16,
+    token: &str,
+    omit_token: bool,
+    generation: &str,
+) -> serde_json::Value {
+    let mut ready = serde_json::json!({
+        "type": "ready",
+        "port": port,
+        "auth_mode": "legacy_single_token",
+        "generation": generation,
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    if !omit_token {
+        ready["token"] = serde_json::json!(token);
+    }
+    ready
+}
+
+/// B1 (REVIEW-TODO PR-B, R4 / C-03): DNS-rebinding and browser-CSRF defence for
+/// the REST surface. Layered OUTSIDE [`build_router`] by `serve` (the only
+/// place the real bound port is known), so it runs before `auth` and covers
+/// `/api/v1/health` and the module reverse-proxy routes alike. It only inspects
+/// headers — the request reaching a module is untouched, and the proxy builds
+/// its own fixed upstream `Host` (`agent24-os-proto::proxy`).
+///
+/// - `Host` must be `127.0.0.1:{port}`, `localhost:{port}` or `[::1]:{port}`
+///   (ASCII case-insensitive); any other value is 403 `bad_host`, and no host
+///   at all (an HTTP/1.0 request) is 400 `bad_host`. (HTTP/2 carries the authority in the URI, which is used when there is no
+///   `Host` header.)
+/// - An `Origin` header other than the literal `null` is 403 `forbidden_origin`
+///   (browsers always send it on cross-origin requests; the CLI/desktop main
+///   process/bridges never do). `Origin: null` stays allowed here; the WS
+///   upgrade rejects any `Origin` itself.
+pub fn guard_host_origin(router: Router, port: u16) -> Router {
+    let allowed: StdArc<[String; 3]> = StdArc::new([
+        format!("127.0.0.1:{port}"),
+        format!("localhost:{port}"),
+        format!("[::1]:{port}"),
+    ]);
+    router.layer(middleware::from_fn_with_state(allowed, host_origin_guard))
+}
+
+async fn host_origin_guard(
+    State(allowed): State<StdArc<[String; 3]>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| req.uri().authority().map(|a| a.as_str().to_owned()));
+    match host.as_deref() {
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "bad_host",
+                "A Host header is required",
+            );
+        }
+        Some(h) if !allowed.iter().any(|a| a.eq_ignore_ascii_case(h)) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "bad_host",
+                "Host header is not this daemon's loopback address",
+            );
+        }
+        Some(_) => {}
+    }
+    if req
+        .headers()
+        .get(header::ORIGIN)
+        .is_some_and(|o| o.as_bytes() != b"null")
+    {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden_origin",
+            "Browser-originated requests are not allowed",
+        );
+    }
+    next.run(req).await
 }
 
 pub fn generate_token() -> String {
@@ -1406,9 +1532,17 @@ pub async fn serve(
     auth_mode: AuthMode,
     host_bootstrap_stdio: bool,
     enroll_endpoint: bool,
+    ready_omit_token: bool,
     cancel: CancellationToken,
 ) -> Result<(), std::io::Error> {
     let mode = validate_auth_startup(auth_mode, host_bootstrap_stdio, enroll_endpoint, ephemeral)?;
+    let module_grants = crate::consent_routes::grant_settings(
+        std::env::var("A24_MODULE_TOOL_GRANTS").ok().as_deref(),
+        std::env::var("A24_MODULE_GRANT_MAX_DAYS").ok().as_deref(),
+        ephemeral,
+        crate::os_config::config_path(),
+    )
+    .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why))?;
     // Only the host-child mode owns the trusted pipes (and so the parent-EOF
     // lease). Service mode has neither: it is not a child of anything.
     let (mut host_ready, parent_liveness) = if mode == StartupMode::HostChild {
@@ -1601,6 +1735,18 @@ pub async fn serve(
     // an in-memory one). A failure here degrades to no memory rather than
     // refusing to start — sessions simply don't remember, as before.
     let memory_base = open_memory_base(ephemeral).await;
+    // P1-02c-c5: bound memory.db's WAL — idle-time wal_checkpoint(TRUNCATE),
+    // tracing-only results, stops with the daemon-wide token. In-memory
+    // (ephemeral) bases have no WAL and spawn nothing. Detached on purpose:
+    // it owns its own connection and ends on `cancel`.
+    if let Some(kv) = &memory_base {
+        let _ = crate::memory_maintenance::spawn(
+            kv,
+            agent24_memory::wal_maintenance::WalMaintenanceConfig::default(),
+            cancel.clone(),
+        )
+        .await;
+    }
     let memory = match memory_base.clone() {
         Some(kv) => match session_memory(kv, &router, &cancel).await {
             Ok(memory) => Some(memory),
@@ -1650,56 +1796,64 @@ pub async fn serve(
     let module_tool_runtime_dyn: StdArc<dyn agent24_tools::ModuleToolRuntime> =
         module_tool_runtime.clone();
     let module_tool_supervisors = module_tool_runtime.supervisors_slot();
-    let consent_gate = StdArc::new(agent24_policy::consent_gate::StoreConsentGate::new(
-        store.clone(),
-    ));
     let mut module_authorizations: std::collections::HashMap<
         (String, String),
         StdArc<dyn agent24_tools::ModuleToolAuthorization>,
     > = std::collections::HashMap::new();
+    let mut card_sources = std::collections::HashMap::new();
     for (_, registered) in module_registry.iter() {
         let module = registered.module().to_owned();
         let declaration = registered.declaration();
         let operation = declaration.operation().to_owned();
-        let summary = agent24_store::ToolPermissionSummary::new(
-            module.clone(),
-            operation.clone(),
-            catalogue
-                .iter()
-                .find(|entry| entry.name == module)
-                .map_or_else(String::new, |entry| entry.version.clone()),
-            agent24_store::ConsentSource::ManualInstall,
-            Some("invoke one host-registered module tool".to_owned()),
-            None,
-            Some("module operation".to_owned()),
-            agent24_store::HostRiskLevel::High,
-        );
-        let request = agent24_policy::consent_gate::ConsentGateRequest {
-            module: module.clone(),
-            op: operation.clone(),
-            module_version: summary.module_version.clone(),
-            current_scope_fingerprint: summary.scope_fingerprint(),
-            risk: agent24_protocol::RiskClass::External,
-            org_restricted: false,
-            source_restricted: false,
-            // The host has no verified reversible-draft semantics for this
-            // path yet, so the L-APPR-5 draft exception never applies here.
-            reversible_draft_declared: false,
-            draft_verification: None,
-        };
-        let authorization = StdArc::new(
-            agent24_policy::consent_gate::ModuleConsentAuthorization::new(
-                consent_gate.clone(),
-                request,
-                StdArc::new(agent24_core::util::now_iso8601),
+        let entry = catalogue.iter().find(|entry| entry.name == module);
+        // K1-6a-G §2.1: the card and the gate are made from one summary, so
+        // a grant's fingerprint and the gate's agree byte for byte.
+        let source = crate::consent_routes::ToolCardSource {
+            summary: agent24_policy::tool_summary::module_tool_summary(
+                &module,
+                &entry.map_or_else(String::new, |entry| entry.version.clone()),
+                declaration,
             ),
+            resource_kinds: declaration.resource_kinds().to_vec(),
+            takes_grants: entry.is_some_and(|entry| {
+                matches!(&entry.build, crate::domain::Build::Package(p) if p.manifest.takes_grants())
+            }),
+        };
+        let authorization = crate::module_tool_runtime::tool_authorization(
+            &source,
+            &store,
+            module_tool_runtime.artifact_source(),
         );
-        module_authorizations.insert((module, operation), authorization);
+        card_sources.insert((module.clone(), operation.clone()), source);
+        if let Some(authorization) = authorization {
+            module_authorizations.insert((module, operation), authorization);
+        }
     }
+    let module_tool_cards = crate::consent_routes::ModuleToolCards {
+        tools: StdArc::new(card_sources),
+        artifact: module_tool_runtime.artifact_source(),
+        notice: {
+            let runtime = module_tool_runtime.clone();
+            StdArc::new(move |end: crate::module_tool_runtime::GrantEnd| {
+                let runtime = runtime.clone();
+                Box::pin(async move {
+                    runtime
+                        .notify_revoked(&end, crate::module_tool_runtime::REVOCATION_NOTICE_WITHIN)
+                        .await
+                }) as futures::future::BoxFuture<'static, _>
+            })
+        },
+    };
     let advert_view = crate::module_tool_runtime::AgentModuleToolAdvertView::new(
         StdArc::clone(&module_tool_runtime),
         module_authorizations.clone(),
-        router.has_remote_tier(),
+        {
+            // Read per call (K1-6a-G §2.4), from this one router instance,
+            // which is never replaced today; a replaceable router must make
+            // the probe read the current instance (#1130 L2).
+            let router = Arc::clone(&router);
+            StdArc::new(move || Some(router.has_remote_tier()))
+        },
     );
     let advert_view_dyn: StdArc<dyn agent24_domain::tool::ModuleToolAdvertView> = advert_view;
     for (_, registered) in module_registry.iter() {
@@ -1921,6 +2075,19 @@ pub async fn serve(
     let os_config = crate::os_config::OsConfig::load(&os_config_path);
     if let Err(why) = &os_config {
         tracing::error!("os.json could not be read ({why}); every admissible domain OS will 503");
+    }
+    // K1-6a-G §2.1 F3: what this start sees of each module with tools,
+    // before a grant of it can hold. A module this fails for keeps none;
+    // an ephemeral daemon sees none, so honours no grant (F6).
+    if !ephemeral && let Ok(config) = &os_config {
+        crate::module_tool_runtime::observe_enable_epochs(
+            &state.store,
+            &module_tool_runtime,
+            config,
+            &os_config_path,
+            module_registry.iter().map(|(_, r)| r.module()),
+        )
+        .await;
     }
 
     // An ephemeral daemon gets a throwaway root, NOT `~/.agent24/os`. The mounter
@@ -2458,6 +2625,20 @@ pub async fn serve(
             .unwrap_or_default(),
     );
     state.supervisors = host.as_ref().ok().map(|h| h.supervisors.clone());
+    // K1-6a-G §2.5 (A5b), §2.5.1: told once the modules run, so a grant
+    // that expired, or an end not told, while the daemon was down reaches
+    // the run that is up now.
+    tokio::spawn(crate::grant_expiry::run(
+        state.store.clone(),
+        module_tool_cards.notice.clone(),
+        {
+            let cards = module_tool_cards.clone();
+            StdArc::new(move |module: &str| cards.on_grants_protocol(module))
+        },
+        cancel.child_token(),
+    ));
+    state.module_tool_cards = Some(module_tool_cards);
+    state.module_grants = module_grants;
     state.shutdown_report = Arc::new(report);
     // A3-2b (design §4/§5): the real attach registry — same "start empty,
     // replace once real data is ready" pattern as `os_reports` above, and for
@@ -2631,14 +2812,9 @@ pub async fn serve(
         return Ok(());
     }
     let ready = match auth_mode {
-        AuthMode::LegacySingleToken => serde_json::json!({
-            "type": "ready",
-            "port": local.port(),
-            "token": token,
-            "auth_mode": "legacy_single_token",
-            "generation": daemon_generation,
-            "version": env!("CARGO_PKG_VERSION"),
-        }),
+        AuthMode::LegacySingleToken => {
+            legacy_ready_line(local.port(), &token, ready_omit_token, &daemon_generation)
+        }
         AuthMode::Capabilities if mode == StartupMode::Service => serde_json::json!({
             "type": "ready",
             "port": local.port(),
@@ -2685,6 +2861,7 @@ pub async fn serve(
     drop(ready);
 
     let graceful_cancel = cancel.clone();
+    let router = guard_host_origin(router, local.port());
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move { graceful_cancel.cancelled().await });
 
@@ -3181,6 +3358,44 @@ pub(crate) mod tests {
         );
     }
 
+    /// #1202 G6 (Codex A5c-2a round 2): `serve` builds each module tool's
+    /// authorization through `tool_authorization`, which refuses a module
+    /// not on the grants protocol, never `store_authorization` directly,
+    /// which would let a grant from an older daemon hold. Scanned with
+    /// `//`-comments stripped, as
+    /// `stop_usage_writer_is_called_after_the_supervisors_have_stopped`.
+    #[test]
+    fn serve_authorizes_module_tools_by_protocol() {
+        let src = include_str!("server.rs");
+        let start = src.find("pub async fn serve(").expect("serve must exist");
+        let body = &src[start..];
+        let end = body
+            .find("\n}\n")
+            .expect("function must be brace-terminated");
+        let code: String = body[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(code.contains("crate::module_tool_runtime::tool_authorization("));
+        assert!(!code.contains("store_authorization("));
+        // The notifier asks the same cards (A5c-2b).
+        assert!(code.contains("cards.on_grants_protocol(module)"));
+    }
+
+    /// #1202 G6 (A5c-2b): a module is on the grants protocol when a tool of
+    /// it takes grants; one whose tools do not, or with none, is not.
+    #[tokio::test]
+    async fn the_cards_say_which_modules_are_on_the_grants_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = StdArc::new(std::sync::atomic::AtomicBool::new(true));
+        let (state, _) = decision_state(&running, &dir.path().join("os.json")).await;
+        let cards = state.module_tool_cards.unwrap();
+        assert!(cards.on_grants_protocol("doc-module"));
+        assert!(!cards.on_grants_protocol("old-module"));
+        assert!(!cards.on_grants_protocol("absent"));
+    }
+
     // ---- ME4-4.2.3b (design §6.3/v3.1 M-2, J19 variant 2a) -------------------
 
     /// J19's structural half: `stop_usage_writer` must be called from
@@ -3388,6 +3603,9 @@ pub(crate) mod tests {
         "/capabilities/creative", // OD-M11 (PAUSED): capability contract is out of scope.
         "/capabilities/{capability_id}/revoke", // OD-M11 (PAUSED): capability contract is out of scope.
         "/events", // WebSocket protocol is documented by protocol/events.schema.json.
+        // KB-HOST-01: the desktop host's private interface (UI-BRIDGE U1.5), not a client contract.
+        "/host/knowledge/bindings/{binding_id}",
+        "/host/knowledge/bindings/{binding_id}/credential",
     ];
 
     // Module-owned contract paths appear in OpenAPI but are not literal routes
@@ -3417,9 +3635,37 @@ pub(crate) mod tests {
         "/documents/extractions/{extraction_id}",
     ];
 
-    // COMM routes are mounted by server::serve, outside the scanned builder;
-    // `/api/v1/comm/*` remains a known blind spot owned by the COMM workstream.
-    const EXTRA_RESERVED_NOT_IN_BUILD_ROUTER: &[&str] = &["/comm/*"];
+    // COMM routes are mounted by server::serve, outside the scanned builder, so
+    // their literals are scanned from the agent24-comm sources instead
+    // (`comm_route_literals`); they are covered by the same gate, no exemption.
+    const COMM_ROUTE_SOURCES: [(&str, &str); 2] = [
+        (
+            include_str!("../../../crates/agent24-comm/src/router.rs"),
+            "pub fn router(",
+        ),
+        (
+            include_str!("../../../crates/agent24-comm/src/groupchat.rs"),
+            "pub(crate) fn routes(",
+        ),
+    ];
+
+    /// `.route("<path>"` literals inside the function starting at `anchor`.
+    fn route_literals(source: &str, anchor: &str) -> Vec<String> {
+        let start = source
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{anchor} must exist"));
+        let body = &source[start..];
+        let body = &body[..body
+            .find("\n}\n")
+            .expect("function must be brace-terminated")];
+        body.match_indices(".route(")
+            .filter_map(|(offset, _)| {
+                let rest = &body[offset + ".route(".len()..];
+                let rest = &rest[rest.find('"')? + 1..];
+                Some(rest[..rest.find('"')?].to_owned())
+            })
+            .collect()
+    }
 
     fn route_openapi_mismatches(
         server_source: &str,
@@ -3427,26 +3673,8 @@ pub(crate) mod tests {
     ) -> (Vec<String>, Vec<String>) {
         use std::collections::BTreeSet;
 
-        let start = server_source
-            .find("pub fn build_router_with_modules")
-            .expect("build_router_with_modules must exist");
-        let body = &server_source[start..];
-        let end = body
-            .find("\n}\n")
-            .expect("build_router_with_modules must be brace-terminated");
-        let body = &body[..end];
-
         let mut routes = BTreeSet::new();
-        for (offset, _) in body.match_indices(".route(") {
-            let registration = &body[offset + ".route(".len()..];
-            let Some(quote_start) = registration.find('"') else {
-                continue;
-            };
-            let path_and_rest = &registration[quote_start + 1..];
-            let Some(quote_end) = path_and_rest.find('"') else {
-                continue;
-            };
-            let path = &path_and_rest[..quote_end];
+        for path in route_literals(server_source, "pub fn build_router_with_modules") {
             if let Some(path) = path.strip_prefix("/api/v1") {
                 routes.insert(path.to_owned());
             }
@@ -3471,7 +3699,14 @@ pub(crate) mod tests {
 
         let undocumented: BTreeSet<&str> = UNDOCUMENTED_KERNEL_ROUTES.iter().copied().collect();
         let module_paths: BTreeSet<&str> = MODULE_SURFACE_PATHS.iter().copied().collect();
-        let _known_external_blind_spot = EXTRA_RESERVED_NOT_IN_BUILD_ROUTER;
+        let mut comm = 0;
+        for (source, anchor) in COMM_ROUTE_SOURCES {
+            for path in route_literals(source, anchor) {
+                routes.insert(format!("/comm{path}"));
+                comm += 1;
+            }
+        }
+        assert!(comm >= 20, "comm route scan found only {comm} paths");
         let expected_openapi: BTreeSet<String> = routes
             .iter()
             .filter(|path| !undocumented.contains(path.as_str()))
@@ -3524,6 +3759,60 @@ pub(crate) mod tests {
         let (missing_from_openapi, extra_in_openapi) = route_openapi_mismatches(&routes, openapi);
         assert_eq!(missing_from_openapi, ["/not-in-openapi"]);
         assert!(extra_in_openapi.is_empty());
+    }
+
+    /// The comm scan reads `.route(` literals out of two functions. A route
+    /// added through `.merge(`/`.nest(` of another module (or a second
+    /// `routes()`) would be invisible to it AND absent from OpenAPI, i.e. the
+    /// gate would pass an unregistered route. Pin the composition instead.
+    fn comm_composition_is_scanned(router_source: &str) -> Result<(), String> {
+        let start = router_source
+            .find("pub fn router(")
+            .ok_or("pub fn router( must exist")?;
+        let body = &router_source[start..];
+        let body = &body[..body
+            .find("\n}\n")
+            .ok_or("router must be brace-terminated")?];
+        let composed: Vec<&str> = body
+            .match_indices(".merge(")
+            .chain(body.match_indices(".nest("))
+            .chain(body.match_indices(".fallback"))
+            .chain(body.match_indices(".route_service("))
+            .map(|(i, _)| body[i..].lines().next().unwrap_or("").trim())
+            .collect();
+        if composed == [".merge(crate::groupchat::routes())"] {
+            Ok(())
+        } else {
+            Err(format!(
+                "comm router composes unscanned routes; extend COMM_ROUTE_SOURCES: {composed:?}"
+            ))
+        }
+    }
+
+    #[test]
+    fn comm_route_scan_covers_every_composed_module() {
+        let real = COMM_ROUTE_SOURCES[0].0;
+        comm_composition_is_scanned(real).unwrap();
+        let sneaky = real.replace(
+            ".merge(crate::groupchat::routes())",
+            ".merge(crate::groupchat::routes())\n        .merge(crate::other::routes())",
+        );
+        assert!(comm_composition_is_scanned(&sneaky).is_err());
+        let nested = real.replace(
+            ".merge(crate::groupchat::routes())",
+            ".merge(crate::groupchat::routes())\n        .nest(\"/x\", y())",
+        );
+        assert!(comm_composition_is_scanned(&nested).is_err());
+    }
+
+    #[test]
+    fn route_openapi_gate_covers_comm_routes() {
+        let routes = include_str!("server.rs");
+        let openapi = include_str!("../../../../protocol/openapi.yaml")
+            .replace("  /comm/groupchat:\n", "  /comm/groupchat-gone:\n");
+        let (missing_from_openapi, extra_in_openapi) = route_openapi_mismatches(routes, &openapi);
+        assert_eq!(missing_from_openapi, ["/comm/groupchat"]);
+        assert_eq!(extra_in_openapi, ["/comm/groupchat-gone"]);
     }
 
     #[test]
@@ -3658,7 +3947,7 @@ pub(crate) mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    async fn capability_state() -> (AppState, String, String) {
+    pub(crate) async fn capability_state() -> (AppState, String, String) {
         let mut state = state().await;
         let now = crate::capabilities::unix_now();
         let store = crate::capabilities::CapabilityStore::new("daemon-test");
@@ -3878,9 +4167,764 @@ pub(crate) mod tests {
         assert_eq!(notice.op, None);
     }
 
+    /// K1-6a-G §2.1: a card shows the summary the gate compares a grant
+    /// with — its fingerprint, version and the running package's identity —
+    /// and there is none for a tool that does not exist or a module with no
+    /// running package.
+    #[tokio::test]
+    async fn a_module_tool_card_shows_what_a_grant_would_be_checked_against() {
+        let none_assembled = build_router(state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/module-consents/modules/doc-module/tools/read_document/card")
+                    .header("Authorization", "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(none_assembled.status(), StatusCode::NOT_FOUND);
+        let mut state = state().await;
+        let mut summary = agent24_store::ToolPermissionSummary::new(
+            "doc-module",
+            "read_document",
+            "1.2.3",
+            agent24_store::ConsentSource::ManualInstall,
+            Some("local documents".to_owned()),
+            None,
+            None,
+            agent24_store::HostRiskLevel::High,
+        );
+        summary.reversible_draft = true;
+        let running = StdArc::new(std::sync::atomic::AtomicBool::new(true));
+        let source = |takes_grants| crate::consent_routes::ToolCardSource {
+            summary: summary.clone(),
+            resource_kinds: vec!["doc".to_owned()],
+            takes_grants,
+        };
+        let gate = source(true).gate_request();
+        let mut old = summary.clone();
+        old.module = "old-module".to_owned();
+        state.module_tool_cards = Some(crate::consent_routes::ModuleToolCards {
+            notice: answering(crate::module_tool_runtime::RevocationStop::NotRunning),
+            tools: StdArc::new(std::collections::HashMap::from([
+                (
+                    ("doc-module".to_owned(), "read_document".to_owned()),
+                    source(true),
+                ),
+                (
+                    ("old-module".to_owned(), "read_document".to_owned()),
+                    crate::consent_routes::ToolCardSource {
+                        summary: old,
+                        ..source(false)
+                    },
+                ),
+            ])),
+            artifact: {
+                let running = StdArc::clone(&running);
+                StdArc::new(move |_: &str| {
+                    running
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        .then(|| "sha256:abc".to_owned())
+                })
+            },
+        });
+        let router = build_router(state);
+        let get = |uri: &'static str| {
+            let router = router.clone();
+            async move {
+                router
+                    .oneshot(
+                        Request::builder()
+                            .uri(uri)
+                            .header("Authorization", "Bearer testtoken")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let card = "/api/v1/module-consents/modules/doc-module/tools/read_document/card";
+        let response = get(card).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["fingerprint"], gate.current_scope_fingerprint);
+        assert_eq!(body["module_version"], gate.module_version);
+        assert_eq!(body["module_version"], "1.2.3");
+        assert_eq!(body["artifact"], "sha256:abc");
+        assert_eq!(body["resource_kinds"], serde_json::json!(["doc"]));
+        assert_eq!(body["host_risk"], "high");
+        assert_eq!(body["source"], "manual_install");
+        assert_eq!(body["scope_summary"]["readable"], "local documents");
+        // What the manifest declares, shown as declared; the gate still
+        // grants no draft exception on this path (`gate_request`).
+        assert_eq!(body["reversible_draft"], true);
+        assert!(!gate.reversible_draft_declared);
+        let response =
+            get("/api/v1/module-consents/modules/doc-module/tools/write_document/card").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response =
+            get("/api/v1/module-consents/modules/old-module/tools/read_document/card").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_json(response).await["error"]["code"],
+            "protocol_too_old"
+        );
+        running.store(false, std::sync::atomic::Ordering::SeqCst);
+        let response = get(card).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_json(response).await["error"]["code"],
+            "no_package_identity"
+        );
+    }
+
+    /// A revocation notice that answers `stop` and keeps what it was told.
+    fn answering_into(
+        stop: crate::module_tool_runtime::RevocationStop,
+        told: StdArc<std::sync::Mutex<Vec<crate::module_tool_runtime::GrantEnd>>>,
+    ) -> crate::consent_routes::RevocationNotice {
+        StdArc::new(move |end| {
+            told.lock().unwrap().push(end);
+            Box::pin(async move { stop }) as futures::future::BoxFuture<'static, _>
+        })
+    }
+
+    fn answering(
+        stop: crate::module_tool_runtime::RevocationStop,
+    ) -> crate::consent_routes::RevocationNotice {
+        answering_into(stop, StdArc::default())
+    }
+
+    /// K1-6a-G §2.5: a revocation tells the module and answers with what it
+    /// said; the list shows it for each revoked grant, and a revocation no
+    /// answer was recorded for — or one replaced since — reads unconfirmed,
+    /// as does one the module did not confirm, which is audited too. It
+    /// tells the grants it ended (§2.5.1), and answers its outbox row.
+    #[tokio::test]
+    async fn a_revocation_answers_whether_the_module_stopped() {
+        use crate::module_tool_runtime::RevocationStop::{Confirmed, NotRunning, Unconfirmed};
+        let dir = tempfile::tempdir().unwrap();
+        let running = StdArc::new(std::sync::atomic::AtomicBool::new(true));
+        let (state, summary) = decision_state(&running, &dir.path().join("os.json")).await;
+        let store = state.store.clone();
+        let told = StdArc::new(std::sync::Mutex::new(Vec::new()));
+        let with = |stop| {
+            let mut state = state.clone();
+            let cards = state.module_tool_cards.as_mut().unwrap();
+            cards.notice = answering_into(stop, StdArc::clone(&told));
+            build_router(state)
+        };
+        let delete = |router: Router, uri: &'static str| async move {
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(uri)
+                        .header("Authorization", "Bearer testtoken")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            body_json(response).await["stop"].clone()
+        };
+        let stop_listed = |store: agent24_store::Store| async move {
+            let views = authorization_list(store).await;
+            views["authorizations"][0]["stop"].clone()
+        };
+        let grant =
+            || store.grant_module_consent(&summary, "2026-10-24T00:00:00Z", "2099-01-01T00:00:00Z");
+        let granted = grant().await.unwrap();
+        assert_eq!(delete(with(Confirmed), DECIDE).await, "confirmed");
+        let unconfirmed = |store: agent24_store::Store| async move {
+            store
+                .list_audit()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| e.action == "module_consent.stop_unconfirmed")
+                .count()
+        };
+        assert_eq!(
+            unconfirmed(store.clone()).await,
+            0,
+            "a confirmed stop is not audited"
+        );
+        let told_end = |operation: &str, refs: Vec<String>| {
+            Some(crate::module_tool_runtime::GrantEnd {
+                module: "doc-module".to_owned(),
+                operation: operation.to_owned(),
+                ended_at: String::new(),
+                reason: "revoked",
+                authorization_refs: Some(refs),
+            })
+        };
+        let pop = || {
+            told.lock()
+                .unwrap()
+                .pop()
+                .map(|end| crate::module_tool_runtime::GrantEnd {
+                    ended_at: String::new(),
+                    ..end
+                })
+        };
+        assert_eq!(
+            pop(),
+            told_end("read_document", vec![granted.authorization_ref()])
+        );
+        assert_eq!(stop_listed(store.clone()).await, "confirmed");
+        let module = "/api/v1/module-consents/modules/doc-module";
+        assert_eq!(delete(with(Unconfirmed), module).await, "unconfirmed");
+        // The grant was told already: the module's revocation ends none.
+        assert_eq!(pop(), told_end("*", Vec::new()));
+        assert_eq!(stop_listed(store.clone()).await, "unconfirmed");
+        let (pending, _) = store
+            .pending_grant_end_notices("2099-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert!(
+            pending.is_empty(),
+            "each route answers its own: {pending:?}"
+        );
+        assert_eq!(unconfirmed(store.clone()).await, 1);
+        // A later revocation of the key while the module answers: the answer
+        // is not this revocation's, so it is not confirmed.
+        let mut racing = state.clone();
+        racing.module_tool_cards.as_mut().unwrap().notice = {
+            let store = store.clone();
+            StdArc::new(move |end: crate::module_tool_runtime::GrantEnd| {
+                let store = store.clone();
+                Box::pin(async move {
+                    store
+                        .revoke_module_consent_tracked(&end.module, None, "2026-10-24T00:30:00Z")
+                        .await
+                        .unwrap();
+                    Confirmed
+                }) as futures::future::BoxFuture<'static, _>
+            })
+        };
+        assert_eq!(delete(build_router(racing), module).await, "unconfirmed");
+        assert_eq!(unconfirmed(store.clone()).await, 2);
+        assert_eq!(delete(with(NotRunning), module).await, "not_running");
+        assert_eq!(stop_listed(store.clone()).await, "not_running");
+        assert_eq!(
+            unconfirmed(store.clone()).await,
+            2,
+            "a module not running is not audited"
+        );
+        // Revoked outside this route (the CLI's lifecycle revocation):
+        // nothing recorded, so unconfirmed.
+        store
+            .revoke_module_consent("doc-module", None, "2026-10-24T01:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(stop_listed(store.clone()).await, "unconfirmed");
+        let no_cards = build_router(AppState {
+            module_tool_cards: None,
+            ..state.clone()
+        });
+        assert_eq!(delete(no_cards, module).await, "not_running");
+        assert_eq!(unconfirmed(store.clone()).await, 2);
+        // The notifier answered the row first (§2.5.1): its answer stands,
+        // on the row and on the revocation, and the route claims none.
+        let mut late = state.clone();
+        late.module_tool_cards.as_mut().unwrap().notice = {
+            let store = store.clone();
+            StdArc::new(move |end: crate::module_tool_runtime::GrantEnd| {
+                let store = store.clone();
+                Box::pin(async move {
+                    let (pending, _) = store
+                        .pending_grant_end_notices("2099-01-01T00:00:00Z")
+                        .await
+                        .unwrap();
+                    let row = pending.last().unwrap();
+                    assert!(
+                        store
+                            .record_grant_end_stop(row.id, agent24_store::GrantEndStop::NotRunning)
+                            .await
+                            .unwrap()
+                    );
+                    store
+                        .record_revocation_stop(&end.module, None, row.generation, "not_running")
+                        .await
+                        .unwrap();
+                    Confirmed
+                }) as futures::future::BoxFuture<'static, _>
+            })
+        };
+        assert_eq!(delete(build_router(late), module).await, "unconfirmed");
+        assert_eq!(stop_listed(store.clone()).await, "not_running");
+        assert_eq!(unconfirmed(store.clone()).await, 3);
+        let fresh = grant().await.unwrap();
+        let views = authorization_list(store.clone()).await;
+        assert!(views["authorizations"][0].get("stop").is_none(), "{views}");
+        // A route's confirmed answer settles what its revocation carried
+        // (#1202 G7, #1222 gate 3): an end left unconfirmed is carried by the
+        // next revocation, and once that is confirmed, by none after it.
+        let carries = |fresh: &agent24_store::ModuleConsentRecord| {
+            let told = pop().unwrap().authorization_refs.unwrap();
+            told.contains(&fresh.authorization_ref())
+        };
+        assert_eq!(delete(with(Unconfirmed), DECIDE).await, "unconfirmed");
+        assert!(carries(&fresh));
+        assert_eq!(delete(with(Confirmed), DECIDE).await, "confirmed");
+        assert!(carries(&fresh), "carried while unconfirmed");
+        assert_eq!(delete(with(Confirmed), DECIDE).await, "confirmed");
+        assert!(!carries(&fresh), "settled by the route's confirmed answer");
+    }
+
+    /// Deletes `uri` through `state`, and gives the stop it answered.
+    async fn revoked_stop(state: AppState, uri: &str) -> serde_json::Value {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(uri)
+                    .header("Authorization", "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        body_json(response).await["stop"].clone()
+    }
+
+    /// K1-6a-G §2.5.1 (A5c-2a review round 2): a revocation whose route
+    /// cannot audit an unconfirmed answer, or cannot read its row, leaves
+    /// both answers to the notifier: the row stays unanswered and the
+    /// revocation records nothing; the route claims no stop. Unread, the
+    /// module is told no references, and stops by operation.
+    #[tokio::test]
+    async fn a_revocation_the_route_cannot_finish_is_left_to_the_notifier() {
+        use crate::module_tool_runtime::RevocationStop::{Confirmed, Unconfirmed};
+        let pool = |store: &agent24_store::Store| agent24_store::test_hooks::pool(store).clone();
+        let left = |store: agent24_store::Store| async move {
+            let (pending, _) = store
+                .pending_grant_end_notices("2099-01-01T00:00:00Z")
+                .await
+                .unwrap();
+            let recorded = store
+                .revocation_stop_state("doc-module", "read_document")
+                .await
+                .unwrap();
+            (pending.len(), recorded)
+        };
+        // The audit fails.
+        let dir = tempfile::tempdir().unwrap();
+        let running = StdArc::new(std::sync::atomic::AtomicBool::new(true));
+        let (mut state, _) = decision_state(&running, &dir.path().join("os.json")).await;
+        let store = state.store.clone();
+        state.module_tool_cards.as_mut().unwrap().notice = answering(Unconfirmed);
+        sqlx::query("CREATE TRIGGER reject_audit BEFORE INSERT ON audit_log BEGIN SELECT RAISE(FAIL, 'offline'); END")
+            .execute(&pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(revoked_stop(state, DECIDE).await, "unconfirmed");
+        assert_eq!(left(store).await, (1, None));
+        // The row cannot be read.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, _) = decision_state(&running, &dir.path().join("os.json")).await;
+        let store = state.store.clone();
+        let told = StdArc::new(std::sync::Mutex::new(Vec::new()));
+        state.module_tool_cards.as_mut().unwrap().notice =
+            answering_into(Confirmed, StdArc::clone(&told));
+        sqlx::query("CREATE TRIGGER garble AFTER INSERT ON module_grant_end_notices BEGIN UPDATE module_grant_end_notices SET authorization_refs = 'x' WHERE id = NEW.id; END")
+            .execute(&pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(revoked_stop(state, DECIDE).await, "unconfirmed");
+        assert_eq!(told.lock().unwrap()[0].authorization_refs, None);
+        let recorded = store
+            .revocation_stop_state("doc-module", "read_document")
+            .await
+            .unwrap();
+        assert_eq!(recorded, None);
+    }
+
+    /// K1-6a-G §2.5 (A5b): an expired grant lists what its module answered
+    /// when told it ended; one not told yet reads unconfirmed. An expired
+    /// refusal started nothing to stop.
+    #[tokio::test]
+    async fn an_expired_grant_lists_whether_the_module_stopped() {
+        let store = agent24_store::Store::open_memory().await.unwrap();
+        let summary = |op: &str| {
+            agent24_store::ToolPermissionSummary::new(
+                "doc-module",
+                op,
+                "1.2.3",
+                agent24_store::ConsentSource::FirstParty,
+                Some("local documents".to_owned()),
+                None,
+                None,
+                agent24_store::HostRiskLevel::Low,
+            )
+        };
+        let (decided, expired) = ("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+        let granted = store
+            .grant_module_consent(&summary("read_document"), decided, expired)
+            .await
+            .unwrap();
+        store
+            .deny_module_consent(&summary("write_document"), decided, expired)
+            .await
+            .unwrap();
+        let stops = |list: serde_json::Value| {
+            list["authorizations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| (a["tool"].clone(), a["status"].clone(), a["stop"].clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            stops(authorization_list(store.clone()).await),
+            [
+                (
+                    "read_document".into(),
+                    "expired".into(),
+                    "unconfirmed".into()
+                ),
+                (
+                    "write_document".into(),
+                    "expired".into(),
+                    serde_json::Value::Null
+                ),
+            ]
+        );
+        assert!(
+            store
+                .record_expiry_stop(
+                    "doc-module",
+                    "read_document",
+                    granted.generation,
+                    "confirmed"
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            stops(authorization_list(store).await)[0].2,
+            serde_json::json!("confirmed")
+        );
+    }
+
+    async fn authorization_list(store: agent24_store::Store) -> serde_json::Value {
+        let mut state = state().await;
+        state.store = store;
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/module-consents")
+                    .header("Authorization", "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        body_json(response).await
+    }
+
+    /// A state with one grants-protocol tool (`doc-module.read_document`,
+    /// kinds `doc`) and one older one, running while `running` holds, and
+    /// decisions open against `os_json`.
+    async fn decision_state(
+        running: &StdArc<std::sync::atomic::AtomicBool>,
+        os_json: &std::path::Path,
+    ) -> (AppState, agent24_store::ToolPermissionSummary) {
+        let mut state = state().await;
+        let summary = agent24_store::ToolPermissionSummary::new(
+            "doc-module",
+            "read_document",
+            "1.2.3",
+            agent24_store::ConsentSource::ManualInstall,
+            None,
+            None,
+            None,
+            agent24_store::HostRiskLevel::High,
+        );
+        let source = |module: &str, takes_grants| crate::consent_routes::ToolCardSource {
+            summary: agent24_store::ToolPermissionSummary {
+                module: module.to_owned(),
+                ..summary.clone()
+            },
+            resource_kinds: vec!["doc".to_owned()],
+            takes_grants,
+        };
+        let running = StdArc::clone(running);
+        state.module_tool_cards = Some(crate::consent_routes::ModuleToolCards {
+            notice: answering(crate::module_tool_runtime::RevocationStop::NotRunning),
+            tools: StdArc::new(std::collections::HashMap::from([
+                (
+                    ("doc-module".to_owned(), "read_document".to_owned()),
+                    source("doc-module", true),
+                ),
+                (
+                    ("old-module".to_owned(), "read_document".to_owned()),
+                    source("old-module", false),
+                ),
+            ])),
+            artifact: StdArc::new(move |_: &str| {
+                running
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .then(|| "sha256:abc".to_owned())
+            }),
+        });
+        state.module_grants = Some(crate::consent_routes::GrantSettings {
+            max_days: 30,
+            os_config: os_json.to_owned(),
+        });
+        (state, summary)
+    }
+
+    const DECIDE: &str = "/api/v1/module-consents/modules/doc-module/tools/read_document";
+
+    fn decision(
+        summary: &agent24_store::ToolPermissionSummary,
+        patch: serde_json::Value,
+    ) -> String {
+        let mut body = serde_json::json!({
+            "decision": "granted",
+            "fingerprint": summary.scope_fingerprint(),
+            "module_version": "1.2.3",
+            "artifact": "sha256:abc",
+            "resources": ["doc:a1"],
+            "expires_at": (chrono::Utc::now() + chrono::Duration::days(7)).to_rfc3339(),
+        });
+        for (key, value) in patch.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        body.to_string()
+    }
+
+    async fn post(router: &Router, uri: &str, body: String) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("Authorization", "Bearer testtoken")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, body_json(response).await)
+    }
+
+    /// K1-6a-G §2.1, criteria 6, 7 and 14: a decision is written only on the
+    /// card as the tool is checked now, with the switch on, the module
+    /// enabled and running, a bounded expiry and resources of declared
+    /// kinds; anything else writes nothing.
+    #[tokio::test]
+    async fn a_module_tool_decision_is_written_only_on_the_card_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let os_json = dir.path().join("os.json");
+        let running = StdArc::new(std::sync::atomic::AtomicBool::new(true));
+        let (state, summary) = decision_state(&running, &os_json).await;
+        let store = state.store.clone();
+        let closed = build_router(AppState {
+            module_grants: None,
+            ..state.clone()
+        });
+        let router = build_router(state);
+        let code = |(status, body): (StatusCode, serde_json::Value)| {
+            (
+                status,
+                body["error"]["code"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        };
+        let expect = |status: StatusCode, code: &str| (status, code.to_owned());
+        let ok = decision(&summary, serde_json::json!({}));
+        assert_eq!(
+            code(post(&closed, DECIDE, ok.clone()).await),
+            expect(StatusCode::FORBIDDEN, "grants_closed")
+        );
+        let (status, _) = post(&router, &format!("{DECIDE}x"), ok.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            code(
+                post(
+                    &router,
+                    "/api/v1/module-consents/modules/old-module/tools/read_document",
+                    ok.clone()
+                )
+                .await
+            ),
+            expect(StatusCode::CONFLICT, "protocol_too_old")
+        );
+        let (status, _) = post(&router, DECIDE, "{".to_owned()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let not_text = decision(&summary, serde_json::json!({ "resources": ["doc:a1", 5] }));
+        let (status, _) = post(&router, DECIDE, not_text).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let in_days = |days| (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339();
+        let many: Vec<String> = (0..257).map(|i| format!("doc:d{i}")).collect();
+        for patch in [
+            serde_json::json!({ "expires_at": null }),
+            serde_json::json!({ "expires_at": "next week" }),
+            serde_json::json!({ "expires_at": in_days(31) }),
+            serde_json::json!({ "expires_at": in_days(-1) }),
+            serde_json::json!({ "resources": ["doc:a b"] }),
+            serde_json::json!({ "resources": ["page:a1"] }),
+            serde_json::json!({ "resources": many }),
+            serde_json::json!({ "decision": "denied" }),
+        ] {
+            assert_eq!(
+                code(post(&router, DECIDE, decision(&summary, patch.clone())).await),
+                expect(StatusCode::UNPROCESSABLE_ENTITY, "invalid_decision"),
+                "{patch}"
+            );
+        }
+        for patch in [
+            serde_json::json!({ "fingerprint": "sha256:other" }),
+            serde_json::json!({ "module_version": "1.2.4" }),
+            serde_json::json!({ "artifact": "sha256:other" }),
+        ] {
+            assert_eq!(
+                code(post(&router, DECIDE, decision(&summary, patch.clone())).await),
+                expect(StatusCode::CONFLICT, "card_changed"),
+                "{patch}"
+            );
+        }
+        running.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            code(post(&router, DECIDE, ok.clone()).await),
+            expect(StatusCode::CONFLICT, "no_package_identity")
+        );
+        running.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::fs::write(&os_json, r#"{"domainOs":{"doc-module":{"enabled":false}}}"#).unwrap();
+        assert_eq!(
+            code(post(&router, DECIDE, ok.clone()).await),
+            expect(StatusCode::CONFLICT, "module_disabled")
+        );
+        std::fs::write(&os_json, "not json").unwrap();
+        assert_eq!(
+            code(post(&router, DECIDE, ok.clone()).await),
+            expect(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        );
+        assert!(store.list_module_consents().await.unwrap().is_empty());
+
+        std::fs::remove_file(&os_json).unwrap();
+        let both = decision(
+            &summary,
+            serde_json::json!({ "resources": ["doc:b2", "doc:a1", "doc:b2"] }),
+        );
+        let (status, body) = post(&router, DECIDE, both).await;
+        assert_eq!(
+            (status, &body["status"]),
+            (StatusCode::OK, &serde_json::json!("granted"))
+        );
+        let records = store.list_module_consents().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].resources, ["doc:a1", "doc:b2"]);
+        assert_eq!(records[0].artifact.as_deref(), Some("sha256:abc"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let lookup = |store: agent24_store::Store| {
+            let (fingerprint, now) = (summary.scope_fingerprint(), now.clone());
+            async move {
+                store
+                    .lookup_module_consent(
+                        "doc-module",
+                        "read_document",
+                        "1.2.3",
+                        &fingerprint,
+                        &now,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(matches!(
+            lookup(store.clone()).await,
+            agent24_store::ConsentLookup::Granted(_)
+        ));
+        let denial = decision(
+            &summary,
+            serde_json::json!({ "decision": "denied", "resources": [] }),
+        );
+        let (status, body) = post(&router, DECIDE, denial).await;
+        assert_eq!(
+            (status, &body["status"]),
+            (StatusCode::OK, &serde_json::json!("denied"))
+        );
+        assert!(matches!(
+            lookup(store).await,
+            agent24_store::ConsentLookup::Denied(_)
+        ));
+    }
+
+    /// K1-6a-G §2.1 F7 and #1157's S2: a decision waits for `os_control`,
+    /// so no enable, disable or stop lands between its checks and its write.
+    #[tokio::test]
+    async fn a_module_tool_decision_waits_for_os_control() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = StdArc::new(std::sync::atomic::AtomicBool::new(true));
+        let (state, summary) = decision_state(&running, &dir.path().join("os.json")).await;
+        let (store, control) = (state.store.clone(), state.os_control.clone());
+        let router = build_router(state);
+        let held = control.lock_owned().await;
+        let body = decision(&summary, serde_json::json!({}));
+        let task = tokio::spawn(async move { post(&router, DECIDE, body).await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!task.is_finished());
+        assert!(store.list_module_consents().await.unwrap().is_empty());
+        drop(held);
+        assert_eq!(task.await.unwrap().0, StatusCode::OK);
+    }
+
+    /// The host's switch and bound (K1-6a-G §2.1): off by default and on an
+    /// ephemeral daemon; a bound past 90 days, or none, stops the start.
+    #[test]
+    fn module_tool_decisions_open_only_on_the_host_switch() {
+        use crate::consent_routes::{GrantSettings, grant_settings};
+        let path = || Some(std::path::PathBuf::from("/x/os.json"));
+        let open = |days| {
+            Ok(Some(GrantSettings {
+                max_days: days,
+                os_config: "/x/os.json".into(),
+            }))
+        };
+        assert_eq!(grant_settings(None, None, false, path()), Ok(None));
+        assert_eq!(grant_settings(Some("0"), None, false, path()), Ok(None));
+        assert_eq!(grant_settings(Some("1"), None, false, path()), open(30));
+        assert_eq!(
+            grant_settings(Some("1"), Some("90"), false, path()),
+            open(90)
+        );
+        assert_eq!(grant_settings(Some("1"), Some("1"), false, path()), open(1));
+        assert_eq!(grant_settings(Some("1"), None, true, path()), Ok(None));
+        assert_eq!(grant_settings(Some("1"), None, false, None), Ok(None));
+        for bad in ["0", "91", "-1", "30d", ""] {
+            assert!(
+                grant_settings(None, Some(bad), false, path()).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(grant_settings(Some("yes"), None, false, path()).is_err());
+    }
+
     #[tokio::test]
     async fn module_consent_routes_reject_creative_identity() {
         let (state, _host, creative) = capability_state().await;
+        let state_again = state.clone();
+        // Decisions open, so only the host-authority check can answer 403.
+        let state_post = AppState {
+            module_grants: Some(crate::consent_routes::GrantSettings {
+                max_days: 30,
+                os_config: "/nonexistent/os.json".into(),
+            }),
+            ..state.clone()
+        };
         let router = build_router(state);
         let response = router
             .oneshot(
@@ -3888,6 +4932,29 @@ pub(crate) mod tests {
                     .uri("/api/v1/module-consents")
                     .header("Authorization", format!("Bearer {creative}"))
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = build_router(state_again)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/module-consents/modules/doc-module/tools/read_document/card")
+                    .header("Authorization", format!("Bearer {creative}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = build_router(state_post)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(DECIDE)
+                    .header("Authorization", format!("Bearer {creative}"))
+                    .body(Body::from("{}"))
                     .unwrap(),
             )
             .await
@@ -4248,6 +5315,112 @@ pub(crate) mod tests {
         assert_eq!(connections.load(Ordering::SeqCst), 1);
     }
 
+    // ---- B1: Host / Origin guard --------------------------------------
+
+    async fn guarded_status(host: Option<&str>, origin: Option<&str>) -> (StatusCode, String) {
+        let router = guard_host_origin(build_router(state().await), 4242);
+        let mut b = Request::builder().uri("/api/v1/health");
+        if let Some(h) = host {
+            b = b.header(header::HOST, h);
+        }
+        if let Some(o) = origin {
+            b = b.header(header::ORIGIN, o);
+        }
+        let res = router
+            .oneshot(b.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let code = if status == StatusCode::OK {
+            String::new()
+        } else {
+            body_json(res).await["error"]["code"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned()
+        };
+        (status, code)
+    }
+
+    #[tokio::test]
+    async fn guard_accepts_the_three_loopback_hosts_case_insensitively() {
+        for h in [
+            "127.0.0.1:4242",
+            "localhost:4242",
+            "[::1]:4242",
+            "LocalHost:4242",
+        ] {
+            assert_eq!(guarded_status(Some(h), None).await.0, StatusCode::OK, "{h}");
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_rejects_wrong_host_even_on_health() {
+        for h in [
+            "evil.example:4242",
+            "127.0.0.1:4243",
+            "127.0.0.1",
+            "localhost.evil.com:4242",
+            "127.0.0.1:4242.evil.com",
+        ] {
+            let (s, c) = guarded_status(Some(h), None).await;
+            assert_eq!((s, c.as_str()), (StatusCode::FORBIDDEN, "bad_host"), "{h}");
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_rejects_a_request_with_no_host_as_400() {
+        let (s, c) = guarded_status(None, None).await;
+        assert_eq!((s, c.as_str()), (StatusCode::BAD_REQUEST, "bad_host"));
+    }
+
+    #[tokio::test]
+    async fn guard_rejects_a_browser_origin_but_allows_null_and_none() {
+        let (s, c) = guarded_status(Some("127.0.0.1:4242"), Some("http://evil.example")).await;
+        assert_eq!((s, c.as_str()), (StatusCode::FORBIDDEN, "forbidden_origin"));
+        let (s, _) = guarded_status(Some("127.0.0.1:4242"), Some("null")).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = guarded_status(Some("127.0.0.1:4242"), None).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn guard_runs_before_auth_and_in_front_of_module_routes() {
+        // Wrong Host on an authenticated route is the guard's answer, not 401.
+        let router = guard_host_origin(build_router(state().await), 4242);
+        let res = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/models")
+                    .header(header::HOST, "evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn legacy_ready_line_has_token_unless_told_to_omit_it() {
+        let with = legacy_ready_line(4242, "sekret", false, "g1");
+        assert_eq!(with["token"], "sekret");
+        assert_eq!(with["port"], 4242);
+        let without = legacy_ready_line(4242, "sekret", true, "g1");
+        assert!(without.get("token").is_none());
+        assert!(!without.to_string().contains("sekret"));
+        assert_eq!(without["type"], "ready");
+        assert_eq!(without["port"], 4242);
+        assert_eq!(without["auth_mode"], "legacy_single_token");
+    }
+
+    #[test]
+    fn serve_layers_the_host_guard_on_the_router_it_serves() {
+        let src = include_str!("server.rs");
+        let start = src.find("pub async fn serve(").expect("serve must exist");
+        assert!(src[start..].contains("guard_host_origin(router, local.port())"));
+    }
+
     #[tokio::test]
     async fn other_routes_401_without_token_with_v1_envelope() {
         let res = build_router(state().await)
@@ -4317,6 +5490,7 @@ pub(crate) mod tests {
             ("POST", "/api/v1/chat"),
             ("GET", "/api/v1/sessions"),
             ("POST", "/api/v1/runs"),
+            ("GET", "/api/v1/peer/runs"),
             ("GET", "/api/v1/events"),
             ("GET", "/api/v1/approvals"),
             ("GET", "/api/v1/tools"),
@@ -5180,6 +6354,12 @@ pub(crate) mod tests {
             reason: "comm 路由 merge 入口：并入 module_routes，使 /api/v1/comm 走 kernel auth",
         },
         AllowedRegistration {
+            file: "crates/agent24-comm/src/router.rs",
+            form: "merge",
+            call: ".merge(crate::groupchat::routes())",
+            reason: "群聊路由并入 comm router；方法清单在 groupchat::routes，由目录扫描覆盖",
+        },
+        AllowedRegistration {
             file: "apps/agent24d/src/comm_routes.rs",
             form: "nest",
             call: ".nest(\"/api/v1/comm\", agent24_comm::router(state))",
@@ -5267,6 +6447,7 @@ pub(crate) mod tests {
         let signature = match path {
             "apps/agent24d/src/server.rs" => "pub fn build_router_with_modules",
             "crates/agent24-comm/src/router.rs" => "pub fn router(",
+            "crates/agent24-comm/src/groupchat.rs" => "pub(crate) fn routes(",
             _ => return None,
         };
         Some(function_span(src, signature))
@@ -5429,7 +6610,14 @@ pub fn build_router_with_modules() {
         );
         assert_eq!(kernel_src.matches(".merge(modules)").count(), 1);
         let kernel = parsed_routes(kernel_src, "pub fn build_router_with_modules", "");
-        let comm = parsed_routes(comm_src, "pub fn router(", "/api/v1/comm");
+        let mut comm = parsed_routes(comm_src, "pub fn router(", "/api/v1/comm");
+        // `router` merges `groupchat::routes()`; both register under the comm prefix.
+        let groupchat_src = source_of(&files, "crates/agent24-comm/src/groupchat.rs");
+        comm.extend(parsed_routes(
+            groupchat_src,
+            "pub(crate) fn routes(",
+            "/api/v1/comm",
+        ));
         let violations = registration_violations(&files);
         assert!(
             violations.is_empty(),
@@ -5840,6 +7028,7 @@ pub fn build_router_with_modules() {
                     workspace_id: None,
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
+                    knowledge_binding_id: None,
                 },
                 output: None,
                 error: None,
@@ -6327,6 +7516,7 @@ pub fn build_router_with_modules() {
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
                 workspace_id: None,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();

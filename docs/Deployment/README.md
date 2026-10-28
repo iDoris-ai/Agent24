@@ -72,6 +72,15 @@ AGENT24_DATA_DIR=/tmp/a24-x agent24 daemon status
   但 CLI / 桌面端只会连上与自己 `AGENT24_DATA_DIR` 相同的那个 daemon。
 - 想回到原数据，去掉这个变量重新启动即可；不需要也不应手动搬动 `agent24.db`。
 
+## 升级后重装 24/7 服务（LaunchAgent）
+
+发布前加固（PR-B / S-04）起，`agent24 service install` 生成的 plist 会带 `--ready-omit-token`，daemon 的 ready 行不再把 bearer token 写进 `~/.agent24/logs/agent24d.out.log`（token 只在 0600 的 `daemon.json`）；同时 `logs/` 收紧为 0700、日志文件为 0600。
+
+- **只换二进制的旧安装不会自动获得这些**：已有的 plist 不带该参数，旧日志也仍是原权限，token 会继续写进日志。
+- 升级后请**执行一次 `agent24 service install`**。它是幂等的：重写 plist、收紧 logs 权限，并 `launchctl bootout` + `bootstrap` 重载。
+- `agent24 service status` 在发现 plist 缺少该参数时会多打一行 `note:` 提示。
+- 旧日志里已经落盘的 token 不会被清掉；若担心，重装后删除旧的 `agent24d.out.log`，必要时轮换 token（重启 daemon 即换新）。
+
 ## 需要 jason 决定或动手的事
 
 1. **Apple 开发者账号**：到位后导出 Developer ID Application 证书和 App Store Connect API key，填进仓库 Secrets（B1，只能由你来做）。

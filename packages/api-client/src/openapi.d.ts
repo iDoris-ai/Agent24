@@ -78,12 +78,39 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        post?: never;
+        /**
+         * Write the user's decision on a module tool's card
+         * @description The card's `fingerprint`, `module_version` and `artifact` must still be what the tool is checked against when the decision is written, and the module enabled and running (K1-6a-G §2.1). Replaces any earlier decision for the tool.
+         */
+        post: operations["decideModuleToolConsent"];
         /**
          * Revoke one module tool authorization
          * @description Persists revocation and broadcasts the 6a.3 revocation notice.
          */
         delete: operations["revokeModuleToolConsent"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/module-consents/modules/{module}/tools/{tool}/card": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                module: string;
+                tool: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * What a grant of one module tool would cover
+         * @description Built by the host from the tool's manifest declaration (risk, output privacy, resource kinds, reversible draft); the module's own description text is not shown. `reversible_draft` is what the manifest declares, and the declaration relaxes nothing: a module tool's dispatch is gated with no draft exception. `fingerprint`, `module_version` and `artifact` are what a grant must repeat, and what dispatch compares it with (K1-6a-G §2.1).
+         */
+        get: operations["getModuleToolCard"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -418,6 +445,51 @@ export interface paths {
          *     effect within 1s (see TASKS C2 acceptance).
          */
         post: operations["cancelRun"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/peer/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List runs as a peer bridge may relay them
+         * @description K1-6b.5c-2 (ADR-K1-02 §2.4). The MCP server and the ACP bridge read
+         *     runs here instead of /runs. A run's prompt, output and error appear
+         *     only when every source tagged on it is ordinary, it has ended, and —
+         *     while tool results carry no source tags — it cannot have taken one in:
+         *     it called no tool, recalled no memory, was not started by a
+         *     kernel-created schedule, and has no session context (no session, or it
+         *     ran, and the daemon runs, without session memory). Any other run
+         *     carries only its id,
+         *     status and a fixed notice.
+         */
+        get: operations["listPeerRuns"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/peer/runs/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one run as a peer bridge may relay it */
+        get: operations["getPeerRun"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1197,7 +1269,7 @@ export interface paths {
         put?: never;
         /**
          * Extract fields from one revision, each value with its provenance; starts a job
-         * @description Idempotent on the business key (document_id, revision, schema_sha256, extractor_version) (§5.4); a rerun is keyed instead by the document and its `Idempotency-Key`, so a key is never shared between documents. The model the kernel's router picks is not known before the call, so it is not in the key: it is recorded in the result's `model_id`, and a new local model is used by extracting again with `rerun` (David, 2026-10-10). The replay statuses are those of import: 202 while queued or running or when a failed or interrupted job is re-queued (same job_id, attempt + 1); 200 once it has succeeded (with `result.extraction_id`) or was cancelled (it stays cancelled). To extract again on purpose, send `rerun: true` with a new `Idempotency-Key`: that key names the rerun within the document (the same key on another document is another rerun), so resending it replays the same rerun and a new key runs again; `rerun: true` without the header is 400 `invalid_request`, and the same key with a different request — the JCS hash of the whole request body differs (§5.4; David, 2026-10-10) — is 422 `idempotency_key_reused`. Field keys must be unique (400 otherwise). Field descriptions and the document text are untrusted data: the OS passes them to the model under a fixed extraction instruction and never follows instructions found in them. The model is called through the kernel under `LocalOnly` (ADR-DOC-01 D8). When the kernel gives this module no model access, the answer is 503 `engine_unavailable`. Whether a local model is available is only known when the job calls it: if none is, the job fails with `engine_unavailable` (retryable; the same key re-queues it). `details.engine` is `local-model` (§3.2).
+         * @description Idempotent on the business key (document_id, revision, schema_sha256, extractor_version) (§5.4); a rerun is keyed instead by the document and its `Idempotency-Key`, so a key is never shared between documents. The model the kernel's router picks is not known before the call, so it is not in the key: it is recorded in the result's `model_id`, and a new local model is used by extracting again with `rerun` (David, 2026-10-10). The replay statuses are those of import: 202 while queued or running or when a failed or interrupted job is re-queued (same job_id, attempt + 1); 200 once it has succeeded (with `result.extraction_id`) or was cancelled (it stays cancelled). To extract again on purpose, send `rerun: true` with a new `Idempotency-Key`: that key names the rerun within the document (the same key on another document is another rerun), so resending it replays the same rerun and a new key runs again; `rerun: true` without the header is 400 `invalid_request`, and the same key with a different request — the JCS hash of the request body, with `"rerun": false` left out so it hashes as the body without `rerun`, differs (§5.4; David, 2026-10-10) — is 422 `idempotency_key_reused`. Field keys must be unique (400 otherwise). Field descriptions and the document text are untrusted data: the OS passes them to the model under a fixed extraction instruction and never follows instructions found in them. The model is called through the kernel under `LocalOnly` (ADR-DOC-01 D8). When the kernel gives this module no model access, the answer is 503 `engine_unavailable`. Whether a local model is available is only known when the job calls it: if none is, the job fails with `engine_unavailable` (retryable; the same key re-queues it). `details.engine` is `local-model` (§3.2).
          */
         post: operations["documentsExtract"];
         delete?: never;
@@ -1220,6 +1292,448 @@ export interface paths {
         get: operations["documentsGetExtraction"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/identity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Hyphae identities */
+        get: operations["listCommIdentities"];
+        put?: never;
+        /** Create an identity (the first one also creates the keystore) */
+        post: operations["createCommIdentity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/identity/default": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Set the default identity */
+        post: operations["useCommIdentity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/unlock": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Verify and remember the keystore password */
+        post: operations["unlockComm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/contact": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List contacts */
+        get: operations["listCommContacts"];
+        put?: never;
+        /** Add a contact */
+        post: operations["addCommContact"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/relay": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List configured relays */
+        get: operations["listCommRelays"];
+        /** Replace the relay list (full replace, at most 8) */
+        put: operations["setCommRelays"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/relay/probe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Probe a relay on demand */
+        post: operations["probeCommRelay"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Import an existing Hyphae home */
+        post: operations["importCommHome"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/daemon": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Hyphae daemon status (process, relay probe, catch-up) */
+        get: operations["getCommDaemon"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/daemon/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Start the Hyphae daemon */
+        post: operations["startCommDaemon"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/daemon/stop": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Stop the Hyphae daemon */
+        post: operations["stopCommDaemon"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/send": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Send a one-to-one message
+         * @description Part-success is `502 partial` with the Hyphae data kept; there is no resend, use the outbox retry route.
+         */
+        post: operations["sendCommMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Inbox history (pull-based) */
+        get: operations["listCommHistory"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/inbox/pull": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Pull the inbox once */
+        post: operations["pullCommInbox"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/outbox": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List outbox entries */
+        get: operations["listCommOutbox"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/outbox/{event_id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Retry one outbox event (same event id) */
+        post: operations["retryCommOutbox"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/outbox/clear": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Clear failed outbox entries (local bookkeeping only) */
+        post: operations["clearCommOutbox"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/groupchat": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the groups this identity belongs to
+         * @description `groupchat list`. Tier CommRead (daily).
+         */
+        get: operations["listCommGroups"];
+        put?: never;
+        /**
+         * Create a group and invite npubs
+         * @description `groupchat create`. Tier CommWrite (elevated). Invitations stay local until each invitee accepts.
+         */
+        post: operations["createCommGroup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/groupchat/{group_id}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                group_id: components["parameters"]["CommGroupId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List a group's members (creator first)
+         * @description `groupchat members`. Tier CommRead (daily).
+         */
+        get: operations["listCommGroupMembers"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/groupchat/{group_id}/invites": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                group_id: components["parameters"]["CommGroupId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List a group's invitations (creator only)
+         * @description `groupchat invite list`. Tier CommRead (daily).
+         */
+        get: operations["listCommGroupInvites"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/groupchat/{group_id}/messages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                group_id: components["parameters"]["CommGroupId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Local group history, oldest first, cursor-paged
+         * @description `groupchat history`. Tier CommRead (daily). `before_id` returns the newest `limit` messages older than that message id; `after_id` the oldest `limit` newer than it (incremental refresh). An unknown cursor, or both cursors, is `400 invalid`. An empty history is `[]`.
+         */
+        get: operations["listCommGroupMessages"];
+        put?: never;
+        /**
+         * Send a group message (per-recipient fan-out)
+         * @description `groupchat send`. Tier CommWrite (elevated). Pass `logical_id` (32 lowercase hex) so the send can be found again by status/retry. Partial fan-out failure is `502 partial` whose `data` is the full send report with per-recipient state; render that, do not re-send. `relay_accepted` means a relay took the event, not that anyone read it.
+         */
+        post: operations["sendCommGroupMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/groupchat/{group_id}/messages/{logical_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                group_id: components["parameters"]["CommGroupId"];
+                /** @description The `logical_id` the message was sent with (also the message `id` in history). */
+                logical_id: components["parameters"]["CommLogicalId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Per-recipient delivery state of one send
+         * @description `groupchat status`. Tier CommRead (daily). A logical id Hyphae does not know is `400 invalid` (since Hyphae v0.27.2; `502 upstream` on 0.27.1).
+         */
+        get: operations["getCommGroupMessageStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/groupchat/{group_id}/messages/{logical_id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                group_id: components["parameters"]["CommGroupId"];
+                /** @description The `logical_id` the message was sent with (also the message `id` in history). */
+                logical_id: components["parameters"]["CommLogicalId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Requeue failed recipients of one send
+         * @description `groupchat retry`. Tier CommWrite (elevated). Reuses the original signed event (no duplicate message). Omit `recipient` to retry every failed one.
+         */
+        post: operations["retryCommGroupMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/groupchat/invites/{invite_id}/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                invite_id: components["parameters"]["CommInviteId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Accept a group invitation
+         * @description `groupchat accept`. Tier CommWrite (elevated). `state:"pending"` (still waiting for other members or the creator) is a success; `"active"` means the group is live. A UI must only call this after an explicit user click. Activation has no command of its own: it follows the last accept.
+         */
+        post: operations["acceptCommGroupInvite"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1390,10 +1904,15 @@ export interface components {
             /** @description Server-measured wall-clock milliseconds for this call. */
             latency_ms?: number | null;
             /**
-             * @description M1-T14: deterministic outcome of an explicit "记住…" turn, set by the daemon — never inferred from the model's own reply text. Omitted when this prompt was not an explicit remember, or session_id was omitted. "saved" covers the write-gate's own idempotent reassert/no-op case too (an identical belief already active), not just a fresh commit.
+             * @description M1-T14: deterministic outcome of an explicit "记住…" turn, set by the daemon — never inferred from the model's own reply text. Omitted when this prompt was not an explicit remember (and its conversation write did not fail), or session_id was omitted. "saved" covers the write-gate's own idempotent reassert/no-op case too (an identical belief already active), not just a fresh commit. P1-02c adds the failure shapes, each with `memory_error_code`: "failed" — an explicit remember wrote NOTHING; "not_saved" — an ordinary turn (no explicit remember) was not written to the session history; "partial" — an explicit remember's conversation turn WAS saved but its assertion was not. No failure value ever reads as saved, and the model's own text is not a receipt.
              * @enum {string}
              */
-            memory_receipt?: "saved" | "paused_not_saved" | "failed";
+            memory_receipt?: "saved" | "paused_not_saved" | "failed" | "not_saved" | "partial";
+            /**
+             * @description P1-02c: why the memory write failed. Present exactly when `memory_receipt` is "failed", "not_saved" or "partial". A closed code, never text: no partition key, no storage error message. `memory_disk_low` is emitted by the c4 pre-write disk gate.
+             * @enum {string}
+             */
+            memory_error_code?: "memory_quota_rows" | "memory_quota_bytes" | "memory_disk_low" | "memory_disk_full" | "memory_reserved_kind" | "memory_retract_id_too_long" | "memory_internal";
         };
         Session: {
             id: string;
@@ -1443,6 +1962,8 @@ export interface components {
             workspace_id: string | null;
             model_override?: string | null;
             mode?: components["schemas"]["RunMode"];
+            /** @description The Knowledge binding copied from the run request; null when the run has none. */
+            knowledge_binding_id: string | null;
         };
         RunOutput: {
             text: string;
@@ -1469,6 +1990,31 @@ export interface components {
             /** Format: date-time */
             ended_at: string | null;
         };
+        /**
+         * @description K1-6b.5c-2: an allowlisted view of a run for peer bridges, never a
+         *     filtered Run, so a field added to Run later is not relayed by default.
+         */
+        PeerRun: {
+            id: string;
+            status: components["schemas"]["RunStatus"];
+            /**
+             * @description True unless every source tagged on the run so far is ordinary and
+             *     the run called no tool, recalled no memory, was not started by a
+             *     kernel-created schedule and has no session context. Sources are
+             *     tagged before the first model call, so afterwards the value only
+             *     changes when the run starts a tool or the daemon restarts with
+             *     session memory turned on or off.
+             */
+            withheld: boolean;
+            /** @description Present only for an ended run that is not withheld */
+            prompt: string | null;
+            /** @description Present only for a completed run that is not withheld */
+            output: components["schemas"]["RunOutput"] | null;
+            /** @description Present only for a failed run that is not withheld */
+            error: components["schemas"]["ErrorBody"] | null;
+            /** @description Fixed explanation, present exactly when withheld is true */
+            notice: string | null;
+        };
         RunCreate: {
             /** @description Omit/null to create a transient run */
             session_id?: string | null;
@@ -1477,6 +2023,8 @@ export interface components {
             prompt: string;
             model_override?: string | null;
             mode?: components["schemas"]["RunMode"];
+            /** @description KB-HOST-01: a Knowledge binding the product host activated over its private interface. A selector, not an authority: only the product host may name one, and only one it has active; the run is pinned to that activation. Omit/null for a run without Knowledge. */
+            knowledge_binding_id?: string | null;
         };
         /** @enum {string} */
         ToolCallStatus: "running" | "completed" | "failed" | "denied";
@@ -2430,12 +2978,50 @@ export interface components {
             expires_at: string;
             /** @enum {string} */
             status: "granted" | "denied" | "revoked" | "expired" | "stale" | "not_granted";
+            /**
+             * @description Only for a revoked one, or an expired grant: whether the module said it stopped the work the grant started when told it ended (K1-6a-G §2.5). `unconfirmed` also when no answer was recorded, as for a revocation made outside this daemon or an expiry not yet told.
+             * @enum {string}
+             */
+            stop?: "confirmed" | "unconfirmed" | "not_running";
+        };
+        ModuleToolCard: {
+            module: string;
+            tool: string;
+            module_version: string;
+            scope_summary: {
+                readable: string | null;
+                writable: string | null;
+                external: string | null;
+            };
+            /** @enum {string} */
+            host_risk: "low" | "medium" | "high";
+            /** @enum {string} */
+            source: "first_party" | "manual_install";
+            reversible_draft: boolean;
+            resource_kinds: string[];
+            fingerprint: string;
+            artifact: string;
+        };
+        ModuleToolDecision: {
+            /** @enum {string} */
+            decision: "granted" | "denied";
+            fingerprint: string;
+            module_version: string;
+            artifact: string;
+            resources?: string[];
+            /** Format: date-time */
+            expires_at: string;
         };
         ModuleAuthorizationRevocation: {
             module: string;
             tool: string | null;
             /** @constant */
             status: "revoked";
+            /**
+             * @description What the module answered when told (K1-6a-G §2.5): `confirmed`, it stopped the work the grants started; `unconfirmed`, no 2xx within the bound, so that work may still run; `not_running`, it had no run. The revocation stands in every case.
+             * @enum {string}
+             */
+            stop: "confirmed" | "unconfirmed" | "not_running";
         };
         /**
          * @description A batch of atomic ops. `status` MUST be `pending` on submit — the server
@@ -2462,8 +3048,203 @@ export interface components {
             decided_at?: string | null;
             result?: components["schemas"]["Sin90AppliedProposal"] | null;
         };
+        /**
+         * @description Closed set (COMM-HYPHAE.md section 4).
+         * @enum {string}
+         */
+        CommErrorCode: "binary_rejected" | "unsupported_platform" | "locked" | "not_configured" | "invalid" | "not_found" | "confirm_required" | "conflict" | "network" | "partial" | "timeout" | "upstream";
+        /** @description Hyphae's own failure envelope shape, NOT the kernel `Error`: comm routes answer `{ok:false,error,message,data?}`. */
+        CommError: {
+            /** @constant */
+            ok: false;
+            error: components["schemas"]["CommErrorCode"];
+            message: string;
+            /** @description Kept on partial / conflict (e.g. the group send report). */
+            data?: unknown;
+        };
+        /** @description Hyphae envelope; `data` is the command's JSON, passed through. */
+        CommOk: {
+            /** @constant */
+            ok: true;
+            data: unknown;
+        };
+        CommGroup: {
+            group_id: string;
+            name: string;
+            /** @description Open enum, e.g. active */
+            state: string;
+            creator_npub: string;
+            members: string[];
+            updated_at: number;
+        };
+        CommGroupMember: {
+            npub: string;
+            state: string;
+            is_creator: boolean;
+        };
+        CommGroupInvite: {
+            invite_id: string;
+            invitee_npub: string;
+            group_id: string;
+            state: string;
+        };
+        /** @description `id` is the send's logical id. The sender's own rows have empty `event_id` and `content`; display `plaintext`. Text comes from the network: strip control characters and bound its length before showing it. */
+        CommGroupMessage: {
+            id: string;
+            event_id: string;
+            group_id: string;
+            sender: string;
+            content: string;
+            plaintext: string;
+            created_at: number;
+            is_encrypted: boolean;
+        };
+        /** @description Other Hyphae diagnostic fields may be present and should be ignored. `relay_accepted` is not "delivered" or "read". */
+        CommGroupRecipient: {
+            recipient_npub: string;
+            event_id: string;
+            queue_id: string;
+            /** @enum {string} */
+            state: "prepared" | "queued" | "relay_accepted" | "failed";
+            relay_acks: number;
+            relay_count: number;
+            attempts: number;
+            max_retries: number;
+        };
+        /** @description Send / status / retry report (status adds `partial` and `bookkeeping`). */
+        CommGroupSendReport: {
+            group_id: string;
+            logical_id: string;
+            created_at?: number;
+            state?: string;
+            accepted?: number;
+            queued: number;
+            failed: number;
+            partial?: boolean;
+            bookkeeping?: unknown;
+            recipients: components["schemas"]["CommGroupRecipient"][];
+        };
+        /** @description Groups; `[]` when there are none. */
+        CommGroupListResponse: {
+            /** @constant */
+            ok: true;
+            data: {
+                groups: components["schemas"]["CommGroup"][];
+            };
+        };
+        /** @description New group id. */
+        CommGroupCreateResponse: {
+            /** @constant */
+            ok: true;
+            data: {
+                group_id: string;
+            };
+        };
+        /** @description Members, creator first. */
+        CommGroupMembersResponse: {
+            /** @constant */
+            ok: true;
+            data: {
+                members: components["schemas"]["CommGroupMember"][];
+            };
+        };
+        /** @description Invitations of a group. */
+        CommGroupInvitesResponse: {
+            /** @constant */
+            ok: true;
+            data: {
+                invites: components["schemas"]["CommGroupInvite"][];
+            };
+        };
+        /** @description Messages oldest first; `[]` when empty. */
+        CommGroupHistoryResponse: {
+            /** @constant */
+            ok: true;
+            data: {
+                messages: components["schemas"]["CommGroupMessage"][];
+            };
+        };
+        /** @description Send report. */
+        CommGroupSendReportResponse: {
+            /** @constant */
+            ok: true;
+            data: components["schemas"]["CommGroupSendReport"];
+        };
+        /** @description Accept result. */
+        CommGroupAcceptResponse: {
+            /** @constant */
+            ok: true;
+            data: {
+                group_id: string;
+                /** @enum {string} */
+                state: "pending" | "active";
+            };
+        };
     };
     responses: {
+        /** @description invalid / confirm_required (400): bad input, or Hyphae user_error such as an unknown history cursor */
+        CommInvalid: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["CommError"];
+            };
+        };
+        /** @description not_found (404) */
+        CommNotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["CommError"];
+            };
+        };
+        /** @description not_configured / conflict (409): no relay, no keystore, or a write conflict */
+        CommConflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["CommError"];
+            };
+        };
+        /** @description locked (423): keystore password missing or rejected */
+        CommLocked: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["CommError"];
+            };
+        };
+        /** @description network / partial / upstream (502); partial carries Hyphae data (e.g. a group send report) */
+        CommBadGateway: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["CommError"];
+            };
+        };
+        /** @description binary_rejected (503): the configured Hyphae binary failed hash verification */
+        CommUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["CommError"];
+            };
+        };
+        /** @description timeout (504): the command may still have taken effect */
+        CommTimeout: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["CommError"];
+            };
+        };
         /** @description internal: the request could not be completed */
         Internal: {
             headers: {
@@ -2631,6 +3412,12 @@ export interface components {
         };
     };
     parameters: {
+        CommGroupId: string;
+        /** @description The `logical_id` the message was sent with (also the message `id` in history). */
+        CommLogicalId: string;
+        CommInviteId: string;
+        /** @description Local identity nickname; the default identity when omitted. */
+        CommIdentityQuery: string;
         PathId: string;
         DocumentId: components["schemas"]["DocumentIdString"];
         /** @description Opaque `next_cursor` from the previous page (ADR-DOC-02 §4). */
@@ -2758,6 +3545,123 @@ export interface operations {
             };
         };
     };
+    decideModuleToolConsent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                module: string;
+                tool: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModuleToolDecision"];
+            };
+        };
+        responses: {
+            /** @description The decision as written */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModuleAuthorization"];
+                };
+            };
+            /** @description `invalid_request`: the body is not JSON */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Missing or invalid host token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Host authority required; or `grants_closed`: the host has not opened decisions (`A24_MODULE_TOOL_GRANTS=1`), or the daemon is ephemeral */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description No such module tool */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `protocol_too_old` or `no_package_identity`, as for the card; `card_changed`: the fingerprint, version or package identity is no longer the current one; `module_disabled` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `invalid_request`: the body is larger than the daemon accepts */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `invalid_request`: the body is not sent as `application/json` */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `invalid_request`: the body is not a decision (`decision`, `fingerprint`, `module_version` or `artifact` missing, a field of another type, or one not defined). `invalid_decision`: `expires_at` missing, null or not an RFC 3339 instant, an expiry already past or past the host's bound (`A24_MODULE_GRANT_MAX_DAYS`, 30 days unless set, at most 90), more than 256 resources, a resource that is not `<kind>:<id>` of a kind the tool declares, or a denial naming resources */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Whether the module is enabled could not be read */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Authorization storage is temporarily unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     revokeModuleToolConsent: {
         parameters: {
             query?: never;
@@ -2781,6 +3685,65 @@ export interface operations {
             };
             /** @description Authorization storage is temporarily unavailable */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getModuleToolCard: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                module: string;
+                tool: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tool's card */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModuleToolCard"];
+                };
+            };
+            /** @description Missing or invalid host token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Host authority required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description No such module tool */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `protocol_too_old`: the module does not require the grants protocol, so it cannot be told its grants were revoked (§2.6). `no_package_identity`: no running package identity to grant against (not running, not yet observed by this daemon start, or an ephemeral daemon). */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3417,7 +4380,25 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            /** @description host_authority_required: knowledge_binding_id was named by a caller other than the product host */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             404: components["responses"]["NotFound"];
+            /** @description knowledge_binding_inactive: the product host has no active Knowledge binding by that id */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     getRun: {
@@ -3461,6 +4442,51 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Run"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listPeerRuns: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Peer run list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        runs: components["schemas"]["PeerRun"][];
+                    };
+                };
+            };
+        };
+    };
+    getPeerRun: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Peer run */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PeerRun"];
                 };
             };
             404: components["responses"]["NotFound"];
@@ -4164,8 +5190,26 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            /** @description `memory_retract_id_too_long` — the memory partition is full and the serialized retraction payload `{"assertion_id":…}` exceeds 256 bytes, so it falls outside the quota exemption, was charged as ordinary content and refused. The test is on the serialized bytes, not the id length: an id containing characters that JSON escapes (`"`, `\`, control characters) crosses the limit sooner than a plain one. Nothing was changed. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             /** @description Personal memory is not available on this daemon */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `memory_disk_full` — the disk holding the memory database is full (SQLITE_FULL). Nothing was changed; free space and retry. The body carries the code and a fixed sentence, never a partition key. */
+            507: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5017,6 +6061,876 @@ export interface operations {
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
             504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    listCommIdentities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    createCommIdentity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    nickname: string;
+                    /** @default false */
+                    default?: boolean;
+                };
+            };
+        };
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    useCommIdentity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    nickname: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    unlockComm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    password: string;
+                    /** @default false */
+                    remember?: boolean;
+                };
+            };
+        };
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    listCommContacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    addCommContact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    nickname: string;
+                    npub: string;
+                    role?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    listCommRelays: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    setCommRelays: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    relays: string[];
+                };
+            };
+        };
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    probeCommRelay: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description Defaults to the first configured relay */
+                    url?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    importCommHome: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    from: string;
+                    /** @default false */
+                    confirm?: boolean;
+                    password?: string;
+                    /** @default false */
+                    dry_run?: boolean;
+                };
+            };
+        };
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    getCommDaemon: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            409: components["responses"]["CommConflict"];
+            503: components["responses"]["CommUnavailable"];
+        };
+    };
+    startCommDaemon: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+        };
+    };
+    stopCommDaemon: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            409: components["responses"]["CommConflict"];
+            503: components["responses"]["CommUnavailable"];
+        };
+    };
+    sendCommMessage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    to: string;
+                    content: string;
+                    from?: string;
+                    /** @default true */
+                    encrypt?: boolean;
+                };
+            };
+        };
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    listCommHistory: {
+        parameters: {
+            query?: {
+                as?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    pullCommInbox: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    as?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    listCommOutbox: {
+        parameters: {
+            query?: {
+                failed_only?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    retryCommOutbox: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                event_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            404: components["responses"]["CommNotFound"];
+            409: components["responses"]["CommConflict"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    clearCommOutbox: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description Must be true */
+                    confirm: boolean;
+                    min_failures?: number;
+                };
+            };
+        };
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    listCommGroups: {
+        parameters: {
+            query?: {
+                /** @description Local identity nickname; the default identity when omitted. */
+                identity?: components["parameters"]["CommIdentityQuery"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommGroupListResponse"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    createCommGroup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    name: string;
+                    invitees: string[];
+                    identity?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommGroupCreateResponse"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    listCommGroupMembers: {
+        parameters: {
+            query?: {
+                /** @description Local identity nickname; the default identity when omitted. */
+                identity?: components["parameters"]["CommIdentityQuery"];
+            };
+            header?: never;
+            path: {
+                group_id: components["parameters"]["CommGroupId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommGroupMembersResponse"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    listCommGroupInvites: {
+        parameters: {
+            query?: {
+                /** @description Local identity nickname; the default identity when omitted. */
+                identity?: components["parameters"]["CommIdentityQuery"];
+            };
+            header?: never;
+            path: {
+                group_id: components["parameters"]["CommGroupId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommGroupInvitesResponse"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    listCommGroupMessages: {
+        parameters: {
+            query?: {
+                /** @description Local identity nickname; the default identity when omitted. */
+                identity?: components["parameters"]["CommIdentityQuery"];
+                limit?: number;
+                before_id?: string;
+                after_id?: string;
+            };
+            header?: never;
+            path: {
+                group_id: components["parameters"]["CommGroupId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommGroupHistoryResponse"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    sendCommGroupMessage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                group_id: components["parameters"]["CommGroupId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    body: string;
+                    logical_id?: string;
+                    max_retries?: number;
+                    identity?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommGroupSendReportResponse"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    getCommGroupMessageStatus: {
+        parameters: {
+            query?: {
+                /** @description Local identity nickname; the default identity when omitted. */
+                identity?: components["parameters"]["CommIdentityQuery"];
+            };
+            header?: never;
+            path: {
+                group_id: components["parameters"]["CommGroupId"];
+                /** @description The `logical_id` the message was sent with (also the message `id` in history). */
+                logical_id: components["parameters"]["CommLogicalId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommGroupSendReportResponse"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    retryCommGroupMessage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                group_id: components["parameters"]["CommGroupId"];
+                /** @description The `logical_id` the message was sent with (also the message `id` in history). */
+                logical_id: components["parameters"]["CommLogicalId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description npub of one failed recipient */
+                    recipient?: string;
+                    identity?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommGroupSendReportResponse"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    acceptCommGroupInvite: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                invite_id: components["parameters"]["CommInviteId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    identity?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommGroupAcceptResponse"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
         };
     };
 }

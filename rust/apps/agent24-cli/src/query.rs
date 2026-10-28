@@ -28,6 +28,11 @@ pub enum SessionAction {
 
 #[derive(clap::Subcommand)]
 pub enum RunAction {
+    /// 列出可向 peer 转发的脱敏 run
+    Peers {
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
     /// 读取一条 run
     Get {
         id: String,
@@ -131,6 +136,7 @@ pub enum ToolsAction {
 
 #[derive(Debug)]
 enum Read {
+    PeerRuns,
     Sessions,
     Session {
         id: String,
@@ -198,8 +204,10 @@ pub async fn session(action: SessionAction) -> Result<(), String> {
 }
 
 pub async fn run_cmd(action: RunAction) -> Result<(), String> {
-    let RunAction::Get { id, json } = action;
-    run(Read::Run { id }, json).await
+    match action {
+        RunAction::Get { id, json } => run(Read::Run { id }, json).await,
+        RunAction::Peers { json } => run(Read::PeerRuns, json).await,
+    }
 }
 
 pub async fn memory(action: MemoryAction) -> Result<(), String> {
@@ -310,6 +318,11 @@ fn request(read: &Read) -> Result<(reqwest::Method, String, View), String> {
         reject_blank(id)?;
     }
     Ok(match read {
+        Read::PeerRuns => (
+            reqwest::Method::GET,
+            "/api/v1/peer/runs".to_owned(),
+            View::rows("runs", &["id", "status"]),
+        ),
         Read::Sessions => (
             reqwest::Method::GET,
             "/api/v1/sessions".to_owned(),
@@ -550,6 +563,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use clap::Parser;
 
     fn endpoint(port: u16) -> crate::Endpoint {
         crate::Endpoint {
@@ -614,6 +628,24 @@ mod tests {
                 .contains("authorization: bearer tok"),
             "{raw}"
         );
+    }
+
+    #[tokio::test]
+    async fn peers_parses_and_calls_the_peer_projection() {
+        let cli = crate::Cli::try_parse_from(["agent24", "runs", "peers", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            crate::Command::Run {
+                action: RunAction::Peers { json: true }
+            }
+        ));
+        assert_roundtrip(
+            Read::PeerRuns,
+            "GET /api/v1/peer/runs HTTP/1.1",
+            r#"{"runs":[{"id":"p1","status":"completed","notice":"withheld"}]}"#,
+            "p1",
+        )
+        .await;
     }
 
     macro_rules! case {
@@ -842,7 +874,7 @@ mod tests {
     /// Exhaustive on purpose (no wildcard): adding a `Read` variant is a
     /// compile error here until its contract is declared. Returns a stable
     /// variant id (0..VARIANTS) used by the completeness check below.
-    const VARIANTS: usize = 17;
+    const VARIANTS: usize = 18;
     fn variant_id(read: &Read) -> usize {
         match read {
             Read::Sessions => 0,
@@ -862,6 +894,7 @@ mod tests {
             Read::StandingGrants => 14,
             Read::ToolOverrides => 15,
             Read::DecideProfile => 16,
+            Read::PeerRuns => 17,
         }
     }
 
@@ -883,6 +916,7 @@ mod tests {
             (Read::Sessions, "Session", Wrap::Inline("listSessions")),
             (Read::Session { id: id() }, "Session", Wrap::None),
             (Read::Run { id: id() }, "Run", Wrap::None),
+            (Read::PeerRuns, "PeerRun", Wrap::Inline("listPeerRuns")),
             (Read::Usage, "Usage", Wrap::None),
             (
                 Read::Memory {
@@ -1097,7 +1131,7 @@ mod tests {
 
     #[tokio::test]
     async fn consent_export_is_always_the_raw_json_backup() {
-        let body = r#"{"authorizations":[{"module":"sin90","tool":"fs","module_version":"1.0.0","scope_summary":{"readable":"a","writable":null,"external":"c"},"host_risk":"high","source":"manual_install","decided_at":"2026-10-26T01:00:00Z","expires_at":"2026-11-26T01:00:00Z","status":"revoked"}]}"#;
+        let body = r#"{"authorizations":[{"module":"sin90","tool":"fs","module_version":"1.0.0","scope_summary":{"readable":"a","writable":null,"external":"c"},"host_risk":"high","source":"manual_install","decided_at":"2026-10-26T01:00:00Z","expires_at":"2026-11-26T01:00:00Z","status":"revoked","stop":"confirmed"}]}"#;
         let (port, _) = stub("200 OK", body);
         // json=false: the default must still be the raw JSON.
         let out = execute(&endpoint(port), &Read::ConsentExport, false)

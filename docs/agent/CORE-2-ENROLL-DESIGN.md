@@ -163,6 +163,8 @@ ADR-037 决策 5 写「签名加公证流程已跑通」。facts §4 只证实�
 | GET | /module-consents/export | ConfigRead | 日常 |
 | DELETE | /module-consents/modules/{module} | ConsentRevoke | 日常 |
 | DELETE | /module-consents/modules/{module}/tools/{tool} | ConsentRevoke | 日常 |
+| POST | /module-consents/modules/{module}/tools/{tool} | ApprovalDecision | 提升 |
+| GET | /module-consents/modules/{module}/tools/{tool}/card | ConfigRead | 日常 |
 | GET | /tool-overrides | ConfigRead | 日常 |
 | GET | /standing-grants | ConfigRead | 日常 |
 | DELETE | /standing-grants/{id} | GrantManage | 提升 |
@@ -203,6 +205,8 @@ ADR-037 决策 5 写「签名加公证流程已跑通」。facts §4 只证实�
 | POST | /runs | RunCreate | 日常 |
 | GET | /runs | RunRead | 日常 |
 | GET | /runs/{id} | RunRead | 日常 |
+| GET | /peer/runs | RunRead | 日常 |
+| GET | /peer/runs/{id} | RunRead | 日常 |
 | POST | /runs/{id}/cancel | RunCancel | 日常 |
 | GET | /comm/identity | CommRead | 日常 |
 | POST | /comm/identity | CommWrite | 提升 |
@@ -223,6 +227,19 @@ ADR-037 决策 5 写「签名加公证流程已跑通」。facts §4 只证实�
 | GET | /comm/outbox | CommRead | 日常 |
 | POST | /comm/outbox/{event_id}/retry | CommWrite | 提升 |
 | POST | /comm/outbox/clear | CommWrite | 提升 |
+| GET | /comm/groupchat | CommRead | 日常 |
+| POST | /comm/groupchat | CommWrite | 提升 |
+| GET | /comm/groupchat/{group_id}/members | CommRead | 日常 |
+| GET | /comm/groupchat/{group_id}/invites | CommRead | 日常 |
+| GET | /comm/groupchat/{group_id}/messages | CommRead | 日常 |
+| POST | /comm/groupchat/{group_id}/messages | CommWrite | 提升 |
+| GET | /comm/groupchat/{group_id}/messages/{logical_id} | CommRead | 日常 |
+| POST | /comm/groupchat/{group_id}/messages/{logical_id}/retry | CommWrite | 提升 |
+| POST | /comm/groupchat/invites/{invite_id}/accept | CommWrite | 提升 |
+| PUT | /host/knowledge/bindings/{binding_id} | KnowledgeHost | 提升 |
+| DELETE | /host/knowledge/bindings/{binding_id} | KnowledgeHost | 提升 |
+| PUT | /host/knowledge/bindings/{binding_id}/credential | KnowledgeHost | 提升 |
+| DELETE | /host/knowledge/bindings/{binding_id}/credential | KnowledgeHost | 提升 |
 
 模块动态路由另列，不混入上述固定路由覆盖率：
 

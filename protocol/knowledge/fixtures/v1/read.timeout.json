@@ -1,0 +1,6 @@
+{ "$comment": "R4.5: the read did not finish within deadline_ms.",
+  "op": "knowledge.read",
+  "request": { "protocol_version": 1, "request_id": "01JB3V4E5F6G7H8J9K0M1N2P3Q", "generation": 15,
+    "scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-7", "deadline_ms": 1000 },
+  "response": { "status": 504, "body": { "error": { "code": "timeout", "message": "Knowledge read timed out.",
+    "details": { "retryable": true, "request_id": "01JB3V4E5F6G7H8J9K0M1N2P3Q", "generation": 15 } } } } }

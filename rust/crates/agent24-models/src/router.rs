@@ -12,6 +12,7 @@
 //!   clears it. This is the closed feedback loop the bare trait deliberately
 //!   omits.
 
+use agent24_domain::{EgressDestination, EgressGate, EgressPurpose, EgressRequest, EgressResource};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -115,6 +116,8 @@ struct Routed {
 /// usage ledger (`served_by`) and the LocalOnly tripwire both read.
 #[derive(Debug, Clone)]
 pub struct Served {
+    /// Validated gateway evidence; direct-provider calls have none.
+    pub idoris: Option<crate::IdorisEvidence>,
     pub provider: String,
     pub tier: Tier,
     pub response: CompletionResponse,
@@ -122,6 +125,7 @@ pub struct Served {
 
 /// Routes completions across tiered providers with a health/cooldown loop.
 pub struct ModelRouter {
+    idoris: Option<Result<Arc<crate::idoris::IdorisClient>, String>>,
     providers: Vec<Routed>,
     health: Mutex<HashMap<String, Health>>,
     base_cooldown: Duration,
@@ -147,7 +151,7 @@ const COOLDOWN_HARD_CAP: Duration = Duration::from_secs(24 * 3600);
 /// conservative: a Remote label on a host that happens to be local cannot
 /// leak); a domain: only `localhost`, exactly; anything that fails to parse,
 /// has no host, or is not http(s): not loopback.
-fn is_loopback_url(url: &str) -> bool {
+pub(crate) fn is_loopback_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
@@ -258,6 +262,7 @@ impl ModelRouter {
             .min(max_cooldown)
             .max(Duration::from_millis(1));
         Self {
+            idoris: None,
             providers: providers
                 .into_iter()
                 .map(|(provider, tier)| Routed { provider, tier })
@@ -279,6 +284,7 @@ impl ModelRouter {
     #[must_use]
     pub fn with_separate_health(&self) -> Self {
         Self {
+            idoris: self.idoris.clone(),
             providers: self
                 .providers
                 .iter()
@@ -318,6 +324,11 @@ impl ModelRouter {
     /// added by the daemon when configured; with only local providers, a
     /// Complex task simply falls back to them.
     pub fn from_env() -> Self {
+        if std::env::var_os("IDORIS_URL").is_some() {
+            let mut router = Self::with_defaults(Vec::new());
+            router.idoris = Some(crate::idoris::IdorisClient::from_env().map(Arc::new));
+            return router;
+        }
         let omlx_url =
             std::env::var("OMLX_URL").unwrap_or_else(|_| "http://127.0.0.1:8088".to_owned());
         let omlx_key = std::env::var("OMLX_API_KEY").unwrap_or_else(|_| "xiaobao8088".to_owned());
@@ -425,6 +436,28 @@ impl ModelRouter {
             .map(|s| (s.provider, s.response))
     }
 
+    /// Host-authorized completion variant for callers carrying a live source snapshot.
+    pub async fn complete_with_egress(
+        &self,
+        profile: TaskProfile,
+        req: &CompletionRequest,
+        cancel: &CancellationToken,
+        gate: std::sync::Arc<dyn EgressGate>,
+        resources: Vec<EgressResource>,
+        authorization_generation: u64,
+    ) -> Result<(String, CompletionResponse), ModelError> {
+        self.complete_served_with_egress(
+            profile,
+            req,
+            cancel,
+            gate,
+            resources,
+            authorization_generation,
+        )
+        .await
+        .map(|served| (served.provider, served.response))
+    }
+
     /// ME4-4.2.2a: route and complete, and say WHICH TIER served it. Only
     /// `Unavailable` falls through to the next routed provider (and records a
     /// cooldown); `Provider`/`Cancelled` errors stop immediately. A LocalOnly
@@ -436,6 +469,75 @@ impl ModelRouter {
         req: &CompletionRequest,
         cancel: &CancellationToken,
     ) -> Result<Served, ModelError> {
+        self.complete_served_with_request_id(profile, req, cancel, None)
+            .await
+    }
+
+    /// Carry an admitted lifecycle id on `X-iDoris-Trace-Id` when iDoris accepts it.
+    /// `X-iDoris-Request-Id` is a fresh idempotency key on every call, with or
+    /// without that id. A missing or rejected id omits the trace header.
+    /// Remote providers stay closed (deny-all egress); the iDoris gateway is
+    /// loopback-only, so it never needs an egress grant.
+    pub async fn complete_served_with_request_id(
+        &self,
+        profile: TaskProfile,
+        req: &CompletionRequest,
+        cancel: &CancellationToken,
+        request_id: Option<&str>,
+    ) -> Result<Served, ModelError> {
+        self.complete_served_inner(
+            profile,
+            req,
+            cancel,
+            request_id,
+            <dyn EgressGate>::deny_all(),
+            Vec::new(),
+            0,
+        )
+        .await
+    }
+
+    /// Host-authorized variant. The live gate is called immediately before
+    /// each remote provider attempt, so a grant revoked during routing is denied.
+    pub async fn complete_served_with_egress(
+        &self,
+        profile: TaskProfile,
+        req: &CompletionRequest,
+        cancel: &CancellationToken,
+        gate: std::sync::Arc<dyn EgressGate>,
+        resources: Vec<EgressResource>,
+        authorization_generation: u64,
+    ) -> Result<Served, ModelError> {
+        self.complete_served_inner(
+            profile,
+            req,
+            cancel,
+            None,
+            gate,
+            resources,
+            authorization_generation,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_served_inner(
+        &self,
+        profile: TaskProfile,
+        req: &CompletionRequest,
+        cancel: &CancellationToken,
+        request_id: Option<&str>,
+        gate: std::sync::Arc<dyn EgressGate>,
+        resources: Vec<EgressResource>,
+        authorization_generation: u64,
+    ) -> Result<Served, ModelError> {
+        if let Some(gateway) = &self.idoris {
+            return gateway
+                .as_ref()
+                .map_err(|e| ModelError::Provider(e.clone()))?
+                .complete(profile, req, cancel, request_id)
+                .await;
+        }
         let route = self.route(profile, Instant::now());
         if route.is_empty() {
             return Err(ModelError::Unavailable(match profile.privacy {
@@ -459,10 +561,28 @@ impl ModelRouter {
                 break;
             }
             let r = &self.providers[idx];
+            if r.tier == Tier::Remote {
+                let request = EgressRequest::remote(
+                    resources.clone(),
+                    EgressPurpose::ModelInference,
+                    r.provider
+                        .outbound_destination()
+                        .map_or_else(EgressDestination::unknown, EgressDestination::exact),
+                    authorization_generation,
+                );
+                if request.authorize(gate.as_ref()).await.is_err() {
+                    tried.push(format!(
+                        "{}: outbound policy denied or unavailable",
+                        r.provider.name()
+                    ));
+                    continue;
+                }
+            }
             match r.provider.complete(req, cancel).await {
                 Ok(response) => {
                     self.record_success(r.provider.name());
                     return Ok(Served {
+                        idoris: None,
                         provider: r.provider.name().to_owned(),
                         tier: r.tier,
                         response,
@@ -506,8 +626,54 @@ impl ModelRouter {
     /// because their provider was briefly unreachable, is a confident wrong answer
     /// (ME-2's mount-time resource check).
     pub async fn models_detailed(&self, cancel: &CancellationToken) -> ModelInventory {
+        self.models_detailed_with_egress(cancel, <dyn EgressGate>::deny_all(), Vec::new(), 0)
+            .await
+    }
+
+    /// Host-authorized inventory. Remote `/models` requests use the same
+    /// exact destination/source gate as inference requests.
+    pub async fn models_detailed_with_egress(
+        &self,
+        cancel: &CancellationToken,
+        gate: std::sync::Arc<dyn EgressGate>,
+        resources: Vec<EgressResource>,
+        authorization_generation: u64,
+    ) -> ModelInventory {
+        if let Some(gateway) = &self.idoris {
+            let result = match gateway {
+                Ok(gateway) => gateway.models(cancel).await,
+                Err(error) => Err(ModelError::Provider(error.clone())),
+            };
+            return match result {
+                Ok(models) => ModelInventory {
+                    models,
+                    failures: Vec::new(),
+                },
+                Err(error) => ModelInventory {
+                    models: Vec::new(),
+                    failures: vec![format!("idoris-local: {error}")],
+                },
+            };
+        }
         let mut inv = ModelInventory::default();
         for r in &self.providers {
+            if r.tier == Tier::Remote {
+                let request = EgressRequest::remote(
+                    resources.clone(),
+                    EgressPurpose::ModelDiscovery,
+                    r.provider
+                        .outbound_destination()
+                        .map_or_else(EgressDestination::unknown, EgressDestination::exact),
+                    authorization_generation,
+                );
+                if request.authorize(gate.as_ref()).await.is_err() {
+                    inv.failures.push(format!(
+                        "{}: outbound policy denied or unavailable",
+                        r.provider.name()
+                    ));
+                    continue;
+                }
+            }
             match r.provider.models(cancel).await {
                 Ok(mut models) => inv.models.append(&mut models),
                 Err(err) => {
@@ -583,6 +749,9 @@ mod tests {
         fn name(&self) -> &str {
             self.name
         }
+        fn outbound_destination(&self) -> Option<String> {
+            Some(format!("provider:{}", self.name))
+        }
         async fn complete(
             &self,
             _req: &CompletionRequest,
@@ -632,6 +801,38 @@ mod tests {
 
     fn router(providers: Vec<(Arc<dyn ModelProvider>, Tier)>) -> ModelRouter {
         ModelRouter::new(providers, Duration::from_secs(10), Duration::from_secs(60))
+    }
+
+    struct TestGrant;
+    #[async_trait]
+    impl EgressGate for TestGrant {
+        async fn check(
+            &self,
+            _request: &EgressRequest,
+        ) -> Result<(), agent24_domain::EgressDecision> {
+            Ok(())
+        }
+    }
+
+    fn authorized_test_scope() -> (Arc<dyn EgressGate>, Vec<EgressResource>) {
+        (
+            Arc::new(TestGrant),
+            vec![
+                EgressResource::cloud_authorized("test-resource", "test-revision", 1)
+                    .with_authorization_ref("test-grant"),
+            ],
+        )
+    }
+
+    struct TestDeny;
+    #[async_trait]
+    impl EgressGate for TestDeny {
+        async fn check(
+            &self,
+            _request: &EgressRequest,
+        ) -> Result<(), agent24_domain::EgressDecision> {
+            Err(agent24_domain::EgressDecision)
+        }
     }
 
     /// A local backend that takes requests and never answers; how many it took.
@@ -770,14 +971,18 @@ mod tests {
             (remote.clone(), Tier::Remote),
             (local.clone(), Tier::Local),
         ]);
+        let (gate, resources) = authorized_test_scope();
         let (name, _) = r
-            .complete(
+            .complete_with_egress(
                 TaskProfile {
                     privacy: Privacy::Any,
                     complexity: Complexity::Simple,
                 },
                 &req(),
                 &CancellationToken::new(),
+                gate,
+                resources,
+                1,
             )
             .await
             .unwrap();
@@ -793,19 +998,115 @@ mod tests {
             (local.clone(), Tier::Local),
             (remote.clone(), Tier::Remote),
         ]);
+        let (gate, resources) = authorized_test_scope();
         let (name, _) = r
-            .complete(
+            .complete_with_egress(
                 TaskProfile {
                     privacy: Privacy::Any,
                     complexity: Complexity::Complex,
                 },
                 &req(),
                 &CancellationToken::new(),
+                gate,
+                resources,
+                1,
             )
             .await
             .unwrap();
         assert_eq!(name, "remote");
         assert_eq!(local.calls(), 0);
+    }
+
+    /// K1-6b.5d: a run's model override is a model id, never a tier. `route`
+    /// reads only the profile and provider health, so an override naming
+    /// either provider leaves the routed tier as the profile chose it, and a
+    /// LocalOnly run never reaches the remote one.
+    #[tokio::test]
+    async fn a_model_override_never_changes_the_routed_tier() {
+        let cases = [
+            (Privacy::Any, Complexity::Simple, "local"),
+            (Privacy::Any, Complexity::Complex, "remote"),
+            (Privacy::LocalOnly, Complexity::Complex, "local"),
+        ];
+        for (privacy, complexity, expected) in cases {
+            for model in ["local", "remote"] {
+                let local = StubProvider::ok("local");
+                let remote = StubProvider::ok("remote");
+                let r = router(vec![
+                    (local.clone(), Tier::Local),
+                    (remote.clone(), Tier::Remote),
+                ]);
+                let (gate, resources) = authorized_test_scope();
+                let mut request = req();
+                request.model = Some(model.to_owned());
+                let (name, _) = r
+                    .complete_with_egress(
+                        TaskProfile {
+                            privacy,
+                            complexity,
+                        },
+                        &request,
+                        &CancellationToken::new(),
+                        gate,
+                        resources,
+                        1,
+                    )
+                    .await
+                    .unwrap();
+                let case = format!("{privacy:?}/{complexity:?}, override {model}");
+                assert_eq!(name, expected, "{case}");
+                let unused = if expected == "local" { &remote } else { &local };
+                assert_eq!(unused.calls(), 0, "{case}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_provider_is_not_called_without_a_host_egress_gate() {
+        let remote = StubProvider::ok("remote");
+        let r = router(vec![(remote.clone(), Tier::Remote)]);
+        assert!(
+            r.complete(TaskProfile::default(), &req(), &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(remote.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn denied_remote_falls_back_to_healthy_local_provider() {
+        let remote = StubProvider::ok("remote");
+        let local = StubProvider::ok("local");
+        let r = router(vec![
+            (remote.clone(), Tier::Remote),
+            (local.clone(), Tier::Local),
+        ]);
+        let resources = vec![
+            EgressResource::cloud_authorized("test-resource", "test-revision", 1)
+                .with_authorization_ref("test-grant"),
+        ];
+        let served = r
+            .complete_served_with_egress(
+                TaskProfile {
+                    privacy: Privacy::Any,
+                    complexity: Complexity::Complex,
+                },
+                &req(),
+                &CancellationToken::new(),
+                Arc::new(TestDeny),
+                resources,
+                1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(served.provider, "local");
+        assert_eq!(
+            remote.calls(),
+            0,
+            "a denied remote provider is never called"
+        );
+        assert_eq!(local.calls(), 1);
     }
 
     #[tokio::test]
@@ -915,14 +1216,18 @@ mod tests {
             (up.clone(), Tier::Remote),
         ]);
         // Simple prefers local (down) → falls through to remote (up)
+        let (gate, resources) = authorized_test_scope();
         let (name, _) = r
-            .complete(
+            .complete_with_egress(
                 TaskProfile {
                     privacy: Privacy::Any,
                     complexity: Complexity::Simple,
                 },
                 &req(),
                 &CancellationToken::new(),
+                gate,
+                resources,
+                1,
             )
             .await
             .unwrap();
@@ -1363,13 +1668,62 @@ mod tests {
         let a = StubProvider::down("local");
         let b = StubProvider::down("remote");
         let r = router(vec![(a, Tier::Local), (b, Tier::Remote)]);
+        let (gate, resources) = authorized_test_scope();
         let err = r
-            .complete(TaskProfile::default(), &req(), &CancellationToken::new())
+            .complete_with_egress(
+                TaskProfile::default(),
+                &req(),
+                &CancellationToken::new(),
+                gate,
+                resources,
+                1,
+            )
             .await
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("local: local down"), "{msg}");
         assert!(msg.contains("remote: remote down"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn rejected_502_upstream_auth_failed_does_not_fall_through() {
+        struct AuthFailed;
+        #[async_trait]
+        impl ModelProvider for AuthFailed {
+            fn name(&self) -> &str {
+                "idoris"
+            }
+            async fn complete(
+                &self,
+                _req: &CompletionRequest,
+                _cancel: &CancellationToken,
+            ) -> Result<CompletionResponse, ModelError> {
+                Err(ModelError::Rejected {
+                    status: 502,
+                    message: "upstream_auth_failed".to_owned(),
+                })
+            }
+            async fn models(
+                &self,
+                _cancel: &CancellationToken,
+            ) -> Result<Vec<crate::Model>, ModelError> {
+                Ok(vec![])
+            }
+        }
+        let fallback = StubProvider::ok("remote");
+        let r = router(vec![
+            (Arc::new(AuthFailed), Tier::Local),
+            (fallback.clone(), Tier::Remote),
+        ]);
+        let err = r
+            .complete(TaskProfile::default(), &req(), &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ModelError::Rejected { status: 502, .. }),
+            "{err}"
+        );
+        assert_eq!(fallback.calls(), 0, "Rejected must not fall through");
     }
 
     #[tokio::test]
@@ -1492,5 +1846,282 @@ mod tests {
         // And the plain `models()` view still hides all of that, which is exactly
         // why a caller drawing conclusions must not use it.
         assert_eq!(router.models(&CancellationToken::new()).await.len(), 1);
+    }
+
+    // ── K1-6b.5b (ADR-K1-02 §2.4, §5): the remote model egress matrix ──────
+
+    /// A remote provider that counts both inference and discovery calls, with
+    /// a destination the test chooses (`None`: it cannot say where it sends).
+    struct CountingRemote {
+        destination: Option<&'static str>,
+        completions: StdMutex<usize>,
+        listings: StdMutex<usize>,
+    }
+
+    impl CountingRemote {
+        fn at(destination: Option<&'static str>) -> Arc<Self> {
+            Arc::new(Self {
+                destination,
+                completions: StdMutex::new(0),
+                listings: StdMutex::new(0),
+            })
+        }
+        fn completions(&self) -> usize {
+            *self.completions.lock().unwrap()
+        }
+        fn listings(&self) -> usize {
+            *self.listings.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for CountingRemote {
+        fn name(&self) -> &str {
+            "counting-remote"
+        }
+        fn outbound_destination(&self) -> Option<String> {
+            self.destination.map(str::to_owned)
+        }
+        async fn complete(
+            &self,
+            _req: &CompletionRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<CompletionResponse, ModelError> {
+            *self.completions.lock().unwrap() += 1;
+            Ok(CompletionResponse {
+                message: Msg::assistant(Some("from remote".to_owned()), vec![]),
+                usage: Usage::default(),
+                model_id: None,
+            })
+        }
+        async fn models(
+            &self,
+            _cancel: &CancellationToken,
+        ) -> Result<Vec<crate::Model>, ModelError> {
+            *self.listings.lock().unwrap() += 1;
+            Ok(vec![])
+        }
+    }
+
+    /// A gate that allows exactly one request and nothing else.
+    struct ExactGate(EgressRequest);
+
+    #[async_trait]
+    impl EgressGate for ExactGate {
+        async fn check(
+            &self,
+            request: &EgressRequest,
+        ) -> Result<(), agent24_domain::EgressDecision> {
+            if *request == self.0 {
+                Ok(())
+            } else {
+                Err(agent24_domain::EgressDecision)
+            }
+        }
+    }
+
+    const REMOTE_AT: &str = "https://models.example/v1";
+
+    fn granted_resource() -> EgressResource {
+        EgressResource::cloud_authorized("doc-1", "rev-1", 3).with_authorization_ref("grant-1")
+    }
+
+    /// The one request the exact gate allows: this resource, inference, this
+    /// destination, generation 7.
+    fn granted(purpose: EgressPurpose) -> EgressRequest {
+        EgressRequest::remote(
+            vec![granted_resource()],
+            purpose,
+            EgressDestination::exact(REMOTE_AT),
+            7,
+        )
+    }
+
+    /// Each element of the granted scope changed on its own, everything else
+    /// as granted: (what changed, resources, authorization generation).
+    fn mismatched_scopes() -> Vec<(&'static str, Vec<EgressResource>, u64)> {
+        let other = |f: fn(&mut EgressResource)| {
+            let mut resource = granted_resource();
+            f(&mut resource);
+            vec![resource]
+        };
+        vec![
+            ("resource", other(|r| r.resource_id = "doc-2".into()), 7),
+            ("revision", other(|r| r.revision = Some("rev-2".into())), 7),
+            (
+                "authorization",
+                other(|r| r.authorization_ref = Some("grant-2".into())),
+                7,
+            ),
+            ("policy version", other(|r| r.policy_version = 4), 7),
+            ("generation", vec![granted_resource()], 8),
+        ]
+    }
+
+    fn any_privacy() -> TaskProfile {
+        TaskProfile {
+            privacy: Privacy::Any,
+            complexity: Complexity::Simple,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_remote_provider_that_cannot_name_its_destination_is_never_called() {
+        let remote = CountingRemote::at(None);
+        let router = router(vec![(remote.clone(), Tier::Remote)]);
+        let (gate, resources) = authorized_test_scope();
+        let result = router
+            .complete_with_egress(
+                any_privacy(),
+                &req(),
+                &CancellationToken::new(),
+                gate.clone(),
+                resources.clone(),
+                1,
+            )
+            .await;
+        assert!(result.is_err());
+        let inventory = router
+            .models_detailed_with_egress(&CancellationToken::new(), gate, resources, 1)
+            .await;
+        assert!(
+            inventory.failures[0].contains("outbound policy denied"),
+            "{:?}",
+            inventory.failures
+        );
+        assert_eq!((remote.completions(), remote.listings()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn an_exact_grant_lets_the_remote_provider_serve_only_that_request() {
+        let remote = CountingRemote::at(Some(REMOTE_AT));
+        let elsewhere = CountingRemote::at(Some("https://elsewhere.example/v1"));
+        let elsewhere_router = router(vec![(elsewhere.clone(), Tier::Remote)]);
+        let router = router(vec![(remote.clone(), Tier::Remote)]);
+        let gate: Arc<dyn EgressGate> = Arc::new(ExactGate(granted(EgressPurpose::ModelInference)));
+        let served = router
+            .complete_served_with_egress(
+                any_privacy(),
+                &req(),
+                &CancellationToken::new(),
+                gate.clone(),
+                vec![granted_resource()],
+                7,
+            )
+            .await
+            .unwrap();
+        assert_eq!(served.tier, Tier::Remote);
+        assert_eq!(remote.completions(), 1);
+
+        // Every other scope: the remote provider is never called again.
+        for (what, resources, generation) in mismatched_scopes() {
+            let result = router
+                .complete_served_with_egress(
+                    any_privacy(),
+                    &req(),
+                    &CancellationToken::new(),
+                    gate.clone(),
+                    resources,
+                    generation,
+                )
+                .await;
+            assert!(result.is_err(), "{what}");
+            assert_eq!(remote.completions(), 1, "{what}");
+        }
+
+        // Another destination, and a grant for another purpose.
+        let discovery_only: Arc<dyn EgressGate> =
+            Arc::new(ExactGate(granted(EgressPurpose::ModelDiscovery)));
+        for (what, router, gate) in [
+            ("destination", &elsewhere_router, gate.clone()),
+            ("purpose", &router, discovery_only),
+        ] {
+            let result = router
+                .complete_served_with_egress(
+                    any_privacy(),
+                    &req(),
+                    &CancellationToken::new(),
+                    gate,
+                    vec![granted_resource()],
+                    7,
+                )
+                .await;
+            assert!(result.is_err(), "{what}");
+        }
+        assert_eq!((remote.completions(), elsewhere.completions()), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn model_discovery_never_lists_a_remote_provider_through_the_default_gate() {
+        let remote = CountingRemote::at(Some(REMOTE_AT));
+        let local = Lister("local", vec!["llama"]);
+        let router = router(vec![
+            (remote.clone(), Tier::Remote),
+            (Arc::new(local), Tier::Local),
+        ]);
+        let inventory = router.models_detailed(&CancellationToken::new()).await;
+        assert_eq!(remote.listings(), 0);
+        assert_eq!(inventory.models.len(), 1);
+        assert!(
+            inventory
+                .failures
+                .iter()
+                .any(|f| f.contains("counting-remote: outbound policy denied")),
+            "{:?}",
+            inventory.failures
+        );
+    }
+
+    #[tokio::test]
+    async fn model_discovery_needs_a_grant_for_the_discovery_purpose() {
+        let remote = CountingRemote::at(Some(REMOTE_AT));
+        let elsewhere = CountingRemote::at(Some("https://elsewhere.example/v1"));
+        let elsewhere_router = router(vec![(elsewhere.clone(), Tier::Remote)]);
+        let router = router(vec![(remote.clone(), Tier::Remote)]);
+        let inference_only: Arc<dyn EgressGate> =
+            Arc::new(ExactGate(granted(EgressPurpose::ModelInference)));
+        let _ = router
+            .models_detailed_with_egress(
+                &CancellationToken::new(),
+                inference_only,
+                vec![granted_resource()],
+                7,
+            )
+            .await;
+        assert_eq!(remote.listings(), 0);
+
+        let discovery: Arc<dyn EgressGate> =
+            Arc::new(ExactGate(granted(EgressPurpose::ModelDiscovery)));
+        for (what, resources, generation) in mismatched_scopes() {
+            let _ = router
+                .models_detailed_with_egress(
+                    &CancellationToken::new(),
+                    discovery.clone(),
+                    resources,
+                    generation,
+                )
+                .await;
+            assert_eq!(remote.listings(), 0, "{what}");
+        }
+        let _ = elsewhere_router
+            .models_detailed_with_egress(
+                &CancellationToken::new(),
+                discovery.clone(),
+                vec![granted_resource()],
+                7,
+            )
+            .await;
+        assert_eq!(elsewhere.listings(), 0, "destination");
+
+        let inventory = router
+            .models_detailed_with_egress(
+                &CancellationToken::new(),
+                discovery,
+                vec![granted_resource()],
+                7,
+            )
+            .await;
+        assert!(inventory.failures.is_empty(), "{:?}", inventory.failures);
+        assert_eq!(remote.listings(), 1);
     }
 }

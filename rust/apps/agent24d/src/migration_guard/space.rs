@@ -29,12 +29,16 @@ pub const DEFAULT_G: GDecl = GDecl::MultipleOfS(2);
 /// rewrite/FTS migrations are conservative multiples, NOT yet measured on a
 /// large-database fixture: 待大库夹具实测替换 (replace with measured peaks).
 pub const G_DECLARATIONS: &[(&str, i64, GDecl)] = &[
-    ("memory.db", 5, GDecl::MultipleOfS(2)), // FTS backfill from mem_assertions
-    ("memory.db", 10, GDecl::MultipleOfS(2)), // table rewrite
-    ("memory.db", 11, GDecl::MultipleOfS(2)), // table rewrite (mem_events)
-    ("memory.db", 13, GDecl::MultipleOfS(2)), // table rewrite
-    ("memory.db", 15, GDecl::MultipleOfS(2)), // table rewrite
-    ("memory.db", 17, GDecl::MultipleOfS(4)), // CJK bigram FTS rebuild
+    // run_message_origins rewrites that came in from main (0028/0029,
+    // K1-6b); the table holds one row per run message, so 2*S is ample.
+    ("agent24.db", 28, GDecl::MultipleOfS(2)), // table rewrite (run_message_origins)
+    ("agent24.db", 29, GDecl::MultipleOfS(2)), // table rewrite (run_message_origins)
+    ("memory.db", 5, GDecl::MultipleOfS(2)),   // FTS backfill from mem_assertions
+    ("memory.db", 10, GDecl::MultipleOfS(2)),  // table rewrite
+    ("memory.db", 11, GDecl::MultipleOfS(2)),  // table rewrite (mem_events)
+    ("memory.db", 13, GDecl::MultipleOfS(2)),  // table rewrite
+    ("memory.db", 15, GDecl::MultipleOfS(2)),  // table rewrite
+    ("memory.db", 17, GDecl::MultipleOfS(4)),  // CJK bigram FTS rebuild
 ];
 
 #[derive(Clone, Copy, Debug)]

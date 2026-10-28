@@ -516,13 +516,34 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
     // response built below can report a deterministic `memory_receipt` —
     // never inferred from the model's own reply text.
     let mut explicit_remember_state: Option<agent24_agent::ExplicitRememberState> = None;
+    let mut memory_source_ref = agent24_store::AssertionSourceRef::from_sources([]);
     let messages = match (chat.session_id.as_deref(), latest_user_message.as_deref()) {
         (Some(sid), Some(prompt)) => {
-            let (prelude, remember_state) = state
+            let prelude = state
                 .runs
-                .chat_memory_prelude(&run_id, Some(sid), prompt)
+                .chat_memory_prelude(
+                    &run_id,
+                    Some(sid),
+                    prompt,
+                    chat.messages.iter().any(|m| m.role != "user"),
+                )
                 .await;
+            // K1-6b.4c: the session floor could not be recorded, so this
+            // turn's sources are unknown; fail before the model call. The
+            // store error stays in the daemon log, not the response.
+            let (prelude, remember_state, source_ref) = match prelude {
+                Ok(prelude) => prelude,
+                Err(err) => {
+                    tracing::error!(run_id = %run_id, error = %err, "chat session source floor not recorded");
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "source_policy_unavailable",
+                        "failed to persist session source policy",
+                    );
+                }
+            };
             explicit_remember_state = remember_state;
+            memory_source_ref = source_ref;
             let combined: Vec<agent24_models::Msg> =
                 prelude.into_iter().chain(base_messages.clone()).collect();
             agent24_agent::normalize_for_provider(&combined)
@@ -574,6 +595,7 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
         .await
     {
         Ok(served) => {
+            let gateway_record_id = served.idoris.map(|evidence| evidence.record_id);
             let provider = served.provider;
             let res = served.response;
             let tier = if served.tier.is_local() {
@@ -629,34 +651,61 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
             // outcome's NotApplicable/not). The saved/paused_not_saved/failed
             // verdict comes exclusively from `chat_remember_turn`'s LIVE
             // result, computed at commit time inside the write transaction.
-            let memory_receipt = if let (Some(sid), Some(prompt)) =
-                (chat.session_id.as_deref(), latest_user_message.as_deref())
-            {
-                let outcome = state.runs.chat_remember_turn(sid, prompt, &text).await;
-                explicit_remember_state.and(match outcome {
-                    agent24_agent::MemoryWriteOutcome::Saved => Some(MemoryReceipt::Saved),
-                    agent24_agent::MemoryWriteOutcome::SkippedPaused => {
-                        Some(MemoryReceipt::PausedNotSaved)
-                    }
-                    agent24_agent::MemoryWriteOutcome::Failed => Some(MemoryReceipt::Failed),
-                    // Unreachable in practice when `explicit_remember_state`
-                    // is `Some`: both snapshots run the same pure
-                    // `explicit_remember(prompt)` match on the same prompt.
-                    // Falls back to "no receipt" rather than fabricating
-                    // saved/paused — never lies about a non-write.
-                    agent24_agent::MemoryWriteOutcome::NotApplicable => None,
-                })
-            } else {
-                None
-            };
+            let (memory_receipt, memory_error_code, memory_persisted) =
+                if let (Some(sid), Some(prompt)) =
+                    (chat.session_id.as_deref(), latest_user_message.as_deref())
+                {
+                    let outcome = state
+                        .runs
+                        .chat_remember_turn(sid, prompt, &text, memory_source_ref)
+                        .await;
+                    let explicit = explicit_remember_state.is_some();
+                    let (receipt, failure) = match outcome {
+                        agent24_agent::MemoryWriteOutcome::Saved => {
+                            (explicit.then_some(MemoryReceipt::Saved), None)
+                        }
+                        agent24_agent::MemoryWriteOutcome::SkippedPaused => {
+                            (explicit.then_some(MemoryReceipt::PausedNotSaved), None)
+                        }
+                        // P1-02c: a failed conversation write is never silent. An
+                        // explicit "remember" keeps `failed`; an ordinary turn,
+                        // which used to carry no receipt at all, is now `not_saved`.
+                        agent24_agent::MemoryWriteOutcome::Failed(f) => (
+                            Some(if explicit {
+                                MemoryReceipt::Failed
+                            } else {
+                                MemoryReceipt::NotSaved
+                            }),
+                            Some(f),
+                        ),
+                        // The turn is in the history, the assertion is not.
+                        agent24_agent::MemoryWriteOutcome::Partial(f) => {
+                            (Some(MemoryReceipt::Partial), Some(f))
+                        }
+                        // Unreachable in practice when `explicit_remember_state`
+                        // is `Some`: both snapshots run the same pure
+                        // `explicit_remember(prompt)` match on the same prompt.
+                        // Falls back to "no receipt" rather than fabricating
+                        // saved/paused — never lies about a non-write.
+                        agent24_agent::MemoryWriteOutcome::NotApplicable => (None, None),
+                    };
+                    (
+                        receipt,
+                        failure.map(agent24_agent::MemoryFailure::wire_code),
+                        Some(outcome.persisted()),
+                    )
+                } else {
+                    (None, None, Some(true))
+                };
             state
                 .events
                 .broadcast(EventBody::RunCompleted(RunCompletedPayload {
                     run_id,
                     output: RunOutputPayload { text: text.clone() },
                     usage: res.usage.clone(),
+                    memory_persisted,
                 }));
-            Json(ChatResponse {
+            let response = Json(ChatResponse {
                 message: agent24_protocol::ChatMessage {
                     role: res.message.role,
                     content: text,
@@ -666,8 +715,13 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                 tier: Some(tier.to_owned()),
                 latency_ms: Some(latency_ms),
                 memory_receipt,
+                memory_error_code,
             })
-            .into_response()
+            .into_response();
+            match gateway_record_id {
+                Some(record_id) => ([("x-idoris-record-id", record_id)], response).into_response(),
+                None => response,
+            }
         }
         Err(err) => {
             state
@@ -844,6 +898,94 @@ mod tests {
         crate::server::build_router_with_modules(state, axum::Router::new())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chat_forwards_validated_gateway_receipt() {
+        use http_body_util::BodyExt;
+        const RECORD: &str = "00000000-0000-4000-8000-000000000003";
+        if std::env::vars_os().any(|(k, v)| k == "A24_RECEIPT_PROBE_CHILD" && v == "1") {
+            let mut state = state_with_stub().await;
+            state.router = std::sync::Arc::new(ModelRouter::from_env());
+            let response = router(state).oneshot(Request::builder()
+                .method("POST").uri("/api/v1/chat")
+                .header("authorization", "Bearer testtoken")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"messages":[{"role":"user","content":"probe"}],"model":"fixture-real"}"#)).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-idoris-record-id")
+                    .and_then(|v| v.to_str().ok()),
+                Some(RECORD)
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["model_id"], "fixture-real");
+            assert_eq!(body["message"]["content"], "receipt answer");
+            return;
+        }
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let fixture = axum::Router::new()
+            .route("/health", axum::routing::get(|| async { Json(serde_json::json!({"service":"idoris","version":"0.3.1-fixture","contract_version":"1.0.1","instance_id":"fixture-instance","dev_no_key_enabled":false})) }))
+            .route("/v1/chat/completions", axum::routing::post(move || { let count=count.clone(); async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                ([("x-idoris-record-id", RECORD),("x-idoris-served-locality","loopback")], Json(serde_json::json!({"model":"fixture-real","choices":[{"message":{"role":"assistant","content":"receipt answer"}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}})))
+            }}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, fixture).await.unwrap();
+        });
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "routes::tests::chat_forwards_validated_gateway_receipt",
+                    "--nocapture",
+                ])
+                .env("A24_RECEIPT_PROBE_CHILD", "1")
+                .env("IDORIS_URL", url)
+                .env("IDORIS_API_KEY", "idk_nonsecret_receipt_fixture")
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        server.abort();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_chat_does_not_fabricate_gateway_receipt() {
+        let state = state_with_stub().await;
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/chat")
+                    .header("authorization", "Bearer testtoken")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"messages":[{"role":"user","content":"probe"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key("x-idoris-record-id"));
+    }
+
     // ── ME4-desktop-model-ui: /api/v1/chat and /api/v1/timings[/summary] ────
 
     /// A provider that always fails — the negative control for
@@ -888,6 +1030,89 @@ mod tests {
                 tempfile::tempdir().expect("tempdir").path().to_path_buf(),
             ),
         })
+    }
+
+    /// K1-6b.5b: a remote provider that counts every call, and the only one
+    /// the daemon has.
+    struct CountingRemote(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CountingRemote {
+        fn name(&self) -> &str {
+            "counting-remote"
+        }
+        fn outbound_destination(&self) -> Option<String> {
+            Some("https://models.example/v1".to_owned())
+        }
+        async fn complete(
+            &self,
+            _req: &agent24_models::CompletionRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<agent24_models::CompletionResponse, ModelError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ModelError::Unavailable("must not be called".into()))
+        }
+        async fn models(&self, _cancel: &CancellationToken) -> Result<Vec<Model>, ModelError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![])
+        }
+    }
+
+    async fn state_with_remote_only(remote: std::sync::Arc<CountingRemote>) -> AppState {
+        crate::server::AppState::new(crate::server::AppDeps {
+            token: "testtoken".to_owned(),
+            router: std::sync::Arc::new(ModelRouter::with_defaults(vec![(remote, Tier::Remote)])),
+            tools: agent24_tools::ToolRegistry::new(),
+            store: agent24_store::Store::open_memory().await.unwrap(),
+            shutdown: crate::server::Shutdown::new(CancellationToken::new()),
+            guardian: None,
+            memory: None,
+            workspace_service: None,
+            mcp_servers: Vec::new(),
+            risk_overrides: std::sync::Arc::new(
+                agent24_policy::overrides::RiskOverrideStore::from_rows(Vec::new()),
+            ),
+            packages_root: std::sync::Arc::new(
+                tempfile::tempdir().expect("tempdir").path().to_path_buf(),
+            ),
+        })
+    }
+
+    /// K1-6b.5b (ADR-K1-02 §2.4 (a)): `/api/v1/chat` routes local-only, so a
+    /// daemon whose only provider is remote answers 503 and the remote
+    /// provider is never called.
+    #[tokio::test]
+    async fn post_chat_never_reaches_a_remote_only_provider() {
+        let remote = std::sync::Arc::new(CountingRemote(std::sync::atomic::AtomicUsize::new(0)));
+        let state = state_with_remote_only(remote.clone()).await;
+        let token = state.token.to_string();
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/chat")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"messages":[{"role":"user","content":"my private note"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "provider_unavailable", "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("local-only")),
+            "{body}"
+        );
+        assert_eq!(remote.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// Review M3: a provider that DOES report a `model_id` — `Stub` above

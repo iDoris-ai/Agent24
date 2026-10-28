@@ -178,6 +178,14 @@ describe('App', () => {
     })
   })
 
+  // A5: node-daemon-era module entries are gone from the navigation.
+  it('has no module-manager / codebox / service-box / hello entries (A5)', async () => {
+    await act(async () => { render(<App />) })
+    expect(screen.queryByText('模块管理')).not.toBeInTheDocument()
+    expect(screen.queryByText('安装模块')).not.toBeInTheDocument()
+    expect(screen.queryByText('能力模块')).not.toBeInTheDocument()
+  })
+
   it('navigates to settings page on click', async () => {
     await act(async () => { render(<App />) })
     // There are multiple '设置' elements (nav + topbar); click the nav button

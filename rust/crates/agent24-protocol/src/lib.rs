@@ -11,6 +11,7 @@
 //!   (hence `Option<T>` without `skip_serializing_if`)
 //! - open string enums stay `String` so unknown values never break decoding
 
+pub mod client;
 pub mod data_dir;
 pub mod events;
 pub mod state_file;

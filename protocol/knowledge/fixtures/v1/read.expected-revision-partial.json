@@ -1,0 +1,7 @@
+{ "$comment": "R4.3 (r9): with chunk_id, expected_revision must carry content_tag; this one has source_revision, index_build_id and chunk_revision but lacks content_tag.",
+  "op": "knowledge.read",
+  "request": { "protocol_version": 1, "request_id": "01JB3V6G7H8J9K0M1N2P3Q4R5S", "generation": 15,
+    "scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-7", "chunk_id": "chk-70",
+    "expected_revision": { "source_revision": "src-8", "index_build_id": "ib-20", "chunk_revision": 2 } },
+  "response": { "status": 400, "body": { "error": { "code": "invalid_request", "message": "The request is not valid.",
+    "details": { "retryable": false, "request_id": "01JB3V6G7H8J9K0M1N2P3Q4R5S", "generation": 15 } } } } }

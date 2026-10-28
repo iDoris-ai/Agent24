@@ -10,6 +10,13 @@
 //!   never runs silently for a remote caller.
 //! - `agent24_list_tools`, `agent24_list_runs` — read-only introspection.
 //!
+//! Run content reaches the caller only through the kernel's peer views
+//! (`/api/v1/peer/runs`, K1-6b.5c-2): a run whose sources are not all Ordinary,
+//! or that may have taken in an untagged tool result (it called a tool,
+//! recalled a memory, was started by a self-wake, or has session context),
+//! comes back as its status and a fixed notice, never its prompt, output or
+//! error.
+//!
 //! It deliberately does NOT expose raw `shell_exec`/`fs_write` as MCP tools:
 //! that would hand a third party an un-gated execution path. Every side effect
 //! happens inside the run `agent24_run` triggers, under the existing
@@ -22,7 +29,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent24_protocol::{Run, RunStatus};
+use agent24_protocol::{PeerRun, Run, RunStatus};
 use rmcp::ErrorData as McpError;
 use rmcp::ServiceExt;
 use rmcp::handler::server::ServerHandler;
@@ -40,6 +47,19 @@ use serde_json::{Map, Value, json};
 const RUN_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 /// Poll cadence while waiting for a run to finish.
 const RUN_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Env override (whole seconds) for the total `agent24_run` time limit. Read
+/// by the `agent24 mcp` command (the CLI), which hands the result to
+/// [`Agent24Server::with_run_timeout`] — this crate itself reads no env.
+pub const RUN_TIMEOUT_ENV: &str = "AGENT24_MCP_RUN_TIMEOUT_SECS";
+
+/// Parse the override: a positive integer number of seconds; anything else
+/// (absent, zero, negative, junk) falls back to the 600s default.
+#[must_use]
+pub fn parse_run_timeout(raw: Option<&str>) -> Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map_or(RUN_WAIT_TIMEOUT, Duration::from_secs)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum McpServerError {
@@ -53,6 +73,7 @@ pub struct Agent24Server {
     base: String,
     token: String,
     http: reqwest::Client,
+    run_timeout: Duration,
 }
 
 impl Agent24Server {
@@ -60,8 +81,16 @@ impl Agent24Server {
         Self {
             base,
             token,
-            http: reqwest::Client::new(),
+            http: agent24_protocol::client::loopback_client(Duration::from_secs(2)),
+            run_timeout: RUN_WAIT_TIMEOUT,
         }
+    }
+
+    /// Total time limit for one `agent24_run` call (default 600s).
+    #[must_use]
+    pub fn with_run_timeout(mut self, limit: Duration) -> Self {
+        self.run_timeout = limit;
+        self
     }
 
     /// Serve this proxy over stdio until the client disconnects.
@@ -113,7 +142,11 @@ impl Agent24Server {
             ),
             Tool::new(
                 Cow::Borrowed("agent24_list_runs"),
-                Cow::Borrowed("List this agent24d's runs and their status (read-only)."),
+                Cow::Borrowed(
+                    "List this agent24d's runs and their status (read-only). Only a \
+                     self-contained run (ordinary sources, no tools, no memory, no session \
+                     context) shows its content; any other shows only its status.",
+                ),
                 empty_obj,
             ),
         ]
@@ -137,6 +170,23 @@ impl Agent24Server {
         }
     }
 
+    /// [`Self::run`] under a hard total time limit: a daemon that accepts the
+    /// connection but never answers must not hang the MCP caller forever.
+    async fn run_bounded(
+        &self,
+        args: &Map<String, Value>,
+        limit: Duration,
+    ) -> Result<String, String> {
+        tokio::time::timeout(limit, self.run(args))
+            .await
+            .unwrap_or_else(|_| {
+                Err(format!(
+                    "agent24_run did not complete within {limit:?} (the run may still be \
+                     going on the daemon; check with agent24_list_runs)"
+                ))
+            })
+    }
+
     /// Start a run and wait (bounded) for it to finish, returning its output.
     async fn run(&self, args: &Map<String, Value>) -> Result<String, String> {
         let Some(prompt) = args.get("prompt").and_then(Value::as_str) else {
@@ -155,9 +205,12 @@ impl Agent24Server {
             .await
             .map_err(|e| format!("daemon unreachable: {e}"))?;
         if !created.status().is_success() {
-            let status = created.status();
-            let text = created.text().await.unwrap_or_default();
-            return Err(format!("run create failed ({status}): {text}"));
+            // Status only: the error body is not a peer view, so it is not
+            // relayed (K1-6b.5c-2).
+            return Err(format!(
+                "run create failed ({}); see the agent24d log",
+                created.status()
+            ));
         }
         let run: Run = created
             .json()
@@ -166,13 +219,14 @@ impl Agent24Server {
         self.await_run(&run.id).await
     }
 
-    /// Poll a run to a terminal state (bounded by RUN_WAIT_TIMEOUT).
+    /// Poll a run's peer view to a terminal state (bounded by
+    /// RUN_WAIT_TIMEOUT). A withheld run ends as its notice, not its content.
     async fn await_run(&self, run_id: &str) -> Result<String, String> {
         let max_polls = (RUN_WAIT_TIMEOUT.as_secs() / RUN_POLL_INTERVAL.as_secs().max(1)).max(1);
         for _ in 0..max_polls {
             let res = self
                 .http
-                .get(format!("{}/api/v1/runs/{run_id}", self.base))
+                .get(format!("{}/api/v1/peer/runs/{run_id}", self.base))
                 .bearer_auth(&self.token)
                 .send()
                 .await
@@ -180,8 +234,14 @@ impl Agent24Server {
             if !res.status().is_success() {
                 return Err(format!("run poll failed: {}", res.status()));
             }
-            let run: Run = res.json().await.map_err(|e| e.to_string())?;
+            let run: PeerRun = res.json().await.map_err(|e| e.to_string())?;
             match run.status {
+                RunStatus::Completed if run.withheld => {
+                    return Err(format!("run completed: {}", run.notice.unwrap_or_default()));
+                }
+                RunStatus::Failed if run.withheld => {
+                    return Err(format!("run failed: {}", run.notice.unwrap_or_default()));
+                }
                 RunStatus::Completed => {
                     return Ok(run.output.map(|o| o.text).unwrap_or_default());
                 }
@@ -201,6 +261,17 @@ impl Agent24Server {
             "run {run_id} did not finish within {RUN_WAIT_TIMEOUT:?} \
              (it is still running on the daemon; check with agent24_list_runs)"
         ))
+    }
+}
+
+impl Agent24Server {
+    async fn dispatch(&self, tool: &str, args: &Map<String, Value>) -> Result<String, String> {
+        match tool {
+            "agent24_run" => self.run_bounded(args, self.run_timeout).await,
+            "agent24_list_tools" => self.get("/api/v1/tools").await,
+            "agent24_list_runs" => self.get("/api/v1/peer/runs").await,
+            other => Err(format!("unknown tool: {other}")),
+        }
     }
 }
 
@@ -230,12 +301,7 @@ impl ServerHandler for Agent24Server {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let args = request.arguments.unwrap_or_default();
-        let outcome = match request.name.as_ref() {
-            "agent24_run" => self.run(&args).await,
-            "agent24_list_tools" => self.get("/api/v1/tools").await,
-            "agent24_list_runs" => self.get("/api/v1/runs").await,
-            other => Err(format!("unknown tool: {other}")),
-        };
+        let outcome = self.dispatch(request.name.as_ref(), &args).await;
         // Tool-level failures are returned as caller-visible error results, not
         // protocol errors (which MCP clients render opaquely).
         Ok(match outcome {
@@ -264,6 +330,41 @@ mod tests {
         // The dangerous builtins must NOT be exposed as MCP tools — the only way
         // to run them is inside a gated `agent24_run`.
         assert!(!names.iter().any(|n| n == "shell_exec" || n == "fs_write"));
+    }
+
+    #[test]
+    fn run_timeout_defaults_to_600s_and_is_overridable() {
+        assert_eq!(parse_run_timeout(None), Duration::from_secs(600));
+        assert_eq!(parse_run_timeout(Some("30")), Duration::from_secs(30));
+        assert_eq!(parse_run_timeout(Some(" 7 ")), Duration::from_secs(7));
+        for bad in ["0", "-1", "abc", ""] {
+            assert_eq!(
+                parse_run_timeout(Some(bad)),
+                Duration::from_secs(600),
+                "{bad}"
+            );
+        }
+    }
+
+    /// C-04: a daemon that accepts the connection and never answers must not
+    /// hang `agent24_run` — the total limit fires.
+    #[tokio::test]
+    async fn run_is_bounded_when_the_daemon_never_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock); // accept, then say nothing
+            }
+        });
+        let server = Agent24Server::new(format!("http://127.0.0.1:{port}"), "t".to_owned());
+        let args = json!({ "prompt": "hi" }).as_object().cloned().unwrap();
+        let err = server
+            .run_bounded(&args, Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert!(err.contains("did not complete within"), "{err}");
     }
 
     #[test]
@@ -328,6 +429,176 @@ mod tests {
         let server = Agent24Server::new("http://127.0.0.1:1".to_owned(), String::new());
         let err = server.get("/api/v1/runs").await.unwrap_err();
         assert!(err.contains("daemon unreachable"), "{err}");
+    }
+
+    // ── K1-6b.5c-2: run content only through the peer views ─────────────────
+
+    /// Marks every piece of run content a withheld run must not leak.
+    const SECRET: &str = "SECRET-7f3a";
+
+    /// A mock daemon that answers by request line: the first route whose
+    /// `"METHOD /path"` prefix matches gets `(status, body)`, anything else
+    /// 404. Captures each request line so tests can see which paths were read.
+    async fn routed_daemon(
+        routes: Vec<(&'static str, u16, String)>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cap = std::sync::Arc::clone(&seen);
+        let routes = std::sync::Arc::new(routes);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let cap = std::sync::Arc::clone(&cap);
+                let routes = std::sync::Arc::clone(&routes);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let line = request.lines().next().unwrap_or_default().to_owned();
+                    if let Ok(mut v) = cap.lock() {
+                        v.push(line.clone());
+                    }
+                    let (status, body) = routes
+                        .iter()
+                        .find(|(prefix, _, _)| line.starts_with(&format!("{prefix} ")))
+                        .map_or((404, String::new()), |(_, status, body)| {
+                            (*status, body.clone())
+                        });
+                    let resp = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// The `POST /api/v1/runs` answer: a queued run whose prompt is secret.
+    fn created_run() -> String {
+        json!({
+            "id": "run_1", "session_id": null, "workspace_id": null, "status": "queued",
+            "input": { "prompt": format!("prompt {SECRET}"), "workspace_id": null },
+            "output": null, "error": null,
+            "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost_usd": 0.0 },
+            "schedule_id": null, "created_at": "2026-10-25T00:00:00Z",
+            "started_at": null, "ended_at": null
+        })
+        .to_string()
+    }
+
+    fn peer_run(status: &str, withheld: bool) -> String {
+        json!({
+            "id": "run_1", "status": status, "withheld": withheld,
+            "prompt": (!withheld).then(|| format!("prompt {SECRET}")),
+            "output": (!withheld && status == "completed").then(|| json!({ "text": format!("output {SECRET}") })),
+            "error": (!withheld && status == "failed")
+                .then(|| json!({ "code": "internal", "message": format!("error {SECRET}") })),
+            "notice": withheld.then_some("withheld by agent24d"),
+        })
+        .to_string()
+    }
+
+    /// The full run, as `/api/v1/runs/{id}` would give it. The proxy must
+    /// never read it: every route answers with content here.
+    fn full_routes(peer: String) -> Vec<(&'static str, u16, String)> {
+        vec![
+            ("POST /api/v1/runs", 202, created_run()),
+            ("GET /api/v1/peer/runs/run_1", 200, peer),
+            (
+                "GET /api/v1/runs/run_1",
+                200,
+                format!(r#"{{"leak":"{SECRET}"}}"#),
+            ),
+            ("GET /api/v1/runs", 200, format!(r#"{{"leak":"{SECRET}"}}"#)),
+            ("GET /api/v1/peer/runs", 200, r#"{"runs":[]}"#.to_owned()),
+        ]
+    }
+
+    fn run_args() -> Map<String, Value> {
+        json!({ "prompt": "do it" }).as_object().cloned().unwrap()
+    }
+
+    fn read_paths(seen: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+        seen.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_run_returns_its_output_from_the_peer_view() {
+        let (base, seen) = routed_daemon(full_routes(peer_run("completed", false))).await;
+        let server = Agent24Server::new(base, "tok".to_owned());
+        let text = server.dispatch("agent24_run", &run_args()).await.unwrap();
+        assert_eq!(text, format!("output {SECRET}"));
+        let paths = read_paths(&seen);
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.starts_with("GET /api/v1/peer/runs/run_1 ")),
+            "{paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with("GET /api/v1/runs/")),
+            "{paths:?}"
+        );
+
+        let (base, _) = routed_daemon(full_routes(peer_run("failed", false))).await;
+        let server = Agent24Server::new(base, "tok".to_owned());
+        let err = server
+            .dispatch("agent24_run", &run_args())
+            .await
+            .unwrap_err();
+        assert_eq!(err, format!("internal: error {SECRET}"));
+    }
+
+    #[tokio::test]
+    async fn a_withheld_run_ends_as_its_notice_and_never_its_content() {
+        for status in ["completed", "failed"] {
+            let (base, seen) = routed_daemon(full_routes(peer_run(status, true))).await;
+            let server = Agent24Server::new(base, "tok".to_owned());
+            let err = server
+                .dispatch("agent24_run", &run_args())
+                .await
+                .unwrap_err();
+            assert_eq!(err, format!("run {status}: withheld by agent24d"));
+            assert!(!err.contains(SECRET), "{err}");
+            let paths = read_paths(&seen);
+            assert!(
+                !paths.iter().any(|p| p.starts_with("GET /api/v1/runs/")),
+                "{paths:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_create_relays_only_its_status() {
+        let (base, _) = routed_daemon(vec![(
+            "POST /api/v1/runs",
+            409,
+            format!(r#"{{"error":{{"code":"conflict","message":"{SECRET}"}}}}"#),
+        )])
+        .await;
+        let server = Agent24Server::new(base, "tok".to_owned());
+        let err = server
+            .dispatch("agent24_run", &run_args())
+            .await
+            .unwrap_err();
+        assert!(err.contains("409"), "{err}");
+        assert!(!err.contains(SECRET), "{err}");
+    }
+
+    #[tokio::test]
+    async fn listing_runs_reads_the_peer_list_only() {
+        let (base, seen) = routed_daemon(full_routes(peer_run("completed", true))).await;
+        let server = Agent24Server::new(base, "tok".to_owned());
+        let text = server
+            .dispatch("agent24_list_runs", &Map::new())
+            .await
+            .unwrap();
+        assert_eq!(text, r#"{"runs":[]}"#);
+        assert_eq!(read_paths(&seen), ["GET /api/v1/peer/runs HTTP/1.1"]);
     }
 
     /// End-to-end through the ACTUAL MCP protocol: a real rmcp client, connected

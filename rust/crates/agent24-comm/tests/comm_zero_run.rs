@@ -6,6 +6,8 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
@@ -143,9 +145,7 @@ esac
     );
     std::fs::write(&source, script).expect("write fake Hyphae executable");
     let bytes = tokio::fs::read(&source).await.expect("read fake binary");
-    VerifiedBinary::install(&source, sha256_of(&bytes), &dir.join("bin"))
-        .await
-        .expect("install verified fake binary")
+    common::install_verified(&source, sha256_of(&bytes), &dir.join("bin")).await
 }
 
 async fn post(app: &Router, uri: &str) -> (StatusCode, Value) {

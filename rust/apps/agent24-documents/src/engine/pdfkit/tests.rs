@@ -349,6 +349,18 @@ async fn a_render_that_is_not_what_was_asked_for_is_a_failure() {
         matches!(render(&e, small).await, Err(RenderError::Failed(m)) if m.contains("too large"))
     );
     assert!(start.elapsed() < Duration::from_secs(5));
+    // Far over it, with a process the helper started holding its output
+    // open: still stopped at once. (Before, the run waited for the end of
+    // the error output: should `head` die before the kill, `sleep 30` ran
+    // on with it, and the render was too slow, not too large.)
+    let e = helper(dir.path(), "sleep 30 & head -c 100000000 /dev/zero");
+    let start = std::time::Instant::now();
+    let got = render(&e, small).await;
+    assert!(
+        matches!(&got, Err(RenderError::Failed(m)) if m.contains("too large")),
+        "{got:?}"
+    );
+    assert!(start.elapsed() < Duration::from_secs(5));
 }
 
 #[tokio::test]
