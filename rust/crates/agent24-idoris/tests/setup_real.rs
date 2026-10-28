@@ -68,8 +68,10 @@ async fn real_v0_4_0_setup_with_local_omlx() {
             dir.path().join("install"),
             env!("CARGO_BIN_EXE_idoris-install-child"),
         ),
-        &Codesign,
+        Codesign,
+        &cancel,
     )
+    .await
     .unwrap();
     let result = run_setup(
         &installed,

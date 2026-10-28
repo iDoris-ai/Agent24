@@ -349,6 +349,7 @@ impl Summarizer for RouterSummarizer {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            idoris_headroom_confirmed: false,
             temperature: None,
             progress: None,
         };
@@ -1273,7 +1274,11 @@ impl RunManager {
             let task = tokio::spawn({
                 let manager = Arc::clone(&manager);
                 let run_id = run_id.clone();
-                async move { manager.execute(run_id, token).await }
+                async move {
+                    manager
+                        .execute(run_id, token, create.idoris_headroom_confirmed)
+                        .await
+                }
             });
             if let Err(err) = task.await
                 && err.is_panic()
@@ -1722,7 +1727,7 @@ impl RunManager {
         // out of plan mode: the only thing a plan-mode run can park on is its
         // plan approval, and reaching here means that was approved (a rejection
         // returned above), so the full tool set is unlocked (H8).
-        self.run_loop(run, messages, false, cancel).await;
+        self.run_loop(run, messages, false, cancel, false).await;
     }
 
     /// Settle the ONE parked call whose approval is already decided (H3): apply
@@ -1842,7 +1847,12 @@ impl RunManager {
         outcome
     }
 
-    async fn execute(&self, run_id: String, cancel: CancellationToken) {
+    async fn execute(
+        &self,
+        run_id: String,
+        cancel: CancellationToken,
+        idoris_headroom_confirmed: bool,
+    ) {
         // Cancelled before starting? queued → cancelled directly.
         if cancel.is_cancelled() {
             self.finish_cancelled(&run_id).await;
@@ -2207,7 +2217,8 @@ impl RunManager {
         }
         // H8: a fresh plan-mode run starts read-only; a Normal run never is.
         let plan_mode = matches!(run.input.mode, RunMode::Plan);
-        self.run_loop(run, snapshot, plan_mode, cancel).await;
+        self.run_loop(run, snapshot, plan_mode, cancel, idoris_headroom_confirmed)
+            .await;
         // M3 growth control, chosen approach: reclaim the prior-context copy
         // ONLY along the path that never parked for approval (`run_loop`
         // only returns here once this SAME invocation reached a terminal
@@ -2392,6 +2403,7 @@ impl RunManager {
         mut messages: Vec<Msg>,
         mut plan_mode: bool,
         cancel: CancellationToken,
+        mut idoris_headroom_confirmed: bool,
     ) {
         let run_id = run.id.clone();
         let mut usage_total = zero_usage();
@@ -2423,6 +2435,7 @@ impl RunManager {
                 response_format: None,
                 max_tokens: None,
                 disable_thinking: false,
+                idoris_headroom_confirmed: std::mem::take(&mut idoris_headroom_confirmed),
                 temperature: None,
                 progress: None,
             };
@@ -2458,6 +2471,12 @@ impl RunManager {
                         // ME4-S2 L3: same handling as `Provider` — same `Display`
                         // text, so the agent loop's output is unchanged.
                         ModelError::Rejected { message, .. } => ("provider_error", message.clone()),
+                        ModelError::IdorisHeadroomConfirmationRequired { .. } => {
+                            ("idoris_headroom_confirmation_required", err.to_string())
+                        }
+                        ModelError::IdorisSupervisorBusy => {
+                            ("idoris_supervisor_busy", err.to_string())
+                        }
                         ModelError::Cancelled => ("internal", err.to_string()),
                     };
                     self.finish_failed(&run_id, code, &message).await;
@@ -3185,6 +3204,7 @@ pub(crate) mod tests {
                 thread_to_messages(&thread),
                 false,
                 CancellationToken::new(),
+                false,
             )
             .await;
         assert!(remote.seen.lock().unwrap().is_empty());
@@ -3534,6 +3554,63 @@ pub(crate) mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn headroom_confirmation_is_consumed_by_the_first_model_call() {
+        struct Recording {
+            seen: StdMutex<Vec<bool>>,
+        }
+        #[async_trait]
+        impl ModelProvider for Recording {
+            fn name(&self) -> &str {
+                "headroom-recording"
+            }
+            async fn complete(
+                &self,
+                req: &CompletionRequest,
+                _: &CancellationToken,
+            ) -> Result<CompletionResponse, ModelError> {
+                let mut seen = self.seen.lock().unwrap();
+                seen.push(req.idoris_headroom_confirmed);
+                let message = if seen.len() == 1 {
+                    tool_call_turn("unknown_tool", "{}".into())
+                } else {
+                    Msg::assistant(Some("done".into()), vec![])
+                };
+                Ok(CompletionResponse {
+                    message,
+                    usage: usage_one(),
+                    model_id: None,
+                })
+            }
+            async fn models(
+                &self,
+                _: &CancellationToken,
+            ) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+                Ok(vec![])
+            }
+        }
+        let provider = Arc::new(Recording {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, _, store) = manager_with(provider.clone()).await;
+        let run = manager
+            .start_run(RunCreate {
+                idoris_headroom_confirmed: true,
+                ..create()
+            })
+            .await
+            .unwrap();
+        let done = wait_terminal(&store, &run.id).await;
+        assert_eq!(done.status, RunStatus::Completed, "{done:?}");
+        assert_eq!(*provider.seen.lock().unwrap(), [true, false]);
+        let run = manager.start_run(create()).await.unwrap();
+        assert_eq!(
+            wait_terminal(&store, &run.id).await.status,
+            RunStatus::Completed
+        );
+        assert_eq!(*provider.seen.lock().unwrap(), [true, false, false]);
+    }
+
     struct HangingProvider;
 
     #[async_trait]
@@ -3711,6 +3788,7 @@ pub(crate) mod tests {
             .unwrap();
         let first = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("bound".into()),
                 workspace_id: Some(workspace_id.clone()),
                 prompt: "workspace run".into(),
@@ -3733,6 +3811,7 @@ pub(crate) mod tests {
 
         let second = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("bound".into()),
                 workspace_id: Some(workspace_id),
                 prompt: "workspace run two".into(),
@@ -3749,6 +3828,7 @@ pub(crate) mod tests {
 
         let error = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("bound".into()),
                 workspace_id: None,
                 prompt: "must not downgrade".into(),
@@ -3789,6 +3869,7 @@ pub(crate) mod tests {
             .unwrap();
         let run = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("bound-tool".into()),
                 workspace_id: Some(workspace_id),
                 prompt: "try a tool".into(),
@@ -4109,6 +4190,7 @@ pub(crate) mod tests {
         assert!(matches!(
             manager
                 .start_run(RunCreate {
+                    idoris_headroom_confirmed: false,
                     session_id: Some("bound".into()),
                     workspace_id: Some(workspace_id),
                     prompt: "fail admission".into(),
@@ -4225,6 +4307,7 @@ pub(crate) mod tests {
             .unwrap();
         let run = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("bound".into()),
                 workspace_id: Some(workspace_id),
                 prompt: "hang".into(),
@@ -4498,6 +4581,7 @@ pub(crate) mod tests {
     ) -> Run {
         let run = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some(session_id.to_owned()),
                 workspace_id: None,
                 prompt: prompt.to_owned(),
@@ -4852,6 +4936,7 @@ pub(crate) mod tests {
         let run = manager
             .start_run_with_schedule(
                 RunCreate {
+                    idoris_headroom_confirmed: false,
                     session_id: session_id.map(str::to_owned),
                     workspace_id: None,
                     prompt: prompt.to_owned(),
@@ -5141,6 +5226,7 @@ pub(crate) mod tests {
 
         let run1 = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("sess_shed".to_owned()),
                 workspace_id: None,
                 prompt: "first question".to_owned(),
@@ -5162,6 +5248,7 @@ pub(crate) mod tests {
 
         let run2 = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("sess_shed".to_owned()),
                 workspace_id: None,
                 prompt: "second question".to_owned(),
@@ -5219,6 +5306,7 @@ pub(crate) mod tests {
         for prompt in ["alpha", "beta"] {
             let run = manager
                 .start_run(RunCreate {
+                    idoris_headroom_confirmed: false,
                     session_id: Some("sess_race".to_owned()),
                     workspace_id: None,
                     prompt: prompt.to_owned(),
@@ -5369,6 +5457,7 @@ pub(crate) mod tests {
         seed_session(&store, "sess_cancel").await;
         let run = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("sess_cancel".to_owned()),
                 workspace_id: None,
                 prompt: "hi".to_owned(),
@@ -5444,6 +5533,7 @@ pub(crate) mod tests {
         // Run A: proceed until it is inside compaction, holding the lock.
         let run_a = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("sess_lockwait".to_owned()),
                 workspace_id: None,
                 prompt: "a".to_owned(),
@@ -5460,6 +5550,7 @@ pub(crate) mod tests {
         // Run B: blocks in session_context() waiting for A's lock.
         let run_b = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("sess_lockwait".to_owned()),
                 workspace_id: None,
                 prompt: "b".to_owned(),
@@ -5510,6 +5601,7 @@ pub(crate) mod tests {
 
     pub(crate) fn create() -> RunCreate {
         RunCreate {
+            idoris_headroom_confirmed: false,
             session_id: None,
             workspace_id: None,
             prompt: "hi".to_owned(),
@@ -5578,6 +5670,7 @@ pub(crate) mod tests {
         let (manager, _sink, _store) = manager_with(Arc::new(FixedProvider)).await;
         let err = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("sess_nope".to_owned()),
                 workspace_id: None,
                 prompt: "hi".to_owned(),
@@ -5664,6 +5757,7 @@ pub(crate) mod tests {
         wait_terminal(&store, &unbound.id).await;
         let bound = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 knowledge_binding_id: Some("b1".to_owned()),
                 ..create()
             })
@@ -5754,6 +5848,7 @@ pub(crate) mod tests {
         let err = manager
             .start_run_then(
                 RunCreate {
+                    idoris_headroom_confirmed: false,
                     session_id: Some("sess_nope".to_owned()),
                     ..create()
                 },
@@ -5768,6 +5863,7 @@ pub(crate) mod tests {
         let err = manager
             .start_run_then(
                 RunCreate {
+                    idoris_headroom_confirmed: false,
                     workspace_id: Some(
                         agent24_protocol::WorkspaceId::parse("ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5")
                             .unwrap(),
@@ -6200,6 +6296,7 @@ mod approval_tests {
 
     fn create_plan() -> RunCreate {
         RunCreate {
+            idoris_headroom_confirmed: false,
             session_id: None,
             workspace_id: None,
             prompt: "do the thing".to_owned(),

@@ -111,6 +111,7 @@ fn req(p: Option<Progress>) -> CompletionRequest {
         response_format: None,
         max_tokens: None,
         disable_thinking: false,
+        idoris_headroom_confirmed: false,
         temperature: None,
         progress: p,
     }
