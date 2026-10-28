@@ -570,6 +570,7 @@ mod tests {
             base: format!("http://127.0.0.1:{port}"),
             token: "tok".to_owned(),
             child: None,
+            session: None,
         }
     }
 
