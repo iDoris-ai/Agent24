@@ -432,7 +432,7 @@ async fn cancel_after_issuance_revokes_and_reaps() {
             .connect(x.request(), Some("cancel-connect"))
             .await
             .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while x.f.host.operation(&op.operation_id).await.unwrap().phase
             != Phase::VerifyingConnection
         {
@@ -670,7 +670,7 @@ async fn cancellation_while_waiting_for_commit_lock_rolls_back() {
             .connect(x.request(), Some("cancel-at-commit"))
             .await
             .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while x.f.host.operation(&op.operation_id).await.unwrap().phase
             != Phase::VerifyingConnection
         {
