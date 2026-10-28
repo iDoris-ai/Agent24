@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import type { IdorisStatusResult } from '../../shared/ipc-types'
+import IdorisPanel from '../components/idoris/IdorisPanel'
 import { translate, useT } from '../i18n'
 import { modelsMessages } from './Models.i18n'
 
@@ -33,11 +33,10 @@ function statusDot(model: OmlxModel) {
   return <span title={title} style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: color, marginRight: 6 }} />
 }
 
-export default function ModelsPage() {
+export default function ModelsPage({ onOpenChat }: { onOpenChat?: () => void } = {}) {
   const t = useT(modelsMessages)
   const [liveModels, setLiveModels] = useState<OmlxModel[]>([])
   const [loading, setLoading] = useState(true)
-  const [idorisStatus, setIdorisStatus] = useState<IdorisStatusResult | null>(null)
 
   useEffect(() => {
     // AUDIT-1: the daemon's real route is `/api/v1/models`, returning
@@ -52,15 +51,9 @@ export default function ModelsPage() {
       })
       .catch(() => {/* oMLX not running */})
       .finally(() => setLoading(false))
-    void window.agent24.idorisStatus().then(setIdorisStatus).catch(() => {
-      setIdorisStatus({ state: 'unavailable', reason: 'unreachable' })
-    })
   }, [])
 
   const hasLive = liveModels.length > 0
-  const idorisModelCount = idorisStatus?.state === 'available'
-    ? idorisStatus.models?.sources.reduce((count, source) => count + source.models.length, 0)
-    : undefined
 
   return (
     <div className="content">
@@ -70,30 +63,7 @@ export default function ModelsPage() {
       </div>
       <div className="page-sub">{t('page.subtitle')}</div>
 
-      <div style={{ margin: '12px 0 16px', padding: '10px 12px', background: 'var(--surface2)', borderRadius: 8, fontSize: 12 }}>
-        <div style={{ fontWeight: 600, marginBottom: 4 }}>{t('idoris.title')}</div>
-        {idorisStatus?.state === 'available' ? (
-          <div data-testid="idoris-status-available">
-            {t('idoris.status', { version: idorisStatus.status.version, components: idorisStatus.status.components, runtimes: idorisStatus.status.runtimes, capacity: t(`capacity.${idorisStatus.status.capacity.state}`) })}
-            {idorisStatus.backends && idorisStatus.models && (
-              <div data-testid="idoris-status-resources" style={{ marginTop: 4, color: 'var(--muted)' }}>
-                {t('idoris.resources', { backends: idorisStatus.backends.length, models: idorisModelCount ?? 0 })}
-              </div>
-            )}
-          </div>
-        ) : idorisStatus === null ? (
-          <div style={{ color: 'var(--muted)' }}>{t('idoris.checking')}</div>
-        ) : idorisStatus.reason === 'handoff-missing' ? (
-          // Launched without an iDoris admin handoff: iDoris is simply not
-          // set up (optional) — not a broken connection.
-          <div data-testid="idoris-not-configured" style={{ color: 'var(--muted)' }}>
-            <div>{t('idoris.notConfigured')}</div>
-            <div>{t('idoris.notConfiguredHint')}</div>
-          </div>
-        ) : (
-          <div data-testid="idoris-disconnected" style={{ color: 'var(--muted)' }}>{t('idoris.unavailable')}</div>
-        )}
-      </div>
+      <IdorisPanel onOpenChat={onOpenChat} />
 
       {/* Live oMLX model status */}
       {hasLive && (

@@ -19,7 +19,6 @@ import type {
   BackendProxyRequest,
   BackendProxyResponse,
   LlmStatusResult,
-  IdorisStatusResult,
   OmlxAuthRequiredResult,
   OmlxDetectResult,
   OmlxModelsResult,
@@ -257,7 +256,6 @@ const invalidRequest = (message: string): BackendProxyResponse =>
   ({ ok: false, status: 400, data: { error: { code: 'invalid_request', message } } })
 
 export function registerIpcHandlers(options: {
-  idorisStatus?: () => Promise<IdorisStatusResult>
   /** Test seam: where to look for the user's `~/.omlx/settings.json`. */
   omlxSettingsPath?: string
   /** Test seam: replace discovery ports to isolate probes from local services. */
@@ -383,9 +381,6 @@ export function registerIpcHandlers(options: {
     return { provider: 'none', url: '', model: '' }
   })
 
-  handle(IpcChannels.IdorisStatus, (): Promise<IdorisStatusResult> =>
-    options.idorisStatus?.() ?? Promise.resolve({ state: 'unavailable', reason: 'handoff-missing' }),
-  )
 
   // The renderer reports its UI language so the tray and native dialogs follow it.
   handle(IpcChannels.AppSetLocale, (_event, locale: unknown): void => {
