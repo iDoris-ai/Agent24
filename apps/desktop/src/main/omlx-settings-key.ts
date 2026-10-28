@@ -49,7 +49,7 @@ export function readOmlxSettingsKey(file = defaultOmlxSettingsPath()): OmlxSetti
     // Open without following a symlink, then check and read THAT descriptor, so
     // nothing can be swapped between the check and the read.
     const noFollow = process.platform === 'win32' ? 0 : fs.constants.O_NOFOLLOW
-    fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow)
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | noFollow)
     const stat = fs.fstatSync(fd)
     if (!stat.isFile() || stat.size > MAX_SETTINGS_BYTES || !isOwnedAndNotWritableByOthers(stat)) return null
     const buf = Buffer.alloc(stat.size)

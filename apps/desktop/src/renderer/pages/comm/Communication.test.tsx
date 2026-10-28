@@ -78,6 +78,22 @@ describe('CommunicationPage', () => {
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
+  it.each([
+    'A24_COMM_PASSWORD_STORE="x" is not a recognized password store backend',
+    'not a recognized relay configuration',
+    'invalid configuration: relay URL must use wss',
+    'misconfigured password store',
+  ])('配置错误展示原文且不引导创建身份：%s', async (message) => {
+    for (const fn of [listCommIdentities, listCommContacts, listCommRelays, getCommStatus]) {
+      vi.mocked(fn).mockRejectedValue(new CommApiError(message, 409, 'not_configured'))
+    }
+    render(<CommunicationPage />)
+    expect(await screen.findByRole('heading', { name: '通信配置有误' })).toBeInTheDocument()
+    expect(screen.getByText(`详情：${message}`)).toBeInTheDocument()
+    expect(screen.queryByText('agent24 comm identity create <昵称> --default')).toBeNull()
+    expect(screen.queryByText('A24_HYPHAE_BIN=/path/to/hyphae')).toBeNull()
+  })
+
   it('a real error still shows as an alert, listing only the real failure, next to the not_configured guide', async () => {
     const nc = () => new CommApiError('Not configured', 409, 'not_configured')
     vi.mocked(listCommIdentities).mockRejectedValue(nc())

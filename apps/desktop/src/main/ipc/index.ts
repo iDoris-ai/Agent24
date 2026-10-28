@@ -56,20 +56,18 @@ function effectiveOmlxKey(base: URL, supplied: string): string {
 
 interface OmlxProbeCandidate { url: string; apiKey: string; fromSettings?: boolean }
 
-function omlxProbeCandidates(): OmlxProbeCandidate[] {
+function omlxProbeCandidates(ports: readonly number[] = [8088, 8000, 8001]): OmlxProbeCandidate[] {
   const key = configuredOmlxKey()
   const fromFile = readOmlxSettingsKey(omlxSettingsPath)
   return [
     // Keyed probe only when a key is configured.
-    ...(key ? [{ url: 'http://127.0.0.1:8088', apiKey: key }] : []),
+    ...(key && ports.includes(8088) ? [{ url: 'http://127.0.0.1:8088', apiKey: key }] : []),
     // The user's own oMLX config, for the address that same config says oMLX
     // listens on. No key is copied here: it is resolved from the file right
     // before the request (effectiveOmlxKey), so it can never be stale.
     ...(fromFile ? [{ url: fromFile.url, apiKey: '', fromSettings: true }] : []),
     // Keyless probes: a keyed server answers 401 (reported as "auth required").
-    { url: 'http://127.0.0.1:8088', apiKey: '' },
-    { url: 'http://127.0.0.1:8000', apiKey: '' },
-    { url: 'http://127.0.0.1:8001', apiKey: '' },
+    ...ports.map((port) => ({ url: `http://127.0.0.1:${port}`, apiKey: '' })),
   ]
 }
 
@@ -109,6 +107,13 @@ function probeOmlx(url: unknown, apiKey: string): Promise<OmlxProbe> {
     if (!base) { resolve({ models: [], authRequired: false }); return }
     const headers: Record<string, string> = { 'Accept': 'application/json' }
     const key = effectiveOmlxKey(base, apiKey)
+    const keyEncodings = key ? [
+      key,
+      Buffer.from(key).toString('base64').replace(/=+$/, ''),
+      Buffer.from(key).toString('base64url'),
+      Buffer.from(key).toString('hex'),
+      Buffer.from(key).toString('hex').toUpperCase(),
+    ] : []
     if (key) headers['Authorization'] = `Bearer ${key}`
     try {
     loopbackRequest(
@@ -130,7 +135,7 @@ function probeOmlx(url: unknown, apiKey: string): Promise<OmlxProbe> {
             // Only plain string ids, and never one that echoes the key back
             // (a reflecting server must not turn into a way to hand it on).
             const models = (body.data ?? []).map((m) => m.id)
-              .filter((id): id is string => typeof id === 'string' && (key === '' || !id.includes(key)))
+              .filter((id): id is string => typeof id === 'string' && !keyEncodings.some((encoded) => id.includes(encoded)))
             resolve({ models, authRequired: false })
           } catch { resolve({ models: [], authRequired: false }) }
         })
@@ -255,6 +260,8 @@ export function registerIpcHandlers(options: {
   idorisStatus?: () => Promise<IdorisStatusResult>
   /** Test seam: where to look for the user's `~/.omlx/settings.json`. */
   omlxSettingsPath?: string
+  /** Test seam: replace discovery ports to isolate probes from local services. */
+  omlxCandidatePorts?: readonly number[]
   /** A3: every handler below is registered through this (sender validation). */
   guard: IpcGuard
 }): void {
@@ -263,7 +270,7 @@ export function registerIpcHandlers(options: {
   // oMLX: auto-detect running server
   handle(IpcChannels.OmlxDetect, async (): Promise<OmlxDetectResult | OmlxAuthRequiredResult | null> => {
     let authRequiredAt: string | null = null
-    for (const candidate of omlxProbeCandidates()) {
+    for (const candidate of omlxProbeCandidates(options.omlxCandidatePorts)) {
       const probe = await probeOmlx(candidate.url, candidate.apiKey)
       if (probe.models.length > 0) {
         if (candidate.fromSettings) {

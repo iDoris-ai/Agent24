@@ -49,6 +49,7 @@ const trustedEvent = { senderFrame: mainFrame, sender: { isDestroyed: () => fals
 let daemon: http.Server
 let modelsRequireKey: string | null = null
 let reflectAuthAsModel = false
+let reflectedKeyEncoding: BufferEncoding | 'base64url' | null = null
 const settingsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-omlx-settings-'))
 const settingsFile = path.join(settingsDir, 'settings.json')
 let seen: { method?: string; url?: string; auth?: string; body: string }[] = []
@@ -64,7 +65,9 @@ beforeAll(async () => {
         res.statusCode = 401
         res.end(JSON.stringify({ error: 'unauthorized' }))
       } else if (req.url === '/v1/models' && reflectAuthAsModel) {
-        res.end(JSON.stringify({ data: [{ id: String(req.headers.authorization ?? '') }, { id: 'm1' }, { id: 7 }] }))
+        const key = String(req.headers.authorization ?? '').replace(/^Bearer /, '')
+        const reflected = reflectedKeyEncoding ? Buffer.from(key).toString(reflectedKeyEncoding) : String(req.headers.authorization ?? '')
+        res.end(JSON.stringify({ data: [{ id: `echo-${reflected}-model` }, { id: 'm1' }, { id: 7 }] }))
       } else if (req.url === '/v1/models') res.end(JSON.stringify({ data: [{ id: 'm1' }] }))
       else if (req.method === 'GET' && req.url === '/api/v1/approvals/ap_1') {
         res.end(JSON.stringify({
@@ -96,6 +99,7 @@ beforeAll(async () => {
   endpoint.port = (daemon.address() as AddressInfo).port
   registerIpcHandlers({
     omlxSettingsPath: settingsFile,
+    omlxCandidatePorts: [endpoint.port],
     guard: createIpcGuard({
       getMainWindow: () => mainWindow as never,
       isTrustedUrl: (u) => u === APP_URL,
@@ -111,6 +115,7 @@ afterAll(() => {
 beforeEach(() => {
   modelsRequireKey = null
   reflectAuthAsModel = false
+  reflectedKeyEncoding = null
   fs.rmSync(settingsFile, { force: true })
   seen = []
   showMessageBox.mockReset()
@@ -471,7 +476,9 @@ describe('oMLX 401 and the key from ~/.omlx/settings.json', () => {
   it('detect: keyed server and no settings file -> authRequired with the url', async () => {
     modelsRequireKey = SECRET
     const res = await call(IpcChannels.OmlxDetect)
-    expect(res).toEqual({ authRequired: true, url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/) })
+    expect(res).toEqual({ authRequired: true, url: url() })
+    expect(seen.length).toBeGreaterThan(0)
+    expect(seen.every((r) => r.url === '/v1/models' && r.auth === undefined)).toBe(true)
   })
 
   it('detect: uses the settings.json key, connects, and the key is NOT in the IPC result or any log', async () => {
@@ -508,6 +515,7 @@ describe('oMLX 401 and the key from ~/.omlx/settings.json', () => {
     writeSettings(goodSettings())
     const res = await call(IpcChannels.OmlxModels, `http://localhost:${endpoint.port}`, '')
     expect(res).toMatchObject({ ok: false, authRequired: true })
+    expect(seen.length).toBeGreaterThan(0)
     expect(seen.every((r) => r.auth === undefined)).toBe(true)
   })
 
@@ -520,6 +528,7 @@ describe('oMLX 401 and the key from ~/.omlx/settings.json', () => {
     fs.rmSync(settingsFile)
     seen = []
     expect(await call(IpcChannels.OmlxModels, url(), '')).toMatchObject({ ok: false, authRequired: true })
+    expect(seen.length).toBeGreaterThan(0)
     expect(seen.every((r) => r.auth === undefined)).toBe(true)
   })
 
@@ -530,6 +539,19 @@ describe('oMLX 401 and the key from ~/.omlx/settings.json', () => {
     expect(models).toMatchObject({ ok: true, models: ['m1'] })
     const detect = await call(IpcChannels.OmlxDetect)
     expect(JSON.stringify([models, detect])).not.toContain(SECRET)
+  })
+
+  it.each(['base64', 'base64url', 'hex'] as const)('拦截模型 id 中的 %s 编码 key', async (encoding) => {
+    const key = 'sk-omlx-~?'
+    reflectAuthAsModel = true
+    reflectedKeyEncoding = encoding
+    writeSettings({ ...goodSettings(), auth: { api_key: key } })
+    const models = await call(IpcChannels.OmlxModels, url(), '')
+    expect(seen.some((r) => r.auth === `Bearer ${key}`)).toBe(true)
+    expect(models).toMatchObject({ ok: true, models: ['m1'] })
+    const detect = await call(IpcChannels.OmlxDetect)
+    expect(detect).toMatchObject({ models: ['m1'] })
+    expect(JSON.stringify([models, detect])).not.toContain(Buffer.from(key).toString(encoding))
   })
 
   it.each([
@@ -544,7 +566,8 @@ describe('oMLX 401 and the key from ~/.omlx/settings.json', () => {
     modelsRequireKey = SECRET
     setup()
     const res = await call(IpcChannels.OmlxDetect)
-    expect(res).toMatchObject({ authRequired: true })
+    expect(res).toMatchObject({ authRequired: true, url: url() })
+    expect(seen.length).toBeGreaterThan(0)
     expect(seen.every((r) => r.auth === undefined)).toBe(true)
   })
 
@@ -554,7 +577,8 @@ describe('oMLX 401 and the key from ~/.omlx/settings.json', () => {
     fs.writeFileSync(real, JSON.stringify(goodSettings()), { mode: 0o600 })
     fs.symlinkSync(real, settingsFile)
     const res = await call(IpcChannels.OmlxDetect)
-    expect(res).toMatchObject({ authRequired: true })
+    expect(res).toMatchObject({ authRequired: true, url: url() })
+    expect(seen.length).toBeGreaterThan(0)
     expect(seen.every((r) => r.auth === undefined)).toBe(true)
     fs.rmSync(real)
   })
