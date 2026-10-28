@@ -963,6 +963,7 @@ async fn revoke_capability(
 /// because the person adding such a header is reading this file
 /// (SPEC-ME3-OUT-OF-PROCESS §2.1).
 async fn auth(State(state): State<AppState>, mut req: Request<Body>, next: Next) -> Response {
+    tracing::debug!(path = %req.uri().path(), "request received");
     if req.method() == Method::GET && req.uri().path() == "/api/v1/health" {
         return next.run(req).await;
     }
@@ -1452,6 +1453,8 @@ pub async fn serve(
     ready_omit_token: bool,
     cancel: CancellationToken,
 ) -> Result<(), std::io::Error> {
+    let startup = std::time::Instant::now();
+    tracing::debug!(ephemeral, "startup: serve");
     validate_auth_startup(auth_mode, host_bootstrap_stdio)?;
     let module_grants = crate::consent_routes::grant_settings(
         std::env::var("A24_MODULE_TOOL_GRANTS").ok().as_deref(),
@@ -1642,6 +1645,7 @@ pub async fn serve(
             .await
             .map_err(std::io::Error::other)?
     };
+    tracing::debug!(elapsed_ms = startup.elapsed().as_millis(), "startup: store");
     // NOTE: the startup sweeps (durable-resume restore + orphan cancel) run
     // AFTER the state is built, below — the restore sweep needs the run manager.
     // Tool workspace: the fs whitelist root + shell cwd. Created up front so
@@ -1668,6 +1672,10 @@ pub async fn serve(
         )
         .await;
     }
+    tracing::debug!(
+        elapsed_ms = startup.elapsed().as_millis(),
+        "startup: memory_base"
+    );
     let memory = match memory_base.clone() {
         Some(kv) => match session_memory(kv, &router, &cancel).await {
             Ok(memory) => Some(memory),
@@ -1682,6 +1690,10 @@ pub async fn serve(
         None => None,
     };
 
+    tracing::debug!(
+        elapsed_ms = startup.elapsed().as_millis(),
+        "startup: session_memory"
+    );
     let state_dir = agent24_protocol::state_file::state_dir()
         .ok_or_else(|| std::io::Error::other("HOME not set"))?;
     let packages_root = Arc::new(agent24_os_packages::packages_root(&state_dir, ephemeral));
@@ -2063,7 +2075,12 @@ pub async fn serve(
     // module is started: a port that is taken fails startup here, rather than
     // after packages are running, on a path that would leave them to the
     // runtime's teardown instead of the ordered stop (review of SUP-4, round 4).
+    tracing::debug!(
+        elapsed_ms = startup.elapsed().as_millis(),
+        "startup: before_bind"
+    );
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    tracing::debug!(elapsed_ms = startup.elapsed().as_millis(), "startup: bound");
     let local = listener.local_addr()?;
 
     let host = process_host(
@@ -2666,6 +2683,7 @@ pub async fn serve(
         .await;
         return Ok(());
     }
+    tracing::debug!(elapsed_ms = startup.elapsed().as_millis(), "startup: ready");
     let ready = match auth_mode {
         AuthMode::LegacySingleToken => {
             legacy_ready_line(local.port(), &token, ready_omit_token, &daemon_generation)
