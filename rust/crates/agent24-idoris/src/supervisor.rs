@@ -60,6 +60,8 @@ pub enum SupervisorError {
     RestartLimit,
     #[error("iDoris supervisor I/O failed: {0}")]
     Io(#[from] io::Error),
+    #[error("installed iDoris verification failed: {0}")]
+    Installation(#[from] crate::install::InstallError),
 }
 
 /// IL-05 returns this after setup; canonicalization rejects symlink escapes.
@@ -425,6 +427,7 @@ fn exit_error(status: ExitStatus) -> SupervisorError {
 struct ManagedProcess {
     child: Child,
     group: Option<Pid>,
+    members: Vec<ProcessRecord>,
     config: Arc<StartConfig>,
     output: logs::Output,
     // Retained only in zeroizing memory for this generation and log redaction.
@@ -458,6 +461,7 @@ impl ManagedProcess {
         let mut process = Self {
             child,
             group: Some(Pid::from_raw(pid as i32)),
+            members: Vec::new(),
             config,
             output,
             _admin: token,
@@ -501,7 +505,11 @@ impl ManagedProcess {
                 }
             };
             lease.write(&record)?;
-            process.ready(spawned + process.config.timings.ready).await
+            process
+                .ready(spawned + process.config.timings.ready)
+                .await?;
+            process.remember_members()?;
+            Ok(())
         }
         .await;
         if let Err(error) = result {
@@ -522,6 +530,29 @@ impl ManagedProcess {
         }
         process.output.event("ready");
         Ok(process)
+    }
+
+    fn remember_members(&mut self) -> io::Result<()> {
+        if self.child.try_wait()?.is_none()
+            && let Some(group) = self.group
+        {
+            self.members = ProcessRecord::group_members(group)?;
+        }
+        Ok(())
+    }
+
+    fn signal_owned_group(&mut self, signal: Signal) -> io::Result<()> {
+        if let Some(group) = self.group {
+            // Once reaped, the numeric PGID alone proves no ownership. Only a
+            // previously observed member with unchanged kernel identity can
+            // authorize group cleanup. Unknown descendants are left alone.
+            if self.child.try_wait()?.is_none()
+                || self.members.iter().any(|member| member.in_group(group))
+            {
+                signal_group(group, signal)?;
+            }
+        }
+        Ok(())
     }
 
     async fn ready(&mut self, deadline: Instant) -> Result<(), SupervisorError> {
@@ -551,7 +582,23 @@ impl ManagedProcess {
                             body.extend_from_slice(&chunk);
                         }
                         validate_health(&body, self.config.lock)?;
-                        return Ok(true);
+                        let admin_url = format!(
+                            "http://127.0.0.1:{}/admin/api/v1/status",
+                            self.config.ports.admin
+                        );
+                        if let Ok(response) = client
+                            .get(admin_url)
+                            .bearer_auth(self._admin.as_str())
+                            .send()
+                            .await
+                        {
+                            return match response.status().as_u16() {
+                                200 => Ok(true),
+                                401 | 403 => Err(SupervisorError::Authentication),
+                                _ => Err(SupervisorError::Contract),
+                            };
+                        }
+                        return Ok(false);
                     }
                     if response.status().is_redirection() || response.status().is_client_error() {
                         return Err(SupervisorError::Contract);
@@ -585,7 +632,8 @@ impl ManagedProcess {
     async fn stop(&mut self) -> Result<bool, SupervisorError> {
         let group = self.group.ok_or(SupervisorError::Stopped)?;
         self.output.event("stopping");
-        signal_group(group, Signal::SIGTERM)?;
+        self.remember_members()?;
+        self.signal_owned_group(Signal::SIGTERM)?;
         let graceful = async {
             self.child.wait().await?;
             // The leader may exit before its runtime descendants. Their
@@ -604,7 +652,7 @@ impl ManagedProcess {
         };
         if forced {
             self.output.event("forced stop");
-            signal_group(group, Signal::SIGKILL)?;
+            self.signal_owned_group(Signal::SIGKILL)?;
         }
         self.child.wait().await?;
         self.group = None;
@@ -612,10 +660,8 @@ impl ManagedProcess {
         Ok(forced)
     }
     async fn finish(&mut self) -> Result<(), SupervisorError> {
-        if let Some(group) = self.group {
-            signal_group(group, Signal::SIGKILL)?;
-            self.group = None;
-        }
+        self.signal_owned_group(Signal::SIGKILL)?;
+        self.group = None;
         self.output.finish().await;
         Ok(())
     }
@@ -630,9 +676,7 @@ fn group_exists(group: Pid) -> io::Result<bool> {
 }
 impl Drop for ManagedProcess {
     fn drop(&mut self) {
-        if let Some(group) = self.group.take() {
-            let _ = signal_group(group, Signal::SIGKILL);
-        }
+        let _ = self.signal_owned_group(Signal::SIGKILL);
     }
 }
 
@@ -648,6 +692,9 @@ fn serve_command(
     budget: &Budget,
     key: Option<&str>,
 ) -> Result<Command, SupervisorError> {
+    // macOS has no fexecve: verify the installed bytes immediately before each
+    // spawn, accepting the remaining same-UID path-swap race after this check.
+    config.installed.verify_for_launch()?;
     let binary = fs::canonicalize(config.installed.binary())?;
     let directory = fs::canonicalize(config.installed.directory())?;
     if !binary.starts_with(&directory) {

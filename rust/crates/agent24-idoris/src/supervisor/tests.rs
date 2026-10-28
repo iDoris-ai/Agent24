@@ -53,6 +53,7 @@ use tokio::net::TcpListener;
 struct Fixture {
     _root: tempfile::TempDir,
     root: PathBuf,
+    proxies: std::sync::Mutex<Vec<JoinHandle<()>>>,
 }
 impl Fixture {
     fn new(scenario: serde_json::Value) -> Self {
@@ -79,13 +80,20 @@ impl Fixture {
             1,
         );
         fs::write(root.join("release/idoris"), script).unwrap();
+        for name in ["catalog.yaml", "routing-policy.yaml"] {
+            fs::write(root.join("release/config").join(name), "fixture: true\n").unwrap();
+        }
         fs::set_permissions(
             root.join("release/idoris"),
             fs::Permissions::from_mode(0o700),
         )
         .unwrap();
         fs::write(root.join("components/scenario.json"), scenario.to_string()).unwrap();
-        Self { _root: temp, root }
+        Self {
+            _root: temp,
+            root,
+            proxies: std::sync::Mutex::new(Vec::new()),
+        }
     }
     fn scenario(&self, scenario: serde_json::Value) {
         fs::write(
@@ -96,7 +104,7 @@ impl Fixture {
     }
     async fn config(&self) -> StartConfig {
         let components = ComponentsDir::new(&self.root, &self.root.join("components")).unwrap();
-        let installed = InstalledVersion::fixture(self.root.join("release"));
+        let installed = InstalledVersion::fixture(self.root.join("release")).unwrap();
         let data = DataPaths {
             db: self.root.join("db.sqlite3"),
             state: self.root.join("state"),
@@ -105,8 +113,8 @@ impl Fixture {
         config.log_dir = self.root.join("logs");
         config.diagnostic_output = true;
         config.ports = Ports {
-            data: free_port().await,
-            admin: free_port().await,
+            data: self.proxy("data").await,
+            admin: self.proxy("admin").await,
         };
         config.timings.ready = Duration::from_secs(3);
         config.timings.poll = Duration::from_millis(10);
@@ -129,13 +137,53 @@ impl Fixture {
         self.root.join("state/managed-process.json")
     }
 }
-async fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        for task in self.proxies.get_mut().unwrap().drain(..) {
+            task.abort();
+        }
+    }
+}
+impl Fixture {
+    async fn proxy(&self, kind: &'static str) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = self.root.join("state");
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (mut downstream, _) = listener.accept().await.unwrap();
+                let state = state.clone();
+                connections.spawn(async move {
+                    // Resolve the report through the current durable PID, so
+                    // a prior generation's recycled port is never forwarded.
+                    let port =
+                        fs::read(state.join("managed-process.json"))
+                            .ok()
+                            .and_then(|bytes| {
+                                let record: ProcessRecord = serde_json::from_slice(&bytes).ok()?;
+                                let bytes =
+                                    fs::read(state.join(format!("ports-{}.json", record.pid)))
+                                        .ok()?;
+                                serde_json::from_slice::<serde_json::Value>(&bytes).ok()?[kind]
+                                    .as_u64()
+                            });
+                    if let Some(port) = port
+                        && let Ok(mut upstream) =
+                            tokio::net::TcpStream::connect(("127.0.0.1", port as u16)).await
+                    {
+                        let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+                    }
+                });
+                while connections.try_join_next().is_some() {}
+            }
+        });
+        self.proxies.lock().unwrap().push(task);
+        port
+    }
+    fn release_exit(&self) {
+        fs::write(self.root.join("state/release-exit"), "exit").unwrap();
+    }
 }
 async fn inputs() -> Result<LaunchInputs, SupervisorError> {
     Ok(LaunchInputs {
@@ -288,7 +336,8 @@ async fn health_invalid_or_missing_fields_stop_child_and_never_retry() {
         .await;
         assert!(
             matches!(result, Err(SupervisorError::Contract)),
-            "missing {field}"
+            "missing {field}: {:?}",
+            result.as_ref().err()
         );
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert!(!fixture.record().exists());
@@ -307,7 +356,8 @@ async fn health_invalid_or_missing_fields_stop_child_and_never_retry() {
         let result = Supervisor::start(fixture.config().await, inputs, || async {}).await;
         assert!(
             matches!(result, Err(SupervisorError::Contract)),
-            "invalid {field}"
+            "invalid {field}: {:?}",
+            result.as_ref().err()
         );
         assert!(!fixture.record().exists());
     }
@@ -394,8 +444,9 @@ async fn crash_restarts_three_times_with_fresh_inputs_and_tokens() {
 #[tokio::test]
 async fn no_restart_for_l4_config_auth_budget_contract_or_user_stop() {
     for error_code in [1, 3] {
-        let fixture =
-            Fixture::new(serde_json::json!({"mode": "exit_after_ready", "code": error_code}));
+        let fixture = Fixture::new(
+            serde_json::json!({"mode": "exit_after_ready", "code": error_code, "wait_for_exit": true, "after": 0.0}),
+        );
         let count = Arc::new(AtomicUsize::new(0));
         let calls = count.clone();
         let supervisor = Supervisor::start(
@@ -408,6 +459,7 @@ async fn no_restart_for_l4_config_auth_budget_contract_or_user_stop() {
         )
         .await
         .unwrap();
+        fixture.release_exit();
         assert!(supervisor.wait().await.is_err());
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
@@ -418,7 +470,8 @@ async fn no_restart_for_l4_config_auth_budget_contract_or_user_stop() {
         SupervisorError::Contract,
         SupervisorError::InstanceConflict,
     ] {
-        let fixture = Fixture::new(serde_json::json!({"mode": "crash"}));
+        let fixture =
+            Fixture::new(serde_json::json!({"mode": "crash", "wait_for_exit": true, "after": 0.0}));
         let mut next_error = Some(error);
         let mut called = false;
         let supervisor = Supervisor::start(
@@ -439,6 +492,7 @@ async fn no_restart_for_l4_config_auth_budget_contract_or_user_stop() {
         )
         .await
         .unwrap();
+        fixture.release_exit();
         assert!(supervisor.wait().await.is_err());
         assert_eq!(fixture.attempts().len(), 1);
     }
@@ -481,7 +535,10 @@ async fn leftover_four_fields_must_match_before_any_signal() {
     for field in ["pid", "start_time", "executable", "uid"] {
         let mut bad = record.clone();
         match field {
-            "pid" => bad.pid = std::process::id(),
+            "pid" => {
+                bad.pid = std::process::id();
+                bad.start_time = ProcessRecord::capture(bad.pid).unwrap().start_time;
+            }
             "start_time" => bad.start_time += 1,
             "executable" => bad.executable = PathBuf::from("/different-program"),
             "uid" => bad.uid += 1,
@@ -491,10 +548,18 @@ async fn leftover_four_fields_must_match_before_any_signal() {
         let result = lease
             .recover(&timings, &CancellationToken::new(), &record.executable)
             .await;
-        assert!(
-            matches!(result, Err(SupervisorError::InstanceConflict)),
-            "{field}"
-        );
+        if field == "start_time" {
+            // A reused PID belongs to a new process. The recorded process is
+            // gone, so clear the stale record without signalling its new owner.
+            assert!(result.is_ok(), "{result:?}");
+            assert!(!fixture.record().exists());
+        } else {
+            assert!(
+                matches!(result, Err(SupervisorError::InstanceConflict)),
+                "{field}"
+            );
+            assert!(fixture.record().exists());
+        }
         assert!(
             child.try_wait().unwrap().is_none(),
             "sent a signal on {field} mismatch"
@@ -525,7 +590,8 @@ async fn real_v040_ready_then_stop() {
     .unwrap();
     fs::remove_file(fixture.root.join("components/scenario.json")).unwrap();
     let mut config = fixture.config().await;
-    config.installed = InstalledVersion::fixture(fs::canonicalize(release).unwrap());
+    config.installed = InstalledVersion::fixture(fs::canonicalize(release).unwrap()).unwrap();
+    config.ports = Ports::default();
     config.timings = Timings::default();
     config.diagnostic_output = false;
     let supervisor = Supervisor::start(
@@ -684,4 +750,252 @@ async fn blocked_or_closed_stdin_fails_handoff_within_deadline() {
     )
     .await;
     assert!(matches!(error, Err(SupervisorError::TokenHandoff)));
+}
+
+#[tokio::test]
+async fn dead_leftover_is_cleared_on_repeated_recovery() {
+    let fixture = Fixture::new(serde_json::json!({}));
+    let mut child = Command::new("/bin/sleep")
+        .arg("60")
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let record = ProcessRecord::capture(child.id().unwrap()).unwrap();
+    child.kill().await.unwrap();
+    let lease = Lease::acquire(&fixture.root.join("state")).unwrap();
+    lease.write(&record).unwrap();
+    for _ in 0..2 {
+        let result = lease
+            .recover(
+                &Timings::default(),
+                &CancellationToken::new(),
+                &record.executable,
+            )
+            .await;
+        assert!(result.is_ok(), "dead record blocks recovery: {result:?}");
+        assert!(!fixture.record().exists());
+    }
+}
+
+#[tokio::test]
+async fn reused_pid_is_cleared_without_signalling_new_owner() {
+    let fixture = Fixture::new(serde_json::json!({}));
+    let mut child = Command::new("/bin/sleep")
+        .arg("60")
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut record = ProcessRecord::capture(child.id().unwrap()).unwrap();
+    record.start_time += 1;
+    let lease = Lease::acquire(&fixture.root.join("state")).unwrap();
+    lease.write(&record).unwrap();
+    let result = lease
+        .recover(
+            &Timings::default(),
+            &CancellationToken::new(),
+            &record.executable,
+        )
+        .await;
+    let untouched = child.try_wait().unwrap().is_none();
+    child.kill().await.unwrap();
+    assert!(result.is_ok(), "reused PID blocks recovery: {result:?}");
+    assert!(!fixture.record().exists());
+    assert!(untouched, "signalled the new PID owner");
+}
+
+#[tokio::test]
+async fn foreign_health_without_child_admin_never_becomes_ready() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture = Fixture::new(serde_json::json!({"mode": "no_read"}));
+    let mut config = fixture.config().await;
+    config.ports.data = listener.local_addr().unwrap().port();
+    config.timings.ready = Duration::from_millis(200);
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            let body = healthy().to_string();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let result = Supervisor::start(config, inputs, || async {}).await;
+    server.abort();
+    let rejected = matches!(result, Err(SupervisorError::StartupTimeout));
+    if let Ok(supervisor) = result {
+        supervisor.stop().await.unwrap();
+    }
+    assert!(
+        rejected,
+        "foreign /health admitted a child that never bound"
+    );
+    assert!(!fixture.record().exists());
+}
+
+#[tokio::test]
+async fn modified_installed_files_are_rejected_before_spawn() {
+    for name in [
+        "idoris",
+        "config/catalog.yaml",
+        "config/routing-policy.yaml",
+    ] {
+        let fixture = Fixture::new(serde_json::json!({}));
+        let config = fixture.config().await;
+        let path = fixture.root.join("release").join(name);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&path, bytes).unwrap();
+        assert!(
+            serve_command(&config, &Budget { allocated_bytes: 0 }, None).is_err(),
+            "accepted changed {name}"
+        );
+        assert!(fixture.attempts().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn reaped_leader_does_not_signal_recycled_group() {
+    let fixture = Fixture::new(serde_json::json!({}));
+    let config = Arc::new(fixture.config().await);
+    let lease = Lease::acquire(&config.data.state).unwrap();
+    let mut process = ManagedProcess::start(config, inputs().await.unwrap(), &lease)
+        .await
+        .unwrap();
+    process.child.kill().await.unwrap();
+    let mut foreign = Command::new("/bin/sleep")
+        .arg("60")
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    // Model a cached PGID that now names an unrelated process group.
+    process.group = Some(Pid::from_raw(foreign.id().unwrap() as i32));
+    process.finish().await.unwrap();
+    sleep(Duration::from_millis(20)).await;
+    let untouched = foreign.try_wait().unwrap().is_none();
+    if untouched {
+        foreign.kill().await.unwrap();
+    }
+    assert!(
+        untouched,
+        "signalled a cached PGID after reaping its leader"
+    );
+}
+
+#[tokio::test]
+async fn symlinked_installed_files_are_rejected_before_spawn() {
+    for name in [
+        "idoris",
+        "config/catalog.yaml",
+        "config/routing-policy.yaml",
+    ] {
+        let fixture = Fixture::new(serde_json::json!({}));
+        let config = fixture.config().await;
+        let path = fixture.root.join("release").join(name);
+        let target = path.with_extension("original");
+        fs::rename(&path, &target).unwrap();
+        std::os::unix::fs::symlink(target, path).unwrap();
+        assert!(
+            serve_command(&config, &Budget { allocated_bytes: 0 }, None).is_err(),
+            "followed {name} symlink"
+        );
+        assert!(fixture.attempts().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn modified_binary_is_rejected_on_crash_restart() {
+    let fixture =
+        Fixture::new(serde_json::json!({"mode": "crash", "wait_for_exit": true, "after": 0.0}));
+    let supervisor = Supervisor::start(fixture.config().await, inputs, || async {})
+        .await
+        .unwrap();
+    let path = fixture.root.join("release/idoris");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes.extend_from_slice(b"\n# changed after first readiness\n");
+    fs::write(path, bytes).unwrap();
+    fixture.release_exit();
+    let result = timeout(Duration::from_secs(3), supervisor.wait())
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, Err(SupervisorError::Installation(crate::install::InstallError::HashMismatch(ref name))) if name == "idoris"),
+        "{result:?}"
+    );
+    assert_eq!(fixture.attempts().len(), 1);
+    assert!(!fixture.record().exists());
+}
+
+#[tokio::test]
+async fn admin_requires_exactly_200_and_never_restarts() {
+    for status in [204, 302, 401, 403, 500] {
+        let fixture = Fixture::new(serde_json::json!({"admin_status": status}));
+        let result = Supervisor::start(fixture.config().await, inputs, || async {}).await;
+        if matches!(status, 401 | 403) {
+            assert!(matches!(result, Err(SupervisorError::Authentication)));
+        } else {
+            assert!(matches!(result, Err(SupervisorError::Contract)));
+        }
+        assert_eq!(fixture.attempts().len(), 1);
+        assert!(!fixture.record().exists());
+    }
+}
+
+#[tokio::test]
+async fn concurrent_starts_admit_only_one_owner() {
+    let fixture = Fixture::new(serde_json::json!({}));
+    let first = fixture.config().await;
+    let second = fixture.config().await;
+    let (a, b) = tokio::join!(
+        Supervisor::start(first, inputs, || async {}),
+        Supervisor::start(second, inputs, || async {})
+    );
+    let owner = match (a, b) {
+        (Ok(owner), Err(SupervisorError::InstanceConflict))
+        | (Err(SupervisorError::InstanceConflict), Ok(owner)) => owner,
+        _ => panic!("concurrent starts did not elect exactly one owner"),
+    };
+    assert_eq!(fixture.attempts().len(), 1);
+    owner.stop().await.unwrap();
+    assert!(!fixture.record().exists());
+}
+
+#[tokio::test]
+async fn recovery_waits_for_reaping_before_checking_group() {
+    let fixture = Fixture::new(serde_json::json!({}));
+    let mut child = Command::new("/bin/sleep")
+        .arg("60")
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let record = ProcessRecord::capture(child.id().unwrap()).unwrap();
+    let lease = Lease::acquire(&fixture.root.join("state")).unwrap();
+    lease.write(&record).unwrap();
+    let reaper = tokio::spawn(async move {
+        sleep(Duration::from_millis(60)).await;
+        child.wait().await.unwrap()
+    });
+    let result = lease
+        .recover(
+            &Timings::default(),
+            &CancellationToken::new(),
+            &record.executable,
+        )
+        .await;
+    reaper.await.unwrap();
+    assert!(result.is_ok(), "zombie group blocked recovery: {result:?}");
+    assert!(!fixture.record().exists());
 }

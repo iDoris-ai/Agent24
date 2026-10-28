@@ -6,6 +6,7 @@ import json
 import os
 import re
 import signal
+import hmac
 import sys
 import threading
 import time
@@ -72,9 +73,16 @@ for field in scenario.get('missing', []):
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        assert self.path == '/health'
-        payload = json.dumps(health).encode()
-        self.send_response(scenario.get('http_status', 200))
+        if self.server.is_admin:
+            assert self.path == '/admin/api/v1/status'
+            authorized = hmac.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + secret.decode())
+            status = scenario.get('admin_status', 200) if authorized else 401
+            payload = b'{}'
+        else:
+            assert self.path == '/health'
+            status = scenario.get('http_status', 200)
+            payload = json.dumps(health).encode()
+        self.send_response(status)
         self.send_header('Content-Length', str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -84,9 +92,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
 class Server(http.server.HTTPServer):
     allow_reuse_address = True
 
-server = Server(('127.0.0.1', int(os.environ['IDORIS_PORT'])), Handler)
+# Bind ephemeral ports directly. Rust keeps stable proxy listeners reserved
+# throughout each fixture's lifetime, forwarding only to these reported ports.
+server = Server(('127.0.0.1', 0), Handler)
+server.is_admin = False
+admin = Server(('127.0.0.1', 0), Handler)
+admin.is_admin = True
+ports = state / 'ports.tmp'
+ports.write_text(json.dumps({'data': server.server_port, 'admin': admin.server_port}))
+ports.replace(state / f'ports-{os.getpid()}.json')
+threading.Thread(target=admin.serve_forever, daemon=True).start()
+
+def exit_when_requested(action):
+    if scenario.get('wait_for_exit'):
+        while not (state / 'release-exit').exists():
+            time.sleep(0.005)
+    time.sleep(scenario.get('after', 0.15))
+    action()
+
 if mode == 'crash':
-    threading.Timer(scenario.get('after', 0.15), lambda: os.kill(os.getpid(), signal.SIGKILL)).start()
+    threading.Thread(target=exit_when_requested, args=(lambda: os.kill(os.getpid(), signal.SIGKILL),), daemon=True).start()
 if mode == 'exit_after_ready':
-    threading.Timer(scenario.get('after', 0.15), lambda: os._exit(scenario['code'])).start()
+    threading.Thread(target=exit_when_requested, args=(lambda: os._exit(scenario['code']),), daemon=True).start()
 server.serve_forever()

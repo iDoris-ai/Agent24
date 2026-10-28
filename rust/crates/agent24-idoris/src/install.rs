@@ -74,11 +74,44 @@ impl InstallOptions {
 #[derive(Debug)]
 pub struct InstalledVersion {
     directory: PathBuf,
+    // Derived from the pinned archive at install time, never a disk receipt.
+    manifest: Manifest,
 }
 impl InstalledVersion {
     #[cfg(test)]
-    pub(crate) fn fixture(directory: PathBuf) -> Self {
-        Self { directory }
+    pub(crate) fn fixture(directory: PathBuf) -> Result<Self, InstallError> {
+        let manifest = [
+            "idoris",
+            "config/catalog.yaml",
+            "config/routing-policy.yaml",
+        ]
+        .into_iter()
+        .map(|name| {
+            let mut file = open_regular(&directory.join(name))?;
+            Ok((
+                name.to_owned(),
+                digest(&mut file, &CancellationToken::new())?,
+            ))
+        })
+        .collect::<Result<_, InstallError>>()?;
+        Ok(Self {
+            directory,
+            manifest,
+        })
+    }
+
+    pub(crate) fn verify_for_launch(&self) -> Result<(), InstallError> {
+        for (name, expected) in &self.manifest {
+            // O_NOFOLLOW and fstat in open_regular, then hash this same fd.
+            let file = open_regular(&self.directory.join(name))?;
+            if file.metadata()?.len() != expected.size
+                || digest(&mut file.take(expected.size + 1), &CancellationToken::new())?
+                    != *expected
+            {
+                return Err(InstallError::HashMismatch(name.clone()));
+            }
+        }
+        Ok(())
     }
 
     pub fn directory(&self) -> &Path {
@@ -245,7 +278,10 @@ fn install_blocking(
         verify_tree(&version, &expected, true, cancel)?;
         signature.verify(&version.join("idoris"), &lock.team_id)?;
         check_cancel(cancel)?;
-        return Ok(InstalledVersion { directory: version });
+        return Ok(InstalledVersion {
+            directory: version,
+            manifest: expected,
+        });
     }
     let available = (opts.available_space)(&root).map_err(InstallError::SpaceUnknown)?;
     check_cancel(cancel)?;
@@ -291,6 +327,7 @@ fn install_blocking(
         check_cancel(cancel)?;
         Ok(InstalledVersion {
             directory: version.clone(),
+            manifest: expected,
         })
     })();
     if result.is_err() {

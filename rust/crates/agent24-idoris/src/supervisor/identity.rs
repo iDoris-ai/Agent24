@@ -27,6 +27,35 @@ pub(super) struct ProcessRecord {
     pub uid: u32,
 }
 impl ProcessRecord {
+    pub fn in_group(&self, group: Pid) -> bool {
+        Self::capture(self.pid).is_ok_and(|actual| self.verify(&actual).is_ok())
+            && getpgid(Some(Pid::from_raw(self.pid as i32))) == Ok(group)
+    }
+
+    pub fn group_members(group: Pid) -> io::Result<Vec<Self>> {
+        #[cfg(target_os = "macos")]
+        let pids = {
+            use libproc::processes::{ProcFilter, pids_by_type};
+            pids_by_type(ProcFilter::All)?
+        };
+        #[cfg(target_os = "linux")]
+        let pids: Vec<u32> = fs::read_dir("/proc")?
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+            .collect();
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let pids: Vec<u32> = Vec::new();
+        Ok(pids
+            .into_iter()
+            .filter_map(|pid| {
+                if getpgid(Some(Pid::from_raw(pid as i32))) != Ok(group) {
+                    return None;
+                }
+                let record = Self::capture(pid).ok()?;
+                record.in_group(group).then_some(record)
+            })
+            .collect())
+    }
+
     #[cfg(target_os = "macos")]
     pub fn capture(pid: u32) -> io::Result<Self> {
         use libproc::libproc::{
@@ -98,15 +127,34 @@ impl ProcessRecord {
             .map_err(|_| SupervisorError::InstanceConflict)?;
         Ok(())
     }
+    async fn wait_for_exit(&self, deadline: Instant) -> Result<bool, SupervisorError> {
+        loop {
+            let alive = self.alive();
+            if matches!(alive, Ok(false)) {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return alive.map(|_| false);
+            }
+            // macOS can return ESRCH from pidinfo for an unreaped zombie while
+            // kill(pid, 0) still succeeds. Retry uncertainty without signalling;
+            // only a verified live identity may authorize escalation.
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
     pub(super) fn alive(&self) -> Result<bool, SupervisorError> {
+        if self.pid <= 1 || i32::try_from(self.pid).is_err() {
+            return Err(SupervisorError::InstanceConflict);
+        }
         #[cfg(target_os = "macos")]
         {
             use libproc::libproc::{bsd_info::BSDInfo, proc_pid::pidinfo};
             match pidinfo::<BSDInfo>(self.pid as i32, 0) {
                 Ok(info) => {
-                    if info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec != self.start_time
-                        || info.pbi_uid != self.uid
-                    {
+                    if info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec != self.start_time {
+                        return Ok(false);
+                    }
+                    if info.pbi_uid != self.uid {
                         return Err(SupervisorError::InstanceConflict);
                     }
                     Ok(info.pbi_status != 5)
@@ -120,10 +168,26 @@ impl ProcessRecord {
         #[cfg(target_os = "linux")]
         {
             match fs::read_to_string(format!("/proc/{}/stat", self.pid)) {
-                Ok(stat) => stat
-                    .rsplit_once(')')
-                    .map(|(_, rest)| !rest.trim_start().starts_with('Z'))
-                    .ok_or(SupervisorError::InstanceConflict),
+                Ok(stat) => {
+                    let fields: Vec<_> = stat
+                        .rsplit_once(')')
+                        .ok_or(SupervisorError::InstanceConflict)?
+                        .1
+                        .split_whitespace()
+                        .collect();
+                    let start: u64 = fields
+                        .get(19)
+                        .and_then(|v| v.parse().ok())
+                        .ok_or(SupervisorError::InstanceConflict)?;
+                    if start != self.start_time {
+                        return Ok(false);
+                    }
+                    use std::os::unix::fs::MetadataExt;
+                    if fs::metadata(format!("/proc/{}", self.pid))?.uid() != self.uid {
+                        return Err(SupervisorError::InstanceConflict);
+                    }
+                    Ok(fields.first().is_some_and(|state| *state != "Z"))
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
                 Err(_) => Err(SupervisorError::InstanceConflict),
             }
@@ -161,6 +225,13 @@ pub(super) fn private_open(path: &Path) -> io::Result<File> {
 pub(super) struct Lease {
     _lock: File,
     record: PathBuf,
+}
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // A concurrent fork may retain the open file description until exec.
+        // Release ownership now instead of waiting for its CLOEXEC close.
+        let _ = fs2::FileExt::unlock(&self._lock);
+    }
 }
 impl Lease {
     pub fn acquire(state: &Path) -> Result<Self, SupervisorError> {
@@ -220,6 +291,12 @@ impl Lease {
         }
         let record: ProcessRecord =
             serde_json::from_slice(&body).map_err(|_| SupervisorError::InstanceConflict)?;
+        // ESRCH or a different start time means the recorded process is gone.
+        // Never signal the new owner of a recycled PID, even if its path matches.
+        if !record.alive()? {
+            self.clear()?;
+            return Ok(());
+        }
         if record.executable != fs::canonicalize(executable)? {
             return Err(SupervisorError::InstanceConflict);
         }
@@ -228,28 +305,46 @@ impl Lease {
         }
         record.signal(Signal::SIGTERM)?;
         let deadline = Instant::now() + timings.terminate;
-        while record.alive()? && Instant::now() < deadline {
-            sleep(Duration::from_millis(20)).await;
-        }
-        if record.alive()? {
+        if !record.wait_for_exit(deadline).await? {
             record.signal(Signal::SIGKILL)?;
             let deadline = Instant::now() + Duration::from_secs(5);
-            while record.alive()? && Instant::now() < deadline {
-                sleep(Duration::from_millis(20)).await;
+            if !record.wait_for_exit(deadline).await? {
+                return Err(SupervisorError::InstanceConflict);
             }
         }
-        if record.alive()? {
-            return Err(SupervisorError::InstanceConflict);
-        }
-        if super::group_exists(Pid::from_raw(record.pid as i32))
+        let group_deadline = Instant::now() + Duration::from_secs(5);
+        while super::group_exists(Pid::from_raw(record.pid as i32))
             .map_err(|_| SupervisorError::InstanceConflict)?
         {
-            // No live leader remains to re-check all four identity fields.
-            // Preserve the record instead of guessing which descendants to kill.
-            return Err(SupervisorError::InstanceConflict);
+            // A zombie leader retains its group until its parent reaps it.
+            // Allow reaping to complete without sending any further signals.
+            if Instant::now() >= group_deadline {
+                // Unknown descendants cannot authorize group signalling.
+                return Err(SupervisorError::InstanceConflict);
+            }
+            sleep(Duration::from_millis(20)).await;
         }
         self.clear()?;
         Ok(())
     }
 }
 use std::time::Duration;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_lease_unlocks_inherited_descriptors() {
+        let directory = tempfile::tempdir().unwrap();
+        let lease = Lease::acquire(directory.path()).unwrap();
+        // dup retains the same open file description, just as a concurrent
+        // fork does before exec closes its inherited CLOEXEC descriptors.
+        let inherited = lease._lock.try_clone().unwrap();
+        drop(lease);
+        let next = Lease::acquire(directory.path());
+        drop(inherited);
+        assert!(next.is_ok(), "an inherited fd retained a released lease");
+    }
+}
