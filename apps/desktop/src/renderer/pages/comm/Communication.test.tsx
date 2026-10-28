@@ -67,6 +67,17 @@ describe('CommunicationPage', () => {
     expect(screen.queryByText(/刷新失败|Refresh failed|not_configured/)).toBeNull()
   })
 
+  it('not_configured because no Hyphae binary: binary guidance (not the identity command) plus the daemon detail', async () => {
+    const nc = () => new CommApiError('no Hyphae binary is configured; set A24_HYPHAE_BIN (COMM-HYPHAE.md §3)', 409, 'not_configured')
+    for (const fn of [listCommIdentities, listCommContacts, listCommRelays, getCommStatus]) vi.mocked(fn).mockRejectedValue(nc())
+    render(<CommunicationPage />)
+    expect(await screen.findByText('没有找到 Hyphae 程序，通信无法启动。请在启动 daemon 前指定它的位置，然后刷新本页：')).toBeInTheDocument()
+    expect(screen.getByText('A24_HYPHAE_BIN=/path/to/hyphae')).toBeInTheDocument()
+    expect(screen.getByText(/详情：no Hyphae binary is configured/)).toBeInTheDocument()
+    expect(screen.queryByText('agent24 comm identity create <昵称> --default')).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
   it('a real error still shows as an alert, listing only the real failure, next to the not_configured guide', async () => {
     const nc = () => new CommApiError('Not configured', 409, 'not_configured')
     vi.mocked(listCommIdentities).mockRejectedValue(nc())

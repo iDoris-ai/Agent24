@@ -4,6 +4,7 @@
 export const IpcChannels = {
   AppPing: 'app:ping',
   AppVersion: 'app:version',
+  AppSetLocale: 'app:set-locale',
   ShellOpenExternal: 'shell:open-external',
   BackendProxy: 'backend:proxy',
   BackendEndpoint: 'backend:endpoint',

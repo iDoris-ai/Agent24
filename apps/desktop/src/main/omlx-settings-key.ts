@@ -27,17 +27,39 @@ export function defaultOmlxSettingsPath(): string {
   return path.join(os.homedir(), '.omlx', 'settings.json')
 }
 
+/** Literal loopback addresses only: a name such as `localhost` is resolved by
+ *  the OS and so could point elsewhere; the key is never sent to a name. */
+const LITERAL_LOOPBACK = new Set(['127.0.0.1', '::1', '[::1]'])
+
+function isOwnedAndNotWritableByOthers(stat: fs.Stats): boolean {
+  if (process.platform === 'win32') return true
+  if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) return false
+  return (stat.mode & 0o022) === 0
+}
+
 /** The configured key and the origin it is valid for, or null if the file is
- *  missing, unreadable, not trustworthy, or holds no usable key. Never throws. */
+ *  missing, unreadable, not trustworthy, or holds no usable key. Never throws.
+ *  Cheap enough to call per request, so nothing needs to be cached (a rotated
+ *  or removed key takes effect at once). */
 export function readOmlxSettingsKey(file = defaultOmlxSettingsPath()): OmlxSettingsKey | null {
+  let fd: number | null = null
   try {
-    const stat = fs.lstatSync(file) // lstat: a symlink is refused, not followed
-    if (!stat.isFile() || stat.size > MAX_SETTINGS_BYTES) return null
-    if (process.platform !== 'win32') {
-      if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) return null
-      if ((stat.mode & 0o022) !== 0) return null
+    // The directory holding it must not be swappable by another user either.
+    if (!isOwnedAndNotWritableByOthers(fs.statSync(path.dirname(file)))) return null
+    // Open without following a symlink, then check and read THAT descriptor, so
+    // nothing can be swapped between the check and the read.
+    const noFollow = process.platform === 'win32' ? 0 : fs.constants.O_NOFOLLOW
+    fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow)
+    const stat = fs.fstatSync(fd)
+    if (!stat.isFile() || stat.size > MAX_SETTINGS_BYTES || !isOwnedAndNotWritableByOthers(stat)) return null
+    const buf = Buffer.alloc(stat.size)
+    let read = 0
+    while (read < buf.length) {
+      const n = fs.readSync(fd, buf, read, buf.length - read, read)
+      if (n === 0) break
+      read += n
     }
-    const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf8'))
+    const parsed: unknown = JSON.parse(buf.subarray(0, read).toString('utf8'))
     if (typeof parsed !== 'object' || parsed === null) return null
     const root = parsed as { auth?: { api_key?: unknown }; server?: { host?: unknown; port?: unknown } }
     const key = root.auth?.api_key
@@ -47,10 +69,12 @@ export function readOmlxSettingsKey(file = defaultOmlxSettingsPath()): OmlxSetti
     if (apiKey === '' || apiKey.length > MAX_KEY_LENGTH || /[\u0000-\u001f\u007f]/.test(apiKey)) return null
     const host = root.server?.host === undefined ? '127.0.0.1' : root.server.host
     const port = root.server?.port === undefined ? 8000 : parsePort(root.server.port)
-    if (typeof host !== 'string' || port === null) return null
+    if (typeof host !== 'string' || !LITERAL_LOOPBACK.has(host) || port === null) return null
     const base = parseLoopbackUrl(`http://${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}:${port}`)
     return base ? { url: base.origin, apiKey } : null
   } catch {
     return null
+  } finally {
+    if (fd !== null) { try { fs.closeSync(fd) } catch { /* ignore */ } }
   }
 }

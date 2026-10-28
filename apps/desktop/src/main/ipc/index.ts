@@ -8,6 +8,7 @@ import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } f
 import { daemonCliEndpoint, daemonConnection, getBackendEndpoint } from '../backend-manager'
 import { findAllowedRoute, proxyError, proxyRequest, timeoutFor } from '../backend-proxy'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
+import { mt, setMainLocale, isMainLocale } from '../main-i18n'
 import { readOmlxSettingsKey } from '../omlx-settings-key'
 import type { IpcGuard } from './guard'
 import { documentsCall } from '../documents'
@@ -39,23 +40,25 @@ function configuredOmlxKey(): string {
   return (process.env['OMLX_API_KEY'] ?? '').trim()
 }
 
-/** A key read from the user's own `~/.omlx/settings.json`. It lives only here,
- *  in main-process memory: it is attached to requests for exactly the origin it
- *  was verified against and is never returned over IPC or logged. */
-let discoveredOmlxKey: { origin: string; apiKey: string } | null = null
+/** Where to look for the user's own `~/.omlx/settings.json` (test seam). */
+let omlxSettingsPath: string | undefined
 
-/** The key to send for `base`: what the caller supplied, or — when it sent none
- *  — the discovered key, but only for the very origin it was verified on. */
+/** The key to send for `base`: what the caller supplied or — when it sent none —
+ *  the one in the user's own oMLX config, but only for the exact address that
+ *  config says oMLX listens on. It is re-read every time (so a rotated or
+ *  removed key is honoured at once), lives only in main-process memory, and is
+ *  never returned over IPC or logged. */
 function effectiveOmlxKey(base: URL, supplied: string): string {
   if (supplied) return supplied
-  return discoveredOmlxKey && discoveredOmlxKey.origin === base.origin ? discoveredOmlxKey.apiKey : ''
+  const fromFile = readOmlxSettingsKey(omlxSettingsPath)
+  return fromFile && new URL(fromFile.url).origin === base.origin ? fromFile.apiKey : ''
 }
 
 interface OmlxProbeCandidate { url: string; apiKey: string; fromSettings?: boolean }
 
-function omlxProbeCandidates(settingsPath?: string): OmlxProbeCandidate[] {
+function omlxProbeCandidates(): OmlxProbeCandidate[] {
   const key = configuredOmlxKey()
-  const fromFile = readOmlxSettingsKey(settingsPath)
+  const fromFile = readOmlxSettingsKey(omlxSettingsPath)
   return [
     // Keyed probe only when a key is configured.
     ...(key ? [{ url: 'http://127.0.0.1:8088', apiKey: key }] : []),
@@ -123,7 +126,11 @@ function probeOmlx(url: unknown, apiKey: string): Promise<OmlxProbe> {
         res.on('end', () => {
           try {
             const body = JSON.parse(Buffer.concat(chunks).toString()) as { data?: { id: string }[] }
-            resolve({ models: (body.data ?? []).map((m) => m.id), authRequired: false })
+            // Only plain string ids, and never one that echoes the key back
+            // (a reflecting server must not turn into a way to hand it on).
+            const models = (body.data ?? []).map((m) => m.id)
+              .filter((id): id is string => typeof id === 'string' && (key === '' || !id.includes(key)))
+            resolve({ models, authRequired: false })
           } catch { resolve({ models: [], authRequired: false }) }
         })
       },
@@ -199,7 +206,7 @@ async function confirmNative(event: IpcMainInvokeEvent, message: string, detail:
   const win = BrowserWindow.fromWebContents(event.sender)
   const opts: Electron.MessageBoxOptions = {
     type: 'warning',
-    buttons: ['确认', '取消'],
+    buttons: [mt('dialog.confirm'), mt('dialog.cancel')],
     defaultId: 1,
     cancelId: 1,
     message,
@@ -216,7 +223,7 @@ async function confirmNative(event: IpcMainInvokeEvent, message: string, detail:
 
 /** Shortens text for the native dialog, and says so (with the full length) when it did. */
 const clip = (text: string, max: number): string =>
-  text.length > max ? `${text.slice(0, max)}…（已截断，共 ${text.length} 字符）` : text
+  text.length > max ? `${text.slice(0, max)}${mt('clip.truncated', { length: text.length })}` : text
 
 // eslint-disable-next-line no-control-regex
 const hasControlChars = (text: string): boolean => /[\u0000-\u001f\u007f]/.test(text)
@@ -228,7 +235,7 @@ const DECISION_SHAPE = /^[a-z_]{1,64}$/
 let sensitiveBusy = false
 async function exclusive(fn: () => Promise<BackendProxyResponse>): Promise<BackendProxyResponse> {
   if (sensitiveBusy) {
-    return { ok: false, status: 429, data: { error: { code: 'busy', message: '另一项需要确认的操作正在进行' } } }
+    return { ok: false, status: 429, data: { error: { code: 'busy', message: mt('err.busy') } } }
   }
   sensitiveBusy = true
   try {
@@ -239,7 +246,7 @@ async function exclusive(fn: () => Promise<BackendProxyResponse>): Promise<Backe
 }
 
 const cancelled = (): BackendProxyResponse =>
-  ({ ok: false, status: 499, data: { error: { code: 'cancelled', message: '操作已取消' } } })
+  ({ ok: false, status: 499, data: { error: { code: 'cancelled', message: mt('err.cancelled') } } })
 const invalidRequest = (message: string): BackendProxyResponse =>
   ({ ok: false, status: 400, data: { error: { code: 'invalid_request', message } } })
 
@@ -250,17 +257,17 @@ export function registerIpcHandlers(options: {
   /** A3: every handler below is registered through this (sender validation). */
   guard: IpcGuard
 }): void {
+  omlxSettingsPath = options.omlxSettingsPath
   const handle: typeof ipcMain.handle = (channel, listener) => ipcMain.handle(channel, options.guard(listener))
   // oMLX: auto-detect running server
   handle(IpcChannels.OmlxDetect, async (): Promise<OmlxDetectResult | OmlxAuthRequiredResult | null> => {
     let authRequiredAt: string | null = null
-    for (const candidate of omlxProbeCandidates(options.omlxSettingsPath)) {
+    for (const candidate of omlxProbeCandidates()) {
       const probe = await probeOmlx(candidate.url, candidate.apiKey)
       if (probe.models.length > 0) {
         if (candidate.fromSettings) {
-          // Verified: remember it for this origin in main only. The renderer
-          // is handed an empty key, never the one from the user's config file.
-          discoveredOmlxKey = { origin: new URL(candidate.url).origin, apiKey: candidate.apiKey }
+          // The renderer is handed an empty key, never the one from the user's
+          // config file; main re-reads it for later requests to this address.
           return { url: candidate.url, apiKey: '', models: probe.models }
         }
         return { url: candidate.url, apiKey: candidate.apiKey, models: probe.models }
@@ -372,6 +379,11 @@ export function registerIpcHandlers(options: {
     options.idorisStatus?.() ?? Promise.resolve({ state: 'unavailable', reason: 'handoff-missing' }),
   )
 
+  // The renderer reports its UI language so the tray and native dialogs follow it.
+  handle(IpcChannels.AppSetLocale, (_event, locale: unknown): void => {
+    if (isMainLocale(locale)) setMainLocale(locale)
+  })
+
   handle(IpcChannels.AppPing, () => 'pong')
   handle(IpcChannels.AppVersion, () => app.getVersion())
   handle(IpcChannels.ShellOpenExternal, (_event, url: unknown) => {
@@ -445,29 +457,32 @@ export function registerIpcHandlers(options: {
 
       const rec = await proxyToBackend({ method: 'GET', path: `/api/v1/approvals/${id}` })
       if (!rec.ok || typeof rec.data !== 'object' || rec.data === null) {
-        return { ok: false, status: rec.status === 404 ? 404 : 502, data: { error: { code: 'approval_unavailable', message: '读不到该审批的真实记录，已拒绝操作' } } }
+        return { ok: false, status: rec.status === 404 ? 404 : 502, data: { error: { code: 'approval_unavailable', message: mt('err.approvalUnavailable') } } }
       }
       const a = rec.data as {
         kind?: unknown; summary?: unknown; payload?: unknown; run_id?: unknown; status?: unknown; available_decisions?: unknown
       }
       if (a.status !== undefined && a.status !== 'pending') {
-        return { ok: false, status: 409, data: { error: { code: 'not_pending', message: `审批已处于 ${String(a.status)} 状态` } } }
+        return { ok: false, status: 409, data: { error: { code: 'not_pending', message: mt('err.notPending', { status: String(a.status) }) } } }
       }
       // The record's own decision list wins when it has one.
       if (Array.isArray(a.available_decisions) && !a.available_decisions.includes(d.type)) {
         return invalidRequest('decision not offered for this approval')
       }
-      const label: Record<string, string> = { approve: '批准', approve_for_session: '本会话内一律批准', deny: '拒绝', abort: '中止' }
+      const decisionLabels: Record<string, string> = {
+        approve: mt('approval.approve'), approve_for_session: mt('approval.approve_for_session'),
+        deny: mt('approval.deny'), abort: mt('approval.abort'),
+      }
       const payload = clip(JSON.stringify(a.payload ?? {}), 600)
       const detail = [
-        `类型：${clip(String(a.kind ?? '?'), 40)}`,
-        `摘要：${clip(String(a.summary ?? ''), 300)}`,
-        `运行：${clip(String(a.run_id ?? '?'), 80)}`,
-        `详情：${payload}`,
-        typeof d.reason === 'string' && d.reason ? `页面备注（仅供参考）：${clip(d.reason, 200)}` : '',
-        '此决定会立即生效，且可能无法撤销。',
+        mt('approval.kind', { value: clip(String(a.kind ?? '?'), 40) }),
+        mt('approval.summary', { value: clip(String(a.summary ?? ''), 300) }),
+        mt('approval.run', { value: clip(String(a.run_id ?? '?'), 80) }),
+        mt('approval.details', { value: payload }),
+        typeof d.reason === 'string' && d.reason ? mt('approval.note', { value: clip(d.reason, 200) }) : '',
+        mt('approval.warning'),
       ].filter(Boolean).join('\n')
-      const ok = await confirmNative(event, `确认对审批 ${id} 做出「${label[d.type as string] ?? d.type}」决定？`, detail)
+      const ok = await confirmNative(event, mt('approval.message', { id, decision: decisionLabels[d.type as string] ?? d.type }), detail)
       if (!ok) return cancelled()
       return proxyToBackend({
         method: 'POST',
@@ -487,12 +502,16 @@ export function registerIpcHandlers(options: {
       const mods = (list.data as { modules?: { name?: unknown; enabled?: unknown; version?: unknown }[] } | null)?.modules
       const mod = list.ok && Array.isArray(mods) ? mods.find((m) => m.name === name) : undefined
       if (!mod) {
-        return { ok: false, status: 404, data: { error: { code: 'module_unavailable', message: '守护进程没有该领域模块，已拒绝操作' } } }
+        return { ok: false, status: 404, data: { error: { code: 'module_unavailable', message: mt('err.moduleUnavailable') } } }
       }
       const ok = await confirmNative(
         event,
-        `确认将领域模块「${name}」${mod.enabled === true ? '由 启用 改为' : mod.enabled === false ? '由 停用 改为' : '改为'} ${enabled ? '启用' : '停用'}？`,
-        `版本：${clip(String(mod.version ?? '?'), 40)}\n立即生效：停用会立刻撤销该模块的 consent 并停止它。`,
+        mt('module.change', {
+          name,
+          from: mod.enabled === true ? mt('module.fromEnabled') : mod.enabled === false ? mt('module.fromDisabled') : '',
+          to: enabled ? mt('module.enabled') : mt('module.disabled'),
+        }),
+        mt('module.detail', { version: clip(String(mod.version ?? '?'), 40) }),
       )
       if (!ok) return cancelled()
       return proxyToBackend({ method: 'PATCH', path: `/api/v1/os/${encodeURIComponent(name)}`, body: { enabled } })

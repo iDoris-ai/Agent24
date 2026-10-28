@@ -48,9 +48,19 @@ export function getLocale(): Locale {
   return current
 }
 
+/** Tell the main process which language the UI is in, so the tray and native
+ * dialogs follow it. Best effort: absent outside Electron (tests). */
+export function reportLocaleToMain(l: Locale = current): void {
+  try {
+    void (globalThis as { window?: { agent24?: { setUiLocale?: (l: string) => Promise<void> } } })
+      .window?.agent24?.setUiLocale?.(l)?.catch(() => { /* main not listening */ })
+  } catch { /* ignore */ }
+}
+
 export function setLocale(l: Locale): void {
   if (!isLocale(l)) return
   try { globalThis.localStorage?.setItem(LOCALE_STORAGE_KEY, l) } catch { /* not persisted; still switch */ }
+  reportLocaleToMain(l)
   if (l === current) return
   current = l
   applyHtmlLang(l)

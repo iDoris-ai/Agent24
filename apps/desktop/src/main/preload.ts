@@ -34,6 +34,7 @@ import {
 
 const api = {
   ping: (): Promise<string> => ipcRenderer.invoke(IpcChannels.AppPing),
+  setUiLocale: (locale: string): Promise<void> => ipcRenderer.invoke(IpcChannels.AppSetLocale, locale),
   getAppVersion: (): Promise<string> => ipcRenderer.invoke(IpcChannels.AppVersion),
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke(IpcChannels.ShellOpenExternal, url),
   backendProxy: (req: BackendProxyRequest): Promise<BackendProxyResponse> =>

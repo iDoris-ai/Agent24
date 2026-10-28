@@ -48,6 +48,7 @@ const trustedEvent = { senderFrame: mainFrame, sender: { isDestroyed: () => fals
 
 let daemon: http.Server
 let modelsRequireKey: string | null = null
+let reflectAuthAsModel = false
 const settingsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-omlx-settings-'))
 const settingsFile = path.join(settingsDir, 'settings.json')
 let seen: { method?: string; url?: string; auth?: string; body: string }[] = []
@@ -62,6 +63,8 @@ beforeAll(async () => {
       if (req.url === '/v1/models' && modelsRequireKey && req.headers.authorization !== `Bearer ${modelsRequireKey}`) {
         res.statusCode = 401
         res.end(JSON.stringify({ error: 'unauthorized' }))
+      } else if (req.url === '/v1/models' && reflectAuthAsModel) {
+        res.end(JSON.stringify({ data: [{ id: String(req.headers.authorization ?? '') }, { id: 'm1' }, { id: 7 }] }))
       } else if (req.url === '/v1/models') res.end(JSON.stringify({ data: [{ id: 'm1' }] }))
       else if (req.method === 'GET' && req.url === '/api/v1/approvals/ap_1') {
         res.end(JSON.stringify({
@@ -107,6 +110,7 @@ afterAll(() => {
 
 beforeEach(() => {
   modelsRequireKey = null
+  reflectAuthAsModel = false
   fs.rmSync(settingsFile, { force: true })
   seen = []
   showMessageBox.mockReset()
@@ -183,7 +187,7 @@ describe('A1 backendProxy allowlist', () => {
       expect(opts.detail).toContain('run_real')
       expect(opts.detail).toContain('exec')
       expect(opts.detail).toContain('/tmp/real')
-      expect(opts.detail).toContain('页面备注（仅供参考）：harmless readme tweak')
+      expect(opts.detail).toContain('Note from the page (for reference only): harmless readme tweak')
     })
     it('approve_for_target (offered by the daemon) goes through: one dialog, one POST', async () => {
       showMessageBox.mockResolvedValue({ response: 0 })
@@ -203,8 +207,8 @@ describe('A1 backendProxy allowlist', () => {
       showMessageBox.mockResolvedValue({ response: 1 })
       await call(IpcChannels.ApprovalDecide, 'ap_long', { type: 'approve' })
       const opts = showMessageBox.mock.calls[0]!.at(-1) as { detail: string }
-      expect(opts.detail).toContain('（已截断，共 500 字符）')
-      expect(opts.detail).toMatch(/（已截断，共 \d{4} 字符）/)
+      expect(opts.detail).toContain('(truncated, 500 characters in total)')
+      expect(opts.detail).toMatch(/\(truncated, \d{4} characters in total\)/)
     })
     it('daemon 404 -> refused without any dialog or POST', async () => {
       const res = await call(IpcChannels.ApprovalDecide, 'ap_missing', { type: 'approve' })
@@ -243,10 +247,10 @@ describe('A1 backendProxy allowlist', () => {
       await call(IpcChannels.OsModuleSetEnabled, 'sin90', true)
       const opts = showMessageBox.mock.calls[0]!.at(-1) as { message: string; detail: string }
       expect(opts.message).toContain('sin90')
-      expect(opts.message).toContain('停用 改为 启用')
+      expect(opts.message).toContain('from disabled to enabled')
       expect(opts.detail).toContain('0.5.0')
-      expect(opts.detail).toContain('立即生效')
-      expect(opts.detail).not.toContain('重启后生效')
+      expect(opts.detail).toContain('Takes effect immediately')
+      expect(opts.detail).not.toContain('takes effect after restart')
     })
     it('a module the daemon does not list is refused without a dialog', async () => {
       const res = await call(IpcChannels.OsModuleSetEnabled, 'ghost', true)
@@ -499,15 +503,33 @@ describe('oMLX 401 and the key from ~/.omlx/settings.json', () => {
     }
   })
 
-  it('the discovered key is only attached for the origin it was verified on', async () => {
+  it('the key goes only to the exact address settings.json names (not localhost, not another port)', async () => {
     modelsRequireKey = SECRET
     writeSettings(goodSettings())
-    await call(IpcChannels.OmlxDetect)
-    seen = []
-    // a different loopback origin (same server, other host spelling) gets no key
     const res = await call(IpcChannels.OmlxModels, `http://localhost:${endpoint.port}`, '')
     expect(res).toMatchObject({ ok: false, authRequired: true })
     expect(seen.every((r) => r.auth === undefined)).toBe(true)
+  })
+
+  it('a rotated key is used at once; a removed settings file stops it being sent', async () => {
+    modelsRequireKey = 'k2'
+    writeSettings({ auth: { api_key: 'k1' }, server: { port: endpoint.port } })
+    expect(await call(IpcChannels.OmlxModels, url(), '')).toMatchObject({ ok: false, authRequired: true })
+    writeSettings({ auth: { api_key: 'k2' }, server: { port: endpoint.port } })
+    expect(await call(IpcChannels.OmlxModels, url(), '')).toMatchObject({ ok: true })
+    fs.rmSync(settingsFile)
+    seen = []
+    expect(await call(IpcChannels.OmlxModels, url(), '')).toMatchObject({ ok: false, authRequired: true })
+    expect(seen.every((r) => r.auth === undefined)).toBe(true)
+  })
+
+  it('a server that echoes the key back as a model id cannot hand it to the renderer', async () => {
+    reflectAuthAsModel = true
+    writeSettings(goodSettings())
+    const models = await call(IpcChannels.OmlxModels, url(), '')
+    expect(models).toMatchObject({ ok: true, models: ['m1'] })
+    const detect = await call(IpcChannels.OmlxDetect)
+    expect(JSON.stringify([models, detect])).not.toContain(SECRET)
   })
 
   it.each([
@@ -515,6 +537,7 @@ describe('oMLX 401 and the key from ~/.omlx/settings.json', () => {
     ['no api_key', () => writeSettings({ auth: {}, server: { port: endpoint.port } })],
     ['empty api_key', () => writeSettings({ auth: { api_key: '  ' }, server: { port: endpoint.port } })],
     ['control chars in key', () => writeSettings({ auth: { api_key: 'a\r\nX-Evil: 1' }, server: { port: endpoint.port } })],
+    ['localhost by name', () => writeSettings({ auth: { api_key: SECRET }, server: { host: 'localhost', port: endpoint.port } })],
     ['non-loopback host', () => writeSettings({ auth: { api_key: SECRET }, server: { host: '192.168.2.32', port: endpoint.port } })],
     ['malformed JSON', () => fs.writeFileSync(settingsFile, '{nope', { mode: 0o600 })],
   ])('settings.json ignored (%s): key never sent, result is authRequired', async (_name, setup) => {
@@ -534,5 +557,20 @@ describe('oMLX 401 and the key from ~/.omlx/settings.json', () => {
     expect(res).toMatchObject({ authRequired: true })
     expect(seen.every((r) => r.auth === undefined)).toBe(true)
     fs.rmSync(real)
+  })
+})
+
+
+describe('app:set-locale', () => {
+  it('switches the main-process language for dialogs, ignoring junk', async () => {
+    const { getMainLocale, resetMainLocaleForTest } = await import('../main-i18n')
+    resetMainLocaleForTest()
+    expect(getMainLocale()).toBe('en')
+    await call(IpcChannels.AppSetLocale, 'zh')
+    expect(getMainLocale()).toBe('zh')
+    await call(IpcChannels.AppSetLocale, { evil: true })
+    await call(IpcChannels.AppSetLocale, 'fr')
+    expect(getMainLocale()).toBe('zh')
+    resetMainLocaleForTest()
   })
 })

@@ -40,7 +40,11 @@ export default function DocumentsPage() {
   const [loadingMore, setLoadingMore] = useState(false)
   const [listError, setListError] = useState<string | null>(null)
   const [unavailable, setUnavailable] = useState<string | null>(null)
-  const [notInstalled, setNotInstalled] = useState(false)
+  // Each endpoint reports on its own; the notice is shown while either says
+  // "no route", and never hides another endpoint's real error.
+  const [capsMissing, setCapsMissing] = useState(false)
+  const [listMissing, setListMissing] = useState(false)
+  const notInstalled = capsMissing || listMissing
   const [open, setOpen] = useState<string | null>(null)
   // The title that opened the details, given focus back when they close;
   // the page's title if a reload has since taken its row away (a document
@@ -59,15 +63,15 @@ export default function DocumentsPage() {
     const res = await api.request({ op: 'list' })
     if (gen !== generation.current) return
     if (moduleNotInstalled(res)) {
-      setNotInstalled(true)
+      setListMissing(true)
       setListError(null)
       return
     }
+    setListMissing(false)
     if (!res.ok) {
       setListError(describeError(res))
       return
     }
-    setNotInstalled(false)
     setListError(null)
     setDocs(res.data.documents)
     setMore(res.data.next_cursor ? { gen, cursor: res.data.next_cursor } : null)
@@ -93,7 +97,8 @@ export default function DocumentsPage() {
     let live = true
     void api.request({ op: 'capabilities' }).then((res) => {
       if (!live) return
-      if (moduleNotInstalled(res)) setNotInstalled(true)
+      setCapsMissing(moduleNotInstalled(res))
+      if (moduleNotInstalled(res)) setUnavailable(null)
       else if (!res.ok) setUnavailable(describeError(res))
       else setUnavailable(res.data.storage.state === 'ready' ? null : STORAGE_UNAVAILABLE)
     })
@@ -134,7 +139,7 @@ export default function DocumentsPage() {
           <code>{t('notInstalled.command')}</code>
         </div>
       )}
-      {!notInstalled && unavailable && (
+      {unavailable && (
         <div role="alert" style={ALERT}>
           {unavailable === STORAGE_UNAVAILABLE ? t('storage.unavailable') : unavailable}
         </div>
@@ -164,7 +169,7 @@ export default function DocumentsPage() {
           </button>
         )}
       </div>
-      {!notInstalled && (error || listError) && (
+      {(error || listError) && (
         <div role="alert" style={ALERT}>
           {error ?? listError}
         </div>

@@ -131,6 +131,13 @@ describe('DocumentsPage: the list', () => {
     expect(screen.queryByText(/No v1 route/)).toBeNull()
   })
 
+  it('capabilities says no route but the list has a real error: the error is still shown', async () => {
+    mount({ capabilities: () => err(404, 'not_found', 'No v1 route'), lists: [() => err(500, 'internal', 'list exploded')] })
+    render(<DocumentsPage />)
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('list exploded'))
+    expect(screen.getByText('文档模块未安装')).toBeInTheDocument()
+  })
+
   it('a real list error (500) is still shown as an alert and import stays enabled', async () => {
     mount({ lists: [() => err(500, 'internal', 'boom')] })
     render(<DocumentsPage />)

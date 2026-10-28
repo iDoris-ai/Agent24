@@ -82,7 +82,7 @@ export default function CommunicationPage() {
   const [relays, setRelays] = useState<CommRelayConfig | null>(null)
   const [daemon, setDaemon] = useState<CommDaemonStatus | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
-  const [notConfigured, setNotConfigured] = useState(false)
+  const [notConfigured, setNotConfigured] = useState<{ kind: 'binary' | 'identity'; detail: string } | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [pending, setPending] = useState<WriteAction | null>(null)
   const [password, setPassword] = useState('')
@@ -101,11 +101,11 @@ export default function CommunicationPage() {
     ])
     if (!mounted.current || token !== sequence.current) return
     const failures: string[] = []
-    let missingSetup = false
+    const setupMessages: string[] = []
     // `not_configured` means "no Hyphae identity yet": a state to guide the
     // user out of, not a failed refresh. Only other rejections are errors.
     const fail = (key: 'error.identities' | 'error.contacts' | 'error.relays' | 'error.process', reason: unknown) => {
-      if (reason instanceof CommApiError && reason.code === 'not_configured') { missingSetup = true; return }
+      if (reason instanceof CommApiError && reason.code === 'not_configured') { setupMessages.push(reason.message); return }
       failures.push(translate(communicationMessages, key, { message: messageOf(reason) }))
     }
     if (results[0].status === 'fulfilled') setIdentities(results[0].value)
@@ -116,7 +116,12 @@ export default function CommunicationPage() {
     else fail('error.relays', results[2].reason)
     if (results[3].status === 'fulfilled') setDaemon(results[3].value)
     else fail('error.process', results[3].reason)
-    setNotConfigured(missingSetup)
+    // Why it is not configured decides the guidance: the daemon uses this one
+    // code both for "no Hyphae program found" and for "no identity yet".
+    setNotConfigured(setupMessages.length === 0 ? null : {
+      kind: setupMessages.some((m) => /hyphae binary|A24_HYPHAE_BIN/i.test(m)) ? 'binary' : 'identity',
+      detail: setupMessages[0] ?? '',
+    })
     setLoadError(failures.length ? translate(communicationMessages, 'error.refresh', { details: failures.join(translate(communicationMessages, 'error.separator')) }) : null)
     setRefreshing(false)
   }, [])
@@ -166,8 +171,8 @@ export default function CommunicationPage() {
     }
   }
 
-  const isFresh = !loadError && !notConfigured && !refreshing && daemon !== null
-  const setupOnly = notConfigured && !loadError
+  const isFresh = !loadError && notConfigured === null && !refreshing && daemon !== null
+  const setupOnly = notConfigured !== null && !loadError
   return (
     <main className="content comm-page">
       <header className="comm-heading">
@@ -184,8 +189,14 @@ export default function CommunicationPage() {
       {notConfigured && (
         <section className="comm-card" role="status" aria-label={t('setup.title')}>
           <h2>{t('setup.title')}</h2>
-          <p className="comm-muted">{t('setup.guide')}</p>
-          <p><code>{t('setup.command')}</code></p>
+          {notConfigured.kind === 'binary' ? <>
+            <p className="comm-muted">{t('setup.binaryGuide')}</p>
+            <p><code>{t('setup.binaryCommand')}</code></p>
+          </> : <>
+            <p className="comm-muted">{t('setup.guide')}</p>
+            <p><code>{t('setup.command')}</code></p>
+          </>}
+          {notConfigured.detail && <p className="comm-muted">{t('setup.detail', { detail: notConfigured.detail })}</p>}
         </section>
       )}
 
