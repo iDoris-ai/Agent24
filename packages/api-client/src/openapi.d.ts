@@ -1683,7 +1683,7 @@ export interface paths {
         };
         /**
          * Per-recipient delivery state of one send
-         * @description `groupchat status`. Tier CommRead (daily). A logical id Hyphae does not know is `502 upstream`.
+         * @description `groupchat status`. Tier CommRead (daily). A logical id Hyphae does not know is `400 invalid` (since Hyphae v0.27.2; `502 upstream` on 0.27.1).
          */
         get: operations["getCommGroupMessageStatus"];
         put?: never;
