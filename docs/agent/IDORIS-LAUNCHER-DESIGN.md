@@ -271,6 +271,22 @@ Admin token 的生成和禁止持久化来自 #588 §1「Admin token 交接」�
 | 已定 | L6：共用 HYAP444FN9，自 v0.4.0 签名并公证；launcher 不支持未签名的 v0.3.x。 |
 | iDoris | 升级 schema 兼容矩阵、一致备份与恢复方法，DB 的 WAL 关闭保证；未明确前禁自动升级与无损回滚承诺。 |
 
+### 13.1 iDoris 冻结答复（2026-10-28，[iDoris#588 评论](https://github.com/iDoris-ai/iDoris/issues/588#issuecomment-6460128833)）
+
+| 条目 | 冻结结论 | 对本设计的影响 |
+| --- | --- | --- |
+| 托管宿主 | 接受 agent24d 作为执行宿主；iDoris 规范 v0.4.0 把「Agent24 不启动 iDoris」改为「agent24d 是执行宿主」，数据面规则不变 | §3 推荐方案成立，§13 第 1 行关闭 |
+| L1 停止 | SIGTERM 与 SIGINT 都优雅停止，最多 10 秒 | §6 停止：SIGTERM，12 秒未退再 SIGKILL |
+| 退出码 | 0 正常；1 失败或超时；**3 = 同一 DB 已有实例**（L4） | §6/§11 的 L4 映射用退出码 3，其他非零不当作实例冲突 |
+| key 子命令与实例锁 | issue/list/revoke 不受实例锁限制，服务运行中可用；revoke 立即生效 | §7 支持在线轮换，删除「先停 serve 再操作 key」的预案 |
+| L2 setup | 只写 out-dir 及其同级的 `.idoris-setup-*` 临时目录；oMLX key **只从 stdin 读取**，不读环境变量；错误码 10 个，已冻结 | §5/§8：out-dir 放在托管根下一层；setup 的 key 改走 stdin，不用 `IDORIS_OMLX_API_KEY` 环境变量 |
+| 签发结果丢失时的归属 | 每次签发用唯一 owner `agent24d:<install_id>:<nonce>`，丢失后按 owner 调 list 找到再 revoke | §7 补偿流程按此实现；owner 不再固定为 `agent24` |
+| L5 就绪 | 只看 /health；兼容规则：major 必须为 1，minor 不低于所需能力对应的版本 | §6 就绪校验和 #1435 的契约检查保持一致；锁里记录所需的最低 minor |
+| 模型默认 | 不做静态分档；最少只绑 daily，是否绑 deep 由用户选择 | §8 的分档表降为候选展示，不作为默认绑定 |
+| 升级、备份、WAL | 放到 M-IDL2 再定 | 与 §14.1 一致 |
+
+iDoris 侧 PR：#586（capabilities）、#587（运行时 headroom）、#589（key list/revoke）、#590（setup omlx）、#591（SIGTERM 与实例锁）。全部合入后发布 v0.4.0（签名并公证）。IL-01 等 v0.4.0 发布后再开工，锁里填入它的 tag 和 sha256。
+
 ## 14. 按依赖顺序拆分实施
 
 下列每片包含自己的行为测试，源代码、测试和手写契约合计最多 300 行；生成文件按仓库规则另计。达到上限继续拆片，不能用巨大框架预埋后续行为。所有安全、授权、数据写入和 wire 片等 PR-Daemon APPROVE。[A3]
