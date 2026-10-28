@@ -38,9 +38,13 @@
 | P1 | CORE-2b | ProductHost 1 小时 TTL + 父管道续期；事件按主体过滤、吊销断连 | S-05 / C-03 / C-13 | ab/core | L |
 | P1 | ID-ERR-1 | iDoris v0.3.2 的 `502` + `error.type=upstream_auth_failed` 映射为终态 `Rejected`（不重试、不换 provider），提示检查 `IDORIS_OMLX_API_KEY`；现 `idoris.rs` 把 5xx 一律当 `Unavailable` | iDoris#583/#582 | ab/idoris（等 v0.3.2） | S |
 | P1 | REV-10 | `VerifiedBinary::install`（agent24-comm）写出可执行文件后立刻 exec：多线程 daemon 中其它线程 fork 会继承写 fd → Linux 首次安装 Hyphae 偶发 ETXTBSY。改为子进程写入或对 spawn 的 ETXTBSY 有界重试 | #1429 发现 | ab/core 或 COMM 线 | S |
-| P2 | FLAKY-1 | `agent24d --test module_tool_card` 偶发失败：高负载下超时（#1432），以及 `no_package_identity`（#1433），疑似时序问题 | 10-28 两次 | ab/kernel | S |
+| P2 | FLAKY-1 | 计时类偶发失败：`agent24d --test module_tool_card` 高负载超时（#1432）与一次 `no_package_identity`（#1433）；`agent24-cli --test attach_cli` 三项本机高负载 19 s 超时（10-28）；`agent24-memory` `wal_maintenance::writers_are_not_stalled_while_a_big_wal_is_checkpointed` 在 macOS CI 得 `Busy`（#1443 run 40658076329）。查根因，产品竞态修产品，测试假设错改条件等待，不靠加大超时 | 10-28 多次 | mini Codex 进行中 | S |
 | P2 | CI-HYB | CI 没有设 `HYPHAE_TEST_BIN`，`groupchat_real_binary` 在 CI 里被跳过；改为用 `Reproduce Hyphae linux-x64` 产物跑 | #1431 R4 | COMM | S |
-| P1 | AE-PAIR | AgentEar 在桌面端开着时配对失败：capabilities 模式下 daemon.json 没有 bearer，CLI attach 报 host authority unavailable。jason 10-28 拍板：不做临时修复，走 CORE-2 每客户端 enroll（ab/core）进 main 解决 | 10-28 人工测试 | ab/core CORE-2 | M |
+| P1 | AE-PAIR | AgentEar 在桌面端开着时配对失败：capabilities 模式下 daemon.json 没有 bearer，CLI attach 报 host authority unavailable。jason 10-28 拍板：不做临时修复，走 CORE-2 每客户端 enroll（ab/core）进 main 解决 | 10-28 人工测试 | ab/core CORE-2 | M；10-28 下午开 CORE-2 AgentEar 纵切：#1448（S1+S2）、#1447（S3 桌面确认）、#1446（S4 CLI 登记），计划 `docs/agent/CORE-2-AGENTEAR-SLICE.md` |
+| P1 | CORE-2-FULL | CORE-2 完整方案（jason 10-28：纵切发版后立即执行）：2c 余项（Linux 签名清单、FD 登记权、配对码退路）；2b 余项（ProductHost 有限 TTL 与父管道续期、开发者令牌 Q6/R3）；2d 余项（Swift LocalAuthentication/Touch ID helper、headless 提供者）；2f 余项（TUI 与桌面自身改走登记、LaunchAgent 服务安装、backendProxy 收窄、G-API）；提升入口按操作逐个开放，每个须先有基于正文的确认摘要 | AE-PAIR 后续 | ab/core | L |
+| P2 | CORE2-S4-DELEGATE | `agent24 os delegate <name>`（#1448 为过覆盖门新增）要在 S4 接入登记与 `presence_required` 自动提升；当前与其他命令一样只在 legacy 可用 | #1448 | ab/core（S4 #1446） | S |
+| P3 | TRAY-DETAIL | 托盘 error 状态不再显示 `BackendManager::statusDetail()`（中文长句不受界面语言控制）；把 detail 做成可本地化字段（协议版本、pid）后再放回托盘/提示 | #1443 Low-1 | ab/core | S |
+| P3 | OFFLINE-CLOSE | 离线入口「先 `Store::close()` 再释放单例锁」的顺序没有测试守护（PR-Daemon 变异 M2 存活）；补能观察到 WAL 句柄/锁顺序的测试或写明不变量 | #1443 Low-2 | ab/core | S |
 | P2 | SW-1 | `self_wake` 工具接受过去时间（模型常编 2026-07-28），导致立刻触发；上限只数未触发行，已触发 at 行永不回收（本机 200 条）。拒绝过去时间或钳到 now+ε；daemon 侧对已触发 at 行做保留期回收 | #1434 调查 | ab/core | S |
 | P1 | ID-HR | iDoris v0.4.0：503 必须先看 reason_code，`headroom_confirmation_required` 时去问用户并带 `X-iDoris-Headroom-Breach: confirmed` 重发，不得当普通 Unavailable 重试或换 provider；/capabilities 1.1 字段（degraded_alternative(s)、headroom_breach_option 含 quant、备选含 capability）；另：503 `supervisor_busy` = 同模型正以不同余量确认加载中，稍后用同一请求头重试、不问用户；`headroom_breach_option` 按「哪个条目带该字段」定位，不按 resident:true 找，快照内最多一次（iDoris#586/#587） | idoris-25 10-28 | ab/idoris | M |
 | P2 | G-API-3b | `ApiErrorCode` 枚举统一 Rust/OpenAPI/桌面三处错误码清单 | C-07 | ab/core | M |
