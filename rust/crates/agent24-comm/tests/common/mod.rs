@@ -16,12 +16,15 @@
 //! the same inode, which stays "open for write" under its new name.
 //!
 //! What does work: let a short-lived child process (`cp`) do the writing.
-//! The writable fd then only ever exists inside that child, which is not a
-//! fork of this multithreaded process (it cannot be copied into anybody
-//! else's child), and we wait for it to exit before anything execs the file.
-//! `chmod` afterwards opens no fd. `VerifiedBinary::install` is then called
-//! as usual and takes its `AlreadyExists` branch (read + hash only, no
+//! The target's writable fd is opened by `cp` only AFTER its exec, so it lives
+//! solely in `cp`'s own descriptor table; a fork by any other thread of this
+//! process cannot copy it. We wait for `cp` to exit before anything execs the
+//! file. `chmod` afterwards opens no fd. `VerifiedBinary::install` is then
+//! called as usual and takes its `AlreadyExists` branch (read + hash only, no
 //! write), so product code is exercised unchanged.
+//!
+//! Contract: one call per `install_dir` (each test owns a private tempdir);
+//! not safe for concurrent calls that share a destination.
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
 use std::os::unix::fs::PermissionsExt;
