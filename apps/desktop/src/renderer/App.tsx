@@ -277,7 +277,7 @@ function AppShell(): JSX.Element {
         {page === 'creative'         && <CreativePage />}
         {page === 'models'           && <ModelsPage />}
         {page === 'memory'           && <MemoryPage />}
-        {page === 'settings'         && <SettingsPage initialTab={route.kind === 'page' ? route.initialTab : undefined} />}
+        {page === 'settings'         && <SettingsPage key={route.kind === 'page' ? route.key : undefined} initialTab={route.kind === 'page' ? route.initialTab : undefined} />}
         {page === 'capabilities'     && <CapabilitiesPage statusFor={statusFor} onOpenSettings={() => open('settings/general', 'capabilities')} />}
         {page === 'modules-manager'  && <ModulesManagerPage />}
         {page === 'module:hello'     && <HelloModule />}

@@ -64,9 +64,9 @@ describe('capability routing', () => {
     }
     window.agent24 = { backendProxy: vi.fn().mockResolvedValue({ ok: false }) } as unknown as Window['agent24']
     render(<CapabilitiesProvider><Actions /></CapabilitiesProvider>)
-    for (const initialTab of ['general', 'activity']) {
+    for (const [key, initialTab] of ['general', 'activity'].entries()) {
       fireEvent.click(screen.getByRole('button', { name: `settings/${initialTab}` }))
-      expect(screen.getByLabelText('Route')).toHaveTextContent(JSON.stringify({ kind: 'page', page: 'settings', initialTab }))
+      expect(screen.getByLabelText('Route')).toHaveTextContent(JSON.stringify({ kind: 'page', page: 'settings', initialTab, key: key + 1 }))
     }
     fireEvent.click(screen.getByRole('button', { name: 'settings/unknown' }))
     expect(screen.getByLabelText('Route')).toHaveTextContent('"initialTab":"activity"')

@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react'
 import { App, pickChatModel, extractDaemonDefaultModel } from './App'
 import { LOCALE_STORAGE_KEY, setLocale } from './i18n'
+import { SETTINGS_TAB_STORAGE_KEY } from './pages/Settings'
 
 const mockBackendProxy = vi.fn()
 const mockModulesList = vi.fn()
@@ -17,7 +18,7 @@ const mockIdorisStatus = vi.fn()
 beforeEach(() => {
   vi.clearAllMocks()
   mockGetAppVersion.mockResolvedValue('1.0.0')
-  mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { status: 'ok', ts: Date.now(), schedules: [] } })
+  mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { status: 'ok', ts: Date.now(), schedules: [], runs: [] } })
   mockModulesList.mockResolvedValue([])
   mockOmlxDetect.mockResolvedValue({ ok: true, models: ['Qwen3-8B-4bit'] })
   mockBackendEndpoint.mockResolvedValue({ port: 60128 })
@@ -36,6 +37,10 @@ beforeEach(() => {
       getNavPrefs: vi.fn().mockResolvedValue({ pinned: ['documents', 'design', 'create'], slotCount: 3, showOverview: true }),
       setNavPrefs: mockSetNavPrefs,
       idorisStatus: mockIdorisStatus,
+      agentearSnapshot: vi.fn().mockResolvedValue([]),
+      modelCallSnapshot: vi.fn().mockResolvedValue([]),
+      onAgentEarEvent: vi.fn(() => () => {}),
+      onModelCallEvent: vi.fn(() => () => {}),
       documents: {
         request: vi.fn(({ op }: { op: string }) => Promise.resolve({ ok: true, status: 200, data:
           op === 'list' ? { documents: [], next_cursor: null } : { storage: { state: 'ready' } },
@@ -378,16 +383,44 @@ describe('App navigation integration', () => {
   })
 
   it('opens Settings from both switcher actions and the full-slots link, and opens Capabilities from the switcher', async () => {
+    window.localStorage.setItem(SETTINGS_TAB_STORAGE_KEY, 'voice')
     await act(async () => { render(<App />) })
-    for (const target of ['settings/activity', 'settings/general']) {
+    for (const [target, tab] of [['settings/activity', 'Activity'], ['settings/general', 'General']]) {
       await switchTo(target)
       expect(screen.getByText('Settings', { selector: '.page-title' })).toBeInTheDocument()
+      expect(screen.getByRole('tab', { name: tab, selected: true })).toBeInTheDocument()
+      expect(screen.getByRole('tabpanel', { name: tab })).toBeInTheDocument()
+      if (tab === 'Activity') expect(screen.getByRole('group', { name: 'Activity summary' })).toBeInTheDocument()
+      else expect(screen.getByLabelText('Language')).toBeInTheDocument()
       expect(screen.queryByRole('navigation', { name: 'Breadcrumb' })).not.toBeInTheDocument()
     }
+    fireEvent.click(screen.getByRole('tab', { name: 'Activity' }))
     await switchTo('capabilities')
     expect(screen.getByRole('heading', { level: 1, name: 'Capabilities' })).toBeInTheDocument()
     await act(async () => { fireEvent.click(screen.getByRole('link', { name: 'Settings › General' })) })
     expect(screen.getByText('Settings', { selector: '.page-title' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'General', selected: true })).toBeInTheDocument()
+    expect(screen.getByTestId('slot-count')).toHaveTextContent('3')
+  })
+
+  it('opens the Voice capability from its Settings tab', async () => {
+    await act(async () => { render(<App />) })
+    fireEvent.click(nav().getByRole('button', { name: 'Settings' }))
+    fireEvent.click(screen.getByRole('tab', { name: 'Voice' }))
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Open Voice' })) })
+    expect(screen.getByText('Voice (AgentEar)', { selector: '.page-title' })).toBeInTheDocument()
+    expect(screen.getByLabelText('Make it speak')).toBeInTheDocument()
+    expect(screen.queryByRole('tablist', { name: 'Settings sections' })).not.toBeInTheDocument()
+  })
+
+  it('reapplies a switcher target after manually changing tabs on the same Settings page', async () => {
+    await act(async () => { render(<App />) })
+    for (const [target, tab] of [['settings/general', 'General'], ['settings/activity', 'Activity']]) {
+      await switchTo(target)
+      fireEvent.click(screen.getByRole('tab', { name: 'Voice' }))
+      await switchTo(target)
+      expect(screen.getByRole('tab', { name: tab, selected: true })).toBeInTheDocument()
+    }
   })
 
   it('keeps default status labels when iDoris and Hyphae status cannot be obtained', async () => {
