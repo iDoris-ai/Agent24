@@ -16,8 +16,9 @@ sha2 = "0.10"
 subtle = "2"
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 tokio-util = "0.7"
-
-[dev-dependencies]
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
+fs2 = "0.4"
 tempfile = "3"
 
 [lints]

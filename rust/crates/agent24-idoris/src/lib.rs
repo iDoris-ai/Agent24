@@ -1,6 +1,7 @@
 //! Pinned iDoris release metadata and launcher contract compatibility.
 
 pub mod download;
+pub mod install;
 
 use semver::Version;
 use serde::Deserialize;
