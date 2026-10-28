@@ -665,6 +665,12 @@ mod tests {
                     continue;
                 }
                 walk_rs(&p, f);
+            } else if p.file_name().is_some_and(|n| n == "tests.rs") {
+                // A `tests.rs` file is a unit-test module pulled in by
+                // `#[cfg(test)] mod tests;`; it never ships in the daemon. The
+                // same reasoning as `tests/` above: opt-in real-binary knobs such
+                // as `IDORIS_TEST_BINARY` live there and are never forwarded.
+                continue;
             } else if p.extension().is_some_and(|x| x == "rs") {
                 f(&p);
             }
