@@ -55,22 +55,27 @@ fn response_error(error: ModelError) -> ModelError {
     }
 }
 
-/// Reads at most 4 KiB of an error body, cancellably, and returns only the
-/// fixed `reason_code` (or `error.type`); nothing else from the body is ever
-/// surfaced. Shared by the 503 and 502 handling.
-async fn error_reason_code(
+#[derive(Default)]
+struct GatewayError {
+    reason_code: Option<String>,
+    remediation: Option<String>,
+}
+
+/// Read only the reason and confirmation guidance from a capped, cancellable body.
+async fn error_fields(
     mut response: reqwest::Response,
     cancel: &CancellationToken,
-) -> Result<Option<String>, ModelError> {
+) -> Result<GatewayError, ModelError> {
     let read = async {
         let mut body = Vec::new();
         while body.len() < 4096 {
             match response.chunk().await {
-                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                Ok(Some(chunk)) => {
+                    body.extend_from_slice(&chunk[..chunk.len().min(4096 - body.len())])
+                }
                 _ => break,
             }
         }
-        body.truncate(4096);
         body
     };
     let body = tokio::select! {
@@ -79,14 +84,21 @@ async fn error_reason_code(
         body = read => body,
     };
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return Ok(None);
+        return Ok(GatewayError::default());
     };
-    Ok(value
+    let reason_code = value
         .pointer("/error/reason_code")
         .or_else(|| value.get("reason_code"))
         .or_else(|| value.pointer("/error/type"))
         .and_then(|v| v.as_str())
-        .map(str::to_owned))
+        .map(str::to_owned);
+    Ok(GatewayError {
+        reason_code,
+        remediation: value
+            .pointer("/error/remediation")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
 }
 
 impl IdorisClient {
@@ -127,6 +139,7 @@ impl IdorisClient {
         &self,
         request: reqwest::RequestBuilder,
         cancel: &CancellationToken,
+        role: &str,
     ) -> Result<reqwest::Response, ModelError> {
         let response = tokio::select! {
             biased;
@@ -138,8 +151,17 @@ impl IdorisClient {
         if !status.is_success() {
             let code = status.as_u16();
             if code == 503 || code == 502 {
-                let reason = error_reason_code(response, cancel).await?;
-                match (code, reason.as_deref()) {
+                let fields = error_fields(response, cancel).await?;
+                match (code, fields.reason_code.as_deref()) {
+                    (503, Some("headroom_confirmation_required")) => {
+                        return Err(ModelError::IdorisHeadroomConfirmationRequired {
+                            role: role.to_owned(),
+                            remediation: fields.remediation,
+                        });
+                    }
+                    (503, Some("supervisor_busy")) => {
+                        return Err(ModelError::IdorisSupervisorBusy);
+                    }
                     (503, Some("local_only_unavailable")) => {
                         return Err(ModelError::Unavailable(
                             "no local model available in iDoris (local_only_unavailable)".into(),
@@ -187,6 +209,7 @@ impl IdorisClient {
                     .get(self.endpoint("/health"))
                     .timeout(Duration::from_secs(2)),
                 cancel,
+                "",
             )
             .await?;
         let identity: Identity = read_json_capped(response, 4096, cancel, "iDoris")
@@ -250,7 +273,28 @@ impl IdorisClient {
         if let Some(trace_id) = request_id.and_then(correlation_trace_id) {
             call = call.header("X-iDoris-Trace-Id", trace_id);
         }
-        let response = self.send(call.json(&body), cancel).await?;
+        if req.idoris_headroom_confirmed {
+            call = call.header("X-iDoris-Headroom-Breach", "confirmed");
+        }
+        let call = call.json(&body);
+        let mut retries = 0;
+        let response = loop {
+            let attempt = call
+                .try_clone()
+                .ok_or_else(|| invalid("cannot replay iDoris request"))?;
+            match self.send(attempt, cancel, role).await {
+                Err(ModelError::IdorisSupervisorBusy) if retries < 3 => {
+                    let delay = Duration::from_secs(1 << retries);
+                    retries += 1;
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return Err(ModelError::Cancelled),
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                }
+                result => break result?,
+            }
+        };
         // Evidence headers must be unambiguous: absent, or exactly one valid UTF-8
         // value. Repeated or non-UTF-8 values are contradictory evidence and fail closed.
         let header = |name: &str| -> Result<Option<&str>, ModelError> {
@@ -333,6 +377,7 @@ impl IdorisClient {
                     .header(AUTHORIZATION, self.key.clone())
                     .timeout(Duration::from_secs(2)),
                 cancel,
+                "",
             )
             .await?;
         #[derive(Deserialize)]
@@ -394,7 +439,9 @@ mod tests {
     use crate::router::Privacy;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    async fn hanging_gateway() -> (
+    async fn hanging_gateway(
+        busy: bool,
+    ) -> (
         IdorisClient,
         tokio::sync::oneshot::Receiver<()>,
         tokio::task::JoinHandle<()>,
@@ -431,6 +478,12 @@ mod tests {
                     }
                 }
                 if data.starts_with(b"POST ") {
+                    if busy {
+                        let body = r#"{"error":{"reason_code":"supervisor_busy"}}"#;
+                        socket.write_all(format!("HTTP/1.1 503 X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                        sent.take().unwrap().send(()).unwrap();
+                        continue;
+                    }
                     sent.take().unwrap().send(()).unwrap();
                     std::future::pending::<()>().await;
                 }
@@ -462,6 +515,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            idoris_headroom_confirmed: false,
             progress: None,
             temperature: None,
         };
@@ -497,6 +551,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            idoris_headroom_confirmed: false,
             progress: None,
             temperature: Some(0.7),
         };
@@ -553,7 +608,7 @@ mod tests {
         };
         let request = gateway.client.get(&url);
         gateway
-            .send(request, &CancellationToken::new())
+            .send(request, &CancellationToken::new(), "idoris/daily")
             .await
             .unwrap_err()
     }
@@ -642,7 +697,12 @@ mod tests {
         let request = gateway.client.get(&url);
         let task = tokio::spawn({
             let cancel = cancel.clone();
-            async move { gateway.send(request, &cancel).await.unwrap_err() }
+            async move {
+                gateway
+                    .send(request, &cancel, "idoris/daily")
+                    .await
+                    .unwrap_err()
+            }
         });
         tokio::time::sleep(Duration::from_millis(500)).await;
         cancel.cancel();
@@ -715,7 +775,12 @@ mod tests {
         let request = gateway.client.get(&url);
         let task = tokio::spawn({
             let cancel = cancel.clone();
-            async move { gateway.send(request, &cancel).await.unwrap_err() }
+            async move {
+                gateway
+                    .send(request, &cancel, "idoris/daily")
+                    .await
+                    .unwrap_err()
+            }
         });
         tokio::time::sleep(Duration::from_millis(500)).await;
         cancel.cancel();
@@ -729,7 +794,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_after_real_post_terminates_pending_response() {
-        let (gateway, received, server) = hanging_gateway().await;
+        let (gateway, received, server) = hanging_gateway(false).await;
         let cancel = CancellationToken::new();
         let task = tokio::spawn(pending_call(cancel.clone(), gateway));
         received.await.unwrap();
@@ -743,8 +808,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supervisor_busy_backoff_is_cancellable() {
+        let (gateway, received, server) = hanging_gateway(true).await;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(pending_call(cancel.clone(), gateway));
+        received.await.unwrap();
+        // Let the response reach the backoff, which must not wait out its timer.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .unwrap()
+            .unwrap();
+        server.abort();
+        assert!(matches!(result, Err(ModelError::Cancelled)), "{result:?}");
+    }
+
+    #[tokio::test]
     async fn full_request_deadline_terminates_after_real_post() {
-        let (gateway, received, server) = hanging_gateway().await;
+        let (gateway, received, server) = hanging_gateway(false).await;
         let task = tokio::spawn(pending_call(CancellationToken::new(), gateway));
         received.await.unwrap();
         let result = tokio::time::timeout(Duration::from_secs(3), task)
