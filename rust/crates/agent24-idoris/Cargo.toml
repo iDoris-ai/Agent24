@@ -7,7 +7,7 @@ repository.workspace = true
 
 [dependencies]
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = "2"
 semver = "1"
 url = "2"
@@ -19,15 +19,17 @@ tokio-util = "0.7"
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
 fs2 = "0.4"
-tempfile = "3"
+rustix = { version = "1", features = ["fs", "process"] }
 zeroize = "1"
+base64 = "0.22"
+tempfile = "3"
 nix = { version = "0.31", features = ["signal", "process", "user"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libproc = "0.14"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["net", "test-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "test-util"] }
 
 [lints]
 workspace = true

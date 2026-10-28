@@ -1,6 +1,10 @@
 //! Install immutable iDoris releases using a dedicated writer process.
 
-use crate::{IdorisLock, download::VerifiedArchive};
+use crate::{
+    IdorisLock,
+    download::{MAX_ARCHIVE_BYTES, VerifiedArchive, hash_matches},
+    storage::{open_regular, private_directory},
+};
 use flate2::read::MultiGzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -10,7 +14,9 @@ use std::{
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
+    time::Duration,
 };
+use tokio_util::sync::CancellationToken;
 
 pub const MAX_UNPACKED_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -18,6 +24,8 @@ pub const MAX_UNPACKED_BYTES: u64 = 512 * 1024 * 1024;
 pub enum InstallError {
     #[error("iDoris installation is already in progress")]
     Busy,
+    #[error("iDoris installation cancelled")]
+    Cancelled,
     #[error("insufficient installation space: need {required}, available {available}")]
     InsufficientSpace { required: u64, available: u64 },
     #[error("installation space is unknown: {0}")]
@@ -43,6 +51,7 @@ pub trait SignatureVerifier {
     fn verify(&self, binary: &Path, team_id: &str) -> Result<(), InstallError>;
 }
 
+#[derive(Clone)]
 pub struct InstallOptions {
     pub root: PathBuf,
     pub child_program: PathBuf,
@@ -134,7 +143,6 @@ struct FileDigest {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChildRequest {
-    archive: PathBuf,
     sha256: String,
     staging: PathBuf,
     files: Vec<String>,
@@ -152,14 +160,41 @@ enum ChildReply {
 /// IL-07/IL-10 should dispatch that subcommand directly to run_install_child,
 /// before starting threads or loading credentials. The tiny binary in this
 /// crate is the integration-test adapter, not a second launcher.
-pub fn install_locked_asset(
+pub async fn install_locked_asset(
+    lock: &IdorisLock,
+    triple: &str,
+    archive: &VerifiedArchive,
+    opts: &InstallOptions,
+    signature: impl SignatureVerifier + Send + 'static,
+    cancel: &CancellationToken,
+) -> Result<InstalledVersion, InstallError> {
+    let (lock, triple, archive, opts) = (
+        lock.clone(),
+        triple.to_owned(),
+        archive.clone(),
+        opts.clone(),
+    );
+    let token = cancel.child_token();
+    let _cancel_on_drop = token.clone().drop_guard();
+    // The worker owns the operation lock and staging guard. Dropping this
+    // future cancels its work without unlocking while disk I/O is in flight.
+    tokio::task::spawn_blocking(move || {
+        install_blocking(&lock, &triple, &archive, &opts, &signature, &token)
+    })
+    .await
+    .map_err(|e| io::Error::other(e.to_string()))?
+}
+
+fn install_blocking(
     lock: &IdorisLock,
     triple: &str,
     archive: &VerifiedArchive,
     opts: &InstallOptions,
     signature: &dyn SignatureVerifier,
+    cancel: &CancellationToken,
 ) -> Result<InstalledVersion, InstallError> {
     signature.check_platform()?;
+    check_cancel(cancel)?;
     let asset = lock
         .asset_for(triple)
         .ok_or(InstallError::UnsupportedPlatform)?;
@@ -181,31 +216,40 @@ pub fn install_locked_asset(
         return Err(violation("invalid signing team"));
     }
     validate_files(&asset.files)?;
-    private_dir(&opts.root)?;
+    if let Some(parent) = opts.root.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    private_directory(&opts.root)?;
     let root = fs::canonicalize(&opts.root)?;
     let _operation_lock = operation_lock(&root)?;
     for name in ["data", "instances"] {
         private_dir(&root.join(name))?;
     }
     let request = ChildRequest {
-        archive: fs::canonicalize(&archive.path)?,
         sha256: asset.sha256.clone(),
         staging: PathBuf::new(),
         files: asset.files.clone(),
         limit: opts.max_unpacked_bytes.min(MAX_UNPACKED_BYTES),
     };
-    if archive.sha256 != asset.sha256 {
+    if !hash_matches(&archive.sha256, &asset.sha256) {
         return Err(InstallError::HashMismatch("archive".into()));
     }
+    // Open the untrusted path exactly once without following links, then keep
+    // a bounded immutable snapshot of that fd's bytes. Hashing, parent scanning
+    // and the child's pipe input all use this same snapshot, so path swaps or
+    // in-place writes cannot change the bytes extracted after verification.
+    let bytes = read_archive_bytes(open_regular(&archive.path)?, &asset.sha256, cancel)?;
     let version = root.join(version_name);
     if fs::symlink_metadata(&version).is_ok() {
-        let expected = scan_archive(&request, false)?;
-        verify_tree(&version, &expected, true)?;
+        let expected = scan_archive(&request, &bytes, false, cancel)?;
+        verify_tree(&version, &expected, true, cancel)?;
         signature.verify(&version.join("idoris"), &lock.team_id)?;
+        check_cancel(cancel)?;
         return Ok(InstalledVersion { directory: version });
     }
     let available = (opts.available_space)(&root).map_err(InstallError::SpaceUnknown)?;
-    let compressed = fs::metadata(&request.archive)?.len();
+    check_cancel(cancel)?;
+    let compressed = bytes.len() as u64;
     let required = compressed
         .saturating_add(request.limit)
         .saturating_add(1024 * 1024);
@@ -225,12 +269,12 @@ pub fn install_locked_asset(
     };
     // Derive authoritative sizes and hashes from the pinned archive, never an
     // editable receipt in the installed directory or an untrusted child reply.
-    let expected = scan_archive(&request, false)?;
-    let extracted = invoke_child(opts, &request)?;
+    let expected = scan_archive(&request, &bytes, false, cancel)?;
+    let extracted = invoke_child(opts, &request, &bytes, cancel)?;
     if extracted != expected {
         return Err(InstallError::HashMismatch("child manifest".into()));
     }
-    verify_tree(staging.path(), &expected, false)?;
+    verify_tree(staging.path(), &expected, false, cancel)?;
     for name in expected.keys() {
         // chmod does not open the executable inode for writing (#1429).
         let path = staging.path().join(name);
@@ -238,11 +282,13 @@ pub fn install_locked_asset(
         File::open(&path)?.sync_all()?;
     }
     sync_dirs(staging.path())?;
+    check_cancel(cancel)?;
     fs::rename(staging.path(), &version)?;
     // Keep rollback under the same operation lock, including signature failure.
     let result = (|| {
         File::open(&root)?.sync_all()?;
         signature.verify(&version.join("idoris"), &lock.team_id)?;
+        check_cancel(cancel)?;
         Ok(InstalledVersion {
             directory: version.clone(),
         })
@@ -254,7 +300,7 @@ pub fn install_locked_asset(
     result
 }
 
-struct OperationLock(File);
+pub(crate) struct OperationLock(File);
 impl Drop for OperationLock {
     fn drop(&mut self) {
         // Concurrent forks may retain a duplicate until exec. Explicit unlock
@@ -263,20 +309,28 @@ impl Drop for OperationLock {
     }
 }
 
-fn operation_lock(root: &Path) -> Result<OperationLock, InstallError> {
+pub(crate) fn operation_lock(root: &Path) -> Result<OperationLock, InstallError> {
     let path = root.join(".operation.lock");
-    if let Ok(metadata) = fs::symlink_metadata(&path) {
-        regular_file(&metadata)?;
-    }
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(false);
+    let lock = File::from(
+        rustix::fs::open(
+            &path,
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .map_err(io::Error::from)?,
+    );
+    regular_file(&lock.metadata()?)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        use std::os::unix::fs::MetadataExt;
+        if lock.metadata()?.uid() != rustix::process::geteuid().as_raw() {
+            return Err(violation("operation lock owner mismatch"));
+        }
     }
-    let lock = options.open(path)?;
-    regular_file(&lock.metadata()?)?;
     match fs2::FileExt::try_lock_exclusive(&lock) {
         Ok(()) => Ok(OperationLock(lock)),
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(InstallError::Busy),
@@ -284,60 +338,138 @@ fn operation_lock(root: &Path) -> Result<OperationLock, InstallError> {
     }
 }
 
-fn invoke_child(opts: &InstallOptions, request: &ChildRequest) -> Result<Manifest, InstallError> {
+fn invoke_child(
+    opts: &InstallOptions,
+    request: &ChildRequest,
+    bytes: &[u8],
+    cancel: &CancellationToken,
+) -> Result<Manifest, InstallError> {
+    let mut reply_file = tempfile::tempfile()?;
     let mut child = Command::new(fs::canonicalize(&opts.child_program)?)
         .args(&opts.child_args)
         .env_clear()
         .current_dir(&request.staging)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::from(reply_file.try_clone()?))
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| InstallError::ChildFailed(e.to_string()))?;
-    let input = serde_json::to_vec(request).map_err(io::Error::other)?;
-    let written = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("missing child stdin"))?
-        .write_all(&input);
-    // Always reap before the staging guard can remove files still being written.
-    let output = child
-        .wait_with_output()
-        .map_err(|e| InstallError::ChildFailed(e.to_string()))?;
-    let reply = serde_json::from_slice::<ChildReply>(&output.stdout);
-    match (output.status.success(), reply) {
+    let written = (|| {
+        let input = serde_json::to_vec(request).map_err(io::Error::other)?;
+        if input.len() > 64 * 1024 {
+            return Err(violation("child request too large"));
+        }
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("missing child stdin"))?;
+        rustix::fs::fcntl_setfl(&stdin, rustix::fs::OFlags::NONBLOCK).map_err(io::Error::from)?;
+        let length = (input.len() as u32).to_be_bytes();
+        for mut data in [length.as_slice(), input.as_slice(), bytes] {
+            while !data.is_empty() {
+                check_cancel(cancel)?;
+                match stdin.write(data) {
+                    Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+                    Ok(n) => data = &data[n..],
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(())
+    })();
+    // Reap before removing staging, even when cancellation interrupted a pipe
+    // write. Nonblocking stdin keeps an unresponsive child cancellable too.
+    if written.is_err() {
+        let _ = child.kill();
+    }
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if cancel.is_cancelled() {
+            let _ = child.kill();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    check_cancel(cancel)?;
+    reply_file.rewind()?;
+    let mut output = Vec::new();
+    reply_file.take(128 * 1024).read_to_end(&mut output)?;
+    let reply = serde_json::from_slice::<ChildReply>(&output);
+    match (status.success(), reply) {
         (true, Ok(ChildReply::Ok(manifest))) if written.is_ok() => Ok(manifest),
         (false, Ok(ChildReply::ManifestViolation(message))) => Err(violation(message)),
         (false, Ok(ChildReply::HashMismatch(message))) => Err(InstallError::HashMismatch(message)),
         (false, Ok(ChildReply::Io(message))) => Err(InstallError::Io(io::Error::other(message))),
-        _ => Err(InstallError::ChildFailed(output.status.to_string())),
+        _ => Err(InstallError::ChildFailed(status.to_string())),
     }
 }
 
-/// Hidden-subcommand entry point. Reads a bounded JSON request from stdin and
+fn check_cancel(cancel: &CancellationToken) -> Result<(), InstallError> {
+    if cancel.is_cancelled() {
+        Err(InstallError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn read_archive_bytes(
+    mut source: impl Read,
+    expected: &str,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>, InstallError> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 64 * 1024];
+    let mut hash = Sha256::new();
+    loop {
+        check_cancel(cancel)?;
+        let n = source.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        if bytes.len() as u64 + n as u64 > MAX_ARCHIVE_BYTES {
+            return Err(violation("compressed archive too large"));
+        }
+        bytes.extend_from_slice(&buffer[..n]);
+        hash.update(&buffer[..n]);
+    }
+    if !hash_matches(&format!("{:x}", hash.finalize()), expected) {
+        return Err(InstallError::HashMismatch("archive".into()));
+    }
+    Ok(bytes)
+}
+
+/// Hidden-subcommand entry point. Reads length-prefixed JSON and archive bytes from stdin and
 /// writes a JSON result to stdout. All file writes happen after exec here; this
 /// path never spawns another process and inherits no environment credentials.
 pub fn run_install_child() -> ExitCode {
     let result = (|| {
-        let mut bytes = Vec::new();
-        io::stdin().take(64 * 1024 + 1).read_to_end(&mut bytes)?;
-        if bytes.len() > 64 * 1024 {
+        let mut input = io::stdin().lock();
+        let mut length = [0; 4];
+        input.read_exact(&mut length)?;
+        let length = u32::from_be_bytes(length) as usize;
+        if length > 64 * 1024 {
             return Err(violation("child request too large"));
         }
+        let mut bytes = vec![0; length];
+        input.read_exact(&mut bytes)?;
         let request: ChildRequest =
             serde_json::from_slice(&bytes).map_err(|e| violation(e.to_string()))?;
         validate_files(&request.files)?;
-        if request.limit > MAX_UNPACKED_BYTES
-            || !request.staging.is_absolute()
-            || !request.archive.is_absolute()
-        {
+        if request.limit > MAX_UNPACKED_BYTES || !request.staging.is_absolute() {
             return Err(violation("invalid child request"));
         }
         private_dir(&request.staging)?;
         if fs::read_dir(&request.staging)?.next().is_some() {
             return Err(violation("staging is not empty"));
         }
-        let manifest = scan_archive(&request, true)?;
+        let cancel = CancellationToken::new();
+        let bytes = read_archive_bytes(input, &request.sha256, &cancel)?;
+        let manifest = scan_archive(&request, &bytes, true, &cancel)?;
         sync_dirs(&request.staging)?;
         Ok(manifest)
     })();
@@ -400,21 +532,17 @@ fn parent_dirs(files: &[String]) -> BTreeSet<String> {
         .collect()
 }
 
-fn scan_archive(request: &ChildRequest, extract: bool) -> Result<Manifest, InstallError> {
-    let mut source = File::open(&request.archive)?;
-    regular_file(&source.metadata()?)?;
-    if source.metadata()?.len() > crate::download::MAX_ARCHIVE_BYTES {
-        return Err(violation("compressed archive too large"));
-    }
-    if digest(&mut source)?.sha256 != request.sha256 {
-        return Err(InstallError::HashMismatch("archive".into()));
-    }
-    source.rewind()?;
+fn scan_archive(
+    request: &ChildRequest,
+    bytes: &[u8],
+    extract: bool,
+    cancel: &CancellationToken,
+) -> Result<Manifest, InstallError> {
     // Bound headers, padding, gzip members and trailing data as well as file
     // payloads. raw(true) lets us validate PAX and reject GNU indirection
     // without interpreting path, size, link or sparse overrides.
     let budget = request.limit.saturating_add(64 * 1024);
-    let decoded = MultiGzDecoder::new(source).take(budget + 1);
+    let decoded = MultiGzDecoder::new(bytes).take(budget + 1);
     let mut tar = tar::Archive::new(decoded);
     let parents = parent_dirs(&request.files);
     let allowed: BTreeSet<_> = request.files.iter().cloned().collect();
@@ -428,6 +556,7 @@ fn scan_archive(request: &ChildRequest, extract: bool) -> Result<Manifest, Insta
         .map_err(|e| violation(e.to_string()))?
         .raw(true)
     {
+        check_cancel(cancel)?;
         let mut entry = entry.map_err(|e| violation(e.to_string()))?;
         let kind = entry.header().entry_type();
         if kind.is_pax_local_extensions() {
@@ -507,6 +636,7 @@ fn scan_archive(request: &ChildRequest, extract: bool) -> Result<Manifest, Insta
         let mut size = 0u64;
         let mut buffer = [0u8; 64 * 1024];
         loop {
+            check_cancel(cancel)?;
             let n = entry
                 .read(&mut buffer)
                 .map_err(|e| violation(e.to_string()))?;
@@ -540,6 +670,7 @@ fn scan_archive(request: &ChildRequest, extract: bool) -> Result<Manifest, Insta
     let mut tail = tar.into_inner();
     let mut buffer = [0u8; 8192];
     loop {
+        check_cancel(cancel)?;
         let n = tail
             .read(&mut buffer)
             .map_err(|e| violation(e.to_string()))?;
@@ -556,7 +687,12 @@ fn scan_archive(request: &ChildRequest, extract: bool) -> Result<Manifest, Insta
     Ok(manifest)
 }
 
-fn verify_tree(root: &Path, expected: &Manifest, immutable: bool) -> Result<(), InstallError> {
+fn verify_tree(
+    root: &Path,
+    expected: &Manifest,
+    immutable: bool,
+    cancel: &CancellationToken,
+) -> Result<(), InstallError> {
     if !fs::symlink_metadata(root)?.is_dir() {
         return Err(violation("version is not a directory"));
     }
@@ -583,7 +719,8 @@ fn verify_tree(root: &Path, expected: &Manifest, immutable: bool) -> Result<(), 
             let wanted = expected
                 .get(&name)
                 .ok_or_else(|| violation(format!("unexpected installed file: {name}")))?;
-            if metadata.len() != wanted.size || digest(&mut File::open(&path)?)? != *wanted {
+            if metadata.len() != wanted.size || digest(&mut File::open(&path)?, cancel)? != *wanted
+            {
                 return Err(InstallError::HashMismatch(name));
             }
             if immutable {
@@ -598,11 +735,12 @@ fn verify_tree(root: &Path, expected: &Manifest, immutable: bool) -> Result<(), 
     Ok(())
 }
 
-fn digest(reader: &mut impl Read) -> io::Result<FileDigest> {
+fn digest(reader: &mut impl Read, cancel: &CancellationToken) -> Result<FileDigest, InstallError> {
     let mut hash = Sha256::new();
     let mut size = 0u64;
     let mut buffer = [0u8; 64 * 1024];
     loop {
+        check_cancel(cancel)?;
         let n = reader.read(&mut buffer)?;
         if n == 0 {
             break;

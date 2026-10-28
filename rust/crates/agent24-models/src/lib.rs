@@ -19,7 +19,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 mod idoris;
-pub use idoris::IdorisEvidence;
+pub use idoris::{ConnectionVerification, IdorisEvidence, IdorisGateway};
 pub mod router;
 mod stream;
 
@@ -123,6 +123,8 @@ pub struct CompletionRequest {
     /// gated on `complexity: simple`) — this crate has no opinion on
     /// complexity.
     pub disable_thinking: bool,
+    /// User confirmation to spend iDoris's reserved headroom on this call only.
+    pub idoris_headroom_confirmed: bool,
     /// ME4-S2b: the sampling temperature, sent only when set. `None` leaves
     /// the body byte for byte as before (and Ollama's OpenAI layer then uses
     /// 1.0, over the model's own default). f64 end to end, so 0.7 stays 0.7.
@@ -205,6 +207,16 @@ pub enum ModelError {
     /// refused" from "the backend is misconfigured".
     #[error("provider error: {message}")]
     Rejected { status: u16, message: String },
+    #[error(
+        "idoris_headroom_confirmation_required: {role} needs reserved memory headroom; confirm before resending"
+    )]
+    IdorisHeadroomConfirmationRequired {
+        role: String,
+        remediation: Option<String>,
+    },
+    /// Transient lifecycle contention; the gateway's bounded retries are exhausted.
+    #[error("idoris_supervisor_busy: iDoris model lifecycle is busy; retry later")]
+    IdorisSupervisorBusy,
     #[error("cancelled")]
     Cancelled,
 }
@@ -1217,6 +1229,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            idoris_headroom_confirmed: false,
             temperature: None,
             progress: None,
         }
@@ -1379,10 +1392,12 @@ mod tests {
         let c = CancellationToken::new();
         let simple = CompletionRequest {
             disable_thinking: true,
+            idoris_headroom_confirmed: false,
             ..req()
         };
         let complex = CompletionRequest {
             disable_thinking: false,
+            idoris_headroom_confirmed: false,
             ..req()
         };
         let _ = p.complete(&simple, &c).await.unwrap();
@@ -1432,6 +1447,7 @@ mod tests {
         let c = CancellationToken::new();
         let simple = CompletionRequest {
             disable_thinking: true,
+            idoris_headroom_confirmed: false,
             ..req()
         };
         let _ = p.complete(&simple, &c).await.unwrap();
@@ -1550,6 +1566,7 @@ mod tests {
     fn thinking_off(progress: Option<Progress>) -> CompletionRequest {
         CompletionRequest {
             disable_thinking: true,
+            idoris_headroom_confirmed: false,
             progress,
             ..req()
         }

@@ -117,3 +117,43 @@ fn contract_requires_the_locked_major_and_minimum_minor() {
         );
     }
 }
+
+#[test]
+fn release_base_rejects_explicit_ports_and_wrong_path_prefixes() {
+    for base in [
+        "https://github.com:443/iDoris-ai/iDoris/releases/download",
+        "https://github.com:444/iDoris-ai/iDoris/releases/download",
+        "https://github.com/other/releases/download",
+        "https://github.com/iDoris-ai/iDoris/releases/download-evil",
+    ] {
+        let mut value: serde_json::Value = serde_json::from_str(EMBEDDED).unwrap();
+        value["release_url_base"] = json!(base);
+        assert!(
+            IdorisLock::parse(&value.to_string()).is_err(),
+            "accepted {base}"
+        );
+    }
+}
+
+#[test]
+fn asset_triples_reject_path_and_url_syntax() {
+    for triple in [
+        "",
+        "../escape",
+        "a/b",
+        "a.b",
+        "AARCH64",
+        "a?b",
+        "a%2fb",
+        "a\\b",
+    ] {
+        let mut value: serde_json::Value = serde_json::from_str(EMBEDDED).unwrap();
+        let mut asset = value["assets"]["aarch64-apple-darwin"].take();
+        asset["name"] = json!(format!("idoris-v0.4.0-{triple}.tar.gz"));
+        value["assets"] = json!({triple: asset});
+        assert!(
+            IdorisLock::parse(&value.to_string()).is_err(),
+            "accepted {triple}"
+        );
+    }
+}
