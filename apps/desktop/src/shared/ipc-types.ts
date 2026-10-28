@@ -19,6 +19,7 @@ export const IpcChannels = {
   // before sending anything.
   ApprovalDecide: 'approval:decide',
   OsModuleSetEnabled: 'os-module:set-enabled',
+  CommInstall: 'comm:install',
   CreativeShow: 'creative:show',
   CreativeRestart: 'creative:restart',
   CreativeBounds: 'creative:bounds',

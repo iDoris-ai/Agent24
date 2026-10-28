@@ -134,6 +134,7 @@ const POLICIES: &[RoutePolicy] = &[
     row("GET", "/api/v1/peer/runs", Operation::RunRead, AssuranceLevel::Everyday),
     row("GET", "/api/v1/peer/runs/{id}", Operation::RunRead, AssuranceLevel::Everyday),
     row("POST", "/api/v1/runs/{id}/cancel", Operation::RunCancel, AssuranceLevel::Everyday),
+    row("POST", "/api/v1/comm/install", Operation::ComponentInstall, AssuranceLevel::Elevated),
     row("GET", "/api/v1/comm/identity", Operation::CommRead, AssuranceLevel::Everyday),
     row("POST", "/api/v1/comm/identity", Operation::CommWrite, AssuranceLevel::Elevated),
     row("POST", "/api/v1/comm/identity/default", Operation::CommWrite, AssuranceLevel::Elevated),

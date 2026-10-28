@@ -354,6 +354,11 @@ enum OsAttachAction {
 /// `agent24 comm …` (COMM-2a/2b; COMM-HYPHAE.md §4's CLI/REST 1:1 mapping).
 #[derive(Subcommand)]
 enum CommAction {
+    /// Download, verify, and set up the pinned Hyphae component
+    Install {
+        #[arg(long)]
+        json: bool,
+    },
     /// 群聊管理与消息投递
     Groups {
         #[command(subcommand)]
@@ -1879,7 +1884,11 @@ async fn cmd_comm(action: CommAction, json: bool) -> Result<(), String> {
     // `send`/`outbox retry` can take up to `5s × 8 relays + 10s = 50s`
     // server-side (COMM-HYPHAE.md §3); give those two a generous timeout too
     // rather than the default 15s.
-    let timeout = if matches!(action, CommAction::Unlock { .. }) {
+    let installing = matches!(action, CommAction::Install { .. });
+    let install_json = matches!(action, CommAction::Install { json: true });
+    let timeout = if installing {
+        Duration::from_secs(360)
+    } else if matches!(action, CommAction::Unlock { .. }) {
         Duration::from_secs(30)
     } else if matches!(action, CommAction::Import { .. }) {
         Duration::from_secs(120)
@@ -1895,15 +1904,23 @@ async fn cmd_comm(action: CommAction, json: bool) -> Result<(), String> {
     } else {
         Duration::from_secs(15)
     };
+    let json = json || install_json;
+    if installing && !json {
+        eprintln!("正在下载并校验 Hyphae，随后设置通信服务…");
+    }
     let (method, path, body) = comm_request(action)?;
     let mut body = CommRequestBody(body);
 
     let ep = connect().await.map_err(|e| {
         format!("{e}\n  `agent24 comm` always goes through the daemon — there is no offline path")
     })?;
-    let result = execute_comm(&ep, method, &path, &mut body, timeout, json).await;
+    let result = execute_comm(&ep, method, &path, &mut body, timeout, json && !installing).await;
     finish(ep).await;
-    println!("{}", result?);
+    let output = result?;
+    if installing && !json {
+        eprintln!("Hyphae 安装完成。");
+    }
+    println!("{output}");
     Ok(())
 }
 
@@ -1911,6 +1928,11 @@ fn comm_request(
     action: CommAction,
 ) -> Result<(reqwest::Method, String, Option<serde_json::Value>), String> {
     Ok(match action {
+        CommAction::Install { .. } => (
+            reqwest::Method::POST,
+            "/api/v1/comm/install".to_owned(),
+            None,
+        ),
         CommAction::Groups { action } => comm_groups::request(action),
         CommAction::Import { from, yes, dry_run } => {
             let password = if dry_run {
@@ -3640,6 +3662,29 @@ mod tests {
         });
         let out = format_comm_error(&body);
         assert_eq!(out, "comm: not_configured — no default identity");
+    }
+
+    #[test]
+    fn comm_install_has_json_mode_and_no_url_or_hash_overrides() {
+        let cli = Cli::try_parse_from(["agent24", "comm", "install", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Comm {
+                action: CommAction::Install { json: true },
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "agent24",
+                "comm",
+                "install",
+                "--url",
+                "https://evil.invalid"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["agent24", "comm", "install", "--sha256", "abc"]).is_err());
     }
 
     #[test]
