@@ -287,6 +287,10 @@ Admin token 的生成和禁止持久化来自 #588 §1「Admin token 交接」�
 
 iDoris 侧 PR：#586（capabilities）、#587（运行时 headroom）、#589（key list/revoke）、#590（setup omlx）、#591（SIGTERM 与实例锁）。全部合入后发布 v0.4.0（签名并公证）。IL-01 等 v0.4.0 发布后再开工，锁里填入它的 tag 和 sha256。
 
+### 13.2 iDoris v0.4.0 行为变化：余量确认（iDoris#597 评审转交）
+
+设置了 `IDORIS_ALLOCATED_BUDGET_BYTES` 且额度紧张时，v0.4.0 起运行时也会保留 1GB 余量（以前只有推荐器保留）。因此**以前能直接加载的模型，现在可能返回 503 `headroom_confirmation_required`**。正确处理：先按 `reason_code` 分类，询问用户，用户确认后对这一次请求带上 `X-iDoris-Headroom-Breach: confirmed` 重发。不要当作普通的不可用去重试或换 provider。另外，503 `supervisor_busy` 表示同一模型正以不同的余量确认状态加载中，用同一个请求头稍后重试即可，不需要问用户。详细契约见 iDoris 规范修订 1.3 §2.7/§2.8，Agent24 侧实现登记为 ID-HR。launcher 按 §6 计算并传入的预算属于这种情形；IL-09（网关连接）和 IL-13（桌面卡片）的验收需要覆盖「额度紧 → 503 → 用户确认 → 重发成功」这条路径。
+
 ## 14. 按依赖顺序拆分实施
 
 下列每片包含自己的行为测试，源代码、测试和手写契约合计最多 300 行；生成文件按仓库规则另计。达到上限继续拆片，不能用巨大框架预埋后续行为。所有安全、授权、数据写入和 wire 片等 PR-Daemon APPROVE。[A3]
