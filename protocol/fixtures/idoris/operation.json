@@ -1,0 +1,9 @@
+{
+  "operation_id": "f3a0b835-7410-4947-b511-2d9d54715457",
+  "action": "start",
+  "phase": "completed",
+  "result": "failed",
+  "error_code": "keychain_locked",
+  "cancellable": false,
+  "idempotency_key": "fixture-start"
+}

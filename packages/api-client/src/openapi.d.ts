@@ -1740,10 +1740,158 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/idoris/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read managed installation and runtime state
+         * @description ProductHost capability or legacy host bearer required; Creative is forbidden.
+         *     No caller-supplied executable, environment, path or credential is accepted.
+         */
+        get: operations["getIdorisStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/idoris/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start the saved managed installation
+         * @description ProductHost capability or legacy host bearer required; Creative is forbidden.
+         *     No caller-supplied executable, environment, path or credential is accepted.
+         *     Returns an operation even when the requested state is already reached.
+         *     A different operation during an active operation returns 409 busy.
+         *     An Idempotency-Key replay returns the original operation across daemon restarts.
+         *     A start interrupted by a daemon restart is recorded as cancelled; desired running state is restored separately.
+         *     Omit Idempotency-Key to create a fresh request identity.
+         */
+        post: operations["startIdoris"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/idoris/stop": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Stop the managed installation
+         * @description ProductHost capability or legacy host bearer required; Creative is forbidden.
+         *     No caller-supplied executable, environment, path or credential is accepted.
+         *     Returns an operation even when the requested state is already reached.
+         *     A different operation during an active operation returns 409 busy.
+         *     An Idempotency-Key replay returns the original operation across daemon restarts.
+         *     A start interrupted by a daemon restart is recorded as cancelled; desired running state is restored separately.
+         *     Omit Idempotency-Key to create a fresh request identity.
+         */
+        post: operations["stopIdoris"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/idoris/operations/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read lifecycle operation progress
+         * @description ProductHost capability or legacy host bearer required; Creative is forbidden.
+         *     No caller-supplied executable, environment, path or credential is accepted.
+         */
+        get: operations["getIdorisOperation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/idoris/operations/{id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel a pending lifecycle start
+         * @description ProductHost capability or legacy host bearer required; Creative is forbidden.
+         *     No caller-supplied executable, environment, path or credential is accepted.
+         *     Start cancellation waits for child cleanup before completing. Stop is not cancellable once cleanup begins. Completed operation cancellation is idempotent.
+         */
+        post: operations["cancelIdorisOperation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @enum {string} */
+        IdorisErrorCode: "not_installed" | "not_configured" | "instance_conflict" | "keychain_locked" | "key_unavailable" | "contract_mismatch" | "start_failed" | "stop_timeout" | "busy" | "cancelled" | "not_found" | "not_cancellable" | "shutting_down" | "invalid_request" | "persistence_failed";
+        IdorisError: {
+            error: {
+                code: components["schemas"]["IdorisErrorCode"] | ("unauthorized" | "forbidden");
+                message: string;
+                retryable?: boolean;
+                next_action?: string;
+            };
+        };
+        IdorisStatus: {
+            /** @enum {string} */
+            state: "not_installed" | "not_configured" | "stopped" | "starting" | "running" | "failed" | "instance_conflict";
+            version: string | null;
+            data_port: number | null;
+            admin_port: number | null;
+            roles: ("daily" | "deep")[];
+            last_error: components["schemas"]["IdorisErrorCode"] | null;
+            current_operation: string | null;
+        };
+        IdorisOperation: {
+            operation_id: string;
+            /** @enum {string} */
+            action: "start" | "stop";
+            /** @enum {string} */
+            phase: "queued" | "starting" | "connecting" | "stopping" | "completed";
+            /** @enum {string|null} */
+            result: "succeeded" | "failed" | "cancelled" | null;
+            error_code: components["schemas"]["IdorisErrorCode"] | null;
+            cancellable: boolean;
+            idempotency_key: string;
+        };
         DomainOsView: {
             name: string;
             namespace: string;
@@ -3183,6 +3331,15 @@ export interface components {
         };
     };
     responses: {
+        /** @description Host authorization or lifecycle failure; stable error.code */
+        IdorisFailure: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["IdorisError"];
+            };
+        };
         /** @description invalid / confirm_required (400): bad input, or Hyphae user_error such as an unknown history cursor */
         CommInvalid: {
             headers: {
@@ -6972,6 +7129,161 @@ export interface operations {
             502: components["responses"]["CommBadGateway"];
             503: components["responses"]["CommUnavailable"];
             504: components["responses"]["CommTimeout"];
+        };
+    };
+    getIdorisStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current non-sensitive projection */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdorisStatus"];
+                };
+            };
+            400: components["responses"]["IdorisFailure"];
+            401: components["responses"]["IdorisFailure"];
+            403: components["responses"]["IdorisFailure"];
+            409: components["responses"]["IdorisFailure"];
+            422: components["responses"]["IdorisFailure"];
+            500: components["responses"]["IdorisFailure"];
+            502: components["responses"]["IdorisFailure"];
+            503: components["responses"]["IdorisFailure"];
+            504: components["responses"]["IdorisFailure"];
+        };
+    };
+    startIdoris: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Lifecycle operation accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdorisOperation"];
+                };
+            };
+            400: components["responses"]["IdorisFailure"];
+            401: components["responses"]["IdorisFailure"];
+            403: components["responses"]["IdorisFailure"];
+            409: components["responses"]["IdorisFailure"];
+            422: components["responses"]["IdorisFailure"];
+            500: components["responses"]["IdorisFailure"];
+            502: components["responses"]["IdorisFailure"];
+            503: components["responses"]["IdorisFailure"];
+            504: components["responses"]["IdorisFailure"];
+        };
+    };
+    stopIdoris: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Lifecycle operation accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdorisOperation"];
+                };
+            };
+            400: components["responses"]["IdorisFailure"];
+            401: components["responses"]["IdorisFailure"];
+            403: components["responses"]["IdorisFailure"];
+            409: components["responses"]["IdorisFailure"];
+            422: components["responses"]["IdorisFailure"];
+            500: components["responses"]["IdorisFailure"];
+            502: components["responses"]["IdorisFailure"];
+            503: components["responses"]["IdorisFailure"];
+            504: components["responses"]["IdorisFailure"];
+        };
+    };
+    getIdorisOperation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current non-sensitive projection */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdorisOperation"];
+                };
+            };
+            400: components["responses"]["IdorisFailure"];
+            401: components["responses"]["IdorisFailure"];
+            403: components["responses"]["IdorisFailure"];
+            404: components["responses"]["IdorisFailure"];
+            409: components["responses"]["IdorisFailure"];
+            422: components["responses"]["IdorisFailure"];
+            500: components["responses"]["IdorisFailure"];
+            502: components["responses"]["IdorisFailure"];
+            503: components["responses"]["IdorisFailure"];
+            504: components["responses"]["IdorisFailure"];
+        };
+    };
+    cancelIdorisOperation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current non-sensitive projection */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdorisOperation"];
+                };
+            };
+            400: components["responses"]["IdorisFailure"];
+            401: components["responses"]["IdorisFailure"];
+            403: components["responses"]["IdorisFailure"];
+            404: components["responses"]["IdorisFailure"];
+            409: components["responses"]["IdorisFailure"];
+            422: components["responses"]["IdorisFailure"];
+            500: components["responses"]["IdorisFailure"];
+            502: components["responses"]["IdorisFailure"];
+            503: components["responses"]["IdorisFailure"];
+            504: components["responses"]["IdorisFailure"];
         };
     };
 }

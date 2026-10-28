@@ -13,7 +13,7 @@ use crate::{
     install::InstalledVersion,
     omlx_probe::{Endpoint, ProbeResult, ProbeStatus, ServiceIdentity},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -22,7 +22,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Daily,

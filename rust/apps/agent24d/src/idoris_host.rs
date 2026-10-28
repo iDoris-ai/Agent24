@@ -1,0 +1,1034 @@
+//! One owner for managed installation metadata, supervisor and gateway publication.
+use crate::managed_idoris::{
+    ManagedConfig, ManagedIdoris, SecretError, SecretSource, SupervisorReady,
+};
+use agent24_idoris::{
+    IdorisLock,
+    download::VerifiedArchive,
+    install::{Codesign, InstalledVersion},
+    keychain::{Keychain, KeychainError, SystemKeychain},
+    omlx_probe::{ApiKey, Endpoint, OmlxProbe, ProbeStatus},
+    setup::Role,
+    supervisor::{
+        Budget, ComponentsDir, DataPaths, LaunchInputs, Ports, StartConfig, Supervisor,
+        SupervisorError,
+    },
+};
+use agent24_models::{IdorisGateway, ModelError, router::ModelRouter};
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex as SyncMutex, Weak},
+    time::Duration,
+};
+use tokio::sync::{Mutex, Notify, watch};
+use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
+
+/// Drain (30s), TERM (17s), KILL/reap and scheduling margin.
+pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(50);
+
+/// Local, non-sensitive receipt written by the install/connect coordinator (IL-11).
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Installation {
+    pub version: String,
+    pub release_dir: PathBuf,
+    pub archive_path: PathBuf,
+    pub components_dir: Option<PathBuf>,
+    pub key_id: Option<String>,
+    pub data_port: u16,
+    pub admin_port: u16,
+    pub roles: Vec<Role>,
+    pub core_reserved_bytes: Option<u64>,
+    pub omlx_url: Option<String>,
+    pub omlx_key_id: Option<String>,
+    pub desired_running: bool,
+}
+
+impl Installation {
+    fn validate(&self) -> Result<(), Code> {
+        let reference = |id: &str| {
+            !id.is_empty()
+                && id.len() <= 128
+                && !id.starts_with("idk_")
+                && !id.starts_with("sk-")
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        };
+        if self.version != IdorisLock::embedded().tag.trim_start_matches('v')
+            || !self.release_dir.is_absolute()
+            || !self.archive_path.is_absolute()
+            || self
+                .components_dir
+                .as_ref()
+                .is_some_and(|p| !p.is_absolute())
+            || self.data_port == 0
+            || self.admin_port == 0
+            || self.data_port == self.admin_port
+            || self
+                .key_id
+                .as_deref()
+                .is_some_and(|id| !id.starts_with("vk_") || !reference(id))
+            || self.omlx_key_id.as_deref().is_some_and(|id| !reference(id))
+            || self
+                .omlx_url
+                .as_deref()
+                .is_some_and(|url| Endpoint::parse(url).is_err())
+        {
+            return Err(Code::InvalidRequest);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum State {
+    NotInstalled,
+    NotConfigured,
+    Stopped,
+    Starting,
+    Running,
+    Failed,
+    InstanceConflict,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Code {
+    NotInstalled,
+    NotConfigured,
+    InstanceConflict,
+    KeychainLocked,
+    KeyUnavailable,
+    ContractMismatch,
+    StartFailed,
+    StopTimeout,
+    Busy,
+    Cancelled,
+    NotFound,
+    NotCancellable,
+    ShuttingDown,
+    InvalidRequest,
+    PersistenceFailed,
+}
+impl Code {
+    pub fn http_status(self) -> axum::http::StatusCode {
+        use axum::http::StatusCode as H;
+        match self {
+            Self::NotFound => H::NOT_FOUND,
+            Self::NotInstalled | Self::NotConfigured | Self::ContractMismatch => {
+                H::UNPROCESSABLE_ENTITY
+            }
+            Self::InstanceConflict | Self::Busy | Self::NotCancellable | Self::Cancelled => {
+                H::CONFLICT
+            }
+            Self::KeychainLocked | Self::KeyUnavailable | Self::ShuttingDown => {
+                H::SERVICE_UNAVAILABLE
+            }
+            Self::StartFailed => H::BAD_GATEWAY,
+            Self::StopTimeout => H::GATEWAY_TIMEOUT,
+            Self::InvalidRequest => H::BAD_REQUEST,
+            Self::PersistenceFailed => H::INTERNAL_SERVER_ERROR,
+        }
+    }
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NotInstalled => "尚未安装 iDoris",
+            Self::NotConfigured => "请先完成 iDoris 配置",
+            Self::InstanceConflict => "同一数据库已有实例或遗留进程身份无法确认",
+            Self::KeychainLocked => "请解锁钥匙串并允许 Agent24 访问",
+            Self::KeyUnavailable => "钥匙串中缺少凭据",
+            Self::ContractMismatch => "iDoris 就绪契约不匹配",
+            Self::StartFailed => "iDoris 启动失败",
+            Self::StopTimeout => "iDoris 停止超时，已执行强制回收",
+            Self::Busy => "已有生命周期操作正在执行",
+            Self::Cancelled => "操作已取消",
+            Self::NotFound => "操作不存在",
+            Self::NotCancellable => "停止回收阶段不可取消",
+            Self::ShuttingDown => "宿主正在关停",
+            Self::InvalidRequest => "请求格式不正确",
+            Self::PersistenceFailed => "无法保存生命周期记录",
+        }
+    }
+}
+impl From<SupervisorError> for Code {
+    fn from(error: SupervisorError) -> Self {
+        match error {
+            SupervisorError::InstanceConflict => Self::InstanceConflict,
+            SupervisorError::Contract => Self::ContractMismatch,
+            SupervisorError::Configuration => Self::NotConfigured,
+            SupervisorError::Stopped => Self::Cancelled,
+            _ => Self::StartFailed,
+        }
+    }
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Status {
+    pub state: State,
+    pub version: Option<String>,
+    pub data_port: Option<u16>,
+    pub admin_port: Option<u16>,
+    pub roles: Vec<Role>,
+    pub last_error: Option<Code>,
+    pub current_operation: Option<String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    Start,
+    Stop,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    Queued,
+    Starting,
+    Connecting,
+    Stopping,
+    Completed,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Operation {
+    pub operation_id: String,
+    pub action: Action,
+    pub phase: Phase,
+    pub result: Option<Outcome>,
+    pub error_code: Option<Code>,
+    pub cancellable: bool,
+    idempotency_key: String,
+}
+
+pub struct KeychainSource(pub Arc<dyn Keychain>);
+#[async_trait]
+impl SecretSource for KeychainSource {
+    async fn secret(&self, key_id: &str) -> Result<Zeroizing<String>, SecretError> {
+        let store = self.0.clone();
+        let id = key_id.to_owned();
+        tokio::task::spawn_blocking(move || store.get(&id))
+            .await
+            .map_err(|_| SecretError::Unavailable)?
+            .map_err(|e| {
+                if e == KeychainError::KeychainLocked {
+                    SecretError::Locked
+                } else {
+                    SecretError::Unavailable
+                }
+            })
+    }
+}
+fn secret_code(error: SecretError) -> Code {
+    match error {
+        SecretError::Locked => Code::KeychainLocked,
+        SecretError::Unavailable => Code::KeyUnavailable,
+    }
+}
+// Keep credential failures typed across IL-09's generic ModelError boundary.
+struct ClassifiedSecrets<'a> {
+    source: &'a dyn SecretSource,
+    failure: SyncMutex<Option<Code>>,
+}
+#[async_trait]
+impl SecretSource for ClassifiedSecrets<'_> {
+    async fn secret(&self, key_id: &str) -> Result<Zeroizing<String>, SecretError> {
+        let result = self.source.secret(key_id).await;
+        if let Err(error) = &result {
+            *self.failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(match error {
+                SecretError::Locked => Code::KeychainLocked,
+                SecretError::Unavailable => Code::KeyUnavailable,
+            });
+        }
+        result
+    }
+}
+pub struct ReadySignal(pub watch::Receiver<bool>);
+#[async_trait]
+impl SupervisorReady for ReadySignal {
+    async fn wait_ready(&self, cancel: &CancellationToken) -> Result<(), ModelError> {
+        let mut signal = self.0.clone();
+        loop {
+            if *signal.borrow_and_update() {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+                changed = signal.changed() => if changed.is_err() { return Err(ModelError::Unavailable("iDoris supervisor stopped".into())); },
+            }
+        }
+    }
+}
+
+/// Injection retains the real IL-07 supervisor in tests; only discovery is replaced.
+#[async_trait]
+pub trait Runtime: Send + Sync {
+    async fn config(
+        &self,
+        root: &Path,
+        record: &Installation,
+        cancel: CancellationToken,
+    ) -> Result<StartConfig, Code>;
+    async fn inputs(&self, record: &Installation) -> Result<LaunchInputs, Code>;
+}
+pub struct SystemRuntime {
+    pub secrets: Arc<dyn SecretSource>,
+}
+#[async_trait]
+impl Runtime for SystemRuntime {
+    async fn config(
+        &self,
+        root: &Path,
+        r: &Installation,
+        cancel: CancellationToken,
+    ) -> Result<StartConfig, Code> {
+        if r.version != IdorisLock::embedded().tag.trim_start_matches('v') {
+            return Err(Code::ContractMismatch);
+        }
+        let dir = r.release_dir.clone();
+        let archive = r.archive_path.clone();
+        let installed = tokio::task::spawn_blocking(move || {
+            InstalledVersion::verify_existing(
+                &dir,
+                IdorisLock::embedded(),
+                &VerifiedArchive {
+                    path: archive,
+                    sha256: String::new(),
+                },
+                &Codesign,
+            )
+        })
+        .await
+        .map_err(|_| Code::StartFailed)?
+        .map_err(|_| Code::NotInstalled)?;
+        let components = ComponentsDir::new(
+            root,
+            r.components_dir.as_deref().ok_or(Code::NotConfigured)?,
+        )
+        .map_err(Code::from)?;
+        let mut config = StartConfig::new(
+            installed,
+            components,
+            DataPaths {
+                db: root.join("data/idoris.sqlite3"),
+                state: root.join("data/state"),
+            },
+        )
+        .map_err(Code::from)?;
+        config.ports = Ports {
+            data: r.data_port,
+            admin: r.admin_port,
+        };
+        config.shutdown = cancel;
+        Ok(config)
+    }
+    async fn inputs(&self, r: &Installation) -> Result<LaunchInputs, Code> {
+        let core = r.core_reserved_bytes.ok_or(Code::NotConfigured)?;
+        let budget = tokio::task::spawn_blocking(move || {
+            agent24_hw::HardwareReport::from_env(&agent24_hw::SystemProbe::new())
+                .idoris_budget_bytes(core)
+        })
+        .await
+        .map_err(|_| Code::StartFailed)?;
+        let key = if let Some(id) = &r.omlx_key_id {
+            Some(self.secrets.secret(id).await.map_err(secret_code)?)
+        } else {
+            None
+        };
+        {
+            let url = r.omlx_url.as_deref().ok_or(Code::NotConfigured)?;
+            let endpoint = Endpoint::parse(url).map_err(|_| Code::NotConfigured)?;
+            let api_key = key
+                .clone()
+                .map(ApiKey::new)
+                .transpose()
+                .map_err(|_| Code::NotConfigured)?;
+            let results = OmlxProbe::new()
+                .map_err(|_| Code::StartFailed)?
+                .probe(Some(&endpoint), api_key.as_ref())
+                .await;
+            if !results
+                .iter()
+                .any(|p| p.endpoint == endpoint && matches!(p.status, ProbeStatus::Ready { .. }))
+            {
+                return Err(Code::NotConfigured);
+            }
+        }
+        Ok(LaunchInputs {
+            budget: Budget {
+                allocated_bytes: budget,
+            },
+            omlx_key: key,
+        })
+    }
+}
+struct Inner {
+    installation: Option<Installation>,
+    state: State,
+    last_error: Option<Code>,
+    operations: BTreeMap<String, Operation>,
+    active: Option<(String, CancellationToken)>,
+    supervisor: Option<Supervisor>,
+    generation: Option<String>,
+    closing: bool,
+}
+pub struct IdorisHost {
+    root: PathBuf,
+    inner: Mutex<Inner>,
+    changed: Notify,
+    runtime: Arc<dyn Runtime>,
+    secrets: Arc<dyn SecretSource>,
+    managed: Arc<ManagedIdoris>,
+    router: Arc<ModelRouter>,
+    draining: SyncMutex<Option<Weak<IdorisGateway>>>,
+}
+fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Code> {
+    let parent = path.parent().ok_or(Code::PersistenceFailed)?;
+    let write = || -> io::Result<()> {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(parent)?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer(&mut file, value)?;
+        file.flush()?;
+        file.as_file().sync_all()?;
+        file.persist(path).map_err(|e| e.error)?;
+        std::fs::File::open(parent)?.sync_all()
+    };
+    write().map_err(|_| Code::PersistenceFailed)
+}
+impl IdorisHost {
+    pub fn system(
+        root: PathBuf,
+        managed: Arc<ManagedIdoris>,
+        router: Arc<ModelRouter>,
+    ) -> io::Result<Arc<Self>> {
+        let secrets: Arc<dyn SecretSource> = Arc::new(KeychainSource(Arc::new(SystemKeychain)));
+        Self::open(
+            root,
+            managed,
+            router,
+            Arc::new(SystemRuntime {
+                secrets: secrets.clone(),
+            }),
+            secrets,
+        )
+    }
+    pub fn open(
+        root: PathBuf,
+        managed: Arc<ManagedIdoris>,
+        router: Arc<ModelRouter>,
+        runtime: Arc<dyn Runtime>,
+        secrets: Arc<dyn SecretSource>,
+    ) -> io::Result<Arc<Self>> {
+        let installation: Option<Installation> = match std::fs::read(root.join("installation.json"))
+        {
+            Ok(body) => Some(serde_json::from_slice(&body).map_err(io::Error::other)?),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(record) = &installation {
+            record
+                .validate()
+                .map_err(|_| io::Error::other("invalid iDoris installation receipt"))?;
+        }
+        let mut operations: BTreeMap<String, Operation> =
+            match std::fs::read(root.join("operations.json")) {
+                Ok(body) => serde_json::from_slice(&body).map_err(io::Error::other)?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
+                Err(e) => return Err(e),
+            };
+        for op in operations.values_mut().filter(|o| o.result.is_none()) {
+            op.phase = Phase::Completed;
+            op.result = Some(Outcome::Cancelled);
+            op.error_code = Some(Code::Cancelled);
+            op.cancellable = false;
+        }
+        let state = match &installation {
+            None => State::NotInstalled,
+            Some(r) if r.components_dir.is_none() || r.key_id.is_none() => State::NotConfigured,
+            Some(_) => State::Stopped,
+        };
+        if installation.is_some() {
+            router.block_idoris("managed iDoris stopped");
+        }
+        Ok(Arc::new(Self {
+            root,
+            runtime,
+            secrets,
+            managed,
+            router,
+            changed: Notify::new(),
+            draining: SyncMutex::new(None),
+            inner: Mutex::new(Inner {
+                installation,
+                state,
+                last_error: None,
+                operations,
+                active: None,
+                supervisor: None,
+                generation: None,
+                closing: false,
+            }),
+        }))
+    }
+    /// IL-11 commits a validated receipt here; HTTP lifecycle requests never accept paths.
+    pub async fn record_installation(&self, record: Installation) -> Result<(), Code> {
+        record.validate()?;
+        let mut inner = self.inner.lock().await;
+        if inner.active.is_some() || inner.supervisor.is_some() {
+            return Err(Code::Busy);
+        }
+        if inner.closing {
+            return Err(Code::ShuttingDown);
+        }
+        write_json(&self.root.join("installation.json"), &record)?;
+        inner.state = if record.components_dir.is_some() && record.key_id.is_some() {
+            State::Stopped
+        } else {
+            State::NotConfigured
+        };
+        inner.installation = Some(record);
+        Ok(())
+    }
+    pub async fn status(&self) -> Status {
+        let i = self.inner.lock().await;
+        let r = i.installation.as_ref();
+        Status {
+            state: i.state,
+            version: r.map(|r| r.version.clone()),
+            data_port: r.map(|r| r.data_port),
+            admin_port: r.map(|r| r.admin_port),
+            roles: r.map(|r| r.roles.clone()).unwrap_or_default(),
+            last_error: i.last_error,
+            current_operation: i.active.as_ref().map(|a| a.0.clone()),
+        }
+    }
+    pub async fn operation(&self, id: &str) -> Result<Operation, Code> {
+        self.inner
+            .lock()
+            .await
+            .operations
+            .get(id)
+            .cloned()
+            .ok_or(Code::NotFound)
+    }
+    pub async fn restore(self: &Arc<Self>) -> Result<(), Code> {
+        let restore = self
+            .inner
+            .lock()
+            .await
+            .installation
+            .as_ref()
+            .is_some_and(|r| r.desired_running && r.components_dir.is_some() && r.key_id.is_some());
+        if restore {
+            self.submit(Action::Start, None).await?;
+        }
+        Ok(())
+    }
+    pub async fn submit(
+        self: &Arc<Self>,
+        action: Action,
+        idempotency: Option<&str>,
+    ) -> Result<Operation, Code> {
+        let mut i = self.inner.lock().await;
+        if i.closing {
+            return Err(Code::ShuttingDown);
+        }
+        let key = idempotency
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if key.is_empty()
+            || key.len() > 128
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        {
+            return Err(Code::InvalidRequest);
+        }
+        if let Some(old) = i.operations.values().find(|op| op.idempotency_key == key) {
+            return if old.action == action {
+                Ok(old.clone())
+            } else {
+                Err(Code::InvalidRequest)
+            };
+        }
+        if i.active.is_some()
+            || (action == Action::Start
+                && i.supervisor.as_ref().is_some_and(|supervisor| {
+                    i.state != State::Running || !*supervisor.accepting_requests().borrow()
+                }))
+        {
+            return Err(Code::Busy);
+        }
+        if action == Action::Start {
+            let r = i.installation.as_ref().ok_or(Code::NotInstalled)?;
+            if r.components_dir.is_none() || r.key_id.is_none() {
+                return Err(Code::NotConfigured);
+            }
+        }
+        let noop = (action == Action::Start && i.state == State::Running)
+            || (action == Action::Stop
+                && i.supervisor.is_none()
+                && !self
+                    .root
+                    .join("data/state/managed-process.json")
+                    .try_exists()
+                    .map_err(|_| Code::PersistenceFailed)?);
+        let op = Operation {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            action,
+            phase: if noop {
+                Phase::Completed
+            } else {
+                Phase::Queued
+            },
+            result: noop.then_some(Outcome::Succeeded),
+            error_code: None,
+            cancellable: !noop && action == Action::Start,
+            idempotency_key: key,
+        };
+        i.operations.insert(op.operation_id.clone(), op.clone());
+        if let Err(e) = write_json(&self.root.join("operations.json"), &i.operations) {
+            i.operations.remove(&op.operation_id);
+            return Err(e);
+        }
+        // Commit the operation before the intent: a rejected start must never
+        // leave an autostart intent for the next daemon. An interrupted queued
+        // operation is cancelled by open().
+        if let Some(r) = i.installation.as_mut() {
+            let mut updated = r.clone();
+            updated.desired_running = action == Action::Start;
+            if let Err(error) = write_json(&self.root.join("installation.json"), &updated) {
+                i.operations.remove(&op.operation_id);
+                return Err(error);
+            }
+            *r = updated;
+        }
+        if noop {
+            if action == Action::Stop {
+                i.state = match &i.installation {
+                    None => State::NotInstalled,
+                    Some(r) if r.components_dir.is_none() || r.key_id.is_none() => {
+                        State::NotConfigured
+                    }
+                    Some(_) => State::Stopped,
+                };
+                i.last_error = None;
+            }
+            return Ok(op);
+        }
+        let token = CancellationToken::new();
+        i.active = Some((op.operation_id.clone(), token.clone()));
+        let host = self.clone();
+        let id = op.operation_id.clone();
+        tokio::spawn(async move {
+            let result = host.execute(action, &id, &token).await;
+            host.finish(&id, action, result).await;
+        });
+        Ok(op)
+    }
+    async fn phase(&self, id: &str, phase: Phase) {
+        let mut i = self.inner.lock().await;
+        if let Some(op) = i.operations.get_mut(id) {
+            op.phase = phase;
+        }
+    }
+    fn block_gateway(&self) {
+        if let Ok(gateway) = self.router.idoris_gateway() {
+            *self.draining.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(Arc::downgrade(&gateway));
+        }
+        self.router.block_idoris("managed iDoris not ready");
+    }
+    async fn connect_gateway(
+        &self,
+        record: &Installation,
+        cancel: &CancellationToken,
+    ) -> Result<(), Code> {
+        let secrets = ClassifiedSecrets {
+            source: self.secrets.as_ref(),
+            failure: SyncMutex::new(None),
+        };
+        self.managed
+            .connect(
+                ManagedConfig {
+                    url: format!("http://127.0.0.1:{}", record.data_port),
+                    key_id: record.key_id.clone().ok_or(Code::NotConfigured)?,
+                },
+                &secrets,
+                cancel,
+            )
+            .await
+            .map_err(|_| {
+                if cancel.is_cancelled() {
+                    Code::Cancelled
+                } else {
+                    secrets
+                        .failure
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .unwrap_or(Code::StartFailed)
+                }
+            })
+    }
+    async fn execute(
+        self: &Arc<Self>,
+        action: Action,
+        id: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(), Code> {
+        if action == Action::Stop {
+            self.phase(id, Phase::Stopping).await;
+            self.block_gateway();
+            let (supervisor, record) = {
+                let mut i = self.inner.lock().await;
+                i.generation = None;
+                (i.supervisor.take(), i.installation.clone())
+            };
+            if let Some(s) = supervisor {
+                let report = s.stop().await.map_err(Code::from)?;
+                if report.forced || report.drain_timed_out {
+                    return Err(Code::StopTimeout);
+                }
+            } else {
+                let record = record.ok_or(Code::InstanceConflict)?;
+                Supervisor::recover_leftover(
+                    DataPaths {
+                        db: self.root.join("data/idoris.sqlite3"),
+                        state: self.root.join("data/state"),
+                    },
+                    &record.release_dir.join("idoris"),
+                )
+                .await
+                .map_err(Code::from)?;
+            }
+            return Ok(());
+        }
+        self.phase(id, Phase::Starting).await;
+        let record = {
+            let mut i = self.inner.lock().await;
+            i.state = State::Starting;
+            i.installation.clone().ok_or(Code::NotInstalled)?
+        };
+        // Preparation is read-only; cancellation can drop it before any spawn.
+        let (config, inputs) = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Code::Cancelled),
+            result = async {
+                self.secrets.secret(record.key_id.as_deref().ok_or(Code::NotConfigured)?)
+                    .await.map_err(secret_code)?;
+                let config = self.runtime.config(&self.root, &record, cancel.clone()).await?;
+                let inputs = self.runtime.inputs(&record).await?;
+                Ok::<_, Code>((config, inputs))
+            } => result?,
+        };
+        let runtime = self.runtime.clone();
+        let refresh_record = record.clone();
+        let mut initial = Some(inputs);
+        let refresh_failure = Arc::new(SyncMutex::new(None));
+        let input_failure = refresh_failure.clone();
+        let host = Arc::downgrade(self);
+        let supervisor = Supervisor::start(
+            config,
+            move || {
+                let first = initial.take();
+                let runtime = runtime.clone();
+                let r = refresh_record.clone();
+                let failure = input_failure.clone();
+                async move {
+                    match first {
+                        Some(inputs) => Ok(inputs),
+                        None => runtime.inputs(&r).await.map_err(|code| {
+                            *failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
+                            SupervisorError::Configuration
+                        }),
+                    }
+                }
+            },
+            move || async move {
+                if let Some(host) = host.upgrade() {
+                    host.block_gateway();
+                    loop {
+                        let pending = host
+                            .draining
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_ref()
+                            .is_some_and(|w| w.strong_count() > 0);
+                        if !pending {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            },
+        )
+        .await
+        .map_err(|error| {
+            refresh_failure
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .unwrap_or_else(|| Code::from(error))
+        })?;
+        let ready = supervisor.accepting_requests();
+        self.phase(id, Phase::Connecting).await;
+        let connected = async {
+            ReadySignal(ready.clone())
+                .wait_ready(cancel)
+                .await
+                .map_err(|_| Code::StartFailed)?;
+            self.connect_gateway(&record, cancel).await
+        }
+        .await;
+        if let Err(e) = connected {
+            self.block_gateway();
+            supervisor.stop().await.map_err(Code::from)?;
+            return Err(e);
+        }
+        {
+            let mut i = self.inner.lock().await;
+            i.supervisor = Some(supervisor);
+            i.generation = Some(id.to_owned());
+        }
+        self.monitor(
+            ready,
+            record,
+            id.to_owned(),
+            cancel.clone(),
+            refresh_failure,
+        );
+        Ok(())
+    }
+    fn monitor(
+        self: &Arc<Self>,
+        mut signal: watch::Receiver<bool>,
+        record: Installation,
+        generation: String,
+        cancel: CancellationToken,
+        refresh_failure: Arc<SyncMutex<Option<Code>>>,
+    ) {
+        let host = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                let changed = signal.changed().await;
+                let Some(host) = host.upgrade() else {
+                    return;
+                };
+                if changed.is_err() {
+                    loop {
+                        let notified = host.changed.notified();
+                        let mut i = host.inner.lock().await;
+                        if i.closing
+                            || cancel.is_cancelled()
+                            || i.generation.as_deref() != Some(&generation)
+                        {
+                            return;
+                        }
+                        if i.active.is_some() {
+                            drop(i);
+                            notified.await;
+                            continue;
+                        }
+                        if let Some(supervisor) = i.supervisor.take() {
+                            // The readiness sender has closed: the supervisor has
+                            // already returned, so this join cannot wait for a stop.
+                            let error = supervisor.wait().await.err().map(Code::from);
+                            let error = refresh_failure
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .take()
+                                .or(error)
+                                .or(i.last_error);
+                            host.block_gateway();
+                            i.last_error = error;
+                            i.state = match error {
+                                Some(Code::InstanceConflict) => State::InstanceConflict,
+                                Some(_) => State::Failed,
+                                None => State::Stopped,
+                            };
+                        }
+                        return;
+                    }
+                }
+                if !*signal.borrow_and_update() {
+                    let mut i = host.inner.lock().await;
+                    if !i.closing
+                        && !cancel.is_cancelled()
+                        && i.generation.as_deref() == Some(&generation)
+                        && i.supervisor.is_some()
+                    {
+                        host.block_gateway();
+                        i.state = State::Starting;
+                    }
+                } else {
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    let result = host.connect_gateway(&record, &cancel).await;
+                    let mut i = host.inner.lock().await;
+                    if i.closing
+                        || cancel.is_cancelled()
+                        || i.generation.as_deref() != Some(&generation)
+                        || i.supervisor.is_none()
+                    {
+                        host.block_gateway();
+                        return;
+                    }
+                    if result.is_ok() {
+                        i.state = State::Running;
+                    } else {
+                        host.block_gateway();
+                        i.last_error = result.err();
+                        i.state = State::Failed;
+                        if let Some(s) = &i.supervisor {
+                            s.request_stop();
+                        }
+                    }
+                }
+            }
+        });
+    }
+    async fn finish(&self, id: &str, action: Action, mut result: Result<(), Code>) {
+        let mut i = self.inner.lock().await;
+        if action == Action::Start
+            && result.is_ok()
+            && i.active
+                .as_ref()
+                .is_some_and(|(_, cancel)| cancel.is_cancelled())
+        {
+            let supervisor = i.supervisor.take();
+            drop(i);
+            self.block_gateway();
+            result = match supervisor {
+                Some(supervisor) => supervisor
+                    .stop()
+                    .await
+                    .map_err(Code::from)
+                    .and(Err(Code::Cancelled)),
+                None => Err(Code::Cancelled),
+            };
+            i = self.inner.lock().await;
+        }
+        i.last_error = result.err();
+        i.state = match result {
+            Ok(()) if action == Action::Start => {
+                if i.supervisor
+                    .as_ref()
+                    .is_some_and(|s| *s.accepting_requests().borrow())
+                {
+                    State::Running
+                } else {
+                    State::Starting
+                }
+            }
+            Ok(()) => match &i.installation {
+                None => State::NotInstalled,
+                Some(r) if r.key_id.is_none() || r.components_dir.is_none() => State::NotConfigured,
+                _ => State::Stopped,
+            },
+            Err(Code::InstanceConflict) => State::InstanceConflict,
+            Err(Code::Cancelled) => State::Stopped,
+            Err(_) => State::Failed,
+        };
+        if let Some(op) = i.operations.get_mut(id) {
+            op.phase = Phase::Completed;
+            op.cancellable = false;
+            op.error_code = result.err();
+            op.result = Some(match result {
+                Ok(()) => Outcome::Succeeded,
+                Err(Code::Cancelled) => Outcome::Cancelled,
+                Err(_) => Outcome::Failed,
+            });
+        }
+        if write_json(&self.root.join("operations.json"), &i.operations).is_err() {
+            if let Some(op) = i.operations.get_mut(id) {
+                op.result = Some(Outcome::Failed);
+                op.error_code = Some(Code::PersistenceFailed);
+            }
+            i.last_error = Some(Code::PersistenceFailed);
+            i.state = State::Failed;
+        }
+        i.active = None;
+        self.changed.notify_waiters();
+    }
+    pub async fn cancel(&self, id: &str) -> Result<Operation, Code> {
+        let mut i = self.inner.lock().await;
+        let op = i.operations.get(id).cloned().ok_or(Code::NotFound)?;
+        if op.result.is_some() {
+            return Ok(op);
+        }
+        if !op.cancellable {
+            return Err(Code::NotCancellable);
+        }
+        if let Some(record) = i.installation.as_mut() {
+            let mut updated = record.clone();
+            updated.desired_running = false;
+            write_json(&self.root.join("installation.json"), &updated)?;
+            *record = updated;
+        }
+        if let Some((active, token)) = &i.active
+            && active == id
+        {
+            token.cancel();
+        }
+        Ok(op)
+    }
+    /// Register before restore so daemon cancellation owns every spawned generation.
+    pub fn stop_on_shutdown(
+        self: &Arc<Self>,
+        cancel: CancellationToken,
+    ) -> tokio::task::JoinHandle<Result<(), Code>> {
+        let host = self.clone();
+        tokio::spawn(async move {
+            cancel.cancelled().await;
+            host.shutdown().await
+        })
+    }
+    /// Close admission, cancel an in-flight start, then wait for reaping.
+    pub async fn shutdown(&self) -> Result<(), Code> {
+        loop {
+            let notified = self.changed.notified();
+            let mut i = self.inner.lock().await;
+            i.closing = true;
+            if let Some((_, token)) = &i.active {
+                token.cancel();
+                drop(i);
+                notified.await;
+                continue;
+            }
+            let supervisor = i.supervisor.take();
+            drop(i);
+            self.block_gateway();
+            if let Some(supervisor) = supervisor {
+                let report = supervisor.stop().await.map_err(Code::from)?;
+                if report.forced || report.drain_timed_out {
+                    return Err(Code::StopTimeout);
+                }
+            }
+            let mut i = self.inner.lock().await;
+            if i.installation.is_some() {
+                i.state = State::Stopped;
+            }
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

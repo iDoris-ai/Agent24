@@ -123,6 +123,35 @@ impl InstalledVersion {
         }
     }
 
+    /// Revalidate a saved installation against the pinned archive before execution.
+    pub fn verify_existing(
+        directory: &Path,
+        lock: &IdorisLock,
+        archive: &VerifiedArchive,
+        signature: &dyn SignatureVerifier,
+    ) -> Result<Self, InstallError> {
+        signature.check_platform()?;
+        let asset = lock
+            .asset_for("aarch64-apple-darwin")
+            .ok_or(InstallError::UnsupportedPlatform)?;
+        validate_files(&asset.files)?;
+        let cancel = CancellationToken::new();
+        let bytes = read_archive_bytes(open_regular(&archive.path)?, &asset.sha256, &cancel)?;
+        let request = ChildRequest {
+            sha256: asset.sha256.clone(),
+            staging: PathBuf::new(),
+            files: asset.files.clone(),
+            limit: MAX_UNPACKED_BYTES,
+        };
+        let expected = scan_archive(&request, &bytes, false, &cancel)?;
+        verify_tree(directory, &expected, true, &cancel)?;
+        signature.verify(&directory.join("idoris"), &lock.team_id)?;
+        Ok(Self {
+            directory: fs::canonicalize(directory)?,
+            manifest: expected,
+        })
+    }
+
     pub fn directory(&self) -> &Path {
         &self.directory
     }
@@ -870,6 +899,63 @@ fn violation(message: impl Into<String>) -> InstallError {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn restored_installation_rechecks_every_pinned_file_before_launch() {
+        use flate2::{Compression, write::GzEncoder};
+
+        struct AcceptSignature;
+        impl SignatureVerifier for AcceptSignature {
+            fn verify(&self, _: &Path, _: &str) -> Result<(), InstallError> {
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("release");
+        let mut lock = IdorisLock::embedded().clone();
+        let asset = lock.assets.get_mut("aarch64-apple-darwin").unwrap();
+        let mut archive = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+        let original = b"fixture\n";
+        for name in &asset.files {
+            let path = release.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, original).unwrap();
+            set_mode(&path, if name == "idoris" { 0o500 } else { 0o400 }).unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(original.len() as u64);
+            header.set_mode(0o600);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, name, &original[..])
+                .unwrap();
+        }
+        for name in ["", "config", "config/components"] {
+            set_mode(&release.join(name), 0o700).unwrap();
+        }
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+        asset.sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let archive = VerifiedArchive {
+            path: dir.path().join("archive.tar.gz"),
+            sha256: asset.sha256.clone(),
+        };
+        fs::write(&archive.path, bytes).unwrap();
+        let installed =
+            InstalledVersion::verify_existing(&release, &lock, &archive, &AcceptSignature).unwrap();
+        installed.verify_for_launch().unwrap();
+
+        for name in &lock.assets["aarch64-apple-darwin"].files {
+            let path = release.join(name);
+            set_mode(&path, 0o600).unwrap();
+            fs::write(&path, b"changed\n").unwrap();
+            assert!(
+                matches!(installed.verify_for_launch(), Err(InstallError::HashMismatch(file)) if file == *name),
+                "restored installation accepted changes to {name}"
+            );
+            fs::write(&path, original).unwrap();
+            set_mode(&path, if name == "idoris" { 0o500 } else { 0o400 }).unwrap();
+        }
+    }
 
     #[test]
     fn operation_lock_release_does_not_wait_for_inherited_descriptors() {

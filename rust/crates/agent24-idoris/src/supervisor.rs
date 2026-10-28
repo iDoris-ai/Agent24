@@ -216,6 +216,18 @@ pub struct Supervisor {
     task: Option<JoinHandle<Result<StopReport, SupervisorError>>>,
 }
 impl Supervisor {
+    /// Reap a recorded orphan without launching a replacement. The lease and
+    /// kernel PID/start-time/executable/UID checks are shared with start().
+    pub async fn recover_leftover(
+        data: DataPaths,
+        executable: &Path,
+    ) -> Result<(), SupervisorError> {
+        let data = data.canonical()?;
+        let lease = Lease::acquire(&data.state)?;
+        lease
+            .recover(&Timings::default(), &CancellationToken::new(), executable)
+            .await
+    }
     pub async fn start<F, Fut, D, Drain>(
         mut config: StartConfig,
         mut refresh: F,
