@@ -3,6 +3,8 @@
 pub mod download;
 pub mod install;
 mod storage;
+#[cfg(unix)]
+pub mod omlx_probe;
 
 use semver::Version;
 use serde::Deserialize;
