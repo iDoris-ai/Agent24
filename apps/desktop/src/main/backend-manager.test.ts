@@ -336,13 +336,15 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
       expect(getBackendEndpoint()).toBeNull()
       expect(spawnProcess).not.toHaveBeenCalled()
       expect(manager.status()).toBe('error')
-      expect(manager.statusDetail()).toContain('请升级较旧的一方')
-      expect(manager.statusDetail()).toContain('4242')
+      expect(manager.statusDetail()).toEqual({
+        kind: 'protocol_mismatch', daemonVersion: CLIENT_PROTOCOL_VERSION + 1,
+        clientVersion: CLIENT_PROTOCOL_VERSION, recordedVersion: CLIENT_PROTOCOL_VERSION, pid: 4242,
+      })
       const logged = warn.mock.calls.map((args) => args.join(' ')).join('\n')
-      expect(logged).toContain('不复用外部 daemon')
-      expect(logged).toContain(`daemon 协议版本 ${CLIENT_PROTOCOL_VERSION + 1}`)
-      expect(logged).toContain(`客户端协议版本 ${CLIENT_PROTOCOL_VERSION}`)
-      expect(logged).toContain(`daemon.json 记录的协议版本为 ${CLIENT_PROTOCOL_VERSION}`)
+      expect(logged).toContain('refusing external daemon')
+      expect(logged).toContain(`"daemonVersion":${CLIENT_PROTOCOL_VERSION + 1}`)
+      expect(logged).toContain(`"clientVersion":${CLIENT_PROTOCOL_VERSION}`)
+      expect(logged).toContain(`"recordedVersion":${CLIENT_PROTOCOL_VERSION}`)
       expect(logged).toContain('4242')
 
       manager.stop()
@@ -370,11 +372,11 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
       expect(manager.isExternalDaemon()).toBe(false)
       expect(spawnProcess).not.toHaveBeenCalled()
       expect(manager.status()).toBe('error')
-      expect(manager.statusDetail()).toContain('请升级较旧的一方')
-      expect(manager.statusDetail()).toContain('daemon.json 没有记录协议版本')
-      expect(manager.statusDetail()).toContain('4242')
+      expect(manager.statusDetail()).toEqual({
+        kind: 'protocol_mismatch', daemonVersion: null, clientVersion: CLIENT_PROTOCOL_VERSION, pid: 4242,
+      })
       const logged = warn.mock.calls.map((args) => args.join(' ')).join('\n')
-      expect(logged).toContain('daemon 版本过旧，请升级')
+      expect(logged).toContain('"daemonVersion":null')
 
       manager.stop()
     } finally {
@@ -421,9 +423,12 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
       expect(manager.isExternalDaemon()).toBe(false)
       expect(getBackendEndpoint()).toBeNull()
       expect(manager.status()).toBe('error')
-      expect(manager.statusDetail()).toContain('daemon 版本过旧，请升级')
+      expect(manager.statusDetail()).toEqual({
+        kind: 'protocol_mismatch', daemonVersion: null,
+        clientVersion: CLIENT_PROTOCOL_VERSION, recordedVersion: CLIENT_PROTOCOL_VERSION, pid: 4242,
+      })
       const logged = warn.mock.calls.map((args) => args.join(' ')).join('\n')
-      expect(logged).toContain('不复用外部 daemon')
+      expect(logged).toContain('refusing external daemon')
 
       manager.stop()
     } finally {
@@ -572,10 +577,10 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
       expect(getBackendEndpoint()).toBeNull()
       expect(manager.status()).toBe('error')
       const detail = manager.statusDetail()
-      expect(detail).toContain('请升级较旧的一方')
-      expect(detail).toContain('4242')
-      expect(detail).toContain(`daemon 协议版本 ${CLIENT_PROTOCOL_VERSION + 1}`)
-      expect(detail).toContain(`客户端协议版本 ${CLIENT_PROTOCOL_VERSION}`)
+      expect(detail).toEqual({
+        kind: 'protocol_mismatch', daemonVersion: CLIENT_PROTOCOL_VERSION + 1,
+        clientVersion: CLIENT_PROTOCOL_VERSION, recordedVersion: CLIENT_PROTOCOL_VERSION, pid: 4242,
+      })
 
       const warnsAfterStart = warn.mock.calls.length
       expect(warnsAfterStart).toBeGreaterThan(0)

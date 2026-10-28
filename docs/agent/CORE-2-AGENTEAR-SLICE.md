@@ -8,7 +8,7 @@
 ```
 AgentEar ─exec→ agent24 os attach add --json
   CLI 读 daemon.json：auth_mode=capabilities 且有 enroll_endpoint
-  CLI ─UDS→ enroll.sock：hello → challenge → 身份校验（SecCode）→ enrolled{token}（日常级 FirstPartyShell）
+  CLI ─UDS→ enroll.sock：challenge（服务端先发）→ hello{nonce} → 身份校验（SecCode）→ enrolled{token}（日常级 FirstPartyShell）
   CLI ─HTTP→ POST /api/v1/attached（Bearer token）→ 403 presence_required{operation,…}
   CLI ─UDS（同一连接）→ elevate{method,path,body_sha256,summary}
        daemon 生成挑战 → 在场证明提供者 = 桌面主进程（ProductHost 长轮询）
@@ -34,8 +34,8 @@ capabilities 仍非默认模式（D1）。legacy 行为一字不改。
 
 | 方向 | 帧 | 说明 |
 |---|---|---|
-| C→S | `{"v":1,"op":"hello","generation":"<daemon.json generation>"}` | generation 不符 → `error{code:"generation_mismatch"}` 并关闭 |
-| S→C | `{"v":1,"op":"challenge","conn_id":"<hex16>","nonce":"<hex32>"}` | 客户端不需要回签；nonce 绑定本连接，用于日志与提升挑战关联 |
+| S→C | `{"v":1,"op":"challenge","conn_id":"<hex16>","nonce":"<hex32>"}` | **服务端先发**（设计 §10 R8）。accept 后、读任何字节前先查入队字节，已有字节 → `error{code:"identity_rejected"}` 并关闭，不发 challenge |
+| C→S | `{"v":1,"op":"hello","generation":"<daemon.json generation>","nonce":"<challenge 的 nonce>"}` | 必须在收到 challenge 之后发，且原样回显 nonce；缺失或不符 → `identity_rejected`；generation 不符 → `error{code:"generation_mismatch"}` 并关闭。该帧照常逐帧复核 audit token |
 | S→C | `{"v":1,"op":"enrolled","token":"<opaque>","expires_in":3600,"tier":"daily","identity":{"kind":"macos_seccode","identifier":"agent24"}}` | 身份通过；token 只出现这一次 |
 | S→C | `{"v":1,"op":"error","code":"identity_rejected"\|"generation_mismatch"\|"unsupported_version"\|"bad_frame"\|"timeout","message":"…"}` | 随后关闭 |
 | C→S | `{"v":1,"op":"elevate","method":"POST","path":"/api/v1/attached","body_sha256":"<hex64>","summary":"<≤200 字符，仅供参考>"}` | 只能在已 enrolled 的连接上发 |
@@ -45,6 +45,8 @@ capabilities 仍非默认模式（D1）。legacy 行为一字不改。
 | C→S / S→C | `{"v":1,"op":"renew"}` / `enrolled{…}`（新 token，旧 token 原子作废） | 只在原连接上（R4） |
 
 - 握手各阶段 5 s；等待在场证明阶段 60 s（D4 挑战期限）。
+- **破坏性变更（#1448 复审 M1′-b，2026-10-28）**：原 v1 为客户端先发 `hello`、challenge 的 nonce 不校验；现改为服务端先发 challenge，`hello` 必须回显 nonce。`v` 仍为 1：该协议尚无已发布客户端（只有测试夹具），旧顺序的客户端无论哪条路径都会确定地得到 `identity_rejected`（字节已入队则在 challenge 前被拒；晚到则缺 nonce 被拒），不会误登记。若此后已有客户端发布，再改协议必须升 `v`。
+- 非 macOS 没有按写入者求值的 peer token，逐帧复核无从比较，一律按失败处理：每一帧都回 `identity_rejected`（登记本就只支持 macOS）。
 - 连接断开：不撤销已签令牌（冻结稿 D5 第 5 条）；令牌仍受进程存活与 TTL 约束。
 - daemon 侧 `summary` 由 daemon **自己**根据 method/path/body 生成后交给提供者展示；客户端的 summary 只记日志（D4 第 1 条：客户端自报摘要不能替代 daemon 摘要）。
 
