@@ -111,3 +111,12 @@ P4 生态 / 分发（M4/M5） ─────────── ◐ Marketplace 
 我即从该项开工：先出设计/拆片，再按 loop 规矩逐 PR 推进。
 
 > 非门后、可不拍板即做的零星项（如需填空档）：`wake_on_event`、G1/H3 PR-3 幂等尾测。
+
+## CORE-2 AgentEar 纵切的后续项（2026-10-28）
+
+依据 `docs/agent/CORE-2-AGENTEAR-SLICE.md`，S1/S2 不包含以下工作，不能据此宣称完整 CORE-2 投产：
+
+- Linux 签名清单、连接绑定的 FD 登记权与配对码退路；当前非 macOS 自动身份登记拒绝。
+- ProductHost 的有限 TTL 与父管道续期（Q4）；开发者令牌治理（Q6、R3）。
+- Swift LocalAuthentication helper、headless 在场证明提供者；S3 提供桌面确认通道。
+- 进程内模块的可核验路由清单；没有清单时，不为其建立 R1 委托。

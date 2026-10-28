@@ -13,6 +13,7 @@ pub fn unix_now() -> UnixSeconds {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Audience {
     ProductHost,
+    FirstPartyShell,
     CreativeRuntime,
 }
 
@@ -90,8 +91,20 @@ impl Resource {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirstPartyTier {
+    Daily,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FirstPartyClaims {
+    pub peer: crate::enroll_api::EnrolledPeer,
+    pub tier: FirstPartyTier,
+    pub deadline: tokio::time::Instant,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityClaims {
+    pub first_party: Option<FirstPartyClaims>,
     pub capability_id: String,
     pub audience: Audience,
     pub workspace_id: Option<String>,

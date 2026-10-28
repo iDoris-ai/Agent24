@@ -288,6 +288,14 @@ enum OsAction {
         #[command(subcommand)]
         action: OsAttachAction,
     },
+    /// Let first-party clients write to a module's current HTTP routes
+    /// (capabilities mode). ProductHost executes directly; first-party clients
+    /// require approval in the Agent24 app. A new module version or route set
+    /// needs a new delegation.
+    Delegate {
+        /// Module name, e.g. documents
+        name: String,
+    },
 }
 
 /// `agent24 os attach …` (A3-2a; §3.2/§3.6).
@@ -1351,6 +1359,9 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     if let OsAction::Uninstall { name } = &action {
         return cmd_uninstall(name).await;
     }
+    if let OsAction::Delegate { name } = &action {
+        return cmd_os_delegate(name).await;
+    }
     if let Some(done) = os_local(&action).await {
         return done;
     }
@@ -1381,7 +1392,7 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
         // Handled before the daemon lookup above; see `os_local`.
         OsAction::Install { .. } | OsAction::Uninstall { .. } => unreachable!(),
         // Handled at the top of this function, before it ever reaches here.
-        OsAction::Attach { .. } => unreachable!(),
+        OsAction::Attach { .. } | OsAction::Delegate { .. } => unreachable!(),
         OsAction::List => bearer(&ep, client().get(format!("{}/api/v1/os", ep.base))),
         OsAction::Enable { name } | OsAction::Disable { name } => {
             let enabled = matches!(action, OsAction::Enable { .. });
@@ -2040,6 +2051,43 @@ fn resolve_allow_relax(allow_remote: bool) -> bool {
 /// `agent24 os attach …` (A3-2a). Always goes through the daemon — see
 /// `cmd_os`'s doc comment on why `Attach` is intercepted before that
 /// function's own `req`/`out` match, which has different response shapes.
+/// `agent24 os delegate <name>` (CORE-2 §10 R1). Only a resident daemon holds
+/// delegation records, so this never starts an ephemeral one.
+async fn cmd_os_delegate(name: &str) -> Result<(), String> {
+    let ep = match attach_only().await {
+        Ok(Some(ep)) => ep,
+        Err(err) => return Err(err),
+        Ok(None) => {
+            return Err("daemon not running; start it with `agent24 daemon start`".to_owned());
+        }
+    };
+    let sent = bearer(
+        &ep,
+        client().post(format!("{}/api/v1/os/{name}/delegation", ep.base)),
+    )
+    .timeout(Duration::from_secs(10))
+    .send()
+    .await;
+    let out = match sent {
+        Ok(res) if res.status().is_success() => {
+            println!("delegated {name}: first-party clients may now write to its current routes");
+            Ok(())
+        }
+        Ok(res) => {
+            let status = res.status();
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            Err(if body["error"]["message"].as_str().is_some() {
+                daemon_error_line(&body)
+            } else {
+                format!("daemon returned {status}")
+            })
+        }
+        Err(e) => Err(e.to_string()),
+    };
+    finish(ep).await;
+    out
+}
+
 async fn cmd_os_attach(action: OsAttachAction) -> Result<(), String> {
     match action {
         OsAttachAction::Add {
@@ -2306,7 +2354,7 @@ fn offline_hint(path: &str, action: &OsAction) -> String {
         // Unreachable for the same reason as the `Install`/`Uninstall` arms
         // above are commented unreachable in `cmd_os`'s own match: `Attach`
         // returns from `cmd_os` before this function is ever called.
-        OsAction::Attach { .. } => unreachable!(),
+        OsAction::Attach { .. } | OsAction::Delegate { .. } => unreachable!(),
         OsAction::List => format!("read {path} to see what is configured"),
         OsAction::Enable { name } | OsAction::Disable { name } => {
             let key = serde_json::to_string(name).unwrap_or_else(|_| "\"?\"".to_owned());

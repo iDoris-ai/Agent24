@@ -104,14 +104,30 @@ fn sock(data: &Path) -> PathBuf {
     data.join("enroll.sock")
 }
 
+/// The endpoint speaks first (design R8): read its challenge, then send
+/// `request` and return everything after the challenge.
 fn ask(path: &Path, request: &[u8]) -> String {
     let mut s = UnixStream::connect(path).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut reader = BufReader::new(s.try_clone().unwrap());
+    let mut challenge = String::new();
+    reader.read_line(&mut challenge).unwrap();
+    assert!(challenge.contains("\"op\":\"challenge\""), "{challenge}");
     // The daemon may close mid-write on an over-long frame.
     let _ = s.write_all(request);
     let mut out = String::new();
-    let _ = s.read_to_string(&mut out);
+    let _ = reader.read_to_string(&mut out);
     out
+}
+
+/// Off macOS there is no peer token to tie a frame to its writer, so the
+/// endpoint refuses every frame (fail closed) before looking at it.
+fn code(code: &'static str) -> &'static str {
+    if cfg!(target_os = "macos") {
+        code
+    } else {
+        "identity_rejected"
+    }
 }
 
 fn wait_gone(path: &Path) {
@@ -190,7 +206,7 @@ fn second_instance_fails() {
     assert_fails_without_ready(&data, SERVICE);
     // The loser must not have touched the winner's socket.
     assert_eq!(std::fs::symlink_metadata(sock(&data)).unwrap().ino(), inode);
-    assert!(ask(&sock(&data), b"{}\n").contains("enroll_unavailable"));
+    assert!(ask(&sock(&data), b"{}\n").contains(code("bad_frame")));
 }
 
 #[test]
@@ -221,7 +237,7 @@ fn new_generation_replaces_a_stale_socket() {
         second.ready.as_ref().unwrap()["generation"],
         first.ready.as_ref().unwrap()["generation"]
     );
-    assert!(ask(&sock(&data), b"{}\n").contains("enroll_unavailable"));
+    assert!(ask(&sock(&data), b"{}\n").contains(code("bad_frame")));
 }
 
 #[test]
@@ -272,7 +288,7 @@ fn service_mode_ignores_stdin_eof_but_host_child_still_exits_on_it() {
     let (_root2, data2) = data_dir();
     let mut child = start_ok(&data2, CHILD);
     assert!(child.ready.as_ref().unwrap()["product_host_token"].is_string());
-    assert!(ask(&sock(&data2), b"{}\n").contains("enroll_unavailable"));
+    assert!(ask(&sock(&data2), b"{}\n").contains(code("bad_frame")));
     child.stdin.take();
     assert!(
         exit_code(&mut child, Duration::from_secs(15))
@@ -283,7 +299,7 @@ fn service_mode_ignores_stdin_eof_but_host_child_still_exits_on_it() {
 }
 
 #[test]
-fn endpoint_answers_unavailable_and_never_a_token() {
+fn endpoint_rejects_invalid_frames_and_never_a_token() {
     let (_root, data) = data_dir();
     let _d = start_ok(&data, SERVICE);
     for request in [
@@ -295,14 +311,22 @@ fn endpoint_answers_unavailable_and_never_a_token() {
         let reply: serde_json::Value = serde_json::from_str(reply.trim()).unwrap();
         assert_eq!(
             reply,
-            serde_json::json!({"error": "enroll_unavailable", "reason": "2c_not_implemented"})
+            serde_json::json!({"v":1,"op":"error","code": code(if request == b"{\"v\":999}\n" {"unsupported_version"} else {"bad_frame"}),"message":"Enrollment rejected"})
         );
     }
-    // Early EOF and an over-long frame get no reply at all.
-    assert_eq!(ask(&sock(&data), b""), "");
+    // An idle peer gets the protocol timeout. An actual early EOF closes
+    // silently after the server-first challenge.
+    assert!(ask(&sock(&data), b"").contains(code("timeout")));
+    let mut eof = UnixStream::connect(sock(&data)).unwrap();
+    eof.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    eof.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut reply = String::new();
+    eof.read_to_string(&mut reply).unwrap();
+    assert_eq!(reply.lines().count(), 1, "{reply}");
+    assert!(reply.contains("\"op\":\"challenge\""), "{reply}");
     let mut big = vec![b'x'; 20 * 1024];
     big.push(b'\n');
-    assert_eq!(ask(&sock(&data), &big), "");
+    assert!(ask(&sock(&data), &big).contains(code("bad_frame")));
 }
 
 #[test]
@@ -326,5 +350,5 @@ fn endpoint_caps_concurrent_connections_and_recovers() {
     // Freeing the slots restores service.
     drop(idle);
     std::thread::sleep(Duration::from_millis(300));
-    assert!(ask(&sock(&data), b"{}\n").contains("enroll_unavailable"));
+    assert!(ask(&sock(&data), b"{}\n").contains(code("bad_frame")));
 }
