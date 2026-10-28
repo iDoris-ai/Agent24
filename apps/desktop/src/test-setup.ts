@@ -24,5 +24,7 @@ if (typeof window !== 'undefined') {
   beforeEach(() => {
     setLocale(DEFAULT_LOCALE)
     window.localStorage.removeItem(LOCALE_STORAGE_KEY)
+    // Settings remembers its tab here. Drop it so a later file still opens General.
+    window.localStorage.removeItem('agent24:settings-tab')
   })
 }
