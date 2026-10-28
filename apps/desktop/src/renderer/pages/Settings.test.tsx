@@ -181,3 +181,43 @@ describe('SettingsPage English default', () => {
     expect(screen.getByText(/无法启动或连接 AI 模型服务/)).toBeInTheDocument()
   })
 })
+
+describe('SettingsPage: oMLX needs an API key (401) vs really down', () => {
+  beforeEach(() => { setLocale('en') })
+
+  it('detect says authRequired: explains the key is needed, points at the key field, does not auto-start', async () => {
+    mockOmlxDetect.mockResolvedValue({ authRequired: true, url: 'http://127.0.0.1:8088' })
+    await act(async () => { render(<SettingsPage />) })
+    expect(await screen.findByText(/oMLX is running but requires an API key/)).toBeInTheDocument()
+    expect(mockOmlxStart).not.toHaveBeenCalled()
+    const keyField = screen.getByLabelText('API Key')
+    expect(keyField).toHaveAttribute('aria-invalid', 'true')
+    expect(keyField).toHaveFocus()
+    // not the generic "could not start or connect" message
+    expect(screen.queryByText(/Could not start or connect/)).toBeNull()
+  })
+
+  it('really down (detect null, start fails): still the generic connect error, key field not flagged', async () => {
+    mockOmlxDetect.mockResolvedValue(null)
+    mockOmlxStart.mockResolvedValue({ ok: false, url: '', error: 'nope' })
+    await act(async () => { render(<SettingsPage />) })
+    expect(await screen.findByText(/Could not start or connect/)).toBeInTheDocument()
+    expect(screen.queryByText(/requires an API key/)).toBeNull()
+    expect(screen.getByLabelText('API Key')).toHaveAttribute('aria-invalid', 'false')
+  })
+
+  it('Test button: 401 -> key-needed message; other failure -> plain failure text', async () => {
+    mockOmlxDetect.mockResolvedValue(null)
+    mockOmlxStart.mockResolvedValue({ ok: false, url: '', error: '' })
+    await act(async () => { render(<SettingsPage />) })
+    await screen.findByText(/Could not start or connect/)
+
+    mockOmlxModels.mockResolvedValueOnce({ ok: false, models: [], authRequired: true, error: 'authentication required' })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /^Test$/ })) })
+    expect(await screen.findByText(/requires an API key/)).toBeInTheDocument()
+
+    mockOmlxModels.mockResolvedValueOnce({ ok: false, models: [], error: 'no response or no models' })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /^Test$/ })) })
+    expect(await screen.findByText(/no response or no models/)).toBeInTheDocument()
+  })
+})

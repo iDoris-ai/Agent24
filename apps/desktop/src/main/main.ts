@@ -3,8 +3,10 @@
 import { app, BrowserWindow, Menu, Tray, WebContentsView, nativeImage, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
+import { initMainLocale, onMainLocaleChange } from './main-i18n'
+import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
-import { BackendManager, type BackendStatus } from './backend-manager'
+import { BackendManager } from './backend-manager'
 import { AgentEarEventBridge } from './agentear-events'
 import { documentsEvent } from './documents'
 import { AgentEarEventLog } from './agentear-log'
@@ -120,6 +122,9 @@ async function showCreativeView(
   if (!creativeViewFence.isCurrent(requestGeneration)) return { ok: false, error: 'Creative view request superseded' }
   if (status.state === 'needs-download') {
     return { ok: false, needsDownload: true, size: status.size }
+  }
+  if (status.state === 'failed' && status.notInstalled) {
+    return { ok: false, notInstalled: true, error: status.error }
   }
   if (status.state !== 'ready' || !status.origin) {
     return { ok: false, error: status.error ?? 'Open Design did not become ready' }
@@ -251,6 +256,10 @@ app.on('second-instance', () => {
 
 app.whenReady().then(async () => {
   if (!isPrimaryInstance) return
+  // UI language for the tray and native dialogs: English unless the user chose
+  // otherwise (the renderer reports its setting; the system locale is ignored).
+  initMainLocale(app.getPath('userData'))
+  onMainLocaleChange(() => refreshTray())
   const idorisStatus = await idorisStatusProviderPromise
   // Owner decision 2026-10-05: Open Design is downloaded on demand (see
   // open-design-component.ts) instead of being bundled in the installer.
@@ -373,62 +382,37 @@ app.whenReady().then(async () => {
   app.on('activate', () => showOrCreateWindow())
 })
 
-// F1b: labels/glyphs for the current daemon status.
-const STATUS_META: Record<BackendStatus, { title: string; label: string }> = {
-  running: { title: '⚡A24', label: '● daemon：运行中' },
-  starting: { title: '…A24', label: '○ daemon：启动中…' },
-  stopped: { title: '⚠️A24', label: '✕ daemon：已停止' },
-  blocked: { title: '⚠️A24', label: '✕ daemon：被另一个 Agent24 占用' },
-}
-
-// Rebuild the tray title, tooltip, and context menu from the live daemon status.
-// Cheap and idempotent — safe to call on a timer.
+// Rebuild the tray title, tooltip, and context menu from the live daemon status
+// and the current UI language. Cheap and idempotent — safe to call on a timer,
+// and called again whenever the language changes.
 function refreshTray(): void {
   if (!tray) return
-  const status = backendManager.status()
-  const external = backendManager.isExternalDaemon()
-  const meta = STATUS_META[status]
-  // DEP-A5: an external daemon (reused from `agent24 daemon start`, not
-  // spawned by this app) gets a visibly different label — the whole point of
-  // requirement #2 is that the user can tell them apart before hitting stop.
-  const foreign = backendManager.foreignDaemonPid()
-  const label = external
-    ? `${meta.label}（外部 daemon · pid ${backendManager.externalDaemonPid() ?? '?'}）`
-    : foreign !== null ? `${meta.label}（pid ${foreign}）` : meta.label
-  if (process.platform === 'darwin') tray.setTitle(meta.title)
-  tray.setToolTip(`Agent24 — ${label.replace(/^[●○✕]\s*/, '')}（${backendManager.backendKind()}）`)
+  const view = buildTrayView({
+    status: backendManager.status(),
+    external: backendManager.isExternalDaemon(),
+    externalPid: backendManager.externalDaemonPid() ?? null,
+    foreignPid: backendManager.foreignDaemonPid(),
+    backendKind: backendManager.backendKind(),
+  })
+  if (process.platform === 'darwin') tray.setTitle(view.title)
+  tray.setToolTip(view.tooltip)
 
-  // DEP-A5 requirement #2: stop/restart must only ever act on a daemon this
-  // app spawned. BackendManager.stopDaemon()/restart() already guard against
-  // killing an external daemon at the method level (see backend-manager.ts),
-  // but the external case also gets its own menu wording here — "断开" instead
-  // of "停止/重启" — so the tray itself never implies a kill that won't happen.
-  const daemonItems: MenuItemConstructorOptions[] =
-    status === 'stopped'
-      ? [{ label: '启动 daemon', click: () => { backendManager.startDaemon(); refreshTray() } }]
-      : external
-        ? [{ label: '断开外部 daemon（不会终止它）', click: () => { backendManager.stopDaemon(); refreshTray() } }]
-        : [
-            { label: '重启 daemon', click: () => { backendManager.restart(); refreshTray() } },
-            { label: '停止 daemon', click: () => { backendManager.stopDaemon(); refreshTray() } },
-          ]
-
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label, enabled: false },
-    { type: 'separator' },
-    { label: '显示窗口', click: () => showOrCreateWindow() },
-    { type: 'separator' },
-    ...daemonItems,
-    { type: 'separator' },
-    {
-      label: '退出 Agent24',
-      click: () => {
-        // Clear tray ref so win.on('close') guard is skipped and app can quit
-        tray = null
-        app.quit()
-      },
+  const actions: Record<TrayAction, () => void> = {
+    start: () => { backendManager.startDaemon(); refreshTray() },
+    disconnect: () => { backendManager.stopDaemon(); refreshTray() },
+    restart: () => { backendManager.restart(); refreshTray() },
+    stop: () => { backendManager.stopDaemon(); refreshTray() },
+    show: () => showOrCreateWindow(),
+    quit: () => {
+      // Clear tray ref so win.on('close') guard is skipped and app can quit
+      tray = null
+      app.quit()
     },
-  ]))
+  }
+  tray.setContextMenu(Menu.buildFromTemplate(view.items.map((item): MenuItemConstructorOptions =>
+    'type' in item ? { type: 'separator' }
+      : 'action' in item ? { label: item.label, click: actions[item.action] }
+        : { label: item.label, enabled: false })))
 }
 
 app.on('before-quit', () => {
