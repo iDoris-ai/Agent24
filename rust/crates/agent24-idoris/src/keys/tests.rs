@@ -172,7 +172,8 @@ async fn lost_issue_result_lists_exact_owner_and_revokes_only_its_key() {
     for mode in ["lost", "unknown", "exit-failure", "oversized", "timeout"] {
         let mut f = Fixture::new(mode, false);
         if mode == "timeout" {
-            f.keys.timeout = Duration::from_millis(300);
+            // The fixture sleeps 2s; leave room for a slow Python start under load.
+            f.keys.timeout = Duration::from_millis(1500);
         }
         let error = f.keys.issue("installation", &[]).await.unwrap_err();
         let calls = f.calls();
