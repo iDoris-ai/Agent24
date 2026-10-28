@@ -154,6 +154,29 @@ impl Keys {
     }
 
     pub async fn issue(&self, install_id: &str, roles: &[&str]) -> Result<IssuedKey, KeyError> {
+        self.issue_transaction(install_id, roles, false).await
+    }
+
+    /// Keep the compensation journal until the host has committed the connection.
+    pub async fn issue_pending(
+        &self,
+        install_id: &str,
+        roles: &[&str],
+    ) -> Result<IssuedKey, KeyError> {
+        self.issue_transaction(install_id, roles, true).await
+    }
+
+    pub fn commit_issue(&self) -> Result<(), KeyError> {
+        let _lock = self.operation_lock()?;
+        self.clear_operation()
+    }
+
+    async fn issue_transaction(
+        &self,
+        install_id: &str,
+        roles: &[&str],
+        retain: bool,
+    ) -> Result<IssuedKey, KeyError> {
         let _lock = self.operation_lock()?;
         if let Some(mut operation) = self.read_operation()? {
             self.compensate(&mut operation).await?;
@@ -178,7 +201,8 @@ impl Keys {
         self.write_operation(&operation)?;
         let result = match self.issue_inner(&mut operation, roles).await {
             // Until this durable removal, a crash is treated as failed issuance.
-            Ok(issued) => self.clear_operation().map(|()| issued),
+            Ok(issued) if !retain => self.clear_operation().map(|()| issued),
+            Ok(issued) => Ok(issued),
             Err(error) => Err(error),
         };
         match result {
@@ -294,6 +318,16 @@ impl Keys {
         }
         while let Some(key_id) = operation.pending_key_ids.first() {
             self.revoke(key_id).await?;
+            let store = self.store.clone();
+            let id = key_id.clone();
+            let deleted = tokio::task::spawn_blocking(move || store.delete(&id))
+                .await
+                .map_err(|_| KeyError::Record)?;
+            if let Err(error) = deleted
+                && error != KeychainError::NotFound
+            {
+                return Err(error.into());
+            }
             operation.pending_key_ids.remove(0);
             self.write_operation(operation)?;
         }

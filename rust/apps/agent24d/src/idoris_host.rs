@@ -28,6 +28,11 @@ use tokio::sync::{Mutex, Notify, watch};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
+mod provision;
+pub use provision::{
+    Candidates, ConnectConsent, ConnectRequest, InstallRequest, Provisioner, SystemProvisioner,
+};
+
 /// Drain (30s), TERM (17s), KILL/reap and scheduling margin.
 pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(50);
 
@@ -115,22 +120,39 @@ pub enum Code {
     ShuttingDown,
     InvalidRequest,
     PersistenceFailed,
+    OmlxUnreachable,
+    OmlxAuthRequired,
+    OmlxAuthRejected,
+    UnknownService,
+    ModelNotFound,
+    ConsentRequired,
+    SetupFailed,
+    VerifyFailed,
+    ReplaceRequired,
 }
 impl Code {
     pub fn http_status(self) -> axum::http::StatusCode {
         use axum::http::StatusCode as H;
         match self {
             Self::NotFound => H::NOT_FOUND,
-            Self::NotInstalled | Self::NotConfigured | Self::ContractMismatch => {
-                H::UNPROCESSABLE_ENTITY
-            }
-            Self::InstanceConflict | Self::Busy | Self::NotCancellable | Self::Cancelled => {
-                H::CONFLICT
-            }
-            Self::KeychainLocked | Self::KeyUnavailable | Self::ShuttingDown => {
-                H::SERVICE_UNAVAILABLE
-            }
-            Self::StartFailed => H::BAD_GATEWAY,
+            Self::ConsentRequired
+            | Self::ModelNotFound
+            | Self::UnknownService
+            | Self::NotInstalled
+            | Self::NotConfigured
+            | Self::ContractMismatch => H::UNPROCESSABLE_ENTITY,
+            Self::ReplaceRequired
+            | Self::InstanceConflict
+            | Self::Busy
+            | Self::NotCancellable
+            | Self::Cancelled => H::CONFLICT,
+            Self::OmlxUnreachable
+            | Self::OmlxAuthRequired
+            | Self::OmlxAuthRejected
+            | Self::KeychainLocked
+            | Self::KeyUnavailable
+            | Self::ShuttingDown => H::SERVICE_UNAVAILABLE,
+            Self::SetupFailed | Self::VerifyFailed | Self::StartFailed => H::BAD_GATEWAY,
             Self::StopTimeout => H::GATEWAY_TIMEOUT,
             Self::InvalidRequest => H::BAD_REQUEST,
             Self::PersistenceFailed => H::INTERNAL_SERVER_ERROR,
@@ -138,6 +160,15 @@ impl Code {
     }
     pub fn message(self) -> &'static str {
         match self {
+            Self::OmlxUnreachable => "无法连接 oMLX",
+            Self::OmlxAuthRequired => "oMLX 需要凭据",
+            Self::OmlxAuthRejected => "oMLX 拒绝了凭据",
+            Self::UnknownService => "端点不是已确认的 oMLX 服务",
+            Self::ModelNotFound => "请选择 oMLX 中存在的模型",
+            Self::ConsentRequired => "请确认凭据交接与选定模型",
+            Self::SetupFailed => "iDoris 配置失败",
+            Self::VerifyFailed => "iDoris 对话验证失败",
+            Self::ReplaceRequired => "已有连接，请显式确认替换",
             Self::NotInstalled => "尚未安装 iDoris",
             Self::NotConfigured => "请先完成 iDoris 配置",
             Self::InstanceConflict => "同一数据库已有实例或遗留进程身份无法确认",
@@ -180,12 +211,22 @@ pub struct Status {
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
+    Install,
+    Connect,
     Start,
     Stop,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
+    Downloading,
+    Verifying,
+    Installing,
+    Setup,
+    IssuingKey,
+    VerifyingConnection,
+    RollingBack,
+    Done,
     Queued,
     Starting,
     Connecting,
@@ -208,6 +249,10 @@ pub struct Operation {
     pub error_code: Option<Code>,
     pub cancellable: bool,
     idempotency_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_code: Option<agent24_idoris::setup::SetupCode>,
 }
 
 pub struct KeychainSource(pub Arc<dyn Keychain>);
@@ -340,9 +385,17 @@ impl Runtime for SystemRuntime {
         .await
         .map_err(|_| Code::StartFailed)?;
         let key = if let Some(id) = &r.omlx_key_id {
-            Some(self.secrets.secret(id).await.map_err(secret_code)?)
+            Some(
+                KeychainSource(Arc::new(agent24_idoris::keychain::OmlxKeychain))
+                    .secret(id)
+                    .await
+                    .map_err(secret_code)?,
+            )
         } else {
-            None
+            SystemProvisioner
+                .upstream_key()
+                .await?
+                .map(ApiKey::into_secret)
         };
         {
             let url = r.omlx_url.as_deref().ok_or(Code::NotConfigured)?;
@@ -389,6 +442,9 @@ pub struct IdorisHost {
     managed: Arc<ManagedIdoris>,
     router: Arc<ModelRouter>,
     draining: SyncMutex<Option<Weak<IdorisGateway>>>,
+    provisioner: Arc<dyn Provisioner>,
+    data_keys: Arc<dyn Keychain>,
+    omlx_keys: Arc<dyn Keychain>,
 }
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Code> {
     let parent = path.parent().ok_or(Code::PersistenceFailed)?;
@@ -473,6 +529,9 @@ impl IdorisHost {
             router,
             changed: Notify::new(),
             draining: SyncMutex::new(None),
+            provisioner: Arc::new(SystemProvisioner),
+            data_keys: Arc::new(SystemKeychain),
+            omlx_keys: Arc::new(agent24_idoris::keychain::OmlxKeychain),
             inner: Mutex::new(Inner {
                 installation,
                 state,
@@ -526,6 +585,7 @@ impl IdorisHost {
             .ok_or(Code::NotFound)
     }
     pub async fn restore(self: &Arc<Self>) -> Result<(), Code> {
+        self.recover_connect().await?;
         let restore = self
             .inner
             .lock()
@@ -543,6 +603,9 @@ impl IdorisHost {
         action: Action,
         idempotency: Option<&str>,
     ) -> Result<Operation, Code> {
+        if !matches!(action, Action::Start | Action::Stop) {
+            return Err(Code::InvalidRequest);
+        }
         let mut i = self.inner.lock().await;
         if i.closing {
             return Err(Code::ShuttingDown);
@@ -579,6 +642,7 @@ impl IdorisHost {
                 return Err(Code::NotConfigured);
             }
         }
+        let guard = self.coordinator_lock()?;
         if let Some(r) = i.installation.as_mut() {
             let mut updated = r.clone();
             updated.desired_running = action == Action::Start;
@@ -599,6 +663,8 @@ impl IdorisHost {
             error_code: None,
             cancellable: !noop && action == Action::Start,
             idempotency_key: key,
+            request_fingerprint: None,
+            setup_code: None,
         };
         i.operations.insert(op.operation_id.clone(), op.clone());
         if let Err(e) = write_json(&self.root.join("operations.json"), &i.operations) {
@@ -623,6 +689,7 @@ impl IdorisHost {
         let host = self.clone();
         let id = op.operation_id.clone();
         tokio::spawn(async move {
+            let _guard = guard;
             let result = host.execute(action, &id, &token).await;
             host.finish(&id, action, result).await;
         });
@@ -632,6 +699,12 @@ impl IdorisHost {
         let mut i = self.inner.lock().await;
         if let Some(op) = i.operations.get_mut(id) {
             op.phase = phase;
+            if phase == Phase::RollingBack {
+                op.cancellable = false;
+            }
+        }
+        if write_json(&self.root.join("operations.json"), &i.operations).is_err() {
+            tracing::warn!("cannot persist iDoris operation phase");
         }
     }
     fn block_gateway(&self) {
@@ -696,6 +769,27 @@ impl IdorisHost {
             i.state = State::Starting;
             i.installation.clone().ok_or(Code::NotInstalled)?
         };
+        let (supervisor, ready, refresh_failure) =
+            self.start_record(&record, id, cancel, true, None).await?;
+        self.inner.lock().await.supervisor = Some(supervisor);
+        self.monitor(ready, record, cancel.clone(), refresh_failure);
+        Ok(())
+    }
+    async fn start_record(
+        self: &Arc<Self>,
+        record: &Installation,
+        id: &str,
+        cancel: &CancellationToken,
+        publish: bool,
+        override_inputs: Option<LaunchInputs>,
+    ) -> Result<
+        (
+            Supervisor,
+            watch::Receiver<bool>,
+            Arc<SyncMutex<Option<Code>>>,
+        ),
+        Code,
+    > {
         // Preparation is read-only; cancellation can drop it before any spawn.
         let (config, inputs) = tokio::select! {
             biased;
@@ -703,13 +797,18 @@ impl IdorisHost {
             result = async {
                 self.secrets.secret(record.key_id.as_deref().ok_or(Code::NotConfigured)?)
                     .await.map_err(secret_code)?;
-                let config = self.runtime.config(&self.root, &record, cancel.clone()).await?;
-                let inputs = self.runtime.inputs(&record).await?;
+                let config = self.runtime.config(&self.root, record, cancel.clone()).await?;
+                let inputs = match override_inputs { Some(inputs) => inputs, None => self.runtime.inputs(record).await? };
                 Ok::<_, Code>((config, inputs))
             } => result?,
         };
         let runtime = self.runtime.clone();
         let refresh_record = record.clone();
+        let transient = if !publish && record.omlx_key_id.is_none() {
+            inputs.omlx_key.clone()
+        } else {
+            None
+        };
         let mut initial = Some(inputs);
         let refresh_failure = Arc::new(SyncMutex::new(None));
         let input_failure = refresh_failure.clone();
@@ -721,13 +820,22 @@ impl IdorisHost {
                 let runtime = runtime.clone();
                 let r = refresh_record.clone();
                 let failure = input_failure.clone();
+                let transient = transient.clone();
                 async move {
                     match first {
                         Some(inputs) => Ok(inputs),
-                        None => runtime.inputs(&r).await.map_err(|code| {
-                            *failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
-                            SupervisorError::Configuration
-                        }),
+                        None => {
+                            let result = runtime.inputs(&r).await.map(|mut inputs| {
+                                if transient.is_some() {
+                                    inputs.omlx_key = transient;
+                                }
+                                inputs
+                            });
+                            result.map_err(|code| {
+                                *failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
+                                SupervisorError::Configuration
+                            })
+                        }
                     }
                 }
             },
@@ -763,8 +871,18 @@ impl IdorisHost {
             ReadySignal(ready.clone())
                 .wait_ready(cancel)
                 .await
-                .map_err(|_| Code::StartFailed)?;
-            self.connect_gateway(&record, cancel).await
+                .map_err(|_| {
+                    if cancel.is_cancelled() {
+                        Code::Cancelled
+                    } else {
+                        Code::StartFailed
+                    }
+                })?;
+            if publish {
+                self.connect_gateway(record, cancel).await
+            } else {
+                Ok(())
+            }
         }
         .await;
         if let Err(e) = connected {
@@ -772,9 +890,7 @@ impl IdorisHost {
             supervisor.stop().await.map_err(Code::from)?;
             return Err(e);
         }
-        self.inner.lock().await.supervisor = Some(supervisor);
-        self.monitor(ready, record, cancel.clone(), refresh_failure);
-        Ok(())
+        Ok((supervisor, ready, refresh_failure))
     }
     fn monitor(
         self: &Arc<Self>,
@@ -790,6 +906,16 @@ impl IdorisHost {
                 let Some(host) = host.upgrade() else {
                     return;
                 };
+                if host
+                    .inner
+                    .lock()
+                    .await
+                    .supervisor
+                    .as_ref()
+                    .is_none_or(|s| !s.accepting_requests().same_channel(&signal))
+                {
+                    return;
+                }
                 if changed.is_err() {
                     loop {
                         let notified = host.changed.notified();
@@ -801,6 +927,12 @@ impl IdorisHost {
                             drop(i);
                             notified.await;
                             continue;
+                        }
+                        if i.supervisor
+                            .as_ref()
+                            .is_none_or(|s| !s.accepting_requests().same_channel(&signal))
+                        {
+                            return;
                         }
                         if let Some(supervisor) = i.supervisor.take() {
                             // The readiness sender has closed: the supervisor has
@@ -875,7 +1007,9 @@ impl IdorisHost {
         }
         i.last_error = result.err();
         i.state = match result {
-            Ok(()) if action == Action::Start => {
+            Ok(())
+                if matches!(action, Action::Start | Action::Connect) || i.supervisor.is_some() =>
+            {
                 if i.supervisor
                     .as_ref()
                     .is_some_and(|s| *s.accepting_requests().borrow())
@@ -890,12 +1024,28 @@ impl IdorisHost {
                 Some(r) if r.key_id.is_none() || r.components_dir.is_none() => State::NotConfigured,
                 _ => State::Stopped,
             },
+            Err(_)
+                if matches!(action, Action::Install | Action::Connect)
+                    && i.supervisor
+                        .as_ref()
+                        .is_some_and(|s| *s.accepting_requests().borrow()) =>
+            {
+                State::Running
+            }
             Err(Code::InstanceConflict) => State::InstanceConflict,
-            Err(Code::Cancelled) => State::Stopped,
+            Err(Code::Cancelled) => match &i.installation {
+                None => State::NotInstalled,
+                Some(r) if r.key_id.is_none() || r.components_dir.is_none() => State::NotConfigured,
+                _ => State::Stopped,
+            },
             Err(_) => State::Failed,
         };
         if let Some(op) = i.operations.get_mut(id) {
-            op.phase = Phase::Completed;
+            op.phase = if matches!(action, Action::Install | Action::Connect) && result.is_ok() {
+                Phase::Done
+            } else {
+                Phase::Completed
+            };
             op.cancellable = false;
             op.error_code = result.err();
             op.result = Some(match result {
@@ -924,7 +1074,9 @@ impl IdorisHost {
         if !op.cancellable {
             return Err(Code::NotCancellable);
         }
-        if let Some(record) = i.installation.as_mut() {
+        if op.action == Action::Start
+            && let Some(record) = i.installation.as_mut()
+        {
             let mut updated = record.clone();
             updated.desired_running = false;
             write_json(&self.root.join("installation.json"), &updated)?;

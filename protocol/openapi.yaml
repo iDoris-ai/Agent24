@@ -3453,6 +3453,48 @@ paths:
         "504":
           $ref: "#/components/responses/CommTimeout"
 
+  /idoris/omlx/candidates:
+    get:
+      operationId: getIdorisOmlxCandidates
+      tags: [idoris]
+      summary: Discover local oMLX endpoints without exposing credentials
+      x-tui-exemption: "IL-12: CLI lifecycle commands are implemented after IL-11."
+      description: |
+        ProductHost capability or legacy host bearer required; Creative is forbidden.
+        Returns service identity, authentication classification and actual model IDs.
+        Credentials read from local settings remain private; only their source flag is exposed.
+        Credentials are sent only to an explicitly confirmed loopback endpoint after identity checks.
+      parameters:
+        - name: endpoint
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: Current non-sensitive projection
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdorisCandidates"
+        "400":
+          $ref: "#/components/responses/IdorisFailure"
+        "401":
+          $ref: "#/components/responses/IdorisFailure"
+        "403":
+          $ref: "#/components/responses/IdorisFailure"
+        "409":
+          $ref: "#/components/responses/IdorisFailure"
+        "422":
+          $ref: "#/components/responses/IdorisFailure"
+        "502":
+          $ref: "#/components/responses/IdorisFailure"
+        "503":
+          $ref: "#/components/responses/IdorisFailure"
+        "504":
+          $ref: "#/components/responses/IdorisFailure"
+        "500":
+          $ref: "#/components/responses/IdorisFailure"
+
   /idoris/status:
     get:
       operationId: getIdorisStatus
@@ -3469,6 +3511,104 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/IdorisStatus"
+        "400":
+          $ref: "#/components/responses/IdorisFailure"
+        "401":
+          $ref: "#/components/responses/IdorisFailure"
+        "403":
+          $ref: "#/components/responses/IdorisFailure"
+        "409":
+          $ref: "#/components/responses/IdorisFailure"
+        "422":
+          $ref: "#/components/responses/IdorisFailure"
+        "502":
+          $ref: "#/components/responses/IdorisFailure"
+        "503":
+          $ref: "#/components/responses/IdorisFailure"
+        "504":
+          $ref: "#/components/responses/IdorisFailure"
+        "500":
+          $ref: "#/components/responses/IdorisFailure"
+
+  /idoris/install:
+    post:
+      operationId: installIdoris
+      tags: [idoris]
+      summary: Install the pinned iDoris release
+      x-tui-exemption: "IL-12: CLI lifecycle commands are implemented after IL-11."
+      description: |
+        ProductHost capability or legacy host bearer required; Creative is forbidden.
+        Downloads, verifies and installs only the embedded lock. Revalidates an existing installation without downloading. Cancellation never activates a partial install.
+        Idempotency-Key is required. Replays return the original operation across restarts.
+        Reusing a key with different input returns invalid_request. Other concurrent mutations return busy.
+        The server records consent with its own timestamp. HTTP disconnect does not cancel an operation.
+        Cancellation is accepted before the commit boundary; rollback and commit cannot be interrupted.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9_-]+$" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/IdorisInstallRequest" }
+      responses:
+        "202":
+          description: Lifecycle operation accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdorisOperation"
+        "400":
+          $ref: "#/components/responses/IdorisFailure"
+        "401":
+          $ref: "#/components/responses/IdorisFailure"
+        "403":
+          $ref: "#/components/responses/IdorisFailure"
+        "409":
+          $ref: "#/components/responses/IdorisFailure"
+        "422":
+          $ref: "#/components/responses/IdorisFailure"
+        "502":
+          $ref: "#/components/responses/IdorisFailure"
+        "503":
+          $ref: "#/components/responses/IdorisFailure"
+        "504":
+          $ref: "#/components/responses/IdorisFailure"
+        "500":
+          $ref: "#/components/responses/IdorisFailure"
+
+  /idoris/connect:
+    post:
+      operationId: connectIdoris
+      tags: [idoris]
+      summary: Connect the managed installation to a selected oMLX backend
+      x-tui-exemption: "IL-12: CLI lifecycle commands are implemented after IL-11."
+      description: |
+        ProductHost capability or legacy host bearer required; Creative is forbidden.
+        Requires explicit credential-sharing and model consent. Runs setup, issues a data key, starts iDoris, and verifies one minimal daily chat before committing. A connected installation requires replace=true; failures compensate the new key and process and retain the previous configuration. Credentials are never accepted in the request or returned. Unknown setup failures retain the frozen setup_code on the operation. The first connection requires explicit core_reserved_bytes; subsequent connections may reuse the saved allocation.
+        Idempotency-Key is required. Replays return the original operation across restarts.
+        Reusing a key with different input returns invalid_request. Other concurrent mutations return busy.
+        The server records consent with its own timestamp. HTTP disconnect does not cancel an operation.
+        Cancellation is accepted before the commit boundary; rollback and commit cannot be interrupted.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9_-]+$" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/IdorisConnectRequest" }
+      responses:
+        "202":
+          description: Lifecycle operation accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdorisOperation"
         "400":
           $ref: "#/components/responses/IdorisFailure"
         "401":
@@ -3932,9 +4072,64 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/ModuleProxyError" }
   schemas:
+    IdorisInstallRequest:
+      type: object
+      additionalProperties: false
+      required: [consent]
+      properties:
+        consent:
+          type: boolean
+          description: Confirms the displayed source, pinned version and installation risks.
+    IdorisConnectConsent:
+      type: object
+      additionalProperties: false
+      required: [share_omlx_key, daily_model]
+      properties:
+        share_omlx_key: { type: boolean }
+        daily_model: { type: string }
+        deep_model: { type: [string, "null"] }
+    IdorisConnectRequest:
+      type: object
+      additionalProperties: false
+      required: [endpoint, daily_model]
+      properties:
+        endpoint:
+          type: string
+          description: Explicitly confirmed loopback HTTP oMLX origin, without credentials, path, query or fragment.
+        daily_model: { type: string, minLength: 1, maxLength: 512 }
+        deep_model: { type: [string, "null"], minLength: 1, maxLength: 512 }
+        save_omlx_key: { type: boolean, default: false }
+        replace: { type: boolean, default: false }
+        core_reserved_bytes:
+          type: [integer, "null"]
+          minimum: 0
+          description: Explicit core reservation required on first connect. Zero is an explicit choice.
+        consent:
+          anyOf:
+            - $ref: "#/components/schemas/IdorisConnectConsent"
+            - type: "null"
+    IdorisCandidates:
+      type: object
+      additionalProperties: false
+      required: [candidates, key_from_local_settings]
+      properties:
+        key_from_local_settings: { type: boolean }
+        candidates:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [endpoint, identity, authentication, models]
+            properties:
+              endpoint: { type: string }
+              identity: { type: string, enum: [omlx, unknown_service] }
+              authentication: { type: string, enum: [ready, auth_required, auth_rejected, unreachable, unknown_service, invalid_response] }
+              models:
+                type: array
+                items: { type: string }
     IdorisErrorCode:
       type: string
-      enum: [not_installed, not_configured, instance_conflict, keychain_locked, key_unavailable, contract_mismatch, start_failed, stop_timeout, busy, cancelled, not_found, not_cancellable, shutting_down, invalid_request, persistence_failed]
+      enum: [not_installed, not_configured, instance_conflict, keychain_locked, key_unavailable, contract_mismatch, start_failed, stop_timeout, busy, cancelled, not_found, not_cancellable, shutting_down, invalid_request, persistence_failed, omlx_unreachable, omlx_auth_required, omlx_auth_rejected, unknown_service, model_not_found, consent_required, setup_failed, verify_failed, replace_required]
     IdorisError:
       type: object
       required: [error]
@@ -3976,8 +4171,8 @@ components:
       required: [operation_id, action, phase, result, error_code, cancellable, idempotency_key]
       properties:
         operation_id: { type: string }
-        action: { type: string, enum: [start, stop] }
-        phase: { type: string, enum: [queued, starting, connecting, stopping, completed] }
+        action: { type: string, enum: [install, connect, start, stop] }
+        phase: { type: string, enum: [queued, downloading, verifying, installing, setup, issuing_key, starting, connecting, verifying_connection, rolling_back, done, stopping, completed] }
         result: { type: [string, "null"], enum: [succeeded, failed, cancelled, null] }
         error_code:
           anyOf:
@@ -3985,6 +4180,10 @@ components:
             - type: "null"
         cancellable: { type: boolean }
         idempotency_key: { type: string }
+        request_fingerprint: { type: string, pattern: "^[a-f0-9]{64}$" }
+        setup_code:
+          type: string
+          enum: [unreachable, auth_required, auth_failed, not_omlx, model_not_found, invalid_endpoint, invalid_role, out_dir_not_empty, validation_failed, write_failed, invalid_api_key_input]
     DomainOsView:
       type: object
       required: [name, namespace, version, enabled, state, granted, missing_models, resources, restart_required]

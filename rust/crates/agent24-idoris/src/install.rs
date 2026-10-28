@@ -328,7 +328,7 @@ fn install_blocking(
     result
 }
 
-pub(crate) struct OperationLock(File);
+pub struct OperationLock(File);
 impl Drop for OperationLock {
     fn drop(&mut self) {
         // Concurrent forks may retain a duplicate until exec. Explicit unlock
@@ -337,7 +337,7 @@ impl Drop for OperationLock {
     }
 }
 
-pub(crate) fn operation_lock(root: &Path) -> Result<OperationLock, InstallError> {
+pub fn operation_lock(root: &Path) -> Result<OperationLock, InstallError> {
     let path = root.join(".operation.lock");
     let lock = File::from(
         rustix::fs::open(

@@ -1740,6 +1740,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/idoris/omlx/candidates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Discover local oMLX endpoints without exposing credentials
+         * @description ProductHost capability or legacy host bearer required; Creative is forbidden.
+         *     Returns service identity, authentication classification and actual model IDs.
+         *     Credentials read from local settings remain private; only their source flag is exposed.
+         *     Credentials are sent only to an explicitly confirmed loopback endpoint after identity checks.
+         */
+        get: operations["getIdorisOmlxCandidates"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/idoris/status": {
         parameters: {
             query?: never;
@@ -1755,6 +1778,56 @@ export interface paths {
         get: operations["getIdorisStatus"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/idoris/install": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Install the pinned iDoris release
+         * @description ProductHost capability or legacy host bearer required; Creative is forbidden.
+         *     Downloads, verifies and installs only the embedded lock. Revalidates an existing installation without downloading. Cancellation never activates a partial install.
+         *     Idempotency-Key is required. Replays return the original operation across restarts.
+         *     Reusing a key with different input returns invalid_request. Other concurrent mutations return busy.
+         *     The server records consent with its own timestamp. HTTP disconnect does not cancel an operation.
+         *     Cancellation is accepted before the commit boundary; rollback and commit cannot be interrupted.
+         */
+        post: operations["installIdoris"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/idoris/connect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Connect the managed installation to a selected oMLX backend
+         * @description ProductHost capability or legacy host bearer required; Creative is forbidden.
+         *     Requires explicit credential-sharing and model consent. Runs setup, issues a data key, starts iDoris, and verifies one minimal daily chat before committing. A connected installation requires replace=true; failures compensate the new key and process and retain the previous configuration. Credentials are never accepted in the request or returned. Unknown setup failures retain the frozen setup_code on the operation. The first connection requires explicit core_reserved_bytes; subsequent connections may reuse the saved allocation.
+         *     Idempotency-Key is required. Replays return the original operation across restarts.
+         *     Reusing a key with different input returns invalid_request. Other concurrent mutations return busy.
+         *     The server records consent with its own timestamp. HTTP disconnect does not cancel an operation.
+         *     Cancellation is accepted before the commit boundary; rollback and commit cannot be interrupted.
+         */
+        post: operations["connectIdoris"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1860,8 +1933,41 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        IdorisInstallRequest: {
+            /** @description Confirms the displayed source, pinned version and installation risks. */
+            consent: boolean;
+        };
+        IdorisConnectConsent: {
+            share_omlx_key: boolean;
+            daily_model: string;
+            deep_model?: string | null;
+        };
+        IdorisConnectRequest: {
+            /** @description Explicitly confirmed loopback HTTP oMLX origin, without credentials, path, query or fragment. */
+            endpoint: string;
+            daily_model: string;
+            deep_model?: string | null;
+            /** @default false */
+            save_omlx_key: boolean;
+            /** @default false */
+            replace: boolean;
+            /** @description Explicit core reservation required on first connect. Zero is an explicit choice. */
+            core_reserved_bytes?: number | null;
+            consent?: components["schemas"]["IdorisConnectConsent"] | null;
+        };
+        IdorisCandidates: {
+            key_from_local_settings: boolean;
+            candidates: {
+                endpoint: string;
+                /** @enum {string} */
+                identity: "omlx" | "unknown_service";
+                /** @enum {string} */
+                authentication: "ready" | "auth_required" | "auth_rejected" | "unreachable" | "unknown_service" | "invalid_response";
+                models: string[];
+            }[];
+        };
         /** @enum {string} */
-        IdorisErrorCode: "not_installed" | "not_configured" | "instance_conflict" | "keychain_locked" | "key_unavailable" | "contract_mismatch" | "start_failed" | "stop_timeout" | "busy" | "cancelled" | "not_found" | "not_cancellable" | "shutting_down" | "invalid_request" | "persistence_failed";
+        IdorisErrorCode: "not_installed" | "not_configured" | "instance_conflict" | "keychain_locked" | "key_unavailable" | "contract_mismatch" | "start_failed" | "stop_timeout" | "busy" | "cancelled" | "not_found" | "not_cancellable" | "shutting_down" | "invalid_request" | "persistence_failed" | "omlx_unreachable" | "omlx_auth_required" | "omlx_auth_rejected" | "unknown_service" | "model_not_found" | "consent_required" | "setup_failed" | "verify_failed" | "replace_required";
         IdorisError: {
             error: {
                 code: components["schemas"]["IdorisErrorCode"] | ("unauthorized" | "forbidden");
@@ -1883,14 +1989,17 @@ export interface components {
         IdorisOperation: {
             operation_id: string;
             /** @enum {string} */
-            action: "start" | "stop";
+            action: "install" | "connect" | "start" | "stop";
             /** @enum {string} */
-            phase: "queued" | "starting" | "connecting" | "stopping" | "completed";
+            phase: "queued" | "downloading" | "verifying" | "installing" | "setup" | "issuing_key" | "starting" | "connecting" | "verifying_connection" | "rolling_back" | "done" | "stopping" | "completed";
             /** @enum {string|null} */
             result: "succeeded" | "failed" | "cancelled" | null;
             error_code: components["schemas"]["IdorisErrorCode"] | null;
             cancellable: boolean;
             idempotency_key: string;
+            request_fingerprint?: string;
+            /** @enum {string} */
+            setup_code?: "unreachable" | "auth_required" | "auth_failed" | "not_omlx" | "model_not_found" | "invalid_endpoint" | "invalid_role" | "out_dir_not_empty" | "validation_failed" | "write_failed" | "invalid_api_key_input";
         };
         DomainOsView: {
             name: string;
@@ -7131,6 +7240,37 @@ export interface operations {
             504: components["responses"]["CommTimeout"];
         };
     };
+    getIdorisOmlxCandidates: {
+        parameters: {
+            query?: {
+                endpoint?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current non-sensitive projection */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdorisCandidates"];
+                };
+            };
+            400: components["responses"]["IdorisFailure"];
+            401: components["responses"]["IdorisFailure"];
+            403: components["responses"]["IdorisFailure"];
+            409: components["responses"]["IdorisFailure"];
+            422: components["responses"]["IdorisFailure"];
+            500: components["responses"]["IdorisFailure"];
+            502: components["responses"]["IdorisFailure"];
+            503: components["responses"]["IdorisFailure"];
+            504: components["responses"]["IdorisFailure"];
+        };
+    };
     getIdorisStatus: {
         parameters: {
             query?: never;
@@ -7147,6 +7287,76 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["IdorisStatus"];
+                };
+            };
+            400: components["responses"]["IdorisFailure"];
+            401: components["responses"]["IdorisFailure"];
+            403: components["responses"]["IdorisFailure"];
+            409: components["responses"]["IdorisFailure"];
+            422: components["responses"]["IdorisFailure"];
+            500: components["responses"]["IdorisFailure"];
+            502: components["responses"]["IdorisFailure"];
+            503: components["responses"]["IdorisFailure"];
+            504: components["responses"]["IdorisFailure"];
+        };
+    };
+    installIdoris: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IdorisInstallRequest"];
+            };
+        };
+        responses: {
+            /** @description Lifecycle operation accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdorisOperation"];
+                };
+            };
+            400: components["responses"]["IdorisFailure"];
+            401: components["responses"]["IdorisFailure"];
+            403: components["responses"]["IdorisFailure"];
+            409: components["responses"]["IdorisFailure"];
+            422: components["responses"]["IdorisFailure"];
+            500: components["responses"]["IdorisFailure"];
+            502: components["responses"]["IdorisFailure"];
+            503: components["responses"]["IdorisFailure"];
+            504: components["responses"]["IdorisFailure"];
+        };
+    };
+    connectIdoris: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IdorisConnectRequest"];
+            };
+        };
+        responses: {
+            /** @description Lifecycle operation accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdorisOperation"];
                 };
             };
             400: components["responses"]["IdorisFailure"];

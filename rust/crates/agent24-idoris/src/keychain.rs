@@ -24,6 +24,8 @@ pub trait Keychain: Send + Sync {
 }
 
 pub struct SystemKeychain;
+pub struct OmlxKeychain;
+pub const OMLX_SERVICE: &str = "ai.auraai.agent24.omlx";
 
 #[cfg(target_os = "macos")]
 fn map_error(error: keyring::Error) -> KeychainError {
@@ -53,6 +55,28 @@ impl Keychain for SystemKeychain {
 
     fn delete(&self, key_id: &str) -> Result<(), KeychainError> {
         keyring::Entry::new(SERVICE, key_id)
+            .and_then(|entry| entry.delete_credential())
+            .map_err(map_error)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Keychain for OmlxKeychain {
+    fn put(&self, key_id: &str, secret: &str) -> Result<(), KeychainError> {
+        keyring::Entry::new(OMLX_SERVICE, key_id)
+            .and_then(|entry| entry.set_password(secret))
+            .map_err(map_error)
+    }
+
+    fn get(&self, key_id: &str) -> Result<Zeroizing<String>, KeychainError> {
+        keyring::Entry::new(OMLX_SERVICE, key_id)
+            .and_then(|entry| entry.get_password())
+            .map(Zeroizing::new)
+            .map_err(map_error)
+    }
+
+    fn delete(&self, key_id: &str) -> Result<(), KeychainError> {
+        keyring::Entry::new(OMLX_SERVICE, key_id)
             .and_then(|entry| entry.delete_credential())
             .map_err(map_error)
     }
@@ -96,6 +120,21 @@ mod tests {
 
 #[cfg(not(target_os = "macos"))]
 impl Keychain for SystemKeychain {
+    fn put(&self, _key_id: &str, _secret: &str) -> Result<(), KeychainError> {
+        Err(KeychainError::Unsupported)
+    }
+
+    fn get(&self, _key_id: &str) -> Result<Zeroizing<String>, KeychainError> {
+        Err(KeychainError::Unsupported)
+    }
+
+    fn delete(&self, _key_id: &str) -> Result<(), KeychainError> {
+        Err(KeychainError::Unsupported)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl Keychain for OmlxKeychain {
     fn put(&self, _key_id: &str, _secret: &str) -> Result<(), KeychainError> {
         Err(KeychainError::Unsupported)
     }

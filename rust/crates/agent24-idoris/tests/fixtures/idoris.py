@@ -78,6 +78,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        assert self.path == '/v1/chat/completions'
+        assert body['model'] == 'idoris/daily'
+        assert body['max_tokens'] == 1
+        if scenario.get('verify_wait'):
+            time.sleep(3)
+        payload = json.dumps({'model': 'real-model', 'choices': [{'message': {'role': 'assistant', 'content': 'Hi'}, 'finish_reason': 'stop'}], 'usage': {'prompt_tokens': 1, 'completion_tokens': 1}}).encode()
+        self.send_response(scenario.get('verify_status', 200))
+        self.send_header('Content-Length', str(len(payload)))
+        self.send_header('X-iDoris-Served-Locality', 'loopback')
+        self.send_header('X-iDoris-Record-Id', 'fixture-chat')
+        self.end_headers()
+        try:
+            self.wfile.write(payload)
+        except BrokenPipeError:
+            pass
     def log_message(self, *_):
         pass
 

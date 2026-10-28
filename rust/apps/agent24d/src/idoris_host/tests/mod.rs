@@ -120,6 +120,13 @@ impl Fixture {
             .unwrap();
         assert!(output.status.success());
         let script = include_str!("../../../../../crates/agent24-idoris/tests/fixtures/idoris.py")
+            .replace(
+                "root = Path(os.environ['IDORIS_COMPONENTS_DIR'])",
+                &format!(
+                    "{}\nroot = Path(os.environ['IDORIS_COMPONENTS_DIR'])",
+                    include_str!("fixtures/provision.py")
+                ),
+            )
             .replacen(
                 "#!/usr/bin/python3",
                 &format!("#!{}", String::from_utf8(output.stdout).unwrap().trim()),
@@ -876,3 +883,5 @@ async fn cancel_interrupts_a_pending_keychain_read_before_spawn() {
     assert!(!f.host.root.join("data/state/attempts.jsonl").exists());
     f.assert_clean();
 }
+
+mod provision;
