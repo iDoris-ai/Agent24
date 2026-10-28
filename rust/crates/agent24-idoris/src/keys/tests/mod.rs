@@ -411,3 +411,47 @@ async fn real_v040_issue_list_revoke() {
     f.store.delete(&issued.key_id).unwrap();
     assert!(f.keys.list(Some("another-owner")).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn pending_success_remains_compensatable_until_host_commit() {
+    let f = Fixture::new("ok", false);
+    let issued = f
+        .keys
+        .issue_pending("installation", &["daily"])
+        .await
+        .unwrap();
+    assert!(f.keys.operation_path().exists());
+    assert!(f.store.entries.lock().unwrap().contains_key(&issued.key_id));
+    f.keys.retry_pending().await.unwrap();
+    assert!(!f.keys.operation_path().exists());
+    assert!(f.store.entries.lock().unwrap().is_empty());
+    assert_eq!(
+        f.calls()
+            .iter()
+            .filter(|args| args.get(1).is_some_and(|arg| arg == "issue"))
+            .count(),
+        1
+    );
+    assert!(
+        f.calls()
+            .contains(&vec!["key".into(), "revoke".into(), KEY.into()])
+    );
+}
+
+#[tokio::test]
+async fn host_commit_keeps_the_key_and_disarms_startup_compensation() {
+    let f = Fixture::new("ok", false);
+    let issued = f
+        .keys
+        .issue_pending("installation", &["daily"])
+        .await
+        .unwrap();
+    f.keys.commit_issue().unwrap();
+    f.keys.retry_pending().await.unwrap();
+    assert!(f.store.entries.lock().unwrap().contains_key(&issued.key_id));
+    assert!(
+        !f.calls()
+            .iter()
+            .any(|args| args.get(1).is_some_and(|arg| arg == "revoke"))
+    );
+}

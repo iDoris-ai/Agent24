@@ -114,7 +114,7 @@ impl ManagedIdoris {
         Ok(())
     }
 
-    async fn prepare(
+    pub(crate) async fn prepare(
         config: &ManagedConfig,
         secrets: &dyn SecretSource,
         cancel: &CancellationToken,
@@ -140,6 +140,30 @@ impl ManagedIdoris {
             IdorisGateway::from_credentials(&config.url, key).map_err(ModelError::Provider)?;
         gateway.check_health(cancel).await?;
         Ok(gateway)
+    }
+
+    pub(crate) fn persist_config(
+        &self,
+        config: &ManagedConfig,
+    ) -> Result<(), crate::idoris_host::Code> {
+        self.persist(config)
+            .map_err(|_| crate::idoris_host::Code::PersistenceFailed)?;
+        Ok(())
+    }
+    pub(crate) fn restore_config(
+        &self,
+        config: Option<ManagedConfig>,
+    ) -> Result<(), crate::idoris_host::Code> {
+        match config {
+            Some(config) => self
+                .persist(&config)
+                .map_err(|_| crate::idoris_host::Code::PersistenceFailed),
+            None => match std::fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(_) => Err(crate::idoris_host::Code::PersistenceFailed),
+            },
+        }
     }
 
     fn persist(&self, config: &ManagedConfig) -> Result<(), ModelError> {

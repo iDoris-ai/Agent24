@@ -1098,6 +1098,18 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
     let kernel = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/idoris/status", get(crate::idoris_routes::status))
+        .route(
+            "/api/v1/idoris/install",
+            post(crate::idoris_routes::install),
+        )
+        .route(
+            "/api/v1/idoris/connect",
+            post(crate::idoris_routes::connect),
+        )
+        .route(
+            "/api/v1/idoris/omlx/candidates",
+            get(crate::idoris_routes::candidates),
+        )
         .route("/api/v1/idoris/start", post(crate::idoris_routes::start))
         .route("/api/v1/idoris/stop", post(crate::idoris_routes::stop))
         .route(
@@ -1523,7 +1535,7 @@ pub async fn serve(
     let shutdown = Shutdown::with_params(cancel.clone(), params);
     let idoris_root =
         agent24_idoris::install::default_install_root().map_err(std::io::Error::other)?;
-    if !ephemeral && idoris_root.join("installation.json").try_exists()? {
+    if !ephemeral {
         shutdown
             .idoris_budget
             .store(true, std::sync::atomic::Ordering::SeqCst);
