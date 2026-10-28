@@ -1145,7 +1145,7 @@ fn cmd_hw(action: HwAction) -> Result<(), String> {
         } => {
             // usable_bytes already accounts for OS and App overhead. Deduct
             // only the explicit core allocation, and preserve a real zero.
-            let bytes = report.usable_bytes.saturating_sub(core_reserved_bytes);
+            let bytes = report.idoris_budget_bytes(core_reserved_bytes);
             println!("IDORIS_ALLOCATED_BUDGET_BYTES={bytes}");
             Ok(())
         }

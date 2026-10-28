@@ -173,6 +173,7 @@ dependencies = [
 name = "agent24-idoris"
 version = "0.1.0"
 dependencies = [
+ "agent24-hw",
  "base64",
  "flate2",
  "fs2",

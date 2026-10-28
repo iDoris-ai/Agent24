@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+agent24-hw = { path = "../agent24-hw" }
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = "2"
@@ -14,7 +15,7 @@ url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 sha2 = "0.10"
 subtle = "2"
-tokio = { version = "1", features = ["macros", "rt", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "time", "process", "io-util"] }
 tokio-util = "0.7"
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
