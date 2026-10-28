@@ -6,6 +6,8 @@ import { contextBridge, ipcRenderer } from 'electron'
 import {
   IpcChannels,
   type BackendEndpointResult,
+  type CliToolStatus,
+  type CliInstallResult,
   type DocumentsEvent,
   type DocumentsImportProgress,
   type DocumentsRequest,
@@ -33,6 +35,13 @@ import {
 } from '../shared/ipc-types'
 
 const api = {
+  onCliToolSettings: (cb: () => void): (() => void) => {
+    ipcRenderer.on(IpcChannels.CliToolOpenSettings, cb)
+    return () => ipcRenderer.removeListener(IpcChannels.CliToolOpenSettings, cb)
+  },
+  cliToolStatus: (): Promise<CliToolStatus> => ipcRenderer.invoke(IpcChannels.CliToolStatus),
+  installCliTool: (): Promise<CliInstallResult> => ipcRenderer.invoke(IpcChannels.CliToolInstall),
+  setAppLocale: (locale: import('../shared/i18n').Locale): Promise<void> => ipcRenderer.invoke(IpcChannels.AppLocale, locale),
   ping: (): Promise<string> => ipcRenderer.invoke(IpcChannels.AppPing),
   setUiLocale: (locale: string): Promise<void> => ipcRenderer.invoke(IpcChannels.AppSetLocale, locale),
   getAppVersion: (): Promise<string> => ipcRenderer.invoke(IpcChannels.AppVersion),

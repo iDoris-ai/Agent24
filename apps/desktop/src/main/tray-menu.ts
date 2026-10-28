@@ -2,6 +2,7 @@
 // Pure (no Electron): main.ts feeds it to Tray/Menu, tests read it directly.
 
 import { mt } from './main-i18n'
+import type { CliToolStatus } from '../shared/ipc-types'
 
 export type TrayStatus = 'running' | 'starting' | 'stopped' | 'blocked'
 
@@ -15,14 +16,23 @@ export interface TrayInput {
   externalPid: number | null
   foreignPid: number | null
   backendKind: string
+  cliTool?: Pick<CliToolStatus, 'state' | 'version'>
 }
 
-export type TrayAction = 'start' | 'disconnect' | 'restart' | 'stop' | 'show' | 'quit'
+export type TrayAction = 'start' | 'disconnect' | 'restart' | 'stop' | 'show' | 'quit' | 'cli-settings'
 export type TrayItem = { type: 'separator' } | { label: string; enabled: false } | { label: string; action: TrayAction }
 
 export interface TrayView { title: string; tooltip: string; items: TrayItem[] }
 
 export function buildTrayView(input: TrayInput): TrayView {
+  const cliItems: TrayItem[] = []
+  const cli = input.cliTool
+  if (cli && (cli.state === 'missing' || cli.state === 'outdated' || cli.state === 'unknown')) {
+    cliItems.push(
+      { label: mt(`cli.${cli.state}`, { version: cli.version ?? '?' }), action: 'cli-settings' },
+      { type: 'separator' },
+    )
+  }
   const base = mt(`tray.${input.status}`)
   // DEP-A5: an external daemon gets a visibly different label so the user can
   // tell it apart before hitting stop.
@@ -42,6 +52,7 @@ export function buildTrayView(input: TrayInput): TrayView {
     title: TITLES[input.status],
     tooltip,
     items: [
+      ...cliItems,
       { label, enabled: false },
       { type: 'separator' },
       { label: mt('tray.show'), action: 'show' },

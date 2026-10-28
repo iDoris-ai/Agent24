@@ -101,6 +101,7 @@ export function extractDaemonDefaultModel(res: { ok: boolean; data: unknown }): 
 
 export function App(): JSX.Element {
   const [page, setPage] = useState<Page>('home')
+  useEffect(() => window.agent24.onCliToolSettings?.(() => setPage('settings')), [])
   const [backendOk, setBackendOk] = useState<boolean | null>(null)
   const [version, setVersion] = useState<string>('')
   const [sidebarOpen, setSidebarOpen] = useState(true)

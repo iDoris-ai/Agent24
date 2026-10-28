@@ -2,6 +2,10 @@
 // Capability modules will extend this in M1+.
 
 export const IpcChannels = {
+  CliToolOpenSettings: 'cli-tool:open-settings',
+  CliToolStatus: 'cli-tool:status',
+  CliToolInstall: 'cli-tool:install',
+  AppLocale: 'app:locale',
   AppPing: 'app:ping',
   AppVersion: 'app:version',
   AppSetLocale: 'app:set-locale',
@@ -417,3 +421,14 @@ export interface DocumentsImportProgress {
   sent: number
   total: number
 }
+
+export interface CliToolStatus {
+  state: 'missing' | 'outdated' | 'current' | 'newer' | 'unknown' | 'unavailable'
+  path: string | null
+  version: string | null
+  bundledVersion: string | null
+}
+
+export type CliInstallResult =
+  | { state: 'installed'; backup: string | null }
+  | { state: 'cancelled' | 'failed' | 'move-app' }

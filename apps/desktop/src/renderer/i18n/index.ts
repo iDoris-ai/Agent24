@@ -11,7 +11,9 @@
 
 import { useSyncExternalStore } from 'react'
 
-export type Locale = 'en' | 'zh' | 'th'
+import { DEFAULT_LOCALE, isLocale, translate as lookup, type Locale, type Messages, type Vars } from '../../shared/i18n'
+export { DEFAULT_LOCALE, isLocale, defineMessages, format } from '../../shared/i18n'
+export type { Locale, Messages, Vars } from '../../shared/i18n'
 
 export const LOCALES: readonly { id: Locale; label: string }[] = [
   { id: 'en', label: 'English' },
@@ -19,14 +21,9 @@ export const LOCALES: readonly { id: Locale; label: string }[] = [
   { id: 'th', label: 'ไทย' },
 ]
 
-export const DEFAULT_LOCALE: Locale = 'en'
 export const LOCALE_STORAGE_KEY = 'agent24:locale'
 
 const HTML_LANG: Record<Locale, string> = { en: 'en', zh: 'zh-CN', th: 'th' }
-
-export function isLocale(v: unknown): v is Locale {
-  return v === 'en' || v === 'zh' || v === 'th'
-}
 
 function readStored(): Locale {
   try {
@@ -36,7 +33,12 @@ function readStored(): Locale {
   return DEFAULT_LOCALE
 }
 
+function syncMainLocale(locale: Locale): void {
+  void globalThis.window?.agent24?.setAppLocale?.(locale).catch(() => { /* main may be shutting down */ })
+}
+
 let current: Locale = readStored()
+syncMainLocale(current)
 const listeners = new Set<() => void>()
 
 function applyHtmlLang(l: Locale) {
@@ -63,6 +65,7 @@ export function setLocale(l: Locale): void {
   reportLocaleToMain(l)
   if (l === current) return
   current = l
+  syncMainLocale(l)
   applyHtmlLang(l)
   listeners.forEach((fn) => fn())
 }
@@ -76,32 +79,9 @@ export function useLocale(): Locale {
   return useSyncExternalStore(subscribe, getLocale, getLocale)
 }
 
-export interface Messages<K extends string> {
-  en: Record<K, string>
-  zh: Record<K, string>
-  th: Record<K, string>
-}
-
-/** Declare a page's copy. en defines the keys; zh and th must match them exactly. */
-export function defineMessages<K extends string>(m: {
-  en: Record<K, string>
-  zh: { [P in K]: string }
-  th: { [P in K]: string }
-}): Messages<K> {
-  return m
-}
-
-export type Vars = Record<string, string | number>
-
-/** `{name}` placeholders; unknown placeholders are left as-is. */
-export function format(s: string, vars?: Vars): string {
-  if (!vars) return s
-  return s.replace(/\{(\w+)\}/g, (m, k: string) => (k in vars ? String(vars[k]) : m))
-}
-
 /** Non-hook lookup, for module-level helpers that are called during render. */
 export function translate<K extends string>(m: Messages<K>, key: K, vars?: Vars, locale: Locale = current): string {
-  return format(m[locale][key] ?? m.en[key] ?? key, vars)
+  return lookup(m, key, vars, locale)
 }
 
 export type T<K extends string> = (key: K, vars?: Vars) => string

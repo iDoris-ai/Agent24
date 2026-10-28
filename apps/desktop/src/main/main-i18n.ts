@@ -10,6 +10,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { cliToolMessages } from '../shared/cli-tool.i18n'
 
 export type MainLocale = 'en' | 'zh' | 'th'
 export const MAIN_DEFAULT_LOCALE: MainLocale = 'en'
@@ -32,6 +33,12 @@ const en = {
   'tray.stop': 'Stop daemon',
   'tray.show': 'Show window',
   'tray.quit': 'Quit Agent24',
+  'cli.missing': cliToolMessages.en.missing,
+  'cli.outdated': cliToolMessages.en.outdated,
+  'cli.unknown': cliToolMessages.en.unknown,
+  'cli.confirmTitle': 'Replace the existing agent24 command?',
+  'cli.confirmDetail': 'The existing /usr/local/bin/agent24 will be renamed to agent24.bak-<date> in the same directory. A symbolic link to this App’s CLI will take its place.',
+  'cli.replace': 'Back up and replace',
   'dialog.confirm': 'Confirm',
   'dialog.cancel': 'Cancel',
   'clip.truncated': '… (truncated, {length} characters in total)',
@@ -67,6 +74,12 @@ const zh: Record<MainMessageKey, string> = {
   'tray.stop': '停止 daemon',
   'tray.show': '显示窗口',
   'tray.quit': '退出 Agent24',
+  'cli.missing': cliToolMessages.zh.missing,
+  'cli.outdated': cliToolMessages.zh.outdated,
+  'cli.unknown': cliToolMessages.zh.unknown,
+  'cli.confirmTitle': '替换已有的 agent24 命令？',
+  'cli.confirmDetail': '已有的 /usr/local/bin/agent24 将在原目录改名为 agent24.bak-<日期>，再由指向本应用 CLI 的符号链接替代。',
+  'cli.replace': '备份并替换',
   'dialog.confirm': '确认',
   'dialog.cancel': '取消',
   'clip.truncated': '…（已截断，共 {length} 字符）',
@@ -100,6 +113,12 @@ const th: Record<MainMessageKey, string> = {
   'tray.stop': 'หยุด daemon',
   'tray.show': 'แสดงหน้าต่าง',
   'tray.quit': 'ออกจาก Agent24',
+  'cli.missing': cliToolMessages.th.missing,
+  'cli.outdated': cliToolMessages.th.outdated,
+  'cli.unknown': cliToolMessages.th.unknown,
+  'cli.confirmTitle': 'แทนที่คำสั่ง agent24 ที่มีอยู่หรือไม่?',
+  'cli.confirmDetail': 'จะเปลี่ยนชื่อ /usr/local/bin/agent24 เดิมเป็น agent24.bak-<วันที่> ในโฟลเดอร์เดิม แล้วสร้างลิงก์สัญลักษณ์ไปยัง CLI ของแอปนี้',
+  'cli.replace': 'สำรองและแทนที่',
   'dialog.confirm': 'ยืนยัน',
   'dialog.cancel': 'ยกเลิก',
   'clip.truncated': '… (ตัดทอนแล้ว รวม {length} ตัวอักษร)',
