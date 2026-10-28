@@ -74,6 +74,27 @@ describe('ModelsPage', () => {
     expect(screen.queryByText('oMLX 未运行 — 启动后此处显示实时模型状态')).not.toBeInTheDocument()
   })
 
+  it('iDoris never configured (handoff-missing): neutral optional note, not "disconnected"', async () => {
+    render(<ModelsPage />)
+    const note = await screen.findByTestId('idoris-not-configured')
+    expect(note).toHaveTextContent('未连接 iDoris（可选）')
+    expect(screen.queryByText(/Admin session 未连接/)).toBeNull()
+    expect(screen.queryByTestId('idoris-disconnected')).toBeNull()
+  })
+
+  it.each(['unreachable', 'http-error', 'handoff-invalid', 'invalid-response', 'invalid-config'] as const)(
+    'iDoris configured but %s: still shown as disconnected',
+    async (reason) => {
+      window.agent24 = {
+        backendProxy: vi.fn().mockResolvedValue({ ok: false, status: 503, data: null }),
+        idorisStatus: vi.fn().mockResolvedValue({ state: 'unavailable', reason }),
+      } as never
+      render(<ModelsPage />)
+      expect(await screen.findByTestId('idoris-disconnected')).toHaveTextContent('状态不可用 — Admin session 未连接')
+      expect(screen.queryByTestId('idoris-not-configured')).toBeNull()
+    },
+  )
+
   it('renders the frozen iDoris Admin v0 status without exposing credentials', async () => {
     window.agent24 = {
       backendProxy: vi.fn().mockResolvedValue({ ok: false, status: 503, data: null }),

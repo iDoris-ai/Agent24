@@ -125,6 +125,7 @@ export default function CreativePage(): JSX.Element {
   const t = useT(creativeMessages)
   const hostRef = useRef<HTMLDivElement>(null)
   const [error, setError] = useState<string | null>(null)
+  const [notInstalled, setNotInstalled] = useState(false)
   const [restarting, setRestarting] = useState(false)
   const [component, setComponent] = useState<OpenDesignComponentStatusResult>({ state: 'not-installed' })
   // PR #670 review (H1): set once `creativeShow` itself reports
@@ -181,7 +182,8 @@ export default function CreativePage(): JSX.Element {
     void window.agent24.creativeShow(rectOf(host)).then(
       (result) => {
         if (cancelled) return
-        if (result.ok) { setError(null); return }
+        if (result.ok) { setError(null); setNotInstalled(false); return }
+        if (result.notInstalled) { setError(null); setNotInstalled(true); return }
         if (result.needsDownload) { setNeedsDownloadSize(result.size ?? 0); return }
         setError(result.error ?? translate(creativeMessages, 'error.start'))
       },
@@ -205,7 +207,8 @@ export default function CreativePage(): JSX.Element {
     setRestarting(true)
     try {
       const result = await window.agent24.creativeRestart(rectOf(host))
-      setError(result.ok ? null : (result.error ?? translate(creativeMessages, 'error.start')))
+      setNotInstalled(!result.ok && result.notInstalled === true)
+      setError(result.ok || result.notInstalled ? null : (result.error ?? translate(creativeMessages, 'error.start')))
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : translate(creativeMessages, 'error.start'))
     } finally {
@@ -223,6 +226,11 @@ export default function CreativePage(): JSX.Element {
   return (
     <div ref={hostRef} className="creative-host">
       {showDownloadCard && <ComponentCard status={cardStatus} onInstall={installComponent} onPause={pauseComponent} />}
+      {tryCreative && notInstalled && !error && (
+        <div className="creative-error" role="status">
+          <div>{t('notInstalled')}</div>
+        </div>
+      )}
       {tryCreative && error && (
         <div className="creative-error">
           <div>{t('error.unavailable', { error })}</div>

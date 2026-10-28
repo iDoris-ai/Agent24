@@ -86,6 +86,7 @@ export function pickChatModel(models: string[]): string | undefined {
 const LLM_DETECTING = '\u0000detecting'
 const LLM_NO_RUNTIME = '\u0000no-runtime'
 const NO_CHAT_MODEL_LABEL = '\u0000no-chat-model'
+const LLM_NEEDS_KEY = '\u0000needs-key'
 
 /** ME4-desktop-model-ui: `GET /api/v1/models`'s `default_model` field
  * (`rust/apps/agent24d/src/routes.rs`) — the daemon's own `DEFAULT_MODEL`
@@ -101,6 +102,7 @@ export function extractDaemonDefaultModel(res: { ok: boolean; data: unknown }): 
 
 export function App(): JSX.Element {
   const [page, setPage] = useState<Page>('home')
+  useEffect(() => window.agent24.onCliToolSettings?.(() => setPage('settings')), [])
   const [backendOk, setBackendOk] = useState<boolean | null>(null)
   const [version, setVersion] = useState<string>('')
   const [sidebarOpen, setSidebarOpen] = useState(true)
@@ -122,7 +124,7 @@ export function App(): JSX.Element {
   // label only when the daemon has none to report (e.g. an older daemon
   // build, or the router was never built via `from_env`).
   const t = useT(appMessages)
-  const FALLBACK_KEYS = { [LLM_DETECTING]: 'llm.detecting', [LLM_NO_RUNTIME]: 'llm.noRuntime', [NO_CHAT_MODEL_LABEL]: 'llm.noChatModel' } as const
+  const FALLBACK_KEYS = { [LLM_DETECTING]: 'llm.detecting', [LLM_NO_RUNTIME]: 'llm.noRuntime', [NO_CHAT_MODEL_LABEL]: 'llm.noChatModel', [LLM_NEEDS_KEY]: 'llm.needsKey' } as const
   const fallbackKey = FALLBACK_KEYS[fallbackLlmLabel as keyof typeof FALLBACK_KEYS]
   const llmLabel = daemonDefaultModel
     ? t('llm.daemonDefault', { model: daemonDefaultModel })
@@ -164,6 +166,12 @@ export function App(): JSX.Element {
     // oMLX auto-detect on startup
     void (async () => {
       const detected = await window.agent24.omlxDetect()
+      if (detected && 'authRequired' in detected) {
+        // oMLX is running but wants an API key: starting another one would
+        // only collide with it. Say so; Settings has the key field.
+        setFallbackLlmLabel(LLM_NEEDS_KEY)
+        return
+      }
       if (detected) {
         const chatModel = pickChatModel(detected.models)
         setFallbackLlmLabel(chatModel ? `${chatModel} · oMLX` : NO_CHAT_MODEL_LABEL)
