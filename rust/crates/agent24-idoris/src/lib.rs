@@ -9,6 +9,7 @@ mod storage;
 pub mod setup;
 pub mod keychain;
 pub mod keys;
+pub mod supervisor;
 
 use semver::Version;
 use serde::Deserialize;

@@ -77,7 +77,11 @@ pub struct InstalledVersion {
 }
 impl InstalledVersion {
     #[cfg(test)]
+<<<<<<< HEAD
     pub(crate) fn from_test_directory(directory: PathBuf) -> Self {
+=======
+    pub(crate) fn fixture(directory: PathBuf) -> Self {
+>>>>>>> origin/feat/idoris-il0708-supervisor
         Self { directory }
     }
 
