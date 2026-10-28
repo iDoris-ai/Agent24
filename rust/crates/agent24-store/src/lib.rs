@@ -109,8 +109,8 @@ pub use source_policy::{
     StoredSourceTag, strictest_classification,
 };
 
-use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::{Connection, SqliteConnection, SqlitePool};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -172,9 +172,36 @@ pub struct Store {
 
 impl Store {
     /// Shut down this pool and await its connections, including pooled clones.
+    /// Finish any remaining WAL checkpoint with a single writable connection.
     /// Offline callers must keep their singleton lock until this completes.
-    pub async fn close(self) {
+    pub async fn close(self) -> Result<()> {
         self.pool.close().await;
+        let options = self.pool.connect_options();
+        let has_sidecars = ["-wal", "-shm"].iter().any(|suffix| {
+            let mut name = options.get_filename().as_os_str().to_owned();
+            name.push(suffix);
+            Path::new(&name).exists()
+        });
+        if has_sidecars {
+            // Concurrent worker shutdowns can each miss SQLite's exclusive
+            // close-time checkpoint lock. Let SQLite clean up after every
+            // pooled worker has finished; never unlink WAL files ourselves.
+            let options = options.as_ref().clone().create_if_missing(false);
+            let mut conn = SqliteConnection::connect_with(&options).await?;
+            let checkpoint: std::result::Result<(i64, i64, i64), _> =
+                sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .fetch_one(&mut conn)
+                    .await;
+            let closed = conn.close().await;
+            let (busy, _, _) = checkpoint?;
+            closed?;
+            if busy != 0 {
+                return Err(StoreError::Conflict(
+                    "SQLite WAL checkpoint is busy after pool close".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Open (creating if needed) a database file and run migrations.
@@ -478,6 +505,111 @@ mod open_without_migration_tests {
         let mut name = path.as_os_str().to_owned();
         name.push(suffix);
         std::path::PathBuf::from(name)
+    }
+
+    #[tokio::test]
+    async fn close_checkpoints_after_borrowed_connections_return() {
+        for _ in 0..16 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("agent24.db");
+            let store = super::Store::open(&path).await.unwrap();
+            sqlx::query("CREATE TABLE close_probe (value TEXT)")
+                .execute(store.pool())
+                .await
+                .unwrap();
+            let pool = store.pool().clone();
+            let mut borrowed = Vec::new();
+            for _ in 0..5 {
+                let mut conn = pool.acquire().await.unwrap();
+                sqlx::query("INSERT INTO close_probe VALUES ('persisted')")
+                    .execute(&mut *conn)
+                    .await
+                    .unwrap();
+                borrowed.push(conn);
+            }
+            let closing = store.close();
+            tokio::pin!(closing);
+            tokio::select! {
+                result = &mut closing => panic!("close returned with borrowed connections: {result:?}"),
+                () = pool.close_event() => {}
+            }
+            drop(borrowed);
+            closing.await.unwrap();
+            assert_eq!(pool.size(), 0);
+            for suffix in ["-wal", "-shm"] {
+                assert!(!sidecar(&path, suffix).exists(), "residual {suffix}");
+            }
+
+            let copy = dir.path().join("copy.db");
+            std::fs::copy(&path, &copy).unwrap();
+            let reopened = super::Store::open_without_migration(&copy).await.unwrap();
+            let values: Vec<String> = sqlx::query_scalar("SELECT value FROM close_probe")
+                .fetch_all(reopened.pool())
+                .await
+                .unwrap();
+            assert_eq!(values, vec!["persisted"; 5]);
+            reopened.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn close_reports_a_busy_checkpoint_without_losing_committed_data() {
+        use sqlx::Connection;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent24.db");
+        let options = super::sqlite_file_options(&path, true)
+            .unwrap()
+            .busy_timeout(std::time::Duration::ZERO);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .unwrap();
+        let store = super::test_hooks::from_pool(pool.clone());
+        sqlx::query("CREATE TABLE close_probe (value TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut reader = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN").execute(&mut reader).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM close_probe")
+            .fetch_one(&mut reader)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        sqlx::query("INSERT INTO close_probe VALUES ('committed')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let err = store.close().await.unwrap_err();
+        assert!(matches!(err, super::StoreError::Conflict(_)), "{err}");
+        assert!(err.to_string().contains("checkpoint is busy"));
+        assert!(pool.is_closed());
+        assert_eq!(pool.size(), 0);
+        assert!(sidecar(&path, "-wal").exists());
+        sqlx::query("ROLLBACK").execute(&mut reader).await.unwrap();
+        let value: String = sqlx::query_scalar("SELECT value FROM close_probe")
+            .fetch_one(&mut reader)
+            .await
+            .unwrap();
+        assert_eq!(value, "committed");
+        reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_memory_closes_all_clones_and_can_be_repeated() {
+        let store = super::Store::open_memory().await.unwrap();
+        let clone = store.clone();
+        store.close().await.unwrap();
+        assert!(matches!(
+            clone.latest_applied_migration().await,
+            Err(super::StoreError::Sqlx(sqlx::Error::PoolClosed))
+        ));
+        clone.close().await.unwrap();
     }
 
     async fn delete_mode_database(path: &std::path::Path, ahead: bool) {

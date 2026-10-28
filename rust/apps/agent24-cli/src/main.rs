@@ -1244,8 +1244,8 @@ async fn invalidate_module_consents_in(
             .await
             .map_err(|err| format!("could not revoke {name} module consent: {err}")),
     };
-    db.close().await;
-    result
+    let closed = db.close().await;
+    result.and(closed)
 }
 
 /// Consent revocation did not land. Package files have not been changed.
@@ -1482,8 +1482,8 @@ async fn cmd_decide_in(dir: &std::path::Path, action: DecideAction) -> Result<()
         }
     }
     .await;
-    db.close().await;
-    result
+    let closed = db.close().await;
+    result.and(closed)
 }
 
 /// Same operator-visible outcome as an empty decision log, without a store.
