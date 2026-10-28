@@ -14,16 +14,21 @@ url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 sha2 = "0.10"
 subtle = "2"
-tokio = { version = "1", features = ["macros", "rt", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "time", "process", "io-util"] }
 tokio-util = "0.7"
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
 fs2 = "0.4"
 rustix = { version = "1", features = ["fs", "process"] }
-zeroize = "1"
 base64 = "0.22"
 nix = { version = "0.29", features = ["user"] }
 tempfile = "3"
+zeroize = { version = "1", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["apple-native"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

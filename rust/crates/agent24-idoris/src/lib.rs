@@ -2,6 +2,8 @@
 
 pub mod download;
 pub mod install;
+pub mod keychain;
+pub mod keys;
 #[cfg(unix)]
 pub mod omlx_probe;
 mod storage;
