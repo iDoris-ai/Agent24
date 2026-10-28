@@ -6,10 +6,11 @@ import CommunicationPage from './Communication'
 import {
   getCommStatus, listCommContacts, listCommIdentities, listCommRelays,
   startCommDaemon, stopCommDaemon, unlockComm,
-  type CommDaemonStatus,
+  CommApiError, type CommDaemonStatus,
 } from './api'
 
-vi.mock('./api', () => ({
+vi.mock('./api', async (importActual) => ({
+  CommApiError: (await importActual<typeof import('./api')>()).CommApiError,
   getCommStatus: vi.fn(), listCommContacts: vi.fn(), listCommIdentities: vi.fn(), listCommRelays: vi.fn(),
   startCommDaemon: vi.fn(), stopCommDaemon: vi.fn(), unlockComm: vi.fn(),
 }))
@@ -51,6 +52,68 @@ describe('CommunicationPage', () => {
     expect(screen.queryByText(/补收完成|已送达/)).not.toBeInTheDocument()
     expect(startCommDaemon).not.toHaveBeenCalled()
     expect(stopCommDaemon).not.toHaveBeenCalled()
+  })
+
+  it('not_configured on every read: shows the guide as a neutral status, not a Refresh-failed alert', async () => {
+    const nc = () => new CommApiError('Not configured', 409, 'not_configured')
+    vi.mocked(listCommIdentities).mockRejectedValue(nc())
+    vi.mocked(listCommContacts).mockRejectedValue(nc())
+    vi.mocked(listCommRelays).mockRejectedValue(nc())
+    vi.mocked(getCommStatus).mockRejectedValue(nc())
+    render(<CommunicationPage />)
+    expect(await screen.findByText('通信尚未配置')).toBeInTheDocument()
+    expect(screen.getByText('agent24 comm identity create <昵称> --default')).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByText(/刷新失败|Refresh failed|not_configured/)).toBeNull()
+  })
+
+  it('not_configured because no Hyphae binary: binary guidance (not the identity command) plus the daemon detail', async () => {
+    const nc = () => new CommApiError('no Hyphae binary is configured; set A24_HYPHAE_BIN (COMM-HYPHAE.md §3)', 409, 'not_configured')
+    for (const fn of [listCommIdentities, listCommContacts, listCommRelays, getCommStatus]) vi.mocked(fn).mockRejectedValue(nc())
+    render(<CommunicationPage />)
+    expect(await screen.findByText('没有找到 Hyphae 程序，通信无法启动。请在启动 daemon 前指定它的位置，然后刷新本页：')).toBeInTheDocument()
+    expect(screen.getByText('A24_HYPHAE_BIN=/path/to/hyphae')).toBeInTheDocument()
+    expect(screen.getByText(/详情：no Hyphae binary is configured/)).toBeInTheDocument()
+    expect(screen.queryByText('agent24 comm identity create <昵称> --default')).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it.each([
+    'A24_COMM_PASSWORD_STORE="x" is not a recognized password store backend',
+    'not a recognized relay configuration',
+    'invalid configuration: relay URL must use wss',
+    'misconfigured password store',
+  ])('配置错误展示原文且不引导创建身份：%s', async (message) => {
+    for (const fn of [listCommIdentities, listCommContacts, listCommRelays, getCommStatus]) {
+      vi.mocked(fn).mockRejectedValue(new CommApiError(message, 409, 'not_configured'))
+    }
+    render(<CommunicationPage />)
+    expect(await screen.findByRole('heading', { name: '通信配置有误' })).toBeInTheDocument()
+    expect(screen.getByText(`详情：${message}`)).toBeInTheDocument()
+    expect(screen.queryByText('agent24 comm identity create <昵称> --default')).toBeNull()
+    expect(screen.queryByText('A24_HYPHAE_BIN=/path/to/hyphae')).toBeNull()
+  })
+
+  it('a real error still shows as an alert, listing only the real failure, next to the not_configured guide', async () => {
+    const nc = () => new CommApiError('Not configured', 409, 'not_configured')
+    vi.mocked(listCommIdentities).mockRejectedValue(nc())
+    vi.mocked(listCommContacts).mockRejectedValue(nc())
+    vi.mocked(listCommRelays).mockRejectedValue(new CommApiError('relay exploded', 500, 'internal'))
+    vi.mocked(getCommStatus).mockRejectedValue(nc())
+    render(<CommunicationPage />)
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('relay exploded')
+    expect(alert).not.toHaveTextContent('身份：')
+    expect(screen.getByText('通信尚未配置')).toBeInTheDocument()
+  })
+
+  it('all reads failing with a real error is shown as an error, with no setup guide', async () => {
+    for (const fn of [listCommIdentities, listCommContacts, listCommRelays, getCommStatus]) {
+      vi.mocked(fn).mockRejectedValue(new CommApiError('daemon down', 503, 'unavailable'))
+    }
+    render(<CommunicationPage />)
+    expect(await screen.findByRole('alert')).toHaveTextContent('daemon down')
+    expect(screen.queryByText('通信尚未配置')).toBeNull()
   })
 
   it('does not paint locked, gave_up, or missing relay as healthy', async () => {

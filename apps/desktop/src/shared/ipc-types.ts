@@ -2,8 +2,13 @@
 // Capability modules will extend this in M1+.
 
 export const IpcChannels = {
+  CliToolOpenSettings: 'cli-tool:open-settings',
+  CliToolStatus: 'cli-tool:status',
+  CliToolInstall: 'cli-tool:install',
+  AppLocale: 'app:locale',
   AppPing: 'app:ping',
   AppVersion: 'app:version',
+  AppSetLocale: 'app:set-locale',
   ShellOpenExternal: 'shell:open-external',
   BackendProxy: 'backend:proxy',
   BackendEndpoint: 'backend:endpoint',
@@ -108,6 +113,10 @@ export interface CreativeViewResult {
    * component is not installed yet — the renderer should show the download
    * card (driven by the OpenDesignComponent* IPC) rather than an error. */
   needsDownload?: boolean
+  /** Set instead of an error when this build neither bakes a downloadable
+   * Open Design component manifest nor finds a local runtime: the optional
+   * component is simply not available, which is a state, not a failure. */
+  notInstalled?: boolean
   size?: number
 }
 
@@ -136,10 +145,19 @@ export interface OmlxDetectResult {
   models: string[]
 }
 
+/** A server answered on this address but demands an API key (401/403). The
+ * renderer should point the user at the API key field, not say "disconnected". */
+export interface OmlxAuthRequiredResult {
+  authRequired: true
+  url: string
+}
+
 export interface OmlxModelsResult {
   ok: boolean
   models: string[]
   error?: string
+  /** The server answered 401/403: it is running but needs an API key. */
+  authRequired?: boolean
 }
 
 export interface OmlxStartResult {
@@ -403,3 +421,14 @@ export interface DocumentsImportProgress {
   sent: number
   total: number
 }
+
+export interface CliToolStatus {
+  state: 'missing' | 'outdated' | 'current' | 'newer' | 'unknown' | 'unavailable'
+  path: string | null
+  version: string | null
+  bundledVersion: string | null
+}
+
+export type CliInstallResult =
+  | { state: 'installed'; backup: string | null }
+  | { state: 'cancelled' | 'failed' | 'move-app' }

@@ -228,6 +228,17 @@ describe('App', () => {
     })
   })
 
+  it('oMLX running but needs a key: says so and does not start a second oMLX', async () => {
+    mockOmlxDetect.mockResolvedValue({ authRequired: true, url: 'http://127.0.0.1:8088' })
+
+    await act(async () => { render(<App />) })
+    await waitFor(() => {
+      expect(screen.getByText('oMLX 已运行，需要 API key（见设置）')).toBeInTheDocument()
+    })
+    expect(screen.queryByText('无 AI 运行时')).toBeNull()
+    expect(mockOmlxStart).not.toHaveBeenCalled()
+  })
+
   // M1-T14: switching to another page and back used to UNMOUNT ChatPage
   // (`{page === 'chat' && <ChatPage />}`), which reset its message list and
   // minted a fresh `session_id` — silently starting a new D1 memory session

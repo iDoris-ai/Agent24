@@ -4,6 +4,9 @@ export const documentsMessages = defineMessages({
   en: {
     'title': 'Documents', 'subtitle': 'Local single-user storage: documents stay on this computer.',
     'storage.unavailable': 'Document storage is temporarily unavailable',
+    'notInstalled.title': 'Documents module is not installed',
+    'notInstalled.guide': 'It ships separately from the installer. Install it by hand (see rust/apps/agent24-documents/README.md), then restart the daemon:',
+    'notInstalled.command': 'agent24 os install <package dir>',
     'import.button': 'Import file (PDF, JPEG, PNG)', 'import.uploading': 'Uploading {percent}%',
     'import.cancel': 'Cancel', 'import.retry': 'Retry',
     'status.queued': 'Queued', 'status.running': 'Importing', 'status.cancelling': 'Cancelling',
@@ -22,6 +25,9 @@ export const documentsMessages = defineMessages({
   zh: {
     'title': '文档', 'subtitle': '本地单用户：文档只保存在这台电脑上。',
     'storage.unavailable': '文档存储暂不可用',
+    'notInstalled.title': '文档模块未安装',
+    'notInstalled.guide': '该模块不随安装包分发，需手工安装（见 rust/apps/agent24-documents/README.md），装好后重启 daemon：',
+    'notInstalled.command': 'agent24 os install <模块包目录>',
     'import.button': '导入文件（PDF、JPEG、PNG）', 'import.uploading': '上传 {percent}%',
     'import.cancel': '取消', 'import.retry': '重试',
     'status.queued': '排队中', 'status.running': '导入中', 'status.cancelling': '取消中',
@@ -40,6 +46,9 @@ export const documentsMessages = defineMessages({
   th: {
     'title': 'เอกสาร', 'subtitle': 'จัดเก็บสำหรับผู้ใช้คนเดียว: เอกสารอยู่บนคอมพิวเตอร์เครื่องนี้เท่านั้น',
     'storage.unavailable': 'ที่เก็บเอกสารไม่พร้อมใช้งานชั่วคราว',
+    'notInstalled.title': 'ยังไม่ได้ติดตั้งโมดูลเอกสาร',
+    'notInstalled.guide': 'โมดูลนี้ไม่รวมอยู่ในตัวติดตั้ง ต้องติดตั้งเอง (ดู rust/apps/agent24-documents/README.md) แล้วรีสตาร์ท daemon:',
+    'notInstalled.command': 'agent24 os install <package dir>',
     'import.button': 'นำเข้าไฟล์ (PDF, JPEG, PNG)', 'import.uploading': 'กำลังอัปโหลด {percent}%',
     'import.cancel': 'ยกเลิก', 'import.retry': 'ลองอีกครั้ง',
     'status.queued': 'รอคิว', 'status.running': 'กำลังนำเข้า', 'status.cancelling': 'กำลังยกเลิก',

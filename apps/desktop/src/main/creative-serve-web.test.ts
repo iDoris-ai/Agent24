@@ -617,6 +617,7 @@ describe('CreativeServeWeb', () => {
     await expect(service.start()).resolves.toEqual({
       state: 'failed',
       error: 'Open Design runtime not found; set A24_OPEN_DESIGN_DIR or package resources/open-design',
+      notInstalled: true,
     })
   })
 
