@@ -6,12 +6,14 @@
 //! §8's COMM-2a row).
 //!
 //! Requires `HYPHAE_TEST_BIN` (see `tests/real_binary.rs`'s own doc comment
-//! for what it may point at); without it every test here prints why it's
-//! skipping and returns early. Never touches the real `~/.hyphae` —
+//! for what it may point at). CI requires it; local runs without it print a
+//! skip reason and return early. Never touches the real `~/.hyphae` —
 //! `CommState::ready` is always built over a throwaway `tempdir()` HOME, and
 //! every password store here is a [`MemoryPasswordStore`].
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,7 +38,7 @@ const REFERENCE_SHA256: &str = "bc30dcf7bcf8b5c1865a3e995518c2bdab224bd8d6a3a064
 /// `HYPHAE_TEST_BIN`, or `None` (having already explained why) so callers
 /// bail out early exactly like the other `HYPHAE_TEST_BIN`-gated tests do.
 async fn comm_state_from_env() -> Option<(CommState, tempfile::TempDir)> {
-    let test_bin = std::env::var("HYPHAE_TEST_BIN").ok()?;
+    let test_bin = common::hyphae_test_bin()?;
     let source = PathBuf::from(&test_bin)
         .canonicalize()
         .unwrap_or_else(|e| panic!("HYPHAE_TEST_BIN={test_bin:?} is not readable: {e}"));

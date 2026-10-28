@@ -33,6 +33,19 @@ use std::path::Path;
 use agent24_comm::VerifiedBinary;
 use agent24_comm::binary::Sha256Digest;
 
+/// Local runs may opt out; CI must exercise the real binary.
+#[track_caller]
+pub fn hyphae_test_bin() -> Option<String> {
+    let bin = std::env::var("HYPHAE_TEST_BIN")
+        .ok()
+        .filter(|bin| !bin.is_empty());
+    assert!(
+        bin.is_some() || std::env::var("CI").as_deref() != Ok("true"),
+        "HYPHAE_TEST_BIN must be set when CI=true"
+    );
+    bin
+}
+
 pub async fn install_verified(
     source: &Path,
     expected: Sha256Digest,
