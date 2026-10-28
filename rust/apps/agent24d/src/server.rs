@@ -47,6 +47,7 @@ pub struct AppState {
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
     pub idoris_host: Option<Arc<agent24d::idoris_host::IdorisHost>>,
+    pub idoris_unavailable: bool,
     pub managed_idoris: Option<Arc<agent24d::managed_idoris::ManagedIdoris>>,
     pub tools: Arc<agent24_tools::ToolRegistry>,
     /// H2: the user's risk overrides. Held here as well as inside the registry
@@ -688,6 +689,7 @@ impl AppState {
             router,
             managed_idoris: None,
             idoris_host: None,
+            idoris_unavailable: false,
             tools,
             broker,
             module_approval_broker,
@@ -1708,12 +1710,21 @@ pub async fn serve(
         }
         Some(managed)
     };
-    let idoris_host = if let Some(managed) = &managed_idoris {
-        Some(agent24d::idoris_host::IdorisHost::system(
+    let mut idoris_unavailable = false;
+    let mut idoris_host = if let Some(managed) = &managed_idoris {
+        match agent24d::idoris_host::IdorisHost::system(
             idoris_root,
             managed.clone(),
             router.clone(),
-        )?)
+        ) {
+            Ok(host) => Some(host),
+            Err(error) => {
+                tracing::warn!(%error, "iDoris lifecycle unavailable; daemon startup continues");
+                idoris_unavailable = true;
+                router.block_idoris("iDoris lifecycle unavailable");
+                None
+            }
+        }
     } else {
         None
     };
@@ -1721,10 +1732,16 @@ pub async fn serve(
     let idoris_stopping = idoris_host
         .as_ref()
         .map(|host| host.stop_on_shutdown(cancel.clone()));
-    if let Some(host) = &idoris_host {
-        host.restore()
-            .await
-            .map_err(|c| std::io::Error::other(c.message()))?;
+    if let Some(host) = &idoris_host
+        && let Err(code) = host.restore().await
+    {
+        tracing::warn!(
+            ?code,
+            "iDoris restore unavailable; daemon startup continues"
+        );
+        idoris_unavailable = true;
+        router.block_idoris("iDoris restore unavailable");
+        idoris_host = None;
     }
     let guardian = build_guardian(&router);
     // D1 session memory: a KV file next to the main store (ephemeral daemons get
@@ -1980,6 +1997,7 @@ pub async fn serve(
     });
     state.managed_idoris = managed_idoris;
     state.idoris_host = idoris_host;
+    state.idoris_unavailable = idoris_unavailable;
     if let Some(capability_store) = capability_store {
         state.enable_capability_auth(capability_store);
     }

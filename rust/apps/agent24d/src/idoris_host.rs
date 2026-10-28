@@ -378,6 +378,7 @@ struct Inner {
     operations: BTreeMap<String, Operation>,
     active: Option<(String, CancellationToken)>,
     supervisor: Option<Supervisor>,
+    generation: Option<String>,
     closing: bool,
 }
 pub struct IdorisHost {
@@ -480,6 +481,7 @@ impl IdorisHost {
                 operations,
                 active: None,
                 supervisor: None,
+                generation: None,
                 closing: false,
             }),
         }))
@@ -579,14 +581,14 @@ impl IdorisHost {
                 return Err(Code::NotConfigured);
             }
         }
-        if let Some(r) = i.installation.as_mut() {
-            let mut updated = r.clone();
-            updated.desired_running = action == Action::Start;
-            write_json(&self.root.join("installation.json"), &updated)?;
-            *r = updated;
-        }
         let noop = (action == Action::Start && i.state == State::Running)
-            || (action == Action::Stop && i.supervisor.is_none());
+            || (action == Action::Stop
+                && i.supervisor.is_none()
+                && !self
+                    .root
+                    .join("data/state/managed-process.json")
+                    .try_exists()
+                    .map_err(|_| Code::PersistenceFailed)?);
         let op = Operation {
             operation_id: uuid::Uuid::new_v4().to_string(),
             action,
@@ -604,6 +606,18 @@ impl IdorisHost {
         if let Err(e) = write_json(&self.root.join("operations.json"), &i.operations) {
             i.operations.remove(&op.operation_id);
             return Err(e);
+        }
+        // Commit the operation before the intent: a rejected start must never
+        // leave an autostart intent for the next daemon. An interrupted queued
+        // operation is cancelled by open().
+        if let Some(r) = i.installation.as_mut() {
+            let mut updated = r.clone();
+            updated.desired_running = action == Action::Start;
+            if let Err(error) = write_json(&self.root.join("installation.json"), &updated) {
+                i.operations.remove(&op.operation_id);
+                return Err(error);
+            }
+            *r = updated;
         }
         if noop {
             if action == Action::Stop {
@@ -681,12 +695,27 @@ impl IdorisHost {
         if action == Action::Stop {
             self.phase(id, Phase::Stopping).await;
             self.block_gateway();
-            let supervisor = self.inner.lock().await.supervisor.take();
+            let (supervisor, record) = {
+                let mut i = self.inner.lock().await;
+                i.generation = None;
+                (i.supervisor.take(), i.installation.clone())
+            };
             if let Some(s) = supervisor {
                 let report = s.stop().await.map_err(Code::from)?;
                 if report.forced || report.drain_timed_out {
                     return Err(Code::StopTimeout);
                 }
+            } else {
+                let record = record.ok_or(Code::InstanceConflict)?;
+                Supervisor::recover_leftover(
+                    DataPaths {
+                        db: self.root.join("data/idoris.sqlite3"),
+                        state: self.root.join("data/state"),
+                    },
+                    &record.release_dir.join("idoris"),
+                )
+                .await
+                .map_err(Code::from)?;
             }
             return Ok(());
         }
@@ -772,14 +801,25 @@ impl IdorisHost {
             supervisor.stop().await.map_err(Code::from)?;
             return Err(e);
         }
-        self.inner.lock().await.supervisor = Some(supervisor);
-        self.monitor(ready, record, cancel.clone(), refresh_failure);
+        {
+            let mut i = self.inner.lock().await;
+            i.supervisor = Some(supervisor);
+            i.generation = Some(id.to_owned());
+        }
+        self.monitor(
+            ready,
+            record,
+            id.to_owned(),
+            cancel.clone(),
+            refresh_failure,
+        );
         Ok(())
     }
     fn monitor(
         self: &Arc<Self>,
         mut signal: watch::Receiver<bool>,
         record: Installation,
+        generation: String,
         cancel: CancellationToken,
         refresh_failure: Arc<SyncMutex<Option<Code>>>,
     ) {
@@ -794,7 +834,10 @@ impl IdorisHost {
                     loop {
                         let notified = host.changed.notified();
                         let mut i = host.inner.lock().await;
-                        if i.closing {
+                        if i.closing
+                            || cancel.is_cancelled()
+                            || i.generation.as_deref() != Some(&generation)
+                        {
                             return;
                         }
                         if i.active.is_some() {
@@ -824,9 +867,13 @@ impl IdorisHost {
                     }
                 }
                 if !*signal.borrow_and_update() {
-                    host.block_gateway();
                     let mut i = host.inner.lock().await;
-                    if !i.closing && !cancel.is_cancelled() && i.supervisor.is_some() {
+                    if !i.closing
+                        && !cancel.is_cancelled()
+                        && i.generation.as_deref() == Some(&generation)
+                        && i.supervisor.is_some()
+                    {
+                        host.block_gateway();
                         i.state = State::Starting;
                     }
                 } else {
@@ -835,7 +882,12 @@ impl IdorisHost {
                     }
                     let result = host.connect_gateway(&record, &cancel).await;
                     let mut i = host.inner.lock().await;
-                    if i.closing || cancel.is_cancelled() || i.supervisor.is_none() {
+                    if i.closing
+                        || cancel.is_cancelled()
+                        || i.generation.as_deref() != Some(&generation)
+                        || i.supervisor.is_none()
+                    {
+                        host.block_gateway();
                         return;
                     }
                     if result.is_ok() {
