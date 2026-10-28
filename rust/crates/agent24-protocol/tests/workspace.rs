@@ -151,6 +151,7 @@ fn session_and_run_workspace_identity_is_strict_nullable_and_backward_compatible
         workspace_id: create.workspace_id,
         model_override: None,
         mode: RunMode::Normal,
+        knowledge_binding_id: None,
     };
     let roundtrip: RunInput =
         serde_json::from_value(serde_json::to_value(&input).unwrap()).unwrap();
@@ -196,4 +197,17 @@ fn rust_json_schema_matches_workspace_id_and_response_requiredness() {
             "workspace_id must be required-but-nullable in response schemas: {schema}"
         );
     }
+    // KB-HOST-01 PR-C: the run's Knowledge binding is always on the wire too.
+    let input = serde_json::to_value(schemars::schema_for!(RunInput)).unwrap();
+    assert!(
+        input["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "knowledge_binding_id")
+    );
+    let stored: RunInput =
+        serde_json::from_value(serde_json::json!({ "prompt": "old", "workspace_id": null }))
+            .unwrap();
+    assert_eq!(stored.knowledge_binding_id, None);
 }

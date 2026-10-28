@@ -37,8 +37,9 @@ use agent24_protocol::{
     ToolCompletedStatus, ToolStartedPayload, Usage,
 };
 use agent24_store::{
-    RunAdmission, RunAdmissionDenial, RunMessage, RunPatch, RunTerminalTransition, Store,
-    StoreError, WorkspaceInstant, WorkspaceLeaseId, WorkspaceStoreError,
+    MessageOrigin, MessageOriginLookup, OriginatedRunMessage, RunAdmission, RunAdmissionDenial,
+    RunMessage, RunPatch, RunTerminalTransition, SnapshotRunMessage, Store, StoreError,
+    WorkspaceInstant, WorkspaceLeaseId, WorkspaceStoreError,
 };
 use agent24_tools::{
     GateDecision, ToolContext, ToolError, ToolRegistry, summarize_input, truncate,
@@ -59,6 +60,37 @@ pub fn merge_source_policy(
 /// Completion→tools round trips per run before the run is failed. A model
 /// stuck asking for tools forever must terminate deterministically.
 pub const MAX_ITERATIONS: usize = 10;
+
+const SOURCE_UNPROVEN_CODE: &str = "source_unproven";
+const SOURCE_UNPROVEN_MESSAGE: &str =
+    "无法证明本线程已落盘消息的来源，已停止发送。请新建会话。不要自动复制旧 recall 或待执行工具。";
+const PROVIDER_ROLE_MESSAGE: &str = "模型返回的角色不是 assistant，已停止。不会执行这一轮的工具。";
+
+fn origin_allows_send(lookup: &MessageOriginLookup) -> bool {
+    match lookup {
+        // A stored HostRecall with a SQL NULL recall_ref is still unproven.
+        // Present HostSystem is sent verbatim (R05-5 section 3).
+        MessageOriginLookup::Present(stored) => !matches!(
+            stored.origin,
+            MessageOrigin::HostRecall { recall_ref: None }
+        ),
+        MessageOriginLookup::Missing | MessageOriginLookup::Unreadable { .. } => false,
+    }
+}
+
+/// Compact JSON array of every assertion id, sorted lexicographically.
+/// One id is `["id"]`. `serde_json::to_string` emits no spaces.
+fn canonical_recall_ref(ids: &[String]) -> Result<String, serde_json::Error> {
+    let mut sorted = ids.to_vec();
+    sorted.sort();
+    serde_json::to_string(&sorted)
+}
+
+fn unproven_source_failure(run: &Run) -> bool {
+    run.error
+        .as_ref()
+        .is_some_and(|error| error.code == SOURCE_UNPROVEN_CODE)
+}
 
 /// Cap for the externally-visible `output_summary` (full output goes back to
 /// the model; full input is audit-only in the store row).
@@ -100,12 +132,96 @@ pub enum MemoryWriteOutcome {
     /// Personal memory was paused at the moment of commit; nothing was
     /// persisted for this turn's explicit remember.
     SkippedPaused,
-    /// The write-gate (or the session append it depends on) reported an
-    /// error.
-    Failed,
+    /// The session append (the conversation turn) reported an error; NOTHING of
+    /// this turn was written. Carries the typed cause, never its text.
+    Failed(MemoryFailure),
+    /// P1-02c: the conversation turn WAS saved, but the explicit-remember
+    /// assertion was not. Distinct from [`Self::Failed`] so a receipt never
+    /// says "nothing saved" about a turn that is in the history, nor "saved"
+    /// about an assertion that is not.
+    Partial(MemoryFailure),
     /// There was nothing to write: no configured memory, no session, the
     /// prompt was not an explicit remember, or the origin was untrusted.
     NotApplicable,
+}
+
+/// P1-02c: the typed cause of a failed memory write — a closed code and, for a
+/// quota code, its dimension. Carries no owner key and no storage text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryFailure {
+    pub code: agent24_memory::MemoryErrorCode,
+}
+
+impl MemoryFailure {
+    pub fn from_error(err: &agent24_memory::MemoryError) -> Self {
+        Self { code: err.code() }
+    }
+
+    /// The wire form of the code. Exhaustive on purpose: a new
+    /// `MemoryErrorCode` is a compile error here until the protocol knows it.
+    pub fn wire_code(self) -> agent24_protocol::MemoryFailureCode {
+        use agent24_memory::MemoryErrorCode as M;
+        use agent24_protocol::MemoryFailureCode as W;
+        match self.code {
+            M::QuotaRows => W::QuotaRows,
+            M::QuotaBytes => W::QuotaBytes,
+            M::DiskLow => W::DiskLow,
+            M::DiskFull => W::DiskFull,
+            M::ReservedKind => W::ReservedKind,
+            M::RetractIdTooLong => W::RetractIdTooLong,
+            M::Internal => W::Internal,
+        }
+    }
+
+    fn wire_code_str(self) -> &'static str {
+        self.code.as_str()
+    }
+
+    fn event(
+        self,
+        session_id: &str,
+        kind: Option<&str>,
+        partial: bool,
+    ) -> agent24_protocol::MemoryWriteFailedPayload {
+        agent24_protocol::MemoryWriteFailedPayload {
+            session_id: session_id.to_owned(),
+            // Sanitized transitional `reason`: the code string, nothing else.
+            reason: Some(self.code.as_str().to_owned()),
+            code: Some(self.wire_code()),
+            dimension: self.code.dimension().map(str::to_owned),
+            owner_kind: Some(agent24_protocol::MemoryOwnerKind::Personal),
+            kind: kind.map(str::to_owned),
+            partial,
+        }
+    }
+}
+
+/// What loading a session's prior context came to (see
+/// [`RunManager::session_context`]).
+enum SessionContext {
+    Ready(Vec<Msg>),
+    Cancelled,
+    ImportIncomplete(MemoryFailure),
+}
+
+#[cfg(test)]
+impl SessionContext {
+    /// Test convenience: the loaded messages, panicking on any other outcome.
+    fn unwrap(self) -> Vec<Msg> {
+        match self {
+            Self::Ready(context) => context,
+            Self::Cancelled => panic!("session context load was cancelled"),
+            Self::ImportIncomplete(f) => panic!("session import incomplete: {}", f.code),
+        }
+    }
+}
+
+impl MemoryWriteOutcome {
+    /// P1-02c: `false` iff a memory write this run attempted failed (wholly or
+    /// partly). Paused and not-applicable are not failures.
+    pub fn persisted(self) -> bool {
+        !matches!(self, Self::Failed(_) | Self::Partial(_))
+    }
 }
 
 /// H8: the reserved tool name the model calls to submit a plan for approval.
@@ -431,6 +547,27 @@ fn prune_stale_recall_message(msg: Msg, active: &std::collections::HashSet<Strin
     }
 }
 
+/// Shape one message that is PROVEN (by its persisted origin) to be a
+/// `HostRecall`. Unlike [`prune_stale_recall_message`], which deliberately
+/// passes a malformed lookalike through for the old text-based decision, a
+/// proven HostRecall that is not a well-formed recall block is dropped: it
+/// cannot be re-validated, so it must not reach the provider.
+fn shape_host_recall(msg: Msg, active: &std::collections::HashSet<String>) -> Option<Msg> {
+    let content = msg.content.as_deref()?;
+    if msg.role != "user" || !content.starts_with(RECALL_PREFIX) {
+        return None;
+    }
+    let body = content.strip_suffix(RECALL_END_MARKER)?;
+    let has_id = body
+        .split("\n- [id=")
+        .skip(1)
+        .any(|entry| entry.find(' ').is_some_and(|space| space > 0));
+    if !has_id {
+        return None;
+    }
+    prune_stale_recall_message(msg, active)
+}
+
 /// The still-unanswered tool calls of the reconstructed thread's LAST
 /// tool-calling assistant turn, in request order. `None` when there is no such
 /// turn (an inconsistent resume — the caller aborts). Returns the full ordered
@@ -738,20 +875,36 @@ impl RunManager {
         &self,
         session_id: Option<&str>,
         cancel: &CancellationToken,
-    ) -> Option<Vec<Msg>> {
+    ) -> SessionContext {
         let (Some(memory), Some(sid)) = (self.memory.as_ref(), session_id) else {
-            return Some(Vec::new());
+            return SessionContext::Ready(Vec::new());
         };
         let load = memory.context(sid);
         let loaded = tokio::select! {
             result = load => result,
-            () = cancel.cancelled() => return None,
+            () = cancel.cancelled() => return SessionContext::Cancelled,
         };
         match loaded {
-            Ok(context) => Some(context),
+            Ok(context) => SessionContext::Ready(context),
+            // W3: the legacy import failed, so this session's history exists but
+            // could not be brought in. Running on as if the session were empty
+            // would answer without context the user believes is there, and the
+            // exchange would then be appended to a history missing its past.
+            // Nothing was written (the import is one transaction), so a retry
+            // starts clean.
+            Err(err @ agent24_memory::MemoryError::SessionImportIncomplete(_)) => {
+                let failure = MemoryFailure::from_error(&err);
+                tracing::error!(session_id = sid, code = %failure.code, error = %err, "session import failed");
+                self.sink.emit(EventBody::MemoryWriteFailed(failure.event(
+                    sid,
+                    Some("session.import"),
+                    false,
+                )));
+                SessionContext::ImportIncomplete(failure)
+            }
             Err(err) => {
                 tracing::warn!("session {sid} memory load failed: {err}");
-                Some(Vec::new())
+                SessionContext::Ready(Vec::new())
             }
         }
     }
@@ -778,21 +931,51 @@ impl RunManager {
             .remember(sid, prompt, answer, prompt_origin, source_ref)
             .await
         {
-            Ok(retain::RetainOutcome::Saved) => MemoryWriteOutcome::Saved,
-            Ok(retain::RetainOutcome::SkippedPaused) => MemoryWriteOutcome::SkippedPaused,
-            Ok(retain::RetainOutcome::NotApplicable) => MemoryWriteOutcome::NotApplicable,
-            Err(err) => {
-                let reason = err.to_string();
-                tracing::error!(session_id = sid, %reason, "session memory write failed");
-                self.sink.emit(EventBody::MemoryWriteFailed(
-                    agent24_protocol::MemoryWriteFailedPayload {
-                        session_id: sid.to_owned(),
-                        reason,
-                    },
-                ));
-                MemoryWriteOutcome::Failed
+            Ok(report) => {
+                self.report_summary_failure(sid, report.compaction_failure.as_ref());
+                match report.retain {
+                    retain::RetainOutcome::Saved => MemoryWriteOutcome::Saved,
+                    retain::RetainOutcome::SkippedPaused => MemoryWriteOutcome::SkippedPaused,
+                    retain::RetainOutcome::NotApplicable => MemoryWriteOutcome::NotApplicable,
+                }
+            }
+            Err(failure_of) => {
+                let failure = MemoryFailure::from_error(&failure_of.error);
+                // W3: the legacy import is its own kind of failed write.
+                let kind = matches!(
+                    failure_of.error,
+                    agent24_memory::MemoryError::SessionImportIncomplete(_)
+                )
+                .then_some("session.import");
+                tracing::error!(session_id = sid, code = %failure.code, error = %failure_of.error, "session memory write failed");
+                self.sink.emit(EventBody::MemoryWriteFailed(failure.event(
+                    sid,
+                    kind,
+                    failure_of.turn_saved,
+                )));
+                // W2 on top of a failed retain: independent events, so a
+                // double failure never loses the summary one.
+                self.report_summary_failure(sid, failure_of.compaction_failure.as_ref());
+                if failure_of.turn_saved {
+                    MemoryWriteOutcome::Partial(failure)
+                } else {
+                    MemoryWriteOutcome::Failed(failure)
+                }
             }
         }
+    }
+
+    /// W2: the turn is durable, but its compaction summary could not be written.
+    /// Observable, with the typed cause only.
+    fn report_summary_failure(&self, sid: &str, err: Option<&agent24_memory::MemoryError>) {
+        let Some(err) = err else { return };
+        let failure = MemoryFailure::from_error(err);
+        tracing::error!(session_id = sid, code = %failure.code, error = %err, "session summary write failed");
+        self.sink.emit(EventBody::MemoryWriteFailed(failure.event(
+            sid,
+            Some("session.summary"),
+            false,
+        )));
     }
 
     /// M1-T12: the SAME recall + pause-notice decision `drive_new` makes at
@@ -1014,33 +1197,83 @@ impl RunManager {
             return false;
         }
         let result = Msg::tool_result(call.id.clone(), answer.content);
-        let _ = self.persist_message(run_id, &result).await;
+        if !self.persist_for_next_send(run_id, &result).await {
+            return false;
+        }
         messages.push(result);
         true
     }
 
     /// Append one message to the run's durable thread (H3/G1 foundation).
-    /// Most callers treat this as best-effort bookkeeping; callers that require
-    /// a complete replay prefix must check the result and fail closed.
+    /// A caller that then pushes the message into the next provider request
+    /// must use [`Self::persist_for_next_send`] instead of ignoring this error.
     async fn persist_message(&self, run_id: &str, msg: &Msg) -> Result<(), StoreError> {
         let tool_calls =
             serde_json::to_value(&msg.tool_calls).unwrap_or_else(|_| serde_json::json!([]));
-        if let Err(err) = self
-            .store
-            .append_run_message(
-                run_id,
-                &msg.role,
-                msg.content.as_deref(),
-                &tool_calls,
-                msg.tool_call_id.as_deref(),
-                &now_iso8601(),
-            )
-            .await
-        {
+        let message = agent24_store::PendingRunMessage {
+            role: msg.role.clone(),
+            content: msg.content.clone(),
+            tool_calls,
+            tool_call_id: msg.tool_call_id.clone(),
+        };
+        let appended = match msg.role.as_str() {
+            "assistant" => {
+                self.store
+                    .append_originated_run_messages(
+                        run_id,
+                        &[OriginatedRunMessage {
+                            message,
+                            origin: MessageOrigin::Assistant,
+                        }],
+                        &now_iso8601(),
+                    )
+                    .await
+            }
+            "tool" => {
+                self.store
+                    .append_originated_run_messages(
+                        run_id,
+                        &[OriginatedRunMessage {
+                            message,
+                            origin: MessageOrigin::ToolResult,
+                        }],
+                        &now_iso8601(),
+                    )
+                    .await
+            }
+            _ => {
+                self.store
+                    .append_run_message(
+                        run_id,
+                        &message.role,
+                        message.content.as_deref(),
+                        &message.tool_calls,
+                        message.tool_call_id.as_deref(),
+                        &now_iso8601(),
+                    )
+                    .await
+            }
+        };
+        if let Err(err) = appended {
             tracing::warn!("run {run_id}: message thread append failed: {err}");
             return Err(err);
         }
         Ok(())
+    }
+
+    /// Persist a message the next provider request would include.
+    /// A failed write ends the run so the caller must not push it.
+    async fn persist_for_next_send(&self, run_id: &str, msg: &Msg) -> bool {
+        if let Err(err) = self.persist_message(run_id, msg).await {
+            self.finish_failed(
+                run_id,
+                "internal",
+                &format!("failed to persist run message: {err}"),
+            )
+            .await;
+            return false;
+        }
+        true
     }
 
     pub async fn start_run(self: &Arc<Self>, create: RunCreate) -> Result<Run, AgentError> {
@@ -1053,6 +1286,26 @@ impl RunManager {
         self: &Arc<Self>,
         create: RunCreate,
         schedule_id: Option<String>,
+    ) -> Result<Run, AgentError> {
+        self.start_run_inner(create, schedule_id, |_| {}).await
+    }
+
+    /// As [`start_run`], with `before_execute` called once the run is stored
+    /// and before it starts executing, so whatever it records about the run
+    /// is there before the run's first step.
+    pub async fn start_run_then(
+        self: &Arc<Self>,
+        create: RunCreate,
+        before_execute: impl FnOnce(&Run),
+    ) -> Result<Run, AgentError> {
+        self.start_run_inner(create, None, before_execute).await
+    }
+
+    async fn start_run_inner(
+        self: &Arc<Self>,
+        create: RunCreate,
+        schedule_id: Option<String>,
+        before_execute: impl FnOnce(&Run),
     ) -> Result<Run, AgentError> {
         if let Some(session_id) = &create.session_id
             && self.store.get_session(session_id).await?.is_none()
@@ -1075,6 +1328,7 @@ impl RunManager {
                 workspace_id: create.workspace_id,
                 model_override: create.model_override,
                 mode: create.mode,
+                knowledge_binding_id: create.knowledge_binding_id,
             },
             output: None,
             error: None,
@@ -1096,6 +1350,7 @@ impl RunManager {
             self.cancels.lock().await.remove(&run.id);
             return Err(err);
         }
+        before_execute(&run);
 
         // Supervised execution: execute() runs in its OWN task whose join
         // result is observed. A panic anywhere in the execution path (the
@@ -1480,6 +1735,25 @@ impl RunManager {
             return;
         }
 
+        // Missing or unreadable origins must not settle a parked tool or
+        // dispatch a sibling such as explore. Failed is legal only from
+        // Running, so the refusal enters Running without RunStarted.
+        if !self.persisted_origins_allow_send(&run_id).await {
+            if let Err(err) = self
+                .store
+                .transition_run(&run_id, RunStatus::Running, RunPatch::default())
+                .await
+            {
+                tracing::error!(
+                    "run {run_id}: resume source refusal could not enter running: {err}"
+                );
+                return;
+            }
+            self.finish_failed(&run_id, SOURCE_UNPROVEN_CODE, SOURCE_UNPROVEN_MESSAGE)
+                .await;
+            return;
+        }
+
         // 3. Reconstruct the conversation and return the run to Running.
         // M1-T07.1 M4 (review #674 round 2 ③): re-validating the recall
         // block used to happen ONLY here, which misses the common case of
@@ -1789,12 +2063,24 @@ impl RunManager {
         // session actually remembers. Empty when memory is off or session-less.
         // A cancel while waiting on a concurrent run's session lock ends the run
         // here rather than proceeding without its own context.
-        let Some(prior_context) = self
+        let prior_context = match self
             .session_context(run.session_id.as_deref(), &cancel)
             .await
-        else {
-            self.finish_cancelled(&run_id).await;
-            return;
+        {
+            SessionContext::Ready(context) => context,
+            SessionContext::Cancelled => {
+                self.finish_cancelled(&run_id).await;
+                return;
+            }
+            SessionContext::ImportIncomplete(failure) => {
+                self.finish_failed(
+                    &run_id,
+                    failure.wire_code_str(),
+                    "this session's earlier history could not be imported; nothing was changed; if retrying still fails, the session's old records may be corrupted",
+                )
+                .await;
+                return;
+            }
         };
         // M1-T07.1: the FULL first-call input — recall block, then the
         // session's prior (compacted) context, then this run's prompt — is the
@@ -1805,14 +2091,29 @@ impl RunManager {
         // `thread_to_messages(&thread)` to rebuild from — a partially
         // persisted snapshot would silently resume with less context than the
         // first call saw. M3: the write itself is now ONE transaction
-        // (`append_run_messages_tx`), not N independent single-row appends —
+        // (`append_snapshot_run_messages`), not N independent single-row appends —
         // a mid-batch failure must leave NOTHING behind, not an unpredictable
         // prefix, which is what fail-closed actually requires.
+        let pending_of = |msg: &Msg| agent24_store::PendingRunMessage {
+            role: msg.role.clone(),
+            content: msg.content.clone(),
+            tool_calls: serde_json::to_value(&msg.tool_calls)
+                .unwrap_or_else(|_| serde_json::json!([])),
+            tool_call_id: msg.tool_call_id.clone(),
+        };
+        let originated = |msg: &Msg, origin: MessageOrigin| {
+            SnapshotRunMessage::Originated(OriginatedRunMessage {
+                message: pending_of(msg),
+                origin,
+            })
+        };
         let prior_context_len = prior_context.len();
         let mut snapshot = Vec::with_capacity(prior_context_len + 3);
+        let mut rows = Vec::with_capacity(prior_context_len + 3);
         let mut recalled_ids = None;
         let mut recalled_tags = Vec::new();
         if let Some((recalled, hits)) = recall {
+            let ids: Vec<String> = hits.iter().map(|hit| hit.id.clone()).collect();
             let recall_seq = snapshot.len() as i64;
             recalled_tags = hits
                 .iter()
@@ -1827,8 +2128,26 @@ impl RunManager {
                     )
                 })
                 .collect();
-            recalled_ids = Some(hits.into_iter().map(|hit| hit.id).collect::<Vec<_>>());
+            let encoded = match canonical_recall_ref(&ids) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    self.finish_failed(
+                        &run_id,
+                        "internal",
+                        &format!("failed to encode recall ref: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            rows.push(originated(
+                &recalled,
+                MessageOrigin::HostRecall {
+                    recall_ref: Some(encoded),
+                },
+            ));
             snapshot.push(recalled);
+            recalled_ids = Some(ids);
         }
         if write_skipped {
             // M1-T10 review H1/M2: part of the SAME atomic snapshot as the
@@ -1836,7 +2155,9 @@ impl RunManager {
             // resume (M2) must replay exactly what THIS run's first call
             // saw, not re-decide anything against whatever the pause switch
             // says by the time it resumes.
-            snapshot.push(Msg::system(retain::PAUSED_WRITE_NOTICE));
+            let notice = Msg::system(retain::PAUSED_WRITE_NOTICE);
+            rows.push(SnapshotRunMessage::PauseNotice(pending_of(&notice)));
+            snapshot.push(notice);
         }
         // M3 growth control: the seq range `prior_context` will occupy in
         // THIS run's own `run_messages`, so it can be reclaimed once the run
@@ -1847,28 +2168,23 @@ impl RunManager {
             let start = snapshot.len() as i64;
             (start, start + prior_context_len as i64 - 1)
         });
-        snapshot.extend(prior_context);
-        snapshot.push(Msg::user(run.input.prompt.clone()));
+        for msg in prior_context {
+            rows.push(originated(&msg, MessageOrigin::SessionHistory));
+            snapshot.push(msg);
+        }
+        let prompt = Msg::user(run.input.prompt.clone());
+        rows.push(originated(&prompt, MessageOrigin::UserPrompt));
+        snapshot.push(prompt);
         // K1-6b.1 (ADR-K1-02 §6): the seq this run's own user-input message
         // will be assigned by the batch append below. Valid because THIS
-        // call is always the run's first `append_run_messages_tx` (a fresh
+        // call is always the run's first `append_snapshot_run_messages` (a fresh
         // run's `MAX(seq)` starts at -1), so each row's assigned seq equals
-        // its index in `snapshot`/`pending` — the user message is pushed
+        // its index in `snapshot`/`rows` — the user message is pushed
         // last, so its seq is `snapshot.len() - 1`.
         let user_msg_seq = (snapshot.len() - 1) as i64;
-        let pending: Vec<agent24_store::PendingRunMessage> = snapshot
-            .iter()
-            .map(|msg| agent24_store::PendingRunMessage {
-                role: msg.role.clone(),
-                content: msg.content.clone(),
-                tool_calls: serde_json::to_value(&msg.tool_calls)
-                    .unwrap_or_else(|_| serde_json::json!([])),
-                tool_call_id: msg.tool_call_id.clone(),
-            })
-            .collect();
         if let Err(err) = self
             .store
-            .append_run_messages_tx(&run_id, &pending, &now_iso8601())
+            .append_snapshot_run_messages(&run_id, &rows, &now_iso8601())
             .await
         {
             self.finish_failed(
@@ -2097,6 +2413,9 @@ impl RunManager {
                 final_run.status,
                 RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
             )
+            // Refusing the send keeps the snapshot. Reclaiming prior-context
+            // rows here would delete bytes this failure promised to leave.
+            && !unproven_source_failure(&final_run)
             && let Err(err) = self
                 .store
                 .delete_run_message_range(&run_id, start, end)
@@ -2108,64 +2427,130 @@ impl RunManager {
         }
     }
 
-    /// M1-T07.1 M4 (review #674 round 2 ③): builds the SAME shape
-    /// `normalize_for_provider` always built, but first re-validates the
-    /// recall block — if any — against the CURRENT ledger. Called fresh on
-    /// EVERY iteration of [`Self::run_loop`], so this is the ONE place that
-    /// covers all three ways a recall block can go stale before the model
-    /// sees it again: a cold-restart resume (`drive_resume` rebuilding from
-    /// `thread_to_messages`), an approval answered while the run is still
-    /// parked in the SAME process (the in-memory broker wakes the task
-    /// directly — no `drive_resume` involved at all), and — in principle —
-    /// a very slow approval wait spanning multiple loop iterations. Never
-    /// mutates `messages` itself, only the copy returned for this request.
+    /// R05-5 4b: the request-only send copy. Each message is shaped by the
+    /// origin kind PERSISTED for its stored seq (`list_run_messages` plus
+    /// `read_run_message_origin`), never by its text or its in-memory index:
     ///
-    /// Round 2 ②: only `messages[0]` is ever treated as a candidate recall
-    /// block — a POSITION check, not a content-prefix scan over the whole
-    /// thread. The snapshot (`execute`) always puts the recall message (if
-    /// any) first, so this is exactly where it would be; scanning every
-    /// message for a `RECALL_PREFIX` match would also treat a bound run's
-    /// own prompt as a recall block if an adversarial user typed text that
-    /// happened to start with that exact prefix.
-    async fn request_messages_for(&self, messages: &[Msg], run_id: &str) -> Vec<Msg> {
-        let Some(memory) = self.memory.as_ref() else {
-            return normalize_for_provider(messages);
-        };
-        let Some(first) = messages.first() else {
-            return normalize_for_provider(messages);
-        };
-        // Round 2 ②: require BOTH the header AND the end marker, not just
-        // the prefix — a real recall block always has this exact shape, so
-        // this is still unambiguous, but it closes the (already-vanishing,
-        // position-0-only) case of a context-free run's very first turn
-        // happening to be the user's OWN prompt and that prompt merely
-        // STARTING WITH the same prefix text without the matching suffix:
-        // such a message is left alone rather than risk getting dropped by
-        // `prune_stale_recall_message` failing to parse it as a real block.
-        if first.role != "user"
-            || !first
-                .content
-                .as_deref()
-                .is_some_and(|c| c.starts_with(RECALL_PREFIX) && c.ends_with(RECALL_END_MARKER))
-        {
-            return normalize_for_provider(messages);
-        }
-        let mut rebuilt = messages.to_vec();
-        match memory.active_ids().await {
-            Ok(active) => match prune_stale_recall_message(first.clone(), &active) {
-                Some(pruned) => rebuilt[0] = pruned,
-                None => {
-                    rebuilt.remove(0);
-                }
-            },
+    /// - `HostRecall` is re-validated against the CURRENT ledger line by line
+    ///   (a retracted id must not reach the model again). A HostRecall that is
+    ///   fully stale, malformed (role not user, no content, no header / end
+    ///   marker, no parsable id), or cannot be re-validated (`active_ids()`
+    ///   failed, or there is no memory) is dropped from the copy with a warn.
+    /// - every other kind (user prompt, session history, assistant, tool
+    ///   result, and any future kind) is sent verbatim, even when its text is
+    ///   shaped exactly like a recall block.
+    ///
+    /// `messages` is the run loop's in-memory thread; it must be provably the
+    /// stored thread (same length, same bytes per seq) or the send is refused
+    /// (`None`) — position is never trusted. Called fresh on EVERY iteration so
+    /// a cold resume, an approval answered in-process, and a long approval wait
+    /// all see the current ledger. Never mutates the store or `messages`; the
+    /// shaping (before `normalize_for_provider`, which merges adjacent user
+    /// turns and would erase the kind boundaries) only affects this copy.
+    async fn request_messages_for(&self, messages: &[Msg], run_id: &str) -> Option<Vec<Msg>> {
+        let stored = match self.store.list_run_messages(run_id).await {
+            Ok(stored) => stored,
             Err(err) => {
-                tracing::warn!(
-                    "run {run_id}: could not re-validate recalled memory; dropping the recall block for this request: {err}"
-                );
-                rebuilt.remove(0);
+                tracing::warn!(run_id, error = %err, "send copy: could not read the stored thread");
+                return None;
+            }
+        };
+        if stored.len() != messages.len()
+            || thread_to_messages(&stored)
+                .iter()
+                .zip(messages)
+                .any(|(a, b)| a != b)
+        {
+            tracing::warn!(
+                run_id,
+                "send copy: the in-memory thread does not match the stored thread; refusing to send"
+            );
+            return None;
+        }
+        // Resolved lazily, once, and only if a HostRecall is actually present.
+        let mut active: Option<Option<std::collections::HashSet<String>>> = None;
+        let mut shaped = Vec::with_capacity(messages.len());
+        for (row, msg) in stored.iter().zip(messages) {
+            let origin = match self.store.read_run_message_origin(run_id, row.seq).await {
+                Ok(MessageOriginLookup::Present(stored_origin)) => stored_origin.origin,
+                Ok(_) => return None,
+                Err(err) => {
+                    tracing::warn!(run_id, seq = row.seq, error = %err, "message origin read failed");
+                    return None;
+                }
+            };
+            match origin {
+                MessageOrigin::HostRecall { recall_ref: None } => return None,
+                MessageOrigin::HostRecall {
+                    recall_ref: Some(_),
+                } => {
+                    if active.is_none() {
+                        active = Some(match self.memory.as_ref() {
+                            None => {
+                                tracing::warn!(
+                                    run_id,
+                                    "run {run_id}: no memory to re-validate HostRecall; dropping it from the send copy"
+                                );
+                                None
+                            }
+                            Some(memory) => match memory.active_ids().await {
+                                Ok(ids) => Some(ids),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        run_id,
+                                        "run {run_id}: could not re-validate HostRecall; dropping it from the send copy: {err}"
+                                    );
+                                    None
+                                }
+                            },
+                        });
+                    }
+                    let kept = match active.as_ref().and_then(Option::as_ref) {
+                        Some(ids) => shape_host_recall(msg.clone(), ids),
+                        None => None,
+                    };
+                    match kept {
+                        Some(kept) => shaped.push(kept),
+                        None => {
+                            tracing::warn!(
+                                run_id,
+                                seq = row.seq,
+                                "dropping a HostRecall row from the send copy (stale, malformed or unverifiable)"
+                            );
+                        }
+                    }
+                }
+                _ => shaped.push(msg.clone()),
             }
         }
-        normalize_for_provider(&rebuilt)
+        Some(normalize_for_provider(&shaped))
+    }
+
+    /// Stored seq order, not message text. A read error is the same refusal
+    /// as a missing or unreadable row: the provider is not called.
+    async fn persisted_origins_allow_send(&self, run_id: &str) -> bool {
+        let messages = match self.store.list_run_messages(run_id).await {
+            Ok(messages) => messages,
+            Err(err) => {
+                tracing::warn!(run_id, error = %err, "message origin read failed");
+                return false;
+            }
+        };
+        for message in messages {
+            match self
+                .store
+                .read_run_message_origin(run_id, message.seq)
+                .await
+            {
+                Ok(lookup) if origin_allows_send(&lookup) => {}
+                Ok(_) => return false,
+                Err(err) => {
+                    tracing::warn!(run_id, seq = message.seq, error = %err, "message origin read failed");
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// The completion↔tool-execution loop shared by a fresh run ([`execute`]) and
@@ -2184,6 +2569,11 @@ impl RunManager {
         let mut usage_total = zero_usage();
 
         for _ in 0..MAX_ITERATIONS {
+            if !self.persisted_origins_allow_send(&run_id).await {
+                self.finish_failed(&run_id, SOURCE_UNPROVEN_CODE, SOURCE_UNPROVEN_MESSAGE)
+                    .await;
+                return;
+            }
             // Recomputed each turn: in plan mode only the read-only subset plus
             // `propose_plan` is offered; the instant a plan is approved
             // `plan_mode` flips false and the full set is advertised (H8).
@@ -2191,10 +2581,17 @@ impl RunManager {
             // re-validated against the CURRENT ledger and reshaped fresh
             // every iteration via `request_messages_for` — request-only,
             // never applied back to `messages` itself.
+            let Some(send_messages) = self.request_messages_for(&messages, &run_id).await else {
+                self.finish_failed(&run_id, SOURCE_UNPROVEN_CODE, SOURCE_UNPROVEN_MESSAGE)
+                    .await;
+                return;
+            };
             let request = CompletionRequest {
-                messages: self.request_messages_for(&messages, &run_id).await,
+                messages: send_messages,
                 model: run.input.model_override.clone(),
-                tools: self.tool_specs_for(plan_mode).await,
+                tools: self
+                    .tool_specs_for(plan_mode, run.input.knowledge_binding_id.is_some())
+                    .await,
                 response_format: None,
                 max_tokens: None,
                 disable_thinking: false,
@@ -2241,6 +2638,12 @@ impl RunManager {
             };
             usage_total = add_usage(usage_total, &res.usage);
 
+            if res.message.role != "assistant" {
+                self.finish_failed(&run_id, "provider_error", PROVIDER_ROLE_MESSAGE)
+                    .await;
+                return;
+            }
+
             if res.message.tool_calls.is_empty() {
                 // Final answer
                 let text = res.message.content.clone().unwrap_or_default();
@@ -2263,8 +2666,8 @@ impl RunManager {
                 // state` is the C2 contract. If cancellation drops this waiter
                 // after append starts, SessionMemory's detached transaction task
                 // keeps the session lock until SQLx confirms the append outcome.
-                tokio::select! {
-                    _ = async {
+                let memory_persisted = tokio::select! {
+                    outcome = async {
                         let source_ref = self.run_assertion_source_ref(&run_id).await;
                         self.remember_exchange(
                             run.session_id.as_deref(),
@@ -2274,12 +2677,12 @@ impl RunManager {
                             source_ref,
                         )
                         .await
-                    } => {},
+                    } => Some(outcome.persisted()),
                     () = cancel.cancelled() => {
                         self.finish_cancelled(&run_id).await;
                         return;
                     }
-                }
+                };
                 // Re-check: a cancel that landed just as the write finished must
                 // still win rather than be overwritten by Completed.
                 //
@@ -2314,6 +2717,7 @@ impl RunManager {
                             run_id,
                             output: RunOutputPayload { text },
                             usage: usage_total,
+                            memory_persisted,
                         }));
                     }
                     Err(err) => tracing::error!("run completion persist failed: {err}"),
@@ -2330,7 +2734,9 @@ impl RunManager {
             // call. This is the row H3 keys resume off: an assistant turn on disk
             // whose trailing tool_call has no answering `tool` row is exactly a
             // run that died awaiting approval.
-            let _ = self.persist_message(&run_id, &res.message).await;
+            if !self.persist_for_next_send(&run_id, &res.message).await {
+                return;
+            }
             messages.push(res.message);
             for (idx, call) in calls.iter().enumerate() {
                 if cancel.is_cancelled() {
@@ -2344,7 +2750,9 @@ impl RunManager {
                             "skipped: per-turn tool call limit ({MAX_TOOL_CALLS_PER_TURN}) exceeded"
                         ),
                     );
-                    let _ = self.persist_message(&run_id, &skipped).await;
+                    if !self.persist_for_next_send(&run_id, &skipped).await {
+                        return;
+                    }
                     messages.push(skipped);
                     continue;
                 }
@@ -2359,7 +2767,9 @@ impl RunManager {
                         PlanOutcome::Approved(content) => {
                             plan_mode = false; // full tool set from the next turn
                             let result = Msg::tool_result(call.id.clone(), content);
-                            let _ = self.persist_message(&run_id, &result).await;
+                            if !self.persist_for_next_send(&run_id, &result).await {
+                                return;
+                            }
                             messages.push(result);
                         }
                         PlanOutcome::Rejected(content) => {
@@ -2394,7 +2804,9 @@ impl RunManager {
                          approved before using this tool"
                             .to_owned(),
                     );
-                    let _ = self.persist_message(&run_id, &denied).await;
+                    if !self.persist_for_next_send(&run_id, &denied).await {
+                        return;
+                    }
                     messages.push(denied);
                     continue;
                 }
@@ -2618,12 +3030,13 @@ impl RunManager {
     }
 
     /// The tool specs advertised this turn: the full advert set normally, or the
-    /// read-only subset plus `propose_plan` in plan mode (H8).
-    async fn tool_specs_for(&self, plan_mode: bool) -> Vec<ToolSpec> {
+    /// read-only subset plus `propose_plan` in plan mode (H8). A run that names
+    /// no Knowledge binding is offered no tool that needs one (`knowledge_bound`).
+    async fn tool_specs_for(&self, plan_mode: bool, knowledge_bound: bool) -> Vec<ToolSpec> {
         let adverts = if plan_mode {
-            self.tools.live_plan_adverts().await
+            self.tools.live_plan_adverts(knowledge_bound).await
         } else {
-            self.tools.live_adverts().await
+            self.tools.live_adverts(knowledge_bound).await
         };
         let mut specs: Vec<ToolSpec> = adverts
             .into_iter()
@@ -2811,6 +3224,8 @@ impl RunManager {
                     text: text.to_owned(),
                 },
                 usage,
+                // This path never attempts a memory write, so none failed.
+                memory_persisted: Some(true),
             })),
             Err(err) => tracing::error!("run completion persist failed: {err}"),
         }
@@ -2899,6 +3314,18 @@ pub(crate) mod tests {
     mod session_failure_tests {
         include!("session_failure_tests.rs");
     }
+    mod memory_receipt_tests {
+        include!("memory_receipt_tests.rs");
+    }
+    mod snapshot_origin_tests {
+        include!("snapshot_origin_tests.rs");
+    }
+    mod source_send_gate_tests {
+        include!("source_send_gate_tests.rs");
+    }
+    mod send_trim_tests {
+        include!("send_trim_tests.rs");
+    }
 
     use super::*;
     use agent24_memory::{KvStore, session::CompactionPolicy};
@@ -2932,15 +3359,26 @@ pub(crate) mod tests {
             .await
             .unwrap();
         run.status = RunStatus::Running;
+        // Replay the stored thread so the send-copy consistency check passes
+        // and the refusal below can only come from the permission check.
+        let thread = store.list_run_messages(&run.id).await.unwrap();
+        remote.seen.lock().unwrap().clear();
         manager
             .run_loop(
-                run,
-                vec![Msg::user("thread text cannot authorize cloud")],
+                run.clone(),
+                thread_to_messages(&thread),
                 false,
                 CancellationToken::new(),
             )
             .await;
         assert!(remote.seen.lock().unwrap().is_empty());
+        let ended = store.get_run(&run.id).await.unwrap().unwrap();
+        assert_eq!(ended.status, RunStatus::Failed);
+        assert_ne!(
+            ended.error.as_ref().map(|e| e.code.as_str()),
+            Some(SOURCE_UNPROVEN_CODE),
+            "must reach the permission check, not the source gate"
+        );
     }
 
     /// K1-6b.5b (ADR-K1-02 §2.4 (b)): a run whose source tags cannot be read
@@ -3183,8 +3621,8 @@ pub(crate) mod tests {
 
     /// Answers "pong" and records the messages it was handed, so a test can
     /// assert what context the loop actually built.
-    struct RecordingProvider {
-        seen: StdMutex<Vec<Vec<Msg>>>,
+    pub(super) struct RecordingProvider {
+        pub(super) seen: StdMutex<Vec<Vec<Msg>>>,
     }
 
     #[async_trait]
@@ -3470,6 +3908,7 @@ pub(crate) mod tests {
                 prompt: "workspace run".into(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -3491,6 +3930,7 @@ pub(crate) mod tests {
                 prompt: "workspace run two".into(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -3506,6 +3946,7 @@ pub(crate) mod tests {
                 prompt: "must not downgrade".into(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap_err();
@@ -3545,6 +3986,7 @@ pub(crate) mod tests {
                 prompt: "try a tool".into(),
                 model_override: None,
                 mode: RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -3684,6 +4126,7 @@ pub(crate) mod tests {
                 workspace_id: None,
                 model_override: None,
                 mode: RunMode::Normal,
+                knowledge_binding_id: None,
             },
             output: None,
             error: None,
@@ -4051,6 +4494,7 @@ pub(crate) mod tests {
                 workspace_id: None,
                 model_override: None,
                 mode: RunMode::Normal,
+                knowledge_binding_id: None,
             },
             output: None,
             error: None,
@@ -4114,6 +4558,7 @@ pub(crate) mod tests {
                     prompt: "fail admission".into(),
                     model_override: None,
                     mode: RunMode::Normal,
+                    knowledge_binding_id: None,
                 })
                 .await,
             Err(AgentError::Workspace(WorkspaceStoreError::Database))
@@ -4150,6 +4595,7 @@ pub(crate) mod tests {
                 workspace_id: Some(workspace_id),
                 model_override: None,
                 mode: RunMode::Normal,
+                knowledge_binding_id: None,
             },
             output: None,
             error: None,
@@ -4228,6 +4674,7 @@ pub(crate) mod tests {
                 prompt: "hang".into(),
                 model_override: None,
                 mode: RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -4275,6 +4722,7 @@ pub(crate) mod tests {
                     workspace_id: Some(workspace_id),
                     model_override: None,
                     mode: RunMode::Normal,
+                    knowledge_binding_id: None,
                 },
                 output: None,
                 error: None,
@@ -4402,6 +4850,7 @@ pub(crate) mod tests {
                     workspace_id: Some(workspace_id),
                     model_override: None,
                     mode: RunMode::Normal,
+                    knowledge_binding_id: None,
                 },
                 output: None,
                 error: None,
@@ -4498,6 +4947,7 @@ pub(crate) mod tests {
                 prompt: prompt.to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -4851,6 +5301,7 @@ pub(crate) mod tests {
                     prompt: prompt.to_owned(),
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
+                    knowledge_binding_id: None,
                 },
                 Some(schedule_id.to_owned()),
             )
@@ -5302,6 +5753,7 @@ pub(crate) mod tests {
                 prompt: "first question".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -5322,6 +5774,7 @@ pub(crate) mod tests {
                 prompt: "second question".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -5378,6 +5831,7 @@ pub(crate) mod tests {
                     prompt: prompt.to_owned(),
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
+                    knowledge_binding_id: None,
                 })
                 .await
                 .unwrap();
@@ -5527,6 +5981,7 @@ pub(crate) mod tests {
                 prompt: "hi".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -5601,6 +6056,7 @@ pub(crate) mod tests {
                 prompt: "a".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -5616,6 +6072,7 @@ pub(crate) mod tests {
                 prompt: "b".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -5665,6 +6122,7 @@ pub(crate) mod tests {
             prompt: "hi".to_owned(),
             model_override: None,
             mode: agent24_protocol::RunMode::Normal,
+            knowledge_binding_id: None,
         }
     }
 
@@ -5732,10 +6190,204 @@ pub(crate) mod tests {
                 prompt: "hi".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap_err();
         assert!(matches!(err, AgentError::SessionNotFound(_)));
+    }
+
+    /// Records the tool names offered on each model call.
+    struct ToolNamesProvider {
+        offered: StdMutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ToolNamesProvider {
+        fn name(&self) -> &str {
+            "tool-names"
+        }
+        async fn complete(
+            &self,
+            req: &CompletionRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<CompletionResponse, ModelError> {
+            let names = req.tools.iter().map(|t| t.name.clone()).collect();
+            self.offered.lock().unwrap().push(names);
+            Ok(CompletionResponse {
+                message: Msg::assistant(Some("pong".to_owned()), vec![]),
+                usage: usage_one(),
+                model_id: None,
+            })
+        }
+        async fn models(
+            &self,
+            _cancel: &CancellationToken,
+        ) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+            Ok(vec![])
+        }
+    }
+
+    struct KnowledgeOnlyTool;
+
+    #[async_trait]
+    impl agent24_tools::Tool for KnowledgeOnlyTool {
+        fn requires_outbound_policy(&self) -> bool {
+            false
+        }
+
+        fn info(&self) -> agent24_protocol::ToolInfo {
+            agent24_protocol::ToolInfo::new(
+                "kb_read",
+                "builtin",
+                "reads Knowledge",
+                agent24_protocol::RiskClass::Read,
+            )
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn needs_knowledge_binding(&self) -> bool {
+            true
+        }
+        async fn call(
+            &self,
+            _ctx: &agent24_tools::ToolContext,
+            _input: &serde_json::Map<String, serde_json::Value>,
+            _cancel: &CancellationToken,
+        ) -> Result<String, agent24_tools::ToolError> {
+            Ok("ok".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_run_that_names_a_knowledge_binding_is_offered_a_tool_that_needs_one() {
+        let provider = Arc::new(ToolNamesProvider {
+            offered: StdMutex::new(vec![]),
+        });
+        let tools = ToolRegistry::new().with(Arc::new(KnowledgeOnlyTool));
+        let (manager, _sink, store) = manager_with_tools(provider.clone(), tools).await;
+        let unbound = manager.start_run(create()).await.unwrap();
+        wait_terminal(&store, &unbound.id).await;
+        let bound = manager
+            .start_run(RunCreate {
+                knowledge_binding_id: Some("b1".to_owned()),
+                ..create()
+            })
+            .await
+            .unwrap();
+        wait_terminal(&store, &bound.id).await;
+        let offered = provider.offered.lock().unwrap().clone();
+        assert_eq!(
+            offered,
+            vec![Vec::<String>::new(), vec!["kb_read".to_owned()]]
+        );
+        // The same holds in plan mode, next to `propose_plan`.
+        let names =
+            |specs: Vec<ToolSpec>| -> Vec<String> { specs.into_iter().map(|s| s.name).collect() };
+        assert_eq!(
+            names(manager.tool_specs_for(true, false).await),
+            vec!["propose_plan"]
+        );
+        assert_eq!(
+            names(manager.tool_specs_for(true, true).await),
+            vec!["kb_read", "propose_plan"]
+        );
+    }
+
+    /// Notes, on its first call, what `before_execute` had recorded by then.
+    struct FirstStepProvider {
+        noted: Arc<StdMutex<Option<String>>>,
+        at_first_step: StdMutex<Option<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for FirstStepProvider {
+        fn name(&self) -> &str {
+            "first-step"
+        }
+        async fn complete(
+            &self,
+            _req: &CompletionRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<CompletionResponse, ModelError> {
+            let noted = self.noted.lock().unwrap().clone();
+            self.at_first_step.lock().unwrap().get_or_insert(noted);
+            Ok(CompletionResponse {
+                message: Msg::assistant(Some("pong".to_owned()), vec![]),
+                usage: usage_one(),
+                model_id: None,
+            })
+        }
+        async fn models(
+            &self,
+            _cancel: &CancellationToken,
+        ) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn before_execute_is_done_before_the_run_takes_its_first_step() {
+        let noted = Arc::new(StdMutex::new(None));
+        let provider = Arc::new(FirstStepProvider {
+            noted: noted.clone(),
+            at_first_step: StdMutex::new(None),
+        });
+        let (manager, _sink, store) = manager_with(provider.clone()).await;
+        let run = manager
+            .start_run_then(create(), |run| {
+                // Slow on purpose: a run already executing would reach the
+                // model on the other worker meanwhile and find nothing noted.
+                std::thread::sleep(Duration::from_millis(300));
+                *noted.lock().unwrap() = Some(run.id.clone());
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_terminal(&store, &run.id).await.status,
+            RunStatus::Completed
+        );
+        assert_eq!(
+            *provider.at_first_step.lock().unwrap(),
+            Some(Some(run.id.clone()))
+        );
+    }
+
+    #[tokio::test]
+    async fn before_execute_is_not_called_for_a_run_that_was_not_created() {
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        let mut called = false;
+        let err = manager
+            .start_run_then(
+                RunCreate {
+                    session_id: Some("sess_nope".to_owned()),
+                    ..create()
+                },
+                |_| called = true,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::SessionNotFound(_)));
+        assert!(!called);
+        // Nor for one the workspace admission denies (no session bound to the
+        // workspace): the run was never stored.
+        let err = manager
+            .start_run_then(
+                RunCreate {
+                    workspace_id: Some(
+                        agent24_protocol::WorkspaceId::parse("ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5")
+                            .unwrap(),
+                    ),
+                    ..create()
+                },
+                |_| called = true,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::WorkspaceAdmission(_)), "{err:?}");
+        assert!(!called);
+        assert!(store.list_runs(None).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -6160,6 +6812,7 @@ mod approval_tests {
             prompt: "do the thing".to_owned(),
             model_override: None,
             mode: RunMode::Plan,
+            knowledge_binding_id: None,
         }
     }
 
@@ -6222,7 +6875,7 @@ mod approval_tests {
         let h = scripted_plan_harness(dir.path().to_path_buf(), vec![]).await;
         let plan: Vec<String> = h
             .manager
-            .tool_specs_for(true)
+            .tool_specs_for(true, false)
             .await
             .into_iter()
             .map(|s| s.name)
@@ -6239,7 +6892,7 @@ mod approval_tests {
         );
         let full: Vec<String> = h
             .manager
-            .tool_specs_for(false)
+            .tool_specs_for(false, false)
             .await
             .into_iter()
             .map(|s| s.name)
@@ -6429,6 +7082,428 @@ mod approval_tests {
         }
     }
 
+    /// [`resume_harness`] plus `explore`, sharing the recording router so a
+    /// test can see a provider call made from the sub-agent.
+    async fn resume_harness_with_explorer(
+        workdir: std::path::PathBuf,
+    ) -> (Harness, Arc<RecordingProvider>) {
+        let store = Store::open_memory().await.unwrap();
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let ev = Arc::clone(&events);
+        let emit: Arc<dyn Fn(EventBody) + Send + Sync> = Arc::new(move |body: EventBody| {
+            if let Ok(mut v) = ev.lock() {
+                v.push(body.wire_type().to_owned());
+            }
+        });
+        let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let router = Arc::new(ModelRouter::with_defaults(vec![(
+            provider.clone() as Arc<dyn agent24_models::ModelProvider>,
+            Tier::Local,
+        )]));
+        let explorer = crate::subagent::ExplorerSubagent::new(
+            Arc::clone(&router),
+            Arc::new(ToolRegistry::read_only(workdir.clone())),
+        );
+        let tools = ToolRegistry::builtin(workdir)
+            .with(Arc::new(explorer))
+            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))));
+        struct FnSink(Arc<dyn Fn(EventBody) + Send + Sync>);
+        impl EventSink for FnSink {
+            fn emit(&self, body: EventBody) {
+                (self.0)(body);
+            }
+        }
+        let manager = RunManager::new(
+            store.clone(),
+            router,
+            Arc::new(tools),
+            Arc::new(FnSink(emit)),
+            CancellationToken::new(),
+        );
+        (
+            Harness {
+                manager,
+                broker,
+                store,
+                events,
+            },
+            provider,
+        )
+    }
+
+    /// Park shell_exec (approval target) and explore on one assistant turn.
+    /// `sourced` writes UserPrompt and Assistant origins. Otherwise the rows
+    /// are legacy `append_run_message` calls with no origin rows.
+    async fn resume_shell_and_explore(
+        sourced: bool,
+        decision_kind: &str,
+        reason: Option<&str>,
+        shell_token: &str,
+    ) -> (Harness, Arc<RecordingProvider>, Run) {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, provider) = resume_harness_with_explorer(dir.path().to_path_buf()).await;
+        let shell_args = serde_json::json!({ "argv": ["/bin/echo", shell_token] });
+        let explore_args = serde_json::json!({ "task": "SECRET-TASK-1197" });
+        let calls = serde_json::json!([
+            {
+                "id": "call_shell",
+                "name": "shell_exec",
+                "arguments": shell_args.to_string()
+            },
+            {
+                "id": "call_explore",
+                "name": "explore",
+                "arguments": explore_args.to_string()
+            }
+        ]);
+        let run = run_in("run_1", RunStatus::AwaitingApproval);
+        h.store.insert_run(&run).await.unwrap();
+        if sourced {
+            seed_proven_parked_thread(&h.store, "run_1", "run echo", calls).await;
+            let user_source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
+            h.store
+                .tag_run_source("run_1", 0, &user_source, &now_iso8601())
+                .await
+                .unwrap();
+        } else {
+            h.store
+                .append_run_message(
+                    "run_1",
+                    "user",
+                    Some("run echo"),
+                    &serde_json::json!([]),
+                    None,
+                    &now_iso8601(),
+                )
+                .await
+                .unwrap();
+            h.store
+                .append_run_message("run_1", "assistant", None, &calls, None, &now_iso8601())
+                .await
+                .unwrap();
+        }
+        let approval = seed_approval(
+            "apr_1",
+            "run_1",
+            "tc_internal_1",
+            shell_args.as_object().unwrap().clone(),
+        );
+        insert_parked(&h.store, &approval, "shell_exec").await;
+        h.broker
+            .resolve("apr_1", decision(decision_kind, reason))
+            .await
+            .unwrap();
+        h.manager
+            .resume_run("run_1".to_owned(), "apr_1".to_owned())
+            .await
+            .unwrap();
+        let done = wait_terminal(&h.store, "run_1").await;
+        (h, provider, done)
+    }
+
+    fn assert_resume_refused_before_tools(h: &Harness, provider: &RecordingProvider, done: &Run) {
+        let error = done.error.clone().unwrap();
+        assert_eq!(done.status, RunStatus::Failed);
+        assert_eq!(error.code, SOURCE_UNPROVEN_CODE);
+        assert_eq!(error.message, SOURCE_UNPROVEN_MESSAGE);
+        assert!(provider.seen.lock().unwrap().is_empty());
+        assert!(
+            !h.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "run.started")
+        );
+    }
+
+    async fn assert_shell_did_not_run(h: &Harness) {
+        // The parked call's row is seeded as Running; the shell must not have
+        // settled it (kernel resume reads the tool name from this row).
+        assert!(
+            h.store
+                .list_tool_calls("run_1")
+                .await
+                .unwrap()
+                .iter()
+                .all(|call| matches!(call.status, ToolCallStatus::Running))
+        );
+        let thread = h.store.list_run_messages("run_1").await.unwrap();
+        assert_eq!(thread.len(), 2);
+        assert!(thread.iter().all(|message| message.role != "tool"));
+    }
+
+    #[tokio::test]
+    async fn legacy_resume_approve_does_not_run_shell_or_call_the_provider() {
+        let (h, provider, done) =
+            resume_shell_and_explore(false, "approve", None, "must-not-run").await;
+        assert_resume_refused_before_tools(&h, &provider, &done);
+        assert_shell_did_not_run(&h).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_resume_deny_does_not_run_shell_or_call_the_provider() {
+        let (h, provider, done) =
+            resume_shell_and_explore(false, "deny", Some("not this time"), "must-not-run").await;
+        assert_resume_refused_before_tools(&h, &provider, &done);
+        assert_shell_did_not_run(&h).await;
+    }
+
+    #[tokio::test]
+    async fn sourced_resume_with_explore_still_completes_and_calls_the_provider() {
+        let (h, provider, done) =
+            resume_shell_and_explore(true, "approve", None, "sourced-ok").await;
+        assert_eq!(done.status, RunStatus::Completed);
+        assert_eq!(done.output.unwrap().text, "pong");
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        assert!(seen.iter().any(|messages| {
+            messages
+                .iter()
+                .any(|message| message.content.as_deref() == Some("SECRET-TASK-1197"))
+        }));
+        let thread = h.store.list_run_messages("run_1").await.unwrap();
+        assert!(thread.iter().any(|message| {
+            message.role == "tool"
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("sourced-ok"))
+        }));
+        assert!(
+            h.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "run.started")
+        );
+    }
+
+    const ROLE_TURN_TASK: &str = "SECRET-TASK-G3";
+
+    struct ScriptedRecordingProvider {
+        recorder: Arc<RecordingProvider>,
+        turn: StdMutex<Option<Msg>>,
+    }
+
+    #[async_trait::async_trait]
+    impl agent24_models::ModelProvider for ScriptedRecordingProvider {
+        fn name(&self) -> &str {
+            "scripted-recording"
+        }
+
+        async fn complete(
+            &self,
+            req: &agent24_models::CompletionRequest,
+            cancel: &CancellationToken,
+        ) -> Result<agent24_models::CompletionResponse, agent24_models::ModelError> {
+            if let Some(turn) = self.turn.lock().unwrap().take() {
+                self.recorder
+                    .seen
+                    .lock()
+                    .unwrap()
+                    .push(req.messages.clone());
+                return Ok(agent24_models::CompletionResponse {
+                    message: turn,
+                    usage: Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
+                        cost_usd: 0.0,
+                    },
+                    model_id: None,
+                });
+            }
+            agent24_models::ModelProvider::complete(self.recorder.as_ref(), req, cancel).await
+        }
+
+        async fn models(
+            &self,
+            cancel: &CancellationToken,
+        ) -> Result<Vec<agent24_protocol::Model>, agent24_models::ModelError> {
+            agent24_models::ModelProvider::models(self.recorder.as_ref(), cancel).await
+        }
+    }
+
+    fn role_tool_turn(role: &str, marker: &std::path::Path) -> Msg {
+        let mut turn = Msg::assistant(
+            None,
+            vec![
+                agent24_models::ToolCallRequest {
+                    id: "call_shell".to_owned(),
+                    name: "shell_exec".to_owned(),
+                    arguments: serde_json::json!({
+                        "argv": ["/usr/bin/touch", marker]
+                    })
+                    .to_string(),
+                },
+                agent24_models::ToolCallRequest {
+                    id: "call_explore".to_owned(),
+                    name: "explore".to_owned(),
+                    arguments: serde_json::json!({ "task": ROLE_TURN_TASK }).to_string(),
+                },
+            ],
+        );
+        turn.role = role.to_owned();
+        turn
+    }
+
+    async fn role_turn_harness(
+        workdir: std::path::PathBuf,
+        turn: Msg,
+    ) -> (Harness, Arc<RecordingProvider>) {
+        let store = Store::open_memory().await.unwrap();
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let ev = Arc::clone(&events);
+        let emit: Arc<dyn Fn(EventBody) + Send + Sync> = Arc::new(move |body: EventBody| {
+            if let Ok(mut v) = ev.lock() {
+                v.push(body.wire_type().to_owned());
+            }
+        });
+        let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
+        let recorder = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let router = Arc::new(ModelRouter::with_defaults(vec![(
+            Arc::new(ScriptedRecordingProvider {
+                recorder: Arc::clone(&recorder),
+                turn: StdMutex::new(Some(turn)),
+            }) as Arc<dyn agent24_models::ModelProvider>,
+            Tier::Local,
+        )]));
+        let explorer = crate::subagent::ExplorerSubagent::new(
+            Arc::clone(&router),
+            Arc::new(ToolRegistry::read_only(workdir.clone())),
+        );
+        let tools = ToolRegistry::builtin(workdir)
+            .with(Arc::new(explorer))
+            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))));
+        struct FnSink(Arc<dyn Fn(EventBody) + Send + Sync>);
+        impl EventSink for FnSink {
+            fn emit(&self, body: EventBody) {
+                (self.0)(body);
+            }
+        }
+        let manager = RunManager::new(
+            store.clone(),
+            router,
+            Arc::new(tools),
+            Arc::new(FnSink(emit)),
+            CancellationToken::new(),
+        );
+        (
+            Harness {
+                manager,
+                broker,
+                store,
+                events,
+            },
+            recorder,
+        )
+    }
+
+    fn saw_task(provider: &RecordingProvider) -> bool {
+        provider.seen.lock().unwrap().iter().any(|messages| {
+            messages
+                .iter()
+                .any(|message| message.content.as_deref() == Some(ROLE_TURN_TASK))
+        })
+    }
+
+    async fn finish_role_turn(h: &Harness, run_id: &str) -> Run {
+        for _ in 0..200 {
+            let run = h.store.get_run(run_id).await.unwrap().unwrap();
+            if agent24_core::run_is_terminal(run.status) {
+                return run;
+            }
+            let pending = h
+                .store
+                .list_approvals(Some(ApprovalStatus::Pending))
+                .await
+                .unwrap();
+            if let Some(approval) = pending.first() {
+                h.broker
+                    .resolve(&approval.id, decision("approve", None))
+                    .await
+                    .unwrap();
+                return wait_terminal(&h.store, run_id).await;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("run {run_id} neither finished nor parked for approval");
+    }
+
+    async fn drive_role_turn(
+        role: &str,
+    ) -> (Harness, Arc<RecordingProvider>, tempfile::TempDir, Run) {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("g3-marker");
+        let (h, provider) =
+            role_turn_harness(dir.path().to_path_buf(), role_tool_turn(role, &marker)).await;
+        let run = h.manager.start_run(create()).await.unwrap();
+        let done = finish_role_turn(&h, &run.id).await;
+        (h, provider, dir, done)
+    }
+
+    #[tokio::test]
+    async fn user_role_with_tools_stops_before_shell_and_explore() {
+        let (h, provider, dir, done) = drive_role_turn("user").await;
+        let marker = dir.path().join("g3-marker");
+        assert_eq!(done.status, RunStatus::Failed);
+        let error = done.error.unwrap();
+        assert_eq!(error.code, "provider_error");
+        assert_eq!(error.message, PROVIDER_ROLE_MESSAGE);
+        assert!(!marker.exists(), "shell_exec must not touch the marker");
+        assert!(!saw_task(&provider), "explore must not call the provider");
+        assert!(h.store.list_tool_calls(&done.id).await.unwrap().is_empty());
+        let thread = h.store.list_run_messages(&done.id).await.unwrap();
+        assert_eq!(
+            thread
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user"]
+        );
+    }
+
+    #[tokio::test]
+    async fn assistant_role_with_the_same_tools_runs_the_shell() {
+        let (h, provider, dir, done) = drive_role_turn("assistant").await;
+        let marker = dir.path().join("g3-marker");
+        assert_eq!(done.status, RunStatus::Completed);
+        assert!(
+            marker.exists(),
+            "approved shell_exec did not touch the marker"
+        );
+        assert!(saw_task(&provider), "explore should call the provider");
+        assert!(
+            h.store
+                .list_tool_calls(&done.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|call| call.tool == "shell_exec" && call.status == ToolCallStatus::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn user_role_final_answer_is_not_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, _) = role_turn_harness(dir.path().to_path_buf(), Msg::user("not-an-answer")).await;
+        let run = h.manager.start_run(create()).await.unwrap();
+        let done = finish_role_turn(&h, &run.id).await;
+        assert_eq!(done.status, RunStatus::Failed);
+        assert_eq!(done.error.unwrap().code, "provider_error");
+        let thread = h.store.list_run_messages(&done.id).await.unwrap();
+        assert!(
+            thread
+                .iter()
+                .all(|message| message.content.as_deref() != Some("not-an-answer"))
+        );
+    }
+
     #[rustfmt::skip]
     async fn assert_bound_recovery_followup_stops(h:&Harness,run:&Run,call:&agent24_models::ToolCallRequest,lease:&str){assert!(matches!(h.manager.run_tool_call(run,call,&CancellationToken::new(),true).await,Err(ParkedCallStop::RecoveryStopped)));let tool_calls:i64=sqlx::query_scalar("SELECT count(*) FROM tool_calls WHERE run_id='run_1'").fetch_one(agent24_store::test_hooks::pool(&h.store)).await.unwrap();assert_eq!(tool_calls,0);sqlx::query("UPDATE runs SET status='running',ended_at=NULL WHERE id='run_1'").execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();sqlx::query("UPDATE workspace_leases SET released_at=NULL WHERE lease_id=?").bind(lease).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();}
     /// End-to-end crash recovery (H3): a run parked awaiting approval, its task
@@ -6471,6 +7546,7 @@ mod approval_tests {
                     workspace_id: None,
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
+                    knowledge_binding_id: None,
                 },
                 output: None,
                 error: None,
@@ -6481,25 +7557,11 @@ mod approval_tests {
                 ended_at: None,
             };
             h.store.insert_run(&run).await.unwrap();
-            h.store
-                .append_run_message(
-                    "run_1",
-                    "user",
-                    Some("run echo"),
-                    &serde_json::json!([]),
-                    None,
-                    &now_iso8601(),
-                )
-                .await
-                .unwrap();
+            let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
+            seed_proven_parked_thread(&h.store, "run_1", "run echo", call).await;
             let source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
             h.store
                 .tag_run_source("run_1", 0, &source, &now_iso8601())
-                .await
-                .unwrap();
-            let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
-            h.store
-                .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
                 .await
                 .unwrap();
             let approval = Approval {
@@ -6600,6 +7662,7 @@ mod approval_tests {
                     workspace_id: None,
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
+                    knowledge_binding_id: None,
                 },
                 output: None,
                 error: None,
@@ -6610,17 +7673,13 @@ mod approval_tests {
                 ended_at: None,
             };
             h.store.insert_run(&run).await.unwrap();
-            h.store
-                .append_run_message(
-                    "run_1",
-                    "user",
-                    Some("touch it"),
-                    &serde_json::json!([]),
-                    None,
-                    &now_iso8601(),
-                )
-                .await
-                .unwrap();
+            let args = serde_json::json!({ "argv": ["/usr/bin/touch", marker] });
+            let call = serde_json::json!([{
+                "id": "call_provider_1",
+                "name": "shell_exec",
+                "arguments": args.to_string()
+            }]);
+            seed_proven_parked_thread(&h.store, "run_1", "touch it", call).await;
             let user = agent24_store::SourceRef::user_input("run_1", now_iso8601());
             h.store
                 .tag_run_source("run_1", 0, &user, &now_iso8601())
@@ -6635,16 +7694,6 @@ mod approval_tests {
                     .await
                     .unwrap();
             }
-            let args = serde_json::json!({ "argv": ["/usr/bin/touch", marker] });
-            let call = serde_json::json!([{
-                "id": "call_provider_1",
-                "name": "shell_exec",
-                "arguments": args.to_string()
-            }]);
-            h.store
-                .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
-                .await
-                .unwrap();
             let approval = seed_approval(
                 "apr_1",
                 "run_1",
@@ -6729,6 +7778,7 @@ mod approval_tests {
                 workspace_id: None,
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             },
             output: None,
             error: None,
@@ -6739,25 +7789,11 @@ mod approval_tests {
             ended_at: None,
         };
         h.store.insert_run(&run).await.unwrap();
-        h.store
-            .append_run_message(
-                "run_1",
-                "user",
-                Some("write it"),
-                &serde_json::json!([]),
-                None,
-                &now_iso8601(),
-            )
-            .await
-            .unwrap();
+        let call = serde_json::json!([{ "id": "call_provider_1", "name": "doc.write", "arguments": "{}" }]);
+        seed_proven_parked_thread(&h.store, "run_1", "write it", call).await;
         let source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
         h.store
             .tag_run_source("run_1", 0, &source, &now_iso8601())
-            .await
-            .unwrap();
-        let call = serde_json::json!([{ "id": "call_provider_1", "name": "doc.write", "arguments": "{}" }]);
-        h.store
-            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
             .await
             .unwrap();
         let approval = Approval {
@@ -6865,6 +7901,7 @@ mod approval_tests {
             workspace_id: Some(workspace_id.clone()),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         };
         sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'awaiting_approval',?,?,?,?)")
             .bind(WS)
@@ -6931,7 +7968,7 @@ mod approval_tests {
         let dir=tempfile::tempdir().unwrap(); let h=resume_harness(dir.path().to_path_buf()).await; let workspace_id=agent24_protocol::WorkspaceId::parse(WS).unwrap(); let now=workspace_timestamp(now_iso8601()); let expires=WorkspaceInstant::parse(&now).unwrap().checked_add_workspace_ttl(agent24_store::WorkspaceTtl::new(60_000).unwrap()).unwrap();
         sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,'/scratch','g1','unix',X'0101010101010101',X'0202020202020202')").bind(WS).bind(&now).bind(expires.as_str()).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
         h.store.insert_session(&agent24_protocol::Session{id:"sess_1".into(),title:"session".into(),channel:"desktop".into(),workspace_id:Some(workspace_id.clone()),created_at:now.clone(),updated_at:now.clone()}).await.unwrap();
-        let input=RunInput{prompt:"run echo".into(),workspace_id:Some(workspace_id),model_override:None,mode:RunMode::Normal};
+        let input=RunInput{prompt:"run echo".into(),workspace_id:Some(workspace_id),model_override:None,mode:RunMode::Normal,knowledge_binding_id:None};
         sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'running',?,?,?,?)").bind(WS).bind(serde_json::to_string(&input).unwrap()).bind(serde_json::to_string(&zero_usage()).unwrap()).bind(&now).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
         sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','run_1','run',?)").bind(LEASE).bind(WS).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
         let run=h.store.get_run("run_1").await.unwrap().unwrap(); let payload=serde_json::json!({"argv":["/bin/echo","must-not-run"]}); let mut approval=seed_approval("apr_1","run_1","tc_internal_1",payload.as_object().unwrap().clone()); approval.status=ApprovalStatus::Approved; approval.decision=Some(decision("approve",None)); approval.decided_at=Some(now_iso8601());
@@ -6951,8 +7988,8 @@ mod approval_tests {
         let now=workspace_timestamp(now_iso8601()); let expires=WorkspaceInstant::parse(&now).unwrap().checked_add_workspace_ttl(agent24_store::WorkspaceTtl::new(60_000).unwrap()).unwrap(); let locator=format!("{WS}.g1"); let parent=state.path().join("workspace-roots"); let root=parent.join(&locator); std::fs::create_dir(&root).unwrap(); std::fs::set_permissions(&root,std::fs::Permissions::from_mode(0o700)).unwrap(); let pm=std::fs::metadata(&parent).unwrap(); let rm=std::fs::metadata(&root).unwrap();
         sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,?,'g1','unix',?,?)").bind(WS).bind(&now).bind(expires.as_str()).bind(root.to_str().unwrap()).bind(rm.dev().to_le_bytes().to_vec()).bind(rm.ino().to_le_bytes().to_vec()).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
         sqlx::query("INSERT INTO workspace_allocations (allocation_id,workspace_id,root_generation,relative_name,parent_identity_kind,parent_unix_device,parent_unix_inode,root_identity_kind,root_unix_device,root_unix_inode,phase,created_at) VALUES ('wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5',?,'g1',?,'unix',?,?,'unix',?,?,'committed',?)").bind(WS).bind(&locator).bind(pm.dev().to_le_bytes().to_vec()).bind(pm.ino().to_le_bytes().to_vec()).bind(rm.dev().to_le_bytes().to_vec()).bind(rm.ino().to_le_bytes().to_vec()).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
-        let wid=agent24_protocol::WorkspaceId::parse(WS).unwrap(); h.store.insert_session(&agent24_protocol::Session{id:"sess_1".into(),title:"s".into(),channel:"desktop".into(),workspace_id:Some(wid.clone()),created_at:now.clone(),updated_at:now.clone()}).await.unwrap(); let input=RunInput{prompt:"two".into(),workspace_id:Some(wid),model_override:None,mode:RunMode::Normal}; sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'awaiting_approval',?,?,?,?)").bind(WS).bind(serde_json::to_string(&input).unwrap()).bind(serde_json::to_string(&zero_usage()).unwrap()).bind(&now).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap(); sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','run_1','run',?)").bind(LEASE).bind(WS).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
-        h.store.append_run_message("run_1","user",Some("two"),&serde_json::json!([]),None,&now_iso8601()).await.unwrap(); let a1=serde_json::json!({"argv":["/bin/echo","first"]}); let a2=serde_json::json!({"argv":["/bin/echo","must-not-run"]}); let calls=serde_json::json!([{"id":"call_provider_1","name":"shell_exec","arguments":a1.to_string()},{"id":"call_provider_2","name":"shell_exec","arguments":a2.to_string()}]); h.store.append_run_message("run_1","assistant",None,&calls,None,&now_iso8601()).await.unwrap(); let approval=seed_approval("apr_1","run_1","tc_internal_1",a1.as_object().unwrap().clone()); insert_parked(&h.store, &approval, "shell_exec").await; h.broker.resolve("apr_1",decision("approve",None)).await.unwrap();
+        let wid=agent24_protocol::WorkspaceId::parse(WS).unwrap(); h.store.insert_session(&agent24_protocol::Session{id:"sess_1".into(),title:"s".into(),channel:"desktop".into(),workspace_id:Some(wid.clone()),created_at:now.clone(),updated_at:now.clone()}).await.unwrap(); let input=RunInput{prompt:"two".into(),workspace_id:Some(wid),model_override:None,mode:RunMode::Normal,knowledge_binding_id:None}; sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'awaiting_approval',?,?,?,?)").bind(WS).bind(serde_json::to_string(&input).unwrap()).bind(serde_json::to_string(&zero_usage()).unwrap()).bind(&now).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap(); sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','run_1','run',?)").bind(LEASE).bind(WS).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        let a1=serde_json::json!({"argv":["/bin/echo","first"]}); let a2=serde_json::json!({"argv":["/bin/echo","must-not-run"]}); let calls=serde_json::json!([{"id":"call_provider_1","name":"shell_exec","arguments":a1.to_string()},{"id":"call_provider_2","name":"shell_exec","arguments":a2.to_string()}]); seed_proven_parked_thread(&h.store,"run_1","two",calls).await; let approval=seed_approval("apr_1","run_1","tc_internal_1",a1.as_object().unwrap().clone()); insert_parked(&h.store, &approval, "shell_exec").await; h.broker.resolve("apr_1",decision("approve",None)).await.unwrap();
         let run=h.store.get_run("run_1").await.unwrap().unwrap(); assert!(h.manager.tool_context_for(&run,"preflight").await.is_ok()); sqlx::raw_sql(&format!("CREATE TRIGGER lose_resume_authority AFTER INSERT ON run_messages WHEN NEW.run_id='run_1' AND NEW.role='tool' AND NEW.tool_call_id='call_provider_1' BEGIN UPDATE workspace_leases SET released_at='{now}' WHERE lease_id='{LEASE}'; END;")).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap(); h.manager.resume_run("run_1".into(),"apr_1".into()).await.unwrap(); assert_eq!(wait_terminal(&h.store,"run_1").await.status,RunStatus::Cancelled);
         assert_eq!(h.store.list_tool_calls("run_1").await.unwrap().iter().map(|c|c.id.as_str()).collect::<Vec<_>>(),["tc_internal_1"]); let thread=h.store.list_run_messages("run_1").await.unwrap(); assert!(thread.iter().any(|m|m.role=="tool"&&m.tool_call_id.as_deref()==Some("call_provider_1"))); assert!(!thread.iter().any(|m|m.role=="tool"&&m.tool_call_id.as_deref()==Some("call_provider_2"))); assert_eq!(h.events.lock().unwrap().iter().filter(|e|e.as_str()=="run.cancelled").count(),1);
     }
@@ -6977,22 +8014,8 @@ mod approval_tests {
         let mut run = run_in("run_1", RunStatus::AwaitingApproval);
         run.session_id = Some("sess_1".to_owned());
         h.store.insert_run(&run).await.unwrap();
-        h.store
-            .append_run_message(
-                "run_1",
-                "user",
-                Some("run echo"),
-                &serde_json::json!([]),
-                None,
-                &now_iso8601(),
-            )
-            .await
-            .unwrap();
         let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
-        h.store
-            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
-            .await
-            .unwrap();
+        seed_proven_parked_thread(&h.store, "run_1", "run echo", call).await;
         let mut approval = seed_approval(
             "apr_1",
             "run_1",
@@ -7089,6 +8112,7 @@ mod approval_tests {
                 workspace_id: None,
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             },
             output: None,
             error: None,
@@ -7099,22 +8123,8 @@ mod approval_tests {
             ended_at: None,
         };
         h.store.insert_run(&run).await.unwrap();
-        h.store
-            .append_run_message(
-                "run_1",
-                "user",
-                Some("run echo"),
-                &serde_json::json!([]),
-                None,
-                &now_iso8601(),
-            )
-            .await
-            .unwrap();
         let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
-        h.store
-            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
-            .await
-            .unwrap();
+        seed_proven_parked_thread(&h.store, "run_1", "run echo", call).await;
         let approval = Approval {
             id: "apr_1".to_owned(),
             run_id: "run_1".to_owned(),
@@ -7156,6 +8166,43 @@ mod approval_tests {
         );
     }
 
+    /// The parked thread a current run would have stored: user prompt and the
+    /// assistant tool call, each with a present origin and no recall ref.
+    async fn seed_proven_parked_thread(
+        store: &Store,
+        run_id: &str,
+        prompt: &str,
+        call: serde_json::Value,
+    ) {
+        store
+            .append_originated_run_messages(
+                run_id,
+                &[
+                    OriginatedRunMessage {
+                        message: agent24_store::PendingRunMessage {
+                            role: "user".into(),
+                            content: Some(prompt.into()),
+                            tool_calls: serde_json::json!([]),
+                            tool_call_id: None,
+                        },
+                        origin: MessageOrigin::UserPrompt,
+                    },
+                    OriginatedRunMessage {
+                        message: agent24_store::PendingRunMessage {
+                            role: "assistant".into(),
+                            content: None,
+                            tool_calls: call,
+                            tool_call_id: None,
+                        },
+                        origin: MessageOrigin::Assistant,
+                    },
+                ],
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+    }
+
     /// A run row in a given status, for seeding crash/parked state directly.
     fn run_in(id: &str, status: RunStatus) -> Run {
         Run {
@@ -7168,6 +8215,7 @@ mod approval_tests {
                 workspace_id: None,
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             },
             output: None,
             error: None,
@@ -7562,6 +8610,7 @@ mod approval_tests {
             workspace_id: Some(workspace_id),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         };
         sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'awaiting_approval',?,?,?,?)")
             .bind(WS).bind(serde_json::to_string(&input).unwrap())
@@ -7663,6 +8712,7 @@ mod approval_tests {
             workspace_id: Some(agent24_protocol::WorkspaceId::parse(WS).unwrap()),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         };
         sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,'/scratch','g1','unix',X'0101010101010101',X'0202020202020202')")
             .bind(WS).bind(&now).bind(expires.as_str()).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();

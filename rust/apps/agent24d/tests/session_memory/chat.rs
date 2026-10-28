@@ -438,8 +438,11 @@ async fn a_retain_failure_still_returns_200_with_content() {
     );
     assert!(!body["message"]["content"].as_str().unwrap().is_empty());
     // M1-T14: the write failed (forced above), memory was NOT paused — the
-    // receipt must say `failed`, not silently look like `saved`.
-    assert_eq!(body["memory_receipt"], json!("failed"));
+    // receipt must not silently look like `saved`. P1-02c: the conversation
+    // turn committed and only the assertion's audit id collided, so this is the
+    // PARTIAL combination, not a total failure.
+    assert_eq!(body["memory_receipt"], json!("partial"));
+    assert_eq!(body["memory_error_code"], json!("memory_internal"));
     assert!(
         kv.assertions()
             .beliefs_as_of(&BeliefQuery::owner(&owner))
@@ -554,4 +557,110 @@ async fn pause_toggled_on_during_the_model_call_reports_saved_with_a_real_row() 
         "a receipt of saved must mean the assertion was actually committed"
     );
     assert_eq!(rows[0].object, json!("我对花生过敏"));
+}
+
+// ── P1-02c c2b: typed receipts on a full partition (T5/T6) ────────────────
+
+async fn set_rows(dir: &std::path::Path, rows: i64) {
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", dir.join("memory.db").display()))
+        .await
+        .unwrap();
+    let r = sqlx::query("UPDATE mem_owner_quota SET max_rows=? WHERE owner='*'")
+        .bind(rows)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(r.rows_affected(), 1);
+    pool.close().await;
+}
+
+/// No receipt or error body may carry the partition key, a NUL, driver/Display
+/// text, or anything that reads as "remembered".
+fn assert_body_is_clean(body: &serde_json::Value) {
+    let raw = body.to_string();
+    assert!(!raw.contains("\\u0000"), "NUL leaked: {raw}");
+    assert!(!raw.contains("quota exceeded for owner"), "{raw}");
+    assert!(!raw.contains("usr:local"), "partition key leaked: {raw}");
+    assert!(!raw.contains("已记住"), "{raw}");
+    assert_ne!(body["memory_receipt"], json!("saved"), "{raw}");
+}
+
+#[tokio::test]
+async fn ordinary_chat_turn_on_a_full_partition_is_not_saved_with_a_typed_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+    let state = app(kv.clone(), dir.path(), Arc::new(Provider::default())).await;
+    ensure_session(&state, "chat-full-ordinary").await;
+    set_rows(dir.path(), 0).await;
+    let mut events = state.events.subscribe();
+
+    let (status, body) = post_chat_with(&state, Some("chat-full-ordinary"), "今天天气怎么样").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["memory_receipt"], json!("not_saved"));
+    assert_eq!(body["memory_error_code"], json!("memory_quota_rows"));
+    assert_body_is_clean(&body);
+    let seen: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    let persisted = seen.iter().find_map(|(_, b)| match b {
+        EventBody::RunCompleted(p) => Some(p.memory_persisted),
+        _ => None,
+    });
+    assert_eq!(
+        persisted,
+        Some(Some(false)),
+        "run.completed must say so too"
+    );
+}
+
+#[tokio::test]
+async fn explicit_remember_on_a_full_partition_is_failed_with_a_typed_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+    let state = app(kv.clone(), dir.path(), Arc::new(Provider::default())).await;
+    ensure_session(&state, "chat-full-explicit").await;
+    set_rows(dir.path(), 0).await;
+
+    let (status, body) = post_chat_with(&state, Some("chat-full-explicit"), "记住我喜欢茶").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["memory_receipt"], json!("failed"));
+    assert_eq!(body["memory_error_code"], json!("memory_quota_rows"));
+    assert_body_is_clean(&body);
+}
+
+#[tokio::test]
+async fn explicit_remember_whose_turn_fits_but_assertion_does_not_is_partial_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+    let state = app(kv.clone(), dir.path(), Arc::new(Provider::default())).await;
+    ensure_session(&state, "chat-full-partial").await;
+    // The turn's two rows fit; the assertion's audit row is the third.
+    set_rows(dir.path(), 2).await;
+
+    let (status, body) = post_chat_with(&state, Some("chat-full-partial"), "记住我喜欢茶").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["memory_receipt"], json!("partial"));
+    assert_eq!(body["memory_error_code"], json!("memory_quota_rows"));
+    assert_body_is_clean(&body);
+    let owner = personal_owner(&kv).await;
+    assert!(
+        kv.assertions()
+            .beliefs_as_of(&BeliefQuery::owner(&owner))
+            .await
+            .unwrap()
+            .is_empty(),
+        "partial means the assertion was NOT written"
+    );
+}
+
+#[tokio::test]
+async fn chat_with_room_never_carries_a_memory_error_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+    let state = app(kv.clone(), dir.path(), Arc::new(Provider::default())).await;
+    ensure_session(&state, "chat-room").await;
+    let (_, body) = post_chat_with(&state, Some("chat-room"), "记住我喜欢茶").await;
+    assert_eq!(body["memory_receipt"], json!("saved"));
+    assert!(body.get("memory_error_code").is_none(), "{body}");
 }

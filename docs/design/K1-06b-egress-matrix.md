@@ -132,7 +132,7 @@
      - 同源回送不拦：模块工具的输出记 Unknown，标签上由内核记下来源模块。发往模块 X 的调用不计来自 X 自己的 Unknown，因为 X 本来就持有这些内容。ADR 目前没有这条例外：它沿用 §2.1.1 第 3、5 条「按动作实际携带的数据判定、由可信宿主收窄」的方向，但第 5 条要证明的是载荷，这里证明的只是接收方，所以 6b.5f-1 落地时要同步补进 ADR §2.1.1。其他来源的 Unknown 和 Restricted 照拦；External 操作不享受这条例外；读不到来源时照拒。同源靠注册表里的绑定来认，不看模块自报的 `output_privacy`。来源模块要带着身份传到同会话后面的轮次。三方都选这一项。这样 Documenting 的对话入口可以在同一个模块内连续调用。
    - **David 2026-10-27 对 6b.5f-3 的两项决定**（证据裁决，记录在本机 `~/.claude/decisions/`）：
      - peer 视图放宽（选 C，三方 R1 收敛）：去掉「没调过工具」，改成每条 tool_calls 行都要有一条 `source_id` 以 `:{这条行的 id}` 结尾的 tool_result 标签，否则扣下；对上的标签照常参与「全部 Ordinary」的判断。被拒的调用不豁免：用户拒绝审批时写的理由、http_fetch 的 SSRF 拒绝里解析出的地址都会进模型，却没有标签。代价：有过被拒调用的 run、plan 模式的 run（propose_plan 不打结果标签）仍扣下；开着会话记忆时带会话的 run 照旧全扣。
-     - 存量缺口回填（选 B，裁判多数）：迁移 0028 给升级时已有的、带会话却没有 session_floor 标签的 run 补一条 Unknown 的 session_floor 标签；peer 视图的判定不为此改动。代价：开发库里不开会话记忆时合法的历史会话 run 也被永久扣下。
+     - 存量缺口回填（选 B，裁判多数）：迁移 0032 给升级时已有的、带会话却没有 session_floor 标签的 run 补一条 Unknown 的 session_floor 标签；peer 视图的判定不为此改动。代价：开发库里不开会话记忆时合法的历史会话 run 也被永久扣下。
 5. **Hyphae `/comm/send`**：只能由用户经 REST 直接调用，没有 Tool 包装，也不带 run 资料。视为用户直接操作，不在 agent 出口矩阵内。
 
 ## 7. 后续切片
@@ -142,6 +142,6 @@
 | 6b.5b 模型类 | **已补**（见上表标 6b.5b 的测试）。模块模型回调的 (b) 不适用：6b.5g 起回调一律 LocalOnly，不读政策 |
 | 6b.5c 网络类 | http_fetch 的 LocalOnly、政策不可用、精确目的地正例和逐项不匹配负例，以及 Ordinary 下 IP 字面量分支和端到端取回；MCP client 的 (a)(b)(d)，以及测试 gate 上的 (c)；MCP server 和 ACP 桥按分类过滤（§6 第 3、4 条）。6b.5c-1（#1220）已补 http_fetch 与 MCP client 的四列；peer 视图拆成 6b.5c-2a（内核视图）、6b.5c-2b（两座桥） |
 | 6b.5d 模块、进程、生命周期 | 模块工具 (b)(c)；shell_exec 零副作用、CloudAuthorized 仍被拒、`tool_context_for` 两个分支；恢复时受限来源的出口测试；模型 override 测试 |
-| 6b.5f 工具结果打标签 | 按 §6 第 4 条 David 10-26 的两项决定。5f-1：run 内打标签（结果进模型之前，写失败就结束 run）和模块的同源回送。5f-2：来源模块跨轮次传到会话后面的轮次。5f-3：放宽 6b.5c-2 的 peer 视图规则，改成按标签逐条对账（§6 第 4 条 10-27 的决定），并用 0028 回填存量缺口 |
+| 6b.5f 工具结果打标签 | 按 §6 第 4 条 David 10-26 的两项决定。5f-1：run 内打标签（结果进模型之前，写失败就结束 run）和模块的同源回送。5f-2：来源模块跨轮次传到会话后面的轮次。5f-3：放宽 6b.5c-2 的 peer 视图规则，改成按标签逐条对账（§6 第 4 条 10-27 的决定），并用 0032 回填存量缺口 |
 | 6b.5g 模块模型回调 | 回调一律 LocalOnly（§6 第 2 条，David 10-27 选 C）；测试 `every_grant_routes_local_only_whatever_its_manifest_declares`，以及 `me4_model_blackbox.rs` 场景 3 改写说明 |
 | 6b.5e 撤 `has_remote` 过渡门 | **已撤**（见 §4 末尾）。前提：本表全绿、§2 末尾那条 LocalOnly 排除测试已补、§6 第 2 条已落实（6b.5g：回调一律 LocalOnly）、6b.5f 已合入、K1-6a 已验收；附 #708 macOS 证据。**撤门要 David 确认** |

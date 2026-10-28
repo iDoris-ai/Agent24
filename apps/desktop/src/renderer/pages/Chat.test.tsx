@@ -154,7 +154,7 @@ describe('ChatPage', () => {
       data: {
         error: {
           code: 'backend_not_ready',
-          message: 'Backend daemon has not announced readiness yet',
+          message: 'Backend daemon is not ready (no announced port or credential)',
         },
       },
     })
@@ -245,6 +245,20 @@ describe('ChatPage', () => {
 
     await waitFor(() => expect(screen.getByText('好的')).toBeInTheDocument())
     expect(screen.getByText('记住失败，请稍后重试')).toBeInTheDocument()
+  })
+
+  it('shows the partial receipt line when memory_receipt is "partial"', async () => {
+    mockBackendProxy.mockResolvedValue({
+      ok: true,
+      status: 200,
+      data: { message: { content: '好的' }, memory_receipt: 'partial', memory_error_code: 'memory_quota_rows' },
+    })
+    render(<ChatPage />)
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), { target: { value: '记住我对花生过敏' } })
+    fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
+
+    await waitFor(() => expect(screen.getByText('好的')).toBeInTheDocument())
+    expect(screen.getByText('对话已保存，但这条记忆没记住')).toBeInTheDocument()
   })
 
   it('shows no receipt line when memory_receipt is absent', async () => {

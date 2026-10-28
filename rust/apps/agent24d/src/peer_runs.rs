@@ -204,6 +204,7 @@ mod tests {
                 workspace_id: None,
                 model_override: None,
                 mode: RunMode::Normal,
+                knowledge_binding_id: None,
             },
             output: (status == RunStatus::Completed).then(|| RunOutput {
                 text: format!("output {SECRET}"),
@@ -743,25 +744,6 @@ mod tests {
             parked.output = None;
             parked.ended_at = None;
             state.store.insert_run(&parked).await.unwrap();
-            state
-                .store
-                .append_run_message(
-                    "run_dup",
-                    "user",
-                    Some("write it"),
-                    &serde_json::json!([]),
-                    None,
-                    &now_iso8601(),
-                )
-                .await
-                .unwrap();
-            tag(
-                &state,
-                "run_dup",
-                0,
-                SourceRef::user_input("run_dup", now_iso8601()),
-            )
-            .await;
             // Both tools read only their own keys, so one set of arguments
             // serves either call.
             let args = serde_json::json!({
@@ -779,16 +761,39 @@ mod tests {
             }
             state
                 .store
-                .append_run_message(
+                .append_originated_run_messages(
                     "run_dup",
-                    "assistant",
-                    None,
-                    &serde_json::json!(calls),
-                    None,
+                    &[
+                        agent24_store::OriginatedRunMessage {
+                            message: agent24_store::PendingRunMessage {
+                                role: "user".into(),
+                                content: Some("write it".into()),
+                                tool_calls: serde_json::json!([]),
+                                tool_call_id: None,
+                            },
+                            origin: agent24_store::MessageOrigin::UserPrompt,
+                        },
+                        agent24_store::OriginatedRunMessage {
+                            message: agent24_store::PendingRunMessage {
+                                role: "assistant".into(),
+                                content: None,
+                                tool_calls: serde_json::json!(calls),
+                                tool_call_id: None,
+                            },
+                            origin: agent24_store::MessageOrigin::Assistant,
+                        },
+                    ],
                     &now_iso8601(),
                 )
                 .await
                 .unwrap();
+            tag(
+                &state,
+                "run_dup",
+                0,
+                SourceRef::user_input("run_dup", now_iso8601()),
+            )
+            .await;
             state
                 .store
                 .insert_tool_call(&agent24_protocol::ToolCall {
