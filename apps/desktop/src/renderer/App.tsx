@@ -28,6 +28,7 @@ import { capabilitiesMessages } from './capabilities/capabilities.i18n'
 import logoSidebar from './assets/logo-sidebar.png'
 import { useT } from './i18n'
 import { appMessages } from './App.i18n'
+import { QuickSwitch } from './components/QuickSwitch'
 
 // FU-89: oMLX's `/v1/models` carries no type/capability field — only bare ids
 // (see fetchOmlxModels in main/ipc/index.ts) — so a real "is this a chat
@@ -187,6 +188,7 @@ function AppShell(): JSX.Element {
 
   return (
     <div className={`app${darkMode ? '' : ' light'}`}>
+      <QuickSwitch />
       {!sidebarOpen && (
         <button className="sidebar-expand-btn" onClick={() => setSidebarOpen(true)}>›</button>
       )}
