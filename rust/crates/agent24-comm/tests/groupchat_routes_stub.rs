@@ -5,13 +5,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent24_comm::{
-    Account, CommState, HyphaeRunner, MemoryPasswordStore, PasswordStore, VerifiedBinary, router,
-};
+use agent24_comm::{Account, CommState, HyphaeRunner, MemoryPasswordStore, PasswordStore, router};
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
@@ -43,9 +43,7 @@ async fn stub_app(code: i32, stdout: &str, stderr: &str) -> (Router, tempfile::T
     );
     tokio::fs::write(&script, &body).await.unwrap();
     let digest = agent24_comm::binary::sha256_of(body.as_bytes());
-    let bin = VerifiedBinary::install(&script, digest, &tmp.path().join("bin"))
-        .await
-        .unwrap();
+    let bin = common::install_verified(&script, digest, &tmp.path().join("bin")).await;
     let store = Arc::new(MemoryPasswordStore::new());
     let password = agent24_comm::Password::new(b"stub-password-0123456789".to_vec()).unwrap();
     store
