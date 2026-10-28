@@ -66,6 +66,12 @@ describe('A1 findAllowedRoute', () => {
       expect(rt.template).not.toMatch(/approvals\/\{|shutdown|tool-overrides|standing-grants|capabilities|\/os\/\{name\}\/stop$/)
     }
   })
+  it('allows the exact HY-2 setup methods through the proxy', () => {
+    for (const [method, route] of [
+      ['POST', 'identity'], ['POST', 'import'], ['PUT', 'relay'], ['POST', 'relay/probe'],
+    ]) expect(isAllowedProxyRoute(method, `/api/v1/comm/${route}`)).toBe(true)
+    expect(isAllowedProxyRoute('DELETE', '/api/v1/comm/identity')).toBe(false)
+  })
   it('gives chat a longer deadline than the default', () => {
     expect(findAllowedRoute('POST', '/api/v1/chat')?.timeoutMs).toBe(CHAT_TIMEOUT_MS)
     expect(CHAT_TIMEOUT_MS).toBeGreaterThan(PROXY_TIMEOUT_MS)
