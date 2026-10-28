@@ -31,6 +31,20 @@ it('explains cancellation and restores the install button', async () => {
   await waitFor(() => expect(button).toBeEnabled())
 })
 
+it('updates CLI status and installation results in Chinese and Thai', async () => {
+  install.mockResolvedValue({ state: 'cancelled' })
+  render(<CliToolSettings />)
+  await screen.findByText('Command line tool is outdated (0.3.0) — Update')
+  fireEvent.click(screen.getByRole('button', { name: 'Install / Update `agent24` command' }))
+  await screen.findByText('Installation cancelled. Administrator permission or replacement was not approved.')
+  act(() => setLocale('zh'))
+  expect(screen.getByText('命令行工具已过期（0.3.0）— 更新')).toBeInTheDocument()
+  expect(screen.getByText('已取消安装：未批准管理员授权或替换操作。')).toBeInTheDocument()
+  act(() => setLocale('th'))
+  expect(screen.getByText('เครื่องมือบรรทัดคำสั่งล้าสมัย (0.3.0) — อัปเดต')).toBeInTheDocument()
+  expect(screen.getByText('ยกเลิกการติดตั้งแล้ว ไม่ได้อนุมัติสิทธิ์ผู้ดูแลระบบหรือการแทนที่')).toBeInTheDocument()
+})
+
 it('stops polling and listening for focus after leaving settings', async () => {
   vi.useFakeTimers()
   status.mockClear()

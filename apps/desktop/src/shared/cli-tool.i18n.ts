@@ -14,9 +14,6 @@ export const cliToolMessages = defineMessages({
     'move-app': 'Move Agent24 to Applications and open it there before installing the command.',
     installed: 'Command installed. Open a new terminal. If another CLI appears above /usr/local/bin on PATH, update your PATH.',
     backup: 'Previous command saved at {path}',
-    confirmTitle: 'Replace the existing agent24 command?',
-    confirmDetail: 'The existing /usr/local/bin/agent24 will be renamed to agent24.bak-<date> in the same directory. A symbolic link to this App’s CLI will take its place.',
-    replace: 'Back up and replace', cancel: 'Cancel',
   },
   zh: {
     title: '命令行工具', path: 'PATH 上的命令', bundled: '包内 CLI 版本',
@@ -29,9 +26,7 @@ export const cliToolMessages = defineMessages({
     cancelled: '已取消安装：未批准管理员授权或替换操作。',
     'move-app': '请先将 Agent24 移到 Applications，并从那里打开，再安装命令。',
     installed: '命令已安装。请打开新终端；若 PATH 中其他 CLI 排在 /usr/local/bin 前面，请调整 PATH。',
-    backup: '旧命令已备份至 {path}', confirmTitle: '替换已有的 agent24 命令？',
-    confirmDetail: '已有的 /usr/local/bin/agent24 将在原目录改名为 agent24.bak-<日期>，再由指向本应用 CLI 的符号链接替代。',
-    replace: '备份并替换', cancel: '取消',
+    backup: '旧命令已备份至 {path}',
   },
   th: {
     title: 'เครื่องมือบรรทัดคำสั่ง', path: 'คำสั่งใน PATH', bundled: 'เวอร์ชัน CLI ที่มาพร้อมแอป',
@@ -44,8 +39,6 @@ export const cliToolMessages = defineMessages({
     cancelled: 'ยกเลิกการติดตั้งแล้ว ไม่ได้อนุมัติสิทธิ์ผู้ดูแลระบบหรือการแทนที่',
     'move-app': 'ย้าย Agent24 ไปที่ Applications แล้วเปิดจากที่นั่นก่อนติดตั้งคำสั่ง',
     installed: 'ติดตั้งคำสั่งแล้ว เปิดเทอร์มินัลใหม่ หาก CLI อื่นอยู่ก่อน /usr/local/bin ใน PATH ให้ปรับ PATH',
-    backup: 'สำรองคำสั่งเดิมไว้ที่ {path}', confirmTitle: 'แทนที่คำสั่ง agent24 ที่มีอยู่หรือไม่?',
-    confirmDetail: 'จะเปลี่ยนชื่อ /usr/local/bin/agent24 เดิมเป็น agent24.bak-<วันที่> ในโฟลเดอร์เดิม แล้วสร้างลิงก์สัญลักษณ์ไปยัง CLI ของแอปนี้',
-    replace: 'สำรองและแทนที่', cancel: 'ยกเลิก',
+    backup: 'สำรองคำสั่งเดิมไว้ที่ {path}',
   },
 })

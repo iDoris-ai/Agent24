@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { act, renderHook } from '@testing-library/react'
 import { DEFAULT_LOCALE, LOCALE_STORAGE_KEY, defineMessages, format, getLocale, setLocale, translate, useT } from '.'
 
@@ -32,5 +32,24 @@ describe('i18n', () => {
     act(() => setLocale('zh'))
     expect(result.current('hi', { name: 'A' })).toBe('你好 A')
     expect(translate(m, 'hi', { name: 'B' }, 'th')).toBe('สวัสดี B')
+  })
+})
+
+describe('reporting the language to the main process', () => {
+  it('setLocale tells main (tray/dialogs follow); startup report sends the current one', async () => {
+    const { setLocale, reportLocaleToMain } = await import('./index')
+    const setUiLocale = vi.fn(() => Promise.resolve())
+    ;(window as unknown as { agent24: unknown }).agent24 = { setUiLocale }
+    setLocale('zh')
+    expect(setUiLocale).toHaveBeenLastCalledWith('zh')
+    setLocale('th')
+    expect(setUiLocale).toHaveBeenLastCalledWith('th')
+    reportLocaleToMain()
+    expect(setUiLocale).toHaveBeenLastCalledWith('th')
+    setLocale('en')
+    expect(setUiLocale).toHaveBeenLastCalledWith('en')
+    delete (window as unknown as { agent24?: unknown }).agent24
+    expect(() => setLocale('zh')).not.toThrow()
+    setLocale('en')
   })
 })

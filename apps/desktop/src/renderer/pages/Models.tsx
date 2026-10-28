@@ -81,8 +81,17 @@ export default function ModelsPage() {
               </div>
             )}
           </div>
+        ) : idorisStatus === null ? (
+          <div style={{ color: 'var(--muted)' }}>{t('idoris.checking')}</div>
+        ) : idorisStatus.reason === 'handoff-missing' ? (
+          // Launched without an iDoris admin handoff: iDoris is simply not
+          // set up (optional) — not a broken connection.
+          <div data-testid="idoris-not-configured" style={{ color: 'var(--muted)' }}>
+            <div>{t('idoris.notConfigured')}</div>
+            <div>{t('idoris.notConfiguredHint')}</div>
+          </div>
         ) : (
-          <div style={{ color: 'var(--muted)' }}>{t('idoris.unavailable')}</div>
+          <div data-testid="idoris-disconnected" style={{ color: 'var(--muted)' }}>{t('idoris.unavailable')}</div>
         )}
       </div>
 

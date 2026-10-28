@@ -26,6 +26,7 @@ import {
   type ModuleUninstallResult,
   type ModelCallEnvelope,
   type OpenDesignComponentStatusResult,
+  type OmlxAuthRequiredResult,
   type OmlxDetectResult,
   type OmlxModelsResult,
   type OmlxStartResult,
@@ -42,6 +43,7 @@ const api = {
   installCliTool: (): Promise<CliInstallResult> => ipcRenderer.invoke(IpcChannels.CliToolInstall),
   setAppLocale: (locale: import('../shared/i18n').Locale): Promise<void> => ipcRenderer.invoke(IpcChannels.AppLocale, locale),
   ping: (): Promise<string> => ipcRenderer.invoke(IpcChannels.AppPing),
+  setUiLocale: (locale: string): Promise<void> => ipcRenderer.invoke(IpcChannels.AppSetLocale, locale),
   getAppVersion: (): Promise<string> => ipcRenderer.invoke(IpcChannels.AppVersion),
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke(IpcChannels.ShellOpenExternal, url),
   backendProxy: (req: BackendProxyRequest): Promise<BackendProxyResponse> =>
@@ -73,7 +75,7 @@ const api = {
     ipcRenderer.on(IpcChannels.OpenDesignComponentProgress, listener)
     return () => ipcRenderer.removeListener(IpcChannels.OpenDesignComponentProgress, listener)
   },
-  omlxDetect: (): Promise<OmlxDetectResult | null> =>
+  omlxDetect: (): Promise<OmlxDetectResult | OmlxAuthRequiredResult | null> =>
     ipcRenderer.invoke(IpcChannels.OmlxDetect),
   omlxModels: (url: string, apiKey: string): Promise<OmlxModelsResult> =>
     ipcRenderer.invoke(IpcChannels.OmlxModels, url, apiKey),

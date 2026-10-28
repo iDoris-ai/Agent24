@@ -2,6 +2,7 @@ import { beforeEach, expect, it, vi } from 'vitest'
 import type { IpcMainInvokeEvent } from 'electron'
 import { createIpcGuard } from './guard'
 import { IpcChannels } from '../../shared/ipc-types'
+import { resetMainLocaleForTest, setMainLocale } from '../main-i18n'
 
 const handlers = new Map<string, (event: IpcMainInvokeEvent, ...args: unknown[]) => unknown>()
 const install = vi.fn()
@@ -19,6 +20,7 @@ import { registerCliTool } from './cli-tool'
 const frame = { url: 'file:///app/index.html' }
 const event = { senderFrame: frame } as IpcMainInvokeEvent
 beforeEach(() => {
+  resetMainLocaleForTest()
   vi.clearAllMocks()
   handlers.clear()
   status.mockResolvedValue({ state: 'outdated', path: '/usr/local/bin/agent24', version: '0.3.0', bundledVersion: '0.6.0' })
@@ -64,15 +66,26 @@ it('deduplicates installs and refreshes the actual PATH status afterwards', asyn
   expect(status).toHaveBeenCalledOnce()
   expect(install.mock.calls[0][0]).toMatchObject({ executable: '/Applications/Agent24.app/Contents/MacOS/Agent24' })
 })
-it('uses the shared locale dictionary for the tray and native confirmation', async () => {
+it('exposes CLI status and uses the main locale for native confirmation', async () => {
   const controller = setup()
   await controller.refresh()
-  expect(controller.trayItem()?.label).toBe('Command line tool is outdated (0.3.0) — Update')
-  invoke(IpcChannels.AppLocale, 'zh')
-  expect(controller.trayItem()?.label).toBe('命令行工具已过期（0.3.0）— 更新')
+  expect(controller.status()).toMatchObject({ state: 'outdated', version: '0.3.0' })
   expect(() => invoke(IpcChannels.AppLocale, '../../evil')).toThrow('Invalid locale')
+  setMainLocale('zh')
   install.mockImplementation(async (options: { confirm: () => Promise<boolean> }) => ({ state: await options.confirm() ? 'installed' : 'cancelled' }))
   confirm.mockResolvedValue({ response: 0 })
   expect(await invoke(IpcChannels.CliToolInstall)).toEqual({ state: 'cancelled' })
   expect(confirm).toHaveBeenCalledWith(expect.objectContaining({ buttons: ['取消', '备份并替换'], defaultId: 0, cancelId: 0 }))
+})
+
+it.each([
+  ['en', 'Replace the existing agent24 command?', ['Cancel', 'Back up and replace']],
+  ['th', 'แทนที่คำสั่ง agent24 ที่มีอยู่หรือไม่?', ['ยกเลิก', 'สำรองและแทนที่']],
+] as const)('uses %s for the replacement dialog', async (locale, title, buttons) => {
+  setup()
+  setMainLocale(locale)
+  install.mockImplementation(async (options: { confirm: () => Promise<boolean> }) => ({ state: await options.confirm() ? 'installed' : 'cancelled' }))
+  confirm.mockResolvedValue({ response: 0 })
+  await invoke(IpcChannels.CliToolInstall)
+  expect(confirm).toHaveBeenCalledWith(expect.objectContaining({ title, message: title, buttons }))
 })
