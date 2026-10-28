@@ -20,6 +20,7 @@ import DocumentsPage from './pages/documents/Documents'
 import logoSidebar from './assets/logo-sidebar.png'
 import { useT } from './i18n'
 import { appMessages } from './App.i18n'
+import { QuickSwitch } from './components/QuickSwitch'
 
 type BuiltinPage =
   | 'home'
@@ -196,6 +197,7 @@ export function App(): JSX.Element {
 
   return (
     <div className={`app${darkMode ? '' : ' light'}`}>
+      <QuickSwitch />
       {!sidebarOpen && (
         <button className="sidebar-expand-btn" onClick={() => setSidebarOpen(true)}>›</button>
       )}
