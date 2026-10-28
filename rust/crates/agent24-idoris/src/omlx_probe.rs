@@ -59,6 +59,11 @@ impl std::fmt::Debug for ApiKey {
 }
 
 impl ApiKey {
+    /// Transfer the in-memory credential to setup's stdin writer.
+    pub fn into_secret(self) -> Zeroizing<String> {
+        self.0
+    }
+
     /// The caller supplies the secret in memory, never via argv or environment.
     pub fn new(value: Zeroizing<String>) -> Result<Self, SettingsError> {
         let trimmed = value.trim();
