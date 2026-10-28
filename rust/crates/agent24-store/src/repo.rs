@@ -35,6 +35,10 @@ const SCHEDULE_STATUS_SELECT: &str = "SELECT schedules.*,
         AND julianday(runs.created_at) >= julianday(strftime('%Y-%m-%dT%H:%M:%S', json_extract(schedules.spec, '$.ts')))
      )) AS completed FROM schedules";
 
+const SCHEDULE_HAS_ACTIVE_RUN: &str = "EXISTS (
+    SELECT 1 FROM runs WHERE runs.schedule_id = schedules.id
+    AND status IN ('queued', 'running', 'awaiting_approval'))";
+
 pub(crate) fn status_str(s: RunStatus) -> &'static str {
     match s {
         RunStatus::Queued => "queued",
@@ -1000,6 +1004,34 @@ impl Store {
         self.delete_schedule_conditionally(id, false).await
     }
 
+    /// Reclaim at most 200 expired schedules, retaining run history.
+    /// Keep failed executions and runs without a valid terminal timestamp.
+    /// Selection and conditional deletion share the write lock so a new run,
+    /// spec change or terminal timestamp cannot race the retention check.
+    pub async fn reclaim_completed_schedules(&self, before: &str) -> Result<u64> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let ids: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT id FROM ({SCHEDULE_STATUS_SELECT}) AS schedules
+             WHERE completed AND consecutive_failures = 0
+             AND NOT {SCHEDULE_HAS_ACTIVE_RUN}
+             AND NOT EXISTS (
+                 SELECT 1 FROM runs WHERE runs.schedule_id = schedules.id
+                 AND (status = 'failed' OR ended_at IS NULL OR julianday(ended_at) IS NULL))
+             AND (SELECT MAX(julianday(ended_at)) FROM runs
+                  WHERE runs.schedule_id = schedules.id) < julianday(?)
+             ORDER BY id LIMIT 200"
+        ))
+        .bind(before)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut deleted = 0;
+        for id in ids {
+            deleted += u64::from(Self::delete_schedule_tx(&mut tx, &id, true).await?);
+        }
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
     /// The write lock covers rechecking completion and deleting grants/row.
     pub async fn delete_schedule_conditionally(
         &self,
@@ -1007,10 +1039,20 @@ impl Store {
         only_if_completed: bool,
     ) -> Result<bool> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let deleted = Self::delete_schedule_tx(&mut tx, id, only_if_completed).await?;
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
+    async fn delete_schedule_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        id: &str,
+        only_if_completed: bool,
+    ) -> Result<bool> {
         if only_if_completed {
             let row = sqlx::query(&format!("{SCHEDULE_STATUS_SELECT} WHERE schedules.id = ?"))
                 .bind(id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut **tx)
                 .await?;
             match row {
                 None => return Ok(false),
@@ -1021,12 +1063,11 @@ impl Store {
             }
             // Completion proves trigger acceptance, not that execution ended.
             // Keep grants for queued/running/approval-waiting runs as well.
-            let has_active_run: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM runs WHERE schedule_id = ? \
-                 AND status IN ('queued', 'running', 'awaiting_approval'))",
-            )
+            let has_active_run: bool = sqlx::query_scalar(&format!(
+                "SELECT {SCHEDULE_HAS_ACTIVE_RUN} FROM schedules WHERE id = ?"
+            ))
             .bind(id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
             if has_active_run {
                 return Err(StoreError::Conflict("schedule has active runs".into()));
@@ -1034,7 +1075,7 @@ impl Store {
         }
         let result = sqlx::query("DELETE FROM schedules WHERE id = ?")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         let deleted = result.rows_affected() > 0;
         if deleted {
@@ -1042,10 +1083,9 @@ impl Store {
                 "DELETE FROM standing_grants WHERE scope_kind = 'schedule' AND scope_id = ?",
             )
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
-        tx.commit().await?;
         Ok(deleted)
     }
 
