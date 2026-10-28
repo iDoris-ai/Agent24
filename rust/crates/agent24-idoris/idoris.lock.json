@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "tag": "v0.4.0",
+  "commit": "20136552cac476ccf6f266a3210a1a021c717ea3",
+  "assets": {
+    "aarch64-apple-darwin": {
+      "name": "idoris-v0.4.0-aarch64-apple-darwin.tar.gz",
+      "sha256": "ab46e0180090ef5143b8fb6ea98b0333f2ef9c3a137bab2dc3cf7307960476d5",
+      "files": [
+        "idoris",
+        "config/catalog.yaml",
+        "config/routing-policy.yaml",
+        "config/components/omlx.yaml",
+        "config/components/subscription.yaml"
+      ]
+    }
+  },
+  "team_id": "HYAP444FN9",
+  "contract_major": 1,
+  "min_contract_minor": 1,
+  "tested_contract_version": "1.1.0",
+  "capabilities": [
+    { "id": "L1", "source": "https://github.com/iDoris-ai/iDoris/pull/594; https://github.com/iDoris-ai/iDoris/pull/591" },
+    { "id": "L2", "source": "https://github.com/iDoris-ai/iDoris/pull/590; https://github.com/iDoris-ai/iDoris/pull/594" },
+    { "id": "L3", "source": "https://github.com/iDoris-ai/iDoris/pull/589" },
+    { "id": "L4", "source": "https://github.com/iDoris-ai/iDoris/pull/591; https://github.com/iDoris-ai/iDoris/pull/594" },
+    { "id": "L5", "source": "https://github.com/iDoris-ai/iDoris/pull/586" },
+    { "id": "L6", "source": "https://github.com/iDoris-ai/iDoris/releases/tag/v0.4.0; Developer ID notarization 71b37549-168c-44e6-8b66-970a3b949121" }
+  ],
+  "release_url_base": "https://github.com/iDoris-ai/iDoris/releases/download"
+}

@@ -46,6 +46,7 @@ pub struct AppState {
     /// D2 router: every model call goes through tier routing + health/cooldown,
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
+    pub managed_idoris: Option<Arc<agent24d::managed_idoris::ManagedIdoris>>,
     pub tools: Arc<agent24_tools::ToolRegistry>,
     /// H2: the user's risk overrides. Held here as well as inside the registry
     /// because the two need the SAME object — the registry resolves against it
@@ -674,6 +675,7 @@ impl AppState {
             knowledge_host: Arc::new(crate::knowledge_host::KnowledgeHostRegistry::default()),
             mcp_servers: Arc::new(mcp_servers),
             router,
+            managed_idoris: None,
             tools,
             broker,
             module_approval_broker,
@@ -1452,6 +1454,7 @@ pub async fn serve(
     host_bootstrap_stdio: bool,
     ready_omit_token: bool,
     cancel: CancellationToken,
+    idoris_dependencies: Option<agent24d::managed_idoris::ManagedDependencies>,
 ) -> Result<(), std::io::Error> {
     validate_auth_startup(auth_mode, host_bootstrap_stdio)?;
     let module_grants = crate::consent_routes::grant_settings(
@@ -1652,6 +1655,29 @@ pub async fn serve(
         .join("workspace");
     std::fs::create_dir_all(&workspace)?;
     let router = Arc::new(ModelRouter::from_env());
+    let managed_idoris = if ephemeral {
+        None
+    } else {
+        let path = agent24_protocol::state_file::state_dir()
+            .ok_or_else(|| std::io::Error::other("HOME not set"))?
+            .join("idoris-connection.json");
+        let managed = Arc::new(agent24d::managed_idoris::ManagedIdoris::new(
+            router.clone(),
+            path,
+        )?);
+        if managed.is_configured()? {
+            let dependencies = idoris_dependencies.as_ref().ok_or_else(|| {
+                std::io::Error::other(
+                    "managed iDoris requires injected Keychain and supervisor services",
+                )
+            })?;
+            managed
+                .restore(dependencies, &cancel)
+                .await
+                .map_err(std::io::Error::other)?;
+        }
+        Some(managed)
+    };
     let guardian = build_guardian(&router);
     // D1 session memory: a KV file next to the main store (ephemeral daemons get
     // an in-memory one). A failure here degrades to no memory rather than
@@ -1904,6 +1930,7 @@ pub async fn serve(
         mcp_servers,
         packages_root: Arc::clone(&packages_root),
     });
+    state.managed_idoris = managed_idoris;
     if let Some(capability_store) = capability_store {
         state.enable_capability_auth(capability_store);
     }
