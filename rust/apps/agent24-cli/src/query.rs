@@ -1097,7 +1097,7 @@ mod tests {
 
     #[tokio::test]
     async fn consent_export_is_always_the_raw_json_backup() {
-        let body = r#"{"authorizations":[{"module":"sin90","tool":"fs","module_version":"1.0.0","scope_summary":{"readable":"a","writable":null,"external":"c"},"host_risk":"high","source":"manual_install","decided_at":"2026-10-26T01:00:00Z","expires_at":"2026-11-26T01:00:00Z","status":"revoked"}]}"#;
+        let body = r#"{"authorizations":[{"module":"sin90","tool":"fs","module_version":"1.0.0","scope_summary":{"readable":"a","writable":null,"external":"c"},"host_risk":"high","source":"manual_install","decided_at":"2026-10-26T01:00:00Z","expires_at":"2026-11-26T01:00:00Z","status":"revoked","stop":"confirmed"}]}"#;
         let (port, _) = stub("200 OK", body);
         // json=false: the default must still be the raw JSON.
         let out = execute(&endpoint(port), &Read::ConsentExport, false)

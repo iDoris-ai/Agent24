@@ -9,7 +9,6 @@ import HomePage from './pages/Home'
 import WorkbenchPage from './pages/Workbench'
 import ModelsPage from './pages/Models'
 import SettingsPage from './pages/Settings'
-import ModulesManagerPage from './pages/ModulesManager'
 import { listOsModules } from './pages/agent/api'
 import RunsPage from './pages/Runs'
 import SchedulesPage from './pages/Schedules'
@@ -37,8 +36,7 @@ type BuiltinPage =
   | 'models'
   | 'memory'
   | 'settings'
-  | 'modules-manager'
-type Page = BuiltinPage | string  // string: Home passes station page ids through
+type Page = BuiltinPage
 
 const BUILTIN_NAV: { id: BuiltinPage; icon: string }[] = [
   // The landing page: an isometric machine showing how one run moves through the components.
@@ -54,7 +52,6 @@ const BUILTIN_NAV: { id: BuiltinPage; icon: string }[] = [
   { id: 'voice',           icon: '🎙️' },
   { id: 'creative',        icon: '🎨' },
   { id: 'models',          icon: '🤖' },
-  { id: 'modules-manager', icon: '🧩' },
   // M1-T11: 记忆页紧挨设置，和它共享"这是你对 Agent24 的控制面"这同一个位置。
   { id: 'memory',          icon: '🧠' },
   { id: 'settings',        icon: '⚙️' },
@@ -173,12 +170,12 @@ export function App(): JSX.Element {
         return
       }
       // Try to start oMLX
-      const started = await window.agent24.omlxStart(8088, 'xiaobao8088')
+      const started = await window.agent24.omlxStart(8088, '')
       if (started.ok) {
         // Poll until ready
         for (let i = 0; i < 5; i++) {
           await new Promise((r) => setTimeout(r, 2000))
-          const r = await window.agent24.omlxModels(started.url, 'xiaobao8088')
+          const r = await window.agent24.omlxModels(started.url, '')
           if (r.ok && r.models.length > 0) {
             const chatModel = pickChatModel(r.models)
             setFallbackLlmLabel(chatModel ? `${chatModel} · oMLX` : NO_CHAT_MODEL_LABEL)
@@ -193,8 +190,7 @@ export function App(): JSX.Element {
     return () => clearInterval(backendTimer)
   }, [])
 
-  const isBuiltin = BUILTIN_NAV.some((n) => n.id === page)
-  const pageTitle = (isBuiltin ? t(`title.${page as BuiltinPage}`) : undefined) ?? page
+  const pageTitle = t(`title.${page}`)
 
   return (
     <div className={`app${darkMode ? '' : ' light'}`}>
@@ -277,7 +273,9 @@ export function App(): JSX.Element {
             backendOk={backendOk}
             backendPort={backendPort}
             moduleCount={osModuleCount}
-            onNavigate={setPage}
+            onNavigate={(target) => {
+              if (BUILTIN_NAV.some((n) => n.id === target)) setPage(target as BuiltinPage)
+            }}
           />
         )}
         {page === 'workbench'        && <WorkbenchPage />}
@@ -289,7 +287,6 @@ export function App(): JSX.Element {
         {page === 'voice'            && <VoicePanel />}
         {page === 'creative'         && <CreativePage />}
         {page === 'models'           && <ModelsPage />}
-        {page === 'modules-manager'  && <ModulesManagerPage />}
         {page === 'memory'           && <MemoryPage />}
         {page === 'settings'         && <SettingsPage />}
       </div>

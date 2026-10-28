@@ -236,7 +236,7 @@ impl<E: Embedder + Clone> Retriever for VectorRetriever<E> {
         let rows = sqlx::query(
             "SELECT a.id, a.scope, a.subject, a.predicate, a.object,
                     a.valid_from, a.valid_to, a.recorded_from, a.recorded_to,
-                    a.evidence, a.confidence, a.modality, a.speaker, a.writer_version,
+                    a.evidence, a.source_ref, a.confidence, a.modality, a.speaker, a.writer_version,
                     a.supersedes, a.qualified, e.vec
              FROM mem_embeddings e
              JOIN mem_assertions a ON a.id = e.assertion_id

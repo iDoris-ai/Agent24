@@ -114,13 +114,13 @@ pub(crate) struct Env {
 
 /// A document with r1, a text engine, and (if given) a model.
 pub(crate) async fn env(model: Option<Arc<Script>>) -> Env {
+    env_with(model, Arc::new(OneBlock)).await
+}
+
+async fn env_with(model: Option<Arc<Script>>, engine: Arc<dyn Engine>) -> Env {
     let dir = tempfile::tempdir().unwrap();
-    let state = AppState::open_serving(
-        dir.path(),
-        Events::default(),
-        Layers::new(Some(Arc::new(OneBlock))),
-    )
-    .await;
+    let state =
+        AppState::open_serving(dir.path(), Events::default(), Layers::new(Some(engine))).await;
     if let Some(m) = model {
         state.set_model(m);
     }
@@ -249,6 +249,31 @@ async fn a_job_writes_its_extraction_with_its_success() {
     assert_eq!(
         serde_json::to_value(&job).unwrap()["result"],
         json!({ "extraction_id": ext })
+    );
+}
+
+/// K1-06a-grant-path §2.5: a job whose layer build is stopped (its
+/// authorization ended) fails as an engine that could not be had,
+/// retryable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_whose_build_is_stopped_fails_engine_unavailable() {
+    let env = env_with(Some(script(vec![])), Arc::new(Stuck)).await;
+    let id = start(&env, &input()).await;
+    let layers = env.state.layers();
+    let asked = Instant::now();
+    while !layers.job_requesters().contains(&(id.clone(), 1)) {
+        assert!(asked.elapsed() < Duration::from_secs(5), "never asked");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let by = crate::engine::Requester::Job {
+        id: id.clone(),
+        attempt: 1,
+    };
+    assert_eq!(layers.stop(|r| *r == by).len(), 1);
+    let (status, code, _) = ended(&env, &id).await;
+    assert_eq!(
+        (status.as_str(), code.as_deref()),
+        ("failed", Some("engine_unavailable"))
     );
 }
 
@@ -436,6 +461,9 @@ async fn a_job_waiting_for_its_layer_sees_its_cancel() {
         "{:?}",
         cancelled.elapsed()
     );
+    // The build goes on, asked for by this attempt: what a revocation stops.
+    let this = Requester::Job { id, attempt: 1 };
+    assert_eq!(env.state.layers().stop(|r| *r == this).len(), 1);
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_retried_extract_job_runs_again() {

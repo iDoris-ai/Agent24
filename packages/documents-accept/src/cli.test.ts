@@ -210,13 +210,22 @@ describe('writeEvidence', () => {
     const said = places.filter((at) => SAID.some((p) => p.test(at.join('.'))))
     // Every kind of place the daemon or a reviewer fills is in this report.
     expect(SAID.filter((p) => !said.some((at) => p.test(at.join('.'))))).toEqual([])
-    for (const at of places) {
-      const planted = structuredClone(clean)
-      const parent = at.slice(0, -1).reduce((x, k) => x[k], planted)
+    const plant = (report: typeof clean, at: (string | number)[]) => {
+      const parent = at.slice(0, -1).reduce((x, k) => x[k], report)
       parent[at.at(-1)!] = `${parent[at.at(-1)!]} on Mac16`
-      if (said.includes(at)) expect(() => writeEvidence(dir, planted, [], ['Mac16']), at.join('.')).toThrow(`secret 1 of 1, at ${at.join('.')}`)
-      else expect(() => writeEvidence(dir, planted, [], ['Mac16']), at.join('.')).not.toThrow()
     }
+    for (const at of said) {
+      const planted = structuredClone(clean)
+      plant(planted, at)
+      expect(() => writeEvidence(dir, planted, [], ['Mac16']), at.join('.')).toThrow(`secret 1 of 1, at ${at.join('.')}`)
+    }
+    // In every text the harness wrote at once: one written report, not one
+    // for each of some 500 texts. Planted in any it looked in, it would be found.
+    // (Through JSON: an object the report holds twice is planted once in each place.)
+    const planted = JSON.parse(JSON.stringify(clean))
+    for (const at of places.filter((at) => !said.includes(at))) plant(planted, at)
+    expect(() => writeEvidence(dir, planted, [], ['Mac16'])).not.toThrow()
+    expect(fs.readFileSync(path.join(dir, 'report.json'), 'utf8').match(/ on Mac16/g)).toHaveLength(places.length - said.length)
   })
 
   it('finds a secret in whichever text of the report it is, and then writes nothing', async () => {

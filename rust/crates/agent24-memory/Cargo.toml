@@ -1,6 +1,6 @@
 [package]
 name = "agent24-memory"
-version = "0.5.1"
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,6 +10,7 @@ description = "Agent24 memory (M-D/D1): L0 SQLite key-value store + canonical se
 agent24-core = { path = "../agent24-core" }
 agent24-models = { path = "../agent24-models" }
 # CORE-5b: one close-on-failure and migration-injection path, shared with store.
+# K1-6b.4b: the write gate merges assertion provenance by its classification.
 agent24-store = { path = "../agent24-store" }
 async-trait = "0.1"
 # T8.5c-P: `EventLog::scan_stream` is a genuinely streaming, row-by-row
@@ -29,7 +30,10 @@ tracing = "0.1"
 # split cannot be gotten wrong by a caller) — library code, not just tests,
 # needs `tokio::sync::Semaphore`. `sqlx`'s `runtime-tokio` feature already
 # pulls in the real tokio runtime; this only adds the `sync` primitives.
-tokio = { version = "1", default-features = false, features = ["sync"] }
+tokio = { version = "1", default-features = false, features = ["sync", "rt"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "0.38", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"

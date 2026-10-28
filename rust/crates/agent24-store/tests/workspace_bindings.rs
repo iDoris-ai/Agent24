@@ -240,6 +240,7 @@ async fn public_session_and_run_repositories_roundtrip_workspace_identity_and_le
             workspace_id: Some(workspace_id.clone()),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         },
         output: None,
         error: None,
@@ -287,6 +288,7 @@ async fn public_session_and_run_repositories_roundtrip_workspace_identity_and_le
         workspace_id: None,
         model_override: None,
         mode: RunMode::Normal,
+        knowledge_binding_id: None,
     })
     .unwrap();
     sqlx::query("UPDATE runs SET input = ? WHERE id = 'run_bound'")

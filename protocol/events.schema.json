@@ -518,6 +518,27 @@
         "message"
       ]
     },
+    "MemoryFailureCode": {
+      "description": "P1-02c: the closed set of memory-failure codes. Mirrors\n`agent24_memory::MemoryErrorCode` one for one (the protocol crate does not\ndepend on the memory crate; `agent24-agent` maps between them with an\nexhaustive `match` and a test pins the strings equal).",
+      "type": "string",
+      "enum": [
+        "memory_quota_rows",
+        "memory_quota_bytes",
+        "memory_disk_low",
+        "memory_disk_full",
+        "memory_reserved_kind",
+        "memory_retract_id_too_long",
+        "memory_internal"
+      ]
+    },
+    "MemoryOwnerKind": {
+      "description": "Whose partition a memory failure concerns. Never the partition key itself.",
+      "type": "string",
+      "enum": [
+        "personal",
+        "module"
+      ]
+    },
     "MemoryRecalledPayload": {
       "description": "Assertion ids that were actually included in a run's recalled context.",
       "type": "object",
@@ -538,19 +559,62 @@
       ]
     },
     "MemoryWriteFailedPayload": {
-      "description": "The answer completed, but its session exchange could not be recorded.",
+      "description": "A memory write failed. Typed on purpose (P1-02c T6): a stable `code`, the\nquota `dimension` when there is one, and the owner CLASS — never the storage\nerror's text, the partition key, or any of the content that was being written.\n\nTRANSITION (v1 compatibility, both directions). Older daemons sent only\n`{session_id, reason}`, and older clients require exactly those two fields.\nSo: `code` and `owner_kind` are `Option` on decode (an old producer's event\ndecodes with `None` — \"unknown\", NOT a made-up `memory_internal`/`personal`,\nwhich would assert a cause nobody established), and current daemons emit the\ntyped fields AND a sanitized `reason`. `reason` is only ever the code string\nitself (e.g. `\"memory_quota_rows\"`) — never a Display, never an owner. It is\ndeprecated and is to be removed in the release after the one that ships this,\nonce no supported client reads it.",
       "type": "object",
       "properties": {
+        "code": {
+          "description": "Absent from an older producer: unknown cause.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryFailureCode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dimension": {
+          "description": "`\"rows\"` or `\"bytes\"` for a quota code; absent otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "What kind of write failed, when it is not the ordinary turn/assertion\nwrite: `\"session.summary\"` (compaction summary) or `\"session.import\"`\n(legacy session import). Absent for the turn itself.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "owner_kind": {
+          "description": "Absent from an older producer: unknown.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryOwnerKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "partial": {
+          "description": "True when the conversation turn WAS saved but its explicit-remember\nassertion was not.",
+          "type": "boolean"
+        },
         "reason": {
-          "type": "string"
+          "description": "Deprecated, transitional: the code string itself when sent by a current\ndaemon; free text from an older one (do not display or parse it).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "session_id": {
           "type": "string"
         }
       },
       "required": [
-        "session_id",
-        "reason"
+        "session_id"
       ]
     },
     "MemoryWriteSkippedPayload": {
@@ -798,6 +862,13 @@
     "RunCompletedPayload": {
       "type": "object",
       "properties": {
+        "memory_persisted": {
+          "description": "P1-02c, THREE-state. `Some(false)`: this run's exchange (or its\nexplicit-remember assertion) FAILED to persist; the answer above is still\nreal, but nothing in the model's text can be taken as \"remembered\".\n`Some(true)`: no memory write this run attempted failed (including when\nthere was nothing to write, or memory is paused — a user choice reported\nby `memory.write_skipped`). `None` (field absent): UNKNOWN — the producer\npredates this field, and a daemon from before it could well have failed to\nwrite. Never read absence as `true`. Current daemons always send it.\n\nScope: this reflects ONLY this run's own writes. A failure to write the\ncompaction summary is reported separately via the `session.summary`\nevent and does NOT flip this flag.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "output": {
           "$ref": "#/$defs/RunOutputPayload"
         },

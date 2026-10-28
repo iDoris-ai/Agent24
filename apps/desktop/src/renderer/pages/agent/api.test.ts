@@ -20,6 +20,15 @@ function setProxy(fn: (req: { method: string; path: string; body?: unknown }) =>
   window.agent24 = { backendProxy: vi.fn(fn as never) } as never
 }
 
+// A1: elevated calls go through dedicated IPCs (native confirm in main).
+function setDedicated(fn: (...args: unknown[]) => unknown, proxy?: (req: { method: string; path: string; body?: unknown }) => unknown) {
+  window.agent24 = {
+    backendProxy: vi.fn((proxy ?? (() => ({ ok: true, status: 200, data: {} }))) as never),
+    approvalDecide: vi.fn(fn as never),
+    osModuleSetEnabled: vi.fn(fn as never),
+  } as never
+}
+
 describe('agent api', () => {
   it('errorMessage prefers the envelope message, falls back to status', () => {
     expect(errorMessage({ status: 500, data: { error: { message: 'boom' } } })).toBe('boom')
@@ -87,45 +96,51 @@ describe('agent api', () => {
   })
 
   it('decideApproval treats 409 as non-fatal but other errors throw', async () => {
-    setProxy(() => ({ ok: false, status: 409, data: {} }))
-    await expect(decideApproval('apr_1', { type: 'approve' })).resolves.toBeUndefined()
-    setProxy(() => ({ ok: false, status: 400, data: { error: { message: 'nope' } } }))
+    setDedicated(() => ({ ok: false, status: 409, data: {} }))
+    await expect(decideApproval('apr_1', { type: 'approve' })).resolves.toBe(true)
+    setDedicated(() => ({ ok: false, status: 400, data: { error: { message: 'nope' } } }))
     await expect(decideApproval('apr_1', { type: 'abort' })).rejects.toThrow('nope')
+    setDedicated(() => ({ ok: false, status: 499, data: { error: { code: 'cancelled', message: 'x' } } }))
+    await expect(decideApproval('apr_1', { type: 'approve' })).resolves.toBe(false)
     setProxy(() => ({ ok: true, status: 200, data: { approvals: [{ id: 'apr_1' }] } }))
     expect(await listPendingApprovals()).toEqual([{ id: 'apr_1' }])
   })
 
   it('decideApproval rejects an empty deny reason before any proxy call', async () => {
     const proxy = vi.fn()
-    window.agent24 = { backendProxy: proxy } as never
+    const approvalDecide = vi.fn()
+    window.agent24 = { backendProxy: proxy, approvalDecide } as never
     await expect(decideApproval('apr_1', { type: 'deny', reason: '  ' })).rejects.toThrow('原因')
     await expect(decideApproval('apr_1', { type: 'deny' })).rejects.toThrow('原因')
     expect(proxy).not.toHaveBeenCalled()
+    expect(approvalDecide).not.toHaveBeenCalled()
   })
 
   it('errorMessage handles a string-shaped error (IPC fallback)', () => {
     expect(errorMessage({ status: 502, data: { error: 'proxy refused' } })).toBe('proxy refused')
   })
 
-  it('FU-90: listOsModules / setOsModuleEnabled hit the right endpoints', async () => {
+  it('FU-90: listOsModules reads via proxy, setOsModuleEnabled via the dedicated IPC (A1)', async () => {
     const seen: { method: string; path: string; body?: unknown }[] = []
     const sin90: { modules: unknown[] } = {
       modules: [{ name: 'sin90', namespace: '/api/v1/sin90', version: '0.5.0', enabled: true, state: 'mounted', granted: ['events'], missing_models: [], resources: 'ok', restart_required: false }],
     }
-    setProxy((req) => {
+    const calls: unknown[][] = []
+    setDedicated((...args) => { calls.push(args); return { ok: true, status: 200, data: sin90 } }, (req) => {
       seen.push(req)
       return { ok: true, status: 200, data: sin90 }
     })
     expect(await listOsModules()).toEqual(sin90)
     expect(await setOsModuleEnabled('sin90', false)).toEqual(sin90)
-    expect(seen).toEqual([
-      { method: 'GET', path: '/api/v1/os' },
-      { method: 'PATCH', path: '/api/v1/os/sin90', body: { enabled: false } },
-    ])
+    expect(seen).toEqual([{ method: 'GET', path: '/api/v1/os' }])
+    expect(calls).toEqual([['sin90', false]])
   })
 
   it('FU-90: a failed os-module call throws the envelope message', async () => {
-    setProxy(() => ({ ok: false, status: 404, data: { error: { message: 'no domain OS named "x"' } } }))
+    setDedicated(
+      () => ({ ok: false, status: 404, data: { error: { message: 'no domain OS named "x"' } } }),
+      () => ({ ok: false, status: 404, data: { error: { message: 'no domain OS named "x"' } } }),
+    )
     await expect(listOsModules()).rejects.toThrow('no domain OS named "x"')
     await expect(setOsModuleEnabled('x', true)).rejects.toThrow('no domain OS named "x"')
   })

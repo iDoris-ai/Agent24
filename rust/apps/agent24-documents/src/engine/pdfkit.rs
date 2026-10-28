@@ -261,20 +261,33 @@ impl PdfKit {
             let mut child = command
                 .spawn()
                 .map_err(|e| RunError::Other(format!("the engine did not start: {e}")))?;
-            let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
+            let (Some(mut out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
                 return Err(RunError::Other("the engine's output is not piped".into()));
             };
             // Output over the cap stops the helper at once; its error
             // output is kept to a few KiB and the rest read away.
+            let over = tokio::sync::Notify::new();
             let run = async {
                 let report = async {
-                    let read = read_capped(out, max, false).await;
+                    // Borrowed, the output stays open until the helper is
+                    // killed: a process it started cannot die of the closed
+                    // pipe first and let the helper go on to something else.
+                    let read = read_capped(&mut out, max, false).await;
                     if matches!(read, Ok((_, true))) {
                         let _ = child.start_kill();
+                        over.notify_one();
                     }
                     read
                 };
-                let (out, err) = tokio::join!(report, read_capped(err, MAX_STDERR, true));
+                // Past the cap the end of the error output is not waited
+                // for: a process the helper started may hold it open.
+                let said = async {
+                    tokio::select! {
+                        read = read_capped(err, MAX_STDERR, true) => read,
+                        () = over.notified() => Ok((Vec::new(), false)),
+                    }
+                };
+                let (out, err) = tokio::join!(report, said);
                 let (out, err) = (out?, err?);
                 Ok::<_, std::io::Error>((out, err, child.wait().await?))
             };

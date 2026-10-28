@@ -142,7 +142,10 @@ impl MemoryConn {
                 })
                 .await);
         }
-        conn.kv = Some(kv_from_pool(conn.inner.pool().clone()));
+        conn.kv = Some(kv_from_pool(
+            conn.inner.pool().clone(),
+            crate::disk_gate::DiskGate::for_path(path),
+        ));
         Ok(conn)
     }
 
@@ -168,9 +171,12 @@ impl MemoryConn {
     #[must_use]
     pub fn into_kv(mut self) -> KvStore {
         self.inner.disarm();
-        self.kv
-            .take()
-            .unwrap_or_else(|| kv_from_pool(self.inner.pool().clone()))
+        self.kv.take().unwrap_or_else(|| {
+            kv_from_pool(
+                self.inner.pool().clone(),
+                crate::disk_gate::DiskGate::disabled(),
+            )
+        })
     }
 
     pub async fn close(mut self) -> Result<(), MemoryError> {
@@ -248,12 +254,14 @@ fn map_err(err: StepError) -> PhaseError {
     }
 }
 
-fn kv_from_pool(pool: SqlitePool) -> KvStore {
+fn kv_from_pool(pool: SqlitePool, disk: crate::disk_gate::DiskGate) -> KvStore {
     KvStore {
         pool,
         oop_admission: Some(Arc::new(tokio::sync::Semaphore::new(
             (KVSTORE_MAX_CONNECTIONS - 1) as usize,
         ))),
+        rejection_queue: Default::default(),
+        disk,
     }
 }
 

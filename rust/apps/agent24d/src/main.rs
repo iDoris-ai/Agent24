@@ -26,9 +26,13 @@ mod domain;
 mod enroll_endpoint;
 mod events;
 mod events_emit;
+mod grant_expiry;
 mod hardware;
 #[cfg(unix)]
 mod host_bootstrap;
+mod knowledge_host;
+#[allow(dead_code)] // Wired at start (KB-C1-04 6c-4) and by the private interface (6d-2).
+mod knowledge_store;
 #[cfg(not(unix))]
 mod host_bootstrap {
     #![allow(
@@ -64,6 +68,7 @@ mod host_bootstrap {
 mod lifecycle;
 mod mcp;
 mod memory_callback;
+mod memory_maintenance;
 mod memory_routes;
 #[allow(
     dead_code,
@@ -81,6 +86,7 @@ mod os_memory;
 mod os_memory_page;
 mod os_routes;
 mod overrides;
+mod peer_runs;
 mod routes;
 mod runs;
 mod scheduler_callback;
@@ -140,6 +146,11 @@ enum Command {
         /// --host-bootstrap-stdio (which opens the endpoint by itself).
         #[arg(long, default_value_t = false)]
         enroll_endpoint: bool,
+        /// Leave the bearer token out of the legacy `ready` line (it still goes
+        /// to the 0600 `daemon.json`). Passed by the LaunchAgent plist, whose
+        /// `StandardOutPath` would otherwise persist the token in a log file.
+        #[arg(long, default_value_t = false)]
+        ready_omit_token: bool,
     },
 }
 
@@ -165,12 +176,14 @@ fn main() -> std::process::ExitCode {
             auth_mode,
             host_bootstrap_stdio,
             enroll_endpoint,
+            ready_omit_token,
         } => run_serve(
             port,
             ephemeral,
             auth_mode.into(),
             host_bootstrap_stdio,
             enroll_endpoint,
+            ready_omit_token,
         ),
     }
 }
@@ -181,6 +194,7 @@ fn run_serve(
     auth_mode: agent24_protocol::state_file::AuthMode,
     host_bootstrap_stdio: bool,
     enroll_endpoint: bool,
+    ready_omit_token: bool,
 ) -> std::process::ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -197,6 +211,7 @@ fn run_serve(
         auth_mode,
         host_bootstrap_stdio,
         enroll_endpoint,
+        ready_omit_token,
         cancel,
     ));
     // Bounded, not the default `Drop`, which waits for every blocking task:

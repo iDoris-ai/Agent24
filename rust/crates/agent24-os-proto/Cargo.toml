@@ -1,6 +1,6 @@
 [package]
 name = "agent24-os-proto"
-version = "0.5.1"
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -20,7 +20,7 @@ hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", 
 serde = { workspace = true }
 serde_json = { workspace = true }
 # For signalling a process GROUP — a safe wrapper over `killpg`.
-rustix = { version = "0.38", features = ["process"] }
+rustix = { version = "0.38", features = ["fs", "process"] }
 # `sync` for the revocation signal (`watch`) and the callback channels; `macros`
 # for `select!` (the proxy's race against revocation, and `rpc::serve`); `rt` +
 # `io-util` for the callback connection loop (ME-3c).

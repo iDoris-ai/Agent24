@@ -1,6 +1,6 @@
 [package]
 name = "agent24d"
-version = "0.5.1"
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -77,11 +77,17 @@ libc = "0.2"
 # only carries the three fields a MODULE needs); read directly rather than
 # adding a fourth field to that shared reader for one caller.
 serde_yaml = "0.9"
+# KB-C1-04 6d: the Provider's records and their stored shape
+# (`knowledge_store.rs`).
+agent24-knowledge = { path = "../../crates/agent24-knowledge" }
+# KB-C1-04 6d-1: `knowledge.db` (`knowledge_store.rs`). Tests also use it
+# (T7b/ME-3e) to force a transient `Store` error in the timeout-scan test by
+# dropping `module_approvals` out from under a live pool — there is no
+# fault-injectable `Store` trait to mock instead.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 
-# CORE-5d: snapshot maintenance connections and the raw-handle backup boundary.
-# sqlx is also used by the T7b/ME-3e test that forces a transient `Store` error
-# by dropping `module_approvals` under a live pool.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+# CORE-5d: snapshot maintenance connections and the raw-handle backup boundary
+# (uses the `sqlx` dependency declared above).
 agent24-os-sqlite = { path = "../../crates/agent24-os-sqlite" }
 
 [dev-dependencies]

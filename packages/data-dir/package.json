@@ -1,6 +1,6 @@
 {
   "name": "@agent24/data-dir",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "private": true,
   "description": "ADR-037 platform data-directory resolver shared by the desktop shell and TS packages. Mirror of agent24-protocol data_dir.rs.",
   "main": "./dist/index.js",
