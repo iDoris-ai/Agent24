@@ -1231,18 +1231,20 @@ async fn invalidate_module_consents_in(
         );
         return Ok(());
     };
-    // `_lock` must outlive the query: dropping it releases the singleton lock.
     // No database file means there is no consent row to revoke, and this must
     // not create one.
-    match offline_db::open_offline_store(dir).await.map_err(|err| {
+    let db = offline_db::open_offline_store(dir).await.map_err(|err| {
         format!("could not open the consent store to revoke {name} module consent: {err}")
-    })? {
+    })?;
+    let result = match &db {
         offline_db::OfflineDb::Absent(_lock) => Ok(()),
         offline_db::OfflineDb::Ready(store, _lock) => store
             .invalidate_module_consents(name)
             .await
             .map_err(|err| format!("could not revoke {name} module consent: {err}")),
-    }
+    };
+    db.close().await;
+    result
 }
 
 /// Consent revocation did not land. Package files have not been changed.
@@ -1454,26 +1456,33 @@ async fn cmd_decide_in(dir: &std::path::Path, action: DecideAction) -> Result<()
         DecideAction::Delete { .. } => {}
         DecideAction::Profile { json } => return query::decide_profile(*json).await,
     }
-    // `_lock` must outlive the query: dropping it releases the singleton lock.
-    match offline_db::open_offline_store(dir).await? {
-        // Nothing was ever recorded, so export is an empty set and delete
-        // removes nothing. Do not create `agent24.db`.
-        offline_db::OfflineDb::Absent(_lock) => decide_without_database(action),
-        offline_db::OfflineDb::Ready(store, _lock) => match action {
-            DecideAction::Export { point, since, .. } => {
-                let rows = store
-                    .export_decision_log(point.as_deref(), since.as_deref())
-                    .await
-                    .map_err(|e| e.to_string())?;
-                for row in &rows {
-                    println!("{}", decision_log_export_line(row)?);
+    let db = offline_db::open_offline_store(dir).await?;
+    let result = async {
+        match &db {
+            // Nothing was ever recorded, so export is an empty set and delete
+            // removes nothing. Do not create `agent24.db`.
+            offline_db::OfflineDb::Absent(_lock) => decide_without_database(action),
+            offline_db::OfflineDb::Ready(store, _lock) => match action {
+                DecideAction::Export { point, since, .. } => {
+                    let rows = store
+                        .export_decision_log(point.as_deref(), since.as_deref())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    for row in &rows {
+                        println!("{}", decision_log_export_line(row)?);
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
-            DecideAction::Delete { action } => cmd_decide_delete(&store, action).await,
-            DecideAction::Profile { .. } => unreachable!("profile returns before the store opens"),
-        },
+                DecideAction::Delete { action } => cmd_decide_delete(store, action).await,
+                DecideAction::Profile { .. } => {
+                    unreachable!("profile returns before the store opens")
+                }
+            },
+        }
     }
+    .await;
+    db.close().await;
+    result
 }
 
 /// Same operator-visible outcome as an empty decision log, without a store.
@@ -2779,7 +2788,7 @@ mod tests {
         drop(lock);
     }
 
-    struct KillOnDrop(std::process::Child);
+    pub(super) struct KillOnDrop(std::process::Child);
 
     impl Drop for KillOnDrop {
         fn drop(&mut self) {
@@ -2788,9 +2797,14 @@ mod tests {
         }
     }
 
-    fn hold_singleton(dir: &std::path::Path) -> KillOnDrop {
+    pub(super) fn hold_singleton(dir: &std::path::Path) -> KillOnDrop {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "tests::offline_db_lock_holder", "--ignored"])
+            .args([
+                "--exact",
+                "tests::offline_db_lock_holder",
+                "--ignored",
+                "--nocapture",
+            ])
             .env("AGENT24_HOLD_SINGLETON_DIR", dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
@@ -2961,6 +2975,9 @@ mod tests {
         invalidate_module_consents_in(Some(dir.path()), "consent-mod")
             .await
             .unwrap();
+        // Probe from another process: a same-process flock retry on macOS
+        // does not prove that the previous offline entry released its lock.
+        drop(hold_singleton(dir.path()));
         cmd_decide_in(
             dir.path(),
             DecideAction::Delete {
@@ -2972,6 +2989,8 @@ mod tests {
         .await
         .unwrap();
 
+        std::fs::remove_file(dir.path().join("holder.ready")).unwrap();
+        drop(hold_singleton(dir.path()));
         let store = agent24_store::Store::open_without_migration(&path)
             .await
             .unwrap();

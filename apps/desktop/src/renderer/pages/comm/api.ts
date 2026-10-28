@@ -78,7 +78,12 @@ function isRecord(value: unknown): value is RecordValue {
 function errorFields(value: unknown, status: number): { message: string; code?: string } {
   if (isRecord(value)) {
     const error = value['error']
-    if (typeof error === 'string' && error.length > 0) return { message: error }
+    if (typeof error === 'string' && error.length > 0) {
+      // The comm routes answer {ok:false, error:"<code>", message:"<why>"}:
+      // keep the code for UI decisions and the message for the user.
+      const why = value['message']
+      return typeof why === 'string' && why.length > 0 ? { message: why, code: error } : { message: error }
+    }
     if (isRecord(error)) {
       const message = error['message']
       const code = error['code']

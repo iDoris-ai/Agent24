@@ -169,6 +169,12 @@ impl Tool for SelfWakeTool {
             .ok_or_else(|| ToolError::Invalid("prompt is required".to_owned()))?
             .to_owned();
         let ts = Self::wake_time(input)?;
+        let spec = ScheduleSpec::At { ts: ts.clone() };
+        let now = agent24_scheduler::next_fire::parse_iso(&agent24_core::util::now_iso8601())
+            .map_err(|e| ToolError::Invalid(e.to_string()))?;
+        let next_run_at = agent24_scheduler::next_fire::initial_fire(&spec, now)
+            .map_err(|e| ToolError::Invalid(e.to_string()))?
+            .map(agent24_scheduler::next_fire::fmt_iso);
 
         // Bound outstanding self-wakes so a loop can't flood the schedule table.
         // Fail-closed on a store error (don't create under uncertainty).
@@ -234,7 +240,7 @@ impl Tool for SelfWakeTool {
             id: schedule_id,
             name: SELF_WAKE_NAME.to_owned(),
             enabled: true,
-            spec: ScheduleSpec::At { ts: ts.clone() },
+            spec,
             action: Some(ScheduleAction::AgentRun {
                 prompt,
                 // Deliver into THIS session so the woken run continues the
@@ -245,7 +251,7 @@ impl Tool for SelfWakeTool {
             delivery: vec![],
             last_run_at: None,
             // One-shot: fire once at `ts`, then the scheduler clears this.
-            next_run_at: Some(ts.clone()),
+            next_run_at,
             consecutive_failures: 0,
             // A self-wake is always a plain user (AgentRun) row.
             owner: None,
@@ -413,7 +419,7 @@ mod tests {
         let (tool, store) = tool().await;
         let mut input = Map::new();
         input.insert("prompt".to_owned(), json!("nightly recap"));
-        input.insert("at".to_owned(), json!("2026-07-28T18:00:00Z"));
+        input.insert("at".to_owned(), json!("2099-07-28T18:00:00Z"));
         tool.call(&ctx(None), &input, &CancellationToken::new())
             .await
             .unwrap();
@@ -421,8 +427,42 @@ mod tests {
             store.list_schedules_lenient().await.unwrap()[0]
                 .next_run_at
                 .as_deref(),
-            Some("2026-07-28T18:00:00Z")
+            Some("2099-07-28T18:00:00Z")
         );
+    }
+
+    #[tokio::test]
+    async fn past_at_is_rejected_without_creating_a_wake() {
+        let (tool, store) = tool().await;
+        let mut input = Map::new();
+        input.insert("prompt".into(), json!("too late"));
+        input.insert("at".into(), json!("2000-01-01T00:00:00Z"));
+        let err = tool
+            .call(&ctx(None), &input, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Invalid(_)), "{err}");
+        assert!(err.to_string().contains("60 seconds"));
+        assert!(store.list_schedules().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn at_within_skew_is_scheduled_for_now() {
+        let (tool, store) = tool().await;
+        let now =
+            agent24_scheduler::next_fire::parse_iso(&agent24_core::util::now_iso8601()).unwrap();
+        let recent =
+            agent24_scheduler::next_fire::fmt_iso(now - std::time::Duration::from_secs(30));
+        let mut input = Map::new();
+        input.insert("prompt".into(), json!("recent"));
+        input.insert("at".into(), json!(recent));
+        tool.call(&ctx(None), &input, &CancellationToken::new())
+            .await
+            .unwrap();
+        let row = store.list_schedules().await.unwrap().remove(0);
+        let next =
+            agent24_scheduler::next_fire::parse_iso(row.next_run_at.as_deref().unwrap()).unwrap();
+        assert!(next >= now);
     }
 
     #[tokio::test]
