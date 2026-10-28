@@ -38,9 +38,12 @@ function invoke(channel: string, ...args: unknown[]) {
 it('rejects all renderer-supplied paths and payloads before installation', () => {
   setup()
   for (const arg of ['/tmp/evil', { target: '/tmp/evil' }, undefined, null]) {
-    expect(() => invoke(IpcChannels.CliToolInstall, arg)).toThrow('no arguments')
+    for (const channel of [IpcChannels.CliToolInstall, IpcChannels.CliToolStatus]) {
+      expect(() => invoke(channel, arg)).toThrow('no arguments')
+    }
   }
   expect(install).not.toHaveBeenCalled()
+  expect(status).not.toHaveBeenCalled()
 })
 it('applies the sender guard to every new handler', () => {
   setup()

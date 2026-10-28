@@ -45,6 +45,18 @@ describe('bundled target', () => {
     await symlink(external, f.target)
     await expect(resolveBundledCli(f.executable, f.resources)).rejects.toThrow()
   })
+  it('rejects executables outside an App bundle', async () => {
+    const f = await fixture()
+    const outside = path.join(f.root, 'Agent24')
+    await writeFile(outside, '')
+    await expect(resolveBundledCli(outside, f.resources)).rejects.toThrow('Invalid App bundle')
+  })
+  it('rejects a directory in place of the bundled CLI', async () => {
+    const f = await fixture()
+    await rm(f.target)
+    await mkdir(f.target)
+    await expect(resolveBundledCli(f.executable, f.resources)).rejects.toThrow('CLI is not a file')
+  })
   it('rejects redirected backend directories and mismatched resources', async () => {
     const f = await fixture()
     await expect(resolveBundledCli(f.executable, f.root)).rejects.toThrow()
@@ -103,10 +115,10 @@ describe('PATH detection and installation', () => {
   it('rejects destination parent symlinks and directories', async () => {
     const f = await fixture()
     await symlink(path.dirname(f.target), path.dirname(f.destination))
-    await expect(installLink({ target: f.target, destination: f.destination, confirm: async () => true })).rejects.toThrow()
+    await expect(installLink({ target: f.target, destination: f.destination, confirm: async () => true })).rejects.toThrow('Symlinked parent directory')
     await rm(path.dirname(f.destination))
     await mkdir(f.destination, { recursive: true })
-    await expect(installLink({ target: f.target, destination: f.destination, confirm: async () => true })).rejects.toThrow()
+    await expect(installLink({ target: f.target, destination: f.destination, confirm: async () => true })).rejects.toThrow('Destination is not a file or symlink')
   })
   it('rejects a replacement changed during confirmation', async () => {
     const f = await fixture()
@@ -116,8 +128,16 @@ describe('PATH detection and installation', () => {
       await rm(f.destination)
       await writeFile(f.destination, 'different CLI')
       return true
-    } })).rejects.toThrow()
+    } })).rejects.toThrow('Installation paths changed')
     expect(await readFile(f.destination, 'utf8')).toBe('different CLI')
+  })
+  it('rejects a symlink target before asking for replacement', async () => {
+    const f = await fixture()
+    const alias = path.join(f.root, 'alias')
+    await symlink(f.target, alias)
+    const confirm = vi.fn(async () => true)
+    await expect(installLink({ target: alias, destination: f.destination, confirm })).rejects.toThrow('Invalid target')
+    expect(confirm).not.toHaveBeenCalled()
   })
   it('quotes shell and AppleScript metacharacters as data', async () => {
     const value = "a'\"\\$() `touch nope` ไทย"

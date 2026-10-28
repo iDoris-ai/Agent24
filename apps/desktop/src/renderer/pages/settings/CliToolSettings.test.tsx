@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, expect, it, vi } from 'vitest'
 import { CliToolSettings } from './CliToolSettings'
 import { setLocale } from '../../i18n'
@@ -29,4 +29,21 @@ it('explains cancellation and restores the install button', async () => {
   fireEvent.click(button)
   await screen.findByText('Installation cancelled. Administrator permission or replacement was not approved.')
   await waitFor(() => expect(button).toBeEnabled())
+})
+
+it('stops polling and listening for focus after leaving settings', async () => {
+  vi.useFakeTimers()
+  status.mockClear()
+  try {
+    const view = render(<CliToolSettings />)
+    await act(async () => {})
+    expect(status).toHaveBeenCalledTimes(1)
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+    expect(status).toHaveBeenCalledTimes(2)
+    await act(async () => { fireEvent.focus(window) })
+    expect(status).toHaveBeenCalledTimes(3)
+    view.unmount()
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); fireEvent.focus(window) })
+    expect(status).toHaveBeenCalledTimes(3)
+  } finally { vi.useRealTimers() }
 })
