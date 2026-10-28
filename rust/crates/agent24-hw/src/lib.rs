@@ -105,6 +105,12 @@ pub struct HardwareReport {
 }
 
 impl HardwareReport {
+    /// Usable already excludes OS and app overhead. Deduct only the explicit
+    /// core allocation and preserve a real zero.
+    pub fn idoris_budget_bytes(&self, core_reserved_bytes: u64) -> u64 {
+        self.usable_bytes.saturating_sub(core_reserved_bytes)
+    }
+
     /// Build from a profile and an (already read) `A24_HW_BUDGET_CAP_GB`.
     pub fn new(profile: HardwareProfile, cap_gb_raw: Option<&str>) -> Self {
         let b = Budget::compute(&profile, cap_gb_raw);

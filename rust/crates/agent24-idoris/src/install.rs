@@ -114,6 +114,15 @@ impl InstalledVersion {
         Ok(())
     }
 
+    #[cfg(test)]
+    /// Setup tests only run the binary; they never go through launch verification.
+    pub(crate) fn from_test_directory(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            manifest: Manifest::new(),
+        }
+    }
+
     pub fn directory(&self) -> &Path {
         &self.directory
     }
