@@ -22,6 +22,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 mod acp;
 mod documents;
+mod idoris;
 mod service;
 mod tui;
 
@@ -51,6 +52,11 @@ enum Command {
     },
     /// List models known to the daemon
     Models,
+    /// Install, run and connect managed iDoris through the daemon
+    Idoris {
+        #[command(subcommand)]
+        action: idoris::IdorisAction,
+    },
     /// Install/remove 24/7 unattended operation (macOS LaunchAgent)
     Service {
         #[command(subcommand)]
@@ -2307,6 +2313,7 @@ async fn main() -> std::process::ExitCode {
             confirm_headroom,
         } => cmd_chat(message, model, confirm_headroom).await,
         Command::Models => cmd_models().await,
+        Command::Idoris { action } => idoris::run(action).await,
         Command::Daemon { action } => cmd_daemon(action).await,
         Command::Service { action } => cmd_service(action),
         Command::Tui => cmd_tui().await,
