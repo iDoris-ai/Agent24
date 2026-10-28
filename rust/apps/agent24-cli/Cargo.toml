@@ -39,6 +39,7 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 # localhost only (ws://, never wss) — `connect` gives connect_async
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 futures-util = { version = "0.3", default-features = false }
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

@@ -28,6 +28,14 @@ const MAX_HEALTH_FAILURES = 3
 
 export type BackendKind = 'node' | 'rust'
 
+export interface BackendStatusDetail {
+  readonly kind: 'protocol_mismatch'
+  readonly daemonVersion: number | null
+  readonly clientVersion: number
+  readonly recordedVersion?: number
+  readonly pid: number
+}
+
 export interface BackendEndpoint {
   port: number
 }
@@ -402,7 +410,7 @@ export class BackendManager {
   // retry forever. While set, start/restart do not spawn and do not signal the
   // external pid. tick keeps probing: a compatible `/health` clears this and
   // reuses the peer; a failed probe clears it and spawns.
-  private blockedReason: string | null = null
+  private blockedReason: BackendStatusDetail | null = null
   // Set while a healthy capability-mode daemon of another host serves this
   // data dir (see tryReuseExternal); nothing is spawned until it is gone.
   private foreignPid: number | null = null
@@ -471,7 +479,7 @@ export class BackendManager {
     const live = protocolCompatibility(health.protocolVersion, CLIENT_PROTOCOL_VERSION)
     if (!live.compatible) {
       this.foreignPid = null
-      return this.refuseExternal(state, live.reason)
+      return this.refuseExternal(state, health.protocolVersion)
     }
     this.blockedReason = null
     if (state.authMode !== 'legacy') {
@@ -496,22 +504,22 @@ export class BackendManager {
   }
 
   /** Live `/health` disagreed. The recorded version is only named in the hint. */
-  private refuseExternal(state: ExternalDaemonState, reason: string): 'incompatible' {
-    const recorded = state.protocolVersion === undefined
-      ? 'daemon.json 没有记录协议版本'
-      : `daemon.json 记录的协议版本为 ${state.protocolVersion}`
-    const message =
-      `${reason}。${recorded}。请升级较旧的一方，使两边协议版本一致，然后重新打开本应用。` +
-      `外部 daemon（pid ${state.pid}）仍在运行，本应用不会终止它，也不会再启动另一个。`
-    const already = this.blockedReason === message
-    this.blockedReason = message
+  private refuseExternal(state: ExternalDaemonState, daemonVersion: number | null): 'incompatible' {
+    const detail: BackendStatusDetail = {
+      kind: 'protocol_mismatch', daemonVersion, clientVersion: CLIENT_PROTOCOL_VERSION,
+      recordedVersion: state.protocolVersion, pid: state.pid,
+    }
+    const already = this.blockedReason?.pid === detail.pid
+      && this.blockedReason.daemonVersion === detail.daemonVersion
+      && this.blockedReason.recordedVersion === detail.recordedVersion
+    this.blockedReason = detail
     this.isExternal = false
     this.externalPid = null
     this.lastHealthy = false
     current = null
     if (!already) {
       console.warn(
-        `[backend:${this.kind}] 不复用外部 daemon（pid ${state.pid}，port ${state.port}）：${message}`,
+        `[backend:${this.kind}] refusing external daemon (port ${state.port}): ${JSON.stringify(detail)}`,
       )
     }
     return 'incompatible'
@@ -545,7 +553,7 @@ export class BackendManager {
   }
 
   /** Upgrade hint while an incompatible external daemon blocks spawn. */
-  statusDetail(): string | null {
+  statusDetail(): BackendStatusDetail | null {
     return this.blockedReason
   }
 
