@@ -1162,13 +1162,8 @@ pub(crate) mod handshake_tests {
             permit,
         ));
         let mut client = BufReader::new(client);
-        send(
-            client.get_mut(),
-            serde_json::json!({"v":1,"op":"hello","generation":"daemon-test"}),
-        )
-        .await
-        .unwrap();
-        assert_eq!(line(&mut client).await["op"], "challenge");
+        // Server first (design §10 R8): read the challenge, echo its nonce.
+        hello(&mut client, "daemon-test").await;
         (client, stop)
     }
 

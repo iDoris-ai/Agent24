@@ -607,6 +607,9 @@ async fn product_host_module_writes_do_not_need_delegation() {
 
 // Keep HTTP in-process and use a socket pair for the real enrolment handshake.
 // Only the registry path is injected; no test writes the user's attached.json.
+// macOS only: off macOS the daemon has no per-writer peer token and rejects
+// every enrolment frame by design (slice §3.1), so the handshake cannot succeed.
+#[cfg(target_os = "macos")]
 async fn desktop_presence_flow(decision: &str) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let (state, host, _) = tests::capability_state().await;
@@ -768,18 +771,22 @@ async fn desktop_presence_flow(decision: &str) {
     stop.cancel();
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn desktop_enroll_elevate_attach_allowed() {
     desktop_presence_flow("allow").await;
 }
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn desktop_enroll_elevate_attach_denied() {
     desktop_presence_flow("deny").await;
 }
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn desktop_enroll_elevate_without_poller() {
     desktop_presence_flow("unavailable").await;
 }
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn desktop_enroll_elevate_presence_timeout() {
     desktop_presence_flow("timeout").await;
