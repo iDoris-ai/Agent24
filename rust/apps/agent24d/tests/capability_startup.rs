@@ -272,6 +272,7 @@ fn idoris_restore_persistence_failure_does_not_prevent_daemon_startup() {
         omlx_url: None,
         omlx_key_id: None,
         desired_running: true,
+        verification: None,
     };
     std::fs::write(
         root.join("installation.json"),
