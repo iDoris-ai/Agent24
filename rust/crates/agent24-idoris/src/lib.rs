@@ -2,13 +2,13 @@
 
 pub mod download;
 pub mod install;
-#[cfg(unix)]
-pub mod omlx_probe;
-mod storage;
-#[cfg(unix)]
-pub mod setup;
 pub mod keychain;
 pub mod keys;
+#[cfg(unix)]
+pub mod omlx_probe;
+#[cfg(unix)]
+pub mod setup;
+mod storage;
 pub mod supervisor;
 
 use semver::Version;

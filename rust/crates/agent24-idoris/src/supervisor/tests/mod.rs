@@ -73,7 +73,7 @@ impl Fixture {
             assert!(result.status.success());
             String::from_utf8(result.stdout).unwrap().trim().to_owned()
         });
-        let script = include_str!("../../tests/fixtures/idoris.py").replacen(
+        let script = include_str!("../../../tests/fixtures/idoris.py").replacen(
             "#!/usr/bin/python3",
             &format!("#!{python}"),
             1,
@@ -618,7 +618,7 @@ async fn pre_cancel_and_token_deadline_fail_without_downgrade() {
 #[test]
 fn health_uses_lock_minimum_minor_and_allows_newer_minor() {
     let mut lock: IdorisLock =
-        serde_json::from_str(include_str!("../../idoris.lock.json")).unwrap();
+        serde_json::from_str(include_str!("../../../idoris.lock.json")).unwrap();
     lock.min_contract_minor = 3;
     let mut body = healthy();
     body["contract_version"] = serde_json::json!("1.2.99");

@@ -162,6 +162,12 @@ pub(super) struct Lease {
     _lock: File,
     record: PathBuf,
 }
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // A concurrent fork may retain this open file description until exec.
+        let _ = fs2::FileExt::unlock(&self._lock);
+    }
+}
 impl Lease {
     pub fn acquire(state: &Path) -> Result<Self, SupervisorError> {
         private_dir(state)?;
@@ -253,3 +259,18 @@ impl Lease {
     }
 }
 use std::time::Duration;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn dropping_lease_releases_descriptors_inherited_before_exec() {
+        let directory = tempfile::tempdir().unwrap();
+        let lease = super::Lease::acquire(directory.path()).unwrap();
+        let inherited = lease._lock.try_clone().unwrap();
+        drop(lease);
+        let next = super::Lease::acquire(directory.path()).unwrap();
+        drop(next);
+        drop(inherited);
+    }
+}

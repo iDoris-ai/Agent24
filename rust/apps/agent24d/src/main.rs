@@ -29,6 +29,7 @@ mod grant_expiry;
 mod hardware;
 #[cfg(unix)]
 mod host_bootstrap;
+mod idoris_routes;
 mod knowledge_host;
 #[allow(dead_code)] // Wired at start (KB-C1-04 6c-4) and by the private interface (6d-2).
 mod knowledge_store;
@@ -144,6 +145,9 @@ fn main() -> std::process::ExitCode {
     // this process is a module's trampoline it becomes the module here, and
     // flagging its fds close-on-exec is race-free only while it has one thread.
     // An ordinary daemon start returns at once.
+    if std::env::args().nth(1).as_deref() == Some("__idoris-install-child") {
+        return agent24_idoris::install::run_install_child();
+    }
     agent24_os_proto::launch::run_as_trampoline_if_asked();
     tracing_subscriber::fmt()
         .with_env_filter(

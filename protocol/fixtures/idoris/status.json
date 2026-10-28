@@ -1,0 +1,9 @@
+{
+  "state": "running",
+  "version": "0.4.0",
+  "data_port": 8740,
+  "admin_port": 8741,
+  "roles": ["daily"],
+  "last_error": null,
+  "current_operation": null
+}

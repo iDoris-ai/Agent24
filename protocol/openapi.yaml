@@ -41,6 +41,8 @@ security:
   - bearerAuth: []
 
 tags:
+  - name: idoris
+    description: Host-only managed iDoris lifecycle (IL-10). CLI coverage deferred to IL-12.
   - name: system
     description: Health, version, and process-level daemon endpoints.
   - name: attached
@@ -3451,6 +3453,216 @@ paths:
         "504":
           $ref: "#/components/responses/CommTimeout"
 
+  /idoris/status:
+    get:
+      operationId: getIdorisStatus
+      tags: [idoris]
+      summary: Read managed installation and runtime state
+      x-tui-exemption: "IL-12: CLI lifecycle commands are implemented after IL-11."
+      description: |
+        ProductHost capability or legacy host bearer required; Creative is forbidden.
+        No caller-supplied executable, environment, path or credential is accepted.
+      responses:
+        "200":
+          description: Current non-sensitive projection
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdorisStatus"
+        "400":
+          $ref: "#/components/responses/IdorisFailure"
+        "401":
+          $ref: "#/components/responses/IdorisFailure"
+        "403":
+          $ref: "#/components/responses/IdorisFailure"
+        "409":
+          $ref: "#/components/responses/IdorisFailure"
+        "422":
+          $ref: "#/components/responses/IdorisFailure"
+        "502":
+          $ref: "#/components/responses/IdorisFailure"
+        "503":
+          $ref: "#/components/responses/IdorisFailure"
+        "504":
+          $ref: "#/components/responses/IdorisFailure"
+        "500":
+          $ref: "#/components/responses/IdorisFailure"
+
+  /idoris/start:
+    post:
+      operationId: startIdoris
+      tags: [idoris]
+      summary: Start the saved managed installation
+      x-tui-exemption: "IL-12: CLI lifecycle commands are implemented after IL-11."
+      description: |
+        ProductHost capability or legacy host bearer required; Creative is forbidden.
+        No caller-supplied executable, environment, path or credential is accepted.
+        Returns an operation even when the requested state is already reached.
+        A different operation during an active operation returns 409 busy.
+        An Idempotency-Key replay returns the original operation across daemon restarts.
+        A start interrupted by a daemon restart is recorded as cancelled; desired running state is restored separately.
+        Omit Idempotency-Key to create a fresh request identity.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: { type: string, minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9_-]+$" }
+      responses:
+        "202":
+          description: Lifecycle operation accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdorisOperation"
+        "400":
+          $ref: "#/components/responses/IdorisFailure"
+        "401":
+          $ref: "#/components/responses/IdorisFailure"
+        "403":
+          $ref: "#/components/responses/IdorisFailure"
+        "409":
+          $ref: "#/components/responses/IdorisFailure"
+        "422":
+          $ref: "#/components/responses/IdorisFailure"
+        "502":
+          $ref: "#/components/responses/IdorisFailure"
+        "503":
+          $ref: "#/components/responses/IdorisFailure"
+        "504":
+          $ref: "#/components/responses/IdorisFailure"
+        "500":
+          $ref: "#/components/responses/IdorisFailure"
+
+  /idoris/stop:
+    post:
+      operationId: stopIdoris
+      tags: [idoris]
+      summary: Stop the managed installation
+      x-tui-exemption: "IL-12: CLI lifecycle commands are implemented after IL-11."
+      description: |
+        ProductHost capability or legacy host bearer required; Creative is forbidden.
+        No caller-supplied executable, environment, path or credential is accepted.
+        Returns an operation even when the requested state is already reached.
+        A different operation during an active operation returns 409 busy.
+        An Idempotency-Key replay returns the original operation across daemon restarts.
+        A start interrupted by a daemon restart is recorded as cancelled; desired running state is restored separately.
+        Omit Idempotency-Key to create a fresh request identity.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: { type: string, minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9_-]+$" }
+      responses:
+        "202":
+          description: Lifecycle operation accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdorisOperation"
+        "400":
+          $ref: "#/components/responses/IdorisFailure"
+        "401":
+          $ref: "#/components/responses/IdorisFailure"
+        "403":
+          $ref: "#/components/responses/IdorisFailure"
+        "409":
+          $ref: "#/components/responses/IdorisFailure"
+        "422":
+          $ref: "#/components/responses/IdorisFailure"
+        "502":
+          $ref: "#/components/responses/IdorisFailure"
+        "503":
+          $ref: "#/components/responses/IdorisFailure"
+        "504":
+          $ref: "#/components/responses/IdorisFailure"
+        "500":
+          $ref: "#/components/responses/IdorisFailure"
+
+  /idoris/operations/{id}:
+    get:
+      operationId: getIdorisOperation
+      tags: [idoris]
+      summary: Read lifecycle operation progress
+      x-tui-exemption: "IL-12: CLI lifecycle commands are implemented after IL-11."
+      description: |
+        ProductHost capability or legacy host bearer required; Creative is forbidden.
+        No caller-supplied executable, environment, path or credential is accepted.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Current non-sensitive projection
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdorisOperation"
+        "400":
+          $ref: "#/components/responses/IdorisFailure"
+        "401":
+          $ref: "#/components/responses/IdorisFailure"
+        "403":
+          $ref: "#/components/responses/IdorisFailure"
+        "409":
+          $ref: "#/components/responses/IdorisFailure"
+        "422":
+          $ref: "#/components/responses/IdorisFailure"
+        "502":
+          $ref: "#/components/responses/IdorisFailure"
+        "503":
+          $ref: "#/components/responses/IdorisFailure"
+        "504":
+          $ref: "#/components/responses/IdorisFailure"
+        "500":
+          $ref: "#/components/responses/IdorisFailure"
+        "404":
+          $ref: "#/components/responses/IdorisFailure"
+
+  /idoris/operations/{id}/cancel:
+    post:
+      operationId: cancelIdorisOperation
+      tags: [idoris]
+      summary: Cancel a pending lifecycle start
+      x-tui-exemption: "IL-12: CLI lifecycle commands are implemented after IL-11."
+      description: |
+        ProductHost capability or legacy host bearer required; Creative is forbidden.
+        No caller-supplied executable, environment, path or credential is accepted.
+        Start cancellation waits for child cleanup before completing. Stop is not cancellable once cleanup begins. Completed operation cancellation is idempotent.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Current non-sensitive projection
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdorisOperation"
+        "400":
+          $ref: "#/components/responses/IdorisFailure"
+        "401":
+          $ref: "#/components/responses/IdorisFailure"
+        "403":
+          $ref: "#/components/responses/IdorisFailure"
+        "409":
+          $ref: "#/components/responses/IdorisFailure"
+        "422":
+          $ref: "#/components/responses/IdorisFailure"
+        "502":
+          $ref: "#/components/responses/IdorisFailure"
+        "503":
+          $ref: "#/components/responses/IdorisFailure"
+        "504":
+          $ref: "#/components/responses/IdorisFailure"
+        "500":
+          $ref: "#/components/responses/IdorisFailure"
+        "404":
+          $ref: "#/components/responses/IdorisFailure"
+
 components:
   securitySchemes:
     bearerAuth:
@@ -3539,6 +3751,12 @@ components:
       schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
 
   responses:
+    IdorisFailure:
+      description: Host authorization or lifecycle failure; stable error.code
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/IdorisError"
     CommInvalid:
       description: "invalid / confirm_required (400): bad input, or Hyphae user_error such as an unknown history cursor"
       content:
@@ -3714,6 +3932,59 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/ModuleProxyError" }
   schemas:
+    IdorisErrorCode:
+      type: string
+      enum: [not_installed, not_configured, instance_conflict, keychain_locked, key_unavailable, contract_mismatch, start_failed, stop_timeout, busy, cancelled, not_found, not_cancellable, shutting_down, invalid_request, persistence_failed]
+    IdorisError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              anyOf:
+                - $ref: "#/components/schemas/IdorisErrorCode"
+                - type: string
+                  enum: [unauthorized, forbidden]
+            message: { type: string }
+            retryable: { type: boolean }
+            next_action: { type: string }
+    IdorisStatus:
+      type: object
+      additionalProperties: false
+      required: [state, version, data_port, admin_port, roles, last_error, current_operation]
+      properties:
+        state:
+          type: string
+          enum: [not_installed, not_configured, stopped, starting, running, failed, instance_conflict]
+        version: { type: [string, "null"] }
+        data_port: { type: [integer, "null"], minimum: 1, maximum: 65535 }
+        admin_port: { type: [integer, "null"], minimum: 1, maximum: 65535 }
+        roles:
+          type: array
+          items: { type: string, enum: [daily, deep] }
+        last_error:
+          anyOf:
+            - $ref: "#/components/schemas/IdorisErrorCode"
+            - type: "null"
+        current_operation: { type: [string, "null"] }
+    IdorisOperation:
+      type: object
+      additionalProperties: false
+      required: [operation_id, action, phase, result, error_code, cancellable, idempotency_key]
+      properties:
+        operation_id: { type: string }
+        action: { type: string, enum: [start, stop] }
+        phase: { type: string, enum: [queued, starting, connecting, stopping, completed] }
+        result: { type: [string, "null"], enum: [succeeded, failed, cancelled, null] }
+        error_code:
+          anyOf:
+            - $ref: "#/components/schemas/IdorisErrorCode"
+            - type: "null"
+        cancellable: { type: boolean }
+        idempotency_key: { type: string }
     DomainOsView:
       type: object
       required: [name, namespace, version, enabled, state, granted, missing_models, resources, restart_required]

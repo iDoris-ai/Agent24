@@ -77,12 +77,36 @@ pub struct InstalledVersion {
 }
 impl InstalledVersion {
     #[cfg(test)]
-<<<<<<< HEAD
-    pub(crate) fn from_test_directory(directory: PathBuf) -> Self {
-=======
     pub(crate) fn fixture(directory: PathBuf) -> Self {
->>>>>>> origin/feat/idoris-il0708-supervisor
         Self { directory }
+    }
+
+    /// Revalidate a saved installation against the pinned archive before execution.
+    pub fn verify_existing(
+        directory: &Path,
+        lock: &IdorisLock,
+        archive: &VerifiedArchive,
+        signature: &dyn SignatureVerifier,
+    ) -> Result<Self, InstallError> {
+        signature.check_platform()?;
+        let asset = lock
+            .asset_for("aarch64-apple-darwin")
+            .ok_or(InstallError::UnsupportedPlatform)?;
+        validate_files(&asset.files)?;
+        let cancel = CancellationToken::new();
+        let bytes = read_archive_bytes(open_regular(&archive.path)?, &asset.sha256, &cancel)?;
+        let request = ChildRequest {
+            sha256: asset.sha256.clone(),
+            staging: PathBuf::new(),
+            files: asset.files.clone(),
+            limit: MAX_UNPACKED_BYTES,
+        };
+        let expected = scan_archive(&request, &bytes, false, &cancel)?;
+        verify_tree(directory, &expected, true, &cancel)?;
+        signature.verify(&directory.join("idoris"), &lock.team_id)?;
+        Ok(Self {
+            directory: fs::canonicalize(directory)?,
+        })
     }
 
     pub fn directory(&self) -> &Path {
