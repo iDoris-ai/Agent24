@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent24_protocol::state_file::AuthMode;
 use async_trait::async_trait;
@@ -21,7 +21,7 @@ use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Notify, Semaphore, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -72,6 +72,10 @@ pub const MAX_WAIT_SECONDS: u64 = 25;
 const TOMBSTONE_FOR: Duration = Duration::from_secs(120);
 /// Queue bound: a runaway requester cannot grow it without limit.
 const MAX_PENDING: usize = 64;
+/// Includes tombstones; reject new challenges rather than evict first-decision history.
+const MAX_RECORDS: usize = 128;
+/// Excess authenticated polls receive 429 and may retry after a slot is released.
+const MAX_ACTIVE_POLLS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Decision {
@@ -100,10 +104,45 @@ struct Inner {
     entries: HashMap<String, Entry>,
 }
 
-#[derive(Default)]
 pub struct DesktopPresence {
     inner: Mutex<Inner>,
     wake: Notify,
+    polls: Semaphore,
+}
+
+impl Default for DesktopPresence {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(Inner::default()),
+            wake: Notify::new(),
+            polls: Semaphore::new(MAX_ACTIVE_POLLS),
+        }
+    }
+}
+
+/// Dropping confirm (for example on UDS disconnect) must also retire its entry.
+struct PendingConfirmation<'a> {
+    presence: &'a DesktopPresence,
+    id: &'a str,
+}
+
+impl Drop for PendingConfirmation<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.presence.lock();
+        if let Some(entry) = inner.entries.get_mut(self.id)
+            && matches!(entry.phase, Phase::Waiting)
+        {
+            entry.phase = Phase::Expired;
+            entry.tx = None;
+        }
+        DesktopPresence::prune(&mut inner, Instant::now());
+    }
+}
+
+impl Entry {
+    fn expired(&self, now: Instant, wall_now: UnixSeconds) -> bool {
+        self.deadline <= now || self.req.expires_at <= wall_now
+    }
 }
 
 /// What `GET .../next` hands the desktop.
@@ -142,8 +181,13 @@ impl DesktopPresence {
     }
 
     fn prune(inner: &mut Inner, now: Instant) {
+        let wall_now = unix_now();
         inner.entries.retain(|_, entry| {
-            matches!(entry.phase, Phase::Waiting) || entry.deadline + TOMBSTONE_FOR > now
+            if matches!(entry.phase, Phase::Waiting) && entry.expired(now, wall_now) {
+                entry.phase = Phase::Expired;
+                entry.tx = None;
+            }
+            entry.deadline + TOMBSTONE_FOR > now
         });
         let entries = &inner.entries;
         inner.order.retain(|id| entries.contains_key(id));
@@ -154,6 +198,7 @@ impl DesktopPresence {
     fn take_next(&self, now: Instant) -> Option<Delivered> {
         let mut guard = self.lock();
         let inner = &mut *guard;
+        Self::prune(inner, now);
         for id in &inner.order {
             let Some(entry) = inner.entries.get_mut(id) else {
                 continue;
@@ -201,14 +246,16 @@ impl DesktopPresence {
     pub fn decide(&self, id: &str, allow: bool) -> Result<(), DecideError> {
         let now = Instant::now();
         let mut inner = self.lock();
+        Self::prune(&mut inner, now);
         let entry = inner.entries.get_mut(id).ok_or(DecideError::Gone)?;
         match entry.phase {
             Phase::Decided => return Err(DecideError::Conflict),
             Phase::Expired => return Err(DecideError::Gone),
             Phase::Waiting => {}
         }
-        if entry.deadline <= now {
+        if entry.expired(now, unix_now()) {
             entry.phase = Phase::Expired;
+            entry.tx = None;
             return Err(DecideError::Gone);
         }
         entry.phase = Phase::Decided;
@@ -259,7 +306,10 @@ fn outcome(decision: Decision) -> PresenceOutcome {
 impl PresenceProvider for DesktopPresence {
     async fn confirm(&self, req: PresenceRequest, cancel: CancellationToken) -> PresenceOutcome {
         let now = Instant::now();
-        let remaining = Duration::from_secs(req.expires_at.saturating_sub(unix_now()));
+        let wall_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let remaining = Duration::from_secs(req.expires_at).saturating_sub(wall_now);
         if remaining.is_zero() {
             return PresenceOutcome::TimedOut;
         }
@@ -277,7 +327,10 @@ impl PresenceProvider for DesktopPresence {
                 .values()
                 .filter(|e| matches!(e.phase, Phase::Waiting))
                 .count();
-            if waiting >= MAX_PENDING || inner.entries.contains_key(&id) {
+            if waiting >= MAX_PENDING
+                || inner.entries.len() >= MAX_RECORDS
+                || inner.entries.contains_key(&id)
+            {
                 return PresenceOutcome::Unavailable;
             }
             inner.order.push_back(id.clone());
@@ -292,6 +345,10 @@ impl PresenceProvider for DesktopPresence {
                 },
             );
         }
+        let _pending = PendingConfirmation {
+            presence: self,
+            id: &id,
+        };
         self.wake.notify_waiters();
         tokio::select! {
             got = &mut rx => got.map_or(PresenceOutcome::TimedOut, outcome),
@@ -346,6 +403,13 @@ pub async fn get_next(
     }
     let Ok(Query(query)) = query else {
         return error_response(StatusCode::BAD_REQUEST, "bad_request", "Invalid wait");
+    };
+    let Ok(_permit) = state.presence_desktop.polls.try_acquire() else {
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "presence_poll_limit",
+            "Too many active presence polls",
+        );
     };
     let wait = Duration::from_secs(query.wait.unwrap_or(MAX_WAIT_SECONDS).min(MAX_WAIT_SECONDS));
     match state.presence_desktop.next(wait).await {
@@ -531,6 +595,106 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_secs(25));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn dropped_confirm_releases_waiting_and_expired_records_are_pruned_by_poll() {
+        let presence = connected().await;
+        for n in 0..64 {
+            let id = format!("drop-{n}");
+            let task = spawn_confirm(&presence, request(&id, 60), CancellationToken::new());
+            presence.next(Duration::from_secs(1)).await.unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        assert!(
+            presence
+                .lock()
+                .entries
+                .values()
+                .all(|e| !matches!(e.phase, Phase::Waiting))
+        );
+        tokio::time::advance(Duration::from_secs(181)).await;
+        presence.next(Duration::ZERO).await;
+        assert!(presence.lock().entries.is_empty());
+        let task = spawn_confirm(
+            &presence,
+            request("recovered", 60),
+            CancellationToken::new(),
+        );
+        assert_eq!(
+            presence
+                .next(Duration::from_secs(1))
+                .await
+                .unwrap()
+                .challenge_id,
+            "recovered"
+        );
+        presence.decide("recovered", true).unwrap();
+        assert_eq!(task.await.unwrap(), PresenceOutcome::Allowed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prune_expires_waiting_even_if_confirm_has_not_resumed() {
+        let presence = connected().await;
+        let task = spawn_confirm(
+            &presence,
+            request("expired-waiting", 60),
+            CancellationToken::new(),
+        );
+        presence.next(Duration::from_secs(1)).await.unwrap();
+        let mut inner = presence.lock();
+        let now = Instant::now() + Duration::from_secs(61);
+        DesktopPresence::prune(&mut inner, now);
+        assert!(!matches!(
+            inner.entries["expired-waiting"].phase,
+            Phase::Waiting
+        ));
+        drop(inner);
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn total_records_are_bounded_even_after_decisions() {
+        let presence = connected().await;
+        for n in 0..128 {
+            let id = format!("done-{n}");
+            let task = spawn_confirm(&presence, request(&id, 60), CancellationToken::new());
+            presence.next(Duration::from_secs(1)).await.unwrap();
+            presence.decide(&id, true).unwrap();
+            assert_eq!(task.await.unwrap(), PresenceOutcome::Allowed);
+        }
+        assert_eq!(
+            presence
+                .confirm(request("overflow", 60), CancellationToken::new())
+                .await,
+            PresenceOutcome::Unavailable
+        );
+        assert_eq!(presence.lock().entries.len(), 128);
+        tokio::time::advance(Duration::from_secs(181)).await;
+        presence.next(Duration::ZERO).await;
+        assert!(presence.lock().entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn absolute_expiry_rejects_decision_before_rounded_monotonic_deadline() {
+        let presence = connected().await;
+        let task = spawn_confirm(
+            &presence,
+            request("wall-expiry", 60),
+            CancellationToken::new(),
+        );
+        presence.next(Duration::from_secs(1)).await.unwrap();
+        // Simulate the wall clock crossing expires_at while the monotonic deadline is still ahead.
+        presence
+            .lock()
+            .entries
+            .get_mut("wall-expiry")
+            .unwrap()
+            .req
+            .expires_at = unix_now();
+        assert_eq!(presence.decide("wall-expiry", true), Err(DecideError::Gone));
+        assert_eq!(task.await.unwrap(), PresenceOutcome::TimedOut);
+    }
+
     // -- HTTP ------------------------------------------------------------
 
     async fn call(
@@ -587,11 +751,71 @@ mod tests {
         let state = crate::server::tests::state().await;
         let token = state.token.to_string();
         let router = build_router(state);
-        let (status, body) = call(&router, Method::GET, NEXT, &token, None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body["error"]["code"], "not_found");
-        let (status, _) = call(&router, Method::POST, DECIDE, &token, Some(ALLOW)).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        for method in [
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+            Method::HEAD,
+        ] {
+            let unknown = call(
+                &router,
+                method.clone(),
+                "/api/v1/unknown-presence",
+                &token,
+                Some(ALLOW),
+            )
+            .await;
+            for uri in [NEXT, DECIDE] {
+                assert_eq!(
+                    call(&router, method.clone(), uri, &token, Some(ALLOW)).await,
+                    unknown,
+                    "{method} {uri}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn active_long_polls_are_bounded_and_aborting_releases_slots() {
+        let (state, host, _) = crate::server::tests::capability_state().await;
+        let presence = state.presence_desktop.clone();
+        let router = build_router(state);
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let router = router.clone();
+            let host = host.clone();
+            tasks.push(tokio::spawn(async move {
+                call(
+                    &router,
+                    Method::GET,
+                    "/api/v1/presence/challenges/next?wait=25",
+                    &host,
+                    None,
+                )
+                .await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while presence.polls.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            call(&router, Method::GET, NEXT, &host, None).await.0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        assert_eq!(
+            call(&router, Method::GET, NEXT, &host, None).await.0,
+            StatusCode::NO_CONTENT
+        );
     }
 
     #[tokio::test]

@@ -1189,16 +1189,6 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             axum::routing::put(crate::knowledge_host::push_credential)
                 .delete(crate::knowledge_host::revoke_credential),
         )
-        // CORE-2 AgentEar S3: the desktop main process long-polls challenges and
-        // answers them. ProductHost only; absent (404) in legacy mode.
-        .route(
-            "/api/v1/presence/challenges/next",
-            get(crate::presence_desktop::get_next),
-        )
-        .route(
-            "/api/v1/presence/challenges/{id}",
-            post(crate::presence_desktop::post_decision),
-        )
         .route("/api/v1/usage", get(crate::routes::get_usage))
         .route("/api/v1/timings", get(crate::routes::get_timings))
         .route(
@@ -1352,11 +1342,25 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             "/api/v1/peer/runs/{id}",
             get(crate::peer_runs::get_peer_run),
         )
-        .fallback(fallback)
-        .with_state(state.clone());
+        .fallback(fallback);
+
+    let kernel = if state.auth_mode == AuthMode::Capabilities {
+        kernel
+            .route(
+                "/api/v1/presence/challenges/next",
+                get(crate::presence_desktop::get_next),
+            )
+            .route(
+                "/api/v1/presence/challenges/{id}",
+                post(crate::presence_desktop::post_decision),
+            )
+    } else {
+        kernel
+    };
 
     // Modules first, auth last — see the doc comment above.
     kernel
+        .with_state(state.clone())
         .merge(modules)
         .layer(middleware::from_fn_with_state(state, auth))
 }
@@ -6675,7 +6679,7 @@ pub fn build_router_with_modules() {
             );
         }
 
-        let state = state().await;
+        let (state, host, _) = capability_state().await;
         let router = router_with_comm(state);
         let trace = Method::from_bytes(b"TRACE").unwrap();
         let mut templates = BTreeSet::new();
@@ -6689,7 +6693,7 @@ pub fn build_router_with_modules() {
                     Request::builder()
                         .method(trace.clone())
                         .uri(concrete_path(&template))
-                        .header(header::AUTHORIZATION, "Bearer testtoken")
+                        .header(header::AUTHORIZATION, format!("Bearer {host}"))
                         .body(Body::empty())
                         .unwrap(),
                 )

@@ -34,6 +34,28 @@ export interface PresenceDialogOptions {
   noLink: true
 }
 
+interface PresenceParent {
+  isDestroyed(): boolean
+  isMinimized(): boolean
+  restore(): void
+  show(): void
+  focus(): void
+}
+
+export async function showPresenceDialog<Parent extends PresenceParent>(
+  parent: Parent | null,
+  opts: PresenceDialogOptions,
+  signal: AbortSignal,
+  showBox: (parent: Parent, opts: PresenceDialogOptions & { signal: AbortSignal }) => Promise<{ response: number }>,
+): Promise<{ response: number }> {
+  if (!parent || parent.isDestroyed()) throw new Error('Trusted presence window unavailable')
+  if (signal.aborted) throw new Error('Presence challenge expired')
+  if (parent.isMinimized()) parent.restore()
+  parent.show()
+  parent.focus()
+  return showBox(parent, { ...opts, signal })
+}
+
 export interface PresencePollerDeps {
   connection: () => DaemonConnection | null
   fetch: typeof fetch
@@ -136,9 +158,7 @@ export class PresencePoller {
     this.loop = this.run(abort.signal)
   }
 
-  /** Stop polling and close any open dialog; resolves when the loop has ended.
-   *  A dialog the platform cannot close (macOS, no parent window) is not waited
-   *  for: its late answer is dropped by the `stopped` check in `ask`. */
+  /** Stop polling and close any open dialog; resolves when the loop has ended. */
   async stop(): Promise<void> {
     this.stopped = true
     this.abort?.abort()
@@ -236,7 +256,7 @@ export class PresencePoller {
       this.abort?.signal.removeEventListener('abort', onStop)
     }
     // Expired (or shutting down) while the box was up: the answer is late.
-    if (expiry.signal.aborted || this.stopped) return
+    if (expiry.signal.aborted || this.stopped || this.deps.nowMs() >= challenge.expires_at * 1000) return
     await this.answer(challenge.challenge_id, response === 0 ? 'allow' : 'deny', conn)
   }
 

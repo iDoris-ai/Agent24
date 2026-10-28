@@ -5,7 +5,7 @@ import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonConnection, setBundledPackaged, type BackendStatus } from './backend-manager'
-import { PresencePoller, defaultPresenceDeps } from './presence-poller'
+import { PresencePoller, defaultPresenceDeps, showPresenceDialog } from './presence-poller'
 import { AgentEarEventBridge } from './agentear-events'
 import { documentsEvent } from './documents'
 import { AgentEarEventLog } from './agentear-log'
@@ -298,13 +298,9 @@ app.whenReady().then(async () => {
   // token); a daemon without the routes answers 404 and is re-checked rarely.
   presencePoller = new PresencePoller(defaultPresenceDeps({
     connection: daemonConnection,
-    // Parent to the main window only while it is on screen: a sheet on a
-    // hidden window (app living in the tray) would never be seen.
     showDialog: (opts, signal) => {
-      const parent = mainWin && !mainWin.isDestroyed() && mainWin.isVisible() ? mainWin : null
-      return parent
-        ? dialog.showMessageBox(parent, { ...opts, signal })
-        : dialog.showMessageBox({ ...opts, signal })
+      if (!mainWin || mainWin.isDestroyed()) mainWin = createMainWindow()
+      return showPresenceDialog(mainWin, opts, signal, (parent, options) => dialog.showMessageBox(parent, options))
     },
   }))
   presencePoller.start()

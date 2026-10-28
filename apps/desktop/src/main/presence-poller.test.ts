@@ -8,6 +8,7 @@ import {
   IDLE_MS,
   NOT_SUPPORTED_MS,
   PresencePoller,
+  showPresenceDialog,
   parseChallenge,
   type PresenceChallenge,
   type PresenceDialogOptions,
@@ -176,9 +177,24 @@ describe('presence poller', () => {
     h.timers[0]!.fn() // the clock reaches expires_at
     expect(dialogSignal?.aborted).toBe(true)
     answer({ response: 0 }) // user clicks Allow a moment too late
-    await h.poller.stop()
+    await until(() => h.timers[0]?.cancelled === true)
     expect(h.posts).toEqual([])
+    await h.poller.stop()
     expect(h.timers[0]?.cancelled).toBe(true)
+  })
+
+  it('drops Allow at actual expiry even when the expiry timer has not fired', async () => {
+    let now = NOW_MS
+    let answer: (v: { response: number }) => void = () => {}
+    const h = harness({ polls: [() => json(challenge())], dialog: () => new Promise((resolve) => { answer = resolve }) })
+    h.deps.nowMs = () => now
+    h.poller.start()
+    await until(() => h.dialogs.length === 1)
+    now += 61_000
+    answer({ response: 0 })
+    await until(() => h.timers[0]?.cancelled === true)
+    expect(h.posts).toEqual([])
+    await h.poller.stop()
   })
 
   it('does not open a dialog for a challenge that has already expired', async () => {
@@ -326,5 +342,30 @@ describe('presence dialog strings', () => {
     expect(mt('presence.allow')).toBe('Allow')
     expect(mt('presence.deny')).toBe('Deny')
     expect(new Set((['en', 'zh', 'th'] as MainLocale[]).map((l) => MAIN_MESSAGE_TABLE[l]['presence.deny'])).size).toBe(3)
+  })
+})
+
+describe('trusted presence dialog parent', () => {
+  const opts: PresenceDialogOptions = { type: 'question', title: '', message: '', detail: '', buttons: [], defaultId: 1, cancelId: 1, noLink: true }
+
+  it('shows and focuses a hidden main window before opening its cancellable sheet', async () => {
+    const events: string[] = []
+    const parent = {
+      isDestroyed: () => false, isVisible: () => false, isMinimized: () => true,
+      restore: () => { events.push('restore') }, show: () => { events.push('show') }, focus: () => { events.push('focus') },
+    }
+    const signal = new AbortController().signal
+    await showPresenceDialog(parent, opts, signal, async (actualParent, actualOpts) => {
+      expect(actualParent).toBe(parent)
+      expect(actualOpts.signal).toBe(signal)
+      expect(events).toEqual(['restore', 'show', 'focus'])
+      return { response: 1 }
+    })
+  })
+
+  it.each([null, { isDestroyed: () => true, isMinimized: () => false, restore: vi.fn(), show: vi.fn(), focus: vi.fn() }])('never opens a parentless dialog for an unavailable window: %s', async (parent) => {
+    const showBox = vi.fn(async () => ({ response: 0 }))
+    await expect(showPresenceDialog(parent, opts, new AbortController().signal, showBox)).rejects.toThrow()
+    expect(showBox).not.toHaveBeenCalled()
   })
 })
