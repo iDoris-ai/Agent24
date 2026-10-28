@@ -2,6 +2,8 @@
 
 pub mod download;
 pub mod install;
+#[cfg(unix)]
+pub mod omlx_probe;
 
 use semver::Version;
 use serde::Deserialize;
