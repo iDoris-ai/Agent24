@@ -122,6 +122,23 @@ pub enum DomainError {
     /// base failing rather than the request being unacceptable.
     #[error("memory: {0}")]
     Memory(String),
+    /// P1-02c: a module tried to write a kind the kernel reserves for itself
+    /// (`assertion.*`, `mem.*`, `session.*`). Typed, with a stable code
+    /// (`memory_reserved_kind`), so it is never confused with a size refusal.
+    #[error("memory_reserved_kind: the kernel reserves this kind")]
+    MemoryReservedKind,
+    /// P1-02c (c2): the kernel could not persist a module's `remember`. `code` is
+    /// one of the stable `memory_*` codes (`memory_quota_rows`,
+    /// `memory_quota_bytes`, `memory_disk_full`, `memory_internal`, …) and
+    /// `dimension` is `"rows"`/`"bytes"` for a quota code. Typed on purpose: the
+    /// old `Store(String)` carried the storage error's `Display`, which spells out
+    /// the partition key, and a module could not tell "quota" from "disk" from
+    /// "bug". This variant holds NOTHING else — no key, no storage text.
+    #[error("{code}")]
+    MemoryWriteFailed {
+        code: &'static str,
+        dimension: Option<&'static str>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, DomainError>;

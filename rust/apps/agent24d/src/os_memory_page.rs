@@ -155,6 +155,23 @@ pub enum MemoryRpcError {
     /// A closed [`ErrorKind`] application error (rate limiting, timeout) —
     /// maps to `-32000` with that `kind`.
     Application(ErrorKind, String),
+    /// P1-02c: the module tried to write a kernel-reserved kind. Maps to
+    /// `-32602` carrying the stable code `memory_reserved_kind` in `data.code`.
+    ReservedKind,
+    /// P1-02c: a quota refusal. Maps to the same `-32000` / `quota_exceeded` as
+    /// before, now also carrying `data.code` (`memory_quota_rows|bytes`) and
+    /// `data.dimension`. No owner key.
+    Quota {
+        code: &'static str,
+        dimension: &'static str,
+        message: String,
+    },
+    /// P1-02c: SQLITE_FULL on the memory database. Maps to `-32603` carrying
+    /// `data.code = memory_disk_full`, so a module can tell it from a bug.
+    DiskFull,
+    /// P1-02c c4: the pre-write disk check refused the write. Same wire shape as
+    /// `DiskFull` but `data.code = memory_disk_low`.
+    DiskLow,
 }
 
 impl MemoryRpcError {
@@ -169,6 +186,23 @@ impl MemoryRpcError {
             Self::Invalid(m) => RpcError::invalid_params(m),
             Self::Store(m) => RpcError::internal(m),
             Self::Application(kind, m) => RpcError::application(kind, m),
+            Self::Quota {
+                code,
+                dimension,
+                message,
+            } => RpcError::application(ErrorKind::QuotaExceeded, message)
+                .with_data("code", serde_json::json!(code))
+                .with_data("dimension", serde_json::json!(dimension)),
+            Self::DiskFull => RpcError::internal("the memory store has no free disk space")
+                .with_data("code", serde_json::json!("memory_disk_full")),
+            Self::DiskLow => {
+                RpcError::internal("the memory store volume is low on free disk space")
+                    .with_data("code", serde_json::json!("memory_disk_low"))
+            }
+            Self::ReservedKind => RpcError::invalid_params(
+                "memory_reserved_kind: this kind is reserved by the kernel",
+            )
+            .with_data("code", serde_json::json!("memory_reserved_kind")),
         }
     }
 }
@@ -190,18 +224,21 @@ impl MemoryRpcError {
 /// allowlist to say anything about itself to a caller, rather than starting
 /// out exposed until someone remembers to audit it.
 pub(crate) fn map_memory_error(e: &MemoryError) -> MemoryRpcError {
+    let code = e.code();
     match e {
         // The one variant confirmed today to carry an internal identifier in
         // its `Display` (`agent24-memory/src/lib.rs`). The caller-visible
-        // message says only which dimension was exceeded; `owner` goes to
-        // `tracing` — an operationally-visible signal, not a JSON-RPC
+        // message says only which dimension was exceeded, and `data.code` /
+        // `data.dimension` give it in machine-readable form (P1-02c); `owner`
+        // goes to `tracing` — an operationally-visible signal, not a JSON-RPC
         // response an external caller controls the audience of.
         MemoryError::QuotaExceeded { owner, dimension } => {
             tracing::warn!(owner = %owner, dimension = %dimension, "memory quota exceeded");
-            MemoryRpcError::application(
-                ErrorKind::QuotaExceeded,
-                format!("memory {dimension} quota exceeded for this module"),
-            )
+            MemoryRpcError::Quota {
+                code: code.as_str(),
+                dimension,
+                message: format!("memory {dimension} quota exceeded for this module"),
+            }
         }
         // Every other variant: today's known-reachable ones on this path
         // (`Sqlx`, `Serde`) do not carry owner/partition keys, but "does not
@@ -210,7 +247,13 @@ pub(crate) fn map_memory_error(e: &MemoryError) -> MemoryRpcError {
         // match every time a variant's message wording changes.
         other => {
             tracing::error!(error = %other, "memory storage error");
-            MemoryRpcError::Store("an internal memory storage error occurred".into())
+            if code == agent24_memory::MemoryErrorCode::DiskFull {
+                MemoryRpcError::DiskFull
+            } else if code == agent24_memory::MemoryErrorCode::DiskLow {
+                MemoryRpcError::DiskLow
+            } else {
+                MemoryRpcError::Store("an internal memory storage error occurred".into())
+            }
         }
     }
 }
@@ -505,6 +548,13 @@ impl Reservation {
         self.committed = true;
     }
 
+    /// Keep the whole reservation spent: no refund at all. For a request that is
+    /// refused but must still cost a token (e.g. an audited reserved-kind probe),
+    /// so refusing cannot be repeated for free.
+    pub(crate) fn spend_in_full(mut self) {
+        self.committed = true;
+    }
+
     #[cfg(test)]
     pub(crate) fn scanned_for_test(&self) -> u32 {
         self.scanned
@@ -752,11 +802,20 @@ mod tests {
         assert!(
             matches!(
                 &mapped,
-                MemoryRpcError::Application(ErrorKind::QuotaExceeded, _)
+                MemoryRpcError::Quota {
+                    code: "memory_quota_rows",
+                    dimension: "rows",
+                    ..
+                }
             ),
             "{mapped:?}"
         );
         let rpc = mapped.into_rpc_error();
+        assert_eq!(rpc.kind, Some(ErrorKind::QuotaExceeded));
+        let data = rpc.data.clone().expect("quota error carries data");
+        assert_eq!(data["code"], "memory_quota_rows");
+        assert_eq!(data["dimension"], "rows");
+        assert!(!format!("{rpc:?}").contains(MARK), "{rpc:?}");
         assert!(
             !rpc.message.contains(MARK),
             "the caller-visible message must not contain the internal owner key: {:?}",
@@ -767,6 +826,55 @@ mod tests {
             "the message should still say which dimension was exceeded: {:?}",
             rpc.message
         );
+    }
+
+    /// A REAL SQLITE_FULL from the driver, through the wire mapping: a coded
+    /// `-32603` a module can tell apart from a bug, with none of the driver's
+    /// own text in it.
+    #[tokio::test]
+    async fn a_real_disk_full_maps_to_a_coded_internal_error() {
+        use sqlx::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let opts = <sqlx::sqlite::SqliteConnectOptions as std::str::FromStr>::from_str(&format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("full.db").display()
+        ))
+        .unwrap();
+        let mut conn = sqlx::sqlite::SqliteConnection::connect_with(&opts)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE t(x BLOB)")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA max_page_count = 8")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let mut failure = None;
+        for _ in 0..64 {
+            if let Err(e) = sqlx::query("INSERT INTO t VALUES(zeroblob(4096))")
+                .execute(&mut conn)
+                .await
+            {
+                failure = Some(e);
+                break;
+            }
+        }
+        let e = MemoryError::from(failure.expect("the tiny database must fill up"));
+        let rpc = map_memory_error(&e).into_rpc_error();
+        assert_eq!(rpc.code, -32603);
+        assert_eq!(rpc.data.as_ref().unwrap()["code"], "memory_disk_full");
+        assert!(!rpc.message.contains("full database"), "{}", rpc.message);
+        assert!(!rpc.message.contains("sqlite"), "{}", rpc.message);
+    }
+
+    #[test]
+    fn disk_low_maps_to_a_typed_memory_disk_low_rpc_error_not_internal() {
+        let rpc = map_memory_error(&MemoryError::DiskLow).into_rpc_error();
+        assert_eq!(rpc.code, -32603);
+        assert_eq!(rpc.data.as_ref().unwrap()["code"], "memory_disk_low");
+        assert!(!rpc.message.contains("sqlite"), "{}", rpc.message);
     }
 
     #[test]

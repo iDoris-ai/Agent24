@@ -4,7 +4,8 @@
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import type { components } from '@agent24/api-client'
-import { describeError, getImportState, nudge, startImport, subscribeImport } from './importStore'
+import { canCancel, canRetry, cancelImport, describeError, getImportState, nudge, retryImport, startImport, subscribeImport } from './importStore'
+import DocumentDetail from './DocumentDetail'
 import { useT } from '../../i18n'
 import { documentsMessages } from './Documents.i18n'
 
@@ -33,6 +34,12 @@ export default function DocumentsPage() {
   const [loadingMore, setLoadingMore] = useState(false)
   const [listError, setListError] = useState<string | null>(null)
   const [unavailable, setUnavailable] = useState<string | null>(null)
+  const [open, setOpen] = useState<string | null>(null)
+  // The title that opened the details, given focus back when they close;
+  // the page's title if a reload has since taken its row away (a document
+  // from a later page is not on the new first one).
+  const opener = useRef<HTMLButtonElement | null>(null)
+  const pageTitle = useRef<HTMLDivElement>(null)
   // Each reload starts a new generation; a reply from an older one (or from
   // an unmounted page) is dropped, so pages never mix or repeat.
   const generation = useRef(0)
@@ -102,7 +109,7 @@ export default function DocumentsPage() {
   const { importing, progress, job, error } = imp
   return (
     <div className="content">
-      <div className="page-title" role="heading" aria-level={1}>
+      <div className="page-title" role="heading" aria-level={1} tabIndex={-1} ref={pageTitle}>
         {t('title')}
       </div>
       <p style={{ color: 'var(--muted)', fontSize: 12 }}>{t('subtitle')}</p>
@@ -125,11 +132,30 @@ export default function DocumentsPage() {
               : STATUS_LABELS[job.status] ? t(STATUS_LABELS[job.status]) : job.status}
           </span>
         )}
+        {canCancel(imp) && (
+          <button className="btn btn-ghost" onClick={() => void cancelImport(api)} disabled={imp.acting}>
+            {t('import.cancel')}
+          </button>
+        )}
+        {canRetry(imp) && (
+          <button className="btn btn-ghost" onClick={() => void retryImport(api)} disabled={imp.acting}>
+            {t('import.retry')}
+          </button>
+        )}
       </div>
       {(error || listError) && (
         <div role="alert" style={ALERT}>
           {error ?? listError}
         </div>
+      )}
+      {open && (
+        <DocumentDetail
+          documentId={open}
+          onClose={() => {
+            setOpen(null)
+            ;(opener.current?.isConnected ? opener.current : pageTitle.current)?.focus()
+          }}
+        />
       )}
       {docs.length === 0 ? (
         <p style={{ color: 'var(--muted)' }}>{t('list.empty')}</p>
@@ -145,7 +171,11 @@ export default function DocumentsPage() {
           <tbody>
             {docs.map((d) => (
               <tr key={d.document_id}>
-                <td style={CELL}>{d.title}</td>
+                <td style={CELL}>
+                  <button className="btn btn-ghost" onClick={(e) => { opener.current = e.currentTarget; setOpen(d.document_id) }} aria-pressed={open === d.document_id}>
+                    {d.title}
+                  </button>
+                </td>
                 <td style={CELL}>{d.media_type}</td>
                 <td style={CELL}>{new Date(d.created_at).toLocaleString()}</td>
               </tr>

@@ -18,6 +18,190 @@ All notable changes to Agent24 are documented here. This project adheres to
   调用点的行为**；版本号 `0.5.1` 只是跟随当前 workspace 其它 crate 的统一版本号起步，本身
   不代表一次发布。
 
+## [0.6.0-preview.20261028.1] — 2026-10-28（预发布）
+
+**预发布（pre-release）体验版，不是 0.6.0 正式版。** 一次带入五条里程碑线，按合入 main 的顺序：
+kernel（K1 第二次发布）、memory-p1、documenting、weknora（Knowledge）、idoris（iDoris v0.3.1 接线）；另有发布前加固 #1358/#1364 和日程 tick 索引 P-13 #1381。清单里的版本号统一
+升到 `0.6.0`，`-preview.20261028.1` 只出现在 tag 和发布物文件名里（与 `v0.5.1-preview.20261016.2`
+同做法）。`agent24-os-sdk`、`agent24-os-fd`、`agent24-os-cwd`、`agent24-workspace`、
+`agent24-sidecar-host*`、`agent24-documents` 仍是各自独立的 `0.1.0` 版本线。
+
+**数据库迁移（升级前先复制 `~/.agent24`；这些迁移都不可回退）**
+
+| 来源 | 库 | 迁移 |
+|---|---|---|
+| kernel（#1280） | memory | `0018_assertion_source_ref`（`mem_assertions` 只加一列 `source_ref`，旧断言为 NULL，读作 Unknown） |
+| kernel（#1280） | store | `0019_module_consent_scope` … `0026_backfill_self_wake_origin`（共 8 个） |
+| documenting | documents（`agent24-documents` 自带库） | `0007_job_acceptances`、`0008_job_revocations` |
+| weknora | knowledge（新库 `knowledge.db`，目录 `rust/apps/agent24d/knowledge_migrations/`） | `0001_log`（Provider 日志与 seal，#1336）；新库，不影响既有库 |
+| memory-p1（#1341） | memory | `0019_retract_quota_exempt`、`0020_write_rejections` |
+| memory-p1（#1341） | store | `0027_run_message_origins`、`0028_run_message_origin_kinds`、`0029_run_message_origin_host_system` |
+| main（P-13，#1381） | store | `0030_schedules_tick_index`（日程 tick 的两个部分索引，只建索引不改数据） |
+
+合入后迁移目录连续：store `0001–0030`，memory `0001–0020`，documents `0001–0008`。
+
+**升级注意：开发机需要重置本地库的情形**
+- 跑过 **memory-p1 改号（#1298）之前** 的 `ab/memory-p1` 开发版的机器，库里记着旧编号
+  （memory `0018`、store `0021–0023`），与本次发布的同号迁移内容不同。**store 库不一致时启动直接失败**；**memory 库不一致时 daemon 照常启动，但记忆被关闭，只在日志里留一条 WARN**，界面上表现为「记忆不可用」，不会弹明确报错（10-27 验收 X-04 实测）。
+  **重置本地库**（或用 `AGENT24_DATA_DIR` 隔开）。
+- 跑过 `ab/kernel` 开发版中间提交（`cf8ccd48` 到 `2d078753` 之间）的库同理（K1 矩阵 §6 第 4 条，
+  David 决定不做兼容，清库）。
+- 从 `v0.5.1` 或 `v0.5.1-preview.20261016.2` 升上来的库正常迁移，无需重置。
+
+**本版已知缺口（按验收第 7 节逐条处置；这些能力本版不对用户宣称）**
+- **模块工具授予（kernel，G-K1）**：授予 POST 默认关闭（要设 `A24_MODULE_TOOL_GRANTS=1`），桌面和 CLI 都没有授予入口，仓库里也没有协议 4 的示例模块。相关行为只有 CI 测试覆盖。
+- **run 路径的记忆回执（memory，G-M5）**：配额满时 run 照常 `completed`，桌面和 TUI 都不提示记忆没写进去（P1-03，下一期）。
+- **普通轮次记忆写失败（memory，G-M1）**：桌面 Chat 不显示「本轮未保存到记忆」。
+- **文档的对话入口（documenting，G-D1/G-D2）**：七个文档工具已实现，但 `domain-os.yml` 还没声明 `tools:`（协议仍为 2），agent 调不到；文档导入、操作、预览经 CLI 和桌面照常可用。
+
+### kernel —— K1 内核第二次发布（#1280；上次进 main 是 #1022，2026-10-16）
+
+固定在 `release/kernel-k1-r2-20261026`（`27acdd72`，#1278 之后）。#1277、K1-6b.5f 系列不在本次。
+
+**新功能**
+- **K1-6a-G 模块工具的内核授予路径**（设计 #1121、#1125、#1202）：授予带资源集合、制品身份与
+  写入代次（#1141、#1143、#1144）；模块包有制品身份（#1133、#1138）；启用纪元，重新启用后旧授予判
+  Stale（#1155、#1157）；逐次审批绑定 `authorization_ref`（#1140）；撤销、到期、换发、拒绝时停掉在途
+  调用（#1134、#1139）；撤销和到期会通知模块并记录它是否停下（#1182、#1190、#1191）；结束通知带
+  引用（发件箱、补发、只发给本次运行：#1222、#1227、#1231、#1236）；确认卡片与授予 POST
+  （#1160、#1172、#1176）；收尾修复 #1237、#1239。
+- **协议**：manifest 的 `resource_kinds` 为协议 3，按引用停为协议 4，`DAEMON_PROTOCOL_VERSION = 4`
+  （#1132、#1227）。协议 1、2 的模块照常连接；只有声明协议 4 的模块才能拿到授予。
+- **K1-6b 来源分类与出口门**：统一出站判定（#783）、记忆来源引用与独立敏感分类（#874、#1199、
+  #1200）、工具出口按来源分类判定（#1180）、会话来源下限（#1203）、self-wake 带上创建它的那次运行
+  的分类（#1204、#1278）、peer 视图只放行自成一体的 run（#1243）、MCP server 与 ACP 桥改读 peer
+  视图（#1266）、逐出口矩阵与测试（#1209、#1216、#1220、#1235、#1244）。
+- **根外写入**：取定目录时任何一级都不跟随符号链接，恢复路径重新询问（#1270、#1274）。
+- **法律与设计文档**：L-APPR-7 就地修订（#1183，jason 2026-10-24 同意）；ADR-K1-01..04 已接受
+  （#766）；ADR-K1-03 断链修正（#1081）；K1-6b.1/.2 与 K1-6a 前序（#743–#792、#856）。
+
+**行为变化（需要知道）**
+1. 没有制品身份的旧授予（`artifact` 为 NULL）派发时一律按 Stale 拒绝，要重新确认。从 main 升级的
+   库里没有这类授予，只影响 `ab/kernel` 开发版留下的库。**已知局限 #1290**：授予列表仍显示
+   `granted`，派发门照样拒绝（失败即关闭）；修复进下一次发布。
+2. **授予 POST 默认关闭**，宿主设 `A24_MODULE_TOOL_GRANTS=1` 才打开（上限 `A24_MODULE_GRANT_MAX_DAYS`，
+   默认 30 天，最多 90 天）；临时（ephemeral）daemon 一直关闭。
+3. **MCP server 与 ACP 桥只看得到自成一体的 run**。用过记忆、工具或来源不明的 run 不给外部工具看，
+   提示 `content is not shared with connected tools; open it in Agent24 to see it`。
+4. 升级前留下的 self-wake（未触发的，或已删除只剩 run 的）按来源 unknown 处理（0026）；出口门收紧，
+   peer 视图里看不到。
+5. 没有 HOME 时，`agent24 os install` / `uninstall` 照常完成并说明授予没有撤销（main 上会报错退出）。
+   启用时先推进启用纪元，停用时先撤销再交出停止；停用撤销失败仍返回 `consent_revocation_failed`。
+
+### documenting —— Documenting 第 1 片之后（上次进 main 是 r5，#1068）
+
+> 任务描述里写的上次发布是 #979（r4）；git 上 r5 `#1068`（`release/documenting-slice1-r5`）之后才是
+> 实际的上一次进 main，范围按 r5 之后算。
+
+**新功能**
+- **文档模块工具**（DOC-1-25..34）：设计与 ADR-DOC-01/02 契约修订（#1082）；入口骨架
+  `POST /_a24/tools/{op}`（#1090）；`documents.list / get / job_get`（#1097）、`read_range / find`（#1098）、
+  `extraction_get`（#1104）、`extract`（#1109，oplog 与认领同一事务，#1099）；工具按
+  `authorized_resources` 校验（#1126）；存储重开与调用方脱钩（#1092）。
+- **授权结束时停下**（DOC-1-37..39）：文本层构建记下请求方并可按请求方中止（#1194）；每个 job
+  attempt 记下接受它的工具调用（#1201，迁移 `0007`）；在途调用登记、构建停止优先（#1206）；接收授权
+  结束通知并停掉在途调用、作业与构建（#1213，迁移 `0008`）；撤销通知按引用停（#1234、#1240）。
+  **依赖 kernel 的协议 4**，所以必须在 kernel 之后合入。
+- **导入体验**：导入的取消与重试（#1186）；文档详情与文字预览（#1192、#1218）。
+- **CLI 与桌面端共用文档逻辑**（DOC-1-41..46）：新增 `agent24-documents-client` crate（#1313）；
+  `agent24 documents import` 与本机 HTTP transport（#1321）；documents 其余操作的 CLI 入口与共享
+  路由（#1334）；桌面端文档导入和其余操作改为调用 CLI，**删除桌面端 TS 里的路由与 HTTP 实现**
+  （#1325、#1343）；#1345 收 PR-Daemon 的 Low。这是 #1293 完整用例验收的前提：CLI 通过即视为
+  桌面端这部分通过。
+- **其他**：统一主对话与知识验收里程碑设计 KB-C0（#906）；稳定偶发测试（#1106、#1212、#1214、#1217）。
+
+**破坏性变更**：桌面端不再带 TS 版文档路由；自建脚本如果依赖 `documents-import.ts` 的内部实现，改走
+`agent24 documents ...`。
+
+**本次不对外（#1386）**：上面「文档模块工具」与「授权结束时停下」两条已合入，但 `domain-os.yml` 没声明
+`tools:`（#705 余下部分），内核授予也默认关闭，agent 看不到这些工具；什么时候开放单独走 #705。
+
+**其他变化（#1386）**：mac 包把 `agent24` 也列进 `mac.binaries`，release 脚本与签名校验两个后端二进制
+都处理（#1375）；桌面包多一个 `backend/agent24`。**不要退回 r5**：r5 打不开 r6 迁移过的库（文档请求
+返回 `storage_unavailable`，数据未被改动，装回 r6 即恢复）。
+
+### weknora —— Knowledge（私有知识库）首次进 main
+
+**新功能**
+- **只读契约 `CONTRACT-READONLY-v1`**（r8 → r10）与机器 schema、夹具、TS/Rust 双边校验
+  （KB-CT-02a/b，#1044、#1053–#1065、#1128、#1131）；状态机、UI 桥、写操作语义三份契约规范核心
+  （KB-CT-03，#1113–#1115）；Knowledge 对 K1 的依赖与私有数据禁用门（#1091）。
+- **新 crate `agent24-knowledge`**（KB-C1-02a，#1110–#1112、#1122、#1124、#1127）：wire 类型、
+  `KnowledgeTransport` trait 与 `MockTransport`（#1156）；`HttpTransport` 禁代理与重定向、字节上限流式
+  读取、deadline、凭据只发往 base URL（#1161、#1169）。
+- **宿主侧私有 Knowledge 接口**（KB-HOST-01，#1177、#1184、#1196、#1198、#1207、#1215、#1219、
+  #1224）：daemon 凭据与端点分离、桌面以 capabilities 模式拉起 `agent24d`、binding 激活与停用、短期
+  凭据推送与作废、长期登录态存储（`safeStorage` 加密文件）、`RunCreate.knowledge_binding_id`、
+  没有 binding 的 run 不广告需要 binding 的工具。
+- **Provider 状态机**（KB-C1-04，#1221、#1223、#1225–#1233、#1238、#1260、#1265、#1267、#1276、
+  #1279、#1289、#1297、#1303、#1305、#1307、#1312、#1315、#1318、#1320、#1327–#1330、#1336–#1340）：
+  服务状态派生、generation 与作废、撤权窗口、持久化账本与按序重放、重启判定、证据纪元与删除墓碑、
+  Provider 编排（Off/On、选用、新建 binding、身份变化、签发）、`knowledge.db` 日志与 seal。
+- **工具层**（KB-C1-05，#1232、#1242、#1264、#1269）：`knowledge.search / read` 的调用层，结果按
+  「数据不是指令」包裹，分块续读拼成整段引用，发送前长度上限。
+- 设计带入与任务方案 v2.1（KB-C0-01，#1171、#1174）；吸收 main（#1032、#1102）；稳定
+  `get_timings` 测试（#1211）。
+
+**行为变化（需要知道，#1396）**
+1. **桌面托管的 daemon 改为 capabilities 模式**（macOS、Linux；Windows 仍 legacy）：桌面开着时，CLI 的
+   `models / chat / tui / daemon stop` 报 `host authority unavailable`，`daemon status` 拿不到关停报告。
+   这是对用户可见的退步，是否接受由 David 定。
+2. 桌面崩溃或被强杀时，它托管的 daemon 随之停下（stdin 即父进程租约，EOF 即关机）。
+3. `POST /api/v1/runs` 的 `RunInput` 新增 `knowledge_binding_id`；非宿主调用方指名 binding 返回 403
+   `host_authority_required`，binding 未激活返回 409 `knowledge_binding_inactive`。新增宿主私有接口
+   `/api/v1/host/knowledge/*`（渲染进程代理拒绝转发，403 `host_interface_private`）与 capability
+   `knowledge.host`。
+4. 新保留路径段 `host`：叫 `host` 的 attached 模块注册会被拒（400 `invalid_manifest`），升级前已有的同名模块
+   也不再加载，需改名后重装。
+5. 单实例：数据目录被另一宿主占用时桌面托盘显示「被占用」。
+6. **不能退回旧版本**：本次带着 store 迁移 0030（P-13，#1381），旧内核读不了迁移后的库。
+
+**迁移 / 破坏性变更**：只新增 `knowledge.db`（`0001_log`），不动既有库。新增 crate 与 `agent24-protocol`
+的 Knowledge 类型是增量，不改现有接口。
+
+### memory-p1 —— 记忆 P1（#1341）
+
+**新功能**
+- **R05 来源契约**：消息与来源、快照与来源同一事务（#1168、#1181）；运行中消息写入 Assistant 与
+  ToolResult 来源（#1195）；HostSystem 来源（store 迁移 `0029`，原编号 `0023`，#1251）；发送副本按
+  已落盘来源 kind 整形（#1250）；**来源无法证明时不发送**（#1197）；**非 assistant 回合不执行工具**
+  （#1205）；冷恢复矩阵补测（#1261）。
+- **H02 重申审计修复**：同秒重申分配独立事件 ID（#1152）、新重申事务补齐当前审计证明（#1153）、
+  存量重申缺当前审计时按有界事件链兼容（#1154）、chat 产品路径回归（#1263）。
+- **P1-02c 配额与失败**：c0 容量实测（#1273）；c1 满额后撤回仍可用，personal 撤回豁免配额
+  （memory 迁移 `0019`，原编号 `0018`，#1275）；c2a 写失败类型化错误码，撤回 507/422、不泄露分区键
+  （#1284）；c2b chat/run 记忆回执三态 `not_saved / partial`、`memory_persisted`（#1285）；c3 写入拒绝
+  留痕，`mem_write_rejections` 限频环形加有界异步队列（memory 迁移 `0020`，#1302；会话缺口表接线留
+  c3b，不在本次）；c4 写前磁盘门 `memory_disk_low`（#1296）；c5 空闲时 WAL checkpoint（#1283）。
+- 迁移改号（#1298）：吸收 main 并避开 kernel 占用的编号。设计与 ADR 文档：P1-01 生命周期（#1149、
+  #1247）、P1-02b/c（#1165、#1271）、R05 系列、PLAN-MEMORY-P1 核销（#1253、#1268）。
+
+**行为变化 / 迁移说明**
+- chat/run 的记忆回执新增类型化三态；`write_failed` 保留过渡兼容，调用方应改读 `memory_persisted`。
+- 记忆写失败返回类型化错误码（撤回 507/422，磁盘不足 `memory_disk_low`），不再是笼统错误。
+- 满额后撤回不再失败（ADR 要求），撤回不占配额。
+
+**不在本次**：c3b（会话缺口接线）、c6（依赖 CORE-2 在场证明）、P1 剩余条目；kernel 的 #1277、K1-6b.5f
+系列与 #1290 修复。
+
+### idoris —— iDoris v0.3.1 接线（#1405，与 iDoris v0.3.1 联合发布）
+
+**新功能**
+- **独占本地网关**：设置 `IDORIS_URL` 和 data key（`IDORIS_API_KEY`，必须是 `idk_` 开头的 virtual key，Admin token 不行）后，所有模型调用只走 iDoris 网关。网关失败原样报错，**不回落**到 oMLX/Ollama 直连或云端（IDORIS-02a/02-04）。
+- **本地证据校验**：启动时校验 `/health` 身份（`service=idoris`、`contract_version=1.0.1`）；每个响应都校验 `X-iDoris-Served-Locality=loopback` 和 Record-Id 的格式；证据头重复或不是合法 UTF-8 一律拒绝（IDORIS-03、#1409）。
+- **回执**：chat 保留网关返回的真实 `response.model`、Record-Id 和 locality，CLI 打印 Record-Id，方便查询和报障（IDORIS-04）。每次调用单独签发 `X-iDoris-Request-Id`，准入 id 走 `X-iDoris-Trace-Id`。
+- **预算导出**：`agent24 hw idoris-env` 计算扣除 core 预留后的字节预算，交给手动启动的 iDoris（`IDORIS_ALLOCATED_BUDGET_BYTES`，IDORIS-05；手动启动步骤见 `docs/agent/IDORIS-MANUAL-BUDGET.md`）。硬件探测子进程不继承凭据（IDORIS-04b）。
+- 错误提示：401 指向 data key，403 指向 role 权限，503 `local_only_unavailable` 提示本地没有可用模型（#1420，ID-8 真机发现）。
+
+**配对与验收**：iDoris v0.3.1（tag `8e3a216`，`idoris-v0.3.1-aarch64-apple-darwin.tar.gz`，sha256 `1125301fc32f9e44d4d06e5127137ba14196a32f9274b7416a345e690b2ffea1`）。Agent24 不打包 iDoris，需要用户自己安装。ID-8 已在 M1 Max 上接真实 oMLX 0.6.4 跑通：`idoris/daily` → `Qwen3-0.6B-4bit`，locality=loopback，日志里没有 key。iDoris 侧证据见 #1370。
+
+**已知限制**
+- iDoris 的 resident 卡不带 oMLX key（iDoris#582，v0.3.2 修）；oMLX 开了认证时，role 卡请保持 `on_demand`。
+- 网关忽略 `temperature`（网关路径不发送这个字段）。
+- 服务模式（`agent24 service install`）不保存 `IDORIS_API_KEY`，只支持手动启动。
+- 共同 launcher、Admin token FD 交接、`idoris-any`、流式输出：本期都不做。
+- iDoris v0.3.2 的 502 `upstream_auth_failed` 终态映射（ID-ERR-1）下一期做。
+
 ## [0.5.1] — 2026-10-01
 
 **DEP-A「现在就能做」阶段收口：CLI 四平台发布流水线 + 桌面端 Linux 包**。自 0.5.0 起主要是

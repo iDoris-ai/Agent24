@@ -1,0 +1,5 @@
+{ "$comment": "R6.1, R6.4: the request body is not valid JSON (request holds the raw body text), so nothing can be echoed.",
+  "op": "knowledge.search",
+  "request": "{ \"protocol_version\": 1, \"request_id\": \"01JB3V0A1B2C3D4E5F6G7H8J9K\", \"generation\": ",
+  "response": { "status": 400, "body": { "error": { "code": "invalid_request", "message": "The request is not valid.",
+    "details": { "retryable": false, "request_id": null, "generation": null } } } } }

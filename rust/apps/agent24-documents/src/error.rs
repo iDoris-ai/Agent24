@@ -131,6 +131,18 @@ impl ApiError {
         )
     }
 
+    /// 413: a single entry (a list row, a job) over the page's byte budget;
+    /// the entry is never cut (DOC-1-06b §2).
+    #[must_use]
+    pub fn over_budget(budget: usize) -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            format!("a single entry is over the {budget}-byte page budget"),
+            false,
+        )
+    }
+
     /// 409: a chunk that neither appends nor replays (§5.6). `received_offset`
     /// is the upload's `received`, which 0001's CHECK keeps ≥ 0.
     #[must_use]
@@ -212,6 +224,12 @@ impl ApiError {
     #[must_use]
     pub fn code(&self) -> &'static str {
         self.code
+    }
+
+    /// `details.retryable`, which every constructor sets.
+    #[must_use]
+    pub fn retryable(&self) -> bool {
+        self.details.get("retryable") == Some(&Value::Bool(true))
     }
 }
 

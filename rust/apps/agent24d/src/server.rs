@@ -40,6 +40,9 @@ pub struct AppState {
     /// router is built.
     pub auth_mode: AuthMode,
     pub capabilities: Option<crate::capabilities::CapabilityStore>,
+    /// KB-HOST-01: the Knowledge bindings the product host activated, in
+    /// memory only (see `crate::knowledge_host`).
+    pub knowledge_host: Arc<crate::knowledge_host::KnowledgeHostRegistry>,
     /// D2 router: every model call goes through tier routing + health/cooldown,
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
@@ -392,6 +395,7 @@ impl agent24_scheduler::RunTrigger for KernelTrigger {
                     // to approve the plan, so a fired schedule always runs
                     // Normal.
                     mode: agent24_protocol::RunMode::Normal,
+                    knowledge_binding_id: None,
                 };
                 match self
                     .runs
@@ -666,6 +670,7 @@ impl AppState {
             token: Arc::new(token),
             auth_mode: AuthMode::LegacySingleToken,
             capabilities: None,
+            knowledge_host: Arc::new(crate::knowledge_host::KnowledgeHostRegistry::default()),
             mcp_servers: Arc::new(mcp_servers),
             router,
             tools,
@@ -797,6 +802,7 @@ fn operation_name(operation: crate::capabilities::Operation) -> &'static str {
         Operation::ModuleAdmin => "module.admin",
         Operation::CapabilityMint => "capability.mint",
         Operation::CapabilityRevoke => "capability.revoke",
+        Operation::KnowledgeHost => "knowledge.host",
         Operation::Shutdown => "shutdown",
         Operation::ModelsRead => "models.read",
         Operation::WorkspaceResolve => "workspace.resolve",
@@ -1023,7 +1029,7 @@ async fn auth(State(state): State<AppState>, mut req: Request<Body>, next: Next)
 /// Capability policy is deliberately closed. Until durable workspace/session
 /// ownership lands, Creative can use only the global model catalogue. Every
 /// other existing or future route maps to a host-only operation by default.
-fn required_operation(method: &Method, path: &str) -> crate::capabilities::Operation {
+pub(crate) fn required_operation(method: &Method, path: &str) -> crate::capabilities::Operation {
     use crate::capabilities::Operation;
     if method == Method::GET && path == "/api/v1/models" {
         Operation::ModelsRead
@@ -1034,6 +1040,10 @@ fn required_operation(method: &Method, path: &str) -> crate::capabilities::Opera
         && path.ends_with("/revoke")
     {
         Operation::CapabilityRevoke
+    } else if path.starts_with("/api/v1/host/knowledge/") {
+        // Host-only, and never in the Creative allow-list; the handlers also
+        // refuse legacy mode and any non-host audience (crate::knowledge_host).
+        Operation::KnowledgeHost
     } else {
         Operation::ModelsAdmin
     }
@@ -1080,6 +1090,18 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         .route(
             "/api/v1/capabilities/{capability_id}/revoke",
             post(revoke_capability),
+        )
+        // The desktop's generic proxy refuses these by their raw path
+        // (`reachesHostInterface`); that holds only while routing matches the
+        // raw path, so never decode or normalize the path before routing.
+        .route(
+            "/api/v1/host/knowledge/bindings/{binding_id}",
+            axum::routing::put(crate::knowledge_host::change).delete(crate::knowledge_host::change),
+        )
+        .route(
+            "/api/v1/host/knowledge/bindings/{binding_id}/credential",
+            axum::routing::put(crate::knowledge_host::push_credential)
+                .delete(crate::knowledge_host::revoke_credential),
         )
         .route("/api/v1/usage", get(crate::routes::get_usage))
         .route("/api/v1/timings", get(crate::routes::get_timings))
@@ -1243,6 +1265,94 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         .layer(middleware::from_fn_with_state(state, auth))
 }
 
+/// The legacy-mode `ready` line. With `omit_token` (B3 / S-04: the LaunchAgent
+/// persists stdout to a log file) the bearer is left out — it is still in the
+/// 0600 `daemon.json`, which is where the CLI of a service-run daemon reads it.
+fn legacy_ready_line(
+    port: u16,
+    token: &str,
+    omit_token: bool,
+    generation: &str,
+) -> serde_json::Value {
+    let mut ready = serde_json::json!({
+        "type": "ready",
+        "port": port,
+        "auth_mode": "legacy_single_token",
+        "generation": generation,
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    if !omit_token {
+        ready["token"] = serde_json::json!(token);
+    }
+    ready
+}
+
+/// B1 (REVIEW-TODO PR-B, R4 / C-03): DNS-rebinding and browser-CSRF defence for
+/// the REST surface. Layered OUTSIDE [`build_router`] by `serve` (the only
+/// place the real bound port is known), so it runs before `auth` and covers
+/// `/api/v1/health` and the module reverse-proxy routes alike. It only inspects
+/// headers — the request reaching a module is untouched, and the proxy builds
+/// its own fixed upstream `Host` (`agent24-os-proto::proxy`).
+///
+/// - `Host` must be `127.0.0.1:{port}`, `localhost:{port}` or `[::1]:{port}`
+///   (ASCII case-insensitive); any other value is 403 `bad_host`, and no host
+///   at all (an HTTP/1.0 request) is 400 `bad_host`. (HTTP/2 carries the authority in the URI, which is used when there is no
+///   `Host` header.)
+/// - An `Origin` header other than the literal `null` is 403 `forbidden_origin`
+///   (browsers always send it on cross-origin requests; the CLI/desktop main
+///   process/bridges never do). `Origin: null` stays allowed here; the WS
+///   upgrade rejects any `Origin` itself.
+pub fn guard_host_origin(router: Router, port: u16) -> Router {
+    let allowed: StdArc<[String; 3]> = StdArc::new([
+        format!("127.0.0.1:{port}"),
+        format!("localhost:{port}"),
+        format!("[::1]:{port}"),
+    ]);
+    router.layer(middleware::from_fn_with_state(allowed, host_origin_guard))
+}
+
+async fn host_origin_guard(
+    State(allowed): State<StdArc<[String; 3]>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| req.uri().authority().map(|a| a.as_str().to_owned()));
+    match host.as_deref() {
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "bad_host",
+                "A Host header is required",
+            );
+        }
+        Some(h) if !allowed.iter().any(|a| a.eq_ignore_ascii_case(h)) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "bad_host",
+                "Host header is not this daemon's loopback address",
+            );
+        }
+        Some(_) => {}
+    }
+    if req
+        .headers()
+        .get(header::ORIGIN)
+        .is_some_and(|o| o.as_bytes() != b"null")
+    {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden_origin",
+            "Browser-originated requests are not allowed",
+        );
+    }
+    next.run(req).await
+}
+
 pub fn generate_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
@@ -1357,6 +1467,7 @@ pub async fn serve(
     ephemeral: bool,
     auth_mode: AuthMode,
     host_bootstrap_stdio: bool,
+    ready_omit_token: bool,
     cancel: CancellationToken,
 ) -> Result<(), std::io::Error> {
     validate_auth_startup(auth_mode, host_bootstrap_stdio)?;
@@ -1559,6 +1670,18 @@ pub async fn serve(
     // an in-memory one). A failure here degrades to no memory rather than
     // refusing to start — sessions simply don't remember, as before.
     let memory_base = open_memory_base(ephemeral).await;
+    // P1-02c-c5: bound memory.db's WAL — idle-time wal_checkpoint(TRUNCATE),
+    // tracing-only results, stops with the daemon-wide token. In-memory
+    // (ephemeral) bases have no WAL and spawn nothing. Detached on purpose:
+    // it owns its own connection and ends on `cancel`.
+    if let Some(kv) = &memory_base {
+        let _ = crate::memory_maintenance::spawn(
+            kv,
+            agent24_memory::wal_maintenance::WalMaintenanceConfig::default(),
+            cancel.clone(),
+        )
+        .await;
+    }
     let memory = match memory_base.clone() {
         Some(kv) => match session_memory(kv, &router, &cancel).await {
             Ok(memory) => Some(memory),
@@ -2523,14 +2646,9 @@ pub async fn serve(
         return Ok(());
     }
     let ready = match auth_mode {
-        AuthMode::LegacySingleToken => serde_json::json!({
-            "type": "ready",
-            "port": local.port(),
-            "token": token,
-            "auth_mode": "legacy_single_token",
-            "generation": daemon_generation,
-            "version": env!("CARGO_PKG_VERSION"),
-        }),
+        AuthMode::LegacySingleToken => {
+            legacy_ready_line(local.port(), &token, ready_omit_token, &daemon_generation)
+        }
         AuthMode::Capabilities => {
             let product_host_token = product_host_token.ok_or_else(|| {
                 std::io::Error::new(
@@ -2572,6 +2690,7 @@ pub async fn serve(
     drop(ready);
 
     let graceful_cancel = cancel.clone();
+    let router = guard_host_origin(router, local.port());
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move { graceful_cancel.cancelled().await });
 
@@ -3276,6 +3395,9 @@ pub(crate) mod tests {
         "/capabilities/creative", // OD-M11 (PAUSED): capability contract is out of scope.
         "/capabilities/{capability_id}/revoke", // OD-M11 (PAUSED): capability contract is out of scope.
         "/events", // WebSocket protocol is documented by protocol/events.schema.json.
+        // KB-HOST-01: the desktop host's private interface (UI-BRIDGE U1.5), not a client contract.
+        "/host/knowledge/bindings/{binding_id}",
+        "/host/knowledge/bindings/{binding_id}/credential",
     ];
 
     // Module-owned contract paths appear in OpenAPI but are not literal routes
@@ -3305,9 +3427,37 @@ pub(crate) mod tests {
         "/documents/extractions/{extraction_id}",
     ];
 
-    // COMM routes are mounted by server::serve, outside the scanned builder;
-    // `/api/v1/comm/*` remains a known blind spot owned by the COMM workstream.
-    const EXTRA_RESERVED_NOT_IN_BUILD_ROUTER: &[&str] = &["/comm/*"];
+    // COMM routes are mounted by server::serve, outside the scanned builder, so
+    // their literals are scanned from the agent24-comm sources instead
+    // (`comm_route_literals`); they are covered by the same gate, no exemption.
+    const COMM_ROUTE_SOURCES: [(&str, &str); 2] = [
+        (
+            include_str!("../../../crates/agent24-comm/src/router.rs"),
+            "pub fn router(",
+        ),
+        (
+            include_str!("../../../crates/agent24-comm/src/groupchat.rs"),
+            "pub(crate) fn routes(",
+        ),
+    ];
+
+    /// `.route("<path>"` literals inside the function starting at `anchor`.
+    fn route_literals(source: &str, anchor: &str) -> Vec<String> {
+        let start = source
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{anchor} must exist"));
+        let body = &source[start..];
+        let body = &body[..body
+            .find("\n}\n")
+            .expect("function must be brace-terminated")];
+        body.match_indices(".route(")
+            .filter_map(|(offset, _)| {
+                let rest = &body[offset + ".route(".len()..];
+                let rest = &rest[rest.find('"')? + 1..];
+                Some(rest[..rest.find('"')?].to_owned())
+            })
+            .collect()
+    }
 
     fn route_openapi_mismatches(
         server_source: &str,
@@ -3315,26 +3465,8 @@ pub(crate) mod tests {
     ) -> (Vec<String>, Vec<String>) {
         use std::collections::BTreeSet;
 
-        let start = server_source
-            .find("pub fn build_router_with_modules")
-            .expect("build_router_with_modules must exist");
-        let body = &server_source[start..];
-        let end = body
-            .find("\n}\n")
-            .expect("build_router_with_modules must be brace-terminated");
-        let body = &body[..end];
-
         let mut routes = BTreeSet::new();
-        for (offset, _) in body.match_indices(".route(") {
-            let registration = &body[offset + ".route(".len()..];
-            let Some(quote_start) = registration.find('"') else {
-                continue;
-            };
-            let path_and_rest = &registration[quote_start + 1..];
-            let Some(quote_end) = path_and_rest.find('"') else {
-                continue;
-            };
-            let path = &path_and_rest[..quote_end];
+        for path in route_literals(server_source, "pub fn build_router_with_modules") {
             if let Some(path) = path.strip_prefix("/api/v1") {
                 routes.insert(path.to_owned());
             }
@@ -3359,7 +3491,14 @@ pub(crate) mod tests {
 
         let undocumented: BTreeSet<&str> = UNDOCUMENTED_KERNEL_ROUTES.iter().copied().collect();
         let module_paths: BTreeSet<&str> = MODULE_SURFACE_PATHS.iter().copied().collect();
-        let _known_external_blind_spot = EXTRA_RESERVED_NOT_IN_BUILD_ROUTER;
+        let mut comm = 0;
+        for (source, anchor) in COMM_ROUTE_SOURCES {
+            for path in route_literals(source, anchor) {
+                routes.insert(format!("/comm{path}"));
+                comm += 1;
+            }
+        }
+        assert!(comm >= 20, "comm route scan found only {comm} paths");
         let expected_openapi: BTreeSet<String> = routes
             .iter()
             .filter(|path| !undocumented.contains(path.as_str()))
@@ -3412,6 +3551,60 @@ pub(crate) mod tests {
         let (missing_from_openapi, extra_in_openapi) = route_openapi_mismatches(&routes, openapi);
         assert_eq!(missing_from_openapi, ["/not-in-openapi"]);
         assert!(extra_in_openapi.is_empty());
+    }
+
+    /// The comm scan reads `.route(` literals out of two functions. A route
+    /// added through `.merge(`/`.nest(` of another module (or a second
+    /// `routes()`) would be invisible to it AND absent from OpenAPI, i.e. the
+    /// gate would pass an unregistered route. Pin the composition instead.
+    fn comm_composition_is_scanned(router_source: &str) -> Result<(), String> {
+        let start = router_source
+            .find("pub fn router(")
+            .ok_or("pub fn router( must exist")?;
+        let body = &router_source[start..];
+        let body = &body[..body
+            .find("\n}\n")
+            .ok_or("router must be brace-terminated")?];
+        let composed: Vec<&str> = body
+            .match_indices(".merge(")
+            .chain(body.match_indices(".nest("))
+            .chain(body.match_indices(".fallback"))
+            .chain(body.match_indices(".route_service("))
+            .map(|(i, _)| body[i..].lines().next().unwrap_or("").trim())
+            .collect();
+        if composed == [".merge(crate::groupchat::routes())"] {
+            Ok(())
+        } else {
+            Err(format!(
+                "comm router composes unscanned routes; extend COMM_ROUTE_SOURCES: {composed:?}"
+            ))
+        }
+    }
+
+    #[test]
+    fn comm_route_scan_covers_every_composed_module() {
+        let real = COMM_ROUTE_SOURCES[0].0;
+        comm_composition_is_scanned(real).unwrap();
+        let sneaky = real.replace(
+            ".merge(crate::groupchat::routes())",
+            ".merge(crate::groupchat::routes())\n        .merge(crate::other::routes())",
+        );
+        assert!(comm_composition_is_scanned(&sneaky).is_err());
+        let nested = real.replace(
+            ".merge(crate::groupchat::routes())",
+            ".merge(crate::groupchat::routes())\n        .nest(\"/x\", y())",
+        );
+        assert!(comm_composition_is_scanned(&nested).is_err());
+    }
+
+    #[test]
+    fn route_openapi_gate_covers_comm_routes() {
+        let routes = include_str!("server.rs");
+        let openapi = include_str!("../../../../protocol/openapi.yaml")
+            .replace("  /comm/groupchat:\n", "  /comm/groupchat-gone:\n");
+        let (missing_from_openapi, extra_in_openapi) = route_openapi_mismatches(routes, &openapi);
+        assert_eq!(missing_from_openapi, ["/comm/groupchat"]);
+        assert_eq!(extra_in_openapi, ["/comm/groupchat-gone"]);
     }
 
     #[test]
@@ -3546,7 +3739,7 @@ pub(crate) mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    async fn capability_state() -> (AppState, String, String) {
+    pub(crate) async fn capability_state() -> (AppState, String, String) {
         let mut state = state().await;
         let now = crate::capabilities::unix_now();
         let store = crate::capabilities::CapabilityStore::new("daemon-test");
@@ -4911,6 +5104,112 @@ pub(crate) mod tests {
         assert_eq!(connections.load(Ordering::SeqCst), 1);
     }
 
+    // ---- B1: Host / Origin guard --------------------------------------
+
+    async fn guarded_status(host: Option<&str>, origin: Option<&str>) -> (StatusCode, String) {
+        let router = guard_host_origin(build_router(state().await), 4242);
+        let mut b = Request::builder().uri("/api/v1/health");
+        if let Some(h) = host {
+            b = b.header(header::HOST, h);
+        }
+        if let Some(o) = origin {
+            b = b.header(header::ORIGIN, o);
+        }
+        let res = router
+            .oneshot(b.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let code = if status == StatusCode::OK {
+            String::new()
+        } else {
+            body_json(res).await["error"]["code"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned()
+        };
+        (status, code)
+    }
+
+    #[tokio::test]
+    async fn guard_accepts_the_three_loopback_hosts_case_insensitively() {
+        for h in [
+            "127.0.0.1:4242",
+            "localhost:4242",
+            "[::1]:4242",
+            "LocalHost:4242",
+        ] {
+            assert_eq!(guarded_status(Some(h), None).await.0, StatusCode::OK, "{h}");
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_rejects_wrong_host_even_on_health() {
+        for h in [
+            "evil.example:4242",
+            "127.0.0.1:4243",
+            "127.0.0.1",
+            "localhost.evil.com:4242",
+            "127.0.0.1:4242.evil.com",
+        ] {
+            let (s, c) = guarded_status(Some(h), None).await;
+            assert_eq!((s, c.as_str()), (StatusCode::FORBIDDEN, "bad_host"), "{h}");
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_rejects_a_request_with_no_host_as_400() {
+        let (s, c) = guarded_status(None, None).await;
+        assert_eq!((s, c.as_str()), (StatusCode::BAD_REQUEST, "bad_host"));
+    }
+
+    #[tokio::test]
+    async fn guard_rejects_a_browser_origin_but_allows_null_and_none() {
+        let (s, c) = guarded_status(Some("127.0.0.1:4242"), Some("http://evil.example")).await;
+        assert_eq!((s, c.as_str()), (StatusCode::FORBIDDEN, "forbidden_origin"));
+        let (s, _) = guarded_status(Some("127.0.0.1:4242"), Some("null")).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = guarded_status(Some("127.0.0.1:4242"), None).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn guard_runs_before_auth_and_in_front_of_module_routes() {
+        // Wrong Host on an authenticated route is the guard's answer, not 401.
+        let router = guard_host_origin(build_router(state().await), 4242);
+        let res = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/models")
+                    .header(header::HOST, "evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn legacy_ready_line_has_token_unless_told_to_omit_it() {
+        let with = legacy_ready_line(4242, "sekret", false, "g1");
+        assert_eq!(with["token"], "sekret");
+        assert_eq!(with["port"], 4242);
+        let without = legacy_ready_line(4242, "sekret", true, "g1");
+        assert!(without.get("token").is_none());
+        assert!(!without.to_string().contains("sekret"));
+        assert_eq!(without["type"], "ready");
+        assert_eq!(without["port"], 4242);
+        assert_eq!(without["auth_mode"], "legacy_single_token");
+    }
+
+    #[test]
+    fn serve_layers_the_host_guard_on_the_router_it_serves() {
+        let src = include_str!("server.rs");
+        let start = src.find("pub async fn serve(").expect("serve must exist");
+        assert!(src[start..].contains("guard_host_origin(router, local.port())"));
+    }
+
     #[tokio::test]
     async fn other_routes_401_without_token_with_v1_envelope() {
         let res = build_router(state().await)
@@ -5323,6 +5622,7 @@ pub(crate) mod tests {
                     workspace_id: None,
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
+                    knowledge_binding_id: None,
                 },
                 output: None,
                 error: None,
@@ -5810,6 +6110,7 @@ pub(crate) mod tests {
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
                 workspace_id: None,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();

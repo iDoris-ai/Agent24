@@ -16,7 +16,7 @@
 > - `docs/specs/SPEC-ME3-OUT-OF-PROCESS.md`；
 > - `docs/agent/PLAN-OOP-OS-AND-BACKLOG.md` §七。
 >
-> 文中行号均按 `dbffe94` 核对。
+> 文中行号原先均按 `dbffe94` 核对。第 1 节「当时」引用的行号（`kernel_call.rs:235`、`:88-95`，`server.rs:1523-1599`，`agent24-mcp/src/lib.rs:269-273`，`agent24-tools/src/lib.rs:400-434`）即此基准，对应这两行最初写入时的 `dd8f7ff1`（2026-10-07）；它们描述当时的代码，不是当前行号。该提交里这几份代码与 `dbffe94` 是同一份（DOC-1-06b，2026-10-18）。
 
 ## 0. 范围
 
@@ -37,8 +37,8 @@
 | 进程外 ② | 已有 Sin90 / Cos72 在用。<br>• 调模型：manifest 需要在 `kernel_capabilities` 里申请 `models`，`model_access` 默认 `local_only`（`agent24-domain/src/lib.rs:235`、`:819-826`）。<br>• 传输：Unix 域套接字（SPEC-ME3 FU-60） |
 | 命名 | 命名空间和数据目录都**从 `name` 推导**：必须是 `/api/v1/{name}` 和 `~/.agent24/os/{name}/`（`lib.rs:546-553`、`:780-800`） |
 | 公开代理 | 对外入口 `/api/v1/<ns>/*`，限制如下：<br>• body 上限 1 MiB；<br>• 首字节 10 s，总时长 30 s；<br>• 不支持流式；<br>• 剥掉双向的 `X-A24-*` 头；<br>• 客户端请求 `_a24` 路径一律返回 404（`agent24-os-proto/src/proxy.rs`） |
-| 内核 → 模块 | `send_kernel_request` 调模块私有的 `/api/v1/<ns>/_a24/...`，每次调用可单独设 `KernelLimits`，不占客户端的并发配额（`os-proto/src/kernel_call.rs:235`）。调度器投递就走这条路（`scheduler_deliver.rs`，`x-a24-fire-id`）。<br>**它只返回状态码**：响应体在限额内读完即丢弃（`KernelResponse { status }`，`:88-95`）。调用语义按“可能重复投递”设计 |
-| 工具 | 领域 OS 不能向 agent loop 贡献工具。<br>• 工具表在 `mount_all` 之前构建并冻结（`server.rs:1523-1599`）。<br>• MCP 工具强制为 `External`（`agent24-mcp/src/lib.rs:269-273`）；第三方声明的风险等级“只是猜测”（`agent24-tools/src/lib.rs:400-434`）。<br>• `Read` 类直接跳过审批 |
+| 内核 → 模块 | 行号基准 `dd8f7ff1`，见文首，覆盖本格（含前半句 `kernel_call.rs:235` 与 `:88-95`），不是当前行号（DOC-1-06b，2026-10-18）。`send_kernel_request` 调模块私有的 `/api/v1/<ns>/_a24/...`，每次调用可单独设 `KernelLimits`，不占客户端的并发配额（`os-proto/src/kernel_call.rs:235`）。调度器投递就走这条路（`scheduler_deliver.rs`，`x-a24-fire-id`）。<br>**当时它只返回状态码**：响应体在限额内读完即丢弃（`KernelResponse { status }`，`:88-95`）。模块工具调用已由 ADR-K1-01 的带响应体调用实现（见 D4.3 与 ADR-DOC-02 §4；DOC-1-06b，2026-10-18）。调用语义按“可能重复投递”设计 |
+| 工具 | **当时领域 OS 不能向 agent loop 贡献工具**。<br>• 工具表在 `mount_all` 之前构建并冻结（`server.rs:1523-1599`）。<br>• MCP 工具强制为 `External`（`agent24-mcp/src/lib.rs:269-273`）；第三方声明的风险等级“只是猜测”（`agent24-tools/src/lib.rs:400-434`；行号基准 `dd8f7ff1`，见文首）。<br>• `Read` 类直接跳过审批。<br>**现状**：模块工具已按 ADR-K1-01 在 `server.rs:1544-1563` 登记、`:1629-1651` 装进 `ToolRegistry`（DOC-1-06b，2026-10-18） |
 | 审批类别 | `BrokerGate::check` 按工具**名字**决定类别，未知名字一律落到 `module`（`agent24-policy/src/lib.rs:897-902`）。这只是兜底，不是为模块设计的接缝 |
 | 记忆 | agent loop 会自动把每轮的 prompt 和最终回答写进内核记忆（`remember_exchange`，`agent24-agent/src/lib.rs:641`、`:1730`） |
 | 桌面 | 运行时只有通用的 `backendProxy`（只能传 JSON、转发任意路径，F11.0 待隔离）。渲染进程只用了 `api-client` 的**类型**。`agentear-events.ts` 是 AgentEar 专用的事件桥 |
@@ -98,8 +98,8 @@
    - 用户覆盖时只能收紧。
    - DOC-1 期间还没有“第一方默认安装”（D6），Documenting 自己的工具也因此是 `External`，每次调用都要审批，除非用户在启用时逐个确认过。这一点如实写进 DOC-1 的验收说明。
 3. **调用通道**：
-   - 内核调用 `POST /api/v1/<ns>/_a24/tools/<op>`，带 `x-a24-run-id` 和 `x-a24-tool-call-id` 头。客户端碰不到 `_a24` 路由，也伪造不了 `X-A24-*` 头。
-   - 现有的 `send_kernel_request` 只返回状态码。内核 ADR 要新增一个**返回响应体**的变体，响应体以 `max_response_bytes` 为上限，这个上限也就是工具输出的上限。
+   - 内核调用 `POST /api/v1/<ns>/_a24/tools/<op>`，正文 `{"context":…,"arguments":…}`，`context` 由内核注入 `run_id`、`tool_call_id` 等（ADR-K1-01，`agent24-tools/src/lib.rs:858-866`；DOC-1-06b，2026-10-18）。客户端碰不到 `_a24` 路由，也伪造不了 `X-A24-*` 头。
+   - 内核已按 ADR-K1-01 实现带响应体的调用，结果信封与 64 KiB 上限见 ADR-DOC-02 §4（DOC-1-06b，2026-10-18）。
    - 工具调用**绝不自动重试**（调度器那条路径默认按“可能重复投递”设计）。
    - **调用关联与业务幂等分两层**（2026-10-07 统一，见 #740）：
      - `tool_call_id`（以及 `run_id`）只用于**可信的调用关联与审计**；
@@ -187,7 +187,7 @@
 
 - **现状**：工具调用会存成数据行和事件，但**哈希链审计**只记被拒、审批、风险覆盖和 workspace 保留。
 - **C 的要求**：模块工具的每次执行（成功或失败）都写一条哈希链审计，actor 为 `module:<name>`。
-- **OS 自身**：在 `data_dir` 维护一份只追加的操作日志，覆盖提交、恢复、导出、删除。
+- **OS 自身**：在 `data_dir` 维护一份只追加的操作日志，覆盖提交、恢复、导出、删除。工具发起的 extract（新建或重放）也写 `oplog`，记这次 run 的关联（`run_id`、`tool_call_id`）。页面发起的 extract 不写，是有意的：页面路径没有 run 可关联，job 本身已记 `origin`（DOC-1-06b，2026-10-18）。
 - **与 README §10.3 的显式偏离**：§10.3 承诺“页面直接编辑与 Agent 调用的审计轨迹相同”。但页面经公开代理发起的变更，内核审计不到，**目前只有 OS 的操作日志**。这一项标为**发布阻塞**：首个面向用户的发布之前，必须由内核提供模块变更审计。README §10.3 已同步注明。
 
 ### D10 平台

@@ -1177,11 +1177,11 @@ mod tests {
         assert_eq!(inherited.kind, SourceKind::ToolResult);
     }
 
-    /// Codex 6b.5f-2 r1 C1: a session whose runs called tools before 0027
+    /// Codex 6b.5f-2 r1 C1: a session whose runs called tools before 0031
     /// carries one legacy origin; a session without tool calls, and a tool
     /// call outside any session, record none.
     #[tokio::test]
-    async fn a_session_that_called_tools_before_0027_carries_a_legacy_origin() {
+    async fn a_session_that_called_tools_before_0031_carries_a_legacy_origin() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -1192,7 +1192,7 @@ mod tests {
             migrator
                 .migrations
                 .iter()
-                .filter(|m| m.version <= 26)
+                .filter(|m| m.version <= 30)
                 .cloned()
                 .collect(),
         );
@@ -1232,7 +1232,7 @@ mod tests {
     /// upgrade that carries no session floor gets an `unknown` one, which
     /// reads back as the session-context tag the kernel itself would write.
     #[tokio::test]
-    async fn a_session_run_without_a_floor_before_0028_gets_an_unknown_one() {
+    async fn a_session_run_without_a_floor_before_0032_gets_an_unknown_one() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -1243,7 +1243,7 @@ mod tests {
             migrator
                 .migrations
                 .iter()
-                .filter(|m| m.version <= 27)
+                .filter(|m| m.version <= 31)
                 .cloned()
                 .collect(),
         );

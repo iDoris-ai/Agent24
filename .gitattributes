@@ -1,0 +1,2 @@
+# Knowledge v1 fixtures are pinned by the sha256 of their bytes (manifest.json): keep LF on every checkout.
+protocol/knowledge/fixtures/** text eol=lf

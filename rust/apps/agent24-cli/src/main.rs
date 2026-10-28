@@ -21,6 +21,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use zeroize::{Zeroize, Zeroizing};
 
 mod acp;
+mod documents;
 mod runs;
 mod schedules;
 mod service;
@@ -78,6 +79,11 @@ enum Command {
         #[command(subcommand)]
         action: OsAction,
     },
+    /// The Documenting OS: import files (the same code the desktop runs)
+    Documents {
+        #[command(subcommand)]
+        action: documents::DocumentsAction,
+    },
     /// Manage the embedded Hyphae-based agent communication layer:
     /// identities, contacts, and relays (COMM-HYPHAE.md §4). A REST client
     /// of `/api/v1/comm/*`, same shape as `agent24 os`.
@@ -122,6 +128,14 @@ enum HwAction {
     /// Probe this machine now and print JSON: profile, level, usable_bytes,
     /// reasons. `A24_HW_BUDGET_CAP_GB=<n>` simulates a smaller machine.
     Probe,
+    /// Print a nonsecret environment assignment for an independently started
+    /// iDoris. Core reservations are explicit; no daemon is started or owned.
+    IdorisEnv {
+        /// Bytes reserved for voice, decision, embedding and other core models.
+        /// Use the actual allocation; zero must be chosen explicitly.
+        #[arg(long)]
+        core_reserved_bytes: u64,
+    },
 }
 
 /// `agent24 decide …` (D0-2).
@@ -525,17 +539,7 @@ fn shutdown_lines(r: &agent24_protocol::ShutdownReport) -> Vec<String> {
 /// itself never redirects, so a 3xx means something else is impersonating it;
 /// following it would hand over the bearer token to that impersonator.
 fn client() -> reqwest::Client {
-    #[expect(
-        clippy::expect_used,
-        reason = "unwrap_or_default() here would silently rebuild the proxy-reading, \
-                  redirect-following client FU-74 exists to rule out; fail closed instead"
-    )]
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("building the loopback-only daemon HTTP client failed")
+    agent24_protocol::client::loopback_client(Duration::from_secs(2))
 }
 
 async fn health_ok(base: &str, token: &str) -> bool {
@@ -753,7 +757,14 @@ async fn attach_only() -> Option<Endpoint> {
 /// to it. Runs until the MCP client closes stdin.
 async fn cmd_mcp() -> Result<(), String> {
     let ep = connect().await?;
+    // C-04: `agent24_run` gets a total time limit (default 600s).
+    let run_timeout = agent24_mcp::server::parse_run_timeout(
+        std::env::var(agent24_mcp::server::RUN_TIMEOUT_ENV)
+            .ok()
+            .as_deref(),
+    );
     let result = agent24_mcp::server::Agent24Server::new(ep.base.clone(), ep.token.clone())
+        .with_run_timeout(run_timeout)
         .serve_stdio()
         .await
         .map_err(|e| e.to_string());
@@ -797,6 +808,10 @@ fn receipt_line(receipt: agent24_protocol::MemoryReceipt) -> &'static str {
             "not remembered: personal memory is paused"
         }
         agent24_protocol::MemoryReceipt::Failed => "not remembered: saving it failed",
+        agent24_protocol::MemoryReceipt::NotSaved => "this turn was not saved to the session",
+        agent24_protocol::MemoryReceipt::Partial => {
+            "conversation saved, but the memory itself was not"
+        }
     }
 }
 
@@ -809,6 +824,11 @@ async fn cmd_chat(req: ChatRequest) -> Result<(), String> {
         .await;
     let out = match result {
         Ok(res) if res.status().is_success() => {
+            let gateway_record_id = res
+                .headers()
+                .get("x-idoris-record-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let body: ChatResponse = res.json().await.map_err(|e| e.to_string())?;
             println!("{}", body.message.content);
             println!("· {} tokens", body.usage.total_tokens);
@@ -816,6 +836,9 @@ async fn cmd_chat(req: ChatRequest) -> Result<(), String> {
             // reply claims (the desktop shows the same receipt).
             if let Some(receipt) = body.memory_receipt {
                 println!("· {}", receipt_line(receipt));
+            }
+            if let Some(record_id) = gateway_record_id {
+                println!("· iDoris record {record_id}");
             }
             Ok(())
         }
@@ -1194,11 +1217,20 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
 /// for a local CLI tool SQLite-via-`agent24-store` IS the implementation,
 /// today and for the foreseeable future.
 fn cmd_hw(action: HwAction) -> Result<(), String> {
+    let report = agent24_hw::HardwareReport::from_env(&agent24_hw::SystemProbe::new());
     match action {
         HwAction::Probe => {
-            let report = agent24_hw::HardwareReport::from_env(&agent24_hw::SystemProbe::new());
             let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
             println!("{json}");
+            Ok(())
+        }
+        HwAction::IdorisEnv {
+            core_reserved_bytes,
+        } => {
+            // usable_bytes already accounts for OS and App overhead. Deduct
+            // only the explicit core allocation, and preserve a real zero.
+            let bytes = report.usable_bytes.saturating_sub(core_reserved_bytes);
+            println!("IDORIS_ALLOCATED_BUDGET_BYTES={bytes}");
             Ok(())
         }
     }
@@ -2319,6 +2351,12 @@ fn cmd_service(action: ServiceAction) -> Result<(), String> {
             println!("loaded:    {}", if loaded { "yes" } else { "no" });
             if let Some(p) = plist {
                 println!("plist:     {}", p.display());
+                if installed && !service::plist_has_ready_omit_token(&p) {
+                    println!(
+                        "note:      this LaunchAgent predates --ready-omit-token and still \
+                         logs the daemon bearer token; run `agent24 service install` to update it"
+                    );
+                }
             }
             match state_file::read_live() {
                 Some(st) => println!("daemon:    running (pid {}, port {})", st.pid, st.port),
@@ -2343,6 +2381,7 @@ async fn main() -> std::process::ExitCode {
         Command::Service { action } => cmd_service(action),
         Command::Tui => cmd_tui().await,
         Command::Os { action } => cmd_os(action).await,
+        Command::Documents { action } => documents::cmd_documents(action).await,
         Command::Comm { action } => cmd_comm(action).await,
         Command::Mcp => cmd_mcp().await,
         Command::Acp => cmd_acp().await,

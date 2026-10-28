@@ -589,6 +589,16 @@ mod tests {
 
     // ---- end-to-end against fake "hyphae" shell scripts -------------------
 
+    fn fixture_stage_flags(home: &std::path::Path) -> [bool; 4] {
+        [
+            "fixture-started",
+            "fixture-after-stdin",
+            "fixture-emitting",
+            "fixture-emitted",
+        ]
+        .map(|name| home.join(name).is_file())
+    }
+
     async fn install_fixture(
         source_dir: &Path,
         script_name: &str,
@@ -650,12 +660,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("hyphae-home");
         tokio::fs::create_dir_all(&home).await.unwrap();
-        let script = "#!/bin/sh\n\
-            n=$(wc -c < /dev/stdin | tr -d ' ')\n\
-            echo \"{\\\"ok\\\":true,\\\"data\\\":{\\\"stdin_len\\\":$n,\\\"argv\\\":\\\"$*\\\"}}\"\n";
+        let script = r#"#!/bin/sh
+printf '' > "$HOME/fixture-started"
+n=$(wc -c < /dev/stdin | tr -d ' ')
+printf '' > "$HOME/fixture-after-stdin"
+printf '' > "$HOME/fixture-emitting"
+echo "{\"ok\":true,\"data\":{\"stdin_len\":$n,\"argv\":\"$*\"}}"
+printf '' > "$HOME/fixture-emitted"
+"#;
         let bin =
             install_fixture(tmp.path(), "echo-stdin.sh", script, &tmp.path().join("bin")).await;
-        let runner = HyphaeRunner::new(bin, home, Duration::from_secs(5));
+        let runner = HyphaeRunner::new(bin, home.clone(), Duration::from_secs(5));
 
         let secret = "s3cr3t-password-value-not-in-argv";
         let inv = Invocation {
@@ -663,7 +678,14 @@ mod tests {
             password: Some(Password::new(secret.as_bytes().to_vec()).unwrap()),
             timeout: None,
         };
-        let envelope = runner.run(inv).await.unwrap();
+        let envelope = runner.run(inv).await.unwrap_or_else(|error| {
+            panic!(
+                "runner failed; timed_out={}; fixture stages: {:?}",
+                matches!(error, RunnerError::Timeout(_)),
+                fixture_stage_flags(&home)
+            )
+        });
+        assert_eq!(fixture_stage_flags(&home), [true; 4]);
         let Envelope::Ok { data } = envelope else {
             panic!("expected Ok envelope")
         };

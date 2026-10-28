@@ -454,6 +454,207 @@ async fn a_blocked_reopen_does_not_stall_the_runtime() {
     release.join().unwrap();
 }
 
+/// Keeps the blob lock a FIFO without a reader, so opening it for writing
+/// blocks.
+///
+/// Timing: a reopen's blocking thread may already have resolved the path to
+/// the FIFO but not yet started waiting in `open`. If the reader were closed
+/// right after the path is removed, that thread would then open a FIFO with
+/// no reader and no path and wait forever — and the runtime, which waits for
+/// blocking threads when it shuts down, would hang the test process. So the
+/// reader stays open until the reopen is known to have finished:
+/// [`Stall::release`] opens it and removes the path, and only
+/// [`Stall::finish`], called after `storage()` has come back (the stuck
+/// reopen returned), closes it. Any other path (a failed assertion) leaks the
+/// reader in `Drop`, so it outlives the runtime's shutdown.
+struct Stall {
+    fifo: PathBuf,
+    reader: Option<File>,
+}
+
+impl Stall {
+    fn new(data_dir: &Path) -> Self {
+        fs::create_dir_all(data_dir.join("blobs")).unwrap();
+        let fifo = data_dir.join("blobs/.lock");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        Self { fifo, reader: None }
+    }
+
+    /// Lets every blocked open through, now and later, and keeps it so.
+    fn release(&mut self) {
+        if self.reader.is_some() {
+            return;
+        }
+        // Opening a FIFO read-write never blocks (Linux, macOS), and as a
+        // reader it lets the blocked writers through. With the path gone,
+        // later opens create a plain file instead of blocking again; an open
+        // that resolved the path before then still finds this reader.
+        self.reader = Some(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.fifo)
+                .unwrap(),
+        );
+        let _ = fs::remove_file(&self.fifo);
+    }
+
+    /// Closes the reader. Only call once the stuck reopen has returned, so no
+    /// thread can still be on its way into the FIFO.
+    fn finish(mut self) {
+        drop(self.reader.take());
+    }
+}
+
+impl Drop for Stall {
+    fn drop(&mut self) {
+        // After `finish` there is no reader and no FIFO: nothing to do.
+        if self.reader.is_none() && !self.fifo.exists() {
+            return;
+        }
+        // Otherwise `finish` was skipped (a failed assertion), and a reopen
+        // may be blocked or on its way into the FIFO: release it, and keep
+        // the reader open for the rest of the process (past the runtime's
+        // shutdown) instead of closing it under that open.
+        if self.reader.is_none() {
+            if let Ok(reader) = OpenOptions::new().read(true).write(true).open(&self.fifo) {
+                self.reader = Some(reader);
+            }
+            let _ = fs::remove_file(&self.fifo);
+        }
+        std::mem::forget(self.reader.take());
+    }
+}
+
+/// A request cancelled while its reopen is stuck (a tool's deadline, a
+/// client that hangs up) must not free the reopen lock: the stuck work goes
+/// on, and the next request would start another, a blocking thread each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_request_leaves_its_reopen_running_and_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut stall = Stall::new(dir.path());
+    // No interval, so only the lock keeps a second reopen from starting.
+    let state = AppState::failed(dir.path(), StorageCause::Locked, Duration::ZERO);
+    for _ in 0..5 {
+        let got = tokio::time::timeout(Duration::from_millis(50), state.storage()).await;
+        assert!(
+            !matches!(got, Ok(Ok(_))),
+            "opened through a blocked lock file"
+        );
+    }
+    assert_eq!(
+        state.0.reopens.load(Ordering::SeqCst),
+        1,
+        "a cancelled request's reopen let another start"
+    );
+    assert!(
+        state.0.last_attempt.try_lock().is_err(),
+        "the reopen lock was freed while the reopen is stuck"
+    );
+
+    // The reopen counted above may not be waiting in `open` yet; the reader
+    // stays open until storage is back, which means that reopen returned.
+    stall.release();
+    let waiting = Instant::now();
+    while state.storage().await.is_err() {
+        assert!(
+            waiting.elapsed() < Duration::from_secs(5),
+            "storage never came back"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    stall.finish();
+    assert_eq!(cause(&state), None);
+}
+
+/// A reopen that panics (a bug, not a storage failure) must reach the caller
+/// as a panic, not pass for the last cause; the lock is freed with it, and
+/// the next request reopens (#1092 review, PR-Daemon L1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panicking_reopen_panics_the_request_and_frees_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::failed(dir.path(), StorageCause::Locked, Duration::ZERO);
+    state.0.hooks.panic_reopen.store(true, Ordering::SeqCst);
+    let asked = tokio::spawn({
+        let state = state.clone();
+        async move { state.storage().await.err() }
+    })
+    .await;
+    match asked {
+        Err(e) => assert!(e.is_panic(), "the request was cancelled, not panicked"),
+        Ok(got) => panic!("the reopen's panic was swallowed: the request got {got:?}"),
+    }
+    assert_eq!(state.0.reopens.load(Ordering::SeqCst), 1);
+    assert!(
+        state.0.last_attempt.try_lock().is_ok(),
+        "the panicked reopen kept the lock"
+    );
+    assert_eq!(cause(&state), Some(StorageCause::Locked), "the last cause");
+    assert!(state.storage().await.is_ok(), "the next request reopens");
+    assert_eq!(state.0.reopens.load(Ordering::SeqCst), 2);
+}
+
+/// A request that takes the lock just after another reopen stored ready
+/// storage must use it, not reopen again: a second open would find the
+/// blob lock held by the first and replace ready storage with `locked`
+/// (#1092 review, PR-Daemon Info).
+#[tokio::test]
+async fn a_request_that_takes_the_lock_after_a_reopen_succeeded_does_not_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::failed(dir.path(), StorageCause::Locked, Duration::ZERO);
+    // Stands in for a reopen that ended between this request's first look
+    // at `current` and its taking the lock.
+    let ready = open_storage(dir.path(), &Events::default()).await.unwrap();
+    *state.0.hooks.after_lock.lock().unwrap() = Some(Box::new(move |state: &AppState| {
+        *state.0.current.lock().unwrap() = Ok(ready);
+    }));
+    let got = state.storage().await;
+    assert_eq!(state.0.reopens.load(Ordering::SeqCst), 0, "reopened again");
+    assert!(got.is_ok(), "did not answer with the ready storage");
+    assert_eq!(cause(&state), None, "ready storage was replaced");
+}
+
+/// The runtime shutting down cancels a reopen task, which the request then
+/// answers with the last cause instead of panicking (#1092 review, L2). The
+/// reopen is spawned onto a runtime that is never driven and then dropped,
+/// while the request itself is polled by hand outside it.
+#[test]
+fn a_reopen_cancelled_by_shutdown_answers_with_the_last_cause() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::failed(dir.path(), StorageCause::Locked, Duration::ZERO);
+    let idle = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut asking = std::pin::pin!(state.storage());
+    let mut cx = Context::from_waker(Waker::noop());
+    {
+        let _runtime = idle.enter();
+        assert!(asking.as_mut().poll(&mut cx).is_pending());
+    }
+    assert_eq!(state.0.reopens.load(Ordering::SeqCst), 1);
+    assert!(
+        state.0.last_attempt.try_lock().is_err(),
+        "the reopen task does not hold the lock"
+    );
+    drop(idle); // cancels the reopen task, which never ran
+    match asking.as_mut().poll(&mut cx) {
+        Poll::Ready(got) => assert_eq!(got.err(), Some(StorageCause::Locked)),
+        Poll::Pending => panic!("still waiting for a cancelled reopen"),
+    }
+    assert!(
+        state.0.last_attempt.try_lock().is_ok(),
+        "the cancelled reopen kept the lock"
+    );
+}
+
 #[tokio::test]
 async fn a_route_that_needs_storage_answers_503_with_the_cause() {
     use axum::body::Body;

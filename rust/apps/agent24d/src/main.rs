@@ -29,6 +29,9 @@ mod grant_expiry;
 mod hardware;
 #[cfg(unix)]
 mod host_bootstrap;
+mod knowledge_host;
+#[allow(dead_code)] // Wired at start (KB-C1-04 6c-4) and by the private interface (6d-2).
+mod knowledge_store;
 #[cfg(not(unix))]
 mod host_bootstrap {
     #![allow(
@@ -64,6 +67,7 @@ mod host_bootstrap {
 mod lifecycle;
 mod mcp;
 mod memory_callback;
+mod memory_maintenance;
 mod memory_routes;
 mod model_callback;
 mod module_approval_broker;
@@ -127,6 +131,11 @@ enum Command {
         /// Required for capability mode and hidden from ordinary CLI help.
         #[arg(long, hide = true, default_value_t = false)]
         host_bootstrap_stdio: bool,
+        /// Leave the bearer token out of the legacy `ready` line (it still goes
+        /// to the 0600 `daemon.json`). Passed by the LaunchAgent plist, whose
+        /// `StandardOutPath` would otherwise persist the token in a log file.
+        #[arg(long, default_value_t = false)]
+        ready_omit_token: bool,
     },
 }
 
@@ -151,7 +160,14 @@ fn main() -> std::process::ExitCode {
             ephemeral,
             auth_mode,
             host_bootstrap_stdio,
-        } => run_serve(port, ephemeral, auth_mode.into(), host_bootstrap_stdio),
+            ready_omit_token,
+        } => run_serve(
+            port,
+            ephemeral,
+            auth_mode.into(),
+            host_bootstrap_stdio,
+            ready_omit_token,
+        ),
     }
 }
 
@@ -160,6 +176,7 @@ fn run_serve(
     ephemeral: bool,
     auth_mode: agent24_protocol::state_file::AuthMode,
     host_bootstrap_stdio: bool,
+    ready_omit_token: bool,
 ) -> std::process::ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -177,6 +194,7 @@ fn run_serve(
         ephemeral,
         auth_mode,
         host_bootstrap_stdio,
+        ready_omit_token,
         cancel,
     ));
     // Bounded, not the default `Drop`, which waits for every blocking task:

@@ -1,6 +1,6 @@
 {
   "name": "@agent24/documents-accept",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "private": true,
   "description": "DOC-1-09: the Documenting acceptance harness. Runs the S01 samples through the documents routes of a real daemon, scores the results against the gold labels and records the evidence (docs/documenting/acceptance/README.md).",
   "type": "module",

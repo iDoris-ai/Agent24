@@ -197,6 +197,7 @@ async fn run_prompt(
         workspace_id: None,
         model_override: None,
         mode: RunMode::Normal,
+        knowledge_binding_id: None,
     };
     let response = bearer(
         ep,
@@ -449,6 +450,7 @@ mod tests {
                 total_tokens: 3,
                 cost_usd: 0.0,
             },
+            memory_persisted: None,
         }))
     }
 

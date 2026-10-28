@@ -104,6 +104,7 @@ async fn assert_quota_rejection(rows: i64) {
             prompt: "this turn cannot be stored".to_owned(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -121,11 +122,10 @@ async fn assert_quota_rejection(rows: i64) {
         })
         .unwrap_or_else(|| panic!("quota={rows}: missing memory.write_failed"));
     assert_eq!(failure["session_id"], "quota-session");
-    assert!(
-        failure["reason"]
-            .as_str()
-            .is_some_and(|s| s.contains("quota"))
-    );
+    // P1-02c: typed, no free-text reason (which spelled out the partition key).
+    assert_eq!(failure["code"], "memory_quota_rows", "quota={rows}");
+    assert_eq!(failure["dimension"], "rows");
+    assert_eq!(failure["reason"], failure["code"], "{failure}");
 
     let view = kv
         .session_log()
@@ -144,6 +144,7 @@ async fn assert_quota_rejection(rows: i64) {
             prompt: "next turn".to_owned(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -225,6 +226,7 @@ async fn lock_timeout_keeps_run_completed_and_reports_failed_memory_write() {
             prompt: "lock timeout".to_owned(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -246,12 +248,10 @@ async fn lock_timeout_keeps_run_completed_and_reports_failed_memory_write() {
         .collect::<Vec<_>>();
     assert_eq!(failures.len(), 1, "lock wait exceeded the write deadline");
     assert_eq!(failures[0]["payload"]["session_id"], "timeout-lock-session");
-    assert!(
-        failures[0]["payload"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("timed out")
-    );
+    // A preparation timeout is not a quota or disk failure: the closed code is
+    // `memory_internal`, and the free-text "timed out" reason is gone (P1-02c).
+    assert_eq!(failures[0]["payload"]["code"], "memory_internal");
+    assert_eq!(failures[0]["payload"]["reason"], "memory_internal");
     drop(guard);
 }
 
@@ -293,6 +293,7 @@ async fn committed_turn_waits_for_ack_after_deadline_and_is_available_next_round
             prompt: "first committed prompt".to_owned(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -360,6 +361,7 @@ async fn committed_turn_waits_for_ack_after_deadline_and_is_available_next_round
             prompt: "second prompt".to_owned(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -426,6 +428,7 @@ async fn summarizer_timeout_keeps_durable_originals_without_write_failed_event()
             prompt: "original survives summary timeout".to_owned(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -563,7 +566,10 @@ async fn cancel_during_sqlite_commit_does_not_release_session_lock_before_commit
         calls: std::sync::atomic::AtomicUsize::new(0),
     });
     let memory = SessionMemory::new(kv.clone(), Arc::new(UnusedSummarizer))
-        .with_session_log(agent24_memory::session_log::SessionLog::new(pool.clone()))
+        .with_session_log(agent24_memory::session_log::SessionLog::new(
+            pool.clone(),
+            agent24_memory::disk_gate::DiskGate::disabled(),
+        ))
         .with_owner("m1-test-owner".to_owned());
     let manager = RunManager::with_memory(
         store.clone(),
@@ -583,6 +589,7 @@ async fn cancel_during_sqlite_commit_does_not_release_session_lock_before_commit
             prompt: "B question".into(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -598,6 +605,7 @@ async fn cancel_during_sqlite_commit_does_not_release_session_lock_before_commit
             prompt: "A question".into(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
