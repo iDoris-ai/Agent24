@@ -9,7 +9,7 @@ import { settingsMessages } from '../Settings.i18n'
 export function SidebarPrefs() {
   const t = useT(settingsMessages)
   const c = useT(capabilitiesMessages)
-  const { defs } = useContext(CapabilitiesContext)
+  const { defs, moduleInventory } = useContext(CapabilitiesContext)
   const { prefs, allPinned = prefs.pinned, setPrefs } = useContext(NavPrefsContext)
   const [saving, setSaving] = useState(false)
   const [notice, setNotice] = useState<CapabilityId[]>([])
@@ -84,7 +84,7 @@ export function SidebarPrefs() {
           <ol className="settings-pin-list">
             {allPinned.map((id, index) => (
               <li key={id}>
-                <span className="settings-pin-name">{nameFor(id)}{!defs.some(d => d.id === id) && ` — ${t('sidebar.unavailable')}`}</span>
+                <span className="settings-pin-name">{nameFor(id)}{!defs.some(d => d.id === id) && ` — ${t(moduleInventory?.disabledIds.has(id) ? 'sidebar.disabled' : 'sidebar.unavailable')}`}</span>
                 <button type="button" className="btn btn-ghost" aria-label={t('sidebar.moveUp', { name: nameFor(id) })}
                   disabled={saving || index === 0} onClick={() => move(index, -1)}>↑</button>
                 <button type="button" className="btn btn-ghost" aria-label={t('sidebar.moveDown', { name: nameFor(id) })}

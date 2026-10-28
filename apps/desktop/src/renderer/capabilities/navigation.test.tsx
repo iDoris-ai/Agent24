@@ -155,6 +155,81 @@ describe('NavPrefsProvider', () => {
     return setNavPrefs
   }
 
+  it.each([
+    { id: 'acme', manifest: { id: 'acme', type: 'ui', name: 'Acme', enabled: false }, status: 'Disabled' },
+    { id: 'acme', manifest: { id: 'acme', type: 'ui' }, status: 'Unavailable' },
+    { id: 'settings/acme', manifest: { id: 'settings/acme', type: 'ui', name: 'Acme' }, status: 'Unavailable' },
+  ])('F7 retains a $status pin filtered from defs ($id), including after edits', async ({ id, manifest, status }) => {
+    vi.useFakeTimers()
+    let manifests: unknown[] = [manifest]
+    const backendProxy = vi.fn().mockImplementation(() => Promise.resolve({ ok: true, data: manifests }))
+    const saved = { pinned: ['documents', id], slotCount: 2, showOverview: true }
+    const setNavPrefs = installPrefs(async () => saved, vi.fn().mockResolvedValue(undefined), backendProxy)
+    const view = renderEditor(<><SidebarPrefs /><Sidebar activeId="settings" navigate={vi.fn()} /></>)
+    try {
+      await act(async () => {})
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(setNavPrefs).not.toHaveBeenCalled()
+      expect(screen.getByText(`${id} — ${status}`)).toBeInTheDocument()
+      expect(screen.getByText('Pinned 2/2')).toBeInTheDocument()
+      expect(within(screen.getByRole('navigation')).queryByText(/acme/i)).not.toBeInTheDocument()
+      await act(async () => { fireEvent.click(screen.getByRole('switch', { name: 'Show Overview in sidebar' })) })
+      expect(setNavPrefs).toHaveBeenLastCalledWith({ ...saved, showOverview: false })
+      expect(screen.queryByText(/no longer installed/)).not.toBeInTheDocument()
+      if (id === 'acme') {
+        manifests = [{ id, type: 'ui', name: 'Acme', enabled: true }]
+        await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+        expect(within(screen.getByRole('navigation')).getByRole('button', { name: 'Acme' })).toBeInTheDocument()
+        expect(setNavPrefs).toHaveBeenCalledTimes(1)
+      }
+    } finally {
+      view.unmount()
+      vi.useRealTimers()
+    }
+  })
+
+  it.each([{ first: [] }, { first: [{ id: 'other', type: 'ui', name: 'Other' }] }])('F7 preserves acme when the first successful list is $first and the second recovers', async ({ first }) => {
+    vi.useFakeTimers()
+    let manifests = first
+    const backendProxy = vi.fn().mockImplementation(() => Promise.resolve({ ok: true, data: manifests }))
+    const setNavPrefs = installPrefs(async () => ({ pinned: ['documents', 'acme'], slotCount: 2, showOverview: true }), vi.fn().mockResolvedValue(undefined), backendProxy)
+    const view = renderEditor(<><SidebarPrefs /><Sidebar activeId="settings" navigate={vi.fn()} /></>)
+    try {
+      await act(async () => {})
+      expect(setNavPrefs).not.toHaveBeenCalled()
+      expect(screen.getByText('Pinned 2/2')).toBeInTheDocument()
+      manifests = [{ id: 'acme', type: 'ui', name: 'Acme' }]
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(within(screen.getByRole('navigation')).getByRole('button', { name: 'Acme' })).toBeInTheDocument()
+      expect(setNavPrefs).not.toHaveBeenCalled()
+      expect(screen.queryByText(/no longer installed/)).not.toBeInTheDocument()
+    } finally {
+      view.unmount()
+      vi.useRealTimers()
+    }
+  })
+
+  it('F7 releases and notifies only after two consecutive successful lists omit the pin', async () => {
+    vi.useFakeTimers()
+    const saved = { pinned: ['documents', 'acme'], slotCount: 2, showOverview: true }
+    const setNavPrefs = installPrefs(async () => saved, vi.fn().mockResolvedValue(undefined), vi.fn().mockResolvedValue({ ok: true, data: [] }))
+    const view = renderEditor(<><SidebarPrefs /><Sidebar activeId="settings" navigate={vi.fn()} /></>)
+    try {
+      await act(async () => {})
+      expect(setNavPrefs).not.toHaveBeenCalled()
+      expect(screen.getByText('Pinned 2/2')).toBeInTheDocument()
+      expect(screen.queryByText(/no longer installed/)).not.toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(setNavPrefs).toHaveBeenCalledExactlyOnceWith({ ...saved, pinned: ['documents'] })
+      expect(screen.getByText('Pinned 1/2')).toBeInTheDocument()
+      expect(screen.getByText('Empty slot')).toBeInTheDocument()
+      expect(screen.getByText('acme is no longer installed and was unpinned.')).toBeInTheDocument()
+    } finally {
+      view.unmount()
+      vi.useRealTimers()
+    }
+  })
+
   it.each(['success', 'failure then success', 'manifest before preferences', 'module removed during session'])('F6 releases removed module slots and notifies after %s', async scenario => {
     vi.useFakeTimers()
     let online = scenario !== 'failure then success'
@@ -175,7 +250,12 @@ describe('NavPrefsProvider', () => {
         await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
       } else if (scenario === 'manifest before preferences') {
         expect(setNavPrefs).not.toHaveBeenCalled()
+        await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
         await act(async () => { finishRead(saved) })
+      }
+      if (scenario !== 'manifest before preferences') {
+        expect(setNavPrefs).not.toHaveBeenCalled()
+        await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
       }
       expect(setNavPrefs).toHaveBeenLastCalledWith({ ...saved, pinned: ['documents'] })
       expect(screen.getByText('acme is no longer installed and was unpinned.')).toBeInTheDocument()
@@ -193,7 +273,7 @@ describe('NavPrefsProvider', () => {
   it('F6 lists unavailable offline pins with matching sidebar counts and allows manual unpinning', async () => {
     const setNavPrefs = installPrefs(async () => ({ pinned: ['documents', 'acme'], slotCount: 2, showOverview: true }))
     renderEditor(<><SidebarPrefs /><Sidebar activeId="settings" navigate={vi.fn()} /></>)
-    expect(await screen.findByText('acme — Unavailable (module removed)')).toBeInTheDocument()
+    expect(await screen.findByText('acme — Unavailable')).toBeInTheDocument()
     expect(screen.getByText('Pinned 2/2')).toBeInTheDocument()
     expect(screen.queryByText('Empty slot')).not.toBeInTheDocument()
     expect(within(screen.getByRole('navigation')).queryByText(/acme/)).not.toBeInTheDocument()
@@ -217,6 +297,8 @@ describe('NavPrefsProvider', () => {
     const view = renderEditor(<><SidebarPrefs /><Editor /></>)
     try {
       await act(async () => {})
+      expect(setNavPrefs).not.toHaveBeenCalled()
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
       expect(setNavPrefs).toHaveBeenCalledTimes(1)
       expect(screen.queryByText(/no longer installed/)).not.toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Unpin acme' })).toBeInTheDocument()

@@ -57,8 +57,8 @@ export const NAV_PREFS_DEFAULT: NavPrefs = {
  * Normalise stored prefs: clamp the slot count, drop unknown, fixed and
  * duplicate ids, and unpin whatever no longer fits. `dropped` lists the ids
  * that were unpinned because of the slot limit, so the UI can say so.
- * Before manifests load successfully, storage normalization reserves slots
- * for unknown saved ids; display normalization hides those ids.
+ * With preserveUnknown, storage normalization reserves slots for hidden
+ * saved ids until removal is confirmed; display normalization hides them.
  */
 export function clampPrefs(
   prefs: NavPrefs,
@@ -90,6 +90,12 @@ export interface CapabilitiesApi {
   approvalsWaiting: number
   /** Stays true after the first successful manifest load, including while offline. */
   manifestsLoaded?: boolean
+  /** Raw module ids before display filtering, from the latest two successful reads. */
+  moduleInventory?: {
+    ids: ReadonlySet<CapabilityId>
+    disabledIds: ReadonlySet<CapabilityId>
+    previousIds?: ReadonlySet<CapabilityId>
+  }
 }
 
 export interface NavPrefsApi {
