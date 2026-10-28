@@ -261,6 +261,12 @@ enum OsAttachAction {
 /// `agent24 comm …` (COMM-2a/2b; COMM-HYPHAE.md §4's CLI/REST 1:1 mapping).
 #[derive(Subcommand)]
 enum CommAction {
+    /// Download, verify, and set up the pinned Hyphae component
+    Install {
+        /// Print the installation result as JSON without progress messages
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage Hyphae identities
     Identity {
         #[command(subcommand)]
@@ -1332,7 +1338,11 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
     // `send`/`outbox retry` can take up to `5s × 8 relays + 10s = 50s`
     // server-side (COMM-HYPHAE.md §3); give those two a generous timeout too
     // rather than the default 15s.
-    let timeout = if matches!(action, CommAction::Unlock { .. }) {
+    let installing = matches!(action, CommAction::Install { .. });
+    let install_json = matches!(action, CommAction::Install { json: true });
+    let timeout = if installing {
+        Duration::from_secs(360)
+    } else if matches!(action, CommAction::Unlock { .. }) {
         Duration::from_secs(30)
     } else if matches!(action, CommAction::Import { .. }) {
         Duration::from_secs(120)
@@ -1348,6 +1358,11 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
         Duration::from_secs(15)
     };
     let (method, path, body) = match action {
+        CommAction::Install { .. } => (
+            reqwest::Method::POST,
+            "/api/v1/comm/install".to_owned(),
+            None,
+        ),
         CommAction::Import { from, yes, dry_run } => {
             let password = if dry_run {
                 None
@@ -1502,6 +1517,9 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
     if let Some(body) = &body.0 {
         req = req.json(body);
     }
+    if installing && !install_json {
+        eprintln!("正在下载并校验 Hyphae，随后设置通信服务…");
+    }
     let result = req.timeout(timeout).send().await;
     body.zeroize_password();
     let out = match result {
@@ -1509,6 +1527,9 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
             let status = res.status();
             let body: serde_json::Value = res.json().await.unwrap_or_default();
             if status.is_success() {
+                if installing && !install_json {
+                    eprintln!("Hyphae 安装完成。");
+                }
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&body["data"]).unwrap_or_default()
@@ -2499,6 +2520,28 @@ mod tests {
         });
         let out = format_comm_error(&body);
         assert_eq!(out, "comm: not_configured — no default identity");
+    }
+
+    #[test]
+    fn comm_install_has_json_mode_and_no_url_or_hash_overrides() {
+        let cli = Cli::try_parse_from(["agent24", "comm", "install", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Comm {
+                action: CommAction::Install { json: true }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "agent24",
+                "comm",
+                "install",
+                "--url",
+                "https://evil.invalid"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["agent24", "comm", "install", "--sha256", "abc"]).is_err());
     }
 
     #[test]
