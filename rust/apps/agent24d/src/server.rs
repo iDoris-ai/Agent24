@@ -2182,10 +2182,6 @@ pub async fn serve(
         mcp_servers,
         packages_root: Arc::clone(&packages_root),
     });
-    #[cfg(feature = "test-enrollment")]
-    if crate::enroll_test_support::enabled() {
-        state.presence_provider = Some(Arc::new(crate::enroll_test_support::TestPresence));
-    }
     if let Some(capability_store) = capability_store {
         state.enable_capability_auth(capability_store);
         if mode == StartupMode::HostChild {
@@ -2194,6 +2190,12 @@ pub async fn serve(
         state.delegations = Arc::new(crate::capabilities::delegation::Delegations::open(
             &state_dir,
         )?);
+    }
+    // Last, so it wins over the desktop provider that HostChild mode installs
+    // just above (the e2e daemon runs as a host child). Debug test builds only.
+    #[cfg(feature = "test-enrollment")]
+    if crate::enroll_test_support::enabled() {
+        state.presence_provider = Some(Arc::new(crate::enroll_test_support::TestPresence));
     }
 
     // M7 durable expiry recovery runs before durable-resume: a stale approval
