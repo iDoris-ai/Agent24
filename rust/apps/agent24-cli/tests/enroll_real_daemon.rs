@@ -128,7 +128,7 @@ impl Host {
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        write!(stream, "{method} {path} HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", self.token, body.len()).unwrap();
+        write!(stream, "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1:{}\r\nauthorization: Bearer {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", self.port, self.token, body.len()).unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         let status = response.split_whitespace().nth(1).unwrap().parse().unwrap();
@@ -198,7 +198,7 @@ fn real_capabilities_attach_allow_matches_201_shape() {
         "/api/v1/attached",
         &json!({"manifest":manifest_text("baseline"), "allow_relax":false}),
     );
-    assert_eq!(status, 201);
+    assert_eq!(status, 201, "baseline ProductHost attach: {baseline}");
     assert_eq!(
         body.as_object().unwrap().keys().collect::<Vec<_>>(),
         baseline.as_object().unwrap().keys().collect::<Vec<_>>()
