@@ -192,8 +192,13 @@ impl IdorisClient {
         let identity: Identity = read_json_capped(response, 4096, cancel, "iDoris")
             .await
             .map_err(response_error)?;
+        if identity.service == "idoris" && !contract_version_accepted(&identity.contract_version) {
+            return Err(invalid(&format!(
+                "iDoris contract_version {:?} not supported: expected 1.x and >= 1.0.1",
+                identity.contract_version
+            )));
+        }
         if identity.service != "idoris"
-            || identity.contract_version != "1.0.1"
             || identity.version.is_empty()
             || identity.instance_id.is_empty()
             || identity.dev_no_key_enabled
@@ -364,6 +369,24 @@ fn gateway_body(req: &CompletionRequest, role: &str) -> serde_json::Value {
     body
 }
 
+/// 契约版本检查：major == 1 且 (minor, patch) >= (0, 1)，即 1.x 且 >= 1.0.1。
+/// 必须恰为 `主.次.修` 三段十进制整数；多余段、前导 `v`、空串一律拒绝。
+/// 预发布/构建后缀（如 `-rc1`、`+build`）保守起见一律拒绝。
+fn contract_version_accepted(v: &str) -> bool {
+    let mut parts = v.split('.');
+    let mut next = || -> Option<u64> {
+        let p = parts.next()?;
+        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        p.parse().ok()
+    };
+    let (Some(major), Some(minor), Some(patch)) = (next(), next(), next()) else {
+        return false;
+    };
+    parts.next().is_none() && major == 1 && (minor, patch) >= (0, 1)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -453,6 +476,16 @@ mod tests {
                 None,
             )
             .await
+    }
+
+    #[test]
+    fn contract_version_range_is_1x_at_least_1_0_1() {
+        for ok in ["1.0.1", "1.0.2", "1.1.0", "1.9.3"] {
+            assert!(contract_version_accepted(ok), "should accept {ok:?}");
+        }
+        for bad in ["1.0.0", "0.9.9", "2.0.0", "1.1", "v1.1.0", "1.1.0-rc1", ""] {
+            assert!(!contract_version_accepted(bad), "should reject {bad:?}");
+        }
     }
 
     #[test]
