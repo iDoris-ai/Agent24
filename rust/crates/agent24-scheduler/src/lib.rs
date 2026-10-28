@@ -87,6 +87,11 @@ pub use invocation::{
 
 use next_fire::{SpecError, fmt_iso, next_fire, validate};
 
+// Keep a week of completed one-shot schedules for inspection without letting
+// self-wake schedules accumulate indefinitely. Run history is retained.
+const COMPLETED_AT_RETENTION: chrono::TimeDelta = chrono::TimeDelta::days(7);
+const COMPLETED_AT_RECLAIM_INTERVAL: Duration = Duration::from_secs(3600);
+
 #[derive(Debug, thiserror::Error)]
 pub enum ScheduleError {
     #[error("schedule not found: {0}")]
@@ -1058,6 +1063,36 @@ impl Scheduler {
         tick_interval: Duration,
         cancel: CancellationToken,
     ) {
+        // Poll retention independently of the tick cadence. Both futures
+        // belong to this task and share shutdown.
+        tokio::join!(
+            self.run_ticks(Arc::clone(&clock), tick_interval, cancel.clone()),
+            self.run_retention(clock, cancel),
+        );
+    }
+
+    async fn run_retention(&self, clock: Arc<dyn Clock>, cancel: CancellationToken) {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {}
+            () = async {
+                loop {
+                    let cutoff = fmt_iso(clock.now() - COMPLETED_AT_RETENTION);
+                    if let Err(err) = self.store.reclaim_completed_schedules(&cutoff).await {
+                        tracing::error!("completed schedule retention failed: {err}");
+                    }
+                    clock.sleep(COMPLETED_AT_RECLAIM_INTERVAL).await;
+                }
+            } => {}
+        }
+    }
+
+    async fn run_ticks(
+        &self,
+        clock: Arc<dyn Clock>,
+        tick_interval: Duration,
+        cancel: CancellationToken,
+    ) {
         tracing::info!("scheduler loop started (tick {tick_interval:?})");
         loop {
             tokio::select! {
@@ -1402,6 +1437,121 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    struct RetentionClock {
+        now: Mutex<DateTime<Utc>>,
+        sleeps: tokio::sync::mpsc::UnboundedSender<Duration>,
+        tick: tokio::sync::Semaphore,
+        retention: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl Clock for RetentionClock {
+        fn now(&self) -> DateTime<Utc> {
+            *self.now.lock().unwrap()
+        }
+
+        async fn sleep(&self, dur: Duration) {
+            self.sleeps.send(dur).unwrap();
+            let gate = if dur == Duration::from_secs(3600) {
+                &self.retention
+            } else {
+                &self.tick
+            };
+            gate.acquire().await.unwrap().forget();
+        }
+    }
+
+    fn retention_clock(
+        now: DateTime<Utc>,
+    ) -> (
+        Arc<RetentionClock>,
+        tokio::sync::mpsc::UnboundedReceiver<Duration>,
+    ) {
+        let (sleeps, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Arc::new(RetentionClock {
+                now: Mutex::new(now),
+                sleeps,
+                tick: tokio::sync::Semaphore::new(0),
+                retention: tokio::sync::Semaphore::new(0),
+            }),
+            rx,
+        )
+    }
+
+    async fn expect_sleep(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Duration>, dur: Duration) {
+        loop {
+            let observed = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if observed == dur {
+                return;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retention_runs_hourly_with_seven_day_retention_and_stops_on_cancel() {
+        let (sched, _, store) = scheduler_with(RecordingTrigger::new()).await;
+        let mut s = sched
+            .create(every_create(60), utc("2026-07-24T10:00:00Z"))
+            .await
+            .unwrap();
+        s.spec = ScheduleSpec::At {
+            ts: "2026-07-24T10:00:00Z".into(),
+        };
+        s.next_run_at = None;
+        store.upsert_schedule(&s).await.unwrap();
+        insert_completion_run(&store, &s.id, "2026-07-24T10:00:00Z").await;
+        sqlx::query("UPDATE runs SET status = 'completed', ended_at = '2026-07-24T10:00:00Z'")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        let (clock, mut sleeps) = retention_clock(utc("2026-07-31T10:00:00Z"));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(sched.run(clock.clone(), Duration::from_secs(10), cancel.clone()));
+        expect_sleep(&mut sleeps, Duration::from_secs(3600)).await;
+        assert!(
+            store.get_schedule(&s.id).await.unwrap().is_some(),
+            "exactly seven days stays"
+        );
+        *clock.now.lock().unwrap() = utc("2026-07-31T11:00:00Z");
+        clock.tick.add_permits(1);
+        expect_sleep(&mut sleeps, Duration::from_secs(10)).await;
+        assert!(
+            store.get_schedule(&s.id).await.unwrap().is_some(),
+            "ticks must not reclaim more often"
+        );
+        clock.retention.add_permits(1);
+        expect_sleep(&mut sleeps, Duration::from_secs(3600)).await;
+        assert!(store.get_schedule(&s.id).await.unwrap().is_none());
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retention_shutdown_cancels_an_in_flight_store_wait() {
+        let (sched, _, store) = scheduler_with(RecordingTrigger::new()).await;
+        let connection = agent24_store::test_hooks::pool(&store)
+            .acquire()
+            .await
+            .unwrap();
+        let (clock, mut sleeps) = retention_clock(utc("2026-07-31T11:00:00Z"));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(sched.run(clock, Duration::from_secs(10), cancel.clone()));
+        expect_sleep(&mut sleeps, Duration::from_secs(10)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(connection);
     }
 
     #[tokio::test]

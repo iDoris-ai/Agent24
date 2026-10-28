@@ -963,6 +963,7 @@ async fn revoke_capability(
 /// because the person adding such a header is reading this file
 /// (SPEC-ME3-OUT-OF-PROCESS §2.1).
 async fn auth(State(state): State<AppState>, mut req: Request<Body>, next: Next) -> Response {
+    tracing::debug!(path = %req.uri().path(), "request received");
     if req.method() == Method::GET && req.uri().path() == "/api/v1/health" {
         return next.run(req).await;
     }
@@ -1470,6 +1471,8 @@ pub async fn serve(
     ready_omit_token: bool,
     cancel: CancellationToken,
 ) -> Result<(), std::io::Error> {
+    let startup = std::time::Instant::now();
+    tracing::debug!(ephemeral, "startup: serve");
     validate_auth_startup(auth_mode, host_bootstrap_stdio)?;
     let module_grants = crate::consent_routes::grant_settings(
         std::env::var("A24_MODULE_TOOL_GRANTS").ok().as_deref(),
@@ -1656,6 +1659,7 @@ pub async fn serve(
             .await
             .map_err(std::io::Error::other)?
     };
+    tracing::debug!(elapsed_ms = startup.elapsed().as_millis(), "startup: store");
     // NOTE: the startup sweeps (durable-resume restore + orphan cancel) run
     // AFTER the state is built, below — the restore sweep needs the run manager.
     // Tool workspace: the fs whitelist root + shell cwd. Created up front so
@@ -1682,6 +1686,10 @@ pub async fn serve(
         )
         .await;
     }
+    tracing::debug!(
+        elapsed_ms = startup.elapsed().as_millis(),
+        "startup: memory_base"
+    );
     let memory = match memory_base.clone() {
         Some(kv) => match session_memory(kv, &router, &cancel).await {
             Ok(memory) => Some(memory),
@@ -1696,6 +1704,10 @@ pub async fn serve(
         None => None,
     };
 
+    tracing::debug!(
+        elapsed_ms = startup.elapsed().as_millis(),
+        "startup: session_memory"
+    );
     let state_dir = agent24_protocol::state_file::state_dir()
         .ok_or_else(|| std::io::Error::other("HOME not set"))?;
     let packages_root = Arc::new(agent24_os_packages::packages_root(&state_dir, ephemeral));
@@ -2041,7 +2053,12 @@ pub async fn serve(
     // module is started: a port that is taken fails startup here, rather than
     // after packages are running, on a path that would leave them to the
     // runtime's teardown instead of the ordered stop (review of SUP-4, round 4).
+    tracing::debug!(
+        elapsed_ms = startup.elapsed().as_millis(),
+        "startup: before_bind"
+    );
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    tracing::debug!(elapsed_ms = startup.elapsed().as_millis(), "startup: bound");
     let local = listener.local_addr()?;
 
     let host = process_host(
@@ -2645,6 +2662,7 @@ pub async fn serve(
         .await;
         return Ok(());
     }
+    tracing::debug!(elapsed_ms = startup.elapsed().as_millis(), "startup: ready");
     let ready = match auth_mode {
         AuthMode::LegacySingleToken => {
             legacy_ready_line(local.port(), &token, ready_omit_token, &daemon_generation)
@@ -2855,12 +2873,15 @@ fn secure_fallback_dir(path: &std::path::Path) -> Result<(), String> {
 /// If `root` is too long AND its fallback directory is not safe to use (see
 /// [`secure_fallback_dir`]). Does not retry at any other path.
 fn callback_root(root: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    let projected = root
+    // CallbackDir canonicalizes before binding. Measure that same path: on
+    // macOS /var and /tmp expand to /private/var and /private/tmp.
+    let resolved = root.canonicalize().unwrap_or_else(|_| root.to_owned());
+    let projected = resolved
         .join("run")
         .join(std::process::id().to_string())
         .join(format!("{}.sock", u64::MAX));
     if projected.as_os_str().len() <= agent24_os_proto::endpoint::MAX_SOCKET_PATH {
-        return Ok(root.to_owned());
+        return Ok(resolved);
     }
     let fallback =
         std::path::PathBuf::from("/tmp").join(format!("a24-run-{:016x}", fallback_dir_hash(root)));
@@ -6229,6 +6250,24 @@ pub(crate) mod tests {
     /// — never asserted on for its OWN sake.
     fn hashed_fallback_path(root: &std::path::Path) -> std::path::PathBuf {
         std::path::PathBuf::from("/tmp").join(format!("a24-run-{:016x}", fallback_dir_hash(root)))
+    }
+
+    #[tokio::test]
+    async fn callback_root_accounts_for_symlink_expansion_before_choosing_a_socket_path() {
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        let real = base.path().join("x".repeat(100));
+        std::fs::create_dir(&real).unwrap();
+        let alias = base.path().join("short");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let fallback = hashed_fallback_path(&alias);
+
+        // Exercise the real directory creation and bind, not only the length check.
+        let host = process_host(&alias, Duration::from_secs(1)).unwrap();
+        let listener = host.callback_dir.listen_next().unwrap();
+        assert!(listener.path().as_os_str().len() <= agent24_os_proto::endpoint::MAX_SOCKET_PATH);
+        drop(listener);
+        drop(host);
+        std::fs::remove_dir_all(fallback).unwrap();
     }
 
     /// Codex ME4-CODEX-DEBT-10 (#528 High): golden value locking

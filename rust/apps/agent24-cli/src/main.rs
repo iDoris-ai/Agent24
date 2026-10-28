@@ -681,29 +681,45 @@ async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::C
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn {bin}: {e}"))?;
-    let stdout = child.stdout.take().ok_or("no stdout from agent24d")?;
-    let mut lines = BufReader::new(stdout).lines();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        let next = tokio::time::timeout_at(deadline, lines.next_line()).await;
-        let line = match next {
-            Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => return Err("agent24d exited before ready line".into()),
-            Ok(Err(e)) => return Err(format!("reading agent24d stdout: {e}").into()),
-            Err(_) => return Err("agent24d did not become ready within 15s".into()),
-        };
-        let Ok(state) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        if state["type"] == "ready" {
-            let pid = child.id().unwrap_or(0);
-            let parsed = parse_ready_state(&state, pid)?;
-            return Ok((parsed, child));
-        }
-        if state["type"] == "failed" {
-            return Err(start_failure(&state));
+    let state = wait_daemon_ready(&mut child, Duration::from_secs(15)).await?;
+    Ok((state, child))
+}
+
+async fn wait_daemon_ready(
+    child: &mut tokio::process::Child,
+    budget: Duration,
+) -> Result<DaemonState, SpawnError> {
+    let result = async {
+        let stdout = child.stdout.take().ok_or("no stdout from agent24d")?;
+        let mut lines = BufReader::new(stdout).lines();
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let next = tokio::time::timeout_at(deadline, lines.next_line()).await;
+            let line = match next {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) => return Err("agent24d exited before ready line".into()),
+                Ok(Err(e)) => return Err(format!("reading agent24d stdout: {e}").into()),
+                Err(_) => return Err("agent24d did not become ready within 15s".into()),
+            };
+            let Ok(state) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if state["type"] == "ready" {
+                let pid = child.id().unwrap_or(0);
+                let parsed = parse_ready_state(&state, pid)?;
+                return Ok(parsed);
+            }
+            if state["type"] == "failed" {
+                return Err(start_failure(&state));
+            }
         }
     }
+    .await;
+    if result.is_err() {
+        // Startup never transferred ownership to the caller.
+        let _ = child.kill().await;
+    }
+    result
 }
 
 /// Attached if a live daemon is discoverable and healthy; standalone otherwise.
@@ -2525,6 +2541,65 @@ mod tests {
             "context must be nested JSON, not a string"
         );
         assert_eq!(v["outcomes"][0]["label"]["answer"], true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ready_timeout_reaps_the_unready_daemon() {
+        let mut child = tokio::process::Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let result = wait_daemon_ready(&mut child, Duration::ZERO).await;
+        let reaped = child.try_wait().unwrap().is_some();
+        // Clean up the negative control before asserting, too.
+        let _ = child.kill().await;
+        assert_eq!(
+            result.unwrap_err().message,
+            "agent24d did not become ready within 15s"
+        );
+        assert!(
+            reaped,
+            "a failed startup must reap its child before returning"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ready_handshake_preserves_success_and_reaps_invalid_ready() {
+        use tokio::io::AsyncWriteExt;
+
+        for port in [0, 8080] {
+            let mut child = tokio::process::Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let line = format!("{{\"type\":\"ready\",\"port\":{port},\"token\":\"legacy\"}}\n");
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(line.as_bytes())
+                .await
+                .unwrap();
+            let result = wait_daemon_ready(&mut child, Duration::from_secs(15)).await;
+            let reaped = child.try_wait().unwrap().is_some();
+            let _ = child.kill().await;
+            if port == 0 {
+                assert_eq!(result.unwrap_err().message, "ready line has invalid port");
+                assert!(reaped, "invalid readiness must not leave a daemon behind");
+            } else {
+                assert_eq!(result.unwrap().port, port);
+                assert!(
+                    !reaped,
+                    "successful readiness transfers the live child to the caller"
+                );
+            }
+        }
     }
 
     #[test]
