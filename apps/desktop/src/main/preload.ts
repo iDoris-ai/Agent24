@@ -24,6 +24,7 @@ import {
   type ModuleUninstallResult,
   type ModelCallEnvelope,
   type OpenDesignComponentStatusResult,
+  type OmlxAuthRequiredResult,
   type OmlxDetectResult,
   type OmlxModelsResult,
   type OmlxStartResult,
@@ -64,7 +65,7 @@ const api = {
     ipcRenderer.on(IpcChannels.OpenDesignComponentProgress, listener)
     return () => ipcRenderer.removeListener(IpcChannels.OpenDesignComponentProgress, listener)
   },
-  omlxDetect: (): Promise<OmlxDetectResult | null> =>
+  omlxDetect: (): Promise<OmlxDetectResult | OmlxAuthRequiredResult | null> =>
     ipcRenderer.invoke(IpcChannels.OmlxDetect),
   omlxModels: (url: string, apiKey: string): Promise<OmlxModelsResult> =>
     ipcRenderer.invoke(IpcChannels.OmlxModels, url, apiKey),

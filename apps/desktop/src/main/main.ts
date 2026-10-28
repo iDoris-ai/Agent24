@@ -121,6 +121,9 @@ async function showCreativeView(
   if (status.state === 'needs-download') {
     return { ok: false, needsDownload: true, size: status.size }
   }
+  if (status.state === 'failed' && status.notInstalled) {
+    return { ok: false, notInstalled: true, error: status.error }
+  }
   if (status.state !== 'ready' || !status.origin) {
     return { ok: false, error: status.error ?? 'Open Design did not become ready' }
   }

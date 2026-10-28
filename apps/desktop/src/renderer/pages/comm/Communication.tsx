@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
+  CommApiError,
   getCommStatus,
   listCommContacts,
   listCommIdentities,
@@ -81,6 +82,7 @@ export default function CommunicationPage() {
   const [relays, setRelays] = useState<CommRelayConfig | null>(null)
   const [daemon, setDaemon] = useState<CommDaemonStatus | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
+  const [notConfigured, setNotConfigured] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [pending, setPending] = useState<WriteAction | null>(null)
   const [password, setPassword] = useState('')
@@ -99,14 +101,22 @@ export default function CommunicationPage() {
     ])
     if (!mounted.current || token !== sequence.current) return
     const failures: string[] = []
+    let missingSetup = false
+    // `not_configured` means "no Hyphae identity yet": a state to guide the
+    // user out of, not a failed refresh. Only other rejections are errors.
+    const fail = (key: 'error.identities' | 'error.contacts' | 'error.relays' | 'error.process', reason: unknown) => {
+      if (reason instanceof CommApiError && reason.code === 'not_configured') { missingSetup = true; return }
+      failures.push(translate(communicationMessages, key, { message: messageOf(reason) }))
+    }
     if (results[0].status === 'fulfilled') setIdentities(results[0].value)
-    else failures.push(translate(communicationMessages, 'error.identities', { message: messageOf(results[0].reason) }))
+    else fail('error.identities', results[0].reason)
     if (results[1].status === 'fulfilled') setContacts(results[1].value)
-    else failures.push(translate(communicationMessages, 'error.contacts', { message: messageOf(results[1].reason) }))
+    else fail('error.contacts', results[1].reason)
     if (results[2].status === 'fulfilled') setRelays(results[2].value)
-    else failures.push(translate(communicationMessages, 'error.relays', { message: messageOf(results[2].reason) }))
+    else fail('error.relays', results[2].reason)
     if (results[3].status === 'fulfilled') setDaemon(results[3].value)
-    else failures.push(translate(communicationMessages, 'error.process', { message: messageOf(results[3].reason) }))
+    else fail('error.process', results[3].reason)
+    setNotConfigured(missingSetup)
     setLoadError(failures.length ? translate(communicationMessages, 'error.refresh', { details: failures.join(translate(communicationMessages, 'error.separator')) }) : null)
     setRefreshing(false)
   }, [])
@@ -156,7 +166,8 @@ export default function CommunicationPage() {
     }
   }
 
-  const isFresh = !loadError && !refreshing && daemon !== null
+  const isFresh = !loadError && !notConfigured && !refreshing && daemon !== null
+  const setupOnly = notConfigured && !loadError
   return (
     <main className="content comm-page">
       <header className="comm-heading">
@@ -170,6 +181,15 @@ export default function CommunicationPage() {
       {actionError && <div role="alert" className="comm-alert">{t('error.action', { message: actionError })}</div>}
       {notice && <div role="status" className="comm-notice">{notice}</div>}
 
+      {notConfigured && (
+        <section className="comm-card" role="status" aria-label={t('setup.title')}>
+          <h2>{t('setup.title')}</h2>
+          <p className="comm-muted">{t('setup.guide')}</p>
+          <p><code>{t('setup.command')}</code></p>
+        </section>
+      )}
+
+      {!setupOnly && <>
       <section className="comm-card">
         <h2>{t('section.identities')}</h2>
         {identities === null ? <p className="comm-muted">{t('empty.data')}</p> : identities.length === 0 ? <p className="comm-muted">{t('empty.identities')}</p> : (
@@ -214,6 +234,7 @@ export default function CommunicationPage() {
           <button type="submit" disabled={pending !== null || password.length === 0}>{pending === 'unlock' ? t('action.unlocking') : t('action.unlock')}</button>
         </form>
       </section>
+      </>}
     </main>
   )
 }

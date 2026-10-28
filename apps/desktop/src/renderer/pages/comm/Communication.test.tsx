@@ -6,10 +6,11 @@ import CommunicationPage from './Communication'
 import {
   getCommStatus, listCommContacts, listCommIdentities, listCommRelays,
   startCommDaemon, stopCommDaemon, unlockComm,
-  type CommDaemonStatus,
+  CommApiError, type CommDaemonStatus,
 } from './api'
 
-vi.mock('./api', () => ({
+vi.mock('./api', async (importActual) => ({
+  CommApiError: (await importActual<typeof import('./api')>()).CommApiError,
   getCommStatus: vi.fn(), listCommContacts: vi.fn(), listCommIdentities: vi.fn(), listCommRelays: vi.fn(),
   startCommDaemon: vi.fn(), stopCommDaemon: vi.fn(), unlockComm: vi.fn(),
 }))
@@ -51,6 +52,41 @@ describe('CommunicationPage', () => {
     expect(screen.queryByText(/补收完成|已送达/)).not.toBeInTheDocument()
     expect(startCommDaemon).not.toHaveBeenCalled()
     expect(stopCommDaemon).not.toHaveBeenCalled()
+  })
+
+  it('not_configured on every read: shows the guide as a neutral status, not a Refresh-failed alert', async () => {
+    const nc = () => new CommApiError('Not configured', 409, 'not_configured')
+    vi.mocked(listCommIdentities).mockRejectedValue(nc())
+    vi.mocked(listCommContacts).mockRejectedValue(nc())
+    vi.mocked(listCommRelays).mockRejectedValue(nc())
+    vi.mocked(getCommStatus).mockRejectedValue(nc())
+    render(<CommunicationPage />)
+    expect(await screen.findByText('通信尚未配置')).toBeInTheDocument()
+    expect(screen.getByText('agent24 comm identity create <昵称> --default')).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByText(/刷新失败|Refresh failed|not_configured/)).toBeNull()
+  })
+
+  it('a real error still shows as an alert, listing only the real failure, next to the not_configured guide', async () => {
+    const nc = () => new CommApiError('Not configured', 409, 'not_configured')
+    vi.mocked(listCommIdentities).mockRejectedValue(nc())
+    vi.mocked(listCommContacts).mockRejectedValue(nc())
+    vi.mocked(listCommRelays).mockRejectedValue(new CommApiError('relay exploded', 500, 'internal'))
+    vi.mocked(getCommStatus).mockRejectedValue(nc())
+    render(<CommunicationPage />)
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('relay exploded')
+    expect(alert).not.toHaveTextContent('身份：')
+    expect(screen.getByText('通信尚未配置')).toBeInTheDocument()
+  })
+
+  it('all reads failing with a real error is shown as an error, with no setup guide', async () => {
+    for (const fn of [listCommIdentities, listCommContacts, listCommRelays, getCommStatus]) {
+      vi.mocked(fn).mockRejectedValue(new CommApiError('daemon down', 503, 'unavailable'))
+    }
+    render(<CommunicationPage />)
+    expect(await screen.findByRole('alert')).toHaveTextContent('daemon down')
+    expect(screen.queryByText('通信尚未配置')).toBeNull()
   })
 
   it('does not paint locked, gave_up, or missing relay as healthy', async () => {

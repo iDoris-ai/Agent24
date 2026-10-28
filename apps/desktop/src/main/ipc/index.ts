@@ -8,6 +8,7 @@ import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } f
 import { daemonCliEndpoint, daemonConnection, getBackendEndpoint } from '../backend-manager'
 import { findAllowedRoute, proxyError, proxyRequest, timeoutFor } from '../backend-proxy'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
+import { readOmlxSettingsKey } from '../omlx-settings-key'
 import type { IpcGuard } from './guard'
 import { documentsCall } from '../documents'
 import { importFile } from '../documents-import'
@@ -18,6 +19,7 @@ import type {
   BackendProxyResponse,
   LlmStatusResult,
   IdorisStatusResult,
+  OmlxAuthRequiredResult,
   OmlxDetectResult,
   OmlxModelsResult,
   OmlxStartResult,
@@ -37,12 +39,30 @@ function configuredOmlxKey(): string {
   return (process.env['OMLX_API_KEY'] ?? '').trim()
 }
 
-function omlxProbeCandidates(): { url: string; apiKey: string }[] {
+/** A key read from the user's own `~/.omlx/settings.json`. It lives only here,
+ *  in main-process memory: it is attached to requests for exactly the origin it
+ *  was verified against and is never returned over IPC or logged. */
+let discoveredOmlxKey: { origin: string; apiKey: string } | null = null
+
+/** The key to send for `base`: what the caller supplied, or — when it sent none
+ *  — the discovered key, but only for the very origin it was verified on. */
+function effectiveOmlxKey(base: URL, supplied: string): string {
+  if (supplied) return supplied
+  return discoveredOmlxKey && discoveredOmlxKey.origin === base.origin ? discoveredOmlxKey.apiKey : ''
+}
+
+interface OmlxProbeCandidate { url: string; apiKey: string; fromSettings?: boolean }
+
+function omlxProbeCandidates(settingsPath?: string): OmlxProbeCandidate[] {
   const key = configuredOmlxKey()
+  const fromFile = readOmlxSettingsKey(settingsPath)
   return [
     // Keyed probe only when a key is configured.
     ...(key ? [{ url: 'http://127.0.0.1:8088', apiKey: key }] : []),
-    // Keyless probes: a keyed server just answers 401, which reads as "no models".
+    // The key from the user's own oMLX config, for the address that same
+    // config says oMLX listens on.
+    ...(fromFile ? [{ url: fromFile.url, apiKey: fromFile.apiKey, fromSettings: true }] : []),
+    // Keyless probes: a keyed server answers 401 (reported as "auth required").
     { url: 'http://127.0.0.1:8088', apiKey: '' },
     { url: 'http://127.0.0.1:8000', apiKey: '' },
     { url: 'http://127.0.0.1:8001', apiKey: '' },
@@ -77,31 +97,44 @@ function loopbackRequest(
   req.end()
 }
 
-function fetchOmlxModels(url: unknown, apiKey: string): Promise<string[]> {
+interface OmlxProbe { models: string[]; authRequired: boolean }
+
+function probeOmlx(url: unknown, apiKey: string): Promise<OmlxProbe> {
   return new Promise((resolve) => {
     const base = parseLoopbackUrl(url)
-    if (!base) { resolve([]); return }
+    if (!base) { resolve({ models: [], authRequired: false }); return }
     const headers: Record<string, string> = { 'Accept': 'application/json' }
-    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
+    const key = effectiveOmlxKey(base, apiKey)
+    if (key) headers['Authorization'] = `Bearer ${key}`
     try {
     loopbackRequest(
       base,
       '/v1/models',
       { method: 'GET', headers, timeout: 2000 },
       (res) => {
+        // 401/403: something is listening and wants a (different) key.
+        if (res.statusCode === 401 || res.statusCode === 403) {
+          res.resume()
+          resolve({ models: [], authRequired: true })
+          return
+        }
         const chunks: Buffer[] = []
         res.on('data', (c: Buffer) => chunks.push(c))
         res.on('end', () => {
           try {
             const body = JSON.parse(Buffer.concat(chunks).toString()) as { data?: { id: string }[] }
-            resolve((body.data ?? []).map((m) => m.id))
-          } catch { resolve([]) }
+            resolve({ models: (body.data ?? []).map((m) => m.id), authRequired: false })
+          } catch { resolve({ models: [], authRequired: false }) }
         })
       },
-      () => resolve([]),
+      () => resolve({ models: [], authRequired: false }),
     )
-    } catch { resolve([]) }
+    } catch { resolve({ models: [], authRequired: false }) }
   })
+}
+
+function fetchOmlxModels(url: unknown, apiKey: string): Promise<string[]> {
+  return probeOmlx(url, apiKey).then((probe) => probe.models)
 }
 
 // Allowlist of URL prefixes permitted for shell.openExternal. Anything
@@ -212,25 +245,39 @@ const invalidRequest = (message: string): BackendProxyResponse =>
 
 export function registerIpcHandlers(options: {
   idorisStatus?: () => Promise<IdorisStatusResult>
+  /** Test seam: where to look for the user's `~/.omlx/settings.json`. */
+  omlxSettingsPath?: string
   /** A3: every handler below is registered through this (sender validation). */
   guard: IpcGuard
 }): void {
   const handle: typeof ipcMain.handle = (channel, listener) => ipcMain.handle(channel, options.guard(listener))
   // oMLX: auto-detect running server
-  handle(IpcChannels.OmlxDetect, async (): Promise<OmlxDetectResult | null> => {
-    for (const candidate of omlxProbeCandidates()) {
-      const models = await fetchOmlxModels(candidate.url, candidate.apiKey)
-      if (models.length > 0) return { ...candidate, models }
+  handle(IpcChannels.OmlxDetect, async (): Promise<OmlxDetectResult | OmlxAuthRequiredResult | null> => {
+    let authRequiredAt: string | null = null
+    for (const candidate of omlxProbeCandidates(options.omlxSettingsPath)) {
+      const probe = await probeOmlx(candidate.url, candidate.apiKey)
+      if (probe.models.length > 0) {
+        if (candidate.fromSettings) {
+          // Verified: remember it for this origin in main only. The renderer
+          // is handed an empty key, never the one from the user's config file.
+          discoveredOmlxKey = { origin: new URL(candidate.url).origin, apiKey: candidate.apiKey }
+          return { url: candidate.url, apiKey: '', models: probe.models }
+        }
+        return { url: candidate.url, apiKey: candidate.apiKey, models: probe.models }
+      }
+      if (probe.authRequired && authRequiredAt === null) authRequiredAt = candidate.url
     }
-    return null
+    return authRequiredAt ? { authRequired: true, url: authRequiredAt } : null
   })
 
   // oMLX: list models from given url+key (url must be loopback http(s))
   handle(IpcChannels.OmlxModels, async (_event, url: unknown, apiKey: unknown): Promise<OmlxModelsResult> => {
     if (!parseLoopbackUrl(url)) return { ok: false, models: [], error: 'invalid url (loopback http/https only)' }
     if (typeof apiKey === 'string' && hasControlChars(apiKey)) return { ok: false, models: [], error: 'forbidden: invalid api key' }
-    const models = await fetchOmlxModels(url, typeof apiKey === 'string' ? apiKey : '')
-    return models.length > 0 ? { ok: true, models } : { ok: false, models: [], error: 'no response or no models' }
+    const probe = await probeOmlx(url, typeof apiKey === 'string' ? apiKey : '')
+    if (probe.models.length > 0) return { ok: true, models: probe.models }
+    if (probe.authRequired) return { ok: false, models: [], authRequired: true, error: 'authentication required' }
+    return { ok: false, models: [], error: 'no response or no models' }
   })
 
   // oMLX: start server via `omlx serve`
@@ -259,7 +306,8 @@ export function registerIpcHandlers(options: {
     return new Promise((resolve) => {
       const body = JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 })
       const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(body)) }
-      if (key) headers['Authorization'] = `Bearer ${key}`
+      const sendKey = effectiveOmlxKey(base, key)
+      if (sendKey) headers['Authorization'] = `Bearer ${sendKey}`
       loopbackRequest(
         base,
         '/v1/chat/completions',

@@ -21,6 +21,12 @@ const STATUS_LABELS: Record<string, 'status.queued' | 'status.running' | 'status
   interrupted: 'status.interrupted',
 }
 const STORAGE_UNAVAILABLE = 'storage-unavailable'
+const NOTE = { color: 'var(--muted)', fontSize: 13, margin: '8px 0' } as const
+/** The daemon has no documents route at all: the module is not
+ * installed (it ships outside the installer, ADR-DOC-01 D6). That is a state,
+ * not a failure; any other 404 (a document that is gone) stays an error. */
+const moduleNotInstalled = (res: { ok: boolean; status?: number; error?: { code?: string } }): boolean =>
+  !res.ok && res.status === 404 && res.error?.code === 'not_found'
 const ALERT = { color: '#e5534b', fontSize: 13, margin: '8px 0' } as const
 const CELL = { padding: '6px 12px 6px 0', borderBottom: '1px solid var(--border)', textAlign: 'left' } as const
 
@@ -34,6 +40,7 @@ export default function DocumentsPage() {
   const [loadingMore, setLoadingMore] = useState(false)
   const [listError, setListError] = useState<string | null>(null)
   const [unavailable, setUnavailable] = useState<string | null>(null)
+  const [notInstalled, setNotInstalled] = useState(false)
   const [open, setOpen] = useState<string | null>(null)
   // The title that opened the details, given focus back when they close;
   // the page's title if a reload has since taken its row away (a document
@@ -51,10 +58,16 @@ export default function DocumentsPage() {
     setMore(null) // no paging until the new first page is here
     const res = await api.request({ op: 'list' })
     if (gen !== generation.current) return
+    if (moduleNotInstalled(res)) {
+      setNotInstalled(true)
+      setListError(null)
+      return
+    }
     if (!res.ok) {
       setListError(describeError(res))
       return
     }
+    setNotInstalled(false)
     setListError(null)
     setDocs(res.data.documents)
     setMore(res.data.next_cursor ? { gen, cursor: res.data.next_cursor } : null)
@@ -80,7 +93,8 @@ export default function DocumentsPage() {
     let live = true
     void api.request({ op: 'capabilities' }).then((res) => {
       if (!live) return
-      if (!res.ok) setUnavailable(describeError(res))
+      if (moduleNotInstalled(res)) setNotInstalled(true)
+      else if (!res.ok) setUnavailable(describeError(res))
       else setUnavailable(res.data.storage.state === 'ready' ? null : STORAGE_UNAVAILABLE)
     })
     return () => {
@@ -113,13 +127,20 @@ export default function DocumentsPage() {
         {t('title')}
       </div>
       <p style={{ color: 'var(--muted)', fontSize: 12 }}>{t('subtitle')}</p>
-      {unavailable && (
+      {notInstalled && (
+        <div role="status" style={NOTE}>
+          <div>{t('notInstalled.title')}</div>
+          <div>{t('notInstalled.guide')}</div>
+          <code>{t('notInstalled.command')}</code>
+        </div>
+      )}
+      {!notInstalled && unavailable && (
         <div role="alert" style={ALERT}>
           {unavailable === STORAGE_UNAVAILABLE ? t('storage.unavailable') : unavailable}
         </div>
       )}
       <div style={{ display: 'flex', gap: 12, alignItems: 'center', margin: '12px 0' }}>
-        <button className="btn btn-primary" onClick={() => void startImport(api)} disabled={importing}>
+        <button className="btn btn-primary" onClick={() => void startImport(api)} disabled={importing || notInstalled}>
           {t('import.button')}
         </button>
         {importing && !job && progress && progress.total > 0 && (
@@ -143,7 +164,7 @@ export default function DocumentsPage() {
           </button>
         )}
       </div>
-      {(error || listError) && (
+      {!notInstalled && (error || listError) && (
         <div role="alert" style={ALERT}>
           {error ?? listError}
         </div>
