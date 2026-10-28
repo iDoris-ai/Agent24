@@ -156,7 +156,7 @@ async fn call(router: &Router, method: &str, uri: &str, body: Value) -> (StatusC
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires HYPHAE_JOINT_BIN and HYPHAE_JOINT_RELAY; starts a local TCP relay"]
 async fn send_pull_retry_round_trip_against_real_binaries() {
     let Ok(bin_path) = std::env::var("HYPHAE_JOINT_BIN") else {
         eprintln!(

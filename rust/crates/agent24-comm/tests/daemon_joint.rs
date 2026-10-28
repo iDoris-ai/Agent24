@@ -144,7 +144,7 @@ async fn get(router: &Router, uri: &str) -> (StatusCode, Value) {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires HYPHAE_JOINT_BIN and HYPHAE_JOINT_RELAY; starts a local TCP relay"]
 async fn daemon_start_receives_a_real_message_then_stops() {
     let Ok(bin_path) = std::env::var("HYPHAE_JOINT_BIN") else {
         eprintln!(
