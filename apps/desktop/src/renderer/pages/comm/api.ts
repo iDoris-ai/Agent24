@@ -216,7 +216,7 @@ function isUnlockResult(value: unknown): value is CommUnlockResult {
 }
 
 async function request<T>(
-  method: 'GET' | 'POST',
+  method: 'GET' | 'POST' | 'PUT',
   path: string,
   validate: (value: unknown) => value is T,
   body?: unknown,
@@ -283,4 +283,31 @@ export async function installComm(): Promise<CommInstallResult> {
   // Main owns the elevated native confirmation and the fixed installation URL.
   const response: unknown = await window.agent24.commInstall()
   return decodeEnvelope(response, isInstallResult)
+}
+
+// Create responses are passed through by Hyphae; only the public key and
+// nickname are required here. Authoritative identity flags come from list.
+export const createCommIdentity = (nickname: string) =>
+  request('POST', '/api/v1/comm/identity', (value): value is { nickname: string; npub: string } =>
+    isRecord(value) && string(value['nickname']) && string(value['npub']), { nickname, default: true })
+
+export const setCommRelay = (url: string) =>
+  request('PUT', '/api/v1/comm/relay', isRelayConfig, { relays: [url] })
+
+export const probeCommRelay = (url: string) =>
+  request('POST', '/api/v1/comm/relay/probe', (value): value is { url: string | null; connected: boolean; error: string | null } =>
+    isRecord(value) && nullableString(value['url']) && typeof value['connected'] === 'boolean' && nullableString(value['error']), { url })
+
+export async function importCommIdentity(from: string, password: string) {
+  try {
+    return await request('POST', '/api/v1/comm/import', (value): value is { identities: number; contacts: number; outbox: number; db_files: string[] } =>
+      isRecord(value) && typeof value['identities'] === 'number' && typeof value['contacts'] === 'number' &&
+      typeof value['outbox'] === 'number' && Array.isArray(value['db_files']) && value['db_files'].every(string),
+    { from, ...(password ? { password } : {}), confirm: true })
+  } catch (error) {
+    if (password && error instanceof CommApiError && error.message.includes(password)) {
+      throw new CommApiError(translate(communicationMessages, 'api.importFailed'), error.status, error.code)
+    }
+    throw error
+  }
 }
