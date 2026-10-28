@@ -197,7 +197,17 @@ fn challenge_nonce(frame: &Value) -> Option<&str> {
 /// written before the challenge arrives, because bytes queued before the
 /// daemon's accept are refused. `generation` is `daemon.json`'s; the daemon
 /// refuses a mismatch.
-pub async fn enroll(socket: &Path, generation: &str) -> Result<Session, EnrollError> {
+///
+/// `http_port` is `daemon.json`'s port, where the token will be sent. The
+/// `enrolled` frame must name the same port (the daemon reports the port it
+/// actually listens on); otherwise `daemon.json` points the token at some
+/// other listener and enrolment fails with `endpoint_mismatch` before the
+/// token leaves this function (#1446 F1).
+pub async fn enroll(
+    socket: &Path,
+    generation: &str,
+    http_port: u16,
+) -> Result<Session, EnrollError> {
     let stream = tokio::time::timeout(HANDSHAKE_STEP, UnixStream::connect(socket))
         .await
         .map_err(|_| EnrollError::new("daemon_unavailable", "timed out connecting to the daemon"))?
@@ -236,6 +246,13 @@ pub async fn enroll(socket: &Path, generation: &str) -> Result<Session, EnrollEr
         .as_str()
         .filter(|t| !t.is_empty())
         .ok_or_else(|| EnrollError::new("bad_frame", "enrolled frame carries no token"))?;
+    if enrolled["http_port"].as_u64() != Some(u64::from(http_port)) {
+        return Err(EnrollError::new(
+            "endpoint_mismatch",
+            "daemon.json's port is not the port of the daemon that enrolled this CLI; \
+             refusing to send credentials there",
+        ));
+    }
     Ok(Session {
         token: Zeroizing::new(token.to_owned()),
         conn: tokio::sync::Mutex::new(conn),

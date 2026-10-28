@@ -51,6 +51,8 @@ enum HttpMode {
 struct Fake {
     http_port: u16,
     posts: Arc<Mutex<Vec<HttpSeen>>>,
+    /// Every HTTP request line with its headers, health probes included.
+    requests: Requests,
     frames: Arc<Mutex<Vec<Value>>>,
     /// Enrolment connections the fake has finished with.
     closed: Arc<AtomicUsize>,
@@ -92,7 +94,17 @@ fn respond(stream: &mut TcpStream, status: &str, body: &Value) {
     );
 }
 
+type Requests = Arc<Mutex<Vec<(String, HashMap<String, String>)>>>;
+
 fn spawn_http(mode: HttpMode, posts: Arc<Mutex<Vec<HttpSeen>>>) -> u16 {
+    spawn_http_recording(mode, posts, Arc::default())
+}
+
+fn spawn_http_recording(
+    mode: HttpMode,
+    posts: Arc<Mutex<Vec<HttpSeen>>>,
+    requests: Requests,
+) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
@@ -101,6 +113,10 @@ fn spawn_http(mode: HttpMode, posts: Arc<Mutex<Vec<HttpSeen>>>) -> u16 {
             let Some((line, headers, body)) = read_http(&mut stream) else {
                 continue;
             };
+            requests
+                .lock()
+                .unwrap()
+                .push((line.trim_end().to_owned(), headers.clone()));
             if line.starts_with("GET /api/v1/health") {
                 respond(
                     &mut stream,
@@ -180,6 +196,8 @@ struct UdsScript {
     elevate_replies: Vec<Value>,
     /// Replace the well-formed `challenge` with this frame.
     challenge: Option<Value>,
+    /// Report this HTTP port in `enrolled` instead of the fake's real one.
+    enrolled_port: Option<u16>,
 }
 
 fn pending_then(final_frame: Value) -> Vec<Value> {
@@ -199,6 +217,7 @@ fn presence_error(code: &str) -> Value {
 
 fn serve_uds(
     listener: UnixListener,
+    http_port: u16,
     script: UdsScript,
     frames: Arc<Mutex<Vec<Value>>>,
     closed: Arc<AtomicUsize>,
@@ -206,7 +225,7 @@ fn serve_uds(
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
-            handle_uds(stream, &script, &frames);
+            handle_uds(stream, http_port, &script, &frames);
             closed.fetch_add(1, Ordering::SeqCst);
         }
     });
@@ -223,7 +242,12 @@ fn challenge() -> Value {
 /// Server first, like the real daemon: `challenge`, then a `hello` that must
 /// echo the nonce, then `enrolled`; afterwards answer each frame with the
 /// scripted elevation replies. Every frame the client sends is recorded.
-fn handle_uds(mut stream: UnixStream, script: &UdsScript, frames: &Arc<Mutex<Vec<Value>>>) {
+fn handle_uds(
+    mut stream: UnixStream,
+    http_port: u16,
+    script: &UdsScript,
+    frames: &Arc<Mutex<Vec<Value>>>,
+) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let sent = script.challenge.clone().unwrap_or_else(challenge);
     send(&mut stream, &sent);
@@ -248,7 +272,8 @@ fn handle_uds(mut stream: UnixStream, script: &UdsScript, frames: &Arc<Mutex<Vec
     send(
         &mut stream,
         &json!({"v":1,"op":"enrolled","token":TOKEN,"expires_in":3600,"tier":"daily",
-                "identity":{"kind":"macos_seccode","identifier":"agent24"}}),
+                "identity":{"kind":"macos_seccode","identifier":"agent24"},
+                "http_port": script.enrolled_port.unwrap_or(http_port)}),
     );
     loop {
         line.clear();
@@ -267,10 +292,12 @@ fn start(mode: HttpMode, script: UdsScript, home: &Path) -> Fake {
     let posts = Arc::new(Mutex::new(Vec::new()));
     let frames = Arc::new(Mutex::new(Vec::new()));
     let closed = Arc::new(AtomicUsize::new(0));
-    let http_port = spawn_http(mode, Arc::clone(&posts));
+    let requests: Requests = Arc::default();
+    let http_port = spawn_http_recording(mode, Arc::clone(&posts), Arc::clone(&requests));
     let sock = home.join("enroll.sock");
     serve_uds(
         UnixListener::bind(&sock).unwrap(),
+        http_port,
         script,
         Arc::clone(&frames),
         Arc::clone(&closed),
@@ -285,6 +312,7 @@ fn start(mode: HttpMode, script: UdsScript, home: &Path) -> Fake {
     Fake {
         http_port,
         posts,
+        requests,
         frames,
         closed,
     }
@@ -380,6 +408,7 @@ fn script(elevate_replies: Vec<Value>) -> UdsScript {
         handshake_error: None,
         elevate_replies,
         challenge: None,
+        enrolled_port: None,
     }
 }
 
@@ -546,6 +575,7 @@ fn generation_mismatch_is_reported_and_nothing_is_sent_over_http() {
             handshake_error: None,
             elevate_replies: vec![],
             challenge: None,
+            enrolled_port: None,
         },
         home.path(),
     );
@@ -566,6 +596,7 @@ fn identity_rejected_is_reported() {
             handshake_error: Some(presence_error("identity_rejected")),
             elevate_replies: vec![],
             challenge: None,
+            enrolled_port: None,
         },
         home.path(),
     );
@@ -844,6 +875,84 @@ fn bad_challenge_is_bad_frame_and_no_hello_is_sent() {
         }
         assert!(fake.frames.lock().unwrap().is_empty(), "{bad}: hello sent");
         assert!(fake.posts.lock().unwrap().is_empty());
+        assert_no_secret(&stdout, &stderr);
+    }
+}
+
+/// #1446 F1: the HTTP side is an independent listener named only by
+/// `daemon.json`. If the daemon that enrolled the CLI reports a different
+/// HTTP port, the token must never reach that listener: no request carries a
+/// credential, and nothing but the anonymous pre-enrolment health probe
+/// (which carries no credential) arrives at all.
+#[test]
+fn enrolled_port_mismatch_sends_nothing_to_daemon_json_port() {
+    let home = tmp_home();
+    let posts = Arc::new(Mutex::new(Vec::new()));
+    let requests: Requests = Arc::default();
+    let listener_port = spawn_http_recording(
+        HttpMode::CreateDirect,
+        Arc::clone(&posts),
+        Arc::clone(&requests),
+    );
+    // The enrolling daemon reports its own HTTP port (the fake's); daemon.json
+    // is then rewritten to point at the independent listener instead.
+    let fake = start(HttpMode::CreateDirect, script(vec![]), home.path());
+    let path = home.path().join(".agent24/daemon.json");
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(record["port"], fake.http_port);
+    assert_ne!(fake.http_port, listener_port);
+    record["port"] = json!(listener_port);
+    write_daemon_json(home.path(), &record);
+
+    let (ok, stdout, stderr) = run_add(home.path());
+    assert!(!ok, "{stdout} {stderr}");
+    assert_eq!(error_body(&stdout)["error"]["code"], "endpoint_mismatch");
+    assert_no_secret(&stdout, &stderr);
+    let seen = requests.lock().unwrap();
+    assert!(
+        seen.iter()
+            .all(|(line, headers)| line.starts_with("GET /api/v1/health")
+                && !headers.contains_key("authorization")
+                && !headers.contains_key("x-agent24-elevation")),
+        "{seen:?}"
+    );
+    assert!(posts.lock().unwrap().is_empty());
+    assert!(fake.requests.lock().unwrap().is_empty());
+    assert!(
+        fake.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|f| f["op"] == "hello")
+    );
+}
+
+/// An `enrolled` frame naming any other port (0 is what a daemon with no
+/// HTTP port to report sends) is refused the same way.
+#[test]
+fn enrolled_frame_must_name_daemon_json_port() {
+    for reported in [Some(0), Some(1)] {
+        let home = tmp_home();
+        let fake = start(
+            HttpMode::CreateDirect,
+            UdsScript {
+                enrolled_port: reported,
+                ..script(vec![])
+            },
+            home.path(),
+        );
+        let (ok, stdout, stderr) = run_add(home.path());
+        assert!(!ok, "{stdout} {stderr}");
+        assert_eq!(error_body(&stdout)["error"]["code"], "endpoint_mismatch");
+        assert!(fake.posts.lock().unwrap().is_empty());
+        assert!(
+            fake.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(line, h)| line.starts_with("GET /api/v1/health")
+                    && !h.contains_key("authorization"))
+        );
         assert_no_secret(&stdout, &stderr);
     }
 }

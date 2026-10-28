@@ -542,12 +542,24 @@ enum ServiceAction {
 
 struct Endpoint {
     base: String,
+    /// The bearer in legacy / ephemeral mode. Empty in capabilities mode:
+    /// there the enrolled token stays in the session's `Zeroizing` buffer and
+    /// is read through [`Endpoint::token`], so no plain copy is kept (#1446 F4).
     token: String,
     /// Ephemeral child to terminate when the CLI exits (standalone mode)
     child: Option<tokio::process::Child>,
     /// Capabilities-mode enrolment (CORE-2 S4): holds the live enrolment
     /// connection that `elevate` needs. `None` in legacy/ephemeral mode.
     session: Option<Box<enroll::Session>>,
+}
+
+impl Endpoint {
+    /// The bearer to send: the enrolled session's token, else `token`.
+    fn token(&self) -> &str {
+        self.session
+            .as_deref()
+            .map_or(self.token.as_str(), enroll::Session::token)
+    }
 }
 
 const HOST_AUTHORITY_UNAVAILABLE: &str = "host authority unavailable";
@@ -856,10 +868,14 @@ async fn attach_discovered_with(state: &DaemonState, enroll_if_possible: bool) -
     }
     if state.auth_mode.is_capabilities() {
         if let (true, Some(socket)) = (enroll_if_possible, state.enroll_endpoint.as_deref()) {
-            return match enroll::enroll(std::path::Path::new(socket), &state.generation).await {
+            // The session's `enrolled` frame must name `state.port`, or the
+            // token would go to whoever listens there (#1446 F1).
+            let enrolled =
+                enroll::enroll(std::path::Path::new(socket), &state.generation, state.port).await;
+            return match enrolled {
                 Ok(session) => DiscoveredAttach::Ready(Endpoint {
                     base,
-                    token: session.token().to_owned(),
+                    token: String::new(),
                     child: None,
                     session: Some(Box::new(session)),
                 }),
@@ -956,7 +972,7 @@ async fn cmd_mcp() -> Result<(), String> {
             .ok()
             .as_deref(),
     );
-    let result = agent24_mcp::server::Agent24Server::new(ep.base.clone(), ep.token.clone())
+    let result = agent24_mcp::server::Agent24Server::new(ep.base.clone(), ep.token().to_owned())
         .with_run_timeout(run_timeout)
         .serve_stdio()
         .await
@@ -976,10 +992,10 @@ async fn cmd_acp() -> Result<(), String> {
 }
 
 fn bearer(ep: &Endpoint, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    if ep.token.is_empty() {
+    if ep.token().is_empty() {
         rb
     } else {
-        rb.bearer_auth(&ep.token)
+        rb.bearer_auth(ep.token())
     }
 }
 
@@ -2802,7 +2818,7 @@ async fn cmd_tui() -> Result<(), String> {
     let ep = connect().await?;
     let conn = tui::Conn {
         base: ep.base.clone(),
-        token: ep.token.clone(),
+        token: ep.token().to_owned(),
     };
     let result = tui::run(conn).await;
     finish(ep).await;

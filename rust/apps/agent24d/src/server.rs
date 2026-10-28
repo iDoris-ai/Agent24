@@ -3007,7 +3007,12 @@ pub async fn serve(
     if let Some(endpoint) = enroll.as_mut()
         && let Some(authority) = enroll_authority
     {
-        endpoint.serve(cancel.clone(), daemon_generation.clone(), authority);
+        endpoint.serve(
+            cancel.clone(),
+            daemon_generation.clone(),
+            local.port(),
+            authority,
+        );
     }
 
     // The state file is written; now readiness and a shutdown request race
