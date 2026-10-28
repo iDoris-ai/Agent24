@@ -448,6 +448,36 @@ mod schedules_rest_guard {
         };
         row.next_run_at = None;
         state.store.upsert_schedule(&row).await.unwrap();
+        // The triggered run is still active: cleanup must keep its grants.
+        assert_eq!(
+            delete_schedule(
+                State(state.clone()),
+                req_json("DELETE", &uri, serde_json::Value::Null)
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        for run in state.store.list_runs(None).await.unwrap() {
+            if run.schedule_id.as_deref() == Some(id)
+                && !matches!(
+                    run.status,
+                    agent24_protocol::RunStatus::Completed
+                        | agent24_protocol::RunStatus::Failed
+                        | agent24_protocol::RunStatus::Cancelled
+                )
+            {
+                state
+                    .store
+                    .transition_run(
+                        &run.id,
+                        agent24_protocol::RunStatus::Cancelled,
+                        Default::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
         assert_eq!(
             delete_schedule(
                 State(state.clone()),

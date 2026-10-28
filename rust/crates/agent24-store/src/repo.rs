@@ -27,11 +27,12 @@ pub struct ScheduleStatus {
 
 // Run status describes execution, not trigger acceptance. A persisted run in
 // ANY state proves acceptance; last_run_at only proves a pre-advance attempt.
+// Runs store created_at at second precision, so truncate at.ts to seconds too.
 const SCHEDULE_STATUS_SELECT: &str = "SELECT schedules.*,
     (owner_module IS NULL AND json_extract(spec, '$.type') = 'at'
      AND next_run_at IS NULL AND EXISTS (
         SELECT 1 FROM runs WHERE runs.schedule_id = schedules.id
-        AND julianday(runs.created_at) >= julianday(json_extract(schedules.spec, '$.ts'))
+        AND julianday(runs.created_at) >= julianday(strftime('%Y-%m-%dT%H:%M:%S', json_extract(schedules.spec, '$.ts')))
      )) AS completed FROM schedules";
 
 pub(crate) fn status_str(s: RunStatus) -> &'static str {
@@ -1017,6 +1018,18 @@ impl Store {
                     return Err(StoreError::Conflict("schedule is not completed".into()));
                 }
                 Some(_) => {}
+            }
+            // Completion proves trigger acceptance, not that execution ended.
+            // Keep grants for queued/running/approval-waiting runs as well.
+            let has_active_run: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM runs WHERE schedule_id = ? \
+                 AND status IN ('queued', 'running', 'awaiting_approval'))",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if has_active_run {
+                return Err(StoreError::Conflict("schedule has active runs".into()));
             }
         }
         let result = sqlx::query("DELETE FROM schedules WHERE id = ?")

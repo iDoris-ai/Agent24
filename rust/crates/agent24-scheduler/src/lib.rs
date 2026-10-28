@@ -508,7 +508,11 @@ impl Scheduler {
             } else {
                 None
             };
-            if update.spec.is_some() {
+            // Repeated schedules restart their failure budget on recompute;
+            // only an unchanged at spec retains the failed-trigger signal.
+            if update.spec.is_some()
+                || !matches!(schedule.spec, agent24_protocol::ScheduleSpec::At { .. })
+            {
                 schedule.consecutive_failures = 0;
             }
         }
@@ -1319,6 +1323,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_at_with_fractional_seconds_matches_second_precision_run() {
+        let (sched, _, store) = scheduler_with(RecordingTrigger::new()).await;
+        let mut create = every_create(60);
+        create.spec = ScheduleSpec::At {
+            ts: "2026-07-24T12:01:00.500+02:00".into(),
+        };
+        let created = sched
+            .create(create, utc("2026-07-24T10:00:00Z"))
+            .await
+            .unwrap();
+        sched.tick(utc("2026-07-24T10:01:00.500Z")).await.unwrap();
+        insert_completion_run(&store, &created.id, "2026-07-24T10:00:59Z").await;
+        assert!(!sched.status(&created.id).await.unwrap().completed);
+        insert_completion_run(&store, &created.id, "2026-07-24T10:01:00Z").await;
+        assert!(sched.status(&created.id).await.unwrap().completed);
+        assert!(sched.statuses().await.unwrap().remove(0).completed);
+    }
+
+    #[tokio::test]
+    async fn completed_cleanup_preserves_grants_until_all_runs_finish() {
+        use agent24_protocol::RunStatus;
+
+        let (sched, _, store) = scheduler_with(RecordingTrigger::new()).await;
+        let mut create = every_create(60);
+        create.spec = ScheduleSpec::At {
+            ts: "2026-07-24T10:01:00Z".into(),
+        };
+        let created = sched
+            .create(create, utc("2026-07-24T10:00:00Z"))
+            .await
+            .unwrap();
+        sched.tick(utc("2026-07-24T10:01:05Z")).await.unwrap();
+        insert_completion_run(&store, &created.id, "2026-07-24T10:01:05Z").await;
+        let grant = agent24_store::StandingGrant {
+            id: "grant_cleanup".into(),
+            scope_kind: "schedule".into(),
+            scope_id: created.id.clone(),
+            tool: "mcp_slack_post".into(),
+            target: "#ops".into(),
+            created_at: "2026-07-24T10:00:00Z".into(),
+        };
+        store.insert_standing_grant(&grant).await.unwrap();
+        for status in [
+            RunStatus::Queued,
+            RunStatus::Running,
+            RunStatus::AwaitingApproval,
+        ] {
+            let mut active = store.list_runs(None).await.unwrap().remove(0);
+            active.id = format!("run_active_{status:?}");
+            active.status = status;
+            // An older run must also keep its grants, even when a newer run
+            // supplies completion evidence for the current spec.
+            active.created_at = "2026-07-24T10:00:00Z".into();
+            store.insert_run(&active).await.unwrap();
+            assert!(sched.status(&created.id).await.unwrap().completed);
+            assert!(matches!(
+                sched.delete_completed(&created.id).await,
+                Err(ScheduleError::NotCompleted(_))
+            ));
+            assert!(store.get_schedule(&created.id).await.unwrap().is_some());
+            assert!(
+                store
+                    .standing_grant_exists("schedule", &created.id, &grant.tool, &grant.target)
+                    .await
+                    .unwrap()
+            );
+            store
+                .transition_run(&active.id, RunStatus::Cancelled, Default::default())
+                .await
+                .unwrap();
+        }
+        sched.delete_completed(&created.id).await.unwrap();
+        assert!(store.get_schedule(&created.id).await.unwrap().is_none());
+        assert!(
+            !store
+                .standing_grant_exists("schedule", &created.id, &grant.tool, &grant.target)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn create_computes_next_run_at() {
         let trig = RecordingTrigger::new();
         let (sched, _ev, _store) = scheduler_with(trig).await;
@@ -1450,6 +1536,46 @@ mod tests {
         assert_eq!(seen.iter().filter(|e| *e == "schedule.disabled").count(), 1);
         // Disabled → subsequent ticks are no-ops
         assert_eq!(sched.tick(t).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn reenable_every_after_five_failures_resets_failure_budget() {
+        let (sched, _, store) = scheduler_with(RecordingTrigger::always_failing()).await;
+        let created = sched
+            .create(every_create(60), utc("2026-07-24T10:00:00Z"))
+            .await
+            .unwrap();
+        let mut now = utc("2026-07-24T10:01:05Z");
+        for _ in 0..5 {
+            sched.tick(now).await.unwrap();
+            now += chrono::Duration::seconds(60);
+        }
+        let disabled = sched.get(&created.id).await.unwrap();
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.consecutive_failures, 5);
+        let reenabled = sched
+            .update(
+                &created.id,
+                ScheduleUpdate {
+                    enabled: Some(true),
+                    ..Default::default()
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reenabled.consecutive_failures, 0);
+        assert_eq!(
+            sched.get(&created.id).await.unwrap().consecutive_failures,
+            0
+        );
+        sched
+            .tick(now + chrono::Duration::seconds(60))
+            .await
+            .unwrap();
+        let after = store.get_schedule(&created.id).await.unwrap().unwrap();
+        assert!(after.enabled);
+        assert_eq!(after.consecutive_failures, 1);
     }
 
     #[tokio::test]
