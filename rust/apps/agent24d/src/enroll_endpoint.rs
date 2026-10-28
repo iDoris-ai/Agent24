@@ -323,6 +323,36 @@ fn verify_peer(
     verifier.verify(pid, audit_token)
 }
 
+/// LOCAL_PEERTOKEN is evaluated when it is read, not when the peer connected:
+/// a forked holder of the socket takes over the reported identity as soon as
+/// it writes. So the token read at accept time proves nothing about who sends
+/// later frames; every received frame is re-tested against it (design R7).
+#[cfg(unix)]
+fn peer_unchanged(
+    stream: &tokio::net::UnixStream,
+    expected: Option<agent24_os_proc::AuditToken>,
+) -> bool {
+    expected
+        .is_none_or(|token| agent24_os_proc::peer_audit_token(stream).is_ok_and(|now| now == token))
+}
+
+/// Read the next frame, then confirm the writer is still the accepted peer.
+/// The comparison covers malformed frames too, so a holder cannot hide behind
+/// a parse error; a mismatch always wins over any other outcome.
+#[cfg(unix)]
+async fn next_frame(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    expected: Option<agent24_os_proc::AuditToken>,
+) -> Result<Option<Frame>, EnrollErrorCode> {
+    let frame = read_frame(reader).await;
+    if !matches!(frame, Ok(None) | Err(EnrollErrorCode::Timeout))
+        && !peer_unchanged(reader.get_ref().as_ref(), expected)
+    {
+        return Err(EnrollErrorCode::IdentityRejected);
+    }
+    frame
+}
+
 #[cfg(unix)]
 async fn answer(
     stream: tokio::net::UnixStream,
@@ -354,7 +384,7 @@ async fn answer(
     };
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
-    let hello = match read_frame(&mut reader).await {
+    let hello = match next_frame(&mut reader, audit_token).await {
         Ok(Some(frame)) => frame,
         Ok(None) => return,
         Err(code) => {
@@ -420,6 +450,12 @@ async fn answer(
             return;
         }
     };
+    // The connection may have changed hands while the token was being issued.
+    if !peer_unchanged(reader.get_ref().as_ref(), audit_token) {
+        authority.revoke(&peer, &token.token_id);
+        send_error(&mut write, EnrollErrorCode::IdentityRejected).await;
+        return;
+    }
     if enrolled(&mut write, &token, &peer).await.is_err() {
         return;
     }
@@ -432,10 +468,13 @@ async fn answer(
             Ok(Ok([])) | Ok(Err(_)) | Err(_) => return,
             _ => {}
         }
-        let frame = match read_frame(&mut reader).await {
+        let frame = match next_frame(&mut reader, audit_token).await {
             Ok(Some(frame)) => frame,
             Ok(None) => return,
             Err(code) => {
+                if code == EnrollErrorCode::IdentityRejected {
+                    authority.revoke(&peer, &token_id);
+                }
                 send_error(&mut write, code).await;
                 return;
             }
@@ -530,6 +569,11 @@ async fn answer(
                     send_error(&mut write, code).await;
                     return;
                 }
+                if !peer_unchanged(reader.get_ref().as_ref(), audit_token) {
+                    authority.revoke(&peer, &token_id);
+                    send_error(&mut write, EnrollErrorCode::IdentityRejected).await;
+                    return;
+                }
                 match result {
                     Ok(grant) => {
                         #[derive(serde::Serialize)]
@@ -564,6 +608,12 @@ async fn answer(
         };
         match result {
             Ok(new) => {
+                if !peer_unchanged(reader.get_ref().as_ref(), audit_token) {
+                    authority.revoke(&peer, &new.token_id);
+                    authority.revoke(&peer, &token_id);
+                    send_error(&mut write, EnrollErrorCode::IdentityRejected).await;
+                    return;
+                }
                 if enrolled(&mut write, &new, &peer).await.is_err() {
                     return;
                 }
@@ -951,73 +1001,238 @@ mod handshake_tests {
         }
     }
     #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn forked_child_cannot_enroll_after_connecting_parent_execs() {
+    struct HeldPeer {
+        child: tokio::process::Child,
+        output: BufReader<tokio::process::ChildStdout>,
+    }
+    #[cfg(target_os = "macos")]
+    impl HeldPeer {
+        async fn connect(socket: &Path, operation: &str) -> Self {
+            let mut child = tokio::process::Command::new("python3")
+                .args(["-c", include_str!("tests/fixtures/held_peer.py")])
+                .arg(socket)
+                .arg(operation)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let output = BufReader::new(child.stdout.take().unwrap());
+            let mut peer = Self { child, output };
+            assert_eq!(peer.line().await["stage"], "connected");
+            peer
+        }
+        async fn line(&mut self) -> serde_json::Value {
+            tokio::time::timeout(Duration::from_secs(10), line(&mut self.output))
+                .await
+                .unwrap()
+        }
+        async fn command(&mut self, command: u8) {
+            self.child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(&[command])
+                .await
+                .unwrap();
+        }
+        async fn fork(&mut self) {
+            self.command(b'e').await;
+            assert_eq!(self.line().await["stage"], "holder_ready");
+        }
+        async fn finish(mut self) -> String {
+            self.command(b'q').await;
+            let mut output = String::new();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                self.output.read_to_string(&mut output),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(self.child.wait().await.unwrap().success());
+            output
+        }
+    }
+    #[cfg(target_os = "macos")]
+    #[derive(Default)]
+    struct PeerAuthority {
+        issued: AtomicUsize,
+        revoked: AtomicUsize,
+    }
+    #[cfg(target_os = "macos")]
+    #[async_trait]
+    impl EnrollAuthority for PeerAuthority {
+        fn issue(&self, _peer: &EnrolledPeer) -> Result<IssuedToken, EnrollErrorCode> {
+            self.issued.fetch_add(1, Ordering::SeqCst);
+            Ok(IssuedToken {
+                token_id: "held-id".into(),
+                secret: zeroize::Zeroizing::new("held-secret".into()),
+                expires_in: 3600,
+            })
+        }
+        fn revoke(&self, _peer: &EnrolledPeer, id: &str) {
+            assert_eq!(id, "held-id");
+            self.revoked.fetch_add(1, Ordering::SeqCst);
+        }
+        fn renew(&self, peer: &EnrolledPeer, _id: &str) -> Result<IssuedToken, EnrollErrorCode> {
+            self.issue(peer)
+        }
+        async fn elevate(
+            &self,
+            _peer: &EnrolledPeer,
+            _id: &str,
+            _request: ElevateRequest,
+            _pending: tokio::sync::oneshot::Sender<String>,
+            _cancel: CancellationToken,
+        ) -> Result<ElevationGrant, EnrollErrorCode> {
+            Err(EnrollErrorCode::PresenceUnavailable)
+        }
+    }
+    /// Flags once `answer` has passed its peer_cred checks (start_time is the
+    /// first verifier call). LOCAL_PEERPID is also evaluated at call time, so
+    /// the holder must not write before that point or the connection would be
+    /// dropped silently instead of exercising the per-frame token check.
+    #[cfg(target_os = "macos")]
+    struct ReadyVerifier(Arc<std::sync::atomic::AtomicBool>);
+    #[cfg(target_os = "macos")]
+    impl IdentityVerifier for ReadyVerifier {
+        fn start_time(&self, pid: i32) -> io::Result<ProcStart> {
+            let start = KernelStartVerifier.start_time(pid);
+            self.0.store(true, Ordering::SeqCst);
+            start
+        }
+        fn verify(
+            &self,
+            pid: i32,
+            audit_token: Option<agent24_os_proc::AuditToken>,
+        ) -> Result<VerifiedIdentity, EnrollErrorCode> {
+            KernelStartVerifier.verify(pid, audit_token)
+        }
+    }
+    #[cfg(target_os = "macos")]
+    async fn reject_exec_holder(exec_before_accept: bool) {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         let socket = dir.path().join("peer.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let mut child = tokio::process::Command::new("python3")
-            .args(["-c", include_str!("tests/fixtures/exec_peer.py")])
-            .arg(&socket)
-            .arg("fork")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let (stream, _) = listener.accept().await.unwrap();
-        let permits = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = Arc::new(permits.acquire_owned().await.unwrap());
-        // Wait until answer has sampled the connecting process, before exec.
-        struct ReadyVerifier(Arc<std::sync::atomic::AtomicBool>);
-        impl IdentityVerifier for ReadyVerifier {
-            fn start_time(&self, pid: i32) -> io::Result<ProcStart> {
-                let start = SystemIdentityVerifier.start_time(pid);
-                self.0.store(true, Ordering::SeqCst);
-                start
-            }
-            fn verify(
-                &self,
-                pid: i32,
-                audit_token: Option<agent24_os_proc::AuditToken>,
-            ) -> Result<VerifiedIdentity, EnrollErrorCode> {
-                KernelStartVerifier.verify(pid, audit_token)
-            }
+        let mut child = HeldPeer::connect(&socket, "hello").await;
+        if exec_before_accept {
+            child.fork().await;
         }
+        let (stream, _) = listener.accept().await.unwrap();
+        let audit_token = agent24_os_proc::peer_audit_token(&stream).unwrap();
+        assert_eq!(audit_token.pid(), child.child.id().unwrap() as i32);
+        let start = SystemIdentityVerifier
+            .start_time(audit_token.pid())
+            .unwrap();
+        if !exec_before_accept {
+            child.fork().await;
+        }
+        assert_eq!(
+            SystemIdentityVerifier
+                .start_time(audit_token.pid())
+                .unwrap(),
+            start
+        );
+        assert_eq!(
+            agent24_os_proc::audit_token_is_live(audit_token),
+            exec_before_accept
+        );
+        let authority = Arc::new(PeerAuthority::default());
+        let permit = Arc::new(
+            Arc::new(tokio::sync::Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .unwrap(),
+        );
         let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let audit_token = Some(agent24_os_proc::peer_audit_token(&stream).unwrap());
         let task = tokio::spawn(answer(
             stream,
-            audit_token,
+            Some(audit_token),
             "g".into(),
-            Arc::new(crate::capabilities::first_party::FirstPartyAuthority::new(
-                crate::capabilities::CapabilityStore::new("g"),
-            )),
+            authority.clone(),
             Arc::new(ReadyVerifier(ready.clone())),
             CancellationToken::new(),
-            permit.clone(),
+            permit,
         ));
-        while !ready.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-            if task.is_finished() {
-                panic!("connection closed before exec");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ready.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
             }
+        })
+        .await
+        .unwrap();
+        child.command(b'h').await;
+        let output = child.finish().await;
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(authority.issued.load(Ordering::SeqCst), 0, "{output}");
+        assert!(output.contains("identity_rejected"), "{output}");
+        assert!(!output.contains("enrolled"), "{output}");
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn forked_child_cannot_enroll_after_connecting_parent_execs() {
+        reject_exec_holder(false).await;
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn forked_child_cannot_enroll_when_parent_execs_before_accept() {
+        reject_exec_holder(true).await;
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn verify_peer_rejects_exec_even_when_start_time_is_unchanged() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = dir.path().join("peer.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut child = HeldPeer::connect(&socket, "hello").await;
+        let (stream, _) = listener.accept().await.unwrap();
+        let token = agent24_os_proc::peer_audit_token(&stream).unwrap();
+        let start = SystemIdentityVerifier.start_time(token.pid()).unwrap();
+        assert!(verify_peer(&KernelStartVerifier, token.pid(), Some(token)).is_ok());
+        child.fork().await;
+        let result = verify_peer(&KernelStartVerifier, token.pid(), Some(token));
+        assert_eq!(
+            SystemIdentityVerifier.start_time(token.pid()).unwrap(),
+            start
+        );
+        child.finish().await;
+        assert_eq!(result, Err(EnrollErrorCode::IdentityRejected));
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn inherited_holder_frames_revoke_even_while_original_peer_is_live() {
+        for op in ["renew", "elevate", "unknown", "malformed"] {
+            let dir = tempfile::tempdir_in("/tmp").unwrap();
+            let mut endpoint = bind(dir.path()).unwrap();
+            let stop = CancellationToken::new();
+            let authority = Arc::new(PeerAuthority::default());
+            endpoint.serve_with_identity(
+                stop.clone(),
+                "g".into(),
+                authority.clone(),
+                Arc::new(KernelStartVerifier),
+            );
+            let mut child = HeldPeer::connect(endpoint.path(), op).await;
+            assert_eq!(child.line().await["op"], "challenge");
+            assert_eq!(child.line().await["op"], "enrolled");
+            let pid = child.child.id().unwrap() as i32;
+            child.fork().await;
+            assert!(agent24_os_proc::is_alive(pid));
+            child.command(b'h').await;
+            let output = child.finish().await;
+            stop.cancel();
+            assert_eq!(authority.issued.load(Ordering::SeqCst), 1, "{op}: {output}");
+            assert_eq!(
+                authority.revoked.load(Ordering::SeqCst),
+                1,
+                "{op}: {output}"
+            );
+            assert!(output.contains("identity_rejected"), "{op}: {output}");
         }
-        child.stdin.take().unwrap().write_all(b"e").await.unwrap();
-        let mut output = BufReader::new(child.stdout.take().unwrap());
-        let mut response = String::new();
-        output.read_line(&mut response).await.unwrap();
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&response).unwrap()["op"],
-            "challenge"
-        );
-        response.clear();
-        output.read_line(&mut response).await.unwrap();
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&response).unwrap()["code"],
-            "identity_rejected"
-        );
-        task.abort();
     }
     #[cfg(target_os = "macos")]
     #[tokio::test]
