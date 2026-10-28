@@ -179,8 +179,24 @@ fn error_from_frame(frame: &Value) -> EnrollError {
     EnrollError::new(code, message)
 }
 
-/// Connect to `socket`, run `hello` → `challenge` → `enrolled`, and return the
-/// session. `generation` is `daemon.json`'s; the daemon refuses a mismatch.
+/// Length of the challenge nonce in hex digits (128 random bits, §3.1).
+const NONCE_HEX_LEN: usize = 32;
+
+/// The nonce of a daemon `challenge` frame, if it is well formed: exactly 32
+/// hex digits. Anything else is a protocol violation and the client must not
+/// answer it with a `hello`.
+fn challenge_nonce(frame: &Value) -> Option<&str> {
+    frame["nonce"]
+        .as_str()
+        .filter(|n| n.len() == NONCE_HEX_LEN && n.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Connect to `socket`, run `challenge` → `hello` → `enrolled`, and return the
+/// session. The daemon speaks first (design §10 R8): the client reads the
+/// `challenge`, then sends `hello` echoing its nonce verbatim; nothing is
+/// written before the challenge arrives, because bytes queued before the
+/// daemon's accept are refused. `generation` is `daemon.json`'s; the daemon
+/// refuses a mismatch.
 pub async fn enroll(socket: &Path, generation: &str) -> Result<Session, EnrollError> {
     let stream = tokio::time::timeout(HANDSHAKE_STEP, UnixStream::connect(socket))
         .await
@@ -196,11 +212,6 @@ pub async fn enroll(socket: &Path, generation: &str) -> Result<Session, EnrollEr
         reader: BufReader::new(read),
         writer: write,
     };
-    write_frame(
-        &mut conn.writer,
-        &json!({"v": PROTOCOL_V, "op": "hello", "generation": generation}),
-    )
-    .await?;
     let timeout = ("timeout", "timed out during the enrolment handshake");
     let challenge = read_step(&mut conn.reader, HANDSHAKE_STEP, timeout).await?;
     match challenge["op"].as_str() {
@@ -208,7 +219,13 @@ pub async fn enroll(socket: &Path, generation: &str) -> Result<Session, EnrollEr
         Some("error") => return Err(error_from_frame(&challenge)),
         _ => return Err(EnrollError::new("bad_frame", "expected a challenge frame")),
     }
-    // The nonce needs no client signature; it only correlates daemon logs.
+    let nonce = challenge_nonce(&challenge)
+        .ok_or_else(|| EnrollError::new("bad_frame", "challenge frame carries no valid nonce"))?;
+    write_frame(
+        &mut conn.writer,
+        &json!({"v": PROTOCOL_V, "op": "hello", "generation": generation, "nonce": nonce}),
+    )
+    .await?;
     let enrolled = read_step(&mut conn.reader, HANDSHAKE_STEP, timeout).await?;
     match enrolled["op"].as_str() {
         Some("enrolled") => {}

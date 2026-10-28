@@ -1,8 +1,14 @@
 //! S4 integration: real CLI and capabilities child daemon, no fake HTTP/UDS server.
 //! S3 is absent here, so only the daemon's test-enrollment feature substitutes
 //! presence and unsigned identity. S5 must validate signed binaries on macOS.
+//!
+//! The daemon speaks first (`challenge`) and the CLI's `hello` must echo its
+//! nonce (design §10 R8), so these tests are the end-to-end check that the
+//! real CLI and the real daemon agree on that order. macOS only: elsewhere
+//! the daemon has no per-writer peer token and rejects every enrolment frame
+//! by design (slice §3.1), so enrolment can never succeed there.
 
-#![cfg(unix)]
+#![cfg(target_os = "macos")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::io::{BufRead, BufReader, Read, Write};

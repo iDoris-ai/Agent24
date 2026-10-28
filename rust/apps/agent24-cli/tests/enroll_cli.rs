@@ -4,8 +4,10 @@
 //! (`docs/agent/CORE-2-AGENTEAR-SLICE.md` §3.1) and a tiny HTTP server that
 //! answers `403 presence_required` until the elevation header matches.
 //!
-//! The real daemon side is a separate slice; these tests pin the CLI's half of
-//! the wire contract and the A3 §3.6 output shapes.
+//! The fake daemon speaks first, as the real one does (design §10 R8): it
+//! sends `challenge`, then requires a `hello` that echoes the nonce. The real
+//! daemon side is covered by `enroll_real_daemon.rs`; these tests pin the
+//! CLI's half of the wire contract and the A3 §3.6 output shapes.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -15,6 +17,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -22,6 +25,7 @@ use serde_json::{Value, json};
 const TOKEN: &str = "tok-SECRET-0123456789abcdef";
 const GRANT: &str = "grant-SECRET-fedcba9876543210";
 const GENERATION: &str = "gen-test-1";
+const NONCE: &str = "00112233445566778899aabbccddeeff";
 const ATTACH_TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 #[derive(Clone)]
@@ -48,6 +52,8 @@ struct Fake {
     http_port: u16,
     posts: Arc<Mutex<Vec<HttpSeen>>>,
     frames: Arc<Mutex<Vec<Value>>>,
+    /// Enrolment connections the fake has finished with.
+    closed: Arc<AtomicUsize>,
 }
 
 fn read_http(stream: &mut TcpStream) -> Option<(String, HashMap<String, String>, Vec<u8>)> {
@@ -172,6 +178,8 @@ struct UdsScript {
     handshake_error: Option<Value>,
     /// Frames sent in reply to an `elevate`.
     elevate_replies: Vec<Value>,
+    /// Replace the well-formed `challenge` with this frame.
+    challenge: Option<Value>,
 }
 
 fn pending_then(final_frame: Value) -> Vec<Value> {
@@ -189,11 +197,17 @@ fn presence_error(code: &str) -> Value {
     json!({"v":1,"op":"error","code":code,"message":"daemon text"})
 }
 
-fn serve_uds(listener: UnixListener, script: UdsScript, frames: Arc<Mutex<Vec<Value>>>) {
+fn serve_uds(
+    listener: UnixListener,
+    script: UdsScript,
+    frames: Arc<Mutex<Vec<Value>>>,
+    closed: Arc<AtomicUsize>,
+) {
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             handle_uds(stream, &script, &frames);
+            closed.fetch_add(1, Ordering::SeqCst);
         }
     });
 }
@@ -202,22 +216,31 @@ fn send(stream: &mut UnixStream, frame: &Value) {
     let _ = writeln!(stream, "{frame}");
 }
 
+fn challenge() -> Value {
+    json!({"v":1,"op":"challenge","conn_id":"00112233445566aa","nonce":NONCE})
+}
+
+/// Server first, like the real daemon: `challenge`, then a `hello` that must
+/// echo the nonce, then `enrolled`; afterwards answer each frame with the
+/// scripted elevation replies. Every frame the client sends is recorded.
 fn handle_uds(mut stream: UnixStream, script: &UdsScript, frames: &Arc<Mutex<Vec<Value>>>) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let sent = script.challenge.clone().unwrap_or_else(challenge);
+    send(&mut stream, &sent);
     let mut line = String::new();
     if reader.read_line(&mut line).unwrap_or(0) == 0 {
         return;
     }
     let hello: Value = serde_json::from_str(&line).unwrap();
     frames.lock().unwrap().push(hello.clone());
+    if script.challenge.is_some() || hello["op"] != "hello" || hello["nonce"] != NONCE {
+        send(&mut stream, &presence_error("identity_rejected"));
+        return;
+    }
     if hello["generation"] != script.generation {
         send(&mut stream, &presence_error("generation_mismatch"));
         return;
     }
-    send(
-        &mut stream,
-        &json!({"v":1,"op":"challenge","conn_id":"00112233445566aa","nonce":"00112233445566778899aabbccddeeff"}),
-    );
     if let Some(err) = &script.handshake_error {
         send(&mut stream, err);
         return;
@@ -243,12 +266,14 @@ fn handle_uds(mut stream: UnixStream, script: &UdsScript, frames: &Arc<Mutex<Vec
 fn start(mode: HttpMode, script: UdsScript, home: &Path) -> Fake {
     let posts = Arc::new(Mutex::new(Vec::new()));
     let frames = Arc::new(Mutex::new(Vec::new()));
+    let closed = Arc::new(AtomicUsize::new(0));
     let http_port = spawn_http(mode, Arc::clone(&posts));
     let sock = home.join("enroll.sock");
     serve_uds(
         UnixListener::bind(&sock).unwrap(),
         script,
         Arc::clone(&frames),
+        Arc::clone(&closed),
     );
     write_daemon_json(
         home,
@@ -261,6 +286,7 @@ fn start(mode: HttpMode, script: UdsScript, home: &Path) -> Fake {
         http_port,
         posts,
         frames,
+        closed,
     }
 }
 
@@ -353,6 +379,7 @@ fn script(elevate_replies: Vec<Value>) -> UdsScript {
         generation: GENERATION,
         handshake_error: None,
         elevate_replies,
+        challenge: None,
     }
 }
 
@@ -417,13 +444,14 @@ fn capabilities_add_succeeds_after_elevation_with_a3_shape() {
     assert_eq!(posts[1].headers["authorization"], format!("Bearer {TOKEN}"));
     assert_eq!(posts[0].body, posts[1].body);
 
-    // Wire frames: hello with daemon.json's generation, then elevate whose
-    // hash is that of the exact body bytes the CLI sent.
+    // Wire frames: hello with daemon.json's generation echoing the challenge
+    // nonce, then elevate whose hash is that of the exact body bytes the CLI
+    // sent.
     let frames = fake.frames.lock().unwrap();
     assert_eq!(frames.len(), 2);
     assert_eq!(
         frames[0],
-        json!({"v":1,"op":"hello","generation":GENERATION})
+        json!({"v":1,"op":"hello","generation":GENERATION,"nonce":NONCE})
     );
     assert_eq!(frames[1]["op"], "elevate");
     assert_eq!(frames[1]["method"], "POST");
@@ -517,6 +545,7 @@ fn generation_mismatch_is_reported_and_nothing_is_sent_over_http() {
             generation: "some-other-generation",
             handshake_error: None,
             elevate_replies: vec![],
+            challenge: None,
         },
         home.path(),
     );
@@ -536,6 +565,7 @@ fn identity_rejected_is_reported() {
             generation: GENERATION,
             handshake_error: Some(presence_error("identity_rejected")),
             elevate_replies: vec![],
+            challenge: None,
         },
         home.path(),
     );
@@ -770,4 +800,50 @@ fn capabilities_delegate_elevates_on_enrolled_connection() {
     assert_eq!(frames.len(), 2);
     assert_eq!(frames[1]["path"], "/api/v1/os/agentear/delegation");
     assert_eq!(frames[1]["body_sha256"], sha256_hex(b""));
+}
+
+/// A `challenge` without a usable nonce is a protocol violation: the CLI
+/// reports `bad_frame` and never answers with a `hello`.
+#[test]
+fn bad_challenge_is_bad_frame_and_no_hello_is_sent() {
+    let mut cases = Vec::new();
+    let mut missing = challenge();
+    missing.as_object_mut().unwrap().remove("nonce");
+    cases.push(missing);
+    for nonce in [
+        json!(null),
+        json!(""),
+        json!(42),
+        json!("00112233445566778899aabbccddeef"),
+        json!("00112233445566778899aabbccddeeff00"),
+        json!("zz112233445566778899aabbccddeeff"),
+    ] {
+        let mut frame = challenge();
+        frame["nonce"] = nonce;
+        cases.push(frame);
+    }
+    cases.push(json!({"v":1,"op":"enrolled","token":TOKEN}));
+    for bad in cases {
+        let home = tmp_home();
+        let fake = start(
+            HttpMode::CreateDirect,
+            UdsScript {
+                challenge: Some(bad.clone()),
+                ..script(vec![])
+            },
+            home.path(),
+        );
+        let (ok, stdout, stderr) = run_add(home.path());
+        assert!(!ok, "{bad}: {stdout} {stderr}");
+        assert_eq!(error_body(&stdout)["error"]["code"], "bad_frame", "{bad}");
+        // The fake records anything the CLI wrote before it hung up.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fake.closed.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "fake never closed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(fake.frames.lock().unwrap().is_empty(), "{bad}: hello sent");
+        assert!(fake.posts.lock().unwrap().is_empty());
+        assert_no_secret(&stdout, &stderr);
+    }
 }
