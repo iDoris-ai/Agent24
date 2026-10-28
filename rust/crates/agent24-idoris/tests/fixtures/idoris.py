@@ -125,7 +125,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         assert body['max_tokens'] == 1
         if scenario.get('verify_wait'):
             time.sleep(3)
-        payload = json.dumps({'model': 'real-model', 'choices': [{'message': {'role': 'assistant', 'content': 'Hi'}, 'finish_reason': 'stop'}], 'usage': {'prompt_tokens': 1, 'completion_tokens': 1}}).encode()
+        payload = json.dumps({'model': scenario.get('verify_model', 'real-model'), 'choices': [{'message': {'role': 'assistant', 'content': 'Hi'}, 'finish_reason': 'stop'}], 'usage': {'prompt_tokens': 1, 'completion_tokens': 1}}).encode()
         self.send_response(scenario.get('verify_status', 200))
         self.send_header('Content-Length', str(len(payload)))
         self.send_header('X-iDoris-Served-Locality', 'loopback')

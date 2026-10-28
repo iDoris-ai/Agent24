@@ -69,9 +69,32 @@ describe('iDoris daemon projection', () => {
     expect(screen.getByRole('button', { name: 'Connect' })).toBeEnabled()
     fireEvent.change(input, { target: { value: '' } })
     expect(screen.getByLabelText(/I agree to share/)).not.toBeChecked()
-    click('Refresh')
-    await waitFor(() => expect(proxy.mock.calls.filter(([req]) => req.path.endsWith('/status')).length).toBe(2))
+    status = { ...status, budget_suggestion: { core_reserved_bytes: 654321, idoris_budget_bytes: 789012 } }
+    await act(async () => { click('Refresh') })
+    await screen.findByText(/654321 B/)
     expect(input).toHaveValue('')
+  })
+  it('preserves consent on an unchanged suggestion and resets it when an unedited suggestion changes', async () => {
+    status = { ...installed, budget_suggestion: { core_reserved_bytes: 123456, idoris_budget_bytes: 789012 }, budget_unavailable_reason: null }
+    vi.useFakeTimers()
+    render(<IdorisPanel />)
+    await act(async () => {})
+    const input = screen.getByLabelText('Core reserved memory (bytes)')
+    fireEvent.change(screen.getByLabelText('oMLX endpoint'), { target: { value: 'http://127.0.0.1:8088' } })
+    await act(async () => {})
+    fireEvent.change(screen.getByLabelText('Daily model (required)'), { target: { value: 'real/daily' } })
+    const consent = screen.getByLabelText(/I agree to share/)
+    fireEvent.click(consent)
+    expect(consent).toBeChecked()
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000) })
+    expect(input).toHaveValue('123456')
+    expect(consent).toBeChecked()
+    expect(screen.getByRole('button', { name: 'Connect' })).toBeEnabled()
+    status = { ...status, budget_suggestion: { core_reserved_bytes: 654321, idoris_budget_bytes: 789012 } }
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000) })
+    expect(input).toHaveValue('654321')
+    expect(consent).not.toBeChecked()
+    expect(screen.getByRole('button', { name: 'Connect' })).toBeDisabled()
   })
   it.each([1024, undefined])('renders streamed download bytes with total %s', async (total) => {
     status = { ...initial, current_operation: 'op-1' }

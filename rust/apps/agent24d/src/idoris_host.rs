@@ -24,7 +24,7 @@ use std::{
     sync::{Arc, Mutex as SyncMutex, Weak},
     time::Duration,
 };
-use tokio::sync::{Mutex, Notify, watch};
+use tokio::sync::{Mutex, Notify, OnceCell, watch};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
@@ -462,6 +462,7 @@ pub struct IdorisHost {
     router: Arc<ModelRouter>,
     draining: SyncMutex<Option<Weak<IdorisGateway>>>,
     provisioner: Arc<dyn Provisioner>,
+    budget_suggestion: OnceCell<Result<agent24_hw::IdorisBudgetSuggestion, &'static str>>,
     data_keys: Arc<dyn Keychain>,
     omlx_keys: Arc<dyn Keychain>,
 }
@@ -549,6 +550,7 @@ impl IdorisHost {
             changed: Notify::new(),
             draining: SyncMutex::new(None),
             provisioner: Arc::new(SystemProvisioner),
+            budget_suggestion: OnceCell::new(),
             data_keys: Arc::new(SystemKeychain),
             omlx_keys: Arc::new(agent24_idoris::keychain::OmlxKeychain),
             inner: Mutex::new(Inner {
@@ -583,14 +585,9 @@ impl IdorisHost {
         Ok(())
     }
     pub async fn status(&self) -> Status {
-        let budget = self.provisioner.budget_suggestion().await;
-        let (budget_suggestion, budget_unavailable_reason) = match budget {
-            Ok(suggestion) => (Some(suggestion), None),
-            Err(reason) => (None, Some(reason.to_owned())),
-        };
         let i = self.inner.lock().await;
         let r = i.installation.as_ref();
-        Status {
+        let mut status = Status {
             state: i.state,
             version: r.map(|r| r.version.clone()),
             data_port: r.map(|r| r.data_port),
@@ -599,9 +596,23 @@ impl IdorisHost {
             last_error: i.last_error,
             current_operation: i.active.as_ref().map(|a| a.0.clone()),
             verification: r.and_then(|r| r.verification.clone()),
-            budget_suggestion,
-            budget_unavailable_reason,
+            budget_suggestion: None,
+            budget_unavailable_reason: None,
+        };
+        drop(i);
+        if status.state == State::NotConfigured
+            || (status.state == State::Failed && status.roles.is_empty())
+        {
+            match self
+                .budget_suggestion
+                .get_or_init(|| self.provisioner.budget_suggestion())
+                .await
+            {
+                Ok(suggestion) => status.budget_suggestion = Some(suggestion.clone()),
+                Err(reason) => status.budget_unavailable_reason = Some((*reason).to_owned()),
+            }
         }
+        status
     }
     pub async fn operation(&self, id: &str) -> Result<Operation, Code> {
         self.inner

@@ -760,7 +760,11 @@ fn lifecycle_wire_fixtures_match_serde_and_openapi() {
     let openapi: serde_json::Value =
         serde_yaml::from_str(&fs::read_to_string(root.join("protocol/openapi.yaml")).unwrap())
             .unwrap();
-    for (file, schema) in [("status", "IdorisStatus"), ("operation", "IdorisOperation")] {
+    for (file, schema) in [
+        ("status", "IdorisStatus"),
+        ("operation", "IdorisOperation"),
+        ("operation-failed", "IdorisOperation"),
+    ] {
         let value: serde_json::Value = serde_json::from_slice(
             &fs::read(root.join(format!("protocol/fixtures/idoris/{file}.json"))).unwrap(),
         )

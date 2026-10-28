@@ -400,6 +400,7 @@ impl IdorisHost {
             .await;
         let download = self.provisioner.download(&self.root, cancel, sender);
         tokio::pin!(download);
+        let mut progress_open = true;
         let archive = loop {
             tokio::select! {
                 result = &mut download => {
@@ -407,10 +408,12 @@ impl IdorisHost {
                     self.download_progress(id, latest).await;
                     break result?;
                 }
-                changed = progress.changed() => {
+                changed = progress.changed(), if progress_open => {
                     if changed.is_ok() {
                         let latest = *progress.borrow_and_update();
                         self.download_progress(id, latest).await;
+                    } else {
+                        progress_open = false;
                     }
                 }
             }
@@ -677,6 +680,14 @@ impl IdorisHost {
                         Code::VerifyFailed
                     }
                 })?;
+            if verification.model_id.len() > 256
+                || verification.model_id.chars().any(|c| {
+                    c.is_control()
+                        || matches!(c, '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+                })
+            {
+                return Err(Code::VerifyFailed);
+            }
             pending.candidate.verification = Some(VerificationReceipt {
                 model_id: verification.model_id,
                 record_id: verification.record_id,
