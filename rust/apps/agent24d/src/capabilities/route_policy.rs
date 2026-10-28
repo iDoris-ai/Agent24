@@ -106,6 +106,7 @@ const POLICIES: &[RoutePolicy] = &[
     row("PATCH", "/api/v1/attached/{name}", Operation::ModuleAdmin, AssuranceLevel::Elevated),
     row("GET", "/api/v1/os", Operation::ModuleRead, AssuranceLevel::Everyday),
     row("PATCH", "/api/v1/os/{name}", Operation::ModuleAdmin, AssuranceLevel::Elevated),
+    row("POST", "/api/v1/os/{name}/delegation", Operation::ModuleAdmin, AssuranceLevel::Elevated),
     row("POST", "/api/v1/os/{name}/stop", Operation::ModuleAdmin, AssuranceLevel::Elevated),
     row("POST", "/api/v1/os/{name}/commands/{command}", Operation::ModuleAdmin, AssuranceLevel::Elevated),
     row("POST", "/api/v1/shutdown", Operation::Shutdown, AssuranceLevel::Elevated),

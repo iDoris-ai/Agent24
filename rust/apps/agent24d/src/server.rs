@@ -41,12 +41,16 @@ pub struct AppState {
     /// router is built.
     pub auth_mode: AuthMode,
     pub capabilities: Option<crate::capabilities::CapabilityStore>,
+    pub first_party: Option<Arc<crate::capabilities::first_party::FirstPartyAuthority>>,
+    pub presence_provider: Option<Arc<dyn crate::capabilities::presence::PresenceProvider>>,
+    pub module_surfaces: Arc<Vec<crate::capabilities::delegation::ModuleSurface>>,
+    pub delegations: Arc<crate::capabilities::delegation::Delegations>,
     /// KB-HOST-01: the Knowledge bindings the product host activated, in
     /// memory only (see `crate::knowledge_host`).
     pub knowledge_host: Arc<crate::knowledge_host::KnowledgeHostRegistry>,
     /// CORE-2 AgentEar S3: the desktop confirmation queue behind
     /// `/api/v1/presence/challenges/*`.
-    pub presence_desktop: Arc<crate::presence_desktop::DesktopPresence>,
+    pub presence_desktop: Option<Arc<crate::presence_desktop::DesktopPresence>>,
     /// D2 router: every model call goes through tier routing + health/cooldown,
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
@@ -679,8 +683,12 @@ impl AppState {
             token: Arc::new(token),
             auth_mode: AuthMode::LegacySingleToken,
             capabilities: None,
+            first_party: None,
+            presence_provider: None,
+            module_surfaces: Arc::new(Vec::new()),
+            delegations: Arc::new(crate::capabilities::delegation::Delegations::default()),
             knowledge_host: Arc::new(crate::knowledge_host::KnowledgeHostRegistry::default()),
-            presence_desktop: Arc::new(crate::presence_desktop::DesktopPresence::new()),
+            presence_desktop: None,
             mcp_servers: Arc::new(mcp_servers),
             router,
             tools,
@@ -727,7 +735,17 @@ impl AppState {
     fn enable_capability_auth(&mut self, store: crate::capabilities::CapabilityStore) {
         self.token = Arc::new(String::new());
         self.auth_mode = AuthMode::Capabilities;
+        self.first_party = Some(Arc::new(
+            crate::capabilities::first_party::FirstPartyAuthority::new(store.clone()),
+        ));
         self.capabilities = Some(store);
+    }
+
+    /// Share one queue between enrolment confirmation and ProductHost HTTP.
+    fn enable_desktop_presence(&mut self) {
+        let presence = Arc::new(crate::presence_desktop::DesktopPresence::new());
+        self.presence_provider = Some(presence.clone());
+        self.presence_desktop = Some(presence);
     }
 
     /// Re-read the override set after the user changed it.
@@ -1119,6 +1137,122 @@ async fn authorize(
             {
                 return error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed");
             }
+            // §10 R1 guards daily first-party tokens. ProductHost is the
+            // parent's full authority and must keep reaching module routes
+            // (desktop documents/knowledge) without a delegation record.
+            if authorization.claims.audience == crate::capabilities::Audience::FirstPartyShell
+                && operation == crate::capabilities::Operation::ModuleRoute
+                && method != Method::GET
+                && method != Method::HEAD
+            {
+                let path = req.uri().path();
+                let delegated = state
+                    .module_surfaces
+                    .iter()
+                    .find(|surface| {
+                        path.strip_prefix(&surface.namespace)
+                            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+                    })
+                    .is_some_and(|surface| state.delegations.permits(surface));
+                if !delegated {
+                    return error_response(
+                        StatusCode::FORBIDDEN,
+                        "module_delegation_required",
+                        "Module surface requires delegation",
+                    );
+                }
+            }
+            if authorization.claims.audience == crate::capabilities::Audience::FirstPartyShell {
+                let elevated = operation.assurance_level()
+                    == Some(crate::capabilities::AssuranceLevel::Elevated);
+                let grant = req
+                    .headers()
+                    .get("X-Agent24-Elevation")
+                    .map(|v| v.to_str().unwrap_or("").to_owned());
+                if elevated && grant.is_none() {
+                    if method == Method::POST && template == "/api/v1/attached" {
+                        let bytes = match axum::body::to_bytes(
+                            req.into_body(),
+                            agent24_domain::http::MAX_BODY_BYTES,
+                        )
+                        .await
+                        {
+                            Ok(bytes) => bytes,
+                            Err(_) => {
+                                return error_response(
+                                    StatusCode::PAYLOAD_TOO_LARGE,
+                                    "payload_too_large",
+                                    "Request body exceeds limit",
+                                );
+                            }
+                        };
+                        if let Some(authority) = &state.first_party {
+                            authority.remember_attached_request(
+                                &authorization.claims.capability_id,
+                                &bytes,
+                            );
+                        }
+                    }
+                    return (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({"error":{"code":"presence_required","message":"Presence confirmation required","operation":format!("{operation:?}")}}))).into_response();
+                }
+                if let Some(grant) = grant {
+                    let (parts, body) = req.into_parts();
+                    let bytes = match axum::body::to_bytes(
+                        body,
+                        agent24_domain::http::MAX_BODY_BYTES,
+                    )
+                    .await
+                    {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            return error_response(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "payload_too_large",
+                                "Request body exceeds limit",
+                            );
+                        }
+                    };
+                    let target = crate::capabilities::first_party::Target {
+                        operation,
+                        method: method.to_string(),
+                        template: template.to_owned(),
+                        path: parts.uri.path().to_owned(),
+                        body_sha256: crate::capabilities::first_party::body_digest(&bytes),
+                    };
+                    // Revalidate after buffering, immediately before the atomic
+                    // consume. A process may exit while supplying a slow body.
+                    let bearer = parts
+                        .headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                        .unwrap_or("");
+                    if store
+                        .validate_bearer(
+                            bearer,
+                            operation,
+                            &crate::capabilities::Resource::global(),
+                            crate::capabilities::unix_now(),
+                        )
+                        .is_err()
+                        || !state.first_party.as_ref().is_some_and(|authority| {
+                            authority.consume(
+                                &grant,
+                                &authorization.claims.capability_id,
+                                &target,
+                                crate::capabilities::unix_now(),
+                            )
+                        })
+                    {
+                        return error_response(
+                            StatusCode::FORBIDDEN,
+                            "elevation_invalid",
+                            "Elevation grant is invalid",
+                        );
+                    }
+                    req = Request::from_parts(parts, Body::from(bytes));
+                }
+            }
             req.extensions_mut().insert(authorization);
             next.run(req).await
         }
@@ -1134,6 +1268,42 @@ async fn authorize(
         ),
     }
 }
+
+async fn establish_module_delegation(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    if state.auth_mode != AuthMode::Capabilities {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Delegation requires capabilities mode",
+        );
+    }
+    let Some(surface) = state.module_surfaces.iter().find(|s| s.name == name) else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "No registered module surface",
+        );
+    };
+    match state.delegations.establish(surface) {
+        Ok(()) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"delegated":true,"name":name})),
+        )
+            .into_response(),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "Cannot persist delegation",
+        ),
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/first_party_http.rs"]
+mod first_party_http_tests;
 
 /// Constant-time comparison — a timing oracle on a localhost token is a small
 /// risk, but the cost of doing it right is one function.
@@ -1161,6 +1331,10 @@ pub fn build_router(state: AppState) -> Router {
 /// hole in the daemon's only access control. `module_routes_are_behind_kernel_auth`
 /// is the regression test; do not reorder these two lines.
 pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
+    if let Some(authority) = &state.first_party {
+        authority.set_provider(state.presence_provider.clone());
+        authority.set_module_surfaces(state.module_surfaces.clone());
+    }
     let kernel = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/chat", post(crate::routes::post_chat))
@@ -1302,6 +1476,10 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         )
         // Domain-OS registry (ME-2b). The daemon owns `os.json`; see `os_routes`.
         .route("/api/v1/os", get(crate::os_routes::list_os))
+        .route(
+            "/api/v1/os/{name}/delegation",
+            post(establish_module_delegation),
+        )
         .route(
             "/api/v1/os/{name}",
             axum::routing::patch(crate::os_routes::patch_os),
@@ -2002,6 +2180,12 @@ pub async fn serve(
     });
     if let Some(capability_store) = capability_store {
         state.enable_capability_auth(capability_store);
+        if mode == StartupMode::HostChild {
+            state.enable_desktop_presence();
+        }
+        state.delegations = Arc::new(crate::capabilities::delegation::Delegations::open(
+            &state_dir,
+        )?);
     }
 
     // M7 durable expiry recovery runs before durable-resume: a stale approval
@@ -2716,6 +2900,38 @@ pub async fn serve(
     // there was nothing to stop.
     let comm_router =
         crate::comm_routes::build(&state_dir, params.stop_grace, &comm_daemon_slot).await;
+    if state.auth_mode == AuthMode::Capabilities {
+        // Package modules register an ANY-method proxy for their namespace.
+        // Bind that registered surface and the exact manifest, not enabled flags.
+        // In-process modules have no route inventory API and remain undelegated.
+        state.module_surfaces = Arc::new(
+            catalogue
+                .iter()
+                .filter_map(|entry| {
+                    let crate::domain::Build::Package(package) = &entry.build else {
+                        return None;
+                    };
+                    let report = state.os_reports.iter().find(|r| {
+                        r.name == package.manifest.name()
+                            && matches!(r.outcome, crate::domain::MountOutcome::Mounted)
+                    })?;
+                    Some(crate::capabilities::delegation::ModuleSurface {
+                        name: report.name.clone(),
+                        version: report.version.clone(),
+                        namespace: report.namespace.clone(),
+                        routes_sha256: crate::capabilities::first_party::body_digest(
+                            format!(
+                                "ANY {}\nANY {}/{{*rest}}\n{}",
+                                report.namespace, report.namespace, package.digest
+                            )
+                            .as_bytes(),
+                        ),
+                    })
+                })
+                .collect(),
+        );
+    }
+    let enroll_authority = state.first_party.clone();
     let router = build_router_with_modules(state, module_routes.merge(comm_router));
 
     // A shutdown that began during startup ends it here, before anything says
@@ -2808,8 +3024,10 @@ pub async fn serve(
         }
         return Err(err);
     }
-    if let Some(endpoint) = enroll.as_mut() {
-        endpoint.serve(cancel.clone());
+    if let Some(endpoint) = enroll.as_mut()
+        && let Some(authority) = enroll_authority
+    {
+        endpoint.serve(cancel.clone(), daemon_generation.clone(), authority);
     }
 
     // The state file is written; now readiness and a shutdown request race
@@ -4000,6 +4218,7 @@ pub(crate) mod tests {
             .unwrap();
         let (creative_bearer, _, _) = creative.into_bearer_parts();
         state.enable_capability_auth(store);
+        state.enable_desktop_presence();
         (state, host_bearer, creative_bearer)
     }
 

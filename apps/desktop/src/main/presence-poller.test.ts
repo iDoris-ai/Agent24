@@ -14,7 +14,7 @@ import {
   type PresenceDialogOptions,
   type PresencePollerDeps,
 } from './presence-poller'
-import { MAIN_MESSAGE_TABLE, mt, resetMainLocaleForTest, setMainLocale, type MainLocale } from './main-i18n'
+import { mt, resetMainLocaleForTest, setMainLocale, type MainLocale } from './main-i18n'
 
 const NOW_MS = 1_800_000_000_000
 const CONN = { port: 4321, authHeaders: { Authorization: 'Bearer host-token' } }
@@ -330,18 +330,27 @@ describe('presence dialog strings', () => {
   const keys = ['presence.title', 'presence.message', 'presence.detail', 'presence.allow', 'presence.deny'] as const
 
   it.each(['en', 'zh', 'th'] as MainLocale[])('has every key in %s with its placeholders', (locale) => {
-    const table = MAIN_MESSAGE_TABLE[locale]
-    for (const key of keys) expect(table[key].length).toBeGreaterThan(0)
-    expect(table['presence.message']).toMatch(/\{requester\}/)
-    expect(table['presence.message']).toMatch(/\{pid\}/)
-    expect(table['presence.message']).toMatch(/\{operation\}/)
-    expect(table['presence.detail']).toMatch(/\{summary\}/)
+    setMainLocale(locale)
+    for (const key of keys) expect(mt(key).length).toBeGreaterThan(0)
+    expect(mt('presence.message')).toMatch(/\{requester\}/)
+    expect(mt('presence.message')).toMatch(/\{pid\}/)
+    expect(mt('presence.message')).toMatch(/\{operation\}/)
+    expect(mt('presence.detail')).toMatch(/\{summary\}/)
+  })
+
+  it('uses the shared main-process locale for presence and tray messages', () => {
+    setMainLocale('zh')
+    expect(mt('tray.show')).toBe('显示窗口')
+    expect(mt('presence.deny')).toBe('拒绝')
+    setMainLocale('th')
+    expect(mt('tray.show')).toBe('แสดงหน้าต่าง')
+    expect(mt('presence.deny')).toBe('ปฏิเสธ')
   })
 
   it('the three languages differ for the buttons, and English is the default', () => {
     expect(mt('presence.allow')).toBe('Allow')
     expect(mt('presence.deny')).toBe('Deny')
-    expect(new Set((['en', 'zh', 'th'] as MainLocale[]).map((l) => MAIN_MESSAGE_TABLE[l]['presence.deny'])).size).toBe(3)
+    expect(new Set((['en', 'zh', 'th'] as MainLocale[]).map((l) => { setMainLocale(l); return mt('presence.deny') })).size).toBe(3)
   })
 })
 

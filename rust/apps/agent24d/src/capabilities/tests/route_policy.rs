@@ -78,9 +78,17 @@ fn method(name: &str) -> Method {
 
 #[test]
 fn section_3_rows_match_operation_and_level() {
-    let (fixed, module) = design_tables();
+    let (mut fixed, module) = design_tables();
     assert_eq!(fixed.len(), 93);
     assert_eq!(module.len(), 2);
+    // Slice S2 adds the explicit R1 delegation entry point; the frozen §3
+    // table predates that route, so keep the original rows as the oracle.
+    fixed.push(DesignRow {
+        method: "POST".into(),
+        path: "/os/{name}/delegation".into(),
+        operation: "ModuleAdmin".into(),
+        level: AssuranceLevel::Elevated,
+    });
 
     let mut catalog = BTreeSet::new();
     for policy in policies() {

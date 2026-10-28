@@ -25,43 +25,11 @@ use tokio::sync::{Notify, Semaphore, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::capabilities::{Audience, Authorization, Operation, UnixSeconds, unix_now};
+use crate::capabilities::presence::{
+    PresenceOutcome, PresenceProvider, PresenceRequest, RequesterIdentity,
+};
+use crate::capabilities::{Audience, Authorization, UnixSeconds, unix_now};
 use crate::server::{AppState, error_response};
-
-// ---------------------------------------------------------------------------
-// TODO(S2 merge): replace this mirror with `capabilities::presence::*`
-// (slice §3.3). Kept to the bare minimum so the rebase is mechanical: delete
-// this block and import the same names.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PresenceOutcome {
-    Allowed,
-    Denied,
-    Unavailable,
-    TimedOut,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RequesterIdentity {
-    pub identifier: String,
-    pub pid: i32,
-}
-
-#[derive(Clone, Debug)]
-pub struct PresenceRequest {
-    pub challenge_id: String,
-    pub operation: Operation,
-    pub method: String,
-    pub path: String,
-    pub summary: String,
-    pub requester: RequesterIdentity,
-    pub expires_at: UnixSeconds,
-}
-
-#[async_trait]
-pub trait PresenceProvider: Send + Sync {
-    async fn confirm(&self, req: PresenceRequest, cancel: CancellationToken) -> PresenceOutcome;
-}
-// ---------------------------------------------------------------------------
 
 /// A desktop poller seen this recently counts as connected.
 pub const POLLER_FRESH_FOR: Duration = Duration::from_secs(30);
@@ -404,7 +372,14 @@ pub async fn get_next(
     let Ok(Query(query)) = query else {
         return error_response(StatusCode::BAD_REQUEST, "bad_request", "Invalid wait");
     };
-    let Ok(_permit) = state.presence_desktop.polls.try_acquire() else {
+    let Some(presence) = &state.presence_desktop else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "presence_unavailable",
+            "No desktop presence channel",
+        );
+    };
+    let Ok(_permit) = presence.polls.try_acquire() else {
         return error_response(
             StatusCode::TOO_MANY_REQUESTS,
             "presence_poll_limit",
@@ -412,7 +387,7 @@ pub async fn get_next(
         );
     };
     let wait = Duration::from_secs(query.wait.unwrap_or(MAX_WAIT_SECONDS).min(MAX_WAIT_SECONDS));
-    match state.presence_desktop.next(wait).await {
+    match presence.next(wait).await {
         Some(c) => Json(serde_json::json!({
             "challenge_id": c.challenge_id,
             "operation": c.operation,
@@ -449,7 +424,14 @@ pub async fn post_decision(
             );
         }
     };
-    match state.presence_desktop.decide(&id, allow) {
+    let Some(presence) = &state.presence_desktop else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "presence_unavailable",
+            "No desktop presence channel",
+        );
+    };
+    match presence.decide(&id, allow) {
         Ok(()) => Json(serde_json::json!({"challenge_id": id, "state": "decided"})).into_response(),
         Err(DecideError::Conflict) => error_response(
             StatusCode::CONFLICT,
@@ -475,6 +457,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::capabilities::Operation;
     use crate::server::build_router;
 
     fn request(id: &str, ttl: u64) -> PresenceRequest {
@@ -780,7 +763,7 @@ mod tests {
     #[tokio::test]
     async fn active_long_polls_are_bounded_and_aborting_releases_slots() {
         let (state, host, _) = crate::server::tests::capability_state().await;
-        let presence = state.presence_desktop.clone();
+        let presence = state.presence_desktop.clone().unwrap();
         let router = build_router(state);
         let mut tasks = Vec::new();
         for _ in 0..16 {
@@ -821,7 +804,7 @@ mod tests {
     #[tokio::test]
     async fn http_round_trip_first_decision_wins_then_409_then_410() {
         let (state, host, _) = crate::server::tests::capability_state().await;
-        let presence = state.presence_desktop.clone();
+        let presence = state.presence_desktop.clone().unwrap();
         let router = build_router(state);
 
         // No poll yet -> unavailable.
@@ -869,7 +852,7 @@ mod tests {
     #[tokio::test]
     async fn an_expired_challenge_is_410_over_http() {
         let (state, host, _) = crate::server::tests::capability_state().await;
-        let presence = state.presence_desktop.clone();
+        let presence = state.presence_desktop.clone().unwrap();
         let router = build_router(state);
         assert!(presence.next(Duration::ZERO).await.is_none());
         let task = spawn_confirm(&presence, request("z1", 1), CancellationToken::new());
