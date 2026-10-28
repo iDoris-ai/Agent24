@@ -15,7 +15,7 @@
 use agent24_domain::{EgressDestination, EgressGate, EgressPurpose, EgressRequest, EgressResource};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
@@ -123,9 +123,11 @@ pub struct Served {
     pub response: CompletionResponse,
 }
 
+type GatewaySnapshot = Option<Result<Arc<crate::IdorisGateway>, String>>;
+
 /// Routes completions across tiered providers with a health/cooldown loop.
 pub struct ModelRouter {
-    idoris: Option<Result<Arc<crate::idoris::IdorisClient>, String>>,
+    idoris: Arc<RwLock<GatewaySnapshot>>,
     providers: Vec<Routed>,
     health: Mutex<HashMap<String, Health>>,
     base_cooldown: Duration,
@@ -232,6 +234,43 @@ fn tier_label(t: Tier) -> &'static str {
 }
 
 impl ModelRouter {
+    /// Build from memory credentials; uses exactly the environment-path checks.
+    pub fn from_idoris(url: &str, key: zeroize::Zeroizing<String>) -> Result<Self, String> {
+        let gateway = crate::IdorisGateway::from_credentials(url, key)?;
+        let router = Self::with_defaults(Vec::new());
+        router.replace_idoris(gateway);
+        Ok(router)
+    }
+
+    /// Keep managed startup fail-closed until its supervisor and credentials are ready.
+    pub fn idoris_unavailable(reason: &str) -> Self {
+        let router = Self::with_defaults(Vec::new());
+        router.block_idoris(reason);
+        router
+    }
+
+    pub fn block_idoris(&self, reason: &str) {
+        *self.idoris.write().unwrap_or_else(|p| p.into_inner()) = Some(Err(reason.into()));
+    }
+
+    /// The caller validates health before publishing. Readers retain their own Arc.
+    pub fn replace_idoris(&self, gateway: crate::IdorisGateway) {
+        *self.idoris.write().unwrap_or_else(|p| p.into_inner()) = Some(Ok(Arc::new(gateway)));
+    }
+
+    fn gateway_snapshot(&self) -> GatewaySnapshot {
+        self.idoris
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub fn idoris_gateway(&self) -> Result<Arc<crate::IdorisGateway>, ModelError> {
+        self.gateway_snapshot()
+            .ok_or_else(|| ModelError::Unavailable("iDoris is not connected".into()))?
+            .map_err(ModelError::Provider)
+    }
+
     #[must_use]
     pub fn has_remote_tier(&self) -> bool {
         self.providers
@@ -262,7 +301,7 @@ impl ModelRouter {
             .min(max_cooldown)
             .max(Duration::from_millis(1));
         Self {
-            idoris: None,
+            idoris: Arc::new(RwLock::new(None)),
             providers: providers
                 .into_iter()
                 .map(|(provider, tier)| Routed { provider, tier })
@@ -325,8 +364,9 @@ impl ModelRouter {
     /// Complex task simply falls back to them.
     pub fn from_env() -> Self {
         if std::env::var_os("IDORIS_URL").is_some() {
-            let mut router = Self::with_defaults(Vec::new());
-            router.idoris = Some(crate::idoris::IdorisClient::from_env().map(Arc::new));
+            let router = Self::with_defaults(Vec::new());
+            *router.idoris.write().unwrap_or_else(|p| p.into_inner()) =
+                Some(crate::IdorisGateway::from_env().map(Arc::new));
             return router;
         }
         let omlx_url =
@@ -531,7 +571,7 @@ impl ModelRouter {
         resources: Vec<EgressResource>,
         authorization_generation: u64,
     ) -> Result<Served, ModelError> {
-        if let Some(gateway) = &self.idoris {
+        if let Some(gateway) = self.gateway_snapshot() {
             return gateway
                 .as_ref()
                 .map_err(|e| ModelError::Provider(e.clone()))?
@@ -639,8 +679,8 @@ impl ModelRouter {
         resources: Vec<EgressResource>,
         authorization_generation: u64,
     ) -> ModelInventory {
-        if let Some(gateway) = &self.idoris {
-            let result = match gateway {
+        if let Some(gateway) = self.gateway_snapshot() {
+            let result = match &gateway {
                 Ok(gateway) => gateway.models(cancel).await,
                 Err(error) => Err(ModelError::Provider(error.clone())),
             };
