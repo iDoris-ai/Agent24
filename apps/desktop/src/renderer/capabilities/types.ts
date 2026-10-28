@@ -57,8 +57,8 @@ export const NAV_PREFS_DEFAULT: NavPrefs = {
  * Normalise stored prefs: clamp the slot count, drop unknown, fixed and
  * duplicate ids, and unpin whatever no longer fits. `dropped` lists the ids
  * that were unpinned because of the slot limit, so the UI can say so.
- * Storage normalization reserves slots for unknown saved ids until they can
- * be explicitly unpinned; display normalization hides those ids.
+ * Before manifests load successfully, storage normalization reserves slots
+ * for unknown saved ids; display normalization hides those ids.
  */
 export function clampPrefs(
   prefs: NavPrefs,
@@ -88,14 +88,18 @@ export interface CapabilitiesApi {
   open: (id: CapabilityId, origin: OpenOrigin) => void
   /** Pending approvals count, shown as a badge on Capabilities and Overview. */
   approvalsWaiting: number
+  /** Stays true after the first successful manifest load, including while offline. */
+  manifestsLoaded?: boolean
 }
 
 export interface NavPrefsApi {
   prefs: NavPrefs
   /** Includes saved pins whose manifests are temporarily unavailable. */
   pinnedCount?: number
+  /** Full ordered list for Settings, including unavailable pins counted above. */
+  allPinned?: readonly CapabilityId[]
   /** Updaters run against the latest saved prefs, including hidden ids, after startup reading.
-   * Persists through the main process; resolves with ids unpinned by the limit. */
+   * Persists through the main process; resolves with ids unpinned by the limit or removal. */
   setPrefs: (next: NavPrefs | ((prev: NavPrefs) => NavPrefs)) => Promise<CapabilityId[]>
 }
 

@@ -4,6 +4,8 @@ import {
   type CapabilityId, type NavPrefsApi, type OpenOrigin,
 } from './types'
 import { CAPABILITIES, withDynamicCapabilities } from './registry'
+import { useT } from '../i18n'
+import { settingsMessages } from '../pages/Settings.i18n'
 
 type Route = { kind: 'page'; page: string; initialTab?: 'general' | 'activity'; key?: number } | { kind: 'capability'; id: CapabilityId; origin: OpenOrigin }
 const RouteContext = createContext<{ route: Route; navigate: (page: string) => void }>({
@@ -12,7 +14,7 @@ const RouteContext = createContext<{ route: Route; navigate: (page: string) => v
 export const useCapabilityRoute = () => useContext(RouteContext)
 
 export function CapabilitiesProvider({ children }: { children: ReactNode }) {
-  const [defs, setDefs] = useState(CAPABILITIES)
+  const [{ defs, manifestsLoaded }, setRegistry] = useState({ defs: CAPABILITIES, manifestsLoaded: false })
   const [route, setRoute] = useState<Route>({ kind: 'page', page: 'home' })
   const [approvalsWaiting, setApprovalsWaiting] = useState(0)
   const settingsVisit = useRef(0)
@@ -35,7 +37,7 @@ export function CapabilitiesProvider({ children }: { children: ReactNode }) {
       if (!modulesBusy) {
         modulesBusy = true
         void window.agent24.backendProxy({ method: 'GET', path: '/api/modules' }).then(res => {
-          if (!disposed && res.ok && Array.isArray(res.data)) setDefs(withDynamicCapabilities(res.data))
+          if (!disposed && res.ok && Array.isArray(res.data)) setRegistry({ defs: withDynamicCapabilities(res.data), manifestsLoaded: true })
         }).catch(() => { /* Keep the last successful registry while offline. */ }).finally(() => { modulesBusy = false })
       }
       if (!approvalsBusy) {
@@ -52,7 +54,7 @@ export function CapabilitiesProvider({ children }: { children: ReactNode }) {
   }, [])
 
   return <CapabilitiesContext.Provider value={{
-    defs, approvalsWaiting,
+    defs, manifestsLoaded, approvalsWaiting,
     open,
   }}>
     <RouteContext.Provider value={{ route, navigate }}>{children}</RouteContext.Provider>
@@ -60,7 +62,11 @@ export function CapabilitiesProvider({ children }: { children: ReactNode }) {
 }
 
 export function NavPrefsProvider({ children }: { children: ReactNode }) {
-  const { defs } = useContext(CapabilitiesContext)
+  const { defs, manifestsLoaded = false } = useContext(CapabilitiesContext)
+  const registry = useRef({ defs, manifestsLoaded })
+  registry.current = { defs, manifestsLoaded }
+  const t = useT(settingsMessages)
+  const [removedNotice, setRemovedNotice] = useState<CapabilityId[]>([])
   const [stored, setStored] = useState(NAV_PREFS_DEFAULT)
   const latest = useRef(NAV_PREFS_DEFAULT)
   const writes = useRef<Promise<void>>(Promise.resolve())
@@ -75,8 +81,10 @@ export function NavPrefsProvider({ children }: { children: ReactNode }) {
     return () => { disposed = true }
   }, [])
 
-  const setPrefs: NavPrefsApi['setPrefs'] = (next) => {
+  const setPrefs = useCallback<NavPrefsApi['setPrefs']>((next) => {
     const write = writes.current.catch(() => {}).then(async () => {
+      // Read the current registry after startup and any earlier writes settle.
+      const { defs, manifestsLoaded } = registry.current
       const prev = latest.current
       const requested = typeof next === 'function' ? next({ ...prev, pinned: [...prev.pinned] }) : { ...next, pinned: [...next.pinned] }
       if (typeof next !== 'function') {
@@ -87,15 +95,30 @@ export function NavPrefsProvider({ children }: { children: ReactNode }) {
         })
       }
       requested.pinned = requested.pinned.filter(id => prev.pinned.includes(id) || defs.some(d => d.id === id))
-      const normalized = clampPrefs(requested, defs, true)
+      const removed = manifestsLoaded ? [...new Set(requested.pinned.filter(id => !defs.some(d => d.id === id)))] : []
+      const normalized = clampPrefs(requested, defs, !manifestsLoaded)
       await window.agent24.setNavPrefs(normalized.prefs)
       latest.current = normalized.prefs
       setStored(normalized.prefs)
-      return normalized.dropped
+      setRemovedNotice(removed)
+      return [...removed, ...normalized.dropped]
     })
     writes.current = write.then(() => {}, () => {})
     return write
-  }
+  }, [])
+  useEffect(() => {
+    if (!manifestsLoaded) return
+    let disposed = false
+    void writes.current.then(() => {
+      if (!disposed && latest.current.pinned.some(id => !defs.some(d => d.id === id))) {
+        void setPrefs(prev => prev).catch(() => { /* Retry normalization on the next write or successful poll. */ })
+      }
+    })
+    return () => { disposed = true }
+  }, [defs, manifestsLoaded, setPrefs])
   const raw = clampPrefs(stored, defs, true).prefs
-  return <NavPrefsContext.Provider value={{ prefs: clampPrefs(raw, defs).prefs, pinnedCount: raw.pinned.length, setPrefs }}>{children}</NavPrefsContext.Provider>
+  return <NavPrefsContext.Provider value={{ prefs: clampPrefs(raw, defs).prefs, allPinned: raw.pinned, pinnedCount: raw.pinned.length, setPrefs }}>
+    {children}
+    {removedNotice.length > 0 && <p className="nav-prefs-notice" role="status">{t('sidebar.removed', { names: removedNotice.join(', ') })}</p>}
+  </NavPrefsContext.Provider>
 }

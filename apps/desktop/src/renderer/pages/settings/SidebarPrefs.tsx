@@ -10,7 +10,7 @@ export function SidebarPrefs() {
   const t = useT(settingsMessages)
   const c = useT(capabilitiesMessages)
   const { defs } = useContext(CapabilitiesContext)
-  const { prefs, setPrefs } = useContext(NavPrefsContext)
+  const { prefs, allPinned = prefs.pinned, setPrefs } = useContext(NavPrefsContext)
   const [saving, setSaving] = useState(false)
   const [notice, setNotice] = useState<CapabilityId[]>([])
   const savingRef = useRef(false)
@@ -26,7 +26,7 @@ export function SidebarPrefs() {
     setSaving(true)
     try {
       const dropped = await setPrefs(next)
-      setNotice(dropped)
+      setNotice(dropped.filter(id => defs.some(d => d.id === id)))
     } catch {
       // The context keeps the last saved prefs. A failed write must not claim
       // that something was unpinned.
@@ -42,9 +42,9 @@ export function SidebarPrefs() {
 
   function move(index: number, dir: -1 | 1) {
     const target = index + dir
-    if (target < 0 || target >= prefs.pinned.length) return
-    const id = prefs.pinned[index]
-    const neighbor = prefs.pinned[target]
+    if (target < 0 || target >= allPinned.length) return
+    const id = allPinned[index]
+    const neighbor = allPinned[target]
     void commit(prev => {
       const pinned = prev.pinned.slice()
       const source = pinned.indexOf(id)
@@ -78,17 +78,20 @@ export function SidebarPrefs() {
           <label>{t('sidebar.order')}</label>
           <p>{t('sidebar.orderHint')}</p>
         </div>
-        {prefs.pinned.length === 0 ? (
+        {allPinned.length === 0 ? (
           <p className="settings-note">{t('sidebar.empty')}</p>
         ) : (
           <ol className="settings-pin-list">
-            {prefs.pinned.map((id, index) => (
+            {allPinned.map((id, index) => (
               <li key={id}>
-                <span className="settings-pin-name">{nameFor(id)}</span>
+                <span className="settings-pin-name">{nameFor(id)}{!defs.some(d => d.id === id) && ` — ${t('sidebar.unavailable')}`}</span>
                 <button type="button" className="btn btn-ghost" aria-label={t('sidebar.moveUp', { name: nameFor(id) })}
                   disabled={saving || index === 0} onClick={() => move(index, -1)}>↑</button>
                 <button type="button" className="btn btn-ghost" aria-label={t('sidebar.moveDown', { name: nameFor(id) })}
-                  disabled={saving || index === prefs.pinned.length - 1} onClick={() => move(index, 1)}>↓</button>
+                  disabled={saving || index === allPinned.length - 1} onClick={() => move(index, 1)}>↓</button>
+                {!defs.some(d => d.id === id) && <button type="button" className="btn btn-ghost"
+                  aria-label={t('sidebar.unpinName', { name: id })} disabled={saving}
+                  onClick={() => { void commit(prev => ({ ...prev, pinned: prev.pinned.filter(pin => pin !== id) })) }}>{t('sidebar.unpin')}</button>}
               </li>
             ))}
           </ol>

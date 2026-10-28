@@ -9,6 +9,7 @@ import { CapabilitiesContext, NavPrefsContext, NAV_PREFS_DEFAULT, type NavPrefs,
 import { CAPABILITIES } from './registry'
 import CapabilitiesPage from '../pages/Capabilities'
 import { SidebarPrefs } from '../pages/settings/SidebarPrefs'
+import { setLocale } from '../i18n'
 
 describe('Sidebar', () => {
   it('renders fixed entries, ordered pins, empty slots, hidden Overview and approval badges', () => {
@@ -153,6 +154,89 @@ describe('NavPrefsProvider', () => {
     } })
     return setNavPrefs
   }
+
+  it.each(['success', 'failure then success', 'manifest before preferences', 'module removed during session'])('F6 releases removed module slots and notifies after %s', async scenario => {
+    vi.useFakeTimers()
+    let online = scenario !== 'failure then success'
+    let installed = scenario === 'module removed during session'
+    let finishRead: (prefs: NavPrefs) => void = () => {}
+    const saved = { pinned: ['documents', 'acme'], slotCount: 2, showOverview: true }
+    const read = scenario === 'manifest before preferences' ? new Promise<NavPrefs>(resolve => { finishRead = resolve }) : Promise.resolve(saved)
+    const backendProxy = vi.fn().mockImplementation(() => Promise.resolve({ ok: online, data: installed ? [{ id: 'acme', type: 'ui', name: 'Acme' }] : [] }))
+    const setNavPrefs = installPrefs(() => read, vi.fn().mockResolvedValue(undefined), backendProxy)
+    const view = renderEditor(<><SidebarPrefs /><Sidebar activeId="settings" navigate={vi.fn()} /><CapabilitiesPage /></>)
+    try {
+      await act(async () => {})
+      if (scenario === 'failure then success' || scenario === 'module removed during session') {
+        expect(setNavPrefs).not.toHaveBeenCalled()
+        expect(screen.getByText('Pinned 2/2')).toBeInTheDocument()
+        online = true
+        installed = false
+        await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      } else if (scenario === 'manifest before preferences') {
+        expect(setNavPrefs).not.toHaveBeenCalled()
+        await act(async () => { finishRead(saved) })
+      }
+      expect(setNavPrefs).toHaveBeenLastCalledWith({ ...saved, pinned: ['documents'] })
+      expect(screen.getByText('acme is no longer installed and was unpinned.')).toBeInTheDocument()
+      expect(screen.getByText('Pinned 1/2')).toBeInTheDocument()
+      expect(screen.getByText('Empty slot')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Pin Design' })).toBeEnabled()
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Pin Design' })) })
+      expect(setNavPrefs).toHaveBeenLastCalledWith({ ...saved, pinned: ['documents', 'design'] })
+    } finally {
+      view.unmount()
+      vi.useRealTimers()
+    }
+  })
+
+  it('F6 lists unavailable offline pins with matching sidebar counts and allows manual unpinning', async () => {
+    const setNavPrefs = installPrefs(async () => ({ pinned: ['documents', 'acme'], slotCount: 2, showOverview: true }))
+    renderEditor(<><SidebarPrefs /><Sidebar activeId="settings" navigate={vi.fn()} /></>)
+    expect(await screen.findByText('acme — Unavailable (module removed)')).toBeInTheDocument()
+    expect(screen.getByText('Pinned 2/2')).toBeInTheDocument()
+    expect(screen.queryByText('Empty slot')).not.toBeInTheDocument()
+    expect(within(screen.getByRole('navigation')).queryByText(/acme/)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('switch', { name: 'Show Overview in sidebar' }))
+    await waitFor(() => expect(setNavPrefs).toHaveBeenLastCalledWith({ pinned: ['documents', 'acme'], slotCount: 2, showOverview: false }))
+    fireEvent.click(screen.getByRole('button', { name: 'Unpin acme' }))
+    await waitFor(() => expect(setNavPrefs).toHaveBeenLastCalledWith({ pinned: ['documents'], slotCount: 2, showOverview: false }))
+    expect(screen.queryByText(/Unavailable/)).not.toBeInTheDocument()
+    expect(screen.getByText('Pinned 1/2')).toBeInTheDocument()
+  })
+
+  it('F6 retries failed cleanup on the next write, returns dropped ids and localizes the removal notice', async () => {
+    vi.useFakeTimers()
+    let online = true
+    const setNavPrefs = installPrefs(async () => ({ pinned: ['documents', 'acme'], slotCount: 2, showOverview: true }),
+      vi.fn().mockRejectedValueOnce(new Error('disk full')).mockResolvedValue(undefined), vi.fn().mockImplementation(() => Promise.resolve({ ok: online, data: [] })))
+    function Editor() {
+      const { setPrefs } = useContext(NavPrefsContext)
+      return <button onClick={() => void setPrefs(prev => ({ ...prev, showOverview: false })).then(ids => { document.title = ids.join(',') })}>Retry</button>
+    }
+    const view = renderEditor(<><SidebarPrefs /><Editor /></>)
+    try {
+      await act(async () => {})
+      expect(setNavPrefs).toHaveBeenCalledTimes(1)
+      expect(screen.queryByText(/no longer installed/)).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Unpin acme' })).toBeInTheDocument()
+      online = false
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(setNavPrefs).toHaveBeenCalledTimes(1)
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry' })) })
+      expect(document.title).toBe('acme')
+      expect(setNavPrefs).toHaveBeenLastCalledWith({ pinned: ['documents'], slotCount: 2, showOverview: false })
+      expect(screen.getByText('acme is no longer installed and was unpinned.')).toBeInTheDocument()
+      act(() => { setLocale('zh') })
+      expect(screen.getByText('acme 已卸载，已取消钉选。')).toBeInTheDocument()
+      act(() => { setLocale('th') })
+      expect(screen.getByText('acme ไม่ได้ติดตั้งแล้วและถูกเลิกปักหมุด')).toBeInTheDocument()
+    } finally {
+      act(() => { setLocale('en') })
+      view.unmount()
+      vi.useRealTimers()
+    }
+  })
 
   it.each(['capabilities', 'settings'])('preserves offline dynamic pins when %s toggles Overview', async page => {
     const setNavPrefs = installPrefs(async () => ({ pinned: ['documents', 'acme'], slotCount: 3, showOverview: true }))
