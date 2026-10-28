@@ -38,6 +38,8 @@
 | P1 | CORE-2b | ProductHost 1 小时 TTL + 父管道续期；事件按主体过滤、吊销断连 | S-05 / C-03 / C-13 | ab/core | L |
 | P1 | ID-ERR-1 | iDoris v0.3.2 的 `502` + `error.type=upstream_auth_failed` 映射为终态 `Rejected`（不重试、不换 provider），提示检查 `IDORIS_OMLX_API_KEY`；现 `idoris.rs` 把 5xx 一律当 `Unavailable` | iDoris#583/#582 | ab/idoris（等 v0.3.2） | S |
 | P1 | REV-10 | `VerifiedBinary::install`（agent24-comm）写出可执行文件后立刻 exec：多线程 daemon 中其它线程 fork 会继承写 fd → Linux 首次安装 Hyphae 偶发 ETXTBSY。改为子进程写入或对 spawn 的 ETXTBSY 有界重试 | #1429 发现 | ab/core 或 COMM 线 | S |
+| P2 | FLAKY-1 | `agent24d --test module_tool_card` 偶发失败：高负载下超时（#1432），以及 `no_package_identity`（#1433），疑似时序问题 | 10-28 两次 | ab/kernel | S |
+| P2 | CI-HYB | CI 没有设 `HYPHAE_TEST_BIN`，`groupchat_real_binary` 在 CI 里被跳过；改为用 `Reproduce Hyphae linux-x64` 产物跑 | #1431 R4 | COMM | S |
 | P2 | G-API-3b | `ApiErrorCode` 枚举统一 Rust/OpenAPI/桌面三处错误码清单 | C-07 | ab/core | M |
 | P2 | REV-05 | 记忆性能：FTS 重建离开 ready 路径、`content=''` 外部内容表、撤回删 FTS 行、`active_ids` 部分索引、`run_messages` 不再复制会话尾部、进程内走准入信号量 | R7 / P-04–07、P-12 | ab/memory-p1（c3b 之后） | L |
 | P2 | REV-06 | `serve()` 按启动阶段拆分，结构性测试改为阶段函数单测；MCP 与模块并行挂载 | R8 / A-01 / C-10 / P-09 | 随 CORE-5f/2e | L |
