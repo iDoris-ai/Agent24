@@ -52,7 +52,11 @@ async fn endpoint_with_redirect(
                 }
                 let request = String::from_utf8(bytes).unwrap();
                 let health = request.starts_with("GET /health ");
-                captured.lock().unwrap().push(request);
+                let attempt = {
+                    let mut requests = captured.lock().unwrap();
+                    requests.push(request);
+                    requests.iter().filter(|r| r.starts_with("POST ")).count()
+                };
                 let mut body = if health {
                     serde_json::json!({"service":"idoris","version":"0.3.0","contract_version":"1.0.1","instance_id":"00000000-0000-4000-8000-000000000001","dev_no_key_enabled":false})
                 } else {
@@ -67,6 +71,38 @@ async fn endpoint_with_redirect(
                     }
                 } else if content == "missing-model" {
                     body.as_object_mut().unwrap().remove("model");
+                }
+                let busy =
+                    content.starts_with("busy-") && (content != "busy-success" || attempt <= 2);
+                if !health
+                    && (content.starts_with("headroom")
+                        || content.starts_with("allocation-")
+                        || content == "wrong-busy-type"
+                        || busy)
+                {
+                    let reason = if busy {
+                        "supervisor_busy"
+                    } else {
+                        "headroom_confirmation_required"
+                    };
+                    let error_type = if content.starts_with("headroom") {
+                        "headroom_confirmation_required"
+                    } else if content == "wrong-busy-type" {
+                        "other"
+                    } else {
+                        "local_only_unavailable"
+                    };
+                    let reason = match content {
+                        "allocation-exceeded" => "future_allocation_reason",
+                        "allocation-reason-only" => "headroom_confirmation_required",
+                        "wrong-busy-type" => "supervisor_busy",
+                        _ => reason,
+                    };
+                    body = serde_json::json!({"error": {"type":error_type, "reason_code":reason,
+                        "rule_id":null, "evidence":null, "remediation":"Ask the user to confirm reserved memory headroom."}});
+                    if content == "headroom-type-only" {
+                        body["error"].as_object_mut().unwrap().remove("reason_code");
+                    }
                 }
                 let body = body.to_string();
                 let record = if content == "missing-record" {
@@ -99,6 +135,13 @@ async fn endpoint_with_redirect(
                 };
                 let status = if content == "redirect" && !health {
                     "307 Temporary Redirect"
+                } else if !health
+                    && (content.starts_with("headroom")
+                        || content.starts_with("allocation-")
+                        || content == "wrong-busy-type"
+                        || busy)
+                {
+                    "503 Unavailable"
                 } else if health {
                     "200 OK"
                 } else {
@@ -142,6 +185,8 @@ async fn configured_gateway_is_the_only_http_target() {
             }),
             max_tokens: std::num::NonZeroU32::new(512),
             disable_thinking: true,
+            idoris_headroom_confirmed: std::env::var("A24_IDORIS_CONFIRMED").as_deref()
+                == Ok("true"),
             progress: None,
             temperature: None,
         };
@@ -160,6 +205,38 @@ async fn configured_gateway_is_the_only_http_target() {
                 &cancel,
             )
             .await;
+        if case.starts_with("headroom")
+            || case.starts_with("busy-")
+            || case.starts_with("allocation-")
+            || case == "wrong-busy-type"
+        {
+            match case.as_str() {
+                "headroom" | "headroom-type-only" => match result.unwrap_err() {
+                    agent24_models::ModelError::IdorisHeadroomConfirmationRequired {
+                        role,
+                        remediation,
+                    } => {
+                        assert_eq!(role, "idoris/deep");
+                        assert_eq!(
+                            remediation.as_deref(),
+                            Some("Ask the user to confirm reserved memory headroom.")
+                        );
+                    }
+                    other => panic!("{other:?}"),
+                },
+                "allocation-exceeded" | "allocation-reason-only" | "wrong-busy-type" => assert!(
+                    matches!(result, Err(agent24_models::ModelError::Unavailable(_))),
+                    "{result:?}"
+                ),
+                "busy-exhausted" => assert!(matches!(
+                    result,
+                    Err(agent24_models::ModelError::IdorisSupervisorBusy)
+                )),
+                "busy-success" => assert!(result.is_ok(), "{result:?}"),
+                _ => panic!("unknown case"),
+            }
+            return;
+        }
         if !case.is_empty() && case != "proxy" {
             assert!(result.is_err(), "case={case}");
             if ["unavailable", "disconnected"].contains(&case.as_str()) {
@@ -387,5 +464,71 @@ async fn invalid_evidence_and_credentials_never_fall_back() {
                 "{case}"
             );
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn headroom_gateway_contract() {
+    for (case, confirmed, expected_calls) in [
+        ("headroom", false, 1),
+        ("headroom", true, 1),
+        ("headroom-type-only", false, 1),
+        ("allocation-exceeded", false, 1),
+        ("allocation-exceeded", true, 1),
+        ("allocation-reason-only", false, 1),
+        ("wrong-busy-type", false, 1),
+        ("", true, 1),
+        ("busy-success", false, 3),
+        ("busy-success", true, 3),
+        ("busy-exhausted", true, 4),
+    ] {
+        let (gateway, received) = endpoint(if case.is_empty() { "gateway" } else { case }).await;
+        let (direct, bypassed) = endpoint("bypass").await;
+        let output = tokio::task::spawn_blocking(move || {
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "configured_gateway_is_the_only_http_target",
+                    "--nocapture",
+                ])
+                .env("A24_IDORIS_PROBE_CHILD", "1")
+                .env("A24_IDORIS_CASE", case)
+                .env("A24_IDORIS_CONFIRMED", confirmed.to_string())
+                .env("IDORIS_URL", gateway)
+                .env("IDORIS_API_KEY", "idk_headroom_fixture")
+                .env("OMLX_URL", &direct)
+                .env("OLLAMA_URL", &direct)
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "case={case}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let requests = received.lock().unwrap();
+        let posts: Vec<_> = requests.iter().filter(|r| r.starts_with("POST ")).collect();
+        assert_eq!(posts.len(), expected_calls, "{case}");
+        assert!(bypassed.lock().unwrap().is_empty(), "{case}");
+        for post in &posts {
+            assert!(post.starts_with("POST /v1/chat/completions "), "{post}");
+            assert_eq!(
+                post.to_ascii_lowercase()
+                    .contains("x-idoris-headroom-breach: confirmed\r\n"),
+                confirmed,
+                "{case}"
+            );
+        }
+        let request_ids: Vec<_> = posts
+            .iter()
+            .map(|post| {
+                post.lines()
+                    .find(|line| line.starts_with("x-idoris-request-id:"))
+                    .unwrap()
+            })
+            .collect();
+        assert!(request_ids.iter().all(|id| id == &request_ids[0]));
     }
 }

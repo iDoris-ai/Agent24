@@ -387,6 +387,7 @@ impl agent24_scheduler::RunTrigger for KernelTrigger {
                     model_override,
                 } = action;
                 let create = agent24_protocol::RunCreate {
+                    idoris_headroom_confirmed: false,
                     session_id: session_id.clone(),
                     workspace_id: None,
                     prompt: prompt.clone(),
@@ -6039,6 +6040,7 @@ pub(crate) mod tests {
         );
         let first = runs
             .start_run(agent24_protocol::RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some(session_id.into()),
                 prompt: "检查一下".into(),
                 model_override: None,

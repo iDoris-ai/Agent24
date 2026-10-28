@@ -794,6 +794,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            idoris_headroom_confirmed: false,
             temperature: None,
             progress: None,
         }
@@ -1388,6 +1389,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            idoris_headroom_confirmed: false,
             temperature: None,
             progress: None,
         }
@@ -1476,6 +1478,7 @@ mod tests {
         };
         let req = CompletionRequest {
             disable_thinking: true,
+            idoris_headroom_confirmed: false,
             ..secret_request()
         };
         let _ = r.complete(profile, &req, &CancellationToken::new()).await;
@@ -1551,6 +1554,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            idoris_headroom_confirmed: false,
             temperature: None,
             progress: None,
         };
