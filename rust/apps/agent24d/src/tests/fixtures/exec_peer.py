@@ -1,4 +1,5 @@
 # A real connecting process whose child can retain its socket across exec.
+import json
 import os
 import socket
 import sys
@@ -7,9 +8,12 @@ peer = socket.socket(socket.AF_UNIX)
 peer.connect(sys.argv[1])
 mode = sys.argv[2]
 if mode in ('renew', 'elevate'):
-    peer.sendall(b'{"v":1,"op":"hello","generation":"g"}\n')
+    # Server first: read the challenge, echo its nonce in hello.
     reader = peer.makefile('rb')
-    print(reader.readline().decode().strip(), flush=True)
+    challenge = reader.readline()
+    print(challenge.decode().strip(), flush=True)
+    nonce = json.loads(challenge)['nonce']
+    peer.sendall(json.dumps({'v': 1, 'op': 'hello', 'generation': 'g', 'nonce': nonce}).encode() + b'\n')
     print(reader.readline().decode().strip(), flush=True)
 assert sys.stdin.buffer.read(1) == b'e'
 if mode in ('fork', 'renew', 'elevate'):
