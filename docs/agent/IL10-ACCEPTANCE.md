@@ -26,7 +26,7 @@ start、stop 接受可选 `Idempotency-Key`。同一标识重放返回原操作�
 
 IL-11 可调用 `record_installation` 保存记录。下载所得归档需要保留，恢复启动时 `InstalledVersion::verify_existing` 用内置锁的 hash 重验归档和全部安装文件，再校验签名。daemon 隐藏参数 `__idoris-install-child` 在启动线程前转入 IL-03 安装子进程。
 
-恢复只启动已配置且 `desired_running=true` 的实例。用户 stop 持久保存停止意图，daemon 自身关停不清除恢复意图。未配置安装保留可查询状态，不阻止 daemon 启动。遗留进程身份核对、L4 处理和崩溃重启继续由 IL-07/08 执行。
+恢复只启动已配置且 `desired_running=true` 的实例。用户 stop 持久保存停止意图，daemon 自身关停不清除恢复意图。未配置安装保留可查询状态，不阻止 daemon 启动。生命周期元数据损坏或 restore 持久化失败时记录警告，将 iDoris 标记为不可用，status 返回 failed / persistence_failed；其余 daemon 功能继续启动。无 supervisor 的 Stop 也会检查遗留进程，复用 IL-07 的 lease 和 PID、启动时间、可执行路径、UID 核对；核对失败保留记录并拒绝发信号。L4 处理和崩溃重启继续由 IL-07/08 执行。
 
 钥匙串实现使用 IL-06 的同用户独立命名空间，读取在 blocking task 中执行。就绪适配器读取 supervisor 的 watch 信号。生产输入每代重新计算实时预算并重新探测已选 oMLX，core 预留未知时拒绝启动。
 
@@ -56,15 +56,15 @@ IL-11 可调用 `record_installation` 保存记录。下载所得归档需要保
 | `cancelled_start_does_not_autostart_on_daemon_restart` | 取消启动后仍保存自动启动意图 |
 | `keychain_lock_after_readiness_retains_the_stable_error_code` | 就绪后钥匙串锁定误报 StartFailed，预期 KeychainLocked |
 | `cancel_interrupts_a_pending_keychain_read_before_spawn` | 等待钥匙串时取消操作超时 |
-| `supervisor::identity::tests::dropping_lease_releases_descriptors_inherited_before_exec` | Lease 已释放但继承描述符使再次 acquire 报 InstanceConflict |
+| `supervisor::identity::tests::dropping_lease_unlocks_inherited_descriptors` | Lease 已释放但继承描述符使再次 acquire 报 InstanceConflict |
 
 其余主要测试为 `state_machine_idempotency_busy_and_stop`、`keychain_locked_is_stable_without_plaintext_or_spawn`、`l4_and_contract_failures_are_mapped_and_reaped`、`leftover_identity_conflict_is_preserved_without_spawning`、`cancel_and_shutdown_wait_for_process_reaping`、`shutdown_during_start_closes_admission_and_cancels`、`forced_stop_is_reported_and_does_not_leave_a_process`、`terminal_child_failure_closes_gateway_and_updates_status`、`stop_blocks_new_gateway_requests_and_drains_retained_snapshot`、`restore_replays_no_completed_operation_and_honors_stop_intent`。
 
 `lifecycle_wire_fixtures_match_serde_and_openapi` 对 `protocol/fixtures/idoris` 的夹具做 Serde 往返和 OpenAPI 校验，并验证未知状态、错误码会被 schema 拒绝。status 序列化及磁盘记录检查不含数据 key、上游 key、Admin token。
 
-## 本机验收
+## 评审修复前的本机验收
 
-所有 cargo 测试均先 `ulimit -n 4096`。主 checkout target 不在沙箱可写范围，使用授权缓存 `CARGO_TARGET_DIR=/Users/jason/.cache/a24-target-il10`，未创建 worktree 自有 `rust/target`。
+所有 cargo 测试均先 `ulimit -n 4096`。主 checkout target 不在沙箱可写范围，使用授权缓存 `CARGO_TARGET_DIR=~/.cache/a24-target-il10`，未创建 worktree 自有 `rust/target`。
 
 第 0 步 `cargo test -p agent24-idoris` 为 130 通过、5 忽略。最终指定验收结果如下。
 
@@ -98,7 +98,7 @@ pnpm 使用仓库指定的 9.12.0，缓存和 Electron 下载缓存放在 `/tmp`
 
 ```sh
 cd rust
-export CARGO_TARGET_DIR=/Users/jason/.cache/a24-target-il10
+export CARGO_TARGET_DIR=~/.cache/a24-target-il10
 ulimit -n 4096
 IDORIS_REAL_V040_DIR="$HOME/a24-codex/idoris-v040" \
   cargo test -p agent24d --lib real_v040_install_existing_start_running_stop -- --ignored --nocapture
@@ -107,10 +107,45 @@ IDORIS_REAL_V040_DIR="$HOME/a24-codex/idoris-v040" \
 该测试复制已解压目录到临时安装根，按锁定归档和签名重验已有安装，再执行 start、确认 running、stop。测试已通过。日志写入临时目录。测试使用内存数据 key，只检查公开 health；跳过 oMLX setup、模型绑定和实际推理，不代表连接或 chat 验收通过。
 
 
-## 进程清理限制
+## 此前验收的进程清理限制
 
-最终用 libproc 枚举进程，没有发现 iDoris。仍有六个 CLI attach 测试遗留的 agent24d：`42232`、`42233`、`42234`、`54686`、`54687`、`54688`。它们的可执行路径均为 `/Users/jason/.cache/a24-target-il10/debug/agent24d`，父进程为 1，测试 HOME 位于已删除的 `/tmp/a24attach*`。发送信号前已两次核对 PID、UID、启动时间和可执行路径。
+此前验收用 libproc 枚举进程，没有发现 iDoris，但发现六个 CLI attach 测试遗留的 agent24d。它们的可执行路径为 `~/.cache/a24-target-il10/debug/agent24d`，测试 HOME 位于已删除的 `/tmp/a24attach*`。当时发送信号前已核对 UID、启动时间和可执行路径。该记录只描述此前验收，不代表当前进程状态。
 
-六个 PID 的 SIGTERM 全部返回 EPERM。`ps` 执行也被沙箱拒绝。测试 HOME 和发现文件已删除，无法用该发现文件恢复 HTTP 认证凭据。因此本次没有完成“无残留 agent24d”的要求，不能把进程清理记为通过。需要在沙箱外按当前进程身份复核并清理这六个测试进程。
+这些进程的 SIGTERM 全部返回 EPERM。`ps` 执行也被沙箱拒绝。测试 HOME 和发现文件已删除，无法用该发现文件恢复 HTTP 认证凭据。因此本次没有完成“无残留 agent24d”的要求，不能把进程清理记为通过。后续清理需要重新按当前进程身份复核。
 
-Mac mini 的执行授权已生效，上述限制来自当前沙箱，未请求重复确认。没有修改未涉及的 COMM 或 Documenting 业务来规避失败，没有提交或推送。
+本轮修复和验收仅在笔记本执行。上述限制来自此前验收的沙箱环境。没有修改未涉及的 COMM 或 Documenting 业务来规避失败，没有提交或推送。
+
+
+## PR #1469 评审修复
+
+| 项目 | 修复与回归测试 |
+| --- | --- |
+| F1 | `concurrent_submits_admit_exactly_one_start` 用 barrier 同时提交 32 个 start，只允许一个准入。 |
+| F2 | `restore_replays_no_completed_operation_and_honors_stop_intent` 先 start、stop，再 reopen、restore，核对无活动操作且 spawn 记录未增加。 |
+| F3 | monitor 在关闭通道分支检查自己的取消令牌和操作代次；`stale_closed_monitor_cannot_take_the_next_supervisor_or_block_status` 复现 A stop、B start 后旧 monitor 醒来，status 必须在 300ms 内返回；`stale_monitor_generation_is_rejected_even_without_cancellation` 单独覆盖代次核对。 |
+| F4 | 先保存 operations，再提交 installation 意图；`rejected_start_does_not_persist_running_intent` 注入原第二次写入失败；`rejected_start_when_intent_write_fails_is_not_admitted_or_restored` 覆盖新顺序第二次写入失败。 |
+| F5 | `stop_after_reopen_reaps_a_live_leftover_without_starting` 创建真实存活子进程和身份记录，保存 stop 意图后重开宿主，经 restore、Stop 确认进程退出、记录清除且没有 spawn；`stop_preserves_an_unverified_live_leftover_without_signalling` 覆盖 UID 不匹配。 |
+| F6 | connect 返回后发现 stop 或旧代次时调用 block_gateway 撤回快照；`stopped_generation_withdraws_a_gateway_published_during_connect` 覆盖发布与 stop 的交错。 |
+| server | `idoris_corrupt_operations_do_not_prevent_daemon_startup`、`idoris_restore_persistence_failure_does_not_prevent_daemon_startup` 启动真实 daemon，核对模型接口仍可访问且生命周期 start 返回 persistence_failed。 |
+
+F3、F4、F5 和两个 server 测试在修复前分别出现 status 超时、残留启动意图、存活进程未回收、daemon 未就绪；修复后通过。变异验证共 7 项，均在对应回归测试中变红：禁用 submit 的 active 检查（F1）、强制 desired_running=true（F2）、去掉关闭通道时的取消与代次检查（F3）、单独去掉代次检查（F3-generation）、恢复先写启动意图的顺序（F4）、恢复无 supervisor 时 Stop 直接成功（F5）、去掉 connect 后的 block_gateway（F6）。变异脚本在 finally 中恢复源码；恢复后的最终门禁结果如下。
+
+
+## 本轮最终验收
+
+全部在笔记本、当前沙箱中执行，先设 `ulimit -n 4096`，构建缓存为 `CARGO_TARGET_DIR=~/.cache/a24-target-il10`。
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test -p agent24d idoris` 连续 5 次 | 每次 39 通过、0 失败、1 忽略 |
+| `cargo test -p agent24d` | 918 通过、0 失败、3 忽略 |
+| `cargo test -p agent24-idoris`（额外验证共用回收逻辑） | 153 通过、0 失败、5 忽略 |
+| `cargo clippy -p agent24d --all-targets -- -D warnings` | 通过 |
+| `cargo fmt --all --check` | 通过 |
+| `git diff --check`、文档引用测试名存在性检查 | 通过 |
+
+上述通过数按命令包含的测试二进制与 doc-tests 汇总；忽略项仍保留，未改成跳过新回归。新增 10 个测试并加强 1 个已有测试。F5 的两个真实进程测试在本机 macOS 上实际执行通过；macOS 专用测试通过 dev-dependency libproc 获取内核进程身份，没有复制生产回收实现。
+
+修复前日志：`/tmp/il10-red.log`（F3/F4/F5）、`/tmp/il10-server-red.log`（两个 server 启动故障）。变异脚本和汇总：`/tmp/il10-mutations.py`、`/tmp/il10-mutations.log`；分项日志为 `/tmp/il10-mutation-*.log`。最终验收脚本和汇总：`/tmp/il10-verify.py`、`/tmp/il10-verify.log`；各命令日志为 `/tmp/il10-verify-*.log`。
+
+本轮未执行 git commit、push、fetch 或 merge。

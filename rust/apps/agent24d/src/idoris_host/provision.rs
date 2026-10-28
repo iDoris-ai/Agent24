@@ -648,8 +648,15 @@ impl IdorisHost {
             self.router.replace_idoris(gateway);
             i.installation = Some(pending.candidate.clone());
             i.supervisor = new_supervisor.take();
+            i.generation = Some(id.to_owned());
             drop(i);
-            self.monitor(ready, pending.candidate.clone(), cancel.clone(), failure);
+            self.monitor(
+                ready,
+                pending.candidate.clone(),
+                id.to_owned(),
+                cancel.clone(),
+                failure,
+            );
             Ok(())
         }
         .await;
@@ -790,10 +797,12 @@ impl IdorisHost {
                 .join("data/state/managed-process.json")
                 .try_exists()
                 .map_err(|_| Code::PersistenceFailed)?
-            && let Err(error) = Supervisor::recover_existing(
-                &installed,
-                &self.root.join("data/state"),
-                &CancellationToken::new(),
+            && let Err(error) = Supervisor::recover_leftover(
+                DataPaths {
+                    db: self.root.join("data/idoris.sqlite3"),
+                    state: self.root.join("data/state"),
+                },
+                &pending.previous.release_dir.join("idoris"),
             )
             .await
         {

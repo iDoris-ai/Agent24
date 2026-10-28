@@ -308,7 +308,7 @@ iDoris 侧 PR：#586（capabilities）、#587（运行时 headroom）、#589（k
 | IL-04 oMLX 探测 | 端口、认证分类、同用户设置读取与安全输入 | 03；L2。 |
 | IL-05 组件配置 | 调 setup、验证目录与绑定；预算复用 hw idoris-env 逻辑 | 04；L2。 |
 | IL-06 数据凭据 | key issue、钥匙串存取、失败吊销及最小角色 | 05；L3、L4 并发约定。 |
-| IL-07 启动就绪 | Admin stdin、环境白名单、共享契约校验与 health | 06；L4、L5。 |
+| IL-07 启动就绪 | Admin stdin、环境白名单、共享契约校验与 health；就绪前证明两个端口的监听者属于子进程组，之后才发 Admin token；每次 spawn 前复核安装哈希（闸门见下） | 06；L4、L5。 |
 | IL-08 停止恢复 | SIGTERM 时限、SIGKILL、有界重启、遗留进程安全处置 | 07；L1、L4。 |
 | IL-09 网关连接 | 内存凭据入口、原子配置、服务重启恢复及首次真实 chat | 08；L5，保留现有安全证据。 |
 | IL-10 生命周期 API | OpenAPI 的 status/start/stop、权限与操作查询 | 09；L1、L4、L5。 |
@@ -320,6 +320,11 @@ iDoris 侧 PR：#586（capabilities）、#587（运行时 headroom）、#589（k
 | IL-16 卸载 | 保留或明确清除数据、吊销补偿，API 与 CLI | 15；L1、L3。 |
 | IL-17 管理界面 | 桌面升级、卸载、凭据管理按钮，共用上述 API | 16；继承相关 L。 |
 | IL-18 发布验收 | 跑完 IL-1 至 IL-9 与完整用户异常流程，整理精确证据 | 17；L1–L5，记录 L6 状态。 |
+
+**IL-07 闸门：已接受的残余风险**（#1468 评审 F2/F3）
+
+- **同 UID 路径替换竞态（已接受）**：macOS 没有 `fexecve`，监督器只能在每次 spawn（含崩溃重启）前用 `O_NOFOLLOW` + 同一 fd 复核安装文件哈希，再按路径 exec。复核与 exec 之间，同 UID 进程仍可替换该路径。同 UID 恶意进程本就在信任边界内（见 §10），这一竞态作为残余风险接受，不再加防护。
+- **监听者归属**：loopback 不提供对端身份，状态码也认证不了服务端。就绪判定在发出 Admin token 之前，要求数据口与 Admin 口上所有可见的 LISTEN socket 都由子进程组持有；出现组外持有者按端口冲突（L4）失败，不重试。macOS 上本 crate 禁止 `unsafe`，而 libproc 只能经 C union 读出 socket 端口，所以改由系统自带的 `/usr/sbin/lsof` 逐进程查询；Linux 读 `/proc`。剩余风险：查询看不到其他 UID 进程的描述符；其他 UID 借 `SO_REUSEPORT` 共享端口的情形不在本闸门覆盖范围内。
 
 ### 14.1 协调者裁决：首个里程碑只做 IL-01 至 IL-13
 
