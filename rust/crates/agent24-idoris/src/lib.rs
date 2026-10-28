@@ -2,6 +2,8 @@
 
 pub mod download;
 pub mod install;
+pub mod keychain;
+pub mod keys;
 
 use semver::Version;
 use serde::Deserialize;
