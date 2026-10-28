@@ -270,6 +270,7 @@ dependencies = [
  "libc",
  "rustix 0.38.44",
  "security-framework 3.7.0",
+ "tempfile",
 ]
 
 [[package]]
@@ -526,6 +527,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

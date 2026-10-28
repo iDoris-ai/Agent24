@@ -12,6 +12,15 @@ pub(crate) struct Record {
     pub(crate) revoked: bool,
 }
 
+impl Record {
+    pub(crate) fn expired(&self, now: super::types::UnixSeconds) -> bool {
+        self.claims.first_party.as_ref().map_or_else(
+            || now >= self.claims.expires_at,
+            |claims| tokio::time::Instant::now() >= claims.deadline,
+        )
+    }
+}
+
 pub(crate) struct State {
     pub(crate) records: HashMap<[u8; 32], Record>,
     pub(crate) ids: HashMap<String, [u8; 32]>,

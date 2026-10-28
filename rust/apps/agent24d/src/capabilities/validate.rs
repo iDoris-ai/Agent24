@@ -25,6 +25,8 @@ impl CapabilityStore {
             let id = record.claims.capability_id.clone();
             state.records.remove(&digest);
             state.ids.remove(&id);
+            state.epoch = state.epoch.wrapping_add(1);
+            let _ = self.shared.changed.send(state.epoch);
             return Err(CapabilityError::Unauthorized);
         }
         let record = state
@@ -72,6 +74,8 @@ impl CapabilityStore {
             let id = record.claims.capability_id.clone();
             state.records.remove(&digest);
             state.ids.remove(&id);
+            state.epoch = state.epoch.wrapping_add(1);
+            let _ = self.shared.changed.send(state.epoch);
             return Err(CapabilityError::Unauthorized);
         }
         let record = state
@@ -84,7 +88,7 @@ impl CapabilityStore {
         if record.claims.daemon_generation != *self.daemon_generation {
             return Err(CapabilityError::StaleGeneration);
         }
-        if now >= record.claims.expires_at {
+        if record.expired(now) {
             return Err(CapabilityError::Expired);
         }
         Ok(())
@@ -135,7 +139,7 @@ impl CapabilityStore {
         if record.claims.daemon_generation != *self.daemon_generation {
             return Err(CapabilityError::StaleGeneration);
         }
-        if now >= record.claims.expires_at {
+        if record.expired(now) {
             return Err(CapabilityError::Expired);
         }
         if record.claims.audience != super::Audience::ProductHost
@@ -162,10 +166,9 @@ impl CapabilityStore {
 }
 
 fn process_live(record: &Record) -> bool {
-    record.claims.first_party.as_ref().is_none_or(|claims| {
-        let peer = &claims.peer;
-        agent24_os_proc::is_alive(peer.pid)
-            && agent24_os_proc::start_time(peer.pid)
-                .is_ok_and(|s| s.sec == peer.start.sec && s.usec == peer.start.usec)
-    })
+    record
+        .claims
+        .first_party
+        .as_ref()
+        .is_none_or(|claims| super::first_party::peer_live(&claims.peer))
 }

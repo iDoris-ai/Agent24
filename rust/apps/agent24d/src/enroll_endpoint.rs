@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 pub const SOCKET_NAME: &str = "enroll.sock";
 /// One JSON line per frame, at most this many bytes (D5).
 const MAX_FRAME: u64 = 16 * 1024;
+const IDLE_DEADLINE: Duration = Duration::from_secs(10 * 60);
 const FRAME_DEADLINE: Duration = Duration::from_secs(5);
 /// Connections served at once; further ones are closed unanswered so a slow
 /// or hostile peer cannot pile up tasks or exhaust descriptors.
@@ -26,7 +27,11 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 pub(crate) trait IdentityVerifier: Send + Sync {
     fn start_time(&self, pid: i32) -> io::Result<ProcStart>;
-    fn verify(&self, pid: i32) -> Result<VerifiedIdentity, EnrollErrorCode>;
+    fn verify(
+        &self,
+        pid: i32,
+        audit_token: Option<agent24_os_proc::AuditToken>,
+    ) -> Result<VerifiedIdentity, EnrollErrorCode>;
 }
 
 pub(crate) struct SystemIdentityVerifier;
@@ -37,14 +42,23 @@ impl IdentityVerifier for SystemIdentityVerifier {
             usec: s.usec,
         })
     }
-    fn verify(&self, pid: i32) -> Result<VerifiedIdentity, EnrollErrorCode> {
-        let identity = agent24_os_proc::verify_code_identity(pid, TEAM_ID, IDENTIFIERS)
-            .map_err(|_| EnrollErrorCode::IdentityRejected)?;
+    fn verify(
+        &self,
+        _pid: i32,
+        audit_token: Option<agent24_os_proc::AuditToken>,
+    ) -> Result<VerifiedIdentity, EnrollErrorCode> {
+        let identity = agent24_os_proc::verify_code_identity(
+            audit_token.ok_or(EnrollErrorCode::IdentityRejected)?,
+            TEAM_ID,
+            IDENTIFIERS,
+        )
+        .map_err(|_| EnrollErrorCode::IdentityRejected)?;
         Ok(VerifiedIdentity {
             kind: IdentityKind::MacosSecCode,
             identifier: identity.identifier,
             team_id: identity.team_id,
             executable: identity.executable,
+            audit_token,
         })
     }
 }
@@ -97,6 +111,13 @@ impl EnrollEndpoint {
                     () = stop.cancelled() => break,
                     accepted = listener.accept() => match accepted {
                         Ok((stream, _)) => {
+                            #[cfg(target_os = "macos")]
+                            let audit_token = match agent24_os_proc::peer_audit_token(&stream) {
+                                Ok(token) => Some(token),
+                                Err(_) => continue,
+                            };
+                            #[cfg(not(target_os = "macos"))]
+                            let audit_token = None;
                             let Ok(permit) = permits.clone().try_acquire_owned() else {
                                 continue; // over the cap: drop = close
                             };
@@ -108,7 +129,7 @@ impl EnrollEndpoint {
                                 let permit = Arc::new(permit);
                                 tokio::select! {
                                     () = stop.cancelled() => {}
-                                    () = answer(stream, generation, authority, verifier, stop.clone(), permit) => {}
+                                    () = answer(stream, audit_token, generation, authority, verifier, stop.clone(), permit) => {}
                                 }
                             });
                         }
@@ -186,9 +207,9 @@ async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
 
 async fn send<W: tokio::io::AsyncWrite + Unpin>(
     write: &mut W,
-    value: serde_json::Value,
+    value: impl serde::Serialize,
 ) -> io::Result<()> {
-    let mut bytes = serde_json::to_vec(&value)?;
+    let mut bytes = zeroize::Zeroizing::new(serde_json::to_vec(&value)?);
     bytes.push(b'\n');
     tokio::time::timeout(FRAME_DEADLINE, write.write_all(&bytes)).await??;
     Ok(())
@@ -211,7 +232,35 @@ async fn enrolled<W: tokio::io::AsyncWrite + Unpin>(
     token: &IssuedToken,
     peer: &EnrolledPeer,
 ) -> io::Result<()> {
-    send(write, serde_json::json!({"v":1,"op":"enrolled","token":token.secret,"expires_in":token.expires_in,"tier":"daily","identity":{"kind":"macos_seccode","identifier":peer.identity.identifier}})).await
+    #[derive(serde::Serialize)]
+    struct Identity<'a> {
+        kind: &'a str,
+        identifier: &'a str,
+    }
+    #[derive(serde::Serialize)]
+    struct Enrolled<'a> {
+        v: u32,
+        op: &'a str,
+        token: &'a str,
+        expires_in: u64,
+        tier: &'a str,
+        identity: Identity<'a>,
+    }
+    send(
+        write,
+        Enrolled {
+            v: 1,
+            op: "enrolled",
+            token: &token.secret,
+            expires_in: token.expires_in,
+            tier: "daily",
+            identity: Identity {
+                kind: "macos_seccode",
+                identifier: &peer.identity.identifier,
+            },
+        },
+    )
+    .await
 }
 fn peer_allowed(uid: u32, pid: Option<i32>) -> Option<i32> {
     (uid == rustix::process::geteuid().as_raw())
@@ -249,7 +298,10 @@ async fn recheck(
 ) -> Result<(), EnrollErrorCode> {
     inspect(permit, move || {
         if verifier.start_time(pid).ok() != Some(start)
-            || verifier.verify(pid).ok().as_ref() != Some(&identity)
+            || verify_peer(&*verifier, pid, identity.audit_token)
+                .ok()
+                .as_ref()
+                != Some(&identity)
         {
             return Err(EnrollErrorCode::IdentityRejected);
         }
@@ -258,9 +310,23 @@ async fn recheck(
     .await
 }
 
+fn verify_peer(
+    verifier: &dyn IdentityVerifier,
+    pid: i32,
+    audit_token: Option<agent24_os_proc::AuditToken>,
+) -> Result<VerifiedIdentity, EnrollErrorCode> {
+    if audit_token
+        .is_some_and(|token| token.pid() != pid || !agent24_os_proc::audit_token_is_live(token))
+    {
+        return Err(EnrollErrorCode::IdentityRejected);
+    }
+    verifier.verify(pid, audit_token)
+}
+
 #[cfg(unix)]
 async fn answer(
     stream: tokio::net::UnixStream,
+    audit_token: Option<agent24_os_proc::AuditToken>,
     generation: String,
     authority: Arc<dyn EnrollAuthority>,
     verifier: Arc<dyn IdentityVerifier>,
@@ -273,6 +339,9 @@ async fn answer(
     let Some(pid) = peer_allowed(cred.uid(), cred.pid()) else {
         return;
     };
+    if audit_token.is_some_and(|token| token.pid() != pid || token.euid() != cred.uid()) {
+        return;
+    }
     let initial = verifier.clone();
     let Ok(start) = inspect(permit.clone(), move || {
         initial
@@ -312,14 +381,18 @@ async fn answer(
         return;
     }
     let first = verifier.clone();
-    let identity = match inspect(permit.clone(), move || first.verify(pid)).await {
+    let identity = match inspect(permit.clone(), move || {
+        verify_peer(&*first, pid, audit_token)
+    })
+    .await
+    {
         Ok(identity) => identity,
         Err(code) => {
             send_error(&mut write, code).await;
             return;
         }
     };
-    // Recheck both identity and birth time: exec does not change birth time.
+    // Recheck the same audit token: exec changes pidversion, not birth time.
     if let Err(code) = recheck(
         verifier.clone(),
         pid,
@@ -353,11 +426,10 @@ async fn answer(
     let mut token_id = token.token_id;
     drop(token.secret);
     loop {
-        // The original connection can stay idle; only a started frame has a
-        // five-second deadline. EOF cancels outstanding presence confirmation.
-        match reader.fill_buf().await {
-            Ok([]) => return,
-            Err(_) => return,
+        // Presence confirmation runs outside this idle wait. Disconnecting
+        // releases capacity but does not revoke the token (D5).
+        match tokio::time::timeout(IDLE_DEADLINE, reader.fill_buf()).await {
+            Ok(Ok([])) | Ok(Err(_)) | Err(_) => return,
             _ => {}
         }
         let frame = match read_frame(&mut reader).await {
@@ -380,10 +452,26 @@ async fn answer(
                 .await
                 {
                     Ok(()) => authority.renew(&peer, &token_id),
-                    Err(code) => Err(code),
+                    Err(code) => {
+                        authority.revoke(&peer, &token_id);
+                        Err(code)
+                    }
                 }
             }
             "elevate" => {
+                if let Err(code) = recheck(
+                    verifier.clone(),
+                    pid,
+                    start,
+                    peer.identity.clone(),
+                    permit.clone(),
+                )
+                .await
+                {
+                    authority.revoke(&peer, &token_id);
+                    send_error(&mut write, code).await;
+                    return;
+                }
                 let (Some(method), Some(path), Some(body_sha256)) =
                     (frame.method, frame.path, frame.body_sha256)
                 else {
@@ -428,8 +516,46 @@ async fn answer(
                     }
                     result = &mut future => result,
                 };
+                // The peer may have exec'd while the user was confirming.
+                if let Err(code) = recheck(
+                    verifier.clone(),
+                    pid,
+                    start,
+                    peer.identity.clone(),
+                    permit.clone(),
+                )
+                .await
+                {
+                    authority.revoke(&peer, &token_id);
+                    send_error(&mut write, code).await;
+                    return;
+                }
                 match result {
-                    Ok(grant) => { if send(&mut write, serde_json::json!({"v":1,"op":"elevated","challenge_id":grant.challenge_id,"grant":grant.secret,"expires_in":grant.expires_in})).await.is_err() { return; } }
+                    Ok(grant) => {
+                        #[derive(serde::Serialize)]
+                        struct Elevated<'a> {
+                            v: u32,
+                            op: &'a str,
+                            challenge_id: &'a str,
+                            grant: &'a str,
+                            expires_in: u64,
+                        }
+                        if send(
+                            &mut write,
+                            Elevated {
+                                v: 1,
+                                op: "elevated",
+                                challenge_id: &grant.challenge_id,
+                                grant: &grant.secret,
+                                expires_in: grant.expires_in,
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
                     Err(code) => send_error(&mut write, code).await,
                 }
                 continue;
@@ -612,7 +738,11 @@ pub(crate) mod handshake_tests {
                 usec: 0,
             })
         }
-        fn verify(&self, _pid: i32) -> Result<VerifiedIdentity, EnrollErrorCode> {
+        fn verify(
+            &self,
+            _pid: i32,
+            audit_token: Option<agent24_os_proc::AuditToken>,
+        ) -> Result<VerifiedIdentity, EnrollErrorCode> {
             if self.reject {
                 return Err(EnrollErrorCode::IdentityRejected);
             }
@@ -627,6 +757,7 @@ pub(crate) mod handshake_tests {
                 .into(),
                 team_id: TEAM_ID.into(),
                 executable: "/agent24".into(),
+                audit_token,
             })
         }
     }
@@ -639,10 +770,11 @@ pub(crate) mod handshake_tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(IssuedToken {
                 token_id: "id".into(),
-                secret: "test-token".into(),
+                secret: zeroize::Zeroizing::new("test-token".into()),
                 expires_in: 3600,
             })
         }
+        fn revoke(&self, _peer: &EnrolledPeer, _id: &str) {}
         fn renew(&self, peer: &EnrolledPeer, _id: &str) -> Result<IssuedToken, EnrollErrorCode> {
             self.issue(peer)
         }
@@ -657,7 +789,7 @@ pub(crate) mod handshake_tests {
             Err(EnrollErrorCode::PresenceUnavailable)
         }
     }
-    async fn line(reader: &mut BufReader<tokio::net::UnixStream>) -> serde_json::Value {
+    async fn line<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> serde_json::Value {
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         serde_json::from_str(&line).unwrap()
@@ -714,6 +846,55 @@ pub(crate) mod handshake_tests {
         stop.cancel();
     }
     #[tokio::test]
+    async fn post_enroll_idle_timeout_closes_connection_and_releases_capacity() {
+        let (_dir, endpoint, stop, _, mut client) = connect(false, false, false).await;
+        client
+            .get_mut()
+            .write_all(b"{\"v\":1,\"op\":\"hello\",\"generation\":\"generation\"}\n")
+            .await
+            .unwrap();
+        assert_eq!(line(&mut client).await["op"], "challenge");
+        assert_eq!(line(&mut client).await["op"], "enrolled");
+        let mut clients = vec![client];
+        for _ in 1..MAX_CONCURRENT {
+            let mut next = BufReader::new(
+                tokio::net::UnixStream::connect(endpoint.path())
+                    .await
+                    .unwrap(),
+            );
+            next.get_mut()
+                .write_all(b"{\"v\":1,\"op\":\"hello\",\"generation\":\"generation\"}\n")
+                .await
+                .unwrap();
+            assert_eq!(line(&mut next).await["op"], "challenge");
+            assert_eq!(line(&mut next).await["op"], "enrolled");
+            clients.push(next);
+        }
+        tokio::time::pause();
+        for client in &mut clients {
+            let mut bytes = Vec::new();
+            let result = tokio::time::timeout(
+                Duration::from_secs(601),
+                client.read_until(b'\n', &mut bytes),
+            )
+            .await;
+            assert_eq!(result.unwrap().unwrap(), 0);
+        }
+        tokio::time::resume();
+        let mut next = BufReader::new(
+            tokio::net::UnixStream::connect(endpoint.path())
+                .await
+                .unwrap(),
+        );
+        next.get_mut()
+            .write_all(b"{\"v\":1,\"op\":\"hello\",\"generation\":\"generation\"}\n")
+            .await
+            .unwrap();
+        assert_eq!(line(&mut next).await["op"], "challenge");
+        assert_eq!(line(&mut next).await["op"], "enrolled");
+        stop.cancel();
+    }
+    #[tokio::test]
     async fn rejected_identity_or_changed_process_never_issues() {
         for (reject, changed_start, changed_identity) in [
             (true, false, false),
@@ -755,12 +936,17 @@ pub(crate) mod handshake_tests {
         fn start_time(&self, pid: i32) -> io::Result<ProcStart> {
             SystemIdentityVerifier.start_time(pid)
         }
-        fn verify(&self, _pid: i32) -> Result<VerifiedIdentity, EnrollErrorCode> {
+        fn verify(
+            &self,
+            _pid: i32,
+            audit_token: Option<agent24_os_proc::AuditToken>,
+        ) -> Result<VerifiedIdentity, EnrollErrorCode> {
             Ok(VerifiedIdentity {
                 kind: IdentityKind::MacosSecCode,
                 identifier: "agent24".into(),
                 team_id: TEAM_ID.into(),
                 executable: std::env::current_exe().unwrap(),
+                audit_token,
             })
         }
     }
@@ -769,6 +955,10 @@ pub(crate) mod handshake_tests {
         authority: Arc<dyn EnrollAuthority>,
     ) -> (BufReader<tokio::net::UnixStream>, CancellationToken) {
         let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        #[cfg(target_os = "macos")]
+        let audit_token = Some(agent24_os_proc::peer_audit_token(&server).unwrap());
+        #[cfg(not(target_os = "macos"))]
+        let audit_token = None;
         let stop = CancellationToken::new();
         let cancel = stop.clone();
         let permit = Arc::new(
@@ -779,6 +969,7 @@ pub(crate) mod handshake_tests {
         );
         tokio::spawn(answer(
             server,
+            audit_token,
             "daemon-test".into(),
             authority,
             Arc::new(KernelStartVerifier),
@@ -796,6 +987,117 @@ pub(crate) mod handshake_tests {
         (client, stop)
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn forked_child_cannot_enroll_after_connecting_parent_execs() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = dir.path().join("peer.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut child = tokio::process::Command::new("python3")
+            .args(["-c", include_str!("tests/fixtures/exec_peer.py")])
+            .arg(&socket)
+            .arg("fork")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::new(permits.acquire_owned().await.unwrap());
+        // Wait until answer has sampled the connecting process, before exec.
+        struct ReadyVerifier(Arc<std::sync::atomic::AtomicBool>);
+        impl IdentityVerifier for ReadyVerifier {
+            fn start_time(&self, pid: i32) -> io::Result<ProcStart> {
+                let start = SystemIdentityVerifier.start_time(pid);
+                self.0.store(true, Ordering::SeqCst);
+                start
+            }
+            fn verify(
+                &self,
+                pid: i32,
+                audit_token: Option<agent24_os_proc::AuditToken>,
+            ) -> Result<VerifiedIdentity, EnrollErrorCode> {
+                KernelStartVerifier.verify(pid, audit_token)
+            }
+        }
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let audit_token = Some(agent24_os_proc::peer_audit_token(&stream).unwrap());
+        let task = tokio::spawn(answer(
+            stream,
+            audit_token,
+            "g".into(),
+            Arc::new(crate::capabilities::first_party::FirstPartyAuthority::new(
+                crate::capabilities::CapabilityStore::new("g"),
+            )),
+            Arc::new(ReadyVerifier(ready.clone())),
+            CancellationToken::new(),
+            permit.clone(),
+        ));
+        while !ready.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+            if task.is_finished() {
+                panic!("connection closed before exec");
+            }
+        }
+        child.stdin.take().unwrap().write_all(b"e").await.unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut response = String::new();
+        output.read_line(&mut response).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()["op"],
+            "challenge"
+        );
+        response.clear();
+        output.read_line(&mut response).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()["code"],
+            "identity_rejected"
+        );
+        task.abort();
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn renew_and_elevate_reject_exec_and_remove_bound_token() {
+        for op in ["renew", "elevate"] {
+            let dir = tempfile::tempdir_in("/tmp").unwrap();
+            let mut endpoint = bind(dir.path()).unwrap();
+            let stop = CancellationToken::new();
+            let store = crate::capabilities::CapabilityStore::new("g");
+            let authority = Arc::new(crate::capabilities::first_party::FirstPartyAuthority::new(
+                store.clone(),
+            ));
+            endpoint.serve_with_identity(
+                stop.clone(),
+                "g".into(),
+                authority,
+                Arc::new(KernelStartVerifier),
+            );
+            let mut child = tokio::process::Command::new("python3")
+                .args(["-c", include_str!("tests/fixtures/exec_peer.py")])
+                .arg(endpoint.path())
+                .arg(op)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut output = BufReader::new(child.stdout.take().unwrap());
+            assert_eq!(line(&mut output).await["op"], "challenge");
+            let enrolled = line(&mut output).await;
+            assert_eq!(enrolled["op"], "enrolled");
+            let token = enrolled["token"].as_str().unwrap();
+            assert!(
+                store
+                    .require_live_bearer(token, crate::capabilities::unix_now())
+                    .is_ok()
+            );
+            child.stdin.take().unwrap().write_all(b"e").await.unwrap();
+            assert_eq!(line(&mut output).await["code"], "identity_rejected");
+            assert!(store.shared.state.lock().unwrap().records.is_empty());
+            stop.cancel();
+        }
+    }
     struct AllowPresence;
     #[async_trait]
     impl crate::capabilities::presence::PresenceProvider for AllowPresence {
@@ -855,7 +1157,7 @@ pub(crate) mod handshake_tests {
                 crate::capabilities::unix_now(),
             )
             .unwrap();
-        authority.remember_attached_request(&authorization.claims.capability_id, &body);
+        authority.remember_attached_request(&authorization.claims.capability_id, &body, &[]);
         send(client.get_mut(), frame.clone()).await.unwrap();
         assert_eq!(line(&mut client).await["op"], "elevation_pending");
         assert_eq!(line(&mut client).await["code"], "presence_unavailable");
@@ -895,7 +1197,11 @@ pub(crate) mod handshake_tests {
         fn start_time(&self, pid: i32) -> io::Result<ProcStart> {
             SystemIdentityVerifier.start_time(pid)
         }
-        fn verify(&self, _pid: i32) -> Result<VerifiedIdentity, EnrollErrorCode> {
+        fn verify(
+            &self,
+            _pid: i32,
+            _audit_token: Option<agent24_os_proc::AuditToken>,
+        ) -> Result<VerifiedIdentity, EnrollErrorCode> {
             std::thread::sleep(FRAME_DEADLINE + Duration::from_millis(100));
             Err(EnrollErrorCode::IdentityRejected)
         }

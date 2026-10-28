@@ -99,6 +99,7 @@ pub enum FirstPartyTier {
 pub struct FirstPartyClaims {
     pub peer: crate::enroll_api::EnrolledPeer,
     pub tier: FirstPartyTier,
+    pub deadline: tokio::time::Instant,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
