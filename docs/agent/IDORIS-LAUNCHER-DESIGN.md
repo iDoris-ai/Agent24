@@ -88,10 +88,15 @@ agent24 idoris stop
 | 锁字段 | 含义与约束 |
 | --- | --- |
 | `schema`、`tag` | 锁格式版本、精确发布 tag；不用 latest、分支或浮动 URL。 |
+| `commit` | 精确发布 tag 对应的完整 Git commit。 |
 | `assets.aarch64-apple-darwin.name`、`sha256` | `idoris-v<ver>-aarch64-apple-darwin.tar.gz` 和 64 位 SHA-256。平台无记录即不支持。 |
-| `contract_major`、`tested_contract_version` | 允许的契约主版本和实际验过的完整版本。主版本不同拒绝；同主版本仍须通过冻结字段及安全语义检查。 |
-| `capabilities` | 已验收的 L1–L5 能力标识及发布说明来源；不通过运行未知参数来猜测。 |
+| `assets.<triple>.files` | 归档内允许的文件清单；非空，相对路径，不含 `..`，不得重复。 |
+| `contract_major`、`min_contract_minor`、`tested_contract_version` | 允许的契约主版本、最低 minor 和实际验过的完整版本。主版本不同或 minor 低于最低值拒绝；同主版本仍须通过冻结字段及安全语义检查。 |
+| `capabilities` | 已验收的 L1–L6 能力标识及发布说明来源；不通过运行未知参数来猜测。 |
 | `team_id` | 签名团队 `HYAP444FN9`；安装时 `codesign` 校验必须一致（L6）。 |
+| `release_url_base` | 官方 HTTPS Release 地址基址，主机须为 `github.com`；资产 URL 由基址、tag 和资产名派生。 |
+
+注：首份锁已随 IL-01 落地（v0.4.0，sha256 `ab46e0180090ef5143b8fb6ea98b0333f2ef9c3a137bab2dc3cf7307960476d5`，team_id `HYAP444FN9`）。
 
 当前资产名、每资产一个 `.sha256`、已发布 tag 与资产不可变来自 #588 §1「下载」第 1、4 条。v0.3.2 只作为历史基线 [A1]，不能填进声称满足 L1–L5 的首份锁。目标 tag、hash、完整契约版本待 iDoris 发版后填入，不预造。
 下载器只接受从锁的 tag 派生的官方 HTTPS Release 资产，重定向逐跳核对官方资产主机白名单；设置连接、总时长和大小上限，失败可重试。`.sha256` 仅供发布核对，最终必须匹配 Agent24 内置锁；不能用同次下载的校验文件替换锁。续传文件也必须重算完整 hash。[A9]
