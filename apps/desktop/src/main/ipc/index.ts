@@ -62,9 +62,10 @@ function omlxProbeCandidates(): OmlxProbeCandidate[] {
   return [
     // Keyed probe only when a key is configured.
     ...(key ? [{ url: 'http://127.0.0.1:8088', apiKey: key }] : []),
-    // The key from the user's own oMLX config, for the address that same
-    // config says oMLX listens on.
-    ...(fromFile ? [{ url: fromFile.url, apiKey: fromFile.apiKey, fromSettings: true }] : []),
+    // The user's own oMLX config, for the address that same config says oMLX
+    // listens on. No key is copied here: it is resolved from the file right
+    // before the request (effectiveOmlxKey), so it can never be stale.
+    ...(fromFile ? [{ url: fromFile.url, apiKey: '', fromSettings: true }] : []),
     // Keyless probes: a keyed server answers 401 (reported as "auth required").
     { url: 'http://127.0.0.1:8088', apiKey: '' },
     { url: 'http://127.0.0.1:8000', apiKey: '' },
