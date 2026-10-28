@@ -2,6 +2,7 @@
 
 pub mod download;
 pub mod install;
+mod storage;
 
 use semver::Version;
 use serde::Deserialize;
@@ -12,7 +13,7 @@ use std::{
 
 const EMBEDDED: &str = include_str!("../idoris.lock.json");
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdorisLock {
     pub schema: u32,
@@ -27,7 +28,7 @@ pub struct IdorisLock {
     pub release_url_base: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LockedAsset {
     pub name: String,
@@ -35,7 +36,7 @@ pub struct LockedAsset {
     pub files: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Capability {
     pub id: String,
@@ -93,6 +94,13 @@ impl IdorisLock {
         )?;
         for (triple, asset) in &lock.assets {
             require(
+                !triple.is_empty()
+                    && triple.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-')
+                    }),
+                "assets.triple",
+            )?;
+            require(
                 asset.name == format!("idoris-{}-{triple}.tar.gz", lock.tag),
                 "assets.name",
             )?;
@@ -128,9 +136,15 @@ impl IdorisLock {
         )?;
         let base = &lock.release_url_base;
         let url = url::Url::parse(base).map_err(|_| LockError::Invalid("release_url_base"))?;
+        // Url removes an explicit :443, so also check the original authority.
         require(
             url.scheme() == "https"
                 && url.host_str() == Some("github.com")
+                && base.split('/').nth(2) == Some("github.com")
+                && (url.path() == "/iDoris-ai/iDoris/releases/download"
+                    || url
+                        .path()
+                        .starts_with("/iDoris-ai/iDoris/releases/download/"))
                 && url.username().is_empty()
                 && url.password().is_none()
                 && url.query().is_none()

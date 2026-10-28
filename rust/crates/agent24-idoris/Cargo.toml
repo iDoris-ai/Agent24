@@ -19,6 +19,7 @@ tokio-util = "0.7"
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
 fs2 = "0.4"
+rustix = { version = "1", features = ["fs", "process"] }
 tempfile = "3"
 
 [lints]
