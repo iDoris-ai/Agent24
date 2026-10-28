@@ -33,7 +33,7 @@ function statusDot(model: OmlxModel) {
   return <span title={title} style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: color, marginRight: 6 }} />
 }
 
-export default function ModelsPage({ onOpenChat }: { onOpenChat?: () => void } = {}) {
+export default function ModelsPage() {
   const t = useT(modelsMessages)
   const [liveModels, setLiveModels] = useState<OmlxModel[]>([])
   const [loading, setLoading] = useState(true)
@@ -63,7 +63,7 @@ export default function ModelsPage({ onOpenChat }: { onOpenChat?: () => void } =
       </div>
       <div className="page-sub">{t('page.subtitle')}</div>
 
-      <IdorisPanel onOpenChat={onOpenChat} />
+      <IdorisPanel />
 
       {/* Live oMLX model status */}
       {hasLive && (

@@ -52,6 +52,17 @@ pub struct Installation {
     pub omlx_url: Option<String>,
     pub omlx_key_id: Option<String>,
     pub desired_running: bool,
+    #[serde(default)]
+    pub verification: Option<VerificationReceipt>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationReceipt {
+    pub model_id: String,
+    pub record_id: String,
+    pub locality: String,
+    pub verified_at: String,
 }
 
 impl Installation {
@@ -207,6 +218,9 @@ pub struct Status {
     pub roles: Vec<Role>,
     pub last_error: Option<Code>,
     pub current_operation: Option<String>,
+    pub verification: Option<VerificationReceipt>,
+    pub budget_suggestion: Option<agent24_hw::IdorisBudgetSuggestion>,
+    pub budget_unavailable_reason: Option<String>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -253,6 +267,10 @@ pub struct Operation {
     request_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_code: Option<agent24_idoris::setup::SetupCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_progress: Option<agent24_idoris::download::DownloadProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<VerificationReceipt>,
 }
 
 pub struct KeychainSource(pub Arc<dyn Keychain>);
@@ -563,6 +581,11 @@ impl IdorisHost {
         Ok(())
     }
     pub async fn status(&self) -> Status {
+        let budget = self.provisioner.budget_suggestion().await;
+        let (budget_suggestion, budget_unavailable_reason) = match budget {
+            Ok(suggestion) => (Some(suggestion), None),
+            Err(reason) => (None, Some(reason.to_owned())),
+        };
         let i = self.inner.lock().await;
         let r = i.installation.as_ref();
         Status {
@@ -573,6 +596,9 @@ impl IdorisHost {
             roles: r.map(|r| r.roles.clone()).unwrap_or_default(),
             last_error: i.last_error,
             current_operation: i.active.as_ref().map(|a| a.0.clone()),
+            verification: r.and_then(|r| r.verification.clone()),
+            budget_suggestion,
+            budget_unavailable_reason,
         }
     }
     pub async fn operation(&self, id: &str) -> Result<Operation, Code> {
@@ -665,6 +691,8 @@ impl IdorisHost {
             idempotency_key: key,
             request_fingerprint: None,
             setup_code: None,
+            download_progress: None,
+            verification: None,
         };
         i.operations.insert(op.operation_id.clone(), op.clone());
         if let Err(e) = write_json(&self.root.join("operations.json"), &i.operations) {

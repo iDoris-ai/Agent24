@@ -9,7 +9,7 @@ import { idorisErrors } from './IdorisPanel.i18n'
 
 type Status = components['schemas']['IdorisStatus']
 type Operation = components['schemas']['IdorisOperation']
-const initial: Status = { state: 'not_installed', version: null, data_port: null, admin_port: null, roles: [], last_error: null, current_operation: null }
+const initial: Status = { state: 'not_installed', version: null, data_port: null, admin_port: null, roles: [], last_error: null, current_operation: null, verification: null, budget_suggestion: null, budget_unavailable_reason: 'hardware_memory_unavailable' }
 const installed: Status = { ...initial, state: 'not_configured', version: '0.4.0' }
 const running: Status = { ...installed, state: 'running', data_port: 8740, admin_port: 8741, roles: ['daily'] }
 const candidate = (endpoint: string) => ({ endpoint, identity: 'omlx', authentication: 'ready', models: ['real/daily', 'real/deep'] })
@@ -52,6 +52,45 @@ async function configure() {
   fireEvent.change(screen.getByLabelText('Core reserved memory (bytes)'), { target: { value: '4294967296' } })
 }
 describe('iDoris daemon projection', () => {
+  it('prefills the hardware estimate but requires confirmation and preserves edits on refresh', async () => {
+    status = { ...installed, budget_suggestion: { core_reserved_bytes: 123456, idoris_budget_bytes: 789012 }, budget_unavailable_reason: null }
+    render(<IdorisPanel />)
+    const input = await screen.findByLabelText('Core reserved memory (bytes)')
+    expect(input).toHaveValue('123456')
+    expect(screen.getByText(/789012 B/)).toBeInTheDocument()
+    await within(screen.getByLabelText('oMLX endpoint')).findByRole('option', { name: /http:\/\/127.0.0.1:8088/ })
+    fireEvent.change(screen.getByLabelText('oMLX endpoint'), { target: { value: 'http://127.0.0.1:8088' } })
+    await within(screen.getByLabelText('Daily model (required)')).findByRole('option', { name: 'real/daily' })
+    fireEvent.change(screen.getByLabelText('Daily model (required)'), { target: { value: 'real/daily' } })
+    expect(screen.getByLabelText(/I agree to share/)).not.toBeChecked()
+    expect(screen.getByRole('button', { name: 'Connect' })).toBeDisabled()
+    expect(proxy.mock.calls.every(([req]) => req.method === 'GET')).toBe(true)
+    fireEvent.click(screen.getByLabelText(/I agree to share/))
+    expect(screen.getByRole('button', { name: 'Connect' })).toBeEnabled()
+    fireEvent.change(input, { target: { value: '' } })
+    expect(screen.getByLabelText(/I agree to share/)).not.toBeChecked()
+    click('Refresh')
+    await waitFor(() => expect(proxy.mock.calls.filter(([req]) => req.path.endsWith('/status')).length).toBe(2))
+    expect(input).toHaveValue('')
+  })
+  it.each([1024, undefined])('renders streamed download bytes with total %s', async (total) => {
+    status = { ...initial, current_operation: 'op-1' }
+    op = { ...operation('install'), phase: 'downloading', ...{ download_progress: { bytes_done: 512, ...(total === undefined ? {} : { bytes_total: total }) } } }
+    render(<IdorisPanel />)
+    const progress = await screen.findByRole('progressbar')
+    if (total === undefined) expect(progress).not.toHaveAttribute('value')
+    else { expect(progress).toHaveAttribute('value', '512'); expect(progress).toHaveAttribute('max', '1024') }
+    expect(screen.getByText(/512 B/)).toBeInTheDocument()
+  })
+  it('shows the persisted verification receipt on a running card after remount', async () => {
+    status = { ...running, ...{ verification: { model_id: 'verified/model', record_id: 'record-123', locality: 'loopback', verified_at: '2026-10-28T12:00:00Z' } } }
+    render(<IdorisPanel />)
+    expect(await screen.findByText(/verified\/model/)).toBeInTheDocument()
+    expect(screen.getByText(/record-123/)).toBeInTheDocument()
+    expect(screen.getByText(/loopback/)).toBeInTheDocument()
+    expect(screen.getByText(/2026-10-28T12:00:00Z/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Send a test message' })).toBeNull()
+  })
   it('renders not installed and starts consented installation through backendProxy', async () => {
     render(<IdorisPanel />)
     await screen.findByRole('button', { name: 'Download and install' }); click('Download and install')
@@ -129,9 +168,8 @@ describe('iDoris daemon projection', () => {
     expect(screen.queryByLabelText('API key')).toBeNull()
     expect(screen.getByRole('button', { name: 'Connect' })).toBeDisabled()
   })
-  it('polls connection success and opens Chat through the embedding page', async () => {
-    const openChat = vi.fn()
-    status = installed; render(<IdorisPanel onOpenChat={openChat} />)
+  it('polls connection success and displays its verification receipt', async () => {
+    status = installed; render(<IdorisPanel />)
     const endpoint = await screen.findByLabelText('oMLX endpoint')
     await within(endpoint).findByRole('option', { name: /http:\/\/127.0.0.1:8088/ })
     fireEvent.change(endpoint, { target: { value: 'http://127.0.0.1:8088' } })
@@ -139,10 +177,9 @@ describe('iDoris daemon projection', () => {
     fireEvent.change(screen.getByLabelText('Daily model (required)'), { target: { value: 'real/daily' } })
     fireEvent.change(screen.getByLabelText('Core reserved memory (bytes)'), { target: { value: '4294967296' } }); fireEvent.click(screen.getByLabelText(/I agree to share/)); click('Connect')
     await screen.findByRole('progressbar')
-    op = { ...op, result: 'succeeded', phase: 'done', cancellable: false }; status = running
+    op = { ...op, result: 'succeeded', phase: 'done', cancellable: false, verification: { model_id: 'real/daily', record_id: 'polled-record', locality: 'loopback', verified_at: '2026-10-28T12:00:00Z' } }; status = running
     expect(await screen.findByText(/Daily chat verified/)).toBeInTheDocument()
-    click('Send a test message')
-    expect(openChat).toHaveBeenCalledOnce()
+    expect(screen.getByText(/polled-record/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled()
   })
   it('start and stop are daemon operations, without optimistic runtime state', async () => {

@@ -1,7 +1,7 @@
 //! Install/connect transactions. Only non-sensitive intent and compensation IDs reach disk.
 use super::*;
 use agent24_idoris::{
-    download::{DownloadOptions, download_locked_asset},
+    download::{DownloadOptions, DownloadProgress, download_locked_asset},
     install::{InstallError, InstallOptions, OperationLock, install_locked_asset, operation_lock},
     keys::{KeyError, Keys},
     omlx_probe::{ServiceIdentity, read_settings_key},
@@ -63,10 +63,19 @@ struct PendingConnect {
 /// Replace only platform boundaries in tests; setup, keys, supervisor and chat remain real.
 #[async_trait]
 pub trait Provisioner: Send + Sync {
+    async fn budget_suggestion(&self) -> Result<agent24_hw::IdorisBudgetSuggestion, &'static str> {
+        tokio::task::spawn_blocking(|| {
+            agent24_hw::HardwareReport::from_env(&agent24_hw::SystemProbe::new())
+                .idoris_budget_suggestion()
+        })
+        .await
+        .map_err(|_| "hardware_probe_failed")?
+    }
     async fn download(
         &self,
         root: &Path,
         cancel: &CancellationToken,
+        progress: watch::Sender<DownloadProgress>,
     ) -> Result<VerifiedArchive, Code>;
     async fn install(
         &self,
@@ -85,12 +94,16 @@ impl Provisioner for SystemProvisioner {
         &self,
         root: &Path,
         cancel: &CancellationToken,
+        progress: watch::Sender<DownloadProgress>,
     ) -> Result<VerifiedArchive, Code> {
         download_locked_asset(
             IdorisLock::embedded(),
             "aarch64-apple-darwin",
             &root.join("cache"),
-            &DownloadOptions::default(),
+            &DownloadOptions {
+                progress: Some(progress),
+                ..DownloadOptions::default()
+            },
             cancel,
         )
         .await
@@ -336,6 +349,8 @@ impl IdorisHost {
             idempotency_key: key.into(),
             request_fingerprint: Some(fingerprint),
             setup_code: None,
+            download_progress: None,
+            verification: None,
         };
         // The receipt is deliberately structured; arbitrary user text is never persisted.
         let receipt = serde_json::json!({"action": action, "version": IdorisLock::embedded().tag, "confirmed_at": chrono::Utc::now().to_rfc3339(), "request": request});
@@ -380,7 +395,26 @@ impl IdorisHost {
         }
         check_cancel(cancel)?;
         self.phase(id, Phase::Downloading).await;
-        let archive = self.provisioner.download(&self.root, cancel).await?;
+        let (sender, mut progress) = watch::channel(DownloadProgress::default());
+        self.download_progress(id, DownloadProgress::default())
+            .await;
+        let download = self.provisioner.download(&self.root, cancel, sender);
+        tokio::pin!(download);
+        let archive = loop {
+            tokio::select! {
+                result = &mut download => {
+                    let latest = *progress.borrow_and_update();
+                    self.download_progress(id, latest).await;
+                    break result?;
+                }
+                changed = progress.changed() => {
+                    if changed.is_ok() {
+                        let latest = *progress.borrow_and_update();
+                        self.download_progress(id, latest).await;
+                    }
+                }
+            }
+        };
         self.phase(id, Phase::Verifying).await;
         check_cancel(cancel)?;
         self.phase(id, Phase::Installing).await;
@@ -402,6 +436,7 @@ impl IdorisHost {
             omlx_url: None,
             omlx_key_id: None,
             desired_running: false,
+            verification: None,
         });
         let record = Installation {
             release_dir: installed.directory().into(),
@@ -414,6 +449,11 @@ impl IdorisHost {
         write_json(&self.root.join("installation.json"), &record)?;
         i.installation = Some(record);
         Ok(())
+    }
+    async fn download_progress(&self, id: &str, progress: DownloadProgress) {
+        if let Some(op) = self.inner.lock().await.operations.get_mut(id) {
+            op.download_progress = Some(progress);
+        }
     }
     async fn execute_connect(
         self: &Arc<Self>,
@@ -627,7 +667,7 @@ impl IdorisHost {
                             .unwrap_or(Code::VerifyFailed)
                     }
                 })?;
-            gateway
+            let verification = gateway
                 .verify_connection(false, cancel)
                 .await
                 .map_err(|_| {
@@ -637,6 +677,12 @@ impl IdorisHost {
                         Code::VerifyFailed
                     }
                 })?;
+            pending.candidate.verification = Some(VerificationReceipt {
+                model_id: verification.model_id,
+                record_id: verification.record_id,
+                locality: verification.locality,
+                verified_at: chrono::Utc::now().to_rfc3339(),
+            });
             let mut i = self.inner.lock().await;
             check_cancel(cancel)?;
             i.operations.get_mut(id).ok_or(Code::NotFound)?.cancellable = false;
@@ -645,6 +691,8 @@ impl IdorisHost {
             write_json(&self.root.join("installation.json"), &pending.candidate)?;
             pending.committed = true;
             write_json(&self.root.join("pending-connect.json"), &pending)?;
+            i.operations.get_mut(id).ok_or(Code::NotFound)?.verification =
+                pending.candidate.verification.clone();
             self.router.replace_idoris(gateway);
             i.installation = Some(pending.candidate.clone());
             i.supervisor = new_supervisor.take();
@@ -809,6 +857,7 @@ impl IdorisHost {
                 op.error_code = None;
                 op.phase = Phase::Done;
                 op.cancellable = false;
+                op.verification = pending.candidate.verification.clone();
             }
             write_json(&self.root.join("operations.json"), &i.operations)?;
             Ok(())

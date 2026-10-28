@@ -47,9 +47,19 @@ struct Provision {
     verifications: AtomicUsize,
     no_key: AtomicBool,
     key_waiting: AtomicBool,
+    budget_unavailable: AtomicBool,
 }
 #[async_trait]
 impl Provisioner for Provision {
+    async fn budget_suggestion(&self) -> Result<agent24_hw::IdorisBudgetSuggestion, &'static str> {
+        let total = if self.budget_unavailable.load(Ordering::SeqCst) {
+            0
+        } else {
+            16 * 1024 * 1024 * 1024_u64
+        };
+        let profile = serde_json::from_value(json!({"total_mem_bytes": total, "avail_mem_bytes": total, "arch":"aarch64", "cpu_cores":8, "accelerator":"metal", "os":"macos"})).unwrap();
+        agent24_hw::HardwareReport::new(profile, None).idoris_budget_suggestion()
+    }
     async fn verify(&self, r: &Installation) -> Result<InstalledVersion, Code> {
         self.verifications.fetch_add(1, Ordering::SeqCst);
         InstalledVersion::verify_existing(
@@ -67,7 +77,12 @@ impl Provisioner for Provision {
         &self,
         _: &Path,
         cancel: &CancellationToken,
+        progress: watch::Sender<agent24_idoris::download::DownloadProgress>,
     ) -> Result<VerifiedArchive, Code> {
+        progress.send_replace(agent24_idoris::download::DownloadProgress {
+            bytes_done: 123,
+            bytes_total: None,
+        });
         self.downloads.fetch_add(1, Ordering::SeqCst);
         while self.gate.load(Ordering::SeqCst) {
             tokio::select! { _ = cancel.cancelled() => return Err(Code::Cancelled), _ = tokio::time::sleep(Duration::from_millis(5)) => {} }
@@ -126,6 +141,7 @@ impl ConnectedFixture {
             verifications: AtomicUsize::new(0),
             no_key: AtomicBool::new(false),
             key_waiting: AtomicBool::new(false),
+            budget_unavailable: AtomicBool::new(false),
         });
         let data = Arc::new(Store::default());
         let upstream = Arc::new(Store::default());
@@ -252,9 +268,42 @@ async fn install_reverifies_and_is_idempotent_and_cancellable() {
     })
     .await
     .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot =
+                serde_json::to_value(x.f.host.operation(&op.operation_id).await.unwrap()).unwrap();
+            if snapshot["download_progress"]["bytes_done"] == 123 {
+                assert_eq!(snapshot["phase"], "downloading");
+                assert!(snapshot["download_progress"].get("bytes_total").is_none());
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     x.f.host.cancel(&op.operation_id).await.unwrap();
     assert_eq!(x.f.complete(&op).await.result, Some(Outcome::Cancelled));
     assert!(!x.f.host.root.join("installation.json").exists());
+}
+
+#[tokio::test]
+async fn budget_suggestion_matches_hw_allocation_and_probe_failure_is_explicit() {
+    let x = ConnectedFixture::new().await;
+    let expected = x.provision.budget_suggestion().await.unwrap();
+    let value = serde_json::to_value(x.f.host.status().await).unwrap();
+    assert_eq!(
+        value["budget_suggestion"],
+        serde_json::to_value(expected).unwrap()
+    );
+    assert_eq!(value["budget_unavailable_reason"], serde_json::Value::Null);
+    x.provision.budget_unavailable.store(true, Ordering::SeqCst);
+    let value = serde_json::to_value(x.f.host.status().await).unwrap();
+    assert_eq!(value["budget_suggestion"], serde_json::Value::Null);
+    assert_eq!(
+        value["budget_unavailable_reason"],
+        "hardware_memory_unavailable"
+    );
 }
 #[tokio::test]
 async fn candidates_expose_identity_models_and_source_but_never_credentials() {
@@ -290,6 +339,17 @@ async fn connect_verifies_chat_commits_once_and_requires_explicit_replace() {
         done.error_code
     );
     assert_eq!(x.f.host.status().await.state, State::Running);
+    let status = serde_json::to_value(x.f.host.status().await).unwrap();
+    let receipt = &status["verification"];
+    assert_eq!(receipt["locality"], "loopback");
+    assert_eq!(receipt["model_id"], "real-model");
+    assert_eq!(receipt["record_id"], "fixture-chat");
+    assert_eq!(receipt.as_object().unwrap().len(), 4);
+    assert!(chrono::DateTime::parse_from_rfc3339(receipt["verified_at"].as_str().unwrap()).is_ok());
+    assert_eq!(
+        serde_json::to_value(&done).unwrap()["verification"],
+        *receipt
+    );
     assert!(x.f.host.router.idoris_gateway().is_ok());
     assert_eq!(x.keys().len(), 1);
     assert_eq!(x.keys()[0]["allowed_roles"], json!(["daily"]));
@@ -322,6 +382,23 @@ async fn connect_verifies_chat_commits_once_and_requires_explicit_replace() {
     .unwrap();
     assert!(consent["confirmed_at"].as_str().is_some());
     x.f.host.shutdown().await.unwrap();
+    let reopened = IdorisHost::open(
+        x.f.host.root.clone(),
+        x.f.host.managed.clone(),
+        x.f.host.router.clone(),
+        x.f.host.runtime.clone(),
+        x.f.host.secrets.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(reopened.status().await).unwrap()["verification"],
+        *receipt
+    );
+    assert_eq!(
+        serde_json::to_value(reopened.operation(&op.operation_id).await.unwrap()).unwrap()["verification"],
+        *receipt
+    );
+    reopened.shutdown().await.unwrap();
     x.f.assert_clean();
     x.assert_safe();
 }

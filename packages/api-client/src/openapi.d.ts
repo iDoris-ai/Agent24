@@ -1976,6 +1976,23 @@ export interface components {
                 next_action?: string;
             };
         };
+        IdorisDownloadProgress: {
+            bytes_done: number;
+            bytes_total?: number;
+        };
+        IdorisVerification: {
+            model_id: string;
+            record_id: string;
+            /** @enum {string} */
+            locality: "loopback";
+            /** Format: date-time */
+            verified_at: string;
+        };
+        /** @description Estimated core reserve capped at 4 GiB or usable memory. Requires explicit user confirmation; iDoris budget uses the hw idoris-env calculation. */
+        IdorisBudgetSuggestion: {
+            core_reserved_bytes: number;
+            idoris_budget_bytes: number;
+        };
         IdorisStatus: {
             /** @enum {string} */
             state: "not_installed" | "not_configured" | "stopped" | "starting" | "running" | "failed" | "instance_conflict";
@@ -1985,6 +2002,10 @@ export interface components {
             roles: ("daily" | "deep")[];
             last_error: components["schemas"]["IdorisErrorCode"] | null;
             current_operation: string | null;
+            verification: components["schemas"]["IdorisVerification"] | null;
+            budget_suggestion: components["schemas"]["IdorisBudgetSuggestion"] | null;
+            /** @enum {string|null} */
+            budget_unavailable_reason: "hardware_memory_unavailable" | "hardware_probe_failed" | "host_unavailable" | null;
         };
         IdorisOperation: {
             operation_id: string;
@@ -1997,6 +2018,8 @@ export interface components {
             error_code: components["schemas"]["IdorisErrorCode"] | null;
             cancellable: boolean;
             idempotency_key: string;
+            download_progress?: components["schemas"]["IdorisDownloadProgress"];
+            verification?: components["schemas"]["IdorisVerification"];
             request_fingerprint?: string;
             /** @enum {string} */
             setup_code?: "unreachable" | "auth_required" | "auth_failed" | "not_omlx" | "model_not_found" | "invalid_endpoint" | "invalid_role" | "out_dir_not_empty" | "validation_failed" | "write_failed" | "invalid_api_key_input";

@@ -288,7 +288,7 @@ export function App(): JSX.Element {
         {page === 'approvals'        && <ApprovalsPage />}
         {page === 'voice'            && <VoicePanel />}
         {page === 'creative'         && <CreativePage />}
-        {page === 'models'           && <ModelsPage onOpenChat={() => setPage('chat')} />}
+        {page === 'models'           && <ModelsPage />}
         {page === 'memory'           && <MemoryPage />}
         {page === 'settings'         && <SettingsPage />}
       </div>

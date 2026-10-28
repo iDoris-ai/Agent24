@@ -4146,10 +4146,34 @@ components:
             message: { type: string }
             retryable: { type: boolean }
             next_action: { type: string }
+    IdorisDownloadProgress:
+      type: object
+      additionalProperties: false
+      required: [bytes_done]
+      properties:
+        bytes_done: { type: integer, minimum: 0 }
+        bytes_total: { type: integer, minimum: 0 }
+    IdorisVerification:
+      type: object
+      additionalProperties: false
+      required: [model_id, record_id, locality, verified_at]
+      properties:
+        model_id: { type: string }
+        record_id: { type: string }
+        locality: { type: string, enum: [loopback] }
+        verified_at: { type: string, format: date-time }
+    IdorisBudgetSuggestion:
+      type: object
+      additionalProperties: false
+      description: Estimated core reserve capped at 4 GiB or usable memory. Requires explicit user confirmation; iDoris budget uses the hw idoris-env calculation.
+      required: [core_reserved_bytes, idoris_budget_bytes]
+      properties:
+        core_reserved_bytes: { type: integer, minimum: 0 }
+        idoris_budget_bytes: { type: integer, minimum: 0 }
     IdorisStatus:
       type: object
       additionalProperties: false
-      required: [state, version, data_port, admin_port, roles, last_error, current_operation]
+      required: [state, version, data_port, admin_port, roles, last_error, current_operation, verification, budget_suggestion, budget_unavailable_reason]
       properties:
         state:
           type: string
@@ -4165,6 +4189,17 @@ components:
             - $ref: "#/components/schemas/IdorisErrorCode"
             - type: "null"
         current_operation: { type: [string, "null"] }
+        verification:
+          anyOf:
+            - $ref: "#/components/schemas/IdorisVerification"
+            - type: "null"
+        budget_suggestion:
+          anyOf:
+            - $ref: "#/components/schemas/IdorisBudgetSuggestion"
+            - type: "null"
+        budget_unavailable_reason:
+          type: [string, "null"]
+          enum: [hardware_memory_unavailable, hardware_probe_failed, host_unavailable, null]
     IdorisOperation:
       type: object
       additionalProperties: false
@@ -4180,6 +4215,10 @@ components:
             - type: "null"
         cancellable: { type: boolean }
         idempotency_key: { type: string }
+        download_progress:
+          $ref: "#/components/schemas/IdorisDownloadProgress"
+        verification:
+          $ref: "#/components/schemas/IdorisVerification"
         request_fingerprint: { type: string, pattern: "^[a-f0-9]{64}$" }
         setup_code:
           type: string

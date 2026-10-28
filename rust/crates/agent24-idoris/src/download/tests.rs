@@ -27,6 +27,64 @@ impl CacheDir {
 const TRIPLE: &str = "aarch64-apple-darwin";
 const PAYLOAD: &[u8] = b"locked archive bytes";
 
+#[tokio::test(start_paused = true)]
+async fn progress_is_monotonic_and_throttled_to_four_updates_per_second() {
+    let (sender, mut receiver) = tokio::sync::watch::channel(DownloadProgress::default());
+    let mut reporter = ProgressReporter {
+        sender: Some(&sender),
+        last: None,
+    };
+    let mut observed = Vec::new();
+    for bytes in 1..=100 {
+        reporter.report(DownloadProgress {
+            bytes_done: bytes,
+            bytes_total: None,
+        });
+        if receiver.has_changed().unwrap() {
+            observed.push((tokio::time::Instant::now(), *receiver.borrow_and_update()));
+        }
+        tokio::time::advance(Duration::from_millis(10)).await;
+    }
+    assert_eq!(observed.len(), 4);
+    for pair in observed.windows(2) {
+        assert!(pair[1].0 - pair[0].0 >= Duration::from_millis(250));
+        assert!(pair[1].1.bytes_done > pair[0].1.bytes_done);
+        assert_eq!(pair[1].1.bytes_total, None);
+    }
+    reporter
+        .finish(DownloadProgress {
+            bytes_done: 100,
+            bytes_total: None,
+        })
+        .await;
+    assert_eq!(receiver.borrow().bytes_done, 100);
+}
+
+#[tokio::test]
+async fn streamed_progress_preserves_unknown_and_known_totals() {
+    for length in [None, Some(PAYLOAD.len() as u64)] {
+        let dir = CacheDir::new();
+        let (sender, receiver) = tokio::sync::watch::channel(DownloadProgress::default());
+        let opts = DownloadOptions {
+            progress: Some(sender),
+            ..DownloadOptions::default()
+        };
+        let mut body = Body::new(PAYLOAD);
+        body.length = length;
+        body.chunks = PAYLOAD.chunks(3).map(Vec::from).collect();
+        run(dir.path(), &opts, &CancellationToken::new(), body)
+            .await
+            .unwrap();
+        assert_eq!(
+            *receiver.borrow(),
+            DownloadProgress {
+                bytes_done: PAYLOAD.len() as u64,
+                bytes_total: length
+            }
+        );
+    }
+}
+
 struct Body {
     chunks: VecDeque<Vec<u8>>,
     length: Option<u64>,
