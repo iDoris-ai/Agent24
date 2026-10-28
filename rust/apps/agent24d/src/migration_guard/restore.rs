@@ -7,8 +7,8 @@
 //! fsync the directory chain, persist that database's progress. Restore is
 //! idempotent: every step is re-derived from disk, nothing trusts memory.
 //!
-//! There is no `rollback_failed` phase in `GuardLog`: it is `Restoring` plus
-//! `last_error` and a returned [`RestoreError::RollbackFailed`]; the marker
+//! A failed restore is persisted as the `RollbackFailed` phase (with
+//! `last_error`) and returned as [`RestoreError::RollbackFailed`]; the marker
 //! itself is 5f. Never an `Ok` after a partial restore.
 //!
 //! Caller contract (5g wiring): the function does blocking IO (hashing, copy
@@ -75,14 +75,15 @@ pub fn restore(
             Ok(drop_quarantined_sidecars(ops, &q))
         }
         Err(reason) => {
-            let mut next = log.clone();
-            next.last_error = Some(reason.clone());
-            // A Restored log must not be rewritten with an error.
-            let persisted =
-                log.phase == Phase::Restoring && persist(ops, req.data_dir, &next).is_ok();
-            if persisted {
-                *log = next;
-            }
+            // Only `Restoring` may fail over; a Restored log is never rewritten
+            // with an error (`failed_restore` refuses every other phase).
+            let persisted = match log.failed_restore(reason.clone()) {
+                Ok(next) if persist(ops, req.data_dir, &next).is_ok() => {
+                    *log = next;
+                    true
+                }
+                _ => false,
+            };
             Err(RestoreError::RollbackFailed { reason, persisted })
         }
     }
@@ -479,6 +480,17 @@ mod tests {
             };
             restore(ops, &req, &mut self.log)
         }
+
+        /// Fresh process after a failed restore: the log on disk is
+        /// `RollbackFailed` and startup would dock. Then model the future
+        /// authorized recovery (installer/manual, 5h/5i) re-opening it, so the
+        /// idempotence of `restore` itself stays covered.
+        fn reload_for_recovery(&mut self) {
+            self.log = guard_log::read(&self.root).unwrap().unwrap();
+            assert_eq!(self.log.phase, Phase::RollbackFailed);
+            self.log.phase = Phase::Restoring;
+            self.log.last_error = None;
+        }
     }
 
     /// Pre-migration pair (memory optional), snapshot, `migrating` log, then a
@@ -684,8 +696,7 @@ mod tests {
                 "step {n}"
             );
             // fresh process: reload the log from disk, not from memory
-            fx.log = guard_log::read(&fx.root).unwrap().unwrap();
-            assert_eq!(fx.log.phase, Phase::Restoring, "step {n}");
+            fx.reload_for_recovery();
             fx.go(&RealOps)
                 .unwrap_or_else(|x| panic!("retry after step {n}: {x:?}"));
             assert_restored(&fx);
@@ -708,13 +719,9 @@ mod tests {
             })
         ));
         assert_eq!(fs::read(&fx.s).unwrap(), before, "formal db untouched");
-        assert!(
-            guard_log::read(&fx.root)
-                .unwrap()
-                .unwrap()
-                .last_error
-                .is_some()
-        );
+        let on_disk = guard_log::read(&fx.root).unwrap().unwrap();
+        assert_eq!(on_disk.phase, Phase::RollbackFailed);
+        assert!(on_disk.last_error.is_some());
         assert!(!fx.root.join(QUARANTINE_DIR).exists());
     }
 
@@ -748,7 +755,7 @@ mod tests {
                 .unwrap();
         let mut fx = fixture(true).await;
         assert!(fx.go(&Probe::new(Some(progress))).is_err());
-        fx.log = guard_log::read(&fx.root).unwrap().unwrap();
+        fx.reload_for_recovery();
         assert_eq!(
             fx.log.store_restore,
             DbRestore::Pending,
@@ -792,7 +799,7 @@ mod tests {
                 .unwrap();
         let mut fx = fixture(true).await;
         assert!(fx.go(&Probe::new(Some(progress))).is_err());
-        fx.log = guard_log::read(&fx.root).unwrap().unwrap();
+        fx.reload_for_recovery();
         assert_eq!(fx.log.store_restore, DbRestore::Pending);
         fx
     }
@@ -834,18 +841,22 @@ mod tests {
         assert_restored(&fx);
     }
 
-    /// Review (Codex, 5e-2): after a crash the failed file can be a hard link
-    /// of its own quarantined name; the move must still take it out of the db
-    /// directory.
+    /// Review (Codex, 5e-2; #1427 F1): after a crash a failed file can be a
+    /// hard link of its own quarantined name; the move must still take it out
+    /// of the db directory. The main file would be overwritten by the install
+    /// rename anyway, so the branch is only observable on a sidecar: without
+    /// the `same_inode` branch the `-wal` survives (`assert_restored`, T3).
     #[tokio::test]
     async fn aliased_quarantine_name_still_leaves_the_db_directory() {
         let mut fx = fixture(true).await;
         let q = fx.root.join(QUARANTINE_DIR).join("a1");
         fs::create_dir_all(&q).unwrap();
-        fs::hard_link(&fx.s, q.join(STORE_FILE)).unwrap();
+        let wal = with_suffix(&fx.s, "-wal");
+        fs::write(&wal, b"failed wal").unwrap();
+        let alias = q.join(format!("{STORE_FILE}-wal"));
+        fs::hard_link(&wal, &alias).unwrap();
         fx.go(&RealOps).unwrap();
         assert_restored(&fx);
-        assert!(q.join(STORE_FILE).exists());
     }
 
     #[test]
@@ -928,7 +939,7 @@ mod tests {
             .unwrap();
         let mut fx = fixture(true).await;
         assert!(fx.go(&Probe::new(Some(mem_stage))).is_err());
-        fx.log = guard_log::read(&fx.root).unwrap().unwrap();
+        fx.reload_for_recovery();
         assert_eq!(
             (fx.log.store_restore, fx.log.memory_restore),
             (DbRestore::Done, DbRestore::Pending)

@@ -25,6 +25,15 @@
 //! - I4  evidence: once an image holds the failed migration's bytes of a
 //!   database, every later image and every replay descendant still holds
 //!   them somewhere (db directory or quarantine).
+//!
+//! Model boundary (#1427 F2): a rebooted image is treated as fully durable.
+//! The window "process crashes, page cache not yet on disk, then power is
+//! lost as well" is NOT modelled: dropping an `fsync_file` on the accepted
+//! main file (restore.rs shortcut) leaves every `t9_*` green and is guarded
+//! only by the unit test `low2_shortcut_fsyncs_the_accepted_main_file`.
+//! `RollbackFailed` is also outside the crash matrix: it is only written by
+//! an injected-error path, never by a crash, and replay never touches files
+//! for it (`rollback_failed_phase_docks_and_is_never_retried`).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -965,17 +974,64 @@ async fn replay_decision_table() {
     assert_eq!(from, Phase::Restored, "second start only re-checks");
 }
 
+/// Carry-over (5f): a pre-5f `Restoring` + `last_error` log is a restore that
+/// already failed. It docks (nothing touched) instead of resuming.
 #[tokio::test]
-async fn replay_resumes_restoring_with_last_error() {
+async fn restoring_with_last_error_docks_after_restart_and_touches_nothing() {
     let (fx, mut log) = state_at(Phase::Migrating).await;
     migrate_badly(&fx);
     advance(&RealOps, &fx.root, &mut log, Phase::Restoring).unwrap();
     log.last_error = Some("earlier failure".into());
     guard_log::persist(&RealOps, &fx.root, &log).unwrap();
-    let ReplayOutcome::Restored { from, .. } = replay(&fx) else {
-        panic!()
-    };
-    assert_eq!(from, Phase::Restoring);
+    let dirty = pair(&fx.store, &fx.memory);
+    for _ in 0..2 {
+        assert!(matches!(
+            replay(&fx),
+            ReplayOutcome::Docked(Dock::RollbackFailed { persisted: true, ref reason })
+                if reason == "earlier failure"
+        ));
+        assert_eq!(pair(&fx.store, &fx.memory), dirty, "nothing may be touched");
+    }
+    assert!(!fx.root.join("migration-quarantine").exists());
+}
+
+/// The same crash without a recorded error is just an interrupted restore.
+#[tokio::test]
+async fn restoring_without_error_is_still_resumed() {
+    let (fx, mut log) = state_at(Phase::Migrating).await;
+    migrate_badly(&fx);
+    advance(&RealOps, &fx.root, &mut log, Phase::Restoring).unwrap();
+    assert!(matches!(
+        replay(&fx),
+        ReplayOutcome::Restored {
+            from: Phase::Restoring,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn rollback_failed_phase_docks_and_is_never_retried() {
+    let (fx, mut log) = state_at(Phase::Migrating).await;
+    migrate_badly(&fx);
+    advance(&RealOps, &fx.root, &mut log, Phase::Restoring).unwrap();
+    let failed = log.failed_restore("disk full".into()).unwrap();
+    guard_log::persist(&RealOps, &fx.root, &failed).unwrap();
+    let dirty = pair(&fx.store, &fx.memory);
+    for _ in 0..2 {
+        let out = replay(&fx);
+        assert!(!out.may_proceed());
+        assert!(matches!(
+            out,
+            ReplayOutcome::Docked(Dock::RollbackFailed { persisted: true, ref reason })
+                if reason == "disk full"
+        ));
+        assert_eq!(pair(&fx.store, &fx.memory), dirty);
+        assert_eq!(
+            guard_log::read(&fx.root).unwrap().unwrap().phase,
+            Phase::RollbackFailed
+        );
+    }
 }
 
 #[tokio::test]
@@ -1026,4 +1082,9 @@ async fn replay_docks_when_snapshot_is_really_corrupt() {
     ));
     assert_eq!(pair(&fx.store, &fx.memory), dirty, "nothing may be touched");
     assert!(!replay(&fx).may_proceed());
+    // The failure is now durable as RollbackFailed: a restart docks on it.
+    assert_eq!(
+        guard_log::read(&fx.root).unwrap().unwrap().phase,
+        Phase::RollbackFailed
+    );
 }

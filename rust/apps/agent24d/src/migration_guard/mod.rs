@@ -6,6 +6,7 @@
 //! internals.
 
 pub mod atomic;
+pub mod dock;
 pub mod guard_log;
 pub mod manifest;
 pub mod replay;
