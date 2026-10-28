@@ -55,25 +55,38 @@ fn response_error(error: ModelError) -> ModelError {
     }
 }
 
-/// Reads at most 4 KiB of a 503 body; only the fixed `reason_code` is consulted,
-/// nothing else from the body is ever surfaced.
-async fn local_only_unavailable(mut response: reqwest::Response) -> bool {
-    let mut body = Vec::new();
-    while body.len() < 4096 {
-        match response.chunk().await {
-            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
-            _ => break,
+/// Reads at most 4 KiB of an error body, cancellably, and returns only the
+/// fixed `reason_code` (or `error.type`); nothing else from the body is ever
+/// surfaced. Shared by the 503 and 502 handling.
+async fn error_reason_code(
+    mut response: reqwest::Response,
+    cancel: &CancellationToken,
+) -> Result<Option<String>, ModelError> {
+    let read = async {
+        let mut body = Vec::new();
+        while body.len() < 4096 {
+            match response.chunk().await {
+                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                _ => break,
+            }
         }
-    }
-    body.truncate(4096);
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return false;
+        body.truncate(4096);
+        body
     };
-    value
+    let body = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(ModelError::Cancelled),
+        body = read => body,
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return Ok(None);
+    };
+    Ok(value
         .pointer("/error/reason_code")
         .or_else(|| value.get("reason_code"))
+        .or_else(|| value.pointer("/error/type"))
         .and_then(|v| v.as_str())
-        == Some("local_only_unavailable")
+        .map(str::to_owned))
 }
 
 impl IdorisClient {
@@ -124,16 +137,23 @@ impl IdorisClient {
         let status = response.status();
         if !status.is_success() {
             let code = status.as_u16();
-            if code == 503 {
-                let local = tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => return Err(ModelError::Cancelled),
-                    v = local_only_unavailable(response) => v,
-                };
-                if local {
-                    return Err(ModelError::Unavailable(
-                        "no local model available in iDoris (local_only_unavailable)".into(),
-                    ));
+            if code == 503 || code == 502 {
+                let reason = error_reason_code(response, cancel).await?;
+                match (code, reason.as_deref()) {
+                    (503, Some("local_only_unavailable")) => {
+                        return Err(ModelError::Unavailable(
+                            "no local model available in iDoris (local_only_unavailable)".into(),
+                        ));
+                    }
+                    // Terminal: iDoris's own upstream credential or access was
+                    // refused. Retrying or switching provider cannot fix it.
+                    (502, Some("upstream_auth_failed")) => {
+                        return Err(ModelError::Rejected {
+                            status: 502,
+                            message: "iDoris's upstream provider rejected authentication or access (upstream_auth_failed): check the iDoris operator's upstream key (e.g. IDORIS_OMLX_API_KEY) or the provider's permissions".into(),
+                        });
+                    }
+                    _ => {}
                 }
             }
             if status.is_server_error() || code == 429 {
@@ -172,8 +192,13 @@ impl IdorisClient {
         let identity: Identity = read_json_capped(response, 4096, cancel, "iDoris")
             .await
             .map_err(response_error)?;
+        if identity.service == "idoris" && !contract_version_accepted(&identity.contract_version) {
+            return Err(invalid(&format!(
+                "iDoris contract_version {:?} not supported: expected 1.x and >= 1.0.1",
+                identity.contract_version
+            )));
+        }
         if identity.service != "idoris"
-            || identity.contract_version != "1.0.1"
             || identity.version.is_empty()
             || identity.instance_id.is_empty()
             || identity.dev_no_key_enabled
@@ -344,6 +369,24 @@ fn gateway_body(req: &CompletionRequest, role: &str) -> serde_json::Value {
     body
 }
 
+/// 契约版本检查：major == 1 且 (minor, patch) >= (0, 1)，即 1.x 且 >= 1.0.1。
+/// 必须恰为 `主.次.修` 三段十进制整数；多余段、前导 `v`、空串一律拒绝。
+/// 预发布/构建后缀（如 `-rc1`、`+build`）保守起见一律拒绝。
+fn contract_version_accepted(v: &str) -> bool {
+    let mut parts = v.split('.');
+    let mut next = || -> Option<u64> {
+        let p = parts.next()?;
+        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        p.parse().ok()
+    };
+    let (Some(major), Some(minor), Some(patch)) = (next(), next(), next()) else {
+        return false;
+    };
+    parts.next().is_none() && major == 1 && (minor, patch) >= (0, 1)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -433,6 +476,16 @@ mod tests {
                 None,
             )
             .await
+    }
+
+    #[test]
+    fn contract_version_range_is_1x_at_least_1_0_1() {
+        for ok in ["1.0.1", "1.0.2", "1.1.0", "1.9.3"] {
+            assert!(contract_version_accepted(ok), "should accept {ok:?}");
+        }
+        for bad in ["1.0.0", "0.9.9", "2.0.0", "1.1", "v1.1.0", "1.1.0-rc1", ""] {
+            assert!(!contract_version_accepted(bad), "should reject {bad:?}");
+        }
     }
 
     #[test]
@@ -596,6 +649,79 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .expect("cancel must interrupt the 503 body read")
+            .unwrap();
+        server.abort();
+        assert!(matches!(result, ModelError::Cancelled), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn status_502_upstream_auth_failed_is_terminal_rejected() {
+        for body in [
+            r#"{"error":{"type":"upstream_auth_failed","reason_code":"upstream_auth_failed","detail":"LEAK idk_secret_fixture_key"}}"#,
+            r#"{"error":{"type":"upstream_auth_failed"}}"#,
+        ] {
+            match error_for(502, body).await {
+                ModelError::Rejected { status, message } => {
+                    assert_eq!(status, 502);
+                    assert!(message.contains("upstream_auth_failed"), "{message}");
+                    assert!(message.contains("IDORIS_OMLX_API_KEY"), "{message}");
+                    assert!(!message.contains("LEAK"), "{message}");
+                    assert!(!message.contains("idk_"), "{message}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn status_502_without_the_code_stays_unavailable() {
+        for body in [
+            r#"{"error":{"reason_code":"other","detail":"LEAK"}}"#,
+            "not json",
+            "{}",
+        ] {
+            match error_for(502, body).await {
+                ModelError::Unavailable(message) => {
+                    assert_eq!(message, "iDoris unavailable (HTTP 502)")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn status_502_stalled_body_is_cancellable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 502 X\r\ncontent-length: 100\r\nconnection: close\r\n\r\n123456789",
+                )
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let gateway = IdorisClient {
+            base: reqwest::Url::parse(&url).unwrap(),
+            key: HeaderValue::from_static("Bearer idk_fixture"),
+            client: base_client_builder().no_proxy().build().unwrap(),
+            request_timeout: Duration::from_secs(120),
+        };
+        let cancel = CancellationToken::new();
+        let request = gateway.client.get(&url);
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { gateway.send(request, &cancel).await.unwrap_err() }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("cancel must interrupt the 502 body read")
             .unwrap();
         server.abort();
         assert!(matches!(result, ModelError::Cancelled), "{result:?}");

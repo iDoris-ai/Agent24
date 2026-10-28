@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react'
 import SchedulesPage from './Schedules'
 import { setLocale } from '../i18n'
 
@@ -320,4 +320,187 @@ describe('SchedulesPage', () => {
     fireEvent.click(screen.getByRole('button', { name: '立即运行' }))
     await waitFor(() => expect(screen.getByText('已投递给模块（fire_id fire_xyz789）')).toBeInTheDocument())
   })
+})
+
+describe('SchedulesPage fired one-time rows', () => {
+  beforeEach(() => { setLocale('zh') })
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks() })
+
+  const FIRED = (id: string) => ({
+    ...SCHEDULE,
+    id,
+    name: 'self-wake',
+    completed: true,
+    spec: { type: 'at', ts: '2026-07-28T18:00:00Z' },
+    next_run_at: null,
+    last_run_at: '2026-09-09T15:38:48Z',
+  })
+
+  it('folds fired one-time rows out of the main list into a collapsed 已完成 group', async () => {
+    mount([SCHEDULE, FIRED('wake_1'), FIRED('wake_2')])
+    render(<SchedulesPage />)
+    await waitFor(() => expect(screen.getByText('每日晨报')).toBeInTheDocument())
+    expect(screen.getByText('已完成 2 条')).toBeInTheDocument()
+    // collapsed by default: no self-wake card, no per-row Run now for them
+    expect(screen.queryByText('self-wake')).not.toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: '立即运行' })).toHaveLength(1)
+    // expanding reveals the audit rows
+    fireEvent.click(screen.getByRole('button', { name: '展开' }))
+    expect(screen.getAllByText('self-wake')).toHaveLength(2)
+  })
+
+  it('a not-yet-fired one-time row and a failed-before-fire row stay in the main list', async () => {
+    mount([
+      { ...FIRED('pending'), name: 'pending-once', completed: false, next_run_at: '2099-01-01T00:00:00Z', last_run_at: null },
+      { ...FIRED('never'), name: 'never-fired', completed: false, last_run_at: null },
+    ])
+    render(<SchedulesPage />)
+    await waitFor(() => expect(screen.getByText('pending-once')).toBeInTheDocument())
+    expect(screen.getByText('never-fired')).toBeInTheDocument()
+    expect(screen.queryByText(/已完成/)).not.toBeInTheDocument()
+  })
+
+  it('清理已完成 deletes exactly the fired one-time rows and nothing else', async () => {
+    const proxy = mount([SCHEDULE, FIRED('wake_1'), FIRED('wake_2')])
+    render(<SchedulesPage />)
+    await waitFor(() => expect(screen.getByText('已完成 2 条')).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', { name: '清理已完成' }))
+    fireEvent.click(screen.getByRole('button', { name: '确认清理' }))
+    await waitFor(() => {
+      const dels = proxy.mock.calls.map((c) => c[0]).filter((r) => r.method === 'DELETE').map((r) => r.path)
+      expect(dels.sort()).toEqual(['/api/v1/schedules/wake_1?only_if_completed=true', '/api/v1/schedules/wake_2?only_if_completed=true'])
+    })
+  })
+  it.each([
+    ['模块行', { owner: { module: 'weather', key: 'once' }, action: null }],
+    ['every 停用行', { spec: { type: 'every', secs: 60 }, enabled: false, completed: false }],
+    ['仍有下次触发', { next_run_at: '2099-01-01T00:00:00Z', completed: false }],
+    ['触发失败', { consecutive_failures: 2, completed: false }],
+    ['PATCH 到未来并停用', { spec: { type: 'at', ts: '2099-01-01T00:00:00Z' }, enabled: false, completed: false }],
+  ])('%s 留在主列表且不会被清理', async (name, fields) => {
+    const proxy = mount([FIRED('done'), { ...FIRED('keep'), name, ...fields }])
+    render(<SchedulesPage />)
+    await screen.findByText(name)
+    expect(screen.getByText('已完成 1 条')).toBeInTheDocument()
+    if (name === '触发失败') expect(screen.getByText('连续失败 2')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '清理已完成' }))
+    fireEvent.click(screen.getByRole('button', { name: '确认清理' }))
+    await waitFor(() => expect(proxy.mock.calls.filter(([r]) => r.method === 'DELETE').map(([r]) => r.path))
+      .toEqual(['/api/v1/schedules/done?only_if_completed=true']))
+  })
+
+  it('全部完成时主列表显示空态，清理需确认且取消不会删除', async () => {
+    const proxy = mount([FIRED('done')])
+    render(<SchedulesPage />)
+    await screen.findByText('已完成 1 条')
+    expect(screen.getByText('暂无进行中的调度')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '清理已完成' }))
+    expect(screen.getByText('确定清理 1 条已完成调度？运行记录会保留。')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '取消' }))
+    expect(screen.queryByRole('button', { name: '确认清理' })).not.toBeInTheDocument()
+    expect(proxy.mock.calls.some(([r]) => r.method === 'DELETE')).toBe(false)
+  })
+
+  it('每个 DELETE 成功后旧轮询失效，即使另一条 DELETE 尚未完成', async () => {
+    const original = [FIRED('ok'), FIRED('slow')]
+    let finishPoll = (_value: unknown) => {}
+    const oldPoll = new Promise((resolve) => { finishPoll = resolve })
+    let finishDelete = (_value: unknown) => {}
+    const slowDelete = new Promise((resolve) => { finishDelete = resolve })
+    let gets = 0
+    const proxy = vi.fn((r: { method: string; path: string }) => {
+      if (r.method === 'GET') {
+        ++gets
+        if (gets === 2) return oldPoll
+        return Promise.resolve({ ok: true, status: 200, data: { schedules: gets === 1 ? original : [] } })
+      }
+      if (r.path.includes('/slow?')) return slowDelete
+      return Promise.resolve({ ok: true, status: 204, data: null })
+    })
+    window.agent24 = { backendProxy: proxy } as never
+    vi.useFakeTimers()
+    await act(async () => { render(<SchedulesPage />) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+    fireEvent.click(screen.getByRole('button', { name: '清理已完成' }))
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '确认清理' })) })
+    expect(screen.getByText('已完成 1 条')).toBeInTheDocument()
+    await act(async () => { finishPoll({ ok: true, status: 200, data: { schedules: original } }) })
+    expect(screen.getByText('已完成 1 条')).toBeInTheDocument()
+    await act(async () => { finishDelete({ ok: true, status: 204, data: null }) })
+    expect(screen.queryByText(/已完成 \d 条/)).not.toBeInTheDocument()
+  })
+
+  it('清理中按钮禁用，重复点击不会再次 DELETE', async () => {
+    let finishDelete = (_value: unknown) => {}
+    const pending = new Promise((resolve) => { finishDelete = resolve })
+    const proxy = vi.fn((r: { method: string }) => r.method === 'GET'
+      ? Promise.resolve({ ok: true, status: 200, data: { schedules: [FIRED('slow')] } })
+      : pending)
+    window.agent24 = { backendProxy: proxy } as never
+    render(<SchedulesPage />)
+    await screen.findByText('已完成 1 条')
+    const clear = screen.getByRole('button', { name: '清理已完成' })
+    fireEvent.click(clear)
+    const confirm = screen.getByRole('button', { name: '确认清理' })
+    fireEvent.click(confirm)
+    expect(clear).toBeDisabled()
+    expect(confirm).toBeDisabled()
+    expect(screen.getByRole('button', { name: '取消' })).toBeDisabled()
+    fireEvent.click(clear)
+    fireEvent.click(confirm)
+    expect(proxy.mock.calls.filter(([r]) => r.method === 'DELETE')).toHaveLength(1)
+    await act(async () => { finishDelete({ ok: true, status: 204, data: null }) })
+  })
+
+  it('条件清理冲突保留调度并显示可操作的本地化提示', async () => {
+    const proxy = vi.fn((r: { method: string }) => Promise.resolve(r.method === 'GET'
+      ? { ok: true, status: 200, data: { schedules: [FIRED('changed')] } }
+      : { ok: false, status: 409, data: { error: { message: '/private/details' } } }))
+    window.agent24 = { backendProxy: proxy } as never
+    render(<SchedulesPage />)
+    await screen.findByText('已完成 1 条')
+    fireEvent.click(screen.getByRole('button', { name: '清理已完成' }))
+    fireEvent.click(screen.getByRole('button', { name: '确认清理' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('调度已变更，请刷新后重试')
+    expect(screen.getByText('已完成 1 条')).toBeInTheDocument()
+  })
+
+  it('部分清理失败立即移除成功行，操作错误经刷新和轮询仍保留且可关闭', async () => {
+    let rows = [FIRED('ok'), FIRED('bad')]
+    let holdRefresh = false
+    let unblockRefresh = () => {}
+    const refreshGate = new Promise<void>((resolve) => { unblockRefresh = resolve })
+    const proxy = vi.fn(async (r: { method: string; path: string }) => {
+      if (r.method === 'GET') {
+        if (holdRefresh) await refreshGate
+        return { ok: true, status: 200, data: { schedules: rows } }
+      }
+      if (r.path.includes('/bad?')) return { ok: false, status: 500, data: { error: { code: 'internal', message: 'storage error /private/secret/db.sqlite' } } }
+      holdRefresh = true
+      rows = rows.filter((row) => row.id !== 'ok')
+      return { ok: true, status: 204, data: null }
+    })
+    window.agent24 = { backendProxy: proxy } as never
+    vi.useFakeTimers()
+    await act(async () => { render(<SchedulesPage />) })
+    expect(screen.getByText('已完成 2 条')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '清理已完成' }))
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '确认清理' })) })
+    const error = () => screen.getByRole('alert')
+    expect(error()).toHaveTextContent('1 条清理失败')
+    expect(error()).toHaveTextContent('服务暂时不可用，请稍后重试')
+    expect(error()).not.toHaveTextContent('/private/')
+    expect(screen.getByText('已完成 1 条')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '展开' }))
+    expect(screen.getAllByText('self-wake')).toHaveLength(1)
+    await act(async () => { holdRefresh = false; unblockRefresh() })
+    expect(error()).toHaveTextContent('1 条清理失败')
+    const gets = proxy.mock.calls.filter(([r]) => r.method === 'GET').length
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+    expect(proxy.mock.calls.filter(([r]) => r.method === 'GET')).toHaveLength(gets + 1)
+    expect(error()).toHaveTextContent('1 条清理失败')
+    fireEvent.click(within(error()).getByRole('button', { name: '关闭' }))
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
 })
