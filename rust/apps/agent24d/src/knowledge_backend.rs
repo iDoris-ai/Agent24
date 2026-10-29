@@ -24,7 +24,7 @@ use agent24_knowledge::provider::state::{LocalReason, Refusal};
 use agent24_knowledge::tool::call::{Failure, KnowledgeBackend, ReadQuery, SearchQuery};
 use agent24_knowledge::{
     Budget, CancelledCode, CancelledDetails, CancelledError, ChunkExpectedRevision, ConstBool,
-    Credential as WireCredential, ErrorEnvelope, HttpTransport, HttpTransportConfig,
+    Credential as WireCredential, ErrorCode, ErrorEnvelope, HttpTransport, HttpTransportConfig,
     KnowledgeOperation, KnowledgeTransport, LocalCancelled, NonEmpty, Page, PositiveInt,
     ProtocolVersion, ReadRequest, ReadResponse, ReadTarget, Scope, SearchRequest, SearchResponse,
     TransportError,
@@ -228,16 +228,24 @@ impl DaemonKnowledgeBackend {
         if answer.status != 200 {
             let envelope: ErrorEnvelope = serde_json::from_slice(&answer.body)
                 .map_err(|_| local(LocalReason::Incompatible, false))?;
-            // The echoes may be `null` (R6.1), never another request's.
+            // Never another request's echoes; `null` only for the codes that
+            // may fail before the body is read (R6.1), paired by this
+            // exchange instead (R7.3).
+            let may_be_null = matches!(
+                envelope.error.code(),
+                ErrorCode::InvalidRequest | ErrorCode::Unauthorized | ErrorCode::Internal
+            );
             let details = serde_json::to_value(&envelope.error).unwrap_or_default();
             let details = &details["details"];
-            let other_id = details["request_id"]
-                .as_str()
-                .is_some_and(|id| id != request_id);
-            let other_generation = details["generation"]
-                .as_u64()
-                .is_some_and(|generation| generation != sent.generation);
-            if other_id || other_generation {
+            let id_ok = match details["request_id"].as_str() {
+                Some(id) => id == request_id,
+                None => may_be_null,
+            };
+            let generation_ok = match details["generation"].as_u64() {
+                Some(generation) => generation == sent.generation,
+                None => may_be_null,
+            };
+            if !(id_ok && generation_ok) {
                 return Err(cancelled(request_id, sent.generation, sent.generation));
             }
             return Err(Failure::Envelope(envelope));

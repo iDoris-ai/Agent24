@@ -31,6 +31,8 @@ enum Answer {
     Unscoped(&'static str),
     /// An error fixture echoing another generation.
     OtherGeneration(&'static str),
+    /// An error fixture echoing `null` for both.
+    NullEcho(&'static str),
     /// The fixture's response with another request id.
     WrongEcho(&'static str),
     /// Never answers.
@@ -71,6 +73,10 @@ impl KnowledgeTransport for Server {
                 (name, request["request_id"].clone())
             }
             Answer::WrongEcho(name) => (name, json!("another-request")),
+            Answer::NullEcho(name) => {
+                generation = Value::Null;
+                (name, Value::Null)
+            }
             Answer::Hang => std::future::pending().await,
             Answer::Fail(e) => return Err(e),
         };
@@ -266,6 +272,14 @@ async fn an_error_answer_for_another_request_or_generation_is_dropped() {
     let s = setup(Answer::WrongEcho("search.unauthorized-revoked.json"));
     assert!(is_cancelled(s.backend.search(RUN, query(None)).await));
     let s = setup(Answer::OtherGeneration("search.unauthorized-revoked.json"));
+    assert!(is_cancelled(s.backend.search(RUN, query(None)).await));
+
+    // `null` echoes: allowed for an `unauthorized` (it may fail before the
+    // body is read), not for a `timeout`.
+    let s = setup(Answer::NullEcho("search.unauthorized-revoked.json"));
+    let result = s.backend.search(RUN, query(None)).await;
+    assert!(matches!(result, Err(Failure::Envelope(_))), "{result:?}");
+    let s = setup(Answer::NullEcho("search.timeout.json"));
     assert!(is_cancelled(s.backend.search(RUN, query(None)).await));
 }
 
