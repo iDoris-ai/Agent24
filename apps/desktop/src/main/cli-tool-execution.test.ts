@@ -20,6 +20,7 @@ afterEach(async () => {
 })
 async function fixture() {
   root = await realpath(await mkdtemp(path.join(tmpdir(), 'a24-exec-')))
+  vi.stubEnv('HOME', path.join(root, 'home'))
   const executable = path.join(root, 'Agent24.app/Contents/MacOS/Agent24')
   const resources = path.join(root, 'Agent24.app/Contents/Resources')
   const target = path.join(resources, 'backend/agent24')
@@ -36,7 +37,9 @@ it.skipIf(process.platform !== 'darwin')('falls back to the process PATH when th
   vi.stubEnv('PATH', path.dirname(f.target))
   exec.mockImplementation((file, args, options) => args[0] === '-ilc'
     ? Promise.resolve({ stdout: 'unrelated shell output', stderr: '' }) : run(file, args, options))
-  expect(await cliToolStatus(f.executable, f.resources, true)).toMatchObject({ state: 'current', path: f.target })
+  expect(await cliToolStatus(f.executable, f.resources, true)).toMatchObject({ bundledVersion: '0.6.0' })
+  // Both the PATH command and the bundle resolve to this temporary executable.
+  expect(exec.mock.calls.filter((call) => call[0] === f.target && call[1][0] === '--version')).toHaveLength(2)
 })
 it('restores the old command and reports shell failure when linking fails', async () => {
   const f = await fixture()

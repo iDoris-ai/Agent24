@@ -89,3 +89,18 @@ it.each([
   await invoke(IpcChannels.CliToolInstall)
   expect(confirm).toHaveBeenCalledWith(expect.objectContaining({ title, message: title, buttons }))
 })
+
+it('only refreshes at startup and repairs the user path only after an explicit guarded request', async () => {
+  const controller = setup()
+  await controller.refresh()
+  expect(install).not.toHaveBeenCalled()
+  const channel = 'cli-tool:repair-user'
+  expect(handlers.has(channel)).toBe(true)
+  for (const arg of ['/tmp/evil', { home: '/tmp/evil' }, undefined, null]) {
+    expect(() => invoke(channel, arg)).toThrow('no arguments')
+  }
+  expect(() => handlers.get(channel)?.({ senderFrame: { url: 'https://evil.test' } } as IpcMainInvokeEvent)).toThrow('untrusted IPC sender')
+  install.mockResolvedValue({ state: 'installed', backup: null })
+  await invoke(channel)
+  expect(install).toHaveBeenCalledWith(expect.objectContaining({ userOnly: true }))
+})

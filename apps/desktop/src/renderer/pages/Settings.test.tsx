@@ -17,7 +17,10 @@ const mockOmlxWarmup = vi.fn()
 function installAgent(extra: Record<string, unknown> = {}) {
   Object.defineProperty(window, 'agent24', {
     value: {
-      cliToolStatus: vi.fn().mockResolvedValue({ state: 'outdated', path: '/usr/local/bin/agent24', version: '0.3.0', bundledVersion: '0.6.0' }),
+      cliToolStatus: vi.fn().mockResolvedValue({ state: 'outdated', path: '/usr/local/bin/agent24', version: '0.3.0', bundledVersion: '0.6.0', paths: [
+    { path: '/usr/local/bin/agent24', link: 'other', state: 'outdated', version: '0.3.0' },
+    { path: '/home/test/.agent24/bin/agent24', link: 'current', state: 'current', version: '0.6.0' },
+  ] }),
       omlxDetect: mockOmlxDetect,
       omlxStart: mockOmlxStart,
       omlxModels: mockOmlxModels,
@@ -645,7 +648,8 @@ describe('Settings voice link and previous blocks', () => {
 
     await openTab('Command line tool')
     expect(screen.getByRole('heading', { name: 'Command line tool' })).toBeInTheDocument()
-    expect(screen.getByText('Command on PATH')).toBeInTheDocument()
+    expect(screen.getByText('/usr/local/bin/agent24')).toBeInTheDocument()
+    expect(screen.getByText('/home/test/.agent24/bin/agent24')).toBeInTheDocument()
     expect(await screen.findByRole('button', { name: 'Install / Update `agent24` command' })).toBeEnabled()
     expect(screen.getByText('Command line tool is outdated (0.3.0) — Update')).toBeInTheDocument()
 

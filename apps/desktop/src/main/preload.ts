@@ -38,6 +38,7 @@ const api = {
   },
   cliToolStatus: (): Promise<CliToolStatus> => ipcRenderer.invoke(IpcChannels.CliToolStatus),
   installCliTool: (): Promise<CliInstallResult> => ipcRenderer.invoke(IpcChannels.CliToolInstall),
+  repairUserCli: (): Promise<CliInstallResult> => ipcRenderer.invoke(IpcChannels.CliToolRepairUser),
   setAppLocale: (locale: import('../shared/i18n').Locale): Promise<void> => ipcRenderer.invoke(IpcChannels.AppLocale, locale),
   ping: (): Promise<string> => ipcRenderer.invoke(IpcChannels.AppPing),
   setUiLocale: (locale: string): Promise<void> => ipcRenderer.invoke(IpcChannels.AppSetLocale, locale),
