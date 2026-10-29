@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { promisify } from 'node:util'
-import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -47,6 +47,30 @@ it('restores the old command and reports shell failure when linking fails', asyn
   exec.mockImplementation((file, args, options) => run(file, [args[0], args[1].replace('/bin/ln -s', '/usr/bin/false')], options))
   await expect(installLink({ ...f, confirm: async () => true })).rejects.toMatchObject({ code: 1 })
   expect(await readFile(f.destination, 'utf8')).toBe('old CLI')
+  expect((await readdir(root)).filter((name) => name.startsWith('agent24'))).toEqual(['agent24'])
+})
+it.each(['foreign', 'dangling'])('preserves the original %s symlink when creating its replacement fails', async (kind) => {
+  const f = await fixture()
+  const original = path.join(root, 'old-cli')
+  if (kind === 'foreign') await writeFile(original, 'old CLI')
+  await symlink(original, f.destination)
+  exec.mockImplementation((file, args, options) => run(file, [args[0], args[1].replace('/bin/ln -s', '/usr/bin/false')], options))
+  await expect(installLink({ ...f, confirm: async () => true })).rejects.toMatchObject({ code: 1 })
+  expect(await readlink(f.destination)).toBe(original)
+  expect((await readdir(root)).filter((name) => name.startsWith('agent24'))).toEqual(['agent24'])
+})
+it('keeps the original link in place until its replacement is ready', async () => {
+  const f = await fixture()
+  const original = path.join(root, 'old-cli')
+  await symlink(original, f.destination)
+  const observer = path.join(root, 'observe-link')
+  await writeFile(observer, '#!/bin/sh\n[ "$(/usr/bin/readlink "$ORIGINAL_CLI")" = "$OLD_CLI" ] || exit 1\nexec /bin/ln -s "$@"\n', { mode: 0o755 })
+  exec.mockImplementation((file, args, options) => run(file, [args[0], args[1].replace('/bin/ln -s', observer)], {
+    ...options, env: { ...options.env, ORIGINAL_CLI: f.destination, OLD_CLI: original },
+  }))
+  expect(await installLink({ ...f, confirm: async () => true })).toEqual({ state: 'installed', backup: null })
+  expect(await readlink(f.destination)).toBe(f.target)
+  expect((await readdir(root)).filter((name) => name.startsWith('agent24'))).toEqual(['agent24'])
 })
 it('rejects elevation for any destination other than the fixed CLI path', async () => {
   const f = await fixture()

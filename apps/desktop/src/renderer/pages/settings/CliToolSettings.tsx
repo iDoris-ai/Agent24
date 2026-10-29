@@ -53,7 +53,6 @@ export function CliToolSettings() {
     {result && <div role="status" style={{ padding: '8px 18px', overflowWrap: 'anywhere' }}>
       {t(result.state)}
       {result.state === 'installed' && result.backup && <p>{t('backup', { path: result.backup })}</p>}
-      {result.state === 'installed' && result.userBackup && <p>{t('backup', { path: result.userBackup })}</p>}
     </div>}
   </section>
 }

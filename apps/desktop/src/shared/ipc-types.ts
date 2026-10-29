@@ -301,5 +301,5 @@ export interface CliToolStatus {
 }
 
 export type CliInstallResult =
-  | { state: 'installed'; backup: string | null; userBackup?: string }
+  | { state: 'installed'; backup: string | null }
   | { state: 'cancelled' | 'failed' | 'move-app' }

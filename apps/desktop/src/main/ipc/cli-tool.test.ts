@@ -21,7 +21,7 @@ const frame = { url: 'file:///app/index.html' }
 const event = { senderFrame: frame } as IpcMainInvokeEvent
 beforeEach(() => {
   resetMainLocaleForTest()
-  vi.clearAllMocks()
+  vi.resetAllMocks()
   handlers.clear()
   status.mockResolvedValue({ state: 'outdated', path: '/usr/local/bin/agent24', version: '0.3.0', bundledVersion: '0.6.0' })
 })
@@ -65,6 +65,27 @@ it('deduplicates installs and refreshes the actual PATH status afterwards', asyn
   expect(install).toHaveBeenCalledOnce()
   expect(status).toHaveBeenCalledOnce()
   expect(install.mock.calls[0][0]).toMatchObject({ executable: '/Applications/Agent24.app/Contents/MacOS/Agent24' })
+})
+it.each([
+  [IpcChannels.CliToolInstall, IpcChannels.CliToolRepairUser],
+  [IpcChannels.CliToolRepairUser, IpcChannels.CliToolInstall],
+])('keeps concurrent %s and %s requests independent', async (firstChannel, secondChannel) => {
+  setup()
+  let finishFirst = (_result: { state: 'cancelled' }) => {}
+  install.mockImplementationOnce(() => new Promise((resolve) => { finishFirst = resolve }))
+    .mockResolvedValueOnce({ state: 'installed', backup: null })
+  const first = invoke(firstChannel)
+  const second = invoke(secondChannel)
+  expect(invoke(firstChannel)).toBe(first)
+  expect(invoke(secondChannel)).toBe(second)
+  finishFirst({ state: 'cancelled' })
+  const results = await Promise.all([first, second])
+  expect(first).not.toBe(second)
+  expect(install).toHaveBeenCalledTimes(2)
+  expect(install.mock.calls.map((call) => call[0].userOnly)).toEqual([
+    firstChannel === IpcChannels.CliToolRepairUser, secondChannel === IpcChannels.CliToolRepairUser,
+  ])
+  expect(results).toEqual([{ state: 'cancelled' }, { state: 'installed', backup: null }])
 })
 it('exposes CLI status and uses the main locale for native confirmation', async () => {
   const controller = setup()

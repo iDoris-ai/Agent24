@@ -11,8 +11,12 @@ vi.mock('node:child_process', () => ({
 }))
 vi.mock('node:fs/promises', async (load) => {
   const fs = await load<typeof import('node:fs/promises')>()
-  return { ...fs, lstat: (file: string, ...args: []) => file === '/usr/local/bin/agent24'
-    ? Promise.reject(Object.assign(new Error('missing'), { code: 'ENOENT' })) : fs.lstat(file, ...args) }
+  return {
+    ...fs,
+    lstat: (file: string, ...args: []) => file === '/usr/local/bin/agent24'
+      ? fs.lstat(path.join(root, 'system-cli'), ...args) : fs.lstat(file, ...args),
+    readlink: (file: string) => file === '/usr/local/bin/agent24' ? Promise.resolve(target) : fs.readlink(file),
+  }
 })
 import { cliToolStatus, installBundledCli, installUserCli, inspectCliPath } from './cli-tool'
 const childProcess = await vi.importActual<typeof import('node:child_process')>('node:child_process')
@@ -45,14 +49,41 @@ async function oldFile(content = '#!/bin/sh\necho "agent24 0.4.0"\n') {
   await mkdir(path.dirname(destination), { recursive: true })
   await writeFile(destination, content, { mode: 0o755 })
 }
-it('creates the missing user CLI link with 0755 directories', async () => {
+it('creates the missing user CLI with a 0700 data directory and a 0755 bin directory', async () => {
   const mask = process.umask(0o077)
   try { expect(await installUserCli(target)).toMatchObject({ state: 'installed' }) }
   finally { process.umask(mask) }
   expect(await readlink(destination)).toBe(target)
-  for (const dir of [path.dirname(destination), path.dirname(path.dirname(destination))]) {
-    expect((await lstat(dir)).mode & 0o777).toBe(0o755)
-  }
+  expect((await lstat(path.dirname(destination))).mode & 0o777).toBe(0o755)
+  expect((await lstat(path.dirname(path.dirname(destination)))).mode & 0o777).toBe(0o700)
+})
+it.skipIf(process.platform !== 'darwin').each([
+  ['installed', 'installed'],
+  ['confirmation cancelled', 'cancelled'],
+  ['authorization cancelled', 'cancelled'],
+  ['shell failed', 'failed'],
+] as const)('system installation leaves the user CLI unchanged when %s', async (outcome, state) => {
+  await oldFile()
+  const original = await readFile(destination, 'utf8')
+  const before = await lstat(destination)
+  if (outcome === 'confirmation cancelled') await writeFile(path.join(root, 'system-cli'), 'old system CLI')
+  exec.mockImplementation((file, args, options) => {
+    if (file === '/usr/bin/osascript') return Promise.reject(new Error('User canceled. (-128)'))
+    if (file === '/bin/sh' && args[1].includes('/usr/local/bin/agent24')) {
+      if (outcome === 'authorization cancelled') return Promise.reject(new Error('Permission denied'))
+      if (outcome === 'shell failed') return Promise.reject(new Error('Destination changed'))
+      return Promise.resolve({ stdout: '', stderr: '' })
+    }
+    return run(file, args, options)
+  })
+  const confirm = vi.fn(async () => false)
+  const result = await installBundledCli({ executable, resources, packaged: true, confirm })
+  if (outcome === 'confirmation cancelled') expect(confirm).toHaveBeenCalledOnce()
+  expect((await lstat(destination)).ino).toBe(before.ino)
+  expect((await lstat(destination)).isFile()).toBe(true)
+  expect(await readFile(destination, 'utf8')).toBe(original)
+  expect(await readdir(path.dirname(destination))).toEqual(['agent24'])
+  expect(result).toEqual(state === 'installed' ? { state, backup: null } : { state })
 })
 it.each(['0.6.0', '0.7.0'])('preserves a regular CLI at version %s', async (version) => {
   await oldFile(`#!/bin/sh\necho "agent24 ${version}"\n`)

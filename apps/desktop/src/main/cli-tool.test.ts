@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { compareVersions, resolveBundledCli, inspectCommand, installLink, shellQuote, appleScript } from './cli-tool'
@@ -103,14 +103,13 @@ describe('PATH detection and installation', () => {
     expect(await installLink({ target: f.target, destination: f.destination, confirm: async () => false })).toEqual({ state: 'cancelled' })
     expect(await readFile(f.destination, 'utf8')).toBe('old CLI')
   })
-  it('backs up foreign and dangling symlinks without touching their targets', async () => {
+  it('replaces a dangling symlink without a backup', async () => {
     const f = await fixture()
     await mkdir(path.dirname(f.destination))
     await symlink('/missing/old-agent24', f.destination)
     const result = await installLink({ target: f.target, destination: f.destination, confirm: async () => true })
-    if (result.state !== 'installed' || !result.backup) throw new Error('missing backup')
-    expect(await readlink(result.backup)).toBe('/missing/old-agent24')
-    expect((await lstat(f.destination)).isSymbolicLink()).toBe(true)
+    expect(result).toEqual({ state: 'installed', backup: null })
+    expect(await readlink(f.destination)).toBe(f.target)
   })
   it('rejects destination parent symlinks and directories', async () => {
     const f = await fixture()

@@ -127,7 +127,7 @@ export async function installUserCli(target: string): Promise<CliInstallResult> 
   if (status.link === 'other' && status.state !== 'outdated' && !(await lstat(destination)).isSymbolicLink()) {
     return { state: 'installed', backup: null }
   }
-  return installLink({ target, destination, confirm: async () => true, replaceSymlink: true })
+  return installLink({ target, destination, confirm: async () => true })
 }
 
 export function shellQuote(value: string): string {
@@ -167,7 +167,6 @@ export async function installLink(options: {
   destination: string
   confirm: () => Promise<boolean>
   elevate?: (script: string) => Promise<void>
-  replaceSymlink?: boolean
 }): Promise<CliInstallResult> {
   const { target, destination } = options
   if (await realpath(target) !== target) throw new Error('Invalid target')
@@ -176,8 +175,9 @@ export async function installLink(options: {
   if (before && (await lstat(destination)).isSymbolicLink() && await readlink(destination) === target) return { state: 'installed', backup: null }
   if (before && !await options.confirm()) return { state: 'cancelled' }
   if (await identity(destination) !== before || await realpath(target) !== target) throw new Error('Installation paths changed')
-  const replaceSymlink = before && options.replaceSymlink && (await lstat(destination)).isSymbolicLink()
+  const replaceSymlink = before && (await lstat(destination)).isSymbolicLink()
   const backup = before && !replaceSymlink ? `${destination}.bak-${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID()}` : null
+  const temporary = `${destination}.tmp-${randomUUID()}`
   const q = shellQuote
   const parents: string[] = []
   for (const start of [path.dirname(destination), target]) {
@@ -187,14 +187,19 @@ export async function installLink(options: {
   // a destination that appeared or changed while the user was deciding.
   const expected = before ? before.split(':').slice(0, 2).join(':') : null
   const statFormat = process.platform === 'darwin' ? "-f '%d:%i'" : "-c '%d:%i'"
+  const absent = `[ ! -e ${q(destination)} ] && [ ! -L ${q(destination)} ]`
   const check = expected
     ? `[ "$(/usr/bin/stat ${statFormat} ${q(destination)})" = ${q(expected)} ]`
-    : `[ ! -e ${q(destination)} ] && [ ! -L ${q(destination)} ]`
-  const move = backup ? `[ ! -e ${q(backup)} ] && [ ! -L ${q(backup)} ] && /bin/mv -n ${q(destination)} ${q(backup)} && ` : replaceSymlink ? `/bin/rm ${q(destination)} && ` : ''
+    : absent
+  const move = backup ? `[ ! -e ${q(backup)} ] && [ ! -L ${q(backup)} ] && /bin/mv -n ${q(destination)} ${q(backup)} && ` : ''
   const rollback = backup ? `/bin/mv -n ${q(backup)} ${q(destination)}; ` : ''
-  const directories = options.replaceSymlink ? [path.dirname(path.dirname(destination)), path.dirname(destination)] : [path.dirname(destination)]
-  const mkdir = directories.map((dir) => `/bin/mkdir -p -m 755 ${q(dir)}`).join(' && ')
-  const script = `${parents.join(' && ')} && [ -f ${q(target)} ] && [ -x ${q(target)} ] && ${check} && ${mkdir} && ${move}{ /bin/ln -s ${q(target)} ${q(destination)} || { ${rollback}exit 1; }; }`
+  // Match daemon state_file::write: keep the data directory private; only bin is 0755.
+  const dataDirectory = destination === userCliDestination() ? `/bin/mkdir -p -m 700 ${q(path.dirname(path.dirname(destination)))} && ` : ''
+  const mkdir = `${dataDirectory}/bin/mkdir -p -m 755 ${q(path.dirname(destination))}`
+  const guards = `${parents.join(' && ')} && [ -f ${q(target)} ] && [ -x ${q(target)} ]`
+  // -h (BSD) / -T (GNU) replaces even a link to a directory rather than following it.
+  const rename = `/bin/mv ${process.platform === 'darwin' ? '-fh' : '-fT'} ${q(temporary)} ${q(destination)}`
+  const script = `${guards} && ${check} && ${mkdir} && ${move}{ /bin/ln -s ${q(target)} ${q(temporary)} && ${guards} && ${backup ? absent : check} && ${rename} || { /bin/rm -f ${q(temporary)}; ${rollback}exit 1; }; }`
   try {
     await run('/bin/sh', ['-c', script], { timeout: 10_000, maxBuffer: 4096, env: { ...process.env, LC_ALL: 'C' } })
   } catch (error) {
@@ -220,12 +225,10 @@ export async function installBundledCli(options: {
     const target = await resolveBundledCli(options.executable, options.resources)
     // A link into a mounted DMG / App Translocation would break after ejecting.
     if (target.startsWith('/Volumes/') || target.includes('/AppTranslocation/')) return { state: 'move-app' }
-    const user = await installUserCli(target)
-    if (options.userOnly || user.state !== 'installed') return user
-    const result = await installLink({
+    if (options.userOnly) return await installUserCli(target)
+    return await installLink({
       target, destination: CLI_DESTINATION, confirm: options.confirm,
       elevate: async (script) => { await run('/usr/bin/osascript', ['-e', appleScript(script)], { timeout: 120_000, maxBuffer: 4096 }) },
     })
-    return result.state === 'installed' && user.backup ? { ...result, userBackup: user.backup } : result
   } catch { return { state: 'failed' } }
 }
