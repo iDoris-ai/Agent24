@@ -1,4 +1,9 @@
 // Contract tests for the CURRENT (pre-v1) node daemon surface.
+// LEGACY / NODE-ONLY (REV-01, ADR-037 decision 1): every legacy `/api/*` route
+// asserted here (/api/modules*, /api/codebox*, /api/service-box*, /api/svc/*)
+// exists only in packages/node-daemon, the reference implementation the CI
+// `contract` job runs. The desktop app no longer calls any of them. Kept so
+// the reference daemon stays honest; do NOT add desktop-facing coverage here.
 // SCOPE: node daemon ONLY — these routes are non-versioned and the LLM probe
 // assumes same-host providers; the agent24d dual-run suite is v1.test.ts,
 // which must never import this file's assumptions.

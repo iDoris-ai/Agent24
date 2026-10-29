@@ -47,6 +47,7 @@ async fn startup_restores_unexpired_pending_approval_and_keeps_snapshot_byte_ide
                 workspace_id: None,
                 model_override: None,
                 mode: RunMode::Normal,
+                knowledge_binding_id: None,
             },
             output: None,
             error: None,
@@ -87,6 +88,19 @@ async fn startup_restores_unexpired_pending_approval_and_keeps_snapshot_byte_ide
         .unwrap();
     let mut payload = Map::new();
     payload.insert("argv".into(), json!(["/bin/echo", "r03"]));
+    store
+        .insert_tool_call(&agent24_protocol::ToolCall {
+            id: "tc_r03".to_owned(),
+            run_id: RUN_ID.to_owned(),
+            tool: "shell_exec".to_owned(),
+            input: payload.clone(),
+            status: agent24_protocol::ToolCallStatus::Running,
+            output_summary: None,
+            started_at: now.clone(),
+            ended_at: None,
+        })
+        .await
+        .unwrap();
     store
         .insert_approval(&Approval {
             id: APPROVAL_ID.to_owned(),

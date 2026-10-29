@@ -66,11 +66,13 @@ async fn paused_snapshot_notice_is_host_system_and_neighbors_are_present() {
     kv.set_memory_enabled("test-owner", false).await.unwrap();
     let run = manager
         .start_run(RunCreate {
+            idoris_headroom_confirmed: false,
             session_id: Some("snap-pause".into()),
             workspace_id: None,
             prompt: "记住 我喜欢喝茶".into(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -163,11 +165,13 @@ async fn recall_snapshot_stores_sorted_assertion_id_array() {
     }
     let run = manager
         .start_run(RunCreate {
+            idoris_headroom_confirmed: false,
             session_id: None,
             workspace_id: None,
             prompt: "花生 烤鸭".into(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();

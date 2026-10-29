@@ -1,0 +1,32 @@
+.quick-switch-backdrop {
+  position: fixed; inset: 0; z-index: 1000;
+  display: flex; justify-content: center; align-items: flex-start;
+  padding: min(15vh, 100px) 16px 16px; background: rgb(0 0 0 / 55%);
+}
+.quick-switch {
+  width: 560px; max-width: 100%; max-height: 100%;
+  display: flex; flex-direction: column; overflow: hidden;
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: 0 16px 64px rgb(0 0 0 / 35%);
+}
+.quick-switch header { display: flex; align-items: center; justify-content: space-between; padding: 16px; gap: 12px; }
+.quick-switch h2 { margin: 0; font-size: 14px; }
+.quick-switch kbd { color: var(--text); font-size: 12px; }
+.quick-switch input {
+  margin: 0 16px 12px; padding: 10px 12px; min-width: 0;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg); color: var(--text); font: inherit;
+}
+.quick-switch input::placeholder { color: var(--text); opacity: 1; }
+.quick-switch input:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+.quick-switch-results { overflow-y: auto; min-height: 0; padding: 4px 8px; }
+.quick-switch-option {
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap;
+  gap: 6px 16px; padding: 12px 10px; border-radius: 6px; cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.quick-switch-option[aria-selected='true'] { background: var(--surface2); box-shadow: inset 3px 0 var(--text); }
+.quick-switch-option:hover { background: var(--surface2); }
+.quick-switch-detail { margin-left: auto; font-size: 12px; }
+.quick-switch-empty:not(:empty) { padding: 16px; }

@@ -5,6 +5,7 @@ use std::time::Duration;
 use crate::domain::Supervisors;
 use agent24_domain::tool::{
     ModuleToolAdvertView, ModuleToolCallError, ModuleToolErrorCode, ModuleToolResult,
+    ToolDeclaration,
 };
 use agent24_os_proto::drain::{DrainState, Generation};
 use agent24_os_proto::kernel_call::{
@@ -330,39 +331,19 @@ fn stale_package() -> ModuleToolCallError {
     ModuleToolCallError::Cancelled
 }
 
-/// Module id of the Documenting OS, as adopted in ADR-DOC-01
-/// (`docs/documenting/adr/ADR-DOC-01-placement-and-integration.md`). Gate 5
-/// (jason 2026-10-08 ruling #5) withholds this module's tools whenever a remote
-/// model tier exists, until K1-6a and K1-6b are both accepted.
-const DOCUMENTS_MODULE_ID: &str = "documents";
-
-/// Whether gate 5 treats `module` as a document-class module.
-fn is_document_class_module(module: &str) -> bool {
-    module == DOCUMENTS_MODULE_ID
-}
-
-/// Whether a remote model tier exists right now (K1-6a-G §2.4): read on
-/// every advert and every call, never a startup snapshot. `None` means the
-/// tier configuration could not be read, which gate 5 treats as a remote
-/// tier being present.
-pub type RemoteTierProbe = Arc<dyn Fn() -> Option<bool> + Send + Sync>;
-
 pub struct AgentModuleToolAdvertView {
     runtime: Arc<AgentModuleToolRuntime>,
     authorizations: HashMap<(String, String), Arc<dyn ModuleToolAuthorization>>,
-    remote_tier: RemoteTierProbe,
 }
 
 impl AgentModuleToolAdvertView {
     pub fn new(
         runtime: Arc<AgentModuleToolRuntime>,
         authorizations: HashMap<(String, String), Arc<dyn ModuleToolAuthorization>>,
-        remote_tier: RemoteTierProbe,
     ) -> Arc<Self> {
         Arc::new(Self {
             runtime,
             authorizations,
-            remote_tier,
         })
     }
 }
@@ -392,10 +373,6 @@ impl ModuleToolAdvertView for AgentModuleToolAdvertView {
     async fn outbound_gate_ready(&self, module: &str, operation: &str) -> bool {
         self.operation_available(module, operation).await
     }
-
-    async fn blocked_by_remote_tier_guard(&self, module: &str, _operation: &str) -> bool {
-        is_document_class_module(module) && (self.remote_tier)().unwrap_or(true)
-    }
 }
 
 /// The daemon's clock for consent checks. Milliseconds: a grant's remaining
@@ -424,6 +401,81 @@ pub(crate) fn store_authorization(
     )
     .with_consent_changes(store.clone())
     .with_artifact_source(artifact)
+}
+
+/// The tool the host registers for `module`'s `declaration`. Every module
+/// operation is `External` to the host's approval gate whatever the manifest
+/// says; what the manifest declares only ever withholds the same-source
+/// exception (K1-6b.5f, ADR-K1-02 §2.1.1 item 6).
+pub(crate) fn assemble_module_tool(
+    module: &str,
+    declaration: &ToolDeclaration,
+    advert_view: Arc<dyn ModuleToolAdvertView>,
+    authorization: Arc<dyn ModuleToolAuthorization>,
+    runtime: Arc<dyn ModuleToolRuntime>,
+    store: agent24_store::Store,
+) -> Result<agent24_tools::ModuleTool, &'static str> {
+    agent24_tools::ModuleTool::new(
+        module,
+        declaration.operation(),
+        declaration.description(),
+        declaration.input_schema().clone(),
+        Duration::from_millis(declaration.timeout_ms()),
+        Duration::from_millis(declaration.inline_wait_ms()),
+        agent24_protocol::RiskClass::External,
+        advert_view,
+        authorization,
+        runtime,
+        store,
+        "agent24d",
+    )
+    .map(|tool| {
+        tool.with_declared_outbound(agent24_policy::tool_summary::declares_outbound(declaration))
+    })
+}
+
+/// Registers a tool for every declaration in `modules` the host holds an
+/// authorization for, each built by [`assemble_module_tool`]; a declaration
+/// without one is not offered (K1-6a-G §2.6).
+pub(crate) fn register_module_tools(
+    tools: &mut agent24_tools::ToolRegistry,
+    modules: &agent24_domain::tool::ModuleToolRegistry,
+    authorizations: &HashMap<(String, String), Arc<dyn ModuleToolAuthorization>>,
+    advert_view: &Arc<dyn ModuleToolAdvertView>,
+    runtime: &Arc<dyn ModuleToolRuntime>,
+    store: &agent24_store::Store,
+) {
+    for (_, registered) in modules.iter() {
+        let module = registered.module();
+        let declaration = registered.declaration();
+        let Some(authorization) =
+            authorizations.get(&(module.to_owned(), declaration.operation().to_owned()))
+        else {
+            continue;
+        };
+        match assemble_module_tool(
+            module,
+            declaration,
+            Arc::clone(advert_view),
+            Arc::clone(authorization),
+            Arc::clone(runtime),
+            store.clone(),
+        ) {
+            Ok(tool) => {
+                if let Err(error) = tools.register_module_tool(Arc::new(tool)) {
+                    tracing::warn!(
+                        module,
+                        operation = declaration.operation(),
+                        %error,
+                        "module tool was not registered"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(module, operation = declaration.operation(), %error, "module tool was not assembled")
+            }
+        }
+    }
 }
 
 /// A module tool's authorization, or none for a module not on the grants
@@ -542,14 +594,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn gate_five_recognises_the_adopted_documents_module_id() {
-        // ADR-DOC-01 adopted "documents"; the earlier "documenting" literal
-        // never matched any real module, leaving gate 5 dead (#790 review).
-        assert!(is_document_class_module("documents"));
-        assert!(!is_document_class_module("documenting"));
-        assert!(!is_document_class_module("sin90"));
-    }
     use agent24_domain::tool::{ModuleToolCallError, ModuleToolResult};
     use agent24_domain::{EgressGate, EgressResource};
     use agent24_policy::consent_gate::{
@@ -578,8 +622,6 @@ mod tests {
         slow_check: AtomicBool,
         unresponsive_check: AtomicBool,
         entered: tokio::sync::Notify,
-        /// What `TestAdvertView`'s gate 5 reads, per call.
-        remote_tier: AtomicBool,
         /// Notified as `check_available` starts.
         check_entered: tokio::sync::Notify,
         /// Run once, synchronously, as `check_available` / `invoke` is
@@ -701,9 +743,6 @@ mod tests {
         }
         async fn outbound_gate_ready(&self, _: &str, _: &str) -> bool {
             self.outbound_ready.load(Ordering::SeqCst)
-        }
-        async fn blocked_by_remote_tier_guard(&self, _: &str, _: &str) -> bool {
-            self.running.remote_tier.load(Ordering::SeqCst)
         }
     }
 
@@ -829,6 +868,25 @@ mod tests {
         )
     }
 
+    fn fake_module(running: bool) -> Arc<FakeModule> {
+        Arc::new(FakeModule {
+            running: AtomicBool::new(running),
+            calls: AtomicUsize::new(0),
+            failure: std::sync::Mutex::new(None),
+            pending: AtomicBool::new(false),
+            wait_for_cancel: AtomicBool::new(false),
+            slow_check: AtomicBool::new(false),
+            unresponsive_check: AtomicBool::new(false),
+            entered: tokio::sync::Notify::new(),
+            check_entered: tokio::sync::Notify::new(),
+            on_check: Hook::default(),
+            on_invoke: Hook::default(),
+            dispatched: std::sync::Mutex::default(),
+            contexts: std::sync::Mutex::default(),
+            run: std::sync::Mutex::default(),
+        })
+    }
+
     async fn fixture(
         risk: RiskClass,
         granted: bool,
@@ -857,6 +915,35 @@ mod tests {
         outbound_ready: bool,
         supplied_store: Option<Store>,
         supplied_authorization: Option<Arc<dyn ModuleToolAuthorization>>,
+    ) -> (
+        ToolRegistry,
+        Arc<FakeModule>,
+        Arc<CountingApproval>,
+        Store,
+        Arc<ModuleTool>,
+    ) {
+        fixture_declaring(
+            risk,
+            granted,
+            running,
+            outbound_ready,
+            supplied_store,
+            supplied_authorization,
+            None,
+        )
+        .await
+    }
+
+    /// [`fixture_using`] whose tool's manifest declares `declared_outbound`;
+    /// `None` leaves the tool's default.
+    async fn fixture_declaring(
+        risk: RiskClass,
+        granted: bool,
+        running: bool,
+        outbound_ready: bool,
+        supplied_store: Option<Store>,
+        supplied_authorization: Option<Arc<dyn ModuleToolAuthorization>>,
+        declared_outbound: Option<bool>,
     ) -> (
         ToolRegistry,
         Arc<FakeModule>,
@@ -900,46 +987,32 @@ mod tests {
                 fixture_package(),
             ));
         let authorization = supplied_authorization.unwrap_or(default_authorization);
-        let runtime = Arc::new(FakeModule {
-            running: AtomicBool::new(running),
-            calls: AtomicUsize::new(0),
-            failure: std::sync::Mutex::new(None),
-            pending: AtomicBool::new(false),
-            wait_for_cancel: AtomicBool::new(false),
-            slow_check: AtomicBool::new(false),
-            unresponsive_check: AtomicBool::new(false),
-            entered: tokio::sync::Notify::new(),
-            remote_tier: AtomicBool::new(false),
-            check_entered: tokio::sync::Notify::new(),
-            on_check: Hook::default(),
-            on_invoke: Hook::default(),
-            dispatched: std::sync::Mutex::default(),
-            contexts: std::sync::Mutex::default(),
-            run: std::sync::Mutex::default(),
-        });
+        let runtime = fake_module(running);
         let test_view = Arc::new(TestAdvertView {
             authorization: Arc::clone(&authorization),
             running: Arc::clone(&runtime),
             outbound_ready: AtomicBool::new(outbound_ready),
         });
         let view: Arc<dyn ModuleToolAdvertView> = test_view;
-        let tool = Arc::new(
-            ModuleTool::new(
-                "fake_module",
-                "write_local",
-                "fake module tool",
-                serde_json::json!({"type":"object"}),
-                Duration::from_secs(2),
-                Duration::from_secs(1),
-                risk,
-                view,
-                authorization,
-                runtime.clone(),
-                store.clone(),
-                "agent24d",
-            )
-            .unwrap(),
-        );
+        let tool = ModuleTool::new(
+            "fake_module",
+            "write_local",
+            "fake module tool",
+            serde_json::json!({"type":"object"}),
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            risk,
+            view,
+            authorization,
+            runtime.clone(),
+            store.clone(),
+            "agent24d",
+        )
+        .unwrap();
+        let tool = Arc::new(match declared_outbound {
+            Some(declared) => tool.with_declared_outbound(declared),
+            None => tool,
+        });
         let approvals = Arc::new(CountingApproval {
             calls: AtomicUsize::new(0),
             deny: AtomicBool::new(false),
@@ -961,7 +1034,7 @@ mod tests {
     #[tokio::test]
     async fn granted_fake_module_is_advertised_and_callable() {
         let (registry, runtime, _, store) = fixture(RiskClass::Read, true, true).await;
-        assert_eq!(registry.live_adverts().await.len(), 1);
+        assert_eq!(registry.live_adverts(false).await.len(), 1);
         let mut arguments = Map::new();
         arguments.insert(
             "credential".to_owned(),
@@ -1159,7 +1232,7 @@ mod tests {
             .unwrap();
         let (registry, runtime, _, store, _) =
             fixture_using(RiskClass::Read, false, true, true, Some(store), None).await;
-        assert!(registry.live_adverts().await.is_empty());
+        assert!(registry.live_adverts(false).await.is_empty());
         let error = registry
             .dispatch(
                 "fake_module.write_local",
@@ -1541,7 +1614,7 @@ mod tests {
     #[tokio::test]
     async fn missing_consent_is_not_advertised_and_never_reaches_fake_module() {
         let (registry, runtime, _, store) = fixture(RiskClass::Read, false, true).await;
-        assert!(registry.live_adverts().await.is_empty());
+        assert!(registry.live_adverts(false).await.is_empty());
         let error = registry
             .dispatch(
                 "fake_module.write_local",
@@ -1597,7 +1670,7 @@ mod tests {
     #[tokio::test]
     async fn write_local_module_tool_asks_existing_approval_gate_every_call() {
         let (registry, runtime, approvals, _) = fixture(RiskClass::WriteLocal, true, true).await;
-        assert_eq!(registry.live_adverts().await.len(), 1);
+        assert_eq!(registry.live_adverts(false).await.len(), 1);
         for _ in 0..2 {
             registry
                 .dispatch(
@@ -1616,7 +1689,7 @@ mod tests {
     #[tokio::test]
     async fn stopped_module_tool_returns_module_unavailable_without_dispatch() {
         let (registry, runtime, _, _) = fixture(RiskClass::Read, true, false).await;
-        assert!(registry.live_adverts().await.is_empty());
+        assert!(registry.live_adverts(false).await.is_empty());
         let error = registry
             .dispatch(
                 "fake_module.write_local",
@@ -2373,7 +2446,6 @@ mod tests {
             slow_check: AtomicBool::new(false),
             unresponsive_check: AtomicBool::new(false),
             entered: tokio::sync::Notify::new(),
-            remote_tier: AtomicBool::new(false),
             check_entered: tokio::sync::Notify::new(),
             on_check: Hook::default(),
             on_invoke: Hook::default(),
@@ -2630,7 +2702,7 @@ mod tests {
     #[tokio::test]
     async fn unready_outbound_gate_is_not_advertised() {
         let (registry, _, _, _) = fixture_with_outbound(RiskClass::Read, true, true, false).await;
-        assert!(registry.live_adverts().await.is_empty());
+        assert!(registry.live_adverts(false).await.is_empty());
     }
 
     #[tokio::test]
@@ -2795,110 +2867,304 @@ mod tests {
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
     }
 
-    /// K1-6a-G §4 case 1: a withheld tool called by name, on either
-    /// dispatch path, is refused before the module and audited as denied.
+    /// The tag id the agent writes for what `module` returned on `call`.
+    fn result_of(module: &str, call: &str) -> EgressResource {
+        let tag = agent24_store::SourceRef::tool_result(
+            &format!("module:{module}"),
+            call,
+            agent24_store::SourceClassification::Unknown,
+            "2026-10-26T00:00:00Z",
+        );
+        EgressResource::local_only(tag.source_id, "unrevisioned")
+    }
+
+    /// What `origin` returned in an earlier turn of a session, as that
+    /// session's later turns carry it (K1-6b.5f-2).
+    fn earlier_turn_result_of(origin: &str) -> EgressResource {
+        let tag =
+            agent24_store::SourceRef::session_tool_result(origin, "sess_1", "2026-10-26T00:00:00Z");
+        EgressResource::local_only(tag.source_id, "unrevisioned")
+    }
+
+    /// K1-6b.5f (David 2026-10-26, same source): a module may be sent back
+    /// what it returned itself, and only that. The run has no egress gate,
+    /// as production builds it, so any other source refuses.
     #[tokio::test]
-    async fn a_withheld_tool_called_by_name_is_refused_and_audited() {
-        let (registry, runtime, _, store) = fixture(RiskClass::Read, true, true).await;
-        runtime.remote_tier.store(true, Ordering::SeqCst);
-        assert!(registry.live_adverts().await.is_empty());
-        let by_dispatch = registry
+    async fn a_module_may_receive_back_only_what_it_returned_itself() {
+        let (registry, runtime, _, _, _) =
+            fixture_declaring(RiskClass::Read, true, true, true, None, None, Some(false)).await;
+        let call = |resources: Vec<EgressResource>| {
+            let registry = &registry;
+            async move {
+                registry
+                    .dispatch(
+                        "fake_module.write_local",
+                        &context().with_egress_resources(resources),
+                        &Map::new(),
+                        &CancellationToken::new(),
+                    )
+                    .await
+            }
+        };
+        call(vec![
+            result_of("fake_module", "tc_1"),
+            result_of("fake_module", "tc_2"),
+            earlier_turn_result_of("module:fake_module"),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+
+        let refused = [
+            (
+                "another module's result",
+                vec![
+                    result_of("fake_module", "tc_1"),
+                    result_of("other_module", "tc_2"),
+                ],
+            ),
+            (
+                "a module whose id only starts the same",
+                vec![result_of("fake_module_2", "tc_1")],
+            ),
+            (
+                "a tool's result",
+                vec![EgressResource::local_only(
+                    "tool_result:tool:shell_exec:tc_3",
+                    "r",
+                )],
+            ),
+            (
+                "another module's result from an earlier turn",
+                vec![earlier_turn_result_of("module:other_module")],
+            ),
+            (
+                "a tool's result from an earlier turn",
+                vec![
+                    earlier_turn_result_of("module:fake_module"),
+                    earlier_turn_result_of("tool:shell_exec"),
+                ],
+            ),
+            (
+                "restricted material",
+                vec![
+                    result_of("fake_module", "tc_1"),
+                    EgressResource::local_only("selected_material:private", "rev-1"),
+                ],
+            ),
+        ];
+        for (what, resources) in refused {
+            let Err(error) = call(resources).await else {
+                panic!("{what} must be refused");
+            };
+            assert!(matches!(error, ToolError::Denied(_)), "{what}: {error}");
+        }
+        let Err(error) = registry
             .dispatch(
                 "fake_module.write_local",
-                &context(),
+                &context()
+                    .with_egress_resources(vec![result_of("fake_module", "tc_1")])
+                    .with_egress_policy_unavailable(),
                 &Map::new(),
                 &CancellationToken::new(),
             )
             .await
-            .unwrap_err();
-        let preapproved = registry
-            .execute_preapproved(
-                "fake_module.write_local",
-                &context(),
-                &Map::new(),
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap_err();
-        for error in [by_dispatch, preapproved] {
-            assert!(error.to_string().contains("permission_denied"), "{error}");
-        }
-        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
-        let rows = store.list_audit().await.unwrap();
-        assert_eq!(rows.len(), 4, "a pre-dispatch and a terminal per call");
-        for pair in rows.chunks(2) {
-            assert_eq!(pair[0].action, "k1.module_tool.pre_dispatch");
-            assert_eq!(
-                pair[0].detail["pre_dispatch"]["authorization_ref"],
-                "denied:remote_tier"
-            );
-            assert_eq!(pair[1].detail["terminal"]["result"], "denied");
-        }
-    }
-
-    /// K1-6a-G §2.4: the guard comes before the authorization lookup; an
-    /// authorization that never answers is never reached.
-    #[tokio::test]
-    async fn the_guard_refuses_before_authorization_is_looked_up() {
-        let authorization = Arc::new(PausingAuthorization {
-            entered: tokio::sync::Notify::new(),
-        });
-        let (registry, runtime, _, _, _tool) =
-            fixture_using(RiskClass::Read, true, true, true, None, Some(authorization)).await;
-        runtime.remote_tier.store(true, Ordering::SeqCst);
-        let refused = tokio::time::timeout(
-            Duration::from_secs(1),
-            registry.dispatch(
-                "fake_module.write_local",
-                &context(),
-                &Map::new(),
-                &CancellationToken::new(),
-            ),
-        )
-        .await
-        .expect("the guard answers without waiting on authorization")
-        .unwrap_err();
-        assert!(refused.to_string().contains("permission_denied"));
-        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
-    }
-
-    /// K1-6a-G §4 case 2: a remote tier that appears while the daemon runs
-    /// refuses the next call; nothing is read once at startup.
-    #[tokio::test]
-    async fn a_remote_tier_added_while_running_refuses_the_next_call() {
-        let (registry, runtime, _, _) = fixture(RiskClass::Read, true, true).await;
-        let (ctx, input, cancel) = (context(), Map::new(), CancellationToken::new());
-        let call = || registry.dispatch("fake_module.write_local", &ctx, &input, &cancel);
-        call().await.unwrap();
-        runtime.remote_tier.store(true, Ordering::SeqCst);
-        let refused = call().await.unwrap_err();
-        assert!(refused.to_string().contains("permission_denied"));
+        else {
+            panic!("an unreadable policy must be refused");
+        };
+        assert!(matches!(error, ToolError::Denied(_)), "{error}");
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
     }
 
-    /// The production view reads its probe on every check, and an unreadable
-    /// tier configuration counts as a remote tier; only the document-class
-    /// module is withheld.
+    /// An operation whose manifest says it may act outside the device gets
+    /// no same-source exception; neither does one the host said nothing
+    /// about (PR-Daemon #1282 N3).
     #[tokio::test]
-    async fn the_production_view_reads_the_tier_on_every_check() {
-        let tier = Arc::new(std::sync::Mutex::new(Some(false)));
-        let probe = {
-            let tier = Arc::clone(&tier);
-            Arc::new(move || *tier.lock().unwrap())
-        };
-        let view = AgentModuleToolAdvertView::new(
-            AgentModuleToolRuntime::new(HashSet::new()),
-            HashMap::new(),
-            probe,
+    async fn an_outbound_operation_is_not_sent_back_its_own_results() {
+        for declared in [None, Some(true)] {
+            let (registry, runtime, _, _, _) =
+                fixture_declaring(RiskClass::Read, true, true, true, None, None, declared).await;
+            let Err(error) = registry
+                .dispatch(
+                    "fake_module.write_local",
+                    &context().with_egress_resources(vec![result_of("fake_module", "tc_1")]),
+                    &Map::new(),
+                    &CancellationToken::new(),
+                )
+                .await
+            else {
+                panic!("an outbound operation must be refused ({declared:?})");
+            };
+            assert!(
+                matches!(error, ToolError::Denied(_)),
+                "{declared:?}: {error}"
+            );
+            assert_eq!(runtime.calls.load(Ordering::SeqCst), 0, "{declared:?}");
+        }
+    }
+
+    /// The host builds every module tool it registers here (PR-Daemon #1282
+    /// N2): only a declaration that keeps its output on the device and is not
+    /// `external` gets the same-source exception, and every tool is
+    /// `External` to the approval gate whatever it declares.
+    #[tokio::test]
+    async fn the_host_builds_a_module_tool_from_what_its_manifest_declares() {
+        let store = Store::open_memory().await.unwrap();
+        let authorization: Arc<dyn ModuleToolAuthorization> = Arc::new(PausingAuthorization {
+            entered: tokio::sync::Notify::new(),
+        });
+        let runtime = fake_module(true);
+        let view: Arc<dyn ModuleToolAdvertView> = Arc::new(TestAdvertView {
+            authorization: Arc::clone(&authorization),
+            running: Arc::clone(&runtime),
+            outbound_ready: AtomicBool::new(true),
+        });
+        for (risk, privacy, outbound) in [
+            ("read", "local_only", false),
+            ("write_local", "local_only", false),
+            ("external", "local_only", true),
+            ("read", "remote_allowed", true),
+        ] {
+            let yaml = format!(
+                "name: documents\nversion: 1.0.0\nroute_namespace: /api/v1/documents\nevent_module: documents\ndata_dir: ~/.agent24/os/documents/\nimpl_kind: in_process_crate\nmin_daemon_protocol: {}\ntools:\n  - operation: get\n    description: Read the document\n    input_schema: {{ type: object }}\n    risk: {risk}\n    output_privacy: {privacy}\n    timeout_ms: 2000\n    inline_wait_ms: 1000\n",
+                agent24_domain::RESOURCE_KINDS_PROTOCOL
+            );
+            let manifest = agent24_domain::DomainOsManifest::from_yaml(&yaml).unwrap();
+            let tool = super::assemble_module_tool(
+                "documents",
+                &manifest.tools()[0],
+                Arc::clone(&view),
+                Arc::clone(&authorization),
+                runtime.clone(),
+                store.clone(),
+            )
+            .unwrap();
+            assert_eq!(tool.declared_outbound(), outbound, "{risk}/{privacy}");
+            assert_eq!(
+                tool.info().risk_class,
+                RiskClass::External,
+                "{risk}/{privacy}"
+            );
+        }
+    }
+
+    /// The host names a module tool's results after the module, so the
+    /// egress gate can recognise them (K1-6b.5f).
+    #[tokio::test]
+    async fn a_module_tools_results_are_unknown_and_named_after_the_module() {
+        let (registry, _, _, _) = fixture(RiskClass::Read, true, true).await;
+        let source = registry.tool_result_source("fake_module.write_local");
+        assert_eq!(source.origin, "module:fake_module");
+        assert_eq!(
+            source.classification,
+            agent24_store::SourceClassification::Unknown
         );
-        assert!(!view.blocked_by_remote_tier_guard("documents", "get").await);
-        *tier.lock().unwrap() = Some(true);
-        assert!(view.blocked_by_remote_tier_guard("documents", "get").await);
-        *tier.lock().unwrap() = None;
-        assert!(view.blocked_by_remote_tier_guard("documents", "get").await);
-        assert!(!view.blocked_by_remote_tier_guard("sin90", "get").await);
-        *tier.lock().unwrap() = Some(false);
-        assert!(!view.blocked_by_remote_tier_guard("documents", "get").await);
+    }
+
+    /// Consents to everything and grants every lookup.
+    struct GrantingAuthorization;
+
+    #[async_trait]
+    impl ModuleToolAuthorization for GrantingAuthorization {
+        async fn authorize(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ToolContext,
+        ) -> Result<agent24_tools::ModuleToolGrantContext, ModuleToolCallError> {
+            Ok(agent24_tools::ModuleToolGrantContext {
+                authorized_resources: vec![],
+                authorization_ref: "grant:test".to_owned(),
+                per_call_approval: false,
+                valid_for: None,
+                artifact: None,
+            })
+        }
+        async fn has_current_consent(&self, _: &str, _: &str) -> bool {
+            true
+        }
+        async fn still_current(&self, _: &str, _: &str, _: &ToolContext, _: &str) -> bool {
+            true
+        }
+    }
+
+    /// What serve registers (#1282 PR-Daemon follow-up): each declaration
+    /// the host holds an authorization for, built from its manifest, so only
+    /// one that keeps its output on the device is sent back the module's own
+    /// results; one without an authorization is not offered.
+    #[tokio::test]
+    async fn the_host_registers_each_authorized_operation_as_its_manifest_declares() {
+        let yaml = format!(
+            "name: documents\nversion: 1.0.0\nroute_namespace: /api/v1/documents\nevent_module: documents\ndata_dir: ~/.agent24/os/documents/\nimpl_kind: in_process_crate\nmin_daemon_protocol: {}\ntools:\n{}",
+            agent24_domain::RESOURCE_KINDS_PROTOCOL,
+            ["find:read", "handoff:external", "draft:read"]
+                .map(|entry| {
+                    let (operation, risk) = entry.split_once(':').unwrap();
+                    format!("  - operation: {operation}\n    description: d\n    input_schema: {{ type: object }}\n    risk: {risk}\n    output_privacy: local_only\n    timeout_ms: 2000\n    inline_wait_ms: 1000\n")
+                })
+                .concat()
+        );
+        let manifest = agent24_domain::DomainOsManifest::from_yaml(&yaml).unwrap();
+        let mut modules = agent24_domain::tool::ModuleToolRegistry::new();
+        modules
+            .register_module("documents", manifest.tools())
+            .unwrap();
+        let authorization: Arc<dyn ModuleToolAuthorization> = Arc::new(GrantingAuthorization);
+        let authorizations: HashMap<(String, String), Arc<dyn ModuleToolAuthorization>> =
+            ["find", "handoff"]
+                .map(|operation| {
+                    (
+                        ("documents".to_owned(), operation.to_owned()),
+                        Arc::clone(&authorization),
+                    )
+                })
+                .into_iter()
+                .collect();
+        let runtime = fake_module(true);
+        let view: Arc<dyn ModuleToolAdvertView> = Arc::new(TestAdvertView {
+            authorization: Arc::clone(&authorization),
+            running: Arc::clone(&runtime),
+            outbound_ready: AtomicBool::new(true),
+        });
+        let runtime_dyn: Arc<dyn ModuleToolRuntime> = runtime.clone();
+        // Every module operation is External to the gate; this one allows.
+        let mut tools = ToolRegistry::new().with_gate(Arc::new(CountingApproval {
+            calls: AtomicUsize::new(0),
+            deny: AtomicBool::new(false),
+        }));
+        super::register_module_tools(
+            &mut tools,
+            &modules,
+            &authorizations,
+            &view,
+            &runtime_dyn,
+            &Store::open_memory().await.unwrap(),
+        );
+        let call = |name: &'static str| {
+            let tools = &tools;
+            async move {
+                tools
+                    .dispatch(
+                        name,
+                        &context().with_egress_resources(vec![result_of("documents", "tc_1")]),
+                        &Map::new(),
+                        &CancellationToken::new(),
+                    )
+                    .await
+            }
+        };
+
+        call("documents.find").await.unwrap();
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+        let Err(error) = call("documents.handoff").await else {
+            panic!("an external operation must be refused");
+        };
+        assert!(matches!(error, ToolError::Denied(_)), "{error}");
+        let Err(error) = call("documents.draft").await else {
+            panic!("an operation without an authorization must not be offered");
+        };
+        assert!(matches!(error, ToolError::Invalid(_)), "{error}");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
     }
 
     /// A grant whose feed, currency and validity a test drives directly
@@ -3762,8 +4028,7 @@ mod tests {
         let mut ops = HashSet::new();
         ops.insert(("doc_mod".to_owned(), "read_op".to_owned()));
         let runtime = AgentModuleToolRuntime::new(ops);
-        let view =
-            AgentModuleToolAdvertView::new(runtime, HashMap::new(), Arc::new(|| Some(false)));
+        let view = AgentModuleToolAdvertView::new(runtime, HashMap::new());
         assert!(view.outbound_gate_ready("doc_mod", "read_op").await);
         assert!(!view.outbound_gate_ready("doc_mod", "unknown_op").await);
     }
@@ -3886,40 +4151,23 @@ mod tests {
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
     }
 
-    /// #1130 L3: a call that could never run shows no card. Withheld by the
-    /// gate-5 guard, or with no grant, it is refused and audited before the
-    /// approval gate is asked.
+    /// #1130 L3: a call that could never run shows no card. With no grant,
+    /// it is refused and audited before the approval gate is asked.
     #[tokio::test]
     async fn a_call_bound_to_be_refused_shows_no_card() {
         let (registry, runtime, approvals, store) =
-            fixture(RiskClass::WriteLocal, true, true).await;
-        runtime.remote_tier.store(true, Ordering::SeqCst);
-        let withheld = dispatch_write_local(&registry).await.unwrap_err();
-        let (registry, ungranted_runtime, ungranted_approvals, ungranted_store) =
             fixture(RiskClass::WriteLocal, false, true).await;
-        let ungranted = dispatch_write_local(&registry).await.unwrap_err();
-        for error in [withheld, ungranted] {
-            assert!(error.to_string().contains("permission_denied"), "{error}");
-        }
-        for (approvals, runtime, store, authorization_ref) in [
-            (approvals, runtime, store, "denied:remote_tier"),
-            (
-                ungranted_approvals,
-                ungranted_runtime,
-                ungranted_store,
-                "denied:no_grant",
-            ),
-        ] {
-            assert_eq!(approvals.calls.load(Ordering::SeqCst), 0);
-            assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
-            let rows = store.list_audit().await.unwrap();
-            assert_eq!(rows.len(), 2);
-            assert_eq!(
-                rows[0].detail["pre_dispatch"]["authorization_ref"],
-                authorization_ref
-            );
-            assert_eq!(rows[1].detail["terminal"]["result"], "denied");
-        }
+        let error = dispatch_write_local(&registry).await.unwrap_err();
+        assert!(error.to_string().contains("permission_denied"), "{error}");
+        assert_eq!(approvals.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].detail["pre_dispatch"]["authorization_ref"],
+            "denied:no_grant"
+        );
+        assert_eq!(rows[1].detail["terminal"]["result"], "denied");
     }
 
     async fn preapprove_write_local(registry: &ToolRegistry) -> Result<String, ToolError> {

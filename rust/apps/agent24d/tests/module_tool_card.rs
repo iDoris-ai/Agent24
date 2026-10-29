@@ -110,7 +110,7 @@ fn start_with(home: &Path, env: &[(&str, &str)], args: &[&str]) -> Daemon {
     let mut child = daemon(home, env, args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
     let stdout = child.stdout.take().unwrap();
@@ -304,7 +304,16 @@ fn a_bound_past_ninety_days_stops_the_start() {
     }
     let out = child.wait_with_output().unwrap();
     assert!(!out.status.success());
-    assert!(out.stdout.is_empty(), "no ready line");
+    // SPEC-002 §4: no ready line, and one `failed` line in its place that
+    // names the variable, for a launcher that does not keep stderr.
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "{stdout}");
+    let failed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(failed["type"], "failed", "{failed}");
+    assert_eq!(failed["code"], "start_failed", "{failed}");
+    let error = failed["error"].as_str().unwrap();
+    assert!(error.starts_with("A24_MODULE_GRANT_MAX_DAYS"), "{error}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("A24_MODULE_GRANT_MAX_DAYS"), "{stderr}");
 }

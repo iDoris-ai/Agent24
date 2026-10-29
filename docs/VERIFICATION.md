@@ -198,7 +198,7 @@
 
 - sidebar 在「设置」按钮下方出现「能力模块」分区
 - 分区内显示「👋 Hello」按钮
-- 点击后主内容区渲染 `HelloModule` 组件，显示输入框和「Greet me」按钮
+- 点击后主内容区渲染 `HelloModule` 组件，显示输入框和「Greet me」按钮（已于 REV-01 移除）
 - 若后端未运行，sidebar 显示灰色「➕ 安装模块」占位按钮，而非崩溃
 
 ---
@@ -346,7 +346,7 @@ Renderer 中模块列表面板提供 toggle 开关，状态持久化到
 
 ---
 
-### 3. ModulesManager UI 页面
+### 3. ModulesManager UI 页面（已于 REV-01 裁剪为仅管理 /api/v1/os 的 domain-OS 模块；npm 安装与市场已移除）
 
 **功能描述**
 
@@ -449,7 +449,7 @@ M2 规划新增独立的模块管理页面，展示所有已注册能力模块�
 
 - `src/backend/module-installer.ts`（`installModule` / `uninstallModule` / `loadInstalledModule` / `discoverInstalledModules`）
 - `src/backend/server.ts`（`POST /api/modules/install`、`POST /api/modules/uninstall`）
-- `src/renderer/pages/ModulesManager.tsx`（npm 安装面板）
+- `src/renderer/pages/ModulesManager.tsx`（npm 安装面板）（已于 REV-01 移除）
 
 ---
 
@@ -519,7 +519,7 @@ M2 规划新增独立的模块管理页面，展示所有已注册能力模块�
 
 - `src/backend/boxlite-host.ts`（懒加载单例，优雅降级）
 - `src/backend/capabilities/example-codebox.ts`（hybrid CapabilityModule）
-- `src/renderer/pages/CodeSandbox.tsx`（Python 编辑器 UI）
+- `src/renderer/pages/CodeSandbox.tsx`（Python 编辑器 UI）（已于 REV-01 移除）
 
 ---
 
@@ -571,7 +571,7 @@ M2 规划新增独立的模块管理页面，展示所有已注册能力模块�
 | 社区模块持久化加载 | ✅ 已实现 | 重启后 `~/.agent24/modules/` 自动加载 |
 | 模块 LLM 模型声明 | ✅ 已实现 | manifest.models → 注册时自动 ensureModel |
 | oMLX 模型实时状态 | ✅ 已实现 | GET /api/llm/models + Models 页面 |
-| BoxLite Python 沙箱 | ✅ 已实现 | POST /api/codebox/run + CodeSandbox.tsx |
+| BoxLite Python 沙箱 | ✅ 已实现 | POST /api/codebox/run + CodeSandbox.tsx（CodeSandbox 与 /api/codebox 调用已于 REV-01 从桌面移除）|
 | Chat → 真实 LLM | ✅ 已实现 | POST /api/llm/chat，用户已验证与 Qwen 模型对话正常 |
 | IPC bridge install/uninstall | ✅ 已实现 | ipc/index.ts + preload.ts 均已实现 |
 

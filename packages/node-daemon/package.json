@@ -1,16 +1,17 @@
 {
   "name": "@agent24/node-daemon",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "private": true,
-  "description": "Agent24 backend daemon (Node) — M-A+: mock/reference implementation of the v1 protocol",
+  "description": "Agent24 backend daemon (Node) — M-A+: mock/reference implementation of the v1 protocol. 仅契约测试与开发参考，不进安装包（ADR-037）",
   "main": "dist/server.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "vitest run",
+    "build": "pnpm --filter @agent24/data-dir build && tsc -p tsconfig.json",
+    "typecheck": "pnpm --filter @agent24/data-dir build && tsc --noEmit -p tsconfig.json",
+    "test": "pnpm --filter @agent24/data-dir build && vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@agent24/data-dir": "workspace:*",
     "@boxlite-ai/boxlite": "^0.9.3",
     "@boxlite-ai/boxlite-darwin-arm64": "^0.9.3",
     "ws": "^8.21.1"

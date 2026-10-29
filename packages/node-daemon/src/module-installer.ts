@@ -1,24 +1,33 @@
 // M3: Community module installer — runs npm install/uninstall in
-// ~/.agent24/modules/ and dynamically loads the installed package.
+// <data_dir>/modules and dynamically loads the installed package.
 
 import { execFile } from 'node:child_process'
 import fs from 'node:fs'
-import path from 'node:path'
-import os from 'node:os'
 import { promisify } from 'node:util'
+import { dataDir, joinLiteral } from '@agent24/data-dir'
 import type { CapabilityModule } from './capabilities/base'
 import { validateManifest } from './module-manifest'
 
 const execFileAsync = promisify(execFile)
 
-const MODULES_DIR = path.join(os.homedir(), '.agent24', 'modules')
-const MODULES_PKG = path.join(MODULES_DIR, 'package.json')
+/** `<data_dir>/modules`. Resolved on each call (ADR-037). */
+export function modulesDir(): string {
+  return joinLiteral(dataDir(), 'modules')
+}
 
-// Ensure ~/.agent24/modules/ exists with a package.json so npm install works.
-function ensureModulesDir(): void {
-  fs.mkdirSync(MODULES_DIR, { recursive: true })
-  if (!fs.existsSync(MODULES_PKG)) {
-    fs.writeFileSync(MODULES_PKG, JSON.stringify({
+/** joinLiteral, but `/` inside a scoped package name stays a separator.
+ * Does not fold `..` in the data dir (unlike path.join). */
+function under(dir: string, ...parts: string[]): string {
+  return joinLiteral(dir, ...parts.flatMap((part) => part.split('/').filter((segment) => segment !== '')))
+}
+
+// Ensure <data_dir>/modules exists with a package.json so npm install works.
+function ensureModulesDir(): string {
+  const dir = modulesDir()
+  fs.mkdirSync(dir, { recursive: true })
+  const pkg = joinLiteral(dir, 'package.json')
+  if (!fs.existsSync(pkg)) {
+    fs.writeFileSync(pkg, JSON.stringify({
       name: 'agent24-community-modules',
       version: '1.0.0',
       private: true,
@@ -26,6 +35,7 @@ function ensureModulesDir(): void {
       dependencies: {},
     }, null, 2))
   }
+  return dir
 }
 
 // Validate package name: allow @scope/name and plain name formats only.
@@ -41,17 +51,17 @@ export async function installModule(packageName: string): Promise<{ ok: boolean;
   }
 
   try {
-    ensureModulesDir()
+    const dir = ensureModulesDir()
 
     // Run npm install (use system npm; Electron bundles Node but not npm)
     await execFileAsync('npm', ['install', packageName, '--save'], {
-      cwd: MODULES_DIR,
+      cwd: dir,
       timeout: 120_000,
       env: { ...process.env, NODE_ENV: 'production' },
     })
 
     // Resolve the installed package path
-    const modulePath = path.join(MODULES_DIR, 'node_modules', packageName)
+    const modulePath = under(dir, 'node_modules', packageName)
 
     if (!fs.existsSync(modulePath)) {
       return { ok: false, error: `Package installed but module path not found: ${modulePath}` }
@@ -70,9 +80,9 @@ export async function uninstallModule(packageName: string): Promise<{ ok: boolea
   }
 
   try {
-    ensureModulesDir()
+    const dir = ensureModulesDir()
     await execFileAsync('npm', ['uninstall', packageName, '--save'], {
-      cwd: MODULES_DIR,
+      cwd: dir,
       timeout: 60_000,
     })
     return { ok: true }
@@ -112,9 +122,10 @@ export function loadInstalledModule(modulePath: string): CapabilityModule | null
   }
 }
 
-// Scan ~/.agent24/modules/node_modules/ for previously installed modules.
+// Scan <data_dir>/modules/node_modules for previously installed modules.
 export function discoverInstalledModules(): { packageName: string; modulePath: string }[] {
-  const nmDir = path.join(MODULES_DIR, 'node_modules')
+  const dir = modulesDir()
+  const nmDir = joinLiteral(dir, 'node_modules')
   if (!fs.existsSync(nmDir)) return []
 
   const result: { packageName: string; modulePath: string }[] = []
@@ -126,16 +137,16 @@ export function discoverInstalledModules(): { packageName: string; modulePath: s
 
       if (entry.startsWith('@')) {
         // Scoped packages: @scope/name
-        const scopeDir = path.join(nmDir, entry)
+        const scopeDir = under(dir, 'node_modules', entry)
         const scoped = fs.readdirSync(scopeDir)
         for (const pkg of scoped) {
           result.push({
             packageName: `${entry}/${pkg}`,
-            modulePath: path.join(scopeDir, pkg),
+            modulePath: under(dir, 'node_modules', entry, pkg),
           })
         }
       } else {
-        result.push({ packageName: entry, modulePath: path.join(nmDir, entry) })
+        result.push({ packageName: entry, modulePath: under(dir, 'node_modules', entry) })
       }
     }
   } catch { /* best-effort */ }

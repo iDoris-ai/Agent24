@@ -1,6 +1,6 @@
 [package]
 name = "agent24-comm"
-version = "0.5.1"
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -50,6 +50,7 @@ rustix = { version = "0.38", features = ["process", "fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = [
     "process",
@@ -73,7 +74,6 @@ zeroize = "1"
 # the feature on means `cargo test -p agent24-comm` (no extra flags) already
 # runs the lock-override-gated tests.
 agent24-comm = { path = ".", features = ["test-lock-override"] }
-tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 # COMM-2a router tests: drives `router()` in-process via
 # `tower::ServiceExt::oneshot`, same pattern as agent24-os-sdk's router tests.

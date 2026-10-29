@@ -47,6 +47,10 @@ use crate::{Result, Store};
 /// `LocalOnly` WITHOUT attempting to parse `tag_json` — see module docs.
 pub const SOURCE_TAG_SCHEMA_VERSION: i64 = 2;
 
+/// Every [`SourceRef::tool_result`] id starts with this, followed by the
+/// result's origin.
+pub const TOOL_RESULT_PREFIX: &str = "tool_result:";
+
 /// What kind of content entering the run this tag describes. Informational
 /// only in this slice (nothing branches on it yet); an unrecognized value on
 /// read is a decode failure, which already forces the tag to `LocalOnly` via
@@ -70,6 +74,10 @@ pub enum SourceKind {
     /// A prompt a kernel-created schedule (a self-wake) carries from the
     /// run that created it (K1-6b.4d).
     ScheduleOrigin,
+    /// What a tool call returned into the run's context (K1-6b.5f). The
+    /// classification is the host's for that kind of tool, never the tool's
+    /// or module's own claim.
+    ToolResult,
 }
 
 /// Sensitivity classification is independent from processing mode and source
@@ -178,6 +186,51 @@ impl SourceRef {
             source_id: format!("schedule_origin:{schedule_id}"),
             kind: SourceKind::ScheduleOrigin,
             classification,
+            revision_digest: None,
+            mode: SourceMode::LocalOnly,
+            policy_version: 0,
+            authorization_ref: None,
+            created_at: created_at.into(),
+        }
+    }
+
+    /// What one tool call returned (K1-6b.5f, ADR-K1-02 §2.1). `origin` names
+    /// where the content came from as the host knows it (`module:{id}`,
+    /// `tool:{name}`), so the egress gate can recognise content a module
+    /// sent back to that same module.
+    pub fn tool_result(
+        origin: &str,
+        tool_call_id: &str,
+        classification: SourceClassification,
+        created_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_id: format!("{TOOL_RESULT_PREFIX}{origin}:{tool_call_id}"),
+            kind: SourceKind::ToolResult,
+            classification,
+            revision_digest: None,
+            mode: SourceMode::LocalOnly,
+            policy_version: 0,
+            authorization_ref: None,
+            created_at: created_at.into(),
+        }
+    }
+
+    /// Results from `origin` that an earlier turn of `session_id` took in
+    /// (K1-6b.5f-2), entering this run through session context. Always
+    /// `Unknown`: only non-ordinary origins are recorded
+    /// ([`Store::tag_tool_result`]). The id keeps the
+    /// `tool_result:{origin}:` prefix, so the same-source exception still
+    /// recognises a module's own results.
+    pub fn session_tool_result(
+        origin: &str,
+        session_id: &str,
+        created_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_id: format!("{TOOL_RESULT_PREFIX}{origin}:session:{session_id}"),
+            kind: SourceKind::ToolResult,
+            classification: SourceClassification::Unknown,
             revision_digest: None,
             mode: SourceMode::LocalOnly,
             policy_version: 0,
@@ -473,24 +526,65 @@ impl Store {
         tag: &SourceRef,
         now: &str,
     ) -> Result<()> {
-        let tag_json = serde_json::to_string(tag)?;
-        sqlx::query(
-            "INSERT INTO run_source_tags (run_id, seq, source_id, schema_version, tag_json, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(run_id, seq, source_id) DO UPDATE SET \
-                schema_version = excluded.schema_version, \
-                tag_json = excluded.tag_json, \
-                created_at = excluded.created_at",
+        let mut conn = self.pool().acquire().await?;
+        insert_run_source_tag(&mut conn, run_id, seq, tag, now).await
+    }
+
+    /// K1-6b.5f-2: persist the tag of a tool result and, for a run in a
+    /// session, the result's origin as one of the session's
+    /// ([`Self::session_tool_result_origins`]) when it is not ordinary.
+    /// `session` is `(session_id, origin)`. One transaction, so a later turn
+    /// never misses an origin whose result this run's model saw.
+    pub async fn tag_tool_result(
+        &self,
+        run_id: &str,
+        seq: i64,
+        tag: &SourceRef,
+        session: Option<(&str, &str)>,
+        now: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool().begin().await?;
+        insert_run_source_tag(&mut tx, run_id, seq, tag, now).await?;
+        if let Some((session_id, origin)) = session
+            && tag.classification != SourceClassification::Ordinary
+        {
+            sqlx::query(
+                "INSERT INTO session_tool_result_origins (session_id, origin, created_at) \
+                 VALUES (?, ?, ?) ON CONFLICT(session_id, origin) DO NOTHING",
+            )
+            .bind(session_id)
+            .bind(origin)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Every origin of a non-ordinary tool result that some turn of
+    /// `session_id` took in (K1-6b.5f-2), in name order. Empty for a session
+    /// with none.
+    pub async fn session_tool_result_origins(&self, session_id: &str) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT origin FROM session_tool_result_origins WHERE session_id = ? ORDER BY origin",
+        )
+        .bind(session_id)
+        .fetch_all(self.pool())
+        .await?)
+    }
+
+    /// Whether `run_id` was unfinished when this library took migration 0033
+    /// (K1-R3 release review): a build that tagged no tool result may have
+    /// driven it.
+    pub async fn run_predates_tool_result_tagging(&self, run_id: &str) -> Result<bool> {
+        let listed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runs_before_tool_result_tagging WHERE run_id = ?",
         )
         .bind(run_id)
-        .bind(seq)
-        .bind(&tag.source_id)
-        .bind(SOURCE_TAG_SCHEMA_VERSION)
-        .bind(&tag_json)
-        .bind(now)
-        .execute(self.pool())
+        .fetch_one(self.pool())
         .await?;
-        Ok(())
+        Ok(listed > 0)
     }
 
     /// Every tag persisted against a run, in `(seq, source_id)` order.
@@ -598,6 +692,33 @@ impl Store {
             tags.into_iter().map(|tag| tag.source).collect(),
         ))
     }
+}
+
+async fn insert_run_source_tag(
+    conn: &mut sqlx::SqliteConnection,
+    run_id: &str,
+    seq: i64,
+    tag: &SourceRef,
+    now: &str,
+) -> Result<()> {
+    let tag_json = serde_json::to_string(tag)?;
+    sqlx::query(
+        "INSERT INTO run_source_tags (run_id, seq, source_id, schema_version, tag_json, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(run_id, seq, source_id) DO UPDATE SET \
+            schema_version = excluded.schema_version, \
+            tag_json = excluded.tag_json, \
+            created_at = excluded.created_at",
+    )
+    .bind(run_id)
+    .bind(seq)
+    .bind(&tag.source_id)
+    .bind(SOURCE_TAG_SCHEMA_VERSION)
+    .bind(&tag_json)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1021,6 +1142,288 @@ mod tests {
         assert_eq!(tags[0].source.kind, SourceKind::SessionContext);
     }
 
+    /// K1-6b.5f-2: a session records the origins of the non-ordinary tool
+    /// results its runs took in, once each; a result outside a session, or an
+    /// ordinary one, records nothing.
+    #[tokio::test]
+    async fn a_session_records_the_origins_of_its_non_ordinary_tool_results() {
+        use SourceClassification::{Ordinary, Unknown};
+        let store = store_with_run("run_tools").await;
+        for (seq, origin, classification, session) in [
+            (1, "tool:shell_exec", Unknown, Some("s1")),
+            (2, "tool:shell_exec", Unknown, Some("s1")),
+            (3, "module:docs", Unknown, Some("s1")),
+            (4, "tool:fs_read", Ordinary, Some("s1")),
+            (5, "tool:mcp_x", Unknown, None),
+        ] {
+            let tag = SourceRef::tool_result(origin, &format!("tc_{seq}"), classification, "t");
+            store
+                .tag_tool_result(
+                    "run_tools",
+                    seq,
+                    &tag,
+                    session.map(|sid| (sid, origin)),
+                    "t",
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.list_run_source_tags("run_tools").await.unwrap().len(),
+            5
+        );
+        assert_eq!(
+            store.session_tool_result_origins("s1").await.unwrap(),
+            ["module:docs", "tool:shell_exec"]
+        );
+        assert!(
+            store
+                .session_tool_result_origins("s2")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let inherited = SourceRef::session_tool_result("module:docs", "s1", "t");
+        assert_eq!(inherited.source_id, "tool_result:module:docs:session:s1");
+        assert_eq!(inherited.classification, Unknown);
+        assert_eq!(inherited.kind, SourceKind::ToolResult);
+    }
+
+    /// Codex 6b.5f-2 r1 C1: a session whose runs called tools before 0031
+    /// carries one legacy origin; a session without tool calls, and a tool
+    /// call outside any session, record none.
+    #[tokio::test]
+    async fn a_session_that_called_tools_before_0031_carries_a_legacy_origin() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.migrations = std::borrow::Cow::Owned(
+            migrator
+                .migrations
+                .iter()
+                .filter(|m| m.version <= 30)
+                .cloned()
+                .collect(),
+        );
+        migrator.run(&pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO sessions (id, title, channel, created_at, updated_at) VALUES \
+                ('s_tools', 't', 'api', 't', 't'), ('s_quiet', 't', 'api', 't', 't'); \
+             INSERT INTO runs (id, session_id, status, input, usage, created_at) VALUES \
+                ('r1', 's_tools', 'completed', '{}', '{}', 't'), \
+                ('r2', 's_tools', 'completed', '{}', '{}', 't'), \
+                ('r3', 's_quiet', 'completed', '{}', '{}', 't'), \
+                ('r4', NULL, 'completed', '{}', '{}', 't'); \
+             INSERT INTO tool_calls (id, run_id, tool, input, status, started_at) VALUES \
+                ('tc1', 'r1', 'shell_exec', '{}', 'ok', 't'), \
+                ('tc2', 'r2', 'docs.find', '{}', 'ok', 't'), \
+                ('tc3', 'r4', 'shell_exec', '{}', 'ok', 't');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let store = crate::test_hooks::from_pool(pool);
+        assert_eq!(
+            store.session_tool_result_origins("s_tools").await.unwrap(),
+            ["tool:legacy"]
+        );
+        assert!(
+            store
+                .session_tool_result_origins("s_quiet")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// K1-6b.5f-3 (David 2026-10-27, B): every session run present at the
+    /// upgrade that carries no session floor gets an `unknown` one, which
+    /// reads back as the session-context tag the kernel itself would write.
+    #[tokio::test]
+    async fn a_session_run_without_a_floor_before_0032_gets_an_unknown_one() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.migrations = std::borrow::Cow::Owned(
+            migrator
+                .migrations
+                .iter()
+                .filter(|m| m.version <= 31)
+                .cloned()
+                .collect(),
+        );
+        migrator.run(&pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO sessions (id, title, channel, created_at, updated_at) VALUES \
+                ('s1', 't', 'api', 't', 't'); \
+             INSERT INTO runs (id, session_id, status, input, usage, created_at) VALUES \
+                ('r_gap', 's1', 'completed', '{}', '{}', 't'), \
+                ('r_untagged', 's1', 'completed', '{}', '{}', 't'), \
+                ('r_floor', 's1', 'completed', '{}', '{}', 't'), \
+                ('r_alone', NULL, 'completed', '{}', '{}', 't');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = crate::test_hooks::from_pool(pool);
+        for run in ["r_gap", "r_floor", "r_alone"] {
+            store
+                .tag_run_source(run, 0, &SourceRef::user_input(run, "t"), "t")
+                .await
+                .unwrap();
+        }
+        let floor = SourceRef::session_floor("s1", SourceClassification::Ordinary, "t");
+        store
+            .tag_run_source("r_floor", 1, &floor, "t")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations")
+            .run(store.pool())
+            .await
+            .unwrap();
+
+        for run in ["r_gap", "r_untagged"] {
+            let floors: Vec<_> = store
+                .list_run_source_tags(run)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|tag| tag.source.kind == SourceKind::SessionContext)
+                .collect();
+            let [backfilled] = floors.as_slice() else {
+                panic!("{run}: one session floor expected, got {floors:?}");
+            };
+            assert_eq!(
+                backfilled.source,
+                SourceRef::session_floor(
+                    "s1",
+                    SourceClassification::Unknown,
+                    backfilled.source.created_at.clone()
+                ),
+                "{run}"
+            );
+        }
+        // A floor the kernel wrote is kept as it was; a run without a
+        // session has none to miss.
+        let kept: Vec<_> = store
+            .list_run_source_tags("r_floor")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|tag| tag.source)
+            .filter(|source| source.kind == SourceKind::SessionContext)
+            .collect();
+        assert_eq!(kept, [floor]);
+        assert!(
+            store
+                .list_run_source_tags("r_alone")
+                .await
+                .unwrap()
+                .iter()
+                .all(|tag| tag.source.kind != SourceKind::SessionContext)
+        );
+    }
+
+    /// K1-R3 release review (David 2026-10-29): every run unfinished at the
+    /// upgrade is listed whatever its creation time says; a finished one, or
+    /// one created afterwards, is not.
+    #[tokio::test]
+    async fn runs_unfinished_before_0033_are_listed_and_later_ones_are_not() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.migrations = std::borrow::Cow::Owned(
+            migrator
+                .migrations
+                .iter()
+                .filter(|m| m.version <= 32)
+                .cloned()
+                .collect(),
+        );
+        migrator.run(&pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO runs (id, session_id, status, input, usage, created_at) VALUES \
+                ('r_parked', NULL, 'awaiting_approval', '{}', '{}', '2999-01-01T00:00:00Z'), \
+                ('r_queued', NULL, 'queued', '{}', '{}', 't'), \
+                ('r_running', NULL, 'running', '{}', '{}', 't'), \
+                ('r_completed', NULL, 'completed', '{}', '{}', 't'), \
+                ('r_failed', NULL, 'failed', '{}', '{}', 't'), \
+                ('r_cancelled', NULL, 'cancelled', '{}', '{}', 't');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO runs (id, session_id, status, input, usage, created_at) VALUES \
+                ('r_after', NULL, 'awaiting_approval', '{}', '{}', '2000-01-01T00:00:00Z');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = crate::test_hooks::from_pool(pool);
+        for (run, listed) in [
+            ("r_parked", true),
+            ("r_queued", true),
+            ("r_running", true),
+            ("r_completed", false),
+            ("r_failed", false),
+            ("r_cancelled", false),
+            ("r_after", false),
+        ] {
+            assert_eq!(
+                store.run_predates_tool_result_tagging(run).await.unwrap(),
+                listed,
+                "{run}"
+            );
+        }
+    }
+
+    /// K1-6b.5f-2: the tag and the session's origin are written together or
+    /// not at all, so a later turn never misses an origin whose result was
+    /// tagged.
+    #[tokio::test]
+    async fn a_tool_result_tag_is_not_kept_without_its_session_origin() {
+        let store = store_with_run("run_tools").await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER no_origin BEFORE INSERT ON session_tool_result_origins \
+             BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let tag = SourceRef::tool_result(
+            "tool:shell_exec",
+            "tc_1",
+            SourceClassification::Unknown,
+            "t",
+        );
+        assert!(
+            store
+                .tag_tool_result("run_tools", 1, &tag, Some(("s1", "tool:shell_exec")), "t")
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .list_run_source_tags("run_tools")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn a_schedule_origin_round_trips_and_user_schedules_have_none() {
         let store = Store::open_memory().await.unwrap();
@@ -1088,10 +1491,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        schedule("sch_user", "self-wake")
-            .execute(&pool)
-            .await
-            .unwrap();
+        // Not self-wakes: the prefix is `wake_` exactly (#1278 PR-Daemon F1).
+        for id in ["sch_user", "wakeful", "WAKE_up"] {
+            schedule(id, "self-wake").execute(&pool).await.unwrap();
+        }
         // A self-wake that fired and was then deleted: only its run is left.
         sqlx::query(
             "INSERT INTO runs (id, status, input, usage, created_at, schedule_id) \
@@ -1123,7 +1526,9 @@ mod tests {
             origin("wake_gone").await.unwrap(),
             Some(SourceClassification::Unknown)
         );
-        assert_eq!(origin("sch_user").await.unwrap(), None);
+        for id in ["sch_user", "wakeful", "WAKE_up"] {
+            assert_eq!(origin(id).await.unwrap(), None, "{id}");
+        }
         assert_eq!(
             origin("wake_new").await.unwrap(),
             Some(SourceClassification::Restricted)

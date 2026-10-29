@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import type { IdorisStatusResult } from '../../shared/ipc-types'
+import IdorisPanel from '../components/idoris/IdorisPanel'
 import { translate, useT } from '../i18n'
 import { modelsMessages } from './Models.i18n'
 
@@ -37,7 +37,6 @@ export default function ModelsPage() {
   const t = useT(modelsMessages)
   const [liveModels, setLiveModels] = useState<OmlxModel[]>([])
   const [loading, setLoading] = useState(true)
-  const [idorisStatus, setIdorisStatus] = useState<IdorisStatusResult | null>(null)
 
   useEffect(() => {
     // AUDIT-1: the daemon's real route is `/api/v1/models`, returning
@@ -52,15 +51,9 @@ export default function ModelsPage() {
       })
       .catch(() => {/* oMLX not running */})
       .finally(() => setLoading(false))
-    void window.agent24.idorisStatus().then(setIdorisStatus).catch(() => {
-      setIdorisStatus({ state: 'unavailable', reason: 'unreachable' })
-    })
   }, [])
 
   const hasLive = liveModels.length > 0
-  const idorisModelCount = idorisStatus?.state === 'available'
-    ? idorisStatus.models?.sources.reduce((count, source) => count + source.models.length, 0)
-    : undefined
 
   return (
     <div className="content">
@@ -70,21 +63,7 @@ export default function ModelsPage() {
       </div>
       <div className="page-sub">{t('page.subtitle')}</div>
 
-      <div style={{ margin: '12px 0 16px', padding: '10px 12px', background: 'var(--surface2)', borderRadius: 8, fontSize: 12 }}>
-        <div style={{ fontWeight: 600, marginBottom: 4 }}>{t('idoris.title')}</div>
-        {idorisStatus?.state === 'available' ? (
-          <div data-testid="idoris-status-available">
-            {t('idoris.status', { version: idorisStatus.status.version, components: idorisStatus.status.components, runtimes: idorisStatus.status.runtimes, capacity: t(`capacity.${idorisStatus.status.capacity.state}`) })}
-            {idorisStatus.backends && idorisStatus.models && (
-              <div data-testid="idoris-status-resources" style={{ marginTop: 4, color: 'var(--muted)' }}>
-                {t('idoris.resources', { backends: idorisStatus.backends.length, models: idorisModelCount ?? 0 })}
-              </div>
-            )}
-          </div>
-        ) : (
-          <div style={{ color: 'var(--muted)' }}>{t('idoris.unavailable')}</div>
-        )}
-      </div>
+      <IdorisPanel />
 
       {/* Live oMLX model status */}
       {hasLive && (

@@ -1,0 +1,8 @@
+{ "$comment": "R2.6: doc-gone does not exist at all; the error body equals read.out-of-scope.json except for the echoed request_id and generation.",
+  "op": "knowledge.read",
+  "request": { "protocol_version": 1, "request_id": "01JB2Q8B1C2D3E4F5G6H7J8K9M", "generation": 7,
+    "scope": { "knowledge_base_ids": ["kb-a"] }, "knowledge_id": "doc-gone",
+    "expected_revision": { "source_revision": "src-1", "index_build_id": "ib-1" },
+    "page": { "cursor": null, "limit": 20 }, "max_bytes": 65536 },
+  "response": { "status": 404, "body": { "error": { "code": "not_found", "message": "Resource not found.",
+    "details": { "retryable": false, "request_id": "01JB2Q8B1C2D3E4F5G6H7J8K9M", "generation": 7 } } } } }

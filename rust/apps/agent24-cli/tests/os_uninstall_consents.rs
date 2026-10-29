@@ -51,7 +51,8 @@ fn write_package(home: &Path) -> String {
 fn assert_fails_on_grants(out: &Output) {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "{stderr}");
-    assert!(stderr.contains("grants"), "{stderr}");
+    // CORE-5a wording: "... module consent ...".
+    assert!(stderr.contains("module consent"), "{stderr}");
 }
 
 fn assert_ok(out: &Output) {
@@ -65,18 +66,23 @@ fn assert_ok(out: &Output) {
 #[test]
 fn an_uninstall_whose_grants_cannot_be_revoked_fails_every_time() {
     let home = tmp_home();
+    // CORE-5a: a package that is not installed never opens the store, so the
+    // revocation is only reached for an installed one.
+    let src = write_package(home.path());
+    assert_ok(&agent24(home.path(), &["os", "install", &src]));
     let db = break_store(home.path());
     for _ in 0..2 {
-        assert_fails_on_grants(&agent24(home.path(), &["os", "uninstall", "ghost"]));
+        assert_fails_on_grants(&agent24(home.path(), &["os", "uninstall", "noted"]));
     }
     std::fs::remove_dir(&db).unwrap();
-    assert_ok(&agent24(home.path(), &["os", "uninstall", "ghost"]));
+    assert_ok(&agent24(home.path(), &["os", "uninstall", "noted"]));
 }
 
-/// A removal whose grants are not revoked fails; the next run finds the
-/// files gone and revokes again.
+/// CORE-5a ordering (supersedes the K1-6a-G "remove, then revoke" one): the
+/// revocation comes first, so a removal whose grants cannot be revoked fails
+/// and leaves the files where they are; the next run revokes and removes.
 #[test]
-fn an_uninstall_that_removed_the_files_retries_the_revocation() {
+fn an_uninstall_that_cannot_revoke_keeps_the_files_and_retries() {
     let home = tmp_home();
     let src = write_package(home.path());
     assert_ok(&agent24(home.path(), &["os", "install", &src]));
@@ -88,13 +94,15 @@ fn an_uninstall_that_removed_the_files_retries_the_revocation() {
     }
     break_store(home.path());
     assert_fails_on_grants(&agent24(home.path(), &["os", "uninstall", "noted"]));
-    assert!(!installed.exists());
+    assert!(installed.exists(), "files stay until the revocation lands");
     std::fs::remove_dir(&db).unwrap();
     assert_ok(&agent24(home.path(), &["os", "uninstall", "noted"]));
+    assert!(!installed.exists());
 }
 
-/// An install whose grants are not revoked is undone, so installing again
-/// retries the revocation rather than finding the package already there.
+/// An install whose grants cannot be revoked never lands (CORE-5a: the
+/// revocation precedes `install`), so installing again retries it rather than
+/// finding the package already there.
 #[test]
 fn an_install_whose_grants_cannot_be_revoked_is_undone() {
     let home = tmp_home();
@@ -114,6 +122,8 @@ fn an_install_whose_grants_cannot_be_revoked_is_undone() {
 #[test]
 fn an_uninstall_whose_revocation_cannot_be_written_fails() {
     let home = tmp_home();
+    let src = write_package(home.path());
+    assert_ok(&agent24(home.path(), &["os", "install", &src]));
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let db = home.path().join(".agent24/agent24.db");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
@@ -126,26 +136,37 @@ fn an_uninstall_whose_revocation_cannot_be_written_fails() {
         .await
         .unwrap();
     });
-    assert_fails_on_grants(&agent24(home.path(), &["os", "uninstall", "ghost"]));
+    assert_fails_on_grants(&agent24(home.path(), &["os", "uninstall", "noted"]));
 }
 
-/// No HOME, no store to reach: the uninstall stands, and says any grants
-/// were not revoked rather than nothing (review G3; failing it would break
-/// the `A24_OS_PACKAGES` install the CLI documents for containers).
+/// No HOME, no store to reach: the install and the uninstall stand, and say
+/// any grants were not revoked rather than nothing (ADR-K1-03 §3, review G3;
+/// failing them would break the `A24_OS_PACKAGES` install the CLI documents
+/// for containers).
 #[test]
-fn an_uninstall_without_home_says_there_was_no_store() {
+fn an_install_and_uninstall_without_home_say_there_was_no_store() {
     let home = tmp_home();
+    let src = write_package(home.path());
     let packages = home.path().join("packages");
     std::fs::create_dir(&packages).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_agent24"))
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("TMPDIR", home.path().join("tmp"))
-        .env("A24_OS_PACKAGES", &packages)
-        .args(["os", "uninstall", "ghost"])
-        .output()
-        .unwrap();
-    assert_ok(&out);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("were not revoked"), "{stderr}");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_agent24"))
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("TMPDIR", home.path().join("tmp"))
+            .env("A24_OS_PACKAGES", &packages)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        vec!["os", "install", src.as_str()],
+        vec!["os", "uninstall", "noted"],
+    ] {
+        let out = run(&args);
+        assert_ok(&out);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("were not revoked"), "{args:?}: {stderr}");
+    }
+    assert!(!packages.join("noted").exists());
 }

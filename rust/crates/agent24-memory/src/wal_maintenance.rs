@@ -570,28 +570,71 @@ mod tests {
         sqlx::query("ROLLBACK").execute(&mut *reader).await.unwrap();
         drop(reader);
 
+        let (start, started) = tokio::sync::oneshot::channel();
+        let (committed, commits) = tokio::sync::oneshot::channel();
+        m.after_passive = Some(Box::pin(async move {
+            start.send(()).unwrap();
+            // Keep the checkpoint in flight until the competing writes finish.
+            commits.await.unwrap();
+        }));
         let writer = kv.clone();
         let w = tokio::spawn(async move {
-            let mut worst = Duration::ZERO;
+            started.await.unwrap();
             for i in 0..50 {
-                let t = Instant::now();
                 writer.put("conc", &format!("w{i}"), &i).await.unwrap();
-                worst = worst.max(t.elapsed());
-                tokio::time::sleep(Duration::from_millis(2)).await;
             }
-            worst
+            committed.send(()).unwrap();
         });
-        let out = m.tick(t0 + Duration::from_secs(70)).await.unwrap();
-        let worst = w.await.unwrap();
-        // Concurrent commits may (correctly) make the round Partial; what
-        // matters is that no writer was stalled either way.
+        // This is a deadlock watchdog, not a per-write latency specification.
+        let out = tokio::time::timeout(
+            Duration::from_secs(30),
+            m.tick(t0 + Duration::from_secs(70)),
+        )
+        .await
+        .expect("writes could not finish while the checkpoint was in flight")
+        .unwrap();
+        w.await.unwrap();
+        assert!(matches!(out, TickOutcome::Partial { .. }), "got {out:?}");
+        assert_eq!(m.truncate_attempts(), 0);
+        for i in 0..50 {
+            assert_eq!(
+                kv.fetch::<i32>("conc", &format!("w{i}")).await.unwrap(),
+                Some(i)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_writer_lock_backs_off_without_waiting_for_its_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = store(&dir).await;
+        let t0 = Instant::now();
+        let mut m = kv.wal_maintainer(cfg(), t0).await.unwrap().unwrap();
+        write_batch(&kv, "a", 50).await;
+        m.tick(t0 + Duration::from_secs(1)).await.unwrap();
+
+        // An uncommitted writer does not change data_version. PASSIVE can
+        // backfill, but TRUNCATE must return Busy rather than wait for COMMIT.
+        let mut writer = kv.pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        let out = tokio::time::timeout(
+            Duration::from_secs(30),
+            m.tick(t0 + Duration::from_secs(70)),
+        )
+        .await
+        .expect("checkpoint waited for the open writer")
+        .unwrap();
+        assert!(matches!(out, TickOutcome::Busy { .. }), "got {out:?}");
+        assert_eq!(m.busy_total(), 1);
+        assert_eq!(m.truncate_attempts(), 1);
+        sqlx::query("COMMIT").execute(&mut *writer).await.unwrap();
+        let out = m.tick(t0 + Duration::from_secs(135)).await.unwrap();
         assert!(
-            matches!(out, TickOutcome::Done { .. } | TickOutcome::Partial { .. }),
+            matches!(out, TickOutcome::Done { wal_after: 0, .. }),
             "got {out:?}"
-        );
-        assert!(
-            worst < Duration::from_secs(1),
-            "a write stalled for {worst:?}"
         );
     }
 
