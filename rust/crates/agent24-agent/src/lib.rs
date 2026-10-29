@@ -1741,9 +1741,12 @@ impl RunManager {
         }
 
         // Missing or unreadable origins must not settle a parked tool or
-        // dispatch a sibling such as explore. Failed is legal only from
-        // Running, so the refusal enters Running without RunStarted.
-        if !self.persisted_origins_allow_send(&run_id).await {
+        // dispatch a sibling such as explore, and neither may a run started
+        // before tool results were tagged. Failed is legal only from Running,
+        // so the refusal enters Running without RunStarted.
+        if !self.persisted_origins_allow_send(&run_id).await
+            || !self.resume_sources_proven(&run).await
+        {
             if let Err(err) = self
                 .store
                 .transition_run(&run_id, RunStatus::Running, RunPatch::default())
@@ -2535,6 +2538,42 @@ impl RunManager {
             }
         }
         Some(normalize_for_provider(&shaped))
+    }
+
+    /// Whether a parked run may be resumed under the tags it has (K1-R3
+    /// release review). A build before this library took migration 0031
+    /// tagged no tool result, and 0031 gave a session that had called tools a
+    /// `tool:legacy` origin only for its later runs. A run that build started
+    /// and parked, resumed after the upgrade, would replay those results as
+    /// ordinary and pass the egress gate. So a run created before the
+    /// migration is not resumed; a read failure is the same refusal. Both
+    /// times are whole seconds: a run of the second the migration ran in is
+    /// the new build's, since the old one had to start it, reach a model,
+    /// park and die before the new one could start.
+    async fn resume_sources_proven(&self, run: &Run) -> bool {
+        match self.store.tool_result_tagging_since().await {
+            Ok(Some(since)) => {
+                let created = run.created_at.get(..19).unwrap_or_default();
+                let proven = created >= since.get(..19).unwrap_or_default();
+                if !proven {
+                    tracing::warn!(
+                        run_id = %run.id,
+                        created_at = %run.created_at,
+                        since = %since,
+                        "resume: the run predates tool result tagging"
+                    );
+                }
+                proven
+            }
+            Ok(None) => {
+                tracing::warn!(run_id = %run.id, "resume: migration 0031 is not recorded");
+                false
+            }
+            Err(err) => {
+                tracing::warn!(run_id = %run.id, error = %err, "resume: migration record unreadable");
+                false
+            }
+        }
     }
 
     /// Stored seq order, not message text. A read error is the same refusal
@@ -7299,6 +7338,48 @@ mod approval_tests {
             .unwrap();
         let done = wait_terminal(&h.store, "run_1").await;
         (h, provider, done)
+    }
+
+    /// K1-R3 release review: a run that a build before migration 0031 started
+    /// and parked holds tool results no tag describes. After the upgrade it
+    /// is not resumed, however well its thread's origins are proven.
+    #[tokio::test]
+    async fn a_run_started_before_tool_result_tagging_is_not_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, provider) = resume_harness_with_explorer(dir.path().to_path_buf()).await;
+        let shell_args = serde_json::json!({ "argv": ["/bin/echo", "PRE-UPGRADE"] });
+        let calls = serde_json::json!([{
+            "id": "call_shell",
+            "name": "shell_exec",
+            "arguments": shell_args.to_string()
+        }]);
+        let mut run = run_in("run_1", RunStatus::AwaitingApproval);
+        run.created_at = "2000-01-01T00:00:00Z".to_owned();
+        h.store.insert_run(&run).await.unwrap();
+        seed_proven_parked_thread(&h.store, "run_1", "run echo", calls).await;
+        let user_source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
+        h.store
+            .tag_run_source("run_1", 0, &user_source, &now_iso8601())
+            .await
+            .unwrap();
+        let approval = seed_approval(
+            "apr_1",
+            "run_1",
+            "tc_internal_1",
+            shell_args.as_object().unwrap().clone(),
+        );
+        insert_parked(&h.store, &approval, "shell_exec").await;
+        h.broker
+            .resolve("apr_1", decision("approve", None))
+            .await
+            .unwrap();
+        h.manager
+            .resume_run("run_1".to_owned(), "apr_1".to_owned())
+            .await
+            .unwrap();
+        let done = wait_terminal(&h.store, "run_1").await;
+        assert_resume_refused_before_tools(&h, &provider, &done);
+        assert_shell_did_not_run(&h).await;
     }
 
     fn assert_resume_refused_before_tools(h: &Harness, provider: &RecordingProvider, done: &Run) {

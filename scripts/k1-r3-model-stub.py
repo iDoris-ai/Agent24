@@ -10,7 +10,8 @@ holds (a session run also carries the earlier turns); the step is the number
 of tool-calling assistant turns since that message.
 A "call" step whose tool the request does not offer answers
 "NOT-OFFERED: <name>" instead. A "say" step's text has "{last}" replaced by the
-last tool answer. Past the last step, or with no marker, it says "STUB-DONE".
+last tool answer, and "{all}" by every tool answer of the turn joined by
+" | ". Past the last step, or with no marker, it says "STUB-DONE".
 Every POST body is saved as <dump dir>/<n>.json. GET /v1/models lists one model.
 """
 import json
@@ -56,7 +57,8 @@ def reply(req, n):
                 "function": {"name": name, "arguments": json.dumps(step["call"]["arguments"])},
             }],
         }, "tool_calls")
-    return completion({"role": "assistant", "content": step["say"].replace("{last}", last)}, "stop")
+    every = " | ".join(str(m.get("content")) for m in tools)
+    return completion({"role": "assistant", "content": step["say"].replace("{last}", last).replace("{all}", every)}, "stop")
 
 
 class Handler(BaseHTTPRequestHandler):

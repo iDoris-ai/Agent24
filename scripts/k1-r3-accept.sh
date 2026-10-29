@@ -41,9 +41,28 @@ WORK=$(resolve "${WORK:-${TMPDIR:-/tmp}/k1r3-accept.$$}")
 printf '%s' "$WORK" | grep -q '[^!-~]' && { echo "--work must be an ASCII path without spaces: $WORK" >&2; exit 2; }
 [ -s "$REAL/daemon.json" ] && kill -0 "$(jq -r .pid "$REAL/daemon.json")" 2>/dev/null \
   && { echo "a daemon is running on $REAL: stop it first (agent24 daemon stop)" >&2; exit 2; }
-case "$WORK/" in "$REAL"/*) echo "--work must not be inside $REAL" >&2; exit 2 ;; esac
+# inside DIR TOP: DIR is TOP or below it, both absolute. TOP is cut to its
+# nearest existing ancestor and the missing rest; an existing ancestor of DIR
+# that is that same directory by inode (a firmlink or bind mount names it
+# otherwise) is followed by DIR's rest, compared without case (a
+# case-insensitive volume takes ~/.Agent24 for ~/.agent24). As K1-R2.
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+inside() {
+  local top=$2 missing="" a=$1 rest=""
+  while [ ! -e "$top" ]; do missing="/$(basename "$top")$missing"; top=$(dirname "$top"); done
+  while :; do
+    if [ -e "$a" ] && [ "$a" -ef "$top" ]; then
+      case "$(lower "$rest")/" in "$(lower "$missing")"/*) return 0 ;; esac
+    fi
+    [ "$a" = / ] && return 1
+    rest="/$(basename "$a")$rest"; a=$(dirname "$a")
+  done
+}
+inside "$WORK" "$REAL" && { echo "--work must not be inside $REAL" >&2; exit 2; }
 [ -z "$(ls -A "$WORK" 2>/dev/null)" ] || { echo "--work must be new or empty: $WORK" >&2; exit 2; }
 mkdir -p "$WORK" || exit 2
+# A binary's first run can wait on a system scan for longer than a case allows
+for b in "$OLD/agent24d" "$OLD/agent24" "$NEW/agent24d" "$NEW/agent24"; do "$b" --version > /dev/null 2>&1; done
 for v in $(env | grep -oE '^(A24|AGENT24|OMLX|OLLAMA)_[A-Z0-9_]+'); do unset "$v"; done
 unset DEFAULT_MODEL
 
@@ -76,13 +95,16 @@ steps() {
 {"S-MARKER": [{"call": {"name": "fs_read", "arguments": {"path": "$DATA/workspace/note.txt"}}}, {"say": "S said: {last}"}],
  "L-MARKER": [{"call": {"name": "http_fetch", "arguments": {"url": "https://k1r3.invalid/l"}}}, {"say": "L said: {last}"}],
  "T1-MARKER": [{"call": {"name": "shell_exec", "arguments": {"argv": ["/bin/echo", "T1-SHELL-OUTPUT"]}}},
-               {"call": {"name": "http_fetch", "arguments": {"url": "https://k1r3.invalid/t1"}}}, {"say": "T1 said: {last}"}],
+               {"call": {"name": "http_fetch", "arguments": {"url": "https://k1r3.invalid/t1"}}}, {"say": "T1 said: {all}"}],
  "T2-MARKER": [{"call": {"name": "fs_read", "arguments": {"path": "$DATA/workspace/note.txt"}}},
-               {"call": {"name": "http_fetch", "arguments": {"url": "https://k1r3.invalid/t2"}}}, {"say": "T2 said: {last}"}],
+               {"call": {"name": "http_fetch", "arguments": {"url": "https://k1r3.invalid/t2"}}}, {"say": "T2 said: {all}"}],
  "T3-MARKER": [{"call": {"name": "shell_exec", "arguments": {"argv": ["/bin/echo", "T3-RESUMED"]}}}, {"say": "T3 said: {last}"}],
+ "H-MARKER": [{"call": {"name": "shell_exec", "arguments": {"argv": ["/bin/echo", "H-SHELL-OUTPUT"]}}},
+              {"call": {"name": "fs_write", "arguments": {"path": "$DATA/workspace/h.txt", "content": "h"}}},
+              {"call": {"name": "http_fetch", "arguments": {"url": "https://k1r3.invalid/h"}}}, {"say": "H said: {all}"}],
  "C2-MARKER": [{"call": {"name": "shell_exec", "arguments": {"argv": ["/bin/echo", "C2-NEVER"]}}}, {"say": "C2 said: {last}"}]}
 EOF
-  mkdir -p "$DATA/workspace"; echo NOTE-CONTENT > "$DATA/workspace/note.txt"
+  mkdir -p "$DATA/workspace"; printf NOTE-CONTENT > "$DATA/workspace/note.txt"
 }
 echo '{}' > "$WORK/steps.json"
 LPORT=$(free_port); RPORT=$(free_port)
@@ -204,12 +226,21 @@ api POST /api/v1/runs '{"prompt":"OLD-RUN-MARKER"}'; OLD_RUN=$(jq -r .id "$WORK/
 # A session that called a tool on main, as the desktop's chat or ACP leaves one
 api POST /api/v1/sessions '{"title":"k1r3 accept","channel":"creative"}'; SID=$(jq -r .id "$WORK/r.json")
 OLD_SESSION_RUN=$(new_run "S-MARKER on main" "$SID"); OLD_S=$(run_end "$OLD_SESSION_RUN")
-stop_daemon
+# A run that has taken in a shell's output and waits on its next approval
+# when main's daemon dies; the upgrade follows before that approval expires
+H_RUN=$(new_run "H-MARKER"); wait_status "$H_RUN" awaiting_approval; H_FIRST=$(pending "$H_RUN"); approve "$H_RUN"
+H_PARKED=""
+for _ in $(seq 1 60); do
+  H_PARKED=$(pending "$H_RUN"); [ -n "$H_PARKED" ] && [ "$H_PARKED" != "$H_FIRST" ] && break; H_PARKED=""; sleep 0.5
+done
+# Dies: a `daemon stop` would abort the waiting approval instead
+kill -KILL "$PID"; for _ in $(seq 1 20); do kill -0 "$PID" 2>/dev/null || break; sleep 0.5; done; PID="" BY_CLI=""
 grant node-ref echo "$(iso -3600)"
 grant documents find "$(iso -3600)"
 OLD_VERSION=$(db "SELECT max(version) FROM _sqlx_migrations")
 echo "old library: migration $OLD_VERSION, run $OLD_RUN, session $SID (run $OLD_SESSION_RUN $OLD_S)"
 [ "$OLD_S" = completed ] || { echo "the session run on main did not complete" >&2; exit 1; }
+[ -n "$H_PARKED" ] || { echo "the run $H_RUN did not park on its second approval on main" >&2; exit 1; }
 rsync -a --exclude '*.sock' "$WORK/old/" "$WORK/up/"
 
 echo "== 2. upgrade with the release ($NEW)"
@@ -220,6 +251,9 @@ steps
 cli "$NEW" daemon status > "$WORK/u2.out" 2>&1; RC=$?
 check U2 "agent24 daemon status after the upgrade" "$( [ $RC = 0 ] && grep -q '^running · ' "$WORK/u2.out" && echo ok || echo fail)" "exit $RC; $(head -1 "$WORK/u2.out")"
 # Every migration this checkout carries past main's
+# R1 comes first: the approval main left must not expire before it is answered
+approve "$H_RUN"; H_END=$(run_end "$H_RUN"); H_CODE=$(jq -r '.error.code // empty' "$WORK/r.json"); H_OUT=$(output "$H_RUN")
+check R1 "a run main parked after a shell_exec is not resumed after the upgrade" "$( [ "$H_END/$H_CODE" = failed/source_unproven ] && case "$H_OUT" in (*"$DNS"*) echo fail ;; (*) echo ok ;; esac || echo fail)" "$H_END ${H_CODE:-}; $(echo "$H_OUT" | cut -c1-70)"
 versions() { ls "$1" | grep -oE '^[0-9]+' | sed 's/^0*//' | sort -nu; }
 WANT=$(versions "$REPO/rust/crates/agent24-store/migrations" | awk -v o="$OLD_VERSION" '$1 > o' | paste -sd, -)
 APPLIED=$(db "SELECT group_concat(version) FROM (SELECT version FROM _sqlx_migrations WHERE version > $OLD_VERSION AND success = 1 ORDER BY version)")
@@ -239,20 +273,27 @@ check L2 "a run outside that session is not restricted" "$(case "$F_OUT" in (*"$
 T1=$(new_run "T1-MARKER"); T1_END=$(after_approval "$T1"); T1_OUT=$(output "$T1")
 check T1 "after an approved shell_exec, the run's http_fetch is refused" "$( [ "$T1_END" = completed ] && case "$T1_OUT" in (*"$DENIED"*) echo ok ;; (*) echo fail ;; esac || echo fail)" "$T1_END; $(echo "$T1_OUT" | cut -c1-80)"
 T2=$(new_run "T2-MARKER"); T2_END=$(run_end "$T2"); T2_OUT=$(output "$T2")
-check T2 "after an fs_read, the run's http_fetch passes the gate (fails at DNS)" "$( [ "$T2_END" = completed ] && case "$T2_OUT" in (*"$DNS"*) echo ok ;; (*) echo fail ;; esac || echo fail)" "$T2_END; $(echo "$T2_OUT" | cut -c1-80)"
+check T2 "after an fs_read that read the file, the run's http_fetch passes the gate (fails at DNS)" "$( [ "$T2_END" = completed ] && case "$T2_OUT" in ("T2 said: NOTE-CONTENT | "*"$DNS"*) echo ok ;; (*) echo fail ;; esac || echo fail)" "$T2_END; $(echo "$T2_OUT" | cut -c1-80)"
 cli "$NEW" run peers --json > "$WORK/p1.json" 2>&1
 P=$(jq -r --arg a "$T2" --arg b "$T1" '[(.runs[] | select(.id == $a) | .withheld), (.runs[] | select(.id == $b) | .withheld)] | map(tostring) | join("/")' "$WORK/p1.json" 2>/dev/null)
-check P1 "agent24 run peers: the fs_read run is shared, the shell_exec one withheld" "$(both "$(is "$P" false/true)" "$(lacks "$WORK/p1.json" T1-SHELL-OUTPUT)")" "T2/T1 withheld: ${P:-?}"
+# The shared one with its own prompt and output, the withheld one with nothing of its own
+SHARED=$(jq -e --arg a "$T2" --arg b "$T1" '(.runs[] | select(.id == $a) | .prompt == "T2-MARKER" and (.output.text | contains("NOTE-CONTENT")))
+  and (.runs[] | select(.id == $b) | .prompt == null and .output == null)' "$WORK/p1.json" > /dev/null 2>&1 && echo ok || echo fail)
+check P1 "agent24 run peers: the fs_read run is shared, the shell_exec one withheld" "$(both "$(is "$P/$SHARED" false/true/ok)" "$(lacks "$WORK/p1.json" T1-SHELL-OUTPUT)")" "T2/T1 withheld: ${P:-?}; contents as expected: $SHARED"
 
 cli "$NEW" schedule create --name k1r3 --prompt C1-PROMPT --every 3600 > "$WORK/c1.create" 2>&1; R1=$?
 SCH=$(sed -n '1s/^\(sch_[A-Za-z0-9]*\) .*/\1/p' "$WORK/c1.create")
 cli "$NEW" schedule update "$SCH" --prompt C1-CHANGED > "$WORK/c1.update" 2>&1; R2=$?
 cli "$NEW" schedules run-now "$SCH" > "$WORK/c1.now" 2>&1; R3=$?; C1_RUN=$(sed -n 's/^started //p' "$WORK/c1.now")
 cli "$NEW" schedule delete "$SCH" > "$WORK/c1.delete" 2>&1; R4=$?
-cli "$NEW" schedule list > "$WORK/c1.list" 2>&1
-C1=$( [ "$R1$R2$R3$R4" = 0000 ] && [ -n "$SCH" ] && [ -n "$C1_RUN" ] && echo ok || echo fail)
-C1=$(both "$C1" "$(both "$(has "$WORK/c1.update" C1-CHANGED)" "$(lacks "$WORK/c1.list" "$SCH")")")
-check C1 "agent24 schedule create / update / run-now / delete" "$C1" "exits $R1$R2$R3$R4; $SCH; run ${C1_RUN:-none}"
+cli "$NEW" schedule list > "$WORK/c1.list" 2>&1; R5=$?
+# The run run-now started: of this schedule, with the changed prompt, and it ended
+C1_END=$( [ -n "$C1_RUN" ] && run_end "$C1_RUN")
+cli "$NEW" run show "$C1_RUN" --json > "$WORK/c1.run" 2>&1
+FIRED=$(jq -e --arg s "$SCH" '.schedule_id == $s and .input.prompt == "C1-CHANGED"' "$WORK/c1.run" > /dev/null 2>&1 && echo ok || echo fail)
+C1=$( [ "$R1$R2$R3$R4$R5" = 00000 ] && [ -n "$SCH" ] && [ "$C1_END" = completed ] && echo ok || echo fail)
+C1=$(both "$C1" "$(both "$FIRED" "$(both "$(has "$WORK/c1.update" C1-CHANGED)" "$(lacks "$WORK/c1.list" "$SCH")")")")
+check C1 "agent24 schedule create / update / run-now / delete" "$C1" "exits $R1$R2$R3$R4$R5; $SCH; run ${C1_RUN:-none} ${C1_END:-} of it with the new prompt: $FIRED"
 
 C2=$(new_run "C2-MARKER"); wait_status "$C2" awaiting_approval
 cli "$NEW" run cancel "$C2" > "$WORK/c2.out" 2>&1; RC=$?
@@ -272,7 +313,7 @@ if start_cli "$NEW" "$WORK/up" A24_MODULE_TOOL_GRANTS=yes; then R=fail; stop_dae
 check C4 "agent24 daemon start says why the daemon refused to start" "$R" "$(head -1 "$WORK/up.start.out" | cut -c1-100)"
 
 N=$(ls "$WORK/remote" | wc -l | tr -d ' ')
-check Z2 "the shell_exec output never reached the remote tier" "$( [ -z "$(grep -rl T1-SHELL-OUTPUT "$WORK/remote")" ] && echo ok || echo fail)" "$N request(s) to the remote stub, $(ls "$WORK/local" | wc -l | tr -d ' ') to the local one"
+check Z2 "no shell_exec output ever reached the remote tier" "$( [ -z "$(grep -rlE 'T1-SHELL-OUTPUT|H-SHELL-OUTPUT' "$WORK/remote")" ] && echo ok || echo fail)" "$N request(s) to the remote stub, $(ls "$WORK/local" | wc -l | tr -d ' ') to the local one"
 
 echo "== 3. no way back"
 dump() { sqlite3 "$WORK/down/agent24.db" .dump | shasum; }

@@ -574,6 +574,20 @@ impl Store {
         .await?)
     }
 
+    /// When this library took migration 0031 (K1-6b.5f-2), as
+    /// `YYYY-MM-DDTHH:MM:SSZ`: the upgrade to a build that tags every tool
+    /// result. A run created before it was started by a build that tagged
+    /// none. `None` if the migration is not recorded as applied.
+    pub async fn tool_result_tagging_since(&self) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', installed_on) FROM _sqlx_migrations \
+             WHERE version = 31 AND success = 1",
+        )
+        .fetch_optional(self.pool())
+        .await?
+        .flatten())
+    }
+
     /// Every tag persisted against a run, in `(seq, source_id)` order.
     /// Empty for a run with none — callers needing the fail-closed default
     /// use [`Store::run_policy_snapshot`] instead of treating an empty
