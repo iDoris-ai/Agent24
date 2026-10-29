@@ -51,11 +51,25 @@ const USAGE_POLL_MS = 5000
  *  visible reason. */
 const SPEAK_TEXT_MAX_LENGTH = 2000
 
-const SPEAK_LANGS: { value: 'zh-CN' | 'en-US' | 'th-TH'; label: 'speak.langChinese' | 'speak.langEnglish' | 'speak.langThai' }[] = [
-  { value: 'zh-CN', label: 'speak.langChinese' },
-  { value: 'en-US', label: 'speak.langEnglish' },
-  { value: 'th-TH', label: 'speak.langThai' },
+type SpeakLang = 'zh-CN' | 'en-US' | 'th-TH'
+const SPEAK_LANGS: { value: SpeakLang; name: string; label: 'speak.langChinese' | 'speak.langEnglish' | 'speak.langThai'; hint: 'speak.suggestChinese' | 'speak.suggestEnglish' | 'speak.suggestThai' }[] = [
+  { value: 'zh-CN', name: 'Chinese', label: 'speak.langChinese', hint: 'speak.suggestChinese' },
+  { value: 'en-US', name: 'English', label: 'speak.langEnglish', hint: 'speak.suggestEnglish' },
+  { value: 'th-TH', name: 'Thai', label: 'speak.langThai', hint: 'speak.suggestThai' },
 ]
+
+function detectSpeakLanguage(text: string): typeof SPEAK_LANGS[number] | null {
+  const letters = text.match(/\p{L}/gu) ?? []
+  // Ignore punctuation, spaces and digits; avoid guessing on short or mixed text.
+  if (letters.length < 6) return null
+  const counts: Record<SpeakLang, number> = { 'zh-CN': 0, 'en-US': 0, 'th-TH': 0 }
+  for (const letter of letters) {
+    if (/\p{Script=Han}/u.test(letter)) counts['zh-CN']++
+    else if (/\p{Script=Thai}/u.test(letter)) counts['th-TH']++
+    else if (/\p{Script=Latin}/u.test(letter)) counts['en-US']++
+  }
+  return SPEAK_LANGS.find(({ value }) => counts[value] === letters.length) ?? null
+}
 
 function isAttached(attach: AttachedView | null): boolean {
   return attach?.attach_status === 'attached'
@@ -172,12 +186,21 @@ function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Elemen
   if (type === 'speech') {
     const stateLabel = labelFor({ started: t('speech.started'), completed: t('speech.completed'), stopped: t('speech.stopped'), failed: t('speech.failed') }, payload.state, t('speech.unknown'))
     const reason = safeString(payload.reason)
+    const ttsHint = payload.state === 'failed'
+      ? labelFor({
+        tts_unavailable: t('speech.ttsUnavailable'),
+        sidecar_not_running: t('speech.ttsNotRunning'),
+        start_failed: t('speech.ttsStartFailed'),
+        start_timeout: t('speech.ttsStartTimeout'),
+      }, reason, payload.code === 'tts_unavailable' ? t('speech.ttsUnavailable') : '')
+      : ''
     return (
       <div className="voice-row voice-row-speech">
         <span className="voice-row-badge">{t('event.speech')}</span>
         <span className="voice-row-text">
           {stateLabel}
           {reason && ` · ${reason}`}
+          {ttsHint && <span style={{ display: 'block', color: 'var(--muted)', marginTop: 4 }}>{ttsHint}</span>}
         </span>
       </div>
     )
@@ -292,7 +315,9 @@ function VoicePanelInner(): JSX.Element {
   const [events, setEvents] = useState<AgentEarEventEnvelope[]>([])
   const [modelCalls, setModelCalls] = useState<ModelCallEnvelope[]>([])
   const [speakText, setSpeakText] = useState('')
-  const [speakLang, setSpeakLang] = useState<'zh-CN' | 'en-US' | 'th-TH'>('zh-CN')
+  const [speakLang, setSpeakLang] = useState<SpeakLang>('zh-CN')
+  const detectedLanguage = detectSpeakLanguage(speakText)
+  const languageSuggestion = detectedLanguage?.value !== speakLang ? detectedLanguage : null
   const [commandError, setCommandError] = useState<string | null>(null)
   const [lastCommandId, setLastCommandId] = useState<string | null>(null)
 
@@ -485,11 +510,14 @@ function VoicePanelInner(): JSX.Element {
         <div style={{ color: '#e05050', fontSize: 12, marginBottom: 8 }}>{commandError}</div>
       )}
 
-      <div style={{ display: 'flex', gap: 6, marginBottom: 12, alignItems: 'center' }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12, alignItems: 'center' }}>
         <select
           aria-label={t('speak.language')}
           value={speakLang}
-          onChange={(e) => setSpeakLang(e.target.value as typeof speakLang)}
+          onChange={(e) => {
+            const language = SPEAK_LANGS.find(({ value }) => value === e.target.value)
+            if (language) setSpeakLang(language.value)
+          }}
           style={{ fontSize: 12 }}
           disabled={!attached}
         >
@@ -499,6 +527,7 @@ function VoicePanelInner(): JSX.Element {
         </select>
         <input
           aria-label={t('speak.label')}
+          aria-describedby={languageSuggestion ? 'voice-language-hint' : undefined}
           placeholder={t('speak.placeholder')}
           value={speakText}
           maxLength={SPEAK_TEXT_MAX_LENGTH}
@@ -506,6 +535,7 @@ function VoicePanelInner(): JSX.Element {
           disabled={!attached}
           style={{
             flex: 1,
+            minWidth: 160,
             fontSize: 12,
             padding: '4px 8px',
             background: 'var(--surface2)',
@@ -530,6 +560,14 @@ function VoicePanelInner(): JSX.Element {
         >
           {t('speak.stop')}
         </button>
+        {languageSuggestion && (
+          <span id="voice-language-hint" role="status" style={{ flexBasis: '100%', fontSize: 12, color: 'var(--muted)' }}>
+            {t(languageSuggestion.hint)}{' '}
+            <button type="button" className="btn" style={{ fontSize: 11 }} disabled={!attached} onClick={() => setSpeakLang(languageSuggestion.value)}>
+              {t('speak.switchLanguage', { language: languageSuggestion.name })}
+            </button>
+          </span>
+        )}
       </div>
 
       {lastCommandId && (

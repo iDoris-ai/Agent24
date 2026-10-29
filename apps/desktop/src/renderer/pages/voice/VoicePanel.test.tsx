@@ -242,6 +242,106 @@ describe('VoicePanel — speak / stop commands', () => {
   })
 })
 
+describe('VoicePanel — speak hints (A-2b)', () => {
+  beforeEach(() => {
+    setLocale('zh')
+    attachModules = [attached()]
+  })
+
+  it.each([
+    [{ reason: 'tts_unavailable' }, 'AgentEar 的语音合成服务（TTS）暂不可用。可以在 AgentEar 里切到对话模式让它自动启动，或者手动启动 TTS 后重试。'],
+    [{ reason: 'sidecar_not_running' }, 'AgentEar 的语音合成服务（TTS）没有运行。可以在 AgentEar 里切到对话模式让它自动启动，或者手动启动 TTS 后重试。'],
+    [{ reason: 'start_failed' }, 'AgentEar 的语音合成服务（TTS）启动失败。请在 AgentEar 里检查 TTS 的错误信息，手动启动成功后重试。'],
+    [{ reason: 'start_timeout' }, 'AgentEar 的语音合成服务（TTS）启动超时。请稍等片刻后重试；如果仍不可用，请在 AgentEar 里检查 TTS 的运行状态。'],
+    [{ code: 'tts_unavailable', reason: 'start_failed' }, 'AgentEar 的语音合成服务（TTS）启动失败。请在 AgentEar 里检查 TTS 的错误信息，手动启动成功后重试。'],
+    [{ code: 'tts_unavailable' }, 'AgentEar 的语音合成服务（TTS）暂不可用。可以在 AgentEar 里切到对话模式让它自动启动，或者手动启动 TTS 后重试。'],
+    [{ code: 'tts_unavailable', reason: 'future_reason' }, 'AgentEar 的语音合成服务（TTS）暂不可用。可以在 AgentEar 里切到对话模式让它自动启动，或者手动启动 TTS 后重试。'],
+    [{ code: 'tts_unavailable', reason: {} }, 'AgentEar 的语音合成服务（TTS）暂不可用。可以在 AgentEar 里切到对话模式让它自动启动，或者手动启动 TTS 后重试。'],
+  ])('explains a TTS failure with payload %j', async (details, hint) => {
+    snapshotEvents = [{ schema: 'agentear.event/1', event_id: 'tts', session_id: 's', seq: 1, type: 'speech', payload: { state: 'failed', ...details } }]
+    mount()
+    render(<VoicePanel />)
+    expect(await screen.findByText(hint)).toBeInTheDocument()
+    expect(screen.getByText(/^播放失败/)).toBeInTheDocument()
+  })
+
+  it.each([
+    { state: 'completed', reason: 'tts_unavailable' },
+    { state: 'failed', reason: 'other_failure' },
+  ])('does not show TTS advice for an unrelated speech event %j', async (payload) => {
+    snapshotEvents = [{ schema: 'agentear.event/1', event_id: 'other', session_id: 's', seq: 1, type: 'speech', payload }]
+    mount()
+    render(<VoicePanel />)
+    await screen.findByText(/other_failure|tts_unavailable/)
+    expect(screen.queryByText(/语音合成服务/)).not.toBeInTheDocument()
+  })
+
+  it('suggests English without changing the choice, then sends English only after a click', async () => {
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(screen.getByLabelText('让它说')).toBeEnabled())
+    fireEvent.change(screen.getByLabelText('让它说'), { target: { value: 'Hello, this is a voice test.' } })
+    expect(screen.getByText('文字看起来是英文，建议选 English')).toBeInTheDocument()
+    expect(screen.getByRole('combobox')).toHaveValue('zh-CN')
+    fireEvent.click(screen.getByRole('button', { name: '切换到 English' }))
+    expect(screen.getByRole('combobox')).toHaveValue('en-US')
+    expect(screen.queryByText(/文字看起来/)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '让它说' }))
+    await waitFor(() => expect(posted).toHaveLength(1))
+    expect(posted[0]?.body).toMatchObject({ payload: { text: 'Hello, this is a voice test.', lang: 'en-US' } })
+  })
+
+  it.each([
+    ['zh-CN', '这是一段用来测试的中文文字'],
+    ['zh-CN', 'Hello 你好世界，这是一段 mixed text'],
+    ['zh-CN', 'This is mostly English but 中文'],
+    ['zh-CN', 'This is a much longer English sentence with just one Chinese character 中'],
+    ['zh-CN', 'สวัสดีวันนี้อากาศดีมาก Hello'],
+    ['zh-CN', 'hi!'],
+    ['zh-CN', '12345 !!! 😊'],
+    ['en-US', 'Hello, this is a voice test.'],
+    ['th-TH', 'สวัสดีวันนี้อากาศดีมาก'],
+  ])('does not suggest a language for %s and %s', async (lang, text) => {
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(screen.getByLabelText('让它说')).toBeEnabled())
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: lang } })
+    fireEvent.change(screen.getByLabelText('让它说'), { target: { value: text } })
+    expect(screen.queryByText(/文字看起来/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /切换到/ })).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['en-US', '这是一段用来测试的中文文字', 'Chinese', 'zh-CN'],
+    ['th-TH', '这是一段用来测试的中文文字', 'Chinese', 'zh-CN'],
+    ['zh-CN', 'สวัสดีวันนี้อากาศดีมาก', 'Thai', 'th-TH'],
+  ])('offers the detected language for %s and %s', async (lang, text, label, expected) => {
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(screen.getByLabelText('让它说')).toBeEnabled())
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: lang } })
+    fireEvent.change(screen.getByLabelText('让它说'), { target: { value: text } })
+    fireEvent.click(screen.getByRole('button', { name: `切换到 ${label}` }))
+    expect(screen.getByRole('combobox')).toHaveValue(expected)
+  })
+
+  it.each<{ locale: Locale; hint: string; action: string; tts: RegExp }>([
+    { locale: 'zh', hint: '文字看起来是英文，建议选 English', action: '切换到 English', tts: /语音合成服务（TTS）/ },
+    { locale: 'en', hint: 'This text looks like English. Try English.', action: 'Switch to English', tts: /text-to-speech service \(TTS\)/ },
+    { locale: 'th', hint: 'ข้อความนี้ดูเหมือนภาษาอังกฤษ แนะนำให้เลือก English', action: 'เปลี่ยนเป็น English', tts: /บริการแปลงข้อความเป็นเสียง \(TTS\)/ },
+  ])('renders localized advice and actions in $locale', async ({ locale, hint, action, tts }) => {
+    setLocale(locale)
+    snapshotEvents = ['tts_unavailable', 'sidecar_not_running', 'start_failed', 'start_timeout'].map((reason, seq) => ({ schema: 'agentear.event/1', event_id: `tts-${seq}`, session_id: 's', seq, type: 'speech', payload: { state: 'failed', reason } }))
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(screen.getAllByText(tts)).toHaveLength(4))
+    expect(new Set(screen.getAllByText(tts).map((node) => node.textContent)).size).toBe(4)
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Hello, this is a voice test.' } })
+    expect(screen.getByText(hint)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: action })).toBeInTheDocument()
+  })
+})
+
 describe('VoicePanel — live event display', () => {
   beforeEach(() => { setLocale('zh') })
   beforeEach(() => {
