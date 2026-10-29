@@ -7,8 +7,7 @@ import type { IpcGuard } from './guard'
 export function registerCliTool(options: {
   guard: IpcGuard; executable: string; resources: string; packaged: boolean; changed: () => void; openSettings: () => void
 }) {
-  let status: CliToolStatus = { state: 'unavailable', path: null, version: null, bundledVersion: null }
-  let pending: Promise<CliInstallResult> | null = null
+  let status: CliToolStatus = { state: 'unavailable', path: null, version: null, bundledVersion: null, paths: [] }
   let checking: Promise<CliToolStatus> | null = null
   function refresh(): Promise<CliToolStatus> {
     checking ??= cliToolStatus(options.executable, options.resources, options.packaged)
@@ -25,22 +24,26 @@ export function registerCliTool(options: {
     noArgs(args)
     return refresh()
   }))
-  ipcMain.handle(IpcChannels.CliToolInstall, options.guard((_event, ...args: unknown[]) => {
-    noArgs(args)
-    pending ??= installBundledCli({
-      ...options,
-      confirm: async () => (await dialog.showMessageBox({
-        type: 'warning', title: mt('cli.confirmTitle'), message: mt('cli.confirmTitle'), detail: mt('cli.confirmDetail'),
-        buttons: [mt('dialog.cancel'), mt('cli.replace')], defaultId: 0, cancelId: 0, noLink: true,
-      })).response === 1,
-    }).then(async (result) => {
-      // Drain an older status probe before starting the post-install one.
-      await checking
-      await refresh()
-      return result
-    }).finally(() => { pending = null })
-    return pending
-  }))
+  for (const channel of [IpcChannels.CliToolInstall, IpcChannels.CliToolRepairUser]) {
+    let pending: Promise<CliInstallResult> | null = null
+    ipcMain.handle(channel, options.guard((_event, ...args: unknown[]) => {
+      noArgs(args)
+      pending ??= installBundledCli({
+        ...options,
+        userOnly: channel === IpcChannels.CliToolRepairUser,
+        confirm: async () => (await dialog.showMessageBox({
+          type: 'warning', title: mt('cli.confirmTitle'), message: mt('cli.confirmTitle'), detail: mt('cli.confirmDetail'),
+          buttons: [mt('dialog.cancel'), mt('cli.replace')], defaultId: 0, cancelId: 0, noLink: true,
+        })).response === 1,
+      }).then(async (result) => {
+        // Drain an older status probe before starting the post-install one.
+        await checking
+        await refresh()
+        return result
+      }).finally(() => { pending = null })
+      return pending
+    }))
+  }
   return {
     refresh,
     status: () => status,

@@ -17,15 +17,18 @@
 // because it was never this component's state to lose — this component
 // just pulls a snapshot on mount and mirrors new arrivals from then on.
 
-import { Component, useEffect, useState, type ErrorInfo, type ReactNode } from 'react'
+import { Component, useCallback, useEffect, useRef, useState, type ErrorInfo, type ReactNode } from 'react'
 import { truncateForDisplay } from './display'
 import {
+  AgentEarAdminError,
   getAgentEarAttachment,
   getAgentEarUsage,
   isBuiltinProposal,
   sendSpeak,
   sendStopPlayback,
+  setAgentEarEnabled,
   totalCalls,
+  unpairAgentEar,
   type AgentEarEventEnvelope,
   type AttachedView,
   type ByServedUsage,
@@ -33,7 +36,7 @@ import {
 import type { ModelCallEnvelope } from '../../../shared/ipc-types'
 import { formatMs } from '../../../shared/format-latency'
 import { MAX_EVENTS_IN_MEMORY, pushCapped } from '../../../shared/agentearSequencer'
-import { translate, useT } from '../../i18n'
+import { translate, useLocale, useT } from '../../i18n'
 import { voicePanelMessages } from './VoicePanel.i18n'
 
 /** Mirrors main/model-call-log.ts's own cap — the main process never sends
@@ -51,11 +54,39 @@ const USAGE_POLL_MS = 5000
  *  visible reason. */
 const SPEAK_TEXT_MAX_LENGTH = 2000
 
-const SPEAK_LANGS: { value: 'zh-CN' | 'en-US' | 'th-TH'; label: 'speak.langChinese' | 'speak.langEnglish' | 'speak.langThai' }[] = [
-  { value: 'zh-CN', label: 'speak.langChinese' },
-  { value: 'en-US', label: 'speak.langEnglish' },
-  { value: 'th-TH', label: 'speak.langThai' },
+type SpeakLang = 'zh-CN' | 'en-US' | 'th-TH'
+const SPEAK_LANGS: { value: SpeakLang; name: string; label: 'speak.langChinese' | 'speak.langEnglish' | 'speak.langThai'; hint: 'speak.suggestChinese' | 'speak.suggestEnglish' | 'speak.suggestThai' }[] = [
+  { value: 'zh-CN', name: 'Chinese', label: 'speak.langChinese', hint: 'speak.suggestChinese' },
+  { value: 'en-US', name: 'English', label: 'speak.langEnglish', hint: 'speak.suggestEnglish' },
+  { value: 'th-TH', name: 'Thai', label: 'speak.langThai', hint: 'speak.suggestThai' },
 ]
+
+function detectSpeakLanguage(text: string): typeof SPEAK_LANGS[number] | null {
+  const letters = text.match(/\p{L}/gu) ?? []
+  // Ignore punctuation, spaces and digits; avoid guessing on short or mixed text.
+  if (letters.length < 6) return null
+  const counts: Record<SpeakLang, number> = { 'zh-CN': 0, 'en-US': 0, 'th-TH': 0 }
+  for (const letter of letters) {
+    if (/\p{Script=Han}/u.test(letter)) counts['zh-CN']++
+    else if (/\p{Script=Thai}/u.test(letter)) counts['th-TH']++
+    else if (/\p{Script=Latin}/u.test(letter)) counts['en-US']++
+  }
+  return SPEAK_LANGS.find(({ value }) => counts[value] === letters.length) ?? null
+}
+
+type AdminErrorKey = 'admin.err.not_paired' | 'admin.err.busy' | 'admin.err.forbidden' | 'admin.err.backend' | 'admin.err.daemon'
+
+/** A-3: which translated message an admin failure shows, by stable code. */
+function adminErrorKey(e: unknown): AdminErrorKey {
+  const code = e instanceof AgentEarAdminError ? e.code : 'daemon_error'
+  switch (code) {
+    case 'not_paired': return 'admin.err.not_paired'
+    case 'busy': return 'admin.err.busy'
+    case 'forbidden': return 'admin.err.forbidden'
+    case 'backend_not_ready': case 'timeout': case 'proxy_failed': return 'admin.err.backend'
+    default: return 'admin.err.daemon'
+  }
+}
 
 function isAttached(attach: AttachedView | null): boolean {
   return attach?.attach_status === 'attached'
@@ -172,12 +203,21 @@ function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Elemen
   if (type === 'speech') {
     const stateLabel = labelFor({ started: t('speech.started'), completed: t('speech.completed'), stopped: t('speech.stopped'), failed: t('speech.failed') }, payload.state, t('speech.unknown'))
     const reason = safeString(payload.reason)
+    const ttsHint = payload.state === 'failed'
+      ? labelFor({
+        tts_unavailable: t('speech.ttsUnavailable'),
+        sidecar_not_running: t('speech.ttsNotRunning'),
+        start_failed: t('speech.ttsStartFailed'),
+        start_timeout: t('speech.ttsStartTimeout'),
+      }, reason, payload.code === 'tts_unavailable' ? t('speech.ttsUnavailable') : '')
+      : ''
     return (
       <div className="voice-row voice-row-speech">
         <span className="voice-row-badge">{t('event.speech')}</span>
         <span className="voice-row-text">
           {stateLabel}
           {reason && ` · ${reason}`}
+          {ttsHint && <span style={{ display: 'block', color: 'var(--muted)', marginTop: 4 }}>{ttsHint}</span>}
         </span>
       </div>
     )
@@ -284,6 +324,7 @@ export default function VoicePanel(): JSX.Element {
 
 function VoicePanelInner(): JSX.Element {
   const t = useT(voicePanelMessages)
+  const locale = useLocale()
   const [attach, setAttach] = useState<AttachedView | null>(null)
   const [attachChecked, setAttachChecked] = useState(false)
   const [attachError, setAttachError] = useState<string | null>(null)
@@ -291,9 +332,21 @@ function VoicePanelInner(): JSX.Element {
   const [events, setEvents] = useState<AgentEarEventEnvelope[]>([])
   const [modelCalls, setModelCalls] = useState<ModelCallEnvelope[]>([])
   const [speakText, setSpeakText] = useState('')
-  const [speakLang, setSpeakLang] = useState<'zh-CN' | 'en-US' | 'th-TH'>('zh-CN')
+  const [speakLang, setSpeakLang] = useState<SpeakLang>('zh-CN')
+  const detectedLanguage = detectSpeakLanguage(speakText)
+  const languageSuggestion = detectedLanguage?.value !== speakLang ? detectedLanguage : null
   const [commandError, setCommandError] = useState<string | null>(null)
   const [lastCommandId, setLastCommandId] = useState<string | null>(null)
+  const [adminBusy, setAdminBusy] = useState(false)
+  const [adminError, setAdminError] = useState<AdminErrorKey | null>(null)
+  // A synchronous guard on top of `adminBusy`: two clicks in the same frame
+  // both see the old state, the ref does not.
+  const adminInFlight = useRef(false)
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
 
   // Review M5: sequencing/de-dup/the 200-cap all happen in the main process
   // now (main/agentear-log.ts) — this component just pulls whatever the log
@@ -340,30 +393,26 @@ function VoicePanelInner(): JSX.Element {
     }
   }, [])
 
-  // Attach status poll (GET /api/v1/attached).
-  useEffect(() => {
-    let cancelled = false
-    const poll = () => {
-      getAgentEarAttachment()
-        .then((view) => {
-          if (cancelled) return
-          setAttach(view)
-          setAttachError(null)
-          setAttachChecked(true)
-        })
-        .catch((e: unknown) => {
-          if (cancelled) return
-          setAttachError(e instanceof Error ? e.message : String(e))
-          setAttachChecked(true)
-        })
+  // Attach status poll (GET /api/v1/attached). Also called right after an
+  // A-3 disable/enable/unpair so the panel does not wait for the next tick.
+  const refreshAttach = useCallback(async (): Promise<void> => {
+    try {
+      const view = await getAgentEarAttachment()
+      if (!mounted.current) return
+      setAttach(view)
+      setAttachError(null)
+    } catch (e: unknown) {
+      if (!mounted.current) return
+      setAttachError(e instanceof Error ? e.message : String(e))
     }
-    poll()
-    const timer = setInterval(poll, ATTACH_POLL_MS)
-    return () => {
-      cancelled = true
-      clearInterval(timer)
-    }
+    setAttachChecked(true)
   }, [])
+
+  useEffect(() => {
+    void refreshAttach()
+    const timer = setInterval(() => void refreshAttach(), ATTACH_POLL_MS)
+    return () => clearInterval(timer)
+  }, [refreshAttach])
 
   // Tier usage poll (GET /api/v1/usage?module=agentear).
   useEffect(() => {
@@ -410,6 +459,25 @@ function VoicePanelInner(): JSX.Element {
     }
   }
 
+  // A-3: main shows the native confirmation and enforces one request at a
+  // time; the panel just disables its buttons meanwhile and refreshes after.
+  const runAdmin = async (op: () => Promise<'done' | 'cancelled'>): Promise<void> => {
+    if (adminInFlight.current) return
+    adminInFlight.current = true
+    setAdminBusy(true)
+    setAdminError(null)
+    try {
+      await op()
+    } catch (e: unknown) {
+      if (mounted.current) setAdminError(adminErrorKey(e))
+    } finally {
+      await refreshAttach()
+      adminInFlight.current = false
+      if (mounted.current) setAdminBusy(false)
+    }
+  }
+  const attachDisabled = attach?.attach_status === 'disabled'
+
   const statusLabel = !attachChecked
     ? t('attachment.checking')
     : attach === null
@@ -427,20 +495,68 @@ function VoicePanelInner(): JSX.Element {
         {t('subtitle', { count: MAX_EVENTS_IN_MEMORY })}
       </div>
 
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-        <span
-          className={`status-dot ${attached ? 'online' : attach?.attach_status === 'disabled' ? '' : 'offline'}`}
-        />
-        <span style={{ fontSize: 12 }}>{t('attachment.label', { status: statusLabel })}</span>
-        {attach?.generation !== undefined && (
-          <span style={{ fontSize: 11, color: 'var(--muted)' }}>{t('attachment.generation', { value: attach.generation })}</span>
-        )}
+      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+        {!attachError && <>
+          <span
+            className={`status-dot ${attached ? 'online' : attach?.attach_status === 'disabled' ? '' : 'offline'}`}
+          />
+          <span style={{ fontSize: 12 }}>{t('attachment.label', { status: statusLabel })}</span>
+          {attach?.generation !== undefined && (
+            <span style={{ fontSize: 11, color: 'var(--muted)' }}>{t('attachment.generation', { value: attach.generation })}</span>
+          )}
+          {attach && (
+            <span style={{ fontSize: 11, color: 'var(--muted)' }}>
+              {t('attachment.pairedAt')}{' '}
+              <time dateTime={attach.created_at}>{new Date(attach.created_at).toLocaleString(locale)}</time>
+            </span>
+          )}
+        </>}
         {usage && (
           <span style={{ fontSize: 11, color: 'var(--muted)', marginLeft: 'auto' }}>
             {t('usage.summary', { local: totalCalls(usage.local), remote: totalCalls(usage.remote) })}
           </span>
         )}
       </div>
+
+      {!attachError && attach !== null && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
+          <button
+            type="button"
+            className="btn"
+            style={{ fontSize: 11 }}
+            disabled={adminBusy}
+            onClick={() => void runAdmin(() => setAgentEarEnabled(attachDisabled))}
+          >
+            {attachDisabled ? t('admin.enable') : t('admin.disable')}
+          </button>
+          <button
+            type="button"
+            className="btn"
+            style={{ fontSize: 11 }}
+            disabled={adminBusy}
+            onClick={() => void runAdmin(unpairAgentEar)}
+          >
+            {t('admin.unpair')}
+          </button>
+        </div>
+      )}
+      {adminError && (
+        <div role="alert" style={{ color: '#e05050', fontSize: 12, marginBottom: 8 }}>{t(adminError)}</div>
+      )}
+
+      {attachChecked && !attachError && attach === null && (
+        <section aria-label={t('pairing.title')} style={{ padding: 16, marginBottom: 12, border: '1px solid var(--border)', borderRadius: 'var(--radius)', background: 'var(--surface2)' }}>
+          <h2 style={{ fontSize: 14, margin: '0 0 12px' }}>{t('pairing.title')}</h2>
+          <ol style={{ margin: 0, paddingInlineStart: 24, fontSize: 13, lineHeight: 2 }}>
+            <li><button type="button" className="btn btn-primary" onClick={() => void window.agent24.openExternal('https://github.com/iDoris-ai/AgentEar/releases/latest')}>{t('pairing.download')}</button></li>
+            <li>{t('pairing.menu')}</li>
+            <li>{t('pairing.allow')}</li>
+          </ol>
+        </section>
+      )}
+      {!attachError && attach?.attach_status === 'detached' && (
+        <p style={{ fontSize: 12, color: 'var(--muted)' }}>{t('attachment.detachedHint')}</p>
+      )}
 
       {modelCalls.length > 0 && (
         <div style={{ marginBottom: 12 }}>
@@ -462,11 +578,14 @@ function VoicePanelInner(): JSX.Element {
         <div style={{ color: '#e05050', fontSize: 12, marginBottom: 8 }}>{commandError}</div>
       )}
 
-      <div style={{ display: 'flex', gap: 6, marginBottom: 12, alignItems: 'center' }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12, alignItems: 'center' }}>
         <select
           aria-label={t('speak.language')}
           value={speakLang}
-          onChange={(e) => setSpeakLang(e.target.value as typeof speakLang)}
+          onChange={(e) => {
+            const language = SPEAK_LANGS.find(({ value }) => value === e.target.value)
+            if (language) setSpeakLang(language.value)
+          }}
           style={{ fontSize: 12 }}
           disabled={!attached}
         >
@@ -476,6 +595,7 @@ function VoicePanelInner(): JSX.Element {
         </select>
         <input
           aria-label={t('speak.label')}
+          aria-describedby={languageSuggestion ? 'voice-language-hint' : undefined}
           placeholder={t('speak.placeholder')}
           value={speakText}
           maxLength={SPEAK_TEXT_MAX_LENGTH}
@@ -483,6 +603,7 @@ function VoicePanelInner(): JSX.Element {
           disabled={!attached}
           style={{
             flex: 1,
+            minWidth: 160,
             fontSize: 12,
             padding: '4px 8px',
             background: 'var(--surface2)',
@@ -507,6 +628,14 @@ function VoicePanelInner(): JSX.Element {
         >
           {t('speak.stop')}
         </button>
+        {languageSuggestion && (
+          <span id="voice-language-hint" role="status" style={{ flexBasis: '100%', fontSize: 12, color: 'var(--muted)' }}>
+            {t(languageSuggestion.hint)}{' '}
+            <button type="button" className="btn" style={{ fontSize: 11 }} disabled={!attached} onClick={() => setSpeakLang(languageSuggestion.value)}>
+              {t('speak.switchLanguage', { language: languageSuggestion.name })}
+            </button>
+          </span>
+        )}
       </div>
 
       {lastCommandId && (
