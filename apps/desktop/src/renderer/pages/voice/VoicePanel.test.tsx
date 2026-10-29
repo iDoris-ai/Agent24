@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import VoicePanel, { MAX_EVENTS_IN_MEMORY, pushCapped, formatModelCall } from './VoicePanel'
 import type { AgentEarEventEnvelope, AttachedView, ModelCallEnvelope } from '../../../shared/ipc-types'
-import { setLocale } from '../../i18n'
+import { setLocale, type Locale } from '../../i18n'
 
 type BackendReq = { method: string; path: string; body?: unknown }
 type BackendRes = { ok: boolean; status: number; data: unknown }
@@ -14,6 +14,8 @@ let onModelCallHandler: ((call: ModelCallEnvelope) => void) | null = null
 let attachModules: AttachedView[] = []
 let snapshotEvents: AgentEarEventEnvelope[] = []
 let modelCallSnapshotCalls: ModelCallEnvelope[] = []
+let attachmentFails = false
+const openExternal = vi.fn(() => Promise.resolve())
 
 function mount(): void {
   posted = []
@@ -21,6 +23,7 @@ function mount(): void {
   onModelCallHandler = null
   const proxy = vi.fn((req: BackendReq): Promise<BackendRes> => {
     if (req.method === 'GET' && req.path === '/api/v1/attached') {
+      if (attachmentFails) return Promise.reject(new Error('daemon offline'))
       return Promise.resolve({ ok: true, status: 200, data: { modules: attachModules } })
     }
     if (req.method === 'GET' && req.path.startsWith('/api/v1/usage')) {
@@ -65,7 +68,7 @@ function mount(): void {
   const modelCallSnapshot = vi.fn(() => Promise.resolve(modelCallSnapshotCalls))
 
   Object.defineProperty(window, 'agent24', {
-    value: { backendProxy: proxy, onAgentEarEvent, agentearSnapshot, onModelCallEvent, modelCallSnapshot },
+    value: { backendProxy: proxy, onAgentEarEvent, agentearSnapshot, onModelCallEvent, modelCallSnapshot, openExternal },
     writable: true,
     configurable: true,
   })
@@ -106,6 +109,8 @@ function modelCall(overrides: Partial<ModelCallEnvelope> = {}): ModelCallEnvelop
 }
 
 beforeEach(() => {
+  attachmentFails = false
+  openExternal.mockClear()
   attachModules = []
   snapshotEvents = []
   modelCallSnapshotCalls = []
@@ -119,10 +124,42 @@ it('renders the English voice title by default', () => {
 
 describe('VoicePanel — attach status', () => {
   beforeEach(() => { setLocale('zh') })
+  it('guides pairing and opens the latest AgentEar release via the existing IPC', async () => {
+    mount()
+    render(<VoicePanel />)
+    const download = await screen.findByRole('button', { name: '下载 AgentEar' })
+    const steps = screen.getAllByRole('listitem')
+    expect(steps).toHaveLength(3)
+    expect(steps[0]).toContainElement(download)
+    expect(steps[1]).toHaveTextContent('在 AgentEar 菜单栏里点「与 Agent24 配对」')
+    expect(steps[2]).toHaveTextContent('在 Agent24 弹出的确认框里选允许')
+    fireEvent.click(download)
+    expect(openExternal).toHaveBeenCalledExactlyOnceWith('https://github.com/iDoris-ai/AgentEar/releases/latest')
+  })
+
+  it('does not show a status or pairing guide when the attachment request fails', async () => {
+    attachmentFails = true
+    mount()
+    render(<VoicePanel />)
+    await screen.findByText(/daemon offline/)
+    expect(screen.queryByText(/附着状态：/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '下载 AgentEar' })).not.toBeInTheDocument()
+  })
+
+  it.each<Locale>(['zh', 'en', 'th'])('formats the pairing time in %s', async (locale) => {
+    setLocale(locale)
+    attachModules = [attached()]
+    mount()
+    const { container } = render(<VoicePanel />)
+    await waitFor(() => expect(container.querySelector('time')).toHaveAttribute('dateTime', attached().created_at))
+    expect(container.querySelector('time')).toHaveTextContent(new Date(attached().created_at).toLocaleString(locale))
+    expect(screen.queryByRole('list')).not.toBeInTheDocument()
+  })
+
   it('disables speak input and both buttons when the module is detached (no record)', async () => {
     mount()
     render(<VoicePanel />)
-    await waitFor(() => expect(screen.getByText(/未附着/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/未配对/)).toBeInTheDocument())
     expect(screen.getByLabelText('让它说')).toBeDisabled()
     expect(screen.getByRole('button', { name: '让它说' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '停止播放' })).toBeDisabled()
@@ -132,7 +169,8 @@ describe('VoicePanel — attach status', () => {
     attachModules = [{ ...attached(), attach_status: 'detached' }]
     mount()
     render(<VoicePanel />)
-    await waitFor(() => expect(screen.getByText(/未附着/)).toBeInTheDocument())
+    await screen.findByText('AgentEar 未在运行或未连接')
+    expect(screen.queryByRole('button', { name: '下载 AgentEar' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: '让它说' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '停止播放' })).toBeDisabled()
   })
@@ -141,7 +179,7 @@ describe('VoicePanel — attach status', () => {
     attachModules = [attached()]
     mount()
     render(<VoicePanel />)
-    await waitFor(() => expect(screen.getByText(/已附着/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/已连接/)).toBeInTheDocument())
     expect(screen.getByLabelText('让它说')).not.toBeDisabled()
     expect(screen.getByRole('button', { name: '停止播放' })).not.toBeDisabled()
     // speak button stays disabled until there's text
@@ -152,7 +190,7 @@ describe('VoicePanel — attach status', () => {
     attachModules = [attached()]
     mount()
     render(<VoicePanel />)
-    await waitFor(() => expect(screen.getByText(/已附着/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/已连接/)).toBeInTheDocument())
     expect(screen.getByLabelText('让它说')).toHaveAttribute('maxLength', '2000')
   })
 })
@@ -166,7 +204,7 @@ describe('VoicePanel — speak / stop commands', () => {
   it('speak posts the correct URL and an agentear.command/1 body shape', async () => {
     mount()
     render(<VoicePanel />)
-    await waitFor(() => expect(screen.getByText(/已附着/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/已连接/)).toBeInTheDocument())
     fireEvent.change(screen.getByLabelText('让它说'), { target: { value: '你好' } })
     fireEvent.click(screen.getByRole('button', { name: '让它说' }))
     await waitFor(() => expect(posted).toHaveLength(1))
@@ -491,7 +529,7 @@ describe('VoicePanel — recent model calls (ME4-desktop-model-ui)', () => {
   it('shows nothing yet when no model call has happened', async () => {
     mount()
     render(<VoicePanel />)
-    await waitFor(() => expect(screen.getByText(/未附着/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/未配对/)).toBeInTheDocument())
     expect(screen.queryByText(/最近模型调用/)).not.toBeInTheDocument()
   })
 

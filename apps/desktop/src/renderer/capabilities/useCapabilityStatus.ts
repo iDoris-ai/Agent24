@@ -5,6 +5,8 @@ import { useT } from '../i18n'
 import { settingsMessages } from '../pages/Settings.i18n'
 import { CommApiError, getCommStatus, type CommDaemonProcessState } from '../pages/comm/api'
 import { communicationMessages } from '../pages/comm/Communication.i18n'
+import { getAgentEarAttachment, type AttachedView } from '../pages/voice/api'
+import { voicePanelMessages } from '../pages/voice/VoicePanel.i18n'
 
 const PROCESS_LABELS = {
   stopped: 'process.stopped', starting: 'process.starting', running: 'process.running',
@@ -15,9 +17,11 @@ const PROCESS_LABELS = {
 export function useCapabilityStatus(active: boolean) {
   const [idoris, setIdoris] = useState<IdorisStatus['state']>()
   const [comm, setComm] = useState<CommDaemonProcessState>()
+  const [voice, setVoice] = useState<AttachedView | null>()
   const idorisText = useT(idorisMessages)
   const settingsText = useT(settingsMessages)
   const commText = useT(communicationMessages)
+  const voiceText = useT(voicePanelMessages)
 
   useEffect(() => {
     if (!active) return
@@ -29,6 +33,9 @@ export function useCapabilityStatus(active: boolean) {
         }),
         getCommStatus().then(value => { if (!disposed) setComm(value.process.state) }).catch((error: unknown) => {
           if (!disposed && error instanceof CommApiError && error.code === 'not_configured') setComm('not_configured')
+        }),
+        getAgentEarAttachment().then(value => { if (!disposed) setVoice(value) }).catch(() => {
+          if (!disposed) setVoice(undefined)
         }),
       ])
     }
@@ -48,6 +55,12 @@ export function useCapabilityStatus(active: boolean) {
         : idorisText(`state.${idoris}`)
     }
     if (id === 'communication' && comm) return commText(PROCESS_LABELS[comm])
+    if (id === 'voice' && voice !== undefined) {
+      if (voice === null) return voiceText('attachment.unpaired')
+      if (voice.attach_status === 'attached') return voiceText('attachment.attached')
+      if (voice.attach_status === 'disabled') return voiceText('attachment.disabled')
+      if (voice.attach_status === 'detached') return `${voiceText('attachment.detached')} · ${voiceText('attachment.open')}`
+    }
     return undefined
   }
 }
