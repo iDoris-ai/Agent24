@@ -175,7 +175,7 @@ export async function installLink(options: {
   if (before && (await lstat(destination)).isSymbolicLink() && await readlink(destination) === target) return { state: 'installed', backup: null }
   if (before && !await options.confirm()) return { state: 'cancelled' }
   if (await identity(destination) !== before || await realpath(target) !== target) throw new Error('Installation paths changed')
-  const replaceSymlink = before && (await lstat(destination)).isSymbolicLink()
+  const replaceSymlink = destination === userCliDestination() && before && (await lstat(destination)).isSymbolicLink()
   const backup = before && !replaceSymlink ? `${destination}.bak-${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID()}` : null
   const temporary = `${destination}.tmp-${randomUUID()}`
   const q = shellQuote
@@ -192,14 +192,15 @@ export async function installLink(options: {
     ? `[ "$(/usr/bin/stat ${statFormat} ${q(destination)})" = ${q(expected)} ]`
     : absent
   const move = backup ? `[ ! -e ${q(backup)} ] && [ ! -L ${q(backup)} ] && /bin/mv -n ${q(destination)} ${q(backup)} && ` : ''
-  const rollback = backup ? `/bin/mv -n ${q(backup)} ${q(destination)}; ` : ''
+  const rollback = backup ? `${absent} && /bin/mv -n ${q(backup)} ${q(destination)}; ` : ''
   // Match daemon state_file::write: keep the data directory private; only bin is 0755.
   const dataDirectory = destination === userCliDestination() ? `/bin/mkdir -p -m 700 ${q(path.dirname(path.dirname(destination)))} && ` : ''
   const mkdir = `${dataDirectory}/bin/mkdir -p -m 755 ${q(path.dirname(destination))}`
   const guards = `${parents.join(' && ')} && [ -f ${q(target)} ] && [ -x ${q(target)} ]`
   // -h (BSD) / -T (GNU) replaces even a link to a directory rather than following it.
   const rename = `/bin/mv ${process.platform === 'darwin' ? '-fh' : '-fT'} ${q(temporary)} ${q(destination)}`
-  const script = `${guards} && ${check} && ${mkdir} && ${move}{ /bin/ln -s ${q(target)} ${q(temporary)} && ${guards} && ${backup ? absent : check} && ${rename} || { /bin/rm -f ${q(temporary)}; ${rollback}exit 1; }; }`
+  const notDirectory = `[ ! -d ${q(destination)} ]`
+  const script = `${guards} && ${check} && ${mkdir} && ${move}{ /bin/ln -s ${q(target)} ${q(temporary)} && ${guards} && ${backup ? absent : check} && ${notDirectory} && ${rename} && [ -L ${q(destination)} ] && ${notDirectory} || { /bin/rm -f ${q(temporary)}; ${rollback}exit 1; }; }`
   try {
     await run('/bin/sh', ['-c', script], { timeout: 10_000, maxBuffer: 4096, env: { ...process.env, LC_ALL: 'C' } })
   } catch (error) {

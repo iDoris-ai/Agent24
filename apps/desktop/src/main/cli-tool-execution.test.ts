@@ -8,7 +8,7 @@ const { exec } = vi.hoisted(() => ({ exec: vi.fn() }))
 vi.mock('node:child_process', () => ({
   execFile: Object.assign(vi.fn(), { [Symbol.for('nodejs.util.promisify.custom')]: exec }),
 }))
-import { cliToolStatus, installBundledCli, installLink } from './cli-tool'
+import { cliToolStatus, installBundledCli, installLink, shellQuote } from './cli-tool'
 
 const childProcess = await vi.importActual<typeof import('node:child_process')>('node:child_process')
 const run = promisify(childProcess.execFile)
@@ -49,6 +49,37 @@ it('restores the old command and reports shell failure when linking fails', asyn
   expect(await readFile(f.destination, 'utf8')).toBe('old CLI')
   expect((await readdir(root)).filter((name) => name.startsWith('agent24'))).toEqual(['agent24'])
 })
+it.each(['directory', 'directory symlink', 'dangling symlink'])('preserves the backup when a concurrent %s blocks rollback', async (kind) => {
+  const f = await fixture()
+  await writeFile(f.destination, 'old CLI')
+  const other = path.join(root, 'other')
+  if (kind !== 'dangling symlink') await mkdir(other)
+  const interfere = path.join(root, 'interfere')
+  const create = kind === 'directory'
+    ? `/bin/mkdir ${shellQuote(f.destination)}`
+    : `/bin/ln -s ${shellQuote(other)} ${shellQuote(f.destination)}`
+  await writeFile(interfere, `#!/bin/sh\n/bin/ln -s "$@" || exit 1\n${create}\nexit 1\n`, { mode: 0o755 })
+  exec.mockImplementation((file, args, options) => run(file, [args[0], args[1].replace('/bin/ln -s', shellQuote(interfere))], options))
+  await expect(installLink({ ...f, confirm: async () => true })).rejects.toMatchObject({ code: 1 })
+  const backups = (await readdir(root)).filter((name) => name.startsWith('agent24.bak-'))
+  expect(backups).toHaveLength(1)
+  expect(await readFile(path.join(root, backups[0]), 'utf8')).toBe('old CLI')
+  if (kind === 'directory') expect(await readdir(f.destination)).toEqual([])
+  else expect(await readlink(f.destination)).toBe(other)
+  if (kind === 'directory symlink') expect(await readdir(other)).toEqual([])
+  expect((await readdir(root)).some((name) => name.startsWith('agent24.tmp-'))).toBe(false)
+})
+it.skipIf(process.platform !== 'darwin')('rejects a directory created at rename even when BSD mv reports success', async () => {
+  const f = await fixture()
+  await writeFile(f.destination, 'old CLI')
+  const interfere = path.join(root, 'interfere')
+  await writeFile(interfere, '#!/bin/sh\n/bin/mkdir "$2" || exit 1\nexec /bin/mv -fh "$@"\n', { mode: 0o755 })
+  exec.mockImplementation((file, args, options) => run(file, [args[0], args[1].replace('/bin/mv -fh', shellQuote(interfere))], options))
+  await expect(installLink({ ...f, confirm: async () => true })).rejects.toMatchObject({ code: 1 })
+  const backups = (await readdir(root)).filter((name) => name.startsWith('agent24.bak-'))
+  expect(backups).toHaveLength(1)
+  expect(await readFile(path.join(root, backups[0]), 'utf8')).toBe('old CLI')
+})
 it.each(['foreign', 'dangling'])('preserves the original %s symlink when creating its replacement fails', async (kind) => {
   const f = await fixture()
   const original = path.join(root, 'old-cli')
@@ -61,6 +92,8 @@ it.each(['foreign', 'dangling'])('preserves the original %s symlink when creatin
 })
 it('keeps the original link in place until its replacement is ready', async () => {
   const f = await fixture()
+  f.destination = path.join(root, 'home/.agent24/bin/agent24')
+  await mkdir(path.dirname(f.destination), { recursive: true })
   const original = path.join(root, 'old-cli')
   await symlink(original, f.destination)
   const observer = path.join(root, 'observe-link')
@@ -70,7 +103,7 @@ it('keeps the original link in place until its replacement is ready', async () =
   }))
   expect(await installLink({ ...f, confirm: async () => true })).toEqual({ state: 'installed', backup: null })
   expect(await readlink(f.destination)).toBe(f.target)
-  expect((await readdir(root)).filter((name) => name.startsWith('agent24'))).toEqual(['agent24'])
+  expect(await readdir(path.dirname(f.destination))).toEqual(['agent24'])
 })
 it('rejects elevation for any destination other than the fixed CLI path', async () => {
   const f = await fixture()

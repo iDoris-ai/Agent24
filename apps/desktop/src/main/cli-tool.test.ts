@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { chmod, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { compareVersions, resolveBundledCli, inspectCommand, installLink, shellQuote, appleScript } from './cli-tool'
@@ -103,12 +103,38 @@ describe('PATH detection and installation', () => {
     expect(await installLink({ target: f.target, destination: f.destination, confirm: async () => false })).toEqual({ state: 'cancelled' })
     expect(await readFile(f.destination, 'utf8')).toBe('old CLI')
   })
-  it('replaces a dangling symlink without a backup', async () => {
+  it('backs up a live foreign symlink at a system destination without changing its target', async () => {
+    const f = await fixture()
+    // Exercise the system policy in a temporary bin, without writing /usr/local/bin.
+    const destination = path.join(f.root, 'usr/local/bin/agent24')
+    const original = path.join(f.root, 'developer-cli')
+    await mkdir(path.dirname(destination), { recursive: true })
+    await writeFile(original, '#!/bin/sh\necho "agent24 0.4.0"\n', { mode: 0o755 })
+    await symlink(original, destination)
+    const before = await lstat(destination)
+    const confirm = vi.fn(async () => true)
+    const result = await installLink({ target: f.target, destination, confirm })
+    expect(result.state).toBe('installed')
+    if (result.state !== 'installed') throw new Error('installation failed')
+    expect(result.backup).not.toBeNull()
+    if (!result.backup) throw new Error('missing backup')
+    expect(result.backup).toMatch(/agent24\.bak-/)
+    expect((await lstat(result.backup)).isSymbolicLink()).toBe(true)
+    expect((await lstat(result.backup)).ino).toBe(before.ino)
+    expect(await readlink(result.backup)).toBe(original)
+    expect(await realpath(result.backup)).toBe(original)
+    expect((await run(result.backup, ['--version'])).stdout.trim()).toBe('agent24 0.4.0')
+    expect(await readlink(destination)).toBe(f.target)
+    expect(confirm).toHaveBeenCalledOnce()
+  })
+  it('backs up a dangling symlink at a system destination', async () => {
     const f = await fixture()
     await mkdir(path.dirname(f.destination))
     await symlink('/missing/old-agent24', f.destination)
     const result = await installLink({ target: f.target, destination: f.destination, confirm: async () => true })
-    expect(result).toEqual({ state: 'installed', backup: null })
+    expect(result.state).toBe('installed')
+    if (result.state !== 'installed' || !result.backup) throw new Error('missing backup')
+    expect(await readlink(result.backup)).toBe('/missing/old-agent24')
     expect(await readlink(f.destination)).toBe(f.target)
   })
   it('rejects destination parent symlinks and directories', async () => {
