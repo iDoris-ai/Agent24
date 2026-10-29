@@ -84,7 +84,13 @@ impl FakeDaemon {
                     })
                 });
                 let (status, reply) = if line.starts_with("GET /api/v1/health ") {
-                    ("200 OK", r#"{"status":"ok"}"#.to_owned())
+                    // The CLI refuses a daemon whose health names no protocol
+                    // version (an old daemon), so a fixture names the current one.
+                    let health = serde_json::json!({
+                        "status": "ok",
+                        "protocol_version": agent24_protocol::PROTOCOL_VERSION,
+                    });
+                    ("200 OK", health.to_string())
                 } else if !bearer {
                     (
                         "401 Unauthorized",
