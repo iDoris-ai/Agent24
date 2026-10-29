@@ -7,6 +7,7 @@ export const IpcChannels = {
   CliToolOpenSettings: 'cli-tool:open-settings',
   CliToolStatus: 'cli-tool:status',
   CliToolInstall: 'cli-tool:install',
+  CliToolRepairUser: 'cli-tool:repair-user',
   AppLocale: 'app:locale',
   AppPing: 'app:ping',
   AppVersion: 'app:version',
@@ -19,6 +20,11 @@ export const IpcChannels = {
   // before sending anything.
   ApprovalDecide: 'approval:decide',
   OsModuleSetEnabled: 'os-module:set-enabled',
+  // A-3: disable/enable or unpair AgentEar (PATCH / DELETE
+  // /api/v1/attached/agentear). The module name is fixed in main; the
+  // renderer cannot name another one. Same native-confirm rule as above.
+  AgentEarSetEnabled: 'agentear:set-enabled',
+  AgentEarUnpair: 'agentear:unpair',
   CreativeShow: 'creative:show',
   CreativeRestart: 'creative:restart',
   CreativeBounds: 'creative:bounds',
@@ -285,11 +291,18 @@ export interface DocumentsImportProgress {
   total: number
 }
 
+export type CliToolPathStatus = { path: string } & (
+  | { link: 'missing'; state: 'missing'; version: null }
+  | { link: 'current'; state: 'current'; version: string }
+  | { link: 'other'; state: 'outdated' | 'current' | 'newer'; version: string | null }
+)
+
 export interface CliToolStatus {
   state: 'missing' | 'outdated' | 'current' | 'newer' | 'unknown' | 'unavailable'
   path: string | null
   version: string | null
   bundledVersion: string | null
+  paths: CliToolPathStatus[]
 }
 
 export type CliInstallResult =
