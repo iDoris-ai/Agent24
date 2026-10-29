@@ -5,10 +5,11 @@ All notable changes to Agent24 are documented here. This project adheres to
 
 ## [Unreleased]
 
-- **内核迁移 0031、0032（升级后不能回退）**：升级到带这两条 store 迁移的版本以后，之前的版本会拒绝打开这个库
+- **内核迁移 0031–0033（升级后不能回退）**：升级到带这三条 store 迁移的版本以后，之前的版本会拒绝打开这个库
   （`migration 31 was previously applied but is missing`），库本身不动。要回退，只能恢复升级前的备份，光换回旧二进制不行，
-  所以升级前请先备份 `~/.agent24`。升级前就停在审批上、升级后才批准的 run 不再恢复，会以 `source_unproven` 结束，
-  因为旧版没有给它的工具结果打来源标签。
+  所以升级前请先备份 `~/.agent24`。升级时还没结束的 run（多半是停在审批上的）不再恢复：升级后批准，它以
+  `source_unproven` 结束；审批已过期的，启动时照旧直接取消。因为旧版没有给它的工具结果打来源标签，0033 在升级时
+  把这些 run 记下来。
 
 - **kernel 迁移改号（开发机注意）**：`ab/kernel` 在吸收 main（#1433）时，为避开 memory-p1 已占用的 0027–0029、
   以及日程索引 0030，把自己的两条 store 迁移从 `0027_session_tool_result_origins`、`0028_backfill_session_floor`

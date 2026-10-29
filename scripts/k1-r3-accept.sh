@@ -257,7 +257,7 @@ check R1 "a run main parked after a shell_exec is not resumed after the upgrade"
 versions() { ls "$1" | grep -oE '^[0-9]+' | sed 's/^0*//' | sort -nu; }
 WANT=$(versions "$REPO/rust/crates/agent24-store/migrations" | awk -v o="$OLD_VERSION" '$1 > o' | paste -sd, -)
 APPLIED=$(db "SELECT group_concat(version) FROM (SELECT version FROM _sqlx_migrations WHERE version > $OLD_VERSION AND success = 1 ORDER BY version)")
-check U3 "store migrations past main's are applied (31 and 32)" "$(case ",$WANT," in (*,31,*32,*) is "$APPLIED" "$WANT" ;; (*) echo fail ;; esac)" "want $WANT; applied ${APPLIED:-none}"
+check U3 "store migrations past main's are applied (31, 32 and 33)" "$(case ",$WANT," in (*,31,*32,*33,*) is "$APPLIED" "$WANT" ;; (*) echo fail ;; esac)" "want $WANT; applied ${APPLIED:-none}"
 cli "$NEW" run list > "$WORK/u4.list" 2>&1; cli "$NEW" run show "$OLD_RUN" > "$WORK/u4.show" 2>&1
 check U4 "agent24 run list / run show have main's runs" "$(both "$(has "$WORK/u4.list" "$OLD_RUN")" "$(has "$WORK/u4.show" OLD-RUN-MARKER)")" "$(grep -c '^run_' "$WORK/u4.list") runs listed; $(head -1 "$WORK/u4.show" | cut -c1-80)"
 

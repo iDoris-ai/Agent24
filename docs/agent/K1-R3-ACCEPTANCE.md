@@ -7,7 +7,7 @@
   - 工具结果带来源标签：先跑 shell_exec 的 run 不能再往外发，只读文件的不受影响；
   - 只读文件的 run 能分享给外部工具；
   - 审批停住时重启 daemon，批准后照常继续；
-  - 迁移 0031/0032，以及升级后不能回退。
+  - 迁移 0031–0033，以及升级后不能回退。
 - **怎么跑**：在发布 head 的 checkout 里跑 `scripts/k1-r3-accept.sh --old <main 的二进制目录> --new <发布 head 的二进制目录> [--work <目录>]`。两个目录里都要有 `agent24d` 和 `agent24`（`cargo build -p agent24d -p agent24-cli`）。U2 以这个 checkout 里的迁移为准。脚本逐条打出 PASS/FAIL，并在工作目录写 `report.md`；有一条 FAIL 就以非 0 退出。
 - **反面对照**：把 `--new` 换成 main 的二进制再跑一遍，本次发布带来的用例应当失败，见文末。
 - **按用户的操作走**：有产品入口的都走产品入口：
@@ -27,8 +27,8 @@
 |---|---|---|---|
 | U1 | 发布版打开 main 的库 | `agent24 daemon start` 成功 | 通过 |
 | U2 | 升级后 daemon 在跑 | `agent24 daemon status` 以 `running · ` 开头 | 通过 |
-| R1 | main 停在审批上的 run，升级后不再恢复（发布评审 High） | 批准它的 fs_write，run 以 `failed`、`source_unproven` 结束，没有走到 http_fetch | 失败（照常恢复，http_fetch 放行到 DNS） |
-| U3 | 迁移 0031、0032 应用了 | 这个 checkout 里比 main 新的 store 迁移都在 `_sqlx_migrations` 里成功，且含 31、32 | 失败 |
+| R1 | main 停在审批上的 run，升级后不再恢复（发布评审 High；0033 记下升级时没结束的 run） | 批准它的 fs_write，run 以 `failed`、`source_unproven` 结束，没有走到 http_fetch | 失败（照常恢复，http_fetch 放行到 DNS） |
+| U3 | 迁移 0031–0033 应用了 | 这个 checkout 里比 main 新的 store 迁移都在 `_sqlx_migrations` 里成功，且含 31、32、33 | 失败 |
 | U4 | 旧 run 还在 | `agent24 run list` 有它，`agent24 run show` 有它的提示词 | 失败（main 没有 `run list/show`） |
 | G1 | 旧授予按派发门判 stale（#1317） | `agent24 consent list --json` 里两条都是 `stale` | 失败（`granted`） |
 | L1 | main 上调用过工具的会话，升级后继续限制外发（0031） | `session_tool_result_origins` 有这个会话的 `tool:legacy`；同一会话里新 run 的 http_fetch 被 `denied by policy` | 失败（没有这张表，http_fetch 放行到 DNS） |

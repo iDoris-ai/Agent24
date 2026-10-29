@@ -2541,36 +2541,23 @@ impl RunManager {
     }
 
     /// Whether a parked run may be resumed under the tags it has (K1-R3
-    /// release review). A build before this library took migration 0031
-    /// tagged no tool result, and 0031 gave a session that had called tools a
-    /// `tool:legacy` origin only for its later runs. A run that build started
-    /// and parked, resumed after the upgrade, would replay those results as
-    /// ordinary and pass the egress gate. So a run created before the
-    /// migration is not resumed; a read failure is the same refusal. Both
-    /// times are whole seconds: a run of the second the migration ran in is
-    /// the new build's, since the old one had to start it, reach a model,
-    /// park and die before the new one could start.
+    /// release review). A build before migration 0031 tagged no tool result,
+    /// and 0031 gave a session that had called tools a `tool:legacy` origin
+    /// only for its later runs. A run that build started and parked, resumed
+    /// after the upgrade, would replay those results as ordinary and pass the
+    /// egress gate. Migration 0033 lists every run unfinished at the upgrade;
+    /// a listed run is not resumed, and a read failure is the same refusal.
+    /// The list decides, not the run's creation time: a wall clock may be set
+    /// back across the upgrade.
     async fn resume_sources_proven(&self, run: &Run) -> bool {
-        match self.store.tool_result_tagging_since().await {
-            Ok(Some(since)) => {
-                let created = run.created_at.get(..19).unwrap_or_default();
-                let proven = created >= since.get(..19).unwrap_or_default();
-                if !proven {
-                    tracing::warn!(
-                        run_id = %run.id,
-                        created_at = %run.created_at,
-                        since = %since,
-                        "resume: the run predates tool result tagging"
-                    );
-                }
-                proven
-            }
-            Ok(None) => {
-                tracing::warn!(run_id = %run.id, "resume: migration 0031 is not recorded");
+        match self.store.run_predates_tool_result_tagging(&run.id).await {
+            Ok(false) => true,
+            Ok(true) => {
+                tracing::warn!(run_id = %run.id, "resume: the run predates tool result tagging");
                 false
             }
             Err(err) => {
-                tracing::warn!(run_id = %run.id, error = %err, "resume: migration record unreadable");
+                tracing::warn!(run_id = %run.id, error = %err, "resume: tool result tagging record unreadable");
                 false
             }
         }
@@ -7353,9 +7340,15 @@ mod approval_tests {
             "name": "shell_exec",
             "arguments": shell_args.to_string()
         }]);
-        let mut run = run_in("run_1", RunStatus::AwaitingApproval);
-        run.created_at = "2000-01-01T00:00:00Z".to_owned();
-        h.store.insert_run(&run).await.unwrap();
+        h.store
+            .insert_run(&run_in("run_1", RunStatus::AwaitingApproval))
+            .await
+            .unwrap();
+        // What migration 0033 writes for a run unfinished at the upgrade.
+        sqlx::query("INSERT INTO runs_before_tool_result_tagging (run_id) VALUES ('run_1')")
+            .execute(agent24_store::test_hooks::pool(&h.store))
+            .await
+            .unwrap();
         seed_proven_parked_thread(&h.store, "run_1", "run echo", calls).await;
         let user_source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
         h.store
