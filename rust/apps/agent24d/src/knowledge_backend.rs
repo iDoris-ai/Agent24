@@ -100,6 +100,10 @@ fn local(reason: LocalReason, retryable: bool) -> Failure {
     Failure::Local(Refusal { reason, retryable })
 }
 
+/// A transport ready for one call, the number of the C it carries and the
+/// binding's knowledge bases.
+type Ready = (Arc<dyn KnowledgeTransport>, u64, Vec<String>);
+
 /// The call as sent: where it went and under which activation and C.
 struct Sent {
     pin: RunBinding,
@@ -143,12 +147,9 @@ impl DaemonKnowledgeBackend {
         Ok((pin, now))
     }
 
-    /// The transport for this activation and C, built anew once either moved.
-    fn transport(
-        &self,
-        pin: &RunBinding,
-        now: &BindingNow,
-    ) -> Result<(Arc<dyn KnowledgeTransport>, u64), Failure> {
+    /// The transport for this activation and C, built anew once either moved,
+    /// with the C's number and the binding's knowledge bases.
+    fn transport(&self, pin: &RunBinding, now: &BindingNow) -> Result<Ready, Failure> {
         let endpoint = now
             .endpoint
             .as_ref()
@@ -167,7 +168,11 @@ impl DaemonKnowledgeBackend {
             && cached.generation == now.generation
             && cached.credential_seq == current.seq
         {
-            return Ok((Arc::clone(&cached.transport), current.seq));
+            return Ok((
+                Arc::clone(&cached.transport),
+                current.seq,
+                endpoint.knowledge_base_ids.clone(),
+            ));
         }
         cache.remove(&key);
         let credential = match &current.credential {
@@ -184,7 +189,7 @@ impl DaemonKnowledgeBackend {
                 transport: Arc::clone(&transport),
             },
         );
-        Ok((transport, current.seq))
+        Ok((transport, current.seq, endpoint.knowledge_base_ids.clone()))
     }
 
     /// Sends `request`; the answer counts only if the activation and C it
@@ -309,14 +314,9 @@ impl KnowledgeBackend for DaemonKnowledgeBackend {
         query: SearchQuery,
     ) -> Result<(SearchRequest, SearchResponse), Failure> {
         let (pin, now) = self.binding(run_id).await?;
-        let (transport, credential_seq) = self.transport(&pin, &now)?;
+        let (transport, credential_seq, allowed) = self.transport(&pin, &now)?;
         let generation = now.generation;
         let request_id = uuid::Uuid::new_v4().to_string();
-        let allowed = now
-            .endpoint
-            .as_ref()
-            .map(|endpoint| endpoint.knowledge_base_ids.clone())
-            .unwrap_or_default();
         let ids = match &query.knowledge_base_ids {
             None => allowed,
             Some(named) => named
@@ -365,16 +365,11 @@ impl KnowledgeBackend for DaemonKnowledgeBackend {
         query: ReadQuery,
     ) -> Result<(ReadRequest, ReadResponse), Failure> {
         let (pin, now) = self.binding(run_id).await?;
-        let (transport, credential_seq) = self.transport(&pin, &now)?;
+        let (transport, credential_seq, allowed) = self.transport(&pin, &now)?;
         let generation = now.generation;
         let request_id = uuid::Uuid::new_v4().to_string();
         // A document outside the binding's knowledge bases is the server's to
         // refuse: it answers `not_found` for one outside the scope (R2.6).
-        let allowed = now
-            .endpoint
-            .as_ref()
-            .map(|endpoint| endpoint.knowledge_base_ids.clone())
-            .unwrap_or_default();
         let Ok(knowledge_base_ids) = NonEmpty::try_from(allowed) else {
             return Err(empty_scope(&request_id, generation));
         };
