@@ -2037,10 +2037,8 @@ export interface components {
             result: "succeeded" | "failed" | "cancelled" | null;
             error_code: components["schemas"]["IdorisErrorCode"] | null;
             cancellable: boolean;
-            idempotency_key: string;
             download_progress?: components["schemas"]["IdorisDownloadProgress"];
             verification?: components["schemas"]["IdorisVerification"];
-            request_fingerprint?: string;
             /** @enum {string} */
             setup_code?: "unreachable" | "auth_required" | "auth_failed" | "not_omlx" | "model_not_found" | "invalid_endpoint" | "invalid_role" | "out_dir_not_empty" | "validation_failed" | "write_failed" | "invalid_api_key_input";
         };

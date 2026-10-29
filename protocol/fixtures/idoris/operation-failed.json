@@ -4,6 +4,5 @@
   "phase": "completed",
   "result": "failed",
   "error_code": "start_failed",
-  "cancellable": false,
-  "idempotency_key": "fixture-failed-start"
+  "cancellable": false
 }

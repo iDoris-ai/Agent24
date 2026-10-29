@@ -1,6 +1,15 @@
-//! Daemon-only iDoris client. Capability enrollment joins here after CORE-2.
+//! Daemon-only iDoris client.
+//!
+//! Legacy daemons are reached with the `daemon.json` bearer. Capabilities
+//! daemons are reached through the CORE-2 enrolment session (I-1): the CLI
+//! enrols for a first-party token, and an elevated route answered with
+//! `403 presence_required` is approved once in the Agent24 app on the same
+//! enrolment connection, then retried once with the grant.
 
-use super::{Endpoint, bearer, client, endpoint_from_state, finish, health_ok, spawn_daemon};
+use super::{
+    DaemonState, DiscoveredAttach, Endpoint, HOST_AUTHORITY_UNAVAILABLE, attach_discovered, bearer,
+    client, endpoint_from_state, enroll::EnrollError, finish, health_ok, spawn_daemon,
+};
 use clap::{Args, Subcommand};
 use reqwest::Method;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -68,7 +77,20 @@ impl Failure {
             message: english(code).to_owned(),
         }
     }
+    /// Keep the enrolment code; prefer this module's English for it.
+    fn enroll(error: EnrollError) -> Self {
+        let message = english(&error.code);
+        Self {
+            message: if message == FALLBACK {
+                error.message
+            } else {
+                message.to_owned()
+            },
+            code: error.code,
+        }
+    }
 }
+const FALLBACK: &str = "The daemon operation failed. Check agent24 idoris status --json.";
 fn english(code: &str) -> &'static str {
     match code {
         "consent_required" => "Consent required. Use --yes in a non-interactive terminal.",
@@ -99,13 +121,35 @@ fn english(code: &str) -> &'static str {
         }
         "replace_required" => "A connection already exists. Use --replace to replace it.",
         "host_authority_unavailable" => {
-            "Capability enrollment requires the CORE-2 client. Use a legacy or ProductHost daemon."
+            "This capabilities daemon offers no CORE-2 enrolment endpoint. Update Agent24 or use a legacy daemon."
         }
+        "incompatible_daemon" => {
+            "The daemon speaks a different protocol version. Upgrade the older side, then restart the daemon."
+        }
+        "identity_rejected" => "The daemon rejected this agent24 binary's identity.",
+        "endpoint_mismatch" => {
+            "daemon.json's port is not the enrolling daemon's port; no credentials were sent."
+        }
+        "generation_mismatch" => {
+            "The daemon restarted since this command read daemon.json; run it again."
+        }
+        "unsupported_version" => "The daemon speaks a different enrolment protocol version.",
+        "bad_frame" => "The daemon sent an invalid enrolment frame.",
+        "timeout" => "Timed out during the enrolment handshake.",
+        "not_enrolled" => "The enrolment session is no longer valid; run the command again.",
+        "presence_required" => "This action needs approval in the Agent24 app.",
+        "presence_denied" => "The request was denied in the Agent24 app.",
+        "presence_timeout" => "Timed out waiting for approval in the Agent24 app.",
+        "presence_unavailable" => {
+            "Approval requires the Agent24 desktop app to be open: open Agent24 and try again."
+        }
+        "not_elevated_operation" => "This action can't be approved from the CLI yet.",
+        "elevation_invalid" => "The daemon rejected the approval for this request.",
         "daemon_unavailable" => "Could not connect to or start the daemon.",
         "transport_error" => "The daemon request failed. Check daemon status.",
         "invalid_response" => "The daemon returned an invalid response.",
         "signal_unavailable" => "Could not register the interrupt handler.",
-        _ => "The daemon operation failed. Check agent24 idoris status --json.",
+        _ => FALLBACK,
     }
 }
 
@@ -170,11 +214,11 @@ fn consent(yes: bool, description: &str) -> Result<(), Failure> {
 async fn host() -> Result<Endpoint, Failure> {
     use agent24_protocol::state_file;
     // A lifecycle command must leave its host running after the CLI exits.
-    // Discovery never supplies authority for capabilities; CORE-2 enrollment
-    // will replace this failure once its shared client is available.
+    // Discovery never supplies authority for capabilities: that host is
+    // reached only through CORE-2 enrolment.
     if let Some(state) = state_file::read_live() {
         if state.auth_mode.is_capabilities() {
-            return Err(Failure::local("host_authority_unavailable"));
+            return enrolled(&state).await;
         }
         let base = format!("http://127.0.0.1:{}", state.port);
         if health_ok(&base, &state.token).await {
@@ -191,6 +235,35 @@ async fn host() -> Result<Endpoint, Failure> {
     endpoint_from_state(state).map_err(|_| Failure::local("host_authority_unavailable"))
 }
 
+/// Capabilities mode (I-1): enrol with the running daemon, exactly as
+/// `os attach add` does. Discovery alone never supplies authority, and a
+/// capabilities daemon is never replaced by a spawned one.
+async fn enrolled(state: &DaemonState) -> Result<Endpoint, Failure> {
+    if state.enroll_endpoint.is_none() {
+        return Err(Failure::local("host_authority_unavailable"));
+    }
+    match attach_discovered(state).await {
+        DiscoveredAttach::Ready(endpoint) => Ok(endpoint),
+        DiscoveredAttach::EnrollFailed(error) => Err(Failure::enroll(error)),
+        // With an enrolment endpoint advertised, this is the failed health
+        // probe: the recorded daemon does not answer.
+        DiscoveredAttach::Incompatible(error) if error == HOST_AUTHORITY_UNAVAILABLE => {
+            Err(Failure::local("daemon_unavailable"))
+        }
+        DiscoveredAttach::Incompatible(_) => Err(Failure::local("incompatible_daemon")),
+        DiscoveredAttach::Unreachable => Err(Failure::local("daemon_unavailable")),
+    }
+}
+fn error_from(bytes: &[u8]) -> Failure {
+    #[derive(Deserialize)]
+    struct Envelope {
+        error: Failure,
+    }
+    serde_json::from_slice::<Envelope>(bytes)
+        .map(|envelope| envelope.error)
+        .unwrap_or_else(|_| Failure::local("invalid_response"))
+}
+
 async fn request(
     ep: &Endpoint,
     method: Method,
@@ -199,7 +272,12 @@ async fn request(
     key: Option<&str>,
 ) -> Result<reqwest::Response, Failure> {
     // Retrying an ambiguous submission uses the original key and identical body.
-    for attempt in 0..2 {
+    // The exact bytes are hashed for an elevation, so they are encoded once.
+    let bytes = body
+        .map(serde_json::to_vec)
+        .transpose()
+        .map_err(|_| Failure::local("invalid_request"))?;
+    let send = |grant: Option<reqwest::header::HeaderValue>| {
         let mut request = bearer(
             ep,
             client().request(method.clone(), format!("{}{path}", ep.base)),
@@ -210,12 +288,23 @@ async fn request(
             15
         }));
         if let Some(body) = body {
-            request = request.json(body);
+            request = match &bytes {
+                Some(bytes) if ep.session.is_some() => request
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(bytes.clone()),
+                _ => request.json(body),
+            };
         }
         if let Some(key) = key {
             request = request.header("Idempotency-Key", key);
         }
-        let response = match request.send().await {
+        if let Some(grant) = grant {
+            request = request.header("X-Agent24-Elevation", grant);
+        }
+        request.send()
+    };
+    for attempt in 0..2 {
+        let response = match send(None).await {
             Ok(response) => response,
             Err(_) if key.is_some() && attempt == 0 => continue,
             Err(_) => return Err(Failure::local("transport_error")),
@@ -223,16 +312,49 @@ async fn request(
         if response.status().is_success() {
             return Ok(response);
         }
-        #[derive(Deserialize)]
-        struct Envelope {
-            error: Failure,
-        }
-        let error = response
-            .json::<Envelope>()
+        let Some(session) = &ep.session else {
+            #[derive(Deserialize)]
+            struct Envelope {
+                error: Failure,
+            }
+            let error = response
+                .json::<Envelope>()
+                .await
+                .map_err(|_| Failure::local("invalid_response"))?
+                .error;
+            return Err(error);
+        };
+        let forbidden = response.status() == reqwest::StatusCode::FORBIDDEN;
+        let reply = response
+            .bytes()
             .await
-            .map_err(|_| Failure::local("invalid_response"))?
-            .error;
-        return Err(error);
+            .map_err(|_| Failure::local("invalid_response"))?;
+        let error = error_from(&reply);
+        if !forbidden || error.code != "presence_required" {
+            return Err(error);
+        }
+        // One approval, one retry. The grant is single-use, so a transport
+        // failure after it is reported rather than resent.
+        let grant = session
+            .elevate(method.as_str(), path, bytes.as_deref().unwrap_or_default())
+            .await
+            .map_err(Failure::enroll)?;
+        // A grant that is not a valid header value is a daemon fault: report
+        // it instead of resending without the header (L3).
+        let mut grant = reqwest::header::HeaderValue::from_str(grant.as_str())
+            .map_err(|_| Failure::local("invalid_response"))?;
+        grant.set_sensitive(true);
+        let response = send(Some(grant))
+            .await
+            .map_err(|_| Failure::local("transport_error"))?;
+        if response.status().is_success() {
+            return Ok(response);
+        }
+        let reply = response
+            .bytes()
+            .await
+            .map_err(|_| Failure::local("invalid_response"))?;
+        return Err(error_from(&reply));
     }
     Err(Failure::local("transport_error"))
 }
