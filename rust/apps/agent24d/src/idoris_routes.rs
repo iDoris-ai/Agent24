@@ -57,7 +57,7 @@ async fn submit(state: AppState, headers: HeaderMap, action: Action) -> Response
         Err(_) => return failure(Code::InvalidRequest),
     };
     match host.submit(action, key).await {
-        Ok(op) => (axum::http::StatusCode::ACCEPTED, Json(op)).into_response(),
+        Ok(op) => (axum::http::StatusCode::ACCEPTED, Json(op.view())).into_response(),
         Err(code) => failure(code),
     }
 }
@@ -80,7 +80,7 @@ pub async fn install(
     };
     let key = headers.get("Idempotency-Key").and_then(|k| k.to_str().ok());
     match host.install(request, key).await {
-        Ok(op) => (axum::http::StatusCode::ACCEPTED, Json(op)).into_response(),
+        Ok(op) => (axum::http::StatusCode::ACCEPTED, Json(op.view())).into_response(),
         Err(code) => failure(code),
     }
 }
@@ -97,7 +97,7 @@ pub async fn connect(
     };
     let key = headers.get("Idempotency-Key").and_then(|k| k.to_str().ok());
     match host.connect(request, key).await {
-        Ok(op) => (axum::http::StatusCode::ACCEPTED, Json(op)).into_response(),
+        Ok(op) => (axum::http::StatusCode::ACCEPTED, Json(op.view())).into_response(),
         Err(code) => failure(code),
     }
 }
@@ -123,7 +123,7 @@ pub async fn operation(State(state): State<AppState>, Path(id): Path<String>) ->
         return failure(Code::NotFound);
     };
     match host.operation(&id).await {
-        Ok(op) => Json(op).into_response(),
+        Ok(op) => Json(op.view()).into_response(),
         Err(code) => failure(code),
     }
 }
@@ -132,7 +132,7 @@ pub async fn cancel(State(state): State<AppState>, Path(id): Path<String>) -> Re
         return failure(Code::NotFound);
     };
     match host.cancel(&id).await {
-        Ok(op) => Json(op).into_response(),
+        Ok(op) => Json(op.view()).into_response(),
         Err(code) => failure(code),
     }
 }

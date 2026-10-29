@@ -277,7 +277,7 @@ async fn request(
         .map(serde_json::to_vec)
         .transpose()
         .map_err(|_| Failure::local("invalid_request"))?;
-    let send = |grant: Option<&str>| {
+    let send = |grant: Option<reqwest::header::HeaderValue>| {
         let mut request = bearer(
             ep,
             client().request(method.clone(), format!("{}{path}", ep.base)),
@@ -298,11 +298,8 @@ async fn request(
         if let Some(key) = key {
             request = request.header("Idempotency-Key", key);
         }
-        if let Some(grant) = grant
-            && let Ok(mut value) = reqwest::header::HeaderValue::from_str(grant)
-        {
-            value.set_sensitive(true);
-            request = request.header("X-Agent24-Elevation", value);
+        if let Some(grant) = grant {
+            request = request.header("X-Agent24-Elevation", grant);
         }
         request.send()
     };
@@ -342,7 +339,12 @@ async fn request(
             .elevate(method.as_str(), path, bytes.as_deref().unwrap_or_default())
             .await
             .map_err(Failure::enroll)?;
-        let response = send(Some(grant.as_str()))
+        // A grant that is not a valid header value is a daemon fault: report
+        // it instead of resending without the header (L3).
+        let mut grant = reqwest::header::HeaderValue::from_str(grant.as_str())
+            .map_err(|_| Failure::local("invalid_response"))?;
+        grant.set_sensitive(true);
+        let response = send(Some(grant))
             .await
             .map_err(|_| Failure::local("transport_error"))?;
         if response.status().is_success() {

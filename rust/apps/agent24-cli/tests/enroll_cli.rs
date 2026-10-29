@@ -1233,3 +1233,23 @@ fn idoris_finds_the_running_daemon_without_ps_on_path() {
     assert!(ok, "{stdout} {stderr}");
     assert_eq!(fake.seen.lock().unwrap().len(), 1);
 }
+
+/// L3: a grant that cannot be sent as a header value is reported; the CLI
+/// never resends the request without it.
+#[test]
+fn idoris_unsendable_grant_is_reported_without_a_resend() {
+    let home = tmp_home();
+    let fake = start_idoris(
+        script(pending_then(json!({"v":1,"op":"elevated",
+            "challenge_id":"c1c1c1c1c1c1c1c1","grant":"bad\u{1}grant","expires_in":60}))),
+        home.path(),
+    );
+    let (ok, stdout, _) = run_idoris(home.path(), &["install", "--yes", "--json"], &os_path());
+    assert!(!ok);
+    assert_eq!(error_body(&stdout)["error"]["code"], "invalid_response");
+    assert_eq!(
+        fake.seen.lock().unwrap().len(),
+        1,
+        "no resend without the grant"
+    );
+}

@@ -125,13 +125,17 @@ impl FirstPartyAuthority {
                 else {
                     return;
                 };
-                format!(
-                    "connect iDoris to oMLX at {}; daily model: {}; deep model: {}; share the local oMLX credential with iDoris: {}; save oMLX credential: {}; replace existing connection: {}; core reserved bytes: {}",
+                let (Some(endpoint), Some(daily), Some(deep)) = (
                     shown(&body.endpoint),
                     shown(&body.daily_model),
                     body.deep_model
                         .as_deref()
-                        .map_or_else(|| "none".to_owned(), shown),
+                        .map_or_else(|| Some("none".to_owned()), shown),
+                ) else {
+                    return;
+                };
+                format!(
+                    "connect iDoris to oMLX at {endpoint}; daily model: {daily}; deep model: {deep}; share the local oMLX credential with iDoris: {}; save oMLX credential: {}; replace existing connection: {}; core reserved bytes: {}",
                     body.consent.as_ref().is_some_and(|c| c.share_omlx_key),
                     body.save_omlx_key,
                     body.replace,
@@ -211,7 +215,7 @@ impl FirstPartyAuthority {
                     .path
                     .strip_prefix("/api/v1/idoris/operations/")?
                     .strip_suffix("/cancel")?;
-                return Some(format!("cancel iDoris operation {}", shown(id)));
+                return Some(format!("cancel iDoris operation {}", shown(id)?));
             }
             _ => {}
         }
@@ -589,14 +593,25 @@ impl EnrollAuthority for FirstPartyAuthority {
     }
 }
 
-/// A request-supplied string as shown in a presence summary: no control
-/// characters, at most 120 characters.
-fn shown(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(120)
-        .collect()
+/// The longest request-supplied value a presence summary shows.
+const SHOWN_MAX_CHARS: usize = 120;
+
+/// A request-supplied string exactly as a presence summary shows it, or
+/// `None` when it cannot be shown faithfully, which leaves nothing to
+/// approve. Control, format (bidi overrides, zero-width), line and paragraph
+/// separator characters are refused rather than dropped: dropping them
+/// would let two different values read the same. An over-long value is
+/// refused rather than cut, so no hidden suffix rides along.
+fn shown(value: &str) -> Option<String> {
+    use unicode_general_category::{GeneralCategory as G, get_general_category};
+    let hidden = |c: char| {
+        matches!(
+            get_general_category(c),
+            G::Control | G::Format | G::LineSeparator | G::ParagraphSeparator
+        )
+    };
+    (value.chars().count() <= SHOWN_MAX_CHARS && !value.chars().any(hidden))
+        .then(|| value.to_owned())
 }
 pub fn body_digest(body: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -1119,7 +1134,7 @@ mod tests {
         assert!(summary.contains("consent: true"), "{summary}");
 
         let connect = serde_json::to_vec(&serde_json::json!({
-            "endpoint": "http://127.0.0.1:8000\u{1b}[2J", "daily_model": "daily-m",
+            "endpoint": "http://127.0.0.1:8000", "daily_model": "daily-m",
             "deep_model": null, "core_reserved_bytes": 1024, "save_omlx_key": false,
             "replace": true,
             "consent": {"share_omlx_key": true, "daily_model": "daily-m", "deep_model": null}
@@ -1129,7 +1144,7 @@ mod tests {
         let target = resolve_target(&idoris("POST", "/api/v1/idoris/connect", &connect)).unwrap();
         let summary = authority.target_summary("id", &target).unwrap();
         for detail in [
-            "oMLX at http://127.0.0.1:8000[2J",
+            "oMLX at http://127.0.0.1:8000;",
             "daily model: daily-m",
             "deep model: none",
             "share the local oMLX credential with iDoris: true",
@@ -1138,7 +1153,6 @@ mod tests {
         ] {
             assert!(summary.contains(detail), "{summary}");
         }
-        assert!(!summary.contains('\u{1b}'));
         assert!(!summary.contains("CLIENT SECRET"));
         // Another body hashes differently: the remembered summary does not cover it.
         let other = resolve_target(&idoris("POST", "/api/v1/idoris/connect", b"{}")).unwrap();
@@ -1148,6 +1162,37 @@ mod tests {
         let bad =
             resolve_target(&idoris("POST", "/api/v1/idoris/install", b"{\"bad\":1}")).unwrap();
         assert!(authority.target_summary("x", &bad).is_none());
+    }
+
+    #[test]
+    fn summaries_refuse_hidden_characters_and_hidden_suffixes() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let summary = |daily: &str| {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "endpoint": "http://127.0.0.1:8000", "daily_model": daily,
+                "consent": {"share_omlx_key": true, "daily_model": daily}
+            }))
+            .unwrap();
+            authority.remember_idoris_request("id", "/api/v1/idoris/connect", &bytes);
+            let target = resolve_target(&idoris("POST", "/api/v1/idoris/connect", &bytes)).unwrap();
+            authority.target_summary("id", &target)
+        };
+        let at_limit = "m".repeat(SHOWN_MAX_CHARS);
+        assert!(summary(&at_limit).unwrap().contains(&at_limit));
+        for (label, daily) in [
+            (
+                "U+202E right-to-left override",
+                "safe\u{202E}ledom".to_owned(),
+            ),
+            ("U+200B zero-width space", "daily\u{200B}-m".to_owned()),
+            ("U+2028 line separator", "daily\u{2028}-m".to_owned()),
+            ("hidden suffix past the limit", format!("{at_limit}-evil")),
+        ] {
+            assert_eq!(summary(&daily), None, "{label}");
+        }
+        let cancel = "/api/v1/idoris/operations/a\u{200B}b/cancel";
+        let target = resolve_target(&idoris("POST", cancel, b"")).unwrap();
+        assert_eq!(authority.target_summary("id", &target), None);
     }
 
     #[test]

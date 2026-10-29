@@ -1245,6 +1245,17 @@ async fn authorize(
                 }
                 if let Some(grant) = grant {
                     let (parts, body) = req.into_parts();
+                    // A grant binds method, path and body; a query string is
+                    // none of those, so the approved text could not describe
+                    // it (`/candidates?endpoint=` would reach another port).
+                    // No CLI request carries one: refuse before consuming.
+                    if parts.uri.query().is_some() {
+                        return error_response(
+                            StatusCode::FORBIDDEN,
+                            "elevation_invalid",
+                            "Elevation grant is invalid",
+                        );
+                    }
                     let bytes = match axum::body::to_bytes(
                         body,
                         agent24_domain::http::MAX_BODY_BYTES,

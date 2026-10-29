@@ -9,7 +9,7 @@ const status = {
 } satisfies IdorisStatus
 const operation = {
   operation_id: 'op', action: 'install', phase: 'downloading', result: null,
-  error_code: null, cancellable: true, idempotency_key: 'test', verification,
+  error_code: null, cancellable: true, verification,
   download_progress: { bytes_done: 1, bytes_total: 2 },
 } satisfies IdorisOperation
 const invalidResponse = new IdorisError('invalid_response')

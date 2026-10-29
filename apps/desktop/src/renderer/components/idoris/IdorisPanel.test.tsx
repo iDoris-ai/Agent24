@@ -13,7 +13,7 @@ const initial: Status = { state: 'not_installed', version: null, data_port: null
 const installed: Status = { ...initial, state: 'not_configured', version: '0.4.0' }
 const running: Status = { ...installed, state: 'running', data_port: 8740, admin_port: 8741, roles: ['daily'] }
 const candidate = (endpoint: string) => ({ endpoint, identity: 'omlx', authentication: 'ready', models: ['real/daily', 'real/deep'] })
-const operation = (action: Operation['action']): Operation => ({ operation_id: 'op-1', action, phase: 'queued', result: null, error_code: null, cancellable: true, idempotency_key: 'test' })
+const operation = (action: Operation['action']): Operation => ({ operation_id: 'op-1', action, phase: 'queued', result: null, error_code: null, cancellable: true })
 let status: Status
 let op: Operation
 let candidates: unknown
