@@ -35,6 +35,13 @@ type Failure = 'not_started' | 'invalid_binding' | 'login_unavailable' | 'creden
 
 export type HostResult = { ok: true } | { ok: false; reason: Failure }
 
+/** Where an active binding's calls go: the Knowledge server's API base and the
+ * knowledge bases they may search. From trusted settings only, never a renderer. */
+export interface KnowledgeEndpoint {
+  endpoint: string
+  knowledgeBaseIds: readonly string[]
+}
+
 /** One request to the daemon: its status and the `error.code` of its body. */
 export type HostTransport = (connection: DaemonConnection, method: 'PUT' | 'DELETE', path: string, body?: string)
   => Promise<{ status: number; code?: string }>
@@ -80,7 +87,7 @@ export interface KnowledgeHostDeps {
 export class KnowledgeHost {
   private started: LoadResult | null = null
   // Bindings that should be active in the daemon, with their current C.
-  private readonly wanted = new Map<string, { credential: KnowledgeCredential | null }>()
+  private readonly wanted = new Map<string, { endpoint: KnowledgeEndpoint | null; credential: KnowledgeCredential | null }>()
   private readonly locks = new Map<string, Promise<unknown>>()
   private connectionKey: string | null = null
   // Bindings whose daemon record may differ from `wanted`, and those queued to be fixed.
@@ -126,12 +133,20 @@ export class KnowledgeHost {
     }
   }
 
-  activate(bindingId: string): Promise<HostResult> {
+  /** Activates `bindingId`, with the endpoint its calls use; without one the
+   * daemon refuses every call of the binding. */
+  activate(bindingId: string, endpoint: KnowledgeEndpoint | null = null): Promise<HostResult> {
+    const copy = endpoint && { endpoint: endpoint.endpoint, knowledgeBaseIds: [...endpoint.knowledgeBaseIds] }
     return this.operate(bindingId, async () => {
       // Activating drops C in the daemon; it is pushed again afterwards.
-      this.wanted.set(bindingId, { credential: null })
-      return this.track(bindingId, await this.send(bindingId, 'PUT', ''))
+      this.wanted.set(bindingId, { endpoint: copy, credential: null })
+      return this.track(bindingId, await this.send(bindingId, 'PUT', '', activationBody(copy)))
     })
+  }
+
+  /** Whether `bindingId` should be active in the daemon. */
+  isWanted(bindingId: string): boolean {
+    return this.wanted.has(bindingId)
   }
 
   deactivate(bindingId: string): Promise<HostResult> {
@@ -232,7 +247,7 @@ export class KnowledgeHost {
     const unsynced = this.unsynced
     if (!unsynced.has(bindingId)) return
     const wanted = this.wanted.get(bindingId)
-    const result = await this.send(bindingId, wanted ? 'PUT' : 'DELETE', '')
+    const result = await this.send(bindingId, wanted ? 'PUT' : 'DELETE', '', wanted ? activationBody(wanted.endpoint) : undefined)
     if (!result.ok) {
       // A refusal will not change by asking again.
       if (!PASSING.includes(result.reason)) unsynced.delete(bindingId)
@@ -276,6 +291,10 @@ function classify(response: { status: number; code?: string }): Failure {
   if (response.code === 'binding_inactive') return 'binding_inactive'
   if (response.status === 503) return 'daemon_unavailable'
   return 'refused'
+}
+
+function activationBody(endpoint: KnowledgeEndpoint | null): string | undefined {
+  return endpoint ? JSON.stringify({ endpoint: endpoint.endpoint, knowledge_base_ids: endpoint.knowledgeBaseIds }) : undefined
 }
 
 function credentialBody(credential: KnowledgeCredential): string {

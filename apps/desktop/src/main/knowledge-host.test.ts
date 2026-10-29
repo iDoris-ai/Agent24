@@ -166,6 +166,21 @@ describe('KnowledgeHost (KB-HOST-01 PR-B2b)', () => {
     expect(daemon.sent.every((r) => r.token === 'Bearer t1')).toBe(true)
   })
 
+  it('activates with the endpoint as a body, and replays it to a new daemon', async () => {
+    const host = makeHost()
+    host.start()
+    await host.activate('b1', { endpoint: 'https://kb.example/api/v1', knowledgeBaseIds: ['kb-a'] })
+    const body = JSON.stringify({ endpoint: 'https://kb.example/api/v1', knowledge_base_ids: ['kb-a'] })
+    expect(daemon.sent[0]).toMatchObject({ method: 'PUT', path: B1, body })
+    expect(host.isWanted('b1')).toBe(true)
+    daemon.setConnection({ port: 2, authHeaders: { Authorization: 'Bearer t2' } })
+    host.sync()
+    await vi.waitFor(() => expect(daemon.sent).toHaveLength(2))
+    expect(daemon.sent[1]).toMatchObject({ token: 'Bearer t2', method: 'PUT', path: B1, body })
+    await host.deactivate('b1')
+    expect(host.isWanted('b1')).toBe(false)
+  })
+
   it('refuses a malformed binding id and a push for a binding it did not activate, sending nothing', async () => {
     const host = makeHost()
     host.start()
