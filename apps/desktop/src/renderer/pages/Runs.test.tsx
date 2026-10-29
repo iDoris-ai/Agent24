@@ -3,6 +3,7 @@ import { beforeEach, describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import RunsPage from './Runs'
 import { setLocale } from '../i18n'
+import { runsMessages } from './Runs.i18n'
 
 function proxyMock(handler: (req: { method: string; path: string }) => unknown) {
   return vi.fn((req: { method: string; path: string }) =>
@@ -24,6 +25,51 @@ it('renders the English runs title by default', () => {
   window.agent24 = { backendProxy: proxyMock(() => ({ ok: true, status: 200, data: { runs: [] } })) } as never
   render(<RunsPage />)
   expect(screen.getByText('Runs')).toBeInTheDocument()
+})
+
+describe('ID-HR-2 run confirmation', () => {
+  const failedRun = { ...RUN, status: 'failed', session_id: 'session_original', input: { prompt: 'original prompt', model_override: 'local-model', mode: 'plan', workspace_id: 'ws_original' }, error: { code: 'idoris_headroom_confirmation_required', message: 'reserved memory' } }
+
+  it('reruns only after confirmation with the original input and selects the new run', async () => {
+    const rerun = { ...failedRun, id: 'run_2', status: 'running', error: null }
+    const proxy = vi.fn(async (req: { method: string; path: string; body?: unknown }) => {
+      if (req.method === 'POST') return { ok: true, status: 202, data: rerun }
+      return { ok: true, status: 200, data: { runs: [failedRun] } }
+    })
+    window.agent24 = { backendProxy: proxy } as never
+    render(<RunsPage />)
+    fireEvent.click(await screen.findByText('original prompt'))
+    expect(screen.getByText(/iDoris needs to use memory reserved for the system/)).toBeInTheDocument()
+    expect(proxy.mock.calls.filter(([req]) => req.method === 'POST')).toHaveLength(0)
+    const button = screen.getByRole('button', { name: 'Rerun and confirm' })
+    fireEvent.click(button)
+    fireEvent.click(button)
+    await waitFor(() => expect(screen.getByText('run_2')).toBeInTheDocument())
+    expect(proxy.mock.calls.filter(([req]) => req.method === 'POST')).toEqual([[{ method: 'POST', path: '/api/v1/runs', body: { ...failedRun.input, session_id: 'session_original', idoris_headroom_confirmed: true } }]])
+  })
+
+  it('explains why a Knowledge host run cannot be rerun through the desktop proxy', async () => {
+    window.agent24 = { backendProxy: proxyMock(() => ({ ok: true, status: 200, data: { runs: [{ ...failedRun, input: { ...failedRun.input, knowledge_binding_id: 'binding_1' } }] } })) } as never
+    render(<RunsPage />)
+    fireEvent.click(await screen.findByText('original prompt'))
+    expect(screen.getByText(/iDoris needs to use memory reserved for the system/)).toBeInTheDocument()
+    expect(screen.getByText(/Knowledge host/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Rerun and confirm' })).not.toBeInTheDocument()
+  })
+
+  it('shows supervisor busy as retryable without headroom confirmation', async () => {
+    window.agent24 = { backendProxy: proxyMock(() => ({ ok: true, status: 200, data: { runs: [{ ...failedRun, error: { code: 'idoris_supervisor_busy', message: 'busy' } }] } })) } as never
+    render(<RunsPage />)
+    fireEvent.click(await screen.findByText('original prompt'))
+    expect(screen.getByText(/iDoris is busy.*try again/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Rerun and confirm' })).not.toBeInTheDocument()
+  })
+
+  it.each(['en', 'zh', 'th'] as const)('has complete nonempty run confirmation translations in %s', locale => {
+    for (const key of ['headroom.explanation', 'headroom.confirm', 'headroom.hostOnly', 'error.supervisorBusy']) {
+      expect(runsMessages[locale]).toHaveProperty([key], expect.stringMatching(/\S/))
+    }
+  })
 })
 
 describe('RunsPage', () => {

@@ -179,6 +179,7 @@ pub struct CallbackDeps {
 /// better shape, but the namespace is fixed by ADR-029 / SPEC-MD-ME §2, so it is
 /// raised there rather than changed here.
 const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
+    "idoris",
     // A3-2a (`docs/design/A3-ATTACHED-MODULE.md` §3.2 M7): the attached-module
     // registry lives at `/api/v1/attached`, so no domain OS may be named
     // `attached` — same reservation mechanism as every other kernel segment

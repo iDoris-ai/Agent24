@@ -23,6 +23,7 @@ mod acp;
 mod comm_groups;
 mod documents;
 mod enroll;
+mod idoris;
 mod module_tools;
 mod offline_db;
 mod query;
@@ -49,9 +50,17 @@ enum Command {
         /// Model id override
         #[arg(long)]
         model: Option<String>,
+        /// Confirm using iDoris's reserved memory headroom for this request
+        #[arg(long)]
+        confirm_headroom: bool,
     },
     /// List models known to the daemon
     Models,
+    /// Install, run and connect managed iDoris through the daemon
+    Idoris {
+        #[command(subcommand)]
+        action: idoris::IdorisAction,
+    },
     /// Install/remove 24/7 unattended operation (macOS LaunchAgent)
     Service {
         #[command(subcommand)]
@@ -1133,9 +1142,14 @@ async fn read_reply(
     })
 }
 
-async fn cmd_chat(message: String, model: Option<String>) -> Result<(), String> {
+async fn cmd_chat(
+    message: String,
+    model: Option<String>,
+    confirm_headroom: bool,
+) -> Result<(), String> {
     let ep = connect().await?;
     let req = ChatRequest {
+        idoris_headroom_confirmed: confirm_headroom,
         messages: vec![ChatMessage {
             role: "user".to_owned(),
             content: message,
@@ -1166,6 +1180,13 @@ async fn cmd_chat(message: String, model: Option<String>) -> Result<(), String> 
         Ok(res) => {
             let status = res.status();
             let body = res.text().await.unwrap_or_default();
+            if serde_json::from_str::<agent24_protocol::ErrorEnvelope>(&body)
+                .is_ok_and(|body| body.error.code == "idoris_headroom_confirmation_required")
+            {
+                eprintln!(
+                    "iDoris needs reserved memory headroom. Resend with --confirm-headroom to confirm this request."
+                );
+            }
             Err(format!("daemon returned {status}: {body}"))
         }
         Err(e) => Err(e.to_string()),
@@ -1630,7 +1651,7 @@ fn cmd_hw(action: HwAction) -> Result<(), String> {
         } => {
             // usable_bytes already accounts for OS and App overhead. Deduct
             // only the explicit core allocation, and preserve a real zero.
-            let bytes = report.usable_bytes.saturating_sub(core_reserved_bytes);
+            let bytes = report.idoris_budget_bytes(core_reserved_bytes);
             println!("IDORIS_ALLOCATED_BUDGET_BYTES={bytes}");
             Ok(())
         }
@@ -2901,8 +2922,13 @@ fn cmd_service(action: ServiceAction) -> Result<(), String> {
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Chat { message, model } => cmd_chat(message, model).await,
+        Command::Chat {
+            message,
+            model,
+            confirm_headroom,
+        } => cmd_chat(message, model, confirm_headroom).await,
         Command::Models => cmd_models().await,
+        Command::Idoris { action } => idoris::run(action).await,
         Command::Daemon { action } => cmd_daemon(action).await,
         Command::Service { action } => cmd_service(action),
         Command::Tui => cmd_tui().await,

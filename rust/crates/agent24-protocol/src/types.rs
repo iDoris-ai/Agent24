@@ -297,6 +297,9 @@ pub struct ChatMessage {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ChatRequest {
+    /// Confirmation for this request only; never inherited by later requests.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub idoris_headroom_confirmed: bool,
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub model: Option<String>,
@@ -473,6 +476,9 @@ pub struct Run {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RunCreate {
+    /// Confirmation for the first model call only; never persisted or resumed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub idoris_headroom_confirmed: bool,
     /// Omit/null to create a transient run
     #[serde(default)]
     pub session_id: Option<String>,

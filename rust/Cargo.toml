@@ -8,6 +8,7 @@ members = [
     "crates/agent24-domain",
     "crates/agent24-documents-client",
     "crates/agent24-hw",
+    "crates/agent24-idoris",
     "crates/agent24-knowledge",
     "crates/agent24-os-fd",
     "crates/agent24-os-proc",

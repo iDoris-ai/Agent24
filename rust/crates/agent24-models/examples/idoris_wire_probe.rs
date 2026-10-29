@@ -32,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         max_tokens: std::num::NonZeroU32::new(512),
         disable_thinking: true,
+        idoris_headroom_confirmed: false,
         progress: None,
         temperature: None,
     };

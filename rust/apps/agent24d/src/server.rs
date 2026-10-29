@@ -54,6 +54,9 @@ pub struct AppState {
     /// D2 router: every model call goes through tier routing + health/cooldown,
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
+    pub idoris_host: Option<Arc<agent24d::idoris_host::IdorisHost>>,
+    pub idoris_unavailable: bool,
+    pub managed_idoris: Option<Arc<agent24d::managed_idoris::ManagedIdoris>>,
     pub tools: Arc<agent24_tools::ToolRegistry>,
     /// H2: the user's risk overrides. Held here as well as inside the registry
     /// because the two need the SAME object — the registry resolves against it
@@ -188,6 +191,7 @@ pub struct Shutdown {
     /// decide, once and atomically, which came first (see
     /// [`Shutdown::commit_ready`]).
     phase: Arc<std::sync::atomic::AtomicU8>,
+    idoris_budget: Arc<std::sync::atomic::AtomicBool>,
 }
 
 const STARTING: u8 = 0;
@@ -205,6 +209,7 @@ impl Shutdown {
     pub fn with_params(token: CancellationToken, params: crate::lifecycle::Params) -> Self {
         Self {
             token,
+            idoris_budget: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             began: Arc::new(std::sync::OnceLock::new()),
             params,
             armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -246,7 +251,15 @@ impl Shutdown {
     #[must_use]
     pub fn deadlines(&self) -> crate::lifecycle::Deadlines {
         let began = *self.began.get_or_init(tokio::time::Instant::now);
-        self.params.deadlines(began)
+        let mut deadlines = self.params.deadlines(began);
+        if self.idoris_budget.load(std::sync::atomic::Ordering::SeqCst) {
+            deadlines.persist = deadlines
+                .persist
+                .max(began + agent24d::idoris_host::SHUTDOWN_BUDGET);
+            deadlines.watchdog =
+                deadlines.http.max(deadlines.persist) + crate::lifecycle::WATCHDOG_MARGIN;
+        }
+        deadlines
     }
 
     /// When the HTTP drain must be done.
@@ -400,6 +413,7 @@ impl agent24_scheduler::RunTrigger for KernelTrigger {
                     model_override,
                 } = action;
                 let create = agent24_protocol::RunCreate {
+                    idoris_headroom_confirmed: false,
                     session_id: session_id.clone(),
                     workspace_id: None,
                     prompt: prompt.clone(),
@@ -691,6 +705,9 @@ impl AppState {
             presence_desktop: None,
             mcp_servers: Arc::new(mcp_servers),
             router,
+            managed_idoris: None,
+            idoris_host: None,
+            idoris_unavailable: false,
             tools,
             broker,
             module_approval_broker,
@@ -1342,6 +1359,29 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
     }
     let kernel = Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/idoris/status", get(crate::idoris_routes::status))
+        .route(
+            "/api/v1/idoris/install",
+            post(crate::idoris_routes::install),
+        )
+        .route(
+            "/api/v1/idoris/connect",
+            post(crate::idoris_routes::connect),
+        )
+        .route(
+            "/api/v1/idoris/omlx/candidates",
+            get(crate::idoris_routes::candidates),
+        )
+        .route("/api/v1/idoris/start", post(crate::idoris_routes::start))
+        .route("/api/v1/idoris/stop", post(crate::idoris_routes::stop))
+        .route(
+            "/api/v1/idoris/operations/{id}",
+            get(crate::idoris_routes::operation),
+        )
+        .route(
+            "/api/v1/idoris/operations/{id}/cancel",
+            post(crate::idoris_routes::cancel),
+        )
         .route("/api/v1/chat", post(crate::routes::post_chat))
         .route("/api/v1/models", get(crate::routes::get_models))
         .route(
@@ -1727,6 +1767,10 @@ fn spawn_approval_recovery_scan_every(
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "startup options include both enrollment and injected iDoris dependencies"
+)]
 pub async fn serve(
     port: u16,
     ephemeral: bool,
@@ -1735,6 +1779,7 @@ pub async fn serve(
     enroll_endpoint: bool,
     ready_omit_token: bool,
     cancel: CancellationToken,
+    idoris_dependencies: Option<agent24d::managed_idoris::ManagedDependencies>,
 ) -> Result<(), std::io::Error> {
     let startup = std::time::Instant::now();
     tracing::debug!(ephemeral, "startup: serve");
@@ -1764,6 +1809,13 @@ pub async fn serve(
     let (params, config_warnings) = crate::lifecycle::Params::from_process_env();
     let mut config_warnings = config_warnings;
     let shutdown = Shutdown::with_params(cancel.clone(), params);
+    let idoris_root =
+        agent24_idoris::install::default_install_root().map_err(std::io::Error::other)?;
+    if !ephemeral {
+        shutdown
+            .idoris_budget
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     if let Some(parent_liveness) = parent_liveness {
         let parent_shutdown = shutdown.clone();
         tokio::spawn(async move {
@@ -1934,6 +1986,59 @@ pub async fn serve(
         .join("workspace");
     std::fs::create_dir_all(&workspace)?;
     let router = Arc::new(ModelRouter::from_env());
+    let managed_idoris = if ephemeral {
+        None
+    } else {
+        let path = agent24_protocol::state_file::state_dir()
+            .ok_or_else(|| std::io::Error::other("HOME not set"))?
+            .join("idoris-connection.json");
+        let managed = Arc::new(agent24d::managed_idoris::ManagedIdoris::new(
+            router.clone(),
+            path,
+        )?);
+        if managed.is_configured()?
+            && let Some(dependencies) = idoris_dependencies.as_ref()
+        {
+            managed
+                .restore(dependencies, &cancel)
+                .await
+                .map_err(std::io::Error::other)?;
+        }
+        Some(managed)
+    };
+    let mut idoris_unavailable = false;
+    let mut idoris_host = if let Some(managed) = &managed_idoris {
+        match agent24d::idoris_host::IdorisHost::system(
+            idoris_root,
+            managed.clone(),
+            router.clone(),
+        ) {
+            Ok(host) => Some(host),
+            Err(error) => {
+                tracing::warn!(%error, "iDoris lifecycle unavailable; daemon startup continues");
+                idoris_unavailable = true;
+                router.block_idoris("iDoris lifecycle unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Registered before restore can spawn a process, including startup cancellation.
+    let idoris_stopping = idoris_host
+        .as_ref()
+        .map(|host| host.stop_on_shutdown(cancel.clone()));
+    if let Some(host) = &idoris_host
+        && let Err(code) = host.restore().await
+    {
+        tracing::warn!(
+            ?code,
+            "iDoris restore unavailable; daemon startup continues"
+        );
+        idoris_unavailable = true;
+        router.block_idoris("iDoris restore unavailable");
+        idoris_host = None;
+    }
     let guardian = build_guardian(&router);
     // D1 session memory: a KV file next to the main store (ephemeral daemons get
     // an in-memory one). A failure here degrades to no memory rather than
@@ -2194,6 +2299,9 @@ pub async fn serve(
         mcp_servers,
         packages_root: Arc::clone(&packages_root),
     });
+    state.managed_idoris = managed_idoris;
+    state.idoris_host = idoris_host;
+    state.idoris_unavailable = idoris_unavailable;
     if let Some(capability_store) = capability_store {
         state.enable_capability_auth(capability_store);
         if mode == StartupMode::HostChild {
@@ -2500,10 +2608,19 @@ pub async fn serve(
                 None => None,
             }
         };
-        let (supervisors_result, comm_result) = tokio::join!(
+        let (supervisors_result, comm_result, idoris_result) = tokio::join!(
             tokio::time::timeout_at(deadlines.modules, stop_supervisors(closed, params.drain)),
             tokio::time::timeout_at(deadlines.modules, comm_shutdown),
+            tokio::time::timeout_at(deadlines.persist - crate::lifecycle::PERSIST, async move {
+                match idoris_stopping {
+                    Some(task) => task.await,
+                    None => Ok(Ok(())),
+                }
+            }),
         );
+        if !matches!(idoris_result, Ok(Ok(Ok(())))) {
+            tracing::warn!("managed iDoris shutdown failed or exceeded the host budget");
+        }
         if supervisors_result.is_err() {
             tracing::warn!(
                 "out-of-process modules were still stopping at the deadline; their supervisors \
@@ -4221,6 +4338,18 @@ pub(crate) mod tests {
     async fn body_json(res: Response) -> serde_json::Value {
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn idoris_shutdown_budget_includes_drain_and_frozen_term_grace() {
+        let shutdown = Shutdown::new(CancellationToken::new());
+        shutdown
+            .idoris_budget
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let deadlines = shutdown.deadlines();
+        assert!(deadlines.persist - deadlines.began >= std::time::Duration::from_secs(50));
+        assert!(deadlines.watchdog > deadlines.persist);
+        assert!(deadlines.modules < deadlines.persist);
     }
 
     pub(crate) async fn capability_state() -> (AppState, String, String) {
@@ -7788,6 +7917,7 @@ pub fn build_router_with_modules() {
         );
         let first = runs
             .start_run(agent24_protocol::RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some(session_id.into()),
                 prompt: "检查一下".into(),
                 model_override: None,

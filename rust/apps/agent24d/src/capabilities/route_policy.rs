@@ -61,6 +61,14 @@ const fn row(
 #[rustfmt::skip]
 const POLICIES: &[RoutePolicy] = &[
     row("GET", "/api/v1/health", Operation::HealthRead, AssuranceLevel::Public),
+    row("GET", "/api/v1/idoris/status", Operation::IdorisLifecycle, AssuranceLevel::Elevated),
+    row("POST", "/api/v1/idoris/install", Operation::IdorisLifecycle, AssuranceLevel::Elevated),
+    row("POST", "/api/v1/idoris/connect", Operation::IdorisLifecycle, AssuranceLevel::Elevated),
+    row("GET", "/api/v1/idoris/omlx/candidates", Operation::IdorisLifecycle, AssuranceLevel::Elevated),
+    row("POST", "/api/v1/idoris/start", Operation::IdorisLifecycle, AssuranceLevel::Elevated),
+    row("POST", "/api/v1/idoris/stop", Operation::IdorisLifecycle, AssuranceLevel::Elevated),
+    row("GET", "/api/v1/idoris/operations/{id}", Operation::IdorisLifecycle, AssuranceLevel::Elevated),
+    row("POST", "/api/v1/idoris/operations/{id}/cancel", Operation::IdorisLifecycle, AssuranceLevel::Elevated),
     row("POST", "/api/v1/chat", Operation::ChatCreate, AssuranceLevel::Everyday),
     row("GET", "/api/v1/models", Operation::ModelsRead, AssuranceLevel::Everyday),
     row("GET", "/api/v1/decide/profile", Operation::ConfigRead, AssuranceLevel::Everyday),

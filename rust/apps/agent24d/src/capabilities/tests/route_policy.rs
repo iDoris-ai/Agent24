@@ -90,6 +90,25 @@ fn section_3_rows_match_operation_and_level() {
         level: AssuranceLevel::Elevated,
     });
 
+    // IL-03/IL-13 lifecycle routes extend the frozen CORE-2 table.
+    for (method, path) in [
+        ("GET", "/idoris/status"),
+        ("POST", "/idoris/install"),
+        ("POST", "/idoris/connect"),
+        ("GET", "/idoris/omlx/candidates"),
+        ("POST", "/idoris/start"),
+        ("POST", "/idoris/stop"),
+        ("GET", "/idoris/operations/{id}"),
+        ("POST", "/idoris/operations/{id}/cancel"),
+    ] {
+        fixed.push(DesignRow {
+            method: method.into(),
+            path: path.into(),
+            operation: "IdorisLifecycle".into(),
+            level: AssuranceLevel::Elevated,
+        });
+    }
+
     let mut catalog = BTreeSet::new();
     for policy in policies() {
         assert!(
