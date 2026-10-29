@@ -613,12 +613,22 @@ mod tests {
                     //   reported it the moment ME-3b-3's `which()` began reading
                     //   PATH on the daemon side: the READING was right, the
                     //   conclusion would have been wrong.
+                    // - LOCALAPPDATA: read only by the Windows branch of
+                    //   `data_dir()` (ADR-037); launchd/LaunchAgents exist on
+                    //   macOS only. There is currently no Windows service; when
+                    //   one is added, check whether LOCALAPPDATA must be passed
+                    //   through.
                     if let Some(name) = name {
                         let shouty = !name.is_empty()
                             && name
                                 .chars()
                                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-                        if shouty && !matches!(name.as_str(), "HOME" | "PATH" | "IDORIS_API_KEY") {
+                        if shouty
+                            && !matches!(
+                                name.as_str(),
+                                "HOME" | "PATH" | "LOCALAPPDATA" | "IDORIS_API_KEY"
+                            )
+                        {
                             found.push(name);
                         }
                     }
@@ -665,6 +675,12 @@ mod tests {
                     continue;
                 }
                 walk_rs(&p, f);
+            } else if p.file_name().is_some_and(|n| n == "tests.rs") {
+                // A `tests.rs` file is a unit-test module pulled in by
+                // `#[cfg(test)] mod tests;`; it never ships in the daemon. The
+                // same reasoning as `tests/` above: opt-in real-binary knobs such
+                // as `IDORIS_TEST_BINARY` live there and are never forwarded.
+                continue;
             } else if p.extension().is_some_and(|x| x == "rs") {
                 f(&p);
             }

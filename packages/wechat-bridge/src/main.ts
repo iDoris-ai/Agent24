@@ -7,7 +7,6 @@
 // you send the bot become agent24d runs, and replies (and approval requests)
 // come back in the chat.
 
-import path from 'node:path'
 import { login } from './ilink/auth.js'
 import { ILinkClient } from './ilink/client.js'
 import { Monitor } from './ilink/monitor.js'
@@ -40,7 +39,7 @@ async function main(): Promise<void> {
   const { bot_token, baseurl } = await login()
   const client = new ILinkClient(bot_token, baseurl)
   const sender = new Sender(client)
-  const bridge = new Bridge(new Agent24Client(daemon), sender, new FileSessionStore(path.join(path.dirname(CONFIG.TOKEN_FILE), 'wechat-sessions.json')), CONFIG.ALLOWED_UIDS)
+  const bridge = new Bridge(new Agent24Client(daemon), sender, new FileSessionStore(CONFIG.SESSION_FILE), CONFIG.ALLOWED_UIDS)
 
   const monitor = new Monitor(client, (msg) => {
     void bridge.handle(msg).catch((err) =>

@@ -1,0 +1,127 @@
+# TUI-1 / ADR-037 "TUI 能力对齐" 豁免表。
+# CI (scripts/tui-coverage.mjs) 语义是「不降」：protocol/openapi.yaml 的每个 operation 必须
+# 被 CLI (rust/apps/agent24-cli) 覆盖，或在此登记。补上 CLI 命令后必须同步删除对应条目
+# （脚本会把「已覆盖却仍在豁免」判为失败）。
+# category: visual | planned-tui-2 | planned-tui-3（ADR-037 §4：豁免只限纯视觉能力）
+#   visual           视觉类功能，终端不做
+#   planned-tui-2    计划在 TUI-2 补（管理/观测类命令）
+#   planned-tui-3    计划在 TUI-3 补（Sin90 / documents 领域命令）
+# fallback: CLI 补齐前的兜底方式。raw-http = 对 daemon 直接发 HTTP（Bearer token，端口/token 见 daemon ready 行）。
+exemptions:
+  - operationId: revokeModuleConsents
+    category: planned-tui-2
+    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
+  - operationId: revokeModuleToolConsent
+    category: planned-tui-2
+    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
+  - operationId: invokeAttachedModuleCommand
+    category: planned-tui-2
+    fallback: "raw-http，TUI-2 增加对应 agent24 子命令（桌面壳目前使用）"
+  - operationId: updateAttachedModule
+    category: planned-tui-2
+    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
+  - operationId: decideModuleApproval
+    category: planned-tui-2
+    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
+  - operationId: updateSchedule
+    category: planned-tui-2
+    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
+  - operationId: deleteSchedule
+    category: planned-tui-2
+    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
+  - operationId: runScheduleNow
+    category: planned-tui-2
+    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
+  - operationId: suspendSchedule
+    category: planned-tui-2
+    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
+  - operationId: resumeSchedule
+    category: planned-tui-2
+    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
+  - operationId: revokeStandingGrant
+    category: planned-tui-2
+    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
+  - operationId: setToolOverride
+    category: planned-tui-2
+    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
+  - operationId: deleteToolOverride
+    category: planned-tui-2
+    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
+  - operationId: forgetMemoryAssertion
+    category: planned-tui-2
+    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
+  - operationId: putMemorySettings
+    category: planned-tui-2
+    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
+  - operationId: sin90ListDirections
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: sin90CreateDirection
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: sin90ListBlocks
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: sin90CreateBlock
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: sin90TransitionBlock
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: sin90ListProposals
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: sin90SubmitProposal
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: sin90GetProposal
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: sin90AcceptProposal
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: sin90Attention
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: documentsGetCapabilities
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: documentsListDocuments
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: documentsGetDocument
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: documentsCreateUpload
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: documentsAppendUploadChunk
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: documentsImport
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: documentsGetJob
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: documentsCancelJob
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: documentsRetryJob
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: documentsRenderPage
+    category: visual
+    fallback: "终端不渲染页面位图；用 documentsReadText 对应的文本读取（TUI-3 补 CLI）或桌面壳查看"
+  - operationId: documentsReadText
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: documentsFind
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: documentsExtract
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: documentsGetExtraction
+    category: planned-tui-3
+    fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"

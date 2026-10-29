@@ -1,4 +1,4 @@
-//! `agent24 runs …`: the run operations the desktop app has
+//! `agent24 run …` (alias `runs`), list/show/cancel: the run operations the desktop app has
 //! (`apps/desktop/src/renderer/pages/agent/api.ts`: list, get, cancel), as REST
 //! calls to the same daemon routes, so a CLI use case exercises what the
 //! desktop does. Like `agent24 os`, it only uses a resident daemon: an
@@ -13,7 +13,7 @@ use clap::Subcommand;
 use super::{Endpoint, attach_only, bearer, client, daemon_error_line, finish};
 
 #[derive(Subcommand)]
-pub(crate) enum RunsAction {
+pub enum RunsAction {
     /// List runs (`GET /api/v1/runs`)
     List {
         #[arg(long)]
@@ -98,7 +98,7 @@ fn cancel_line(run: &Run) -> String {
 }
 
 pub(super) async fn resident() -> Result<Endpoint, String> {
-    if let Some(ep) = attach_only().await {
+    if let Some(ep) = attach_only().await? {
         return Ok(ep);
     }
     // `attach_only` also says no to a daemon that is running but keeps host
@@ -248,6 +248,7 @@ pub(crate) mod tests {
             base,
             token: "tok".to_owned(),
             child: None,
+            session: None,
         };
         (ep, seen)
     }
@@ -384,6 +385,7 @@ pub(crate) mod tests {
             base: "http://127.0.0.1:9".to_owned(),
             token: String::new(),
             child: None,
+            session: None,
         };
         for id in ["../shutdown#", "a/b", "a?b", "run_1#x", "", "run 1"] {
             let show = runs(

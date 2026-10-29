@@ -246,6 +246,31 @@ mod tests {
     }
 
     #[test]
+    fn idoris_suggestion_uses_the_same_allocation_as_hw_idoris_env() {
+        for ram in [0, 2, 8, 16, 64] {
+            let report = crate::HardwareReport::new(profile(ram * GIB), Some("16"));
+            if ram == 0 {
+                assert_eq!(
+                    report.idoris_budget_suggestion(),
+                    Err("hardware_memory_unavailable")
+                );
+            } else {
+                let Ok(suggestion) = report.idoris_budget_suggestion() else {
+                    panic!("known memory must produce a budget suggestion");
+                };
+                assert_eq!(
+                    suggestion.core_reserved_bytes,
+                    report.usable_bytes.min(4 * GIB)
+                );
+                assert_eq!(
+                    suggestion.idoris_budget_bytes,
+                    report.idoris_budget_bytes(suggestion.core_reserved_bytes)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn bad_cap_is_ignored_and_recorded() {
         let p = profile(16 * GIB);
         for raw in ["abc", "", "-3", "0", "1.5", "99999999999999999999"] {

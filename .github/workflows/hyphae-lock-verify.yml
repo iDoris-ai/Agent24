@@ -14,6 +14,8 @@ name: Hyphae lock verify
 # workflow file — the latter so that the job actually *runs* (and so proves
 # itself) the first time this workflow is introduced, rather than sitting
 # dormant until some future, unrelated lock edit.
+# CI also calls this workflow for linux-x64 and darwin-arm64; both use the
+# same locked recipe and publish a verified binary for the Rust test jobs.
 
 on:
   push:
@@ -27,16 +29,24 @@ on:
       - 'rust/crates/agent24-comm/hyphae.lock.json'
       - '.github/workflows/hyphae-lock-verify.yml'
   workflow_dispatch: {}
+  workflow_call:
+    inputs:
+      platform:
+        description: Locked platform to reproduce
+        type: string
+        default: linux-x64
 
 concurrency:
-  group: hyphae-lock-verify-${{ github.workflow }}-${{ github.ref }}
+  group: hyphae-lock-verify-${{ github.workflow }}-${{ inputs.platform || 'linux-x64' }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   verify-linux-x64:
-    name: Reproduce Hyphae linux-x64 and compare to lock
+    name: Reproduce Hyphae ${{ inputs.platform || 'linux-x64' }} and compare to lock
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      HYPHAE_PLATFORM: ${{ inputs.platform || 'linux-x64' }}
 
     steps:
       - name: Checkout Agent24 (for hyphae.lock.json)
@@ -49,9 +59,14 @@ jobs:
         id: lock
         run: |
           set -euo pipefail
+          case "$HYPHAE_PLATFORM" in
+            linux-x64) GOOS=linux; GOARCH=amd64 ;;
+            darwin-arm64) GOOS=darwin; GOARCH=arm64 ;;
+            *) echo "::error::unsupported platform: $HYPHAE_PLATFORM"; exit 1 ;;
+          esac
           LOCK=agent24/rust/crates/agent24-comm/hyphae.lock.json
           SOURCE_SHA=$(jq -r '.source_sha' "$LOCK")
-          EXPECTED=$(jq -r '.binaries["linux-x64"]' "$LOCK")
+          EXPECTED=$(jq -r --arg platform "$HYPHAE_PLATFORM" '.binaries[$platform]' "$LOCK")
           LOCK_GO=$(jq -r '.go' "$LOCK")
           RECIPE=$(jq -r '.recipe' "$LOCK")
           if ! printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
@@ -59,7 +74,7 @@ jobs:
             exit 1
           fi
           if ! printf '%s' "$EXPECTED" | grep -Eq '^[0-9a-f]{64}$'; then
-            echo "::error::hyphae.lock.json has no valid linux-x64 sha256"
+            echo "::error::hyphae.lock.json has no valid $HYPHAE_PLATFORM sha256"
             exit 1
           fi
           if ! printf '%s' "$LOCK_GO" | grep -Eq '^go[0-9]+\.[0-9]+\.[0-9]+$'; then
@@ -74,11 +89,13 @@ jobs:
             echo "source_sha=$SOURCE_SHA"
             echo "go_version=${LOCK_GO#go}"
             echo "expected=$EXPECTED"
+            echo "goos=$GOOS"
+            echo "goarch=$GOARCH"
             echo "recipe<<HYPHAE_RECIPE_EOF"
             echo "$RECIPE"
             echo "HYPHAE_RECIPE_EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "locked source_sha=$SOURCE_SHA expected linux-x64=$EXPECTED"
+          echo "locked source_sha=$SOURCE_SHA expected $HYPHAE_PLATFORM=$EXPECTED"
 
       - name: Checkout Hyphae at the locked source_sha
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
@@ -95,10 +112,12 @@ jobs:
         with:
           go-version: ${{ steps.lock.outputs.go_version }}
 
-      - name: Build linux-x64 per the locked recipe
+      - name: Build per the locked recipe
         working-directory: hyphae-src
         env:
           HYPHAE_RECIPE: ${{ steps.lock.outputs.recipe }}
+          LOCK_GOOS: ${{ steps.lock.outputs.goos }}
+          LOCK_GOARCH: ${{ steps.lock.outputs.goarch }}
         run: |
           set -euo pipefail
           # Substitute the recipe's own <os>/<arch> placeholders for this
@@ -106,7 +125,7 @@ jobs:
           # its own GOTOOLCHAIN=... prefix) runs exactly as the lock wrote
           # it, so a future recipe edit is honored without touching this
           # workflow.
-          cmd=$(printf '%s' "$HYPHAE_RECIPE" | sed -e 's/<os>/linux/g' -e 's/<arch>/amd64/g')
+          cmd=$(printf '%s' "$HYPHAE_RECIPE" | sed -e "s/<os>/$LOCK_GOOS/g" -e "s/<arch>/$LOCK_GOARCH/g")
           echo "+ $cmd"
           sh -c "$cmd"
           test -f hyphae || { echo "::error::recipe did not produce ./hyphae"; exit 1; }
@@ -117,14 +136,21 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$EXPECTED" ] || [ "$EXPECTED" = "null" ]; then
-            echo "::error::hyphae.lock.json has no recorded linux-x64 hash to verify against"
+            echo "::error::hyphae.lock.json has no recorded $HYPHAE_PLATFORM hash to verify against"
             exit 1
           fi
           actual=$(sha256sum hyphae-src/hyphae | awk '{print $1}')
           echo "expected=$EXPECTED"
           echo "actual=$actual"
           if [ "$actual" != "$EXPECTED" ]; then
-            echo "::error::linux-x64 build (sha256 $actual) does not match hyphae.lock.json's recorded hash ($EXPECTED)"
+            echo "::error::$HYPHAE_PLATFORM build (sha256 $actual) does not match hyphae.lock.json's recorded hash ($EXPECTED)"
             exit 1
           fi
-          echo "linux-x64 reproducible build matches hyphae.lock.json ($actual)"
+          echo "$HYPHAE_PLATFORM reproducible build matches hyphae.lock.json ($actual)"
+
+      - name: Upload verified Hyphae
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: hyphae-${{ env.HYPHAE_PLATFORM }}
+          path: hyphae-src/hyphae
+          if-no-files-found: error

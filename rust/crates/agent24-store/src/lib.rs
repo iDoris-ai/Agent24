@@ -23,6 +23,7 @@ mod allocation_retention_plan;
 mod allocation_retention_writer;
 mod allocation_types;
 mod audit;
+mod conn_phase;
 mod decision_log;
 mod legacy_recovery;
 mod message_origin;
@@ -38,6 +39,8 @@ mod run_workspace_authority;
 mod run_workspace_orphan;
 mod run_workspace_terminal;
 pub mod source_policy;
+#[doc(hidden)]
+pub mod sqlite_phase;
 mod terminal_core;
 mod terminal_helpers;
 pub(crate) mod terminal_mutations;
@@ -106,8 +109,8 @@ pub use source_policy::{
     StoredSourceTag, TOOL_RESULT_PREFIX, strictest_classification,
 };
 
-use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::{Connection, SqliteConnection, SqlitePool};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -136,9 +139,17 @@ pub enum StoreError {
     /// its closed-set/bounded-identifier validation.
     #[error("invalid audit metadata: {0}")]
     InvalidAuditMetadata(String),
+    /// Offline open refused to migrate. `current` is 0 when the file or the
+    /// `_sqlx_migrations` table is absent.
+    #[error("请先启动 daemon 完成升级 (applied {current}, binary {latest})")]
+    SchemaBehind { current: i64, latest: i64 },
+    #[error("database schema {current} is newer than this binary ({latest})")]
+    SchemaAhead { current: i64, latest: i64 },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+pub use conn_phase::{OBSERVE_UNCLOSED, PhaseError, PhaseFault, StoreConn, embedded_version};
 
 /// Persistence boundary for trusted, internally authorized workflow code.
 ///
@@ -160,21 +171,73 @@ pub struct Store {
 }
 
 impl Store {
+    /// Shut down this pool and await its connections, including pooled clones.
+    /// Finish any remaining WAL checkpoint with a single writable connection.
+    /// Offline callers must keep their singleton lock until this completes.
+    pub async fn close(self) -> Result<()> {
+        self.pool.close().await;
+        let options = self.pool.connect_options();
+        let has_sidecars = ["-wal", "-shm"].iter().any(|suffix| {
+            let mut name = options.get_filename().as_os_str().to_owned();
+            name.push(suffix);
+            Path::new(&name).exists()
+        });
+        if has_sidecars {
+            // Concurrent worker shutdowns can each miss SQLite's exclusive
+            // close-time checkpoint lock. Let SQLite clean up after every
+            // pooled worker has finished; never unlink WAL files ourselves.
+            let options = options.as_ref().clone().create_if_missing(false);
+            let mut conn = SqliteConnection::connect_with(&options).await?;
+            let checkpoint: std::result::Result<(i64, i64, i64), _> =
+                sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .fetch_one(&mut conn)
+                    .await;
+            let closed = conn.close().await;
+            let (busy, _, _) = checkpoint?;
+            closed?;
+            if busy != 0 {
+                return Err(StoreError::Conflict(
+                    "SQLite WAL checkpoint is busy after pool close".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Open (creating if needed) a database file and run migrations.
     pub async fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| StoreError::Conflict(e.to_string()))?;
+        StoreConn::migrate(path, PhaseFault::none())
+            .await
+            .map(StoreConn::into_store)
+            .map_err(|err| err.source)
+    }
+
+    /// Open an existing file and do not migrate it.
+    ///
+    /// A separate function, not a flag on [`Store::open`]: the daemon keeps
+    /// migrating, and an offline caller cannot forget the flag. A missing
+    /// file is schema 0 and is not created. The applied version is read on a
+    /// read-only connection that does not set `journal_mode` and does not
+    /// create the file. Only a matching version opens the read-write pool.
+    /// `journal_mode=WAL` rewrites the database header and creates `-wal` /
+    /// `-shm`, so a mismatched DELETE file must be refused before that.
+    pub async fn open_without_migration(path: &Path) -> Result<Self> {
+        let latest = embedded_schema_version();
+        if !path.exists() {
+            return Err(StoreError::SchemaBehind { current: 0, latest });
         }
-        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
-            .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .foreign_keys(true);
+        let current = schema_version_readonly(path).await?;
+        if current != latest {
+            return Err(if current < latest {
+                StoreError::SchemaBehind { current, latest }
+            } else {
+                StoreError::SchemaAhead { current, latest }
+            });
+        }
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect_with(options)
+            .connect_with(sqlite_file_options(path, false)?)
             .await?;
-        sqlx::migrate!("./migrations").run(&pool).await?;
         let (module_consent_revocations, _) = tokio::sync::broadcast::channel(128);
         let (module_consent_changes, _) = tokio::sync::broadcast::channel(128);
         Ok(Self {
@@ -211,6 +274,73 @@ impl Store {
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+
+    /// Latest successful migration in `_sqlx_migrations`, or 0 when none
+    /// has been applied. This is the run-database watermark `/health` reports.
+    pub async fn latest_applied_migration(&self) -> Result<i64> {
+        let version: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(version.unwrap_or(0))
+    }
+}
+
+fn sqlite_file_options(path: &Path, create_if_missing: bool) -> Result<SqliteConnectOptions> {
+    Ok(
+        SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
+            .create_if_missing(create_if_missing)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true),
+    )
+}
+
+/// Read `_sqlx_migrations` without changing the file.
+///
+/// `mode=ro` / [`SqliteConnectOptions::read_only`] and no `journal_mode`.
+/// `create_if_missing` stays false.
+fn sqlite_readonly_options(path: &Path) -> Result<SqliteConnectOptions> {
+    Ok(
+        SqliteConnectOptions::from_str(&format!("sqlite://{}?mode=ro", path.display()))?
+            .read_only(true)
+            .create_if_missing(false),
+    )
+}
+
+async fn schema_version_readonly(path: &Path) -> Result<i64> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlite_readonly_options(path)?)
+        .await?;
+    let current = applied_schema_version(&pool).await;
+    pool.close().await;
+    current
+}
+
+fn embedded_schema_version() -> i64 {
+    sqlx::migrate!("./migrations")
+        .migrations
+        .iter()
+        .map(|migration| migration.version)
+        .max()
+        .unwrap_or(0)
+}
+
+async fn applied_schema_version(pool: &SqlitePool) -> Result<i64> {
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if tables == 0 {
+        return Ok(0);
+    }
+    let version: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+            .fetch_one(pool)
+            .await?;
+    Ok(version.unwrap_or(0))
 }
 
 /// Test-only escape hatch (integration tests need raw SQL to simulate
@@ -285,6 +415,64 @@ pub mod test_hooks {
         }
     }
 
+    /// Create `path` with only migrations whose version is `< stop_before`.
+    pub async fn prepare_db_stopped_before(
+        path: &std::path::Path,
+        stop_before: i64,
+    ) -> super::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| super::StoreError::Conflict(e.to_string()))?;
+        }
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(super::sqlite_file_options(path, true)?)
+            .await?;
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.migrations = migrator
+            .migrations
+            .iter()
+            .filter(|migration| migration.version < stop_before)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        migrator.run(&pool).await?;
+        pool.close().await;
+        Ok(())
+    }
+
+    pub async fn applied_schema_version(path: &std::path::Path) -> super::Result<i64> {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(super::sqlite_file_options(path, false)?)
+            .await?;
+        let version = super::applied_schema_version(&pool).await?;
+        pool.close().await;
+        Ok(version)
+    }
+
+    pub fn embedded_schema_version() -> i64 {
+        super::embedded_schema_version()
+    }
+
+    /// Truncate the WAL and close this pool so a later open sees one file.
+    pub async fn checkpoint(store: &super::Store) -> super::Result<()> {
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(store.pool())
+            .await?;
+        store.pool().close().await;
+        Ok(())
+    }
+
+    pub async fn revocation_count(store: &super::Store, module: &str) -> super::Result<i64> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM module_consent_revocations WHERE module = ?")
+                .bind(module)
+                .fetch_one(store.pool())
+                .await?;
+        Ok(count)
+    }
+
     /// Insert a schedule row with arbitrary (possibly invalid) JSON columns —
     /// lets tests simulate a corrupt row that would fail deserialization.
     pub async fn insert_raw_schedule(
@@ -304,5 +492,209 @@ pub mod test_hooks {
         .execute(store.pool())
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod open_without_migration_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::str::FromStr;
+
+    fn sidecar(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        std::path::PathBuf::from(name)
+    }
+
+    #[tokio::test]
+    async fn close_checkpoints_after_borrowed_connections_return() {
+        for _ in 0..16 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("agent24.db");
+            let store = super::Store::open(&path).await.unwrap();
+            sqlx::query("CREATE TABLE close_probe (value TEXT)")
+                .execute(store.pool())
+                .await
+                .unwrap();
+            let pool = store.pool().clone();
+            let mut borrowed = Vec::new();
+            for _ in 0..5 {
+                let mut conn = pool.acquire().await.unwrap();
+                sqlx::query("INSERT INTO close_probe VALUES ('persisted')")
+                    .execute(&mut *conn)
+                    .await
+                    .unwrap();
+                borrowed.push(conn);
+            }
+            let closing = store.close();
+            tokio::pin!(closing);
+            tokio::select! {
+                result = &mut closing => panic!("close returned with borrowed connections: {result:?}"),
+                () = pool.close_event() => {}
+            }
+            drop(borrowed);
+            closing.await.unwrap();
+            assert_eq!(pool.size(), 0);
+            for suffix in ["-wal", "-shm"] {
+                assert!(!sidecar(&path, suffix).exists(), "residual {suffix}");
+            }
+
+            let copy = dir.path().join("copy.db");
+            std::fs::copy(&path, &copy).unwrap();
+            let reopened = super::Store::open_without_migration(&copy).await.unwrap();
+            let values: Vec<String> = sqlx::query_scalar("SELECT value FROM close_probe")
+                .fetch_all(reopened.pool())
+                .await
+                .unwrap();
+            assert_eq!(values, vec!["persisted"; 5]);
+            reopened.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn close_reports_a_busy_checkpoint_without_losing_committed_data() {
+        use sqlx::Connection;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent24.db");
+        let options = super::sqlite_file_options(&path, true)
+            .unwrap()
+            .busy_timeout(std::time::Duration::ZERO);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .unwrap();
+        let store = super::test_hooks::from_pool(pool.clone());
+        sqlx::query("CREATE TABLE close_probe (value TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut reader = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN").execute(&mut reader).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM close_probe")
+            .fetch_one(&mut reader)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        sqlx::query("INSERT INTO close_probe VALUES ('committed')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let err = store.close().await.unwrap_err();
+        assert!(matches!(err, super::StoreError::Conflict(_)), "{err}");
+        assert!(err.to_string().contains("checkpoint is busy"));
+        assert!(pool.is_closed());
+        assert_eq!(pool.size(), 0);
+        assert!(sidecar(&path, "-wal").exists());
+        sqlx::query("ROLLBACK").execute(&mut reader).await.unwrap();
+        let value: String = sqlx::query_scalar("SELECT value FROM close_probe")
+            .fetch_one(&mut reader)
+            .await
+            .unwrap();
+        assert_eq!(value, "committed");
+        reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_memory_closes_all_clones_and_can_be_repeated() {
+        let store = super::Store::open_memory().await.unwrap();
+        let clone = store.clone();
+        store.close().await.unwrap();
+        assert!(matches!(
+            clone.latest_applied_migration().await,
+            Err(super::StoreError::Sqlx(sqlx::Error::PoolClosed))
+        ));
+        clone.close().await.unwrap();
+    }
+
+    async fn delete_mode_database(path: &std::path::Path, ahead: bool) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let options =
+            sqlx::sqlite::SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+                .unwrap()
+                .create_if_missing(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete)
+                .foreign_keys(true);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let latest = super::embedded_schema_version();
+        let mut migrator = sqlx::migrate!("./migrations");
+        if !ahead {
+            migrator.migrations = migrator
+                .migrations
+                .iter()
+                .filter(|migration| migration.version < latest)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into();
+        }
+        migrator.run(&pool).await.unwrap();
+        if ahead {
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations \
+                 (version, description, success, checksum, execution_time) \
+                 VALUES (?, 'test schema ahead', 1, ?, 0)",
+            )
+            .bind(latest + 1)
+            .bind(Vec::<u8>::new())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "delete");
+        pool.close().await;
+        assert!(
+            !sidecar(path, "-wal").exists() && !sidecar(path, "-shm").exists(),
+            "DELETE fixture must not already have WAL sidecars"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_without_migration_rejects_a_delete_mode_mismatch_without_rewriting_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for ahead in [false, true] {
+            let path = dir
+                .path()
+                .join(if ahead { "ahead.db" } else { "behind.db" });
+            delete_mode_database(&path, ahead).await;
+            let before = std::fs::read(&path).unwrap();
+            let err = match super::Store::open_without_migration(&path).await {
+                Ok(_) => panic!("mismatched schema must be refused"),
+                Err(err) => err,
+            };
+            let message = err.to_string();
+            if ahead {
+                assert!(message.contains("newer"), "{message}");
+            } else {
+                assert!(message.contains("请先启动 daemon"), "{message}");
+            }
+            assert_eq!(
+                before,
+                std::fs::read(&path).unwrap(),
+                "refusing {message} must not rewrite the database header"
+            );
+            assert!(
+                !sidecar(&path, "-wal").exists(),
+                "refusing a DELETE database must not create a -wal sidecar"
+            );
+            assert!(
+                !sidecar(&path, "-shm").exists(),
+                "refusing a DELETE database must not create a -shm sidecar"
+            );
+        }
     }
 }

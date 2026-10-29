@@ -1,20 +1,16 @@
-//! `agent24 schedules …`: the desktop's schedule operations (`apps/desktop/
-//! src/renderer/pages/agent/api.ts`: list, create, update, delete, run now) on
-//! the same daemon routes. A resident daemon only, like `agent24 runs`.
+//! `agent24 schedule …` (alias `schedules`), create/update/delete/run-now: the
+//! desktop's schedule writes (`apps/desktop/src/renderer/pages/agent/api.ts`)
+//! on the same daemon routes; list and get are `crate::query`'s. A resident
+//! daemon only, like `agent24 runs`.
 
 use agent24_protocol::{Schedule, ScheduleAction, ScheduleCreate, ScheduleSpec, ScheduleUpdate};
 use clap::{Args, Subcommand};
 
-use super::runs::{decode, pretty, resident, segment, send, short};
+use super::runs::{decode, resident, segment, send, short};
 use super::{Endpoint, bearer, client, finish};
 
 #[derive(Subcommand)]
-pub(crate) enum SchedulesAction {
-    /// List schedules (`GET /api/v1/schedules`)
-    List {
-        #[arg(long)]
-        json: bool,
-    },
+pub enum SchedulesAction {
     /// Create a schedule that starts an agent run
     Create(New),
     /// Change a schedule; only what is given changes
@@ -30,7 +26,7 @@ pub(crate) enum SchedulesAction {
 }
 
 #[derive(Args)]
-pub(crate) struct New {
+pub struct New {
     #[arg(long)]
     name: String,
     #[arg(long)]
@@ -48,7 +44,7 @@ pub(crate) struct New {
 }
 
 #[derive(Args)]
-pub(crate) struct Change {
+pub struct Change {
     #[arg(long)]
     name: Option<String>,
     #[command(flatten)]
@@ -68,7 +64,7 @@ pub(crate) struct Change {
 
 /// When a schedule fires: at most one of these.
 #[derive(Args)]
-pub(crate) struct When {
+pub struct When {
     /// Every N seconds (60 to 86400)
     #[arg(long, conflicts_with_all = ["cron", "at"])]
     every: Option<u32>,
@@ -214,16 +210,6 @@ async fn schedules(ep: &Endpoint, action: SchedulesAction) -> Result<String, Str
     let base = &ep.base;
     let one = |id: &str| Ok::<_, String>(format!("{base}/api/v1/schedules/{}", segment(id)?));
     let schedule = match action {
-        SchedulesAction::List { json } => {
-            let body = send(bearer(ep, client().get(format!("{base}/api/v1/schedules")))).await?;
-            let list: Vec<Schedule> = decode(body["schedules"].clone())?;
-            let lines: Vec<String> = list.iter().flat_map(schedule_lines).collect();
-            return Ok(match (json, lines.is_empty()) {
-                (true, _) => pretty(&body),
-                (false, true) => "(no schedules)".to_owned(),
-                (false, false) => lines.join("\n"),
-            });
-        }
         SchedulesAction::Create(new) => {
             let req = client()
                 .post(format!("{base}/api/v1/schedules"))
@@ -261,6 +247,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::query::ScheduleAction as Cmd;
     use crate::runs::tests::answer_each;
     use crate::{Cli, Command};
     use clap::Parser;
@@ -274,8 +261,8 @@ mod tests {
         let mut all = vec!["schedules", "create"];
         all.extend_from_slice(args);
         match parse(&all).map_err(|e| e.to_string())? {
-            Command::Schedules {
-                action: SchedulesAction::Create(new),
+            Command::Schedule {
+                action: Cmd::Ops(SchedulesAction::Create(new)),
             } => new.body(),
             _ => panic!("not a create"),
         }
@@ -285,8 +272,8 @@ mod tests {
         let mut all = vec!["schedules", "update", "sch_1"];
         all.extend_from_slice(args);
         match parse(&all).map_err(|e| e.to_string())? {
-            Command::Schedules {
-                action: SchedulesAction::Update { change, .. },
+            Command::Schedule {
+                action: Cmd::Ops(SchedulesAction::Update { change, .. }),
             } => Ok(change),
             _ => panic!("not an update"),
         }
@@ -503,7 +490,9 @@ mod tests {
         let mut all = vec!["schedules"];
         all.extend_from_slice(action);
         match parse(&all).unwrap() {
-            Command::Schedules { action } => schedules(ep, action).await,
+            Command::Schedule {
+                action: Cmd::Ops(action),
+            } => schedules(ep, action).await,
             _ => panic!("not schedules"),
         }
     }
@@ -586,23 +575,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_reads_the_envelope_and_a_bad_id_sends_nothing() {
-        let list = format!(
-            r#"{{"schedules":[{}]}}"#,
-            schedule_json(agent_run("p", None, None), every())
-        );
-        let (ep, _seen) = answer_each(vec![("200 OK", list)]);
-        let out = run(&["list"], &ep).await.unwrap();
-        assert!(
-            out.starts_with("sch_1  \"daily\"  [enabled]  every 3600s"),
-            "{out}"
-        );
-        let (ep, _seen) = answer_each(vec![("200 OK", r#"{"items":[]}"#.to_owned())]);
-        assert!(run(&["list", "--json"], &ep).await.is_err());
+    async fn a_bad_id_sends_nothing() {
         let ep = Endpoint {
             base: "http://127.0.0.1:9".to_owned(),
             token: String::new(),
             child: None,
+            session: None,
         };
         for args in [
             ["delete", "../shutdown#"],

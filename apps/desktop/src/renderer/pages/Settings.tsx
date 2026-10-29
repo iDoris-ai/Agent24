@@ -1,210 +1,76 @@
-import { useEffect, useRef, useState } from 'react'
+import { useContext, useEffect, useRef, useState, type KeyboardEvent } from 'react'
+import { CapabilitiesContext } from '../capabilities/types'
 import { LOCALES, isLocale, setLocale, useLocale, useT } from '../i18n'
 import { settingsMessages } from './Settings.i18n'
+import { ActivityTab } from './settings/ActivityTab'
 import { CliToolSettings } from './settings/CliToolSettings'
+import { ModelServiceSettings } from './settings/ModelServiceSettings'
+import { SidebarPrefs } from './settings/SidebarPrefs'
 
-type OmlxStatus = 'detecting' | 'connected' | 'disconnected' | 'starting' | 'stopping'
-type ModelCategory = 'resident' | 'ondemand'
-type TestResult = { ok: boolean; msg: string } | null
-// Our own errors are stored as keys so a later language switch relabels them
-// (and an init request finishing after the switch can't bake in the old
-// language); errors reported by the service are shown verbatim.
-type DetectError = { key: keyof typeof settingsMessages.en } | { raw: string } | null
+// Tab ownership of the blocks that used to be one scrolling page:
+// General — language. Models — AI model service. Command line tool — the
+// CLI installer. Voice, Connections and Advanced had no settings blocks;
+// Voice links to that capability, and the other two say so.
 
-const CATEGORIES_KEY = 'agent24:model-categories'
-const AUTO_START_PORT = 8088
-// No built-in API key: an auto-started oMLX runs keyless on loopback; a key is
-// only used if the user types one into the field below.
-const AUTO_START_KEY = ''
+export const SETTINGS_TABS = ['general', 'models', 'voice', 'activity', 'cli', 'connections', 'advanced'] as const
+export type SettingsTab = (typeof SETTINGS_TABS)[number]
+export const SETTINGS_TAB_STORAGE_KEY = 'agent24:settings-tab'
 
-function loadCategories(): Record<string, ModelCategory> {
-  try { return JSON.parse(localStorage.getItem(CATEGORIES_KEY) ?? '{}') } catch { return {} }
+const TAB_LABEL: Record<SettingsTab, 'tabs.general' | 'tabs.models' | 'tabs.voice' | 'tabs.activity' | 'tabs.cli' | 'tabs.connections' | 'tabs.advanced'> = {
+  general: 'tabs.general',
+  models: 'tabs.models',
+  voice: 'tabs.voice',
+  activity: 'tabs.activity',
+  cli: 'tabs.cli',
+  connections: 'tabs.connections',
+  advanced: 'tabs.advanced',
 }
-function saveCategories(c: Record<string, ModelCategory>) {
-  localStorage.setItem(CATEGORIES_KEY, JSON.stringify(c))
+
+function isSettingsTab(v: string | null | undefined): v is SettingsTab {
+  return SETTINGS_TABS.some(tab => tab === v)
 }
 
-export default function SettingsPage() {
-  const [omlxStatus, setOmlxStatus] = useState<OmlxStatus>('detecting')
-  const [omlxUrl, setOmlxUrl] = useState(`http://127.0.0.1:${AUTO_START_PORT}`)
-  const [omlxApiKey, setOmlxApiKey] = useState(AUTO_START_KEY)
-  const [showApiKey, setShowApiKey] = useState(false)
-  const [omlxModels, setOmlxModels] = useState<string[]>([])
-  const [omlxActiveModel, setOmlxActiveModel] = useState('')
-  const [omlxPort, setOmlxPort] = useState(String(AUTO_START_PORT))
-  const [categories, setCategories] = useState<Record<string, ModelCategory>>(loadCategories)
-  const [warmingUp, setWarmingUp] = useState<Record<string, boolean>>({})
-  const [detectError, setDetectError] = useState<DetectError>(null)
-  const [testResult, setTestResult] = useState<TestResult>(null)
-  const testTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const initDone = useRef(false)
-  const apiKeyInput = useRef<HTMLInputElement>(null)
-  const [keyNeeded, setKeyNeeded] = useState(false)
-  const locale = useLocale()
+function readStoredTab(): SettingsTab {
+  try {
+    const v = localStorage.getItem(SETTINGS_TAB_STORAGE_KEY)
+    if (isSettingsTab(v)) return v
+  } catch { /* storage unavailable — open General */ }
+  return 'general'
+}
+
+function rememberTab(tab: SettingsTab) {
+  try { localStorage.setItem(SETTINGS_TAB_STORAGE_KEY, tab) } catch { /* the choice still applies this visit */ }
+}
+
+export default function SettingsPage({ initialTab }: { initialTab?: string } = {}) {
   const t = useT(settingsMessages)
-
+  const [tab, setTab] = useState(() => isSettingsTab(initialTab) ? initialTab : readStoredTab())
   useEffect(() => {
-    if (initDone.current) return
-    initDone.current = true
-    initialize()
-  }, [])
-
-  async function initialize() {
-    setOmlxStatus('detecting')
-    setDetectError(null)
-    const probed = await window.agent24.omlxDetect()
-    if (probed && 'authRequired' in probed) {
-      // Running, but it wants an API key: do not auto-start a second one.
-      setOmlxUrl(probed.url)
-      needsKey()
-      return
+    if (isSettingsTab(initialTab)) {
+      setTab(initialTab)
+      rememberTab(initialTab)
     }
-    let detected = probed
-    if (!detected) {
-      // Auto-start oMLX
-      setOmlxStatus('starting')
-      const started = await window.agent24.omlxStart(AUTO_START_PORT, AUTO_START_KEY)
-      if (started.ok) {
-        setOmlxUrl(started.url)
-        // Poll up to 5 attempts
-        for (let i = 0; i < 5; i++) {
-          await new Promise((r) => setTimeout(r, 2000))
-          const r = await window.agent24.omlxModels(started.url, AUTO_START_KEY)
-          if (r.ok) { detected = { url: started.url, apiKey: AUTO_START_KEY, models: r.models }; break }
-        }
-      }
-    }
-    if (detected) {
-      setOmlxUrl(detected.url)
-      setOmlxApiKey(detected.apiKey)
-      applyDetected(detected.url, detected.apiKey, detected.models)
-    } else {
-      setOmlxStatus('disconnected')
-      setDetectError({ key: 'error.startConnect' })
-    }
+  }, [initialTab])
+  const tabRefs = useRef<Partial<Record<SettingsTab, HTMLButtonElement | null>>>({})
+  // The model form probes and may auto-start a service. Keep it mounted after
+  // the first visit so leaving the tab does not wipe a key the user typed.
+  const keepModels = useRef(tab === 'models')
+  if (tab === 'models') keepModels.current = true
+
+  function activate(next: SettingsTab, focus: boolean) {
+    setTab(next)
+    rememberTab(next)
+    if (focus) tabRefs.current[next]?.focus()
   }
 
-  /** oMLX answered 401/403: running, but the key is missing or wrong. Say
-   *  that, and put the cursor in the key field. */
-  function needsKey() {
-    setOmlxStatus('disconnected')
-    setKeyNeeded(true)
-    setDetectError({ key: 'error.authRequired' })
-    apiKeyInput.current?.focus()
-  }
-
-  function applyDetected(url: string, key: string, models: string[]) {
-    setKeyNeeded(false)
-    setOmlxModels(models)
-    setOmlxActiveModel((m) => m || models[0] || '')
-    setOmlxStatus('connected')
-    // Warmup resident models
-    const cats = loadCategories()
-    const residents = models.filter((m) => cats[m] === 'resident')
-    if (residents.length > 0) warmupModels(url, key, residents)
-  }
-
-  async function warmupModels(url: string, key: string, models: string[]) {
-    const busy: Record<string, boolean> = {}
-    models.forEach((m) => { busy[m] = true })
-    setWarmingUp((w) => ({ ...w, ...busy }))
-    await Promise.all(models.map((m) => window.agent24.omlxWarmup(url, key, m)))
-    setWarmingUp((w) => {
-      const next = { ...w }
-      models.forEach((m) => { delete next[m] })
-      return next
-    })
-  }
-
-  function showTestResult(r: TestResult) {
-    setTestResult(r)
-    if (testTimer.current) clearTimeout(testTimer.current)
-    testTimer.current = setTimeout(() => setTestResult(null), 4000)
-  }
-
-  async function autoDetect() {
-    setOmlxStatus('detecting')
-    setDetectError(null)
-    const result = await window.agent24.omlxDetect()
-    if (result && 'authRequired' in result) {
-      setOmlxUrl(result.url)
-      needsKey()
-    } else if (result) {
-      setOmlxUrl(result.url)
-      setOmlxApiKey(result.apiKey)
-      applyDetected(result.url, result.apiKey, result.models)
-    } else {
-      setOmlxStatus('disconnected')
-      setDetectError({ key: 'error.noService' })
-    }
-  }
-
-  async function testConnection() {
-    setTestResult(null)
-    setDetectError(null)
-    setOmlxStatus('detecting')
-    const result = await window.agent24.omlxModels(omlxUrl, omlxApiKey)
-    if (result.ok) {
-      applyDetected(omlxUrl, omlxApiKey, result.models)
-      showTestResult({ ok: true, msg: t('result.connected', { count: result.models.length }) })
-    } else if (result.authRequired) {
-      needsKey()
-    } else {
-      setOmlxStatus('disconnected')
-      showTestResult({ ok: false, msg: result.error ?? t('error.connectionFailed') })
-    }
-  }
-
-  async function startServer() {
-    setOmlxStatus('starting')
-    setDetectError(null)
-    const port = parseInt(omlxPort, 10) || AUTO_START_PORT
-    const result = await window.agent24.omlxStart(port, omlxApiKey)
-    if (result.ok) {
-      setOmlxUrl(result.url)
-      let attempts = 0
-      const poll = async () => {
-        const r = await window.agent24.omlxModels(result.url, omlxApiKey)
-        if (r.ok) { applyDetected(result.url, omlxApiKey, r.models) }
-        else if (++attempts < 5) setTimeout(poll, 2000)
-        else { setOmlxStatus('disconnected'); setDetectError({ key: 'error.startedUnresponsive' }) }
-      }
-      setTimeout(poll, 2000)
-    } else {
-      setOmlxStatus('disconnected')
-      setDetectError(result.error ? { raw: result.error } : { key: 'error.startFailed' })
-    }
-  }
-
-  async function stopServer() {
-    setOmlxStatus('stopping')
-    await window.agent24.omlxStop()
-    setOmlxModels([])
-    setOmlxActiveModel('')
-    setWarmingUp({})
-    setOmlxStatus('disconnected')
-  }
-
-  function setCategory(model: string, cat: ModelCategory) {
-    const next = { ...categories, [model]: cat }
-    setCategories(next)
-    saveCategories(next)
-    // If switching to resident while service is running, warmup immediately
-    if (cat === 'resident' && omlxStatus === 'connected') {
-      warmupModels(omlxUrl, omlxApiKey, [model])
-    }
-  }
-
-  const isConnected = omlxStatus === 'connected'
-  const isBusy = omlxStatus === 'detecting' || omlxStatus === 'starting' || omlxStatus === 'stopping'
-
-  const statusLabel: Record<OmlxStatus, string> = {
-    detecting: t('status.detecting'), connected: t('status.connected'),
-    disconnected: t('status.disconnected'), starting: t('status.starting'), stopping: t('status.stopping'),
-  }
-  const statusDotColor: Record<OmlxStatus, string> = {
-    detecting: '#888', connected: '#4caf50',
-    disconnected: '#f44336', starting: '#ff9800', stopping: '#ff9800',
+  function onTabKeyDown(e: KeyboardEvent<HTMLDivElement>) {
+    const i = SETTINGS_TABS.indexOf(tab)
+    let nextIndex = -1
+    if (e.key === 'ArrowRight') nextIndex = (i + 1) % SETTINGS_TABS.length
+    else if (e.key === 'ArrowLeft') nextIndex = (i - 1 + SETTINGS_TABS.length) % SETTINGS_TABS.length
+    else return
+    e.preventDefault()
+    activate(SETTINGS_TABS[nextIndex], true)
   }
 
   return (
@@ -212,163 +78,46 @@ export default function SettingsPage() {
       <div className="page-title">{t('page.title')}</div>
       <div className="page-sub">{t('page.subtitle')}</div>
 
-      <CliToolSettings />
-
-      {/* ── AI Model Service ── */}
-      <div className="settings-section">
-        <h3>{t('service.title')}</h3>
-
-        {/* Status bar */}
-        <div className="setting-row" style={{ background: 'var(--surface2)', marginBottom: 2 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{
-              width: 8, height: 8, borderRadius: '50%', flexShrink: 0,
-              background: statusDotColor[omlxStatus],
-              boxShadow: isConnected ? `0 0 6px ${statusDotColor[omlxStatus]}66` : 'none',
-            }} />
-            <span style={{ fontSize: 13 }}>{statusLabel[omlxStatus]}</span>
-            {isConnected && (
-              <span style={{ fontSize: 11, color: 'var(--muted)' }}>
-                {omlxUrl} · {t('status.modelCount', { count: omlxModels.length })}
-              </span>
-            )}
-          </div>
-          <div style={{ display: 'flex', gap: 6 }}>
-            <button className="btn btn-ghost" onClick={autoDetect} disabled={isBusy}
-              style={{ fontSize: 12, padding: '4px 10px' }}>{t('action.autoDetect')}</button>
-            {isConnected ? (
-              <button className="btn btn-ghost" onClick={stopServer} disabled={isBusy}
-                style={{ fontSize: 12, padding: '4px 10px', color: '#f44336', borderColor: '#f44336' }}>
-                {t('action.stop')}
-              </button>
-            ) : (
-              <button className="btn btn-primary" onClick={startServer} disabled={isBusy}
-                style={{ fontSize: 12, padding: '4px 10px' }}>
-                {t('action.start')}
-              </button>
-            )}
-          </div>
-        </div>
-
-        {detectError && (
-          <div style={{ fontSize: 12, color: '#f44336', padding: '6px 18px', marginBottom: 2, background: 'rgba(244,67,54,0.08)', borderRadius: 6 }}>
-            {'key' in detectError ? t(detectError.key) : detectError.raw}
-          </div>
-        )}
-
-        {/* URL + Test */}
-        <div className="setting-row">
-          <div><label>{t('service.url')}</label><p>{t('service.urlHint')}</p></div>
-          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-            <input type="text" value={omlxUrl} onChange={(e) => setOmlxUrl(e.target.value)}
-              style={{ width: 210 }} placeholder="http://127.0.0.1:8088" />
-            <button className="btn btn-ghost" onClick={testConnection} disabled={isBusy}
-              style={{ fontSize: 12, padding: '4px 10px', whiteSpace: 'nowrap' }}>
-              {isBusy ? t('action.testing') : t('action.test')}
-            </button>
-            {testResult && (
-              <span style={{ fontSize: 11, fontWeight: 600, whiteSpace: 'nowrap', color: testResult.ok ? '#4caf50' : '#f44336' }}>
-                {testResult.ok ? '✓' : '✗'} {testResult.msg}
-              </span>
-            )}
-          </div>
-        </div>
-
-        {/* API Key + eye */}
-        <div className="setting-row">
-          <div><label>{t('service.apiKey')}</label><p>{t('service.apiKeyHint')}</p></div>
-          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-            <input ref={apiKeyInput} type={showApiKey ? 'text' : 'password'} value={omlxApiKey}
-              aria-invalid={keyNeeded} aria-label={t('service.apiKey')}
-              onChange={(e) => setOmlxApiKey(e.target.value)}
-              style={{ width: 180, ...(keyNeeded ? { borderColor: '#f44336' } : {}) }} placeholder={t('service.optional')} />
-            <button onClick={() => setShowApiKey((v) => !v)}
-              style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--muted)', fontSize: 15, padding: '2px 4px', lineHeight: 1 }}
-              title={showApiKey ? t('action.hide') : t('action.show')}>
-              {showApiKey ? '🙈' : '👁'}
-            </button>
-          </div>
-        </div>
-
-        {/* Start port (disconnected only) */}
-        {!isConnected && (
-          <div className="setting-row">
-            <div><label>{t('service.port')}</label><p>{t('service.portHint')}</p></div>
-            <input type="text" value={omlxPort} onChange={(e) => setOmlxPort(e.target.value)} style={{ width: 80 }} />
-          </div>
-        )}
-
-        {/* ── Model list with categories ── */}
-        {omlxModels.length > 0 && (
-          <div style={{ marginTop: 4 }}>
-            <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--muted)', padding: '8px 18px 4px', letterSpacing: '0.6px', textTransform: 'uppercase' }}>
-              {t('models.heading')}
-            </div>
-            {omlxModels.map((model) => {
-              const cat: ModelCategory = categories[model] ?? 'ondemand'
-              const isWarmingUp = warmingUp[model]
-              const isActive = omlxActiveModel === model
-              return (
-                <div key={model} className="setting-row" style={{ marginBottom: 2, alignItems: 'center' }}
-                  onClick={() => setOmlxActiveModel(model)}
-                  role="button"
-                  tabIndex={0}
-                  onKeyDown={(e) => e.key === 'Enter' && setOmlxActiveModel(model)}
-                >
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, cursor: 'pointer' }}>
-                    <span style={{
-                      width: 6, height: 6, borderRadius: '50%', flexShrink: 0,
-                      background: isActive ? 'var(--accent)' : 'var(--border)',
-                    }} />
-                    <span style={{ fontSize: 13, fontWeight: isActive ? 600 : 400, color: isActive ? 'var(--accent)' : 'var(--text)' }}>
-                      {model}
-                    </span>
-                    {isWarmingUp && (
-                      <span style={{ fontSize: 10, color: '#ff9800' }}>{t('models.loading')}</span>
-                    )}
-                  </div>
-                  <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                    <button
-                      onClick={(e) => { e.stopPropagation(); setCategory(model, 'resident') }}
-                      style={{
-                        fontSize: 11, padding: '3px 10px', borderRadius: 20, cursor: 'pointer', fontWeight: 600,
-                        background: cat === 'resident' ? 'rgba(76,175,80,0.15)' : 'transparent',
-                        color: cat === 'resident' ? '#4caf50' : 'var(--muted)',
-                        border: cat === 'resident' ? '1px solid #4caf5066' : '1px solid var(--border)',
-                      }}
-                    >
-                      {t('models.resident')}
-                    </button>
-                    <button
-                      onClick={(e) => { e.stopPropagation(); setCategory(model, 'ondemand') }}
-                      style={{
-                        fontSize: 11, padding: '3px 10px', borderRadius: 20, cursor: 'pointer', fontWeight: 600,
-                        background: cat === 'ondemand' ? 'rgba(33,150,243,0.15)' : 'transparent',
-                        color: cat === 'ondemand' ? '#2196f3' : 'var(--muted)',
-                        border: cat === 'ondemand' ? '1px solid #2196f366' : '1px solid var(--border)',
-                      }}
-                    >
-                      {t('models.onDemand')}
-                    </button>
-                  </div>
-                </div>
-              )
-            })}
-            <div style={{ fontSize: 11, color: 'var(--muted)', padding: '4px 18px 0' }}>
-              <b>{t('models.resident')}</b> — {t('models.residentHint')}&nbsp;
-              <b>{t('models.onDemand')}</b> — {t('models.onDemandHint')}
-            </div>
-          </div>
-        )}
-
-        {!isConnected && omlxModels.length === 0 && (
-          <div className="setting-row">
-            <span style={{ fontSize: 12, color: 'var(--muted)' }}>{t('models.connectHint')}</span>
-          </div>
-        )}
+      <div className="settings-tabs" role="tablist" aria-label={t('tabs.label')} onKeyDown={onTabKeyDown}>
+        {SETTINGS_TABS.map((id) => (
+          <button
+            key={id}
+            ref={(el) => { tabRefs.current[id] = el }}
+            type="button"
+            role="tab"
+            id={`settings-tab-${id}`}
+            aria-selected={tab === id}
+            aria-controls="settings-panel"
+            tabIndex={tab === id ? 0 : -1}
+            onClick={() => activate(id, false)}
+          >
+            {t(TAB_LABEL[id])}
+          </button>
+        ))}
       </div>
 
-      {/* ── Appearance ── the one global language setting every page follows. */}
+      <div role="tabpanel" id="settings-panel" aria-labelledby={`settings-tab-${tab}`}>
+        {tab === 'general' && <GeneralTab />}
+        {keepModels.current && (
+          <div hidden={tab !== 'models'}>
+            <ModelServiceSettings />
+          </div>
+        )}
+        {tab === 'voice' && <VoiceTab />}
+        {tab === 'activity' && <ActivityTab />}
+        {tab === 'cli' && <CliToolSettings />}
+        {tab === 'connections' && <ConnectionsTab />}
+        {tab === 'advanced' && <AdvancedTab />}
+      </div>
+    </div>
+  )
+}
+
+function GeneralTab() {
+  const t = useT(settingsMessages)
+  const locale = useLocale()
+  return (
+    <>
       <div className="settings-section">
         <h3>{t('appearance.title')}</h3>
         <div className="setting-row">
@@ -379,16 +128,44 @@ export default function SettingsPage() {
           </select>
         </div>
       </div>
+      <SidebarPrefs />
+    </>
+  )
+}
 
-      {/*
-       * AUDIT-2: "Backend Daemon" (Daemon Port), "Appearance" (Language) and
-       * the Save Settings / Reset Defaults buttons were removed — none of
-       * these four controls had an onChange/onClick handler, so editing or
-       * clicking them silently did nothing and reset on next visit (a
-       * "looks saved but wasn't" trap). Only the AI Model Service section
-       * above is wired to real state/persistence; hidden until these get
-       * real logic rather than shipping dead controls.
-       */}
+function VoiceTab() {
+  const t = useT(settingsMessages)
+  const { open } = useContext(CapabilitiesContext)
+  return (
+    <div className="settings-section">
+      <h3>{t('voice.title')}</h3>
+      <p className="settings-note">{t('voice.none')}</p>
+      <button type="button" className="btn btn-ghost" style={{ marginTop: 12 }}
+        onClick={() => open('voice', 'other')}>
+        {t('voice.open')}
+      </button>
+    </div>
+  )
+}
+
+function ConnectionsTab() {
+  const t = useT(settingsMessages)
+  return (
+    <div className="settings-section">
+      <h3>{t('connections.title')}</h3>
+      <p className="settings-note">{t('connections.empty')}</p>
+    </div>
+  )
+}
+
+function AdvancedTab() {
+  const t = useT(settingsMessages)
+  return (
+    <div className="settings-section">
+      <h3>{t('advanced.title')}</h3>
+      {/* Daemon port, Save and Reset were unwired and removed (AUDIT-2).
+          Do not put those dead controls back. */}
+      <p className="settings-note">{t('advanced.empty')}</p>
     </div>
   )
 }

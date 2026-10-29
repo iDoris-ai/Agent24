@@ -401,15 +401,25 @@ describe('main', () => {
     fs.writeFileSync(path.join(out, 'review.json'), JSON.stringify({ reviewer: 'david', items: [{ sample: NOTICE.id, extraction_id: id('ext'), field: 'notice_reference', verdict: 'correct', note: 'Bearer tok-9f3a1c' }] }))
     await expect(main(['review', '--out', out, '--daemon', state])).rejects.toThrow('the report holds what it must not (secret 1 of')
     await expect(main(['review', '--out', out, '--daemon', path.join(out, 'none.json')])).rejects.toThrow('not a daemon state file that can be read')
-    // Without --daemon, ~/.agent24/daemon.json, where there is one.
+    // Without --daemon, <data_dir>/daemon.json. AGENT24_DATA_DIR unset → $HOME/.agent24.
     const home = temp()
-    vi.spyOn(os, 'homedir').mockReturnValue(home)
-    fs.mkdirSync(path.join(home, '.agent24'))
-    fs.copyFileSync(state, path.join(home, '.agent24', 'daemon.json'))
-    await expect(main(['review', '--out', out])).rejects.toThrow('the report holds what it must not (secret 1 of')
-    expect(fs.readFileSync(path.join(out, 'report.json'), 'utf8')).toBe(before)
-    fs.rmSync(path.join(home, '.agent24'), { recursive: true })
-    expect((await lines(['review', '--out', out])).code).toBe(0)
+    const savedHome = process.env.HOME
+    const savedDir = process.env.AGENT24_DATA_DIR
+    delete process.env.AGENT24_DATA_DIR
+    process.env.HOME = home
+    try {
+      fs.mkdirSync(path.join(home, '.agent24'))
+      fs.copyFileSync(state, path.join(home, '.agent24', 'daemon.json'))
+      await expect(main(['review', '--out', out])).rejects.toThrow('the report holds what it must not (secret 1 of')
+      expect(fs.readFileSync(path.join(out, 'report.json'), 'utf8')).toBe(before)
+      fs.rmSync(path.join(home, '.agent24'), { recursive: true })
+      expect((await lines(['review', '--out', out])).code).toBe(0)
+    } finally {
+      if (savedHome === undefined) delete process.env.HOME
+      else process.env.HOME = savedHome
+      if (savedDir === undefined) delete process.env.AGENT24_DATA_DIR
+      else process.env.AGENT24_DATA_DIR = savedDir
+    }
   })
 
   it('refuses a review it cannot read, and leaves the evidence as it was', async () => {

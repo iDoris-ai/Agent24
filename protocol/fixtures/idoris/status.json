@@ -1,0 +1,22 @@
+{
+  "state": "running",
+  "version": "0.4.0",
+  "data_port": 8740,
+  "admin_port": 8741,
+  "roles": [
+    "daily"
+  ],
+  "last_error": null,
+  "current_operation": null,
+  "verification": {
+    "model_id": "real-model",
+    "record_id": "record-fixture",
+    "locality": "loopback",
+    "verified_at": "2026-10-28T12:00:00Z"
+  },
+  "budget_suggestion": {
+    "core_reserved_bytes": 4294967296,
+    "idoris_budget_bytes": 5970004541
+  },
+  "budget_unavailable_reason": null
+}

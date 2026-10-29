@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { listRuns, cancelRun, type Run, type RunStatus } from './agent/api'
+import { listRuns, cancelRun, createRun, type Run, type RunStatus } from './agent/api'
 import { useT } from '../i18n'
 import { runsMessages } from './Runs.i18n'
 
@@ -21,6 +21,8 @@ export default function RunsPage() {
   const [runs, setRuns] = useState<Run[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [retrying, setRetrying] = useState(false)
+  const retryInFlight = useRef(false)
 
   // Only the latest refresh's result may land (review C7 poll-race guard).
   const reqSeq = useRef(0)
@@ -52,6 +54,31 @@ export default function RunsPage() {
       refresh()
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  const onConfirmRerun = async (run: Run) => {
+    if (retryInFlight.current) return
+    retryInFlight.current = true
+    setRetrying(true)
+    try {
+      const rerun = await createRun({
+        prompt: run.input.prompt,
+        model_override: run.input.model_override,
+        mode: run.input.mode,
+        workspace_id: run.input.workspace_id,
+        session_id: run.session_id,
+        idoris_headroom_confirmed: true,
+      })
+      reqSeq.current += 1
+      setRuns(prev => [rerun, ...prev])
+      setSelectedId(rerun.id)
+      setError(null)
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      retryInFlight.current = false
+      setRetrying(false)
     }
   }
 
@@ -142,7 +169,16 @@ export default function RunsPage() {
                   <strong>{t('detail.output')}</strong> {selected.output.text}
                 </div>
               )}
-              {selected.error && (
+              {selected.status === 'failed' && selected.error?.code === 'idoris_headroom_confirmation_required' ? (
+                <div style={{ fontSize: 12, marginBottom: 8 }}>
+                  <p>{t('headroom.explanation')}</p>
+                  {selected.input.knowledge_binding_id
+                    ? <p>{t('headroom.hostOnly')}</p>
+                    : <button className="btn" disabled={retrying} onClick={() => void onConfirmRerun(selected)}>{t('headroom.confirm')}</button>}
+                </div>
+              ) : selected.error?.code === 'idoris_supervisor_busy' ? (
+                <p role="status">{t('error.supervisorBusy')}</p>
+              ) : selected.error && (
                 <div style={{ fontSize: 12, color: '#e05050', marginBottom: 8 }}>
                   <strong>{t('detail.error', { code: selected.error.code })}</strong> {selected.error.message}
                 </div>

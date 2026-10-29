@@ -2,9 +2,12 @@
 // Capability modules will extend this in M1+.
 
 export const IpcChannels = {
+  NavPrefsGet: 'nav-prefs:get',
+  NavPrefsSet: 'nav-prefs:set',
   CliToolOpenSettings: 'cli-tool:open-settings',
   CliToolStatus: 'cli-tool:status',
   CliToolInstall: 'cli-tool:install',
+  CliToolRepairUser: 'cli-tool:repair-user',
   AppLocale: 'app:locale',
   AppPing: 'app:ping',
   AppVersion: 'app:version',
@@ -17,6 +20,11 @@ export const IpcChannels = {
   // before sending anything.
   ApprovalDecide: 'approval:decide',
   OsModuleSetEnabled: 'os-module:set-enabled',
+  // A-3: disable/enable or unpair AgentEar (PATCH / DELETE
+  // /api/v1/attached/agentear). The module name is fixed in main; the
+  // renderer cannot name another one. Same native-confirm rule as above.
+  AgentEarSetEnabled: 'agentear:set-enabled',
+  AgentEarUnpair: 'agentear:unpair',
   CreativeShow: 'creative:show',
   CreativeRestart: 'creative:restart',
   CreativeBounds: 'creative:bounds',
@@ -37,14 +45,7 @@ export const IpcChannels = {
   OmlxStart: 'omlx:start',
   OmlxStop: 'omlx:stop',
   OmlxWarmup: 'omlx:warmup',
-  ModulesList: 'modules:list',
-  ModulesDiscover: 'modules:discover',
-  ModulesEnable: 'modules:enable',
-  ModulesDisable: 'modules:disable',
-  ModulesInstall: 'modules:install',
-  ModulesUninstall: 'modules:uninstall',
   LlmStatus: 'llm:status',
-  IdorisStatus: 'idoris:status',
   // A3-4: push channel only (main -> renderer via webContents.send). Not an
   // ipcMain.handle() target — see main/agentear-events.ts.
   AgentEarEvent: 'agentear:event',
@@ -76,6 +77,8 @@ export interface BackendProxyRequest {
   method: HttpMethod
   path: string
   body?: unknown
+  /** One constrained header; authentication headers remain main-process owned. */
+  idempotencyKey?: string
 }
 
 export interface BackendProxyResponse {
@@ -176,144 +179,10 @@ export interface OmlxWarmupResult {
   error?: string
 }
 
-// ── Module system ─────────────────────────────────────────────────────────────
-// MIRROR NOTICE: packages/node-daemon/src/manifest.ts keeps an identical copy;
-// machine-readable truth is protocol/module.schema.json. Unified via generated
-// api-client in task A6 — keep in lockstep until then.
-
-export type ModuleType = 'ui' | 'headless' | 'hybrid'
-
-export type Permission =
-  | 'llm' | 'memory' | 'network' | 'filesystem' | 'wechat' | 'nostr'
-
-export interface ModuleNavItem {
-  icon: string
-  label: string
-  route: string
-}
-
-export interface ModuleManifest {
-  id: string
-  version: string
-  name: string
-  description: string
-  type: ModuleType
-  permissions: Permission[]
-  navItem?: ModuleNavItem
-  /** M3: LLM models this module needs — Gateway will ensure they're loaded on register */
-  models?: string[]
-  /** M4: OCI container service — BoxLite starts the container and proxies /api/svc/<id>/* to it */
-  container?: {
-    image: string         // OCI image, e.g. 'python:slim'
-    port: number          // guest port inside container
-    startCmd?: string[]   // command to start the service (defaults to image entrypoint)
-    healthPath?: string   // health-check path polled until 200 (default: '/health')
-    memoryMib?: number    // default 512
-  }
-  /** RESERVED (E5): AgentStore / PGL charter metadata — see protocol/module.schema.json */
-  pgl?: Record<string, unknown>
-}
-
-// ModuleManifest extended with runtime enable/disable state
-export interface ModuleInfo extends ModuleManifest {
-  enabled: boolean
-}
-
 export interface LlmStatusResult {
   provider: 'omlx' | 'ollama' | 'none'
   url: string
   model: string
-}
-
-export interface IdorisCapacityEntry {
-  id: string
-  capability: string
-  resident: boolean
-  estimated_memory_gb: number
-  ctx_limit: number
-  queue_depth: number
-  admission_status: 'ready' | 'requires_eviction' | 'blocked'
-}
-
-export type IdorisCapacity =
-  | { state: 'observed'; entries: IdorisCapacityEntry[] }
-  | { state: 'unavailable' }
-  | { state: 'error' }
-
-export interface IdorisStatusResponse {
-  status: 'ok'
-  service: 'idoris'
-  version: string
-  contract_version: string
-  instance_id: string
-  components: number
-  runtimes: number
-  subscriptions: number
-  budget_configured: boolean
-  audit_configured: boolean
-  capacity: IdorisCapacity
-}
-
-export interface IdorisBackend {
-  provider_id: string
-  locality: 'loopback' | 'lan' | 'remote'
-  form: 'http_service' | 'spawn_cli' | 'bundled_binary' | 'nostr_node' | 'mitm_proxy' | 'batch_job'
-  lifecycle_runtime_bound: boolean
-}
-
-export type IdorisModelSource =
-  | { provider_id: string; source: 'http_models_endpoint'; state: 'observed'; models: string[] }
-  | { provider_id: string; source: 'subscription_registration'; state: 'configured'; models: string[] }
-  | { provider_id: string; source: 'http_models_endpoint'; state: 'error'; models: []; error: 'unavailable' | 'authentication_failed' }
-
-export interface IdorisModelsResponse {
-  sources: IdorisModelSource[]
-}
-
-export type IdorisUnavailableReason =
-  | 'handoff-missing'
-  | 'handoff-invalid'
-  | 'invalid-config'
-  | 'unreachable'
-  | 'http-error'
-  | 'invalid-response'
-
-export type IdorisStatusResult =
-  | { state: 'available'; status: IdorisStatusResponse; backends?: IdorisBackend[]; models?: IdorisModelsResponse }
-  | { state: 'unavailable'; reason: IdorisUnavailableReason }
-
-export interface ModuleInstallResult {
-  ok: boolean
-  id?: string        // module id if successfully loaded
-  error?: string
-}
-
-export interface ModuleUninstallResult {
-  ok: boolean
-  error?: string
-}
-
-// ── M4 marketplace: discovery / browse ────────────────────────────────────────
-// MIRROR NOTICE: packages/node-daemon/src/module-discovery.ts is the source of
-// truth (the daemon computes trust tier from the package name, anti-spoof).
-
-export type TrustTier = 'official' | 'community' | 'third-party'
-
-export interface DiscoveredModule {
-  packageName: string
-  version: string
-  name: string
-  description: string
-  trustTier: TrustTier
-  installed: boolean
-}
-
-/** Browse filters driving GET /api/modules/discover?q=&tier=&installed= — all
- * optional; an absent field doesn't constrain. */
-export interface DiscoverFilter {
-  query?: string
-  trustTier?: TrustTier
-  installed?: boolean
 }
 
 // ── A3 attached modules (docs/design/A3-ATTACHED-MODULE.md) ────────────────────
@@ -422,11 +291,18 @@ export interface DocumentsImportProgress {
   total: number
 }
 
+export type CliToolPathStatus = { path: string } & (
+  | { link: 'missing'; state: 'missing'; version: null }
+  | { link: 'current'; state: 'current'; version: string }
+  | { link: 'other'; state: 'outdated' | 'current' | 'newer'; version: string | null }
+)
+
 export interface CliToolStatus {
   state: 'missing' | 'outdated' | 'current' | 'newer' | 'unknown' | 'unavailable'
   path: string | null
   version: string | null
   bundledVersion: string | null
+  paths: CliToolPathStatus[]
 }
 
 export type CliInstallResult =

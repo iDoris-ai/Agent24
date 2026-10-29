@@ -574,6 +574,19 @@ impl Store {
         .await?)
     }
 
+    /// Whether `run_id` was unfinished when this library took migration 0033
+    /// (K1-R3 release review): a build that tagged no tool result may have
+    /// driven it.
+    pub async fn run_predates_tool_result_tagging(&self, run_id: &str) -> Result<bool> {
+        let listed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runs_before_tool_result_tagging WHERE run_id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(listed > 0)
+    }
+
     /// Every tag persisted against a run, in `(seq, source_id)` order.
     /// Empty for a run with none — callers needing the fail-closed default
     /// use [`Store::run_policy_snapshot`] instead of treating an empty
@@ -1317,6 +1330,64 @@ mod tests {
                 .iter()
                 .all(|tag| tag.source.kind != SourceKind::SessionContext)
         );
+    }
+
+    /// K1-R3 release review (David 2026-10-29): every run unfinished at the
+    /// upgrade is listed whatever its creation time says; a finished one, or
+    /// one created afterwards, is not.
+    #[tokio::test]
+    async fn runs_unfinished_before_0033_are_listed_and_later_ones_are_not() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.migrations = std::borrow::Cow::Owned(
+            migrator
+                .migrations
+                .iter()
+                .filter(|m| m.version <= 32)
+                .cloned()
+                .collect(),
+        );
+        migrator.run(&pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO runs (id, session_id, status, input, usage, created_at) VALUES \
+                ('r_parked', NULL, 'awaiting_approval', '{}', '{}', '2999-01-01T00:00:00Z'), \
+                ('r_queued', NULL, 'queued', '{}', '{}', 't'), \
+                ('r_running', NULL, 'running', '{}', '{}', 't'), \
+                ('r_completed', NULL, 'completed', '{}', '{}', 't'), \
+                ('r_failed', NULL, 'failed', '{}', '{}', 't'), \
+                ('r_cancelled', NULL, 'cancelled', '{}', '{}', 't');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO runs (id, session_id, status, input, usage, created_at) VALUES \
+                ('r_after', NULL, 'awaiting_approval', '{}', '{}', '2000-01-01T00:00:00Z');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = crate::test_hooks::from_pool(pool);
+        for (run, listed) in [
+            ("r_parked", true),
+            ("r_queued", true),
+            ("r_running", true),
+            ("r_completed", false),
+            ("r_failed", false),
+            ("r_cancelled", false),
+            ("r_after", false),
+        ] {
+            assert_eq!(
+                store.run_predates_tool_result_tagging(run).await.unwrap(),
+                listed,
+                "{run}"
+            );
+        }
     }
 
     /// K1-6b.5f-2: the tag and the session's origin are written together or

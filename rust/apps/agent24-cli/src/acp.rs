@@ -186,12 +186,13 @@ async fn run_prompt(
     // Subscribe before creating the run so a fast local model cannot complete
     // between POST /runs and the WebSocket handshake.
     let ws_url = format!("{}/api/v1/events", ep.base.replacen("http", "ws", 1));
-    let request = ws_request(&ws_url, &ep.token)?;
+    let request = ws_request(&ws_url, ep.token())?;
     let (socket, _) = tokio_tungstenite::connect_async(request)
         .await
         .map_err(|e| format!("connecting event stream: {e}"))?;
 
     let create = RunCreate {
+        idoris_headroom_confirmed: false,
         session_id: Some(session_id.to_owned()),
         prompt,
         workspace_id: None,

@@ -5,6 +5,7 @@ import http from 'node:http'
 import https from 'node:https'
 import { execFile, type ChildProcess } from 'node:child_process'
 import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron'
+import { createNavPrefsStore } from '../nav-prefs'
 import { daemonCliEndpoint, daemonConnection, getBackendEndpoint } from '../backend-manager'
 import { findAllowedRoute, proxyError, proxyRequest, timeoutFor } from '../backend-proxy'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
@@ -19,7 +20,6 @@ import type {
   BackendProxyRequest,
   BackendProxyResponse,
   LlmStatusResult,
-  IdorisStatusResult,
   OmlxAuthRequiredResult,
   OmlxDetectResult,
   OmlxModelsResult,
@@ -164,8 +164,23 @@ const EXTERNAL_URL_ALLOWLIST = ['https://', 'http://'] as const
 const HOST_INTERFACE = /^\/api\/v1\/host(\/|$)/i
 
 export function reachesHostInterface(requestPath: string): boolean {
+  return reachesPrefix(HOST_INTERFACE, requestPath)
+}
+
+// CORE-2 AgentEar S3: the daemon's desktop confirmation channel
+// (`/api/v1/presence/challenges/…`) belongs to main alone. If the renderer
+// could read or answer a challenge it could approve its own elevation, so the
+// proxy refuses the whole `/presence` subtree on top of the allowlist, by the
+// same raw / decoded / normalized rule as the host interface.
+const PRESENCE_CHANNEL = /^(\/api\/v1)?\/presence(\/|$)/i
+
+export function reachesPresenceChannel(requestPath: string): boolean {
+  return reachesPrefix(PRESENCE_CHANNEL, requestPath)
+}
+
+function reachesPrefix(prefix: RegExp, requestPath: string): boolean {
   const raw = requestPath.split(/[?#]/, 1)[0] ?? ''
-  const hits = (path: string) => HOST_INTERFACE.test(path.replace(/\/{2,}/g, '/'))
+  const hits = (path: string) => prefix.test(path.replace(/\/{2,}/g, '/'))
   if (hits(raw)) return true
   try {
     return hits(new URL(decodeURIComponent(raw), 'http://daemon').pathname)
@@ -233,7 +248,6 @@ const clip = (text: string, max: number): string =>
 
 // eslint-disable-next-line no-control-regex
 const hasControlChars = (text: string): boolean => /[\u0000-\u001f\u007f]/.test(text)
-const SAFE_MODULE_ID = /^[A-Za-z0-9._-]+$/
 const DECISION_SHAPE = /^[a-z_]{1,64}$/
 
 // Sensitive IPCs share one in-flight slot: a script that fires them in a loop
@@ -251,13 +265,46 @@ async function exclusive(fn: () => Promise<BackendProxyResponse>): Promise<Backe
   }
 }
 
+// A-3: the one attached module the desktop may disable or unpair. Fixed here,
+// never taken from the renderer.
+const AGENTEAR = 'agentear'
+const AGENTEAR_PATH = `/api/v1/attached/${AGENTEAR}`
+
+/** Error codes the AgentEar IPCs promise the renderer. Anything else the
+ *  daemon or transport says is folded into one of these. */
+export type AgentEarErrorCode =
+  | 'invalid_request' | 'busy' | 'cancelled' | 'not_paired' | 'forbidden' | 'daemon_error'
+  | 'backend_not_ready' | 'timeout' | 'proxy_failed'
+
+const agentearError = (status: number, code: AgentEarErrorCode, message: string): BackendProxyResponse =>
+  ({ ok: false, status, data: { error: { code, message } } })
+
+/** Maps a failed daemon/proxy response onto the stable AgentEar codes. */
+function agentearFailure(res: BackendProxyResponse): BackendProxyResponse {
+  const code = (res.data as { error?: { code?: unknown } } | null)?.error?.code
+  // Transport failures produced by backend-proxy keep their own code.
+  if (code === 'backend_not_ready' || code === 'timeout' || code === 'proxy_failed') return res
+  if (res.status === 404) return agentearError(404, 'not_paired', mt('err.agentearNotPaired'))
+  if (res.status === 401 || res.status === 403) return agentearError(403, 'forbidden', mt('err.agentearForbidden'))
+  return agentearError(502, 'daemon_error', mt('err.agentearDaemon'))
+}
+
+/** Confirms from the daemon's own list (never from the page) that AgentEar
+ *  is paired. Null = go ahead; otherwise the failure to return as is. */
+async function agentearPairedOrFailure(): Promise<BackendProxyResponse | null> {
+  const list = await proxyToBackend({ method: 'GET', path: '/api/v1/attached' })
+  if (!list.ok) return agentearFailure(list)
+  const mods = (list.data as { modules?: unknown } | null)?.modules
+  const paired = Array.isArray(mods) && mods.some((m) => (m as { name?: unknown } | null)?.name === AGENTEAR)
+  return paired ? null : agentearError(404, 'not_paired', mt('err.agentearNotPaired'))
+}
+
 const cancelled = (): BackendProxyResponse =>
   ({ ok: false, status: 499, data: { error: { code: 'cancelled', message: mt('err.cancelled') } } })
 const invalidRequest = (message: string): BackendProxyResponse =>
   ({ ok: false, status: 400, data: { error: { code: 'invalid_request', message } } })
 
 export function registerIpcHandlers(options: {
-  idorisStatus?: () => Promise<IdorisStatusResult>
   /** Test seam: where to look for the user's `~/.omlx/settings.json`. */
   omlxSettingsPath?: string
   /** Test seam: replace discovery ports to isolate probes from local services. */
@@ -345,29 +392,6 @@ export function registerIpcHandlers(options: {
     }
     return { ok: true }
   })
-  // modules:* — node-daemon era (npm community modules). The Rust daemon has
-  // no `/api/modules*`; list/discover/install/uninstall are retired (A5) and
-  // answer with a fixed envelope. The pages stay until REV-01 deletes them.
-  const modulesNotSupported = (): { error: { code: string; message: string } } =>
-    ({ error: { code: 'not_supported', message: 'node-daemon only' } })
-  handle(IpcChannels.ModulesList, modulesNotSupported)
-  handle(IpcChannels.ModulesDiscover, modulesNotSupported)
-  handle(IpcChannels.ModulesInstall, modulesNotSupported)
-  handle(IpcChannels.ModulesUninstall, modulesNotSupported)
-
-  // modules:enable / modules:disable — toggle module state via backend
-  handle(IpcChannels.ModulesEnable, async (_event, id: unknown): Promise<{ ok: boolean }> => {
-    if (typeof id !== 'string' || !SAFE_MODULE_ID.test(id) || id === '.' || id.includes('..')) return { ok: false }
-    const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/enable` })
-    return { ok: res.ok }
-  })
-
-  handle(IpcChannels.ModulesDisable, async (_event, id: unknown): Promise<{ ok: boolean }> => {
-    if (typeof id !== 'string' || !SAFE_MODULE_ID.test(id) || id === '.' || id.includes('..')) return { ok: false }
-    const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/disable` })
-    return { ok: res.ok }
-  })
-
   // llm:status — current active LLM provider + model
   handle(IpcChannels.LlmStatus, async (): Promise<LlmStatusResult> => {
     // Try oMLX first
@@ -383,14 +407,15 @@ export function registerIpcHandlers(options: {
     return { provider: 'none', url: '', model: '' }
   })
 
-  handle(IpcChannels.IdorisStatus, (): Promise<IdorisStatusResult> =>
-    options.idorisStatus?.() ?? Promise.resolve({ state: 'unavailable', reason: 'handoff-missing' }),
-  )
 
   // The renderer reports its UI language so the tray and native dialogs follow it.
   handle(IpcChannels.AppSetLocale, (_event, locale: unknown): void => {
     if (isMainLocale(locale)) setMainLocale(locale)
   })
+
+  const navPrefs = () => createNavPrefsStore(app.getPath('userData'))
+  handle(IpcChannels.NavPrefsGet, () => navPrefs().get())
+  handle(IpcChannels.NavPrefsSet, (_event, value: unknown) => navPrefs().set(value))
 
   handle(IpcChannels.AppPing, () => 'pong')
   handle(IpcChannels.AppVersion, () => app.getVersion())
@@ -438,6 +463,13 @@ export function registerIpcHandlers(options: {
         ok: false,
         status: 403,
         data: { error: { code: 'host_interface_private', message: 'The host interface is not reachable from the renderer' } },
+      }
+    }
+    if (reachesPresenceChannel(req.path)) {
+      return {
+        ok: false,
+        status: 403,
+        data: { error: { code: 'presence_channel_private', message: 'The presence channel is not reachable from the renderer' } },
       }
     }
     // A1: only allowlisted (method, path-template) pairs are forwarded.
@@ -523,6 +555,40 @@ export function registerIpcHandlers(options: {
       )
       if (!ok) return cancelled()
       return proxyToBackend({ method: 'PATCH', path: `/api/v1/os/${encodeURIComponent(name)}`, body: { enabled } })
+    }),
+  )
+
+  // A-3: PATCH /api/v1/attached/agentear — disable / re-enable AgentEar.
+  // Elevated in route_policy.rs; main sends it with the ProductHost credential,
+  // which the daemon does not gate with a presence challenge, so this native
+  // dialog is the human confirmation. Only `enabled` comes from the page; the
+  // module name is fixed and any further arguments are ignored.
+  handle(IpcChannels.AgentEarSetEnabled, (event, enabled: unknown): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      if (typeof enabled !== 'boolean') return invalidRequest('enabled must be a boolean')
+      const refused = await agentearPairedOrFailure()
+      if (refused) return refused
+      const ok = await confirmNative(
+        event,
+        mt(enabled ? 'agentear.enableMessage' : 'agentear.disableMessage'),
+        mt(enabled ? 'agentear.enableDetail' : 'agentear.disableDetail'),
+      )
+      if (!ok) return cancelled()
+      const res = await proxyToBackend({ method: 'PATCH', path: AGENTEAR_PATH, body: { enabled } })
+      return res.ok ? res : agentearFailure(res)
+    }),
+  )
+
+  // A-3: DELETE /api/v1/attached/agentear — revoke the pairing. AgentEar must
+  // pair again (its own menu bar + the presence dialog) to come back.
+  handle(IpcChannels.AgentEarUnpair, (event): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      const refused = await agentearPairedOrFailure()
+      if (refused) return refused
+      const ok = await confirmNative(event, mt('agentear.unpairMessage'), mt('agentear.unpairDetail'))
+      if (!ok) return cancelled()
+      const res = await proxyToBackend({ method: 'DELETE', path: AGENTEAR_PATH })
+      return res.ok ? res : agentearFailure(res)
     }),
   )
 }
