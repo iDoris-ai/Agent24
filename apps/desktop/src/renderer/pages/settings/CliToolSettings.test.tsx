@@ -8,7 +8,10 @@ const status = vi.fn()
 const install = vi.fn()
 beforeEach(() => {
   setLocale('en')
-  status.mockResolvedValue({ state: 'outdated', path: '/usr/local/bin/agent24', version: '0.3.0', bundledVersion: '0.6.0' })
+  status.mockResolvedValue({ state: 'outdated', path: '/usr/local/bin/agent24', version: '0.3.0', bundledVersion: '0.6.0', paths: [
+    { path: '/usr/local/bin/agent24', link: 'other', state: 'outdated', version: '0.3.0' },
+    { path: '/home/test/.agent24/bin/agent24', link: 'current', state: 'current', version: '0.6.0' },
+  ] })
   Object.defineProperty(window, 'agent24', { configurable: true, value: { cliToolStatus: status, installCliTool: install } })
 })
 it('shows PATH and bundled versions, installs without arguments and displays the backup', async () => {
@@ -60,4 +63,27 @@ it('stops polling and listening for focus after leaving settings', async () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(60_000); fireEvent.focus(window) })
     expect(status).toHaveBeenCalledTimes(3)
   } finally { vi.useRealTimers() }
+})
+
+it('shows both fixed CLI paths and offers an explicit user-only repair in all three locales', async () => {
+  const repair = vi.fn().mockResolvedValue({ state: 'installed', backup: null })
+  Object.defineProperty(window, 'agent24', { configurable: true, value: { cliToolStatus: status, installCliTool: install, repairUserCli: repair } })
+  status.mockResolvedValue({ state: 'outdated', path: '/home/test/.agent24/bin/agent24', version: '0.4.0', bundledVersion: '0.6.0', paths: [
+    { path: '/usr/local/bin/agent24', link: 'current', state: 'current', version: '0.6.0' },
+    { path: '/home/test/.agent24/bin/agent24', link: 'other', state: 'outdated', version: '0.4.0' },
+  ] })
+  render(<CliToolSettings />)
+  await screen.findByText('/usr/local/bin/agent24')
+  expect(screen.getByText('/home/test/.agent24/bin/agent24')).toBeInTheDocument()
+  expect(screen.getByText('Linked to this App')).toBeInTheDocument()
+  expect(screen.getByText('Other link or regular file')).toBeInTheDocument()
+  expect(screen.getByText(/AgentEar.*0.4.0.*pairing/)).toBeInTheDocument()
+  expect(repair).not.toHaveBeenCalled()
+  act(() => setLocale('zh'))
+  expect(screen.getByText(/AgentEar.*0.4.0.*配对失败/)).toBeInTheDocument()
+  act(() => setLocale('th'))
+  expect(screen.getByText(/AgentEar.*0.4.0.*จับคู่/)).toBeInTheDocument()
+  act(() => setLocale('en'))
+  fireEvent.click(screen.getByRole('button', { name: 'Repair user CLI' }))
+  await waitFor(() => expect(repair).toHaveBeenCalledWith())
 })

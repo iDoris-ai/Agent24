@@ -3,6 +3,9 @@ import { defineMessages } from './i18n'
 export const cliToolMessages = defineMessages({
   en: {
     title: 'Command line tool', path: 'Command on PATH', bundled: 'Bundled CLI version',
+    'link.missing': 'Not found', 'link.current': 'Linked to this App', 'link.other': 'Other link or regular file',
+    unknownVersion: 'Unknown', repairUser: 'Repair user CLI',
+    userWarning: 'AgentEar and other tools prefer ~/.agent24/bin/agent24. Its version is {version} (outdated or unknown), which can cause pairing to fail.',
     install: 'Install / Update `agent24` command', refresh: 'Check again', busy: 'Installing…',
     missing: 'Command line tool is missing — Install',
     outdated: 'Command line tool is outdated ({version}) — Update',
@@ -17,6 +20,9 @@ export const cliToolMessages = defineMessages({
   },
   zh: {
     title: '命令行工具', path: 'PATH 上的命令', bundled: '包内 CLI 版本',
+    'link.missing': '不存在', 'link.current': '已链接到当前 App', 'link.other': '指向别处或是普通文件',
+    unknownVersion: '未知', repairUser: '一键修复',
+    userWarning: 'AgentEar 等工具会优先使用 ~/.agent24/bin/agent24，当前版本为 {version}（旧版或未知），会导致配对失败。',
     install: '安装 / 更新 `agent24` 命令', refresh: '重新检测', busy: '安装中…',
     missing: '未找到命令行工具 — 安装', outdated: '命令行工具已过期（{version}）— 更新',
     current: 'CLI 版本一致', newer: 'PATH 上的 CLI 比包内版本更新',
@@ -30,6 +36,9 @@ export const cliToolMessages = defineMessages({
   },
   th: {
     title: 'เครื่องมือบรรทัดคำสั่ง', path: 'คำสั่งใน PATH', bundled: 'เวอร์ชัน CLI ที่มาพร้อมแอป',
+    'link.missing': 'ไม่พบ', 'link.current': 'ลิงก์ไปยังแอปนี้แล้ว', 'link.other': 'ลิงก์ไปที่อื่นหรือเป็นไฟล์ทั่วไป',
+    unknownVersion: 'ไม่ทราบ', repairUser: 'ซ่อม CLI ของผู้ใช้',
+    userWarning: 'AgentEar และเครื่องมืออื่นจะใช้ ~/.agent24/bin/agent24 ก่อน เวอร์ชันปัจจุบันคือ {version} (เก่าหรือไม่ทราบ) ซึ่งอาจทำให้จับคู่ไม่สำเร็จ',
     install: 'ติดตั้ง / อัปเดตคำสั่ง `agent24`', refresh: 'ตรวจสอบอีกครั้ง', busy: 'กำลังติดตั้ง…',
     missing: 'ไม่พบเครื่องมือบรรทัดคำสั่ง — ติดตั้ง', outdated: 'เครื่องมือบรรทัดคำสั่งล้าสมัย ({version}) — อัปเดต',
     current: 'เวอร์ชัน CLI ตรงกัน', newer: 'CLI ใน PATH ใหม่กว่า CLI ที่มาพร้อมแอป',
