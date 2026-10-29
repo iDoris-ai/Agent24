@@ -6,7 +6,7 @@ import './idoris.css'
 
 // Runtime truth comes exclusively from daemon snapshots. Form choices live only
 // for this mount; no installation, credential or operation state is persisted.
-export default function IdorisPanel({ onOpenChat }: { onOpenChat?: () => void } = {}) {
+export default function IdorisPanel() {
   const t = useT(idorisMessages)
   const locale = useLocale()
   const id = useId()
@@ -21,6 +21,8 @@ export default function IdorisPanel({ onOpenChat }: { onOpenChat?: () => void } 
   const [daily, setDaily] = useState('')
   const [deep, setDeep] = useState('')
   const [core, setCore] = useState('')
+  const coreEdited = useRef(false)
+  const suggestedCore = useRef<number | null>(null)
   const [consent, setConsent] = useState(false)
   const [saveKey, setSaveKey] = useState(false)
   const mounted = useRef(false)
@@ -41,6 +43,10 @@ export default function IdorisPanel({ onOpenChat }: { onOpenChat?: () => void } 
         const op = operationId ? await getOperation(operationId) : null
         if (!mounted.current) return
         setStatus(next)
+        if (!coreEdited.current && next.budget_suggestion && suggestedCore.current !== next.budget_suggestion.core_reserved_bytes) {
+          suggestedCore.current = next.budget_suggestion.core_reserved_bytes
+          setCore(String(suggestedCore.current)); setConsent(false)
+        }
         if (op) {
           setOperation(op)
           trackedOperation.current = op.result === null ? op.operation_id : null
@@ -102,6 +108,8 @@ export default function IdorisPanel({ onOpenChat }: { onOpenChat?: () => void } 
   const canConnect = !blocked && !probing && candidate?.identity === 'omlx' && candidate.authentication === 'ready' && candidate.models.includes(daily) && (!deep || candidate.models.includes(deep)) && Number.isSafeInteger(coreBytes) && coreBytes >= 0 && consent
   const errorCode = error ?? status?.last_error ?? (status?.state === 'instance_conflict' ? 'instance_conflict' : null)
   const errorText = Object.entries(idorisErrors).find(([code]) => code === errorCode)?.[1][locale] ?? t('errorGeneric')
+  const progress = operation?.phase === 'downloading' ? operation.download_progress : undefined
+  const receipt = status?.verification ?? (operation?.result === 'succeeded' ? operation.verification : undefined)
 
   return <section className="idoris-panel" aria-labelledby={`${id}-title`}>
     <h2 id={`${id}-title`}>{t('title')}</h2>
@@ -114,7 +122,8 @@ export default function IdorisPanel({ onOpenChat }: { onOpenChat?: () => void } 
       {!status.roles.includes('deep') && status.roles.length > 0 && <p>{t('noDeep')}</p>}
       {active && operation && <div className="idoris-progress" role="status" aria-live="polite">
         <span>{t(`phase.${operation.phase}`)}</span>
-        <progress aria-label={t(`phase.${operation.phase}`)} />
+        <progress aria-label={t(`phase.${operation.phase}`)} max={progress?.bytes_total || undefined} value={progress?.bytes_total ? progress.bytes_done : undefined} />
+        {progress && <span>{progress.bytes_total === undefined ? t('downloaded', { done: `${progress.bytes_done} B` }) : t('downloadedTotal', { done: `${progress.bytes_done} B`, total: `${progress.bytes_total} B` })}</span>}
         <button className="btn" disabled={pending || !operation.cancellable} onClick={() => { void run(() => cancelOperation(operation.operation_id)) }}>{t('cancel')}</button>
       </div>}
       {status.state === 'not_installed' && <>
@@ -154,8 +163,10 @@ export default function IdorisPanel({ onOpenChat }: { onOpenChat?: () => void } 
           {candidate?.models.map(model => <option key={model} value={model}>{model}</option>)}
         </select>
         <label htmlFor={`${id}-core`}>{t('core')}</label>
-        <input id={`${id}-core`} type="text" inputMode="numeric" required value={core} aria-describedby={`${id}-budget-help`} onChange={event => { setCore(event.target.value); setConsent(false) }} />
+        <input id={`${id}-core`} type="text" inputMode="numeric" required value={core} aria-describedby={`${id}-budget-help`} onChange={event => { coreEdited.current = true; setCore(event.target.value); setConsent(false) }} />
         <p id={`${id}-budget-help`}>{t('budgetHelp')}</p>
+        {status.budget_suggestion && <p>{t('budgetSuggestion', { core: `${status.budget_suggestion.core_reserved_bytes} B`, budget: `${status.budget_suggestion.idoris_budget_bytes} B` })}</p>}
+        {status.budget_unavailable_reason && <p>{t(`budget.${status.budget_unavailable_reason}`)}</p>}
         <label className="idoris-check"><input type="checkbox" checked={consent} onChange={event => setConsent(event.target.checked)} />{t('consent')}</label>
         <label className="idoris-check"><input type="checkbox" checked={saveKey} onChange={event => { setSaveKey(event.target.checked); setConsent(false) }} />{t('saveKey')}</label>
         <button className="btn btn-primary" disabled={!canConnect} onClick={() => { void run(() => submitOperation('connect', {
@@ -164,8 +175,13 @@ export default function IdorisPanel({ onOpenChat }: { onOpenChat?: () => void } 
         })) }}>{t('connect')}</button>
       </fieldset>}
       {status.state === 'running' && <>
-        <p role="status">{operation?.action === 'connect' && operation.result === 'succeeded' ? t('verified') : t('runningHint')}</p>
-        <button className="btn" disabled={!onOpenChat} onClick={onOpenChat}>{t('chat')}</button>
+        {receipt ? <div role="status">
+          <p>{t('verified')}</p>
+          <p>{t('verificationModel', { model: receipt.model_id })}</p>
+          <p>{t('verificationRecord', { record: receipt.record_id })}</p>
+          <p>{t('verificationLocality', { locality: receipt.locality })}</p>
+          <p>{t('verificationTime', { time: receipt.verified_at })}</p>
+        </div> : <p>{t('runningHint')}</p>}
         <button className="btn" disabled={blocked} onClick={() => { void run(() => submitOperation('stop')) }}>{t('stop')}</button>
       </>}
       {(status.state === 'stopped' || (status.state === 'failed' && status.roles.length > 0)) && <button className="btn" disabled={blocked} onClick={() => { void run(() => submitOperation('start')) }}>{t('start')}</button>}

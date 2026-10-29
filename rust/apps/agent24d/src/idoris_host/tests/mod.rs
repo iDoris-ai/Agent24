@@ -172,6 +172,7 @@ impl Fixture {
             omlx_url: None,
             omlx_key_id: None,
             desired_running: true,
+            verification: None,
         };
         let runtime = Arc::new(FixtureRuntime {
             lock,
@@ -646,6 +647,7 @@ async fn real_v040_install_existing_start_running_stop() {
         omlx_url: None,
         omlx_key_id: None,
         desired_running: true,
+        verification: None,
     })
     .await
     .unwrap();
@@ -758,7 +760,11 @@ fn lifecycle_wire_fixtures_match_serde_and_openapi() {
     let openapi: serde_json::Value =
         serde_yaml::from_str(&fs::read_to_string(root.join("protocol/openapi.yaml")).unwrap())
             .unwrap();
-    for (file, schema) in [("status", "IdorisStatus"), ("operation", "IdorisOperation")] {
+    for (file, schema) in [
+        ("status", "IdorisStatus"),
+        ("operation", "IdorisOperation"),
+        ("operation-failed", "IdorisOperation"),
+    ] {
         let value: serde_json::Value = serde_json::from_slice(
             &fs::read(root.join(format!("protocol/fixtures/idoris/{file}.json"))).unwrap(),
         )

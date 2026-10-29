@@ -24,7 +24,7 @@ use std::{
     sync::{Arc, Mutex as SyncMutex, Weak},
     time::Duration,
 };
-use tokio::sync::{Mutex, Notify, watch};
+use tokio::sync::{Mutex, Notify, OnceCell, watch};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
@@ -52,6 +52,17 @@ pub struct Installation {
     pub omlx_url: Option<String>,
     pub omlx_key_id: Option<String>,
     pub desired_running: bool,
+    #[serde(default)]
+    pub verification: Option<VerificationReceipt>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationReceipt {
+    pub model_id: String,
+    pub record_id: String,
+    pub locality: String,
+    pub verified_at: String,
 }
 
 impl Installation {
@@ -207,6 +218,9 @@ pub struct Status {
     pub roles: Vec<Role>,
     pub last_error: Option<Code>,
     pub current_operation: Option<String>,
+    pub verification: Option<VerificationReceipt>,
+    pub budget_suggestion: Option<agent24_hw::IdorisBudgetSuggestion>,
+    pub budget_unavailable_reason: Option<String>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -253,6 +267,10 @@ pub struct Operation {
     request_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_code: Option<agent24_idoris::setup::SetupCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_progress: Option<agent24_idoris::download::DownloadProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<VerificationReceipt>,
 }
 
 pub struct KeychainSource(pub Arc<dyn Keychain>);
@@ -444,6 +462,7 @@ pub struct IdorisHost {
     router: Arc<ModelRouter>,
     draining: SyncMutex<Option<Weak<IdorisGateway>>>,
     provisioner: Arc<dyn Provisioner>,
+    budget_suggestion: OnceCell<Result<agent24_hw::IdorisBudgetSuggestion, &'static str>>,
     data_keys: Arc<dyn Keychain>,
     omlx_keys: Arc<dyn Keychain>,
 }
@@ -531,6 +550,7 @@ impl IdorisHost {
             changed: Notify::new(),
             draining: SyncMutex::new(None),
             provisioner: Arc::new(SystemProvisioner),
+            budget_suggestion: OnceCell::new(),
             data_keys: Arc::new(SystemKeychain),
             omlx_keys: Arc::new(agent24_idoris::keychain::OmlxKeychain),
             inner: Mutex::new(Inner {
@@ -567,7 +587,7 @@ impl IdorisHost {
     pub async fn status(&self) -> Status {
         let i = self.inner.lock().await;
         let r = i.installation.as_ref();
-        Status {
+        let mut status = Status {
             state: i.state,
             version: r.map(|r| r.version.clone()),
             data_port: r.map(|r| r.data_port),
@@ -575,7 +595,24 @@ impl IdorisHost {
             roles: r.map(|r| r.roles.clone()).unwrap_or_default(),
             last_error: i.last_error,
             current_operation: i.active.as_ref().map(|a| a.0.clone()),
+            verification: r.and_then(|r| r.verification.clone()),
+            budget_suggestion: None,
+            budget_unavailable_reason: None,
+        };
+        drop(i);
+        if status.state == State::NotConfigured
+            || (status.state == State::Failed && status.roles.is_empty())
+        {
+            match self
+                .budget_suggestion
+                .get_or_init(|| self.provisioner.budget_suggestion())
+                .await
+            {
+                Ok(suggestion) => status.budget_suggestion = Some(suggestion.clone()),
+                Err(reason) => status.budget_unavailable_reason = Some((*reason).to_owned()),
+            }
         }
+        status
     }
     pub async fn operation(&self, id: &str) -> Result<Operation, Code> {
         self.inner
@@ -667,6 +704,8 @@ impl IdorisHost {
             idempotency_key: key,
             request_fingerprint: None,
             setup_code: None,
+            download_progress: None,
+            verification: None,
         };
         i.operations.insert(op.operation_id.clone(), op.clone());
         if let Err(e) = write_json(&self.root.join("operations.json"), &i.operations) {

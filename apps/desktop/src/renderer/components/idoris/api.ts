@@ -35,6 +35,28 @@ function port(value: unknown): number | null {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 65535) throw new IdorisError('invalid_response')
   return value
 }
+function bytes(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new IdorisError('invalid_response')
+  return value
+}
+function parseVerification(value: unknown): components['schemas']['IdorisVerification'] {
+  const v = object(value)
+  const verifiedAt = text(v.verified_at)
+  if (!Number.isFinite(Date.parse(verifiedAt))) throw new IdorisError('invalid_response')
+  return { model_id: text(v.model_id), record_id: text(v.record_id), locality: choice(v.locality, ['loopback']), verified_at: verifiedAt }
+}
+function parseBudget(value: unknown): components['schemas']['IdorisBudgetSuggestion'] {
+  const v = object(value)
+  return { core_reserved_bytes: bytes(v.core_reserved_bytes), idoris_budget_bytes: bytes(v.idoris_budget_bytes) }
+}
+function parseProgress(value: unknown): components['schemas']['IdorisDownloadProgress'] {
+  const v = object(value)
+  const done = bytes(v.bytes_done)
+  if (v.bytes_total === undefined) return { bytes_done: done }
+  const total = bytes(v.bytes_total)
+  if (total < done) throw new IdorisError('invalid_response')
+  return { bytes_done: done, bytes_total: total }
+}
 const codes: readonly components['schemas']['IdorisErrorCode'][] = [
   'not_installed', 'not_configured', 'instance_conflict', 'keychain_locked', 'key_unavailable', 'contract_mismatch', 'start_failed', 'stop_timeout', 'busy', 'cancelled', 'not_found', 'not_cancellable', 'shutting_down', 'invalid_request', 'persistence_failed', 'omlx_unreachable', 'omlx_auth_required', 'omlx_auth_rejected', 'unknown_service', 'model_not_found', 'consent_required', 'setup_failed', 'verify_failed', 'replace_required',
 ]
@@ -46,6 +68,9 @@ export function parseStatus(value: unknown): IdorisStatus {
     roles: array(v.roles).map(role => choice(role, ['daily', 'deep'])),
     last_error: v.last_error === null ? null : choice(v.last_error, codes),
     current_operation: v.current_operation === null ? null : text(v.current_operation),
+    verification: v.verification === null ? null : parseVerification(v.verification),
+    budget_suggestion: v.budget_suggestion === null ? null : parseBudget(v.budget_suggestion),
+    budget_unavailable_reason: v.budget_unavailable_reason === null ? null : choice(v.budget_unavailable_reason, ['hardware_memory_unavailable', 'hardware_probe_failed', 'host_unavailable']),
   }
 }
 export function parseOperation(value: unknown): IdorisOperation {
@@ -56,6 +81,8 @@ export function parseOperation(value: unknown): IdorisOperation {
     result: v.result === null ? null : choice(v.result, ['succeeded', 'failed', 'cancelled']),
     error_code: v.error_code === null ? null : choice(v.error_code, codes),
     cancellable: bool(v.cancellable), idempotency_key: text(v.idempotency_key),
+    ...(v.download_progress === undefined ? {} : { download_progress: parseProgress(v.download_progress) }),
+    ...(v.verification === undefined ? {} : { verification: parseVerification(v.verification) }),
   }
 }
 function parseCandidates(value: unknown): IdorisCandidates {

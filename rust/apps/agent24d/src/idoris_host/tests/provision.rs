@@ -51,12 +51,26 @@ struct Provision {
     lock: IdorisLock,
     gate: AtomicBool,
     downloads: AtomicUsize,
+    initial_gate: AtomicBool,
+    budget_probes: AtomicUsize,
     verifications: AtomicUsize,
     no_key: AtomicBool,
     key_waiting: AtomicBool,
+    budget_unavailable: AtomicBool,
 }
 #[async_trait]
 impl Provisioner for Provision {
+    async fn budget_suggestion(&self) -> Result<agent24_hw::IdorisBudgetSuggestion, &'static str> {
+        self.budget_probes.fetch_add(1, Ordering::SeqCst);
+        tokio::task::yield_now().await;
+        let total = if self.budget_unavailable.load(Ordering::SeqCst) {
+            0
+        } else {
+            16 * 1024 * 1024 * 1024_u64
+        };
+        let profile = serde_json::from_value(json!({"total_mem_bytes": total, "avail_mem_bytes": total, "arch":"aarch64", "cpu_cores":8, "accelerator":"metal", "os":"macos"})).unwrap();
+        agent24_hw::HardwareReport::new(profile, None).idoris_budget_suggestion()
+    }
     async fn verify(&self, r: &Installation) -> Result<InstalledVersion, Code> {
         self.verifications.fetch_add(1, Ordering::SeqCst);
         InstalledVersion::verify_existing(
@@ -74,11 +88,23 @@ impl Provisioner for Provision {
         &self,
         _: &Path,
         cancel: &CancellationToken,
+        progress: watch::Sender<agent24_idoris::download::DownloadProgress>,
     ) -> Result<VerifiedArchive, Code> {
         self.downloads.fetch_add(1, Ordering::SeqCst);
+        while self.initial_gate.load(Ordering::SeqCst) {
+            tokio::select! { _ = cancel.cancelled() => return Err(Code::Cancelled), _ = tokio::time::sleep(Duration::from_millis(5)) => {} }
+        }
+        progress.send_replace(agent24_idoris::download::DownloadProgress {
+            bytes_done: 123,
+            bytes_total: None,
+        });
         while self.gate.load(Ordering::SeqCst) {
             tokio::select! { _ = cancel.cancelled() => return Err(Code::Cancelled), _ = tokio::time::sleep(Duration::from_millis(5)) => {} }
         }
+        progress.send_replace(agent24_idoris::download::DownloadProgress {
+            bytes_done: 456,
+            bytes_total: Some(456),
+        });
         Ok(VerifiedArchive {
             path: self.record.archive_path.clone(),
             sha256: String::new(),
@@ -130,9 +156,12 @@ impl ConnectedFixture {
             lock: f.runtime.lock.clone(),
             gate: AtomicBool::new(false),
             downloads: AtomicUsize::new(0),
+            initial_gate: AtomicBool::new(false),
+            budget_probes: AtomicUsize::new(0),
             verifications: AtomicUsize::new(0),
             no_key: AtomicBool::new(false),
             key_waiting: AtomicBool::new(false),
+            budget_unavailable: AtomicBool::new(false),
         });
         let data = Arc::new(Store::default());
         let upstream = Arc::new(Store::default());
@@ -259,10 +288,189 @@ async fn install_reverifies_and_is_idempotent_and_cancellable() {
     })
     .await
     .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot =
+                serde_json::to_value(x.f.host.operation(&op.operation_id).await.unwrap()).unwrap();
+            if snapshot["download_progress"]["bytes_done"] == 123 {
+                assert_eq!(snapshot["phase"], "downloading");
+                assert!(snapshot["download_progress"].get("bytes_total").is_none());
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     x.f.host.cancel(&op.operation_id).await.unwrap();
     assert_eq!(x.f.complete(&op).await.result, Some(Outcome::Cancelled));
     assert!(!x.f.host.root.join("installation.json").exists());
 }
+
+#[tokio::test]
+async fn budget_suggestion_matches_hw_allocation_and_probe_failure_is_explicit() {
+    let x = ConnectedFixture::new().await;
+    x.installed().await;
+    let expected = x.provision.budget_suggestion().await.unwrap();
+    let value = serde_json::to_value(x.f.host.status().await).unwrap();
+    assert_eq!(
+        value["budget_suggestion"],
+        serde_json::to_value(expected).unwrap()
+    );
+    assert_eq!(value["budget_unavailable_reason"], serde_json::Value::Null);
+    let x = ConnectedFixture::new().await;
+    x.installed().await;
+    x.provision.budget_unavailable.store(true, Ordering::SeqCst);
+    let value = serde_json::to_value(x.f.host.status().await).unwrap();
+    assert_eq!(value["budget_suggestion"], serde_json::Value::Null);
+    assert_eq!(
+        value["budget_unavailable_reason"],
+        "hardware_memory_unavailable"
+    );
+}
+#[tokio::test]
+async fn status_caches_budget_probe_across_concurrent_and_repeated_calls() {
+    for unavailable in [false, true] {
+        let x = ConnectedFixture::new().await;
+        x.provision
+            .budget_unavailable
+            .store(unavailable, Ordering::SeqCst);
+        x.installed().await;
+        let (first, second) = tokio::join!(x.f.host.status(), x.f.host.status());
+        let third = x.f.host.status().await;
+        assert_eq!(x.provision.budget_probes.load(Ordering::SeqCst), 1);
+        for status in [first, second, third] {
+            assert_eq!(status.budget_suggestion.is_none(), unavailable);
+            assert_eq!(status.budget_unavailable_reason.is_some(), unavailable);
+        }
+        x.f.install().await;
+        assert!(x.f.host.status().await.budget_suggestion.is_none());
+        assert_eq!(x.provision.budget_probes.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn status_skips_budget_probe_outside_setup() {
+    let x = ConnectedFixture::new().await;
+    assert!(x.f.host.status().await.budget_suggestion.is_none());
+    x.f.install().await;
+    assert!(x.f.host.status().await.budget_suggestion.is_none());
+    assert_eq!(x.provision.budget_probes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn install_projects_zero_progress_before_the_first_download_update() {
+    let x = ConnectedFixture::new().await;
+    x.provision.initial_gate.store(true, Ordering::SeqCst);
+    let op =
+        x.f.host
+            .install(InstallRequest { consent: true }, Some("progress-test"))
+            .await
+            .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while x.provision.downloads.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let snapshot = x.f.host.operation(&op.operation_id).await.unwrap();
+    x.f.host.cancel(&op.operation_id).await.unwrap();
+    assert_eq!(x.f.complete(&op).await.result, Some(Outcome::Cancelled));
+    assert_eq!(snapshot.phase, Phase::Downloading);
+    assert_eq!(
+        serde_json::to_value(snapshot).unwrap()["download_progress"],
+        json!({"bytes_done": 0})
+    );
+}
+
+#[tokio::test]
+async fn install_flushes_the_last_progress_when_download_completes() {
+    let x = ConnectedFixture::new().await;
+    let op =
+        x.f.host
+            .install(InstallRequest { consent: true }, Some("progress-test"))
+            .await
+            .unwrap();
+    let done = x.f.complete(&op).await;
+    assert_eq!(done.result, Some(Outcome::Succeeded));
+    assert_eq!(
+        serde_json::to_value(done).unwrap()["download_progress"],
+        json!({"bytes_done":456, "bytes_total":456})
+    );
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&fs::read(x.f.host.root.join("operations.json")).unwrap()).unwrap();
+    assert_eq!(
+        persisted[&op.operation_id]["download_progress"],
+        json!({"bytes_done":456, "bytes_total":456})
+    );
+}
+
+#[tokio::test]
+async fn connect_rejects_oversized_or_unsafe_verification_model_id_without_commit() {
+    for model_id in [
+        "x".repeat(257),
+        "bad\nmodel".into(),
+        "bad\u{7f}model".into(),
+        "bad\u{061c}model".into(),
+        "bad\u{200e}model".into(),
+        "bad\u{202e}model".into(),
+        "bad\u{2066}model".into(),
+    ] {
+        let x = ConnectedFixture::new().await;
+        x.installed().await;
+        let before = fs::read(x.f.host.root.join("installation.json")).unwrap();
+        x.scenario(json!({"serve":{"verify_model": model_id}}));
+        let op =
+            x.f.host
+                .connect(x.request(), Some("invalid-receipt"))
+                .await
+                .unwrap();
+        let done = x.f.complete(&op).await;
+        x.f.host.shutdown().await.unwrap();
+        assert_eq!(done.error_code, Some(Code::VerifyFailed));
+        assert_eq!(done.result, Some(Outcome::Failed));
+        assert!(done.verification.is_none());
+        assert_eq!(
+            fs::read(x.f.host.root.join("installation.json")).unwrap(),
+            before
+        );
+        assert!(x.f.host.status().await.verification.is_none());
+        assert!(!x.f.host.root.join("connection.json").exists());
+        assert!(!x.f.host.root.join("pending-connect.json").exists());
+        assert!(x.f.host.router.idoris_gateway().is_err());
+        assert_eq!(x.keys()[0]["status"], "revoked");
+        assert!(x.data.entries.lock().unwrap().is_empty());
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(x.f.host.root.join("operations.json")).unwrap())
+                .unwrap();
+        assert!(persisted[&op.operation_id].get("verification").is_none());
+        x.f.assert_clean();
+    }
+}
+
+#[tokio::test]
+async fn connect_accepts_verification_model_id_at_the_limit() {
+    let x = ConnectedFixture::new().await;
+    x.installed().await;
+    let model_id = "x".repeat(256);
+    x.scenario(json!({"serve":{"verify_model": model_id}}));
+    let op =
+        x.f.host
+            .connect(x.request(), Some("bounded-receipt"))
+            .await
+            .unwrap();
+    let done = x.f.complete(&op).await;
+    x.f.host.shutdown().await.unwrap();
+    assert_eq!(done.result, Some(Outcome::Succeeded));
+    assert_eq!(done.verification.unwrap().model_id, model_id);
+    assert_eq!(
+        x.f.host.status().await.verification.unwrap().model_id,
+        model_id
+    );
+    x.f.assert_clean();
+}
+
 #[tokio::test]
 async fn candidates_expose_identity_models_and_source_but_never_credentials() {
     let x = ConnectedFixture::new().await;
@@ -297,6 +505,17 @@ async fn connect_verifies_chat_commits_once_and_requires_explicit_replace() {
         done.error_code
     );
     assert_eq!(x.f.host.status().await.state, State::Running);
+    let status = serde_json::to_value(x.f.host.status().await).unwrap();
+    let receipt = &status["verification"];
+    assert_eq!(receipt["locality"], "loopback");
+    assert_eq!(receipt["model_id"], "real-model");
+    assert_eq!(receipt["record_id"], "fixture-chat");
+    assert_eq!(receipt.as_object().unwrap().len(), 4);
+    assert!(chrono::DateTime::parse_from_rfc3339(receipt["verified_at"].as_str().unwrap()).is_ok());
+    assert_eq!(
+        serde_json::to_value(&done).unwrap()["verification"],
+        *receipt
+    );
     assert!(x.f.host.router.idoris_gateway().is_ok());
     assert_eq!(x.keys().len(), 1);
     assert_eq!(x.keys()[0]["allowed_roles"], json!(["daily"]));
@@ -329,6 +548,23 @@ async fn connect_verifies_chat_commits_once_and_requires_explicit_replace() {
     .unwrap();
     assert!(consent["confirmed_at"].as_str().is_some());
     x.f.host.shutdown().await.unwrap();
+    let reopened = IdorisHost::open(
+        x.f.host.root.clone(),
+        x.f.host.managed.clone(),
+        x.f.host.router.clone(),
+        x.f.host.runtime.clone(),
+        x.f.host.secrets.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(reopened.status().await).unwrap()["verification"],
+        *receipt
+    );
+    assert_eq!(
+        serde_json::to_value(reopened.operation(&op.operation_id).await.unwrap()).unwrap()["verification"],
+        *receipt
+    );
+    reopened.shutdown().await.unwrap();
     x.f.assert_clean();
     x.assert_safe();
 }
@@ -564,6 +800,21 @@ async fn restore_finishes_committed_replace_after_old_key_revoke_failure() {
             .exists()
     );
     x.scenario(json!({}));
+    let receipt =
+        x.f.host
+            .operation(&op.operation_id)
+            .await
+            .unwrap()
+            .verification
+            .unwrap();
+    x.f.host
+        .inner
+        .lock()
+        .await
+        .operations
+        .get_mut(&op.operation_id)
+        .unwrap()
+        .verification = None;
     let restored = x.f.host.restore().await;
     // Always reap the running replacement before a regression assertion can panic.
     let cleared = !pending.exists();
@@ -572,6 +823,17 @@ async fn restore_finishes_committed_replace_after_old_key_revoke_failure() {
     x.f.host.shutdown().await.unwrap();
     assert_eq!(restored, Ok(()));
     assert!(cleared);
+    let recovered = x.f.host.operation(&op.operation_id).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(recovered.verification).unwrap(),
+        serde_json::to_value(&receipt).unwrap()
+    );
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&fs::read(x.f.host.root.join("operations.json")).unwrap()).unwrap();
+    assert_eq!(
+        persisted[&op.operation_id]["verification"],
+        serde_json::to_value(receipt).unwrap()
+    );
     assert_eq!(keys[0]["status"], "revoked");
     assert_eq!(keys[1]["status"], "active");
     assert!(matches!(next, Err(Code::ReplaceRequired)));

@@ -38,6 +38,41 @@ pub struct DownloadOptions {
     pub total_timeout: Duration,
     /// May lower the limit, but cannot exceed MAX_ARCHIVE_BYTES.
     pub max_bytes: u64,
+    pub progress: Option<tokio::sync::watch::Sender<DownloadProgress>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DownloadProgress {
+    pub bytes_done: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_total: Option<u64>,
+}
+
+struct ProgressReporter<'a> {
+    sender: Option<&'a tokio::sync::watch::Sender<DownloadProgress>>,
+    last: Option<tokio::time::Instant>,
+}
+impl ProgressReporter<'_> {
+    fn report(&mut self, progress: DownloadProgress) {
+        if let Some(sender) = self.sender
+            && self
+                .last
+                .is_none_or(|last| last.elapsed() >= Duration::from_millis(250))
+        {
+            sender.send_replace(progress);
+            self.last = Some(tokio::time::Instant::now());
+        }
+    }
+    async fn finish(&mut self, progress: DownloadProgress) {
+        if let Some(sender) = self.sender
+            && *sender.borrow() != progress
+        {
+            if let Some(last) = self.last {
+                tokio::time::sleep_until(last + Duration::from_millis(250)).await;
+            }
+            self.report(progress);
+        }
+    }
 }
 
 impl Default for DownloadOptions {
@@ -46,6 +81,7 @@ impl Default for DownloadOptions {
             connect_timeout: Duration::from_secs(15),
             total_timeout: Duration::from_secs(300),
             max_bytes: MAX_ARCHIVE_BYTES,
+            progress: None,
         }
     }
 }
@@ -277,6 +313,11 @@ async fn download_with<S: Source, F: Future<Output = Result<S, DownloadError>>>(
         .await?;
         let mut hash = Sha256::new();
         let mut size = 0u64;
+        let total = source.content_length();
+        let mut progress = ProgressReporter {
+            sender: opts.progress.as_ref(),
+            last: None,
+        };
         while let Some(chunk) = source.next_chunk().await? {
             if chunk.len() as u64 > limit - size {
                 return Err(DownloadError::TooLarge);
@@ -290,7 +331,17 @@ async fn download_with<S: Source, F: Future<Output = Result<S, DownloadError>>>(
                 Ok((file, hash))
             })
             .await?;
+            progress.report(DownloadProgress {
+                bytes_done: size,
+                bytes_total: total.filter(|t| *t >= size),
+            });
         }
+        progress
+            .finish(DownloadProgress {
+                bytes_done: size,
+                bytes_total: total.filter(|t| *t >= size),
+            })
+            .await;
         let sha256 = format!("{:x}", hash.finalize());
         if !hash_matches(&sha256, &asset.sha256) {
             return Err(DownloadError::HashMismatch);

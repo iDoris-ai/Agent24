@@ -33,6 +33,9 @@ pub async fn status(State(state): State<AppState>) -> Response {
             roles: Vec::new(),
             last_error: state.idoris_unavailable.then_some(Code::PersistenceFailed),
             current_operation: None,
+            verification: None,
+            budget_suggestion: None,
+            budget_unavailable_reason: Some("host_unavailable".into()),
         },
     };
     Json(status).into_response()
