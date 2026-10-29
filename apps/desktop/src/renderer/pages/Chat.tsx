@@ -165,7 +165,9 @@ export default function ChatPage() {
     }
   }
 
-  // The turn as a run: the session keeps the history, so only the new prompt goes.
+  // The turn as a run: only the new prompt goes. The run sees earlier turns
+  // only through its session's memory (agent24-agent `session_context`): none
+  // while memory is off, and never the turns that went to /api/v1/chat.
   const replyWithKnowledge = async (index: number, request: ChatRequest) => {
     const prompt = request.messages[request.messages.length - 1]?.content ?? ''
     const sentAt = performance.now()
