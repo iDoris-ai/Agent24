@@ -151,17 +151,24 @@ export class KnowledgeController {
     const keyOk = apiKey === undefined || (typeof apiKey === 'string' && /^[\x21-\x7e]{1,16384}$/.test(apiKey))
     if (!validEndpoint(endpoint) || !validKnowledgeBaseIds(knowledgeBaseIds) || !keyOk) return { ok: false, reason: 'invalid' }
     const mine = ++this.version
+    const overtaken = () => mine !== this.version
     const next: KnowledgeSettings = { enabled: this.settings.enabled, endpoint, knowledgeBaseIds: [...knowledgeBaseIds] }
     try {
-      if (typeof apiKey === 'string') {
-        // The login names the endpoint it is for (`key()`).
-        await this.logins.put(KNOWLEDGE_BINDING, { profileId: endpoint, material: apiKey, unusable: false, temporary: false })
-      }
-      await this.save(next)
+      // The key and the settings take their turn with every other write, so
+      // an older `enabled` never lands after a later Off; a change overtaken
+      // before its turn writes nothing.
+      await this.serial(async () => {
+        if (overtaken()) return
+        if (typeof apiKey === 'string') {
+          // The login names the endpoint it is for (`key()`).
+          await this.logins.put(KNOWLEDGE_BINDING, { profileId: endpoint, material: apiKey, unusable: false, temporary: false })
+        }
+        await this.store.save(next)
+      })
     } catch {
       return { ok: false, reason: 'not_saved' }
     }
-    if (mine !== this.version) return { ok: false, reason: 'not_saved' }
+    if (overtaken()) return { ok: false, reason: 'not_saved' }
     this.settings = next
     return this.apply()
   }
@@ -208,9 +215,13 @@ export class KnowledgeController {
     await this.push()
   }
 
-  /** Writes run one at a time, in call order. */
   private save(settings: KnowledgeSettings): Promise<void> {
-    const run = this.saving.then(() => this.store.save(settings))
+    return this.serial(() => this.store.save(settings))
+  }
+
+  /** Writes run one at a time, in call order. */
+  private serial(write: () => Promise<void>): Promise<void> {
+    const run = this.saving.then(write)
     this.saving = run.catch(() => {})
     return run
   }

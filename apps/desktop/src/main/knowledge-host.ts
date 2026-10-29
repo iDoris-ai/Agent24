@@ -95,6 +95,9 @@ export class KnowledgeHost {
   // Bindings whose daemon record may differ from `wanted`, and those queued to be fixed.
   private unsynced = new Set<string>()
   private readonly reconciling = new Set<string>()
+  // Bumped for a binding by every deactivate: an activation called before it
+  // and still queued then does nothing.
+  private readonly drops = new Map<string, number>()
   private readonly deps: Required<KnowledgeHostDeps>
 
   constructor(private readonly logins: KnowledgeLoginStore, deps: KnowledgeHostDeps = {}) {
@@ -140,7 +143,10 @@ export class KnowledgeHost {
    * daemon refuses every call of the binding. */
   activate(bindingId: string, endpoint: KnowledgeEndpoint | null = null): Promise<HostResult> {
     const copy = endpoint && { endpoint: endpoint.endpoint, knowledgeBaseIds: [...endpoint.knowledgeBaseIds] }
+    const drops = this.drops.get(bindingId) ?? 0
     return this.operate(bindingId, async () => {
+      // An Off since the call wins, even over an activation queued behind a refresh.
+      if ((this.drops.get(bindingId) ?? 0) !== drops) return failure('binding_inactive')
       // Activating drops C in the daemon; it is pushed again afterwards.
       this.wanted.set(bindingId, { endpoint: copy, credential: null })
       this.confirmed.delete(bindingId)
@@ -154,11 +160,12 @@ export class KnowledgeHost {
   }
 
   /** Drops `bindingId` at once, ahead of anything queued for it (Off): it
-   * is no longer wanted, so a queued push or replay sends nothing, and an
-   * activation still being retried stops. */
+   * is no longer wanted, so a queued push, replay or activation sends
+   * nothing, and an activation still being retried stops. */
   async deactivate(bindingId: string): Promise<HostResult> {
     if (!validBindingId(bindingId)) return failure('invalid_binding')
     if (!this.started) return failure('not_started')
+    this.drops.set(bindingId, (this.drops.get(bindingId) ?? 0) + 1)
     this.wanted.delete(bindingId)
     this.confirmed.delete(bindingId)
     this.sync()

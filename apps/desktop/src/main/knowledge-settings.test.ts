@@ -175,6 +175,48 @@ describe('KnowledgeController (M3)', () => {
     save.mockRestore()
   })
 
+  it('a change whose key is still being written cannot undo a later Off on disk', async () => {
+    const c = make()
+    await c.configure(GOOD)
+    await c.setEnabled(true)
+    let release = () => {}
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const real = KnowledgeLoginStore.prototype.put
+    const put = vi.spyOn(KnowledgeLoginStore.prototype, 'put').mockImplementationOnce(async function (this: KnowledgeLoginStore, ...args) {
+      await gate
+      return real.apply(this, args)
+    })
+    const change = c.configure({ ...GOOD, apiKey: 'sk-NEW' })
+    const off = c.setEnabled(false)
+    release()
+    expect(await change).toEqual({ ok: false, reason: 'not_saved' })
+    expect(await off).toEqual({ ok: true })
+    expect(c.bindingForRun()).toBeNull()
+    expect(make().status().enabled).toBe(false)
+    put.mockRestore()
+  })
+
+  it('a change overtaken while waiting its turn writes no key', async () => {
+    const c = make()
+    await c.configure(GOOD)
+    let release = () => {}
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const real = KnowledgeSettingsStore.prototype.save
+    const save = vi.spyOn(KnowledgeSettingsStore.prototype, 'save').mockImplementationOnce(async function (this: KnowledgeSettingsStore, s) {
+      await gate
+      return real.call(this, s)
+    })
+    const on = c.setEnabled(true)
+    const change = c.configure({ ...GOOD, apiKey: 'sk-NEW' })
+    const off = c.setEnabled(false)
+    release()
+    expect(await change).toEqual({ ok: false, reason: 'not_saved' })
+    await on
+    await off
+    expect(logins.list().get(KNOWLEDGE_BINDING)?.material).toBe(GOOD.apiKey)
+    save.mockRestore()
+  })
+
   it('names no binding for a run until the daemon on this connection has taken the activation', async () => {
     const c = make()
     await c.configure(GOOD)

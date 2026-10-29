@@ -207,6 +207,24 @@ describe('KnowledgeHost (KB-HOST-01 PR-B2b)', () => {
     expect(daemon.sent.filter((r) => r.path === `${B1}/credential`)).toEqual([])
   })
 
+  it('drops a binding at once, ahead of an activation queued behind a refresh, which then sends nothing', async () => {
+    const host = makeHost()
+    host.start()
+    await store.put('b1', login('m'))
+    await host.activate('b1')
+    let release = () => {}
+    const pending = host.refresh('b1', () => new Promise((resolve) => { release = () => resolve(credential('late')) }))
+    const queued = host.activate('b1', { endpoint: 'https://kb.example/api/v1', knowledgeBaseIds: ['kb'] })
+    expect(await host.deactivate('b1')).toEqual({ ok: true })
+    const before = daemon.sent.length
+    release()
+    expect(await pending).toEqual({ ok: false, reason: 'binding_inactive' })
+    expect(await queued).toEqual({ ok: false, reason: 'binding_inactive' })
+    expect(daemon.sent.slice(before)).toEqual([])
+    expect(host.isActive('b1')).toBe(false)
+    expect(await host.pushCredential('b1', credential('after'))).toEqual({ ok: false, reason: 'binding_inactive' })
+  })
+
   it('stops retrying a stale activation once the binding is dropped', async () => {
     const host = makeHost()
     host.start()
