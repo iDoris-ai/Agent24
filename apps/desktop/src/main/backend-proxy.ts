@@ -43,7 +43,9 @@ const r = (method: HttpMethod, template: string, timeoutMs?: number): ProxyRoute
  *   PUT|DELETE /api/v1/tool-overrides/{pattern}
  *   DELETE /api/v1/standing-grants/{id}
  *   POST   /api/v1/capabilities/*
- *   POST|PATCH|DELETE /api/v1/attached*
+ *   POST   /api/v1/attached
+ *   PATCH  /api/v1/attached/{name}           -> IpcChannels.AgentEarSetEnabled (agentear only)
+ *   DELETE /api/v1/attached/{name}           -> IpcChannels.AgentEarUnpair (agentear only)
  *   PATCH  /api/v1/os/{name}                 -> IpcChannels.OsModuleSetEnabled
  *   POST   /api/v1/os/{name}/stop
  */

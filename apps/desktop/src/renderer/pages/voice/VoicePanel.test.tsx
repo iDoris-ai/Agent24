@@ -16,12 +16,18 @@ let snapshotEvents: AgentEarEventEnvelope[] = []
 let modelCallSnapshotCalls: ModelCallEnvelope[] = []
 let attachmentFails = false
 const openExternal = vi.fn(() => Promise.resolve())
+// A-3: the dedicated main-process IPCs. Each test sets what they resolve to.
+const agentearSetEnabled = vi.fn((_enabled: boolean): Promise<BackendRes> => Promise.resolve({ ok: true, status: 200, data: { modules: [] } }))
+const agentearUnpair = vi.fn((): Promise<BackendRes> => Promise.resolve({ ok: true, status: 204, data: null }))
+let proxyCalls: BackendReq[] = []
 
 function mount(): void {
   posted = []
   onEventHandler = null
   onModelCallHandler = null
+  proxyCalls = []
   const proxy = vi.fn((req: BackendReq): Promise<BackendRes> => {
+    proxyCalls.push(req)
     if (req.method === 'GET' && req.path === '/api/v1/attached') {
       if (attachmentFails) return Promise.reject(new Error('daemon offline'))
       return Promise.resolve({ ok: true, status: 200, data: { modules: attachModules } })
@@ -68,7 +74,7 @@ function mount(): void {
   const modelCallSnapshot = vi.fn(() => Promise.resolve(modelCallSnapshotCalls))
 
   Object.defineProperty(window, 'agent24', {
-    value: { backendProxy: proxy, onAgentEarEvent, agentearSnapshot, onModelCallEvent, modelCallSnapshot, openExternal },
+    value: { backendProxy: proxy, onAgentEarEvent, agentearSnapshot, onModelCallEvent, modelCallSnapshot, openExternal, agentearSetEnabled, agentearUnpair },
     writable: true,
     configurable: true,
   })
@@ -111,6 +117,10 @@ function modelCall(overrides: Partial<ModelCallEnvelope> = {}): ModelCallEnvelop
 beforeEach(() => {
   attachmentFails = false
   openExternal.mockClear()
+  agentearSetEnabled.mockReset()
+  agentearSetEnabled.mockImplementation(() => Promise.resolve({ ok: true, status: 200, data: { modules: [] } }))
+  agentearUnpair.mockReset()
+  agentearUnpair.mockImplementation(() => Promise.resolve({ ok: true, status: 204, data: null }))
   attachModules = []
   snapshotEvents = []
   modelCallSnapshotCalls = []
@@ -192,6 +202,124 @@ describe('VoicePanel — attach status', () => {
     render(<VoicePanel />)
     await waitFor(() => expect(screen.getByText(/已连接/)).toBeInTheDocument())
     expect(screen.getByLabelText('让它说')).toHaveAttribute('maxLength', '2000')
+  })
+})
+
+describe('VoicePanel — disable / unpair (A-3)', () => {
+  beforeEach(() => { setLocale('zh') })
+
+  it('shows no admin buttons while unpaired', async () => {
+    mount()
+    render(<VoicePanel />)
+    await screen.findByText(/未配对/)
+    expect(screen.queryByRole('button', { name: '停用' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '启用' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '解除配对' })).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['attached', '停用'],
+    ['detached', '停用'],
+    ['disabled', '启用'],
+  ])('paired + %s -> toggle reads %s, plus unpair', async (status, toggle) => {
+    attachModules = [{ ...attached(), attach_status: status }]
+    mount()
+    render(<VoicePanel />)
+    expect(await screen.findByRole('button', { name: toggle })).not.toBeDisabled()
+    expect(screen.getByRole('button', { name: '解除配对' })).not.toBeDisabled()
+    expect(screen.queryByRole('button', { name: toggle === '停用' ? '启用' : '停用' })).not.toBeInTheDocument()
+  })
+
+  it.each<[Locale, string, string]>([['en', 'Disable', 'Unpair'], ['th', 'ปิดใช้งาน', 'ยกเลิกการจับคู่']])('labels in %s', async (locale, disable, unpair) => {
+    setLocale(locale)
+    attachModules = [attached()]
+    mount()
+    render(<VoicePanel />)
+    expect(await screen.findByRole('button', { name: disable })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: unpair })).toBeInTheDocument()
+  })
+
+  it('disable calls the dedicated IPC (never the generic proxy) and refreshes the status at once', async () => {
+    attachModules = [attached()]
+    agentearSetEnabled.mockImplementation(() => {
+      attachModules = [{ ...attached(), attach_status: 'disabled' }]
+      return Promise.resolve({ ok: true, status: 200, data: { modules: attachModules } })
+    })
+    mount()
+    render(<VoicePanel />)
+    fireEvent.click(await screen.findByRole('button', { name: '停用' }))
+    expect(await screen.findByRole('button', { name: '启用' })).toBeInTheDocument()
+    expect(agentearSetEnabled).toHaveBeenCalledExactlyOnceWith(false)
+    expect(screen.getByText(/附着状态：已停用/)).toBeInTheDocument()
+    expect(proxyCalls.filter((r) => r.method !== 'GET')).toEqual([])
+  })
+
+  it('enable sends true', async () => {
+    attachModules = [{ ...attached(), attach_status: 'disabled' }]
+    mount()
+    render(<VoicePanel />)
+    fireEvent.click(await screen.findByRole('button', { name: '启用' }))
+    await waitFor(() => expect(agentearSetEnabled).toHaveBeenCalledExactlyOnceWith(true))
+  })
+
+  it('unpair calls the dedicated IPC and the panel falls back to the pairing guide', async () => {
+    attachModules = [attached()]
+    agentearUnpair.mockImplementation(() => {
+      attachModules = []
+      return Promise.resolve({ ok: true, status: 204, data: null })
+    })
+    mount()
+    render(<VoicePanel />)
+    fireEvent.click(await screen.findByRole('button', { name: '解除配对' }))
+    expect(await screen.findByRole('button', { name: '下载 AgentEar' })).toBeInTheDocument()
+    expect(agentearUnpair).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole('button', { name: '解除配对' })).not.toBeInTheDocument()
+    expect(proxyCalls.filter((r) => r.method !== 'GET')).toEqual([])
+  })
+
+  it('both buttons are disabled while a request is in flight; a second click sends nothing', async () => {
+    attachModules = [attached()]
+    let release!: (v: BackendRes) => void
+    agentearUnpair.mockImplementation(() => new Promise((r) => { release = r }))
+    mount()
+    render(<VoicePanel />)
+    const unpair = await screen.findByRole('button', { name: '解除配对' })
+    fireEvent.click(unpair)
+    await waitFor(() => expect(unpair).toBeDisabled())
+    expect(screen.getByRole('button', { name: '停用' })).toBeDisabled()
+    fireEvent.click(unpair)
+    fireEvent.click(screen.getByRole('button', { name: '停用' }))
+    expect(agentearUnpair).toHaveBeenCalledTimes(1)
+    expect(agentearSetEnabled).not.toHaveBeenCalled()
+    release({ ok: false, status: 499, data: { error: { code: 'cancelled', message: 'x' } } })
+    await waitFor(() => expect(unpair).not.toBeDisabled())
+  })
+
+  it('a cancelled confirmation is not an error', async () => {
+    attachModules = [attached()]
+    agentearSetEnabled.mockResolvedValue({ ok: false, status: 499, data: { error: { code: 'cancelled', message: 'Operation cancelled' } } })
+    mount()
+    render(<VoicePanel />)
+    fireEvent.click(await screen.findByRole('button', { name: '停用' }))
+    await waitFor(() => expect(agentearSetEnabled).toHaveBeenCalled())
+    await waitFor(() => expect(screen.getByRole('button', { name: '停用' })).not.toBeDisabled())
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['not_paired', 'AgentEar 已不在配对列表中'],
+    ['busy', '另一项需要确认的操作正在进行'],
+    ['forbidden', '守护进程拒绝了此操作'],
+    ['daemon_error', '守护进程未能完成此操作'],
+    ['something_new', '守护进程未能完成此操作'],
+  ])('failure %s -> a translated message by error code', async (code, text) => {
+    attachModules = [attached()]
+    agentearUnpair.mockResolvedValue({ ok: false, status: 502, data: { error: { code, message: 'raw daemon text' } } })
+    mount()
+    render(<VoicePanel />)
+    fireEvent.click(await screen.findByRole('button', { name: '解除配对' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(text)
+    expect(screen.getByRole('alert')).not.toHaveTextContent('raw daemon text')
   })
 })
 
