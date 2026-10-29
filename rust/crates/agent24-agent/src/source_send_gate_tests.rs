@@ -66,6 +66,7 @@ async fn present_prompt_without_recall_or_pause_still_forms_a_provider_request()
     let (manager, _, store) = manager_with(provider.clone()).await;
     let run = manager
         .start_run(RunCreate {
+            idoris_headroom_confirmed: false,
             session_id: None,
             workspace_id: None,
             prompt: "plain question".into(),
@@ -166,6 +167,7 @@ async fn null_host_recall_does_not_call_the_provider() {
             thread_to_messages(&before),
             false,
             CancellationToken::new(),
+            false,
         )
         .await;
     let done = store.get_run(&run.id).await.unwrap().unwrap();
@@ -205,6 +207,7 @@ async fn pause_notice_completes_the_run_and_keeps_snapshot_rows() {
     kv.set_memory_enabled("test-owner", false).await.unwrap();
     let run = manager
         .start_run(RunCreate {
+            idoris_headroom_confirmed: false,
             session_id: Some("gate-pause".into()),
             workspace_id: None,
             prompt: "记住 我喜欢喝茶".into(),
@@ -263,6 +266,7 @@ async fn paused_remember_run_completes_and_provider_gets_notice() {
     kv.set_memory_enabled("test-owner", false).await.unwrap();
     let run = manager
         .start_run(RunCreate {
+            idoris_headroom_confirmed: false,
             session_id: Some("gate-pause-ok".into()),
             workspace_id: None,
             prompt: "记住 X".into(),
@@ -337,6 +341,7 @@ async fn legacy_unsourced_pause_notice_still_refused() {
             thread_to_messages(&before),
             false,
             CancellationToken::new(),
+            false,
         )
         .await;
     let done = store.get_run(&run.id).await.unwrap().unwrap();
@@ -382,7 +387,7 @@ async fn unreadable_assistant_recall_ref_fails_before_the_next_send() {
     let running = reopen(&store, &run.id).await;
     let messages = thread_to_messages(&before);
     manager
-        .run_loop(running, messages, false, CancellationToken::new())
+        .run_loop(running, messages, false, CancellationToken::new(), false)
         .await;
     let done = store.get_run(&run.id).await.unwrap().unwrap();
     assert_eq!(done.status, RunStatus::Failed);
@@ -417,6 +422,7 @@ async fn origin_read_failure_does_not_call_the_provider() {
             thread_to_messages(&before),
             false,
             CancellationToken::new(),
+            false,
         )
         .await;
     let done = store.get_run(&run.id).await.unwrap().unwrap();

@@ -4,31 +4,27 @@ import { render, screen, fireEvent, waitFor, act, within } from '@testing-librar
 import { App, pickChatModel, extractDaemonDefaultModel } from './App'
 import { LOCALE_STORAGE_KEY, setLocale } from './i18n'
 import { SETTINGS_TAB_STORAGE_KEY } from './pages/Settings'
+import type { IdorisStatus } from './components/idoris/api'
 
 const mockBackendProxy = vi.fn()
-const mockModulesList = vi.fn()
 const mockGetAppVersion = vi.fn()
 const mockOmlxDetect = vi.fn()
 const mockOmlxStart = vi.fn()
 const mockOmlxModels = vi.fn()
 const mockBackendEndpoint = vi.fn()
 const mockSetNavPrefs = vi.fn()
-const mockIdorisStatus = vi.fn()
 
 beforeEach(() => {
   vi.clearAllMocks()
   mockGetAppVersion.mockResolvedValue('1.0.0')
   mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { status: 'ok', ts: Date.now(), schedules: [], runs: [] } })
-  mockModulesList.mockResolvedValue([])
   mockOmlxDetect.mockResolvedValue({ ok: true, models: ['Qwen3-8B-4bit'] })
   mockBackendEndpoint.mockResolvedValue({ port: 60128 })
   mockSetNavPrefs.mockResolvedValue(undefined)
-  mockIdorisStatus.mockResolvedValue({ state: 'unavailable', reason: 'handoff-missing' })
 
   Object.defineProperty(window, 'agent24', {
     value: {
       backendProxy: mockBackendProxy,
-      modulesList: mockModulesList,
       getAppVersion: mockGetAppVersion,
       omlxDetect: mockOmlxDetect,
       omlxStart: mockOmlxStart,
@@ -36,7 +32,6 @@ beforeEach(() => {
       backendEndpoint: mockBackendEndpoint,
       getNavPrefs: vi.fn().mockResolvedValue({ pinned: ['documents', 'design', 'create'], slotCount: 3, showOverview: true }),
       setNavPrefs: mockSetNavPrefs,
-      idorisStatus: mockIdorisStatus,
       agentearSnapshot: vi.fn().mockResolvedValue([]),
       modelCallSnapshot: vi.fn().mockResolvedValue([]),
       onAgentEarEvent: vi.fn(() => () => {}),
@@ -184,13 +179,44 @@ describe('App', () => {
     })
   })
 
+  it('Home module count reads GET /api/v1/os', async () => {
+    mockBackendProxy.mockImplementation((req: { path: string }) =>
+      Promise.resolve(
+        req.path === '/api/v1/os'
+          ? { ok: true, status: 200, data: { modules: [{ name: 'a', state: 'mounted' }, { name: 'b', state: 'mounted' }, { name: 'c', state: 'mounted' }, { name: 'd', state: 'disabled' }, { name: 'e', state: 'refused' }] } }
+          : { ok: true, status: 200, data: { status: 'ok' } },
+      ),
+    )
+    await act(async () => { render(<App />) })
+    fireEvent.click(screen.getAllByText('总览')[0])
+    await waitFor(() => {
+      expect(mockBackendProxy).toHaveBeenCalledWith({ method: 'GET', path: '/api/v1/os' })
+      expect(screen.getByText('已加载模块').nextElementSibling).toHaveTextContent('3')
+    })
+  })
+
+  it('Home module count is 0 when every OS module is disabled or refused', async () => {
+    mockBackendProxy.mockImplementation((req: { path: string }) =>
+      Promise.resolve(
+        req.path === '/api/v1/os'
+          ? { ok: true, status: 200, data: { modules: [{ name: 'a', state: 'disabled' }, { name: 'b', state: 'refused' }] } }
+          : { ok: true, status: 200, data: { status: 'ok' } },
+      ),
+    )
+    await act(async () => { render(<App />) })
+    fireEvent.click(screen.getAllByText('总览')[0])
+    await waitFor(() => {
+      expect(mockBackendProxy).toHaveBeenCalledWith({ method: 'GET', path: '/api/v1/os' })
+      expect(screen.getByText('已加载模块').nextElementSibling).toHaveTextContent('0')
+    })
+  })
+
   // A5: node-daemon-era module entries are gone from the navigation.
   it('has no module-manager / codebox / service-box / hello entries (A5)', async () => {
     await act(async () => { render(<App />) })
     expect(screen.queryByText('模块管理')).not.toBeInTheDocument()
     expect(screen.queryByText('安装模块')).not.toBeInTheDocument()
     expect(screen.queryByText('能力模块')).not.toBeInTheDocument()
-    expect(mockModulesList).not.toHaveBeenCalled()
   })
 
   it('navigates to settings page on click', async () => {
@@ -424,7 +450,6 @@ describe('App navigation integration', () => {
   })
 
   it('keeps default status labels when iDoris and Hyphae status cannot be obtained', async () => {
-    mockIdorisStatus.mockRejectedValue(new Error('offline'))
     mockBackendProxy.mockResolvedValue({ ok: false, status: 503, data: null })
     await act(async () => { render(<App />) })
     await act(async () => { center() })
@@ -436,6 +461,11 @@ describe('App navigation integration', () => {
   it('shows approval badges and known iDoris and Hyphae status in the center', async () => {
     mockBackendProxy.mockImplementation(({ path }: { path: string }) => Promise.resolve({ ok: true, status: 200, data:
       path.includes('/approvals?') ? { approvals: [{ id: 'one' }, { id: 'two' }] }
+        : path === '/api/v1/idoris/status' ? {
+          state: 'not_configured', version: '0.4.0', data_port: null, admin_port: null,
+          roles: [], last_error: null, current_operation: null, verification: null,
+          budget_suggestion: null, budget_unavailable_reason: 'hardware_memory_unavailable',
+        } satisfies IdorisStatus
         : path === '/api/v1/comm/daemon' ? { ok: true, data: {
           process: { state: 'running', generation: 1, consecutive_failures: 0, reason: null },
           relay_probe: null, catch_up: { state: 'unknown', last_incomplete_at_ms: null },
@@ -445,7 +475,7 @@ describe('App navigation integration', () => {
     expect(nav().getByRole('button', { name: /Capabilities\s*2/ })).toHaveTextContent('2')
     center()
     expect(row('Approvals').getByRole('status', { name: '2 waiting' })).toHaveTextContent('2')
-    await waitFor(() => expect(row('Local models').getByText('iDoris not connected (optional)')).toBeInTheDocument())
+    await waitFor(() => expect(row('Local models').getByText('Installed · not connected')).toBeInTheDocument())
     expect(row('Communication').getByText('Running')).toBeInTheDocument()
   })
 })

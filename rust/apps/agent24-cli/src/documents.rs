@@ -206,12 +206,15 @@ fn invalid(message: String) -> Response {
 /// The running daemon. A failure to find it, like every failure before
 /// anything is sent, is a [`Response`] too, so `--json` still ends with its
 /// result line: 400 `invalid_request` for what was given, 503
-/// `backend_not_ready` for no daemon (the desktop's code for it).
+/// `backend_not_ready` for no daemon (the desktop's code for it), 503
+/// `backend_incompatible` for a daemon on another protocol (CORE-4): nothing
+/// is sent to it.
 async fn daemon() -> Result<HttpTransport, Response> {
     let ep = super::attach_only()
         .await
+        .map_err(|why| Response::fail(503, "backend_incompatible", &why))?
         .ok_or_else(|| Response::fail(503, "backend_not_ready", NO_DAEMON))?;
-    HttpTransport::new(&ep.base, Some(ep.token.clone())).map_err(invalid)
+    HttpTransport::new(&ep.base, Some(ep.token().to_owned())).map_err(invalid)
 }
 
 /// Where to send and what: from stdin (the desktop) or from the argument and

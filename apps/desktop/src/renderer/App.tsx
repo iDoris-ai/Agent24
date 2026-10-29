@@ -8,6 +8,7 @@ import ChatPage from './pages/Chat'
 import HomePage from './pages/Home'
 import ModelsPage from './pages/Models'
 import SettingsPage from './pages/Settings'
+import { listOsModules } from './pages/agent/api'
 import RunsPage from './pages/Runs'
 import SchedulesPage from './pages/Schedules'
 import CommunicationPage from './pages/comm/Communication'
@@ -17,7 +18,6 @@ import CreativePage from './pages/Creative'
 import MemoryPage from './pages/Memory'
 import DocumentsPage from './pages/documents/Documents'
 import ModulesManagerPage from './pages/ModulesManager'
-import HelloModule from './pages/modules/HelloModule'
 import { Sidebar } from './capabilities/Sidebar'
 import { Breadcrumb } from './capabilities/Breadcrumb'
 import { CapabilityPage } from './capabilities/CapabilityPage'
@@ -94,6 +94,8 @@ function AppShell(): JSX.Element {
   const [version, setVersion] = useState<string>('')
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [darkMode, setDarkMode] = useState(true)
+  // Domain-OS modules actually mounted (state==='mounted') in the daemon (`GET /api/v1/os`) — the Home card.
+  const [osModuleCount, setOsModuleCount] = useState(0)
   // Renamed from `llmLabel`: this is now only the oMLX-derived FALLBACK,
   // used when the daemon has no `default_model` to report. The topbar's
   // actual displayed label is the `llmLabel` derived value below.
@@ -121,12 +123,15 @@ function AppShell(): JSX.Element {
 
     void window.agent24.getAppVersion().then(setVersion)
 
-    // Backend health polling
+    // Backend health + domain-OS module count polling
     const checkBackend = () => {
       window.agent24.backendProxy({ method: 'GET', path: '/api/v1/health' })
         .then((res) => {
           setBackendOk(res.ok)
           if (res.ok) {
+            void listOsModules()
+              .then((l) => setOsModuleCount(Array.isArray(l.modules) ? l.modules.filter((m) => m.state === 'mounted').length : 0))
+              .catch(() => { /* keep the last count */ })
             // FU-93: show the daemon's real port, not a hardcoded guess.
             void window.agent24.backendEndpoint().then((e) => setBackendPort(e?.port ?? null))
             // ME4-desktop-model-ui: ask the daemon what its OWN default
@@ -260,7 +265,7 @@ function AppShell(): JSX.Element {
           <HomePage
             backendOk={backendOk}
             backendPort={backendPort}
-            moduleCount={defs.filter(d => d.page.startsWith('module:')).length}
+            moduleCount={osModuleCount}
             onNavigate={(target) => {
               const def = defs.find(d => d.page === target || d.id === target)
               if (def) open(def.id, 'other')
@@ -280,8 +285,7 @@ function AppShell(): JSX.Element {
         {page === 'settings'         && <SettingsPage key={route.kind === 'page' ? route.key : undefined} initialTab={route.kind === 'page' ? route.initialTab : undefined} />}
         {page === 'capabilities'     && <CapabilitiesPage statusFor={statusFor} onOpenSettings={() => open('settings/general', 'capabilities')} />}
         {page === 'modules-manager'  && <ModulesManagerPage />}
-        {page === 'module:hello'     && <HelloModule />}
-        {selected && !['chat', 'documents', 'schedules', 'communication', 'approvals', 'voice', 'creative', 'models', 'memory', 'modules-manager', 'module:hello'].includes(selected.page)
+        {selected && !['chat', 'documents', 'schedules', 'communication', 'approvals', 'voice', 'creative', 'models', 'memory', 'modules-manager'].includes(selected.page)
           && <CapabilityPage capability={selected} />}
       </div>
     </div>

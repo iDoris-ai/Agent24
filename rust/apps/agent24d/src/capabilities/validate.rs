@@ -12,11 +12,23 @@ impl CapabilityStore {
         now: UnixSeconds,
     ) -> Result<Authorization, CapabilityError> {
         let digest = digest(token);
-        let state = self
+        let mut state = self
             .shared
             .state
             .lock()
             .map_err(|_| CapabilityError::Unauthorized)?;
+        let record = state
+            .records
+            .get(&digest)
+            .ok_or(CapabilityError::Unauthorized)?;
+        if !process_live(record) {
+            let id = record.claims.capability_id.clone();
+            state.records.remove(&digest);
+            state.ids.remove(&id);
+            state.epoch = state.epoch.wrapping_add(1);
+            let _ = self.shared.changed.send(state.epoch);
+            return Err(CapabilityError::Unauthorized);
+        }
         let record = state
             .records
             .get(&digest)
@@ -37,6 +49,49 @@ impl CapabilityStore {
     ) -> Result<Authorization, CapabilityError> {
         let token = CapabilityToken::parse_bearer(bearer)?;
         self.validate(&token, operation, resource, now)
+    }
+
+    /// Bearer is known, unrevoked, unexpired, and for this daemon.
+    /// Operation and resource are not checked: 404 and 405 must not reveal the
+    /// route table to a missing, unknown, or revoked token.
+    pub fn require_live_bearer(
+        &self,
+        bearer: &str,
+        now: UnixSeconds,
+    ) -> Result<(), CapabilityError> {
+        let token = CapabilityToken::parse_bearer(bearer)?;
+        let digest = digest(&token);
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| CapabilityError::Unauthorized)?;
+        let record = state
+            .records
+            .get(&digest)
+            .ok_or(CapabilityError::Unauthorized)?;
+        if !process_live(record) {
+            let id = record.claims.capability_id.clone();
+            state.records.remove(&digest);
+            state.ids.remove(&id);
+            state.epoch = state.epoch.wrapping_add(1);
+            let _ = self.shared.changed.send(state.epoch);
+            return Err(CapabilityError::Unauthorized);
+        }
+        let record = state
+            .records
+            .get(&digest)
+            .ok_or(CapabilityError::Unauthorized)?;
+        if record.revoked {
+            return Err(CapabilityError::Revoked);
+        }
+        if record.claims.daemon_generation != *self.daemon_generation {
+            return Err(CapabilityError::StaleGeneration);
+        }
+        if record.expired(now) {
+            return Err(CapabilityError::Expired);
+        }
+        Ok(())
     }
 
     pub fn validate_action(
@@ -84,15 +139,15 @@ impl CapabilityStore {
         if record.claims.daemon_generation != *self.daemon_generation {
             return Err(CapabilityError::StaleGeneration);
         }
-        if now >= record.claims.expires_at {
+        if record.expired(now) {
             return Err(CapabilityError::Expired);
         }
-        if record.claims.audience == super::Audience::CreativeRuntime
+        if record.claims.audience != super::Audience::ProductHost
             && !record.claims.allowed_operations.contains(&operation)
         {
             return Err(CapabilityError::OperationDenied);
         }
-        if record.claims.audience == super::Audience::CreativeRuntime {
+        if record.claims.audience != super::Audience::ProductHost {
             let exact = match operation.scope() {
                 ResourceScope::Global => resource == &Resource::global(),
                 ResourceScope::Principal => {
@@ -108,4 +163,12 @@ impl CapabilityStore {
         }
         Ok(())
     }
+}
+
+fn process_live(record: &Record) -> bool {
+    record
+        .claims
+        .first_party
+        .as_ref()
+        .is_none_or(|claims| super::first_party::peer_live(&claims.peer))
 }

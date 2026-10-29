@@ -45,6 +45,16 @@ pub struct DaemonState {
     /// Missing means the pre-capability legacy format.
     #[serde(default)]
     pub auth_mode: AuthMode,
+    /// Wire protocol this daemon speaks. Absent on discovery files written
+    /// before version negotiation; readers treat absence as unknown, which
+    /// is incompatible ([`crate::protocol_compatibility`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
+    /// Path of the enrolment socket (`<data_dir>/enroll.sock`), published by
+    /// capability daemons that run the endpoint (CORE-2e). A path, never a
+    /// credential; absent for legacy daemons and for older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enroll_endpoint: Option<String>,
 }
 
 impl DaemonState {
@@ -63,6 +73,8 @@ impl DaemonState {
             version: version.into(),
             generation: generation.into(),
             auth_mode: AuthMode::LegacySingleToken,
+            protocol_version: Some(crate::PROTOCOL_VERSION),
+            enroll_endpoint: None,
         };
         state.validate().map(|()| state)
     }
@@ -82,12 +94,25 @@ impl DaemonState {
             version: version.into(),
             generation: generation.into(),
             auth_mode: AuthMode::Capabilities,
+            protocol_version: Some(crate::PROTOCOL_VERSION),
+            enroll_endpoint: None,
         };
         state.validate().map(|()| state)
     }
 
+    /// Advertise the enrolment socket. Only capability records may carry it
+    /// ([`Self::validate`] rejects it elsewhere).
+    #[must_use]
+    pub fn with_enroll_endpoint(mut self, path: impl Into<String>) -> Self {
+        self.enroll_endpoint = Some(path.into());
+        self
+    }
+
     /// Check the mutually-exclusive credential contract.
     pub fn validate(&self) -> Result<(), String> {
+        if self.enroll_endpoint.is_some() && self.auth_mode != AuthMode::Capabilities {
+            return Err("enroll_endpoint is valid only in capabilities auth mode".to_owned());
+        }
         match self.auth_mode {
             AuthMode::LegacySingleToken => {
                 if self.token.is_empty() {
@@ -123,29 +148,13 @@ impl DaemonState {
     }
 }
 
-/// Environment variable that overrides the data root (MAINT-03).
-pub const DATA_DIR_ENV: &str = "AGENT24_DATA_DIR";
+pub use crate::data_dir::DATA_DIR_ENV;
 
-/// The single data root: `daemon.json`, `logs/`, `agent24.db`, `attach/` and
-/// the tool workspace all derive from it. `AGENT24_DATA_DIR` (non-empty,
-/// absolute) wins and is used as-is; otherwise `$HOME/.agent24`; no `HOME`
-/// → `None`. Unset, the result is exactly the pre-override behaviour.
+/// Compatibility alias for [`crate::data_dir::data_dir`]; `None` when the
+/// platform root cannot be resolved (no `HOME`, or no `LOCALAPPDATA` on
+/// Windows). The single resolver lives in `data_dir.rs`.
 pub fn state_dir() -> Option<PathBuf> {
-    state_dir_from(std::env::var_os(DATA_DIR_ENV), std::env::var_os("HOME"))
-}
-
-/// Pure resolution behind [`state_dir`], so tests can exercise it without
-/// mutating the process environment (`set_var` is `unsafe` in edition 2024).
-fn state_dir_from(
-    data_dir: Option<std::ffi::OsString>,
-    home: Option<std::ffi::OsString>,
-) -> Option<PathBuf> {
-    if let Some(dir) = data_dir.map(PathBuf::from)
-        && dir.is_absolute()
-    {
-        return Some(dir);
-    }
-    home.map(|h| PathBuf::from(h).join(".agent24"))
+    crate::data_dir::data_dir().ok()
 }
 
 pub fn state_path() -> Option<PathBuf> {
@@ -207,11 +216,17 @@ pub fn write(state: &DaemonState) -> std::io::Result<()> {
 /// (two CLIs both deciding "nothing running" and both spawning).
 /// Returns Ok(None) when another daemon already holds the lock.
 pub fn try_acquire_singleton() -> std::io::Result<Option<std::fs::File>> {
-    use fs2::FileExt;
     let Some(dir) = state_dir() else {
         return Err(std::io::Error::other("HOME not set"));
     };
-    std::fs::create_dir_all(&dir)?;
+    try_acquire_singleton_in(&dir)
+}
+
+/// `<dir>/daemon.singleton.lock`, the same non-blocking `fs2` lock.
+/// `Ok(None)` means it is already held. The file releases the lock on drop.
+pub fn try_acquire_singleton_in(dir: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
+    use fs2::FileExt;
+    std::fs::create_dir_all(dir)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -289,46 +304,9 @@ mod tests {
 
     use super::*;
 
-    fn os(s: &str) -> Option<std::ffi::OsString> {
-        Some(s.into())
-    }
-
     #[test]
-    fn data_dir_unset_keeps_home_dot_agent24() {
-        assert_eq!(
-            state_dir_from(None, os("/home/u")),
-            Some(PathBuf::from("/home/u/.agent24"))
-        );
-        assert_eq!(state_dir_from(None, None), None);
-    }
-
-    #[test]
-    fn data_dir_override_is_used_as_is() {
-        assert_eq!(
-            state_dir_from(os("/tmp/x"), os("/home/u")),
-            Some(PathBuf::from("/tmp/x"))
-        );
-        // No `.agent24` suffix, and HOME is not needed at all.
-        assert_eq!(
-            state_dir_from(os("/tmp/x"), None),
-            Some(PathBuf::from("/tmp/x"))
-        );
-    }
-
-    #[test]
-    fn empty_or_relative_data_dir_falls_back_to_home() {
-        let home = Some(PathBuf::from("/home/u/.agent24"));
-        assert_eq!(state_dir_from(os(""), os("/home/u")), home);
-        assert_eq!(state_dir_from(os("rel/dir"), os("/home/u")), home);
-        assert_eq!(state_dir_from(os(""), None), None);
-    }
-
-    #[test]
-    fn state_dir_reads_the_real_environment() {
-        assert_eq!(
-            state_dir(),
-            state_dir_from(std::env::var_os(DATA_DIR_ENV), std::env::var_os("HOME"))
-        );
+    fn state_dir_is_the_data_dir_alias() {
+        assert_eq!(state_dir(), crate::data_dir::data_dir().ok());
     }
 
     #[test]
@@ -349,6 +327,7 @@ mod tests {
                 .unwrap();
         assert_eq!(state.auth_mode, AuthMode::LegacySingleToken);
         assert_eq!(state.generation, "");
+        assert_eq!(state.protocol_version, None);
         assert_eq!(state.bearer_token(), Ok("old-token"));
     }
 
@@ -358,6 +337,7 @@ mod tests {
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(json["auth_mode"], "capabilities");
         assert_eq!(json["generation"], "gen-1");
+        assert_eq!(json["protocol_version"], crate::PROTOCOL_VERSION);
         assert!(json.get("token").is_none());
         assert_eq!(state.bearer_token(), Err("host authority unavailable"));
     }
@@ -371,6 +351,8 @@ mod tests {
             version: "v".into(),
             generation: "gen".into(),
             auth_mode: AuthMode::Capabilities,
+            protocol_version: Some(crate::PROTOCOL_VERSION),
+            enroll_endpoint: None,
         };
         assert!(with_token.validate().is_err());
         let without_token = DaemonState {
@@ -380,7 +362,27 @@ mod tests {
             version: "v".into(),
             generation: "gen".into(),
             auth_mode: AuthMode::LegacySingleToken,
+            protocol_version: None,
+            enroll_endpoint: None,
         };
         assert!(without_token.validate().is_err());
+    }
+
+    #[test]
+    fn enroll_endpoint_is_a_capability_only_path_with_no_token() {
+        let state = DaemonState::new_capabilities(1, 2, "v", "g")
+            .unwrap()
+            .with_enroll_endpoint("/d/enroll.sock");
+        state.validate().unwrap();
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["enroll_endpoint"], "/d/enroll.sock");
+        assert!(json.get("token").is_none());
+        let mut legacy = DaemonState::new_legacy(1, "t", 2, "v", "g").unwrap();
+        legacy.enroll_endpoint = Some("/d/enroll.sock".to_owned());
+        assert!(legacy.validate().is_err());
+        // Old files without the field still parse.
+        let old: DaemonState =
+            serde_json::from_str(r#"{"port":1,"token":"t","pid":2,"version":"v"}"#).unwrap();
+        assert_eq!(old.enroll_endpoint, None);
     }
 }

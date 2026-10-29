@@ -32,6 +32,9 @@ describe('A1 template matching ({param} = one safe segment)', () => {
 })
 
 describe('A1 findAllowedRoute', () => {
+  it('allows creating a confirmed rerun through the backend proxy', () => {
+    expect(isAllowedProxyRoute('POST', '/api/v1/runs')).toBe(true)
+  })
   it('ignores the query string and requires the exact method', () => {
     expect(isAllowedProxyRoute('GET', '/api/v1/approvals?status=pending')).toBe(true)
     expect(isAllowedProxyRoute('GET', '/api/v1/usage?module=agentear')).toBe(true)
