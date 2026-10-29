@@ -11,8 +11,6 @@
 //! generation, and stay inside the scope asked. Nothing here logs; a failure carries a fixed code, never the
 //! endpoint, C or the server's own text.
 
-// Consumed by the Knowledge tools (#1087 b).
-#![cfg_attr(not(test), allow(dead_code))]
 // `Failure` is the error type of `KnowledgeBackend`, which the helpers return.
 #![allow(clippy::result_large_err)]
 
@@ -116,6 +114,7 @@ impl DaemonKnowledgeBackend {
         Self::with_connect(registry, runs, Box::new(http_transport))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_connect(
         registry: Arc<KnowledgeHostRegistry>,
         runs: Arc<dyn RunSelector>,
