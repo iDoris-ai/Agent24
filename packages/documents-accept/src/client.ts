@@ -3,8 +3,7 @@
 // (acceptance README §1). Nothing here reads the data directory or an engine.
 
 import fs from 'node:fs'
-import os from 'node:os'
-import path from 'node:path'
+import { dataDir, joinLiteral } from '@agent24/data-dir'
 import { ContractError, conform } from './contract'
 
 export interface Connection {
@@ -13,8 +12,13 @@ export interface Connection {
   token: string
 }
 
-/** Reads the daemon's state file: `~/.agent24/daemon.json`, or the one named. */
-export function connect(daemonJson = path.join(os.homedir(), '.agent24', 'daemon.json')): Connection {
+/** `<data_dir>/daemon.json` (ADR-037). Resolved when `connect` is called. */
+export function defaultDaemonStateFile(): string {
+  return joinLiteral(dataDir(), 'daemon.json')
+}
+
+/** Reads the daemon's state file: `<data_dir>/daemon.json`, or the one named. */
+export function connect(daemonJson = defaultDaemonStateFile()): Connection {
   let state: { port?: unknown; token?: unknown } | null
   try {
     state = JSON.parse(fs.readFileSync(daemonJson, 'utf8')) as typeof state

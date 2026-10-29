@@ -21,6 +21,8 @@ tokio-util = "0.7"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
+zeroize = "1"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }

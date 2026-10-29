@@ -224,6 +224,7 @@ impl ExplorerSubagent {
                 response_format: None,
                 max_tokens: None,
                 disable_thinking: false,
+                idoris_headroom_confirmed: false,
                 temperature: None,
                 progress: None,
             };

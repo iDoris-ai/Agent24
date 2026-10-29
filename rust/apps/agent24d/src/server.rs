@@ -1,5 +1,6 @@
 //! HTTP server: router, auth middleware, ready line, graceful shutdown.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use agent24_protocol::state_file::AuthMode;
 use agent24_store::Store;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, MatchedPath, Path, State};
 use axum::http::{Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
@@ -40,12 +41,22 @@ pub struct AppState {
     /// router is built.
     pub auth_mode: AuthMode,
     pub capabilities: Option<crate::capabilities::CapabilityStore>,
+    pub first_party: Option<Arc<crate::capabilities::first_party::FirstPartyAuthority>>,
+    pub presence_provider: Option<Arc<dyn crate::capabilities::presence::PresenceProvider>>,
+    pub module_surfaces: Arc<Vec<crate::capabilities::delegation::ModuleSurface>>,
+    pub delegations: Arc<crate::capabilities::delegation::Delegations>,
     /// KB-HOST-01: the Knowledge bindings the product host activated, in
     /// memory only (see `crate::knowledge_host`).
     pub knowledge_host: Arc<crate::knowledge_host::KnowledgeHostRegistry>,
+    /// CORE-2 AgentEar S3: the desktop confirmation queue behind
+    /// `/api/v1/presence/challenges/*`.
+    pub presence_desktop: Option<Arc<crate::presence_desktop::DesktopPresence>>,
     /// D2 router: every model call goes through tier routing + health/cooldown,
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
+    pub idoris_host: Option<Arc<agent24d::idoris_host::IdorisHost>>,
+    pub idoris_unavailable: bool,
+    pub managed_idoris: Option<Arc<agent24d::managed_idoris::ManagedIdoris>>,
     pub tools: Arc<agent24_tools::ToolRegistry>,
     /// H2: the user's risk overrides. Held here as well as inside the registry
     /// because the two need the SAME object — the registry resolves against it
@@ -73,6 +84,11 @@ pub struct AppState {
     /// `agent24 os enable` needs a name to act on and a module that only appeared
     /// once it was already on could never be turned on.
     pub os_reports: Arc<Vec<crate::domain::MountReport>>,
+    /// Namespaces that were actually mounted (including disabled and degraded).
+    /// Capability auth uses this when axum did not record a `MatchedPath`
+    /// (`nest_service` / fallback nests). Refused mounts are absent. Empty
+    /// until `serve` fills it, same ordering as `os_reports`.
+    pub module_namespaces: Arc<BTreeSet<String>>,
     /// Where installed (out-of-process) packages live on disk (ME-3a). Computed
     /// once at startup (`agent24_os_packages::packages_root`, same call `serve`
     /// already made) and injected through [`AppDeps`] — unlike `os_reports`, this
@@ -175,6 +191,7 @@ pub struct Shutdown {
     /// decide, once and atomically, which came first (see
     /// [`Shutdown::commit_ready`]).
     phase: Arc<std::sync::atomic::AtomicU8>,
+    idoris_budget: Arc<std::sync::atomic::AtomicBool>,
 }
 
 const STARTING: u8 = 0;
@@ -192,6 +209,7 @@ impl Shutdown {
     pub fn with_params(token: CancellationToken, params: crate::lifecycle::Params) -> Self {
         Self {
             token,
+            idoris_budget: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             began: Arc::new(std::sync::OnceLock::new()),
             params,
             armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -233,7 +251,15 @@ impl Shutdown {
     #[must_use]
     pub fn deadlines(&self) -> crate::lifecycle::Deadlines {
         let began = *self.began.get_or_init(tokio::time::Instant::now);
-        self.params.deadlines(began)
+        let mut deadlines = self.params.deadlines(began);
+        if self.idoris_budget.load(std::sync::atomic::Ordering::SeqCst) {
+            deadlines.persist = deadlines
+                .persist
+                .max(began + agent24d::idoris_host::SHUTDOWN_BUDGET);
+            deadlines.watchdog =
+                deadlines.http.max(deadlines.persist) + crate::lifecycle::WATCHDOG_MARGIN;
+        }
+        deadlines
     }
 
     /// When the HTTP drain must be done.
@@ -387,6 +413,7 @@ impl agent24_scheduler::RunTrigger for KernelTrigger {
                     model_override,
                 } = action;
                 let create = agent24_protocol::RunCreate {
+                    idoris_headroom_confirmed: false,
                     session_id: session_id.clone(),
                     workspace_id: None,
                     prompt: prompt.clone(),
@@ -670,9 +697,17 @@ impl AppState {
             token: Arc::new(token),
             auth_mode: AuthMode::LegacySingleToken,
             capabilities: None,
+            first_party: None,
+            presence_provider: None,
+            module_surfaces: Arc::new(Vec::new()),
+            delegations: Arc::new(crate::capabilities::delegation::Delegations::default()),
             knowledge_host: Arc::new(crate::knowledge_host::KnowledgeHostRegistry::default()),
+            presence_desktop: None,
             mcp_servers: Arc::new(mcp_servers),
             router,
+            managed_idoris: None,
+            idoris_host: None,
+            idoris_unavailable: false,
             tools,
             broker,
             module_approval_broker,
@@ -687,6 +722,7 @@ impl AppState {
             // assignment is ordered ahead of router construction rather than left
             // to chance.
             os_reports: Arc::new(Vec::new()),
+            module_namespaces: Arc::new(BTreeSet::new()),
             packages_root,
             // Empty for the same reason and until the same moment as `os_reports`
             // above — see that field's comment.
@@ -716,7 +752,17 @@ impl AppState {
     fn enable_capability_auth(&mut self, store: crate::capabilities::CapabilityStore) {
         self.token = Arc::new(String::new());
         self.auth_mode = AuthMode::Capabilities;
+        self.first_party = Some(Arc::new(
+            crate::capabilities::first_party::FirstPartyAuthority::new(store.clone()),
+        ));
         self.capabilities = Some(store);
+    }
+
+    /// Share one queue between enrolment confirmation and ProductHost HTTP.
+    fn enable_desktop_presence(&mut self) {
+        let presence = Arc::new(crate::presence_desktop::DesktopPresence::new());
+        self.presence_provider = Some(presence.clone());
+        self.presence_desktop = Some(presence);
     }
 
     /// Re-read the override set after the user changed it.
@@ -734,11 +780,30 @@ impl AppState {
 
 pub use agent24_domain::http::{error_response, error_response_with_hint};
 
-async fn health() -> Json<Health> {
+async fn health(State(state): State<AppState>) -> Json<Health> {
+    let store = match state.store.latest_applied_migration().await {
+        Ok(version) => version,
+        Err(err) => {
+            tracing::warn!("health: run database migration watermark: {err}");
+            0
+        }
+    };
+    let memory = match &state.memory_kv {
+        Some(kv) => match kv.latest_applied_migration().await {
+            Ok(version) => version,
+            Err(err) => {
+                tracing::warn!("health: memory database migration watermark: {err}");
+                0
+            }
+        },
+        None => 0,
+    };
     Json(Health {
         status: "ok".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         backend: "rust".to_owned(),
+        protocol_version: agent24_protocol::PROTOCOL_VERSION,
+        migrations: agent24_protocol::HealthMigrations { store, memory },
     })
 }
 
@@ -789,32 +854,7 @@ fn valid_scope_id(value: &str) -> bool {
 }
 
 fn operation_name(operation: crate::capabilities::Operation) -> &'static str {
-    use crate::capabilities::Operation;
-    match operation {
-        Operation::ModelsAdmin => "models.admin",
-        Operation::WorkspaceCreate => "workspace.create",
-        Operation::WorkspaceRelease => "workspace.release",
-        Operation::HostLease => "host.lease",
-        Operation::ApprovalDecision => "approval.decision",
-        Operation::GrantManage => "grant.manage",
-        Operation::OverrideManage => "override.manage",
-        Operation::ScheduleManage => "schedule.manage",
-        Operation::ModuleAdmin => "module.admin",
-        Operation::CapabilityMint => "capability.mint",
-        Operation::CapabilityRevoke => "capability.revoke",
-        Operation::KnowledgeHost => "knowledge.host",
-        Operation::Shutdown => "shutdown",
-        Operation::ModelsRead => "models.read",
-        Operation::WorkspaceResolve => "workspace.resolve",
-        Operation::SessionCreate => "session.create",
-        Operation::SessionRead => "session.read",
-        Operation::SessionTranscript => "session.transcript",
-        Operation::RunCreate => "run.create",
-        Operation::RunRead => "run.read",
-        Operation::RunCancel => "run.cancel",
-        Operation::EventsRead => "events.read",
-        Operation::ApprovalStatusRead => "approval.status",
-    }
+    operation.action()
 }
 
 async fn mint_creative_capability(
@@ -962,93 +1002,330 @@ async fn revoke_capability(
 /// This note lives beside the auth middleware rather than beside the proxy
 /// because the person adding such a header is reading this file
 /// (SPEC-ME3-OUT-OF-PROCESS §2.1).
-async fn auth(State(state): State<AppState>, mut req: Request<Body>, next: Next) -> Response {
+async fn auth(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
     tracing::debug!(path = %req.uri().path(), "request received");
     if req.method() == Method::GET && req.uri().path() == "/api/v1/health" {
         return next.run(req).await;
     }
+    match state.auth_mode {
+        AuthMode::LegacySingleToken => legacy_auth(state, req, next).await,
+        AuthMode::Capabilities => capability_auth(state, req, next).await,
+    }
+}
+
+/// Single shared token. Does not consult the route catalog or assurance levels.
+async fn legacy_auth(state: AppState, req: Request<Body>, next: Next) -> Response {
     let bearer = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    match state.auth_mode {
-        AuthMode::LegacySingleToken => {
-            if bearer.is_some_and(|presented| {
-                constant_time_eq(presented.as_bytes(), state.token.as_bytes())
-            }) {
-                next.run(req).await
-            } else {
-                error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "unauthorized",
-                    "Missing or invalid bearer token",
-                )
+    if bearer
+        .is_some_and(|presented| constant_time_eq(presented.as_bytes(), state.token.as_bytes()))
+    {
+        next.run(req).await
+    } else {
+        error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Missing or invalid bearer token",
+        )
+    }
+}
+
+/// Method + matched template → operation. Levels are metadata: they are not a
+/// deny input (2b). Unknown paths are answered here so a fallback cannot run
+/// unauthenticated. HEAD uses the GET row inside [`crate::capabilities::decide`].
+/// 404 and 405 come after the bearer is live, so a missing, unknown, or revoked
+/// token cannot enumerate routes. Explicit public routes skip that check.
+async fn capability_auth(state: AppState, req: Request<Body>, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    let matched = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_owned());
+    match crate::capabilities::decide(&method, matched.as_deref(), &path, &state.module_namespaces)
+    {
+        crate::capabilities::RouteDecision::UnknownPath => {
+            if let Some(denied) = capability_token_rejected(&state, &req) {
+                return denied;
             }
+            error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route")
         }
-        AuthMode::Capabilities => {
-            let Some(store) = state.capabilities.as_ref() else {
-                return error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "host_authority_unavailable",
-                    "Capability authority unavailable",
-                );
-            };
-            let Some(bearer) = bearer else {
-                return error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "unauthorized",
-                    "Missing or invalid bearer token",
-                );
-            };
-            let operation = required_operation(req.method(), req.uri().path());
-            match store.validate_bearer(
-                bearer,
-                operation,
-                &crate::capabilities::Resource::global(),
-                crate::capabilities::unix_now(),
-            ) {
-                Ok(authorization) => {
-                    req.extensions_mut().insert(authorization);
-                    next.run(req).await
-                }
-                Err(
-                    crate::capabilities::CapabilityError::OperationDenied
-                    | crate::capabilities::CapabilityError::ResourceDenied
-                    | crate::capabilities::CapabilityError::HostRequired,
-                ) => error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed"),
-                Err(_) => error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "unauthorized",
-                    "Missing or invalid bearer token",
-                ),
+        crate::capabilities::RouteDecision::MethodNotAllowed => {
+            if let Some(denied) = capability_token_rejected(&state, &req) {
+                return denied;
             }
+            next.run(req).await
+        }
+        crate::capabilities::RouteDecision::Mapped(policy)
+            if policy.level == crate::capabilities::AssuranceLevel::Public =>
+        {
+            next.run(req).await
+        }
+        crate::capabilities::RouteDecision::Mapped(policy) => {
+            authorize(
+                &state,
+                req,
+                next,
+                policy.operation,
+                policy.template,
+                &method,
+            )
+            .await
+        }
+        crate::capabilities::RouteDecision::Module { operation, .. } => {
+            let template = matched.as_deref().unwrap_or("");
+            authorize(&state, req, next, operation, template, &method).await
         }
     }
 }
 
-/// Capability policy is deliberately closed. Until durable workspace/session
-/// ownership lands, Creative can use only the global model catalogue. Every
-/// other existing or future route maps to a host-only operation by default.
-pub(crate) fn required_operation(method: &Method, path: &str) -> crate::capabilities::Operation {
-    use crate::capabilities::Operation;
-    if method == Method::GET && path == "/api/v1/models" {
-        Operation::ModelsRead
-    } else if method == Method::POST && path == "/api/v1/capabilities/creative" {
-        Operation::CapabilityMint
-    } else if method == Method::POST
-        && path.starts_with("/api/v1/capabilities/")
-        && path.ends_with("/revoke")
-    {
-        Operation::CapabilityRevoke
-    } else if path.starts_with("/api/v1/host/knowledge/") {
-        // Host-only, and never in the Creative allow-list; the handlers also
-        // refuse legacy mode and any non-host audience (crate::knowledge_host).
-        Operation::KnowledgeHost
-    } else {
-        Operation::ModelsAdmin
+/// Missing, unparseable, unknown, revoked, expired, or stale bearers are 401.
+/// A live token returns `None` so the caller can answer 404 or 405.
+fn capability_token_rejected(state: &AppState, req: &Request<Body>) -> Option<Response> {
+    let Some(store) = state.capabilities.as_ref() else {
+        return Some(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "host_authority_unavailable",
+            "Capability authority unavailable",
+        ));
+    };
+    let Some(bearer) = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return Some(error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Missing or invalid bearer token",
+        ));
+    };
+    match store.require_live_bearer(bearer, crate::capabilities::unix_now()) {
+        Ok(()) => None,
+        Err(_) => Some(error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Missing or invalid bearer token",
+        )),
     }
 }
+
+async fn authorize(
+    state: &AppState,
+    mut req: Request<Body>,
+    next: Next,
+    operation: crate::capabilities::Operation,
+    template: &str,
+    method: &Method,
+) -> Response {
+    let Some(store) = state.capabilities.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "host_authority_unavailable",
+            "Capability authority unavailable",
+        );
+    };
+    let Some(bearer) = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Missing or invalid bearer token",
+        );
+    };
+    match store.validate_bearer(
+        bearer,
+        operation,
+        &crate::capabilities::Resource::global(),
+        crate::capabilities::unix_now(),
+    ) {
+        Ok(authorization) => {
+            // R5: a Creative token that validates still cannot call a route
+            // this mapping newly exposed. Resource scope is not this gate.
+            if authorization.claims.audience == crate::capabilities::Audience::CreativeRuntime
+                && !crate::capabilities::creative_route_permitted(method, template)
+            {
+                return error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed");
+            }
+            // §10 R1 guards daily first-party tokens. ProductHost is the
+            // parent's full authority and must keep reaching module routes
+            // (desktop documents/knowledge) without a delegation record.
+            if authorization.claims.audience == crate::capabilities::Audience::FirstPartyShell
+                && operation == crate::capabilities::Operation::ModuleRoute
+                && method != Method::GET
+                && method != Method::HEAD
+            {
+                let path = req.uri().path();
+                let delegated = state
+                    .module_surfaces
+                    .iter()
+                    .find(|surface| {
+                        path.strip_prefix(&surface.namespace)
+                            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+                    })
+                    .is_some_and(|surface| state.delegations.permits(surface));
+                if !delegated {
+                    return error_response(
+                        StatusCode::FORBIDDEN,
+                        "module_delegation_required",
+                        "Module surface requires delegation",
+                    );
+                }
+            }
+            if authorization.claims.audience == crate::capabilities::Audience::FirstPartyShell {
+                let elevated = operation.assurance_level()
+                    == Some(crate::capabilities::AssuranceLevel::Elevated);
+                let grant = req
+                    .headers()
+                    .get("X-Agent24-Elevation")
+                    .map(|v| v.to_str().unwrap_or("").to_owned());
+                if elevated && grant.is_none() {
+                    if method == Method::POST && template == "/api/v1/attached" {
+                        let bytes = match axum::body::to_bytes(
+                            req.into_body(),
+                            agent24_domain::http::MAX_BODY_BYTES,
+                        )
+                        .await
+                        {
+                            Ok(bytes) => bytes,
+                            Err(_) => {
+                                return error_response(
+                                    StatusCode::PAYLOAD_TOO_LARGE,
+                                    "payload_too_large",
+                                    "Request body exceeds limit",
+                                );
+                            }
+                        };
+                        if let Some(authority) = &state.first_party
+                            && let Some(path) = crate::attached::config_path()
+                            && let Ok(registrations) = crate::attached::list(&path)
+                        {
+                            authority.remember_attached_request(
+                                &authorization.claims.capability_id,
+                                &bytes,
+                                &registrations,
+                            );
+                        }
+                    }
+                    return (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({"error":{"code":"presence_required","message":"Presence confirmation required","operation":format!("{operation:?}")}}))).into_response();
+                }
+                if let Some(grant) = grant {
+                    let (parts, body) = req.into_parts();
+                    let bytes = match axum::body::to_bytes(
+                        body,
+                        agent24_domain::http::MAX_BODY_BYTES,
+                    )
+                    .await
+                    {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            return error_response(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "payload_too_large",
+                                "Request body exceeds limit",
+                            );
+                        }
+                    };
+                    let target = crate::capabilities::first_party::Target {
+                        operation,
+                        method: method.to_string(),
+                        template: template.to_owned(),
+                        path: parts.uri.path().to_owned(),
+                        body_sha256: crate::capabilities::first_party::body_digest(&bytes),
+                    };
+                    // Revalidate after buffering, immediately before the atomic
+                    // consume. A process may exit while supplying a slow body.
+                    let bearer = parts
+                        .headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                        .unwrap_or("");
+                    if store
+                        .validate_bearer(
+                            bearer,
+                            operation,
+                            &crate::capabilities::Resource::global(),
+                            crate::capabilities::unix_now(),
+                        )
+                        .is_err()
+                        || !state.first_party.as_ref().is_some_and(|authority| {
+                            authority.consume(
+                                &grant,
+                                &authorization.claims.capability_id,
+                                &target,
+                                crate::capabilities::unix_now(),
+                            )
+                        })
+                    {
+                        return error_response(
+                            StatusCode::FORBIDDEN,
+                            "elevation_invalid",
+                            "Elevation grant is invalid",
+                        );
+                    }
+                    req = Request::from_parts(parts, Body::from(bytes));
+                }
+            }
+            req.extensions_mut().insert(authorization);
+            next.run(req).await
+        }
+        Err(
+            crate::capabilities::CapabilityError::OperationDenied
+            | crate::capabilities::CapabilityError::ResourceDenied
+            | crate::capabilities::CapabilityError::HostRequired,
+        ) => error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed"),
+        Err(_) => error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Missing or invalid bearer token",
+        ),
+    }
+}
+
+async fn establish_module_delegation(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    if state.auth_mode != AuthMode::Capabilities {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Delegation requires capabilities mode",
+        );
+    }
+    let Some(surface) = state.module_surfaces.iter().find(|s| s.name == name) else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "No registered module surface",
+        );
+    };
+    match state.delegations.establish(surface) {
+        Ok(()) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"delegated":true,"name":name})),
+        )
+            .into_response(),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "Cannot persist delegation",
+        ),
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/first_party_http.rs"]
+mod first_party_http_tests;
 
 /// Constant-time comparison — a timing oracle on a localhost token is a small
 /// risk, but the cost of doing it right is one function.
@@ -1076,8 +1353,35 @@ pub fn build_router(state: AppState) -> Router {
 /// hole in the daemon's only access control. `module_routes_are_behind_kernel_auth`
 /// is the regression test; do not reorder these two lines.
 pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
+    if let Some(authority) = &state.first_party {
+        authority.set_provider(state.presence_provider.clone());
+        authority.set_module_surfaces(state.module_surfaces.clone());
+    }
     let kernel = Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/idoris/status", get(crate::idoris_routes::status))
+        .route(
+            "/api/v1/idoris/install",
+            post(crate::idoris_routes::install),
+        )
+        .route(
+            "/api/v1/idoris/connect",
+            post(crate::idoris_routes::connect),
+        )
+        .route(
+            "/api/v1/idoris/omlx/candidates",
+            get(crate::idoris_routes::candidates),
+        )
+        .route("/api/v1/idoris/start", post(crate::idoris_routes::start))
+        .route("/api/v1/idoris/stop", post(crate::idoris_routes::stop))
+        .route(
+            "/api/v1/idoris/operations/{id}",
+            get(crate::idoris_routes::operation),
+        )
+        .route(
+            "/api/v1/idoris/operations/{id}/cancel",
+            post(crate::idoris_routes::cancel),
+        )
         .route("/api/v1/chat", post(crate::routes::post_chat))
         .route("/api/v1/models", get(crate::routes::get_models))
         .route(
@@ -1218,6 +1522,10 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         // Domain-OS registry (ME-2b). The daemon owns `os.json`; see `os_routes`.
         .route("/api/v1/os", get(crate::os_routes::list_os))
         .route(
+            "/api/v1/os/{name}/delegation",
+            post(establish_module_delegation),
+        )
+        .route(
             "/api/v1/os/{name}",
             axum::routing::patch(crate::os_routes::patch_os),
         )
@@ -1257,11 +1565,25 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             "/api/v1/peer/runs/{id}",
             get(crate::peer_runs::get_peer_run),
         )
-        .fallback(fallback)
-        .with_state(state.clone());
+        .fallback(fallback);
+
+    let kernel = if state.auth_mode == AuthMode::Capabilities {
+        kernel
+            .route(
+                "/api/v1/presence/challenges/next",
+                get(crate::presence_desktop::get_next),
+            )
+            .route(
+                "/api/v1/presence/challenges/{id}",
+                post(crate::presence_desktop::post_decision),
+            )
+    } else {
+        kernel
+    };
 
     // Modules first, auth last — see the doc comment above.
     kernel
+        .with_state(state.clone())
         .merge(modules)
         .layer(middleware::from_fn_with_state(state, auth))
 }
@@ -1463,17 +1785,23 @@ impl std::fmt::Display for AlreadyRunning {
 
 impl std::error::Error for AlreadyRunning {}
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "startup options include both enrollment and injected iDoris dependencies"
+)]
 pub async fn serve(
     port: u16,
     ephemeral: bool,
     auth_mode: AuthMode,
     host_bootstrap_stdio: bool,
+    enroll_endpoint: bool,
     ready_omit_token: bool,
     cancel: CancellationToken,
+    idoris_dependencies: Option<agent24d::managed_idoris::ManagedDependencies>,
 ) -> Result<(), std::io::Error> {
     let startup = std::time::Instant::now();
     tracing::debug!(ephemeral, "startup: serve");
-    validate_auth_startup(auth_mode, host_bootstrap_stdio)?;
+    let mode = validate_auth_startup(auth_mode, host_bootstrap_stdio, enroll_endpoint, ephemeral)?;
     let module_grants = crate::consent_routes::grant_settings(
         std::env::var("A24_MODULE_TOOL_GRANTS").ok().as_deref(),
         std::env::var("A24_MODULE_GRANT_MAX_DAYS").ok().as_deref(),
@@ -1481,24 +1809,13 @@ pub async fn serve(
         crate::os_config::config_path(),
     )
     .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why))?;
-    let (mut host_ready, parent_liveness) = match (auth_mode, host_bootstrap_stdio) {
-        (AuthMode::Capabilities, true) => {
-            let (writer, liveness) = crate::host_bootstrap::open_stdio()?;
-            (Some(writer), Some(liveness))
-        }
-        (AuthMode::Capabilities, false) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "capability mode requires trusted host bootstrap stdio",
-            ));
-        }
-        (AuthMode::LegacySingleToken, false) => (None, None),
-        (AuthMode::LegacySingleToken, true) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "host bootstrap stdio is valid only in capability mode",
-            ));
-        }
+    // Only the host-child mode owns the trusted pipes (and so the parent-EOF
+    // lease). Service mode has neither: it is not a child of anything.
+    let (mut host_ready, parent_liveness) = if mode == StartupMode::HostChild {
+        let (writer, liveness) = crate::host_bootstrap::open_stdio()?;
+        (Some(writer), Some(liveness))
+    } else {
+        (None, None)
     };
     // The shutdown controller, and the signals that request it, before
     // anything else: a SIGTERM during startup — which can take seconds (the
@@ -1510,6 +1827,13 @@ pub async fn serve(
     let (params, config_warnings) = crate::lifecycle::Params::from_process_env();
     let mut config_warnings = config_warnings;
     let shutdown = Shutdown::with_params(cancel.clone(), params);
+    let idoris_root =
+        agent24_idoris::install::default_install_root().map_err(std::io::Error::other)?;
+    if !ephemeral {
+        shutdown
+            .idoris_budget
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     if let Some(parent_liveness) = parent_liveness {
         let parent_shutdown = shutdown.clone();
         tokio::spawn(async move {
@@ -1635,15 +1959,22 @@ pub async fn serve(
         AuthMode::LegacySingleToken => (generate_token(), None, None),
         AuthMode::Capabilities => {
             let store = crate::capabilities::CapabilityStore::new(daemon_generation.clone());
-            let minted = store
-                .mint_product_host(
-                    generate_token(),
-                    Duration::from_secs(u64::MAX),
-                    crate::capabilities::unix_now(),
-                )
-                .map_err(std::io::Error::other)?;
-            let (bearer, _, _) = minted.into_bearer_parts();
-            (String::new(), Some(store), Some(bearer))
+            // CORE-2 R5: a service has no trusted parent pipe to hand a host
+            // credential to, so it mints none (and nothing secret is ever
+            // published for it).
+            let bearer = if !mints_product_host(mode) {
+                None
+            } else {
+                let minted = store
+                    .mint_product_host(
+                        generate_token(),
+                        Duration::from_secs(u64::MAX),
+                        crate::capabilities::unix_now(),
+                    )
+                    .map_err(std::io::Error::other)?;
+                Some(minted.into_bearer_parts().0)
+            };
+            (String::new(), Some(store), bearer)
         }
     };
     // Store: file-backed under ~/.agent24 (ephemeral instances get :memory:)
@@ -1669,6 +2000,59 @@ pub async fn serve(
         .join("workspace");
     std::fs::create_dir_all(&workspace)?;
     let router = Arc::new(ModelRouter::from_env());
+    let managed_idoris = if ephemeral {
+        None
+    } else {
+        let path = agent24_protocol::state_file::state_dir()
+            .ok_or_else(|| std::io::Error::other("HOME not set"))?
+            .join("idoris-connection.json");
+        let managed = Arc::new(agent24d::managed_idoris::ManagedIdoris::new(
+            router.clone(),
+            path,
+        )?);
+        if managed.is_configured()?
+            && let Some(dependencies) = idoris_dependencies.as_ref()
+        {
+            managed
+                .restore(dependencies, &cancel)
+                .await
+                .map_err(std::io::Error::other)?;
+        }
+        Some(managed)
+    };
+    let mut idoris_unavailable = false;
+    let mut idoris_host = if let Some(managed) = &managed_idoris {
+        match agent24d::idoris_host::IdorisHost::system(
+            idoris_root,
+            managed.clone(),
+            router.clone(),
+        ) {
+            Ok(host) => Some(host),
+            Err(error) => {
+                tracing::warn!(%error, "iDoris lifecycle unavailable; daemon startup continues");
+                idoris_unavailable = true;
+                router.block_idoris("iDoris lifecycle unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Registered before restore can spawn a process, including startup cancellation.
+    let idoris_stopping = idoris_host
+        .as_ref()
+        .map(|host| host.stop_on_shutdown(cancel.clone()));
+    if let Some(host) = &idoris_host
+        && let Err(code) = host.restore().await
+    {
+        tracing::warn!(
+            ?code,
+            "iDoris restore unavailable; daemon startup continues"
+        );
+        idoris_unavailable = true;
+        router.block_idoris("iDoris restore unavailable");
+        idoris_host = None;
+    }
     let guardian = build_guardian(&router);
     // D1 session memory: a KV file next to the main store (ephemeral daemons get
     // an in-memory one). A failure here degrades to no memory rather than
@@ -1893,8 +2277,23 @@ pub async fn serve(
         mcp_servers,
         packages_root: Arc::clone(&packages_root),
     });
+    state.managed_idoris = managed_idoris;
+    state.idoris_host = idoris_host;
+    state.idoris_unavailable = idoris_unavailable;
     if let Some(capability_store) = capability_store {
         state.enable_capability_auth(capability_store);
+        if mode == StartupMode::HostChild {
+            state.enable_desktop_presence();
+        }
+        state.delegations = Arc::new(crate::capabilities::delegation::Delegations::open(
+            &state_dir,
+        )?);
+    }
+    // Last, so it wins over the desktop provider that HostChild mode installs
+    // just above (the e2e daemon runs as a host child). Debug test builds only.
+    #[cfg(feature = "test-enrollment")]
+    if crate::enroll_test_support::enabled() {
+        state.presence_provider = Some(Arc::new(crate::enroll_test_support::TestPresence));
     }
 
     // M7 durable expiry recovery runs before durable-resume: a stale approval
@@ -2187,10 +2586,19 @@ pub async fn serve(
                 None => None,
             }
         };
-        let (supervisors_result, comm_result) = tokio::join!(
+        let (supervisors_result, comm_result, idoris_result) = tokio::join!(
             tokio::time::timeout_at(deadlines.modules, stop_supervisors(closed, params.drain)),
             tokio::time::timeout_at(deadlines.modules, comm_shutdown),
+            tokio::time::timeout_at(deadlines.persist - crate::lifecycle::PERSIST, async move {
+                match idoris_stopping {
+                    Some(task) => task.await,
+                    None => Ok(Ok(())),
+                }
+            }),
         );
+        if !matches!(idoris_result, Ok(Ok(Ok(())))) {
+            tracing::warn!("managed iDoris shutdown failed or exceeded the host budget");
+        }
         if supervisors_result.is_err() {
             tracing::warn!(
                 "out-of-process modules were still stopping at the deadline; their supervisors \
@@ -2506,6 +2914,21 @@ pub async fn serve(
     // Hand the verdicts to the state BEFORE the router clones it, so `/api/v1/os`
     // can report what the mounter actually decided rather than re-deriving it.
     state.os_reports = Arc::new(reports);
+    state.module_namespaces = Arc::new(
+        state
+            .os_reports
+            .iter()
+            .filter(|report| {
+                matches!(
+                    report.outcome,
+                    crate::domain::MountOutcome::Mounted
+                        | crate::domain::MountOutcome::Disabled
+                        | crate::domain::MountOutcome::Degraded(_)
+                )
+            })
+            .map(|report| report.namespace.clone())
+            .collect(),
+    );
     // T8/ME-3g: same ordering reason as `os_reports` just above — `catalogue`
     // is still in scope (only borrowed by `mount_all`, never moved), so this is
     // a cheap O(n) derivation, not a second discovery pass.
@@ -2599,6 +3022,38 @@ pub async fn serve(
     // there was nothing to stop.
     let comm_router =
         crate::comm_routes::build(&state_dir, params.stop_grace, &comm_daemon_slot).await;
+    if state.auth_mode == AuthMode::Capabilities {
+        // Package modules register an ANY-method proxy for their namespace.
+        // Bind that registered surface and the exact manifest, not enabled flags.
+        // In-process modules have no route inventory API and remain undelegated.
+        state.module_surfaces = Arc::new(
+            catalogue
+                .iter()
+                .filter_map(|entry| {
+                    let crate::domain::Build::Package(package) = &entry.build else {
+                        return None;
+                    };
+                    let report = state.os_reports.iter().find(|r| {
+                        r.name == package.manifest.name()
+                            && matches!(r.outcome, crate::domain::MountOutcome::Mounted)
+                    })?;
+                    Some(crate::capabilities::delegation::ModuleSurface {
+                        name: report.name.clone(),
+                        version: report.version.clone(),
+                        namespace: report.namespace.clone(),
+                        routes_sha256: crate::capabilities::first_party::body_digest(
+                            format!(
+                                "ANY {}\nANY {}/{{*rest}}\n{}",
+                                report.namespace, report.namespace, package.digest
+                            )
+                            .as_bytes(),
+                        ),
+                    })
+                })
+                .collect(),
+        );
+    }
+    let enroll_authority = state.first_party.clone();
     let router = build_router_with_modules(state, module_routes.merge(comm_router));
 
     // A shutdown that began during startup ends it here, before anything says
@@ -2623,7 +3078,27 @@ pub async fn serve(
     // Discovery state file BEFORE the ready line: a CLI that has seen the
     // ready line may immediately rely on attached-mode discovery.
     let daemon_pid = std::process::id();
+    // CORE-2e (D5): lock -> migration -> bind the enrolment endpoint -> only
+    // then publish daemon.json and the ready line. A bind or (service mode)
+    // publish failure ends this start; nothing half-ready is advertised.
+    let mut enroll = None;
+    let mut publish_error = None;
     if !ephemeral {
+        let bound = if mode == StartupMode::Legacy {
+            Ok(None)
+        } else {
+            crate::enroll_endpoint::bind(&state_dir).map(Some)
+        };
+        match bound {
+            Ok(endpoint) => enroll = endpoint,
+            Err(err) => {
+                publish_error = Some(std::io::Error::other(format!(
+                    "cannot bind the enrolment endpoint: {err}"
+                )))
+            }
+        }
+    }
+    if publish_error.is_none() && !ephemeral {
         let discovery = match auth_mode {
             AuthMode::LegacySingleToken => agent24_protocol::state_file::DaemonState::new_legacy(
                 local.port(),
@@ -2640,9 +3115,47 @@ pub async fn serve(
             ),
         }
         .map_err(std::io::Error::other)?;
+        let discovery = match &enroll {
+            Some(endpoint) => {
+                discovery.with_enroll_endpoint(endpoint.path().to_string_lossy().into_owned())
+            }
+            None => discovery,
+        };
         if let Err(err) = agent24_protocol::state_file::write(&discovery) {
-            tracing::warn!("could not write daemon state file: {err}");
+            if mode == StartupMode::Service {
+                // Revises facts §8.3 for the service path only: a service
+                // nobody can discover is a failed start.
+                publish_error = Some(err);
+            } else {
+                tracing::warn!("could not write daemon state file: {err}");
+            }
         }
+    }
+    if let Some(err) = publish_error {
+        tracing::error!("daemon start failed before ready: {err}");
+        shutdown.request();
+        tracing::info!("stopping modules after a failed start");
+        let _ = stopping.await;
+        crate::usage_recorder::stop_usage_writer(
+            usage_recorder,
+            usage_writer,
+            shutdown.deadlines().modules,
+        )
+        .await;
+        if !ephemeral {
+            agent24_protocol::state_file::remove_if_owner(daemon_pid);
+        }
+        return Err(err);
+    }
+    if let Some(endpoint) = enroll.as_mut()
+        && let Some(authority) = enroll_authority
+    {
+        endpoint.serve(
+            cancel.clone(),
+            daemon_generation.clone(),
+            local.port(),
+            authority,
+        );
     }
 
     // The state file is written; now readiness and a shutdown request race
@@ -2667,6 +3180,14 @@ pub async fn serve(
         AuthMode::LegacySingleToken => {
             legacy_ready_line(local.port(), &token, ready_omit_token, &daemon_generation)
         }
+        AuthMode::Capabilities if mode == StartupMode::Service => serde_json::json!({
+            "type": "ready",
+            "port": local.port(),
+            "auth_mode": "capabilities",
+            "generation": daemon_generation,
+            "version": env!("CARGO_PKG_VERSION"),
+            "enroll_endpoint": enroll.as_ref().map(|e| e.path().to_string_lossy().into_owned()),
+        }),
         AuthMode::Capabilities => {
             let product_host_token = product_host_token.ok_or_else(|| {
                 std::io::Error::new(
@@ -2688,6 +3209,7 @@ pub async fn serve(
     };
     match auth_mode {
         AuthMode::LegacySingleToken => println!("{ready}"),
+        AuthMode::Capabilities if mode == StartupMode::Service => println!("{ready}"),
         AuthMode::Capabilities => {
             let host_ready = host_ready.as_mut().ok_or_else(|| {
                 std::io::Error::new(
@@ -2751,23 +3273,60 @@ pub async fn serve(
     result
 }
 
-/// Capability mode requires the trusted host-bootstrap transport; the route
-/// middleware maps every request before accepting its bearer.
+/// How this process is started (CORE-2 D8). The single source of the
+/// bootstrap / enroll matrix; `serve` acts on the returned mode only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupMode {
+    /// Single-token daemon, unchanged.
+    Legacy,
+    /// Capability daemon owned by a trusted parent over stdio pipes: the
+    /// parent-EOF lease applies and the enrolment endpoint opens by itself.
+    HostChild,
+    /// Capability daemon run by a service manager: no pipes, no parent lease,
+    /// no host credential; the enrolment endpoint is the only way in.
+    Service,
+}
+
+/// Only a host-child daemon has a trusted pipe to hand a `ProductHost`
+/// credential to; a service never mints one (CORE-2 R5, T17).
+fn mints_product_host(mode: StartupMode) -> bool {
+    mode == StartupMode::HostChild
+}
+
+/// Validate the auth / bootstrap / enroll combination. Mutually exclusive by
+/// construction, not by argument order; bootstrap together with enroll is
+/// refused as ambiguous (§9 Q5).
 fn validate_auth_startup(
     auth_mode: AuthMode,
     host_bootstrap_stdio: bool,
-) -> Result<(), std::io::Error> {
-    match (auth_mode, host_bootstrap_stdio) {
-        (AuthMode::Capabilities, true) => Ok(()),
-        (AuthMode::Capabilities, false) => Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "capability mode requires trusted host bootstrap stdio",
-        )),
-        (AuthMode::LegacySingleToken, true) => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
+    enroll_endpoint: bool,
+    ephemeral: bool,
+) -> Result<StartupMode, std::io::Error> {
+    use std::io::{Error, ErrorKind};
+    match (auth_mode, host_bootstrap_stdio, enroll_endpoint) {
+        (AuthMode::LegacySingleToken, false, false) => Ok(StartupMode::Legacy),
+        (AuthMode::LegacySingleToken, true, _) => Err(Error::new(
+            ErrorKind::InvalidInput,
             "host bootstrap stdio is valid only in capability mode",
         )),
-        (AuthMode::LegacySingleToken, false) => Ok(()),
+        (AuthMode::LegacySingleToken, false, true) => Err(Error::new(
+            ErrorKind::InvalidInput,
+            "--enroll-endpoint is valid only in capability mode",
+        )),
+        (AuthMode::Capabilities, true, false) => Ok(StartupMode::HostChild),
+        (AuthMode::Capabilities, false, false) => Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "capability mode requires trusted host bootstrap stdio or --enroll-endpoint",
+        )),
+        (AuthMode::Capabilities, true, true) => Err(Error::new(
+            ErrorKind::InvalidInput,
+            "host bootstrap stdio and --enroll-endpoint are mutually exclusive",
+        )),
+        (AuthMode::Capabilities, false, true) if ephemeral => Err(Error::new(
+            ErrorKind::InvalidInput,
+            "--enroll-endpoint needs a discoverable daemon and cannot be ephemeral",
+        )),
+        (AuthMode::Capabilities, false, true) => Ok(StartupMode::Service),
     }
 }
 
@@ -3419,6 +3978,10 @@ pub(crate) mod tests {
         // KB-HOST-01: the desktop host's private interface (UI-BRIDGE U1.5), not a client contract.
         "/host/knowledge/bindings/{binding_id}",
         "/host/knowledge/bindings/{binding_id}/credential",
+        // CORE-2 AgentEar S3: the desktop main process's confirmation channel, ProductHost
+        // only (slice §3.4) — private to the desktop, not a client contract.
+        "/presence/challenges/next",
+        "/presence/challenges/{id}",
     ];
 
     // Module-owned contract paths appear in OpenAPI but are not literal routes
@@ -3760,6 +4323,18 @@ pub(crate) mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    #[test]
+    fn idoris_shutdown_budget_includes_drain_and_frozen_term_grace() {
+        let shutdown = Shutdown::new(CancellationToken::new());
+        shutdown
+            .idoris_budget
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let deadlines = shutdown.deadlines();
+        assert!(deadlines.persist - deadlines.began >= std::time::Duration::from_secs(50));
+        assert!(deadlines.watchdog > deadlines.persist);
+        assert!(deadlines.modules < deadlines.persist);
+    }
+
     pub(crate) async fn capability_state() -> (AppState, String, String) {
         let mut state = state().await;
         let now = crate::capabilities::unix_now();
@@ -3791,6 +4366,7 @@ pub(crate) mod tests {
             .unwrap();
         let (creative_bearer, _, _) = creative.into_bearer_parts();
         state.enable_capability_auth(store);
+        state.enable_desktop_presence();
         (state, host_bearer, creative_bearer)
     }
 
@@ -3810,6 +4386,51 @@ pub(crate) mod tests {
         assert_eq!(json["status"], "ok");
         assert_eq!(json["backend"], "rust");
         assert!(json["version"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn health_reports_protocol_version_and_applied_migrations() {
+        let mut app = state().await;
+        let memory = agent24_memory::KvStore::open_memory().await.unwrap();
+        let store_applied: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(agent24_store::test_hooks::pool(&app.store))
+                .await
+                .unwrap();
+        let memory_applied: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(agent24_memory::test_hooks::pool(&memory))
+                .await
+                .unwrap();
+        let store_applied = store_applied.unwrap();
+        let memory_applied = memory_applied.unwrap();
+        assert!(store_applied > 0, "run database has no applied migration");
+        assert!(
+            memory_applied > 0,
+            "memory database has no applied migration"
+        );
+        app.memory_kv = Some(memory);
+
+        let res = build_router(app)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = body_json(res).await;
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["backend"], "rust");
+        assert!(json["version"].as_str().is_some());
+        assert_eq!(
+            json["protocol_version"].as_u64(),
+            Some(u64::from(agent24_protocol::PROTOCOL_VERSION))
+        );
+        assert_eq!(json["migrations"]["store"].as_i64(), Some(store_applied));
+        assert_eq!(json["migrations"]["memory"].as_i64(), Some(memory_applied));
     }
 
     #[tokio::test]
@@ -4815,10 +5436,37 @@ pub(crate) mod tests {
 
     #[test]
     fn capability_startup_requires_the_trusted_host_bootstrap_transport() {
-        assert!(validate_auth_startup(AuthMode::Capabilities, true).is_ok());
-        let err = validate_auth_startup(AuthMode::Capabilities, false)
+        assert_eq!(
+            validate_auth_startup(AuthMode::Capabilities, true, false, false).unwrap(),
+            StartupMode::HostChild
+        );
+        let err = validate_auth_startup(AuthMode::Capabilities, false, false, false)
             .expect_err("capability startup without private host pipes");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn only_the_host_child_mints_a_product_host() {
+        assert!(mints_product_host(StartupMode::HostChild));
+        assert!(!mints_product_host(StartupMode::Service));
+        assert!(!mints_product_host(StartupMode::Legacy));
+    }
+
+    /// CORE-2e T4: every row of the D8 matrix (+ Q5, + ephemeral service).
+    #[test]
+    fn startup_matrix_matches_d8() {
+        use AuthMode::{Capabilities as C, LegacySingleToken as L};
+        let m = |a, b, e, eph| validate_auth_startup(a, b, e, eph).ok();
+        assert_eq!(m(L, false, false, false), Some(StartupMode::Legacy));
+        assert_eq!(m(L, true, false, false), None);
+        assert_eq!(m(L, true, true, false), None);
+        assert_eq!(m(L, false, true, false), None);
+        assert_eq!(m(C, true, false, false), Some(StartupMode::HostChild));
+        assert_eq!(m(C, true, false, true), Some(StartupMode::HostChild));
+        assert_eq!(m(C, false, true, false), Some(StartupMode::Service));
+        assert_eq!(m(C, false, false, false), None);
+        assert_eq!(m(C, true, true, false), None);
+        assert_eq!(m(C, false, true, true), None);
     }
 
     #[tokio::test]
@@ -4831,7 +5479,7 @@ pub(crate) mod tests {
         let res = build_router(capability_state)
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/not-a-route")
+                    .uri("/api/v1/models")
                     .header(header::AUTHORIZATION, "Bearer ")
                     .body(Body::empty())
                     .unwrap(),
@@ -4884,7 +5532,8 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(models.status(), StatusCode::OK);
 
-        let default_route = router
+        let unknown = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/not-a-route")
@@ -4894,8 +5543,21 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(default_route.status(), StatusCode::FORBIDDEN);
-        assert_eq!(body_json(default_route).await["error"]["code"], "forbidden");
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(unknown).await["error"]["code"], "not_found");
+
+        let closed = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/usage")
+                    .header(header::AUTHORIZATION, format!("Bearer {creative_bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(closed.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(closed).await["error"]["code"], "forbidden");
     }
 
     #[tokio::test]
@@ -5305,7 +5967,6 @@ pub(crate) mod tests {
             ("GET", "/api/v1/approvals"),
             ("GET", "/api/v1/tools"),
             ("POST", "/api/v1/shutdown"),
-            ("GET", "/api/v1/future-unregistered-route"),
         ] {
             let response = router
                 .clone()
@@ -5321,13 +5982,1209 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
         }
+
+        let unknown = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/future-unregistered-route")
+                    .header("Authorization", format!("Bearer {creative}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn attached_probe() -> StatusCode {
+        StatusCode::NO_CONTENT
+    }
+
+    fn concrete_path(template: &str) -> String {
+        let mut path = String::new();
+        let mut rest = template;
+        while let Some(start) = rest.find('{') {
+            path.push_str(&rest[..start]);
+            let end = rest[start..].find('}').expect("template brace");
+            path.push('x');
+            rest = &rest[start + end + 1..];
+        }
+        path.push_str(rest);
+        path
+    }
+
+    #[tokio::test]
+    async fn creative_is_refused_on_every_mapped_route_except_models() {
+        let (state, _host, creative) = capability_state().await;
+        let router = router_with_comm(state);
+        for policy in crate::capabilities::policies() {
+            let path = concrete_path(policy.template);
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(policy.method)
+                        .uri(&path)
+                        .header(header::AUTHORIZATION, format!("Bearer {creative}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let expect = if policy.template == "/api/v1/models"
+                || policy.level == crate::capabilities::AssuranceLevel::Public
+            {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            assert_eq!(response.status(), expect, "{} {path}", policy.method);
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_head_follows_get_and_does_not_skip_auth() {
+        let (state, _host, creative) = capability_state().await;
+        let router = build_router(state);
+
+        let health = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let models = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/api/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(models.status(), StatusCode::UNAUTHORIZED);
+
+        let creative_models = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/api/v1/models")
+                    .header(header::AUTHORIZATION, format!("Bearer {creative}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(creative_models.status(), StatusCode::FORBIDDEN);
+
+        let usage = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/api/v1/usage")
+                    .header(header::AUTHORIZATION, format!("Bearer {creative}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(usage.status(), StatusCode::FORBIDDEN);
+
+        let post_only = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/api/v1/chat")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_only.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn capability_missing_invalid_and_revoked_tokens_cannot_enumerate_routes() {
+        let mut app = state().await;
+        let now = crate::capabilities::unix_now();
+        let store = crate::capabilities::CapabilityStore::new("daemon-test");
+        let live = store
+            .mint_product_host("live-host", Duration::from_secs(3_600), now)
+            .unwrap();
+        let (live_bearer, _, _) = live.into_bearer_parts();
+        let revoked = store
+            .mint_product_host("revoked-host", Duration::from_secs(3_600), now)
+            .unwrap();
+        let (revoked_bearer, revoked_id, _) = revoked.into_bearer_parts();
+        assert!(store.revoke_by_id(&revoked_id));
+        app.enable_capability_auth(store);
+        let router = build_router(app);
+        let invalid = "00".repeat(32);
+        let probes = [
+            (Method::POST, "/api/v1/models"),
+            (Method::GET, "/api/v1/not-a-route"),
+        ];
+        let tokens: [(&str, Option<&str>); 3] = [
+            ("missing", None),
+            ("invalid", Some(invalid.as_str())),
+            ("revoked", Some(revoked_bearer.as_str())),
+        ];
+        for (label, token) in tokens {
+            for (method, path) in &probes {
+                let mut request = Request::builder().method(method.clone()).uri(*path);
+                if let Some(token) = token {
+                    request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+                }
+                let response = router
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{label} {method} {path}"
+                );
+                assert_eq!(
+                    body_json(response).await["error"]["code"],
+                    "unauthorized",
+                    "{label} {method} {path}"
+                );
+            }
+        }
+
+        for method in [Method::GET, Method::HEAD] {
+            let health = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri("/api/v1/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(health.status(), StatusCode::OK, "{method} /api/v1/health");
+        }
+
+        let denied_method = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/models")
+                    .header(header::AUTHORIZATION, format!("Bearer {live_bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let unknown = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/not-a-route")
+                    .header(header::AUTHORIZATION, format!("Bearer {live_bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(unknown).await["error"]["code"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn capability_unknown_method_is_405_and_unknown_path_does_not_run_fallback() {
+        let (mut state, host, creative) = capability_state().await;
+        let post_health = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/health")
+                    .header(header::AUTHORIZATION, format!("Bearer {host}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_health.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        state.module_namespaces = Arc::new(BTreeSet::from(["/api/v1/probe".to_owned()]));
+        let router = Router::new()
+            .route("/api/v1/mounted/secret", get(attached_probe))
+            .fallback(attached_probe)
+            .layer(middleware::from_fn_with_state(state, auth));
+
+        let mounted = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/mounted/secret")
+                    .header(header::AUTHORIZATION, format!("Bearer {host}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mounted.status(), StatusCode::NO_CONTENT);
+        let creative_mounted = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/mounted/secret")
+                    .header(header::AUTHORIZATION, format!("Bearer {creative}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(creative_mounted.status(), StatusCode::FORBIDDEN);
+
+        let namespace = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/probe/secret")
+                    .header(header::AUTHORIZATION, format!("Bearer {host}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(namespace.status(), StatusCode::NO_CONTENT);
+
+        for path in ["/api/v1/probe-x", "/api/v1/missing"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(header::AUTHORIZATION, format!("Bearer {host}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(body_json(response).await["error"]["code"], "not_found");
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_head_health_stays_unauthorized() {
+        let res = build_router(state().await)
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn router_with_comm(state: AppState) -> Router {
+        let modules = Router::new().nest(
+            "/api/v1/comm",
+            agent24_comm::router(agent24_comm::CommState::unconfigured("coverage")),
+        );
+        build_router_with_modules(state, modules)
+    }
+
+    fn function_span(src: &str, signature: &str) -> std::ops::Range<usize> {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("missing {signature}"));
+        let end = src[start..]
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("unclosed {signature}"));
+        start..start + end
+    }
+
+    fn ident_boundary_before(src: &str, at: usize) -> bool {
+        match src[..at].chars().next_back() {
+            Some(ch) => !ch.is_ascii_alphanumeric() && ch != '_',
+            None => true,
+        }
+    }
+
+    fn line_comment_end(src: &str, at: usize) -> usize {
+        match src[at..].find('\n') {
+            Some(rel) => at + rel + 1,
+            None => src.len(),
+        }
+    }
+
+    fn block_comment_end(src: &str, at: usize) -> usize {
+        let mut i = at + 2;
+        let mut depth = 1;
+        while i < src.len() && depth > 0 {
+            if src[i..].starts_with("/*") {
+                depth += 1;
+                i += 2;
+            } else if src[i..].starts_with("*/") {
+                depth -= 1;
+                i += 2;
+            } else {
+                i += src[i..].chars().next().unwrap().len_utf8();
+            }
+        }
+        i
+    }
+
+    /// `r"..."`, `r#"..."#`, and the `b`/`c` prefixes. `at` may sit on the prefix.
+    fn raw_string_end(src: &str, at: usize) -> Option<usize> {
+        let rest = &src[at..];
+        let mut rel = 0;
+        if rest.starts_with('b') || rest.starts_with('c') {
+            if !ident_boundary_before(src, at) {
+                return None;
+            }
+            rel = 1;
+        } else if !rest.starts_with('r') {
+            return None;
+        }
+        if !rest[rel..].starts_with('r') {
+            return None;
+        }
+        if rel == 0 && !ident_boundary_before(src, at) {
+            return None;
+        }
+        let bytes = src.as_bytes();
+        let mut i = at + rel + 1;
+        let mut hashes = 0;
+        while bytes.get(i) == Some(&b'#') {
+            hashes += 1;
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'"') {
+            return None;
+        }
+        i += 1;
+        let mut close = String::from("\"");
+        close.extend(std::iter::repeat_n('#', hashes));
+        while i < src.len() {
+            if src[i..].starts_with(&close) {
+                return Some(i + close.len());
+            }
+            i += src[i..].chars().next().unwrap().len_utf8();
+        }
+        Some(src.len())
+    }
+
+    fn cooked_string_end(src: &str, at: usize) -> usize {
+        let mut i = at + 1;
+        let mut escaped = false;
+        while i < src.len() {
+            let ch = src[i..].chars().next().unwrap();
+            i += ch.len_utf8();
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => return i,
+                _ => {}
+            }
+        }
+        src.len()
+    }
+
+    fn char_literal_end(src: &str, at: usize) -> Option<usize> {
+        let rest = &src[at..];
+        if !rest.starts_with('\'') {
+            return None;
+        }
+        let mut i = at + 1;
+        if i >= src.len() {
+            return None;
+        }
+        if src[i..].starts_with('\\') {
+            i += 1;
+            if src[i..].starts_with("u{") {
+                let close = src[i..].find('}')?;
+                i += close + 1;
+            } else {
+                i += src[i..].chars().next()?.len_utf8();
+            }
+        } else {
+            let ch = src[i..].chars().next()?;
+            if ch.is_ascii_alphabetic() || ch == '_' {
+                return None;
+            }
+            i += ch.len_utf8();
+        }
+        if src[i..].starts_with('\'') {
+            Some(i + 1)
+        } else {
+            None
+        }
+    }
+
+    /// End index when `src[at..]` opens a comment, string, or char literal.
+    fn non_code_end(src: &str, at: usize) -> Option<usize> {
+        let rest = &src[at..];
+        if rest.starts_with("//") {
+            return Some(line_comment_end(src, at));
+        }
+        if rest.starts_with("/*") {
+            return Some(block_comment_end(src, at));
+        }
+        if (rest.starts_with('b') || rest.starts_with('c') || rest.starts_with('r'))
+            && let Some(end) = raw_string_end(src, at)
+        {
+            return Some(end);
+        }
+        if rest.starts_with('"') || rest.starts_with("b\"") || rest.starts_with("c\"") {
+            let quote = if rest.starts_with('"') { at } else { at + 1 };
+            return Some(cooked_string_end(src, quote));
+        }
+        if rest.starts_with('\'') {
+            return char_literal_end(src, at);
+        }
+        None
+    }
+
+    fn skip_trivia(src: &str) -> &str {
+        let mut i = 0;
+        loop {
+            let rest = &src[i..];
+            let trimmed = rest.trim_start();
+            if trimmed.len() != rest.len() {
+                i += rest.len() - trimmed.len();
+                continue;
+            }
+            if (rest.starts_with("//") || rest.starts_with("/*"))
+                && let Some(end) = non_code_end(src, i)
+            {
+                i = end;
+                continue;
+            }
+            return &src[i..];
+        }
+    }
+
+    fn route_interior(src: &str) -> &str {
+        let mut depth = 1;
+        let mut i = 0;
+        while i < src.len() {
+            if let Some(end) = non_code_end(src, i) {
+                i = end;
+                continue;
+            }
+            let ch = src[i..].chars().next().unwrap();
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[..i];
+                    }
+                }
+                _ => {}
+            }
+            i += ch.len_utf8();
+        }
+        panic!("unbalanced .route(");
+    }
+
+    fn rust_string(src: &str) -> Option<(&str, &str)> {
+        let src = skip_trivia(src);
+        let mut chars = src.char_indices();
+        if chars.next()?.1 != '"' {
+            return None;
+        }
+        let mut escaped = false;
+        for (index, ch) in chars {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => return Some((&src[1..index], &src[index + 1..])),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn method_names(expr: &str) -> Vec<&'static str> {
+        const NAMES: &[&str] = &["get", "post", "put", "patch", "delete", "head"];
+        let mut found = Vec::new();
+        let mut index = 0;
+        let mut boundary = true;
+        while index < expr.len() {
+            if let Some(end) = non_code_end(expr, index) {
+                index = end;
+                boundary = true;
+                continue;
+            }
+            let ch = expr[index..].chars().next().unwrap();
+            if boundary {
+                for name in NAMES {
+                    if !expr[index..].starts_with(name) {
+                        continue;
+                    }
+                    let end = index + name.len();
+                    let next = expr[end..].chars().next();
+                    let ended = next.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+                    if ended && expr[end..].starts_with('(') {
+                        found.push(*name);
+                    }
+                    break;
+                }
+            }
+            boundary = !ch.is_ascii_alphanumeric() && ch != '_';
+            index += ch.len_utf8();
+        }
+        found
+    }
+
+    /// Every `.route(` in `signature`. Comments are not calls. Unparseable calls,
+    /// calls with no method, and duplicate method/template pairs fail closed.
+    /// Other axum registrars are policed by [`registration_violations`].
+    fn parsed_routes(src: &str, signature: &str, prefix: &str) -> BTreeSet<(String, String)> {
+        let span = function_span(src, signature);
+        let body = &src[span];
+        let mut routes = BTreeSet::new();
+        for call in code_calls(body) {
+            if call.form != "route" {
+                continue;
+            }
+            let interior = route_interior(&body[call.at + ".route(".len()..]);
+            let (path, after) = rust_string(interior)
+                .unwrap_or_else(|| panic!("unparseable .route( near {signature}"));
+            let methods = method_names(after);
+            assert!(!methods.is_empty(), "no method on {path}");
+            for name in methods {
+                let template = if path.starts_with("/api/v1") {
+                    path.to_owned()
+                } else {
+                    format!("{prefix}{path}")
+                };
+                assert!(
+                    routes.insert((name.to_ascii_uppercase(), template.clone())),
+                    "duplicate {name} {template}"
+                );
+            }
+        }
+        assert!(!routes.is_empty(), "{signature} registered no routes");
+        routes
+    }
+
+    struct Registration {
+        form: &'static str,
+        at: usize,
+    }
+
+    /// Longest form first, so `.route_service(` is not read as `.route(`.
+    const REGISTRATION_FORMS: &[&str] = &[
+        "fallback_service",
+        "route_service",
+        "nest_service",
+        "route_layer",
+        "fallback",
+        "route",
+        "nest",
+        "merge",
+    ];
+
+    fn registration_at(src: &str, at: usize) -> Option<&'static str> {
+        let rest = &src[at..];
+        if !rest.starts_with('.') {
+            return None;
+        }
+        let rest = &rest[1..];
+        REGISTRATION_FORMS
+            .iter()
+            .copied()
+            .find(|form| rest.starts_with(form) && rest[form.len()..].starts_with('('))
+    }
+
+    fn code_calls(src: &str) -> Vec<Registration> {
+        let mut calls = Vec::new();
+        let mut i = 0;
+        while i < src.len() {
+            if let Some(end) = non_code_end(src, i) {
+                i = end;
+                continue;
+            }
+            if let Some(form) = registration_at(src, i) {
+                calls.push(Registration { form, at: i });
+            }
+            i += src[i..].chars().next().unwrap().len_utf8();
+        }
+        calls
+    }
+
+    fn skip_ws_idx(src: &str, mut i: usize) -> usize {
+        while let Some(ch) = src[i..].chars().next() {
+            if !ch.is_whitespace() {
+                break;
+            }
+            i += ch.len_utf8();
+        }
+        i
+    }
+
+    fn skip_bracket_group(src: &str, at: usize) -> usize {
+        let start = if src[at..].starts_with('#') {
+            at + 1
+        } else {
+            at
+        };
+        let mut i = start + 1;
+        let mut depth = 1;
+        while i < src.len() && depth > 0 {
+            if let Some(end) = non_code_end(src, i) {
+                i = end;
+                continue;
+            }
+            match src[i..].chars().next().unwrap() {
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ => {}
+            }
+            i += src[i..].chars().next().unwrap().len_utf8();
+        }
+        i
+    }
+
+    fn skip_paren_group(src: &str, at: usize) -> usize {
+        let mut i = at + 1;
+        let mut depth = 1;
+        while i < src.len() && depth > 0 {
+            if let Some(end) = non_code_end(src, i) {
+                i = end;
+                continue;
+            }
+            match src[i..].chars().next().unwrap() {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            i += src[i..].chars().next().unwrap().len_utf8();
+        }
+        i
+    }
+
+    fn skip_visibility(src: &str, i: usize) -> usize {
+        let i = skip_ws_idx(src, i);
+        if !src[i..].starts_with("pub") {
+            return i;
+        }
+        let after = i + 3;
+        let next = src[after..].chars().next();
+        if next.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+            return i;
+        }
+        let i = skip_ws_idx(src, after);
+        if src[i..].starts_with('(') {
+            skip_paren_group(src, i)
+        } else {
+            i
+        }
+    }
+
+    /// One Rust item: through the matching `}` of a body, or through `;`.
+    fn skip_item_body(src: &str, mut i: usize) -> usize {
+        let mut brace = 0i32;
+        let mut paren = 0i32;
+        let mut bracket = 0i32;
+        let mut seen_brace = false;
+        while i < src.len() {
+            if let Some(end) = non_code_end(src, i) {
+                i = end;
+                continue;
+            }
+            let ch = src[i..].chars().next().unwrap();
+            match ch {
+                '{' => {
+                    brace += 1;
+                    seen_brace = true;
+                }
+                '}' => {
+                    brace -= 1;
+                    if seen_brace && brace == 0 && paren == 0 && bracket == 0 {
+                        return i + ch.len_utf8();
+                    }
+                }
+                '(' => paren += 1,
+                ')' => paren -= 1,
+                '[' => bracket += 1,
+                ']' => bracket -= 1,
+                ';' if brace == 0 && paren == 0 && bracket == 0 => return i + ch.len_utf8(),
+                _ => {}
+            }
+            i += ch.len_utf8();
+        }
+        i
+    }
+
+    fn skip_cfg_test_item(src: &str, i: usize) -> usize {
+        let mut i = i + "#[cfg(test)]".len();
+        loop {
+            i = skip_ws_idx(src, i);
+            if (src[i..].starts_with("//") || src[i..].starts_with("/*"))
+                && let Some(end) = non_code_end(src, i)
+            {
+                i = end;
+                continue;
+            }
+            if src[i..].starts_with("#[") {
+                i = skip_bracket_group(src, i);
+                continue;
+            }
+            break;
+        }
+        skip_item_body(src, skip_visibility(src, i))
+    }
+
+    fn strip_cfg_test(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < src.len() {
+            if let Some(end) = non_code_end(src, i) {
+                out.push_str(&src[i..end]);
+                i = end;
+                continue;
+            }
+            if src[i..].starts_with("#[cfg(test)]") {
+                i = skip_cfg_test_item(src, i);
+                continue;
+            }
+            let ch = src[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        out
+    }
+
+    /// `at` is a code byte, not inside a comment or string.
+    fn is_code_index(src: &str, at: usize) -> bool {
+        let mut i = 0;
+        while i < at {
+            if let Some(end) = non_code_end(src, i) {
+                if at < end {
+                    return false;
+                }
+                i = end;
+                continue;
+            }
+            i += src[i..].chars().next().unwrap().len_utf8();
+        }
+        i == at && non_code_end(src, at).is_none()
+    }
+
+    struct AllowedRegistration {
+        file: &'static str,
+        form: &'static str,
+        /// Exact call text in production code. Must occur once and cover one call.
+        call: &'static str,
+        reason: &'static str,
+    }
+
+    /// Axum registrars that are not `.route(` inside the two catalog functions.
+    /// `build_router_with_modules` and `agent24_comm::router` are parsed into the
+    /// operation catalog; every other registration in agent24d / agent24-comm
+    /// production source must be listed here.
+    const ALLOWED_REGISTRATIONS: &[AllowedRegistration] = &[
+        AllowedRegistration {
+            file: "apps/agent24d/src/server.rs",
+            form: "fallback",
+            call: ".fallback(fallback)",
+            reason: "v1 fallback：未登记路径的 kernel 404，不进 Operation 目录",
+        },
+        AllowedRegistration {
+            file: "apps/agent24d/src/server.rs",
+            form: "merge",
+            call: ".merge(modules)",
+            reason: "模块路由 merge 入口：auth layer 之前折入 domain OS",
+        },
+        AllowedRegistration {
+            file: "apps/agent24d/src/server.rs",
+            form: "merge",
+            call: "module_routes.merge(comm_router)",
+            reason: "comm 路由 merge 入口：并入 module_routes，使 /api/v1/comm 走 kernel auth",
+        },
+        AllowedRegistration {
+            file: "crates/agent24-comm/src/router.rs",
+            form: "merge",
+            call: ".merge(crate::groupchat::routes())",
+            reason: "群聊路由并入 comm router；方法清单在 groupchat::routes，由目录扫描覆盖",
+        },
+        AllowedRegistration {
+            file: "apps/agent24d/src/comm_routes.rs",
+            form: "nest",
+            call: ".nest(\"/api/v1/comm\", agent24_comm::router(state))",
+            reason: "comm 前缀挂载点；方法清单在 agent24-comm::router，由目录扫描覆盖",
+        },
+        AllowedRegistration {
+            file: "apps/agent24d/src/domain.rs",
+            form: "nest",
+            call: "app.nest(namespace, Router::new().fallback(handler.clone()))",
+            reason: "模块命名空间 503 的 nest，路径来自 namespace，不是固定 Operation",
+        },
+        AllowedRegistration {
+            file: "apps/agent24d/src/domain.rs",
+            form: "fallback",
+            call: "Router::new().fallback(handler.clone())",
+            reason: "模块命名空间 503 的 fallback，应答该命名空间下全部方法",
+        },
+        AllowedRegistration {
+            file: "apps/agent24d/src/domain.rs",
+            form: "route",
+            call: ".route(&format!(\"{namespace}/\"), axum::routing::any(handler))",
+            reason: "命名空间尾斜杠 503：matchit 不匹配空 segment",
+        },
+        AllowedRegistration {
+            file: "apps/agent24d/src/domain.rs",
+            form: "nest",
+            call: "app.nest(&namespace, module.routes(ctx))",
+            reason: "已挂载模块的动态路由入口，路径来自 manifest",
+        },
+    ];
+
+    fn production_sources() -> Vec<(String, String)> {
+        let rust_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut files = Vec::new();
+        for root in ["apps/agent24d/src", "crates/agent24-comm/src"] {
+            collect_rs(&rust_root.join(root), root, &mut files);
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files
+    }
+
+    fn collect_rs(dir: &std::path::Path, rel: &str, out: &mut Vec<(String, String)>) {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|err| panic!("read {}: {err}", dir.display()));
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|err| panic!("read {}: {err}", dir.display()));
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == "tests" {
+                continue;
+            }
+            let path = entry.path();
+            let rel_path = format!("{rel}/{name}");
+            if path.is_dir() {
+                collect_rs(&path, &rel_path, out);
+                continue;
+            }
+            if !name.ends_with(".rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+            out.push((rel_path, strip_cfg_test(&text)));
+        }
+    }
+
+    fn source_of<'a>(files: &'a [(String, String)], path: &str) -> &'a str {
+        files
+            .iter()
+            .find(|(name, _)| name == path)
+            .unwrap_or_else(|| panic!("missing {path}"))
+            .1
+            .as_str()
+    }
+
+    fn preview_at(src: &str, at: usize) -> String {
+        let end = src[at..]
+            .find('\n')
+            .map_or(src.len(), |rel| at + rel)
+            .min(at + 160);
+        src[at..end].trim().to_owned()
+    }
+
+    fn registrar_span(path: &str, src: &str) -> Option<std::ops::Range<usize>> {
+        let signature = match path {
+            "apps/agent24d/src/server.rs" => "pub fn build_router_with_modules",
+            "crates/agent24-comm/src/router.rs" => "pub fn router(",
+            "crates/agent24-comm/src/groupchat.rs" => "pub(crate) fn routes(",
+            _ => return None,
+        };
+        Some(function_span(src, signature))
+    }
+
+    /// Empty means every production axum registration is either a catalog
+    /// `.route(` or a live whitelist entry. A missing whitelist call is a
+    /// violation, so deleting the real call fails the gate.
+    fn registration_violations(files: &[(String, String)]) -> Vec<String> {
+        let mut violations = Vec::new();
+        let mut ranges: Vec<(&str, std::ops::Range<usize>, &str)> = Vec::new();
+        for entry in ALLOWED_REGISTRATIONS {
+            let Some(src) = files
+                .iter()
+                .find(|(path, _)| path == entry.file)
+                .map(|(_, text)| text.as_str())
+            else {
+                violations.push(format!("whitelist file missing: {}", entry.file));
+                continue;
+            };
+            let mut starts = Vec::new();
+            let mut search = 0;
+            while let Some(rel) = src[search..].find(entry.call) {
+                let at = search + rel;
+                if is_code_index(src, at) {
+                    starts.push(at);
+                }
+                search = at + entry.call.len();
+            }
+            if starts.len() != 1 {
+                violations.push(format!(
+                    "whitelist entry must occur once, found {} in {}: `{}` ({})",
+                    starts.len(),
+                    entry.file,
+                    entry.call,
+                    entry.reason
+                ));
+                continue;
+            }
+            let start = starts[0];
+            let range = start..start + entry.call.len();
+            let covered = code_calls(src)
+                .iter()
+                .filter(|call| call.form == entry.form && range.contains(&call.at))
+                .count();
+            if covered != 1 {
+                violations.push(format!(
+                    "whitelist entry does not cover exactly one {} call (covered {covered}) in {}: `{}` ({})",
+                    entry.form, entry.file, entry.call, entry.reason
+                ));
+                continue;
+            }
+            ranges.push((entry.file, range, entry.form));
+        }
+        for (path, src) in files {
+            let span = registrar_span(path, src);
+            for call in code_calls(src) {
+                let in_catalog =
+                    call.form == "route" && span.as_ref().is_some_and(|s| s.contains(&call.at));
+                let listed = ranges.iter().any(|(file, range, form)| {
+                    *file == path && *form == call.form && range.contains(&call.at)
+                });
+                if !in_catalog && !listed {
+                    violations.push(format!(
+                        "unlisted {} in {path}: {}",
+                        call.form,
+                        preview_at(src, call.at)
+                    ));
+                }
+            }
+        }
+        violations
+    }
+
+    fn replace_server(files: &[(String, String)], from: &str, to: &str) -> Vec<(String, String)> {
+        let mut files = files.to_vec();
+        let server = files
+            .iter_mut()
+            .find(|(path, _)| path == "apps/agent24d/src/server.rs")
+            .expect("server.rs");
+        let count = server.1.matches(from).count();
+        assert_eq!(count, 1, "expected one occurrence of {from}, found {count}");
+        server.1 = server.1.replacen(from, to, 1);
+        files
+    }
+
+    #[test]
+    fn a_route_with_a_chinese_comment_parses() {
+        let src = "\
+pub fn build_router_with_modules() {
+    .route(
+        /* 中文 */
+        \"/api/v1/health\",
+        get(/* 中文) */ health).post(health), // 行注释 post(
+    )
+}
+";
+        let routes = parsed_routes(src, "pub fn build_router_with_modules", "");
+        assert_eq!(
+            routes,
+            BTreeSet::from([
+                ("GET".to_owned(), "/api/v1/health".to_owned()),
+                ("POST".to_owned(), "/api/v1/health".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn an_unlisted_route_service_fails_the_registration_gate() {
+        let files = replace_server(
+            &production_sources(),
+            ".route(\"/api/v1/health\", get(health))",
+            ".route(\"/api/v1/health\", get(health))\n        .route_service(\"/api/v1/x\", get(health))",
+        );
+        let violations = registration_violations(&files);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("route_service") && v.contains("/api/v1/x")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_unlisted_nest_fails_the_registration_gate() {
+        let files = replace_server(
+            &production_sources(),
+            ".route(\"/api/v1/health\", get(health))",
+            ".nest(\"/api/v1/y\", Router::new())\n        .route(\"/api/v1/health\", get(health))",
+        );
+        let violations = registration_violations(&files);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("unlisted nest") && v.contains("/api/v1/y")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn removing_a_whitelisted_merge_fails_the_registration_gate() {
+        let files = replace_server(&production_sources(), ".merge(modules)", "");
+        let violations = registration_violations(&files);
+        assert!(
+            violations.iter().any(|v| {
+                v.contains(".merge(modules)") && v.contains("模块路由 merge 入口")
+            }),
+            "{violations:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_routes_match_the_operation_catalog() {
+        let files = production_sources();
+        let kernel_src = source_of(&files, "apps/agent24d/src/server.rs");
+        let comm_src = source_of(&files, "crates/agent24-comm/src/router.rs");
+        assert!(
+            !kernel_src.contains("fn registered_routes_match_the_operation_catalog"),
+            "cfg(test) module was scanned as production"
+        );
+        assert_eq!(kernel_src.matches(".merge(modules)").count(), 1);
+        let kernel = parsed_routes(kernel_src, "pub fn build_router_with_modules", "");
+        let mut comm = parsed_routes(comm_src, "pub fn router(", "/api/v1/comm");
+        // `router` merges `groupchat::routes()`; both register under the comm prefix.
+        let groupchat_src = source_of(&files, "crates/agent24-comm/src/groupchat.rs");
+        comm.extend(parsed_routes(
+            groupchat_src,
+            "pub(crate) fn routes(",
+            "/api/v1/comm",
+        ));
+        let violations = registration_violations(&files);
+        assert!(
+            violations.is_empty(),
+            "registration gate:\n{}",
+            violations.join("\n")
+        );
+        assert!(kernel.len() >= 50, "kernel scan saw only {}", kernel.len());
+        let comm_paths = comm
+            .iter()
+            .map(|(_, path)| path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            comm_paths.len() >= 16,
+            "comm scan saw only {}",
+            comm_paths.len()
+        );
+
+        let mut registered = kernel.clone();
+        registered.extend(comm.iter().cloned());
+        let catalog = crate::capabilities::policies()
+            .iter()
+            .map(|policy| (policy.method.to_owned(), policy.template.to_owned()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(registered, catalog);
+
+        let empty = BTreeSet::new();
+        for (method_name, template) in &registered {
+            let decision = crate::capabilities::decide(
+                &Method::from_bytes(method_name.as_bytes()).unwrap(),
+                Some(template),
+                template,
+                &empty,
+            );
+            assert!(
+                matches!(decision, crate::capabilities::RouteDecision::Mapped(_)),
+                "{method_name} {template} fell into the module fallback"
+            );
+        }
+
+        let (state, host, _) = capability_state().await;
+        let router = router_with_comm(state);
+        let trace = Method::from_bytes(b"TRACE").unwrap();
+        let mut templates = BTreeSet::new();
+        for (_, template) in &registered {
+            templates.insert(template.clone());
+        }
+        for template in templates {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(trace.clone())
+                        .uri(concrete_path(&template))
+                        .header(header::AUTHORIZATION, format!("Bearer {host}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{template}"
+            );
+            let allow = response
+                .headers()
+                .get(header::ALLOW)
+                .unwrap_or_else(|| panic!("no Allow on {template}"))
+                .to_str()
+                .unwrap();
+            let got = allow
+                .split(',')
+                .map(|part| part.trim().to_owned())
+                .collect::<BTreeSet<_>>();
+            let mut expect = registered
+                .iter()
+                .filter(|(_, path)| path == &template)
+                .map(|(method_name, _)| method_name.clone())
+                .collect::<BTreeSet<_>>();
+            if expect.contains("GET") {
+                expect.insert("HEAD".to_owned());
+            }
+            assert_eq!(got, expect, "{template} Allow: {allow}");
+        }
     }
 
     #[tokio::test]
     async fn attached_routes_are_host_only_in_capability_mode() {
         let (state, host, creative) = capability_state().await;
         let router = Router::new()
-            .fallback(|| async { StatusCode::NO_CONTENT })
+            .route("/api/v1/attached", get(attached_probe).post(attached_probe))
+            .route(
+                "/api/v1/attached/{name}",
+                axum::routing::patch(attached_probe).delete(attached_probe),
+            )
             .layer(middleware::from_fn_with_state(state, auth));
 
         for (method, path) in [
@@ -6126,6 +7983,7 @@ pub(crate) mod tests {
         );
         let first = runs
             .start_run(agent24_protocol::RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some(session_id.into()),
                 prompt: "检查一下".into(),
                 model_override: None,

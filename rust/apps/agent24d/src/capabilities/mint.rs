@@ -58,6 +58,7 @@ impl CapabilityStore {
         created_at: UnixSeconds,
     ) -> Result<MintedCapability, CapabilityError> {
         self.insert(CapabilityClaims {
+            first_party: None,
             capability_id: random_capability_id(),
             audience: Audience::ProductHost,
             workspace_id: None,
@@ -128,6 +129,7 @@ impl CapabilityStore {
         self.insert_locked(
             &mut state,
             CapabilityClaims {
+                first_party: None,
                 capability_id: random_capability_id(),
                 audience: Audience::CreativeRuntime,
                 workspace_id: Some(request.workspace_id),

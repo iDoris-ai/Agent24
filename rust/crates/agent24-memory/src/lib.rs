@@ -11,6 +11,7 @@
 pub mod artifact;
 pub mod assertion;
 pub mod condenser;
+mod conn_phase;
 pub mod consolidator;
 pub mod disk_gate;
 pub mod eval;
@@ -111,6 +112,8 @@ pub enum MemoryError {
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;
+
+pub use conn_phase::{MemoryConn, OBSERVE_UNCLOSED, PhaseError, PhaseFault, embedded_version};
 
 /// P1-02c (c2): the closed set of externally visible memory-failure codes.
 ///
@@ -369,6 +372,15 @@ pub struct MemorySettings {
     pub enabled: bool,
 }
 
+/// Test-only pool access so `/health` can be checked against the migration
+/// table without making the pool part of the supported API.
+#[doc(hidden)]
+pub mod test_hooks {
+    pub fn pool(store: &super::KvStore) -> &sqlx::SqlitePool {
+        &store.pool
+    }
+}
+
 /// L0: a namespaced JSON key-value store over SQLite (WAL, 5s busy timeout).
 #[derive(Clone)]
 pub struct KvStore {
@@ -399,37 +411,10 @@ pub struct KvStore {
 impl KvStore {
     /// Open (creating if needed) a database file and run migrations.
     pub async fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|e| MemoryError::Io(format!("mkdir: {e}")))?;
-        }
-        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
-            .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            // FKs are OFF by default in SQLite; the trace projection (MD-8) relies
-            // on a composite FK so a node's ref can never be unresolvable.
-            .foreign_keys(true)
-            .busy_timeout(std::time::Duration::from_secs(5))
-            // T8.5c-P §3.2 (v2 "sqlx 预取 High", v4 M1 "常量口径"): shrink
-            // sqlx-sqlite's worker-thread row lookahead from its default of
-            // 50 to the single shared constant every `EventLog`-producing
-            // pool must reference — see `MEMORY_SQLITE_ROW_BUFFER_SIZE`'s doc.
-            .row_buffer_size(MEMORY_SQLITE_ROW_BUFFER_SIZE);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(KVSTORE_MAX_CONNECTIONS)
-            .connect_with(options)
-            .await?;
-        sqlx::migrate!("./migrations").run(&pool).await?;
-        Self::rebuild_fts_if_needed(&pool).await?;
-        Ok(Self {
-            pool,
-            oop_admission: Some(Arc::new(tokio::sync::Semaphore::new(
-                (KVSTORE_MAX_CONNECTIONS - 1) as usize,
-            ))),
-            rejection_queue: Default::default(),
-            disk: disk_gate::DiskGate::for_path(path),
-        })
+        MemoryConn::migrate(path, PhaseFault::none())
+            .await
+            .map(MemoryConn::into_kv)
+            .map_err(|err| err.source)
     }
 
     /// In-memory database for tests. A single connection: every `:memory:`
@@ -463,13 +448,23 @@ impl KvStore {
         })
     }
 
+    /// Latest successful migration in `_sqlx_migrations`, or 0 when none
+    /// has been applied. This is the memory-database watermark `/health` reports.
+    pub async fn latest_applied_migration(&self) -> Result<i64> {
+        let version: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(version.unwrap_or(0))
+    }
+
     /// Replace the disk gate (tests inject a fake probe and clock here).
     pub fn with_disk_gate(mut self, gate: disk_gate::DiskGate) -> Self {
         self.disk = gate;
         self
     }
 
-    async fn rebuild_fts_if_needed(pool: &SqlitePool) -> Result<()> {
+    pub(crate) async fn rebuild_fts_if_needed(pool: &SqlitePool) -> Result<()> {
         let marker: Option<String> =
             sqlx::query_scalar("SELECT v FROM mem_fts_state WHERE k = 'needs_rebuild'")
                 .fetch_optional(pool)

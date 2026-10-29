@@ -5,11 +5,12 @@
   "description": "DOC-1-09: the Documenting acceptance harness. Runs the S01 samples through the documents routes of a real daemon, scores the results against the gold labels and records the evidence (docs/documenting/acceptance/README.md).",
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "vitest run",
-    "accept": "tsx src/cli.ts"
+    "typecheck": "pnpm --filter @agent24/data-dir build && tsc --noEmit -p tsconfig.json",
+    "test": "pnpm --filter @agent24/data-dir build && vitest run",
+    "accept": "pnpm --filter @agent24/data-dir build && tsx src/cli.ts"
   },
   "dependencies": {
+    "@agent24/data-dir": "workspace:*",
     "ajv": "^8.17.1",
     "ajv-formats": "^3.0.1",
     "js-yaml": "^4.1.0"

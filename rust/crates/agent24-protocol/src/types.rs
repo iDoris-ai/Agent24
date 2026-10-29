@@ -6,6 +6,19 @@ use serde_json::{Map, Value};
 
 // ── System ───────────────────────────────────────────────────────────────────
 
+/// Latest successful sqlx migration on each database the daemon migrates.
+///
+/// `0` means this process has no successful row to report (the database is
+/// not open, or `_sqlx_migrations` has none). A migrated database reports
+/// `MAX(version)` where `success = 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HealthMigrations {
+    /// Run database (`agent24.db`).
+    pub store: i64,
+    /// Memory database (`memory.db`).
+    pub memory: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Health {
     /// Always "ok" when reachable
@@ -13,6 +26,10 @@ pub struct Health {
     pub version: String,
     /// Open enum: "node" | "rust" | future backends
     pub backend: String,
+    /// `PROTOCOL_VERSION` of this daemon. Shells refuse a different value.
+    pub protocol_version: u32,
+    /// Migration watermarks of the run database and the memory database.
+    pub migrations: HealthMigrations,
 }
 
 /// `GET /api/v1/shutdown` (SHUT-1c): the shutdown budgets this daemon runs
@@ -280,6 +297,9 @@ pub struct ChatMessage {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ChatRequest {
+    /// Confirmation for this request only; never inherited by later requests.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub idoris_headroom_confirmed: bool,
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub model: Option<String>,
@@ -456,6 +476,9 @@ pub struct Run {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RunCreate {
+    /// Confirmation for the first model call only; never persisted or resumed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub idoris_headroom_confirmed: bool,
     /// Omit/null to create a transient run
     #[serde(default)]
     pub session_id: Option<String>,
