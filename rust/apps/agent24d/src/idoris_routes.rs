@@ -188,7 +188,13 @@ mod tests {
                     &method,
                     &path.replace("operations/missing", "operations/{id}"),
                 ),
-                crate::capabilities::Operation::from_action("idoris.lifecycle")
+                crate::capabilities::Operation::from_action(
+                    if method == Method::GET && !path.ends_with("/candidates") {
+                        "idoris.read"
+                    } else {
+                        "idoris.lifecycle"
+                    }
+                )
             );
         }
     }
