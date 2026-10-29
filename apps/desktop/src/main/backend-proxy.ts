@@ -43,17 +43,31 @@ const r = (method: HttpMethod, template: string, timeoutMs?: number): ProxyRoute
  *   PUT|DELETE /api/v1/tool-overrides/{pattern}
  *   DELETE /api/v1/standing-grants/{id}
  *   POST   /api/v1/capabilities/*
- *   POST|PATCH|DELETE /api/v1/attached*
+ *   POST   /api/v1/attached
+ *   PATCH  /api/v1/attached/{name}           -> IpcChannels.AgentEarSetEnabled (agentear only)
+ *   DELETE /api/v1/attached/{name}           -> IpcChannels.AgentEarUnpair (agentear only)
  *   PATCH  /api/v1/os/{name}                 -> IpcChannels.OsModuleSetEnabled
  *   POST   /api/v1/os/{name}/stop
  */
 export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
+  // IL-13: host-only lifecycle API; Admin credentials never enter Electron.
+  r('GET', '/api/v1/idoris/status'),
+  r('GET', '/api/v1/idoris/omlx/candidates'),
+  r('GET', '/api/v1/idoris/operations/{id}'),
+  r('POST', '/api/v1/idoris/operations/{id}/cancel'),
+  r('POST', '/api/v1/idoris/install'),
+  r('POST', '/api/v1/idoris/connect'),
+  r('POST', '/api/v1/idoris/start'),
+  r('POST', '/api/v1/idoris/stop'),
   r('GET', '/api/v1/health'),
+  // Optional UI manifests; daemons without this endpoint keep the static registry.
+  r('GET', '/api/modules'),
   r('GET', '/api/v1/models'),
   r('POST', '/api/v1/chat', CHAT_TIMEOUT_MS),
   r('GET', '/api/v1/usage'),
   // runs
   r('GET', '/api/v1/runs'),
+  r('POST', '/api/v1/runs'),
   r('GET', '/api/v1/runs/{id}'),
   r('POST', '/api/v1/runs/{id}/cancel'),
   // schedules
@@ -172,6 +186,10 @@ export interface ProxyOptions {
   maxBytes?: number
 }
 
+export function validIdempotencyKey(value: unknown): value is string | undefined {
+  return value === undefined || (typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value))
+}
+
 /** Forwards one request to the daemon. Never rejects. No allowlist check here:
  *  callers (the generic handler, or a dedicated IPC) decide what may be sent. */
 export function proxyRequest(
@@ -179,6 +197,9 @@ export function proxyRequest(
   req: BackendProxyRequest,
   opts: ProxyOptions = {},
 ): Promise<BackendProxyResponse> {
+  if (!validIdempotencyKey(req.idempotencyKey)) {
+    return Promise.resolve(proxyError('invalid_request', 'invalid idempotency key'))
+  }
   const timeoutMs = opts.timeoutMs ?? PROXY_TIMEOUT_MS
   const maxBytes = opts.maxBytes ?? PROXY_MAX_BODY_BYTES
   return new Promise((resolve) => {
@@ -217,6 +238,7 @@ export function proxyRequest(
           headers: {
             'Content-Type': 'application/json',
             ...endpoint.authHeaders,
+            ...(req.idempotencyKey ? { 'Idempotency-Key': req.idempotencyKey } : {}),
             ...(body ? { 'Content-Length': Buffer.byteLength(body) } : {}),
           },
         },

@@ -3,6 +3,9 @@
 // daemon is a real loopback http server so "no request reached it" is a
 // factual assertion, not a mock-call count.
 
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -12,7 +15,7 @@ const showMessageBox = vi.fn()
 const execFileMock = vi.fn()
 
 vi.mock('electron', () => ({
-  app: { getVersion: () => '0.0.0-test' },
+  app: { getVersion: () => '0.0.0-test', getPath: () => settingsDir },
   BrowserWindow: { fromWebContents: () => null },
   dialog: { showMessageBox: (...a: unknown[]) => showMessageBox(...a), showOpenDialog: vi.fn() },
   ipcMain: { handle: (channel: string, fn: (event: unknown, ...args: unknown[]) => unknown) => { handlers.set(channel, fn) } },
@@ -36,7 +39,7 @@ vi.mock('../backend-manager', () => ({
 
 import { IpcChannels } from '../../shared/ipc-types'
 import { createIpcGuard } from './guard'
-import { reachesHostInterface, registerIpcHandlers } from './index'
+import { reachesHostInterface, reachesPresenceChannel, registerIpcHandlers } from './index'
 
 const APP_URL = 'file:///app/renderer/index.html'
 const mainFrame = { url: APP_URL }
@@ -44,16 +47,32 @@ const mainWindow = { isDestroyed: () => false, webContents: { mainFrame } }
 const trustedEvent = { senderFrame: mainFrame, sender: { isDestroyed: () => false, send: vi.fn() } }
 
 let daemon: http.Server
+let modelsRequireKey: string | null = null
+let reflectAuthAsModel = false
+let reflectedKeyEncoding: BufferEncoding | 'base64url' | null = null
+const settingsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-omlx-settings-'))
+const settingsFile = path.join(settingsDir, 'settings.json')
 let seen: { method?: string; url?: string; auth?: string; body: string }[] = []
+// A-3: what GET /api/v1/attached lists, and an optional forced failure for
+// PATCH/DELETE /api/v1/attached/agentear.
+let attachedModules: { name: string; attach_status: string }[] = []
+let attachedFailure: { status: number; code: string } | null = null
 
 beforeAll(async () => {
   daemon = http.createServer((req, res) => {
     const chunks: Buffer[] = []
     req.on('data', (c: Buffer) => chunks.push(c))
     req.on('end', () => {
-      if (!(req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/')) && !(req.method === 'GET' && req.url === '/api/v1/os')) seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: Buffer.concat(chunks).toString() })
+      if (!(req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/')) && !(req.method === 'GET' && req.url === '/api/v1/os') && !(req.method === 'GET' && req.url === '/api/v1/attached')) seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: Buffer.concat(chunks).toString() })
       res.setHeader('Content-Type', 'application/json')
-      if (req.url === '/v1/models') res.end(JSON.stringify({ data: [{ id: 'm1' }] }))
+      if (req.url === '/v1/models' && modelsRequireKey && req.headers.authorization !== `Bearer ${modelsRequireKey}`) {
+        res.statusCode = 401
+        res.end(JSON.stringify({ error: 'unauthorized' }))
+      } else if (req.url === '/v1/models' && reflectAuthAsModel) {
+        const key = String(req.headers.authorization ?? '').replace(/^Bearer /, '')
+        const reflected = reflectedKeyEncoding ? Buffer.from(key).toString(reflectedKeyEncoding) : String(req.headers.authorization ?? '')
+        res.end(JSON.stringify({ data: [{ id: `echo-${reflected}-model` }, { id: 'm1' }, { id: 7 }] }))
+      } else if (req.url === '/v1/models') res.end(JSON.stringify({ data: [{ id: 'm1' }] }))
       else if (req.method === 'GET' && req.url === '/api/v1/approvals/ap_1') {
         res.end(JSON.stringify({
           id: 'ap_1', kind: 'exec', summary: 'REAL: rm -rf /tmp/real', run_id: 'run_real',
@@ -75,6 +94,16 @@ beforeAll(async () => {
       } else if (req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/ap_missing')) {
         res.statusCode = 404
         res.end(JSON.stringify({ error: { code: 'not_found', message: 'nope' } }))
+      } else if (req.method === 'GET' && req.url === '/api/v1/attached') {
+        res.end(JSON.stringify({ modules: attachedModules }))
+      } else if (req.url?.startsWith('/api/v1/attached/') && attachedFailure) {
+        res.statusCode = attachedFailure.status
+        res.end(JSON.stringify({ error: { code: attachedFailure.code, message: 'daemon says no' } }))
+      } else if (req.method === 'DELETE' && req.url?.startsWith('/api/v1/attached/')) {
+        res.statusCode = 204
+        res.end()
+      } else if (req.method === 'PATCH' && req.url?.startsWith('/api/v1/attached/')) {
+        res.end(JSON.stringify({ modules: attachedModules }))
       } else if (req.method === 'GET' && req.url === '/api/v1/os') {
         res.end(JSON.stringify({ modules: [{ name: 'sin90', enabled: false, version: '0.5.0' }] }))
       } else res.end(JSON.stringify({ ok: true, echoed: req.url }))
@@ -83,6 +112,8 @@ beforeAll(async () => {
   await new Promise<void>((r) => daemon.listen(0, '127.0.0.1', r))
   endpoint.port = (daemon.address() as AddressInfo).port
   registerIpcHandlers({
+    omlxSettingsPath: settingsFile,
+    omlxCandidatePorts: [endpoint.port],
     guard: createIpcGuard({
       getMainWindow: () => mainWindow as never,
       isTrustedUrl: (u) => u === APP_URL,
@@ -90,10 +121,20 @@ beforeAll(async () => {
   })
 })
 
-afterAll(() => new Promise<void>((r) => daemon.close(() => r())))
+afterAll(() => {
+  fs.rmSync(settingsDir, { recursive: true, force: true })
+  return new Promise<void>((r) => daemon.close(() => r()))
+})
 
 beforeEach(() => {
+  modelsRequireKey = null
+  reflectAuthAsModel = false
+  reflectedKeyEncoding = null
+  fs.rmSync(settingsFile, { force: true })
+  fs.rmSync(path.join(settingsDir, 'ui-prefs.json'), { force: true })
   seen = []
+  attachedModules = [{ name: 'agentear', attach_status: 'attached' }, { name: 'other', attach_status: 'attached' }]
+  attachedFailure = null
   showMessageBox.mockReset()
   execFileMock.mockReset()
 })
@@ -121,7 +162,8 @@ describe('A1 backendProxy allowlist', () => {
     ['PATCH', '/api/v1/os/sin90'],
     ['POST', '/api/v1/os/sin90/stop'],
     ['GET', '/api/v1/not-a-route'],
-    ['GET', '/api/modules'],
+    ['POST', '/api/modules'],
+    ['GET', '/api/modules/install'],
     ['GET', '/api/v1/runs/../shutdown'],
     ['GET', '/api/v1/runs/%2e%2e/shutdown'],
   ]
@@ -168,7 +210,7 @@ describe('A1 backendProxy allowlist', () => {
       expect(opts.detail).toContain('run_real')
       expect(opts.detail).toContain('exec')
       expect(opts.detail).toContain('/tmp/real')
-      expect(opts.detail).toContain('页面备注（仅供参考）：harmless readme tweak')
+      expect(opts.detail).toContain('Note from the page (for reference only): harmless readme tweak')
     })
     it('approve_for_target (offered by the daemon) goes through: one dialog, one POST', async () => {
       showMessageBox.mockResolvedValue({ response: 0 })
@@ -188,8 +230,8 @@ describe('A1 backendProxy allowlist', () => {
       showMessageBox.mockResolvedValue({ response: 1 })
       await call(IpcChannels.ApprovalDecide, 'ap_long', { type: 'approve' })
       const opts = showMessageBox.mock.calls[0]!.at(-1) as { detail: string }
-      expect(opts.detail).toContain('（已截断，共 500 字符）')
-      expect(opts.detail).toMatch(/（已截断，共 \d{4} 字符）/)
+      expect(opts.detail).toContain('(truncated, 500 characters in total)')
+      expect(opts.detail).toMatch(/\(truncated, \d{4} characters in total\)/)
     })
     it('daemon 404 -> refused without any dialog or POST', async () => {
       const res = await call(IpcChannels.ApprovalDecide, 'ap_missing', { type: 'approve' })
@@ -228,10 +270,10 @@ describe('A1 backendProxy allowlist', () => {
       await call(IpcChannels.OsModuleSetEnabled, 'sin90', true)
       const opts = showMessageBox.mock.calls[0]!.at(-1) as { message: string; detail: string }
       expect(opts.message).toContain('sin90')
-      expect(opts.message).toContain('停用 改为 启用')
+      expect(opts.message).toContain('from disabled to enabled')
       expect(opts.detail).toContain('0.5.0')
-      expect(opts.detail).toContain('立即生效')
-      expect(opts.detail).not.toContain('重启后生效')
+      expect(opts.detail).toContain('Takes effect immediately')
+      expect(opts.detail).not.toContain('takes effect after restart')
     })
     it('a module the daemon does not list is refused without a dialog', async () => {
       const res = await call(IpcChannels.OsModuleSetEnabled, 'ghost', true)
@@ -245,6 +287,158 @@ describe('A1 backendProxy allowlist', () => {
       expect(res.ok).toBe(false)
       expect(seen).toHaveLength(0)
     })
+  })
+})
+
+describe('A-3 AgentEar disable / unpair (dedicated IPC + native confirm)', () => {
+  it('setEnabled(false) PATCHes /api/v1/attached/agentear after confirmation, with the host credential', async () => {
+    showMessageBox.mockResolvedValue({ response: 0 })
+    const res = await call(IpcChannels.AgentEarSetEnabled, false)
+    expect(res.ok).toBe(true)
+    expect(showMessageBox).toHaveBeenCalledTimes(1)
+    expect(seen).toHaveLength(1)
+    expect(seen[0]?.method).toBe('PATCH')
+    expect(seen[0]?.url).toBe('/api/v1/attached/agentear')
+    expect(seen[0]?.auth).toBe('Bearer daemon-secret')
+    expect(JSON.parse(seen[0]!.body)).toEqual({ enabled: false })
+  })
+  it('setEnabled(true) sends enabled: true', async () => {
+    attachedModules = [{ name: 'agentear', attach_status: 'disabled' }]
+    showMessageBox.mockResolvedValue({ response: 0 })
+    const res = await call(IpcChannels.AgentEarSetEnabled, true)
+    expect(res.ok).toBe(true)
+    expect(seen.map((s) => [s.method, s.url, s.body])).toEqual([['PATCH', '/api/v1/attached/agentear', '{"enabled":true}']])
+  })
+  it('unpair DELETEs /api/v1/attached/agentear after confirmation', async () => {
+    showMessageBox.mockResolvedValue({ response: 0 })
+    const res = await call(IpcChannels.AgentEarUnpair)
+    expect(res.ok).toBe(true)
+    expect(res.status).toBe(204)
+    expect(seen.map((s) => [s.method, s.url])).toEqual([['DELETE', '/api/v1/attached/agentear']])
+  })
+  it('only ever touches agentear: a page-supplied name is ignored or refused', async () => {
+    showMessageBox.mockResolvedValue({ response: 0 })
+    // A name in the first slot is not a boolean -> refused before any dialog.
+    const named = await call(IpcChannels.AgentEarSetEnabled, 'other', false)
+    expect(named.data.error.code).toBe('invalid_request')
+    expect(showMessageBox).not.toHaveBeenCalled()
+    expect(seen).toHaveLength(0)
+    // Extra arguments cannot redirect the request.
+    await call(IpcChannels.AgentEarSetEnabled, false, 'other')
+    await call(IpcChannels.AgentEarUnpair, 'other')
+    await call(IpcChannels.AgentEarUnpair, '../../shutdown')
+    expect(seen.map((s) => s.url)).toEqual(['/api/v1/attached/agentear', '/api/v1/attached/agentear', '/api/v1/attached/agentear'])
+  })
+  it('rejects a non-boolean enabled before asking', async () => {
+    for (const v of [undefined, null, 'false', 0, 1, {}]) {
+      const res = await call(IpcChannels.AgentEarSetEnabled, v)
+      expect(res.ok).toBe(false)
+      expect(res.data.error.code).toBe('invalid_request')
+    }
+    expect(showMessageBox).not.toHaveBeenCalled()
+    expect(seen).toHaveLength(0)
+  })
+  it('sends nothing when the user cancels (both channels)', async () => {
+    showMessageBox.mockResolvedValue({ response: 1 })
+    const a = await call(IpcChannels.AgentEarSetEnabled, false)
+    const b = await call(IpcChannels.AgentEarUnpair)
+    expect(a.data.error.code).toBe('cancelled')
+    expect(b.data.error.code).toBe('cancelled')
+    expect(showMessageBox).toHaveBeenCalledTimes(2)
+    expect(seen).toHaveLength(0)
+  })
+  it('a dialog that fails to open counts as a cancel', async () => {
+    showMessageBox.mockRejectedValue(new Error('no display'))
+    const res = await call(IpcChannels.AgentEarUnpair)
+    expect(res.data.error.code).toBe('cancelled')
+    expect(seen).toHaveLength(0)
+  })
+  it('not paired -> not_paired without any dialog or write', async () => {
+    attachedModules = [{ name: 'other', attach_status: 'attached' }]
+    const a = await call(IpcChannels.AgentEarSetEnabled, false)
+    const b = await call(IpcChannels.AgentEarUnpair)
+    for (const res of [a, b]) {
+      expect(res.ok).toBe(false)
+      expect(res.status).toBe(404)
+      expect(res.data.error.code).toBe('not_paired')
+    }
+    expect(showMessageBox).not.toHaveBeenCalled()
+    expect(seen).toHaveLength(0)
+  })
+  it('the unpair dialog says AgentEar must be paired again; the disable dialog says pairing is kept', async () => {
+    showMessageBox.mockResolvedValue({ response: 1 })
+    await call(IpcChannels.AgentEarUnpair)
+    await call(IpcChannels.AgentEarSetEnabled, false)
+    await call(IpcChannels.AgentEarSetEnabled, true)
+    const [unpair, disable, enable] = showMessageBox.mock.calls.map((c) => c.at(-1) as { message: string; detail: string; buttons: string[]; cancelId: number; defaultId: number })
+    expect(unpair!.message).toContain('Unpair AgentEar')
+    expect(unpair!.detail).toContain('pair AgentEar again')
+    expect(disable!.message).toContain('Disable AgentEar')
+    expect(disable!.detail).toContain('pairing is kept')
+    expect(enable!.message).toContain('Enable AgentEar')
+    // Cancel is the default and the Escape answer.
+    for (const opts of [unpair!, disable!, enable!]) {
+      expect(opts.defaultId).toBe(1)
+      expect(opts.cancelId).toBe(1)
+    }
+  })
+  it('the dialogs are translated (zh, th)', async () => {
+    showMessageBox.mockResolvedValue({ response: 1 })
+    await call(IpcChannels.AppSetLocale, 'zh')
+    await call(IpcChannels.AgentEarUnpair)
+    await call(IpcChannels.AppSetLocale, 'th')
+    await call(IpcChannels.AgentEarUnpair)
+    await call(IpcChannels.AppSetLocale, 'en')
+    const [zh, th] = showMessageBox.mock.calls.map((c) => c.at(-1) as { message: string; detail: string })
+    expect(zh!.message).toContain('解除')
+    expect(zh!.detail).toContain('重新配对')
+    expect(th!.message).toContain('ยกเลิกการจับคู่')
+    expect(th!.detail).toContain('จับคู่ใหม่')
+  })
+  it.each([
+    [404, 'not_found', 404, 'not_paired'],
+    [403, 'presence_required', 403, 'forbidden'],
+    [401, 'unauthorized', 403, 'forbidden'],
+    [500, 'internal', 502, 'daemon_error'],
+    [400, 'invalid_request', 502, 'daemon_error'],
+  ])('daemon %i %s -> stable error code', async (status, code, wantStatus, wantCode) => {
+    attachedFailure = { status, code }
+    showMessageBox.mockResolvedValue({ response: 0 })
+    for (const res of [await call(IpcChannels.AgentEarSetEnabled, false), await call(IpcChannels.AgentEarUnpair)]) {
+      expect(res.ok).toBe(false)
+      expect(res.status).toBe(wantStatus)
+      expect(res.data.error.code).toBe(wantCode)
+      expect(typeof res.data.error.message).toBe('string')
+    }
+  })
+  it('daemon unreachable -> backend error code passes through, never a raw throw', async () => {
+    const saved = endpoint.port
+    endpoint.port = 1
+    try {
+      const res = await call(IpcChannels.AgentEarUnpair)
+      expect(res.ok).toBe(false)
+      expect(['proxy_failed', 'backend_not_ready', 'timeout']).toContain(res.data.error.code)
+      expect(showMessageBox).not.toHaveBeenCalled()
+    } finally {
+      endpoint.port = saved
+    }
+  })
+  it('concurrent calls: one dialog, the rest are busy at once and send nothing', async () => {
+    let release!: (v: { response: number }) => void
+    showMessageBox.mockReturnValue(new Promise((r) => { release = r }))
+    const first = call(IpcChannels.AgentEarUnpair)
+    const second = call(IpcChannels.AgentEarUnpair)
+    const third = call(IpcChannels.AgentEarSetEnabled, false)
+    const fourth = call(IpcChannels.OsModuleSetEnabled, 'sin90', true)
+    for (const p of [second, third, fourth]) expect((await p).data.error.code).toBe('busy')
+    await vi.waitFor(() => expect(showMessageBox).toHaveBeenCalledTimes(1))
+    release({ response: 0 })
+    expect((await first).ok).toBe(true)
+    expect(showMessageBox).toHaveBeenCalledTimes(1)
+    expect(seen.map((s) => [s.method, s.url])).toEqual([['DELETE', '/api/v1/attached/agentear']])
+    // Released afterwards.
+    showMessageBox.mockResolvedValue({ response: 1 })
+    expect((await call(IpcChannels.AgentEarSetEnabled, true)).data.error.code).toBe('cancelled')
   })
 })
 
@@ -362,30 +556,32 @@ describe('A4 oMLX IPC hardening', () => {
   })
 })
 
-describe('ModulesEnable/Disable id validation', () => {
-  it.each(['..', 'a/../b', '', 'x y', '.'])('%j is refused without touching the daemon', async (id) => {
-    for (const ch of [IpcChannels.ModulesEnable, IpcChannels.ModulesDisable]) {
-      expect(await call(ch, id)).toEqual({ ok: false })
-    }
-    expect(seen).toHaveLength(0)
-  })
-  it('an ordinary id is forwarded', async () => {
-    await call(IpcChannels.ModulesEnable, 'hello-1.2')
-    expect(seen[0]?.url).toBe('/api/modules/hello-1.2/enable')
-  })
-})
+// The node-daemon-era `modules:*` IPC (A5 on main) was deleted outright by
+// REV-01 on ab/core: its tests went with the handlers.
 
-describe('A5 node-daemon module IPC is retired', () => {
-  const notSupported = { error: { code: 'not_supported', message: 'node-daemon only' } }
-  it.each([
-    [IpcChannels.ModulesList, []],
-    [IpcChannels.ModulesDiscover, [{}]],
-    [IpcChannels.ModulesInstall, ['@x/y']],
-    [IpcChannels.ModulesUninstall, ['@x/y', 'y']],
-  ])('%s returns not_supported without touching the daemon', async (channel, args) => {
-    const res = await call(channel, ...(args as unknown[]))
-    expect(res).toEqual(notSupported)
+describe('D1 navigation preferences IPC', () => {
+  it('reads defaults, persists valid preferences and recovers from a damaged file', async () => {
+    expect(await call(IpcChannels.NavPrefsGet)).toEqual({ pinned: ['documents', 'design', 'create'], slotCount: 3, showOverview: true })
+    const prefs = { pinned: ['voice'], slotCount: 2, showOverview: false }
+    await call(IpcChannels.NavPrefsSet, prefs)
+    expect(await call(IpcChannels.NavPrefsGet)).toEqual(prefs)
+    await expect(call(IpcChannels.NavPrefsSet, { pinned: [2] })).rejects.toThrow('Invalid navigation preferences')
+    expect(await call(IpcChannels.NavPrefsGet)).toEqual(prefs)
+    fs.writeFileSync(path.join(settingsDir, 'ui-prefs.json'), 'broken')
+    expect((await call(IpcChannels.NavPrefsGet)).slotCount).toBe(3)
     expect(seen).toHaveLength(0)
+  })
+
+  it('allows only read-only manifest discovery through the proxy', async () => {
+    expect((await call(IpcChannels.BackendProxy, { method: 'GET', path: '/api/modules' })).ok).toBe(true)
+    expect(seen).toMatchObject([{ method: 'GET', url: '/api/modules' }])
+  })
+
+  it('refuses preference changes from an untrusted frame', async () => {
+    const write = handlers.get(IpcChannels.NavPrefsSet)
+    expect(write).toBeDefined()
+    await expect(Promise.resolve().then(() => write?.({ senderFrame: { url: 'https://evil.example' } }, { pinned: [], slotCount: 1, showOverview: false }))).rejects.toThrow()
+    expect(fs.existsSync(path.join(settingsDir, 'ui-prefs.json'))).toBe(false)
   })
 })
 
@@ -394,6 +590,31 @@ describe('backend:endpoint hands the renderer the port only (KB-HOST-01 PR-A1)',
     const result = await call(IpcChannels.BackendEndpoint)
     expect(result).toEqual({ port: endpoint.port })
     expect(JSON.stringify(result)).not.toContain(endpoint.token)
+  })
+})
+
+describe('the generic backend proxy never reaches the presence channel (CORE-2 AgentEar S3)', () => {
+  it.each([
+    ['GET', '/api/v1/presence/challenges/next?wait=25'],
+    ['POST', '/api/v1/presence/challenges/abc123'],
+    ['GET', '/api/v1/presence'],
+    ['GET', '/API/v1/Presence/challenges/next'],
+    ['GET', '/api/v1/./presence/challenges/next'],
+    ['GET', '/api/v1/models/../presence/challenges/next'],
+    ['GET', '/api/v1//presence/challenges/next'],
+    ['GET', '/api/v1/%70resence/challenges/next'],
+    ['POST', '/api/v1/presence%2Fchallenges%2Fabc'],
+    ['POST', '/api/v1\\presence/challenges/abc'],
+    ['POST', '/presence/challenges/abc'],
+  ] as const)('refuses %s %s without sending it', async (method, path) => {
+    const res = await call(IpcChannels.BackendProxy, { method, path })
+    expect(res.status).toBe(403)
+    expect(JSON.stringify(res.data)).toContain('presence_channel_private')
+    expect(seen).toHaveLength(0)
+  })
+
+  it.each(['/api/v1/presences', '/api/v1/sessions?next=/api/v1/presence/x', '/api/v1/models'])('does not flag %s', (path) => {
+    expect(reachesPresenceChannel(path)).toBe(false)
   })
 })
 
@@ -419,5 +640,158 @@ describe('the generic backend proxy never reaches the host interface (KB-HOST-01
 
   it.each(['/api/v1/hosts', '/api/v1/sessions?next=/api/v1/host/x', '/api/v1/tool-overrides/foo%'])('still proxies %s', async (path) => {
     expect(reachesHostInterface(path)).toBe(false)
+  })
+})
+
+
+describe('oMLX 401 and the key from ~/.omlx/settings.json', () => {
+  const SECRET = 'sk-omlx-from-settings-9f3a'
+  const url = () => `http://127.0.0.1:${endpoint.port}`
+  const writeSettings = (obj: unknown, mode = 0o600) => {
+    fs.writeFileSync(settingsFile, JSON.stringify(obj), { mode })
+    fs.chmodSync(settingsFile, mode)
+  }
+  const goodSettings = () => ({ auth: { api_key: SECRET }, server: { host: '127.0.0.1', port: endpoint.port } })
+
+  it('OmlxModels on 401 reports authRequired (running, needs a key), not a generic failure', async () => {
+    modelsRequireKey = 'right-key'
+    const res = await call(IpcChannels.OmlxModels, url(), '')
+    expect(res).toMatchObject({ ok: false, authRequired: true })
+    const wrong = await call(IpcChannels.OmlxModels, url(), 'wrong-key')
+    expect(wrong).toMatchObject({ ok: false, authRequired: true })
+    const right = await call(IpcChannels.OmlxModels, url(), 'right-key')
+    expect(right).toMatchObject({ ok: true, models: ['m1'] })
+    expect(right.authRequired).toBeUndefined()
+  })
+
+  it('a server that is simply down is not reported as authRequired', async () => {
+    const res = await call(IpcChannels.OmlxModels, 'http://127.0.0.1:1', '')
+    expect(res).toMatchObject({ ok: false })
+    expect(res.authRequired).toBeUndefined()
+  })
+
+  it('detect: keyed server and no settings file -> authRequired with the url', async () => {
+    modelsRequireKey = SECRET
+    const res = await call(IpcChannels.OmlxDetect)
+    expect(res).toEqual({ authRequired: true, url: url() })
+    expect(seen.length).toBeGreaterThan(0)
+    expect(seen.every((r) => r.url === '/v1/models' && r.auth === undefined)).toBe(true)
+  })
+
+  it('detect: uses the settings.json key, connects, and the key is NOT in the IPC result or any log', async () => {
+    modelsRequireKey = SECRET
+    writeSettings(goodSettings())
+    const spies = (['log', 'info', 'warn', 'error', 'debug'] as const).map((m) => vi.spyOn(console, m).mockImplementation(() => {}))
+    try {
+      const res = await call(IpcChannels.OmlxDetect)
+      expect(res).toMatchObject({ url: url(), models: ['m1'], apiKey: '' })
+      expect(JSON.stringify(res)).not.toContain(SECRET)
+      // the key really was sent to the verified origin (and only as a header)
+      expect(seen.some((r) => r.auth === `Bearer ${SECRET}`)).toBe(true)
+      expect(seen.every((r) => !(r.url ?? '').includes(SECRET) && !r.body.includes(SECRET))).toBe(true)
+
+      // follow-up calls the renderer makes with an empty key still work, still return no key
+      const models = await call(IpcChannels.OmlxModels, url(), '')
+      expect(models).toMatchObject({ ok: true, models: ['m1'] })
+      expect(JSON.stringify(models)).not.toContain(SECRET)
+      const warm = await call(IpcChannels.OmlxWarmup, url(), '', 'm1')
+      expect(JSON.stringify(warm)).not.toContain(SECRET)
+      const llm = await call(IpcChannels.LlmStatus)
+      expect(JSON.stringify(llm)).not.toContain(SECRET)
+
+      for (const spy of spies) {
+        expect(JSON.stringify(spy.mock.calls)).not.toContain(SECRET)
+      }
+    } finally {
+      spies.forEach((spy) => spy.mockRestore())
+    }
+  })
+
+  it('the key goes only to the exact address settings.json names (not localhost, not another port)', async () => {
+    modelsRequireKey = SECRET
+    writeSettings(goodSettings())
+    const res = await call(IpcChannels.OmlxModels, `http://localhost:${endpoint.port}`, '')
+    expect(res).toMatchObject({ ok: false, authRequired: true })
+    expect(seen.length).toBeGreaterThan(0)
+    expect(seen.every((r) => r.auth === undefined)).toBe(true)
+  })
+
+  it('a rotated key is used at once; a removed settings file stops it being sent', async () => {
+    modelsRequireKey = 'k2'
+    writeSettings({ auth: { api_key: 'k1' }, server: { port: endpoint.port } })
+    expect(await call(IpcChannels.OmlxModels, url(), '')).toMatchObject({ ok: false, authRequired: true })
+    writeSettings({ auth: { api_key: 'k2' }, server: { port: endpoint.port } })
+    expect(await call(IpcChannels.OmlxModels, url(), '')).toMatchObject({ ok: true })
+    fs.rmSync(settingsFile)
+    seen = []
+    expect(await call(IpcChannels.OmlxModels, url(), '')).toMatchObject({ ok: false, authRequired: true })
+    expect(seen.length).toBeGreaterThan(0)
+    expect(seen.every((r) => r.auth === undefined)).toBe(true)
+  })
+
+  it('a server that echoes the key back as a model id cannot hand it to the renderer', async () => {
+    reflectAuthAsModel = true
+    writeSettings(goodSettings())
+    const models = await call(IpcChannels.OmlxModels, url(), '')
+    expect(models).toMatchObject({ ok: true, models: ['m1'] })
+    const detect = await call(IpcChannels.OmlxDetect)
+    expect(JSON.stringify([models, detect])).not.toContain(SECRET)
+  })
+
+  it.each(['base64', 'base64url', 'hex'] as const)('拦截模型 id 中的 %s 编码 key', async (encoding) => {
+    const key = 'sk-omlx-~?'
+    reflectAuthAsModel = true
+    reflectedKeyEncoding = encoding
+    writeSettings({ ...goodSettings(), auth: { api_key: key } })
+    const models = await call(IpcChannels.OmlxModels, url(), '')
+    expect(seen.some((r) => r.auth === `Bearer ${key}`)).toBe(true)
+    expect(models).toMatchObject({ ok: true, models: ['m1'] })
+    const detect = await call(IpcChannels.OmlxDetect)
+    expect(detect).toMatchObject({ models: ['m1'] })
+    expect(JSON.stringify([models, detect])).not.toContain(Buffer.from(key).toString(encoding))
+  })
+
+  it.each([
+    ['group/world writable', () => writeSettings(goodSettings(), 0o666)],
+    ['no api_key', () => writeSettings({ auth: {}, server: { port: endpoint.port } })],
+    ['empty api_key', () => writeSettings({ auth: { api_key: '  ' }, server: { port: endpoint.port } })],
+    ['control chars in key', () => writeSettings({ auth: { api_key: 'a\r\nX-Evil: 1' }, server: { port: endpoint.port } })],
+    ['localhost by name', () => writeSettings({ auth: { api_key: SECRET }, server: { host: 'localhost', port: endpoint.port } })],
+    ['non-loopback host', () => writeSettings({ auth: { api_key: SECRET }, server: { host: '192.168.2.32', port: endpoint.port } })],
+    ['malformed JSON', () => fs.writeFileSync(settingsFile, '{nope', { mode: 0o600 })],
+  ])('settings.json ignored (%s): key never sent, result is authRequired', async (_name, setup) => {
+    modelsRequireKey = SECRET
+    setup()
+    const res = await call(IpcChannels.OmlxDetect)
+    expect(res).toMatchObject({ authRequired: true, url: url() })
+    expect(seen.length).toBeGreaterThan(0)
+    expect(seen.every((r) => r.auth === undefined)).toBe(true)
+  })
+
+  it('settings.json that is a symlink is ignored', async () => {
+    modelsRequireKey = SECRET
+    const real = path.join(settingsDir, 'real.json')
+    fs.writeFileSync(real, JSON.stringify(goodSettings()), { mode: 0o600 })
+    fs.symlinkSync(real, settingsFile)
+    const res = await call(IpcChannels.OmlxDetect)
+    expect(res).toMatchObject({ authRequired: true, url: url() })
+    expect(seen.length).toBeGreaterThan(0)
+    expect(seen.every((r) => r.auth === undefined)).toBe(true)
+    fs.rmSync(real)
+  })
+})
+
+
+describe('app:set-locale', () => {
+  it('switches the main-process language for dialogs, ignoring junk', async () => {
+    const { getMainLocale, resetMainLocaleForTest } = await import('../main-i18n')
+    resetMainLocaleForTest()
+    expect(getMainLocale()).toBe('en')
+    await call(IpcChannels.AppSetLocale, 'zh')
+    expect(getMainLocale()).toBe('zh')
+    await call(IpcChannels.AppSetLocale, { evil: true })
+    await call(IpcChannels.AppSetLocale, 'fr')
+    expect(getMainLocale()).toBe('zh')
+    resetMainLocaleForTest()
   })
 })

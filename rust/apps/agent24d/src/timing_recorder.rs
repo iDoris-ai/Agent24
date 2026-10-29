@@ -181,6 +181,10 @@ pub fn timing_error_kind(e: &ModelError) -> &'static str {
         ModelError::Unavailable(_) => "unavailable",
         ModelError::Provider(_) => "provider_error",
         ModelError::Rejected { .. } => "rejected",
+        ModelError::IdorisHeadroomConfirmationRequired { .. } => {
+            "idoris_headroom_confirmation_required"
+        }
+        ModelError::IdorisSupervisorBusy => "idoris_supervisor_busy",
         ModelError::Cancelled => "cancelled",
     }
 }

@@ -137,6 +137,17 @@ describe('CreativePage — on-demand iDoris Design component', () => {
     expect(screen.queryByRole('button', { name: '下载' })).toBeNull()
   })
 
+  it('no runtime and no downloadable component -> neutral not-installed note, no env var, no retry', async () => {
+    openDesignComponentStatus.mockResolvedValue({ state: 'unavailable', reason: 'no manifest baked' })
+    creativeShow.mockResolvedValue({ ok: false, notInstalled: true, error: 'Open Design runtime not found; set A24_OPEN_DESIGN_DIR or package resources/open-design' })
+    render(<CreativePage />)
+
+    expect(await screen.findByText('Design 组件未安装（按需下载，本版暂未开放）。')).toBeTruthy()
+    expect(screen.queryByText(/A24_OPEN_DESIGN_DIR/)).toBeNull()
+    expect(screen.queryByText(/暂不可用/)).toBeNull()
+    expect(screen.queryByRole('button', { name: '重试' })).toBeNull()
+  })
+
   it('drives download -> install click -> progress -> installed, then starts Creative', async () => {
     openDesignComponentStatus.mockResolvedValue({ state: 'not-installed', size: 10 * 1024 * 1024 })
     // install() only resolves once the (simulated) download/verify/extract

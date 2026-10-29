@@ -2,6 +2,11 @@ import { defineMessages } from '../i18n'
 
 export const chatMessages = defineMessages({
   en: {
+    'headroom.explanation': 'iDoris needs to use memory reserved for the system to load this model. This may slow down your computer.',
+    'headroom.confirm': 'Load anyway',
+    'headroom.cancel': 'Cancel',
+    'status.notSent': 'Not sent',
+    'reply.supervisorBusy': 'iDoris is busy loading this model. Please try again shortly.',
     'welcome.subtitle': 'Your local AI assistant. Your data stays on this device.',
     'suggestion.analyze': 'Help me analyze some text',
     'suggestion.summarize': 'Summarize this article in Chinese',
@@ -20,6 +25,11 @@ export const chatMessages = defineMessages({
     'latency.firstToken': 'First token {time}', 'latency.total': 'Total {time}',
   },
   zh: {
+    'headroom.explanation': 'iDoris 需要占用为系统保留的内存余量才能加载这个模型，可能让电脑变慢。',
+    'headroom.confirm': '仍然加载',
+    'headroom.cancel': '取消',
+    'status.notSent': '未发送',
+    'reply.supervisorBusy': 'iDoris 正在加载这个模型，请稍后重试。',
     'welcome.subtitle': '你的本地 AI 助理，数据不离机',
     'suggestion.analyze': '帮我分析一段文字',
     'suggestion.summarize': '用中文总结这篇文章',
@@ -38,6 +48,11 @@ export const chatMessages = defineMessages({
     'latency.firstToken': '首字 {time}', 'latency.total': '总计 {time}',
   },
   th: {
+    'headroom.explanation': 'iDoris ต้องใช้หน่วยความจำที่สำรองไว้สำหรับระบบเพื่อโหลดโมเดลนี้ ซึ่งอาจทำให้คอมพิวเตอร์ของคุณช้าลง',
+    'headroom.confirm': 'โหลดต่อไป',
+    'headroom.cancel': 'ยกเลิก',
+    'status.notSent': 'ยังไม่ได้ส่ง',
+    'reply.supervisorBusy': 'iDoris กำลังโหลดโมเดลนี้ โปรดลองอีกครั้งในอีกสักครู่',
     'welcome.subtitle': 'ผู้ช่วย AI ในเครื่องของคุณ ข้อมูลอยู่บนอุปกรณ์นี้',
     'suggestion.analyze': 'ช่วยวิเคราะห์ข้อความนี้',
     'suggestion.summarize': 'สรุปบทความนี้เป็นภาษาจีน',

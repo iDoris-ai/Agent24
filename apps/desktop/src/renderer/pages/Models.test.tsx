@@ -9,7 +9,6 @@ describe('ModelsPage', () => {
   beforeEach(() => {
     window.agent24 = {
       backendProxy: vi.fn().mockResolvedValue({ ok: false, status: 503, data: null }),
-      idorisStatus: vi.fn().mockResolvedValue({ state: 'unavailable', reason: 'handoff-missing' }),
     } as never
   })
 
@@ -60,7 +59,6 @@ describe('ModelsPage', () => {
           default_model: 'Qwen3-8B-4bit',
         },
       }),
-      idorisStatus: vi.fn().mockResolvedValue({ state: 'unavailable', reason: 'handoff-missing' }),
     } as never
 
     render(<ModelsPage />)
@@ -74,29 +72,10 @@ describe('ModelsPage', () => {
     expect(screen.queryByText('oMLX 未运行 — 启动后此处显示实时模型状态')).not.toBeInTheDocument()
   })
 
-  it('renders the frozen iDoris Admin v0 status without exposing credentials', async () => {
-    window.agent24 = {
-      backendProxy: vi.fn().mockResolvedValue({ ok: false, status: 503, data: null }),
-      idorisStatus: vi.fn().mockResolvedValue({
-        state: 'available',
-        status: {
-          status: 'ok', service: 'idoris', version: '1.2.3', contract_version: 'admin-v0', instance_id: 'instance-1',
-          components: 4, runtimes: 2, subscriptions: 0, budget_configured: true, audit_configured: true,
-          capacity: { state: 'observed', entries: [] },
-        },
-        backends: [
-          { provider_id: 'omlx-local', locality: 'loopback', form: 'http_service', lifecycle_runtime_bound: true },
-          { provider_id: 'llama-local', locality: 'loopback', form: 'spawn_cli', lifecycle_runtime_bound: true },
-        ],
-        models: { sources: [
-          { provider_id: 'omlx-local', source: 'http_models_endpoint', state: 'observed', models: ['qwen3-8b', 'bge-m3'] },
-          { provider_id: 'subscription', source: 'subscription_registration', state: 'configured', models: ['remote-coding'] },
-        ] },
-      }),
-    } as never
+  it('mounts the reusable iDoris daemon panel', async () => {
     render(<ModelsPage />)
-    expect(await screen.findByTestId('idoris-status-available')).toHaveTextContent('v1.2.3 · 4 个组件 · 2 个运行时 · 容量 已观测')
-    expect(screen.getByTestId('idoris-status-resources')).toHaveTextContent('2 个后端 · 3 个模型')
+    await waitFor(() => expect(window.agent24.backendProxy).toHaveBeenCalledWith({ method: 'GET', path: '/api/v1/idoris/status' }))
+    expect(screen.getByRole('heading', { name: '本地模型（iDoris）' })).toBeInTheDocument()
   })
 })
 
@@ -104,7 +83,6 @@ describe('ModelsPage English default', () => {
   it('shows the English page title', () => {
     window.agent24 = {
       backendProxy: vi.fn().mockResolvedValue({ ok: false, status: 503, data: null }),
-      idorisStatus: vi.fn().mockResolvedValue({ state: 'unavailable', reason: 'handoff-missing' }),
     } as never
     render(<ModelsPage />)
     expect(screen.getByText('Model management')).toBeInTheDocument()

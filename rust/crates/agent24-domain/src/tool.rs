@@ -539,7 +539,6 @@ impl ModuleToolRegistry {
                 && view.operation_available(module, operation).await
                 && view.has_current_consent(module, operation).await
                 && view.outbound_gate_ready(module, operation).await
-                && !view.blocked_by_remote_tier_guard(module, operation).await
             {
                 adverts.push(ModuleToolAdvert {
                     full_name: Self::full_name(module, operation),
@@ -642,15 +641,17 @@ impl ModuleToolAdvert {
 }
 
 /// The per-`(module, operation)` gates a host must satisfy before a
-/// registered tool is advertised to the model (ADR-K1-01 §2.2; jason's
-/// 2026-10-08 ruling point 5). [`ModuleToolRegistry::adverts`] queries this
-/// trait fresh on every call, for every registered tool — nothing cached.
+/// registered tool is advertised to the model (ADR-K1-01 §2.2).
+/// [`ModuleToolRegistry::adverts`] queries this trait fresh on every call, for
+/// every registered tool — nothing cached.
 ///
 /// Every gate is awaited fresh for every registered tool. Defaults fail closed;
 /// agent24d supplies live supervisor state, registered manifest operations,
-/// ConsentGate lookups, and the remote-tier/document guard. Gate 5 only narrows
-/// what gates 1-4 allow. Gate 6 also withholds tools until K1-5.3 invokes
-/// through the live egress gate.
+/// ConsentGate lookups and the outbound gate. Gate 6 also withholds tools
+/// until K1-5.3 invokes through the live egress gate. Gate 5, the
+/// transitional remote-tier/document guard of jason's 2026-10-08 ruling point
+/// 5, was removed once K1-6a and K1-6b were accepted (K1-6b.5e, ADR-K1-02
+/// §2.5).
 #[async_trait::async_trait]
 pub trait ModuleToolAdvertView: Send + Sync {
     /// Gates 1+2 (ADR-K1-01 §2.2): `module` is registered and its current
@@ -687,16 +688,6 @@ pub trait ModuleToolAdvertView: Send + Sync {
     async fn outbound_gate_ready(&self, _module: &str, _operation: &str) -> bool {
         false
     }
-
-    /// Gate 5 — jason's 2026-10-08 ruling point 5 (ADR-K1-01 §2.1, §4.4):
-    /// `true` for `(module, operation)` withholds that tool even if gates
-    /// 1-4 pass, until K1-6a AND K1-6b are BOTH accepted. This crate has no
-    /// "document" domain of its own (§0 forbids adding one); a host wiring a
-    /// real check owns both "is this a Documenting operation" and "does a
-    /// remote model tier exist" and combines them itself. There is
-    /// intentionally no default: the host must explicitly implement this
-    /// check, and return `true` whenever the ruling requires withholding.
-    async fn blocked_by_remote_tier_guard(&self, module: &str, operation: &str) -> bool;
 }
 
 #[cfg(test)]
@@ -958,7 +949,6 @@ mod tests {
         module_ready: bool,
         operation_available: bool,
         authorized: bool,
-        remote_tier_blocked: bool,
         outbound_ready: bool,
     }
 
@@ -968,7 +958,6 @@ mod tests {
                 module_ready: true,
                 operation_available: true,
                 authorized: true,
-                remote_tier_blocked: false,
                 outbound_ready: true,
             }
         }
@@ -991,22 +980,14 @@ mod tests {
         async fn outbound_gate_ready(&self, _module: &str, _operation: &str) -> bool {
             self.outbound_ready
         }
-
-        async fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
-            self.remote_tier_blocked
-        }
     }
 
-    /// Relies ONLY on gates 1-4's fail-closed defaults: gate 5 answers
-    /// "not blocked" on purpose, so `the_default_trait_advertises_nothing`
-    /// proves gates 1-3 alone keep everything unadvertised (#773 review).
+    /// Relies ONLY on the gates' fail-closed defaults, so
+    /// `the_default_trait_advertises_nothing` proves they alone keep
+    /// everything unadvertised (#773 review).
     struct NoopView;
     #[async_trait::async_trait]
-    impl ModuleToolAdvertView for NoopView {
-        async fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
-            false
-        }
-    }
+    impl ModuleToolAdvertView for NoopView {}
 
     fn registry_with_one_tool() -> ModuleToolRegistry {
         let mut reg = ModuleToolRegistry::new();
@@ -1102,19 +1083,6 @@ mod tests {
         assert!(reg.adverts(&view).await.is_empty());
     }
 
-    // ---- jason's 2026-10-08 ruling point 5: the remote-tier/document guard
-    // narrows what gates 1-4 already allowed; it never widens it.
-
-    #[tokio::test]
-    async fn the_remote_tier_guard_withholds_a_tool_even_when_otherwise_fully_authorized() {
-        let reg = registry_with_one_tool();
-        let view = TestView {
-            remote_tier_blocked: true,
-            ..TestView::all_pass()
-        };
-        assert!(reg.adverts(&view).await.is_empty());
-    }
-
     // ---- "动态状态变化时，后续通告应更新": adverts is recomputed fresh on
     // every call, so two calls against views that disagree see different
     // results without any cache to invalidate.
@@ -1140,30 +1108,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_view_with_remote_tier_guard_enabled_withholds_an_otherwise_ready_tool() {
-        let reg = registry_with_one_tool();
-
-        struct GuardedView;
-        #[async_trait::async_trait]
-        impl ModuleToolAdvertView for GuardedView {
-            async fn module_ready(&self, _module: &str) -> bool {
-                true
-            }
-            async fn operation_available(&self, _module: &str, _operation: &str) -> bool {
-                true
-            }
-            async fn has_current_consent(&self, _module: &str, _operation: &str) -> bool {
-                true
-            }
-            async fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
-                true
-            }
-        }
-
-        assert!(reg.adverts(&GuardedView).await.is_empty());
-    }
-
-    #[tokio::test]
     async fn only_the_tool_whose_module_passes_every_gate_is_advertised() {
         let mut reg = ModuleToolRegistry::new();
         reg.register_module("ready-module", &[declared("list-notes")])
@@ -1185,9 +1129,6 @@ mod tests {
             }
             async fn outbound_gate_ready(&self, _module: &str, _operation: &str) -> bool {
                 true
-            }
-            async fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
-                false
             }
         }
 

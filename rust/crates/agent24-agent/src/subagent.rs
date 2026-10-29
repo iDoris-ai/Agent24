@@ -113,6 +113,13 @@ impl ExplorerSubagent {
 
 #[async_trait]
 impl Tool for ExplorerSubagent {
+    /// Its sub-run has only `fs_read`, so what it reports is traceable the
+    /// same way (David 2026-10-26). What the parent put in its brief is
+    /// already tagged on the parent run.
+    fn result_source(&self) -> agent24_tools::ToolResultSource {
+        agent24_tools::ToolResultSource::ordinary(&self.info().name)
+    }
+
     fn requires_outbound_policy(&self) -> bool {
         false
     }
@@ -217,6 +224,7 @@ impl ExplorerSubagent {
                 response_format: None,
                 max_tokens: None,
                 disable_thinking: false,
+                idoris_headroom_confirmed: false,
                 temperature: None,
                 progress: None,
             };

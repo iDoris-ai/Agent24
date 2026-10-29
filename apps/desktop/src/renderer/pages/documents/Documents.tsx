@@ -21,6 +21,12 @@ const STATUS_LABELS: Record<string, 'status.queued' | 'status.running' | 'status
   interrupted: 'status.interrupted',
 }
 const STORAGE_UNAVAILABLE = 'storage-unavailable'
+const NOTE = { color: 'var(--muted)', fontSize: 13, margin: '8px 0' } as const
+/** The daemon has no documents route at all: the module is not
+ * installed (it ships outside the installer, ADR-DOC-01 D6). That is a state,
+ * not a failure; any other 404 (a document that is gone) stays an error. */
+const moduleNotInstalled = (res: { ok: boolean; status?: number; error?: { code?: string } }): boolean =>
+  !res.ok && res.status === 404 && res.error?.code === 'not_found'
 const ALERT = { color: '#e5534b', fontSize: 13, margin: '8px 0' } as const
 const CELL = { padding: '6px 12px 6px 0', borderBottom: '1px solid var(--border)', textAlign: 'left' } as const
 
@@ -34,6 +40,11 @@ export default function DocumentsPage() {
   const [loadingMore, setLoadingMore] = useState(false)
   const [listError, setListError] = useState<string | null>(null)
   const [unavailable, setUnavailable] = useState<string | null>(null)
+  // Each endpoint reports on its own; the notice is shown while either says
+  // "no route", and never hides another endpoint's real error.
+  const [capsMissing, setCapsMissing] = useState(false)
+  const [listMissing, setListMissing] = useState(false)
+  const notInstalled = capsMissing || listMissing
   const [open, setOpen] = useState<string | null>(null)
   // The title that opened the details, given focus back when they close;
   // the page's title if a reload has since taken its row away (a document
@@ -51,6 +62,12 @@ export default function DocumentsPage() {
     setMore(null) // no paging until the new first page is here
     const res = await api.request({ op: 'list' })
     if (gen !== generation.current) return
+    if (moduleNotInstalled(res)) {
+      setListMissing(true)
+      setListError(null)
+      return
+    }
+    setListMissing(false)
     if (!res.ok) {
       setListError(describeError(res))
       return
@@ -80,7 +97,9 @@ export default function DocumentsPage() {
     let live = true
     void api.request({ op: 'capabilities' }).then((res) => {
       if (!live) return
-      if (!res.ok) setUnavailable(describeError(res))
+      setCapsMissing(moduleNotInstalled(res))
+      if (moduleNotInstalled(res)) setUnavailable(null)
+      else if (!res.ok) setUnavailable(describeError(res))
       else setUnavailable(res.data.storage.state === 'ready' ? null : STORAGE_UNAVAILABLE)
     })
     return () => {
@@ -113,13 +132,20 @@ export default function DocumentsPage() {
         {t('title')}
       </div>
       <p style={{ color: 'var(--muted)', fontSize: 12 }}>{t('subtitle')}</p>
+      {notInstalled && (
+        <div role="status" style={NOTE}>
+          <div>{t('notInstalled.title')}</div>
+          <div>{t('notInstalled.guide')}</div>
+          <code>{t('notInstalled.command')}</code>
+        </div>
+      )}
       {unavailable && (
         <div role="alert" style={ALERT}>
           {unavailable === STORAGE_UNAVAILABLE ? t('storage.unavailable') : unavailable}
         </div>
       )}
       <div style={{ display: 'flex', gap: 12, alignItems: 'center', margin: '12px 0' }}>
-        <button className="btn btn-primary" onClick={() => void startImport(api)} disabled={importing}>
+        <button className="btn btn-primary" onClick={() => void startImport(api)} disabled={importing || notInstalled}>
           {t('import.button')}
         </button>
         {importing && !job && progress && progress.total > 0 && (

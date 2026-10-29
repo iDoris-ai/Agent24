@@ -46,7 +46,7 @@ pub async fn post_attached(state: State<AppState>, req: Request<Body>) -> Respon
 /// seam `os_routes::patch_os_at` uses, for the same reason: tests assert on
 /// exactly what did or did not get written without touching the real
 /// `~/.agent24/attached.json`.
-async fn post_attached_at(
+pub(crate) async fn post_attached_at(
     State(state): State<AppState>,
     req: Request<Body>,
     path: &Path,

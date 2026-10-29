@@ -15,7 +15,7 @@
 use agent24_domain::{EgressDestination, EgressGate, EgressPurpose, EgressRequest, EgressResource};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
@@ -116,13 +116,18 @@ struct Routed {
 /// usage ledger (`served_by`) and the LocalOnly tripwire both read.
 #[derive(Debug, Clone)]
 pub struct Served {
+    /// Validated gateway evidence; direct-provider calls have none.
+    pub idoris: Option<crate::IdorisEvidence>,
     pub provider: String,
     pub tier: Tier,
     pub response: CompletionResponse,
 }
 
+type GatewaySnapshot = Option<Result<Arc<crate::IdorisGateway>, String>>;
+
 /// Routes completions across tiered providers with a health/cooldown loop.
 pub struct ModelRouter {
+    idoris: Arc<RwLock<GatewaySnapshot>>,
     providers: Vec<Routed>,
     health: Mutex<HashMap<String, Health>>,
     base_cooldown: Duration,
@@ -148,7 +153,7 @@ const COOLDOWN_HARD_CAP: Duration = Duration::from_secs(24 * 3600);
 /// conservative: a Remote label on a host that happens to be local cannot
 /// leak); a domain: only `localhost`, exactly; anything that fails to parse,
 /// has no host, or is not http(s): not loopback.
-fn is_loopback_url(url: &str) -> bool {
+pub(crate) fn is_loopback_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
@@ -229,11 +234,41 @@ fn tier_label(t: Tier) -> &'static str {
 }
 
 impl ModelRouter {
-    #[must_use]
-    pub fn has_remote_tier(&self) -> bool {
-        self.providers
-            .iter()
-            .any(|routed| routed.tier == Tier::Remote)
+    /// Build from memory credentials; uses exactly the environment-path checks.
+    pub fn from_idoris(url: &str, key: zeroize::Zeroizing<String>) -> Result<Self, String> {
+        let gateway = crate::IdorisGateway::from_credentials(url, key)?;
+        let router = Self::with_defaults(Vec::new());
+        router.replace_idoris(gateway);
+        Ok(router)
+    }
+
+    /// Keep managed startup fail-closed until its supervisor and credentials are ready.
+    pub fn idoris_unavailable(reason: &str) -> Self {
+        let router = Self::with_defaults(Vec::new());
+        router.block_idoris(reason);
+        router
+    }
+
+    pub fn block_idoris(&self, reason: &str) {
+        *self.idoris.write().unwrap_or_else(|p| p.into_inner()) = Some(Err(reason.into()));
+    }
+
+    /// The caller validates health before publishing. Readers retain their own Arc.
+    pub fn replace_idoris(&self, gateway: crate::IdorisGateway) {
+        *self.idoris.write().unwrap_or_else(|p| p.into_inner()) = Some(Ok(Arc::new(gateway)));
+    }
+
+    fn gateway_snapshot(&self) -> GatewaySnapshot {
+        self.idoris
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub fn idoris_gateway(&self) -> Result<Arc<crate::IdorisGateway>, ModelError> {
+        self.gateway_snapshot()
+            .ok_or_else(|| ModelError::Unavailable("iDoris is not connected".into()))?
+            .map_err(ModelError::Provider)
     }
 
     /// Build from `(provider, tier)` pairs. Cooldown grows exponentially from
@@ -259,6 +294,7 @@ impl ModelRouter {
             .min(max_cooldown)
             .max(Duration::from_millis(1));
         Self {
+            idoris: Arc::new(RwLock::new(None)),
             providers: providers
                 .into_iter()
                 .map(|(provider, tier)| Routed { provider, tier })
@@ -280,6 +316,7 @@ impl ModelRouter {
     #[must_use]
     pub fn with_separate_health(&self) -> Self {
         Self {
+            idoris: self.idoris.clone(),
             providers: self
                 .providers
                 .iter()
@@ -319,6 +356,12 @@ impl ModelRouter {
     /// added by the daemon when configured; with only local providers, a
     /// Complex task simply falls back to them.
     pub fn from_env() -> Self {
+        if std::env::var_os("IDORIS_URL").is_some() {
+            let router = Self::with_defaults(Vec::new());
+            *router.idoris.write().unwrap_or_else(|p| p.into_inner()) =
+                Some(crate::IdorisGateway::from_env().map(Arc::new));
+            return router;
+        }
         let omlx_url =
             std::env::var("OMLX_URL").unwrap_or_else(|_| "http://127.0.0.1:8088".to_owned());
         let omlx_key = std::env::var("OMLX_API_KEY").unwrap_or_else(|_| "xiaobao8088".to_owned());
@@ -459,10 +502,27 @@ impl ModelRouter {
         req: &CompletionRequest,
         cancel: &CancellationToken,
     ) -> Result<Served, ModelError> {
-        self.complete_served_with_egress(
+        self.complete_served_with_request_id(profile, req, cancel, None)
+            .await
+    }
+
+    /// Carry an admitted lifecycle id on `X-iDoris-Trace-Id` when iDoris accepts it.
+    /// `X-iDoris-Request-Id` is a fresh idempotency key on every call, with or
+    /// without that id. A missing or rejected id omits the trace header.
+    /// Remote providers stay closed (deny-all egress); the iDoris gateway is
+    /// loopback-only, so it never needs an egress grant.
+    pub async fn complete_served_with_request_id(
+        &self,
+        profile: TaskProfile,
+        req: &CompletionRequest,
+        cancel: &CancellationToken,
+        request_id: Option<&str>,
+    ) -> Result<Served, ModelError> {
+        self.complete_served_inner(
             profile,
             req,
             cancel,
+            request_id,
             <dyn EgressGate>::deny_all(),
             Vec::new(),
             0,
@@ -481,6 +541,36 @@ impl ModelRouter {
         resources: Vec<EgressResource>,
         authorization_generation: u64,
     ) -> Result<Served, ModelError> {
+        self.complete_served_inner(
+            profile,
+            req,
+            cancel,
+            None,
+            gate,
+            resources,
+            authorization_generation,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_served_inner(
+        &self,
+        profile: TaskProfile,
+        req: &CompletionRequest,
+        cancel: &CancellationToken,
+        request_id: Option<&str>,
+        gate: std::sync::Arc<dyn EgressGate>,
+        resources: Vec<EgressResource>,
+        authorization_generation: u64,
+    ) -> Result<Served, ModelError> {
+        if let Some(gateway) = self.gateway_snapshot() {
+            return gateway
+                .as_ref()
+                .map_err(|e| ModelError::Provider(e.clone()))?
+                .complete(profile, req, cancel, request_id)
+                .await;
+        }
         let route = self.route(profile, Instant::now());
         if route.is_empty() {
             return Err(ModelError::Unavailable(match profile.privacy {
@@ -525,6 +615,7 @@ impl ModelRouter {
                 Ok(response) => {
                     self.record_success(r.provider.name());
                     return Ok(Served {
+                        idoris: None,
                         provider: r.provider.name().to_owned(),
                         tier: r.tier,
                         response,
@@ -581,6 +672,22 @@ impl ModelRouter {
         resources: Vec<EgressResource>,
         authorization_generation: u64,
     ) -> ModelInventory {
+        if let Some(gateway) = self.gateway_snapshot() {
+            let result = match &gateway {
+                Ok(gateway) => gateway.models(cancel).await,
+                Err(error) => Err(ModelError::Provider(error.clone())),
+            };
+            return match result {
+                Ok(models) => ModelInventory {
+                    models,
+                    failures: Vec::new(),
+                },
+                Err(error) => ModelInventory {
+                    models: Vec::new(),
+                    failures: vec![format!("idoris-local: {error}")],
+                },
+            };
+        }
         let mut inv = ModelInventory::default();
         for r in &self.providers {
             if r.tier == Tier::Remote {
@@ -720,6 +827,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            idoris_headroom_confirmed: false,
             temperature: None,
             progress: None,
         }
@@ -1060,6 +1168,103 @@ mod tests {
         );
     }
 
+    /// Completes under a gate that allows every request, with a valid cloud
+    /// grant: nothing but the LocalOnly exclusion in `tier_order` stands
+    /// between a task and a remote provider (K1-6b.5e prerequisite, #1209
+    /// PR-Daemon).
+    async fn complete_granted(
+        r: &ModelRouter,
+        privacy: Privacy,
+        complexity: Complexity,
+    ) -> Result<(String, CompletionResponse), ModelError> {
+        let (gate, resources) = authorized_test_scope();
+        r.complete_with_egress(
+            TaskProfile {
+                privacy,
+                complexity,
+            },
+            &req(),
+            &CancellationToken::new(),
+            gate,
+            resources,
+            1,
+        )
+        .await
+    }
+
+    /// With only a remote provider, the granting gate serves a task with no
+    /// privacy label (the control) and never a LocalOnly one.
+    #[tokio::test]
+    async fn a_granting_gate_never_serves_local_only_from_a_lone_remote() {
+        for complexity in [Complexity::Simple, Complexity::Complex] {
+            let remote = StubProvider::ok("remote");
+            let r = router(vec![(remote.clone(), Tier::Remote)]);
+            let (name, _) = complete_granted(&r, Privacy::Any, complexity)
+                .await
+                .unwrap();
+            assert_eq!(name, "remote", "{complexity:?}");
+            assert_eq!(remote.calls(), 1, "{complexity:?}");
+
+            let err = complete_granted(&r, Privacy::LocalOnly, complexity)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ModelError::Unavailable(_)),
+                "{complexity:?}: {err}"
+            );
+            assert_eq!(remote.calls(), 1, "{complexity:?}");
+        }
+    }
+
+    /// A local provider that fails does not hand a LocalOnly task to the
+    /// remote one the gate would let through.
+    #[tokio::test]
+    async fn a_granting_gate_never_serves_local_only_when_local_fails() {
+        for complexity in [Complexity::Simple, Complexity::Complex] {
+            let local = StubProvider::down("local");
+            let remote = StubProvider::ok("remote");
+            let r = router(vec![
+                (local.clone(), Tier::Local),
+                (remote.clone(), Tier::Remote),
+            ]);
+            let err = complete_granted(&r, Privacy::LocalOnly, complexity)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ModelError::Unavailable(_)),
+                "{complexity:?}: {err}"
+            );
+            assert_eq!(local.calls(), 1, "{complexity:?}");
+            assert_eq!(remote.calls(), 0, "{complexity:?}");
+        }
+    }
+
+    /// Nor does one cooling down after a failure, when no local provider is
+    /// left to try at all.
+    #[tokio::test]
+    async fn a_granting_gate_never_serves_local_only_while_local_cools_down() {
+        for complexity in [Complexity::Simple, Complexity::Complex] {
+            let local = StubProvider::down("local");
+            let remote = StubProvider::ok("remote");
+            let r = router(vec![
+                (local.clone(), Tier::Local),
+                (remote.clone(), Tier::Remote),
+            ]);
+            complete_granted(&r, Privacy::LocalOnly, complexity)
+                .await
+                .unwrap_err();
+            let err = complete_granted(&r, Privacy::LocalOnly, complexity)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ModelError::Unavailable(_)),
+                "{complexity:?}: {err}"
+            );
+            assert_eq!(local.calls(), 1, "{complexity:?}: cooling, not retried");
+            assert_eq!(remote.calls(), 0, "{complexity:?}");
+        }
+    }
+
     #[tokio::test]
     async fn local_only_with_cooled_down_local_still_never_uses_remote() {
         // Privacy × health: even when the ONLY local provider is in cooldown, a
@@ -1314,6 +1519,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            idoris_headroom_confirmed: false,
             temperature: None,
             progress: None,
         }
@@ -1402,6 +1608,7 @@ mod tests {
         };
         let req = CompletionRequest {
             disable_thinking: true,
+            idoris_headroom_confirmed: false,
             ..secret_request()
         };
         let _ = r.complete(profile, &req, &CancellationToken::new()).await;
@@ -1477,6 +1684,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            idoris_headroom_confirmed: false,
             temperature: None,
             progress: None,
         };
@@ -1609,6 +1817,47 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("local: local down"), "{msg}");
         assert!(msg.contains("remote: remote down"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn rejected_502_upstream_auth_failed_does_not_fall_through() {
+        struct AuthFailed;
+        #[async_trait]
+        impl ModelProvider for AuthFailed {
+            fn name(&self) -> &str {
+                "idoris"
+            }
+            async fn complete(
+                &self,
+                _req: &CompletionRequest,
+                _cancel: &CancellationToken,
+            ) -> Result<CompletionResponse, ModelError> {
+                Err(ModelError::Rejected {
+                    status: 502,
+                    message: "upstream_auth_failed".to_owned(),
+                })
+            }
+            async fn models(
+                &self,
+                _cancel: &CancellationToken,
+            ) -> Result<Vec<crate::Model>, ModelError> {
+                Ok(vec![])
+            }
+        }
+        let fallback = StubProvider::ok("remote");
+        let r = router(vec![
+            (Arc::new(AuthFailed), Tier::Local),
+            (fallback.clone(), Tier::Remote),
+        ]);
+        let err = r
+            .complete(TaskProfile::default(), &req(), &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ModelError::Rejected { status: 502, .. }),
+            "{err}"
+        );
+        assert_eq!(fallback.calls(), 0, "Rejected must not fall through");
     }
 
     #[tokio::test]

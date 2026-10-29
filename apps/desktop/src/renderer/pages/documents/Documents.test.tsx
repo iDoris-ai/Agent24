@@ -120,6 +120,32 @@ describe('DocumentsPage: the list', () => {
     expect(screen.getByText('还没有文档。')).toBeInTheDocument()
   })
 
+  it('module not installed (no v1 route): neutral note with install guide, import disabled, no red alert', async () => {
+    const noRoute = () => err(404, 'not_found', 'No v1 route')
+    mount({ capabilities: noRoute, lists: [noRoute] })
+    render(<DocumentsPage />)
+    expect(await screen.findByText('文档模块未安装')).toBeInTheDocument()
+    expect(screen.getByText(/agent24-documents\/README\.md/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: IMPORT.name })).toBeDisabled()
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByText(/No v1 route/)).toBeNull()
+  })
+
+  it('capabilities says no route but the list has a real error: the error is still shown', async () => {
+    mount({ capabilities: () => err(404, 'not_found', 'No v1 route'), lists: [() => err(500, 'internal', 'list exploded')] })
+    render(<DocumentsPage />)
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('list exploded'))
+    expect(screen.getByText('文档模块未安装')).toBeInTheDocument()
+  })
+
+  it('a real list error (500) is still shown as an alert and import stays enabled', async () => {
+    mount({ lists: [() => err(500, 'internal', 'boom')] })
+    render(<DocumentsPage />)
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('boom'))
+    expect(screen.queryByText('文档模块未安装')).toBeNull()
+    expect(screen.getByRole('button', { name: IMPORT.name })).toBeEnabled()
+  })
+
   it('a page from before a reload is dropped, not mixed into the new list', async () => {
     let releaseOld: () => void = () => {}
     mount({

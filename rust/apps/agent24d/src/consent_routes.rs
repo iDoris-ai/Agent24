@@ -84,20 +84,45 @@ async fn authorization_views(state: &AppState) -> Result<Vec<AuthorizationView>,
         .await
         .map_err(|err| Box::new(storage_error("list", err)))?;
     let now = Utc::now().to_rfc3339();
+    let cards = state.module_tool_cards.as_ref();
     let mut views = Vec::with_capacity(records.len());
     for record in records {
+        // As the gate judges a call (#1290): against the tool and the
+        // package as they are now. A tool not mounted, or of a module not on
+        // the grants protocol (never dispatched, §2.6), has neither; its own
+        // version and fingerprint still tell revoked, expired and denied
+        // apart, and a grant of it is stale.
+        let key = (record.module.clone(), record.op.clone());
+        let mounted = cards.and_then(|cards| {
+            let tool = cards.tools.get(&key).filter(|tool| tool.takes_grants)?;
+            Some((cards, tool))
+        });
+        let (version, fingerprint, running) = match mounted {
+            Some((cards, tool)) => (
+                tool.summary.module_version.clone(),
+                tool.summary.scope_fingerprint(),
+                (cards.artifact)(&record.module),
+            ),
+            None => (
+                record.module_version.clone(),
+                record.scope_fingerprint.clone(),
+                None,
+            ),
+        };
         let lookup = state
             .store
-            .lookup_module_consent(
-                &record.module,
-                &record.op,
-                &record.module_version,
-                &record.scope_fingerprint,
-                &now,
-            )
+            .lookup_module_consent(&record.module, &record.op, &version, &fingerprint, &now)
             .await
             .map_err(|err| Box::new(storage_error("resolve_status", err)))?;
         let status = match lookup {
+            agent24_store::ConsentLookup::Granted(granted)
+                if !agent24_policy::consent_gate::holds_for_package(
+                    granted.artifact.as_deref(),
+                    running.as_deref(),
+                ) =>
+            {
+                "stale"
+            }
             agent24_store::ConsentLookup::Granted(_) => "granted",
             agent24_store::ConsentLookup::Denied(_) => "denied",
             agent24_store::ConsentLookup::Revoked(_) => "revoked",
