@@ -58,6 +58,8 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('POST', '/api/v1/idoris/start'),
   r('POST', '/api/v1/idoris/stop'),
   r('GET', '/api/v1/health'),
+  // Optional UI manifests; daemons without this endpoint keep the static registry.
+  r('GET', '/api/modules'),
   r('GET', '/api/v1/models'),
   r('POST', '/api/v1/chat', CHAT_TIMEOUT_MS),
   r('GET', '/api/v1/usage'),

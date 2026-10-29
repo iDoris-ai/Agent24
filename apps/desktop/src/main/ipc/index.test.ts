@@ -15,7 +15,7 @@ const showMessageBox = vi.fn()
 const execFileMock = vi.fn()
 
 vi.mock('electron', () => ({
-  app: { getVersion: () => '0.0.0-test' },
+  app: { getVersion: () => '0.0.0-test', getPath: () => settingsDir },
   BrowserWindow: { fromWebContents: () => null },
   dialog: { showMessageBox: (...a: unknown[]) => showMessageBox(...a), showOpenDialog: vi.fn() },
   ipcMain: { handle: (channel: string, fn: (event: unknown, ...args: unknown[]) => unknown) => { handlers.set(channel, fn) } },
@@ -117,6 +117,7 @@ beforeEach(() => {
   reflectAuthAsModel = false
   reflectedKeyEncoding = null
   fs.rmSync(settingsFile, { force: true })
+  fs.rmSync(path.join(settingsDir, 'ui-prefs.json'), { force: true })
   seen = []
   showMessageBox.mockReset()
   execFileMock.mockReset()
@@ -145,7 +146,8 @@ describe('A1 backendProxy allowlist', () => {
     ['PATCH', '/api/v1/os/sin90'],
     ['POST', '/api/v1/os/sin90/stop'],
     ['GET', '/api/v1/not-a-route'],
-    ['GET', '/api/modules'],
+    ['POST', '/api/modules'],
+    ['GET', '/api/modules/install'],
     ['GET', '/api/v1/runs/../shutdown'],
     ['GET', '/api/v1/runs/%2e%2e/shutdown'],
   ]
@@ -388,6 +390,32 @@ describe('A4 oMLX IPC hardening', () => {
 
 // The node-daemon-era `modules:*` IPC (A5 on main) was deleted outright by
 // REV-01 on ab/core: its tests went with the handlers.
+
+describe('D1 navigation preferences IPC', () => {
+  it('reads defaults, persists valid preferences and recovers from a damaged file', async () => {
+    expect(await call(IpcChannels.NavPrefsGet)).toEqual({ pinned: ['documents', 'design', 'create'], slotCount: 3, showOverview: true })
+    const prefs = { pinned: ['voice'], slotCount: 2, showOverview: false }
+    await call(IpcChannels.NavPrefsSet, prefs)
+    expect(await call(IpcChannels.NavPrefsGet)).toEqual(prefs)
+    await expect(call(IpcChannels.NavPrefsSet, { pinned: [2] })).rejects.toThrow('Invalid navigation preferences')
+    expect(await call(IpcChannels.NavPrefsGet)).toEqual(prefs)
+    fs.writeFileSync(path.join(settingsDir, 'ui-prefs.json'), 'broken')
+    expect((await call(IpcChannels.NavPrefsGet)).slotCount).toBe(3)
+    expect(seen).toHaveLength(0)
+  })
+
+  it('allows only read-only manifest discovery through the proxy', async () => {
+    expect((await call(IpcChannels.BackendProxy, { method: 'GET', path: '/api/modules' })).ok).toBe(true)
+    expect(seen).toMatchObject([{ method: 'GET', url: '/api/modules' }])
+  })
+
+  it('refuses preference changes from an untrusted frame', async () => {
+    const write = handlers.get(IpcChannels.NavPrefsSet)
+    expect(write).toBeDefined()
+    await expect(Promise.resolve().then(() => write?.({ senderFrame: { url: 'https://evil.example' } }, { pinned: [], slotCount: 1, showOverview: false }))).rejects.toThrow()
+    expect(fs.existsSync(path.join(settingsDir, 'ui-prefs.json'))).toBe(false)
+  })
+})
 
 describe('backend:endpoint hands the renderer the port only (KB-HOST-01 PR-A1)', () => {
   it('returns exactly {port}, with no credential, while main holds one', async () => {

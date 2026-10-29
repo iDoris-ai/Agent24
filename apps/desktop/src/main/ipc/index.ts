@@ -5,6 +5,7 @@ import http from 'node:http'
 import https from 'node:https'
 import { execFile, type ChildProcess } from 'node:child_process'
 import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron'
+import { createNavPrefsStore } from '../nav-prefs'
 import { daemonCliEndpoint, daemonConnection, getBackendEndpoint } from '../backend-manager'
 import { findAllowedRoute, proxyError, proxyRequest, timeoutFor } from '../backend-proxy'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
@@ -377,6 +378,10 @@ export function registerIpcHandlers(options: {
   handle(IpcChannels.AppSetLocale, (_event, locale: unknown): void => {
     if (isMainLocale(locale)) setMainLocale(locale)
   })
+
+  const navPrefs = () => createNavPrefsStore(app.getPath('userData'))
+  handle(IpcChannels.NavPrefsGet, () => navPrefs().get())
+  handle(IpcChannels.NavPrefsSet, (_event, value: unknown) => navPrefs().set(value))
 
   handle(IpcChannels.AppPing, () => 'pong')
   handle(IpcChannels.AppVersion, () => app.getVersion())
