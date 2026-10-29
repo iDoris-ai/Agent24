@@ -172,13 +172,54 @@ describe('KnowledgeHost (KB-HOST-01 PR-B2b)', () => {
     await host.activate('b1', { endpoint: 'https://kb.example/api/v1', knowledgeBaseIds: ['kb-a'] })
     const body = JSON.stringify({ endpoint: 'https://kb.example/api/v1', knowledge_base_ids: ['kb-a'] })
     expect(daemon.sent[0]).toMatchObject({ method: 'PUT', path: B1, body })
-    expect(host.isWanted('b1')).toBe(true)
+    expect(host.isActive('b1')).toBe(true)
+    // A new daemon has not taken it until the replay lands.
+    let release = () => {}
+    daemon.respondWith(() => ({ status: 204 }))
     daemon.setConnection({ port: 2, authHeaders: { Authorization: 'Bearer t2' } })
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const transport = daemon.transport
+    const held: HostTransport = async (...args) => { await gate; return transport(...args) }
+    const replaying = new KnowledgeHost(store, { connection: daemon.connection, transport: held, clock: new SequenceClock(() => now), nowSeconds: () => NOW })
+    replaying.start()
+    void replaying.activate('b1', { endpoint: 'https://kb.example/api/v1', knowledgeBaseIds: ['kb-a'] })
+    expect(replaying.isActive('b1')).toBe(false)
+    release()
+    await vi.waitFor(() => expect(replaying.isActive('b1')).toBe(true))
     host.sync()
-    await vi.waitFor(() => expect(daemon.sent).toHaveLength(2))
-    expect(daemon.sent[1]).toMatchObject({ token: 'Bearer t2', method: 'PUT', path: B1, body })
+    await vi.waitFor(() => expect(daemon.sent.filter((r) => r.token === 'Bearer t2' && r.method === 'PUT' && r.body === body).length).toBeGreaterThan(0))
     await host.deactivate('b1')
-    expect(host.isWanted('b1')).toBe(false)
+    expect(host.isActive('b1')).toBe(false)
+  })
+
+  it('drops a binding at once, ahead of a refresh still waiting, which then sends nothing', async () => {
+    const host = makeHost()
+    host.start()
+    await store.put('b1', login('m'))
+    await host.activate('b1')
+    let release = () => {}
+    const pending = host.refresh('b1', () => new Promise((resolve) => { release = () => resolve(credential('late')) }))
+    const off = await host.deactivate('b1')
+    expect(off).toEqual({ ok: true })
+    expect(daemon.sent.at(-1)).toMatchObject({ method: 'DELETE', path: B1 })
+    release()
+    expect(await pending).toEqual({ ok: false, reason: 'binding_inactive' })
+    expect(daemon.sent.filter((r) => r.path === `${B1}/credential`)).toEqual([])
+  })
+
+  it('stops retrying a stale activation once the binding is dropped', async () => {
+    const host = makeHost()
+    host.start()
+    let calls = 0
+    daemon.respondWith((req) => {
+      if (req.method === 'PUT' && ++calls === 1) {
+        void host.deactivate('b1')
+        return { status: 409, code: 'stale_sequence' }
+      }
+      return { status: 204 }
+    })
+    expect(await host.activate('b1')).toEqual({ ok: false, reason: 'binding_inactive' })
+    expect(daemon.sent.filter((r) => r.method === 'PUT')).toHaveLength(1)
   })
 
   it('refuses a malformed binding id and a push for a binding it did not activate, sending nothing', async () => {

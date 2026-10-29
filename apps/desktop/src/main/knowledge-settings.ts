@@ -7,9 +7,14 @@
 // endpoint and no C.
 //
 // Turning Off takes effect at once, in memory and in the daemon, whether or
-// not the file is written; turning On takes effect only once it is on disk
-// (STATE I1/I2). Off never waits behind a refresh: the key is read from
-// memory, not fetched.
+// not the file is written, and voids every On or change still being saved;
+// turning On takes effect only once it is on disk (STATE I1/I2). Off never
+// waits behind a refresh (KnowledgeHost.deactivate). Saves are written in
+// call order.
+//
+// The key is kept with the endpoint it was given for, and used for that
+// endpoint only: a new address needs the key again, so a renderer cannot send
+// a saved key somewhere else.
 
 import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
@@ -109,6 +114,10 @@ export class KnowledgeController {
   private settings: KnowledgeSettings
   /** When the C last pushed for the binding expires, or 0 when none is. */
   private pushedUntil = 0
+  /** Bumped by every change; a change whose save finishes under a later
+   * number was overtaken and takes no effect. */
+  private version = 0
+  private saving: Promise<void> = Promise.resolve()
   private readonly nowSeconds: () => number
 
   constructor(
@@ -132,7 +141,7 @@ export class KnowledgeController {
 
   /** The binding a new run is to name, or none while Off or incomplete. */
   bindingForRun(): string | null {
-    return this.settings.enabled && this.complete() && this.host.isWanted(KNOWLEDGE_BINDING) ? KNOWLEDGE_BINDING : null
+    return this.settings.enabled && this.complete() && this.host.isActive(KNOWLEDGE_BINDING) ? KNOWLEDGE_BINDING : null
   }
 
   /** Saves the endpoint, the knowledge bases and, when given, a new key; the
@@ -141,37 +150,39 @@ export class KnowledgeController {
     const { endpoint, knowledgeBaseIds, apiKey } = input
     const keyOk = apiKey === undefined || (typeof apiKey === 'string' && /^[\x21-\x7e]{1,16384}$/.test(apiKey))
     if (!validEndpoint(endpoint) || !validKnowledgeBaseIds(knowledgeBaseIds) || !keyOk) return { ok: false, reason: 'invalid' }
+    const mine = ++this.version
     const next: KnowledgeSettings = { enabled: this.settings.enabled, endpoint, knowledgeBaseIds: [...knowledgeBaseIds] }
     try {
       if (typeof apiKey === 'string') {
-        await this.logins.put(KNOWLEDGE_BINDING, { profileId: KNOWLEDGE_BINDING, material: apiKey, unusable: false, temporary: false })
+        // The login names the endpoint it is for (`key()`).
+        await this.logins.put(KNOWLEDGE_BINDING, { profileId: endpoint, material: apiKey, unusable: false, temporary: false })
       }
-      await this.store.save(next)
+      await this.save(next)
     } catch {
       return { ok: false, reason: 'not_saved' }
     }
+    if (mine !== this.version) return { ok: false, reason: 'not_saved' }
     this.settings = next
     return this.apply()
   }
 
   /** Off at once, saved or not; On once saved. */
   async setEnabled(enabled: boolean): Promise<SettingsResult> {
+    const mine = ++this.version
     const next = { ...this.settings, knowledgeBaseIds: [...this.settings.knowledgeBaseIds], enabled }
     if (!enabled) {
       this.settings = next
+      const saved = this.save(next).then(() => true, () => false)
       const dropped = await this.apply()
-      try {
-        await this.store.save(next)
-      } catch {
-        return { ok: false, reason: 'not_saved' }
-      }
+      if (!(await saved)) return { ok: false, reason: 'not_saved' }
       return dropped
     }
     try {
-      await this.store.save(next)
+      await this.save(next)
     } catch {
       return { ok: false, reason: 'not_saved' }
     }
+    if (mine !== this.version) return { ok: false, reason: 'not_saved' }
     this.settings = next
     return this.apply()
   }
@@ -197,9 +208,20 @@ export class KnowledgeController {
     await this.push()
   }
 
+  /** Writes run one at a time, in call order. */
+  private save(settings: KnowledgeSettings): Promise<void> {
+    const run = this.saving.then(() => this.store.save(settings))
+    this.saving = run.catch(() => {})
+    return run
+  }
+
   private async push(): Promise<HostResult> {
     const expiresAt = this.nowSeconds() + CREDENTIAL_LIFETIME_S
-    const result = await this.host.refresh(KNOWLEDGE_BINDING, async (login) => ({ kind: 'api_key', value: login.material, expiresAt }))
+    const endpoint = this.settings.endpoint
+    const result = await this.host.refresh(KNOWLEDGE_BINDING, async (login) => {
+      if (login.profileId !== endpoint || this.settings.endpoint !== endpoint) throw new Error('key is for another endpoint')
+      return { kind: 'api_key', value: login.material, expiresAt }
+    })
     // Replayed by the host on a daemon not up yet.
     if (result.ok || result.reason === 'daemon_unavailable') this.pushedUntil = expiresAt
     return result
@@ -209,9 +231,10 @@ export class KnowledgeController {
     return validEndpoint(this.settings.endpoint) && validKnowledgeBaseIds(this.settings.knowledgeBaseIds) && this.key() !== null
   }
 
+  /** The saved key, if it was given for the endpoint in the settings. */
   private key(): string | null {
     const login = this.logins.list().get(KNOWLEDGE_BINDING)
-    return login && !login.unusable ? login.material : null
+    return login && !login.unusable && login.profileId === this.settings.endpoint ? login.material : null
   }
 }
 

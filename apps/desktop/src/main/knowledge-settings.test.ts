@@ -139,6 +139,53 @@ describe('KnowledgeController (M3)', () => {
     expect(sent.map((s) => s.path)).toEqual([`${BINDING}/credential`])
   })
 
+  it('never sends a saved key to a new endpoint: the new address needs the key again', async () => {
+    const c = make()
+    await c.configure(GOOD)
+    await c.setEnabled(true)
+    sent = []
+    expect(await c.configure({ endpoint: 'https://evil.example/api/v1', knowledgeBaseIds: ['kb-a'] })).toEqual({ ok: true })
+    expect(c.status()).toMatchObject({ hasKey: false, active: false })
+    expect(c.bindingForRun()).toBeNull()
+    // Incomplete: dropped, and no C pushed.
+    expect(sent.map((s) => [s.method, s.path])).toEqual([['DELETE', BINDING]])
+    await c.tick()
+    expect(sent.filter((s) => s.path.endsWith('/credential'))).toEqual([])
+  })
+
+  it('an On or a change still being saved cannot undo a later Off', async () => {
+    const c = make()
+    await c.configure(GOOD)
+    let release = () => {}
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const real = KnowledgeSettingsStore.prototype.save
+    const save = vi.spyOn(KnowledgeSettingsStore.prototype, 'save').mockImplementationOnce(async function (this: KnowledgeSettingsStore, s) {
+      await gate
+      return real.call(this, s)
+    })
+    const on = c.setEnabled(true)
+    const off = c.setEnabled(false)
+    release()
+    expect(await on).toEqual({ ok: false, reason: 'not_saved' })
+    expect(await off).toEqual({ ok: true })
+    expect(c.status().enabled).toBe(false)
+    expect(c.bindingForRun()).toBeNull()
+    // Written in call order: the file ends Off.
+    expect(make().status().enabled).toBe(false)
+    save.mockRestore()
+  })
+
+  it('names no binding for a run until the daemon on this connection has taken the activation', async () => {
+    const c = make()
+    await c.configure(GOOD)
+    const isActive = vi.spyOn(host, 'isActive').mockReturnValue(false)
+    await c.setEnabled(true)
+    expect(c.status()).toMatchObject({ enabled: true, active: false })
+    expect(c.bindingForRun()).toBeNull()
+    isActive.mockRestore()
+    expect(c.bindingForRun()).toBe(KNOWLEDGE_BINDING)
+  })
+
   it('keeps a later key without sending it anywhere but the daemon', async () => {
     const c = make()
     await c.configure(GOOD)

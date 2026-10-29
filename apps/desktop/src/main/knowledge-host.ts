@@ -90,6 +90,8 @@ export class KnowledgeHost {
   private readonly wanted = new Map<string, { endpoint: KnowledgeEndpoint | null; credential: KnowledgeCredential | null }>()
   private readonly locks = new Map<string, Promise<unknown>>()
   private connectionKey: string | null = null
+  // Bindings whose activation the daemon on this connection has taken.
+  private readonly confirmed = new Set<string>()
   // Bindings whose daemon record may differ from `wanted`, and those queued to be fixed.
   private unsynced = new Set<string>()
   private readonly reconciling = new Set<string>()
@@ -122,6 +124,7 @@ export class KnowledgeHost {
     if (key !== this.connectionKey) {
       this.connectionKey = key
       this.unsynced = new Set(this.wanted.keys())
+      this.confirmed.clear()
     }
     for (const bindingId of this.unsynced) {
       if (this.reconciling.has(bindingId)) continue
@@ -140,20 +143,26 @@ export class KnowledgeHost {
     return this.operate(bindingId, async () => {
       // Activating drops C in the daemon; it is pushed again afterwards.
       this.wanted.set(bindingId, { endpoint: copy, credential: null })
-      return this.track(bindingId, await this.send(bindingId, 'PUT', '', activationBody(copy)))
+      this.confirmed.delete(bindingId)
+      return this.track(bindingId, await this.activation(bindingId))
     })
   }
 
-  /** Whether `bindingId` should be active in the daemon. */
-  isWanted(bindingId: string): boolean {
-    return this.wanted.has(bindingId)
+  /** Whether the daemon on this connection has `bindingId` active, as wanted. */
+  isActive(bindingId: string): boolean {
+    return this.wanted.has(bindingId) && this.confirmed.has(bindingId)
   }
 
-  deactivate(bindingId: string): Promise<HostResult> {
-    return this.operate(bindingId, async () => {
-      this.wanted.delete(bindingId)
-      return this.track(bindingId, await this.send(bindingId, 'DELETE', ''))
-    })
+  /** Drops `bindingId` at once, ahead of anything queued for it (Off): it
+   * is no longer wanted, so a queued push or replay sends nothing, and an
+   * activation still being retried stops. */
+  async deactivate(bindingId: string): Promise<HostResult> {
+    if (!validBindingId(bindingId)) return failure('invalid_binding')
+    if (!this.started) return failure('not_started')
+    this.wanted.delete(bindingId)
+    this.confirmed.delete(bindingId)
+    this.sync()
+    return this.track(bindingId, await this.send(bindingId, 'DELETE', ''))
   }
 
   pushCredential(bindingId: string, credential: KnowledgeCredential): Promise<HostResult> {
@@ -247,7 +256,7 @@ export class KnowledgeHost {
     const unsynced = this.unsynced
     if (!unsynced.has(bindingId)) return
     const wanted = this.wanted.get(bindingId)
-    const result = await this.send(bindingId, wanted ? 'PUT' : 'DELETE', '', wanted ? activationBody(wanted.endpoint) : undefined)
+    const result = wanted ? await this.activation(bindingId) : await this.send(bindingId, 'DELETE', '')
     if (!result.ok) {
       // A refusal will not change by asking again.
       if (!PASSING.includes(result.reason)) unsynced.delete(bindingId)
@@ -261,10 +270,21 @@ export class KnowledgeHost {
     unsynced.delete(bindingId)
   }
 
-  /** Sends one change, again under a new number while the daemon calls it stale. */
+  /** Sends the wanted activation, and records it as taken by this connection. */
+  private async activation(bindingId: string): Promise<HostResult> {
+    const key = this.connectionKey
+    const result = await this.send(bindingId, 'PUT', '', activationBody(this.wanted.get(bindingId)?.endpoint ?? null))
+    if (result.ok && key === this.connectionKey && this.wanted.has(bindingId)) this.confirmed.add(bindingId)
+    return result
+  }
+
+  /** Sends one change, again under a new number while the daemon calls it
+   * stale. A PUT stops once its binding is no longer the one wanted. */
   private async send(bindingId: string, method: 'PUT' | 'DELETE', suffix: string, body?: string): Promise<HostResult> {
     let last: Failure = 'stale_sequence'
+    const entry = this.wanted.get(bindingId)
     for (let attempt = 0; attempt < MAX_STALE_RETRIES; attempt++) {
+      if (method === 'PUT' && (entry === undefined || this.wanted.get(bindingId) !== entry)) return failure('binding_inactive')
       const conn = this.deps.connection()
       if (!conn) return failure('daemon_unavailable')
       const path = `${BINDINGS}/${encodeURIComponent(bindingId)}${suffix}?seq=${this.deps.clock.next()}`
