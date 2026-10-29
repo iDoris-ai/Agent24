@@ -197,6 +197,7 @@ impl ModelCompleteParams {
             // that (see `disable_thinking` above), never on which module is
             // calling, and never on an absent/defaulted complexity.
             disable_thinking,
+            idoris_headroom_confirmed: false,
             temperature: self.temperature,
             progress: None,
         };
@@ -628,6 +629,14 @@ pub fn map_model_error(module: &str, e: &ModelError) -> RpcError {
                 "the model backend failed this request",
             )
         }
+        ModelError::IdorisSupervisorBusy => unavailable(
+            UnavailableCause::NoProvider,
+            "the model lifecycle is busy; retry later",
+        ),
+        ModelError::IdorisHeadroomConfirmationRequired { .. } => unavailable(
+            UnavailableCause::RequestRejected,
+            "the model needs user confirmation to use reserved memory headroom",
+        ),
         ModelError::Cancelled => {
             RpcError::application(ErrorKind::Cancelled, "the daemon is shutting down")
         }
@@ -1332,6 +1341,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            idoris_headroom_confirmed: false,
             temperature: None,
             progress: None,
         }

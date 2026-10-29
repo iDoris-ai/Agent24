@@ -17,7 +17,7 @@ export interface Run {
   id: string
   session_id: string | null
   status: RunStatus
-  input: { prompt: string; model_override?: string | null }
+  input: Pick<components['schemas']['RunInput'], 'prompt'> & Partial<Omit<components['schemas']['RunInput'], 'prompt'>>
   output?: { text: string } | null
   error?: { code: string; message: string } | null
   usage: { total_tokens: number }
@@ -110,6 +110,12 @@ async function get<T>(path: string, pick: string): Promise<T> {
 
 export const listRuns = (): Promise<Run[]> => get<Run[]>('/api/v1/runs', 'runs')
 
+export const createRun = async (body: components['schemas']['RunCreate']): Promise<Run> => {
+  const res = await window.agent24.backendProxy({ method: 'POST', path: '/api/v1/runs', body })
+  if (!res.ok) throw new Error(errorMessage(res))
+  return res.data as Run
+}
+
 export const getRun = async (id: string): Promise<Run> => {
   const res = await window.agent24.backendProxy({ method: 'GET', path: `/api/v1/runs/${id}` })
   if (!res.ok) throw new Error(errorMessage(res))
@@ -200,8 +206,8 @@ export const decideApproval = async (id: string, decision: Decision): Promise<bo
 }
 
 // ── FU-90: domain-OS modules (`GET`/`PATCH /api/v1/os`) ─────────────────────
-// These are kernel-mounted out-of-process modules (e.g. Sin90) — a different
-// thing from the npm community modules ModulesManager.tsx otherwise manages.
+// These are kernel-mounted out-of-process modules (e.g. Sin90), managed by
+// ModulesManager.tsx.
 // Mirrors agent24-protocol's DomainOsView/DomainOsList (rust/crates/agent24-protocol/src/types.rs).
 
 /** One domain OS, as `GET /api/v1/os` sees it. */

@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
-import type { IdorisStatusResult } from '../../shared/ipc-types'
+import { getStatus, type IdorisStatus } from '../components/idoris/api'
+import { idorisMessages } from '../components/idoris/IdorisPanel.i18n'
 import { useT } from '../i18n'
 import { settingsMessages } from '../pages/Settings.i18n'
-import { modelsMessages } from '../pages/Models.i18n'
 import { CommApiError, getCommStatus, type CommDaemonProcessState } from '../pages/comm/api'
 import { communicationMessages } from '../pages/comm/Communication.i18n'
 
@@ -13,9 +13,9 @@ const PROCESS_LABELS = {
 } as const satisfies Record<CommDaemonProcessState, keyof typeof communicationMessages.en>
 
 export function useCapabilityStatus(active: boolean) {
-  const [idoris, setIdoris] = useState<IdorisStatusResult>()
+  const [idoris, setIdoris] = useState<IdorisStatus['state']>()
   const [comm, setComm] = useState<CommDaemonProcessState>()
-  const modelText = useT(modelsMessages)
+  const idorisText = useT(idorisMessages)
   const settingsText = useT(settingsMessages)
   const commText = useT(communicationMessages)
 
@@ -24,7 +24,9 @@ export function useCapabilityStatus(active: boolean) {
     let disposed = false
     const refresh = async () => {
       await Promise.allSettled([
-        window.agent24.idorisStatus?.().then(value => { if (!disposed) setIdoris(value) }),
+        getStatus().then(value => { if (!disposed) setIdoris(value.state) }).catch(() => {
+          if (!disposed) setIdoris(undefined)
+        }),
         getCommStatus().then(value => { if (!disposed) setComm(value.process.state) }).catch((error: unknown) => {
           if (!disposed && error instanceof CommApiError && error.code === 'not_configured') setComm('not_configured')
         }),
@@ -42,8 +44,8 @@ export function useCapabilityStatus(active: boolean) {
 
   return (id: string): string | undefined => {
     if (id === 'localModels' && idoris) {
-      return idoris.state === 'available' ? `iDoris · ${settingsText('status.connected')}`
-        : modelText(idoris.reason === 'handoff-missing' ? 'idoris.notConfigured' : 'idoris.unavailable')
+      return idoris === 'running' ? `iDoris · ${settingsText('status.connected')}`
+        : idorisText(`state.${idoris}`)
     }
     if (id === 'communication' && comm) return commText(PROCESS_LABELS[comm])
     return undefined

@@ -202,6 +202,7 @@ async fn drive(manager: &Arc<RunManager>, store: &Store, run_id: &str) -> Run {
             thread_to_messages(&thread),
             false,
             CancellationToken::new(),
+            false,
         )
         .await;
     store.get_run(run_id).await.unwrap().unwrap()
@@ -238,6 +239,7 @@ async fn send_copy_keeps_user_prompt_shaped_like_recall() {
     let shaped = block(&[&facts[0]]);
     let run = manager
         .start_run(RunCreate {
+            idoris_headroom_confirmed: false,
             session_id: None,
             workspace_id: None,
             prompt: shaped.clone(),
@@ -283,6 +285,7 @@ async fn send_copy_keeps_session_history_shaped_like_recall() {
         .unwrap();
     let run = manager
         .start_run(RunCreate {
+            idoris_headroom_confirmed: false,
             session_id: Some("trim-hist".into()),
             workspace_id: None,
             prompt: "next".into(),
@@ -315,6 +318,7 @@ async fn send_copy_trims_revoked_ids_from_real_host_recall() {
     let facts = live_assertions(&kv, &["I am allergic to peanuts"]).await;
     let run = manager
         .start_run(RunCreate {
+            idoris_headroom_confirmed: false,
             session_id: None,
             workspace_id: None,
             prompt: "peanuts".into(),
@@ -582,7 +586,7 @@ async fn send_copy_fails_closed_when_memory_and_store_disagree() {
     let mut messages = thread_to_messages(&thread);
     messages[0] = Msg::user("not what the store holds");
     manager
-        .run_loop(running, messages, false, CancellationToken::new())
+        .run_loop(running, messages, false, CancellationToken::new(), false)
         .await;
     let done = store.get_run(&run_id).await.unwrap().unwrap();
     assert_eq!(done.status, RunStatus::Failed);

@@ -39,7 +39,7 @@ vi.mock('../backend-manager', () => ({
 
 import { IpcChannels } from '../../shared/ipc-types'
 import { createIpcGuard } from './guard'
-import { reachesHostInterface, registerIpcHandlers } from './index'
+import { reachesHostInterface, reachesPresenceChannel, registerIpcHandlers } from './index'
 
 const APP_URL = 'file:///app/renderer/index.html'
 const mainFrame = { url: APP_URL }
@@ -388,32 +388,8 @@ describe('A4 oMLX IPC hardening', () => {
   })
 })
 
-describe('ModulesEnable/Disable id validation', () => {
-  it.each(['..', 'a/../b', '', 'x y', '.'])('%j is refused without touching the daemon', async (id) => {
-    for (const ch of [IpcChannels.ModulesEnable, IpcChannels.ModulesDisable]) {
-      expect(await call(ch, id)).toEqual({ ok: false })
-    }
-    expect(seen).toHaveLength(0)
-  })
-  it('an ordinary id is forwarded', async () => {
-    await call(IpcChannels.ModulesEnable, 'hello-1.2')
-    expect(seen[0]?.url).toBe('/api/modules/hello-1.2/enable')
-  })
-})
-
-describe('A5 node-daemon module IPC is retired', () => {
-  const notSupported = { error: { code: 'not_supported', message: 'node-daemon only' } }
-  it.each([
-    [IpcChannels.ModulesList, []],
-    [IpcChannels.ModulesDiscover, [{}]],
-    [IpcChannels.ModulesInstall, ['@x/y']],
-    [IpcChannels.ModulesUninstall, ['@x/y', 'y']],
-  ])('%s returns not_supported without touching the daemon', async (channel, args) => {
-    const res = await call(channel, ...(args as unknown[]))
-    expect(res).toEqual(notSupported)
-    expect(seen).toHaveLength(0)
-  })
-})
+// The node-daemon-era `modules:*` IPC (A5 on main) was deleted outright by
+// REV-01 on ab/core: its tests went with the handlers.
 
 describe('D1 navigation preferences IPC', () => {
   it('reads defaults, persists valid preferences and recovers from a damaged file', async () => {
@@ -446,6 +422,31 @@ describe('backend:endpoint hands the renderer the port only (KB-HOST-01 PR-A1)',
     const result = await call(IpcChannels.BackendEndpoint)
     expect(result).toEqual({ port: endpoint.port })
     expect(JSON.stringify(result)).not.toContain(endpoint.token)
+  })
+})
+
+describe('the generic backend proxy never reaches the presence channel (CORE-2 AgentEar S3)', () => {
+  it.each([
+    ['GET', '/api/v1/presence/challenges/next?wait=25'],
+    ['POST', '/api/v1/presence/challenges/abc123'],
+    ['GET', '/api/v1/presence'],
+    ['GET', '/API/v1/Presence/challenges/next'],
+    ['GET', '/api/v1/./presence/challenges/next'],
+    ['GET', '/api/v1/models/../presence/challenges/next'],
+    ['GET', '/api/v1//presence/challenges/next'],
+    ['GET', '/api/v1/%70resence/challenges/next'],
+    ['POST', '/api/v1/presence%2Fchallenges%2Fabc'],
+    ['POST', '/api/v1\\presence/challenges/abc'],
+    ['POST', '/presence/challenges/abc'],
+  ] as const)('refuses %s %s without sending it', async (method, path) => {
+    const res = await call(IpcChannels.BackendProxy, { method, path })
+    expect(res.status).toBe(403)
+    expect(JSON.stringify(res.data)).toContain('presence_channel_private')
+    expect(seen).toHaveLength(0)
+  })
+
+  it.each(['/api/v1/presences', '/api/v1/sessions?next=/api/v1/presence/x', '/api/v1/models'])('does not flag %s', (path) => {
+    expect(reachesPresenceChannel(path)).toBe(false)
   })
 })
 

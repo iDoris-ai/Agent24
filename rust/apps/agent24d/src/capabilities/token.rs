@@ -3,19 +3,25 @@ use rand::RngCore;
 use super::types::{CapabilityClaims, CapabilityError};
 
 /// Opaque 256-bit bearer secret. It has no debug, display, or serialization.
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub struct CapabilityToken(pub(crate) [u8; 32]);
+#[derive(Clone, Eq, PartialEq)]
+pub struct CapabilityToken(pub(crate) zeroize::Zeroizing<[u8; 32]>);
+
+impl std::hash::Hash for CapabilityToken {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.as_ref().hash(state);
+    }
+}
 
 impl CapabilityToken {
     pub(crate) fn random() -> Self {
-        let mut bytes = [0_u8; 32];
-        rand::rng().fill_bytes(&mut bytes);
+        let mut bytes = zeroize::Zeroizing::new([0_u8; 32]);
+        rand::rng().fill_bytes(bytes.as_mut());
         Self(bytes)
     }
 
     pub(crate) fn bearer(&self) -> String {
         let mut bearer = String::with_capacity(64);
-        for byte in self.0 {
+        for byte in self.0.iter() {
             use std::fmt::Write as _;
             let _ = write!(bearer, "{byte:02x}");
         }
@@ -26,7 +32,7 @@ impl CapabilityToken {
         if bearer.len() != 64 || !bearer.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(CapabilityError::Unauthorized);
         }
-        let mut bytes = [0_u8; 32];
+        let mut bytes = zeroize::Zeroizing::new([0_u8; 32]);
         for (index, pair) in bearer.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             bytes[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
         }
@@ -73,12 +79,12 @@ impl MintedCapability {
 
 pub(crate) fn digest(token: &CapabilityToken) -> [u8; 32] {
     use sha2::{Digest, Sha256};
-    Sha256::digest(token.0).into()
+    Sha256::digest(token.0.as_ref()).into()
 }
 
 pub(crate) fn random_capability_id() -> String {
     let mut bytes = [0_u8; 16];
-    rand::rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(bytes.as_mut());
     let mut id = String::with_capacity(32);
     for byte in bytes {
         use std::fmt::Write as _;
