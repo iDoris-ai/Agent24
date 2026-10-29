@@ -5,12 +5,14 @@
 //! fake-script-driven unit tests in `src/import.rs`.
 //!
 //! Requires `HYPHAE_TEST_BIN` (see `tests/real_binary.rs`'s own doc comment
-//! for what it may point at); without it this prints why it's skipping and
-//! returns early, same as every other `HYPHAE_TEST_BIN`-gated test in this
+//! for what it may point at). CI requires it; local runs without it print a
+//! skip reason and return early, like the other real-binary tests in this
 //! crate. Never touches the real `~/.hyphae` — both the "old" and "new"
 //! homes here are throwaway `tempdir()`s.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod common;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -28,7 +30,7 @@ use agent24_comm::{
 const REFERENCE_SHA256: &str = "bc30dcf7bcf8b5c1865a3e995518c2bdab224bd8d6a3a064c4d7fc780de5e2b7";
 
 async fn verified_bin_from_env(install_dir: &std::path::Path) -> Option<VerifiedBinary> {
-    let test_bin = std::env::var("HYPHAE_TEST_BIN").ok()?;
+    let test_bin = common::hyphae_test_bin()?;
     let source = PathBuf::from(&test_bin)
         .canonicalize()
         .unwrap_or_else(|e| panic!("HYPHAE_TEST_BIN={test_bin:?} is not readable: {e}"));

@@ -110,7 +110,7 @@ fn start_with(home: &Path, env: &[(&str, &str)], args: &[&str]) -> Daemon {
     let mut child = daemon(home, env, args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
     let stdout = child.stdout.take().unwrap();

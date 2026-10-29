@@ -269,14 +269,11 @@ async fn poll(
             Some(_) => return Err(Failure::local("invalid_response")),
             None => {}
         }
-        let path = format!(
-            "/api/v1/idoris/operations/{}",
-            super::qs_encode(&op.operation_id)
-        );
+        let operation_id = super::qs_encode(&op.operation_id);
         tokio::select! {
             _ = interrupt.recv(), if !cancelling => {
                 cancelling = true;
-                match request(ep, Method::POST, &format!("{path}/cancel"), None, None).await {
+                match request(ep, Method::POST, &format!("/api/v1/idoris/operations/{operation_id}/cancel"), None, None).await {
                     Ok(response) => op = decode(response).await?,
                     Err(error) if error.code == "not_cancellable" => {
                         if !json { eprintln!("{}", english(&error.code)); }
@@ -286,7 +283,7 @@ async fn poll(
             }
             next = async {
                 tokio::time::sleep(Duration::from_millis(250)).await;
-                decode(request(ep, Method::GET, &path, None, None).await?).await
+                decode(request(ep, Method::GET, &format!("/api/v1/idoris/operations/{operation_id}"), None, None).await?).await
             } => op = next?,
         }
     }
@@ -314,18 +311,22 @@ async fn verify(ep: &Endpoint) -> Result<Value, Failure> {
 }
 
 async fn execute(action: IdorisAction, json_output: bool) -> Result<Value, Failure> {
-    let (path, body, mutation) = match action {
-        IdorisAction::Status(_) => ("status", None, false),
-        IdorisAction::Candidates(_) => ("omlx/candidates", None, false),
+    let (method, path, body) = match action {
+        IdorisAction::Status(_) => (Method::GET, "/api/v1/idoris/status", None),
+        IdorisAction::Candidates(_) => (Method::GET, "/api/v1/idoris/omlx/candidates", None),
         IdorisAction::Install { yes, .. } => {
             consent(
                 yes,
                 "Download and install the daemon's locked iDoris release. This runs downloaded software after integrity and signature checks.",
             )?;
-            ("install", Some(json!({"consent":true})), true)
+            (
+                Method::POST,
+                "/api/v1/idoris/install",
+                Some(json!({"consent":true})),
+            )
         }
-        IdorisAction::Start(_) => ("start", None, true),
-        IdorisAction::Stop(_) => ("stop", None, true),
+        IdorisAction::Start(_) => (Method::POST, "/api/v1/idoris/start", None),
+        IdorisAction::Stop(_) => (Method::POST, "/api/v1/idoris/stop", None),
         IdorisAction::Connect(options) => {
             consent(
                 options.yes,
@@ -343,40 +344,34 @@ async fn execute(action: IdorisAction, json_output: bool) -> Result<Value, Failu
                 ),
             )?;
             (
-                "connect",
+                Method::POST,
+                "/api/v1/idoris/connect",
                 Some(
                     json!({"endpoint":options.endpoint, "daily_model":options.daily, "deep_model":options.deep, "core_reserved_bytes":options.core_reserved_bytes, "save_omlx_key":options.save_omlx_key, "replace":options.replace,
                 "consent":{"share_omlx_key":true, "daily_model":options.daily, "deep_model":options.deep}}),
                 ),
-                true,
             )
         }
     };
+    let mutation = method != Method::GET;
     let mut interrupt =
         signal(SignalKind::interrupt()).map_err(|_| Failure::local("signal_unavailable"))?;
     let ep = host().await?;
     let result = async {
         let key = mutation.then(|| uuid::Uuid::new_v4().to_string());
-        let response = request(
-            &ep,
-            if mutation { Method::POST } else { Method::GET },
-            &format!("/api/v1/idoris/{path}"),
-            body.as_ref(),
-            key.as_deref(),
-        )
-        .await?;
+        let response = request(&ep, method, path, body.as_ref(), key.as_deref()).await?;
         if mutation {
             let op = poll(&ep, decode(response).await?, json_output, &mut interrupt).await?;
             let mut value =
                 serde_json::to_value(op).map_err(|_| Failure::local("invalid_response"))?;
-            if path == "connect" {
+            if path == "/api/v1/idoris/connect" {
                 value["verification"] = tokio::select! {
                     result = verify(&ep) => result?,
                     _ = interrupt.recv() => return Err(Failure::local("cancelled")),
                 };
             }
             Ok(value)
-        } else if path == "status" {
+        } else if path == "/api/v1/idoris/status" {
             let status: Status = decode(response).await?;
             serde_json::to_value(status).map_err(|_| Failure::local("invalid_response"))
         } else {

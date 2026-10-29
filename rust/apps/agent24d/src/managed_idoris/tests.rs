@@ -24,6 +24,7 @@ impl Drop for Server {
         self.2.abort();
     }
 }
+#[cfg(test)]
 async fn server() -> Server {
     let fixture = Arc::new(Fixture::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

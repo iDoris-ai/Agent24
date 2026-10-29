@@ -9,6 +9,7 @@ import HomePage from './pages/Home'
 import WorkbenchPage from './pages/Workbench'
 import ModelsPage from './pages/Models'
 import SettingsPage from './pages/Settings'
+import { listOsModules } from './pages/agent/api'
 import RunsPage from './pages/Runs'
 import SchedulesPage from './pages/Schedules'
 import CommunicationPage from './pages/comm/Communication'
@@ -106,6 +107,8 @@ export function App(): JSX.Element {
   const [version, setVersion] = useState<string>('')
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [darkMode, setDarkMode] = useState(true)
+  // Domain-OS modules actually mounted (state==='mounted') in the daemon (`GET /api/v1/os`) — the Home card.
+  const [osModuleCount, setOsModuleCount] = useState(0)
   // Renamed from `llmLabel`: this is now only the oMLX-derived FALLBACK,
   // used when the daemon has no `default_model` to report. The topbar's
   // actual displayed label is the `llmLabel` derived value below.
@@ -133,12 +136,15 @@ export function App(): JSX.Element {
 
     void window.agent24.getAppVersion().then(setVersion)
 
-    // Backend health polling
+    // Backend health + domain-OS module count polling
     const checkBackend = () => {
       window.agent24.backendProxy({ method: 'GET', path: '/api/v1/health' })
         .then((res) => {
           setBackendOk(res.ok)
           if (res.ok) {
+            void listOsModules()
+              .then((l) => setOsModuleCount(Array.isArray(l.modules) ? l.modules.filter((m) => m.state === 'mounted').length : 0))
+              .catch(() => { /* keep the last count */ })
             // FU-93: show the daemon's real port, not a hardcoded guess.
             void window.agent24.backendEndpoint().then((e) => setBackendPort(e?.port ?? null))
             // ME4-desktop-model-ui: ask the daemon what its OWN default
@@ -274,7 +280,7 @@ export function App(): JSX.Element {
           <HomePage
             backendOk={backendOk}
             backendPort={backendPort}
-            moduleCount={0}
+            moduleCount={osModuleCount}
             onNavigate={(target) => {
               if (BUILTIN_NAV.some((n) => n.id === target)) setPage(target as BuiltinPage)
             }}

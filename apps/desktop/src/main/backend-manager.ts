@@ -1,7 +1,7 @@
 // Backend process manager — supervises the daemon child process.
 // AGENT24_BACKEND=node|rust selects the implementation (default: rust since
-// v0.1.0 — the Rust agent24d is the shipping backend; `node` stays available
-// as an explicit opt-in for the legacy mock).
+// v0.1.0 — the Rust agent24d is the shipping backend; `node` is a dev-only
+// opt-in for the reference mock, ignored in packaged builds per ADR-037).
 // Both backends speak the same v1 protocol and announce themselves via the
 // SPEC-002 §4 ready line: the manager scans child stdout for the first
 // {"type":"ready","port":…} JSON line and exposes the port to the IPC proxy
@@ -14,14 +14,27 @@ import fs from 'node:fs'
 import path from 'node:path'
 import http from 'node:http'
 import readline from 'node:readline'
+import {
+  CLIENT_PROTOCOL_VERSION,
+  protocolCompatibility,
+  protocolVersionOf,
+} from './protocol-compatibility'
+import { joinLiteral, tryDataDir } from './data-dir'
 
 const HEALTH_INTERVAL_MS = 5_000
 const HEALTH_TIMEOUT_MS = 3_000
 const MAX_HEALTH_FAILURES = 3
 
-const isDev = process.env['NODE_ENV'] === 'development'
 
 export type BackendKind = 'node' | 'rust'
+
+export interface BackendStatusDetail {
+  readonly kind: 'protocol_mismatch'
+  readonly daemonVersion: number | null
+  readonly clientVersion: number
+  readonly recordedVersion?: number
+  readonly pid: number
+}
 
 export interface BackendEndpoint {
   port: number
@@ -82,16 +95,63 @@ export function selectedAuthMode(kind: BackendKind, platform: NodeJS.Platform = 
   return kind === 'rust' && platform !== 'win32' ? 'capabilities' : 'legacy'
 }
 
-export function selectedBackend(): BackendKind {
-  // Default rust (v0.1.0); only an explicit `node` opts into the legacy mock.
-  return process.env['AGENT24_BACKEND'] === 'node' ? 'node' : 'rust'
+/** Dev-only, explicit opt-in (`AGENT24_BACKEND=node`): the contract-test
+ * reference daemon at packages/node-daemon/dist/server.js. REV-01: desktop no
+ * longer depends on or builds @agent24/node-daemon, so this resolves the
+ * workspace path directly and the developer builds it by hand
+ * (`pnpm --filter @agent24/node-daemon build`). Throws if absent, which
+ * selectedBackend turns into a fall-back to rust. */
+export function resolveNodeEntryFrom(dir: string, exists: (p: string) => boolean = fs.existsSync): string {
+  // <repo>/apps/desktop/{dist,src}/main → repo root
+  const entry = path.resolve(dir, '../../../../packages/node-daemon/dist/server.js')
+  if (!exists(entry)) {
+    throw new Error(`${entry} not found — run: pnpm --filter @agent24/node-daemon build`)
+  }
+  return entry
+}
+
+function resolveNodeEntry(): string {
+  return resolveNodeEntryFrom(__dirname)
+}
+
+/** `packaged` MUST come from Electron's `app.isPackaged` (injected by main.ts).
+ * It is deliberately NOT derived from NODE_ENV: an installed app can inherit
+ * NODE_ENV=development from its launching shell, and that must not unlock the
+ * node backend. Default `true` = fail closed (never node unless told dev).
+ *
+ * ADR-037 decision 1 (CORE-8): node-daemon is not shipped in installers, so:
+ * - packaged + AGENT24_BACKEND=node → warn, use rust;
+ * - dev + node but the dependency cannot be resolved → warn, use rust (never
+ *   throw: a stray env var must not brick the app). */
+export function selectedBackend(
+  packaged: boolean = true,
+  resolveNode: () => string = resolveNodeEntry,
+): BackendKind {
+  if (process.env['AGENT24_BACKEND'] !== 'node') return 'rust'
+  if (packaged) {
+    console.warn(
+      '[backend] AGENT24_BACKEND=node ignored in packaged builds (ADR-037: node-daemon is a dev/contract-test reference only); using rust',
+    )
+    return 'rust'
+  }
+  try {
+    resolveNode()
+  } catch (err) {
+    console.warn(
+      `[backend] AGENT24_BACKEND=node requested but packages/node-daemon/dist/server.js is not resolvable (${String(err)}); using rust`,
+    )
+    return 'rust'
+  }
+  return 'node'
 }
 
 /** Daemon lifecycle status surfaced to the tray (F1b). */
-export type BackendStatus = 'running' | 'starting' | 'stopped' | 'blocked'
+export type BackendStatus = 'running' | 'starting' | 'stopped' | 'error' | 'blocked'
 
 /** Pure derivation of the tray status from the manager's observable state.
  * Exported so the state machine is unit-testable without spawning a process:
+ * - an incompatible external daemon pins `error` until a later probe finds it
+ *   gone or on this protocol;
  * - a user-initiated stop pins `stopped` (the health loop won't auto-respawn);
  * - a capability-mode daemon of another host serving this data dir is
  *   `blocked`: there is nothing to connect to and nothing this app may start;
@@ -102,8 +162,10 @@ export function deriveStatus(s: {
   userStopped: boolean
   hasEndpoint: boolean
   healthy: boolean
+  incompatible?: boolean
   foreignHost?: boolean
 }): BackendStatus {
+  if (s.incompatible) return 'error'
   if (s.userStopped) return 'stopped'
   if (s.foreignHost) return 'blocked'
   if (s.hasEndpoint && s.healthy) return 'running'
@@ -115,23 +177,26 @@ function repoRootDev(): string {
   return path.join(__dirname, '..', '..', '..', '..')
 }
 
-function resolveNodeEntry(): string {
-  if (isDev) {
-    // Workspace dep: @agent24/node-daemon main → packages/node-daemon/dist/server.js
-    return require.resolve('@agent24/node-daemon')
-  }
-  return path.join(process.resourcesPath, 'backend', 'server.js')
+/** `packaged` = Electron `app.isPackaged` (injected), NOT NODE_ENV: an installed
+ * app may inherit NODE_ENV=development and must still use its bundled binary. */
+export function resolveRustBinary(packaged: boolean): string {
+  return process.env['AGENT24D_BIN'] || resolveBundledRustBinary('agent24d', packaged)
 }
 
-function resolveRustBinary(): string {
-  return process.env['AGENT24D_BIN'] || resolveBundledRustBinary('agent24d')
+/** Set once by main.ts from `app.isPackaged` for callers that have no
+ * BackendManager at hand (documents-cli.ts). Default `true` = fail closed:
+ * use the bundled binary, never the dev build tree. */
+let bundledPackaged = true
+export function setBundledPackaged(packaged: boolean): void {
+  bundledPackaged = packaged
 }
 
 /** A Rust binary the app ships: `agent24d`, or the `agent24` CLI whose
- * commands main runs (documents-import.ts). */
-export function resolveBundledRustBinary(name: string): string {
+ * commands main runs (documents-cli.ts). `packaged` as for `resolveRustBinary`;
+ * omitted → the value main.ts registered via `setBundledPackaged`. */
+export function resolveBundledRustBinary(name: string, packaged: boolean = bundledPackaged): string {
   const exe = process.platform === 'win32' ? `${name}.exe` : name
-  if (isDev) {
+  if (!packaged) {
     return path.join(repoRootDev(), 'rust', 'target', 'debug', exe)
   }
   // Packaged: electron-builder copies the platform-native release binary into
@@ -152,20 +217,22 @@ export interface ExternalDaemonState {
   token: string
   pid: number
   authMode: DaemonAuthMode
+  /** Absent when daemon.json was written before version negotiation. */
+  protocolVersion?: number
+}
+
+/** One `GET /api/v1/health`. `protocolVersion: null` means the field is absent. */
+export interface DaemonHealthProbe {
+  ok: boolean
+  protocolVersion: number | null
 }
 
 /** Mirrors `agent24_protocol::state_file::state_path()` (Rust), i.e.
- * `state_dir()/daemon.json`: `AGENT24_DATA_DIR` (non-empty, absolute) is the
- * data root as-is; otherwise `$HOME/.agent24`; no `HOME` → null. Reads the
- * env directly (not `os.homedir()`) so this stays in lockstep with where the
- * daemon itself looks, and so tests can point it at an isolated dir without
- * touching the real one. */
+ * `data_dir()/daemon.json`, with the data root from the one shared resolver
+ * (`@agent24/data-dir`, re-exported from `./data-dir`, ADR-037); unresolvable root → null. */
 export function daemonStatePath(): string | null {
-  const dataDir = process.env['AGENT24_DATA_DIR']
-  if (dataDir && path.isAbsolute(dataDir)) return path.join(dataDir, 'daemon.json')
-  const home = process.env['HOME']
-  if (!home) return null
-  return path.join(home, '.agent24', 'daemon.json')
+  const dir = tryDataDir()
+  return dir === null ? null : joinLiteral(dir, 'daemon.json')
 }
 
 /** Read + parse `daemon.json`. Absent, unreadable, or malformed all mean the
@@ -176,13 +243,29 @@ export function readExternalDaemonState(): ExternalDaemonState | null {
   if (!statePath) return null
   try {
     const raw = fs.readFileSync(statePath, 'utf8')
-    const parsed = JSON.parse(raw) as { port?: unknown; token?: unknown; pid?: unknown; auth_mode?: unknown }
+    const parsed = JSON.parse(raw) as {
+      port?: unknown
+      token?: unknown
+      pid?: unknown
+      auth_mode?: unknown
+      protocol_version?: unknown
+    }
     if (typeof parsed.port !== 'number' || typeof parsed.pid !== 'number') return null
     const token = typeof parsed.token === 'string' ? parsed.token : ''
     // Only a legacy record (or one from before `auth_mode` existed) shares its
     // token through this file; any other mode keeps host authority private.
     const legacy = parsed.auth_mode === undefined || parsed.auth_mode === 'legacy_single_token'
-    return { port: parsed.port, token, pid: parsed.pid, authMode: legacy ? 'legacy' : 'capabilities' }
+    const state: ExternalDaemonState = {
+      port: parsed.port,
+      token,
+      pid: parsed.pid,
+      authMode: legacy ? 'legacy' : 'capabilities',
+    }
+    const recorded = parsed.protocol_version
+    if (typeof recorded === 'number' && Number.isInteger(recorded) && recorded >= 0) {
+      state.protocolVersion = recorded
+    }
+    return state
   } catch {
     return null
   }
@@ -193,6 +276,8 @@ export function readExternalDaemonState(): ExternalDaemonState | null {
 export interface ExternalDaemonSource {
   read(): ExternalDaemonState | null
   checkHealth(endpoint: BackendEndpoint | null): Promise<boolean>
+  /** Body of `GET /api/v1/health`, including the protocol version. */
+  fetchHealth(endpoint: BackendEndpoint): Promise<DaemonHealthProbe>
 }
 
 /** Constructor-injectable seams. Both default to the real implementations —
@@ -205,6 +290,30 @@ export interface BackendManagerDeps {
   spawnProcess?: (kind: BackendKind, authMode: DaemonAuthMode) => ChildProcess
   /** Defaults to `selectedAuthMode(kind)`. */
   authMode?: DaemonAuthMode
+  /** Electron `app.isPackaged`, injected by main.ts. Omitted → treated as
+   * packaged (fail closed). */
+  isPackaged?: boolean
+  /** Test seam for the dev-time node-daemon resolution. */
+  resolveNode?: () => string
+}
+
+/** Production probe for `tryReuseExternal`. Tests stub `globalThis.fetch`.
+ * `/api/v1/health` takes no credential, so none is sent. */
+export async function fetchDaemonHealth(endpoint: BackendEndpoint): Promise<DaemonHealthProbe> {
+  try {
+    const response = await fetch(`http://127.0.0.1:${endpoint.port}/api/v1/health`, {
+      signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
+    })
+    if (!response.ok) return { ok: false, protocolVersion: null }
+    try {
+      return { ok: true, protocolVersion: protocolVersionOf(await response.json()) }
+    } catch {
+      // 200 whose body is not JSON: a process is occupying the port.
+      return { ok: true, protocolVersion: null }
+    }
+  } catch {
+    return { ok: false, protocolVersion: null }
+  }
 }
 
 // `/api/v1/health` takes no credential, so none is sent.
@@ -228,9 +337,9 @@ function checkHealth(endpoint: BackendEndpoint | null): Promise<boolean> {
   })
 }
 
-function defaultSpawnProcess(kind: BackendKind, authMode: DaemonAuthMode): ChildProcess {
+function defaultSpawnProcess(kind: BackendKind, authMode: DaemonAuthMode, packaged: boolean): ChildProcess {
   if (kind === 'rust') {
-    const bin = resolveRustBinary()
+    const bin = resolveRustBinary(packaged)
     if (authMode === 'capabilities') {
       // stdin is a pipe this process holds open for the child's lifetime: the
       // daemon treats EOF there as its host going away and shuts down.
@@ -275,13 +384,14 @@ function readyToken(ready: ReadyLine, authMode: DaemonAuthMode): string {
 const defaultExternalDaemonSource: ExternalDaemonSource = {
   read: readExternalDaemonState,
   checkHealth,
+  fetchHealth: fetchDaemonHealth,
 }
 
 export class BackendManager {
   private child: ChildProcess | null = null
   private healthTimer: NodeJS.Timeout | null = null
   private failureCount = 0
-  private readonly kind: BackendKind = selectedBackend()
+  private readonly kind: BackendKind
   private readonly external: ExternalDaemonSource
   private readonly spawnProcess: (kind: BackendKind, authMode: DaemonAuthMode) => ChildProcess
   private readonly authMode: DaemonAuthMode
@@ -295,6 +405,12 @@ export class BackendManager {
   // lifecycle action that would otherwise kill a process we don't own.
   private isExternal = false
   private externalPid: number | null = null
+  // Set when a discoverable daemon is up but on another protocol. That process
+  // holds the singleton lock, so spawning would fail and the health loop would
+  // retry forever. While set, start/restart do not spawn and do not signal the
+  // external pid. tick keeps probing: a compatible `/health` clears this and
+  // reuses the peer; a failed probe clears it and spawns.
+  private blockedReason: BackendStatusDetail | null = null
   // Set while a healthy capability-mode daemon of another host serves this
   // data dir (see tryReuseExternal); nothing is spawned until it is gone.
   private foreignPid: number | null = null
@@ -315,32 +431,57 @@ export class BackendManager {
   private disposed = false
 
   constructor(deps: BackendManagerDeps = {}) {
+    this.kind = selectedBackend(deps.isPackaged ?? true, deps.resolveNode)
     this.external = deps.external ?? defaultExternalDaemonSource
-    this.spawnProcess = deps.spawnProcess ?? defaultSpawnProcess
+    const packaged = deps.isPackaged ?? true
+    this.spawnProcess =
+      deps.spawnProcess ?? ((kind, authMode) => defaultSpawnProcess(kind, authMode, packaged))
     this.authMode = deps.authMode ?? selectedAuthMode(this.kind)
   }
 
   async start(): Promise<void> {
-    if ((await this.tryReuseExternal()) === 'none') this.spawnChild()
+    // Only "nothing to reuse" may spawn. An incompatible or foreign daemon
+    // already holds the singleton lock; spawning fails and the health loop
+    // would retry forever.
+    const reuse = await this.tryReuseExternal()
     if (this.disposed) return
+    if (reuse === 'absent') this.spawnChild()
     this.healthTimer = setInterval(() => { void this.tick() }, HEALTH_INTERVAL_MS)
   }
 
   /** DEP-A5 step 1: before spawning anything, check whether a daemon started
    * outside this app (typically `agent24 daemon start`) is already up and
    * healthy — if so, point at it instead of racing it for the singleton lock.
-   * A healthy capability-mode daemon belongs to another host: its authority
-   * never reaches this file, and spawning our own would only lose the lock,
-   * so that is `foreign` and nothing is spawned. */
-  private async tryReuseExternal(): Promise<'reused' | 'foreign' | 'none' | 'superseded'> {
+   * Probe first. `incompatible` is only a live daemon whose `/health`
+   * `protocol_version` this app must not attach to and must not spawn over.
+   * The version recorded in daemon.json is named in that error; it is not a
+   * reason to skip the probe. A healthy capability-mode daemon belongs to
+   * another host: its authority never reaches this file, and spawning our own
+   * would only lose the lock, so that is `foreign`. `absent` (no record, or
+   * the probe did not connect) is the only outcome that may spawn. */
+  private async tryReuseExternal(): Promise<'reused' | 'foreign' | 'absent' | 'incompatible' | 'superseded'> {
     const lifecycle = this.lifecycle
     const state = this.external.read()
-    const healthy = state !== null && (await this.external.checkHealth({ port: state.port }))
-    if (lifecycle !== this.lifecycle) return 'superseded'
-    if (!state || !healthy) {
+    if (!state) {
+      this.blockedReason = null
       this.foreignPid = null
-      return 'none'
+      return 'absent'
     }
+    const health = await this.external.fetchHealth({ port: state.port })
+    if (lifecycle !== this.lifecycle) return 'superseded'
+    if (!health.ok) {
+      // Nothing answered. A leftover daemon.json must not block spawn, and a
+      // peer that previously blocked us has released the lock.
+      this.blockedReason = null
+      this.foreignPid = null
+      return 'absent'
+    }
+    const live = protocolCompatibility(health.protocolVersion, CLIENT_PROTOCOL_VERSION)
+    if (!live.compatible) {
+      this.foreignPid = null
+      return this.refuseExternal(state, health.protocolVersion)
+    }
+    this.blockedReason = null
     if (state.authMode !== 'legacy') {
       if (this.foreignPid !== state.pid) {
         console.warn(`[backend:${this.kind}] daemon pid ${state.pid} serves this data dir in capability mode for another host — waiting for it to exit`)
@@ -360,6 +501,28 @@ export class BackendManager {
       `[backend:${this.kind}] reusing external daemon (pid ${state.pid}, port ${state.port}) — not spawning our own`,
     )
     return 'reused'
+  }
+
+  /** Live `/health` disagreed. The recorded version is only named in the hint. */
+  private refuseExternal(state: ExternalDaemonState, daemonVersion: number | null): 'incompatible' {
+    const detail: BackendStatusDetail = {
+      kind: 'protocol_mismatch', daemonVersion, clientVersion: CLIENT_PROTOCOL_VERSION,
+      recordedVersion: state.protocolVersion, pid: state.pid,
+    }
+    const already = this.blockedReason?.pid === detail.pid
+      && this.blockedReason.daemonVersion === detail.daemonVersion
+      && this.blockedReason.recordedVersion === detail.recordedVersion
+    this.blockedReason = detail
+    this.isExternal = false
+    this.externalPid = null
+    this.lastHealthy = false
+    current = null
+    if (!already) {
+      console.warn(
+        `[backend:${this.kind}] refusing external daemon (port ${state.port}): ${JSON.stringify(detail)}`,
+      )
+    }
+    return 'incompatible'
   }
 
   /** pid of another host's capability-mode daemon while it blocks this app. */
@@ -384,8 +547,14 @@ export class BackendManager {
       userStopped: this.userStopped,
       hasEndpoint: current !== null,
       healthy: this.lastHealthy,
+      incompatible: this.blockedReason !== null,
       foreignHost: this.foreignPid !== null,
     })
+  }
+
+  /** Upgrade hint while an incompatible external daemon blocks spawn. */
+  statusDetail(): BackendStatusDetail | null {
+    return this.blockedReason
   }
 
   /** Which backend implementation is running (shown in the tray tooltip). */
@@ -396,6 +565,10 @@ export class BackendManager {
   /** Tray "启动 daemon": clear a prior manual stop and (re)spawn if needed. */
   startDaemon(): void {
     this.lifecycle += 1
+    // Spawning against an incompatible peer's lock just restarts the failure
+    // loop. (A `foreign` peer is different: a manual start is allowed through,
+    // and its outcome is re-read on the next probe.)
+    if (this.blockedReason !== null) return
     this.userStopped = false
     this.failureCount = 0
     if (!this.child && !this.isExternal) this.spawnChild()
@@ -425,6 +598,7 @@ export class BackendManager {
    * bring up a desktop-managed one instead". */
   restart(): void {
     this.lifecycle += 1
+    if (this.blockedReason !== null) return
     this.userStopped = false
     this.failureCount = 0
     this.lastHealthy = false
@@ -526,12 +700,24 @@ export class BackendManager {
         this.lastHealthy = false
         return
       }
+      // The external pid is not ours to kill, and another spawn cannot take
+      // the singleton lock while that peer is still up. Keep probing so an
+      // upgrade (or the peer exiting) recovers without reopening the app.
+      if (this.blockedReason !== null) {
+        this.lastHealthy = false
+        const outcome = await this.tryReuseExternal()
+        if (outcome === 'absent') {
+          this.failureCount = 0
+          this.spawnChild()
+        }
+        return
+      }
 
       // Another host's daemon holds this data dir: wait for it to go away
       // instead of starting one that cannot take the singleton lock.
       if (this.foreignPid !== null) {
         this.lastHealthy = false
-        if ((await this.tryReuseExternal()) === 'none') this.spawnChild()
+        if ((await this.tryReuseExternal()) === 'absent') this.spawnChild()
         return
       }
 
@@ -578,10 +764,10 @@ export class BackendManager {
         // this re-check, that self-spawned child would just get killed and
         // re-spawned forever every MAX_HEALTH_FAILURES ticks, even once the
         // real (CLI-owned) daemon is up and healthy. Only fall back to
-        // spawning our own when no daemon answers at all: a capability-mode
-        // daemon of another host (`foreign`) parks this manager in `blocked`
-        // instead, so the same loop cannot start there either.
-        if ((await this.tryReuseExternal()) === 'none') {
+        // spawning our own when the external daemon is still not reachable
+        // (`absent`): an incompatible or foreign daemon parks this manager in
+        // `error` / `blocked` instead, so the same loop cannot start there either.
+        if ((await this.tryReuseExternal()) === 'absent') {
           this.spawnChild()
         }
       }

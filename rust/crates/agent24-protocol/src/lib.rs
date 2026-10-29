@@ -12,11 +12,14 @@
 //! - open string enums stay `String` so unknown values never break decoding
 
 pub mod client;
+pub mod data_dir;
 pub mod events;
 pub mod state_file;
 pub mod types;
+pub mod version;
 pub mod workspace;
 
 pub use events::*;
 pub use types::*;
+pub use version::{PROTOCOL_VERSION, protocol_compatibility};
 pub use workspace::*;

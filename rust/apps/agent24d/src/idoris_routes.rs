@@ -184,8 +184,11 @@ mod tests {
                 assert_eq!(response.status(), StatusCode::OK);
             }
             assert_eq!(
-                crate::server::required_operation(&method, path),
-                crate::capabilities::Operation::from_action("idoris.lifecycle").unwrap()
+                crate::capabilities::required_operation(
+                    &method,
+                    &path.replace("operations/missing", "operations/{id}"),
+                ),
+                crate::capabilities::Operation::from_action("idoris.lifecycle")
             );
         }
     }
