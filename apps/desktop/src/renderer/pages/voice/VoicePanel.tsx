@@ -33,7 +33,7 @@ import {
 import type { ModelCallEnvelope } from '../../../shared/ipc-types'
 import { formatMs } from '../../../shared/format-latency'
 import { MAX_EVENTS_IN_MEMORY, pushCapped } from '../../../shared/agentearSequencer'
-import { translate, useT } from '../../i18n'
+import { translate, useLocale, useT } from '../../i18n'
 import { voicePanelMessages } from './VoicePanel.i18n'
 
 /** Mirrors main/model-call-log.ts's own cap — the main process never sends
@@ -284,6 +284,7 @@ export default function VoicePanel(): JSX.Element {
 
 function VoicePanelInner(): JSX.Element {
   const t = useT(voicePanelMessages)
+  const locale = useLocale()
   const [attach, setAttach] = useState<AttachedView | null>(null)
   const [attachChecked, setAttachChecked] = useState(false)
   const [attachError, setAttachError] = useState<string | null>(null)
@@ -427,20 +428,42 @@ function VoicePanelInner(): JSX.Element {
         {t('subtitle', { count: MAX_EVENTS_IN_MEMORY })}
       </div>
 
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-        <span
-          className={`status-dot ${attached ? 'online' : attach?.attach_status === 'disabled' ? '' : 'offline'}`}
-        />
-        <span style={{ fontSize: 12 }}>{t('attachment.label', { status: statusLabel })}</span>
-        {attach?.generation !== undefined && (
-          <span style={{ fontSize: 11, color: 'var(--muted)' }}>{t('attachment.generation', { value: attach.generation })}</span>
-        )}
+      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+        {!attachError && <>
+          <span
+            className={`status-dot ${attached ? 'online' : attach?.attach_status === 'disabled' ? '' : 'offline'}`}
+          />
+          <span style={{ fontSize: 12 }}>{t('attachment.label', { status: statusLabel })}</span>
+          {attach?.generation !== undefined && (
+            <span style={{ fontSize: 11, color: 'var(--muted)' }}>{t('attachment.generation', { value: attach.generation })}</span>
+          )}
+          {attach && (
+            <span style={{ fontSize: 11, color: 'var(--muted)' }}>
+              {t('attachment.pairedAt')}{' '}
+              <time dateTime={attach.created_at}>{new Date(attach.created_at).toLocaleString(locale)}</time>
+            </span>
+          )}
+        </>}
         {usage && (
           <span style={{ fontSize: 11, color: 'var(--muted)', marginLeft: 'auto' }}>
             {t('usage.summary', { local: totalCalls(usage.local), remote: totalCalls(usage.remote) })}
           </span>
         )}
       </div>
+
+      {attachChecked && !attachError && attach === null && (
+        <section aria-label={t('pairing.title')} style={{ padding: 16, marginBottom: 12, border: '1px solid var(--border)', borderRadius: 'var(--radius)', background: 'var(--surface2)' }}>
+          <h2 style={{ fontSize: 14, margin: '0 0 12px' }}>{t('pairing.title')}</h2>
+          <ol style={{ margin: 0, paddingInlineStart: 24, fontSize: 13, lineHeight: 2 }}>
+            <li><button type="button" className="btn btn-primary" onClick={() => void window.agent24.openExternal('https://github.com/iDoris-ai/AgentEar/releases/latest')}>{t('pairing.download')}</button></li>
+            <li>{t('pairing.menu')}</li>
+            <li>{t('pairing.allow')}</li>
+          </ol>
+        </section>
+      )}
+      {!attachError && attach?.attach_status === 'detached' && (
+        <p style={{ fontSize: 12, color: 'var(--muted)' }}>{t('attachment.detachedHint')}</p>
+      )}
 
       {modelCalls.length > 0 && (
         <div style={{ marginBottom: 12 }}>
