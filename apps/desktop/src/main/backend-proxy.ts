@@ -307,6 +307,7 @@ export function withKnowledgeBinding(route: ProxyRoute, req: BackendProxyRequest
   const body = req.body
   const creates = route.method === 'POST' && route.template === '/api/v1/runs'
   if (!creates || typeof body !== 'object' || body === null || Array.isArray(body)) return req
-  const { knowledge_binding_id: _dropped, ...rest } = body as Record<string, unknown>
+  const rest = { ...(body as Record<string, unknown>) }
+  delete rest['knowledge_binding_id']
   return { ...req, body: binding === null ? rest : { ...rest, knowledge_binding_id: binding } }
 }
