@@ -52,6 +52,13 @@ const api = {
   /** A1: elevated; main asks the user in a native dialog before sending. */
   osModuleSetEnabled: (name: string, enabled: boolean): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.OsModuleSetEnabled, name, enabled),
+  /** A-3: elevated; disables/enables AgentEar (the name is fixed in main).
+   *  Main asks the user in a native dialog before sending. */
+  agentearSetEnabled: (enabled: boolean): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.AgentEarSetEnabled, enabled),
+  /** A-3: elevated; revokes AgentEar's pairing. Main asks first. */
+  agentearUnpair: (): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.AgentEarUnpair),
   backendEndpoint: (): Promise<BackendEndpointResult | null> =>
     ipcRenderer.invoke(IpcChannels.BackendEndpoint),
   creativeShow: (bounds: CreativeViewBounds): Promise<CreativeViewResult> =>

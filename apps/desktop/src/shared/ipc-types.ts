@@ -20,6 +20,11 @@ export const IpcChannels = {
   // before sending anything.
   ApprovalDecide: 'approval:decide',
   OsModuleSetEnabled: 'os-module:set-enabled',
+  // A-3: disable/enable or unpair AgentEar (PATCH / DELETE
+  // /api/v1/attached/agentear). The module name is fixed in main; the
+  // renderer cannot name another one. Same native-confirm rule as above.
+  AgentEarSetEnabled: 'agentear:set-enabled',
+  AgentEarUnpair: 'agentear:unpair',
   CreativeShow: 'creative:show',
   CreativeRestart: 'creative:restart',
   CreativeBounds: 'creative:bounds',

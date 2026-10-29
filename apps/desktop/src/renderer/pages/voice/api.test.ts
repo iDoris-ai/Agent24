@@ -7,7 +7,9 @@ import {
   isBuiltinProposal,
   sendSpeak,
   sendStopPlayback,
+  setAgentEarEnabled,
   totalCalls,
+  unpairAgentEar,
 } from './api'
 import type { AgentEarEventEnvelope } from '../../../shared/ipc-types'
 
@@ -261,5 +263,41 @@ describe('getAgentEarUsage / totalCalls', () => {
     const by = await getAgentEarUsage()
     expect(totalCalls(by!.local)).toBe(5)
     expect(totalCalls(by!.remote)).toBe(0)
+  })
+})
+
+describe('A-3 setAgentEarEnabled / unpairAgentEar', () => {
+  function mockAdmin(res: { ok: boolean; status: number; data: unknown }) {
+    const backendProxy = vi.fn()
+    const agentearSetEnabled = vi.fn(() => Promise.resolve(res))
+    const agentearUnpair = vi.fn(() => Promise.resolve(res))
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy, agentearSetEnabled, agentearUnpair },
+      writable: true,
+      configurable: true,
+    })
+    return { backendProxy, agentearSetEnabled, agentearUnpair }
+  }
+
+  it('go through the dedicated IPCs only, never the generic proxy, and name no module', async () => {
+    const m = mockAdmin({ ok: true, status: 200, data: null })
+    expect(await setAgentEarEnabled(false)).toBe('done')
+    expect(await unpairAgentEar()).toBe('done')
+    expect(m.agentearSetEnabled).toHaveBeenCalledExactlyOnceWith(false)
+    expect(m.agentearUnpair).toHaveBeenCalledExactlyOnceWith()
+    expect(m.backendProxy).not.toHaveBeenCalled()
+  })
+
+  it('cancelled -> "cancelled", not an error', async () => {
+    mockAdmin({ ok: false, status: 499, data: { error: { code: 'cancelled', message: 'x' } } })
+    expect(await setAgentEarEnabled(true)).toBe('cancelled')
+    expect(await unpairAgentEar()).toBe('cancelled')
+  })
+
+  it('failures throw an error carrying the code (unknown shapes -> daemon_error)', async () => {
+    mockAdmin({ ok: false, status: 404, data: { error: { code: 'not_paired', message: 'm' } } })
+    await expect(unpairAgentEar()).rejects.toMatchObject({ code: 'not_paired' })
+    mockAdmin({ ok: false, status: 500, data: 'garbage' })
+    await expect(setAgentEarEnabled(false)).rejects.toMatchObject({ code: 'daemon_error' })
   })
 })

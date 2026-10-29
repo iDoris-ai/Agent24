@@ -17,15 +17,18 @@
 // because it was never this component's state to lose — this component
 // just pulls a snapshot on mount and mirrors new arrivals from then on.
 
-import { Component, useEffect, useState, type ErrorInfo, type ReactNode } from 'react'
+import { Component, useCallback, useEffect, useRef, useState, type ErrorInfo, type ReactNode } from 'react'
 import { truncateForDisplay } from './display'
 import {
+  AgentEarAdminError,
   getAgentEarAttachment,
   getAgentEarUsage,
   isBuiltinProposal,
   sendSpeak,
   sendStopPlayback,
+  setAgentEarEnabled,
   totalCalls,
+  unpairAgentEar,
   type AgentEarEventEnvelope,
   type AttachedView,
   type ByServedUsage,
@@ -69,6 +72,20 @@ function detectSpeakLanguage(text: string): typeof SPEAK_LANGS[number] | null {
     else if (/\p{Script=Latin}/u.test(letter)) counts['en-US']++
   }
   return SPEAK_LANGS.find(({ value }) => counts[value] === letters.length) ?? null
+}
+
+type AdminErrorKey = 'admin.err.not_paired' | 'admin.err.busy' | 'admin.err.forbidden' | 'admin.err.backend' | 'admin.err.daemon'
+
+/** A-3: which translated message an admin failure shows, by stable code. */
+function adminErrorKey(e: unknown): AdminErrorKey {
+  const code = e instanceof AgentEarAdminError ? e.code : 'daemon_error'
+  switch (code) {
+    case 'not_paired': return 'admin.err.not_paired'
+    case 'busy': return 'admin.err.busy'
+    case 'forbidden': return 'admin.err.forbidden'
+    case 'backend_not_ready': case 'timeout': case 'proxy_failed': return 'admin.err.backend'
+    default: return 'admin.err.daemon'
+  }
 }
 
 function isAttached(attach: AttachedView | null): boolean {
@@ -320,6 +337,16 @@ function VoicePanelInner(): JSX.Element {
   const languageSuggestion = detectedLanguage?.value !== speakLang ? detectedLanguage : null
   const [commandError, setCommandError] = useState<string | null>(null)
   const [lastCommandId, setLastCommandId] = useState<string | null>(null)
+  const [adminBusy, setAdminBusy] = useState(false)
+  const [adminError, setAdminError] = useState<AdminErrorKey | null>(null)
+  // A synchronous guard on top of `adminBusy`: two clicks in the same frame
+  // both see the old state, the ref does not.
+  const adminInFlight = useRef(false)
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
 
   // Review M5: sequencing/de-dup/the 200-cap all happen in the main process
   // now (main/agentear-log.ts) — this component just pulls whatever the log
@@ -366,30 +393,26 @@ function VoicePanelInner(): JSX.Element {
     }
   }, [])
 
-  // Attach status poll (GET /api/v1/attached).
-  useEffect(() => {
-    let cancelled = false
-    const poll = () => {
-      getAgentEarAttachment()
-        .then((view) => {
-          if (cancelled) return
-          setAttach(view)
-          setAttachError(null)
-          setAttachChecked(true)
-        })
-        .catch((e: unknown) => {
-          if (cancelled) return
-          setAttachError(e instanceof Error ? e.message : String(e))
-          setAttachChecked(true)
-        })
+  // Attach status poll (GET /api/v1/attached). Also called right after an
+  // A-3 disable/enable/unpair so the panel does not wait for the next tick.
+  const refreshAttach = useCallback(async (): Promise<void> => {
+    try {
+      const view = await getAgentEarAttachment()
+      if (!mounted.current) return
+      setAttach(view)
+      setAttachError(null)
+    } catch (e: unknown) {
+      if (!mounted.current) return
+      setAttachError(e instanceof Error ? e.message : String(e))
     }
-    poll()
-    const timer = setInterval(poll, ATTACH_POLL_MS)
-    return () => {
-      cancelled = true
-      clearInterval(timer)
-    }
+    setAttachChecked(true)
   }, [])
+
+  useEffect(() => {
+    void refreshAttach()
+    const timer = setInterval(() => void refreshAttach(), ATTACH_POLL_MS)
+    return () => clearInterval(timer)
+  }, [refreshAttach])
 
   // Tier usage poll (GET /api/v1/usage?module=agentear).
   useEffect(() => {
@@ -436,6 +459,25 @@ function VoicePanelInner(): JSX.Element {
     }
   }
 
+  // A-3: main shows the native confirmation and enforces one request at a
+  // time; the panel just disables its buttons meanwhile and refreshes after.
+  const runAdmin = async (op: () => Promise<'done' | 'cancelled'>): Promise<void> => {
+    if (adminInFlight.current) return
+    adminInFlight.current = true
+    setAdminBusy(true)
+    setAdminError(null)
+    try {
+      await op()
+    } catch (e: unknown) {
+      if (mounted.current) setAdminError(adminErrorKey(e))
+    } finally {
+      await refreshAttach()
+      adminInFlight.current = false
+      if (mounted.current) setAdminBusy(false)
+    }
+  }
+  const attachDisabled = attach?.attach_status === 'disabled'
+
   const statusLabel = !attachChecked
     ? t('attachment.checking')
     : attach === null
@@ -475,6 +517,32 @@ function VoicePanelInner(): JSX.Element {
           </span>
         )}
       </div>
+
+      {!attachError && attach !== null && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
+          <button
+            type="button"
+            className="btn"
+            style={{ fontSize: 11 }}
+            disabled={adminBusy}
+            onClick={() => void runAdmin(() => setAgentEarEnabled(attachDisabled))}
+          >
+            {attachDisabled ? t('admin.enable') : t('admin.disable')}
+          </button>
+          <button
+            type="button"
+            className="btn"
+            style={{ fontSize: 11 }}
+            disabled={adminBusy}
+            onClick={() => void runAdmin(unpairAgentEar)}
+          >
+            {t('admin.unpair')}
+          </button>
+        </div>
+      )}
+      {adminError && (
+        <div role="alert" style={{ color: '#e05050', fontSize: 12, marginBottom: 8 }}>{t(adminError)}</div>
+      )}
 
       {attachChecked && !attachError && attach === null && (
         <section aria-label={t('pairing.title')} style={{ padding: 16, marginBottom: 12, border: '1px solid var(--border)', borderRadius: 'var(--radius)', background: 'var(--surface2)' }}>
