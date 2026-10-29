@@ -1,0 +1,9 @@
+{
+  "operation_id": "8b7911a0-1d35-48a1-b7e9-dd1bfa7616b8",
+  "action": "start",
+  "phase": "completed",
+  "result": "failed",
+  "error_code": "start_failed",
+  "cancellable": false,
+  "idempotency_key": "fixture-failed-start"
+}

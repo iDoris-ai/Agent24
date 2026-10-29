@@ -24,9 +24,9 @@
 //!    — and the remote stub's count is still 0 (a LocalOnly call must never
 //!    reach a remote provider, health or no health).
 //! 3. `m_remote` (`model_access: remote_allowed`) with `complexity: "complex"`
-//!    is eligible for remote routing, but without a host egress policy the
-//!    remote-labelled stub is not dialled; the request falls back to the local
-//!    stub and reports `tier: "local"`.
+//!    is routed LocalOnly like every callback (K1-6b.5g): the remote-labelled
+//!    stub is not dialled; the local stub serves it and the result reports
+//!    `tier: "local"`.
 //! 4. A module that never requested `models` (`m_none`) calling
 //!    `_a24/model/complete` → `forbidden` — the method is registered
 //!    unconditionally (design §2.4/J2), so this is the handler's own check,
@@ -841,9 +841,9 @@ fn model_complete_blackbox_round_trip() {
     );
     local_stub.set_mode("ok");
 
-    // ── scenario 3: remote_allowed permits remote routing, but cannot
-    //    replace the missing host egress policy; the local provider serves
-    //    the fallback and the remote stub remains untouched. ─────────────
+    // ── scenario 3: remote_allowed does not widen routing (K1-6b.5g);
+    //    the local provider serves the call and the remote stub remains
+    //    untouched. ───────────────────────────────────────────────────────
     let r3 = call_model(
         d1.port,
         &d1.token,
@@ -856,12 +856,12 @@ fn model_complete_blackbox_round_trip() {
     assert_eq!(
         remote_stub.request_count(),
         0,
-        "remote_allowed alone must not dial the remote stub without host egress: {r3}"
+        "remote_allowed must not dial the remote stub: {r3}"
     );
     assert_eq!(
         local_stub.request_count(),
         3,
-        "the local stub serves the remote route's fail-closed fallback: {r3}"
+        "the local stub serves the remote_allowed call: {r3}"
     );
 
     // ── scenario 4: a module that never requested `models` is forbidden —

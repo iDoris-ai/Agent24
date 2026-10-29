@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useContext, useEffect, useRef, useState } from 'react'
 import type { Agent24API } from '../main/preload'
 
 declare global {
@@ -6,9 +6,9 @@ declare global {
 }
 import ChatPage from './pages/Chat'
 import HomePage from './pages/Home'
-import WorkbenchPage from './pages/Workbench'
 import ModelsPage from './pages/Models'
 import SettingsPage from './pages/Settings'
+import { listOsModules } from './pages/agent/api'
 import RunsPage from './pages/Runs'
 import SchedulesPage from './pages/Schedules'
 import CommunicationPage from './pages/comm/Communication'
@@ -17,44 +17,19 @@ import VoicePanel from './pages/voice/VoicePanel'
 import CreativePage from './pages/Creative'
 import MemoryPage from './pages/Memory'
 import DocumentsPage from './pages/documents/Documents'
+import ModulesManagerPage from './pages/ModulesManager'
+import { Sidebar } from './capabilities/Sidebar'
+import { Breadcrumb } from './capabilities/Breadcrumb'
+import { CapabilityPage } from './capabilities/CapabilityPage'
+import CapabilitiesPage from './pages/Capabilities'
+import { useCapabilityStatus } from './capabilities/useCapabilityStatus'
+import { CapabilitiesProvider, NavPrefsProvider, useCapabilityRoute } from './capabilities/providers'
+import { CapabilitiesContext, NavPrefsContext } from './capabilities/types'
+import { capabilitiesMessages } from './capabilities/capabilities.i18n'
 import logoSidebar from './assets/logo-sidebar.png'
 import { useT } from './i18n'
 import { appMessages } from './App.i18n'
-
-type BuiltinPage =
-  | 'home'
-  | 'chat'
-  | 'workbench'
-  | 'runs'
-  | 'schedules'
-  | 'communication'
-  | 'approvals'
-  | 'documents'
-  | 'voice'
-  | 'creative'
-  | 'models'
-  | 'memory'
-  | 'settings'
-type Page = BuiltinPage
-
-const BUILTIN_NAV: { id: BuiltinPage; icon: string }[] = [
-  // The landing page: an isometric machine showing how one run moves through the components.
-  { id: 'home',            icon: '🏠' },
-  { id: 'chat',            icon: '💬' },
-  { id: 'workbench',       icon: '🔧' },
-  // ADR-DOC-01 D3: the Documenting OS's page (#705).
-  { id: 'documents',       icon: '📄' },
-  { id: 'runs',            icon: '📋' },
-  { id: 'schedules',       icon: '⏰' },
-  { id: 'communication',   icon: '🪢' },
-  { id: 'approvals',       icon: '🔐' },
-  { id: 'voice',           icon: '🎙️' },
-  { id: 'creative',        icon: '🎨' },
-  { id: 'models',          icon: '🤖' },
-  // M1-T11: 记忆页紧挨设置，和它共享"这是你对 Agent24 的控制面"这同一个位置。
-  { id: 'memory',          icon: '🧠' },
-  { id: 'settings',        icon: '⚙️' },
-]
+import { QuickSwitch } from './components/QuickSwitch'
 
 // FU-89: oMLX's `/v1/models` carries no type/capability field — only bare ids
 // (see fetchOmlxModels in main/ipc/index.ts) — so a real "is this a chat
@@ -85,6 +60,7 @@ export function pickChatModel(models: string[]): string | undefined {
 const LLM_DETECTING = '\u0000detecting'
 const LLM_NO_RUNTIME = '\u0000no-runtime'
 const NO_CHAT_MODEL_LABEL = '\u0000no-chat-model'
+const LLM_NEEDS_KEY = '\u0000needs-key'
 
 /** ME4-desktop-model-ui: `GET /api/v1/models`'s `default_model` field
  * (`rust/apps/agent24d/src/routes.rs`) — the daemon's own `DEFAULT_MODEL`
@@ -99,11 +75,27 @@ export function extractDaemonDefaultModel(res: { ok: boolean; data: unknown }): 
 }
 
 export function App(): JSX.Element {
-  const [page, setPage] = useState<Page>('home')
+  return <CapabilitiesProvider><NavPrefsProvider><AppShell /></NavPrefsProvider></CapabilitiesProvider>
+}
+
+function AppShell(): JSX.Element {
+  const { route, navigate } = useCapabilityRoute()
+  const { defs, open } = useContext(CapabilitiesContext)
+  const { prefs } = useContext(NavPrefsContext)
+  const selected = route.kind === 'capability' ? defs.find(d => d.id === route.id) : undefined
+  const page = route.kind === 'page' ? route.page : selected?.page
+  const c = useT(capabilitiesMessages)
+  const statusFor = useCapabilityStatus(page === 'capabilities')
+  useEffect(() => window.agent24.onCliToolSettings?.(() => navigate('settings')), [navigate])
+  useEffect(() => {
+    if (!prefs.showOverview && route.kind === 'page' && route.page === 'home') open('assistant', 'other')
+  }, [prefs.showOverview, route, open])
   const [backendOk, setBackendOk] = useState<boolean | null>(null)
   const [version, setVersion] = useState<string>('')
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [darkMode, setDarkMode] = useState(true)
+  // Domain-OS modules actually mounted (state==='mounted') in the daemon (`GET /api/v1/os`) — the Home card.
+  const [osModuleCount, setOsModuleCount] = useState(0)
   // Renamed from `llmLabel`: this is now only the oMLX-derived FALLBACK,
   // used when the daemon has no `default_model` to report. The topbar's
   // actual displayed label is the `llmLabel` derived value below.
@@ -119,7 +111,7 @@ export function App(): JSX.Element {
   // label only when the daemon has none to report (e.g. an older daemon
   // build, or the router was never built via `from_env`).
   const t = useT(appMessages)
-  const FALLBACK_KEYS = { [LLM_DETECTING]: 'llm.detecting', [LLM_NO_RUNTIME]: 'llm.noRuntime', [NO_CHAT_MODEL_LABEL]: 'llm.noChatModel' } as const
+  const FALLBACK_KEYS = { [LLM_DETECTING]: 'llm.detecting', [LLM_NO_RUNTIME]: 'llm.noRuntime', [NO_CHAT_MODEL_LABEL]: 'llm.noChatModel', [LLM_NEEDS_KEY]: 'llm.needsKey' } as const
   const fallbackKey = FALLBACK_KEYS[fallbackLlmLabel as keyof typeof FALLBACK_KEYS]
   const llmLabel = daemonDefaultModel
     ? t('llm.daemonDefault', { model: daemonDefaultModel })
@@ -131,12 +123,15 @@ export function App(): JSX.Element {
 
     void window.agent24.getAppVersion().then(setVersion)
 
-    // Backend health polling
+    // Backend health + domain-OS module count polling
     const checkBackend = () => {
       window.agent24.backendProxy({ method: 'GET', path: '/api/v1/health' })
         .then((res) => {
           setBackendOk(res.ok)
           if (res.ok) {
+            void listOsModules()
+              .then((l) => setOsModuleCount(Array.isArray(l.modules) ? l.modules.filter((m) => m.state === 'mounted').length : 0))
+              .catch(() => { /* keep the last count */ })
             // FU-93: show the daemon's real port, not a hardcoded guess.
             void window.agent24.backendEndpoint().then((e) => setBackendPort(e?.port ?? null))
             // ME4-desktop-model-ui: ask the daemon what its OWN default
@@ -158,6 +153,12 @@ export function App(): JSX.Element {
     // oMLX auto-detect on startup
     void (async () => {
       const detected = await window.agent24.omlxDetect()
+      if (detected && 'authRequired' in detected) {
+        // oMLX is running but wants an API key: starting another one would
+        // only collide with it. Say so; Settings has the key field.
+        setFallbackLlmLabel(LLM_NEEDS_KEY)
+        return
+      }
       if (detected) {
         const chatModel = pickChatModel(detected.models)
         setFallbackLlmLabel(chatModel ? `${chatModel} · oMLX` : NO_CHAT_MODEL_LABEL)
@@ -184,10 +185,17 @@ export function App(): JSX.Element {
     return () => clearInterval(backendTimer)
   }, [])
 
-  const pageTitle = t(`title.${page}`)
+  const pageTitle = selected ? c(selected.nameKey)
+    : page === 'capabilities' ? t('nav.capabilities')
+      : page === 'chat' ? c('assistant.name')
+        : page === 'home' ? t('title.home')
+          : page === 'settings' ? t('title.settings')
+            : page === 'runs' ? t('title.runs') : t('nav.capabilities')
+  const activeId = selected?.id ?? (page === 'chat' ? 'assistant' : page ?? '')
 
   return (
     <div className={`app${darkMode ? '' : ' light'}`}>
+      <QuickSwitch />
       {!sidebarOpen && (
         <button className="sidebar-expand-btn" onClick={() => setSidebarOpen(true)}>›</button>
       )}
@@ -203,18 +211,7 @@ export function App(): JSX.Element {
           <button className="sidebar-collapse-btn" onClick={() => setSidebarOpen(false)}>‹</button>
         </div>
 
-        <nav className="sidebar-nav">
-          {BUILTIN_NAV.map(item => (
-            <button
-              key={item.id}
-              className={`nav-item ${page === item.id ? 'active' : ''}`}
-              onClick={() => setPage(item.id)}
-            >
-              <span className="icon">{item.icon}</span>
-              <span>{t(`nav.${item.id}`)}</span>
-            </button>
-          ))}
-        </nav>
+        <Sidebar activeId={activeId} navigate={navigate} />
 
         <div className="sidebar-footer">
           <div className="backend-status">
@@ -244,6 +241,8 @@ export function App(): JSX.Element {
           </button>
         </div>
 
+        {selected && route.kind === 'capability' && <Breadcrumb capability={selected} origin={route.origin} onBack={() => navigate('capabilities')} />}
+
         {/* Review M3: the chat suffix no longer takes a default-model prop —
             it shows ONLY the server's own reported model_id (chat-latency.ts),
             never the topbar's daemon-default guess standing in for it.
@@ -266,13 +265,14 @@ export function App(): JSX.Element {
           <HomePage
             backendOk={backendOk}
             backendPort={backendPort}
-            moduleCount={0}
+            moduleCount={osModuleCount}
             onNavigate={(target) => {
-              if (BUILTIN_NAV.some((n) => n.id === target)) setPage(target as BuiltinPage)
+              const def = defs.find(d => d.page === target || d.id === target)
+              if (def) open(def.id, 'other')
+              else navigate(target)
             }}
           />
         )}
-        {page === 'workbench'        && <WorkbenchPage />}
         {page === 'documents'        && <DocumentsPage />}
         {page === 'runs'             && <RunsPage />}
         {page === 'schedules'        && <SchedulesPage />}
@@ -282,7 +282,11 @@ export function App(): JSX.Element {
         {page === 'creative'         && <CreativePage />}
         {page === 'models'           && <ModelsPage />}
         {page === 'memory'           && <MemoryPage />}
-        {page === 'settings'         && <SettingsPage />}
+        {page === 'settings'         && <SettingsPage key={route.kind === 'page' ? route.key : undefined} initialTab={route.kind === 'page' ? route.initialTab : undefined} />}
+        {page === 'capabilities'     && <CapabilitiesPage statusFor={statusFor} onOpenSettings={() => open('settings/general', 'capabilities')} />}
+        {page === 'modules-manager'  && <ModulesManagerPage />}
+        {selected && !['chat', 'documents', 'schedules', 'communication', 'approvals', 'voice', 'creative', 'models', 'memory', 'modules-manager'].includes(selected.page)
+          && <CapabilityPage capability={selected} />}
       </div>
     </div>
   )

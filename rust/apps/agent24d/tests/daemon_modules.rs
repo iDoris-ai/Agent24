@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// A package module: HTTP on the listener the kernel hands it — `/slow`
@@ -153,6 +154,24 @@ fn start(home: &Path) -> Daemon {
         daemon,
         module: None,
     };
+    // Start draining stderr BEFORE waiting for the ready line. Two reasons:
+    // a daemon that writes a lot before its ready line would otherwise block
+    // once the 64 KiB pipe fills, and when the daemon dies before printing a
+    // ready line its stderr is the only evidence of why.
+    let stderr = run.daemon.stderr.take().unwrap();
+    let (log_tx, log) = std::sync::mpsc::channel::<String>();
+    let stderr_log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&stderr_log);
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if let Ok(mut sink) = sink.lock() {
+                sink.push(line.clone());
+            }
+            if log_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
     // Bounded: a daemon that stalls before its ready line fails the test
     // rather than hanging it.
     let stdout = run.daemon.stdout.take().unwrap();
@@ -162,25 +181,94 @@ fn start(home: &Path) -> Daemon {
         let _ = BufReader::new(stdout).read_line(&mut line);
         let _ = tx.send(line);
     });
-    let ready = rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("no ready line within 30s");
-    let stderr = run.daemon.stderr.take().unwrap();
-    let (log_tx, log) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if log_tx.send(line).is_err() {
-                break;
-            }
+    let ready = match rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(line) => line,
+        Err(error) => {
+            let (status, stderr) = diagnose(&mut run.daemon, &stderr_log);
+            panic!("no ready line within 30s ({error}); daemon {status}; stderr: {stderr}");
         }
-    });
-    let ready: serde_json::Value = serde_json::from_str(&ready).expect("the ready line");
+    };
+    let ready: serde_json::Value = match serde_json::from_str(&ready) {
+        Ok(ready) => ready,
+        Err(error) => {
+            let (status, stderr) = diagnose(&mut run.daemon, &stderr_log);
+            panic!(
+                "the ready line was not parseable ({error}); daemon {status}; \
+                 stdout: {ready:?}; stderr: {stderr}"
+            );
+        }
+    };
     Daemon {
         run,
         port: u16::try_from(ready["port"].as_u64().unwrap()).unwrap(),
         token: ready["token"].as_str().unwrap().to_owned(),
         log,
     }
+}
+
+/// Best-effort explanation for a start() failure: the child's exit status (or
+/// the fact that it is still running) and everything it wrote to stderr. Never
+/// blocks longer than the bounded wait, so a hung daemon still fails fast.
+fn diagnose(
+    daemon: &mut std::process::Child,
+    stderr: &Arc<Mutex<Vec<String>>>,
+) -> (String, String) {
+    let status = match daemon.try_wait() {
+        Ok(Some(status)) => format!("exited with {status}"),
+        Ok(None) => {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut waited = None;
+            while Instant::now() < deadline {
+                match daemon.try_wait() {
+                    Ok(Some(status)) => {
+                        waited = Some(format!("exited with {status}"));
+                        break;
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                    Err(error) => {
+                        waited = Some(format!("wait failed: {error}"));
+                        break;
+                    }
+                }
+            }
+            waited.unwrap_or_else(|| "still running after 5s".to_owned())
+        }
+        Err(error) => format!("wait failed: {error}"),
+    };
+    let stderr = stderr
+        .lock()
+        .map(|lines| lines.join("\n"))
+        .unwrap_or_else(|_| "<stderr lock poisoned>".to_owned());
+    (status, stderr)
+}
+
+/// The diagnostic path must actually carry the evidence: a child that dies
+/// before any ready line has to surface its exit status and its stderr, not an
+/// opaque EOF.
+#[test]
+fn a_child_that_dies_before_its_ready_line_reports_status_and_stderr() {
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "echo 'singleton lock held' >&2; exit 3"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let stderr = child.stderr.take().unwrap();
+    let (status, captured) = diagnose(&mut child, &Arc::new(Mutex::new(Vec::new())));
+    assert!(status.contains("exited"), "status was {status}");
+    assert!(status.contains('3'), "status was {status}");
+    // `diagnose` reports what the sink holds; the sink is fed by the thread that
+    // start() spawns, so drain directly here to prove the same text is reachable.
+    let drained: Vec<String> = BufReader::new(stderr)
+        .lines()
+        .map_while(Result::ok)
+        .collect();
+    assert!(
+        drained.join("\n").contains("singleton lock held"),
+        "stderr was {drained:?} (diagnose sink: {captured})"
+    );
 }
 
 /// Wait until the package answers through the proxy — once it has shaken

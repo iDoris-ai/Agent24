@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/iDoris-ai/Agent24/protocol/knowledge/v1/read.schema.json",
+  "title": "Agent24 Knowledge v1 — knowledge.read",
+  "description": "Read request ($defs/request) and success response ($defs/response), CONTRACT-READONLY-v1 §4. Errors use error.schema.json.",
+  "$defs": {
+    "chunk_expected_revision": {
+      "description": "R4.3 (r9): with chunk_id, expected_revision must carry content_tag; the other parts are informational and not compared.",
+      "type": "object", "required": ["content_tag"], "additionalProperties": false,
+      "properties": {
+        "content_tag": { "$ref": "common.schema.json#/$defs/content_tag" },
+        "source_revision": { "$ref": "common.schema.json#/$defs/id" },
+        "index_build_id": { "$ref": "common.schema.json#/$defs/id" },
+        "chunk_revision": { "oneOf": [{ "$ref": "common.schema.json#/$defs/chunk_revision" }, { "type": "null" }] }
+      }
+    },
+    "request": {
+      "type": "object", "required": ["protocol_version", "request_id", "generation", "scope", "knowledge_id"], "additionalProperties": false,
+      "properties": {
+        "protocol_version": { "$ref": "common.schema.json#/$defs/protocol_version" },
+        "request_id": { "$ref": "common.schema.json#/$defs/request_id" },
+        "generation": { "$ref": "common.schema.json#/$defs/generation" },
+        "scope": { "$ref": "common.schema.json#/$defs/request_scope" },
+        "knowledge_id": { "$ref": "common.schema.json#/$defs/id" },
+        "chunk_id": { "$ref": "common.schema.json#/$defs/id" },
+        "expected_revision": true,
+        "page": {
+          "description": "R4.1: limit is optional; continuing a single-chunk read needs only the cursor.",
+          "type": "object", "required": ["cursor"], "additionalProperties": false,
+          "properties": {
+            "cursor": { "oneOf": [{ "type": "string", "minLength": 1, "maxLength": 1024 }, { "type": "null" }] },
+            "limit": { "$ref": "common.schema.json#/$defs/positive_int" }
+          }
+        },
+        "max_bytes": { "$ref": "common.schema.json#/$defs/positive_int" },
+        "deadline_ms": { "$ref": "common.schema.json#/$defs/positive_int" }
+      },
+      "if": { "required": ["chunk_id"] },
+      "then": { "properties": { "expected_revision": { "$ref": "#/$defs/chunk_expected_revision" } } },
+      "else": { "properties": { "expected_revision": { "$ref": "common.schema.json#/$defs/doc_revision" } } }
+    },
+    "segment": {
+      "type": "object", "required": ["chunk_id", "chunk_type", "chunk_revision", "content_tag", "text"], "additionalProperties": false,
+      "properties": {
+        "chunk_id": { "$ref": "common.schema.json#/$defs/id" },
+        "chunk_type": { "$ref": "common.schema.json#/$defs/chunk_type" },
+        "chunk_revision": { "$ref": "common.schema.json#/$defs/chunk_revision" },
+        "content_tag": { "$ref": "common.schema.json#/$defs/content_tag" },
+        "text": { "type": "string" }
+      }
+    },
+    "response": {
+      "description": "R4.2-R4.5. Top-level revision holds the document pair only; chunk_revision lives in each segment.",
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "request_id", "generation", "effective_scope", "knowledge_id", "revision", "segments", "truncated", "next_cursor"],
+      "properties": {
+        "protocol_version": { "$ref": "common.schema.json#/$defs/protocol_version" },
+        "request_id": { "$ref": "common.schema.json#/$defs/request_id" },
+        "generation": { "$ref": "common.schema.json#/$defs/generation" },
+        "effective_scope": { "$ref": "common.schema.json#/$defs/effective_scope" },
+        "knowledge_id": { "$ref": "common.schema.json#/$defs/id" },
+        "revision": { "$ref": "common.schema.json#/$defs/doc_revision" },
+        "display": { "$ref": "common.schema.json#/$defs/display" },
+        "segments": { "type": "array", "items": { "$ref": "#/$defs/segment" } },
+        "truncated": { "type": "boolean" },
+        "next_cursor": { "oneOf": [{ "type": "string", "minLength": 1, "maxLength": 1024 }, { "type": "null" }] }
+      },
+      "if": { "properties": { "truncated": { "const": true } } },
+      "then": { "properties": { "next_cursor": { "type": "string" } } }
+    }
+  }
+}

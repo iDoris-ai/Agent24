@@ -3,6 +3,7 @@ import { formatReplySuffix, extractServerReported, type ReplyLatency } from './c
 import logoWelcome from '../assets/logo-welcome.png'
 import { useT } from '../i18n'
 import { chatMessages } from './Chat.i18n'
+import type { components } from '@agent24/api-client'
 
 /** M1-T14: what `/api/v1/chat` ACTUALLY did with an explicit "记住…" turn —
  *  read off the response field, never off the model's own reply text (the
@@ -10,8 +11,12 @@ import { chatMessages } from './Chat.i18n'
  *  skipped because memory was paused). */
 type MemoryReceipt = 'saved' | 'paused_not_saved' | 'failed' | 'partial'
 
-interface Message {
-  role: 'user' | 'assistant'
+type ChatRequest = components['schemas']['ChatRequest']
+type Delivery = { kind: 'sending' | 'sent' | 'notSent' } | { kind: 'headroom'; request: ChatRequest }
+type Message = { role: 'user'; content: string; delivery: Delivery } | AssistantMessage
+
+interface AssistantMessage {
+  role: 'assistant'
   content: string
   /** ME4-desktop-model-ui: the "model · tier · 首字/总计 ms" line shown under
    *  an assistant reply. Never set on a user message or the error fallback
@@ -44,16 +49,34 @@ export default function ChatPage() {
   const [sessionId] = useState(() => genChatSessionId())
   const bottomRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const requestInFlight = useRef(false)
+  const awaitingConfirmation = messages.some(m => m.role === 'user' && m.delivery.kind === 'headroom')
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
   const send = async (text: string) => {
-    if (!text.trim() || loading) return
-    const userMsg: Message = { role: 'user', content: text.trim() }
+    if (!text.trim() || requestInFlight.current || awaitingConfirmation) return
+    const userMsg: Message = { role: 'user', content: text.trim(), delivery: { kind: 'sending' } }
+    const request: ChatRequest = {
+      messages: [...messages.filter(m => m.role === 'assistant' || m.delivery.kind === 'sent'), userMsg]
+        .map(m => ({ role: m.role, content: m.content })),
+      session_id: sessionId,
+    }
     setMessages(prev => [...prev, userMsg])
     setInput('')
+    await requestReply(messages.length, request)
+  }
+
+  const setDelivery = (index: number, delivery: Delivery) => {
+    setMessages(prev => prev.map((m, i) => i === index && m.role === 'user' ? { ...m, delivery } : m))
+  }
+
+  const requestReply = async (index: number, request: ChatRequest) => {
+    if (requestInFlight.current) return
+    requestInFlight.current = true
+    setDelivery(index, { kind: 'sending' })
     setLoading(true)
 
     // ME4-desktop-model-ui: total wall-clock time for THIS call, timed on the
@@ -68,18 +91,24 @@ export default function ChatPage() {
       const res = await window.agent24.backendProxy({
         method: 'POST',
         path: '/api/v1/chat',
-        body: {
-          messages: [...messages, userMsg].map(m => ({ role: m.role, content: m.content })),
-          session_id: sessionId,
-        },
+        body: request,
       })
       if (!res.ok) {
         // v1 error envelope { error: { code, message } }
         const err = (res.data as { error?: { code?: string; message?: string } } | null)?.error
+        if (err?.code === 'idoris_headroom_confirmation_required') {
+          setDelivery(index, { kind: 'headroom', request })
+          return
+        }
+        if (err?.code === 'idoris_supervisor_busy') {
+          setDelivery(index, { kind: 'notSent' })
+          setMessages(prev => [...prev, { role: 'assistant', content: t('reply.supervisorBusy') }])
+          return
+        }
         // The catch below picks its message by `code`. `proxyToBackend`
-        // answers `backend_not_ready` (503) whenever `getBackendEndpoint()`
-        // is null, i.e. the daemon's ready line never arrived
-        // (apps/desktop/src/main/ipc/index.ts). That is a daemon-startup
+        // answers `backend_not_ready` (503) whenever `daemonConnection()`
+        // is null, i.e. the daemon's ready line never arrived or left no
+        // credential (apps/desktop/src/main/ipc/index.ts). That is a daemon-startup
         // failure, not an unreachable model service, so it must not read
         // like one — 2026-10-16 install acceptance followed the wrong one.
         const failure = new Error(err?.message ?? `HTTP ${res.status}`) as Error & { code?: string }
@@ -107,8 +136,10 @@ export default function ChatPage() {
         firstTokenMs: server.firstTokenMs,
         totalMs: server.totalMs ?? totalMs,
       }
+      setDelivery(index, { kind: 'sent' })
       setMessages(prev => [...prev, { role: 'assistant', content: reply, suffix, memoryReceipt }])
     } catch (e) {
+      setDelivery(index, { kind: 'notSent' })
       // `failure.code` above is the only input: `backend_not_ready` gets the
       // daemon-startup message, everything else the generic request failure.
       const content = (e as { code?: string } | null)?.code === 'backend_not_ready'
@@ -116,6 +147,7 @@ export default function ChatPage() {
         : t('reply.connectionError', { error: String(e) })
       setMessages(prev => [...prev, { role: 'assistant', content }])
     } finally {
+      requestInFlight.current = false
       setLoading(false)
     }
   }
@@ -151,12 +183,25 @@ export default function ChatPage() {
             </div>
             <div className="message-bubble">
               {m.content}
-              {m.suffix && (
+              {m.role === 'user' && m.delivery.kind === 'headroom' && (
+                <div role="group" aria-label={t('headroom.explanation')} style={{ marginTop: 8 }}>
+                  <p role="status">{t('headroom.explanation')}</p>
+                  <button className="btn" disabled={loading || m.delivery.request.idoris_headroom_confirmed === true}
+                    onClick={() => {
+                      if (m.delivery.kind === 'headroom' && !m.delivery.request.idoris_headroom_confirmed) {
+                        void requestReply(i, { ...m.delivery.request, idoris_headroom_confirmed: true })
+                      }
+                    }}>{t('headroom.confirm')}</button>
+                  <button className="btn" disabled={loading} onClick={() => setDelivery(i, { kind: 'notSent' })}>{t('headroom.cancel')}</button>
+                </div>
+              )}
+              {m.role === 'user' && m.delivery.kind === 'notSent' && <div role="status">{t('status.notSent')}</div>}
+              {m.role === 'assistant' && m.suffix && (
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>{formatReplySuffix(m.suffix)}</div>
               )}
               {/* M1-T14: a deterministic system line, visually distinct from
                   (and never mistaken for) the model's own reply text. */}
-              {m.memoryReceipt && (
+              {m.role === 'assistant' && m.memoryReceipt && (
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>
                   {t(`memory.${m.memoryReceipt}`)}
                 </div>
@@ -185,7 +230,7 @@ export default function ChatPage() {
         />
         <button
           className="send-btn"
-          disabled={!input.trim() || loading}
+          disabled={!input.trim() || loading || awaitingConfirmation}
           onClick={() => void send(input)}
         >
           ↑

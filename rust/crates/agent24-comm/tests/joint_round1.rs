@@ -202,7 +202,7 @@ async fn a_run(runner: &HyphaeRunner, args: &[&str], password: Option<&str>) -> 
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires HYPHAE_JOINT_BIN and HYPHAE_JOINT_RELAY; starts a local TCP relay"]
 async fn joint_round1() {
     let Ok(bin_path) = std::env::var("HYPHAE_JOINT_BIN") else {
         eprintln!(

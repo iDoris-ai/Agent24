@@ -1,0 +1,7 @@
+{ "$comment": "R6.1, R6.4, R7.3: the credential is rejected before the body is parsed, so both echoes are null; the client pairs this envelope with the HTTP exchange that sent the request and must not turn it into cancelled.",
+  "op": "knowledge.search",
+  "request": { "protocol_version": 1, "request_id": "01JB3VA0M1N2P3Q4R5S6T7V8W9", "generation": 7,
+    "query": "报销流程", "scope": { "knowledge_base_ids": ["kb-a"] },
+    "budget": { "deadline_ms": 8000, "max_results": 10, "max_concurrency": 2 } },
+  "response": { "status": 401, "body": { "error": { "code": "unauthorized", "message": "Credential is not valid.",
+    "details": { "retryable": false, "reason": "credential_expired", "request_id": null, "generation": null } } } } }

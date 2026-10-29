@@ -39,7 +39,7 @@ BUILDER_IDENTITY="${SIGN_IDENTITY#Developer ID Application: }"
 unset CSC_LINK CSC_KEY_PASSWORD CSC_NAME
 
 step "1/6 构建 Rust release（agent24d、agent24）"
-( cd "$REPO_ROOT" && cargo build --release -p agent24d -p agent24-cli --manifest-path rust/Cargo.toml )
+( cd "$REPO_ROOT" && cargo build --release --locked -p agent24d -p agent24-cli --manifest-path rust/Cargo.toml )
 CARGO_OUT="${CARGO_TARGET_DIR:-$REPO_ROOT/rust/target}/release"
 # 两个都进包：extraResources 的 backend/agent24d 和 backend/agent24（文档导入调用 agent24）
 for b in agent24d agent24; do

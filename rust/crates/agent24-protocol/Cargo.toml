@@ -1,6 +1,6 @@
 [package]
 name = "agent24-protocol"
-version = "0.5.1"
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -20,6 +20,8 @@ thiserror = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
+agent24-knowledge = { path = "../agent24-knowledge" }
+jsonschema = { version = "0.59", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "process", "time"] }
 
 [lints]

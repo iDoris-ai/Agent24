@@ -6,12 +6,17 @@
 //! source tagged on it is Ordinary; a Restricted or Unknown source, no tags at
 //! all, or a failed tag read all withhold it (David 2026-10-25, option 丙).
 //!
-//! Tool results are not tagged yet (ADR-K1-02 §2.1 says they should be;
-//! 6b.5f), and what a tool returned travels on untagged: through a session's
+//! A tool's result is tagged before it reaches the model (6b.5f-1), so a run
+//! that called tools is relayed only when each call has a tag of its own,
+//! and then as strictly as its tags say (David 2026-10-27, option C). A call
+//! without one put text no tag describes into the run: a refusal (it can
+//! carry the user's reason, or an address a lookup resolved), an invalid,
+//! cancelled or timed-out call, a plan, or a call made before 6b.5f.
+//!
+//! What a tool returned also travels on past its run: through a session's
 //! memory of earlier turns (including `/chat` turns, which are not stored as
 //! runs), through a remembered fact recalled elsewhere, through a self-wake
-//! prompt. Until it is tagged, only a run that cannot have taken any of it in
-//! is relayed: no tool call, no recalled memory, not started by a
+//! prompt. So a run is relayed only with no recalled memory, not started by a
 //! kernel-created schedule, and no session context — no session, or it ran,
 //! and the daemon runs, without session memory (David 2026-10-26, option A).
 
@@ -42,9 +47,8 @@ async fn peer_classification(state: &AppState, run: &Run) -> SourceClassificatio
     }
     // Every tool call is recorded before the tool runs, and a call that
     // cannot be recorded does not run.
-    match state.store.list_tool_calls(&run.id).await {
-        Ok(calls) if calls.is_empty() => {}
-        Ok(_) => return UNKNOWN,
+    let calls = match state.store.list_tool_calls(&run.id).await {
+        Ok(calls) => calls,
         Err(err) => {
             tracing::warn!(
                 run_id = %run.id,
@@ -53,7 +57,7 @@ async fn peer_classification(state: &AppState, run: &Run) -> SourceClassificatio
             );
             return UNKNOWN;
         }
-    }
+    };
     // A self-wake's prompt was written from its creating run's context. A
     // schedule the user created has no recorded origin.
     if let Some(schedule_id) = run.schedule_id.as_deref() {
@@ -93,6 +97,17 @@ async fn peer_classification(state: &AppState, run: &Run) -> SourceClassificatio
             tag.source.kind,
             SourceKind::MemoryRecall | SourceKind::SessionContext
         )
+    }) {
+        return UNKNOWN;
+    }
+    // Each call's result is tagged `tool_result:{origin}:{call id}`, and only
+    // a result tag counts. A call id is `tc_{ulid}`, so no other call's tag,
+    // and no session-inherited one (`…:session:{id}`), ends the same way.
+    if !calls.iter().all(|call| {
+        let own = format!(":{}", call.id);
+        tags.iter().any(|tag| {
+            tag.source.kind == SourceKind::ToolResult && tag.source.source_id.ends_with(&own)
+        })
     }) {
         return UNKNOWN;
     }
@@ -189,6 +204,7 @@ mod tests {
                 workspace_id: None,
                 model_override: None,
                 mode: RunMode::Normal,
+                knowledge_binding_id: None,
             },
             output: (status == RunStatus::Completed).then(|| RunOutput {
                 text: format!("output {SECRET}"),
@@ -438,34 +454,144 @@ mod tests {
         assert!(!peer_run(&state, "run_user_schedule").await.0.withheld);
     }
 
-    #[tokio::test]
-    async fn a_run_that_called_a_tool_is_withheld_until_tool_results_are_tagged() {
-        let state = crate::server::tests::state().await;
-        ordinary(&state, run("run_tool", RunStatus::Completed)).await;
-        // Control: the same Ordinary run without a tool call is relayed.
-        assert!(!peer_run(&state, "run_tool").await.0.withheld);
-
+    async fn call(state: &AppState, run: &str, id: &str, status: agent24_protocol::ToolCallStatus) {
         state
             .store
             .insert_tool_call(&agent24_protocol::ToolCall {
-                id: "tc_1".to_owned(),
-                run_id: "run_tool".to_owned(),
+                id: id.to_owned(),
+                run_id: run.to_owned(),
                 tool: "fs_read".to_owned(),
                 input: serde_json::Map::new(),
-                status: agent24_protocol::ToolCallStatus::Completed,
+                status,
                 output_summary: None,
                 started_at: now_iso8601(),
                 ended_at: Some(now_iso8601()),
             })
             .await
             .unwrap();
+    }
+
+    async fn tag(state: &AppState, run: &str, seq: i64, source: SourceRef) {
+        state
+            .store
+            .tag_run_source(run, seq, &source, &now_iso8601())
+            .await
+            .unwrap();
+    }
+
+    /// K1-6b.5f-3 (David 2026-10-27, C): a run that called tools is relayed
+    /// once each call has a tag of its own and every tag is Ordinary. A call
+    /// without its own tag — here a refusal, or one whose only near match
+    /// belongs to another call or an earlier turn — withholds it.
+    #[tokio::test]
+    async fn a_run_that_called_tools_is_relayed_only_when_each_call_has_its_own_ordinary_tag() {
+        use agent24_protocol::ToolCallStatus::{Completed, Denied};
+        let state = crate::server::tests::state().await;
+        ordinary(&state, run("run_tool", RunStatus::Completed)).await;
+        call(&state, "run_tool", "tc_1", Completed).await;
+        // Its result was never tagged, as before 6b.5f.
         let (view, body) = peer_run(&state, "run_tool").await;
         assert_withheld(&view, &body);
-        let (_, list) = get(&state, "/api/v1/peer/runs").await;
+
+        let read = |id: &str, classification| {
+            SourceRef::tool_result("tool:fs_read", id, classification, now_iso8601())
+        };
+        tag(
+            &state,
+            "run_tool",
+            1,
+            read("tc_1", SourceClassification::Ordinary),
+        )
+        .await;
+        let (view, body) = peer_run(&state, "run_tool").await;
+        assert!(!view.withheld, "{body}");
         assert!(
-            !list.contains(SECRET),
-            "withheld content reached a peer: {list}"
+            body.contains(SECRET),
+            "an ordinary run is relayed in full: {body}"
         );
+
+        // A refusal carries no tag, and its text can carry the user's reason.
+        call(&state, "run_tool", "tc_2", Denied).await;
+        let (view, body) = peer_run(&state, "run_tool").await;
+        assert_withheld(&view, &body);
+
+        // Each run's call is `tc_n{seq}`; none of these tags is its own. The
+        // last run is named like its call, so its user-input tag
+        // (`user_input:{run}`) ends the same way without being a result.
+        for seq in 1..=4 {
+            let own = format!("tc_n{seq}");
+            let id = if seq == 4 {
+                own.clone()
+            } else {
+                format!("run_near_{seq}")
+            };
+            let near = match seq {
+                1 => read(&format!("{own}0"), SourceClassification::Ordinary),
+                2 => read(&format!("x{own}"), SourceClassification::Ordinary),
+                3 => SourceRef::session_tool_result("tool:fs_read", &own, now_iso8601()),
+                _ => SourceRef::user_input(&id, now_iso8601()),
+            };
+            ordinary(&state, run(&id, RunStatus::Completed)).await;
+            call(&state, &id, &own, Completed).await;
+            tag(&state, &id, 1, near.clone()).await;
+            let (view, body) = peer_run(&state, &id).await;
+            assert_withheld(&view, &body);
+            assert!(
+                !body.contains(SECRET),
+                "{}: withheld content reached a peer: {body}",
+                near.source_id
+            );
+        }
+
+        // Its own tag, but Unknown (shell_exec, MCP, a module).
+        ordinary(&state, run("run_exec", RunStatus::Completed)).await;
+        call(&state, "run_exec", "tc_e1", Completed).await;
+        tag(
+            &state,
+            "run_exec",
+            1,
+            read("tc_e1", SourceClassification::Unknown),
+        )
+        .await;
+        let (view, body) = peer_run(&state, "run_exec").await;
+        assert_withheld(&view, &body);
+        let (_, list) = get(&state, "/api/v1/peer/runs").await;
+        let relayed: Vec<String> = serde_json::from_value::<Vec<PeerRun>>(
+            serde_json::from_str::<serde_json::Value>(&list).unwrap()["runs"].clone(),
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|run| !run.withheld)
+        .map(|run| run.id)
+        .collect();
+        assert!(relayed.is_empty(), "{relayed:?}");
+    }
+
+    /// #1243 PR-Daemon N1: a run whose tool calls or schedule origin cannot
+    /// be read is withheld, the same run relayed while both can.
+    #[tokio::test]
+    async fn a_run_whose_tool_calls_or_schedule_origin_cannot_be_read_is_withheld() {
+        for table in ["tool_calls", "schedule_source_origin"] {
+            let state = crate::server::tests::state().await;
+            let mut scheduled = run("run_x", RunStatus::Completed);
+            scheduled.schedule_id = Some("user_1".to_owned());
+            ordinary(&state, scheduled).await;
+            assert!(!peer_run(&state, "run_x").await.0.withheld, "{table}");
+
+            sqlx::raw_sql(&format!("DROP TABLE {table}"))
+                .execute(agent24_store::test_hooks::pool(&state.store))
+                .await
+                .unwrap();
+            let (view, body) = peer_run(&state, "run_x").await;
+            assert_withheld(&view, &body);
+            let (status, list) = get(&state, "/api/v1/peer/runs").await;
+            assert_eq!(status, StatusCode::OK, "{table}");
+            assert!(list.contains("\"withheld\":true"), "{table}: {list}");
+            assert!(
+                !list.contains(SECRET),
+                "{table}: withheld content reached a peer: {list}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -547,5 +673,206 @@ mod tests {
         let state = crate::server::tests::state().await;
         let (status, _) = get(&state, "/api/v1/peer/runs/run_missing").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Answers every turn with plain text and no tool calls.
+    struct Done;
+
+    #[async_trait::async_trait]
+    impl agent24_models::ModelProvider for Done {
+        fn name(&self) -> &str {
+            "done"
+        }
+        async fn complete(
+            &self,
+            _req: &agent24_models::CompletionRequest,
+            _cancel: &tokio_util::sync::CancellationToken,
+        ) -> Result<agent24_models::CompletionResponse, agent24_models::ModelError> {
+            Ok(agent24_models::CompletionResponse {
+                message: agent24_models::Msg::assistant(Some("done".into()), vec![]),
+                usage: Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                    cost_usd: 0.0,
+                },
+                model_id: None,
+            })
+        }
+        async fn models(
+            &self,
+            _cancel: &tokio_util::sync::CancellationToken,
+        ) -> Result<Vec<agent24_protocol::Model>, agent24_models::ModelError> {
+            Ok(vec![])
+        }
+    }
+
+    /// #1349 F1: a provider may repeat a call id within a turn. A run parked
+    /// on an approved fs_write whose turn also holds an http_fetch under the
+    /// same id must not settle both on resume: the fetch would run with no row
+    /// of its own, its refusal (which names the address a lookup resolved)
+    /// untagged, and the run relayed. Such a turn is not resumed at all (N1).
+    /// The same run with the fs_write alone is relayed, so the fixture would
+    /// show a leak.
+    #[tokio::test]
+    async fn a_resumed_turn_that_repeats_a_call_id_is_still_withheld() {
+        for repeated in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let note = dir.path().canonicalize().unwrap().join("note.txt");
+            let state = AppState::new(crate::server::AppDeps {
+                token: "testtoken".to_owned(),
+                router: std::sync::Arc::new(agent24_models::router::ModelRouter::with_defaults(
+                    vec![(
+                        std::sync::Arc::new(Done)
+                            as std::sync::Arc<dyn agent24_models::ModelProvider>,
+                        agent24_models::router::Tier::Local,
+                    )],
+                )),
+                tools: agent24_tools::ToolRegistry::builtin(dir.path().to_path_buf()),
+                store: agent24_store::Store::open_memory().await.unwrap(),
+                shutdown: crate::server::Shutdown::new(tokio_util::sync::CancellationToken::new()),
+                guardian: None,
+                memory: None,
+                workspace_service: None,
+                mcp_servers: Vec::new(),
+                risk_overrides: std::sync::Arc::new(
+                    agent24_policy::overrides::RiskOverrideStore::from_rows(Vec::new()),
+                ),
+                packages_root: std::sync::Arc::new(dir.path().to_path_buf()),
+            });
+            let mut parked = run("run_dup", RunStatus::AwaitingApproval);
+            parked.output = None;
+            parked.ended_at = None;
+            state.store.insert_run(&parked).await.unwrap();
+            // Both tools read only their own keys, so one set of arguments
+            // serves either call.
+            let args = serde_json::json!({
+                "path": note.to_str().unwrap(),
+                "content": "x",
+                "url": "http://localhost/",
+            });
+            let mut calls = vec![serde_json::json!({
+                "id": "call_dup", "name": "fs_write", "arguments": args.to_string(),
+            })];
+            if repeated {
+                calls.push(serde_json::json!({
+                    "id": "call_dup", "name": "http_fetch", "arguments": args.to_string(),
+                }));
+            }
+            state
+                .store
+                .append_originated_run_messages(
+                    "run_dup",
+                    &[
+                        agent24_store::OriginatedRunMessage {
+                            message: agent24_store::PendingRunMessage {
+                                role: "user".into(),
+                                content: Some("write it".into()),
+                                tool_calls: serde_json::json!([]),
+                                tool_call_id: None,
+                            },
+                            origin: agent24_store::MessageOrigin::UserPrompt,
+                        },
+                        agent24_store::OriginatedRunMessage {
+                            message: agent24_store::PendingRunMessage {
+                                role: "assistant".into(),
+                                content: None,
+                                tool_calls: serde_json::json!(calls),
+                                tool_call_id: None,
+                            },
+                            origin: agent24_store::MessageOrigin::Assistant,
+                        },
+                    ],
+                    &now_iso8601(),
+                )
+                .await
+                .unwrap();
+            tag(
+                &state,
+                "run_dup",
+                0,
+                SourceRef::user_input("run_dup", now_iso8601()),
+            )
+            .await;
+            state
+                .store
+                .insert_tool_call(&agent24_protocol::ToolCall {
+                    id: "tc_parked".to_owned(),
+                    run_id: "run_dup".to_owned(),
+                    tool: "fs_write".to_owned(),
+                    input: args.as_object().unwrap().clone(),
+                    status: agent24_protocol::ToolCallStatus::Running,
+                    output_summary: None,
+                    started_at: now_iso8601(),
+                    ended_at: None,
+                })
+                .await
+                .unwrap();
+            state
+                .store
+                .insert_approval(&agent24_protocol::Approval {
+                    id: "apr_dup".to_owned(),
+                    run_id: "run_dup".to_owned(),
+                    tool_call_id: "tc_parked".to_owned(),
+                    kind: "write".to_owned(),
+                    summary: "fs_write".to_owned(),
+                    payload: args.as_object().unwrap().clone(),
+                    available_decisions: vec!["approve".to_owned(), "deny".to_owned()],
+                    standing_target: None,
+                    status: agent24_protocol::ApprovalStatus::Pending,
+                    decision: None,
+                    expires_at: agent24_core::util::iso8601_after(std::time::Duration::from_secs(
+                        30,
+                    )),
+                    created_at: now_iso8601(),
+                    decided_at: None,
+                })
+                .await
+                .unwrap();
+            state
+                .broker
+                .resolve(
+                    "apr_dup",
+                    agent24_protocol::Decision {
+                        kind: "approve".to_owned(),
+                        reason: None,
+                        extra: serde_json::Map::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            state
+                .runs
+                .resume_run("run_dup".to_owned(), "apr_dup".to_owned())
+                .await
+                .unwrap();
+            // Resumed: it ends, or parks again on a call it has not been
+            // allowed yet.
+            let mut settled = None;
+            for _ in 0..200 {
+                let run = state.store.get_run("run_dup").await.unwrap().unwrap();
+                let reparked = run.status == RunStatus::AwaitingApproval
+                    && state.store.list_tool_calls("run_dup").await.unwrap().len() > 1;
+                if agent24_core::run_is_terminal(run.status) || reparked {
+                    settled = Some(run);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let settled = settled.expect("the resumed run never settled");
+            let (view, body) = peer_run(&state, "run_dup").await;
+            if repeated {
+                // The turn cannot say which call was approved, so the run
+                // does not resume (#1349 N1): nothing runs, and it stays
+                // withheld.
+                assert_eq!(settled.status, RunStatus::Cancelled, "{body}");
+                assert!(!note.exists(), "nothing ran");
+                assert_withheld(&view, &body);
+            } else {
+                assert!(note.exists(), "the approved write ran: {settled:?}");
+                assert_eq!(settled.status, RunStatus::Completed, "{body}");
+                assert!(!view.withheld, "{body}");
+            }
+        }
     }
 }

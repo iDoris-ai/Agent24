@@ -104,7 +104,31 @@ pub struct HardwareReport {
     pub reasons: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdorisBudgetSuggestion {
+    pub core_reserved_bytes: u64,
+    pub idoris_budget_bytes: u64,
+}
+
 impl HardwareReport {
+    /// A conservative starting estimate, never a recorded allocation. The user
+    /// must confirm or edit it for their actual speech/decision/embedding models.
+    pub fn idoris_budget_suggestion(&self) -> Result<IdorisBudgetSuggestion, &'static str> {
+        if self.profile.total_mem_bytes == 0 {
+            return Err("hardware_memory_unavailable");
+        }
+        let core_reserved_bytes = self.usable_bytes.min(4 * 1024 * 1024 * 1024);
+        Ok(IdorisBudgetSuggestion {
+            core_reserved_bytes,
+            idoris_budget_bytes: self.idoris_budget_bytes(core_reserved_bytes),
+        })
+    }
+    /// Usable already excludes OS and app overhead. Deduct only the explicit
+    /// core allocation and preserve a real zero.
+    pub fn idoris_budget_bytes(&self, core_reserved_bytes: u64) -> u64 {
+        self.usable_bytes.saturating_sub(core_reserved_bytes)
+    }
+
     /// Build from a profile and an (already read) `A24_HW_BUDGET_CAP_GB`.
     pub fn new(profile: HardwareProfile, cap_gb_raw: Option<&str>) -> Self {
         let b = Budget::compute(&profile, cap_gb_raw);

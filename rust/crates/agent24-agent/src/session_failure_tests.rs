@@ -99,11 +99,13 @@ async fn assert_quota_rejection(rows: i64) {
 
     let first = manager
         .start_run(RunCreate {
+            idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some("quota-session".to_owned()),
             prompt: "this turn cannot be stored".to_owned(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -138,11 +140,13 @@ async fn assert_quota_rejection(rows: i64) {
 
     let second = manager
         .start_run(RunCreate {
+            idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some("quota-session".to_owned()),
             prompt: "next turn".to_owned(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -219,11 +223,13 @@ async fn lock_timeout_keeps_run_completed_and_reports_failed_memory_write() {
 
     let run = manager
         .start_run(RunCreate {
+            idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some("timeout-lock-session".to_owned()),
             prompt: "lock timeout".to_owned(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -285,11 +291,13 @@ async fn committed_turn_waits_for_ack_after_deadline_and_is_available_next_round
 
     let first = manager
         .start_run(RunCreate {
+            idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some("commit-ack-session".to_owned()),
             prompt: "first committed prompt".to_owned(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -352,11 +360,13 @@ async fn committed_turn_waits_for_ack_after_deadline_and_is_available_next_round
     );
     let second = manager
         .start_run(RunCreate {
+            idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some("commit-ack-session".to_owned()),
             prompt: "second prompt".to_owned(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -418,11 +428,13 @@ async fn summarizer_timeout_keeps_durable_originals_without_write_failed_event()
 
     let run = manager
         .start_run(RunCreate {
+            idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some("timeout-summary-session".to_owned()),
             prompt: "original survives summary timeout".to_owned(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -578,11 +590,13 @@ async fn cancel_during_sqlite_commit_does_not_release_session_lock_before_commit
     // B reaches the provider and pauses after obtaining its read-side session lock.
     let b = manager
         .start_run(RunCreate {
+            idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some("commit-cancel-race".into()),
             prompt: "B question".into(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();
@@ -593,11 +607,13 @@ async fn cancel_during_sqlite_commit_does_not_release_session_lock_before_commit
     armed.store(true, Ordering::SeqCst);
     let a = manager
         .start_run(RunCreate {
+            idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some("commit-cancel-race".into()),
             prompt: "A question".into(),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         })
         .await
         .unwrap();

@@ -1,0 +1,6 @@
+{ "$comment": "§12 #20 v1 default, R6.4: operations.read is disabled on the server, so read is forbidden/operation_disabled; a new credential would not help.",
+  "op": "knowledge.read",
+  "request": { "protocol_version": 1, "request_id": "01JB3V8J9K0M1N2P3Q4R5S6T7V", "generation": 15,
+    "scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-7" },
+  "response": { "status": 403, "body": { "error": { "code": "forbidden", "message": "Operation is not allowed.",
+    "details": { "retryable": false, "reason": "operation_disabled", "request_id": "01JB3V8J9K0M1N2P3Q4R5S6T7V", "generation": 15 } } } } }

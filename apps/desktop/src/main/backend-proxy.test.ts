@@ -32,6 +32,9 @@ describe('A1 template matching ({param} = one safe segment)', () => {
 })
 
 describe('A1 findAllowedRoute', () => {
+  it('allows creating a confirmed rerun through the backend proxy', () => {
+    expect(isAllowedProxyRoute('POST', '/api/v1/runs')).toBe(true)
+  })
   it('ignores the query string and requires the exact method', () => {
     expect(isAllowedProxyRoute('GET', '/api/v1/approvals?status=pending')).toBe(true)
     expect(isAllowedProxyRoute('GET', '/api/v1/usage?module=agentear')).toBe(true)
@@ -118,11 +121,11 @@ describe('A2 proxyRequest', () => {
   afterEach(async () => {
     await Promise.all(servers.splice(0).map((s) => new Promise<void>((r) => { s.closeAllConnections(); s.close(() => r()) })))
   })
-  async function serve(handler: http.RequestListener): Promise<{ port: number; token: string }> {
+  async function serve(handler: http.RequestListener): Promise<{ port: number; authHeaders: Record<string, string> }> {
     const s = http.createServer(handler)
     servers.push(s)
     await new Promise<void>((r) => s.listen(0, '127.0.0.1', r))
-    return { port: (s.address() as AddressInfo).port, token: 't' }
+    return { port: (s.address() as AddressInfo).port, authHeaders: { Authorization: 'Bearer t' } }
   }
 
   it('defaults are 30 s and 8 MiB', () => {
@@ -179,7 +182,7 @@ describe('A2 proxyRequest', () => {
     await new Promise<void>((r) => s.listen(0, '127.0.0.1', r))
     const port = (s.address() as AddressInfo).port
     await new Promise<void>((r) => s.close(() => r()))
-    const out = await proxyRequest({ port, token: '' }, { method: 'GET', path: '/x' })
+    const out = await proxyRequest({ port, authHeaders: {} }, { method: 'GET', path: '/x' })
     expect(out.ok).toBe(false)
     expect((out.data as { error: { code: string; message: string } }).error.code).toBe('proxy_failed')
   })

@@ -78,7 +78,7 @@ done
 ZIP="$OUT/agent24-cli-macos-$ARCH.zip"
 # zip 内直接放二进制（无多余目录层）；ditto 保留元数据，notarytool 接受 zip
 rm -f "$ZIP"
-( cd "$OUT/stage" && ditto -c -k . "$ZIP" )
+( cd "$OUT/stage" && ditto -c -k --norsrc . "$ZIP" )
 
 if [[ "${SKIP_NOTARIZE:-0}" != "1" ]]; then
   SUBMIT="$OUT/notarize-submission.json"

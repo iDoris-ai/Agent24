@@ -1,0 +1,32 @@
+{
+  "client_protocol_version": 1,
+  "cases": [
+    {
+      "name": "same_version",
+      "daemon": 1,
+      "client": 1,
+      "compatible": true
+    },
+    {
+      "name": "old_daemon_missing_version",
+      "daemon": null,
+      "client": 1,
+      "compatible": false,
+      "reason": "daemon 版本过旧，请升级"
+    },
+    {
+      "name": "daemon_ahead",
+      "daemon": 2,
+      "client": 1,
+      "compatible": false,
+      "reason": "协议版本不兼容：daemon 协议版本 2，客户端协议版本 1"
+    },
+    {
+      "name": "client_ahead",
+      "daemon": 1,
+      "client": 2,
+      "compatible": false,
+      "reason": "协议版本不兼容：daemon 协议版本 1，客户端协议版本 2"
+    }
+  ]
+}

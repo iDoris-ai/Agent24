@@ -14,14 +14,21 @@ use std::time::Duration;
 use agent24_protocol::state_file::{self, DaemonState};
 use agent24_protocol::{
     AttachedAddRequest, AttachedAddResponse, AttachedList, ChatMessage, ChatRequest, ChatResponse,
-    Health,
 };
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use zeroize::{Zeroize, Zeroizing};
 
 mod acp;
+mod comm_groups;
 mod documents;
+mod enroll;
+mod idoris;
+mod module_tools;
+mod offline_db;
+mod query;
+mod runs;
+mod schedules;
 mod service;
 mod tui;
 
@@ -45,9 +52,29 @@ enum Command {
         /// Model id override
         #[arg(long)]
         model: Option<String>,
+        /// Chat with the daemon's personal memory, as the desktop's chat page
+        /// does for each conversation: what you remember is recalled for the
+        /// reply, and an explicit "记住…" is kept unless memory is paused, with
+        /// the daemon's receipt printed, a failed save included (none when the
+        /// message is not an explicit remember, or the daemon has no personal
+        /// memory). Memory is
+        /// shared by all your conversations; this id files the turn under one
+        /// of them, whose source floor (the strictest source it has recalled) a
+        /// new memory takes. Only this one message is sent, not the turns
+        /// before it
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        session: Option<String>,
+        /// Confirm using iDoris's reserved memory headroom for this request
+        #[arg(long)]
+        confirm_headroom: bool,
     },
     /// List models known to the daemon
     Models,
+    /// Install, run and connect managed iDoris through the daemon
+    Idoris {
+        #[command(subcommand)]
+        action: idoris::IdorisAction,
+    },
     /// Install/remove 24/7 unattended operation (macOS LaunchAgent)
     Service {
         #[command(subcommand)]
@@ -76,6 +103,9 @@ enum Command {
     Comm {
         #[command(subcommand)]
         action: CommAction,
+        /// 原样输出完整 JSON 响应
+        #[arg(long, global = true)]
+        json: bool,
     },
     /// Serve agent24d as an MCP server over stdio, so an external MCP client
     /// (Claude Desktop, another agent) can run tasks on it and introspect it.
@@ -85,8 +115,9 @@ enum Command {
     /// Open Design uses this bridge for its Creative runtime.
     Acp,
     /// Export/delete the local decision log (D0-2; `docs/agent/PLAN-DECIDE.md`
-    /// §2.1-§2.3). Like `os install`/`uninstall`, this does NOT go through the
-    /// daemon — see `cmd_decide`'s doc comment.
+    /// §2.1-§2.3). No export/delete route exists, so these use the offline
+    /// database gate — see `cmd_decide`. `profile` is the exception: a
+    /// read-only daemon GET.
     Decide {
         #[command(subcommand)]
         action: DecideAction,
@@ -96,6 +127,70 @@ enum Command {
         #[command(subcommand)]
         action: HwAction,
     },
+    /// 会话：列出或读取一条（只读）
+    Session {
+        #[command(subcommand)]
+        action: query::SessionAction,
+    },
+    /// run：列出、读取、取消，或列出 peer 可见的 run（桌面端 Runs 页）
+    #[command(alias = "runs")]
+    Run {
+        #[command(subcommand)]
+        action: query::RunAction,
+    },
+    /// 个人记忆：列出断言或读取暂停开关（只读）
+    Memory {
+        #[command(subcommand)]
+        action: query::MemoryAction,
+    },
+    /// 定时任务：列出、读取、创建、修改、删除、立即触发（桌面端 Schedules 页）
+    #[command(alias = "schedules")]
+    Schedule {
+        #[command(subcommand)]
+        action: query::ScheduleAction,
+    },
+    /// 本次 daemon 启动以来的 token / 费用（只读）
+    Usage {
+        #[arg(long, help = "原样输出 JSON 响应")]
+        json: bool,
+    },
+    /// 模型调用耗时：逐行，或 --summary 汇总（只读）
+    Timings {
+        /// 按 source、model、step 汇总
+        #[arg(long)]
+        summary: bool,
+        /// 只看这个 source（不能和 --summary 一起用）
+        #[arg(long)]
+        source: Option<String>,
+        /// 时间下界，原样传给 timing store
+        #[arg(long)]
+        since: Option<String>,
+        /// 条数。daemon 默认 500，上限 5000（不能和 --summary 一起用）
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long, help = "原样输出 JSON 响应")]
+        json: bool,
+    },
+    /// 模块工具授权：列出或导出（只读）
+    Consent {
+        #[command(subcommand)]
+        action: query::ConsentAction,
+    },
+    /// 模块工具授权卡片与决定
+    ModuleConsents {
+        #[command(subcommand)]
+        action: module_tools::Action,
+    },
+    /// 模块审批（只读）
+    Approval {
+        #[command(subcommand)]
+        action: query::ApprovalAction,
+    },
+    /// 工具清单、长期授权、风险覆盖（只读）
+    Tools {
+        #[command(subcommand)]
+        action: query::ToolsAction,
+    },
 }
 
 /// `agent24 hw …` (HW-1).
@@ -104,6 +199,14 @@ enum HwAction {
     /// Probe this machine now and print JSON: profile, level, usable_bytes,
     /// reasons. `A24_HW_BUDGET_CAP_GB=<n>` simulates a smaller machine.
     Probe,
+    /// Print a nonsecret environment assignment for an independently started
+    /// iDoris. Core reservations are explicit; no daemon is started or owned.
+    IdorisEnv {
+        /// Bytes reserved for voice, decision, embedding and other core models.
+        /// Use the actual allocation; zero must be chosen explicitly.
+        #[arg(long)]
+        core_reserved_bytes: u64,
+    },
 }
 
 /// `agent24 decide …` (D0-2).
@@ -129,6 +232,11 @@ enum DecideAction {
     Delete {
         #[command(subcommand)]
         action: DecideDeleteAction,
+    },
+    /// 读取硬件档位与决策模型有效档（只读，走 daemon）
+    Profile {
+        #[arg(long, help = "原样输出 JSON 响应")]
+        json: bool,
     },
 }
 
@@ -205,6 +313,14 @@ enum OsAction {
         #[command(subcommand)]
         action: OsAttachAction,
     },
+    /// Let first-party clients write to a module's current HTTP routes
+    /// (capabilities mode). ProductHost executes directly; first-party clients
+    /// require approval in the Agent24 app. A new module version or route set
+    /// needs a new delegation.
+    Delegate {
+        /// Module name, e.g. documents
+        name: String,
+    },
 }
 
 /// `agent24 os attach …` (A3-2a; §3.2/§3.6).
@@ -253,6 +369,11 @@ enum OsAttachAction {
 /// `agent24 comm …` (COMM-2a/2b; COMM-HYPHAE.md §4's CLI/REST 1:1 mapping).
 #[derive(Subcommand)]
 enum CommAction {
+    /// 群聊管理与消息投递
+    Groups {
+        #[command(subcommand)]
+        action: comm_groups::GroupsAction,
+    },
     /// Manage Hyphae identities
     Identity {
         #[command(subcommand)]
@@ -445,9 +566,24 @@ enum ServiceAction {
 
 struct Endpoint {
     base: String,
+    /// The bearer in legacy / ephemeral mode. Empty in capabilities mode:
+    /// there the enrolled token stays in the session's `Zeroizing` buffer and
+    /// is read through [`Endpoint::token`], so no plain copy is kept (#1446 F4).
     token: String,
     /// Ephemeral child to terminate when the CLI exits (standalone mode)
     child: Option<tokio::process::Child>,
+    /// Capabilities-mode enrolment (CORE-2 S4): holds the live enrolment
+    /// connection that `elevate` needs. `None` in legacy/ephemeral mode.
+    session: Option<Box<enroll::Session>>,
+}
+
+impl Endpoint {
+    /// The bearer to send: the enrolled session's token, else `token`.
+    fn token(&self) -> &str {
+        self.session
+            .as_deref()
+            .map_or(self.token.as_str(), enroll::Session::token)
+    }
 }
 
 const HOST_AUTHORITY_UNAVAILABLE: &str = "host authority unavailable";
@@ -543,6 +679,7 @@ fn endpoint_from_state(state: DaemonState) -> Result<Endpoint, String> {
         base: format!("http://127.0.0.1:{}", state.port),
         token,
         child: None,
+        session: None,
     })
 }
 
@@ -570,6 +707,10 @@ fn parse_ready_state(value: &serde_json::Value, pid: u32) -> Result<DaemonState,
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    let protocol_version = value
+        .get("protocol_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok());
     let state = DaemonState {
         port,
         token,
@@ -577,6 +718,8 @@ fn parse_ready_state(value: &serde_json::Value, pid: u32) -> Result<DaemonState,
         version: value["version"].as_str().unwrap_or("").to_owned(),
         generation: value["generation"].as_str().unwrap_or("").to_owned(),
         auth_mode,
+        protocol_version,
+        enroll_endpoint: value["enroll_endpoint"].as_str().map(str::to_owned),
     };
     state
         .validate()
@@ -597,7 +740,41 @@ fn agent24d_binary() -> String {
         .unwrap_or_else(|| "agent24d".to_owned())
 }
 
-async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::Child), String> {
+/// Why `spawn_daemon` got no ready line.
+#[derive(Debug)]
+struct SpawnError {
+    message: String,
+    /// The start may have lost a concurrent-start race, so a winner may be
+    /// coming up: the daemon said `already_running`, or it gave no reason.
+    /// A daemon that said why it failed otherwise had no winner to wait for.
+    maybe_raced: bool,
+}
+
+impl From<String> for SpawnError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            maybe_raced: true,
+        }
+    }
+}
+
+impl From<&str> for SpawnError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+/// A SPEC-002 §4 `failed` line: what the daemon said before exiting.
+fn start_failure(line: &serde_json::Value) -> SpawnError {
+    let error = line["error"].as_str().unwrap_or("it gave no reason");
+    SpawnError {
+        message: format!("agent24d did not start: {error}"),
+        maybe_raced: line["code"] == "already_running",
+    }
+}
+
+async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::Child), SpawnError> {
     let bin = agent24d_binary();
     let mut cmd = tokio::process::Command::new(&bin);
     let mut args = vec!["serve", "--port", "0"];
@@ -615,47 +792,213 @@ async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::C
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn {bin}: {e}"))?;
-    let stdout = child.stdout.take().ok_or("no stdout from agent24d")?;
-    let mut lines = BufReader::new(stdout).lines();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        let next = tokio::time::timeout_at(deadline, lines.next_line()).await;
-        let line = match next {
-            Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => return Err("agent24d exited before ready line".to_owned()),
-            Ok(Err(e)) => return Err(format!("reading agent24d stdout: {e}")),
-            Err(_) => return Err("agent24d did not become ready within 15s".to_owned()),
-        };
-        if let Ok(state) = serde_json::from_str::<serde_json::Value>(&line)
-            && state["type"] == "ready"
-        {
-            let pid = child.id().unwrap_or(0);
-            let parsed = parse_ready_state(&state, pid)?;
-            return Ok((parsed, child));
+    let state = wait_daemon_ready(&mut child, Duration::from_secs(15)).await?;
+    Ok((state, child))
+}
+
+async fn wait_daemon_ready(
+    child: &mut tokio::process::Child,
+    budget: Duration,
+) -> Result<DaemonState, SpawnError> {
+    let result = async {
+        let stdout = child.stdout.take().ok_or("no stdout from agent24d")?;
+        let mut lines = BufReader::new(stdout).lines();
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let next = tokio::time::timeout_at(deadline, lines.next_line()).await;
+            let line = match next {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) => return Err("agent24d exited before ready line".into()),
+                Ok(Err(e)) => return Err(format!("reading agent24d stdout: {e}").into()),
+                Err(_) => return Err("agent24d did not become ready within 15s".into()),
+            };
+            let Ok(state) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if state["type"] == "ready" {
+                let pid = child.id().unwrap_or(0);
+                let parsed = parse_ready_state(&state, pid)?;
+                return Ok(parsed);
+            }
+            if state["type"] == "failed" {
+                return Err(start_failure(&state));
+            }
         }
+    }
+    .await;
+    if result.is_err() {
+        // Startup never transferred ownership to the caller.
+        let _ = child.kill().await;
+    }
+    result
+}
+
+/// What `connect` should do with a daemon `read_live` already found.
+enum DiscoveredAttach {
+    Ready(Endpoint),
+    /// Protocol mismatch, or a capability daemon that still has no host bearer.
+    /// `connect` returns this to the user and does not spawn another daemon.
+    Incompatible(String),
+    /// Capabilities-mode enrolment was attempted and refused (CORE-2 S4).
+    /// Kept apart from `Incompatible` so `--json` can print the daemon's code.
+    EnrollFailed(enroll::EnrollError),
+    /// Nothing answered. `connect` may spawn an ephemeral daemon.
+    Unreachable,
+}
+
+#[derive(serde::Deserialize)]
+struct HealthAdvertisement {
+    #[serde(default)]
+    protocol_version: Option<u32>,
+}
+
+/// What `daemon status` reads from `GET /api/v1/health`. Unlike the strict
+/// `Health` resource, a missing `protocol_version` is an old daemon, not a
+/// parse error. Other fields added after that daemon shipped are skipped
+/// the same way.
+#[derive(serde::Deserialize)]
+struct StatusHealth {
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    backend: String,
+    #[serde(default)]
+    protocol_version: Option<u32>,
+}
+
+/// `Ok(None)` is a live daemon that did not advertise a protocol version
+/// (an old `/health`). `Err` means the probe itself failed.
+async fn fetch_protocol_version(base: &str, token: &str) -> Result<Option<u32>, ()> {
+    let req = client().get(format!("{base}/api/v1/health"));
+    let req = if token.is_empty() {
+        req
+    } else {
+        req.bearer_auth(token)
+    };
+    let response = req
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|_| ())?;
+    if !response.status().is_success() {
+        return Err(());
+    }
+    match response.json::<HealthAdvertisement>().await {
+        Ok(body) => Ok(body.protocol_version),
+        // A 200 that is not the health object is still a live peer we must
+        // not attach to, and must not paper over by spawning a second daemon.
+        Err(_) => Ok(None),
     }
 }
 
-/// Attached if a live daemon is discoverable and healthy; standalone otherwise.
-async fn connect() -> Result<Endpoint, String> {
-    if let Some(state) = state_file::read_live() {
-        let base = format!("http://127.0.0.1:{}", state.port);
-        if state.auth_mode.is_capabilities() {
-            // Health is deliberately anonymous, but it never grants the
-            // bearer needed by the operation that called `connect`.
-            let _ = health_ok(&base, "").await;
-            return Err(HOST_AUTHORITY_UNAVAILABLE.to_owned());
+fn incompatible_daemon_error(daemon: Option<u32>, client: u32, recorded: Option<u32>) -> String {
+    let reason = match agent24_protocol::protocol_compatibility(daemon, client) {
+        Err(reason) => reason,
+        Ok(()) => "协议版本不兼容".to_owned(),
+    };
+    let daemon_label = match daemon {
+        Some(version) => version.to_string(),
+        None => "未知".to_owned(),
+    };
+    let recorded_note = match recorded {
+        Some(version) => format!("daemon.json 记录的协议版本为 {version}。"),
+        None => "daemon.json 没有记录协议版本。".to_owned(),
+    };
+    format!(
+        "无法接入 daemon：{reason}。daemon 协议版本 {daemon_label}，客户端协议版本 {client}。\
+         {recorded_note}\
+         请升级较旧的一方，使两边协议版本一致，然后先 agent24 daemon stop 再 agent24 daemon start（或 service install）。\
+         协议版本不一致时不要继续使用这个 daemon。"
+    )
+}
+
+async fn attach_discovered(state: &DaemonState) -> DiscoveredAttach {
+    attach_discovered_with(state, true).await
+}
+
+/// `enroll_if_possible = false` keeps the pre-S4 answer for capabilities mode
+/// (`host authority unavailable`): best-effort callers such as the uninstall
+/// hot-stop must not pop an approval prompt or enrol just to probe.
+async fn attach_discovered_with(state: &DaemonState, enroll_if_possible: bool) -> DiscoveredAttach {
+    let client_version = agent24_protocol::PROTOCOL_VERSION;
+    // Probe first. A leftover daemon.json with no protocol_version, or a
+    // record that names another version, must not refuse a port that is
+    // down or a live daemon that actually speaks this protocol. The record
+    // is quoted only after a successful probe.
+    let base = format!("http://127.0.0.1:{}", state.port);
+    let daemon_protocol = match fetch_protocol_version(&base, discovery_health_token(state)).await {
+        Ok(version) => version,
+        Err(()) => {
+            if state.auth_mode.is_capabilities() {
+                // Health is deliberately anonymous, but it never grants the
+                // bearer needed by the operation that called `connect`.
+                return DiscoveredAttach::Incompatible(HOST_AUTHORITY_UNAVAILABLE.to_owned());
+            }
+            return DiscoveredAttach::Unreachable;
         }
-        if health_ok(&base, discovery_health_token(&state)).await {
-            return endpoint_from_state(state);
+    };
+    if agent24_protocol::protocol_compatibility(daemon_protocol, client_version).is_err() {
+        return DiscoveredAttach::Incompatible(incompatible_daemon_error(
+            daemon_protocol,
+            client_version,
+            state.protocol_version,
+        ));
+    }
+    if state.auth_mode.is_capabilities() {
+        if let (true, Some(socket)) = (enroll_if_possible, state.enroll_endpoint.as_deref()) {
+            // The session's `enrolled` frame must name `state.port`, or the
+            // token would go to whoever listens there (#1446 F1).
+            let enrolled =
+                enroll::enroll(std::path::Path::new(socket), &state.generation, state.port).await;
+            return match enrolled {
+                Ok(session) => DiscoveredAttach::Ready(Endpoint {
+                    base,
+                    token: String::new(),
+                    child: None,
+                    session: Some(Box::new(session)),
+                }),
+                Err(err) => DiscoveredAttach::EnrollFailed(err),
+            };
+        }
+        return DiscoveredAttach::Incompatible(HOST_AUTHORITY_UNAVAILABLE.to_owned());
+    }
+    match endpoint_from_state(state.clone()) {
+        Ok(endpoint) => DiscoveredAttach::Ready(endpoint),
+        Err(err) => DiscoveredAttach::Incompatible(err),
+    }
+}
+
+/// Attached if a live daemon is discoverable, healthy, and on this protocol.
+/// An incompatible daemon is an error: do not attach, and do not spawn another.
+/// Standalone (ephemeral) only when nothing is there to attach to.
+async fn connect() -> Result<Endpoint, String> {
+    connect_detailed().await.map_err(|e| e.message)
+}
+
+/// Like [`connect`], but keeps the machine-readable error code for `--json`
+/// callers (`daemon_unavailable` unless enrolment itself said otherwise).
+async fn connect_detailed() -> Result<Endpoint, enroll::EnrollError> {
+    let unavailable = |message: String| enroll::EnrollError {
+        code: "daemon_unavailable".to_owned(),
+        message,
+    };
+    if let Some(state) = state_file::read_live() {
+        match attach_discovered(&state).await {
+            DiscoveredAttach::Ready(endpoint) => return Ok(endpoint),
+            DiscoveredAttach::Incompatible(err) => return Err(unavailable(err)),
+            DiscoveredAttach::EnrollFailed(err) => return Err(err),
+            DiscoveredAttach::Unreachable => {}
         }
     }
-    let (state, child) = spawn_daemon(true).await?;
+    let (state, child) = spawn_daemon(true)
+        .await
+        .map_err(|err| unavailable(err.message))?;
     let base = format!("http://127.0.0.1:{}", state.port);
     Ok(Endpoint {
         base,
-        token: host_token(&state)?.to_owned(),
+        token: host_token(&state).map_err(unavailable)?.to_owned(),
         child: Some(child),
+        session: None,
     })
 }
 
@@ -669,17 +1012,33 @@ async fn finish(mut ep: Endpoint) {
 /// `connect`, which falls back to `spawn_daemon` when none is found) — for a
 /// best-effort step (FU-61's `uninstall` hot-disable) that must not bring up
 /// a fresh ephemeral daemon, which could run the very package being removed.
-/// `None` if no live daemon is discoverable or healthy.
-async fn attach_only() -> Option<Endpoint> {
-    let state = state_file::read_live()?;
-    if state.auth_mode.is_capabilities() {
-        return None;
+///
+/// `Ok(None)` if no live daemon is discoverable or healthy. `Err` is a daemon
+/// that is up but must not be used; callers keep that error and do not send.
+async fn attach_only() -> Result<Option<Endpoint>, String> {
+    attach_only_with_enrollment(false).await
+}
+
+async fn attach_only_with_enrollment(enroll: bool) -> Result<Option<Endpoint>, String> {
+    match state_file::read_live() {
+        Some(state) => attach_only_from(&state, enroll).await,
+        None => Ok(None),
     }
-    let base = format!("http://127.0.0.1:{}", state.port);
-    health_ok(&base, discovery_health_token(&state))
-        .await
-        .then(|| endpoint_from_state(state).ok())
-        .flatten()
+}
+
+async fn attach_only_from(state: &DaemonState, enroll: bool) -> Result<Option<Endpoint>, String> {
+    // Same checks as `connect`: probe `/health` first, then the live
+    // advertisement. `Ok(None)` only when there is nothing to attach to.
+    match attach_discovered_with(state, enroll).await {
+        DiscoveredAttach::Ready(endpoint) => Ok(Some(endpoint)),
+        DiscoveredAttach::Unreachable => Ok(None),
+        // Capability discovery has no host bearer. Callers already treat that
+        // as "nothing to attach to". A protocol mismatch must stay an error
+        // so os enable/disable and the uninstall hot-stop do not send.
+        DiscoveredAttach::Incompatible(err) if err == HOST_AUTHORITY_UNAVAILABLE => Ok(None),
+        DiscoveredAttach::Incompatible(err) => Err(err),
+        DiscoveredAttach::EnrollFailed(err) => Err(err.message),
+    }
 }
 
 /// Serve agent24d as an MCP server over stdio (E4). Attaches to the running
@@ -693,7 +1052,7 @@ async fn cmd_mcp() -> Result<(), String> {
             .ok()
             .as_deref(),
     );
-    let result = agent24_mcp::server::Agent24Server::new(ep.base.clone(), ep.token.clone())
+    let result = agent24_mcp::server::Agent24Server::new(ep.base.clone(), ep.token().to_owned())
         .with_run_timeout(run_timeout)
         .serve_stdio()
         .await
@@ -713,23 +1072,164 @@ async fn cmd_acp() -> Result<(), String> {
 }
 
 fn bearer(ep: &Endpoint, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    if ep.token.is_empty() {
+    if ep.token().is_empty() {
         rb
     } else {
-        rb.bearer_auth(&ep.token)
+        rb.bearer_auth(ep.token())
     }
 }
 
-async fn cmd_chat(message: String, model: Option<String>) -> Result<(), String> {
-    let ep = connect().await?;
-    let req = ChatRequest {
+/// Legacy replies retain reqwest's decoding and body-read error semantics.
+/// Capabilities replies are buffered to inspect the presence_required code.
+struct Reply {
+    status: reqwest::StatusCode,
+    body: ReplyBody,
+}
+
+enum ReplyBody {
+    Legacy(reqwest::Response),
+    Buffered(Vec<u8>),
+}
+
+impl Reply {
+    async fn json<T: serde::de::DeserializeOwned>(self) -> Result<T, String> {
+        match self.body {
+            ReplyBody::Legacy(res) => res.json().await.map_err(|e| e.to_string()),
+            ReplyBody::Buffered(body) => serde_json::from_slice(&body).map_err(|e| e.to_string()),
+        }
+    }
+
+    async fn json_value(self) -> serde_json::Value {
+        self.json().await.unwrap_or_default()
+    }
+
+    fn presence_required(&self) -> bool {
+        self.status == reqwest::StatusCode::FORBIDDEN
+            && match &self.body {
+                ReplyBody::Buffered(body) => serde_json::from_slice::<serde_json::Value>(body)
+                    .is_ok_and(|value| value["error"]["code"] == "presence_required"),
+                ReplyBody::Legacy(_) => false,
+            }
+    }
+}
+
+/// Why [`send_elevating`] produced no reply.
+enum SendError {
+    Http(reqwest::Error),
+    /// Enrolment/elevation failed; carries the `--json` error code.
+    Enroll(enroll::EnrollError),
+}
+
+impl SendError {
+    /// `(code, message)` for the A3 §3.6 failure shape.
+    fn parts(self) -> (String, String) {
+        match self {
+            Self::Http(e) => ("daemon_unavailable".to_owned(), e.to_string()),
+            Self::Enroll(e) => (e.code, e.message),
+        }
+    }
+}
+
+/// `{"error":{"code","message"}}` with an explicit code.
+fn error_envelope(code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({"error": {"code": code, "message": message}})
+}
+
+/// Send one daemon request. In capabilities mode (an enrolled session), a
+/// `403 presence_required` is answered by one `elevate` round on the same
+/// enrolment connection, then ONE retry carrying `X-Agent24-Elevation`. In
+/// legacy mode there is no session and this is exactly one plain request.
+/// `body`, when present, is the exact JSON bytes sent (and hashed).
+async fn send_elevating(
+    ep: &Endpoint,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Vec<u8>>,
+    timeout: Duration,
+    json_content: bool,
+) -> Result<Reply, SendError> {
+    let url = format!("{}{path}", ep.base);
+    let build = |grant: Option<&str>| {
+        let mut rb = bearer(ep, client().request(method.clone(), &url)).timeout(timeout);
+        if let Some(bytes) = &body {
+            if json_content {
+                rb = rb.header(reqwest::header::CONTENT_TYPE, "application/json");
+            }
+            rb = rb.body(bytes.clone());
+        }
+        if let Some(grant) = grant
+            && let Ok(mut value) = reqwest::header::HeaderValue::from_str(grant)
+        {
+            value.set_sensitive(true);
+            rb = rb.header("X-Agent24-Elevation", value);
+        }
+        rb
+    };
+    let response = build(None).send().await.map_err(SendError::Http)?;
+    let Some(session) = &ep.session else {
+        return Ok(Reply {
+            status: response.status(),
+            body: ReplyBody::Legacy(response),
+        });
+    };
+    let first = read_reply(Ok(response)).await.map_err(SendError::Http)?;
+    if !first.presence_required() {
+        return Ok(first);
+    }
+    let grant = session
+        .elevate(method.as_str(), path, body.as_deref().unwrap_or_default())
+        .await
+        .map_err(SendError::Enroll)?;
+    read_reply(build(Some(grant.as_str())).send().await)
+        .await
+        .map_err(SendError::Http)
+}
+
+async fn read_reply(
+    sent: Result<reqwest::Response, reqwest::Error>,
+) -> Result<Reply, reqwest::Error> {
+    let res = sent?;
+    let status = res.status();
+    let body = res.bytes().await?.to_vec();
+    Ok(Reply {
+        status,
+        body: ReplyBody::Buffered(body),
+    })
+}
+
+fn chat_request(
+    message: String,
+    model: Option<String>,
+    session: Option<String>,
+    confirm_headroom: bool,
+) -> ChatRequest {
+    ChatRequest {
+        idoris_headroom_confirmed: confirm_headroom,
         messages: vec![ChatMessage {
             role: "user".to_owned(),
             content: message,
         }],
         model,
-        session_id: None,
-    };
+        session_id: session,
+    }
+}
+
+fn receipt_line(receipt: agent24_protocol::MemoryReceipt) -> &'static str {
+    match receipt {
+        agent24_protocol::MemoryReceipt::Saved => "remembered",
+        agent24_protocol::MemoryReceipt::PausedNotSaved => {
+            "not remembered: personal memory is paused"
+        }
+        agent24_protocol::MemoryReceipt::Failed => "not remembered: saving it failed",
+        agent24_protocol::MemoryReceipt::NotSaved => "this turn was not saved to the session",
+        agent24_protocol::MemoryReceipt::Partial => {
+            "conversation saved, but the memory itself was not"
+        }
+    }
+}
+
+async fn cmd_chat(req: ChatRequest) -> Result<(), String> {
+    let ep = connect().await?;
     let result = bearer(&ep, client().post(format!("{}/api/v1/chat", ep.base)))
         .timeout(Duration::from_secs(180))
         .json(&req)
@@ -737,14 +1237,34 @@ async fn cmd_chat(message: String, model: Option<String>) -> Result<(), String> 
         .await;
     let out = match result {
         Ok(res) if res.status().is_success() => {
+            let gateway_record_id = res
+                .headers()
+                .get("x-idoris-record-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let body: ChatResponse = res.json().await.map_err(|e| e.to_string())?;
             println!("{}", body.message.content);
             println!("· {} tokens", body.usage.total_tokens);
+            // What the daemon did with an explicit "记住…", never what the
+            // reply claims (the desktop shows the same receipt).
+            if let Some(receipt) = body.memory_receipt {
+                println!("· {}", receipt_line(receipt));
+            }
+            if let Some(record_id) = gateway_record_id {
+                println!("· iDoris record {record_id}");
+            }
             Ok(())
         }
         Ok(res) => {
             let status = res.status();
             let body = res.text().await.unwrap_or_default();
+            if serde_json::from_str::<agent24_protocol::ErrorEnvelope>(&body)
+                .is_ok_and(|body| body.error.code == "idoris_headroom_confirmation_required")
+            {
+                eprintln!(
+                    "iDoris needs reserved memory headroom. Resend with --confirm-headroom to confirm this request."
+                );
+            }
             Err(format!("daemon returned {status}: {body}"))
         }
         Err(e) => Err(e.to_string()),
@@ -832,43 +1352,15 @@ async fn os_local(action: &OsAction) -> Option<Result<(), String>> {
     };
     match action {
         OsAction::Install { path } => {
-            Some(match agent24_os_packages::install::install(path, &root) {
-                Ok(dest) => {
-                    // Grants from an earlier install of this name end now,
-                    // or this install does not stand (K1-6a-G §2.1 F1):
-                    // undone, so running it again retries the revocation.
-                    let revoked = match dest.file_name().and_then(|n| n.to_str()) {
-                        Some(module) => match revoke_module_consents(module).await {
-                            Ok(()) => Ok(()),
-                            Err(e) => {
-                                let undone = agent24_os_packages::install::uninstall(module, &root);
-                                Err(match undone {
-                                    Ok(_) => format!("{e}; the install was undone"),
-                                    Err(u) => format!("{e}; the install could not be undone: {u}"),
-                                })
-                            }
-                        },
-                        None => Ok(()),
-                    };
-                    if revoked.is_ok() {
-                        println!("installed {}", dest.display());
-                        println!(
-                            "  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start"
-                        );
-                        // Said out loud because the isolation is deliberate and
-                        // therefore permanent: an ephemeral daemon (`agent24 chat`
-                        // with nothing running) resolves a different packages root
-                        // and will never see this package. Without this line the two
-                        // lines above are, for that user, a promise that never comes
-                        // true.
-                        println!(
-                            "  (a daemon started implicitly by `agent24 chat` does NOT read installed packages)"
-                        );
-                    }
-                    revoked
-                }
-                Err(e) => Err(e.to_string()),
-            })
+            // `attach_only` is `None` for capabilities mode. The consent step
+            // must finish (or be shown impossible) before `install` writes.
+            let state = state_file::state_dir();
+            // An incompatible daemon is an error (CORE-4), not "offline".
+            let online = match attach_only().await {
+                Ok(online) => online,
+                Err(e) => return Some(Err(e)),
+            };
+            Some(install_with_consent(path, &root, state.as_deref(), online.as_ref()).await)
         }
         // Handled before this function is ever called; see `cmd_uninstall`.
         OsAction::Uninstall { .. } => None,
@@ -876,70 +1368,184 @@ async fn os_local(action: &OsAction) -> Option<Result<(), String>> {
     }
 }
 
-/// `agent24 os uninstall` — file removal decides success or failure by
-/// itself (unchanged contract: works with the daemon down); hot-disable
-/// (FU-61) is a best-effort step tried ONLY after a real removal, whose
-/// outcome can only add an informational line, never flip the `Result` this
-/// function already decided. The one thing that CAN turn a real removal
-/// into an `Err` is a failed consent revocation (ADR-K1-03 §3, fail-closed):
-/// the removal still stands and the hot stop is still tried, but the command
-/// must not report success while the consent may still be live. This split (rather than folding into
-/// `os_local`) exists because the daemon call needs the REAL `bool`
-/// `install::uninstall` returns (was something actually removed just now?)
-/// — `os_local`'s shared `Option<Result<(), String>>` shape has nowhere to
-/// carry that.
+/// `agent24 os uninstall`. Consent is revoked before any file is removed.
+/// A failed revocation leaves the package where it is and fails the command,
+/// so a retry cannot report success just because the package is already gone.
+/// A package that is not installed is still success and does not open the
+/// store. Hot-disable (FU-61) runs only after a real removal.
 async fn cmd_uninstall(name: &str) -> Result<(), String> {
     let root = packages_root()?;
-    match agent24_os_packages::install::uninstall(name, &root) {
-        Err(e) => Err(e.to_string()), // nothing removed: no hot-stop, ever
+    let state = state_file::state_dir();
+    // An incompatible daemon is an error (CORE-4), not "offline".
+    let online = attach_only().await?;
+    uninstall_with_consent(name, &root, state.as_deref(), online.as_ref()).await
+}
+
+/// Package files stay untouched until consent revocation has succeeded.
+/// `online == None` is what capabilities mode produces (`attach_only`).
+async fn install_with_consent(
+    src: &std::path::Path,
+    packages_root: &std::path::Path,
+    state_dir: Option<&std::path::Path>,
+    online: Option<&Endpoint>,
+) -> Result<(), String> {
+    let module =
+        agent24_os_packages::install::source_module_name(src).map_err(|e| e.to_string())?;
+    if agent24_os_packages::install::package_is_installed(&module, packages_root)
+        .map_err(|e| e.to_string())?
+    {
+        return Err(
+            agent24_os_packages::install::InstallError::AlreadyInstalled(module).to_string(),
+        );
+    }
+    // Revoke before `install` creates directories. A busy or docked gate must
+    // leave the packages root byte-for-byte unchanged.
+    revoke_module_consent(&module, state_dir, online).await?;
+    match agent24_os_packages::install::install(src, packages_root) {
+        Ok(dest) => {
+            println!("installed {}", dest.display());
+            println!(
+                "  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start"
+            );
+            // An ephemeral daemon (`agent24 chat` with nothing running)
+            // resolves a different packages root and will never see this
+            // package.
+            println!(
+                "  (a daemon started implicitly by `agent24 chat` does NOT read installed packages)"
+            );
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Removal happens only after consent revocation succeeds. A missing package
+/// is still a success and does not touch the store: there is nothing to revoke
+/// that this command would have left behind.
+async fn uninstall_with_consent(
+    name: &str,
+    packages_root: &std::path::Path,
+    state_dir: Option<&std::path::Path>,
+    online: Option<&Endpoint>,
+) -> Result<(), String> {
+    match agent24_os_packages::install::package_is_installed(name, packages_root) {
+        Err(e) => return Err(e.to_string()),
         Ok(false) => {
-            // Not an error: the end state the operator asked for is the one
-            // they have. Saying so beats a failure they must decide to
-            // ignore. Idempotent: nothing NEW was removed, so there is
-            // nothing for a hot-stop to respond to. Its grants are ended
-            // again all the same: an earlier run may have removed the files
-            // and failed to (K1-6a-G §2.1 F1).
             println!("{name} was not installed; nothing to remove");
-            revoke_module_consents(name).await
+            return Ok(());
+        }
+        Ok(true) => {}
+    }
+    revoke_module_consent(name, state_dir, online).await?;
+    match agent24_os_packages::install::uninstall(name, packages_root) {
+        Err(e) => Err(e.to_string()),
+        Ok(false) => {
+            println!("{name} was not installed; nothing to remove");
+            Ok(())
         }
         Ok(true) => {
             println!("removed {name}");
             println!("  it takes effect at the next daemon start");
-            let revoked = revoke_module_consents(name).await;
             hot_disable_best_effort(name).await;
-            revoked
+            Ok(())
         }
     }
 }
 
-/// End `name`'s module tool grants after a package lifecycle change. A
-/// store that cannot record it fails the command (K1-6a-G §2.1 F1): whether
-/// a grant still holds is what the store says, not what this printed. An
-/// install is undone and an uninstall finds nothing left to remove, so
-/// running either again retries this. Without HOME no store can be
-/// reached (a daemon does not start without one either): the command
-/// stands, and says the grants, if any, were not revoked.
-async fn revoke_module_consents(name: &str) -> Result<(), String> {
-    revoke_module_consents_in(state_file::state_dir().as_deref(), name).await
+/// Revoke persisted enablement consent after a package lifecycle change.
+/// Fail-closed (ADR-K1-03 §3): every way this can fail — no state directory
+/// at all, a store that will not open, a write that does not land — is an
+/// `Err` the caller turns into a visible, non-zero result. Never a silent
+/// skip.
+///
+/// An attached daemon uses `DELETE /api/v1/module-consents/modules/{module}`
+/// and does not open the database. Otherwise this uses the offline gate.
+async fn revoke_module_consent(
+    name: &str,
+    state_dir: Option<&std::path::Path>,
+    online: Option<&Endpoint>,
+) -> Result<(), String> {
+    let revoked = if let Some(ep) = online {
+        revoke_module_consents_online(ep, name, state_dir).await
+    } else {
+        invalidate_module_consents_in(state_dir, name).await
+    };
+    revoked.map_err(|e| consent_revocation_failed_message(&e))
 }
 
-async fn revoke_module_consents_in(
+async fn revoke_module_consents_online(
+    ep: &Endpoint,
+    name: &str,
+    state_dir: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let url = format!("{}/api/v1/module-consents/modules/{name}", ep.base);
+    match bearer(ep, client().delete(url))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(res) if res.status().is_success() => Ok(()),
+        Ok(res) => {
+            let status = res.status();
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            if body["error"]["message"].as_str().is_some() {
+                Err(format!(
+                    "could not revoke {name} module consent: {}",
+                    daemon_error_line(&body)
+                ))
+            } else {
+                Err(format!(
+                    "could not revoke {name} module consent: daemon returned {status}"
+                ))
+            }
+        }
+        // Connection failure may use the offline gate. A live daemon holds
+        // the lock, so that path returns busy and does not open the database.
+        Err(err) => match invalidate_module_consents_in(state_dir, name).await {
+            Ok(()) => Ok(()),
+            Err(offline) => Err(format!(
+                "could not reach the daemon to revoke {name} module consent ({err}); {offline}"
+            )),
+        },
+    }
+}
+
+async fn invalidate_module_consents_in(
     state_dir: Option<&std::path::Path>,
     name: &str,
 ) -> Result<(), String> {
+    // ADR-K1-03 §3: the one exception to fail-closed. Without HOME no consent
+    // store can be reached (a daemon does not start without one either), so the
+    // command stands and says so, rather than breaking the documented
+    // `A24_OS_PACKAGES` container install (review G3, David 2026-10-26).
     let Some(dir) = state_dir else {
         eprintln!(
             "  HOME is not set: cannot reach a consent store, so any grants of {name} were not revoked"
         );
         return Ok(());
     };
-    let store = agent24_store::Store::open(&dir.join("agent24.db"))
-        .await
-        .map_err(|e| format!("could not open the consent store to revoke {name}'s grants: {e}"))?;
-    store
-        .invalidate_module_consents(name)
-        .await
-        .map_err(|e| format!("could not revoke {name}'s module grants: {e}"))
+    // No database file means there is no consent row to revoke, and this must
+    // not create one.
+    let db = offline_db::open_offline_store(dir).await.map_err(|err| {
+        format!("could not open the consent store to revoke {name} module consent: {err}")
+    })?;
+    let result = match &db {
+        offline_db::OfflineDb::Absent(_lock) => Ok(()),
+        offline_db::OfflineDb::Ready(store, _lock) => store
+            .invalidate_module_consents(name)
+            .await
+            .map_err(|err| format!("could not revoke {name} module consent: {err}")),
+    };
+    let closed = db.close().await;
+    result.and(closed)
+}
+
+/// Consent revocation did not land. Package files have not been changed.
+fn consent_revocation_failed_message(why: &str) -> String {
+    format!(
+        "{why}\n  the package files were not changed; an earlier consent for this module may \
+         still be recorded; fix the state store and re-run the command"
+    )
 }
 
 /// Render a daemon error envelope the way every call site here should
@@ -966,12 +1572,20 @@ fn daemon_error_line(body: &serde_json::Value) -> String {
 /// `cmd_uninstall`'s result is decided by the removal and the consent
 /// revocation, not by this.
 async fn hot_disable_best_effort(name: &str) {
-    let Some(ep) = attach_only().await else {
-        println!(
-            "  no reachable daemon right now; a module of it running elsewhere will report \
-             `package_changed` after its own next restart"
-        );
-        return;
+    let ep = match attach_only().await {
+        Ok(Some(ep)) => ep,
+        Ok(None) => {
+            println!(
+                "  no reachable daemon right now; a module of it running elsewhere will report \
+                 `package_changed` after its own next restart"
+            );
+            return;
+        }
+        // Version mismatch must stay visible. Do not POST /stop to that daemon.
+        Err(err) => {
+            println!("  {err}");
+            return;
+        }
     };
     // POST .../stop, NOT the PATCH `agent24 os disable` uses — that one
     // persists `enabled:false` into `os.json`, which is actively wrong for a
@@ -1037,15 +1651,21 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     if let OsAction::Uninstall { name } = &action {
         return cmd_uninstall(name).await;
     }
+    if let OsAction::Delegate { name } = &action {
+        return cmd_os_delegate(name).await;
+    }
     if let Some(done) = os_local(&action).await {
         return done;
     }
     let ep = match attach_only().await {
-        Some(ep) => ep,
+        Ok(Some(ep)) => ep,
+        // A daemon that answered on the wrong protocol is not "not running".
+        // Enable/disable must fail with that error and must not PATCH it.
+        Err(err) => return Err(err),
         // `connect` would start an ephemeral daemon with an isolated package
         // root. Its empty catalogue would report false facts about the user's
         // installed OS packages, so these commands only use a resident daemon.
-        None => {
+        Ok(None) => {
             let path = agent24_protocol::state_file::state_dir()
                 .map(|d| d.join("os.json").display().to_string())
                 .unwrap_or_else(|| "~/.agent24/os.json".to_owned());
@@ -1064,7 +1684,7 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
         // Handled before the daemon lookup above; see `os_local`.
         OsAction::Install { .. } | OsAction::Uninstall { .. } => unreachable!(),
         // Handled at the top of this function, before it ever reaches here.
-        OsAction::Attach { .. } => unreachable!(),
+        OsAction::Attach { .. } | OsAction::Delegate { .. } => unreachable!(),
         OsAction::List => bearer(&ep, client().get(format!("{}/api/v1/os", ep.base))),
         OsAction::Enable { name } | OsAction::Disable { name } => {
             let enabled = matches!(action, OsAction::Enable { .. });
@@ -1096,58 +1716,88 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     out
 }
 
-/// `agent24 decide export`/`delete` — D0-2 (`docs/agent/PLAN-DECIDE.md`
-/// §2.1-§2.3). Unlike every other CLI command except `os install`/`uninstall`
-/// (see `os_local`'s doc comment), this does NOT go through the daemon: the
-/// decision log is a local-only privacy feature (§2.3 — "日志只存本地…永不
-/// 上传"), and a user must be able to export or delete their own data even
-/// if the daemon that would otherwise own `~/.agent24/agent24.db` is not
-/// running (or has crashed) — the same shape of argument `os install` makes
-/// for not depending on "someone reading", just for "someone running".
-/// SQLite's WAL mode (how `Store::open` already connects) supports a second
-/// process reading/writing the same file concurrently with a running
-/// daemon's own connection pool; this is not a new concurrency hazard.
-///
-/// This talks to `agent24-store` directly, NOT through
-/// `agent24_decide::log::DecisionLog` — that trait is D0-2's write-path
-/// contract for whatever D1 component actually runs decisions (composed
-/// inside `agent24d`, see `docs/decision.md` ADR-034). Export/delete are
-/// read/delete-only maintenance operations on already-written rows; they
-/// have no need for an abstraction over "which store backs this", because
-/// for a local CLI tool SQLite-via-`agent24-store` IS the implementation,
-/// today and for the foreseeable future.
 fn cmd_hw(action: HwAction) -> Result<(), String> {
+    let report = agent24_hw::HardwareReport::from_env(&agent24_hw::SystemProbe::new());
     match action {
         HwAction::Probe => {
-            let report = agent24_hw::HardwareReport::from_env(&agent24_hw::SystemProbe::new());
             let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
             println!("{json}");
+            Ok(())
+        }
+        HwAction::IdorisEnv {
+            core_reserved_bytes,
+        } => {
+            // usable_bytes already accounts for OS and App overhead. Deduct
+            // only the explicit core allocation, and preserve a real zero.
+            let bytes = report.idoris_budget_bytes(core_reserved_bytes);
+            println!("IDORIS_ALLOCATED_BUDGET_BYTES={bytes}");
             Ok(())
         }
     }
 }
 
+/// `agent24 decide export`/`delete` (D0-2). No export/delete route exists,
+/// so this always uses the offline gate and does not migrate.
 async fn cmd_decide(action: DecideAction) -> Result<(), String> {
+    let dir = agent24_protocol::state_file::state_dir().ok_or_else(|| "HOME not set".to_owned())?;
+    cmd_decide_in(&dir, action).await
+}
+
+async fn cmd_decide_in(dir: &std::path::Path, action: DecideAction) -> Result<(), String> {
     match &action {
         DecideAction::Export { jsonl, .. } => require_jsonl(*jsonl)?,
         DecideAction::Delete { .. } => {}
+        DecideAction::Profile { json } => return query::decide_profile(*json).await,
     }
-    let dir = agent24_protocol::state_file::state_dir().ok_or_else(|| "HOME not set".to_owned())?;
-    let store = agent24_store::Store::open(&dir.join("agent24.db"))
-        .await
-        .map_err(|e| e.to_string())?;
-    match action {
-        DecideAction::Export { point, since, .. } => {
-            let rows = store
-                .export_decision_log(point.as_deref(), since.as_deref())
-                .await
-                .map_err(|e| e.to_string())?;
-            for row in &rows {
-                println!("{}", decision_log_export_line(row)?);
-            }
-            Ok(())
+    let db = offline_db::open_offline_store(dir).await?;
+    let result = async {
+        match &db {
+            // Nothing was ever recorded, so export is an empty set and delete
+            // removes nothing. Do not create `agent24.db`.
+            offline_db::OfflineDb::Absent(_lock) => decide_without_database(action),
+            offline_db::OfflineDb::Ready(store, _lock) => match action {
+                DecideAction::Export { point, since, .. } => {
+                    let rows = store
+                        .export_decision_log(point.as_deref(), since.as_deref())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    for row in &rows {
+                        println!("{}", decision_log_export_line(row)?);
+                    }
+                    Ok(())
+                }
+                DecideAction::Delete { action } => cmd_decide_delete(store, action).await,
+                DecideAction::Profile { .. } => {
+                    unreachable!("profile returns before the store opens")
+                }
+            },
         }
-        DecideAction::Delete { action } => cmd_decide_delete(&store, action).await,
+    }
+    .await;
+    let closed = db.close().await;
+    result.and(closed)
+}
+
+/// Same operator-visible outcome as an empty decision log, without a store.
+fn decide_without_database(action: DecideAction) -> Result<(), String> {
+    match action {
+        DecideAction::Export { .. } => Ok(()),
+        DecideAction::Delete { action } => match action {
+            DecideDeleteAction::Id { .. } => {
+                println!("no decision with that id");
+                Ok(())
+            }
+            DecideDeleteAction::Point { point } => {
+                println!("deleted 0 decision(s) at point {point:?}");
+                Ok(())
+            }
+            DecideDeleteAction::All { confirm } => {
+                require_confirm(confirm)?;
+                println!("deleted 0 decision(s)");
+                Ok(())
+            }
+        },
+        DecideAction::Profile { .. } => unreachable!("profile returns before the store opens"),
     }
 }
 
@@ -1298,7 +1948,7 @@ fn format_comm_error(body: &serde_json::Value) -> String {
     out
 }
 
-async fn cmd_comm(action: CommAction) -> Result<(), String> {
+async fn cmd_comm(action: CommAction, json: bool) -> Result<(), String> {
     // Import's server-side work (copy + verify + a Hyphae-side password
     // check) is real file and subprocess I/O, not a quick REST round trip —
     // give it a much longer client-side timeout than every other comm
@@ -1313,7 +1963,8 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
         Duration::from_secs(120)
     } else if matches!(
         action,
-        CommAction::Send { .. }
+        CommAction::Groups { .. }
+            | CommAction::Send { .. }
             | CommAction::Outbox {
                 action: CommOutboxAction::Retry { .. },
             }
@@ -1322,7 +1973,23 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
     } else {
         Duration::from_secs(15)
     };
-    let (method, path, body) = match action {
+    let (method, path, body) = comm_request(action)?;
+    let mut body = CommRequestBody(body);
+
+    let ep = connect().await.map_err(|e| {
+        format!("{e}\n  `agent24 comm` always goes through the daemon — there is no offline path")
+    })?;
+    let result = execute_comm(&ep, method, &path, &mut body, timeout, json).await;
+    finish(ep).await;
+    println!("{}", result?);
+    Ok(())
+}
+
+fn comm_request(
+    action: CommAction,
+) -> Result<(reqwest::Method, String, Option<serde_json::Value>), String> {
+    Ok(match action {
+        CommAction::Groups { action } => comm_groups::request(action),
         CommAction::Import { from, yes, dry_run } => {
             let password = if dry_run {
                 None
@@ -1424,35 +2091,35 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
                 "to": to, "content": content, "from": from, "encrypt": !no_encrypt
             })),
         ),
-        CommAction::History { as_, limit } => {
-            let mut qs: Vec<String> = Vec::new();
-            if let Some(a) = &as_ {
-                qs.push(format!("as={}", qs_encode(a)));
-            }
-            if let Some(l) = limit {
-                qs.push(format!("limit={l}"));
-            }
-            let path = if qs.is_empty() {
-                "/api/v1/comm/history".to_owned()
-            } else {
-                format!("/api/v1/comm/history?{}", qs.join("&"))
-            };
-            (reqwest::Method::GET, path, None)
-        }
+        CommAction::History { as_, limit } => (
+            reqwest::Method::GET,
+            {
+                let mut path = "/api/v1/comm/history".to_owned();
+                if let Some(a) = as_ {
+                    comm_groups::append_query(&mut path, "as", &a);
+                }
+                if let Some(limit) = limit {
+                    comm_groups::append_query(&mut path, "limit", &limit.to_string());
+                }
+                path
+            },
+            None,
+        ),
         CommAction::Pull { as_ } => (
             reqwest::Method::POST,
             "/api/v1/comm/inbox/pull".to_owned(),
             Some(serde_json::json!({"as": as_})),
         ),
         CommAction::Outbox { action } => match action {
-            CommOutboxAction::List { failed_only } => {
-                let path = if failed_only {
+            CommOutboxAction::List { failed_only } => (
+                reqwest::Method::GET,
+                if failed_only {
                     "/api/v1/comm/outbox?failed_only=true".to_owned()
                 } else {
                     "/api/v1/comm/outbox".to_owned()
-                };
-                (reqwest::Method::GET, path, None)
-            }
+                },
+                None,
+            ),
             CommOutboxAction::Retry { event_id } => (
                 reqwest::Method::POST,
                 format!("/api/v1/comm/outbox/{}/retry", qs_encode(&event_id)),
@@ -1467,36 +2134,36 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
                 Some(serde_json::json!({"confirm": confirm, "min_failures": min_failures})),
             ),
         },
-    };
-    let mut body = CommRequestBody(body);
+    })
+}
 
-    let ep = connect().await.map_err(|e| {
-        format!("{e}\n  `agent24 comm` always goes through the daemon — there is no offline path")
-    })?;
-    let mut req = bearer(&ep, client().request(method, format!("{}{path}", ep.base)));
+async fn execute_comm(
+    ep: &Endpoint,
+    method: reqwest::Method,
+    path: &str,
+    body: &mut CommRequestBody,
+    timeout: Duration,
+    json: bool,
+) -> Result<String, String> {
+    let mut req = bearer(ep, client().request(method, format!("{}{path}", ep.base)));
     if let Some(body) = &body.0 {
         req = req.json(body);
     }
     let result = req.timeout(timeout).send().await;
     body.zeroize_password();
-    let out = match result {
-        Ok(res) => {
-            let status = res.status();
-            let body: serde_json::Value = res.json().await.unwrap_or_default();
-            if status.is_success() {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&body["data"]).unwrap_or_default()
-                );
-                Ok(())
-            } else {
-                Err(format_comm_error(&body))
-            }
-        }
-        Err(e) => Err(e.to_string()),
-    };
-    finish(ep).await;
-    out
+    let response = result.map_err(|e| e.to_string())?;
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+    let body: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("daemon returned {status} but the body is not JSON: {e}"))?;
+    if !status.is_success() {
+        return Err(format_comm_error(&body));
+    }
+    if json {
+        Ok(text)
+    } else {
+        serde_json::to_string_pretty(&body["data"]).map_err(|e| e.to_string())
+    }
 }
 
 /// A comm JSON body can contain a password for import/unlock. Clear that
@@ -1676,6 +2343,45 @@ fn resolve_allow_relax(allow_remote: bool) -> bool {
 /// `agent24 os attach …` (A3-2a). Always goes through the daemon — see
 /// `cmd_os`'s doc comment on why `Attach` is intercepted before that
 /// function's own `req`/`out` match, which has different response shapes.
+/// `agent24 os delegate <name>` (CORE-2 §10 R1). Only a resident daemon holds
+/// delegation records, so this never starts an ephemeral one.
+async fn cmd_os_delegate(name: &str) -> Result<(), String> {
+    let ep = match attach_only_with_enrollment(true).await {
+        Ok(Some(ep)) => ep,
+        Err(err) => return Err(err),
+        Ok(None) => {
+            return Err("daemon not running; start it with `agent24 daemon start`".to_owned());
+        }
+    };
+    let sent = send_elevating(
+        &ep,
+        reqwest::Method::POST,
+        &format!("/api/v1/os/{name}/delegation"),
+        None,
+        Duration::from_secs(10),
+        false,
+    )
+    .await;
+    let out = match sent {
+        Ok(res) if res.status.is_success() => {
+            println!("delegated {name}: first-party clients may now write to its current routes");
+            Ok(())
+        }
+        Ok(res) => {
+            let status = res.status;
+            let body: serde_json::Value = res.json_value().await;
+            Err(if body["error"]["message"].as_str().is_some() {
+                daemon_error_line(&body)
+            } else {
+                format!("daemon returned {status}")
+            })
+        }
+        Err(e) => Err(e.parts().1),
+    };
+    finish(ep).await;
+    out
+}
+
 async fn cmd_os_attach(action: OsAttachAction) -> Result<(), String> {
     match action {
         OsAttachAction::Add {
@@ -1706,23 +2412,34 @@ async fn cmd_attach_add(
     // Resolved BEFORE contacting the daemon: a TTY prompt after an ephemeral
     // daemon has already been spawned would be a strange place to block.
     let allow_relax = resolve_allow_relax(allow_remote);
-    let ep = match connect().await {
+    let ep = match connect_detailed().await {
         Ok(ep) => ep,
         Err(e) => {
             if json {
-                println!("{}", daemon_unavailable_envelope(&e));
+                println!("{}", error_envelope(&e.code, &e.message));
             }
-            return Err(e);
+            return Err(e.message);
         }
     };
-    let sent = bearer(&ep, client().post(format!("{}/api/v1/attached", ep.base)))
-        .json(&AttachedAddRequest {
-            manifest,
-            allow_relax,
-        })
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await;
+    let request_body = match serde_json::to_vec(&AttachedAddRequest {
+        manifest,
+        allow_relax,
+    }) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            finish(ep).await;
+            return Err(e.to_string());
+        }
+    };
+    let sent = send_elevating(
+        &ep,
+        reqwest::Method::POST,
+        "/api/v1/attached",
+        Some(request_body),
+        Duration::from_secs(10),
+        true,
+    )
+    .await;
     // No `?` below: any early return here would skip `finish(ep)` (the
     // ephemeral daemon it may have spawned would never be reaped), and under
     // `--json` a 2xx with an unreadable/unresizable body must still print
@@ -1730,7 +2447,7 @@ async fn cmd_attach_add(
     // already comes from returning `Err` below, `main` maps that to
     // `ExitCode::FAILURE`.
     let out = match sent {
-        Ok(res) if res.status().is_success() => match res.json::<AttachedAddResponse>().await {
+        Ok(res) if res.status.is_success() => match res.json::<AttachedAddResponse>().await {
             Ok(body) => match serde_json::to_string(&body) {
                 Ok(text) => {
                     if json {
@@ -1762,8 +2479,8 @@ async fn cmd_attach_add(
             }
         },
         Ok(res) => {
-            let status = res.status();
-            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            let status = res.status;
+            let body = res.json_value().await;
             if json {
                 println!("{}", error_envelope_or(status, &body));
             }
@@ -1774,10 +2491,11 @@ async fn cmd_attach_add(
             })
         }
         Err(e) => {
+            let (code, message) = e.parts();
             if json {
-                println!("{}", daemon_unavailable_envelope(&e.to_string()));
+                println!("{}", error_envelope(&code, &message));
             }
-            Err(e.to_string())
+            Err(message)
         }
     };
     finish(ep).await;
@@ -1799,24 +2517,29 @@ fn print_attached(list: &AttachedList) {
 }
 
 async fn cmd_attach_list(json: bool) -> Result<(), String> {
-    let ep = match connect().await {
+    let ep = match connect_detailed().await {
         Ok(ep) => ep,
         Err(e) => {
             if json {
-                println!("{}", daemon_unavailable_envelope(&e));
+                println!("{}", error_envelope(&e.code, &e.message));
             }
-            return Err(e);
+            return Err(e.message);
         }
     };
-    let sent = bearer(&ep, client().get(format!("{}/api/v1/attached", ep.base)))
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await;
+    let sent = send_elevating(
+        &ep,
+        reqwest::Method::GET,
+        "/api/v1/attached",
+        None,
+        Duration::from_secs(10),
+        false,
+    )
+    .await;
     // See `cmd_attach_add`'s comment: no `?` here either, for the same two
     // reasons (must not skip `finish(ep)`; `--json` must still emit exactly
     // one JSON object even on an unreadable/unresizable 2xx body).
     let out = match sent {
-        Ok(res) if res.status().is_success() => match res.json::<AttachedList>().await {
+        Ok(res) if res.status.is_success() => match res.json::<AttachedList>().await {
             Ok(body) => match serde_json::to_string(&body) {
                 Ok(text) => {
                     if json {
@@ -1843,8 +2566,8 @@ async fn cmd_attach_list(json: bool) -> Result<(), String> {
             }
         },
         Ok(res) => {
-            let status = res.status();
-            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            let status = res.status;
+            let body = res.json_value().await;
             if json {
                 println!("{}", error_envelope_or(status, &body));
             }
@@ -1855,10 +2578,11 @@ async fn cmd_attach_list(json: bool) -> Result<(), String> {
             })
         }
         Err(e) => {
+            let (code, message) = e.parts();
             if json {
-                println!("{}", daemon_unavailable_envelope(&e.to_string()));
+                println!("{}", error_envelope(&code, &message));
             }
-            Err(e.to_string())
+            Err(message)
         }
     };
     finish(ep).await;
@@ -1866,24 +2590,26 @@ async fn cmd_attach_list(json: bool) -> Result<(), String> {
 }
 
 async fn cmd_attach_remove(name: &str, json: bool) -> Result<(), String> {
-    let ep = match connect().await {
+    let ep = match connect_detailed().await {
         Ok(ep) => ep,
         Err(e) => {
             if json {
-                println!("{}", daemon_unavailable_envelope(&e));
+                println!("{}", error_envelope(&e.code, &e.message));
             }
-            return Err(e);
+            return Err(e.message);
         }
     };
-    let sent = bearer(
+    let sent = send_elevating(
         &ep,
-        client().delete(format!("{}/api/v1/attached/{name}", ep.base)),
+        reqwest::Method::DELETE,
+        &format!("/api/v1/attached/{name}"),
+        None,
+        Duration::from_secs(10),
+        false,
     )
-    .timeout(Duration::from_secs(10))
-    .send()
     .await;
     let out = match sent {
-        Ok(res) if res.status() == reqwest::StatusCode::NO_CONTENT => {
+        Ok(res) if res.status == reqwest::StatusCode::NO_CONTENT => {
             if json {
                 println!("{}", serde_json::json!({"removed": name}));
             } else {
@@ -1892,8 +2618,8 @@ async fn cmd_attach_remove(name: &str, json: bool) -> Result<(), String> {
             Ok(())
         }
         Ok(res) => {
-            let status = res.status();
-            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            let status = res.status;
+            let body = res.json_value().await;
             if json {
                 println!("{}", error_envelope_or(status, &body));
             }
@@ -1904,10 +2630,11 @@ async fn cmd_attach_remove(name: &str, json: bool) -> Result<(), String> {
             })
         }
         Err(e) => {
+            let (code, message) = e.parts();
             if json {
-                println!("{}", daemon_unavailable_envelope(&e.to_string()));
+                println!("{}", error_envelope(&code, &message));
             }
-            Err(e.to_string())
+            Err(message)
         }
     };
     finish(ep).await;
@@ -1942,7 +2669,7 @@ fn offline_hint(path: &str, action: &OsAction) -> String {
         // Unreachable for the same reason as the `Install`/`Uninstall` arms
         // above are commented unreachable in `cmd_os`'s own match: `Attach`
         // returns from `cmd_os` before this function is ever called.
-        OsAction::Attach { .. } => unreachable!(),
+        OsAction::Attach { .. } | OsAction::Delegate { .. } => unreachable!(),
         OsAction::List => format!("read {path} to see what is configured"),
         OsAction::Enable { name } | OsAction::Disable { name } => {
             let key = serde_json::to_string(name).unwrap_or_else(|_| "\"?\"".to_owned());
@@ -2052,6 +2779,20 @@ async fn wait_for_stop(state: &DaemonState) -> Result<(), String> {
     }
 }
 
+/// `daemon status`'s reading of `GET /api/v1/health`.
+fn daemon_status_summary(pid: u32, port: u16, body: &str) -> Result<String, String> {
+    let health: StatusHealth = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let backend = &health.backend;
+    let version = &health.version;
+    let mut lines = vec![format!(
+        "running · pid {pid} · port {port} · backend {backend} · v{version}"
+    )];
+    if health.protocol_version.is_none() {
+        lines.push("daemon 版本过旧，请升级".to_owned());
+    }
+    Ok(lines.join("\n"))
+}
+
 async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
     match action {
         DaemonAction::Start => {
@@ -2067,6 +2808,7 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
             }
             let (state, child) = match spawn_daemon(false).await {
                 Ok(v) => v,
+                Err(err) if !err.maybe_raced => return Err(err.message),
                 Err(err) => {
                     // Lost a concurrent-start race? The winner holds the
                     // singleton lock and our child exited before ready. The
@@ -2085,7 +2827,7 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
                         }
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
-                    return Err(err);
+                    return Err(err.message);
                 }
             };
             // Detach: without kill_on_drop, dropping the handle leaves the
@@ -2104,11 +2846,9 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
                         .send()
                         .await
                         .map_err(|e| e.to_string())?;
-                    let health: Health = res.json().await.map_err(|e| e.to_string())?;
-                    println!(
-                        "running · pid {} · port {} · backend {} · v{}",
-                        state.pid, state.port, health.backend, health.version
-                    );
+                    let body = res.text().await.map_err(|e| e.to_string())?;
+                    let summary = daemon_status_summary(state.pid, state.port, &body)?;
+                    println!("{summary}");
                     // SHUT-1c. Only a daemon from before it (405) is skipped
                     // quietly; any other failure is said, since the report is
                     // how a budget that is too tight gets noticed (review of
@@ -2194,7 +2934,7 @@ async fn cmd_tui() -> Result<(), String> {
     let ep = connect().await?;
     let conn = tui::Conn {
         base: ep.base.clone(),
-        token: ep.token.clone(),
+        token: ep.token().to_owned(),
     };
     let result = tui::run(conn).await;
     finish(ep).await;
@@ -2261,18 +3001,40 @@ fn cmd_service(action: ServiceAction) -> Result<(), String> {
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Chat { message, model } => cmd_chat(message, model).await,
+        Command::Chat {
+            message,
+            model,
+            session,
+            confirm_headroom,
+        } => cmd_chat(chat_request(message, model, session, confirm_headroom)).await,
         Command::Models => cmd_models().await,
+        Command::Idoris { action } => idoris::run(action).await,
         Command::Daemon { action } => cmd_daemon(action).await,
         Command::Service { action } => cmd_service(action),
         Command::Tui => cmd_tui().await,
         Command::Os { action } => cmd_os(action).await,
         Command::Documents { action } => documents::cmd_documents(action).await,
-        Command::Comm { action } => cmd_comm(action).await,
+        Command::Comm { action, json } => cmd_comm(action, json).await,
+        Command::ModuleConsents { action } => module_tools::run(action).await,
         Command::Mcp => cmd_mcp().await,
         Command::Acp => cmd_acp().await,
         Command::Decide { action } => cmd_decide(action).await,
         Command::Hw { action } => cmd_hw(action),
+        Command::Session { action } => query::session(action).await,
+        Command::Run { action } => query::run_cmd(action).await,
+        Command::Memory { action } => query::memory(action).await,
+        Command::Schedule { action } => query::schedule(action).await,
+        Command::Usage { json } => query::usage(json).await,
+        Command::Timings {
+            summary,
+            source,
+            since,
+            limit,
+            json,
+        } => query::timings(summary, source, since, limit, json).await,
+        Command::Consent { action } => query::consent(action).await,
+        Command::Approval { action } => query::approval(action).await,
+        Command::Tools { action } => query::tools(action).await,
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -2284,19 +3046,29 @@ async fn main() -> std::process::ExitCode {
 }
 
 #[cfg(test)]
+mod coverage_tests;
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
 
-    /// No HOME, no store to reach: the command stands (review G3; the
-    /// `A24_OS_PACKAGES` install the CLI documents for containers), and
-    /// says the grants, if any, were not revoked.
+    /// No HOME, no store to reach: the command stands (ADR-K1-03 §3, review
+    /// G3; the `A24_OS_PACKAGES` install the CLI documents for containers),
+    /// and says the grants, if any, were not revoked.
     #[tokio::test]
     async fn consent_revocation_without_state_dir_stands() {
-        revoke_module_consents_in(None, "consent-mod")
+        invalidate_module_consents_in(None, "consent-mod")
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn consent_revocation_failure_message_says_files_were_not_changed() {
+        let msg = consent_revocation_failed_message("boom");
+        assert!(msg.contains("may"), "{msg}");
+        assert!(msg.contains("were not changed"), "{msg}");
     }
 
     #[tokio::test]
@@ -2304,7 +3076,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A directory where the database file should be: opening it fails.
         std::fs::create_dir(dir.path().join("agent24.db")).unwrap();
-        let err = revoke_module_consents_in(Some(dir.path()), "consent-mod")
+        let err = invalidate_module_consents_in(Some(dir.path()), "consent-mod")
             .await
             .unwrap_err();
         assert!(err.contains("consent-mod"), "{err}");
@@ -2313,9 +3085,424 @@ mod tests {
     #[tokio::test]
     async fn consent_revocation_succeeds_with_a_writable_store() {
         let dir = tempfile::tempdir().unwrap();
-        revoke_module_consents_in(Some(dir.path()), "consent-mod")
+        migrated_db(dir.path()).await;
+        invalidate_module_consents_in(Some(dir.path()), "consent-mod")
             .await
             .unwrap();
+    }
+
+    // ── CORE-5a / T10: offline entries share the daemon lock and dock markers ──
+
+    /// `fs2` exclusive locks are per process on macOS, so a second try in this
+    /// process would not look held (FU-61). The child holds the real lock.
+    #[test]
+    #[ignore = "spawned by the offline lock test; holds daemon.singleton.lock until stdin closes"]
+    fn offline_db_lock_holder() {
+        let Ok(dir) = std::env::var("AGENT24_HOLD_SINGLETON_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let lock = agent24_protocol::state_file::try_acquire_singleton_in(&dir)
+            .expect("lock io")
+            .expect("singleton lock already held");
+        std::fs::write(dir.join("holder.ready"), b"1").expect("ready");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        drop(lock);
+    }
+
+    pub(super) struct KillOnDrop(std::process::Child);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    pub(super) fn hold_singleton(dir: &std::path::Path) -> KillOnDrop {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::offline_db_lock_holder",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("AGENT24_HOLD_SINGLETON_DIR", dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let ready = dir.join("holder.ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if ready.exists() {
+                return KillOnDrop(child);
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                let mut err = String::new();
+                if let Some(stderr) = child.stderr.as_mut() {
+                    use std::io::Read;
+                    let _ = stderr.read_to_string(&mut err);
+                }
+                panic!("lock holder exited {status}: {err}");
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("lock holder did not become ready");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn db_snapshot(dir: &std::path::Path) -> String {
+        ["agent24.db", "agent24.db-wal", "agent24.db-shm"]
+            .into_iter()
+            .map(|name| match std::fs::metadata(dir.join(name)) {
+                Ok(meta) => format!("{name}:{}:{:?}", meta.len(), meta.modified().ok()),
+                Err(_) => format!("{name}:absent"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    async fn migrated_db(dir: &std::path::Path) {
+        let store = agent24_store::Store::open(&dir.join("agent24.db"))
+            .await
+            .unwrap();
+        agent24_store::test_hooks::checkpoint(&store).await.unwrap();
+        drop(store);
+        let _ = std::fs::remove_file(dir.join("agent24.db-wal"));
+        let _ = std::fs::remove_file(dir.join("agent24.db-shm"));
+    }
+
+    async fn both(dir: &std::path::Path) -> (Result<(), String>, Result<(), String>) {
+        let consent = invalidate_module_consents_in(Some(dir), "mod").await;
+        let decide = cmd_decide_in(
+            dir,
+            DecideAction::Export {
+                jsonl: true,
+                point: None,
+                since: None,
+            },
+        )
+        .await;
+        (consent, decide)
+    }
+
+    fn assert_rejected(got: &(Result<(), String>, Result<(), String>), needle: &str) {
+        for (label, result) in [("consent", &got.0), ("decide", &got.1)] {
+            let err = result.as_ref().expect_err(label);
+            assert!(err.contains(needle), "{label}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_entries_return_busy_without_touching_the_database_when_the_singleton_lock_is_held()
+     {
+        let empty = tempfile::tempdir().unwrap();
+        let _empty_holder = hold_singleton(empty.path());
+        let absent = db_snapshot(empty.path());
+        assert_rejected(&both(empty.path()).await, "busy:");
+        assert_eq!(
+            absent,
+            db_snapshot(empty.path()),
+            "busy must not create a database file"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        migrated_db(dir.path()).await;
+        let before = db_snapshot(dir.path());
+        assert!(
+            before.contains("agent24.db-shm:absent"),
+            "quiesce failed: {before}"
+        );
+        let _holder = hold_singleton(dir.path());
+        assert_rejected(&both(dir.path()).await, "busy:");
+        assert_eq!(
+            before,
+            db_snapshot(dir.path()),
+            "busy must not open the database"
+        );
+    }
+
+    async fn refuse_marker(name: &str, needle: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        migrated_db(dir.path()).await;
+        std::fs::write(dir.path().join(name), b"{}").unwrap();
+        let before = db_snapshot(dir.path());
+        assert_rejected(&both(dir.path()).await, needle);
+        assert_eq!(
+            before,
+            db_snapshot(dir.path()),
+            "{name} must be refused before the database is opened"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_entries_return_docked_when_migration_failed_exists() {
+        refuse_marker("migration_failed", "docked: migration_failed").await;
+    }
+
+    #[tokio::test]
+    async fn offline_entries_return_docked_when_migration_guard_log_exists() {
+        refuse_marker("migration-guard.json", "docked: migration-guard.json").await;
+    }
+
+    #[tokio::test]
+    async fn offline_entries_refuse_a_behind_schema_and_leave_the_version_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent24.db");
+        let latest = agent24_store::test_hooks::embedded_schema_version();
+        agent24_store::test_hooks::prepare_db_stopped_before(&path, latest)
+            .await
+            .unwrap();
+        let before = agent24_store::test_hooks::applied_schema_version(&path)
+            .await
+            .unwrap();
+        assert!(
+            before < latest,
+            "fixture must be behind ({before} < {latest})"
+        );
+        assert_rejected(&both(dir.path()).await, "请先启动 daemon 完成升级");
+        let after = agent24_store::test_hooks::applied_schema_version(&path)
+            .await
+            .unwrap();
+        assert_eq!(before, after, "offline open must not migrate");
+    }
+
+    #[tokio::test]
+    async fn offline_entries_run_when_the_lock_is_free_and_the_schema_is_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent24.db");
+        let store = agent24_store::Store::open(&path).await.unwrap();
+        store
+            .insert_decision_log(&agent24_store::NewDecisionLogEntry {
+                decision_id: "d1".to_owned(),
+                ts: "2026-10-07T00:00:00Z".to_owned(),
+                schema_version: 1,
+                point: "retain.intent".to_owned(),
+                input: None,
+                context_json: None,
+                question_json: "[]".to_owned(),
+                layers_json: "[]".to_owned(),
+                final_action: "execute".to_owned(),
+                hw_tier: None,
+            })
+            .await
+            .unwrap();
+        agent24_store::test_hooks::checkpoint(&store).await.unwrap();
+        drop(store);
+
+        invalidate_module_consents_in(Some(dir.path()), "consent-mod")
+            .await
+            .unwrap();
+        // Probe from another process: a same-process flock retry on macOS
+        // does not prove that the previous offline entry released its lock.
+        drop(hold_singleton(dir.path()));
+        cmd_decide_in(
+            dir.path(),
+            DecideAction::Delete {
+                action: DecideDeleteAction::Id {
+                    decision_id: "d1".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        std::fs::remove_file(dir.path().join("holder.ready")).unwrap();
+        drop(hold_singleton(dir.path()));
+        let store = agent24_store::Store::open_without_migration(&path)
+            .await
+            .unwrap();
+        let revocations = agent24_store::test_hooks::revocation_count(&store, "consent-mod")
+            .await
+            .unwrap();
+        assert_eq!(revocations, 1, "consent revocation must land");
+        let remaining = store.export_decision_log(None, None).await.unwrap();
+        assert!(
+            remaining.is_empty(),
+            "decide delete must remove the seeded row"
+        );
+    }
+
+    fn write_domain_package(dir: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("domain-os.yml"),
+            format!(
+                "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+                 event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+                 requires_models: []\nrequires_apis: []\nrequires_deps: []\n\
+                 kernel_capabilities: []\nimpl_kind: in_process_crate\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Every directory and file under `root`, in order. Directory entries end
+    /// with `/` and carry no bytes, so an added or removed directory is visible
+    /// even when it is empty. File bytes are the contents, not a size.
+    fn package_tree(root: &std::path::Path) -> Vec<(String, Option<Vec<u8>>)> {
+        fn walk(
+            base: &std::path::Path,
+            dir: &std::path::Path,
+            out: &mut Vec<(String, Option<Vec<u8>>)>,
+        ) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap())
+                .collect();
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                if meta.file_type().is_symlink() {
+                    let target = std::fs::read_link(&path).unwrap();
+                    out.push((
+                        rel,
+                        Some(target.to_string_lossy().into_owned().into_bytes()),
+                    ));
+                } else if meta.is_dir() {
+                    out.push((format!("{rel}/"), None));
+                    walk(base, &path, out);
+                } else {
+                    out.push((rel, Some(std::fs::read(&path).unwrap())));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if root.exists() {
+            walk(root, root, &mut out);
+        }
+        out
+    }
+
+    fn assert_busy(result: Result<(), String>) -> String {
+        let err = result.expect_err("install/uninstall must fail while the lock is held");
+        assert!(err.contains("busy:"), "expected busy, got {err}");
+        err
+    }
+
+    /// Capabilities mode makes `attach_only` return `None`. This passes that
+    /// `None` in directly and holds `daemon.singleton.lock` in another process.
+    #[tokio::test]
+    async fn install_and_uninstall_stay_busy_and_leave_every_package_entry_unchanged() {
+        let state = tempfile::tempdir().unwrap();
+        let packages = tempfile::tempdir().unwrap();
+        let sources = tempfile::tempdir().unwrap();
+        let installed_src = sources.path().join("busyun");
+        let fresh_src = sources.path().join("busyinst");
+        write_domain_package(&installed_src, "busyun");
+        write_domain_package(&fresh_src, "busyinst");
+
+        install_with_consent(&installed_src, packages.path(), Some(state.path()), None)
+            .await
+            .unwrap();
+        let before = package_tree(packages.path());
+        assert!(
+            before.iter().any(|(rel, _)| rel == "busyun/"),
+            "setup must install busyun: {before:?}"
+        );
+        assert!(
+            before.iter().all(|(rel, _)| !rel.starts_with("busyinst")),
+            "busyinst must not be installed yet"
+        );
+
+        let _holder = hold_singleton(state.path());
+
+        assert_busy(
+            install_with_consent(&fresh_src, packages.path(), Some(state.path()), None).await,
+        );
+        assert_eq!(
+            before,
+            package_tree(packages.path()),
+            "a busy install must not add, remove, or rewrite any package entry"
+        );
+        assert_busy(
+            install_with_consent(&fresh_src, packages.path(), Some(state.path()), None).await,
+        );
+        assert_eq!(
+            before,
+            package_tree(packages.path()),
+            "retrying a busy install must still change nothing"
+        );
+
+        assert_busy(
+            uninstall_with_consent("busyun", packages.path(), Some(state.path()), None).await,
+        );
+        assert_eq!(
+            before,
+            package_tree(packages.path()),
+            "a busy uninstall must not remove or rewrite any package entry"
+        );
+        let retry =
+            uninstall_with_consent("busyun", packages.path(), Some(state.path()), None).await;
+        assert_busy(retry);
+        assert_eq!(
+            before,
+            package_tree(packages.path()),
+            "retrying a busy uninstall must stay busy and leave the package in place"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_database_consent_export_and_delete_succeed_without_creating_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = db_snapshot(dir.path());
+        invalidate_module_consents_in(Some(dir.path()), "consent-mod")
+            .await
+            .unwrap();
+        cmd_decide_in(
+            dir.path(),
+            DecideAction::Export {
+                jsonl: true,
+                point: None,
+                since: None,
+            },
+        )
+        .await
+        .unwrap();
+        cmd_decide_in(
+            dir.path(),
+            DecideAction::Delete {
+                action: DecideDeleteAction::Id {
+                    decision_id: "missing".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        cmd_decide_in(
+            dir.path(),
+            DecideAction::Delete {
+                action: DecideDeleteAction::Point {
+                    point: "retain.intent".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        cmd_decide_in(
+            dir.path(),
+            DecideAction::Delete {
+                action: DecideDeleteAction::All { confirm: true },
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            absent,
+            db_snapshot(dir.path()),
+            "a missing database has nothing to revoke, export, or delete, so no file is created"
+        );
     }
 
     // ── D0-2 `agent24 decide` guards (pre-pr-check T2) ──────────────────────
@@ -2411,6 +3598,65 @@ mod tests {
         assert_eq!(v["outcomes"][0]["label"]["answer"], true);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ready_timeout_reaps_the_unready_daemon() {
+        let mut child = tokio::process::Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let result = wait_daemon_ready(&mut child, Duration::ZERO).await;
+        let reaped = child.try_wait().unwrap().is_some();
+        // Clean up the negative control before asserting, too.
+        let _ = child.kill().await;
+        assert_eq!(
+            result.unwrap_err().message,
+            "agent24d did not become ready within 15s"
+        );
+        assert!(
+            reaped,
+            "a failed startup must reap its child before returning"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ready_handshake_preserves_success_and_reaps_invalid_ready() {
+        use tokio::io::AsyncWriteExt;
+
+        for port in [0, 8080] {
+            let mut child = tokio::process::Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let line = format!("{{\"type\":\"ready\",\"port\":{port},\"token\":\"legacy\"}}\n");
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(line.as_bytes())
+                .await
+                .unwrap();
+            let result = wait_daemon_ready(&mut child, Duration::from_secs(15)).await;
+            let reaped = child.try_wait().unwrap().is_some();
+            let _ = child.kill().await;
+            if port == 0 {
+                assert_eq!(result.unwrap_err().message, "ready line has invalid port");
+                assert!(reaped, "invalid readiness must not leave a daemon behind");
+            } else {
+                assert_eq!(result.unwrap().port, port);
+                assert!(
+                    !reaped,
+                    "successful readiness transfers the live child to the caller"
+                );
+            }
+        }
+    }
+
     #[test]
     fn old_ready_line_requires_and_keeps_legacy_token() {
         let ready = serde_json::json!({
@@ -2482,9 +3728,42 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Comm {
-                action: CommAction::Unlock { remember: true }
+                action: CommAction::Unlock { remember: true },
+                ..
             }
         ));
+    }
+
+    /// `--session` reaches the request as the desktop's chat page sends it;
+    /// without it the chat stays session-less.
+    #[test]
+    fn chat_sends_the_session_it_was_given() {
+        let request = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Chat {
+                message,
+                model,
+                session,
+                confirm_headroom,
+            } = cli.command
+            else {
+                panic!("not a chat");
+            };
+            serde_json::to_value(chat_request(message, model, session, confirm_headroom)).unwrap()
+        };
+        let body = request(&["agent24", "chat", "hi", "--session", "chat_1"]);
+        assert_eq!(body["session_id"], "chat_1", "{body}");
+        assert_eq!(body["messages"][0]["content"], "hi", "{body}");
+        let body = request(&["agent24", "chat", "hi"]);
+        assert_eq!(body.get("session_id"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn a_remember_receipt_says_what_the_daemon_did() {
+        use agent24_protocol::MemoryReceipt::{Failed, PausedNotSaved, Saved};
+        assert_eq!(receipt_line(Saved), "remembered");
+        assert!(receipt_line(PausedNotSaved).contains("paused"));
+        assert!(receipt_line(Failed).contains("failed"));
     }
 
     #[test]
@@ -2723,10 +4002,260 @@ mod tests {
 
     fn health_ok_reply() -> String {
         let body = r#"{"status":"ok"}"#;
+        json_reply(body)
+    }
+
+    fn json_reply(body: &str) -> String {
         format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    #[tokio::test]
+    async fn connect_refuses_a_daemon_on_a_different_protocol_version() {
+        let body = r#"{"status":"ok","version":"9.9.9","backend":"rust","protocol_version":2,"migrations":{"store":1,"memory":1}}"#;
+        let (port, _) = thread_stub(json_reply(body));
+        let state =
+            DaemonState::new_legacy(port, "tok", std::process::id(), "9.9.9", "gen").unwrap();
+        let DiscoveredAttach::Incompatible(err) = attach_discovered(&state).await else {
+            panic!("connect must refuse a daemon on another protocol version");
+        };
+        assert!(err.contains("协议版本不兼容"), "{err}");
+        assert!(err.contains("daemon 协议版本 2"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "客户端协议版本 {}",
+                agent24_protocol::PROTOCOL_VERSION
+            )),
+            "{err}"
+        );
+        assert!(err.contains("agent24 daemon start"), "{err}");
+        assert!(
+            err.contains("先 agent24 daemon stop 再 agent24 daemon start（或 service install）"),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "daemon.json 记录的协议版本为 {}",
+                agent24_protocol::PROTOCOL_VERSION
+            )),
+            "{err}"
+        );
+        assert!(err.contains("升级"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn connect_refuses_an_old_health_body_without_protocol_version() {
+        let body = r#"{"status":"ok","version":"0.4.0","backend":"rust"}"#;
+        let (port, _) = thread_stub(json_reply(body));
+        let state =
+            DaemonState::new_legacy(port, "tok", std::process::id(), "0.4.0", "gen").unwrap();
+        let DiscoveredAttach::Incompatible(err) = attach_discovered(&state).await else {
+            panic!("connect must refuse an old daemon whose /health has no protocol_version");
+        };
+        assert!(err.contains("daemon 版本过旧，请升级"), "{err}");
+        assert!(err.contains("daemon 协议版本 未知"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "客户端协议版本 {}",
+                agent24_protocol::PROTOCOL_VERSION
+            )),
+            "{err}"
+        );
+        assert!(
+            err.contains("先 agent24 daemon stop 再 agent24 daemon start（或 service install）"),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "daemon.json 记录的协议版本为 {}",
+                agent24_protocol::PROTOCOL_VERSION
+            )),
+            "{err}"
+        );
+    }
+
+    /// An old `daemon.json` (no `protocol_version`) whose port is dead is
+    /// absent. Judging the record before the probe used to refuse forever
+    /// and skip the spawn `connect` is allowed to do.
+    #[tokio::test]
+    async fn connect_treats_an_old_daemon_json_on_a_dead_port_as_unreachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut state = DaemonState::new_legacy(port, "tok", 4242, "0.4.0", "gen").unwrap();
+        state.protocol_version = None;
+        match attach_discovered(&state).await {
+            DiscoveredAttach::Unreachable => {}
+            DiscoveredAttach::Incompatible(err) => {
+                panic!("a dead port must be unreachable, not incompatible: {err}")
+            }
+            DiscoveredAttach::Ready(_) | DiscoveredAttach::EnrollFailed(_) => {
+                panic!("a dead port must not attach")
+            }
+        }
+    }
+
+    /// The live `/health` advertisement wins. A missing or stale record is
+    /// only extra text on a refusal, not a reason to skip the probe.
+    #[tokio::test]
+    async fn connect_attaches_when_an_old_daemon_json_health_matches() {
+        let body = format!(
+            r#"{{"status":"ok","version":"0.5.1","backend":"rust","protocol_version":{},"migrations":{{"store":1,"memory":1}}}}"#,
+            agent24_protocol::PROTOCOL_VERSION
+        );
+        let (port, hits) = thread_stub(json_reply(&body));
+        let mut state =
+            DaemonState::new_legacy(port, "tok", std::process::id(), "0.4.0", "gen").unwrap();
+        state.protocol_version = None;
+        let DiscoveredAttach::Ready(endpoint) = attach_discovered(&state).await else {
+            panic!(
+                "a live matching /health must attach even when daemon.json has no protocol_version"
+            );
+        };
+        assert!(
+            hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the probe has to run before the record is judged"
+        );
+        assert_eq!(endpoint.base, format!("http://127.0.0.1:{port}"));
+        assert_eq!(endpoint.token, "tok");
+    }
+
+    #[tokio::test]
+    async fn connect_attaches_when_recorded_version_disagrees_but_health_matches() {
+        let body = format!(
+            r#"{{"status":"ok","version":"0.5.1","backend":"rust","protocol_version":{},"migrations":{{"store":1,"memory":1}}}}"#,
+            agent24_protocol::PROTOCOL_VERSION
+        );
+        let (port, _) = thread_stub(json_reply(&body));
+        let mut state =
+            DaemonState::new_legacy(port, "tok", std::process::id(), "9.9.9", "gen").unwrap();
+        state.protocol_version = Some(9);
+        let DiscoveredAttach::Ready(endpoint) = attach_discovered(&state).await else {
+            panic!("the recorded version must not override a compatible /health");
+        };
+        assert_eq!(endpoint.token, "tok");
+    }
+
+    #[tokio::test]
+    async fn connect_names_the_recorded_version_only_after_a_live_probe() {
+        let body = r#"{"status":"ok","version":"9.9.9","backend":"rust","protocol_version":2,"migrations":{"store":1,"memory":1}}"#;
+        let (port, hits) = thread_stub(json_reply(body));
+        let mut state =
+            DaemonState::new_legacy(port, "tok", std::process::id(), "9.9.9", "gen").unwrap();
+        state.protocol_version = Some(9);
+        let DiscoveredAttach::Incompatible(err) = attach_discovered(&state).await else {
+            panic!("live protocol 2 must still be refused");
+        };
+        assert!(
+            hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "must probe before judging the record"
+        );
+        assert!(err.contains("daemon 协议版本 2"), "{err}");
+        assert!(err.contains("daemon.json 记录的协议版本为 9"), "{err}");
+        assert!(
+            !err.contains("daemon 协议版本 9，"),
+            "the refusal must follow the live version, not the record: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_refuses_a_200_whose_body_is_not_json() {
+        let (port, _) = thread_stub(json_reply("not-json"));
+        let state =
+            DaemonState::new_legacy(port, "tok", std::process::id(), "9.9.9", "gen").unwrap();
+        match attach_discovered(&state).await {
+            DiscoveredAttach::Incompatible(err) => {
+                assert!(err.contains("daemon 版本过旧，请升级"), "{err}");
+                assert!(err.contains("daemon 协议版本 未知"), "{err}");
+            }
+            DiscoveredAttach::Unreachable => {
+                panic!("a 200 is a live peer, not an absent daemon")
+            }
+            DiscoveredAttach::Ready(_) | DiscoveredAttach::EnrollFailed(_) => {
+                panic!("a non-JSON 200 must not be attached")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_attaches_when_health_protocol_matches() {
+        let body = format!(
+            r#"{{"status":"ok","version":"0.5.1","backend":"rust","protocol_version":{},"migrations":{{"store":1,"memory":1}}}}"#,
+            agent24_protocol::PROTOCOL_VERSION
+        );
+        let (port, _) = thread_stub(json_reply(&body));
+        let state =
+            DaemonState::new_legacy(port, "tok", std::process::id(), "0.5.1", "gen").unwrap();
+        let DiscoveredAttach::Ready(endpoint) = attach_discovered(&state).await else {
+            panic!("a matching protocol version must still attach");
+        };
+        assert_eq!(endpoint.base, format!("http://127.0.0.1:{port}"));
+        assert_eq!(endpoint.token, "tok");
+        assert!(endpoint.child.is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_only_refuses_an_incompatible_daemon_and_keeps_the_error() {
+        let body = r#"{"status":"ok","version":"9.9.9","backend":"rust","protocol_version":2,"migrations":{"store":1,"memory":1}}"#;
+        let (port, _) = thread_stub(json_reply(body));
+        let state =
+            DaemonState::new_legacy(port, "tok", std::process::id(), "9.9.9", "gen").unwrap();
+        match attach_only_from(&state, false).await {
+            Err(err) => {
+                assert!(err.contains("协议版本不兼容"), "{err}");
+                assert!(err.contains("daemon 协议版本 2"), "{err}");
+                assert!(err.contains("升级"), "{err}");
+            }
+            Ok(Some(_)) => panic!(
+                "attach_only handed back an endpoint; os enable/disable and uninstall hot-stop would send to this daemon"
+            ),
+            Ok(None) => {
+                panic!("attach_only swallowed the incompatible daemon as if none were running")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_only_still_attaches_when_the_protocol_matches() {
+        let body = format!(
+            r#"{{"status":"ok","version":"0.5.1","backend":"rust","protocol_version":{},"migrations":{{"store":1,"memory":1}}}}"#,
+            agent24_protocol::PROTOCOL_VERSION
+        );
+        let (port, _) = thread_stub(json_reply(&body));
+        let state =
+            DaemonState::new_legacy(port, "tok", std::process::id(), "0.5.1", "gen").unwrap();
+        let endpoint = attach_only_from(&state, false)
+            .await
+            .expect("a matching daemon is not an error")
+            .expect("a matching daemon is attached");
+        assert_eq!(endpoint.base, format!("http://127.0.0.1:{port}"));
+        assert_eq!(endpoint.token, "tok");
+    }
+
+    #[test]
+    fn daemon_status_of_an_old_health_body_says_the_daemon_is_too_old() {
+        let current = format!(
+            r#"{{"status":"ok","version":"0.5.1","backend":"rust","protocol_version":{},"migrations":{{"store":1,"memory":1}}}}"#,
+            agent24_protocol::PROTOCOL_VERSION
+        );
+        let current_report = daemon_status_summary(7, 4321, &current).unwrap();
+        assert!(
+            current_report.contains("running · pid 7 · port 4321 · backend rust · v0.5.1"),
+            "{current_report}"
+        );
+        assert!(!current_report.contains("版本过旧"), "{current_report}");
+
+        let old = r#"{"status":"ok","version":"0.4.0","backend":"rust","migrations":{"store":1,"memory":1}}"#;
+        let report = daemon_status_summary(7, 4321, old)
+            .unwrap_or_else(|err| panic!("old daemon must not surface a parse error: {err}"));
+        assert!(report.contains("daemon 版本过旧"), "{report}");
+        assert!(
+            report.contains("running · pid 7 · port 4321 · backend rust · v0.4.0"),
+            "{report}"
+        );
+        assert!(!report.contains("missing field"), "{report}");
     }
 
     fn target_port() -> u16 {

@@ -1,12 +1,17 @@
 [package]
 name = "agent24d"
-version = "0.5.1"
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Agent24 Rust daemon — v1 protocol server (B2: skeleton — health, auth handshake, graceful shutdown)"
 
+[features]
+# Unsigned binaries and automatic presence are exclusively for integration tests.
+test-enrollment = []
+
 [dependencies]
+agent24-os-proc = { path = "../../crates/agent24-os-proc" }
 agent24-agent = { path = "../../crates/agent24-agent" }
 # COMM-2a: `/api/v1/comm/*` — see `src/comm_routes.rs`.
 agent24-comm = { path = "../../crates/agent24-comm" }
@@ -14,6 +19,8 @@ agent24-core = { path = "../../crates/agent24-core" }
 # D0-3: `GET /api/v1/decide/profile` only — hardware probe + tier policy,
 # not the decision cascade itself (that is D1, still unwired).
 agent24-decide = { path = "../../crates/agent24-decide" }
+agent24-idoris = { path = "../../crates/agent24-idoris" }
+uuid = { version = "1", features = ["v4"] }
 agent24-hw = { path = "../../crates/agent24-hw" }
 agent24-domain = { path = "../../crates/agent24-domain" }
 agent24-os-packages = { path = "../../crates/agent24-os-packages" }
@@ -35,6 +42,7 @@ clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 http-body-util = "0.1"
 rand = "0.9"
+zeroize = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 # ME4-4.2.3b (design §6.5): `GET /api/v1/usage?module=` reads the raw query
@@ -77,17 +85,29 @@ libc = "0.2"
 # only carries the three fields a MODULE needs); read directly rather than
 # adding a fourth field to that shared reader for one caller.
 serde_yaml = "0.9"
+# KB-C1-04 6d: the Provider's records and their stored shape
+# (`knowledge_store.rs`).
+agent24-knowledge = { path = "../../crates/agent24-knowledge" }
+# KB-C1-04 6d-1: `knowledge.db` (`knowledge_store.rs`). Tests also use it
+# (T7b/ME-3e) to force a transient `Store` error in the timeout-scan test by
+# dropping `module_approvals` out from under a live pool — there is no
+# fault-injectable `Store` trait to mock instead.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+
+# CORE-5d: snapshot maintenance connections and the raw-handle backup boundary
+# (uses the `sqlx` dependency declared above).
+agent24-os-sqlite = { path = "../../crates/agent24-os-sqlite" }
+
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
+jsonschema = { version = "0.59", default-features = false }
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
 # ME4-S3 §6 (J-S7): the SDK's five clients tested against these callback
 # handlers' own `h.call` fixtures, on `agent24-os-proto`'s in-memory fake
 # kernel (forwarded through the SDK's `test-util` feature, L8).
 agent24-os-sdk = { path = "../../crates/agent24-os-sdk", features = ["test-util"] }
-# T7b/ME-3e: forces a transient `Store` error in the timeout-scan test by
-# dropping `module_approvals` out from under a live pool — there is no
-# fault-injectable `Store` trait to mock instead.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tower = { version = "0.5", features = ["util"] }
 # A paused clock, for deadlines asserted exactly rather than with slack.
 tokio = { version = "1", features = ["test-util"] }
@@ -95,6 +115,9 @@ tokio = { version = "1", features = ["test-util"] }
 # `GET /api/v1/events` consumer boundary, not just the callback's ack — same
 # version/feature set `agent24-cli`'s TUI already uses as a client.
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libproc = "0.14"
 
 [lints]
 workspace = true

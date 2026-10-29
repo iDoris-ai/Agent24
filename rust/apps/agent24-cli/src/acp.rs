@@ -9,7 +9,8 @@
 //! (`/api/v1/peer/runs/{id}`) says it is not withheld. The view is read at
 //! the first delta, failure or completion — sources are tagged before the
 //! first model call — and read again after each tool the run starts, since
-//! the kernel withholds a run that called a tool (its results are untagged).
+//! a tool's result can withhold the run (K1-6b.5f-3: a call without its own
+//! result tag, or one whose tag is not Ordinary).
 //! Every prompt here runs in a session, so while the daemon keeps session
 //! memory the kernel withholds all of them.
 
@@ -185,17 +186,19 @@ async fn run_prompt(
     // Subscribe before creating the run so a fast local model cannot complete
     // between POST /runs and the WebSocket handshake.
     let ws_url = format!("{}/api/v1/events", ep.base.replacen("http", "ws", 1));
-    let request = ws_request(&ws_url, &ep.token)?;
+    let request = ws_request(&ws_url, ep.token())?;
     let (socket, _) = tokio_tungstenite::connect_async(request)
         .await
         .map_err(|e| format!("connecting event stream: {e}"))?;
 
     let create = RunCreate {
+        idoris_headroom_confirmed: false,
         session_id: Some(session_id.to_owned()),
         prompt,
         workspace_id: None,
         model_override: None,
         mode: RunMode::Normal,
+        knowledge_binding_id: None,
     };
     let response = bearer(
         ep,
@@ -564,8 +567,8 @@ mod tests {
 
     #[tokio::test]
     async fn deltas_after_a_tool_starts_wait_for_a_fresh_check() {
-        // The kernel withholds a run once it has called a tool: the second
-        // check answers withheld.
+        // The tool's result withheld the run: the second check answers
+        // withheld.
         let checks = AtomicUsize::new(0);
         let mut out = Vec::new();
         let result = relay_run(
@@ -641,6 +644,33 @@ mod tests {
         assert_eq!(result.unwrap_err(), "run cancelled");
         assert!(sent.is_empty(), "{sent}");
         assert_eq!(checks, 0);
+    }
+
+    #[tokio::test]
+    async fn another_runs_completion_or_cancellation_does_not_end_this_run() {
+        let mut other_completed = completed("run_2");
+        if let Ok(Event {
+            body: EventBody::RunCompleted(done),
+            ..
+        }) = &mut other_completed
+        {
+            done.usage.completion_tokens = 99;
+        }
+        let (result, _, checks) = relay(
+            vec![
+                other_completed,
+                event(EventBody::RunCancelled(
+                    agent24_protocol::RunCancelledPayload {
+                        run_id: "run_2".to_owned(),
+                    },
+                )),
+                completed("run_1"),
+            ],
+            || view(false),
+        )
+        .await;
+        assert_eq!(result.unwrap()["usage"]["outputTokens"], 2);
+        assert_eq!(checks, 1);
     }
 
     #[test]
