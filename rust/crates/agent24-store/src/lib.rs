@@ -106,7 +106,7 @@ pub use run_workspace_terminal::RunTerminalTransition;
 pub use source_policy::{
     ASSERTION_SOURCE_REF_SCHEMA_VERSION, AssertionSourceRef, PolicySnapshot,
     SOURCE_TAG_SCHEMA_VERSION, SourceClassification, SourceKind, SourceMode, SourceRef,
-    StoredSourceTag, strictest_classification,
+    StoredSourceTag, TOOL_RESULT_PREFIX, strictest_classification,
 };
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};

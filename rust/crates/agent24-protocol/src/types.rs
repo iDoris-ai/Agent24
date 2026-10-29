@@ -500,23 +500,25 @@ pub struct RunCreate {
 /// K1-6b.5c-2 (ADR-K1-02 §2.4): a run as a peer bridge (the MCP server, the
 /// ACP bridge) may relay it. Content is present only when `withheld` is false
 /// and the run has ended. Any other run — a source that is not Ordinary,
-/// sources that cannot be read, or, while tool results carry no source tags,
-/// a run that may have taken one in (it called a tool, recalled a memory, was
-/// started by a kernel-created schedule, or has session context) — carries
-/// only its id, status and `notice`.
+/// sources that cannot be read, a tool call without its own result tag
+/// (K1-6b.5f-3), or a run that may have taken in an earlier run's tool
+/// results (it recalled a memory, was started by a kernel-created schedule,
+/// or has session context) — carries only its id, status and `notice`.
 /// An allowlist, not a filtered [`Run`]: a field added to `Run` later never
 /// reaches a peer by default.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct PeerRun {
     pub id: String,
     pub status: RunStatus,
-    /// True unless every source tagged on the run so far is Ordinary and the
-    /// run has called no tool, recalled no memory, was not started by a
-    /// kernel-created schedule and has no session context (no session, or it
-    /// ran — and the daemon runs — without session memory). Sources are tagged
-    /// before the first model call, so afterwards the value only changes when
-    /// the run starts a tool or the daemon restarts with session memory turned
-    /// on or off.
+    /// True unless every source tagged on the run so far is Ordinary, each
+    /// tool call it made has its own result tag (K1-6b.5f-3), and it recalled
+    /// no memory, was not started by a kernel-created schedule and has no
+    /// session context (no session, or it ran — and the daemon runs — without
+    /// session memory). Sources are tagged before the first model call and a
+    /// tool's result before the model sees it, so afterwards the value only
+    /// changes while a tool runs (true from its start until its result is
+    /// tagged, then as that tag says) or when the daemon restarts with
+    /// session memory turned on or off.
     pub withheld: bool,
     /// Present only for an ended run that is not withheld
     pub prompt: Option<String>,

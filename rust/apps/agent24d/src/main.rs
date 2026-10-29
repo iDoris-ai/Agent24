@@ -213,7 +213,9 @@ fn run_serve(
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(err) => {
-            tracing::error!("failed to start tokio runtime: {err}");
+            let error = format!("failed to start tokio runtime: {err}");
+            tracing::error!("{error}");
+            say_start_failed("start_failed", &error);
             return std::process::ExitCode::FAILURE;
         }
     };
@@ -238,7 +240,55 @@ fn run_serve(
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!("serve failed: {err}");
+            let already_running = err
+                .get_ref()
+                .is_some_and(|inner| inner.is::<server::AlreadyRunning>());
+            let code = if already_running {
+                "already_running"
+            } else {
+                "start_failed"
+            };
+            say_start_failed(code, &err.to_string());
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+/// SPEC-002 §4: a start that fails before its ready line says why on stdout
+/// too, `{"type":"failed","code":…,"error":…}`, so a launcher that does not
+/// keep stderr can still tell the user. Never after the ready line; a write
+/// error is ignored, since the reader may be gone.
+fn say_start_failed(code: &str, error: &str) {
+    use std::io::Write;
+    let ready_sent = server::READY_SENT.load(std::sync::atomic::Ordering::SeqCst);
+    let Some(line) = start_failed_line(ready_sent, code, error) else {
+        return;
+    };
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+}
+
+/// The `failed` line, or none once the ready line has gone out.
+fn start_failed_line(ready_sent: bool, code: &str, error: &str) -> Option<String> {
+    (!ready_sent)
+        .then(|| serde_json::json!({ "type": "failed", "code": code, "error": error }).to_string())
+}
+
+#[cfg(test)]
+mod start_failed_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::start_failed_line;
+
+    #[test]
+    fn nothing_follows_the_ready_line() {
+        assert_eq!(start_failed_line(true, "start_failed", "x"), None);
+        let line = start_failed_line(false, "already_running", "held").unwrap();
+        let line: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            line,
+            serde_json::json!({ "type": "failed", "code": "already_running", "error": "held" })
+        );
     }
 }

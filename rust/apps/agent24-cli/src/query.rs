@@ -1,7 +1,9 @@
 //! TUI-2a / TUI-2a2：daemon 的只读 GET。
 //! session / run / memory / schedule / usage，以及 timings、consent、
 //! approval、tools、decide profile。
-//! 写操作留给 TUI-2b（CORE-2 提升级在场证明）。
+//! 写操作留给 TUI-2b（CORE-2 提升级在场证明）。例外是 `run` 的 list/show/cancel
+//! 与 `schedule` 的 create/update/delete/run-now：它们来自内核的 `crate::runs`、
+//! `crate::schedules`，作为 `Ops` 并进这里的子命令。
 //!
 //! 路径字面量必须写在 `Method::GET` 元组里，`scripts/tui-coverage.mjs` 才认。
 
@@ -39,6 +41,9 @@ pub enum RunAction {
         #[arg(long, help = JSON_HELP)]
         json: bool,
     },
+    /// list、show、cancel：桌面端 Runs 页的操作（`crate::runs`）
+    #[command(flatten)]
+    Ops(crate::runs::RunsAction),
 }
 
 #[derive(clap::Subcommand)]
@@ -74,6 +79,9 @@ pub enum ScheduleAction {
         #[arg(long, help = JSON_HELP)]
         json: bool,
     },
+    /// create、update、delete、run-now：桌面端 Schedules 页的写操作（`crate::schedules`）
+    #[command(flatten)]
+    Ops(crate::schedules::SchedulesAction),
 }
 
 #[derive(clap::Subcommand)]
@@ -207,6 +215,7 @@ pub async fn run_cmd(action: RunAction) -> Result<(), String> {
     match action {
         RunAction::Get { id, json } => run(Read::Run { id }, json).await,
         RunAction::Peers { json } => run(Read::PeerRuns, json).await,
+        RunAction::Ops(action) => crate::runs::cmd_runs(action).await,
     }
 }
 
@@ -222,6 +231,7 @@ pub async fn schedule(action: ScheduleAction) -> Result<(), String> {
     let (read, json) = match action {
         ScheduleAction::List { json } => (Read::Schedules, json),
         ScheduleAction::Get { id, json } => (Read::Schedule { id }, json),
+        ScheduleAction::Ops(action) => return crate::schedules::cmd_schedules(action).await,
     };
     run(read, json).await
 }
