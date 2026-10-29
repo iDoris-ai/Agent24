@@ -17,13 +17,8 @@ import {
   type ApprovalDecisionInput,
   type CreativeViewBounds,
   type CreativeViewResult,
-  type DiscoverFilter,
-  type DiscoveredModule,
   type LlmStatusResult,
   type IdorisStatusResult,
-  type ModuleInfo,
-  type ModuleInstallResult,
-  type ModuleUninstallResult,
   type ModelCallEnvelope,
   type OpenDesignComponentStatusResult,
   type OmlxAuthRequiredResult,
@@ -85,18 +80,6 @@ const api = {
     ipcRenderer.invoke(IpcChannels.OmlxStop),
   omlxWarmup: (url: string, apiKey: string, modelId: string): Promise<OmlxWarmupResult> =>
     ipcRenderer.invoke(IpcChannels.OmlxWarmup, url, apiKey, modelId),
-  modulesList: (): Promise<ModuleInfo[]> =>
-    ipcRenderer.invoke(IpcChannels.ModulesList),
-  modulesDiscover: (filter?: DiscoverFilter): Promise<DiscoveredModule[]> =>
-    ipcRenderer.invoke(IpcChannels.ModulesDiscover, filter ?? {}),
-  modulesEnable: (id: string): Promise<{ ok: boolean }> =>
-    ipcRenderer.invoke(IpcChannels.ModulesEnable, id),
-  modulesDisable: (id: string): Promise<{ ok: boolean }> =>
-    ipcRenderer.invoke(IpcChannels.ModulesDisable, id),
-  modulesInstall: (packageName: string): Promise<ModuleInstallResult> =>
-    ipcRenderer.invoke(IpcChannels.ModulesInstall, packageName),
-  modulesUninstall: (packageName: string, id?: string): Promise<ModuleUninstallResult> =>
-    ipcRenderer.invoke(IpcChannels.ModulesUninstall, packageName, id),
   llmStatus: (): Promise<LlmStatusResult> =>
     ipcRenderer.invoke(IpcChannels.LlmStatus),
   idorisStatus: (): Promise<IdorisStatusResult> =>

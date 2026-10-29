@@ -37,12 +37,6 @@ export const IpcChannels = {
   OmlxStart: 'omlx:start',
   OmlxStop: 'omlx:stop',
   OmlxWarmup: 'omlx:warmup',
-  ModulesList: 'modules:list',
-  ModulesDiscover: 'modules:discover',
-  ModulesEnable: 'modules:enable',
-  ModulesDisable: 'modules:disable',
-  ModulesInstall: 'modules:install',
-  ModulesUninstall: 'modules:uninstall',
   LlmStatus: 'llm:status',
   IdorisStatus: 'idoris:status',
   // A3-4: push channel only (main -> renderer via webContents.send). Not an
@@ -176,49 +170,6 @@ export interface OmlxWarmupResult {
   error?: string
 }
 
-// ── Module system ─────────────────────────────────────────────────────────────
-// MIRROR NOTICE: packages/node-daemon/src/manifest.ts keeps an identical copy;
-// machine-readable truth is protocol/module.schema.json. Unified via generated
-// api-client in task A6 — keep in lockstep until then.
-
-export type ModuleType = 'ui' | 'headless' | 'hybrid'
-
-export type Permission =
-  | 'llm' | 'memory' | 'network' | 'filesystem' | 'wechat' | 'nostr'
-
-export interface ModuleNavItem {
-  icon: string
-  label: string
-  route: string
-}
-
-export interface ModuleManifest {
-  id: string
-  version: string
-  name: string
-  description: string
-  type: ModuleType
-  permissions: Permission[]
-  navItem?: ModuleNavItem
-  /** M3: LLM models this module needs — Gateway will ensure they're loaded on register */
-  models?: string[]
-  /** M4: OCI container service — BoxLite starts the container and proxies /api/svc/<id>/* to it */
-  container?: {
-    image: string         // OCI image, e.g. 'python:slim'
-    port: number          // guest port inside container
-    startCmd?: string[]   // command to start the service (defaults to image entrypoint)
-    healthPath?: string   // health-check path polled until 200 (default: '/health')
-    memoryMib?: number    // default 512
-  }
-  /** RESERVED (E5): AgentStore / PGL charter metadata — see protocol/module.schema.json */
-  pgl?: Record<string, unknown>
-}
-
-// ModuleManifest extended with runtime enable/disable state
-export interface ModuleInfo extends ModuleManifest {
-  enabled: boolean
-}
-
 export interface LlmStatusResult {
   provider: 'omlx' | 'ollama' | 'none'
   url: string
@@ -281,40 +232,6 @@ export type IdorisUnavailableReason =
 export type IdorisStatusResult =
   | { state: 'available'; status: IdorisStatusResponse; backends?: IdorisBackend[]; models?: IdorisModelsResponse }
   | { state: 'unavailable'; reason: IdorisUnavailableReason }
-
-export interface ModuleInstallResult {
-  ok: boolean
-  id?: string        // module id if successfully loaded
-  error?: string
-}
-
-export interface ModuleUninstallResult {
-  ok: boolean
-  error?: string
-}
-
-// ── M4 marketplace: discovery / browse ────────────────────────────────────────
-// MIRROR NOTICE: packages/node-daemon/src/module-discovery.ts is the source of
-// truth (the daemon computes trust tier from the package name, anti-spoof).
-
-export type TrustTier = 'official' | 'community' | 'third-party'
-
-export interface DiscoveredModule {
-  packageName: string
-  version: string
-  name: string
-  description: string
-  trustTier: TrustTier
-  installed: boolean
-}
-
-/** Browse filters driving GET /api/modules/discover?q=&tier=&installed= — all
- * optional; an absent field doesn't constrain. */
-export interface DiscoverFilter {
-  query?: string
-  trustTier?: TrustTier
-  installed?: boolean
-}
 
 // ── A3 attached modules (docs/design/A3-ATTACHED-MODULE.md) ────────────────────
 // MIRROR NOTICE: field names copied from the merged Rust

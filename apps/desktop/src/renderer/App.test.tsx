@@ -5,7 +5,6 @@ import { App, pickChatModel, extractDaemonDefaultModel } from './App'
 import { LOCALE_STORAGE_KEY, setLocale } from './i18n'
 
 const mockBackendProxy = vi.fn()
-const mockModulesList = vi.fn()
 const mockGetAppVersion = vi.fn()
 const mockOmlxDetect = vi.fn()
 const mockOmlxStart = vi.fn()
@@ -16,14 +15,12 @@ beforeEach(() => {
   vi.clearAllMocks()
   mockGetAppVersion.mockResolvedValue('1.0.0')
   mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { status: 'ok', ts: Date.now() } })
-  mockModulesList.mockResolvedValue([])
   mockOmlxDetect.mockResolvedValue({ ok: true, models: ['Qwen3-8B-4bit'] })
   mockBackendEndpoint.mockResolvedValue({ port: 60128 })
 
   Object.defineProperty(window, 'agent24', {
     value: {
       backendProxy: mockBackendProxy,
-      modulesList: mockModulesList,
       getAppVersion: mockGetAppVersion,
       omlxDetect: mockOmlxDetect,
       omlxStart: mockOmlxStart,
@@ -149,13 +146,44 @@ describe('App', () => {
     })
   })
 
+  it('Home module count reads GET /api/v1/os', async () => {
+    mockBackendProxy.mockImplementation((req: { path: string }) =>
+      Promise.resolve(
+        req.path === '/api/v1/os'
+          ? { ok: true, status: 200, data: { modules: [{ name: 'a', state: 'mounted' }, { name: 'b', state: 'mounted' }, { name: 'c', state: 'mounted' }, { name: 'd', state: 'disabled' }, { name: 'e', state: 'refused' }] } }
+          : { ok: true, status: 200, data: { status: 'ok' } },
+      ),
+    )
+    await act(async () => { render(<App />) })
+    fireEvent.click(screen.getAllByText('总览')[0])
+    await waitFor(() => {
+      expect(mockBackendProxy).toHaveBeenCalledWith({ method: 'GET', path: '/api/v1/os' })
+      expect(screen.getByText('已加载模块').nextElementSibling).toHaveTextContent('3')
+    })
+  })
+
+  it('Home module count is 0 when every OS module is disabled or refused', async () => {
+    mockBackendProxy.mockImplementation((req: { path: string }) =>
+      Promise.resolve(
+        req.path === '/api/v1/os'
+          ? { ok: true, status: 200, data: { modules: [{ name: 'a', state: 'disabled' }, { name: 'b', state: 'refused' }] } }
+          : { ok: true, status: 200, data: { status: 'ok' } },
+      ),
+    )
+    await act(async () => { render(<App />) })
+    fireEvent.click(screen.getAllByText('总览')[0])
+    await waitFor(() => {
+      expect(mockBackendProxy).toHaveBeenCalledWith({ method: 'GET', path: '/api/v1/os' })
+      expect(screen.getByText('已加载模块').nextElementSibling).toHaveTextContent('0')
+    })
+  })
+
   // A5: node-daemon-era module entries are gone from the navigation.
   it('has no module-manager / codebox / service-box / hello entries (A5)', async () => {
     await act(async () => { render(<App />) })
     expect(screen.queryByText('模块管理')).not.toBeInTheDocument()
     expect(screen.queryByText('安装模块')).not.toBeInTheDocument()
     expect(screen.queryByText('能力模块')).not.toBeInTheDocument()
-    expect(mockModulesList).not.toHaveBeenCalled()
   })
 
   it('navigates to settings page on click', async () => {

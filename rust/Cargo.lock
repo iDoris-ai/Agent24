@@ -49,12 +49,14 @@ dependencies = [
  "agent24-store",
  "clap",
  "crossterm",
+ "fs2",
  "futures-util",
  "ratatui",
  "reqwest",
  "rustix 0.38.44",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tempfile",
  "tokio",
@@ -262,6 +264,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent24-os-proc"
+version = "0.1.0"
+dependencies = [
+ "core-foundation 0.10.1",
+ "libc",
+ "rustix 0.38.44",
+ "security-framework 3.7.0",
+ "tempfile",
+]
+
+[[package]]
 name = "agent24-os-proto"
 version = "0.6.0"
 dependencies = [
@@ -302,6 +315,16 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "agent24-os-sqlite"
+version = "0.1.0"
+dependencies = [
+ "libsqlite3-sys",
+ "sqlx",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -471,8 +494,10 @@ dependencies = [
  "agent24-memory",
  "agent24-models",
  "agent24-os-packages",
+ "agent24-os-proc",
  "agent24-os-proto",
  "agent24-os-sdk",
+ "agent24-os-sqlite",
  "agent24-policy",
  "agent24-protocol",
  "agent24-scheduler",
@@ -503,6 +528,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

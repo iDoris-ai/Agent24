@@ -232,6 +232,26 @@ export interface paths {
         patch: operations["updateDomainOs"];
         trace?: never;
     };
+    "/os/{name}/delegation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Delegate the current registered module HTTP surface
+         * @description Requires capabilities mode and ModuleAdmin authority. FirstPartyShell requests require a single-use elevation grant bound to this request.
+         */
+        post: operations["delegateDomainOs"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/os/{name}/stop": {
         parameters: {
             query?: never;
@@ -1856,6 +1876,13 @@ export interface components {
             cut_requests: string[];
             omitted_records: number;
         };
+        /** @description Latest successful sqlx migration on each database the daemon migrates. Read from `_sqlx_migrations` (`MAX(version)` where `success = 1`). 0 means this process has no successful row to report. */
+        HealthMigrations: {
+            /** @description Run database (`agent24.db`). */
+            store: number;
+            /** @description Memory database (`memory.db`). */
+            memory: number;
+        };
         Health: {
             /** @constant */
             status: "ok";
@@ -1866,6 +1893,9 @@ export interface components {
              * @example rust
              */
             backend: string;
+            /** @description Wire protocol version (`PROTOCOL_VERSION`, currently 1). Increment by 1 when a wire change is incompatible (a field removed or renamed, a changed meaning, or a difference a peer must refuse). Adding an optional field does not bump this. Shells refuse a daemon whose value differs from their own, and treat a missing value as an old daemon. */
+            protocol_version: number;
+            migrations: components["schemas"]["HealthMigrations"];
         };
         ChatMessage: {
             /**
@@ -3913,6 +3943,62 @@ export interface operations {
             };
             /** @description registry_invalid or disable_pending */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    delegateDomainOs: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Agent24-Elevation"?: string;
+            };
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Delegation durably records the module version and registered route digest */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @enum {boolean} */
+                        delegated: true;
+                        name: string;
+                    };
+                };
+            };
+            /** @description Missing or invalid bearer token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Presence confirmation is required or the elevation grant is invalid */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description The delegation record could not be persisted */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };

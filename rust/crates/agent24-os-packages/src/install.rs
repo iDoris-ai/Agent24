@@ -63,6 +63,33 @@ impl std::fmt::Display for InstallError {
     }
 }
 
+/// Manifest module name, read and validated, with nothing written.
+pub fn source_module_name(src: &Path) -> Result<String, InstallError> {
+    Ok(read_manifest(src)?.name().to_owned())
+}
+
+/// Whether `uninstall` would remove an entry. Does not remove it.
+///
+/// An invalid module name is an error, matching [`uninstall`], so a caller can
+/// refuse the name before any consent or file change.
+pub fn package_is_installed(name: &str, packages_root: &Path) -> Result<bool, InstallError> {
+    if !agent24_domain::is_valid_module_name(name) {
+        return Err(InstallError::InvalidName(name.to_owned()));
+    }
+    entry_exists(&packages_root.join(name))
+}
+
+fn read_manifest(src: &Path) -> Result<DomainOsManifest, InstallError> {
+    // Read and validate BEFORE touching the destination. A source that will be
+    // rejected must never have caused a directory to be created.
+    let manifest_path = src.join(MANIFEST_FILE);
+    let bytes = std::fs::read(&manifest_path)
+        .map_err(|e| InstallError::Source(format!("no readable {MANIFEST_FILE}: {e}")))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|e| InstallError::Source(format!("{MANIFEST_FILE} is not valid UTF-8: {e}")))?;
+    DomainOsManifest::from_yaml(&text).map_err(|e| InstallError::Source(e.to_string()))
+}
+
 /// Install the package directory `src` into `packages_root`.
 ///
 /// The destination name comes from the **validated manifest**, never from the
@@ -84,15 +111,7 @@ impl std::fmt::Display for InstallError {
 /// a test passing here says nothing about their disk. Hence `same_device` is
 /// checked at runtime, not merely covered by a test.
 pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError> {
-    // Read and validate BEFORE touching the destination. A source that will be
-    // rejected must never have caused a directory to be created.
-    let manifest_path = src.join(MANIFEST_FILE);
-    let bytes = std::fs::read(&manifest_path)
-        .map_err(|e| InstallError::Source(format!("no readable {MANIFEST_FILE}: {e}")))?;
-    let text = String::from_utf8(bytes)
-        .map_err(|e| InstallError::Source(format!("{MANIFEST_FILE} is not valid UTF-8: {e}")))?;
-    let manifest =
-        DomainOsManifest::from_yaml(&text).map_err(|e| InstallError::Source(e.to_string()))?;
+    let manifest = read_manifest(src)?;
 
     let dest = packages_root.join(manifest.name());
     if entry_exists(&dest)? {
@@ -216,13 +235,10 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
 /// manifest is held to, deliberately not a new "does it look like a path" check.
 /// A second, weaker definition of "package name" is how the two drift apart.
 pub fn uninstall(name: &str, packages_root: &Path) -> Result<bool, InstallError> {
-    if !agent24_domain::is_valid_module_name(name) {
-        return Err(InstallError::InvalidName(name.to_owned()));
-    }
-    let dest = packages_root.join(name);
-    if !entry_exists(&dest)? {
+    if !package_is_installed(name, packages_root)? {
         return Ok(false);
     }
+    let dest = packages_root.join(name);
     // Removal is staged the same way installation is, and for the same reason:
     // `remove_dir_all` is not atomic. Half way through it can hit a permission
     // error or an I/O error and return `Err` having already deleted files — and

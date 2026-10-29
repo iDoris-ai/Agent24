@@ -2,11 +2,8 @@
 // agent-speaker CLI (a subprocess — G3), and IN to the local agent24d over its
 // v1 HTTP API (discovered from the daemon's state file, overridable by env).
 
-import path from 'node:path'
-import os from 'node:os'
 import fs from 'node:fs'
-
-const HOME = os.homedir()
+import { dataDir, joinLiteral } from '@agent24/data-dir'
 
 /** Parse a duration env var into a finite positive number of milliseconds.
  *
@@ -52,9 +49,10 @@ export const CONFIG = {
   RELAY: process.env.A24_NOSTR_RELAY || '',
   /** Display name published in the profile. */
   AGENT_NAME: process.env.A24_NOSTR_NAME || 'agent24',
-  /** Editable capability source (§5). */
-  PROFILE_FILE:
-    process.env.A24_NOSTR_PROFILE || path.join(HOME, '.agent24', 'agent-profile.yml'),
+  /** Editable capability source (§5). Read on each access (ADR-037 data dir). */
+  get PROFILE_FILE(): string {
+    return process.env.A24_NOSTR_PROFILE || joinLiteral(dataDir(), 'agent-profile.yml')
+  },
   /** Inbound authorization — fail-closed (SECURITY, same as F3). */
   ALLOWED_NPUBS: parseNpubs(process.env.A24_NOSTR_ALLOWED_NPUBS),
   /** COMM-5a: F4b inbound execution is frozen by default — an allowlisted
@@ -104,16 +102,17 @@ export const CONFIG = {
    * counters and generation into a single meaningless ledger — and a monitor
    * sampling it would see whichever instance wrote last, so one bridge's outage
    * could be masked by the other's health. */
-  HEALTH_FILE:
-    process.env.A24_NOSTR_HEALTH_FILE ??
-    path.join(
-      HOME,
-      '.agent24',
-      `nostr-bridge-health-${(process.env.A24_NOSTR_IDENTITY || 'agent24').replace(/[^A-Za-z0-9_.-]/g, '_')}.json`,
-    ),
+  get HEALTH_FILE(): string {
+    const override = process.env.A24_NOSTR_HEALTH_FILE
+    if (override !== undefined) return override
+    const identity = (process.env.A24_NOSTR_IDENTITY || 'agent24').replace(/[^A-Za-z0-9_.-]/g, '_')
+    return joinLiteral(dataDir(), `nostr-bridge-health-${identity}.json`)
+  },
 
   // ── agent24d discovery (Rust writes port+token here; env overrides win) ──
-  DAEMON_STATE_FILE: path.join(HOME, '.agent24', 'daemon.json'),
+  get DAEMON_STATE_FILE(): string {
+    return joinLiteral(dataDir(), 'daemon.json')
+  },
 }
 
 export interface DaemonEndpoint {

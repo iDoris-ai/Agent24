@@ -30,6 +30,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { joinLiteral } from '@agent24/data-dir'
 import type { SessionStore } from './bridge.js'
 
 /** Directory-fsync failures that mean "this platform/filesystem does not offer
@@ -205,7 +206,9 @@ export class FileSessionStore implements SessionStore {
     const cutoff = Date.now() - TEMP_ORPHAN_AGE_MS
     for (const name of entries) {
       if (!pattern.test(name)) continue
-      const full = path.join(dir, name)
+      // Temps are named by concatenating onto `this.file`. path.join would fold
+      // `..` in that directory and unlink a different file.
+      const full = joinLiteral(dir, name)
       try {
         if (fs.statSync(full).mtimeMs > cutoff) continue // possibly a live write
         fs.unlinkSync(full)

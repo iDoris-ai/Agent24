@@ -164,8 +164,23 @@ const EXTERNAL_URL_ALLOWLIST = ['https://', 'http://'] as const
 const HOST_INTERFACE = /^\/api\/v1\/host(\/|$)/i
 
 export function reachesHostInterface(requestPath: string): boolean {
+  return reachesPrefix(HOST_INTERFACE, requestPath)
+}
+
+// CORE-2 AgentEar S3: the daemon's desktop confirmation channel
+// (`/api/v1/presence/challenges/…`) belongs to main alone. If the renderer
+// could read or answer a challenge it could approve its own elevation, so the
+// proxy refuses the whole `/presence` subtree on top of the allowlist, by the
+// same raw / decoded / normalized rule as the host interface.
+const PRESENCE_CHANNEL = /^(\/api\/v1)?\/presence(\/|$)/i
+
+export function reachesPresenceChannel(requestPath: string): boolean {
+  return reachesPrefix(PRESENCE_CHANNEL, requestPath)
+}
+
+function reachesPrefix(prefix: RegExp, requestPath: string): boolean {
   const raw = requestPath.split(/[?#]/, 1)[0] ?? ''
-  const hits = (path: string) => HOST_INTERFACE.test(path.replace(/\/{2,}/g, '/'))
+  const hits = (path: string) => prefix.test(path.replace(/\/{2,}/g, '/'))
   if (hits(raw)) return true
   try {
     return hits(new URL(decodeURIComponent(raw), 'http://daemon').pathname)
@@ -233,7 +248,6 @@ const clip = (text: string, max: number): string =>
 
 // eslint-disable-next-line no-control-regex
 const hasControlChars = (text: string): boolean => /[\u0000-\u001f\u007f]/.test(text)
-const SAFE_MODULE_ID = /^[A-Za-z0-9._-]+$/
 const DECISION_SHAPE = /^[a-z_]{1,64}$/
 
 // Sensitive IPCs share one in-flight slot: a script that fires them in a loop
@@ -345,29 +359,6 @@ export function registerIpcHandlers(options: {
     }
     return { ok: true }
   })
-  // modules:* — node-daemon era (npm community modules). The Rust daemon has
-  // no `/api/modules*`; list/discover/install/uninstall are retired (A5) and
-  // answer with a fixed envelope. The pages stay until REV-01 deletes them.
-  const modulesNotSupported = (): { error: { code: string; message: string } } =>
-    ({ error: { code: 'not_supported', message: 'node-daemon only' } })
-  handle(IpcChannels.ModulesList, modulesNotSupported)
-  handle(IpcChannels.ModulesDiscover, modulesNotSupported)
-  handle(IpcChannels.ModulesInstall, modulesNotSupported)
-  handle(IpcChannels.ModulesUninstall, modulesNotSupported)
-
-  // modules:enable / modules:disable — toggle module state via backend
-  handle(IpcChannels.ModulesEnable, async (_event, id: unknown): Promise<{ ok: boolean }> => {
-    if (typeof id !== 'string' || !SAFE_MODULE_ID.test(id) || id === '.' || id.includes('..')) return { ok: false }
-    const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/enable` })
-    return { ok: res.ok }
-  })
-
-  handle(IpcChannels.ModulesDisable, async (_event, id: unknown): Promise<{ ok: boolean }> => {
-    if (typeof id !== 'string' || !SAFE_MODULE_ID.test(id) || id === '.' || id.includes('..')) return { ok: false }
-    const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/disable` })
-    return { ok: res.ok }
-  })
-
   // llm:status — current active LLM provider + model
   handle(IpcChannels.LlmStatus, async (): Promise<LlmStatusResult> => {
     // Try oMLX first
@@ -438,6 +429,13 @@ export function registerIpcHandlers(options: {
         ok: false,
         status: 403,
         data: { error: { code: 'host_interface_private', message: 'The host interface is not reachable from the renderer' } },
+      }
+    }
+    if (reachesPresenceChannel(req.path)) {
+      return {
+        ok: false,
+        status: 403,
+        data: { error: { code: 'presence_channel_private', message: 'The presence channel is not reachable from the renderer' } },
       }
     }
     // A1: only allowlisted (method, path-template) pairs are forwarded.

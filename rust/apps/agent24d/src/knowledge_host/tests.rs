@@ -137,11 +137,12 @@ fn the_routes_map_to_a_host_only_operation() {
     use crate::capabilities::Operation;
     for method in [Method::PUT, Method::DELETE] {
         for path in [
-            "/api/v1/host/knowledge/bindings/b1",
-            "/api/v1/host/knowledge/bindings/b1/credential",
+            "/api/v1/host/knowledge/bindings/{binding_id}",
+            "/api/v1/host/knowledge/bindings/{binding_id}/credential",
         ] {
-            let operation = crate::server::required_operation(&method, path);
-            assert_eq!(operation, Operation::KnowledgeHost, "{method} {path}");
+            // The fixed route table keys on axum's matched template.
+            let operation = crate::capabilities::required_operation(&method, path);
+            assert_eq!(operation, Some(Operation::KnowledgeHost), "{method} {path}");
         }
     }
     assert!(!Operation::creative_allowlist().contains(&Operation::KnowledgeHost));
