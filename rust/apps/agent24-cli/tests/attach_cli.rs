@@ -15,8 +15,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 fn tmp_home() -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -45,6 +47,7 @@ fn agent24d_bin() -> std::path::PathBuf {
 /// does for its plain-text assertions) would let a stray stderr line pass as
 /// valid JSON on stdout.
 fn run(home: &Path, args: &[&str]) -> (bool, String, String) {
+    eprintln!("start CLI {} {args:?}", home.display());
     let out = Command::new(env!("CARGO_BIN_EXE_agent24"))
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -56,6 +59,7 @@ fn run(home: &Path, args: &[&str]) -> (bool, String, String) {
         .stderr(Stdio::piped())
         .output()
         .unwrap();
+    eprintln!("end CLI {} {args:?}: {}", home.display(), out.status);
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -86,15 +90,44 @@ fn is_lowercase_hex(s: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-/// Kills the daemon this test started (same guard shape as
-/// `uninstall_hot_stop.rs::Daemon`, trimmed to what this file needs).
-struct Daemon<'a> {
-    home: &'a Path,
+/// Own the child until teardown: daemon stop relies on process discovery,
+/// which can be unavailable in a sandbox even when startup succeeded.
+struct Daemon(Child);
+
+impl Daemon {
+    fn start(home: &Path) -> Self {
+        let mut child = Command::new(agent24d_bin())
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", home)
+            .args(["serve", "--port", "0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let daemon = Self(child);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut ready = String::new();
+            let result = BufReader::new(stdout).read_line(&mut ready).map(|_| ready);
+            let _ = tx.send(result);
+        });
+        let line = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("daemon did not publish ready")
+            .unwrap();
+        let ready: serde_json::Value = serde_json::from_str(&line).expect("daemon ready JSON");
+        assert_eq!(ready["type"], "ready");
+        daemon
+    }
 }
 
-impl Drop for Daemon<'_> {
+impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = run(self.home, &["daemon", "stop"]);
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -104,9 +137,7 @@ impl Drop for Daemon<'_> {
 #[test]
 fn attach_add_json_success_snapshot() {
     let home = tmp_home();
-    let (ok, out, err) = run(home.path(), &["daemon", "start"]);
-    assert!(ok, "{out} {err}");
-    let _daemon = Daemon { home: home.path() };
+    let _daemon = Daemon::start(home.path());
 
     let manifest = write_manifest(home.path(), "agentear", None);
     let (ok, stdout, stderr) = run(
@@ -177,9 +208,7 @@ fn attach_add_json_success_snapshot() {
 #[test]
 fn attach_add_json_relax_requires_confirmation_snapshot() {
     let home = tmp_home();
-    let (ok, out, err) = run(home.path(), &["daemon", "start"]);
-    assert!(ok, "{out} {err}");
-    let _daemon = Daemon { home: home.path() };
+    let _daemon = Daemon::start(home.path());
 
     let manifest = write_manifest(home.path(), "agentear", Some("remote_allowed"));
     let (ok, stdout, stderr) = run(
@@ -233,9 +262,7 @@ fn attach_add_json_relax_requires_confirmation_snapshot() {
 #[test]
 fn attach_add_list_remove_round_trip() {
     let home = tmp_home();
-    let (ok, out, err) = run(home.path(), &["daemon", "start"]);
-    assert!(ok, "{out} {err}");
-    let _daemon = Daemon { home: home.path() };
+    let _daemon = Daemon::start(home.path());
 
     let manifest = write_manifest(home.path(), "agentear", None);
     let (ok, out, err) = run(

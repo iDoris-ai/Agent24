@@ -87,3 +87,39 @@ AGENT24_DATA_DIR=/tmp/a24-x agent24 daemon status
 2. **v0.5.1 不发 macOS dmg**（评审后改的建议）：从 macOS 15 起，未签名的 dmg 不能再用「右键 → 打开」放行，得去系统设置里手动放行，甚至要执行 `xattr -cr`，体验太差。所以 dmg 等签名后在 v0.5.2 发；v0.5.1 的 macOS 用户先用 CLI。
 3. **Windows 签名**：Azure Trusted Signing 的个人验证据说只开放给美国和加拿大，请你先核实能不能申请；不能的话就改买 OV/EV 证书（C1，要花钱）。
 4. **移动端方向**：遥控端要做哪些功能，远程访问走 tailscale、自建 relay 还是 Nostr。定下来之后再启动 C4。
+
+## 命令行工具
+
+macOS 的 DMG 安装不会自动替换终端中已有的 `agent24`。将 Agent24 拖入 **Applications**，打开应用，进入 **Settings → Command line tool**，点击 **Install / Update `agent24` command**。
+
+设置页显示登录 shell 的 PATH 上首先命中的 CLI 路径、版本，以及应用包内的 CLI 版本。应用启动时发现 CLI 缺失或过期，会在托盘和设置页提示；启动时不弹窗。点击托盘提示可打开设置页。
+
+安装会在 `/usr/local/bin/agent24` 创建指向本应用 `Contents/Resources/backend/agent24` 的符号链接。没有写入权限时，macOS 会请求管理员授权；取消授权会保留原命令。已有实体文件或指向其他位置的链接时，应用先询问，再将旧命令改名为同目录的 `agent24.bak-<日期>-<唯一标识>`，然后创建链接。
+
+在原位置升级 App 后，链接使用新包里的 CLI。移动或删除 App 会让链接失效，请重新安装命令。不要从挂载的 DMG 内安装命令。
+
+安装后打开新终端验证：
+
+```bash
+command -v agent24
+agent24 --version
+```
+
+如果仍然命中其他旧 CLI，运行 `type -a agent24`，将 `/usr/local/bin` 放到该目录之前。AgentEar 等外部程序也需要让自己的 PATH 优先命中 `/usr/local/bin`，然后重新启动程序。shell alias、function 和已运行程序缓存的环境不会由桌面端修改。
+
+### 手工链接到桌面应用
+
+先确认 `/Applications/Agent24.app/Contents/Resources/backend/agent24 --version` 的输出。若 `/usr/local/bin/agent24` 已存在，先改名备份，再创建链接：
+
+```bash
+sudo mkdir -p /usr/local/bin
+# 仅在旧文件或旧链接存在时执行；替换日期后缀，避免覆盖已有备份。
+sudo mv /usr/local/bin/agent24 /usr/local/bin/agent24.bak-2026-10-28
+sudo ln -sf /Applications/Agent24.app/Contents/Resources/backend/agent24 /usr/local/bin/agent24
+```
+
+### 单独安装 CLI
+
+从 [GitHub Releases](https://github.com/iDoris-ai/Agent24/releases) 下载与你的平台、架构匹配的 CLI `tar.gz`。macOS Apple Silicon 选择 `agent24-<版本>-macos-arm64.tar.gz`，Intel 选择 `agent24-<版本>-macos-x64.tar.gz`。对照发行页的 `SHA256SUMS` 校验后解压，将 `agent24` 和 `agent24d` 一起放到 PATH 中的同一个目录；替换旧文件前先备份。
+
+独立安装的 CLI 需要随版本手工更新。希望 CLI 随桌面 App 升级时，使用设置页的安装入口或上述符号链接。

@@ -1,6 +1,6 @@
 [package]
 name = "agent24-models"
-version = "0.5.1"
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -19,6 +19,9 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "time"] }
 tokio-util = "0.7"
 tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+zeroize = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }

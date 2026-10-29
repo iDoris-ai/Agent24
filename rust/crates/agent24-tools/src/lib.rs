@@ -172,6 +172,17 @@ impl ToolContext {
         self.authorize_egress(purpose, destination).await
     }
 
+    /// This context without the results `module` itself returned: their
+    /// ids are host-written ([`agent24_store::SourceRef::tool_result`]), so
+    /// a source from anywhere else never matches.
+    fn without_results_of_module(&self, module: &str) -> Self {
+        let own = format!("{}module:{module}:", agent24_store::TOOL_RESULT_PREFIX);
+        let mut ctx = self.clone();
+        ctx.egress_resources
+            .retain(|resource| !resource.resource_id.starts_with(&own));
+        ctx
+    }
+
     fn with_egress_gate(mut self, gate: Arc<dyn EgressGate>) -> Self {
         self.egress = Some(gate);
         self
@@ -569,11 +580,46 @@ impl ApprovalGate for DenyAllGate {
     }
 }
 
+/// Where a tool's result came from and how the host classifies it
+/// (K1-6b.5f, ADR-K1-02 §2.1). Decided by the host's code for each kind of
+/// tool, so an MCP server or a module process cannot change it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResultSource {
+    /// `module:{id}` for a module tool, `tool:{name}` otherwise.
+    pub origin: String,
+    pub classification: agent24_store::SourceClassification,
+}
+
+impl ToolResultSource {
+    #[must_use]
+    pub fn ordinary(tool: &str) -> Self {
+        Self {
+            origin: format!("tool:{tool}"),
+            classification: agent24_store::SourceClassification::Ordinary,
+        }
+    }
+
+    #[must_use]
+    pub fn unknown(tool: &str) -> Self {
+        Self {
+            origin: format!("tool:{tool}"),
+            classification: agent24_store::SourceClassification::Unknown,
+        }
+    }
+}
+
 /// One callable tool. `parameters` is the JSON Schema advertised to the model;
 /// `call` returns the string handed back as the tool result message.
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn info(&self) -> ToolInfo;
+
+    /// How the host classifies what this tool returns (David 2026-10-26):
+    /// Unknown unless the host can trace it, which only the builtin file
+    /// read, public fetch and receipt-only tools override.
+    fn result_source(&self) -> ToolResultSource {
+        ToolResultSource::unknown(&self.info().name)
+    }
 
     /// Whether this tool always needs a registry-bound egress gate, regardless
     /// of per-run source provenance. Source-aware tools enforce the gate at
@@ -871,6 +917,11 @@ pub struct ModuleTool {
     runtime: Arc<dyn ModuleToolRuntime>,
     audit_store: Store,
     audit_actor: String,
+    /// Whether the manifest says this operation may act or send outside the
+    /// device. Only ever withholds the same-source exception, so a module
+    /// that misstates it gains nothing it did not already hold. True until
+    /// the host says otherwise.
+    declared_outbound: bool,
 }
 
 impl ModuleTool {
@@ -901,29 +952,6 @@ impl ModuleTool {
                 .transpose()
                 .map_err(|_| audit_unavailable())?,
         })
-    }
-
-    /// Writes the pre-dispatch record and its `Denied` terminal for a call
-    /// gate 5 refused, under [`REMOTE_TIER_REF`], and leaves the relation on
-    /// the invocation as the authorized path does.
-    async fn audit_remote_tier_refusal(
-        &self,
-        ctx: &ToolContext,
-        capability: &ModuleInvocationCapability,
-    ) -> Result<(), ToolError> {
-        let relation = self.audit_relation(ctx, REMOTE_TIER_REF, None, &capability.attempt_id)?;
-        {
-            let mut state = capability.state.lock().map_err(|_| audit_unavailable())?;
-            state.relation = Some(relation.clone());
-        }
-        self.append_audit(&ModuleToolAuditEvent::PreDispatch(relation.clone()))
-            .await?;
-        self.finish_audit(
-            &relation,
-            ModuleToolResultCode::Denied,
-            std::time::Instant::now(),
-        )
-        .await
     }
 
     /// Resolves once the grant behind `authorization_ref` has ended: its
@@ -1086,12 +1114,36 @@ impl ModuleTool {
             runtime,
             audit_store,
             audit_actor: audit_actor.into(),
+            declared_outbound: true,
         })
+    }
+
+    /// Record what the manifest declares (K1-6b.5f): `false` only for an
+    /// operation declared neither `external` nor able to send output off the
+    /// device, which may then receive back what this module returned.
+    #[must_use]
+    pub fn with_declared_outbound(mut self, outbound: bool) -> Self {
+        self.declared_outbound = outbound;
+        self
+    }
+
+    /// What [`Self::with_declared_outbound`] recorded; `true` unless the host
+    /// said otherwise.
+    #[must_use]
+    pub fn declared_outbound(&self) -> bool {
+        self.declared_outbound
     }
 }
 
 #[async_trait]
 impl Tool for ModuleTool {
+    fn result_source(&self) -> ToolResultSource {
+        ToolResultSource {
+            origin: format!("module:{}", self.module),
+            classification: agent24_store::SourceClassification::Unknown,
+        }
+    }
+
     fn requires_outbound_policy(&self) -> bool {
         // Enforced dynamically at invocation time via
         // `ToolContext::authorize_egress_if_restricted`.
@@ -1111,10 +1163,6 @@ impl Tool for ModuleTool {
             && self
                 .advert_view
                 .outbound_gate_ready(&self.module, &self.operation)
-                .await
-            && !self
-                .advert_view
-                .blocked_by_remote_tier_guard(&self.module, &self.operation)
                 .await
     }
 
@@ -1145,34 +1193,19 @@ impl Tool for ModuleTool {
         ctx: &ToolContext,
         cancel: &CancellationToken,
     ) -> Result<Option<String>, ToolError> {
-        // #1130 L3: the gate-5 guard and the grant are settled before any
-        // card, so a call that `call_with_invocation` would refuse is refused
-        // here, with the same audit and the same error. Only the lookup is
-        // cancellable and bounded; a refusal's audit is always written whole.
-        let lookup = async {
-            if self
-                .advert_view
-                .blocked_by_remote_tier_guard(&self.module, &self.operation)
-                .await
-            {
-                return None;
-            }
-            Some(
-                self.authorization
-                    .authorize(&self.module, &self.operation, ctx)
-                    .await,
-            )
-        };
-        let looked_up = tokio::select! {
+        // #1130 L3: the grant is settled before any card, so a call that
+        // `call_with_invocation` would refuse is refused here, with the same
+        // audit and the same error. Only the lookup is cancellable and
+        // bounded; a refusal's audit is always written whole.
+        let lookup = self
+            .authorization
+            .authorize(&self.module, &self.operation, ctx);
+        let authorized = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(ToolError::Cancelled),
             looked_up = tokio::time::timeout(self.timeout, lookup) => {
                 looked_up.map_err(|_| ToolError::Timeout(self.timeout))?
             }
-        };
-        let Some(authorized) = looked_up else {
-            self.audit_refusal_as(ctx, REMOTE_TIER_REF).await?;
-            return Err(ToolError::Failed(module_error_json(permission_denied())));
         };
         match authorized {
             // A resource set the dispatch would refuse (§4 case 10) shows no
@@ -1288,11 +1321,21 @@ impl Tool for ModuleTool {
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
-        ctx.authorize_egress_if_restricted(
-            EgressPurpose::ModuleTool,
-            EgressDestination::exact(&self.name),
-        )
-        .await?;
+        // Same source (David 2026-10-26): what this module returned earlier
+        // is already the module's, so sending it back is not egress. Every
+        // other source still counts, and an operation declared to act
+        // outside the device gets no exception.
+        let egress = if self.declared_outbound {
+            ctx.clone()
+        } else {
+            ctx.without_results_of_module(&self.module)
+        };
+        egress
+            .authorize_egress_if_restricted(
+                EgressPurpose::ModuleTool,
+                EgressDestination::exact(&self.name),
+            )
+            .await?;
         let Some(capability) = invocation.module.as_ref() else {
             return Err(unknown_module_outcome("result_unknown"));
         };
@@ -1300,19 +1343,6 @@ impl Tool for ModuleTool {
             return Err(unknown_module_outcome("result_unknown"));
         }
         let mut execution_guard = capability.claim_for_execution()?;
-
-        // Gate 5 at dispatch (K1-6a-G §2.4): before the authorization lookup,
-        // so `dispatch` and `execute_preapproved` both pass it, and a call
-        // by name to a withheld tool is refused and audited.
-        if self
-            .advert_view
-            .blocked_by_remote_tier_guard(&self.module, &self.operation)
-            .await
-        {
-            self.audit_remote_tier_refusal(ctx, capability).await?;
-            execution_guard.mark_completed();
-            return Err(ToolError::Failed(module_error_json(permission_denied())));
-        }
 
         let changes = self.authorization.consent_changes();
         let looked_up = tokio::time::Instant::now();
@@ -1573,10 +1603,6 @@ fn persisted_terminal_error(result: agent24_store::ModuleToolResultCode) -> Tool
     };
     ToolError::Failed(module_error_json(failure))
 }
-
-/// The audit `authorization_ref` of a call refused by gate 5: no grant was
-/// looked up for it.
-const REMOTE_TIER_REF: &str = "denied:remote_tier";
 
 fn audit_unavailable() -> ToolError {
     ToolError::Failed("module_tool_audit_unavailable".to_owned())
@@ -1894,6 +1920,15 @@ impl ToolRegistry {
         self.tools
             .get(name.trim())
             .map(|t| self.effective_risk(&t.info()))
+    }
+
+    /// Where `name`'s result comes from and how it is classified
+    /// (K1-6b.5f). A name that is not registered is Unknown.
+    pub fn tool_result_source(&self, name: &str) -> ToolResultSource {
+        self.tools.get(name.trim()).map_or_else(
+            || ToolResultSource::unknown(name.trim()),
+            |tool| tool.result_source(),
+        )
     }
 
     /// Sorted list for `GET /api/v1/tools`.
@@ -2309,25 +2344,11 @@ mod tests {
 
     use super::*;
 
+    /// Every gate at its fail-closed default.
     struct DenyAdvertView;
 
     #[async_trait]
-    impl agent24_domain::tool::ModuleToolAdvertView for DenyAdvertView {
-        async fn blocked_by_remote_tier_guard(&self, _: &str, _: &str) -> bool {
-            true
-        }
-    }
-
-    /// Gate 5 open, so a call reaches its authorization (K1-6a-G §2.4 puts
-    /// the guard first).
-    struct UnguardedAdvertView;
-
-    #[async_trait]
-    impl agent24_domain::tool::ModuleToolAdvertView for UnguardedAdvertView {
-        async fn blocked_by_remote_tier_guard(&self, _: &str, _: &str) -> bool {
-            false
-        }
-    }
+    impl agent24_domain::tool::ModuleToolAdvertView for DenyAdvertView {}
 
     struct SlowTool;
 
@@ -2899,6 +2920,26 @@ mod tests {
         assert!(!listed[0].requires_approval);
     }
 
+    /// K1-6b.5f (David 2026-10-26): only what the host can trace or a
+    /// receipt is Ordinary; a command's output, and any name the registry
+    /// does not know, is Unknown.
+    #[test]
+    fn builtin_results_are_classified_by_the_host() {
+        use agent24_store::SourceClassification::{Ordinary, Unknown};
+        let registry = ToolRegistry::builtin(std::path::PathBuf::from("/nonexistent"));
+        for (tool, classification) in [
+            ("fs_read", Ordinary),
+            ("fs_write", Ordinary),
+            ("http_fetch", Ordinary),
+            ("shell_exec", Unknown),
+            ("no_such_tool", Unknown),
+        ] {
+            let source = registry.tool_result_source(tool);
+            assert_eq!(source.classification, classification, "{tool}");
+            assert_eq!(source.origin, format!("tool:{tool}"));
+        }
+    }
+
     /// H1 is an additive migration: the gating outcome must be byte-for-byte
     /// what it was before the risk classes existed. If a future edit changes a
     /// builtin's class, this test is where the behaviour change surfaces —
@@ -2999,7 +3040,7 @@ mod tests {
                 Duration::from_secs(2),
                 Duration::from_secs(1),
                 RiskClass::External,
-                Arc::new(UnguardedAdvertView),
+                Arc::new(DenyAdvertView),
                 Arc::new(DenyModuleToolAuthorization),
                 Arc::new(Runtime),
                 agent24_store::Store::open_memory().await.unwrap(),

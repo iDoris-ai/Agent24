@@ -349,6 +349,7 @@ impl Summarizer for RouterSummarizer {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            idoris_headroom_confirmed: false,
             temperature: None,
             progress: None,
         };
@@ -622,6 +623,31 @@ pub struct RunManager {
 enum ParkedCallStop {
     CancelRun,
     RecoveryStopped,
+}
+
+/// What one tool call hands back to the model, with the source tag that must
+/// be durable before the model sees it (K1-6b.5f, ADR-K1-02 §2.1). `source`
+/// is `None` only for fixed text the tool never produced: a refusal, a
+/// cancellation, a timeout, unparseable arguments.
+struct ToolAnswer {
+    content: String,
+    source: Option<ResultTag>,
+}
+
+/// A tool result's tag and the origin it names (`module:{id}`,
+/// `tool:{name}`), which a session records for its later turns (K1-6b.5f-2).
+struct ResultTag {
+    origin: String,
+    tag: agent24_store::SourceRef,
+}
+
+impl ToolAnswer {
+    fn fixed(content: String) -> Self {
+        Self {
+            content,
+            source: None,
+        }
+    }
 }
 
 impl RunManager {
@@ -1057,6 +1083,13 @@ impl RunManager {
                 )
                 .await?;
             sources.push((format!("session_floor:{sid}"), floor));
+            // K1-6b.5f-2: what earlier /runs turns of the session took in
+            // from tools (/chat itself offers none).
+            for origin in self.store.session_tool_result_origins(sid).await? {
+                let tag =
+                    agent24_store::SourceRef::session_tool_result(&origin, sid, now_iso8601());
+                sources.push((tag.source_id, tag.classification));
+            }
         }
         Ok((
             prelude,
@@ -1111,6 +1144,65 @@ impl RunManager {
                 .into_iter()
                 .map(|source| (source.source_id, source.classification)),
         )
+    }
+
+    /// The source tag for what `tool` returned on call `tool_call_id`.
+    fn tool_result_tag(&self, tool: &str, tool_call_id: &str) -> ResultTag {
+        let source = self.tools.tool_result_source(tool);
+        let tag = agent24_store::SourceRef::tool_result(
+            &source.origin,
+            tool_call_id,
+            source.classification,
+            now_iso8601(),
+        );
+        ResultTag {
+            origin: source.origin,
+            tag,
+        }
+    }
+
+    /// Persist `answer`'s source tag, then hand its content to the model as
+    /// the result of `call`. A tag that cannot be written ends the run before
+    /// the content reaches the model; returns false then. In a session, a
+    /// non-ordinary result's origin is recorded with the tag, so the
+    /// session's later turns carry it (K1-6b.5f-2). It is recorded whether or
+    /// not memory is configured now: a run parked without memory may finish,
+    /// and feed later turns, after a restart that has it.
+    async fn answer_tool_call(
+        &self,
+        run: &Run,
+        messages: &mut Vec<Msg>,
+        call: &ToolCallRequest,
+        answer: ToolAnswer,
+    ) -> bool {
+        let run_id = run.id.as_str();
+        let session = run.session_id.as_deref();
+        if let Some(result) = &answer.source
+            && let Err(err) = self
+                .store
+                .tag_tool_result(
+                    run_id,
+                    messages.len() as i64,
+                    &result.tag,
+                    session.map(|sid| (sid, result.origin.as_str())),
+                    &now_iso8601(),
+                )
+                .await
+        {
+            self.finish_failed(
+                run_id,
+                "source_policy_unavailable",
+                &format!("failed to persist a tool result's source: {err}"),
+            )
+            .await;
+            return false;
+        }
+        let result = Msg::tool_result(call.id.clone(), answer.content);
+        if !self.persist_for_next_send(run_id, &result).await {
+            return false;
+        }
+        messages.push(result);
+        true
     }
 
     /// Append one message to the run's durable thread (H3/G1 foundation).
@@ -1273,7 +1365,11 @@ impl RunManager {
             let task = tokio::spawn({
                 let manager = Arc::clone(&manager);
                 let run_id = run_id.clone();
-                async move { manager.execute(run_id, token).await }
+                async move {
+                    manager
+                        .execute(run_id, token, create.idoris_headroom_confirmed)
+                        .await
+                }
             });
             if let Err(err) = task.await
                 && err.is_panic()
@@ -1432,11 +1528,17 @@ impl RunManager {
                     continue;
                 }
             };
-            // NB: the approval's `tool_call_id` (an internal `tc_` id) is
-            // deliberately NOT passed — the suspension point is derived from the
-            // thread's provider ids, and the approval is matched by payload.
+            // NB: the suspension point is derived from the thread's provider
+            // ids, never from the approval's `tool_call_id`; that id and the
+            // tool its `tool_calls` row names only confirm the approval is the
+            // parked call's own (with the payload).
+            let approved_tool = self.approved_tool(&approval).await?;
             match crate::resume::assess_restore(
-                &approval.payload,
+                &crate::resume::ApprovedCall {
+                    payload: &approval.payload,
+                    tool_call_id: &approval.tool_call_id,
+                    tool: approved_tool.as_deref(),
+                },
                 &approval.created_at,
                 run.status,
                 &thread,
@@ -1568,6 +1670,19 @@ impl RunManager {
         Ok(())
     }
 
+    /// The tool `approval` was asked for: the one its `tool_calls` row names,
+    /// written before the call parked. `None` when there is no such row, as
+    /// for an approval asked again while a resume settled the call.
+    async fn approved_tool(&self, approval: &Approval) -> Result<Option<String>, AgentError> {
+        Ok(self
+            .store
+            .list_tool_calls(&approval.run_id)
+            .await?
+            .into_iter()
+            .find(|call| call.id == approval.tool_call_id)
+            .map(|call| call.tool))
+    }
+
     /// Body of a resume: re-validate, reconstruct, settle the parked turn's
     /// unanswered calls, then hand off to the shared loop.
     async fn drive_resume(
@@ -1581,13 +1696,25 @@ impl RunManager {
 
         // 1+2. Re-validate off the persisted thread and locate the suspension
         // point. The point is a PROVIDER id derived from the thread (NOT the
-        // approval's internal `tc_` id — a different namespace that never
-        // matches); the approval is tied to that call by payload equality inside
-        // assess_restore. Done BEFORE any state change, so an unrestorable run
+        // approval's `tool_call_id`); the approval is tied to that call by
+        // payload equality and call identity inside assess_restore. Done
+        // BEFORE any state change, so an unrestorable run
         // never emits a spurious RunStarted→Cancelled pair.
         let cutoff = agent24_core::util::iso8601_before(RESUME_TTL);
+        let approved_tool = match self.approved_tool(&approval).await {
+            Ok(tool) => tool,
+            Err(err) => {
+                tracing::warn!("run {run_id}: resume aborted — approval's call unreadable: {err}");
+                self.finish_cancelled(&run_id).await;
+                return;
+            }
+        };
         let tool_call_id = match crate::resume::assess_restore(
-            &approval.payload,
+            &crate::resume::ApprovedCall {
+                payload: &approval.payload,
+                tool_call_id: &approval.tool_call_id,
+                tool: approved_tool.as_deref(),
+            },
             &approval.created_at,
             run.status,
             &thread,
@@ -1614,9 +1741,12 @@ impl RunManager {
         }
 
         // Missing or unreadable origins must not settle a parked tool or
-        // dispatch a sibling such as explore. Failed is legal only from
-        // Running, so the refusal enters Running without RunStarted.
-        if !self.persisted_origins_allow_send(&run_id).await {
+        // dispatch a sibling such as explore, and neither may a run started
+        // before tool results were tagged. Failed is legal only from Running,
+        // so the refusal enters Running without RunStarted.
+        if !self.persisted_origins_allow_send(&run_id).await
+            || !self.resume_sources_proven(&run).await
+        {
             if let Err(err) = self
                 .store
                 .transition_run(&run_id, RunStatus::Running, RunPatch::default())
@@ -1660,17 +1790,22 @@ impl RunManager {
         // is the one this approval decided (settle from the row, no second ask);
         // any calls after it in the same fan-out were never approved, so they go
         // through the normal gate via run_tool_call (which may itself re-park).
+        // Only one call is settled: a provider can repeat an id within a turn,
+        // and a second call sharing it would otherwise run with no row of its
+        // own, so the peer view could not see it (K1-6b.5f-3, #1349 F1).
         let Some(unanswered) = unanswered_calls_of_last_turn(&messages) else {
             tracing::warn!("run {run_id}: no unanswered parked turn on resume; aborting");
             self.finish_cancelled(&run_id).await;
             return;
         };
+        let mut settled = false;
         for call in unanswered {
             if cancel.is_cancelled() {
                 self.finish_cancelled(&run_id).await;
                 return;
             }
-            let content = if call.id == tool_call_id {
+            let answer = if !settled && call.id == tool_call_id {
+                settled = true;
                 if call.name.trim() == PROPOSE_PLAN {
                     // H8: the parked call is a plan approval (the only thing a
                     // plan-mode run can park on — read tools never gate, and no
@@ -1686,14 +1821,16 @@ impl RunManager {
                             .await;
                         return;
                     }
-                    "Plan approved. The full tool set is now available — carry out the plan."
-                        .to_owned()
+                    ToolAnswer::fixed(
+                        "Plan approved. The full tool set is now available — carry out the plan."
+                            .to_owned(),
+                    )
                 } else {
                     match self
                         .settle_parked_call(&run, &approval, &call, &cancel)
                         .await
                     {
-                        Ok(content) => content,
+                        Ok(answer) => answer,
                         Err(ParkedCallStop::CancelRun) => {
                             self.finish_cancelled(&run_id).await;
                             return;
@@ -1703,7 +1840,7 @@ impl RunManager {
                 }
             } else {
                 match self.run_tool_call(&run, &call, &cancel, true).await {
-                    Ok(content) => content,
+                    Ok(answer) => answer,
                     Err(ParkedCallStop::CancelRun) => {
                         self.finish_cancelled(&run_id).await;
                         return;
@@ -1711,18 +1848,19 @@ impl RunManager {
                     Err(ParkedCallStop::RecoveryStopped) => return,
                 }
             };
-            let result = Msg::tool_result(call.id.clone(), content);
-            if !self.persist_for_next_send(&run_id, &result).await {
+            if !self
+                .answer_tool_call(&run, &mut messages, &call, answer)
+                .await
+            {
                 return;
             }
-            messages.push(result);
         }
 
         // 5. Continue the shared loop for subsequent model iterations. Always
         // out of plan mode: the only thing a plan-mode run can park on is its
         // plan approval, and reaching here means that was approved (a rejection
         // returned above), so the full tool set is unlocked (H8).
-        self.run_loop(run, messages, false, cancel).await;
+        self.run_loop(run, messages, false, cancel, false).await;
     }
 
     /// Settle the ONE parked call whose approval is already decided (H3): apply
@@ -1736,7 +1874,7 @@ impl RunManager {
         approval: &Approval,
         call: &ToolCallRequest,
         cancel: &CancellationToken,
-    ) -> Result<String, ParkedCallStop> {
+    ) -> Result<ToolAnswer, ParkedCallStop> {
         let decision = approval.decision.clone().unwrap_or_else(|| Decision {
             kind: "deny".to_owned(),
             reason: Some("no decision was recorded".to_owned()),
@@ -1762,9 +1900,9 @@ impl RunManager {
                             self.cancel_workspace_resume_recovery(&run.id).await;
                             return Err(ParkedCallStop::RecoveryStopped);
                         }
-                        return Ok(format!(
+                        return Ok(ToolAnswer::fixed(format!(
                             "tool error: workspace authority unavailable: {err}"
-                        ));
+                        )));
                     }
                 };
                 self.tools
@@ -1795,19 +1933,29 @@ impl RunManager {
                     }
                     outcome => outcome,
                 };
+                // As in `run_tool_call`: only `Ok` and `Failed` carry what the
+                // tool produced.
+                let tag = || Some(self.tool_result_tag(&call.name, &approval.tool_call_id));
                 match outcome {
-                    Ok(out) => Ok(out),
+                    Ok(content) => Ok(ToolAnswer {
+                        content,
+                        source: tag(),
+                    }),
                     // The whole-run abort choice is honoured even on resume.
                     Err(ToolError::AbortRun(_)) | Err(ToolError::Cancelled) => {
                         Err(ParkedCallStop::CancelRun)
                     }
-                    Err(err) => Ok(format!("tool error: {err}")),
+                    Err(err @ ToolError::Failed(_)) => Ok(ToolAnswer {
+                        content: format!("tool error: {err}"),
+                        source: tag(),
+                    }),
+                    Err(err) => Ok(ToolAnswer::fixed(format!("tool error: {err}"))),
                 }
             }
-            "deny" => Ok(format!(
+            "deny" => Ok(ToolAnswer::fixed(format!(
                 "denied by user: {}",
                 decision.reason.as_deref().unwrap_or("no reason given")
-            )),
+            ))),
             // "abort" or anything unexpected → cancel the run (fail-closed).
             _ => Err(ParkedCallStop::CancelRun),
         }
@@ -1842,7 +1990,12 @@ impl RunManager {
         outcome
     }
 
-    async fn execute(&self, run_id: String, cancel: CancellationToken) {
+    async fn execute(
+        &self,
+        run_id: String,
+        cancel: CancellationToken,
+        idoris_headroom_confirmed: bool,
+    ) {
         // Cancelled before starting? queued → cancelled directly.
         if cancel.is_cancelled() {
             self.finish_cancelled(&run_id).await;
@@ -2182,6 +2335,38 @@ impl RunManager {
                 .await;
                 return;
             }
+            // K1-6b.5f-2: tool results earlier turns took in, one source per
+            // origin. They stay out of the floor merged above, so a module
+            // can still be sent back what it returned itself.
+            let inherited = match self.store.session_tool_result_origins(sid).await {
+                Ok(origins) => origins,
+                Err(err) => {
+                    self.finish_failed(
+                        &run_id,
+                        "source_policy_unavailable",
+                        &format!("failed to read session tool result origins: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            for origin in inherited {
+                let tag =
+                    agent24_store::SourceRef::session_tool_result(&origin, sid, now_iso8601());
+                if let Err(err) = self
+                    .store
+                    .tag_run_source(&run_id, seq, &tag, &now_iso8601())
+                    .await
+                {
+                    self.finish_failed(
+                        &run_id,
+                        "source_policy_unavailable",
+                        &format!("failed to persist session source policy: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            }
         }
         // The audit event names exactly the ids that made it into the
         // now-durable snapshot — emitted only once the snapshot is safely on
@@ -2207,7 +2392,8 @@ impl RunManager {
         }
         // H8: a fresh plan-mode run starts read-only; a Normal run never is.
         let plan_mode = matches!(run.input.mode, RunMode::Plan);
-        self.run_loop(run, snapshot, plan_mode, cancel).await;
+        self.run_loop(run, snapshot, plan_mode, cancel, idoris_headroom_confirmed)
+            .await;
         // M3 growth control, chosen approach: reclaim the prior-context copy
         // ONLY along the path that never parked for approval (`run_loop`
         // only returns here once this SAME invocation reached a terminal
@@ -2354,6 +2540,29 @@ impl RunManager {
         Some(normalize_for_provider(&shaped))
     }
 
+    /// Whether a parked run may be resumed under the tags it has (K1-R3
+    /// release review). A build before migration 0031 tagged no tool result,
+    /// and 0031 gave a session that had called tools a `tool:legacy` origin
+    /// only for its later runs. A run that build started and parked, resumed
+    /// after the upgrade, would replay those results as ordinary and pass the
+    /// egress gate. Migration 0033 lists every run unfinished at the upgrade;
+    /// a listed run is not resumed, and a read failure is the same refusal.
+    /// The list decides, not the run's creation time: a wall clock may be set
+    /// back across the upgrade.
+    async fn resume_sources_proven(&self, run: &Run) -> bool {
+        match self.store.run_predates_tool_result_tagging(&run.id).await {
+            Ok(false) => true,
+            Ok(true) => {
+                tracing::warn!(run_id = %run.id, "resume: the run predates tool result tagging");
+                false
+            }
+            Err(err) => {
+                tracing::warn!(run_id = %run.id, error = %err, "resume: tool result tagging record unreadable");
+                false
+            }
+        }
+    }
+
     /// Stored seq order, not message text. A read error is the same refusal
     /// as a missing or unreadable row: the provider is not called.
     async fn persisted_origins_allow_send(&self, run_id: &str) -> bool {
@@ -2392,6 +2601,7 @@ impl RunManager {
         mut messages: Vec<Msg>,
         mut plan_mode: bool,
         cancel: CancellationToken,
+        mut idoris_headroom_confirmed: bool,
     ) {
         let run_id = run.id.clone();
         let mut usage_total = zero_usage();
@@ -2423,6 +2633,7 @@ impl RunManager {
                 response_format: None,
                 max_tokens: None,
                 disable_thinking: false,
+                idoris_headroom_confirmed: std::mem::take(&mut idoris_headroom_confirmed),
                 temperature: None,
                 progress: None,
             };
@@ -2458,6 +2669,12 @@ impl RunManager {
                         // ME4-S2 L3: same handling as `Provider` — same `Display`
                         // text, so the agent loop's output is unchanged.
                         ModelError::Rejected { message, .. } => ("provider_error", message.clone()),
+                        ModelError::IdorisHeadroomConfirmationRequired { .. } => {
+                            ("idoris_headroom_confirmation_required", err.to_string())
+                        }
+                        ModelError::IdorisSupervisorBusy => {
+                            ("idoris_supervisor_busy", err.to_string())
+                        }
                         ModelError::Cancelled => ("internal", err.to_string()),
                     };
                     self.finish_failed(&run_id, code, &message).await;
@@ -2639,12 +2856,13 @@ impl RunManager {
                     continue;
                 }
                 match self.run_tool_call(&run, call, &cancel, false).await {
-                    Ok(content) => {
-                        let result = Msg::tool_result(call.id.clone(), content);
-                        if !self.persist_for_next_send(&run_id, &result).await {
+                    Ok(answer) => {
+                        if !self
+                            .answer_tool_call(&run, &mut messages, call, answer)
+                            .await
+                        {
                             return;
                         }
-                        messages.push(result);
                     }
                     Err(ParkedCallStop::CancelRun) => {
                         // Cancelled mid-tool, or the user chose abort on an
@@ -2675,7 +2893,7 @@ impl RunManager {
         call: &agent24_models::ToolCallRequest,
         cancel: &CancellationToken,
         recovery_resume: bool,
-    ) -> Result<String, ParkedCallStop> {
+    ) -> Result<ToolAnswer, ParkedCallStop> {
         let run_id = run.id.as_str();
         let (input, parse_error) = if call.arguments.trim().is_empty() {
             (serde_json::Map::new(), None)
@@ -2726,7 +2944,9 @@ impl RunManager {
         };
         if let Err(err) = self.store.insert_tool_call(&tc).await {
             tracing::error!("tool call persist failed: {err}");
-            return Ok("tool error: internal persistence failure".to_owned());
+            return Ok(ToolAnswer::fixed(
+                "tool error: internal persistence failure".to_owned(),
+            ));
         }
         self.sink.emit(EventBody::ToolStarted(ToolStartedPayload {
             run_id: run_id.to_owned(),
@@ -2749,6 +2969,8 @@ impl RunManager {
             tracing::error!("run {run_id}: awaiting_approval transition failed: {err}");
         }
 
+        // Only content the tool itself produced carries a source tag.
+        let dispatched = parse_error.is_none();
         let outcome = match parse_error {
             Some(msg) => Err(ToolError::Invalid(msg)),
             None => match recovery_ctx {
@@ -2777,6 +2999,10 @@ impl RunManager {
             tracing::error!("run {run_id}: back-to-running transition failed: {err}");
         }
 
+        // `Invalid` is the host's own argument check or an unknown name;
+        // what an MCP server or a module sends back arrives as `Ok` or
+        // `Failed`.
+        let produced = dispatched && matches!(outcome, Ok(_) | Err(ToolError::Failed(_)));
         let (status, summary, content, cancelled) = match outcome {
             Ok(output) => {
                 let summary = truncate(&output, SUMMARY_MAX_BYTES);
@@ -2842,7 +3068,10 @@ impl RunManager {
         if cancelled {
             return Err(ParkedCallStop::CancelRun);
         }
-        Ok(content)
+        Ok(ToolAnswer {
+            content,
+            source: produced.then(|| self.tool_result_tag(&call.name, &tc.id)),
+        })
     }
 
     /// The tool specs advertised this turn: the full advert set normally, or the
@@ -3185,6 +3414,7 @@ pub(crate) mod tests {
                 thread_to_messages(&thread),
                 false,
                 CancellationToken::new(),
+                false,
             )
             .await;
         assert!(remote.seen.lock().unwrap().is_empty());
@@ -3534,6 +3764,63 @@ pub(crate) mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn headroom_confirmation_is_consumed_by_the_first_model_call() {
+        struct Recording {
+            seen: StdMutex<Vec<bool>>,
+        }
+        #[async_trait]
+        impl ModelProvider for Recording {
+            fn name(&self) -> &str {
+                "headroom-recording"
+            }
+            async fn complete(
+                &self,
+                req: &CompletionRequest,
+                _: &CancellationToken,
+            ) -> Result<CompletionResponse, ModelError> {
+                let mut seen = self.seen.lock().unwrap();
+                seen.push(req.idoris_headroom_confirmed);
+                let message = if seen.len() == 1 {
+                    tool_call_turn("unknown_tool", "{}".into())
+                } else {
+                    Msg::assistant(Some("done".into()), vec![])
+                };
+                Ok(CompletionResponse {
+                    message,
+                    usage: usage_one(),
+                    model_id: None,
+                })
+            }
+            async fn models(
+                &self,
+                _: &CancellationToken,
+            ) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+                Ok(vec![])
+            }
+        }
+        let provider = Arc::new(Recording {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, _, store) = manager_with(provider.clone()).await;
+        let run = manager
+            .start_run(RunCreate {
+                idoris_headroom_confirmed: true,
+                ..create()
+            })
+            .await
+            .unwrap();
+        let done = wait_terminal(&store, &run.id).await;
+        assert_eq!(done.status, RunStatus::Completed, "{done:?}");
+        assert_eq!(*provider.seen.lock().unwrap(), [true, false]);
+        let run = manager.start_run(create()).await.unwrap();
+        assert_eq!(
+            wait_terminal(&store, &run.id).await.status,
+            RunStatus::Completed
+        );
+        assert_eq!(*provider.seen.lock().unwrap(), [true, false, false]);
+    }
+
     struct HangingProvider;
 
     #[async_trait]
@@ -3648,13 +3935,21 @@ pub(crate) mod tests {
         provider: Arc<dyn ModelProvider>,
         summarizer: Arc<dyn Summarizer>,
     ) -> (Arc<RunManager>, Store, KvStore) {
+        manager_with_memory_and_tools(provider, summarizer, ToolRegistry::new()).await
+    }
+
+    async fn manager_with_memory_and_tools(
+        provider: Arc<dyn ModelProvider>,
+        summarizer: Arc<dyn Summarizer>,
+        tools: ToolRegistry,
+    ) -> (Arc<RunManager>, Store, KvStore) {
         let store = Store::open_memory().await.unwrap();
         let sink = Arc::new(RecordingSink(StdMutex::new(vec![])));
         let kv = KvStore::open_memory().await.unwrap();
         let manager = RunManager::with_memory(
             store.clone(),
             Arc::new(ModelRouter::with_defaults(vec![(provider, Tier::Local)])),
-            Arc::new(ToolRegistry::new()),
+            Arc::new(tools),
             sink,
             CancellationToken::new(),
             Some(SessionMemory::new(kv.clone(), summarizer).with_owner("test-owner".into())),
@@ -3663,7 +3958,7 @@ pub(crate) mod tests {
     }
 
     /// Insert a session row so `start_run` accepts it.
-    async fn seed_session(store: &Store, id: &str) {
+    pub(crate) async fn seed_session(store: &Store, id: &str) {
         let now = now_iso8601();
         store
             .insert_session(&agent24_protocol::Session {
@@ -3711,6 +4006,7 @@ pub(crate) mod tests {
             .unwrap();
         let first = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("bound".into()),
                 workspace_id: Some(workspace_id.clone()),
                 prompt: "workspace run".into(),
@@ -3733,6 +4029,7 @@ pub(crate) mod tests {
 
         let second = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("bound".into()),
                 workspace_id: Some(workspace_id),
                 prompt: "workspace run two".into(),
@@ -3749,6 +4046,7 @@ pub(crate) mod tests {
 
         let error = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("bound".into()),
                 workspace_id: None,
                 prompt: "must not downgrade".into(),
@@ -3789,6 +4087,7 @@ pub(crate) mod tests {
             .unwrap();
         let run = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("bound-tool".into()),
                 workspace_id: Some(workspace_id),
                 prompt: "try a tool".into(),
@@ -4034,6 +4333,258 @@ pub(crate) mod tests {
         );
     }
 
+    const TOOL_SECRET: &str = "TOOL-SECRET-91c2";
+
+    /// Returns [`TOOL_SECRET`]; the host classifies it as `source` says.
+    struct ReadingTool(agent24_tools::ToolResultSource);
+
+    #[async_trait]
+    impl agent24_tools::Tool for ReadingTool {
+        fn info(&self) -> agent24_protocol::ToolInfo {
+            agent24_protocol::ToolInfo::new("reader", "builtin", "reads", RiskClass::Read)
+        }
+        fn requires_outbound_policy(&self) -> bool {
+            false
+        }
+        fn result_source(&self) -> agent24_tools::ToolResultSource {
+            self.0.clone()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            _: &ToolContext,
+            _: &serde_json::Map<String, serde_json::Value>,
+            _: &CancellationToken,
+        ) -> Result<String, ToolError> {
+            Ok(TOOL_SECRET.to_owned())
+        }
+    }
+
+    /// Fails with [`TOOL_SECRET`], as an MCP `is_error` result or a module's
+    /// error body hands back what the other side sent; the host's default
+    /// classification applies.
+    struct FailingReader;
+
+    #[async_trait]
+    impl agent24_tools::Tool for FailingReader {
+        fn info(&self) -> agent24_protocol::ToolInfo {
+            agent24_protocol::ToolInfo::new("reader", "builtin", "reads", RiskClass::Read)
+        }
+        fn requires_outbound_policy(&self) -> bool {
+            false
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            _: &ToolContext,
+            _: &serde_json::Map<String, serde_json::Value>,
+            _: &CancellationToken,
+        ) -> Result<String, ToolError> {
+            Err(ToolError::Failed(TOOL_SECRET.to_owned()))
+        }
+    }
+
+    /// Answers whether its call could leave the device, as `shell_exec` asks.
+    struct EgressProbe;
+
+    #[async_trait]
+    impl agent24_tools::Tool for EgressProbe {
+        fn info(&self) -> agent24_protocol::ToolInfo {
+            agent24_protocol::ToolInfo::new("probe", "builtin", "probes", RiskClass::Read)
+        }
+        fn requires_outbound_policy(&self) -> bool {
+            false
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            ctx: &ToolContext,
+            _: &serde_json::Map<String, serde_json::Value>,
+            _: &CancellationToken,
+        ) -> Result<String, ToolError> {
+            ctx.authorize_egress_if_restricted(
+                agent24_domain::EgressPurpose::ProcessExecution,
+                agent24_domain::EgressDestination::unknown(),
+            )
+            .await?;
+            Ok("egress allowed".to_owned())
+        }
+    }
+
+    fn calls(name: &str, id: &str) -> Msg {
+        Msg::assistant(
+            None,
+            vec![agent24_models::ToolCallRequest {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                arguments: "{}".to_owned(),
+            }],
+        )
+    }
+
+    /// Runs `reader` then `probe`, and returns the probe's answer (the final
+    /// output) and the run's tags.
+    async fn read_then_probe(
+        source: agent24_tools::ToolResultSource,
+    ) -> (Run, Vec<agent24_store::StoredSourceTag>) {
+        run_then_probe(Arc::new(ReadingTool(source))).await
+    }
+
+    /// [`read_then_probe`] with `reader` as the tool called first.
+    async fn run_then_probe(
+        reader: Arc<dyn agent24_tools::Tool>,
+    ) -> (Run, Vec<agent24_store::StoredSourceTag>) {
+        let tools = ToolRegistry::new().with(reader).with(Arc::new(EgressProbe));
+        let provider = ScriptedProvider::new(vec![calls("probe", "c2"), calls("reader", "c1")]);
+        let (manager, _sink, store) = manager_with_tools(Arc::new(provider), tools).await;
+        let run = manager.start_run(create()).await.unwrap();
+        let run = wait_terminal(&store, &run.id).await;
+        let tags = store.list_run_source_tags(&run.id).await.unwrap();
+        (run, tags)
+    }
+
+    /// K1-6b.5f: a tool's result is tagged as the host classifies that tool,
+    /// and the tag restricts the run's next egress. An Ordinary result does
+    /// not.
+    #[tokio::test]
+    async fn a_tool_result_is_tagged_and_an_unknown_one_restricts_later_egress() {
+        use agent24_store::{SourceClassification, SourceKind};
+        let (run, tags) = read_then_probe(agent24_tools::ToolResultSource::unknown("reader")).await;
+        assert_eq!(run.status, RunStatus::Completed);
+        let output = run.output.unwrap().text;
+        assert_eq!(
+            output,
+            "tool said: denied by policy: outbound policy unavailable"
+        );
+        let results: Vec<_> = tags
+            .iter()
+            .filter(|tag| tag.source.kind == SourceKind::ToolResult)
+            .collect();
+        // The refused probe returned fixed text, so only the reader's
+        // result carries a tag.
+        let [reader] = results.as_slice() else {
+            panic!("only the reader produced content: {results:?}");
+        };
+        assert!(
+            reader
+                .source
+                .source_id
+                .starts_with("tool_result:tool:reader:tc_"),
+            "the reader's result is tagged under its origin and call"
+        );
+        assert_eq!(reader.source.classification, SourceClassification::Unknown);
+
+        let (run, tags) =
+            read_then_probe(agent24_tools::ToolResultSource::ordinary("reader")).await;
+        assert_eq!(run.output.unwrap().text, "tool said: egress allowed");
+        assert!(
+            tags.iter()
+                .filter(|tag| tag.source.kind == SourceKind::ToolResult)
+                .all(
+                    |tag| tag.source.classification == SourceClassification::Ordinary
+                        || tag.source.source_id.starts_with("tool_result:tool:probe:")
+                ),
+        );
+    }
+
+    /// K1-6b.5f (PR-Daemon #1282 N1): a call that failed hands the model
+    /// whatever the other side sent, so its error is tagged like a result
+    /// and restricts the run's next egress.
+    #[tokio::test]
+    async fn a_failed_tool_call_is_tagged_and_restricts_later_egress() {
+        let (run, tags) = run_then_probe(Arc::new(FailingReader)).await;
+        assert_eq!(run.status, RunStatus::Completed);
+        assert_eq!(
+            run.output.unwrap().text,
+            "tool said: denied by policy: outbound policy unavailable"
+        );
+        let failed = tags
+            .iter()
+            .find(|tag| {
+                tag.source
+                    .source_id
+                    .starts_with("tool_result:tool:reader:tc_")
+            })
+            .expect("the failed call's error is tagged");
+        assert_eq!(
+            failed.source.classification,
+            agent24_store::SourceClassification::Unknown
+        );
+    }
+
+    /// Answers from a script and remembers whether any request it was sent
+    /// carried [`TOOL_SECRET`].
+    struct WatchingProvider {
+        script: ScriptedProvider,
+        saw_secret: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl ModelProvider for WatchingProvider {
+        fn name(&self) -> &str {
+            "watching"
+        }
+        async fn complete(
+            &self,
+            req: &CompletionRequest,
+            cancel: &CancellationToken,
+        ) -> Result<CompletionResponse, ModelError> {
+            if req.messages.iter().any(|m| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains(TOOL_SECRET))
+            }) {
+                self.saw_secret
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.script.complete(req, cancel).await
+        }
+        async fn models(
+            &self,
+            _: &CancellationToken,
+        ) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+            Ok(vec![])
+        }
+    }
+
+    /// K1-6b.5f: a result whose tag cannot be written never reaches the
+    /// model; the run ends failed instead.
+    #[tokio::test]
+    async fn a_tool_result_whose_tag_cannot_be_written_never_reaches_the_model() {
+        let provider = Arc::new(WatchingProvider {
+            script: ScriptedProvider::new(vec![calls("reader", "c1")]),
+            saw_secret: std::sync::atomic::AtomicBool::new(false),
+        });
+        let tools = ToolRegistry::new().with(Arc::new(ReadingTool(
+            agent24_tools::ToolResultSource::unknown("reader"),
+        )));
+        let (manager, _sink, store) = manager_with_tools(provider.clone(), tools).await;
+        sqlx::query(
+            "CREATE TRIGGER no_tool_result_tags BEFORE INSERT ON run_source_tags \
+             WHEN NEW.source_id LIKE 'tool_result:%' \
+             BEGIN SELECT RAISE(ABORT, 'tag write refused'); END",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        let run = manager.start_run(create()).await.unwrap();
+        let run = wait_terminal(&store, &run.id).await;
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.error.unwrap().code, "source_policy_unavailable");
+        assert!(
+            !provider
+                .saw_secret
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the untagged result reached the model"
+        );
+    }
+
     #[tokio::test]
     async fn stale_legacy_tool_context_rejects_current_bound_run() {
         const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
@@ -4109,6 +4660,7 @@ pub(crate) mod tests {
         assert!(matches!(
             manager
                 .start_run(RunCreate {
+                    idoris_headroom_confirmed: false,
                     session_id: Some("bound".into()),
                     workspace_id: Some(workspace_id),
                     prompt: "fail admission".into(),
@@ -4225,6 +4777,7 @@ pub(crate) mod tests {
             .unwrap();
         let run = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("bound".into()),
                 workspace_id: Some(workspace_id),
                 prompt: "hang".into(),
@@ -4498,6 +5051,7 @@ pub(crate) mod tests {
     ) -> Run {
         let run = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some(session_id.to_owned()),
                 workspace_id: None,
                 prompt: prompt.to_owned(),
@@ -4852,6 +5406,7 @@ pub(crate) mod tests {
         let run = manager
             .start_run_with_schedule(
                 RunCreate {
+                    idoris_headroom_confirmed: false,
                     session_id: session_id.map(str::to_owned),
                     workspace_id: None,
                     prompt: prompt.to_owned(),
@@ -4981,6 +5536,169 @@ pub(crate) mod tests {
         assert!(
             provider.seen.lock().unwrap().is_empty(),
             "the model must not be called"
+        );
+    }
+
+    // ── K1-6b.5f-2: tool result origins across the turns of a session ──
+
+    /// K1-6b.5f-2: what a tool returned in one turn restricts the later turns
+    /// of its session through its origin, without raising the floor; an
+    /// ordinary result leaves nothing behind.
+    #[tokio::test]
+    async fn a_later_turn_carries_the_origins_of_its_sessions_tool_results() {
+        use agent24_store::SourceClassification::{Ordinary, Unknown};
+        for (source, inherited) in [
+            (
+                agent24_tools::ToolResultSource::unknown("reader"),
+                Some(Unknown),
+            ),
+            (agent24_tools::ToolResultSource::ordinary("reader"), None),
+        ] {
+            let tools = ToolRegistry::new().with(Arc::new(ReadingTool(source)));
+            let provider = ScriptedProvider::new(vec![calls("reader", "c1")]);
+            let (manager, store, _kv) = manager_with_memory_and_tools(
+                Arc::new(provider),
+                Arc::new(UnusedSummarizer),
+                tools,
+            )
+            .await;
+            seed_session(&store, "sess_tools").await;
+            let first = run_in_session(&manager, &store, "sess_tools", "read it").await;
+            assert_eq!(first.status, RunStatus::Completed, "{:?}", first.error);
+            let later = run_in_session(&manager, &store, "sess_tools", "and then").await;
+            let snapshot = store.run_policy_snapshot(&later.id).await.unwrap();
+            let classification_of = |id: &str| {
+                snapshot
+                    .sources
+                    .iter()
+                    .find(|source| source.source_id == id)
+                    .map(|source| source.classification)
+            };
+            assert_eq!(
+                classification_of("session_floor:sess_tools"),
+                Some(Ordinary)
+            );
+            assert_eq!(
+                classification_of("tool_result:tool:reader:session:sess_tools"),
+                inherited
+            );
+            assert_eq!(
+                process_egress_allowed_in(&manager, &later).await,
+                inherited.is_none()
+            );
+        }
+    }
+
+    /// Codex 6b.5f-2 r1 C2: the origin is recorded even while memory is not
+    /// configured, since the run may finish after a restart that has it.
+    #[tokio::test]
+    async fn a_session_records_its_tool_result_origins_without_memory() {
+        let tools = ToolRegistry::new().with(Arc::new(ReadingTool(
+            agent24_tools::ToolResultSource::unknown("reader"),
+        )));
+        let provider = ScriptedProvider::new(vec![calls("reader", "c1")]);
+        let (manager, _sink, store) = manager_with_tools(Arc::new(provider), tools).await;
+        seed_session(&store, "sess_nomemory").await;
+        let run = run_in_session(&manager, &store, "sess_nomemory", "read it").await;
+        assert_eq!(run.status, RunStatus::Completed, "{:?}", run.error);
+        assert_eq!(
+            store
+                .session_tool_result_origins("sess_nomemory")
+                .await
+                .unwrap(),
+            ["tool:reader"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_tool_result_origins_cannot_be_read_stops_before_the_model() {
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, _kv) =
+            manager_with_memory(provider.clone(), Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_noorigins").await;
+        sqlx::raw_sql("DROP TABLE session_tool_result_origins")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        let run = run_in_session(&manager, &store, "sess_noorigins", "hello").await;
+        assert_eq!(run.status, RunStatus::Failed);
+        let error = run.error.expect("a failed run carries its error");
+        assert_eq!(error.code, "source_policy_unavailable");
+        assert!(error.message.contains("tool result origins"), "{error:?}");
+        assert!(
+            provider.seen.lock().unwrap().is_empty(),
+            "the model must not be called"
+        );
+    }
+
+    /// K1-6b.5f-2: a result whose session origin cannot be recorded is not
+    /// tagged either, and never reaches the model.
+    #[tokio::test]
+    async fn a_tool_result_whose_session_origin_cannot_be_written_never_reaches_the_model() {
+        let provider = Arc::new(WatchingProvider {
+            script: ScriptedProvider::new(vec![calls("reader", "c1")]),
+            saw_secret: std::sync::atomic::AtomicBool::new(false),
+        });
+        let tools = ToolRegistry::new().with(Arc::new(ReadingTool(
+            agent24_tools::ToolResultSource::unknown("reader"),
+        )));
+        let (manager, store, _kv) =
+            manager_with_memory_and_tools(provider.clone(), Arc::new(UnusedSummarizer), tools)
+                .await;
+        seed_session(&store, "sess_noorigin").await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER no_origin BEFORE INSERT ON session_tool_result_origins \
+             BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        let run = run_in_session(&manager, &store, "sess_noorigin", "read it").await;
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.error.unwrap().code, "source_policy_unavailable");
+        assert!(
+            !provider
+                .saw_secret
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the result reached the model"
+        );
+    }
+
+    /// K1-6b.5f-2: /chat offers no tools, but what earlier /runs turns of its
+    /// session took in from tools is part of its context.
+    #[tokio::test]
+    async fn the_chat_prelude_carries_its_sessions_tool_result_origins() {
+        use agent24_store::SourceClassification::{Ordinary, Unknown};
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, _kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        let pool = agent24_store::test_hooks::pool(&store);
+        sqlx::raw_sql(
+            "INSERT INTO session_tool_result_origins (session_id, origin, created_at) \
+             VALUES ('chat_tools', 'tool:shell_exec', 't')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        for (sid, expected) in [("chat_tools", Unknown), ("chat_plain", Ordinary)] {
+            let (_, _, source_ref) = manager
+                .chat_memory_prelude("run_chat", Some(sid), "hello", false)
+                .await
+                .unwrap();
+            assert_eq!(source_ref.classification, expected, "{sid}");
+        }
+        sqlx::raw_sql("DROP TABLE session_tool_result_origins")
+            .execute(pool)
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .chat_memory_prelude("run_chat", Some("chat_tools"), "hello", false)
+                .await
+                .is_err()
         );
     }
 
@@ -5141,6 +5859,7 @@ pub(crate) mod tests {
 
         let run1 = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("sess_shed".to_owned()),
                 workspace_id: None,
                 prompt: "first question".to_owned(),
@@ -5162,6 +5881,7 @@ pub(crate) mod tests {
 
         let run2 = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("sess_shed".to_owned()),
                 workspace_id: None,
                 prompt: "second question".to_owned(),
@@ -5219,6 +5939,7 @@ pub(crate) mod tests {
         for prompt in ["alpha", "beta"] {
             let run = manager
                 .start_run(RunCreate {
+                    idoris_headroom_confirmed: false,
                     session_id: Some("sess_race".to_owned()),
                     workspace_id: None,
                     prompt: prompt.to_owned(),
@@ -5369,6 +6090,7 @@ pub(crate) mod tests {
         seed_session(&store, "sess_cancel").await;
         let run = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("sess_cancel".to_owned()),
                 workspace_id: None,
                 prompt: "hi".to_owned(),
@@ -5444,6 +6166,7 @@ pub(crate) mod tests {
         // Run A: proceed until it is inside compaction, holding the lock.
         let run_a = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("sess_lockwait".to_owned()),
                 workspace_id: None,
                 prompt: "a".to_owned(),
@@ -5460,6 +6183,7 @@ pub(crate) mod tests {
         // Run B: blocks in session_context() waiting for A's lock.
         let run_b = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("sess_lockwait".to_owned()),
                 workspace_id: None,
                 prompt: "b".to_owned(),
@@ -5510,6 +6234,7 @@ pub(crate) mod tests {
 
     pub(crate) fn create() -> RunCreate {
         RunCreate {
+            idoris_headroom_confirmed: false,
             session_id: None,
             workspace_id: None,
             prompt: "hi".to_owned(),
@@ -5578,6 +6303,7 @@ pub(crate) mod tests {
         let (manager, _sink, _store) = manager_with(Arc::new(FixedProvider)).await;
         let err = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 session_id: Some("sess_nope".to_owned()),
                 workspace_id: None,
                 prompt: "hi".to_owned(),
@@ -5664,6 +6390,7 @@ pub(crate) mod tests {
         wait_terminal(&store, &unbound.id).await;
         let bound = manager
             .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
                 knowledge_binding_id: Some("b1".to_owned()),
                 ..create()
             })
@@ -5754,6 +6481,7 @@ pub(crate) mod tests {
         let err = manager
             .start_run_then(
                 RunCreate {
+                    idoris_headroom_confirmed: false,
                     session_id: Some("sess_nope".to_owned()),
                     ..create()
                 },
@@ -5768,6 +6496,7 @@ pub(crate) mod tests {
         let err = manager
             .start_run_then(
                 RunCreate {
+                    idoris_headroom_confirmed: false,
                     workspace_id: Some(
                         agent24_protocol::WorkspaceId::parse("ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5")
                             .unwrap(),
@@ -6200,6 +6929,7 @@ mod approval_tests {
 
     fn create_plan() -> RunCreate {
         RunCreate {
+            idoris_headroom_confirmed: false,
             session_id: None,
             workspace_id: None,
             prompt: "do the thing".to_owned(),
@@ -6584,7 +7314,7 @@ mod approval_tests {
             "tc_internal_1",
             shell_args.as_object().unwrap().clone(),
         );
-        h.store.insert_approval(&approval).await.unwrap();
+        insert_parked(&h.store, &approval, "shell_exec").await;
         h.broker
             .resolve("apr_1", decision(decision_kind, reason))
             .await
@@ -6595,6 +7325,54 @@ mod approval_tests {
             .unwrap();
         let done = wait_terminal(&h.store, "run_1").await;
         (h, provider, done)
+    }
+
+    /// K1-R3 release review: a run that a build before migration 0031 started
+    /// and parked holds tool results no tag describes. After the upgrade it
+    /// is not resumed, however well its thread's origins are proven.
+    #[tokio::test]
+    async fn a_run_started_before_tool_result_tagging_is_not_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, provider) = resume_harness_with_explorer(dir.path().to_path_buf()).await;
+        let shell_args = serde_json::json!({ "argv": ["/bin/echo", "PRE-UPGRADE"] });
+        let calls = serde_json::json!([{
+            "id": "call_shell",
+            "name": "shell_exec",
+            "arguments": shell_args.to_string()
+        }]);
+        h.store
+            .insert_run(&run_in("run_1", RunStatus::AwaitingApproval))
+            .await
+            .unwrap();
+        // What migration 0033 writes for a run unfinished at the upgrade.
+        sqlx::query("INSERT INTO runs_before_tool_result_tagging (run_id) VALUES ('run_1')")
+            .execute(agent24_store::test_hooks::pool(&h.store))
+            .await
+            .unwrap();
+        seed_proven_parked_thread(&h.store, "run_1", "run echo", calls).await;
+        let user_source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
+        h.store
+            .tag_run_source("run_1", 0, &user_source, &now_iso8601())
+            .await
+            .unwrap();
+        let approval = seed_approval(
+            "apr_1",
+            "run_1",
+            "tc_internal_1",
+            shell_args.as_object().unwrap().clone(),
+        );
+        insert_parked(&h.store, &approval, "shell_exec").await;
+        h.broker
+            .resolve("apr_1", decision("approve", None))
+            .await
+            .unwrap();
+        h.manager
+            .resume_run("run_1".to_owned(), "apr_1".to_owned())
+            .await
+            .unwrap();
+        let done = wait_terminal(&h.store, "run_1").await;
+        assert_resume_refused_before_tools(&h, &provider, &done);
+        assert_shell_did_not_run(&h).await;
     }
 
     fn assert_resume_refused_before_tools(h: &Harness, provider: &RecordingProvider, done: &Run) {
@@ -6613,7 +7391,16 @@ mod approval_tests {
     }
 
     async fn assert_shell_did_not_run(h: &Harness) {
-        assert!(h.store.list_tool_calls("run_1").await.unwrap().is_empty());
+        // The parked call's row is seeded as Running; the shell must not have
+        // settled it (kernel resume reads the tool name from this row).
+        assert!(
+            h.store
+                .list_tool_calls("run_1")
+                .await
+                .unwrap()
+                .iter()
+                .all(|call| matches!(call.status, ToolCallStatus::Running))
+        );
         let thread = h.store.list_run_messages("run_1").await.unwrap();
         assert_eq!(thread.len(), 2);
         assert!(thread.iter().all(|message| message.role != "tool"));
@@ -6893,92 +7680,135 @@ mod approval_tests {
     /// End-to-end crash recovery (H3): a run parked awaiting approval, its task
     /// gone, is resumed once a human answers the restored approval — the parked
     /// tool runs and the run completes, all reconstructed from the persisted
-    /// thread.
+    /// thread. A parked call that fails once it runs is settled the same way,
+    /// its error tagged like any result (K1-6b.5f, PR-Daemon #1282 N1). A
+    /// session run's settled result also records its origin for the session's
+    /// later turns (K1-6b.5f-2, PR-Daemon #1309 S2).
     #[tokio::test]
     async fn a_parked_run_resumes_after_its_approval_is_answered() {
-        let dir = tempfile::tempdir().unwrap();
-        let h = resume_harness(dir.path().to_path_buf()).await;
+        for (argv, answer, session) in [
+            (vec!["/bin/echo", "resumed-output"], "resumed-output", None),
+            (vec!["/nonexistent/agent24-resume-test"], "spawn", None),
+            (
+                vec!["/bin/echo", "resumed-output"],
+                "resumed-output",
+                Some("sess_1"),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let h = resume_harness(dir.path().to_path_buf()).await;
+            if let Some(sid) = session {
+                seed_session(&h.store, sid).await;
+            }
 
-        // Seed the crash state directly: an awaiting_approval run with NO live
-        // task, its thread persisted (user + assistant turn whose trailing
-        // tool_call is unanswered), and a matching pending approval. The
-        // assistant call's arguments MUST equal the approval payload, or
-        // staleness re-validation would (correctly) refuse to run B for A.
-        let args = serde_json::json!({ "argv": ["/bin/echo", "resumed-output"] });
-        let run = Run {
-            id: "run_1".to_owned(),
-            session_id: None,
-            workspace_id: None,
-            status: RunStatus::AwaitingApproval,
-            input: RunInput {
-                prompt: "run echo".to_owned(),
+            // Seed the crash state directly: an awaiting_approval run with NO live
+            // task, its thread persisted (user + assistant turn whose trailing
+            // tool_call is unanswered), and a matching pending approval. The
+            // assistant call's arguments MUST equal the approval payload, or
+            // staleness re-validation would (correctly) refuse to run B for A.
+            let args = serde_json::json!({ "argv": argv });
+            let run = Run {
+                id: "run_1".to_owned(),
+                session_id: session.map(str::to_owned),
                 workspace_id: None,
-                model_override: None,
-                mode: agent24_protocol::RunMode::Normal,
-                knowledge_binding_id: None,
-            },
-            output: None,
-            error: None,
-            usage: zero_usage(),
-            schedule_id: None,
-            created_at: now_iso8601(),
-            started_at: Some(now_iso8601()),
-            ended_at: None,
-        };
-        h.store.insert_run(&run).await.unwrap();
-        let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
-        seed_proven_parked_thread(&h.store, "run_1", "run echo", call).await;
-        let source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
-        h.store
-            .tag_run_source("run_1", 0, &source, &now_iso8601())
-            .await
-            .unwrap();
-        let approval = Approval {
-            id: "apr_1".to_owned(),
-            run_id: "run_1".to_owned(),
-            tool_call_id: "tc_internal_1".to_owned(),
-            kind: "exec".to_owned(),
-            summary: "shell_exec".to_owned(),
-            payload: args.as_object().unwrap().clone(),
-            available_decisions: vec!["approve".to_owned(), "deny".to_owned(), "abort".to_owned()],
-            standing_target: None,
-            status: ApprovalStatus::Pending,
-            decision: None,
-            expires_at: agent24_core::util::iso8601_after(Duration::from_secs(30)),
-            created_at: now_iso8601(),
-            decided_at: None,
-        };
-        h.store.insert_approval(&approval).await.unwrap();
+                status: RunStatus::AwaitingApproval,
+                input: RunInput {
+                    prompt: "run echo".to_owned(),
+                    workspace_id: None,
+                    model_override: None,
+                    mode: agent24_protocol::RunMode::Normal,
+                    knowledge_binding_id: None,
+                },
+                output: None,
+                error: None,
+                usage: zero_usage(),
+                schedule_id: None,
+                created_at: now_iso8601(),
+                started_at: Some(now_iso8601()),
+                ended_at: None,
+            };
+            h.store.insert_run(&run).await.unwrap();
+            let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
+            seed_proven_parked_thread(&h.store, "run_1", "run echo", call).await;
+            let source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
+            h.store
+                .tag_run_source("run_1", 0, &source, &now_iso8601())
+                .await
+                .unwrap();
+            let approval = Approval {
+                id: "apr_1".to_owned(),
+                run_id: "run_1".to_owned(),
+                tool_call_id: "tc_internal_1".to_owned(),
+                kind: "exec".to_owned(),
+                summary: "shell_exec".to_owned(),
+                payload: args.as_object().unwrap().clone(),
+                available_decisions: vec![
+                    "approve".to_owned(),
+                    "deny".to_owned(),
+                    "abort".to_owned(),
+                ],
+                standing_target: None,
+                status: ApprovalStatus::Pending,
+                decision: None,
+                expires_at: agent24_core::util::iso8601_after(Duration::from_secs(30)),
+                created_at: now_iso8601(),
+                decided_at: None,
+            };
+            insert_parked(&h.store, &approval, "shell_exec").await;
 
-        // The human answers — no in-memory waiter is woken (the task is gone).
-        h.broker
-            .resolve("apr_1", decision("approve", None))
-            .await
-            .unwrap();
-        // The daemon resumes the run off the persisted thread.
-        h.manager
-            .resume_run("run_1".to_owned(), "apr_1".to_owned())
-            .await
-            .unwrap();
+            // The human answers — no in-memory waiter is woken (the task is gone).
+            h.broker
+                .resolve("apr_1", decision("approve", None))
+                .await
+                .unwrap();
+            // The daemon resumes the run off the persisted thread.
+            h.manager
+                .resume_run("run_1".to_owned(), "apr_1".to_owned())
+                .await
+                .unwrap();
 
-        let done = wait_terminal(&h.store, "run_1").await;
-        assert_eq!(done.status, RunStatus::Completed);
-        // The parked shell_exec actually ran on resume; its output flowed into
-        // the final answer.
-        assert!(
-            done.output.unwrap().text.contains("resumed-output"),
-            "the parked tool did not run on resume"
-        );
-        // The reconstructed thread gained the tool result for the parked call,
-        // keyed on the THREAD's provider id (call_provider_1) — NOT the
-        // approval's tc_internal_1. Resume works across the two id namespaces.
-        let thread = h.store.list_run_messages("run_1").await.unwrap();
-        assert!(
-            thread
+            let done = wait_terminal(&h.store, "run_1").await;
+            assert_eq!(done.status, RunStatus::Completed);
+            // The parked shell_exec actually ran on resume; its output flowed into
+            // the final answer.
+            assert!(
+                done.output.unwrap().text.contains(answer),
+                "the parked tool did not run on resume"
+            );
+            // The reconstructed thread gained the tool result for the parked call,
+            // keyed on the THREAD's provider id (call_provider_1) — NOT the
+            // approval's tc_internal_1. Resume works across the two id namespaces.
+            let thread = h.store.list_run_messages("run_1").await.unwrap();
+            assert!(
+                thread
+                    .iter()
+                    .any(|m| m.role == "tool"
+                        && m.tool_call_id.as_deref() == Some("call_provider_1")),
+                "no tool result was recorded for the resumed call"
+            );
+            // K1-6b.5f: the settled call's result is tagged like any other, under
+            // the approval's call id.
+            let tags = h.store.list_run_source_tags("run_1").await.unwrap();
+            let result = tags
                 .iter()
-                .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_provider_1")),
-            "no tool result was recorded for the resumed call"
-        );
+                .find(|tag| tag.source.kind == agent24_store::SourceKind::ToolResult)
+                .expect("the resumed shell_exec's result is tagged");
+            assert_eq!(
+                result.source.source_id,
+                "tool_result:tool:shell_exec:tc_internal_1"
+            );
+            assert_eq!(
+                result.source.classification,
+                agent24_store::SourceClassification::Unknown
+            );
+            if let Some(sid) = session {
+                assert_eq!(
+                    h.store.session_tool_result_origins(sid).await.unwrap(),
+                    ["tool:shell_exec"],
+                    "the resumed result's origin is recorded for the session"
+                );
+            }
+        }
     }
 
     /// K1-6b.5d: a run parked on a shell_exec approval when the daemon
@@ -7041,7 +7871,7 @@ mod approval_tests {
                 "tc_internal_1",
                 args.as_object().unwrap().clone(),
             );
-            h.store.insert_approval(&approval).await.unwrap();
+            insert_parked(&h.store, &approval, "shell_exec").await;
 
             assert_eq!(h.manager.restore_pending_approvals().await.unwrap(), (1, 0));
             h.broker
@@ -7152,7 +7982,7 @@ mod approval_tests {
             created_at: now_iso8601(),
             decided_at: None,
         };
-        h.store.insert_approval(&approval).await.unwrap();
+        insert_parked(&h.store, &approval, "doc.write").await;
         h.broker
             .resolve("apr_1", decision("approve", None))
             .await
@@ -7179,6 +8009,28 @@ mod approval_tests {
         .expect("the resumed call is asked about again");
         let waiting = h.store.get_run("run_1").await.unwrap().unwrap();
         assert_eq!(waiting.status, RunStatus::AwaitingApproval);
+        // #1379 review: had the daemon restarted here, the approval asked
+        // again would still restore. It has no `tool_calls` row of its own;
+        // it is bound to the parked call's provider id.
+        let approved_tool = h.manager.approved_tool(&asked_again).await.unwrap();
+        let thread = h.store.list_run_messages("run_1").await.unwrap();
+        assert_eq!(
+            crate::resume::assess_restore(
+                &crate::resume::ApprovedCall {
+                    payload: &asked_again.payload,
+                    tool_call_id: &asked_again.tool_call_id,
+                    tool: approved_tool.as_deref(),
+                },
+                &asked_again.created_at,
+                waiting.status,
+                &thread,
+                |_| true,
+                "",
+            ),
+            crate::resume::RestoreDecision::Restore {
+                tool_call_id: "call_provider_1".to_owned()
+            }
+        );
         h.broker
             .resolve(&asked_again.id, decision("approve", None))
             .await
@@ -7255,7 +8107,7 @@ mod approval_tests {
             "tc_internal_1",
             args.as_object().unwrap().clone(),
         );
-        h.store.insert_approval(&approval).await.unwrap();
+        insert_parked(&h.store, &approval, "shell_exec").await;
         h.broker
             .resolve("apr_1", decision("approve", None))
             .await
@@ -7308,9 +8160,9 @@ mod approval_tests {
         sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,?,'g1','unix',?,?)").bind(WS).bind(&now).bind(expires.as_str()).bind(root.to_str().unwrap()).bind(rm.dev().to_le_bytes().to_vec()).bind(rm.ino().to_le_bytes().to_vec()).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
         sqlx::query("INSERT INTO workspace_allocations (allocation_id,workspace_id,root_generation,relative_name,parent_identity_kind,parent_unix_device,parent_unix_inode,root_identity_kind,root_unix_device,root_unix_inode,phase,created_at) VALUES ('wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5',?,'g1',?,'unix',?,?,'unix',?,?,'committed',?)").bind(WS).bind(&locator).bind(pm.dev().to_le_bytes().to_vec()).bind(pm.ino().to_le_bytes().to_vec()).bind(rm.dev().to_le_bytes().to_vec()).bind(rm.ino().to_le_bytes().to_vec()).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
         let wid=agent24_protocol::WorkspaceId::parse(WS).unwrap(); h.store.insert_session(&agent24_protocol::Session{id:"sess_1".into(),title:"s".into(),channel:"desktop".into(),workspace_id:Some(wid.clone()),created_at:now.clone(),updated_at:now.clone()}).await.unwrap(); let input=RunInput{prompt:"two".into(),workspace_id:Some(wid),model_override:None,mode:RunMode::Normal,knowledge_binding_id:None}; sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'awaiting_approval',?,?,?,?)").bind(WS).bind(serde_json::to_string(&input).unwrap()).bind(serde_json::to_string(&zero_usage()).unwrap()).bind(&now).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap(); sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','run_1','run',?)").bind(LEASE).bind(WS).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
-        let a1=serde_json::json!({"argv":["/bin/echo","first"]}); let a2=serde_json::json!({"argv":["/bin/echo","must-not-run"]}); let calls=serde_json::json!([{"id":"call_provider_1","name":"shell_exec","arguments":a1.to_string()},{"id":"call_provider_2","name":"shell_exec","arguments":a2.to_string()}]); seed_proven_parked_thread(&h.store,"run_1","two",calls).await; let approval=seed_approval("apr_1","run_1","tc_internal_1",a1.as_object().unwrap().clone()); h.store.insert_approval(&approval).await.unwrap(); h.broker.resolve("apr_1",decision("approve",None)).await.unwrap();
+        let a1=serde_json::json!({"argv":["/bin/echo","first"]}); let a2=serde_json::json!({"argv":["/bin/echo","must-not-run"]}); let calls=serde_json::json!([{"id":"call_provider_1","name":"shell_exec","arguments":a1.to_string()},{"id":"call_provider_2","name":"shell_exec","arguments":a2.to_string()}]); seed_proven_parked_thread(&h.store,"run_1","two",calls).await; let approval=seed_approval("apr_1","run_1","tc_internal_1",a1.as_object().unwrap().clone()); insert_parked(&h.store, &approval, "shell_exec").await; h.broker.resolve("apr_1",decision("approve",None)).await.unwrap();
         let run=h.store.get_run("run_1").await.unwrap().unwrap(); assert!(h.manager.tool_context_for(&run,"preflight").await.is_ok()); sqlx::raw_sql(&format!("CREATE TRIGGER lose_resume_authority AFTER INSERT ON run_messages WHEN NEW.run_id='run_1' AND NEW.role='tool' AND NEW.tool_call_id='call_provider_1' BEGIN UPDATE workspace_leases SET released_at='{now}' WHERE lease_id='{LEASE}'; END;")).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap(); h.manager.resume_run("run_1".into(),"apr_1".into()).await.unwrap(); assert_eq!(wait_terminal(&h.store,"run_1").await.status,RunStatus::Cancelled);
-        assert_eq!(h.store.list_tool_calls("run_1").await.unwrap().len(),0); let thread=h.store.list_run_messages("run_1").await.unwrap(); assert!(thread.iter().any(|m|m.role=="tool"&&m.tool_call_id.as_deref()==Some("call_provider_1"))); assert!(!thread.iter().any(|m|m.role=="tool"&&m.tool_call_id.as_deref()==Some("call_provider_2"))); assert_eq!(h.events.lock().unwrap().iter().filter(|e|e.as_str()=="run.cancelled").count(),1);
+        assert_eq!(h.store.list_tool_calls("run_1").await.unwrap().iter().map(|c|c.id.as_str()).collect::<Vec<_>>(),["tc_internal_1"]); let thread=h.store.list_run_messages("run_1").await.unwrap(); assert!(thread.iter().any(|m|m.role=="tool"&&m.tool_call_id.as_deref()==Some("call_provider_1"))); assert!(!thread.iter().any(|m|m.role=="tool"&&m.tool_call_id.as_deref()==Some("call_provider_2"))); assert_eq!(h.events.lock().unwrap().iter().filter(|e|e.as_str()=="run.cancelled").count(),1);
     }
 
     #[tokio::test]
@@ -7344,7 +8196,7 @@ mod approval_tests {
         approval
             .available_decisions
             .insert(1, "approve_for_session".to_owned());
-        h.store.insert_approval(&approval).await.unwrap();
+        insert_parked(&h.store, &approval, "shell_exec").await;
 
         h.broker
             .resolve("apr_1", decision("approve_for_session", None))
@@ -7459,7 +8311,7 @@ mod approval_tests {
             created_at: now_iso8601(),
             decided_at: None,
         };
-        h.store.insert_approval(&approval).await.unwrap();
+        insert_parked(&h.store, &approval, "shell_exec").await;
 
         h.broker
             .resolve("apr_1", decision("deny", Some("not this time")))
@@ -7547,6 +8399,26 @@ mod approval_tests {
     }
 
     /// A pending approval row.
+    /// Inserts `approval` after the `tool_calls` row of the `tool` call it was
+    /// asked for, in the order `run_tool_call` writes them: a restore checks
+    /// the parked call against that row's tool.
+    async fn insert_parked(store: &Store, approval: &Approval, tool: &str) {
+        store
+            .insert_tool_call(&ToolCall {
+                id: approval.tool_call_id.clone(),
+                run_id: approval.run_id.clone(),
+                tool: tool.to_owned(),
+                input: approval.payload.clone(),
+                status: ToolCallStatus::Running,
+                output_summary: None,
+                started_at: now_iso8601(),
+                ended_at: None,
+            })
+            .await
+            .unwrap();
+        store.insert_approval(approval).await.unwrap();
+    }
+
     fn seed_approval(
         id: &str,
         run_id: &str,
@@ -7629,7 +8501,7 @@ mod approval_tests {
             args.as_object().unwrap().clone(),
         );
         approval.expires_at = "2020-01-01T00:00:00Z".to_owned();
-        h.store.insert_approval(&approval).await.unwrap();
+        insert_parked(&h.store, &approval, "shell_exec").await;
 
         // Prove this fixture would be re-broadcast if startup restore ran
         // before expiry reconciliation; otherwise the regression is vacuous.
@@ -7717,17 +8589,19 @@ mod approval_tests {
             .append_run_message("run_ok", "assistant", None, &call, None, &now_iso8601())
             .await
             .unwrap();
-        h.store
-            .insert_approval(&seed_approval(
+        insert_parked(
+            &h.store,
+            &seed_approval(
                 "apr_ok",
                 "run_ok",
                 // tc_ namespace — deliberately DIFFERENT from the thread's
                 // provider id (call_provider_1); correspondence is by payload.
                 "tc_internal_1",
                 args.as_object().unwrap().clone(),
-            ))
-            .await
-            .unwrap();
+            ),
+            "shell_exec",
+        )
+        .await;
 
         // Non-restorable: a pending approval whose run already COMPLETED — the
         // status gate in plan_resume refuses it, so the sweep aborts it.
@@ -7934,15 +8808,17 @@ mod approval_tests {
             .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
             .await
             .unwrap();
-        h.store
-            .insert_approval(&seed_approval(
+        insert_parked(
+            &h.store,
+            &seed_approval(
                 "apr_1",
                 "run_1",
                 "tc_internal_1",
                 args.as_object().unwrap().clone(),
-            ))
-            .await
-            .unwrap();
+            ),
+            "shell_exec",
+        )
+        .await;
 
         assert_eq!(h.manager.restore_pending_approvals().await.unwrap(), (0, 1));
         assert_eq!(
@@ -8031,15 +8907,17 @@ mod approval_tests {
             .append_run_message("run_db", "assistant", None, &calls, None, &now_iso8601())
             .await
             .unwrap();
-        h.store
-            .insert_approval(&seed_approval(
+        insert_parked(
+            &h.store,
+            &seed_approval(
                 "apr_db",
                 "run_db",
                 "tc_internal_1",
                 args.as_object().unwrap().clone(),
-            ))
-            .await
-            .unwrap();
+            ),
+            "shell_exec",
+        )
+        .await;
         sqlx::query("DROP TABLE workspace_leases")
             .execute(agent24_store::test_hooks::pool(&h.store))
             .await

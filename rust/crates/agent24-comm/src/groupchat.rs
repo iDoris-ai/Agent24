@@ -24,11 +24,15 @@
 //! Every command needs the keystore password (`--password-stdin`), fetched
 //! from the same [`PasswordStore`](crate::PasswordStore) as `send`. Failure
 //! mapping is the shared closed set (`crate::error`): exit 1 `user_error`
-//! (bad history cursor, both cursors) → 400 `invalid`; exit 4 with a send
+//! (bad history cursor, both cursors; since Hyphae v0.27.2 also group not
+//! active, unknown logical id, invite/identity not found) → 400 `invalid`;
+//! exit 4 with a send
 //! report in `data` (partial fan-out) → 502 `partial` carrying that report
 //! verbatim, so a UI can render per-recipient state; other exit 4 → 502
-//! `upstream`. Input that Hyphae itself would only reject as `other_error`
-//! (malformed ids, npubs) is rejected here first as 400 `invalid`.
+//! `upstream`. Mapping keys on the envelope error name, not the exit number,
+//! so 0.27.1 (`other_error`/4 → 502) and 0.27.2 (`user_error`/1 → 400) both
+//! classify correctly. Malformed ids and npubs are still rejected locally
+//! first as 400 `invalid`.
 
 use std::ffi::OsString;
 

@@ -1,11 +1,13 @@
 //! COMM-1b: proves (and then fixes) the concurrent-keystore-write race
 //! `KeystoreWriteLock` exists to close (COMM-HYPHAE.md §3, H3/G8).
 //!
-//! Requires `HYPHAE_TEST_BIN` (see `tests/real_binary.rs`); without it both
-//! tests print why they're skipping and return early. Neither test ever
+//! Requires `HYPHAE_TEST_BIN` (see `tests/real_binary.rs`). CI requires it;
+//! local runs without it print a skip reason and return early. Neither test ever
 //! touches the real `~/.hyphae` — `HOME` is always a throwaway `tempdir()`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod common;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -31,7 +33,7 @@ const CONCURRENT_CREATES: usize = 10;
 /// already explained why) so callers can bail out early exactly like
 /// `tests/real_binary.rs` does.
 async fn runner_from_env(home: PathBuf) -> Option<HyphaeRunner> {
-    let test_bin = std::env::var("HYPHAE_TEST_BIN").ok()?;
+    let test_bin = common::hyphae_test_bin()?;
     let source = PathBuf::from(&test_bin)
         .canonicalize()
         .unwrap_or_else(|e| panic!("HYPHAE_TEST_BIN={test_bin:?} is not readable: {e}"));
@@ -132,8 +134,7 @@ async fn spawn_concurrent_creates(
 /// already been flushed to disk, so there is no read-modify-write window for
 /// two of them to race in. Not `#[ignore]`d: this is the regression test —
 /// deterministic, and safe to run whenever `HYPHAE_TEST_BIN` happens to be
-/// set (CI doesn't set it, so it just skips there, matching
-/// `tests/real_binary.rs`'s existing convention).
+/// set. CI supplies a lock-verified binary; local runs may skip without it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_identity_create_with_lock_keeps_all_identities() {
     let tmp = tempfile::tempdir().expect("tempdir");

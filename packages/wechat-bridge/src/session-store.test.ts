@@ -247,4 +247,34 @@ describe('FileSessionStore crash safety', () => {
     expect(fs.existsSync(liveOther)).toBe(true) // ← the round-3 regression
     expect(fs.existsSync(unrelated)).toBe(true) // not ours to delete
   })
+
+  it('sweeps an orphan temp next to a session path that still contains /../', () => {
+    // `link` → `elsewhere`, so `nest/link/..` and the lexically folded `nest`
+    // are different directories. The temp is written with string concatenation
+    // (`${file}.<pid>.tmp`); sweeping it with path.join would delete the decoy
+    // in `nest` and leave the real temp behind.
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-wechat-sessions-literal-'))
+    try {
+      const nest = path.join(base, 'nest')
+      fs.mkdirSync(path.join(base, 'elsewhere'))
+      fs.mkdirSync(nest)
+      fs.symlinkSync(path.join(base, 'elsewhere'), path.join(nest, 'link'))
+      const session = `${nest}/link/../wechat-sessions.json`
+      const literalTemp = `${session}.1.tmp`
+      const collapsedTemp = path.join(nest, 'wechat-sessions.json.1.tmp')
+      fs.writeFileSync(literalTemp, '{}')
+      fs.writeFileSync(collapsedTemp, 'decoy')
+      const longAgo = new Date(Date.now() - 3 * 60 * 60 * 1000)
+      fs.utimesSync(literalTemp, longAgo, longAgo)
+      fs.utimesSync(collapsedTemp, longAgo, longAgo)
+
+      new FileSessionStore(session).load()
+
+      expect(session).toContain('/../')
+      expect(fs.existsSync(literalTemp)).toBe(false)
+      expect(fs.existsSync(collapsedTemp)).toBe(true)
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true })
+    }
+  })
 })

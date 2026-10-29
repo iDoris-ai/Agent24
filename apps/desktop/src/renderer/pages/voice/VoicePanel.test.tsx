@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import VoicePanel, { MAX_EVENTS_IN_MEMORY, pushCapped, formatModelCall } from './VoicePanel'
 import type { AgentEarEventEnvelope, AttachedView, ModelCallEnvelope } from '../../../shared/ipc-types'
-import { setLocale } from '../../i18n'
+import { setLocale, type Locale } from '../../i18n'
 
 type BackendReq = { method: string; path: string; body?: unknown }
 type BackendRes = { ok: boolean; status: number; data: unknown }
@@ -14,13 +14,22 @@ let onModelCallHandler: ((call: ModelCallEnvelope) => void) | null = null
 let attachModules: AttachedView[] = []
 let snapshotEvents: AgentEarEventEnvelope[] = []
 let modelCallSnapshotCalls: ModelCallEnvelope[] = []
+let attachmentFails = false
+const openExternal = vi.fn(() => Promise.resolve())
+// A-3: the dedicated main-process IPCs. Each test sets what they resolve to.
+const agentearSetEnabled = vi.fn((_enabled: boolean): Promise<BackendRes> => Promise.resolve({ ok: true, status: 200, data: { modules: [] } }))
+const agentearUnpair = vi.fn((): Promise<BackendRes> => Promise.resolve({ ok: true, status: 204, data: null }))
+let proxyCalls: BackendReq[] = []
 
 function mount(): void {
   posted = []
   onEventHandler = null
   onModelCallHandler = null
+  proxyCalls = []
   const proxy = vi.fn((req: BackendReq): Promise<BackendRes> => {
+    proxyCalls.push(req)
     if (req.method === 'GET' && req.path === '/api/v1/attached') {
+      if (attachmentFails) return Promise.reject(new Error('daemon offline'))
       return Promise.resolve({ ok: true, status: 200, data: { modules: attachModules } })
     }
     if (req.method === 'GET' && req.path.startsWith('/api/v1/usage')) {
@@ -65,7 +74,7 @@ function mount(): void {
   const modelCallSnapshot = vi.fn(() => Promise.resolve(modelCallSnapshotCalls))
 
   Object.defineProperty(window, 'agent24', {
-    value: { backendProxy: proxy, onAgentEarEvent, agentearSnapshot, onModelCallEvent, modelCallSnapshot },
+    value: { backendProxy: proxy, onAgentEarEvent, agentearSnapshot, onModelCallEvent, modelCallSnapshot, openExternal, agentearSetEnabled, agentearUnpair },
     writable: true,
     configurable: true,
   })
@@ -106,6 +115,12 @@ function modelCall(overrides: Partial<ModelCallEnvelope> = {}): ModelCallEnvelop
 }
 
 beforeEach(() => {
+  attachmentFails = false
+  openExternal.mockClear()
+  agentearSetEnabled.mockReset()
+  agentearSetEnabled.mockImplementation(() => Promise.resolve({ ok: true, status: 200, data: { modules: [] } }))
+  agentearUnpair.mockReset()
+  agentearUnpair.mockImplementation(() => Promise.resolve({ ok: true, status: 204, data: null }))
   attachModules = []
   snapshotEvents = []
   modelCallSnapshotCalls = []
@@ -119,10 +134,42 @@ it('renders the English voice title by default', () => {
 
 describe('VoicePanel — attach status', () => {
   beforeEach(() => { setLocale('zh') })
+  it('guides pairing and opens the latest AgentEar release via the existing IPC', async () => {
+    mount()
+    render(<VoicePanel />)
+    const download = await screen.findByRole('button', { name: '下载 AgentEar' })
+    const steps = screen.getAllByRole('listitem')
+    expect(steps).toHaveLength(3)
+    expect(steps[0]).toContainElement(download)
+    expect(steps[1]).toHaveTextContent('在 AgentEar 菜单栏里点「与 Agent24 配对」')
+    expect(steps[2]).toHaveTextContent('在 Agent24 弹出的确认框里选允许')
+    fireEvent.click(download)
+    expect(openExternal).toHaveBeenCalledExactlyOnceWith('https://github.com/iDoris-ai/AgentEar/releases/latest')
+  })
+
+  it('does not show a status or pairing guide when the attachment request fails', async () => {
+    attachmentFails = true
+    mount()
+    render(<VoicePanel />)
+    await screen.findByText(/daemon offline/)
+    expect(screen.queryByText(/附着状态：/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '下载 AgentEar' })).not.toBeInTheDocument()
+  })
+
+  it.each<Locale>(['zh', 'en', 'th'])('formats the pairing time in %s', async (locale) => {
+    setLocale(locale)
+    attachModules = [attached()]
+    mount()
+    const { container } = render(<VoicePanel />)
+    await waitFor(() => expect(container.querySelector('time')).toHaveAttribute('dateTime', attached().created_at))
+    expect(container.querySelector('time')).toHaveTextContent(new Date(attached().created_at).toLocaleString(locale))
+    expect(screen.queryByRole('list')).not.toBeInTheDocument()
+  })
+
   it('disables speak input and both buttons when the module is detached (no record)', async () => {
     mount()
     render(<VoicePanel />)
-    await waitFor(() => expect(screen.getByText(/未附着/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/未配对/)).toBeInTheDocument())
     expect(screen.getByLabelText('让它说')).toBeDisabled()
     expect(screen.getByRole('button', { name: '让它说' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '停止播放' })).toBeDisabled()
@@ -132,7 +179,8 @@ describe('VoicePanel — attach status', () => {
     attachModules = [{ ...attached(), attach_status: 'detached' }]
     mount()
     render(<VoicePanel />)
-    await waitFor(() => expect(screen.getByText(/未附着/)).toBeInTheDocument())
+    await screen.findByText('AgentEar 未在运行或未连接')
+    expect(screen.queryByRole('button', { name: '下载 AgentEar' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: '让它说' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '停止播放' })).toBeDisabled()
   })
@@ -141,7 +189,7 @@ describe('VoicePanel — attach status', () => {
     attachModules = [attached()]
     mount()
     render(<VoicePanel />)
-    await waitFor(() => expect(screen.getByText(/已附着/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/已连接/)).toBeInTheDocument())
     expect(screen.getByLabelText('让它说')).not.toBeDisabled()
     expect(screen.getByRole('button', { name: '停止播放' })).not.toBeDisabled()
     // speak button stays disabled until there's text
@@ -152,8 +200,126 @@ describe('VoicePanel — attach status', () => {
     attachModules = [attached()]
     mount()
     render(<VoicePanel />)
-    await waitFor(() => expect(screen.getByText(/已附着/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/已连接/)).toBeInTheDocument())
     expect(screen.getByLabelText('让它说')).toHaveAttribute('maxLength', '2000')
+  })
+})
+
+describe('VoicePanel — disable / unpair (A-3)', () => {
+  beforeEach(() => { setLocale('zh') })
+
+  it('shows no admin buttons while unpaired', async () => {
+    mount()
+    render(<VoicePanel />)
+    await screen.findByText(/未配对/)
+    expect(screen.queryByRole('button', { name: '停用' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '启用' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '解除配对' })).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['attached', '停用'],
+    ['detached', '停用'],
+    ['disabled', '启用'],
+  ])('paired + %s -> toggle reads %s, plus unpair', async (status, toggle) => {
+    attachModules = [{ ...attached(), attach_status: status }]
+    mount()
+    render(<VoicePanel />)
+    expect(await screen.findByRole('button', { name: toggle })).not.toBeDisabled()
+    expect(screen.getByRole('button', { name: '解除配对' })).not.toBeDisabled()
+    expect(screen.queryByRole('button', { name: toggle === '停用' ? '启用' : '停用' })).not.toBeInTheDocument()
+  })
+
+  it.each<[Locale, string, string]>([['en', 'Disable', 'Unpair'], ['th', 'ปิดใช้งาน', 'ยกเลิกการจับคู่']])('labels in %s', async (locale, disable, unpair) => {
+    setLocale(locale)
+    attachModules = [attached()]
+    mount()
+    render(<VoicePanel />)
+    expect(await screen.findByRole('button', { name: disable })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: unpair })).toBeInTheDocument()
+  })
+
+  it('disable calls the dedicated IPC (never the generic proxy) and refreshes the status at once', async () => {
+    attachModules = [attached()]
+    agentearSetEnabled.mockImplementation(() => {
+      attachModules = [{ ...attached(), attach_status: 'disabled' }]
+      return Promise.resolve({ ok: true, status: 200, data: { modules: attachModules } })
+    })
+    mount()
+    render(<VoicePanel />)
+    fireEvent.click(await screen.findByRole('button', { name: '停用' }))
+    expect(await screen.findByRole('button', { name: '启用' })).toBeInTheDocument()
+    expect(agentearSetEnabled).toHaveBeenCalledExactlyOnceWith(false)
+    expect(screen.getByText(/附着状态：已停用/)).toBeInTheDocument()
+    expect(proxyCalls.filter((r) => r.method !== 'GET')).toEqual([])
+  })
+
+  it('enable sends true', async () => {
+    attachModules = [{ ...attached(), attach_status: 'disabled' }]
+    mount()
+    render(<VoicePanel />)
+    fireEvent.click(await screen.findByRole('button', { name: '启用' }))
+    await waitFor(() => expect(agentearSetEnabled).toHaveBeenCalledExactlyOnceWith(true))
+  })
+
+  it('unpair calls the dedicated IPC and the panel falls back to the pairing guide', async () => {
+    attachModules = [attached()]
+    agentearUnpair.mockImplementation(() => {
+      attachModules = []
+      return Promise.resolve({ ok: true, status: 204, data: null })
+    })
+    mount()
+    render(<VoicePanel />)
+    fireEvent.click(await screen.findByRole('button', { name: '解除配对' }))
+    expect(await screen.findByRole('button', { name: '下载 AgentEar' })).toBeInTheDocument()
+    expect(agentearUnpair).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole('button', { name: '解除配对' })).not.toBeInTheDocument()
+    expect(proxyCalls.filter((r) => r.method !== 'GET')).toEqual([])
+  })
+
+  it('both buttons are disabled while a request is in flight; a second click sends nothing', async () => {
+    attachModules = [attached()]
+    let release!: (v: BackendRes) => void
+    agentearUnpair.mockImplementation(() => new Promise((r) => { release = r }))
+    mount()
+    render(<VoicePanel />)
+    const unpair = await screen.findByRole('button', { name: '解除配对' })
+    fireEvent.click(unpair)
+    await waitFor(() => expect(unpair).toBeDisabled())
+    expect(screen.getByRole('button', { name: '停用' })).toBeDisabled()
+    fireEvent.click(unpair)
+    fireEvent.click(screen.getByRole('button', { name: '停用' }))
+    expect(agentearUnpair).toHaveBeenCalledTimes(1)
+    expect(agentearSetEnabled).not.toHaveBeenCalled()
+    release({ ok: false, status: 499, data: { error: { code: 'cancelled', message: 'x' } } })
+    await waitFor(() => expect(unpair).not.toBeDisabled())
+  })
+
+  it('a cancelled confirmation is not an error', async () => {
+    attachModules = [attached()]
+    agentearSetEnabled.mockResolvedValue({ ok: false, status: 499, data: { error: { code: 'cancelled', message: 'Operation cancelled' } } })
+    mount()
+    render(<VoicePanel />)
+    fireEvent.click(await screen.findByRole('button', { name: '停用' }))
+    await waitFor(() => expect(agentearSetEnabled).toHaveBeenCalled())
+    await waitFor(() => expect(screen.getByRole('button', { name: '停用' })).not.toBeDisabled())
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['not_paired', 'AgentEar 已不在配对列表中'],
+    ['busy', '另一项需要确认的操作正在进行'],
+    ['forbidden', '守护进程拒绝了此操作'],
+    ['daemon_error', '守护进程未能完成此操作'],
+    ['something_new', '守护进程未能完成此操作'],
+  ])('failure %s -> a translated message by error code', async (code, text) => {
+    attachModules = [attached()]
+    agentearUnpair.mockResolvedValue({ ok: false, status: 502, data: { error: { code, message: 'raw daemon text' } } })
+    mount()
+    render(<VoicePanel />)
+    fireEvent.click(await screen.findByRole('button', { name: '解除配对' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(text)
+    expect(screen.getByRole('alert')).not.toHaveTextContent('raw daemon text')
   })
 })
 
@@ -166,7 +332,7 @@ describe('VoicePanel — speak / stop commands', () => {
   it('speak posts the correct URL and an agentear.command/1 body shape', async () => {
     mount()
     render(<VoicePanel />)
-    await waitFor(() => expect(screen.getByText(/已附着/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/已连接/)).toBeInTheDocument())
     fireEvent.change(screen.getByLabelText('让它说'), { target: { value: '你好' } })
     fireEvent.click(screen.getByRole('button', { name: '让它说' }))
     await waitFor(() => expect(posted).toHaveLength(1))
@@ -201,6 +367,106 @@ describe('VoicePanel — speak / stop commands', () => {
     await waitFor(() => expect(posted).toHaveLength(2))
     const ids = posted.map((p) => (p.body as Record<string, unknown>)['command_id'])
     expect(new Set(ids).size).toBe(2)
+  })
+})
+
+describe('VoicePanel — speak hints (A-2b)', () => {
+  beforeEach(() => {
+    setLocale('zh')
+    attachModules = [attached()]
+  })
+
+  it.each([
+    [{ reason: 'tts_unavailable' }, 'AgentEar 的语音合成服务（TTS）暂不可用。可以在 AgentEar 里切到对话模式让它自动启动，或者手动启动 TTS 后重试。'],
+    [{ reason: 'sidecar_not_running' }, 'AgentEar 的语音合成服务（TTS）没有运行。可以在 AgentEar 里切到对话模式让它自动启动，或者手动启动 TTS 后重试。'],
+    [{ reason: 'start_failed' }, 'AgentEar 的语音合成服务（TTS）启动失败。请在 AgentEar 里检查 TTS 的错误信息，手动启动成功后重试。'],
+    [{ reason: 'start_timeout' }, 'AgentEar 的语音合成服务（TTS）启动超时。请稍等片刻后重试；如果仍不可用，请在 AgentEar 里检查 TTS 的运行状态。'],
+    [{ code: 'tts_unavailable', reason: 'start_failed' }, 'AgentEar 的语音合成服务（TTS）启动失败。请在 AgentEar 里检查 TTS 的错误信息，手动启动成功后重试。'],
+    [{ code: 'tts_unavailable' }, 'AgentEar 的语音合成服务（TTS）暂不可用。可以在 AgentEar 里切到对话模式让它自动启动，或者手动启动 TTS 后重试。'],
+    [{ code: 'tts_unavailable', reason: 'future_reason' }, 'AgentEar 的语音合成服务（TTS）暂不可用。可以在 AgentEar 里切到对话模式让它自动启动，或者手动启动 TTS 后重试。'],
+    [{ code: 'tts_unavailable', reason: {} }, 'AgentEar 的语音合成服务（TTS）暂不可用。可以在 AgentEar 里切到对话模式让它自动启动，或者手动启动 TTS 后重试。'],
+  ])('explains a TTS failure with payload %j', async (details, hint) => {
+    snapshotEvents = [{ schema: 'agentear.event/1', event_id: 'tts', session_id: 's', seq: 1, type: 'speech', payload: { state: 'failed', ...details } }]
+    mount()
+    render(<VoicePanel />)
+    expect(await screen.findByText(hint)).toBeInTheDocument()
+    expect(screen.getByText(/^播放失败/)).toBeInTheDocument()
+  })
+
+  it.each([
+    { state: 'completed', reason: 'tts_unavailable' },
+    { state: 'failed', reason: 'other_failure' },
+  ])('does not show TTS advice for an unrelated speech event %j', async (payload) => {
+    snapshotEvents = [{ schema: 'agentear.event/1', event_id: 'other', session_id: 's', seq: 1, type: 'speech', payload }]
+    mount()
+    render(<VoicePanel />)
+    await screen.findByText(/other_failure|tts_unavailable/)
+    expect(screen.queryByText(/语音合成服务/)).not.toBeInTheDocument()
+  })
+
+  it('suggests English without changing the choice, then sends English only after a click', async () => {
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(screen.getByLabelText('让它说')).toBeEnabled())
+    fireEvent.change(screen.getByLabelText('让它说'), { target: { value: 'Hello, this is a voice test.' } })
+    expect(screen.getByText('文字看起来是英文，建议选 English')).toBeInTheDocument()
+    expect(screen.getByRole('combobox')).toHaveValue('zh-CN')
+    fireEvent.click(screen.getByRole('button', { name: '切换到 English' }))
+    expect(screen.getByRole('combobox')).toHaveValue('en-US')
+    expect(screen.queryByText(/文字看起来/)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '让它说' }))
+    await waitFor(() => expect(posted).toHaveLength(1))
+    expect(posted[0]?.body).toMatchObject({ payload: { text: 'Hello, this is a voice test.', lang: 'en-US' } })
+  })
+
+  it.each([
+    ['zh-CN', '这是一段用来测试的中文文字'],
+    ['zh-CN', 'Hello 你好世界，这是一段 mixed text'],
+    ['zh-CN', 'This is mostly English but 中文'],
+    ['zh-CN', 'This is a much longer English sentence with just one Chinese character 中'],
+    ['zh-CN', 'สวัสดีวันนี้อากาศดีมาก Hello'],
+    ['zh-CN', 'hi!'],
+    ['zh-CN', '12345 !!! 😊'],
+    ['en-US', 'Hello, this is a voice test.'],
+    ['th-TH', 'สวัสดีวันนี้อากาศดีมาก'],
+  ])('does not suggest a language for %s and %s', async (lang, text) => {
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(screen.getByLabelText('让它说')).toBeEnabled())
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: lang } })
+    fireEvent.change(screen.getByLabelText('让它说'), { target: { value: text } })
+    expect(screen.queryByText(/文字看起来/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /切换到/ })).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['en-US', '这是一段用来测试的中文文字', 'Chinese', 'zh-CN'],
+    ['th-TH', '这是一段用来测试的中文文字', 'Chinese', 'zh-CN'],
+    ['zh-CN', 'สวัสดีวันนี้อากาศดีมาก', 'Thai', 'th-TH'],
+  ])('offers the detected language for %s and %s', async (lang, text, label, expected) => {
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(screen.getByLabelText('让它说')).toBeEnabled())
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: lang } })
+    fireEvent.change(screen.getByLabelText('让它说'), { target: { value: text } })
+    fireEvent.click(screen.getByRole('button', { name: `切换到 ${label}` }))
+    expect(screen.getByRole('combobox')).toHaveValue(expected)
+  })
+
+  it.each<{ locale: Locale; hint: string; action: string; tts: RegExp }>([
+    { locale: 'zh', hint: '文字看起来是英文，建议选 English', action: '切换到 English', tts: /语音合成服务（TTS）/ },
+    { locale: 'en', hint: 'This text looks like English. Try English.', action: 'Switch to English', tts: /text-to-speech service \(TTS\)/ },
+    { locale: 'th', hint: 'ข้อความนี้ดูเหมือนภาษาอังกฤษ แนะนำให้เลือก English', action: 'เปลี่ยนเป็น English', tts: /บริการแปลงข้อความเป็นเสียง \(TTS\)/ },
+  ])('renders localized advice and actions in $locale', async ({ locale, hint, action, tts }) => {
+    setLocale(locale)
+    snapshotEvents = ['tts_unavailable', 'sidecar_not_running', 'start_failed', 'start_timeout'].map((reason, seq) => ({ schema: 'agentear.event/1', event_id: `tts-${seq}`, session_id: 's', seq, type: 'speech', payload: { state: 'failed', reason } }))
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(screen.getAllByText(tts)).toHaveLength(4))
+    expect(new Set(screen.getAllByText(tts).map((node) => node.textContent)).size).toBe(4)
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Hello, this is a voice test.' } })
+    expect(screen.getByText(hint)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: action })).toBeInTheDocument()
   })
 })
 
@@ -491,7 +757,7 @@ describe('VoicePanel — recent model calls (ME4-desktop-model-ui)', () => {
   it('shows nothing yet when no model call has happened', async () => {
     mount()
     render(<VoicePanel />)
-    await waitFor(() => expect(screen.getByText(/未附着/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/未配对/)).toBeInTheDocument())
     expect(screen.queryByText(/最近模型调用/)).not.toBeInTheDocument()
   })
 

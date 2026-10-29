@@ -1,10 +1,14 @@
 // Agent24 main process entry — M2: integrates BackendManager daemon.
 
-import { app, BrowserWindow, Menu, Tray, WebContentsView, nativeImage, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, dialog, Menu, Tray, WebContentsView, nativeImage, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
+import { registerCliTool } from './ipc/cli-tool'
+import { initMainLocale, onMainLocaleChange } from './main-i18n'
+import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
-import { BackendManager, type BackendStatus } from './backend-manager'
+import { BackendManager, daemonConnection, setBundledPackaged } from './backend-manager'
+import { PresencePoller, defaultPresenceDeps, showPresenceDialog } from './presence-poller'
 import { AgentEarEventBridge } from './agentear-events'
 import { documentsEvent } from './documents'
 import { AgentEarEventLog } from './agentear-log'
@@ -19,15 +23,12 @@ import {
   classifyCreativeUrl,
 } from './creative-serve-web'
 import { OpenDesignComponentInstaller } from './open-design-component'
-import { createIdorisStatusProvider } from './idoris-admin'
 import { KnowledgeHost } from './knowledge-host'
 import { KnowledgeLoginStore } from './knowledge-logins'
 
 const isDev = process.env.NODE_ENV === 'development'
-const backendManager = new BackendManager()
-// Start the one-shot inherited-FD read immediately. The promise is awaited
-// before any managed child is spawned, so the secret-bearing FD is closed first.
-const idorisStatusProviderPromise = createIdorisStatusProvider()
+setBundledPackaged(app.isPackaged)
+const backendManager = new BackendManager({ isPackaged: app.isPackaged })
 // A3-4 review M5: the sequenced/capped event log lives here, in main, so it
 // survives the renderer's VoicePanel unmounting when the user switches
 // sidebar pages (design §7.2's intent — a host-side log, not a per-tab one).
@@ -81,9 +82,13 @@ const guard = createIpcGuard({ getMainWindow: () => mainWin, isTrustedUrl: isApp
 let isQuitting = false
 // F1b: periodic tray refresh so the menu-bar reflects live daemon status
 let trayTimer: NodeJS.Timeout | null = null
+let cliTool: ReturnType<typeof registerCliTool> | null = null
+let cliCheckTicks = 0
 let creativeServeWeb: CreativeServeWeb | null = null
 // KB-HOST-01: Knowledge logins and the daemon's private Knowledge interface.
 let knowledgeHost: KnowledgeHost | null = null
+// CORE-2 AgentEar S3: long-polls the daemon for native confirmation challenges.
+let presencePoller: PresencePoller | null = null
 let openDesignComponent: OpenDesignComponentInstaller | null = null
 let creativeView: WebContentsView | null = null
 let creativeOrigin: string | null = null
@@ -120,6 +125,9 @@ async function showCreativeView(
   if (!creativeViewFence.isCurrent(requestGeneration)) return { ok: false, error: 'Creative view request superseded' }
   if (status.state === 'needs-download') {
     return { ok: false, needsDownload: true, size: status.size }
+  }
+  if (status.state === 'failed' && status.notInstalled) {
+    return { ok: false, notInstalled: true, error: status.error }
   }
   if (status.state !== 'ready' || !status.origin) {
     return { ok: false, error: status.error ?? 'Open Design did not become ready' }
@@ -251,7 +259,10 @@ app.on('second-instance', () => {
 
 app.whenReady().then(async () => {
   if (!isPrimaryInstance) return
-  const idorisStatus = await idorisStatusProviderPromise
+  // UI language for the tray and native dialogs: English unless the user chose
+  // otherwise (the renderer reports its setting; the system locale is ignored).
+  initMainLocale(app.getPath('userData'))
+  onMainLocaleChange(() => refreshTray())
   // Owner decision 2026-10-05: Open Design is downloaded on demand (see
   // open-design-component.ts) instead of being bundled in the installer.
   // CreativeServeWeb only ever reads this accessor's current status — it
@@ -289,6 +300,17 @@ app.whenReady().then(async () => {
   // read `backendManager.status()` / `getBackendEndpoint()` live, so this
   // resolving a beat later than the old synchronous spawn is harmless.
   void backendManager.start()
+  // CORE-2 AgentEar S3: native confirmation for elevated operations. Idle until
+  // the daemon runs in capabilities mode (main then holds the ProductHost
+  // token); a daemon without the routes answers 404 and is re-checked rarely.
+  presencePoller = new PresencePoller(defaultPresenceDeps({
+    connection: daemonConnection,
+    showDialog: (opts, signal) => {
+      if (!mainWin || mainWin.isDestroyed()) mainWin = createMainWindow()
+      return showPresenceDialog(mainWin, opts, signal, (parent, options) => dialog.showMessageBox(parent, options))
+    },
+  }))
+  presencePoller.start()
   // safeStorage needs the app ready. The logins load once, here, before
   // anything can change them; the reason is logged, never the contents.
   knowledgeHost = new KnowledgeHost(new KnowledgeLoginStore(app.getPath('userData'), safeStorage))
@@ -310,7 +332,18 @@ app.whenReady().then(async () => {
     })
   })
 
-  registerIpcHandlers({ idorisStatus, guard })
+  registerIpcHandlers({ guard })
+  cliTool = registerCliTool({
+    guard, executable: process.execPath, resources: process.resourcesPath, packaged: app.isPackaged,
+    changed: refreshTray,
+    openSettings: () => {
+      showOrCreateWindow()
+      const contents = mainWin?.webContents
+      if (contents?.isLoading()) contents.once('did-finish-load', () => contents.send(IpcChannels.CliToolOpenSettings))
+      else contents?.send(IpcChannels.CliToolOpenSettings)
+    },
+  })
+  void cliTool.refresh()
   mainWin = createMainWindow()
   ipcMain.handle(IpcChannels.CreativeShow, guard((_event, bounds: CreativeViewBounds) => showCreativeView(bounds)))
   ipcMain.handle(IpcChannels.CreativeRestart, guard((_event, bounds: CreativeViewBounds) => restartCreativeView(bounds)))
@@ -363,6 +396,7 @@ app.whenReady().then(async () => {
   // crashes, or is toggled from the menu itself.
   trayTimer = setInterval(() => {
     refreshTray()
+    if (++cliCheckTicks % 15 === 0) void cliTool?.refresh()
     // Replays the wanted Knowledge bindings on a restarted daemon and retries
     // changes that did not land.
     knowledgeHost?.sync()
@@ -373,62 +407,40 @@ app.whenReady().then(async () => {
   app.on('activate', () => showOrCreateWindow())
 })
 
-// F1b: labels/glyphs for the current daemon status.
-const STATUS_META: Record<BackendStatus, { title: string; label: string }> = {
-  running: { title: '⚡A24', label: '● daemon：运行中' },
-  starting: { title: '…A24', label: '○ daemon：启动中…' },
-  stopped: { title: '⚠️A24', label: '✕ daemon：已停止' },
-  blocked: { title: '⚠️A24', label: '✕ daemon：被另一个 Agent24 占用' },
-}
-
-// Rebuild the tray title, tooltip, and context menu from the live daemon status.
-// Cheap and idempotent — safe to call on a timer.
+// Rebuild the tray title, tooltip, and context menu from the live daemon status
+// and the current UI language. Cheap and idempotent — safe to call on a timer,
+// and called again whenever the language changes.
 function refreshTray(): void {
   if (!tray) return
-  const status = backendManager.status()
-  const external = backendManager.isExternalDaemon()
-  const meta = STATUS_META[status]
-  // DEP-A5: an external daemon (reused from `agent24 daemon start`, not
-  // spawned by this app) gets a visibly different label — the whole point of
-  // requirement #2 is that the user can tell them apart before hitting stop.
-  const foreign = backendManager.foreignDaemonPid()
-  const label = external
-    ? `${meta.label}（外部 daemon · pid ${backendManager.externalDaemonPid() ?? '?'}）`
-    : foreign !== null ? `${meta.label}（pid ${foreign}）` : meta.label
-  if (process.platform === 'darwin') tray.setTitle(meta.title)
-  tray.setToolTip(`Agent24 — ${label.replace(/^[●○✕]\s*/, '')}（${backendManager.backendKind()}）`)
+  const view = buildTrayView({
+    status: backendManager.status(),
+    detail: backendManager.statusDetail(),
+    external: backendManager.isExternalDaemon(),
+    externalPid: backendManager.externalDaemonPid() ?? null,
+    foreignPid: backendManager.foreignDaemonPid(),
+    backendKind: backendManager.backendKind(),
+    cliTool: cliTool?.status(),
+  })
+  if (process.platform === 'darwin') tray.setTitle(view.title)
+  tray.setToolTip(view.tooltip)
 
-  // DEP-A5 requirement #2: stop/restart must only ever act on a daemon this
-  // app spawned. BackendManager.stopDaemon()/restart() already guard against
-  // killing an external daemon at the method level (see backend-manager.ts),
-  // but the external case also gets its own menu wording here — "断开" instead
-  // of "停止/重启" — so the tray itself never implies a kill that won't happen.
-  const daemonItems: MenuItemConstructorOptions[] =
-    status === 'stopped'
-      ? [{ label: '启动 daemon', click: () => { backendManager.startDaemon(); refreshTray() } }]
-      : external
-        ? [{ label: '断开外部 daemon（不会终止它）', click: () => { backendManager.stopDaemon(); refreshTray() } }]
-        : [
-            { label: '重启 daemon', click: () => { backendManager.restart(); refreshTray() } },
-            { label: '停止 daemon', click: () => { backendManager.stopDaemon(); refreshTray() } },
-          ]
-
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label, enabled: false },
-    { type: 'separator' },
-    { label: '显示窗口', click: () => showOrCreateWindow() },
-    { type: 'separator' },
-    ...daemonItems,
-    { type: 'separator' },
-    {
-      label: '退出 Agent24',
-      click: () => {
-        // Clear tray ref so win.on('close') guard is skipped and app can quit
-        tray = null
-        app.quit()
-      },
+  const actions: Record<TrayAction, () => void> = {
+    'cli-settings': () => cliTool?.openSettings(),
+    start: () => { backendManager.startDaemon(); refreshTray() },
+    disconnect: () => { backendManager.stopDaemon(); refreshTray() },
+    restart: () => { backendManager.restart(); refreshTray() },
+    stop: () => { backendManager.stopDaemon(); refreshTray() },
+    show: () => showOrCreateWindow(),
+    quit: () => {
+      // Clear tray ref so win.on('close') guard is skipped and app can quit
+      tray = null
+      app.quit()
     },
-  ]))
+  }
+  tray.setContextMenu(Menu.buildFromTemplate(view.items.map((item): MenuItemConstructorOptions =>
+    'type' in item ? { type: 'separator' }
+      : 'action' in item ? { label: item.label, click: actions[item.action] }
+        : { label: item.label, enabled: false })))
 }
 
 app.on('before-quit', () => {
@@ -436,6 +448,9 @@ app.on('before-quit', () => {
   // M5: cancel an in-flight Open Design component download rather than
   // leaving it (and its partial files) orphaned past app exit.
   openDesignComponent?.abort('Agent24 is quitting')
+  // Stop answering challenges before the daemon goes away; not awaited (a
+  // dialog that cannot be closed must not hold up quit).
+  void presencePoller?.stop()
 })
 
 app.on('will-quit', () => {

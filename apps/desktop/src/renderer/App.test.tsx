@@ -1,34 +1,48 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react'
 import { App, pickChatModel, extractDaemonDefaultModel } from './App'
 import { LOCALE_STORAGE_KEY, setLocale } from './i18n'
+import { SETTINGS_TAB_STORAGE_KEY } from './pages/Settings'
+import type { IdorisStatus } from './components/idoris/api'
 
 const mockBackendProxy = vi.fn()
-const mockModulesList = vi.fn()
 const mockGetAppVersion = vi.fn()
 const mockOmlxDetect = vi.fn()
 const mockOmlxStart = vi.fn()
 const mockOmlxModels = vi.fn()
 const mockBackendEndpoint = vi.fn()
+const mockSetNavPrefs = vi.fn()
 
 beforeEach(() => {
   vi.clearAllMocks()
   mockGetAppVersion.mockResolvedValue('1.0.0')
-  mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { status: 'ok', ts: Date.now() } })
-  mockModulesList.mockResolvedValue([])
+  mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { status: 'ok', ts: Date.now(), schedules: [], runs: [] } })
   mockOmlxDetect.mockResolvedValue({ ok: true, models: ['Qwen3-8B-4bit'] })
   mockBackendEndpoint.mockResolvedValue({ port: 60128 })
+  mockSetNavPrefs.mockResolvedValue(undefined)
 
   Object.defineProperty(window, 'agent24', {
     value: {
       backendProxy: mockBackendProxy,
-      modulesList: mockModulesList,
       getAppVersion: mockGetAppVersion,
       omlxDetect: mockOmlxDetect,
       omlxStart: mockOmlxStart,
       omlxModels: mockOmlxModels,
       backendEndpoint: mockBackendEndpoint,
+      getNavPrefs: vi.fn().mockResolvedValue({ pinned: ['documents', 'design', 'create'], slotCount: 3, showOverview: true }),
+      setNavPrefs: mockSetNavPrefs,
+      agentearSnapshot: vi.fn().mockResolvedValue([]),
+      modelCallSnapshot: vi.fn().mockResolvedValue([]),
+      onAgentEarEvent: vi.fn(() => () => {}),
+      onModelCallEvent: vi.fn(() => () => {}),
+      documents: {
+        request: vi.fn(({ op }: { op: string }) => Promise.resolve({ ok: true, status: 200, data:
+          op === 'list' ? { documents: [], next_cursor: null } : { storage: { state: 'ready' } },
+        })),
+        onImportProgress: () => () => {},
+        onEvent: () => () => {},
+      },
     },
     writable: true,
     configurable: true,
@@ -39,12 +53,28 @@ describe('App', () => {
   // These assertions predate i18n and are written against the zh copy.
   beforeEach(() => { setLocale('zh') })
 
-  it('renders built-in sidebar nav items', async () => {
+  it('renders the fixed sidebar and default pins without Workbench', async () => {
     await act(async () => { render(<App />) })
-    expect(screen.getAllByText('对话').length).toBeGreaterThan(0)
-    expect(screen.getByText('工作台')).toBeInTheDocument()
-    expect(screen.getByText('模型')).toBeInTheDocument()
+    expect(screen.getAllByText('助手').length).toBeGreaterThan(0)
+    expect(screen.queryByText('工作台')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '能力中心' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '本地模型' })).not.toBeInTheDocument()
     expect(screen.getAllByText('设置').length).toBeGreaterThan(0)
+  })
+
+  it('opens a full capability page, shows the center breadcrumb and clears it on sidebar navigation', async () => {
+    await act(async () => { render(<App />) })
+    fireEvent.click(screen.getByRole('button', { name: '能力中心' }))
+    fireEvent.click(within(screen.getByRole('main')).getByRole('button', { name: '创作' }))
+    expect(screen.getByRole('status')).toHaveTextContent('尚未设置')
+    expect(screen.getByText('安装并连接视频创作服务，即可开始创作。')).toBeInTheDocument()
+    const breadcrumb = screen.getByRole('navigation', { name: '面包屑' })
+    expect(breadcrumb).toHaveTextContent('能力中心›创作')
+    fireEvent.click(within(breadcrumb).getByRole('button'))
+    expect(screen.getByRole('main')).toHaveTextContent('领域 OS')
+    fireEvent.click(within(screen.getByRole('navigation', { name: '主导航' })).getByRole('button', { name: '创作' }))
+    expect(screen.queryByRole('navigation', { name: '面包屑' })).not.toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent('尚未设置')
   })
 
   it('shows backend status after health check', async () => {
@@ -131,7 +161,7 @@ describe('App', () => {
           data: { models: [], default_model: 'Qwen3.6-35B-A3B-MLX-8bit' },
         })
       }
-      return Promise.resolve({ ok: true, status: 200, data: { status: 'ok', ts: Date.now() } })
+      return Promise.resolve({ ok: true, status: 200, data: { status: 'ok', ts: Date.now(), schedules: [] } })
     })
     await act(async () => { render(<App />) })
     await waitFor(() => {
@@ -149,13 +179,44 @@ describe('App', () => {
     })
   })
 
+  it('Home module count reads GET /api/v1/os', async () => {
+    mockBackendProxy.mockImplementation((req: { path: string }) =>
+      Promise.resolve(
+        req.path === '/api/v1/os'
+          ? { ok: true, status: 200, data: { modules: [{ name: 'a', state: 'mounted' }, { name: 'b', state: 'mounted' }, { name: 'c', state: 'mounted' }, { name: 'd', state: 'disabled' }, { name: 'e', state: 'refused' }] } }
+          : { ok: true, status: 200, data: { status: 'ok' } },
+      ),
+    )
+    await act(async () => { render(<App />) })
+    fireEvent.click(screen.getAllByText('总览')[0])
+    await waitFor(() => {
+      expect(mockBackendProxy).toHaveBeenCalledWith({ method: 'GET', path: '/api/v1/os' })
+      expect(screen.getByText('已加载模块').nextElementSibling).toHaveTextContent('3')
+    })
+  })
+
+  it('Home module count is 0 when every OS module is disabled or refused', async () => {
+    mockBackendProxy.mockImplementation((req: { path: string }) =>
+      Promise.resolve(
+        req.path === '/api/v1/os'
+          ? { ok: true, status: 200, data: { modules: [{ name: 'a', state: 'disabled' }, { name: 'b', state: 'refused' }] } }
+          : { ok: true, status: 200, data: { status: 'ok' } },
+      ),
+    )
+    await act(async () => { render(<App />) })
+    fireEvent.click(screen.getAllByText('总览')[0])
+    await waitFor(() => {
+      expect(mockBackendProxy).toHaveBeenCalledWith({ method: 'GET', path: '/api/v1/os' })
+      expect(screen.getByText('已加载模块').nextElementSibling).toHaveTextContent('0')
+    })
+  })
+
   // A5: node-daemon-era module entries are gone from the navigation.
   it('has no module-manager / codebox / service-box / hello entries (A5)', async () => {
     await act(async () => { render(<App />) })
     expect(screen.queryByText('模块管理')).not.toBeInTheDocument()
     expect(screen.queryByText('安装模块')).not.toBeInTheDocument()
     expect(screen.queryByText('能力模块')).not.toBeInTheDocument()
-    expect(mockModulesList).not.toHaveBeenCalled()
   })
 
   it('navigates to settings page on click', async () => {
@@ -228,6 +289,17 @@ describe('App', () => {
     })
   })
 
+  it('oMLX running but needs a key: says so and does not start a second oMLX', async () => {
+    mockOmlxDetect.mockResolvedValue({ authRequired: true, url: 'http://127.0.0.1:8088' })
+
+    await act(async () => { render(<App />) })
+    await waitFor(() => {
+      expect(screen.getByText('oMLX 已运行，需要 API key（见设置）')).toBeInTheDocument()
+    })
+    expect(screen.queryByText('无 AI 运行时')).toBeNull()
+    expect(mockOmlxStart).not.toHaveBeenCalled()
+  })
+
   // M1-T14: switching to another page and back used to UNMOUNT ChatPage
   // (`{page === 'chat' && <ChatPage />}`), which reset its message list and
   // minted a fresh `session_id` — silently starting a new D1 memory session
@@ -239,7 +311,7 @@ describe('App', () => {
       if (req.path === '/api/v1/chat') {
         return Promise.resolve({ ok: true, status: 200, data: { message: { content: 'ack' } } })
       }
-      return Promise.resolve({ ok: true, status: 200, data: { status: 'ok', ts: Date.now() } })
+      return Promise.resolve({ ok: true, status: 200, data: { status: 'ok', ts: Date.now(), schedules: [] } })
     })
 
     await act(async () => { render(<App />) })
@@ -255,14 +327,14 @@ describe('App', () => {
     )?.[0].body.session_id
     expect(firstSessionId).toBeTruthy()
 
-    // Navigate to 记忆 and back to 对话. ChatPage stays MOUNTED the whole
+    // Navigate to Capabilities and back to Assistant. ChatPage stays mounted the whole
     // time (just hidden) — `hello there` is still findable in the DOM, so
     // the real assertion is on visibility, not presence.
-    fireEvent.click(screen.getAllByText('记忆')[0])
+    fireEvent.click(screen.getByRole('button', { name: '能力中心' }))
     await waitFor(() => {
       expect(screen.getByText('hello there')).not.toBeVisible()
     })
-    fireEvent.click(screen.getAllByText('对话')[0])
+    fireEvent.click(within(screen.getByRole('navigation', { name: '主导航' })).getByRole('button', { name: '助手' }))
 
     // The message list and session id must be exactly as they were.
     await waitFor(() => {
@@ -285,11 +357,134 @@ describe('App', () => {
   })
 })
 
+describe('App navigation integration', () => {
+  function nav() { return within(screen.getByRole('navigation', { name: 'Main navigation' })) }
+  function center() { fireEvent.click(nav().getByRole('button', { name: /Capabilities/ })) }
+  function row(name: string) { return within(screen.getByRole('listitem', { name })) }
+  async function switchTo(query: string) {
+    fireEvent.keyDown(window, { key: 'k', metaKey: true })
+    expect(screen.getAllByRole('dialog')).toHaveLength(1)
+    const input = within(screen.getByRole('dialog')).getByRole('combobox')
+    fireEvent.change(input, { target: { value: query } })
+    await act(async () => { fireEvent.keyDown(input, { key: 'Enter' }) })
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  }
+
+  it('replaces Create with Schedules in the three pinned slots and persists both changes through IPC', async () => {
+    await act(async () => { render(<App />) })
+    expect(nav().getAllByRole('button').map(button => button.textContent)).toEqual([
+      'Overview', 'Assistant', 'Documents', 'Design', 'Create', 'Capabilities', 'Settings',
+    ])
+    expect(nav().getByText('Pinned 3/3')).toBeInTheDocument()
+    center()
+    expect(row('Schedules').getByText('Manage recurring and scheduled tasks.')).toBeInTheDocument()
+    expect(row('Schedules').getByRole('button', { name: 'Slots full Schedules' })).toBeDisabled()
+    fireEvent.click(row('Create').getByRole('button', { name: 'Pinned Create' }))
+    await waitFor(() => expect(row('Schedules').getByRole('button', { name: 'Pin Schedules' })).toBeEnabled())
+    expect(nav().queryByRole('button', { name: 'Create' })).not.toBeInTheDocument()
+    fireEvent.click(row('Schedules').getByRole('button', { name: 'Pin Schedules' }))
+    await waitFor(() => expect(nav().getByRole('button', { name: 'Schedules' })).toBeInTheDocument())
+    expect(mockSetNavPrefs.mock.calls).toEqual([
+      [{ pinned: ['documents', 'design'], slotCount: 3, showOverview: true }],
+      [{ pinned: ['documents', 'design', 'schedules'], slotCount: 3, showOverview: true }],
+    ])
+  })
+
+  it('opens Schedules with cmd-K sch Enter without a breadcrumb, and returns from Documents to the center', async () => {
+    await act(async () => { render(<App />) })
+    await switchTo('sch')
+    expect(screen.getByText('Schedules', { selector: '.page-title' })).toBeInTheDocument()
+    expect(screen.queryByRole('navigation', { name: 'Breadcrumb' })).not.toBeInTheDocument()
+    center()
+    for (const button of ['Documents', 'Open']) {
+      await act(async () => { fireEvent.click(row('Documents').getByRole('button', { name: button })) })
+      expect(screen.getByText('No documents yet.')).toBeInTheDocument()
+      const breadcrumb = screen.getByRole('navigation', { name: 'Breadcrumb' })
+      expect(breadcrumb).toHaveTextContent('Capabilities›Documents')
+      fireEvent.click(within(breadcrumb).getByRole('button', { name: 'Capabilities' }))
+      expect(screen.getByRole('heading', { level: 1, name: 'Capabilities' })).toBeInTheDocument()
+    }
+    await act(async () => { fireEvent.click(nav().getByRole('button', { name: 'Documents' })) })
+    expect(screen.queryByRole('navigation', { name: 'Breadcrumb' })).not.toBeInTheDocument()
+  })
+
+  it('opens Settings from both switcher actions and the full-slots link, and opens Capabilities from the switcher', async () => {
+    window.localStorage.setItem(SETTINGS_TAB_STORAGE_KEY, 'voice')
+    await act(async () => { render(<App />) })
+    for (const [target, tab] of [['settings/activity', 'Activity'], ['settings/general', 'General']]) {
+      await switchTo(target)
+      expect(screen.getByText('Settings', { selector: '.page-title' })).toBeInTheDocument()
+      expect(screen.getByRole('tab', { name: tab, selected: true })).toBeInTheDocument()
+      expect(screen.getByRole('tabpanel', { name: tab })).toBeInTheDocument()
+      if (tab === 'Activity') expect(screen.getByRole('group', { name: 'Activity summary' })).toBeInTheDocument()
+      else expect(screen.getByLabelText('Language')).toBeInTheDocument()
+      expect(screen.queryByRole('navigation', { name: 'Breadcrumb' })).not.toBeInTheDocument()
+    }
+    fireEvent.click(screen.getByRole('tab', { name: 'Activity' }))
+    await switchTo('capabilities')
+    expect(screen.getByRole('heading', { level: 1, name: 'Capabilities' })).toBeInTheDocument()
+    await act(async () => { fireEvent.click(screen.getByRole('link', { name: 'Settings › General' })) })
+    expect(screen.getByText('Settings', { selector: '.page-title' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'General', selected: true })).toBeInTheDocument()
+    expect(screen.getByTestId('slot-count')).toHaveTextContent('3')
+  })
+
+  it('opens the Voice capability from its Settings tab', async () => {
+    await act(async () => { render(<App />) })
+    fireEvent.click(nav().getByRole('button', { name: 'Settings' }))
+    fireEvent.click(screen.getByRole('tab', { name: 'Voice' }))
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Open Voice' })) })
+    expect(screen.getByText('Voice (AgentEar)', { selector: '.page-title' })).toBeInTheDocument()
+    expect(screen.getByLabelText('Make it speak')).toBeInTheDocument()
+    expect(screen.queryByRole('tablist', { name: 'Settings sections' })).not.toBeInTheDocument()
+  })
+
+  it('reapplies a switcher target after manually changing tabs on the same Settings page', async () => {
+    await act(async () => { render(<App />) })
+    for (const [target, tab] of [['settings/general', 'General'], ['settings/activity', 'Activity']]) {
+      await switchTo(target)
+      fireEvent.click(screen.getByRole('tab', { name: 'Voice' }))
+      await switchTo(target)
+      expect(screen.getByRole('tab', { name: tab, selected: true })).toBeInTheDocument()
+    }
+  })
+
+  it('keeps default status labels when iDoris and Hyphae status cannot be obtained', async () => {
+    mockBackendProxy.mockResolvedValue({ ok: false, status: 503, data: null })
+    await act(async () => { render(<App />) })
+    await act(async () => { center() })
+    for (const name of ['Local models', 'Communication']) {
+      expect(row(name).getByText('Open', { selector: '.cap-status' })).toBeInTheDocument()
+    }
+  })
+
+  it('shows approval badges and known iDoris and Hyphae status in the center', async () => {
+    mockBackendProxy.mockImplementation(({ path }: { path: string }) => Promise.resolve({ ok: true, status: 200, data:
+      path.includes('/approvals?') ? { approvals: [{ id: 'one' }, { id: 'two' }] }
+        : path === '/api/v1/idoris/status' ? {
+          state: 'not_configured', version: '0.4.0', data_port: null, admin_port: null,
+          roles: [], last_error: null, current_operation: null, verification: null,
+          budget_suggestion: null, budget_unavailable_reason: 'hardware_memory_unavailable',
+        } satisfies IdorisStatus
+        : path === '/api/v1/comm/daemon' ? { ok: true, data: {
+          process: { state: 'running', generation: 1, consecutive_failures: 0, reason: null },
+          relay_probe: null, catch_up: { state: 'unknown', last_incomplete_at_ms: null },
+        } } : { status: 'ok' },
+    }))
+    await act(async () => { render(<App />) })
+    expect(nav().getByRole('button', { name: /Capabilities\s*2/ })).toHaveTextContent('2')
+    center()
+    expect(row('Approvals').getByRole('status', { name: '2 waiting' })).toHaveTextContent('2')
+    await waitFor(() => expect(row('Local models').getByText('Installed · not connected')).toBeInTheDocument())
+    expect(row('Communication').getByText('Running')).toBeInTheDocument()
+  })
+})
+
 describe('App language', () => {
   it('defaults to English when nothing is persisted', async () => {
     await act(async () => { render(<App />) })
-    expect(screen.getAllByText('Chat').length).toBeGreaterThan(0)
-    expect(screen.getByText('Workbench')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Assistant' })).toBeInTheDocument()
+    expect(screen.queryByText('Workbench')).not.toBeInTheDocument()
     await waitFor(() => expect(screen.getByText(/Backend running/)).toBeInTheDocument())
     expect(document.documentElement.lang).toBe('en')
   })
@@ -300,7 +495,7 @@ describe('App language', () => {
     await act(async () => {
       fireEvent.change(screen.getByLabelText('Language'), { target: { value: 'th' } })
     })
-    expect(screen.getByText('โต๊ะทำงาน')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'ผู้ช่วย' })).toBeInTheDocument()
     expect(screen.getAllByText('ตั้งค่า').length).toBeGreaterThan(0)
     expect(window.localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('th')
     expect(document.documentElement.lang).toBe('th')

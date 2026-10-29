@@ -5,8 +5,9 @@ use std::sync::Mutex;
 use agent24_models::router::TaskProfile;
 use agent24_models::{CompletionRequest, ModelError};
 use agent24_protocol::{
-    ChatRequest, ChatResponse, ErrorBody, EventBody, MemoryReceipt, Model, ModelDeltaPayload,
-    RunCompletedPayload, RunFailedPayload, RunOutputPayload, RunStartedPayload, Usage,
+    ChatRequest, ChatResponse, ErrorBody, ErrorEnvelope, EventBody, MemoryReceipt, Model,
+    ModelDeltaPayload, RunCompletedPayload, RunFailedPayload, RunOutputPayload, RunStartedPayload,
+    Usage,
 };
 use agent24_store::{CallTimingRow, CallTimingSummaryRow, ModelUsageRow};
 use axum::body::Body;
@@ -559,6 +560,7 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
         response_format: None,
         max_tokens: None,
         disable_thinking: false,
+        idoris_headroom_confirmed: chat.idoris_headroom_confirmed,
         temperature: None,
         progress: None,
     };
@@ -595,6 +597,7 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
         .await
     {
         Ok(served) => {
+            let gateway_record_id = served.idoris.map(|evidence| evidence.record_id);
             let provider = served.provider;
             let res = served.response;
             let tier = if served.tier.is_local() {
@@ -704,7 +707,7 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                     usage: res.usage.clone(),
                     memory_persisted,
                 }));
-            Json(ChatResponse {
+            let response = Json(ChatResponse {
                 message: agent24_protocol::ChatMessage {
                     role: res.message.role,
                     content: text,
@@ -716,7 +719,11 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                 memory_receipt,
                 memory_error_code,
             })
-            .into_response()
+            .into_response();
+            match gateway_record_id {
+                Some(record_id) => ([("x-idoris-record-id", record_id)], response).into_response(),
+                None => response,
+            }
         }
         Err(err) => {
             state
@@ -728,11 +735,30 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                     total_ms: call_start.elapsed().as_millis() as u64,
                     ..Default::default()
                 });
+            let details = match &err {
+                ModelError::IdorisHeadroomConfirmationRequired { role, remediation } => {
+                    Some(serde_json::Map::from_iter([
+                        ("role".into(), serde_json::json!(role)),
+                        ("remediation".into(), serde_json::json!(remediation)),
+                    ]))
+                }
+                _ => None,
+            };
             let (status, code, message) = match err {
                 ModelError::Unavailable(msg) => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "provider_unavailable",
                     format!("All LLM providers unavailable. Last error: {msg}"),
+                ),
+                ModelError::IdorisHeadroomConfirmationRequired { .. } => (
+                    StatusCode::CONFLICT,
+                    "idoris_headroom_confirmation_required",
+                    err.to_string(),
+                ),
+                ModelError::IdorisSupervisorBusy => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "idoris_supervisor_busy",
+                    err.to_string(),
                 ),
                 ModelError::Cancelled => (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -746,18 +772,19 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                     (StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
                 }
             };
+            let error = ErrorBody {
+                code: code.to_owned(),
+                message,
+                hint: None,
+                details,
+            };
             state
                 .events
                 .broadcast(EventBody::RunFailed(RunFailedPayload {
                     run_id,
-                    error: ErrorBody {
-                        code: code.to_owned(),
-                        message: message.clone(),
-                        hint: None,
-                        details: None,
-                    },
+                    error: error.clone(),
                 }));
-            error_response(status, code, &message)
+            (status, Json(ErrorEnvelope { error })).into_response()
         }
     }
 }
@@ -891,6 +918,246 @@ mod tests {
 
     fn router(state: AppState) -> axum::Router {
         crate::server::build_router_with_modules(state, axum::Router::new())
+    }
+
+    #[tokio::test]
+    async fn headroom_chat_and_run_requests_keep_confirmation_scoped() {
+        struct Gateway {
+            busy: bool,
+            seen: std::sync::Arc<Mutex<Vec<bool>>>,
+        }
+        #[async_trait::async_trait]
+        impl ModelProvider for Gateway {
+            fn name(&self) -> &str {
+                "gateway"
+            }
+            async fn complete(
+                &self,
+                req: &CompletionRequest,
+                cancel: &CancellationToken,
+            ) -> Result<agent24_models::CompletionResponse, ModelError> {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(req.idoris_headroom_confirmed);
+                if self.busy {
+                    return Err(ModelError::IdorisSupervisorBusy);
+                }
+                if !req.idoris_headroom_confirmed {
+                    return Err(ModelError::IdorisHeadroomConfirmationRequired {
+                        role: "idoris/daily".into(),
+                        remediation: Some("Confirm reserved memory headroom.".into()),
+                    });
+                }
+                Stub.complete(req, cancel).await
+            }
+            async fn models(&self, _: &CancellationToken) -> Result<Vec<Model>, ModelError> {
+                Ok(vec![])
+            }
+        }
+        for busy in [false, true] {
+            let seen = std::sync::Arc::new(Mutex::new(vec![]));
+            let mut state = state_with_stub().await;
+            state.router = std::sync::Arc::new(ModelRouter::with_defaults(vec![(
+                std::sync::Arc::new(Gateway {
+                    busy,
+                    seen: seen.clone(),
+                }),
+                Tier::Local,
+            )]));
+            // Rebuild the run manager with the same provider as /chat.
+            state.runs = agent24_agent::RunManager::new(
+                state.store.clone(),
+                state.router.clone(),
+                std::sync::Arc::new(agent24_tools::ToolRegistry::new()),
+                std::sync::Arc::new(state.events.clone()),
+                CancellationToken::new(),
+            );
+            let app = router(state.clone());
+            for confirmed in [None, Some(true), None] {
+                let mut body = serde_json::json!({"messages":[{"role":"user","content":"probe"}]});
+                if let Some(confirmed) = confirmed {
+                    body["idoris_headroom_confirmed"] = confirmed.into();
+                }
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/v1/chat")
+                            .header("authorization", "Bearer testtoken")
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                if busy {
+                    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                    assert_eq!(body["error"]["code"], "idoris_supervisor_busy");
+                } else if confirmed == Some(true) {
+                    assert_eq!(status, StatusCode::OK);
+                } else {
+                    assert_eq!(status, StatusCode::CONFLICT);
+                    assert_eq!(
+                        body["error"]["code"],
+                        "idoris_headroom_confirmation_required"
+                    );
+                    assert_eq!(body["error"]["details"]["role"], "idoris/daily");
+                    assert_eq!(
+                        body["error"]["details"]["remediation"],
+                        "Confirm reserved memory headroom."
+                    );
+                }
+            }
+            for confirmed in [false, true] {
+                let body =
+                    serde_json::json!({"prompt":"probe", "idoris_headroom_confirmed":confirmed});
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/v1/runs")
+                            .header("authorization", "Bearer testtoken")
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::ACCEPTED);
+                let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap();
+                let run: agent24_protocol::Run = serde_json::from_slice(&bytes).unwrap();
+                let done = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let run = state.store.get_run(&run.id).await.unwrap().unwrap();
+                        if matches!(
+                            run.status,
+                            agent24_protocol::RunStatus::Completed
+                                | agent24_protocol::RunStatus::Failed
+                        ) {
+                            break run;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                if busy {
+                    assert_eq!(done.error.unwrap().code, "idoris_supervisor_busy");
+                } else if confirmed {
+                    assert_eq!(done.status, agent24_protocol::RunStatus::Completed);
+                } else {
+                    assert_eq!(
+                        done.error.unwrap().code,
+                        "idoris_headroom_confirmation_required"
+                    );
+                }
+                assert!(
+                    serde_json::to_value(done.input)
+                        .unwrap()
+                        .get("idoris_headroom_confirmed")
+                        .is_none()
+                );
+            }
+            assert_eq!(*seen.lock().unwrap(), [false, true, false, false, true]);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chat_forwards_validated_gateway_receipt() {
+        use http_body_util::BodyExt;
+        const RECORD: &str = "00000000-0000-4000-8000-000000000003";
+        if std::env::vars_os().any(|(k, v)| k == "A24_RECEIPT_PROBE_CHILD" && v == "1") {
+            let mut state = state_with_stub().await;
+            state.router = std::sync::Arc::new(ModelRouter::from_env());
+            let response = router(state).oneshot(Request::builder()
+                .method("POST").uri("/api/v1/chat")
+                .header("authorization", "Bearer testtoken")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"messages":[{"role":"user","content":"probe"}],"model":"fixture-real"}"#)).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-idoris-record-id")
+                    .and_then(|v| v.to_str().ok()),
+                Some(RECORD)
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["model_id"], "fixture-real");
+            assert_eq!(body["message"]["content"], "receipt answer");
+            return;
+        }
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let fixture = axum::Router::new()
+            .route("/health", axum::routing::get(|| async { Json(serde_json::json!({"service":"idoris","version":"0.3.1-fixture","contract_version":"1.0.1","instance_id":"fixture-instance","dev_no_key_enabled":false})) }))
+            .route("/v1/chat/completions", axum::routing::post(move || { let count=count.clone(); async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                ([("x-idoris-record-id", RECORD),("x-idoris-served-locality","loopback")], Json(serde_json::json!({"model":"fixture-real","choices":[{"message":{"role":"assistant","content":"receipt answer"}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}})))
+            }}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, fixture).await.unwrap();
+        });
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "routes::tests::chat_forwards_validated_gateway_receipt",
+                    "--nocapture",
+                ])
+                .env("A24_RECEIPT_PROBE_CHILD", "1")
+                .env("IDORIS_URL", url)
+                .env("IDORIS_API_KEY", "idk_nonsecret_receipt_fixture")
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        server.abort();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_chat_does_not_fabricate_gateway_receipt() {
+        let state = state_with_stub().await;
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/chat")
+                    .header("authorization", "Bearer testtoken")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"messages":[{"role":"user","content":"probe"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key("x-idoris-record-id"));
     }
 
     // ── ME4-desktop-model-ui: /api/v1/chat and /api/v1/timings[/summary] ────
