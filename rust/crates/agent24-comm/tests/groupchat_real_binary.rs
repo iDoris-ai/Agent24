@@ -1,7 +1,7 @@
 //! COMM-G1 acceptance: every `/comm/groupchat/*` route against the REAL
 //! Hyphae CLI (the release asset matching `hyphae.lock.json`), in a
-//! throwaway HOME. Requires `HYPHAE_TEST_BIN`; without it each test prints
-//! why and returns early (same convention as `router_lifecycle.rs`).
+//! throwaway HOME. CI requires `HYPHAE_TEST_BIN`; local runs without it print
+//! a skip reason and return early (same convention as `router_lifecycle.rs`).
 //!
 //! Hyphae's partial-fan-out failure hook (`HYPHAE_FAIL_GROUP_RECIPIENT`) is
 //! an env var the runner's `env_clear()` would strip, so that one test runs
@@ -9,6 +9,8 @@
 //! real binary.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -60,7 +62,7 @@ async fn install(source: &std::path::Path, dir: &std::path::Path) -> VerifiedBin
 impl Fx {
     /// Fresh HOME with identities alice (default), bob and carol.
     async fn new() -> Option<Self> {
-        let source = PathBuf::from(std::env::var("HYPHAE_TEST_BIN").ok()?)
+        let source = PathBuf::from(common::hyphae_test_bin()?)
             .canonicalize()
             .expect("HYPHAE_TEST_BIN is readable");
         let tmp = tempfile::tempdir().unwrap();

@@ -220,6 +220,8 @@ const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     "os",
     // K1-6b.5c-2: `/api/v1/peer/runs`, the run views peer bridges relay.
     "peer",
+    // CORE-2 AgentEar S3: `/api/v1/presence/challenges/*`, the desktop confirmation channel.
+    "presence",
     "runs",
     "schedules",
     "sessions",

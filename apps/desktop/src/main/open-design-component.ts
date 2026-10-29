@@ -48,6 +48,7 @@ import { execFile, spawn } from 'node:child_process'
 import { once } from 'node:events'
 import fs from 'node:fs'
 import os from 'node:os'
+import { dataDir, joinLiteral, tryDataDir } from './data-dir'
 import path from 'node:path'
 import readline from 'node:readline'
 import { Readable } from 'node:stream'
@@ -179,11 +180,18 @@ export function loadOpenDesignComponentManifest(resourcesPath?: string): OpenDes
   }
 }
 
-/** Not a frozen module-level constant — reads os.homedir() fresh every
- * call, matching the constructor's own (pre-existing) behavior of
- * resolving it at construction time rather than at module load. */
-function defaultComponentsRoot(): string {
-  return path.join(os.homedir(), '.agent24', 'components', 'open-design')
+/** `<data_dir>/components/open-design` (ADR-037 data-dir contract). Not a
+ * frozen module-level constant — resolves the data dir fresh every call,
+ * matching the constructor's own (pre-existing) behavior of resolving it at
+ * construction time rather than at module load. */
+export function defaultComponentsRoot(): string {
+  return joinLiteral(dataDir(), 'components', 'open-design')
+}
+
+/** Like [defaultComponentsRoot] but null when the data dir is unresolvable. */
+function tryDefaultComponentsRoot(): string | null {
+  const dir = tryDataDir()
+  return dir === null ? null : joinLiteral(dir, 'components', 'open-design')
 }
 
 export function openDesignComponentInstallDir(componentsRoot: string, manifest: OpenDesignComponentManifest): string {
@@ -856,7 +864,7 @@ export class OpenDesignComponentInstaller {
     // standalone location must never have THIS installer start chmod'ing
     // that override's parent, which could be anything up to a shared
     // system temp directory it has no business touching.
-    if (this.componentsRoot === defaultComponentsRoot()) {
+    if (this.componentsRoot === tryDefaultComponentsRoot()) {
       const componentsRootParent = path.dirname(this.componentsRoot)
       fs.mkdirSync(componentsRootParent, { recursive: true, mode: 0o700 })
       fs.chmodSync(componentsRootParent, 0o700)

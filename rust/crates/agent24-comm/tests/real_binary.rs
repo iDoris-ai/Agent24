@@ -3,8 +3,8 @@
 //! the runner's envelope parsing matches real-world output.
 //!
 //! Requires the `HYPHAE_TEST_BIN` environment variable to point at a Hyphae
-//! binary (see the task's documented baseline sha256). Without it, this test
-//! prints why it's skipping and returns early — it never touches the real
+//! binary (see the task's documented baseline sha256). CI requires it; local
+//! runs without it print a skip reason and return early. It never touches the real
 //! `~/.hyphae` and never falls back to a binary found some other way.
 //!
 //! `HYPHAE_TEST_BIN` may be either of two legitimate "a real Hyphae binary"
@@ -21,6 +21,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -36,9 +38,61 @@ use agent24_comm::{
 /// lock — and is substituted in via the test-only lock override.
 const REFERENCE_SHA256: &str = "bc30dcf7bcf8b5c1865a3e995518c2bdab224bd8d6a3a064c4d7fc780de5e2b7";
 
+#[test]
+fn ci_requires_hyphae_test_bin() {
+    for bin in [None, Some("")] {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "real_hyphae_binary_envelopes_round_trip",
+                "--nocapture",
+            ])
+            .env("CI", "true")
+            .env_remove("HYPHAE_TEST_BIN");
+        if let Some(bin) = bin {
+            command.env("HYPHAE_TEST_BIN", bin);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            !output.status.success(),
+            "CI must fail without HYPHAE_TEST_BIN: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("HYPHAE_TEST_BIN must be set when CI=true"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn local_missing_hyphae_test_bin_reports_skip() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "real_hyphae_binary_envelopes_round_trip",
+            "--nocapture",
+        ])
+        .env_remove("CI")
+        .env_remove("HYPHAE_TEST_BIN")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "skipping real_hyphae_binary_envelopes_round_trip: HYPHAE_TEST_BIN is not set"
+        ),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test]
 async fn real_hyphae_binary_envelopes_round_trip() {
-    let Ok(test_bin) = std::env::var("HYPHAE_TEST_BIN") else {
+    let Some(test_bin) = common::hyphae_test_bin() else {
         eprintln!(
             "skipping real_hyphae_binary_envelopes_round_trip: HYPHAE_TEST_BIN is not set \
              (point it at a Hyphae binary matching sha256 {REFERENCE_SHA256} to run this test)"

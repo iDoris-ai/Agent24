@@ -6,7 +6,12 @@ license.workspace = true
 repository.workspace = true
 description = "Agent24 Rust daemon — v1 protocol server (B2: skeleton — health, auth handshake, graceful shutdown)"
 
+[features]
+# Unsigned binaries and automatic presence are exclusively for integration tests.
+test-enrollment = []
+
 [dependencies]
+agent24-os-proc = { path = "../../crates/agent24-os-proc" }
 agent24-agent = { path = "../../crates/agent24-agent" }
 # COMM-2a: `/api/v1/comm/*` — see `src/comm_routes.rs`.
 agent24-comm = { path = "../../crates/agent24-comm" }
@@ -37,6 +42,7 @@ clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 http-body-util = "0.1"
 rand = "0.9"
+zeroize = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 # ME4-4.2.3b (design §6.5): `GET /api/v1/usage?module=` reads the raw query
@@ -88,7 +94,10 @@ agent24-knowledge = { path = "../../crates/agent24-knowledge" }
 # fault-injectable `Store` trait to mock instead.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 
-zeroize = "1"
+# CORE-5d: snapshot maintenance connections and the raw-handle backup boundary
+# (uses the `sqlx` dependency declared above).
+agent24-os-sqlite = { path = "../../crates/agent24-os-sqlite" }
+
 tempfile = "3"
 
 [dev-dependencies]

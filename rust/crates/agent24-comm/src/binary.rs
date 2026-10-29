@@ -4,17 +4,19 @@
 //! the sha256 of a Hyphae binary built with a fixed, reproducible recipe
 //! (COMM-HYPHAE.md §8.1). [`VerifiedBinary::install`] is the *only* way to
 //! obtain a [`VerifiedBinary`]: it reads the candidate binary into memory
-//! once, hashes those bytes, and — only on a match — writes an O_EXCL,
-//! mode-0500 copy into `install_dir`. A copy that already exists there is
+//! once, hashes those bytes, and — only on a match — has an isolated child
+//! write a copy, re-verifies it, and publishes it as mode 0500 in `install_dir`.
+//! A copy that already exists there is
 //! re-hashed on every call; a mismatch there is a hard error (a tampered
 //! copy), never a silent overwrite (COMM-0 r2 decision M9: no TOCTOU window
 //! between verifying and executing).
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions, Permissions};
-use std::io;
+use std::fs::{self, File, OpenOptions, Permissions};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use sha2::{Digest, Sha256};
 
@@ -139,8 +141,8 @@ pub struct VerifiedBinary {
 impl VerifiedBinary {
     /// Reads `source` into memory once, hashes those bytes, and — only if
     /// they match `expected` — installs a verified copy into `install_dir`
-    /// as `hyphae-<sha16>` (mode 0500, written via O_EXCL so two concurrent
-    /// installs can't race each other into a half-written file).
+    /// as `hyphae-<sha16>` (mode 0500). Installs in the same directory are
+    /// locked; only a complete, re-verified child-written copy is published.
     ///
     /// If a copy already exists at that path it is re-hashed on *every*
     /// call rather than trusted; a mismatch there is reported as
@@ -177,6 +179,17 @@ fn install_blocking(
     expected: Sha256Digest,
     install_dir: &Path,
 ) -> Result<VerifiedBinary, BinaryError> {
+    install_blocking_with_io(source, expected, install_dir, &|path, options| {
+        options.open(path)
+    })
+}
+
+fn install_blocking_with_io(
+    source: &Path,
+    expected: Sha256Digest,
+    install_dir: &Path,
+    open: &impl Fn(&Path, &OpenOptions) -> io::Result<File>,
+) -> Result<VerifiedBinary, BinaryError> {
     let bytes = fs::read(source).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             BinaryError::Missing(source.to_path_buf())
@@ -195,43 +208,94 @@ fn install_blocking(
     fs::create_dir_all(install_dir).map_err(BinaryError::Io)?;
     let dest = install_dir.join(format!("hyphae-{}", expected.short()));
 
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o500)
-        .open(&dest)
-    {
-        Ok(mut file) => {
-            use std::io::Write;
-            file.write_all(&bytes).map_err(BinaryError::Io)?;
-            file.flush().map_err(BinaryError::Io)?;
-            drop(file);
-            // `create_new` + `mode` is still subject to the process umask on
-            // some platforms; pin the exact mode explicitly rather than rely
-            // on it.
-            fs::set_permissions(&dest, Permissions::from_mode(0o500)).map_err(BinaryError::Io)?;
-            Ok(VerifiedBinary {
+    // Keep this lock file: unlinking it would let new callers lock a different inode.
+    let lock = open(
+        &install_dir.join(".install.lock"),
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32),
+    )
+    .map_err(BinaryError::Io)?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
+        .map_err(|e| BinaryError::Io(e.into()))?;
+    match open(&dest, OpenOptions::new().read(true)) {
+        Ok(file) => {
+            verify_installed_file(file, expected)?;
+            return Ok(VerifiedBinary {
                 path: dest,
                 sha256: expected,
-            })
+            });
         }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            let existing = fs::read(&dest).map_err(BinaryError::Io)?;
-            let existing_hash = sha256_of(&existing);
-            if existing_hash == expected {
-                Ok(VerifiedBinary {
-                    path: dest,
-                    sha256: expected,
-                })
-            } else {
-                Err(BinaryError::HashMismatch {
-                    expected: expected.to_hex(),
-                    actual: existing_hash.to_hex(),
-                })
-            }
-        }
-        Err(e) => Err(BinaryError::Io(e)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(BinaryError::Io(e)),
     }
+
+    let staging = tempfile::Builder::new()
+        .prefix(".hyphae-")
+        .tempdir_in(install_dir)
+        .map_err(BinaryError::Io)?;
+    let input = staging.path().join("input");
+    let output = staging.path().join("executable");
+    let mut file = open(
+        &input,
+        OpenOptions::new().write(true).create_new(true).mode(0o600),
+    )
+    .map_err(BinaryError::Io)?;
+    file.write_all(&bytes).map_err(BinaryError::Io)?;
+    drop(bytes);
+    drop(file);
+    fs::set_permissions(&input, Permissions::from_mode(0o600)).map_err(BinaryError::Io)?;
+
+    // cp opens the output inode only AFTER exec and does not fork descendants.
+    // The parent writes only `input`, a different inode that is never executed.
+    // Thus concurrent forks of the daemon cannot inherit an output write fd.
+    // Waiting for cp to exit closes its write fd before verification/publication;
+    // CLOEXEC, close in the parent, or rename alone cannot provide this guarantee.
+    let status = Command::new("/bin/cp")
+        .arg(&input)
+        .arg(&output)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(BinaryError::Io)?;
+    if !status.success() {
+        return Err(BinaryError::Io(io::Error::other(format!(
+            "binary installer /bin/cp failed: {status}"
+        ))));
+    }
+    let file = open(&output, OpenOptions::new().read(true)).map_err(BinaryError::Io)?;
+    let file = verify_installed_file(file, expected)?;
+    // fsync through a read-only fd after cp exits: durability needs no write fd
+    // in the parent. The output stays non-executable until its hash is verified.
+    fs::set_permissions(&output, Permissions::from_mode(0o500)).map_err(BinaryError::Io)?;
+    file.sync_all().map_err(BinaryError::Io)?;
+    fs::rename(&output, &dest).map_err(BinaryError::Io)?;
+    open(install_dir, OpenOptions::new().read(true))
+        .and_then(|dir| dir.sync_all())
+        .map_err(BinaryError::Io)?;
+    Ok(VerifiedBinary {
+        path: dest,
+        sha256: expected,
+    })
+}
+
+fn verify_installed_file(mut file: File, expected: Sha256Digest) -> Result<File, BinaryError> {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(BinaryError::Io)?;
+    let actual = sha256_of(&bytes);
+    if actual != expected {
+        return Err(BinaryError::HashMismatch {
+            expected: expected.to_hex(),
+            actual: actual.to_hex(),
+        });
+    }
+    Ok(file)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -257,6 +321,161 @@ mod tests {
     use super::*;
 
     const SAMPLE_SHA: &str = "bc30dcf7bcf8b5c1865a3e995518c2bdab224bd8d6a3a064c4d7fc780de5e2b7";
+
+    #[test]
+    fn install_parent_never_opens_executable_inode_for_writing() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let bytes = b"verified executable bytes";
+        fs::write(&source, bytes).unwrap();
+        let opens = RefCell::new(Vec::new());
+        let installed = install_blocking_with_io(
+            &source,
+            sha256_of(bytes),
+            &tmp.path().join("bin"),
+            &|path, options| {
+                let file = options.open(path)?;
+                let meta = file.metadata()?;
+                opens.borrow_mut().push((
+                    meta.dev(),
+                    meta.ino(),
+                    rustix::fs::fcntl_getfl(&file)?.contains(rustix::fs::OFlags::WRONLY)
+                        || rustix::fs::fcntl_getfl(&file)?.contains(rustix::fs::OFlags::RDWR),
+                ));
+                Ok(file)
+            },
+        )
+        .unwrap();
+        let meta = fs::metadata(installed.path()).unwrap();
+        let opens = opens.borrow();
+        assert!(!opens.is_empty());
+        assert!(opens.iter().any(|entry| entry.2));
+        assert!(
+            opens.iter().any(|&(dev, ino, writable)| {
+                !writable && (dev, ino) == (meta.dev(), meta.ino())
+            })
+        );
+        assert_eq!(meta.permissions().mode() & 0o777, 0o500);
+        assert!(
+            opens.iter().all(|&(dev, ino, writable)| {
+                !writable || (dev, ino) != (meta.dev(), meta.ino())
+            }),
+            "parent opened the executable inode for writing: {opens:?}"
+        );
+        assert_eq!(
+            sha256_of(&fs::read(installed.path()).unwrap()),
+            sha256_of(bytes)
+        );
+    }
+
+    #[test]
+    fn install_rechecks_child_output_before_publication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        fs::write(&source, b"expected bytes").unwrap();
+        let expected = sha256_of(b"expected bytes");
+        let dir = tmp.path().join("bin");
+        let err = install_blocking_with_io(&source, expected, &dir, &|path, options| {
+            // Corrupt the child output before the parent's verification read.
+            if path.file_name().unwrap() == "executable" {
+                fs::write(path, b"corrupt copy").unwrap();
+            }
+            options.open(path)
+        })
+        .unwrap_err();
+        assert!(matches!(err, BinaryError::HashMismatch { .. }));
+        assert!(!dir.join(format!("hyphae-{}", expected.short())).exists());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1); // Only the persistent lock.
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_installs_publish_one_complete_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        fs::write(&source, b"concurrent install").unwrap();
+        let expected = sha256_of(b"concurrent install");
+        let dir = tmp.path().join("bin");
+        let mut installs = Vec::new();
+        for _ in 0..8 {
+            let (source, dir) = (source.clone(), dir.clone());
+            installs.push(tokio::spawn(async move {
+                let binary = VerifiedBinary::install(&source, expected, &dir)
+                    .await
+                    .unwrap();
+                assert_eq!(sha256_of(&fs::read(binary.path()).unwrap()), expected);
+                fs::metadata(binary.path()).unwrap().ino()
+            }));
+        }
+        let inode = installs.remove(0).await.unwrap();
+        for install in installs {
+            assert_eq!(install.await.unwrap(), inode);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn linux_installs_execute_under_concurrent_fork_pressure() {
+        use std::os::unix::process::CommandExt;
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const INSTALLS: usize = 100;
+        let tmp = tempfile::tempdir().unwrap();
+        // Use an ELF executable: shell scripts would exercise the interpreter.
+        let source = Path::new("/bin/true");
+        let expected = sha256_of(&fs::read(source).unwrap());
+        let stop = AtomicBool::new(false);
+        let ready = Barrier::new(5);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        ready.wait();
+                        let mut forks = 0;
+                        while !stop.load(Ordering::Acquire) {
+                            // Setting uid forces Rust's Linux spawn path through fork,
+                            // rather than posix_spawn. No credential change is needed.
+                            assert!(
+                                Command::new("/bin/true")
+                                    .uid(rustix::process::getuid().as_raw())
+                                    .status()
+                                    .unwrap()
+                                    .success()
+                            );
+                            forks += 1;
+                        }
+                        forks
+                    })
+                })
+                .collect();
+            ready.wait();
+            let result = (|| {
+                for n in 0..INSTALLS {
+                    let binary =
+                        install_blocking(source, expected, &tmp.path().join(n.to_string()))?;
+                    let status = Command::new(binary.path())
+                        .status()
+                        .map_err(BinaryError::Io)?;
+                    if !status.success() {
+                        return Err(BinaryError::Io(io::Error::other(format!(
+                            "installation {n}: {status}"
+                        ))));
+                    }
+                }
+                Ok::<_, BinaryError>(())
+            })();
+            stop.store(true, Ordering::Release);
+            for worker in workers {
+                assert!(worker.join().unwrap() > 0);
+            }
+            result.unwrap();
+        });
+    }
 
     #[test]
     fn digest_hex_roundtrip() {

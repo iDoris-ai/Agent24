@@ -23,6 +23,16 @@ mod comm_routes;
 mod consent_routes;
 mod decide_routes;
 mod domain;
+#[allow(dead_code, reason = "frozen CORE-2 slice seam; wired by S1/S2")]
+mod enroll_api;
+mod enroll_endpoint;
+// The feature trusts unsigned binaries and auto-answers presence: it must
+// never reach a release build (#1446 F2). The e2e builds it in debug.
+#[cfg(all(feature = "test-enrollment", not(debug_assertions)))]
+compile_error!("the `test-enrollment` feature is for debug test builds only");
+#[cfg(feature = "test-enrollment")]
+#[path = "../tests/support/enroll.rs"]
+mod enroll_test_support;
 mod events;
 mod events_emit;
 mod grant_expiry;
@@ -70,6 +80,13 @@ mod mcp;
 mod memory_callback;
 mod memory_maintenance;
 mod memory_routes;
+#[allow(
+    dead_code,
+    reason = "CORE-5b coordinator stays unwired; production startup still uses Store::open"
+)]
+mod migration_coordinator;
+#[allow(dead_code, reason = "CORE-5c building blocks stay unwired until 5d-5f")]
+mod migration_guard;
 mod model_callback;
 mod module_approval_broker;
 mod module_approvals;
@@ -80,12 +97,15 @@ mod os_memory_page;
 mod os_routes;
 mod overrides;
 mod peer_runs;
+mod presence_desktop;
 mod routes;
 mod runs;
 mod scheduler_callback;
 mod scheduler_deliver;
 mod schedules;
 mod server;
+
+const _: () = assert!(!migration_coordinator::ENABLED);
 mod timing_recorder;
 mod usage_recorder;
 
@@ -132,6 +152,11 @@ enum Command {
         /// Required for capability mode and hidden from ordinary CLI help.
         #[arg(long, hide = true, default_value_t = false)]
         host_bootstrap_stdio: bool,
+        /// Service mode: capability daemon with no parent pipes that opens
+        /// the enrolment endpoint `<data_dir>/enroll.sock`. Exclusive with
+        /// --host-bootstrap-stdio (which opens the endpoint by itself).
+        #[arg(long, default_value_t = false)]
+        enroll_endpoint: bool,
         /// Leave the bearer token out of the legacy `ready` line (it still goes
         /// to the 0600 `daemon.json`). Passed by the LaunchAgent plist, whose
         /// `StandardOutPath` would otherwise persist the token in a log file.
@@ -164,12 +189,14 @@ fn main() -> std::process::ExitCode {
             ephemeral,
             auth_mode,
             host_bootstrap_stdio,
+            enroll_endpoint,
             ready_omit_token,
         } => run_serve(
             port,
             ephemeral,
             auth_mode.into(),
             host_bootstrap_stdio,
+            enroll_endpoint,
             ready_omit_token,
         ),
     }
@@ -180,6 +207,7 @@ fn run_serve(
     ephemeral: bool,
     auth_mode: agent24_protocol::state_file::AuthMode,
     host_bootstrap_stdio: bool,
+    enroll_endpoint: bool,
     ready_omit_token: bool,
 ) -> std::process::ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
@@ -196,6 +224,7 @@ fn run_serve(
         ephemeral,
         auth_mode,
         host_bootstrap_stdio,
+        enroll_endpoint,
         ready_omit_token,
         cancel,
         None,

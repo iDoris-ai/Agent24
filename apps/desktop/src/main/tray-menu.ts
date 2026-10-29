@@ -1,13 +1,14 @@
 // The tray's text, built from the daemon status and the current UI language.
 // Pure (no Electron): main.ts feeds it to Tray/Menu, tests read it directly.
 
+import type { BackendStatusDetail } from './backend-manager'
 import { mt } from './main-i18n'
 import type { CliToolStatus } from '../shared/ipc-types'
 
-export type TrayStatus = 'running' | 'starting' | 'stopped' | 'blocked'
+export type TrayStatus = 'running' | 'starting' | 'stopped' | 'error' | 'blocked'
 
 const TITLES: Record<TrayStatus, string> = {
-  running: '⚡A24', starting: '…A24', stopped: '⚠️A24', blocked: '⚠️A24',
+  running: '⚡A24', starting: '…A24', stopped: '⚠️A24', error: '⚠️A24', blocked: '⚠️A24',
 }
 
 export interface TrayInput {
@@ -15,6 +16,7 @@ export interface TrayInput {
   external: boolean
   externalPid: number | null
   foreignPid: number | null
+  detail?: BackendStatusDetail | null
   backendKind: string
   cliTool?: Pick<CliToolStatus, 'state' | 'version'>
 }
@@ -39,15 +41,35 @@ export function buildTrayView(input: TrayInput): TrayView {
   const label = input.external
     ? mt('tray.external', { label: base, pid: input.externalPid ?? '?' })
     : input.foreignPid !== null ? mt('tray.foreign', { label: base, pid: input.foreignPid }) : base
-  const tooltip = `Agent24 — ${label.replace(/^[●○✕]\s*/, '')} (${input.backendKind})`
+  let tooltip = `Agent24 — ${label.replace(/^[●○✕]\s*/, '')} (${input.backendKind})`
+  const detail = input.status === 'error' ? input.detail : null
+  const summary = detail ? mt('tray.protocolShort', {
+    daemonVersion: detail.daemonVersion ?? mt('tray.protocolUnknown'),
+    clientVersion: detail.clientVersion, pid: detail.pid,
+  }) : null
+  if (detail && summary) {
+    tooltip += '\n' + mt('tray.protocolDetail', {
+      summary,
+      recorded: detail.recordedVersion === undefined
+        ? mt('tray.protocolUnrecorded')
+        : mt('tray.protocolRecorded', { version: detail.recordedVersion }),
+      hint: mt('tray.errorHint'),
+    })
+  }
   // DEP-A5 #2: stop/restart only ever act on a daemon this app spawned, so the
-  // external case is worded "disconnect", never implying a kill.
+  // external case is worded "disconnect", never implying a kill. An
+  // incompatible daemon is neither reused nor killed: no start/stop at all.
   const daemonItems: TrayItem[] =
-    input.status === 'stopped'
-      ? [{ label: mt('tray.start'), action: 'start' }]
-      : input.external
-        ? [{ label: mt('tray.disconnect'), action: 'disconnect' }]
-        : [{ label: mt('tray.restart'), action: 'restart' }, { label: mt('tray.stop'), action: 'stop' }]
+    input.status === 'error'
+      ? [
+        ...(summary ? [{ label: summary, enabled: false } satisfies TrayItem] : []),
+        { label: mt('tray.errorHint'), enabled: false },
+      ]
+      : input.status === 'stopped'
+        ? [{ label: mt('tray.start'), action: 'start' }]
+        : input.external
+          ? [{ label: mt('tray.disconnect'), action: 'disconnect' }]
+          : [{ label: mt('tray.restart'), action: 'restart' }, { label: mt('tray.stop'), action: 'stop' }]
   return {
     title: TITLES[input.status],
     tooltip,
