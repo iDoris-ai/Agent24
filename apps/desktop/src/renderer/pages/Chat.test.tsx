@@ -292,6 +292,39 @@ describe('ChatPage', () => {
   })
 })
 
+describe('ChatPage with Knowledge', () => {
+  beforeEach(() => { setLocale('zh') })
+
+  it('asks main before every turn, so a switch turned On after the page opened takes effect', async () => {
+    const status = vi.fn()
+      .mockResolvedValueOnce({ enabled: true, active: false })
+      .mockResolvedValue({ enabled: true, active: true })
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: mockBackendProxy, knowledge: { status } },
+      writable: true,
+      configurable: true,
+    })
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.path === '/api/v1/chat') return { ok: true, status: 200, data: { message: { content: 'plain' } } }
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: 'r1' } }
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: 'from the knowledge base' } } }
+    })
+
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'first' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('plain')).toBeInTheDocument())
+
+    fireEvent.change(textarea, { target: { value: 'second' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('from the knowledge base')).toBeInTheDocument(), { timeout: 3000 })
+    expect(screen.getByText(chatMessages.zh['knowledge.via'])).toBeInTheDocument()
+    expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: 'second', session_id: 's1' } }))
+  })
+})
+
 describe('ChatPage English default', () => {
   it('shows the English welcome copy', () => {
     render(<ChatPage />)

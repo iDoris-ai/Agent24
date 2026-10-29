@@ -54,7 +54,6 @@ export default function ChatPage() {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const requestInFlight = useRef(false)
   // Knowledge on: turns go to /runs, in a real session created once.
-  const [knowledgeOn, setKnowledgeOn] = useState(false)
   const [awaitingApproval, setAwaitingApproval] = useState(false)
   const runSession = useRef<string | null>(null)
   const awaitingConfirmation = messages.some(m => m.role === 'user' && m.delivery.kind === 'headroom')
@@ -62,16 +61,6 @@ export default function ChatPage() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
-
-  useEffect(() => {
-    const check = () => {
-      window.agent24.knowledge?.status()
-        .then((status) => setKnowledgeOn(status?.active === true), () => setKnowledgeOn(false))
-    }
-    check()
-    window.addEventListener('focus', check)
-    return () => window.removeEventListener('focus', check)
-  }, [])
 
   const send = async (text: string) => {
     if (!text.trim() || requestInFlight.current || awaitingConfirmation) return
@@ -103,6 +92,8 @@ export default function ChatPage() {
     // case a future daemon response reports its own (see chat-latency.ts).
     const sentAt = performance.now()
 
+    // Asked of main on every turn: it may have turned On since the page opened.
+    const knowledgeOn = await window.agent24.knowledge?.status().then((status) => status?.active === true, () => false)
     if (knowledgeOn) {
       await replyWithKnowledge(index, request)
       return
