@@ -24,8 +24,13 @@ fn fixture(name: &str) -> Value {
 /// What the fake server does with a request.
 #[derive(Clone)]
 enum Answer {
-    /// The fixture's response, echoing the request's id and generation.
+    /// The fixture's response, echoing the request's id and generation, and
+    /// answering within the scope asked.
     Fixture(&'static str),
+    /// The same, but whatever the fixture's scope and hits are.
+    Unscoped(&'static str),
+    /// An error fixture echoing another generation.
+    OtherGeneration(&'static str),
     /// The fixture's response with another request id.
     WrongEcho(&'static str),
     /// Never answers.
@@ -53,8 +58,18 @@ impl KnowledgeTransport for Server {
         if let Some(during) = self.during.lock().unwrap().take() {
             during();
         }
+        let mut scoped = false;
+        let mut generation = request["generation"].clone();
         let (name, echo) = match self.answer.clone() {
-            Answer::Fixture(name) => (name, request["request_id"].clone()),
+            Answer::Fixture(name) => {
+                scoped = true;
+                (name, request["request_id"].clone())
+            }
+            Answer::Unscoped(name) => (name, request["request_id"].clone()),
+            Answer::OtherGeneration(name) => {
+                generation = json!(999);
+                (name, request["request_id"].clone())
+            }
             Answer::WrongEcho(name) => (name, json!("another-request")),
             Answer::Hang => std::future::pending().await,
             Answer::Fail(e) => return Err(e),
@@ -67,7 +82,15 @@ impl KnowledgeTransport for Server {
             &mut body
         };
         echoes["request_id"] = echo;
-        echoes["generation"] = request["generation"].clone();
+        echoes["generation"] = generation;
+        if scoped && body.get("effective_scope").is_some() {
+            let asked = request["scope"]["knowledge_base_ids"].clone();
+            let ids: Vec<Value> = asked.as_array().unwrap().clone();
+            body["effective_scope"]["knowledge_base_ids"] = asked;
+            if let Some(hits) = body.get_mut("hits").and_then(Value::as_array_mut) {
+                hits.retain(|hit| ids.contains(&hit["knowledge_base_id"]));
+            }
+        }
         Ok(TransportResponse {
             status: u16::try_from(response["status"].as_u64().unwrap()).unwrap(),
             body: serde_json::to_vec(&body).unwrap(),
@@ -203,6 +226,47 @@ async fn the_knowledge_bases_named_are_cut_to_the_binding_and_none_left_sends_no
         agent24_knowledge::ErrorCode::Forbidden
     );
     assert_eq!(s.server.sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_answer_outside_the_scope_asked_is_refused() {
+    // The fixture answers for kb-a and kb-b; only kb-b was asked.
+    let s = setup(Answer::Unscoped("search.ok.json"));
+    let result = s.backend.search(RUN, query(Some(vec!["kb-b"]))).await;
+    assert!(
+        matches!(
+            &result,
+            Err(Failure::Local(Refusal {
+                reason: LocalReason::Incompatible,
+                ..
+            }))
+        ),
+        "{result:?}"
+    );
+    // The same answer to a search of both is inside.
+    s.backend.search(RUN, query(None)).await.unwrap();
+
+    // A read answered for a knowledge base the binding does not have.
+    let s = setup(Answer::Unscoped("read.chunk.json"));
+    let result = s.backend.read(RUN, chunk_read()).await;
+    assert!(
+        matches!(
+            &result,
+            Err(Failure::Local(Refusal {
+                reason: LocalReason::Incompatible,
+                ..
+            }))
+        ),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_error_answer_for_another_request_or_generation_is_dropped() {
+    let s = setup(Answer::WrongEcho("search.unauthorized-revoked.json"));
+    assert!(is_cancelled(s.backend.search(RUN, query(None)).await));
+    let s = setup(Answer::OtherGeneration("search.unauthorized-revoked.json"));
+    assert!(is_cancelled(s.backend.search(RUN, query(None)).await));
 }
 
 #[tokio::test]

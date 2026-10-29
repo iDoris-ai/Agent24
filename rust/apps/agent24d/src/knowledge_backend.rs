@@ -8,7 +8,7 @@
 //! dropped as `cancelled` when the activation or C it was sent under is gone by
 //! the time the answer is back: a deactivation, a revoke or a new push in
 //! between (STATE S4.8). The answer must also echo the request's id and
-//! generation. Nothing here logs; a failure carries a fixed code, never the
+//! generation, and stay inside the scope asked. Nothing here logs; a failure carries a fixed code, never the
 //! endpoint, C or the server's own text.
 
 // Consumed by the Knowledge tools (#1087 b).
@@ -228,6 +228,18 @@ impl DaemonKnowledgeBackend {
         if answer.status != 200 {
             let envelope: ErrorEnvelope = serde_json::from_slice(&answer.body)
                 .map_err(|_| local(LocalReason::Incompatible, false))?;
+            // The echoes may be `null` (R6.1), never another request's.
+            let details = serde_json::to_value(&envelope.error).unwrap_or_default();
+            let details = &details["details"];
+            let other_id = details["request_id"]
+                .as_str()
+                .is_some_and(|id| id != request_id);
+            let other_generation = details["generation"]
+                .as_u64()
+                .is_some_and(|generation| generation != sent.generation);
+            if other_id || other_generation {
+                return Err(cancelled(request_id, sent.generation, sent.generation));
+            }
             return Err(Failure::Envelope(envelope));
         }
         let response: Resp = serde_json::from_slice(&answer.body)
@@ -356,6 +368,22 @@ impl KnowledgeBackend for DaemonKnowledgeBackend {
                 |r: &SearchResponse| (r.request_id.as_str(), r.generation),
             )
             .await?;
+        // What comes back stays inside what was asked (R2.1, R3.8).
+        let asked = request.scope.knowledge_base_ids.as_slice();
+        let effective = response.effective_scope.knowledge_base_ids.as_slice();
+        let failed = response
+            .partial_failures
+            .as_ref()
+            .map_or(&[][..], NonEmpty::as_slice);
+        let inside = effective.iter().all(|id| asked.contains(id))
+            && response
+                .hits
+                .iter()
+                .all(|hit| effective.contains(&hit.knowledge_base_id))
+            && failed.iter().all(|f| asked.contains(&f.knowledge_base_id));
+        if !inside {
+            return Err(local(LocalReason::Incompatible, false));
+        }
         Ok((request, response))
     }
 
@@ -416,6 +444,11 @@ impl KnowledgeBackend for DaemonKnowledgeBackend {
                 |r: &ReadResponse| (r.request_id.as_str(), r.generation),
             )
             .await?;
+        let asked = request.scope.knowledge_base_ids.as_slice();
+        let effective = response.effective_scope.knowledge_base_ids.as_slice();
+        if !effective.iter().all(|id| asked.contains(id)) {
+            return Err(local(LocalReason::Incompatible, false));
+        }
         Ok((request, response))
     }
 }
