@@ -208,8 +208,9 @@ impl KnowledgeTransport for HttpTransport {
     }
 }
 
-/// Checks the base URL and returns it without a trailing `/`.
-fn validate_base_url(raw: &str) -> Result<String, HttpConfigError> {
+/// Checks the base URL as [`HttpTransport::new`] does and returns it without
+/// a trailing `/`.
+pub fn validate_base_url(raw: &str) -> Result<String, HttpConfigError> {
     let url = Url::parse(raw).map_err(|_| HttpConfigError::InvalidUrl)?;
     if url.cannot_be_a_base() {
         return Err(HttpConfigError::InvalidUrl);
