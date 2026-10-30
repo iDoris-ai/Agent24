@@ -79,7 +79,9 @@ pub trait KnowledgeBackend: Send + Sync {
 pub enum Refused {
     /// Arguments the model may correct.
     Invalid(String),
-    /// Local `cancelled`: it never reaches the model's context (STATE S5.7).
+    /// Local `cancelled`: no evidence of it reaches the model's context
+    /// (STATE S5.7). The daemon's tools turn it into a fixed refusal the
+    /// model may retry.
     Cancelled,
     /// The refusal the model reads.
     Failed(String),
