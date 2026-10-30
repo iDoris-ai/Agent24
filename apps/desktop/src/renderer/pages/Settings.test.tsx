@@ -658,8 +658,8 @@ describe('Settings voice link and previous blocks', () => {
     expect(screen.getByRole('button', { name: 'Open Voice' })).toBeInTheDocument()
 
     await openTab('Connections')
-    expect(screen.getByRole('heading', { name: 'Connections' })).toBeInTheDocument()
-    expect(screen.getByText('No connection settings in this build.')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Knowledge (WeKnora)' })).toBeInTheDocument()
+    expect(screen.getByLabelText('WeKnora API address')).toBeInTheDocument()
 
     await openTab('Advanced')
     expect(screen.getByRole('heading', { name: 'Advanced' })).toBeInTheDocument()

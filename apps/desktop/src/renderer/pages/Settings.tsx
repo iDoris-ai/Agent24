@@ -4,13 +4,15 @@ import { LOCALES, isLocale, setLocale, useLocale, useT } from '../i18n'
 import { settingsMessages } from './Settings.i18n'
 import { ActivityTab } from './settings/ActivityTab'
 import { CliToolSettings } from './settings/CliToolSettings'
+import { KnowledgeSettings } from './settings/KnowledgeSettings'
 import { ModelServiceSettings } from './settings/ModelServiceSettings'
 import { SidebarPrefs } from './settings/SidebarPrefs'
 
 // Tab ownership of the blocks that used to be one scrolling page:
 // General — language. Models — AI model service. Command line tool — the
-// CLI installer. Voice, Connections and Advanced had no settings blocks;
-// Voice links to that capability, and the other two say so.
+// CLI installer. Voice and Advanced have no settings blocks of their own;
+// Voice links to that capability, Connections holds the Knowledge (WeKnora)
+// settings, and Advanced says it has none.
 
 export const SETTINGS_TABS = ['general', 'models', 'voice', 'activity', 'cli', 'connections', 'advanced'] as const
 export type SettingsTab = (typeof SETTINGS_TABS)[number]
@@ -149,13 +151,7 @@ function VoiceTab() {
 }
 
 function ConnectionsTab() {
-  const t = useT(settingsMessages)
-  return (
-    <div className="settings-section">
-      <h3>{t('connections.title')}</h3>
-      <p className="settings-note">{t('connections.empty')}</p>
-    </div>
-  )
+  return <KnowledgeSettings />
 }
 
 function AdvancedTab() {
