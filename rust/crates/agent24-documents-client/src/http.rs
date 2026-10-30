@@ -106,6 +106,15 @@ impl Transport for HttpTransport {
             }
         };
         let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            // Every value, lossily: one that is not text still counts as there.
+            .map(|(name, value)| {
+                let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
+                (name.as_str().to_owned(), value)
+            })
+            .collect();
         let mut body = Vec::new();
         loop {
             match response.chunk().await {
@@ -120,7 +129,11 @@ impl Transport for HttpTransport {
                 Err(_) => return failed(502, "backend_unreachable", "the reply was cut short"),
             }
         }
-        Reply::Http { status, body }
+        Reply::Http {
+            status,
+            headers,
+            body,
+        }
     }
 }
 
