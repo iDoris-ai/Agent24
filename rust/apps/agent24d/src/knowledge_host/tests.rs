@@ -948,6 +948,36 @@ fn a_session_pin_is_exact() {
 }
 
 #[test]
+fn concurrent_first_runs_of_a_session_agree_on_one_activation() {
+    let registry = std::sync::Arc::new(KnowledgeHostRegistry::default());
+    let start = std::sync::Arc::new(std::sync::Barrier::new(16));
+    let calls: Vec<_> = (0..16u64)
+        .map(|n| {
+            let (registry, start) = (registry.clone(), start.clone());
+            std::thread::spawn(move || {
+                let binding = pin("host", "b1", 1 + n % 2);
+                start.wait();
+                (
+                    binding.generation,
+                    registry.pin_session("s1", &binding, false),
+                )
+            })
+        })
+        .collect();
+    let results: Vec<(u64, bool)> = calls.into_iter().map(|c| c.join().unwrap()).collect();
+    let won: Vec<u64> = results
+        .iter()
+        .filter(|(_, ok)| *ok)
+        .map(|(g, _)| *g)
+        .collect();
+    let first = won[0];
+    assert!(
+        results.iter().all(|(g, ok)| *ok == (*g == first)),
+        "{results:?}"
+    );
+}
+
+#[test]
 fn no_new_pin_for_a_session_with_knowledge_results_and_none_past_the_cap() {
     let registry = KnowledgeHostRegistry::default();
     assert!(!registry.pin_session("s1", &pin("host", "b1", 1), true));
