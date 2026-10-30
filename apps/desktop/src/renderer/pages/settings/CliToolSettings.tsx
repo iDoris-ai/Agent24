@@ -10,7 +10,7 @@ export function CliToolSettings() {
   const [busy, setBusy] = useState(false)
   async function refresh() {
     try { setStatus(await window.agent24.cliToolStatus()) }
-    catch { setStatus({ state: 'unavailable', path: null, version: null, bundledVersion: null }) }
+    catch { setStatus({ state: 'unavailable', path: null, version: null, bundledVersion: null, paths: [] }) }
   }
   useEffect(() => {
     void refresh()
@@ -18,10 +18,10 @@ export function CliToolSettings() {
     window.addEventListener('focus', refresh)
     return () => { clearInterval(timer); window.removeEventListener('focus', refresh) }
   }, [])
-  async function install() {
+  async function install(userOnly = false) {
     setBusy(true)
     setResult(null)
-    try { setResult(await window.agent24.installCliTool()) }
+    try { setResult(await (userOnly ? window.agent24.repairUserCli() : window.agent24.installCliTool())) }
     catch { setResult({ state: 'failed' }) }
     finally { await refresh(); setBusy(false) }
   }
@@ -29,10 +29,19 @@ export function CliToolSettings() {
     <h3 id="cli-tool-title">{t('title')}</h3>
     <div className="setting-row" style={{ flexWrap: 'wrap', gap: 12 }}>
       <div style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
-        <label>{t('path')}</label>
-        <p><code>{status?.path ?? t('absent')}</code> · {status?.version ?? '—'}</p>
         <p>{t('bundled')}: {status?.bundledVersion ?? '—'}</p>
-        {status && <p role="status">{t(status.state, { version: status.version ?? '?' })}</p>}
+        {status && !status.paths.some((item) => item.path === status.path) && <div>
+          <p>{t('path')}: <code>{status.path ?? t('absent')}</code> · {status.version ?? t('unknownVersion')}</p>
+          <p role="status">{t(status.state, { version: status.version ?? '?' })}</p>
+        </div>}
+        {status?.paths.map((item) => <div key={item.path}>
+          <p><code>{item.path}</code> · {item.version ?? t('unknownVersion')}</p>
+          <p><span>{t(`link.${item.link}`)}</span> · <span>{t(item.state, { version: item.version ?? t('unknownVersion') })}</span></p>
+          {item.path.endsWith('/.agent24/bin/agent24') && item.state === 'outdated' && <div role="alert">
+            <p>{t('userWarning', { version: item.version ?? t('unknownVersion') })}</p>
+            <button className="btn btn-primary" disabled={busy} onClick={() => { void install(true) }}>{t('repairUser')}</button>
+          </div>}
+        </div>)}
       </div>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
         <button className="btn btn-ghost" disabled={busy} onClick={() => { void refresh() }}>{t('refresh')}</button>

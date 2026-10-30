@@ -698,6 +698,19 @@ async fn approve_and_resume(env: &ResumeEnv) -> Run {
         created_at: now_iso8601(),
         decided_at: None,
     };
+    env.store
+        .insert_tool_call(&agent24_protocol::ToolCall {
+            id: approval.tool_call_id.clone(),
+            run_id: approval.run_id.clone(),
+            tool: "shell_exec".to_owned(),
+            input: approval.payload.clone(),
+            status: agent24_protocol::ToolCallStatus::Running,
+            output_summary: None,
+            started_at: now_iso8601(),
+            ended_at: None,
+        })
+        .await
+        .unwrap();
     env.store.insert_approval(&approval).await.unwrap();
     env.broker
         .resolve(
