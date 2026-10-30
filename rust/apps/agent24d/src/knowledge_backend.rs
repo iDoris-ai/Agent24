@@ -462,7 +462,7 @@ impl KnowledgeBackend for DaemonKnowledgeBackend {
         // is refused rather than shown.
         let other_chunk = match &request.target {
             ReadTarget::Chunk { chunk_id, .. } => {
-                response.segments.iter().any(|s| s.chunk_id != *chunk_id)
+                !matches!(response.segments.as_slice(), [s] if s.chunk_id == *chunk_id)
             }
             ReadTarget::Document { .. } => false,
         };

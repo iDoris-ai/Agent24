@@ -35,8 +35,8 @@ enum Answer {
     NullEcho(&'static str),
     /// The fixture's response with another request id.
     WrongEcho(&'static str),
-    /// As `Fixture`, with the string at a JSON pointer of the body replaced.
-    Altered(&'static str, &'static str, &'static str),
+    /// As `Fixture`, with the value at a JSON pointer of the body replaced.
+    Altered(&'static str, &'static str, fn() -> Value),
     /// Never answers.
     Hang,
     Fail(TransportError),
@@ -106,7 +106,7 @@ impl KnowledgeTransport for Server {
             }
         }
         if let Some((pointer, value)) = altered {
-            *body.pointer_mut(pointer).unwrap() = json!(value);
+            *body.pointer_mut(pointer).unwrap() = value();
         }
         Ok(TransportResponse {
             status: u16::try_from(response["status"].as_u64().unwrap()).unwrap(),
@@ -289,10 +289,13 @@ async fn a_read_answered_with_another_document_or_chunk_is_refused() {
             }))
         )
     };
-    for (pointer, value) in [
-        ("/knowledge_id", "doc-other"),
-        ("/segments/0/chunk_id", "chk-other"),
-    ] {
+    let cases: [(&str, fn() -> Value); 3] = [
+        ("/knowledge_id", || json!("doc-other")),
+        ("/segments/0/chunk_id", || json!("chk-other")),
+        // That chunk alone (R4.3), so not none of it either.
+        ("/segments", || json!([])),
+    ];
+    for (pointer, value) in cases {
         let s = setup(Answer::Altered("read.chunk.json", pointer, value));
         let result = s.backend.read(RUN, chunk_read()).await;
         assert!(incompatible(&result), "{pointer}: {result:?}");
@@ -306,14 +309,12 @@ async fn a_read_answered_with_another_document_or_chunk_is_refused() {
     let s = setup(Answer::Altered(
         "read.chunk.json",
         "/segments/0/chunk_id",
-        "chk-other",
+        || json!("chk-other"),
     ));
     s.backend.read(RUN, document.clone()).await.unwrap();
-    let s = setup(Answer::Altered(
-        "read.chunk.json",
-        "/knowledge_id",
-        "doc-other",
-    ));
+    let s = setup(Answer::Altered("read.chunk.json", "/knowledge_id", || {
+        json!("doc-other")
+    }));
     assert!(incompatible(&s.backend.read(RUN, document).await));
 }
 
