@@ -28,3 +28,10 @@
 .comm-notice { color: var(--success, #42b883); background: rgba(66,184,131,.1); }
 .comm-fresh-indicator { color: var(--muted); font-size: 12px; }
 @media (max-width: 760px) { .comm-status-grid { grid-template-columns: 1fr; } }
+
+.comm-steps { display: flex; flex-wrap: wrap; gap: 32px; padding-left: 20px; color: var(--muted); }
+.comm-steps [aria-current="step"] { color: var(--text); font-weight: 600; }
+.comm-setup-form { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin: 16px 0; }
+.comm-setup-form label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.comm-setup-form input, .comm-setup-form select { padding: 8px; max-width: 100%; }
+.comm-setup-form p { flex-basis: 100%; }

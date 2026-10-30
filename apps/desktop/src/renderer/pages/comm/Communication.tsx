@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   CommApiError,
+  createCommIdentity, importCommIdentity, setCommRelay, probeCommRelay,
   getCommStatus,
   installComm,
   listCommContacts,
@@ -17,8 +18,9 @@ import {
 import { translate, useT } from '../../i18n'
 import { communicationMessages } from './Communication.i18n'
 import './communication.css'
+import { getDefaultRelays } from './relayDefaults'
 
-type WriteAction = 'start' | 'stop' | 'unlock' | 'install'
+type WriteAction = 'start' | 'stop' | 'unlock' | 'install' | 'create' | 'import' | 'relay'
 
 function messageOf(error: unknown, secret = ''): string {
   const text = error instanceof Error ? error.message : String(error)
@@ -90,6 +92,18 @@ export default function CommunicationPage() {
   const [remember, setRemember] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [nickname, setNickname] = useState('')
+  const [importOpen, setImportOpen] = useState(false)
+  const [importFrom, setImportFrom] = useState('')
+  const [importPassword, setImportPassword] = useState('')
+  const [importConfirmed, setImportConfirmed] = useState(false)
+  const defaults = getDefaultRelays()
+  const [selectedRelay, setSelectedRelay] = useState('')
+  const [handshakeFailed, setHandshakeFailed] = useState(false)
+  // A stale choice (no longer offered after a refresh) falls back to the default option.
+  const relayOptions = [...defaults.map((relay) => relay.url), ...(relays?.relays ?? [])]
+  const relayUrl = (selectedRelay && relayOptions.includes(selectedRelay) ? selectedRelay : '')
+    || (relays?.configured ? relays.relays[0] : '') || defaults[0]?.url || ''
   const sequence = useRef(0)
   const mounted = useRef(false)
 
@@ -138,14 +152,31 @@ export default function CommunicationPage() {
     setPending(action)
     setActionError(null)
     setNotice(null)
-    const submittedPassword = action === 'unlock' ? password : ''
+    const submittedPassword = action === 'unlock' ? password : action === 'import' ? importPassword : ''
     if (action === 'unlock') setPassword('')
+    if (action === 'import') setImportPassword('')
     try {
       if (action === 'install') {
         const result = await installComm()
         if (mounted.current && token === sequence.current) {
           setNotice(result.restart_required ? t('notice.restart', { reason: result.reason ?? '' }) : t('notice.installed'))
         }
+      } else if (action === 'create') {
+        await createCommIdentity(nickname.trim())
+      } else if (action === 'import') {
+        await importCommIdentity(importFrom.trim(), submittedPassword)
+      } else if (action === 'relay') {
+        // PUT replaces the whole list server-side (and restarts the daemon):
+        // keep the existing entries, and skip the write if nothing changes.
+        const existing = relays?.configured ? relays.relays : []
+        if (existing[0] !== relayUrl) {
+          await setCommRelay([relayUrl, ...existing.filter((url) => url !== relayUrl)].slice(0, 8))
+        }
+        setHandshakeFailed(true)
+        const probe = await probeCommRelay(relayUrl)
+        if (probe.connected) setHandshakeFailed(false)
+        if (!probe.connected) throw new Error(`${t('probe.failure')}${probe.error ? `: ${probe.error}` : ''}`)
+        if (mounted.current && token === sequence.current) setNotice(t('probe.success'))
       } else if (action === 'start') {
         await startCommDaemon()
         if (mounted.current && token === sequence.current) setNotice(t('notice.start'))
@@ -178,6 +209,14 @@ export default function CommunicationPage() {
 
   const isFresh = !loadError && notConfigured === null && !refreshing && daemon !== null
   const setupOnly = notConfigured !== null && !loadError
+  // Installation progress is transient IPC state. All completed steps come
+  // from daemon reads, including after a write fails or the page remounts.
+  const setupState = pending === 'install' ? 'installing'
+    : notConfigured?.kind === 'binary' ? 'not_installed'
+    : identities !== null && daemon !== null && relays !== null && !loadError && notConfigured === null
+      ? !identities.some((identity) => identity.default) ? 'no_identity'
+        : !relays.configured ? 'no_relay' : 'ready'
+      : null
   return (
     <main className="content comm-page">
       <header className="comm-heading">
@@ -191,6 +230,37 @@ export default function CommunicationPage() {
       {actionError && <div role="alert" className="comm-alert">{t('error.action', { message: actionError })}</div>}
       {pending === 'install' && <p role="status">{t('action.installing')}</p>}
       {notice && <div role="status" className="comm-notice">{notice}</div>}
+
+      {setupState && <section className="comm-card" data-testid="comm-setup" data-state={setupState} aria-label={t('wizard.title')}>
+        <h2>{t('wizard.title')}</h2>
+        <ol className="comm-steps">
+          <li aria-current={setupState === 'not_installed' || setupState === 'installing' ? 'step' : undefined}>{t('wizard.download')}{setupState !== 'not_installed' && setupState !== 'installing' ? ' ✓' : ''}</li>
+          <li aria-current={setupState === 'no_identity' ? 'step' : undefined}>{t('wizard.identity')}{setupState === 'no_relay' || setupState === 'ready' ? ' ✓' : ''}</li>
+          <li aria-current={setupState === 'no_relay' ? 'step' : undefined}>{t('wizard.relay')}{setupState === 'ready' && !handshakeFailed ? ' ✓' : ''}</li>
+        </ol>
+        {setupState === 'no_identity' && <>
+          <form className="comm-setup-form" onSubmit={(event) => { event.preventDefault(); void runAction('create') }}>
+            <label>{t('wizard.name')}<input value={nickname} onChange={(event) => setNickname(event.target.value)} /></label>
+            <button disabled={pending !== null || refreshing || !nickname.trim()}>{t('wizard.identity')}</button>
+          </form>
+          <button type="button" disabled={pending !== null} onClick={() => setImportOpen(!importOpen)}>{t('wizard.importKey')}</button>
+          {importOpen && <form className="comm-setup-form" onSubmit={(event) => { event.preventDefault(); void runAction('import') }}>
+            <p className="comm-muted">{t('wizard.importGuide')}</p>
+            <label>{t('wizard.importFrom')}<input value={importFrom} onChange={(event) => setImportFrom(event.target.value)} /></label>
+            <label>{t('wizard.importPassword')}<input type="password" autoComplete="off" value={importPassword} onChange={(event) => setImportPassword(event.target.value)} /></label>
+            <label><input type="checkbox" checked={importConfirmed} onChange={(event) => setImportConfirmed(event.target.checked)} />{t('wizard.importConfirm')}</label>
+            <button disabled={pending !== null || refreshing || !importFrom.trim() || !importConfirmed}>{t('wizard.import')}</button>
+          </form>}
+        </>}
+        {(setupState === 'no_relay' || setupState === 'ready') && <form className="comm-setup-form" onSubmit={(event) => { event.preventDefault(); void runAction('relay') }}>
+          <label>{t('wizard.relayServer')}<select value={relayUrl} onChange={(event) => setSelectedRelay(event.target.value)}>
+            {defaults.map((relay) => <option key={relay.name} value={relay.url}>{relay.name} · {relay.url}</option>)}
+            {relays?.relays.filter((url) => !defaults.some((relay) => relay.url === url)).map((url) => <option key={url} value={url}>{url}</option>)}
+          </select></label>
+          <button disabled={pending !== null || refreshing || !relayUrl}>{t('wizard.relay')}</button>
+        </form>}
+        {setupState === 'ready' && <p className="comm-muted">{handshakeFailed ? t('wizard.relaySavedFailed') : t('wizard.ready')}</p>}
+      </section>}
 
       {notConfigured && (
         <section className="comm-card" role="status" aria-label={t(notConfigured.kind === 'config' ? 'setup.configTitle' : 'setup.title')}>

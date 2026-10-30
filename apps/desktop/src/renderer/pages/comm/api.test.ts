@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   CommApiError,
   getCommStatus,
+  importCommIdentity,
   installComm,
   listCommContacts,
   listCommIdentities,
@@ -177,5 +178,14 @@ describe('COMM typed backend API', () => {
     const failure = await listCommIdentities().catch((e: unknown) => e)
     expect(failure).toBeInstanceOf(CommApiError)
     expect(failure).toMatchObject({ code: 'not_configured', message: 'no Hyphae binary is configured; set A24_HYPHAE_BIN', status: 409 })
+  })
+
+  it('importCommIdentity never reflects the source keystore password in a thrown error', async () => {
+    const password = 'import-secret-pw'
+    setProxy(() => ({ ok: false, status: 409, data: { ok: false, error: 'locked', message: `bad password ${password}` } }))
+    const failure = await importCommIdentity('/Users/alice', password).catch((e: unknown) => e)
+    expect(failure).toBeInstanceOf(CommApiError)
+    expect((failure as Error).message).not.toContain(password)
+    expect(failure).toMatchObject({ code: 'locked', status: 409 })
   })
 })
