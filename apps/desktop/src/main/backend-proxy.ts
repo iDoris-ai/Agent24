@@ -97,7 +97,7 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('POST', '/api/v1/comm/identity'), // [E]
   r('POST', '/api/v1/comm/import'), // [E]
   r('PUT', '/api/v1/comm/relay'), // [E]
-  r('POST', '/api/v1/comm/relay/probe'),
+  r('POST', '/api/v1/comm/relay/probe'), // [E]
   r('GET', '/api/v1/comm/contact'),
   r('GET', '/api/v1/comm/relay'),
   r('GET', '/api/v1/comm/daemon'),

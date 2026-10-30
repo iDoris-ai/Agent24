@@ -99,7 +99,11 @@ export default function CommunicationPage() {
   const [importConfirmed, setImportConfirmed] = useState(false)
   const defaults = getDefaultRelays()
   const [selectedRelay, setSelectedRelay] = useState('')
-  const relayUrl = selectedRelay || (relays?.configured ? relays.relays[0] : '') || defaults[0]?.url || ''
+  const [handshakeFailed, setHandshakeFailed] = useState(false)
+  // A stale choice (no longer offered after a refresh) falls back to the default option.
+  const relayOptions = [...defaults.map((relay) => relay.url), ...(relays?.relays ?? [])]
+  const relayUrl = (selectedRelay && relayOptions.includes(selectedRelay) ? selectedRelay : '')
+    || (relays?.configured ? relays.relays[0] : '') || defaults[0]?.url || ''
   const sequence = useRef(0)
   const mounted = useRef(false)
 
@@ -162,8 +166,15 @@ export default function CommunicationPage() {
       } else if (action === 'import') {
         await importCommIdentity(importFrom.trim(), submittedPassword)
       } else if (action === 'relay') {
-        await setCommRelay(relayUrl)
+        // PUT replaces the whole list server-side (and restarts the daemon):
+        // keep the existing entries, and skip the write if nothing changes.
+        const existing = relays?.configured ? relays.relays : []
+        if (existing[0] !== relayUrl) {
+          await setCommRelay([relayUrl, ...existing.filter((url) => url !== relayUrl)].slice(0, 8))
+        }
+        setHandshakeFailed(true)
         const probe = await probeCommRelay(relayUrl)
+        if (probe.connected) setHandshakeFailed(false)
         if (!probe.connected) throw new Error(`${t('probe.failure')}${probe.error ? `: ${probe.error}` : ''}`)
         if (mounted.current && token === sequence.current) setNotice(t('probe.success'))
       } else if (action === 'start') {
@@ -225,7 +236,7 @@ export default function CommunicationPage() {
         <ol className="comm-steps">
           <li aria-current={setupState === 'not_installed' || setupState === 'installing' ? 'step' : undefined}>{t('wizard.download')}{setupState !== 'not_installed' && setupState !== 'installing' ? ' ✓' : ''}</li>
           <li aria-current={setupState === 'no_identity' ? 'step' : undefined}>{t('wizard.identity')}{setupState === 'no_relay' || setupState === 'ready' ? ' ✓' : ''}</li>
-          <li aria-current={setupState === 'no_relay' ? 'step' : undefined}>{t('wizard.relay')}{setupState === 'ready' ? ' ✓' : ''}</li>
+          <li aria-current={setupState === 'no_relay' ? 'step' : undefined}>{t('wizard.relay')}{setupState === 'ready' && !handshakeFailed ? ' ✓' : ''}</li>
         </ol>
         {setupState === 'no_identity' && <>
           <form className="comm-setup-form" onSubmit={(event) => { event.preventDefault(); void runAction('create') }}>
@@ -248,7 +259,7 @@ export default function CommunicationPage() {
           </select></label>
           <button disabled={pending !== null || refreshing || !relayUrl}>{t('wizard.relay')}</button>
         </form>}
-        {setupState === 'ready' && <p className="comm-muted">{t('wizard.ready')}</p>}
+        {setupState === 'ready' && <p className="comm-muted">{handshakeFailed ? t('wizard.relaySavedFailed') : t('wizard.ready')}</p>}
       </section>}
 
       {notConfigured && (

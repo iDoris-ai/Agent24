@@ -10,8 +10,8 @@ vi.mock('./relayDefaults', async (original) => {
   return { ...actual, getDefaultRelays: () => actual.getDefaultRelays(fixtures.aa) }
 })
 const identity = { nickname: 'Alice', npub: 'npub1alice', default: true, encrypted: true }
-function setup({ installed = true, identities = [identity], configured = true, connected = true } = {}) {
-  const proxy = vi.fn(async ({ method, path }: { method: string; path: string; body?: unknown }) => {
+function setup({ installed = true, identities = [identity], configured = true, connected = true, relayList = ['wss://relay.aastar.io'] } = {}) {
+  const proxy = vi.fn(async ({ method, path, body }: { method: string; path: string; body?: unknown }) => {
     let data: unknown = {}
     if (method === 'GET') {
       if (path.endsWith('/daemon')) data = {
@@ -22,10 +22,10 @@ function setup({ installed = true, identities = [identity], configured = true, c
       else if (!installed) return { ok: false, status: 409, data: { ok: false, error: 'not_configured', message: 'no Hyphae binary is configured' } }
       else if (path.endsWith('/identity')) data = identities
       else if (path.endsWith('/contact')) data = []
-      else data = { relays: ['wss://relay.aastar.io'], source: configured ? 'config' : 'default', configured }
+      else data = { relays: relayList, source: configured ? 'config' : 'default', configured }
     } else if (path.endsWith('/identity')) data = identity
     else if (method === 'PUT') data = { relays: ['wss://relay.aastar.io'], source: 'config', configured: true }
-    else if (path.endsWith('/probe')) data = { url: 'wss://relay.aastar.io', connected, error: connected ? null : 'connection refused' }
+    else if (path.endsWith('/probe')) data = { url: (body as { url: string }).url, connected, error: connected ? null : 'connection refused' }
     else if (path.endsWith('/import')) data = { identities: 1, contacts: 0, outbox: 0, db_files: [] }
     return { ok: true, status: 200, data: { ok: true, data } }
   })
@@ -71,6 +71,59 @@ it('saves the selected relay then probes through backendProxy and shows handshak
     { method: 'PUT', path: '/api/v1/comm/relay', body: { relays: ['wss://relay.aastar.io'] } },
     { method: 'POST', path: '/api/v1/comm/relay/probe', body: { url: 'wss://relay.aastar.io' } },
   ])
+})
+const A = 'wss://a.example'
+const B = 'wss://b.example'
+const writes = (proxy: ReturnType<typeof setup>) => proxy.mock.calls.map(([call]) => call).filter((call) => call.method !== 'GET')
+it('B1: connecting the already-first relay skips the PUT (no daemon restart) and only probes', async () => {
+  const proxy = setup({ relayList: [A, B] })
+  render(<CommunicationPage />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Connect relay' }))
+  await waitFor(() => expect(writes(proxy)).toHaveLength(1))
+  expect(writes(proxy)).toEqual([{ method: 'POST', path: '/api/v1/comm/relay/probe', body: { url: A } }])
+})
+it('B1: choosing another configured relay moves it first and keeps the rest of the list', async () => {
+  const proxy = setup({ relayList: [A, B] })
+  render(<CommunicationPage />)
+  fireEvent.change(await screen.findByRole('combobox', { name: 'Relay server' }), { target: { value: B } })
+  fireEvent.click(screen.getByRole('button', { name: 'Connect relay' }))
+  await waitFor(() => expect(writes(proxy)).toHaveLength(2))
+  expect(writes(proxy)[0]).toEqual({ method: 'PUT', path: '/api/v1/comm/relay', body: { relays: [B, A] } })
+})
+it('B1: the saved list is capped at 8 entries', async () => {
+  const many = Array.from({ length: 8 }, (_, i) => `wss://r${i}.example`)
+  const proxy = setup({ relayList: many })
+  render(<CommunicationPage />)
+  fireEvent.change(await screen.findByRole('combobox', { name: 'Relay server' }), { target: { value: 'wss://relay.aastar.io' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Connect relay' }))
+  await waitFor(() => expect(writes(proxy).length).toBeGreaterThan(0))
+  const put = writes(proxy)[0].body as { relays: string[] }
+  expect(put.relays).toHaveLength(8)
+  expect(put.relays[0]).toBe('wss://relay.aastar.io')
+})
+it('F1: a failed handshake removes the relay check mark and the "setup is complete" claim', async () => {
+  setup({ connected: false })
+  render(<CommunicationPage />)
+  const card = await screen.findByTestId('comm-setup')
+  await waitFor(() => expect(card.textContent).toContain('Connect relay ✓'))
+  expect(card.textContent).toContain('Setup is complete')
+  fireEvent.click(screen.getByRole('button', { name: 'Connect relay' }))
+  await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('connection refused'))
+  expect(card.textContent).not.toContain('Connect relay ✓')
+  expect(card.textContent).not.toContain('Setup is complete')
+  expect(card.textContent).toContain('Relay saved, but the handshake failed')
+})
+it('N2: a stale relay choice no longer offered after refresh falls back to the default option', async () => {
+  setup({ relayList: [A, B] })
+  render(<CommunicationPage />)
+  fireEvent.change(await screen.findByRole('combobox', { name: 'Relay server' }), { target: { value: B } })
+  const C = 'wss://c.example'
+  const proxy = setup({ relayList: [C] })
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+  await waitFor(() => expect(screen.getByRole('combobox', { name: 'Relay server' })).toHaveValue(C))
+  fireEvent.click(screen.getByRole('button', { name: 'Connect relay' }))
+  await waitFor(() => expect(writes(proxy)).toHaveLength(1))
+  expect(writes(proxy)).toEqual([{ method: 'POST', path: '/api/v1/comm/relay/probe', body: { url: C } }])
 })
 it('imports an existing Hyphae home with explicit confirmation and clears the password', async () => {
   const proxy = setup({ identities: [] })

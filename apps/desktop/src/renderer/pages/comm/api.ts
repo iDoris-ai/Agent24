@@ -291,8 +291,9 @@ export const createCommIdentity = (nickname: string) =>
   request('POST', '/api/v1/comm/identity', (value): value is { nickname: string; npub: string } =>
     isRecord(value) && string(value['nickname']) && string(value['npub']), { nickname, default: true })
 
-export const setCommRelay = (url: string) =>
-  request('PUT', '/api/v1/comm/relay', isRelayConfig, { relays: [url] })
+/** Replaces the whole relay list server-side; callers pass the full ordered list. */
+export const setCommRelay = (relays: string[]) =>
+  request('PUT', '/api/v1/comm/relay', isRelayConfig, { relays })
 
 export const probeCommRelay = (url: string) =>
   request('POST', '/api/v1/comm/relay/probe', (value): value is { url: string | null; connected: boolean; error: string | null } =>
