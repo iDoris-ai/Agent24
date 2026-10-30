@@ -12,6 +12,9 @@ test-enrollment = []
 
 [dependencies]
 agent24-os-proc = { path = "../../crates/agent24-os-proc" }
+thiserror = "2"
+tower = { version = "0.5", features = ["util"] }
+agent24-components = { path = "../../crates/agent24-components" }
 agent24-agent = { path = "../../crates/agent24-agent" }
 # COMM-2a: `/api/v1/comm/*` — see `src/comm_routes.rs`.
 agent24-comm = { path = "../../crates/agent24-comm" }
@@ -101,6 +104,7 @@ agent24-os-sqlite = { path = "../../crates/agent24-os-sqlite" }
 tempfile = "3"
 
 [dev-dependencies]
+agent24-comm = { path = "../../crates/agent24-comm", features = ["test-lock-override"] }
 jsonschema = { version = "0.59", default-features = false }
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
@@ -108,7 +112,6 @@ tar = { version = "0.4", default-features = false }
 # handlers' own `h.call` fixtures, on `agent24-os-proto`'s in-memory fake
 # kernel (forwarded through the SDK's `test-util` feature, L8).
 agent24-os-sdk = { path = "../../crates/agent24-os-sdk", features = ["test-util"] }
-tower = { version = "0.5", features = ["util"] }
 # A paused clock, for deadlines asserted exactly rather than with slack.
 tokio = { version = "1", features = ["test-util"] }
 # T9/ME-3f: the black-box test observes event forwarding at the real

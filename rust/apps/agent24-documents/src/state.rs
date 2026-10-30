@@ -160,6 +160,17 @@ impl AppState {
         Self::opened(data_dir, REOPEN_INTERVAL, events, layers).await
     }
 
+    /// [`AppState::open_with_events`] that reopens failed storage every
+    /// `reopen_interval`.
+    #[cfg(test)]
+    pub(crate) async fn open_with_events_every(
+        data_dir: &Path,
+        events: Events,
+        reopen_interval: Duration,
+    ) -> Self {
+        Self::opened(data_dir, reopen_interval, events, Layers::new(None)).await
+    }
+
     pub(crate) async fn open_with(data_dir: &Path, reopen_interval: Duration) -> Self {
         Self::opened(
             data_dir,

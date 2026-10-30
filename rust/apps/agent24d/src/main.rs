@@ -39,6 +39,7 @@ mod grant_expiry;
 mod hardware;
 #[cfg(unix)]
 mod host_bootstrap;
+mod hyphae_install;
 mod idoris_routes;
 mod knowledge_backend;
 mod knowledge_host;

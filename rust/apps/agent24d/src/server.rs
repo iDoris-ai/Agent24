@@ -4024,7 +4024,7 @@ pub(crate) mod tests {
     // COMM routes are mounted by server::serve, outside the scanned builder, so
     // their literals are scanned from the agent24-comm sources instead
     // (`comm_route_literals`); they are covered by the same gate, no exemption.
-    const COMM_ROUTE_SOURCES: [(&str, &str); 2] = [
+    const COMM_ROUTE_SOURCES: [(&str, &str); 3] = [
         (
             include_str!("../../../crates/agent24-comm/src/router.rs"),
             "pub fn router(",
@@ -4033,6 +4033,7 @@ pub(crate) mod tests {
             include_str!("../../../crates/agent24-comm/src/groupchat.rs"),
             "pub(crate) fn routes(",
         ),
+        (include_str!("comm_routes.rs"), "fn runtime_router("),
     ];
 
     /// `.route("<path>"` literals inside the function starting at `anchor`.
@@ -4378,6 +4379,55 @@ pub(crate) mod tests {
         state.enable_capability_auth(store);
         state.enable_desktop_presence();
         (state, host_bearer, creative_bearer)
+    }
+
+    #[tokio::test]
+    async fn component_install_requires_host_authority_before_dispatch() {
+        let (state, host, creative) = capability_state().await;
+        let modules = Router::new().route(
+            "/api/v1/comm/install",
+            axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+        );
+        let app = build_router_with_modules(state, modules);
+        for (bearer, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some(creative), StatusCode::FORBIDDEN),
+            (Some(host), StatusCode::NO_CONTENT),
+        ] {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/comm/install");
+            if let Some(bearer) = bearer {
+                req = req.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+            }
+            let res = app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn hot_comm_router_preserves_core2_matched_templates() {
+        let (state, host, _) = capability_state().await;
+        let dir = tempfile::tempdir().unwrap();
+        let slot = Arc::new(crate::comm_routes::CommDaemonSlot::new());
+        let comm = crate::comm_routes::build(dir.path(), Duration::from_millis(500), &slot).await;
+        let app = build_router_with_modules(state, comm);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/comm/identity")
+                    .header(header::AUTHORIZATION, format!("Bearer {host}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(response).await["error"], "not_configured");
     }
 
     #[tokio::test]
@@ -6312,7 +6362,8 @@ pub(crate) mod tests {
     fn router_with_comm(state: AppState) -> Router {
         let modules = Router::new().nest(
             "/api/v1/comm",
-            agent24_comm::router(agent24_comm::CommState::unconfigured("coverage")),
+            agent24_comm::router(agent24_comm::CommState::unconfigured("coverage"))
+                .route("/install", axum::routing::post(attached_probe)),
         );
         build_router_with_modules(state, modules)
     }
@@ -6848,6 +6899,18 @@ pub(crate) mod tests {
             reason: "comm 前缀挂载点；方法清单在 agent24-comm::router，由目录扫描覆盖",
         },
         AllowedRegistration {
+            file: "apps/agent24d/src/comm_routes.rs",
+            form: "route_layer",
+            call: ".route_layer(middleware::from_fn_with_state(",
+            reason: "保留固定路由模板，仅将请求转发到热切换后的通信实例",
+        },
+        AllowedRegistration {
+            file: "apps/agent24d/src/comm_routes.rs",
+            form: "nest",
+            call: ".nest(\"/api/v1/comm\", routes)",
+            reason: "热切换 comm 前缀挂载；runtime_router 的方法清单由目录扫描覆盖",
+        },
+        AllowedRegistration {
             file: "apps/agent24d/src/domain.rs",
             form: "nest",
             call: "app.nest(namespace, Router::new().fallback(handler.clone()))",
@@ -6930,6 +6993,7 @@ pub(crate) mod tests {
             "apps/agent24d/src/server.rs" => "pub fn build_router_with_modules",
             "crates/agent24-comm/src/router.rs" => "pub fn router(",
             "crates/agent24-comm/src/groupchat.rs" => "pub(crate) fn routes(",
+            "apps/agent24d/src/comm_routes.rs" => "fn runtime_router(",
             _ => return None,
         };
         Some(function_span(src, signature))
@@ -7098,6 +7162,11 @@ pub fn build_router_with_modules() {
         comm.extend(parsed_routes(
             groupchat_src,
             "pub(crate) fn routes(",
+            "/api/v1/comm",
+        ));
+        comm.extend(parsed_routes(
+            source_of(&files, "apps/agent24d/src/comm_routes.rs"),
+            "fn runtime_router(",
             "/api/v1/comm",
         ));
         let violations = registration_violations(&files);

@@ -9,15 +9,113 @@
 //! surrogate escape such as `\ud800` in any key) never reaches [`route`]
 //! here, and the CLI refuses it as 400 `invalid_request`.
 
-use serde_json::Value;
+use base64::Engine as _;
+use serde_json::{Map, Value, json};
 
 use crate::import::{BASE, safe_u64, ulid_id};
 use crate::response::{Response, to_response};
-use crate::transport::{Method, Request, Transport};
+use crate::transport::{Method, Reply, Request, Transport};
 
-/// What the list and text routes take as a cursor: 1–4096 lower-case hex.
+/// What the list, text, find and extraction routes take as a cursor: 1–4096
+/// lower-case letters and digits. The OS's are opaque (`DocumentsCursor`):
+/// hex for list, text and find, `v<n>` for an extraction's values; nothing
+/// that could end the parameter (`&`, `=`, `%`, `#`, a space) gets through.
 fn cursor_ok(c: &str) -> bool {
-    (1..=4096).contains(&c.len()) && c.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    (1..=4096).contains(&c.len()) && c.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'z'))
+}
+
+/// A positive whole number, no leading zero; up to 20 digits, a `u64`'s.
+fn ordinal(s: &str) -> bool {
+    (1..=20).contains(&s.len()) && !s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A text layer's block id: `p<page>/b<n>` (`text_layer.rs`).
+fn block_ok(b: &str) -> bool {
+    let Some((page, n)) = b.split_once('/') else {
+        return false;
+    };
+    matches!((page.strip_prefix('p'), n.strip_prefix('b')), (Some(p), Some(n)) if ordinal(p) && ordinal(n))
+}
+
+/// One corner coordinate of a render `region`, as the OpenAPI pattern takes
+/// it: `[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?`.
+fn coordinate_ok(c: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let (mantissa, exponent) = match c.find(['e', 'E']) {
+        Some(i) => (&c[..i], Some(&c[i + 1..])),
+        None => (c, None),
+    };
+    let mantissa_ok = match mantissa.split_once('.') {
+        Some((whole, fraction)) => digits(whole) && digits(fraction),
+        None => digits(mantissa),
+    };
+    let exponent_ok = exponent.is_none_or(|e| digits(e.strip_prefix(['+', '-']).unwrap_or(e)));
+    mantissa_ok && exponent_ok
+}
+
+/// `x0,y0,x1,y1`.
+fn region_ok(r: &str) -> bool {
+    r.split(',').count() == 4 && r.split(',').all(coordinate_ok)
+}
+
+/// An `Idempotency-Key`: 1–200 visible ASCII characters, no spaces.
+fn key_ok(k: &str) -> bool {
+    (1..=200).contains(&k.len()) && k.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+/// What a routed operation answers with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Answer {
+    /// A JSON resource or the error envelope ([`to_response`]).
+    Json,
+    /// A rendered page: PNG bytes and their scale ([`to_page`]), at most
+    /// the one asked for (1 when none was).
+    Png { asked: f64 },
+}
+
+/// The request's optional keys, each `None` when present but malformed.
+struct Keys<'a>(&'a Map<String, Value>);
+
+impl<'a> Keys<'a> {
+    fn id(&self, key: &str, prefix: &str) -> Option<&'a str> {
+        self.0
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|v| ulid_id(v, prefix))
+    }
+
+    /// A revision or page: a safe integer, at least 1.
+    fn number(&self, key: &str) -> Option<u64> {
+        self.0.get(key).and_then(safe_u64).filter(|n| *n >= 1)
+    }
+
+    /// An absent key is fine; a present one must pass `ok`.
+    fn optional<T>(&self, key: &str, ok: impl FnOnce(&'a Value) -> Option<T>) -> Option<Option<T>> {
+        match self.0.get(key) {
+            None => Some(None),
+            Some(v) => ok(v).map(Some),
+        }
+    }
+
+    fn cursor(&self) -> Option<Option<&'a str>> {
+        self.optional("cursor", |v| v.as_str().filter(|c| cursor_ok(c)))
+    }
+
+    fn limit(&self) -> Option<Option<u64>> {
+        self.optional("limit", |v| safe_u64(v).filter(|n| (1..=200).contains(n)))
+    }
+
+    fn flag(&self, key: &str) -> Option<Option<bool>> {
+        self.optional(key, Value::as_bool)
+    }
+}
+
+/// `path` with `query`'s pairs, if any.
+fn with_query(path: String, query: &[String]) -> String {
+    match query.is_empty() {
+        true => path,
+        false => format!("{path}?{}", query.join("&")),
+    }
 }
 
 /// The fixed route for a request (`{"op":"list","cursor":..,"limit":..}`,
@@ -25,58 +123,199 @@ fn cursor_ok(c: &str) -> bool {
 /// allowed operations or carries a malformed id, cursor, limit or revision.
 /// Keys it does not read are ignored, as the desktop did.
 pub fn route(req: &Value) -> Option<Request> {
-    let r = req.as_object()?;
-    let id = |key: &str, prefix: &str| {
-        r.get(key)
-            .and_then(Value::as_str)
-            .filter(|v| ulid_id(v, prefix))
-    };
-    // An absent key is fine; a present one must be a well-formed cursor.
-    let cursor = || match r.get("cursor") {
-        None => Some(None),
-        Some(v) => v.as_str().filter(|c| cursor_ok(c)).map(Some),
-    };
-    let get = |path: String| (Method::Get, path);
-    let (method, path) = match r.get("op")?.as_str()? {
+    routed(req).map(|(request, _)| request)
+}
+
+fn routed(req: &Value) -> Option<(Request, Answer)> {
+    let k = Keys(req.as_object()?);
+    let get = |path: String| (Method::Get, path, None, Vec::new(), Answer::Json);
+    let (method, path, body, headers, answer) = match k.0.get("op")?.as_str()? {
         "capabilities" => get(format!("{BASE}/capabilities")),
         "list" => {
             let mut query = Vec::new();
-            if let Some(c) = cursor()? {
+            if let Some(c) = k.cursor()? {
                 query.push(format!("cursor={c}"));
             }
-            if let Some(v) = r.get("limit") {
-                let limit = safe_u64(v).filter(|n| (1..=200).contains(n))?;
+            if let Some(limit) = k.limit()? {
                 query.push(format!("limit={limit}"));
             }
-            get(match query.is_empty() {
-                true => format!("{BASE}/documents"),
-                false => format!("{BASE}/documents?{}", query.join("&")),
-            })
+            get(with_query(format!("{BASE}/documents"), &query))
         }
-        "get" => get(format!("{BASE}/documents/{}", id("documentId", "doc_")?)),
+        "get" => get(format!("{BASE}/documents/{}", k.id("documentId", "doc_")?)),
         "readText" => {
-            let document = id("documentId", "doc_")?;
-            let revision = r.get("revision").and_then(safe_u64).filter(|n| *n >= 1)?;
+            let document = k.id("documentId", "doc_")?;
+            let revision = k.number("revision")?;
+            let mut query = Vec::new();
+            if let Some(b) = k.optional("block", |v| v.as_str().filter(|b| block_ok(b)))? {
+                query.push(format!("block={b}"));
+            }
+            if let Some(c) = k.cursor()? {
+                query.push(format!("cursor={c}"));
+            }
+            if let Some(limit) = k.limit()? {
+                query.push(format!("limit={limit}"));
+            }
+            if let Some(complete) = k.flag("requireComplete")? {
+                query.push(format!("require_complete={complete}"));
+            }
             let path = format!("{BASE}/documents/{document}/revisions/{revision}/text");
-            get(match cursor()? {
-                Some(c) => format!("{path}?cursor={c}"),
-                None => path,
-            })
+            get(with_query(path, &query))
         }
-        "job" => get(format!("{BASE}/jobs/{}", id("jobId", "job_")?)),
-        op @ ("cancelJob" | "retryJob") => {
-            let job = id("jobId", "job_")?;
-            let action = if op == "cancelJob" { "cancel" } else { "retry" };
-            (Method::Post, format!("{BASE}/jobs/{job}/{action}"))
+        "find" => {
+            let document = k.id("documentId", "doc_")?;
+            let query = k.0.get("query")?.as_str()?;
+            if !(1..=500).contains(&query.chars().count()) {
+                return None;
+            }
+            let mut body = json!({"revision": k.number("revision")?, "query": query});
+            if let Some(c) = k.cursor()? {
+                body["cursor"] = json!(c);
+            }
+            if let Some(limit) = k.limit()? {
+                body["limit"] = json!(limit);
+            }
+            if let Some(complete) = k.flag("requireComplete")? {
+                body["require_complete"] = json!(complete);
+            }
+            let path = format!("{BASE}/documents/{document}/find");
+            (Method::Post, path, Some(body), Vec::new(), Answer::Json)
+        }
+        "extract" => {
+            let document = k.id("documentId", "doc_")?;
+            // The fields are the OS's to check (`DocumentsExtractRequest`).
+            let schema = k.0.get("schema").filter(|s| s.is_object())?;
+            let mut body = json!({"revision": k.number("revision")?, "schema": schema});
+            if let Some(rerun) = k.flag("rerun")? {
+                body["rerun"] = json!(rerun);
+            }
+            let mut headers = Vec::new();
+            if let Some(key) = k.optional("idempotencyKey", |v| v.as_str().filter(|s| key_ok(s)))? {
+                headers.push(("Idempotency-Key".to_owned(), key.to_owned()));
+            }
+            let path = format!("{BASE}/documents/{document}/extractions");
+            (Method::Post, path, Some(body), headers, Answer::Json)
+        }
+        "getExtraction" => {
+            let extraction = k.id("extractionId", "ext_")?;
+            let mut query = Vec::new();
+            if let Some(c) = k.cursor()? {
+                query.push(format!("cursor={c}"));
+            }
+            if let Some(limit) = k.limit()? {
+                query.push(format!("limit={limit}"));
+            }
+            get(with_query(
+                format!("{BASE}/extractions/{extraction}"),
+                &query,
+            ))
+        }
+        "renderPage" => {
+            let document = k.id("documentId", "doc_")?;
+            let (revision, page) = (k.number("revision")?, k.number("page")?);
+            let mut query = Vec::new();
+            let scale = |v: &Value| {
+                v.as_f64()
+                    .filter(|s| (0.25..=4.0).contains(s))
+                    .map(|s| (s, v.to_string()))
+            };
+            let mut asked = 1.0;
+            if let Some((s, written)) = k.optional("scale", scale)? {
+                asked = s;
+                query.push(format!("scale={written}"));
+            }
+            if let Some(r) = k.optional("region", |v| v.as_str().filter(|r| region_ok(r)))? {
+                // `+` in a query is a space: an exponent's sign is sent encoded.
+                query.push(format!("region={}", r.replace('+', "%2B")));
+            }
+            let path = format!("{BASE}/documents/{document}/revisions/{revision}/pages/{page}");
+            let (method, path, body, headers, _) = get(with_query(path, &query));
+            (method, path, body, headers, Answer::Png { asked })
+        }
+        op @ ("job" | "cancelJob" | "retryJob") => {
+            let job = k.id("jobId", "job_")?;
+            match op {
+                "job" => get(format!("{BASE}/jobs/{job}")),
+                "cancelJob" => post(format!("{BASE}/jobs/{job}/cancel")),
+                _ => post(format!("{BASE}/jobs/{job}/retry")),
+            }
         }
         _ => return None,
     };
-    Some(Request {
+    let (headers, body) = match body {
+        Some(body) => {
+            let mut headers = headers;
+            headers.push(("Content-Type".to_owned(), "application/json".to_owned()));
+            (headers, Some(body.to_string().into_bytes()))
+        }
+        None => (headers, None),
+    };
+    let request = Request {
         method,
         path,
-        headers: Vec::new(),
-        body: None,
-    })
+        headers,
+        body,
+    };
+    Some((request, answer))
+}
+
+fn post(path: String) -> (Method, String, Option<Value>, Vec<(String, String)>, Answer) {
+    (Method::Post, path, None, Vec::new(), Answer::Json)
+}
+
+/// A rendered page as one JSON resource: `{media_type, bytes, scale, png}`,
+/// the PNG in standard base64 and `scale` the one the OS used
+/// (`Documents-Render-Scale`, 0.25 up to the `asked` scale). A 2xx that is
+/// not a PNG with such a scale is `invalid_response`; an error is read as
+/// [`to_response`] reads it.
+fn to_page(reply: Reply, asked: f64) -> Response {
+    let Reply::Http {
+        status,
+        headers,
+        body,
+    } = &reply
+    else {
+        return to_response(reply);
+    };
+    if !(200..300).contains(status) {
+        return to_response(reply);
+    }
+    // Exactly one of each: a repeated header could say two things. Only
+    // spaces and tabs are padding (RFC 9110 OWS), not every Unicode space.
+    let header = |name: &str| {
+        let mut values = headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case(name));
+        match (values.next(), values.next()) {
+            (Some((_, v)), None) => Some(v.as_str()),
+            _ => None,
+        }
+    };
+    let png = header("content-type")
+        .and_then(|t| t.split(';').next())
+        .is_some_and(|t| {
+            t.trim_matches([' ', '\t'])
+                .eq_ignore_ascii_case("image/png")
+        })
+        // The signature, then the header chunk every PNG starts with (its
+        // 13-byte length and type): not just eight bytes that look like one.
+        && body.starts_with(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR");
+    let scale = header("documents-render-scale")
+        .and_then(|s| s.trim_matches([' ', '\t']).parse::<f64>().ok())
+        .filter(|s| (0.25..=asked).contains(s));
+    match (*status, png, scale) {
+        (200, true, Some(scale)) => Response::Ok {
+            status: 200,
+            data: json!({
+                "media_type": "image/png",
+                "bytes": body.len(),
+                "scale": scale,
+                "png": base64::engine::general_purpose::STANDARD.encode(body),
+            }),
+        },
+        _ => Response::fail(
+            *status,
+            "invalid_response",
+            &format!("unexpected {status} reply from the daemon"),
+        ),
+    }
 }
 
 /// The answer to a request [`route`] does not take: 400 `invalid_request`.
@@ -86,8 +325,9 @@ pub fn refused() -> Response {
 
 /// Runs one allowed operation; anything else is [`refused`] here, unsent.
 pub async fn call<T: Transport + Sync>(req: &Value, transport: &T) -> Response {
-    match route(req) {
-        Some(request) => to_response(transport.send(request).await),
+    match routed(req) {
+        Some((request, Answer::Json)) => to_response(transport.send(request).await),
+        Some((request, Answer::Png { asked })) => to_page(transport.send(request).await, asked),
         None => refused(),
     }
 }

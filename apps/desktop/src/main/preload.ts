@@ -53,6 +53,8 @@ const api = {
   approvalDecide: (id: string, decision: ApprovalDecisionInput): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.ApprovalDecide, id, decision),
   /** A1: elevated; main asks the user in a native dialog before sending. */
+  commInstall: (): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.CommInstall),
+
   osModuleSetEnabled: (name: string, enabled: boolean): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.OsModuleSetEnabled, name, enabled),
   /** A-3: elevated; disables/enables AgentEar (the name is fixed in main).
