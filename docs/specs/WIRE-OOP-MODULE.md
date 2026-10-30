@@ -82,7 +82,7 @@ daemon 用户一致、组/其他不可写（符号链接只查属主）——这
 | `requires_models` | `[string]` | 否 | `[]` | 信息性，本文不展开 |
 | `requires_apis` | `[string]` | 否 | `[]` | 同上 |
 | `requires_deps` | `[string]` | 否 | `[]` | 同上 |
-| `model_access` | string | 否 | 缺省视为 `local_only` | 值闭集 `local_only` \| `remote_allowed`；**声明了此字段但 `kernel_capabilities` 不含 `models`** → 解析期拒绝（`lib.rs:818-830`） |
+| `model_access` | string | 否 | 缺省视为 `local_only` | 值闭集 `local_only` \| `remote_allowed`；**声明了此字段但 `kernel_capabilities` 不含 `models`** → 解析期拒绝（`lib.rs:818-830`）。K1-6b.5g 起 `remote_allowed` 照常解析，但回调一律按 LocalOnly 路由（出口矩阵 §6 第 2 条） |
 | `ui_entry` | string | 否 | `None` | 信息性 |
 | `impl_kind` | enum（snake_case） | ✅ | — | `in_process_crate` \| `out_of_process_provider` \| `attached_process`（`lib.rs:274-290`） |
 | `spawn` | `{command: string, args: [string]=[]}` | 见下 | `None` | 自身也 `deny_unknown_fields`（`lib.rs:316-328`）；`command`/`args` 纯词法校验：非空、拒绝绝对路径、拒绝 `..`（`lib.rs:370-392`） |
@@ -653,7 +653,8 @@ cron 规则：恰好 5 段（无秒段，即便 REST 路径接受 6 段这里也
 ### 5.5 `_a24/model/complete`
 
 进程内无对应物（`KernelCtx` 没有模型句柄；ME-4b 新增）。所需能力：`models`。manifest 字段
-`model_access` 决定隐私路由（§1.2）——由**调用方在 manifest 里静态声明**，不是每次调用可选的字段。
+`model_access` 由**调用方在 manifest 里静态声明**，不是每次调用可选的字段（§1.2）。K1-6b.5g 起它不再影响路由：
+回调一律按 LocalOnly 路由，见[出口矩阵](../design/K1-06b-egress-matrix.md) §6 第 2 条。
 
 **params**（`ModelCompleteParams`，`rust/apps/agent24d/src/model_callback.rs:67-81`，
 `deny_unknown_fields`）：

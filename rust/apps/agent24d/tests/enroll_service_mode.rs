@@ -92,10 +92,15 @@ fn exit_code(d: &mut Daemon, wait: Duration) -> Option<std::process::ExitStatus>
 
 fn assert_fails_without_ready(data: &Path, args: &[&str]) {
     let mut d = spawn(data, args);
-    assert!(
-        first_line(&mut d, Duration::from_secs(30)).is_none(),
-        "a refused start must print no ready line"
-    );
+    // SPEC-002 §4: the only line a refused start may print is its `failed`
+    // line (argument errors print none).
+    if let Some(line) = first_line(&mut d, Duration::from_secs(30)) {
+        let line: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            line["type"], "failed",
+            "a refused start must print no ready line: {line}"
+        );
+    }
     let status = exit_code(&mut d, Duration::from_secs(15)).expect("process must exit");
     assert!(!status.success(), "refused start must exit non-zero");
 }

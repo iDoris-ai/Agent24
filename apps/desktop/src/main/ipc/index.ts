@@ -265,6 +265,40 @@ async function exclusive(fn: () => Promise<BackendProxyResponse>): Promise<Backe
   }
 }
 
+// A-3: the one attached module the desktop may disable or unpair. Fixed here,
+// never taken from the renderer.
+const AGENTEAR = 'agentear'
+const AGENTEAR_PATH = `/api/v1/attached/${AGENTEAR}`
+
+/** Error codes the AgentEar IPCs promise the renderer. Anything else the
+ *  daemon or transport says is folded into one of these. */
+export type AgentEarErrorCode =
+  | 'invalid_request' | 'busy' | 'cancelled' | 'not_paired' | 'forbidden' | 'daemon_error'
+  | 'backend_not_ready' | 'timeout' | 'proxy_failed'
+
+const agentearError = (status: number, code: AgentEarErrorCode, message: string): BackendProxyResponse =>
+  ({ ok: false, status, data: { error: { code, message } } })
+
+/** Maps a failed daemon/proxy response onto the stable AgentEar codes. */
+function agentearFailure(res: BackendProxyResponse): BackendProxyResponse {
+  const code = (res.data as { error?: { code?: unknown } } | null)?.error?.code
+  // Transport failures produced by backend-proxy keep their own code.
+  if (code === 'backend_not_ready' || code === 'timeout' || code === 'proxy_failed') return res
+  if (res.status === 404) return agentearError(404, 'not_paired', mt('err.agentearNotPaired'))
+  if (res.status === 401 || res.status === 403) return agentearError(403, 'forbidden', mt('err.agentearForbidden'))
+  return agentearError(502, 'daemon_error', mt('err.agentearDaemon'))
+}
+
+/** Confirms from the daemon's own list (never from the page) that AgentEar
+ *  is paired. Null = go ahead; otherwise the failure to return as is. */
+async function agentearPairedOrFailure(): Promise<BackendProxyResponse | null> {
+  const list = await proxyToBackend({ method: 'GET', path: '/api/v1/attached' })
+  if (!list.ok) return agentearFailure(list)
+  const mods = (list.data as { modules?: unknown } | null)?.modules
+  const paired = Array.isArray(mods) && mods.some((m) => (m as { name?: unknown } | null)?.name === AGENTEAR)
+  return paired ? null : agentearError(404, 'not_paired', mt('err.agentearNotPaired'))
+}
+
 const cancelled = (): BackendProxyResponse =>
   ({ ok: false, status: 499, data: { error: { code: 'cancelled', message: mt('err.cancelled') } } })
 const invalidRequest = (message: string): BackendProxyResponse =>
@@ -521,6 +555,40 @@ export function registerIpcHandlers(options: {
       )
       if (!ok) return cancelled()
       return proxyToBackend({ method: 'PATCH', path: `/api/v1/os/${encodeURIComponent(name)}`, body: { enabled } })
+    }),
+  )
+
+  // A-3: PATCH /api/v1/attached/agentear — disable / re-enable AgentEar.
+  // Elevated in route_policy.rs; main sends it with the ProductHost credential,
+  // which the daemon does not gate with a presence challenge, so this native
+  // dialog is the human confirmation. Only `enabled` comes from the page; the
+  // module name is fixed and any further arguments are ignored.
+  handle(IpcChannels.AgentEarSetEnabled, (event, enabled: unknown): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      if (typeof enabled !== 'boolean') return invalidRequest('enabled must be a boolean')
+      const refused = await agentearPairedOrFailure()
+      if (refused) return refused
+      const ok = await confirmNative(
+        event,
+        mt(enabled ? 'agentear.enableMessage' : 'agentear.disableMessage'),
+        mt(enabled ? 'agentear.enableDetail' : 'agentear.disableDetail'),
+      )
+      if (!ok) return cancelled()
+      const res = await proxyToBackend({ method: 'PATCH', path: AGENTEAR_PATH, body: { enabled } })
+      return res.ok ? res : agentearFailure(res)
+    }),
+  )
+
+  // A-3: DELETE /api/v1/attached/agentear — revoke the pairing. AgentEar must
+  // pair again (its own menu bar + the presence dialog) to come back.
+  handle(IpcChannels.AgentEarUnpair, (event): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      const refused = await agentearPairedOrFailure()
+      if (refused) return refused
+      const ok = await confirmNative(event, mt('agentear.unpairMessage'), mt('agentear.unpairDetail'))
+      if (!ok) return cancelled()
+      const res = await proxyToBackend({ method: 'DELETE', path: AGENTEAR_PATH })
+      return res.ok ? res : agentearFailure(res)
     }),
   )
 }

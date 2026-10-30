@@ -53,13 +53,17 @@ let reflectedKeyEncoding: BufferEncoding | 'base64url' | null = null
 const settingsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-omlx-settings-'))
 const settingsFile = path.join(settingsDir, 'settings.json')
 let seen: { method?: string; url?: string; auth?: string; body: string }[] = []
+// A-3: what GET /api/v1/attached lists, and an optional forced failure for
+// PATCH/DELETE /api/v1/attached/agentear.
+let attachedModules: { name: string; attach_status: string }[] = []
+let attachedFailure: { status: number; code: string } | null = null
 
 beforeAll(async () => {
   daemon = http.createServer((req, res) => {
     const chunks: Buffer[] = []
     req.on('data', (c: Buffer) => chunks.push(c))
     req.on('end', () => {
-      if (!(req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/')) && !(req.method === 'GET' && req.url === '/api/v1/os')) seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: Buffer.concat(chunks).toString() })
+      if (!(req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/')) && !(req.method === 'GET' && req.url === '/api/v1/os') && !(req.method === 'GET' && req.url === '/api/v1/attached')) seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: Buffer.concat(chunks).toString() })
       res.setHeader('Content-Type', 'application/json')
       if (req.url === '/v1/models' && modelsRequireKey && req.headers.authorization !== `Bearer ${modelsRequireKey}`) {
         res.statusCode = 401
@@ -90,6 +94,16 @@ beforeAll(async () => {
       } else if (req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/ap_missing')) {
         res.statusCode = 404
         res.end(JSON.stringify({ error: { code: 'not_found', message: 'nope' } }))
+      } else if (req.method === 'GET' && req.url === '/api/v1/attached') {
+        res.end(JSON.stringify({ modules: attachedModules }))
+      } else if (req.url?.startsWith('/api/v1/attached/') && attachedFailure) {
+        res.statusCode = attachedFailure.status
+        res.end(JSON.stringify({ error: { code: attachedFailure.code, message: 'daemon says no' } }))
+      } else if (req.method === 'DELETE' && req.url?.startsWith('/api/v1/attached/')) {
+        res.statusCode = 204
+        res.end()
+      } else if (req.method === 'PATCH' && req.url?.startsWith('/api/v1/attached/')) {
+        res.end(JSON.stringify({ modules: attachedModules }))
       } else if (req.method === 'GET' && req.url === '/api/v1/os') {
         res.end(JSON.stringify({ modules: [{ name: 'sin90', enabled: false, version: '0.5.0' }] }))
       } else res.end(JSON.stringify({ ok: true, echoed: req.url }))
@@ -119,6 +133,8 @@ beforeEach(() => {
   fs.rmSync(settingsFile, { force: true })
   fs.rmSync(path.join(settingsDir, 'ui-prefs.json'), { force: true })
   seen = []
+  attachedModules = [{ name: 'agentear', attach_status: 'attached' }, { name: 'other', attach_status: 'attached' }]
+  attachedFailure = null
   showMessageBox.mockReset()
   execFileMock.mockReset()
 })
@@ -271,6 +287,158 @@ describe('A1 backendProxy allowlist', () => {
       expect(res.ok).toBe(false)
       expect(seen).toHaveLength(0)
     })
+  })
+})
+
+describe('A-3 AgentEar disable / unpair (dedicated IPC + native confirm)', () => {
+  it('setEnabled(false) PATCHes /api/v1/attached/agentear after confirmation, with the host credential', async () => {
+    showMessageBox.mockResolvedValue({ response: 0 })
+    const res = await call(IpcChannels.AgentEarSetEnabled, false)
+    expect(res.ok).toBe(true)
+    expect(showMessageBox).toHaveBeenCalledTimes(1)
+    expect(seen).toHaveLength(1)
+    expect(seen[0]?.method).toBe('PATCH')
+    expect(seen[0]?.url).toBe('/api/v1/attached/agentear')
+    expect(seen[0]?.auth).toBe('Bearer daemon-secret')
+    expect(JSON.parse(seen[0]!.body)).toEqual({ enabled: false })
+  })
+  it('setEnabled(true) sends enabled: true', async () => {
+    attachedModules = [{ name: 'agentear', attach_status: 'disabled' }]
+    showMessageBox.mockResolvedValue({ response: 0 })
+    const res = await call(IpcChannels.AgentEarSetEnabled, true)
+    expect(res.ok).toBe(true)
+    expect(seen.map((s) => [s.method, s.url, s.body])).toEqual([['PATCH', '/api/v1/attached/agentear', '{"enabled":true}']])
+  })
+  it('unpair DELETEs /api/v1/attached/agentear after confirmation', async () => {
+    showMessageBox.mockResolvedValue({ response: 0 })
+    const res = await call(IpcChannels.AgentEarUnpair)
+    expect(res.ok).toBe(true)
+    expect(res.status).toBe(204)
+    expect(seen.map((s) => [s.method, s.url])).toEqual([['DELETE', '/api/v1/attached/agentear']])
+  })
+  it('only ever touches agentear: a page-supplied name is ignored or refused', async () => {
+    showMessageBox.mockResolvedValue({ response: 0 })
+    // A name in the first slot is not a boolean -> refused before any dialog.
+    const named = await call(IpcChannels.AgentEarSetEnabled, 'other', false)
+    expect(named.data.error.code).toBe('invalid_request')
+    expect(showMessageBox).not.toHaveBeenCalled()
+    expect(seen).toHaveLength(0)
+    // Extra arguments cannot redirect the request.
+    await call(IpcChannels.AgentEarSetEnabled, false, 'other')
+    await call(IpcChannels.AgentEarUnpair, 'other')
+    await call(IpcChannels.AgentEarUnpair, '../../shutdown')
+    expect(seen.map((s) => s.url)).toEqual(['/api/v1/attached/agentear', '/api/v1/attached/agentear', '/api/v1/attached/agentear'])
+  })
+  it('rejects a non-boolean enabled before asking', async () => {
+    for (const v of [undefined, null, 'false', 0, 1, {}]) {
+      const res = await call(IpcChannels.AgentEarSetEnabled, v)
+      expect(res.ok).toBe(false)
+      expect(res.data.error.code).toBe('invalid_request')
+    }
+    expect(showMessageBox).not.toHaveBeenCalled()
+    expect(seen).toHaveLength(0)
+  })
+  it('sends nothing when the user cancels (both channels)', async () => {
+    showMessageBox.mockResolvedValue({ response: 1 })
+    const a = await call(IpcChannels.AgentEarSetEnabled, false)
+    const b = await call(IpcChannels.AgentEarUnpair)
+    expect(a.data.error.code).toBe('cancelled')
+    expect(b.data.error.code).toBe('cancelled')
+    expect(showMessageBox).toHaveBeenCalledTimes(2)
+    expect(seen).toHaveLength(0)
+  })
+  it('a dialog that fails to open counts as a cancel', async () => {
+    showMessageBox.mockRejectedValue(new Error('no display'))
+    const res = await call(IpcChannels.AgentEarUnpair)
+    expect(res.data.error.code).toBe('cancelled')
+    expect(seen).toHaveLength(0)
+  })
+  it('not paired -> not_paired without any dialog or write', async () => {
+    attachedModules = [{ name: 'other', attach_status: 'attached' }]
+    const a = await call(IpcChannels.AgentEarSetEnabled, false)
+    const b = await call(IpcChannels.AgentEarUnpair)
+    for (const res of [a, b]) {
+      expect(res.ok).toBe(false)
+      expect(res.status).toBe(404)
+      expect(res.data.error.code).toBe('not_paired')
+    }
+    expect(showMessageBox).not.toHaveBeenCalled()
+    expect(seen).toHaveLength(0)
+  })
+  it('the unpair dialog says AgentEar must be paired again; the disable dialog says pairing is kept', async () => {
+    showMessageBox.mockResolvedValue({ response: 1 })
+    await call(IpcChannels.AgentEarUnpair)
+    await call(IpcChannels.AgentEarSetEnabled, false)
+    await call(IpcChannels.AgentEarSetEnabled, true)
+    const [unpair, disable, enable] = showMessageBox.mock.calls.map((c) => c.at(-1) as { message: string; detail: string; buttons: string[]; cancelId: number; defaultId: number })
+    expect(unpair!.message).toContain('Unpair AgentEar')
+    expect(unpair!.detail).toContain('pair AgentEar again')
+    expect(disable!.message).toContain('Disable AgentEar')
+    expect(disable!.detail).toContain('pairing is kept')
+    expect(enable!.message).toContain('Enable AgentEar')
+    // Cancel is the default and the Escape answer.
+    for (const opts of [unpair!, disable!, enable!]) {
+      expect(opts.defaultId).toBe(1)
+      expect(opts.cancelId).toBe(1)
+    }
+  })
+  it('the dialogs are translated (zh, th)', async () => {
+    showMessageBox.mockResolvedValue({ response: 1 })
+    await call(IpcChannels.AppSetLocale, 'zh')
+    await call(IpcChannels.AgentEarUnpair)
+    await call(IpcChannels.AppSetLocale, 'th')
+    await call(IpcChannels.AgentEarUnpair)
+    await call(IpcChannels.AppSetLocale, 'en')
+    const [zh, th] = showMessageBox.mock.calls.map((c) => c.at(-1) as { message: string; detail: string })
+    expect(zh!.message).toContain('解除')
+    expect(zh!.detail).toContain('重新配对')
+    expect(th!.message).toContain('ยกเลิกการจับคู่')
+    expect(th!.detail).toContain('จับคู่ใหม่')
+  })
+  it.each([
+    [404, 'not_found', 404, 'not_paired'],
+    [403, 'presence_required', 403, 'forbidden'],
+    [401, 'unauthorized', 403, 'forbidden'],
+    [500, 'internal', 502, 'daemon_error'],
+    [400, 'invalid_request', 502, 'daemon_error'],
+  ])('daemon %i %s -> stable error code', async (status, code, wantStatus, wantCode) => {
+    attachedFailure = { status, code }
+    showMessageBox.mockResolvedValue({ response: 0 })
+    for (const res of [await call(IpcChannels.AgentEarSetEnabled, false), await call(IpcChannels.AgentEarUnpair)]) {
+      expect(res.ok).toBe(false)
+      expect(res.status).toBe(wantStatus)
+      expect(res.data.error.code).toBe(wantCode)
+      expect(typeof res.data.error.message).toBe('string')
+    }
+  })
+  it('daemon unreachable -> backend error code passes through, never a raw throw', async () => {
+    const saved = endpoint.port
+    endpoint.port = 1
+    try {
+      const res = await call(IpcChannels.AgentEarUnpair)
+      expect(res.ok).toBe(false)
+      expect(['proxy_failed', 'backend_not_ready', 'timeout']).toContain(res.data.error.code)
+      expect(showMessageBox).not.toHaveBeenCalled()
+    } finally {
+      endpoint.port = saved
+    }
+  })
+  it('concurrent calls: one dialog, the rest are busy at once and send nothing', async () => {
+    let release!: (v: { response: number }) => void
+    showMessageBox.mockReturnValue(new Promise((r) => { release = r }))
+    const first = call(IpcChannels.AgentEarUnpair)
+    const second = call(IpcChannels.AgentEarUnpair)
+    const third = call(IpcChannels.AgentEarSetEnabled, false)
+    const fourth = call(IpcChannels.OsModuleSetEnabled, 'sin90', true)
+    for (const p of [second, third, fourth]) expect((await p).data.error.code).toBe('busy')
+    await vi.waitFor(() => expect(showMessageBox).toHaveBeenCalledTimes(1))
+    release({ response: 0 })
+    expect((await first).ok).toBe(true)
+    expect(showMessageBox).toHaveBeenCalledTimes(1)
+    expect(seen.map((s) => [s.method, s.url])).toEqual([['DELETE', '/api/v1/attached/agentear']])
+    // Released afterwards.
+    showMessageBox.mockResolvedValue({ response: 1 })
+    expect((await call(IpcChannels.AgentEarSetEnabled, true)).data.error.code).toBe('cancelled')
   })
 })
 

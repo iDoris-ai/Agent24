@@ -2,15 +2,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
+import { promisify } from 'node:util'
 
 const exec = vi.fn()
 let installedTarget = ''
 vi.mock('node:child_process', () => ({
-  execFile: (file: string, args: string[], options: unknown, callback: (error: Error | null, stdout: string, stderr: string) => void) => {
+  execFile: Object.assign(vi.fn(), { [Symbol.for('nodejs.util.promisify.custom')]: async (file: string, args: string[], options: object) => {
+    if (args[0] === '--version' || (file === '/bin/sh' && !args[1].includes('/usr/local/bin/agent24'))) return run(file, args, options)
     const error: Error | null = exec(file, args, options)
-    callback(error, '', '')
-    return {}
-  },
+    if (error) throw error
+    return { stdout: '', stderr: '' }
+  } }),
 }))
 vi.mock('node:fs/promises', async (load) => {
   const fs = await load<typeof import('node:fs/promises')>()
@@ -25,16 +27,19 @@ vi.mock('node:fs/promises', async (load) => {
   }
 })
 import { installBundledCli } from './cli-tool'
+const childProcess = await vi.importActual<typeof import('node:child_process')>('node:child_process')
+const run = promisify(childProcess.execFile)
 
 let root = ''
 beforeEach(() => { exec.mockReset() })
-afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }) })
+afterEach(async () => { vi.unstubAllEnvs(); if (root) await rm(root, { recursive: true, force: true }) })
 
 // Simulate only OS permission/auth responses. Real bundle resolution still runs;
-// neither the shell nor osascript is executed and /usr/local is never modified.
+// Only the temporary HOME runs real linking; /usr/local is never modified.
 describe.skipIf(process.platform !== 'darwin')('administrator authorization', () => {
   async function install() {
     root = await realpath(await mkdtemp(path.join(tmpdir(), 'a24-auth-')))
+    vi.stubEnv('HOME', path.join(root, 'home'))
     const bundle = path.join(root, 'Agent24.app/Contents')
     const executable = path.join(bundle, 'MacOS/Agent24')
     const resources = path.join(bundle, 'Resources')
@@ -42,7 +47,7 @@ describe.skipIf(process.platform !== 'darwin')('administrator authorization', ()
     await mkdir(path.dirname(executable), { recursive: true })
     await mkdir(path.dirname(installedTarget), { recursive: true })
     await writeFile(executable, '')
-    await writeFile(installedTarget, 'CLI')
+    await writeFile(installedTarget, '#!/bin/sh\necho "agent24 0.6.0"\n')
     await chmod(installedTarget, 0o755)
     return installBundledCli({ executable, resources, packaged: true, confirm: async () => true })
   }

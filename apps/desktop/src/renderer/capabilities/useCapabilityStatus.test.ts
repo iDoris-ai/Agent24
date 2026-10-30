@@ -3,6 +3,7 @@ import { act, cleanup, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { BackendProxyRequest } from '../../shared/ipc-types'
 import type { IdorisStatus } from '../components/idoris/api'
+import type { AttachedView } from '../pages/voice/api'
 import { setLocale, type Locale } from '../i18n'
 import { useCapabilityStatus } from './useCapabilityStatus'
 
@@ -12,8 +13,11 @@ const initial: IdorisStatus = {
   budget_suggestion: null, budget_unavailable_reason: 'hardware_memory_unavailable',
 }
 let status: IdorisStatus
+let modules: AttachedView[]
+let attachmentFails: boolean
 const proxy = vi.fn(async (req: BackendProxyRequest) => {
   if (req.path === '/api/v1/idoris/status') return { ok: true, status: 200, data: status }
+  if (req.path === '/api/v1/attached' && !attachmentFails) return { ok: true, status: 200, data: { modules } }
   throw new Error('unavailable')
 })
 
@@ -21,6 +25,8 @@ beforeEach(() => {
   vi.useFakeTimers()
   setLocale('zh')
   status = initial
+  modules = []
+  attachmentFails = false
   proxy.mockClear()
   Object.defineProperty(window, 'agent24', {
     value: { backendProxy: proxy }, writable: true, configurable: true,
@@ -89,5 +95,40 @@ describe('local model capability status', () => {
     await act(async () => {})
     expect(proxy).not.toHaveBeenCalled()
     expect(result.current('localModels')).toBeUndefined()
+  })
+})
+
+describe('voice capability status', () => {
+  const attachment: AttachedView = {
+    name: 'agentear', manifest_digest: 'sha256:test', token_id: 'tok_1',
+    created_at: '2026-09-27T00:00:00Z', attach_status: 'attached',
+  }
+  describe.each<{ locale: Locale; labels: string[] }>([
+    { locale: 'zh', labels: ['已连接', '已配对但未连接 · 打开 AgentEar', '已停用', '未配对'] },
+    { locale: 'en', labels: ['Connected', 'Paired but disconnected · Open AgentEar', 'Disabled', 'Not paired'] },
+    { locale: 'th', labels: ['เชื่อมต่อแล้ว', 'จับคู่แล้วแต่ไม่ได้เชื่อมต่อ · เปิด AgentEar', 'ปิดใช้งาน', 'ยังไม่ได้จับคู่'] },
+  ])('$locale', ({ locale, labels }) => {
+    it.each(['attached', 'detached', 'disabled', 'unpaired'])('shows %s for AgentEar only', async (state) => {
+      setLocale(locale)
+      modules = [{ ...attachment, name: 'another-module' }]
+      if (state !== 'unpaired') modules.push({ ...attachment, attach_status: state })
+      const { result } = renderHook(() => useCapabilityStatus(true))
+      await act(async () => {})
+      expect(proxy).toHaveBeenCalledWith({ method: 'GET', path: '/api/v1/attached' })
+      expect(result.current('voice')).toBe(labels[['attached', 'detached', 'disabled', 'unpaired'].indexOf(state)])
+    })
+  })
+
+  it.each([false, true])('hides status on request failure (previous success: %s)', async (previousSuccess) => {
+    modules = [attachment]
+    attachmentFails = !previousSuccess
+    const { result } = renderHook(() => useCapabilityStatus(true))
+    await act(async () => {})
+    if (previousSuccess) {
+      expect(result.current('voice')).toBe('已连接')
+      attachmentFails = true
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+    }
+    expect(result.current('voice')).toBeUndefined()
   })
 })
