@@ -23,8 +23,11 @@ describe('knowledge-grounding', () => {
     expect(grounding('来源：d#c', read(['d', 'c'])).unread).toEqual([])
     // At the end of a sentence, still the source read.
     expect(grounding('见 doc-7#chk-71. 以及 doc-7#chk-71:', read(['doc-7', 'chk-71'])).unread).toEqual([])
-    // A longer ID that starts with one read is another source.
+    // A longer ID that starts or ends with one read is another source.
     expect(grounding('来源：doc-7#chk-712', read(['doc-7', 'chk-71'])).unread).toEqual(['doc-7#chk-712'])
+    expect(grounding('来源：fake-doc-7#chk-71', read(['doc-7', 'chk-71'])).unread).toEqual(['fake-doc-7#chk-71'])
+    // Markdown around a source read is not part of it.
+    expect(grounding('~~doc-7#chk-71~~ 与 **doc-7#chk-71**', read(['doc-7', 'chk-71'])).unread).toEqual([])
   })
 
   it('an answer from a run that called no Knowledge tool says so, and none of its sources stand', () => {
