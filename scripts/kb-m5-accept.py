@@ -395,19 +395,25 @@ def has_fact(text):
     return all(part in text for part in FACT_PARTS)
 
 
-# The closing time as an answer may word it, Markdown stripped: Wednesday,
-# evening eight, closed. "早上八点" does not match.
-CLOSING = re.compile(r"周三.{0,8}(晚上八点|晚上8点|20[:：]00|20点).{0,6}闭馆")
+# Eight in the evening, in the words an answer may use; not "八点半" or "20:30".
+EIGHT_PM = re.compile(r"(晚上八点|晚上8点|20[:：]00|20点)(?![半\d:：零一二三四五六七八九十分])")
+
+
+def plain(text):
+    return re.sub(r"[\s*_`>]", "", text)
 
 
 def answers_fact(body):
-    plain = re.sub(r"[\s*_`>#]", "", body)
-    return bool(CLOSING.search(plain)) and "林小满" in plain
+    """One line names Wednesday, closing and eight in the evening, in either
+    order ("每周三晚上八点闭馆", "每周三闭馆时间：晚上八点"); the curator is named."""
+    lines = [plain(line) for line in re.split(r"[\n。]", body)]
+    closing = any("周三" in line and "闭馆" in line and EIGHT_PM.search(line) for line in lines)
+    return closing and "林小满" in plain(body)
 
 
 def listed_ids(sources):
-    """Every `knowledge_id#chunk_id` the source list names."""
-    return set(re.findall(r"[\w-]+#[\w-]+", sources))
+    """Every `knowledge_id#chunk_id` the source list names, Markdown stripped."""
+    return set(re.findall(r"[0-9A-Za-z-]+#[0-9A-Za-z-]+", re.sub(r"[*_`>]", " ", sources)))
 
 
 def evidence_of(result):
@@ -522,11 +528,13 @@ def main():
                 d.stop()
         finally:
             for server in (model, embed):
-                if server is not None:
-                    try:
-                        server.shutdown()
-                    finally:
-                        server.server_close()
+                if server is None:
+                    continue
+                try:
+                    server.shutdown()
+                    server.server_close()
+                except Exception as exc:
+                    print(f"cleanup: {exc!r}", file=sys.stderr)
     with open(os.path.join(WORK, "report.md"), "w") as f:
         mode = f"真实模型 {ARGS.model}（经 {ARGS.model_url}）" if real else "脚本模型（stub）"
         f.write(f"# KB-M5 端到端验收\n\n- WeKnora：{WK}\n- 模型：{mode}\n- 时间（UTC）：{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n\n")
