@@ -990,8 +990,17 @@ mod hy1_regression_tests {
             )
             .await
             .unwrap(),
-            Some(sibling)
+            Some(sibling.clone())
         );
+        // A symlink to a matching binary is still not a regular file.
+        #[cfg(unix)]
+        {
+            tokio::fs::symlink(&sibling, &component).await.unwrap();
+            let err = resolve_candidates(None, None, &component, Some(sibling), &lock, &platform)
+                .await
+                .unwrap_err();
+            assert!(err.contains("regular file"), "{err}");
+        }
     }
 
     #[tokio::test]
