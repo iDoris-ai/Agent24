@@ -2205,6 +2205,15 @@ pub async fn serve(
     tools = tools.with(StdArc::new(agent24_agent::self_wake::SelfWakeTool::new(
         store.clone(),
     )));
+    // #1087 b: the Knowledge tools, offered only to a run that names a
+    // binding. They read the private host interface's registry, which the
+    // state takes over below, so both see the same activations and C.
+    let knowledge_host = StdArc::new(crate::knowledge_host::KnowledgeHostRegistry::default());
+    let knowledge_runs: StdArc<dyn crate::knowledge_backend::RunSelector> =
+        StdArc::new(store.clone());
+    for tool in crate::knowledge_tools::tools(StdArc::clone(&knowledge_host), knowledge_runs) {
+        tools = tools.with(tool);
+    }
     let mcp_servers = match crate::mcp::config_path() {
         Some(path) => match crate::mcp::load_config(&path) {
             Ok(cfg) => {
@@ -2277,6 +2286,7 @@ pub async fn serve(
         mcp_servers,
         packages_root: Arc::clone(&packages_root),
     });
+    state.knowledge_host = knowledge_host;
     state.managed_idoris = managed_idoris;
     state.idoris_host = idoris_host;
     state.idoris_unavailable = idoris_unavailable;
