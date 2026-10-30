@@ -4,6 +4,7 @@ import logoWelcome from '../assets/logo-welcome.png'
 import { useT } from '../i18n'
 import { chatMessages } from './Chat.i18n'
 import type { components } from '@agent24/api-client'
+import { askWithKnowledge, createChatSession } from './chat-knowledge'
 
 /** M1-T14: what `/api/v1/chat` ACTUALLY did with an explicit "记住…" turn —
  *  read off the response field, never off the model's own reply text (the
@@ -26,6 +27,8 @@ interface AssistantMessage {
    *  reply, distinct from (and below) the latency suffix. Never set on a
    *  user message or the error fallback message. */
   memoryReceipt?: MemoryReceipt
+  /** Answered as a run with the Knowledge tools (chat-knowledge.ts). */
+  viaKnowledge?: boolean
 }
 
 // M1-T12: one id per conversation, sent as `session_id` on every
@@ -50,6 +53,14 @@ export default function ChatPage() {
   const bottomRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const requestInFlight = useRef(false)
+  // Knowledge on: turns go to /runs, in a real session created once.
+  const [awaitingApproval, setAwaitingApproval] = useState(false)
+  const runSession = useRef<string | null>(null)
+  // The endpoint and knowledge bases the session's turns searched: a session
+  // carries its earlier Knowledge results into later runs, which may send
+  // them back to the Knowledge server (decision
+  // 2026-10-30-knowledge-same-source-egress), so another server gets a new session.
+  const runScope = useRef<string | null>(null)
   const awaitingConfirmation = messages.some(m => m.role === 'user' && m.delivery.kind === 'headroom')
 
   useEffect(() => {
@@ -85,6 +96,18 @@ export default function ChatPage() {
     // whole latency; extractServerReported still gets first crack at it in
     // case a future daemon response reports its own (see chat-latency.ts).
     const sentAt = performance.now()
+
+    // Asked of main on every turn: it may have turned On since the page opened.
+    const knowledge = await window.agent24.knowledge?.status().then((status) => status, () => null)
+    if (knowledge?.active === true) {
+      const scope = JSON.stringify([knowledge.endpoint, knowledge.knowledgeBaseIds])
+      if (runScope.current !== scope) {
+        runSession.current = null
+        runScope.current = scope
+      }
+      await replyWithKnowledge(index, request)
+      return
+    }
 
     // Call backend LLM gateway via IPC proxy
     try {
@@ -152,6 +175,51 @@ export default function ChatPage() {
     }
   }
 
+  // The turn as a run: only the new prompt goes. The run sees earlier turns
+  // only through its session's memory (agent24-agent `session_context`): none
+  // while memory is off, and never the turns that went to /api/v1/chat.
+  const replyWithKnowledge = async (index: number, request: ChatRequest) => {
+    const prompt = request.messages[request.messages.length - 1]?.content ?? ''
+    const sentAt = performance.now()
+    try {
+      const proxy = window.agent24.backendProxy
+      const ask = async () => {
+        runSession.current ??= await createChatSession(proxy)
+        return runSession.current === null
+          ? { kind: 'failed' as const, code: 'session_unavailable', message: 'session_unavailable' }
+          : await askWithKnowledge(prompt, runSession.current, { proxy, onAwaitingApproval: setAwaitingApproval }, request.idoris_headroom_confirmed === true)
+      }
+      let turn = await ask()
+      // The daemon ties a session to one activation of the binding; after a
+      // change it refuses the old session, so the turn goes to a new one.
+      if (turn.kind === 'failed' && turn.code === 'knowledge_session_rebound') {
+        runSession.current = null
+        turn = await ask()
+      }
+      // Same inline confirmation as a /api/v1/chat turn; confirming sends
+      // the turn again with the flag set.
+      if (turn.kind === 'failed' && turn.code === 'idoris_headroom_confirmation_required') {
+        setDelivery(index, { kind: 'headroom', request })
+        return
+      }
+      if (turn.kind === 'answer') {
+        const suffix: ReplyLatency = { modelName: null, tier: null, firstTokenMs: null, totalMs: performance.now() - sentAt }
+        setDelivery(index, { kind: 'sent' })
+        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, viaKnowledge: true }])
+      } else {
+        setDelivery(index, { kind: 'notSent' })
+        setMessages(prev => [...prev, { role: 'assistant', content: t('knowledge.failed', { error: turn.message }) }])
+      }
+    } catch (e) {
+      setDelivery(index, { kind: 'notSent' })
+      setMessages(prev => [...prev, { role: 'assistant', content: t('knowledge.failed', { error: String(e) }) }])
+    } finally {
+      setAwaitingApproval(false)
+      requestInFlight.current = false
+      setLoading(false)
+    }
+  }
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
@@ -199,6 +267,9 @@ export default function ChatPage() {
               {m.role === 'assistant' && m.suffix && (
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>{formatReplySuffix(m.suffix)}</div>
               )}
+              {m.role === 'assistant' && m.viaKnowledge && (
+                <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>{t('knowledge.via')}</div>
+              )}
               {/* M1-T14: a deterministic system line, visually distinct from
                   (and never mistaken for) the model's own reply text. */}
               {m.role === 'assistant' && m.memoryReceipt && (
@@ -212,7 +283,9 @@ export default function ChatPage() {
         {loading && (
           <div className="message assistant">
             <div className="message-avatar">🤖</div>
-            <div className="message-bubble" style={{ color: 'var(--muted)' }}>{t('status.thinking')}</div>
+            <div className="message-bubble" style={{ color: 'var(--muted)' }}>
+              {awaitingApproval ? t('knowledge.awaitingApproval') : t('status.thinking')}
+            </div>
           </div>
         )}
         <div ref={bottomRef} />

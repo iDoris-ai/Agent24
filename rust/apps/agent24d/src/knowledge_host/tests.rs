@@ -527,6 +527,73 @@ async fn the_host_activates_and_deactivates_a_binding() {
 }
 
 #[tokio::test]
+async fn an_activation_sets_the_endpoint_its_calls_use_and_a_bad_one_changes_nothing() {
+    let (state, host, _) = crate::server::tests::capability_state().await;
+    let registry = state.knowledge_host.clone();
+    let router = build_router(state);
+    let put = |seq: u64, body: serde_json::Value| {
+        with_body(
+            Method::PUT,
+            &format!("{BINDING}?seq={seq}"),
+            &host,
+            &body.to_string(),
+        )
+    };
+    let good = serde_json::json!({ "endpoint": "https://kb.example/api/v1",
+                                   "knowledge_base_ids": ["kb-a", "kb-b"] });
+    let (status, _) = send(&router, put(1, good)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let host_id = registry.only_host();
+    let now = registry.binding_now(&host_id, "b1", unix_now()).unwrap();
+    assert_eq!(now.generation, 1);
+    assert_eq!(
+        now.endpoint,
+        Some(Endpoint {
+            base_url: "https://kb.example/api/v1".into(),
+            knowledge_base_ids: vec!["kb-a".into(), "kb-b".into()],
+        })
+    );
+
+    let too_many: Vec<String> = (0..=MAX_KNOWLEDGE_BASES)
+        .map(|i| format!("kb-{i}"))
+        .collect();
+    for (i, bad) in [
+        serde_json::json!({ "endpoint": "http://kb.example/api/v1", "knowledge_base_ids": ["kb-a"] }),
+        serde_json::json!({ "endpoint": "https://u:p@kb.example", "knowledge_base_ids": ["kb-a"] }),
+        serde_json::json!({ "endpoint": "https://kb.example", "knowledge_base_ids": [] }),
+        serde_json::json!({ "endpoint": "https://kb.example", "knowledge_base_ids": [" "] }),
+        serde_json::json!({ "endpoint": "https://kb.example", "knowledge_base_ids": ["a", "a"] }),
+        serde_json::json!({ "endpoint": "https://kb.example", "knowledge_base_ids": too_many }),
+        serde_json::json!({ "endpoint": "https://kb.example", "knowledge_base_ids": ["a"], "x": 1 }),
+        serde_json::json!({ "knowledge_base_ids": ["a"] }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (status, body) = send(&router, put(2 + i as u64, bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "case {i}");
+        assert!(!body.contains("kb.example"), "{body}");
+    }
+    // Refused before the registry: still generation 1, endpoint as it was.
+    let now = registry.binding_now(&host_id, "b1", unix_now()).unwrap();
+    assert_eq!((now.generation, now.endpoint.is_some()), (1, true));
+
+    // Loopback http is allowed; a deactivation drops the endpoint with C.
+    let local = serde_json::json!({ "endpoint": "http://127.0.0.1:8080/api/v1",
+                                    "knowledge_base_ids": ["kb-a"] });
+    assert_eq!(
+        send(&router, put(20, local)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    send(
+        &router,
+        request(Method::DELETE, &format!("{BINDING}?seq=21"), &host),
+    )
+    .await;
+    assert_eq!(registry.binding_now(&host_id, "b1", unix_now()), None);
+}
+
+#[tokio::test]
 async fn a_creative_runtime_is_refused() {
     let (state, _, creative) = crate::server::tests::capability_state().await;
     let registry = state.knowledge_host.clone();
@@ -811,4 +878,176 @@ async fn a_run_naming_a_binding_it_may_not_use_is_refused_and_not_created() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(body.contains("host_authority_required"));
     assert_eq!(run_count(&legacy).await, 0);
+}
+
+#[tokio::test]
+async fn a_session_keeps_the_activation_its_first_bound_run_had() {
+    let (state, host, _) = crate::server::tests::capability_state().await;
+    let router = build_router(state.clone());
+    let new_session = || async {
+        let req = with_body(
+            Method::POST,
+            "/api/v1/sessions",
+            &host,
+            r#"{"title":"","channel":"desktop"}"#,
+        );
+        let (status, body) = send(&router, req).await;
+        assert!(status.is_success(), "{body}");
+        let session: serde_json::Value = serde_json::from_str(&body).unwrap();
+        session["id"].as_str().unwrap().to_owned()
+    };
+    let run_in = |session: String, binding: Option<&'static str>| {
+        let mut body = serde_json::json!({ "prompt": "hi", "session_id": session });
+        if let Some(binding) = binding {
+            body["knowledge_binding_id"] = binding.into();
+        }
+        create_run_request(&host, body)
+    };
+    send(
+        &router,
+        request(Method::PUT, &format!("{BINDING}?seq=1"), &host),
+    )
+    .await;
+    let first = new_session().await;
+    let (status, body) = send(&router, run_in(first.clone(), Some("b1"))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let (status, body) = send(&router, run_in(first.clone(), Some("b1"))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "same activation: {body}");
+
+    // A new activation (another endpoint, say) is another source.
+    send(
+        &router,
+        request(Method::PUT, &format!("{BINDING}?seq=2"), &host),
+    )
+    .await;
+    let before = run_count(&state).await;
+    let (status, body) = send(&router, run_in(first.clone(), Some("b1"))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("knowledge_session_rebound"), "{body}");
+    assert_eq!(run_count(&state).await, before);
+
+    let (status, body) = send(&router, run_in(new_session().await, Some("b1"))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "a new session: {body}");
+    let (status, body) = send(&router, run_in(first, None)).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "no binding, no Knowledge tools: {body}"
+    );
+}
+
+#[test]
+fn a_session_pin_is_exact() {
+    let registry = KnowledgeHostRegistry::default();
+    assert!(registry.pin_session("s1", &pin("host", "b1", 1), false));
+    assert!(registry.pin_session("s1", &pin("host", "b1", 1), true));
+    assert!(!registry.pin_session("s1", &pin("host", "b1", 2), false));
+    assert!(!registry.pin_session("s1", &pin("host", "b2", 1), false));
+    assert!(!registry.pin_session("s1", &pin("other", "b1", 1), false));
+    assert!(registry.pin_session("s2", &pin("host", "b1", 2), false));
+}
+
+#[test]
+fn concurrent_first_runs_of_a_session_agree_on_one_activation() {
+    let registry = std::sync::Arc::new(KnowledgeHostRegistry::default());
+    let start = std::sync::Arc::new(std::sync::Barrier::new(16));
+    let calls: Vec<_> = (0..16u64)
+        .map(|n| {
+            let (registry, start) = (registry.clone(), start.clone());
+            std::thread::spawn(move || {
+                let binding = pin("host", "b1", 1 + n % 2);
+                start.wait();
+                (
+                    binding.generation,
+                    registry.pin_session("s1", &binding, false),
+                )
+            })
+        })
+        .collect();
+    let results: Vec<(u64, bool)> = calls.into_iter().map(|c| c.join().unwrap()).collect();
+    let won: Vec<u64> = results
+        .iter()
+        .filter(|(_, ok)| *ok)
+        .map(|(g, _)| *g)
+        .collect();
+    let first = won[0];
+    assert!(
+        results.iter().all(|(g, ok)| *ok == (*g == first)),
+        "{results:?}"
+    );
+}
+
+#[test]
+fn no_new_pin_for_a_session_with_knowledge_results_and_none_past_the_cap() {
+    let registry = KnowledgeHostRegistry::default();
+    assert!(!registry.pin_session("s1", &pin("host", "b1", 1), true));
+    assert!(!registry.pin_session("s1", &pin("host", "b1", 1), true));
+
+    // Never dropped: past the cap a new session is refused, a pinned one
+    // keeps its pin.
+    assert!(registry.pin_session("s2", &pin("host", "b1", 1), false));
+    for n in 1..MAX_PINNED_SESSIONS {
+        assert!(registry.pin_session(&format!("other-{n}"), &pin("host", "b1", 1), false));
+    }
+    assert!(!registry.pin_session("late", &pin("host", "b1", 1), false));
+    assert!(registry.pin_session("s2", &pin("host", "b1", 1), true));
+    assert!(!registry.pin_session("s2", &pin("host", "b1", 2), false));
+}
+
+#[tokio::test]
+async fn a_session_holding_knowledge_results_without_a_pin_is_refused() {
+    // As after a restart: the session took in Knowledge results, the pin
+    // that tied them to an activation is gone.
+    let (state, host, _) = crate::server::tests::capability_state().await;
+    let router = build_router(state.clone());
+    send(
+        &router,
+        request(Method::PUT, &format!("{BINDING}?seq=1"), &host),
+    )
+    .await;
+    let mut sessions = Vec::new();
+    for origin in [
+        "tool:knowledge_search",
+        "tool:knowledge_read",
+        "tool:shell_exec",
+    ] {
+        let req = with_body(
+            Method::POST,
+            "/api/v1/sessions",
+            &host,
+            r#"{"title":"","channel":"desktop"}"#,
+        );
+        let (_, body) = send(&router, req).await;
+        let session: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let id = session["id"].as_str().unwrap().to_owned();
+        sqlx::query(
+            "INSERT INTO session_tool_result_origins (session_id, origin, created_at) VALUES (?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(origin)
+        .bind("2026-10-30T00:00:00Z")
+        .execute(agent24_store::test_hooks::pool(&state.store))
+        .await
+        .unwrap();
+        sessions.push(id);
+    }
+    let run_in = |session: &str| {
+        create_run_request(
+            &host,
+            serde_json::json!({ "prompt": "hi", "session_id": session, "knowledge_binding_id": "b1" }),
+        )
+    };
+    let before = run_count(&state).await;
+    for session in &sessions[..2] {
+        let (status, body) = send(&router, run_in(session)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("knowledge_session_rebound"), "{body}");
+    }
+    assert_eq!(run_count(&state).await, before);
+    let (status, body) = send(&router, run_in(&sessions[2])).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "another tool's results: {body}"
+    );
 }

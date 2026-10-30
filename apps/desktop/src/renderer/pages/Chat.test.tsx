@@ -292,6 +292,137 @@ describe('ChatPage', () => {
   })
 })
 
+describe('ChatPage with Knowledge', () => {
+  beforeEach(() => { setLocale('zh') })
+
+  it('asks main before every turn, so a switch turned On after the page opened takes effect', async () => {
+    const status = vi.fn()
+      .mockResolvedValueOnce({ enabled: true, active: false })
+      .mockResolvedValue({ enabled: true, active: true })
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: mockBackendProxy, knowledge: { status } },
+      writable: true,
+      configurable: true,
+    })
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.path === '/api/v1/chat') return { ok: true, status: 200, data: { message: { content: 'plain' } } }
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: 'r1' } }
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: 'from the knowledge base' } } }
+    })
+
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'first' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('plain')).toBeInTheDocument())
+
+    fireEvent.change(textarea, { target: { value: 'second' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('from the knowledge base')).toBeInTheDocument(), { timeout: 3000 })
+    expect(screen.getByText(chatMessages.zh['knowledge.via'])).toBeInTheDocument()
+    expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: 'second', session_id: 's1' } }))
+  })
+})
+
+describe('ChatPage with Knowledge on another server', () => {
+  beforeEach(() => { setLocale('zh') })
+
+  it('starts a new session once the endpoint or knowledge bases change', async () => {
+    const status = vi.fn()
+      .mockResolvedValueOnce({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] })
+      .mockResolvedValueOnce({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] })
+      .mockResolvedValue({ enabled: true, active: true, endpoint: 'https://b.example/api/v1', knowledgeBaseIds: ['kb'] })
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: mockBackendProxy, knowledge: { status } },
+      writable: true,
+      configurable: true,
+    })
+    let sessions = 0
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: `s${++sessions}` } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: 'r1' } }
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: `answer ${sessions}` } } }
+    })
+
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    for (const text of ['one', 'two', 'three']) {
+      fireEvent.change(textarea, { target: { value: text } })
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+      await waitFor(() => expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ body: expect.objectContaining({ prompt: text }) })), { timeout: 3000 })
+      await waitFor(() => expect(screen.queryByText(/思考中|thinking/i)).toBeNull(), { timeout: 3000 })
+    }
+    const runs = mockBackendProxy.mock.calls.map(([req]) => req).filter((req) => req.method === 'POST' && req.path === '/api/v1/runs')
+    expect(runs.map((req) => req.body.session_id)).toEqual(['s1', 's1', 's2'])
+  })
+})
+
+describe('ChatPage when the daemon refuses an old session', () => {
+  beforeEach(() => { setLocale('zh') })
+
+  it('asks again in a new session, once', async () => {
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: mockBackendProxy, knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
+      writable: true,
+      configurable: true,
+    })
+    let sessions = 0
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { session_id?: string } }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: `s${++sessions}` } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') {
+        return req.body?.session_id === 's1'
+          ? { ok: false, status: 409, data: { error: { code: 'knowledge_session_rebound', message: 'start a new session' } } }
+          : { ok: true, status: 201, data: { id: 'r1' } }
+      }
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: 'from s2' } } }
+    })
+
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'q' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('from s2')).toBeInTheDocument(), { timeout: 3000 })
+    const runs = mockBackendProxy.mock.calls.map(([req]) => req).filter((req) => req.method === 'POST' && req.path === '/api/v1/runs')
+    expect(runs.map((req) => req.body.session_id)).toEqual(['s1', 's2'])
+  })
+})
+
+describe('ChatPage with Knowledge when iDoris needs reserved memory', () => {
+  beforeEach(() => { setLocale('zh') })
+
+  it('shows the inline confirmation, then sends the turn again in the same session with the flag', async () => {
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: mockBackendProxy, knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
+      writable: true,
+      configurable: true,
+    })
+    let sessions = 0
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { idoris_headroom_confirmed?: boolean } }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: `s${++sessions}` } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: req.body?.idoris_headroom_confirmed ? 'r2' : 'r1' } }
+      return req.path.endsWith('/r1')
+        ? { ok: true, status: 200, data: { status: 'failed', error: { code: 'idoris_headroom_confirmation_required', message: 'reserved memory' } } }
+        : { ok: true, status: 200, data: { status: 'completed', output: { text: 'loaded with knowledge' } } }
+    })
+
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'q' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    const confirm = await screen.findByRole('button', { name: chatMessages.zh['headroom.confirm'] }, { timeout: 3000 })
+    expect(screen.queryByText(/知识库回答失败/)).not.toBeInTheDocument()
+    fireEvent.click(confirm)
+    await waitFor(() => expect(screen.getByText('loaded with knowledge')).toBeInTheDocument(), { timeout: 3000 })
+    const runs = mockBackendProxy.mock.calls.map(([req]) => req).filter((req) => req.method === 'POST' && req.path === '/api/v1/runs')
+    expect(runs.map((req) => req.body)).toEqual([
+      { prompt: 'q', session_id: 's1' },
+      { prompt: 'q', session_id: 's1', idoris_headroom_confirmed: true },
+    ])
+    expect(sessions).toBe(1)
+  })
+})
+
 describe('ChatPage English default', () => {
   it('shows the English welcome copy', () => {
     render(<ChatPage />)

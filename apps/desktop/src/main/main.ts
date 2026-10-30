@@ -25,6 +25,7 @@ import {
 import { OpenDesignComponentInstaller } from './open-design-component'
 import { KnowledgeHost } from './knowledge-host'
 import { KnowledgeLoginStore } from './knowledge-logins'
+import { KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
 
 const isDev = process.env.NODE_ENV === 'development'
 setBundledPackaged(app.isPackaged)
@@ -87,6 +88,7 @@ let cliCheckTicks = 0
 let creativeServeWeb: CreativeServeWeb | null = null
 // KB-HOST-01: Knowledge logins and the daemon's private Knowledge interface.
 let knowledgeHost: KnowledgeHost | null = null
+let knowledge: KnowledgeController | null = null
 // CORE-2 AgentEar S3: long-polls the daemon for native confirmation challenges.
 let presencePoller: PresencePoller | null = null
 let openDesignComponent: OpenDesignComponentInstaller | null = null
@@ -313,9 +315,13 @@ app.whenReady().then(async () => {
   presencePoller.start()
   // safeStorage needs the app ready. The logins load once, here, before
   // anything can change them; the reason is logged, never the contents.
-  knowledgeHost = new KnowledgeHost(new KnowledgeLoginStore(app.getPath('userData'), safeStorage))
+  const loginStore = new KnowledgeLoginStore(app.getPath('userData'), safeStorage)
+  knowledgeHost = new KnowledgeHost(loginStore)
   const knowledgeLogins = knowledgeHost.start()
   if (!knowledgeLogins.ok) console.warn(`[knowledge] logins unavailable: ${knowledgeLogins.reason}`)
+  // The user's Knowledge settings drive the one binding; Off keeps it inactive.
+  knowledge = new KnowledgeController(knowledgeHost, loginStore, new KnowledgeSettingsStore(app.getPath('userData')))
+  void knowledge.apply()
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     callback({
       responseHeaders: {
@@ -332,7 +338,7 @@ app.whenReady().then(async () => {
     })
   })
 
-  registerIpcHandlers({ guard })
+  registerIpcHandlers({ guard, knowledge: () => knowledge })
   cliTool = registerCliTool({
     guard, executable: process.execPath, resources: process.resourcesPath, packaged: app.isPackaged,
     changed: refreshTray,
@@ -400,6 +406,7 @@ app.whenReady().then(async () => {
     // Replays the wanted Knowledge bindings on a restarted daemon and retries
     // changes that did not land.
     knowledgeHost?.sync()
+    void knowledge?.tick()
   }, 4_000)
   // ─────────────────────────────────────────────────────────────────────────
 
