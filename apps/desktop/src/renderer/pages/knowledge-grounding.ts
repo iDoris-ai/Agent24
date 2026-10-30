@@ -15,34 +15,23 @@ export type Grounding =
   | { kind: 'nothingRead'; unread: string[] }
   | { kind: 'read'; unread: string[] }
 
-// Anything joined by `#`, as the tools ask sources to be written. Broad on
-// purpose: a made-up source left unmarked is worse than a URL's fragment
-// marked as not read. The right side stops short of `.` and `:`, which end a
-// sentence or a label.
-const CITED = /[\w.:+=~@%-]+#[\w+=~@%-]+/g
-/** What an ID is made of; anything else around one (`Sources:`, `~~`) is not
- * part of it. */
-const ID_CHAR = /[A-Za-z0-9_-]/
+// Two IDs joined by `#`, as the tools ask sources to be written; an ID is a
+// run of these characters, so `Sources:`, `~~` or a full stop around one is
+// not part of it, and `a#b+c#d` is two sources. Broad on purpose: a made-up
+// source left unmarked is worse than a URL's fragment marked as not read.
+// WeKnora's IDs are UUIDs; an ID with other characters would be split and
+// marked, never passed over.
+const CITED = /[A-Za-z0-9_-]+#[A-Za-z0-9_-]+/g
 
-/** Each `x#y` in `text`, once, in order. */
+/** Each `knowledge_id#chunk_id` in `text`, once, in order. */
 export function citedChunks(text: string): string[] {
   return [...new Set(text.match(CITED) ?? [])]
 }
 
-/** Whether `cited` is `knowledgeId#chunkId`, give or take what is written
- * around it: `fake-doc-7` is another ID than `doc-7`, `~~doc-7` is not. */
-function names(cited: string, knowledgeId: string, chunkId: string): boolean {
-  const at = cited.indexOf('#')
-  const [left, right] = [cited.slice(0, at), cited.slice(at + 1)]
-  const before = left.charAt(left.length - knowledgeId.length - 1)
-  const after = right.charAt(chunkId.length)
-  return left.endsWith(knowledgeId) && right.startsWith(chunkId) && !ID_CHAR.test(before) && !ID_CHAR.test(after)
-}
-
 /** `knowledge` null: the run had no Knowledge binding, so searched nothing. */
 export function grounding(text: string, knowledge: RunKnowledge | null): Grounding {
-  const read = knowledge?.read_chunks ?? []
-  const unread = citedChunks(text).filter((cited) => !read.some((c) => names(cited, c.knowledge_id, c.chunk_id)))
+  const read = new Set((knowledge?.read_chunks ?? []).map((c) => `${c.knowledge_id}#${c.chunk_id}`))
+  const unread = citedChunks(text).filter((id) => !read.has(id))
   if (!knowledge?.searched) return { kind: 'notSearched', unread }
-  return { kind: read.length > 0 ? 'read' : 'nothingRead', unread }
+  return { kind: read.size > 0 ? 'read' : 'nothingRead', unread }
 }

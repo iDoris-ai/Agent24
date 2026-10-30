@@ -11,14 +11,14 @@ const read = (...ids: [string, string][]) => ({
 describe('knowledge-grounding', () => {
   it('finds every source an answer names, once each, however it is written', () => {
     const text = `煮沸 1 分钟。\n来源 / Sources\n- s01-02-zh-water-2025.pdf，${DOC}#${CHUNK}\n- doc-7#chk-71（又见 doc-7#chk-71）\nSources:doc-9#chk-99；d#c 与 C# 语言、#1515`
-    expect(citedChunks(text)).toEqual([`${DOC}#${CHUNK}`, 'doc-7#chk-71', 'Sources:doc-9#chk-99', 'd#c'])
+    expect(citedChunks(text)).toEqual([`${DOC}#${CHUNK}`, 'doc-7#chk-71', 'doc-9#chk-99', 'd#c'])
   })
 
   it('a source written right after a colon or with short IDs is still checked', () => {
     // Read back: stands even with "Sources:" against it.
     expect(grounding('Sources:doc-7#chk-71', read(['doc-7', 'chk-71']))).toEqual({ kind: 'read', unread: [] })
     // Not read back: marked, not passed over.
-    expect(grounding('答案。Sources:doc-9#chk-99', read(['doc-7', 'chk-71'])).unread).toEqual(['Sources:doc-9#chk-99'])
+    expect(grounding('答案。Sources:doc-9#chk-99', read(['doc-7', 'chk-71'])).unread).toEqual(['doc-9#chk-99'])
     expect(grounding('来源：d#c', read(['doc-7', 'chk-71'])).unread).toEqual(['d#c'])
     expect(grounding('来源：d#c', read(['d', 'c'])).unread).toEqual([])
     // At the end of a sentence, still the source read.
@@ -28,6 +28,8 @@ describe('knowledge-grounding', () => {
     expect(grounding('来源：fake-doc-7#chk-71', read(['doc-7', 'chk-71'])).unread).toEqual(['fake-doc-7#chk-71'])
     // Markdown around a source read is not part of it.
     expect(grounding('~~doc-7#chk-71~~ 与 **doc-7#chk-71**', read(['doc-7', 'chk-71'])).unread).toEqual([])
+    // Two sources written together are checked one by one.
+    expect(grounding('doc-7#chk-71+fake-doc-8#chk-81', read(['doc-7', 'chk-71'])).unread).toEqual(['fake-doc-8#chk-81'])
   })
 
   it('an answer from a run that called no Knowledge tool says so, and none of its sources stand', () => {
