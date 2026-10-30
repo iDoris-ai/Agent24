@@ -53,6 +53,9 @@ const MAX_BINDING_ID_BYTES: usize = 256;
 /// Run pins kept; the oldest goes first, and its run is then refused.
 const MAX_PINNED_RUNS: usize = 4096;
 const MAX_CREDENTIAL_BYTES: usize = 16 * 1024;
+/// Knowledge bases one activation may name.
+pub const MAX_KNOWLEDGE_BASES: usize = 64;
+const MAX_KNOWLEDGE_BASE_ID_CHARS: usize = 256;
 
 /// How the Knowledge service expects C to be presented. `Debug` never prints
 /// the secret.
@@ -80,12 +83,30 @@ pub struct CurrentCredential {
     pub expires_at: UnixSeconds,
 }
 
+/// Where an active binding's requests go and what they may search: the
+/// Knowledge server's API base and the knowledge bases of the binding. Set by
+/// the activation that made the generation, so it cannot change under a run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Endpoint {
+    pub base_url: String,
+    pub knowledge_base_ids: Vec<String>,
+}
+
+/// One active binding as a call sees it, read under one lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindingNow {
+    pub generation: u64,
+    pub endpoint: Option<Endpoint>,
+    pub credential: Option<CurrentCredential>,
+}
+
 #[derive(Clone, Default)]
 struct Entry {
     seq: u64,
     active: bool,
     /// The sequence number of the activation in effect: the generation.
     activated_seq: u64,
+    endpoint: Option<Endpoint>,
     credential: Option<CurrentCredential>,
 }
 
@@ -129,6 +150,8 @@ struct RunPins {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Change {
     /// Also drops the credential: the host pushes C again after activating.
+    /// Leaves the binding without an endpoint; see
+    /// [`KnowledgeHostRegistry::activate`].
     Activate,
     /// Also drops the credential.
     Deactivate,
@@ -151,6 +174,9 @@ pub enum ChangeError {
 pub struct KnowledgeHostRegistry {
     entries: Mutex<HashMap<(String, String), Entry>>,
     runs: Mutex<RunPins>,
+    /// Woken on every change applied, so a call in flight can tell at once
+    /// that its binding moved (`crate::knowledge_backend`).
+    changed: tokio::sync::Notify,
 }
 
 impl KnowledgeHostRegistry {
@@ -166,15 +192,54 @@ impl KnowledgeHostRegistry {
                 Change::Activate => {
                     entry.active = true;
                     entry.activated_seq = seq;
+                    entry.endpoint = None;
                     entry.credential = None;
                 }
                 Change::Deactivate => {
                     entry.active = false;
+                    entry.endpoint = None;
                     entry.credential = None;
                 }
                 Change::RevokeCredential => entry.credential = None,
             }
             Ok(())
+        })
+    }
+
+    /// Activates `binding` with the endpoint its calls use; like
+    /// [`Change::Activate`] otherwise.
+    pub fn activate(
+        &self,
+        host: &str,
+        binding: &str,
+        seq: u64,
+        endpoint: Endpoint,
+    ) -> Result<(), ChangeError> {
+        self.change(host, binding, seq, |entry| {
+            entry.active = true;
+            entry.activated_seq = seq;
+            entry.endpoint = Some(endpoint);
+            entry.credential = None;
+            Ok(())
+        })
+    }
+
+    /// Generation, endpoint and C of `binding` if `host` has it active; an
+    /// expired C reads as none. A missing record or a poisoned lock counts as
+    /// inactive.
+    pub fn binding_now(&self, host: &str, binding: &str, now: UnixSeconds) -> Option<BindingNow> {
+        let entries = self.entries.lock().ok()?;
+        let entry = entries
+            .get(&(host.to_owned(), binding.to_owned()))
+            .filter(|entry| entry.active)?;
+        let credential = entry
+            .credential
+            .clone()
+            .filter(|current| current.expires_at > now);
+        Some(BindingNow {
+            generation: entry.activated_seq,
+            endpoint: entry.endpoint.clone(),
+            credential,
         })
     }
 
@@ -249,7 +314,14 @@ impl KnowledgeHostRegistry {
         apply(&mut entry)?;
         entry.seq = seq;
         entries.insert(key, entry);
+        drop(entries);
+        self.changed.notify_waiters();
         Ok(())
+    }
+
+    /// Woken on every change applied after `notified()` was enabled.
+    pub fn changed(&self) -> &tokio::sync::Notify {
+        &self.changed
     }
 
     /// The generation of `binding` if `host` has it active. A missing record
@@ -449,24 +521,60 @@ pub fn bind_run(
 }
 
 /// `PUT /api/v1/host/knowledge/bindings/{binding_id}?seq=n` activates the
-/// binding, `DELETE` of the same deactivates it.
+/// binding, with `{"endpoint", "knowledge_base_ids"}` for its calls or with
+/// no body (then every call is refused); `DELETE` of the same deactivates it.
 pub async fn change(
     State(state): State<AppState>,
     authorization: Option<Extension<Authorization>>,
     method: Method,
     path: Result<Path<String>, PathRejection>,
     query: Result<Query<SeqQuery>, QueryRejection>,
+    req: Request<Body>,
 ) -> Response {
     let (host, binding_id, seq) = match host_and_seq(&state, authorization, path, query) {
         Ok(found) => found,
         Err(refused) => return refused.into_response(),
     };
-    let change = if method == Method::PUT {
-        Change::Activate
-    } else {
-        Change::Deactivate
+    let registry = &state.knowledge_host;
+    if method != Method::PUT {
+        return change_response(registry.apply(&host, &binding_id, seq, Change::Deactivate));
+    }
+    let body = match read_body_or_response(req).await {
+        Ok(body) => body,
+        Err(refused) => return refused,
     };
-    change_response(state.knowledge_host.apply(&host, &binding_id, seq, change))
+    if body.is_empty() {
+        return change_response(registry.apply(&host, &binding_id, seq, Change::Activate));
+    }
+    let Some(endpoint) = endpoint_of(&body) else {
+        return invalid_request();
+    };
+    change_response(registry.activate(&host, &binding_id, seq, endpoint))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivateBody {
+    endpoint: String,
+    knowledge_base_ids: Vec<String>,
+}
+
+/// The activation body `{"endpoint", "knowledge_base_ids"}`: an API base the
+/// HTTP transport accepts (`https`, or `http` to a loopback IP) and 1 to
+/// [`MAX_KNOWLEDGE_BASES`] distinct, non-blank ids.
+fn endpoint_of(body: &[u8]) -> Option<Endpoint> {
+    let body: ActivateBody = serde_json::from_slice(body).ok()?;
+    agent24_knowledge::validate_base_url(&body.endpoint).ok()?;
+    let ids = &body.knowledge_base_ids;
+    let id_ok =
+        |id: &String| !id.trim().is_empty() && id.chars().count() <= MAX_KNOWLEDGE_BASE_ID_CHARS;
+    let distinct = ids.iter().collect::<std::collections::HashSet<_>>().len() == ids.len();
+    let ids_ok = !ids.is_empty() && ids.len() <= MAX_KNOWLEDGE_BASES && distinct;
+    let ok = ids_ok && ids.iter().all(id_ok);
+    ok.then_some(Endpoint {
+        base_url: body.endpoint,
+        knowledge_base_ids: body.knowledge_base_ids,
+    })
 }
 
 /// `DELETE /api/v1/host/knowledge/bindings/{binding_id}/credential?seq=n`

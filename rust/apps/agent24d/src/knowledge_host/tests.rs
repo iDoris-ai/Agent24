@@ -527,6 +527,73 @@ async fn the_host_activates_and_deactivates_a_binding() {
 }
 
 #[tokio::test]
+async fn an_activation_sets_the_endpoint_its_calls_use_and_a_bad_one_changes_nothing() {
+    let (state, host, _) = crate::server::tests::capability_state().await;
+    let registry = state.knowledge_host.clone();
+    let router = build_router(state);
+    let put = |seq: u64, body: serde_json::Value| {
+        with_body(
+            Method::PUT,
+            &format!("{BINDING}?seq={seq}"),
+            &host,
+            &body.to_string(),
+        )
+    };
+    let good = serde_json::json!({ "endpoint": "https://kb.example/api/v1",
+                                   "knowledge_base_ids": ["kb-a", "kb-b"] });
+    let (status, _) = send(&router, put(1, good)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let host_id = registry.only_host();
+    let now = registry.binding_now(&host_id, "b1", unix_now()).unwrap();
+    assert_eq!(now.generation, 1);
+    assert_eq!(
+        now.endpoint,
+        Some(Endpoint {
+            base_url: "https://kb.example/api/v1".into(),
+            knowledge_base_ids: vec!["kb-a".into(), "kb-b".into()],
+        })
+    );
+
+    let too_many: Vec<String> = (0..=MAX_KNOWLEDGE_BASES)
+        .map(|i| format!("kb-{i}"))
+        .collect();
+    for (i, bad) in [
+        serde_json::json!({ "endpoint": "http://kb.example/api/v1", "knowledge_base_ids": ["kb-a"] }),
+        serde_json::json!({ "endpoint": "https://u:p@kb.example", "knowledge_base_ids": ["kb-a"] }),
+        serde_json::json!({ "endpoint": "https://kb.example", "knowledge_base_ids": [] }),
+        serde_json::json!({ "endpoint": "https://kb.example", "knowledge_base_ids": [" "] }),
+        serde_json::json!({ "endpoint": "https://kb.example", "knowledge_base_ids": ["a", "a"] }),
+        serde_json::json!({ "endpoint": "https://kb.example", "knowledge_base_ids": too_many }),
+        serde_json::json!({ "endpoint": "https://kb.example", "knowledge_base_ids": ["a"], "x": 1 }),
+        serde_json::json!({ "knowledge_base_ids": ["a"] }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (status, body) = send(&router, put(2 + i as u64, bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "case {i}");
+        assert!(!body.contains("kb.example"), "{body}");
+    }
+    // Refused before the registry: still generation 1, endpoint as it was.
+    let now = registry.binding_now(&host_id, "b1", unix_now()).unwrap();
+    assert_eq!((now.generation, now.endpoint.is_some()), (1, true));
+
+    // Loopback http is allowed; a deactivation drops the endpoint with C.
+    let local = serde_json::json!({ "endpoint": "http://127.0.0.1:8080/api/v1",
+                                    "knowledge_base_ids": ["kb-a"] });
+    assert_eq!(
+        send(&router, put(20, local)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    send(
+        &router,
+        request(Method::DELETE, &format!("{BINDING}?seq=21"), &host),
+    )
+    .await;
+    assert_eq!(registry.binding_now(&host_id, "b1", unix_now()), None);
+}
+
+#[tokio::test]
 async fn a_creative_runtime_is_refused() {
     let (state, _, creative) = crate::server::tests::capability_state().await;
     let registry = state.knowledge_host.clone();
