@@ -71,6 +71,15 @@ const en = {
   'module.fromEnabled': ' from enabled', 'module.fromDisabled': ' from disabled',
   'module.enabled': 'enabled', 'module.disabled': 'disabled',
   'module.detail': 'Version: {version}\nTakes effect immediately: disabling revokes the module\'s consent and stops it.',
+  'err.agentearNotPaired': 'AgentEar is not paired with this Agent24; nothing to change',
+  'err.agentearForbidden': 'The daemon refused this operation',
+  'err.agentearDaemon': 'The daemon could not complete this operation',
+  'agentear.disableMessage': 'Disable AgentEar?',
+  'agentear.disableDetail': 'AgentEar disconnects immediately and cannot reconnect until you enable it again here. Its pairing is kept: enabling it later does not need a new pairing.',
+  'agentear.enableMessage': 'Enable AgentEar?',
+  'agentear.enableDetail': 'AgentEar will be allowed to connect to Agent24 again with its existing pairing.',
+  'agentear.unpairMessage': 'Unpair AgentEar?',
+  'agentear.unpairDetail': 'AgentEar\'s credential is revoked and it disconnects immediately. This cannot be undone: to use AgentEar with Agent24 again you must pair AgentEar again from its menu bar.',
 } as const
 
 export type MainMessageKey = keyof typeof en
@@ -126,6 +135,15 @@ const zh: Record<MainMessageKey, string> = {
   'module.fromEnabled': '由 启用 ', 'module.fromDisabled': '由 停用 ',
   'module.enabled': '启用', 'module.disabled': '停用',
   'module.detail': '版本：{version}\n立即生效：停用会立刻撤销该模块的 consent 并停止它。',
+  'err.agentearNotPaired': 'AgentEar 尚未与本 Agent24 配对，无需操作',
+  'err.agentearForbidden': '守护进程拒绝了此操作',
+  'err.agentearDaemon': '守护进程未能完成此操作',
+  'agentear.disableMessage': '确认停用 AgentEar？',
+  'agentear.disableDetail': 'AgentEar 会立即断开，在你回到这里重新启用之前无法再连接。配对关系保留：之后启用不需要重新配对。',
+  'agentear.enableMessage': '确认启用 AgentEar？',
+  'agentear.enableDetail': 'AgentEar 将被允许用现有配对再次连接 Agent24。',
+  'agentear.unpairMessage': '确认解除与 AgentEar 的配对？',
+  'agentear.unpairDetail': 'AgentEar 的凭据会被撤销并立即断开。此操作不可撤回：之后要在 Agent24 中继续使用 AgentEar，必须在 AgentEar 菜单栏里重新配对。',
 }
 
 const th: Record<MainMessageKey, string> = {
@@ -179,6 +197,15 @@ const th: Record<MainMessageKey, string> = {
   'module.fromEnabled': 'จาก เปิดใช้งาน ', 'module.fromDisabled': 'จาก ปิดใช้งาน ',
   'module.enabled': 'เปิดใช้งาน', 'module.disabled': 'ปิดใช้งาน',
   'module.detail': 'เวอร์ชัน: {version}\nมีผลทันที: การปิดใช้งานจะเพิกถอน consent ของโมดูลและหยุดโมดูลนั้นทันที',
+  'err.agentearNotPaired': 'AgentEar ยังไม่ได้จับคู่กับ Agent24 นี้ ไม่มีอะไรต้องเปลี่ยน',
+  'err.agentearForbidden': 'daemon ปฏิเสธการดำเนินการนี้',
+  'err.agentearDaemon': 'daemon ดำเนินการนี้ไม่สำเร็จ',
+  'agentear.disableMessage': 'ยืนยันปิดใช้งาน AgentEar?',
+  'agentear.disableDetail': 'AgentEar จะตัดการเชื่อมต่อทันทีและเชื่อมต่อใหม่ไม่ได้จนกว่าคุณจะเปิดใช้งานอีกครั้งที่นี่ การจับคู่ยังคงอยู่ เปิดใช้งานภายหลังได้โดยไม่ต้องจับคู่ใหม่',
+  'agentear.enableMessage': 'ยืนยันเปิดใช้งาน AgentEar?',
+  'agentear.enableDetail': 'AgentEar จะได้รับอนุญาตให้เชื่อมต่อกับ Agent24 อีกครั้งด้วยการจับคู่เดิม',
+  'agentear.unpairMessage': 'ยืนยันยกเลิกการจับคู่ AgentEar?',
+  'agentear.unpairDetail': 'ข้อมูลรับรองของ AgentEar จะถูกเพิกถอนและตัดการเชื่อมต่อทันที ย้อนกลับไม่ได้ หากต้องการใช้ AgentEar กับ Agent24 อีก ต้องจับคู่ใหม่จากแถบเมนูของ AgentEar',
 }
 
 const TABLE: Record<MainLocale, Record<MainMessageKey, string>> = { en, zh, th }

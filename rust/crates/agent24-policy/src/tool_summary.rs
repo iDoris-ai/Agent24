@@ -54,6 +54,15 @@ pub fn module_tool_summary(
     summary
 }
 
+/// Whether `declaration` says its operation may act or send output outside
+/// the device (K1-6b.5f). Self-reported, so it is used only to withhold the
+/// same-source exception (ADR-K1-02 §2.1.1 item 6), never to allow anything.
+#[must_use]
+pub fn declares_outbound(declaration: &ToolDeclaration) -> bool {
+    declaration.risk() == RiskClass::External
+        || declaration.output_privacy() != DeclaredOutputPrivacy::LocalOnly
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -134,6 +143,25 @@ mod tests {
             let fingerprint =
                 module_tool_summary("documents", "1.0.0", variant).scope_fingerprint();
             assert!(seen.insert(fingerprint), "{variant:?}");
+        }
+    }
+
+    /// Only an operation declared both non-external and `local_only` may be
+    /// sent back its own module's results.
+    #[test]
+    fn only_a_local_non_external_declaration_is_not_outbound() {
+        for (risk, privacy, outbound) in [
+            ("read", "local_only", false),
+            ("write_local", "local_only", false),
+            ("external", "local_only", true),
+            ("read", "remote_allowed", true),
+        ] {
+            let declaration = declaration_with("Read", risk, privacy, "");
+            assert_eq!(
+                declares_outbound(&declaration),
+                outbound,
+                "{risk}/{privacy}"
+            );
         }
     }
 

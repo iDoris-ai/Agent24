@@ -27,6 +27,8 @@ mod idoris;
 mod module_tools;
 mod offline_db;
 mod query;
+mod runs;
+mod schedules;
 mod service;
 mod tui;
 
@@ -50,6 +52,18 @@ enum Command {
         /// Model id override
         #[arg(long)]
         model: Option<String>,
+        /// Chat with the daemon's personal memory, as the desktop's chat page
+        /// does for each conversation: what you remember is recalled for the
+        /// reply, and an explicit "记住…" is kept unless memory is paused, with
+        /// the daemon's receipt printed, a failed save included (none when the
+        /// message is not an explicit remember, or the daemon has no personal
+        /// memory). Memory is
+        /// shared by all your conversations; this id files the turn under one
+        /// of them, whose source floor (the strictest source it has recalled) a
+        /// new memory takes. Only this one message is sent, not the turns
+        /// before it
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        session: Option<String>,
         /// Confirm using iDoris's reserved memory headroom for this request
         #[arg(long)]
         confirm_headroom: bool,
@@ -118,7 +132,7 @@ enum Command {
         #[command(subcommand)]
         action: query::SessionAction,
     },
-    /// 读取 run 或列出 peer 可见的 run（只读）
+    /// run：列出、读取、取消，或列出 peer 可见的 run（桌面端 Runs 页）
     #[command(alias = "runs")]
     Run {
         #[command(subcommand)]
@@ -129,7 +143,8 @@ enum Command {
         #[command(subcommand)]
         action: query::MemoryAction,
     },
-    /// 定时任务：列出或读取一条（只读）
+    /// 定时任务：列出、读取、创建、修改、删除、立即触发（桌面端 Schedules 页）
+    #[command(alias = "schedules")]
     Schedule {
         #[command(subcommand)]
         action: query::ScheduleAction,
@@ -730,7 +745,41 @@ fn agent24d_binary() -> String {
         .unwrap_or_else(|| "agent24d".to_owned())
 }
 
-async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::Child), String> {
+/// Why `spawn_daemon` got no ready line.
+#[derive(Debug)]
+struct SpawnError {
+    message: String,
+    /// The start may have lost a concurrent-start race, so a winner may be
+    /// coming up: the daemon said `already_running`, or it gave no reason.
+    /// A daemon that said why it failed otherwise had no winner to wait for.
+    maybe_raced: bool,
+}
+
+impl From<String> for SpawnError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            maybe_raced: true,
+        }
+    }
+}
+
+impl From<&str> for SpawnError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+/// A SPEC-002 §4 `failed` line: what the daemon said before exiting.
+fn start_failure(line: &serde_json::Value) -> SpawnError {
+    let error = line["error"].as_str().unwrap_or("it gave no reason");
+    SpawnError {
+        message: format!("agent24d did not start: {error}"),
+        maybe_raced: line["code"] == "already_running",
+    }
+}
+
+async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::Child), SpawnError> {
     let bin = agent24d_binary();
     let mut cmd = tokio::process::Command::new(&bin);
     let mut args = vec!["serve", "--port", "0"];
@@ -755,7 +804,7 @@ async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::C
 async fn wait_daemon_ready(
     child: &mut tokio::process::Child,
     budget: Duration,
-) -> Result<DaemonState, String> {
+) -> Result<DaemonState, SpawnError> {
     let result = async {
         let stdout = child.stdout.take().ok_or("no stdout from agent24d")?;
         let mut lines = BufReader::new(stdout).lines();
@@ -764,16 +813,20 @@ async fn wait_daemon_ready(
             let next = tokio::time::timeout_at(deadline, lines.next_line()).await;
             let line = match next {
                 Ok(Ok(Some(line))) => line,
-                Ok(Ok(None)) => return Err("agent24d exited before ready line".to_owned()),
-                Ok(Err(e)) => return Err(format!("reading agent24d stdout: {e}")),
-                Err(_) => return Err("agent24d did not become ready within 15s".to_owned()),
+                Ok(Ok(None)) => return Err("agent24d exited before ready line".into()),
+                Ok(Err(e)) => return Err(format!("reading agent24d stdout: {e}").into()),
+                Err(_) => return Err("agent24d did not become ready within 15s".into()),
             };
-            if let Ok(state) = serde_json::from_str::<serde_json::Value>(&line)
-                && state["type"] == "ready"
-            {
+            let Ok(state) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if state["type"] == "ready" {
                 let pid = child.id().unwrap_or(0);
                 let parsed = parse_ready_state(&state, pid)?;
                 return Ok(parsed);
+            }
+            if state["type"] == "failed" {
+                return Err(start_failure(&state));
             }
         }
     }
@@ -942,7 +995,9 @@ async fn connect_detailed() -> Result<Endpoint, enroll::EnrollError> {
             DiscoveredAttach::Unreachable => {}
         }
     }
-    let (state, child) = spawn_daemon(true).await.map_err(unavailable)?;
+    let (state, child) = spawn_daemon(true)
+        .await
+        .map_err(|err| unavailable(err.message))?;
     let base = format!("http://127.0.0.1:{}", state.port);
     Ok(Endpoint {
         base,
@@ -1147,21 +1202,39 @@ async fn read_reply(
     })
 }
 
-async fn cmd_chat(
+fn chat_request(
     message: String,
     model: Option<String>,
+    session: Option<String>,
     confirm_headroom: bool,
-) -> Result<(), String> {
-    let ep = connect().await?;
-    let req = ChatRequest {
+) -> ChatRequest {
+    ChatRequest {
         idoris_headroom_confirmed: confirm_headroom,
         messages: vec![ChatMessage {
             role: "user".to_owned(),
             content: message,
         }],
         model,
-        session_id: None,
-    };
+        session_id: session,
+    }
+}
+
+fn receipt_line(receipt: agent24_protocol::MemoryReceipt) -> &'static str {
+    match receipt {
+        agent24_protocol::MemoryReceipt::Saved => "remembered",
+        agent24_protocol::MemoryReceipt::PausedNotSaved => {
+            "not remembered: personal memory is paused"
+        }
+        agent24_protocol::MemoryReceipt::Failed => "not remembered: saving it failed",
+        agent24_protocol::MemoryReceipt::NotSaved => "this turn was not saved to the session",
+        agent24_protocol::MemoryReceipt::Partial => {
+            "conversation saved, but the memory itself was not"
+        }
+    }
+}
+
+async fn cmd_chat(req: ChatRequest) -> Result<(), String> {
+    let ep = connect().await?;
     let result = bearer(&ep, client().post(format!("{}/api/v1/chat", ep.base)))
         .timeout(Duration::from_secs(180))
         .json(&req)
@@ -1177,6 +1250,11 @@ async fn cmd_chat(
             let body: ChatResponse = res.json().await.map_err(|e| e.to_string())?;
             println!("{}", body.message.content);
             println!("· {} tokens", body.usage.total_tokens);
+            // What the daemon did with an explicit "记住…", never what the
+            // reply claims (the desktop shows the same receipt).
+            if let Some(receipt) = body.memory_receipt {
+                println!("· {}", receipt_line(receipt));
+            }
             if let Some(record_id) = gateway_record_id {
                 println!("· iDoris record {record_id}");
             }
@@ -2752,6 +2830,7 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
             }
             let (state, child) = match spawn_daemon(false).await {
                 Ok(v) => v,
+                Err(err) if !err.maybe_raced => return Err(err.message),
                 Err(err) => {
                     // Lost a concurrent-start race? The winner holds the
                     // singleton lock and our child exited before ready. The
@@ -2770,7 +2849,7 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
                         }
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
-                    return Err(err);
+                    return Err(err.message);
                 }
             };
             // Detach: without kill_on_drop, dropping the handle leaves the
@@ -2947,8 +3026,9 @@ async fn main() -> std::process::ExitCode {
         Command::Chat {
             message,
             model,
+            session,
             confirm_headroom,
-        } => cmd_chat(message, model, confirm_headroom).await,
+        } => cmd_chat(chat_request(message, model, session, confirm_headroom)).await,
         Command::Models => cmd_models().await,
         Command::Idoris { action } => idoris::run(action).await,
         Command::Daemon { action } => cmd_daemon(action).await,
@@ -3554,7 +3634,7 @@ mod tests {
         // Clean up the negative control before asserting, too.
         let _ = child.kill().await;
         assert_eq!(
-            result.unwrap_err(),
+            result.unwrap_err().message,
             "agent24d did not become ready within 15s"
         );
         assert!(
@@ -3587,7 +3667,7 @@ mod tests {
             let reaped = child.try_wait().unwrap().is_some();
             let _ = child.kill().await;
             if port == 0 {
-                assert_eq!(result.unwrap_err(), "ready line has invalid port");
+                assert_eq!(result.unwrap_err().message, "ready line has invalid port");
                 assert!(reaped, "invalid readiness must not leave a daemon behind");
             } else {
                 assert_eq!(result.unwrap().port, port);
@@ -3697,6 +3777,38 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// `--session` reaches the request as the desktop's chat page sends it;
+    /// without it the chat stays session-less.
+    #[test]
+    fn chat_sends_the_session_it_was_given() {
+        let request = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Chat {
+                message,
+                model,
+                session,
+                confirm_headroom,
+            } = cli.command
+            else {
+                panic!("not a chat");
+            };
+            serde_json::to_value(chat_request(message, model, session, confirm_headroom)).unwrap()
+        };
+        let body = request(&["agent24", "chat", "hi", "--session", "chat_1"]);
+        assert_eq!(body["session_id"], "chat_1", "{body}");
+        assert_eq!(body["messages"][0]["content"], "hi", "{body}");
+        let body = request(&["agent24", "chat", "hi"]);
+        assert_eq!(body.get("session_id"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn a_remember_receipt_says_what_the_daemon_did() {
+        use agent24_protocol::MemoryReceipt::{Failed, PausedNotSaved, Saved};
+        assert_eq!(receipt_line(Saved), "remembered");
+        assert!(receipt_line(PausedNotSaved).contains("paused"));
+        assert!(receipt_line(Failed).contains("failed"));
     }
 
     #[test]

@@ -3,8 +3,9 @@ import { promisify } from 'node:util'
 import { constants } from 'node:fs'
 import { access, lstat, realpath, readlink, stat } from 'node:fs/promises'
 import path from 'node:path'
+import { homedir } from 'node:os'
 import { randomUUID } from 'node:crypto'
-import type { CliToolStatus, CliInstallResult } from '../shared/ipc-types'
+import type { CliToolStatus, CliInstallResult, CliToolPathStatus } from '../shared/ipc-types'
 
 const run = promisify(execFile)
 export const CLI_DESTINATION = '/usr/local/bin/agent24'
@@ -52,7 +53,7 @@ export async function resolveBundledCli(executable: string, resources: string): 
 
 async function versionOf(executable: string): Promise<string | null> {
   try {
-    const { stdout } = await run(executable, ['--version'], { timeout: 3_000, maxBuffer: 4096 })
+    const { stdout } = await run(executable, ['--version'], { timeout: 3_000, killSignal: 'SIGKILL', maxBuffer: 4096 })
     const version = /^agent24\s+(\S+)\s*$/.exec(stdout.trim())?.[1]
     return version && parseVersion(version) ? version : null
   } catch { return null }
@@ -82,16 +83,51 @@ async function loginPath(): Promise<string> {
 }
 
 export async function cliToolStatus(executable: string, resources: string, packaged: boolean): Promise<CliToolStatus> {
-  if (process.platform !== 'darwin' || !packaged) return { state: 'unavailable', path: null, version: null, bundledVersion: null }
+  if (process.platform !== 'darwin' || !packaged) return { state: 'unavailable', path: null, version: null, bundledVersion: null, paths: [] }
   const command = await inspectCommand(await loginPath())
   try {
     const target = await resolveBundledCli(executable, resources)
     const bundledVersion = await versionOf(target)
-    if (!bundledVersion) return { ...command, bundledVersion: null, state: 'unavailable' }
+    if (!bundledVersion) return { ...command, bundledVersion: null, state: 'unavailable', paths: [] }
+    const paths = await Promise.all([CLI_DESTINATION, userCliDestination()].map((destination) => inspectCliPath(destination, target, bundledVersion)))
+    const problem = [...paths].reverse().find((item) => item.state === 'outdated' || item.state === 'missing')
+    if (problem) return { ...problem, bundledVersion, paths }
     const comparison = command.version ? compareVersions(command.version, bundledVersion) : null
     const state = !command.path ? 'missing' : comparison === null ? 'unknown' : comparison < 0 ? 'outdated' : comparison > 0 ? 'newer' : 'current'
-    return { ...command, bundledVersion, state }
-  } catch { return { ...command, bundledVersion: null, state: 'unavailable' } }
+    return { ...command, bundledVersion, state, paths }
+  } catch { return { ...command, bundledVersion: null, state: 'unavailable', paths: [] } }
+}
+
+function userCliDestination(): string {
+  return path.join(homedir(), '.agent24/bin/agent24')
+}
+
+export async function inspectCliPath(destination: string, target: string, bundledVersion: string): Promise<CliToolPathStatus> {
+  try {
+    await lstat(destination)
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return { path: destination, link: 'missing', state: 'missing', version: null }
+    return { path: destination, link: 'other', state: 'outdated', version: null }
+  }
+  try {
+    if ((await lstat(destination)).isSymbolicLink() && await realpath(destination) === target) {
+      return { path: destination, link: 'current', state: 'current', version: bundledVersion }
+    }
+  } catch { /* Dangling links still need replacement. */ }
+  const version = await versionOf(destination)
+  const comparison = version ? compareVersions(version, bundledVersion) : null
+  return { path: destination, link: 'other', version, state: comparison === null || comparison < 0 ? 'outdated' : comparison > 0 ? 'newer' : 'current' }
+}
+
+export async function installUserCli(target: string): Promise<CliInstallResult> {
+  const destination = userCliDestination()
+  const version = await versionOf(target)
+  if (!version) throw new Error('Bundled CLI version unavailable')
+  const status = await inspectCliPath(destination, target, version)
+  if (status.link === 'other' && status.state !== 'outdated' && !(await lstat(destination)).isSymbolicLink()) {
+    return { state: 'installed', backup: null }
+  }
+  return installLink({ target, destination, confirm: async () => true })
 }
 
 export function shellQuote(value: string): string {
@@ -139,7 +175,9 @@ export async function installLink(options: {
   if (before && (await lstat(destination)).isSymbolicLink() && await readlink(destination) === target) return { state: 'installed', backup: null }
   if (before && !await options.confirm()) return { state: 'cancelled' }
   if (await identity(destination) !== before || await realpath(target) !== target) throw new Error('Installation paths changed')
-  const backup = before ? `${destination}.bak-${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID()}` : null
+  const replaceSymlink = destination === userCliDestination() && before && (await lstat(destination)).isSymbolicLink()
+  const backup = before && !replaceSymlink ? `${destination}.bak-${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID()}` : null
+  const temporary = `${destination}.tmp-${randomUUID()}`
   const q = shellQuote
   const parents: string[] = []
   for (const start of [path.dirname(destination), target]) {
@@ -149,12 +187,20 @@ export async function installLink(options: {
   // a destination that appeared or changed while the user was deciding.
   const expected = before ? before.split(':').slice(0, 2).join(':') : null
   const statFormat = process.platform === 'darwin' ? "-f '%d:%i'" : "-c '%d:%i'"
+  const absent = `[ ! -e ${q(destination)} ] && [ ! -L ${q(destination)} ]`
   const check = expected
     ? `[ "$(/usr/bin/stat ${statFormat} ${q(destination)})" = ${q(expected)} ]`
-    : `[ ! -e ${q(destination)} ] && [ ! -L ${q(destination)} ]`
+    : absent
   const move = backup ? `[ ! -e ${q(backup)} ] && [ ! -L ${q(backup)} ] && /bin/mv -n ${q(destination)} ${q(backup)} && ` : ''
-  const rollback = backup ? `/bin/mv -n ${q(backup)} ${q(destination)}; ` : ''
-  const script = `${parents.join(' && ')} && [ -f ${q(target)} ] && [ -x ${q(target)} ] && ${check} && /bin/mkdir -p ${q(path.dirname(destination))} && ${move}{ /bin/ln -s ${q(target)} ${q(destination)} || { ${rollback}exit 1; }; }`
+  const rollback = backup ? `${absent} && /bin/mv -n ${q(backup)} ${q(destination)}; ` : ''
+  // Match daemon state_file::write: keep the data directory private; only bin is 0755.
+  const dataDirectory = destination === userCliDestination() ? `/bin/mkdir -p -m 700 ${q(path.dirname(path.dirname(destination)))} && ` : ''
+  const mkdir = `${dataDirectory}/bin/mkdir -p -m 755 ${q(path.dirname(destination))}`
+  const guards = `${parents.join(' && ')} && [ -f ${q(target)} ] && [ -x ${q(target)} ]`
+  // -h (BSD) / -T (GNU) replaces even a link to a directory rather than following it.
+  const rename = `/bin/mv ${process.platform === 'darwin' ? '-fh' : '-fT'} ${q(temporary)} ${q(destination)}`
+  const notDirectory = `[ ! -d ${q(destination)} ]`
+  const script = `${guards} && ${check} && ${mkdir} && ${move}{ /bin/ln -s ${q(target)} ${q(temporary)} && ${guards} && ${backup ? absent : check} && ${notDirectory} && ${rename} && [ -L ${q(destination)} ] && ${notDirectory} || { /bin/rm -f ${q(temporary)}; ${rollback}exit 1; }; }`
   try {
     await run('/bin/sh', ['-c', script], { timeout: 10_000, maxBuffer: 4096, env: { ...process.env, LC_ALL: 'C' } })
   } catch (error) {
@@ -173,12 +219,14 @@ export async function installLink(options: {
 
 export async function installBundledCli(options: {
   executable: string; resources: string; packaged: boolean; confirm: () => Promise<boolean>
+  userOnly?: boolean
 }): Promise<CliInstallResult> {
   if (process.platform !== 'darwin' || !options.packaged) return { state: 'failed' }
   try {
     const target = await resolveBundledCli(options.executable, options.resources)
     // A link into a mounted DMG / App Translocation would break after ejecting.
     if (target.startsWith('/Volumes/') || target.includes('/AppTranslocation/')) return { state: 'move-app' }
+    if (options.userOnly) return await installUserCli(target)
     return await installLink({
       target, destination: CLI_DESTINATION, confirm: options.confirm,
       elevate: async (script) => { await run('/usr/bin/osascript', ['-e', appleScript(script)], { timeout: 120_000, maxBuffer: 4096 }) },

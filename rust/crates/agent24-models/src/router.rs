@@ -271,13 +271,6 @@ impl ModelRouter {
             .map_err(ModelError::Provider)
     }
 
-    #[must_use]
-    pub fn has_remote_tier(&self) -> bool {
-        self.providers
-            .iter()
-            .any(|routed| routed.tier == Tier::Remote)
-    }
-
     /// Build from `(provider, tier)` pairs. Cooldown grows exponentially from
     /// `base_cooldown`, capped at `max_cooldown`.
     ///
@@ -1173,6 +1166,103 @@ mod tests {
             0,
             "remote must never be called for LocalOnly"
         );
+    }
+
+    /// Completes under a gate that allows every request, with a valid cloud
+    /// grant: nothing but the LocalOnly exclusion in `tier_order` stands
+    /// between a task and a remote provider (K1-6b.5e prerequisite, #1209
+    /// PR-Daemon).
+    async fn complete_granted(
+        r: &ModelRouter,
+        privacy: Privacy,
+        complexity: Complexity,
+    ) -> Result<(String, CompletionResponse), ModelError> {
+        let (gate, resources) = authorized_test_scope();
+        r.complete_with_egress(
+            TaskProfile {
+                privacy,
+                complexity,
+            },
+            &req(),
+            &CancellationToken::new(),
+            gate,
+            resources,
+            1,
+        )
+        .await
+    }
+
+    /// With only a remote provider, the granting gate serves a task with no
+    /// privacy label (the control) and never a LocalOnly one.
+    #[tokio::test]
+    async fn a_granting_gate_never_serves_local_only_from_a_lone_remote() {
+        for complexity in [Complexity::Simple, Complexity::Complex] {
+            let remote = StubProvider::ok("remote");
+            let r = router(vec![(remote.clone(), Tier::Remote)]);
+            let (name, _) = complete_granted(&r, Privacy::Any, complexity)
+                .await
+                .unwrap();
+            assert_eq!(name, "remote", "{complexity:?}");
+            assert_eq!(remote.calls(), 1, "{complexity:?}");
+
+            let err = complete_granted(&r, Privacy::LocalOnly, complexity)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ModelError::Unavailable(_)),
+                "{complexity:?}: {err}"
+            );
+            assert_eq!(remote.calls(), 1, "{complexity:?}");
+        }
+    }
+
+    /// A local provider that fails does not hand a LocalOnly task to the
+    /// remote one the gate would let through.
+    #[tokio::test]
+    async fn a_granting_gate_never_serves_local_only_when_local_fails() {
+        for complexity in [Complexity::Simple, Complexity::Complex] {
+            let local = StubProvider::down("local");
+            let remote = StubProvider::ok("remote");
+            let r = router(vec![
+                (local.clone(), Tier::Local),
+                (remote.clone(), Tier::Remote),
+            ]);
+            let err = complete_granted(&r, Privacy::LocalOnly, complexity)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ModelError::Unavailable(_)),
+                "{complexity:?}: {err}"
+            );
+            assert_eq!(local.calls(), 1, "{complexity:?}");
+            assert_eq!(remote.calls(), 0, "{complexity:?}");
+        }
+    }
+
+    /// Nor does one cooling down after a failure, when no local provider is
+    /// left to try at all.
+    #[tokio::test]
+    async fn a_granting_gate_never_serves_local_only_while_local_cools_down() {
+        for complexity in [Complexity::Simple, Complexity::Complex] {
+            let local = StubProvider::down("local");
+            let remote = StubProvider::ok("remote");
+            let r = router(vec![
+                (local.clone(), Tier::Local),
+                (remote.clone(), Tier::Remote),
+            ]);
+            complete_granted(&r, Privacy::LocalOnly, complexity)
+                .await
+                .unwrap_err();
+            let err = complete_granted(&r, Privacy::LocalOnly, complexity)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ModelError::Unavailable(_)),
+                "{complexity:?}: {err}"
+            );
+            assert_eq!(local.calls(), 1, "{complexity:?}: cooling, not retried");
+            assert_eq!(remote.calls(), 0, "{complexity:?}");
+        }
     }
 
     #[tokio::test]

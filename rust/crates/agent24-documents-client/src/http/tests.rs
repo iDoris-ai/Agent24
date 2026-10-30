@@ -82,18 +82,24 @@ fn only_a_loopback_daemon_address_is_taken() {
 
 #[tokio::test]
 async fn a_request_goes_out_with_its_bearer_headers_and_body_and_the_reply_comes_back() {
-    let (base, task) = serve(Some(http("201 Created", r#"{"ok":1}"#, ""))).await;
+    let scale = "Documents-Render-Scale: 0.5\r\n";
+    let (base, task) = serve(Some(http("201 Created", r#"{"ok":1}"#, scale))).await;
     let t = HttpTransport::new(&base, Some("tok-123".to_owned())).unwrap();
     let reply = t
         .send(post("/api/v1/documents/uploads", b"{\"a\":1}"))
         .await;
-    assert_eq!(
-        reply,
-        Reply::Http {
-            status: 201,
-            body: br#"{"ok":1}"#.to_vec()
-        }
-    );
+    let Reply::Http {
+        status,
+        headers,
+        body,
+    } = reply
+    else {
+        panic!("{reply:?}");
+    };
+    assert_eq!((status, body), (201, br#"{"ok":1}"#.to_vec()));
+    // Names in lower case, values as sent.
+    let header = ("documents-render-scale".to_owned(), "0.5".to_owned());
+    assert!(headers.contains(&header), "{headers:?}");
     let seen = task.await.unwrap();
     assert!(
         seen.starts_with("POST /api/v1/documents/uploads HTTP/1.1\r\n"),
@@ -121,12 +127,9 @@ async fn a_redirect_is_returned_as_it_is_never_followed() {
     .await;
     let t = HttpTransport::new(&base, Some("tok".to_owned())).unwrap();
     let reply = t.send(post("/api/v1/documents/imports", b"{}")).await;
-    assert_eq!(
-        reply,
-        Reply::Http {
-            status: 302,
-            body: Vec::new()
-        }
+    assert!(
+        matches!(&reply, Reply::Http { status: 302, body, .. } if body.is_empty()),
+        "{reply:?}"
     );
     task.await.unwrap();
 }
@@ -176,4 +179,21 @@ async fn a_path_that_does_not_start_with_a_slash_is_never_sent() {
     let reply = t.send(post("@evil.example/x", b"")).await;
     assert_eq!(reply, failed(400, "invalid_request", "not a daemon path"));
     task.abort();
+}
+
+#[tokio::test]
+async fn a_header_that_is_not_text_is_kept_not_dropped() {
+    // Dropped, it could hide a second Documents-Render-Scale (ops.rs).
+    let mut reply =
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\nDocuments-Render-Scale: "
+            .to_vec();
+    reply.extend_from_slice(b"\xff\r\n\r\n");
+    let (base, task) = serve(Some(reply)).await;
+    let t = HttpTransport::new(&base, Some("tok".to_owned())).unwrap();
+    let Reply::Http { headers, .. } = t.send(post("/api/v1/documents/x", b"{}")).await else {
+        panic!("expected a reply");
+    };
+    let header = ("documents-render-scale".to_owned(), "\u{fffd}".to_owned());
+    assert!(headers.contains(&header), "{headers:?}");
+    task.await.unwrap();
 }

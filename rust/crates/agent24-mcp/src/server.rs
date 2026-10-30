@@ -12,10 +12,11 @@
 //!
 //! Run content reaches the caller only through the kernel's peer views
 //! (`/api/v1/peer/runs`, K1-6b.5c-2): a run whose sources are not all Ordinary,
-//! or that may have taken in an untagged tool result (it called a tool,
-//! recalled a memory, was started by a self-wake, or has session context),
-//! comes back as its status and a fixed notice, never its prompt, output or
-//! error.
+//! that made a tool call without its own result tag (K1-6b.5f-3), or that may
+//! have taken in an earlier run's tool results (it recalled a memory, was
+//! started by a self-wake, or has session context), comes back as its status
+//! and a fixed notice, never its prompt, output or error. A failed daemon
+//! call relays only its HTTP status, never the error body.
 //!
 //! It deliberately does NOT expose raw `shell_exec`/`fs_write` as MCP tools:
 //! that would hand a third party an un-gated execution path. Every side effect
@@ -162,12 +163,12 @@ impl Agent24Server {
             .await
             .map_err(|e| format!("daemon unreachable: {e}"))?;
         let status = res.status();
-        let body = res.text().await.map_err(|e| e.to_string())?;
-        if status.is_success() {
-            Ok(body)
-        } else {
-            Err(format!("daemon returned {status}: {body}"))
+        if !status.is_success() {
+            // Status only, as for a failed run create: an error body is not a
+            // peer view (K1-6b.5c-2).
+            return Err(format!("daemon returned {status}; see the agent24d log"));
         }
+        res.text().await.map_err(|e| e.to_string())
     }
 
     /// [`Self::run`] under a hard total time limit: a daemon that accepts the
@@ -599,6 +600,73 @@ mod tests {
             .unwrap();
         assert_eq!(text, r#"{"runs":[]}"#);
         assert_eq!(read_paths(&seen), ["GET /api/v1/peer/runs HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_relays_only_its_status() {
+        for (tool, route) in [
+            ("agent24_list_runs", "GET /api/v1/peer/runs"),
+            ("agent24_list_tools", "GET /api/v1/tools"),
+        ] {
+            let (base, _) =
+                routed_daemon(vec![(route, 500, format!(r#"{{"leak":"{SECRET}"}}"#))]).await;
+            let server = Agent24Server::new(base, "tok".to_owned());
+            let err = server.dispatch(tool, &Map::new()).await.unwrap_err();
+            assert!(err.contains("500"), "{tool}: {err}");
+            assert!(!err.contains(SECRET), "{tool}: {err}");
+        }
+    }
+
+    /// A mock daemon that creates run_1 and answers successive polls of its
+    /// peer view with `views` in order, repeating the last one.
+    async fn polled_daemon(views: Vec<String>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let views = std::sync::Arc::new(std::sync::Mutex::new(views));
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let views = std::sync::Arc::clone(&views);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let (status, body) = if request.starts_with("POST /api/v1/runs ") {
+                        (202, created_run())
+                    } else if request.starts_with("GET /api/v1/peer/runs/run_1 ") {
+                        let mut views = views.lock().unwrap();
+                        let view = if views.len() > 1 {
+                            views.remove(0)
+                        } else {
+                            views[0].clone()
+                        };
+                        (200, view)
+                    } else {
+                        (404, String::new())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_run_withheld_only_when_it_ends_still_ends_as_its_notice() {
+        for status in ["completed", "failed"] {
+            let base =
+                polled_daemon(vec![peer_run("running", false), peer_run(status, true)]).await;
+            let server = Agent24Server::new(base, "tok".to_owned());
+            let err = server
+                .dispatch("agent24_run", &run_args())
+                .await
+                .unwrap_err();
+            assert_eq!(err, format!("run {status}: withheld by agent24d"));
+        }
     }
 
     /// End-to-end through the ACTUAL MCP protocol: a real rmcp client, connected

@@ -182,11 +182,13 @@ async fn host() -> Result<Endpoint, Failure> {
         }
     }
     let (state, _child) = spawn_daemon(false).await.map_err(|error| {
-        Failure::local(if error.contains(super::HOST_AUTHORITY_UNAVAILABLE) {
-            "host_authority_unavailable"
-        } else {
-            "daemon_unavailable"
-        })
+        Failure::local(
+            if error.message.contains(super::HOST_AUTHORITY_UNAVAILABLE) {
+                "host_authority_unavailable"
+            } else {
+                "daemon_unavailable"
+            },
+        )
     })?;
     endpoint_from_state(state).map_err(|_| Failure::local("host_authority_unavailable"))
 }

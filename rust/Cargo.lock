@@ -53,6 +53,7 @@ dependencies = [
  "agent24-os-packages",
  "agent24-protocol",
  "agent24-store",
+ "base64",
  "clap",
  "crossterm",
  "fs2",
@@ -151,6 +152,7 @@ dependencies = [
 name = "agent24-documents-client"
 version = "0.6.0"
 dependencies = [
+ "base64",
  "reqwest",
  "serde",
  "serde_json",
