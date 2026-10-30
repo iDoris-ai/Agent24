@@ -37,7 +37,7 @@
 | E0 | 按 main 的做法激活绑定并推入 C | 两次 PUT 都返回 204 |
 | E1 | 带绑定的主对话 run 完成 | run 状态为 `completed` |
 | E2 | 检索 | 这一轮的第一个工具结果是 `knowledge.search`，有证据，每条都来自本次新建的知识库，并有一条的 snippet 含完整的样本事实（「每周三晚上八点闭馆」和「林小满」） |
-| E3 | 先读回，再引用 | 这一轮里有 `knowledge_read` 的结果，给出带 `content_tag` 的 `use: citation` 证据。回答在「来源」之前的正文里有「八点」和「林小满」，「来源」之后列出的 `knowledge_id#chunk_id` 正是读回的 citation。stub 的回答正文就是读回的那段文字，不是写死的答案 |
+| E3 | 先读回，再引用 | 这一轮里有 `knowledge_read` 的结果，给出带 `content_tag` 的 `use: citation` 证据。回答在「来源」之前的正文（去掉 Markdown）里，同一行有「周三」「闭馆」和晚上八点（晚上八点、晚上8点、20:00、20点；八点半、20:30 不算），并有「林小满」。「来源」之后列出的每个 `knowledge_id#chunk_id` 都是读回的 citation，至少一个。stub 的回答正文就是读回的那段文字，不是写死的答案 |
 | E4 | 同一会话的下一轮照样能检索 | 第二轮 run 完成。只看这一轮（最后一条用户消息之后）的工具结果，其中有含样本事实的证据 |
 | E5 | 回源 | 在新的一轮里，按引用（`knowledge_id`、`chunk_id`、`content_tag`）调 `knowledge_read`。读回的同一个 `chunk_id` 块必须是 `use: citation`，`content_tag` 非空且与命中一致，这一块的正文含样本事实 |
 | E6 | 同一个 run 里检索第二次 | 两次检索都拿到含样本事实的证据（Knowledge 同源例外，ADR-K1-02 §2.1.1 第 6 条） |
