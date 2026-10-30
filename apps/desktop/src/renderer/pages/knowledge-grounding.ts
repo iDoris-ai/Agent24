@@ -19,8 +19,8 @@ export type Grounding =
 // run of these characters, so `Sources:`, `~~` or a full stop around one is
 // not part of it, and `a#b+c#d` is two sources. Broad on purpose: a made-up
 // source left unmarked is worse than a URL's fragment marked as not read.
-// WeKnora's IDs are UUIDs; an ID with other characters would be split and
-// marked, never passed over.
+// WeKnora's IDs are UUIDs; an ID with other characters is split, and each
+// part checked as if it were the whole.
 const CITED = /[A-Za-z0-9_-]+#[A-Za-z0-9_-]+/g
 
 /** Each `knowledge_id#chunk_id` in `text`, once, in order. */
