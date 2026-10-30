@@ -397,8 +397,9 @@ describe('ChatPage with Knowledge when iDoris needs reserved memory', () => {
       writable: true,
       configurable: true,
     })
+    let sessions = 0
     mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { idoris_headroom_confirmed?: boolean } }) => {
-      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: `s${++sessions}` } }
       if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: req.body?.idoris_headroom_confirmed ? 'r2' : 'r1' } }
       return req.path.endsWith('/r1')
         ? { ok: true, status: 200, data: { status: 'failed', error: { code: 'idoris_headroom_confirmation_required', message: 'reserved memory' } } }
@@ -418,6 +419,7 @@ describe('ChatPage with Knowledge when iDoris needs reserved memory', () => {
       { prompt: 'q', session_id: 's1' },
       { prompt: 'q', session_id: 's1', idoris_headroom_confirmed: true },
     ])
+    expect(sessions).toBe(1)
   })
 })
 
