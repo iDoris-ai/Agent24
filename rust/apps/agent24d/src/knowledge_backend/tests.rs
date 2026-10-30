@@ -21,6 +21,9 @@ fn fixture(name: &str) -> Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
+/// A value put into an answer's body.
+type MakeValue = fn() -> Value;
+
 /// What the fake server does with a request.
 #[derive(Clone)]
 enum Answer {
@@ -36,7 +39,7 @@ enum Answer {
     /// The fixture's response with another request id.
     WrongEcho(&'static str),
     /// As `Fixture`, with the value at a JSON pointer of the body replaced.
-    Altered(&'static str, &'static str, fn() -> Value),
+    Altered(&'static str, &'static str, MakeValue),
     /// Never answers.
     Hang,
     Fail(TransportError),
@@ -289,7 +292,7 @@ async fn a_read_answered_with_another_document_or_chunk_is_refused() {
             }))
         )
     };
-    let cases: [(&str, fn() -> Value); 3] = [
+    let cases: [(&str, MakeValue); 3] = [
         ("/knowledge_id", || json!("doc-other")),
         ("/segments/0/chunk_id", || json!("chk-other")),
         // That chunk alone (R4.3), so not none of it either.
