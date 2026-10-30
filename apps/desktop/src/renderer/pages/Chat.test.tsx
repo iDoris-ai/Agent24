@@ -325,6 +325,39 @@ describe('ChatPage with Knowledge', () => {
   })
 })
 
+describe('ChatPage with Knowledge on another server', () => {
+  beforeEach(() => { setLocale('zh') })
+
+  it('starts a new session once the endpoint or knowledge bases change', async () => {
+    const status = vi.fn()
+      .mockResolvedValueOnce({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] })
+      .mockResolvedValueOnce({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] })
+      .mockResolvedValue({ enabled: true, active: true, endpoint: 'https://b.example/api/v1', knowledgeBaseIds: ['kb'] })
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: mockBackendProxy, knowledge: { status } },
+      writable: true,
+      configurable: true,
+    })
+    let sessions = 0
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: `s${++sessions}` } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: 'r1' } }
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: `answer ${sessions}` } } }
+    })
+
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    for (const text of ['one', 'two', 'three']) {
+      fireEvent.change(textarea, { target: { value: text } })
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+      await waitFor(() => expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ body: expect.objectContaining({ prompt: text }) })), { timeout: 3000 })
+      await waitFor(() => expect(screen.queryByText(/思考中|thinking/i)).toBeNull(), { timeout: 3000 })
+    }
+    const runs = mockBackendProxy.mock.calls.map(([req]) => req).filter((req) => req.method === 'POST' && req.path === '/api/v1/runs')
+    expect(runs.map((req) => req.body.session_id)).toEqual(['s1', 's1', 's2'])
+  })
+})
+
 describe('ChatPage English default', () => {
   it('shows the English welcome copy', () => {
     render(<ChatPage />)

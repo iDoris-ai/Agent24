@@ -56,6 +56,11 @@ export default function ChatPage() {
   // Knowledge on: turns go to /runs, in a real session created once.
   const [awaitingApproval, setAwaitingApproval] = useState(false)
   const runSession = useRef<string | null>(null)
+  // The endpoint and knowledge bases the session's turns searched: a session
+  // carries its earlier Knowledge results into later runs, which may send
+  // them back to the Knowledge server (decision
+  // 2026-10-30-knowledge-same-source-egress), so another server gets a new session.
+  const runScope = useRef<string | null>(null)
   const awaitingConfirmation = messages.some(m => m.role === 'user' && m.delivery.kind === 'headroom')
 
   useEffect(() => {
@@ -93,8 +98,13 @@ export default function ChatPage() {
     const sentAt = performance.now()
 
     // Asked of main on every turn: it may have turned On since the page opened.
-    const knowledgeOn = await window.agent24.knowledge?.status().then((status) => status?.active === true, () => false)
-    if (knowledgeOn) {
+    const knowledge = await window.agent24.knowledge?.status().then((status) => status, () => null)
+    if (knowledge?.active === true) {
+      const scope = JSON.stringify([knowledge.endpoint, knowledge.knowledgeBaseIds])
+      if (runScope.current !== scope) {
+        runSession.current = null
+        runScope.current = scope
+      }
       await replyWithKnowledge(index, request)
       return
     }

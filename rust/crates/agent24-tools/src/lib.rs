@@ -172,14 +172,29 @@ impl ToolContext {
         self.authorize_egress(purpose, destination).await
     }
 
-    /// This context without the results `module` itself returned: their
-    /// ids are host-written ([`agent24_store::SourceRef::tool_result`]), so
-    /// a source from anywhere else never matches.
+    /// This context without the results `module` itself returned.
     fn without_results_of_module(&self, module: &str) -> Self {
-        let own = format!("{}module:{module}:", agent24_store::TOOL_RESULT_PREFIX);
+        self.without_results_from(&[&format!("module:{module}")])
+    }
+
+    /// This context without the results that came from `origins`, named as
+    /// [`ToolResultSource::origin`] names them (`module:{id}`, `tool:{name}`):
+    /// the same-source exception (ADR-K1-02 §2.1.1 item 6) for a caller that
+    /// sends only back to where those results came from. Their ids are
+    /// host-written ([`agent24_store::SourceRef::tool_result`]), in a run and
+    /// across a session's turns alike, so a source from anywhere else never
+    /// matches.
+    #[must_use]
+    pub fn without_results_from(&self, origins: &[&str]) -> Self {
+        let own: Vec<String> = origins
+            .iter()
+            .map(|origin| format!("{}{origin}:", agent24_store::TOOL_RESULT_PREFIX))
+            .collect();
         let mut ctx = self.clone();
-        ctx.egress_resources
-            .retain(|resource| !resource.resource_id.starts_with(&own));
+        ctx.egress_resources.retain(|resource| {
+            !own.iter()
+                .any(|prefix| resource.resource_id.starts_with(prefix))
+        });
         ctx
     }
 
