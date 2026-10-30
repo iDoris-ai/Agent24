@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Operation {
     ModelsAdmin,
+    ComponentInstall,
     WorkspaceCreate,
     WorkspaceRelease,
     HostLease,
@@ -87,6 +88,7 @@ impl Operation {
     pub const fn action(self) -> &'static str {
         match self {
             Self::ModelsAdmin => "models.admin",
+            Self::ComponentInstall => "component.install",
             Self::WorkspaceCreate => "workspace.create",
             Self::WorkspaceRelease => "workspace.release",
             Self::HostLease => "host.lease",
@@ -136,6 +138,7 @@ impl Operation {
     pub fn from_action(action: &str) -> Option<Self> {
         Some(match action {
             "models.admin" => Self::ModelsAdmin,
+            "component.install" => Self::ComponentInstall,
             "workspace.create" => Self::WorkspaceCreate,
             "workspace.release" => Self::WorkspaceRelease,
             "host.lease" => Self::HostLease,

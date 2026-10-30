@@ -5,14 +5,14 @@ import { setLocale } from '../../i18n'
 import CommunicationPage from './Communication'
 import {
   getCommStatus, listCommContacts, listCommIdentities, listCommRelays,
-  startCommDaemon, stopCommDaemon, unlockComm,
+  startCommDaemon, stopCommDaemon, unlockComm, installComm,
   CommApiError, type CommDaemonStatus,
 } from './api'
 
 vi.mock('./api', async (importActual) => ({
   CommApiError: (await importActual<typeof import('./api')>()).CommApiError,
   getCommStatus: vi.fn(), listCommContacts: vi.fn(), listCommIdentities: vi.fn(), listCommRelays: vi.fn(),
-  startCommDaemon: vi.fn(), stopCommDaemon: vi.fn(), unlockComm: vi.fn(),
+  startCommDaemon: vi.fn(), stopCommDaemon: vi.fn(), unlockComm: vi.fn(), installComm: vi.fn(),
 }))
 
 const identity = { nickname: 'alice', npub: 'npub1alice', default: true, encrypted: true }
@@ -38,6 +38,23 @@ afterEach(() => { cleanup(); vi.clearAllMocks() })
 
 describe('CommunicationPage', () => {
   beforeEach(() => { setLocale('zh') })
+  it('offers one-click download when the binary is missing', async () => {
+    success()
+    for (const fn of [listCommIdentities, listCommContacts, listCommRelays]) {
+      vi.mocked(fn).mockRejectedValue(new CommApiError('no Hyphae binary is configured', 409, 'not_configured'))
+    }
+    vi.mocked(getCommStatus).mockResolvedValue({ ...status, installable: true, installed_version: null })
+    render(<CommunicationPage />)
+    vi.mocked(installComm).mockImplementation(async () => {
+      success()
+      return { installed_version: 'v0.27.2', path: '/state/components/hyphae/v0.27.2/hyphae', restart_required: false, reason: null }
+    })
+    fireEvent.click(await screen.findByRole('button', { name: '下载并设置' }))
+    expect(await screen.findByText('npub1alice')).toBeInTheDocument()
+    expect(installComm).toHaveBeenCalledTimes(1)
+    expect(screen.getByText('Hyphae 已就绪，通信状态已刷新。')).toBeInTheDocument()
+  })
+
   it('renders identities, contacts, relay source, and independent status dimensions', async () => {
     success()
     render(<CommunicationPage />)
@@ -71,8 +88,8 @@ describe('CommunicationPage', () => {
     const nc = () => new CommApiError('no Hyphae binary is configured; set A24_HYPHAE_BIN (COMM-HYPHAE.md §3)', 409, 'not_configured')
     for (const fn of [listCommIdentities, listCommContacts, listCommRelays, getCommStatus]) vi.mocked(fn).mockRejectedValue(nc())
     render(<CommunicationPage />)
-    expect(await screen.findByText('没有找到 Hyphae 程序，通信无法启动。请在启动 daemon 前指定它的位置，然后刷新本页：')).toBeInTheDocument()
-    expect(screen.getByText('A24_HYPHAE_BIN=/path/to/hyphae')).toBeInTheDocument()
+    expect(await screen.findByText('下载并设置 Hyphae，即可在这台电脑上使用通信功能。')).toBeInTheDocument()
+    expect(screen.getByText('当前平台或 Agent24 版本暂不支持下载 Hyphae。')).toBeInTheDocument()
     expect(screen.getByText(/详情：no Hyphae binary is configured/)).toBeInTheDocument()
     expect(screen.queryByText('agent24 comm identity create <昵称> --default')).toBeNull()
     expect(screen.queryByRole('alert')).toBeNull()

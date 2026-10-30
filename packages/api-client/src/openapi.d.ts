@@ -1439,6 +1439,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/comm/install": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Download and set up the pinned Hyphae release
+         * @description Host-only elevated operation: downloads and installs executable code. No request body or URL overrides. HTTPS redirects are host allowlisted and SHA-256 comes from the embedded upstream lock. Repeated installs reverify existing bytes. The daemon rebuilds comm state without restarting. CLI `agent24 comm install --json` prints the data object from this envelope to stdout; progress is suppressed in JSON mode. Otherwise progress is written to stderr. If restart_required is true, reason explains why communication could not be rebuilt.
+         */
+        post: operations["installCommComponent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/comm/daemon": {
         parameters: {
             query?: never;
@@ -1446,7 +1466,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Hyphae daemon status (process, relay probe, catch-up) */
+        /**
+         * Hyphae daemon status (process, relay probe, catch-up)
+         * @description Always returns 200 when comm is not configured, with process.state not_configured. data.installable indicates a platform with both release asset and non-null lock hash. data.installed_version is the component tag (v0.27.2) after full hash revalidation, or null when absent or rejected. Developer and sibling binaries do not count as installed components.
+         */
         get: operations["getCommDaemon"];
         put?: never;
         post?: never;
@@ -2042,6 +2065,14 @@ export interface components {
             request_fingerprint?: string;
             /** @enum {string} */
             setup_code?: "unreachable" | "auth_required" | "auth_failed" | "not_omlx" | "model_not_found" | "invalid_endpoint" | "invalid_role" | "out_dir_not_empty" | "validation_failed" | "write_failed" | "invalid_api_key_input";
+        };
+        CommInstallResult: {
+            /** @example v0.27.2 */
+            installed_version: string;
+            /** @description Absolute installed component path */
+            path: string;
+            restart_required: boolean;
+            reason: string | null;
         };
         DomainOsView: {
             name: string;
@@ -3367,7 +3398,7 @@ export interface components {
          * @description Closed set (COMM-HYPHAE.md section 4).
          * @enum {string}
          */
-        CommErrorCode: "binary_rejected" | "unsupported_platform" | "locked" | "not_configured" | "invalid" | "not_found" | "confirm_required" | "conflict" | "network" | "partial" | "timeout" | "upstream";
+        CommErrorCode: "hyphae_unsupported_platform" | "hyphae_download_failed" | "hyphae_hash_mismatch" | "binary_rejected" | "unsupported_platform" | "locked" | "not_configured" | "invalid" | "not_found" | "confirm_required" | "conflict" | "network" | "partial" | "timeout" | "upstream";
         /** @description Hyphae's own failure envelope shape, NOT the kernel `Error`: comm routes answer `{ok:false,error,message,data?}`. */
         CommError: {
             /** @constant */
@@ -6795,6 +6826,57 @@ export interface operations {
             502: components["responses"]["CommBadGateway"];
             503: components["responses"]["CommUnavailable"];
             504: components["responses"]["CommTimeout"];
+        };
+    };
+    installCommComponent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hyphae installed and comm state rebuilt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @constant */
+                        ok: true;
+                        data: components["schemas"]["CommInstallResult"];
+                    };
+                };
+            };
+            /** @description hyphae_unsupported_platform (including null lock digests) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+            /** @description hyphae_hash_mismatch (downloaded or installed bytes rejected) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+            /** @description hyphae_download_failed (network, cancellation, storage or shutdown) */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
         };
     };
     getCommDaemon: {
