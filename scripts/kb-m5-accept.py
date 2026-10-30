@@ -25,6 +25,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import secrets
 import select
 import subprocess
@@ -305,11 +306,14 @@ class Daemon:
             [os.path.join(BIN, "agent24d"), "serve", "--port", "0", "--auth-mode", "capabilities",
              "--host-bootstrap-stdio"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, env=env, cwd=data)
-        line = read_ready(self.proc, 30)
-        self.port, self.token = line.get("port"), line.get("product_host_token")
-        if line.get("type") != "ready" or not isinstance(self.port, int) or not isinstance(self.token, str):
+        try:
+            line = read_ready(self.proc, 30)
+            self.port, self.token = line.get("port"), line.get("product_host_token")
+            if line.get("type") != "ready" or not isinstance(self.port, int) or not isinstance(self.token, str):
+                sys.exit(f"daemon did not come up; see {data}.serve.log")
+        except BaseException:
             self.stop()
-            sys.exit(f"daemon did not come up; see {data}.serve.log")
+            raise
         self.seq = int(time.time() * 1000)
 
     def call(self, method, path, body=None):
@@ -391,6 +395,21 @@ def has_fact(text):
     return all(part in text for part in FACT_PARTS)
 
 
+# The closing time as an answer may word it, Markdown stripped: Wednesday,
+# evening eight, closed. "早上八点" does not match.
+CLOSING = re.compile(r"周三.{0,8}(晚上八点|晚上8点|20[:：]00|20点).{0,6}闭馆")
+
+
+def answers_fact(body):
+    plain = re.sub(r"[\s*_`>#]", "", body)
+    return bool(CLOSING.search(plain)) and "林小满" in plain
+
+
+def listed_ids(sources):
+    """Every `knowledge_id#chunk_id` the source list names."""
+    return set(re.findall(r"[\w-]+#[\w-]+", sources))
+
+
 def evidence_of(result):
     """The hits of a search result; anything else has none."""
     try:
@@ -427,9 +446,10 @@ def cases(d, lib, real):
     cited = citations_of(results)
     body, _, sources = answer.partition("来源")
     # The body is what precedes the source list, so the ids in it cannot stand in for the fact.
-    check("E3", "读回为 citation 再作答：正文含样本事实（八点、林小满），「来源」列出的 knowledge_id#chunk_id 是读回的 citation",
-          bool(cited) and any(c in sources for c in cited) and "八点" in body and "林小满" in body,
-          f"citation {sorted(cited)}；回答 {answer[:400]!r}")
+    listed = listed_ids(sources)
+    check("E3", "读回为 citation 再作答：正文答对样本事实（每周三晚上八点闭馆、林小满），「来源」列出的每个 knowledge_id#chunk_id 都是读回的 citation",
+          bool(cited) and bool(listed) and listed <= cited.keys() and answers_fact(body),
+          f"citation {sorted(cited)}；来源列出 {sorted(listed)}；回答 {answer[:400]!r}")
     if real:
         return
 
@@ -496,12 +516,17 @@ def main():
         d = Daemon(os.path.join(WORK, "data"), model_env)
         cases(d, lib, real)
     finally:
-        if d is not None:
-            d.stop()
-        for server in (model, embed):
-            if server is not None:
-                server.shutdown()
-                server.server_close()
+        # Each is released even when the one before it fails to stop.
+        try:
+            if d is not None:
+                d.stop()
+        finally:
+            for server in (model, embed):
+                if server is not None:
+                    try:
+                        server.shutdown()
+                    finally:
+                        server.server_close()
     with open(os.path.join(WORK, "report.md"), "w") as f:
         mode = f"真实模型 {ARGS.model}（经 {ARGS.model_url}）" if real else "脚本模型（stub）"
         f.write(f"# KB-M5 端到端验收\n\n- WeKnora：{WK}\n- 模型：{mode}\n- 时间（UTC）：{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n\n")
