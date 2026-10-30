@@ -21,6 +21,9 @@ fn fixture(name: &str) -> Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
+/// A value put into an answer's body.
+type MakeValue = fn() -> Value;
+
 /// What the fake server does with a request.
 #[derive(Clone)]
 enum Answer {
@@ -35,6 +38,8 @@ enum Answer {
     NullEcho(&'static str),
     /// The fixture's response with another request id.
     WrongEcho(&'static str),
+    /// As `Fixture`, with the value at a JSON pointer of the body replaced.
+    Altered(&'static str, &'static str, MakeValue),
     /// Never answers.
     Hang,
     Fail(TransportError),
@@ -61,10 +66,16 @@ impl KnowledgeTransport for Server {
             during();
         }
         let mut scoped = false;
+        let mut altered = None;
         let mut generation = request["generation"].clone();
         let (name, echo) = match self.answer.clone() {
             Answer::Fixture(name) => {
                 scoped = true;
+                (name, request["request_id"].clone())
+            }
+            Answer::Altered(name, pointer, value) => {
+                scoped = true;
+                altered = Some((pointer, value));
                 (name, request["request_id"].clone())
             }
             Answer::Unscoped(name) => (name, request["request_id"].clone()),
@@ -96,6 +107,9 @@ impl KnowledgeTransport for Server {
             if let Some(hits) = body.get_mut("hits").and_then(Value::as_array_mut) {
                 hits.retain(|hit| ids.contains(&hit["knowledge_base_id"]));
             }
+        }
+        if let Some((pointer, value)) = altered {
+            *body.pointer_mut(pointer).unwrap() = value();
         }
         Ok(TransportResponse {
             status: u16::try_from(response["status"].as_u64().unwrap()).unwrap(),
@@ -265,6 +279,46 @@ async fn an_answer_outside_the_scope_asked_is_refused() {
         ),
         "{result:?}"
     );
+}
+
+#[tokio::test]
+async fn a_read_answered_with_another_document_or_chunk_is_refused() {
+    let incompatible = |result: &Result<_, Failure>| {
+        matches!(
+            result,
+            Err(Failure::Local(Refusal {
+                reason: LocalReason::Incompatible,
+                ..
+            }))
+        )
+    };
+    let cases: [(&str, MakeValue); 3] = [
+        ("/knowledge_id", || json!("doc-other")),
+        ("/segments/0/chunk_id", || json!("chk-other")),
+        // That chunk alone (R4.3), so not none of it either.
+        ("/segments", || json!([])),
+    ];
+    for (pointer, value) in cases {
+        let s = setup(Answer::Altered("read.chunk.json", pointer, value));
+        let result = s.backend.read(RUN, chunk_read()).await;
+        assert!(incompatible(&result), "{pointer}: {result:?}");
+    }
+    // A document read may answer with any of its chunks, not another document.
+    let document = ReadQuery {
+        chunk_id: None,
+        content_tag: None,
+        ..chunk_read()
+    };
+    let s = setup(Answer::Altered(
+        "read.chunk.json",
+        "/segments/0/chunk_id",
+        || json!("chk-other"),
+    ));
+    s.backend.read(RUN, document.clone()).await.unwrap();
+    let s = setup(Answer::Altered("read.chunk.json", "/knowledge_id", || {
+        json!("doc-other")
+    }));
+    assert!(incompatible(&s.backend.read(RUN, document).await));
 }
 
 #[tokio::test]
