@@ -151,6 +151,13 @@ fn section_3_rows_match_operation_and_level() {
         });
     }
 
+    fixed.push(DesignRow {
+        method: "POST".into(),
+        path: "/comm/install".into(),
+        operation: "ComponentInstall".into(),
+        level: AssuranceLevel::Elevated,
+    });
+
     let mut catalog = BTreeSet::new();
     for policy in policies() {
         assert!(

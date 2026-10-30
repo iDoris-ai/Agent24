@@ -20,6 +20,7 @@ export const IpcChannels = {
   // before sending anything.
   ApprovalDecide: 'approval:decide',
   OsModuleSetEnabled: 'os-module:set-enabled',
+  CommInstall: 'comm:install',
   // A-3: disable/enable or unpair AgentEar (PATCH / DELETE
   // /api/v1/attached/agentear). The module name is fixed in main; the
   // renderer cannot name another one. Same native-confirm rule as above.
@@ -245,13 +246,51 @@ export interface AgentEarEventEnvelope {
 type DocSchemas = import('@agent24/api-client').components['schemas']
 type DocOps = import('@agent24/api-client').operations
 type ListQuery = NonNullable<DocOps['documentsListDocuments']['parameters']['query']>
+type TextQuery = NonNullable<DocOps['documentsReadText']['parameters']['query']>
+type FindBody = DocSchemas['DocumentsFindRequest']
+type ExtractBody = DocSchemas['DocumentsExtractRequest']
 
 /** The operations the page may ask for (ADR-DOC-02 §4). */
 export type DocumentsRequest =
   | { op: 'capabilities' }
   | { op: 'list'; cursor?: ListQuery['cursor']; limit?: ListQuery['limit'] }
   | { op: 'get'; documentId: DocSchemas['DocumentIdString'] }
-  | { op: 'readText'; documentId: DocSchemas['DocumentIdString']; revision: number; cursor?: string }
+  | {
+      op: 'readText'
+      documentId: DocSchemas['DocumentIdString']
+      revision: number
+      block?: TextQuery['block']
+      cursor?: string
+      limit?: TextQuery['limit']
+      requireComplete?: TextQuery['require_complete']
+    }
+  | {
+      op: 'find'
+      documentId: DocSchemas['DocumentIdString']
+      revision: FindBody['revision']
+      query: FindBody['query']
+      cursor?: FindBody['cursor']
+      limit?: FindBody['limit']
+      requireComplete?: FindBody['require_complete']
+    }
+  | {
+      op: 'extract'
+      documentId: DocSchemas['DocumentIdString']
+      revision: ExtractBody['revision']
+      schema: ExtractBody['schema']
+      rerun?: ExtractBody['rerun']
+      /** Required with `rerun: true` (the `Idempotency-Key` header). */
+      idempotencyKey?: string
+    }
+  | { op: 'getExtraction'; extractionId: DocSchemas['ExtractionIdString']; cursor?: string; limit?: number }
+  | {
+      op: 'renderPage'
+      documentId: DocSchemas['DocumentIdString']
+      revision: number
+      page: number
+      scale?: number
+      region?: string
+    }
   | { op: 'job'; jobId: DocSchemas['JobIdString'] }
   | { op: 'cancelJob'; jobId: DocSchemas['JobIdString'] }
   | { op: 'retryJob'; jobId: DocSchemas['JobIdString'] }
@@ -262,6 +301,11 @@ export interface DocumentsResults {
   list: DocSchemas['DocumentList']
   get: DocSchemas['DocumentDetail']
   readText: DocSchemas['DocumentsTextPage']
+  find: DocSchemas['DocumentsFindResult']
+  extract: DocSchemas['DocumentsJob']
+  getExtraction: DocSchemas['DocumentsExtraction']
+  /** The PNG in standard base64; `scale` is the one the OS used. */
+  renderPage: { media_type: 'image/png'; bytes: number; scale: number; png: string }
   job: DocSchemas['DocumentsJob']
   cancelJob: DocSchemas['DocumentsJob']
   retryJob: DocSchemas['DocumentsJob']

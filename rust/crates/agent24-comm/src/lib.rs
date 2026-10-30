@@ -30,6 +30,7 @@ pub mod keystore_lock;
 pub mod npub;
 pub mod password;
 pub mod password_store;
+pub mod release;
 mod restart_policy;
 pub mod router;
 pub mod runner;
