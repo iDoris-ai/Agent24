@@ -174,6 +174,11 @@ pub enum ChangeError {
 pub struct KnowledgeHostRegistry {
     entries: Mutex<HashMap<(String, String), Entry>>,
     runs: Mutex<RunPins>,
+    /// The activation each session's runs were bound to: a session carries
+    /// its Knowledge results into later turns, and the Knowledge tools send
+    /// those back to the binding's endpoint (ADR-K1-02 §2.1.1 item 6), so a
+    /// session never moves to another activation.
+    sessions: Mutex<RunPins>,
     /// Woken on every change applied, so a call in flight can tell at once
     /// that its binding moved (`crate::knowledge_backend`).
     changed: tokio::sync::Notify,
@@ -347,6 +352,28 @@ impl KnowledgeHostRegistry {
         }
     }
 
+    /// Ties `session_id` to `binding`; false when the session's runs were
+    /// already bound to another host, binding or activation. A poisoned lock
+    /// is false too.
+    pub fn pin_session(&self, session_id: &str, binding: &RunBinding) -> bool {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return false;
+        };
+        match sessions.pins.get(session_id) {
+            Some(pinned) => return pinned == binding,
+            None => {
+                sessions.pins.insert(session_id.to_owned(), binding.clone());
+                sessions.order.push_back(session_id.to_owned());
+            }
+        }
+        while sessions.order.len() > MAX_PINNED_RUNS {
+            if let Some(oldest) = sessions.order.pop_front() {
+                sessions.pins.remove(&oldest);
+            }
+        }
+        true
+    }
+
     /// The binding a run may use now: the one it names in its persisted input
     /// (`selector`), still active under the host and generation it was pinned
     /// to. Nothing else is looked up, so a run never moves to a new binding.
@@ -458,6 +485,8 @@ pub enum Refused {
     NotHost,
     Malformed,
     Inactive,
+    /// The session's earlier runs were bound to another activation.
+    SessionRebound,
 }
 
 impl IntoResponse for Refused {
@@ -473,6 +502,11 @@ impl IntoResponse for Refused {
                 StatusCode::CONFLICT,
                 "knowledge_binding_inactive",
                 "The product host has no active Knowledge binding by that id",
+            ),
+            Self::SessionRebound => error_response(
+                StatusCode::CONFLICT,
+                "knowledge_session_rebound",
+                "This session's runs used another activation of that Knowledge binding; start a new session",
             ),
         }
     }
@@ -498,12 +532,13 @@ fn host_and_seq(
 }
 
 /// Checks a run's `knowledge_binding_id` at creation and returns what to pin
-/// the run to: only the product host may name a binding, and only one it has
-/// active.
+/// the run to: only the product host may name a binding, only one it has
+/// active, and in a session only the activation its earlier runs had.
 pub fn bind_run(
     state: &AppState,
     authorization: Option<Extension<Authorization>>,
     binding_id: &str,
+    session_id: Option<&str>,
 ) -> Result<RunBinding, Refused> {
     let host = host_capability(state, authorization).ok_or(Refused::NotHost)?;
     if !valid_binding_id(binding_id) {
@@ -513,11 +548,17 @@ pub fn bind_run(
         .knowledge_host
         .generation(&host, binding_id)
         .ok_or(Refused::Inactive)?;
-    Ok(RunBinding {
+    let binding = RunBinding {
         host,
         binding: binding_id.to_owned(),
         generation,
-    })
+    };
+    if let Some(session_id) = session_id
+        && !state.knowledge_host.pin_session(session_id, &binding)
+    {
+        return Err(Refused::SessionRebound);
+    }
+    Ok(binding)
 }
 
 /// `PUT /api/v1/host/knowledge/bindings/{binding_id}?seq=n` activates the

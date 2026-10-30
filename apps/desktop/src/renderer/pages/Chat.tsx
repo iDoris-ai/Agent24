@@ -183,10 +183,19 @@ export default function ChatPage() {
     const sentAt = performance.now()
     try {
       const proxy = window.agent24.backendProxy
-      runSession.current ??= await createChatSession(proxy)
-      const turn = runSession.current === null
-        ? { kind: 'failed' as const, code: 'session_unavailable', message: 'session_unavailable' }
-        : await askWithKnowledge(prompt, runSession.current, { proxy, onAwaitingApproval: setAwaitingApproval })
+      const ask = async () => {
+        runSession.current ??= await createChatSession(proxy)
+        return runSession.current === null
+          ? { kind: 'failed' as const, code: 'session_unavailable', message: 'session_unavailable' }
+          : await askWithKnowledge(prompt, runSession.current, { proxy, onAwaitingApproval: setAwaitingApproval })
+      }
+      let turn = await ask()
+      // The daemon ties a session to one activation of the binding; after a
+      // change it refuses the old session, so the turn goes to a new one.
+      if (turn.kind === 'failed' && turn.code === 'knowledge_session_rebound') {
+        runSession.current = null
+        turn = await ask()
+      }
       if (turn.kind === 'answer') {
         const suffix: ReplyLatency = { modelName: null, tier: null, firstTokenMs: null, totalMs: performance.now() - sentAt }
         setDelivery(index, { kind: 'sent' })

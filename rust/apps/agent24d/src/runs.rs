@@ -191,7 +191,12 @@ pub async fn create_run(
     // executes, so its first Knowledge tool call already finds the pin.
     let binding = match create.knowledge_binding_id.as_deref() {
         None => None,
-        Some(id) => match crate::knowledge_host::bind_run(&state, authorization, id) {
+        Some(id) => match crate::knowledge_host::bind_run(
+            &state,
+            authorization,
+            id,
+            create.session_id.as_deref(),
+        ) {
             Ok(binding) => Some(binding),
             Err(refused) => return refused.into_response(),
         },

@@ -63,8 +63,10 @@
    - **同源回送是第 3、5 条之外的一条明确例外**：发往模块 X 的调用不计 X 自己先前返回的结果（宿主在标签上记下来源模块；第 5 条要求证明载荷，这里证明的是接收方，所以单独列为例外）。理由是 X 本来就持有这些内容，送回去不多给它什么。其他来源的 `Unknown`、任何 `Restricted`、来源或政策读取失败照拒；manifest 声明会外发（`risk: external` 或 `output_privacy` 不是 `local_only`）的操作不享受这条例外 —— 该声明只能取消例外，不能放行。
    - **Knowledge 的同源回送（2026-10-30，David 定；决策 `2026-10-30-knowledge-same-source-egress`）**：`knowledge_search`、`knowledge_read` 出网前，不计来源为 `tool:knowledge_search`、`tool:knowledge_read` 的结果（`ToolContext::without_results_from`）。这两个工具只向 run 所绑定的 Knowledge 端点发请求，而这些结果就是从 Knowledge 端点检索来的；工具是只读的（`RiskClass::Read`），不改服务器上的任何东西。
      - 其他来源的 `Unknown`、任何 `Restricted`、来源或政策读取失败照拒。Knowledge 结果对 `http_fetch` 等其他工具照旧算 `Unknown`。
-     - 宿主认的是工具名，不是端点。同一 run 被钉在绑定的 generation 上，端点改了，旧 run 就失效（`BindingStale`）；跨轮次则靠桌面宿主在端点或知识库变化时换新会话。宿主之外的调用方要自己保证同一会话不换 Knowledge 端点。
-     - 已知局限：模型可以把会话里其他内容写进检索词。这些内容如果来自别的来源，那一来源本身仍会拦下调用；只有 Knowledge 自己的结果会被送回 Knowledge 端点。
+     - 来源标签认的是工具名，不是端点；「同源」由绑定保证。同一 run 被钉在绑定的 generation 上，端点改了，旧 run 就失效（`BindingStale`）。跨轮次时，daemon 把会话钉在它第一个带绑定的 run 的那次激活上（`KnowledgeHostRegistry::pin_session`）：换了激活（改端点、改知识库、Off 后再 On），同一会话里再建带该绑定的 run，会以 409 `knowledge_session_rebound` 拒绝，桌面随即换新会话。
+     - 已知局限：
+       - 会话钉扎只在内存里，daemon 重启后清空；桌面在端点或知识库变化时也会换新会话，作为第二层。
+       - 模型可以把会话里其他内容写进检索词。这些内容如果来自别的非 `Ordinary` 来源，那一来源本身仍会拦下调用；被送回 Knowledge 端点的，只有 Knowledge 自己的结果和 `Ordinary` 内容。
    - **跨轮次（K1-6b.5f-2）**：开着会话记忆时，后面的轮次会带上前面轮次的上下文，所以会话里非 `Ordinary` 的工具结果按来源（`module:{id}`、`tool:{name}`）记下，记录和该结果的标签在同一事务里写入。后面每一轮在调模型之前，每个来源打一条 `Unknown` 标签，`source_id` 保留 `tool_result:{来源}:` 前缀，所以同源例外跨轮次仍然成立。这些来源不并入会话下限 `session_source_floor`（K1-6b.4c），否则一次模块调用就会把整个会话抬成 `Unknown`，同源例外在下一轮失效。来源记录读不出来时，该轮在调模型前失败。只记汇总分类、不带来源的路径照旧按汇总分类收紧，不享受同源例外：self-wake 按创建它的 run 的最严分类记来源（第 2.2 节），由它触发的轮次会把会话下限抬到这个分类；0031 之前就调用过工具的会话，补记一个 `tool:legacy` 来源（`Unknown`）。
 
 ### 2.2 跨轮次、恢复、委派与后台传播

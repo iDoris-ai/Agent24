@@ -879,3 +879,70 @@ async fn a_run_naming_a_binding_it_may_not_use_is_refused_and_not_created() {
     assert!(body.contains("host_authority_required"));
     assert_eq!(run_count(&legacy).await, 0);
 }
+
+#[tokio::test]
+async fn a_session_keeps_the_activation_its_first_bound_run_had() {
+    let (state, host, _) = crate::server::tests::capability_state().await;
+    let router = build_router(state.clone());
+    let new_session = || async {
+        let req = with_body(
+            Method::POST,
+            "/api/v1/sessions",
+            &host,
+            r#"{"title":"","channel":"desktop"}"#,
+        );
+        let (status, body) = send(&router, req).await;
+        assert!(status.is_success(), "{body}");
+        let session: serde_json::Value = serde_json::from_str(&body).unwrap();
+        session["id"].as_str().unwrap().to_owned()
+    };
+    let run_in = |session: String, binding: Option<&'static str>| {
+        let mut body = serde_json::json!({ "prompt": "hi", "session_id": session });
+        if let Some(binding) = binding {
+            body["knowledge_binding_id"] = binding.into();
+        }
+        create_run_request(&host, body)
+    };
+    send(
+        &router,
+        request(Method::PUT, &format!("{BINDING}?seq=1"), &host),
+    )
+    .await;
+    let first = new_session().await;
+    let (status, body) = send(&router, run_in(first.clone(), Some("b1"))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let (status, body) = send(&router, run_in(first.clone(), Some("b1"))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "same activation: {body}");
+
+    // A new activation (another endpoint, say) is another source.
+    send(
+        &router,
+        request(Method::PUT, &format!("{BINDING}?seq=2"), &host),
+    )
+    .await;
+    let before = run_count(&state).await;
+    let (status, body) = send(&router, run_in(first.clone(), Some("b1"))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("knowledge_session_rebound"), "{body}");
+    assert_eq!(run_count(&state).await, before);
+
+    let (status, body) = send(&router, run_in(new_session().await, Some("b1"))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "a new session: {body}");
+    let (status, body) = send(&router, run_in(first, None)).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "no binding, no Knowledge tools: {body}"
+    );
+}
+
+#[test]
+fn a_session_pin_is_exact() {
+    let registry = KnowledgeHostRegistry::default();
+    assert!(registry.pin_session("s1", &pin("host", "b1", 1)));
+    assert!(registry.pin_session("s1", &pin("host", "b1", 1)));
+    assert!(!registry.pin_session("s1", &pin("host", "b1", 2)));
+    assert!(!registry.pin_session("s1", &pin("host", "b2", 1)));
+    assert!(!registry.pin_session("s1", &pin("other", "b1", 1)));
+    assert!(registry.pin_session("s2", &pin("host", "b1", 2)));
+}
