@@ -290,8 +290,16 @@ fn unsafe_free_kill(pid: u32) -> bool {
     if std::path::Path::new(&format!("/proc/{pid}")).exists() {
         return true;
     }
-    // macOS has no /proc — use ps (cheap, and only on CLI/daemon boundary paths)
-    std::process::Command::new("ps")
+    // macOS has no /proc — use ps (cheap, and only on CLI/daemon boundary paths).
+    // I-1: by absolute path. A bare `ps` depends on the caller's PATH, and
+    // a PATH without /bin made every live daemon look dead, so the CLI
+    // spawned a second one that lost the singleton lock (`daemon_unavailable`).
+    let ps = if std::path::Path::new("/bin/ps").exists() {
+        "/bin/ps"
+    } else {
+        "ps"
+    };
+    std::process::Command::new(ps)
         .args(["-p", &pid.to_string(), "-o", "pid="])
         .output()
         .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())

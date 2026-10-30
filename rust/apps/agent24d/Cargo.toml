@@ -60,6 +60,8 @@ form_urlencoded = "1"
 # Capability and attached-module token hashing are both production daemon
 # responsibilities; one shared dependency serves both paths.
 sha2 = "0.10"
+# I-1 L1: presence summaries refuse format/separator characters.
+unicode-general-category = "1.1"
 # T8.5c-P: `EventLog::scan_stream`'s consumer (`os_memory_page.rs`) drives it
 # with `StreamExt::next()`/`Pin<&mut S>` directly, not through sqlx.
 futures = { version = "0.3", default-features = false, features = ["std"] }
