@@ -832,6 +832,34 @@ mod hy1_regression_tests {
     }
 
     #[tokio::test]
+    async fn concurrent_installs_serialize_and_both_publish_one_verified_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime(dir.path()).await;
+        let app = runtime_router(runtime.clone());
+        let (a, b) = tokio::join!(
+            request(&app, "POST", "/api/v1/comm/install"),
+            request(&app, "POST", "/api/v1/comm/install"),
+        );
+        for (status, body) in [a, b] {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["data"]["restart_required"], false);
+        }
+        let install_dir = runtime.release.install_dir(dir.path());
+        assert!(!install_dir.join("hyphae.installing").exists());
+        assert_eq!(
+            tokio::fs::read(runtime.release.installed_path(dir.path()))
+                .await
+                .unwrap(),
+            FIXTURE
+        );
+        let (status, identities) = request(&app, "GET", "/api/v1/comm/identity").await;
+        assert_eq!(status, StatusCode::OK, "{identities}");
+        if let Some(handle) = runtime.slot.close() {
+            handle.shutdown(tokio::time::Instant::now()).await;
+        }
+    }
+
+    #[tokio::test]
     async fn install_api_rejects_hash_mismatch_and_status_does_not_claim_installed() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = runtime(dir.path()).await;
