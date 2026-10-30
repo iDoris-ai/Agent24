@@ -196,7 +196,9 @@ pub async fn create_run(
             authorization,
             id,
             create.session_id.as_deref(),
-        ) {
+        )
+        .await
+        {
             Ok(binding) => Some(binding),
             Err(refused) => return refused.into_response(),
         },

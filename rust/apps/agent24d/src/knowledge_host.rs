@@ -353,14 +353,22 @@ impl KnowledgeHostRegistry {
     }
 
     /// Ties `session_id` to `binding`; false when the session's runs were
-    /// already bound to another host, binding or activation. A poisoned lock
-    /// is false too.
-    pub fn pin_session(&self, session_id: &str, binding: &RunBinding) -> bool {
+    /// already bound to another host, binding or activation, or when it has
+    /// no pin yet `took_knowledge`: pins live in memory, so one evicted or
+    /// lost with a restart no longer says where those results came from. A
+    /// poisoned lock is false too.
+    pub fn pin_session(
+        &self,
+        session_id: &str,
+        binding: &RunBinding,
+        took_knowledge: bool,
+    ) -> bool {
         let Ok(mut sessions) = self.sessions.lock() else {
             return false;
         };
         match sessions.pins.get(session_id) {
             Some(pinned) => return pinned == binding,
+            None if took_knowledge => return false,
             None => {
                 sessions.pins.insert(session_id.to_owned(), binding.clone());
                 sessions.order.push_back(session_id.to_owned());
@@ -485,8 +493,11 @@ pub enum Refused {
     NotHost,
     Malformed,
     Inactive,
-    /// The session's earlier runs were bound to another activation.
+    /// The session's earlier runs were bound to another activation, or took
+    /// in Knowledge results from one it can no longer tell.
     SessionRebound,
+    /// The session's tool result origins could not be read.
+    SourcesUnavailable,
 }
 
 impl IntoResponse for Refused {
@@ -507,6 +518,11 @@ impl IntoResponse for Refused {
                 StatusCode::CONFLICT,
                 "knowledge_session_rebound",
                 "This session's runs used another activation of that Knowledge binding; start a new session",
+            ),
+            Self::SourcesUnavailable => error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "source_policy_unavailable",
+                "This session's sources could not be read",
             ),
         }
     }
@@ -534,7 +550,7 @@ fn host_and_seq(
 /// Checks a run's `knowledge_binding_id` at creation and returns what to pin
 /// the run to: only the product host may name a binding, only one it has
 /// active, and in a session only the activation its earlier runs had.
-pub fn bind_run(
+pub async fn bind_run(
     state: &AppState,
     authorization: Option<Extension<Authorization>>,
     binding_id: &str,
@@ -553,10 +569,22 @@ pub fn bind_run(
         binding: binding_id.to_owned(),
         generation,
     };
-    if let Some(session_id) = session_id
-        && !state.knowledge_host.pin_session(session_id, &binding)
-    {
-        return Err(Refused::SessionRebound);
+    if let Some(session_id) = session_id {
+        // Read before the pin is taken; a run that adds such results has
+        // pinned the session before it executes.
+        let took_knowledge = state
+            .store
+            .session_tool_result_origins(session_id)
+            .await
+            .map_err(|_| Refused::SourcesUnavailable)?
+            .iter()
+            .any(|origin| crate::knowledge_tools::KNOWLEDGE_ORIGINS.contains(&origin.as_str()));
+        if !state
+            .knowledge_host
+            .pin_session(session_id, &binding, took_knowledge)
+        {
+            return Err(Refused::SessionRebound);
+        }
     }
     Ok(binding)
 }

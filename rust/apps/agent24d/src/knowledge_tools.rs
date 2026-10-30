@@ -40,7 +40,7 @@ pub struct KnowledgeTool {
 
 /// Where the host says these tools' results came from
 /// ([`agent24_tools::ToolResultSource::unknown`]).
-const KNOWLEDGE_ORIGINS: [&str; 2] = ["tool:knowledge_search", "tool:knowledge_read"];
+pub(crate) const KNOWLEDGE_ORIGINS: [&str; 2] = ["tool:knowledge_search", "tool:knowledge_read"];
 
 /// Both tools over one backend, for the registry.
 pub fn tools(

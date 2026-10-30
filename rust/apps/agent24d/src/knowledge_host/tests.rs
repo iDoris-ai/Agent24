@@ -939,10 +939,82 @@ async fn a_session_keeps_the_activation_its_first_bound_run_had() {
 #[test]
 fn a_session_pin_is_exact() {
     let registry = KnowledgeHostRegistry::default();
-    assert!(registry.pin_session("s1", &pin("host", "b1", 1)));
-    assert!(registry.pin_session("s1", &pin("host", "b1", 1)));
-    assert!(!registry.pin_session("s1", &pin("host", "b1", 2)));
-    assert!(!registry.pin_session("s1", &pin("host", "b2", 1)));
-    assert!(!registry.pin_session("s1", &pin("other", "b1", 1)));
-    assert!(registry.pin_session("s2", &pin("host", "b1", 2)));
+    assert!(registry.pin_session("s1", &pin("host", "b1", 1), false));
+    assert!(registry.pin_session("s1", &pin("host", "b1", 1), true));
+    assert!(!registry.pin_session("s1", &pin("host", "b1", 2), false));
+    assert!(!registry.pin_session("s1", &pin("host", "b2", 1), false));
+    assert!(!registry.pin_session("s1", &pin("other", "b1", 1), false));
+    assert!(registry.pin_session("s2", &pin("host", "b1", 2), false));
+}
+
+#[test]
+fn a_session_with_knowledge_results_and_no_pin_is_not_pinned_anew() {
+    let registry = KnowledgeHostRegistry::default();
+    assert!(!registry.pin_session("s1", &pin("host", "b1", 1), true));
+    assert!(!registry.pin_session("s1", &pin("host", "b1", 1), true));
+
+    // Evicted: the pin no longer says where its results came from.
+    assert!(registry.pin_session("s2", &pin("host", "b1", 1), false));
+    for n in 0..MAX_PINNED_RUNS {
+        assert!(registry.pin_session(&format!("other-{n}"), &pin("host", "b1", 1), false));
+    }
+    assert!(!registry.pin_session("s2", &pin("host", "b1", 2), true));
+}
+
+#[tokio::test]
+async fn a_session_holding_knowledge_results_without_a_pin_is_refused() {
+    // As after a restart: the session took in Knowledge results, the pin
+    // that tied them to an activation is gone.
+    let (state, host, _) = crate::server::tests::capability_state().await;
+    let router = build_router(state.clone());
+    send(
+        &router,
+        request(Method::PUT, &format!("{BINDING}?seq=1"), &host),
+    )
+    .await;
+    let mut sessions = Vec::new();
+    for origin in [
+        "tool:knowledge_search",
+        "tool:knowledge_read",
+        "tool:shell_exec",
+    ] {
+        let req = with_body(
+            Method::POST,
+            "/api/v1/sessions",
+            &host,
+            r#"{"title":"","channel":"desktop"}"#,
+        );
+        let (_, body) = send(&router, req).await;
+        let session: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let id = session["id"].as_str().unwrap().to_owned();
+        sqlx::query(
+            "INSERT INTO session_tool_result_origins (session_id, origin, created_at) VALUES (?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(origin)
+        .bind("2026-10-30T00:00:00Z")
+        .execute(agent24_store::test_hooks::pool(&state.store))
+        .await
+        .unwrap();
+        sessions.push(id);
+    }
+    let run_in = |session: &str| {
+        create_run_request(
+            &host,
+            serde_json::json!({ "prompt": "hi", "session_id": session, "knowledge_binding_id": "b1" }),
+        )
+    };
+    let before = run_count(&state).await;
+    for session in &sessions[..2] {
+        let (status, body) = send(&router, run_in(session)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("knowledge_session_rebound"), "{body}");
+    }
+    assert_eq!(run_count(&state).await, before);
+    let (status, body) = send(&router, run_in(&sessions[2])).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "another tool's results: {body}"
+    );
 }
