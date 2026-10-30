@@ -25,6 +25,47 @@ export async function getAgentEarAttachment(): Promise<AttachedView | null> {
   return modules.find((m) => m.name === AGENTEAR_MODULE_NAME) ?? null
 }
 
+// ── A-3: disable / enable / unpair ──────────────────────────────────────────
+// PATCH/DELETE /api/v1/attached/agentear are Elevated and deliberately NOT on
+// the generic backendProxy allowlist. These go through dedicated main-process
+// IPCs that fix the module name, ask the user in a native dialog and allow one
+// request at a time (main/ipc/index.ts).
+
+/** Stable codes main returns (`AgentEarErrorCode` in main/ipc/index.ts). */
+export type AgentEarAdminErrorCode =
+  | 'invalid_request' | 'busy' | 'not_paired' | 'forbidden' | 'daemon_error'
+  | 'backend_not_ready' | 'timeout' | 'proxy_failed'
+
+const ADMIN_CODES: readonly string[] = [
+  'invalid_request', 'busy', 'not_paired', 'forbidden', 'daemon_error', 'backend_not_ready', 'timeout', 'proxy_failed',
+]
+
+export class AgentEarAdminError extends Error {
+  constructor(readonly code: AgentEarAdminErrorCode, message: string) {
+    super(message)
+    this.name = 'AgentEarAdminError'
+  }
+}
+
+function adminOutcome(res: { ok: boolean; status: number; data: unknown }): 'done' | 'cancelled' {
+  if (res.ok) return 'done'
+  const raw = (res.data as { error?: { code?: unknown } } | null)?.error?.code
+  if (raw === 'cancelled') return 'cancelled'
+  const code = typeof raw === 'string' && ADMIN_CODES.includes(raw) ? raw as AgentEarAdminErrorCode : 'daemon_error'
+  throw new AgentEarAdminError(code, errorMessage(res))
+}
+
+/** Disable (`false`) or re-enable (`true`) AgentEar. 'cancelled' = the user
+ *  said no in the native dialog; nothing was sent. */
+export async function setAgentEarEnabled(enabled: boolean): Promise<'done' | 'cancelled'> {
+  return adminOutcome(await window.agent24.agentearSetEnabled(enabled))
+}
+
+/** Revoke AgentEar's pairing; it must pair again to come back. */
+export async function unpairAgentEar(): Promise<'done' | 'cancelled'> {
+  return adminOutcome(await window.agent24.agentearUnpair())
+}
+
 // Monotonic-enough unique id generator for command_id (design §6.3: the
 // panel is the caller here, not AgentEar's own dedupe cache, but a command_id
 // that collided across clicks would make AgentEar's dedupe silently swallow

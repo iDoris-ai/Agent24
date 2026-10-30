@@ -23,9 +23,6 @@ exemptions:
   - operationId: decideModuleApproval
     category: planned-tui-2
     fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
-  - operationId: createSchedule
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
   - operationId: updateSchedule
     category: planned-tui-2
     fallback: "raw-http，TUI-2 增加对应 agent24 子命令"

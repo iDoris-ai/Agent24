@@ -1767,6 +1767,24 @@ fn spawn_approval_recovery_scan_every(
     })
 }
 
+/// Set once the ready line has gone out (SPEC-002 §4): from then on stdout
+/// carries nothing, not even a `failed` line.
+pub static READY_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Another daemon holds the singleton lock: the start that loses a
+/// concurrent-start race. Its `failed` line says `already_running`, so a
+/// launcher knows to look for the winner instead of reporting an error.
+#[derive(Debug)]
+pub struct AlreadyRunning;
+
+impl std::fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("another agent24d is already running (singleton lock held)")
+    }
+}
+
+impl std::error::Error for AlreadyRunning {}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "startup options include both enrollment and injected iDoris dependencies"
@@ -1895,11 +1913,7 @@ pub async fn serve(
     } else {
         match agent24_protocol::state_file::try_acquire_singleton()? {
             Some(guard) => Some(guard),
-            None => {
-                return Err(std::io::Error::other(
-                    "another agent24d is already running (singleton lock held)",
-                ));
-            }
+            None => return Err(std::io::Error::other(AlreadyRunning)),
         }
     };
     // SHUT-1b: what the previous daemon left, then this one's marker — right
@@ -2164,52 +2178,16 @@ pub async fn serve(
     let advert_view = crate::module_tool_runtime::AgentModuleToolAdvertView::new(
         StdArc::clone(&module_tool_runtime),
         module_authorizations.clone(),
-        {
-            // Read per call (K1-6a-G §2.4), from this one router instance,
-            // which is never replaced today; a replaceable router must make
-            // the probe read the current instance (#1130 L2).
-            let router = Arc::clone(&router);
-            StdArc::new(move || Some(router.has_remote_tier()))
-        },
     );
     let advert_view_dyn: StdArc<dyn agent24_domain::tool::ModuleToolAdvertView> = advert_view;
-    for (_, registered) in module_registry.iter() {
-        let module = registered.module();
-        let declaration = registered.declaration();
-        let Some(authorization) =
-            module_authorizations.get(&(module.to_owned(), declaration.operation().to_owned()))
-        else {
-            continue;
-        };
-        match agent24_tools::ModuleTool::new(
-            module,
-            declaration.operation(),
-            declaration.description(),
-            declaration.input_schema().clone(),
-            Duration::from_millis(declaration.timeout_ms()),
-            Duration::from_millis(declaration.inline_wait_ms()),
-            agent24_protocol::RiskClass::External,
-            StdArc::clone(&advert_view_dyn),
-            StdArc::clone(authorization),
-            StdArc::clone(&module_tool_runtime_dyn),
-            store.clone(),
-            "agent24d",
-        ) {
-            Ok(tool) => {
-                if let Err(error) = tools.register_module_tool(StdArc::new(tool)) {
-                    tracing::warn!(
-                    module,
-                    operation = declaration.operation(),
-                    %error,
-                    "module tool was not registered"
-                    );
-                }
-            }
-            Err(error) => {
-                tracing::warn!(module, operation = declaration.operation(), %error, "module tool was not assembled")
-            }
-        }
-    }
+    crate::module_tool_runtime::register_module_tools(
+        &mut tools,
+        &module_registry,
+        &module_authorizations,
+        &advert_view_dyn,
+        &module_tool_runtime_dyn,
+        &store,
+    );
     // H9: register the read-only explorer subagent. It runs against a registry
     // that holds ONLY read builtins and NOT itself, so the sub-run cannot write,
     // execute, or recurse — the guarantees are structural, not policy-checked.
@@ -3095,7 +3073,8 @@ pub async fn serve(
 
     // SPEC-002 §4 ready line: legacy parsers scan stdout; capability mode first
     // proves stdin/stdout are parent-owned pipes and binds lifetime to stdin.
-    // stdout carries nothing else in either mode (logs go to stderr).
+    // stdout carries nothing else in either mode (logs go to stderr), except
+    // a `failed` line in place of the ready line when the start fails first.
     // Discovery state file BEFORE the ready line: a CLI that has seen the
     // ready line may immediately rely on attached-mode discovery.
     let daemon_pid = std::process::id();
@@ -3241,6 +3220,10 @@ pub async fn serve(
             host_ready.send(&ready).await?;
         }
     }
+    // SPEC-002 §4: nothing follows the ready line, so `main` writes no
+    // `failed` line after this. Only review guards this store: no test can
+    // fail a start between the line and here (review of #1332).
+    READY_SENT.store(true, std::sync::atomic::Ordering::SeqCst);
     // In capability mode `ready` is the only temporary owner of the raw host
     // bearer after the private write completes. Do not retain it for daemon
     // lifetime; the authority store keeps only its digest.
@@ -4584,7 +4567,9 @@ pub(crate) mod tests {
             authorization["scope_summary"]["readable"],
             "local documents"
         );
-        assert_eq!(authorization["status"], "granted");
+        // No module is mounted here and the grant names no package: the gate
+        // would refuse it, so the export says stale too (#1290).
+        assert_eq!(authorization["status"], "stale");
         for forbidden in ["body", "content", "credential", "token", "password"] {
             assert!(!serialized.to_lowercase().contains(forbidden));
         }
@@ -5068,9 +5053,90 @@ pub(crate) mod tests {
         );
     }
 
+    /// #1290: the list calls a grant what the gate would make of a call —
+    /// for the tool and the package as they are now. Only the grant for the
+    /// running package reads granted; one with no package identity, one for
+    /// another package (replaced in place), one whose package is not
+    /// running, one whose tool is not mounted, one of a module not on the
+    /// grants protocol (never dispatched, §2.6) and one given for an earlier
+    /// version of the tool all read stale.
+    #[tokio::test]
+    async fn the_list_calls_stale_what_the_gate_would_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = StdArc::new(std::sync::atomic::AtomicBool::new(true));
+        let (state, summary) = decision_state(&running, &dir.path().join("os.json")).await;
+        let (decided, expires) = ("2026-10-24T00:00:00Z", "2099-01-01T00:00:00Z");
+        let statuses = |state: AppState| async move {
+            let list = listed(state).await;
+            let views = list["authorizations"].as_array().unwrap();
+            let status = |module: &str| {
+                let view = views.iter().find(|view| view["module"] == module).unwrap();
+                view["status"].as_str().unwrap().to_owned()
+            };
+            (
+                status("doc-module"),
+                status("gone-module"),
+                status("old-module"),
+            )
+        };
+        let grant = |summary: agent24_store::ToolPermissionSummary, artifact: Option<&str>| {
+            let (store, artifact) = (state.store.clone(), artifact.map(str::to_owned));
+            async move {
+                let scope = agent24_store::GrantScope {
+                    resources: Vec::new(),
+                    artifact,
+                };
+                store
+                    .grant_module_consent_scoped(&summary, &scope, decided, expires)
+                    .await
+                    .unwrap();
+            }
+        };
+        // The tool is gone from the running package: never dispatched.
+        let gone = agent24_store::ToolPermissionSummary {
+            module: "gone-module".to_owned(),
+            ..summary.clone()
+        };
+        grant(gone, Some("sha256:abc")).await;
+        // Version, scope and package all match, but the module is not on the
+        // grants protocol: the gate never dispatches it.
+        let old_protocol = agent24_store::ToolPermissionSummary {
+            module: "old-module".to_owned(),
+            ..summary.clone()
+        };
+        grant(old_protocol, Some("sha256:abc")).await;
+
+        grant(summary.clone(), Some("sha256:abc")).await;
+        assert_eq!(
+            statuses(state.clone()).await,
+            ("granted".to_owned(), "stale".to_owned(), "stale".to_owned())
+        );
+        running.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(statuses(state.clone()).await.0, "stale");
+        running.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Given for 1.0.0 of a tool that is 1.2.3 now: judged by what it is now.
+        let earlier = agent24_store::ToolPermissionSummary {
+            module_version: "1.0.0".to_owned(),
+            ..summary.clone()
+        };
+        grant(earlier, Some("sha256:abc")).await;
+        assert_eq!(statuses(state.clone()).await.0, "stale");
+        grant(summary.clone(), Some("sha256:replaced-in-place")).await;
+        assert_eq!(statuses(state.clone()).await.0, "stale");
+        grant(summary, None).await;
+        assert_eq!(statuses(state.clone()).await.0, "stale");
+        // No identity on either side is no match.
+        running.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(statuses(state).await.0, "stale");
+    }
+
     async fn authorization_list(store: agent24_store::Store) -> serde_json::Value {
         let mut state = state().await;
         state.store = store;
+        listed(state).await
+    }
+
+    async fn listed(state: AppState) -> serde_json::Value {
         let response = build_router(state)
             .oneshot(
                 Request::builder()
