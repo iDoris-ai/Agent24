@@ -388,6 +388,39 @@ describe('ChatPage when the daemon refuses an old session', () => {
   })
 })
 
+describe('ChatPage with Knowledge when iDoris needs reserved memory', () => {
+  beforeEach(() => { setLocale('zh') })
+
+  it('shows the inline confirmation, then sends the turn again in the same session with the flag', async () => {
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: mockBackendProxy, knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
+      writable: true,
+      configurable: true,
+    })
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { idoris_headroom_confirmed?: boolean } }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: req.body?.idoris_headroom_confirmed ? 'r2' : 'r1' } }
+      return req.path.endsWith('/r1')
+        ? { ok: true, status: 200, data: { status: 'failed', error: { code: 'idoris_headroom_confirmation_required', message: 'reserved memory' } } }
+        : { ok: true, status: 200, data: { status: 'completed', output: { text: 'loaded with knowledge' } } }
+    })
+
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'q' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    const confirm = await screen.findByRole('button', { name: chatMessages.zh['headroom.confirm'] }, { timeout: 3000 })
+    expect(screen.queryByText(/知识库回答失败/)).not.toBeInTheDocument()
+    fireEvent.click(confirm)
+    await waitFor(() => expect(screen.getByText('loaded with knowledge')).toBeInTheDocument(), { timeout: 3000 })
+    const runs = mockBackendProxy.mock.calls.map(([req]) => req).filter((req) => req.method === 'POST' && req.path === '/api/v1/runs')
+    expect(runs.map((req) => req.body)).toEqual([
+      { prompt: 'q', session_id: 's1' },
+      { prompt: 'q', session_id: 's1', idoris_headroom_confirmed: true },
+    ])
+  })
+})
+
 describe('ChatPage English default', () => {
   it('shows the English welcome copy', () => {
     render(<ChatPage />)

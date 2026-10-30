@@ -192,6 +192,19 @@ describe('KnowledgeHost (KB-HOST-01 PR-B2b)', () => {
     expect(host.isActive('b1')).toBe(false)
   })
 
+  it('does not report a binding active on a restarted daemon before the replay lands, even ahead of the timer', async () => {
+    const host = makeHost()
+    host.start()
+    await host.activate('b1', { endpoint: 'https://kb.example/api/v1', knowledgeBaseIds: ['kb-a'] })
+    expect(host.isActive('b1')).toBe(true)
+    daemon.setConnection({ port: 2, authHeaders: { Authorization: 'Bearer t2' } })
+    // No sync() from the timer yet: asking alone notices the new daemon, and
+    // the replay it queues has not landed when the answer is given.
+    expect(host.isActive('b1')).toBe(false)
+    await vi.waitFor(() => expect(host.isActive('b1')).toBe(true))
+    expect(daemon.sent.some((r) => r.token === 'Bearer t2' && r.method === 'PUT' && r.path === B1)).toBe(true)
+  })
+
   it('drops a binding at once, ahead of a refresh still waiting, which then sends nothing', async () => {
     const host = makeHost()
     host.start()
