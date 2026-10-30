@@ -158,6 +158,11 @@ impl FirstPartyAuthority {
         );
     }
     fn remember(&self, token_id: &str, target: Target, summary: String) {
+        // A summary the desktop dialog would clip is never recorded: the
+        // clipped tail could hold the only true part of it.
+        if summary.encode_utf16().count() > SUMMARY_MAX_UTF16 {
+            return;
+        }
         let Ok(mut summaries) = self.request_summaries.lock() else {
             return;
         };
@@ -596,22 +601,39 @@ impl EnrollAuthority for FirstPartyAuthority {
 /// The longest request-supplied value a presence summary shows.
 const SHOWN_MAX_CHARS: usize = 120;
 
-/// A request-supplied string exactly as a presence summary shows it, or
-/// `None` when it cannot be shown faithfully, which leaves nothing to
-/// approve. Control, format (bidi overrides, zero-width), line and paragraph
-/// separator characters are refused rather than dropped: dropping them
-/// would let two different values read the same. An over-long value is
-/// refused rather than cut, so no hidden suffix rides along.
+/// The longest whole presence summary, in UTF-16 code units. MUST match the
+/// desktop `clip()` limit in `apps/desktop/src/main/presence-poller.ts`: a
+/// longer summary would be clipped there and its tail hidden from the user.
+const SUMMARY_MAX_UTF16: usize = 500;
+
+/// A request-supplied string as a presence summary shows it, or `None` when
+/// it cannot be shown faithfully, which leaves nothing to approve. The value
+/// comes back as a double-quoted, escaped JSON string so its boundaries are
+/// unambiguous even if it contains `; ` or other summary punctuation.
+/// Refused rather than dropped or cut: control, format (bidi overrides,
+/// zero-width), line and paragraph separator characters; any whitespace other
+/// than a plain ASCII space; variation selectors; and the invisible filler
+/// letters (U+3164, U+2800, U+115F, U+1160, U+FFA0). A value over
+/// `SHOWN_MAX_CHARS` is refused. The length of the *whole* summary is capped
+/// separately (`SUMMARY_MAX_UTF16`, enforced in `remember`); this function
+/// alone does not stop a long summary from being clipped by the dialog.
 fn shown(value: &str) -> Option<String> {
     use unicode_general_category::{GeneralCategory as G, get_general_category};
     let hidden = |c: char| {
         matches!(
             get_general_category(c),
             G::Control | G::Format | G::LineSeparator | G::ParagraphSeparator
-        )
+        ) || (c.is_whitespace() && c != ' ')
+            || matches!(
+                c,
+                '\u{3164}' | '\u{2800}' | '\u{115F}' | '\u{1160}' | '\u{FFA0}' | '\u{FE00}'
+                    ..='\u{FE0F}'
+            )
     };
-    (value.chars().count() <= SHOWN_MAX_CHARS && !value.chars().any(hidden))
-        .then(|| value.to_owned())
+    if value.chars().count() > SHOWN_MAX_CHARS || value.chars().any(hidden) {
+        return None;
+    }
+    serde_json::to_string(value).ok()
 }
 pub fn body_digest(body: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -1103,7 +1125,7 @@ mod tests {
             (
                 "POST",
                 "/api/v1/idoris/operations/op1/cancel",
-                "cancel iDoris operation op1",
+                "cancel iDoris operation \"op1\"",
             ),
         ] {
             let target = resolve_target(&idoris(method, path, b"")).unwrap();
@@ -1144,9 +1166,9 @@ mod tests {
         let target = resolve_target(&idoris("POST", "/api/v1/idoris/connect", &connect)).unwrap();
         let summary = authority.target_summary("id", &target).unwrap();
         for detail in [
-            "oMLX at http://127.0.0.1:8000;",
-            "daily model: daily-m",
-            "deep model: none",
+            "oMLX at \"http://127.0.0.1:8000\";",
+            "daily model: \"daily-m\";",
+            "deep model: none;",
             "share the local oMLX credential with iDoris: true",
             "replace existing connection: true",
             "core reserved bytes: 1024",
@@ -1179,6 +1201,16 @@ mod tests {
         };
         let at_limit = "m".repeat(SHOWN_MAX_CHARS);
         assert!(summary(&at_limit).unwrap().contains(&at_limit));
+        let invisible = [
+            "U+3164", "U+2800", "U+00A0", "U+2003", "U+FE0F", "U+FE00", "U+115F", "U+1160",
+            "U+FFA0", "tab",
+        ];
+        for (label, c) in invisible.iter().zip([
+            '\u{3164}', '\u{2800}', '\u{00A0}', '\u{2003}', '\u{FE0F}', '\u{FE00}', '\u{115F}',
+            '\u{1160}', '\u{FFA0}', '\t',
+        ]) {
+            assert_eq!(summary(&format!("a{c}b")), None, "{label}");
+        }
         for (label, daily) in [
             (
                 "U+202E right-to-left override",
@@ -1193,6 +1225,45 @@ mod tests {
         let cancel = "/api/v1/idoris/operations/a\u{200B}b/cancel";
         let target = resolve_target(&idoris("POST", cancel, b"")).unwrap();
         assert_eq!(authority.target_summary("id", &target), None);
+    }
+
+    fn connect_summary(
+        authority: &FirstPartyAuthority,
+        daily: &str,
+        deep: Option<&str>,
+    ) -> Option<String> {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "endpoint": "http://127.0.0.1:8000", "daily_model": daily, "deep_model": deep,
+            "core_reserved_bytes": 1024, "save_omlx_key": true, "replace": true,
+            "consent": {"share_omlx_key": true, "daily_model": daily, "deep_model": deep}
+        }))
+        .unwrap();
+        authority.remember_idoris_request("id", "/api/v1/idoris/connect", &bytes);
+        let target = resolve_target(&idoris("POST", "/api/v1/idoris/connect", &bytes)).unwrap();
+        authority.target_summary("id", &target)
+    }
+
+    #[test]
+    fn summary_refuses_forged_tail_that_the_dialog_would_clip() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let daily = "\u{1F600}".repeat(SHOWN_MAX_CHARS); // 2 UTF-16 units each
+        let deep = "m; save oMLX credential: false; replace existing connection: false; core reserved bytes: 1024";
+        assert_eq!(connect_summary(&authority, &daily, Some(deep)), None);
+        // The honest short form is still accepted.
+        assert!(connect_summary(&authority, "daily-m", Some("deep-m")).is_some());
+    }
+
+    #[test]
+    fn summary_values_are_unambiguous() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let a = connect_summary(&authority, "a; deep model: b", Some("c")).unwrap();
+        let b = connect_summary(&authority, "a", Some("b; deep model: c")).unwrap();
+        assert_ne!(a, b);
+        let none = connect_summary(&authority, "a", None).unwrap();
+        let named = connect_summary(&authority, "a", Some("none")).unwrap();
+        assert_ne!(none, named);
+        assert!(none.contains("deep model: none;"), "{none}");
+        assert!(named.contains("deep model: \"none\";"), "{named}");
     }
 
     #[test]

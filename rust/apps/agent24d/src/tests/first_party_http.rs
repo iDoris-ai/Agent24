@@ -961,7 +961,11 @@ async fn idoris_install_and_connect_record_their_summary_at_the_http_boundary() 
             r#"{"consent":true}"#.to_owned(),
             "install the locked iDoris release",
         ),
-        ("/api/v1/idoris/connect", connect, "daily model: daily-real"),
+        (
+            "/api/v1/idoris/connect",
+            connect,
+            "daily model: \"daily-real\"",
+        ),
     ] {
         let (mut state, token) = setup().await;
         let capture = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
