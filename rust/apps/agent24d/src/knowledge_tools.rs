@@ -6,8 +6,9 @@
 //!
 //! The model reads what the call layer renders: evidence wrapped as data, or a
 //! refusal with a fixed code and sentence. A local `cancelled` (the binding
-//! moved while the call was out) is no evidence and reaches the model only as
-//! the tool's own cancellation.
+//! or its credential moved while the call was out) is no evidence: the model
+//! reads it as a refusal it may retry, and the run goes on. Only the run's own
+//! cancellation cancels the call.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -118,10 +119,29 @@ impl Tool for KnowledgeTool {
         };
         result.map_err(|refused| match refused {
             Refused::Invalid(message) => ToolError::Invalid(message),
-            Refused::Cancelled => ToolError::Cancelled,
+            Refused::Cancelled => superseded(self.kind),
             Refused::Failed(text) => ToolError::Failed(text),
         })
     }
+}
+
+/// The binding or its credential moved while the call was out (a credential
+/// refresh, say): the answer is dropped, the run is not cancelled.
+fn superseded(kind: Kind) -> ToolError {
+    let kind = match kind {
+        Kind::Search => "knowledge.search",
+        Kind::Read => "knowledge.read",
+    };
+    ToolError::Failed(
+        serde_json::json!({
+            "kind": kind,
+            "outcome": "refused",
+            "code": "knowledge_call_superseded",
+            "retryable": true,
+            "advice": "调用途中知识库的设置或凭据变了，这次结果作废，可以再试一次。",
+        })
+        .to_string(),
+    )
 }
 
 #[cfg(test)]
