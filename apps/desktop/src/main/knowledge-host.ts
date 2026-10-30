@@ -154,8 +154,11 @@ export class KnowledgeHost {
     })
   }
 
-  /** Whether the daemon on this connection has `bindingId` active, as wanted. */
+  /** Whether the daemon on this connection has `bindingId` active, as wanted.
+   * Checks the connection first: a restarted daemon has nothing active yet,
+   * even before the timer's `sync()` notices it. */
   isActive(bindingId: string): boolean {
+    this.sync()
     return this.wanted.has(bindingId) && this.confirmed.has(bindingId)
   }
 

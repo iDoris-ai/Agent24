@@ -32,6 +32,15 @@ describe('chat-knowledge', () => {
     expect(calls.filter((c) => c.method === 'GET').every((c) => c.path === '/api/v1/runs/run_1')).toBe(true)
   })
 
+  it('sends the iDoris headroom confirmation only when the user gave it', async () => {
+    const plain = proxyWith([{ status: 'completed', output: { text: 'x' } }])
+    await askWithKnowledge('q', 's', { proxy: plain.proxy, sleep: async () => {} })
+    expect(plain.calls[0]?.body).not.toHaveProperty('idoris_headroom_confirmed')
+    const confirmed = proxyWith([{ status: 'completed', output: { text: 'x' } }])
+    await askWithKnowledge('q', 's', { proxy: confirmed.proxy, sleep: async () => {} }, true)
+    expect(confirmed.calls[0]?.body).toEqual({ prompt: 'q', session_id: 's', idoris_headroom_confirmed: true })
+  })
+
   it('reports an approval wait once, then its end', async () => {
     const seen: boolean[] = []
     const { proxy } = proxyWith([{ status: 'awaiting_approval' }, { status: 'awaiting_approval' }, { status: 'completed', output: { text: 'x' } }])

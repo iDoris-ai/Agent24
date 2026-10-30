@@ -187,7 +187,7 @@ export default function ChatPage() {
         runSession.current ??= await createChatSession(proxy)
         return runSession.current === null
           ? { kind: 'failed' as const, code: 'session_unavailable', message: 'session_unavailable' }
-          : await askWithKnowledge(prompt, runSession.current, { proxy, onAwaitingApproval: setAwaitingApproval })
+          : await askWithKnowledge(prompt, runSession.current, { proxy, onAwaitingApproval: setAwaitingApproval }, request.idoris_headroom_confirmed === true)
       }
       let turn = await ask()
       // The daemon ties a session to one activation of the binding; after a
@@ -195,6 +195,12 @@ export default function ChatPage() {
       if (turn.kind === 'failed' && turn.code === 'knowledge_session_rebound') {
         runSession.current = null
         turn = await ask()
+      }
+      // Same inline confirmation as a /api/v1/chat turn; confirming sends
+      // the turn again with the flag set.
+      if (turn.kind === 'failed' && turn.code === 'idoris_headroom_confirmation_required') {
+        setDelivery(index, { kind: 'headroom', request })
+        return
       }
       if (turn.kind === 'answer') {
         const suffix: ReplyLatency = { modelName: null, tier: null, firstTokenMs: null, totalMs: performance.now() - sentAt }
