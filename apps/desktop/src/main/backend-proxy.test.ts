@@ -12,6 +12,7 @@ import {
   isAllowedProxyRoute,
   matchTemplate,
   proxyRequest,
+  withKnowledgeBinding,
 } from './backend-proxy'
 
 describe('A1 template matching ({param} = one safe segment)', () => {
@@ -226,5 +227,31 @@ describe('A2 proxyRequest', () => {
     await proxyRequest(ep, { method: 'POST', path: '/x', body: { k: 1 } })
     expect(seen.auth).toBe('Bearer t')
     expect(JSON.parse(seen.body)).toEqual({ k: 1 })
+  })
+})
+
+describe('withKnowledgeBinding (decision 2026-10-30-main-chat-knowledge-path)', () => {
+  const runs = findAllowedRoute('POST', '/api/v1/runs')!
+  const chat = findAllowedRoute('POST', '/api/v1/chat')!
+
+  it('drops the renderer’s binding from a run it creates and sets main’s', () => {
+    const req = { method: 'POST' as const, path: '/api/v1/runs', body: { prompt: 'q', knowledge_binding_id: 'evil' } }
+    expect(withKnowledgeBinding(runs, req, 'default')?.body).toEqual({ prompt: 'q', knowledge_binding_id: 'default' })
+    expect(withKnowledgeBinding(runs, req, null)?.body).toEqual({ prompt: 'q' })
+  })
+
+  it('leaves every other route as it is', () => {
+    const other = { method: 'POST' as const, path: '/api/v1/chat', body: { knowledge_binding_id: 'x' } }
+    expect(withKnowledgeBinding(chat, other, 'default')).toBe(other)
+  })
+
+  it('refuses a run whose body is no JSON object, which could name a binding by position', () => {
+    for (const body of [[false, null, null, 'q', null, 'normal', 'default'], 'q', null, undefined]) {
+      expect(withKnowledgeBinding(runs, { method: 'POST' as const, path: '/api/v1/runs', body }, null)).toBeNull()
+    }
+  })
+
+  it('lets the renderer create a session for the main chat', () => {
+    expect(findAllowedRoute('POST', '/api/v1/sessions')).toBeTruthy()
   })
 })
