@@ -15,19 +15,25 @@ export type Grounding =
   | { kind: 'nothingRead'; unread: string[] }
   | { kind: 'read'; unread: string[] }
 
-// Two IDs joined by `#`, as the tools ask sources to be written; not a URL's
-// fragment (`…/page#part`).
-const CITED = /(?<![\w/.:#-])([\w-]{4,256})#([\w-]{4,256})(?![\w#-])/g
+// Anything joined by `#`, as the tools ask sources to be written. Broad on
+// purpose: a made-up source left unmarked is worse than a URL's fragment
+// marked as not read. The right side stops short of `.` and `:`, which end a
+// sentence or a label.
+const CITED = /[\w.:+=~@%-]+#[\w+=~@%-]+/g
+const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
-/** Each `knowledge_id#chunk_id` in `text`, once, in order. */
+/** Each `x#y` in `text`, once, in order. */
 export function citedChunks(text: string): string[] {
-  return [...new Set([...text.matchAll(CITED)].map((m) => `${m[1]}#${m[2]}`))]
+  return [...new Set(text.match(CITED) ?? [])]
 }
 
 /** `knowledge` null: the run had no Knowledge binding, so searched nothing. */
 export function grounding(text: string, knowledge: RunKnowledge | null): Grounding {
-  const read = new Set((knowledge?.read_chunks ?? []).map((c) => `${c.knowledge_id}#${c.chunk_id}`))
-  const unread = citedChunks(text).filter((id) => !read.has(id))
+  const read = (knowledge?.read_chunks ?? []).map((c) => `${c.knowledge_id}#${c.chunk_id}`)
+  // The sources the run read back stand wherever they are written ("来源:"
+  // right before one, say); every other `x#y` left is not a source.
+  const rest = read.reduce((rest, id) => rest.replace(new RegExp(`${escape(id)}(?![\\w+=~@%-])`, 'g'), ' '), text)
+  const unread = citedChunks(rest)
   if (!knowledge?.searched) return { kind: 'notSearched', unread }
-  return { kind: read.size > 0 ? 'read' : 'nothingRead', unread }
+  return { kind: read.length > 0 ? 'read' : 'nothingRead', unread }
 }

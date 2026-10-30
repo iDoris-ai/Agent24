@@ -9,9 +9,22 @@ const read = (...ids: [string, string][]) => ({
 })
 
 describe('knowledge-grounding', () => {
-  it('finds the knowledge_id#chunk_id sources an answer names, once each, not URL fragments', () => {
-    const text = `煮沸 1 分钟。\n来源 / Sources\n- s01-02-zh-water-2025.pdf，${DOC}#${CHUNK}\n- doc-7#chk-71（又见 doc-7#chk-71）\n见 https://example.com/page#section 与 C# 语言`
-    expect(citedChunks(text)).toEqual([`${DOC}#${CHUNK}`, 'doc-7#chk-71'])
+  it('finds every source an answer names, once each, however it is written', () => {
+    const text = `煮沸 1 分钟。\n来源 / Sources\n- s01-02-zh-water-2025.pdf，${DOC}#${CHUNK}\n- doc-7#chk-71（又见 doc-7#chk-71）\nSources:doc-9#chk-99；d#c 与 C# 语言、#1515`
+    expect(citedChunks(text)).toEqual([`${DOC}#${CHUNK}`, 'doc-7#chk-71', 'Sources:doc-9#chk-99', 'd#c'])
+  })
+
+  it('a source written right after a colon or with short IDs is still checked', () => {
+    // Read back: stands even with "Sources:" against it.
+    expect(grounding('Sources:doc-7#chk-71', read(['doc-7', 'chk-71']))).toEqual({ kind: 'read', unread: [] })
+    // Not read back: marked, not passed over.
+    expect(grounding('答案。Sources:doc-9#chk-99', read(['doc-7', 'chk-71'])).unread).toEqual(['Sources:doc-9#chk-99'])
+    expect(grounding('来源：d#c', read(['doc-7', 'chk-71'])).unread).toEqual(['d#c'])
+    expect(grounding('来源：d#c', read(['d', 'c'])).unread).toEqual([])
+    // At the end of a sentence, still the source read.
+    expect(grounding('见 doc-7#chk-71. 以及 doc-7#chk-71:', read(['doc-7', 'chk-71'])).unread).toEqual([])
+    // A longer ID that starts with one read is another source.
+    expect(grounding('来源：doc-7#chk-712', read(['doc-7', 'chk-71'])).unread).toEqual(['doc-7#chk-712'])
   })
 
   it('an answer from a run that called no Knowledge tool says so, and none of its sources stand', () => {
