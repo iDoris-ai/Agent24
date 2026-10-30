@@ -484,6 +484,7 @@ export function registerIpcHandlers(options: {
       return proxyError('forbidden', `${req.method} ${req.path.split('?')[0]} is not available through the renderer proxy`)
     }
     const forwarded = withKnowledgeBinding(route, req, knowledge()?.bindingForRun() ?? null)
+    if (!forwarded) return proxyError('invalid_request', 'A run is created from a JSON object')
     return proxyToBackend(forwarded, timeoutFor(route))
   })
 

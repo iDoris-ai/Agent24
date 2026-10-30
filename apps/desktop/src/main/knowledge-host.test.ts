@@ -225,6 +225,27 @@ describe('KnowledgeHost (KB-HOST-01 PR-B2b)', () => {
     expect(await host.pushCredential('b1', credential('after'))).toEqual({ ok: false, reason: 'binding_inactive' })
   })
 
+  it('does not let a stale retry of an Off drop an activation that came after it', async () => {
+    const host = makeHost()
+    host.start()
+    await host.activate('b1')
+    let release = () => {}
+    let first = true
+    daemon.respondWith(((req: Sent) => {
+      if (req.method === 'DELETE' && first) {
+        first = false
+        return new Promise((resolve) => { release = () => resolve({ status: 409, code: 'stale_sequence' }) })
+      }
+      return { status: 204 }
+    }) as never)
+    const off = host.deactivate('b1')
+    expect(await host.activate('b1')).toEqual({ ok: true })
+    release()
+    expect(await off).toEqual({ ok: false, reason: 'binding_inactive' })
+    expect(daemon.sent.filter((r) => r.method === 'DELETE')).toHaveLength(1)
+    expect(host.isActive('b1')).toBe(true)
+  })
+
   it('stops retrying a stale activation once the binding is dropped', async () => {
     const host = makeHost()
     host.start()

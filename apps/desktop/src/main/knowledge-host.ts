@@ -291,7 +291,9 @@ export class KnowledgeHost {
     let last: Failure = 'stale_sequence'
     const entry = this.wanted.get(bindingId)
     for (let attempt = 0; attempt < MAX_STALE_RETRIES; attempt++) {
-      if (method === 'PUT' && (entry === undefined || this.wanted.get(bindingId) !== entry)) return failure('binding_inactive')
+      // Overtaken: a later change of the binding wins, so a stale retry of
+      // an Off never drops an activation that came after it.
+      if (this.wanted.get(bindingId) !== entry || (method === 'PUT' && entry === undefined)) return failure('binding_inactive')
       const conn = this.deps.connection()
       if (!conn) return failure('daemon_unavailable')
       const path = `${BINDINGS}/${encodeURIComponent(bindingId)}${suffix}?seq=${this.deps.clock.next()}`

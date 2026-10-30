@@ -217,6 +217,25 @@ describe('KnowledgeController (M3)', () => {
     save.mockRestore()
   })
 
+  it('keeps the saved key when a change with a new key cannot be saved', async () => {
+    const c = make()
+    await c.configure(GOOD)
+    const save = vi.spyOn(KnowledgeSettingsStore.prototype, 'save').mockRejectedValueOnce(new Error('disk full'))
+    expect(await c.configure({ endpoint: 'https://other.example/api/v1', knowledgeBaseIds: ['kb-x'], apiKey: 'sk-OTHER' }))
+      .toEqual({ ok: false, reason: 'not_saved' })
+    expect(logins.list().get(KNOWLEDGE_BINDING)).toMatchObject({ profileId: GOOD.endpoint, material: GOOD.apiKey })
+    expect(c.status()).toMatchObject({ endpoint: GOOD.endpoint, hasKey: true })
+    save.mockRestore()
+  })
+
+  it('leaves no key behind when a first change cannot be saved', async () => {
+    const c = make()
+    const save = vi.spyOn(KnowledgeSettingsStore.prototype, 'save').mockRejectedValueOnce(new Error('disk full'))
+    expect(await c.configure(GOOD)).toEqual({ ok: false, reason: 'not_saved' })
+    expect(logins.list().get(KNOWLEDGE_BINDING)).toBeUndefined()
+    save.mockRestore()
+  })
+
   it('names no binding for a run until the daemon on this connection has taken the activation', async () => {
     const c = make()
     await c.configure(GOOD)
