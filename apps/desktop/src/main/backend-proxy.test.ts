@@ -236,15 +236,19 @@ describe('withKnowledgeBinding (decision 2026-10-30-main-chat-knowledge-path)', 
 
   it('drops the renderer’s binding from a run it creates and sets main’s', () => {
     const req = { method: 'POST' as const, path: '/api/v1/runs', body: { prompt: 'q', knowledge_binding_id: 'evil' } }
-    expect(withKnowledgeBinding(runs, req, 'default').body).toEqual({ prompt: 'q', knowledge_binding_id: 'default' })
-    expect(withKnowledgeBinding(runs, req, null).body).toEqual({ prompt: 'q' })
+    expect(withKnowledgeBinding(runs, req, 'default')?.body).toEqual({ prompt: 'q', knowledge_binding_id: 'default' })
+    expect(withKnowledgeBinding(runs, req, null)?.body).toEqual({ prompt: 'q' })
   })
 
-  it('leaves every other route and a body that is no object as it is', () => {
+  it('leaves every other route as it is', () => {
     const other = { method: 'POST' as const, path: '/api/v1/chat', body: { knowledge_binding_id: 'x' } }
     expect(withKnowledgeBinding(chat, other, 'default')).toBe(other)
-    const odd = { method: 'POST' as const, path: '/api/v1/runs', body: ['x'] }
-    expect(withKnowledgeBinding(runs, odd, 'default')).toBe(odd)
+  })
+
+  it('refuses a run whose body is no JSON object, which could name a binding by position', () => {
+    for (const body of [[false, null, null, 'q', null, 'normal', 'default'], 'q', null, undefined]) {
+      expect(withKnowledgeBinding(runs, { method: 'POST' as const, path: '/api/v1/runs', body }, null)).toBeNull()
+    }
   })
 
   it('lets the renderer create a session for the main chat', () => {

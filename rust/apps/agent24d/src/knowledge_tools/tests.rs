@@ -3,7 +3,10 @@
 use std::sync::Mutex;
 
 use agent24_knowledge::tool::call::{Failure, ReadQuery, SearchQuery};
-use agent24_knowledge::{ReadRequest, ReadResponse, SearchRequest, SearchResponse};
+use agent24_knowledge::{
+    CancelledCode, CancelledDetails, CancelledError, ConstBool, LocalCancelled, ReadRequest,
+    ReadResponse, SearchRequest, SearchResponse,
+};
 use serde_json::json;
 
 use super::*;
@@ -164,6 +167,43 @@ async fn refusals_invalid_arguments_and_cancellation_map_to_tool_errors() {
         .call(&ctx(), &input(json!({ "query": "q" })), &cancel)
         .await;
     assert!(matches!(cancelled, Err(ToolError::Cancelled)));
+}
+
+#[tokio::test]
+async fn a_binding_that_moves_mid_call_drops_the_answer_not_the_run() {
+    let moved = Failure::Cancelled(LocalCancelled {
+        error: CancelledError {
+            code: CancelledCode::Cancelled,
+            message: "The Knowledge binding changed while the call was out".into(),
+            hint: None,
+            details: CancelledDetails {
+                retryable: ConstBool,
+                request_id: "req-1".into(),
+                generation: 1,
+                current_generation: 1,
+            },
+        },
+    });
+    for (kind, args, tag) in [
+        (Kind::Search, json!({ "query": "q" }), "knowledge.search"),
+        (
+            Kind::Read,
+            json!({ "knowledge_id": "doc-1" }),
+            "knowledge.read",
+        ),
+    ] {
+        let (tool, _) = tool(kind, Some(moved.clone()));
+        let refused = tool
+            .call(&ctx(), &input(args), &CancellationToken::new())
+            .await;
+        let Err(ToolError::Failed(text)) = refused else {
+            panic!("{refused:?}");
+        };
+        let out: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(out["code"], "knowledge_call_superseded");
+        assert_eq!(out["kind"], tag);
+        assert_eq!(out["retryable"], true);
+    }
 }
 
 #[tokio::test]

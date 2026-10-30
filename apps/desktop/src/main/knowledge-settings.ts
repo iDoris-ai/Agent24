@@ -159,11 +159,20 @@ export class KnowledgeController {
       // before its turn writes nothing.
       await this.serial(async () => {
         if (overtaken()) return
+        const previous = this.logins.list().get(KNOWLEDGE_BINDING)
         if (typeof apiKey === 'string') {
           // The login names the endpoint it is for (`key()`).
           await this.logins.put(KNOWLEDGE_BINDING, { profileId: endpoint, material: apiKey, unusable: false, temporary: false })
         }
-        await this.store.save(next)
+        try {
+          await this.store.save(next)
+        } catch (err) {
+          // Not saved: the saved settings keep their own key.
+          if (typeof apiKey === 'string') {
+            await (previous ? this.logins.put(KNOWLEDGE_BINDING, { ...previous }) : this.logins.remove(KNOWLEDGE_BINDING))
+          }
+          throw err
+        }
       })
     } catch {
       return { ok: false, reason: 'not_saved' }
