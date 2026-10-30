@@ -220,3 +220,56 @@ async fn a_run_whose_source_policy_is_unavailable_sends_nothing() {
     assert!(matches!(denied, Err(ToolError::Denied(_))), "{denied:?}");
     assert!(backend.runs.lock().unwrap().is_empty());
 }
+
+fn result_of(origin: &str, call: &str) -> agent24_domain::EgressResource {
+    agent24_domain::EgressResource::local_only(format!("tool_result:{origin}:{call}"), "r")
+}
+
+#[tokio::test]
+async fn earlier_knowledge_results_do_not_hold_back_another_knowledge_call() {
+    // In this run, and from the session's earlier turns.
+    let ctx = ctx().with_egress_resources(vec![
+        result_of("tool:knowledge_search", "tc_1"),
+        result_of("tool:knowledge_read", "session:s1"),
+    ]);
+    for kind in [Kind::Search, Kind::Read] {
+        let (tool, backend) = tool(kind, None);
+        let args = match kind {
+            Kind::Search => json!({ "query": "q" }),
+            Kind::Read => json!({ "knowledge_id": "k" }),
+        };
+        let got = tool
+            .call(&ctx, &input(args), &CancellationToken::new())
+            .await;
+        // Past the egress check and on to the backend.
+        assert!(!matches!(got, Err(ToolError::Denied(_))), "{got:?}");
+        assert_eq!(backend.runs.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn any_other_source_still_holds_it_back() {
+    for other in [
+        "tool:shell_exec",
+        "tool:knowledge_search_x",
+        "module:knowledge_search",
+    ] {
+        let ctx = ctx().with_egress_resources(vec![
+            result_of("tool:knowledge_search", "tc_1"),
+            result_of(other, "tc_2"),
+        ]);
+        let (search, backend) = tool(Kind::Search, None);
+        let denied = search
+            .call(
+                &ctx,
+                &input(json!({ "query": "q" })),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(denied, Err(ToolError::Denied(_))),
+            "{other}: {denied:?}"
+        );
+        assert!(backend.runs.lock().unwrap().is_empty(), "{other}");
+    }
+}
