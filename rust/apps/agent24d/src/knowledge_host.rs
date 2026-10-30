@@ -52,6 +52,9 @@ pub const MAX_BINDINGS_PER_HOST: usize = 1024;
 const MAX_BINDING_ID_BYTES: usize = 256;
 /// Run pins kept; the oldest goes first, and its run is then refused.
 const MAX_PINNED_RUNS: usize = 4096;
+/// Session pins kept. None is ever dropped (see `pin_session`); past this
+/// many, a session not yet pinned is refused until the daemon restarts.
+const MAX_PINNED_SESSIONS: usize = 65_536;
 const MAX_CREDENTIAL_BYTES: usize = 16 * 1024;
 /// Knowledge bases one activation may name.
 pub const MAX_KNOWLEDGE_BASES: usize = 64;
@@ -178,7 +181,7 @@ pub struct KnowledgeHostRegistry {
     /// its Knowledge results into later turns, and the Knowledge tools send
     /// those back to the binding's endpoint (ADR-K1-02 §2.1.1 item 6), so a
     /// session never moves to another activation.
-    sessions: Mutex<RunPins>,
+    sessions: Mutex<HashMap<String, RunBinding>>,
     /// Woken on every change applied, so a call in flight can tell at once
     /// that its binding moved (`crate::knowledge_backend`).
     changed: tokio::sync::Notify,
@@ -353,10 +356,12 @@ impl KnowledgeHostRegistry {
     }
 
     /// Ties `session_id` to `binding`; false when the session's runs were
-    /// already bound to another host, binding or activation, or when it has
-    /// no pin yet `took_knowledge`: pins live in memory, so one evicted or
-    /// lost with a restart no longer says where those results came from. A
-    /// poisoned lock is false too.
+    /// already bound to another host, binding or activation. A pin is never
+    /// dropped, so a session without one had no bound run since this daemon
+    /// started and none is still out: its `took_knowledge` (read from the
+    /// store) is then complete, and true means results from an activation
+    /// lost with a restart, so it is refused too. Past the cap, and on a
+    /// poisoned lock, false.
     pub fn pin_session(
         &self,
         session_id: &str,
@@ -366,20 +371,14 @@ impl KnowledgeHostRegistry {
         let Ok(mut sessions) = self.sessions.lock() else {
             return false;
         };
-        match sessions.pins.get(session_id) {
-            Some(pinned) => return pinned == binding,
-            None if took_knowledge => return false,
+        match sessions.get(session_id) {
+            Some(pinned) => pinned == binding,
+            None if took_knowledge || sessions.len() >= MAX_PINNED_SESSIONS => false,
             None => {
-                sessions.pins.insert(session_id.to_owned(), binding.clone());
-                sessions.order.push_back(session_id.to_owned());
+                sessions.insert(session_id.to_owned(), binding.clone());
+                true
             }
         }
-        while sessions.order.len() > MAX_PINNED_RUNS {
-            if let Some(oldest) = sessions.order.pop_front() {
-                sessions.pins.remove(&oldest);
-            }
-        }
-        true
     }
 
     /// The binding a run may use now: the one it names in its persisted input

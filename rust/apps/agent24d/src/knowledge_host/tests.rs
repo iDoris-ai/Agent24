@@ -948,17 +948,20 @@ fn a_session_pin_is_exact() {
 }
 
 #[test]
-fn a_session_with_knowledge_results_and_no_pin_is_not_pinned_anew() {
+fn no_new_pin_for_a_session_with_knowledge_results_and_none_past_the_cap() {
     let registry = KnowledgeHostRegistry::default();
     assert!(!registry.pin_session("s1", &pin("host", "b1", 1), true));
     assert!(!registry.pin_session("s1", &pin("host", "b1", 1), true));
 
-    // Evicted: the pin no longer says where its results came from.
+    // Never dropped: past the cap a new session is refused, a pinned one
+    // keeps its pin.
     assert!(registry.pin_session("s2", &pin("host", "b1", 1), false));
-    for n in 0..MAX_PINNED_RUNS {
+    for n in 1..MAX_PINNED_SESSIONS {
         assert!(registry.pin_session(&format!("other-{n}"), &pin("host", "b1", 1), false));
     }
-    assert!(!registry.pin_session("s2", &pin("host", "b1", 2), true));
+    assert!(!registry.pin_session("late", &pin("host", "b1", 1), false));
+    assert!(registry.pin_session("s2", &pin("host", "b1", 1), true));
+    assert!(!registry.pin_session("s2", &pin("host", "b1", 2), false));
 }
 
 #[tokio::test]
