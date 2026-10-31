@@ -95,6 +95,9 @@ export default function ChatPage() {
     setMessages([])
     setInput('')
     setSessionId(genChatSessionId())
+    // Knowledge turns run in their own session (`runSession`); a new
+    // conversation must not carry the old one's turns into its runs.
+    runSession.current = null
   }
 
   const setDelivery = (index: number, delivery: Delivery) => {
