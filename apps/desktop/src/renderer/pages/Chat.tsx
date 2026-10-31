@@ -31,6 +31,9 @@ interface AssistantMessage {
   /** Answered as a run with the Knowledge tools (chat-knowledge.ts): what
    *  the run read, which the labels under the reply say. */
   knowledge?: Grounding
+  /** Answered without Knowledge although its switch is On: main had no
+   *  binding for a run, so the turn went to `/api/v1/chat`. */
+  knowledgeInactive?: boolean
 }
 
 // M1-T12: one id per conversation, sent as `session_id` on every
@@ -110,6 +113,9 @@ export default function ChatPage() {
       await replyWithKnowledge(index, request)
       return
     }
+    // On but not in effect (no binding, e.g. a daemon started from the CLI):
+    // the reply still comes, and says it did not use Knowledge.
+    const knowledgeInactive = knowledge?.enabled === true
 
     // Call backend LLM gateway via IPC proxy
     try {
@@ -162,7 +168,7 @@ export default function ChatPage() {
         totalMs: server.totalMs ?? totalMs,
       }
       setDelivery(index, { kind: 'sent' })
-      setMessages(prev => [...prev, { role: 'assistant', content: reply, suffix, memoryReceipt }])
+      setMessages(prev => [...prev, { role: 'assistant', content: reply, suffix, memoryReceipt, knowledgeInactive }])
     } catch (e) {
       setDelivery(index, { kind: 'notSent' })
       // `failure.code` above is the only input: `backend_not_ready` gets the
@@ -276,6 +282,9 @@ export default function ChatPage() {
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>
                   {m.knowledge.kind === 'read' ? t('knowledge.via') : t(`knowledge.${m.knowledge.kind}`)}
                 </div>
+              )}
+              {m.role === 'assistant' && m.knowledgeInactive && (
+                <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>{t('knowledge.inactive')}</div>
               )}
               {m.role === 'assistant' && m.knowledge && m.knowledge.unread.length > 0 && (
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>
