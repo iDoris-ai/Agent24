@@ -7422,8 +7422,7 @@ mod approval_tests {
                 .unwrap(),
             agent24_store::test_hooks::embedded_schema_version()
         );
-        let (h, provider) =
-            resume_harness_with_explorer_on(dir.path().to_path_buf(), store).await;
+        let (h, provider) = resume_harness_with_explorer_on(dir.path().to_path_buf(), store).await;
         let shell_args = serde_json::json!({ "argv": ["/bin/echo", "PRE-UPGRADE"] });
         let calls = serde_json::json!([{
             "id": "call_shell",
