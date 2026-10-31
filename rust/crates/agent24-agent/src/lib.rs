@@ -7210,7 +7210,14 @@ mod approval_tests {
     async fn resume_harness_with_explorer(
         workdir: std::path::PathBuf,
     ) -> (Harness, Arc<RecordingProvider>) {
-        let store = Store::open_memory().await.unwrap();
+        resume_harness_with_explorer_on(workdir, Store::open_memory().await.unwrap()).await
+    }
+
+    /// [`resume_harness_with_explorer`] over a store the test opened itself.
+    async fn resume_harness_with_explorer_on(
+        workdir: std::path::PathBuf,
+        store: Store,
+    ) -> (Harness, Arc<RecordingProvider>) {
         let events = Arc::new(StdMutex::new(Vec::new()));
         let ev = Arc::clone(&events);
         let emit: Arc<dyn Fn(EventBody) + Send + Sync> = Arc::new(move |body: EventBody| {
@@ -7349,6 +7356,82 @@ mod approval_tests {
             .execute(agent24_store::test_hooks::pool(&h.store))
             .await
             .unwrap();
+        seed_proven_parked_thread(&h.store, "run_1", "run echo", calls).await;
+        let user_source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
+        h.store
+            .tag_run_source("run_1", 0, &user_source, &now_iso8601())
+            .await
+            .unwrap();
+        let approval = seed_approval(
+            "apr_1",
+            "run_1",
+            "tc_internal_1",
+            shell_args.as_object().unwrap().clone(),
+        );
+        insert_parked(&h.store, &approval, "shell_exec").await;
+        h.broker
+            .resolve("apr_1", decision("approve", None))
+            .await
+            .unwrap();
+        h.manager
+            .resume_run("run_1".to_owned(), "apr_1".to_owned())
+            .await
+            .unwrap();
+        let done = wait_terminal(&h.store, "run_1").await;
+        assert_resume_refused_before_tools(&h, &provider, &done);
+        assert_shell_did_not_run(&h).await;
+    }
+
+    /// The whole upgrade path of the issue #1498 follow-up: a library a build
+    /// before tool result tagging left (schema 0030, a run parked on an
+    /// approval) is migrated straight to 0033, and the run's resume is
+    /// refused: no shell, no model call.
+    #[tokio::test]
+    async fn a_run_parked_at_schema_0030_is_not_resumed_after_migrating_to_0033() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("agent24.db");
+        agent24_store::test_hooks::prepare_db_stopped_before(&db, 31)
+            .await
+            .unwrap();
+        assert_eq!(
+            agent24_store::test_hooks::applied_schema_version(&db)
+                .await
+                .unwrap(),
+            30
+        );
+        {
+            let legacy = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&format!("sqlite://{}", db.display()))
+                .await
+                .unwrap();
+            sqlx::raw_sql(
+                "INSERT INTO runs (id, session_id, status, input, usage, created_at) VALUES \
+                    ('run_1', NULL, 'awaiting_approval', '{\"prompt\":\"go\"}', \
+                    '{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}', 't');",
+            )
+            .execute(&legacy)
+            .await
+            .unwrap();
+            legacy.close().await;
+        }
+        let store = Store::open(&db).await.unwrap();
+        assert_eq!(
+            agent24_store::test_hooks::applied_schema_version(&db)
+                .await
+                .unwrap(),
+            agent24_store::test_hooks::embedded_schema_version()
+        );
+        let (h, provider) =
+            resume_harness_with_explorer_on(dir.path().to_path_buf(), store).await;
+        let shell_args = serde_json::json!({ "argv": ["/bin/echo", "PRE-UPGRADE"] });
+        let calls = serde_json::json!([{
+            "id": "call_shell",
+            "name": "shell_exec",
+            "arguments": shell_args.to_string()
+        }]);
+        // The thread and approval as the old build left them, written through
+        // the schema the upgrade produced; the run row itself is the legacy one.
         seed_proven_parked_thread(&h.store, "run_1", "run echo", calls).await;
         let user_source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
         h.store
