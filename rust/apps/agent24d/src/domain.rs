@@ -3068,10 +3068,24 @@ raise SystemExit(3)
     /// list length, but a process only ends once, and the stop of an already
     /// stopped one would be a second `SIGTERM` to nothing — so exactly one
     /// line, together with the stop record, pins "stopped once, by one side".
+    ///
+    /// SIGTERM is not handled by a Python-level handler on the main thread:
+    /// that handler only runs once the main thread leaves its blocking
+    /// `readline`, and a signal arriving just before the main thread blocks
+    /// (a stop right after the handshake) is never noticed. The stop then
+    /// waits out its grace and SIGKILLs, `atexit` never runs and no exit line
+    /// is written: the flake of #1499. Instead the C-level handler writes to a
+    /// wakeup fd — whichever thread takes the signal, whenever it arrives — and
+    /// a watcher thread runs the `atexit` hooks and exits.
     fn counting_module(exits: &Path) -> String {
         format!(
-            "import atexit, signal, sys\n\
-             signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n\
+            "import atexit, os, signal, threading\n\
+             _r, _w = os.pipe()\n\
+             os.set_blocking(_w, False)\n\
+             signal.set_wakeup_fd(_w)\n\
+             signal.signal(signal.SIGTERM, lambda *_: None)\n\
+             def _on_term():\n    os.read(_r, 1)\n    atexit._run_exitfuncs()\n    os._exit(0)\n\
+             threading.Thread(target=_on_term, daemon=True).start()\n\
              def _mark():\n    with open({exits:?}, 'a') as f:\n        f.write('exit\\n')\n\
              atexit.register(_mark)\n{PACKAGE_MODULE}"
         )
