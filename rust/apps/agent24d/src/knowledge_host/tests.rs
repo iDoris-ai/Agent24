@@ -836,6 +836,93 @@ async fn the_host_creates_a_run_pinned_to_a_binding_it_activated() {
 }
 
 #[tokio::test]
+async fn a_bound_run_reads_back_what_its_knowledge_tools_did() {
+    use agent24_protocol::{ToolCall, ToolCallStatus};
+    let (state, host, _) = crate::server::tests::capability_state().await;
+    let router = build_router(state.clone());
+    send(
+        &router,
+        request(Method::PUT, &format!("{BINDING}?seq=7"), &host),
+    )
+    .await;
+    let create = |body: serde_json::Value| {
+        let router = router.clone();
+        let host = host.clone();
+        async move {
+            let (status, body) = send(&router, create_run_request(&host, body)).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+    let bound = create(serde_json::json!({ "prompt": "hi", "knowledge_binding_id": "b1" })).await;
+    let unbound = create(serde_json::json!({ "prompt": "hi" })).await;
+    let knowledge = |id: &str| {
+        let (router, host, id) = (router.clone(), host.clone(), id.to_owned());
+        async move {
+            let (status, body) = send(
+                &router,
+                request(Method::GET, &format!("/api/v1/runs/{id}"), &host),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["knowledge"].clone()
+        }
+    };
+    // Answered without the tools: whatever sources the answer names.
+    assert_eq!(
+        knowledge(&bound).await,
+        serde_json::json!({ "searched": false, "read_chunks": [] })
+    );
+    assert!(knowledge(&unbound).await.is_null());
+
+    for (i, (tool, input)) in [
+        ("knowledge_search", serde_json::json!({ "query": "q" })),
+        (
+            "knowledge_read",
+            serde_json::json!({ "knowledge_id": "doc-7", "chunk_id": "chk-71", "content_tag": "ct" }),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        state
+            .store
+            .insert_tool_call(&ToolCall {
+                id: format!("tc_{i}"),
+                run_id: bound.clone(),
+                tool: tool.into(),
+                input: input.as_object().unwrap().clone(),
+                status: ToolCallStatus::Completed,
+                output_summary: None,
+                started_at: format!("2026-10-31T00:00:0{i}Z"),
+                ended_at: None,
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        knowledge(&bound).await,
+        serde_json::json!({
+            "searched": true,
+            "read_chunks": [{ "knowledge_id": "doc-7", "chunk_id": "chk-71" }]
+        })
+    );
+    // A list of runs does not say.
+    let (_, body) = send(&router, request(Method::GET, "/api/v1/runs", &host)).await;
+    let runs: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        runs["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r.get("knowledge").is_none())
+    );
+}
+
+#[tokio::test]
 async fn a_run_naming_a_binding_it_may_not_use_is_refused_and_not_created() {
     let (state, host, _) = crate::server::tests::capability_state().await;
     let router = build_router(state.clone());

@@ -5,6 +5,7 @@ import { useT } from '../i18n'
 import { chatMessages } from './Chat.i18n'
 import type { components } from '@agent24/api-client'
 import { askWithKnowledge, createChatSession } from './chat-knowledge'
+import { grounding, type Grounding } from './knowledge-grounding'
 
 /** M1-T14: what `/api/v1/chat` ACTUALLY did with an explicit "记住…" turn —
  *  read off the response field, never off the model's own reply text (the
@@ -27,8 +28,9 @@ interface AssistantMessage {
    *  reply, distinct from (and below) the latency suffix. Never set on a
    *  user message or the error fallback message. */
   memoryReceipt?: MemoryReceipt
-  /** Answered as a run with the Knowledge tools (chat-knowledge.ts). */
-  viaKnowledge?: boolean
+  /** Answered as a run with the Knowledge tools (chat-knowledge.ts): what
+   *  the run read, which the labels under the reply say. */
+  knowledge?: Grounding
 }
 
 // M1-T12: one id per conversation, sent as `session_id` on every
@@ -205,7 +207,8 @@ export default function ChatPage() {
       if (turn.kind === 'answer') {
         const suffix: ReplyLatency = { modelName: null, tier: null, firstTokenMs: null, totalMs: performance.now() - sentAt }
         setDelivery(index, { kind: 'sent' })
-        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, viaKnowledge: true }])
+        const knowledge = grounding(turn.text, turn.knowledge)
+        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge }])
       } else {
         setDelivery(index, { kind: 'notSent' })
         setMessages(prev => [...prev, { role: 'assistant', content: t('knowledge.failed', { error: turn.message }) }])
@@ -267,8 +270,17 @@ export default function ChatPage() {
               {m.role === 'assistant' && m.suffix && (
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>{formatReplySuffix(m.suffix)}</div>
               )}
-              {m.role === 'assistant' && m.viaKnowledge && (
-                <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>{t('knowledge.via')}</div>
+              {/* Lines the daemon's record of the run backs, not the reply:
+                  the reply may name sources the run never read. */}
+              {m.role === 'assistant' && m.knowledge && (
+                <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>
+                  {m.knowledge.kind === 'read' ? t('knowledge.via') : t(`knowledge.${m.knowledge.kind}`)}
+                </div>
+              )}
+              {m.role === 'assistant' && m.knowledge && m.knowledge.unread.length > 0 && (
+                <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>
+                  {t('knowledge.unread', { ids: m.knowledge.unread.join(', ') })}
+                </div>
               )}
               {/* M1-T14: a deterministic system line, visually distinct from
                   (and never mistaken for) the model's own reply text. */}

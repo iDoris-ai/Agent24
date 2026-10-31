@@ -308,7 +308,7 @@ describe('ChatPage with Knowledge', () => {
       if (req.path === '/api/v1/chat') return { ok: true, status: 200, data: { message: { content: 'plain' } } }
       if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
       if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: 'r1' } }
-      return { ok: true, status: 200, data: { status: 'completed', output: { text: 'from the knowledge base' } } }
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: 'from the knowledge base' }, knowledge: { searched: true, read_chunks: [{ knowledge_id: 'doc-7', chunk_id: 'chk-71' }] } } }
     })
 
     render(<ChatPage />)
@@ -321,7 +321,44 @@ describe('ChatPage with Knowledge', () => {
     fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
     await waitFor(() => expect(screen.getByText('from the knowledge base')).toBeInTheDocument(), { timeout: 3000 })
     expect(screen.getByText(chatMessages.zh['knowledge.via'])).toBeInTheDocument()
+    expect(screen.queryByText(/本次没有读到/)).not.toBeInTheDocument()
     expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: 'second', session_id: 's1' } }))
+  })
+})
+
+describe('ChatPage with Knowledge when the answer names sources the run did not read', () => {
+  beforeEach(() => { setLocale('zh') })
+
+  const answerWith = async (text: string, knowledge: unknown) => {
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: mockBackendProxy, knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
+      writable: true,
+      configurable: true,
+    })
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: 'r1' } }
+      return { ok: true, status: 200, data: { status: 'completed', output: { text }, knowledge } }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'Can the tap water be drunk during the boil water notice?' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText(text)).toBeInTheDocument(), { timeout: 3000 })
+  }
+
+  it('says the answer did not search Knowledge when the run called no tool, and marks its sources', async () => {
+    const made = 'b512455b-6df2-4419-8df1-72126627085c#22b86b23-4bce-4898-9e43-9c62411f54c9'
+    await answerWith(`煮沸至少 1 分钟。来源：s01-02-zh-water-2025.pdf，${made}`, { searched: false, read_chunks: [] })
+    expect(screen.queryByText(chatMessages.zh['knowledge.via'])).not.toBeInTheDocument()
+    expect(screen.getByText(chatMessages.zh['knowledge.notSearched'])).toBeInTheDocument()
+    expect(screen.getByText(`⚠️ 以下来源本次没有读到，不能当作来源：${made}`)).toBeInTheDocument()
+  })
+
+  it('marks only the sources that are not among the chunks the run read back', async () => {
+    await answerWith('答案。来源：doc-7#chk-71；doc-9#chk-99', { searched: true, read_chunks: [{ knowledge_id: 'doc-7', chunk_id: 'chk-71' }] })
+    expect(screen.getByText(chatMessages.zh['knowledge.via'])).toBeInTheDocument()
+    expect(screen.getByText('⚠️ 以下来源本次没有读到，不能当作来源：doc-9#chk-99')).toBeInTheDocument()
   })
 })
 
