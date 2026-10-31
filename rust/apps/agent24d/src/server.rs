@@ -1188,7 +1188,33 @@ async fn authorize(
                     .get("X-Agent24-Elevation")
                     .map(|v| v.to_str().unwrap_or("").to_owned());
                 if elevated && grant.is_none() {
-                    if method == Method::POST && template == "/api/v1/attached" {
+                    if method == Method::POST
+                        && matches!(
+                            template,
+                            "/api/v1/idoris/install" | "/api/v1/idoris/connect"
+                        )
+                    {
+                        // I-1: the presence summary comes from this body.
+                        let Ok(bytes) = axum::body::to_bytes(
+                            req.into_body(),
+                            agent24_domain::http::MAX_BODY_BYTES,
+                        )
+                        .await
+                        else {
+                            return error_response(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "payload_too_large",
+                                "Request body exceeds limit",
+                            );
+                        };
+                        if let Some(authority) = &state.first_party {
+                            authority.remember_idoris_request(
+                                &authorization.claims.capability_id,
+                                template,
+                                &bytes,
+                            );
+                        }
+                    } else if method == Method::POST && template == "/api/v1/attached" {
                         let bytes = match axum::body::to_bytes(
                             req.into_body(),
                             agent24_domain::http::MAX_BODY_BYTES,
@@ -1219,6 +1245,17 @@ async fn authorize(
                 }
                 if let Some(grant) = grant {
                     let (parts, body) = req.into_parts();
+                    // A grant binds method, path and body; a query string is
+                    // none of those, so the approved text could not describe
+                    // it (`/candidates?endpoint=` would reach another port).
+                    // No CLI request carries one: refuse before consuming.
+                    if parts.uri.query().is_some() {
+                        return error_response(
+                            StatusCode::FORBIDDEN,
+                            "elevation_invalid",
+                            "Elevation grant is invalid",
+                        );
+                    }
                     let bytes = match axum::body::to_bytes(
                         body,
                         agent24_domain::http::MAX_BODY_BYTES,

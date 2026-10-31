@@ -4307,7 +4307,7 @@ components:
     IdorisOperation:
       type: object
       additionalProperties: false
-      required: [operation_id, action, phase, result, error_code, cancellable, idempotency_key]
+      required: [operation_id, action, phase, result, error_code, cancellable]
       properties:
         operation_id: { type: string }
         action: { type: string, enum: [install, connect, start, stop] }
@@ -4318,12 +4318,10 @@ components:
             - $ref: "#/components/schemas/IdorisErrorCode"
             - type: "null"
         cancellable: { type: boolean }
-        idempotency_key: { type: string }
         download_progress:
           $ref: "#/components/schemas/IdorisDownloadProgress"
         verification:
           $ref: "#/components/schemas/IdorisVerification"
-        request_fingerprint: { type: string, pattern: "^[a-f0-9]{64}$" }
         setup_code:
           type: string
           enum: [unreachable, auth_required, auth_failed, not_omlx, model_not_found, invalid_endpoint, invalid_role, out_dir_not_empty, validation_failed, write_failed, invalid_api_key_input]

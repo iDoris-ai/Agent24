@@ -44,6 +44,9 @@ pub enum Operation {
     // CORE-2 AgentEar S3: desktop confirmation channel (ProductHost only).
     PresenceRead,
     PresenceDecide,
+    // I-1: read-only iDoris lifecycle state (status, operation progress), so
+    // an enrolled CLI can poll without a presence prompt per request.
+    IdorisRead,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,6 +130,7 @@ impl Operation {
             Self::ModuleRoute => "module.route",
             Self::PresenceRead => "presence.read",
             Self::PresenceDecide => "presence.decide",
+            Self::IdorisRead => "idoris.read",
         }
     }
 
@@ -173,6 +177,7 @@ impl Operation {
             "module.route" => Self::ModuleRoute,
             "presence.read" => Self::PresenceRead,
             "presence.decide" => Self::PresenceDecide,
+            "idoris.read" => Self::IdorisRead,
             "schedule.read" => Self::ScheduleRead,
             "usage.read" => Self::UsageRead,
             "config.read" => Self::ConfigRead,
