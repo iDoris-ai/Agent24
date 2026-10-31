@@ -362,6 +362,36 @@ describe('ChatPage with Knowledge when the answer names sources the run did not 
   })
 })
 
+describe('ChatPage with Knowledge switched On but not in effect', () => {
+  beforeEach(() => { setLocale('zh') })
+
+  const askPlain = async (status: { enabled: boolean; active: boolean }) => {
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: mockBackendProxy, knowledge: { status: vi.fn().mockResolvedValue({ ...status, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
+      writable: true,
+      configurable: true,
+    })
+    mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { message: { content: '工本费是 10 元。' } } })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '工本费多少？' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('工本费是 10 元。')).toBeInTheDocument(), { timeout: 3000 })
+    expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/chat' }))
+  }
+
+  it('says the answer did not use Knowledge while the switch is On but main has no binding', async () => {
+    await askPlain({ enabled: true, active: false })
+    expect(screen.getByText(chatMessages.zh['knowledge.inactive'])).toBeInTheDocument()
+    expect(screen.queryByText(chatMessages.zh['knowledge.via'])).not.toBeInTheDocument()
+  })
+
+  it('says nothing about Knowledge while the switch is Off', async () => {
+    await askPlain({ enabled: false, active: false })
+    expect(screen.queryByText(chatMessages.zh['knowledge.inactive'])).not.toBeInTheDocument()
+  })
+})
+
 describe('ChatPage with Knowledge on another server', () => {
   beforeEach(() => { setLocale('zh') })
 
