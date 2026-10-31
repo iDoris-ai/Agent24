@@ -66,6 +66,9 @@ for b in "$OLD/agent24d" "$OLD/agent24" "$NEW/agent24d" "$NEW/agent24"; do "$b" 
 for v in $(env | grep -oE '^(A24|AGENT24|OMLX|OLLAMA)_[A-Z0-9_]+'); do unset "$v"; done
 unset DEFAULT_MODEL
 
+# clip N: stdin cut to its first N characters per line (LC_ALL=C makes cut -c count bytes)
+clip() { N=$1 perl -CS -ne 'chomp; print substr($_, 0, $ENV{N}), "\n"'; }
+
 FAILS=0
 : > "$WORK/results"
 touch "$WORK/.start"
@@ -253,27 +256,27 @@ check U2 "agent24 daemon status after the upgrade" "$( [ $RC = 0 ] && grep -q '^
 # Every migration this checkout carries past main's
 # R1 comes first: the approval main left must not expire before it is answered
 approve "$H_RUN"; H_END=$(run_end "$H_RUN"); H_CODE=$(jq -r '.error.code // empty' "$WORK/r.json"); H_OUT=$(output "$H_RUN")
-check R1 "a run main parked after a shell_exec is not resumed after the upgrade" "$( [ "$H_END/$H_CODE" = failed/source_unproven ] && case "$H_OUT" in (*"$DNS"*) echo fail ;; (*) echo ok ;; esac || echo fail)" "$H_END ${H_CODE:-}; $(echo "$H_OUT" | cut -c1-70)"
+check R1 "a run main parked after a shell_exec is not resumed after the upgrade" "$( [ "$H_END/$H_CODE" = failed/source_unproven ] && case "$H_OUT" in (*"$DNS"*) echo fail ;; (*) echo ok ;; esac || echo fail)" "$H_END ${H_CODE:-}; $(echo "$H_OUT" | clip 70)"
 versions() { ls "$1" | grep -oE '^[0-9]+' | sed 's/^0*//' | sort -nu; }
 WANT=$(versions "$REPO/rust/crates/agent24-store/migrations" | awk -v o="$OLD_VERSION" '$1 > o' | paste -sd, -)
 APPLIED=$(db "SELECT group_concat(version) FROM (SELECT version FROM _sqlx_migrations WHERE version > $OLD_VERSION AND success = 1 ORDER BY version)")
 check U3 "store migrations past main's are applied (31, 32 and 33)" "$(case ",$WANT," in (*,31,*32,*33,*) is "$APPLIED" "$WANT" ;; (*) echo fail ;; esac)" "want $WANT; applied ${APPLIED:-none}"
 cli "$NEW" run list > "$WORK/u4.list" 2>&1; cli "$NEW" run show "$OLD_RUN" > "$WORK/u4.show" 2>&1
-check U4 "agent24 run list / run show have main's runs" "$(both "$(has "$WORK/u4.list" "$OLD_RUN")" "$(has "$WORK/u4.show" OLD-RUN-MARKER)")" "$(grep -c '^run_' "$WORK/u4.list") runs listed; $(head -1 "$WORK/u4.show" | cut -c1-80)"
+check U4 "agent24 run list / run show have main's runs" "$(both "$(has "$WORK/u4.list" "$OLD_RUN")" "$(has "$WORK/u4.show" OLD-RUN-MARKER)")" "$(grep -c '^run_' "$WORK/u4.list") runs listed; $(head -1 "$WORK/u4.show" | clip 80)"
 
 S1=$(consent_status node-ref echo); S2=$(consent_status documents find)
 check G1 "agent24 consent list: a grant from before the upgrade is stale (#1317)" "$(is "$S1/$S2" stale/stale)" "node-ref/echo $S1, documents/find $S2"
 
 ORIGIN=$(db "SELECT origin FROM session_tool_result_origins WHERE session_id = '$SID'" 2>&1)
 L_RUN=$(new_run "L-MARKER in the old session" "$SID"); run_end "$L_RUN" > /dev/null; L_OUT=$(output "$L_RUN")
-check L1 "a session that called tools on main keeps restricting egress (0031)" "$(both "$(is "$ORIGIN" tool:legacy)" "$(case "$L_OUT" in (*"$DENIED"*) echo ok ;; (*) echo fail ;; esac)")" "origin ${ORIGIN:-none}; http_fetch: $(echo "$L_OUT" | cut -c1-70)"
+check L1 "a session that called tools on main keeps restricting egress (0031)" "$(both "$(is "$ORIGIN" tool:legacy)" "$(case "$L_OUT" in (*"$DENIED"*) echo ok ;; (*) echo fail ;; esac)")" "origin ${ORIGIN:-none}; http_fetch: $(echo "$L_OUT" | clip 70)"
 F_RUN=$(new_run "L-MARKER outside any session"); run_end "$F_RUN" > /dev/null; F_OUT=$(output "$F_RUN")
-check L2 "a run outside that session is not restricted" "$(case "$F_OUT" in (*"$DNS"*) echo ok ;; (*) echo fail ;; esac)" "http_fetch: $(echo "$F_OUT" | cut -c1-70)"
+check L2 "a run outside that session is not restricted" "$(case "$F_OUT" in (*"$DNS"*) echo ok ;; (*) echo fail ;; esac)" "http_fetch: $(echo "$F_OUT" | clip 70)"
 
 T1=$(new_run "T1-MARKER"); T1_END=$(after_approval "$T1"); T1_OUT=$(output "$T1")
-check T1 "after an approved shell_exec, the run's http_fetch is refused" "$( [ "$T1_END" = completed ] && case "$T1_OUT" in (*"$DENIED"*) echo ok ;; (*) echo fail ;; esac || echo fail)" "$T1_END; $(echo "$T1_OUT" | cut -c1-80)"
+check T1 "after an approved shell_exec, the run's http_fetch is refused" "$( [ "$T1_END" = completed ] && case "$T1_OUT" in (*"$DENIED"*) echo ok ;; (*) echo fail ;; esac || echo fail)" "$T1_END; $(echo "$T1_OUT" | clip 80)"
 T2=$(new_run "T2-MARKER"); T2_END=$(run_end "$T2"); T2_OUT=$(output "$T2")
-check T2 "after an fs_read that read the file, the run's http_fetch passes the gate (fails at DNS)" "$( [ "$T2_END" = completed ] && case "$T2_OUT" in ("T2 said: NOTE-CONTENT | "*"$DNS"*) echo ok ;; (*) echo fail ;; esac || echo fail)" "$T2_END; $(echo "$T2_OUT" | cut -c1-80)"
+check T2 "after an fs_read that read the file, the run's http_fetch passes the gate (fails at DNS)" "$( [ "$T2_END" = completed ] && case "$T2_OUT" in ("T2 said: NOTE-CONTENT | "*"$DNS"*) echo ok ;; (*) echo fail ;; esac || echo fail)" "$T2_END; $(echo "$T2_OUT" | clip 80)"
 cli "$NEW" run peers --json > "$WORK/p1.json" 2>&1
 P=$(jq -r --arg a "$T2" --arg b "$T1" '[(.runs[] | select(.id == $a) | .withheld), (.runs[] | select(.id == $b) | .withheld)] | map(tostring) | join("/")' "$WORK/p1.json" 2>/dev/null)
 # The shared one with its own prompt and output, the withheld one with nothing of its own
@@ -297,7 +300,7 @@ check C1 "agent24 schedule create / update / run-now / delete" "$C1" "exits $R1$
 
 C2=$(new_run "C2-MARKER"); wait_status "$C2" awaiting_approval
 cli "$NEW" run cancel "$C2" > "$WORK/c2.out" 2>&1; RC=$?
-check C2 "agent24 run cancel stops a run awaiting approval" "$( [ $RC = 0 ] && is "$(run_end "$C2")" cancelled || echo fail)" "exit $RC; $(head -1 "$WORK/c2.out" | cut -c1-80)"
+check C2 "agent24 run cancel stops a run awaiting approval" "$( [ $RC = 0 ] && is "$(run_end "$C2")" cancelled || echo fail)" "exit $RC; $(head -1 "$WORK/c2.out" | clip 80)"
 
 cli "$NEW" chat "记住我喜欢绿茶" --session chat_k1r3 > "$WORK/c3.out" 2>&1; RC=$?
 cli "$NEW" memory list --json > "$WORK/c3.mem" 2>&1
@@ -306,11 +309,11 @@ check C3 "agent24 chat --session keeps an explicit remember" "$( [ $RC = 0 ] && 
 T3=$(new_run "T3-MARKER"); wait_status "$T3" awaiting_approval
 kill -KILL "$PID"; for _ in $(seq 1 20); do kill -0 "$PID" 2>/dev/null || break; sleep 0.5; done; PID="" BY_CLI=""
 start_cli "$NEW" "$WORK/up"; T3_END=$(after_approval "$T3"); T3_OUT=$(output "$T3")
-check T3 "a run awaiting approval when the daemon died resumes once approved" "$( [ "$T3_END" = completed ] && case "$T3_OUT" in (*T3-RESUMED*) echo ok ;; (*) echo fail ;; esac || echo fail)" "$T3_END; $(echo "$T3_OUT" | cut -c1-80)"
+check T3 "a run awaiting approval when the daemon died resumes once approved" "$( [ "$T3_END" = completed ] && case "$T3_OUT" in (*T3-RESUMED*) echo ok ;; (*) echo fail ;; esac || echo fail)" "$T3_END; $(echo "$T3_OUT" | clip 80)"
 stop_daemon
 
 if start_cli "$NEW" "$WORK/up" A24_MODULE_TOOL_GRANTS=yes; then R=fail; stop_daemon; else R=$(has "$WORK/up.start.out" 'agent24d did not start: A24_MODULE_TOOL_GRANTS'); fi
-check C4 "agent24 daemon start says why the daemon refused to start" "$R" "$(head -1 "$WORK/up.start.out" | cut -c1-100)"
+check C4 "agent24 daemon start says why the daemon refused to start" "$R" "$(head -1 "$WORK/up.start.out" | clip 100)"
 
 N=$(ls "$WORK/remote" | wc -l | tr -d ' ')
 check Z2 "no shell_exec output ever reached the remote tier" "$( [ -z "$(grep -rlE 'T1-SHELL-OUTPUT|H-SHELL-OUTPUT' "$WORK/remote")" ] && echo ok || echo fail)" "$N request(s) to the remote stub, $(ls "$WORK/local" | wc -l | tr -d ' ') to the local one"
@@ -322,7 +325,7 @@ rsync -a --delete --exclude '*.sock' --exclude daemon.json "$WORK/up/" "$WORK/do
 BEFORE=$(dump)
 if start_raw "$OLD" "$WORK/down"; then R=fail; stop_daemon; else R=$(has "$WORK/down.serve.log" "previously applied but is missing"); fi
 SAME=$( [ "$(dump)" = "$BEFORE" ] && echo yes || echo no); [ "$SAME" = yes ] || R=fail
-check D1 "main refuses the upgraded library and leaves it alone" "$R" "$(grep -m1 -o 'migration [0-9]* was previously applied[^"]*' "$WORK/down.serve.log" | cut -c1-90); dump unchanged: $SAME"
+check D1 "main refuses the upgraded library and leaves it alone" "$R" "$(grep -m1 -o 'migration [0-9]* was previously applied[^"]*' "$WORK/down.serve.log" | clip 90); dump unchanged: $SAME"
 if start_cli "$NEW" "$WORK/down"; then R=ok; stop_daemon; else R=fail; fi
 check D2 "the release still opens it afterwards" "$R" "$(head -1 "$WORK/down.start.out")"
 
