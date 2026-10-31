@@ -456,6 +456,19 @@ impl KnowledgeBackend for DaemonKnowledgeBackend {
         if !effective.iter().all(|id| asked.contains(id)) {
             return Err(local(LocalReason::Incompatible, false));
         }
+        // The document asked for, and with `chunk_id` that chunk alone
+        // (READONLY R4.3): what a run read is told from its calls' arguments
+        // (`knowledge_tools::run_knowledge`), so an answer about another one
+        // is refused rather than shown.
+        let other_chunk = match &request.target {
+            ReadTarget::Chunk { chunk_id, .. } => {
+                !matches!(response.segments.as_slice(), [s] if s.chunk_id == *chunk_id)
+            }
+            ReadTarget::Document { .. } => false,
+        };
+        if response.knowledge_id != request.knowledge_id || other_chunk {
+            return Err(local(LocalReason::Incompatible, false));
+        }
         Ok((request, response))
     }
 }

@@ -273,3 +273,81 @@ async fn any_other_source_still_holds_it_back() {
         assert!(backend.runs.lock().unwrap().is_empty(), "{other}");
     }
 }
+
+fn stored(tool: &str, status: ToolCallStatus, input: Value) -> ToolCall {
+    ToolCall {
+        id: format!("tc_{tool}"),
+        run_id: "run-1".into(),
+        tool: tool.into(),
+        input: input.as_object().unwrap().clone(),
+        status,
+        output_summary: None,
+        started_at: "2026-10-31T00:00:00Z".into(),
+        ended_at: None,
+    }
+}
+
+#[test]
+fn a_run_answered_without_the_tools_read_nothing() {
+    // The answer may still name sources: they are not in the run's calls.
+    assert_eq!(
+        run_knowledge(&[]),
+        RunKnowledge {
+            searched: false,
+            read_chunks: vec![]
+        }
+    );
+    // Calls that did not complete, or other tools, read nothing either.
+    let calls = [
+        stored(
+            READ,
+            ToolCallStatus::Failed,
+            json!({ "knowledge_id": "doc-x", "chunk_id": "chk-x" }),
+        ),
+        stored(SEARCH, ToolCallStatus::Denied, json!({ "query": "q" })),
+        stored(
+            "http_fetch",
+            ToolCallStatus::Completed,
+            json!({ "knowledge_id": "doc-x", "chunk_id": "chk-x" }),
+        ),
+    ];
+    assert_eq!(
+        run_knowledge(&calls),
+        RunKnowledge {
+            searched: false,
+            read_chunks: vec![]
+        }
+    );
+}
+
+#[test]
+fn the_chunks_a_run_read_are_those_its_completed_reads_named() {
+    let chunk = |k: &str, c: &str| ReadChunk {
+        knowledge_id: k.into(),
+        chunk_id: c.into(),
+    };
+    let read = |k: &str, c: &str| json!({ "knowledge_id": k, "chunk_id": c, "content_tag": "ct" });
+    let calls = [
+        stored(SEARCH, ToolCallStatus::Completed, json!({ "query": "q" })),
+        stored(READ, ToolCallStatus::Completed, read("doc-7", "chk-71")),
+        // A page read names no chunk.
+        stored(
+            READ,
+            ToolCallStatus::Completed,
+            json!({ "knowledge_id": "doc-8" }),
+        ),
+        stored(READ, ToolCallStatus::Failed, read("doc-9", "chk-91")),
+        stored(READ, ToolCallStatus::Completed, read("doc-7", "chk-72")),
+        stored(READ, ToolCallStatus::Completed, read("doc-7", "chk-71")),
+    ];
+    assert_eq!(
+        run_knowledge(&calls),
+        RunKnowledge {
+            searched: true,
+            read_chunks: vec![chunk("doc-7", "chk-71"), chunk("doc-7", "chk-72")]
+        }
+    );
+    // A search alone is a search, with nothing read back.
+    let knowledge = run_knowledge(&calls[..1]);
+    assert!(knowledge.searched && knowledge.read_chunks.is_empty());
+}

@@ -5,14 +5,18 @@
 // nothing here names one. A run needs a session that exists, so the
 // conversation gets a real one first.
 
+import type { RunKnowledge } from './knowledge-grounding'
+
 export const POLL_MS = 1_000
 /** As long as `/api/v1/chat` may take for one reply (backend-proxy.ts). */
 export const MAX_WAIT_MS = 10 * 60_000
 
 type Proxy = Window['agent24']['backendProxy']
 
+/** `knowledge`: what the run's Knowledge tools did, as the daemon tells it
+ * (null when the run had no binding). */
 export type KnowledgeTurn =
-  | { kind: 'answer'; text: string }
+  | { kind: 'answer'; text: string; knowledge: RunKnowledge | null }
   | { kind: 'failed'; code: string; message: string }
 
 export interface TurnDeps {
@@ -53,13 +57,13 @@ export async function askWithKnowledge(prompt: string, sessionId: string, deps: 
     await sleep(POLL_MS)
     const res = await deps.proxy({ method: 'GET', path: `/api/v1/runs/${encodeURIComponent(runId)}` })
     if (!res.ok) continue
-    const run = res.data as { status?: string; output?: { text?: string } | null; error?: { code?: string; message?: string } | null }
+    const run = res.data as { status?: string; output?: { text?: string } | null; error?: { code?: string; message?: string } | null; knowledge?: RunKnowledge | null }
     const approval = run.status === 'awaiting_approval'
     if (approval !== waiting) {
       waiting = approval
       deps.onAwaitingApproval?.(approval)
     }
-    if (run.status === 'completed') return { kind: 'answer', text: run.output?.text ?? '' }
+    if (run.status === 'completed') return { kind: 'answer', text: run.output?.text ?? '', knowledge: run.knowledge ?? null }
     if (run.status === 'failed' || run.status === 'cancelled') return failure(run, `run_${run.status}`)
   }
   // Not left running unseen: the turn gave up on it.
