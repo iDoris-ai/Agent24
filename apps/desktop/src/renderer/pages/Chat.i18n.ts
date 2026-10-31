@@ -2,6 +2,7 @@ import { defineMessages } from '../i18n'
 
 export const chatMessages = defineMessages({
   en: {
+    'newChat': 'New chat',
     'headroom.explanation': 'iDoris needs to use memory reserved for the system to load this model. This may slow down your computer.',
     'headroom.confirm': 'Load anyway',
     'headroom.cancel': 'Cancel',
@@ -25,6 +26,7 @@ export const chatMessages = defineMessages({
     'latency.firstToken': 'First token {time}', 'latency.total': 'Total {time}',
   },
   zh: {
+    'newChat': '新对话',
     'headroom.explanation': 'iDoris 需要占用为系统保留的内存余量才能加载这个模型，可能让电脑变慢。',
     'headroom.confirm': '仍然加载',
     'headroom.cancel': '取消',
@@ -48,6 +50,7 @@ export const chatMessages = defineMessages({
     'latency.firstToken': '首字 {time}', 'latency.total': '总计 {time}',
   },
   th: {
+    'newChat': 'แชตใหม่',
     'headroom.explanation': 'iDoris ต้องใช้หน่วยความจำที่สำรองไว้สำหรับระบบเพื่อโหลดโมเดลนี้ ซึ่งอาจทำให้คอมพิวเตอร์ของคุณช้าลง',
     'headroom.confirm': 'โหลดต่อไป',
     'headroom.cancel': 'ยกเลิก',
