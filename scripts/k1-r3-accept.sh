@@ -238,6 +238,14 @@ for _ in $(seq 1 60); do
 done
 # Dies: a `daemon stop` would abort the waiting approval instead
 kill -KILL "$PID"; for _ in $(seq 1 20); do kill -0 "$PID" 2>/dev/null || break; sleep 0.5; done; PID="" BY_CLI=""
+# What main's run really did, from its tool_calls rows and the stub's request
+# dumps (not from the final error text): R1 reads these after the upgrade
+H_TOOLS=$(db "SELECT group_concat(tool || ':' || status) FROM (SELECT tool, status FROM tool_calls WHERE run_id = '$H_RUN' ORDER BY started_at, rowid)")
+H_PARKED_TOOL=$(db "SELECT tool FROM tool_calls WHERE id = (SELECT tool_call_id FROM approvals WHERE id = '$H_PARKED')")
+h_requests() { grep -l H-MARKER "$WORK"/local/*.json "$WORK"/remote/*.json 2>/dev/null | wc -l | tr -d ' '; }
+# a request of the run that carries the shell's output as a tool answer
+H_SHELL_IN_THREAD=$(jq -s '[.[] | select(any(.messages[]?; .role == "user" and ((.content | tostring) | contains("H-MARKER")))) | .messages[] | select(.role == "tool" and ((.content | tostring) | contains("H-SHELL-OUTPUT")))] | length' "$WORK"/local/*.json 2>/dev/null || echo 0)
+H_REQS_BEFORE=$(h_requests)
 grant node-ref echo "$(iso -3600)"
 grant documents find "$(iso -3600)"
 OLD_VERSION=$(db "SELECT max(version) FROM _sqlx_migrations")
@@ -256,7 +264,17 @@ check U2 "agent24 daemon status after the upgrade" "$( [ $RC = 0 ] && grep -q '^
 # Every migration this checkout carries past main's
 # R1 comes first: the approval main left must not expire before it is answered
 approve "$H_RUN"; H_END=$(run_end "$H_RUN"); H_CODE=$(jq -r '.error.code // empty' "$WORK/r.json"); H_OUT=$(output "$H_RUN")
-check R1 "a run main parked after a shell_exec is not resumed after the upgrade" "$( [ "$H_END/$H_CODE" = failed/source_unproven ] && case "$H_OUT" in (*"$DNS"*) echo fail ;; (*) echo ok ;; esac || echo fail)" "$H_END ${H_CODE:-}; $(echo "$H_OUT" | clip 70)"
+H_TOOLS_AFTER=$(db "SELECT group_concat(tool || ':' || status) FROM (SELECT tool, status FROM tool_calls WHERE run_id = '$H_RUN' ORDER BY started_at, rowid)")
+R1_OK=fail
+if [ "$H_END/$H_CODE" = failed/source_unproven ]; then
+  case "$H_OUT" in (*"$DNS"*) ;; (*)
+    # before: the shell ran and its output reached the thread, the next approval is fs_write;
+    # after: no tool ran and no http_fetch row exists, and the model was not asked again
+    case "$H_TOOLS" in (shell_exec:completed*) [ "${H_SHELL_IN_THREAD:-0}" -ge 1 ] 2>/dev/null && [ "$H_PARKED_TOOL" = fs_write ] \
+      && [ "$H_TOOLS_AFTER" = "$H_TOOLS" ] && [ "$(h_requests)" = "$H_REQS_BEFORE" ] && R1_OK=ok ;; esac ;;
+  esac
+fi
+check R1 "a run main parked after a shell_exec is not resumed after the upgrade" "$R1_OK" "$H_END ${H_CODE:-}; before: ${H_TOOLS:-none}, shell output in thread x${H_SHELL_IN_THREAD:-0}, parked ${H_PARKED_TOOL:-none}; after: ${H_TOOLS_AFTER:-none}; $(echo "$H_OUT" | clip 70)"
 versions() { ls "$1" | grep -oE '^[0-9]+' | sed 's/^0*//' | sort -nu; }
 WANT=$(versions "$REPO/rust/crates/agent24-store/migrations" | awk -v o="$OLD_VERSION" '$1 > o' | paste -sd, -)
 APPLIED=$(db "SELECT group_concat(version) FROM (SELECT version FROM _sqlx_migrations WHERE version > $OLD_VERSION AND success = 1 ORDER BY version)")
