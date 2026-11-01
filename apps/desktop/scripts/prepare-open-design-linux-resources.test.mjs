@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import { hoistStandalonePnpmDependencies } from './prepare-open-design-linux-resources.mjs'
+import { hoistStandalonePnpmDependencies, prepareOpenDesignLinuxResources } from './prepare-open-design-linux-resources.mjs'
 
 // pnpm-style standalone: apps/web/node_modules/next is a symlink into
 // node_modules/.pnpm/next@1/node_modules/next, and next's dependencies are its
@@ -158,6 +158,34 @@ test('hoist keeps the realpath already selected by an apps/web direct dependency
   }
 })
 
+test('hoist refuses a scope symlink that points outside even when the package target is inside', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-hoist-scope-'))
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-hoist-scope-out-'))
+  try {
+    seedRealPackage(root, 'next@1', 'next', '1.0.0')
+    const helper = path.join(root, 'node_modules', '.pnpm', 'next@1', 'node_modules', '@scope', 'helper')
+    fs.mkdirSync(helper, { recursive: true })
+    fs.writeFileSync(path.join(helper, 'package.json'), JSON.stringify({ name: '@scope/helper', version: '1.0.0' }))
+    fs.writeFileSync(path.join(helper, 'index.js'), 'module.exports = 1')
+    const webModules = path.join(root, 'apps', 'web', 'node_modules')
+    fs.mkdirSync(webModules, { recursive: true })
+    fs.writeFileSync(path.join(root, 'apps', 'web', 'package.json'), JSON.stringify({ dependencies: { next: '1.0.0' } }))
+    fs.symlinkSync('../../../node_modules/.pnpm/next@1/node_modules/next', path.join(webModules, 'next'))
+    // The link we would create (@scope/helper) names an in-tree package.
+    // The directory we would write through is a symlink to somewhere else.
+    fs.symlinkSync(outside, path.join(webModules, '@scope'))
+
+    await assert.rejects(
+      () => hoistStandalonePnpmDependencies(root, undefined, { platform: 'darwin' }),
+      /points outside the standalone root/,
+    )
+    assert.deepEqual(fs.readdirSync(outside), [])
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+    fs.rmSync(outside, { recursive: true, force: true })
+  }
+})
+
 test('hoist refuses a link target whose realpath is outside the standalone root', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-hoist-escape-'))
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-hoist-outside-'))
@@ -178,6 +206,27 @@ test('hoist refuses a link target whose realpath is outside the standalone root'
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
     fs.rmSync(outside, { recursive: true, force: true })
+  }
+})
+
+test('prepareOpenDesignLinuxResources rejects a dirty checkout before writing a stamp', async () => {
+  const checkout = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-prepare-dirty-'))
+  const resources = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-prepare-res-'))
+  try {
+    const git = (...args) => execFileSync('git', ['-C', checkout, ...args], { stdio: 'pipe' })
+    git('init', '-q')
+    fs.writeFileSync(path.join(checkout, 'local.txt'), 'base')
+    git('-c', 'user.email=t@t', '-c', 'user.name=t', 'add', 'local.txt')
+    git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'x')
+    fs.writeFileSync(path.join(checkout, 'local.txt'), 'dirty')
+    await assert.rejects(
+      () => prepareOpenDesignLinuxResources(checkout, resources),
+      /uncommitted changes/,
+    )
+    assert.equal(fs.existsSync(path.join(resources, '.agent24-od-source.json')), false)
+  } finally {
+    fs.rmSync(checkout, { recursive: true, force: true })
+    fs.rmSync(resources, { recursive: true, force: true })
   }
 })
 

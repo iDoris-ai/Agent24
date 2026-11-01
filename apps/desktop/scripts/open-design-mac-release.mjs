@@ -17,12 +17,13 @@
 // rejects nothing for them, but an unsigned arm64 binary is not worth the risk).
 
 import { execFile, execFileSync } from 'node:child_process'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 
-import { OPEN_DESIGN_SHA } from './pack-open-design-component.mjs'
+import { OPEN_DESIGN_PIN_VERSION, OPEN_DESIGN_SHA } from './pack-open-design-component.mjs'
 
 export const OD_SOURCE_STAMP_FILE = '.agent24-od-source.json'
 export const OPEN_DESIGN_REPOSITORY = 'iDoris-ai/Agent24'
@@ -81,15 +82,98 @@ export function checkOpenDesignSource(dir) {
   return sha.trim()
 }
 
+const TREE_DIGEST_CHUNK = 1024 * 1024
+
+/** sha256 of one file, read in fixed-size chunks so a large resource is never
+ * held in memory all at once. */
+function sha256File(filePath) {
+  const hash = crypto.createHash('sha256')
+  const fd = fs.openSync(filePath, 'r')
+  const buf = Buffer.allocUnsafe(TREE_DIGEST_CHUNK)
+  try {
+    while (true) {
+      const n = fs.readSync(fd, buf, 0, buf.length, null)
+      if (n === 0) break
+      hash.update(n === buf.length ? buf : buf.subarray(0, n))
+    }
+  } finally {
+    fs.closeSync(fd)
+  }
+  return hash.digest('hex')
+}
+
+/**
+ * Digest of a prepared Resources tree. Entries are sorted by relative path.
+ * Each regular file contributes a streaming sha256 and its permission bits;
+ * each symlink contributes a sha256 of its target text plus that target.
+ * The stamp file itself is excluded (it records this digest). Directory
+ * symlinks are not followed, so a link cannot pull outside files into the hash.
+ */
+export function openDesignResourceTreeDigest(resourcesRoot) {
+  const entries = []
+  const visit = (directory) => {
+    for (const name of fs.readdirSync(directory)) {
+      const full = path.join(directory, name)
+      const rel = path.relative(resourcesRoot, full).split(path.sep).join('/')
+      if (rel === OD_SOURCE_STAMP_FILE) continue
+      const st = fs.lstatSync(full)
+      const mode = st.mode & 0o7777
+      if (st.isSymbolicLink()) {
+        const link = fs.readlinkSync(full)
+        entries.push({
+          path: rel,
+          kind: 'symlink',
+          mode,
+          sha256: crypto.createHash('sha256').update(link).digest('hex'),
+          link,
+        })
+        continue
+      }
+      if (st.isDirectory()) {
+        visit(full)
+        continue
+      }
+      if (st.isFile()) {
+        entries.push({ path: rel, kind: 'file', mode, sha256: sha256File(full), link: null })
+        continue
+      }
+      entries.push({
+        path: rel,
+        kind: 'other',
+        mode,
+        sha256: crypto.createHash('sha256').update('').digest('hex'),
+        link: null,
+      })
+    }
+  }
+  visit(resourcesRoot)
+  entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+  const hash = crypto.createHash('sha256')
+  for (const entry of entries) {
+    hash.update(JSON.stringify({
+      path: entry.path,
+      kind: entry.kind,
+      mode: entry.mode,
+      sha256: entry.sha256,
+      link: entry.link,
+    }))
+    hash.update('\n')
+  }
+  return hash.digest('hex')
+}
+
 export function writeOpenDesignSourceStamp(resourcesRoot, { sha, version }) {
   if (!sha || !version) throw new Error('Open Design source stamp requires sha and version')
+  if (!resourcesRoot || !path.isAbsolute(resourcesRoot)) throw new Error('Open Design Resources path must be absolute')
+  const tree = openDesignResourceTreeDigest(resourcesRoot)
   const file = path.join(resourcesRoot, OD_SOURCE_STAMP_FILE)
-  fs.writeFileSync(file, `${JSON.stringify({ sha, version })}\n`)
+  fs.writeFileSync(file, `${JSON.stringify({ sha, version, tree })}\n`)
   return file
 }
 
 /** Reusing a prepared Resources directory skips the source checkout. The
- * stamp written by prepare is the only record of which sha was built. */
+ * stamp must name the pinned sha and version, and its tree digest must still
+ * match the files, modes, and symlink targets on disk. */
 export function assertOpenDesignResourcesStamp(resourcesRoot, expectedSha = OPEN_DESIGN_SHA) {
   if (!resourcesRoot || !path.isAbsolute(resourcesRoot)) throw new Error('Open Design Resources path must be absolute')
   const file = path.join(resourcesRoot, OD_SOURCE_STAMP_FILE)
@@ -104,6 +188,13 @@ export function assertOpenDesignResourcesStamp(resourcesRoot, expectedSha = OPEN
   }
   if (parsed.sha !== expectedSha) {
     throw new Error(`Open Design Resources stamp sha ${parsed.sha ?? '(missing)'} does not match pin ${expectedSha}`)
+  }
+  if (parsed.version !== OPEN_DESIGN_PIN_VERSION) {
+    throw new Error(`Open Design Resources stamp version ${parsed.version ?? '(missing)'} does not match pin ${OPEN_DESIGN_PIN_VERSION}`)
+  }
+  const tree = openDesignResourceTreeDigest(resourcesRoot)
+  if (parsed.tree !== tree) {
+    throw new Error('Open Design Resources tree digest does not match the stamp (a file, its mode, or a symlink target changed after prepare)')
   }
   return parsed
 }

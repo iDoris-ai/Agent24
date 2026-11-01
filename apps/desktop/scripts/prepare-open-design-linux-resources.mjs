@@ -6,7 +6,7 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 
-import { writeOpenDesignSourceStamp } from './open-design-mac-release.mjs'
+import { checkOpenDesignSource, writeOpenDesignSourceStamp } from './open-design-mac-release.mjs'
 
 const execFileAsync = promisify(execFile)
 
@@ -76,6 +76,41 @@ function relativeImport(fromDirectory, targetPath) {
 function isWithin(parent, child) {
   const relative = path.relative(parent, child)
   return relative.length === 0 || (!relative.startsWith('..') && !path.isAbsolute(relative))
+}
+
+/** Parents of a hoist link, from `webNodeModules` down through each scope
+ * directory. Existing ones must realpath inside the standalone root. A
+ * symlink whose own target resolves outside is rejected even before mkdir. */
+async function assertHoistWriteInside(standaloneRoot, webNodeModules, linkPath) {
+  const parent = path.dirname(linkPath)
+  const relative = path.relative(webNodeModules, parent)
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error(`hoist refuses to write ${linkPath}: it is outside apps/web/node_modules`)
+  }
+  const dirs = [webNodeModules]
+  if (relative && relative !== '.') {
+    let cursor = webNodeModules
+    for (const part of relative.split(path.sep)) {
+      cursor = path.join(cursor, part)
+      dirs.push(cursor)
+    }
+  }
+  for (const dir of dirs) {
+    const st = await fsp.lstat(dir).catch(() => null)
+    if (st == null) continue
+    if (st.isSymbolicLink()) {
+      const text = await fsp.readlink(dir)
+      const direct = path.resolve(path.dirname(dir), text)
+      const directReal = await fsp.realpath(direct).catch(() => null)
+      if (directReal == null || !isWithin(standaloneRoot, directReal)) {
+        throw new Error(`hoist refuses to write through symlink ${dir}: it points outside the standalone root (${directReal ?? direct})`)
+      }
+    }
+    const real = await fsp.realpath(dir).catch(() => null)
+    if (real == null || !isWithin(standaloneRoot, real)) {
+      throw new Error(`hoist refuses to write through ${dir}: realpath is outside the standalone root (${real ?? dir})`)
+    }
+  }
 }
 
 async function rewriteStandaloneSymlinks({ destinationRoot, destinationWebRoot, sourceRoot, sourceWebRoot }) {
@@ -160,7 +195,10 @@ async function pruneBrokenSymlinks(current) {
  * directly depends on that name and `apps/web/node_modules` already links
  * one realpath, that direct dependency is the one that is kept, and the
  * choice is printed. Every new link target's realpath must stay inside
- * `standaloneRoot`.
+ * `standaloneRoot`. So must the path we write: `apps/web/node_modules` and
+ * every scope parent (`@scope`) have to realpath inside the tree, and must
+ * not be a symlink that points outside — `mkdir` / `symlink` would follow
+ * that link and create the package outside the standalone root.
  */
 export async function hoistStandalonePnpmDependencies(standaloneRoot, webRoot = path.join(standaloneRoot, 'apps', 'web'), options = {}) {
   const platform = options.platform ?? process.platform
@@ -222,8 +260,9 @@ export async function hoistStandalonePnpmDependencies(standaloneRoot, webRoot = 
       }
       const existing = chosen.get(sibling.name)
       if (existing == null) {
-        chosen.set(sibling.name, target)
         const linkPath = path.join(webNodeModules, ...sibling.name.split('/'))
+        await assertHoistWriteInside(standaloneRoot, webNodeModules, linkPath)
+        chosen.set(sibling.name, target)
         await fsp.mkdir(path.dirname(linkPath), { recursive: true })
         await fsp.symlink(path.relative(path.dirname(linkPath), target), linkPath)
         queue.push(linkPath)
@@ -395,10 +434,9 @@ export async function prepareOpenDesignLinuxResources(openDesignPath, linuxResou
   }
   const openDesignRoot = requireAbsolutePath(openDesignPath, 'Open Design checkout')
   const resourcesRoot = requireAbsolutePath(linuxResourcesPath, 'Open Design Linux Resources')
-  const actualSha = await run('git', ['rev-parse', 'HEAD'], { cwd: openDesignRoot })
-  if (actualSha !== OPEN_DESIGN_SHA) {
-    throw new Error(`Open Design checkout must be exact ${OPEN_DESIGN_SHA}; found ${actualSha}`)
-  }
+  // Same check release-mac.sh and rebuild-open-design-native call: porcelain
+  // empty and HEAD equal to the pin, before the build and before the stamp.
+  const actualSha = checkOpenDesignSource(openDesignRoot)
 
   const packaged = JSON.parse(await fsp.readFile(path.join(openDesignRoot, 'apps', 'packaged', 'package.json'), 'utf8'))
   if (packaged.version !== OPEN_DESIGN_PIN_VERSION) {

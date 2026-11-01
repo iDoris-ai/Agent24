@@ -100,6 +100,35 @@ test('check-open-design-release-asset fails when the URL is not reachable', asyn
   }
 })
 
+test('check-open-design-release-asset ignores Content-Length from a redirect hop', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-asset-redir-'))
+  const server = net.createServer((socket) => {
+    let buf = ''
+    socket.on('data', (chunk) => {
+      buf += chunk
+      if (!buf.includes('\r\n\r\n')) return
+      const { port } = server.address()
+      if (buf.includes(' /final ')) {
+        socket.end('HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n')
+        return
+      }
+      socket.end(`HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: http://127.0.0.1:${port}/final\r\nConnection: close\r\n\r\n`)
+    })
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const { port } = server.address()
+    const manifest = writeManifest(dir, `http://127.0.0.1:${port}/start`, 99)
+    const result = await run(manifest)
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`)
+    assert.match(result.stdout, /no Content-Length/)
+    assert.doesNotMatch(result.stderr, /Content-Length 0/)
+  } finally {
+    server.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('check-open-design-release-asset skips the size check when Content-Length is absent', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-asset-nolen-'))
   const server = net.createServer((socket) => {

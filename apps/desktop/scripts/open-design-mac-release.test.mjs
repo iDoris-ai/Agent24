@@ -5,10 +5,11 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { promisify } from 'node:util'
+import { fileURLToPath } from 'node:url'
 
 const execFileAsync = promisify(execFile)
 
-import { OPEN_DESIGN_SHA } from './pack-open-design-component.mjs'
+import { OPEN_DESIGN_PIN_VERSION, OPEN_DESIGN_SHA } from './pack-open-design-component.mjs'
 import {
   assertOpenDesignResourcesStamp,
   assertPinnedSha,
@@ -86,9 +87,71 @@ test('reused Resources must carry a stamp whose sha matches the pin', () => {
     assert.throws(() => assertOpenDesignResourcesStamp(dir), /stamp is missing/)
     writeOpenDesignSourceStamp(dir, { sha: '0'.repeat(40), version: '0.22.2' })
     assert.throws(() => assertOpenDesignResourcesStamp(dir), /does not match pin/)
-    writeOpenDesignSourceStamp(dir, { sha: OPEN_DESIGN_SHA, version: '0.22.2' })
+    writeOpenDesignSourceStamp(dir, { sha: OPEN_DESIGN_SHA, version: OPEN_DESIGN_PIN_VERSION })
     assert.equal(assertOpenDesignResourcesStamp(dir).sha, OPEN_DESIGN_SHA)
+    assert.equal(assertOpenDesignResourcesStamp(dir).version, OPEN_DESIGN_PIN_VERSION)
     assert.throws(() => assertOpenDesignResourcesStamp('relative/resources'), /absolute/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('reused Resources stamp rejects a file changed after it was written', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-stamp-body-'))
+  try {
+    const file = path.join(dir, 'pkg.js')
+    // Longer than the digest's read chunk, so a hasher that keeps only the
+    // first buffer would miss this tail and the stamp would still match.
+    const bytes = Buffer.alloc(1024 * 1024 + 1, 7)
+    fs.writeFileSync(file, bytes)
+    writeOpenDesignSourceStamp(dir, { sha: OPEN_DESIGN_SHA, version: OPEN_DESIGN_PIN_VERSION })
+    assert.equal(assertOpenDesignResourcesStamp(dir).sha, OPEN_DESIGN_SHA)
+    const fd = fs.openSync(file, 'r+')
+    try {
+      fs.writeSync(fd, Buffer.from([8]), 0, 1, bytes.length - 1)
+    } finally {
+      fs.closeSync(fd)
+    }
+    assert.throws(() => assertOpenDesignResourcesStamp(dir), /tree digest/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('reused Resources stamp rejects a mode change after it was written', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-stamp-mode-'))
+  try {
+    const file = path.join(dir, 'pkg.js')
+    fs.writeFileSync(file, 'same')
+    fs.chmodSync(file, 0o644)
+    writeOpenDesignSourceStamp(dir, { sha: OPEN_DESIGN_SHA, version: OPEN_DESIGN_PIN_VERSION })
+    fs.chmodSync(file, 0o755)
+    assert.throws(() => assertOpenDesignResourcesStamp(dir), /tree digest/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('reused Resources stamp rejects a version other than the pin', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-stamp-ver-'))
+  try {
+    fs.writeFileSync(path.join(dir, 'pkg.js'), 'x')
+    writeOpenDesignSourceStamp(dir, { sha: OPEN_DESIGN_SHA, version: '9.9.9' })
+    assert.throws(() => assertOpenDesignResourcesStamp(dir), /stamp version 9\.9\.9 does not match pin/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('reused Resources stamp rejects a symlink retargeted after it was written', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-stamp-link-'))
+  try {
+    fs.writeFileSync(path.join(dir, 'real.txt'), 'x')
+    fs.symlinkSync('real.txt', path.join(dir, 'link.txt'))
+    writeOpenDesignSourceStamp(dir, { sha: OPEN_DESIGN_SHA, version: OPEN_DESIGN_PIN_VERSION })
+    fs.unlinkSync(path.join(dir, 'link.txt'))
+    fs.symlinkSync('other.txt', path.join(dir, 'link.txt'))
+    assert.throws(() => assertOpenDesignResourcesStamp(dir), /tree digest/)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -302,4 +365,140 @@ test('release-mac.sh pins the repository and prints the upload command; verify r
   assert.match(verify, /OPEN_DESIGN_PIN_VERSION/)
   assert.match(verify, /https:\/\/github.com\/iDoris-ai\/Agent24\/releases\/download\//)
   assert.match(verify, /verify-signed/)
+})
+
+function dirtyGitCheckout(prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix))
+  const git = (...args) => execFileSync('git', ['-C', dir, ...args], { stdio: 'pipe' })
+  git('init', '-q')
+  fs.writeFileSync(path.join(dir, 'local.txt'), 'base')
+  git('-c', 'user.email=t@t', '-c', 'user.name=t', 'add', 'local.txt')
+  git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'x')
+  fs.writeFileSync(path.join(dir, 'local.txt'), 'dirty')
+  return dir
+}
+
+test('release-mac.sh refuses a dirty checkout when Open Design resources are reused', () => {
+  const checkout = dirtyGitCheckout('a24-od-release-dirty-')
+  const resources = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-release-res-'))
+  try {
+    const result = spawnSync('bash', [fileURLToPath(new URL('./release-mac.sh', import.meta.url))], {
+      encoding: 'utf8',
+      timeout: 20000,
+      env: {
+        ...process.env,
+        A24_RELEASE_TAG: 'v0.6.0',
+        A24_OPEN_DESIGN_SOURCE_DIR: checkout,
+        A24_OPEN_DESIGN_RESOURCES_DIR: resources,
+        SKIP_NOTARIZE: '1',
+      },
+    })
+    const output = `${result.stdout}\n${result.stderr}`
+    assert.notEqual(result.status, 0, output)
+    assert.match(output, /uncommitted changes/)
+    assert.doesNotMatch(output, /构建 Rust|electron-builder|只能在 macOS/)
+  } finally {
+    fs.rmSync(checkout, { recursive: true, force: true })
+    fs.rmSync(resources, { recursive: true, force: true })
+  }
+})
+
+test('rebuild-open-design-native rejects a dirty checkout before looking at the staged tree', () => {
+  const checkout = dirtyGitCheckout('a24-od-rebuild-dirty-')
+  try {
+    const result = spawnSync(process.execPath, [fileURLToPath(new URL('./rebuild-open-design-native.mjs', import.meta.url))], {
+      encoding: 'utf8',
+      env: { ...process.env, A24_OPEN_DESIGN_SOURCE_DIR: checkout },
+    })
+    const output = `${result.stdout}\n${result.stderr}`
+    assert.notEqual(result.status, 0, output)
+    assert.match(output, /uncommitted changes/)
+    assert.doesNotMatch(output, /staged Open Design package manifest is missing/)
+  } finally {
+    fs.rmSync(checkout, { recursive: true, force: true })
+  }
+})
+
+// codesign 替身不走真签名：夹具 tarball 里没有已签名的 Mach-O，默认的
+// `verify-signed`（codesign --verify --strict + Team ID）会因为夹具失败，
+// 盖住清单、包内目录和 sha 这几条断言。A24_OD_SKIP_CODESIGN=1 只跳过这一步；
+// release-mac.sh 不设置它，发布路径仍跑真实验证。
+const verifyScript = fileURLToPath(new URL('./verify-mac-open-design.sh', import.meta.url))
+
+function verifyFixture(dir, mutate) {
+  const resources = path.join(dir, 'Agent24.app', 'Contents', 'Resources')
+  fs.mkdirSync(resources, { recursive: true })
+  const payload = path.join(dir, 'payload')
+  fs.mkdirSync(payload)
+  fs.writeFileSync(path.join(payload, 'hello.txt'), 'hello')
+  const tarballDir = path.join(dir, 'tarballs')
+  fs.mkdirSync(tarballDir)
+  const asset = 'open-design-fixture.tar.gz'
+  const tarball = path.join(tarballDir, asset)
+  execFileSync('tar', ['-czf', tarball, '-C', payload, 'hello.txt'], { stdio: 'pipe' })
+  const sha256 = execFileSync('shasum', ['-a', '256', tarball], { encoding: 'utf8' }).split(/\s+/)[0]
+  const size = fs.statSync(tarball).size
+  const manifest = {
+    version: OPEN_DESIGN_PIN_VERSION,
+    odSha: OPEN_DESIGN_SHA,
+    platform: 'darwin',
+    arch: 'arm64',
+    url: `https://github.com/iDoris-ai/Agent24/releases/download/v0.6.0/${asset}`,
+    sha256,
+    size,
+  }
+  if (mutate) mutate({ manifest, resources })
+  fs.writeFileSync(path.join(resources, 'open-design-component.json'), `${JSON.stringify(manifest)}\n`)
+  const dmg = path.join(dir, 'Agent24.dmg')
+  fs.writeFileSync(dmg, 'not-a-real-dmg')
+  return { app: path.join(dir, 'Agent24.app'), dmg, tarballDir }
+}
+
+function runVerify(dir, mutate) {
+  const fixture = verifyFixture(dir, mutate)
+  return spawnSync('bash', [verifyScript, fixture.app, fixture.dmg, fixture.tarballDir, '0.6.0'], {
+    encoding: 'utf8',
+    env: { ...process.env, A24_OD_SKIP_CODESIGN: '1' },
+  })
+}
+
+test('verify-mac-open-design accepts a manifest-only app and a matching tarball', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-verify-ok-'))
+  try {
+    const result = runVerify(dir)
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`)
+    assert.match(result.stdout, /OK:/)
+    assert.match(result.stdout, /A24_OD_SKIP_CODESIGN/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('verify-mac-open-design fails when the app bundle contains an Open Design directory', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-verify-tree-'))
+  try {
+    const result = runVerify(dir, ({ resources }) => {
+      fs.mkdirSync(path.join(resources, 'open-design'))
+      fs.writeFileSync(path.join(resources, 'open-design', 'extra.txt'), 'bundled')
+    })
+    const output = `${result.stdout}\n${result.stderr}`
+    assert.notEqual(result.status, 0, output)
+    assert.match(output, /Open Design 目录被打进了安装包/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('verify-mac-open-design fails when the manifest sha256 does not match the tarball', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-verify-sha-'))
+  try {
+    const result = runVerify(dir, ({ manifest }) => {
+      manifest.sha256 = 'b'.repeat(64)
+    })
+    const output = `${result.stdout}\n${result.stderr}`
+    assert.notEqual(result.status, 0, output)
+    assert.match(output, /资产 sha256 与清单不一致/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })

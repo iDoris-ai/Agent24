@@ -47,10 +47,17 @@ if ! HEADERS="$(curl -fsIL --max-time 60 "$URL")"; then
   exit 1
 fi
 
+# 每一跳都有自己的状态行。302 上的 Content-Length（常见是 0）不能留给
+# 后面没带该头的最终 200，否则会把可达的资产误报成尺寸不符。
 CL="$(printf '%s\n' "$HEADERS" | awk '
+BEGIN { last = "" }
 {
   line = $0
   sub(/\r$/, "", line)
+  if (line ~ /^HTTP\//) {
+    last = ""
+    next
+  }
   key = tolower(line)
   if (key ~ /^content-length:/) {
     sub(/^[^:]*:[[:space:]]*/, "", line)

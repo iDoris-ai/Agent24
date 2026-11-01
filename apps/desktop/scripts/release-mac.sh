@@ -13,7 +13,8 @@
 #                          不会回退到 package.json 的版本（那个 tag 不存在，用户会 404）。
 #   A24_OPEN_DESIGN_SOURCE_DIR  Open Design 源码 checkout，默认 ~/Dev/auraai/open-design-agent24，必须在固定 sha
 #   A24_OPEN_DESIGN_RESOURCES_DIR  可选：已用 prepare-open-design-linux-resources.mjs 备好的 Resources 目录，
-#                          设了就跳过 tools-pack 与 prepare（省约 5 分钟，复跑时用）
+#                          设了就跳过 tools-pack 与 prepare（省约 5 分钟，复跑时用）。
+#                          源码 checkout 仍要干净且 HEAD 等于 pin：后面会重建原生模块。
 #   A24_DMG_MAX_MB         DMG 体积上限，默认 250（防止 Open Design 被重新打进包）
 # 产物：release/*.dmg（只含清单）与 .open-design-component-dist/open-design-*.tar.gz（要上传到同一 release 的资产）
 set -euo pipefail
@@ -36,7 +37,27 @@ ENTITLEMENTS="$DESKTOP_DIR/build/entitlements.mac.plist"
 step() { printf '\n==> %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# 公共实现是 open-design-mac-release.mjs 的 checkOpenDesignSource：
+# git status --porcelain 为空，且 HEAD 等于 pin。prepare 写 stamp 前、
+# rebuild-open-design-native 入口也会调它。复用 Resources 只跳过 tools-pack / prepare。
+require_open_design_source() {
+  node "$OD_RELEASE" check-source "$OD_SOURCE_DIR" >/dev/null \
+    || die "Open Design 源码不在固定 sha，或工作区不干净：$OD_SOURCE_DIR"
+}
+
+# 调用方点名了 checkout 时先检查，放在「只能在 macOS」之前：复用路径的集成反例
+# 在 Linux 上也能对脏工作区失败，而不会被平台检查挡住。没点名时仍走下面的 Darwin 检查。
+if [[ -n "${A24_OPEN_DESIGN_SOURCE_DIR:-}" ]]; then
+  require_open_design_source
+fi
+
 [[ "$(uname -s)" == "Darwin" ]] || die "只能在 macOS 上运行"
+
+# 默认 checkout（未设置 A24_OPEN_DESIGN_SOURCE_DIR）也要查。上面查过的再查一次，结果相同。
+# 放在签名身份和 cargo 之前，脏 pin 不必等 keychain。
+[[ -n "${A24_RELEASE_TAG:-}" ]] || die "必须设置 A24_RELEASE_TAG（本次发布的 GitHub tag，如 v0.6.0-preview.20261028.10）。清单里的下载 URL 要指向真实存在的 release，不能默认用 package.json 的版本"
+OD_APP_VERSION="$(node "$OD_RELEASE" version "$A24_RELEASE_TAG")" || exit 1
+require_open_design_source
 
 step "0/6 前置检查"
 security find-identity -v -p codesigning | grep -F "${SIGN_IDENTITY}" >/dev/null \
@@ -44,12 +65,6 @@ security find-identity -v -p codesigning | grep -F "${SIGN_IDENTITY}" >/dev/null
 if [[ "${SKIP_NOTARIZE:-0}" != "1" ]]; then
   xcrun notarytool history --keychain-profile "${NOTARY_PROFILE}" >/dev/null \
     || die "notarytool profile 不可用：${NOTARY_PROFILE}（见 docs/Deployment/MACOS-SIGNING.md）"
-fi
-# Open Design 按需组件：tag 必填（早失败，别等十几分钟构建完才发现）
-[[ -n "${A24_RELEASE_TAG:-}" ]] || die "必须设置 A24_RELEASE_TAG（本次发布的 GitHub tag，如 v0.6.0-preview.20261028.10）。清单里的下载 URL 要指向真实存在的 release，不能默认用 package.json 的版本"
-OD_APP_VERSION="$(node "$OD_RELEASE" version "$A24_RELEASE_TAG")" || exit 1
-if [[ -z "${A24_OPEN_DESIGN_RESOURCES_DIR:-}" ]]; then
-  node "$OD_RELEASE" check-source "$OD_SOURCE_DIR" >/dev/null || die "Open Design 源码不在固定 sha，或工作区不干净：$OD_SOURCE_DIR"
 fi
 echo "release tag: $A24_RELEASE_TAG  -> 组件清单版本 $OD_APP_VERSION"
 # electron-builder 的 identity 不能带 "Developer ID Application:" 前缀
@@ -86,7 +101,7 @@ rm -rf "$OD_MANIFEST_DIR" "$OD_TARBALL_DIR" "$OD_STAGE_DIR"
 if [[ -n "${A24_OPEN_DESIGN_RESOURCES_DIR:-}" ]]; then
   OD_RESOURCES="$A24_OPEN_DESIGN_RESOURCES_DIR"
   # 复用跳过了 check-source。stamp 是这份树的出处，必须和 pin 一致。
-  node "$OD_RELEASE" check-resources "$OD_RESOURCES" >/dev/null || die "复用的 Open Design Resources 缺少 .agent24-od-source.json，或 sha 与固定 pin 不符：$OD_RESOURCES"
+  node "$OD_RELEASE" check-resources "$OD_RESOURCES" >/dev/null || die "复用的 Open Design Resources 缺少 .agent24-od-source.json，或 sha / 版本 / 内容摘要与 pin 不符：$OD_RESOURCES"
   echo "复用已备好的 Open Design Resources：$OD_RESOURCES"
 else
   rm -rf "$OD_WORK_DIR"
