@@ -23,7 +23,7 @@
 |---|---|---|---|---|---|
 | ADR-039 | [概念模型：本体、能力、技能](ADR-039-concept-model.md) | 已接受（原文：已接受（r2，Fable 评审后修订）） | adr/ | 一个本体加两个概念（能力、技能）；对外只说这些，其余名词归入对内实现；新东西按此归类 | 上位于 ADR-038/040–043；[可进化性评估](../architecture/EVOLVABILITY-ASSESSMENT-2026-11-01.md)；ADR-K1-01、ADR-K1-03、ADR-004（未标明体系） |
 | ADR-037 | [产品形态与进程模型：agent24d 是本体，外壳都是客户端](../decision.md) | 提议（原文：提议；待评审，批准前不派生产实现） | 日志 | 守护进程常驻为本体，外壳只做客户端；手机遥控不直连，以此取代旧的直连方案 | ADR-020、ADR-022、ADR-027；[事实清单](../tracking/2026-10-26/SOURCE-ADR-037-facts.md)；ADR-023、ADR-026、ADR-029、ADR-031、ADR-032、ADR-035、ADR-036、ADR-OD-004、ADR-OD-005 |
-| ADR-026 | [Agent24 采用 Rust Core + Polyglot Worker 架构](../ADR-026-rust-core-polyglot.md) | 已接受（原文：采纳） | docs/ | 内核用 Rust，Python 只做 ML Worker；含 11 条设计硬约束（含 fail-closed） | 取代 ADR-023、部分取代 ADR-024；收缩 ADR-016（docs/）；[分层总览](../ARCHITECTURE-LAYERS.md)；ADR-017、ADR-019、ADR-022 |
+| ADR-026 | [Agent24 采用 Rust Core + Polyglot Worker 架构](../ADR-026-rust-core-polyglot.md) | 已接受（原文：采纳） | docs/ | 内核用 Rust，Python 只做 ML Worker；含 §6.5 的 11 条设计硬约束（第 2 条：审批请求-响应、fail-closed） | 取代 ADR-023、部分取代 ADR-024；收缩 ADR-016（docs/）；[分层总览](../ARCHITECTURE-LAYERS.md)；ADR-017、ADR-019、ADR-022 |
 | ADR-003 | [模块按「服务对象」分三层（Base/Community/Personal）](../decision.md) | 已接受（原文：采纳） | 日志 | 主分类按服务对象，用前缀区分基础、社区和个人模块 | ADR-002 |
 | ADR-002 | [从「裁剪」改为「模块化适配层」](../decision.md) | 已接受（原文：采纳（已修正初版方案）） | 日志 | 内核加三层模块，能力都做成可插拔，不裁掉原有能力 | ADR-001、ADR-003 |
 | ADR-001 | [从 xiaoheishu/desktop 借鉴而非从零开发](../decision.md) | 已接受（原文：采纳） | 日志 | 把 xiaoheishu 当子模块引入，抽出通用部分，场景功能以后独立发包 | ADR-002 |
@@ -100,7 +100,7 @@
 
 | 编号 | 标题 | 状态 | 位置 | 一句话决策 | 关联 |
 |---|---|---|---|---|---|
-| ADR-027 | [移动端 shell-agnostic 双壳（Tauri + Expo/React Native）](../decision.md) | 被替代（原文：部分取代） | 日志 | 官方给两个瘦壳示例且不钦定框架；直连守护进程已被 ADR-037 取代 | ADR-018、ADR-037；ADR-026 |
+| ADR-027 | [移动端 shell-agnostic 双壳（Tauri + Expo/React Native）](../decision.md) | 已接受（部分被 ADR-037 取代；原文：部分取代） | 日志 | 取代 ADR-018，不钦定单一移动框架；直连守护进程部分已被 ADR-037 决策 6 取代，双壳选型待遥控设计时再定 | ADR-018、ADR-037；ADR-026 |
 | ADR-018 | [移动端技术路径选 Tauri 2.0](../decision.md) | 被替代（原文：Superseded by ADR-027） | 日志 | 移动端原定 Tauri，已被 ADR-027 取代；避免桌面专属接口的约束仍有效 | ADR-027；ADR-015 |
 | ADR-020 | [后端 Daemon 技术选型（TypeScript + Node http）](../decision.md) | 被替代（原文：已取代（ADR-020 → ADR-023 → ADR-026）） | 日志 | M2 选用 Node 内置 http；本篇已标被取代，只留作契约测试参考 | ADR-023、ADR-026、ADR-037 |
 | ADR-023 | [后端语言从 Node.js 切换到 Python FastAPI](../decision.md) | 被替代（原文：Superseded by ADR-026） | 日志 | 原定 M3 改用 Python 接口框架；已被 ADR-026 取代，Python 降为模型工人 | ADR-026；ADR-020、ADR-022 |
@@ -118,7 +118,7 @@
 
 ## 8. 演进（Super Agent）
 
-ADR-040 至 ADR-043 来自 [Super Agent 演进终稿](../research/deepseek-superagent/SUPERAGENT-EVOLUTION-2026-11-01.md)，ADR-038 来自[可进化性评估终稿](../architecture/EVOLVABILITY-ASSESSMENT-2026-11-01.md)，都在 PR #1530 上；表见上面各节，这里只列清单：
+ADR-040 至 ADR-043 来自 [Super Agent 演进终稿](../research/deepseek-superagent/SUPERAGENT-EVOLUTION-2026-11-01.md)，ADR-038 来自[可进化性评估终稿](../architecture/EVOLVABILITY-ASSESSMENT-2026-11-01.md)，随 PR #1530 合入 main；表见上面各节，这里只列清单：
 
 | 编号 | 标题 | 状态 | 所在节 |
 |---|---|---|---|
@@ -176,7 +176,7 @@ Fable 初稿的五份 ADR 草案，原样保留、不再更新，最终版见上
 核对时拿不准的条目：
 
 - ADR-024：本篇状态行仍是「✅ 采纳」。ADR-026 另写「部分 Superseded」，但本篇没有改自己的状态。状态列按本篇填「已接受」，没有写成被替代。
-- ADR-027：状态原文是「部分取代」。它取代 ADR-018，同时「移动瘦壳经 HTTP/WS 直连 daemon」及遗留项被 ADR-037 决策 6 取代。五档里归入「被替代」；双壳、不钦定单一框架，仍是本篇写下的决定。
+- ADR-027：状态原文是「部分取代」。它取代 ADR-018，同时「移动瘦壳经 HTTP/WS 直连 daemon」及遗留项被 ADR-037 决策 6 取代。状态列写「已接受（部分被 ADR-037 取代）」，与架构总入口一致；双壳、不钦定单一框架，仍是本篇写下的决定。
 - ADR-028：「暂定 / 需 spike」不在已接受、提议、草案、被替代、废弃之内，按未标处理。原先索引写成草案，是推断。
 - docs/ 的 ADR-016：状态原文是「进行中（migration 分支活跃）」。进行中不在上述五档里，按未标处理。
 - ADR-015：现行正文里改名前后的仓库名都写成 Agent24。「去掉 Desktop」只出现在用户引语里。一句话写成改仓库名，并避免架构只绑桌面。
