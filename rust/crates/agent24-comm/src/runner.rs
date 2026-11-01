@@ -381,8 +381,14 @@ impl HyphaeRunner {
     /// refuses interactive prompts) and with stdio left for the caller to
     /// attach to a pty.
     pub(crate) fn interactive_command(&self, args: &[&str]) -> std::process::Command {
-        let mut cmd = std::process::Command::new(self.bin.path());
-        cmd.args(args);
+        // `sh -c 'ulimit -c 0; exec "$0" "$@"'`: the child can never leave a core
+        // dump holding the key (std's pre_exec is `unsafe`, which this crate
+        // forbids). `exec` keeps the pid, so process-group kill still works.
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("ulimit -c 0 2>/dev/null; exec \"$0\" \"$@\"")
+            .arg(self.bin.path())
+            .args(args);
         cmd.env_clear();
         for (key, value) in filtered_env(std::env::vars()) {
             cmd.env(key, value);

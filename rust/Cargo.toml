@@ -56,3 +56,16 @@ double_must_use = "allow"
 # SPEC-001 §5: no unwrap/expect outside tests
 unwrap_used = "deny"
 expect_used = "deny"
+
+# NIP-49 backups use scrypt N=2^16 (64 MiB); unoptimised that takes ~10 s per
+# call, which would make debug-build tests and `cargo run` exports crawl.
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3

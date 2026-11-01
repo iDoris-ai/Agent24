@@ -125,3 +125,6 @@ exemptions:
   - operationId: documentsGetExtraction
     category: planned-tui-3
     fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: exportCommIdentity
+    category: planned-tui-2
+    fallback: "CLI 导出待 CORE-2d 在场证明接入（CommWrite 目前不在 resolve_target 的可提升集合内，FirstPartyShell 会拿到 presence_required）；桌面端走专用 IPC（原生确认 + 保存框）"

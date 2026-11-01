@@ -313,16 +313,27 @@ export async function importCommIdentity(from: string, password: string) {
   }
 }
 
+/** Elevated writes go through dedicated, validated IPC in main, never the generic proxy. */
+async function viaIpc<T>(call: () => Promise<unknown>, validate: (value: unknown) => value is T): Promise<T> {
+  let response: unknown
+  try {
+    response = await call()
+  } catch {
+    throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)
+  }
+  return decodeEnvelope(response, validate)
+}
+
 export const addCommContact = (nickname: string, npub: string, role: string) =>
-  request('POST', '/api/v1/comm/contact', (value): value is RecordValue => isRecord(value) || value === null,
-    { nickname, npub, ...(role ? { role } : {}) })
+  viaIpc(() => window.agent24.commContactAdd(nickname, npub, role),
+    (value): value is RecordValue => isRecord(value) || value === null)
 
 export interface CommSendResult {
   published_to: number
 }
 
 export const sendCommMessage = (to: string, content: string): Promise<CommSendResult> =>
-  request('POST', '/api/v1/comm/send', (value): value is RecordValue => isRecord(value), { to, content, encrypt: true })
+  viaIpc(() => window.agent24.commSend(to, content), (value): value is RecordValue => isRecord(value))
     .then((data) => ({ published_to: typeof data['published_to'] === 'number' ? data['published_to'] : 0 }))
 
 export interface CommHistoryItem {
@@ -368,17 +379,11 @@ export interface CommExportResult {
 }
 
 /**
- * Private-key backup. The main process asks for confirmation, lets the user
- * pick the file and has the daemon write it (0600); only {nickname,npub,path}
- * comes back. A cancelled dialog rejects with code `cancelled`.
+ * Password-encrypted private-key backup (NIP-49). The main process asks for
+ * confirmation, lets the user pick the file and has the daemon create it
+ * (0600, never overwriting); only {nickname,npub,path} comes back. A cancelled
+ * dialog rejects with code `cancelled`; an existing file with `target_exists`.
  */
-export async function exportCommIdentity(nickname: string): Promise<CommExportResult> {
-  let response: unknown
-  try {
-    response = await window.agent24.commIdentityExport(nickname)
-  } catch {
-    throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)
-  }
-  return decodeEnvelope(response, (value): value is CommExportResult =>
+export const exportCommIdentity = (nickname: string, backupPassword: string): Promise<CommExportResult> =>
+  viaIpc(() => window.agent24.commIdentityExport(nickname, backupPassword), (value): value is CommExportResult =>
     isRecord(value) && string(value['nickname']) && string(value['npub']) && string(value['path']))
-}

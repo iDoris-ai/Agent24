@@ -102,12 +102,14 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('PUT', '/api/v1/comm/relay'), // [E]
   r('POST', '/api/v1/comm/relay/probe'), // [E]
   r('GET', '/api/v1/comm/contact'),
-  r('POST', '/api/v1/comm/contact'), // [E]
-  r('POST', '/api/v1/comm/send', 90_000), // [E] daemon allows up to 5s per relay + 10s (8 relays max)
   r('GET', '/api/v1/comm/history'),
-  // NOT here on purpose: POST /api/v1/comm/identity/export (private-key backup).
-  // It has its own IPC (CommIdentityExport): native confirm + native save
-  // dialog in main, so the page can neither pick the path nor skip the prompt.
+  // NOT here on purpose, each has its own validated IPC in main:
+  //   POST /api/v1/comm/identity/export  (CommIdentityExport: native confirm + save dialog)
+  //   POST /api/v1/comm/contact          (CommContactAdd)
+  //   POST /api/v1/comm/send             (CommSend)
+  // The proxy forwards with the host's ProductHost credential, which the
+  // daemon's presence check does not constrain, so an Elevated write must not
+  // be reachable here with a body of the page's choosing.
   r('GET', '/api/v1/comm/relay'),
   r('GET', '/api/v1/comm/daemon'),
   r('POST', '/api/v1/comm/daemon/start'), // [E]

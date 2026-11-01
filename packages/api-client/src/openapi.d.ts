@@ -1345,8 +1345,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Back up an identity's private key to a file
-         * @description Writes the identity's private key (nsec) to `path` with mode 0600, using the keystore password held in the system keychain. The key is never part of the response, a log line or a temp file. `path` must be absolute, in an existing folder outside the Hyphae data directory; symlinks are refused. The desktop app does not expose this through the renderer proxy: its main process picks `path` with a native save dialog after a native confirmation.
+         * Back up an identity's private key to a password-encrypted file
+         * @description Writes the identity's private key to `path` as a NIP-49 `ncryptsec1…` string (scrypt log_n 16, XChaCha20-Poly1305) encrypted with `backup_password`; there is no plaintext option. The keystore password is taken from the system keychain. The file is created with O_CREAT|O_EXCL|O_NOFOLLOW, mode 0600, relative to a once-opened parent directory: an existing target of any kind is refused with `409 conflict` and `data.reason = "target_exists"`, and nothing is overwritten, truncated or chmod-ed. `path` must be absolute and outside the Hyphae data directory. Neither the key, the encrypted backup nor the backup password is part of the response or a log line. The desktop app does not expose this through the renderer proxy; its main process picks `path` with a native save dialog after a native confirmation. There is no CLI command yet (it needs the CORE-2d presence proof for CommWrite).
          */
         post: operations["exportCommIdentity"];
         delete?: never;
@@ -6623,13 +6623,16 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": {
+                    /** @description No control characters. */
                     nickname: string;
                     path: string;
+                    /** @description Encrypts the backup. Lose it and the backup cannot be restored; it is not stored. */
+                    backup_password: string;
                 };
             };
         };
         responses: {
-            /** @description Backup written; data is `{nickname, npub, path}` */
+            /** @description Backup written; data is `{nickname, npub, path, format:"ncryptsec"}` */
             200: {
                 headers: {
                     [name: string]: unknown;

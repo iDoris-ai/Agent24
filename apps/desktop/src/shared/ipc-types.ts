@@ -24,6 +24,10 @@ export const IpcChannels = {
   // Private-key backup: native confirm + native save dialog in main; the
   // backend writes the file itself, so the key never crosses IPC.
   CommIdentityExport: 'comm:identity-export',
+  // Elevated comm writes that used to ride the generic proxy. Strictly
+  // validated in main; presence binding is pending CORE-7c/CORE-2d.
+  CommContactAdd: 'comm:contact-add',
+  CommSend: 'comm:send',
   // A-3: disable/enable or unpair AgentEar (PATCH / DELETE
   // /api/v1/attached/agentear). The module name is fixed in main; the
   // renderer cannot name another one. Same native-confirm rule as above.

@@ -105,12 +105,6 @@ mod tests {
         None
     );
     comm_case!(
-        identity_export,
-        &["identity", "export", "alice", "--out", "/tmp/alice-key.txt"],
-        "POST /api/v1/comm/identity/export HTTP/1.1",
-        Some(json!({"nickname":"alice","path":"/tmp/alice-key.txt"}))
-    );
-    comm_case!(
         outbox,
         &["outbox", "list", "--failed-only"],
         "GET /api/v1/comm/outbox?failed_only=true HTTP/1.1",

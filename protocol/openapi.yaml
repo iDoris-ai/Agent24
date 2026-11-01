@@ -2689,30 +2689,39 @@ paths:
     post:
       operationId: exportCommIdentity
       tags: [comm]
-      summary: Back up an identity's private key to a file
+      summary: Back up an identity's private key to a password-encrypted file
       x-comm-tier: CommWrite
       x-operation-level: elevated
-      x-cli: agent24 comm identity export <nickname> --out <file>
       description: >-
-        Writes the identity's private key (nsec) to `path` with mode 0600, using the keystore password held
-        in the system keychain. The key is never part of the response, a log line or a temp file. `path` must
-        be absolute, in an existing folder outside the Hyphae data directory; symlinks are refused. The desktop
-        app does not expose this through the renderer proxy: its main process picks `path` with a native save
-        dialog after a native confirmation.
+        Writes the identity's private key to `path` as a NIP-49 `ncryptsec1…` string (scrypt log_n 16,
+        XChaCha20-Poly1305) encrypted with `backup_password`; there is no plaintext option. The keystore
+        password is taken from the system keychain. The file is created with O_CREAT|O_EXCL|O_NOFOLLOW, mode 0600,
+        relative to a once-opened parent directory: an existing target of any kind is refused with
+        `409 conflict` and `data.reason = "target_exists"`, and nothing is overwritten, truncated or chmod-ed.
+        `path` must be absolute and outside the Hyphae data directory. Neither the key, the encrypted backup
+        nor the backup password is part of the response or a log line. The desktop app does not expose this
+        through the renderer proxy; its main process picks `path` with a native save dialog after a native
+        confirmation. There is no CLI command yet (it needs the CORE-2d presence proof for CommWrite).
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [nickname, path]
+              required: [nickname, path, backup_password]
               additionalProperties: false
               properties:
-                nickname: { type: string }
+                nickname: { type: string, description: "No control characters." }
                 path: { type: string }
+                backup_password:
+                  type: string
+                  writeOnly: true
+                  minLength: 8
+                  maxLength: 1024
+                  description: Encrypts the backup. Lose it and the backup cannot be restored; it is not stored.
       responses:
         "200":
-          description: Backup written; data is `{nickname, npub, path}`
+          description: Backup written; data is `{nickname, npub, path, format:"ncryptsec"}`
           content:
             application/json:
               schema:

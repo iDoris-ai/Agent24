@@ -196,14 +196,16 @@ describe('COMM typed backend API', () => {
 
 
 describe('COMM contact, send, history and export wrappers', () => {
-  it('posts the contact with an optional role and sends encrypted by default', async () => {
-    const proxy = setProxy(() => successful({ published_to: 3 }))
-    await addCommContact('bob', 'npub1bob', '')
+  it('sends contact add and send through dedicated IPC, never the generic proxy', async () => {
+    const proxy = setProxy(() => { throw new Error('generic proxy must not carry Elevated comm writes') })
+    const commContactAdd = vi.fn(async () => successful({}))
+    const commSend = vi.fn(async () => successful({ published_to: 3 }))
+    window.agent24 = { ...window.agent24, commContactAdd, commSend } as never
+    await addCommContact('bob', 'npub1bob', 'friend')
     await expect(sendCommMessage('bob', 'hi')).resolves.toEqual({ published_to: 3 })
-    expect(proxy.mock.calls.map((c) => c[0])).toEqual([
-      { method: 'POST', path: '/api/v1/comm/contact', body: { nickname: 'bob', npub: 'npub1bob' } },
-      { method: 'POST', path: '/api/v1/comm/send', body: { to: 'bob', content: 'hi', encrypt: true } },
-    ])
+    expect(commContactAdd).toHaveBeenCalledWith('bob', 'npub1bob', 'friend')
+    expect(commSend).toHaveBeenCalledWith('bob', 'hi')
+    expect(proxy).not.toHaveBeenCalled()
   })
   it('keeps only displayable history rows', async () => {
     setProxy(() => successful([{ id: 'e1', from: 'npub1bob', content: 'hello', created_at: 1_700_000_000 }, { id: 'x' }]))
@@ -211,13 +213,15 @@ describe('COMM contact, send, history and export wrappers', () => {
     expect(rows).toHaveLength(1)
     expect(rows[0]).toMatchObject({ id: 'e1', from: 'npub1bob', content: 'hello' })
   })
-  it('exports through the dedicated IPC, never the generic proxy, and rejects a cancel with its code', async () => {
+  it('exports through the dedicated IPC with the backup password, and rejects a cancel with its code', async () => {
     const proxy = setProxy(() => { throw new Error('generic proxy must not export keys') })
-    window.agent24 = { ...window.agent24, commIdentityExport: vi.fn()
-      .mockResolvedValueOnce(successful({ nickname: 'alice', npub: 'npub1a', path: '/p.txt' }))
-      .mockResolvedValueOnce({ ok: false, status: 499, data: { error: { code: 'cancelled', message: 'cancelled' } } }) } as never
-    await expect(exportCommIdentity('alice')).resolves.toEqual({ nickname: 'alice', npub: 'npub1a', path: '/p.txt' })
-    await expect(exportCommIdentity('alice')).rejects.toMatchObject({ code: 'cancelled' })
+    const commIdentityExport = vi.fn()
+      .mockResolvedValueOnce(successful({ nickname: 'alice', npub: 'npub1a', path: '/p.ncryptsec' }))
+      .mockResolvedValueOnce({ ok: false, status: 499, data: { error: { code: 'cancelled', message: 'cancelled' } } })
+    window.agent24 = { ...window.agent24, commIdentityExport } as never
+    await expect(exportCommIdentity('alice', 'backup-pass')).resolves.toEqual({ nickname: 'alice', npub: 'npub1a', path: '/p.ncryptsec' })
+    await expect(exportCommIdentity('alice', 'backup-pass')).rejects.toMatchObject({ code: 'cancelled' })
+    expect(commIdentityExport).toHaveBeenCalledWith('alice', 'backup-pass')
     expect(proxy).not.toHaveBeenCalled()
   })
 })

@@ -354,20 +354,38 @@ describe('CommunicationPage usability', () => {
     await waitFor(() => expect(listCommHistory).toHaveBeenCalledTimes(2))
   })
 
-  it('exports a private-key backup without showing the key, and treats cancel as silent', async () => {
+  it('asks for a backup password twice (min 8 chars) before exporting, and clears it', async () => {
     success()
     vi.mocked(exportCommIdentity)
       .mockRejectedValueOnce(new CommApiError('cancelled', 499, 'cancelled'))
-      .mockResolvedValueOnce({ nickname: 'alice', npub: 'npub1alice', path: '/safe/alice.txt' })
+      .mockResolvedValueOnce({ nickname: 'alice', npub: 'npub1alice', path: '/safe/alice.ncryptsec' })
     render(<CommunicationPage />)
-    const button = await screen.findByRole('button', { name: 'Export private key backup alice' })
-    fireEvent.click(button)
-    await waitFor(() => expect(exportCommIdentity).toHaveBeenCalledWith('alice'))
-    await waitFor(() => expect(button).toBeEnabled())
-    expect(screen.queryByRole('alert')).toBeNull()
-    fireEvent.click(button)
-    expect(await screen.findByText(/saved to \/safe\/alice\.txt/)).toBeInTheDocument()
-    expect(document.body.textContent).not.toMatch(/nsec1/)
+    fireEvent.click(await screen.findByRole('button', { name: 'Export private key backup alice' }))
+    expect(screen.getByText(/cannot be restored; Agent24 does not store it/)).toBeInTheDocument()
+    const first = screen.getByLabelText('Backup password') as HTMLInputElement
+    const second = screen.getByLabelText('Repeat backup password') as HTMLInputElement
+    const submit = screen.getByRole('button', { name: 'Choose where to save…' })
+
+    fireEvent.change(first, { target: { value: 'short' } })
+    fireEvent.change(second, { target: { value: 'short' } })
+    fireEvent.click(submit)
+    expect(await screen.findByText('The backup password must be at least 8 characters')).toBeInTheDocument()
+    fireEvent.change(first, { target: { value: 'long-enough-1' } })
+    fireEvent.change(second, { target: { value: 'long-enough-2' } })
+    fireEvent.click(submit)
+    expect(await screen.findByText('The two passwords do not match')).toBeInTheDocument()
+    expect(exportCommIdentity).not.toHaveBeenCalled()
+
+    fireEvent.change(second, { target: { value: 'long-enough-1' } })
+    fireEvent.click(submit)
+    await waitFor(() => expect(exportCommIdentity).toHaveBeenCalledWith('alice', 'long-enough-1'))
+    await waitFor(() => expect(first.value).toBe(''))
+    expect(screen.queryByRole('alert')).toBeNull() // a cancelled dialog is silent
+    fireEvent.change(first, { target: { value: 'long-enough-1' } })
+    fireEvent.change(second, { target: { value: 'long-enough-1' } })
+    fireEvent.click(submit)
+    expect(await screen.findByText(/saved to \/safe\/alice\.ncryptsec/)).toBeInTheDocument()
+    expect(document.body.textContent).not.toMatch(/nsec1|long-enough-1/)
   })
 
   const stranger = 'npub1strangerstrangerstrangerstrangerstrangerstrangerxyz'

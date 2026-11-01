@@ -1,6 +1,7 @@
 // IPC handler registry. M0/M1 starter handlers; capability modules will
 // register their own handlers here via the module loader (later M1 task).
 
+import fs from 'node:fs'
 import path from 'node:path'
 import http from 'node:http'
 import https from 'node:https'
@@ -11,6 +12,7 @@ import { daemonCliEndpoint, daemonConnection, getBackendEndpoint } from '../back
 import { findAllowedRoute, proxyError, proxyRequest, timeoutFor, withKnowledgeBinding } from '../backend-proxy'
 import type { KnowledgeController } from '../knowledge-settings'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
+import { isSafeBackupPassword, isSafeMessage, isSafeName, isValidNpub } from '../comm-validate'
 import { mt, setMainLocale, isMainLocale } from '../main-i18n'
 import { readOmlxSettingsKey } from '../omlx-settings-key'
 import type { IpcGuard } from './guard'
@@ -221,6 +223,11 @@ function isBackendProxyRequest(req: unknown): req is BackendProxyRequest {
     requestPath.startsWith('/') &&
     !requestPath.startsWith('//')
   )
+}
+
+/** True if anything (file, dir, even a dangling symlink) is at `p`. */
+function pathExists(p: string): boolean {
+  try { fs.lstatSync(p); return true } catch { return false }
 }
 
 const SAFE_ID = /^[A-Za-z0-9_.:-]{1,128}$/
@@ -519,18 +526,17 @@ export function registerIpcHandlers(options: {
   // here with a native save dialog (never by the page) and the daemon writes
   // the key itself (0600, no temp file), so the nsec never reaches this
   // process or the renderer. The page only learns {nickname, npub, path}.
-  handle(IpcChannels.CommIdentityExport, (event, nickname: unknown): Promise<BackendProxyResponse> =>
+  handle(IpcChannels.CommIdentityExport, (event, nickname: unknown, backupPassword: unknown): Promise<BackendProxyResponse> =>
     exclusive(async () => {
-      if (typeof nickname !== 'string' || !nickname.trim() || nickname.length > 128 || hasControlChars(nickname)) {
-        return invalidRequest('invalid nickname')
-      }
+      if (!isSafeName(nickname, 128)) return invalidRequest('invalid nickname')
+      if (!isSafeBackupPassword(backupPassword)) return invalidRequest('invalid backup password')
       const ok = await confirmNative(event, mt('comm.export', { name: clip(nickname, 80) }), mt('comm.exportDetail'))
       if (!ok) return cancelled()
       const win = BrowserWindow.fromWebContents(event.sender)
       const options: Electron.SaveDialogOptions = {
         title: mt('comm.exportSave'),
-        defaultPath: path.join(app.getPath('documents'), `${nickname.replace(/[^\w.-]+/g, '_')}-private-key-backup.txt`),
-        filters: [{ name: 'Text', extensions: ['txt'] }],
+        defaultPath: path.join(app.getPath('documents'), `${nickname.replace(/[^\w.-]+/g, '_')}.ncryptsec`),
+        filters: [{ name: 'NIP-49 ncryptsec', extensions: ['ncryptsec'] }],
       }
       let picked: Electron.SaveDialogReturnValue
       try {
@@ -539,9 +545,39 @@ export function registerIpcHandlers(options: {
         return { ok: false, status: 500, data: { error: { code: 'dialog_failed', message: 'the file dialog could not open' } } }
       }
       if (picked.canceled || !picked.filePath) return cancelled()
-      return proxyToBackend({ method: 'POST', path: '/api/v1/comm/identity/export', body: { nickname, path: picked.filePath } })
+      // The daemon never overwrites (O_EXCL) and says so; checking here too
+      // gives the user the reason before any key material is touched.
+      if (pathExists(picked.filePath)) {
+        return { ok: false, status: 409, data: { error: { code: 'target_exists', message: mt('err.targetExists') } } }
+      }
+      return proxyToBackend({
+        method: 'POST', path: '/api/v1/comm/identity/export',
+        body: { nickname, path: picked.filePath, backup_password: backupPassword },
+      })
     }),
   )
+
+  // Elevated comm writes that no longer ride the generic proxy. Everything the
+  // page supplies is validated here (checksum-valid npub, names without
+  // control characters, bounded content) and the daemon route is fixed.
+  // NOTE: no presence proof is attached. The daemon's resolve_target has no
+  // CommWrite support yet (CORE-2d / CORE-7c), and the host credential is not
+  // subject to the presence check; this narrows the surface, it does not close it.
+  handle(IpcChannels.CommContactAdd, (_event, nickname: unknown, npub: unknown, role: unknown): Promise<BackendProxyResponse> => {
+    if (!isSafeName(nickname)) return Promise.resolve(invalidRequest('invalid nickname'))
+    if (!isValidNpub(npub)) return Promise.resolve(invalidRequest('invalid npub'))
+    if (role !== undefined && role !== '' && !isSafeName(role)) return Promise.resolve(invalidRequest('invalid role'))
+    return proxyToBackend({
+      method: 'POST', path: '/api/v1/comm/contact',
+      body: { nickname, npub, ...(typeof role === 'string' && role ? { role } : {}) },
+    })
+  })
+  handle(IpcChannels.CommSend, (_event, to: unknown, content: unknown): Promise<BackendProxyResponse> => {
+    if (!(typeof to === 'string' && to.startsWith('npub1') ? isValidNpub(to) : isSafeName(to))) return Promise.resolve(invalidRequest('invalid recipient'))
+    if (!isSafeMessage(content)) return Promise.resolve(invalidRequest('invalid message'))
+    // The daemon allows 5 s per relay + 10 s (8 relays max).
+    return proxyToBackend({ method: 'POST', path: '/api/v1/comm/send', body: { to, content, encrypt: true } }, 90_000)
+  })
 
   // A1: POST /api/v1/approvals/{id} — an elevated operation, so it is not on
   // the generic proxy. The native dialog shows the daemon's OWN record of the

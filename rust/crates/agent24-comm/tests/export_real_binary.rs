@@ -73,25 +73,33 @@ async fn export_writes_a_0600_backup_with_the_real_cli() {
         .await
         .unwrap();
     let app = router(CommState::ready(runner, store, home));
+    let app_again = app.clone();
 
     let out_dir = std::env::var("HYPHAE_EXPORT_OUT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| tmp.path().join("out"));
     std::fs::create_dir_all(&out_dir).unwrap();
-    let dest = out_dir.join("exp.nsec.txt");
+    let dest = out_dir.join("exp.ncryptsec");
     let request = Request::builder()
         .method("POST")
         .uri("/identity/export")
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::to_vec(&json!({"nickname": "exp", "path": dest})).unwrap(),
+            serde_json::to_vec(
+                &json!({"nickname": "exp", "path": dest, "backup_password": "backup passphrase 1"}),
+            )
+            .unwrap(),
         ))
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(!text.contains("nsec1"), "response must not carry the key");
+    assert!(
+        !text.contains("nsec1")
+            && !text.contains("ncryptsec1")
+            && !text.contains("backup passphrase")
+    );
     let body: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(body["data"]["npub"], npub.as_str());
     assert_eq!(
@@ -99,6 +107,24 @@ async fn export_writes_a_0600_backup_with_the_real_cli() {
         0o600
     );
     let key = std::fs::read_to_string(&dest).unwrap();
-    assert!(key.starts_with("nsec1") && key.ends_with('\n'));
+    assert!(key.starts_with("ncryptsec1") && key.ends_with('\n') && !key.contains("nsec1"));
+    // an existing target is refused and left alone
+    let again = app_again;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/identity/export")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(
+                &json!({"nickname": "exp", "path": dest, "backup_password": "other passphrase"}),
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        again.oneshot(request).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), key);
     println!("EXPORT_NPUB={npub}");
 }
