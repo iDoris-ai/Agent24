@@ -1,5 +1,7 @@
 # ADR-K1-04：审计与共同授权入口
 
+索引：[架构总入口](../architecture/README.md)・[ADR 索引](README.md)
+
 > **状态**：**Accepted**（2026-10-08 jason 确认；PR-Daemon 已 APPROVE。实现按 PLAN-KERNEL-K1 §4 切片进行，每片仍须 PR-Daemon APPROVE）
 >
 > **日期**：2026-10-07 · **方向**：Kernel K1 · **任务**：#735 / K1-4

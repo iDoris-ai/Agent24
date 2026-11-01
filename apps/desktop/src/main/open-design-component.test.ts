@@ -3,6 +3,7 @@ import crypto from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
 import http from 'node:http'
+import net from 'node:net'
 import type { AddressInfo } from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
@@ -10,8 +11,11 @@ import zlib from 'node:zlib'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL_ENV,
   OpenDesignComponentInstaller,
+  assertExtractedEntriesAreRegular,
   loadOpenDesignComponentManifest,
+  resolveLocalDownloadOverride,
   openDesignComponentInstallDir,
   parseOpenDesignComponentManifest,
   assertResourceSafeBaseAncestryIsSafe,
@@ -160,9 +164,16 @@ function seedTreeFor(prefix: string): string {
   return root
 }
 
-async function startServer(filePath: string, onRequest?: () => void): Promise<{ url: string; requestCount: () => number }> {
+async function startServer(filePath: string, onRequest?: () => void, assetName = 'asset.tar.gz'): Promise<{ url: string; requestCount: () => number }> {
   let requestCount = 0
-  const server = http.createServer((_req, res) => {
+  const expectedPath = `/${assetName}`
+  const server = http.createServer((req, res) => {
+    const pathname = decodeURIComponent(new URL(req.url ?? '/', 'http://127.0.0.1').pathname)
+    if (pathname !== expectedPath) {
+      res.writeHead(404)
+      res.end()
+      return
+    }
     requestCount += 1
     onRequest?.()
     const body = fs.readFileSync(filePath)
@@ -172,7 +183,7 @@ async function startServer(filePath: string, onRequest?: () => void): Promise<{ 
   servers.push(server)
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
   const { port } = server.address() as AddressInfo
-  return { url: `http://127.0.0.1:${port}/asset.tar.gz`, requestCount: () => requestCount }
+  return { url: `http://127.0.0.1:${port}/${assetName}`, requestCount: () => requestCount }
 }
 
 /** Server that 302-redirects `/redirect` to `/asset.tar.gz` on the same
@@ -180,12 +191,18 @@ async function startServer(filePath: string, onRequest?: () => void): Promise<{ 
  * arbitrary `Location` override when provided. */
 async function startRedirectingServer(filePath: string, locationOverride?: (selfOrigin: string) => string): Promise<{ url: string }> {
   const server = http.createServer((req, res) => {
-    if (req.url === '/redirect') {
+    const pathname = decodeURIComponent(new URL(req.url ?? '/', 'http://127.0.0.1').pathname)
+    if (pathname === '/redirect') {
       const { port: selfPort } = server.address() as AddressInfo
       const location = locationOverride
         ? locationOverride(`http://127.0.0.1:${selfPort}`)
         : `https://127.0.0.1:${selfPort}/asset.tar.gz`
       res.writeHead(302, { Location: location })
+      res.end()
+      return
+    }
+    if (pathname !== '/asset.tar.gz') {
+      res.writeHead(404)
       res.end()
       return
     }
@@ -1717,5 +1734,225 @@ describe('OpenDesignComponentInstaller', () => {
       expect(second.dir).toBe(finalDir)
       expect(fs.readFileSync(path.join(finalDir, '.agent24-component.json'), 'utf8')).toBe(markerBefore)
     })
+  })
+})
+
+describe('loopback download override (release verification hook)', () => {
+  const ENV = OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL_ENV
+
+  it('is off unless set, and only accepts plain-http loopback URLs without credentials', () => {
+    expect(resolveLocalDownloadOverride({})).toBeNull()
+    expect(resolveLocalDownloadOverride({ [ENV]: '' })).toBeNull()
+    expect(resolveLocalDownloadOverride({ [ENV]: 'not a url' })).toBeNull()
+    expect(resolveLocalDownloadOverride({ [ENV]: 'https://127.0.0.1:8080/' })).toBeNull()
+    expect(resolveLocalDownloadOverride({ [ENV]: 'http://example.com:8080/' })).toBeNull()
+    expect(resolveLocalDownloadOverride({ [ENV]: 'http://192.168.1.5:8080/' })).toBeNull()
+    expect(resolveLocalDownloadOverride({ [ENV]: 'http://user:pw@127.0.0.1:8080/' })).toBeNull()
+    expect(resolveLocalDownloadOverride({ [ENV]: 'http://127.0.0.1:8080' })?.href).toBe('http://127.0.0.1:8080/')
+    expect(resolveLocalDownloadOverride({ [ENV]: 'http://[::1]:9000/dist' })?.href).toBe('http://[::1]:9000/dist/')
+    expect(resolveLocalDownloadOverride({ [ENV]: 'http://localhost:9000/dist' })).toBeNull()
+    expect(resolveLocalDownloadOverride({ [ENV]: 'http://127.0.0.1.example:8080/' })).toBeNull()
+  })
+
+  it('downloads the manifest asset from the loopback server over http, still verifying the baked sha256', async () => {
+    const asset = 'open-design-test.tar.gz'
+    const stage = seedTreeFor('a24-od-stage-override-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath, { url: `https://github.com/iDoris-ai/Agent24/releases/download/v9.9.9/${asset}` })
+    const server = await startServer(tarPath, undefined, asset)
+    const base = new URL('.', server.url).href
+    const componentsRoot = tmpDir('a24-od-root-override-')
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    // Real fetch, default allow-list: only the override makes plain http on 127.0.0.1 legal.
+    // The fixture server 404s any path other than the asset filename, so a rewrite that
+    // dropped the name would never install.
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, env: { [ENV]: base } })
+    expect(installer.status()).toMatchObject({ state: 'not-installed', overrideActive: true })
+    const result = await installer.install()
+    expect(result).toEqual({ state: 'installed', dir: openDesignComponentInstallDir(componentsRoot, manifest), overrideActive: true })
+    expect(server.requestCount()).toBe(1)
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(base))
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(asset))
+  })
+
+  it('rejects a loopback tarball whose sha256 differs from the baked manifest', async () => {
+    const asset = 'open-design-test.tar.gz'
+    const stage = seedTreeFor('a24-od-stage-override-bad-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath, {
+      url: `https://github.com/iDoris-ai/Agent24/releases/download/v9.9.9/${asset}`,
+      sha256: 'f'.repeat(64),
+    })
+    const server = await startServer(tarPath, undefined, asset)
+    const base = new URL('.', server.url).href
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot: tmpDir('a24-od-root-override-bad-'), env: { [ENV]: base } })
+    const result = await installer.install()
+    expect(result.state).toBe('failed')
+    expect(result.overrideActive).toBe(true)
+  })
+
+  it('does not follow an override redirect onto another port or onto https', async () => {
+    const asset = 'open-design-test.tar.gz'
+    const stage = seedTreeFor('a24-od-stage-override-hop-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath, { url: `https://github.com/iDoris-ai/Agent24/releases/download/v9.9.9/${asset}` })
+    const fileServer = await startServer(tarPath, undefined, asset)
+    const otherPort = new URL(fileServer.url).port
+
+    const redirectServer = http.createServer((req, res) => {
+      const pathname = decodeURIComponent(new URL(req.url ?? '/', 'http://127.0.0.1').pathname)
+      if (pathname !== `/${asset}`) {
+        res.writeHead(404)
+        res.end()
+        return
+      }
+      const hop = req.headers['x-hop'] === 'https'
+        ? `https://127.0.0.1:${otherPort}/${asset}`
+        : `http://127.0.0.1:${otherPort}/${asset}`
+      res.writeHead(302, { Location: hop })
+      res.end()
+    })
+    servers.push(redirectServer)
+    await new Promise<void>((resolve) => redirectServer.listen(0, '127.0.0.1', resolve))
+    const { port } = redirectServer.address() as AddressInfo
+    const base = `http://127.0.0.1:${port}/`
+
+    const otherPortInstaller = new OpenDesignComponentInstaller({
+      manifest,
+      componentsRoot: tmpDir('a24-od-root-override-port-'),
+      env: { [ENV]: base },
+    })
+    const otherPortResult = await otherPortInstaller.install()
+    expect(otherPortResult.state).toBe('failed')
+    expect(otherPortResult.error).toContain('HTTPS')
+    expect(fileServer.requestCount()).toBe(0)
+
+    const httpsHop: typeof fetch = (input, init) => {
+      const headers = new Headers(init?.headers)
+      headers.set('x-hop', 'https')
+      return fetch(input, { ...init, headers })
+    }
+    const httpsInstaller = new OpenDesignComponentInstaller({
+      manifest,
+      componentsRoot: tmpDir('a24-od-root-override-https-'),
+      env: { [ENV]: base },
+    }, httpsHop)
+    const httpsResult = await httpsInstaller.install()
+    expect(httpsResult.state).toBe('failed')
+    expect(httpsResult.error).toContain('not allow-listed')
+    expect(fileServer.requestCount()).toBe(0)
+  })
+
+  it('does not apply the loopback override to a later hop that stays on that origin', async () => {
+    const asset = 'open-design-test.tar.gz'
+    const stage = seedTreeFor('a24-od-stage-override-same-origin-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath, { url: `https://github.com/iDoris-ai/Agent24/releases/download/v9.9.9/${asset}` })
+    let payloadHits = 0
+    const server = http.createServer((req, res) => {
+      const pathname = decodeURIComponent(new URL(req.url ?? '/', 'http://127.0.0.1').pathname)
+      if (pathname === `/payload/${asset}`) {
+        payloadHits += 1
+        const body = fs.readFileSync(tarPath)
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': String(body.length) })
+        res.end(body)
+        return
+      }
+      if (pathname !== `/${asset}`) {
+        res.writeHead(404)
+        res.end()
+        return
+      }
+      res.writeHead(302, { Location: `/payload/${asset}` })
+      res.end()
+    })
+    servers.push(server)
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address() as AddressInfo
+    const installer = new OpenDesignComponentInstaller({
+      manifest,
+      componentsRoot: tmpDir('a24-od-root-override-same-origin-'),
+      env: { [ENV]: `http://127.0.0.1:${port}/` },
+    })
+    const result = await installer.install()
+    expect(result.state).toBe('failed')
+    expect(result.error).toContain('first hop')
+    expect(result.error).toContain(`http://127.0.0.1:${port}/payload/${asset}`)
+    expect(payloadHits).toBe(0)
+  })
+
+  it('without the override a plain-http manifest URL is still refused', async () => {
+    const stage = seedTreeFor('a24-od-stage-noverride-')
+    const tarPath = buildTarball(stage)
+    const server = await startServer(tarPath)
+    const { manifest } = manifestFor(tarPath, { url: server.url })
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot: tmpDir('a24-od-root-noverride-'), env: {} })
+    const result = await installer.install()
+    expect(result.state).toBe('failed')
+    expect(server.requestCount()).toBe(0)
+  })
+})
+
+describe('extracted component entries', () => {
+  it('rejects hardlinks and non-regular files, and leaves directories and symlinks to the other checks', async () => {
+    const root = tmpDir('a24-od-irregular-')
+    fs.mkdirSync(path.join(root, 'sub'))
+    fs.writeFileSync(path.join(root, 'sub', 'plain.txt'), 'ok')
+    fs.symlinkSync('plain.txt', path.join(root, 'sub', 'link.txt'))
+    expect(() => assertExtractedEntriesAreRegular(root)).not.toThrow()
+
+    const file = path.join(root, 'sub', 'a.txt')
+    fs.writeFileSync(file, 'x')
+    fs.linkSync(file, path.join(root, 'sub', 'b.txt'))
+    expect(() => assertExtractedEntriesAreRegular(root)).toThrow(/hardlink/)
+    fs.unlinkSync(path.join(root, 'sub', 'b.txt'))
+    fs.unlinkSync(file)
+
+    const fifo = path.join(root, 'sub', 'pipe')
+    execFileSync('mkfifo', [fifo])
+    expect(() => assertExtractedEntriesAreRegular(root)).toThrow(/non-regular/)
+    fs.unlinkSync(fifo)
+
+    const sockPath = path.join(root, 'sub', 's.sock')
+    const sock = net.createServer()
+    await new Promise<void>((resolve) => sock.listen(sockPath, resolve))
+    try {
+      expect(() => assertExtractedEntriesAreRegular(root)).toThrow(/non-regular/)
+    } finally {
+      await new Promise((resolve) => sock.close(resolve))
+    }
+  })
+
+  it('install() rejects a tarball that extracts a hardlink or a fifo', async () => {
+    const hardlinkStage = seedTreeFor('a24-od-stage-hardlink-')
+    const payload = path.join(hardlinkStage, 'app', 'payload.txt')
+    fs.writeFileSync(payload, 'same-bytes')
+    fs.linkSync(payload, path.join(hardlinkStage, 'app', 'payload-link.txt'))
+    expect(fs.statSync(payload).nlink).toBeGreaterThan(1)
+    const hardlinkTar = buildTarball(hardlinkStage)
+    const hardlinkManifest = manifestFor(hardlinkTar).manifest
+    const hardlinkServer = await startServer(hardlinkTar)
+    hardlinkManifest.url = httpsManifestUrl(hardlinkServer.url)
+    const hardlinkResult = await new OpenDesignComponentInstaller({
+      manifest: hardlinkManifest,
+      componentsRoot: tmpDir('a24-od-root-hardlink-'),
+      allowedHosts: ['127.0.0.1'],
+    }, localFetch).install()
+    expect(hardlinkResult.state).toBe('failed')
+    expect(hardlinkResult.error).toMatch(/hardlink/)
+
+    const fifoStage = seedTreeFor('a24-od-stage-fifo-')
+    execFileSync('mkfifo', [path.join(fifoStage, 'app', 'pipe')])
+    const fifoTar = buildTarball(fifoStage)
+    const fifoManifest = manifestFor(fifoTar).manifest
+    const fifoServer = await startServer(fifoTar)
+    fifoManifest.url = httpsManifestUrl(fifoServer.url)
+    const fifoResult = await new OpenDesignComponentInstaller({
+      manifest: fifoManifest,
+      componentsRoot: tmpDir('a24-od-root-fifo-'),
+      allowedHosts: ['127.0.0.1'],
+    }, localFetch).install()
+    expect(fifoResult.state).toBe('failed')
+    expect(fifoResult.error).toMatch(/non-regular/)
   })
 })

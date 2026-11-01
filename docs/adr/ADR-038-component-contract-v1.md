@@ -1,5 +1,7 @@
 # ADR-038：组件契约 v1
 
+索引：[架构总入口](../architecture/README.md)・[ADR 索引](README.md)
+
 - 状态：**草案 r3**（2026-11-01）。r2 按 ADR-039 修订：范围扩大到所有运行形态，加入签名验证，加入组件清单；r3 按 Fable 评审修订，见下方修订记录
 - 上位：[ADR-039 概念模型](ADR-039-concept-model.md)。按 ADR-039 的定义，组件是**能力**（Capability）的安装包；对用户只讲能力，不讲组件
 - 依据：[可进化性评估最终版](../architecture/EVOLVABILITY-ASSESSMENT-2026-11-01.md) 建议第 2 条

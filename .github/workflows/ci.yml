@@ -56,6 +56,16 @@ jobs:
       - name: Test
         run: pnpm test
 
+      # node:test scripts are not part of `pnpm test`. Signing cases that need
+      # a real `codesign` skip themselves off darwin; the macOS job below runs
+      # the same file so those cases actually execute.
+      - name: Open Design component script tests
+        working-directory: apps/desktop
+        run: |
+          pnpm test:pack-open-design
+          pnpm test:stage-open-design
+          pnpm test:open-design-mac-release
+
   rust:
     name: Rust (fmt + clippy + test)
     needs: hyphae-linux-x64
@@ -177,6 +187,19 @@ jobs:
       - name: Real Hyphae unlock
         working-directory: rust
         run: cargo test -p agent24-comm --test unlock_real_binary -- --ignored --nocapture
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
+        with:
+          node-version: '22'
+          # v5 auto-enables pnpm caching from package.json's packageManager,
+          # but this job doesn't install pnpm; the signing test needs only node.
+          package-manager-cache: false
+
+      # Real codesign (dylib/node without entitlements, runtime flag, verify).
+      # Ad-hoc Team ID injection is covered by the Linux script-test step.
+      - name: Open Design macOS signing tests
+        run: node --test apps/desktop/scripts/open-design-mac-release.test.mjs
 
   contract:
     name: Contract Tests + Codegen Drift

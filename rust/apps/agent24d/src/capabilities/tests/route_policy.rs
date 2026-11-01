@@ -94,6 +94,25 @@ fn section_3_rows_match_operation_and_level() {
     // I-1 splits the read-only status and operation progress out as
     // everyday `IdorisRead`; every mutation stays elevated.
     for (method, path, operation, level) in [
+        // CORE-5f-2: docked-router diagnostics (design CORE-5 D6), daily level.
+        (
+            "GET",
+            "/diagnostics/migration",
+            "DiagnosticRead",
+            AssuranceLevel::Everyday,
+        ),
+        (
+            "GET",
+            "/diagnostics/migration/snapshots",
+            "DiagnosticRead",
+            AssuranceLevel::Everyday,
+        ),
+        (
+            "GET",
+            "/diagnostics/migration/space",
+            "DiagnosticRead",
+            AssuranceLevel::Everyday,
+        ),
         (
             "GET",
             "/idoris/status",

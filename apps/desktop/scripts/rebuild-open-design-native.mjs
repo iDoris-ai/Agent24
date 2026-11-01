@@ -5,8 +5,9 @@ import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 
+import { checkOpenDesignSource } from './open-design-mac-release.mjs'
+
 const execFileAsync = promisify(execFile)
-const OPEN_DESIGN_SHA = '34bc2ba810cf894daff6a7c1736d1cef6c7726b1'
 const BETTER_SQLITE3_VERSION = '12.10.0'
 const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 const desktopRoot = path.resolve(scriptDir, '..')
@@ -42,16 +43,15 @@ async function run(command, args, options = {}) {
   })
 }
 
-async function resolveNativeSource() {
+function resolveNativeSource() {
   const sourceRootValue = process.env.A24_OPEN_DESIGN_SOURCE_DIR?.trim()
   if (!sourceRootValue || !path.isAbsolute(sourceRootValue)) {
     throw new Error('A24_OPEN_DESIGN_SOURCE_DIR must be an absolute exact Open Design checkout path')
   }
   const sourceRoot = fs.realpathSync(sourceRootValue)
-  const { stdout: sourceSha } = await run('git', ['rev-parse', 'HEAD'], { cwd: sourceRoot })
-  if (sourceSha.trim() !== OPEN_DESIGN_SHA) {
-    throw new Error(`Open Design native source must be exact ${OPEN_DESIGN_SHA}`)
-  }
+  // Clean porcelain and exact pin. Called before the staged tree is touched,
+  // so a dirty checkout fails even when this script is invoked on its own.
+  checkOpenDesignSource(sourceRoot)
 
   const pnpmRoot = path.join(sourceRoot, 'node_modules', '.pnpm')
   const packageRoot = path.join(
@@ -77,6 +77,7 @@ async function resolveNativeSource() {
 }
 
 export async function rebuildOpenDesignNativeModules() {
+  const nativeSource = resolveNativeSource()
   const packagePath = path.join(stagedAppRoot, 'package.json')
   const sqliteManifest = path.join(stagedAppRoot, 'node_modules', 'better-sqlite3', 'package.json')
   requireFile(packagePath, 'staged Open Design package manifest')
@@ -86,7 +87,6 @@ export async function rebuildOpenDesignNativeModules() {
   if (sqlitePackage.name !== 'better-sqlite3' || sqlitePackage.version !== BETTER_SQLITE3_VERSION) {
     throw new Error('staged Open Design better-sqlite3 package identity changed')
   }
-  const nativeSource = await resolveNativeSource()
 
   const { executable, version } = resolveElectronRuntime()
   const arch = process.env.A24_ELECTRON_ARCH?.trim() || process.arch

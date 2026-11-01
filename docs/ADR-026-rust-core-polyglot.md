@@ -1,5 +1,7 @@
 # ADR-026: Agent24 采用 Rust Core + Polyglot Worker 架构
 
+索引：[架构总入口](architecture/README.md)・[ADR 索引](adr/README.md)
+
 **状态**: ✅ 采纳（2026-08-21 jason 确认）——全仓已按此架构落地：`agent24d` Rust 核心 + `node-daemon` v1 协议参考实现 + `api-client` 生成物均在 main，SPIKE-00 端到端已通
 **日期**: 2026-07-23
 **作者**: jason / Claude Code

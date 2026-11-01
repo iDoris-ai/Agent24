@@ -456,7 +456,7 @@ COMM-3 + COMM-6 → 7
 
 | # | 项 | 处理 |
 |---|---|---|
-| R1 | relay 默认值暂时留空，但 Hyphae 在未配置时会自动回落到 `wss://relay.aastar.io`（实测 `source:"default"`） | `source!="config"` 视为未配置；启动 daemon 时总是显式传 `--relay`。官方 relay 上线后由 Agent24 自己写入默认值 |
+| R1 | relay 默认值暂时留空，但 Hyphae 在未配置时会自动回落到 `wss://relay.aastar.io`（实测 `source:"default"`） | `source!="config"` 视为未配置；启动 daemon 时总是显式传 `--relay`。官方 relay 上线后由 Agent24 自己写入默认值。**2026-11-01 已完成**：Hyphae 自建 relay 上线，#1529 把桌面默认写成 `wss://relay.aastar.io`（Hyphae (AAStar)） |
 | R2 | Windows | Hyphae 在 Windows 上读 `USERPROFILE`；`process_group` / `killpg` 只在 Unix 可用；**#549 的教训：`env_clear` 会让 Windows PowerShell 子进程挂起**，Windows 版的白名单必须补回 `SystemRoot`、`ComSpec`、`PATHEXT`、`USERPROFILE` 等变量，并单独验证。在 DEP-A7 冻结之前，Windows 返回 `unsupported_platform` |
 | R3 | macOS 钥匙串 ACL 与代码签名绑定，未签名的 agent24d 升级后可能再次弹窗 | 在 DEP-B3 之前接受这一点；UI 给出说明 |
 | R4 | A3 发布包只含 `agent24` 和 `agent24d` | HY-1 改为运行时按需下载并校验 Hyphae，不打入 DMG。开发者仍可用 `A24_HYPHAE_BIN` 覆盖 |
