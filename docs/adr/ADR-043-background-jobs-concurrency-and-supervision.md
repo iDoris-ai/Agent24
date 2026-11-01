@@ -1,5 +1,7 @@
 # ADR-043：后台作业、并发与监督回路
 
+索引：[架构总入口](../architecture/README.md)・[ADR 索引](README.md)
+
 - 状态：**提议**（2026-11-01，三步评审终稿，待 jason 拍板）
 - 上位：[ADR-039](ADR-039-concept-model.md) §2.1（本体负责调度）、§3 规则 3（系统不得静默修改技能）；ADR-026 硬约束 2（fail-closed）
 - 相关：ADR-K1-01 §2.4（`pending` 作业句柄契约）；ADR-K1-02 §2.2（后台传播继承来源）；`agent24-agent/src/self_wake.rs`；`agent24-policy/src/guardian.rs`；CORE-5 5f（`/health` 契约）；`docs/design/SHUT-shutdown-observability.md`；[ADR-040](ADR-040-skill-contract-v1.md) D5（提案收件箱）；[ADR-041](ADR-041-inbound-events-admission-and-work-items.md)；[ADR-042](ADR-042-durable-actions-and-reconciliation.md)

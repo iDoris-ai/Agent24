@@ -1,5 +1,7 @@
 # ADR-040：技能契约 v1
 
+索引：[架构总入口](../architecture/README.md)・[ADR 索引](README.md)
+
 - 状态：**提议**（2026-11-01，三步评审终稿，待 jason 拍板）
 - 上位：[ADR-039 概念模型](ADR-039-concept-model.md) §2.3、§3 规则 3、§6
 - 相关：[ADR-038 组件契约 v1](ADR-038-component-contract-v1.md) D8、D9（能力 id、`skills` 占位）；`docs/specs/SPEC-SKILL-DISTRIBUTION.md`（三来源与版本播种，设计定稿未实现）；issue #1037；ADR-K1-03（逐工具授权）；[ADR-041](ADR-041-inbound-events-admission-and-work-items.md)（主动技能的触发来源）

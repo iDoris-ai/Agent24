@@ -269,6 +269,7 @@ agent24 mcp                           # 把 agent24d 自己变成 MCP server —
 
 - [工作站规划](docs/WORKSTATION_PLAN.md) — oMLX API 调研、64GB Mac 模型清单、能力 TODO
 - [决策日志](docs/decision.md) — ADR-001 ~ ADR-030
+- [架构总入口](docs/architecture/README.md) · [ADR 总索引](docs/adr/README.md) — 架构文档与全部 ADR 的导航
 - [实现蓝图](docs/specs/SPEC-MD-ME.md) — M-D 记忆 + M-E 领域 OS · [任务队列](docs/specs/TASKS.md) — loop 的工作来源（**M-D 的状态源是 `SPEC-MD-ME.md` §3，不是这里**）
 
 ## 参考实现
