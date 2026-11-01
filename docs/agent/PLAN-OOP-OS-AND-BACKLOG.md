@@ -94,7 +94,7 @@ data_dir: ~/.agent24/os/sin90/     # 自己管数据,不用内核记忆
 
 ### A. 挡 F5 泡测（外部依赖 / 环境，非本仓代码）
 - **FU-33** 上游 hyphae：发布早于落库的竞态。【实测】本地 minirelay 上 `sent=105 confirmed=2 lost=94`，赢面约 2% → **F5 判据 6 必然失败**。详见下方决策上下文。
-- **FU-38**（2026-11-01 已关闭：2026-11-01 更新：已恢复，现由 Hyphae 自建 relay 提供，Cloudflare Worker + Durable Object；Agent24 #1529 已接为默认，preview .9 起生效）`relay.aastar.io` 下线（HTTP 530，Cloudflare 源站不可达）。【实测】DNS/TCP 正常，正对照 `relay.damus.io` 返回 200。**它是 iDoris 自己的 relay，INTERFACES.md 列为「核心」依赖 —— 下线本身要报上游。**
+- **FU-38**（2026-11-01 已关闭：已恢复，现由 Hyphae 自建 relay 提供，Cloudflare Worker + Durable Object；Agent24 #1529 已接为默认，preview .9 起生效）`relay.aastar.io` 下线（HTTP 530，Cloudflare 源站不可达）。【实测】DNS/TCP 正常，正对照 `relay.damus.io` 返回 200。**它是 iDoris 自己的 relay，INTERFACES.md 列为「核心」依赖 —— 下线本身要报上游。**
 - **FU-34** 上游二进制改名 `agent-speaker` → `hyphae`；`--json` 契约四条已逐条验过没漂移；剩 keystore 非交互解锁（R3）。
 - **FU-39** 两个桥进程抢同一个健康快照文件，症状会把人引向完全错误的诊断。
 
