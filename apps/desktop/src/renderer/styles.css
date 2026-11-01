@@ -172,6 +172,7 @@ button { cursor: pointer; font-family: var(--font); }
 
 /* ── Chat page ── */
 .chat-layout { display: flex; flex-direction: column; height: 100%; }
+.chat-toolbar { display: flex; justify-content: flex-end; padding: 8px 24px 0; }
 .chat-messages { flex: 1; overflow-y: auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 16px; }
 .chat-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--muted); }
 .chat-empty-logo { width: 96px; height: 96px; image-rendering: pixelated; }

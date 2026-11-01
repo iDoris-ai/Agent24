@@ -10,6 +10,9 @@ import {
   type CliToolStatus,
   type CliInstallResult,
   type DocumentsEvent,
+  type KnowledgeConfigureInput,
+  type KnowledgeSettingsResult,
+  type KnowledgeStatus,
   type DocumentsImportProgress,
   type DocumentsRequest,
   type DocumentsResponse,
@@ -50,6 +53,8 @@ const api = {
   approvalDecide: (id: string, decision: ApprovalDecisionInput): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.ApprovalDecide, id, decision),
   /** A1: elevated; main asks the user in a native dialog before sending. */
+  commInstall: (): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.CommInstall),
+
   osModuleSetEnabled: (name: string, enabled: boolean): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.OsModuleSetEnabled, name, enabled),
   /** A-3: elevated; disables/enables AgentEar (the name is fixed in main).
@@ -114,6 +119,14 @@ const api = {
   },
   modelCallSnapshot: (): Promise<ModelCallEnvelope[]> =>
     ipcRenderer.invoke(IpcChannels.ModelCallSnapshot),
+  // Knowledge settings: the key goes in, never comes back (main/knowledge-settings.ts).
+  knowledge: {
+    status: (): Promise<KnowledgeStatus> => ipcRenderer.invoke(IpcChannels.KnowledgeStatus),
+    configure: (input: KnowledgeConfigureInput): Promise<KnowledgeSettingsResult> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeConfigure, input),
+    setEnabled: (enabled: boolean): Promise<KnowledgeSettingsResult> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeSetEnabled, enabled),
+  },
   // ADR-DOC-01 D5: the Documenting OS, by operation, never by path.
   documents: {
     request: <R extends DocumentsRequest>(req: R): Promise<DocumentsResponse<R['op']>> =>

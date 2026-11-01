@@ -91,23 +91,91 @@ fn section_3_rows_match_operation_and_level() {
     });
 
     // IL-03/IL-13 lifecycle routes extend the frozen CORE-2 table.
-    for (method, path) in [
-        ("GET", "/idoris/status"),
-        ("POST", "/idoris/install"),
-        ("POST", "/idoris/connect"),
-        ("GET", "/idoris/omlx/candidates"),
-        ("POST", "/idoris/start"),
-        ("POST", "/idoris/stop"),
-        ("GET", "/idoris/operations/{id}"),
-        ("POST", "/idoris/operations/{id}/cancel"),
+    // I-1 splits the read-only status and operation progress out as
+    // everyday `IdorisRead`; every mutation stays elevated.
+    for (method, path, operation, level) in [
+        // CORE-5f-2: docked-router diagnostics (design CORE-5 D6), daily level.
+        (
+            "GET",
+            "/diagnostics/migration",
+            "DiagnosticRead",
+            AssuranceLevel::Everyday,
+        ),
+        (
+            "GET",
+            "/diagnostics/migration/snapshots",
+            "DiagnosticRead",
+            AssuranceLevel::Everyday,
+        ),
+        (
+            "GET",
+            "/diagnostics/migration/space",
+            "DiagnosticRead",
+            AssuranceLevel::Everyday,
+        ),
+        (
+            "GET",
+            "/idoris/status",
+            "IdorisRead",
+            AssuranceLevel::Everyday,
+        ),
+        (
+            "POST",
+            "/idoris/install",
+            "IdorisLifecycle",
+            AssuranceLevel::Elevated,
+        ),
+        (
+            "POST",
+            "/idoris/connect",
+            "IdorisLifecycle",
+            AssuranceLevel::Elevated,
+        ),
+        (
+            "GET",
+            "/idoris/omlx/candidates",
+            "IdorisLifecycle",
+            AssuranceLevel::Elevated,
+        ),
+        (
+            "POST",
+            "/idoris/start",
+            "IdorisLifecycle",
+            AssuranceLevel::Elevated,
+        ),
+        (
+            "POST",
+            "/idoris/stop",
+            "IdorisLifecycle",
+            AssuranceLevel::Elevated,
+        ),
+        (
+            "GET",
+            "/idoris/operations/{id}",
+            "IdorisRead",
+            AssuranceLevel::Everyday,
+        ),
+        (
+            "POST",
+            "/idoris/operations/{id}/cancel",
+            "IdorisLifecycle",
+            AssuranceLevel::Elevated,
+        ),
     ] {
         fixed.push(DesignRow {
             method: method.into(),
             path: path.into(),
-            operation: "IdorisLifecycle".into(),
-            level: AssuranceLevel::Elevated,
+            operation: operation.into(),
+            level,
         });
     }
+
+    fixed.push(DesignRow {
+        method: "POST".into(),
+        path: "/comm/install".into(),
+        operation: "ComponentInstall".into(),
+        level: AssuranceLevel::Elevated,
+    });
 
     let mut catalog = BTreeSet::new();
     for policy in policies() {

@@ -1188,7 +1188,33 @@ async fn authorize(
                     .get("X-Agent24-Elevation")
                     .map(|v| v.to_str().unwrap_or("").to_owned());
                 if elevated && grant.is_none() {
-                    if method == Method::POST && template == "/api/v1/attached" {
+                    if method == Method::POST
+                        && matches!(
+                            template,
+                            "/api/v1/idoris/install" | "/api/v1/idoris/connect"
+                        )
+                    {
+                        // I-1: the presence summary comes from this body.
+                        let Ok(bytes) = axum::body::to_bytes(
+                            req.into_body(),
+                            agent24_domain::http::MAX_BODY_BYTES,
+                        )
+                        .await
+                        else {
+                            return error_response(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "payload_too_large",
+                                "Request body exceeds limit",
+                            );
+                        };
+                        if let Some(authority) = &state.first_party {
+                            authority.remember_idoris_request(
+                                &authorization.claims.capability_id,
+                                template,
+                                &bytes,
+                            );
+                        }
+                    } else if method == Method::POST && template == "/api/v1/attached" {
                         let bytes = match axum::body::to_bytes(
                             req.into_body(),
                             agent24_domain::http::MAX_BODY_BYTES,
@@ -1219,6 +1245,17 @@ async fn authorize(
                 }
                 if let Some(grant) = grant {
                     let (parts, body) = req.into_parts();
+                    // A grant binds method, path and body; a query string is
+                    // none of those, so the approved text could not describe
+                    // it (`/candidates?endpoint=` would reach another port).
+                    // No CLI request carries one: refuse before consuming.
+                    if parts.uri.query().is_some() {
+                        return error_response(
+                            StatusCode::FORBIDDEN,
+                            "elevation_invalid",
+                            "Elevation grant is invalid",
+                        );
+                    }
                     let bytes = match axum::body::to_bytes(
                         body,
                         agent24_domain::http::MAX_BODY_BYTES,
@@ -2205,6 +2242,15 @@ pub async fn serve(
     tools = tools.with(StdArc::new(agent24_agent::self_wake::SelfWakeTool::new(
         store.clone(),
     )));
+    // #1087 b: the Knowledge tools, offered only to a run that names a
+    // binding. They read the private host interface's registry, which the
+    // state takes over below, so both see the same activations and C.
+    let knowledge_host = StdArc::new(crate::knowledge_host::KnowledgeHostRegistry::default());
+    let knowledge_runs: StdArc<dyn crate::knowledge_backend::RunSelector> =
+        StdArc::new(store.clone());
+    for tool in crate::knowledge_tools::tools(StdArc::clone(&knowledge_host), knowledge_runs) {
+        tools = tools.with(tool);
+    }
     let mcp_servers = match crate::mcp::config_path() {
         Some(path) => match crate::mcp::load_config(&path) {
             Ok(cfg) => {
@@ -2277,6 +2323,7 @@ pub async fn serve(
         mcp_servers,
         packages_root: Arc::clone(&packages_root),
     });
+    state.knowledge_host = knowledge_host;
     state.managed_idoris = managed_idoris;
     state.idoris_host = idoris_host;
     state.idoris_unavailable = idoris_unavailable;
@@ -4014,7 +4061,7 @@ pub(crate) mod tests {
     // COMM routes are mounted by server::serve, outside the scanned builder, so
     // their literals are scanned from the agent24-comm sources instead
     // (`comm_route_literals`); they are covered by the same gate, no exemption.
-    const COMM_ROUTE_SOURCES: [(&str, &str); 2] = [
+    const COMM_ROUTE_SOURCES: [(&str, &str); 3] = [
         (
             include_str!("../../../crates/agent24-comm/src/router.rs"),
             "pub fn router(",
@@ -4023,6 +4070,7 @@ pub(crate) mod tests {
             include_str!("../../../crates/agent24-comm/src/groupchat.rs"),
             "pub(crate) fn routes(",
         ),
+        (include_str!("comm_routes.rs"), "fn runtime_router("),
     ];
 
     /// `.route("<path>"` literals inside the function starting at `anchor`.
@@ -4051,6 +4099,12 @@ pub(crate) mod tests {
 
         let mut routes = BTreeSet::new();
         for path in route_literals(server_source, "pub fn build_router_with_modules") {
+            if let Some(path) = path.strip_prefix("/api/v1") {
+                routes.insert(path.to_owned());
+            }
+        }
+        // CORE-5f-2: the docked router is a second router, scanned the same way.
+        for path in route_literals(include_str!("docked_router.rs"), "pub fn docked_router") {
             if let Some(path) = path.strip_prefix("/api/v1") {
                 routes.insert(path.to_owned());
             }
@@ -4368,6 +4422,55 @@ pub(crate) mod tests {
         state.enable_capability_auth(store);
         state.enable_desktop_presence();
         (state, host_bearer, creative_bearer)
+    }
+
+    #[tokio::test]
+    async fn component_install_requires_host_authority_before_dispatch() {
+        let (state, host, creative) = capability_state().await;
+        let modules = Router::new().route(
+            "/api/v1/comm/install",
+            axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+        );
+        let app = build_router_with_modules(state, modules);
+        for (bearer, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some(creative), StatusCode::FORBIDDEN),
+            (Some(host), StatusCode::NO_CONTENT),
+        ] {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/comm/install");
+            if let Some(bearer) = bearer {
+                req = req.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+            }
+            let res = app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn hot_comm_router_preserves_core2_matched_templates() {
+        let (state, host, _) = capability_state().await;
+        let dir = tempfile::tempdir().unwrap();
+        let slot = Arc::new(crate::comm_routes::CommDaemonSlot::new());
+        let comm = crate::comm_routes::build(dir.path(), Duration::from_millis(500), &slot).await;
+        let app = build_router_with_modules(state, comm);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/comm/identity")
+                    .header(header::AUTHORIZATION, format!("Bearer {host}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(response).await["error"], "not_configured");
     }
 
     #[tokio::test]
@@ -6018,6 +6121,11 @@ pub(crate) mod tests {
         let (state, _host, creative) = capability_state().await;
         let router = router_with_comm(state);
         for policy in crate::capabilities::policies() {
+            // Docked-only routes are not on the business router; the docked
+            // router's own tests cover Creative there.
+            if policy.operation == crate::capabilities::Operation::DiagnosticRead {
+                continue;
+            }
             let path = concrete_path(policy.template);
             let response = router
                 .clone()
@@ -6302,7 +6410,8 @@ pub(crate) mod tests {
     fn router_with_comm(state: AppState) -> Router {
         let modules = Router::new().nest(
             "/api/v1/comm",
-            agent24_comm::router(agent24_comm::CommState::unconfigured("coverage")),
+            agent24_comm::router(agent24_comm::CommState::unconfigured("coverage"))
+                .route("/install", axum::routing::post(attached_probe)),
         );
         build_router_with_modules(state, modules)
     }
@@ -6527,7 +6636,13 @@ pub(crate) mod tests {
     }
 
     fn method_names(expr: &str) -> Vec<&'static str> {
-        const NAMES: &[&str] = &["get", "post", "put", "patch", "delete", "head"];
+        // Every axum method registrar is recognised, so an extra registration
+        // (`.options(..)`, `any(..)`, `on(..)`) shows up as a (method, path) pair
+        // the catalog does not list instead of being skipped.
+        const NAMES: &[&str] = &[
+            "get", "post", "put", "patch", "delete", "head", "options", "trace", "connect", "any",
+            "on",
+        ];
         let mut found = Vec::new();
         let mut index = 0;
         let mut boundary = true;
@@ -6838,6 +6953,24 @@ pub(crate) mod tests {
             reason: "comm 前缀挂载点；方法清单在 agent24-comm::router，由目录扫描覆盖",
         },
         AllowedRegistration {
+            file: "apps/agent24d/src/comm_routes.rs",
+            form: "route_layer",
+            call: ".route_layer(middleware::from_fn_with_state(",
+            reason: "保留固定路由模板，仅将请求转发到热切换后的通信实例",
+        },
+        AllowedRegistration {
+            file: "apps/agent24d/src/comm_routes.rs",
+            form: "nest",
+            call: ".nest(\"/api/v1/comm\", routes)",
+            reason: "热切换 comm 前缀挂载；runtime_router 的方法清单由目录扫描覆盖",
+        },
+        AllowedRegistration {
+            file: "apps/agent24d/src/docked_router.rs",
+            form: "fallback",
+            call: ".fallback(not_found)",
+            reason: "停靠 router 的 404：未登记路径一律 not_found，不进 Operation 目录",
+        },
+        AllowedRegistration {
             file: "apps/agent24d/src/domain.rs",
             form: "nest",
             call: "app.nest(namespace, Router::new().fallback(handler.clone()))",
@@ -6920,6 +7053,8 @@ pub(crate) mod tests {
             "apps/agent24d/src/server.rs" => "pub fn build_router_with_modules",
             "crates/agent24-comm/src/router.rs" => "pub fn router(",
             "crates/agent24-comm/src/groupchat.rs" => "pub(crate) fn routes(",
+            "apps/agent24d/src/comm_routes.rs" => "fn runtime_router(",
+            "apps/agent24d/src/docked_router.rs" => "pub fn docked_router",
             _ => return None,
         };
         Some(function_span(src, signature))
@@ -7090,6 +7225,11 @@ pub fn build_router_with_modules() {
             "pub(crate) fn routes(",
             "/api/v1/comm",
         ));
+        comm.extend(parsed_routes(
+            source_of(&files, "apps/agent24d/src/comm_routes.rs"),
+            "fn runtime_router(",
+            "/api/v1/comm",
+        ));
         let violations = registration_violations(&files);
         assert!(
             violations.is_empty(),
@@ -7109,6 +7249,15 @@ pub fn build_router_with_modules() {
 
         let mut registered = kernel.clone();
         registered.extend(comm.iter().cloned());
+        // CORE-5f-2: docked-only routes are catalogued but not mounted on the
+        // business router, so they join the catalog comparison, not the 405 sweep.
+        let docked = parsed_routes(
+            source_of(&files, "apps/agent24d/src/docked_router.rs"),
+            "pub fn docked_router",
+            "",
+        );
+        let business = registered.clone();
+        registered.extend(docked.iter().cloned());
         let catalog = crate::capabilities::policies()
             .iter()
             .map(|policy| (policy.method.to_owned(), policy.template.to_owned()))
@@ -7133,7 +7282,7 @@ pub fn build_router_with_modules() {
         let router = router_with_comm(state);
         let trace = Method::from_bytes(b"TRACE").unwrap();
         let mut templates = BTreeSet::new();
-        for (_, template) in &registered {
+        for (_, template) in &business {
             templates.insert(template.clone());
         }
         for template in templates {
@@ -7164,7 +7313,7 @@ pub fn build_router_with_modules() {
                 .split(',')
                 .map(|part| part.trim().to_owned())
                 .collect::<BTreeSet<_>>();
-            let mut expect = registered
+            let mut expect = business
                 .iter()
                 .filter(|(_, path)| path == &template)
                 .map(|(method_name, _)| method_name.clone())

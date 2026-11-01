@@ -22,6 +22,8 @@ mod capabilities;
 mod comm_routes;
 mod consent_routes;
 mod decide_routes;
+#[allow(dead_code, reason = "CORE-5f-2 docked router stays unwired until 5f-3")]
+mod docked_router;
 mod domain;
 #[allow(dead_code, reason = "frozen CORE-2 slice seam; wired by S1/S2")]
 mod enroll_api;
@@ -39,10 +41,13 @@ mod grant_expiry;
 mod hardware;
 #[cfg(unix)]
 mod host_bootstrap;
+mod hyphae_install;
 mod idoris_routes;
+mod knowledge_backend;
 mod knowledge_host;
 #[allow(dead_code)] // Wired at start (KB-C1-04 6c-4) and by the private interface (6d-2).
 mod knowledge_store;
+mod knowledge_tools;
 #[cfg(not(unix))]
 mod host_bootstrap {
     #![allow(

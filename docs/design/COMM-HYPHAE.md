@@ -148,7 +148,12 @@ pub fn router(state: CommState) -> axum::Router;
 ```
 
 规则：
-- **路径**：解析顺序为 `A24_HYPHAE_BIN` → `A24_SPEAKER_BIN`（兼容，打 warn）→ agent24d 同目录下的 `hyphae`。不查 PATH，相对路径直接拒绝。
+- **路径**：解析顺序为 `A24_HYPHAE_BIN` → `A24_SPEAKER_BIN`（兼容，打 warn）→ `<state_dir>/components/hyphae/<tag>/hyphae` → agent24d 同目录下的 `hyphae`。不查 PATH，相对路径直接拒绝。组件目录中的文件每次解析都按 lock 的完整 SHA-256 重验。组件被篡改时返回 `binary_rejected`，不回退到同目录程序。
+- **按需安装（HY-1）**：桌面通信页通过“下载并设置”按钮安装，用户无需设置环境变量。安装可执行文件属于提升级操作，桌面使用专用 IPC 和原生确认框。CLI 入口为 `agent24 comm install`，`--json` 输出 `{installed_version,path,restart_required,reason}`。进度写入 stderr，JSON 模式关闭进度输出。
+- **发布信息**：Agent24 自有的 `rust/crates/agent24-comm/hyphae.release.json` 给出 tag `v0.27.2`、GitHub 下载地址与平台资产名。SHA-256 只取自逐字保留的上游 `hyphae.lock.json`。只有 darwin-arm64 和 linux-x64 有可安装资产，lock 中 hash 为 null 的平台不可安装。DMG 不包含 Hyphae，运行时下载避免重签改变 hash。
+- **下载安装流程**：`POST /api/v1/comm/install` 使用 `agent24-components::fetch_verified` 下载，通过 HTTPS、逐跳主机白名单、大小和超时限制、流式 SHA-256 校验后，调用 `VerifiedBinary::install`。下载器薄转发到 main 的 `agent24-idoris::download_locked_asset`，保留安装互斥、同 fd 校验、取消和 watch 进度。缓存位于 `<state_dir>/idoris/component-cache/hyphae`，使用私有的 `.part` 和 `.verified` 文件，与 iDoris 安装共用操作锁，命中缓存仍全量重验。安装发布到 `<state_dir>/components/hyphae/v0.27.2/hyphae`，重复安装重验已有文件。
+- **热重建**：下载期间保留现有通信状态。安装完成后等待已进入的通信请求完成，关闭旧 supervisor，并在同一密码存储和通信数据目录上重建路由。daemon 无需重启；重建失败时响应 `restart_required:true` 和原因。`GET /api/v1/comm/daemon` 即使未配置也返回 200，包含 `installable` 和经过 hash 重验的 `installed_version`。安装错误码为 `hyphae_unsupported_platform`、`hyphae_download_failed`、`hyphae_hash_mismatch`。
+- **认证**：复用 main 的 CORE-2 路由策略，在 `capabilities/route_policy.rs` 登记 `ComponentInstall` 与 Elevated 元数据，`operations.rs` 映射 `component.install`；与 `/api/v1/idoris/install` 一样，使用现有宿主权限检查。桌面通过专用 IPC 的原生确认框取得用户确认。
 - **hash**：hash 取自 lock 中当前平台那一项，平台缺项或不一致时 comm 进入 `binary_rejected`，其他路由照常工作。只有 `install` 产出的副本会被执行。
 - **改 keystore 的命令必须走 `run_keystore_write`**（H3）：identity create、identity use、contact add、import。Hyphae `SaveKeyStore` 是读-改-rename，中间不加锁，并发写会丢失新身份的私钥。这把锁只能防住 comm 内部的并发；daemon 不写 keystore；外部进程本来就不应碰专用 HOME（G8）。
 - **超时**：默认 15 s；send 与 `outbox retry` 为 `5 s × relay 数 + 10 s`；`relay info` 为 `--timeout` 加 2 s。超时后对进程组 `killpg`。send 超时时结果未知，按 §5.3 处理，不自动重试。
@@ -454,7 +459,7 @@ COMM-3 + COMM-6 → 7
 | R1 | relay 默认值暂时留空，但 Hyphae 在未配置时会自动回落到 `wss://relay.aastar.io`（实测 `source:"default"`） | `source!="config"` 视为未配置；启动 daemon 时总是显式传 `--relay`。官方 relay 上线后由 Agent24 自己写入默认值 |
 | R2 | Windows | Hyphae 在 Windows 上读 `USERPROFILE`；`process_group` / `killpg` 只在 Unix 可用；**#549 的教训：`env_clear` 会让 Windows PowerShell 子进程挂起**，Windows 版的白名单必须补回 `SystemRoot`、`ComSpec`、`PATHEXT`、`USERPROFILE` 等变量，并单独验证。在 DEP-A7 冻结之前，Windows 返回 `unsupported_platform` |
 | R3 | macOS 钥匙串 ACL 与代码签名绑定，未签名的 agent24d 升级后可能再次弹窗 | 在 DEP-B3 之前接受这一点；UI 给出说明 |
-| R4 | A3 发布包只含 `agent24` 和 `agent24d` | 另起 DEP 任务把 `hyphae` 加进发布包（需修改 A3 的布局断言）；在此之前用 `A24_HYPHAE_BIN` 指定 |
+| R4 | A3 发布包只含 `agent24` 和 `agent24d` | HY-1 改为运行时按需下载并校验 Hyphae，不打入 DMG。开发者仍可用 `A24_HYPHAE_BIN` 覆盖 |
 | R5 | send 超时或进程被杀时，是否已发出无法确定 | 返回 `timeout`；按 §5.3 核对；不自动重试 |
 | R6 | 构建配方的 hash 依赖 Go 的补丁版本 | 配方固定 `GOTOOLCHAIN`；升级 Go 视为修改 lock |
 | G1 | 没有只读的口令验证命令；`change-password` 在 JSON 模式下不接受 stdin | 暂用 `identity create __verify`，放在一次性 HOME 中执行（§4.1）。请 Hyphae 提供 `keystore verify --password-stdin` |

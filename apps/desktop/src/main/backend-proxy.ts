@@ -64,6 +64,9 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('GET', '/api/modules'),
   r('GET', '/api/v1/models'),
   r('POST', '/api/v1/chat', CHAT_TIMEOUT_MS),
+  // A real session for the main chat, so its turns can go to /runs too
+  // (Knowledge on; Everyday in route_policy.rs).
+  r('POST', '/api/v1/sessions'),
   r('GET', '/api/v1/usage'),
   // runs
   r('GET', '/api/v1/runs'),
@@ -94,6 +97,10 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('PUT', '/api/v1/memory/settings'), // [E]
   // communication (Hyphae)
   r('GET', '/api/v1/comm/identity'),
+  r('POST', '/api/v1/comm/identity'), // [E]
+  r('POST', '/api/v1/comm/import'), // [E]
+  r('PUT', '/api/v1/comm/relay'), // [E]
+  r('POST', '/api/v1/comm/relay/probe'), // [E]
   r('GET', '/api/v1/comm/contact'),
   r('GET', '/api/v1/comm/relay'),
   r('GET', '/api/v1/comm/daemon'),
@@ -294,4 +301,20 @@ export function proxyRequest(
 /** Effective deadline for a request that already passed the allowlist. */
 export function timeoutFor(route: ProxyRoute | null): number {
   return route?.timeoutMs ?? PROXY_TIMEOUT_MS
+}
+
+/** The run a renderer creates names the Knowledge binding main says, never
+ * one of its own: on the route `POST /api/v1/runs` matched,
+ * `knowledge_binding_id` is dropped and set to `binding` when there is one
+ * (decision 2026-10-30-main-chat-knowledge-path). A body that is no JSON
+ * object there is refused (null): the daemon would also read a positional
+ * array, binding field included. */
+export function withKnowledgeBinding(route: ProxyRoute, req: BackendProxyRequest, binding: string | null): BackendProxyRequest | null {
+  const body = req.body
+  const creates = route.method === 'POST' && route.template === '/api/v1/runs'
+  if (!creates) return req
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return null
+  const rest = { ...(body as Record<string, unknown>) }
+  delete rest['knowledge_binding_id']
+  return { ...req, body: binding === null ? rest : { ...rest, knowledge_binding_id: binding } }
 }

@@ -772,8 +772,14 @@ fn lifecycle_wire_fixtures_match_serde_and_openapi() {
         let roundtrip = if file == "status" {
             serde_json::to_value(serde_json::from_value::<Status>(value.clone()).unwrap()).unwrap()
         } else {
-            serde_json::to_value(serde_json::from_value::<Operation>(value.clone()).unwrap())
-                .unwrap()
+            // On disk the record keeps its private retry fields; the API
+            // projection drops them (N1).
+            let mut stored = value.clone();
+            stored["idempotency_key"] = json!("idk-private");
+            stored["request_fingerprint"] = json!("f".repeat(64));
+            let op = serde_json::from_value::<Operation>(stored.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&op).unwrap(), stored);
+            serde_json::to_value(op.view()).unwrap()
         };
         assert_eq!(roundtrip, value);
         let validator = jsonschema::options().offline().build(&json!({

@@ -24,7 +24,7 @@ use crate::{
 pub struct SearchQuery {
     pub query: String,
     pub knowledge_base_ids: Option<NonEmpty<String>>,
-    /// The model's, or [`RESULTS_MAX`] when it names none.
+    /// The model's, or [`RESULTS_DEFAULT`] when it names none.
     pub max_results: PositiveInt,
 }
 
@@ -79,7 +79,9 @@ pub trait KnowledgeBackend: Send + Sync {
 pub enum Refused {
     /// Arguments the model may correct.
     Invalid(String),
-    /// Local `cancelled`: it never reaches the model's context (STATE S5.7).
+    /// Local `cancelled`: no evidence of it reaches the model's context
+    /// (STATE S5.7). The daemon's tools turn it into a fixed refusal the
+    /// model may retry.
     Cancelled,
     /// The refusal the model reads.
     Failed(String),
@@ -114,6 +116,10 @@ const QUERY_MAX: usize = 4096;
 const ID_MAX: usize = 256;
 const CURSOR_MAX: usize = 1024;
 const RESULTS_MAX: PositiveInt = PositiveInt::MIN.saturating_add(49);
+/// Hits a search returns when the model names no limit. Fifty hits of
+/// document text overflow a 16K-token local model's context, so the turn
+/// fails; the model can still ask for up to [`RESULTS_MAX`].
+const RESULTS_DEFAULT: PositiveInt = PositiveInt::MIN.saturating_add(9);
 /// Pages a citation read follows for one chunk before it settles for the
 /// first page as current text.
 const PAGES_MAX: usize = 8;
@@ -182,7 +188,7 @@ pub fn parse_search(input: &Map<String, Value>) -> Result<SearchQuery, Refused> 
             Some(ids)
         }
     };
-    let max_results = a.max_results.unwrap_or(RESULTS_MAX);
+    let max_results = a.max_results.unwrap_or(RESULTS_DEFAULT);
     if max_results > RESULTS_MAX {
         return Err(Refused::Invalid(format!(
             "max_results is above {RESULTS_MAX}"

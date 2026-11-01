@@ -354,6 +354,22 @@ describe('App', () => {
       (c) => c[0].path === '/api/v1/chat',
     )?.[0].body.session_id
     expect(secondSessionId).toBe(firstSessionId)
+
+    // Issue #1517: an explicit new chat still works inside the always-mounted
+    // page, and switching pages afterwards keeps the NEW conversation.
+    fireEvent.click(screen.getByRole('button', { name: '新对话' }))
+    expect(screen.queryByText('hello there')).not.toBeInTheDocument()
+    mockBackendProxy.mockClear()
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), { target: { value: 'fresh topic' } })
+    fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('fresh topic')).toBeInTheDocument())
+    const thirdSessionId = mockBackendProxy.mock.calls.find(
+      (c) => c[0].path === '/api/v1/chat',
+    )?.[0].body.session_id
+    expect(thirdSessionId).not.toBe(firstSessionId)
+    fireEvent.click(screen.getByRole('button', { name: '能力中心' }))
+    fireEvent.click(within(screen.getByRole('navigation', { name: '主导航' })).getByRole('button', { name: '助手' }))
+    await waitFor(() => expect(screen.getByText('fresh topic')).toBeVisible())
   })
 })
 
