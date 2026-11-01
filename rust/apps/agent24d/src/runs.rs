@@ -2,17 +2,19 @@
 
 use agent24_agent::AgentError;
 use agent24_core::util::{now_iso8601, ulid};
-use agent24_protocol::{RunCreate, RunStatus, Session, SessionCreate};
+use agent24_protocol::{Run, RunCreate, RunStatus, Session, SessionCreate};
 use agent24_store::{RunAdmissionDenial, StoreError, WorkspaceStoreError};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Extension, Path, State};
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
+use serde::Serialize;
 
 use crate::routes::read_body_or_response;
 
 use crate::capabilities::Authorization;
+use crate::knowledge_tools::{RunKnowledge, run_knowledge};
 use crate::server::{AppState, error_response};
 
 fn map_agent_error(err: AgentError) -> Response {
@@ -191,7 +193,14 @@ pub async fn create_run(
     // executes, so its first Knowledge tool call already finds the pin.
     let binding = match create.knowledge_binding_id.as_deref() {
         None => None,
-        Some(id) => match crate::knowledge_host::bind_run(&state, authorization, id) {
+        Some(id) => match crate::knowledge_host::bind_run(
+            &state,
+            authorization,
+            id,
+            create.session_id.as_deref(),
+        )
+        .await
+        {
             Ok(binding) => Some(binding),
             Err(refused) => return refused.into_response(),
         },
@@ -241,9 +250,28 @@ pub async fn list_runs(State(state): State<AppState>, req: Request<Body>) -> Res
     }
 }
 
+/// A run as `GET /api/v1/runs/{id}` shows it. Only this read says what the
+/// run's Knowledge tools did: in a list it would cost every run's calls.
+#[derive(Serialize)]
+struct RunDetail {
+    #[serde(flatten)]
+    run: Run,
+    /// Null when the run has no Knowledge binding.
+    knowledge: Option<RunKnowledge>,
+}
+
 pub async fn get_run(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     match state.store.get_run(&id).await {
-        Ok(Some(run)) => Json(run).into_response(),
+        Ok(Some(run)) => {
+            let knowledge = match run.input.knowledge_binding_id {
+                None => None,
+                Some(_) => match state.store.list_tool_calls(&run.id).await {
+                    Ok(calls) => Some(run_knowledge(&calls)),
+                    Err(err) => return map_store_error(err),
+                },
+            };
+            Json(RunDetail { run, knowledge }).into_response()
+        }
         Ok(None) => error_response(StatusCode::NOT_FOUND, "not_found", &format!("run {id}")),
         Err(err) => map_store_error(err),
     }

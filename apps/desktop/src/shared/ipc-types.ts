@@ -68,7 +68,31 @@ export const IpcChannels = {
   DocumentsImportProgress: 'documents:import-progress',
   // The OS's job and document events, pushed (ADR-DOC-02 §7; main/documents.ts).
   DocumentsEvent: 'documents:event',
+  // Knowledge settings (main/knowledge-settings.ts): the WeKnora endpoint, the
+  // knowledge bases and the On/Off switch. The key goes in, never comes back.
+  KnowledgeStatus: 'knowledge:status',
+  KnowledgeConfigure: 'knowledge:configure',
+  KnowledgeSetEnabled: 'knowledge:set-enabled',
 } as const
+
+/** What the renderer sees of the Knowledge settings: never the key. */
+export interface KnowledgeStatus {
+  enabled: boolean
+  endpoint: string
+  knowledgeBaseIds: string[]
+  hasKey: boolean
+  /** On, complete and activated in the daemon. */
+  active: boolean
+}
+
+/** The key is optional: left out, the saved one is kept. */
+export interface KnowledgeConfigureInput {
+  endpoint: string
+  knowledgeBaseIds: string[]
+  apiKey?: string
+}
+
+export type KnowledgeSettingsResult = { ok: true } | { ok: false; reason: 'invalid' | 'not_saved' | 'unavailable' }
 
 export type IpcChannel = typeof IpcChannels[keyof typeof IpcChannels]
 

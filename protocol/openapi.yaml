@@ -4793,6 +4793,38 @@ components:
         ended_at:
           type: [string, "null"]
           format: date-time
+        knowledge:
+          oneOf:
+            - $ref: "#/components/schemas/RunKnowledge"
+            - type: "null"
+          description: |
+            Only on `GET /api/v1/runs/{id}`, never in a list. Null when the
+            run has no Knowledge binding. What the run's Knowledge tools did,
+            told from its stored tool calls, never from the answer's text: an
+            answer may name sources the run never read.
+
+    RunKnowledge:
+      type: object
+      required: [searched, read_chunks]
+      properties:
+        searched:
+          type: boolean
+          description: Some `knowledge_search` or `knowledge_read` call of the run completed.
+        read_chunks:
+          type: array
+          description: |
+            Each chunk a completed `knowledge_read` named, in the order first
+            read. Such a read completes only with that chunk of that
+            document, so the run read these back, as a citation or as
+            current text.
+          items:
+            type: object
+            required: [knowledge_id, chunk_id]
+            properties:
+              knowledge_id:
+                type: string
+              chunk_id:
+                type: string
 
     PeerRun:
       type: object

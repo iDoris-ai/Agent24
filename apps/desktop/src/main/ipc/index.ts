@@ -7,7 +7,8 @@ import { execFile, type ChildProcess } from 'node:child_process'
 import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron'
 import { createNavPrefsStore } from '../nav-prefs'
 import { daemonCliEndpoint, daemonConnection, getBackendEndpoint } from '../backend-manager'
-import { findAllowedRoute, proxyError, proxyRequest, timeoutFor } from '../backend-proxy'
+import { findAllowedRoute, proxyError, proxyRequest, timeoutFor, withKnowledgeBinding } from '../backend-proxy'
+import type { KnowledgeController } from '../knowledge-settings'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
 import { mt, setMainLocale, isMainLocale } from '../main-i18n'
 import { readOmlxSettingsKey } from '../omlx-settings-key'
@@ -16,6 +17,8 @@ import { documentsCall } from '../documents'
 import { importFile } from '../documents-import'
 import { IpcChannels } from '../../shared/ipc-types'
 import type {
+  KnowledgeSettingsResult,
+  KnowledgeStatus,
   BackendEndpointResult,
   BackendProxyRequest,
   BackendProxyResponse,
@@ -311,7 +314,10 @@ export function registerIpcHandlers(options: {
   omlxCandidatePorts?: readonly number[]
   /** A3: every handler below is registered through this (sender validation). */
   guard: IpcGuard
+  /** The Knowledge settings, once main has built them. */
+  knowledge?: () => KnowledgeController | null
 }): void {
+  const knowledge = options.knowledge ?? (() => null)
   omlxSettingsPath = options.omlxSettingsPath
   const handle: typeof ipcMain.handle = (channel, listener) => ipcMain.handle(channel, options.guard(listener))
   // oMLX: auto-detect running server
@@ -477,7 +483,26 @@ export function registerIpcHandlers(options: {
     if (!route) {
       return proxyError('forbidden', `${req.method} ${req.path.split('?')[0]} is not available through the renderer proxy`)
     }
-    return proxyToBackend(req, timeoutFor(route))
+    const forwarded = withKnowledgeBinding(route, req, knowledge()?.bindingForRun() ?? null)
+    if (!forwarded) return proxyError('invalid_request', 'A run is created from a JSON object')
+    return proxyToBackend(forwarded, timeoutFor(route))
+  })
+
+  handle(IpcChannels.KnowledgeStatus, (): KnowledgeStatus | null => knowledge()?.status() ?? null)
+  handle(IpcChannels.KnowledgeConfigure, (_event, input: unknown): Promise<KnowledgeSettingsResult> => {
+    const controller = knowledge()
+    if (!controller || typeof input !== 'object' || input === null) {
+      return Promise.resolve({ ok: false, reason: controller ? 'invalid' : 'unavailable' })
+    }
+    const { endpoint, knowledgeBaseIds, apiKey } = input as Record<string, unknown>
+    return controller.configure({ endpoint, knowledgeBaseIds, apiKey })
+  })
+  handle(IpcChannels.KnowledgeSetEnabled, (_event, enabled: unknown): Promise<KnowledgeSettingsResult> => {
+    const controller = knowledge()
+    if (!controller || typeof enabled !== 'boolean') {
+      return Promise.resolve({ ok: false, reason: controller ? 'invalid' : 'unavailable' })
+    }
+    return controller.setEnabled(enabled)
   })
 
   // Executable installation is elevated and must never use the generic proxy.

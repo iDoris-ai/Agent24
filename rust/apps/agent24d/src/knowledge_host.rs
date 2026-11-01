@@ -52,7 +52,13 @@ pub const MAX_BINDINGS_PER_HOST: usize = 1024;
 const MAX_BINDING_ID_BYTES: usize = 256;
 /// Run pins kept; the oldest goes first, and its run is then refused.
 const MAX_PINNED_RUNS: usize = 4096;
+/// Session pins kept. None is ever dropped (see `pin_session`); past this
+/// many, a session not yet pinned is refused until the daemon restarts.
+const MAX_PINNED_SESSIONS: usize = 65_536;
 const MAX_CREDENTIAL_BYTES: usize = 16 * 1024;
+/// Knowledge bases one activation may name.
+pub const MAX_KNOWLEDGE_BASES: usize = 64;
+const MAX_KNOWLEDGE_BASE_ID_CHARS: usize = 256;
 
 /// How the Knowledge service expects C to be presented. `Debug` never prints
 /// the secret.
@@ -80,12 +86,30 @@ pub struct CurrentCredential {
     pub expires_at: UnixSeconds,
 }
 
+/// Where an active binding's requests go and what they may search: the
+/// Knowledge server's API base and the knowledge bases of the binding. Set by
+/// the activation that made the generation, so it cannot change under a run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Endpoint {
+    pub base_url: String,
+    pub knowledge_base_ids: Vec<String>,
+}
+
+/// One active binding as a call sees it, read under one lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindingNow {
+    pub generation: u64,
+    pub endpoint: Option<Endpoint>,
+    pub credential: Option<CurrentCredential>,
+}
+
 #[derive(Clone, Default)]
 struct Entry {
     seq: u64,
     active: bool,
     /// The sequence number of the activation in effect: the generation.
     activated_seq: u64,
+    endpoint: Option<Endpoint>,
     credential: Option<CurrentCredential>,
 }
 
@@ -129,6 +153,8 @@ struct RunPins {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Change {
     /// Also drops the credential: the host pushes C again after activating.
+    /// Leaves the binding without an endpoint; see
+    /// [`KnowledgeHostRegistry::activate`].
     Activate,
     /// Also drops the credential.
     Deactivate,
@@ -151,6 +177,14 @@ pub enum ChangeError {
 pub struct KnowledgeHostRegistry {
     entries: Mutex<HashMap<(String, String), Entry>>,
     runs: Mutex<RunPins>,
+    /// The activation each session's runs were bound to: a session carries
+    /// its Knowledge results into later turns, and the Knowledge tools send
+    /// those back to the binding's endpoint (ADR-K1-02 §2.1.1 item 6), so a
+    /// session never moves to another activation.
+    sessions: Mutex<HashMap<String, RunBinding>>,
+    /// Woken on every change applied, so a call in flight can tell at once
+    /// that its binding moved (`crate::knowledge_backend`).
+    changed: tokio::sync::Notify,
 }
 
 impl KnowledgeHostRegistry {
@@ -166,15 +200,54 @@ impl KnowledgeHostRegistry {
                 Change::Activate => {
                     entry.active = true;
                     entry.activated_seq = seq;
+                    entry.endpoint = None;
                     entry.credential = None;
                 }
                 Change::Deactivate => {
                     entry.active = false;
+                    entry.endpoint = None;
                     entry.credential = None;
                 }
                 Change::RevokeCredential => entry.credential = None,
             }
             Ok(())
+        })
+    }
+
+    /// Activates `binding` with the endpoint its calls use; like
+    /// [`Change::Activate`] otherwise.
+    pub fn activate(
+        &self,
+        host: &str,
+        binding: &str,
+        seq: u64,
+        endpoint: Endpoint,
+    ) -> Result<(), ChangeError> {
+        self.change(host, binding, seq, |entry| {
+            entry.active = true;
+            entry.activated_seq = seq;
+            entry.endpoint = Some(endpoint);
+            entry.credential = None;
+            Ok(())
+        })
+    }
+
+    /// Generation, endpoint and C of `binding` if `host` has it active; an
+    /// expired C reads as none. A missing record or a poisoned lock counts as
+    /// inactive.
+    pub fn binding_now(&self, host: &str, binding: &str, now: UnixSeconds) -> Option<BindingNow> {
+        let entries = self.entries.lock().ok()?;
+        let entry = entries
+            .get(&(host.to_owned(), binding.to_owned()))
+            .filter(|entry| entry.active)?;
+        let credential = entry
+            .credential
+            .clone()
+            .filter(|current| current.expires_at > now);
+        Some(BindingNow {
+            generation: entry.activated_seq,
+            endpoint: entry.endpoint.clone(),
+            credential,
         })
     }
 
@@ -249,7 +322,14 @@ impl KnowledgeHostRegistry {
         apply(&mut entry)?;
         entry.seq = seq;
         entries.insert(key, entry);
+        drop(entries);
+        self.changed.notify_waiters();
         Ok(())
+    }
+
+    /// Woken on every change applied after `notified()` was enabled.
+    pub fn changed(&self) -> &tokio::sync::Notify {
+        &self.changed
     }
 
     /// The generation of `binding` if `host` has it active. A missing record
@@ -271,6 +351,32 @@ impl KnowledgeHostRegistry {
         while runs.order.len() > MAX_PINNED_RUNS {
             if let Some(oldest) = runs.order.pop_front() {
                 runs.pins.remove(&oldest);
+            }
+        }
+    }
+
+    /// Ties `session_id` to `binding`; false when the session's runs were
+    /// already bound to another host, binding or activation. A pin is never
+    /// dropped, so a session without one had no bound run since this daemon
+    /// started and none is still out: its `took_knowledge` (read from the
+    /// store) is then complete, and true means results from an activation
+    /// lost with a restart, so it is refused too. Past the cap, and on a
+    /// poisoned lock, false.
+    pub fn pin_session(
+        &self,
+        session_id: &str,
+        binding: &RunBinding,
+        took_knowledge: bool,
+    ) -> bool {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return false;
+        };
+        match sessions.get(session_id) {
+            Some(pinned) => pinned == binding,
+            None if took_knowledge || sessions.len() >= MAX_PINNED_SESSIONS => false,
+            None => {
+                sessions.insert(session_id.to_owned(), binding.clone());
+                true
             }
         }
     }
@@ -386,6 +492,11 @@ pub enum Refused {
     NotHost,
     Malformed,
     Inactive,
+    /// The session's earlier runs were bound to another activation, or took
+    /// in Knowledge results from one it can no longer tell.
+    SessionRebound,
+    /// The session's tool result origins could not be read.
+    SourcesUnavailable,
 }
 
 impl IntoResponse for Refused {
@@ -401,6 +512,16 @@ impl IntoResponse for Refused {
                 StatusCode::CONFLICT,
                 "knowledge_binding_inactive",
                 "The product host has no active Knowledge binding by that id",
+            ),
+            Self::SessionRebound => error_response(
+                StatusCode::CONFLICT,
+                "knowledge_session_rebound",
+                "This session's runs used another activation of that Knowledge binding; start a new session",
+            ),
+            Self::SourcesUnavailable => error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "source_policy_unavailable",
+                "This session's sources could not be read",
             ),
         }
     }
@@ -426,12 +547,13 @@ fn host_and_seq(
 }
 
 /// Checks a run's `knowledge_binding_id` at creation and returns what to pin
-/// the run to: only the product host may name a binding, and only one it has
-/// active.
-pub fn bind_run(
+/// the run to: only the product host may name a binding, only one it has
+/// active, and in a session only the activation its earlier runs had.
+pub async fn bind_run(
     state: &AppState,
     authorization: Option<Extension<Authorization>>,
     binding_id: &str,
+    session_id: Option<&str>,
 ) -> Result<RunBinding, Refused> {
     let host = host_capability(state, authorization).ok_or(Refused::NotHost)?;
     if !valid_binding_id(binding_id) {
@@ -441,32 +563,86 @@ pub fn bind_run(
         .knowledge_host
         .generation(&host, binding_id)
         .ok_or(Refused::Inactive)?;
-    Ok(RunBinding {
+    let binding = RunBinding {
         host,
         binding: binding_id.to_owned(),
         generation,
-    })
+    };
+    if let Some(session_id) = session_id {
+        // Read before the pin is taken; a run that adds such results has
+        // pinned the session before it executes.
+        let took_knowledge = state
+            .store
+            .session_tool_result_origins(session_id)
+            .await
+            .map_err(|_| Refused::SourcesUnavailable)?
+            .iter()
+            .any(|origin| crate::knowledge_tools::KNOWLEDGE_ORIGINS.contains(&origin.as_str()));
+        if !state
+            .knowledge_host
+            .pin_session(session_id, &binding, took_knowledge)
+        {
+            return Err(Refused::SessionRebound);
+        }
+    }
+    Ok(binding)
 }
 
 /// `PUT /api/v1/host/knowledge/bindings/{binding_id}?seq=n` activates the
-/// binding, `DELETE` of the same deactivates it.
+/// binding, with `{"endpoint", "knowledge_base_ids"}` for its calls or with
+/// no body (then every call is refused); `DELETE` of the same deactivates it.
 pub async fn change(
     State(state): State<AppState>,
     authorization: Option<Extension<Authorization>>,
     method: Method,
     path: Result<Path<String>, PathRejection>,
     query: Result<Query<SeqQuery>, QueryRejection>,
+    req: Request<Body>,
 ) -> Response {
     let (host, binding_id, seq) = match host_and_seq(&state, authorization, path, query) {
         Ok(found) => found,
         Err(refused) => return refused.into_response(),
     };
-    let change = if method == Method::PUT {
-        Change::Activate
-    } else {
-        Change::Deactivate
+    let registry = &state.knowledge_host;
+    if method != Method::PUT {
+        return change_response(registry.apply(&host, &binding_id, seq, Change::Deactivate));
+    }
+    let body = match read_body_or_response(req).await {
+        Ok(body) => body,
+        Err(refused) => return refused,
     };
-    change_response(state.knowledge_host.apply(&host, &binding_id, seq, change))
+    if body.is_empty() {
+        return change_response(registry.apply(&host, &binding_id, seq, Change::Activate));
+    }
+    let Some(endpoint) = endpoint_of(&body) else {
+        return invalid_request();
+    };
+    change_response(registry.activate(&host, &binding_id, seq, endpoint))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivateBody {
+    endpoint: String,
+    knowledge_base_ids: Vec<String>,
+}
+
+/// The activation body `{"endpoint", "knowledge_base_ids"}`: an API base the
+/// HTTP transport accepts (`https`, or `http` to a loopback IP) and 1 to
+/// [`MAX_KNOWLEDGE_BASES`] distinct, non-blank ids.
+fn endpoint_of(body: &[u8]) -> Option<Endpoint> {
+    let body: ActivateBody = serde_json::from_slice(body).ok()?;
+    agent24_knowledge::validate_base_url(&body.endpoint).ok()?;
+    let ids = &body.knowledge_base_ids;
+    let id_ok =
+        |id: &String| !id.trim().is_empty() && id.chars().count() <= MAX_KNOWLEDGE_BASE_ID_CHARS;
+    let distinct = ids.iter().collect::<std::collections::HashSet<_>>().len() == ids.len();
+    let ids_ok = !ids.is_empty() && ids.len() <= MAX_KNOWLEDGE_BASES && distinct;
+    let ok = ids_ok && ids.iter().all(id_ok);
+    ok.then_some(Endpoint {
+        base_url: body.endpoint,
+        knowledge_base_ids: body.knowledge_base_ids,
+    })
 }
 
 /// `DELETE /api/v1/host/knowledge/bindings/{binding_id}/credential?seq=n`
