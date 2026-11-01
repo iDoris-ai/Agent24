@@ -33,7 +33,9 @@ use crate::error::{CommError, map_envelope_failure, map_runner_error, map_store_
 use crate::npub::is_valid_npub;
 use crate::password::Password;
 use crate::password_store::{Account, PasswordStore};
-use crate::runner::{Envelope, ExitClass, HyphaeRunner, Invocation};
+use crate::runner::{
+    Envelope, ExitClass, HyphaeRunner, Invocation, RunnerError, hold_until_reaped,
+};
 
 type CommResult = Result<Json<Value>, CommError>;
 
@@ -355,6 +357,7 @@ async fn create_identity(
 ) -> CommResult {
     let (runner, password_store, home) = state.require_ready()?;
     invalid_if_bad_name("nickname", &req.nickname)?;
+    check_nickname_len(&req.nickname)?;
 
     // Held for the ENTIRE decision+create+promote sequence below, not just
     // around the spawn — two concurrent requests both reading "no keystore
@@ -454,6 +457,12 @@ async fn create_identity(
             ))
         }
         Err(e) => {
+            // A child that could not be confirmed dead may still be writing the
+            // keystore: keep the lock until it is reaped, decide nothing yet.
+            if let RunnerError::StillTerminating(reaped) = &e {
+                hold_until_reaped(guard, reaped.clone());
+                return Err(map_runner_error(e));
+            }
             let outcome = if is_first_identity {
                 Some(resolve_first_identity_failure(home, password_store, &account).await)
             } else {
@@ -654,6 +663,27 @@ pub(crate) fn is_format_control(c: char) -> bool {
         | 0xE0001 | 0xE0020..=0xE007F)
 }
 
+/// The nickname contract for NEW names (create, contact add, restore) and for
+/// export: at most 128 characters and 512 UTF-8 bytes, the same as the desktop.
+/// Existing longer names still list and work for everything except export
+/// (`default` deliberately does not check it); export and restore of such a
+/// name answer `nickname_too_long`.
+pub(crate) const NICKNAME_MAX_CHARS: usize = 128;
+pub(crate) const NICKNAME_MAX_BYTES: usize = 512;
+
+fn check_nickname_len(value: &str) -> Result<(), CommError> {
+    if value.chars().count() > NICKNAME_MAX_CHARS || value.len() > NICKNAME_MAX_BYTES {
+        return Err(CommError::Coded(
+            axum::http::StatusCode::BAD_REQUEST,
+            "nickname_too_long",
+            format!(
+                "a nickname may have at most {NICKNAME_MAX_CHARS} characters ({NICKNAME_MAX_BYTES} bytes)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Identity and contact names end up in Hyphae's line-oriented output and in
 /// argv; a control character (a newline above all) has no legitimate use.
 fn invalid_if_bad_name(field: &'static str, value: &str) -> Result<(), CommError> {
@@ -682,17 +712,20 @@ async fn export_identity(
     let Json(req) = payload.map_err(|_| CommError::Invalid("invalid export request".to_owned()))?;
     let (runner, password_store, home) = state.require_ready()?;
     invalid_if_bad_name("nickname", &req.nickname)?;
+    check_nickname_len(&req.nickname)?;
     invalid_if_blank("path", &req.path)?;
     crate::export::validate_backup_password(&req.backup_password.0)?;
     let dest = PathBuf::from(&req.path);
     // One export at a time: Hyphae's scrypt work, the keychain read and the
     // staged file are heavy and secret-bearing; a second caller is refused.
-    let _single = state.export_gate.try_lock().map_err(|_| {
-        CommError::Conflict(
-            "export_in_progress: another key backup is already running".to_owned(),
-            Some(json!({"reason": "export_in_progress"})),
-        )
-    })?;
+    let single = Arc::clone(&state.export_gate)
+        .try_lock_owned()
+        .map_err(|_| {
+            CommError::Conflict(
+                "export_in_progress: another key backup is already running".to_owned(),
+                Some(json!({"reason": "export_in_progress"})),
+            )
+        })?;
     crate::export::require_feature(runner, crate::export::Feature::Export).await?;
     let staged = crate::export::Staged::begin(&dest, home)?;
 
@@ -708,22 +741,29 @@ async fn export_identity(
         .get(&account)
         .await
         .map_err(map_store_error)?;
-    crate::export::export_identity_backup(
+    let outcome = crate::export::export_identity_backup(
         runner,
         keystore_password,
         &req.nickname,
         &npub,
         &req.backup_password.0,
         staged,
+        single,
     )
     .await?;
     tracing::info!(nickname = %req.nickname, "identity key backup exported");
-    Ok(Json(json!({"ok": true, "data": {
+    // The backup is published and stays published; `warnings` tells the user
+    // about the two things that could not be confirmed afterwards.
+    let mut data = json!({
         "nickname": req.nickname,
         "npub": npub,
         "path": req.path,
         "format": "ncryptsec",
-    }})))
+    });
+    if let Some(warnings) = outcome.warnings_json() {
+        data["warnings"] = warnings;
+    }
+    Ok(Json(json!({"ok": true, "data": data})))
 }
 
 /// `(npub, is_default)` of the identity called `nickname` according to
@@ -795,6 +835,7 @@ async fn import_identity(
         payload.map_err(|_| CommError::Invalid("invalid restore request".to_owned()))?;
     let (runner, password_store, home) = state.require_ready()?;
     invalid_if_bad_name("nickname", &req.nickname)?;
+    check_nickname_len(&req.nickname)?;
     invalid_if_blank("path", &req.path)?;
     crate::export::validate_restore_password(&req.backup_password.0)?;
     let ncryptsec = crate::export::read_backup_file(Path::new(&req.path))?;
@@ -903,6 +944,10 @@ async fn import_identity(
             }
         }
         Err(e) => {
+            if let RunnerError::StillTerminating(reaped) = &e {
+                hold_until_reaped(guard, reaped.clone());
+                return Err(map_runner_error(e));
+            }
             let outcome = if is_first_identity {
                 Some(resolve_first_identity_failure(home, password_store, &account).await)
             } else {
@@ -1042,6 +1087,7 @@ struct ContactAddReq {
 async fn add_contact(State(state): State<CommState>, Json(req): Json<ContactAddReq>) -> CommResult {
     let (runner, ..) = state.require_ready()?;
     invalid_if_bad_name("nickname", &req.nickname)?;
+    check_nickname_len(&req.nickname)?;
     if !is_valid_npub(&req.npub) {
         return Err(CommError::Invalid(format!(
             "{:?} is not a well-formed npub",
@@ -2170,6 +2216,34 @@ echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2
     }
 
     #[tokio::test]
+    async fn export_user_error_from_hyphae_is_explained_as_an_unencrypted_keystore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fake = Fake::new(tmp.path());
+        fake.export_body = "echo '{\"ok\":false,\"error\":\"user_error\",\"message\":\"keystore is not encrypted\"}' >&2; exit 1\n".to_owned();
+        let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
+        let (status, resp) = export_call(
+            router(state),
+            "t1",
+            &tmp.path().join("t1.ncryptsec"),
+            "backup-pass-1",
+        )
+        .await;
+        assert_eq!(
+            (status, resp["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid")),
+            "{resp:?}"
+        );
+        assert!(
+            resp["message"]
+                .as_str()
+                .unwrap()
+                .contains("keystore must be encrypted"),
+            "{resp:?}"
+        );
+        assert!(!tmp.path().join("t1.ncryptsec").exists());
+    }
+
+    #[tokio::test]
     async fn export_validates_the_request_before_running_anything() {
         let tmp = tempfile::tempdir().unwrap();
         let fake = Fake::new(tmp.path());
@@ -2228,6 +2302,58 @@ echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2
             let (s, b) = call(app.clone(), "POST", uri, Some(body)).await;
             assert_eq!(s, StatusCode::BAD_REQUEST, "{uri} {b:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn nicknames_follow_one_length_contract_but_old_long_names_keep_working() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(tmp.path());
+        let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
+        let app = router(state);
+        let file = write_backup(tmp.path());
+        let npub = crate::export::testkit::npub();
+        let long = "x".repeat(129);
+        let max = "y".repeat(128);
+        let wide = "𝔘".repeat(129); // 129 characters, 516 bytes
+        for name in [&long, &wide] {
+            for (uri, body) in [
+                ("/identity", json!({"nickname": name})),
+                ("/contact", json!({"nickname": name, "npub": npub})),
+                (
+                    "/identity/import",
+                    json!({"nickname": name, "path": file, "backup_password": "x"}),
+                ),
+                (
+                    "/identity/export",
+                    json!({"nickname": name, "path": "/tmp/x", "backup_password": "backup-pass-1"}),
+                ),
+            ] {
+                let (s, b) = call(app.clone(), "POST", uri, Some(body)).await;
+                assert_eq!(
+                    (s, b["error"].as_str()),
+                    (StatusCode::BAD_REQUEST, Some("nickname_too_long")),
+                    "{uri} {b:?}"
+                );
+            }
+        }
+        // exactly at the limit passes this check (create then reaches the fake hyphae)
+        let (_, b) = call(
+            app.clone(),
+            "POST",
+            "/identity",
+            Some(json!({"nickname": max})),
+        )
+        .await;
+        assert_ne!(b["error"].as_str(), Some("nickname_too_long"), "{b:?}");
+        // an existing long name can still be made the default
+        let (_, b) = call(
+            app,
+            "POST",
+            "/identity/default",
+            Some(json!({"nickname": long})),
+        )
+        .await;
+        assert_ne!(b["error"].as_str(), Some("nickname_too_long"), "{b:?}");
     }
 
     #[tokio::test]

@@ -112,6 +112,7 @@ export default function CommunicationPage() {
   const [remember, setRemember] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [warnings, setWarnings] = useState<string[]>([])
   const [nickname, setNickname] = useState('')
   const [importOpen, setImportOpen] = useState(false)
   const [importFrom, setImportFrom] = useState('')
@@ -356,10 +357,17 @@ export default function CommunicationPage() {
     setPending('export')
     setActionError(null)
     setNotice(null)
+    setWarnings([])
     try {
       // The backup password is asked for by the main process, not by this page.
       const result = await exportCommIdentity(name)
-      if (mounted.current) setNotice(t('export.done', { path: result.path }))
+      if (mounted.current) {
+        setNotice(t('export.done', { path: result.path }))
+        // The backup is saved either way; these say what could not be confirmed.
+        setWarnings(result.warnings.map((w) => (w.code === 'cleanup_failed'
+          ? t('export.warnCleanup', { path: w.path ?? '' })
+          : t('export.warnDurability'))))
+      }
     } catch (error) {
       // Declining any native step is not an error.
       const cancelled = error instanceof CommApiError && error.code === 'cancelled'
@@ -441,6 +449,7 @@ export default function CommunicationPage() {
       {actionError && <div role="alert" className="comm-alert">{t('error.action', { message: actionError })}</div>}
       {pending === 'install' && <p role="status">{t('action.installing')}</p>}
       {notice && <div role="status" className="comm-notice">{notice}</div>}
+      {warnings.map((warning) => <div key={warning} role="status" className="comm-warning">{warning}</div>)}
 
       {setupState && <section className="comm-card" data-testid="comm-setup" data-state={setupState} aria-label={t('wizard.title')}>
         <h2>{t('wizard.title')}</h2>

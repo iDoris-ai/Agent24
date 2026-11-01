@@ -42,9 +42,13 @@ const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]|(?![\u200c\u200d])\p{C
 /** A display name: 1..max chars, no control characters (a newline would let a
  *  name forge fields in Hyphae's line-oriented output). */
 export function isSafeName(value: unknown, max = 64): value is string {
-  return typeof value === 'string' && value.trim().length > 0 && value.length <= max && !CONTROL.test(value)
+  return typeof value === 'string' && value.trim().length > 0 && [...value].length <= max &&
+    Buffer.byteLength(value, 'utf8') <= NICKNAME_MAX_BYTES && !CONTROL.test(value)
 }
 
+/** The daemon's nickname contract: at most 128 characters (callers may pass a
+ *  smaller limit) and 512 UTF-8 bytes. */
+export const NICKNAME_MAX_BYTES = 512
 export const MAX_MESSAGE_BYTES = 16 * 1024
 export const BACKUP_PASSWORD_MIN = 8
 export const BACKUP_PASSWORD_MAX = 1024

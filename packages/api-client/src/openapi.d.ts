@@ -1508,7 +1508,7 @@ export interface paths {
         };
         /**
          * Hyphae daemon status (process, relay probe, catch-up)
-         * @description Always returns 200 when comm is not configured, with process.state not_configured. data.installable indicates a platform with both release asset and non-null lock hash. data.installed_version is the component tag (v0.28.0) after full hash revalidation, or null when absent or rejected. Developer and sibling binaries do not count as installed components.
+         * @description Always returns 200 when comm is not configured, with process.state not_configured. data.installable indicates a platform with both release asset and non-null lock hash. data.installed_version is the component tag (v0.28.1) after full hash revalidation, or null when absent or rejected. Developer and sibling binaries do not count as installed components.
          */
         get: operations["getCommDaemon"];
         put?: never;
@@ -2105,7 +2105,7 @@ export interface components {
             setup_code?: "unreachable" | "auth_required" | "auth_failed" | "not_omlx" | "model_not_found" | "invalid_endpoint" | "invalid_role" | "out_dir_not_empty" | "validation_failed" | "write_failed" | "invalid_api_key_input";
         };
         CommInstallResult: {
-            /** @example v0.28.0 */
+            /** @example v0.28.1 */
             installed_version: string;
             /** @description Absolute installed component path */
             path: string;
@@ -3457,7 +3457,7 @@ export interface components {
          * @description Closed set (COMM-HYPHAE.md section 4).
          * @enum {string}
          */
-        CommErrorCode: "hyphae_unsupported_platform" | "hyphae_download_failed" | "hyphae_hash_mismatch" | "binary_rejected" | "unsupported_platform" | "locked" | "not_configured" | "invalid" | "not_found" | "confirm_required" | "conflict" | "network" | "partial" | "timeout" | "upstream" | "hyphae_too_old" | "bad_backup_password" | "invalid_key" | "nickname_exists" | "keystore_locked";
+        CommErrorCode: "hyphae_unsupported_platform" | "hyphae_download_failed" | "hyphae_hash_mismatch" | "binary_rejected" | "unsupported_platform" | "locked" | "not_configured" | "invalid" | "not_found" | "confirm_required" | "conflict" | "network" | "partial" | "timeout" | "upstream" | "hyphae_too_old" | "bad_backup_password" | "invalid_key" | "nickname_exists" | "keystore_locked" | "nickname_too_long" | "still_terminating";
         /** @description Hyphae's own failure envelope shape, NOT the kernel `Error`: comm routes answer `{ok:false,error,message,data?}`. */
         CommError: {
             /** @constant */
@@ -6643,7 +6643,7 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": {
-                    /** @description No control characters. */
+                    /** @description No control or invisible formatting characters; at most 128 characters and 512 UTF-8 bytes (`400 nickname_too_long`). */
                     nickname: string;
                     path: string;
                     /** @description Encrypts the backup. At least 8 characters and at most 1024 UTF-8 bytes (the byte limit is enforced by the server), a single line (no CR, LF or NUL) and not whitespace only. Lose it and the backup cannot be restored; it is not stored. */
@@ -6697,7 +6697,7 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": {
-                    /** @description No control characters. */
+                    /** @description No control or invisible formatting characters; at most 128 characters and 512 UTF-8 bytes (`400 nickname_too_long`). */
                     nickname: string;
                     path: string;
                     /** @description The password the backup was made with. A single line (no CR, LF or NUL). */

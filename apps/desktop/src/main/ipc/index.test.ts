@@ -61,6 +61,8 @@ let seen: { method?: string; url?: string; auth?: string; body: string }[] = []
 // PATCH/DELETE /api/v1/attached/agentear.
 let attachedModules: { name: string; attach_status: string }[] = []
 let attachedFailure: { status: number; code: string } | null = null
+// does `GET /api/v1/comm/identity` report a default identity?
+let identityListHasDefault = true
 
 beforeAll(async () => {
   daemon = http.createServer((req, res) => {
@@ -111,7 +113,7 @@ beforeAll(async () => {
           res.end(JSON.stringify({ ok: false, error: 'nickname_exists', message: 'exists' }))
         } else res.end(JSON.stringify({ ok: true, data: { status: 'imported', nickname: 'r1', npub: 'npub1x', default: false } }))
       } else if (req.method === 'GET' && req.url === '/api/v1/comm/identity') {
-        res.end(JSON.stringify({ ok: true, data: [{ nickname: 'alice', npub: 'npub1alice', default: true, encrypted: true }] }))
+        res.end(JSON.stringify({ ok: true, data: [{ nickname: 'alice', npub: 'npub1alice', default: identityListHasDefault, encrypted: true }] }))
       } else if (req.method === 'GET' && req.url === '/api/v1/attached') {
         res.end(JSON.stringify({ modules: attachedModules }))
       } else if (req.url?.startsWith('/api/v1/attached/') && attachedFailure) {
@@ -155,6 +157,7 @@ beforeEach(() => {
   seen = []
   attachedModules = [{ name: 'agentear', attach_status: 'attached' }, { name: 'other', attach_status: 'attached' }]
   attachedFailure = null
+  identityListHasDefault = true
   showMessageBox.mockReset()
   showSaveDialog.mockReset()
   promptBackupPassword.mockReset()
@@ -566,6 +569,47 @@ describe('Restore from backup (CommImportPick / CommIdentityImport)', () => {
     typing('restore-pass-1')
     expect((await call(IpcChannels.CommIdentityImport, second.ticket, 'bob', false)).ok).toBe(true)
     expect(JSON.parse(seen[0]!.body).path).toBe('/Users/x/Downloads/second.ncryptsec')
+  })
+  it('main decides the "will become the default" notice: when asked, OR when there is no default identity yet', async () => {
+    identityListHasDefault = false
+    const { ticket } = await pick()
+    typing('restore-pass-1')
+    await call(IpcChannels.CommIdentityImport, ticket, 'alice', false) // the page did NOT ask for the default
+    expect(promptRestorePassword.mock.calls[0]![2]).toEqual({ willBeDefault: true })
+    identityListHasDefault = true
+    const second = await pick()
+    typing('restore-pass-1')
+    await call(IpcChannels.CommIdentityImport, second.ticket, 'bob', false)
+    expect(promptRestorePassword.mock.calls[1]![2]).toEqual({ willBeDefault: false })
+  })
+  it('retries inside the open window count against the attempt limit', async () => {
+    const { ticket } = await pick()
+    typing('wrong-pass-a', 'wrong-pass-b', 'wrong-pass-c', 'wrong-pass-d')
+    const result = await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)
+    // 1 free submit + 2 retries (3 attempts in all), then the flow is closed with a clear message
+    expect(seen).toHaveLength(3)
+    expect(result.ok).toBe(false)
+    expect(result.data.error.code).toBe('too_many_attempts')
+    expect((await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)).data.error.code).toBe('ticket_expired')
+  })
+  it('a retry inside the open window cannot outlive the ticket expiry', async () => {
+    const t0 = 1_900_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+    try {
+      const { ticket } = await pick()
+      promptRestorePassword.mockImplementation(async (_w: unknown, work: (p: string) => Promise<{ done: boolean; value?: unknown }>) => {
+        const first = await work('wrong-pass-a')
+        if (first.done) return first.value
+        now.mockReturnValue(t0 + 5 * 60_000 + 1) // the user dawdles past the expiry
+        const second = await work('right-pass-1')
+        return second.done ? second.value : null
+      })
+      const result = await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)
+      expect(result.data.error.code).toBe('ticket_expired')
+      expect(seen).toHaveLength(1) // only the first submit reached the daemon
+    } finally {
+      now.mockRestore()
+    }
   })
   it('a ticket is single use after success and unknown tickets are refused without any window', async () => {
     const { ticket } = await pick()

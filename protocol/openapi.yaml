@@ -2719,7 +2719,7 @@ paths:
               required: [nickname, path, backup_password]
               additionalProperties: false
               properties:
-                nickname: { type: string, description: "No control characters." }
+                nickname: { type: string, maxLength: 128, description: "No control or invisible formatting characters; at most 128 characters and 512 UTF-8 bytes (`400 nickname_too_long`)." }
                 path: { type: string }
                 backup_password:
                   type: string
@@ -2793,7 +2793,7 @@ paths:
               required: [nickname, path, backup_password]
               additionalProperties: false
               properties:
-                nickname: { type: string, description: "No control characters." }
+                nickname: { type: string, maxLength: 128, description: "No control or invisible formatting characters; at most 128 characters and 512 UTF-8 bytes (`400 nickname_too_long`)." }
                 path: { type: string }
                 backup_password:
                   type: string
@@ -3156,7 +3156,7 @@ paths:
       description: >-
         Always returns 200 when comm is not configured, with process.state not_configured.
         data.installable indicates a platform with both release asset and non-null lock hash.
-        data.installed_version is the component tag (v0.28.0) after full hash revalidation,
+        data.installed_version is the component tag (v0.28.1) after full hash revalidation,
         or null when absent or rejected. Developer and sibling binaries do not count as installed components.
       responses:
         "200":
@@ -4491,7 +4491,7 @@ components:
       properties:
         installed_version:
           type: string
-          example: v0.28.0
+          example: v0.28.1
         path:
           type: string
           description: Absolute installed component path
@@ -6882,7 +6882,7 @@ components:
     CommErrorCode:
       type: string
       description: Closed set (COMM-HYPHAE.md section 4).
-      enum: [hyphae_unsupported_platform, hyphae_download_failed, hyphae_hash_mismatch, binary_rejected, unsupported_platform, locked, not_configured, invalid, not_found, confirm_required, conflict, network, partial, timeout, upstream, hyphae_too_old, bad_backup_password, invalid_key, nickname_exists, keystore_locked]
+      enum: [hyphae_unsupported_platform, hyphae_download_failed, hyphae_hash_mismatch, binary_rejected, unsupported_platform, locked, not_configured, invalid, not_found, confirm_required, conflict, network, partial, timeout, upstream, hyphae_too_old, bad_backup_password, invalid_key, nickname_exists, keystore_locked, nickname_too_long, still_terminating]
     CommError:
       type: object
       description: >-

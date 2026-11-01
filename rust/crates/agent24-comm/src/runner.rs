@@ -120,6 +120,13 @@ pub enum RunnerError {
     OutputTooLarge,
     #[error("io error: {0}")]
     Io(#[source] io::Error),
+    /// The child was sent SIGKILL but was not confirmed gone within the wait
+    /// window. A background reaper keeps waiting (and killing); the receiver
+    /// turns `true` when the child is finally reaped. Callers that hold a lock
+    /// protecting what the child may still be writing must keep it until then
+    /// ([`hold_until_reaped`]) and must not start a conflicting operation.
+    #[error("hyphae is still terminating")]
+    StillTerminating(tokio::sync::watch::Receiver<bool>),
 }
 
 /// Pure function: parses Hyphae's envelope out of `(exit code, stdout,
@@ -259,13 +266,55 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-/// SIGKILL the child's process group, then wait for the child (bounded) so it
-/// is reaped before the caller proceeds.
-async fn kill_and_reap(child: &mut tokio::process::Child, pid: Option<u32>) {
+/// SIGKILL the child's process group, then wait for the child (bounded).
+/// `true` only if the child was confirmed reaped within `window`.
+async fn kill_and_reap(
+    child: &mut tokio::process::Child,
+    pid: Option<u32>,
+    window: Duration,
+) -> bool {
     if let Some(pid) = pid {
         kill_process_group_best_effort(pid);
     }
-    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    matches!(tokio::time::timeout(window, child.wait()).await, Ok(Ok(_)))
+}
+
+/// The child could not be confirmed reaped in time: hand it to a background
+/// task that keeps killing and waiting until it is really gone, and give the
+/// caller the receiver that says when.
+fn reap_in_background(
+    mut child: tokio::process::Child,
+    pid: Option<u32>,
+) -> tokio::sync::watch::Receiver<bool> {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        loop {
+            if let Some(pid) = pid {
+                kill_process_group_best_effort(pid);
+            }
+            if tokio::time::timeout(Duration::from_secs(1), child.wait())
+                .await
+                .is_ok()
+            {
+                break;
+            }
+        }
+        let _ = tx.send(true);
+    });
+    rx
+}
+
+/// Keep `guard` (a lock over state the unreaped child may still be writing)
+/// until the child is gone; only then release it. No conflicting operation can
+/// start in between.
+pub(crate) fn hold_until_reaped<G: Send + 'static>(
+    guard: G,
+    mut reaped: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let _guard = guard;
+        let _ = reaped.wait_for(|done| *done).await;
+    });
 }
 
 pub(crate) fn kill_process_group_best_effort(pid: u32) {
@@ -331,6 +380,9 @@ pub struct HyphaeRunner {
     home: PathBuf,
     default_timeout: Duration,
     keystore_lock: KeystoreWriteLock,
+    /// How long to wait for a SIGKILLed child before handing it to the
+    /// background reaper (tests shrink it to exercise that path).
+    reap_window: Duration,
 }
 
 impl HyphaeRunner {
@@ -340,6 +392,7 @@ impl HyphaeRunner {
             home,
             default_timeout,
             keystore_lock: KeystoreWriteLock::default(),
+            reap_window: Duration::from_secs(2),
         }
     }
 
@@ -369,6 +422,7 @@ impl HyphaeRunner {
             home,
             default_timeout: self.default_timeout,
             keystore_lock: KeystoreWriteLock::default(),
+            reap_window: Duration::from_secs(2),
         }
     }
 
@@ -428,6 +482,12 @@ impl HyphaeRunner {
     /// Test-only seam: lets tests supply a synthetic parent environment
     /// (e.g. a sentinel variable that must not leak) instead of the real
     /// process environment, without touching `std::env::set_var`.
+    #[cfg(test)]
+    pub(crate) fn with_reap_window(mut self, window: Duration) -> Self {
+        self.reap_window = window;
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn command_with_parent_env(
         &self,
@@ -514,13 +574,21 @@ impl HyphaeRunner {
         let (status, out, err) = match tokio::time::timeout(timeout, io_and_wait).await {
             Ok(Ok(done)) => done,
             Ok(Err(e)) => {
-                if matches!(e, RunnerError::OutputTooLarge) {
-                    kill_and_reap(&mut child, pid).await;
+                if matches!(e, RunnerError::OutputTooLarge)
+                    && !kill_and_reap(&mut child, pid, self.reap_window).await
+                {
+                    return Err(RunnerError::StillTerminating(reap_in_background(
+                        child, pid,
+                    )));
                 }
                 return Err(e);
             }
             Err(_elapsed) => {
-                kill_and_reap(&mut child, pid).await;
+                if !kill_and_reap(&mut child, pid, self.reap_window).await {
+                    return Err(RunnerError::StillTerminating(reap_in_background(
+                        child, pid,
+                    )));
+                }
                 return Err(RunnerError::Timeout(timeout));
             }
         };
@@ -575,8 +643,12 @@ impl HyphaeRunner {
     /// `identity use`, `contact add`, and every step of `import`
     /// (COMM-HYPHAE.md §3).
     pub async fn run_keystore_write(&self, inv: Invocation) -> Result<Envelope, RunnerError> {
-        let _guard = self.keystore_lock.acquire().await;
-        self.run(inv).await
+        let guard = self.keystore_lock.acquire().await;
+        let result = self.run(inv).await;
+        if let Err(RunnerError::StillTerminating(reaped)) = &result {
+            hold_until_reaped(guard, reaped.clone());
+        }
+        result
     }
 }
 
@@ -819,6 +891,79 @@ printf '' > "$HOME/fixture-emitted"
     }
 
     #[tokio::test]
+    async fn a_child_not_reaped_in_time_goes_to_a_background_reaper_that_keeps_the_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        let pidfile = tmp.path().join("pid");
+        let script = format!("#!/bin/sh\necho $$ > \"{}\"\nsleep 30\n", pidfile.display());
+        let bin = install_fixture(tmp.path(), "slow.sh", &script, &tmp.path().join("bin")).await;
+        // a zero wait window: the kill is sent but "confirmed reaped" cannot be
+        // established in time, which is exactly the situation to handle
+        let runner =
+            HyphaeRunner::new(bin, home, Duration::from_secs(5)).with_reap_window(Duration::ZERO);
+        let lock = runner.keystore_lock().clone();
+        let inv = Invocation {
+            args: vec![],
+            password: None,
+            timeout: Some(Duration::from_secs(3)),
+        };
+        let result = {
+            let guard = lock.acquire().await;
+            let result = runner.run(inv).await;
+            if let Err(RunnerError::StillTerminating(rx)) = &result {
+                hold_until_reaped(guard, rx.clone());
+            }
+            result
+        };
+        let Err(RunnerError::StillTerminating(mut reaped)) = result else {
+            // the kill was confirmed within a zero window (possible on a fast
+            // machine): nothing to hold, which is also correct
+            return;
+        };
+        // no new keystore write can start while the child is unreaped...
+        // (the background task releases the lock only after `reaped` turns true)
+        tokio::time::timeout(Duration::from_secs(10), reaped.wait_for(|done| *done))
+            .await
+            .expect("the background reaper must finish")
+            .unwrap();
+        // ...and once it is reaped the lock is free again
+        let again = tokio::time::timeout(Duration::from_secs(5), lock.acquire()).await;
+        assert!(
+            again.is_ok(),
+            "the lock must be released after the child is reaped"
+        );
+        if let Ok(pid) = std::fs::read_to_string(&pidfile) {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .status()
+                .unwrap()
+                .success();
+            assert!(!alive, "reaped means gone");
+        }
+    }
+
+    #[tokio::test]
+    async fn hold_until_reaped_keeps_a_lock_until_the_signal() {
+        let lock = KeystoreWriteLock::default();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        hold_until_reaped(lock.acquire().await, rx);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // still held: acquiring must not complete
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), lock.acquire())
+                .await
+                .is_err()
+        );
+        tx.send(true).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), lock.acquire())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn kill_and_reap_leaves_no_zombie_behind() {
         let mut child = tokio::process::Command::new("/bin/sleep")
             .arg("30")
@@ -827,7 +972,7 @@ printf '' > "$HOME/fixture-emitted"
             .unwrap();
         let pid = child.id();
         let started = std::time::Instant::now();
-        kill_and_reap(&mut child, pid).await;
+        assert!(kill_and_reap(&mut child, pid, Duration::from_secs(5)).await);
         assert!(started.elapsed() < Duration::from_secs(5));
         // reaped: its exit status was already collected, so there is nothing left to wait for
         assert!(child.try_wait().unwrap().is_some());

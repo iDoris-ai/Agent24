@@ -52,7 +52,7 @@ afterEach(() => {
 describe('COMM typed backend API', () => {
   it('installs through the dedicated elevated IPC instead of the generic proxy', async () => {
     const proxy = setProxy(() => { throw new Error('generic proxy must not install executables') })
-    const result = { installed_version: 'v0.28.0', path: '/state/components/hyphae/v0.28.0/hyphae', restart_required: false, reason: null }
+    const result = { installed_version: 'v0.28.1', path: '/state/components/hyphae/v0.28.1/hyphae', restart_required: false, reason: null }
     window.agent24 = { ...window.agent24, commInstall: vi.fn(async () => successful(result)) }
     expect(await installComm()).toEqual(result)
     expect(window.agent24.commInstall).toHaveBeenCalledOnce()
@@ -221,11 +221,24 @@ describe('COMM contact, send, history and export wrappers', () => {
       .mockResolvedValueOnce(successful({ nickname: 'alice', npub: 'npub1a', path: '/p.ncryptsec' }))
       .mockResolvedValueOnce({ ok: false, status: 499, data: { error: { code: 'cancelled', message: 'cancelled' } } })
     window.agent24 = { ...window.agent24, commIdentityExport } as never
-    await expect(exportCommIdentity('alice')).resolves.toEqual({ nickname: 'alice', npub: 'npub1a', path: '/p.ncryptsec' })
+    await expect(exportCommIdentity('alice')).resolves.toEqual({ nickname: 'alice', npub: 'npub1a', path: '/p.ncryptsec', warnings: [] })
     await expect(exportCommIdentity('alice')).rejects.toMatchObject({ code: 'cancelled' })
     expect(commIdentityExport).toHaveBeenCalledTimes(2)
     expect(commIdentityExport.mock.calls.every((c) => c.length === 1 && c[0] === 'alice')).toBe(true)
     expect(proxy).not.toHaveBeenCalled()
+  })
+})
+
+describe('COMM export warnings', () => {
+  it('passes the daemon warnings through and ignores unknown ones', async () => {
+    const commIdentityExport = vi.fn().mockResolvedValue(successful({
+      nickname: 'a', npub: 'n', path: '/p',
+      warnings: [{ code: 'cleanup_failed', path: '/tmp/x' }, { code: 'durability_unconfirmed' }, { code: 'something_new' }, 'junk'],
+    }))
+    window.agent24 = { ...window.agent24, commIdentityExport } as never
+    await expect(exportCommIdentity('a')).resolves.toMatchObject({
+      warnings: [{ code: 'cleanup_failed', path: '/tmp/x' }, { code: 'durability_unconfirmed' }],
+    })
   })
 })
 

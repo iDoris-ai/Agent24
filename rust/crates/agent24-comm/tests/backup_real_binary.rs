@@ -1,9 +1,9 @@
 //! Key backup (`identity export`) and restore (`identity import`) against the
-//! REAL released Hyphae v0.28.0 (the build pinned in `hyphae.lock.json`), and
+//! REAL released Hyphae v0.28.1 (the build pinned in `hyphae.lock.json`), and
 //! `hyphae_too_old` against the previous release v0.27.2. Ignored in normal
 //! runs; every home is an isolated temp dir.
 //!
-//! - `HYPHAE_TEST_BIN`: the released v0.28.0 (checked against the embedded lock).
+//! - `HYPHAE_TEST_BIN`: the released v0.28.1 (checked against the embedded lock).
 //! - `HYPHAE_OLD_BIN`: v0.27.2 (no non-interactive export, no `identity import`).
 //! - `HYPHAE_EXPORT_OUT`: optional directory in which the exported backup
 //!   (password `backup passphrase 1`) is left, for an independent decrypt.
@@ -63,7 +63,7 @@ async fn new_home(source: &Path, lock_pinned: bool, create: Option<&str>) -> Hom
             .unwrap();
         assert_eq!(
             digest, expected,
-            "HYPHAE_TEST_BIN must be the locked v0.28.0 build"
+            "HYPHAE_TEST_BIN must be the locked v0.28.1 build"
         );
     }
     let verified = install(source, digest, tmp.path()).await;
@@ -155,7 +155,7 @@ fn preview_bin() -> PathBuf {
 }
 
 #[tokio::test]
-#[ignore = "requires the locked Hyphae v0.28.0; set HYPHAE_TEST_BIN and pass --ignored"]
+#[ignore = "requires the locked Hyphae v0.28.1; set HYPHAE_TEST_BIN and pass --ignored"]
 async fn export_then_restore_round_trips_through_the_real_binary() {
     let bin = preview_bin();
     let a = new_home(&bin, true, Some("exp")).await;
@@ -302,6 +302,34 @@ async fn export_then_restore_round_trips_through_the_real_binary() {
     let listed = identities(&c).await;
     assert_eq!(listed.len(), 2);
     assert!(listed.contains(&("restored".to_owned(), npub.clone())));
+
+    // v0.28.1: with the keystore password AND the backup password both wrong,
+    // import answers keystore_locked (not bad_backup_password); a wrong keychain
+    // password with the right backup password is keystore_locked too.
+    let wrong_keystore = Password::new(b"not the keystore password".to_vec()).unwrap();
+    let salt = {
+        let keystore: Value =
+            serde_json::from_slice(&std::fs::read(c.home.join(".hyphae/keystore.json")).unwrap())
+                .unwrap();
+        keystore["salt"].as_str().unwrap().to_owned()
+    };
+    c.store
+        .put(&Account::from_salt(&salt), &wrong_keystore)
+        .await
+        .unwrap();
+    for bp in ["wrong passphrase", BACKUP_PW] {
+        let (status, body) = post(
+            &c.app,
+            "/identity/import",
+            json!({"nickname": "other", "path": backup, "backup_password": bp}),
+        )
+        .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::LOCKED, Some("keystore_locked")),
+            "{bp}: {body}"
+        );
+    }
 
     if std::env::var("HYPHAE_EXPORT_OUT").is_err() {
         std::fs::remove_file(&backup).unwrap();

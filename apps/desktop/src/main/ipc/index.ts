@@ -645,7 +645,30 @@ export function registerIpcHandlers(options: {
       }
       pendingBackup = null // consumed: re-armed below only on a non-success
       const win = BrowserWindow.fromWebContents(event.sender)
+      // This flow itself uses one attempt; every further try inside the open
+      // window uses another, so the window cannot be used to bypass the limit
+      // or the expiry.
+      let budget = entry.attemptsLeft - 1
+      let submits = 0
+      // Main decides whether to warn that the restored identity becomes the
+      // default (the page's flag is not trusted for that): it does when the
+      // request asks for it OR the keystore has no default identity.
+      const listed = await proxyToBackend({ method: 'GET', path: '/api/v1/comm/identity' })
+      const known = (listed.data as { data?: unknown } | null)?.data
+      const hasDefault = listed.ok && Array.isArray(known) &&
+        known.some((i) => (i as { default?: unknown } | null)?.default === true)
+      const willBeDefault = makeDefault || (listed.ok && !hasDefault)
       const result = await promptRestorePassword<BackendProxyResponse>(win, async (backupPassword) => {
+        submits += 1
+        if (entry.expires < Date.now()) {
+          return { done: true, value: { ok: false, status: 410, data: { error: { code: 'ticket_expired', message: mt('err.noBackupTicket') } } } }
+        }
+        if (submits > 1) {
+          if (budget <= 0) {
+            return { done: true, value: { ok: false, status: 429, data: { error: { code: 'too_many_attempts', message: mt('err.restoreAttempts') } } } }
+          }
+          budget -= 1
+        }
         const response = await proxyToBackend({
           method: 'POST', path: '/api/v1/comm/identity/import',
           body: { nickname, path: entry.path, backup_password: backupPassword, default: makeDefault },
@@ -658,14 +681,14 @@ export function registerIpcHandlers(options: {
           return { done: false, error: typeof body.message === 'string' ? clip(body.message, 200) : mt('backupPw.restoreInvalid') }
         }
         return { done: true, value: response }
-      }, { willBeDefault: makeDefault })
+      }, { willBeDefault })
       // Not finished (cancelled, or the daemon said no): keep the selection so
       // the user can fix the nickname or try again without re-choosing the file,
       // but only a few times, never past the original expiry, and never over a
       // newer pick.
       const finished = result !== null && result.ok
-      if (!finished && pendingBackup === null && entry.attemptsLeft > 1 && entry.expires > Date.now()) {
-        pendingBackup = { ...entry, attemptsLeft: entry.attemptsLeft - 1 }
+      if (!finished && pendingBackup === null && budget > 0 && entry.expires > Date.now()) {
+        pendingBackup = { ...entry, attemptsLeft: budget }
       }
       return result ?? cancelled()
     }),

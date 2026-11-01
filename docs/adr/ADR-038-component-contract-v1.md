@@ -101,8 +101,8 @@ Agent24 现在交付能力的方式各不相同。其中进程外、独立发版
 {
   "schema": 2,
   "id": "hyphae",
-  "version": "v0.28.0",
-  "source": { "repo": "https://github.com/iDoris-ai/Hyphae", "commit": "2fcf6216…" },
+  "version": "v0.28.1",
+  "source": { "repo": "https://github.com/iDoris-ai/Hyphae", "commit": "44189b8e…" },
   "contract": { "name": "hyphae-cli", "major": 1, "min_minor": 0, "tested": "1.0.0" },
   "release_url_base": "https://github.com/iDoris-ai/Hyphae/releases/download",
   "assets": {

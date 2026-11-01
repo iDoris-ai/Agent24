@@ -51,7 +51,7 @@ describe('CommunicationPage', () => {
     render(<CommunicationPage />)
     vi.mocked(installComm).mockImplementation(async () => {
       success()
-      return { installed_version: 'v0.28.0', path: '/state/components/hyphae/v0.28.0/hyphae', restart_required: false, reason: null }
+      return { installed_version: 'v0.28.1', path: '/state/components/hyphae/v0.28.1/hyphae', restart_required: false, reason: null }
     })
     fireEvent.click(await screen.findByRole('button', { name: '下载并设置' }))
     expect(await screen.findByText('npub1alice')).toBeInTheDocument()
@@ -358,7 +358,7 @@ describe('CommunicationPage usability', () => {
     success()
     vi.mocked(exportCommIdentity)
       .mockRejectedValueOnce(new CommApiError('cancelled', 499, 'cancelled'))
-      .mockResolvedValueOnce({ nickname: 'alice', npub: 'npub1alice', path: '/safe/alice.ncryptsec' })
+      .mockResolvedValueOnce({ nickname: 'alice', npub: 'npub1alice', path: '/safe/alice.ncryptsec', warnings: [] })
     render(<CommunicationPage />)
     const button = await screen.findByRole('button', { name: 'Export private key backup alice' })
     fireEvent.click(button)
@@ -504,5 +504,28 @@ describe('CommunicationPage usability', () => {
     expect(await screen.findByLabelText('Make it the default identity')).toBeChecked()
     fireEvent.click(screen.getByRole('button', { name: 'Restore' }))
     await waitFor(() => expect(restoreCommIdentity).toHaveBeenCalledWith('tk4', 'first', true))
+  })
+
+  it('shows a warning next to the success message when the saved backup has unconfirmed follow-ups', async () => {
+    success()
+    vi.mocked(exportCommIdentity).mockResolvedValueOnce({
+      nickname: 'alice', npub: 'npub1alice', path: '/safe/alice.ncryptsec',
+      warnings: [{ code: 'cleanup_failed', path: '/safe/.agent24-backup-ab12.tmp' }, { code: 'durability_unconfirmed' }],
+    })
+    render(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Export private key backup alice' }))
+    expect(await screen.findByText(/saved to \/safe\/alice\.ncryptsec/)).toBeInTheDocument()
+    expect(screen.getByText(/could not be removed: \/safe\/\.agent24-backup-ab12\.tmp/)).toBeInTheDocument()
+    expect(screen.getByText(/could not yet confirm it is safely on disk/)).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('shows no warning when the export is clean', async () => {
+    success()
+    vi.mocked(exportCommIdentity).mockResolvedValueOnce({ nickname: 'alice', npub: 'npub1alice', path: '/safe/a.ncryptsec', warnings: [] })
+    render(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Export private key backup alice' }))
+    expect(await screen.findByText(/saved to \/safe\/a\.ncryptsec/)).toBeInTheDocument()
+    expect(document.querySelector('.comm-warning')).toBeNull()
   })
 })

@@ -7,7 +7,8 @@
 //!
 //! - **The daemon, not Hyphae, writes the file.** Export is run WITHOUT
 //!   `--out`, so Hyphae returns `{nickname, npub, ncryptsec}` on stdout: that
-//!   is ciphertext, the plaintext key never enters this process. The daemon
+//!   is ciphertext, and Hyphae never prints the plaintext key. (The daemon does
+//!   briefly decrypt the backup itself to verify it, see below.) The daemon
 //!   validates it strictly (bech32 checksum, HRP, payload length, version,
 //!   log_n), proves it opens with the user's backup password and yields the
 //!   identity's npub (so a backup that would not restore is never written),
@@ -22,6 +23,18 @@
 //!   directory descriptor's identity rather than a path string.
 //! - A capability probe: older Hyphae (v0.27.x) lacks the flags, and the answer
 //!   is a clear `hyphae_too_old` instead of a confusing usage error.
+//!
+//! **What is and is not erased.** To prove a backup restores, the daemon
+//! decrypts it once with the user's backup password and derives the public key.
+//! Everything it owns that holds the key or a password (the decrypted key, the
+//! derived key, the normalised password, the stdin and stdout buffers) is
+//! zero-on-drop and allocated at its final size so it never moves. NOT erased:
+//! scrypt 0.12's internal work buffers (its `b`/`v`/`t` vectors), the JSON
+//! request body held by axum/serde, and library-internal copies in
+//! secp256k1/bech32/chacha20poly1305. The crate is not replaced; the exposure
+//! is bounded by disabling core dumps for the daemon and its children (agent24d
+//! `harden_process`) and by the key being resident for milliseconds. Swap is
+//! unaffected.
 //!
 //! Known Hyphae behaviours this relies on or works around: a backup made with
 //! an EMPTY password cannot be imported (our >= 8 character rule prevents it),
@@ -47,17 +60,23 @@ use zeroize::Zeroizing;
 
 use crate::error::{CommError, map_envelope_failure, map_runner_error};
 use crate::password::Password;
-use crate::runner::{Envelope, HyphaeRunner, Invocation};
+use crate::runner::{Envelope, HyphaeRunner, Invocation, RunnerError, hold_until_reaped};
 
 pub(crate) const BACKUP_PASSWORD_MIN_CHARS: usize = 8;
 pub(crate) const BACKUP_PASSWORD_MAX_BYTES: usize = 1024;
 /// A NIP-49 string is ~163 bytes; anything near this is not a backup.
 pub(crate) const BACKUP_FILE_MAX_BYTES: u64 = 4096;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
-/// `{nickname, npub, ncryptsec}` is ~250 bytes. This is the hard size of the
-/// preallocated stdout/stderr buffers, which therefore never reallocate.
+/// Hyphae's `{nickname, npub, ncryptsec}` line is 8 KiB at most. This is the
+/// hard size of the preallocated stdout/stderr buffers, which therefore never
+/// reallocate. It suffices because the nickname contract (<= 512 bytes, no
+/// control or format characters, so at most `"` and `\` need escaping and the
+/// JSON form is <= ~1 KiB) plus the 63-byte npub and the <= 200-byte ncryptsec
+/// come to ~1.4 KiB. A name that is already longer is refused up front
+/// (`nickname_too_long`) rather than failing here.
 const EXPORT_OUTPUT_CAP: usize = 8 * 1024;
-/// NIP-49: version 0x02, log_n <= 19 (scrypt r = 8: 2^19 is ~512 MiB).
+/// NIP-49: version 0x02, 1 <= log_n <= 19 (scrypt r = 8: 2^19 is ~512 MiB;
+/// Hyphae >= 0.28.1 rejects log_n 0 as `invalid_key`, so do we).
 const NIP49_MAX_LOG_N: u8 = 19;
 const NIP49_PAYLOAD_LEN: usize = 91;
 const NCRYPTSEC_MAX_LEN: usize = 200;
@@ -177,6 +196,7 @@ pub(crate) fn validate_ncryptsec(text: &str) -> Result<Vec<u8>, CommError> {
     if hrp.as_str() != "ncryptsec"
         || data.len() != NIP49_PAYLOAD_LEN
         || data[0] != 0x02
+        || data[1] == 0
         || data[1] > NIP49_MAX_LOG_N
         || data[42] > 2
     {
@@ -347,6 +367,32 @@ pub(crate) struct Staged {
 pub(crate) struct Faults {
     pub fail_cleanup: bool,
     pub fail_write: bool,
+    pub fail_dir_sync: bool,
+}
+
+/// A published backup, plus anything that could not be confirmed afterwards.
+/// The target is NEVER rolled back for these: the file is complete and valid.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PublishOutcome {
+    /// The staging link could not be removed: a second link to the same
+    /// ciphertext remains at this path.
+    pub cleanup_failed: Option<PathBuf>,
+    /// The directory could not be fsynced, so the new entry may not survive a
+    /// power loss yet.
+    pub durability_unconfirmed: bool,
+}
+
+impl PublishOutcome {
+    pub(crate) fn warnings_json(&self) -> Option<Value> {
+        let mut out = Vec::new();
+        if let Some(path) = &self.cleanup_failed {
+            out.push(json!({"code": "cleanup_failed", "path": path.display().to_string()}));
+        }
+        if self.durability_unconfirmed {
+            out.push(json!({"code": "durability_unconfirmed"}));
+        }
+        (!out.is_empty()).then_some(Value::Array(out))
+    }
 }
 
 impl Staged {
@@ -416,7 +462,7 @@ impl Staged {
     /// `text` + newline, fsync, publish under the final name with `linkat`
     /// (never replacing anything), remove the staging name and fsync the
     /// directory.
-    pub(crate) fn write_and_publish(self, text: &str) -> Result<(), CommError> {
+    pub(crate) fn write_and_publish(self, text: &str) -> Result<PublishOutcome, CommError> {
         let fd = rustix::fs::openat(
             &self.dest.parent,
             self.staging_name.as_os_str(),
@@ -462,17 +508,22 @@ impl Staged {
             Err(_) => return Err(self.abandon("publishing the backup file failed")),
         }
         // Published and complete; the staging name is now just a second link.
+        // Neither of the two follow-ups below rolls the target back: they are
+        // reported to the caller instead.
+        let mut outcome = PublishOutcome::default();
         if !self.unlink_staging() {
             tracing::warn!(
                 path = %self.staging_path().display(),
                 "backup published but its staging link could not be removed"
             );
+            outcome.cleanup_failed = Some(self.staging_path());
         }
         // Make the new directory entry durable too.
-        if rustix::fs::fsync(&self.dest.parent).is_err() {
+        if self.faults.fail_dir_sync || rustix::fs::fsync(&self.dest.parent).is_err() {
             tracing::warn!("backup published but the directory could not be synced");
+            outcome.durability_unconfirmed = true;
         }
-        Ok(())
+        Ok(outcome)
     }
 }
 
@@ -492,7 +543,8 @@ pub(crate) async fn export_identity_backup(
     expected_npub: &str,
     backup_password: &str,
     staged: Staged,
-) -> Result<(), CommError> {
+    gate: tokio::sync::OwnedMutexGuard<()>,
+) -> Result<PublishOutcome, CommError> {
     check_line_safe(&keystore_password)?;
     let stdin = stdin_lines(&[keystore_password.as_bytes(), backup_password.as_bytes()])?;
     drop(keystore_password);
@@ -524,12 +576,28 @@ pub(crate) async fn export_identity_backup(
         }) => {
             return Err(if message.contains("not found") {
                 CommError::NotFound("identity not found".to_owned())
+            } else if error == "user_error" {
+                // Hyphae >= 0.28.1 answers a `user_error` WITHOUT reading stdin
+                // for an unencrypted keystore (we only ever have an encrypted
+                // one, so this is unexpected) -- say what it means.
+                CommError::Invalid(
+                    "Hyphae refused the export: the keystore must be encrypted for a password-protected backup"
+                        .to_owned(),
+                )
             } else {
                 map_envelope_failure(&error, &message, data)
             });
         }
-        Err(e) => return Err(map_runner_error(e)),
+        Err(e) => {
+            // Hyphae could not be confirmed dead: keep the one-export-at-a-time
+            // gate until it is, so no second export starts meanwhile.
+            if let RunnerError::StillTerminating(reaped) = &e {
+                hold_until_reaped(gate, reaped.clone());
+            }
+            return Err(map_runner_error(e));
+        }
     };
+    drop(gate);
     let ncryptsec = data
         .get("ncryptsec")
         .and_then(Value::as_str)
@@ -669,7 +737,7 @@ pub(crate) fn classify_import_failure(
         "keystore_locked" | "auth_error" => coded(
             StatusCode::LOCKED,
             "keystore_locked",
-            "The keystore password held by Agent24 was rejected (it may have been changed by another program)",
+            "The keystore password held by Agent24 was rejected (it may have been changed by another program). Hyphae also answers this when the backup password is wrong as well",
         ),
         other => ImportFailure::Failed(map_envelope_failure(other, message, data)),
     }
@@ -812,6 +880,7 @@ mod tests {
             ("truncated", reencode(&payload[..90])),
             ("too long", reencode(&[payload.clone(), vec![0]].concat())),
             ("version 1", tweak(0, 1)),
+            ("log_n 0", tweak(1, 0)),
             ("log_n 20", tweak(1, 20)),
             ("key security 3", tweak(42, 3)),
             ("not bech32", "ncryptsec1!!!".to_owned()),
@@ -821,8 +890,9 @@ mod tests {
         ] {
             assert!(validate_ncryptsec(&bad).is_err(), "{name}");
         }
-        // log_n 19 is the allowed ceiling
+        // log_n 1 and 19 are the allowed floor and ceiling
         assert!(validate_ncryptsec(&tweak(1, 19)).is_ok());
+        assert!(validate_ncryptsec(&tweak(1, 1)).is_ok());
     }
 
     #[test]
@@ -932,6 +1002,76 @@ mod tests {
     }
 
     #[test]
+    fn follow_up_failures_after_publishing_are_reported_not_rolled_back() {
+        let (_t, home, out) = sandbox();
+        let published = |name: &str, faults: Faults| {
+            let dest = out.join(name);
+            let staged = Staged::begin_with(&dest, &home, faults).unwrap();
+            let outcome = staged.write_and_publish(SPEC_NCRYPTSEC).unwrap();
+            // the target is complete and stays, whatever the follow-ups did
+            assert_eq!(
+                std::fs::read_to_string(&dest).unwrap(),
+                format!("{SPEC_NCRYPTSEC}\n")
+            );
+            (dest, outcome)
+        };
+
+        let (_, clean) = published("a.ncryptsec", Faults::default());
+        assert_eq!(clean, PublishOutcome::default());
+        assert!(clean.warnings_json().is_none());
+
+        // the staging link cannot be removed: success + cleanup_failed naming the path
+        let (dest, o) = published(
+            "b.ncryptsec",
+            Faults {
+                fail_cleanup: true,
+                ..Faults::default()
+            },
+        );
+        let leftover = o.cleanup_failed.clone().expect("cleanup_failed");
+        assert!(leftover.to_string_lossy().contains(".agent24-backup-"));
+        assert!(
+            leftover.exists(),
+            "the remaining staging link is where the warning says"
+        );
+        assert!(!o.durability_unconfirmed);
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().nlink(),
+            2,
+            "the second link is the staging name"
+        );
+        let w = o.warnings_json().unwrap();
+        assert_eq!(w[0]["code"], "cleanup_failed");
+        assert_eq!(w[0]["path"], leftover.display().to_string().as_str());
+
+        // the directory cannot be fsynced: success + durability_unconfirmed only
+        let (_, o) = published(
+            "c.ncryptsec",
+            Faults {
+                fail_dir_sync: true,
+                ..Faults::default()
+            },
+        );
+        assert!(o.cleanup_failed.is_none() && o.durability_unconfirmed);
+        assert_eq!(
+            o.warnings_json().unwrap()[0]["code"],
+            "durability_unconfirmed"
+        );
+
+        // both at once
+        let (_, o) = published(
+            "d.ncryptsec",
+            Faults {
+                fail_cleanup: true,
+                fail_dir_sync: true,
+                fail_write: false,
+            },
+        );
+        assert!(o.cleanup_failed.is_some() && o.durability_unconfirmed);
+        assert_eq!(o.warnings_json().unwrap().as_array().unwrap().len(), 2);
+    }
+
+    #[test]
     fn an_existing_target_is_refused_up_front_and_never_touched() {
         let (_t, home, out) = sandbox();
         let dest = out.join("d.ncryptsec");
@@ -969,7 +1109,7 @@ mod tests {
             &home,
             Faults {
                 fail_write: true,
-                fail_cleanup: false,
+                ..Faults::default()
             },
         )
         .unwrap();
@@ -988,6 +1128,7 @@ mod tests {
             Faults {
                 fail_write: true,
                 fail_cleanup: true,
+                ..Faults::default()
             },
         )
         .unwrap();

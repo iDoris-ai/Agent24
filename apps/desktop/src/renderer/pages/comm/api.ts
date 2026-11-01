@@ -372,10 +372,27 @@ function toHistoryItems(value: unknown[]): CommHistoryItem[] {
 export const listCommHistory = (limit = 20): Promise<CommHistoryItem[]> =>
   request('GET', `/api/v1/comm/history?limit=${limit}`, (value): value is unknown[] => Array.isArray(value)).then(toHistoryItems)
 
+/** Things that could not be confirmed AFTER the backup was safely published. */
+export interface CommExportWarning {
+  code: 'cleanup_failed' | 'durability_unconfirmed'
+  path?: string
+}
+
 export interface CommExportResult {
   nickname: string
   npub: string
   path: string
+  warnings: CommExportWarning[]
+}
+
+function exportWarnings(value: unknown): CommExportWarning[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((w): CommExportWarning[] => {
+    if (!isRecord(w)) return []
+    if (w['code'] === 'cleanup_failed') return [{ code: 'cleanup_failed', ...(string(w['path']) ? { path: w['path'] } : {}) }]
+    if (w['code'] === 'durability_unconfirmed') return [{ code: 'durability_unconfirmed' }]
+    return []
+  })
 }
 
 /**
@@ -386,8 +403,14 @@ export interface CommExportResult {
  * step rejects with code `cancelled`; an existing file with `target_exists`.
  */
 export const exportCommIdentity = (nickname: string): Promise<CommExportResult> =>
-  viaIpc(() => window.agent24.commIdentityExport(nickname), (value): value is CommExportResult =>
+  viaIpc(() => window.agent24.commIdentityExport(nickname), (value): value is RecordValue =>
     isRecord(value) && string(value['nickname']) && string(value['npub']) && string(value['path']))
+    .then((data) => ({
+      nickname: data['nickname'] as string,
+      npub: data['npub'] as string,
+      path: data['path'] as string,
+      warnings: exportWarnings(data['warnings']),
+    }))
 
 export type CommPickResult = { ticket: string; fileName: string } | null
 
