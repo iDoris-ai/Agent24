@@ -141,7 +141,7 @@ $A24_SPEAKER_BIN history inbox --as agent24 --limit 5 --json
 
 | relay | 结果 |
 |---|---|
-| `wss://relay.aastar.io`（默认，iDoris 自己的） | **下线**。DNS 正常、TCP 443 通、WS 升级返回 **HTTP 530**（Cloudflare 源站不可达） |
+| `wss://relay.aastar.io`（默认，iDoris 自己的） | **下线**（2026-09 实测）。DNS 正常、TCP 443 通、WS 升级返回 **HTTP 530**（Cloudflare 源站不可达）。（2026-11-01 更新：已恢复，现由 Hyphae 自建 relay 提供，Cloudflare Worker + Durable Object；Agent24 #1529 已接为默认，preview .9 起生效） |
 | `wss://relay.damus.io` | 第一次发成功，**接着连发三次全失败**（`503` + `publish: context deadline exceeded`）——限流 |
 | `ws://localhost:7447`（`bin/minirelay`） | ⚠️ **条件不明，与下文的 2% 不同源，不作为推荐依据** —— 见下 |
 
@@ -222,7 +222,7 @@ messages.db 含 canary 的行：      is_incoming=0 → 130 行 ｜ is_incoming=
 |---|---|
 | 公共 relay（damus 等） | 限流 → `degraded` 是 relay 的错 |
 | 本地 minirelay | **竞态几乎必发 → 确认率约 2%,`degraded_transitions` 持续增长,判据 6 必挂** |
-| `relay.aastar.io` | 当前下线 |
+| `relay.aastar.io` | 2026-09 时下线；2026-11-01 已恢复（Hyphae 自建），F5 需按新 relay 重测 |
 | **修上游** | 无失效 —— 见下 |
 
 **唯一干净的解法是修上游**，而它是一行 SQL：`StoreOutgoingMessage` 的 upsert 让 `is_incoming` **单调**，即 `ON CONFLICT ... DO UPDATE SET is_incoming = messages.is_incoming OR excluded.is_incoming`（或者干脆先落库再发布）。FU-33 早就记了这条，今天它从「理论上可能」变成「实测挡住了 F5」。

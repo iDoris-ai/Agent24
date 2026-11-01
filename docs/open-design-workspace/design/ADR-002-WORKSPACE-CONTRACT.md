@@ -1,5 +1,7 @@
 # ADR-002：`a24.workspace.v1`
 
+索引：[架构总入口](../../architecture/README.md)・[ADR 索引](../../adr/README.md)
+
 > 状态：Accepted / P0 frozen
 >
 > 覆盖：A24-OD-01、A24-OD-02

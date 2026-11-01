@@ -1,5 +1,7 @@
 # ADR-039：概念模型——本体、能力、技能
 
+索引：[架构总入口](../architecture/README.md)・[ADR 索引](README.md)
+
 - 状态：**已接受（r2，Fable 评审后修订）**（2026-11-01，jason 认可；r2 落实评审项 H1、H2、H3、M8、M9、M12，见各节）
 - 地位：总纲。之后所有关于扩展、组件、技能的 ADR，都要用本文的概念和名词。
 - 相关：[ADR-038 组件契约 v1](ADR-038-component-contract-v1.md)、[ADR-K1-01 模块工具契约](ADR-K1-01-module-tool-contract.md)、[可进化性评估](../architecture/EVOLVABILITY-ASSESSMENT-2026-11-01.md)
