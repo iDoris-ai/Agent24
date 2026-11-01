@@ -125,3 +125,12 @@ exemptions:
   - operationId: documentsGetExtraction
     category: planned-tui-3
     fallback: "raw-http，TUI-3 增加 agent24 sin90 / documents 子命令"
+  - operationId: getMigrationDiagnostics
+    category: planned-tui-2
+    fallback: "停靠态诊断，CLI 在 5g/T5 接入"
+  - operationId: getMigrationSnapshots
+    category: planned-tui-2
+    fallback: "停靠态诊断，CLI 在 5g/T5 接入"
+  - operationId: getMigrationSpace
+    category: planned-tui-2
+    fallback: "停靠态诊断，CLI 在 5g/T5 接入"

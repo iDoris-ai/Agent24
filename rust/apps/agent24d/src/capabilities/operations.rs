@@ -47,6 +47,8 @@ pub enum Operation {
     // I-1: read-only iDoris lifecycle state (status, operation progress), so
     // an enrolled CLI can poll without a presence prompt per request.
     IdorisRead,
+    // CORE-5f-2: docked-router migration diagnostics (daily level).
+    DiagnosticRead,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,6 +133,7 @@ impl Operation {
             Self::PresenceRead => "presence.read",
             Self::PresenceDecide => "presence.decide",
             Self::IdorisRead => "idoris.read",
+            Self::DiagnosticRead => "diagnostic.read",
         }
     }
 
@@ -178,6 +181,7 @@ impl Operation {
             "presence.read" => Self::PresenceRead,
             "presence.decide" => Self::PresenceDecide,
             "idoris.read" => Self::IdorisRead,
+            "diagnostic.read" => Self::DiagnosticRead,
             "schedule.read" => Self::ScheduleRead,
             "usage.read" => Self::UsageRead,
             "config.read" => Self::ConfigRead,
