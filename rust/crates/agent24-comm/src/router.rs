@@ -34,7 +34,7 @@ use crate::npub::is_valid_npub;
 use crate::password::Password;
 use crate::password_store::{Account, PasswordStore};
 use crate::runner::{
-    Envelope, ExitClass, HyphaeRunner, Invocation, RunnerError, hold_until_reaped,
+    Envelope, ExitClass, HyphaeRunner, Invocation, RunnerError, hold_until_reaped_then,
 };
 
 type CommResult = Result<Json<Value>, CommError>;
@@ -460,7 +460,13 @@ async fn create_identity(
             // A child that could not be confirmed dead may still be writing the
             // keystore: keep the lock until it is reaped, decide nothing yet.
             if let RunnerError::StillTerminating(reaped) = &e {
-                hold_until_reaped(guard, reaped.clone());
+                hold_first_identity_until_reaped(
+                    guard,
+                    reaped.clone(),
+                    state.clone(),
+                    account.clone(),
+                    is_first_identity,
+                );
                 return Err(map_runner_error(e));
             }
             let outcome = if is_first_identity {
@@ -472,6 +478,32 @@ async fn create_identity(
             Err(first_identity_failure_error(outcome, map_runner_error(e)))
         }
     }
+}
+
+/// Restore runs longer than a plain read (Hyphae decrypts with scrypt).
+#[cfg(not(test))]
+const IMPORT_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const IMPORT_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// A first-identity create/restore whose child could not be confirmed dead.
+/// The child may still be writing `keystore.json`, so the keystore lock stays
+/// held until it is reaped, and THEN -- still holding the lock -- the same
+/// reconciliation the normal failure path does runs: `keystore.json` written
+/// -> promote the generated password from `Pending` to its `Salt` account;
+/// not written -> remove `Pending`. Only after that is the lock released.
+fn hold_first_identity_until_reaped(
+    guard: crate::keystore_lock::KeystoreGuard,
+    reaped: tokio::sync::watch::Receiver<bool>,
+    state: CommState,
+    account: Account,
+    is_first_identity: bool,
+) {
+    hold_until_reaped_then(guard, reaped, async move {
+        if is_first_identity && let Ok((_, store, home)) = state.require_ready() {
+            let _ = resolve_first_identity_failure(home, store, &account).await;
+        }
+    });
 }
 
 /// First-identity success path: promote the `Pending` password onto its new
@@ -887,7 +919,7 @@ async fn import_identity(
         .run(Invocation {
             args: argv,
             password: Some(stdin),
-            timeout: Some(Duration::from_secs(60)),
+            timeout: Some(IMPORT_TIMEOUT),
         })
         .await;
 
@@ -945,7 +977,13 @@ async fn import_identity(
         }
         Err(e) => {
             if let RunnerError::StillTerminating(reaped) = &e {
-                hold_until_reaped(guard, reaped.clone());
+                hold_first_identity_until_reaped(
+                    guard,
+                    reaped.clone(),
+                    state.clone(),
+                    account.clone(),
+                    is_first_identity,
+                );
                 return Err(map_runner_error(e));
             }
             let outcome = if is_first_identity {
@@ -2354,6 +2392,137 @@ echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2
         )
         .await;
         assert_ne!(b["error"].as_str(), Some("nickname_too_long"), "{b:?}");
+    }
+
+    /// A runner whose `identity create|import` writes (or not) a keystore and
+    /// then hangs past the timeout, with a zero reap window so the child is
+    /// reported as still terminating.
+    async fn hanging_first_identity(
+        dir: &Path,
+        writes_keystore: bool,
+    ) -> (Router, Arc<HyphaeRunner>, Arc<MemoryPasswordStore>, PathBuf) {
+        let write = if writes_keystore {
+            "mkdir -p \"$HOME/.hyphae\"; echo '{\"salt\":\"c2FsdC1mb3ItdGVzdA==\"}' > \"$HOME/.hyphae/keystore.json\";"
+        } else {
+            ""
+        };
+        let script = format!(
+            "#!/bin/sh\nif [ \"$3\" = \"--help\" ]; then echo \"--ncryptsec-stdin --password-stdin\"; exit 0; fi\n\
+             case \"$1 $2\" in \"identity create\"|\"identity import\") {write} sleep 30;; esac\n"
+        );
+        let home = dir.join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        let bin = install_fixture(dir, "hyphae-fake.sh", &script).await;
+        let runner = Arc::new(
+            HyphaeRunner::new(bin, home.clone(), Duration::from_secs(4))
+                .with_reap_window(Duration::ZERO),
+        );
+        let store = Arc::new(MemoryPasswordStore::new());
+        let app = router(CommState::ready(
+            runner.clone(),
+            store.clone(),
+            home.clone(),
+        ));
+        (app, runner, store, home)
+    }
+
+    async fn settled_keys(runner: &HyphaeRunner, store: &MemoryPasswordStore) -> Vec<String> {
+        // the lock is released only after the child is reaped AND reconciled
+        let guard = tokio::time::timeout(Duration::from_secs(15), runner.keystore_lock().acquire())
+            .await
+            .expect("the keystore lock must be released once the child is reaped");
+        let keys = store.snapshot_keys().await;
+        drop(guard);
+        keys
+    }
+
+    #[tokio::test]
+    async fn first_identity_create_that_is_still_terminating_ends_with_the_password_promoted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, runner, store, _home) = hanging_first_identity(tmp.path(), true).await;
+        let (status, body) = call(
+            app,
+            "POST",
+            "/identity",
+            Some(json!({"nickname": "first", "default": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+        assert_eq!(body["error"], "still_terminating");
+        let salt_key = Account::from_salt("c2FsdC1mb3ItdGVzdA==")
+            .as_key()
+            .to_owned();
+        assert_eq!(
+            settled_keys(&runner, &store).await,
+            vec![salt_key],
+            "Pending promoted to the salt account"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_identity_create_that_is_still_terminating_without_a_keystore_removes_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, runner, store, _home) = hanging_first_identity(tmp.path(), false).await;
+        let (status, body) = call(
+            app,
+            "POST",
+            "/identity",
+            Some(json!({"nickname": "first", "default": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+        assert_eq!(body["error"], "still_terminating");
+        assert!(
+            settled_keys(&runner, &store).await.is_empty(),
+            "no Pending entry may survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_identity_restore_that_is_still_terminating_is_reconciled_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, runner, store, _home) = hanging_first_identity(tmp.path(), true).await;
+        let file = write_backup(tmp.path());
+        let (status, body) = import_call(app, "first", &file, "backup-pass-1", false).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+        assert_eq!(body["error"], "still_terminating");
+        let salt_key = Account::from_salt("c2FsdC1mb3ItdGVzdA==")
+            .as_key()
+            .to_owned();
+        assert_eq!(settled_keys(&runner, &store).await, vec![salt_key]);
+    }
+
+    #[tokio::test]
+    async fn a_second_export_is_refused_while_the_first_is_still_verifying_and_publishing() {
+        use crate::export::testkit::{encrypt_nip49, npub, sk};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fake = Fake::new(tmp.path());
+        // Hyphae answers at once; the daemon's own scrypt check (log_n 18, ~256 MiB)
+        // then runs for a good while: that is the stage the gate must still cover.
+        fake.export_body = Fake::export_json(&npub(), &encrypt_nip49(&sk(), "backup-pass-1", 18));
+        let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
+        let app = router(state);
+        let first = tmp.path().join("one.ncryptsec");
+        let second = tmp.path().join("two.ncryptsec");
+        let running = tokio::spawn({
+            let (app, first) = (app.clone(), first.clone());
+            async move { export_call(app, "t1", &first, "backup-pass-1").await }
+        });
+        // wait until Hyphae has been asked (so the first export is past its run), then ask again
+        for _ in 0..200 {
+            if !fake.calls().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let (status, body) = export_call(app.clone(), "t1", &second, "backup-pass-1").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+        assert_eq!(body["data"]["reason"], "export_in_progress");
+        assert!(!second.exists());
+        let (status, body) = running.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert!(first.exists());
     }
 
     #[tokio::test]

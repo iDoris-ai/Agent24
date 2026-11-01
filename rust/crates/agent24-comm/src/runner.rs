@@ -276,6 +276,11 @@ async fn kill_and_reap(
     if let Some(pid) = pid {
         kill_process_group_best_effort(pid);
     }
+    // A zero window means "do not wait for confirmation" (used by tests to force
+    // the unconfirmed path deterministically).
+    if window.is_zero() {
+        return false;
+    }
     matches!(tokio::time::timeout(window, child.wait()).await, Ok(Ok(_)))
 }
 
@@ -309,11 +314,25 @@ fn reap_in_background(
 /// start in between.
 pub(crate) fn hold_until_reaped<G: Send + 'static>(
     guard: G,
-    mut reaped: tokio::sync::watch::Receiver<bool>,
+    reaped: tokio::sync::watch::Receiver<bool>,
 ) {
+    hold_until_reaped_then(guard, reaped, async {});
+}
+
+/// [`hold_until_reaped`], and once the child is gone but BEFORE the lock is
+/// released, run `then` (e.g. reconcile state the dead child left behind).
+pub(crate) fn hold_until_reaped_then<G, F>(
+    guard: G,
+    mut reaped: tokio::sync::watch::Receiver<bool>,
+    then: F,
+) where
+    G: Send + 'static,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     tokio::spawn(async move {
         let _guard = guard;
         let _ = reaped.wait_for(|done| *done).await;
+        then.await;
     });
 }
 

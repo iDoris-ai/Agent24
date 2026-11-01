@@ -23,6 +23,8 @@ export type BackupPasswordMode = 'export' | 'restore'
 export interface BackupWindowOptions {
   /** Restore mode: tell the user the restored identity will become the default. */
   willBeDefault?: boolean
+  /** Could not find out whether a default identity exists: say it MAY become the default. */
+  mayBeDefault?: boolean
 }
 
 export function backupPasswordHtml(mode: BackupPasswordMode = 'export', options: BackupWindowOptions = {}): string {
@@ -44,7 +46,7 @@ ${mode === 'export' ? `<h1>${t('backupPw.title')}</h1>
 <label>${t('backupPw.repeat')}<input id="p2" type="password" autocomplete="new-password"></label>
 <p class="warn">${t('backupPw.warning')}</p>` : `<h1>${t('backupPw.restoreTitle')}</h1>
 <p class="rules">${t('backupPw.restoreRules')}</p>
-${options.willBeDefault ? `<p class="warn">${t('backupPw.willBeDefault')}</p>` : ''}
+${options.willBeDefault ? `<p class="warn">${t('backupPw.willBeDefault')}</p>` : options.mayBeDefault ? `<p class="warn">${t('backupPw.mayBeDefault')}</p>` : ''}
 <label>${t('backupPw.restorePassword')}<input id="p1" type="password" autocomplete="off" autofocus></label>`}
 <p id="err" role="alert"></p>
 <div class="row"><button type="button" id="cancel">${t('backupPw.cancel')}</button><button type="submit" id="go">${t('backupPw.submit')}</button></div>

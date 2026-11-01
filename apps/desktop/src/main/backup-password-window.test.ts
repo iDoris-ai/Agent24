@@ -225,6 +225,14 @@ describe('restore password window', () => {
     expect(decodeURIComponent(windows.at(-1)!.loadedUrl)).toContain('默认身份')
   })
 
+  it('says the identity MAY become the default when that could not be determined', () => {
+    const html = backupPasswordHtml('restore', { mayBeDefault: true })
+    expect(html).toContain('This identity may become the default identity.')
+    expect(html).not.toContain('will become')
+    // a definite "will" wins over "may"
+    expect(backupPasswordHtml('restore', { willBeDefault: true, mayBeDefault: true })).toContain('will become the default')
+  })
+
   it('ignores close and cancel while the daemon call is in flight, and says to wait', async () => {
     let release!: () => void
     const result = promptRestorePassword(null, () => new Promise((resolve) => { release = () => resolve({ done: true, value: 'finished' }) }))

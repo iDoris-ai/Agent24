@@ -31,10 +31,11 @@
 //! zero-on-drop and allocated at its final size so it never moves. NOT erased:
 //! scrypt 0.12's internal work buffers (its `b`/`v`/`t` vectors), the JSON
 //! request body held by axum/serde, and library-internal copies in
-//! secp256k1/bech32/chacha20poly1305. The crate is not replaced; the exposure
-//! is bounded by disabling core dumps for the daemon and its children (agent24d
-//! `harden_process`) and by the key being resident for milliseconds. Swap is
-//! unaffected.
+//! secp256k1/bech32/chacha20poly1305. The crate is not replaced. Non-zeroized
+//! remnants can persist in freed memory until it is overwritten, so this is a
+//! reduction, not a guarantee. Disabling core dumps for the daemon and its
+//! children (agent24d `harden_process`) removes only ONE path to disk; swap and
+//! a debugger or memory read by a same-user process are unaffected.
 //!
 //! Known Hyphae behaviours this relies on or works around: a backup made with
 //! an EMPTY password cannot be imported (our >= 8 character rule prevents it),
@@ -597,7 +598,9 @@ pub(crate) async fn export_identity_backup(
             return Err(map_runner_error(e));
         }
     };
-    drop(gate);
+    // `gate` stays held to the end of this function: verify and publish (scrypt,
+    // secret buffers) must not overlap with a second export.
+    let _gate = gate;
     let ncryptsec = data
         .get("ncryptsec")
         .and_then(Value::as_str)

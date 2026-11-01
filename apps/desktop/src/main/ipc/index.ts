@@ -657,7 +657,9 @@ export function registerIpcHandlers(options: {
       const known = (listed.data as { data?: unknown } | null)?.data
       const hasDefault = listed.ok && Array.isArray(known) &&
         known.some((i) => (i as { default?: unknown } | null)?.default === true)
+      // If the list could not be read, do not guess "no": say it MAY become the default.
       const willBeDefault = makeDefault || (listed.ok && !hasDefault)
+      const mayBeDefault = !willBeDefault && !listed.ok
       const result = await promptRestorePassword<BackendProxyResponse>(win, async (backupPassword) => {
         submits += 1
         if (entry.expires < Date.now()) {
@@ -681,7 +683,7 @@ export function registerIpcHandlers(options: {
           return { done: false, error: typeof body.message === 'string' ? clip(body.message, 200) : mt('backupPw.restoreInvalid') }
         }
         return { done: true, value: response }
-      }, { willBeDefault })
+      }, { willBeDefault, mayBeDefault })
       // Not finished (cancelled, or the daemon said no): keep the selection so
       // the user can fix the nickname or try again without re-choosing the file,
       // but only a few times, never past the original expiry, and never over a

@@ -63,6 +63,7 @@ let attachedModules: { name: string; attach_status: string }[] = []
 let attachedFailure: { status: number; code: string } | null = null
 // does `GET /api/v1/comm/identity` report a default identity?
 let identityListHasDefault = true
+let identityListFails = false
 
 beforeAll(async () => {
   daemon = http.createServer((req, res) => {
@@ -112,6 +113,9 @@ beforeAll(async () => {
           res.statusCode = 409
           res.end(JSON.stringify({ ok: false, error: 'nickname_exists', message: 'exists' }))
         } else res.end(JSON.stringify({ ok: true, data: { status: 'imported', nickname: 'r1', npub: 'npub1x', default: false } }))
+      } else if (req.method === 'GET' && req.url === '/api/v1/comm/identity' && identityListFails) {
+        res.statusCode = 503
+        res.end(JSON.stringify({ ok: false, error: 'unavailable', message: 'down' }))
       } else if (req.method === 'GET' && req.url === '/api/v1/comm/identity') {
         res.end(JSON.stringify({ ok: true, data: [{ nickname: 'alice', npub: 'npub1alice', default: identityListHasDefault, encrypted: true }] }))
       } else if (req.method === 'GET' && req.url === '/api/v1/attached') {
@@ -158,6 +162,7 @@ beforeEach(() => {
   attachedModules = [{ name: 'agentear', attach_status: 'attached' }, { name: 'other', attach_status: 'attached' }]
   attachedFailure = null
   identityListHasDefault = true
+  identityListFails = false
   showMessageBox.mockReset()
   showSaveDialog.mockReset()
   promptBackupPassword.mockReset()
@@ -516,11 +521,11 @@ describe('Restore from backup (CommImportPick / CommIdentityImport)', () => {
     const { ticket } = await pick()
     typing('restore-pass-1')
     await call(IpcChannels.CommIdentityImport, ticket, 'alice', true)
-    expect(promptRestorePassword.mock.calls[0]![2]).toEqual({ willBeDefault: true })
+    expect(promptRestorePassword.mock.calls[0]![2]).toEqual({ willBeDefault: true, mayBeDefault: false })
     const second = await pick()
     typing('restore-pass-1')
     await call(IpcChannels.CommIdentityImport, second.ticket, 'bob', false)
-    expect(promptRestorePassword.mock.calls[1]![2]).toEqual({ willBeDefault: false })
+    expect(promptRestorePassword.mock.calls[1]![2]).toEqual({ willBeDefault: false, mayBeDefault: false })
   })
   it('input the daemon calls invalid is fixed inside the window, not by closing it', async () => {
     const { ticket } = await pick()
@@ -575,12 +580,24 @@ describe('Restore from backup (CommImportPick / CommIdentityImport)', () => {
     const { ticket } = await pick()
     typing('restore-pass-1')
     await call(IpcChannels.CommIdentityImport, ticket, 'alice', false) // the page did NOT ask for the default
-    expect(promptRestorePassword.mock.calls[0]![2]).toEqual({ willBeDefault: true })
+    expect(promptRestorePassword.mock.calls[0]![2]).toEqual({ willBeDefault: true, mayBeDefault: false })
     identityListHasDefault = true
     const second = await pick()
     typing('restore-pass-1')
     await call(IpcChannels.CommIdentityImport, second.ticket, 'bob', false)
-    expect(promptRestorePassword.mock.calls[1]![2]).toEqual({ willBeDefault: false })
+    expect(promptRestorePassword.mock.calls[1]![2]).toEqual({ willBeDefault: false, mayBeDefault: false })
+  })
+  it('if the identity list cannot be read, the window says the identity MAY become the default (never silently "no")', async () => {
+    identityListFails = true
+    const { ticket } = await pick()
+    typing('restore-pass-1')
+    await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)
+    expect(promptRestorePassword.mock.calls[0]![2]).toEqual({ willBeDefault: false, mayBeDefault: true })
+    // when the page asked for the default, that stays a plain "will"
+    const second = await pick()
+    typing('restore-pass-1')
+    await call(IpcChannels.CommIdentityImport, second.ticket, 'bob', true)
+    expect(promptRestorePassword.mock.calls[1]![2]).toEqual({ willBeDefault: true, mayBeDefault: false })
   })
   it('retries inside the open window count against the attempt limit', async () => {
     const { ticket } = await pick()
