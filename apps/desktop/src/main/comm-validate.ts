@@ -33,10 +33,10 @@ export function isValidNpub(value: unknown): value is string {
   return ((groups[51] as number) & 0x0f) === 0
 }
 
-// eslint-disable-next-line no-control-regex
 // Cc plus Cf (format controls, which include the bidi overrides/isolates that
 // make a name read differently from what it is). ZWNJ/ZWJ stay allowed: Persian
 // and Indic words need them. Mirrors the daemon's `is_format_control`.
+// eslint-disable-next-line no-control-regex -- rejecting control characters is the point
 const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]|(?![\u200c\u200d])\p{Cf}/u
 
 /** A display name: 1..max chars, no control characters (a newline would let a

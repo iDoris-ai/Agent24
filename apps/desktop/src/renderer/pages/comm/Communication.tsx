@@ -307,6 +307,7 @@ export default function CommunicationPage() {
       if (picked && mounted.current) {
         setRestore(picked)
         // A nickname suggested from the file name; the user can change it.
+        // eslint-disable-next-line no-control-regex -- strip control characters from the suggested name
         const stem = picked.fileName.replace(/\.(ncryptsec|txt)$/i, '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 64)
         setRestoreNickname(stem)
         setRestoreDefault(!identities?.length)
