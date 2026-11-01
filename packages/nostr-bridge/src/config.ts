@@ -45,7 +45,7 @@ export const CONFIG = {
   SPEAKER_BIN: process.env.A24_SPEAKER_BIN || 'agent-speaker',
   /** agent-speaker identity nickname this bridge acts as. */
   IDENTITY: process.env.A24_NOSTR_IDENTITY || 'agent24',
-  /** Relay override; empty = agent-speaker's own default (wss://relay.aastar.io). */
+  /** Relay override; empty = Hyphae's own default (wss://relay.aastar.io). */
   RELAY: process.env.A24_NOSTR_RELAY || '',
   /** Display name published in the profile. */
   AGENT_NAME: process.env.A24_NOSTR_NAME || 'agent24',

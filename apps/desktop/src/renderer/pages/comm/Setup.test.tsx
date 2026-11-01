@@ -4,7 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { setLocale } from '../../i18n'
 import CommunicationPage from './Communication'
 
-const fixtures = vi.hoisted(() => ({ aa: '' }))
+const fixtures = vi.hoisted(() => ({ aa: undefined as string | undefined }))
 vi.mock('./relayDefaults', async (original) => {
   const actual = await original<typeof import('./relayDefaults')>()
   return { ...actual, getDefaultRelays: () => actual.getDefaultRelays(fixtures.aa) }
@@ -32,7 +32,7 @@ function setup({ installed = true, identities = [identity], configured = true, c
   window.agent24 = { ...window.agent24, backendProxy: proxy }
   return proxy
 }
-beforeEach(() => { setLocale('en'); fixtures.aa = '' })
+beforeEach(() => { setLocale('en'); fixtures.aa = undefined })
 afterEach(() => { cleanup(); vi.restoreAllMocks() })
 
 it.each([
@@ -55,12 +55,19 @@ it('creates a default identity through backendProxy without persisting renderer 
   expect(storageSpy).not.toHaveBeenCalled()
   expect(screen.getByTestId('comm-setup')).toHaveAttribute('data-state', 'no_identity')
 })
-it.each(['', 'wss://aastar.example'])('hides empty AAStar and selects supplied AAStar as default: %s', async (url) => {
-  fixtures.aa = url
+it('offers the Hyphae relay as the only default', async () => {
   setup({ configured: false })
   render(<CommunicationPage />)
-  expect(await screen.findByRole('combobox', { name: 'Relay server' })).toHaveValue(url || 'wss://relay.aastar.io')
-  expect(screen.queryByRole('option', { name: /^AAStar/ }) !== null).toBe(Boolean(url))
+  expect(await screen.findByRole('combobox', { name: 'Relay server' })).toHaveValue('wss://relay.aastar.io')
+  expect(screen.getByRole('option', { name: /^Hyphae \(AAStar\)/ })).toBeInTheDocument()
+  expect(screen.queryByRole('option', { name: /agent-speaker-relay/ })).toBeNull()
+})
+it('offers no default when the relay url is empty', async () => {
+  fixtures.aa = ''
+  setup({ configured: false })
+  render(<CommunicationPage />)
+  await screen.findByRole('combobox', { name: 'Relay server' })
+  expect(screen.queryByRole('option', { name: /^Hyphae/ })).toBeNull()
 })
 it('saves the selected relay then probes through backendProxy and shows handshake failure', async () => {
   const proxy = setup({ configured: false, connected: false })
