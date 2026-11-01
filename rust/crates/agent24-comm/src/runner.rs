@@ -389,30 +389,6 @@ impl HyphaeRunner {
         cmd
     }
 
-    /// Like [`Self::command`] but for the one Hyphae subcommand that only
-    /// reads its password from a terminal (`identity export`): same scrubbed
-    /// environment, HOME and cwd, but WITHOUT `HYPHAE_OUTPUT=json` (JSON mode
-    /// refuses interactive prompts) and with stdio left for the caller to
-    /// attach to a pty.
-    pub(crate) fn interactive_command(&self, args: &[&str]) -> std::process::Command {
-        // `sh -c 'ulimit -c 0; exec "$0" "$@"'`: the child can never leave a core
-        // dump holding the key (std's pre_exec is `unsafe`, which this crate
-        // forbids). `exec` keeps the pid, so process-group kill still works.
-        let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.arg("-c")
-            .arg("ulimit -c 0 2>/dev/null; exec \"$0\" \"$@\"")
-            .arg(self.bin.path())
-            .args(args);
-        cmd.env_clear();
-        for (key, value) in filtered_env(std::env::vars()) {
-            cmd.env(key, value);
-        }
-        cmd.env("HOME", &self.home);
-        cmd.current_dir(&self.home);
-        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-        cmd
-    }
-
     /// Test-only seam: lets tests supply a synthetic parent environment
     /// (e.g. a sentinel variable that must not leak) instead of the real
     /// process environment, without touching `std::env::set_var`.
@@ -485,6 +461,38 @@ impl HyphaeRunner {
         tracing::debug!(subcommand = %subcommand, exit = code, "hyphae run finished");
 
         parse_envelope(code, &output.stdout, &output.stderr)
+    }
+
+    /// `hyphae <args…>` (expected to be a `--help`) as plain text, bounded and
+    /// time-limited: used to ask the installed binary whether it has a flag
+    /// (capability probe) instead of trusting a version string. Never logs or
+    /// forwards the text.
+    pub(crate) async fn help_text(&self, args: &[&str]) -> Result<String, RunnerError> {
+        let mut cmd = tokio::process::Command::new(self.bin.path());
+        cmd.args(args)
+            .env_clear()
+            .env("HOME", &self.home)
+            .current_dir(&self.home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(10), async {
+            let child = {
+                let _gate = lock_spawn_gate();
+                cmd.spawn().map_err(RunnerError::Spawn)?
+            };
+            child.wait_with_output().await.map_err(RunnerError::Spawn)
+        })
+        .await
+        .map_err(|_| RunnerError::Timeout(Duration::from_secs(10)))??;
+        if output.stdout.len() > OUTPUT_CAP || output.stderr.len() > OUTPUT_CAP {
+            return Err(RunnerError::OutputTooLarge);
+        }
+        // urfave prints help to stdout, "No help topic" style errors to stderr.
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        Ok(text)
     }
 
     /// Like [`Self::run`], but holds [`Self::keystore_lock`] for the entire

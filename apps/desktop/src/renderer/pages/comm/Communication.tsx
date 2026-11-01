@@ -10,6 +10,8 @@ import {
   listCommContacts,
   listCommHistory,
   listCommIdentities,
+  pickCommBackup,
+  restoreCommIdentity,
   sendCommMessage,
   listCommRelays,
   startCommDaemon,
@@ -26,7 +28,7 @@ import { communicationMessages } from './Communication.i18n'
 import './communication.css'
 import { getDefaultRelays } from './relayDefaults'
 
-type WriteAction = 'start' | 'stop' | 'unlock' | 'install' | 'create' | 'import' | 'relay' | 'export' | 'contact' | 'send'
+type WriteAction = 'start' | 'stop' | 'unlock' | 'install' | 'create' | 'import' | 'relay' | 'export' | 'contact' | 'send' | 'restore'
 
 /** Daemon states that settle on their own: the page polls until they do. */
 const TRANSITIONAL_STATES = ['starting', 'backoff']
@@ -128,6 +130,9 @@ export default function CommunicationPage() {
   const [messageTo, setMessageTo] = useState('')
   const [messageText, setMessageText] = useState('')
   const contactNameRef = useRef<HTMLInputElement>(null)
+  const [restore, setRestore] = useState<{ ticket: string; fileName: string } | null>(null)
+  const [restoreNickname, setRestoreNickname] = useState('')
+  const [restoreDefault, setRestoreDefault] = useState(false)
   const [history, setHistory] = useState<CommHistoryItem[] | null>(null)
   // A stale choice (no longer offered after a refresh) falls back to the default option.
   const relayOptions = [...defaults.map((relay) => relay.url), ...(relays?.relays ?? [])]
@@ -281,6 +286,71 @@ export default function CommunicationPage() {
     }
   }
 
+  // Stable daemon codes get their own wording; everything else shows the message.
+  const errorText = (error: unknown): string => {
+    const code = error instanceof CommApiError ? error.code : undefined
+    if (code === 'hyphae_too_old') return t('error.hyphaeTooOld')
+    if (code === 'nickname_exists') return t('restore.nicknameExists')
+    if (code === 'invalid_key') return t('restore.invalidKey')
+    if (code === 'keystore_locked') return t('restore.keystoreLocked')
+    return messageOf(error)
+  }
+
+  const chooseBackup = async () => {
+    if (pending) return
+    setPending('restore')
+    setActionError(null)
+    setNotice(null)
+    try {
+      const picked = await pickCommBackup()
+      if (picked && mounted.current) {
+        setRestore(picked)
+        // A nickname suggested from the file name; the user can change it.
+        const stem = picked.fileName.replace(/\.(ncryptsec|txt)$/i, '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 64)
+        setRestoreNickname(stem)
+        setRestoreDefault(!identities?.length)
+      }
+    } catch (error) {
+      if (mounted.current) setActionError(errorText(error))
+    } finally {
+      if (mounted.current) setPending(null)
+    }
+  }
+
+  const submitRestore = async () => {
+    if (pending || !restore || !restoreNickname.trim()) return
+    setPending('restore')
+    setActionError(null)
+    setNotice(null)
+    try {
+      // The backup password is asked for by the main process, not by this page.
+      const result = await restoreCommIdentity(restore.ticket, restoreNickname.trim(), restoreDefault)
+      if (mounted.current) {
+        setNotice(result.status === 'already_present'
+          ? (result.nickname ? t('restore.alreadyAs', { nickname: result.nickname }) : t('restore.already'))
+          : t('restore.done', { nickname: result.nickname ?? restoreNickname.trim() }))
+        setRestore(null)
+      }
+    } catch (error) {
+      // Cancelling the password window keeps the form so the user can try again.
+      const cancelled = error instanceof CommApiError && error.code === 'cancelled'
+      if (mounted.current && !cancelled) setActionError(errorText(error))
+    } finally {
+      if (mounted.current) { setPending(null); void refresh() }
+    }
+  }
+
+  const restoreUi = <>
+    <button type="button" disabled={pending !== null} onClick={() => void chooseBackup()}>{t('restore.button')}</button>
+    {restore && <form className="comm-setup-form" aria-label={t('restore.button')} onSubmit={(event) => { event.preventDefault(); void submitRestore() }}>
+      <p className="comm-muted">{t('restore.file', { file: restore.fileName })}</p>
+      <label>{t('restore.nickname')}<input value={restoreNickname} onChange={(event) => setRestoreNickname(event.target.value)} /></label>
+      <label className="comm-checkbox"><input type="checkbox" checked={restoreDefault} onChange={(event) => setRestoreDefault(event.target.checked)} />{t('restore.makeDefault')}</label>
+      <button type="submit" disabled={pending !== null || !restoreNickname.trim()}>{t('restore.submit')}</button>
+      <button type="button" onClick={() => setRestore(null)}>{t('restore.cancel')}</button>
+    </form>}
+  </>
+
   const exportKey = async (name: string) => {
     if (pending) return
     setPending('export')
@@ -293,7 +363,7 @@ export default function CommunicationPage() {
     } catch (error) {
       // Declining any native step is not an error.
       const cancelled = error instanceof CommApiError && error.code === 'cancelled'
-      if (mounted.current && !cancelled) setActionError(messageOf(error))
+      if (mounted.current && !cancelled) setActionError(errorText(error))
     } finally {
       if (mounted.current) setPending(null)
     }
@@ -385,6 +455,7 @@ export default function CommunicationPage() {
             <button disabled={pending !== null || refreshing || !nickname.trim()}>{t('wizard.identity')}</button>
           </form>
           <button type="button" disabled={pending !== null} onClick={() => setImportOpen(!importOpen)}>{t('wizard.importKey')}</button>
+          {restoreUi}
           {importOpen && <form className="comm-setup-form" onSubmit={(event) => { event.preventDefault(); void runAction('import') }}>
             <p className="comm-muted">{t('wizard.importGuide')}</p>
             <label>{t('wizard.importFrom')}<input value={importFrom} onChange={(event) => setImportFrom(event.target.value)} /></label>
@@ -439,6 +510,7 @@ export default function CommunicationPage() {
             </tr>)}
           </tbody></table></div>
         )}
+        {identities !== null && identities.length > 0 && <div className="comm-row-actions">{restoreUi}</div>}
         {identities?.some((identity) => identity.default) && <p className="comm-muted">{t('identity.myAddress')}</p>}
       </section>
 

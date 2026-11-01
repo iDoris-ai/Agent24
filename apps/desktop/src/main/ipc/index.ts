@@ -3,6 +3,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { randomBytes } from 'node:crypto'
 import http from 'node:http'
 import https from 'node:https'
 import { execFile, type ChildProcess } from 'node:child_process'
@@ -13,7 +14,10 @@ import { findAllowedRoute, proxyError, proxyRequest, timeoutFor, withKnowledgeBi
 import type { KnowledgeController } from '../knowledge-settings'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
 import { backupFileStem, isSafeBackupPassword, isSafeMessage, isSafeName, isValidNpub } from '../comm-validate'
-import { promptBackupPassword as openBackupPasswordWindow } from '../backup-password-window'
+import {
+  promptBackupPassword as openBackupPasswordWindow,
+  promptRestorePassword as openRestorePasswordWindow,
+} from '../backup-password-window'
 import { mt, setMainLocale, isMainLocale } from '../main-i18n'
 import { readOmlxSettingsKey } from '../omlx-settings-key'
 import type { IpcGuard } from './guard'
@@ -21,6 +25,7 @@ import { documentsCall } from '../documents'
 import { importFile } from '../documents-import'
 import { IpcChannels } from '../../shared/ipc-types'
 import type {
+  CommImportPickResult,
   KnowledgeSettingsResult,
   KnowledgeStatus,
   BackendEndpointResult,
@@ -229,6 +234,10 @@ function isBackendProxyRequest(req: unknown): req is BackendProxyRequest {
 /** The daemon's whole export budget is 30 s of pty plus one scrypt run; this stays well above it. */
 const EXPORT_TIMEOUT_MS = 90_000
 
+/** Restore: opaque single-use tickets standing for a file the user picked. */
+const importTickets = new Map<string, { path: string; expires: number }>()
+const IMPORT_TICKET_TTL_MS = 5 * 60_000
+
 /** True if anything (file, dir, even a dangling symlink) is at `p`. */
 function pathExists(p: string): boolean {
   try { fs.lstatSync(p); return true } catch { return false }
@@ -330,8 +339,11 @@ export function registerIpcHandlers(options: {
   knowledge?: () => KnowledgeController | null
   /** Test seam: the main-owned backup-password window. */
   promptBackupPassword?: (parent: BrowserWindow | null) => Promise<string | null>
+  /** Test seam: the main-owned restore-password window. */
+  promptRestorePassword?: typeof openRestorePasswordWindow
 }): void {
   const promptBackupPassword = options.promptBackupPassword ?? openBackupPasswordWindow
+  const promptRestorePassword = options.promptRestorePassword ?? openRestorePasswordWindow
   const knowledge = options.knowledge ?? (() => null)
   omlxSettingsPath = options.omlxSettingsPath
   const handle: typeof ipcMain.handle = (channel, listener) => ipcMain.handle(channel, options.guard(listener))
@@ -582,6 +594,62 @@ export function registerIpcHandlers(options: {
         // Best effort (JS strings are immutable): drop main's only reference.
         backupPassword = null
       }
+    }),
+  )
+
+  // Restore from an encrypted backup. Step 1 (native open dialog) hands the page
+  // only a file NAME and a single-use ticket; the path and the contents never
+  // leave main. Step 2 takes the ticket, the nickname the page collected and
+  // whether it should become the default; main then asks for the backup
+  // password in its own window (with an in-window "decrypting…" state and
+  // retry on a wrong password) and calls the daemon.
+  handle(IpcChannels.CommImportPick, async (event): Promise<CommImportPickResult> => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    const options: Electron.OpenDialogOptions = {
+      title: mt('comm.restoreOpen'),
+      properties: ['openFile'],
+      filters: [{ name: 'NIP-49 ncryptsec', extensions: ['ncryptsec', 'txt'] }],
+    }
+    let picked: Electron.OpenDialogReturnValue
+    try {
+      picked = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+    } catch {
+      return { ok: false, cancelled: true }
+    }
+    const file = picked.filePaths[0]
+    if (picked.canceled || !file) return { ok: false, cancelled: true }
+    const ticket = randomBytes(16).toString('hex')
+    importTickets.clear() // one pending selection at a time
+    importTickets.set(ticket, { path: file, expires: Date.now() + IMPORT_TICKET_TTL_MS })
+    return { ok: true, ticket, fileName: path.basename(file) }
+  })
+  handle(IpcChannels.CommIdentityImport, (event, ticket: unknown, nickname: unknown, makeDefault: unknown): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      if (typeof ticket !== 'string' || !isSafeName(nickname) || typeof makeDefault !== 'boolean') {
+        return invalidRequest('invalid restore request')
+      }
+      const entry = importTickets.get(ticket)
+      importTickets.delete(ticket) // single use
+      if (!entry || entry.expires < Date.now()) {
+        return { ok: false, status: 410, data: { error: { code: 'ticket_expired', message: mt('err.noBackupTicket') } } }
+      }
+      const win = BrowserWindow.fromWebContents(event.sender)
+      const result = await promptRestorePassword<BackendProxyResponse>(win, async (backupPassword) => {
+        const response = await proxyToBackend({
+          method: 'POST', path: '/api/v1/comm/identity/import',
+          body: { nickname, path: entry.path, backup_password: backupPassword, default: makeDefault },
+        }, EXPORT_TIMEOUT_MS)
+        // A wrong password is retried inside the window; everything else ends it.
+        if ((response.data as { error?: unknown } | null)?.error === 'bad_backup_password') {
+          return { done: false, error: mt('backupPw.badPassword') }
+        }
+        return { done: true, value: response }
+      })
+      // Not finished (cancelled, or the daemon said no): keep the selection so
+      // the user can fix the nickname or try again without re-choosing the file.
+      const finished = result !== null && result.ok
+      if (!finished) importTickets.set(ticket, { path: entry.path, expires: Date.now() + IMPORT_TICKET_TTL_MS })
+      return result ?? cancelled()
     }),
   )
 

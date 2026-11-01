@@ -57,6 +57,12 @@ pub enum CommError {
     Timeout,
     #[error("upstream: {0}")]
     Upstream(String),
+    /// A stable, route-specific failure code the UI branches on
+    /// (`hyphae_too_old`, `bad_backup_password`, `invalid_key`,
+    /// `nickname_exists`, `keystore_locked`): `{ok:false,error:<code>,message}`
+    /// with the given HTTP status.
+    #[error("{1}: {2}")]
+    Coded(StatusCode, &'static str, String),
 }
 
 impl CommError {
@@ -105,6 +111,7 @@ impl CommError {
                 None,
             ),
             CommError::Upstream(m) => (StatusCode::BAD_GATEWAY, "upstream", m.clone(), None),
+            CommError::Coded(status, code, m) => (*status, *code, m.clone(), None),
         }
     }
 }

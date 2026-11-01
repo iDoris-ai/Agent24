@@ -1014,12 +1014,17 @@ async fn auth(State(state): State<AppState>, req: Request<Body>, next: Next) -> 
 }
 
 /// Routes that only the desktop's ProductHost may call, in any auth mode.
-/// The private-key backup lets the caller choose the password that encrypts
-/// the key, so a bearer that merely proves "same user, same machine" (the
+/// Private-key backup and restore. Export lets the caller choose the password
+/// that encrypts the key, and restore plants a key of the caller's choosing as
+/// one of the user's identities, so a bearer that merely proves "same user, same machine" (the
 /// legacy shared token, any FirstPartyShell or Creative token) must not reach
 /// it: it would let any local process produce a backup it can decrypt.
 fn host_only_route(method: &Method, path: &str) -> bool {
-    method == Method::POST && path == "/api/v1/comm/identity/export"
+    method == Method::POST
+        && matches!(
+            path,
+            "/api/v1/comm/identity/export" | "/api/v1/comm/identity/import"
+        )
 }
 
 /// Single shared token. Does not consult the route catalog or assurance levels,
@@ -4471,19 +4476,49 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn key_backup_is_product_host_only_in_capabilities_mode() {
         let (state, host, creative) = capability_state().await;
-        let modules = Router::new().route(
-            "/api/v1/comm/identity/export",
-            axum::routing::post(|| async { StatusCode::NO_CONTENT }),
-        );
+        let modules = Router::new()
+            .route(
+                "/api/v1/comm/identity/export",
+                axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/api/v1/comm/identity/import",
+                axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+            );
         let app = build_router_with_modules(state, modules);
-        for (bearer, expected) in [
-            (None, StatusCode::UNAUTHORIZED),
-            (Some(creative), StatusCode::FORBIDDEN),
-            (Some(host), StatusCode::NO_CONTENT),
+        for (uri, bearer, expected) in [
+            (
+                "/api/v1/comm/identity/export",
+                None,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "/api/v1/comm/identity/export",
+                Some(creative.clone()),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "/api/v1/comm/identity/export",
+                Some(host.clone()),
+                StatusCode::NO_CONTENT,
+            ),
+            (
+                "/api/v1/comm/identity/import",
+                None,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "/api/v1/comm/identity/import",
+                Some(creative),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "/api/v1/comm/identity/import",
+                Some(host),
+                StatusCode::NO_CONTENT,
+            ),
         ] {
-            let mut req = Request::builder()
-                .method(Method::POST)
-                .uri("/api/v1/comm/identity/export");
+            let mut req = Request::builder().method(Method::POST).uri(uri);
             if let Some(bearer) = bearer {
                 req = req.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
             }
@@ -4504,12 +4539,17 @@ pub(crate) mod tests {
                 axum::routing::post(|| async { StatusCode::NO_CONTENT }),
             )
             .route(
+                "/api/v1/comm/identity/import",
+                axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
                 "/api/v1/comm/contact",
                 axum::routing::post(|| async { StatusCode::NO_CONTENT }),
             );
         let app = build_router_with_modules(state().await, modules);
         for (uri, expected) in [
             ("/api/v1/comm/identity/export", StatusCode::FORBIDDEN),
+            ("/api/v1/comm/identity/import", StatusCode::FORBIDDEN),
             ("/api/v1/comm/contact", StatusCode::NO_CONTENT), // other routes unchanged
         ] {
             let res = app
@@ -4537,34 +4577,41 @@ pub(crate) mod tests {
                 r#"{"nickname":"a","path":"/tmp/x.ncryptsec","backup_password":"long-enough-1"}"#,
             )
         };
-        let post = |bearer: &str| {
-            Request::builder()
-                .method(Method::POST)
-                .uri("/api/v1/comm/identity/export")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
-                .body(body())
-                .unwrap()
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let slot = Arc::new(crate::comm_routes::CommDaemonSlot::new());
+        for uri in [
+            "/api/v1/comm/identity/export",
+            "/api/v1/comm/identity/import",
+        ] {
+            let post = |bearer: &str| {
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                    .body(body())
+                    .unwrap()
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let slot = Arc::new(crate::comm_routes::CommDaemonSlot::new());
 
-        // legacy mode, correct token: refused
-        let comm = crate::comm_routes::build(dir.path(), Duration::from_millis(500), &slot).await;
-        let legacy = build_router_with_modules(state().await, comm);
-        let res = legacy.oneshot(post("testtoken")).await.unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+            // legacy mode, correct token: refused
+            let comm =
+                crate::comm_routes::build(dir.path(), Duration::from_millis(500), &slot).await;
+            let legacy = build_router_with_modules(state().await, comm);
+            let res = legacy.oneshot(post("testtoken")).await.unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN);
 
-        // capabilities mode: Creative refused, ProductHost reaches the handler
-        // (no Hyphae binary here, so it answers its own not_configured)
-        let (state, host, creative) = capability_state().await;
-        let comm = crate::comm_routes::build(dir.path(), Duration::from_millis(500), &slot).await;
-        let app = build_router_with_modules(state, comm);
-        let res = app.clone().oneshot(post(&creative)).await.unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-        let res = app.oneshot(post(&host)).await.unwrap();
-        assert_ne!(res.status(), StatusCode::FORBIDDEN);
-        assert_eq!(res.status(), StatusCode::CONFLICT);
+            // capabilities mode: Creative refused, ProductHost reaches the handler
+            // (no Hyphae binary here, so it answers its own not_configured)
+            let (state, host, creative) = capability_state().await;
+            let comm =
+                crate::comm_routes::build(dir.path(), Duration::from_millis(500), &slot).await;
+            let app = build_router_with_modules(state, comm);
+            let res = app.clone().oneshot(post(&creative)).await.unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN);
+            let res = app.oneshot(post(&host)).await.unwrap();
+            assert_ne!(res.status(), StatusCode::FORBIDDEN);
+            assert_eq!(res.status(), StatusCode::CONFLICT);
+        }
     }
 
     #[tokio::test]

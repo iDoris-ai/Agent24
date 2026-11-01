@@ -6,7 +6,7 @@ import CommunicationPage from './Communication'
 import {
   getCommStatus, listCommContacts, listCommIdentities, listCommRelays,
   startCommDaemon, stopCommDaemon, unlockComm, installComm,
-  addCommContact, sendCommMessage, listCommHistory, exportCommIdentity,
+  addCommContact, sendCommMessage, listCommHistory, exportCommIdentity, pickCommBackup, restoreCommIdentity,
   CommApiError, type CommDaemonStatus,
 } from './api'
 
@@ -14,7 +14,7 @@ vi.mock('./api', async (importActual) => ({
   CommApiError: (await importActual<typeof import('./api')>()).CommApiError,
   getCommStatus: vi.fn(), listCommContacts: vi.fn(), listCommIdentities: vi.fn(), listCommRelays: vi.fn(),
   startCommDaemon: vi.fn(), stopCommDaemon: vi.fn(), unlockComm: vi.fn(), installComm: vi.fn(),
-  addCommContact: vi.fn(), sendCommMessage: vi.fn(), listCommHistory: vi.fn(), exportCommIdentity: vi.fn(),
+  addCommContact: vi.fn(), sendCommMessage: vi.fn(), listCommHistory: vi.fn(), exportCommIdentity: vi.fn(), pickCommBackup: vi.fn(), restoreCommIdentity: vi.fn(),
 }))
 
 const identity = { nickname: 'alice', npub: 'npub1alice', default: true, encrypted: true }
@@ -428,4 +428,81 @@ describe('CommunicationPage usability', () => {
     await waitFor(() => expect(sendCommMessage).toHaveBeenCalledWith(stranger, 'hello'))
   })
 
+
+  it('restores from a backup: the file is picked natively, the nickname is suggested from its name, and the page never asks for a password', async () => {
+    success()
+    vi.mocked(pickCommBackup).mockResolvedValueOnce({ ticket: 'tk1', fileName: 'work-laptop.ncryptsec' })
+    vi.mocked(restoreCommIdentity).mockResolvedValueOnce({ status: 'imported', nickname: 'work-laptop', npub: 'npub1w' })
+    render(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Restore from backup' }))
+    const nickname = await screen.findByLabelText('Nickname for the restored identity')
+    expect(nickname).toHaveValue('work-laptop')
+    expect(document.querySelector('input[type="password"]')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Restore' }))
+    await waitFor(() => expect(restoreCommIdentity).toHaveBeenCalledWith('tk1', 'work-laptop', false))
+    expect(await screen.findByText('Identity "work-laptop" was restored from the backup.')).toBeInTheDocument()
+    await waitFor(() => expect(vi.mocked(listCommIdentities).mock.calls.length).toBeGreaterThan(1))
+  })
+
+  it('a cancelled file dialog shows no form; a cancelled password window keeps the form for a retry', async () => {
+    success()
+    vi.mocked(pickCommBackup).mockResolvedValueOnce(null)
+    render(<CommunicationPage />)
+    const button = await screen.findByRole('button', { name: 'Restore from backup' })
+    fireEvent.click(button)
+    await waitFor(() => expect(pickCommBackup).toHaveBeenCalledTimes(1))
+    expect(screen.queryByLabelText('Nickname for the restored identity')).toBeNull()
+
+    vi.mocked(pickCommBackup).mockResolvedValueOnce({ ticket: 'tk2', fileName: 'b.ncryptsec' })
+    vi.mocked(restoreCommIdentity).mockRejectedValueOnce(new CommApiError('cancelled', 499, 'cancelled'))
+    fireEvent.click(button)
+    fireEvent.click(await screen.findByRole('button', { name: 'Restore' }))
+    await waitFor(() => expect(restoreCommIdentity).toHaveBeenCalledTimes(1))
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByLabelText('Nickname for the restored identity')).toBeInTheDocument()
+  })
+
+  it('says when the identity is already on this device, and maps daemon codes to plain wording', async () => {
+    success()
+    vi.mocked(pickCommBackup).mockResolvedValue({ ticket: 'tk3', fileName: 'c.ncryptsec' })
+    vi.mocked(restoreCommIdentity)
+      .mockResolvedValueOnce({ status: 'already_present', nickname: 'alice', npub: 'npub1alice' })
+      .mockRejectedValueOnce(new CommApiError('exists', 409, 'nickname_exists'))
+      .mockRejectedValueOnce(new CommApiError('too old', 409, 'hyphae_too_old'))
+    render(<CommunicationPage />)
+    const open = async () => {
+      const opener = await screen.findByRole('button', { name: 'Restore from backup' })
+      await waitFor(() => expect(opener).toBeEnabled())
+      fireEvent.click(opener)
+      fireEvent.click(await screen.findByRole('button', { name: 'Restore' }))
+    }
+    await open()
+    expect(await screen.findByText('This identity is already on this device (as "alice").')).toBeInTheDocument()
+    await open()
+    expect(await screen.findByText(/An identity with that nickname already exists\. Choose another nickname\./)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Restore' }))
+    expect(await screen.findByText(/Requires Hyphae v0\.28\.0 or newer/)).toBeInTheDocument()
+  })
+
+  it('shows "Requires Hyphae v0.28.0 or newer" when the key backup is not supported', async () => {
+    success()
+    vi.mocked(exportCommIdentity).mockRejectedValueOnce(new CommApiError('too old', 409, 'hyphae_too_old'))
+    render(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Export private key backup alice' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Requires Hyphae v0.28.0 or newer')
+  })
+
+  it('offers Restore from backup in the setup wizard when there is no identity yet, defaulting it', async () => {
+    success()
+    vi.mocked(listCommIdentities).mockResolvedValue([])
+    vi.mocked(pickCommBackup).mockResolvedValueOnce({ ticket: 'tk4', fileName: 'first.ncryptsec' })
+    vi.mocked(restoreCommIdentity).mockResolvedValueOnce({ status: 'imported', nickname: 'first', npub: 'npub1f' })
+    render(<CommunicationPage />)
+    const wizard = await screen.findByTestId('comm-setup')
+    expect(wizard).toHaveAttribute('data-state', 'no_identity')
+    fireEvent.click(screen.getByRole('button', { name: 'Restore from backup' }))
+    expect(await screen.findByLabelText('Make it the default identity')).toBeChecked()
+    fireEvent.click(screen.getByRole('button', { name: 'Restore' }))
+    await waitFor(() => expect(restoreCommIdentity).toHaveBeenCalledWith('tk4', 'first', true))
+  })
 })

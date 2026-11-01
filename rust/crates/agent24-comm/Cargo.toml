@@ -45,9 +45,9 @@ keyring = { version = "3.6", default-features = false, features = [
 ] }
 # COMM-2b's import flow (`import.rs`) non-blockingly `flock`s the source
 # `outbox.json.lock` for the duration of the file copy (COMM-HYPHAE.md
-# §4.1 step 2) — `fs` is rustix's gate for `rustix::fs::flock`. `pty` is for
-# `export.rs` (`identity export` only prompts on a terminal).
-rustix = { version = "0.38", features = ["process", "fs", "pty", "termios"] }
+# §4.1 step 2) — `fs` is rustix's gate for `rustix::fs::flock` (and the dir-fd file ops in
+# `export.rs`).
+rustix = { version = "0.38", features = ["process", "fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
@@ -69,16 +69,15 @@ tracing = "0.1"
 # `Password(/* Zeroizing<Vec<u8>> */)`). Not a direct workspace dependency
 # elsewhere, but already resolved in Cargo.lock (1.9.0, transitive).
 zeroize = "1"
-# NIP-49 password-encrypted key backup (export.rs): scrypt KDF, XChaCha20-Poly1305,
-# bech32 `ncryptsec`, NFKC password normalisation, and secp256k1 to prove the
-# backed-up key belongs to the identity before anything is written.
+
+[dev-dependencies]
+# Decrypt-only NIP-49 helper used by tests to verify, independently of Hyphae,
+# that a backup Hyphae wrote round-trips to the identity's npub.
 scrypt = { version = "0.12", default-features = false }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 bech32 = "0.12"
 unicode-normalization = "0.1"
 secp256k1 = { version = "0.30", default-features = false, features = ["std"] }
-
-[dev-dependencies]
 # Mirrors agent24-os-proto's `test-util` pattern: depending on ourselves with
 # the feature on means `cargo test -p agent24-comm` (no extra flags) already
 # runs the lock-override-gated tests.

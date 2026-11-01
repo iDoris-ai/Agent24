@@ -54,7 +54,9 @@ vi.mock('electron', () => ({
 }))
 
 import { setMainLocale } from './main-i18n'
-import { BACKUP_PW_CANCEL, BACKUP_PW_ERROR, BACKUP_PW_SUBMIT, backupPasswordHtml, promptBackupPassword } from './backup-password-window'
+import {
+  BACKUP_PW_BUSY, BACKUP_PW_CANCEL, BACKUP_PW_ERROR, BACKUP_PW_SUBMIT, backupPasswordHtml, promptBackupPassword, promptRestorePassword,
+} from './backup-password-window'
 
 const emit = (channel: string, event: unknown, ...args: unknown[]) => {
   for (const fn of [...(ipcListeners.get(channel) ?? [])]) fn(event, ...args)
@@ -148,6 +150,81 @@ describe('backup password window', () => {
   })
 })
 
+describe('restore password window', () => {
+  const tick = () => new Promise((r) => setTimeout(r, 0))
+
+  it('asks once (no repeat field), is as hardened as the export window, and has no script', () => {
+    void promptRestorePassword(null, async () => ({ done: true, value: 1 }))
+    const prefs = FakeWindow.options[0]!['webPreferences'] as Record<string, unknown>
+    expect(prefs).toMatchObject({ contextIsolation: true, sandbox: true, nodeIntegration: false, devTools: false })
+    const html = backupPasswordHtml('restore')
+    expect(html).toContain('id="p1"')
+    expect(html).not.toContain('id="p2"')
+    expect(html).not.toMatch(/<script/i)
+    expect(html).toContain("default-src 'none'")
+    expect(html).toContain('Restore from backup')
+    setMainLocale('zh')
+    expect(backupPasswordHtml('restore')).toContain('从备份恢复')
+    setMainLocale('th')
+    expect(backupPasswordHtml('restore')).toContain('กู้คืนจากไฟล์สำรอง')
+  })
+
+  it('runs the work with the typed password, shows "Decrypting…" meanwhile, and closes with the result', async () => {
+    let release!: () => void
+    const work = vi.fn((pw: string) => new Promise<{ done: true; value: string }>((resolve) => { release = () => resolve({ done: true, value: `ok:${pw}` }) }))
+    const result = promptRestorePassword(null, work)
+    const w = windows[0]!
+    emit(BACKUP_PW_SUBMIT, fromWindow(w), 'whatever-it-was', 'whatever-it-was')
+    expect(work).toHaveBeenCalledWith('whatever-it-was')
+    expect(w.webContents.sent[0]).toEqual([BACKUP_PW_BUSY, 'Decrypting…'])
+    // while working: a second submit and a cancel are ignored, the window stays
+    emit(BACKUP_PW_SUBMIT, fromWindow(w), 'second', 'second')
+    emit(BACKUP_PW_CANCEL, fromWindow(w))
+    expect(work).toHaveBeenCalledTimes(1)
+    expect(w.closed).toBe(false)
+    release()
+    await expect(result).resolves.toBe('ok:whatever-it-was')
+    expect(w.closed).toBe(true)
+  })
+
+  it('lets the user retry in place when the work asks for it, then finishes', async () => {
+    const work = vi.fn()
+      .mockResolvedValueOnce({ done: false, error: 'wrong, try again' })
+      .mockResolvedValueOnce({ done: true, value: 'second-time' })
+    const result = promptRestorePassword<string>(null, work)
+    const w = windows[0]!
+    emit(BACKUP_PW_SUBMIT, fromWindow(w), 'bad-one', 'bad-one')
+    await tick()
+    expect(w.webContents.sent.map((a) => a[0])).toEqual([BACKUP_PW_BUSY, BACKUP_PW_ERROR])
+    expect(w.webContents.sent[1]![1]).toBe('wrong, try again')
+    expect(w.closed).toBe(false)
+    emit(BACKUP_PW_SUBMIT, fromWindow(w), 'good-one', 'good-one')
+    await expect(result).resolves.toBe('second-time')
+  })
+
+  it('ignores other webContents, rejects an empty or multi-line password in main, and cancels to null', async () => {
+    const work = vi.fn()
+    const result = promptRestorePassword<string>(null, work)
+    const w = windows[0]!
+    const other = new FakeContents()
+    emit(BACKUP_PW_SUBMIT, { sender: other, senderFrame: other.mainFrame }, 'attacker', 'attacker')
+    emit(BACKUP_PW_SUBMIT, fromWindow(w), '', '')
+    emit(BACKUP_PW_SUBMIT, fromWindow(w), 'a\nb', 'a\nb')
+    expect(work).not.toHaveBeenCalled()
+    expect(w.webContents.sent.filter((a) => a[0] === BACKUP_PW_ERROR)).toHaveLength(2)
+    emit(BACKUP_PW_CANCEL, fromWindow(w))
+    await expect(result).resolves.toBeNull()
+  })
+
+  it('closing the window while idle resolves null without calling the work', async () => {
+    const work = vi.fn()
+    const result = promptRestorePassword<string>(null, work)
+    windows[0]!.close()
+    await expect(result).resolves.toBeNull()
+    expect(work).not.toHaveBeenCalled()
+  })
+})
+
 describe('backup password preload', () => {
   const source = fs.readFileSync(path.join(__dirname, 'backup-password-preload.ts'), 'utf8')
   it('is self-contained (a sandboxed preload cannot require siblings): only imports electron', () => {
@@ -158,6 +235,7 @@ describe('backup password preload', () => {
     expect(source).toContain(`'${BACKUP_PW_SUBMIT}'`)
     expect(source).toContain(`'${BACKUP_PW_CANCEL}'`)
     expect(source).toContain(`'${BACKUP_PW_ERROR}'`)
+    expect(source).toContain(`'${BACKUP_PW_BUSY}'`)
     expect(source).toContain("event.key === 'Escape'")
   })
 })

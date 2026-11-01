@@ -128,3 +128,6 @@ exemptions:
   - operationId: exportCommIdentity
     category: planned-tui-2
     fallback: "CLI 导出待 CORE-2d 在场证明接入（CommWrite 目前不在 resolve_target 的可提升集合内，FirstPartyShell 会拿到 presence_required）；桌面端走专用 IPC（原生确认 + 保存框）"
+  - operationId: importCommIdentity
+    category: planned-tui-2
+    fallback: "CLI 恢复待 CORE-2d 在场证明接入（CommWrite 目前不在 resolve_target 的可提升集合内）；桌面端走专用 IPC（原生打开框 + 主进程口令窗口）"

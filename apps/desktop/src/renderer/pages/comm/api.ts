@@ -388,3 +388,39 @@ export interface CommExportResult {
 export const exportCommIdentity = (nickname: string): Promise<CommExportResult> =>
   viaIpc(() => window.agent24.commIdentityExport(nickname), (value): value is CommExportResult =>
     isRecord(value) && string(value['nickname']) && string(value['npub']) && string(value['path']))
+
+export type CommPickResult = { ticket: string; fileName: string } | null
+
+/** Native "choose a backup" dialog (in main). Only the file NAME and an opaque ticket come back. */
+export async function pickCommBackup(): Promise<CommPickResult> {
+  let result: unknown
+  try {
+    result = await window.agent24.commImportPick()
+  } catch {
+    throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)
+  }
+  if (isRecord(result) && result['ok'] === true && string(result['ticket']) && string(result['fileName'])) {
+    return { ticket: result['ticket'], fileName: result['fileName'] }
+  }
+  return null
+}
+
+export interface CommRestoreResult {
+  status: 'imported' | 'already_present'
+  nickname: string | null
+  npub: string | null
+}
+
+/**
+ * Restore the picked backup. Main collects the backup password in its own
+ * window; this page never sees it (or the file). A cancelled window rejects
+ * with code `cancelled`.
+ */
+export const restoreCommIdentity = (ticket: string, nickname: string, makeDefault: boolean): Promise<CommRestoreResult> =>
+  viaIpc(() => window.agent24.commIdentityImport(ticket, nickname, makeDefault),
+    (value): value is RecordValue => isRecord(value) && (value['status'] === 'imported' || value['status'] === 'already_present'))
+    .then((data) => ({
+      status: data['status'] as CommRestoreResult['status'],
+      nickname: typeof data['nickname'] === 'string' ? data['nickname'] : null,
+      npub: typeof data['npub'] === 'string' ? data['npub'] : null,
+    }))

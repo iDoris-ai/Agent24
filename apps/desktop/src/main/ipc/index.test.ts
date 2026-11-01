@@ -13,13 +13,15 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 const handlers = new Map<string, (event: unknown, ...args: unknown[]) => unknown>()
 const showMessageBox = vi.fn()
 const showSaveDialog = vi.fn()
+const showOpenDialog = vi.fn()
 const promptBackupPassword = vi.fn()
+const promptRestorePassword = vi.fn()
 const execFileMock = vi.fn()
 
 vi.mock('electron', () => ({
   app: { getVersion: () => '0.0.0-test', getPath: () => settingsDir },
   BrowserWindow: { fromWebContents: () => null },
-  dialog: { showMessageBox: (...a: unknown[]) => showMessageBox(...a), showOpenDialog: vi.fn(), showSaveDialog: (...a: unknown[]) => showSaveDialog(...a) },
+  dialog: { showMessageBox: (...a: unknown[]) => showMessageBox(...a), showOpenDialog: (...a: unknown[]) => showOpenDialog(...a), showSaveDialog: (...a: unknown[]) => showSaveDialog(...a) },
   ipcMain: { handle: (channel: string, fn: (event: unknown, ...args: unknown[]) => unknown) => { handlers.set(channel, fn) } },
   shell: { openExternal: vi.fn(() => Promise.resolve()) },
 }))
@@ -96,6 +98,15 @@ beforeAll(async () => {
       } else if (req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/ap_missing')) {
         res.statusCode = 404
         res.end(JSON.stringify({ error: { code: 'not_found', message: 'nope' } }))
+      } else if (req.method === 'POST' && req.url === '/api/v1/comm/identity/import') {
+        const sent = Buffer.concat(chunks).toString()
+        if (sent.includes('wrong-pass')) {
+          res.statusCode = 400
+          res.end(JSON.stringify({ ok: false, error: 'bad_backup_password', message: 'nope' }))
+        } else if (sent.includes('dupe-nick')) {
+          res.statusCode = 409
+          res.end(JSON.stringify({ ok: false, error: 'nickname_exists', message: 'exists' }))
+        } else res.end(JSON.stringify({ ok: true, data: { status: 'imported', nickname: 'r1', npub: 'npub1x', default: false } }))
       } else if (req.method === 'GET' && req.url === '/api/v1/comm/identity') {
         res.end(JSON.stringify({ ok: true, data: [{ nickname: 'alice', npub: 'npub1alice', default: true, encrypted: true }] }))
       } else if (req.method === 'GET' && req.url === '/api/v1/attached') {
@@ -119,6 +130,7 @@ beforeAll(async () => {
     omlxSettingsPath: settingsFile,
     omlxCandidatePorts: [endpoint.port],
     promptBackupPassword: (...a: unknown[]) => promptBackupPassword(...a),
+    promptRestorePassword: (...a: unknown[]) => promptRestorePassword(...a) as never,
     guard: createIpcGuard({
       getMainWindow: () => mainWindow as never,
       isTrustedUrl: (u) => u === APP_URL,
@@ -143,6 +155,8 @@ beforeEach(() => {
   showMessageBox.mockReset()
   showSaveDialog.mockReset()
   promptBackupPassword.mockReset()
+  promptRestorePassword.mockReset()
+  showOpenDialog.mockReset()
   execFileMock.mockReset()
 })
 
@@ -422,6 +436,101 @@ describe('CommIdentityExport elevated IPC', () => {
     const result = await call(IpcChannels.CommIdentityExport, ...(args as unknown[]))
     expect(result.data.error.code).toBe('invalid_request')
     expect(showMessageBox).not.toHaveBeenCalled()
+    expect(seen).toHaveLength(0)
+  })
+})
+
+describe('Restore from backup (CommImportPick / CommIdentityImport)', () => {
+  const FILE = '/Users/x/Downloads/alice-backup.ncryptsec'
+  /** The real window runs `work` with what the user typed; this stands in for it. */
+  const typing = (...passwords: string[]) => promptRestorePassword.mockImplementation(async (_win: unknown, work: (p: string) => Promise<{ done: boolean; value?: unknown; error?: string }>) => {
+    for (const pw of passwords) {
+      const outcome = await work(pw)
+      if (outcome.done) return outcome.value
+    }
+    return null // user gave up
+  })
+  const pick = async () => {
+    showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [FILE] })
+    return call(IpcChannels.CommImportPick)
+  }
+
+  it('the open dialog hands the page a file NAME and a ticket, never the path', async () => {
+    const result = await pick()
+    expect(result.ok).toBe(true)
+    expect(result.fileName).toBe('alice-backup.ncryptsec')
+    expect(typeof result.ticket).toBe('string')
+    expect(JSON.stringify(result)).not.toContain('/Users/x')
+    const opts = showOpenDialog.mock.calls.at(-1)!.at(-1) as { properties: string[] }
+    expect(opts.properties).toContain('openFile')
+  })
+  it('cancelling the open dialog yields no ticket and nothing else happens', async () => {
+    showOpenDialog.mockResolvedValueOnce({ canceled: true, filePaths: [] })
+    expect(await call(IpcChannels.CommImportPick)).toEqual({ ok: false, cancelled: true })
+    expect(promptRestorePassword).not.toHaveBeenCalled()
+    expect(seen).toHaveLength(0)
+  })
+  it('restores: the path comes from main, the password from main\'s window, the nickname and default from the page', async () => {
+    const { ticket } = await pick()
+    typing('restore-pass-1')
+    const result = await call(IpcChannels.CommIdentityImport, ticket, 'alice', true)
+    expect(result.ok).toBe(true)
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toMatchObject({ method: 'POST', url: '/api/v1/comm/identity/import', auth: 'Bearer daemon-secret' })
+    expect(JSON.parse(seen[0]!.body)).toEqual({ nickname: 'alice', path: FILE, backup_password: 'restore-pass-1', default: true })
+    expect(promptRestorePassword).toHaveBeenCalledTimes(1)
+  })
+  it('a wrong password is retried inside the window; the page only sees the final answer', async () => {
+    const { ticket } = await pick()
+    typing('wrong-pass-x', 'right-pass-1')
+    const result = await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)
+    expect(result.ok).toBe(true)
+    expect(seen.map((r) => JSON.parse(r.body).backup_password)).toEqual(['wrong-pass-x', 'right-pass-1'])
+  })
+  it('cancelling the password window makes no daemon call and keeps the selection', async () => {
+    const { ticket } = await pick()
+    typing() // closes without typing anything
+    const cancelled = await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)
+    expect(cancelled.data.error.code).toBe('cancelled')
+    expect(seen).toHaveLength(0)
+    typing('restore-pass-1') // the same ticket still works
+    const again = await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)
+    expect(again.ok).toBe(true)
+  })
+  it('a daemon refusal (nickname_exists) keeps the selection so the nickname can be changed', async () => {
+    const { ticket } = await pick()
+    typing('dupe-nick-pass')
+    const refused = await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)
+    expect(refused.ok).toBe(false)
+    expect(refused.data.error).toBe('nickname_exists')
+    typing('restore-pass-1')
+    expect((await call(IpcChannels.CommIdentityImport, ticket, 'alice2', false)).ok).toBe(true)
+  })
+  it('a ticket is single use after success and unknown tickets are refused without any window', async () => {
+    const { ticket } = await pick()
+    typing('restore-pass-1')
+    await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)
+    promptRestorePassword.mockClear()
+    const reused = await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)
+    expect(reused.data.error.code).toBe('ticket_expired')
+    const forged = await call(IpcChannels.CommIdentityImport, 'f'.repeat(32), 'alice', false)
+    expect(forged.data.error.code).toBe('ticket_expired')
+    expect(promptRestorePassword).not.toHaveBeenCalled()
+  })
+  it.each([
+    ['control chars in the nickname', ['al\nice', false]],
+    ['object as the nickname', [{}, false]],
+    ['non-boolean default', ['alice', 'yes']],
+  ])('refuses %s before any window', async (_name, rest) => {
+    const { ticket } = await pick()
+    const result = await call(IpcChannels.CommIdentityImport, ticket, ...(rest as unknown[]))
+    expect(result.data.error.code).toBe('invalid_request')
+    expect(promptRestorePassword).not.toHaveBeenCalled()
+    expect(seen).toHaveLength(0)
+  })
+  it('a non-string ticket is refused', async () => {
+    const result = await call(IpcChannels.CommIdentityImport, { path: '/etc/passwd' }, 'alice', false)
+    expect(result.data.error.code).toBe('invalid_request')
     expect(seen).toHaveLength(0)
   })
 })

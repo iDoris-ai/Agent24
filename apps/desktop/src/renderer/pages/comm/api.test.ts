@@ -5,6 +5,8 @@ import {
   addCommContact,
   exportCommIdentity,
   listCommHistory,
+  pickCommBackup,
+  restoreCommIdentity,
   sendCommMessage,
   getCommStatus,
   importCommIdentity,
@@ -223,6 +225,32 @@ describe('COMM contact, send, history and export wrappers', () => {
     await expect(exportCommIdentity('alice')).rejects.toMatchObject({ code: 'cancelled' })
     expect(commIdentityExport).toHaveBeenCalledTimes(2)
     expect(commIdentityExport.mock.calls.every((c) => c.length === 1 && c[0] === 'alice')).toBe(true)
+    expect(proxy).not.toHaveBeenCalled()
+  })
+})
+
+describe('COMM restore wrappers', () => {
+  it('pick returns only a ticket and a file name; a cancel is null', async () => {
+    const commImportPick = vi.fn()
+      .mockResolvedValueOnce({ ok: true, ticket: 't1', fileName: 'a.ncryptsec' })
+      .mockResolvedValueOnce({ ok: false, cancelled: true })
+    window.agent24 = { ...window.agent24, commImportPick } as never
+    await expect(pickCommBackup()).resolves.toEqual({ ticket: 't1', fileName: 'a.ncryptsec' })
+    await expect(pickCommBackup()).resolves.toBeNull()
+  })
+  it('restore goes through the dedicated IPC with ticket, nickname and default ONLY (no password)', async () => {
+    const proxy = setProxy(() => { throw new Error('generic proxy must not restore keys') })
+    const commIdentityImport = vi.fn()
+      .mockResolvedValueOnce(successful({ status: 'imported', nickname: 'alice', npub: 'npub1a', default: true }))
+      .mockResolvedValueOnce(successful({ status: 'already_present', nickname: 'old', npub: 'npub1a' }))
+      .mockResolvedValueOnce({ ok: false, status: 409, data: { ok: false, error: 'nickname_exists', message: 'x' } })
+      .mockResolvedValueOnce({ ok: false, status: 499, data: { error: { code: 'cancelled', message: 'c' } } })
+    window.agent24 = { ...window.agent24, commIdentityImport } as never
+    await expect(restoreCommIdentity('t1', 'alice', true)).resolves.toEqual({ status: 'imported', nickname: 'alice', npub: 'npub1a' })
+    await expect(restoreCommIdentity('t1', 'alice', false)).resolves.toMatchObject({ status: 'already_present', nickname: 'old' })
+    await expect(restoreCommIdentity('t1', 'alice', false)).rejects.toMatchObject({ code: 'nickname_exists' })
+    await expect(restoreCommIdentity('t1', 'alice', false)).rejects.toMatchObject({ code: 'cancelled' })
+    expect(commIdentityImport.mock.calls.every((c) => c.length === 3)).toBe(true)
     expect(proxy).not.toHaveBeenCalled()
   })
 })

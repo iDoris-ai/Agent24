@@ -7,6 +7,7 @@ import type { NavPrefs } from '../renderer/capabilities/types'
 import {
   IpcChannels,
   type BackendEndpointResult,
+  type CommImportPickResult,
   type CliToolStatus,
   type CliInstallResult,
   type DocumentsEvent,
@@ -63,6 +64,12 @@ const api = {
   /** Elevated comm write, validated in main (not on the generic proxy). */
   commSend: (to: string, content: string): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.CommSend, to, content),
+
+  /** Native open dialog for a `.ncryptsec` backup. Resolves with a file NAME and a single-use ticket (never the path or contents). */
+  commImportPick: (): Promise<CommImportPickResult> => ipcRenderer.invoke(IpcChannels.CommImportPick),
+  /** Restore the picked backup under `nickname`. Main asks for the backup password in its own window; the page never sees it. */
+  commIdentityImport: (ticket: string, nickname: string, makeDefault: boolean): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommIdentityImport, ticket, nickname, makeDefault),
 
   osModuleSetEnabled: (name: string, enabled: boolean): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.OsModuleSetEnabled, name, enabled),

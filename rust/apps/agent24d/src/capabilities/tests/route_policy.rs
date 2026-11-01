@@ -161,6 +161,13 @@ fn section_3_rows_match_operation_and_level() {
 
     fixed.push(DesignRow {
         method: "POST".into(),
+        path: "/comm/identity/import".into(),
+        operation: "CommWrite".into(),
+        level: AssuranceLevel::Elevated,
+    });
+
+    fixed.push(DesignRow {
+        method: "POST".into(),
         path: "/comm/install".into(),
         operation: "ComponentInstall".into(),
         level: AssuranceLevel::Elevated,
