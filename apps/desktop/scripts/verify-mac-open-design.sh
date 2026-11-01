@@ -28,7 +28,7 @@ field() { node -e "process.stdout.write(String(JSON.parse(require('fs').readFile
 [[ -f "$MANIFEST" ]] || fail "包内缺少 ${MANIFEST}（Design 页会显示『组件未安装』）"
 PIN_SHA="$(node -e "import('$SCRIPT_DIR/pack-open-design-component.mjs').then(m=>process.stdout.write(m.OPEN_DESIGN_SHA))")"
 PIN_VERSION="$(node -e "import('$SCRIPT_DIR/pack-open-design-component.mjs').then(m=>process.stdout.write(m.OPEN_DESIGN_PIN_VERSION))")"
-[[ "$(field version)" == "$PIN_VERSION" ]] || fail "manifest.version=$(field version)（期望 $PIN_VERSION）"
+[[ "$(field version)" == "$PIN_VERSION" ]] || fail "manifest.version=$(field version)（期望 ${PIN_VERSION}）"
 [[ "$(field odSha)" == "$PIN_SHA" ]] || fail "manifest.odSha 与固定 sha 不符：$(field odSha)"
 [[ "$(field platform)" == "darwin" ]] || fail "manifest.platform=$(field platform)"
 [[ "$(field arch)" == "arm64" ]] || fail "manifest.arch=$(field arch)"
