@@ -29,11 +29,15 @@ export const OD_SOURCE_STAMP_FILE = '.agent24-od-source.json'
 export const OPEN_DESIGN_REPOSITORY = 'iDoris-ai/Agent24'
 export const EXPECTED_TEAM_ID = 'HYAP444FN9'
 
-/** Basenames that get allow-jit + allow-unsigned-executable-memory.
- * Only opencode (bun / JavaScriptCore). ffmpeg, esbuild, spawn-helper, and
- * vela are signed with Hardened Runtime and no entitlements: a local smoke
- * of the staged darwin-arm64 tree showed they still start. */
-export const JIT_ENTITLEMENT_BASENAMES = new Set(['opencode'])
+/**
+ * The only stage-tree path that may carry allow-jit and
+ * allow-unsigned-executable-memory. This is opencode (bun / JavaScriptCore)
+ * inside the packed component, not every Mach-O whose basename is `opencode`.
+ * Signing and `verify-signed` both fail unless this relative path occurs
+ * exactly once. ffmpeg, esbuild, spawn-helper, and vela stay on Hardened
+ * Runtime with no entitlements.
+ */
+export const JIT_ENTITLEMENT_RELATIVE_PATH = 'open-design/bin/libexec/opencode/opencode'
 
 const execFileAsync = promisify(execFile)
 
@@ -211,6 +215,44 @@ export function teamIdFromIdentity(identity) {
   return match ? match[1] : null
 }
 
+/** Designated requirement that pins the Developer ID team. Ad-hoc signatures
+ * do not satisfy it, including a binary whose path or identifier merely
+ * contains the text `TeamIdentifier=<TEAM>`. */
+export function teamIdRequirement(teamId) {
+  if (!/^[A-Z0-9]{10}$/.test(teamId ?? '')) {
+    throw new Error(`refusing to build a codesign requirement for team id: ${teamId}`)
+  }
+  return `anchor apple generic and certificate leaf[subject.OU] = "${teamId}"`
+}
+
+export function posixRelative(root, file) {
+  return path.relative(root, file).split(path.sep).join('/')
+}
+
+/** `codesign -dv` prints one `flags=0xNNNN(...runtime...)` token on the
+ * CodeDirectory line. Match that token, not a substring anywhere in the text. */
+export function codesignOutputHasRuntimeFlag(text) {
+  return String(text).split(/\r?\n/).some((line) => /(?:^|\s)flags=0x[0-9a-fA-F]+\([^)]*\bruntime\b/.test(line))
+}
+
+export function entitlementsTextHasJit(text) {
+  return /allow-jit/.test(text) || /allow-unsigned-executable-memory/.test(text)
+}
+
+export function assertExactlyOneJitPath(root, files, expected = JIT_ENTITLEMENT_RELATIVE_PATH) {
+  const hits = files.filter((item) => posixRelative(root, item.file) === expected)
+  if (hits.length !== 1) {
+    throw new Error(`expected exactly one Mach-O at ${expected} for JIT entitlements, found ${hits.length}`)
+  }
+  return hits[0]
+}
+
+function commandFailureDetail(error) {
+  const stderr = error && error.stderr != null ? String(error.stderr).trim() : ''
+  if (stderr) return stderr
+  return error instanceof Error ? error.message : String(error)
+}
+
 const THIN_MAGICS = new Set(['cffaedfe', 'cefaedfe', 'feedfacf', 'feedface'])
 const FAT_MAGICS = new Set(['cafebabe', 'cafebabf', 'bebafeca', 'bfbafeca'])
 
@@ -255,29 +297,44 @@ export function findMachOFiles(root) {
 
 /** codesign argv for one Mach-O. Libraries (`.dylib`, `.node`) never get an
  * entitlements plist. Executables get `--options runtime`; only
- * {@link JIT_ENTITLEMENT_BASENAMES} also get the JIT entitlements plist. */
-export function machOSigningArgs({ file, kind, identity, entitlements, timestamp = true }) {
+ * {@link JIT_ENTITLEMENT_RELATIVE_PATH} also gets the JIT entitlements plist.
+ * `relativePath` is the path inside the stage tree (`/` separators). */
+export function machOSigningArgs({ file, kind, identity, entitlements, timestamp = true, relativePath }) {
   const adhoc = identity === '-'
   const args = ['--force', '--sign', identity]
   if (kind === 'executable' || !adhoc) args.push('--options', 'runtime')
   if (timestamp && !adhoc) args.push('--timestamp')
-  if (kind === 'executable' && entitlements && JIT_ENTITLEMENT_BASENAMES.has(path.basename(file))) {
+  if (kind === 'executable' && entitlements && relativePath === JIT_ENTITLEMENT_RELATIVE_PATH) {
     args.push('--entitlements', entitlements)
   }
   args.push(file)
   return args
 }
 
+/** `--verify --strict`, plus `-R` when a team requirement applies.
+ * Ad-hoc tests pass no team id (skip `-R`) or inject `requirement`. */
+export function codesignVerifyArgs(file, { teamId, requirement } = {}) {
+  const args = ['--verify', '--strict']
+  const resolved = requirement === undefined ? (teamId ? teamIdRequirement(teamId) : null) : requirement
+  if (resolved) args.push('-R', resolved)
+  args.push(file)
+  return args
+}
+
 /**
  * Signs every Mach-O under `root` (Developer ID, Hardened Runtime, secure
- * timestamp) and verifies each with `codesign --verify --strict`, plus that the
- * Team ID matches the identity's. `identity: '-'` (ad-hoc) is for tests only:
- * its derived Team ID is empty, so pass `expectedTeamId` to exercise the
- * check. `runCommand` and `files` are test seams (no `codesign` / no Mach-O).
+ * timestamp). Each file is then checked with
+ * `codesign --verify --strict -R='anchor apple generic and certificate leaf[subject.OU] = "<TEAM>"'`.
+ * `identity: '-'` (ad-hoc) derives no Team ID, so that `-R` step is skipped
+ * unless `expectedTeamId` or `requirement` is injected. When a requirement is
+ * checked, flags must include `runtime`, and only
+ * {@link JIT_ENTITLEMENT_RELATIVE_PATH} may carry JIT entitlements.
+ * `requireJitMatch` (default true) fails unless that path occurs exactly once.
+ * `runCommand` and `files` are test seams (no `codesign` / no Mach-O).
  */
 export async function signOpenDesignTree({
   root, identity, entitlements, timestamp = true, log = () => {},
-  runCommand = execFileAsync, files, expectedTeamId,
+  runCommand = execFileAsync, files, expectedTeamId, requirement, requireJitMatch = true,
 }) {
   if (!root || !path.isAbsolute(root)) throw new Error('root must be an absolute path')
   if (!identity) throw new Error('identity is required')
@@ -289,34 +346,67 @@ export async function signOpenDesignTree({
 
   const discovered = files ?? findMachOFiles(root)
   if (discovered.length === 0) throw new Error(`no Mach-O files found under ${root} — refusing to continue (expected native modules)`)
+  if (requireJitMatch) assertExactlyOneJitPath(root, discovered)
+  const resolvedRequirement = requirement === undefined
+    ? (teamId ? teamIdRequirement(teamId) : null)
+    : requirement
   for (const { file, kind } of discovered) {
-    await runCommand('codesign', machOSigningArgs({ file, kind, identity, entitlements, timestamp }))
-    await runCommand('codesign', ['--verify', '--strict', file])
-    if (teamId) {
-      const { stderr = '' } = await runCommand('codesign', ['-dv', file])
-      if (!stderr.includes(`TeamIdentifier=${teamId}`)) {
-        throw new Error(`${file} was not signed with Team ID ${teamId}`)
-      }
+    const relativePath = posixRelative(root, file)
+    await runCommand('codesign', machOSigningArgs({ file, kind, identity, entitlements, timestamp, relativePath }))
+    try {
+      await runCommand('codesign', codesignVerifyArgs(file, { requirement: resolvedRequirement ?? null }))
+    } catch (error) {
+      throw new Error(`${file} failed codesign --verify --strict -R for Team ID ${teamId ?? '(none)'}: ${commandFailureDetail(error)}`)
     }
-    log(`signed (${kind}) ${path.relative(root, file)}`)
+    if (resolvedRequirement) {
+      await assertRuntimeAndJitEntitlements({ file, root, runCommand })
+    }
+    log(`signed (${kind}) ${relativePath}`)
   }
   return discovered
 }
 
+async function assertRuntimeAndJitEntitlements({ file, root, runCommand }) {
+  const described = await runCommand('codesign', ['-dv', file])
+  const describedText = `${described?.stderr ?? ''}\n${described?.stdout ?? ''}`
+  if (!codesignOutputHasRuntimeFlag(describedText)) {
+    throw new Error(`${file} is missing the hardened runtime flag`)
+  }
+  const entitlements = await runCommand('codesign', ['-d', '--entitlements', ':-', file])
+  const entitlementsText = `${entitlements?.stdout ?? ''}\n${entitlements?.stderr ?? ''}`
+  if (posixRelative(root, file) !== JIT_ENTITLEMENT_RELATIVE_PATH && entitlementsTextHasJit(entitlementsText)) {
+    throw new Error(`${file} has JIT entitlements but is not ${JIT_ENTITLEMENT_RELATIVE_PATH}`)
+  }
+}
+
 /** After packaging (including SKIP_NOTARIZE=1): every Mach-O in the extracted
- * component tarball must `codesign --verify --strict` and carry Team ID
- * HYAP444FN9. */
-export async function verifySignedMachOTree({ root, teamId = EXPECTED_TEAM_ID, runCommand = execFileAsync, files }) {
+ * component tarball must satisfy
+ * `codesign --verify --strict -R='anchor apple generic and certificate leaf[subject.OU] = "<TEAM>"'`,
+ * carry the hardened runtime flag, and (unless it is exactly
+ * {@link JIT_ENTITLEMENT_RELATIVE_PATH}) have no JIT entitlements.
+ * `requirement` replaces the team requirement (ad-hoc tests). Pass
+ * `requirement: null` to skip `-R`. `requireJitMatch` (default true) fails
+ * unless the JIT path occurs exactly once. */
+export async function verifySignedMachOTree({
+  root, teamId = EXPECTED_TEAM_ID, requirement, runCommand = execFileAsync, files, requireJitMatch = true,
+}) {
   if (!root || !path.isAbsolute(root)) throw new Error('root must be an absolute path')
   const discovered = files ?? findMachOFiles(root)
   if (discovered.length === 0) throw new Error(`no Mach-O files found under ${root}`)
+  const resolvedRequirement = requirement === undefined
+    ? (teamId ? teamIdRequirement(teamId) : null)
+    : requirement
   for (const { file } of discovered) {
-    await runCommand('codesign', ['--verify', '--strict', file])
-    const { stderr = '' } = await runCommand('codesign', ['-dv', file])
-    if (!stderr.includes(`TeamIdentifier=${teamId}`)) {
-      throw new Error(`${file} TeamIdentifier is not ${teamId}`)
+    try {
+      await runCommand('codesign', codesignVerifyArgs(file, { requirement: resolvedRequirement ?? null }))
+    } catch (error) {
+      throw new Error(`${file} failed codesign --verify --strict -R for Team ID ${teamId ?? '(none)'}: ${commandFailureDetail(error)}`)
+    }
+    if (resolvedRequirement) {
+      await assertRuntimeAndJitEntitlements({ file, root, runCommand })
     }
   }
+  if (requireJitMatch) assertExactlyOneJitPath(root, discovered)
   return discovered.length
 }
 

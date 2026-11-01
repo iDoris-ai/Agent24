@@ -1,18 +1,29 @@
 #!/usr/bin/env bash
-# 发布之后确认清单里的 Open Design 资产 URL 真的能下载。
+# 发布之后确认清单里的 Open Design 资产 URL 真的能下载，并且字节与清单一致。
 # 用法：
 #   bash apps/desktop/scripts/check-open-design-release-asset.sh <dmg 或清单 json>
-# 读出清单的 url / sha256 / size，用 curl -fsIL --max-time 60 确认 URL 可达。
-# 服务器如果返回了 Content-Length，再核对该值是否等于清单里的 size。
-# 没有 Content-Length 时只确认可达，不把 size 当成失败。
+# GET 下载到临时文件，计算 sha256 和字节数，与清单比对，退出时删掉临时文件。
+# 只接受 https。缺 Content-Length 不算失败：size 以实际下载的字节数为准。
+#
+# 单元测试的夹具是 Node 的 http.Server，签不出可用的 TLS 证书。因此字面量
+# http://127.0.0.1 和 http://[::1] 有豁免，其它 http（含 127.0.0.1.evil.com、带用户信息的 URL）拒绝。
+# 选择豁免而不是注入 curl：测试要走真实的下载、哈希和清理路径，替身 curl 盖不住这些。
+# 重定向逐跳重查：后续跳转仍须是 https，或仍停在字面 loopback 的 http 上。
 set -euo pipefail
 
 TARGET="${1:?usage: check-open-design-release-asset.sh <dmg-or-manifest-json>}"
 MOUNT=""
+TMP=""
+HDR=""
 cleanup() {
+  # bash 3.2 把 EXIT trap 的返回码当成脚本退出码。空变量上的 [[ ]] && rm
+  # 会留下状态 1，把已经打印 OK 的成功跑成失败。
   if [[ -n "$MOUNT" ]]; then
     hdiutil detach "$MOUNT" >/dev/null || true
   fi
+  if [[ -n "$TMP" ]]; then rm -f "$TMP"; fi
+  if [[ -n "$HDR" ]]; then rm -f "$HDR"; fi
+  return 0
 }
 trap cleanup EXIT
 
@@ -33,7 +44,20 @@ fi
 FIELDS="$(node -e '
 const fs = require("fs");
 const m = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-if (typeof m.url !== "string" || !/^https?:\/\//.test(m.url)) { console.error("manifest url is missing"); process.exit(1); }
+let parsed;
+try { parsed = new URL(m.url); }
+catch { console.error("manifest url is missing"); process.exit(1); }
+const host = parsed.hostname;
+const loopback = host === "127.0.0.1" || host === "[::1]" || host === "::1";
+const loopbackHttp = parsed.protocol === "http:" && loopback;
+if (parsed.username || parsed.password) {
+  console.error("manifest url must not contain credentials");
+  process.exit(1);
+}
+if (parsed.protocol !== "https:" && !loopbackHttp) {
+  console.error("manifest url must be https (http is only allowed for a literal loopback test server)");
+  process.exit(1);
+}
 if (typeof m.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(m.sha256)) { console.error("manifest sha256 is missing"); process.exit(1); }
 if (typeof m.size !== "number" || !Number.isInteger(m.size) || m.size <= 0) { console.error("manifest size is missing"); process.exit(1); }
 process.stdout.write(m.url + "\n" + m.sha256 + "\n" + String(m.size) + "\n");
@@ -42,37 +66,61 @@ URL="$(printf '%s\n' "$FIELDS" | sed -n '1p')"
 SHA="$(printf '%s\n' "$FIELDS" | sed -n '2p')"
 SIZE="$(printf '%s\n' "$FIELDS" | sed -n '3p')"
 
-if ! HEADERS="$(curl -fsIL --max-time 60 "$URL")"; then
-  echo "FAIL: asset URL is not reachable: $URL" >&2
-  exit 1
-fi
-
-# 每一跳都有自己的状态行。302 上的 Content-Length（常见是 0）不能留给
-# 后面没带该头的最终 200，否则会把可达的资产误报成尺寸不符。
-CL="$(printf '%s\n' "$HEADERS" | awk '
-BEGIN { last = "" }
-{
-  line = $0
-  sub(/\r$/, "", line)
-  if (line ~ /^HTTP\//) {
-    last = ""
-    next
-  }
-  key = tolower(line)
-  if (key ~ /^content-length:/) {
-    sub(/^[^:]*:[[:space:]]*/, "", line)
-    last = line
-  }
+url_is_allowed() {
+  node -e '
+    let parsed;
+    try { parsed = new URL(process.argv[1]); }
+    catch { process.exit(1); }
+    const host = parsed.hostname;
+    const loopback = host === "127.0.0.1" || host === "[::1]" || host === "::1";
+    if (parsed.protocol === "https:") process.exit(0);
+    if (parsed.protocol === "http:" && loopback && !parsed.username && !parsed.password) process.exit(0);
+    process.exit(1);
+  ' "$1"
 }
-END { print last }
-')"
-if [[ -n "$CL" && "$CL" != "$SIZE" ]]; then
-  echo "FAIL: Content-Length $CL does not match manifest size $SIZE ($URL)" >&2
+
+TMP="$(mktemp "${TMPDIR:-/tmp}/a24-od-asset.XXXXXX")"
+CURRENT="$URL"
+for HOP in 1 2 3 4 5; do
+  url_is_allowed "$CURRENT" || { echo "FAIL: asset URL must be https (http is only allowed for a literal loopback test server): $CURRENT" >&2; exit 1; }
+  HDR="$(mktemp "${TMPDIR:-/tmp}/a24-od-asset-hdr.XXXXXX")"
+  PROTO=(--proto '=https')
+  case "$CURRENT" in
+    http://127.0.0.1[:/]*|http://\[::1\][:/]*) PROTO=(--proto '=http,https') ;;
+  esac
+  if ! curl -fsS --max-time 60 "${PROTO[@]}" -D "$HDR" -o "$TMP" "$CURRENT"; then
+    echo "FAIL: asset URL is not reachable: $CURRENT" >&2
+    exit 1
+  fi
+  STATUS="$(awk 'BEGIN { code = "" } { line = $0; sub(/\r$/, "", line); if (line ~ /^HTTP\//) code = $2 } END { print code }' "$HDR")"
+  case "$STATUS" in
+    301|302|303|307|308)
+      LOC="$(awk 'BEGIN { loc = "" } { line = $0; sub(/\r$/, "", line); key = tolower(line); if (key ~ /^location:/) { sub(/^[^:]*:[[:space:]]*/, "", line); loc = line } } END { print loc }' "$HDR")"
+      rm -f "$HDR"
+      HDR=""
+      [[ -n "$LOC" ]] || { echo "FAIL: redirect is missing a Location header: $CURRENT" >&2; exit 1; }
+      CURRENT="$(node -e 'process.stdout.write(new URL(process.argv[1], process.argv[2]).href)' "$LOC" "$CURRENT")"
+      if [[ "$HOP" -eq 5 ]]; then
+        echo "FAIL: too many redirects: $URL" >&2
+        exit 1
+      fi
+      ;;
+    *)
+      rm -f "$HDR"
+      HDR=""
+      break
+      ;;
+  esac
+done
+
+ACTUAL_SHA="$(shasum -a 256 "$TMP" | awk '{print $1}')"
+ACTUAL_SIZE="$(wc -c < "$TMP" | tr -d '[:space:]')"
+if [[ "$ACTUAL_SIZE" != "$SIZE" ]]; then
+  echo "FAIL: downloaded size $ACTUAL_SIZE does not match manifest size $SIZE ($URL)" >&2
   exit 1
 fi
-
-if [[ -n "$CL" ]]; then
-  echo "OK: $URL reachable, Content-Length $CL matches manifest size, sha256 $SHA"
-else
-  echo "OK: $URL reachable (no Content-Length; size not checked), sha256 $SHA"
+if [[ "$ACTUAL_SHA" != "$SHA" ]]; then
+  echo "FAIL: downloaded sha256 $ACTUAL_SHA does not match manifest sha256 $SHA ($URL)" >&2
+  exit 1
 fi
+echo "OK: $URL reachable, downloaded size $ACTUAL_SIZE matches manifest, sha256 $SHA verified"

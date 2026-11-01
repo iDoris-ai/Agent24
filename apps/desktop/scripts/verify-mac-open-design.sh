@@ -7,7 +7,8 @@
 #   2. Resources 里没有 app/ open-design/ open-design-web-standalone/ 目录，也没有任何 *.tar.gz（C1）
 #   3. 清单里的 sha256/size 与 tarball-dir 里那个资产文件实际一致
 #   4. DMG 不超过 A24_DMG_MAX_MB（默认 250），防止 Open Design 被重新打进安装包
-#   5. 解开 tarball，对每个 Mach-O 跑 codesign --verify --strict，TeamIdentifier 必须是 HYAP444FN9
+#   5. 解开 tarball，拒绝硬链接（nlink>1 的普通文件）和非常规文件（非普通文件/目录/软链接）
+#   6. 对每个 Mach-O 跑 codesign --verify --strict -R（Team ID 必须是 HYAP444FN9）
 #      （SKIP_NOTARIZE=1 时同样执行；这一步不依赖公证）
 set -euo pipefail
 
@@ -40,7 +41,7 @@ ASSET="$(basename "$URL")"
 for tree in app open-design open-design-web-standalone; do
   [[ ! -e "$RES/$tree" ]] || fail "Open Design 目录被打进了安装包：$RES/$tree"
 done
-if find "$RES" -maxdepth 2 -name '*.tar.gz' -print | grep -q .; then
+if [[ -n "$(find "$RES" -maxdepth 2 -name '*.tar.gz' -print -quit)" ]]; then
   find "$RES" -maxdepth 2 -name '*.tar.gz' >&2
   fail "安装包 Resources 内发现 .tar.gz —— 按需组件绝不能进安装包"
 fi
@@ -61,12 +62,18 @@ EXTRACT="$(mktemp -d "${TMPDIR:-/tmp}/a24-od-verify.XXXXXX")"
 cleanup_extract() { rm -rf "$EXTRACT"; }
 trap cleanup_extract EXIT
 tar -xzf "$TARBALL" -C "$EXTRACT"
+# 与运行时安装器 assertExtractedEntriesAreRegular 对齐：硬链接和非常规文件在这里就失败，
+# 不必等用户下载后才被安装器拒绝。-print -quit 避免 pipefail 下 find | grep -q 的 SIGPIPE。
+HARDLINK="$(find "$EXTRACT" -type f -links +1 -print -quit)"
+[[ -z "$HARDLINK" ]] || fail "组件含硬链接：${HARDLINK}"
+SPECIAL="$(find "$EXTRACT" ! -type f ! -type d ! -type l -print -quit)"
+[[ -z "$SPECIAL" ]] || fail "组件含非常规文件：${SPECIAL}"
 if [[ "${A24_OD_SKIP_CODESIGN:-}" == "1" ]]; then
   MACH_O_NOTE="Mach-O codesign 已跳过（A24_OD_SKIP_CODESIGN=1）"
 else
   node "$SCRIPT_DIR/open-design-mac-release.mjs" verify-signed "$EXTRACT" \
-    || fail "Open Design tarball 里有 Mach-O 未通过 codesign --verify --strict，或 TeamIdentifier 不是 HYAP444FN9"
+    || fail "Open Design tarball 里有 Mach-O 未通过 codesign --verify --strict -R（Team ID HYAP444FN9），或缺少 runtime，或白名单外带了 JIT entitlements"
   MACH_O_NOTE="tarball 内 Mach-O 已验证 Team ID"
 fi
 
-echo "OK: manifest 在包内（url=${URL}），包内无 Open Design 目录/tarball，资产 sha256/size 一致，DMG=${DMG_BYTES} 字节（上限 ${MAX_MB}MB），${MACH_O_NOTE}"
+echo "OK: manifest 在包内（url=${URL}），包内无 Open Design 目录/tarball，解开后无硬链接、无非常规文件，资产 sha256/size 一致，DMG=${DMG_BYTES} 字节（上限 ${MAX_MB}MB），${MACH_O_NOTE}"

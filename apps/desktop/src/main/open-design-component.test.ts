@@ -1843,6 +1843,44 @@ describe('loopback download override (release verification hook)', () => {
     expect(fileServer.requestCount()).toBe(0)
   })
 
+  it('does not apply the loopback override to a later hop that stays on that origin', async () => {
+    const asset = 'open-design-test.tar.gz'
+    const stage = seedTreeFor('a24-od-stage-override-same-origin-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath, { url: `https://github.com/iDoris-ai/Agent24/releases/download/v9.9.9/${asset}` })
+    let payloadHits = 0
+    const server = http.createServer((req, res) => {
+      const pathname = decodeURIComponent(new URL(req.url ?? '/', 'http://127.0.0.1').pathname)
+      if (pathname === `/payload/${asset}`) {
+        payloadHits += 1
+        const body = fs.readFileSync(tarPath)
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': String(body.length) })
+        res.end(body)
+        return
+      }
+      if (pathname !== `/${asset}`) {
+        res.writeHead(404)
+        res.end()
+        return
+      }
+      res.writeHead(302, { Location: `/payload/${asset}` })
+      res.end()
+    })
+    servers.push(server)
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address() as AddressInfo
+    const installer = new OpenDesignComponentInstaller({
+      manifest,
+      componentsRoot: tmpDir('a24-od-root-override-same-origin-'),
+      env: { [ENV]: `http://127.0.0.1:${port}/` },
+    })
+    const result = await installer.install()
+    expect(result.state).toBe('failed')
+    expect(result.error).toContain('first hop')
+    expect(result.error).toContain(`http://127.0.0.1:${port}/payload/${asset}`)
+    expect(payloadHits).toBe(0)
+  })
+
   it('without the override a plain-http manifest URL is still refused', async () => {
     const stage = seedTreeFor('a24-od-stage-noverride-')
     const tarPath = buildTarball(stage)

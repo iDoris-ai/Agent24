@@ -90,21 +90,31 @@ Open Design 不进 dmg：`release-mac.sh` 在打包前构建它、签名其原�
 - 组件清单的下载仓库写死为 `iDoris-ai/Agent24`，不读环境变量 `A24_OD_REPOSITORY`。
 - **为什么原生模块必须同 Team ID 签名**：组件的 daemon 跑在 app 自己的二进制里（`ELECTRON_RUN_AS_NODE`），
   app 开了 Hardened Runtime 且没有 `disable-library-validation`，所以下载来的 `.node`/`.dylib` 不同 Team ID 就加载不了。
-  `open-design-mac-release.mjs sign` 对组件树里每个 Mach-O 用 Developer ID + `--timestamp` 签名并 `codesign --verify --strict`。
+  `open-design-mac-release.mjs sign` 对组件树里每个 Mach-O 用 Developer ID + `--timestamp` 签名，
+  再用 `codesign --verify --strict -R='anchor apple generic and certificate leaf[subject.OU] = "HYAP444FN9"'` 校验。
+  ad-hoc（身份 `-`）没有 Team ID，测试可以注入另一条 requirement，或者不传 Team ID 以跳过 `-R`。
+  带 Team 要求时还会看 `codesign -dv` 的 flags 含 `runtime`。
   executable 和正式签名的库带 `--options runtime`。`.dylib` / `.node` 不挂 entitlements。
-  JIT 两项（`allow-jit`、`allow-unsigned-executable-memory`）只给白名单里的 executable，目前只有 `opencode`（bun/JSC）。
+  JIT 两项（`allow-jit`、`allow-unsigned-executable-memory`）只给 stage 树里这一条精确相对路径：
+  `open-design/bin/libexec/opencode/opencode`（bun/JSC）。不再按 basename 放行。
+  这条路径的命中数必须正好是 1，否则签名和 `verify-signed` 都失败。
+  其它 Mach-O 用 `codesign -d --entitlements :-` 确认没有这两项。
   `ffmpeg`、`esbuild`、`spawn-helper`、`vela` 只签 Hardened Runtime。应用自己的
   `build/entitlements.mac.plist` 不变，仍给 Electron/V8 用。
 - **组件 tarball 要不要公证**：应用自己 `fetch` 下载，文件没有 quarantine 标记，Gatekeeper 不评估它，能否加载只看 Team ID。
   松散文件也无法 staple。脚本仍会把 zip 提交公证（几分钟）以登记 cdhash，万一用户用浏览器手动下载资产也能放行；`SKIP_NOTARIZE=1` 时跳过公证。
-  无论是否公证，`verify-mac-open-design.sh` 都会把 tarball 解到临时目录，对每个 Mach-O 跑
-  `codesign --verify --strict`，并核对 `TeamIdentifier` 是 `HYAP444FN9`。
+  顺序是先打 tarball，再把这份 tarball 解到临时副本，公证 zip 只打这个副本，不再读可变的 stage。
+  无论是否公证，`verify-mac-open-design.sh` 都会把 tarball 解到临时目录，对每个 Mach-O 跑上面的
+  `codesign --verify --strict -R`，并核对 runtime 与 JIT 白名单。
 - `verify-mac-open-design.sh` 还校验：清单在包内且字段正确（version 来自 pack 模块的 pin，不再写死），
   下载 URL 的 owner/repo 只能是 `iDoris-ai/Agent24`，包内没有 Open Design 目录/tarball，资产 sha256/size 与清单一致，
-  DMG 不超过 `A24_DMG_MAX_MB`（默认 250）。
+  解开后的树里没有硬链接（`nlink > 1` 的普通文件）、也没有非常规文件（不是普通文件、目录或软链接），
+  DMG 不超过 `A24_DMG_MAX_MB`（默认 250）。这两项和运行时安装器的拒绝一致，发布闸门不再只查 Mach-O 签名。
 - 脚本结束时打印上传命令：`gh release upload "$A24_RELEASE_TAG" "<tarball 绝对路径>" -R iDoris-ai/Agent24`。
-  **发布之后**再跑可达性检查（读清单里的 URL、sha256、size；`curl -fsIL --max-time 60` 确认 URL 可达，服务器给了
-  `Content-Length` 时再核对 size）：
+  **发布之后**再跑可达性检查。脚本 GET 下载到临时文件，计算 sha256 和字节数，与清单比对，用完删除临时文件。
+  只接受 https。单元测试的夹具服务器没有 TLS，所以字面量 `http://127.0.0.1` 和 `http://[::1]` 有豁免
+  （不注入 curl，这样测试仍走真实的下载、哈希和删除）；其它 http 直接拒绝。重定向逐跳重查。
+  缺 Content-Length 不再失败，size 以实际下载的字节数为准。OK 行会写明 sha256 已校验：
 
   ```bash
   bash apps/desktop/scripts/check-open-design-release-asset.sh <dmg 或 open-design-component.json>
@@ -113,9 +123,20 @@ Open Design 不进 dmg：`release-mac.sh` 在打包前构建它、签名其原�
 - 发布前本地验证（不上传 GitHub）：把 tarball 用本机 http 服务起来，启动已签名 app 时设
   `A24_OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL=http://127.0.0.1:<port>/` 或 `http://[::1]:<port>/`。
   只接受这两个字面地址的 `http`，不接受 `localhost`，也不把主机名放进全局下载白名单。
-  豁免只对这一个 origin（协议 + 主机 + 端口）生效，跳到别的端口或 `https` 会被拒绝。
+  豁免只对首跳生效。后续跳转不能进入这个 origin（停在同一端口的另一条路径也不行），
+  跳到别的端口或 `https` 同样会被拒绝。
   覆盖只改资产所在目录，文件名仍用清单里的名字。sha256 仍按包内清单校验。
   覆盖生效时下载卡片会显示「使用本地测试源」。
+
+### 出 preview 前必做
+
+`release-mac.sh` 结束时会打印这条。在当前 head 打出签名包之后、发 preview 之前，用本地测试源把下载 → 安装 → 启动走一遍：
+
+1. `A24_RELEASE_TAG=v0.6.0-preview.<日期>.<序号> SKIP_NOTARIZE=1 bash apps/desktop/scripts/release-mac.sh`
+   （要连公证一起做就不要设 `SKIP_NOTARIZE`）。产物是 `apps/desktop/release/*.dmg` 和 `.open-design-component-dist/open-design-*.tar.gz`。
+2. 在 tarball 所在目录起一个只听 loopback 的服务，例如 `python3 -m http.server 8765 --bind 127.0.0.1`。
+3. 从 dmg 装好 Agent24，启动时带上 `A24_OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL=http://127.0.0.1:8765/`。
+4. 打开 Design 页，确认卡片写着「使用本地测试源」，下载完成、安装成功、Open Design 能启动。
 
 ## 验证
 
@@ -146,6 +167,10 @@ dmg 路径：`spctl -t open --context context:primary-signature` + `stapler vali
 | `notarytool` 报 keychain profile 不存在 | 重新 `store-credentials`（见前置 2） |
 | electron-builder 报 identity 前缀错误 | `mac.identity` 不能带 `Developer ID Application:` 前缀（脚本已处理） |
 | 校验时 `spctl` 为 `rejected` / `source=Unnotarized Developer ID` | 没公证或公证后又改动了 dmg（改动即作废票据）；公证必须是最后一步，之后只能 staple |
+
+## 残余风险
+
+- 41b3aaf5 给运行时安装器加了 nlink/非常规文件拒绝；406bf752 的 e2e 没有覆盖到，出 preview 前必须在当前 head 的签名包上重跑。
 
 ## 未自动化的点
 

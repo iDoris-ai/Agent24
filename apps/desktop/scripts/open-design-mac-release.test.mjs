@@ -17,7 +17,7 @@ import {
   classifyMachO,
   desktopPackageVersion,
   findMachOFiles,
-  JIT_ENTITLEMENT_BASENAMES,
+  JIT_ENTITLEMENT_RELATIVE_PATH,
   machOSigningArgs,
   signOpenDesignTree,
   teamIdFromIdentity,
@@ -240,7 +240,7 @@ test('signOpenDesignTree signs and verifies every Mach-O (ad-hoc stand-in for th
   try {
     fs.copyFileSync('/usr/bin/true', path.join(root, 'tool'))
     fs.writeFileSync(path.join(root, 'x.js'), '//')
-    const signed = await signOpenDesignTree({ root, identity: '-', timestamp: false })
+    const signed = await signOpenDesignTree({ root, identity: '-', timestamp: false, requireJitMatch: false })
     assert.equal(signed.length, 1)
     execFileSync('codesign', ['--verify', '--strict', path.join(root, 'tool')])
   } finally {
@@ -261,21 +261,33 @@ test('signOpenDesignTree fails when there is nothing to sign, or the identity ha
 
 const DEVELOPER_ID = 'Developer ID Application: Huifeng Jiao (HYAP444FN9)'
 
-test('libraries get no entitlements; only opencode gets the JIT plist; executables use runtime', () => {
+test('libraries get no entitlements; only the exact opencode path gets the JIT plist; executables use runtime', () => {
   const entitlements = '/tmp/entitlements.mac.plist'
   const identity = DEVELOPER_ID
   for (const name of ['libfoo.dylib', 'addon.node']) {
-    const args = machOSigningArgs({ file: `/tree/${name}`, kind: 'library', identity, entitlements })
+    const args = machOSigningArgs({ file: `/tree/${name}`, kind: 'library', identity, entitlements, relativePath: name })
     assert.equal(args.includes('--entitlements'), false)
     assert.deepEqual(args.slice(args.indexOf('--options'), args.indexOf('--options') + 2), ['--options', 'runtime'])
   }
-  for (const name of ['ffmpeg', 'esbuild', 'spawn-helper', 'vela']) {
-    const args = machOSigningArgs({ file: `/tree/${name}`, kind: 'executable', identity, entitlements })
-    assert.equal(args.includes('--entitlements'), false)
+  for (const name of ['ffmpeg', 'esbuild', 'spawn-helper', 'vela', 'opencode']) {
+    const args = machOSigningArgs({
+      file: `/tree/${name}`,
+      kind: 'executable',
+      identity,
+      entitlements,
+      relativePath: name === 'opencode' ? 'vendor/opencode' : name,
+    })
+    assert.equal(args.includes('--entitlements'), false, name)
     assert.deepEqual(args.slice(args.indexOf('--options'), args.indexOf('--options') + 2), ['--options', 'runtime'])
   }
-  const opencode = machOSigningArgs({ file: '/tree/opencode', kind: 'executable', identity, entitlements })
-  assert.equal(JIT_ENTITLEMENT_BASENAMES.has('opencode'), true)
+  const opencode = machOSigningArgs({
+    file: `/tree/${JIT_ENTITLEMENT_RELATIVE_PATH}`,
+    kind: 'executable',
+    identity,
+    entitlements,
+    relativePath: JIT_ENTITLEMENT_RELATIVE_PATH,
+  })
+  assert.equal(JIT_ENTITLEMENT_RELATIVE_PATH, 'open-design/bin/libexec/opencode/opencode')
   assert.equal(opencode[opencode.indexOf('--entitlements') + 1], entitlements)
   assert.deepEqual(opencode.slice(opencode.indexOf('--options'), opencode.indexOf('--options') + 2), ['--options', 'runtime'])
 })
@@ -287,7 +299,7 @@ test('signOpenDesignTree records codesign --verify and checks an injected Team I
     const calls = []
     const runCommand = async (cmd, args) => {
       calls.push([cmd, [...args]])
-      if (args[0] === '-dv') return { stdout: '', stderr: 'TeamIdentifier=HYAP444FN9\n' }
+      if (args[0] === '-dv') return { stdout: '', stderr: 'CodeDirectory v=20500 flags=0x10000(runtime) hashes=1\n' }
       return { stdout: '', stderr: '' }
     }
     await signOpenDesignTree({
@@ -295,11 +307,17 @@ test('signOpenDesignTree records codesign --verify and checks an injected Team I
       identity: '-',
       timestamp: false,
       expectedTeamId: 'HYAP444FN9',
+      requireJitMatch: false,
       runCommand,
       files: [{ file: tool, kind: 'executable' }],
     })
-    assert.ok(calls.some(([cmd, args]) => cmd === 'codesign' && args[0] === '--verify' && args[1] === '--strict' && args[2] === tool))
+    const verified = calls.find(([cmd, args]) => cmd === 'codesign' && args[0] === '--verify')
+    assert.ok(verified, 'codesign --verify was not invoked')
+    assert.equal(verified[1][1], '--strict')
+    assert.deepEqual(verified[1].slice(2, 4), ['-R', 'anchor apple generic and certificate leaf[subject.OU] = "HYAP444FN9"'])
+    assert.equal(verified[1].at(-1), tool)
     assert.ok(calls.some(([cmd, args]) => cmd === 'codesign' && args[0] === '-dv' && args[1] === tool))
+    assert.ok(calls.some(([cmd, args]) => cmd === 'codesign' && args[0] === '-d' && args[1] === '--entitlements' && args[2] === ':-' && args[3] === tool))
     const signArgs = calls.find(([cmd, args]) => cmd === 'codesign' && args.includes('--sign'))[1]
     assert.deepEqual(signArgs.slice(signArgs.indexOf('--options'), signArgs.indexOf('--options') + 2), ['--options', 'runtime'])
     assert.equal(signArgs.includes('--entitlements'), false)
@@ -309,10 +327,12 @@ test('signOpenDesignTree records codesign --verify and checks an injected Team I
       root,
       identity: '-',
       timestamp: false,
+      requireJitMatch: false,
       runCommand: async (cmd, args) => { skipped.push(args); return { stdout: '', stderr: '' } },
       files: [{ file: tool, kind: 'executable' }],
     })
     assert.equal(skipped.some((args) => args[0] === '-dv'), false)
+    assert.equal(skipped.some((args) => args.includes('-R')), false)
 
     await assert.rejects(
       signOpenDesignTree({
@@ -320,7 +340,15 @@ test('signOpenDesignTree records codesign --verify and checks an injected Team I
         identity: '-',
         timestamp: false,
         expectedTeamId: 'HYAP444FN9',
-        runCommand: async (cmd, args) => ({ stdout: '', stderr: args[0] === '-dv' ? 'TeamIdentifier=not set\n' : '' }),
+        requireJitMatch: false,
+        runCommand: async (cmd, args) => {
+          if (args.includes('-R')) {
+            const error = new Error('code failed to satisfy specified code requirement(s)')
+            error.stderr = 'test-requirement: code failed to satisfy specified code requirement(s)\n'
+            throw error
+          }
+          return { stdout: '', stderr: 'Identifier=TeamIdentifier=HYAP444FN9\nExecutable=/tmp/TeamIdentifier=HYAP444FN9\n' }
+        },
         files: [{ file: tool, kind: 'executable' }],
       }),
       /Team ID HYAP444FN9/,
@@ -330,28 +358,155 @@ test('signOpenDesignTree records codesign --verify and checks an injected Team I
   }
 })
 
-test('verifySignedMachOTree requires codesign --verify and the expected Team ID', async () => {
+function signedTreeRunCommand({ jitOn = null } = {}) {
+  return async (cmd, args) => {
+    if (args.includes('-R')) return { stdout: '', stderr: '' }
+    if (args[0] === '-dv') return { stdout: '', stderr: 'CodeDirectory v=20500 flags=0x10000(runtime) hashes=1\nTeamIdentifier=not set\n' }
+    if (args[0] === '-d' && args[1] === '--entitlements') {
+      const file = args.at(-1)
+      if (jitOn && file === jitOn) {
+        return { stdout: '<key>com.apple.security.cs.allow-jit</key><true/>', stderr: '' }
+      }
+      return { stdout: '', stderr: '' }
+    }
+    return { stdout: '', stderr: '' }
+  }
+}
+
+test('verifySignedMachOTree uses codesign -R, requires runtime, and rejects JIT entitlements off the whitelist', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-verify-signed-'))
   try {
     const file = path.join(root, 'tool')
     const calls = []
     const count = await verifySignedMachOTree({
       root,
+      requireJitMatch: false,
       files: [{ file, kind: 'executable' }],
       runCommand: async (cmd, args) => {
         calls.push(args)
-        return { stdout: '', stderr: args[0] === '-dv' ? 'TeamIdentifier=HYAP444FN9\n' : '' }
+        return signedTreeRunCommand()(cmd, args)
       },
     })
     assert.equal(count, 1)
-    assert.deepEqual(calls[0], ['--verify', '--strict', file])
+    assert.deepEqual(calls[0].slice(0, 2), ['--verify', '--strict'])
+    assert.equal(calls[0][2], '-R')
+    assert.match(calls[0][3], /certificate leaf\[subject\.OU\] = "HYAP444FN9"/)
+    assert.equal(calls[0].at(-1), file)
     await assert.rejects(
       verifySignedMachOTree({
         root,
+        requireJitMatch: false,
         files: [{ file, kind: 'executable' }],
-        runCommand: async (cmd, args) => ({ stdout: '', stderr: args[0] === '-dv' ? 'TeamIdentifier=\n' : '' }),
+        runCommand: async (cmd, args) => {
+          if (args.includes('-R')) {
+            const error = new Error('code failed to satisfy specified code requirement(s)')
+            error.stderr = 'test-requirement: code failed to satisfy specified code requirement(s)\n'
+            throw error
+          }
+          return { stdout: '', stderr: 'Executable=/tmp/TeamIdentifier=HYAP444FN9\nIdentifier=TeamIdentifier=HYAP444FN9\n' }
+        },
       }),
-      /TeamIdentifier is not HYAP444FN9/,
+      /Team ID HYAP444FN9/,
+    )
+    await assert.rejects(
+      verifySignedMachOTree({
+        root,
+        requireJitMatch: false,
+        files: [{ file, kind: 'executable' }],
+        runCommand: async () => ({ stdout: '', stderr: 'flags=0x2(adhoc)\n' }),
+      }),
+      /hardened runtime/,
+    )
+    await assert.rejects(
+      verifySignedMachOTree({
+        root,
+        requireJitMatch: false,
+        files: [{ file, kind: 'executable' }],
+        runCommand: signedTreeRunCommand({ jitOn: file }),
+      }),
+      /JIT entitlements/,
+    )
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('sign and verify fail unless the JIT path occurs exactly once', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-jit-count-'))
+  try {
+    const opencode = path.join(root, JIT_ENTITLEMENT_RELATIVE_PATH)
+    const decoy = path.join(root, 'vendor', 'opencode')
+    const entitlements = path.join(root, 'entitlements.plist')
+    fs.writeFileSync(entitlements, '<plist/>')
+    const calls = []
+    await signOpenDesignTree({
+      root,
+      identity: '-',
+      timestamp: false,
+      entitlements,
+      files: [
+        { file: opencode, kind: 'executable' },
+        { file: decoy, kind: 'executable' },
+      ],
+      runCommand: async (cmd, args) => {
+        calls.push([...args])
+        return { stdout: '', stderr: '' }
+      },
+    })
+    const signed = calls.filter((args) => args.includes('--sign'))
+    const openArgs = signed.find((args) => args.at(-1) === opencode)
+    const decoyArgs = signed.find((args) => args.at(-1) === decoy)
+    assert.ok(openArgs)
+    assert.equal(openArgs[openArgs.indexOf('--entitlements') + 1], entitlements)
+    assert.equal(decoyArgs.includes('--entitlements'), false)
+
+    await assert.rejects(
+      signOpenDesignTree({
+        root,
+        identity: '-',
+        timestamp: false,
+        files: [{ file: decoy, kind: 'executable' }],
+        runCommand: async () => ({ stdout: '', stderr: '' }),
+      }),
+      /exactly one Mach-O at open-design\/bin\/libexec\/opencode\/opencode/,
+    )
+    await assert.rejects(
+      signOpenDesignTree({
+        root,
+        identity: '-',
+        timestamp: false,
+        files: [
+          { file: opencode, kind: 'executable' },
+          { file: opencode, kind: 'executable' },
+        ],
+        runCommand: async () => ({ stdout: '', stderr: '' }),
+      }),
+      /found 2/,
+    )
+    await assert.rejects(
+      verifySignedMachOTree({
+        root,
+        files: [{ file: decoy, kind: 'executable' }],
+        runCommand: signedTreeRunCommand(),
+      }),
+      /found 0/,
+    )
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('an ad-hoc Mach-O named TeamIdentifier=HYAP444FN9 does not satisfy the Team ID requirement', macOnly, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-team-name-'))
+  try {
+    const file = path.join(root, 'TeamIdentifier=HYAP444FN9')
+    fs.copyFileSync('/usr/bin/true', file)
+    execFileSync('codesign', ['--force', '--sign', '-', '--options', 'runtime', file], { stdio: 'pipe' })
+    const described = spawnSync('codesign', ['-dv', file], { encoding: 'utf8' })
+    assert.match(`${described.stdout}\n${described.stderr}`, /TeamIdentifier=HYAP444FN9/)
+    await assert.rejects(
+      verifySignedMachOTree({ root, requireJitMatch: false }),
+      /Team ID HYAP444FN9/,
     )
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
@@ -383,6 +538,7 @@ test('dylib and node samples are signed without entitlements', macOnly, async ()
       identity: '-',
       timestamp: false,
       entitlements,
+      requireJitMatch: false,
       runCommand: async (cmd, args) => {
         calls.push([...args])
         return execFileAsync(cmd, args)
@@ -415,6 +571,11 @@ test('release-mac.sh pins the repository and prints the upload command; verify r
   assert.match(release, /A24_OD_SKIP_CODESIGN 不能用于正式发布/)
   assert.match(release, /A24_OD_SKIP_CODESIGN= bash "\$DESKTOP_DIR\/scripts\/verify-mac-open-design\.sh"/)
   assert.match(release, /gh release upload \\"\$\{A24_RELEASE_TAG\}\\" \\"\$\{OD_TARBALL\}\\" -R iDoris-ai\/Agent24/)
+  const packAt = release.indexOf('pnpm pack:open-design')
+  const dittoAt = release.indexOf('ditto -c -k --sequesterRsrc')
+  assert.ok(packAt > 0 && dittoAt > packAt, 'notarize zip must be built after the tarball')
+  assert.match(release, /ditto -c -k --sequesterRsrc "\$OD_NOTARY_SRC" "\$OD_NOTARY_ZIP"/)
+  assert.match(release, /出 preview 前，必须在当前 head 的签名包上，用本地测试源重跑一遍下载 → 安装 → 启动/)
   const verify = fs.readFileSync(new URL('./verify-mac-open-design.sh', import.meta.url), 'utf8')
   assert.equal(verify.includes("'0.22.2'"), false)
   assert.match(verify, /OPEN_DESIGN_PIN_VERSION/)
@@ -508,7 +669,10 @@ function verifyFixture(dir, mutate) {
   fs.mkdirSync(tarballDir)
   const asset = 'open-design-fixture.tar.gz'
   const tarball = path.join(tarballDir, asset)
-  execFileSync('tar', ['-czf', tarball, '-C', payload, 'hello.txt'], { stdio: 'pipe' })
+  execFileSync('tar', ['-czf', tarball, '-C', payload, 'hello.txt'], {
+    stdio: 'pipe',
+    env: { ...process.env, COPYFILE_DISABLE: '1' },
+  })
   const sha256 = execFileSync('shasum', ['-a', '256', tarball], { encoding: 'utf8' }).split(/\s+/)[0]
   const size = fs.statSync(tarball).size
   const manifest = {
@@ -520,7 +684,7 @@ function verifyFixture(dir, mutate) {
     sha256,
     size,
   }
-  if (mutate) mutate({ manifest, resources })
+  if (mutate) mutate({ manifest, resources, payload, tarball, tarballDir })
   fs.writeFileSync(path.join(resources, 'open-design-component.json'), `${JSON.stringify(manifest)}\n`)
   const dmg = path.join(dir, 'Agent24.dmg')
   fs.writeFileSync(dmg, 'not-a-real-dmg')
@@ -557,6 +721,47 @@ test('verify-mac-open-design fails when the app bundle contains an Open Design d
     const output = `${result.stdout}\n${result.stderr}`
     assert.notEqual(result.status, 0, output)
     assert.match(output, /Open Design 目录被打进了安装包/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+function replaceFixtureTarball(payload, tarball, manifest) {
+  fs.rmSync(tarball, { force: true })
+  execFileSync('tar', ['-czf', tarball, '-C', payload, '.'], {
+    stdio: 'pipe',
+    env: { ...process.env, COPYFILE_DISABLE: '1' },
+  })
+  manifest.sha256 = execFileSync('shasum', ['-a', '256', tarball], { encoding: 'utf8' }).split(/\s+/)[0]
+  manifest.size = fs.statSync(tarball).size
+}
+
+test('verify-mac-open-design fails when the tarball contains a hardlink', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-verify-hardlink-'))
+  try {
+    const result = runVerify(dir, ({ manifest, payload, tarball }) => {
+      fs.writeFileSync(path.join(payload, 'a.txt'), 'same')
+      fs.linkSync(path.join(payload, 'a.txt'), path.join(payload, 'b.txt'))
+      replaceFixtureTarball(payload, tarball, manifest)
+    })
+    const output = `${result.stdout}\n${result.stderr}`
+    assert.notEqual(result.status, 0, output)
+    assert.match(output, /组件含硬链接/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('verify-mac-open-design fails when the tarball contains a fifo', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-verify-fifo-'))
+  try {
+    const result = runVerify(dir, ({ manifest, payload, tarball }) => {
+      execFileSync('mkfifo', [path.join(payload, 'pipe')], { stdio: 'pipe' })
+      replaceFixtureTarball(payload, tarball, manifest)
+    })
+    const output = `${result.stdout}\n${result.stderr}`
+    assert.notEqual(result.status, 0, output)
+    assert.match(output, /组件含非常规文件/)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

@@ -752,8 +752,10 @@ export const OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL_ENV = 'A24_OPEN_DESIGN_COMPONE
  *    manifest baked into the app, so a swapped tarball is rejected exactly as
  *    in production;
  *  - it only rewrites the asset's directory, keeping the manifest's asset file
- *    name. The exemption is that one origin: another port or https is not it,
- *    and the hostname is not added to the global download allowlist.
+ *    name. The exemption applies to the first request only: a later hop that
+ *    lands on the override origin (including a redirect that stays there) is
+ *    rejected. Another port or https is not the override, and the hostname is
+ *    not added to the global download allowlist.
  * Anything malformed is ignored (production behaviour), never half-applied.
  */
 export function resolveLocalDownloadOverride(env: NodeJS.ProcessEnv): URL | null {
@@ -1059,7 +1061,8 @@ export class OpenDesignComponentInstaller {
     }
   }
 
-  /** True only for the exact override origin (scheme + host + port). */
+  /** True only for the exact override origin (scheme + host + port).
+   * Callers must apply this on the first hop only. */
   private isLocalOverrideUrl(url: string): boolean {
     if (!this.localOverride) return false
     try {
@@ -1072,12 +1075,16 @@ export class OpenDesignComponentInstaller {
   /** L3: follows redirects manually, re-checking HTTPS + the host allowlist
    * at every hop — fetch's automatic `redirect: 'follow'` would trust
    * wherever the server points next without either check. The loopback
-   * override exempts only its own origin; it does not widen `allowedHosts`. */
+   * override exempts only the first hop; a later hop may not enter that
+   * origin, and the hostname is not added to `allowedHosts`. */
   private async fetchWithAllowedRedirects(initialUrl: string, signal: AbortSignal, headers?: Record<string, string>): Promise<Response> {
     let current = initialUrl
     for (let hop = 0; hop < MAX_REDIRECT_HOPS; hop++) {
       const parsed = new URL(current)
-      if (!this.isLocalOverrideUrl(current)) {
+      if (hop > 0 && this.isLocalOverrideUrl(current)) {
+        throw new Error(`Open Design component local test source applies only to the first hop: ${current}`)
+      }
+      if (!(hop === 0 && this.isLocalOverrideUrl(current))) {
         if (parsed.protocol !== 'https:') {
           throw new Error(`Open Design component download must use HTTPS at every hop: ${current}`)
         }

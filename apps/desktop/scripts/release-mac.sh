@@ -129,14 +129,27 @@ A24_OPEN_DESIGN_SOURCE_DIR="$OD_SOURCE_DIR" pnpm rebuild:open-design-native
 # 组件的 daemon 跑在 app 自己的二进制里（ELECTRON_RUN_AS_NODE），app 开了 Hardened Runtime 且没有
 # disable-library-validation，所以组件里每个 .node/.dylib 必须同 Team ID 签名，否则下载成功也加载不了
 node "$OD_RELEASE" sign "$OD_STAGE_DIR" "$SIGN_IDENTITY" "$ENTITLEMENTS"
+# 先打 tar，再从这份 tar 解出副本去做公证 zip。两边不再同时读可变的 stage，
+# 公证登记的字节就是用户稍后下载的那一份。
+A24_OD_REPOSITORY=iDoris-ai/Agent24 A24_OD_STAGE_DIR="$OD_STAGE_DIR" A24_OD_PACK_OUT_DIR="$OD_MANIFEST_DIR" A24_OD_TARBALL_OUT_DIR="$OD_TARBALL_DIR" \
+  A24_OD_APP_VERSION="$OD_APP_VERSION" A24_OD_PLATFORM=darwin A24_OD_ARCH="${ARCH}" pnpm pack:open-design
+OD_TARBALL="$(find "$OD_TARBALL_DIR" -maxdepth 1 -name 'open-design-*.tar.gz' -print -quit)"
+[[ -f "$OD_TARBALL" ]] || die "未生成 Open Design tarball"
+echo "open-design tarball: $OD_TARBALL"
 if [[ "${SKIP_NOTARIZE:-0}" != "1" ]]; then
   # 组件由 app 自己 fetch，没有 quarantine 标记，Gatekeeper 不会评估它，加载只看 Team ID。
   # 仍提交公证：zip 里的 Mach-O 会按 cdhash 登记公证票据，用户若改用浏览器手动下载资产（带 quarantine）也能放行。
   # 松散文件无法 staple，所以这只是登记，没有产物要回写。
-  OD_NOTARY_ZIP="$OD_WORK_DIR/open-design-notarize.zip"
+  # zip 的输入是 tarball 的解压副本，不是 stage 目录本身。
+  OD_NOTARY_SRC="$OD_WORK_DIR/open-design-notarize-src"
   mkdir -p "$OD_WORK_DIR"
+  rm -rf "$OD_NOTARY_SRC"
+  mkdir -p "$OD_NOTARY_SRC"
+  tar -xzf "$OD_TARBALL" -C "$OD_NOTARY_SRC"
+  [[ -n "$(find "$OD_NOTARY_SRC" -type f -print -quit)" ]] || die "从 tarball 解出的公证副本是空的"
+  OD_NOTARY_ZIP="$OD_WORK_DIR/open-design-notarize.zip"
   rm -f "$OD_NOTARY_ZIP"
-  ditto -c -k --sequesterRsrc "$OD_STAGE_DIR" "$OD_NOTARY_ZIP"
+  ditto -c -k --sequesterRsrc "$OD_NOTARY_SRC" "$OD_NOTARY_ZIP"
   OD_SUBMIT_JSON="$OD_WORK_DIR/open-design-notarize-submit.json"
   xcrun notarytool submit "$OD_NOTARY_ZIP" --keychain-profile "${NOTARY_PROFILE}" --wait --output-format json | tee "$OD_SUBMIT_JSON"
   OD_STATUS="$(/usr/bin/plutil -extract status raw -o - "$OD_SUBMIT_JSON")"
@@ -147,13 +160,8 @@ if [[ "${SKIP_NOTARIZE:-0}" != "1" ]]; then
   fi
   echo "Open Design 组件公证 submission id: $OD_SUB_ID"
   rm -f "$OD_NOTARY_ZIP"
+  rm -rf "$OD_NOTARY_SRC"
 fi
-# 仓库写死，不从环境继承（调用前环境里的 A24_OD_REPOSITORY 会被这条赋值盖掉）。
-A24_OD_REPOSITORY=iDoris-ai/Agent24 A24_OD_STAGE_DIR="$OD_STAGE_DIR" A24_OD_PACK_OUT_DIR="$OD_MANIFEST_DIR" A24_OD_TARBALL_OUT_DIR="$OD_TARBALL_DIR" \
-  A24_OD_APP_VERSION="$OD_APP_VERSION" A24_OD_PLATFORM=darwin A24_OD_ARCH="${ARCH}" pnpm pack:open-design
-OD_TARBALL="$(find "$OD_TARBALL_DIR" -maxdepth 1 -name 'open-design-*.tar.gz' -print | head -n1)"
-[[ -f "$OD_TARBALL" ]] || die "未生成 Open Design tarball"
-echo "open-design tarball: $OD_TARBALL"
 
 step "3/6 electron-builder 打包 + 签名（${ARCH}，Hardened Runtime）"
 rm -rf "$DESKTOP_DIR/release"
@@ -199,3 +207,4 @@ echo
 echo "完成：$DMG"
 echo "Open Design 组件资产（须上传到 release ${A24_RELEASE_TAG}）：$OD_TARBALL"
 echo "gh release upload \"${A24_RELEASE_TAG}\" \"${OD_TARBALL}\" -R iDoris-ai/Agent24"
+echo "必做：出 preview 前，必须在当前 head 的签名包上，用本地测试源重跑一遍下载 → 安装 → 启动（见 docs/Deployment/MACOS-SIGNING.md）"
