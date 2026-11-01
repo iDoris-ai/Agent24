@@ -133,6 +133,63 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/diagnostics/migration": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Failed-migration details (docked daemon only)
+         * @description Served by the docked router only. Needs a first-party token (`diagnostic.read`, daily level). Without a capability authority the route answers 503 `diagnostics_unavailable`.
+         */
+        get: operations["getMigrationDiagnostics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/diagnostics/migration/snapshots": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Snapshot metadata of the failed attempt (docked daemon only)
+         * @description Ids, sizes, hashes and restore progress; never file contents.
+         */
+        get: operations["getMigrationSnapshots"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/diagnostics/migration/space": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Last disk-space probe of the failed attempt (docked daemon only) */
+        get: operations["getMigrationSpace"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/chat": {
         parameters: {
             query?: never;
@@ -2192,8 +2249,17 @@ export interface components {
             memory: number;
         };
         Health: {
-            /** @constant */
-            status: "ok";
+            /**
+             * @description `ok` (HTTP 200) or `migration_failed` (HTTP 503, docked). Treat any other value as not reusable.
+             * @enum {string}
+             */
+            status: "ok" | "migration_failed";
+            /**
+             * @description Present only while docked.
+             * @constant
+             */
+            startup_state?: "docked";
+            reason?: components["schemas"]["HealthReason"];
             version: string;
             /**
              * @description Open enum — clients must tolerate unknown values
@@ -2204,6 +2270,61 @@ export interface components {
             /** @description Wire protocol version (`PROTOCOL_VERSION`, currently 1). Increment by 1 when a wire change is incompatible (a field removed or renamed, a changed meaning, or a difference a peer must refuse). Adding an optional field does not bump this. Shells refuse a daemon whose value differs from their own, and treat a missing value as an old daemon. */
             protocol_version: number;
             migrations: components["schemas"]["HealthMigrations"];
+        };
+        /**
+         * @description Stable public reason code. Never carries paths or raw errors.
+         * @enum {string}
+         */
+        DockCode: "interrupted" | "migration_failed" | "rollback_failed" | "guard_invalid" | "persist_failed" | "marker_invalid" | "space_insufficient" | "space_budget_unknown";
+        /** @enum {string} */
+        DockPhase: "preflight" | "migrating" | "fts_rebuild" | "restoring";
+        /** @enum {string} */
+        RollbackState: "not_needed" | "in_progress" | "restored" | "failed";
+        /** @enum {string} */
+        DockDatabase: "store" | "memory";
+        HealthReason: {
+            code: components["schemas"]["DockCode"];
+            phase: components["schemas"]["DockPhase"];
+            rollback: components["schemas"]["RollbackState"];
+            /**
+             * @description Retry is closed (CORE-5 Q2).
+             * @constant
+             */
+            retry_allowed: false;
+            /**
+             * @description `verified`: `Health.migrations` is the real post-restore value. `unknown`: it is reported as 0/0, not a watermark.
+             * @enum {string}
+             */
+            migrations: "verified" | "unknown";
+        };
+        MigrationDiagnostics: {
+            attempt_id: string;
+            snapshot_id: string | null;
+            failed_version: string;
+            database: components["schemas"]["DockDatabase"] | null;
+            migration_version: number | null;
+            phase: components["schemas"]["DockPhase"];
+            code: components["schemas"]["DockCode"];
+            rollback: components["schemas"]["RollbackState"];
+            /** @constant */
+            retry_allowed: false;
+            /** @description The marker's bounded summary, capped at 256 characters on read. Not scrubbed here: the marker writer must build it from a closed set of messages. */
+            error_summary: string;
+        };
+        SnapshotDiagnostics: {
+            snapshot_id: string | null;
+            restore: components["schemas"]["RollbackState"];
+            files: {
+                database: components["schemas"]["DockDatabase"];
+                existed: boolean;
+                bytes: number | null;
+                sha256: string | null;
+            }[];
+        };
+        SpaceDiagnostics: {
+            available_bytes: number | null;
+            budget_bytes: number | null;
+            failures: components["schemas"]["DockCode"][];
         };
         ChatMessage: {
             /**
@@ -3637,6 +3758,33 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description unauthorized (401): missing, unknown, expired or revoked bearer */
+        Unauthorized: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description forbidden (403): the token may not call this operation */
+        Forbidden: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description diagnostics_unavailable (503): no capability authority, so the diagnostics routes stay closed */
+        DiagnosticsUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
         /** @description invalid_request: malformed or invalid request */
         BadRequest: {
             headers: {
@@ -4136,7 +4284,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Daemon is alive */
+            /** @description Daemon is alive (`status` is `ok`) */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -4145,6 +4293,84 @@ export interface operations {
                     "application/json": components["schemas"]["Health"];
                 };
             };
+            /** @description Docked after a failed database migration (`status` is `migration_failed`). Only this route and the diagnostics routes are served; every other path is 404. Clients must not reuse a daemon whose status is anything but `ok`. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Health"];
+                };
+            };
+        };
+    };
+    getMigrationDiagnostics: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Scrubbed marker contents */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MigrationDiagnostics"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            503: components["responses"]["DiagnosticsUnavailable"];
+        };
+    };
+    getMigrationSnapshots: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Snapshot metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SnapshotDiagnostics"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            503: components["responses"]["DiagnosticsUnavailable"];
+        };
+    };
+    getMigrationSpace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cached space probe */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SpaceDiagnostics"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            503: components["responses"]["DiagnosticsUnavailable"];
         };
     };
     postChat: {
