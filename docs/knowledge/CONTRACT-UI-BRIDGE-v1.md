@@ -1,6 +1,6 @@
 # Knowledge UI 身份交换与消息桥契约 v1（CONTRACT-UI-BRIDGE-v1）
 
-> **状态**：规范核心 v1（草案）· **日期**：2026-10-20 · **桥报文** `v: 1`
+> **状态**：规范核心 v1，已评审合入；KB-R1/R2 只实施了长期登录态的本机存储（`knowledge-logins.ts`）和 C 不进 renderer（U1.4）。KnowledgeView、一次性票据、session JWT 与消息桥**没有实施**（11-11 后）。条款按 READONLY r8 写成，现行 READONLY 为 r10。· **日期**：2026-10-20 · **桥报文** `v: 1`
 > **依据**：`docs/knowledge/CONTRACT-READONLY-v1.md`（下称 READONLY，按 r8）；`docs/knowledge/CONTRACT-STATE-v1.md`（下称 STATE，规范核心 v1，PR #1113；本文依赖它的规则汇总在 §8.2）。
 > 由完整版 `ab/weknora-03b-ui-bridge`（#1077 的分支）压缩而来。本文只写对外行为与不变式；实现机制由各实现任务以代码和测试证明。
 > 编号：`R*` 为 READONLY 规则，`S*` 为 STATE 规范核心 v1（同批）的条款，`U*` 为本文规则（沿用完整版编号，空号即已移出规范），`决定 #n` 见 §9.1（已定）与 §9.5（待决）。
