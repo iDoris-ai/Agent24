@@ -21,6 +21,9 @@ export const IpcChannels = {
   ApprovalDecide: 'approval:decide',
   OsModuleSetEnabled: 'os-module:set-enabled',
   CommInstall: 'comm:install',
+  // Private-key backup: native confirm + native save dialog in main; the
+  // backend writes the file itself, so the key never crosses IPC.
+  CommIdentityExport: 'comm:identity-export',
   // A-3: disable/enable or unpair AgentEar (PATCH / DELETE
   // /api/v1/attached/agentear). The module name is fixed in main; the
   // renderer cannot name another one. Same native-confirm rule as above.

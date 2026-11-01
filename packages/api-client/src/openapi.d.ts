@@ -1335,6 +1335,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/comm/identity/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Back up an identity's private key to a file
+         * @description Writes the identity's private key (nsec) to `path` with mode 0600, using the keystore password held in the system keychain. The key is never part of the response, a log line or a temp file. `path` must be absolute, in an existing folder outside the Hyphae data directory; symlinks are refused. The desktop app does not expose this through the renderer proxy: its main process picks `path` with a native save dialog after a native confirmation.
+         */
+        post: operations["exportCommIdentity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/comm/identity/default": {
         parameters: {
             query?: never;
@@ -6577,6 +6597,39 @@ export interface operations {
         };
         responses: {
             /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    exportCommIdentity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    nickname: string;
+                    path: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Backup written; data is `{nickname, npub, path}` */
             200: {
                 headers: {
                     [name: string]: unknown;

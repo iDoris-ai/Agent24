@@ -54,6 +54,9 @@ const api = {
     ipcRenderer.invoke(IpcChannels.ApprovalDecide, id, decision),
   /** A1: elevated; main asks the user in a native dialog before sending. */
   commInstall: (): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.CommInstall),
+  /** Elevated; main confirms natively, lets the user pick the file, and the daemon writes the key there (0600). Resolves with `{nickname,npub,path}` only. */
+  commIdentityExport: (nickname: string): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommIdentityExport, nickname),
 
   osModuleSetEnabled: (name: string, enabled: boolean): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.OsModuleSetEnabled, name, enabled),

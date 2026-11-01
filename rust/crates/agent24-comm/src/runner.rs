@@ -218,7 +218,7 @@ where
         .collect()
 }
 
-fn kill_process_group_best_effort(pid: u32) {
+pub(crate) fn kill_process_group_best_effort(pid: u32) {
     let Ok(raw) = i32::try_from(pid) else {
         return;
     };
@@ -372,6 +372,24 @@ impl HyphaeRunner {
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
         cmd.process_group(0);
+        cmd
+    }
+
+    /// Like [`Self::command`] but for the one Hyphae subcommand that only
+    /// reads its password from a terminal (`identity export`): same scrubbed
+    /// environment, HOME and cwd, but WITHOUT `HYPHAE_OUTPUT=json` (JSON mode
+    /// refuses interactive prompts) and with stdio left for the caller to
+    /// attach to a pty.
+    pub(crate) fn interactive_command(&self, args: &[&str]) -> std::process::Command {
+        let mut cmd = std::process::Command::new(self.bin.path());
+        cmd.args(args);
+        cmd.env_clear();
+        for (key, value) in filtered_env(std::env::vars()) {
+            cmd.env(key, value);
+        }
+        cmd.env("HOME", &self.home);
+        cmd.current_dir(&self.home);
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
         cmd
     }
 

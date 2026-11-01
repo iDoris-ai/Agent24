@@ -312,3 +312,73 @@ export async function importCommIdentity(from: string, password: string) {
     throw error
   }
 }
+
+export const addCommContact = (nickname: string, npub: string, role: string) =>
+  request('POST', '/api/v1/comm/contact', (value): value is RecordValue => isRecord(value) || value === null,
+    { nickname, npub, ...(role ? { role } : {}) })
+
+export interface CommSendResult {
+  published_to: number
+}
+
+export const sendCommMessage = (to: string, content: string): Promise<CommSendResult> =>
+  request('POST', '/api/v1/comm/send', (value): value is RecordValue => isRecord(value), { to, content, encrypt: true })
+    .then((data) => ({ published_to: typeof data['published_to'] === 'number' ? data['published_to'] : 0 }))
+
+export interface CommHistoryItem {
+  id: string
+  from: string
+  content: string
+  at: string
+}
+
+function historyTime(raw: unknown): string {
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    return new Date(raw < 1e12 ? raw * 1000 : raw).toLocaleString()
+  }
+  return typeof raw === 'string' ? raw : ''
+}
+
+/** Hyphae's history rows are passed through; keep only what the compact list shows. */
+function toHistoryItems(value: unknown[]): CommHistoryItem[] {
+  const items: CommHistoryItem[] = []
+  for (const row of value) {
+    if (!isRecord(row)) continue
+    const content = [row['content'], row['plaintext']].find(string)
+    if (content === undefined) continue
+    const from = [row['from'], row['sender'], row['sender_npub']].find(string) ?? ''
+    const id = row['id']
+    items.push({
+      id: typeof id === 'string' || typeof id === 'number' ? String(id) : `${items.length}`,
+      from,
+      content,
+      at: historyTime(row['created_at'] ?? row['received_at'] ?? row['time'] ?? row['ts']),
+    })
+  }
+  return items
+}
+
+export const listCommHistory = (limit = 20): Promise<CommHistoryItem[]> =>
+  request('GET', `/api/v1/comm/history?limit=${limit}`, (value): value is unknown[] => Array.isArray(value)).then(toHistoryItems)
+
+export interface CommExportResult {
+  nickname: string
+  npub: string
+  path: string
+}
+
+/**
+ * Private-key backup. The main process asks for confirmation, lets the user
+ * pick the file and has the daemon write it (0600); only {nickname,npub,path}
+ * comes back. A cancelled dialog rejects with code `cancelled`.
+ */
+export async function exportCommIdentity(nickname: string): Promise<CommExportResult> {
+  let response: unknown
+  try {
+    response = await window.agent24.commIdentityExport(nickname)
+  } catch {
+    throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)
+  }
+  return decodeEnvelope(response, (value): value is CommExportResult =>
+    isRecord(value) && string(value['nickname']) && string(value['npub']) && string(value['path']))
+}

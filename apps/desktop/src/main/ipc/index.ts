@@ -1,6 +1,7 @@
 // IPC handler registry. M0/M1 starter handlers; capability modules will
 // register their own handlers here via the module loader (later M1 task).
 
+import path from 'node:path'
 import http from 'node:http'
 import https from 'node:https'
 import { execFile, type ChildProcess } from 'node:child_process'
@@ -511,6 +512,34 @@ export function registerIpcHandlers(options: {
       const ok = await confirmNative(event, mt('comm.install'), mt('comm.installDetail'))
       if (!ok) return cancelled()
       return proxyToBackend({ method: 'POST', path: '/api/v1/comm/install' }, 360_000)
+    }),
+  )
+
+  // Private-key backup. Not on the generic proxy: the destination is chosen
+  // here with a native save dialog (never by the page) and the daemon writes
+  // the key itself (0600, no temp file), so the nsec never reaches this
+  // process or the renderer. The page only learns {nickname, npub, path}.
+  handle(IpcChannels.CommIdentityExport, (event, nickname: unknown): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      if (typeof nickname !== 'string' || !nickname.trim() || nickname.length > 128 || hasControlChars(nickname)) {
+        return invalidRequest('invalid nickname')
+      }
+      const ok = await confirmNative(event, mt('comm.export', { name: clip(nickname, 80) }), mt('comm.exportDetail'))
+      if (!ok) return cancelled()
+      const win = BrowserWindow.fromWebContents(event.sender)
+      const options: Electron.SaveDialogOptions = {
+        title: mt('comm.exportSave'),
+        defaultPath: path.join(app.getPath('documents'), `${nickname.replace(/[^\w.-]+/g, '_')}-private-key-backup.txt`),
+        filters: [{ name: 'Text', extensions: ['txt'] }],
+      }
+      let picked: Electron.SaveDialogReturnValue
+      try {
+        picked = win ? await dialog.showSaveDialog(win, options) : await dialog.showSaveDialog(options)
+      } catch {
+        return { ok: false, status: 500, data: { error: { code: 'dialog_failed', message: 'the file dialog could not open' } } }
+      }
+      if (picked.canceled || !picked.filePath) return cancelled()
+      return proxyToBackend({ method: 'POST', path: '/api/v1/comm/identity/export', body: { nickname, path: picked.filePath } })
     }),
   )
 

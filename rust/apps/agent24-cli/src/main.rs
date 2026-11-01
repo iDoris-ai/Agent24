@@ -497,6 +497,13 @@ enum CommIdentityAction {
     },
     /// Switch the default identity
     Use { nickname: String },
+    /// Back up an identity's private key (nsec) to a new 0600 file; keep it offline
+    Export {
+        nickname: String,
+        /// Destination file (made absolute; must not be inside ~/.hyphae)
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2050,6 +2057,16 @@ fn comm_request(
                 reqwest::Method::POST,
                 "/api/v1/comm/identity".to_owned(),
                 Some(serde_json::json!({"nickname": nickname, "default": default})),
+            ),
+            CommIdentityAction::Export { nickname, out } => (
+                reqwest::Method::POST,
+                "/api/v1/comm/identity/export".to_owned(),
+                Some(serde_json::json!({
+                    "nickname": nickname,
+                    "path": std::path::absolute(&out)
+                        .map_err(|e| format!("invalid --out path: {e}"))?
+                        .to_string_lossy(),
+                })),
             ),
             CommIdentityAction::Use { nickname } => (
                 reqwest::Method::POST,

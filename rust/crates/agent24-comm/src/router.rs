@@ -161,6 +161,7 @@ pub fn router(state: CommState) -> Router {
     Router::new()
         .route("/identity", get(list_identity).post(create_identity))
         .route("/identity/default", post(use_identity))
+        .route("/identity/export", post(export_identity))
         .route("/unlock", post(unlock))
         .route("/contact", get(list_contact).post(add_contact))
         .route("/relay", get(list_relay).put(set_relay))
@@ -622,6 +623,46 @@ async fn use_identity(
         daemon.on_config_changed().await;
     }
     envelope_response(envelope)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityExportReq {
+    nickname: String,
+    path: String,
+}
+
+/// `POST /comm/identity/export` writes the identity's `nsec` to `path` (0600)
+/// and answers `{nickname, npub, path}` only: the key is never in a response,
+/// a log line or a temp file. See `export.rs` for the pty mechanics.
+async fn export_identity(
+    State(state): State<CommState>,
+    payload: Result<Json<IdentityExportReq>, JsonRejection>,
+) -> CommResult {
+    let Json(req) = payload.map_err(|_| CommError::Invalid("invalid export request".to_owned()))?;
+    let (runner, password_store, home) = state.require_ready()?;
+    invalid_if_blank("nickname", &req.nickname)?;
+    invalid_if_blank("path", &req.path)?;
+    let dest = PathBuf::from(&req.path);
+    // Cheap destination checks before the password is even fetched.
+    if !dest.is_absolute() {
+        return Err(CommError::Invalid("path must be absolute".to_owned()));
+    }
+    let account = resolve_account(home).await?.ok_or_else(|| {
+        CommError::NotConfigured("no keystore exists yet; create an identity first".to_owned())
+    })?;
+    let password = password_store
+        .get(&account)
+        .await
+        .map_err(map_store_error)?;
+    let key = crate::export::export_nsec(runner, &req.nickname, password).await?;
+    crate::export::write_secret_file(&dest, home, &key.nsec)?;
+    tracing::info!(nickname = %req.nickname, "identity private key exported");
+    Ok(Json(json!({"ok": true, "data": {
+        "nickname": req.nickname,
+        "npub": key.npub,
+        "path": req.path,
+    }})))
 }
 
 struct UnlockSecret(Zeroizing<String>);
@@ -1530,6 +1571,89 @@ mod tests {
             serde_json::from_slice(&bytes).unwrap()
         };
         (status, value)
+    }
+
+    // ---- identity export (pty) ------------------------------------------
+
+    const EXPORT_SCRIPT: &str = r#"#!/bin/sh
+if [ "$HYPHAE_OUTPUT" = "json" ]; then echo "json mode" >&2; exit 4; fi
+printf 'Keystore password: '
+stty -echo 2>/dev/null
+read -r pw
+stty echo 2>/dev/null
+echo
+if [ "$pw" != "test-password" ]; then echo "Error: failed to load keystore: incorrect password"; exit 3; fi
+echo "Identity: $4"
+echo "Npub:     npub194veg99mv8vxrw9xe3c2t8kegm3f5j0df8e238mmwhtx2y3q4xmsgpk4jv"
+echo "Nsec:     nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+"#;
+
+    #[tokio::test]
+    async fn identity_export_writes_a_0600_file_and_never_returns_the_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = ready_state_with_identity(tmp.path(), EXPORT_SCRIPT).await;
+        let out = tmp.path().join("out");
+        tokio::fs::create_dir_all(&out).await.unwrap();
+        let dest = out.join("t1.nsec.txt");
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/identity/export",
+            Some(json!({"nickname": "t1", "path": dest.to_str().unwrap()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert!(!body.to_string().contains("nsec1"), "{body:?}");
+        assert_eq!(
+            body["data"]["npub"],
+            "npub194veg99mv8vxrw9xe3c2t8kegm3f5j0df8e238mmwhtx2y3q4xmsgpk4jv"
+        );
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(std::fs::read_to_string(&dest).unwrap().starts_with("nsec1"));
+    }
+
+    #[tokio::test]
+    async fn identity_export_wrong_password_is_locked_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = EXPORT_SCRIPT.replace("test-password", "other-password");
+        let state = ready_state_with_identity(tmp.path(), &script).await;
+        let dest = tmp.path().join("t1.nsec.txt");
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/identity/export",
+            Some(json!({"nickname": "t1", "path": dest.to_str().unwrap()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::LOCKED, "{body:?}");
+        assert!(!dest.exists());
+    }
+
+    #[tokio::test]
+    async fn identity_export_rejects_relative_path_and_unknown_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = ready_state_with_identity(tmp.path(), EXPORT_SCRIPT).await;
+        let app = router(state);
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/identity/export",
+            Some(json!({"nickname": "t1", "path": "rel.txt"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(
+            app,
+            "POST",
+            "/identity/export",
+            Some(json!({"nickname": "t1", "path": "/tmp/x", "password": "p"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     // ---- unconfigured / binary_rejected: every route, no binary touched --

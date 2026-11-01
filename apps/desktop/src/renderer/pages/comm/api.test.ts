@@ -2,6 +2,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   CommApiError,
+  addCommContact,
+  exportCommIdentity,
+  listCommHistory,
+  sendCommMessage,
   getCommStatus,
   importCommIdentity,
   installComm,
@@ -187,5 +191,33 @@ describe('COMM typed backend API', () => {
     expect(failure).toBeInstanceOf(CommApiError)
     expect((failure as Error).message).not.toContain(password)
     expect(failure).toMatchObject({ code: 'locked', status: 409 })
+  })
+})
+
+
+describe('COMM contact, send, history and export wrappers', () => {
+  it('posts the contact with an optional role and sends encrypted by default', async () => {
+    const proxy = setProxy(() => successful({ published_to: 3 }))
+    await addCommContact('bob', 'npub1bob', '')
+    await expect(sendCommMessage('bob', 'hi')).resolves.toEqual({ published_to: 3 })
+    expect(proxy.mock.calls.map((c) => c[0])).toEqual([
+      { method: 'POST', path: '/api/v1/comm/contact', body: { nickname: 'bob', npub: 'npub1bob' } },
+      { method: 'POST', path: '/api/v1/comm/send', body: { to: 'bob', content: 'hi', encrypt: true } },
+    ])
+  })
+  it('keeps only displayable history rows', async () => {
+    setProxy(() => successful([{ id: 'e1', from: 'npub1bob', content: 'hello', created_at: 1_700_000_000 }, { id: 'x' }]))
+    const rows = await listCommHistory(5)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ id: 'e1', from: 'npub1bob', content: 'hello' })
+  })
+  it('exports through the dedicated IPC, never the generic proxy, and rejects a cancel with its code', async () => {
+    const proxy = setProxy(() => { throw new Error('generic proxy must not export keys') })
+    window.agent24 = { ...window.agent24, commIdentityExport: vi.fn()
+      .mockResolvedValueOnce(successful({ nickname: 'alice', npub: 'npub1a', path: '/p.txt' }))
+      .mockResolvedValueOnce({ ok: false, status: 499, data: { error: { code: 'cancelled', message: 'cancelled' } } }) } as never
+    await expect(exportCommIdentity('alice')).resolves.toEqual({ nickname: 'alice', npub: 'npub1a', path: '/p.txt' })
+    await expect(exportCommIdentity('alice')).rejects.toMatchObject({ code: 'cancelled' })
+    expect(proxy).not.toHaveBeenCalled()
   })
 })

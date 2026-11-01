@@ -73,6 +73,13 @@ describe('A1 findAllowedRoute', () => {
     ]) expect(isAllowedProxyRoute(method, `/api/v1/comm/${route}`)).toBe(true)
     expect(isAllowedProxyRoute('DELETE', '/api/v1/comm/identity')).toBe(false)
   })
+  it('allows contact add, send and history, but keeps the private-key export off the proxy', () => {
+    expect(isAllowedProxyRoute('POST', '/api/v1/comm/contact')).toBe(true)
+    expect(isAllowedProxyRoute('POST', '/api/v1/comm/send')).toBe(true)
+    expect(findAllowedRoute('POST', '/api/v1/comm/send')?.timeoutMs).toBeGreaterThan(60_000)
+    expect(isAllowedProxyRoute('GET', '/api/v1/comm/history?limit=20')).toBe(true)
+    expect(isAllowedProxyRoute('POST', '/api/v1/comm/identity/export')).toBe(false)
+  })
   it('gives chat a longer deadline than the default', () => {
     expect(findAllowedRoute('POST', '/api/v1/chat')?.timeoutMs).toBe(CHAT_TIMEOUT_MS)
     expect(CHAT_TIMEOUT_MS).toBeGreaterThan(PROXY_TIMEOUT_MS)

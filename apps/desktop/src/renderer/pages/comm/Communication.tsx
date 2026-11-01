@@ -4,13 +4,19 @@ import {
   createCommIdentity, importCommIdentity, setCommRelay, probeCommRelay,
   getCommStatus,
   installComm,
+  addCommContact,
+  exportCommIdentity,
+  getCommStatus as pollCommStatus,
   listCommContacts,
+  listCommHistory,
   listCommIdentities,
+  sendCommMessage,
   listCommRelays,
   startCommDaemon,
   stopCommDaemon,
   unlockComm,
   type CommContact,
+  type CommHistoryItem,
   type CommDaemonStatus,
   type CommIdentity,
   type CommRelayConfig,
@@ -20,11 +26,20 @@ import { communicationMessages } from './Communication.i18n'
 import './communication.css'
 import { getDefaultRelays } from './relayDefaults'
 
-type WriteAction = 'start' | 'stop' | 'unlock' | 'install' | 'create' | 'import' | 'relay'
+type WriteAction = 'start' | 'stop' | 'unlock' | 'install' | 'create' | 'import' | 'relay' | 'export' | 'contact' | 'send'
+
+/** Daemon states that settle on their own: the page polls until they do. */
+const TRANSITIONAL_STATES = ['starting', 'backoff']
+const POLL_INTERVAL_MS = 1000
+const POLL_MAX_TICKS = 30
 
 function messageOf(error: unknown, secret = ''): string {
   const text = error instanceof Error ? error.message : String(error)
   return secret ? text.split(secret).join('•••') : text
+}
+
+function shortNpub(npub: string): string {
+  return npub.length > 20 ? `${npub.slice(0, 12)}…${npub.slice(-6)}` : npub
 }
 
 function processLabel(state: string): string {
@@ -56,7 +71,10 @@ function DaemonStatusView({ status, fresh }: { status: CommDaemonStatus | null; 
     <div className="comm-status-grid">
       <section className="comm-status-item">
         <h3>{t('process.title')}</h3>
-        <p><span className={`comm-state${fresh && process.state === 'running' ? ' comm-state-running' : ''}`}>{processLabel(process.state)}</span></p>
+        <p><span className={`comm-state${fresh && process.state === 'running' ? ' comm-state-running' : ''}`} aria-busy={TRANSITIONAL_STATES.includes(process.state) || undefined}>
+          {TRANSITIONAL_STATES.includes(process.state) && <span className="comm-spinner" data-testid="comm-spinner" aria-hidden="true">⟳</span>}
+          {processLabel(process.state)}
+        </span></p>
         {process.reason && <p className="comm-muted">{t('process.reason', { code: process.reason, reason: reasonLabel(process.reason) })}</p>}
         <p className="comm-muted">{t('process.metrics', { generation: process.generation, failures: process.consecutive_failures })}</p>
       </section>
@@ -100,6 +118,17 @@ export default function CommunicationPage() {
   const defaults = getDefaultRelays()
   const [selectedRelay, setSelectedRelay] = useState('')
   const [handshakeFailed, setHandshakeFailed] = useState(false)
+  const [unlockFailed, setUnlockFailed] = useState(false)
+  const [unlockError, setUnlockError] = useState<string | null>(null)
+  const [copied, setCopied] = useState<string | null>(null)
+  const [contactName, setContactName] = useState('')
+  const [contactNpub, setContactNpub] = useState('')
+  const [contactRole, setContactRole] = useState('')
+  const [contactError, setContactError] = useState<string | null>(null)
+  const [messageTo, setMessageTo] = useState('')
+  const [messageText, setMessageText] = useState('')
+  const contactNameRef = useRef<HTMLInputElement>(null)
+  const [history, setHistory] = useState<CommHistoryItem[] | null>(null)
   // A stale choice (no longer offered after a refresh) falls back to the default option.
   const relayOptions = [...defaults.map((relay) => relay.url), ...(relays?.relays ?? [])]
   const relayUrl = (selectedRelay && relayOptions.includes(selectedRelay) ? selectedRelay : '')
@@ -140,11 +169,36 @@ export default function CommunicationPage() {
     setRefreshing(false)
   }, [])
 
+  const loadHistory = useCallback(async () => {
+    try {
+      const items = await listCommHistory(20)
+      if (mounted.current) setHistory(items)
+    } catch {
+      // The list is a convenience; the status cards already report real failures.
+      if (mounted.current) setHistory(null)
+    }
+  }, [])
+
   useEffect(() => {
     mounted.current = true
     void refresh()
+    void loadHistory()
     return () => { mounted.current = false; sequence.current++ }
-  }, [refresh])
+  }, [refresh, loadHistory])
+
+  // `starting` becomes `running` on its own once the child has stayed alive
+  // for a few seconds; keep the card current until the state settles (bounded).
+  const processState = daemon?.process.state
+  useEffect(() => {
+    if (!processState || !TRANSITIONAL_STATES.includes(processState)) return
+    let ticks = 0
+    const timer = setInterval(() => {
+      ticks += 1
+      if (ticks > POLL_MAX_TICKS) { clearInterval(timer); return }
+      pollCommStatus().then((next) => { if (mounted.current) setDaemon(next) }).catch(() => undefined)
+    }, POLL_INTERVAL_MS)
+    return () => clearInterval(timer)
+  }, [processState])
 
   const runAction = async (action: WriteAction) => {
     if (pending) return
@@ -152,6 +206,7 @@ export default function CommunicationPage() {
     setPending(action)
     setActionError(null)
     setNotice(null)
+    if (action === 'unlock') setUnlockError(null)
     const submittedPassword = action === 'unlock' ? password : action === 'import' ? importPassword : ''
     if (action === 'unlock') setPassword('')
     if (action === 'import') setImportPassword('')
@@ -187,12 +242,21 @@ export default function CommunicationPage() {
         const result = await unlockComm(submittedPassword, remember)
         if (mounted.current && token === sequence.current) {
           setNotice(result.remembered ? t('notice.remembered') : t('notice.session'))
+          setUnlockFailed(false)
         }
       }
     } catch (error) {
       if (mounted.current && token === sequence.current) {
         const code = typeof error === 'object' && error !== null && 'code' in error
           ? error.code : undefined
+        if (action === 'unlock') {
+          setUnlockFailed(true)
+          // A rejected password is an expected answer, not a service fault.
+          if (code === 'locked' && !messageOf(error, submittedPassword).includes('keychain_unavailable')) {
+            setUnlockError(t('error.passwordIncorrect'))
+            return
+          }
+        }
         const knownCodes = ['binary_rejected', 'not_configured', 'locked', 'password_rejected', 'keychain_unavailable']
         const reason = typeof code === 'string' && knownCodes.includes(code)
           ? t('error.reasonPrefix', { code, reason: reasonLabel(code) }) : ''
@@ -207,6 +271,82 @@ export default function CommunicationPage() {
     }
   }
 
+  const copyNpub = async (npub: string) => {
+    try {
+      await navigator.clipboard.writeText(npub)
+      setCopied(npub)
+      setTimeout(() => { if (mounted.current) setCopied((current) => (current === npub ? null : current)) }, 2000)
+    } catch {
+      setActionError(t('identity.copyFailed'))
+    }
+  }
+
+  const exportKey = async (name: string) => {
+    if (pending) return
+    setPending('export')
+    setActionError(null)
+    setNotice(null)
+    try {
+      const result = await exportCommIdentity(name)
+      if (mounted.current) setNotice(t('export.done', { path: result.path }))
+    } catch (error) {
+      // Declining the native confirm or the save dialog is not an error.
+      const cancelled = error instanceof CommApiError && error.code === 'cancelled'
+      if (mounted.current && !cancelled) setActionError(messageOf(error))
+    } finally {
+      if (mounted.current) setPending(null)
+    }
+  }
+
+  const submitContact = async () => {
+    if (pending) return
+    const npubValue = contactNpub.trim()
+    if (!npubValue.startsWith('npub1')) { setContactError(t('contact.npubInvalid')); return }
+    setContactError(null)
+    setPending('contact')
+    setActionError(null)
+    setNotice(null)
+    try {
+      await addCommContact(contactName.trim(), npubValue, contactRole.trim())
+      if (mounted.current) {
+        setContactName(''); setContactNpub(''); setContactRole('')
+        setNotice(t('contact.added'))
+      }
+    } catch (error) {
+      if (mounted.current) setActionError(messageOf(error))
+    } finally {
+      if (mounted.current) { setPending(null); void refresh() }
+    }
+  }
+
+  const submitMessage = async () => {
+    if (pending) return
+    const to = messageTo.trim()
+    if (!to || !messageText.trim()) return
+    // A contact nickname or any raw npub; contacts are only a local name book.
+    if (!to.startsWith('npub1') && !contacts?.some((c) => c.nickname === to)) {
+      setActionError(t('message.recipientInvalid'))
+      return
+    }
+    setPending('send')
+    setActionError(null)
+    setNotice(null)
+    try {
+      const result = await sendCommMessage(to, messageText)
+      if (mounted.current) {
+        setMessageText('')
+        setNotice(result.published_to > 0 ? t('message.sent', { count: result.published_to }) : t('message.queued'))
+      }
+    } catch (error) {
+      if (mounted.current) setActionError(messageOf(error))
+    } finally {
+      if (mounted.current) { setPending(null); void loadHistory() }
+    }
+  }
+
+  const needsUnlock = daemon !== null && (daemon.process.state === 'locked'
+    || daemon.process.reason === 'password_rejected' || daemon.process.reason === 'keychain_unavailable')
+  const showUnlock = needsUnlock || unlockFailed
   const isFresh = !loadError && notConfigured === null && !refreshing && daemon !== null
   const setupOnly = notConfigured !== null && !loadError
   // Installation progress is transient IPC state. All completed steps come
@@ -283,17 +423,28 @@ export default function CommunicationPage() {
       <section className="comm-card">
         <h2>{t('section.identities')}</h2>
         {identities === null ? <p className="comm-muted">{t('empty.data')}</p> : identities.length === 0 ? <p className="comm-muted">{t('empty.identities')}</p> : (
-          <div className="comm-table-wrap"><table><thead><tr><th>{t('table.nickname')}</th><th>{t('table.publicKey')}</th><th>{t('table.default')}</th><th>{t('table.keystore')}</th></tr></thead><tbody>
+          <div className="comm-table-wrap"><table><thead><tr><th>{t('table.nickname')}</th><th>{t('table.publicKey')}</th><th>{t('table.default')}</th><th>{t('table.keystore')}</th><th>{t('identity.actions')}</th></tr></thead><tbody>
             {identities.map((identity) => <tr key={identity.nickname}>
               <td>{identity.nickname}</td><td className="comm-key">{identity.npub}</td>
               <td>{identity.default ? t('table.default') : '—'}</td><td>{identity.encrypted ? t('value.encrypted') : t('value.unencrypted')}</td>
+              <td className="comm-row-actions">
+                <button type="button" onClick={() => void copyNpub(identity.npub)} aria-label={`${t('identity.copy')} ${identity.nickname}`}>
+                  {copied === identity.npub ? t('identity.copied') : t('identity.copy')}
+                </button>
+                <button type="button" disabled={pending !== null} onClick={() => void exportKey(identity.nickname)} aria-label={`${t('export.button')} ${identity.nickname}`}>
+                  {t('export.button')}
+                </button>
+              </td>
             </tr>)}
           </tbody></table></div>
         )}
+        {identities?.some((identity) => identity.default) && <p className="comm-muted">{t('identity.myAddress')}</p>}
       </section>
 
       <section className="comm-card">
         <h2>{t('section.contacts')}</h2>
+        <p className="comm-muted">{t('contact.guide')}</p>
+        <p className="comm-muted">{t('contact.guideAny')}</p>
         {contacts === null ? <p className="comm-muted">{t('empty.data')}</p> : contacts.length === 0 ? <p className="comm-muted">{t('empty.contacts')}</p> : (
           <div className="comm-table-wrap"><table><thead><tr><th>{t('table.nickname')}</th><th>{t('table.publicKey')}</th><th>{t('table.role')}</th></tr></thead><tbody>
             {contacts.map((contact) => <tr key={`${contact.nickname}:${contact.npub}`}>
@@ -301,6 +452,44 @@ export default function CommunicationPage() {
             </tr>)}
           </tbody></table></div>
         )}
+      </section>
+
+      <section className="comm-card" aria-label={t('contact.add')}>
+        <h2>{t('contact.add')}</h2>
+        <form className="comm-setup-form" onSubmit={(event) => { event.preventDefault(); void submitContact() }}>
+          <label>{t('contact.nickname')}<input ref={contactNameRef} value={contactName} onChange={(event) => setContactName(event.target.value)} /></label>
+          <label>{t('contact.npub')}<input value={contactNpub} placeholder="npub1…" onChange={(event) => { setContactNpub(event.target.value); setContactError(null) }} /></label>
+          <label>{t('contact.role')}<input value={contactRole} onChange={(event) => setContactRole(event.target.value)} /></label>
+          <button type="submit" disabled={pending !== null || !contactName.trim() || !contactNpub.trim()}>{t('contact.add')}</button>
+          {contactError && <p role="alert" className="comm-alert">{contactError}</p>}
+        </form>
+      </section>
+
+      <section className="comm-card">
+        <div className="comm-section-heading"><h2>{t('message.title')}</h2>
+          <button type="button" onClick={() => void loadHistory()}>{t('message.refresh')}</button></div>
+        <form className="comm-setup-form" onSubmit={(event) => { event.preventDefault(); void submitMessage() }}>
+          <label>{t('message.to')}<input list="comm-recipients" value={messageTo} placeholder={t('message.toPlaceholder')} onChange={(event) => setMessageTo(event.target.value)} /></label>
+          <datalist id="comm-recipients">{(contacts ?? []).map((c) => <option key={`${c.nickname}:${c.npub}`} value={c.nickname} />)}</datalist>
+          <label>{t('message.content')}<textarea rows={2} value={messageText} onChange={(event) => setMessageText(event.target.value)} /></label>
+          <button type="submit" disabled={pending !== null || !messageTo.trim() || !messageText.trim()}>{pending === 'send' ? t('message.sending') : t('message.send')}</button>
+        </form>
+        <h3>{t('message.recent')}</h3>
+        {history && history.length > 0 ? (
+          <ul className="comm-history">{history.map((item) => {
+            const known = contacts?.find((c) => c.npub === item.from || c.nickname === item.from)
+            const isNpub = item.from.startsWith('npub1')
+            const sender = known ? known.nickname : isNpub ? shortNpub(item.from) : item.from
+            return <li key={item.id}>
+              <span className="comm-muted">{item.at}{item.at && sender ? ' · ' : ''}{sender}</span>
+              <div>{item.content}</div>
+              {item.from && <div className="comm-row-actions">
+                <button type="button" onClick={() => setMessageTo(known ? known.nickname : item.from)}>{t('message.reply')}</button>
+                {!known && isNpub && <button type="button" onClick={() => { setContactNpub(item.from); setContactError(null); contactNameRef.current?.focus() }}>{t('message.addContact')}</button>}
+              </div>}
+            </li>
+          })}</ul>
+        ) : <p className="comm-muted">{t('message.empty')}</p>}
       </section>
 
       <section className="comm-card">
@@ -318,11 +507,13 @@ export default function CommunicationPage() {
           <button type="button" onClick={() => void runAction('start')} disabled={pending !== null}>{t('action.start')}</button>
           <button type="button" onClick={() => void runAction('stop')} disabled={pending !== null}>{t('action.stop')}</button>
         </div>
-        <form className="comm-unlock" onSubmit={(event) => { event.preventDefault(); void runAction('unlock') }}>
+        {showUnlock && <form className="comm-unlock" aria-label={t('unlock.title')} onSubmit={(event) => { event.preventDefault(); void runAction('unlock') }}>
+          <p className="comm-muted comm-unlock-explain">{t('unlock.explain')}</p>
           <label>{t('password.label')}<input type="password" autoComplete="off" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
           <label className="comm-checkbox"><input type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} />{t('password.remember')}</label>
           <button type="submit" disabled={pending !== null || password.length === 0}>{pending === 'unlock' ? t('action.unlocking') : t('action.unlock')}</button>
-        </form>
+          {unlockError && <p role="alert" className="comm-unlock-error">{unlockError}</p>}
+        </form>}
       </section>
       </>}
     </main>

@@ -102,6 +102,12 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('PUT', '/api/v1/comm/relay'), // [E]
   r('POST', '/api/v1/comm/relay/probe'), // [E]
   r('GET', '/api/v1/comm/contact'),
+  r('POST', '/api/v1/comm/contact'), // [E]
+  r('POST', '/api/v1/comm/send', 90_000), // [E] daemon allows up to 5s per relay + 10s (8 relays max)
+  r('GET', '/api/v1/comm/history'),
+  // NOT here on purpose: POST /api/v1/comm/identity/export (private-key backup).
+  // It has its own IPC (CommIdentityExport): native confirm + native save
+  // dialog in main, so the page can neither pick the path nor skip the prompt.
   r('GET', '/api/v1/comm/relay'),
   r('GET', '/api/v1/comm/daemon'),
   r('POST', '/api/v1/comm/daemon/start'), // [E]

@@ -12,12 +12,13 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 
 const handlers = new Map<string, (event: unknown, ...args: unknown[]) => unknown>()
 const showMessageBox = vi.fn()
+const showSaveDialog = vi.fn()
 const execFileMock = vi.fn()
 
 vi.mock('electron', () => ({
   app: { getVersion: () => '0.0.0-test', getPath: () => settingsDir },
   BrowserWindow: { fromWebContents: () => null },
-  dialog: { showMessageBox: (...a: unknown[]) => showMessageBox(...a), showOpenDialog: vi.fn() },
+  dialog: { showMessageBox: (...a: unknown[]) => showMessageBox(...a), showOpenDialog: vi.fn(), showSaveDialog: (...a: unknown[]) => showSaveDialog(...a) },
   ipcMain: { handle: (channel: string, fn: (event: unknown, ...args: unknown[]) => unknown) => { handlers.set(channel, fn) } },
   shell: { openExternal: vi.fn(() => Promise.resolve()) },
 }))
@@ -304,6 +305,40 @@ describe('CommInstall elevated IPC', () => {
     expect(showMessageBox).toHaveBeenCalledTimes(1)
     expect(seen).toHaveLength(1)
     expect(seen[0]).toMatchObject({ method: 'POST', url: '/api/v1/comm/install' })
+  })
+})
+
+describe('CommIdentityExport elevated IPC', () => {
+  it('cancelling the native confirm sends nothing and opens no save dialog', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 1 })
+    const result = await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(result.ok).toBe(false)
+    expect(showSaveDialog).not.toHaveBeenCalled()
+    expect(seen).toHaveLength(0)
+  })
+  it('cancelling the save dialog sends nothing', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    showSaveDialog.mockResolvedValueOnce({ canceled: true })
+    const result = await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(result.ok).toBe(false)
+    expect(result.data.error.code).toBe('cancelled')
+    expect(seen).toHaveLength(0)
+  })
+  it('sends one request whose path comes from the dialog, with the host credential', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    showSaveDialog.mockResolvedValueOnce({ canceled: false, filePath: '/Users/x/alice-backup.txt' })
+    await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toMatchObject({ method: 'POST', url: '/api/v1/comm/identity/export', auth: 'Bearer daemon-secret' })
+    expect(JSON.parse(seen[0]!.body)).toEqual({ nickname: 'alice', path: '/Users/x/alice-backup.txt' })
+    const opts = showMessageBox.mock.calls.at(-1)!.at(-1) as { detail: string }
+    expect(opts.detail).toMatch(/impersonate/)
+  })
+  it('refuses a malformed nickname before any dialog', async () => {
+    showMessageBox.mockClear()
+    const result = await call(IpcChannels.CommIdentityExport, { nickname: 'alice' })
+    expect(result.data.error.code).toBe('invalid_request')
+    expect(showMessageBox).not.toHaveBeenCalled()
   })
 })
 

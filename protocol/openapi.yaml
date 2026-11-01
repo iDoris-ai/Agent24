@@ -2685,6 +2685,51 @@ paths:
         "504":
           $ref: "#/components/responses/CommTimeout"
 
+  /comm/identity/export:
+    post:
+      operationId: exportCommIdentity
+      tags: [comm]
+      summary: Back up an identity's private key to a file
+      x-comm-tier: CommWrite
+      x-operation-level: elevated
+      x-cli: agent24 comm identity export <nickname> --out <file>
+      description: >-
+        Writes the identity's private key (nsec) to `path` with mode 0600, using the keystore password held
+        in the system keychain. The key is never part of the response, a log line or a temp file. `path` must
+        be absolute, in an existing folder outside the Hyphae data directory; symlinks are refused. The desktop
+        app does not expose this through the renderer proxy: its main process picks `path` with a native save
+        dialog after a native confirmation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nickname, path]
+              additionalProperties: false
+              properties:
+                nickname: { type: string }
+                path: { type: string }
+      responses:
+        "200":
+          description: Backup written; data is `{nickname, npub, path}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
   /comm/identity/default:
     post:
       operationId: useCommIdentity
