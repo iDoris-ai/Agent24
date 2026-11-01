@@ -1,6 +1,6 @@
 # Knowledge profile / Off / 撤权状态机契约 v1（CONTRACT-STATE-v1）
 
-> **状态**：规范核心 v1（草案）· **日期**：2026-10-20 · **Issue**：#1013 ①（KB-CT-03），阶段 #1000
+> **状态**：规范核心 v1，已评审合入，随 KB-R1/R2 **部分实施**：Provider 代码在 `agent24_knowledge::provider`（KB-R1），生产路径走 KB-R2 的薄接线，偏离见 §12。条款按 READONLY r8 写成，现行 READONLY 为 r10。· **日期**：2026-10-20 · **Issue**：#1013 ①（KB-CT-03），阶段 #1000
 > **依据**：`docs/knowledge/CONTRACT-READONLY-v1.md`（下称 READONLY，按 r8），规则写作 `R7.3` 等。本文由完整版 `ab/weknora-03a-state-machine`（#1072 的分支）压缩而来，只写对外行为与不变式，实现机制由实现任务以测试证明。条款沿用完整版编号，空号（如 S1.9、S1.11）即压缩时已删除，不再使用。
 
 ## 0. 范围与边界
@@ -200,3 +200,26 @@
 ## 11. 非规范材料
 
 完整版（含转移表、验收用例、故障注入用例、参考设计、现状证据与评审记录）保留在分支 `ab/weknora-03a-state-machine`（#1072 的分支），由实现任务以测试证明，不约束本契约。
+
+## 12. 实施现状与偏离（2026-11-01，KB-R2）
+
+KB-R2 的生产路径没有接 Provider，走的是薄接线（`knowledge_backend.rs`、`knowledge_host.rs`、`knowledge-settings.ts`）。这是决策 `2026-10-30-m1-thin-wiring` 定的，只用于开发者预览和样本数据：Provider 编排推迟，不推翻，接线在 #1085–#1087 里排到 11-11 后。本节只记现状，不改上面的条款；Provider 接上后删除对应行。
+
+| 条款 | 薄接线现在的行为 |
+|---|---|
+| S1.1–S1.5、S3.4 服务状态与探测 | 没有服务状态，也没有就绪与能力探测。main 只知道开关和有没有 binding；调用直接发给 WeKnora，失败只作为这次调用的结果。 |
+| S1.5、决定 14 Off 时的广告 | 不带 binding 的 run 不广告 Knowledge 工具，而不是标明不可用。Off 时 run 不带 binding；硬调按 `knowledge_unbound` 拒绝。 |
+| §2、S3.5、S4.9 身份与多 binding | 一个桌面一个 binding（`default`）。没有 profile、principal、`retired`；换端点或知识库是同一 binding 的新激活。key 只用于保存它时的端点，换地址要重填。 |
+| S1.10、S1.14 崩溃安全与重启 | 只有开关和设置上的 I1 与 I2 前半：On 写盘成功后才生效；Off 立即生效，写盘失败也生效（`knowledge-settings.ts`）。写盘失败后不自动重试，只给用户返回 `not_saved`，所以重启后可能恢复成 On，I2 的「提交」没有兑现。没有全局收紧、待确认和 I3–I8。 |
+| S3.1 凭据与撤权 | C 是用户填的 retrieve key，main 按 24 小时有效推送，到期前 1 小时续推，没有签发与续签判定。服务端的 `unauthorized` 只作为调用失败返回，不改状态、不递增、不占位。 |
+| S4.1–S4.4 generation | 值是激活的序号（`activated_seq`，main 用墙钟毫秒，只增不减），只在 daemon 内存里，不持久。On 也会换一个新值，S4.3 规定 On 不递增。 |
+| S4.7 run 绑定 | run 钉在创建时的一个 binding 和它的 generation 上，不是 binding 集合。激活一变（含 Off 后再 On）或 daemon 重启，旧 run 的调用按 `knowledge_binding_stale` 拒绝。 |
+| S4.6、§6 被作废的调用 | 途中被作废的调用立即结束（S4.5、S4.8 的丢弃成立），但返回 `knowledge_call_superseded`、`retryable: true`，而不是 `cancelled`、retryable false。 |
+| §6 本地结果 | Off 与没有 binding 共用 `knowledge_unbound`，没有 `knowledge_off`。其他本地结果只按这一次调用判定，不来自服务状态：激活没带端点得 `profile_inactive`（桌面不会这样激活），没有可用 C 得 `not_ready`，连不上得 `dependency`，应答不符得 `incompatible`。开关开着但这一轮没有 binding 时，回答走普通聊天，并在回答下方写明没有使用知识库（#1524）。 |
+| S5.6、S5.10、决定 4 占位与证据 | 没有证据纪元、占位和服务端收窄判定。换激活和重启由下面的会话钉扎处理；服务端撤权不改变激活，钉扎不管：同一会话可以继续用，已有的证据不会换成占位。 |
+
+**会话钉扎（本文没有这一条，定义在 ADR-K1-02 §2.1.1 第 6 条）**：daemon 把会话钉在它第一个带 binding 的 run 所用的激活上，钉扎只在内存里。
+
+- 换激活（改端点、改知识库、Off 后再 On）后，同一会话再建带 binding 的 run，以 409 `knowledge_session_rebound` 拒绝，桌面开新会话重试一次，前几轮的上下文不带过去。这和决定 4「Off、On、单纯重启不处理已有证据」不同。
+- daemon 重启后钉扎清空，库里记着取过 Knowledge 结果的会话同样按 409 拒绝；读不出这条记录时以 503 `source_policy_unavailable` 拒绝。
+- 钉扎满 65536 个后，新会话一律按 409 拒绝，直到 daemon 重启。

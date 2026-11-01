@@ -4829,8 +4829,17 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
-            /** @description knowledge_binding_inactive: the product host has no active Knowledge binding by that id */
+            /** @description knowledge_binding_inactive: the product host has no active Knowledge binding by that id. knowledge_session_rebound: the session's runs used another activation of that binding, or it holds Knowledge results from before a daemon restart; start a new session. Also returned for a session not yet pinned once the daemon has reached its limit of pinned sessions; then a new session is refused too, until the daemon restarts. */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description source_policy_unavailable: a run named a Knowledge binding, and the tool result origins of its session could not be read */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
