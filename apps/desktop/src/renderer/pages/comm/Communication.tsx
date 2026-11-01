@@ -128,10 +128,6 @@ export default function CommunicationPage() {
   const [messageTo, setMessageTo] = useState('')
   const [messageText, setMessageText] = useState('')
   const contactNameRef = useRef<HTMLInputElement>(null)
-  const [exporting, setExporting] = useState<string | null>(null)
-  const [exportPassword, setExportPassword] = useState('')
-  const [exportRepeat, setExportRepeat] = useState('')
-  const [exportError, setExportError] = useState<string | null>(null)
   const [history, setHistory] = useState<CommHistoryItem[] | null>(null)
   // A stale choice (no longer offered after a refresh) falls back to the default option.
   const relayOptions = [...defaults.map((relay) => relay.url), ...(relays?.relays ?? [])]
@@ -285,29 +281,19 @@ export default function CommunicationPage() {
     }
   }
 
-  const closeExport = () => { setExporting(null); setExportPassword(''); setExportRepeat(''); setExportError(null) }
-
   const exportKey = async (name: string) => {
     if (pending) return
-    if ([...exportPassword].length < 8) { setExportError(t('export.tooShort')); return }
-    if (/[\r\n\0]/.test(exportPassword) || !exportPassword.trim() || new TextEncoder().encode(exportPassword).length > 1024) {
-      setExportError(t('export.invalid')); return
-    }
-    if (exportPassword !== exportRepeat) { setExportError(t('export.mismatch')); return }
-    const backupPassword = exportPassword
-    setExportPassword('')
-    setExportRepeat('')
-    setExportError(null)
     setPending('export')
     setActionError(null)
     setNotice(null)
     try {
-      const result = await exportCommIdentity(name, backupPassword)
-      if (mounted.current) { setNotice(t('export.done', { path: result.path })); setExporting(null) }
+      // The backup password is asked for by the main process, not by this page.
+      const result = await exportCommIdentity(name)
+      if (mounted.current) setNotice(t('export.done', { path: result.path }))
     } catch (error) {
-      // Declining the native confirm or the save dialog is not an error.
+      // Declining any native step is not an error.
       const cancelled = error instanceof CommApiError && error.code === 'cancelled'
-      if (mounted.current && !cancelled) { setActionError(messageOf(error, backupPassword)); setExporting(null) }
+      if (mounted.current && !cancelled) setActionError(messageOf(error))
     } finally {
       if (mounted.current) setPending(null)
     }
@@ -446,21 +432,13 @@ export default function CommunicationPage() {
                 <button type="button" onClick={() => void copyNpub(identity.npub)} aria-label={`${t('identity.copy')} ${identity.nickname}`}>
                   {copied === identity.npub ? t('identity.copied') : t('identity.copy')}
                 </button>
-                <button type="button" disabled={pending !== null} onClick={() => { setExporting(identity.nickname); setExportError(null) }} aria-label={`${t('export.button')} ${identity.nickname}`}>
+                <button type="button" disabled={pending !== null} onClick={() => void exportKey(identity.nickname)} aria-label={`${t('export.button')} ${identity.nickname}`}>
                   {t('export.button')}
                 </button>
               </td>
             </tr>)}
           </tbody></table></div>
         )}
-        {exporting && <form className="comm-setup-form" aria-label={t('export.button')} onSubmit={(event) => { event.preventDefault(); void exportKey(exporting) }}>
-          <label>{t('export.password')}<input type="password" autoComplete="new-password" value={exportPassword} onChange={(event) => setExportPassword(event.target.value)} /></label>
-          <label>{t('export.confirmPassword')}<input type="password" autoComplete="new-password" value={exportRepeat} onChange={(event) => setExportRepeat(event.target.value)} /></label>
-          <p className="comm-muted">{t('export.note')}</p>
-          {exportError && <p role="alert" className="comm-alert">{exportError}</p>}
-          <button type="submit" disabled={pending !== null || !exportPassword || !exportRepeat}>{t('export.start')}</button>
-          <button type="button" onClick={closeExport}>{t('export.cancel')}</button>
-        </form>}
         {identities?.some((identity) => identity.default) && <p className="comm-muted">{t('identity.myAddress')}</p>}
       </section>
 

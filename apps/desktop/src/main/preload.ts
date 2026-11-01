@@ -54,9 +54,9 @@ const api = {
     ipcRenderer.invoke(IpcChannels.ApprovalDecide, id, decision),
   /** A1: elevated; main asks the user in a native dialog before sending. */
   commInstall: (): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.CommInstall),
-  /** Elevated; main confirms natively, lets the user pick the file, and the daemon writes an NIP-49 password-encrypted backup there (0600, never overwriting). Resolves with `{nickname,npub,path,format}` only. */
-  commIdentityExport: (nickname: string, backupPassword: string): Promise<BackendProxyResponse> =>
-    ipcRenderer.invoke(IpcChannels.CommIdentityExport, nickname, backupPassword),
+  /** Elevated; the page sends only the nickname. Main confirms natively, collects the backup password in its own isolated window, lets the user pick the file, and the daemon writes an NIP-49 encrypted backup there (0600, never overwriting). Resolves with `{nickname,npub,path,format}` only. */
+  commIdentityExport: (nickname: string): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommIdentityExport, nickname),
   /** Elevated comm write, validated in main (not on the generic proxy). */
   commContactAdd: (nickname: string, npub: string, role: string): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.CommContactAdd, nickname, npub, role),

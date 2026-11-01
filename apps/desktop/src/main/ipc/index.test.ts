@@ -13,6 +13,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 const handlers = new Map<string, (event: unknown, ...args: unknown[]) => unknown>()
 const showMessageBox = vi.fn()
 const showSaveDialog = vi.fn()
+const promptBackupPassword = vi.fn()
 const execFileMock = vi.fn()
 
 vi.mock('electron', () => ({
@@ -117,6 +118,7 @@ beforeAll(async () => {
   registerIpcHandlers({
     omlxSettingsPath: settingsFile,
     omlxCandidatePorts: [endpoint.port],
+    promptBackupPassword: (...a: unknown[]) => promptBackupPassword(...a),
     guard: createIpcGuard({
       getMainWindow: () => mainWindow as never,
       isTrustedUrl: (u) => u === APP_URL,
@@ -139,6 +141,8 @@ beforeEach(() => {
   attachedModules = [{ name: 'agentear', attach_status: 'attached' }, { name: 'other', attach_status: 'attached' }]
   attachedFailure = null
   showMessageBox.mockReset()
+  showSaveDialog.mockReset()
+  promptBackupPassword.mockReset()
   execFileMock.mockReset()
 })
 
@@ -315,46 +319,78 @@ const NPUB = 'npub1' + 'q'.repeat(58)
 const REAL_NPUB = 'npub140q9dxxcn4kan7s75j87vhrwn7mn7s7ncy5q2zutrcg6q2rqylmqxvda2x'
 
 describe('CommIdentityExport elevated IPC', () => {
-  it('cancelling the native confirm sends nothing and opens no save dialog', async () => {
+  const PW = 'backup-pass-1'
+  const noDaemonCall = () => expect(seen.filter((r) => r.url?.includes('/identity/export'))).toHaveLength(0)
+
+  it('the page API takes only a nickname: any extra argument (a password) is never used', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockResolvedValueOnce('main-collected-pass')
+    showSaveDialog.mockResolvedValueOnce({ canceled: false, filePath: path.join(settingsDir, 'sig.ncryptsec') })
+    await call(IpcChannels.CommIdentityExport, 'alice', 'renderer-supplied-pass')
+    expect(JSON.parse(seen[0]!.body).backup_password).toBe('main-collected-pass')
+    expect(seen[0]!.body).not.toContain('renderer-supplied-pass')
+  })
+  it('runs the steps in order: identity check, risk confirm, password window, save dialog, daemon', async () => {
+    const order: string[] = []
+    showMessageBox.mockImplementationOnce(async () => { order.push('confirm'); return { response: 0 } })
+    promptBackupPassword.mockImplementationOnce(async () => { order.push('password'); return PW })
+    showSaveDialog.mockImplementationOnce(async () => { order.push('save'); return { canceled: false, filePath: path.join(settingsDir, 'ord.ncryptsec') } })
+    await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(order).toEqual(['confirm', 'password', 'save'])
+    expect(seen.map((r) => r.url)).toEqual(['/api/v1/comm/identity/export'])
+  })
+  it('cancelling the risk confirm: no password window, no save dialog, no daemon call', async () => {
     showMessageBox.mockResolvedValueOnce({ response: 1 })
-    const result = await call(IpcChannels.CommIdentityExport, 'alice', 'backup-pass-1')
-    expect(result.ok).toBe(false)
-    expect(showSaveDialog).not.toHaveBeenCalled()
-    expect(seen).toHaveLength(0)
-  })
-  it('cancelling the save dialog sends nothing', async () => {
-    showMessageBox.mockResolvedValueOnce({ response: 0 })
-    showSaveDialog.mockResolvedValueOnce({ canceled: true })
-    const result = await call(IpcChannels.CommIdentityExport, 'alice', 'backup-pass-1')
+    const result = await call(IpcChannels.CommIdentityExport, 'alice')
     expect(result.data.error.code).toBe('cancelled')
-    expect(seen).toHaveLength(0)
+    expect(promptBackupPassword).not.toHaveBeenCalled()
+    expect(showSaveDialog).not.toHaveBeenCalled()
+    noDaemonCall()
   })
-  it('sends one request: path from the dialog, backup password in the body only, host credential', async () => {
+  it('cancelling the password window: no save dialog, no daemon call', async () => {
     showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockResolvedValueOnce(null)
+    const result = await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(result.data.error.code).toBe('cancelled')
+    expect(showSaveDialog).not.toHaveBeenCalled()
+    noDaemonCall()
+  })
+  it('cancelling the save dialog: no daemon call', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockResolvedValueOnce(PW)
+    showSaveDialog.mockResolvedValueOnce({ canceled: true })
+    const result = await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(result.data.error.code).toBe('cancelled')
+    noDaemonCall()
+  })
+  it('sends one request: path from the dialog, the main-collected password in the body only, host credential', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockResolvedValueOnce(PW)
     showSaveDialog.mockResolvedValueOnce({ canceled: false, filePath: path.join(settingsDir, 'fresh-alice.ncryptsec') })
-    await call(IpcChannels.CommIdentityExport, 'alice', 'backup-pass-1')
+    await call(IpcChannels.CommIdentityExport, 'alice')
     expect(seen).toHaveLength(1)
     expect(seen[0]).toMatchObject({ method: 'POST', url: '/api/v1/comm/identity/export', auth: 'Bearer daemon-secret' })
     expect(JSON.parse(seen[0]!.body)).toEqual({
-      nickname: 'alice', path: path.join(settingsDir, 'fresh-alice.ncryptsec'), backup_password: 'backup-pass-1',
+      nickname: 'alice', path: path.join(settingsDir, 'fresh-alice.ncryptsec'), backup_password: PW,
     })
-    const opts = showMessageBox.mock.calls.at(-1)!.at(-1) as { detail: string; message: string }
+    const opts = showMessageBox.mock.calls.at(-1)!.at(-1) as { detail: string }
     expect(opts.detail).toMatch(/impersonate/)
-    expect(JSON.stringify(opts)).not.toContain('backup-pass-1')
+    expect(JSON.stringify(opts)).not.toContain(PW)
+    expect(JSON.stringify(showSaveDialog.mock.calls.at(-1))).not.toContain(PW)
   })
-  it('an unknown identity is refused before any dialog', async () => {
+  it('an unknown identity is refused before any dialog or window', async () => {
     showMessageBox.mockClear()
-    const result = await call(IpcChannels.CommIdentityExport, 'ghost', 'backup-pass-1')
+    const result = await call(IpcChannels.CommIdentityExport, 'ghost')
     expect(result.data.error.code).toBe('identity_not_found')
     expect(showMessageBox).not.toHaveBeenCalled()
+    expect(promptBackupPassword).not.toHaveBeenCalled()
     expect(seen).toHaveLength(0)
   })
-  it('the native confirm says where the password was typed; the save dialog defaults to Downloads with a Unicode-safe name', async () => {
+  it('the save dialog defaults to Downloads with a Unicode-safe name', async () => {
     showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockResolvedValueOnce(PW)
     showSaveDialog.mockResolvedValueOnce({ canceled: true })
-    await call(IpcChannels.CommIdentityExport, 'alice', 'backup-pass-1')
-    const confirm = showMessageBox.mock.calls.at(-1)!.at(-1) as { detail: string }
-    expect(confirm.detail).toContain('entered in the Agent24 window')
+    await call(IpcChannels.CommIdentityExport, 'alice')
     const save = showSaveDialog.mock.calls.at(-1)!.at(-1) as { defaultPath: string }
     expect(save.defaultPath).toBe(path.join(settingsDir, 'alice.ncryptsec'))
   })
@@ -362,21 +398,25 @@ describe('CommIdentityExport elevated IPC', () => {
     const existing = path.join(settingsDir, 'taken.ncryptsec')
     fs.writeFileSync(existing, 'precious')
     showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockResolvedValueOnce(PW)
     showSaveDialog.mockResolvedValueOnce({ canceled: false, filePath: existing })
-    const result = await call(IpcChannels.CommIdentityExport, 'alice', 'backup-pass-1')
+    const result = await call(IpcChannels.CommIdentityExport, 'alice')
     expect(result.data.error.code).toBe('target_exists')
-    expect(seen).toHaveLength(0)
+    noDaemonCall()
     expect(fs.readFileSync(existing, 'utf8')).toBe('precious')
   })
+  it('a password the window returns but main finds unusable is refused before the save dialog', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockResolvedValueOnce('short')
+    const result = await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(result.data.error.code).toBe('invalid_request')
+    expect(showSaveDialog).not.toHaveBeenCalled()
+    noDaemonCall()
+  })
   it.each([
-    ['control chars in the name', ['al\nice', 'backup-pass-1']],
-    ['object as the name', [{ nickname: 'alice' }, 'backup-pass-1']],
-    ['short password', ['alice', 'short']],
-    ['password with a line break', ['alice', 'good-long\npassword']],
-    ['password with NUL', ['alice', 'good-long\0password']],
-    ['whitespace-only password', ['alice', '          ']],
-    ['password over 1024 UTF-8 bytes', ['alice', 'é'.repeat(513)]],
-    ['missing password', ['alice', undefined]],
+    ['control chars in the name', ['al\nice']],
+    ['object as the name', [{ nickname: 'alice' }]],
+    ['no name', []],
   ])('refuses %s before any dialog', async (_name, args) => {
     showMessageBox.mockClear()
     const result = await call(IpcChannels.CommIdentityExport, ...(args as unknown[]))
@@ -387,7 +427,17 @@ describe('CommIdentityExport elevated IPC', () => {
 })
 
 describe('CommContactAdd / CommSend dedicated IPC', () => {
+  it('contact add shows a native confirm with the nickname and the FULL npub; cancelling sends nothing', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 1 })
+    const result = await call(IpcChannels.CommContactAdd, 'bob', REAL_NPUB, 'friend')
+    expect(result.data.error.code).toBe('cancelled')
+    expect(seen).toHaveLength(0)
+    const opts = showMessageBox.mock.calls.at(-1)!.at(-1) as { message: string }
+    expect(opts.message).toContain('bob')
+    expect(opts.message).toContain(REAL_NPUB)
+  })
   it('adds a contact with a fixed route and only validated fields', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
     await call(IpcChannels.CommContactAdd, 'bob', REAL_NPUB, 'friend')
     expect(seen).toHaveLength(1)
     expect(seen[0]).toMatchObject({ method: 'POST', url: '/api/v1/comm/contact', auth: 'Bearer daemon-secret' })
@@ -399,10 +449,12 @@ describe('CommContactAdd / CommSend dedicated IPC', () => {
     ['newline in the nickname', ['bo\nb', REAL_NPUB, '']],
     ['newline in the role', ['bob', REAL_NPUB, 'x\ny']],
     ['non-string nickname', [{}, REAL_NPUB, '']],
-  ])('contact add refuses %s', async (_name, args) => {
+  ])('contact add refuses %s (before the confirm dialog)', async (_name, args) => {
+    showMessageBox.mockClear()
     const result = await call(IpcChannels.CommContactAdd, ...(args as unknown[]))
     expect(result.data.error.code).toBe('invalid_request')
     expect(seen).toHaveLength(0)
+    expect(showMessageBox).not.toHaveBeenCalled()
   })
   it('sends encrypted to a contact name or a valid npub, with bounded content', async () => {
     await call(IpcChannels.CommSend, 'bob', 'hello')

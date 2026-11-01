@@ -218,10 +218,12 @@ where
         .collect()
 }
 
-/// Held across every `spawn()` this crate does, and across the pty master's
-/// creation in `export.rs`, so that no child can be forked in the instant
-/// between `openpt` and the `FD_CLOEXEC` that keeps the master out of it
-/// (rustix cannot set `O_CLOEXEC` at `posix_openpt` time on Apple targets).
+/// Serialises `spawn()` calls made by this crate. NOT a protection for the
+/// export pty (its fds are close-on-exec from creation, see `export.rs`). It
+/// exists because `std::process::Command` creates its stdin/stdout pipes with
+/// `pipe` + `fcntl` on macOS, so a child forked on another thread in that gap
+/// inherits a sibling's pipe end and keeps it open (a hung `cat` waiting for
+/// EOF that never comes).
 static SPAWN_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) fn lock_spawn_gate() -> std::sync::MutexGuard<'static, ()> {

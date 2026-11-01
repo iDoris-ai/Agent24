@@ -27,8 +27,7 @@ use bech32::{Bech32, Hrp};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rustix::fs::{AtFlags, Mode, OFlags};
-use rustix::io::FdFlags;
-use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+use rustix::pty::{grantpt, ptsname, unlockpt};
 use rustix::termios::LocalModes;
 use serde_json::json;
 use unicode_normalization::UnicodeNormalization;
@@ -101,15 +100,23 @@ fn check_typable(password: &Password) -> Result<(), CommError> {
     Ok(())
 }
 
-/// A pty pair whose MASTER cannot leak into any child: `FD_CLOEXEC` is set
-/// while the spawn gate is held, so no other spawn in this crate can fork in
-/// the gap (Apple's `posix_openpt` has no `O_CLOEXEC`). The slave is opened
-/// `O_CLOEXEC` too; the exporting child gets it only as its dup2'd stdio.
+/// A pty pair that is close-on-exec from the instant it exists. The master is
+/// opened with `open("/dev/ptmx", O_RDWR|O_NOCTTY|O_CLOEXEC)` (what
+/// `posix_openpt` does, but with the flag applied atomically: Apple's
+/// `posix_openpt` has no `O_CLOEXEC`, and `openpt` + a later `fcntl` leaves a
+/// window in which ANY fork/exec in this process, from any crate, would
+/// inherit the master and could read the key). There is no such window here
+/// and nothing relies on a lock. The slave is opened `O_CLOEXEC` too; the
+/// exporting child gets it only as its dup2'd stdio (dup2 clears the flag on
+/// the target descriptors).
 fn open_pty() -> Result<(OwnedFd, OwnedFd), CommError> {
     let io_err = |_| upstream("could not allocate a terminal for identity export");
-    let _gate = lock_spawn_gate();
-    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).map_err(io_err)?;
-    rustix::io::fcntl_setfd(&master, FdFlags::CLOEXEC).map_err(io_err)?;
+    let master = rustix::fs::open(
+        "/dev/ptmx",
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io_err)?;
     grantpt(&master).map_err(io_err)?;
     unlockpt(&master).map_err(io_err)?;
     let slave_name = ptsname(&master, Vec::new()).map_err(io_err)?;
@@ -453,8 +460,12 @@ pub(crate) fn parse_export_output(
 // NIP-49
 // ---------------------------------------------------------------------
 
+/// NFKC can lengthen text ("Ⅷ" is 3 bytes, "VIII" is 4), so the output size is
+/// computed first and allocated exactly: the buffer never grows while it holds
+/// the password, which would leave an unzeroed copy in the old allocation.
 fn nfkc(password: &str) -> Zeroizing<String> {
-    let mut out = Zeroizing::new(String::with_capacity(password.len()));
+    let needed: usize = password.nfkc().map(char::len_utf8).sum();
+    let mut out = Zeroizing::new(String::with_capacity(needed));
     out.extend(password.nfkc());
     out
 }
@@ -598,50 +609,114 @@ pub(crate) fn precheck_destination(dest: &Path, hyphae_home: &Path) -> Result<()
     }
 }
 
-/// Creates the destination with `O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600, as a
-/// brand-new inode owned by this user, and writes `text` + newline to it. An
-/// existing target (any kind, including a symlink or a hard link to something
-/// else) is refused: nothing is ever opened, truncated or chmod-ed in place.
+#[derive(Default)]
+struct Faults {
+    fail_write: bool,
+    fail_cleanup: bool,
+}
+
+/// Writes `text` + newline to a NEW file `dest`, never replacing anything.
+///
+/// The ciphertext goes to a random staging name in the same directory
+/// (`O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600, relative to the directory
+/// descriptor), is fsynced, and is only then published under the final name
+/// with `linkat` (which fails with EEXIST rather than replace anything,
+/// including a dangling symlink) followed by removing the staging name. A
+/// reader of the final name therefore never sees a partial file. If a failure
+/// cannot be cleaned up, the error says a partial encrypted file may remain
+/// and names it.
 pub(crate) fn write_backup_file(
     dest: &Path,
     hyphae_home: &Path,
     text: &str,
 ) -> Result<(), CommError> {
+    write_backup_file_with(dest, hyphae_home, text, &Faults::default())
+}
+
+fn write_backup_file_with(
+    dest: &Path,
+    hyphae_home: &Path,
+    text: &str,
+    faults: &Faults,
+) -> Result<(), CommError> {
     let d = open_destination(dest, hyphae_home)?;
+    let mut nonce = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut nonce);
+    let staging_name =
+        std::ffi::OsString::from(format!(".agent24-backup-{}.tmp", hex::encode(nonce)));
+    let staging_path = dest
+        .parent()
+        .map_or_else(|| staging_name.clone().into(), |p| p.join(&staging_name));
+
     let fd = rustix::fs::openat(
         &d.parent,
-        d.name.as_os_str(),
+        staging_name.as_os_str(),
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::RUSR | Mode::WUSR,
     )
-    .map_err(|e| {
-        if e == rustix::io::Errno::EXIST {
-            target_exists()
+    .map_err(|_| CommError::Invalid("cannot create the destination file".to_owned()))?;
+
+    // Remove the staging file; if that fails, say exactly what may remain.
+    let discard = |why: &str| -> CommError {
+        let removed = !faults.fail_cleanup
+            && rustix::fs::unlinkat(&d.parent, staging_name.as_os_str(), AtFlags::empty()).is_ok();
+        if removed {
+            upstream(why)
         } else {
-            CommError::Invalid("cannot create the destination file".to_owned())
+            CommError::Upstream(format!(
+                "{why}; a partial encrypted file may remain at {}",
+                staging_path.display()
+            ))
         }
-    })?;
-    let discard = |d: &Destination| {
-        let _ = rustix::fs::unlinkat(&d.parent, d.name.as_os_str(), AtFlags::empty());
     };
+
     // Belt and braces against a hostile umask or filesystem: it is our inode,
     // so tighten it before a single byte is written.
     let ok = rustix::fs::fchmod(&fd, Mode::RUSR | Mode::WUSR).is_ok()
         && rustix::fs::fstat(&fd)
             .is_ok_and(|st| st.st_uid == rustix::process::geteuid().as_raw() && st.st_nlink == 1);
     if !ok {
-        discard(&d);
-        return Err(upstream("the new backup file is not private to this user"));
+        return Err(discard("the new backup file is not private to this user"));
     }
     let mut file = File::from(fd);
-    let result = file
-        .write_all(text.as_bytes())
-        .and_then(|()| file.write_all(b"\n"))
-        .and_then(|()| file.sync_all());
-    if result.is_err() {
-        drop(file);
-        discard(&d);
-        return Err(upstream("writing the backup file failed"));
+    let written = if faults.fail_write {
+        Err(std::io::Error::other("injected write failure"))
+    } else {
+        file.write_all(text.as_bytes())
+            .and_then(|()| file.write_all(b"\n"))
+            .and_then(|()| file.sync_all())
+    };
+    drop(file);
+    if written.is_err() {
+        return Err(discard("writing the backup file failed"));
+    }
+
+    // Publish without overwriting: link fails with EEXIST if anything is there.
+    match rustix::fs::linkat(
+        &d.parent,
+        staging_name.as_os_str(),
+        &d.parent,
+        d.name.as_os_str(),
+        AtFlags::empty(),
+    ) {
+        Ok(()) => {}
+        Err(e) if e == rustix::io::Errno::EXIST => {
+            let cleanup = discard("target_exists");
+            return Err(match cleanup {
+                CommError::Upstream(m) if m.contains("may remain") => CommError::Upstream(m),
+                _ => target_exists(),
+            });
+        }
+        Err(_) => return Err(discard("publishing the backup file failed")),
+    }
+    // Published and complete; the staging name is now just a second link.
+    if faults.fail_cleanup
+        || rustix::fs::unlinkat(&d.parent, staging_name.as_os_str(), AtFlags::empty()).is_err()
+    {
+        tracing::warn!(
+            path = %staging_path.display(),
+            "backup published but its staging link could not be removed"
+        );
     }
     Ok(())
 }
@@ -669,6 +744,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    use rustix::io::FdFlags;
 
     use super::*;
 
@@ -745,7 +822,7 @@ mod tests {
     fn cancelled_reader_never_touches_the_password() {
         // The master end is a plain pty nobody writes to: if `drive` did not
         // check `cancel` first it would block forever in read().
-        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
+        let (master, _slave) = open_pty().unwrap();
         let cancel = AtomicBool::new(true);
         let password = Password::new(b"keychain-password".to_vec()).unwrap();
         let started = Instant::now();
@@ -800,6 +877,123 @@ mod tests {
         assert!(validate_backup_password(&"a".repeat(1025)).is_err());
         // 1024 bytes is measured in UTF-8, not characters
         assert!(validate_backup_password(&"é".repeat(513)).is_err());
+    }
+
+    #[test]
+    fn nfkc_allocates_exactly_for_expanding_characters() {
+        // "Ⅷ" (U+2167, 3 bytes) normalises to "VIII" (4 bytes): 24 -> 32 bytes.
+        let input = "Ⅷ".repeat(8);
+        assert_eq!(input.len(), 24);
+        let out = nfkc(&input);
+        assert_eq!(out.as_str(), "VIII".repeat(8));
+        assert_eq!(out.len(), 32);
+        assert_eq!(out.capacity(), 32, "the buffer must never have been grown");
+        let enc = encrypt_nip49(&[3u8; 32], &input, 4).unwrap();
+        assert_eq!(
+            &*decrypt_nip49(&enc, &"VIII".repeat(8)).unwrap(),
+            &[3u8; 32]
+        );
+    }
+
+    #[test]
+    fn the_pty_is_allocated_close_on_exec_without_the_non_atomic_openpt() {
+        let (master, slave) = open_pty().unwrap();
+        for fd in [&master, &slave] {
+            assert!(
+                rustix::io::fcntl_getfd(fd)
+                    .unwrap()
+                    .contains(FdFlags::CLOEXEC)
+            );
+        }
+        // Structural guard: production code must not call `openpt` (open then
+        // fcntl leaves a window in which a fork anywhere in the process
+        // inherits the master).
+        let source = include_str!("export.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            !production.contains(concat!("open", "pt(")),
+            "use open_pty()"
+        );
+        assert!(production.contains("/dev/ptmx"));
+    }
+
+    #[test]
+    fn publishing_leaves_no_staging_file_and_never_exposes_a_partial_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        write_backup_file(&out.join("a.ncryptsec"), &home, "ncryptsec1abc").unwrap();
+        let names: Vec<_> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("a.ncryptsec")]);
+        // target_exists also leaves nothing behind
+        assert!(matches!(
+            write_backup_file(&out.join("a.ncryptsec"), &home, "zzz"),
+            Err(CommError::Conflict(..))
+        ));
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_failed_write_is_cleaned_up_or_reports_the_remaining_partial_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let dest = out.join("b.ncryptsec");
+
+        let err = write_backup_file_with(
+            &dest,
+            &home,
+            "x",
+            &Faults {
+                fail_write: true,
+                fail_cleanup: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, CommError::Upstream(m) if !m.contains("may remain")),
+            "{err:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&out).unwrap().count(),
+            0,
+            "staging removed, target never created"
+        );
+
+        let err = write_backup_file_with(
+            &dest,
+            &home,
+            "x",
+            &Faults {
+                fail_write: true,
+                fail_cleanup: true,
+            },
+        )
+        .unwrap_err();
+        let leftovers: Vec<_> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(leftovers.len(), 1);
+        assert!(!dest.exists());
+        let CommError::Upstream(message) = err else {
+            panic!("expected upstream")
+        };
+        assert!(
+            message.contains("a partial encrypted file may remain"),
+            "{message}"
+        );
+        assert!(
+            message.contains(leftovers[0].to_str().unwrap()),
+            "{message}"
+        );
     }
 
     #[test]

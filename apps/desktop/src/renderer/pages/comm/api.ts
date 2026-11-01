@@ -379,11 +379,12 @@ export interface CommExportResult {
 }
 
 /**
- * Password-encrypted private-key backup (NIP-49). The main process asks for
- * confirmation, lets the user pick the file and has the daemon create it
- * (0600, never overwriting); only {nickname,npub,path} comes back. A cancelled
- * dialog rejects with code `cancelled`; an existing file with `target_exists`.
+ * Password-encrypted private-key backup (NIP-49). The page sends ONLY the
+ * nickname: the main process confirms, collects the backup password in its own
+ * isolated window, lets the user pick the file and has the daemon create it
+ * (0600, never overwriting). Only {nickname,npub,path} comes back. A cancelled
+ * step rejects with code `cancelled`; an existing file with `target_exists`.
  */
-export const exportCommIdentity = (nickname: string, backupPassword: string): Promise<CommExportResult> =>
-  viaIpc(() => window.agent24.commIdentityExport(nickname, backupPassword), (value): value is CommExportResult =>
+export const exportCommIdentity = (nickname: string): Promise<CommExportResult> =>
+  viaIpc(() => window.agent24.commIdentityExport(nickname), (value): value is CommExportResult =>
     isRecord(value) && string(value['nickname']) && string(value['npub']) && string(value['path']))

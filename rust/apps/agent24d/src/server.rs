@@ -4528,6 +4528,45 @@ pub(crate) mod tests {
         }
     }
 
+    /// Through the REAL comm router (nested exactly as production nests it),
+    /// not a stub handler: the restriction must hold on the actual route.
+    #[tokio::test]
+    async fn key_backup_restriction_holds_on_the_real_comm_router() {
+        let body = || {
+            Body::from(
+                r#"{"nickname":"a","path":"/tmp/x.ncryptsec","backup_password":"long-enough-1"}"#,
+            )
+        };
+        let post = |bearer: &str| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/comm/identity/export")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .body(body())
+                .unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let slot = Arc::new(crate::comm_routes::CommDaemonSlot::new());
+
+        // legacy mode, correct token: refused
+        let comm = crate::comm_routes::build(dir.path(), Duration::from_millis(500), &slot).await;
+        let legacy = build_router_with_modules(state().await, comm);
+        let res = legacy.oneshot(post("testtoken")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // capabilities mode: Creative refused, ProductHost reaches the handler
+        // (no Hyphae binary here, so it answers its own not_configured)
+        let (state, host, creative) = capability_state().await;
+        let comm = crate::comm_routes::build(dir.path(), Duration::from_millis(500), &slot).await;
+        let app = build_router_with_modules(state, comm);
+        let res = app.clone().oneshot(post(&creative)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let res = app.oneshot(post(&host)).await.unwrap();
+        assert_ne!(res.status(), StatusCode::FORBIDDEN);
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+    }
+
     #[tokio::test]
     async fn hot_comm_router_preserves_core2_matched_templates() {
         let (state, host, _) = capability_state().await;

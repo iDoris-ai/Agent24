@@ -354,38 +354,31 @@ describe('CommunicationPage usability', () => {
     await waitFor(() => expect(listCommHistory).toHaveBeenCalledTimes(2))
   })
 
-  it('asks for a backup password twice (min 8 chars) before exporting, and clears it', async () => {
+  it('exports with the nickname only; the page has no password fields and a cancelled step is silent', async () => {
     success()
     vi.mocked(exportCommIdentity)
       .mockRejectedValueOnce(new CommApiError('cancelled', 499, 'cancelled'))
       .mockResolvedValueOnce({ nickname: 'alice', npub: 'npub1alice', path: '/safe/alice.ncryptsec' })
     render(<CommunicationPage />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Export private key backup alice' }))
-    expect(screen.getByText(/cannot be restored; Agent24 does not store it/)).toBeInTheDocument()
-    const first = screen.getByLabelText('Backup password') as HTMLInputElement
-    const second = screen.getByLabelText('Repeat backup password') as HTMLInputElement
-    const submit = screen.getByRole('button', { name: 'Choose where to save…' })
-
-    fireEvent.change(first, { target: { value: 'short' } })
-    fireEvent.change(second, { target: { value: 'short' } })
-    fireEvent.click(submit)
-    expect(await screen.findByText('The backup password must be at least 8 characters')).toBeInTheDocument()
-    fireEvent.change(first, { target: { value: 'long-enough-1' } })
-    fireEvent.change(second, { target: { value: 'long-enough-2' } })
-    fireEvent.click(submit)
-    expect(await screen.findByText('The two passwords do not match')).toBeInTheDocument()
-    expect(exportCommIdentity).not.toHaveBeenCalled()
-
-    fireEvent.change(second, { target: { value: 'long-enough-1' } })
-    fireEvent.click(submit)
-    await waitFor(() => expect(exportCommIdentity).toHaveBeenCalledWith('alice', 'long-enough-1'))
-    await waitFor(() => expect(first.value).toBe(''))
-    expect(screen.queryByRole('alert')).toBeNull() // a cancelled dialog is silent
-    fireEvent.change(first, { target: { value: 'long-enough-1' } })
-    fireEvent.change(second, { target: { value: 'long-enough-1' } })
-    fireEvent.click(submit)
+    const button = await screen.findByRole('button', { name: 'Export private key backup alice' })
+    fireEvent.click(button)
+    await waitFor(() => expect(exportCommIdentity).toHaveBeenCalledTimes(1))
+    expect(exportCommIdentity).toHaveBeenCalledWith('alice')
+    await waitFor(() => expect(button).toBeEnabled())
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByLabelText(/backup password/i)).toBeNull()
+    expect(document.querySelector('input[type="password"]')).toBeNull()
+    fireEvent.click(button)
     expect(await screen.findByText(/saved to \/safe\/alice\.ncryptsec/)).toBeInTheDocument()
-    expect(document.body.textContent).not.toMatch(/nsec1|long-enough-1/)
+    expect(document.body.textContent).not.toMatch(/nsec1/)
+  })
+
+  it('shows an existing-file refusal as an error', async () => {
+    success()
+    vi.mocked(exportCommIdentity).mockRejectedValueOnce(new CommApiError('A file with that name already exists', 409, 'target_exists'))
+    render(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Export private key backup alice' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('already exists')
   })
 
   const stranger = 'npub1strangerstrangerstrangerstrangerstrangerstrangerxyz'
@@ -435,17 +428,4 @@ describe('CommunicationPage usability', () => {
     await waitFor(() => expect(sendCommMessage).toHaveBeenCalledWith(stranger, 'hello'))
   })
 
-  it('rejects a blank or over-long backup password in the form (line breaks are stripped by the input itself)', async () => {
-    success()
-    render(<CommunicationPage />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Export private key backup alice' }))
-    const submit = screen.getByRole('button', { name: 'Choose where to save…' })
-    for (const bad of ['           ', 'é'.repeat(513)]) {
-      fireEvent.change(screen.getByLabelText('Backup password'), { target: { value: bad } })
-      fireEvent.change(screen.getByLabelText('Repeat backup password'), { target: { value: bad } })
-      fireEvent.click(submit)
-      expect(await screen.findByText(/must be one line, not only spaces/)).toBeInTheDocument()
-    }
-    expect(exportCommIdentity).not.toHaveBeenCalled()
-  })
 })

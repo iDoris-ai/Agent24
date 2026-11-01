@@ -13,6 +13,7 @@ import { findAllowedRoute, proxyError, proxyRequest, timeoutFor, withKnowledgeBi
 import type { KnowledgeController } from '../knowledge-settings'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
 import { backupFileStem, isSafeBackupPassword, isSafeMessage, isSafeName, isValidNpub } from '../comm-validate'
+import { promptBackupPassword as openBackupPasswordWindow } from '../backup-password-window'
 import { mt, setMainLocale, isMainLocale } from '../main-i18n'
 import { readOmlxSettingsKey } from '../omlx-settings-key'
 import type { IpcGuard } from './guard'
@@ -327,7 +328,10 @@ export function registerIpcHandlers(options: {
   guard: IpcGuard
   /** The Knowledge settings, once main has built them. */
   knowledge?: () => KnowledgeController | null
+  /** Test seam: the main-owned backup-password window. */
+  promptBackupPassword?: (parent: BrowserWindow | null) => Promise<string | null>
 }): void {
+  const promptBackupPassword = options.promptBackupPassword ?? openBackupPasswordWindow
   const knowledge = options.knowledge ?? (() => null)
   omlxSettingsPath = options.omlxSettingsPath
   const handle: typeof ipcMain.handle = (channel, listener) => ipcMain.handle(channel, options.guard(listener))
@@ -529,42 +533,55 @@ export function registerIpcHandlers(options: {
   // here with a native save dialog (never by the page) and the daemon writes
   // the key itself (0600, no temp file), so the nsec never reaches this
   // process or the renderer. The page only learns {nickname, npub, path}.
-  handle(IpcChannels.CommIdentityExport, (event, nickname: unknown, backupPassword: unknown): Promise<BackendProxyResponse> =>
+  handle(IpcChannels.CommIdentityExport, (event, nickname: unknown): Promise<BackendProxyResponse> =>
     exclusive(async () => {
+      // The page asks only for "export this identity". The backup password is
+      // collected below by a window main owns, never by or through the page.
       if (!isSafeName(nickname, 128)) return invalidRequest('invalid nickname')
-      if (!isSafeBackupPassword(backupPassword)) return invalidRequest('invalid backup password')
-      // The identity must exist before the user is asked anything.
+      // 1. The identity must exist before the user is asked anything.
       const listed = await proxyToBackend({ method: 'GET', path: '/api/v1/comm/identity' })
       const identities = (listed.data as { data?: unknown } | null)?.data
       if (!listed.ok || !Array.isArray(identities) ||
           !identities.some((i) => (i as { nickname?: unknown } | null)?.nickname === nickname)) {
         return { ok: false, status: 404, data: { error: { code: 'identity_not_found', message: mt('err.identityNotFound') } } }
       }
+      // 2. Risk confirmation.
       const ok = await confirmNative(event, mt('comm.export', { name: clip(nickname, 80) }), mt('comm.exportDetail'))
       if (!ok) return cancelled()
       const win = BrowserWindow.fromWebContents(event.sender)
-      const options: Electron.SaveDialogOptions = {
-        title: mt('comm.exportSave'),
-        // Downloads, not Documents (which is often iCloud-synced).
-        defaultPath: path.join(app.getPath('downloads'), `${backupFileStem(nickname)}.ncryptsec`),
-        filters: [{ name: 'NIP-49 ncryptsec', extensions: ['ncryptsec'] }],
-      }
-      let picked: Electron.SaveDialogReturnValue
+      // 3. Backup password, in main's own isolated window.
+      let backupPassword: string | null = await promptBackupPassword(win)
+      if (backupPassword === null) return cancelled()
       try {
-        picked = win ? await dialog.showSaveDialog(win, options) : await dialog.showSaveDialog(options)
-      } catch {
-        return { ok: false, status: 500, data: { error: { code: 'dialog_failed', message: 'the file dialog could not open' } } }
+        if (!isSafeBackupPassword(backupPassword)) return invalidRequest('invalid backup password')
+        // 4. Where to save.
+        const options: Electron.SaveDialogOptions = {
+          title: mt('comm.exportSave'),
+          // Downloads, not Documents (which is often iCloud-synced).
+          defaultPath: path.join(app.getPath('downloads'), `${backupFileStem(nickname)}.ncryptsec`),
+          filters: [{ name: 'NIP-49 ncryptsec', extensions: ['ncryptsec'] }],
+        }
+        let picked: Electron.SaveDialogReturnValue
+        try {
+          picked = win ? await dialog.showSaveDialog(win, options) : await dialog.showSaveDialog(options)
+        } catch {
+          return { ok: false, status: 500, data: { error: { code: 'dialog_failed', message: 'the file dialog could not open' } } }
+        }
+        if (picked.canceled || !picked.filePath) return cancelled()
+        // The daemon never overwrites (O_EXCL) and says so; checking here too
+        // gives the user the reason before any key material is touched.
+        if (pathExists(picked.filePath)) {
+          return { ok: false, status: 409, data: { error: { code: 'target_exists', message: mt('err.targetExists') } } }
+        }
+        // 5. The daemon.
+        return await proxyToBackend({
+          method: 'POST', path: '/api/v1/comm/identity/export',
+          body: { nickname, path: picked.filePath, backup_password: backupPassword },
+        }, EXPORT_TIMEOUT_MS)
+      } finally {
+        // Best effort (JS strings are immutable): drop main's only reference.
+        backupPassword = null
       }
-      if (picked.canceled || !picked.filePath) return cancelled()
-      // The daemon never overwrites (O_EXCL) and says so; checking here too
-      // gives the user the reason before any key material is touched.
-      if (pathExists(picked.filePath)) {
-        return { ok: false, status: 409, data: { error: { code: 'target_exists', message: mt('err.targetExists') } } }
-      }
-      return proxyToBackend({
-        method: 'POST', path: '/api/v1/comm/identity/export',
-        body: { nickname, path: picked.filePath, backup_password: backupPassword },
-      }, EXPORT_TIMEOUT_MS)
     }),
   )
 
@@ -573,16 +590,24 @@ export function registerIpcHandlers(options: {
   // control characters, bounded content) and the daemon route is fixed.
   // NOTE: no presence proof is attached. The daemon's resolve_target has no
   // CommWrite support yet (CORE-2d / CORE-7c), and the host credential is not
-  // subject to the presence check; this narrows the surface, it does not close it.
-  handle(IpcChannels.CommContactAdd, (_event, nickname: unknown, npub: unknown, role: unknown): Promise<BackendProxyResponse> => {
-    if (!isSafeName(nickname)) return Promise.resolve(invalidRequest('invalid nickname'))
-    if (!isValidNpub(npub)) return Promise.resolve(invalidRequest('invalid npub'))
-    if (role !== undefined && role !== '' && !isSafeName(role)) return Promise.resolve(invalidRequest('invalid role'))
-    return proxyToBackend({
-      method: 'POST', path: '/api/v1/comm/contact',
-      body: { nickname, npub, ...(typeof role === 'string' && role ? { role } : {}) },
-    })
-  })
+  // subject to the presence check. Contact add is therefore confirmed natively;
+  // SEND is NOT (accepted residual risk until CORE-7c/2d), so a compromised page
+  // can still send a validated message to a valid recipient.
+  // Adding a contact is confirmed in a native dialog that shows the nickname and
+  // the FULL address, so a compromised page cannot silently plant a contact.
+  handle(IpcChannels.CommContactAdd, (event, nickname: unknown, npub: unknown, role: unknown): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      if (!isSafeName(nickname)) return invalidRequest('invalid nickname')
+      if (!isValidNpub(npub)) return invalidRequest('invalid npub')
+      if (role !== undefined && role !== '' && !isSafeName(role)) return invalidRequest('invalid role')
+      const ok = await confirmNative(event, mt('comm.contactAdd', { name: clip(nickname, 64), npub }), mt('comm.contactAddDetail'))
+      if (!ok) return cancelled()
+      return proxyToBackend({
+        method: 'POST', path: '/api/v1/comm/contact',
+        body: { nickname, npub, ...(typeof role === 'string' && role ? { role } : {}) },
+      })
+    }),
+  )
   handle(IpcChannels.CommSend, (_event, to: unknown, content: unknown): Promise<BackendProxyResponse> => {
     if (!(typeof to === 'string' && to.startsWith('npub1') ? isValidNpub(to) : isSafeName(to))) return Promise.resolve(invalidRequest('invalid recipient'))
     if (!isSafeMessage(content)) return Promise.resolve(invalidRequest('invalid message'))
