@@ -14,16 +14,14 @@ use agent24_protocol::state_file::AuthMode;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 
 use crate::capabilities::{
-    Audience, CapabilityError, CapabilityStore, Operation, Resource, RouteDecision, decide,
-    unix_now,
+    Audience, CapabilityError, CapabilityStore, Operation, Resource, required_operation, unix_now,
 };
 use crate::migration_guard::dock::{
     DockCode, DockPhase, DockedHealth, FailedDb, MigrationMarker, RollbackState,
@@ -150,30 +148,32 @@ async fn not_found() -> Response {
     error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route")
 }
 
-/// Route catalog first (same table as the business router), then the
-/// `DiagnosticRead` check. Unknown path and wrong method fall through to the
-/// router's own 404 / 405; anything else is refused.
+/// Fail-closed allow-list: only GET and HEAD on the four catalogued paths ever
+/// reach a handler. Everything else is answered here (404 for an unknown
+/// path, 405 with `Allow: GET,HEAD` for any other method, OPTIONS and TRACE
+/// included), whatever methods the router itself happens to have registered.
 async fn gate(State(s): State<DockedState>, req: Request<Body>, next: Next) -> Response {
-    let matched = req
-        .extensions()
-        .get::<axum::extract::MatchedPath>()
-        .map(|m| m.as_str().to_owned());
-    match decide(
-        req.method(),
-        matched.as_deref(),
-        req.uri().path(),
-        &BTreeSet::new(),
-    ) {
-        RouteDecision::UnknownPath | RouteDecision::MethodNotAllowed => next.run(req).await,
-        RouteDecision::Mapped(p) if p.operation == Operation::HealthRead => next.run(req).await,
-        RouteDecision::Mapped(p) if p.operation == Operation::DiagnosticRead => {
-            match diagnostic_denied(&s, &req) {
-                Some(denied) => denied,
-                None => next.run(req).await,
-            }
-        }
-        _ => not_found().await,
+    let op = required_operation(&Method::GET, req.uri().path())
+        .filter(|op| matches!(op, Operation::HealthRead | Operation::DiagnosticRead));
+    let Some(op) = op else {
+        return not_found().await;
+    };
+    if !matches!(*req.method(), Method::GET | Method::HEAD) {
+        let mut resp = error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            "Method not allowed",
+        );
+        resp.headers_mut()
+            .insert(header::ALLOW, header::HeaderValue::from_static("GET,HEAD"));
+        return resp;
     }
+    if op == Operation::DiagnosticRead
+        && let Some(denied) = diagnostic_denied(&s, &req)
+    {
+        return denied;
+    }
+    next.run(req).await
 }
 
 fn diagnostic_denied(s: &DockedState, req: &Request<Body>) -> Option<Response> {
@@ -231,6 +231,7 @@ mod tests {
     use crate::migration_guard::dock::{DbMark, DockReason, MigrationsState, PairMark};
     use crate::migration_guard::manifest::BinaryIdentity;
     use agent24_protocol::HealthMigrations;
+    use std::collections::BTreeSet;
     use std::time::Duration;
     use tower::ServiceExt;
 
@@ -382,6 +383,32 @@ mod tests {
             .await
             .unwrap();
         (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    async fn allow_of(r: &Router, method: &str, path: &str) -> (StatusCode, BTreeSet<String>) {
+        let resp = r
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let allow = resp
+            .headers()
+            .get(header::ALLOW)
+            .map(|v| {
+                v.to_str()
+                    .unwrap()
+                    .split(',')
+                    .map(|m| m.trim().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        (resp.status(), allow)
     }
 
     fn code(body: &str) -> String {
@@ -572,6 +599,132 @@ mod tests {
             StatusCode::OK,
             "diagnostics must not exist on the business router"
         );
+    }
+
+    /// Full method matrix, no token: GET/HEAD reach the route's own gate, every
+    /// other method (OPTIONS, TRACE, CONNECT included) is 405 with exactly
+    /// `Allow: GET,HEAD` and never runs a handler; unknown paths are 404.
+    #[tokio::test]
+    async fn method_matrix_is_closed_on_every_path() {
+        let f = fx();
+        let allow: BTreeSet<String> = ["GET", "HEAD"].iter().map(|m| (*m).to_owned()).collect();
+        let methods = [
+            "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT",
+        ];
+        for (path, open) in [
+            ("/api/v1/health", StatusCode::SERVICE_UNAVAILABLE),
+            (DIAG[0], StatusCode::UNAUTHORIZED),
+            (DIAG[1], StatusCode::UNAUTHORIZED),
+            (DIAG[2], StatusCode::UNAUTHORIZED),
+        ] {
+            for m in methods {
+                let (status, got) = allow_of(&f.router, m, path).await;
+                if m == "GET" || m == "HEAD" {
+                    assert_eq!(status, open, "{m} {path}");
+                    assert!(got.is_empty(), "{m} {path}");
+                } else {
+                    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{m} {path}");
+                    assert_eq!(got, allow, "{m} {path}");
+                    let (_, body) = call(&f.router, m, path, Some(&f.host)).await;
+                    assert!(!body.contains("snap-1") && !body.contains("migration_failed"));
+                }
+            }
+        }
+        for m in methods {
+            let (status, _) = allow_of(&f.router, m, "/api/v1/diagnostics/other").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{m}");
+        }
+    }
+
+    /// Minimal OpenAPI check: type (incl. nullable), const, enum, required,
+    /// properties, items, $ref and oneOf.
+    fn validate(doc: &serde_yaml::Value, sc: &serde_yaml::Value, v: &serde_json::Value, at: &str) {
+        use serde_json::Value as J;
+        if let Some(r) = sc.get("$ref").and_then(|r| r.as_str()) {
+            let name = r.rsplit('/').next().unwrap();
+            return validate(doc, &doc["components"]["schemas"][name], v, at);
+        }
+        if let Some(opts) = sc.get("oneOf").and_then(|o| o.as_sequence()) {
+            let ok = opts.iter().any(|o| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| validate(doc, o, v, at)))
+                    .is_ok()
+            });
+            assert!(ok, "{at}: no oneOf branch matches {v}");
+            return;
+        }
+        if let Some(t) = sc.get("type") {
+            let types: Vec<&str> = match t.as_str() {
+                Some(one) => vec![one],
+                None => t
+                    .as_sequence()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.as_str().unwrap())
+                    .collect(),
+            };
+            let ok = types.iter().any(|t| match (*t, v) {
+                ("string", J::String(_)) | ("boolean", J::Bool(_)) | ("null", J::Null) => true,
+                ("integer", J::Number(n)) => n.is_i64() || n.is_u64(),
+                ("array", J::Array(_)) | ("object", J::Object(_)) => true,
+                _ => false,
+            });
+            assert!(ok, "{at}: {v} is not {types:?}");
+        }
+        if let Some(c) = sc.get("const") {
+            assert_eq!(serde_json::to_value(c).unwrap(), *v, "{at}: const");
+        }
+        if let Some(e) = sc.get("enum") {
+            let e = serde_json::to_value(e).unwrap();
+            assert!(e.as_array().unwrap().contains(v), "{at}: {v} not in {e}");
+        }
+        if let (Some(props), J::Object(obj)) = (sc.get("properties"), v) {
+            for r in sc
+                .get("required")
+                .and_then(|r| r.as_sequence())
+                .into_iter()
+                .flatten()
+            {
+                assert!(obj.contains_key(r.as_str().unwrap()), "{at}: missing {r:?}");
+            }
+            for (k, val) in obj {
+                let sub = props
+                    .get(k.as_str())
+                    .unwrap_or_else(|| panic!("{at}: extra {k}"));
+                validate(doc, sub, val, &format!("{at}.{k}"));
+            }
+        }
+        if let (Some(items), J::Array(a)) = (sc.get("items"), v) {
+            a.iter()
+                .enumerate()
+                .for_each(|(i, x)| validate(doc, items, x, &format!("{at}[{i}]")));
+        }
+    }
+
+    /// Real responses (not the shared fixture constructor) are what is asserted:
+    /// `retry_allowed` is false in the raw JSON, and every body fits its schema.
+    #[tokio::test]
+    async fn responses_are_raw_checked_and_fit_the_openapi_schemas() {
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str(include_str!("../../../../protocol/openapi.yaml")).unwrap();
+        let f = fx();
+        let t = Some(f.first_party.as_str());
+        let (_, h) = call(&f.router, "GET", "/api/v1/health", None).await;
+        let h: serde_json::Value = serde_json::from_str(&h).unwrap();
+        assert_eq!(h["reason"]["retry_allowed"], serde_json::json!(false));
+        validate(&doc, &doc["components"]["schemas"]["Health"], &h, "health");
+        for (p, schema) in [
+            (DIAG[0], "MigrationDiagnostics"),
+            (DIAG[1], "SnapshotDiagnostics"),
+            (DIAG[2], "SpaceDiagnostics"),
+        ] {
+            let (st, b) = call(&f.router, "GET", p, t).await;
+            assert_eq!(st, StatusCode::OK);
+            let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+            if schema == "MigrationDiagnostics" {
+                assert_eq!(v["retry_allowed"], serde_json::json!(false));
+            }
+            validate(&doc, &doc["components"]["schemas"][schema], &v, schema);
+        }
     }
 
     fn keys_of(v: &serde_yaml::Value) -> BTreeSet<String> {

@@ -6636,7 +6636,13 @@ pub(crate) mod tests {
     }
 
     fn method_names(expr: &str) -> Vec<&'static str> {
-        const NAMES: &[&str] = &["get", "post", "put", "patch", "delete", "head"];
+        // Every axum method registrar is recognised, so an extra registration
+        // (`.options(..)`, `any(..)`, `on(..)`) shows up as a (method, path) pair
+        // the catalog does not list instead of being skipped.
+        const NAMES: &[&str] = &[
+            "get", "post", "put", "patch", "delete", "head", "options", "trace", "connect", "any",
+            "on",
+        ];
         let mut found = Vec::new();
         let mut index = 0;
         let mut boundary = true;
