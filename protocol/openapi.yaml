@@ -4731,7 +4731,7 @@ components:
         code: { $ref: "#/components/schemas/DockCode" }
         rollback: { $ref: "#/components/schemas/RollbackState" }
         retry_allowed: { type: boolean, const: false }
-        error_summary: { type: string, description: Bounded and scrubbed. }
+        error_summary: { type: string, maxLength: 256, description: "The marker's bounded summary, capped at 256 characters on read. Not scrubbed here: the marker writer must build it from a closed set of messages." }
     SnapshotDiagnostics:
       type: object
       required: [snapshot_id, restore, files]

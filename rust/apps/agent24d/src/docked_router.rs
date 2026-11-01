@@ -29,7 +29,9 @@ use crate::migration_guard::dock::{
 use crate::migration_guard::manifest::{DbRecord, Manifest};
 use agent24_domain::http::error_response;
 
-/// `GET /api/v1/diagnostics/migration`. Scrubbed: no paths, no raw errors.
+/// `GET /api/v1/diagnostics/migration`. `error_summary` is the marker's bounded
+/// summary, capped at [`SUMMARY_MAX_CHARS`] here; it is NOT scrubbed on this
+/// side. The marker writer (5f-3) must build it from a closed set of messages.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrationDiagnostics {
     pub attempt_id: String,
@@ -44,6 +46,9 @@ pub struct MigrationDiagnostics {
     pub error_summary: String,
 }
 
+/// Read-side cap for `error_summary` (the marker type documents only "bounded").
+pub const SUMMARY_MAX_CHARS: usize = 256;
+
 impl MigrationDiagnostics {
     #[must_use]
     pub fn from_marker(m: &MigrationMarker) -> Self {
@@ -57,7 +62,7 @@ impl MigrationDiagnostics {
             code: m.error_code,
             rollback: m.rollback,
             retry_allowed: false,
-            error_summary: m.error_summary.clone(),
+            error_summary: m.error_summary.chars().take(SUMMARY_MAX_CHARS).collect(),
         }
     }
 }
@@ -244,6 +249,7 @@ mod tests {
         host: String,
         creative: String,
         creative_with_diag: String,
+        health_only: String,
     }
 
     fn marker() -> MigrationMarker {
@@ -352,6 +358,25 @@ mod tests {
             .unwrap()
             .secret
             .to_string();
+        // A first-party-audience token scoped to HealthRead only.
+        let health_only = store
+            .insert(crate::capabilities::CapabilityClaims {
+                first_party: None,
+                capability_id: "scoped-health-only".into(),
+                audience: Audience::FirstPartyShell,
+                workspace_id: None,
+                attachment_id: None,
+                principal_id: None,
+                daemon_generation: "g".into(),
+                host_generation: None,
+                sidecar_generation: None,
+                created_at: now,
+                expires_at: now + 600,
+                allowed_operations: BTreeSet::from([Operation::HealthRead]),
+            })
+            .unwrap()
+            .into_bearer_parts()
+            .0;
         let state = state(AuthMode::Capabilities, Some(store));
         Fx {
             router: docked_router(state.clone()),
@@ -360,6 +385,7 @@ mod tests {
             host: host_bearer,
             creative,
             creative_with_diag,
+            health_only,
         }
     }
 
@@ -512,6 +538,7 @@ mod tests {
                 (Some("not-a-token"), StatusCode::UNAUTHORIZED),
                 (Some(f.creative.as_str()), StatusCode::FORBIDDEN),
                 (Some(f.creative_with_diag.as_str()), StatusCode::FORBIDDEN),
+                (Some(f.health_only.as_str()), StatusCode::FORBIDDEN),
                 (Some(f.first_party.as_str()), StatusCode::OK),
                 (Some(f.host.as_str()), StatusCode::OK),
             ] {
@@ -601,6 +628,25 @@ mod tests {
         );
     }
 
+    /// A long or hostile marker summary is capped on a char boundary on read.
+    #[test]
+    fn long_or_hostile_summary_is_capped() {
+        let mut m = marker();
+        for raw in [
+            "é".repeat(10_000),
+            format!("{} /Users/jason/secret.db", "x".repeat(5_000)),
+            "日本語".repeat(500),
+        ] {
+            m.error_summary = raw.clone();
+            let d = MigrationDiagnostics::from_marker(&m);
+            assert_eq!(d.error_summary.chars().count(), SUMMARY_MAX_CHARS);
+            assert!(raw.starts_with(&d.error_summary));
+            assert!(!d.error_summary.contains("secret.db"));
+        }
+        m.error_summary = "short".into();
+        assert_eq!(MigrationDiagnostics::from_marker(&m).error_summary, "short");
+    }
+
     /// Full method matrix, no token: GET/HEAD reach the route's own gate, every
     /// other method (OPTIONS, TRACE, CONNECT included) is 405 with exactly
     /// `Allow: GET,HEAD` and never runs a handler; unknown paths are 404.
@@ -669,6 +715,12 @@ mod tests {
                 _ => false,
             });
             assert!(ok, "{at}: {v} is not {types:?}");
+        }
+        if let (Some(max), J::String(text)) = (sc.get("maxLength").and_then(|m| m.as_u64()), v) {
+            assert!(
+                text.chars().count() as u64 <= max,
+                "{at}: longer than {max}"
+            );
         }
         if let Some(c) = sc.get("const") {
             assert_eq!(serde_json::to_value(c).unwrap(), *v, "{at}: const");

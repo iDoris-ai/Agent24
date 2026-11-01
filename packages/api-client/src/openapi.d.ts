@@ -2308,7 +2308,7 @@ export interface components {
             rollback: components["schemas"]["RollbackState"];
             /** @constant */
             retry_allowed: false;
-            /** @description Bounded and scrubbed. */
+            /** @description The marker's bounded summary, capped at 256 characters on read. Not scrubbed here: the marker writer must build it from a closed set of messages. */
             error_summary: string;
         };
         SnapshotDiagnostics: {

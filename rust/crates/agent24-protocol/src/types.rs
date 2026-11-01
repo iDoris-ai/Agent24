@@ -21,7 +21,8 @@ pub struct HealthMigrations {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Health {
-    /// Always "ok" when reachable
+    /// Always "ok" for the normal health (HTTP 200). A docked daemon answers
+    /// 503 through `DockedHealth` (agent24d) with `migration_failed`.
     pub status: String,
     pub version: String,
     /// Open enum: "node" | "rust" | future backends
