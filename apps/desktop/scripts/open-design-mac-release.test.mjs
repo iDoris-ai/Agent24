@@ -22,6 +22,7 @@ import {
   signOpenDesignTree,
   teamIdFromIdentity,
   verifySignedMachOTree,
+  codesignVerifyArgs,
   versionFromReleaseTag,
   writeOpenDesignSourceStamp,
 } from './open-design-mac-release.mjs'
@@ -314,7 +315,7 @@ test('signOpenDesignTree records codesign --verify and checks an injected Team I
     const verified = calls.find(([cmd, args]) => cmd === 'codesign' && args[0] === '--verify')
     assert.ok(verified, 'codesign --verify was not invoked')
     assert.equal(verified[1][1], '--strict')
-    assert.deepEqual(verified[1].slice(2, 4), ['-R', 'anchor apple generic and certificate leaf[subject.OU] = "HYAP444FN9"'])
+    assert.deepEqual(verified[1].slice(2, 4), ['-R', '=anchor apple generic and certificate leaf[subject.OU] = "HYAP444FN9"'])
     assert.equal(verified[1].at(-1), tool)
     assert.ok(calls.some(([cmd, args]) => cmd === 'codesign' && args[0] === '-dv' && args[1] === tool))
     assert.ok(calls.some(([cmd, args]) => cmd === 'codesign' && args[0] === '-d' && args[1] === '--entitlements' && args[2] === ':-' && args[3] === tool))
@@ -506,8 +507,58 @@ test('an ad-hoc Mach-O named TeamIdentifier=HYAP444FN9 does not satisfy the Team
     assert.match(`${described.stdout}\n${described.stderr}`, /TeamIdentifier=HYAP444FN9/)
     await assert.rejects(
       verifySignedMachOTree({ root, requireJitMatch: false }),
-      /Team ID HYAP444FN9/,
+      (error) => {
+        // Must fail because the requirement is unmet, not because codesign
+        // could not parse `-R` (the "No such file" bug).
+        assert.match(error.message, /Team ID HYAP444FN9/)
+        assert.match(error.message, /satisf/i)
+        assert.doesNotMatch(error.message, /No such file|invalid requirement/i)
+        return true
+      },
     )
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('codesignVerifyArgs builds a -R that real codesign evaluates (satisfied passes, unmet fails as unmet)', macOnly, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-req-'))
+  try {
+    const file = path.join(root, 'reqtool')
+    fs.copyFileSync('/usr/bin/true', file)
+    execFileSync('codesign', ['--force', '--sign', '-', '--options', 'runtime', file], { stdio: 'pipe' })
+    const described = spawnSync('codesign', ['-dv', file], { encoding: 'utf8' })
+    const identifier = /^Identifier=(.+)$/m.exec(`${described.stdout}\n${described.stderr}`)?.[1]
+    assert.ok(identifier, 'ad-hoc signature has an Identifier')
+    const ok = spawnSync('codesign', codesignVerifyArgs(file, { requirement: `identifier "${identifier}"` }), { encoding: 'utf8' })
+    assert.equal(ok.status, 0, ok.stderr)
+    const bad = spawnSync('codesign', codesignVerifyArgs(file, { teamId: 'HYAP444FN9' }), { encoding: 'utf8' })
+    assert.notEqual(bad.status, 0)
+    assert.match(bad.stderr, /satisf/i)
+    assert.doesNotMatch(bad.stderr, /No such file|invalid requirement/i)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('JIT detection ignores stderr paths that contain "allow-jit"', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-jitpath-'))
+  try {
+    const dir = path.join(root, 'allow-jit')
+    fs.mkdirSync(dir)
+    const file = path.join(dir, 'tool')
+    fs.writeFileSync(file, Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]))
+    const count = await verifySignedMachOTree({
+      root,
+      teamId: 'HYAP444FN9',
+      requireJitMatch: false,
+      runCommand: async (_cmd, args) => {
+        if (args[0] === '-dv') return { stdout: '', stderr: `Executable=${file}\nCodeDirectory v=20500 size=1 flags=0x10000(runtime) hashes=1+0\n` }
+        if (args[0] === '-d') return { stdout: '', stderr: `Executable=${file}\n` }
+        return { stdout: '', stderr: '' }
+      },
+    })
+    assert.equal(count, 1)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

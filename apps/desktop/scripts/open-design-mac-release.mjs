@@ -316,7 +316,10 @@ export function machOSigningArgs({ file, kind, identity, entitlements, timestamp
 export function codesignVerifyArgs(file, { teamId, requirement } = {}) {
   const args = ['--verify', '--strict']
   const resolved = requirement === undefined ? (teamId ? teamIdRequirement(teamId) : null) : requirement
-  if (resolved) args.push('-R', resolved)
+  // codesign -R takes a FILE path unless the value starts with `=`, in which
+  // case the rest is a requirement-language string (codesign(1)). Without
+  // the `=` it fails with "No such file or directory" on every real sign.
+  if (resolved) args.push('-R', resolved.startsWith('=') ? resolved : `=${resolved}`)
   args.push(file)
   return args
 }
@@ -373,7 +376,9 @@ async function assertRuntimeAndJitEntitlements({ file, root, runCommand }) {
     throw new Error(`${file} is missing the hardened runtime flag`)
   }
   const entitlements = await runCommand('codesign', ['-d', '--entitlements', ':-', file])
-  const entitlementsText = `${entitlements?.stdout ?? ''}\n${entitlements?.stderr ?? ''}`
+  // Only the entitlements plist on stdout counts; stderr carries
+  // `Executable=<path>`, so a path containing "allow-jit" would false-match.
+  const entitlementsText = `${entitlements?.stdout ?? ''}`
   if (posixRelative(root, file) !== JIT_ENTITLEMENT_RELATIVE_PATH && entitlementsTextHasJit(entitlementsText)) {
     throw new Error(`${file} has JIT entitlements but is not ${JIT_ENTITLEMENT_RELATIVE_PATH}`)
   }
