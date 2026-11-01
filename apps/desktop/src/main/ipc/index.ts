@@ -1,6 +1,9 @@
 // IPC handler registry. M0/M1 starter handlers; capability modules will
 // register their own handlers here via the module loader (later M1 task).
 
+import fs from 'node:fs'
+import path from 'node:path'
+import { randomBytes } from 'node:crypto'
 import http from 'node:http'
 import https from 'node:https'
 import { execFile, type ChildProcess } from 'node:child_process'
@@ -10,6 +13,11 @@ import { daemonCliEndpoint, daemonConnection, getBackendEndpoint } from '../back
 import { findAllowedRoute, proxyError, proxyRequest, timeoutFor, withKnowledgeBinding } from '../backend-proxy'
 import type { KnowledgeController } from '../knowledge-settings'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
+import { backupFileStem, isSafeBackupPassword, isSafeMessage, isSafeName, isValidNpub } from '../comm-validate'
+import {
+  promptBackupPassword as openBackupPasswordWindow,
+  promptRestorePassword as openRestorePasswordWindow,
+} from '../backup-password-window'
 import { mt, setMainLocale, isMainLocale } from '../main-i18n'
 import { readOmlxSettingsKey } from '../omlx-settings-key'
 import type { IpcGuard } from './guard'
@@ -17,6 +25,7 @@ import { documentsCall } from '../documents'
 import { importFile } from '../documents-import'
 import { IpcChannels } from '../../shared/ipc-types'
 import type {
+  CommImportPickResult,
   KnowledgeSettingsResult,
   KnowledgeStatus,
   BackendEndpointResult,
@@ -222,6 +231,27 @@ function isBackendProxyRequest(req: unknown): req is BackendProxyRequest {
   )
 }
 
+/** The daemon's whole export budget is 30 s for Hyphae's run plus one in-daemon scrypt check; this stays well above it. */
+const EXPORT_TIMEOUT_MS = 90_000
+
+/**
+ * Restore: the one pending backup selection, an opaque ticket standing for a
+ * file the user picked. It is consumed when used. After a result that is not a
+ * success it is re-armed (same ticket, SAME expiry: the TTL is never extended)
+ * at most IMPORT_MAX_ATTEMPTS times in total, and only if the user has not
+ * picked a different file in the meantime (a newer pick replaces it, so an older
+ * flow can never put its own ticket back).
+ */
+interface PendingBackup { id: string; path: string; expires: number; attemptsLeft: number }
+let pendingBackup: PendingBackup | null = null
+const IMPORT_TICKET_TTL_MS = 5 * 60_000
+const IMPORT_MAX_ATTEMPTS = 3
+
+/** True if anything (file, dir, even a dangling symlink) is at `p`. */
+function pathExists(p: string): boolean {
+  try { fs.lstatSync(p); return true } catch { return false }
+}
+
 const SAFE_ID = /^[A-Za-z0-9_.:-]{1,128}$/
 
 /** Native yes/no for an elevated operation. The text is built here, in main,
@@ -316,7 +346,13 @@ export function registerIpcHandlers(options: {
   guard: IpcGuard
   /** The Knowledge settings, once main has built them. */
   knowledge?: () => KnowledgeController | null
+  /** Test seam: the main-owned backup-password window. */
+  promptBackupPassword?: (parent: BrowserWindow | null) => Promise<string | null>
+  /** Test seam: the main-owned restore-password window. */
+  promptRestorePassword?: typeof openRestorePasswordWindow
 }): void {
+  const promptBackupPassword = options.promptBackupPassword ?? openBackupPasswordWindow
+  const promptRestorePassword = options.promptRestorePassword ?? openRestorePasswordWindow
   const knowledge = options.knowledge ?? (() => null)
   omlxSettingsPath = options.omlxSettingsPath
   const handle: typeof ipcMain.handle = (channel, listener) => ipcMain.handle(channel, options.guard(listener))
@@ -513,6 +549,182 @@ export function registerIpcHandlers(options: {
       return proxyToBackend({ method: 'POST', path: '/api/v1/comm/install' }, 360_000)
     }),
   )
+
+  // Private-key backup. Not on the generic proxy: the destination is chosen
+  // here with a native save dialog (never by the page) and the daemon creates
+  // the file itself (0600, exclusive create, never overwriting). What is
+  // written is Hyphae's password-encrypted NIP-49 backup, so no plaintext key
+  // exists in this process or the renderer; the page only learns
+  // {nickname, npub, path}.
+  handle(IpcChannels.CommIdentityExport, (event, nickname: unknown): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      // The page asks only for "export this identity". The backup password is
+      // collected below by a window main owns, never by or through the page.
+      if (!isSafeName(nickname, 128)) return invalidRequest('invalid nickname')
+      // 1. The identity must exist before the user is asked anything.
+      const listed = await proxyToBackend({ method: 'GET', path: '/api/v1/comm/identity' })
+      const identities = (listed.data as { data?: unknown } | null)?.data
+      if (!listed.ok || !Array.isArray(identities) ||
+          !identities.some((i) => (i as { nickname?: unknown } | null)?.nickname === nickname)) {
+        return { ok: false, status: 404, data: { error: { code: 'identity_not_found', message: mt('err.identityNotFound') } } }
+      }
+      // 2. Risk confirmation.
+      const ok = await confirmNative(event, mt('comm.export', { name: clip(nickname, 80) }), mt('comm.exportDetail'))
+      if (!ok) return cancelled()
+      const win = BrowserWindow.fromWebContents(event.sender)
+      // 3. Backup password, in main's own isolated window.
+      let backupPassword: string | null = await promptBackupPassword(win)
+      if (backupPassword === null) return cancelled()
+      try {
+        if (!isSafeBackupPassword(backupPassword)) return invalidRequest('invalid backup password')
+        // 4. Where to save.
+        const options: Electron.SaveDialogOptions = {
+          title: mt('comm.exportSave'),
+          // Downloads, not Documents (which is often iCloud-synced).
+          defaultPath: path.join(app.getPath('downloads'), `${backupFileStem(nickname)}.ncryptsec`),
+          filters: [{ name: 'NIP-49 ncryptsec', extensions: ['ncryptsec'] }],
+        }
+        let picked: Electron.SaveDialogReturnValue
+        try {
+          picked = win ? await dialog.showSaveDialog(win, options) : await dialog.showSaveDialog(options)
+        } catch {
+          return { ok: false, status: 500, data: { error: { code: 'dialog_failed', message: 'the file dialog could not open' } } }
+        }
+        if (picked.canceled || !picked.filePath) return cancelled()
+        // The daemon never overwrites (O_EXCL) and says so; checking here too
+        // gives the user the reason before any key material is touched.
+        if (pathExists(picked.filePath)) {
+          return { ok: false, status: 409, data: { error: { code: 'target_exists', message: mt('err.targetExists') } } }
+        }
+        // 5. The daemon.
+        return await proxyToBackend({
+          method: 'POST', path: '/api/v1/comm/identity/export',
+          body: { nickname, path: picked.filePath, backup_password: backupPassword },
+        }, EXPORT_TIMEOUT_MS)
+      } finally {
+        // Best effort (JS strings are immutable): drop main's only reference.
+        backupPassword = null
+      }
+    }),
+  )
+
+  // Restore from an encrypted backup. Step 1 (native open dialog) hands the page
+  // only a file NAME and a single-use ticket; the path and the contents never
+  // leave main. Step 2 takes the ticket, the nickname the page collected and
+  // whether it should become the default; main then asks for the backup
+  // password in its own window (with an in-window "decrypting…" state and
+  // retry on a wrong password) and calls the daemon.
+  handle(IpcChannels.CommImportPick, async (event): Promise<CommImportPickResult> => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    const options: Electron.OpenDialogOptions = {
+      title: mt('comm.restoreOpen'),
+      properties: ['openFile'],
+      filters: [{ name: 'NIP-49 ncryptsec', extensions: ['ncryptsec', 'txt'] }],
+    }
+    let picked: Electron.OpenDialogReturnValue
+    try {
+      picked = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+    } catch {
+      return { ok: false, cancelled: true }
+    }
+    const file = picked.filePaths[0]
+    if (picked.canceled || !file) return { ok: false, cancelled: true }
+    const ticket = randomBytes(16).toString('hex')
+    // Replaces any older selection, which thereby stops working.
+    pendingBackup = { id: ticket, path: file, expires: Date.now() + IMPORT_TICKET_TTL_MS, attemptsLeft: IMPORT_MAX_ATTEMPTS }
+    return { ok: true, ticket, fileName: path.basename(file) }
+  })
+  handle(IpcChannels.CommIdentityImport, (event, ticket: unknown, nickname: unknown, makeDefault: unknown): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      if (typeof ticket !== 'string' || !isSafeName(nickname) || typeof makeDefault !== 'boolean') {
+        return invalidRequest('invalid restore request')
+      }
+      const entry = pendingBackup
+      if (!entry || entry.id !== ticket || entry.expires < Date.now()) {
+        return { ok: false, status: 410, data: { error: { code: 'ticket_expired', message: mt('err.noBackupTicket') } } }
+      }
+      pendingBackup = null // consumed: re-armed below only on a non-success
+      const win = BrowserWindow.fromWebContents(event.sender)
+      // This flow itself uses one attempt; every further try inside the open
+      // window uses another, so the window cannot be used to bypass the limit
+      // or the expiry.
+      let budget = entry.attemptsLeft - 1
+      let submits = 0
+      // Main decides whether to warn that the restored identity becomes the
+      // default (the page's flag is not trusted for that): it does when the
+      // request asks for it OR the keystore has no default identity.
+      const listed = await proxyToBackend({ method: 'GET', path: '/api/v1/comm/identity' })
+      const known = (listed.data as { data?: unknown } | null)?.data
+      const hasDefault = listed.ok && Array.isArray(known) &&
+        known.some((i) => (i as { default?: unknown } | null)?.default === true)
+      // If the list could not be read, do not guess "no": say it MAY become the default.
+      const willBeDefault = makeDefault || (listed.ok && !hasDefault)
+      const mayBeDefault = !willBeDefault && !listed.ok
+      const result = await promptRestorePassword<BackendProxyResponse>(win, async (backupPassword) => {
+        submits += 1
+        if (entry.expires < Date.now()) {
+          return { done: true, value: { ok: false, status: 410, data: { error: { code: 'ticket_expired', message: mt('err.noBackupTicket') } } } }
+        }
+        if (submits > 1) {
+          if (budget <= 0) {
+            return { done: true, value: { ok: false, status: 429, data: { error: { code: 'too_many_attempts', message: mt('err.restoreAttempts') } } } }
+          }
+          budget -= 1
+        }
+        const response = await proxyToBackend({
+          method: 'POST', path: '/api/v1/comm/identity/import',
+          body: { nickname, path: entry.path, backup_password: backupPassword, default: makeDefault },
+        }, EXPORT_TIMEOUT_MS)
+        // A wrong password, or input the daemon found unusable (`invalid`), is
+        // handled inside the window so the user can fix it; everything else ends it.
+        const body = response.data as { error?: unknown; message?: unknown } | null
+        if (body?.error === 'bad_backup_password') return { done: false, error: mt('backupPw.badPassword') }
+        if (body?.error === 'invalid') {
+          return { done: false, error: typeof body.message === 'string' ? clip(body.message, 200) : mt('backupPw.restoreInvalid') }
+        }
+        return { done: true, value: response }
+      }, { willBeDefault, mayBeDefault })
+      // Not finished (cancelled, or the daemon said no): keep the selection so
+      // the user can fix the nickname or try again without re-choosing the file,
+      // but only a few times, never past the original expiry, and never over a
+      // newer pick.
+      const finished = result !== null && result.ok
+      if (!finished && pendingBackup === null && budget > 0 && entry.expires > Date.now()) {
+        pendingBackup = { ...entry, attemptsLeft: budget }
+      }
+      return result ?? cancelled()
+    }),
+  )
+
+  // Elevated comm writes that no longer ride the generic proxy. Everything the
+  // page supplies is validated here (checksum-valid npub, names without
+  // control characters, bounded content) and the daemon route is fixed.
+  // NOTE: no presence proof is attached. The daemon's resolve_target has no
+  // CommWrite support yet (CORE-2d / CORE-7c), and the host credential is not
+  // subject to the presence check. Contact add is therefore confirmed natively;
+  // SEND is NOT (accepted residual risk until CORE-7c/2d), so a compromised page
+  // can still send a validated message to a valid recipient.
+  // Adding a contact is confirmed in a native dialog that shows the nickname and
+  // the FULL address, so a compromised page cannot silently plant a contact.
+  handle(IpcChannels.CommContactAdd, (event, nickname: unknown, npub: unknown, role: unknown): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      if (!isSafeName(nickname)) return invalidRequest('invalid nickname')
+      if (!isValidNpub(npub)) return invalidRequest('invalid npub')
+      if (role !== undefined && role !== '' && !isSafeName(role)) return invalidRequest('invalid role')
+      const ok = await confirmNative(event, mt('comm.contactAdd', { name: clip(nickname, 64), npub }), mt('comm.contactAddDetail'))
+      if (!ok) return cancelled()
+      return proxyToBackend({
+        method: 'POST', path: '/api/v1/comm/contact',
+        body: { nickname, npub, ...(typeof role === 'string' && role ? { role } : {}) },
+      })
+    }),
+  )
+  handle(IpcChannels.CommSend, (_event, to: unknown, content: unknown): Promise<BackendProxyResponse> => {
+    if (!(typeof to === 'string' && to.startsWith('npub1') ? isValidNpub(to) : isSafeName(to))) return Promise.resolve(invalidRequest('invalid recipient'))
+    if (!isSafeMessage(content)) return Promise.resolve(invalidRequest('invalid message'))
+    // The daemon allows 5 s per relay + 10 s (8 relays max).
+    return proxyToBackend({ method: 'POST', path: '/api/v1/comm/send', body: { to, content, encrypt: true } }, 90_000)
+  })
 
   // A1: POST /api/v1/approvals/{id} — an elevated operation, so it is not on
   // the generic proxy. The native dialog shows the daemon's OWN record of the

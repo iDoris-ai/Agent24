@@ -24,6 +24,7 @@
 pub mod binary;
 pub mod daemon;
 pub mod error;
+mod export;
 mod groupchat;
 pub mod import;
 pub mod keystore_lock;

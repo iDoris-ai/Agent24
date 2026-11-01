@@ -21,6 +21,17 @@ export const IpcChannels = {
   ApprovalDecide: 'approval:decide',
   OsModuleSetEnabled: 'os-module:set-enabled',
   CommInstall: 'comm:install',
+  // Private-key backup: native confirm + native save dialog in main; the
+  // backend writes the file itself, so the key never crosses IPC.
+  CommIdentityExport: 'comm:identity-export',
+  // Elevated comm writes that used to ride the generic proxy. Strictly
+  // validated in main; presence binding is pending CORE-7c/CORE-2d.
+  CommContactAdd: 'comm:contact-add',
+  CommSend: 'comm:send',
+  // Restore from an encrypted backup: main picks the file (native open dialog)
+  // and collects the password (its own window); the page only names the identity.
+  CommImportPick: 'comm:import-pick',
+  CommIdentityImport: 'comm:identity-import',
   // A-3: disable/enable or unpair AgentEar (PATCH / DELETE
   // /api/v1/attached/agentear). The module name is fixed in main; the
   // renderer cannot name another one. Same native-confirm rule as above.
@@ -105,6 +116,13 @@ export interface BackendProxyRequest {
   /** One constrained header; authentication headers remain main-process owned. */
   idempotencyKey?: string
 }
+
+/** Result of the native "choose a backup file" step. The page learns only the
+ *  file NAME (to suggest a nickname) and an opaque single-use ticket; the path
+ *  and the file's contents stay in the main process. */
+export type CommImportPickResult =
+  | { ok: true; ticket: string; fileName: string }
+  | { ok: false; cancelled: true }
 
 export interface BackendProxyResponse {
   ok: boolean

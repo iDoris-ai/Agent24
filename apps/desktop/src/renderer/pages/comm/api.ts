@@ -312,3 +312,138 @@ export async function importCommIdentity(from: string, password: string) {
     throw error
   }
 }
+
+/** Elevated writes go through dedicated, validated IPC in main, never the generic proxy. */
+async function viaIpc<T>(call: () => Promise<unknown>, validate: (value: unknown) => value is T): Promise<T> {
+  let response: unknown
+  try {
+    response = await call()
+  } catch {
+    throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)
+  }
+  return decodeEnvelope(response, validate)
+}
+
+export const addCommContact = (nickname: string, npub: string, role: string) =>
+  viaIpc(() => window.agent24.commContactAdd(nickname, npub, role),
+    (value): value is RecordValue => isRecord(value) || value === null)
+
+export interface CommSendResult {
+  published_to: number
+}
+
+export const sendCommMessage = (to: string, content: string): Promise<CommSendResult> =>
+  viaIpc(() => window.agent24.commSend(to, content), (value): value is RecordValue => isRecord(value))
+    .then((data) => ({ published_to: typeof data['published_to'] === 'number' ? data['published_to'] : 0 }))
+
+export interface CommHistoryItem {
+  id: string
+  from: string
+  content: string
+  at: string
+}
+
+function historyTime(raw: unknown): string {
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    return new Date(raw < 1e12 ? raw * 1000 : raw).toLocaleString()
+  }
+  return typeof raw === 'string' ? raw : ''
+}
+
+/** Hyphae's history rows are passed through; keep only what the compact list shows. */
+function toHistoryItems(value: unknown[]): CommHistoryItem[] {
+  const items: CommHistoryItem[] = []
+  for (const row of value) {
+    if (!isRecord(row)) continue
+    const content = [row['content'], row['plaintext']].find(string)
+    if (content === undefined) continue
+    const from = [row['from'], row['sender'], row['sender_npub']].find(string) ?? ''
+    const id = row['id']
+    items.push({
+      id: typeof id === 'string' || typeof id === 'number' ? String(id) : `${items.length}`,
+      from,
+      content,
+      at: historyTime(row['created_at'] ?? row['received_at'] ?? row['time'] ?? row['ts']),
+    })
+  }
+  return items
+}
+
+export const listCommHistory = (limit = 20): Promise<CommHistoryItem[]> =>
+  request('GET', `/api/v1/comm/history?limit=${limit}`, (value): value is unknown[] => Array.isArray(value)).then(toHistoryItems)
+
+/** Things that could not be confirmed AFTER the backup was safely published. */
+export interface CommExportWarning {
+  code: 'cleanup_failed' | 'durability_unconfirmed'
+  path?: string
+}
+
+export interface CommExportResult {
+  nickname: string
+  npub: string
+  path: string
+  warnings: CommExportWarning[]
+}
+
+function exportWarnings(value: unknown): CommExportWarning[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((w): CommExportWarning[] => {
+    if (!isRecord(w)) return []
+    if (w['code'] === 'cleanup_failed') return [{ code: 'cleanup_failed', ...(string(w['path']) ? { path: w['path'] } : {}) }]
+    if (w['code'] === 'durability_unconfirmed') return [{ code: 'durability_unconfirmed' }]
+    return []
+  })
+}
+
+/**
+ * Password-encrypted private-key backup (NIP-49). The page sends ONLY the
+ * nickname: the main process confirms, collects the backup password in its own
+ * isolated window, lets the user pick the file and has the daemon create it
+ * (0600, never overwriting). Only {nickname,npub,path} comes back. A cancelled
+ * step rejects with code `cancelled`; an existing file with `target_exists`.
+ */
+export const exportCommIdentity = (nickname: string): Promise<CommExportResult> =>
+  viaIpc(() => window.agent24.commIdentityExport(nickname), (value): value is RecordValue =>
+    isRecord(value) && string(value['nickname']) && string(value['npub']) && string(value['path']))
+    .then((data) => ({
+      nickname: data['nickname'] as string,
+      npub: data['npub'] as string,
+      path: data['path'] as string,
+      warnings: exportWarnings(data['warnings']),
+    }))
+
+export type CommPickResult = { ticket: string; fileName: string } | null
+
+/** Native "choose a backup" dialog (in main). Only the file NAME and an opaque ticket come back. */
+export async function pickCommBackup(): Promise<CommPickResult> {
+  let result: unknown
+  try {
+    result = await window.agent24.commImportPick()
+  } catch {
+    throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)
+  }
+  if (isRecord(result) && result['ok'] === true && string(result['ticket']) && string(result['fileName'])) {
+    return { ticket: result['ticket'], fileName: result['fileName'] }
+  }
+  return null
+}
+
+export interface CommRestoreResult {
+  status: 'imported' | 'already_present'
+  nickname: string | null
+  npub: string | null
+}
+
+/**
+ * Restore the picked backup. Main collects the backup password in its own
+ * window; this page never sees it (or the file). A cancelled window rejects
+ * with code `cancelled`.
+ */
+export const restoreCommIdentity = (ticket: string, nickname: string, makeDefault: boolean): Promise<CommRestoreResult> =>
+  viaIpc(() => window.agent24.commIdentityImport(ticket, nickname, makeDefault),
+    (value): value is RecordValue => isRecord(value) && (value['status'] === 'imported' || value['status'] === 'already_present'))
+    .then((data) => ({
+      status: data['status'] as CommRestoreResult['status'],
+      nickname: typeof data['nickname'] === 'string' ? data['nickname'] : null,
+      npub: typeof data['npub'] === 'string' ? data['npub'] : null,
+    }))

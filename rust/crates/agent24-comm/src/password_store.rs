@@ -83,7 +83,7 @@ impl Account {
     }
 
     /// The literal string used as the keyring/in-memory-map account key.
-    fn as_key(&self) -> &str {
+    pub(crate) fn as_key(&self) -> &str {
         match self {
             Account::Pending(s) | Account::Salt(s) => s,
         }

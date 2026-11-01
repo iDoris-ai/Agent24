@@ -19,6 +19,7 @@ use rustix::process::{Pid, Signal, kill_process_group};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use zeroize::Zeroizing;
 
 use crate::binary::VerifiedBinary;
 use crate::keystore_lock::KeystoreWriteLock;
@@ -119,6 +120,13 @@ pub enum RunnerError {
     OutputTooLarge,
     #[error("io error: {0}")]
     Io(#[source] io::Error),
+    /// The child was sent SIGKILL but was not confirmed gone within the wait
+    /// window. A background reaper keeps waiting (and killing); the receiver
+    /// turns `true` when the child is finally reaped. Callers that hold a lock
+    /// protecting what the child may still be writing must keep it until then
+    /// ([`hold_until_reaped`]) and must not start a conflicting operation.
+    #[error("hyphae is still terminating")]
+    StillTerminating(tokio::sync::watch::Receiver<bool>),
 }
 
 /// Pure function: parses Hyphae's envelope out of `(exit code, stdout,
@@ -218,7 +226,117 @@ where
         .collect()
 }
 
-fn kill_process_group_best_effort(pid: u32) {
+/// Serialises `spawn()` calls made by this crate. It exists because
+/// `std::process::Command` creates its stdin/stdout pipes with
+/// `pipe` + `fcntl` on macOS, so a child forked on another thread in that gap
+/// inherits a sibling's pipe end and keeps it open (a hung `cat` waiting for
+/// EOF that never comes).
+static SPAWN_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn lock_spawn_gate() -> std::sync::MutexGuard<'static, ()> {
+    SPAWN_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Reads `r` to EOF into a zero-on-drop buffer holding at most `cap` bytes;
+/// more than that is [`RunnerError::OutputTooLarge`] (the stream is not drained
+/// further: the caller kills the child).
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    r: &mut R,
+    cap: usize,
+    exact: bool,
+) -> Result<Zeroizing<Vec<u8>>, RunnerError> {
+    use tokio::io::AsyncReadExt;
+    let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(if exact {
+        cap
+    } else {
+        cap.min(16 * 1024)
+    }));
+    let mut chunk: Zeroizing<[u8; 4096]> = Zeroizing::new([0u8; 4096]);
+    loop {
+        let n = r.read(&mut chunk[..]).await.map_err(RunnerError::Spawn)?;
+        if n == 0 {
+            return Ok(buf);
+        }
+        if buf.len() + n > cap {
+            return Err(RunnerError::OutputTooLarge);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// SIGKILL the child's process group, then wait for the child (bounded).
+/// `true` only if the child was confirmed reaped within `window`.
+async fn kill_and_reap(
+    child: &mut tokio::process::Child,
+    pid: Option<u32>,
+    window: Duration,
+) -> bool {
+    if let Some(pid) = pid {
+        kill_process_group_best_effort(pid);
+    }
+    // A zero window means "do not wait for confirmation" (used by tests to force
+    // the unconfirmed path deterministically).
+    if window.is_zero() {
+        return false;
+    }
+    matches!(tokio::time::timeout(window, child.wait()).await, Ok(Ok(_)))
+}
+
+/// The child could not be confirmed reaped in time: hand it to a background
+/// task that keeps killing and waiting until it is really gone, and give the
+/// caller the receiver that says when.
+fn reap_in_background(
+    mut child: tokio::process::Child,
+    pid: Option<u32>,
+) -> tokio::sync::watch::Receiver<bool> {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        loop {
+            if let Some(pid) = pid {
+                kill_process_group_best_effort(pid);
+            }
+            if tokio::time::timeout(Duration::from_secs(1), child.wait())
+                .await
+                .is_ok()
+            {
+                break;
+            }
+        }
+        let _ = tx.send(true);
+    });
+    rx
+}
+
+/// Keep `guard` (a lock over state the unreaped child may still be writing)
+/// until the child is gone; only then release it. No conflicting operation can
+/// start in between.
+pub(crate) fn hold_until_reaped<G: Send + 'static>(
+    guard: G,
+    reaped: tokio::sync::watch::Receiver<bool>,
+) {
+    hold_until_reaped_then(guard, reaped, async {});
+}
+
+/// [`hold_until_reaped`], and once the child is gone but BEFORE the lock is
+/// released, run `then` (e.g. reconcile state the dead child left behind).
+pub(crate) fn hold_until_reaped_then<G, F>(
+    guard: G,
+    mut reaped: tokio::sync::watch::Receiver<bool>,
+    then: F,
+) where
+    G: Send + 'static,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let _guard = guard;
+        let _ = reaped.wait_for(|done| *done).await;
+        then.await;
+    });
+}
+
+pub(crate) fn kill_process_group_best_effort(pid: u32) {
     let Ok(raw) = i32::try_from(pid) else {
         return;
     };
@@ -281,6 +399,9 @@ pub struct HyphaeRunner {
     home: PathBuf,
     default_timeout: Duration,
     keystore_lock: KeystoreWriteLock,
+    /// How long to wait for a SIGKILLed child before handing it to the
+    /// background reaper (tests shrink it to exercise that path).
+    reap_window: Duration,
 }
 
 impl HyphaeRunner {
@@ -290,6 +411,7 @@ impl HyphaeRunner {
             home,
             default_timeout,
             keystore_lock: KeystoreWriteLock::default(),
+            reap_window: Duration::from_secs(2),
         }
     }
 
@@ -319,6 +441,7 @@ impl HyphaeRunner {
             home,
             default_timeout: self.default_timeout,
             keystore_lock: KeystoreWriteLock::default(),
+            reap_window: Duration::from_secs(2),
         }
     }
 
@@ -379,6 +502,12 @@ impl HyphaeRunner {
     /// (e.g. a sentinel variable that must not leak) instead of the real
     /// process environment, without touching `std::env::set_var`.
     #[cfg(test)]
+    pub(crate) fn with_reap_window(mut self, window: Duration) -> Self {
+        self.reap_window = window;
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn command_with_parent_env(
         &self,
         inv: &Invocation,
@@ -394,6 +523,23 @@ impl HyphaeRunner {
     /// already have taken effect (COMM-HYPHAE.md §3), so callers must not
     /// treat a timeout as "nothing happened".
     pub async fn run(&self, inv: Invocation) -> Result<Envelope, RunnerError> {
+        self.run_capped(inv, OUTPUT_CAP, false).await
+    }
+
+    /// [`Self::run`] with an explicit per-stream output cap. With
+    /// `exact_buffers` each stream's buffer is allocated at `cap` up front and
+    /// can therefore never reallocate (a realloc would leave an unzeroed copy of
+    /// what it held); both buffers are zeroized when dropped.
+    ///
+    /// On timeout (or an over-long output) the whole process group is killed
+    /// and then WAITED for, bounded, so that when this returns the child is
+    /// gone and reaped and the caller may safely clean up after it.
+    pub(crate) async fn run_capped(
+        &self,
+        inv: Invocation,
+        cap: usize,
+        exact_buffers: bool,
+    ) -> Result<Envelope, RunnerError> {
         let timeout = inv.timeout.unwrap_or(self.default_timeout);
         let subcommand = inv
             .args
@@ -402,48 +548,109 @@ impl HyphaeRunner {
             .unwrap_or_default();
 
         let mut cmd = self.command(&inv);
-        let mut child = cmd.spawn().map_err(RunnerError::Spawn)?;
+        let mut child = {
+            let _gate = lock_spawn_gate();
+            cmd.spawn().map_err(RunnerError::Spawn)?
+        };
         let pid = child.id();
         #[cfg(test)]
         timeout_test_hook::pause_before_timeout(self.bin.path()).await;
         let password = inv.password;
+        let mut stdin = child.stdin.take();
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| RunnerError::Spawn(io::Error::other("hyphae stdout unavailable")))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| RunnerError::Spawn(io::Error::other("hyphae stderr unavailable")))?;
 
-        let wait = async move {
-            if let Some(password) = password {
-                let mut stdin = child.stdin.take().ok_or_else(|| {
-                    RunnerError::Spawn(io::Error::other("hyphae stdin unavailable"))
-                })?;
-                stdin
-                    .write_all(password.as_bytes())
-                    .await
-                    .map_err(RunnerError::Spawn)?;
-                stdin.shutdown().await.map_err(RunnerError::Spawn)?;
-                drop(stdin);
-            }
-            child.wait_with_output().await.map_err(RunnerError::Spawn)
+        let io_and_wait = async {
+            let write = async {
+                if let Some(password) = password {
+                    let mut stdin = stdin.take().ok_or_else(|| {
+                        RunnerError::Spawn(io::Error::other("hyphae stdin unavailable"))
+                    })?;
+                    stdin
+                        .write_all(password.as_bytes())
+                        .await
+                        .map_err(RunnerError::Spawn)?;
+                    stdin.shutdown().await.map_err(RunnerError::Spawn)?;
+                    drop(stdin);
+                }
+                Ok::<(), RunnerError>(())
+            };
+            let ((), out, err) = tokio::try_join!(
+                write,
+                read_capped(&mut stdout, cap, exact_buffers),
+                read_capped(&mut stderr, cap, exact_buffers),
+            )?;
+            let status = child.wait().await.map_err(RunnerError::Spawn)?;
+            Ok::<_, RunnerError>((status, out, err))
         };
 
-        let output = match tokio::time::timeout(timeout, wait).await {
-            Ok(result) => result?,
+        let (status, out, err) = match tokio::time::timeout(timeout, io_and_wait).await {
+            Ok(Ok(done)) => done,
+            Ok(Err(e)) => {
+                if matches!(e, RunnerError::OutputTooLarge)
+                    && !kill_and_reap(&mut child, pid, self.reap_window).await
+                {
+                    return Err(RunnerError::StillTerminating(reap_in_background(
+                        child, pid,
+                    )));
+                }
+                return Err(e);
+            }
             Err(_elapsed) => {
-                if let Some(pid) = pid {
-                    kill_process_group_best_effort(pid);
+                if !kill_and_reap(&mut child, pid, self.reap_window).await {
+                    return Err(RunnerError::StillTerminating(reap_in_background(
+                        child, pid,
+                    )));
                 }
                 return Err(RunnerError::Timeout(timeout));
             }
         };
 
-        if output.stdout.len() > OUTPUT_CAP || output.stderr.len() > OUTPUT_CAP {
-            return Err(RunnerError::OutputTooLarge);
-        }
-
-        let Some(code) = output.status.code() else {
+        let Some(code) = status.code() else {
             return Err(RunnerError::Signaled);
         };
 
         tracing::debug!(subcommand = %subcommand, exit = code, "hyphae run finished");
 
-        parse_envelope(code, &output.stdout, &output.stderr)
+        parse_envelope(code, &out, &err)
+    }
+
+    /// `hyphae <args…>` (expected to be a `--help`) as plain text, bounded and
+    /// time-limited: used to ask the installed binary whether it has a flag
+    /// (capability probe) instead of trusting a version string. Never logs or
+    /// forwards the text.
+    pub(crate) async fn help_text(&self, args: &[&str]) -> Result<String, RunnerError> {
+        let mut cmd = tokio::process::Command::new(self.bin.path());
+        cmd.args(args)
+            .env_clear()
+            .env("HOME", &self.home)
+            .current_dir(&self.home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(10), async {
+            let child = {
+                let _gate = lock_spawn_gate();
+                cmd.spawn().map_err(RunnerError::Spawn)?
+            };
+            child.wait_with_output().await.map_err(RunnerError::Spawn)
+        })
+        .await
+        .map_err(|_| RunnerError::Timeout(Duration::from_secs(10)))??;
+        if output.stdout.len() > OUTPUT_CAP || output.stderr.len() > OUTPUT_CAP {
+            return Err(RunnerError::OutputTooLarge);
+        }
+        // urfave prints help to stdout, "No help topic" style errors to stderr.
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        Ok(text)
     }
 
     /// Like [`Self::run`], but holds [`Self::keystore_lock`] for the entire
@@ -455,8 +662,12 @@ impl HyphaeRunner {
     /// `identity use`, `contact add`, and every step of `import`
     /// (COMM-HYPHAE.md §3).
     pub async fn run_keystore_write(&self, inv: Invocation) -> Result<Envelope, RunnerError> {
-        let _guard = self.keystore_lock.acquire().await;
-        self.run(inv).await
+        let guard = self.keystore_lock.acquire().await;
+        let result = self.run(inv).await;
+        if let Err(RunnerError::StillTerminating(reaped)) = &result {
+            hold_until_reaped(guard, reaped.clone());
+        }
+        result
     }
 }
 
@@ -696,6 +907,155 @@ printf '' > "$HOME/fixture-emitted"
         let argv = data.get("argv").and_then(Value::as_str).unwrap();
         assert!(argv.contains("--password-stdin"));
         assert!(!argv.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn a_child_not_reaped_in_time_goes_to_a_background_reaper_that_keeps_the_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        let pidfile = tmp.path().join("pid");
+        let script = format!("#!/bin/sh\necho $$ > \"{}\"\nsleep 30\n", pidfile.display());
+        let bin = install_fixture(tmp.path(), "slow.sh", &script, &tmp.path().join("bin")).await;
+        // a zero wait window: the kill is sent but "confirmed reaped" cannot be
+        // established in time, which is exactly the situation to handle
+        let runner =
+            HyphaeRunner::new(bin, home, Duration::from_secs(5)).with_reap_window(Duration::ZERO);
+        let lock = runner.keystore_lock().clone();
+        let inv = Invocation {
+            args: vec![],
+            password: None,
+            timeout: Some(Duration::from_secs(3)),
+        };
+        let result = {
+            let guard = lock.acquire().await;
+            let result = runner.run(inv).await;
+            if let Err(RunnerError::StillTerminating(rx)) = &result {
+                hold_until_reaped(guard, rx.clone());
+            }
+            result
+        };
+        let Err(RunnerError::StillTerminating(mut reaped)) = result else {
+            // the kill was confirmed within a zero window (possible on a fast
+            // machine): nothing to hold, which is also correct
+            return;
+        };
+        // no new keystore write can start while the child is unreaped...
+        // (the background task releases the lock only after `reaped` turns true)
+        tokio::time::timeout(Duration::from_secs(10), reaped.wait_for(|done| *done))
+            .await
+            .expect("the background reaper must finish")
+            .unwrap();
+        // ...and once it is reaped the lock is free again
+        let again = tokio::time::timeout(Duration::from_secs(5), lock.acquire()).await;
+        assert!(
+            again.is_ok(),
+            "the lock must be released after the child is reaped"
+        );
+        if let Ok(pid) = std::fs::read_to_string(&pidfile) {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .status()
+                .unwrap()
+                .success();
+            assert!(!alive, "reaped means gone");
+        }
+    }
+
+    #[tokio::test]
+    async fn hold_until_reaped_keeps_a_lock_until_the_signal() {
+        let lock = KeystoreWriteLock::default();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        hold_until_reaped(lock.acquire().await, rx);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // still held: acquiring must not complete
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), lock.acquire())
+                .await
+                .is_err()
+        );
+        tx.send(true).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), lock.acquire())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_and_reap_leaves_no_zombie_behind() {
+        let mut child = tokio::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let started = std::time::Instant::now();
+        assert!(kill_and_reap(&mut child, pid, Duration::from_secs(5)).await);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // reaped: its exit status was already collected, so there is nothing left to wait for
+        assert!(child.try_wait().unwrap().is_some());
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.unwrap().to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(
+            !alive,
+            "`kill -0` succeeds on a zombie, so this proves it was reaped"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_a_timeout_run_returns_only_once_the_child_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        let pidfile = tmp.path().join("pid");
+        let script = format!("#!/bin/sh\necho $$ > \"{}\"\nsleep 30\n", pidfile.display());
+        let bin = install_fixture(tmp.path(), "slow.sh", &script, &tmp.path().join("bin")).await;
+        let runner = HyphaeRunner::new(bin, home, Duration::from_secs(5));
+        let inv = Invocation {
+            args: vec![],
+            password: None,
+            timeout: Some(Duration::from_secs(3)),
+        };
+        let err = runner.run(inv).await.unwrap_err();
+        assert!(matches!(err, RunnerError::Timeout(_)));
+        // (the shell may not even have started on a very loaded machine; then there is nothing to check)
+        if let Ok(pid) = std::fs::read_to_string(&pidfile) {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .status()
+                .unwrap()
+                .success();
+            assert!(
+                !alive,
+                "the timed-out child must be reaped before run() returns"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn capped_output_never_reallocates_and_too_much_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        let script = "#!/bin/sh\nhead -c 100000 /dev/zero | tr '\\0' 'a'\nsleep 60\n";
+        let bin = install_fixture(tmp.path(), "big.sh", script, &tmp.path().join("bin")).await;
+        let runner = HyphaeRunner::new(bin, home, Duration::from_secs(120));
+        let inv = Invocation {
+            args: vec![],
+            password: None,
+            timeout: None,
+        };
+        let started = std::time::Instant::now();
+        let err = runner.run_capped(inv, 8 * 1024, true).await.unwrap_err();
+        assert!(matches!(err, RunnerError::OutputTooLarge), "{err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(40),
+            "the child is killed, not waited out"
+        );
     }
 
     #[tokio::test]

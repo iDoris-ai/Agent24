@@ -15,7 +15,7 @@ function setup({ installed = true, identities = [identity], configured = true, c
     let data: unknown = {}
     if (method === 'GET') {
       if (path.endsWith('/daemon')) data = {
-        installable: true, installed_version: installed ? 'v0.27.2' : null,
+        installable: true, installed_version: installed ? 'v0.28.1' : null,
         process: { state: 'stopped', generation: 0, consecutive_failures: 0, reason: null },
         relay_probe: null, catch_up: { state: 'unknown', last_incomplete_at_ms: null },
       }

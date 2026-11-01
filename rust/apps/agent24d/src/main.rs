@@ -170,7 +170,26 @@ enum Command {
     },
 }
 
+/// No core dump from this process or anything it spawns (the limit is
+/// inherited): the daemon holds the keystore password, the backup password and
+/// restore secrets in memory, and a core file would put them on disk. On Linux
+/// the process is also made non-dumpable (which blocks ptrace by a same-user
+/// process). Best effort: failure is not fatal.
+fn harden_process() {
+    use rustix::process::{Resource, Rlimit, setrlimit};
+    let _ = setrlimit(
+        Resource::Core,
+        Rlimit {
+            current: Some(0),
+            maximum: Some(0),
+        },
+    );
+    #[cfg(target_os = "linux")]
+    let _ = rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable);
+}
+
 fn main() -> std::process::ExitCode {
+    harden_process();
     // Before anything else — logging, the runtime — can start a thread: when
     // this process is a module's trampoline it becomes the module here, and
     // flagging its fds close-on-exec is race-free only while it has one thread.
@@ -284,7 +303,7 @@ fn start_failed_line(ready_sent: bool, code: &str, error: &str) -> Option<String
 mod start_failed_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::start_failed_line;
+    use super::{harden_process, start_failed_line};
 
     #[test]
     fn nothing_follows_the_ready_line() {
@@ -295,5 +314,23 @@ mod start_failed_tests {
             line,
             serde_json::json!({ "type": "failed", "code": "already_running", "error": "held" })
         );
+    }
+
+    #[test]
+    fn hardening_forbids_core_dumps_for_this_process_and_its_children() {
+        harden_process();
+        let limit = rustix::process::getrlimit(rustix::process::Resource::Core);
+        assert_eq!(limit.current, Some(0));
+        assert_eq!(
+            limit.maximum,
+            Some(0),
+            "the hard limit too, so nothing can raise it"
+        );
+        // children inherit it
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", "ulimit -c"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0");
     }
 }

@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { setLocale } from '../../i18n'
 import CommunicationPage from './Communication'
 import {
   getCommStatus, listCommContacts, listCommIdentities, listCommRelays,
   startCommDaemon, stopCommDaemon, unlockComm, installComm,
+  addCommContact, sendCommMessage, listCommHistory, exportCommIdentity, pickCommBackup, restoreCommIdentity,
   CommApiError, type CommDaemonStatus,
 } from './api'
 
@@ -13,6 +14,7 @@ vi.mock('./api', async (importActual) => ({
   CommApiError: (await importActual<typeof import('./api')>()).CommApiError,
   getCommStatus: vi.fn(), listCommContacts: vi.fn(), listCommIdentities: vi.fn(), listCommRelays: vi.fn(),
   startCommDaemon: vi.fn(), stopCommDaemon: vi.fn(), unlockComm: vi.fn(), installComm: vi.fn(),
+  addCommContact: vi.fn(), sendCommMessage: vi.fn(), listCommHistory: vi.fn(), exportCommIdentity: vi.fn(), pickCommBackup: vi.fn(), restoreCommIdentity: vi.fn(),
 }))
 
 const identity = { nickname: 'alice', npub: 'npub1alice', default: true, encrypted: true }
@@ -32,7 +34,9 @@ function success() {
   vi.mocked(startCommDaemon).mockResolvedValue(status)
   vi.mocked(stopCommDaemon).mockResolvedValue({ ...status, process: { ...status.process, state: 'stopped' } })
   vi.mocked(unlockComm).mockResolvedValue({ unlocked: true, remembered: false })
+  vi.mocked(listCommHistory).mockResolvedValue([])
 }
+const lockedStatus: CommDaemonStatus = { ...status, process: { ...status.process, state: 'locked', reason: 'password_rejected' } }
 
 afterEach(() => { cleanup(); vi.clearAllMocks() })
 
@@ -47,7 +51,7 @@ describe('CommunicationPage', () => {
     render(<CommunicationPage />)
     vi.mocked(installComm).mockImplementation(async () => {
       success()
-      return { installed_version: 'v0.27.2', path: '/state/components/hyphae/v0.27.2/hyphae', restart_required: false, reason: null }
+      return { installed_version: 'v0.28.1', path: '/state/components/hyphae/v0.28.1/hyphae', restart_required: false, reason: null }
     })
     fireEvent.click(await screen.findByRole('button', { name: '下载并设置' }))
     expect(await screen.findByText('npub1alice')).toBeInTheDocument()
@@ -186,8 +190,9 @@ describe('CommunicationPage', () => {
 
   it('clears unlock password on success and failure and defaults remember to false', async () => {
     success()
+    vi.mocked(getCommStatus).mockResolvedValue(lockedStatus)
     render(<CommunicationPage />)
-    const input = screen.getByLabelText('Keystore 口令') as HTMLInputElement
+    const input = await screen.findByLabelText('Keystore 口令') as HTMLInputElement
     fireEvent.change(input, { target: { value: 'secret-pass' } })
     fireEvent.click(screen.getByRole('button', { name: '解锁' }))
     await waitFor(() => expect(unlockComm).toHaveBeenCalledWith('secret-pass', false))
@@ -216,11 +221,12 @@ describe('CommunicationPage', () => {
 
   it('uses only IPC proxy wrappers and never invokes fetch or storage for secrets', async () => {
     success()
+    vi.mocked(getCommStatus).mockResolvedValue(lockedStatus)
     const fetchSpy = vi.spyOn(window, 'fetch')
     const storageSet = vi.spyOn(Storage.prototype, 'setItem')
     render(<CommunicationPage />)
     await screen.findByText('npub1alice')
-    fireEvent.change(screen.getByLabelText('Keystore 口令'), { target: { value: 'do-not-store' } })
+    fireEvent.change(await screen.findByLabelText('Keystore 口令'), { target: { value: 'do-not-store' } })
     fireEvent.click(screen.getByRole('button', { name: '解锁' }))
     await waitFor(() => expect(unlockComm).toHaveBeenCalled())
     expect(fetchSpy).not.toHaveBeenCalled()
@@ -234,5 +240,292 @@ describe('CommunicationPage English default', () => {
     success()
     render(<CommunicationPage />)
     expect(screen.getByRole('heading', { name: 'Communication overview' })).toBeInTheDocument()
+  })
+})
+
+
+describe('CommunicationPage usability', () => {
+  beforeEach(() => { setLocale('en') })
+  afterEach(() => { vi.useRealTimers() })
+
+  it('hides the unlock form in the normal state', async () => {
+    success()
+    render(<CommunicationPage />)
+    await screen.findByText('npub1alice')
+    expect(screen.queryByLabelText('Keystore password')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Unlock' })).toBeNull()
+  })
+
+  it.each([
+    ['locked state', { state: 'locked' as const, reason: null }],
+    ['password_rejected', { state: 'stopped' as const, reason: 'password_rejected' }],
+    ['keychain_unavailable', { state: 'gave_up' as const, reason: 'keychain_unavailable' }],
+  ])('shows the unlock form with an explanation when %s', async (_name, process) => {
+    success()
+    vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, ...process } })
+    render(<CommunicationPage />)
+    expect(await screen.findByLabelText('Keystore password')).toBeInTheDocument()
+    expect(screen.getByText(/generated and kept in the system keychain automatically/)).toBeInTheDocument()
+  })
+
+  it('says the password is incorrect instead of the service-locked wording', async () => {
+    success()
+    vi.mocked(getCommStatus).mockResolvedValue(lockedStatus)
+    vi.mocked(unlockComm).mockRejectedValueOnce(new CommApiError('password verification failed', 423, 'locked'))
+    render(<CommunicationPage />)
+    fireEvent.change(await screen.findByLabelText('Keystore password'), { target: { value: 'guess' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Unlock' }))
+    expect(await screen.findByText('The password is incorrect')).toBeInTheDocument()
+    expect(screen.queryByText(/service is locked/)).toBeNull()
+  })
+
+  it('shows a spinner while starting, polls until running, and shows no spinner once running', async () => {
+    success()
+    vi.useFakeTimers()
+    const starting: CommDaemonStatus = { ...status, process: { ...status.process, state: 'starting' } }
+    vi.mocked(getCommStatus).mockResolvedValue(starting)
+    render(<CommunicationPage />)
+    await act(async () => { await vi.advanceTimersByTimeAsync(10) })
+    expect(screen.getByTestId('comm-spinner')).toBeInTheDocument()
+    expect(screen.getByText('Starting…')).toBeInTheDocument()
+    vi.mocked(getCommStatus).mockResolvedValue(status)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1100) })
+    expect(screen.getByText('Running')).toBeInTheDocument()
+    expect(screen.queryByTestId('comm-spinner')).toBeNull()
+    const calls = vi.mocked(getCommStatus).mock.calls.length
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+    expect(vi.mocked(getCommStatus).mock.calls.length).toBe(calls)
+  })
+
+  it('stops polling after about 30 seconds and when unmounted', async () => {
+    success()
+    vi.useFakeTimers()
+    vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, state: 'backoff' } })
+    const view = render(<CommunicationPage />)
+    await act(async () => { await vi.advanceTimersByTimeAsync(10) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(40_000) })
+    const calls = vi.mocked(getCommStatus).mock.calls.length
+    expect(calls).toBeGreaterThanOrEqual(25)
+    expect(calls).toBeLessThanOrEqual(32)
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+    expect(vi.mocked(getCommStatus).mock.calls.length).toBe(calls)
+    view.unmount()
+  })
+
+  it('shows each npub with a Copy button and the hint for the default identity', async () => {
+    success()
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+    render(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Copy alice' }))
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('npub1alice'))
+    expect(screen.getByText('Send this address to a colleague so they can add you.')).toBeInTheDocument()
+  })
+
+  it('adds a contact after validating the npub prefix', async () => {
+    success()
+    vi.mocked(addCommContact).mockResolvedValue({})
+    render(<CommunicationPage />)
+    await screen.findByText('npub1alice')
+    expect(screen.getByText(/1\. Exchange npub addresses/)).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Nickname'), { target: { value: 'carol' } })
+    fireEvent.change(screen.getByLabelText('npub address'), { target: { value: 'nsec1nope' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add contact' }))
+    expect(await screen.findByText('The address must start with npub1')).toBeInTheDocument()
+    expect(addCommContact).not.toHaveBeenCalled()
+    fireEvent.change(screen.getByLabelText('npub address'), { target: { value: 'npub1carol' } })
+    fireEvent.change(screen.getByLabelText('Role (optional)'), { target: { value: 'colleague' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add contact' }))
+    await waitFor(() => expect(addCommContact).toHaveBeenCalledWith('carol', 'npub1carol', 'colleague'))
+    await waitFor(() => expect(listCommContacts).toHaveBeenCalledTimes(2))
+  })
+
+  it('sends an encrypted message to a contact and reports relays; lists recent messages', async () => {
+    success()
+    vi.mocked(listCommHistory).mockResolvedValue([{ id: 'e1', from: 'bob', content: 'hello there', at: '10:00' }])
+    vi.mocked(sendCommMessage).mockResolvedValue({ published_to: 2 })
+    render(<CommunicationPage />)
+    expect(await screen.findByText('hello there')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('To'), { target: { value: 'bob' } })
+    fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'hi bob' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => expect(sendCommMessage).toHaveBeenCalledWith('bob', 'hi bob'))
+    expect(await screen.findByText('Published to 2 relay(s).')).toBeInTheDocument()
+    await waitFor(() => expect(listCommHistory).toHaveBeenCalledTimes(2))
+  })
+
+  it('exports with the nickname only; the page has no password fields and a cancelled step is silent', async () => {
+    success()
+    vi.mocked(exportCommIdentity)
+      .mockRejectedValueOnce(new CommApiError('cancelled', 499, 'cancelled'))
+      .mockResolvedValueOnce({ nickname: 'alice', npub: 'npub1alice', path: '/safe/alice.ncryptsec', warnings: [] })
+    render(<CommunicationPage />)
+    const button = await screen.findByRole('button', { name: 'Export private key backup alice' })
+    fireEvent.click(button)
+    await waitFor(() => expect(exportCommIdentity).toHaveBeenCalledTimes(1))
+    expect(exportCommIdentity).toHaveBeenCalledWith('alice')
+    await waitFor(() => expect(button).toBeEnabled())
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByLabelText(/backup password/i)).toBeNull()
+    expect(document.querySelector('input[type="password"]')).toBeNull()
+    fireEvent.click(button)
+    expect(await screen.findByText(/saved to \/safe\/alice\.ncryptsec/)).toBeInTheDocument()
+    expect(document.body.textContent).not.toMatch(/nsec1/)
+  })
+
+  it('shows an existing-file refusal as an error', async () => {
+    success()
+    vi.mocked(exportCommIdentity).mockRejectedValueOnce(new CommApiError('A file with that name already exists', 409, 'target_exists'))
+    render(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Export private key backup alice' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('already exists')
+  })
+
+  const stranger = 'npub1strangerstrangerstrangerstrangerstrangerstrangerxyz'
+
+  it('offers Add as contact for an unknown sender, prefilling the form, but not for a contact', async () => {
+    success()
+    vi.mocked(listCommHistory).mockResolvedValue([
+      { id: 'a', from: stranger, content: 'who dis', at: '' },
+      { id: 'b', from: 'npub1bob', content: 'from a contact', at: '' },
+    ])
+    render(<CommunicationPage />)
+    expect(await screen.findByText('who dis')).toBeInTheDocument()
+    expect(screen.queryByText(stranger)).toBeNull()
+    expect(screen.getAllByRole('button', { name: 'Add as contact' })).toHaveLength(1)
+    fireEvent.click(screen.getByRole('button', { name: 'Add as contact' }))
+    expect(screen.getByLabelText('npub address')).toHaveValue(stranger)
+  })
+
+  it('Reply pre-selects the sender: contact nickname, or the raw npub for strangers', async () => {
+    success()
+    vi.mocked(listCommHistory).mockResolvedValue([
+      { id: 'a', from: stranger, content: 'who dis', at: '' },
+      { id: 'b', from: 'npub1bob', content: 'from a contact', at: '' },
+    ])
+    render(<CommunicationPage />)
+    await screen.findByText('who dis')
+    const replies = screen.getAllByRole('button', { name: 'Reply' })
+    fireEvent.click(replies[1]!)
+    expect(screen.getByLabelText('To')).toHaveValue('bob')
+    fireEvent.click(replies[0]!)
+    expect(screen.getByLabelText('To')).toHaveValue(stranger)
+  })
+
+  it('sends to a raw npub that is not a contact, and rejects an unknown name', async () => {
+    success()
+    vi.mocked(sendCommMessage).mockResolvedValue({ published_to: 1 })
+    render(<CommunicationPage />)
+    await screen.findByText('npub1alice')
+    expect(screen.getByText(/anyone with your npub can message you/)).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'hello' } })
+    fireEvent.change(screen.getByLabelText('To'), { target: { value: 'nobody' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    expect(await screen.findByText(/Enter a contact name or an address starting with npub1/)).toBeInTheDocument()
+    expect(sendCommMessage).not.toHaveBeenCalled()
+    fireEvent.change(screen.getByLabelText('To'), { target: { value: stranger } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => expect(sendCommMessage).toHaveBeenCalledWith(stranger, 'hello'))
+  })
+
+
+  it('restores from a backup: the file is picked natively, the nickname is suggested from its name, and the page never asks for a password', async () => {
+    success()
+    vi.mocked(pickCommBackup).mockResolvedValueOnce({ ticket: 'tk1', fileName: 'work-laptop.ncryptsec' })
+    vi.mocked(restoreCommIdentity).mockResolvedValueOnce({ status: 'imported', nickname: 'work-laptop', npub: 'npub1w' })
+    render(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Restore from backup' }))
+    const nickname = await screen.findByLabelText('Nickname for the restored identity')
+    expect(nickname).toHaveValue('work-laptop')
+    expect(document.querySelector('input[type="password"]')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Restore' }))
+    await waitFor(() => expect(restoreCommIdentity).toHaveBeenCalledWith('tk1', 'work-laptop', false))
+    expect(await screen.findByText('Identity "work-laptop" was restored from the backup.')).toBeInTheDocument()
+    await waitFor(() => expect(vi.mocked(listCommIdentities).mock.calls.length).toBeGreaterThan(1))
+  })
+
+  it('a cancelled file dialog shows no form; a cancelled password window keeps the form for a retry', async () => {
+    success()
+    vi.mocked(pickCommBackup).mockResolvedValueOnce(null)
+    render(<CommunicationPage />)
+    const button = await screen.findByRole('button', { name: 'Restore from backup' })
+    fireEvent.click(button)
+    await waitFor(() => expect(pickCommBackup).toHaveBeenCalledTimes(1))
+    expect(screen.queryByLabelText('Nickname for the restored identity')).toBeNull()
+
+    vi.mocked(pickCommBackup).mockResolvedValueOnce({ ticket: 'tk2', fileName: 'b.ncryptsec' })
+    vi.mocked(restoreCommIdentity).mockRejectedValueOnce(new CommApiError('cancelled', 499, 'cancelled'))
+    fireEvent.click(button)
+    fireEvent.click(await screen.findByRole('button', { name: 'Restore' }))
+    await waitFor(() => expect(restoreCommIdentity).toHaveBeenCalledTimes(1))
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByLabelText('Nickname for the restored identity')).toBeInTheDocument()
+  })
+
+  it('says when the identity is already on this device, and maps daemon codes to plain wording', async () => {
+    success()
+    vi.mocked(pickCommBackup).mockResolvedValue({ ticket: 'tk3', fileName: 'c.ncryptsec' })
+    vi.mocked(restoreCommIdentity)
+      .mockResolvedValueOnce({ status: 'already_present', nickname: 'alice', npub: 'npub1alice' })
+      .mockRejectedValueOnce(new CommApiError('exists', 409, 'nickname_exists'))
+      .mockRejectedValueOnce(new CommApiError('too old', 409, 'hyphae_too_old'))
+    render(<CommunicationPage />)
+    const open = async () => {
+      const opener = await screen.findByRole('button', { name: 'Restore from backup' })
+      await waitFor(() => expect(opener).toBeEnabled())
+      fireEvent.click(opener)
+      fireEvent.click(await screen.findByRole('button', { name: 'Restore' }))
+    }
+    await open()
+    expect(await screen.findByText('This identity is already on this device (as "alice").')).toBeInTheDocument()
+    await open()
+    expect(await screen.findByText(/An identity with that nickname already exists\. Choose another nickname\./)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Restore' }))
+    expect(await screen.findByText(/Requires Hyphae v0\.28\.0 or newer/)).toBeInTheDocument()
+  })
+
+  it('shows "Requires Hyphae v0.28.0 or newer" when the key backup is not supported', async () => {
+    success()
+    vi.mocked(exportCommIdentity).mockRejectedValueOnce(new CommApiError('too old', 409, 'hyphae_too_old'))
+    render(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Export private key backup alice' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Requires Hyphae v0.28.0 or newer')
+  })
+
+  it('offers Restore from backup in the setup wizard when there is no identity yet, defaulting it', async () => {
+    success()
+    vi.mocked(listCommIdentities).mockResolvedValue([])
+    vi.mocked(pickCommBackup).mockResolvedValueOnce({ ticket: 'tk4', fileName: 'first.ncryptsec' })
+    vi.mocked(restoreCommIdentity).mockResolvedValueOnce({ status: 'imported', nickname: 'first', npub: 'npub1f' })
+    render(<CommunicationPage />)
+    const wizard = await screen.findByTestId('comm-setup')
+    expect(wizard).toHaveAttribute('data-state', 'no_identity')
+    fireEvent.click(screen.getByRole('button', { name: 'Restore from backup' }))
+    expect(await screen.findByLabelText('Make it the default identity')).toBeChecked()
+    fireEvent.click(screen.getByRole('button', { name: 'Restore' }))
+    await waitFor(() => expect(restoreCommIdentity).toHaveBeenCalledWith('tk4', 'first', true))
+  })
+
+  it('shows a warning next to the success message when the saved backup has unconfirmed follow-ups', async () => {
+    success()
+    vi.mocked(exportCommIdentity).mockResolvedValueOnce({
+      nickname: 'alice', npub: 'npub1alice', path: '/safe/alice.ncryptsec',
+      warnings: [{ code: 'cleanup_failed', path: '/safe/.agent24-backup-ab12.tmp' }, { code: 'durability_unconfirmed' }],
+    })
+    render(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Export private key backup alice' }))
+    expect(await screen.findByText(/saved to \/safe\/alice\.ncryptsec/)).toBeInTheDocument()
+    expect(screen.getByText(/could not be removed: \/safe\/\.agent24-backup-ab12\.tmp/)).toBeInTheDocument()
+    expect(screen.getByText(/could not yet confirm it is safely on disk/)).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('shows no warning when the export is clean', async () => {
+    success()
+    vi.mocked(exportCommIdentity).mockResolvedValueOnce({ nickname: 'alice', npub: 'npub1alice', path: '/safe/a.ncryptsec', warnings: [] })
+    render(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Export private key backup alice' }))
+    expect(await screen.findByText(/saved to \/safe\/a\.ncryptsec/)).toBeInTheDocument()
+    expect(document.querySelector('.comm-warning')).toBeNull()
   })
 })

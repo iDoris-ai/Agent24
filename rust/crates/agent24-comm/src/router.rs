@@ -33,7 +33,9 @@ use crate::error::{CommError, map_envelope_failure, map_runner_error, map_store_
 use crate::npub::is_valid_npub;
 use crate::password::Password;
 use crate::password_store::{Account, PasswordStore};
-use crate::runner::{Envelope, ExitClass, HyphaeRunner, Invocation};
+use crate::runner::{
+    Envelope, ExitClass, HyphaeRunner, Invocation, RunnerError, hold_until_reaped_then,
+};
 
 type CommResult = Result<Json<Value>, CommError>;
 
@@ -67,6 +69,8 @@ pub struct CommState {
     /// the `/comm/daemon*` routes then answer `not_configured` same as any
     /// other route on those backends.
     daemon: Option<Arc<crate::daemon::HyphaeDaemonSupervisor>>,
+    /// One private-key export at a time (a second gets `export_in_progress`).
+    export_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl CommState {
@@ -89,6 +93,7 @@ impl CommState {
                 home: Arc::new(home),
             },
             daemon: None,
+            export_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -110,6 +115,7 @@ impl CommState {
                 reason: Arc::new(reason.into()),
             },
             daemon: None,
+            export_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -122,6 +128,7 @@ impl CommState {
                 reason: Arc::new(reason.into()),
             },
             daemon: None,
+            export_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -161,6 +168,8 @@ pub fn router(state: CommState) -> Router {
     Router::new()
         .route("/identity", get(list_identity).post(create_identity))
         .route("/identity/default", post(use_identity))
+        .route("/identity/export", post(export_identity))
+        .route("/identity/import", post(import_identity))
         .route("/unlock", post(unlock))
         .route("/contact", get(list_contact).post(add_contact))
         .route("/relay", get(list_relay).put(set_relay))
@@ -347,7 +356,8 @@ async fn create_identity(
     Json(req): Json<IdentityCreateReq>,
 ) -> CommResult {
     let (runner, password_store, home) = state.require_ready()?;
-    invalid_if_blank("nickname", &req.nickname)?;
+    invalid_if_bad_name("nickname", &req.nickname)?;
+    check_nickname_len(&req.nickname)?;
 
     // Held for the ENTIRE decision+create+promote sequence below, not just
     // around the spawn — two concurrent requests both reading "no keystore
@@ -447,6 +457,18 @@ async fn create_identity(
             ))
         }
         Err(e) => {
+            // A child that could not be confirmed dead may still be writing the
+            // keystore: keep the lock until it is reaped, decide nothing yet.
+            if let RunnerError::StillTerminating(reaped) = &e {
+                hold_first_identity_until_reaped(
+                    guard,
+                    reaped.clone(),
+                    state.clone(),
+                    account.clone(),
+                    is_first_identity,
+                );
+                return Err(map_runner_error(e));
+            }
             let outcome = if is_first_identity {
                 Some(resolve_first_identity_failure(home, password_store, &account).await)
             } else {
@@ -456,6 +478,32 @@ async fn create_identity(
             Err(first_identity_failure_error(outcome, map_runner_error(e)))
         }
     }
+}
+
+/// Restore runs longer than a plain read (Hyphae decrypts with scrypt).
+#[cfg(not(test))]
+const IMPORT_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const IMPORT_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// A first-identity create/restore whose child could not be confirmed dead.
+/// The child may still be writing `keystore.json`, so the keystore lock stays
+/// held until it is reaped, and THEN -- still holding the lock -- the same
+/// reconciliation the normal failure path does runs: `keystore.json` written
+/// -> promote the generated password from `Pending` to its `Salt` account;
+/// not written -> remove `Pending`. Only after that is the lock released.
+fn hold_first_identity_until_reaped(
+    guard: crate::keystore_lock::KeystoreGuard,
+    reaped: tokio::sync::watch::Receiver<bool>,
+    state: CommState,
+    account: Account,
+    is_first_identity: bool,
+) {
+    hold_until_reaped_then(guard, reaped, async move {
+        if is_first_identity && let Ok((_, store, home)) = state.require_ready() {
+            let _ = resolve_first_identity_failure(home, store, &account).await;
+        }
+    });
 }
 
 /// First-identity success path: promote the `Pending` password onto its new
@@ -604,7 +652,7 @@ async fn use_identity(
     Json(req): Json<IdentityDefaultReq>,
 ) -> CommResult {
     let (runner, ..) = state.require_ready()?;
-    invalid_if_blank("nickname", &req.nickname)?;
+    invalid_if_bad_name("nickname", &req.nickname)?;
     let envelope = runner
         .run_keystore_write(read_invocation(&[
             "identity",
@@ -622,6 +670,347 @@ async fn use_identity(
         daemon.on_config_changed().await;
     }
     envelope_response(envelope)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityExportReq {
+    nickname: String,
+    path: String,
+    /// Encrypts the backup (NIP-49, done by Hyphae). Held zeroizing, never
+    /// logged or echoed.
+    backup_password: UnlockSecret,
+}
+
+/// Unicode general category Cf (format controls), which includes the bidi
+/// overrides and isolates (U+202A-202E, U+2066-2069) that can make a name read
+/// differently from what it is. U+200C/U+200D (joiners) are allowed: scripts
+/// such as Persian and Indic need them for ordinary words.
+pub(crate) fn is_format_control(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890..=0x0891 | 0x08E2
+        | 0x180E | 0x200B | 0x200E..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064
+        | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD
+        | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A
+        | 0xE0001 | 0xE0020..=0xE007F)
+}
+
+/// The nickname contract for NEW names (create, contact add, restore) and for
+/// export: at most 128 characters and 512 UTF-8 bytes, the same as the desktop.
+/// Existing longer names still list and work for everything except export
+/// (`default` deliberately does not check it); export and restore of such a
+/// name answer `nickname_too_long`.
+pub(crate) const NICKNAME_MAX_CHARS: usize = 128;
+pub(crate) const NICKNAME_MAX_BYTES: usize = 512;
+
+fn check_nickname_len(value: &str) -> Result<(), CommError> {
+    if value.chars().count() > NICKNAME_MAX_CHARS || value.len() > NICKNAME_MAX_BYTES {
+        return Err(CommError::Coded(
+            axum::http::StatusCode::BAD_REQUEST,
+            "nickname_too_long",
+            format!(
+                "a nickname may have at most {NICKNAME_MAX_CHARS} characters ({NICKNAME_MAX_BYTES} bytes)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Identity and contact names end up in Hyphae's line-oriented output and in
+/// argv; a control character (a newline above all) has no legitimate use.
+fn invalid_if_bad_name(field: &'static str, value: &str) -> Result<(), CommError> {
+    invalid_if_blank(field, value)?;
+    if value
+        .chars()
+        .any(|c| c.is_control() || is_format_control(c))
+    {
+        return Err(CommError::Invalid(format!(
+            "{field} must not contain control or invisible formatting characters"
+        )));
+    }
+    Ok(())
+}
+
+/// `POST /comm/identity/export` makes Hyphae write an NIP-49 password-encrypted
+/// (`ncryptsec1…`) backup of the identity's key, then publishes it at `path`
+/// without ever overwriting anything (see `export.rs`). Answers
+/// `{nickname, npub, path, format}` only: neither the key, the backup nor the
+/// backup password is in a response or a log line. Needs Hyphae >= v0.28.0
+/// (`hyphae_too_old` otherwise).
+async fn export_identity(
+    State(state): State<CommState>,
+    payload: Result<Json<IdentityExportReq>, JsonRejection>,
+) -> CommResult {
+    let Json(req) = payload.map_err(|_| CommError::Invalid("invalid export request".to_owned()))?;
+    let (runner, password_store, home) = state.require_ready()?;
+    invalid_if_bad_name("nickname", &req.nickname)?;
+    check_nickname_len(&req.nickname)?;
+    invalid_if_blank("path", &req.path)?;
+    crate::export::validate_backup_password(&req.backup_password.0)?;
+    let dest = PathBuf::from(&req.path);
+    // One export at a time: Hyphae's scrypt work, the keychain read and the
+    // staged file are heavy and secret-bearing; a second caller is refused.
+    let single = Arc::clone(&state.export_gate)
+        .try_lock_owned()
+        .map_err(|_| {
+            CommError::Conflict(
+                "export_in_progress: another key backup is already running".to_owned(),
+                Some(json!({"reason": "export_in_progress"})),
+            )
+        })?;
+    crate::export::require_feature(runner, crate::export::Feature::Export).await?;
+    let staged = crate::export::Staged::begin(&dest, home)?;
+
+    // The identity's npub comes from `identity list`: Hyphae must report
+    // exactly this one for the export to be accepted.
+    let npub = identity_npub(runner, &req.nickname)
+        .await?
+        .ok_or_else(|| CommError::NotFound("identity not found".to_owned()))?;
+    let account = resolve_account(home).await?.ok_or_else(|| {
+        CommError::NotConfigured("no keystore exists yet; create an identity first".to_owned())
+    })?;
+    let keystore_password = password_store
+        .get(&account)
+        .await
+        .map_err(map_store_error)?;
+    let outcome = crate::export::export_identity_backup(
+        runner,
+        keystore_password,
+        &req.nickname,
+        &npub,
+        &req.backup_password.0,
+        staged,
+        single,
+    )
+    .await?;
+    tracing::info!(nickname = %req.nickname, "identity key backup exported");
+    // The backup is published and stays published; `warnings` tells the user
+    // about the two things that could not be confirmed afterwards.
+    let mut data = json!({
+        "nickname": req.nickname,
+        "npub": npub,
+        "path": req.path,
+        "format": "ncryptsec",
+    });
+    if let Some(warnings) = outcome.warnings_json() {
+        data["warnings"] = warnings;
+    }
+    Ok(Json(json!({"ok": true, "data": data})))
+}
+
+/// `(npub, is_default)` of the identity called `nickname` according to
+/// `identity list`.
+async fn identity_entry(
+    runner: &HyphaeRunner,
+    nickname: &str,
+) -> Result<Option<(String, bool)>, CommError> {
+    let listed = match runner
+        .run(read_invocation(&["identity", "list"]))
+        .await
+        .map_err(map_runner_error)?
+    {
+        Envelope::Ok { data } => data,
+        Envelope::Failed {
+            error,
+            message,
+            data,
+            ..
+        } => {
+            return Err(map_envelope_failure(&error, &message, data));
+        }
+    };
+    Ok(listed.as_array().and_then(|items| {
+        items
+            .iter()
+            .find(|i| i.get("nickname").and_then(Value::as_str) == Some(nickname))
+            .and_then(|i| {
+                Some((
+                    i.get("npub").and_then(Value::as_str)?.to_owned(),
+                    i.get("default").and_then(Value::as_bool).unwrap_or(false),
+                ))
+            })
+    }))
+}
+
+/// `npub` of the identity called `nickname` according to `identity list`.
+async fn identity_npub(runner: &HyphaeRunner, nickname: &str) -> Result<Option<String>, CommError> {
+    Ok(identity_entry(runner, nickname)
+        .await?
+        .map(|(npub, _)| npub))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityImportReq {
+    nickname: String,
+    path: String,
+    backup_password: UnlockSecret,
+    #[serde(default)]
+    default: bool,
+}
+
+/// `POST /comm/identity/import` restores an identity from an NIP-49 backup
+/// file: `hyphae identity import --nickname=N --password-stdin
+/// --ncryptsec-stdin [--default]` with stdin `keystore password`, `backup
+/// password`, `ncryptsec1…` (one per line, that order). The keystore follows
+/// the same two flows as `create_identity` (first identity: generate a keychain
+/// password under `KeystoreWriteLock` and promote it on success; later: reuse
+/// the stored one), with the lock held for the whole import.
+///
+/// The same key already being present is not an error: it answers
+/// `{status:"already_present", nickname?, npub?}`.
+async fn import_identity(
+    State(state): State<CommState>,
+    payload: Result<Json<IdentityImportReq>, JsonRejection>,
+) -> CommResult {
+    let Json(req) =
+        payload.map_err(|_| CommError::Invalid("invalid restore request".to_owned()))?;
+    let (runner, password_store, home) = state.require_ready()?;
+    invalid_if_bad_name("nickname", &req.nickname)?;
+    check_nickname_len(&req.nickname)?;
+    invalid_if_blank("path", &req.path)?;
+    crate::export::validate_restore_password(&req.backup_password.0)?;
+    let ncryptsec = crate::export::read_backup_file(Path::new(&req.path))?;
+    crate::export::require_feature(runner, crate::export::Feature::Import).await?;
+
+    let guard = runner.keystore_lock().acquire().await;
+    let existing = resolve_account(home).await?;
+    let (account, keystore_password, is_first_identity) = match existing {
+        Some(account) => {
+            let password = password_store
+                .get(&account)
+                .await
+                .map_err(map_store_error)?;
+            (account, password, false)
+        }
+        None => {
+            let pending = Account::new_pending();
+            let mut random32 = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rng(), &mut random32);
+            let password = Password::generate(random32);
+            password_store
+                .put(&pending, &password)
+                .await
+                .map_err(map_store_error)?;
+            (pending, password, true)
+        }
+    };
+    let stdin = crate::export::import_stdin(&keystore_password, &req.backup_password.0, &ncryptsec);
+    drop(keystore_password);
+    let stdin = match stdin {
+        Ok(stdin) => stdin,
+        Err(e) => {
+            if is_first_identity {
+                let _ = resolve_first_identity_failure(home, password_store, &account).await;
+            }
+            return Err(e);
+        }
+    };
+    let mut argv: Vec<OsString> = vec![
+        "identity".into(),
+        "import".into(),
+        format!("--nickname={}", req.nickname).into(),
+        "--ncryptsec-stdin".into(),
+    ];
+    if req.default {
+        argv.push("--default".into());
+    }
+    let result = runner
+        .run(Invocation {
+            args: argv,
+            password: Some(stdin),
+            timeout: Some(IMPORT_TIMEOUT),
+        })
+        .await;
+
+    match result {
+        Ok(Envelope::Ok { data }) => {
+            if is_first_identity {
+                promote_first_identity_password(home, password_store, &account).await;
+            }
+            drop(guard);
+            // Whether it ended up the default is read back from Hyphae, not
+            // inferred from the request: Hyphae also makes an identity the
+            // default when the keystore had none.
+            let imported_nickname = data
+                .get("nickname")
+                .and_then(Value::as_str)
+                .unwrap_or(&req.nickname)
+                .to_owned();
+            let became_default = identity_entry(runner, &imported_nickname)
+                .await
+                .ok()
+                .flatten()
+                .map_or(req.default || is_first_identity, |(_, is_default)| {
+                    is_default
+                });
+            if became_default && let Some(daemon) = state.daemon.clone() {
+                daemon.on_config_changed().await;
+            }
+            Ok(Json(json!({"ok": true, "data": {
+                "status": "imported",
+                "nickname": data.get("nickname").and_then(Value::as_str).unwrap_or(&req.nickname),
+                "npub": data.get("npub").cloned().unwrap_or(Value::Null),
+                "default": became_default,
+            }})))
+        }
+        Ok(Envelope::Failed {
+            error,
+            message,
+            data,
+            ..
+        }) => {
+            let outcome = if is_first_identity {
+                Some(resolve_first_identity_failure(home, password_store, &account).await)
+            } else {
+                None
+            };
+            drop(guard);
+            match crate::export::classify_import_failure(&error, &message, data) {
+                crate::export::ImportFailure::AlreadyPresent { message } => {
+                    already_present(runner, &message).await
+                }
+                crate::export::ImportFailure::Failed(e) => {
+                    Err(first_identity_failure_error(outcome, e))
+                }
+            }
+        }
+        Err(e) => {
+            if let RunnerError::StillTerminating(reaped) = &e {
+                hold_first_identity_until_reaped(
+                    guard,
+                    reaped.clone(),
+                    state.clone(),
+                    account.clone(),
+                    is_first_identity,
+                );
+                return Err(map_runner_error(e));
+            }
+            let outcome = if is_first_identity {
+                Some(resolve_first_identity_failure(home, password_store, &account).await)
+            } else {
+                None
+            };
+            drop(guard);
+            Err(first_identity_failure_error(outcome, map_runner_error(e)))
+        }
+    }
+}
+
+/// `{status:"already_present"}` plus the existing identity, when Hyphae's
+/// message names one that `identity list` confirms.
+async fn already_present(runner: &HyphaeRunner, message: &str) -> CommResult {
+    let named = crate::export::nickname_from_npub_exists(message);
+    let npub = match named {
+        Some(nickname) => identity_npub(runner, nickname).await.ok().flatten(),
+        None => None,
+    };
+    let nickname = npub.as_ref().and(named);
+    Ok(Json(json!({"ok": true, "data": {
+        "status": "already_present",
+        "nickname": nickname,
+        "npub": npub,
+    }})))
 }
 
 struct UnlockSecret(Zeroizing<String>);
@@ -735,7 +1124,8 @@ struct ContactAddReq {
 /// render as the unhelpful `upstream`).
 async fn add_contact(State(state): State<CommState>, Json(req): Json<ContactAddReq>) -> CommResult {
     let (runner, ..) = state.require_ready()?;
-    invalid_if_blank("nickname", &req.nickname)?;
+    invalid_if_bad_name("nickname", &req.nickname)?;
+    check_nickname_len(&req.nickname)?;
     if !is_valid_npub(&req.npub) {
         return Err(CommError::Invalid(format!(
             "{:?} is not a well-formed npub",
@@ -1530,6 +1920,889 @@ mod tests {
             serde_json::from_slice(&bytes).unwrap()
         };
         (status, value)
+    }
+
+    // ---- identity export / import (non-interactive Hyphae >= 0.28) ---------
+
+    const FLAGS_EXPORT: &str = "--nickname --password-stdin --format --out";
+    const FLAGS_IMPORT: &str = "--nickname --ncryptsec-stdin --password-stdin --default";
+
+    /// A fake `hyphae`: answers `--help` probes, `identity list`, and the two
+    /// new commands, logging every call's argv and stdin lines to `log`.
+    struct Fake {
+        log: PathBuf,
+        export_help: String,
+        import_help: String,
+        export_body: String,
+        import_body: String,
+    }
+
+    impl Fake {
+        fn new(dir: &Path) -> Self {
+            let npub = crate::export::testkit::npub();
+            Self {
+                log: dir.join("calls.log"),
+                export_help: FLAGS_EXPORT.to_owned(),
+                import_help: FLAGS_IMPORT.to_owned(),
+                export_body: Fake::export_ok(&crate::export::testkit::sk(), "backup-pass-1", &npub),
+                import_body: format!(
+                    "echo '{{\"ok\":true,\"data\":{{\"nickname\":\"'\"$nick\"'\",\"npub\":\"{npub}\"}}}}'\n"
+                ),
+            }
+        }
+
+        /// Hyphae's `--format ncryptsec` answer: ciphertext on stdout, no file.
+        fn export_ok(secret: &[u8; 32], password: &str, npub: &str) -> String {
+            let nc = crate::export::testkit::encrypt_nip49(secret, password, 4);
+            Self::export_json(npub, &nc)
+        }
+
+        fn export_json(npub: &str, ncryptsec: &str) -> String {
+            format!(
+                "echo '{{\"ok\":true,\"data\":{{\"nickname\":\"t1\",\"npub\":\"{npub}\",\"ncryptsec\":\"{ncryptsec}\"}}}}'\n"
+            )
+        }
+
+        fn fail_import(mut self, code: &str, message: &str, exit: u8) -> Self {
+            self.import_body = format!(
+                "echo \"{{\\\"ok\\\":false,\\\"error\\\":\\\"{code}\\\",\\\"message\\\":\\\"{message}\\\"}}\" >&2\nexit {exit}\n"
+            );
+            self
+        }
+
+        fn script(&self) -> String {
+            let npub = crate::export::testkit::npub();
+            format!(
+                r#"#!/bin/sh
+LOG="{log}"
+cmd="$1 $2"; all="$*"
+if [ "$3" = "--help" ]; then
+  if [ "$2" = "export" ]; then echo "{eh}"; else echo "{ih}"; fi
+  exit 0
+fi
+if [ "$cmd" = "identity list" ]; then
+  echo '{{"ok":true,"data":[{{"nickname":"t1","npub":"{npub}","default":true,"encrypted":true}},{{"nickname":"r1","npub":"{npub}","default":false,"encrypted":true}},{{"nickname":"auto","npub":"{npub}","default":true,"encrypted":true}}]}}'
+  exit 0
+fi
+out=""; nick=""
+for a in "$@"; do
+  case "$a" in --nickname=*) nick="${{a#--nickname=}}";; esac
+done
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--out" ]; then out="$a"; fi
+  prev="$a"
+done
+if [ "$cmd" = "identity export" ]; then
+  IFS= read -r ks; IFS= read -r bp
+  echo "export|$all|$ks|$bp" >> "$LOG"
+{export_body}
+  exit 0
+fi
+if [ "$cmd" = "identity import" ]; then
+  IFS= read -r ks; IFS= read -r bp; IFS= read -r nc
+  echo "import|$all|$ks|$bp|$nc" >> "$LOG"
+  mkdir -p "$HOME/.hyphae"
+  [ -f "$HOME/.hyphae/keystore.json" ] || echo '{{"salt":"c2FsdC1mb3ItdGVzdA=="}}' > "$HOME/.hyphae/keystore.json"
+{import_body}
+  exit 0
+fi
+echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2; exit 4
+"#,
+                log = self.log.display(),
+                eh = self.export_help,
+                ih = self.import_help,
+                export_body = self.export_body,
+                import_body = self.import_body,
+            )
+        }
+
+        fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.log)
+                .map(|t| t.lines().map(str::to_owned).collect())
+                .unwrap_or_default()
+        }
+    }
+
+    async fn export_call(
+        app: Router,
+        nickname: &str,
+        path: &Path,
+        pw: &str,
+    ) -> (StatusCode, Value) {
+        call(
+            app,
+            "POST",
+            "/identity/export",
+            Some(json!({"nickname": nickname, "path": path.to_str().unwrap(), "backup_password": pw})),
+        )
+        .await
+    }
+
+    async fn import_call(
+        app: Router,
+        nickname: &str,
+        path: &Path,
+        pw: &str,
+        default: bool,
+    ) -> (StatusCode, Value) {
+        call(
+            app,
+            "POST",
+            "/identity/import",
+            Some(json!({"nickname": nickname, "path": path.to_str().unwrap(), "backup_password": pw, "default": default})),
+        )
+        .await
+    }
+
+    fn write_backup(dir: &Path) -> PathBuf {
+        let p = dir.join("in.ncryptsec");
+        std::fs::write(&p, format!("{}\n", crate::export::testkit::SPEC_NCRYPTSEC)).unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn export_drives_hyphae_without_out_verifies_the_backup_then_writes_it_itself() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(tmp.path());
+        let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
+        let out = tmp.path().join("out");
+        tokio::fs::create_dir_all(&out).await.unwrap();
+        let dest = out.join("t1.ncryptsec");
+        let (status, body) = export_call(router(state), "t1", &dest, "backup-pass-1").await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        let text = body.to_string();
+        assert!(
+            !text.contains("ncryptsec1")
+                && !text.contains("nsec1")
+                && !text.contains("backup-pass-1"),
+            "{text}"
+        );
+        assert_eq!(
+            body["data"]["npub"],
+            crate::export::testkit::npub().as_str()
+        );
+        assert_eq!(body["data"]["format"], "ncryptsec");
+
+        // argv + stdin order: keystore password first, then the backup password.
+        // No --out: the ciphertext comes back on stdout and the staging name
+        // never reaches Hyphae.
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let parts: Vec<&str> = calls[0].split('|').collect();
+        assert_eq!(parts[0], "export");
+        assert_eq!(
+            parts[1],
+            "identity export --nickname=t1 --format ncryptsec --password-stdin"
+        );
+        assert_eq!((parts[2], parts[3]), ("test-password", "backup-pass-1"));
+
+        // the daemon created it: 0600, one link, nothing else in the folder, and
+        // it opens with the user's password to this identity's key
+        let meta = std::fs::metadata(&dest).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(meta.nlink(), 1);
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
+        let file = std::fs::read_to_string(&dest).unwrap();
+        assert!(file.starts_with("ncryptsec1") && file.ends_with('\n'));
+        let key = crate::export::decrypt_nip49(file.trim(), "backup-pass-1").unwrap();
+        assert_eq!(
+            crate::export::npub_of_secret(&key).unwrap(),
+            crate::export::testkit::npub()
+        );
+        assert!(crate::export::decrypt_nip49(file.trim(), "some-other-pass").is_err());
+    }
+
+    #[tokio::test]
+    async fn export_and_restore_say_hyphae_too_old_when_the_flags_are_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fake = Fake::new(tmp.path());
+        // what v0.27.2 prints: no --password-stdin / --format / --out on export,
+        // and no `identity import` at all
+        fake.export_help = "--nickname".to_owned();
+        fake.import_help = "No help topic".to_owned();
+        let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
+        let app = router(state);
+        let dest = tmp.path().join("t1.ncryptsec");
+        let (status, body) = export_call(app.clone(), "t1", &dest, "backup-pass-1").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+        assert_eq!(body["error"], "hyphae_too_old");
+        assert!(body["message"].as_str().unwrap().contains("v0.28.0"));
+        let (status, body) =
+            import_call(app, "r9", &write_backup(tmp.path()), "nostr", false).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+        assert_eq!(body["error"], "hyphae_too_old");
+        assert!(
+            fake.calls().is_empty(),
+            "nothing may be run on an old binary"
+        );
+        assert!(!dest.exists());
+    }
+
+    #[tokio::test]
+    async fn export_refuses_an_existing_target_without_running_hyphae() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(tmp.path());
+        let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
+        let dest = tmp.path().join("exists.ncryptsec");
+        std::fs::write(&dest, "precious").unwrap();
+        let (status, body) = export_call(router(state), "t1", &dest, "backup-pass-1").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+        assert_eq!(body["data"]["reason"], "target_exists");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "precious");
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn export_writes_nothing_unless_the_backup_opens_with_the_users_password_to_this_identity()
+     {
+        use crate::export::testkit::{SPEC_NCRYPTSEC, encrypt_nip49, npub, sk};
+        let tmp = tempfile::tempdir().unwrap();
+        let other = [9u8; 32];
+        let mut flipped = encrypt_nip49(&sk(), "backup-pass-1", 4);
+        flipped.pop();
+        flipped.push(if flipped.ends_with('q') { 'p' } else { 'q' });
+        let cases = [
+            // encrypted with some OTHER password (e.g. an unencrypted keystore made
+            // Hyphae take our first stdin line, the keystore password, as the
+            // backup password)
+            (
+                "wrong password",
+                Fake::export_json(&npub(), &encrypt_nip49(&sk(), "test-password", 4)),
+            ),
+            (
+                "the spec vector (password nostr)",
+                Fake::export_json(&npub(), SPEC_NCRYPTSEC),
+            ),
+            // opens, but it is a different identity's key
+            (
+                "someone else's key",
+                Fake::export_json(&npub(), &encrypt_nip49(&other, "backup-pass-1", 4)),
+            ),
+            // Hyphae reports another identity
+            (
+                "reports another npub",
+                Fake::export_json("npub1other", &encrypt_nip49(&sk(), "backup-pass-1", 4)),
+            ),
+            ("bad checksum", Fake::export_json(&npub(), &flipped)),
+            ("not an ncryptsec", Fake::export_json(&npub(), "hello")),
+            (
+                "no ncryptsec field",
+                "echo '{\"ok\":true,\"data\":{\"nickname\":\"t1\"}}'\n".to_owned(),
+            ),
+        ];
+        for (name, body) in cases {
+            let mut fake = Fake::new(tmp.path());
+            fake.export_body = body;
+            let sub = tempfile::tempdir_in(tmp.path()).unwrap();
+            let state = ready_state_with_identity(sub.path(), &fake.script()).await;
+            let dest = sub.path().join("t1.ncryptsec");
+            let (status, resp) = export_call(router(state), "t1", &dest, "backup-pass-1").await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{name}: {resp:?}");
+            assert!(!dest.exists(), "{name}");
+            let leftovers: Vec<_> = std::fs::read_dir(sub.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(".agent24-backup-"))
+                .collect();
+            assert!(leftovers.is_empty(), "{name}: {leftovers:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn export_maps_hyphae_failures_and_cleans_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (body, expected, needle) in [
+            (
+                "echo '{\"ok\":false,\"error\":\"auth_error\",\"message\":\"failed to unlock keystore\"}' >&2; exit 3\n",
+                StatusCode::LOCKED,
+                "locked",
+            ),
+            (
+                "echo '{\"ok\":false,\"error\":\"user_error\",\"message\":\"unsupported --format\"}' >&2; exit 1\n",
+                StatusCode::BAD_REQUEST,
+                "invalid",
+            ),
+        ] {
+            let mut fake = Fake::new(tmp.path());
+            fake.export_body = body.to_owned();
+            let sub = tempfile::tempdir_in(tmp.path()).unwrap();
+            let state = ready_state_with_identity(sub.path(), &fake.script()).await;
+            let (status, resp) = export_call(
+                router(state),
+                "t1",
+                &sub.path().join("t1.ncryptsec"),
+                "backup-pass-1",
+            )
+            .await;
+            assert_eq!(status, expected, "{resp:?}");
+            assert_eq!(resp["error"], needle);
+            assert_eq!(
+                std::fs::read_dir(sub.path())
+                    .unwrap()
+                    .filter(|e| e
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".agent24"))
+                    .count(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn export_user_error_from_hyphae_is_explained_as_an_unencrypted_keystore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fake = Fake::new(tmp.path());
+        fake.export_body = "echo '{\"ok\":false,\"error\":\"user_error\",\"message\":\"keystore is not encrypted\"}' >&2; exit 1\n".to_owned();
+        let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
+        let (status, resp) = export_call(
+            router(state),
+            "t1",
+            &tmp.path().join("t1.ncryptsec"),
+            "backup-pass-1",
+        )
+        .await;
+        assert_eq!(
+            (status, resp["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid")),
+            "{resp:?}"
+        );
+        assert!(
+            resp["message"]
+                .as_str()
+                .unwrap()
+                .contains("keystore must be encrypted"),
+            "{resp:?}"
+        );
+        assert!(!tmp.path().join("t1.ncryptsec").exists());
+    }
+
+    #[tokio::test]
+    async fn export_validates_the_request_before_running_anything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(tmp.path());
+        let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
+        let app = router(state);
+        let ok = tmp.path().join("x.ncryptsec");
+        let (s, _) = export_call(app.clone(), "t1", Path::new("rel.txt"), "backup-pass-1").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        for bad in [
+            "short",
+            "bad\nline-pass",
+            "bad\rline-pass",
+            "bad\u{0}nul-pass",
+            "          ",
+        ] {
+            let (s, b) = export_call(app.clone(), "t1", &ok, bad).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad:?} {b:?}");
+        }
+        let (s, _) = export_call(app.clone(), "t1\nNsec: x", &ok, "backup-pass-1").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = export_call(app.clone(), "nobody", &ok, "backup-pass-1").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, _) = call(app.clone(), "POST", "/identity/export",
+            Some(json!({"nickname": "t1", "path": "/tmp/x", "backup_password": "backup-pass-1", "extra": 1}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = call(
+            app,
+            "POST",
+            "/identity/export",
+            Some(json!({"nickname": "t1", "path": "/tmp/x"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(fake.calls().is_empty());
+        assert!(!ok.exists());
+    }
+
+    #[tokio::test]
+    async fn control_characters_are_rejected_in_names_everywhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(tmp.path());
+        let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
+        let app = router(state);
+        for (uri, body) in [
+            ("/identity", json!({"nickname": "a\nb"})),
+            ("/identity/default", json!({"nickname": "a\nb"})),
+            (
+                "/contact",
+                json!({"nickname": "a\u{7}b", "npub": crate::export::testkit::npub()}),
+            ),
+            (
+                "/identity/import",
+                json!({"nickname": "a\nb", "path": "/tmp/x", "backup_password": "x"}),
+            ),
+        ] {
+            let (s, b) = call(app.clone(), "POST", uri, Some(body)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{uri} {b:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn nicknames_follow_one_length_contract_but_old_long_names_keep_working() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(tmp.path());
+        let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
+        let app = router(state);
+        let file = write_backup(tmp.path());
+        let npub = crate::export::testkit::npub();
+        let long = "x".repeat(129);
+        let max = "y".repeat(128);
+        let wide = "𝔘".repeat(129); // 129 characters, 516 bytes
+        for name in [&long, &wide] {
+            for (uri, body) in [
+                ("/identity", json!({"nickname": name})),
+                ("/contact", json!({"nickname": name, "npub": npub})),
+                (
+                    "/identity/import",
+                    json!({"nickname": name, "path": file, "backup_password": "x"}),
+                ),
+                (
+                    "/identity/export",
+                    json!({"nickname": name, "path": "/tmp/x", "backup_password": "backup-pass-1"}),
+                ),
+            ] {
+                let (s, b) = call(app.clone(), "POST", uri, Some(body)).await;
+                assert_eq!(
+                    (s, b["error"].as_str()),
+                    (StatusCode::BAD_REQUEST, Some("nickname_too_long")),
+                    "{uri} {b:?}"
+                );
+            }
+        }
+        // exactly at the limit passes this check (create then reaches the fake hyphae)
+        let (_, b) = call(
+            app.clone(),
+            "POST",
+            "/identity",
+            Some(json!({"nickname": max})),
+        )
+        .await;
+        assert_ne!(b["error"].as_str(), Some("nickname_too_long"), "{b:?}");
+        // an existing long name can still be made the default
+        let (_, b) = call(
+            app,
+            "POST",
+            "/identity/default",
+            Some(json!({"nickname": long})),
+        )
+        .await;
+        assert_ne!(b["error"].as_str(), Some("nickname_too_long"), "{b:?}");
+    }
+
+    /// A runner whose `identity create|import` writes (or not) a keystore and
+    /// then hangs past the timeout, with a zero reap window so the child is
+    /// reported as still terminating.
+    async fn hanging_first_identity(
+        dir: &Path,
+        writes_keystore: bool,
+    ) -> (Router, Arc<HyphaeRunner>, Arc<MemoryPasswordStore>, PathBuf) {
+        let write = if writes_keystore {
+            "mkdir -p \"$HOME/.hyphae\"; echo '{\"salt\":\"c2FsdC1mb3ItdGVzdA==\"}' > \"$HOME/.hyphae/keystore.json\";"
+        } else {
+            ""
+        };
+        let script = format!(
+            "#!/bin/sh\nif [ \"$3\" = \"--help\" ]; then echo \"--ncryptsec-stdin --password-stdin\"; exit 0; fi\n\
+             case \"$1 $2\" in \"identity create\"|\"identity import\") {write} sleep 30;; esac\n"
+        );
+        let home = dir.join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        let bin = install_fixture(dir, "hyphae-fake.sh", &script).await;
+        let runner = Arc::new(
+            HyphaeRunner::new(bin, home.clone(), Duration::from_secs(4))
+                .with_reap_window(Duration::ZERO),
+        );
+        let store = Arc::new(MemoryPasswordStore::new());
+        let app = router(CommState::ready(
+            runner.clone(),
+            store.clone(),
+            home.clone(),
+        ));
+        (app, runner, store, home)
+    }
+
+    async fn settled_keys(runner: &HyphaeRunner, store: &MemoryPasswordStore) -> Vec<String> {
+        // the lock is released only after the child is reaped AND reconciled
+        let guard = tokio::time::timeout(Duration::from_secs(15), runner.keystore_lock().acquire())
+            .await
+            .expect("the keystore lock must be released once the child is reaped");
+        let keys = store.snapshot_keys().await;
+        drop(guard);
+        keys
+    }
+
+    #[tokio::test]
+    async fn first_identity_create_that_is_still_terminating_ends_with_the_password_promoted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, runner, store, _home) = hanging_first_identity(tmp.path(), true).await;
+        let (status, body) = call(
+            app,
+            "POST",
+            "/identity",
+            Some(json!({"nickname": "first", "default": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+        assert_eq!(body["error"], "still_terminating");
+        let salt_key = Account::from_salt("c2FsdC1mb3ItdGVzdA==")
+            .as_key()
+            .to_owned();
+        assert_eq!(
+            settled_keys(&runner, &store).await,
+            vec![salt_key],
+            "Pending promoted to the salt account"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_identity_create_that_is_still_terminating_without_a_keystore_removes_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, runner, store, _home) = hanging_first_identity(tmp.path(), false).await;
+        let (status, body) = call(
+            app,
+            "POST",
+            "/identity",
+            Some(json!({"nickname": "first", "default": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+        assert_eq!(body["error"], "still_terminating");
+        assert!(
+            settled_keys(&runner, &store).await.is_empty(),
+            "no Pending entry may survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_identity_restore_that_is_still_terminating_is_reconciled_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, runner, store, _home) = hanging_first_identity(tmp.path(), true).await;
+        let file = write_backup(tmp.path());
+        let (status, body) = import_call(app, "first", &file, "backup-pass-1", false).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+        assert_eq!(body["error"], "still_terminating");
+        let salt_key = Account::from_salt("c2FsdC1mb3ItdGVzdA==")
+            .as_key()
+            .to_owned();
+        assert_eq!(settled_keys(&runner, &store).await, vec![salt_key]);
+    }
+
+    #[tokio::test]
+    async fn a_second_export_is_refused_while_the_first_is_still_verifying_and_publishing() {
+        use crate::export::testkit::{encrypt_nip49, npub, sk};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fake = Fake::new(tmp.path());
+        // Hyphae answers at once; the daemon's own scrypt check (log_n 18, ~256 MiB)
+        // then runs for a good while: that is the stage the gate must still cover.
+        fake.export_body = Fake::export_json(&npub(), &encrypt_nip49(&sk(), "backup-pass-1", 18));
+        let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
+        let app = router(state);
+        let first = tmp.path().join("one.ncryptsec");
+        let second = tmp.path().join("two.ncryptsec");
+        let running = tokio::spawn({
+            let (app, first) = (app.clone(), first.clone());
+            async move { export_call(app, "t1", &first, "backup-pass-1").await }
+        });
+        // wait until Hyphae has been asked (so the first export is past its run), then ask again
+        for _ in 0..200 {
+            if !fake.calls().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let (status, body) = export_call(app.clone(), "t1", &second, "backup-pass-1").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+        assert_eq!(body["data"]["reason"], "export_in_progress");
+        assert!(!second.exists());
+        let (status, body) = running.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert!(first.exists());
+    }
+
+    #[tokio::test]
+    async fn a_second_concurrent_export_gets_export_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fake = Fake::new(tmp.path());
+        fake.export_body = format!("sleep 2\n{}", fake.export_body);
+        let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
+        let app = router(state);
+        let first = tmp.path().join("one.ncryptsec");
+        let second = tmp.path().join("two.ncryptsec");
+        let running = tokio::spawn({
+            let (app, first) = (app.clone(), first.clone());
+            async move { export_call(app, "t1", &first, "backup-pass-1").await }
+        });
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let (status, body) = export_call(app.clone(), "t1", &second, "backup-pass-1").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+        assert_eq!(body["data"]["reason"], "export_in_progress");
+        let (status, body) = running.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        let (status, _) = export_call(app, "t1", &second, "backup-pass-1").await;
+        assert_eq!(status, StatusCode::OK, "the gate is released afterwards");
+    }
+
+    #[tokio::test]
+    async fn restore_into_an_existing_keystore_uses_the_documented_argv_and_stdin_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(tmp.path());
+        let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
+        let file = write_backup(tmp.path());
+        let (status, body) = import_call(router(state), "r2", &file, "backup-pass-1", true).await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["data"]["status"], "imported");
+        assert_eq!(body["data"]["nickname"], "r2");
+        assert_eq!(body["data"]["default"], true);
+        let text = body.to_string();
+        assert!(!text.contains("backup-pass-1") && !text.contains("ncryptsec1"));
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let parts: Vec<&str> = calls[0].split('|').collect();
+        assert_eq!(parts[0], "import");
+        assert_eq!(
+            parts[1],
+            "identity import --nickname=r2 --ncryptsec-stdin --default --password-stdin"
+        );
+        // stdin: keystore password (from our keychain), backup password, ncryptsec LAST
+        assert_eq!(parts[2], "test-password");
+        assert_eq!(parts[3], "backup-pass-1");
+        assert_eq!(parts[4], crate::export::testkit::SPEC_NCRYPTSEC);
+    }
+
+    #[tokio::test]
+    async fn restore_as_the_first_identity_generates_and_promotes_a_keychain_password() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(tmp.path());
+        let home = tmp.path().join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        let bin = install_fixture(tmp.path(), "hyphae-fake.sh", &fake.script()).await;
+        let runner = Arc::new(HyphaeRunner::new(bin, home.clone(), Duration::from_secs(5)));
+        let store = Arc::new(MemoryPasswordStore::new());
+        let app = router(CommState::ready(runner, store.clone(), home));
+        let file = write_backup(tmp.path());
+        let (status, body) = import_call(app, "first", &file, "backup-pass-1", false).await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(
+            body["data"]["default"], true,
+            "the first identity is the default"
+        );
+        let parts: Vec<String> = fake.calls()[0].split('|').map(str::to_owned).collect();
+        assert_eq!(parts[2].len(), 43, "a generated keystore password was used");
+        // ... and it was promoted onto the keystore's salt account
+        let promoted = store
+            .get(&Account::from_salt("c2FsdC1mb3ItdGVzdA=="))
+            .await
+            .unwrap();
+        assert_eq!(promoted.as_bytes(), parts[2].as_bytes());
+    }
+
+    #[tokio::test]
+    async fn restore_first_identity_failure_leaves_no_keychain_entry_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fake = Fake::new(tmp.path());
+        // fails before writing a keystore: the fake's keystore.json write is skipped
+        fake.import_body = "rm -f \"$HOME/.hyphae/keystore.json\"\necho '{\"ok\":false,\"error\":\"bad_backup_password\",\"message\":\"x\"}' >&2\nexit 3\n".to_owned();
+        let home = tmp.path().join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        let bin = install_fixture(tmp.path(), "hyphae-fake.sh", &fake.script()).await;
+        let runner = Arc::new(HyphaeRunner::new(bin, home.clone(), Duration::from_secs(5)));
+        let store = Arc::new(MemoryPasswordStore::new());
+        let app = router(CommState::ready(runner, store.clone(), home.clone()));
+        let (status, body) =
+            import_call(app, "first", &write_backup(tmp.path()), "wrong", false).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(body["error"], "bad_backup_password");
+        assert!(!home.join(".hyphae").join("keystore.json").exists());
+        assert!(matches!(
+            store.get(&Account::from_salt("c2FsdC1mb3ItdGVzdA==")).await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn restore_maps_each_hyphae_error_code_by_its_string() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = write_backup(tmp.path());
+        // exit codes are shared (1, 3) on purpose: the string decides
+        for (code, exit, status) in [
+            ("bad_backup_password", 3, StatusCode::BAD_REQUEST),
+            ("invalid_key", 1, StatusCode::BAD_REQUEST),
+            ("nickname_exists", 1, StatusCode::CONFLICT),
+            ("keystore_locked", 3, StatusCode::LOCKED),
+        ] {
+            let fake = Fake::new(tmp.path()).fail_import(code, "hyphae says no", exit);
+            let sub = tempfile::tempdir_in(tmp.path()).unwrap();
+            let state = ready_state_with_identity(sub.path(), &fake.script()).await;
+            let (s, body) = import_call(router(state), "r3", &file, "backup-pass-1", false).await;
+            assert_eq!(s, status, "{code} {body:?}");
+            assert_eq!(body["error"], code);
+        }
+        // Hyphae's release notes: a keystore password changed by another process
+        // answers a plain auth_error on import; it means the same thing to us
+        let fake = Fake::new(tmp.path()).fail_import("auth_error", "failed to unlock keystore", 3);
+        let sub = tempfile::tempdir_in(tmp.path()).unwrap();
+        let state = ready_state_with_identity(sub.path(), &fake.script()).await;
+        let (s, body) = import_call(router(state), "r3", &file, "backup-pass-1", false).await;
+        assert_eq!(
+            (s, body["error"].as_str()),
+            (StatusCode::LOCKED, Some("keystore_locked")),
+            "{body:?}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("another program")
+        );
+        // a code we do not know is NOT mistaken for one we do
+        let fake = Fake::new(tmp.path()).fail_import("user_error", "bad flag", 1);
+        let sub = tempfile::tempdir_in(tmp.path()).unwrap();
+        let state = ready_state_with_identity(sub.path(), &fake.script()).await;
+        let (s, body) = import_call(router(state), "r3", &file, "backup-pass-1", false).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid");
+    }
+
+    #[tokio::test]
+    async fn the_reported_default_flag_comes_from_identity_list_not_from_the_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = write_backup(tmp.path());
+        let fake = Fake::new(tmp.path());
+        let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
+        let app = router(state);
+        // Hyphae made "auto" the default although the request did not ask for it
+        let (s, body) = import_call(app.clone(), "auto", &file, "backup-pass-1", false).await;
+        assert_eq!(s, StatusCode::OK, "{body:?}");
+        assert_eq!(body["data"]["default"], true);
+        // the request asked for the default but Hyphae did not set it
+        let (s, body) = import_call(app, "r1", &file, "backup-pass-1", true).await;
+        assert_eq!(s, StatusCode::OK, "{body:?}");
+        assert_eq!(body["data"]["default"], false);
+    }
+
+    #[tokio::test]
+    async fn invisible_formatting_and_bidi_characters_are_rejected_in_names() {
+        assert!(
+            !is_format_control('a')
+                && !is_format_control('张')
+                && !is_format_control('\u{200C}')
+                && !is_format_control('\u{200D}')
+        );
+        for c in [
+            '\u{202E}', '\u{202A}', '\u{2066}', '\u{2069}', '\u{200B}', '\u{200F}', '\u{FEFF}',
+            '\u{00AD}', '\u{2060}',
+        ] {
+            assert!(is_format_control(c), "{c:?}");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(tmp.path());
+        let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
+        let app = router(state);
+        let file = write_backup(tmp.path());
+        let npub = crate::export::testkit::npub();
+        for name in [
+            "al\u{202E}ice",
+            "al\u{2066}ice",
+            "al\u{200B}ice",
+            "\u{FEFF}alice",
+        ] {
+            for (uri, body) in [
+                ("/identity", json!({"nickname": name})),
+                ("/identity/default", json!({"nickname": name})),
+                ("/contact", json!({"nickname": name, "npub": npub})),
+                (
+                    "/identity/import",
+                    json!({"nickname": name, "path": file, "backup_password": "x"}),
+                ),
+                (
+                    "/identity/export",
+                    json!({"nickname": name, "path": "/tmp/x", "backup_password": "backup-pass-1"}),
+                ),
+            ] {
+                let (s, b) = call(app.clone(), "POST", uri, Some(body)).await;
+                assert_eq!(s, StatusCode::BAD_REQUEST, "{uri} {name:?} {b:?}");
+            }
+        }
+        // joiners used by real scripts are fine (this one reaches the fake, which refuses it)
+        let (s, _) = call(
+            app,
+            "POST",
+            "/identity/default",
+            Some(json!({"nickname": "می\u{200C}خواهم"})),
+        )
+        .await;
+        assert_ne!(s, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn restoring_a_key_that_is_already_stored_is_already_present_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = write_backup(tmp.path());
+        let npub = crate::export::testkit::npub();
+        let fake = Fake::new(tmp.path()).fail_import(
+            "npub_exists",
+            "this key is already stored as identity 'r1'",
+            1,
+        );
+        let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
+        let (s, body) = import_call(router(state), "again", &file, "backup-pass-1", false).await;
+        assert_eq!(s, StatusCode::OK, "{body:?}");
+        assert_eq!(body["data"]["status"], "already_present");
+        assert_eq!(body["data"]["nickname"], "r1");
+        assert_eq!(body["data"]["npub"], npub.as_str());
+        // a named identity that `identity list` does not confirm is not echoed
+        let sub = tempfile::tempdir_in(tmp.path()).unwrap();
+        let fake = Fake::new(sub.path()).fail_import(
+            "npub_exists",
+            "this key is already stored as identity 'ghost'",
+            1,
+        );
+        let state = ready_state_with_identity(sub.path(), &fake.script()).await;
+        let (s, body) = import_call(router(state), "again", &file, "backup-pass-1", false).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(body["data"]["status"], "already_present");
+        assert!(
+            body["data"]["nickname"].is_null() && body["data"]["npub"].is_null(),
+            "{body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_bad_files_and_passwords_before_running_hyphae() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(tmp.path());
+        let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
+        let app = router(state);
+        let good = write_backup(tmp.path());
+        let plain = tmp.path().join("plain.txt");
+        std::fs::write(&plain, "hello\n").unwrap();
+        let link = tmp.path().join("link.ncryptsec");
+        std::os::unix::fs::symlink(&good, &link).unwrap();
+        let big = tmp.path().join("big.ncryptsec");
+        std::fs::write(&big, format!("ncryptsec1{}", "q".repeat(5000))).unwrap();
+        for (path, expect) in [
+            (&plain, "invalid_key"),
+            (&link, "invalid"),
+            (&big, "invalid"),
+            (&tmp.path().join("missing.ncryptsec"), "not_found"),
+        ] {
+            let (s, b) = import_call(app.clone(), "r4", path, "backup-pass-1", false).await;
+            assert!(s.is_client_error(), "{path:?} {b:?}");
+            assert_eq!(b["error"], expect, "{path:?}");
+        }
+        for bad in ["", "two\nlines", "cr\rhere", "nul\u{0}here"] {
+            let (s, b) = import_call(app.clone(), "r4", &good, bad, false).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad:?} {b:?}");
+        }
+        let (s, _) = import_call(app, "r4", Path::new("relative"), "x", false).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(fake.calls().is_empty());
     }
 
     // ---- unconfigured / binary_rejected: every route, no binary touched --

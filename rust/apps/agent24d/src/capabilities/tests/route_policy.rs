@@ -170,6 +170,21 @@ fn section_3_rows_match_operation_and_level() {
         });
     }
 
+    // Private-key backup extends the frozen table (elevated comm write).
+    fixed.push(DesignRow {
+        method: "POST".into(),
+        path: "/comm/identity/export".into(),
+        operation: "CommWrite".into(),
+        level: AssuranceLevel::Elevated,
+    });
+
+    fixed.push(DesignRow {
+        method: "POST".into(),
+        path: "/comm/identity/import".into(),
+        operation: "CommWrite".into(),
+        level: AssuranceLevel::Elevated,
+    });
+
     fixed.push(DesignRow {
         method: "POST".into(),
         path: "/comm/install".into(),

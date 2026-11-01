@@ -770,9 +770,11 @@ async fn try_start(
     cmd.stdout(stdout);
     cmd.stderr(stderr);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| DaemonStartError::Failed(e.to_string()))?;
+    let mut child = {
+        let _gate = crate::runner::lock_spawn_gate();
+        cmd.spawn()
+            .map_err(|e| DaemonStartError::Failed(e.to_string()))?
+    };
     let pid = child
         .id()
         .ok_or_else(|| DaemonStartError::Failed("spawned child has no pid".to_owned()))?;
