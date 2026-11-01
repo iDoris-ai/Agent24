@@ -133,7 +133,11 @@ export async function packOpenDesignComponent({
       '-czf', tempAssetPath,
       '-C', stageDir,
       'app', 'open-design', 'open-design-web-standalone',
-    ])
+    ], {
+      // macOS bsdtar otherwise stores xattrs as AppleDouble `._*` members, which
+      // would pollute the component tree (and fail the unknown-file contract).
+      env: { ...process.env, COPYFILE_DISABLE: '1' },
+    })
 
     const sha256 = await sha256File(tempAssetPath)
     const size = fs.statSync(tempAssetPath).size

@@ -6,6 +6,8 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 
+import { checkOpenDesignSource, writeOpenDesignSourceStamp } from './open-design-mac-release.mjs'
+
 const execFileAsync = promisify(execFile)
 
 export const OPEN_DESIGN_SHA = '34bc2ba810cf894daff6a7c1736d1cef6c7726b1'
@@ -76,6 +78,41 @@ function isWithin(parent, child) {
   return relative.length === 0 || (!relative.startsWith('..') && !path.isAbsolute(relative))
 }
 
+/** Parents of a hoist link, from `webNodeModules` down through each scope
+ * directory. Existing ones must realpath inside the standalone root. A
+ * symlink whose own target resolves outside is rejected even before mkdir. */
+async function assertHoistWriteInside(standaloneRoot, webNodeModules, linkPath) {
+  const parent = path.dirname(linkPath)
+  const relative = path.relative(webNodeModules, parent)
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error(`hoist refuses to write ${linkPath}: it is outside apps/web/node_modules`)
+  }
+  const dirs = [webNodeModules]
+  if (relative && relative !== '.') {
+    let cursor = webNodeModules
+    for (const part of relative.split(path.sep)) {
+      cursor = path.join(cursor, part)
+      dirs.push(cursor)
+    }
+  }
+  for (const dir of dirs) {
+    const st = await fsp.lstat(dir).catch(() => null)
+    if (st == null) continue
+    if (st.isSymbolicLink()) {
+      const text = await fsp.readlink(dir)
+      const direct = path.resolve(path.dirname(dir), text)
+      const directReal = await fsp.realpath(direct).catch(() => null)
+      if (directReal == null || !isWithin(standaloneRoot, directReal)) {
+        throw new Error(`hoist refuses to write through symlink ${dir}: it points outside the standalone root (${directReal ?? direct})`)
+      }
+    }
+    const real = await fsp.realpath(dir).catch(() => null)
+    if (real == null || !isWithin(standaloneRoot, real)) {
+      throw new Error(`hoist refuses to write through ${dir}: realpath is outside the standalone root (${real ?? dir})`)
+    }
+  }
+}
+
 async function rewriteStandaloneSymlinks({ destinationRoot, destinationWebRoot, sourceRoot, sourceWebRoot }) {
   const mappings = [
     [path.join(destinationWebRoot, 'node_modules'), path.join(sourceWebRoot, 'node_modules')],
@@ -132,6 +169,151 @@ async function pruneBrokenSymlinks(current) {
   }
 }
 
+/**
+ * Makes the pnpm-layout Next standalone tree resolvable WITHOUT realpath.
+ *
+ * `next build` (standalone) on a pnpm workspace emits `apps/web/node_modules/next`
+ * as a symlink into `node_modules/.pnpm/<id>/node_modules/next`, whose own
+ * dependencies (`@swc/helpers`, `styled-jsx`, `react`, ...) are SIBLINGS of that
+ * real directory. That only resolves if the module loader realpath()s the
+ * symlink first. Inside Open Design's web sidecar (Electron-as-Node, in-process
+ * `import()` of server.js) the loader keeps the symlinked path, so
+ * `require('@swc/helpers/_/...')` from next/dist/... walks
+ * `<webRoot>/node_modules` and fails with MODULE_NOT_FOUND (the Design page
+ * then reports a daemon that "exited before reporting status").
+ *
+ * Fix: also expose the transitive closure of those siblings under
+ * `<webRoot>/node_modules` (what `shamefully-hoist` would do), as relative
+ * symlinks that point straight at real directories.
+ *
+ * Darwin only (`options.platform`, default `process.platform`). Linux keeps
+ * the pre-hoist layout: its loader realpaths symlinks, and running this
+ * there would change which copy of a duplicated package wins.
+ *
+ * The same package name with two different realpaths fails the build and
+ * prints every conflicting path. Exception: if `apps/web/package.json`
+ * directly depends on that name and `apps/web/node_modules` already links
+ * one realpath, that direct dependency is the one that is kept, and the
+ * choice is printed. Every new link target's realpath must stay inside
+ * `standaloneRoot`. So must the path we write: `apps/web/node_modules` and
+ * every scope parent (`@scope`) have to realpath inside the tree, and must
+ * not be a symlink that points outside — `mkdir` / `symlink` would follow
+ * that link and create the package outside the standalone root.
+ */
+export async function hoistStandalonePnpmDependencies(standaloneRoot, webRoot = path.join(standaloneRoot, 'apps', 'web'), options = {}) {
+  const platform = options.platform ?? process.platform
+  if (platform !== 'darwin') return 0
+  const log = options.log ?? ((line) => process.stderr.write(`${line}\n`))
+  // Work on realpaths throughout: the relative links written below are computed
+  // against realpath'd targets, so a symlinked prefix (macOS /var -> /private/var)
+  // would otherwise yield links that climb out of the tree.
+  if (!fs.existsSync(webRoot)) return 0
+  standaloneRoot = await fsp.realpath(standaloneRoot)
+  webRoot = await fsp.realpath(webRoot)
+  const webNodeModules = path.join(webRoot, 'node_modules')
+  const pnpmRoot = path.join(standaloneRoot, 'node_modules', '.pnpm')
+  if (!fs.existsSync(webNodeModules) || !fs.existsSync(pnpmRoot)) return 0
+
+  const packageRealDir = async (entryPath) => fsp.realpath(entryPath).catch(() => null)
+  const listPackages = async (nodeModulesDir) => {
+    const found = []
+    for (const entry of await fsp.readdir(nodeModulesDir, { withFileTypes: true })) {
+      if (entry.name === '.bin' || entry.name === '.pnpm') continue
+      const full = path.join(nodeModulesDir, entry.name)
+      if (entry.name.startsWith('@')) {
+        for (const scoped of await fsp.readdir(full, { withFileTypes: true })) {
+          found.push({ name: `${entry.name}/${scoped.name}`, full: path.join(full, scoped.name) })
+        }
+      } else {
+        found.push({ name: entry.name, full })
+      }
+    }
+    return found
+  }
+
+  const pnpmReal = await fsp.realpath(pnpmRoot)
+  const directNames = await readWebDirectDependencyNames(webRoot)
+  const initial = await listPackages(webNodeModules)
+  const chosen = new Map()
+  const directChosen = new Map()
+  for (const pkg of initial) {
+    const real = await packageRealDir(pkg.full)
+    if (real == null) continue
+    chosen.set(pkg.name, real)
+    if (directNames.has(pkg.name)) directChosen.set(pkg.name, real)
+  }
+  const queue = initial.map((pkg) => pkg.full)
+  const conflicts = new Map()
+  let added = 0
+  while (queue.length > 0) {
+    const real = await packageRealDir(queue.pop())
+    if (real == null || !isWithin(pnpmReal, real)) continue
+    // <pnpm>/<id>/node_modules/<name | @scope/name>: the siblings live next to it.
+    const containing = real.split(path.sep).lastIndexOf('node_modules')
+    if (containing < 0) continue
+    const siblingsDir = real.split(path.sep).slice(0, containing + 1).join(path.sep)
+    for (const sibling of await listPackages(siblingsDir)) {
+      const target = await packageRealDir(sibling.full)
+      if (target == null) continue
+      if (!isWithin(standaloneRoot, target)) {
+        throw new Error(`hoist refuses ${sibling.name}: link target realpath is outside the standalone root (${target})`)
+      }
+      const existing = chosen.get(sibling.name)
+      if (existing == null) {
+        const linkPath = path.join(webNodeModules, ...sibling.name.split('/'))
+        await assertHoistWriteInside(standaloneRoot, webNodeModules, linkPath)
+        chosen.set(sibling.name, target)
+        await fsp.mkdir(path.dirname(linkPath), { recursive: true })
+        await fsp.symlink(path.relative(path.dirname(linkPath), target), linkPath)
+        queue.push(linkPath)
+        added += 1
+        continue
+      }
+      if (existing === target) continue
+      if (directChosen.has(sibling.name)) {
+        log(`hoist: apps/web direct dependency selects ${sibling.name} (${await describeHoistedPackage(directChosen.get(sibling.name))}); skipping ${await describeHoistedPackage(target)}`)
+        continue
+      }
+      if (!conflicts.has(sibling.name)) conflicts.set(sibling.name, new Set([existing]))
+      conflicts.get(sibling.name).add(target)
+    }
+  }
+  if (conflicts.size > 0) {
+    const lines = []
+    for (const [name, paths] of conflicts) {
+      lines.push(`  ${name}:`)
+      for (const item of paths) lines.push(`    - ${await describeHoistedPackage(item)}`)
+    }
+    const message = `hoist conflict: same package name, different realpaths, and apps/web has no direct dependency to choose:\n${lines.join('\n')}`
+    log(message)
+    throw new Error(message)
+  }
+  return added
+}
+
+async function readWebDirectDependencyNames(webRoot) {
+  let pkg
+  try {
+    pkg = JSON.parse(await fsp.readFile(path.join(webRoot, 'package.json'), 'utf8'))
+  } catch {
+    return new Set()
+  }
+  return new Set([
+    ...Object.keys(pkg.dependencies ?? {}),
+    ...Object.keys(pkg.optionalDependencies ?? {}),
+    ...Object.keys(pkg.peerDependencies ?? {}),
+  ])
+}
+
+async function describeHoistedPackage(dir) {
+  try {
+    const pkg = JSON.parse(await fsp.readFile(path.join(dir, 'package.json'), 'utf8'))
+    return pkg.version ? `${pkg.version} ${dir}` : dir
+  } catch {
+    return dir
+  }
+}
+
 async function buildStandaloneWorkspace(openDesignRoot) {
   const env = { OD_WEB_OUTPUT_MODE: 'standalone' }
   await runPnpm(openDesignRoot, [
@@ -146,7 +328,10 @@ async function buildReviewedPrebundles(openDesignRoot, resourcesRoot) {
   const { banner, policies, target } = await loadReviewedPrebundleContract(openDesignRoot)
   const prebundledRoot = path.join(resourcesRoot, 'app', 'prebundled')
   const daemonRoot = path.join(prebundledRoot, 'daemon')
-  const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'agent24-od-prebundle-'))
+  // realpath: on macOS os.tmpdir() is /var/folders/... but /var is a symlink to
+  // /private/var, so a relative import computed from the unresolved path
+  // climbs the wrong number of levels once esbuild resolves it physically.
+  const tempRoot = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), 'agent24-od-prebundle-')))
   const webMeta = path.join(tempRoot, 'web-sidecar.meta.json')
   const daemonMeta = path.join(tempRoot, 'daemon.meta.json')
 
@@ -190,6 +375,10 @@ async function buildReviewedPrebundles(openDesignRoot, resourcesRoot) {
       '--bundle', '--splitting', '--platform=node', '--format=esm', `--target=${target}`,
       `--banner:js=${banner}`,
       ...policies.daemonSidecar.externals.map((dependency) => `--external:${dependency}`),
+      // macOS only: chokidar's optional `fsevents` is installed on darwin (not on
+      // Linux) and is a native .node esbuild cannot bundle. chokidar loads it in
+      // try/catch and falls back to fs.watch, so keep it external.
+      ...(process.platform === 'darwin' ? ['--external:fsevents'] : []),
       `--outdir=${daemonRoot}`, '--entry-names=[name]', '--chunk-names=chunks/[name]-[hash]',
       '--out-extension:.js=.mjs', `--metafile=${daemonMeta}`,
     ])
@@ -217,6 +406,7 @@ async function copyStandaloneWeb(openDesignRoot, resourcesRoot) {
   await fsp.cp(sourceRoot, destinationRoot, { recursive: true, verbatimSymlinks: true })
   await rewriteStandaloneSymlinks({ destinationRoot, destinationWebRoot, sourceRoot, sourceWebRoot })
   await pruneBrokenSymlinks(destinationRoot)
+  await hoistStandalonePnpmDependencies(destinationRoot, destinationWebRoot)
 
   const staticRoot = path.join(openDesignRoot, 'apps', 'web', '.next', 'static')
   const publicRoot = path.join(openDesignRoot, 'apps', 'web', 'public')
@@ -235,13 +425,18 @@ async function copyStandaloneWeb(openDesignRoot, resourcesRoot) {
 }
 
 export async function prepareOpenDesignLinuxResources(openDesignPath, linuxResourcesPath) {
-  if (process.platform !== 'linux') throw new Error('Open Design Linux resources must be prepared on Linux')
+  // The assembly below is platform-neutral (esbuild prebundles + Next standalone
+  // copy); the only platform-specific part is the tools-pack Resources base it
+  // is layered on. macOS release builds (release-mac.sh) reuse it unchanged
+  // on top of `tools-pack mac build --to app --portable` Resources.
+  if (process.platform !== 'linux' && process.platform !== 'darwin') {
+    throw new Error('Open Design resources must be prepared on Linux or macOS')
+  }
   const openDesignRoot = requireAbsolutePath(openDesignPath, 'Open Design checkout')
   const resourcesRoot = requireAbsolutePath(linuxResourcesPath, 'Open Design Linux Resources')
-  const actualSha = await run('git', ['rev-parse', 'HEAD'], { cwd: openDesignRoot })
-  if (actualSha !== OPEN_DESIGN_SHA) {
-    throw new Error(`Open Design checkout must be exact ${OPEN_DESIGN_SHA}; found ${actualSha}`)
-  }
+  // Same check release-mac.sh and rebuild-open-design-native call: porcelain
+  // empty and HEAD equal to the pin, before the build and before the stamp.
+  const actualSha = checkOpenDesignSource(openDesignRoot)
 
   const packaged = JSON.parse(await fsp.readFile(path.join(openDesignRoot, 'apps', 'packaged', 'package.json'), 'utf8'))
   if (packaged.version !== OPEN_DESIGN_PIN_VERSION) {
@@ -263,6 +458,7 @@ export async function prepareOpenDesignLinuxResources(openDesignPath, linuxResou
   await buildStandaloneWorkspace(openDesignRoot)
   await buildReviewedPrebundles(openDesignRoot, resourcesRoot)
   await copyStandaloneWeb(openDesignRoot, resourcesRoot)
+  await writeOpenDesignSourceStamp(resourcesRoot, { sha: actualSha, version: packaged.version })
   return resourcesRoot
 }
 

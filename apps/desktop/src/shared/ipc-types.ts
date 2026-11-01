@@ -165,6 +165,8 @@ export interface OpenDesignComponentStatusResult {
   /** SD-01: estimated seconds remaining; `null` while the rate is unknown
    * or zero. */
   etaSeconds?: number | null
+  /** Present when the main process rewrote the download onto a loopback test origin. */
+  overrideActive?: boolean
 }
 
 export interface OmlxDetectResult {

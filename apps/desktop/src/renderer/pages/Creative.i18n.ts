@@ -22,6 +22,7 @@ export const creativeMessages = defineMessages({
     'error.start': 'Could not start iDoris Design',
     'error.unavailable': 'iDoris Design is unavailable: {error}',
     'action.starting': 'Starting iDoris Design…',
+    'download.localOverride': 'Using a local test source',
   },
   zh: {
     'download.progress': '正在下载 iDoris Design 组件…',
@@ -44,6 +45,7 @@ export const creativeMessages = defineMessages({
     'error.start': 'iDoris Design 启动失败',
     'error.unavailable': 'iDoris Design 暂不可用：{error}',
     'action.starting': '正在启动 iDoris Design…',
+    'download.localOverride': '使用本地测试源',
   },
   th: {
     'download.progress': 'กำลังดาวน์โหลดคอมโพเนนต์ iDoris Design…',
@@ -66,5 +68,6 @@ export const creativeMessages = defineMessages({
     'error.start': 'เริ่ม iDoris Design ไม่สำเร็จ',
     'error.unavailable': 'iDoris Design ใช้งานไม่ได้: {error}',
     'action.starting': 'กำลังเริ่ม iDoris Design…',
+    'download.localOverride': 'ใช้แหล่งทดสอบในเครื่อง',
   },
 })
