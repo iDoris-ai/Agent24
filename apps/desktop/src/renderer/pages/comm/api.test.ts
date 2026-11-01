@@ -52,7 +52,7 @@ afterEach(() => {
 describe('COMM typed backend API', () => {
   it('installs through the dedicated elevated IPC instead of the generic proxy', async () => {
     const proxy = setProxy(() => { throw new Error('generic proxy must not install executables') })
-    const result = { installed_version: 'v0.27.2', path: '/state/components/hyphae/v0.27.2/hyphae', restart_required: false, reason: null }
+    const result = { installed_version: 'v0.28.0', path: '/state/components/hyphae/v0.28.0/hyphae', restart_required: false, reason: null }
     window.agent24 = { ...window.agent24, commInstall: vi.fn(async () => successful(result)) }
     expect(await installComm()).toEqual(result)
     expect(window.agent24.commInstall).toHaveBeenCalledOnce()

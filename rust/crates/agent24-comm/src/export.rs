@@ -1,38 +1,48 @@
 //! Private-key backup and restore on top of Hyphae's non-interactive
-//! `identity export --password-stdin --format ncryptsec --out` and
+//! `identity export --password-stdin --format ncryptsec` and
 //! `identity import --password-stdin --ncryptsec-stdin` (Hyphae >= v0.28.0).
 //!
-//! Hyphae does the cryptography (NIP-49: scrypt + XChaCha20-Poly1305) and the
-//! exclusive 0600 file creation. This module adds what only the daemon can:
+//! Hyphae does the encrypting (NIP-49: scrypt + XChaCha20-Poly1305) and, on
+//! restore, the decrypting. This module adds what only the daemon can:
 //!
-//! - **Staging, then publish.** Hyphae is told to write a random staging name
-//!   in the destination directory; the daemon then re-opens that file *through
-//!   the directory descriptor it pinned before the export* (so replacing a path
-//!   component in between cannot redirect the check), verifies it, and
-//!   publishes it under the final name with `linkat` (which fails rather than
-//!   replace anything) before removing the staging name. A partial or foreign
-//!   file is therefore never visible under the final name, an existing target
-//!   is never touched, and a failure is cleaned up or reported by path. Letting
-//!   Hyphae write the final name directly would be one step simpler but would
-//!   give up all three guarantees.
+//! - **The daemon, not Hyphae, writes the file.** Export is run WITHOUT
+//!   `--out`, so Hyphae returns `{nickname, npub, ncryptsec}` on stdout: that
+//!   is ciphertext, the plaintext key never enters this process. The daemon
+//!   validates it strictly (bech32 checksum, HRP, payload length, version,
+//!   log_n), proves it opens with the user's backup password and yields the
+//!   identity's npub (so a backup that would not restore is never written),
+//!   and only then creates the file itself, relative to a directory descriptor
+//!   pinned *before* the export: `openat(O_CREAT|O_EXCL|O_NOFOLLOW, 0600)` to a
+//!   random staging name, write, `fsync`, `linkat` to the final name (which
+//!   fails rather than replace anything), unlink the staging name, `fsync` the
+//!   directory. There is no window between "check" and "use" in which a path
+//!   component or the file itself could be swapped: nothing is checked after
+//!   the fact, the daemon creates what it writes.
 //! - The "destination is outside the Hyphae home" check, decided from the
 //!   directory descriptor's identity rather than a path string.
-//! - A capability probe: older Hyphae (v0.27.x) has neither flag set, and the
-//!   answer is a clear `hyphae_too_old` instead of a confusing usage error.
+//! - A capability probe: older Hyphae (v0.27.x) lacks the flags, and the answer
+//!   is a clear `hyphae_too_old` instead of a confusing usage error.
 //!
-//! The file only ever holds ciphertext; the plaintext key never reaches this
-//! process.
+//! Known Hyphae behaviours this relies on or works around: a backup made with
+//! an EMPTY password cannot be imported (our >= 8 character rule prevents it),
+//! and an unencrypted keystore would make Hyphae read the first stdin line as
+//! the backup password (the in-daemon round-trip check catches that: the
+//! result would not open with the user's password).
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use axum::http::StatusCode;
+use bech32::{Bech32, Hrp};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde_json::{Value, json};
+use unicode_normalization::UnicodeNormalization;
 use zeroize::Zeroizing;
 
 use crate::error::{CommError, map_envelope_failure, map_runner_error};
@@ -44,6 +54,13 @@ pub(crate) const BACKUP_PASSWORD_MAX_BYTES: usize = 1024;
 /// A NIP-49 string is ~163 bytes; anything near this is not a backup.
 pub(crate) const BACKUP_FILE_MAX_BYTES: u64 = 4096;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+/// `{nickname, npub, ncryptsec}` is ~250 bytes. This is the hard size of the
+/// preallocated stdout/stderr buffers, which therefore never reallocate.
+const EXPORT_OUTPUT_CAP: usize = 8 * 1024;
+/// NIP-49: version 0x02, log_n <= 19 (scrypt r = 8: 2^19 is ~512 MiB).
+const NIP49_MAX_LOG_N: u8 = 19;
+const NIP49_PAYLOAD_LEN: usize = 91;
+const NCRYPTSEC_MAX_LEN: usize = 200;
 const NCRYPTSEC_PREFIX: &str = "ncryptsec1";
 
 fn upstream(msg: &str) -> CommError {
@@ -134,6 +151,91 @@ pub(crate) fn stdin_lines(lines: &[&[u8]]) -> Result<Password, CommError> {
     }
     // `Password::new` takes ownership of a Vec; hand it a copy-free move.
     Password::new(std::mem::take(&mut *buf)).map_err(|e| CommError::Invalid(e.to_string()))
+}
+
+// ---------------------------------------------------------------------
+// NIP-49 (decrypt + validate only: Hyphae encrypts)
+// ---------------------------------------------------------------------
+
+pub(crate) type SecretKey = Zeroizing<[u8; 32]>;
+
+/// Strict structural check of an `ncryptsec1…` string: lowercase bech32 with a
+/// valid checksum and HRP `ncryptsec`, a 91-byte payload, version 0x02,
+/// log_n <= 19 and a key-security byte of 0, 1 or 2. Returns the payload.
+/// (Ciphertext, not a secret.)
+pub(crate) fn validate_ncryptsec(text: &str) -> Result<Vec<u8>, CommError> {
+    let bad = || upstream("the backup Hyphae returned is not a valid ncryptsec");
+    if text.len() > NCRYPTSEC_MAX_LEN
+        || !text.starts_with(NCRYPTSEC_PREFIX)
+        || !text
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    {
+        return Err(bad());
+    }
+    let (hrp, data) = bech32::decode(text).map_err(|_| bad())?;
+    if hrp.as_str() != "ncryptsec"
+        || data.len() != NIP49_PAYLOAD_LEN
+        || data[0] != 0x02
+        || data[1] > NIP49_MAX_LOG_N
+        || data[42] > 2
+    {
+        return Err(bad());
+    }
+    Ok(data)
+}
+
+/// NFKC can lengthen text ("Ⅷ" is 3 bytes, "VIII" is 4), so the output size is
+/// computed first and allocated exactly: the buffer never grows while it holds
+/// the password, which would leave an unzeroed copy in the old allocation.
+fn nfkc(password: &str) -> Zeroizing<String> {
+    let needed: usize = password.nfkc().map(char::len_utf8).sum();
+    let mut out = Zeroizing::new(String::with_capacity(needed));
+    out.extend(password.nfkc());
+    out
+}
+
+/// NIP-49 decrypt. `Err(None)`-style failures are all "does not open": a wrong
+/// password and a damaged string are indistinguishable by design. The AEAD tag
+/// comparison is constant-time (chacha20poly1305 / poly1305 crates).
+pub(crate) fn decrypt_nip49(ncryptsec: &str, password: &str) -> Result<SecretKey, CommError> {
+    let data = validate_ncryptsec(ncryptsec)?;
+    let no_open = || upstream("the backup does not open with the backup password");
+    let params = scrypt::Params::new(data[1], 8, 1).map_err(|_| no_open())?;
+    let mut key: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
+    scrypt::scrypt(
+        nfkc(password).as_bytes(),
+        &data[2..18],
+        &params,
+        &mut key[..],
+    )
+    .map_err(|_| no_open())?;
+    let plain = Zeroizing::new(
+        XChaCha20Poly1305::new((&*key).into())
+            .decrypt(
+                XNonce::from_slice(&data[18..42]),
+                Payload {
+                    msg: &data[43..],
+                    aad: &data[42..43],
+                },
+            )
+            .map_err(|_| no_open())?,
+    );
+    let mut out: SecretKey = Zeroizing::new([0u8; 32]);
+    if plain.len() != 32 {
+        return Err(no_open());
+    }
+    out.copy_from_slice(&plain);
+    Ok(out)
+}
+
+/// The `npub1…` of a secret key (the derivation is erased afterwards).
+pub(crate) fn npub_of_secret(secret: &[u8; 32]) -> Option<String> {
+    let secp = secp256k1::Secp256k1::new();
+    let mut pair = secp256k1::Keypair::from_seckey_slice(&secp, secret).ok()?;
+    let pk = pair.x_only_public_key().0.serialize();
+    pair.non_secure_erase();
+    bech32::encode::<Bech32>(Hrp::parse("npub").ok()?, &pk).ok()
 }
 
 // ---------------------------------------------------------------------
@@ -234,7 +336,7 @@ fn open_destination(dest: &Path, hyphae_home: &Path) -> Result<Destination, Comm
 }
 
 /// A destination whose parent is pinned and whose final name is known to be
-/// free, plus the random staging name Hyphae will be told to create.
+/// free, plus the random staging name the daemon will create.
 pub(crate) struct Staged {
     dest: Destination,
     staging_name: OsString,
@@ -244,6 +346,7 @@ pub(crate) struct Staged {
 #[derive(Default, Clone, Copy)]
 pub(crate) struct Faults {
     pub fail_cleanup: bool,
+    pub fail_write: bool,
 }
 
 impl Staged {
@@ -276,8 +379,7 @@ impl Staged {
         })
     }
 
-    /// Where Hyphae must create the file (`--out`).
-    pub(crate) fn staging_path(&self) -> PathBuf {
+    fn staging_path(&self) -> PathBuf {
         self.dest.parent_path.join(&self.staging_name)
     }
 
@@ -293,8 +395,14 @@ impl Staged {
 
     /// Give up: remove whatever sits at the staging name. If that cannot be
     /// done, say a partial encrypted file may remain, and where.
-    pub(crate) fn abandon(&self, why: &str) -> CommError {
-        if self.unlink_staging() || !self.staging_exists() {
+    fn abandon(&self, why: &str) -> CommError {
+        let gone = rustix::fs::statat(
+            &self.dest.parent,
+            self.staging_name.as_os_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .is_err();
+        if gone || self.unlink_staging() {
             upstream(why)
         } else {
             CommError::Upstream(format!(
@@ -304,53 +412,38 @@ impl Staged {
         }
     }
 
-    fn staging_exists(&self) -> bool {
-        rustix::fs::statat(
-            &self.dest.parent,
-            self.staging_name.as_os_str(),
-            AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .is_ok()
-    }
-
-    /// Re-open the staging file THROUGH the pinned directory (never by path)
-    /// and check it is what we asked for: a regular, private, single-link file
-    /// owned by us holding one `ncryptsec1…` line.
-    fn verify(&self) -> Result<(), &'static str> {
-        let bad = || "the backup file Hyphae wrote is not what was expected";
+    /// Create the staging file (`O_EXCL|O_NOFOLLOW`, 0600, our inode), write
+    /// `text` + newline, fsync, publish under the final name with `linkat`
+    /// (never replacing anything), remove the staging name and fsync the
+    /// directory.
+    pub(crate) fn write_and_publish(self, text: &str) -> Result<(), CommError> {
         let fd = rustix::fs::openat(
             &self.dest.parent,
             self.staging_name.as_os_str(),
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
         )
-        .map_err(|_| "the backup file did not appear in the chosen folder")?;
-        let st = rustix::fs::fstat(&fd).map_err(|_| bad())?;
-        if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile
-            || st.st_uid != rustix::process::geteuid().as_raw()
-            || st.st_nlink != 1
-            || (st.st_mode & 0o777) != 0o600
-            || st.st_size <= 0
-            || st.st_size as u64 > BACKUP_FILE_MAX_BYTES
-        {
-            return Err(bad());
+        .map_err(|_| CommError::Invalid("cannot create the destination file".to_owned()))?;
+        // Belt and braces against a hostile umask or filesystem: it is our
+        // inode, so tighten it before a single byte is written.
+        let ok = rustix::fs::fchmod(&fd, Mode::RUSR | Mode::WUSR).is_ok()
+            && rustix::fs::fstat(&fd).is_ok_and(|st| {
+                st.st_uid == rustix::process::geteuid().as_raw() && st.st_nlink == 1
+            });
+        if !ok {
+            return Err(self.abandon("the new backup file is not private to this user"));
         }
-        let mut text = String::new();
-        File::from(fd)
-            .take(BACKUP_FILE_MAX_BYTES)
-            .read_to_string(&mut text)
-            .map_err(|_| bad())?;
-        let line = text.strip_suffix('\n').ok_or_else(bad)?;
-        if !line.starts_with(NCRYPTSEC_PREFIX) || line.contains(char::is_whitespace) {
-            return Err(bad());
-        }
-        Ok(())
-    }
-
-    /// Verify, then publish under the final name without overwriting anything.
-    pub(crate) fn publish(self) -> Result<(), CommError> {
-        if let Err(why) = self.verify() {
-            return Err(self.abandon(why));
+        let mut file = File::from(fd);
+        let written = if self.faults.fail_write {
+            Err(std::io::Error::other("injected write failure"))
+        } else {
+            file.write_all(text.as_bytes())
+                .and_then(|()| file.write_all(b"\n"))
+                .and_then(|()| file.sync_all())
+        };
+        drop(file);
+        if written.is_err() {
+            return Err(self.abandon("writing the backup file failed"));
         }
         match rustix::fs::linkat(
             &self.dest.parent,
@@ -375,6 +468,10 @@ impl Staged {
                 "backup published but its staging link could not be removed"
             );
         }
+        // Make the new directory entry durable too.
+        if rustix::fs::fsync(&self.dest.parent).is_err() {
+            tracing::warn!("backup published but the directory could not be synced");
+        }
         Ok(())
     }
 }
@@ -383,9 +480,11 @@ impl Staged {
 // export
 // ---------------------------------------------------------------------
 
-/// `hyphae identity export --nickname=N --format ncryptsec --out <staging>
-/// --password-stdin` with stdin `keystore-password\nbackup-password\n`, then
-/// verify and publish the staged file to `dest`.
+/// `hyphae identity export --nickname=N --format ncryptsec --password-stdin`
+/// with stdin `keystore-password\nbackup-password\n` (no `--out`: the
+/// ciphertext comes back on stdout). The daemon validates it, proves it opens
+/// with `backup_password` and yields `expected_npub`, and only then writes it
+/// to `staged`.
 pub(crate) async fn export_identity_backup(
     runner: &HyphaeRunner,
     keystore_password: Password,
@@ -397,61 +496,71 @@ pub(crate) async fn export_identity_backup(
     check_line_safe(&keystore_password)?;
     let stdin = stdin_lines(&[keystore_password.as_bytes(), backup_password.as_bytes()])?;
     drop(keystore_password);
-    let out = staged.staging_path();
     let argv: Vec<OsString> = vec![
         "identity".into(),
         "export".into(),
         format!("--nickname={nickname}").into(),
         "--format".into(),
         "ncryptsec".into(),
-        "--out".into(),
-        out.clone().into_os_string(),
     ];
     let result = runner
-        .run(Invocation {
-            args: argv,
-            password: Some(stdin),
-            timeout: Some(OPERATION_TIMEOUT),
-        })
+        .run_capped(
+            Invocation {
+                args: argv,
+                password: Some(stdin),
+                timeout: Some(OPERATION_TIMEOUT),
+            },
+            EXPORT_OUTPUT_CAP,
+            true,
+        )
         .await;
-    match result {
-        Ok(Envelope::Ok { data }) => {
-            let reported_ok = data.get("npub").and_then(Value::as_str) == Some(expected_npub)
-                && data.get("format").and_then(Value::as_str) == Some("ncryptsec")
-                && data.get("out").and_then(Value::as_str) == out.to_str();
-            if !reported_ok {
-                return Err(staged.abandon("Hyphae reported an unexpected export result"));
-            }
-            staged.publish()
-        }
+    let data = match result {
+        Ok(Envelope::Ok { data }) => data,
         Ok(Envelope::Failed {
             error,
             message,
             data,
             ..
         }) => {
-            let cleanup = staged.abandon("export failed");
-            let mapped = if message.contains("already exists") {
-                target_exists()
-            } else if message.contains("not found") {
+            return Err(if message.contains("not found") {
                 CommError::NotFound("identity not found".to_owned())
             } else {
                 map_envelope_failure(&error, &message, data)
-            };
-            Err(match cleanup {
-                CommError::Upstream(m) if m.contains("may remain") => CommError::Upstream(m),
-                _ => mapped,
-            })
+            });
         }
-        Err(e) => {
-            // A timeout may have left a file behind.
-            let cleanup = staged.abandon("export did not finish");
-            Err(match cleanup {
-                CommError::Upstream(m) if m.contains("may remain") => CommError::Upstream(m),
-                _ => map_runner_error(e),
-            })
+        Err(e) => return Err(map_runner_error(e)),
+    };
+    let ncryptsec = data
+        .get("ncryptsec")
+        .and_then(Value::as_str)
+        .filter(|_| data.get("npub").and_then(Value::as_str) == Some(expected_npub))
+        .ok_or_else(|| upstream("Hyphae reported an unexpected export result"))?
+        .to_owned();
+    validate_ncryptsec(&ncryptsec)?;
+
+    // Round trip: the backup must open with THE USER'S password and be this
+    // identity's key. This also catches an unencrypted keystore (Hyphae would
+    // have taken our first stdin line as the backup password). scrypt is
+    // CPU-bound, so keep it off the async workers.
+    let (check, pw) = (
+        ncryptsec.clone(),
+        Zeroizing::new(backup_password.to_owned()),
+    );
+    let expected = expected_npub.to_owned();
+    tokio::task::spawn_blocking(move || -> Result<(), CommError> {
+        let key = decrypt_nip49(&check, &pw)?;
+        if npub_of_secret(&key).as_deref() == Some(expected.as_str()) {
+            Ok(())
+        } else {
+            Err(upstream(
+                "the backup does not belong to this identity; nothing was written",
+            ))
         }
-    }
+    })
+    .await
+    .map_err(|_| upstream("backup verification task failed"))??;
+
+    staged.write_and_publish(&ncryptsec)
 }
 
 // ---------------------------------------------------------------------
@@ -554,10 +663,13 @@ pub(crate) fn classify_import_failure(
             "nickname_exists",
             "An identity with that nickname already exists",
         ),
-        "keystore_locked" => coded(
+        // Hyphae's release notes: if another process changed the keystore
+        // password, import answers a plain `auth_error` instead of
+        // `keystore_locked`. Same meaning for us.
+        "keystore_locked" | "auth_error" => coded(
             StatusCode::LOCKED,
             "keystore_locked",
-            "The keystore password held by Agent24 was rejected",
+            "The keystore password held by Agent24 was rejected (it may have been changed by another program)",
         ),
         other => ImportFailure::Failed(map_envelope_failure(other, message, data)),
     }
@@ -587,54 +699,47 @@ pub(crate) fn import_stdin(
     ])
 }
 
-/// Test-only: an independent NIP-49 decrypt (never used by the daemon, which
-/// leaves all cryptography to Hyphae) plus fixtures.
+/// Test-only fixtures. `encrypt_nip49` exists only to MAKE fake Hyphae output;
+/// verification always goes through the production decrypt, the official NIP-49
+/// vector, the real Hyphae binary and an independent Python implementation.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 pub(crate) mod testkit {
-    use bech32::{Bech32, Hrp};
-    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-    use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-    use unicode_normalization::UnicodeNormalization;
+    use super::*;
 
     /// NIP-49's published test vector (password "nostr").
     pub(crate) const SPEC_NCRYPTSEC: &str = "ncryptsec1qgg9947rlpvqu76pj5ecreduf9jxhselq2nae2kghhvd5g7dgjtcxfqtd67p9m0w57lspw8gsq6yphnm8623nsl8xn9j4jdzz84zm3frztj3z7s35vpzmqf6ksu8r89qk5z2zxfmu5gv8th8wclt0h4p";
     pub(crate) const SPEC_HEX: &str =
         "3501454135014541350145413501453fefb02227e449e57cf4d3a3ce05378683";
 
-    pub(crate) fn decrypt_nip49(ncryptsec: &str, password: &str) -> Option<[u8; 32]> {
-        let (hrp, data) = bech32::decode(ncryptsec).ok()?;
-        if hrp.as_str() != "ncryptsec" || data.len() != 91 || data[0] != 2 {
-            return None;
-        }
-        let pw: String = password.nfkc().collect();
-        let params = scrypt::Params::new(data[1], 8, 1).ok()?;
-        let mut key = [0u8; 32];
-        scrypt::scrypt(pw.as_bytes(), &data[2..18], &params, &mut key).ok()?;
-        let plain = XChaCha20Poly1305::new((&key).into())
-            .decrypt(
-                XNonce::from_slice(&data[18..42]),
-                Payload {
-                    msg: &data[43..],
-                    aad: &data[42..43],
-                },
-            )
-            .ok()?;
-        plain.try_into().ok()
-    }
-
-    pub(crate) fn npub_of(secret: &[u8; 32]) -> String {
-        let secp = secp256k1::Secp256k1::new();
-        let pair = secp256k1::Keypair::from_seckey_slice(&secp, secret).unwrap();
-        let pk = pair.x_only_public_key().0.serialize();
-        bech32::encode::<Bech32>(Hrp::parse("npub").unwrap(), &pk).unwrap()
-    }
-
     pub(crate) fn sk() -> [u8; 32] {
         hex::decode(SPEC_HEX).unwrap().try_into().unwrap()
     }
     pub(crate) fn npub() -> String {
-        npub_of(&sk())
+        npub_of_secret(&sk()).unwrap()
+    }
+
+    /// Test-only NIP-49 encrypt (log_n kept tiny so tests stay fast).
+    pub(crate) fn encrypt_nip49(secret: &[u8; 32], password: &str, log_n: u8) -> String {
+        let (salt, nonce) = ([9u8; 16], [7u8; 24]);
+        let params = scrypt::Params::new(log_n, 8, 1).unwrap();
+        let mut key = [0u8; 32];
+        scrypt::scrypt(nfkc(password).as_bytes(), &salt, &params, &mut key).unwrap();
+        let ct = XChaCha20Poly1305::new((&key).into())
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: secret,
+                    aad: &[2],
+                },
+            )
+            .unwrap();
+        let mut data = vec![0x02, log_n];
+        data.extend_from_slice(&salt);
+        data.extend_from_slice(&nonce);
+        data.push(2);
+        data.extend_from_slice(&ct);
+        bech32::encode::<Bech32>(Hrp::parse("ncryptsec").unwrap(), &data).unwrap()
     }
 }
 
@@ -648,12 +753,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn official_vector_decrypts_with_the_test_helper() {
-        assert_eq!(
-            hex::encode(decrypt_nip49(SPEC_NCRYPTSEC, "nostr").unwrap()),
-            SPEC_HEX
-        );
-        assert!(decrypt_nip49(SPEC_NCRYPTSEC, "wrong").is_none());
+    fn the_official_nip49_vector_opens_with_the_production_decrypt() {
+        let key = decrypt_nip49(SPEC_NCRYPTSEC, "nostr").unwrap();
+        assert_eq!(hex::encode(*key), SPEC_HEX);
+        assert_eq!(npub_of_secret(&key).unwrap(), npub());
+        assert!(decrypt_nip49(SPEC_NCRYPTSEC, "wrong").is_err());
+        assert!(decrypt_nip49(SPEC_NCRYPTSEC, "Nostr").is_err());
+    }
+
+    #[test]
+    fn a_made_up_backup_round_trips_and_nfkc_equivalent_passwords_agree() {
+        let text = encrypt_nip49(&sk(), "correct horse", 4);
+        assert!(text.starts_with("ncryptsec1"));
+        assert_eq!(*decrypt_nip49(&text, "correct horse").unwrap(), sk());
+        // U+FB01 (fi ligature) normalises to "fi" under NFKC, as NIP-49 requires
+        let t = encrypt_nip49(&sk(), "ﬁrst-password", 4);
+        assert_eq!(*decrypt_nip49(&t, "first-password").unwrap(), sk());
+    }
+
+    #[test]
+    fn nfkc_allocates_exactly_for_expanding_characters() {
+        // "Ⅷ" (U+2167, 3 bytes) normalises to "VIII" (4 bytes): 24 -> 32 bytes.
+        let input = "Ⅷ".repeat(8);
+        assert_eq!(input.len(), 24);
+        let out = nfkc(&input);
+        assert_eq!(out.as_str(), "VIII".repeat(8));
+        assert_eq!(out.capacity(), 32, "the buffer must never have been grown");
+        let enc = encrypt_nip49(&sk(), &input, 4);
+        assert!(decrypt_nip49(&enc, &"VIII".repeat(8)).is_ok());
+    }
+
+    #[test]
+    fn ncryptsec_validation_is_strict() {
+        let good = encrypt_nip49(&sk(), "validpassword", 4);
+        assert!(validate_ncryptsec(&good).is_ok());
+        assert!(validate_ncryptsec(SPEC_NCRYPTSEC).is_ok());
+        let flip_last = |t: &str| {
+            let mut c: Vec<u8> = t.bytes().collect();
+            let last = c.len() - 1;
+            c[last] = if c[last] == b'q' { b'p' } else { b'q' };
+            String::from_utf8(c).unwrap()
+        };
+        let reencode =
+            |data: &[u8]| bech32::encode::<Bech32>(Hrp::parse("ncryptsec").unwrap(), data).unwrap();
+        let payload = validate_ncryptsec(&good).unwrap();
+        let tweak = |i: usize, v: u8| {
+            let mut d = payload.clone();
+            d[i] = v;
+            reencode(&d)
+        };
+        for (name, bad) in [
+            ("bad checksum", flip_last(&good)),
+            ("upper case", good.to_uppercase()),
+            (
+                "wrong hrp",
+                bech32::encode::<Bech32>(Hrp::parse("nsec").unwrap(), &payload).unwrap(),
+            ),
+            ("truncated", reencode(&payload[..90])),
+            ("too long", reencode(&[payload.clone(), vec![0]].concat())),
+            ("version 1", tweak(0, 1)),
+            ("log_n 20", tweak(1, 20)),
+            ("key security 3", tweak(42, 3)),
+            ("not bech32", "ncryptsec1!!!".to_owned()),
+            ("empty", String::new()),
+            ("oversized", format!("ncryptsec1{}", "q".repeat(300))),
+            ("trailing space", format!("{good} ")),
+        ] {
+            assert!(validate_ncryptsec(&bad).is_err(), "{name}");
+        }
+        // log_n 19 is the allowed ceiling
+        assert!(validate_ncryptsec(&tweak(1, 19)).is_ok());
     }
 
     #[test]
@@ -715,20 +884,18 @@ mod tests {
             ("invalid_key", "invalid_key"),
             ("nickname_exists", "nickname_exists"),
             ("keystore_locked", "keystore_locked"),
+            // Hyphae's release notes: a keystore password changed by another
+            // process surfaces as a plain auth_error on import
+            ("auth_error", "keystore_locked"),
         ] {
             match f(code) {
-                ImportFailure::Failed(CommError::Coded(_, c, _)) => assert_eq!(c, expect),
+                ImportFailure::Failed(CommError::Coded(_, c, _)) => assert_eq!(c, expect, "{code}"),
                 _ => panic!("{code}"),
             }
         }
-        // exit codes are shared (1, 3), so an unknown code never masquerades
         assert!(matches!(
             f("user_error"),
             ImportFailure::Failed(CommError::Invalid(_))
-        ));
-        assert!(matches!(
-            f("auth_error"),
-            ImportFailure::Failed(CommError::Locked(_))
         ));
         assert_eq!(
             nickname_from_npub_exists("this key is already stored as identity 'r1'"),
@@ -746,72 +913,22 @@ mod tests {
         (tmp, home, out)
     }
 
-    fn plant(staged: &Staged, content: &str, mode: u32) {
-        let path = staged.staging_path();
-        std::fs::write(&path, content).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-    }
-
     #[test]
-    fn a_good_staged_file_is_published_without_a_trace_of_the_staging_name() {
+    fn the_daemon_creates_a_0600_single_link_file_and_leaves_no_staging_name() {
         let (_t, home, out) = sandbox();
         let dest = out.join("a.ncryptsec");
-        let staged = Staged::begin(&dest, &home).unwrap();
-        plant(&staged, &format!("{SPEC_NCRYPTSEC}\n"), 0o600);
-        staged.publish().unwrap();
+        Staged::begin(&dest, &home)
+            .unwrap()
+            .write_and_publish(SPEC_NCRYPTSEC)
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(&dest).unwrap(),
             format!("{SPEC_NCRYPTSEC}\n")
         );
-        assert_eq!(
-            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(std::fs::metadata(&dest).unwrap().nlink(), 1);
+        let meta = std::fs::metadata(&dest).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(meta.nlink(), 1);
         assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
-    }
-
-    #[test]
-    fn files_that_are_not_what_we_asked_for_are_rejected_and_removed() {
-        let (_t, home, out) = sandbox();
-        for (content, mode) in [
-            ("not a backup\n".to_owned(), 0o600),
-            (SPEC_NCRYPTSEC.to_string(), 0o600),    // no newline
-            (format!("{SPEC_NCRYPTSEC}\n"), 0o644), // not private
-            (format!("{SPEC_NCRYPTSEC}\nextra line\n"), 0o600),
-            (String::new(), 0o600),
-        ] {
-            let dest = out.join("b.ncryptsec");
-            let staged = Staged::begin(&dest, &home).unwrap();
-            plant(&staged, &content, mode);
-            assert!(staged.publish().is_err(), "{content:?} {mode:o}");
-            assert!(!dest.exists());
-            assert_eq!(
-                std::fs::read_dir(&out).unwrap().count(),
-                0,
-                "staging removed"
-            );
-        }
-    }
-
-    #[test]
-    fn a_hard_linked_or_symlinked_staging_file_is_rejected() {
-        let (_t, home, out) = sandbox();
-        let victim = out.join("victim");
-        std::fs::write(&victim, "keep").unwrap();
-        let staged = Staged::begin(&out.join("c.ncryptsec"), &home).unwrap();
-        std::os::unix::fs::symlink(&victim, staged.staging_path()).unwrap();
-        assert!(staged.publish().is_err());
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
-        let staged = Staged::begin(&out.join("c.ncryptsec"), &home).unwrap();
-        std::fs::write(staged.staging_path(), format!("{SPEC_NCRYPTSEC}\n")).unwrap();
-        std::fs::set_permissions(
-            staged.staging_path(),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
-        std::fs::hard_link(staged.staging_path(), out.join("second-link")).unwrap();
-        assert!(staged.publish().is_err(), "nlink != 1");
     }
 
     #[test]
@@ -823,38 +940,74 @@ mod tests {
         assert!(
             matches!(&err, CommError::Conflict(m, Some(d)) if m.contains("target_exists") && d["reason"] == "target_exists")
         );
-        // appearing between begin() and publish(): linkat refuses, target kept
+        // appearing between begin() and publish(): linkat refuses, target kept, staging removed
         let dest = out.join("e.ncryptsec");
         let staged = Staged::begin(&dest, &home).unwrap();
-        plant(&staged, &format!("{SPEC_NCRYPTSEC}\n"), 0o600);
         std::fs::write(&dest, "raced in").unwrap();
-        assert!(matches!(staged.publish(), Err(CommError::Conflict(..))));
+        assert!(matches!(
+            staged.write_and_publish(SPEC_NCRYPTSEC),
+            Err(CommError::Conflict(..))
+        ));
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "raced in");
+        assert!(!std::fs::read_dir(&out).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".agent24")
+        }));
         // a dangling symlink at the target counts as existing
         std::os::unix::fs::symlink(out.join("nowhere"), out.join("f.ncryptsec")).unwrap();
         assert!(Staged::begin(&out.join("f.ncryptsec"), &home).is_err());
     }
 
     #[test]
-    fn cleanup_failure_names_the_partial_file_that_may_remain() {
+    fn a_failed_write_is_cleaned_up_or_names_the_remaining_partial_file() {
         let (_t, home, out) = sandbox();
+        let dest = out.join("g.ncryptsec");
         let staged = Staged::begin_with(
-            &out.join("g.ncryptsec"),
+            &dest,
             &home,
-            Faults { fail_cleanup: true },
+            Faults {
+                fail_write: true,
+                fail_cleanup: false,
+            },
         )
         .unwrap();
-        plant(&staged, "garbage\n", 0o600);
-        let path = staged.staging_path();
-        let CommError::Upstream(message) = staged.publish().unwrap_err() else {
+        assert!(
+            matches!(staged.write_and_publish("x").unwrap_err(), CommError::Upstream(m) if !m.contains("may remain"))
+        );
+        assert_eq!(
+            std::fs::read_dir(&out).unwrap().count(),
+            0,
+            "staging removed, target never created"
+        );
+
+        let staged = Staged::begin_with(
+            &dest,
+            &home,
+            Faults {
+                fail_write: true,
+                fail_cleanup: true,
+            },
+        )
+        .unwrap();
+        let CommError::Upstream(message) = staged.write_and_publish("x").unwrap_err() else {
             panic!()
         };
+        let leftovers: Vec<_> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(leftovers.len(), 1);
+        assert!(!dest.exists());
         assert!(
             message.contains("a partial encrypted file may remain"),
             "{message}"
         );
-        assert!(message.contains(path.to_str().unwrap()), "{message}");
-        assert!(path.exists());
+        assert!(
+            message.contains(leftovers[0].to_str().unwrap()),
+            "{message}"
+        );
     }
 
     #[test]
@@ -902,7 +1055,6 @@ mod tests {
             Err(CommError::NotFound(_))
         ));
         assert!(read_backup_file(Path::new("rel")).is_err());
-        // a FIFO must be refused, not block
         let fifo = out.join("fifo");
         assert!(
             std::process::Command::new("mkfifo")

@@ -19,6 +19,7 @@ use rustix::process::{Pid, Signal, kill_process_group};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use zeroize::Zeroizing;
 
 use crate::binary::VerifiedBinary;
 use crate::keystore_lock::KeystoreWriteLock;
@@ -218,9 +219,8 @@ where
         .collect()
 }
 
-/// Serialises `spawn()` calls made by this crate. NOT a protection for the
-/// export pty (its fds are close-on-exec from creation, see `export.rs`). It
-/// exists because `std::process::Command` creates its stdin/stdout pipes with
+/// Serialises `spawn()` calls made by this crate. It exists because
+/// `std::process::Command` creates its stdin/stdout pipes with
 /// `pipe` + `fcntl` on macOS, so a child forked on another thread in that gap
 /// inherits a sibling's pipe end and keeps it open (a hung `cat` waiting for
 /// EOF that never comes).
@@ -230,6 +230,42 @@ pub(crate) fn lock_spawn_gate() -> std::sync::MutexGuard<'static, ()> {
     SPAWN_GATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Reads `r` to EOF into a zero-on-drop buffer holding at most `cap` bytes;
+/// more than that is [`RunnerError::OutputTooLarge`] (the stream is not drained
+/// further: the caller kills the child).
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    r: &mut R,
+    cap: usize,
+    exact: bool,
+) -> Result<Zeroizing<Vec<u8>>, RunnerError> {
+    use tokio::io::AsyncReadExt;
+    let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(if exact {
+        cap
+    } else {
+        cap.min(16 * 1024)
+    }));
+    let mut chunk: Zeroizing<[u8; 4096]> = Zeroizing::new([0u8; 4096]);
+    loop {
+        let n = r.read(&mut chunk[..]).await.map_err(RunnerError::Spawn)?;
+        if n == 0 {
+            return Ok(buf);
+        }
+        if buf.len() + n > cap {
+            return Err(RunnerError::OutputTooLarge);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// SIGKILL the child's process group, then wait for the child (bounded) so it
+/// is reaped before the caller proceeds.
+async fn kill_and_reap(child: &mut tokio::process::Child, pid: Option<u32>) {
+    if let Some(pid) = pid {
+        kill_process_group_best_effort(pid);
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
 }
 
 pub(crate) fn kill_process_group_best_effort(pid: u32) {
@@ -408,6 +444,23 @@ impl HyphaeRunner {
     /// already have taken effect (COMM-HYPHAE.md §3), so callers must not
     /// treat a timeout as "nothing happened".
     pub async fn run(&self, inv: Invocation) -> Result<Envelope, RunnerError> {
+        self.run_capped(inv, OUTPUT_CAP, false).await
+    }
+
+    /// [`Self::run`] with an explicit per-stream output cap. With
+    /// `exact_buffers` each stream's buffer is allocated at `cap` up front and
+    /// can therefore never reallocate (a realloc would leave an unzeroed copy of
+    /// what it held); both buffers are zeroized when dropped.
+    ///
+    /// On timeout (or an over-long output) the whole process group is killed
+    /// and then WAITED for, bounded, so that when this returns the child is
+    /// gone and reaped and the caller may safely clean up after it.
+    pub(crate) async fn run_capped(
+        &self,
+        inv: Invocation,
+        cap: usize,
+        exact_buffers: bool,
+    ) -> Result<Envelope, RunnerError> {
         let timeout = inv.timeout.unwrap_or(self.default_timeout);
         let subcommand = inv
             .args
@@ -424,43 +477,61 @@ impl HyphaeRunner {
         #[cfg(test)]
         timeout_test_hook::pause_before_timeout(self.bin.path()).await;
         let password = inv.password;
+        let mut stdin = child.stdin.take();
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| RunnerError::Spawn(io::Error::other("hyphae stdout unavailable")))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| RunnerError::Spawn(io::Error::other("hyphae stderr unavailable")))?;
 
-        let wait = async move {
-            if let Some(password) = password {
-                let mut stdin = child.stdin.take().ok_or_else(|| {
-                    RunnerError::Spawn(io::Error::other("hyphae stdin unavailable"))
-                })?;
-                stdin
-                    .write_all(password.as_bytes())
-                    .await
-                    .map_err(RunnerError::Spawn)?;
-                stdin.shutdown().await.map_err(RunnerError::Spawn)?;
-                drop(stdin);
-            }
-            child.wait_with_output().await.map_err(RunnerError::Spawn)
+        let io_and_wait = async {
+            let write = async {
+                if let Some(password) = password {
+                    let mut stdin = stdin.take().ok_or_else(|| {
+                        RunnerError::Spawn(io::Error::other("hyphae stdin unavailable"))
+                    })?;
+                    stdin
+                        .write_all(password.as_bytes())
+                        .await
+                        .map_err(RunnerError::Spawn)?;
+                    stdin.shutdown().await.map_err(RunnerError::Spawn)?;
+                    drop(stdin);
+                }
+                Ok::<(), RunnerError>(())
+            };
+            let ((), out, err) = tokio::try_join!(
+                write,
+                read_capped(&mut stdout, cap, exact_buffers),
+                read_capped(&mut stderr, cap, exact_buffers),
+            )?;
+            let status = child.wait().await.map_err(RunnerError::Spawn)?;
+            Ok::<_, RunnerError>((status, out, err))
         };
 
-        let output = match tokio::time::timeout(timeout, wait).await {
-            Ok(result) => result?,
-            Err(_elapsed) => {
-                if let Some(pid) = pid {
-                    kill_process_group_best_effort(pid);
+        let (status, out, err) = match tokio::time::timeout(timeout, io_and_wait).await {
+            Ok(Ok(done)) => done,
+            Ok(Err(e)) => {
+                if matches!(e, RunnerError::OutputTooLarge) {
+                    kill_and_reap(&mut child, pid).await;
                 }
+                return Err(e);
+            }
+            Err(_elapsed) => {
+                kill_and_reap(&mut child, pid).await;
                 return Err(RunnerError::Timeout(timeout));
             }
         };
 
-        if output.stdout.len() > OUTPUT_CAP || output.stderr.len() > OUTPUT_CAP {
-            return Err(RunnerError::OutputTooLarge);
-        }
-
-        let Some(code) = output.status.code() else {
+        let Some(code) = status.code() else {
             return Err(RunnerError::Signaled);
         };
 
         tracing::debug!(subcommand = %subcommand, exit = code, "hyphae run finished");
 
-        parse_envelope(code, &output.stdout, &output.stderr)
+        parse_envelope(code, &out, &err)
     }
 
     /// `hyphae <args…>` (expected to be a `--help`) as plain text, bounded and
@@ -745,6 +816,82 @@ printf '' > "$HOME/fixture-emitted"
         let argv = data.get("argv").and_then(Value::as_str).unwrap();
         assert!(argv.contains("--password-stdin"));
         assert!(!argv.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn kill_and_reap_leaves_no_zombie_behind() {
+        let mut child = tokio::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let started = std::time::Instant::now();
+        kill_and_reap(&mut child, pid).await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // reaped: its exit status was already collected, so there is nothing left to wait for
+        assert!(child.try_wait().unwrap().is_some());
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.unwrap().to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(
+            !alive,
+            "`kill -0` succeeds on a zombie, so this proves it was reaped"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_a_timeout_run_returns_only_once_the_child_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        let pidfile = tmp.path().join("pid");
+        let script = format!("#!/bin/sh\necho $$ > \"{}\"\nsleep 30\n", pidfile.display());
+        let bin = install_fixture(tmp.path(), "slow.sh", &script, &tmp.path().join("bin")).await;
+        let runner = HyphaeRunner::new(bin, home, Duration::from_secs(5));
+        let inv = Invocation {
+            args: vec![],
+            password: None,
+            timeout: Some(Duration::from_secs(3)),
+        };
+        let err = runner.run(inv).await.unwrap_err();
+        assert!(matches!(err, RunnerError::Timeout(_)));
+        // (the shell may not even have started on a very loaded machine; then there is nothing to check)
+        if let Ok(pid) = std::fs::read_to_string(&pidfile) {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .status()
+                .unwrap()
+                .success();
+            assert!(
+                !alive,
+                "the timed-out child must be reaped before run() returns"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn capped_output_never_reallocates_and_too_much_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        let script = "#!/bin/sh\nhead -c 100000 /dev/zero | tr '\\0' 'a'\nsleep 60\n";
+        let bin = install_fixture(tmp.path(), "big.sh", script, &tmp.path().join("bin")).await;
+        let runner = HyphaeRunner::new(bin, home, Duration::from_secs(120));
+        let inv = Invocation {
+            args: vec![],
+            password: None,
+            timeout: None,
+        };
+        let started = std::time::Instant::now();
+        let err = runner.run_capped(inv, 8 * 1024, true).await.unwrap_err();
+        assert!(matches!(err, RunnerError::OutputTooLarge), "{err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(40),
+            "the child is killed, not waited out"
+        );
     }
 
     #[tokio::test]

@@ -51,7 +51,7 @@ describe('CommunicationPage', () => {
     render(<CommunicationPage />)
     vi.mocked(installComm).mockImplementation(async () => {
       success()
-      return { installed_version: 'v0.27.2', path: '/state/components/hyphae/v0.27.2/hyphae', restart_required: false, reason: null }
+      return { installed_version: 'v0.28.0', path: '/state/components/hyphae/v0.28.0/hyphae', restart_required: false, reason: null }
     })
     fireEvent.click(await screen.findByRole('button', { name: '下载并设置' }))
     expect(await screen.findByText('npub1alice')).toBeInTheDocument()

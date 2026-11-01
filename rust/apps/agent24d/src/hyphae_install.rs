@@ -59,8 +59,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     #[tokio::test]
-    #[ignore = "downloads the pinned v0.27.2 darwin-arm64 binary from GitHub"]
-    async fn real_github_v0_27_2_darwin_arm64_matches_lock() {
+    #[ignore = "downloads the pinned v0.28.0 darwin-arm64 binary from GitHub"]
+    async fn real_github_v0_28_0_darwin_arm64_matches_lock() {
         let dir = tempfile::tempdir().unwrap();
         let release = HyphaeRelease::embedded().unwrap();
         let lock = HyphaeLock::embedded().unwrap();
@@ -77,7 +77,7 @@ mod tests {
         let digest = agent24_comm::binary::sha256_of(&bytes);
         assert_eq!(digest, lock.expected_for("darwin-arm64").unwrap());
         eprintln!(
-            "verified Hyphae v0.27.2 darwin-arm64: {} bytes, sha256 {}",
+            "verified Hyphae v0.28.0 darwin-arm64: {} bytes, sha256 {}",
             bytes.len(),
             digest.to_hex()
         );

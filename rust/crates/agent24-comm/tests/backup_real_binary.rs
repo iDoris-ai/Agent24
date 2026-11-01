@@ -1,12 +1,10 @@
-//! Key backup (`identity export`) and restore (`identity import`) against a
-//! REAL Hyphae build that has the non-interactive commands (>= v0.28.0, or the
-//! #329 preview), and `hyphae_too_old` against the locked v0.27.2. Ignored in
-//! normal runs; every home is an isolated temp dir.
+//! Key backup (`identity export`) and restore (`identity import`) against the
+//! REAL released Hyphae v0.28.0 (the build pinned in `hyphae.lock.json`), and
+//! `hyphae_too_old` against the previous release v0.27.2. Ignored in normal
+//! runs; every home is an isolated temp dir.
 //!
-//! - `HYPHAE_TEST_BIN`: a Hyphae with `identity export --password-stdin` and
-//!   `identity import`. It is hashed and installed as-is (it need not match
-//!   `hyphae.lock.json`, which still pins v0.27.2).
-//! - `HYPHAE_OLD_BIN`: the locked v0.27.2 (checked against the embedded lock).
+//! - `HYPHAE_TEST_BIN`: the released v0.28.0 (checked against the embedded lock).
+//! - `HYPHAE_OLD_BIN`: v0.27.2 (no non-interactive export, no `identity import`).
 //! - `HYPHAE_EXPORT_OUT`: optional directory in which the exported backup
 //!   (password `backup passphrase 1`) is left, for an independent decrypt.
 
@@ -52,6 +50,7 @@ async fn install(
 /// A fresh isolated home; with `create`, one identity called `create` already
 /// exists and its keystore password is filed in the (in-memory) keychain.
 async fn new_home(source: &Path, lock_pinned: bool, create: Option<&str>) -> Home {
+    // `lock_pinned`: the binary must be exactly the one hyphae.lock.json names.
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("hyphae-home");
     tokio::fs::create_dir_all(&home).await.unwrap();
@@ -62,7 +61,10 @@ async fn new_home(source: &Path, lock_pinned: bool, create: Option<&str>) -> Hom
             .unwrap()
             .expected_for(&current_platform())
             .unwrap();
-        assert_eq!(digest, expected, "HYPHAE_OLD_BIN must be the locked build");
+        assert_eq!(
+            digest, expected,
+            "HYPHAE_TEST_BIN must be the locked v0.28.0 build"
+        );
     }
     let verified = install(source, digest, tmp.path()).await;
     let runner = Arc::new(HyphaeRunner::new(
@@ -153,10 +155,10 @@ fn preview_bin() -> PathBuf {
 }
 
 #[tokio::test]
-#[ignore = "requires a Hyphae >= 0.28 build; set HYPHAE_TEST_BIN and pass --ignored"]
+#[ignore = "requires the locked Hyphae v0.28.0; set HYPHAE_TEST_BIN and pass --ignored"]
 async fn export_then_restore_round_trips_through_the_real_binary() {
     let bin = preview_bin();
-    let a = new_home(&bin, false, Some("exp")).await;
+    let a = new_home(&bin, true, Some("exp")).await;
     let npub = identities(&a).await[0].1.clone();
 
     // ---- export ----------------------------------------------------------
@@ -206,7 +208,7 @@ async fn export_then_restore_round_trips_through_the_real_binary() {
     assert_eq!(std::fs::read_to_string(&backup).unwrap(), file);
 
     // ---- restore as the very first identity of another home ---------------
-    let b = new_home(&bin, false, None).await;
+    let b = new_home(&bin, true, None).await;
     let (status, body) = post(
         &b.app,
         "/identity/import",
@@ -294,7 +296,7 @@ async fn export_then_restore_round_trips_through_the_real_binary() {
     );
 
     // ---- restore into a home that already has a keystore ------------------
-    let c = new_home(&bin, false, Some("local")).await;
+    let c = new_home(&bin, true, Some("local")).await;
     let (status, body) = post(&c.app, "/identity/import", json!({"nickname": "restored", "path": backup, "backup_password": BACKUP_PW, "default": true})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let listed = identities(&c).await;
@@ -308,12 +310,12 @@ async fn export_then_restore_round_trips_through_the_real_binary() {
 }
 
 #[tokio::test]
-#[ignore = "requires the locked Hyphae v0.27.2; set HYPHAE_OLD_BIN and pass --ignored"]
-async fn both_endpoints_say_hyphae_too_old_on_the_locked_binary() {
+#[ignore = "requires Hyphae v0.27.2; set HYPHAE_OLD_BIN and pass --ignored"]
+async fn both_endpoints_say_hyphae_too_old_on_the_previous_release() {
     let old = PathBuf::from(std::env::var("HYPHAE_OLD_BIN").expect("HYPHAE_OLD_BIN"))
         .canonicalize()
         .unwrap();
-    let h = new_home(&old, true, Some("old")).await;
+    let h = new_home(&old, false, Some("old")).await;
     let dir = h._tmp.path().join("out");
     std::fs::create_dir_all(&dir).unwrap();
     let dest = dir.join("old.ncryptsec");

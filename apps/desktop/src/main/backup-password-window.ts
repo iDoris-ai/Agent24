@@ -20,7 +20,12 @@ const escapeHtml = (text: string): string =>
 
 export type BackupPasswordMode = 'export' | 'restore'
 
-export function backupPasswordHtml(mode: BackupPasswordMode = 'export'): string {
+export interface BackupWindowOptions {
+  /** Restore mode: tell the user the restored identity will become the default. */
+  willBeDefault?: boolean
+}
+
+export function backupPasswordHtml(mode: BackupPasswordMode = 'export', options: BackupWindowOptions = {}): string {
   const t = (key: Parameters<typeof mt>[0]): string => escapeHtml(mt(key))
   return `<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
@@ -39,6 +44,7 @@ ${mode === 'export' ? `<h1>${t('backupPw.title')}</h1>
 <label>${t('backupPw.repeat')}<input id="p2" type="password" autocomplete="new-password"></label>
 <p class="warn">${t('backupPw.warning')}</p>` : `<h1>${t('backupPw.restoreTitle')}</h1>
 <p class="rules">${t('backupPw.restoreRules')}</p>
+${options.willBeDefault ? `<p class="warn">${t('backupPw.willBeDefault')}</p>` : ''}
 <label>${t('backupPw.restorePassword')}<input id="p1" type="password" autocomplete="off" autofocus></label>`}
 <p id="err" role="alert"></p>
 <div class="row"><button type="button" id="cancel">${t('backupPw.cancel')}</button><button type="submit" id="go">${t('backupPw.submit')}</button></div>
@@ -59,6 +65,7 @@ function openPasswordWindow<T>(
   parent: BrowserWindow | null,
   mode: BackupPasswordMode,
   work: (password: string) => Promise<Outcome<T>>,
+  options: BackupWindowOptions = {},
 ): Promise<T | null> {
   return new Promise((resolve) => {
     const win = new BrowserWindow({
@@ -105,7 +112,7 @@ function openPasswordWindow<T>(
       if (mode === 'export') {
         if (first !== second) { event.sender.send(BACKUP_PW_ERROR, mt('backupPw.mismatch')); return }
         if (!isSafeBackupPassword(first)) { event.sender.send(BACKUP_PW_ERROR, mt('backupPw.invalid')); return }
-      } else if (!first || first.length > 1024 || /[\r\n\0]/.test(first)) {
+      } else if (!first || Buffer.byteLength(first, 'utf8') > 1024 || /[\r\n\0]/.test(first)) {
         event.sender.send(BACKUP_PW_ERROR, mt('backupPw.restoreInvalid'))
         return
       }
@@ -127,7 +134,10 @@ function openPasswordWindow<T>(
       )
     }
     const onCancel = (event: IpcMainEvent): void => {
-      if (!fromWindow(event) || working) return
+      if (!fromWindow(event)) return
+      // Never report "cancelled" while the daemon call is in flight: the
+      // restore may well complete, and the user must not be told it did not.
+      if (working) { event.sender.send(BACKUP_PW_BUSY, mt('backupPw.wait')); return }
       finish(null)
     }
     ipcMain.on(BACKUP_PW_SUBMIT, onSubmit)
@@ -135,9 +145,17 @@ function openPasswordWindow<T>(
 
     contents.setWindowOpenHandler(() => ({ action: 'deny' }))
     contents.on('will-navigate', (event) => event.preventDefault())
+    // Closing the window (button, Cmd+W, Escape) is ignored while the daemon
+    // call is in flight, for the same reason.
+    win.on('close', (event: { preventDefault: () => void }) => {
+      if (working) {
+        event.preventDefault()
+        if (!contents.isDestroyed()) contents.send(BACKUP_PW_BUSY, mt('backupPw.wait'))
+      }
+    })
     win.on('closed', () => finish(null))
     win.once('ready-to-show', () => win.show())
-    void win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(backupPasswordHtml(mode))}`).catch(() => finish(null))
+    void win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(backupPasswordHtml(mode, options))}`).catch(() => finish(null))
   })
 }
 
@@ -153,6 +171,7 @@ export function promptBackupPassword(parent: BrowserWindow | null): Promise<stri
 export function promptRestorePassword<T>(
   parent: BrowserWindow | null,
   work: (password: string) => Promise<Outcome<T>>,
+  options: BackupWindowOptions = {},
 ): Promise<T | null> {
-  return openPasswordWindow<T>(parent, 'restore', work)
+  return openPasswordWindow<T>(parent, 'restore', work, options)
 }

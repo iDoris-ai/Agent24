@@ -231,12 +231,21 @@ function isBackendProxyRequest(req: unknown): req is BackendProxyRequest {
   )
 }
 
-/** The daemon's whole export budget is 30 s of pty plus one scrypt run; this stays well above it. */
+/** The daemon's whole export budget is 30 s for Hyphae's run plus one in-daemon scrypt check; this stays well above it. */
 const EXPORT_TIMEOUT_MS = 90_000
 
-/** Restore: opaque single-use tickets standing for a file the user picked. */
-const importTickets = new Map<string, { path: string; expires: number }>()
+/**
+ * Restore: the one pending backup selection, an opaque ticket standing for a
+ * file the user picked. It is consumed when used. After a result that is not a
+ * success it is re-armed (same ticket, SAME expiry: the TTL is never extended)
+ * at most IMPORT_MAX_ATTEMPTS times in total, and only if the user has not
+ * picked a different file in the meantime (a newer pick replaces it, so an older
+ * flow can never put its own ticket back).
+ */
+interface PendingBackup { id: string; path: string; expires: number; attemptsLeft: number }
+let pendingBackup: PendingBackup | null = null
 const IMPORT_TICKET_TTL_MS = 5 * 60_000
+const IMPORT_MAX_ATTEMPTS = 3
 
 /** True if anything (file, dir, even a dangling symlink) is at `p`. */
 function pathExists(p: string): boolean {
@@ -542,9 +551,11 @@ export function registerIpcHandlers(options: {
   )
 
   // Private-key backup. Not on the generic proxy: the destination is chosen
-  // here with a native save dialog (never by the page) and the daemon writes
-  // the key itself (0600, no temp file), so the nsec never reaches this
-  // process or the renderer. The page only learns {nickname, npub, path}.
+  // here with a native save dialog (never by the page) and the daemon creates
+  // the file itself (0600, exclusive create, never overwriting). What is
+  // written is Hyphae's password-encrypted NIP-49 backup, so no plaintext key
+  // exists in this process or the renderer; the page only learns
+  // {nickname, npub, path}.
   handle(IpcChannels.CommIdentityExport, (event, nickname: unknown): Promise<BackendProxyResponse> =>
     exclusive(async () => {
       // The page asks only for "export this identity". The backup password is
@@ -619,8 +630,8 @@ export function registerIpcHandlers(options: {
     const file = picked.filePaths[0]
     if (picked.canceled || !file) return { ok: false, cancelled: true }
     const ticket = randomBytes(16).toString('hex')
-    importTickets.clear() // one pending selection at a time
-    importTickets.set(ticket, { path: file, expires: Date.now() + IMPORT_TICKET_TTL_MS })
+    // Replaces any older selection, which thereby stops working.
+    pendingBackup = { id: ticket, path: file, expires: Date.now() + IMPORT_TICKET_TTL_MS, attemptsLeft: IMPORT_MAX_ATTEMPTS }
     return { ok: true, ticket, fileName: path.basename(file) }
   })
   handle(IpcChannels.CommIdentityImport, (event, ticket: unknown, nickname: unknown, makeDefault: unknown): Promise<BackendProxyResponse> =>
@@ -628,27 +639,34 @@ export function registerIpcHandlers(options: {
       if (typeof ticket !== 'string' || !isSafeName(nickname) || typeof makeDefault !== 'boolean') {
         return invalidRequest('invalid restore request')
       }
-      const entry = importTickets.get(ticket)
-      importTickets.delete(ticket) // single use
-      if (!entry || entry.expires < Date.now()) {
+      const entry = pendingBackup
+      if (!entry || entry.id !== ticket || entry.expires < Date.now()) {
         return { ok: false, status: 410, data: { error: { code: 'ticket_expired', message: mt('err.noBackupTicket') } } }
       }
+      pendingBackup = null // consumed: re-armed below only on a non-success
       const win = BrowserWindow.fromWebContents(event.sender)
       const result = await promptRestorePassword<BackendProxyResponse>(win, async (backupPassword) => {
         const response = await proxyToBackend({
           method: 'POST', path: '/api/v1/comm/identity/import',
           body: { nickname, path: entry.path, backup_password: backupPassword, default: makeDefault },
         }, EXPORT_TIMEOUT_MS)
-        // A wrong password is retried inside the window; everything else ends it.
-        if ((response.data as { error?: unknown } | null)?.error === 'bad_backup_password') {
-          return { done: false, error: mt('backupPw.badPassword') }
+        // A wrong password, or input the daemon found unusable (`invalid`), is
+        // handled inside the window so the user can fix it; everything else ends it.
+        const body = response.data as { error?: unknown; message?: unknown } | null
+        if (body?.error === 'bad_backup_password') return { done: false, error: mt('backupPw.badPassword') }
+        if (body?.error === 'invalid') {
+          return { done: false, error: typeof body.message === 'string' ? clip(body.message, 200) : mt('backupPw.restoreInvalid') }
         }
         return { done: true, value: response }
-      })
+      }, { willBeDefault: makeDefault })
       // Not finished (cancelled, or the daemon said no): keep the selection so
-      // the user can fix the nickname or try again without re-choosing the file.
+      // the user can fix the nickname or try again without re-choosing the file,
+      // but only a few times, never past the original expiry, and never over a
+      // newer pick.
       const finished = result !== null && result.ok
-      if (!finished) importTickets.set(ticket, { path: entry.path, expires: Date.now() + IMPORT_TICKET_TTL_MS })
+      if (!finished && pendingBackup === null && entry.attemptsLeft > 1 && entry.expires > Date.now()) {
+        pendingBackup = { ...entry, attemptsLeft: entry.attemptsLeft - 1 }
+      }
       return result ?? cancelled()
     }),
   )

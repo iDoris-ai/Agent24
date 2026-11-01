@@ -216,6 +216,53 @@ describe('restore password window', () => {
     await expect(result).resolves.toBeNull()
   })
 
+  it('shows the "will become the default" line only when asked', () => {
+    expect(backupPasswordHtml('restore')).not.toContain('will become the default')
+    expect(backupPasswordHtml('restore', { willBeDefault: true })).toContain('This identity will become the default identity.')
+    setMainLocale('zh')
+    expect(backupPasswordHtml('restore', { willBeDefault: true })).toContain('默认身份')
+    void promptRestorePassword(null, async () => ({ done: true, value: 1 }), { willBeDefault: true })
+    expect(decodeURIComponent(windows.at(-1)!.loadedUrl)).toContain('默认身份')
+  })
+
+  it('ignores close and cancel while the daemon call is in flight, and says to wait', async () => {
+    let release!: () => void
+    const result = promptRestorePassword(null, () => new Promise((resolve) => { release = () => resolve({ done: true, value: 'finished' }) }))
+    const w = windows.at(-1)!
+    emit(BACKUP_PW_SUBMIT, fromWindow(w), 'some-password', 'some-password')
+    // the window's own close attempt is vetoed...
+    const veto = { prevented: false, preventDefault() { this.prevented = true } }
+    w.handlers.get('close')!(veto as never)
+    expect(veto.prevented).toBe(true)
+    // ...Escape / Cancel are not reported as a cancel...
+    emit(BACKUP_PW_CANCEL, fromWindow(w))
+    expect(w.closed).toBe(false)
+    expect(w.webContents.sent.filter((a) => a[0] === BACKUP_PW_BUSY).map((a) => a[1])).toEqual(
+      ['Decrypting…', 'Please wait until this finishes…', 'Please wait until this finishes…'])
+    // ...and the real outcome is what comes back
+    release()
+    await expect(result).resolves.toBe('finished')
+  })
+
+  it('lets the window close when nothing is in flight', () => {
+    void promptRestorePassword(null, async () => ({ done: true, value: 1 }))
+    const w = windows.at(-1)!
+    const veto = { prevented: false, preventDefault() { this.prevented = true } }
+    w.handlers.get('close')!(veto as never)
+    expect(veto.prevented).toBe(false)
+  })
+
+  it('measures the restore password in UTF-8 bytes like the daemon', async () => {
+    const work = vi.fn()
+    const result = promptRestorePassword<string>(null, work)
+    const w = windows.at(-1)!
+    emit(BACKUP_PW_SUBMIT, fromWindow(w), 'é'.repeat(600), 'é'.repeat(600)) // 600 characters, 1200 bytes
+    expect(work).not.toHaveBeenCalled()
+    expect(w.webContents.sent.at(-1)![0]).toBe(BACKUP_PW_ERROR)
+    emit(BACKUP_PW_CANCEL, fromWindow(w))
+    await expect(result).resolves.toBeNull()
+  })
+
   it('closing the window while idle resolves null without calling the work', async () => {
     const work = vi.fn()
     const result = promptRestorePassword<string>(null, work)

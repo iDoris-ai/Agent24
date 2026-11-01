@@ -104,7 +104,8 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('GET', '/api/v1/comm/contact'),
   r('GET', '/api/v1/comm/history'),
   // NOT here on purpose, each has its own validated IPC in main:
-  //   POST /api/v1/comm/identity/export  (CommIdentityExport: native confirm + save dialog)
+  //   POST /api/v1/comm/identity/export  (CommIdentityExport: native confirm, own password window, save dialog)
+  //   POST /api/v1/comm/identity/import  (CommImportPick + CommIdentityImport: native open dialog, own password window)
   //   POST /api/v1/comm/contact          (CommContactAdd)
   //   POST /api/v1/comm/send             (CommSend)
   // The proxy forwards with the host's ProductHost credential, which the

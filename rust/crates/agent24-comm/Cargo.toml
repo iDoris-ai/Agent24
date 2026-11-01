@@ -69,15 +69,16 @@ tracing = "0.1"
 # `Password(/* Zeroizing<Vec<u8>> */)`). Not a direct workspace dependency
 # elsewhere, but already resolved in Cargo.lock (1.9.0, transitive).
 zeroize = "1"
-
-[dev-dependencies]
-# Decrypt-only NIP-49 helper used by tests to verify, independently of Hyphae,
-# that a backup Hyphae wrote round-trips to the identity's npub.
+# NIP-49 *decrypt* only (export.rs): after Hyphae writes a backup the daemon
+# opens it with the user's backup password and checks it derives the identity's
+# npub BEFORE anything touches the disk. Hyphae does all encrypting.
 scrypt = { version = "0.12", default-features = false }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 bech32 = "0.12"
 unicode-normalization = "0.1"
 secp256k1 = { version = "0.30", default-features = false, features = ["std"] }
+
+[dev-dependencies]
 # Mirrors agent24-os-proto's `test-util` pattern: depending on ourselves with
 # the feature on means `cargo test -p agent24-comm` (no extra flags) already
 # runs the lock-override-gated tests.

@@ -1,5 +1,5 @@
 {
-  "tag": "v0.27.2",
+  "tag": "v0.28.0",
   "release_url_base": "https://github.com/iDoris-ai/Hyphae/releases/download",
   "assets": {
     "darwin-arm64": "hyphae-darwin-arm64",

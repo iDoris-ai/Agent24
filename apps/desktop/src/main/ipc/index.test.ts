@@ -103,6 +103,9 @@ beforeAll(async () => {
         if (sent.includes('wrong-pass')) {
           res.statusCode = 400
           res.end(JSON.stringify({ ok: false, error: 'bad_backup_password', message: 'nope' }))
+        } else if (sent.includes('bad-input-pass')) {
+          res.statusCode = 400
+          res.end(JSON.stringify({ ok: false, error: 'invalid', message: 'path must be absolute' }))
         } else if (sent.includes('dupe-nick')) {
           res.statusCode = 409
           res.end(JSON.stringify({ ok: false, error: 'nickname_exists', message: 'exists' }))
@@ -505,6 +508,64 @@ describe('Restore from backup (CommImportPick / CommIdentityImport)', () => {
     expect(refused.data.error).toBe('nickname_exists')
     typing('restore-pass-1')
     expect((await call(IpcChannels.CommIdentityImport, ticket, 'alice2', false)).ok).toBe(true)
+  })
+  it('shows "will become the default" in the window only when the restore asks for the default', async () => {
+    const { ticket } = await pick()
+    typing('restore-pass-1')
+    await call(IpcChannels.CommIdentityImport, ticket, 'alice', true)
+    expect(promptRestorePassword.mock.calls[0]![2]).toEqual({ willBeDefault: true })
+    const second = await pick()
+    typing('restore-pass-1')
+    await call(IpcChannels.CommIdentityImport, second.ticket, 'bob', false)
+    expect(promptRestorePassword.mock.calls[1]![2]).toEqual({ willBeDefault: false })
+  })
+  it('input the daemon calls invalid is fixed inside the window, not by closing it', async () => {
+    const { ticket } = await pick()
+    typing('bad-input-pass', 'restore-pass-1')
+    const result = await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)
+    expect(result.ok).toBe(true)
+    expect(seen.map((r) => JSON.parse(r.body).backup_password)).toEqual(['bad-input-pass', 'restore-pass-1'])
+  })
+  it('a selection survives at most three attempts', async () => {
+    const { ticket } = await pick()
+    typing() // the user closes the window each time
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const result = await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)
+      expect(result.data.error.code, `attempt ${attempt}`).toBe('cancelled')
+    }
+    const fourth = await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)
+    expect(fourth.data.error.code).toBe('ticket_expired')
+    expect(seen).toHaveLength(0)
+  })
+  it('re-arming never extends the original expiry', async () => {
+    const t0 = 1_800_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+    try {
+      const { ticket } = await pick()
+      typing()
+      now.mockReturnValue(t0 + 4 * 60_000) // inside the 5 minute window
+      expect((await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)).data.error.code).toBe('cancelled')
+      now.mockReturnValue(t0 + 5 * 60_000 + 1) // re-armed 61 s ago, but the original 5 minutes are up
+      expect((await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)).data.error.code).toBe('ticket_expired')
+    } finally {
+      now.mockRestore()
+    }
+  })
+  it('a newer pick invalidates the older ticket, and an older flow cannot put its ticket back', async () => {
+    const first = await pick()
+    let release!: () => void
+    promptRestorePassword.mockImplementationOnce(() => new Promise((resolve) => { release = () => resolve(null) }))
+    const running = call(IpcChannels.CommIdentityImport, first.ticket, 'alice', false)
+    await new Promise((r) => setTimeout(r, 20)) // the window for the FIRST selection is open
+    showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: ['/Users/x/Downloads/second.ncryptsec'] })
+    const second = await call(IpcChannels.CommImportPick)
+    release() // the first flow ends in a cancel
+    expect((await running).data.error.code).toBe('cancelled')
+    // the first ticket is dead; the second still works
+    expect((await call(IpcChannels.CommIdentityImport, first.ticket, 'alice', false)).data.error.code).toBe('ticket_expired')
+    typing('restore-pass-1')
+    expect((await call(IpcChannels.CommIdentityImport, second.ticket, 'bob', false)).ok).toBe(true)
+    expect(JSON.parse(seen[0]!.body).path).toBe('/Users/x/Downloads/second.ncryptsec')
   })
   it('a ticket is single use after success and unknown tickets are refused without any window', async () => {
     const { ticket } = await pick()

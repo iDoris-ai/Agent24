@@ -811,7 +811,7 @@ mod hy1_regression_tests {
             let (status, installed) = request(&app, "POST", "/api/v1/comm/install").await;
             assert_eq!(status, StatusCode::OK, "{installed}");
             assert_eq!(installed["data"]["restart_required"], false);
-            assert_eq!(installed["data"]["installed_version"], "v0.27.2");
+            assert_eq!(installed["data"]["installed_version"], "v0.28.0");
             assert_eq!(
                 tokio::fs::read(runtime.release.installed_path(dir.path()))
                     .await
@@ -824,7 +824,7 @@ mod hy1_regression_tests {
             let (status, process) = request(&app, "GET", "/api/v1/comm/daemon").await;
             assert_eq!(status, StatusCode::OK);
             assert_ne!(process["data"]["process"]["state"], "not_configured");
-            assert_eq!(process["data"]["installed_version"], "v0.27.2");
+            assert_eq!(process["data"]["installed_version"], "v0.28.0");
         }
         if let Some(handle) = runtime.slot.close() {
             handle.shutdown(tokio::time::Instant::now()).await;

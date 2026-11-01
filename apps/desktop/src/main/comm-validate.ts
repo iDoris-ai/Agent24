@@ -34,7 +34,10 @@ export function isValidNpub(value: unknown): value is string {
 }
 
 // eslint-disable-next-line no-control-regex
-const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/
+// Cc plus Cf (format controls, which include the bidi overrides/isolates that
+// make a name read differently from what it is). ZWNJ/ZWJ stay allowed: Persian
+// and Indic words need them. Mirrors the daemon's `is_format_control`.
+const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]|(?![\u200c\u200d])\p{Cf}/u
 
 /** A display name: 1..max chars, no control characters (a newline would let a
  *  name forge fields in Hyphae's line-oriented output). */
