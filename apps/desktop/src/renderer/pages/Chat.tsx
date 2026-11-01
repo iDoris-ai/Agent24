@@ -52,9 +52,10 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
-  // New conversation (a fresh mount of this page) gets a new id — never
-  // regenerated for the lifetime of this component instance.
-  const [sessionId] = useState(() => genChatSessionId())
+  // One id per conversation. ChatPage stays mounted for the whole app
+  // lifetime (M1-T14), so a new conversation is started explicitly via
+  // `newChat` below, which swaps in a fresh id.
+  const [sessionId, setSessionId] = useState(() => genChatSessionId())
   const bottomRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const requestInFlight = useRef(false)
@@ -83,6 +84,20 @@ export default function ChatPage() {
     setMessages(prev => [...prev, userMsg])
     setInput('')
     await requestReply(messages.length, request)
+  }
+
+  // Issue #1517: start a fresh conversation. Disabled while a reply is in
+  // flight (the chat call is a single blocking IPC with no abort handle, so
+  // the button is disabled rather than aborting) — hence no stale reply can
+  // land in the new conversation.
+  const newChat = () => {
+    if (requestInFlight.current) return
+    setMessages([])
+    setInput('')
+    setSessionId(genChatSessionId())
+    // Knowledge turns run in their own session (`runSession`); a new
+    // conversation must not carry the old one's turns into its runs.
+    runSession.current = null
   }
 
   const setDelivery = (index: number, delivery: Delivery) => {
@@ -238,6 +253,9 @@ export default function ChatPage() {
 
   return (
     <div className="chat-layout">
+      <div className="chat-toolbar">
+        <button className="btn" disabled={loading} onClick={newChat}>{t('newChat')}</button>
+      </div>
       <div className="chat-messages">
         {messages.length === 0 && (
           <div className="chat-empty">

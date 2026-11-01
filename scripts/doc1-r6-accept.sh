@@ -4,38 +4,47 @@
 # the daemon's HTTP API only where no product entry exists (T1, T2). Cases and
 # the release scope: docs/documenting/acceptance/R6-RELEASE-USECASES.md.
 #
-#   scripts/doc1-r6-accept.sh --bin <bin dir> [--old <main bin dir>] [--work <dir>]
+#   scripts/doc1-r6-accept.sh --bin <bin dir> [--old <main bin dir>] [--work <dir>] [--next]
 #
 # The bin dir holds `agent24`, `agent24d` and `agent24-documents`
 # (`cargo build -p agent24-cli -p agent24d -p agent24-documents`); --old the
-# same three built from main (r5), for the upgrade cases M1-M6. Run it from
+# same three built from main (r5), for the upgrade cases M1-M7. --next adds
+# the R cases, for CLI entries added after r6 (DOC-1-57): r6's binaries have
+# none of them, so they fail there. Run it from
 # the release checkout: the package is assembled from the domain-os.yml, the
 # pdfkit engine sources and the samples found here. macOS only (the engine).
 # The daemon runs on its own AGENT24_DATA_DIR under --work; Z1 checks the
 # user's ~/.agent24, so stop your own daemon first. No model is needed.
-# Needs jq, curl, perl, python3 and swiftc (engines/pdfkit/build.sh); with
-# --old, sqlite3 too (M4 reads the migrations, which have no product entry).
+# Needs jq, curl, perl, python3, sips (U9's PNG) and swiftc
+# (engines/pdfkit/build.sh); with --old, sqlite3 too (M4 reads the
+# migrations, which have no product entry).
 set -uo pipefail
 export LC_ALL=C
 # Relative paths are the caller's: taken from where it ran, before the cd.
 abs() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$PWD" "$1" ;; esac; }
-BIN="" OLD="" WORK=""
+BIN="" OLD="" WORK="" NEXT=""
 while [ $# -gt 0 ]; do
+  case "$1" in
+    # Each takes a value: without one, `$(abs "$2")` fails in its subshell
+    # only and `shift 2` shifts nothing, so the loop would never end.
+    --bin|--old|--work) [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; } ;;
+  esac
   case "$1" in
     --bin) BIN=$(abs "$2"); shift 2 ;;
     --old) OLD=$(abs "$2"); shift 2 ;;
     --work) WORK=$(abs "$2"); shift 2 ;;
+    --next) NEXT=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
-[ -n "$BIN" ] || { sed -n 2,17p "$0" >&2; exit 2; }
+[ -n "$BIN" ] || { sed -n 2,20p "$0" >&2; exit 2; }
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
 for b in agent24 agent24d agent24-documents; do
   [ -x "$BIN/$b" ] || { echo "missing binary: $BIN/$b" >&2; exit 2; }
   [ -z "$OLD" ] || [ -x "$OLD/$b" ] || { echo "missing binary: $OLD/$b" >&2; exit 2; }
 done
-for t in jq curl perl python3 ${OLD:+sqlite3}; do
+for t in jq curl perl python3 sips ${OLD:+sqlite3}; do
   command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 2; }
 done
 resolve() { python3 -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
@@ -94,11 +103,11 @@ settle() {
 # The daemon this run started is stopped however the run ends.
 # C1 makes blobs/tmp read-only for a while: an interrupted run puts it back,
 # or the work dir cannot be removed.
-# Both data dirs (the M cases use a second one), whichever is current.
+# Every data dir (E and M use their own), whichever is current.
 cleanup() {
   [ -n "${TMPBLOBS:-}" ] && chmod u+w "$TMPBLOBS" 2>/dev/null
   local dir pid
-  for dir in "$WORK/data" "$WORK/up/data"; do
+  for dir in "$WORK/data" "$WORK/bare/data" "$WORK/up/data"; do
     [ -s "$dir/daemon.json" ] || continue
     AGENT24_DATA_DIR=$dir limit 30 "$BIN/agent24" daemon stop > /dev/null 2>&1 && continue
     pid=$(jq -r .pid "$dir/daemon.json" 2>/dev/null)
@@ -243,6 +252,9 @@ check O13 "a wrong token: unauthorized, exit 1" "$(is "$rc/$(grep -c '^error: un
 a24 documents job job_00000000000000000000000000 > /dev/null 2> "$WORK/o14.err"; rc=$?
 check O14 "job that does not exist: not_found" "$(is "$rc/$(cat "$WORK/o14.err")" "1/error: not_found: no such job")" "rc=$rc; $(one "$WORK/o14.err")"
 
+a24 documents get doc_00000000000000000000000000 > /dev/null 2> "$WORK/o15.err"; rc=$?
+check O15 "get a document that does not exist: not_found" "$(is "$rc/$(cat "$WORK/o15.err")" "1/error: not_found: no such document")" "rc=$rc; $(one "$WORK/o15.err")"
+
 # --- C: cancel and retry (#1186) --------------------------------------------------
 # A blob store that cannot be written fails an import at its store stage:
 # storage_unavailable, which the desktop offers to retry.
@@ -281,6 +293,51 @@ done
 check C5 "list: the two retried imports are documents now" "$(is "$rc/$(last "$WORK/c5.out" '.data.documents | length')/$retried" 0/4/2)" \
   "rc=$rc; documents=$(last "$WORK/c5.out" '.data.documents | length'), retried ones listed: $retried"
 
+# --- U, again: images and file names (after C5, which counts the documents) ------
+doc_of() { a24 documents job "$1" --json 2>/dev/null | tail -n 1 | jq -r '.data.document_id // empty'; }
+# readtext DOC OUT: page 1's text. An image's text layer is built (OCR) on its
+# first read, which answers engine_unavailable until it is there; any other
+# answer is final. No new read starts after 60 s: each read itself may wait
+# 8 s for the layer before it answers, so the bound is the clock, not a
+# count, and the last read may end that much later. The case judges the
+# words, not the time.
+readtext() {
+  local t0
+  t0=$(perl -MTime::HiRes=time -e 'printf "%d", time * 1000')
+  # The deadline is checked right before each read, after its pause.
+  while [ $(($(perl -MTime::HiRes=time -e 'printf "%d", time * 1000') - t0)) -lt 60000 ]; do
+    a24 documents text "$1" 1 --json > "$2" 2>/dev/null && return 0
+    [ "$(last "$2" .error.code)" = engine_unavailable ] || return 1
+    sleep 1
+  done
+  return 1
+}
+# image ID WHAT FILE MEDIA: import a scan of the 2026 holiday notice, read its
+# words back. Its page has no text layer: "春节" can only come from the OCR.
+image() {
+  local rc st doc mt words
+  a24 documents import "$3" > "$WORK/$1.out" 2>&1; rc=$?
+  st=$(settle "$(job_of "$WORK/$1.out")"); doc=$(doc_of "$(job_of "$WORK/$1.out")")
+  mt=$(a24 documents get "$doc" 2>/dev/null | jq -r .head.media_type 2>/dev/null)
+  readtext "$doc" "$WORK/$1.text"
+  words=$(last "$WORK/$1.text" '[.data.blocks[].text] | join(" ") | test("春节")')
+  check "$1" "$2" "$(is "$rc/$st/$mt/$words" "0/succeeded/$4/true")" \
+    "rc=$rc; $st; $mt; blocks=$(last "$WORK/$1.text" '.data.blocks | length'), 春节: $words$(last "$WORK/$1.text" '.error.code // empty' | sed 's/^./; &/')"
+}
+SCAN=$REPO/docs/documenting/samples/s01/s01-06-zh-holiday-2026-scan/source.jpg
+image U8 "import a JPG scan: its words read back through OCR" "$SCAN" image/jpeg
+sips -s format png "$SCAN" --out "$WORK/scan.png" > /dev/null 2>&1
+image U9 "import a PNG of the same scan: its words read back" "$WORK/scan.png" image/png
+
+# U1's PDF under another name: the name is part of the import's key, so this
+# is an import of its own, not U1's job again.
+NAMED="$WORK/煮沸 通知.pdf"
+cp "$SMALL" "$NAMED"
+a24 documents import "$NAMED" > "$WORK/u10.out" 2>&1; rc=$?
+JOBN=$(job_of "$WORK/u10.out"); st=$(settle "$JOBN")
+title=$(a24 documents get "$(doc_of "$JOBN")" 2>/dev/null | jq -r .title 2>/dev/null)
+check U10 "a Chinese file name with a space: the document keeps it as its title" "$(is "$rc/$st/$title" "0/succeeded/煮沸 通知.pdf")" "rc=$rc; $st; title=$title"
+
 # --- T: the agent-facing tools (not in this release) -----------------------------
 code=$(curl -s -m 30 -o "$WORK/t1.out" -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/api/v1/tools")
 listed=$(jq -r 'if (.tools | type) == "array" and (.tools | length) > 0 then "listed" else "no list" end' "$WORK/t1.out" 2>/dev/null)
@@ -297,6 +354,120 @@ code=$(curl -s -m 30 -o "$WORK/t2.out" -w '%{http_code}' -X POST -H "Authorizati
   -H 'Content-Type: application/json' -d '{"context":{},"arguments":{}}' \
   "http://127.0.0.1:$PORT/api/v1/documents/_a24/tools/find")
 check T2 "the module's tool route is not reachable from outside" "$(is "$code/$(jq -r .error.code "$WORK/t2.out" 2>/dev/null)" 404/not_found)" "$code $(cut -c1-80 "$WORK/t2.out")"
+
+# --- R: reading, finding, extracting, rendering (after r6, only with --next) --------
+# DOC-1-57: `text --block/--limit/--require-complete`, `find`, `extract`,
+# `extraction`, `render`. On U1's document (DOC1), whose page 1 O6 read whole:
+# what a page holds is judged against that read, not against fixed ids.
+if [ -n "$NEXT" ]; then
+  ids() { last "$1" '[.data.blocks[].block_id] | join(",")'; }
+  # lines OUT: how many lines a --json run printed (its result is the only
+  # one), a last line with no newline counted too.
+  lines() { awk 'END { print NR }' "$1"; }
+  # dims PNG: its pixel size as WxH; for anything that is not an image, what
+  # sips makes of it ("" or "<nil>x<nil>"): only ever compared with a size.
+  dims() { sips -g pixelWidth -g pixelHeight "$1" 2>/dev/null | awk '/pixel/ { print $2 }' | paste -sd x -; }
+  png() { [ "$(head -c 8 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = 89504e470d0a1a0a ] && echo y; }
+  full=$(last "$WORK/o6.out" '[.data.blocks[:4][].block_id] | join(",")')
+
+  a24 documents text "$DOC1" 1 --limit 2 --json > "$WORK/r1.out" 2>/dev/null; rc=$?
+  CUR=$(last "$WORK/r1.out" '.data.next_cursor // empty')
+  a24 documents text "$DOC1" 1 --limit 2 --cursor "$CUR" --json > "$WORK/r1b.out" 2>/dev/null; rc2=$?
+  check R1 "text --limit 2, then --cursor: two blocks a page, the next two after them" \
+    "$(is "$rc/$rc2/$(last "$WORK/r1.out" '.data.blocks | length')/$(last "$WORK/r1b.out" '.data.blocks | length')/$(ids "$WORK/r1.out"),$(ids "$WORK/r1b.out")" "0/0/2/2/$full")" \
+    "rc=$rc/$rc2; $(ids "$WORK/r1.out") | $(ids "$WORK/r1b.out"); whole read: $full"
+
+  third=$(last "$WORK/o6.out" '.data.blocks[2].block_id')
+  a24 documents text "$DOC1" 1 --block "$third" --limit 1 --json > "$WORK/r2.out" 2>/dev/null; rc=$?
+  check R2 "text --block: starts at that block" \
+    "$(is "$rc/$(ids "$WORK/r2.out")/$(last "$WORK/r2.out" '.data.blocks[0].text')" "0/$third/$(last "$WORK/o6.out" '.data.blocks[2].text')")" \
+    "rc=$rc; ${third:-no block 3 in O6}: $(ids "$WORK/r2.out")"
+
+  a24 documents text "$DOC1" 1 --block "$third" --cursor "$CUR" --json > "$WORK/r3.out" 2>/dev/null; rc=$?
+  check R3 "text --block with --cursor: a result line, invalid_request, exit 1" \
+    "$(is "$rc/$(lines "$WORK/r3.out")/$(last "$WORK/r3.out" '"\(.type)/\(.status)/\(.error.code)/\(.error.message | test("give block or cursor, not both"))"')" 1/1/result/400/invalid_request/true)" \
+    "rc=$rc; $(last "$WORK/r3.out" .error.message)"
+
+  a24 documents find "$DOC1" 1 boil --json > "$WORK/r4.out" 2>/dev/null; rc=$?
+  n=$(last "$WORK/r4.out" '.data.matches | length')
+  each=$(last "$WORK/r4.out" '[.data.matches[] | .document_id == "'"$DOC1"'" and .page == 1 and (.quote | test("boil"; "i")) and (.block_id | type) == "string" and (.text_range.start | type) == "number"] | all')
+  check R4 "find: every match is an anchor on page 1 quoting the word" \
+    "$(is "$rc/$([ "${n:-0}" -ge 2 ] && echo y)/$each" 0/y/true)" "rc=$rc; matches=$n; first $(last "$WORK/r4.out" '.data.matches[0] | "\(.block_id) \(.quote)"')"
+
+  # at OUT I: match I's place as block@start, or nothing when there is no such
+  # match: a missing place never compares equal to another missing one.
+  at() { last "$1" ".data.matches[$2] | select((.block_id | type) == \"string\" and (.text_range.start | type) == \"number\") | \"\(.block_id)@\(.text_range.start)\""; }
+  a24 documents find "$DOC1" 1 boil --limit 1 --json > "$WORK/r5.out" 2>/dev/null; rc=$?
+  FCUR=$(last "$WORK/r5.out" '.data.next_cursor // empty')
+  a24 documents find "$DOC1" 1 boil --limit 1 --cursor "$FCUR" --json > "$WORK/r5b.out" 2>/dev/null; rc2=$?
+  check R5 "find --limit 1, then --cursor: the first match, then the second" \
+    "$(is "$rc/$rc2/$(last "$WORK/r5.out" '.data.matches | length')/$(last "$WORK/r5b.out" '.data.matches | length')/$(at "$WORK/r5.out" 0)/$(at "$WORK/r5b.out" 0)/$([ -n "$(at "$WORK/r4.out" 0)" ] && [ -n "$(at "$WORK/r4.out" 1)" ] && echo both)" "0/0/1/1/$(at "$WORK/r4.out" 0)/$(at "$WORK/r4.out" 1)/both")" \
+    "rc=$rc/$rc2; $(at "$WORK/r5.out" 0) then $(at "$WORK/r5b.out" 0)"
+
+  a24 documents find "$DOC1" 1 zzqqxxjj --json > "$WORK/r6.out" 2>/dev/null; rc=$?
+  check R6 "find what is not there: no matches, no cursor" \
+    "$(is "$rc/$(last "$WORK/r6.out" '"\(.data.matches | type)/\(.data.matches | length)/\(.data | has("next_cursor"))/\(.data.next_cursor)"')" 0/array/0/true/null)" "rc=$rc"
+
+  a24 documents render "$DOC1" 1 1 --out "$WORK/r7.png" > "$WORK/r7.out" 2>&1; rc=$?
+  check R7 "render --out: the page as a PNG at scale 1, the file named in the output" \
+    "$(is "$rc/$(png "$WORK/r7.png")/$(dims "$WORK/r7.png")/$(jq -r '"\(.scale == 1)/\(.written_to)"' "$WORK/r7.out" 2>/dev/null)" "0/y/612x792/true/$WORK/r7.png")" \
+    "rc=$rc; $(dims "$WORK/r7.png"); $(tr -d '\n ' < "$WORK/r7.out" | cut -c1-100)"
+
+  a24 documents render "$DOC1" 1 1 --scale 0.5 --region 0,0,100,50 --json > "$WORK/r8.out" 2>/dev/null; rc=$?
+  last "$WORK/r8.out" '.data.png // empty' | base64 -d > "$WORK/r8.png" 2>/dev/null
+  check R8 "render --scale 0.5 --region: that area, at that scale, in base64 with --json" \
+    "$(is "$rc/$(lines "$WORK/r8.out")/$(last "$WORK/r8.out" '"\(.type)/\(.data.media_type)/\(.data.scale == 0.5)/\(.data.bytes)"')/$(png "$WORK/r8.png")/$(dims "$WORK/r8.png")" "0/1/result/image/png/true/$(wc -c < "$WORK/r8.png" | tr -d ' ')/y/50x25")" \
+    "rc=$rc; $(dims "$WORK/r8.png"), $(wc -c < "$WORK/r8.png" | tr -d ' ') bytes"
+
+  a24 documents render "$DOC1" 1 99 --json > "$WORK/r9.out" 2>/dev/null; rc=$?
+  check R9 "render a page that is not there: not_found, exit 1" "$(is "$rc/$(last "$WORK/r9.out" '"\(.status)/\(.error.code)"')" 1/404/not_found)" "rc=$rc; $(last "$WORK/r9.out" .error.message)"
+
+  a24 documents render "$DOC1" 1 1 --out "$WORK/no/such/dir/p.png" --json > "$WORK/r10.out" 2>/dev/null; rc=$?
+  check R10 "render --out where no file can be made: file_unwritable, exit 1, nothing written" \
+    "$(is "$rc/$(last "$WORK/r10.out" '"\(.status)/\(.error.code)"')/$([ -e "$WORK/no" ] && echo made)" 1/400/file_unwritable/)" "rc=$rc"
+
+  printf '{"fields":[{"key":"issued_by","description":"who issued the notice","type":"text"}]}' > "$WORK/ask.json"
+  # No model is needed: what is judged is the job made and its end once
+  # cancelled, not what the model would extract.
+  a24 documents extract "$DOC1" 1 --schema "$WORK/ask.json" > "$WORK/r11.out" 2>&1; rc=$?
+  JOBX=$(job_of "$WORK/r11.out")
+  kind=$(a24 documents job "$JOBX" --json 2>/dev/null | tail -n 1 | jq -r .data.kind 2>/dev/null)
+  a24 documents cancel "$JOBX" > /dev/null 2>&1; rc2=$?
+  check R11 "extract: an extract job, which cancel then ends" \
+    "$(is "$rc/$(grep -cE '^extract job job_[0-9A-Z]{26} \((queued|running)\)$' "$WORK/r11.out")/$kind/$rc2/$(settle "$JOBX")" 0/1/extract/0/cancelled)" \
+    "rc=$rc/$rc2; $(one "$WORK/r11.out")"
+
+  a24 documents extract "$DOC1" 1 --schema "$WORK/ask.json" --rerun --json > "$WORK/r12.out" 2>/dev/null; rc=$?
+  check R12 "extract --rerun without --key: a result line, the key is required, exit 1" \
+    "$(is "$rc/$(lines "$WORK/r12.out")/$(last "$WORK/r12.out" '"\(.type)/\(.status)/\(.error.message)"')" "1/1/result/400/the Idempotency-Key header is required")" "rc=$rc"
+
+  a24 documents extract "$DOC1" 1 --schema "$WORK/ask.json" --key k1 --json > "$WORK/r13.out" 2>/dev/null; rc=$?
+  check R13 "extract --key without --rerun: refused, not ignored" \
+    "$(is "$rc/$(lines "$WORK/r13.out")/$(last "$WORK/r13.out" '"\(.type)/\(.status)/\(.error.code)/\(.error.message)"')" "1/1/result/400/invalid_request/--key names a rerun; give --rerun with it")" "rc=$rc"
+
+  printf 'fields: issued_by\n' > "$WORK/ask.txt"
+  a24 documents extract "$DOC1" 1 --schema "$WORK/ask.txt" --json > "$WORK/r14.out" 2>/dev/null; rc=$?
+  # That it is not sent is the CLI's unit test's to show: extract_request
+  # refuses it, so no request is made
+  # (a_schema_is_any_json_from_its_file_and_anything_else_is_refused_unsent).
+  check R14 "extract with a schema that is not JSON: refused" \
+    "$(is "$rc/$(lines "$WORK/r14.out")/$(last "$WORK/r14.out" '"\(.type)/\(.status)/\(.error.message)"')" "1/1/result/400/the schema is not JSON")" "rc=$rc"
+
+  a24 documents extraction ext_00000000000000000000000000 --json > "$WORK/r15.out" 2>/dev/null; rc=$?
+  check R15 "extraction that does not exist: not_found" "$(is "$rc/$(lines "$WORK/r15.out")/$(last "$WORK/r15.out" '"\(.type)/\(.status)/\(.error.message)"')" "1/1/result/404/no such extraction")" "rc=$rc"
+
+  printf '{"base":"http://127.0.0.1:%s","token":"%s","request":{"op":"find","documentId":"%s","revision":1,"query":"boil"}}' "$PORT" "$TOKEN" "$DOC1" \
+    | limit 120 "$BIN/agent24" documents request --host-stdin --json > "$WORK/r16.out" 2>/dev/null; rc=$?
+  check R16 "find through request --host-stdin (the desktop's way): the same matches" \
+    "$(is "$rc/$(lines "$WORK/r16.out")/$(last "$WORK/r16.out" '"\(.type)/\(.data.matches | type)/\(.data.matches | length)"')/$([ "${n:-0}" -ge 2 ] && echo ref)" "0/1/result/array/$n/ref")" "rc=$rc; R4 had $n"
+
+  printf '{"base":"http://127.0.0.1:%s","token":"%s","request":{"op":"renderPage","documentId":"%s","revision":1,"page":1,"scale":0.25}}' "$PORT" "$TOKEN" "$DOC1" \
+    | limit 120 "$BIN/agent24" documents request --host-stdin --json > "$WORK/r17.out" 2>/dev/null; rc=$?
+  last "$WORK/r17.out" '.data.png // empty' | base64 -d > "$WORK/r17.png" 2>/dev/null
+  check R17 "renderPage through request --host-stdin: the PNG in the result line" \
+    "$(is "$rc/$(lines "$WORK/r17.out")/$(last "$WORK/r17.out" '"\(.type)/\(.data.media_type)/\(.data.scale == 0.25)"')/$(png "$WORK/r17.png")/$(dims "$WORK/r17.png")" "0/1/result/image/png/true/y/153x198")" \
+    "rc=$rc; $(dims "$WORK/r17.png")"
+fi
 
 # --- N: no daemon -------------------------------------------------------------------
 limit 60 "$BIN/agent24" daemon stop > "$WORK/n0.out" 2>&1
@@ -317,6 +488,36 @@ check N4 "a malformed request with no daemon: invalid_request, not backend_not_r
 
 printf 'not json' | limit 60 "$BIN/agent24" documents import --host-stdin --json > "$WORK/n5.out" 2>/dev/null; rc=$?
 check N5 "--host-stdin --json with bad input: a result line, invalid_request" "$(is "$rc/$(last "$WORK/n5.out" '"\(.type)/\(.error.code)"')" 1/result/invalid_request)" "rc=$rc; $(cut -c1-100 "$WORK/n5.out")"
+
+# --- E: a package without the read engine ---------------------------------------------
+# What a user gets who skipped engines/pdfkit/build.sh (the module README's
+# step), or runs where the engine cannot be: imports work, reading does not.
+export AGENT24_DATA_DIR="$WORK/bare/data"
+BARE=$WORK/bare/pkg; mkdir -p "$BARE/bin"
+cp "$REPO/rust/apps/agent24-documents/domain-os.yml" "$BARE/"
+cp "$BIN/agent24-documents" "$BARE/bin/"
+a24 os install "$BARE" > "$WORK/e1.out" 2>&1; r1=$?
+PATH="$BIN:$PATH" limit 60 "$BIN/agent24" daemon start >> "$WORK/e1.out" 2>&1; r2=$?
+r3=1
+for _ in $(seq 1 150); do
+  a24 documents capabilities > "$WORK/e1.json" 2>/dev/null && { r3=0; break; }
+  sleep 0.2
+done
+check E1 "no engine in the package: the module starts, both pdfkit engines absent" \
+  "$(is "$r1/$r2/$r3/$(jq -r '"\(.storage.state)/" + ([.engines[] | select(.id == "apple-pdfkit") | "\(.kind):\(.state)"] | sort | join(","))' "$WORK/e1.json" 2>/dev/null)" "0/0/0/ready/parse:absent,render:absent")" \
+  "rc=$r1/$r2/$r3; $(jq -c '[.engines[] | {id, kind, state}]' "$WORK/e1.json" 2>/dev/null | cut -c1-120)"
+
+a24 documents import "$SMALL" > "$WORK/e2.out" 2>&1; rc=$?
+JOBE=$(job_of "$WORK/e2.out"); st=$(settle "$JOBE")
+check E2 "no engine: an import still succeeds" "$(is "$rc/$st" 0/succeeded)" "rc=$rc; $JOBE $st"
+
+a24 documents text "$(doc_of "$JOBE")" 1 --json > "$WORK/e3.out" 2>/dev/null; rc=$?
+check E3 "no engine: text answers engine_unavailable (503, retryable), exit 1" \
+  "$(is "$rc/$(last "$WORK/e3.out" '"\(.type)/\(.status)/\(.error.code)/\(.error.details.engine)/\(.error.details.retryable)/\(.error.message)"')" \
+    "1/result/503/engine_unavailable/apple-pdfkit/true/no read engine on this platform")" \
+  "rc=$rc; $(tail -n 1 "$WORK/e3.out" | cut -c1-140)"
+limit 60 "$BIN/agent24" daemon stop > /dev/null 2>&1
+for _ in $(seq 1 40); do [ -s "$AGENT24_DATA_DIR/daemon.json" ] || break; sleep 0.5; done
 
 # --- M: upgrading from r5 (main), only with --old ------------------------------------
 # r5's CLI has no `documents`: its side is driven with its own `os` and
@@ -394,7 +595,7 @@ if [ -n "$OLD" ]; then
   PATH="$OLD:$PATH" limit 60 "$OLD/agent24" daemon start >> "$WORK/m6.out" 2>&1; r1=$?
   st=""
   for _ in $(seq 1 150); do
-    a24 documents list --json > "$WORK/m6l.out" 2>/dev/null
+    a24 documents list --json > "$WORK/m6l.out" 2>/dev/null; rl=$?
     st=$(last "$WORK/m6l.out" '.error.code // "listed"')
     [ "$st" = module_not_ready ] || break
     sleep 0.2
@@ -402,8 +603,11 @@ if [ -n "$OLD" ]; then
   limit 60 "$OLD/agent24" daemon stop >> "$WORK/m6.out" 2>&1
   for _ in $(seq 1 40); do [ -s "$AGENT24_DATA_DIR/daemon.json" ] || break; sleep 0.5; done
   h2=$(dump)
+  # r5's kernel must start for this to say anything about the documents library:
+  # a kernel store migration newer than r5's stops it first (its error is shown).
   check M6 "back to r5: the library refused (storage_unavailable), not changed" \
-    "$(is "$vb/$r1/$st/$h2" "8/1/0/storage_unavailable/$h1")" "library $vb; rc=$r1; $(last "$WORK/m6l.out" .error.message); dump $h1 → $h2"
+    "$(is "$vb/$r1/$rl/$st/$h2" "8/1/0/1/storage_unavailable/$h1")" \
+    "library $vb; rc=$r1, list rc=$rl; $(last "$WORK/m6l.out" .error.message); dump $h1 → $h2$(grep -m 1 '^error: ' "$WORK/m6.out" | cut -c1-140 | sed 's/^/; r5: /')"
 
   a24 os uninstall documents > "$WORK/m7.out" 2>&1
   a24 os install "$PKG" >> "$WORK/m7.out" 2>&1

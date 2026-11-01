@@ -43,24 +43,30 @@ fn queries_past_64_items_and_multibyte_text_work() {
     assert_eq!(&text[hits[1].0..hits[1].1], long);
 }
 
+/// `find`, and the steps it took.
+fn counted(text: &str, q: &str) -> (Vec<(usize, usize)>, usize) {
+    super::STEPS.with(|s| s.set(0));
+    let hits = find(text, q);
+    (hits, super::STEPS.with(std::cell::Cell::get))
+}
+
 /// The worst case of trying every start: a 16 KiB block of one letter and a
-/// 500-character query that fails at its last character. Linear here.
+/// 500-character query that fails at its last character. One step a
+/// character, where retrying from every start would take some 500 each.
+/// Counted, not timed: a busy machine stretched a timed bound past 5 s for
+/// the same work.
 #[test]
 fn the_worst_case_stays_linear() {
     let text = "a".repeat(16 * 1024);
     let query = format!("{}b", "a".repeat(499));
-    let start = std::time::Instant::now();
-    for _ in 0..100 {
-        assert_eq!(find(&text, &query), []);
-    }
-    // 100 such blocks (a whole response's pages): about 0.4 s in a debug
-    // build on a laptop. Retrying from every start does some 60 times the
-    // work (8 million comparisons a block, not 130 thousand word steps), so
-    // 5 s still tells the two apart and leaves room for a busy CI runner,
-    // where 1 s did not.
-    assert!(
-        start.elapsed() < std::time::Duration::from_secs(5),
-        "{:?}",
-        start.elapsed()
-    );
+    assert_eq!(counted(&text, &query), (vec![], text.len()));
+    // With matches, finding where each starts reads its own range back once:
+    // at most two steps a character in all. Here 65535 of the 65536: 32768
+    // forward, then 3 back for the first match and 4 for each other (the
+    // fourth clears the state). So one more step for each match also fails
+    // this, well short of quadratic.
+    let text = "a b ".repeat(8 * 1024);
+    let (hits, steps) = counted(&text, "a b");
+    assert_eq!(hits.len(), 8 * 1024);
+    assert!(steps <= 2 * text.len(), "{steps} steps for {}", text.len());
 }

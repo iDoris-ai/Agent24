@@ -83,6 +83,42 @@ describe('ChatPage', () => {
     expect(thirdCallBody.session_id).not.toBe(firstCallBody.session_id)
   })
 
+  // Issue #1517: "New chat" clears the thread and mints a new session_id, so
+  // the previous context is not sent to the model.
+  it('new chat clears messages and uses a different session_id for the next send', async () => {
+    mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { message: { content: 'ack' } } })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'old topic' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
+    const oldBody = mockBackendProxy.mock.calls[0][0].body
+
+    fireEvent.click(screen.getByRole('button', { name: '新对话' }))
+    expect(screen.queryByText('old topic')).not.toBeInTheDocument()
+    expect(screen.queryByText('ack')).not.toBeInTheDocument()
+
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), { target: { value: 'new topic' } })
+    fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(mockBackendProxy).toHaveBeenCalledTimes(2))
+    const newBody = mockBackendProxy.mock.calls[1][0].body
+    expect(newBody.session_id).toBeTruthy()
+    expect(newBody.session_id).not.toBe(oldBody.session_id)
+    expect(newBody.messages).toEqual([{ role: 'user', content: 'new topic' }])
+  })
+
+  it('disables the new chat button while a reply is in flight', async () => {
+    let resolve!: (v: unknown) => void
+    mockBackendProxy.mockReturnValue(new Promise(r => { resolve = r }))
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'slow' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByRole('button', { name: '新对话' })).toBeDisabled())
+    resolve({ ok: true, status: 200, data: { message: { content: 'done' } } })
+    await waitFor(() => expect(screen.getByRole('button', { name: '新对话' })).toBeEnabled())
+  })
+
   // Review M3: `/api/v1/chat` now reports the server-measured model_id/tier
   // for the call that actually served it — the suffix shows THAT, never a
   // guessed/default name.
@@ -323,6 +359,34 @@ describe('ChatPage with Knowledge', () => {
     expect(screen.getByText(chatMessages.zh['knowledge.via'])).toBeInTheDocument()
     expect(screen.queryByText(/本次没有读到/)).not.toBeInTheDocument()
     expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: 'second', session_id: 's1' } }))
+  })
+
+  it('runs the first Knowledge turn of a new conversation in a new session', async () => {
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: mockBackendProxy, knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
+      writable: true,
+      configurable: true,
+    })
+    let sessions = 0
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { prompt?: string } }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: `s${++sessions}` } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt}` } }
+      const text = req.path.endsWith('r-first') ? 'answer one' : 'answer two'
+      return { ok: true, status: 200, data: { status: 'completed', output: { text }, knowledge: { searched: true, read_chunks: [] } } }
+    })
+
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'first' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('answer one')).toBeInTheDocument(), { timeout: 3000 })
+
+    await waitFor(() => expect(screen.getByRole('button', { name: '新对话' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: '新对话' }))
+    fireEvent.change(textarea, { target: { value: 'second' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('answer two')).toBeInTheDocument(), { timeout: 3000 })
+    expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: 'second', session_id: 's2' } }))
   })
 })
 

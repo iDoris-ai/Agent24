@@ -53,6 +53,7 @@ dependencies = [
  "agent24-os-packages",
  "agent24-protocol",
  "agent24-store",
+ "base64",
  "clap",
  "crossterm",
  "fs2",
@@ -92,6 +93,17 @@ dependencies = [
  "tower",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "agent24-components"
+version = "0.1.0"
+dependencies = [
+ "agent24-idoris",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -140,6 +152,7 @@ dependencies = [
 name = "agent24-documents-client"
 version = "0.6.0"
 dependencies = [
+ "base64",
  "reqwest",
  "serde",
  "serde_json",
@@ -522,6 +535,7 @@ version = "0.6.0"
 dependencies = [
  "agent24-agent",
  "agent24-comm",
+ "agent24-components",
  "agent24-core",
  "agent24-decide",
  "agent24-domain",
@@ -564,12 +578,14 @@ dependencies = [
  "sqlx",
  "tar",
  "tempfile",
+ "thiserror 2.0.19",
  "tokio",
  "tokio-tungstenite 0.24.0",
  "tokio-util",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "unicode-general-category",
  "uuid",
  "zeroize",
 ]

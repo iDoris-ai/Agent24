@@ -151,6 +151,7 @@ describe('A1 backendProxy allowlist', () => {
     ['POST', '/api/v1/approvals/abc'],
     ['POST', '/api/v1/module-approvals/abc'],
     ['POST', '/api/v1/shutdown'],
+    ['POST', '/api/v1/comm/install'],
     ['PUT', '/api/v1/tool-overrides/shell'],
     ['DELETE', '/api/v1/tool-overrides/shell'],
     ['DELETE', '/api/v1/standing-grants/g1'],
@@ -287,6 +288,22 @@ describe('A1 backendProxy allowlist', () => {
       expect(res.ok).toBe(false)
       expect(seen).toHaveLength(0)
     })
+  })
+})
+
+describe('CommInstall elevated IPC', () => {
+  it('requires native confirmation and cancellation sends no request', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 1 })
+    const result = await call(IpcChannels.CommInstall)
+    expect(result.ok).toBe(false)
+    expect(seen).toHaveLength(0)
+  })
+  it('confirmation sends exactly one fixed install request', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    await call(IpcChannels.CommInstall)
+    expect(showMessageBox).toHaveBeenCalledTimes(1)
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toMatchObject({ method: 'POST', url: '/api/v1/comm/install' })
   })
 })
 

@@ -3,6 +3,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   CommApiError,
   getCommStatus,
+  importCommIdentity,
+  installComm,
   listCommContacts,
   listCommIdentities,
   listCommRelays,
@@ -42,6 +44,15 @@ afterEach(() => {
 })
 
 describe('COMM typed backend API', () => {
+  it('installs through the dedicated elevated IPC instead of the generic proxy', async () => {
+    const proxy = setProxy(() => { throw new Error('generic proxy must not install executables') })
+    const result = { installed_version: 'v0.27.2', path: '/state/components/hyphae/v0.27.2/hyphae', restart_required: false, reason: null }
+    window.agent24 = { ...window.agent24, commInstall: vi.fn(async () => successful(result)) }
+    expect(await installComm()).toEqual(result)
+    expect(window.agent24.commInstall).toHaveBeenCalledOnce()
+    expect(proxy).not.toHaveBeenCalled()
+  })
+
   it('unwraps nested success envelopes and calls the frozen read/status routes', async () => {
     const proxy = setProxy((({ path }: { path: string }) => {
       if (path.endsWith('/identity')) {
@@ -167,5 +178,14 @@ describe('COMM typed backend API', () => {
     const failure = await listCommIdentities().catch((e: unknown) => e)
     expect(failure).toBeInstanceOf(CommApiError)
     expect(failure).toMatchObject({ code: 'not_configured', message: 'no Hyphae binary is configured; set A24_HYPHAE_BIN', status: 409 })
+  })
+
+  it('importCommIdentity never reflects the source keystore password in a thrown error', async () => {
+    const password = 'import-secret-pw'
+    setProxy(() => ({ ok: false, status: 409, data: { ok: false, error: 'locked', message: `bad password ${password}` } }))
+    const failure = await importCommIdentity('/Users/alice', password).catch((e: unknown) => e)
+    expect(failure).toBeInstanceOf(CommApiError)
+    expect((failure as Error).message).not.toContain(password)
+    expect(failure).toMatchObject({ code: 'locked', status: 409 })
   })
 })

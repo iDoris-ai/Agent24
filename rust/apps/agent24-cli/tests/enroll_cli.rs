@@ -956,3 +956,300 @@ fn enrolled_frame_must_name_daemon_json_port() {
         assert_no_secret(&stdout, &stderr);
     }
 }
+
+// ---- I-1: `agent24 idoris` over the enrolment session -------------------
+
+/// One request the fake iDoris HTTP side saw.
+#[derive(Clone)]
+struct IdorisSeen {
+    line: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+/// A fake capabilities daemon for `/api/v1/idoris/*`: status and operation
+/// progress are everyday (bearer only); install needs a matching grant.
+fn spawn_idoris_http(seen: Arc<Mutex<Vec<IdorisSeen>>>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let Some((line, headers, body)) = read_http(&mut stream) else {
+                continue;
+            };
+            let line = line.trim_end().to_owned();
+            if line.starts_with("GET /api/v1/health") {
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    &json!({"protocol_version": agent24_protocol::PROTOCOL_VERSION}),
+                );
+                continue;
+            }
+            seen.lock().unwrap().push(IdorisSeen {
+                line: line.clone(),
+                headers: headers.clone(),
+                body,
+            });
+            if headers.get("authorization").map(String::as_str) != Some(&format!("Bearer {TOKEN}"))
+            {
+                respond(
+                    &mut stream,
+                    "401 Unauthorized",
+                    &json!({"error":{"code":"unauthorized","message":"bad bearer"}}),
+                );
+                continue;
+            }
+            let op = |phase: &str, result: Option<&str>| {
+                json!({"operation_id":"op-12","action":"install","phase":phase,
+                       "result":result,"error_code":null,"cancellable":result.is_none(),
+                       "idempotency_key":"internal-key"})
+            };
+            if line.starts_with("GET /api/v1/idoris/status ") {
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    &json!({"state":"not_installed","version":null,"data_port":null,
+                            "admin_port":null,"roles":[],"last_error":null,
+                            "current_operation":null}),
+                );
+            } else if line.starts_with("GET /api/v1/idoris/operations/op-12 ") {
+                respond(&mut stream, "200 OK", &op("installed", Some("succeeded")));
+            } else if line.starts_with("POST /api/v1/idoris/install ") {
+                if headers.get("x-agent24-elevation").map(String::as_str) == Some(GRANT) {
+                    respond(&mut stream, "202 Accepted", &op("downloading", None));
+                } else {
+                    respond(
+                        &mut stream,
+                        "403 Forbidden",
+                        &json!({"error":{"code":"presence_required","message":"Presence confirmation required","operation":"IdorisLifecycle"}}),
+                    );
+                }
+            } else {
+                respond(
+                    &mut stream,
+                    "404 Not Found",
+                    &json!({"error":{"code":"not_found","message":line}}),
+                );
+            }
+        }
+    });
+    port
+}
+
+struct IdorisFake {
+    seen: Arc<Mutex<Vec<IdorisSeen>>>,
+    frames: Arc<Mutex<Vec<Value>>>,
+}
+
+fn start_idoris(script: UdsScript, home: &Path) -> IdorisFake {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let http_port = spawn_idoris_http(Arc::clone(&seen));
+    let sock = home.join("enroll.sock");
+    serve_uds(
+        UnixListener::bind(&sock).unwrap(),
+        http_port,
+        script,
+        Arc::clone(&frames),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    write_daemon_json(
+        home,
+        &json!({"port": http_port, "pid": std::process::id(), "version": "9.9.9",
+                "generation": GENERATION, "auth_mode": "capabilities",
+                "protocol_version": agent24_protocol::PROTOCOL_VERSION,
+                "enroll_endpoint": sock}),
+    );
+    IdorisFake { seen, frames }
+}
+
+/// Run `agent24 idoris <args>`. A spawned daemon would mask the result, so
+/// `AGENT24D_BIN` points nowhere.
+fn run_idoris(home: &Path, args: &[&str], path: &std::ffi::OsStr) -> (bool, String, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent24"))
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", home)
+        .env("AGENT24D_BIN", home.join("no-spawned-daemon"))
+        .arg("idoris")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("CLI exceeded the 15 second test deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+fn os_path() -> std::ffi::OsString {
+    std::env::var_os("PATH").unwrap_or_default()
+}
+
+#[test]
+fn idoris_status_is_everyday_with_the_enrolled_token() {
+    let home = tmp_home();
+    let fake = start_idoris(script(vec![]), home.path());
+    let (ok, stdout, stderr) = run_idoris(home.path(), &["status", "--json"], &os_path());
+    assert!(ok, "{stdout} {stderr}");
+    let body: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(body["state"], "not_installed");
+    let seen = fake.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].line.starts_with("GET /api/v1/idoris/status "));
+    assert!(!seen[0].headers.contains_key("x-agent24-elevation"));
+    let frames = fake.frames.lock().unwrap();
+    assert!(frames.iter().all(|f| f["op"] != "elevate"), "{frames:?}");
+    assert!(!stderr.contains("Waiting for approval"), "{stderr}");
+    assert_no_secret(&stdout, &stderr);
+}
+
+#[test]
+fn idoris_install_elevates_once_on_the_enrolled_connection() {
+    let home = tmp_home();
+    let fake = start_idoris(script(pending_then(elevated())), home.path());
+    let (ok, stdout, stderr) = run_idoris(home.path(), &["install", "--yes", "--json"], &os_path());
+    assert!(ok, "{stdout} {stderr}");
+    let body: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(body["result"], "succeeded");
+    assert!(body.get("idempotency_key").is_none(), "{body}");
+    assert!(
+        stderr.contains("Waiting for approval in the Agent24 app"),
+        "{stderr}"
+    );
+    let seen = fake.seen.lock().unwrap();
+    let lines: Vec<_> = seen.iter().map(|s| s.line.as_str()).collect();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(lines[0].starts_with("POST /api/v1/idoris/install "));
+    assert!(lines[1].starts_with("POST /api/v1/idoris/install "));
+    // Progress polling is everyday: no second approval.
+    assert!(lines[2].starts_with("GET /api/v1/idoris/operations/op-12 "));
+    assert!(!seen[0].headers.contains_key("x-agent24-elevation"));
+    assert_eq!(seen[1].headers["x-agent24-elevation"], GRANT);
+    assert!(!seen[2].headers.contains_key("x-agent24-elevation"));
+    // The approved request is the rejected one: same bytes, same key.
+    assert_eq!(seen[0].body, br#"{"consent":true}"#);
+    assert_eq!(seen[0].body, seen[1].body);
+    assert_eq!(
+        seen[0].headers["idempotency-key"],
+        seen[1].headers["idempotency-key"]
+    );
+    let frames = fake.frames.lock().unwrap();
+    let elevates: Vec<_> = frames.iter().filter(|f| f["op"] == "elevate").collect();
+    assert_eq!(elevates.len(), 1);
+    assert_eq!(elevates[0]["method"], "POST");
+    assert_eq!(elevates[0]["path"], "/api/v1/idoris/install");
+    assert_eq!(elevates[0]["body_sha256"], sha256_hex(&seen[0].body));
+    assert_no_secret(&stdout, &stderr);
+}
+
+#[test]
+fn idoris_install_denied_in_the_app_is_presence_denied() {
+    let home = tmp_home();
+    let fake = start_idoris(
+        script(pending_then(presence_error("presence_denied"))),
+        home.path(),
+    );
+    let (ok, stdout, stderr) = run_idoris(home.path(), &["install", "--yes", "--json"], &os_path());
+    assert!(!ok);
+    let body = error_body(&stdout);
+    assert_eq!(body["error"]["code"], "presence_denied");
+    assert!(stderr.contains("denied in the Agent24 app"), "{stderr}");
+    assert_eq!(
+        fake.seen.lock().unwrap().len(),
+        1,
+        "no retry without a grant"
+    );
+    assert_no_secret(&stdout, &stderr);
+}
+
+#[test]
+fn idoris_enrolment_failures_keep_their_codes() {
+    for (code, mut script) in [
+        ("identity_rejected", script(vec![])),
+        ("endpoint_mismatch", script(vec![])),
+    ] {
+        if code == "identity_rejected" {
+            script.handshake_error = Some(presence_error("identity_rejected"));
+        } else {
+            script.enrolled_port = Some(1);
+        }
+        let home = tmp_home();
+        let fake = start_idoris(script, home.path());
+        let (ok, stdout, stderr) = run_idoris(home.path(), &["status", "--json"], &os_path());
+        assert!(!ok, "{code}");
+        assert_eq!(error_body(&stdout)["error"]["code"], code, "{stdout}");
+        assert!(fake.seen.lock().unwrap().is_empty(), "{code}: nothing sent");
+        assert_no_secret(&stdout, &stderr);
+    }
+}
+
+#[test]
+fn idoris_unanswering_capabilities_daemon_is_daemon_unavailable() {
+    let home = tmp_home();
+    // A port nothing listens on: bind, read the port, then close it.
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    write_daemon_json(
+        home.path(),
+        &json!({"port": port, "pid": std::process::id(), "version": "9.9.9",
+                "generation": GENERATION, "auth_mode": "capabilities",
+                "protocol_version": agent24_protocol::PROTOCOL_VERSION,
+                "enroll_endpoint": home.path().join("enroll.sock")}),
+    );
+    let (ok, stdout, _) = run_idoris(home.path(), &["status", "--json"], &os_path());
+    assert!(!ok);
+    assert_eq!(error_body(&stdout)["error"]["code"], "daemon_unavailable");
+}
+
+/// The 10-29 `daemon_unavailable` report: liveness of the recorded pid was
+/// probed with a bare `ps`, so a PATH without /bin made the running
+/// capabilities daemon look dead and the CLI tried to spawn a second one.
+#[test]
+fn idoris_finds_the_running_daemon_without_ps_on_path() {
+    let home = tmp_home();
+    let fake = start_idoris(script(vec![]), home.path());
+    let empty = home.path().join("empty-bin");
+    std::fs::create_dir_all(&empty).unwrap();
+    let (ok, stdout, stderr) = run_idoris(home.path(), &["status", "--json"], empty.as_os_str());
+    assert!(ok, "{stdout} {stderr}");
+    assert_eq!(fake.seen.lock().unwrap().len(), 1);
+}
+
+/// L3: a grant that cannot be sent as a header value is reported; the CLI
+/// never resends the request without it.
+#[test]
+fn idoris_unsendable_grant_is_reported_without_a_resend() {
+    let home = tmp_home();
+    let fake = start_idoris(
+        script(pending_then(json!({"v":1,"op":"elevated",
+            "challenge_id":"c1c1c1c1c1c1c1c1","grant":"bad\u{1}grant","expires_in":60}))),
+        home.path(),
+    );
+    let (ok, stdout, _) = run_idoris(home.path(), &["install", "--yes", "--json"], &os_path());
+    assert!(!ok);
+    assert_eq!(error_body(&stdout)["error"]["code"], "invalid_response");
+    assert_eq!(
+        fake.seen.lock().unwrap().len(),
+        1,
+        "no resend without the grant"
+    );
+}

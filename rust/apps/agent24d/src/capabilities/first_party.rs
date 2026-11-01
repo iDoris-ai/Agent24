@@ -34,7 +34,9 @@ struct Grant {
     target: Target,
     expires_at: Instant,
 }
-struct AttachedSummary {
+/// A presence summary the daemon derived from the rejected request's own
+/// body, kept until the matching `elevate` arrives (one per token).
+struct RequestSummary {
     target: Target,
     summary: String,
     expires_at: Instant,
@@ -44,7 +46,7 @@ pub struct FirstPartyAuthority {
     store: CapabilityStore,
     provider: Mutex<Option<Arc<dyn PresenceProvider>>>,
     grants: Mutex<HashMap<[u8; 32], Grant>>,
-    attached_summaries: Mutex<HashMap<String, AttachedSummary>>,
+    request_summaries: Mutex<HashMap<String, RequestSummary>>,
     module_surfaces: Mutex<Arc<Vec<super::delegation::ModuleSurface>>>,
 }
 impl FirstPartyAuthority {
@@ -53,7 +55,7 @@ impl FirstPartyAuthority {
             store,
             provider: Mutex::new(None),
             grants: Mutex::new(HashMap::new()),
-            attached_summaries: Mutex::new(HashMap::new()),
+            request_summaries: Mutex::new(HashMap::new()),
             module_surfaces: Mutex::new(Arc::new(Vec::new())),
         }
     }
@@ -71,7 +73,98 @@ impl FirstPartyAuthority {
         let Ok(manifest) = agent24_domain::DomainOsManifest::from_yaml(&body.manifest) else {
             return;
         };
-        let Ok(mut summaries) = self.attached_summaries.lock() else {
+        let summary = format!(
+            "register attached module '{}'; {}; allow_relax: {}; model_access: {}; kernel_capabilities: [{}]; host_commands: [{}]",
+            manifest.name(),
+            if registrations.iter().any(|r| r.name == manifest.name()) {
+                "replace existing registration"
+            } else {
+                "new registration"
+            },
+            body.allow_relax,
+            manifest.model_access().as_str(),
+            manifest
+                .kernel_capabilities()
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            manifest.host_commands().join(", "),
+        );
+        self.remember(
+            token_id,
+            Target {
+                operation: Operation::ModuleAdmin,
+                method: "POST".into(),
+                template: "/api/v1/attached".into(),
+                path: "/api/v1/attached".into(),
+                body_sha256: body_digest(bytes),
+            },
+            summary,
+        );
+    }
+    /// I-1: derive the presence summary for an iDoris install or connect
+    /// from the rejected request's body. Any other template, or a body the
+    /// handler would refuse, leaves nothing to approve.
+    pub fn remember_idoris_request(&self, token_id: &str, template: &str, bytes: &[u8]) {
+        let summary = match template {
+            "/api/v1/idoris/install" => {
+                let Ok(body) =
+                    serde_json::from_slice::<agent24d::idoris_host::InstallRequest>(bytes)
+                else {
+                    return;
+                };
+                format!(
+                    "install the locked iDoris release (downloads and runs software after integrity and signature checks); consent: {}",
+                    body.consent
+                )
+            }
+            "/api/v1/idoris/connect" => {
+                let Ok(body) =
+                    serde_json::from_slice::<agent24d::idoris_host::ConnectRequest>(bytes)
+                else {
+                    return;
+                };
+                let (Some(endpoint), Some(daily), Some(deep)) = (
+                    shown(&body.endpoint),
+                    shown(&body.daily_model),
+                    body.deep_model
+                        .as_deref()
+                        .map_or_else(|| Some("none".to_owned()), shown),
+                ) else {
+                    return;
+                };
+                format!(
+                    "connect iDoris to oMLX at {endpoint}; daily model: {daily}; deep model: {deep}; share the local oMLX credential with iDoris: {}; save oMLX credential: {}; replace existing connection: {}; core reserved bytes: {}",
+                    body.consent.as_ref().is_some_and(|c| c.share_omlx_key),
+                    body.save_omlx_key,
+                    body.replace,
+                    body.core_reserved_bytes
+                        .map_or_else(|| "daemon allocation".to_owned(), |n| n.to_string()),
+                )
+            }
+            _ => return,
+        };
+        self.remember(
+            token_id,
+            Target {
+                operation: Operation::IdorisLifecycle,
+                method: "POST".into(),
+                template: template.into(),
+                path: template.into(),
+                body_sha256: body_digest(bytes),
+            },
+            summary,
+        );
+    }
+    fn remember(&self, token_id: &str, target: Target, summary: String) {
+        // Defence in depth only: this caps `details`, not the dialog string.
+        // The authoritative check is in `elevate()`, which measures the full
+        // "{identifier} (pid {pid}) wants to: {details}" the desktop clips.
+        if summary.encode_utf16().count() > SUMMARY_MAX_UTF16 {
+            return;
+        }
+        let Ok(mut summaries) = self.request_summaries.lock() else {
             return;
         };
         let now = Instant::now();
@@ -86,22 +179,9 @@ impl FirstPartyAuthority {
         }
         summaries.insert(
             token_id.to_owned(),
-            AttachedSummary {
-                target: Target {
-                    operation: Operation::ModuleAdmin,
-                    method: "POST".into(),
-                    template: "/api/v1/attached".into(),
-                    path: "/api/v1/attached".into(),
-                    body_sha256: body_digest(bytes),
-                },
-                summary: format!(
-                    "register attached module '{}'; {}; allow_relax: {}; model_access: {}; kernel_capabilities: [{}]; host_commands: [{}]",
-                    manifest.name(),
-                    if registrations.iter().any(|r| r.name == manifest.name()) { "replace existing registration" } else { "new registration" },
-                    body.allow_relax, manifest.model_access().as_str(),
-                    manifest.kernel_capabilities().iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", "),
-                    manifest.host_commands().join(", "),
-                ),
+            RequestSummary {
+                target,
+                summary,
                 expires_at: now + Duration::from_secs(GRANT_TTL),
             },
         );
@@ -112,9 +192,12 @@ impl FirstPartyAuthority {
         }
     }
     fn target_summary(&self, token_id: &str, target: &Target) -> Option<String> {
-        if target.template == "/api/v1/attached" {
+        if matches!(
+            target.template.as_str(),
+            "/api/v1/attached" | "/api/v1/idoris/install" | "/api/v1/idoris/connect"
+        ) {
             return self
-                .attached_summaries
+                .request_summaries
                 .lock()
                 .ok()?
                 .get(token_id)
@@ -123,6 +206,24 @@ impl FirstPartyAuthority {
         }
         if target.body_sha256 != body_digest(b"") {
             return None;
+        }
+        match target.template.as_str() {
+            "/api/v1/idoris/start" => return Some("start managed iDoris".to_owned()),
+            "/api/v1/idoris/stop" => return Some("stop managed iDoris".to_owned()),
+            "/api/v1/idoris/omlx/candidates" => {
+                return Some(
+                    "list local oMLX endpoints, their identity, authentication and model IDs"
+                        .to_owned(),
+                );
+            }
+            "/api/v1/idoris/operations/{id}/cancel" => {
+                let id = target
+                    .path
+                    .strip_prefix("/api/v1/idoris/operations/")?
+                    .strip_suffix("/cancel")?;
+                return Some(format!("cancel iDoris operation {}", shown(id)?));
+            }
+            _ => {}
         }
         let name = target
             .path
@@ -362,12 +463,23 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
         .ok_or(EnrollErrorCode::UnknownRoute)?;
     // Full CORE-2 will enable elevated operations individually; each must first
     // have a daemon-generated summary derived from its actual request body.
-    let supported = policy.operation == Operation::ModuleAdmin
+    let supported = (policy.operation == Operation::ModuleAdmin
         && method == Method::POST
         && matches!(
             policy.template,
             "/api/v1/attached" | "/api/v1/os/{name}/delegation"
-        );
+        ))
+        // I-1: the iDoris lifecycle, each with a daemon-derived summary.
+        || (policy.operation == Operation::IdorisLifecycle
+            && matches!(
+                (method.as_str(), policy.template),
+                ("POST", "/api/v1/idoris/install")
+                    | ("POST", "/api/v1/idoris/connect")
+                    | ("POST", "/api/v1/idoris/start")
+                    | ("POST", "/api/v1/idoris/stop")
+                    | ("POST", "/api/v1/idoris/operations/{id}/cancel")
+                    | ("GET", "/api/v1/idoris/omlx/candidates")
+            ));
     if policy.level != AssuranceLevel::Elevated || !supported {
         return Err(EnrollErrorCode::NotElevatedOperation);
     }
@@ -430,6 +542,11 @@ impl EnrollAuthority for FirstPartyAuthority {
             "{} (pid {}) wants to: {}",
             peer.identity.identifier, peer.pid, details
         );
+        // The desktop clips this whole string, not just `details`: refuse
+        // before anything is sent to `pending` or shown, so no tail is hidden.
+        if summary.encode_utf16().count() > SUMMARY_MAX_UTF16 {
+            return Err(EnrollErrorCode::NotElevatedOperation);
+        }
         let req = PresenceRequest {
             challenge_id: challenge_id.clone(),
             operation: target.operation,
@@ -487,6 +604,47 @@ impl EnrollAuthority for FirstPartyAuthority {
     }
 }
 
+/// The longest request-supplied value a presence summary shows.
+const SHOWN_MAX_CHARS: usize = 120;
+
+/// The longest whole dialog summary, in UTF-16 code units. MUST match the
+/// desktop `clip()` limit in `apps/desktop/src/main/presence-poller.ts`: a
+/// longer string would be clipped there and its tail hidden from the user.
+/// The authoritative check is in `elevate()`, on the full string including
+/// the "{identifier} (pid {pid}) wants to: " prefix and for every summary
+/// source (including delegation); `remember()` repeats it on the details
+/// alone as redundancy.
+const SUMMARY_MAX_UTF16: usize = 500;
+
+/// A request-supplied string as a presence summary shows it, or `None` when
+/// it cannot be shown faithfully, which leaves nothing to approve. The value
+/// comes back as a double-quoted, escaped JSON string so its boundaries are
+/// unambiguous even if it contains `; ` or other summary punctuation.
+/// Refused rather than dropped or cut: control, format (bidi overrides,
+/// zero-width), line and paragraph separator characters; any whitespace other
+/// than a plain ASCII space; variation selectors; and the invisible filler
+/// letters (U+3164, U+2800, U+115F, U+1160, U+FFA0). A value over
+/// `SHOWN_MAX_CHARS` is refused. The length of the *whole* summary is capped
+/// separately (`SUMMARY_MAX_UTF16`, enforced in `elevate`); this function
+/// alone does not stop a long summary from being clipped by the dialog.
+fn shown(value: &str) -> Option<String> {
+    use unicode_general_category::{GeneralCategory as G, get_general_category};
+    let hidden = |c: char| {
+        matches!(
+            get_general_category(c),
+            G::Control | G::Format | G::LineSeparator | G::ParagraphSeparator
+        ) || (c.is_whitespace() && c != ' ')
+            || matches!(
+                c,
+                '\u{3164}' | '\u{2800}' | '\u{115F}' | '\u{1160}' | '\u{FFA0}' | '\u{FE00}'
+                    ..='\u{FE0F}'
+            )
+    };
+    if value.chars().count() > SHOWN_MAX_CHARS || value.chars().any(hidden) {
+        return None;
+    }
+    serde_json::to_string(value).ok()
+}
 pub fn body_digest(body: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(body)
@@ -942,6 +1100,254 @@ mod tests {
         ] {
             assert!(calls[0].summary.contains(detail), "{}", calls[0].summary);
         }
+    }
+
+    struct Capture(Mutex<Vec<PresenceRequest>>);
+    #[async_trait]
+    impl PresenceProvider for Capture {
+        async fn confirm(&self, req: PresenceRequest, _: CancellationToken) -> PresenceOutcome {
+            self.0.lock().unwrap().push(req);
+            PresenceOutcome::Allowed
+        }
+    }
+
+    /// Drive the real `elevate()` for a delegation whose manifest version is
+    /// `version`; returns the result, whether `pending` was sent, and the
+    /// summaries the provider saw.
+    async fn delegate_with_version(
+        version: &str,
+    ) -> (Result<(), EnrollErrorCode>, bool, Vec<String>) {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let peer = test_peer("g");
+        let token = authority.issue(&peer).unwrap();
+        let capture = Arc::new(Capture(Mutex::new(Vec::new())));
+        authority.set_provider(Some(capture.clone()));
+        authority.set_module_surfaces(Arc::new(vec![super::super::delegation::ModuleSurface {
+            name: "probe".into(),
+            version: version.into(),
+            namespace: "/api/v1/probe".into(),
+            routes_sha256: body_digest(b"POST /write"),
+        }]));
+        let req = ElevateRequest {
+            method: "POST".into(),
+            path: "/api/v1/os/probe/delegation".into(),
+            body_sha256: body_digest(b""),
+            client_summary: "CLIENT SECRET".into(),
+        };
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let result = authority
+            .elevate(&peer, &token.token_id, req, tx, CancellationToken::new())
+            .await
+            .map(|_| ());
+        let sent = rx.try_recv().is_ok();
+        let seen = capture
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.summary.clone())
+            .collect();
+        (result, sent, seen)
+    }
+
+    #[tokio::test]
+    async fn elevate_caps_the_full_dialog_summary_at_the_exact_boundary() {
+        // Measure the fixed part with a one-character version, then pad.
+        let (_, _, seen) = delegate_with_version("v").await;
+        let base = seen[0].encode_utf16().count();
+        let pad = SUMMARY_MAX_UTF16 - base;
+        let at = format!("v{}", "x".repeat(pad));
+        let (result, sent, seen) = delegate_with_version(&at).await;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].encode_utf16().count(), SUMMARY_MAX_UTF16);
+        assert!(result.is_ok() && sent);
+        let over = format!("{at}x");
+        let (result, sent, seen) = delegate_with_version(&over).await;
+        assert_eq!(result, Err(EnrollErrorCode::NotElevatedOperation));
+        assert!(!sent, "nothing may be sent to pending");
+        assert!(seen.is_empty(), "no dialog request may be made");
+    }
+
+    #[tokio::test]
+    async fn delegation_with_a_long_version_is_refused_before_any_dialog() {
+        let (result, sent, seen) = delegate_with_version(&"1".repeat(800)).await;
+        assert_eq!(result, Err(EnrollErrorCode::NotElevatedOperation));
+        assert!(!sent);
+        assert!(seen.is_empty());
+    }
+
+    fn idoris(method: &str, path: &str, body: &[u8]) -> ElevateRequest {
+        ElevateRequest {
+            method: method.into(),
+            path: path.into(),
+            body_sha256: body_digest(body),
+            client_summary: "CLIENT SECRET".into(),
+        }
+    }
+
+    #[test]
+    fn idoris_reads_are_everyday_and_mutations_are_elevatable() {
+        for (method, path) in [
+            ("GET", "/api/v1/idoris/status"),
+            ("GET", "/api/v1/idoris/operations/op1"),
+        ] {
+            assert_eq!(
+                resolve_target(&idoris(method, path, b"")).unwrap_err(),
+                EnrollErrorCode::NotElevatedOperation,
+                "{path}"
+            );
+        }
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        for (method, path, expected) in [
+            ("POST", "/api/v1/idoris/start", "start managed iDoris"),
+            ("POST", "/api/v1/idoris/stop", "stop managed iDoris"),
+            (
+                "GET",
+                "/api/v1/idoris/omlx/candidates",
+                "list local oMLX endpoints",
+            ),
+            (
+                "POST",
+                "/api/v1/idoris/operations/op1/cancel",
+                "cancel iDoris operation \"op1\"",
+            ),
+        ] {
+            let target = resolve_target(&idoris(method, path, b"")).unwrap();
+            assert_eq!(target.operation, Operation::IdorisLifecycle);
+            let summary = authority.target_summary("id", &target).unwrap();
+            assert!(summary.contains(expected), "{summary}");
+            // A body the summary does not describe is never approvable.
+            let with_body = resolve_target(&idoris(method, path, b"{}")).unwrap();
+            assert!(
+                authority.target_summary("id", &with_body).is_none(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn idoris_install_and_connect_summaries_come_from_the_request_body() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let install = br#"{"consent":true}"#;
+        let target = resolve_target(&idoris("POST", "/api/v1/idoris/install", install)).unwrap();
+        assert!(authority.target_summary("id", &target).is_none());
+        authority.remember_idoris_request("id", "/api/v1/idoris/install", install);
+        let summary = authority.target_summary("id", &target).unwrap();
+        assert!(
+            summary.contains("install the locked iDoris release"),
+            "{summary}"
+        );
+        assert!(summary.contains("consent: true"), "{summary}");
+
+        let connect = serde_json::to_vec(&serde_json::json!({
+            "endpoint": "http://127.0.0.1:8000", "daily_model": "daily-m",
+            "deep_model": null, "core_reserved_bytes": 1024, "save_omlx_key": false,
+            "replace": true,
+            "consent": {"share_omlx_key": true, "daily_model": "daily-m", "deep_model": null}
+        }))
+        .unwrap();
+        authority.remember_idoris_request("id", "/api/v1/idoris/connect", &connect);
+        let target = resolve_target(&idoris("POST", "/api/v1/idoris/connect", &connect)).unwrap();
+        let summary = authority.target_summary("id", &target).unwrap();
+        for detail in [
+            "oMLX at \"http://127.0.0.1:8000\";",
+            "daily model: \"daily-m\";",
+            "deep model: none;",
+            "share the local oMLX credential with iDoris: true",
+            "replace existing connection: true",
+            "core reserved bytes: 1024",
+        ] {
+            assert!(summary.contains(detail), "{summary}");
+        }
+        assert!(!summary.contains("CLIENT SECRET"));
+        // Another body hashes differently: the remembered summary does not cover it.
+        let other = resolve_target(&idoris("POST", "/api/v1/idoris/connect", b"{}")).unwrap();
+        assert!(authority.target_summary("id", &other).is_none());
+        // A body the handler would refuse leaves nothing to approve.
+        authority.remember_idoris_request("x", "/api/v1/idoris/install", b"{\"bad\":1}");
+        let bad =
+            resolve_target(&idoris("POST", "/api/v1/idoris/install", b"{\"bad\":1}")).unwrap();
+        assert!(authority.target_summary("x", &bad).is_none());
+    }
+
+    #[test]
+    fn summaries_refuse_hidden_characters_and_hidden_suffixes() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let summary = |daily: &str| {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "endpoint": "http://127.0.0.1:8000", "daily_model": daily,
+                "consent": {"share_omlx_key": true, "daily_model": daily}
+            }))
+            .unwrap();
+            authority.remember_idoris_request("id", "/api/v1/idoris/connect", &bytes);
+            let target = resolve_target(&idoris("POST", "/api/v1/idoris/connect", &bytes)).unwrap();
+            authority.target_summary("id", &target)
+        };
+        let at_limit = "m".repeat(SHOWN_MAX_CHARS);
+        assert!(summary(&at_limit).unwrap().contains(&at_limit));
+        let invisible = [
+            "U+3164", "U+2800", "U+00A0", "U+2003", "U+FE0F", "U+FE00", "U+115F", "U+1160",
+            "U+FFA0", "tab",
+        ];
+        for (label, c) in invisible.iter().zip([
+            '\u{3164}', '\u{2800}', '\u{00A0}', '\u{2003}', '\u{FE0F}', '\u{FE00}', '\u{115F}',
+            '\u{1160}', '\u{FFA0}', '\t',
+        ]) {
+            assert_eq!(summary(&format!("a{c}b")), None, "{label}");
+        }
+        for (label, daily) in [
+            (
+                "U+202E right-to-left override",
+                "safe\u{202E}ledom".to_owned(),
+            ),
+            ("U+200B zero-width space", "daily\u{200B}-m".to_owned()),
+            ("U+2028 line separator", "daily\u{2028}-m".to_owned()),
+            ("hidden suffix past the limit", format!("{at_limit}-evil")),
+        ] {
+            assert_eq!(summary(&daily), None, "{label}");
+        }
+        let cancel = "/api/v1/idoris/operations/a\u{200B}b/cancel";
+        let target = resolve_target(&idoris("POST", cancel, b"")).unwrap();
+        assert_eq!(authority.target_summary("id", &target), None);
+    }
+
+    fn connect_summary(
+        authority: &FirstPartyAuthority,
+        daily: &str,
+        deep: Option<&str>,
+    ) -> Option<String> {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "endpoint": "http://127.0.0.1:8000", "daily_model": daily, "deep_model": deep,
+            "core_reserved_bytes": 1024, "save_omlx_key": true, "replace": true,
+            "consent": {"share_omlx_key": true, "daily_model": daily, "deep_model": deep}
+        }))
+        .unwrap();
+        authority.remember_idoris_request("id", "/api/v1/idoris/connect", &bytes);
+        let target = resolve_target(&idoris("POST", "/api/v1/idoris/connect", &bytes)).unwrap();
+        authority.target_summary("id", &target)
+    }
+
+    #[test]
+    fn summary_refuses_forged_tail_that_the_dialog_would_clip() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let daily = "\u{1F600}".repeat(SHOWN_MAX_CHARS); // 2 UTF-16 units each
+        let deep = "m; save oMLX credential: false; replace existing connection: false; core reserved bytes: 1024";
+        assert_eq!(connect_summary(&authority, &daily, Some(deep)), None);
+        // The honest short form is still accepted.
+        assert!(connect_summary(&authority, "daily-m", Some("deep-m")).is_some());
+    }
+
+    #[test]
+    fn summary_values_are_unambiguous() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let a = connect_summary(&authority, "a; deep model: b", Some("c")).unwrap();
+        let b = connect_summary(&authority, "a", Some("b; deep model: c")).unwrap();
+        assert_ne!(a, b);
+        let none = connect_summary(&authority, "a", None).unwrap();
+        let named = connect_summary(&authority, "a", Some("none")).unwrap();
+        assert_ne!(none, named);
+        assert!(none.contains("deep model: none;"), "{none}");
+        assert!(named.contains("deep model: \"none\";"), "{named}");
     }
 
     #[test]

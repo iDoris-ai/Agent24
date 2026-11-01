@@ -273,6 +273,40 @@ pub struct Operation {
     pub verification: Option<VerificationReceipt>,
 }
 
+/// The API form of an [`Operation`] (I-1 N1). The idempotency key and
+/// request fingerprint stay in `operations.json`, where retries across a
+/// restart need them; no reader of the lifecycle routes receives them.
+#[derive(Serialize)]
+pub struct OperationView<'a> {
+    operation_id: &'a str,
+    action: &'a Action,
+    phase: &'a Phase,
+    result: &'a Option<Outcome>,
+    error_code: &'a Option<Code>,
+    cancellable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    setup_code: &'a Option<agent24_idoris::setup::SetupCode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    download_progress: &'a Option<agent24_idoris::download::DownloadProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: &'a Option<VerificationReceipt>,
+}
+impl Operation {
+    pub fn view(&self) -> OperationView<'_> {
+        OperationView {
+            operation_id: &self.operation_id,
+            action: &self.action,
+            phase: &self.phase,
+            result: &self.result,
+            error_code: &self.error_code,
+            cancellable: self.cancellable,
+            setup_code: &self.setup_code,
+            download_progress: &self.download_progress,
+            verification: &self.verification,
+        }
+    }
+}
+
 pub struct KeychainSource(pub Arc<dyn Keychain>);
 #[async_trait]
 impl SecretSource for KeychainSource {

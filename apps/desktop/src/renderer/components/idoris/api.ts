@@ -80,7 +80,7 @@ export function parseOperation(value: unknown): IdorisOperation {
     phase: choice(v.phase, ['queued', 'downloading', 'verifying', 'installing', 'setup', 'issuing_key', 'starting', 'connecting', 'verifying_connection', 'rolling_back', 'done', 'stopping', 'completed']),
     result: v.result === null ? null : choice(v.result, ['succeeded', 'failed', 'cancelled']),
     error_code: v.error_code === null ? null : choice(v.error_code, codes),
-    cancellable: bool(v.cancellable), idempotency_key: text(v.idempotency_key),
+    cancellable: bool(v.cancellable),
     ...(v.download_progress === undefined ? {} : { download_progress: parseProgress(v.download_progress) }),
     ...(v.verification === undefined ? {} : { verification: parseVerification(v.verification) }),
   }

@@ -579,19 +579,28 @@ async fn a_cancel_that_ends_a_job_announces_it_once() {
 
 /// A restart of `state`'s module on `dir`, telling WS clients through
 /// `events`: the old instance stops wholly first, as when its process exits.
-/// Dropping the state alone leaves its pool's connections closing on their
-/// own threads, and an instance that opens meanwhile may not get its storage
-/// (#1116); one that does not says why, not just that nothing was announced.
+/// In one process its locks may outlive that for a moment (its pool's
+/// connections close on their own threads, #1116; CI saw `Locked` here),
+/// where a new process would find them gone. So the new instance gets what a
+/// module gets for lock contention: it opens its storage again, here every
+/// 20 ms for up to 10 s, and announces the jobs it recovers when it does. One
+/// that never gets its storage says why, not just that nothing was announced.
 /// Only for an instance with no job running: a runner holds the storage, and
 /// with it the blob store's lock, past the pool's close.
 async fn restarted(state: AppState, dir: &std::path::Path, events: Events) -> AppState {
     state.storage().await.unwrap().db.pool().close().await;
     drop(state);
-    let state = AppState::open_with_events(dir, events).await;
-    if let Err(cause) = state.storage().await {
-        panic!("the restarted instance has no storage: {cause:?}");
+    let state = AppState::open_with_events_every(dir, events, Duration::from_millis(20)).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match state.storage().await {
+            Ok(_) => return state,
+            Err(cause) if cause.retryable() && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(cause) => panic!("the restarted instance has no storage: {cause:?}"),
+        }
     }
-    state
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
