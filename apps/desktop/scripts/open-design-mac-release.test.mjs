@@ -157,6 +157,59 @@ test('reused Resources stamp rejects a symlink retargeted after it was written',
   }
 })
 
+test('reused Resources stamp rejects an empty directory added or removed after it was written', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-stamp-dir-'))
+  try {
+    fs.writeFileSync(path.join(dir, 'pkg.js'), 'x')
+    const empty = path.join(dir, 'empty')
+    fs.mkdirSync(empty)
+    writeOpenDesignSourceStamp(dir, { sha: OPEN_DESIGN_SHA, version: OPEN_DESIGN_PIN_VERSION })
+    assert.equal(assertOpenDesignResourcesStamp(dir).sha, OPEN_DESIGN_SHA)
+    fs.rmdirSync(empty)
+    assert.throws(() => assertOpenDesignResourcesStamp(dir), /tree digest/)
+    fs.mkdirSync(empty)
+    assert.equal(assertOpenDesignResourcesStamp(dir).sha, OPEN_DESIGN_SHA)
+    fs.mkdirSync(path.join(dir, 'extra'))
+    assert.throws(() => assertOpenDesignResourcesStamp(dir), /tree digest/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('reused Resources stamp rejects a directory mode change after it was written', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-stamp-dirmode-'))
+  try {
+    const nested = path.join(dir, 'nested')
+    fs.mkdirSync(nested)
+    fs.chmodSync(nested, 0o755)
+    writeOpenDesignSourceStamp(dir, { sha: OPEN_DESIGN_SHA, version: OPEN_DESIGN_PIN_VERSION })
+    fs.chmodSync(nested, 0o700)
+    assert.throws(() => assertOpenDesignResourcesStamp(dir), /tree digest/)
+    fs.chmodSync(nested, 0o755)
+    assert.equal(assertOpenDesignResourcesStamp(dir).sha, OPEN_DESIGN_SHA)
+    const rootMode = fs.statSync(dir).mode & 0o777
+    fs.chmodSync(dir, rootMode === 0o755 ? 0o700 : 0o755)
+    assert.throws(() => assertOpenDesignResourcesStamp(dir), /tree digest/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('reused Resources stamp rejects a fifo in the tree', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-stamp-fifo-'))
+  try {
+    fs.writeFileSync(path.join(dir, 'pkg.js'), 'x')
+    writeOpenDesignSourceStamp(dir, { sha: OPEN_DESIGN_SHA, version: OPEN_DESIGN_PIN_VERSION })
+    execFileSync('mkfifo', [path.join(dir, 'pipe')], { stdio: 'pipe' })
+    assert.throws(
+      () => assertOpenDesignResourcesStamp(dir),
+      /only regular files, directories, and symlinks/,
+    )
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('teamIdFromIdentity', () => {
   assert.equal(teamIdFromIdentity('Developer ID Application: Huifeng Jiao (HYAP444FN9)'), 'HYAP444FN9')
   assert.equal(teamIdFromIdentity('-'), null)
@@ -359,6 +412,8 @@ test('release-mac.sh pins the repository and prints the upload command; verify r
   const release = fs.readFileSync(new URL('./release-mac.sh', import.meta.url), 'utf8')
   assert.match(release, /A24_OD_REPOSITORY=iDoris-ai\/Agent24/)
   assert.match(release, /check-resources/)
+  assert.match(release, /A24_OD_SKIP_CODESIGN 不能用于正式发布/)
+  assert.match(release, /A24_OD_SKIP_CODESIGN= bash "\$DESKTOP_DIR\/scripts\/verify-mac-open-design\.sh"/)
   assert.match(release, /gh release upload \\"\$\{A24_RELEASE_TAG\}\\" \\"\$\{OD_TARBALL\}\\" -R iDoris-ai\/Agent24/)
   const verify = fs.readFileSync(new URL('./verify-mac-open-design.sh', import.meta.url), 'utf8')
   assert.equal(verify.includes("'0.22.2'"), false)
@@ -377,6 +432,24 @@ function dirtyGitCheckout(prefix) {
   fs.writeFileSync(path.join(dir, 'local.txt'), 'dirty')
   return dir
 }
+
+test('release-mac.sh refuses a non-empty A24_OD_SKIP_CODESIGN before any build step', () => {
+  for (const value of ['1', '0']) {
+    const result = spawnSync('bash', [fileURLToPath(new URL('./release-mac.sh', import.meta.url))], {
+      encoding: 'utf8',
+      timeout: 20000,
+      env: {
+        ...process.env,
+        A24_OD_SKIP_CODESIGN: value,
+        A24_RELEASE_TAG: 'v0.6.0',
+      },
+    })
+    const output = `${result.stdout}\n${result.stderr}`
+    assert.notEqual(result.status, 0, output)
+    assert.match(output, /A24_OD_SKIP_CODESIGN 不能用于正式发布/)
+    assert.doesNotMatch(output, /构建 Rust|electron-builder|只能在 macOS/)
+  }
+})
 
 test('release-mac.sh refuses a dirty checkout when Open Design resources are reused', () => {
   const checkout = dirtyGitCheckout('a24-od-release-dirty-')
@@ -421,8 +494,8 @@ test('rebuild-open-design-native rejects a dirty checkout before looking at the 
 
 // codesign 替身不走真签名：夹具 tarball 里没有已签名的 Mach-O，默认的
 // `verify-signed`（codesign --verify --strict + Team ID）会因为夹具失败，
-// 盖住清单、包内目录和 sha 这几条断言。A24_OD_SKIP_CODESIGN=1 只跳过这一步；
-// release-mac.sh 不设置它，发布路径仍跑真实验证。
+// 盖住清单、包内目录和 sha 这几条断言。A24_OD_SKIP_CODESIGN=1 只跳过这一步。
+// release-mac.sh 拒绝非空值，并在调用 verify 前清空它。
 const verifyScript = fileURLToPath(new URL('./verify-mac-open-design.sh', import.meta.url))
 
 function verifyFixture(dir, mutate) {

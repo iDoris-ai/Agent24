@@ -83,8 +83,10 @@ Open Design 不进 dmg：`release-mac.sh` 在打包前构建它、签名其原�
   `apps/desktop/package.json` 的 `version` 开头：当前是 `0.6.0`，所以只接受 `v0.6.0` 或 `v0.6.0-…`。
 - Open Design 源码默认 `~/Dev/auraai/open-design-agent24`（`A24_OPEN_DESIGN_SOURCE_DIR` 可改）。
   `check-source` 要求工作区干净（`git status --porcelain` 为空）并且 HEAD 等于固定 sha。
-  prepare 在 Resources 根目录写 `.agent24-od-source.json`（`{sha, version}`）。设置了
-  `A24_OPEN_DESIGN_RESOURCES_DIR` 复用已有树时，stamp 必须存在且 sha 等于 pin，否则拒绝打包。
+  prepare 在 Resources 根目录写 `.agent24-od-source.json`（`{sha, version, tree}`）。`tree` 覆盖每个普通文件的内容与权限、每条软链接的目标，以及每个目录（含根目录）的路径与权限。设置了
+  `A24_OPEN_DESIGN_RESOURCES_DIR` 复用已有树时，stamp 必须存在且 sha、version、tree 都与 pin 和当前树一致，否则拒绝打包。
+  本次改动之前生成的旧 stamp 不带目录和内容摘要，复用前必须重新跑 prepare。
+  本地 stamp 不防「树和 stamp 被同时重写」，它只用来发现意外改动，不是防篡改手段。
 - 组件清单的下载仓库写死为 `iDoris-ai/Agent24`，不读环境变量 `A24_OD_REPOSITORY`。
 - **为什么原生模块必须同 Team ID 签名**：组件的 daemon 跑在 app 自己的二进制里（`ELECTRON_RUN_AS_NODE`），
   app 开了 Hardened Runtime 且没有 `disable-library-validation`，所以下载来的 `.node`/`.dylib` 不同 Team ID 就加载不了。

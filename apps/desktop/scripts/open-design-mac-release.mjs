@@ -105,13 +105,27 @@ function sha256File(filePath) {
 /**
  * Digest of a prepared Resources tree. Entries are sorted by relative path.
  * Each regular file contributes a streaming sha256 and its permission bits;
- * each symlink contributes a sha256 of its target text plus that target.
- * The stamp file itself is excluded (it records this digest). Directory
- * symlinks are not followed, so a link cannot pull outside files into the hash.
+ * each symlink contributes a sha256 of its target text plus that target;
+ * each directory contributes `{path, kind:"dir", mode}` only.
+ * The resources root is included (relative path `"."`) so its mode is part of
+ * the digest: chmod on the Resources directory itself must not reuse a stamp.
+ * The stamp file is excluded (it records this digest). Directory symlinks are
+ * not followed, so a link cannot pull outside files into the hash.
+ * FIFO, socket, and device nodes are rejected. Folding them into one `other`
+ * kind dropped the file type and let different special files share a digest.
  */
 export function openDesignResourceTreeDigest(resourcesRoot) {
   const entries = []
+  const recordDirectory = (full) => {
+    const rel = path.relative(resourcesRoot, full).split(path.sep).join('/')
+    entries.push({
+      path: rel === '' ? '.' : rel,
+      kind: 'dir',
+      mode: fs.lstatSync(full).mode & 0o7777,
+    })
+  }
   const visit = (directory) => {
+    recordDirectory(directory)
     for (const name of fs.readdirSync(directory)) {
       const full = path.join(directory, name)
       const rel = path.relative(resourcesRoot, full).split(path.sep).join('/')
@@ -137,26 +151,17 @@ export function openDesignResourceTreeDigest(resourcesRoot) {
         entries.push({ path: rel, kind: 'file', mode, sha256: sha256File(full), link: null })
         continue
       }
-      entries.push({
-        path: rel,
-        kind: 'other',
-        mode,
-        sha256: crypto.createHash('sha256').update('').digest('hex'),
-        link: null,
-      })
+      throw new Error(`Open Design Resources tree contains an unsupported file type at ${rel} (only regular files, directories, and symlinks are allowed)`)
     }
   }
   visit(resourcesRoot)
   entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
   const hash = crypto.createHash('sha256')
   for (const entry of entries) {
-    hash.update(JSON.stringify({
-      path: entry.path,
-      kind: entry.kind,
-      mode: entry.mode,
-      sha256: entry.sha256,
-      link: entry.link,
-    }))
+    const recorded = entry.kind === 'dir'
+      ? { path: entry.path, kind: entry.kind, mode: entry.mode }
+      : { path: entry.path, kind: entry.kind, mode: entry.mode, sha256: entry.sha256, link: entry.link }
+    hash.update(JSON.stringify(recorded))
     hash.update('\n')
   }
   return hash.digest('hex')
@@ -173,7 +178,8 @@ export function writeOpenDesignSourceStamp(resourcesRoot, { sha, version }) {
 
 /** Reusing a prepared Resources directory skips the source checkout. The
  * stamp must name the pinned sha and version, and its tree digest must still
- * match the files, modes, and symlink targets on disk. */
+ * match the files, directory entries (including the root's mode), and
+ * symlink targets on disk. */
 export function assertOpenDesignResourcesStamp(resourcesRoot, expectedSha = OPEN_DESIGN_SHA) {
   if (!resourcesRoot || !path.isAbsolute(resourcesRoot)) throw new Error('Open Design Resources path must be absolute')
   const file = path.join(resourcesRoot, OD_SOURCE_STAMP_FILE)
@@ -194,7 +200,7 @@ export function assertOpenDesignResourcesStamp(resourcesRoot, expectedSha = OPEN
   }
   const tree = openDesignResourceTreeDigest(resourcesRoot)
   if (parsed.tree !== tree) {
-    throw new Error('Open Design Resources tree digest does not match the stamp (a file, its mode, or a symlink target changed after prepare)')
+    throw new Error('Open Design Resources tree digest does not match the stamp (a file, its mode, a directory, or a symlink target changed after prepare)')
   }
   return parsed
 }

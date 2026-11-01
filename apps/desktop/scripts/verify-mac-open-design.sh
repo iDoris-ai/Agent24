@@ -55,7 +55,8 @@ DMG_BYTES="$(file_bytes "$DMG")"
 
 # 公证与否都要做：解开 tarball，每个 Mach-O codesign --verify --strict，Team ID 必须是 HYAP444FN9。
 # A24_OD_SKIP_CODESIGN=1 只给行为测试：假 tarball 没有已签名 Mach-O，真实 codesign
-# 会因夹具失败，盖住清单 / 目录 / sha 这些断言。release-mac.sh 不设置它。
+# 会因夹具失败，盖住清单 / 目录 / sha 这些断言。release-mac.sh 发现它非空会直接退出，
+# 并在调用本脚本前把它清空。
 EXTRACT="$(mktemp -d "${TMPDIR:-/tmp}/a24-od-verify.XXXXXX")"
 cleanup_extract() { rm -rf "$EXTRACT"; }
 trap cleanup_extract EXIT

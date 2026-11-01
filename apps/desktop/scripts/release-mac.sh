@@ -37,6 +37,12 @@ ENTITLEMENTS="$DESKTOP_DIR/build/entitlements.mac.plist"
 step() { printf '\n==> %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# verify 的行为测试用 A24_OD_SKIP_CODESIGN=1 跳过 tarball 解包后的 codesign。
+# 正式发布不能继承这个开关：非空直接退出。调用 verify 时还会再把它清空。
+if [[ -n "${A24_OD_SKIP_CODESIGN:-}" ]]; then
+  die "A24_OD_SKIP_CODESIGN 不能用于正式发布（当前：${A24_OD_SKIP_CODESIGN}）"
+fi
+
 # 公共实现是 open-design-mac-release.mjs 的 checkOpenDesignSource：
 # git status --porcelain 为空，且 HEAD 等于 pin。prepare 写 stamp 前、
 # rebuild-open-design-native 入口也会调它。复用 Resources 只跳过 tools-pack / prepare。
@@ -157,7 +163,11 @@ DMG="$(find "$DESKTOP_DIR/release" -maxdepth 1 -name '*.dmg' -print | head -n1)"
 echo "dmg: $DMG"
 
 step "3b/6 验证 Open Design 不在包内、只带清单（C1）"
-bash "$DESKTOP_DIR/scripts/verify-mac-open-design.sh" "$(find "$DESKTOP_DIR/release" -maxdepth 2 -type d -name 'Agent24.app' -print -quit)" "$DMG" "$OD_TARBALL_DIR" "$OD_APP_VERSION"
+# 启动检查已经拒绝非空的 A24_OD_SKIP_CODESIGN。这里再清空后调用，
+# 避免 verify 继承测试开关、跳过 tarball 解包后的 codesign。
+A24_OD_SKIP_CODESIGN= bash "$DESKTOP_DIR/scripts/verify-mac-open-design.sh" \
+  "$(find "$DESKTOP_DIR/release" -maxdepth 2 -type d -name 'Agent24.app' -print -quit)" \
+  "$DMG" "$OD_TARBALL_DIR" "$OD_APP_VERSION"
 
 if [[ "${SKIP_NOTARIZE:-0}" == "1" ]]; then
   step "4-5/6 已跳过公证与 staple（SKIP_NOTARIZE=1）"
