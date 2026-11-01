@@ -380,11 +380,83 @@ paths:
       security: []
       responses:
         "200":
-          description: Daemon is alive
+          description: Daemon is alive (`status` is `ok`)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Health"
+        "503":
+          description: >
+            Docked after a failed database migration (`status` is
+            `migration_failed`). Only this route and the diagnostics routes
+            are served; every other path is 404. Clients must not reuse a
+            daemon whose status is anything but `ok`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
+  /diagnostics/migration:
+    get:
+      operationId: getMigrationDiagnostics
+      tags: [system]
+      summary: Failed-migration details (docked daemon only)
+      description: >
+        Served by the docked router only. Needs a first-party token
+        (`diagnostic.read`, daily level). Without a capability authority the
+        route answers 503 `diagnostics_unavailable`.
+      responses:
+        "200":
+          description: Scrubbed marker contents
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MigrationDiagnostics"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/DiagnosticsUnavailable"
+
+  /diagnostics/migration/snapshots:
+    get:
+      operationId: getMigrationSnapshots
+      tags: [system]
+      summary: Snapshot metadata of the failed attempt (docked daemon only)
+      description: Ids, sizes, hashes and restore progress; never file contents.
+      responses:
+        "200":
+          description: Snapshot metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotDiagnostics"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/DiagnosticsUnavailable"
+
+  /diagnostics/migration/space:
+    get:
+      operationId: getMigrationSpace
+      tags: [system]
+      summary: Last disk-space probe of the failed attempt (docked daemon only)
+      responses:
+        "200":
+          description: Cached space probe
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SpaceDiagnostics"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/DiagnosticsUnavailable"
 
   /chat:
     post:
@@ -4055,6 +4127,24 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: "unauthorized (401): missing, unknown, expired or revoked bearer"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: "forbidden (403): the token may not call this operation"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    DiagnosticsUnavailable:
+      description: "diagnostics_unavailable (503): no capability authority, so the diagnostics routes stay closed"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     BadRequest:
       description: "invalid_request: malformed or invalid request"
       content:
@@ -4557,7 +4647,16 @@ components:
       properties:
         status:
           type: string
-          const: ok
+          enum: [ok, migration_failed]
+          description: >
+            `ok` (HTTP 200) or `migration_failed` (HTTP 503, docked). Treat
+            any other value as not reusable.
+        startup_state:
+          type: string
+          const: docked
+          description: Present only while docked.
+        reason:
+          $ref: "#/components/schemas/HealthReason"
         version:
           type: string
         backend:
@@ -4577,6 +4676,87 @@ components:
             treat a missing value as an old daemon.
         migrations:
           $ref: "#/components/schemas/HealthMigrations"
+
+    DockCode:
+      type: string
+      description: Stable public reason code. Never carries paths or raw errors.
+      enum:
+        - interrupted
+        - migration_failed
+        - rollback_failed
+        - guard_invalid
+        - persist_failed
+        - marker_invalid
+        - space_insufficient
+        - space_budget_unknown
+    DockPhase:
+      type: string
+      enum: [preflight, migrating, fts_rebuild, restoring]
+    RollbackState:
+      type: string
+      enum: [not_needed, in_progress, restored, failed]
+    DockDatabase:
+      type: string
+      enum: [store, memory]
+    HealthReason:
+      type: object
+      required: [code, phase, rollback, retry_allowed, migrations]
+      properties:
+        code: { $ref: "#/components/schemas/DockCode" }
+        phase: { $ref: "#/components/schemas/DockPhase" }
+        rollback: { $ref: "#/components/schemas/RollbackState" }
+        retry_allowed:
+          type: boolean
+          const: false
+          description: Retry is closed (CORE-5 Q2).
+        migrations:
+          type: string
+          enum: [verified, unknown]
+          description: >
+            `verified`: `Health.migrations` is the real post-restore value.
+            `unknown`: it is reported as 0/0, not a watermark.
+    MigrationDiagnostics:
+      type: object
+      required: [attempt_id, snapshot_id, failed_version, database, migration_version, phase, code, rollback, retry_allowed, error_summary]
+      properties:
+        attempt_id: { type: string }
+        snapshot_id: { type: [string, "null"] }
+        failed_version: { type: string }
+        database:
+          oneOf:
+            - $ref: "#/components/schemas/DockDatabase"
+            - type: "null"
+        migration_version: { type: [integer, "null"] }
+        phase: { $ref: "#/components/schemas/DockPhase" }
+        code: { $ref: "#/components/schemas/DockCode" }
+        rollback: { $ref: "#/components/schemas/RollbackState" }
+        retry_allowed: { type: boolean, const: false }
+        error_summary: { type: string, description: Bounded and scrubbed. }
+    SnapshotDiagnostics:
+      type: object
+      required: [snapshot_id, restore, files]
+      properties:
+        snapshot_id: { type: [string, "null"] }
+        restore: { $ref: "#/components/schemas/RollbackState" }
+        files:
+          type: array
+          items:
+            type: object
+            required: [database, existed, bytes, sha256]
+            properties:
+              database: { $ref: "#/components/schemas/DockDatabase" }
+              existed: { type: boolean }
+              bytes: { type: [integer, "null"], minimum: 0 }
+              sha256: { type: [string, "null"] }
+    SpaceDiagnostics:
+      type: object
+      required: [available_bytes, budget_bytes, failures]
+      properties:
+        available_bytes: { type: [integer, "null"], minimum: 0 }
+        budget_bytes: { type: [integer, "null"], minimum: 0 }
+        failures:
+          type: array
+          items: { $ref: "#/components/schemas/DockCode" }
 
     ChatMessage:
       type: object

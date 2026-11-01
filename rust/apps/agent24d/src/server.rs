@@ -4103,6 +4103,12 @@ pub(crate) mod tests {
                 routes.insert(path.to_owned());
             }
         }
+        // CORE-5f-2: the docked router is a second router, scanned the same way.
+        for path in route_literals(include_str!("docked_router.rs"), "pub fn docked_router") {
+            if let Some(path) = path.strip_prefix("/api/v1") {
+                routes.insert(path.to_owned());
+            }
+        }
         assert!(
             routes.len() >= 20,
             "route scan found only {} paths; build_router_with_modules may have changed shape",
@@ -6115,6 +6121,11 @@ pub(crate) mod tests {
         let (state, _host, creative) = capability_state().await;
         let router = router_with_comm(state);
         for policy in crate::capabilities::policies() {
+            // Docked-only routes are not on the business router; the docked
+            // router's own tests cover Creative there.
+            if policy.operation == crate::capabilities::Operation::DiagnosticRead {
+                continue;
+            }
             let path = concrete_path(policy.template);
             let response = router
                 .clone()
@@ -6948,6 +6959,12 @@ pub(crate) mod tests {
             reason: "热切换 comm 前缀挂载；runtime_router 的方法清单由目录扫描覆盖",
         },
         AllowedRegistration {
+            file: "apps/agent24d/src/docked_router.rs",
+            form: "fallback",
+            call: ".fallback(not_found)",
+            reason: "停靠 router 的 404：未登记路径一律 not_found，不进 Operation 目录",
+        },
+        AllowedRegistration {
             file: "apps/agent24d/src/domain.rs",
             form: "nest",
             call: "app.nest(namespace, Router::new().fallback(handler.clone()))",
@@ -7031,6 +7048,7 @@ pub(crate) mod tests {
             "crates/agent24-comm/src/router.rs" => "pub fn router(",
             "crates/agent24-comm/src/groupchat.rs" => "pub(crate) fn routes(",
             "apps/agent24d/src/comm_routes.rs" => "fn runtime_router(",
+            "apps/agent24d/src/docked_router.rs" => "pub fn docked_router",
             _ => return None,
         };
         Some(function_span(src, signature))
@@ -7225,6 +7243,15 @@ pub fn build_router_with_modules() {
 
         let mut registered = kernel.clone();
         registered.extend(comm.iter().cloned());
+        // CORE-5f-2: docked-only routes are catalogued but not mounted on the
+        // business router, so they join the catalog comparison, not the 405 sweep.
+        let docked = parsed_routes(
+            source_of(&files, "apps/agent24d/src/docked_router.rs"),
+            "pub fn docked_router",
+            "",
+        );
+        let business = registered.clone();
+        registered.extend(docked.iter().cloned());
         let catalog = crate::capabilities::policies()
             .iter()
             .map(|policy| (policy.method.to_owned(), policy.template.to_owned()))
@@ -7249,7 +7276,7 @@ pub fn build_router_with_modules() {
         let router = router_with_comm(state);
         let trace = Method::from_bytes(b"TRACE").unwrap();
         let mut templates = BTreeSet::new();
-        for (_, template) in &registered {
+        for (_, template) in &business {
             templates.insert(template.clone());
         }
         for template in templates {
@@ -7280,7 +7307,7 @@ pub fn build_router_with_modules() {
                 .split(',')
                 .map(|part| part.trim().to_owned())
                 .collect::<BTreeSet<_>>();
-            let mut expect = registered
+            let mut expect = business
                 .iter()
                 .filter(|(_, path)| path == &template)
                 .map(|(method_name, _)| method_name.clone())
