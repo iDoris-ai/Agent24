@@ -1,5 +1,7 @@
 # ADR-006：Legacy Recovery Holds
 
+索引：[架构总入口](../../architecture/README.md)・[ADR 索引](../../adr/README.md)
+
 > 状态：Accepted / frozen for incremental G4 implementation
 >
 > 接受依据：项目 owner 已批准 P0–P9 计划与阶段门禁后的自动推进；后续切片不得偏离本 ADR，重大设计变化仍需重新确认。

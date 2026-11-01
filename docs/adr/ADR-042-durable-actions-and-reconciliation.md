@@ -1,5 +1,7 @@
 # ADR-042：待执行动作与对账
 
+索引：[架构总入口](../architecture/README.md)・[ADR 索引](README.md)
+
 - 状态：**提议**（2026-11-01，三步评审终稿，待 jason 拍板）
 - 上位：[ADR-039](ADR-039-concept-model.md) §2.1（本体负责审批与审计、调度）；ADR-026 硬约束 2（fail-closed）
 - 相关：ADR-K1-01 §2.4–2.6（有界调用、结果未知、不自动重试）——**本 ADR 是 §2.6 预留的「另开 ADR」，范围只到 D3**；[ADR-038](ADR-038-component-contract-v1.md) D6、D9；[ADR-041](ADR-041-inbound-events-admission-and-work-items.md) D8（完成条件）；CORE-5 §3 T9（掉电验收方法）；`docs/design/COMM-HYPHAE.md` §5（消息四层、outbox）

@@ -1,5 +1,7 @@
 # Agent24 向 Super Agent 框架演进（最终版，2026-11-01）
 
+索引：[架构总入口](../../architecture/README.md)・[ADR 索引](../../adr/README.md)
+
 > 对应 main `09cdad8f`。三步评审的最终版：Fable 初稿 → Codex gpt-6-astra 独立评估（未读初稿）→ Fable 裁判对照代码与原型整合。
 > 输入：[Fable 初稿](SUPERAGENT-EVOLUTION-2026-11-01-fable.md)（含 [adr-drafts/](adr-drafts/) 五份草案）、[Codex astra 评估](SUPERAGENT-EVOLUTION-2026-11-01-codex-astra.md)。来源编号见 [SOURCES.md](SOURCES.md)。
 > 裁判只做静态核查（grep / 读源码），另用 `gh api` 取回原型固定提交 `6337fc8` 的 `docs/001-domain.md`、`002-authorization.md`、`003-execution.md` 全文逐条对照。不构建、不运行。

@@ -1,5 +1,7 @@
 # ADR-004：Electron Creative host contract
 
+索引：[架构总入口](../../architecture/README.md)・[ADR 索引](../../adr/README.md)
+
 > 状态：Accepted / P0 frozen
 >
 > 依赖：`a24.workspace.v1`、`agent24.open-design.v1`
