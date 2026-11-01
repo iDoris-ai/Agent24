@@ -10,8 +10,10 @@ import zlib from 'node:zlib'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL_ENV,
   OpenDesignComponentInstaller,
   loadOpenDesignComponentManifest,
+  resolveLocalDownloadOverride,
   openDesignComponentInstallDir,
   parseOpenDesignComponentManifest,
   assertResourceSafeBaseAncestryIsSafe,
@@ -1717,5 +1719,60 @@ describe('OpenDesignComponentInstaller', () => {
       expect(second.dir).toBe(finalDir)
       expect(fs.readFileSync(path.join(finalDir, '.agent24-component.json'), 'utf8')).toBe(markerBefore)
     })
+  })
+})
+
+describe('loopback download override (release verification hook)', () => {
+  const ENV = OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL_ENV
+
+  it('is off unless set, and only accepts plain-http loopback URLs without credentials', () => {
+    expect(resolveLocalDownloadOverride({})).toBeNull()
+    expect(resolveLocalDownloadOverride({ [ENV]: '' })).toBeNull()
+    expect(resolveLocalDownloadOverride({ [ENV]: 'not a url' })).toBeNull()
+    expect(resolveLocalDownloadOverride({ [ENV]: 'https://127.0.0.1:8080/' })).toBeNull()
+    expect(resolveLocalDownloadOverride({ [ENV]: 'http://example.com:8080/' })).toBeNull()
+    expect(resolveLocalDownloadOverride({ [ENV]: 'http://192.168.1.5:8080/' })).toBeNull()
+    expect(resolveLocalDownloadOverride({ [ENV]: 'http://user:pw@127.0.0.1:8080/' })).toBeNull()
+    expect(resolveLocalDownloadOverride({ [ENV]: 'http://127.0.0.1:8080' })?.href).toBe('http://127.0.0.1:8080/')
+    expect(resolveLocalDownloadOverride({ [ENV]: 'http://localhost:9000/dist' })?.href).toBe('http://localhost:9000/dist/')
+  })
+
+  it('downloads the manifest asset from the loopback server over http, still verifying the baked sha256', async () => {
+    const stage = seedTreeFor('a24-od-stage-override-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath, { url: 'https://github.com/iDoris-ai/Agent24/releases/download/v9.9.9/open-design-test.tar.gz' })
+    const server = await startServer(tarPath)
+    const base = server.url.replace(/\/asset\.tar\.gz$/, '/')
+    const componentsRoot = tmpDir('a24-od-root-override-')
+    // Real fetch, default allow-list: only the override makes plain http on 127.0.0.1 legal.
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, env: { [ENV]: base } })
+    const result = await installer.install()
+    expect(result).toEqual({ state: 'installed', dir: openDesignComponentInstallDir(componentsRoot, manifest) })
+    expect(server.requestCount()).toBe(1)
+  })
+
+  it('rejects a loopback tarball whose sha256 differs from the baked manifest', async () => {
+    const stage = seedTreeFor('a24-od-stage-override-bad-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath, {
+      url: 'https://github.com/iDoris-ai/Agent24/releases/download/v9.9.9/open-design-test.tar.gz',
+      sha256: 'f'.repeat(64),
+    })
+    const server = await startServer(tarPath)
+    const base = server.url.replace(/\/asset\.tar\.gz$/, '/')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot: tmpDir('a24-od-root-override-bad-'), env: { [ENV]: base } })
+    const result = await installer.install()
+    expect(result.state).toBe('failed')
+  })
+
+  it('without the override a plain-http manifest URL is still refused', async () => {
+    const stage = seedTreeFor('a24-od-stage-noverride-')
+    const tarPath = buildTarball(stage)
+    const server = await startServer(tarPath)
+    const { manifest } = manifestFor(tarPath, { url: server.url })
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot: tmpDir('a24-od-root-noverride-'), env: {} })
+    const result = await installer.install()
+    expect(result.state).toBe('failed')
+    expect(server.requestCount()).toBe(0)
   })
 })

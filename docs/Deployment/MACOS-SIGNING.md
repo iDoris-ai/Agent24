@@ -72,6 +72,24 @@ bash scripts/sign-cli-mac.sh bin/sin90 bin/cos72  # 或显式传入路径
 
 **裸二进制不能 staple**：票据只能附着在 `.app/.pkg/.dmg`。分发 zip 即可：用户（浏览器下载带 quarantine）首次运行时 Gatekeeper 在线查询票据；完全离线机器首次运行会被拦。要离线可用，请把 CLI 装进 `.pkg` 或 dmg 再公证 staple（未做）。`tar` 解压或 `curl` 下载不带 quarantine，不触发 Gatekeeper，行为与未签名一致。
 
+## Open Design 按需组件（darwin-arm64）
+
+Open Design 不进 dmg：`release-mac.sh` 在打包前构建它、签名其原生模块、打成 tarball，**只有清单**
+（`open-design-component.json`）通过 `extraResources` 进包；tarball 在 `.open-design-component-dist/`，
+要手动上传到同名 GitHub release 的资产里（应用运行时从 `releases/download/<tag>/<资产>` 下载）。
+
+- **必须设 `A24_RELEASE_TAG`**（如 `v0.6.0-preview.20261028.10`）。清单 URL 里的版本 = tag 去掉 `v`，
+  不会回退到 package.json 的版本（那个 tag 不存在，用户会 404）。
+- Open Design 源码默认 `~/Dev/auraai/open-design-agent24`（`A24_OPEN_DESIGN_SOURCE_DIR` 可改），必须在固定 sha。
+- **为什么原生模块必须同 Team ID 签名**：组件的 daemon 跑在 app 自己的二进制里（`ELECTRON_RUN_AS_NODE`），
+  app 开了 Hardened Runtime 且没有 `disable-library-validation`，所以下载来的 `.node`/`.dylib` 不同 Team ID 就加载不了。
+  `open-design-mac-release.mjs sign` 对组件树里每个 Mach-O 用 Developer ID + `--options runtime --timestamp` 签名并 `codesign --verify --strict`。
+- **组件 tarball 要不要公证**：应用自己 `fetch` 下载，文件没有 quarantine 标记，Gatekeeper 不评估它，能否加载只看 Team ID。
+  松散文件也无法 staple。脚本仍会把 zip 提交公证（几分钟）以登记 cdhash，万一用户用浏览器手动下载资产也能放行；`SKIP_NOTARIZE=1` 时跳过。
+- `verify-mac-open-design.sh` 校验：清单在包内且字段正确，包内没有 Open Design 目录/tarball，资产 sha256/size 与清单一致，DMG 不超过 `A24_DMG_MAX_MB`（默认 250）。
+- 发布前本地验证（不上传 GitHub）：把 tarball 用本机 http 服务起来，启动已签名 app 时设
+  `A24_OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL=http://127.0.0.1:<port>/`（只认 loopback 的 http，sha256 仍按包内清单校验）。
+
 ## 验证
 
 ```bash

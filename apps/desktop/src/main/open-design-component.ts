@@ -706,9 +706,47 @@ export interface OpenDesignComponentInstallerOptions {
   /** M5: ms of no data before an in-flight download is aborted. Defaults to
    * 30s; tests shrink this instead of waiting out a real 30s timer. */
   idleTimeoutMs?: number
+  /** Environment to read the loopback download override from (tests inject
+   * this; defaults to `process.env`). */
+  env?: NodeJS.ProcessEnv
+}
+
+export const OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL_ENV = 'A24_OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL'
+
+/**
+ * Release verification hook (NOT a user feature): lets a maintainer prove the
+ * signed, packaged app can download -> verify -> install -> run the component
+ * against a tarball served from this machine BEFORE it is published to GitHub.
+ *
+ * Deliberately narrow:
+ *  - only plain `http://` on a loopback host (127.0.0.1 / localhost / [::1]),
+ *    never a remote host and never credentials — nothing off-box can be
+ *    reached through it;
+ *  - only the transport changes: the sha256 and size still come from the
+ *    manifest baked into the app, so a swapped tarball is rejected exactly as
+ *    in production;
+ *  - it only rewrites the asset's directory, keeping the manifest's asset file
+ *    name, and redirects off the override origin are still refused.
+ * Anything malformed is ignored (production behaviour), never half-applied.
+ */
+export function resolveLocalDownloadOverride(env: NodeJS.ProcessEnv): URL | null {
+  const raw = env[OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL_ENV]?.trim()
+  if (!raw) return null
+  let parsed: URL
+  try {
+    parsed = new URL(raw)
+  } catch {
+    return null
+  }
+  const loopback = ['127.0.0.1', 'localhost', '[::1]']
+  if (parsed.protocol !== 'http:' || !loopback.includes(parsed.hostname)) return null
+  if (parsed.username || parsed.password) return null
+  if (!parsed.pathname.endsWith('/')) parsed.pathname += '/'
+  return parsed
 }
 
 export class OpenDesignComponentInstaller {
+  private readonly localOverride: URL | null
   private readonly manifest: OpenDesignComponentManifest | null
   private readonly componentsRoot: string
   private readonly tarBinary: string
@@ -743,10 +781,20 @@ export class OpenDesignComponentInstaller {
     } else {
       this.manifest = loaded
     }
+    this.localOverride = this.manifest ? resolveLocalDownloadOverride(options.env ?? process.env) : null
+    if (this.manifest && this.localOverride) {
+      const assetName = path.posix.basename(new URL(this.manifest.url).pathname)
+      this.manifest = { ...this.manifest, url: new URL(assetName, this.localOverride).href }
+      console.warn(
+        `[open-design-component] ${OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL_ENV} active: downloading from ${this.manifest.url} ` +
+        '(loopback only; sha256 is still verified against the baked manifest)',
+      )
+    }
     this.componentsRoot = options.componentsRoot ?? defaultComponentsRoot()
     this.tarBinary = options.tarBinary ?? 'tar'
     this.fetchFn = fetchFn
     this.allowedHosts = new Set(options.allowedHosts ?? DEFAULT_ALLOWED_DOWNLOAD_HOSTS)
+    if (this.localOverride) this.allowedHosts.add(this.localOverride.hostname)
     this.idleTimeoutMs = options.idleTimeoutMs ?? DOWNLOAD_IDLE_TIMEOUT_MS
     this.current = this.computeInitialStatus()
     cleanupStalePartials(this.componentsRoot)
@@ -841,7 +889,7 @@ export class OpenDesignComponentInstaller {
   }
 
   private async installOnce(manifest: OpenDesignComponentManifest, alreadyReset = false): Promise<OpenDesignComponentStatus> {
-    if (!manifest.url.startsWith('https://')) {
+    if (!manifest.url.startsWith('https://') && !this.isLocalOverrideUrl(manifest.url)) {
       this.setStatus({ state: 'failed', error: 'Open Design component manifest URL must use HTTPS' })
       return this.status()
     }
@@ -984,11 +1032,20 @@ export class OpenDesignComponentInstaller {
   /** L3: follows redirects manually, re-checking HTTPS + the host allowlist
    * at every hop — fetch's automatic `redirect: 'follow'` would trust
    * wherever the server points next without either check. */
+  private isLocalOverrideUrl(url: string): boolean {
+    if (!this.localOverride) return false
+    try {
+      return new URL(url).origin === this.localOverride.origin
+    } catch {
+      return false
+    }
+  }
+
   private async fetchWithAllowedRedirects(initialUrl: string, signal: AbortSignal, headers?: Record<string, string>): Promise<Response> {
     let current = initialUrl
     for (let hop = 0; hop < MAX_REDIRECT_HOPS; hop++) {
       const parsed = new URL(current)
-      if (parsed.protocol !== 'https:') {
+      if (parsed.protocol !== 'https:' && !this.isLocalOverrideUrl(current)) {
         throw new Error(`Open Design component download must use HTTPS at every hop: ${current}`)
       }
       if (!this.allowedHosts.has(parsed.hostname)) {
