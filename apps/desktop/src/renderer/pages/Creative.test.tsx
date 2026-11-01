@@ -289,3 +289,32 @@ describe('CreativePage — F1 i18n under English default', () => {
     expect(downloadingUnit).toBe(pausedUnit)
   })
 })
+
+describe('CreativePage — local test source notice', () => {
+  const cases = [
+    ['zh', '使用本地测试源'],
+    ['en', 'Using a local test source'],
+    ['th', 'ใช้แหล่งทดสอบในเครื่อง'],
+  ] as const
+
+  for (const [locale, text] of cases) {
+    it(`shows the notice in ${locale} when overrideActive is set`, async () => {
+      setLocale(locale)
+      openDesignComponentStatus.mockResolvedValue({
+        state: 'not-installed',
+        size: 10 * 1024 * 1024,
+        overrideActive: true,
+      })
+      render(<CreativePage />)
+      expect(await screen.findByText(text)).toBeTruthy()
+    })
+  }
+
+  it('stays hidden when the download is not using a local override', async () => {
+    setLocale('zh')
+    openDesignComponentStatus.mockResolvedValue({ state: 'not-installed', size: 10 * 1024 * 1024 })
+    render(<CreativePage />)
+    expect(await screen.findByRole('button', { name: '下载' })).toBeTruthy()
+    expect(screen.queryByText('使用本地测试源')).toBeNull()
+  })
+})

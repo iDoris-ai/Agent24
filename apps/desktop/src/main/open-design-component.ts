@@ -124,6 +124,9 @@ export interface OpenDesignComponentStatus {
    * the rate is unknown or zero (renderer shows "等待网络" instead of an
    * infinite/garbage ETA). Absent outside `downloading`. */
   etaSeconds?: number | null
+  /** Set when `A24_OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL` rewrote the download
+   * onto one loopback origin. The renderer download card shows a local-test note. */
+  overrideActive?: boolean
 }
 
 type FetchFn = typeof fetch
@@ -518,6 +521,29 @@ async function assertSafeTarMembers(tarBinary: string, tarballPath: string, sign
   }
 }
 
+/** After extraction: a hardlink (`nlink > 1` on a regular file) or a
+ * non-regular file (device, FIFO, socket) is rejected. Directory nlink counts
+ * subdirectories and is not treated as a hardlink. Symlinks are left to
+ * verifySymlinksRecursive. */
+export function assertExtractedEntriesAreRegular(root: string): void {
+  const visit = (current: string): void => {
+    const stat = fs.lstatSync(current)
+    if (stat.isSymbolicLink()) return
+    if (stat.isDirectory()) {
+      for (const name of fs.readdirSync(current)) visit(path.join(current, name))
+      return
+    }
+    const relative = path.relative(root, current) || current
+    if (!stat.isFile()) {
+      throw new Error(`Open Design component contains a non-regular file: ${relative}`)
+    }
+    if (stat.nlink > 1) {
+      throw new Error(`Open Design component contains a hardlink: ${relative} (nlink=${stat.nlink})`)
+    }
+  }
+  visit(root)
+}
+
 function cleanupStalePartials(componentsRoot: string): void {
   if (!fs.statSync(componentsRoot, { throwIfNoEntry: false })?.isDirectory()) return
   for (const entry of fs.readdirSync(componentsRoot)) {
@@ -719,14 +745,15 @@ export const OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL_ENV = 'A24_OPEN_DESIGN_COMPONE
  * against a tarball served from this machine BEFORE it is published to GitHub.
  *
  * Deliberately narrow:
- *  - only plain `http://` on a loopback host (127.0.0.1 / localhost / [::1]),
- *    never a remote host and never credentials — nothing off-box can be
- *    reached through it;
+ *  - only plain `http://` on the literal hosts `127.0.0.1` or `[::1]`
+ *    (`localhost` is a name and is rejected), never a remote host and never
+ *    credentials — nothing off-box can be reached through it;
  *  - only the transport changes: the sha256 and size still come from the
  *    manifest baked into the app, so a swapped tarball is rejected exactly as
  *    in production;
  *  - it only rewrites the asset's directory, keeping the manifest's asset file
- *    name, and redirects off the override origin are still refused.
+ *    name. The exemption is that one origin: another port or https is not it,
+ *    and the hostname is not added to the global download allowlist.
  * Anything malformed is ignored (production behaviour), never half-applied.
  */
 export function resolveLocalDownloadOverride(env: NodeJS.ProcessEnv): URL | null {
@@ -738,8 +765,9 @@ export function resolveLocalDownloadOverride(env: NodeJS.ProcessEnv): URL | null
   } catch {
     return null
   }
-  const loopback = ['127.0.0.1', 'localhost', '[::1]']
-  if (parsed.protocol !== 'http:' || !loopback.includes(parsed.hostname)) return null
+  // Literal addresses only. `localhost` resolves through the name and is rejected.
+  const loopback = new Set(['127.0.0.1', '[::1]'])
+  if (parsed.protocol !== 'http:' || !loopback.has(parsed.hostname)) return null
   if (parsed.username || parsed.password) return null
   if (!parsed.pathname.endsWith('/')) parsed.pathname += '/'
   return parsed
@@ -794,7 +822,6 @@ export class OpenDesignComponentInstaller {
     this.tarBinary = options.tarBinary ?? 'tar'
     this.fetchFn = fetchFn
     this.allowedHosts = new Set(options.allowedHosts ?? DEFAULT_ALLOWED_DOWNLOAD_HOSTS)
-    if (this.localOverride) this.allowedHosts.add(this.localOverride.hostname)
     this.idleTimeoutMs = options.idleTimeoutMs ?? DOWNLOAD_IDLE_TIMEOUT_MS
     this.current = this.computeInitialStatus()
     cleanupStalePartials(this.componentsRoot)
@@ -834,11 +861,13 @@ export class OpenDesignComponentInstaller {
       }
     }
     // R5: recompute live rather than returning a stored, possibly-stale reading.
+    let snapshot: OpenDesignComponentStatus = { ...this.current }
     if (this.current.state === 'downloading' && this.speedEstimator) {
       const { bytesPerSecond, etaSeconds } = this.speedEstimator.currentReading(Date.now())
-      return { ...this.current, bytesPerSecond, etaSeconds }
+      snapshot = { ...snapshot, bytesPerSecond, etaSeconds }
     }
-    return { ...this.current }
+    if (this.localOverride) snapshot = { ...snapshot, overrideActive: true }
+    return snapshot
   }
 
   onProgress(callback: (status: OpenDesignComponentStatus) => void): () => void {
@@ -966,6 +995,7 @@ export class OpenDesignComponentInstaller {
         signal: controller.signal,
       })
       throwIfAborted(controller)
+      assertExtractedEntriesAreRegular(partialDir)
       verifyComponentContract(partialDir, manifest.version)
       // M4: record the entry files' content hashes now, while they're
       // still known-good (just extracted + contract-verified), so
@@ -1029,9 +1059,7 @@ export class OpenDesignComponentInstaller {
     }
   }
 
-  /** L3: follows redirects manually, re-checking HTTPS + the host allowlist
-   * at every hop — fetch's automatic `redirect: 'follow'` would trust
-   * wherever the server points next without either check. */
+  /** True only for the exact override origin (scheme + host + port). */
   private isLocalOverrideUrl(url: string): boolean {
     if (!this.localOverride) return false
     try {
@@ -1041,15 +1069,21 @@ export class OpenDesignComponentInstaller {
     }
   }
 
+  /** L3: follows redirects manually, re-checking HTTPS + the host allowlist
+   * at every hop — fetch's automatic `redirect: 'follow'` would trust
+   * wherever the server points next without either check. The loopback
+   * override exempts only its own origin; it does not widen `allowedHosts`. */
   private async fetchWithAllowedRedirects(initialUrl: string, signal: AbortSignal, headers?: Record<string, string>): Promise<Response> {
     let current = initialUrl
     for (let hop = 0; hop < MAX_REDIRECT_HOPS; hop++) {
       const parsed = new URL(current)
-      if (parsed.protocol !== 'https:' && !this.isLocalOverrideUrl(current)) {
-        throw new Error(`Open Design component download must use HTTPS at every hop: ${current}`)
-      }
-      if (!this.allowedHosts.has(parsed.hostname)) {
-        throw new Error(`Open Design component download host is not allow-listed: ${parsed.hostname}`)
+      if (!this.isLocalOverrideUrl(current)) {
+        if (parsed.protocol !== 'https:') {
+          throw new Error(`Open Design component download must use HTTPS at every hop: ${current}`)
+        }
+        if (!this.allowedHosts.has(parsed.hostname)) {
+          throw new Error(`Open Design component download host is not allow-listed: ${parsed.hostname}`)
+        }
       }
       const response = await this.fetchFn(current, { signal, redirect: 'manual', headers })
       if (response.status >= 300 && response.status < 400) {

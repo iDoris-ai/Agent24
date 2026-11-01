@@ -49,7 +49,7 @@ fi
 [[ -n "${A24_RELEASE_TAG:-}" ]] || die "必须设置 A24_RELEASE_TAG（本次发布的 GitHub tag，如 v0.6.0-preview.20261028.10）。清单里的下载 URL 要指向真实存在的 release，不能默认用 package.json 的版本"
 OD_APP_VERSION="$(node "$OD_RELEASE" version "$A24_RELEASE_TAG")" || exit 1
 if [[ -z "${A24_OPEN_DESIGN_RESOURCES_DIR:-}" ]]; then
-  node "$OD_RELEASE" check-source "$OD_SOURCE_DIR" >/dev/null || die "Open Design 源码不在固定 sha：$OD_SOURCE_DIR"
+  node "$OD_RELEASE" check-source "$OD_SOURCE_DIR" >/dev/null || die "Open Design 源码不在固定 sha，或工作区不干净：$OD_SOURCE_DIR"
 fi
 echo "release tag: $A24_RELEASE_TAG  -> 组件清单版本 $OD_APP_VERSION"
 # electron-builder 的 identity 不能带 "Developer ID Application:" 前缀
@@ -85,6 +85,8 @@ step "2b/6 Open Design 按需组件（darwin-${ARCH}：构建 → 签名原生�
 rm -rf "$OD_MANIFEST_DIR" "$OD_TARBALL_DIR" "$OD_STAGE_DIR"
 if [[ -n "${A24_OPEN_DESIGN_RESOURCES_DIR:-}" ]]; then
   OD_RESOURCES="$A24_OPEN_DESIGN_RESOURCES_DIR"
+  # 复用跳过了 check-source。stamp 是这份树的出处，必须和 pin 一致。
+  node "$OD_RELEASE" check-resources "$OD_RESOURCES" >/dev/null || die "复用的 Open Design Resources 缺少 .agent24-od-source.json，或 sha 与固定 pin 不符：$OD_RESOURCES"
   echo "复用已备好的 Open Design Resources：$OD_RESOURCES"
 else
   rm -rf "$OD_WORK_DIR"
@@ -125,7 +127,8 @@ if [[ "${SKIP_NOTARIZE:-0}" != "1" ]]; then
   echo "Open Design 组件公证 submission id: $OD_SUB_ID"
   rm -f "$OD_NOTARY_ZIP"
 fi
-A24_OD_STAGE_DIR="$OD_STAGE_DIR" A24_OD_PACK_OUT_DIR="$OD_MANIFEST_DIR" A24_OD_TARBALL_OUT_DIR="$OD_TARBALL_DIR" \
+# 仓库写死，不从环境继承（调用前环境里的 A24_OD_REPOSITORY 会被这条赋值盖掉）。
+A24_OD_REPOSITORY=iDoris-ai/Agent24 A24_OD_STAGE_DIR="$OD_STAGE_DIR" A24_OD_PACK_OUT_DIR="$OD_MANIFEST_DIR" A24_OD_TARBALL_OUT_DIR="$OD_TARBALL_DIR" \
   A24_OD_APP_VERSION="$OD_APP_VERSION" A24_OD_PLATFORM=darwin A24_OD_ARCH="${ARCH}" pnpm pack:open-design
 OD_TARBALL="$(find "$OD_TARBALL_DIR" -maxdepth 1 -name 'open-design-*.tar.gz' -print | head -n1)"
 [[ -f "$OD_TARBALL" ]] || die "未生成 Open Design tarball"
@@ -170,3 +173,4 @@ bash "$VERIFY" ${EXPECT[@]+"${EXPECT[@]}"} --arch "${ARCH}" "$DMG"
 echo
 echo "完成：$DMG"
 echo "Open Design 组件资产（须上传到 release ${A24_RELEASE_TAG}）：$OD_TARBALL"
+echo "gh release upload \"${A24_RELEASE_TAG}\" \"${OD_TARBALL}\" -R iDoris-ai/Agent24"

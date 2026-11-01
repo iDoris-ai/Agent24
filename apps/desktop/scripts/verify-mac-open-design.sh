@@ -7,6 +7,8 @@
 #   2. Resources 里没有 app/ open-design/ open-design-web-standalone/ 目录，也没有任何 *.tar.gz（C1）
 #   3. 清单里的 sha256/size 与 tarball-dir 里那个资产文件实际一致
 #   4. DMG 不超过 A24_DMG_MAX_MB（默认 250），防止 Open Design 被重新打进安装包
+#   5. 解开 tarball，对每个 Mach-O 跑 codesign --verify --strict，TeamIdentifier 必须是 HYAP444FN9
+#      （SKIP_NOTARIZE=1 时同样执行；这一步不依赖公证）
 set -euo pipefail
 
 APP="${1:?usage: verify-mac-open-design.sh <Agent24.app> <dmg> <tarball-dir> <app-version>}"
@@ -23,14 +25,15 @@ field() { node -e "process.stdout.write(String(JSON.parse(require('fs').readFile
 
 [[ -f "$MANIFEST" ]] || fail "包内缺少 ${MANIFEST}（Design 页会显示『组件未安装』）"
 PIN_SHA="$(node -e "import('$SCRIPT_DIR/pack-open-design-component.mjs').then(m=>process.stdout.write(m.OPEN_DESIGN_SHA))")"
-[[ "$(field version)" == "0.22.2" ]] || fail "manifest.version=$(field version)"
+PIN_VERSION="$(node -e "import('$SCRIPT_DIR/pack-open-design-component.mjs').then(m=>process.stdout.write(m.OPEN_DESIGN_PIN_VERSION))")"
+[[ "$(field version)" == "$PIN_VERSION" ]] || fail "manifest.version=$(field version)（期望 $PIN_VERSION）"
 [[ "$(field odSha)" == "$PIN_SHA" ]] || fail "manifest.odSha 与固定 sha 不符：$(field odSha)"
 [[ "$(field platform)" == "darwin" ]] || fail "manifest.platform=$(field platform)"
 [[ "$(field arch)" == "arm64" ]] || fail "manifest.arch=$(field arch)"
 URL="$(field url)"
 ASSET="$(basename "$URL")"
-[[ "$URL" == "https://github.com/"*"/releases/download/v${APP_VERSION}/${ASSET}" ]] \
-  || fail "manifest.url 与发布 tag v${APP_VERSION} 不符：$URL"
+[[ "$URL" == "https://github.com/iDoris-ai/Agent24/releases/download/v${APP_VERSION}/${ASSET}" ]] \
+  || fail "manifest.url 必须是 iDoris-ai/Agent24 上的 tag v${APP_VERSION}：$URL"
 
 for tree in app open-design open-design-web-standalone; do
   [[ ! -e "$RES/$tree" ]] || fail "Open Design 目录被打进了安装包：$RES/$tree"
@@ -48,4 +51,12 @@ TARBALL="$TARBALL_DIR/$ASSET"
 DMG_BYTES="$(stat -f%z "$DMG")"
 (( DMG_BYTES <= MAX_MB * 1024 * 1024 )) || fail "$(basename "$DMG") 为 ${DMG_BYTES} 字节，超过 ${MAX_MB}MB 上限 —— Open Design 可能被重新打进安装包"
 
-echo "OK: manifest 在包内（url=${URL}），包内无 Open Design 目录/tarball，资产 sha256/size 一致，DMG=${DMG_BYTES} 字节（上限 ${MAX_MB}MB）"
+# 公证与否都要做：解开 tarball，每个 Mach-O codesign --verify --strict，Team ID 必须是 HYAP444FN9。
+EXTRACT="$(mktemp -d "${TMPDIR:-/tmp}/a24-od-verify.XXXXXX")"
+cleanup_extract() { rm -rf "$EXTRACT"; }
+trap cleanup_extract EXIT
+tar -xzf "$TARBALL" -C "$EXTRACT"
+node "$SCRIPT_DIR/open-design-mac-release.mjs" verify-signed "$EXTRACT" \
+  || fail "Open Design tarball 里有 Mach-O 未通过 codesign --verify --strict，或 TeamIdentifier 不是 HYAP444FN9"
+
+echo "OK: manifest 在包内（url=${URL}），包内无 Open Design 目录/tarball，资产 sha256/size 一致，DMG=${DMG_BYTES} 字节（上限 ${MAX_MB}MB），tarball 内 Mach-O 已验证 Team ID"

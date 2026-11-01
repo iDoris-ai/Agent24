@@ -19,17 +19,34 @@
 import { execFile, execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 
 import { OPEN_DESIGN_SHA } from './pack-open-design-component.mjs'
 
+export const OD_SOURCE_STAMP_FILE = '.agent24-od-source.json'
+export const OPEN_DESIGN_REPOSITORY = 'iDoris-ai/Agent24'
+export const EXPECTED_TEAM_ID = 'HYAP444FN9'
+
+/** Basenames that get allow-jit + allow-unsigned-executable-memory.
+ * Only opencode (bun / JavaScriptCore). ffmpeg, esbuild, spawn-helper, and
+ * vela are signed with Hardened Runtime and no entitlements: a local smoke
+ * of the staged darwin-arm64 tree showed they still start. */
+export const JIT_ENTITLEMENT_BASENAMES = new Set(['opencode'])
+
 const execFileAsync = promisify(execFile)
+
+export function desktopPackageVersion() {
+  const packageJson = fileURLToPath(new URL('../package.json', import.meta.url))
+  return JSON.parse(fs.readFileSync(packageJson, 'utf8')).version
+}
 
 /** `v0.6.0-preview.20261028.10` -> `0.6.0-preview.20261028.10`. The result is
  * baked into the manifest URL `releases/download/v<version>/...`, so it MUST be
- * the real GitHub release tag minus the `v` — never package.json's version. */
-export function versionFromReleaseTag(tag) {
+ * the real GitHub release tag minus the `v` — never a guessed tag. It must
+ * also start with `apps/desktop/package.json`'s version (`v0.6.0` or
+ * `v0.6.0-…` when that version is 0.6.0). */
+export function versionFromReleaseTag(tag, packageVersion = desktopPackageVersion()) {
   if (typeof tag !== 'string' || tag.trim() === '') {
     throw new Error(
       'A24_RELEASE_TAG is required (the GitHub release tag this build will be published under, e.g. v0.6.0-preview.20261028.10); ' +
@@ -38,7 +55,13 @@ export function versionFromReleaseTag(tag) {
   }
   const match = /^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?)$/.exec(tag.trim())
   if (!match) throw new Error(`A24_RELEASE_TAG must look like v<semver> (e.g. v0.6.0-preview.20261028.10); got: ${tag}`)
-  return match[1]
+  const version = match[1]
+  if (packageVersion != null && packageVersion !== '' && version !== packageVersion && !version.startsWith(`${packageVersion}-`)) {
+    throw new Error(
+      `A24_RELEASE_TAG ${tag.trim()} must start with apps/desktop package.json version ${packageVersion} (v${packageVersion} or v${packageVersion}-…); got ${version}`,
+    )
+  }
+  return version
 }
 
 export function assertPinnedSha(actualSha, expected = OPEN_DESIGN_SHA) {
@@ -49,9 +72,40 @@ export function assertPinnedSha(actualSha, expected = OPEN_DESIGN_SHA) {
 
 export function checkOpenDesignSource(dir) {
   if (!dir || !path.isAbsolute(dir)) throw new Error('Open Design checkout path must be absolute')
+  const status = execFileSync('git', ['-C', dir, 'status', '--porcelain'], { encoding: 'utf8' })
+  if (status.trim() !== '') {
+    throw new Error(`Open Design checkout has uncommitted changes (git status --porcelain must be empty):\n${status.trim()}`)
+  }
   const sha = execFileSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8' })
   assertPinnedSha(sha)
   return sha.trim()
+}
+
+export function writeOpenDesignSourceStamp(resourcesRoot, { sha, version }) {
+  if (!sha || !version) throw new Error('Open Design source stamp requires sha and version')
+  const file = path.join(resourcesRoot, OD_SOURCE_STAMP_FILE)
+  fs.writeFileSync(file, `${JSON.stringify({ sha, version })}\n`)
+  return file
+}
+
+/** Reusing a prepared Resources directory skips the source checkout. The
+ * stamp written by prepare is the only record of which sha was built. */
+export function assertOpenDesignResourcesStamp(resourcesRoot, expectedSha = OPEN_DESIGN_SHA) {
+  if (!resourcesRoot || !path.isAbsolute(resourcesRoot)) throw new Error('Open Design Resources path must be absolute')
+  const file = path.join(resourcesRoot, OD_SOURCE_STAMP_FILE)
+  if (!fs.existsSync(file)) {
+    throw new Error(`Open Design Resources stamp is missing: ${file} (refusing to reuse a tree whose source sha was not recorded)`)
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+  } catch {
+    throw new Error(`Open Design Resources stamp is not JSON: ${file}`)
+  }
+  if (parsed.sha !== expectedSha) {
+    throw new Error(`Open Design Resources stamp sha ${parsed.sha ?? '(missing)'} does not match pin ${expectedSha}`)
+  }
+  return parsed
 }
 
 /** "Developer ID Application: Name (HYAP444FN9)" -> "HYAP444FN9"; null for ad-hoc "-". */
@@ -102,40 +156,71 @@ export function findMachOFiles(root) {
   return found.sort((a, b) => a.file.localeCompare(b.file))
 }
 
+/** codesign argv for one Mach-O. Libraries (`.dylib`, `.node`) never get an
+ * entitlements plist. Executables get `--options runtime`; only
+ * {@link JIT_ENTITLEMENT_BASENAMES} also get the JIT entitlements plist. */
+export function machOSigningArgs({ file, kind, identity, entitlements, timestamp = true }) {
+  const adhoc = identity === '-'
+  const args = ['--force', '--sign', identity]
+  if (kind === 'executable' || !adhoc) args.push('--options', 'runtime')
+  if (timestamp && !adhoc) args.push('--timestamp')
+  if (kind === 'executable' && entitlements && JIT_ENTITLEMENT_BASENAMES.has(path.basename(file))) {
+    args.push('--entitlements', entitlements)
+  }
+  args.push(file)
+  return args
+}
+
 /**
  * Signs every Mach-O under `root` (Developer ID, Hardened Runtime, secure
  * timestamp) and verifies each with `codesign --verify --strict`, plus that the
- * Team ID matches the identity's. `identity: '-'` (ad-hoc) is for tests only.
+ * Team ID matches the identity's. `identity: '-'` (ad-hoc) is for tests only:
+ * its derived Team ID is empty, so pass `expectedTeamId` to exercise the
+ * check. `runCommand` and `files` are test seams (no `codesign` / no Mach-O).
  */
-export async function signOpenDesignTree({ root, identity, entitlements, timestamp = true, log = () => {} }) {
+export async function signOpenDesignTree({
+  root, identity, entitlements, timestamp = true, log = () => {},
+  runCommand = execFileAsync, files, expectedTeamId,
+}) {
   if (!root || !path.isAbsolute(root)) throw new Error('root must be an absolute path')
   if (!identity) throw new Error('identity is required')
-  const teamId = teamIdFromIdentity(identity)
+  const derivedTeamId = teamIdFromIdentity(identity)
+  const teamId = expectedTeamId === undefined ? derivedTeamId : expectedTeamId
   const adhoc = identity === '-'
   if (!adhoc && !teamId) throw new Error(`cannot derive a Team ID from signing identity: ${identity}`)
   if (entitlements && !fs.existsSync(entitlements)) throw new Error(`entitlements file is missing: ${entitlements}`)
 
-  const files = findMachOFiles(root)
-  if (files.length === 0) throw new Error(`no Mach-O files found under ${root} — refusing to continue (expected native modules)`)
-  for (const { file, kind } of files) {
-    const args = ['--force', '--sign', identity]
-    if (!adhoc) args.push('--options', 'runtime')
-    if (timestamp && !adhoc) args.push('--timestamp')
-    // Same entitlements as the app for spawned executables: some (e.g. JS/JIT
-    // runtimes) need JIT under Hardened Runtime; harmless for the rest.
-    if (kind === 'executable' && entitlements) args.push('--entitlements', entitlements)
-    args.push(file)
-    await execFileAsync('codesign', args)
-    await execFileAsync('codesign', ['--verify', '--strict', file])
+  const discovered = files ?? findMachOFiles(root)
+  if (discovered.length === 0) throw new Error(`no Mach-O files found under ${root} — refusing to continue (expected native modules)`)
+  for (const { file, kind } of discovered) {
+    await runCommand('codesign', machOSigningArgs({ file, kind, identity, entitlements, timestamp }))
+    await runCommand('codesign', ['--verify', '--strict', file])
     if (teamId) {
-      const { stderr } = await execFileAsync('codesign', ['-dv', file])
+      const { stderr = '' } = await runCommand('codesign', ['-dv', file])
       if (!stderr.includes(`TeamIdentifier=${teamId}`)) {
         throw new Error(`${file} was not signed with Team ID ${teamId}`)
       }
     }
     log(`signed (${kind}) ${path.relative(root, file)}`)
   }
-  return files
+  return discovered
+}
+
+/** After packaging (including SKIP_NOTARIZE=1): every Mach-O in the extracted
+ * component tarball must `codesign --verify --strict` and carry Team ID
+ * HYAP444FN9. */
+export async function verifySignedMachOTree({ root, teamId = EXPECTED_TEAM_ID, runCommand = execFileAsync, files }) {
+  if (!root || !path.isAbsolute(root)) throw new Error('root must be an absolute path')
+  const discovered = files ?? findMachOFiles(root)
+  if (discovered.length === 0) throw new Error(`no Mach-O files found under ${root}`)
+  for (const { file } of discovered) {
+    await runCommand('codesign', ['--verify', '--strict', file])
+    const { stderr = '' } = await runCommand('codesign', ['-dv', file])
+    if (!stderr.includes(`TeamIdentifier=${teamId}`)) {
+      throw new Error(`${file} TeamIdentifier is not ${teamId}`)
+    }
+  }
+  return discovered.length
 }
 
 async function main(argv) {
@@ -147,6 +232,14 @@ async function main(argv) {
     case 'check-source':
       process.stdout.write(`${checkOpenDesignSource(rest[0])}\n`)
       return
+    case 'check-resources':
+      process.stdout.write(`${assertOpenDesignResourcesStamp(path.resolve(rest[0])).sha}\n`)
+      return
+    case 'verify-signed': {
+      const count = await verifySignedMachOTree({ root: path.resolve(rest[0]) })
+      process.stdout.write(`verified ${count} Mach-O files under ${rest[0]}\n`)
+      return
+    }
     case 'sign': {
       const [root, identity, entitlements] = rest
       const files = await signOpenDesignTree({
@@ -156,7 +249,7 @@ async function main(argv) {
       return
     }
     default:
-      throw new Error('usage: open-design-mac-release.mjs version <tag> | check-source <dir> | sign <dir> <identity> <entitlements>')
+      throw new Error('usage: open-design-mac-release.mjs version <tag> | check-source <dir> | check-resources <dir> | verify-signed <dir> | sign <dir> <identity> <entitlements>')
   }
 }
 

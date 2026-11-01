@@ -79,16 +79,41 @@ Open Design 不进 dmg：`release-mac.sh` 在打包前构建它、签名其原�
 要手动上传到同名 GitHub release 的资产里（应用运行时从 `releases/download/<tag>/<资产>` 下载）。
 
 - **必须设 `A24_RELEASE_TAG`**（如 `v0.6.0-preview.20261028.10`）。清单 URL 里的版本 = tag 去掉 `v`，
-  不会回退到 package.json 的版本（那个 tag 不存在，用户会 404）。
-- Open Design 源码默认 `~/Dev/auraai/open-design-agent24`（`A24_OPEN_DESIGN_SOURCE_DIR` 可改），必须在固定 sha。
+  不会回退到 package.json 的版本（那个 tag 不存在，用户会 404）。去掉前导 `v` 之后，tag 还必须以
+  `apps/desktop/package.json` 的 `version` 开头：当前是 `0.6.0`，所以只接受 `v0.6.0` 或 `v0.6.0-…`。
+- Open Design 源码默认 `~/Dev/auraai/open-design-agent24`（`A24_OPEN_DESIGN_SOURCE_DIR` 可改）。
+  `check-source` 要求工作区干净（`git status --porcelain` 为空）并且 HEAD 等于固定 sha。
+  prepare 在 Resources 根目录写 `.agent24-od-source.json`（`{sha, version}`）。设置了
+  `A24_OPEN_DESIGN_RESOURCES_DIR` 复用已有树时，stamp 必须存在且 sha 等于 pin，否则拒绝打包。
+- 组件清单的下载仓库写死为 `iDoris-ai/Agent24`，不读环境变量 `A24_OD_REPOSITORY`。
 - **为什么原生模块必须同 Team ID 签名**：组件的 daemon 跑在 app 自己的二进制里（`ELECTRON_RUN_AS_NODE`），
   app 开了 Hardened Runtime 且没有 `disable-library-validation`，所以下载来的 `.node`/`.dylib` 不同 Team ID 就加载不了。
-  `open-design-mac-release.mjs sign` 对组件树里每个 Mach-O 用 Developer ID + `--options runtime --timestamp` 签名并 `codesign --verify --strict`。
+  `open-design-mac-release.mjs sign` 对组件树里每个 Mach-O 用 Developer ID + `--timestamp` 签名并 `codesign --verify --strict`。
+  executable 和正式签名的库带 `--options runtime`。`.dylib` / `.node` 不挂 entitlements。
+  JIT 两项（`allow-jit`、`allow-unsigned-executable-memory`）只给白名单里的 executable，目前只有 `opencode`（bun/JSC）。
+  `ffmpeg`、`esbuild`、`spawn-helper`、`vela` 只签 Hardened Runtime。应用自己的
+  `build/entitlements.mac.plist` 不变，仍给 Electron/V8 用。
 - **组件 tarball 要不要公证**：应用自己 `fetch` 下载，文件没有 quarantine 标记，Gatekeeper 不评估它，能否加载只看 Team ID。
-  松散文件也无法 staple。脚本仍会把 zip 提交公证（几分钟）以登记 cdhash，万一用户用浏览器手动下载资产也能放行；`SKIP_NOTARIZE=1` 时跳过。
-- `verify-mac-open-design.sh` 校验：清单在包内且字段正确，包内没有 Open Design 目录/tarball，资产 sha256/size 与清单一致，DMG 不超过 `A24_DMG_MAX_MB`（默认 250）。
+  松散文件也无法 staple。脚本仍会把 zip 提交公证（几分钟）以登记 cdhash，万一用户用浏览器手动下载资产也能放行；`SKIP_NOTARIZE=1` 时跳过公证。
+  无论是否公证，`verify-mac-open-design.sh` 都会把 tarball 解到临时目录，对每个 Mach-O 跑
+  `codesign --verify --strict`，并核对 `TeamIdentifier` 是 `HYAP444FN9`。
+- `verify-mac-open-design.sh` 还校验：清单在包内且字段正确（version 来自 pack 模块的 pin，不再写死），
+  下载 URL 的 owner/repo 只能是 `iDoris-ai/Agent24`，包内没有 Open Design 目录/tarball，资产 sha256/size 与清单一致，
+  DMG 不超过 `A24_DMG_MAX_MB`（默认 250）。
+- 脚本结束时打印上传命令：`gh release upload "$A24_RELEASE_TAG" "<tarball 绝对路径>" -R iDoris-ai/Agent24`。
+  **发布之后**再跑可达性检查（读清单里的 URL、sha256、size；`curl -fsIL --max-time 60` 确认 URL 可达，服务器给了
+  `Content-Length` 时再核对 size）：
+
+  ```bash
+  bash apps/desktop/scripts/check-open-design-release-asset.sh <dmg 或 open-design-component.json>
+  ```
+
 - 发布前本地验证（不上传 GitHub）：把 tarball 用本机 http 服务起来，启动已签名 app 时设
-  `A24_OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL=http://127.0.0.1:<port>/`（只认 loopback 的 http，sha256 仍按包内清单校验）。
+  `A24_OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL=http://127.0.0.1:<port>/` 或 `http://[::1]:<port>/`。
+  只接受这两个字面地址的 `http`，不接受 `localhost`，也不把主机名放进全局下载白名单。
+  豁免只对这一个 origin（协议 + 主机 + 端口）生效，跳到别的端口或 `https` 会被拒绝。
+  覆盖只改资产所在目录，文件名仍用清单里的名字。sha256 仍按包内清单校验。
+  覆盖生效时下载卡片会显示「使用本地测试源」。
 
 ## 验证
 
