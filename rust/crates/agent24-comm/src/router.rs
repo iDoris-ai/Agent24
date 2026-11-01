@@ -67,6 +67,8 @@ pub struct CommState {
     /// the `/comm/daemon*` routes then answer `not_configured` same as any
     /// other route on those backends.
     daemon: Option<Arc<crate::daemon::HyphaeDaemonSupervisor>>,
+    /// One private-key export at a time (a second gets `export_in_progress`).
+    export_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl CommState {
@@ -89,6 +91,7 @@ impl CommState {
                 home: Arc::new(home),
             },
             daemon: None,
+            export_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -110,6 +113,7 @@ impl CommState {
                 reason: Arc::new(reason.into()),
             },
             daemon: None,
+            export_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -122,6 +126,7 @@ impl CommState {
                 reason: Arc::new(reason.into()),
             },
             daemon: None,
+            export_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -659,17 +664,16 @@ async fn export_identity(
     let (runner, password_store, home) = state.require_ready()?;
     invalid_if_bad_name("nickname", &req.nickname)?;
     invalid_if_blank("path", &req.path)?;
-    let backup_password: &str = &req.backup_password.0;
-    if backup_password.chars().count() < crate::export::BACKUP_PASSWORD_MIN_CHARS {
-        return Err(CommError::Invalid(format!(
-            "backup password must be at least {} characters",
-            crate::export::BACKUP_PASSWORD_MIN_CHARS
-        )));
-    }
-    if backup_password.len() > crate::export::BACKUP_PASSWORD_MAX_BYTES {
-        return Err(CommError::Invalid("backup password is too long".to_owned()));
-    }
+    crate::export::validate_backup_password(&req.backup_password.0)?;
     let dest = PathBuf::from(&req.path);
+    // One export at a time: the pty, the keychain read and the scrypt work are
+    // heavy and secret-bearing, and a second caller gets a clear refusal.
+    let _single = state.export_gate.try_lock().map_err(|_| {
+        CommError::Conflict(
+            "export_in_progress: another key backup is already running".to_owned(),
+            Some(json!({"reason": "export_in_progress"})),
+        )
+    })?;
     crate::export::precheck_destination(&dest, home)?;
 
     // The identity's public key comes from `identity list`, not from the text
@@ -1799,6 +1803,7 @@ echo "Nsec:     {nsec}"
             Password::new(b"pw".to_vec()).unwrap(),
             &pk,
             Duration::from_secs(3),
+            Duration::from_secs(2),
         )
         .await;
         assert!(matches!(result, Err(CommError::Timeout)), "{result:?}");
@@ -1813,6 +1818,135 @@ echo "Nsec:     {nsec}"
             .unwrap()
             .success();
         assert!(!alive, "the exporting child must not outlive the timeout");
+    }
+
+    /// Runs the real export machinery against a fake `hyphae` script.
+    async fn export_with(
+        script: &str,
+        keychain_password: &[u8],
+        echo_wait: Duration,
+    ) -> Result<(), CommError> {
+        use crate::export::{export_secret_key_within, fixtures};
+        let tmp = tempfile::tempdir().unwrap();
+        let state = ready_state_with_identity(tmp.path(), script).await;
+        let (runner, ..) = state.require_ready().unwrap();
+        let pk = crate::export::npub_to_pubkey(&fixtures::npub()).unwrap();
+        export_secret_key_within(
+            runner,
+            "t1",
+            Password::new(keychain_password.to_vec()).unwrap(),
+            &pk,
+            Duration::from_secs(10),
+            echo_wait,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn the_password_is_never_written_while_the_terminal_still_echoes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = tmp.path().join("received");
+        // never turns echo off
+        let script = format!(
+            "#!/bin/sh\nprintf 'Keystore password: '\nsleep 2\nread -r pw\necho \"$pw\" > {}\n",
+            sink.display()
+        );
+        let result = export_with(&script, b"keychain-pw", Duration::from_millis(300)).await;
+        assert!(
+            matches!(&result, Err(CommError::Upstream(m)) if m.contains("echo")),
+            "{result:?}"
+        );
+        assert!(!sink.exists(), "the password must not have been written");
+    }
+
+    #[tokio::test]
+    async fn failure_text_after_the_prompt_is_classified_so_not_found_is_reachable() {
+        let script = |reply: &str| {
+            format!(
+                "#!/bin/sh\nprintf 'Keystore password: '\nstty -echo 2>/dev/null\nread -r pw\necho\necho \"{reply}\"\nexit 4\n"
+            )
+        };
+        let missing = export_with(
+            &script("Error: identity 'x' not found"),
+            b"pw",
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            matches!(missing, Err(CommError::NotFound(_))),
+            "{missing:?}"
+        );
+        let wrong = export_with(
+            &script(
+                "Error: failed to load keystore: failed to unlock keystore: incorrect password",
+            ),
+            b"pw",
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(matches!(wrong, Err(CommError::Locked(_))), "{wrong:?}");
+        let other = export_with(
+            &script("Error: disk on fire"),
+            b"pw",
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(matches!(other, Err(CommError::Upstream(_))), "{other:?}");
+    }
+
+    #[tokio::test]
+    async fn an_untypable_keychain_password_is_refused_before_anything_is_spawned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("spawned");
+        let script = format!("#!/bin/sh\ntouch {}\n", marker.display());
+        let result = export_with(&script, b"tab\there", Duration::from_secs(1)).await;
+        assert!(matches!(result, Err(CommError::Invalid(_))), "{result:?}");
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn identity_export_rejects_unusable_backup_passwords() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = ready_state_with_identity(tmp.path(), &export_script("test-password")).await;
+        let app = router(state);
+        let dest = tmp.path().join("x.ncryptsec");
+        for bad in [
+            "bad\nline-pass",
+            "bad\rline-pass",
+            "bad\u{0}nul-pass",
+            "          ",
+        ] {
+            let (s, b) = export_call(app.clone(), "t1", &dest, bad).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad:?} {b:?}");
+        }
+        assert!(!dest.exists());
+    }
+
+    #[tokio::test]
+    async fn a_second_concurrent_export_gets_export_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        // the first export lingers so it is still running when the second arrives
+        let script = export_script("test-password").replace("echo\nif [", "sleep 2\necho\nif [");
+        let state = ready_state_with_identity(tmp.path(), &script).await;
+        let app = router(state);
+        let first = tmp.path().join("one.ncryptsec");
+        let second = tmp.path().join("two.ncryptsec");
+        let running = tokio::spawn({
+            let (app, first) = (app.clone(), first.clone());
+            async move { export_call(app, "t1", &first, "backup-pass-1").await }
+        });
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let (status, body) = export_call(app.clone(), "t1", &second, "backup-pass-1").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+        assert_eq!(body["data"]["reason"], "export_in_progress");
+        assert!(!second.exists());
+        let (status, body) = running.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert!(first.exists());
+        // and the gate is released afterwards
+        let (status, _) = export_call(app, "t1", &second, "backup-pass-1").await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     // ---- unconfigured / binary_rejected: every route, no binary touched --

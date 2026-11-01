@@ -27,23 +27,30 @@ use bech32::{Bech32, Hrp};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rustix::fs::{AtFlags, Mode, OFlags};
+use rustix::io::FdFlags;
 use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+use rustix::termios::LocalModes;
 use serde_json::json;
 use unicode_normalization::UnicodeNormalization;
 use zeroize::Zeroizing;
 
 use crate::error::CommError;
 use crate::password::Password;
-use crate::runner::{HyphaeRunner, kill_process_group_best_effort};
+use crate::runner::{HyphaeRunner, kill_process_group_best_effort, lock_spawn_gate};
 
 const PROMPT: &[u8] = b"assword:";
 /// The whole transcript of a successful export is ~300 bytes; this is the hard
 /// bound of the preallocated buffer, which therefore never reallocates.
 const READ_CAP: usize = 8 * 1024;
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Hyphae switches the tty to no-echo right after printing the prompt; a short
-/// pause keeps the password from being echoed into the (discarded) pty buffer.
-const PROMPT_SETTLE: Duration = Duration::from_millis(150);
+/// Hyphae turns echo off right after printing the prompt. The password is only
+/// written once the pty really reports ECHO off (never on a guess), and never
+/// at all if that takes longer than this.
+const ECHO_OFF_WAIT: Duration = Duration::from_secs(5);
+/// A canonical-mode tty line holds at most MAX_CANON (1024) bytes, control bytes
+/// are interpreted, and the keystore password is one line: refuse what the line
+/// discipline would silently mangle.
+const TTY_LINE_MAX: usize = 1000;
 
 /// NIP-49 defaults: scrypt N=2^16, r=8, p=1; key-security byte 0x02 ("unknown":
 /// the key has been handled by software that cannot attest to its history).
@@ -57,6 +64,62 @@ pub(crate) type SecretKey = Zeroizing<[u8; 32]>;
 
 fn upstream(msg: &str) -> CommError {
     CommError::Upstream(msg.to_owned())
+}
+
+/// The one rule for the backup password, mirrored in the desktop main process
+/// and OpenAPI: at least 8 characters, at most 1024 UTF-8 bytes, a single line
+/// (no CR, LF or NUL: Hyphae's import protocol reads one value per stdin line)
+/// and not whitespace only.
+pub(crate) fn validate_backup_password(password: &str) -> Result<(), CommError> {
+    let bad = |m: &str| Err(CommError::Invalid(m.to_owned()));
+    if password.chars().count() < BACKUP_PASSWORD_MIN_CHARS {
+        return bad("backup password must be at least 8 characters");
+    }
+    if password.len() > BACKUP_PASSWORD_MAX_BYTES {
+        return bad("backup password must be at most 1024 bytes");
+    }
+    if password.contains(['\r', '\n', '\0']) {
+        return bad("backup password must not contain line breaks or NUL");
+    }
+    if password.trim().is_empty() {
+        return bad("backup password must not be only whitespace");
+    }
+    Ok(())
+}
+
+/// The keychain password is typed to a terminal; refuse one the tty line
+/// discipline would alter (generated passwords are 43 base64url characters).
+fn check_typable(password: &Password) -> Result<(), CommError> {
+    let pw = password.as_bytes();
+    if pw.len() >= TTY_LINE_MAX || pw.iter().any(|b| *b < 0x20 || *b == 0x7f) {
+        return Err(CommError::Invalid(
+            "the keystore password cannot be entered through a terminal (control characters or \
+             1000+ bytes); export is unavailable for this keystore"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// A pty pair whose MASTER cannot leak into any child: `FD_CLOEXEC` is set
+/// while the spawn gate is held, so no other spawn in this crate can fork in
+/// the gap (Apple's `posix_openpt` has no `O_CLOEXEC`). The slave is opened
+/// `O_CLOEXEC` too; the exporting child gets it only as its dup2'd stdio.
+fn open_pty() -> Result<(OwnedFd, OwnedFd), CommError> {
+    let io_err = |_| upstream("could not allocate a terminal for identity export");
+    let _gate = lock_spawn_gate();
+    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).map_err(io_err)?;
+    rustix::io::fcntl_setfd(&master, FdFlags::CLOEXEC).map_err(io_err)?;
+    grantpt(&master).map_err(io_err)?;
+    unlockpt(&master).map_err(io_err)?;
+    let slave_name = ptsname(&master, Vec::new()).map_err(io_err)?;
+    let slave = rustix::fs::open(
+        slave_name.as_c_str(),
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io_err)?;
+    Ok((master, slave))
 }
 
 // ---------------------------------------------------------------------
@@ -126,6 +189,7 @@ fn drive(
     master: OwnedFd,
     password: &Password,
     cancel: &AtomicBool,
+    echo_wait: Duration,
 ) -> Result<Zeroizing<Vec<u8>>, CommError> {
     if cancel.load(Ordering::SeqCst) {
         return Err(CommError::Timeout);
@@ -147,9 +211,22 @@ fn drive(
         }
         out.extend_from_slice(&chunk[..n]);
         if !answered && out.windows(PROMPT.len()).any(|w| w == PROMPT) {
-            std::thread::sleep(PROMPT_SETTLE);
-            if cancel.load(Ordering::SeqCst) {
-                return Err(CommError::Timeout);
+            // Wait for the terminal to say echo is off; abort (writing nothing)
+            // if it never does.
+            let until = Instant::now() + echo_wait;
+            loop {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(CommError::Timeout);
+                }
+                match rustix::termios::tcgetattr(&master) {
+                    Ok(t) if !t.local_modes.contains(LocalModes::ECHO) => break,
+                    _ if Instant::now() >= until => {
+                        return Err(upstream(
+                            "the terminal never turned echo off; the password was not sent",
+                        ));
+                    }
+                    _ => std::thread::sleep(Duration::from_millis(10)),
+                }
             }
             let pw = password.as_bytes();
             let mut line: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(pw.len() + 1));
@@ -185,7 +262,15 @@ pub(crate) async fn export_secret_key(
     password: Password,
     expected_pubkey: &[u8; 32],
 ) -> Result<SecretKey, CommError> {
-    export_secret_key_within(runner, nickname, password, expected_pubkey, EXPORT_TIMEOUT).await
+    export_secret_key_within(
+        runner,
+        nickname,
+        password,
+        expected_pubkey,
+        EXPORT_TIMEOUT,
+        ECHO_OFF_WAIT,
+    )
+    .await
 }
 
 pub(crate) async fn export_secret_key_within(
@@ -194,24 +279,17 @@ pub(crate) async fn export_secret_key_within(
     password: Password,
     expected_pubkey: &[u8; 32],
     limit: Duration,
+    echo_wait: Duration,
 ) -> Result<SecretKey, CommError> {
-    let io_err = |_| upstream("could not allocate a terminal for identity export");
-    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).map_err(io_err)?;
-    grantpt(&master).map_err(io_err)?;
-    unlockpt(&master).map_err(io_err)?;
-    let slave_name = ptsname(&master, Vec::new()).map_err(io_err)?;
-    let slave = rustix::fs::open(
-        slave_name.as_c_str(),
-        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(io_err)?;
+    check_typable(&password)?;
+    let (master, slave) = open_pty()?;
 
     // The child is spawned HERE, on the caller's task, and owned by `guard`
     // from the instant it exists: there is no window in which a process runs
     // without an owner that will kill it, and no queued task that can start
     // one later.
-    let mut command = runner.interactive_command(&["identity", "export", "--nickname", nickname]);
+    let mut command =
+        runner.interactive_command(&["identity", "export", &format!("--nickname={nickname}")]);
     let child = {
         let stdin = slave
             .try_clone()
@@ -220,9 +298,11 @@ pub(crate) async fn export_secret_key_within(
             .try_clone()
             .map_err(|_| upstream("pty setup failed"))?;
         command.stdin(stdin).stdout(stdout).stderr(slave);
-        let spawned = command
-            .spawn()
-            .map_err(|e| CommError::Upstream(format!("failed to spawn hyphae: {e}")));
+        let spawned = {
+            let _gate = lock_spawn_gate();
+            command.spawn()
+        }
+        .map_err(|e| CommError::Upstream(format!("failed to spawn hyphae: {e}")));
         // Release the parent's copies of the slave side so the master sees EOF
         // when the child exits.
         command.stdin(std::process::Stdio::null());
@@ -237,9 +317,11 @@ pub(crate) async fn export_secret_key_within(
     let cancel_for_task = Arc::clone(&cancel);
     let deadline = Instant::now() + limit;
     let session = async {
-        let out = tokio::task::spawn_blocking(move || drive(master, &password, &cancel_for_task))
-            .await
-            .map_err(|_| upstream("identity export task failed"))??;
+        let out = tokio::task::spawn_blocking(move || {
+            drive(master, &password, &cancel_for_task, echo_wait)
+        })
+        .await
+        .map_err(|_| upstream("identity export task failed"))??;
         let status = loop {
             if let Some(status) = guard.try_wait()? {
                 break status;
@@ -252,10 +334,18 @@ pub(crate) async fn export_secret_key_within(
         if !status.success() {
             // Classified on bounded byte matches; the transcript is never
             // copied into a String and never forwarded.
+            // Only what Hyphae printed AFTER the prompt counts: the prompt
+            // itself says "Keystore password" and would match everything.
+            let reply = out
+                .windows(PROMPT.len())
+                .position(|w| w == PROMPT)
+                .map_or(&out[..], |i| &out[i + PROMPT.len()..]);
             return Err(
-                if contains_ci(&out, b"password") || contains_ci(&out, b"keystore") {
+                if contains_ci(reply, b"incorrect password")
+                    || contains_ci(reply, b"unlock keystore")
+                {
                     CommError::Locked("password verification failed".to_owned())
-                } else if contains_ci(&out, b"not found") || contains_ci(&out, b"no identity") {
+                } else if contains_ci(reply, b"not found") {
                     CommError::NotFound("identity not found".to_owned())
                 } else {
                     CommError::Upstream(format!(
@@ -467,7 +557,11 @@ fn open_destination(dest: &Path, hyphae_home: &Path) -> Result<Destination, Comm
     let parent = rustix::fs::open(parent_path, dir_flags, Mode::empty())
         .map_err(|_| CommError::Invalid("the destination folder does not exist".to_owned()))?;
 
-    if let Ok(home) = rustix::fs::stat(hyphae_home) {
+    {
+        // Fail closed: if the Hyphae home cannot be identified, nothing is
+        // written (we could not prove the destination is outside it).
+        let home = rustix::fs::stat(hyphae_home)
+            .map_err(|_| upstream("cannot identify the Hyphae data directory"))?;
         let mut current = rustix::io::fcntl_dupfd_cloexec(&parent, 0)
             .map_err(|_| upstream("cannot inspect the destination folder"))?;
         loop {
@@ -655,9 +749,57 @@ mod tests {
         let cancel = AtomicBool::new(true);
         let password = Password::new(b"keychain-password".to_vec()).unwrap();
         let started = Instant::now();
-        let result = drive(master, &password, &cancel);
+        let result = drive(master, &password, &cancel, Duration::from_secs(1));
         assert!(matches!(result, Err(CommError::Timeout)));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_pty_master_is_close_on_exec_so_no_child_can_inherit_it() {
+        let (master, slave) = open_pty().unwrap();
+        for fd in [&master, &slave] {
+            assert!(
+                rustix::io::fcntl_getfd(fd)
+                    .unwrap()
+                    .contains(FdFlags::CLOEXEC)
+            );
+        }
+    }
+
+    #[test]
+    fn typable_keychain_passwords_only() {
+        // what create_identity generates
+        let generated = Password::generate([5u8; 32]);
+        assert!(check_typable(&generated).is_ok());
+        for bad in [
+            &b"has\ttab-and-more"[..],
+            b"new\nline",
+            b"nul\0byte",
+            b"del\x7fchar",
+        ] {
+            assert!(check_typable(&Password::new(bad.to_vec()).unwrap()).is_err());
+        }
+        assert!(check_typable(&Password::new(vec![b'a'; 1000]).unwrap()).is_err());
+        assert!(check_typable(&Password::new(vec![b'a'; 999]).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn backup_password_rule_is_one_line_8_chars_1024_bytes_not_blank() {
+        assert!(validate_backup_password("12345678").is_ok());
+        assert!(validate_backup_password("pässwörd-ünï").is_ok());
+        for bad in [
+            "short",
+            "        ",
+            "a\nb-long-enough",
+            "a\rb-long-enough",
+            "a\0b-long-enough",
+        ] {
+            assert!(validate_backup_password(bad).is_err(), "{bad:?}");
+        }
+        assert!(validate_backup_password(&"a".repeat(1024)).is_ok());
+        assert!(validate_backup_password(&"a".repeat(1025)).is_err());
+        // 1024 bytes is measured in UTF-8, not characters
+        assert!(validate_backup_password(&"é".repeat(513)).is_err());
     }
 
     #[test]
@@ -721,6 +863,11 @@ mod tests {
         assert!(!home.join(".hyphae").join("new").exists());
 
         assert!(write_backup_file(Path::new("relative.txt"), &home, "x").is_err());
+        // fail closed: a Hyphae home that cannot be identified refuses the write
+        assert!(
+            write_backup_file(&out.join("fresh"), &tmp.path().join("no-such-home"), "x").is_err()
+        );
+        assert!(!out.join("fresh").exists());
         assert!(write_backup_file(&out.join("a").join("b"), &home, "x").is_err());
     }
 }

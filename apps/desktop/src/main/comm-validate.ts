@@ -51,7 +51,17 @@ export function isSafeMessage(value: unknown): value is string {
     Buffer.byteLength(value, 'utf8') <= MAX_MESSAGE_BYTES
 }
 
+/** The one backup-password rule (mirrors the daemon and OpenAPI): at least 8
+ *  characters, at most 1024 UTF-8 bytes, a single line (no CR, LF or NUL: Hyphae
+ *  reads one value per stdin line) and not whitespace only. */
 export function isSafeBackupPassword(value: unknown): value is string {
-  return typeof value === 'string' && [...value].length >= BACKUP_PASSWORD_MIN && value.length <= BACKUP_PASSWORD_MAX &&
-    !value.includes('\0')
+  return typeof value === 'string' && [...value].length >= BACKUP_PASSWORD_MIN &&
+    Buffer.byteLength(value, 'utf8') <= BACKUP_PASSWORD_MAX && !/[\r\n\0]/.test(value) && value.trim().length > 0
+}
+
+/** `<nickname>` as a file name: letters and digits of any script kept, anything
+ *  else becomes `_`, no leading dots, never empty. */
+export function backupFileStem(nickname: string): string {
+  const stem = nickname.replace(/[^\p{L}\p{M}\p{N}]+/gu, '_').replace(/^[._]+|[._]+$/g, '')
+  return stem || 'agent24-identity'
 }

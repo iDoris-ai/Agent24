@@ -218,6 +218,18 @@ where
         .collect()
 }
 
+/// Held across every `spawn()` this crate does, and across the pty master's
+/// creation in `export.rs`, so that no child can be forked in the instant
+/// between `openpt` and the `FD_CLOEXEC` that keeps the master out of it
+/// (rustix cannot set `O_CLOEXEC` at `posix_openpt` time on Apple targets).
+static SPAWN_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn lock_spawn_gate() -> std::sync::MutexGuard<'static, ()> {
+    SPAWN_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub(crate) fn kill_process_group_best_effort(pid: u32) {
     let Ok(raw) = i32::try_from(pid) else {
         return;
@@ -426,7 +438,10 @@ impl HyphaeRunner {
             .unwrap_or_default();
 
         let mut cmd = self.command(&inv);
-        let mut child = cmd.spawn().map_err(RunnerError::Spawn)?;
+        let mut child = {
+            let _gate = lock_spawn_gate();
+            cmd.spawn().map_err(RunnerError::Spawn)?
+        };
         let pid = child.id();
         #[cfg(test)]
         timeout_test_hook::pause_before_timeout(self.bin.path()).await;

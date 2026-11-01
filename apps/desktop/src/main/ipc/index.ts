@@ -12,7 +12,7 @@ import { daemonCliEndpoint, daemonConnection, getBackendEndpoint } from '../back
 import { findAllowedRoute, proxyError, proxyRequest, timeoutFor, withKnowledgeBinding } from '../backend-proxy'
 import type { KnowledgeController } from '../knowledge-settings'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
-import { isSafeBackupPassword, isSafeMessage, isSafeName, isValidNpub } from '../comm-validate'
+import { backupFileStem, isSafeBackupPassword, isSafeMessage, isSafeName, isValidNpub } from '../comm-validate'
 import { mt, setMainLocale, isMainLocale } from '../main-i18n'
 import { readOmlxSettingsKey } from '../omlx-settings-key'
 import type { IpcGuard } from './guard'
@@ -224,6 +224,9 @@ function isBackendProxyRequest(req: unknown): req is BackendProxyRequest {
     !requestPath.startsWith('//')
   )
 }
+
+/** The daemon's whole export budget is 30 s of pty plus one scrypt run; this stays well above it. */
+const EXPORT_TIMEOUT_MS = 90_000
 
 /** True if anything (file, dir, even a dangling symlink) is at `p`. */
 function pathExists(p: string): boolean {
@@ -530,12 +533,20 @@ export function registerIpcHandlers(options: {
     exclusive(async () => {
       if (!isSafeName(nickname, 128)) return invalidRequest('invalid nickname')
       if (!isSafeBackupPassword(backupPassword)) return invalidRequest('invalid backup password')
+      // The identity must exist before the user is asked anything.
+      const listed = await proxyToBackend({ method: 'GET', path: '/api/v1/comm/identity' })
+      const identities = (listed.data as { data?: unknown } | null)?.data
+      if (!listed.ok || !Array.isArray(identities) ||
+          !identities.some((i) => (i as { nickname?: unknown } | null)?.nickname === nickname)) {
+        return { ok: false, status: 404, data: { error: { code: 'identity_not_found', message: mt('err.identityNotFound') } } }
+      }
       const ok = await confirmNative(event, mt('comm.export', { name: clip(nickname, 80) }), mt('comm.exportDetail'))
       if (!ok) return cancelled()
       const win = BrowserWindow.fromWebContents(event.sender)
       const options: Electron.SaveDialogOptions = {
         title: mt('comm.exportSave'),
-        defaultPath: path.join(app.getPath('documents'), `${nickname.replace(/[^\w.-]+/g, '_')}.ncryptsec`),
+        // Downloads, not Documents (which is often iCloud-synced).
+        defaultPath: path.join(app.getPath('downloads'), `${backupFileStem(nickname)}.ncryptsec`),
         filters: [{ name: 'NIP-49 ncryptsec', extensions: ['ncryptsec'] }],
       }
       let picked: Electron.SaveDialogReturnValue
@@ -553,7 +564,7 @@ export function registerIpcHandlers(options: {
       return proxyToBackend({
         method: 'POST', path: '/api/v1/comm/identity/export',
         body: { nickname, path: picked.filePath, backup_password: backupPassword },
-      })
+      }, EXPORT_TIMEOUT_MS)
     }),
   )
 

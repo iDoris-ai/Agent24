@@ -1013,7 +1013,17 @@ async fn auth(State(state): State<AppState>, req: Request<Body>, next: Next) -> 
     }
 }
 
-/// Single shared token. Does not consult the route catalog or assurance levels.
+/// Routes that only the desktop's ProductHost may call, in any auth mode.
+/// The private-key backup lets the caller choose the password that encrypts
+/// the key, so a bearer that merely proves "same user, same machine" (the
+/// legacy shared token, any FirstPartyShell or Creative token) must not reach
+/// it: it would let any local process produce a backup it can decrypt.
+fn host_only_route(method: &Method, path: &str) -> bool {
+    method == Method::POST && path == "/api/v1/comm/identity/export"
+}
+
+/// Single shared token. Does not consult the route catalog or assurance levels,
+/// except for [`host_only_route`]s, which are refused outright.
 async fn legacy_auth(state: AppState, req: Request<Body>, next: Next) -> Response {
     let bearer = req
         .headers()
@@ -1023,6 +1033,13 @@ async fn legacy_auth(state: AppState, req: Request<Body>, next: Next) -> Respons
     if bearer
         .is_some_and(|presented| constant_time_eq(presented.as_bytes(), state.token.as_bytes()))
     {
+        if host_only_route(req.method(), req.uri().path()) {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "Operation not allowed in this auth mode",
+            );
+        }
         next.run(req).await
     } else {
         error_response(
@@ -1148,6 +1165,11 @@ async fn authorize(
         crate::capabilities::unix_now(),
     ) {
         Ok(authorization) => {
+            if host_only_route(method, req.uri().path())
+                && authorization.claims.audience != crate::capabilities::Audience::ProductHost
+            {
+                return error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed");
+            }
             // R5: a Creative token that validates still cannot call a route
             // this mapping newly exposed. Resource scope is not this gate.
             if authorization.claims.audience == crate::capabilities::Audience::CreativeRuntime
@@ -4443,6 +4465,66 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             assert_eq!(res.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn key_backup_is_product_host_only_in_capabilities_mode() {
+        let (state, host, creative) = capability_state().await;
+        let modules = Router::new().route(
+            "/api/v1/comm/identity/export",
+            axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+        );
+        let app = build_router_with_modules(state, modules);
+        for (bearer, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some(creative), StatusCode::FORBIDDEN),
+            (Some(host), StatusCode::NO_CONTENT),
+        ] {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/comm/identity/export");
+            if let Some(bearer) = bearer {
+                req = req.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+            }
+            let res = app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn key_backup_is_refused_in_legacy_mode_even_with_the_right_token() {
+        let modules = Router::new()
+            .route(
+                "/api/v1/comm/identity/export",
+                axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/api/v1/comm/contact",
+                axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+            );
+        let app = build_router_with_modules(state().await, modules);
+        for (uri, expected) in [
+            ("/api/v1/comm/identity/export", StatusCode::FORBIDDEN),
+            ("/api/v1/comm/contact", StatusCode::NO_CONTENT), // other routes unchanged
+        ] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, "Bearer testtoken")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), expected, "{uri}");
         }
     }
 

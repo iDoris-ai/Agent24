@@ -64,7 +64,7 @@ beforeAll(async () => {
     const chunks: Buffer[] = []
     req.on('data', (c: Buffer) => chunks.push(c))
     req.on('end', () => {
-      if (!(req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/')) && !(req.method === 'GET' && req.url === '/api/v1/os') && !(req.method === 'GET' && req.url === '/api/v1/attached')) seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: Buffer.concat(chunks).toString() })
+      if (!(req.method === 'GET' && req.url === '/api/v1/comm/identity') && !(req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/')) && !(req.method === 'GET' && req.url === '/api/v1/os') && !(req.method === 'GET' && req.url === '/api/v1/attached')) seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: Buffer.concat(chunks).toString() })
       res.setHeader('Content-Type', 'application/json')
       if (req.url === '/v1/models' && modelsRequireKey && req.headers.authorization !== `Bearer ${modelsRequireKey}`) {
         res.statusCode = 401
@@ -95,6 +95,8 @@ beforeAll(async () => {
       } else if (req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/ap_missing')) {
         res.statusCode = 404
         res.end(JSON.stringify({ error: { code: 'not_found', message: 'nope' } }))
+      } else if (req.method === 'GET' && req.url === '/api/v1/comm/identity') {
+        res.end(JSON.stringify({ ok: true, data: [{ nickname: 'alice', npub: 'npub1alice', default: true, encrypted: true }] }))
       } else if (req.method === 'GET' && req.url === '/api/v1/attached') {
         res.end(JSON.stringify({ modules: attachedModules }))
       } else if (req.url?.startsWith('/api/v1/attached/') && attachedFailure) {
@@ -340,6 +342,22 @@ describe('CommIdentityExport elevated IPC', () => {
     expect(opts.detail).toMatch(/impersonate/)
     expect(JSON.stringify(opts)).not.toContain('backup-pass-1')
   })
+  it('an unknown identity is refused before any dialog', async () => {
+    showMessageBox.mockClear()
+    const result = await call(IpcChannels.CommIdentityExport, 'ghost', 'backup-pass-1')
+    expect(result.data.error.code).toBe('identity_not_found')
+    expect(showMessageBox).not.toHaveBeenCalled()
+    expect(seen).toHaveLength(0)
+  })
+  it('the native confirm says where the password was typed; the save dialog defaults to Downloads with a Unicode-safe name', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    showSaveDialog.mockResolvedValueOnce({ canceled: true })
+    await call(IpcChannels.CommIdentityExport, 'alice', 'backup-pass-1')
+    const confirm = showMessageBox.mock.calls.at(-1)!.at(-1) as { detail: string }
+    expect(confirm.detail).toContain('entered in the Agent24 window')
+    const save = showSaveDialog.mock.calls.at(-1)!.at(-1) as { defaultPath: string }
+    expect(save.defaultPath).toBe(path.join(settingsDir, 'alice.ncryptsec'))
+  })
   it('an existing target is refused before any request (nothing overwritten)', async () => {
     const existing = path.join(settingsDir, 'taken.ncryptsec')
     fs.writeFileSync(existing, 'precious')
@@ -354,6 +372,10 @@ describe('CommIdentityExport elevated IPC', () => {
     ['control chars in the name', ['al\nice', 'backup-pass-1']],
     ['object as the name', [{ nickname: 'alice' }, 'backup-pass-1']],
     ['short password', ['alice', 'short']],
+    ['password with a line break', ['alice', 'good-long\npassword']],
+    ['password with NUL', ['alice', 'good-long\0password']],
+    ['whitespace-only password', ['alice', '          ']],
+    ['password over 1024 UTF-8 bytes', ['alice', 'é'.repeat(513)]],
     ['missing password', ['alice', undefined]],
   ])('refuses %s before any dialog', async (_name, args) => {
     showMessageBox.mockClear()

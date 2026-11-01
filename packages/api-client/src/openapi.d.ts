@@ -1346,7 +1346,7 @@ export interface paths {
         put?: never;
         /**
          * Back up an identity's private key to a password-encrypted file
-         * @description Writes the identity's private key to `path` as a NIP-49 `ncryptsec1…` string (scrypt log_n 16, XChaCha20-Poly1305) encrypted with `backup_password`; there is no plaintext option. The keystore password is taken from the system keychain. The file is created with O_CREAT|O_EXCL|O_NOFOLLOW, mode 0600, relative to a once-opened parent directory: an existing target of any kind is refused with `409 conflict` and `data.reason = "target_exists"`, and nothing is overwritten, truncated or chmod-ed. `path` must be absolute and outside the Hyphae data directory. Neither the key, the encrypted backup nor the backup password is part of the response or a log line. The desktop app does not expose this through the renderer proxy; its main process picks `path` with a native save dialog after a native confirmation. There is no CLI command yet (it needs the CORE-2d presence proof for CommWrite).
+         * @description Writes the identity's private key to `path` as a NIP-49 `ncryptsec1…` string (scrypt log_n 16, XChaCha20-Poly1305) encrypted with `backup_password`; there is no plaintext option. The keystore password is taken from the system keychain. The file is created with O_CREAT|O_EXCL|O_NOFOLLOW, mode 0600, relative to a once-opened parent directory: an existing target of any kind is refused with `409 conflict` and `data.reason = "target_exists"`, and nothing is overwritten, truncated or chmod-ed. `path` must be absolute and outside the Hyphae data directory. Neither the key, the encrypted backup nor the backup password is part of the response or a log line. The desktop app does not expose this through the renderer proxy; its main process picks `path` with a native save dialog after a native confirmation. There is no CLI command yet (it needs the CORE-2d presence proof for CommWrite). Only the desktop's ProductHost credential may call it: the legacy shared-token mode and every other audience get `403`, because the caller chooses the password that encrypts the key. One export runs at a time (`409` with `data.reason = "export_in_progress"`).
          */
         post: operations["exportCommIdentity"];
         delete?: never;
@@ -6626,7 +6626,7 @@ export interface operations {
                     /** @description No control characters. */
                     nickname: string;
                     path: string;
-                    /** @description Encrypts the backup. Lose it and the backup cannot be restored; it is not stored. */
+                    /** @description Encrypts the backup. At least 8 characters and at most 1024 UTF-8 bytes (the byte limit is enforced by the server), a single line (no CR, LF or NUL) and not whitespace only. Lose it and the backup cannot be restored; it is not stored. */
                     backup_password: string;
                 };
             };
@@ -6642,6 +6642,16 @@ export interface operations {
                 };
             };
             400: components["responses"]["CommInvalid"];
+            /** @description Not the desktop ProductHost credential (or legacy auth mode) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+            404: components["responses"]["CommNotFound"];
             409: components["responses"]["CommConflict"];
             423: components["responses"]["CommLocked"];
             502: components["responses"]["CommBadGateway"];

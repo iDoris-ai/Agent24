@@ -434,4 +434,18 @@ describe('CommunicationPage usability', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
     await waitFor(() => expect(sendCommMessage).toHaveBeenCalledWith(stranger, 'hello'))
   })
+
+  it('rejects a blank or over-long backup password in the form (line breaks are stripped by the input itself)', async () => {
+    success()
+    render(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Export private key backup alice' }))
+    const submit = screen.getByRole('button', { name: 'Choose where to save…' })
+    for (const bad of ['           ', 'é'.repeat(513)]) {
+      fireEvent.change(screen.getByLabelText('Backup password'), { target: { value: bad } })
+      fireEvent.change(screen.getByLabelText('Repeat backup password'), { target: { value: bad } })
+      fireEvent.click(submit)
+      expect(await screen.findByText(/must be one line, not only spaces/)).toBeInTheDocument()
+    }
+    expect(exportCommIdentity).not.toHaveBeenCalled()
+  })
 })

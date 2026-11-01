@@ -290,6 +290,9 @@ export default function CommunicationPage() {
   const exportKey = async (name: string) => {
     if (pending) return
     if ([...exportPassword].length < 8) { setExportError(t('export.tooShort')); return }
+    if (/[\r\n\0]/.test(exportPassword) || !exportPassword.trim() || new TextEncoder().encode(exportPassword).length > 1024) {
+      setExportError(t('export.invalid')); return
+    }
     if (exportPassword !== exportRepeat) { setExportError(t('export.mismatch')); return }
     const backupPassword = exportPassword
     setExportPassword('')
