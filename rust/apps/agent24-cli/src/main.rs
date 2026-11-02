@@ -725,6 +725,7 @@ fn parse_ready_state(value: &serde_json::Value, pid: u32) -> Result<DaemonState,
         auth_mode,
         protocol_version,
         enroll_endpoint: value["enroll_endpoint"].as_str().map(str::to_owned),
+        startup_state: None,
     };
     state
         .validate()

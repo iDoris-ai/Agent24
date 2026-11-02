@@ -630,6 +630,9 @@ mod tests {
                                 // opt-in #[ignore] real-filesystem test switch
                                 // (agent24-comm export.rs); the daemon never reads it
                                     | "A24_FS_TEST_DIRS"
+                                // debug-only seam behind `--features test-enrollment`
+                                // (a compile_error in release); never set in a LaunchAgent
+                                    | "AGENT24_TEST_MIGRATION_GUARD"
                             )
                         {
                             found.push(name);
