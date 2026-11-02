@@ -628,7 +628,7 @@ test('release-mac.sh pins the repository and prints the upload command; verify r
   assert.match(release, /ditto -c -k --sequesterRsrc "\$OD_NOTARY_SRC" "\$OD_NOTARY_ZIP"/)
   assert.match(release, /出 preview 前，必须在当前 head 的签名包上，用本地测试源重跑一遍下载 → 安装 → 启动/)
   const verify = fs.readFileSync(new URL('./verify-mac-open-design.sh', import.meta.url), 'utf8')
-  assert.equal(verify.includes("'0.22.2'"), false)
+  assert.equal(verify.includes(`'${OPEN_DESIGN_PIN_VERSION}'`), false)
   assert.match(verify, /OPEN_DESIGN_PIN_VERSION/)
   assert.match(verify, /https:\/\/github.com\/iDoris-ai\/Agent24\/releases\/download\//)
   assert.match(verify, /verify-signed/)

@@ -33,8 +33,8 @@ import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 
-export const OPEN_DESIGN_PIN_VERSION = '0.22.2'
-export const OPEN_DESIGN_SHA = '34bc2ba810cf894daff6a7c1736d1cef6c7726b1'
+export const OPEN_DESIGN_PIN_VERSION = '0.26.1'
+export const OPEN_DESIGN_SHA = '89d83b8c22871aaafc91afabfa1925564609e0db'
 
 function requireDirectory(target, label) {
   const stat = fs.statSync(target, { throwIfNoEntry: false })
