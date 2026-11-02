@@ -514,3 +514,72 @@ fn attached_entries_named_like_a_builtin_component_are_not_listed() {
         "a forged entry is dropped, a real one stays"
     );
 }
+
+/// Many threads report through one `ComponentReports`. `ready` and `degraded` follow each other
+/// by D5 edges in both directions, so whatever the interleaving no report may be flagged
+/// unexpected, and what is read afterwards is a state somebody reported. `report` reads the
+/// previous entry and writes the new one under a single guard, so there is no window between
+/// the check and the store for another report to slip into.
+#[test]
+fn concurrent_reports_are_serialised_and_never_misflagged() {
+    use std::sync::Arc;
+    let reports = Arc::new(ComponentReports::default());
+    let t0 = Instant::now();
+    let body = |state| ReportBody {
+        state,
+        version: None,
+        reason: None,
+    };
+    reports
+        .report(
+            "open-design",
+            ReportBody {
+                state: ComponentState::Ready,
+                version: None,
+                reason: None,
+            },
+            t0,
+        )
+        .unwrap();
+    let threads: Vec<_> = (0..8)
+        .map(|i| {
+            let reports = Arc::clone(&reports);
+            std::thread::spawn(move || {
+                let mut flagged = 0;
+                for n in 0..500 {
+                    let state = if (n + i) % 2 == 0 {
+                        ComponentState::Ready
+                    } else {
+                        ComponentState::Degraded
+                    };
+                    let now = t0 + Duration::from_millis(n);
+                    if reports
+                        .report(
+                            "open-design",
+                            ReportBody {
+                                state,
+                                version: None,
+                                reason: None,
+                            },
+                            now,
+                        )
+                        .unwrap()
+                        .is_some()
+                    {
+                        flagged += 1;
+                    }
+                }
+                flagged
+            })
+        })
+        .collect();
+    let flagged: u32 = threads.into_iter().map(|t| t.join().unwrap()).sum();
+    assert_eq!(flagged, 0);
+    let last = reports
+        .current("open-design", t0 + Duration::from_millis(500))
+        .unwrap();
+    assert!(matches!(
+        last.state,
+        ComponentState::Ready | ComponentState::Degraded
+    ));
+}

@@ -85,9 +85,9 @@ impl Form {
         }
     }
 
-    /// Edges D5 states in prose for a subset rather than in the table: a form with no
-    /// `stopping` goes straight to `stopped` (a dropped connection, an unconfigured
-    /// service, a closed server), and a per-call CLI, which never runs `starting`, learns of a
+    /// Edges D5 states in prose for a subset rather than in the table: a dropped
+    /// connection (attach), an unconfigured service (remote) and a closed server (MCP) go
+    /// straight to `stopped`, and a per-call CLI, which never runs `starting`, learns of a
     /// contract mismatch from the installed binary.
     fn extra(self, from: ComponentState, to: ComponentState) -> bool {
         match (self, to) {

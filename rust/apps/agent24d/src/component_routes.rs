@@ -3,8 +3,9 @@
 //! One status model for every component. The daemon reads the sources it owns (iDoris, the
 //! Hyphae daemon, attached modules, the Documents package, Knowledge); Open Design is the
 //! desktop's, so the desktop reports it and the daemon only remembers the report for a while.
-//! The old status routes stay as they are and are not read from here: they and this route
-//! read the same underlying objects.
+//! The old status routes stay as they are and are not called from here; for iDoris, Hyphae,
+//! attached modules and Documents this route reads the same objects (`IdorisHost`, the comm
+//! daemon supervisor, `AttachRegistry`, `os_reports` + `module_status`) at request time.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
@@ -63,7 +64,8 @@ pub struct Item {
     detail: Option<Value>,
 }
 
-/// What every other audience sees: no paths, pids, ports, messages, team ids or commits.
+/// What a non-host audience sees in capability mode (see [`sees_everything`]): the fields are
+/// only id, version, state and provides, so no paths, pids, ports, messages, team ids or commits.
 #[derive(Serialize)]
 struct Redacted<'a> {
     id: &'a str,
@@ -106,7 +108,7 @@ impl Item {
     }
 }
 
-/// `{components: [...]}`, full for the host and redacted for everyone else.
+/// `{components: [...]}`, full or redacted as [`sees_everything`] decided for this request.
 fn render(items: &[Item], full: bool) -> Value {
     let components = if full {
         serde_json::to_value(items)
@@ -163,7 +165,8 @@ fn from_supervised(status: &Supervised) -> (ComponentState, Option<&'static str>
     }
 }
 
-/// The Hyphae daemon, by pid liveness only (ADR-038 §7.4: no `health` before C2, so never
+/// The Hyphae daemon, from the supervisor's process state (is the child alive, did it exit;
+/// ADR-038 §7.4: no `health` before C2, so never
 /// `degraded`). A process that died and will be restarted, gave up, or was refused its
 /// password is `failed`; one that is not configured or was stopped is `stopped`.
 fn from_hyphae(process: &str) -> (ComponentState, Option<String>) {
@@ -426,7 +429,7 @@ pub enum ReportError {
 }
 
 /// What the desktop last said about the components it owns, in memory only. An entry older than
-/// [`REPORT_TTL`] is gone: reading it gives `None`, and the next report is a fresh baseline.
+/// [`REPORT_TTL`] is ignored: reading it gives `None`, and the next report is a fresh baseline.
 #[derive(Default)]
 pub struct ComponentReports(Mutex<HashMap<String, Reported>>);
 
@@ -438,7 +441,8 @@ impl ComponentReports {
             .cloned()
     }
 
-    /// Record a report. The daemon only aggregates (D5): whatever the desktop says is
+    /// Record a report. The daemon only aggregates (D5): any state legal for the
+    /// form is
     /// stored and the TTL refreshed, or a restarted desktop would leave a stale state on
     /// show. A state that does not follow the last live one by a D5 edge (or the same state
     /// again) is still stored, logged, and marked in `detail.unexpected_transition`; with

@@ -703,7 +703,7 @@ impl AttachRegistry {
     }
 
     /// Every registered module as `(name, disabled, state of its last generation)`, for
-    /// `/api/v1/components`. In-memory only: nothing here reads `attached.json`.
+    /// `/api/v1/components`. Reads the in-memory entries at call time, never `attached.json`.
     #[must_use]
     pub fn snapshot(&self) -> Vec<(String, bool, Option<DrainState>)> {
         let state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);

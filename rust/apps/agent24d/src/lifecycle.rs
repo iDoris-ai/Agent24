@@ -22,7 +22,8 @@ pub const HTTP_GRACE: Duration = Duration::from_millis(1500);
 /// After a module's stop grace: time to confirm its group is gone.
 pub const CONFIRM: Duration = Duration::from_millis(200);
 /// How long an in-flight model call of a module or attached module gets to wind down once
-/// the shutdown's drain is over (ADR-038 D6's cancel grace). Independent of the stop grace:
+/// the shutdown's drain is over (ADR-038 D6's cancel grace; `Params::deadlines` caps it at
+/// the stop grace when that is shorter). Independent of the stop grace:
 /// attached modules are never sent SIGTERM, so the 15s a package gets to flush is not theirs.
 pub const CALL_CANCEL_GRACE: Duration = Duration::from_secs(2);
 /// After the modules' deadline: time to put the summary on disk.

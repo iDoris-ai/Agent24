@@ -30,7 +30,7 @@ fn workspace_recovery_instant_at(
 // out-of-process modules' drain and stop grace (tunable: `A24_MODULE_DRAIN_MS`,
 // `A24_COMPONENT_STOP_GRACE_MS`), the time to put the summary on disk, and the
 // watchdog after all of them — live in `crate::lifecycle` (SHUT-1b). At the
-// defaults `kill -TERM` ends the process within 16.5s (ADR-038 D5 raised the stop grace to 15s; TASKS B2's 2s now holds only with a lowered grace).
+// defaults `kill -TERM` ends the process within 16.5s, or about 50.6s while a managed iDoris holds the summary open (ADR-038 D5 raised the stop grace to 15s; TASKS B2's 2s now holds only with a lowered grace).
 
 #[derive(Clone)]
 pub struct AppState {
@@ -291,8 +291,9 @@ impl Shutdown {
 
     /// Resolves when in-flight model calls of modules and attached modules must be
     /// cancelled: the drain plus the per-call cancel grace
-    /// ([`crate::lifecycle::CALL_CANCEL_GRACE`], ADR-038 D6), never the stop grace. Attached
-    /// modules get no SIGTERM, so a 15s stop grace must not keep their calls alive. Stored
+    /// ([`crate::lifecycle::CALL_CANCEL_GRACE`], ADR-038 D6), capped by the stop grace when that
+    /// is shorter and never stretched by it. Attached modules get no SIGTERM, so a 15s stop
+    /// grace must not keep their calls alive. Stored
     /// instant, like [`Shutdown::modules_cut_off`].
     pub fn calls_cut_off(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
         let shutdown = self.clone();

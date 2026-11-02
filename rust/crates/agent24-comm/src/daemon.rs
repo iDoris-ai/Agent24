@@ -1553,7 +1553,7 @@ async fn run_actor(
     let mut phase = Phase::Idle;
     // PR #626 review, High #2: the SAME already-validated grace every other
     // out-of-process module's stop uses, handed in by `agent24d` — never
-    // this crate's own raw read of the stop-grace env var (removed; `agent24d::lifecycle::Params` is the only reader).
+    // this crate's own raw read of the stop-grace env var (removed: `Params::from_env` is the only reader).
     let grace = ctx.grace;
     // PR #626 review, Medium #3: set the moment a MANUAL `Cmd::Start` spawns
     // a child (fresh or while already `has_child`), cleared the moment that
