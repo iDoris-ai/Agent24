@@ -856,6 +856,12 @@ export class OpenDesignComponentInstaller {
    * renderer's existing "下载" button doubles as the "重新下载" entry point
    * the install() guard below also relies on this, not a separately cached
    * flag, so a deleted dir is always retried rather than permanently stuck. */
+  /** Manifest version the host reports. Falls back to the pin sha when version is empty. */
+  reportedVersion(): string | null {
+    if (!this.manifest) return null
+    return this.manifest.version.length > 0 ? this.manifest.version : this.manifest.odSha
+  }
+
   status(): OpenDesignComponentStatus {
     if (this.current.state === 'installed' && this.manifest) {
       if (!this.current.dir || !quickValidateInstalledComponent(this.current.dir, this.manifest.sha256)) {

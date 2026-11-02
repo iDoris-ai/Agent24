@@ -409,6 +409,7 @@ describe('CreativeServeWeb', () => {
       { state: 'ready', origin: 'http://127.0.0.1:17456' },
     ])
     expect(spawnFn).toHaveBeenCalledTimes(1)
+    expect(service.headlessSidecarState()).toBeNull()
     await service.stop()
   })
 
@@ -481,6 +482,52 @@ describe('CreativeServeWeb', () => {
       resourceSafeBase: fs.realpathSync(componentDir),
     })
     await service.stop()
+  })
+
+  it('reports headless sidecar phases and clears them after a clean stop', async () => {
+    const { resources: componentDir, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const child = new FakeChild()
+    const service = new CreativeServeWeb(
+      {
+        stateRoot,
+        runtimeExecutable,
+        readyTimeoutMs: 500,
+        component: { status: () => ({ state: 'installed', dir: componentDir }) },
+      },
+      vi.fn(() => child as unknown as ChildProcess) as never,
+      vi.fn(async () => new Response('{}', { status: 200 })),
+    )
+    const starting = service.start()
+    expect(service.headlessSidecarState()).toBe('starting')
+    child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
+    expect(service.headlessSidecarState()).toBe('ready')
+    child.emit('exit', 1, null)
+    expect(service.headlessSidecarState()).toBe('failed')
+    expect(service.status()).toEqual({ state: 'stopped' })
+  })
+
+  it('clears the headless phase after a clean stop so the report falls back to installed', async () => {
+    const { resources: componentDir, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const child = new FakeChild()
+    const service = new CreativeServeWeb(
+      {
+        stateRoot,
+        runtimeExecutable,
+        readyTimeoutMs: 500,
+        component: { status: () => ({ state: 'installed', dir: componentDir }) },
+      },
+      vi.fn(() => child as unknown as ChildProcess) as never,
+      vi.fn(async () => new Response('{}', { status: 200 })),
+    )
+    const starting = service.start()
+    child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
+    await starting
+    const stopping = service.stop()
+    expect(service.headlessSidecarState()).toBe('stopping')
+    expect(service.status()).toEqual({ state: 'stopped' })
+    await stopping
+    expect(service.headlessSidecarState()).toBeNull()
   })
 
   it('C1: Design still starts when resourcesPath is unset entirely (proves no dependency on a writable — or any — app resources dir for the on-demand path)', async () => {

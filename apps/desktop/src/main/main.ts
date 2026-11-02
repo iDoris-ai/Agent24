@@ -23,6 +23,7 @@ import {
   classifyCreativeUrl,
 } from './creative-serve-web'
 import { OpenDesignComponentInstaller } from './open-design-component'
+import { OpenDesignStatusReporter, mapOpenDesignReport, postOpenDesignReport } from './open-design-report'
 import { KnowledgeHost } from './knowledge-host'
 import { KnowledgeLoginStore } from './knowledge-logins'
 import { KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
@@ -92,6 +93,7 @@ let knowledge: KnowledgeController | null = null
 // CORE-2 AgentEar S3: long-polls the daemon for native confirmation challenges.
 let presencePoller: PresencePoller | null = null
 let openDesignComponent: OpenDesignComponentInstaller | null = null
+let openDesignReporter: OpenDesignStatusReporter | null = null
 let creativeView: WebContentsView | null = null
 let creativeOrigin: string | null = null
 const creativeViewFence = new CreativeViewRequestFence()
@@ -289,6 +291,23 @@ app.whenReady().then(async () => {
     pinVersion: OPEN_DESIGN_PIN_VERSION,
     component: openDesignComponent ?? undefined,
   })
+  // ADR-038 C3b: main owns the ProductHost credential and reports Open Design.
+  // The renderer never receives this client or the report route.
+  openDesignReporter = new OpenDesignStatusReporter({
+    snapshot: () => {
+      const install = openDesignComponent?.status()
+      return mapOpenDesignReport({
+        installState: install?.state ?? 'unavailable',
+        reason: install?.reason ?? install?.error,
+        version: openDesignComponent?.reportedVersion() ?? null,
+        sidecar: creativeServeWeb?.headlessSidecarState() ?? null,
+      })
+    },
+    connection: daemonConnection,
+    send: postOpenDesignReport,
+  })
+  creativeServeWeb.onStatus(() => openDesignReporter?.notify())
+  openDesignReporter.start()
   // Dev-only: show the real app icon in the dock immediately, without
   // waiting for an electron-builder packaged build (which is where mac.icon
   // in package.json normally takes effect).
@@ -368,6 +387,7 @@ app.whenReady().then(async () => {
     return openDesignComponent?.status() ?? { state: 'unavailable', reason: 'Open Design component installer is unavailable' }
   }))
   openDesignComponent?.onProgress((status) => {
+    openDesignReporter?.notify()
     if (mainWin && !mainWin.isDestroyed()) {
       mainWin.webContents.send(IpcChannels.OpenDesignComponentProgress, status)
     }
@@ -462,6 +482,7 @@ app.on('before-quit', () => {
 
 app.on('will-quit', () => {
   if (trayTimer) { clearInterval(trayTimer); trayTimer = null }
+  openDesignReporter?.stop()
   agentEarBridge.stop()
   agentEarLog.stop()
   backendManager.stop()
