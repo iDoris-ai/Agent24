@@ -588,12 +588,16 @@ impl Staged {
     /// Give up: remove whatever sits at the staging name. If that cannot be
     /// done, say a partial encrypted file may remain, and where.
     fn abandon(&self, why: &str) -> CommError {
-        let gone = rustix::fs::statat(
-            &self.dest.parent,
-            self.staging_name.as_os_str(),
-            AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .is_err();
+        // Only "does not exist" counts as gone; EACCES/EIO must still report
+        // the possible leftover.
+        let gone = matches!(
+            rustix::fs::statat(
+                &self.dest.parent,
+                self.staging_name.as_os_str(),
+                AtFlags::SYMLINK_NOFOLLOW,
+            ),
+            Err(rustix::io::Errno::NOENT)
+        );
         if gone || self.unlink_staging() {
             upstream(why)
         } else {
@@ -643,11 +647,11 @@ impl Staged {
         .is_ok_and(|st| st.st_dev == want.st_dev && st.st_ino == want.st_ino)
     }
 
-    /// Remove the staging name, but only if it still is our inode.
-    fn unlink_staging_if_ours(&self, want: &rustix::fs::Stat) {
-        if self.is_ours(&self.staging_name, want) {
-            let _ = self.unlink_staging();
-        }
+    /// Remove the staging name, but only if it still is our inode. Returns the
+    /// path if it is ours and could not be removed.
+    fn unlink_staging_if_ours(&self, want: &rustix::fs::Stat) -> Option<PathBuf> {
+        (self.is_ours(&self.staging_name, want) && !self.unlink_staging())
+            .then(|| self.staging_path())
     }
 
     /// Last resort for file systems with neither hard links nor an exclusive
@@ -828,12 +832,23 @@ impl Staged {
             }
         };
         // `linkat`/`renameat` publish a NAME, not the descriptor we verified.
-        // Prove the final name is that very inode; if not, take it back.
+        // Prove the final name is that very inode. If not, report it: whatever
+        // sits there is never deleted or replaced (it may be the user's file).
         let checked = self.verify_final(&want);
         drop(file);
         if let Err(e) = checked {
-            self.unlink_staging_if_ours(&want);
-            return Err(e);
+            let leftover = self.unlink_staging_if_ours(&want);
+            return Err(match (e, leftover) {
+                (CommError::Coded(status, code, msg), Some(staging)) => CommError::Coded(
+                    status,
+                    code,
+                    format!(
+                        "{msg}; a complete encrypted backup may remain at {}",
+                        staging.display()
+                    ),
+                ),
+                (e, _) => e,
+            });
         }
         // Published and complete. After `linkat` the staging name is just a
         // second link; after the rename fallback there is none. Neither
@@ -1581,6 +1596,56 @@ mod tests {
             // our own staging name is gone; nothing else was created
             assert_eq!(leftovers(&out), vec!["mine.ncryptsec".to_owned()], "{tier}");
         }
+    }
+
+    #[test]
+    fn a_conflict_whose_staging_cleanup_fails_names_the_staging_file() {
+        let (_t, home, out) = sandbox();
+        let dest = out.join("m.ncryptsec");
+        let err = Staged::begin_with(
+            &dest,
+            &home,
+            Faults {
+                swap_after_publish: true,
+                fail_cleanup: true,
+                ..Faults::default()
+            },
+        )
+        .unwrap()
+        .write_and_publish(SPEC_NCRYPTSEC)
+        .unwrap_err();
+        match &err {
+            CommError::Coded(_, "publish_conflict", msg) => {
+                assert!(
+                    msg.contains("a complete encrypted backup may remain at"),
+                    "{msg}"
+                );
+                assert!(msg.contains(".agent24-backup-"), "{msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "the user's own file\n"
+        );
+    }
+
+    #[test]
+    fn only_a_missing_staging_name_counts_as_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_t, home, out) = sandbox();
+        let staged = Staged::begin(&out.join("g.ncryptsec"), &home).unwrap();
+        // absent: gone, a plain error
+        assert!(!staged.abandon("x").to_string().contains("may remain"));
+        // a staging file that cannot be inspected (EACCES) is NOT "gone"
+        std::fs::write(staged.staging_path(), b"x").unwrap();
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = staged.abandon("x").to_string();
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if rustix::process::geteuid().is_root() {
+            return; // root ignores the mode: nothing to prove here
+        }
+        assert!(blocked.contains("may remain at"), "{blocked}");
     }
 
     #[test]

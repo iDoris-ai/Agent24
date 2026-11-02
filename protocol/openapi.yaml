@@ -2775,7 +2775,8 @@ paths:
         pinned before the export: exclusive create of a random staging name (mode 0600), write, fsync,
         `linkat` to `path` (which never replaces anything), unlink the staging name, fsync the directory.
         After publishing it checks that the final name is the very inode it wrote (`fstatat` without
-        following links, compared by device and inode) and takes the file back if not. On file systems
+        following links, compared by device and inode); if it is not, the file at that name is left untouched and the answer is
+        `409 publish_conflict`. On file systems
         without hard links (FAT, exFAT, some SMB mounts; `linkat` fails with EPERM, ENOTSUP, EOPNOTSUPP,
         EXDEV or EMLINK) it renames the staging file with `RENAME_EXCL` (macOS) or `RENAME_NOREPLACE`
         (Linux), which also never overwrites; if that is unsupported too (exFAT on macOS) it creates the final

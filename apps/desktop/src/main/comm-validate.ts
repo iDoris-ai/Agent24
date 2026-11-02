@@ -93,13 +93,13 @@ function isLoopbackHost(hostname: string): boolean {
  * One relay URL in the form that is both shown and sent, or null if unusable:
  * printable ASCII only in the raw text (so no homoglyph, bidi or zero-width
  * character can be hidden in it), `wss://` (or `ws://` for loopback only), a
- * host, no userinfo, no query, no fragment. `URL` normalizes (lower-case host,
+ * host, no userinfo (an `@` in the PATH is fine), no query, no fragment. `URL` normalizes (lower-case host,
  * punycode, default port dropped); a bare "/" path is dropped again so a plain
  * `wss://host` stays `wss://host`.
  */
 export function normalizeRelayUrl(entry: unknown): string | null {
   if (typeof entry !== 'string' || entry.length > MAX_RELAY_URL_LENGTH || !PRINTABLE_ASCII.test(entry)) return null
-  if (entry.includes('?') || entry.includes('#') || entry.includes('@')) return null
+  if (entry.includes('?') || entry.includes('#')) return null
   let url: URL
   try { url = new URL(entry) } catch { return null }
   if (!/^wss?:\/\//i.test(entry)) return null

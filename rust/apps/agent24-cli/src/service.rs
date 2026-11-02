@@ -627,6 +627,9 @@ mod tests {
                             && !matches!(
                                 name.as_str(),
                                 "HOME" | "PATH" | "LOCALAPPDATA" | "IDORIS_API_KEY"
+                                // opt-in #[ignore] real-filesystem test switch
+                                // (agent24-comm export.rs); the daemon never reads it
+                                    | "A24_FS_TEST_DIRS"
                             )
                         {
                             found.push(name);

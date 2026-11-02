@@ -284,6 +284,7 @@ export default function CommunicationPage() {
     if (code === 'hyphae_too_old') return t('error.hyphaeTooOld')
     if (code === 'nickname_exists') return t('restore.nicknameExists')
     if (code === 'invalid_key') return t('restore.invalidKey')
+    if (code === 'publish_conflict') return t('export.publishConflict')
     if (code === 'permission_denied') return t('export.permissionDenied')
     if (code === 'filesystem_unsupported') return t('export.filesystemUnsupported')
     if (code === 'keystore_locked') return t('restore.keystoreLocked')

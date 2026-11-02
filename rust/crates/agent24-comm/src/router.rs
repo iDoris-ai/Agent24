@@ -1231,18 +1231,53 @@ fn check_relay_url(url: &str) -> Result<(), CommError> {
     if rest.contains(['?', '#']) {
         return Err(bad("a query string or fragment is not allowed"));
     }
+    // `@` in the PATH is fine; in the authority it would be userinfo.
     let authority = rest.split('/').next().unwrap_or("");
     if authority.contains('@') {
         return Err(bad("credentials in the url are not allowed"));
     }
-    // host[:port], or [v6][:port]
-    let host = if let Some(v6) = authority.strip_prefix('[') {
-        v6.split(']').next().unwrap_or("")
+    // host[:port] or [v6][:port]: a valid host and an optional numeric port,
+    // nothing after the closing bracket but a port.
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+        let (inside, after) = v6
+            .split_once(']')
+            .ok_or_else(|| bad("unterminated [ in the host"))?;
+        if inside.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(bad("invalid IPv6 address"));
+        }
+        let port = match after {
+            "" => None,
+            _ => Some(
+                after
+                    .strip_prefix(':')
+                    .ok_or_else(|| bad("unexpected text after the host"))?,
+            ),
+        };
+        (inside, port)
     } else {
-        authority.split(':').next().unwrap_or("")
+        match authority.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        }
     };
     if host.is_empty() {
         return Err(bad("the url has no host"));
+    }
+    if !authority.starts_with('[')
+        && (host.starts_with(['.', '-'])
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'))
+    {
+        return Err(bad("invalid host name"));
+    }
+    if let Some(port) = port
+        && (port.is_empty()
+            || port.len() > 5
+            || !port.bytes().all(|b| b.is_ascii_digit())
+            || port.parse::<u32>().is_ok_and(|n| n == 0 || n > 65535))
+    {
+        return Err(bad("the port must be a number from 1 to 65535"));
     }
     if !secure && !is_loopback_host(host) {
         return Err(bad("ws:// is only allowed for loopback hosts; use wss://"));
@@ -2926,6 +2961,9 @@ echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2
             "ws://127.0.0.1",
             "ws://127.9.9.9:80/x",
             "ws://[::1]:8080",
+            "wss://x.example/path@tag",
+            "wss://[2001:db8::1]:443/x",
+            "wss://relay.example:65535",
             &format!("wss://{}", "a".repeat(250)),
         ] {
             assert!(check_relay_url(ok).is_ok(), "{ok}");
@@ -2935,6 +2973,18 @@ echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2
             "ws://10.0.0.1",
             "ws://128.0.0.1",
             "ws://localhost.evil.example",
+            "ws://[::1]evil",
+            "ws://localhost:evil",
+            "ws://localhost:",
+            "ws://localhost:0",
+            "wss://relay.example:65536",
+            "wss://relay.example:123456",
+            "wss://[::1",
+            "wss://[zz]:80",
+            "wss://[::1]:80x",
+            "wss://.relay.example",
+            "wss://re_lay.example",
+            "wss://re%6Cay.example",
             "https://relay.example",
             "relay.example",
             "wss://",

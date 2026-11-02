@@ -659,6 +659,13 @@ describe('Restore from backup (CommImportPick / CommIdentityImport)', () => {
     expect(result.ok).toBe(true)
     expect(seen.map((r) => JSON.parse(r.body).backup_password)).toEqual(['bad-input-pass', 'restore-pass-1'])
   })
+  it('an invalid-input answer (empty nickname/password) does not use up an attempt', async () => {
+    const { ticket } = await pick()
+    typing('bad-input-pass', 'bad-input-pass', 'bad-input-pass', 'bad-input-pass', 'restore-pass-1')
+    const result = await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)
+    expect(result.ok).toBe(true)
+    expect(seen).toHaveLength(5)
+  })
   it('a selection survives at most three attempts', async () => {
     const { ticket } = await pick()
     typing() // the user closes the window each time
@@ -872,6 +879,11 @@ describe('L4: whole-home import, relay list and unlock (dedicated IPC)', () => {
     await call(IpcChannels.CommRelaySet, ['wss://old.example'])
     expect(seen).toHaveLength(1)
   })
+  it('an @ in the PATH is fine; only userinfo is refused', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    expect((await call(IpcChannels.CommRelaySet, ['wss://x.example/path@tag'])).ok).toBe(true)
+    expect(JSON.parse(seen[0]!.body).relays).toEqual(['wss://x.example/path@tag'])
+  })
   it('L-9: ws:// is accepted for loopback hosts only', async () => {
     showMessageBox.mockResolvedValue({ response: 0 })
     const list = ['ws://localhost', 'ws://127.0.0.1:9', 'ws://127.8.8.8', 'ws://[::1]:7777']
@@ -909,6 +921,8 @@ describe('L4: whole-home import, relay list and unlock (dedicated IPC)', () => {
     ['fragment', ['wss://relay.example/#frag']],
     ['query string', ['wss://relay.example/?q=1']],
     ['userinfo', ['user@relay.example', 'wss://user@relay.example']],
+    ['malformed authority [::1]evil', ['ws://[::1]evil']],
+    ['non-numeric port', ['ws://localhost:evil']],
     ['257-character url', [`wss://r.example/${'p'.repeat(257 - 'wss://r.example/'.length)}`]],
     ['eight valid and one hidden over-long url', [...Array.from({ length: 7 }, (_, i) => `wss://r${i}.example`), `wss://r.example/${'p'.repeat(300)}`]],
     ['no scheme', ['a.example']],

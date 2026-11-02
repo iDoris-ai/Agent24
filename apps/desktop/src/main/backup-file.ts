@@ -17,8 +17,9 @@ export type BackupFileResult =
   | { ok: false; reason: 'unreadable' | 'not_regular' | 'bad_size' | 'not_backup' }
 
 export function parseBackupText(text: string): string | null {
-  // The file's own single trailing line break is not part of the backup.
-  const line = text.endsWith('\r\n') ? text.slice(0, -2) : text.endsWith('\n') ? text.slice(0, -1) : text
+  // The file's own single trailing line break (CRLF, LF or a lone CR, as the
+  // old reader accepted) is not part of the backup.
+  const line = text.endsWith('\r\n') ? text.slice(0, -2) : text.endsWith('\n') || text.endsWith('\r') ? text.slice(0, -1) : text
   return line.length <= NCRYPTSEC_MAX_LEN && NCRYPTSEC.test(line) ? line : null
 }
 

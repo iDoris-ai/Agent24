@@ -19,6 +19,8 @@ describe('readBackupFile (L2: read once, at pick time)', () => {
     expect(readBackupFile(put('a', `${GOOD}\n`))).toEqual({ ok: true, ncryptsec: GOOD })
     expect(readBackupFile(put('b', `${GOOD}\r\n`))).toEqual({ ok: true, ncryptsec: GOOD })
     expect(readBackupFile(put('c', GOOD))).toEqual({ ok: true, ncryptsec: GOOD })
+    expect(readBackupFile(put('d', `${GOOD}\r`))).toEqual({ ok: true, ncryptsec: GOOD }) // a lone CR, like the old reader
+    expect(parseBackupText(`${GOOD}\r\r`)).toBeNull()
   })
 
   it('refuses everything that is not exactly that', () => {

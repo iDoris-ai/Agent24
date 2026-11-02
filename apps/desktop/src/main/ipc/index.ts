@@ -693,11 +693,13 @@ export function registerIpcHandlers(options: {
         if (entry.expires < Date.now()) {
           return { done: true, value: { ok: false, status: 410, data: { error: { code: 'ticket_expired', message: mt('err.noBackupTicket') } } } }
         }
+        let charged = false
         if (submits > 1) {
           if (budget <= 0) {
             return { done: true, value: { ok: false, status: 429, data: { error: { code: 'too_many_attempts', message: mt('err.restoreAttempts') } } } }
           }
           budget -= 1
+          charged = true
         }
         const response = await proxyToBackend({
           method: 'POST', path: '/api/v1/comm/identity/import',
@@ -708,6 +710,9 @@ export function registerIpcHandlers(options: {
         const body = response.data as { error?: unknown; message?: unknown } | null
         if (body?.error === 'bad_backup_password') return { done: false, error: mt('backupPw.badPassword') }
         if (body?.error === 'invalid') {
+          // Input the daemon refused before trying the backup at all (an empty
+          // or blank nickname or password): not a failed attempt.
+          if (charged) budget += 1
           return { done: false, error: typeof body.message === 'string' ? clip(body.message, 200) : mt('backupPw.restoreInvalid') }
         }
         return { done: true, value: response }
