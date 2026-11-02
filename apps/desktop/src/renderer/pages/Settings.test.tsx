@@ -557,7 +557,7 @@ describe('Settings sidebar prefs', () => {
     try {
       await act(async () => { render(<Harness initial={room} />) })
       expect(screen.getByText(/Pinned 1 \/ 4\./)).toBeInTheDocument()
-      const openLink = screen.getByRole('link', { name: 'Choose what to pin in Capabilities →' })
+      const openLink = screen.getByRole('button', { name: 'Choose what to pin in Capabilities →' })
       expect(openLink).toHaveClass('is-open')
       expect(openLink).not.toHaveClass('is-quiet')
       fireEvent.click(openLink)
@@ -566,7 +566,7 @@ describe('Settings sidebar prefs', () => {
       cleanup()
       await act(async () => { render(<Harness initial={full} />) })
       expect(screen.getByText(/Pinned 3 \/ 3\./)).toBeInTheDocument()
-      const quiet = screen.getByRole('link', { name: 'Choose what to pin in Capabilities →' })
+      const quiet = screen.getByRole('button', { name: 'Choose what to pin in Capabilities →' })
       expect(quiet).toHaveClass('is-quiet')
       expect(quiet).not.toHaveClass('is-open')
       fireEvent.click(quiet)
@@ -576,10 +576,10 @@ describe('Settings sidebar prefs', () => {
       await act(async () => { render(<Harness initial={room} />) })
       await act(async () => { setLocale('zh') })
       expect(screen.getByText(/已钉选 1 \/ 4 个。/)).toBeInTheDocument()
-      expect(screen.getByRole('link', { name: '去能力中心选择要钉选的能力 →' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: '去能力中心选择要钉选的能力 →' })).toBeInTheDocument()
       await act(async () => { setLocale('th') })
       expect(screen.getByText(/ปักหมุดแล้ว 1 \/ 4 รายการ/)).toBeInTheDocument()
-      expect(screen.getByRole('link', { name: 'ไปเลือกความสามารถที่จะปักหมุด →' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'ไปเลือกความสามารถที่จะปักหมุด →' })).toBeInTheDocument()
     } finally {
       act(() => { setLocale('en') })
     }

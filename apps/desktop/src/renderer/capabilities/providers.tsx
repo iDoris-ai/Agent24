@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   CapabilitiesContext, NavPrefsContext, NAV_PREFS_DEFAULT, clampPrefs,
-  type CapabilitiesApi, type CapabilityId, type NavPrefsApi, type OpenOrigin,
+  type CapabilitiesApi, type CapabilityId, type NavPrefsApi, type OpenOptions, type OpenOrigin,
 } from './types'
 import { CAPABILITIES, withDynamicCapabilities } from './registry'
 import { useT } from '../i18n'
@@ -19,10 +19,10 @@ export function CapabilitiesProvider({ children }: { children: ReactNode }) {
   const [approvalsWaiting, setApprovalsWaiting] = useState(0)
   const settingsVisit = useRef(0)
   const navigate = useCallback((page: string) => setRoute({ kind: 'page', page }), [])
-  const open = useCallback((id: CapabilityId, origin: OpenOrigin) => {
+  const open = useCallback((id: CapabilityId, origin: OpenOrigin, options?: OpenOptions) => {
     if (id === 'settings/general' || id === 'settings/activity') {
-      // The capabilities slots-full banner asks for the pinned-slots row, not the top of General.
-      const focus = id === 'settings/general' && origin === 'capabilities' ? 'slots' as const : undefined
+      // Only an explicit { focus: 'slots' } lands on the pinned-slots row. Other entries stay at the top of the tab.
+      const focus = id === 'settings/general' ? options?.focus : undefined
       setRoute({ kind: 'page', page: 'settings', initialTab: id === 'settings/general' ? 'general' : 'activity', key: ++settingsVisit.current, ...(focus ? { focus } : {}) })
     } else if (id === 'capabilities') {
       setRoute({ kind: 'page', page: 'capabilities' })

@@ -19,11 +19,21 @@ export function SidebarPrefs() {
   const slotsRowRef = useRef<HTMLDivElement>(null)
   const focusSlots = route.kind === 'page' && route.focus === 'slots'
   const focusKey = route.kind === 'page' ? route.key : undefined
+  const [highlightedKey, setHighlightedKey] = useState<number | undefined>()
+  const highlighted = focusSlots && highlightedKey !== undefined && highlightedKey === focusKey
   const hasRoom = pinnedCount < prefs.slotCount
 
+  // Momentary landmark keyed by route.key: clear after ~2s, or on the first stepper click.
   useEffect(() => {
-    if (!focusSlots) return
-    slotsRowRef.current?.scrollIntoView({ block: 'nearest' })
+    if (!focusSlots || focusKey === undefined) return
+    setHighlightedKey(focusKey)
+    const row = slotsRowRef.current
+    row?.scrollIntoView?.({ block: 'nearest' })
+    row?.focus()
+    const timer = setTimeout(() => {
+      setHighlightedKey(current => (current === focusKey ? undefined : current))
+    }, 2000)
+    return () => clearTimeout(timer)
   }, [focusSlots, focusKey])
 
   function nameFor(id: CapabilityId) {
@@ -48,6 +58,7 @@ export function SidebarPrefs() {
   }
 
   function stepSlots(delta: number) {
+    setHighlightedKey(undefined)
     void commit(prev => ({ ...prev, slotCount: Math.min(SLOT_MAX, Math.max(SLOT_MIN, prev.slotCount + delta)) }))
   }
 
@@ -70,7 +81,13 @@ export function SidebarPrefs() {
     <div className="settings-section">
       <h3>{t('sidebar.title')}</h3>
 
-      <div id="settings-pinned-slots" ref={slotsRowRef} className={`setting-row${focusSlots ? ' is-target' : ''}`}>
+      <div
+        id="settings-pinned-slots"
+        ref={slotsRowRef}
+        tabIndex={-1}
+        data-highlighted={highlighted ? 'true' : undefined}
+        className="setting-row"
+      >
         <div>
           <label htmlFor="settings-slot-count">{t('sidebar.slots')}</label>
           <p>{t('sidebar.slotsHint', { min: SLOT_MIN, max: SLOT_MAX })}</p>
@@ -85,14 +102,11 @@ export function SidebarPrefs() {
       </div>
       <p className="settings-slots-go">
         {t('sidebar.slotsPinned', { pinned: pinnedCount, slots: prefs.slotCount })}{' '}
-        <a
-          href="#capabilities"
-          className={`settings-slots-link${hasRoom ? ' is-open' : ' is-quiet'}`}
-          onClick={(event) => {
-            event.preventDefault()
-            navigate('capabilities')
-          }}
-        >{t('sidebar.slotsGoPick')}</a>
+        <button
+          type="button"
+          className={`btn-link settings-slots-link${hasRoom ? ' is-open' : ' is-quiet'}`}
+          onClick={() => navigate('capabilities')}
+        >{t('sidebar.slotsGoPick')}</button>
       </p>
 
       <div className="setting-row" style={{ alignItems: 'flex-start' }}>

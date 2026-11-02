@@ -435,7 +435,7 @@ describe('App navigation integration', () => {
       if (tab === 'Activity') expect(screen.getByRole('group', { name: 'Activity summary' })).toBeInTheDocument()
       else {
         expect(screen.getByLabelText('Language')).toBeInTheDocument()
-        expect(document.getElementById('settings-pinned-slots')).not.toHaveClass('is-target')
+        expect(document.getElementById('settings-pinned-slots')).not.toHaveAttribute('data-highlighted')
       }
       expect(screen.queryByRole('navigation', { name: 'Breadcrumb' })).not.toBeInTheDocument()
     }
@@ -446,7 +446,7 @@ describe('App navigation integration', () => {
     expect(screen.getByText('Settings', { selector: '.page-title' })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: 'General', selected: true })).toBeInTheDocument()
     expect(screen.getByTestId('slot-count')).toHaveTextContent('3')
-    expect(document.getElementById('settings-pinned-slots')).toHaveClass('is-target')
+    expect(document.getElementById('settings-pinned-slots')).toHaveAttribute('data-highlighted', 'true')
   })
 
   it('opens the Voice capability from its Settings tab', async () => {
