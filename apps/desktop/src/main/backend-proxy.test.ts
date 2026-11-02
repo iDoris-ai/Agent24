@@ -61,6 +61,9 @@ describe('A1 findAllowedRoute', () => {
       ['POST', '/api/v1/capabilities/creative'], ['POST', '/api/v1/capabilities/x/revoke'],
       ['POST', '/api/v1/attached'], ['PATCH', '/api/v1/attached/x'], ['DELETE', '/api/v1/attached/x'],
       ['PATCH', '/api/v1/os/x'], ['POST', '/api/v1/os/x/stop'],
+      ['POST', '/api/v1/components/open-design/report'],
+      ['PUT', '/api/v1/components/open-design/report'],
+      ['GET', '/api/v1/components/open-design/report'],
     ]
     for (const [m, p] of forbidden) expect(isAllowedProxyRoute(m, p), `${m} ${p}`).toBe(false)
     for (const rt of ALLOWED_PROXY_ROUTES) {
@@ -79,6 +82,13 @@ describe('A1 findAllowedRoute', () => {
     }
     expect(isAllowedProxyRoute('PUT', '/api/v1/comm/relay')).toBe(false)
     expect(isAllowedProxyRoute('GET', '/api/v1/comm/history?limit=20')).toBe(true)
+  })
+  it('lets the renderer read the component list and keeps the host report off the proxy', () => {
+    expect(isAllowedProxyRoute('GET', '/api/v1/components')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/components?audience=host')).toBe(true)
+    expect(isAllowedProxyRoute('POST', '/api/v1/components/open-design/report')).toBe(false)
+    expect(isAllowedProxyRoute('POST', '/api/v1/components/{id}/report')).toBe(false)
+    expect(ALLOWED_PROXY_ROUTES.some((route) => route.template.includes('/report'))).toBe(false)
   })
   it('gives chat a longer deadline than the default', () => {
     expect(findAllowedRoute('POST', '/api/v1/chat')?.timeoutMs).toBe(CHAT_TIMEOUT_MS)

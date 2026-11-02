@@ -10,6 +10,22 @@ import {
   revealCommExport,
   CommApiError, type CommDaemonStatus,
 } from './api'
+import type { ComponentView } from '../../components/componentApi'
+
+const hyphaeBox = vi.hoisted(() => ({
+  mode: 'ready' as 'ready' | 'error' | 'missing',
+  component: {
+    id: 'hyphae', version: 'v0.28.1', state: 'ready', form: 'resident', provides: [] as { id: string }[],
+  } as ComponentView,
+}))
+
+vi.mock('../../components/componentApi', () => ({
+  listComponents: vi.fn(async () => {
+    if (hyphaeBox.mode === 'error') throw new Error('components down')
+    if (hyphaeBox.mode === 'missing') return []
+    return [hyphaeBox.component]
+  }),
+}))
 
 vi.mock('./api', async (importActual) => {
   const actual = await importActual<typeof import('./api')>()
@@ -31,7 +47,21 @@ const status: CommDaemonStatus = {
   catch_up: { state: 'unknown' as const, last_incomplete_at_ms: null },
 }
 
+const readyHyphae: ComponentView = { id: 'hyphae', version: 'v0.28.1', state: 'ready', form: 'resident', provides: [] }
+
+function mirrorHyphae(state: CommDaemonStatus['process']['state']) {
+  hyphaeBox.mode = 'ready'
+  if (state === 'running') hyphaeBox.component = { ...readyHyphae, state: 'ready' }
+  else if (state === 'stopped' || state === 'not_configured') {
+    hyphaeBox.component = state === 'not_configured'
+      ? { ...readyHyphae, state: 'stopped', reason: 'not_configured' }
+      : { ...readyHyphae, state: 'stopped' }
+  } else hyphaeBox.component = { ...readyHyphae, state: 'failed', reason: state }
+}
+
 function success() {
+  hyphaeBox.mode = 'ready'
+  hyphaeBox.component = { ...readyHyphae }
   vi.mocked(listCommIdentities).mockResolvedValue([identity])
   vi.mocked(listCommContacts).mockResolvedValue([contact])
   vi.mocked(listCommRelays).mockResolvedValue(relayConfig)
@@ -43,7 +73,12 @@ function success() {
 }
 const lockedStatus: CommDaemonStatus = { ...status, process: { ...status.process, state: 'locked', reason: 'password_rejected' } }
 
-afterEach(() => { cleanup(); vi.clearAllMocks() })
+afterEach(() => {
+  cleanup()
+  vi.clearAllMocks()
+  hyphaeBox.mode = 'ready'
+  hyphaeBox.component = { ...readyHyphae }
+})
 
 describe('CommunicationPage', () => {
   beforeEach(() => { setLocale('zh') })
@@ -146,12 +181,14 @@ describe('CommunicationPage', () => {
   it('does not paint locked, gave_up, or missing relay as healthy', async () => {
     success()
     vi.mocked(listCommRelays).mockResolvedValue({ relays: [], source: 'default', configured: false })
+    mirrorHyphae('locked')
     vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, state: 'locked', reason: 'binary_rejected' } })
     const { rerender } = render(<CommunicationPage />)
     expect(await screen.findByText('已锁定')).toBeInTheDocument()
     expect(screen.getByText('原因 binary_rejected：Hyphae 二进制校验失败')).toBeInTheDocument()
     expect(screen.getByText('来源：default · 未配置')).toBeInTheDocument()
     expect(screen.getByText('已锁定').className).not.toContain('comm-state-running')
+    mirrorHyphae('gave_up')
     vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, state: 'gave_up', reason: 'misconfigured' } })
     fireEvent.click(screen.getByRole('button', { name: '刷新' }))
     await waitFor(() => expect(screen.getByText('已停止重试')).toBeInTheDocument())
@@ -282,11 +319,13 @@ describe('CommunicationPage usability', () => {
     success()
     vi.useFakeTimers()
     const starting: CommDaemonStatus = { ...status, process: { ...status.process, state: 'starting' } }
+    mirrorHyphae('starting')
     vi.mocked(getCommStatus).mockResolvedValue(starting)
     render(<CommunicationPage />)
     await act(async () => { await vi.advanceTimersByTimeAsync(10) })
     expect(screen.getByTestId('comm-spinner')).toBeInTheDocument()
     expect(screen.getByText('Starting…')).toBeInTheDocument()
+    mirrorHyphae('running')
     vi.mocked(getCommStatus).mockResolvedValue(status)
     await act(async () => { await vi.advanceTimersByTimeAsync(1100) })
     expect(screen.getByText('Running')).toBeInTheDocument()
@@ -633,8 +672,13 @@ describe('CommunicationPage usability', () => {
     const stopFor = async (state: CommDaemonStatus['process']['state'] | null) => {
       cleanup()
       success()
-      if (state === null) vi.mocked(getCommStatus).mockRejectedValue(new CommApiError('down', 503, 'unavailable'))
-      else vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, state } })
+      if (state === null) {
+        hyphaeBox.mode = 'error'
+        vi.mocked(getCommStatus).mockRejectedValue(new CommApiError('down', 503, 'unavailable'))
+      } else {
+        mirrorHyphae(state)
+        vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, state } })
+      }
       render(<CommunicationPage />)
       return screen.findByRole('button', { name: 'Stop service' })
     }
@@ -651,6 +695,7 @@ describe('CommunicationPage usability', () => {
     for (const state of ['running', 'starting', 'backoff'] as const) {
       cleanup()
       success()
+      mirrorHyphae(state)
       vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, state } })
       render(<CommunicationPage />)
       const stop = await screen.findByRole('button', { name: 'Stop service' })
@@ -660,6 +705,7 @@ describe('CommunicationPage usability', () => {
     }
     cleanup()
     success()
+    mirrorHyphae('stopped')
     vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, state: 'stopped' } })
     render(<CommunicationPage />)
     const stop = await screen.findByRole('button', { name: 'Stop service' })
