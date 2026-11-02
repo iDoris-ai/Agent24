@@ -16,7 +16,9 @@ import {
   resolveRustBinary,
   getBackendEndpoint,
   daemonCliEndpoint,
+  daemonAuthMode,
   daemonConnection,
+  onDaemonReady,
   selectedAuthMode,
   type DaemonAuthMode,
   type ExternalDaemonSource,
@@ -818,11 +820,19 @@ describe('daemon credential stays out of the endpoint (KB-HOST-01 PR-A1)', () =>
 
   it('a rust daemon that announced no token gets no connection: nothing is sent without a credential', async () => {
     delete process.env['AGENT24_BACKEND']
-    const manager = await startWith({ port: 4101 })
-    expect(getBackendEndpoint()).toEqual({ port: 4101 })
-    expect(daemonConnection()).toBeNull()
-    expect(daemonCliEndpoint()).toBeNull()
-    manager.stop()
+    const events: string[] = []
+    const stop = onDaemonReady(() => { events.push('ready') })
+    try {
+      const manager = await startWith({ port: 4101 })
+      expect(getBackendEndpoint()).toEqual({ port: 4101 })
+      expect(daemonConnection()).toBeNull()
+      expect(daemonCliEndpoint()).toBeNull()
+      expect(daemonAuthMode()).toBeNull()
+      expect(events).toEqual([])
+      manager.stop()
+    } finally {
+      stop()
+    }
   })
 
   it('the health tick probes the current port', async () => {
@@ -884,6 +894,7 @@ describe('daemon credential stays out of the endpoint (KB-HOST-01 PR-A1)', () =>
     const manager = new BackendManager({ external, spawnProcess: silentChild })
     await manager.start()
     expect(daemonConnection()).not.toBeNull()
+    expect(daemonAuthMode()).toBe('legacy')
 
     healthy = false
     const tick = (manager as unknown as { tick(): Promise<void> }).tick.bind(manager)
@@ -1200,5 +1211,39 @@ describe('capability-mode startup (KB-HOST-01 PR-A2)', () => {
     expect(getBackendEndpoint()).toBeNull()
     expect(log.mock.calls.flat().join(' ')).not.toContain('leaky')
     manager.stop()
+  })
+
+  it('publishes a ready event for the first connection and again after restart', async () => {
+    const events: Array<{ port: number; mode: ReturnType<typeof daemonAuthMode> }> = []
+    const stop = onDaemonReady(() => {
+      events.push({ port: daemonConnection()?.port ?? 0, mode: daemonAuthMode() })
+    })
+    const children: ChildProcess[] = []
+    const external: ExternalDaemonSource = withProbe({ read: () => null, checkHealth: vi.fn().mockResolvedValue(true) })
+    const manager = new BackendManager({
+      external,
+      authMode: 'capabilities',
+      spawnProcess: () => {
+        const child = childAnnouncing({
+          port: 4400 + children.length,
+          auth_mode: 'capabilities',
+          product_host_token: `host-${children.length}`,
+        })
+        children.push(child)
+        return child
+      },
+    })
+    try {
+      await manager.start()
+      await vi.waitFor(() => expect(events).toEqual([{ port: 4400, mode: 'capabilities' }]))
+      manager.restart()
+      await vi.waitFor(() => expect(events).toEqual([
+        { port: 4400, mode: 'capabilities' },
+        { port: 4401, mode: 'capabilities' },
+      ]))
+    } finally {
+      stop()
+      manager.stop()
+    }
   })
 })

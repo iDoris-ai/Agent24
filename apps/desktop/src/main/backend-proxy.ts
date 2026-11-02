@@ -51,8 +51,11 @@ const r = (method: HttpMethod, template: string, timeoutMs?: number): ProxyRoute
  *   POST   /api/v1/comm/import               -> IpcChannels.CommHomeImport
  *   PUT    /api/v1/comm/relay                -> IpcChannels.CommRelaySet
  *   POST   /api/v1/comm/unlock               -> IpcChannels.CommUnlock
+ *   POST   /api/v1/components/{id}/report    -> main only (open-design-report.ts)
  */
 export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
+  // ADR-038 C3b: read-only component list. The host report POST stays in main.
+  r('GET', '/api/v1/components'),
   // IL-13: host-only lifecycle API; Admin credentials never enter Electron.
   r('GET', '/api/v1/idoris/status'),
   r('GET', '/api/v1/idoris/omlx/candidates'),

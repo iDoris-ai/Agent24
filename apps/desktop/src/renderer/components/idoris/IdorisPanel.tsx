@@ -1,16 +1,40 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import { useLocale, useT } from '../../i18n'
+import { listComponents, type ComponentView } from '../componentApi'
 import { cancelOperation, getCandidates, getOperation, getStatus, IdorisError, submitOperation, type IdorisCandidates, type IdorisOperation, type IdorisStatus } from './api'
 import { idorisErrors, idorisMessages } from './IdorisPanel.i18n'
 import './idoris.css'
 
-// Runtime truth comes exclusively from daemon snapshots. Form choices live only
+type IdorisComponentPhase =
+  | { kind: 'loading' }
+  | { kind: 'error' }
+  | { kind: 'ready'; component: ComponentView | null }
+
+function idorisStateText(t: (key: keyof typeof idorisMessages.en, vars?: Record<string, string | number>) => string, component: ComponentView): string {
+  switch (component.state) {
+    case 'absent': return t('state.not_installed')
+    case 'installing': return t('phase.installing')
+    case 'installed': return component.reason === 'not_configured' ? t('state.not_configured') : t('state.installed')
+    case 'starting': return t('state.starting')
+    case 'ready': return t('state.running')
+    case 'degraded': return t('state.degraded')
+    case 'stopping': return t('state.stopping')
+    case 'stopped': return t('state.stopped')
+    case 'incompatible': return t('state.incompatible')
+    case 'failed': return component.reason === 'instance_conflict' ? t('state.instance_conflict') : t('state.failed')
+    default: return component.state
+  }
+}
+
+// Ports, roles, budget and operations still come from /api/v1/idoris/status.
+// Installed / running comes from GET /api/v1/components. Form choices live only
 // for this mount; no installation, credential or operation state is persisted.
 export default function IdorisPanel() {
   const t = useT(idorisMessages)
   const locale = useLocale()
   const id = useId()
   const [status, setStatus] = useState<IdorisStatus | null>(null)
+  const [componentPhase, setComponentPhase] = useState<IdorisComponentPhase>({ kind: 'loading' })
   const [operation, setOperation] = useState<IdorisOperation | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
@@ -41,8 +65,16 @@ export default function IdorisPanel() {
         const next = await getStatus()
         const operationId = next.current_operation ?? trackedOperation.current
         const op = operationId ? await getOperation(operationId) : null
+        let phase: IdorisComponentPhase
+        try {
+          const list = await listComponents()
+          phase = { kind: 'ready', component: list.find((item) => item.id === 'idoris') ?? null }
+        } catch {
+          phase = { kind: 'error' }
+        }
         if (!mounted.current) return
         setStatus(next)
+        setComponentPhase(phase)
         if (!coreEdited.current && next.budget_suggestion && suggestedCore.current !== next.budget_suggestion.core_reserved_bytes) {
           suggestedCore.current = next.budget_suggestion.core_reserved_bytes
           setCore(String(suggestedCore.current)); setConsent(false)
@@ -52,7 +84,10 @@ export default function IdorisPanel() {
           trackedOperation.current = op.result === null ? op.operation_id : null
           if (op.error_code) setError(op.error_code)
         }
-      } catch (err) { reportError(err) }
+      } catch (err) {
+        reportError(err)
+        if (mounted.current) setComponentPhase({ kind: 'error' })
+      }
     })()
     poll.current = task
     void task.finally(() => { poll.current = null })
@@ -65,7 +100,9 @@ export default function IdorisPanel() {
     return () => { mounted.current = false; window.clearInterval(timer) }
   }, [refresh])
 
-  const needsSetup = status?.state === 'not_configured' || (status?.state === 'failed' && status.roles.length === 0)
+  const idorisComponent = componentPhase.kind === 'ready' ? componentPhase.component : null
+  const needsSetup = (idorisComponent?.state === 'installed' && idorisComponent.reason === 'not_configured')
+    || (idorisComponent?.state === 'failed' && idorisComponent.reason !== 'instance_conflict' && (status?.roles.length ?? 0) === 0)
   const discover = useCallback(async (selected: string) => {
     const generation = ++discoveryGeneration.current
     setProbing(true); setConfirmed(null); setDaily(''); setDeep(''); setConsent(false)
@@ -106,7 +143,7 @@ export default function IdorisPanel() {
   const candidate = confirmed?.candidates.find(c => c.endpoint === endpoint)
   const coreBytes = /^\d+$/.test(core) ? Number(core) : NaN
   const canConnect = !blocked && !probing && candidate?.identity === 'omlx' && candidate.authentication === 'ready' && candidate.models.includes(daily) && (!deep || candidate.models.includes(deep)) && Number.isSafeInteger(coreBytes) && coreBytes >= 0 && consent
-  const errorCode = error ?? status?.last_error ?? (status?.state === 'instance_conflict' ? 'instance_conflict' : null)
+  const errorCode = error ?? status?.last_error ?? (idorisComponent?.state === 'failed' && idorisComponent.reason === 'instance_conflict' ? 'instance_conflict' : null)
   const errorText = Object.entries(idorisErrors).find(([code]) => code === errorCode)?.[1][locale] ?? t('errorGeneric')
   const progress = operation?.phase === 'downloading' ? operation.download_progress : undefined
   const receipt = status?.verification ?? (operation?.result === 'succeeded' ? operation.verification : undefined)
@@ -114,8 +151,11 @@ export default function IdorisPanel() {
   return <section className="idoris-panel" aria-labelledby={`${id}-title`}>
     <h2 id={`${id}-title`}>{t('title')}</h2>
     {errorCode && <div role="alert">{errorText}</div>}
-    {!status ? <p>{t('loading')}</p> : <>
-      <p data-testid="idoris-state" data-state={status.state}>{t(`state.${status.state}`)}</p>
+    {!status && componentPhase.kind === 'loading' ? <p>{t('loading')}</p> : !status ? <p role="alert" data-testid="idoris-state" data-state="error">{t('component.error')}</p> : <>
+      {componentPhase.kind === 'loading' && <p data-testid="idoris-state" data-state="loading">{t('loading')}</p>}
+      {componentPhase.kind === 'error' && <p role="alert" data-testid="idoris-state" data-state="error">{t('component.error')}</p>}
+      {componentPhase.kind === 'ready' && !idorisComponent && <p data-testid="idoris-state" data-state="missing">{t('component.missing')}</p>}
+      {idorisComponent && <p data-testid="idoris-state" data-state={idorisComponent.state}>{idorisStateText(t, idorisComponent)}</p>}
       {status.version && <p>{t('version', { version: status.version })}</p>}
       {(status.data_port !== null || status.admin_port !== null) && <p>{t('ports', { data: status.data_port ?? t('unknown'), admin: status.admin_port ?? t('unknown') })}</p>}
       {status.roles.length > 0 && <p>{t('roles', { roles: status.roles.join(', ') })}</p>}
@@ -126,7 +166,7 @@ export default function IdorisPanel() {
         {progress && <span>{progress.bytes_total === undefined ? t('downloaded', { done: `${progress.bytes_done} B` }) : t('downloadedTotal', { done: `${progress.bytes_done} B`, total: `${progress.bytes_total} B` })}</span>}
         <button className="btn" disabled={pending || !operation.cancellable} onClick={() => { void run(() => cancelOperation(operation.operation_id)) }}>{t('cancel')}</button>
       </div>}
-      {status.state === 'not_installed' && <>
+      {idorisComponent?.state === 'absent' && <>
         <p>{t('installConsent')}</p>
         <button className="btn btn-primary" disabled={blocked} onClick={() => { void run(() => submitOperation('install', { consent: true })) }}>{t('install')}</button>
       </>}
@@ -174,7 +214,7 @@ export default function IdorisPanel() {
           consent: { share_omlx_key: true, daily_model: daily, deep_model: deep || null },
         })) }}>{t('connect')}</button>
       </fieldset>}
-      {status.state === 'running' && <>
+      {idorisComponent?.state === 'ready' && <>
         {receipt ? <div role="status">
           <p>{t('verified')}</p>
           <p>{t('verificationModel', { model: receipt.model_id })}</p>
@@ -184,7 +224,7 @@ export default function IdorisPanel() {
         </div> : <p>{t('runningHint')}</p>}
         <button className="btn" disabled={blocked} onClick={() => { void run(() => submitOperation('stop')) }}>{t('stop')}</button>
       </>}
-      {(status.state === 'stopped' || (status.state === 'failed' && status.roles.length > 0)) && <button className="btn" disabled={blocked} onClick={() => { void run(() => submitOperation('start')) }}>{t('start')}</button>}
+      {(idorisComponent?.state === 'stopped' || (idorisComponent?.state === 'failed' && idorisComponent.reason !== 'instance_conflict' && status.roles.length > 0)) && <button className="btn" disabled={blocked} onClick={() => { void run(() => submitOperation('start')) }}>{t('start')}</button>}
     </>}
     <button className="btn" disabled={pending || probing} onClick={() => { setError(null); void refresh(); if (needsSetup) void discover(endpoint) }}>{t('retry')}</button>
   </section>

@@ -469,18 +469,24 @@ describe('App navigation integration', () => {
     }
   })
 
-  it('keeps default status labels when iDoris and Hyphae status cannot be obtained', async () => {
+  it('shows an explicit unavailable status when the component list cannot be read', async () => {
     mockBackendProxy.mockResolvedValue({ ok: false, status: 503, data: null })
     await act(async () => { render(<App />) })
     await act(async () => { center() })
-    for (const name of ['Local models', 'Communication']) {
-      expect(row(name).getByText('Open', { selector: '.cap-status' })).toBeInTheDocument()
+    for (const name of ['Local models', 'Communication', 'Voice']) {
+      expect(row(name).getByText('Status unavailable', { selector: '.cap-status' })).toBeInTheDocument()
     }
   })
 
   it('shows approval badges and known iDoris and Hyphae status in the center', async () => {
     mockBackendProxy.mockImplementation(({ path }: { path: string }) => Promise.resolve({ ok: true, status: 200, data:
       path.includes('/approvals?') ? { approvals: [{ id: 'one' }, { id: 'two' }] }
+        : path === '/api/v1/components' ? {
+          components: [
+            { id: 'idoris', version: '0.4.0', state: 'installed', reason: 'not_configured', form: 'cli', provides: [] },
+            { id: 'hyphae', version: '1', state: 'ready', form: 'resident', provides: [] },
+          ],
+        }
         : path === '/api/v1/idoris/status' ? {
           state: 'not_configured', version: '0.4.0', data_port: null, admin_port: null,
           roles: [], last_error: null, migration_pending: false, last_migration_error: null, current_operation: null, verification: null,

@@ -28,6 +28,46 @@ import { translate, useT } from '../../i18n'
 import { communicationMessages } from './Communication.i18n'
 import './communication.css'
 import { getDefaultRelays } from './relayDefaults'
+import { listComponents, type ComponentView } from '../../components/componentApi'
+
+type HyphaePhase =
+  | { kind: 'loading' }
+  | { kind: 'error' }
+  | { kind: 'ready'; component: ComponentView | null }
+
+const STOPPABLE_REASONS = new Set(['backoff', 'gave_up', 'restarting', 'starting'])
+
+function hyphaeTransitional(component: ComponentView | null): boolean {
+  if (!component) return false
+  return component.state === 'starting' || component.state === 'stopping'
+    || (component.state === 'failed' && (component.reason === 'starting' || component.reason === 'backoff' || component.reason === 'restarting'))
+}
+
+function hyphaeStoppable(component: ComponentView | null): boolean {
+  if (!component) return false
+  return component.state === 'ready' || component.state === 'starting' || component.state === 'degraded' || component.state === 'stopping'
+    || (component.state === 'failed' && STOPPABLE_REASONS.has(component.reason ?? ''))
+}
+
+function hyphaeLabel(component: ComponentView, t: (key: keyof typeof communicationMessages.en, vars?: Record<string, string | number>) => string): string {
+  if (component.state === 'ready') return t('process.running')
+  if (component.state === 'starting') return t('process.starting')
+  if (component.state === 'stopped') return component.reason === 'not_configured' ? t('process.notConfigured') : t('process.stopped')
+  if (component.state === 'failed') {
+    if (component.reason === 'locked') return t('process.locked')
+    if (component.reason === 'gave_up') return t('process.gaveUp')
+    if (component.reason === 'backoff') return t('process.backoff')
+    if (component.reason === 'starting') return t('process.starting')
+    return t('component.failed')
+  }
+  if (component.state === 'installing') return t('component.installing')
+  if (component.state === 'degraded') return t('component.degraded')
+  if (component.state === 'stopping') return t('component.stopping')
+  if (component.state === 'absent') return t('component.absent')
+  if (component.state === 'installed') return t('component.installed')
+  if (component.state === 'incompatible') return t('component.incompatible')
+  return component.state
+}
 
 type WriteAction = 'start' | 'stop' | 'unlock' | 'install' | 'create' | 'import' | 'relay' | 'export' | 'contact' | 'send' | 'restore'
 
@@ -45,14 +85,6 @@ function shortNpub(npub: string): string {
   return npub.length > 20 ? `${npub.slice(0, 12)}…${npub.slice(-6)}` : npub
 }
 
-function processLabel(state: string): string {
-  const labels: Record<string, keyof typeof communicationMessages.en> = {
-    stopped: 'process.stopped', starting: 'process.starting', running: 'process.running', backoff: 'process.backoff',
-    gave_up: 'process.gaveUp', locked: 'process.locked', not_configured: 'process.notConfigured',
-  }
-  return labels[state] ? translate(communicationMessages, labels[state]) : state
-}
-
 function reasonLabel(reason: string | null | undefined): string {
   if (!reason) return ''
   const labels: Record<string, keyof typeof communicationMessages.en> = {
@@ -64,22 +96,30 @@ function reasonLabel(reason: string | null | undefined): string {
   return translate(communicationMessages, labels[reason] ?? 'reason.other')
 }
 
-function DaemonStatusView({ status, fresh }: { status: CommDaemonStatus | null; fresh: boolean }) {
+function DaemonStatusView({ status, phase, fresh }: { status: CommDaemonStatus | null; phase: HyphaePhase; fresh: boolean }) {
   const t = useT(communicationMessages)
-  if (!status) return <p className="comm-muted">{t('process.unloaded')}</p>
-  const process = status.process
-  const probe = status.relay_probe
-  const catchUp = status.catch_up
+  const component = phase.kind === 'ready' ? phase.component : null
+  const running = component?.state === 'ready'
+  const spinning = hyphaeTransitional(component)
+  const headline = phase.kind === 'loading' ? t('component.loading')
+    : phase.kind === 'error' ? t('component.error')
+    : component ? hyphaeLabel(component, t)
+    : t('component.missing')
+  const dataState = phase.kind === 'ready' ? (component?.state ?? 'missing') : phase.kind
+  const process = status?.process
+  const probe = status?.relay_probe
+  const catchUp = status?.catch_up
   return (
     <div className="comm-status-grid">
       <section className="comm-status-item">
         <h3>{t('process.title')}</h3>
-        <p><span className={`comm-state${fresh && process.state === 'running' ? ' comm-state-running' : ''}`} aria-busy={TRANSITIONAL_STATES.includes(process.state) || undefined}>
-          {TRANSITIONAL_STATES.includes(process.state) && <span className="comm-spinner" data-testid="comm-spinner" aria-hidden="true">⟳</span>}
-          {processLabel(process.state)}
+        <p><span className={`comm-state${fresh && running ? ' comm-state-running' : ''}`} data-state={dataState} aria-busy={spinning || undefined}>
+          {spinning && <span className="comm-spinner" data-testid="comm-spinner" aria-hidden="true">⟳</span>}
+          {headline}
         </span></p>
-        {process.reason && <p className="comm-muted">{t('process.reason', { code: process.reason, reason: reasonLabel(process.reason) })}</p>}
-        <p className="comm-muted">{t('process.metrics', { generation: process.generation, failures: process.consecutive_failures })}</p>
+        {process?.reason && <p className="comm-muted">{t('process.reason', { code: process.reason, reason: reasonLabel(process.reason) })}</p>}
+        {process && <p className="comm-muted">{t('process.metrics', { generation: process.generation, failures: process.consecutive_failures })}</p>}
+        {!status && <p className="comm-muted">{t('process.unloaded')}</p>}
       </section>
       <section className="comm-status-item">
         <h3>{t('probe.title')}</h3>
@@ -92,8 +132,8 @@ function DaemonStatusView({ status, fresh }: { status: CommDaemonStatus | null; 
       </section>
       <section className="comm-status-item">
         <h3>{t('catchUp.title')}</h3>
-        <p>{catchUp.state === 'incomplete' ? t('catchUp.incomplete') : t('catchUp.unknown')}</p>
-        {catchUp.last_incomplete_at_ms !== null && <p className="comm-muted">{t('catchUp.timestamp', { time: catchUp.last_incomplete_at_ms })}</p>}
+        <p>{catchUp?.state === 'incomplete' ? t('catchUp.incomplete') : t('catchUp.unknown')}</p>
+        {catchUp && catchUp.last_incomplete_at_ms !== null && <p className="comm-muted">{t('catchUp.timestamp', { time: catchUp.last_incomplete_at_ms })}</p>}
       </section>
     </div>
   )
@@ -105,6 +145,7 @@ export default function CommunicationPage() {
   const [contacts, setContacts] = useState<CommContact[] | null>(null)
   const [relays, setRelays] = useState<CommRelayConfig | null>(null)
   const [daemon, setDaemon] = useState<CommDaemonStatus | null>(null)
+  const [hyphaePhase, setHyphaePhase] = useState<HyphaePhase>({ kind: 'loading' })
   const [loadError, setLoadError] = useState<string | null>(null)
   const [notConfigured, setNotConfigured] = useState<{ kind: 'binary' | 'identity' | 'config'; detail: string } | null>(null)
   const [refreshing, setRefreshing] = useState(false)
@@ -138,6 +179,7 @@ export default function CommunicationPage() {
   const relayUrl = (selectedRelay && relayOptions.includes(selectedRelay) ? selectedRelay : '')
     || (relays?.configured ? relays.relays[0] : '') || defaults[0]?.url || ''
   const sequence = useRef(0)
+  const followTick = useRef(0)
   const mounted = useRef(false)
 
   const refresh = useCallback(async () => {
@@ -170,6 +212,14 @@ export default function CommunicationPage() {
       detail: [...new Set(setupMessages)].join(translate(communicationMessages, 'error.separator')),
     })
     setLoadError(failures.length ? translate(communicationMessages, 'error.refresh', { details: failures.join(translate(communicationMessages, 'error.separator')) }) : null)
+    try {
+      const list = await listComponents()
+      if (!mounted.current || token !== sequence.current) return
+      setHyphaePhase({ kind: 'ready', component: list.find((item) => item.id === 'hyphae') ?? null })
+    } catch {
+      if (!mounted.current || token !== sequence.current) return
+      setHyphaePhase({ kind: 'error' })
+    }
     setRefreshing(false)
   }, [])
 
@@ -193,16 +243,27 @@ export default function CommunicationPage() {
   // `starting` becomes `running` on its own once the child has stayed alive
   // for a few seconds; keep the card current until the state settles (bounded).
   const processState = daemon?.process.state
+  const componentFollow = hyphaePhase.kind === 'ready' && hyphaeTransitional(hyphaePhase.component)
   useEffect(() => {
-    if (!processState || !TRANSITIONAL_STATES.includes(processState)) return
+    const followProcess = Boolean(processState && TRANSITIONAL_STATES.includes(processState))
+    if (!followProcess && !componentFollow) return
     let ticks = 0
     const timer = setInterval(() => {
       ticks += 1
       if (ticks > POLL_MAX_TICKS) { clearInterval(timer); return }
+      const token = sequence.current
+      const tick = ++followTick.current // a slower earlier tick must not overwrite a later one
       pollCommStatus().then((next) => { if (mounted.current) setDaemon(next) }).catch(() => undefined)
+      listComponents().then((list) => {
+        if (!mounted.current || token !== sequence.current || tick !== followTick.current) return
+        setHyphaePhase({ kind: 'ready', component: list.find((item) => item.id === 'hyphae') ?? null })
+      }).catch(() => {
+        if (!mounted.current || token !== sequence.current || tick !== followTick.current) return
+        setHyphaePhase({ kind: 'error' })
+      })
     }, POLL_INTERVAL_MS)
     return () => clearInterval(timer)
-  }, [processState])
+  }, [processState, componentFollow])
 
   const runAction = async (action: WriteAction) => {
     if (pending) return
@@ -439,13 +500,11 @@ export default function CommunicationPage() {
   // `gave_up` has no child but Stop still means something there: it moves the
   // supervisor to `stopped` and switches autostart off, ending the retry
   // cycle. `locked` has nothing to stop; Unlock is the way forward.
-  const serviceStoppable = daemon?.process.state === 'running'
-    || daemon?.process.state === 'starting'
-    || daemon?.process.state === 'backoff'
-    || daemon?.process.state === 'gave_up'
+  const hyphae = hyphaePhase.kind === 'ready' ? hyphaePhase.component : null
+  const serviceStoppable = hyphaeStoppable(hyphae)
   const stopTitle = serviceStoppable ? undefined
-    : daemon === null ? t('action.stopUnavailable')
-    : daemon.process.state === 'locked' ? t('action.stopLocked')
+    : hyphaePhase.kind !== 'ready' || hyphae === null ? t('action.stopUnavailable')
+    : hyphae.state === 'failed' && hyphae.reason === 'locked' ? t('action.stopLocked')
     : t('action.stopIdle')
   const revealLabel = (() => {
     const hint = typeof navigator === 'undefined' ? '' : (navigator.platform || navigator.userAgent)
@@ -614,8 +673,8 @@ export default function CommunicationPage() {
       </section>
 
       <section className="comm-card">
-        <div className="comm-section-heading"><h2>{t('section.service')}</h2><span className={isFresh && daemon?.process.state === 'running' ? 'comm-fresh-indicator' : 'comm-muted'}>{isFresh ? t('data.fresh') : t('data.stale')}</span></div>
-        <DaemonStatusView status={daemon} fresh={isFresh} />
+        <div className="comm-section-heading"><h2>{t('section.service')}</h2><span className={isFresh && hyphae?.state === 'ready' ? 'comm-fresh-indicator' : 'comm-muted'}>{isFresh ? t('data.fresh') : t('data.stale')}</span></div>
+        <DaemonStatusView status={daemon} phase={hyphaePhase} fresh={isFresh} />
         <div className="comm-actions">
           <button type="button" onClick={() => void runAction('start')} disabled={pending !== null}>{t('action.start')}</button>
           <button type="button" onClick={() => void runAction('stop')} disabled={pending !== null || !serviceStoppable} title={stopTitle}>{t('action.stop')}</button>

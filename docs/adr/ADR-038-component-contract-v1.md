@@ -228,6 +228,8 @@ CLI 绑定额外规定（和 `agent24-comm/src/runner.rs` 现有约定一致）�
 | `SidecarState::healthy` | 同上 | ready |
 | `OpenDesignComponentState` `not-installed` | `open-design-component.ts` | absent |
 | `paused`（断点续传中） | 同上 | installing |
+| `downloading`（下载中） | 同上 | installing |
+| `verifying`（校验中） | 同上 | installing |
 | `installed / failed` | 同上 | 同名 |
 | `unavailable`（本构建没带 manifest、平台不匹配） | 同上 | absent，附 `reason` |
 
@@ -321,7 +323,7 @@ CLI 绑定额外规定（和 `agent24-comm/src/runner.rs` 现有约定一致）�
 | C1 | 在 `agent24-components` 里加 `ComponentLock`（schema 2，`provides` / `requires` / `assurance`）、通用下载器和签名验证（D2a，推广 `SignatureVerifier`：按 `executables` 逐个验、Hardened Runtime、`spctl`、放开架构）；`fetch_verified` 改用它；iDoris 锁升到 schema 2（行为不变，L1–L6 移到 `assurance`），iDoris 迁到新托管根（重下，旧目录标记可删）。**依赖方向反转**：现在 `agent24-components` 依赖 `agent24-idoris`，C1 后 `agent24-idoris` 依赖 `agent24-components`；`run_install_child` 隐藏子命令随下载器一起搬，仍由宿主二进制（`agent24d`）分发，不另起启动器 | Agent24 |
 | C1b | Hyphae 发布流水线加 Developer ID 签名与公证；锁同时换 `sha256`（签名后）和填 `reproducible.unsigned_sha256`（签名前）；Agent24 侧对 Hyphae macOS 资产启用 D2a。**排在 Hyphae 发出签名版之后**，可与 C2 同期 | Hyphae + Agent24 |
 | C2 | Hyphae 新增 `contract`、`health` 子命令（`HYPHAE_OUTPUT=json` 下输出 envelope），统一 envelope 和退出码。Hyphae 锁**仍是 schema 1、不加字段**；Agent24 在 `agent24-comm` 代码里写死对 Hyphae 的契约期望（`name=hyphae-cli`、`major=1`、`min_minor=0`），`contract` 字段等 C1b 的 schema 2 锁再进锁（§7.4）。**排在 Hyphae relay 上线之后**（jason 拍板） | Hyphae + Agent24 |
-| C3 | 新增 `GET /api/v1/components`（含 D9 清单、audience 脱敏、`Operation::ComponentsRead`）和 `POST /api/v1/components/{id}/report`；统一状态机（D5 转移表与映射表）；`GRACE_MAX_MS` 抬到 ≥15 000、默认值与 env 名统一；能力中心、通信页、本地模型页改为读这个接口。**过渡期**：C2 之前 Hyphae 没有 `health`，它的状态由现有 pid 存活判定，只有 `ready / stopped / failed`，没有 `degraded` | Agent24 |
+| C3 | 新增 `GET /api/v1/components`（含 D9 清单、audience 脱敏、`Operation::ComponentsRead`）和 `POST /api/v1/components/{id}/report`；统一状态机（D5 转移表与映射表）；`GRACE_MAX_MS` 抬到 ≥15 000、默认值与 env 名统一；能力中心、通信页、本地模型页改为读这个接口。C3b：桌面上报 + 心跳 30s。**过渡期**：C2 之前 Hyphae 没有 `health`，它的状态由现有 pid 存活判定，只有 `ready / stopped / failed`，没有 `degraded` | Agent24 |
 | C4 | AgentEar：只在 `/api/v1/components` 里登记（attach 子集状态），握手不变；D2/D2a 不适用（见 D2a 缺口说明）；补 §3 用例 2、3、4 | Agent24 |
 | C5 | Knowledge：把 `/system/capabilities` 映射到 D3/D5（远端服务子集） | Agent24 |
 | C6 | Documents：补 D9 清单；等它独立发版时再补 D2 的锁 | Agent24 |

@@ -14,6 +14,9 @@ function setup({ installed = true, identities = [identity], configured = true, c
   const proxy = vi.fn(async ({ method, path, body }: { method: string; path: string; body?: unknown }) => {
     let data: unknown = {}
     if (method === 'GET') {
+      if (path === '/api/v1/components' || path.startsWith('/api/v1/components?')) {
+        return { ok: true, status: 200, data: { components: [{ id: 'hyphae', version: installed ? 'v0.28.1' : null, state: 'stopped', form: 'resident', provides: [] }] } }
+      }
       if (path.endsWith('/daemon')) data = {
         installable: true, installed_version: installed ? 'v0.28.1' : null,
         process: { state: 'stopped', generation: 0, consecutive_failures: 0, reason: null },
