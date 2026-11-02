@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   CommApiError,
   addCommContact,
-  COMM_IPC_TIMEOUT_MS,
+  COMM_HTTP_TIMEOUT_MS,
   exportCommIdentity,
   listCommHistory,
   revealCommExport,
@@ -220,13 +220,28 @@ describe('COMM contact, send, history and export wrappers', () => {
     expect(proxy).not.toHaveBeenCalled()
   })
 
-  it('rejects an export IPC that never returns, so the page can clear pending', async () => {
+  it('does not race a human-interactive IPC: an export that takes 10 minutes still resolves', async () => {
     vi.useFakeTimers()
     try {
-      const commIdentityExport = vi.fn(() => new Promise(() => {}))
+      let finish: (value: unknown) => void = () => {}
+      const commIdentityExport = vi.fn(() => new Promise((resolve) => { finish = resolve }))
       window.agent24 = { ...window.agent24, commIdentityExport } as never
-      const pending = exportCommIdentity('alice').then(() => 'ok' as const, (error: unknown) => error)
-      await vi.advanceTimersByTimeAsync(COMM_IPC_TIMEOUT_MS)
+      const pending = exportCommIdentity('alice').then((value) => value, (error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(10 * 60_000)
+      finish(successful({ nickname: 'alice', npub: 'npub1alice', path: '/safe/a.ncryptsec', format: 'ncryptsec' }))
+      await expect(pending).resolves.toMatchObject({ path: '/safe/a.ncryptsec' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('still bounds a plain HTTP read that never answers', async () => {
+    vi.useFakeTimers()
+    try {
+      const backendProxy = vi.fn(() => new Promise(() => {}))
+      window.agent24 = { ...window.agent24, backendProxy } as never
+      const pending = listCommContacts().then(() => 'ok' as const, (error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(COMM_HTTP_TIMEOUT_MS)
       await expect(pending).resolves.toMatchObject({ code: 'timeout' })
     } finally {
       vi.useRealTimers()

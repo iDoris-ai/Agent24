@@ -215,20 +215,22 @@ function isUnlockResult(value: unknown): value is CommUnlockResult {
   return isRecord(value) && value['unlocked'] === true && typeof value['remembered'] === 'boolean'
 }
 
-/** Same budget as the main-process export IPC. A call that never settles must not leave the page's `pending` set. */
-export const COMM_IPC_TIMEOUT_MS = 90_000
+/**
+ * Deadline for plain HTTP reads and writes through the generic proxy only.
+ * Never put it over an IPC that waits for a person (install, export, restore,
+ * unlock, home import, file pick): main keeps working after the page gives up,
+ * and the page would then show a failure for something that goes on to succeed.
+ */
+export const COMM_HTTP_TIMEOUT_MS = 90_000
 
-export function withCommTimeout<T>(work: Promise<T> | T, ms = COMM_IPC_TIMEOUT_MS): Promise<T> {
+function withHttpTimeout<T>(work: Promise<T> | T): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
-  // IPC mocks (and a few Electron APIs) may return a plain value. Adopt either
-  // shape so a sync result is not mistaken for a transport failure.
   const pending = Promise.resolve(work)
-  // A rejection that arrives after the deadline must not become unhandled.
   void pending.catch(() => undefined)
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       reject(new CommApiError(translate(communicationMessages, 'error.timeout'), 504, 'timeout'))
-    }, ms)
+    }, COMM_HTTP_TIMEOUT_MS)
   })
   return Promise.race([pending, timeout]).finally(() => clearTimeout(timer))
 }
@@ -241,7 +243,7 @@ async function request<T>(
 ): Promise<T> {
   let response: unknown
   try {
-    response = await withCommTimeout(window.agent24.backendProxy({ method, path, ...(body === undefined ? {} : { body }) }))
+    response = await withHttpTimeout(window.agent24.backendProxy({ method, path, ...(body === undefined ? {} : { body }) }))
   } catch (error) {
     if (error instanceof CommApiError) throw error
     throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)
@@ -283,7 +285,7 @@ function isInstallResult(value: unknown): value is CommInstallResult {
 
 export async function installComm(): Promise<CommInstallResult> {
   // Main owns the elevated native confirmation and the fixed installation URL.
-  const response: unknown = await withCommTimeout(window.agent24.commInstall())
+  const response: unknown = await window.agent24.commInstall()
   return decodeEnvelope(response, isInstallResult)
 }
 
@@ -305,7 +307,7 @@ export const probeCommRelay = (url: string) =>
 async function viaIpc<T>(call: () => Promise<unknown>, validate: (value: unknown) => value is T): Promise<T> {
   let response: unknown
   try {
-    response = await withCommTimeout(call())
+    response = await call()
   } catch (error) {
     if (error instanceof CommApiError) throw error
     throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)
@@ -425,7 +427,7 @@ export type CommPickResult = { ticket: string; fileName: string } | null
 export async function pickCommBackup(): Promise<CommPickResult> {
   let result: unknown
   try {
-    result = await withCommTimeout(window.agent24.commImportPick())
+    result = await window.agent24.commImportPick()
   } catch (error) {
     if (error instanceof CommApiError) throw error
     throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)

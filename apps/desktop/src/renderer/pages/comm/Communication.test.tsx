@@ -7,7 +7,7 @@ import {
   getCommStatus, listCommContacts, listCommIdentities, listCommRelays,
   startCommDaemon, stopCommDaemon, unlockComm, installComm,
   addCommContact, sendCommMessage, listCommHistory, exportCommIdentity, pickCommBackup, restoreCommIdentity,
-  revealCommExport, COMM_IPC_TIMEOUT_MS,
+  revealCommExport,
   CommApiError, type CommDaemonStatus,
 } from './api'
 
@@ -15,8 +15,6 @@ vi.mock('./api', async (importActual) => {
   const actual = await importActual<typeof import('./api')>()
   return {
     CommApiError: actual.CommApiError,
-    withCommTimeout: actual.withCommTimeout,
-    COMM_IPC_TIMEOUT_MS: actual.COMM_IPC_TIMEOUT_MS,
     getCommStatus: vi.fn(), listCommContacts: vi.fn(), listCommIdentities: vi.fn(), listCommRelays: vi.fn(),
     startCommDaemon: vi.fn(), stopCommDaemon: vi.fn(), unlockComm: vi.fn(), installComm: vi.fn(),
     addCommContact: vi.fn(), sendCommMessage: vi.fn(), listCommHistory: vi.fn(), exportCommIdentity: vi.fn(), pickCommBackup: vi.fn(), restoreCommIdentity: vi.fn(),
@@ -572,7 +570,7 @@ describe('CommunicationPage usability', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Export private key backup alice' }))
     if (pathText) {
       expect(await screen.findByText(/\/Users\/x\/Downloads\/alice\.ncryptsec/)).toBeInTheDocument()
-      fireEvent.click(screen.getByRole('button', { name: 'Show in Finder' }))
+      fireEvent.click(screen.getByRole('button', { name: /^Show in / }))
       await waitFor(() => expect(revealCommExport).toHaveBeenCalledWith(pathText))
     } else {
       await waitFor(() => expect(exportCommIdentity).toHaveBeenCalled())
@@ -584,20 +582,69 @@ describe('CommunicationPage usability', () => {
     })
   })
 
-  it('a comm export IPC that never returns times out and re-enables Restore and Stop', async () => {
+  it('an export that takes longer than 90 s (a person choosing a password and a folder) is not timed out, and shows the path', async () => {
     success()
-    vi.mocked(exportCommIdentity).mockImplementation(() => new Promise(() => {}))
+    let finish: (value: Awaited<ReturnType<typeof exportCommIdentity>>) => void = () => {}
+    vi.mocked(exportCommIdentity).mockImplementation(() => new Promise((resolve) => { finish = resolve }))
     render(<CommunicationPage />)
     await screen.findByText('npub1alice')
     vi.useFakeTimers()
     fireEvent.click(screen.getByRole('button', { name: 'Export private key backup alice' }))
     const { restore, stop } = restoreAndStop()
+    await act(async () => { await vi.advanceTimersByTimeAsync(120_000) })
     expect(restore).toBeDisabled()
     expect(stop).toBeDisabled()
-    await act(async () => { await vi.advanceTimersByTimeAsync(COMM_IPC_TIMEOUT_MS) })
+    expect(screen.queryByRole('alert')).toBeNull()
+    await act(async () => { finish({ nickname: 'alice', npub: 'npub1alice', path: '/Users/x/Downloads/late.ncryptsec', warnings: [] }) })
     expect(restore).toBeEnabled()
     expect(stop).toBeEnabled()
-    expect(screen.getByRole('alert')).toHaveTextContent('timed out')
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByRole('status')).toHaveTextContent('/Users/x/Downloads/late.ncryptsec')
+    vi.useRealTimers()
+  })
+
+  it.each([
+    ['MacIntel', 'Show in Finder'],
+    ['Win32', 'Show in File Explorer'],
+    ['Linux x86_64', 'Show in file manager'],
+    ['', 'Show in folder'],
+  ])('labels the reveal button for platform %j as %s', async (platform, label) => {
+    success()
+    vi.spyOn(window.navigator, 'platform', 'get').mockReturnValue(platform)
+    vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue('')
+    vi.mocked(exportCommIdentity).mockResolvedValueOnce({ nickname: 'alice', npub: 'npub1alice', path: '/p/a.ncryptsec', warnings: [] })
+    render(<CommunicationPage />)
+    await screen.findByText('npub1alice')
+    fireEvent.click(screen.getByRole('button', { name: 'Export private key backup alice' }))
+    expect(await screen.findByRole('button', { name: label })).toBeInTheDocument()
+    vi.restoreAllMocks()
+  })
+
+  it('a 409 export_in_progress from the daemon reads as "still finishing"', async () => {
+    success()
+    vi.mocked(exportCommIdentity).mockRejectedValueOnce(new CommApiError('export_in_progress: another key backup is already running', 409, 'conflict'))
+    render(<CommunicationPage />)
+    await screen.findByText('npub1alice')
+    fireEvent.click(screen.getByRole('button', { name: 'Export private key backup alice' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('still finishing')
+  })
+
+  it('explains why Stop is unavailable: locked, no status, or just not running; and allows it after the supervisor gave up', async () => {
+    const stopFor = async (state: CommDaemonStatus['process']['state'] | null) => {
+      cleanup()
+      success()
+      if (state === null) vi.mocked(getCommStatus).mockRejectedValue(new CommApiError('down', 503, 'unavailable'))
+      else vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, state } })
+      render(<CommunicationPage />)
+      return screen.findByRole('button', { name: 'Stop service' })
+    }
+    expect(await stopFor('gave_up')).toBeEnabled()
+    const locked = await stopFor('locked')
+    expect(locked).toBeDisabled()
+    expect(locked).toHaveAttribute('title', expect.stringContaining('Locked'))
+    const unknown = await stopFor(null)
+    expect(unknown).toBeDisabled()
+    expect(unknown).toHaveAttribute('title', expect.stringContaining('unavailable'))
   })
 
   it('enables Stop while the service is running, starting, or backing off, and disables it once stopped', async () => {

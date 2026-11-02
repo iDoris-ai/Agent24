@@ -111,23 +111,53 @@ function openPasswordWindow<T>(
     })
     const contents = win.webContents
     let settled = false
+    let released = false
     let working = false
-    // Set while the window is already closing, so finish() does not call close()
-    // again (that re-enters this handler, and a throw would skip resolve()).
+    let outcome: T | null = null
+    let teardownTimer: ReturnType<typeof setTimeout> | undefined
+    // Set once win.close() has been called or the window reported closing, so
+    // finish() does not call close() again (that re-enters the close handler).
     let closing = false
 
+    // The promise settles only when the window is really gone, so the caller
+    // can open the next native window (the save dialog is a sheet on the same
+    // parent) without racing this one's teardown.
+    const release = (): void => {
+      if (released) return
+      released = true
+      if (teardownTimer !== undefined) clearTimeout(teardownTimer)
+      parent?.removeListener('closed', onParentGone)
+      app.removeListener('before-quit', onQuit)
+      resolve(outcome)
+    }
+
+    // Settles exactly once, whatever happens to the window: submit, cancel,
+    // `close`, `closed`, the web contents going away, the parent going away, or
+    // the app quitting. It never relies on win.close() working: close() may
+    // throw, a close may be vetoed, and a modal window torn down with its parent
+    // can emit `close` and never `closed`.
     const finish = (value: T | null): void => {
       if (settled) return
       settled = true
+      outcome = value
       ipcMain.removeListener(BACKUP_PW_SUBMIT, onSubmit)
       ipcMain.removeListener(BACKUP_PW_CANCEL, onCancel)
-      // Resolve before close(). close() can throw once the window is going
-      // away, and that used to skip resolve() and leave the IPC pending.
-      resolve(value)
-      if (closing || win.isDestroyed()) return
-      closing = true
-      try { win.close() } catch { /* already closing */ }
+      if (win.isDestroyed()) { release(); return }
+      if (!closing) {
+        closing = true
+        try { win.close() } catch { /* the destroy below covers it */ }
+      }
+      // If it is still there on the next tick, destroy it. destroy() cannot be
+      // vetoed and is synchronous, so after it the window is gone.
+      teardownTimer = setTimeout(() => {
+        try { if (!win.isDestroyed()) win.destroy() } catch { /* nothing left to do */ }
+        release()
+      }, 0)
     }
+    const onParentGone = (): void => finish(null)
+    const onQuit = (): void => { working = false; finish(null) }
+    parent?.once('closed', onParentGone)
+    app.once('before-quit', onQuit)
     // Only THIS window's top frame may speak on these channels.
     const fromWindow = (event: IpcMainEvent): boolean =>
       !contents.isDestroyed() && event.sender === contents &&
@@ -187,6 +217,11 @@ function openPasswordWindow<T>(
       finish(null)
     })
     win.on('closed', () => {
+      closing = true
+      finish(null)
+      release()
+    })
+    contents.once('destroyed', () => {
       closing = true
       finish(null)
     })

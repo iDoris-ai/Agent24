@@ -9,7 +9,23 @@ type Listener = (event: unknown, ...args: unknown[]) => void
   const ipcListeners = new Map<string, Set<Listener>>()
   const windows: FakeWindow[] = []
   
-  class FakeContents {
+  class Emitter {
+    listeners = new Map<string, Array<(...a: unknown[]) => void>>()
+    on(event: string, fn: (...a: unknown[]) => void) { this.listeners.set(event, [...(this.listeners.get(event) ?? []), fn]); return this }
+    once(event: string, fn: (...a: unknown[]) => void) { return this.on(event, fn) }
+    removeListener(event: string, fn: (...a: unknown[]) => void) {
+      this.listeners.set(event, (this.listeners.get(event) ?? []).filter((f) => f !== fn))
+      return this
+    }
+    emit(event: string, ...args: unknown[]) { for (const f of [...(this.listeners.get(event) ?? [])]) f(...args) }
+  }
+  class FakeParent extends Emitter {
+    destroyed = false
+    id = 'parent'
+    isDestroyed() { return this.destroyed }
+  }
+  const fakeApp = Object.assign(new Emitter(), { isPackaged: true })
+  class FakeContents extends Emitter {
     static nextId = 1
     id = FakeContents.nextId++
     mainFrame = { id: 'main' }
@@ -18,31 +34,43 @@ type Listener = (event: unknown, ...args: unknown[]) => void
     isDestroyed() { return this.destroyed }
     send(...args: unknown[]) { this.sent.push(args) }
     setWindowOpenHandler = vi.fn()
-    on = vi.fn()
   }
   class FakeWindow {
     static options: Record<string, unknown>[] = []
     webContents = new FakeContents()
     closed = false
-    handlers = new Map<string, () => void>()
+    handlers = new Map<string, (...a: unknown[]) => void>()
+    listeners = new Map<string, Array<(...a: unknown[]) => void>>()
+    /** normal: close() ends in `closed`. event-only: only `close` fires, `closed` never does. throws: close() throws. */
+    closeMode: 'normal' | 'event-only' | 'throws' = 'normal'
+    destroyCalls = 0
     loadedUrl = ''
     constructor(options: Record<string, unknown>) {
       FakeWindow.options.push(options)
       windows.push(this)
     }
-    on(event: string, fn: () => void) { this.handlers.set(event, fn) }
-    once(event: string, fn: () => void) { this.handlers.set(event, fn) }
+    on(event: string, fn: (...a: unknown[]) => void) {
+      this.listeners.set(event, [...(this.listeners.get(event) ?? []), fn])
+      this.handlers.set(event, (...a) => { for (const f of this.listeners.get(event) ?? []) f(...a) })
+    }
+    once(event: string, fn: (...a: unknown[]) => void) { this.on(event, fn) }
     show() {}
     isDestroyed() { return this.closed }
-    close() { this.closed = true; this.handlers.get('closed')?.() }
+    close() {
+      if (this.closeMode === 'throws') throw new Error('Object has been destroyed')
+      if (this.closeMode === 'event-only') { this.handlers.get('close')?.({ preventDefault() {} }); return }
+      this.closed = true
+      this.handlers.get('closed')?.()
+    }
+    destroy() { this.destroyCalls++; this.closed = true; this.handlers.get('closed')?.() }
     loadURL(url: string) { this.loadedUrl = url; return Promise.resolve() }
   }
-  return { ipcListeners, windows, FakeWindow, FakeContents }
+  return { ipcListeners, windows, FakeWindow, FakeContents, FakeParent, fakeApp }
 })
-const { ipcListeners, windows, FakeWindow, FakeContents } = h
+const { ipcListeners, windows, FakeWindow, FakeContents, FakeParent, fakeApp } = h
 
 vi.mock('electron', () => ({
-  app: { isPackaged: true },
+  app: h.fakeApp,
   BrowserWindow: h.FakeWindow,
   ipcMain: {
     on: (channel: string, fn: Listener) => {
@@ -72,7 +100,7 @@ beforeEach(() => {
 
 describe('backup password window', () => {
   it('is isolated: sandboxed, no node, context-isolated, no devtools when packaged, own preload, modal on the parent', () => {
-    const parent = { id: 'parent' }
+    const parent = new FakeParent()
     void promptBackupPassword(parent as never)
     const o = FakeWindow.options[0]!
     const prefs = o['webPreferences'] as Record<string, unknown>
@@ -153,6 +181,97 @@ describe('backup password window', () => {
     const result = promptBackupPassword(null)
     windows[0]!.handlers.get('close')?.()
     await expect(result).resolves.toBeNull()
+  })
+})
+
+// The hang from the field: the export IPC never answered after the password
+// step. Every way the window can end must settle the promise, and only once the
+// window is really gone (the save dialog opens next, on the same parent).
+describe('the password promise always settles, and only once the window is gone', () => {
+  it('`close` without `closed` (a modal torn down with its parent): settles, window destroyed first', async () => {
+    const result = promptBackupPassword(null)
+    const w = windows[0]!
+    w.closeMode = 'event-only'
+    w.handlers.get('close')?.({ preventDefault() {} })
+    await expect(result).resolves.toBeNull()
+    expect(w.isDestroyed()).toBe(true)
+    expect(w.destroyCalls).toBe(1)
+  })
+
+  it('a submit whose window never emits `closed` still delivers the password, after destroy', async () => {
+    const result = promptBackupPassword(null)
+    const w = windows[0]!
+    w.closeMode = 'event-only'
+    emit(BACKUP_PW_SUBMIT, fromWindow(w), 'good-pass-1', 'good-pass-1')
+    let settled = false
+    void result.then(() => { settled = true })
+    await Promise.resolve()
+    expect(settled).toBe(false) // not before the window is gone
+    await expect(result).resolves.toBe('good-pass-1')
+    expect(w.isDestroyed()).toBe(true)
+  })
+
+  it('win.close() throwing inside finish() still settles, via destroy', async () => {
+    const result = promptBackupPassword(null)
+    const w = windows[0]!
+    w.closeMode = 'throws'
+    emit(BACKUP_PW_SUBMIT, fromWindow(w), 'good-pass-1', 'good-pass-1')
+    await expect(result).resolves.toBe('good-pass-1')
+    expect(w.destroyCalls).toBe(1)
+  })
+
+  it('cancel with a close() that throws settles null', async () => {
+    const result = promptBackupPassword(null)
+    const w = windows[0]!
+    w.closeMode = 'throws'
+    emit(BACKUP_PW_CANCEL, fromWindow(w))
+    await expect(result).resolves.toBeNull()
+  })
+
+  it('the parent being destroyed settles null and tears the window down', async () => {
+    const parent = new FakeParent()
+    const result = promptBackupPassword(parent as never)
+    const w = windows[0]!
+    w.closeMode = 'event-only'
+    parent.destroyed = true
+    parent.emit('closed')
+    await expect(result).resolves.toBeNull()
+    expect(w.isDestroyed()).toBe(true)
+  })
+
+  it('the web contents being destroyed settles null', async () => {
+    const result = promptBackupPassword(null)
+    const w = windows[0]!
+    w.closeMode = 'event-only'
+    w.webContents.emit('destroyed')
+    await expect(result).resolves.toBeNull()
+  })
+
+  it('the app quitting settles null, even mid-work', async () => {
+    const result = promptRestorePassword(null, () => new Promise(() => {}))
+    const w = windows[0]!
+    emit(BACKUP_PW_SUBMIT, fromWindow(w), 'whatever-pass', '')
+    fakeApp.emit('before-quit')
+    await expect(result).resolves.toBeNull()
+    expect(w.isDestroyed()).toBe(true)
+  })
+
+  it('a close that someone vetoes does not leave a dead window behind', async () => {
+    const result = promptBackupPassword(null)
+    const w = windows[0]!
+    w.closeMode = 'event-only' // close() neither throws nor reaches `closed`
+    emit(BACKUP_PW_CANCEL, fromWindow(w))
+    await expect(result).resolves.toBeNull()
+    expect(w.isDestroyed()).toBe(true)
+  })
+
+  it('removes its listeners from the parent and the app once settled', async () => {
+    const parent = new FakeParent()
+    const result = promptBackupPassword(parent as never)
+    emit(BACKUP_PW_CANCEL, fromWindow(windows[0]!))
+    await result
+    expect(parent.listeners.get('closed') ?? []).toHaveLength(0)
+    expect(fakeApp.listeners.get('before-quit') ?? []).toHaveLength(0)
   })
 })
 

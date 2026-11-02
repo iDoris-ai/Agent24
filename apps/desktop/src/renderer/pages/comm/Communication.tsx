@@ -14,7 +14,6 @@ import {
   restoreCommIdentity,
   revealCommExport,
   sendCommMessage,
-  withCommTimeout,
   listCommRelays,
   startCommDaemon,
   stopCommDaemon,
@@ -215,34 +214,34 @@ export default function CommunicationPage() {
     if (action === 'unlock') setUnlockError(null)
     try {
       if (action === 'install') {
-        const result = await withCommTimeout(installComm())
+        const result = await installComm()
         if (mounted.current && token === sequence.current) {
           setNotice(result.restart_required ? t('notice.restart', { reason: result.reason ?? '' }) : t('notice.installed'))
         }
       } else if (action === 'create') {
-        await withCommTimeout(createCommIdentity(nickname.trim()))
+        await createCommIdentity(nickname.trim())
       } else if (action === 'import') {
-        await withCommTimeout(importCommHome())
+        await importCommHome()
       } else if (action === 'relay') {
         // PUT replaces the whole list server-side (and restarts the daemon):
         // keep the existing entries, and skip the write if nothing changes.
         const existing = relays?.configured ? relays.relays : []
         if (existing[0] !== relayUrl) {
-          await withCommTimeout(setCommRelay([relayUrl, ...existing.filter((url) => url !== relayUrl)].slice(0, 8)))
+          await setCommRelay([relayUrl, ...existing.filter((url) => url !== relayUrl)].slice(0, 8))
         }
         setHandshakeFailed(true)
-        const probe = await withCommTimeout(probeCommRelay(relayUrl))
+        const probe = await probeCommRelay(relayUrl)
         if (probe.connected) setHandshakeFailed(false)
         if (!probe.connected) throw new Error(`${t('probe.failure')}${probe.error ? `: ${probe.error}` : ''}`)
         if (mounted.current && token === sequence.current) setNotice(t('probe.success'))
       } else if (action === 'start') {
-        await withCommTimeout(startCommDaemon())
+        await startCommDaemon()
         if (mounted.current && token === sequence.current) setNotice(t('notice.start'))
       } else if (action === 'stop') {
-        await withCommTimeout(stopCommDaemon())
+        await stopCommDaemon()
         if (mounted.current && token === sequence.current) setNotice(t('notice.stop'))
       } else {
-        const result = await withCommTimeout(unlockComm(remember))
+        const result = await unlockComm(remember)
         if (mounted.current && token === sequence.current) {
           setNotice(result.remembered ? t('notice.remembered') : t('notice.session'))
           setUnlockFailed(false)
@@ -292,6 +291,7 @@ export default function CommunicationPage() {
     if (code === 'permission_denied') return t('export.permissionDenied')
     if (code === 'filesystem_unsupported') return t('export.filesystemUnsupported')
     if (code === 'keystore_locked') return t('restore.keystoreLocked')
+    if (code === 'export_in_progress' || (code === 'conflict' && messageOf(error).startsWith('export_in_progress'))) return t('error.exportInProgress')
     return messageOf(error)
   }
 
@@ -302,7 +302,7 @@ export default function CommunicationPage() {
     setNotice(null)
     setExportedPath(null)
     try {
-      const picked = await withCommTimeout(pickCommBackup())
+      const picked = await pickCommBackup()
       if (picked && mounted.current) {
         setRestore(picked)
         // A nickname suggested from the file name; the user can change it.
@@ -326,7 +326,7 @@ export default function CommunicationPage() {
     setExportedPath(null)
     try {
       // The backup password is asked for by the main process, not by this page.
-      const result = await withCommTimeout(restoreCommIdentity(restore.ticket, restoreNickname.trim(), restoreDefault))
+      const result = await restoreCommIdentity(restore.ticket, restoreNickname.trim(), restoreDefault)
       if (mounted.current) {
         setNotice(result.status === 'already_present'
           ? (result.nickname ? t('restore.alreadyAs', { nickname: result.nickname }) : t('restore.already'))
@@ -362,7 +362,7 @@ export default function CommunicationPage() {
     setWarnings([])
     try {
       // The backup password is asked for by the main process, not by this page.
-      const result = await withCommTimeout(exportCommIdentity(name))
+      const result = await exportCommIdentity(name)
       if (mounted.current) {
         setExportedPath(result.path)
         setNotice(t('export.done', { path: result.path }))
@@ -382,7 +382,7 @@ export default function CommunicationPage() {
 
   const revealExported = async (filePath: string) => {
     try {
-      await withCommTimeout(revealCommExport(filePath))
+      await revealCommExport(filePath)
     } catch (error) {
       if (mounted.current) setActionError(errorText(error))
     }
@@ -398,7 +398,7 @@ export default function CommunicationPage() {
     setNotice(null)
     setExportedPath(null)
     try {
-      await withCommTimeout(addCommContact(contactName.trim(), npubValue, contactRole.trim()))
+      await addCommContact(contactName.trim(), npubValue, contactRole.trim())
       if (mounted.current) {
         setContactName(''); setContactNpub(''); setContactRole('')
         setNotice(t('contact.added'))
@@ -424,7 +424,7 @@ export default function CommunicationPage() {
     setNotice(null)
     setExportedPath(null)
     try {
-      const result = await withCommTimeout(sendCommMessage(to, messageText))
+      const result = await sendCommMessage(to, messageText)
       if (mounted.current) {
         setMessageText('')
         setNotice(result.published_to > 0 ? t('message.sent', { count: result.published_to }) : t('message.queued'))
@@ -436,9 +436,24 @@ export default function CommunicationPage() {
     }
   }
 
+  // `gave_up` has no child but Stop still means something there: it moves the
+  // supervisor to `stopped` and switches autostart off, ending the retry
+  // cycle. `locked` has nothing to stop; Unlock is the way forward.
   const serviceStoppable = daemon?.process.state === 'running'
     || daemon?.process.state === 'starting'
     || daemon?.process.state === 'backoff'
+    || daemon?.process.state === 'gave_up'
+  const stopTitle = serviceStoppable ? undefined
+    : daemon === null ? t('action.stopUnavailable')
+    : daemon.process.state === 'locked' ? t('action.stopLocked')
+    : t('action.stopIdle')
+  const revealLabel = (() => {
+    const hint = typeof navigator === 'undefined' ? '' : (navigator.platform || navigator.userAgent)
+    if (/mac|darwin|iphone|ipad/i.test(hint)) return t('export.revealMac')
+    if (/\bwin/i.test(hint)) return t('export.revealWin')
+    if (/linux|x11|bsd/i.test(hint)) return t('export.revealLinux')
+    return t('export.reveal')
+  })()
   const needsUnlock = daemon !== null && (daemon.process.state === 'locked'
     || daemon.process.reason === 'password_rejected' || daemon.process.reason === 'keychain_unavailable')
   const showUnlock = needsUnlock || unlockFailed
@@ -466,7 +481,7 @@ export default function CommunicationPage() {
       {pending === 'install' && <p role="status">{t('action.installing')}</p>}
       {notice && <div role="status" className="comm-notice">
         <span>{notice}</span>
-        {exportedPath && <button type="button" onClick={() => void revealExported(exportedPath)}>{t('export.reveal')}</button>}
+        {exportedPath && <button type="button" onClick={() => void revealExported(exportedPath)}>{revealLabel}</button>}
       </div>}
       {warnings.map((warning) => <div key={warning} role="status" className="comm-warning">{warning}</div>)}
 
@@ -603,7 +618,7 @@ export default function CommunicationPage() {
         <DaemonStatusView status={daemon} fresh={isFresh} />
         <div className="comm-actions">
           <button type="button" onClick={() => void runAction('start')} disabled={pending !== null}>{t('action.start')}</button>
-          <button type="button" onClick={() => void runAction('stop')} disabled={pending !== null || !serviceStoppable} title={serviceStoppable ? undefined : t('action.stopIdle')}>{t('action.stop')}</button>
+          <button type="button" onClick={() => void runAction('stop')} disabled={pending !== null || !serviceStoppable} title={stopTitle}>{t('action.stop')}</button>
         </div>
         {showUnlock && <form className="comm-unlock" aria-label={t('unlock.title')} onSubmit={(event) => { event.preventDefault(); void runAction('unlock') }}>
           <p className="comm-muted comm-unlock-explain">{t('unlock.explain')}</p>
