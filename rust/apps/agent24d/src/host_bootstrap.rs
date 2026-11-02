@@ -45,6 +45,12 @@ fn is_ipc_channel(mode: rustix::fs::RawMode) -> bool {
 }
 
 impl ReadyWriter {
+    /// A writer over any pipe, for tests of the host-child ready path.
+    #[cfg(test)]
+    pub fn for_test(file: std::fs::File) -> Self {
+        Self(tokio::fs::File::from_std(file))
+    }
+
     pub async fn send(&mut self, ready: &serde_json::Value) -> io::Result<()> {
         let mut line = serde_json::to_vec(ready).map_err(io::Error::other)?;
         line.push(b'\n');

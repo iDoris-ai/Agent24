@@ -96,6 +96,7 @@ dependencies = [
  "keyring",
  "rand 0.9.5",
  "rustix 0.38.44",
+ "rustix 1.1.4",
  "scrypt",
  "secp256k1",
  "serde",

@@ -843,7 +843,10 @@ async fn identity_npub(runner: &HyphaeRunner, nickname: &str) -> Result<Option<S
 #[serde(deny_unknown_fields)]
 struct IdentityImportReq {
     nickname: String,
-    path: String,
+    /// The `ncryptsec1…` backup text itself (one line). The desktop reads and
+    /// validates the file the user picked and sends its content, so the daemon
+    /// never opens a path the caller names.
+    ncryptsec: String,
     backup_password: UnlockSecret,
     #[serde(default)]
     default: bool,
@@ -868,10 +871,10 @@ async fn import_identity(
     let (runner, password_store, home) = state.require_ready()?;
     invalid_if_bad_name("nickname", &req.nickname)?;
     check_nickname_len(&req.nickname)?;
-    invalid_if_blank("path", &req.path)?;
+    let ncryptsec = crate::export::parse_backup_text(&req.ncryptsec)?;
     crate::export::validate_restore_password(&req.backup_password.0)?;
-    let ncryptsec = crate::export::read_backup_file(Path::new(&req.path))?;
     crate::export::require_feature(runner, crate::export::Feature::Import).await?;
+    crate::export::check_backup_structure(ncryptsec)?;
 
     let guard = runner.keystore_lock().acquire().await;
     let existing = resolve_account(home).await?;
@@ -895,7 +898,7 @@ async fn import_identity(
             (pending, password, true)
         }
     };
-    let stdin = crate::export::import_stdin(&keystore_password, &req.backup_password.0, &ncryptsec);
+    let stdin = crate::export::import_stdin(&keystore_password, &req.backup_password.0, ncryptsec);
     drop(keystore_password);
     let stdin = match stdin {
         Ok(stdin) => stdin,
@@ -1203,6 +1206,96 @@ struct RelaySetReq {
     relays: Vec<String>,
 }
 
+/// Longest relay URL accepted (the desktop shows every URL in full in its
+/// confirmation, so the limit is shared with `comm-validate.ts`).
+const MAX_RELAY_URL_BYTES: usize = 256;
+
+/// A relay URL the daemon will hand to Hyphae: printable ASCII only (no
+/// homoglyph, bidi or zero-width trick can hide in it), `wss://`, or `ws://`
+/// only for loopback; a host, no userinfo, no query, no fragment.
+fn check_relay_url(url: &str) -> Result<(), CommError> {
+    let bad = |why: &str| CommError::Invalid(format!("relay url rejected: {why}"));
+    if url.is_empty() || url.len() > MAX_RELAY_URL_BYTES {
+        return Err(bad("length must be 1..=256 bytes"));
+    }
+    if !url.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        return Err(bad("only printable ASCII is allowed"));
+    }
+    let (secure, rest) = if let Some(rest) = url.strip_prefix("wss://") {
+        (true, rest)
+    } else if let Some(rest) = url.strip_prefix("ws://") {
+        (false, rest)
+    } else {
+        return Err(bad("not a ws:// or wss:// url"));
+    };
+    if rest.contains(['?', '#']) {
+        return Err(bad("a query string or fragment is not allowed"));
+    }
+    // `@` in the PATH is fine; in the authority it would be userinfo.
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.contains('@') {
+        return Err(bad("credentials in the url are not allowed"));
+    }
+    // host[:port] or [v6][:port]: a valid host and an optional numeric port,
+    // nothing after the closing bracket but a port.
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+        let (inside, after) = v6
+            .split_once(']')
+            .ok_or_else(|| bad("unterminated [ in the host"))?;
+        if inside.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(bad("invalid IPv6 address"));
+        }
+        let port = match after {
+            "" => None,
+            _ => Some(
+                after
+                    .strip_prefix(':')
+                    .ok_or_else(|| bad("unexpected text after the host"))?,
+            ),
+        };
+        (inside, port)
+    } else {
+        match authority.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return Err(bad("the url has no host"));
+    }
+    if !authority.starts_with('[')
+        && (host.starts_with(['.', '-'])
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'))
+    {
+        return Err(bad("invalid host name"));
+    }
+    if let Some(port) = port
+        && (port.is_empty()
+            || port.len() > 5
+            || !port.bytes().all(|b| b.is_ascii_digit())
+            || port.parse::<u32>().is_ok_and(|n| n == 0 || n > 65535))
+    {
+        return Err(bad("the port must be a number from 1 to 65535"));
+    }
+    if !secure && !is_loopback_host(host) {
+        return Err(bad("ws:// is only allowed for loopback hosts; use wss://"));
+    }
+    Ok(())
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    if host == "localhost" || host == "::1" {
+        return true;
+    }
+    match host.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) => ip.octets()[0] == 127,
+        Err(_) => false,
+    }
+}
+
 /// `PUT /comm/relay` → **one call**: `relay set --relay U1 --relay U2 …`
 /// (§4: a full replace, not an incremental add — COMM-0 r2's own
 /// "Low" processing note: "relay set 改为一次调用").
@@ -1215,11 +1308,7 @@ async fn set_relay(State(state): State<CommState>, Json(req): Json<RelaySetReq>)
         )));
     }
     for url in &req.relays {
-        if !(url.starts_with("ws://") || url.starts_with("wss://")) {
-            return Err(CommError::Invalid(format!(
-                "{url:?} is not a ws:// or wss:// url"
-            )));
-        }
+        check_relay_url(url)?;
     }
     let mut argv: Vec<OsString> = vec!["relay".into(), "set".into()];
     for url in req.relays {
@@ -2050,7 +2139,7 @@ echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2
             app,
             "POST",
             "/identity/import",
-            Some(json!({"nickname": nickname, "path": path.to_str().unwrap(), "backup_password": pw, "default": default})),
+            Some(json!({"nickname": nickname, "ncryptsec": std::fs::read_to_string(path).unwrap().trim(), "backup_password": pw, "default": default})),
         )
         .await
     }
@@ -2334,7 +2423,7 @@ echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2
             ),
             (
                 "/identity/import",
-                json!({"nickname": "a\nb", "path": "/tmp/x", "backup_password": "x"}),
+                json!({"nickname": "a\nb", "ncryptsec": "ncryptsec1x", "backup_password": "x"}),
             ),
         ] {
             let (s, b) = call(app.clone(), "POST", uri, Some(body)).await;
@@ -2359,7 +2448,7 @@ echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2
                 ("/contact", json!({"nickname": name, "npub": npub})),
                 (
                     "/identity/import",
-                    json!({"nickname": name, "path": file, "backup_password": "x"}),
+                    json!({"nickname": name, "ncryptsec": std::fs::read_to_string(&file).unwrap().trim(), "backup_password": "x"}),
                 ),
                 (
                     "/identity/export",
@@ -2718,7 +2807,7 @@ echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2
                 ("/contact", json!({"nickname": name, "npub": npub})),
                 (
                     "/identity/import",
-                    json!({"nickname": name, "path": file, "backup_password": "x"}),
+                    json!({"nickname": name, "ncryptsec": std::fs::read_to_string(&file).unwrap().trim(), "backup_password": "x"}),
                 ),
                 (
                     "/identity/export",
@@ -2774,34 +2863,49 @@ echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2
     }
 
     #[tokio::test]
-    async fn restore_refuses_bad_files_and_passwords_before_running_hyphae() {
+    async fn restore_refuses_bad_text_and_passwords_before_running_hyphae() {
         let tmp = tempfile::tempdir().unwrap();
         let fake = Fake::new(tmp.path());
         let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
         let app = router(state);
-        let good = write_backup(tmp.path());
-        let plain = tmp.path().join("plain.txt");
-        std::fs::write(&plain, "hello\n").unwrap();
-        let link = tmp.path().join("link.ncryptsec");
-        std::os::unix::fs::symlink(&good, &link).unwrap();
-        let big = tmp.path().join("big.ncryptsec");
-        std::fs::write(&big, format!("ncryptsec1{}", "q".repeat(5000))).unwrap();
-        for (path, expect) in [
-            (&plain, "invalid_key"),
-            (&link, "invalid"),
-            (&big, "invalid"),
-            (&tmp.path().join("missing.ncryptsec"), "not_found"),
+        let spec = crate::export::testkit::SPEC_NCRYPTSEC;
+        let post_text = |text: String, pw: &'static str| {
+            let app = app.clone();
+            async move {
+                call(
+                    app,
+                    "POST",
+                    "/identity/import",
+                    Some(json!({"nickname": "r4", "ncryptsec": text, "backup_password": pw})),
+                )
+                .await
+            }
+        };
+        for bad in [
+            "hello".to_owned(),
+            String::new(),
+            format!("{spec}\n"),
+            format!("{spec}\nsecond"),
+            format!("{spec} "),
+            format!("ncryptsec1{}", "q".repeat(5000)),
         ] {
-            let (s, b) = import_call(app.clone(), "r4", path, "backup-pass-1", false).await;
-            assert!(s.is_client_error(), "{path:?} {b:?}");
-            assert_eq!(b["error"], expect, "{path:?}");
+            let (s, b) = post_text(bad.clone(), "backup-pass-1").await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad:?} {b:?}");
+            assert_eq!(b["error"], "invalid_key", "{bad:?}");
         }
+        // the old `path` field is gone: unknown fields are refused
+        let (s, _) = call(
+            app.clone(),
+            "POST",
+            "/identity/import",
+            Some(json!({"nickname": "r4", "path": "/tmp/x", "ncryptsec": spec, "backup_password": "backup-pass-1"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
         for bad in ["", "two\nlines", "cr\rhere", "nul\u{0}here"] {
-            let (s, b) = import_call(app.clone(), "r4", &good, bad, false).await;
+            let (s, b) = post_text(spec.to_owned(), bad).await;
             assert_eq!(s, StatusCode::BAD_REQUEST, "{bad:?} {b:?}");
         }
-        let (s, _) = import_call(app, "r4", Path::new("relative"), "x", false).await;
-        assert_eq!(s, StatusCode::BAD_REQUEST);
         assert!(fake.calls().is_empty());
     }
 
@@ -2846,6 +2950,79 @@ echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2
         let (status, body) = call(router(state), "GET", "/relay", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["data"]["configured"], true);
+    }
+
+    #[tokio::test]
+    async fn relay_urls_are_ascii_wss_or_loopback_ws_without_userinfo_query_or_fragment() {
+        for ok in [
+            "wss://relay.example",
+            "wss://relay.example:443/path",
+            "ws://localhost:7777",
+            "ws://127.0.0.1",
+            "ws://127.9.9.9:80/x",
+            "ws://[::1]:8080",
+            "wss://x.example/path@tag",
+            "wss://[2001:db8::1]:443/x",
+            "wss://relay.example:65535",
+            &format!("wss://{}", "a".repeat(250)),
+        ] {
+            assert!(check_relay_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "ws://relay.example",
+            "ws://10.0.0.1",
+            "ws://128.0.0.1",
+            "ws://localhost.evil.example",
+            "ws://[::1]evil",
+            "ws://localhost:evil",
+            "ws://localhost:",
+            "ws://localhost:0",
+            "wss://relay.example:65536",
+            "wss://relay.example:123456",
+            "wss://[::1",
+            "wss://[zz]:80",
+            "wss://[::1]:80x",
+            "wss://.relay.example",
+            "wss://re_lay.example",
+            "wss://re%6Cay.example",
+            "https://relay.example",
+            "relay.example",
+            "wss://",
+            "wss:///path",
+            "wss://\u{0440}elay.example", // Cyrillic er: homoglyph host
+            "wss://relay.example/\u{202E}gpj", // RLO
+            "wss://relay\u{200B}.example", // zero-width space
+            "wss://relay.example/#frag",
+            "wss://relay.example/?q=1",
+            "wss://user@relay.example",
+            "wss://user:pw@relay.example",
+            "wss://relay.example /x",
+            "wss://relay.example\n",
+            &format!("wss://{}", "a".repeat(251)),
+            "",
+        ] {
+            assert!(
+                matches!(check_relay_url(bad), Err(CommError::Invalid(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_set_rejects_a_bad_url_before_running_hyphae() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(tmp.path());
+        let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
+        let (status, body) = call(
+            router(state),
+            "PUT",
+            "/relay",
+            Some(json!({"relays": ["wss://ok.example", "ws://evil.example"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid");
+        assert!(fake.calls().is_empty());
     }
 
     #[tokio::test]

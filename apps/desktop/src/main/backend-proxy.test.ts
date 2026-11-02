@@ -69,14 +69,15 @@ describe('A1 findAllowedRoute', () => {
   })
   it('allows the exact HY-2 setup methods through the proxy', () => {
     for (const [method, route] of [
-      ['POST', 'identity'], ['POST', 'import'], ['PUT', 'relay'], ['POST', 'relay/probe'],
+      ['POST', 'identity'], ['POST', 'relay/probe'], ['GET', 'relay'],
     ]) expect(isAllowedProxyRoute(method, `/api/v1/comm/${route}`)).toBe(true)
     expect(isAllowedProxyRoute('DELETE', '/api/v1/comm/identity')).toBe(false)
   })
-  it('keeps the Elevated comm writes (contact add, send, key export) off the proxy; history stays', () => {
-    for (const route of ['contact', 'send', 'identity/export']) {
+  it('keeps the Elevated comm writes (contact add, send, key export/restore, home import, unlock) off the proxy; history stays', () => {
+    for (const route of ['contact', 'send', 'identity/export', 'identity/import', 'import', 'unlock']) {
       expect(isAllowedProxyRoute('POST', `/api/v1/comm/${route}`), route).toBe(false)
     }
+    expect(isAllowedProxyRoute('PUT', '/api/v1/comm/relay')).toBe(false)
     expect(isAllowedProxyRoute('GET', '/api/v1/comm/history?limit=20')).toBe(true)
   })
   it('gives chat a longer deadline than the default', () => {
