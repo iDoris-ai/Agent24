@@ -2041,6 +2041,30 @@ pub async fn serve(
             (String::new(), Some(store), bearer)
         }
     };
+    // CORE-5 5f-3: a marker or an unfinished upgrade docks here, before any
+    // store, task or listener of the business daemon exists. `ENABLED` is
+    // false, so this is skipped and startup is exactly the code below.
+    if !ephemeral
+        && let Some(dir) = agent24_protocol::state_file::state_dir()
+        && let Some(docking) =
+            crate::docked_startup::pre_start(crate::docked_startup::guard_enabled(), &dir).await
+    {
+        let launch = crate::docked_startup::Launch {
+            data_dir: &dir,
+            port,
+            auth_mode,
+            enroll: mode != StartupMode::Legacy,
+            generation: daemon_generation,
+            capabilities: capability_store,
+            ready: match host_ready.take() {
+                Some(writer) => crate::docked_startup::ReadyOut::Host(writer),
+                None => crate::docked_startup::ReadyOut::Stdout,
+            },
+            shutdown,
+            lock: _singleton,
+        };
+        return crate::docked_startup::serve_docked(launch, docking).await;
+    }
     // Store: file-backed under ~/.agent24 (ephemeral instances get :memory:)
     let store = if ephemeral {
         Store::open_memory().await.map_err(std::io::Error::other)?
