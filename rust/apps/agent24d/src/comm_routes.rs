@@ -71,11 +71,14 @@ pub struct CommDaemonSlot(
     Mutex<Option<Rejection>>,
 );
 
-/// Why the last attempt to bring Hyphae up refused the binary it found. A stable,
-/// path-free code: `GET /api/v1/components` (host view) shows it as the Hyphae item's
-/// `reason` with state `failed`, and `GET /api/v1/comm/daemon` as `data.rejection`.
-/// Cleared by the next attempt that does not reject a binary (a successful start, or
-/// nothing installed at all), so it never outlives the file it describes.
+/// Why the last build of the comm state (daemon start, or the rebuild after a host
+/// install) refused the binary it found. A stable, path-free code:
+/// `GET /api/v1/components` (host view) shows it as the Hyphae item's `reason` with
+/// state `failed`, and `GET /api/v1/comm/daemon` as `data.rejection`. Set and cleared
+/// only by those builds: the next one that does not refuse a binary (a successful
+/// start, or nothing installed) clears it. Fixing the file on disk is therefore seen at
+/// the next start or install, not before; an install that fails before its rebuild
+/// leaves it as it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Rejection {
