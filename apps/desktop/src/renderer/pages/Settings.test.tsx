@@ -5,6 +5,7 @@ import { useState, type ReactNode } from 'react'
 import SettingsPage, { SETTINGS_TABS, SETTINGS_TAB_STORAGE_KEY } from './Settings'
 import { settingsMessages } from './Settings.i18n'
 import { setLocale } from '../i18n'
+import { CapabilitiesProvider, useCapabilityRoute } from '../capabilities/providers'
 import { CapabilitiesContext, NavPrefsContext, type CapabilityDef, type NavPrefs } from '../capabilities/types'
 import { CAPABILITIES, withDynamicCapabilities } from '../capabilities/registry'
 
@@ -532,6 +533,56 @@ describe('Settings sidebar prefs', () => {
     await renderPrefs({ pinned: [], slotCount: 3, showOverview: true }, (next) => applyStore(next))
     expect(screen.getByText('Nothing is pinned. Pin capabilities from Capabilities.')).toBeInTheDocument()
     expect(screen.queryByRole('listitem')).not.toBeInTheDocument()
+  })
+
+  it('shows pinned usage and opens Capabilities from the slot shortcut', async () => {
+    setLocale('en')
+    installAgent({ backendProxy: vi.fn().mockResolvedValue({ ok: false }) })
+    function RouteProbe() {
+      const { route } = useCapabilityRoute()
+      return <output aria-label="Route">{route.kind === 'page' ? route.page : route.id}</output>
+    }
+    function Harness({ initial }: { initial: NavPrefs }) {
+      return (
+        <CapabilitiesProvider>
+          <PrefsHarness initial={initial} apply={(next) => applyStore(next)}>
+            <SettingsPage />
+            <RouteProbe />
+          </PrefsHarness>
+        </CapabilitiesProvider>
+      )
+    }
+    const room: NavPrefs = { pinned: ['documents'], slotCount: 4, showOverview: true }
+    const full: NavPrefs = { pinned: ['documents', 'design', 'create'], slotCount: 3, showOverview: true }
+    try {
+      await act(async () => { render(<Harness initial={room} />) })
+      expect(screen.getByText(/Pinned 1 \/ 4\./)).toBeInTheDocument()
+      const openLink = screen.getByRole('link', { name: 'Choose what to pin in Capabilities →' })
+      expect(openLink).toHaveClass('is-open')
+      expect(openLink).not.toHaveClass('is-quiet')
+      fireEvent.click(openLink)
+      expect(screen.getByLabelText('Route')).toHaveTextContent('capabilities')
+
+      cleanup()
+      await act(async () => { render(<Harness initial={full} />) })
+      expect(screen.getByText(/Pinned 3 \/ 3\./)).toBeInTheDocument()
+      const quiet = screen.getByRole('link', { name: 'Choose what to pin in Capabilities →' })
+      expect(quiet).toHaveClass('is-quiet')
+      expect(quiet).not.toHaveClass('is-open')
+      fireEvent.click(quiet)
+      expect(screen.getByLabelText('Route')).toHaveTextContent('capabilities')
+
+      cleanup()
+      await act(async () => { render(<Harness initial={room} />) })
+      await act(async () => { setLocale('zh') })
+      expect(screen.getByText(/已钉选 1 \/ 4 个。/)).toBeInTheDocument()
+      expect(screen.getByRole('link', { name: '去能力中心选择要钉选的能力 →' })).toBeInTheDocument()
+      await act(async () => { setLocale('th') })
+      expect(screen.getByText(/ปักหมุดแล้ว 1 \/ 4 รายการ/)).toBeInTheDocument()
+      expect(screen.getByRole('link', { name: 'ไปเลือกความสามารถที่จะปักหมุด →' })).toBeInTheDocument()
+    } finally {
+      act(() => { setLocale('en') })
+    }
   })
 })
 

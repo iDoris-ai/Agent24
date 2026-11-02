@@ -76,6 +76,29 @@ describe('capability routing', () => {
     expect(screen.getByLabelText('Route')).toHaveTextContent(JSON.stringify({ kind: 'page', page: 'capabilities' }))
   })
 
+  it('opens the pinned-slots row from the capabilities slots-full link', () => {
+    const scroll = vi.spyOn(HTMLElement.prototype, 'scrollIntoView').mockImplementation(() => {})
+    function Pages() {
+      const { open } = useContext(CapabilitiesContext)
+      return <>
+        <CapabilitiesPage onOpenSettings={() => open('settings/general', 'capabilities')} />
+        <SidebarPrefs />
+      </>
+    }
+    window.agent24 = { backendProxy: vi.fn().mockResolvedValue({ ok: false }) } as unknown as Window['agent24']
+    try {
+      render(<CapabilitiesProvider><Pages /></CapabilitiesProvider>)
+      expect(screen.getByText(/All sidebar slots are in use/)).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('link', { name: 'Settings › General' }))
+      const row = document.getElementById('settings-pinned-slots')
+      expect(row).toHaveClass('is-target')
+      expect(row?.contains(screen.getByTestId('slot-count'))).toBe(true)
+      expect(scroll).toHaveBeenCalled()
+    } finally {
+      scroll.mockRestore()
+    }
+  })
+
   it('polls manifests through backendProxy, lists dynamic UI in domainOs and never auto-pins it', async () => {
     const backendProxy = vi.fn().mockImplementation(({ path }: { path: string }) => Promise.resolve({ ok: true, data:
       path === '/api/modules' ? [{ id: 'hello', type: 'ui', enabled: true, name: 'Hello' }] : { approvals: [{}, {}] },

@@ -7,7 +7,7 @@ import { CAPABILITIES, withDynamicCapabilities } from './registry'
 import { useT } from '../i18n'
 import { settingsMessages } from '../pages/Settings.i18n'
 
-type Route = { kind: 'page'; page: string; initialTab?: 'general' | 'activity'; key?: number } | { kind: 'capability'; id: CapabilityId; origin: OpenOrigin }
+type Route = { kind: 'page'; page: string; initialTab?: 'general' | 'activity'; key?: number; focus?: 'slots' } | { kind: 'capability'; id: CapabilityId; origin: OpenOrigin }
 const RouteContext = createContext<{ route: Route; navigate: (page: string) => void }>({
   route: { kind: 'page', page: 'home' }, navigate: () => {},
 })
@@ -21,7 +21,9 @@ export function CapabilitiesProvider({ children }: { children: ReactNode }) {
   const navigate = useCallback((page: string) => setRoute({ kind: 'page', page }), [])
   const open = useCallback((id: CapabilityId, origin: OpenOrigin) => {
     if (id === 'settings/general' || id === 'settings/activity') {
-      setRoute({ kind: 'page', page: 'settings', initialTab: id === 'settings/general' ? 'general' : 'activity', key: ++settingsVisit.current })
+      // The capabilities slots-full banner asks for the pinned-slots row, not the top of General.
+      const focus = id === 'settings/general' && origin === 'capabilities' ? 'slots' as const : undefined
+      setRoute({ kind: 'page', page: 'settings', initialTab: id === 'settings/general' ? 'general' : 'activity', key: ++settingsVisit.current, ...(focus ? { focus } : {}) })
     } else if (id === 'capabilities') {
       setRoute({ kind: 'page', page: 'capabilities' })
     } else if (defs.some(d => d.id === id)) setRoute({ kind: 'capability', id, origin })
