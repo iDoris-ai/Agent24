@@ -255,6 +255,11 @@ mod tests {
 
     #[test]
     fn embedded_lock_is_the_signed_v0_30_0_release() {
+        // Byte-for-byte the published release file (ADR-038 §7.4).
+        assert_eq!(
+            agent24_comm::binary::sha256_of(HYPHAE_LOCK_JSON.as_bytes()).to_hex(),
+            "55c4d493dacf60ecbfc4f42571aa5f140ab80c30dad4013acf6340eab8e2e1cf"
+        );
         let lock = HyphaeLock::embedded().unwrap();
         let c = lock.component();
         assert_eq!(c.schema, 2);
@@ -358,6 +363,13 @@ mod tests {
             ],
             "Linux never reaches the verifier; macOS asks Gatekeeper only at install"
         );
+        // A lock cannot switch notarization off for macOS.
+        let mut lax = lock.clone();
+        lax.component_mut().signing.as_mut().unwrap().notarized = false;
+        assert!(matches!(
+            verify_signature(&lax, "darwin-arm64", path, &verifier, VerifyMode::Install).await,
+            Err(SignError::ManifestViolation(_))
+        ));
         // A macOS asset whose lock lost `signing` is refused, not treated as unsigned.
         let mut unsigned = lock.clone();
         unsigned.component_mut().signing = None;

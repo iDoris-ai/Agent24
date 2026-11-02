@@ -319,6 +319,11 @@ export default function CommunicationPage() {
           // A rejected password is retried inside main's window; reaching here
           // means the keystore could not be unlocked for another reason.
         }
+        // The bytes matched the lock but D2a did not pass; usually an offline notarization check.
+        if (action === 'install' && code === 'hyphae_signature_rejected') {
+          setActionError(t('error.signatureRejected'))
+          return
+        }
         const knownCodes = ['binary_rejected', 'not_configured', 'locked', 'password_rejected', 'keychain_unavailable']
         const reason = typeof code === 'string' && knownCodes.includes(code)
           ? t('error.reasonPrefix', { code, reason: reasonLabel(code) }) : ''

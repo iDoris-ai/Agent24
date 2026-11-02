@@ -34,8 +34,8 @@ pub struct SigningRequirement<'a> {
 
 /// What D2a demands of `platform`'s executables in `mode`, decided from the lock alone.
 ///
-/// - `darwin-*`: always `Some`. A lock without `signing` (or with a malformed Team ID)
-///   is refused, never treated as unsigned. Notarization is asked for only in
+/// - `darwin-*`: always `Some`. A lock without `signing`, with a malformed Team ID or
+///   with `notarized: false` is refused, never treated as weaker. Notarization is asked for only in
 ///   [`VerifyMode::Install`]; [`VerifyMode::AtRest`] stays offline.
 /// - every other platform: `None`, meaning *this platform has no system signature*
 ///   and the sha256 from the lock (plus the reproducible-build CI) is the whole check.
@@ -57,10 +57,17 @@ pub fn signing_requirement<'a>(
             "invalid signing team".into(),
         ));
     }
+    // Notarization is not the lock's to waive: every macOS asset we install must be
+    // notarized, so `notarized: false` makes the lock unusable rather than weaker.
+    if !signing.notarized {
+        return Err(InstallError::ManifestViolation(
+            "macOS assets must be notarized (signing.notarized=false)".into(),
+        ));
+    }
     Ok(Some(SigningRequirement {
         team_id: &signing.macos_team_id,
         // Only an install-time check may reach out to Gatekeeper.
-        notarized: signing.notarized && mode == VerifyMode::Install,
+        notarized: mode == VerifyMode::Install,
     }))
 }
 

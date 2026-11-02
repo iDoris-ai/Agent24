@@ -450,6 +450,20 @@ fn signing_requirement_is_decided_by_platform_and_mode() {
                 .is_none()
         );
     }
+    // The lock cannot waive notarization.
+    lock.signing.as_mut().unwrap().notarized = false;
+    for mode in [VerifyMode::Install, VerifyMode::AtRest] {
+        assert!(matches!(
+            signing_requirement(&lock, "darwin-arm64", mode),
+            Err(InstallError::ManifestViolation(_))
+        ));
+    }
+    assert!(
+        signing_requirement(&lock, "linux-x64", VerifyMode::Install)
+            .unwrap()
+            .is_none()
+    );
+    lock.signing.as_mut().unwrap().notarized = true;
     lock.signing.as_mut().unwrap().macos_team_id = "bad\"team".into();
     assert!(matches!(
         signing_requirement(&lock, "darwin-arm64", VerifyMode::AtRest),

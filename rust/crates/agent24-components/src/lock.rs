@@ -350,7 +350,7 @@ pub const TEST_LOCK: &str = r#"{
       "executables": ["demo"]
     }
   },
-  "signing": { "macos_team_id": "HYAP444FN9", "notarized": false },
+  "signing": { "macos_team_id": "HYAP444FN9", "notarized": true },
   "provides": [
     { "id": "demo-cap",
       "name": { "zh": "演示", "en": "Demo", "th": "สาธิต" },

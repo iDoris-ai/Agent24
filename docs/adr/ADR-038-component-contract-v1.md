@@ -433,3 +433,8 @@ D4 原文写「退出码只区分 0、1、2」，这和 Hyphae 现有的语义�
 - D2 订正两处，均为对已发布锁的兼容，不放宽安全判定：`provides[].name` / `summary` 改为可选（Hyphae 的锁只带 id）；`contract.tested` 与契约检查接受 `major.minor`（§7.2 CLI 的 `contract_version` 格式）和 `major.minor.patch` 两种写法。
 - 验签点：安装（含重装已存在的副本）走 `VerifyMode::Install`；agent24d 每次构建 comm 状态（启动、安装后热重建）对实际执行的那份副本走 `VerifyMode::AtRest`。`GET /comm/daemon` 的状态复查只做 sha256，不跑 codesign（每次轮询起子进程不划算；sha256 等于锁里签名后的摘要已蕴含签名字节未变）。Linux 返回显式的 `UnsignedPlatform`。
 - `stop_grace_ms`（15000）暂未接线：Hyphae 守护进程的停止宽限仍用全局 `lifecycle::Params::stop_grace`，因为 agent24d 的关停总预算按全局值算，单组件更长的宽限会被总预算截断。留待 D5 生命周期统一时按组件接入（iDoris 锁的同名字段同样未用）。
+- 契约错误码：验签失败单独报 422 `hyphae_signature_rejected`，不再混进 `hyphae_hash_mismatch`（后者只表示字节与锁的 SHA-256 不符）。`NotNotarized` 和验签工具的 I/O 错误（含 spctl 超时）提示「验证公证需要联网」。安装接口只回固定文本，不带工具 stderr 和路径，完整错误只写 daemon 日志。
+- `signing.notarized` 不能由锁关掉：macOS 资产的锁写 `notarized: false` 时，`signing_requirement` 直接以 `ManifestViolation` 拒绝（安装和启动都一样），不会降级成只验团队签名。
+- **信任假设（r5，评审 M1 / L3）**：
+  - (a) 签名资产与可复现构建的关系。CI 只证明 `reproducible.unsigned_sha256` 能从 `source.commit` 按配方复现。「锁里的签名资产 = 这份构建重新签名」这一点 CI 不证明，靠的是 Developer ID 签名（只有持有 HYAP444FN9 凭据的人能签）加 Apple 公证。后续可以补一道比对：把签名资产 `codesign --remove-signature` 后，比较各段和 code-page 哈希（`codesign -d --hash-sha256` / CodeDirectory 的页哈希）与未签名构建一致，从而把两者在 CI 里连起来。
+  - (b) 威胁模型不含同 uid 攻击者。校验是按路径进行的（先打开文件算 sha256、再按同一路径跑 codesign 和 exec），校验与执行之间存在 path-vs-fd 的 TOCTOU 窗口；能以同一用户身份改写 `~/.agent24` 的进程本来就能直接篡改 agent24d 自身，不在 v1 防护范围内。现有缓解：已发布的 Hyphae 副本是 0500（只有属主可读可执行、任何人不可写，由 `VerifiedBinary` 写入后 chmod），下载缓存根是 0700 且属主必须是当前用户；每次启动都重算 sha256。这些只防误改和其它 uid，不防同 uid 的有意竞态。

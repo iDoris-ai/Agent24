@@ -3683,7 +3683,7 @@ export interface components {
          * @description Closed set (COMM-HYPHAE.md section 4).
          * @enum {string}
          */
-        CommErrorCode: "hyphae_unsupported_platform" | "hyphae_download_failed" | "hyphae_hash_mismatch" | "binary_rejected" | "unsupported_platform" | "locked" | "not_configured" | "invalid" | "not_found" | "confirm_required" | "conflict" | "network" | "partial" | "timeout" | "upstream" | "hyphae_too_old" | "bad_backup_password" | "invalid_key" | "nickname_exists" | "keystore_locked" | "nickname_too_long" | "still_terminating" | "filesystem_unsupported" | "permission_denied" | "publish_conflict";
+        CommErrorCode: "hyphae_unsupported_platform" | "hyphae_download_failed" | "hyphae_hash_mismatch" | "hyphae_signature_rejected" | "binary_rejected" | "unsupported_platform" | "locked" | "not_configured" | "invalid" | "not_found" | "confirm_required" | "conflict" | "network" | "partial" | "timeout" | "upstream" | "hyphae_too_old" | "bad_backup_password" | "invalid_key" | "nickname_exists" | "keystore_locked" | "nickname_too_long" | "still_terminating" | "filesystem_unsupported" | "permission_denied" | "publish_conflict";
         /** @description Hyphae's own failure envelope shape, NOT the kernel `Error`: comm routes answer `{ok:false,error,message,data?}`. */
         CommError: {
             /** @constant */
@@ -7435,7 +7435,7 @@ export interface operations {
                     "application/json": components["schemas"]["CommError"];
                 };
             };
-            /** @description hyphae_hash_mismatch (downloaded or installed bytes rejected — SHA-256 against the lock, or on macOS the Developer ID / Hardened Runtime / notarization check) */
+            /** @description hyphae_hash_mismatch (downloaded or installed bytes do not match the lock's SHA-256), or hyphae_signature_rejected (macOS: the bytes match but the Developer ID / Hardened Runtime / notarization check failed; notarization is an online check, so offline is the usual cause). Messages are fixed texts without paths or tool output. */
             422: {
                 headers: {
                     [name: string]: unknown;

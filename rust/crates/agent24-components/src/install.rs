@@ -1147,18 +1147,15 @@ mod tests {
             VerifyMode::AtRest,
         )
         .unwrap();
-        // A lock that is not notarized never asks, in either mode.
+        // A lock cannot waive notarization: `notarized: false` is refused in both modes.
         lock.signing.as_mut().unwrap().notarized = false;
         let asset = &lock.assets["darwin-arm64"];
-        verify_signatures(
-            dir,
-            &lock,
-            "darwin-arm64",
-            asset,
-            &Offline,
-            VerifyMode::Install,
-        )
-        .unwrap();
+        for mode in [VerifyMode::Install, VerifyMode::AtRest] {
+            assert!(matches!(
+                verify_signatures(dir, &lock, "darwin-arm64", asset, &Offline, mode),
+                Err(InstallError::ManifestViolation(_))
+            ));
+        }
     }
 
     #[test]

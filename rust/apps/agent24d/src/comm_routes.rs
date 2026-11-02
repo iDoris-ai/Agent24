@@ -566,26 +566,140 @@ fn install_failure(message: String) -> (StatusCode, Json<Value>) {
     )
 }
 
+/// Notarization (`spctl --type install`) is an online Gatekeeper lookup for a bare,
+/// unstapled Mach-O: a "not notarized" verdict on an offline machine is the usual cause.
+const NEEDS_NETWORK: &str = "Hyphae's notarization could not be confirmed: verifying \
+     notarization needs internet access. Connect to the internet and install again.";
+
+/// Map an installation failure to a stable code and a fixed, path-free message.
+///
+/// `POST /comm/install` is host-only (ProductHost / legacy token; FirstPartyShell
+/// tokens cannot elevate it and Creative is excluded), but the host UI still gets no
+/// raw tool output: codesign stderr and I/O errors can carry absolute paths with the
+/// user name. The full error goes to the daemon log only.
 fn install_error(error: InstallError) -> (StatusCode, Json<Value>) {
-    let (status, code) = match &error {
-        InstallError::Download(DownloadError::UnsupportedPlatform) => {
-            (StatusCode::CONFLICT, "hyphae_unsupported_platform")
-        }
-        // The bytes were rejected: by SHA-256, or (macOS) by the D2a signature check.
+    use std::borrow::Cow;
+    let (status, code, message): (StatusCode, &str, Cow<'static, str>) = match &error {
+        InstallError::Download(DownloadError::UnsupportedPlatform) => (
+            StatusCode::CONFLICT,
+            "hyphae_unsupported_platform",
+            "Hyphae has no pinned release for this platform".into(),
+        ),
         InstallError::Download(DownloadError::HashMismatch)
-        | InstallError::Binary(agent24_comm::BinaryError::HashMismatch { .. })
-        | InstallError::Signature(
-            SignError::SignatureMismatch
-            | SignError::HardenedRuntimeMissing
-            | SignError::NotNotarized
-            | SignError::ManifestViolation(_),
-        ) => (StatusCode::UNPROCESSABLE_ENTITY, "hyphae_hash_mismatch"),
-        _ => (StatusCode::BAD_GATEWAY, "hyphae_download_failed"),
+        | InstallError::Binary(agent24_comm::BinaryError::HashMismatch { .. }) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "hyphae_hash_mismatch",
+            "the Hyphae binary does not match the pinned SHA-256".into(),
+        ),
+        // D2a: the bytes matched the lock, but Gatekeeper's verdict could not be had or
+        // was negative; offline is the common case (and a spctl deadline is offline too).
+        InstallError::Signature(SignError::NotNotarized | SignError::Io(_)) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "hyphae_signature_rejected",
+            NEEDS_NETWORK.into(),
+        ),
+        InstallError::Signature(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "hyphae_signature_rejected",
+            "the Hyphae binary's code signature does not match the pinned Developer ID; it was \
+             not installed"
+                .into(),
+        ),
+        // Static, path-free reasons are kept; everything else gets a fixed text.
+        InstallError::Download(DownloadError::Network(why)) => (
+            StatusCode::BAD_GATEWAY,
+            "hyphae_download_failed",
+            format!("Hyphae download failed: {why}").into(),
+        ),
+        InstallError::Download(DownloadError::Cancelled) => (
+            StatusCode::BAD_GATEWAY,
+            "hyphae_download_failed",
+            "Hyphae download was cancelled".into(),
+        ),
+        InstallError::Download(DownloadError::Redirect(_)) => (
+            StatusCode::BAD_GATEWAY,
+            "hyphae_download_failed",
+            "Hyphae download was redirected outside the allowed release hosts".into(),
+        ),
+        _ => (
+            StatusCode::BAD_GATEWAY,
+            "hyphae_download_failed",
+            "Hyphae download or installation failed; see the agent24d log".into(),
+        ),
     };
+    tracing::warn!(code, error = %error, "comm: Hyphae installation failed");
     (
         status,
-        Json(json!({"ok": false, "error": code, "message": error.to_string()})),
+        Json(json!({"ok": false, "error": code, "message": message})),
     )
+}
+
+#[cfg(test)]
+mod install_error_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn map(error: InstallError) -> (StatusCode, String, String) {
+        let (status, Json(body)) = install_error(error);
+        (
+            status,
+            body["error"].as_str().unwrap().to_owned(),
+            body["message"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    #[test]
+    fn signature_failures_have_their_own_code_and_offline_says_so() {
+        for offline in [
+            SignError::NotNotarized,
+            SignError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "/usr/sbin/spctl did not finish within 60s",
+            )),
+        ] {
+            let (status, code, message) = map(InstallError::Signature(offline));
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(code, "hyphae_signature_rejected");
+            assert!(message.contains("needs internet access"), "{message}");
+        }
+        for rejected in [
+            SignError::SignatureMismatch,
+            SignError::HardenedRuntimeMissing,
+            SignError::ManifestViolation("notarization not required".into()),
+        ] {
+            let (status, code, message) = map(InstallError::Signature(rejected));
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(code, "hyphae_signature_rejected");
+            assert!(!message.contains("internet"), "{message}");
+        }
+        // A real digest mismatch keeps its own code.
+        let (_, code, _) = map(InstallError::Download(DownloadError::HashMismatch));
+        assert_eq!(code, "hyphae_hash_mismatch");
+    }
+
+    #[test]
+    fn messages_never_carry_tool_output_or_paths() {
+        let leaky = "/Users/alice/Library/Agent24/components/hyphae/v0.30.0/hyphae-0123: \
+                     code object is not signed at all";
+        let cases = [
+            InstallError::Signature(SignError::SignatureCheckFailed(leaky.into())),
+            InstallError::Binary(agent24_comm::BinaryError::Missing(
+                "/Users/alice/secret/hyphae".into(),
+            )),
+            InstallError::Io(std::io::Error::other(leaky)),
+            InstallError::Download(DownloadError::Io(std::io::Error::other(leaky))),
+            InstallError::Download(DownloadError::Redirect(
+                "https://evil.invalid/Users/alice".into(),
+            )),
+        ];
+        for error in cases {
+            let (_, code, message) = map(error);
+            assert!(
+                !message.contains("/Users") && !message.contains("alice"),
+                "{code}: {message}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
