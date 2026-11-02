@@ -28,7 +28,7 @@ fn workspace_recovery_instant_at(
 
 // A shutdown's budgets and deadlines — the HTTP drain's fixed 1.5s, the
 // out-of-process modules' drain and stop grace (tunable: `A24_MODULE_DRAIN_MS`,
-// `A24_MODULE_STOP_GRACE_MS`), the time to put the summary on disk, and the
+// `A24_COMPONENT_STOP_GRACE_MS`), the time to put the summary on disk, and the
 // watchdog after all of them — live in `crate::lifecycle` (SHUT-1b). At the
 // defaults `kill -TERM` ends the process within 16.5s (ADR-038 D5 raised the stop grace to 15s; TASKS B2's 2s now holds only with a lowered grace).
 
@@ -56,6 +56,10 @@ pub struct AppState {
     pub router: Arc<ModelRouter>,
     pub idoris_host: Option<Arc<agent24d::idoris_host::IdorisHost>>,
     pub idoris_unavailable: bool,
+    /// Where the Hyphae daemon supervisor lives, once `serve` has one (`/api/v1/components`).
+    pub comm_slot: Option<Arc<crate::comm_routes::CommDaemonSlot>>,
+    /// What the desktop reported about the components it owns (ADR-038 D5).
+    pub component_reports: Arc<crate::component_routes::ComponentReports>,
     pub managed_idoris: Option<Arc<agent24d::managed_idoris::ManagedIdoris>>,
     pub tools: Arc<agent24_tools::ToolRegistry>,
     /// H2: the user's risk overrides. Held here as well as inside the registry
@@ -708,6 +712,8 @@ impl AppState {
             managed_idoris: None,
             idoris_host: None,
             idoris_unavailable: false,
+            comm_slot: None,
+            component_reports: Arc::default(),
             tools,
             broker,
             module_approval_broker,
@@ -1021,10 +1027,17 @@ async fn auth(State(state): State<AppState>, req: Request<Body>, next: Next) -> 
 /// it: it would let any local process produce a backup it can decrypt.
 fn host_only_route(method: &Method, path: &str) -> bool {
     method == Method::POST
-        && matches!(
+        && (matches!(
             path,
             "/api/v1/comm/identity/export" | "/api/v1/comm/identity/import"
-        )
+        ) || is_component_report(path))
+}
+
+/// `/api/v1/components/{id}/report`: the desktop's status push (ADR-038 D5).
+fn is_component_report(path: &str) -> bool {
+    path.strip_prefix("/api/v1/components/")
+        .and_then(|rest| rest.strip_suffix("/report"))
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
 /// Single shared token. Does not consult the route catalog or assurance levels,
@@ -1423,6 +1436,11 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
     }
     let kernel = Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/components", get(crate::component_routes::list))
+        .route(
+            "/api/v1/components/{id}/report",
+            post(crate::component_routes::report),
+        )
         .route("/api/v1/idoris/status", get(crate::idoris_routes::status))
         .route(
             "/api/v1/idoris/install",
@@ -3127,6 +3145,7 @@ pub async fn serve(
     // there was nothing to stop.
     let comm_router =
         crate::comm_routes::build(&state_dir, params.stop_grace, &comm_daemon_slot).await;
+    state.comm_slot = Some(Arc::clone(&comm_daemon_slot));
     if state.auth_mode == AuthMode::Capabilities {
         // Package modules register an ANY-method proxy for their namespace.
         // Bind that registered surface and the exact manifest, not enabled flags.

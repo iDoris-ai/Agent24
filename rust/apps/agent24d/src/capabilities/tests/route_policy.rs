@@ -192,6 +192,20 @@ fn section_3_rows_match_operation_and_level() {
         level: AssuranceLevel::Elevated,
     });
 
+    // ADR-038 C3 (the table is frozen; this extends it): component status and the desktop's
+    // report. Read is everyday for any audience but Creative; report is host-only at the route.
+    for (method, path, operation) in [
+        ("GET", "/components", "ComponentsRead"),
+        ("POST", "/components/{id}/report", "ComponentsReport"),
+    ] {
+        fixed.push(DesignRow {
+            method: method.into(),
+            path: path.into(),
+            operation: operation.into(),
+            level: AssuranceLevel::Everyday,
+        });
+    }
+
     let mut catalog = BTreeSet::new();
     for policy in policies() {
         assert!(

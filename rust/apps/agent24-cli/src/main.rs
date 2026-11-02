@@ -70,6 +70,12 @@ enum Command {
     },
     /// List models known to the daemon
     Models,
+    /// Lifecycle state of every component: iDoris, Hyphae, attached modules, Documents,
+    /// Knowledge, Open Design (ADR-038 D5)
+    Components {
+        #[command(subcommand)]
+        action: ComponentsAction,
+    },
     /// Install, run and connect managed iDoris through the daemon
     Idoris {
         #[command(subcommand)]
@@ -1273,6 +1279,67 @@ async fn cmd_chat(req: ChatRequest) -> Result<(), String> {
             }
             Err(format!("daemon returned {status}: {body}"))
         }
+        Err(e) => Err(e.to_string()),
+    };
+    finish(ep).await;
+    out
+}
+
+#[derive(Subcommand)]
+enum ComponentsAction {
+    /// One line per component: id, state, version and the capabilities it provides. A client
+    /// that is not the desktop sees the redacted view (no reasons, ports or paths).
+    List {
+        /// 原样输出完整 JSON 响应
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+fn component_lines(body: &serde_json::Value) -> Vec<String> {
+    body["components"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|c| {
+                    let provides: Vec<&str> = c["provides"]
+                        .as_array()
+                        .map(|p| p.iter().filter_map(|p| p["id"].as_str()).collect())
+                        .unwrap_or_default();
+                    format!(
+                        "{:<12} {:<12} {:<10} {}",
+                        c["id"].as_str().unwrap_or("?"),
+                        c["state"].as_str().unwrap_or("?"),
+                        c["version"].as_str().unwrap_or("-"),
+                        provides.join(",")
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn cmd_components(action: ComponentsAction) -> Result<(), String> {
+    let ComponentsAction::List { json } = action;
+    let ep = connect().await?;
+    let result = bearer(&ep, client().get(format!("{}/api/v1/components", ep.base)))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+    let out = match result {
+        Ok(res) if res.status().is_success() => {
+            let body: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+            if json {
+                println!("{body}");
+            } else {
+                for line in component_lines(&body) {
+                    println!("{line}");
+                }
+            }
+            Ok(())
+        }
+        Ok(res) => Err(format!("daemon returned {}", res.status())),
         Err(e) => Err(e.to_string()),
     };
     finish(ep).await;
@@ -3036,6 +3103,7 @@ async fn main() -> std::process::ExitCode {
         Command::Service { action } => cmd_service(action),
         Command::Tui => cmd_tui().await,
         Command::Os { action } => cmd_os(action).await,
+        Command::Components { action } => cmd_components(action).await,
         Command::Documents { action } => documents::cmd_documents(action).await,
         Command::Comm { action, json } => cmd_comm(action, json).await,
         Command::ModuleConsents { action } => module_tools::run(action).await,
@@ -3076,6 +3144,20 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn components_list_prints_id_state_version_and_capabilities() {
+        let body = serde_json::json!({"components": [
+            {"id": "hyphae", "state": "ready", "version": "v0.28.1",
+             "provides": [{"id": "nostr-dm"}, {"id": "nostr-group"}]},
+            {"id": "open-design", "state": "absent", "version": null, "provides": []},
+        ]});
+        let lines = component_lines(&body);
+        assert!(lines[0].starts_with("hyphae") && lines[0].ends_with("nostr-dm,nostr-group"));
+        assert!(lines[0].contains(" ready ") && lines[0].contains("v0.28.1"));
+        assert!(lines[1].contains(" absent ") && lines[1].contains(" - "));
+        assert!(component_lines(&serde_json::json!({})).is_empty());
+    }
 
     /// No HOME, no store to reach: the command stands (ADR-K1-03 §3, review
     /// G3; the `A24_OS_PACKAGES` install the CLI documents for containers),

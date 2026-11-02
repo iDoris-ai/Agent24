@@ -36,6 +36,13 @@ mod restart_policy;
 pub mod router;
 pub mod runner;
 
+/// What Agent24 expects of the Hyphae CLI contract until C1b's schema-2 lock can carry a
+/// `contract` field (ADR-038 §7.4). Remove with the lock transition.
+pub const HYPHAE_CONTRACT: (&str, u64, u64) = ("hyphae-cli", 1, 0);
+/// The capability ids Hyphae provides, as agreed with Hyphae (ADR-038 D9). Until
+/// `docs/capabilities/REGISTRY.md` exists these are the registry; C1b moves them into the lock.
+pub const HYPHAE_PROVIDES: [&str; 4] = ["nostr-dm", "nostr-group", "nostr-identity", "nostr-relay"];
+
 pub use binary::{BinaryError, HyphaeLock, Sha256Digest, VerifiedBinary, current_platform};
 pub use daemon::{
     CatchUpStatus, Ctx as DaemonCtx, DaemonShutdownOutcome, DaemonStartError, DaemonStatus,

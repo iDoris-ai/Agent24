@@ -405,6 +405,13 @@ impl KnowledgeHostRegistry {
         }
     }
 
+    /// Whether any host has any binding active (`/api/v1/components`).
+    pub fn any_active(&self) -> bool {
+        self.entries
+            .lock()
+            .is_ok_and(|entries| entries.values().any(|entry| entry.active))
+    }
+
     /// Whether `host` has `binding` active.
     // Consumed by run binding (PR-C) and the Provider (KB-C1-01).
     #[cfg_attr(not(test), allow(dead_code))]

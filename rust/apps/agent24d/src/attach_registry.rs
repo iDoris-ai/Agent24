@@ -702,6 +702,21 @@ impl AttachRegistry {
         }
     }
 
+    /// Every registered module as `(name, disabled, state of its last generation)`, for
+    /// `/api/v1/components`. In-memory only: nothing here reads `attached.json`.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<(String, bool, Option<DrainState>)> {
+        let state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        state
+            .entries
+            .iter()
+            .map(|(name, e)| {
+                let drain = e.last_generation.as_ref().map(|(_, g)| g.state());
+                (name.clone(), e.disabled, drain)
+            })
+            .collect()
+    }
+
     /// The `on_commit` hook for [`crate::attached::register`]/`revoke`/
     /// `set_disabled` — see [`Change`]'s own doc comment for why this runs
     /// inside THEIR file-lock critical section rather than being called
