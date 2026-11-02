@@ -3,7 +3,7 @@
 use crate::{
     download::{MAX_ARCHIVE_BYTES, VerifiedArchive, hash_matches},
     lock::{Asset, ComponentLock, clean_relative},
-    sign::{SignatureVerifier, SigningRequirement, VerifyMode},
+    sign::{SignatureVerifier, VerifyMode},
     storage::{open_regular, private_directory},
 };
 use flate2::read::MultiGzDecoder;
@@ -176,22 +176,9 @@ fn verify_signatures(
     signature: &dyn SignatureVerifier,
     mode: VerifyMode,
 ) -> Result<(), InstallError> {
-    if !platform.starts_with("darwin-") {
-        // Linux and others: sha256 plus reproducible-build data only (D2a).
+    // Linux and others: `None`, sha256 plus reproducible-build data only (D2a).
+    let Some(required) = crate::sign::signing_requirement(lock, platform, mode)? else {
         return Ok(());
-    }
-    // A macOS asset without a signing section is never installable (fail closed).
-    let signing = lock
-        .signing
-        .as_ref()
-        .ok_or_else(|| violation("unsigned macOS asset"))?;
-    if !crate::sign::valid_team_id(&signing.macos_team_id) {
-        return Err(violation("invalid signing team"));
-    }
-    let required = SigningRequirement {
-        team_id: &signing.macos_team_id,
-        // Only an install-time check may reach out to Gatekeeper.
-        notarized: signing.notarized && mode == VerifyMode::Install,
     };
     for executable in &asset.executables {
         signature.verify(&directory.join(executable), &required)?;
@@ -941,6 +928,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::lock::test_lock;
+    use crate::sign::SigningRequirement;
 
     struct AcceptSignature;
     impl SignatureVerifier for AcceptSignature {
@@ -1159,18 +1147,15 @@ mod tests {
             VerifyMode::AtRest,
         )
         .unwrap();
-        // A lock that is not notarized never asks, in either mode.
+        // A lock cannot waive notarization: `notarized: false` is refused in both modes.
         lock.signing.as_mut().unwrap().notarized = false;
         let asset = &lock.assets["darwin-arm64"];
-        verify_signatures(
-            dir,
-            &lock,
-            "darwin-arm64",
-            asset,
-            &Offline,
-            VerifyMode::Install,
-        )
-        .unwrap();
+        for mode in [VerifyMode::Install, VerifyMode::AtRest] {
+            assert!(matches!(
+                verify_signatures(dir, &lock, "darwin-arm64", asset, &Offline, mode),
+                Err(InstallError::ManifestViolation(_))
+            ));
+        }
     }
 
     #[test]

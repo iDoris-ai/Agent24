@@ -87,6 +87,7 @@ name = "agent24-comm"
 version = "0.6.0"
 dependencies = [
  "agent24-comm",
+ "agent24-components",
  "async-trait",
  "axum",
  "base64",

@@ -28,9 +28,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use agent24_comm::{
-    Envelope, ExitClass, HyphaeLock, HyphaeRunner, Invocation, Password, Sha256Digest,
-    current_platform,
+    Envelope, ExitClass, HyphaeRunner, Invocation, Password, Sha256Digest, current_platform,
 };
+use common::HyphaeLock;
 
 /// The Hyphae proposal's acceptance binary, as documented in
 /// COMM-HYPHAE.md's baseline (source `a4aa606eb81d...`, `hyphae version dev`).

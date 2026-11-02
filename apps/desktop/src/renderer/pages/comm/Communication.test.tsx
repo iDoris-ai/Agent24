@@ -99,6 +99,19 @@ describe('CommunicationPage', () => {
     expect(screen.getByText('Hyphae 已就绪，通信状态已刷新。')).toBeInTheDocument()
   })
 
+  it('explains a rejected signature (often offline notarization) instead of a raw message', async () => {
+    success()
+    for (const fn of [listCommIdentities, listCommContacts, listCommRelays]) {
+      vi.mocked(fn).mockRejectedValue(new CommApiError('no Hyphae binary is configured', 409, 'not_configured'))
+    }
+    vi.mocked(getCommStatus).mockResolvedValue({ ...status, installable: true, installed_version: null })
+    vi.mocked(installComm).mockRejectedValue(new CommApiError('raw daemon text', 422, 'hyphae_signature_rejected'))
+    render(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: '下载并设置' }))
+    expect(await screen.findByText(/验证公证需要联网/)).toBeInTheDocument()
+    expect(screen.queryByText(/raw daemon text/)).not.toBeInTheDocument()
+  })
+
   it('renders identities, contacts, relay source, and independent status dimensions', async () => {
     success()
     render(<CommunicationPage />)

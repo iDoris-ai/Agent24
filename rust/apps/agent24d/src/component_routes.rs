@@ -90,11 +90,16 @@ impl Item {
         f(&mut self);
         self
     }
-    fn ids(ids: &[&str]) -> Vec<Provide> {
-        ids.iter()
-            .map(|id| Provide {
-                id: (*id).to_owned(),
-                name: None,
+    /// D9 provides, straight from the component's lock (names only where it has them).
+    fn provides_of(lock: &agent24_components::ComponentLock) -> Vec<Provide> {
+        lock.provides
+            .iter()
+            .map(|p| Provide {
+                id: p.id.clone(),
+                name: p
+                    .name
+                    .as_ref()
+                    .map(|n| json!({"zh": n.zh, "en": n.en, "th": n.th})),
             })
             .collect()
     }
@@ -182,15 +187,7 @@ fn from_hyphae(process: &str) -> (ComponentState, Option<String>) {
 // ---- sources ---------------------------------------------------------------------------
 
 async fn idoris_item(state: &AppState) -> Item {
-    let lock = agent24_idoris::IdorisLock::embedded().to_component();
-    let provides = lock
-        .provides
-        .iter()
-        .map(|p| Provide {
-            id: p.id.clone(),
-            name: Some(json!({"zh": p.name.zh, "en": p.name.en, "th": p.name.th})),
-        })
-        .collect();
+    let provides = Item::provides_of(&agent24_idoris::IdorisLock::embedded().to_component());
     let item = Item::new("idoris", Form::Resident, ComponentState::Absent);
     let Some(host) = state.idoris_host.as_ref() else {
         return item.with(|i| {
@@ -228,12 +225,21 @@ async fn idoris_item(state: &AppState) -> Item {
 }
 
 fn hyphae_item(state: &AppState) -> Item {
-    let (contract, major, min_minor) = agent24_comm::HYPHAE_CONTRACT;
+    // C1b: contract and provides come from the embedded schema-2 lock (ADR-038 §7.4).
+    let lock = match crate::hyphae_install::HyphaeLock::embedded() {
+        Ok(lock) => lock,
+        Err(_) => {
+            return Item::new("hyphae", Form::Resident, ComponentState::Failed)
+                .with(|i| i.reason = Some("lock_invalid".into()));
+        }
+    };
+    let lock = lock.component();
     let item = Item::new("hyphae", Form::Resident, ComponentState::Absent).with(|i| {
-        i.provides = Item::ids(&agent24_comm::HYPHAE_PROVIDES);
-        // §7.4: until C1b's schema-2 lock carries `contract`, the expectation is code.
-        i.detail =
-            Some(json!({"contract": {"name": contract, "major": major, "min_minor": min_minor}}));
+        i.provides = Item::provides_of(lock);
+        i.detail = Some(json!({"contract": {
+            "name": lock.contract.name, "major": lock.contract.major,
+            "min_minor": lock.contract.min_minor,
+        }}));
     });
     let Some(daemon) = state.comm_slot.as_ref().and_then(|slot| slot.current()) else {
         return item;
@@ -242,9 +248,7 @@ fn hyphae_item(state: &AppState) -> Item {
     let (mapped, reason) = from_hyphae(process.state);
     item.with(|i| {
         i.state = mapped;
-        i.version = agent24_comm::release::HyphaeRelease::embedded()
-            .ok()
-            .map(|r| r.tag);
+        i.version = Some(lock.version.clone());
         i.reason = reason.or(process.reason);
         if let Some(Value::Object(d)) = i.detail.as_mut() {
             d.insert("generation".into(), json!(process.generation));

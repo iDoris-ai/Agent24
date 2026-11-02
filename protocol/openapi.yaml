@@ -3300,13 +3300,17 @@ paths:
                   data:
                     $ref: "#/components/schemas/CommInstallResult"
         "409":
-          description: hyphae_unsupported_platform (including null lock digests)
+          description: hyphae_unsupported_platform (the lock has no asset for this platform)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/CommError"
         "422":
-          description: hyphae_hash_mismatch (downloaded or installed bytes rejected)
+          description: >-
+            hyphae_hash_mismatch (downloaded or installed bytes do not match the lock's SHA-256), or
+            hyphae_signature_rejected (macOS: the bytes match but the Developer ID / Hardened Runtime /
+            notarization check failed; notarization is an online check, so offline is the usual cause).
+            Messages are fixed texts without paths or tool output.
           content:
             application/json:
               schema:
@@ -3325,8 +3329,8 @@ paths:
       summary: Hyphae daemon status (process, relay probe, catch-up)
       description: >-
         Always returns 200 when comm is not configured, with process.state not_configured.
-        data.installable indicates a platform with both release asset and non-null lock hash.
-        data.installed_version is the component tag (v0.29.0) after full hash revalidation,
+        data.installable indicates a platform the lock has an asset for.
+        data.installed_version is the component tag (v0.30.0) after full hash revalidation,
         or null when absent or rejected. Developer and sibling binaries do not count as installed components.
       responses:
         "200":
@@ -4686,7 +4690,7 @@ components:
       properties:
         installed_version:
           type: string
-          example: v0.29.0
+          example: v0.30.0
         path:
           type: string
           description: Absolute installed component path
@@ -7225,7 +7229,7 @@ components:
     CommErrorCode:
       type: string
       description: Closed set (COMM-HYPHAE.md section 4).
-      enum: [hyphae_unsupported_platform, hyphae_download_failed, hyphae_hash_mismatch, binary_rejected, unsupported_platform, locked, not_configured, invalid, not_found, confirm_required, conflict, network, partial, timeout, upstream, hyphae_too_old, bad_backup_password, invalid_key, nickname_exists, keystore_locked, nickname_too_long, still_terminating, filesystem_unsupported, permission_denied, publish_conflict]
+      enum: [hyphae_unsupported_platform, hyphae_download_failed, hyphae_hash_mismatch, hyphae_signature_rejected, binary_rejected, unsupported_platform, locked, not_configured, invalid, not_found, confirm_required, conflict, network, partial, timeout, upstream, hyphae_too_old, bad_backup_password, invalid_key, nickname_exists, keystore_locked, nickname_too_long, still_terminating, filesystem_unsupported, permission_denied, publish_conflict]
     CommError:
       type: object
       description: >-

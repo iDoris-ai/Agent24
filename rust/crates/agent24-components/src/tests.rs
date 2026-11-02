@@ -1,7 +1,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
 use sha2::{Digest, Sha256};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+use tokio_util::sync::CancellationToken;
 
 const URL: &str = "https://github.com/example/component/releases/download/v1/component.bin";
 const NAME: &str = "component.bin";
@@ -28,10 +32,12 @@ async fn fetch(
     options: &DownloadOptions,
     cancel: &CancellationToken,
 ) -> Result<VerifiedArchive, DownloadError> {
-    fetch_verified(
-        url,
-        &format!("{:x}", Sha256::digest(PAYLOAD)),
-        name,
+    download_pinned(
+        &PinnedAsset {
+            url: url.into(),
+            name: name.into(),
+            sha256: format!("{:x}", Sha256::digest(PAYLOAD)),
+        },
         cache,
         options,
         cancel,
@@ -80,23 +86,6 @@ async fn forwarding_cannot_widen_main_host_policy() {
             Err(DownloadError::Redirect(_))
         ));
     }
-}
-
-#[tokio::test]
-async fn forwarding_rejects_mismatched_url_and_cache_name() {
-    let root = tempfile::tempdir().unwrap();
-    assert!(matches!(
-        fetch(
-            URL,
-            "different.bin",
-            root.path(),
-            &DownloadOptions::default(),
-            &CancellationToken::new()
-        )
-        .await,
-        Err(DownloadError::Network(_))
-    ));
-    assert!(!root.path().join("different.bin.verified").exists());
 }
 
 #[tokio::test]

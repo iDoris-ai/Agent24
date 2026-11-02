@@ -1,7 +1,7 @@
 //! `ComponentLock` (ADR-038 D2, schema 2): the one lock format for every component that
 //! Agent24 downloads. Parsing is strict: unknown fields, other schema versions and
-//! structurally unsafe values are rejected. Schema 1 is readable only through
-//! [`ComponentLock::migrate_schema1`].
+//! structurally unsafe values are rejected. Schema 1 is not readable at all: every
+//! shipped lock (iDoris, Hyphae since C1b) is schema 2.
 
 use semver::Version;
 use serde::Deserialize;
@@ -93,8 +93,12 @@ pub struct Localized {
 #[serde(deny_unknown_fields)]
 pub struct Provides {
     pub id: String,
-    pub name: Localized,
-    pub summary: Localized,
+    /// Display text is optional: Hyphae's published lock carries ids only, and the
+    /// lock is copied byte for byte (ADR-038 §7.4), so a missing name is not invalid.
+    #[serde(default)]
+    pub name: Option<Localized>,
+    #[serde(default)]
+    pub summary: Option<Localized>,
     #[serde(default)]
     pub tools: Vec<String>,
 }
@@ -207,10 +211,8 @@ impl ComponentLock {
             "source.repo",
         )?;
         require(!self.contract.name.is_empty(), "contract.name")?;
-        let tested = Version::parse(&self.contract.tested)
-            .map_err(|_| LockError::Invalid("contract.tested"))?;
         require(
-            tested.major == self.contract.major && tested.minor >= self.contract.min_minor,
+            self.accepts_contract(&self.contract.tested),
             "contract.tested",
         )?;
         require(!self.assets.is_empty(), "assets")?;
@@ -304,97 +306,25 @@ impl ComponentLock {
     }
 
     /// Contract acceptance (D3): same major, minor at least `min_minor`.
+    /// Accepts both `major.minor` (CLI `contract_version`, ADR-038 §7.2) and a full
+    /// `major.minor.patch` semver (iDoris HTTP).
     pub fn accepts_contract(&self, version: &str) -> bool {
-        Version::parse(version)
-            .is_ok_and(|v| v.major == self.contract.major && v.minor >= self.contract.min_minor)
+        contract_version(version).is_some_and(|(major, minor)| {
+            major == self.contract.major && minor >= self.contract.min_minor
+        })
     }
+}
 
-    /// The only reader of schema-1 locks (iDoris shape). `id`, `provides` and
-    /// `requires` did not exist in schema 1, so the caller supplies them; nothing
-    /// else is guessed. No shipped lock is schema 1 any more (iDoris moved in C1b'),
-    /// so this survives only to test the migration; Hyphae's schema-1 lock is read by
-    /// agent24-comm. Delete it with its tests once C1b has moved Hyphae.
-    #[cfg(test)]
-    pub fn migrate_schema1(
-        json: &str,
-        id: &str,
-        contract_name: &str,
-        provides: Vec<Provides>,
-        requires: Requires,
-        executables: &[&str],
-    ) -> Result<Self, LockError> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct V1Asset {
-            name: String,
-            sha256: String,
-            files: Vec<String>,
-        }
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct V1 {
-            schema: u32,
-            tag: String,
-            commit: String,
-            assets: BTreeMap<String, V1Asset>,
-            team_id: String,
-            contract_major: u64,
-            min_contract_minor: u64,
-            tested_contract_version: String,
-            capabilities: Vec<Assurance>,
-            release_url_base: String,
-        }
-        let v1: V1 = serde_json::from_str(json)?;
-        require(v1.schema == 1, "schema")?;
-        let repo = v1
-            .release_url_base
-            .strip_suffix("/releases/download")
-            .ok_or(LockError::Invalid("release_url_base"))?
-            .to_owned();
-        let mut assets = BTreeMap::new();
-        for (triple, a) in v1.assets {
-            let key =
-                platform_key_from_triple(&triple).ok_or(LockError::Invalid("assets.triple"))?;
-            assets.insert(
-                key,
-                Asset {
-                    name: a.name,
-                    sha256: a.sha256,
-                    files: a.files,
-                    executables: executables.iter().map(|s| (*s).to_owned()).collect(),
-                },
-            );
-        }
-        let lock = Self {
-            schema: SCHEMA,
-            id: id.into(),
-            version: v1.tag,
-            source: Source {
-                repo,
-                commit: v1.commit,
-            },
-            contract: Contract {
-                name: contract_name.into(),
-                major: v1.contract_major,
-                min_minor: v1.min_contract_minor,
-                tested: v1.tested_contract_version,
-            },
-            release_url_base: v1.release_url_base,
-            assets,
-            signing: Some(Signing {
-                macos_team_id: v1.team_id,
-                // Schema 1 never recorded notarization; the caller sets it afterwards.
-                notarized: false,
-            }),
-            reproducible: None,
-            stop_grace_ms: None,
-            provides,
-            requires,
-            assurance: v1.capabilities,
-        };
-        lock.validate()?;
-        Ok(lock)
+/// `major.minor` or a plain `major.minor.patch` (no pre-release or build metadata).
+fn contract_version(version: &str) -> Option<(u64, u64)> {
+    if version.split('.').count() == 2 {
+        // Same digit rules as semver (no leading zeros, no signs) via a zero patch.
+        return contract_version(&format!("{version}.0"));
     }
+    Version::parse(version)
+        .ok()
+        .filter(|v| v.pre.is_empty() && v.build.is_empty())
+        .map(|v| (v.major, v.minor))
 }
 
 /// A small valid lock for tests in this and dependent crates.
@@ -420,7 +350,7 @@ pub const TEST_LOCK: &str = r#"{
       "executables": ["demo"]
     }
   },
-  "signing": { "macos_team_id": "HYAP444FN9", "notarized": false },
+  "signing": { "macos_team_id": "HYAP444FN9", "notarized": true },
   "provides": [
     { "id": "demo-cap",
       "name": { "zh": "演示", "en": "Demo", "th": "สาธิต" },

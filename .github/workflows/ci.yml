@@ -107,7 +107,7 @@ jobs:
       - name: Verify and enable Hyphae integration tests
         run: |
           set -euo pipefail
-          expected=$(jq -er '.binaries["linux-x64"]' rust/crates/agent24-comm/hyphae.lock.json)
+          expected=$(jq -er '.assets["linux-x64"].sha256' rust/crates/agent24-comm/hyphae.lock.json)
           bin="$RUNNER_TEMP/hyphae-linux-x64/hyphae"
           printf '%s  %s\n' "$expected" "$bin" | shasum -a 256 --check
           chmod +x "$bin"
@@ -174,7 +174,7 @@ jobs:
       - name: Verify and enable Hyphae integration tests
         run: |
           set -euo pipefail
-          expected=$(jq -er '.binaries["darwin-arm64"]' rust/crates/agent24-comm/hyphae.lock.json)
+          expected=$(jq -er '.assets["darwin-arm64"].sha256' rust/crates/agent24-comm/hyphae.lock.json)
           bin="$RUNNER_TEMP/hyphae-darwin-arm64/hyphae"
           printf '%s  %s\n' "$expected" "$bin" | shasum -a 256 --check
           chmod +x "$bin"

@@ -78,7 +78,7 @@ async fn the_host_sees_everything_and_open_design_is_absent_until_reported() {
     let idoris = find(&body, "idoris");
     assert_eq!(idoris["form"], "resident");
     assert_eq!(idoris["provides"][0]["id"], "model-gateway");
-    // §7.4: the hard-coded expectation travels in the detail, and Hyphae has no `health`.
+    // C1b: the lock's contract travels in the detail, and Hyphae has no `health`.
     let hyphae = find(&body, "hyphae");
     assert_eq!(hyphae["state"], "absent");
     assert_eq!(

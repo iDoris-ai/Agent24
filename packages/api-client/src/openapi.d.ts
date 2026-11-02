@@ -1623,7 +1623,7 @@ export interface paths {
         };
         /**
          * Hyphae daemon status (process, relay probe, catch-up)
-         * @description Always returns 200 when comm is not configured, with process.state not_configured. data.installable indicates a platform with both release asset and non-null lock hash. data.installed_version is the component tag (v0.29.0) after full hash revalidation, or null when absent or rejected. Developer and sibling binaries do not count as installed components.
+         * @description Always returns 200 when comm is not configured, with process.state not_configured. data.installable indicates a platform the lock has an asset for. data.installed_version is the component tag (v0.30.0) after full hash revalidation, or null when absent or rejected. Developer and sibling binaries do not count as installed components.
          */
         get: operations["getCommDaemon"];
         put?: never;
@@ -2223,7 +2223,7 @@ export interface components {
             setup_code?: "unreachable" | "auth_required" | "auth_failed" | "not_omlx" | "model_not_found" | "invalid_endpoint" | "invalid_role" | "out_dir_not_empty" | "validation_failed" | "write_failed" | "invalid_api_key_input";
         };
         CommInstallResult: {
-            /** @example v0.29.0 */
+            /** @example v0.30.0 */
             installed_version: string;
             /** @description Absolute installed component path */
             path: string;
@@ -3683,7 +3683,7 @@ export interface components {
          * @description Closed set (COMM-HYPHAE.md section 4).
          * @enum {string}
          */
-        CommErrorCode: "hyphae_unsupported_platform" | "hyphae_download_failed" | "hyphae_hash_mismatch" | "binary_rejected" | "unsupported_platform" | "locked" | "not_configured" | "invalid" | "not_found" | "confirm_required" | "conflict" | "network" | "partial" | "timeout" | "upstream" | "hyphae_too_old" | "bad_backup_password" | "invalid_key" | "nickname_exists" | "keystore_locked" | "nickname_too_long" | "still_terminating" | "filesystem_unsupported" | "permission_denied" | "publish_conflict";
+        CommErrorCode: "hyphae_unsupported_platform" | "hyphae_download_failed" | "hyphae_hash_mismatch" | "hyphae_signature_rejected" | "binary_rejected" | "unsupported_platform" | "locked" | "not_configured" | "invalid" | "not_found" | "confirm_required" | "conflict" | "network" | "partial" | "timeout" | "upstream" | "hyphae_too_old" | "bad_backup_password" | "invalid_key" | "nickname_exists" | "keystore_locked" | "nickname_too_long" | "still_terminating" | "filesystem_unsupported" | "permission_denied" | "publish_conflict";
         /** @description Hyphae's own failure envelope shape, NOT the kernel `Error`: comm routes answer `{ok:false,error,message,data?}`. */
         CommError: {
             /** @constant */
@@ -7426,7 +7426,7 @@ export interface operations {
                     };
                 };
             };
-            /** @description hyphae_unsupported_platform (including null lock digests) */
+            /** @description hyphae_unsupported_platform (the lock has no asset for this platform) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -7435,7 +7435,7 @@ export interface operations {
                     "application/json": components["schemas"]["CommError"];
                 };
             };
-            /** @description hyphae_hash_mismatch (downloaded or installed bytes rejected) */
+            /** @description hyphae_hash_mismatch (downloaded or installed bytes do not match the lock's SHA-256), or hyphae_signature_rejected (macOS: the bytes match but the Developer ID / Hardened Runtime / notarization check failed; notarization is an online check, so offline is the usual cause). Messages are fixed texts without paths or tool output. */
             422: {
                 headers: {
                     [name: string]: unknown;
