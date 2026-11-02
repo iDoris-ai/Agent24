@@ -1,5 +1,7 @@
 # ADR-DOC-03：DOCX 编辑引擎与转换 worker（README §17 #6 / #11）
 
+索引：[架构总入口](../../architecture/README.md)・[ADR 索引](../../adr/README.md)
+
 > **状态**：**Accepted**（2026-10-08）。三项条件都已满足：
 > - 引擎方向由 jason 拍板：只用 SuperDoc 的 headless SDK（[#696 决策记录](https://github.com/iDoris-ai/Agent24/issues/696#issuecomment-6056284819)）；
 > - David 评审同意（[#696](https://github.com/iDoris-ai/Agent24/issues/696#issuecomment-6064088128)）；

@@ -18,5 +18,7 @@
     "core_reserved_bytes": 4294967296,
     "idoris_budget_bytes": 5970004541
   },
-  "budget_unavailable_reason": null
+  "budget_unavailable_reason": null,
+  "migration_pending": false,
+  "last_migration_error": null
 }

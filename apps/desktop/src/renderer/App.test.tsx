@@ -433,7 +433,10 @@ describe('App navigation integration', () => {
       expect(screen.getByRole('tab', { name: tab, selected: true })).toBeInTheDocument()
       expect(screen.getByRole('tabpanel', { name: tab })).toBeInTheDocument()
       if (tab === 'Activity') expect(screen.getByRole('group', { name: 'Activity summary' })).toBeInTheDocument()
-      else expect(screen.getByLabelText('Language')).toBeInTheDocument()
+      else {
+        expect(screen.getByLabelText('Language')).toBeInTheDocument()
+        expect(document.getElementById('settings-pinned-slots')).not.toHaveAttribute('data-highlighted')
+      }
       expect(screen.queryByRole('navigation', { name: 'Breadcrumb' })).not.toBeInTheDocument()
     }
     fireEvent.click(screen.getByRole('tab', { name: 'Activity' }))
@@ -443,6 +446,7 @@ describe('App navigation integration', () => {
     expect(screen.getByText('Settings', { selector: '.page-title' })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: 'General', selected: true })).toBeInTheDocument()
     expect(screen.getByTestId('slot-count')).toHaveTextContent('3')
+    expect(document.getElementById('settings-pinned-slots')).toHaveAttribute('data-highlighted', 'true')
   })
 
   it('opens the Voice capability from its Settings tab', async () => {
@@ -479,7 +483,7 @@ describe('App navigation integration', () => {
       path.includes('/approvals?') ? { approvals: [{ id: 'one' }, { id: 'two' }] }
         : path === '/api/v1/idoris/status' ? {
           state: 'not_configured', version: '0.4.0', data_port: null, admin_port: null,
-          roles: [], last_error: null, current_operation: null, verification: null,
+          roles: [], last_error: null, migration_pending: false, last_migration_error: null, current_operation: null, verification: null,
           budget_suggestion: null, budget_unavailable_reason: 'hardware_memory_unavailable',
         } satisfies IdorisStatus
         : path === '/api/v1/comm/daemon' ? { ok: true, data: {

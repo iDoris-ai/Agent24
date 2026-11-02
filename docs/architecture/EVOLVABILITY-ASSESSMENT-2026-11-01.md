@@ -1,5 +1,7 @@
 # Agent24 可进化性评估（最终版，2026-11-01）
 
+索引：[架构总入口](README.md)・[ADR 索引](../adr/README.md)
+
 > 对应 main `bb434b61`。这是三步评审的最终版：Opus 初评 → Codex gpt-6-astra 独立评估 → Fable 裁判对照代码整合。
 > 输入：[Opus 初评](EVOLVABILITY-ASSESSMENT-2026-11-01-opus.md)、[Codex astra 评估](EVOLVABILITY-ASSESSMENT-2026-11-01-codex-astra.md)。
 > 裁判只做静态核查（grep / 读源码），不构建、不测试。

@@ -165,6 +165,10 @@ button { cursor: pointer; font-family: var(--font); }
 
 /* ── Buttons ── */
 .btn { padding: 7px 14px; border-radius: var(--radius); border: none; font-size: 13px; transition: opacity 0.15s; }
+.btn-link {
+  background: none; border: 0; padding: 0; font: inherit; color: var(--accent);
+  text-decoration: underline; text-underline-offset: 2px;
+}
 .btn:hover { opacity: 0.85; }
 .btn-primary { background: var(--accent); color: #000; font-weight: 600; }
 .btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
@@ -254,6 +258,15 @@ button { cursor: pointer; font-family: var(--font); }
 .settings-note { font-size: 13px; color: var(--muted); line-height: 1.5; }
 .settings-status { font-size: 13px; margin-top: 8px; }
 .nav-prefs-notice { position: fixed; bottom: 24px; right: 24px; z-index: 100; max-width: min(480px, calc(100vw - 48px)); padding: 12px 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--text); font-size: 13px; }
+.settings-slots-go { margin: -2px 2px 12px; font-size: 12px; line-height: 1.5; color: var(--muted); }
+.settings-slots-link.is-open { color: var(--accent); font-weight: 700; text-decoration: underline; text-underline-offset: 2px; }
+.settings-slots-link.is-quiet { color: var(--muted); font-weight: 400; text-decoration: underline; text-underline-offset: 2px; }
+.settings-slots-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.setting-row[data-highlighted] {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 .settings-stepper { display: flex; align-items: center; gap: 8px; }
 .settings-stepper output { min-width: 1.5em; text-align: center; font-size: 14px; font-weight: 600; }
 .settings-stepper .btn:disabled, .settings-pin-list .btn:disabled { opacity: 0.35; cursor: not-allowed; }

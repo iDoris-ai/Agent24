@@ -212,6 +212,61 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/components": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Lifecycle state of every component (ADR-038 D5)
+         * @description One status model for iDoris, Hyphae, attached modules, Documents, Knowledge and Open
+         *     Design (whose state the desktop reports). Needs `components.read`; Creative tokens are
+         *     refused (403). The ProductHost audience, and legacy mode (one shared token that already
+         *     reads every full status route), get `ComponentView`. Every other audience gets
+         *     `ComponentRedactedView`: id, version, state and provides only, with no install path, pid,
+         *     port, error message, team id or commit. A first-party token carries only the operations it
+         *     was issued with, so one issued by an older daemon gets 403 here until it is re-issued. The older status routes (`/idoris/status`,
+         *     `/comm/daemon`, `/os`) are unchanged.
+         */
+        get: operations["listComponents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/components/{id}/report": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * The desktop reports the state of a component it owns (ADR-038 D5)
+         * @description ProductHost audience only; legacy mode, first-party and Creative tokens get 403. Accepted
+         *     only for components whose state the desktop owns (today `open-design`); any other id is
+         *     404. The first report, or the first after the previous one expired, is taken as the
+         *     baseline. Otherwise whatever legal state is reported is stored and refreshes the report
+         *     (the daemon only aggregates); one that does not follow the last live report by a D5 edge
+         *     is logged and marked for the host as `detail.unexpected_transition` `{from, to}` on the
+         *     component. An unknown id is 404 before the body is read. A report expires 90 seconds after it was
+         *     received, after which the component reads `absent` with reason `not_reported`; the
+         *     desktop must re-send within that time.
+         */
+        post: operations["reportComponentState"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/decide/profile": {
         parameters: {
             query?: never;
@@ -798,7 +853,7 @@ export interface paths {
         /**
          * The shutdown budgets in effect and the previous shutdown (authenticated)
          * @description SHUT-1c. The out-of-process modules' drain and stop grace
-         *     (`A24_MODULE_DRAIN_MS`, `A24_MODULE_STOP_GRACE_MS`), the exit bound
+         *     (`A24_MODULE_DRAIN_MS`, `A24_COMPONENT_STOP_GRACE_MS`), the exit bound
          *     they give, values that were rejected, and what this daemon found of
          *     the one before it — so a budget that is too tight can be found and
          *     adjusted. agent24d only.
@@ -1392,6 +1447,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/comm/identity/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Back up an identity's private key to a password-encrypted file
+         * @description Needs Hyphae v0.28.0 or newer (`409 hyphae_too_old` otherwise, decided from the installed binary's own `--help`). Runs `hyphae identity export --format ncryptsec --password-stdin` (no `--out`) with the keystore password (from the system keychain) and `backup_password` on stdin, one per line; Hyphae answers with the NIP-49 `ncryptsec1…` ciphertext on stdout, so the plaintext key never enters the daemon. The daemon validates it strictly (bech32 checksum, HRP, payload length, version, log_n <= 19), opens it with `backup_password` and checks it derives the identity's npub (a backup that would not restore is never written), and only then creates the file itself, relative to a directory descriptor pinned before the export: exclusive create of a random staging name (mode 0600), write, fsync, `linkat` to `path` (which never replaces anything), unlink the staging name, fsync the directory. After publishing it checks that the final name is the very inode it wrote (`fstatat` without following links, compared by device and inode); if it is not, the file at that name is left untouched and the answer is `409 publish_conflict`. On file systems without hard links (FAT, exFAT, some SMB mounts; `linkat` fails with EPERM, ENOTSUP, EOPNOTSUPP, EXDEV or EMLINK) it renames the staging file with `RENAME_EXCL` (macOS) or `RENAME_NOREPLACE` (Linux), which also never overwrites; if that is unsupported too (exFAT on macOS) it creates the final name directly with `O_EXCL` (never replacing anything; a crash mid-write can leave a partial, undecryptable file) and only if that is refused as well the answer is `422 filesystem_unsupported`. On such file systems there is no atomic publish: a crash mid-write can leave a partial, undecryptable file at the final name (a failed write removes it, and the error names it if it cannot). After publishing the final name must still be the file Agent24 wrote; if another file appeared there it is NEVER deleted or replaced and the answer is `409 publish_conflict`. EPERM/EACCES from any of these steps is `422 permission_denied`. An existing target of any kind is refused with `409 conflict` and `data.reason = "target_exists"`. `path` must be absolute and outside the Hyphae data directory. Neither the key, the backup nor the backup password is part of the response or a log line. Only the desktop's ProductHost credential may call it (legacy shared-token mode and every other audience get `403`), because the caller chooses the password that encrypts the key. One export runs at a time (`409` with `data.reason = "export_in_progress"`). The desktop does not expose it through the renderer proxy; its main process confirms natively, collects the password in its own window and picks `path` with a native save dialog. There is no CLI command yet (it needs the CORE-2d presence proof for CommWrite).
+         */
+        post: operations["exportCommIdentity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/identity/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Restore an identity from an encrypted (NIP-49) backup file
+         * @description Needs Hyphae v0.28.0 or newer (`409 hyphae_too_old` otherwise). Takes the backup text itself in `ncryptsec` (one `ncryptsec1…` token of at most 200 ASCII characters, no whitespace or line break; the desktop's main process reads and validates the file the user picked, then sends its content, so the daemon never opens a path the caller names; the bech32 structure is checked too) and runs `hyphae identity import --nickname=<n> --password-stdin --ncryptsec-stdin [--default]` with stdin `keystore password`, `backup_password`, `ncryptsec1…` (one per line, in that order). The keystore password comes from the system keychain; when no identity exists yet a fresh one is generated and promoted exactly like `POST /comm/identity` does for the first identity. The comm daemon is restarted if the restored identity becomes the default. Only the desktop's ProductHost credential may call it (legacy mode and every other audience get `403`). Errors carry stable codes: `bad_backup_password` (400), `invalid_key` (400), `nickname_exists` (409), `keystore_locked` (423, also what Hyphae's plain `auth_error` on import means), `hyphae_too_old` (409). Restoring a key that is already stored is not an error: it answers 200 with `data.status = "already_present"`, plus `nickname` and `npub` of the existing identity when known. There is no CLI command yet (CORE-2d).
+         */
+        post: operations["importCommIdentity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/comm/identity/default": {
         parameters: {
             query?: never;
@@ -1453,7 +1548,10 @@ export interface paths {
         };
         /** List configured relays */
         get: operations["listCommRelays"];
-        /** Replace the relay list (full replace, at most 8) */
+        /**
+         * Replace the relay list (full replace, at most 8)
+         * @description Each URL: 1..256 characters of printable ASCII, `wss://` (or `ws://` for loopback hosts only: localhost, 127.0.0.0/8, [::1]), a host, no userinfo, no query string, no fragment (`400 invalid`).
+         */
         put: operations["setCommRelays"];
         post?: never;
         delete?: never;
@@ -1525,7 +1623,7 @@ export interface paths {
         };
         /**
          * Hyphae daemon status (process, relay probe, catch-up)
-         * @description Always returns 200 when comm is not configured, with process.state not_configured. data.installable indicates a platform with both release asset and non-null lock hash. data.installed_version is the component tag (v0.27.2) after full hash revalidation, or null when absent or rejected. Developer and sibling binaries do not count as installed components.
+         * @description Always returns 200 when comm is not configured, with process.state not_configured. data.installable indicates a platform with both release asset and non-null lock hash. data.installed_version is the component tag (v0.29.0) after full hash revalidation, or null when absent or rejected. Developer and sibling binaries do not count as installed components.
          */
         get: operations["getCommDaemon"];
         put?: never;
@@ -2105,6 +2203,9 @@ export interface components {
             budget_suggestion: components["schemas"]["IdorisBudgetSuggestion"] | null;
             /** @enum {string|null} */
             budget_unavailable_reason: "hardware_memory_unavailable" | "hardware_probe_failed" | "host_unavailable" | null;
+            /** @description The installed release is outside the ADR-038 managed root; the next Install re-downloads it there. The current install keeps working meanwhile. */
+            migration_pending: boolean;
+            last_migration_error: components["schemas"]["IdorisErrorCode"] | null;
         };
         IdorisOperation: {
             operation_id: string;
@@ -2122,7 +2223,7 @@ export interface components {
             setup_code?: "unreachable" | "auth_required" | "auth_failed" | "not_omlx" | "model_not_found" | "invalid_endpoint" | "invalid_role" | "out_dir_not_empty" | "validation_failed" | "write_failed" | "invalid_api_key_input";
         };
         CommInstallResult: {
-            /** @example v0.27.2 */
+            /** @example v0.29.0 */
             installed_version: string;
             /** @description Absolute installed component path */
             path: string;
@@ -2187,6 +2288,50 @@ export interface components {
         AttachedList: {
             modules: components["schemas"]["AttachedView"][];
         };
+        /** @enum {string} */
+        ComponentState: "absent" | "installing" | "installed" | "starting" | "ready" | "degraded" | "stopping" | "stopped" | "incompatible" | "failed";
+        ComponentProvide: {
+            /** @description Capability id (ADR-038 D9) */
+            id: string;
+            /** @description Localized display name, when the component's lock carries one */
+            name?: {
+                zh: string;
+                en: string;
+                th: string;
+            };
+        };
+        /** @description Host view of one component. */
+        ComponentView: {
+            id: string;
+            version: string | null;
+            state: components["schemas"]["ComponentState"];
+            /** @enum {string} */
+            form: "resident" | "sidecar" | "cli" | "attach" | "remote" | "mcp";
+            provides: components["schemas"]["ComponentProvide"][];
+            /** @description Short machine-readable cause; host only */
+            reason?: string;
+            /** @description Ports, contract expectation, counters, messages; host only */
+            detail?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description What every audience other than the host sees. No path, pid, port, message, team id or commit. */
+        ComponentRedactedView: {
+            id: string;
+            version: string | null;
+            state: components["schemas"]["ComponentState"];
+            provides: components["schemas"]["ComponentProvide"][];
+        };
+        ComponentList: {
+            components: (components["schemas"]["ComponentView"] | components["schemas"]["ComponentRedactedView"])[];
+        };
+        ComponentReport: {
+            state: components["schemas"]["ComponentState"];
+            /** @description Kept from the previous report when omitted */
+            version?: string;
+            /** @description No control characters; shown to the host only */
+            reason?: string;
+        };
         AttachedUpdate: {
             enabled: boolean;
         };
@@ -2224,7 +2369,7 @@ export interface components {
             evidence_dir?: string;
             drain_ms: number;
             stop_grace_ms: number;
-            /** @description From SIGTERM to the process gone, at the latest (2000 at the defaults). */
+            /** @description From SIGTERM to the process gone, at the latest (16500 at the defaults, with no managed iDoris holding the shutdown open). */
             exit_bound_ms: number;
             config_warnings: string[];
             /** @description Open enum: no_history | clean | unreadable | cleanup_failed | unconfirmed. */
@@ -3538,7 +3683,7 @@ export interface components {
          * @description Closed set (COMM-HYPHAE.md section 4).
          * @enum {string}
          */
-        CommErrorCode: "hyphae_unsupported_platform" | "hyphae_download_failed" | "hyphae_hash_mismatch" | "binary_rejected" | "unsupported_platform" | "locked" | "not_configured" | "invalid" | "not_found" | "confirm_required" | "conflict" | "network" | "partial" | "timeout" | "upstream";
+        CommErrorCode: "hyphae_unsupported_platform" | "hyphae_download_failed" | "hyphae_hash_mismatch" | "binary_rejected" | "unsupported_platform" | "locked" | "not_configured" | "invalid" | "not_found" | "confirm_required" | "conflict" | "network" | "partial" | "timeout" | "upstream" | "hyphae_too_old" | "bad_backup_password" | "invalid_key" | "nickname_exists" | "keystore_locked" | "nickname_too_long" | "still_terminating" | "filesystem_unsupported" | "permission_denied" | "publish_conflict";
         /** @description Hyphae's own failure envelope shape, NOT the kernel `Error`: comm routes answer `{ok:false,error,message,data?}`. */
         CommError: {
             /** @constant */
@@ -4406,6 +4551,56 @@ export interface operations {
                 };
             };
             503: components["responses"]["ProviderUnavailable"];
+        };
+    };
+    listComponents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Components; each item is the full or the redacted variant by audience */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ComponentList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    reportComponentState: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ComponentReport"];
+            };
+        };
+        responses: {
+            /** @description Recorded */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
         };
     };
     getDecideProfile: {
@@ -6814,6 +7009,142 @@ export interface operations {
             400: components["responses"]["CommInvalid"];
             409: components["responses"]["CommConflict"];
             423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    exportCommIdentity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description No control or invisible formatting characters; at most 128 characters and 512 UTF-8 bytes (`400 nickname_too_long`). */
+                    nickname: string;
+                    path: string;
+                    /** @description Encrypts the backup. At least 8 characters and at most 1024 UTF-8 bytes (the byte limit is enforced by the server), a single line (no CR, LF or NUL) and not whitespace only. Lose it and the backup cannot be restored; it is not stored. */
+                    backup_password: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Backup written; data is `{nickname, npub, path, format:"ncryptsec"}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            /** @description Not the desktop ProductHost credential (or legacy auth mode) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+            404: components["responses"]["CommNotFound"];
+            /** @description `conflict` (`target_exists`, `export_in_progress`), `publish_conflict` (another file appeared at the destination; left untouched) or `hyphae_too_old` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+            /** @description `filesystem_unsupported` (the destination's file system cannot publish a file safely; choose another folder) or `permission_denied` (the folder is not writable) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    importCommIdentity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description No control or invisible formatting characters; at most 128 characters and 512 UTF-8 bytes (`400 nickname_too_long`). */
+                    nickname: string;
+                    /** @description The NIP-49 backup text (ciphertext, still protected by the backup password); never returned or logged. */
+                    ncryptsec: string;
+                    /** @description The password the backup was made with. A single line (no CR, LF or NUL). */
+                    backup_password: string;
+                    /** @default false */
+                    default?: boolean;
+                };
+            };
+        };
+        responses: {
+            /** @description `data` is `{status:"imported", nickname, npub, default}` or `{status:"already_present", nickname?, npub?}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            /** @description `invalid` (including an unusable backup password), `bad_backup_password`, `invalid_key` */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+            /** @description Not the desktop ProductHost credential (or legacy auth mode) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+            404: components["responses"]["CommNotFound"];
+            /** @description `nickname_exists`, `hyphae_too_old` or `conflict` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+            /** @description `keystore_locked` or `locked` */
+            423: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
             502: components["responses"]["CommBadGateway"];
             503: components["responses"]["CommUnavailable"];
             504: components["responses"]["CommTimeout"];

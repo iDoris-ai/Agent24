@@ -1,5 +1,7 @@
 # ADR-001：Agent24 × Open Design 集成边界
 
+索引：[架构总入口](../../architecture/README.md)・[ADR 索引](../../adr/README.md)
+
 > 状态：Accepted / P0 frozen
 >
 > 决策日期：2026-09-19

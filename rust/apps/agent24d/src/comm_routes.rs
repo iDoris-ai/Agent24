@@ -118,6 +118,18 @@ impl CommDaemonSlot {
         }
     }
 
+    /// The registered supervisor, if any (read-only; status for `/api/v1/components`).
+    pub fn current(&self) -> Option<Arc<HyphaeDaemonSupervisor>> {
+        match &*self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            CommDaemonSlotState::Registered(handle) => Some(handle.clone()),
+            _ => None,
+        }
+    }
+
     /// Mark the slot closed, cancel downloads, and return the current handle.
     pub fn close(&self) -> Option<Arc<HyphaeDaemonSupervisor>> {
         self.1.cancel();
@@ -762,16 +774,12 @@ mod hy1_regression_tests {
             ))),
             installation: AsyncMutex::new(()),
         });
-        let cache = dir.join("idoris/component-cache/hyphae");
+        let cache = dir.join("components/hyphae-cache");
         tokio::fs::create_dir_all(&cache).await.unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            for path in [
-                dir.join("idoris"),
-                dir.join("idoris/component-cache"),
-                cache.clone(),
-            ] {
+            for path in [cache.clone()] {
                 tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
                     .await
                     .unwrap();
@@ -811,7 +819,7 @@ mod hy1_regression_tests {
             let (status, installed) = request(&app, "POST", "/api/v1/comm/install").await;
             assert_eq!(status, StatusCode::OK, "{installed}");
             assert_eq!(installed["data"]["restart_required"], false);
-            assert_eq!(installed["data"]["installed_version"], "v0.27.2");
+            assert_eq!(installed["data"]["installed_version"], "v0.29.0");
             assert_eq!(
                 tokio::fs::read(runtime.release.installed_path(dir.path()))
                     .await
@@ -824,7 +832,7 @@ mod hy1_regression_tests {
             let (status, process) = request(&app, "GET", "/api/v1/comm/daemon").await;
             assert_eq!(status, StatusCode::OK);
             assert_ne!(process["data"]["process"]["state"], "not_configured");
-            assert_eq!(process["data"]["installed_version"], "v0.27.2");
+            assert_eq!(process["data"]["installed_version"], "v0.29.0");
         }
         if let Some(handle) = runtime.slot.close() {
             handle.shutdown(tokio::time::Instant::now()).await;
@@ -902,7 +910,7 @@ mod hy1_regression_tests {
             "https://untrusted.invalid/release".into();
         tokio::fs::remove_file(
             dir.path()
-                .join("idoris/component-cache/hyphae/fixture-hyphae.verified"),
+                .join("components/hyphae-cache/fixture-hyphae.verified"),
         )
         .await
         .unwrap();

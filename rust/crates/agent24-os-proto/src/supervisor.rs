@@ -1212,7 +1212,7 @@ fn warn_if_tight(name: &str, timings: &Timings, r: &crate::stop_record::StopReco
             grace_ms = timings.stop_grace.as_millis(),
             stop_ms = r.stop_elapsed.unwrap_or_default().as_millis(),
             "the module did not exit within its stop grace and was SIGKILLed — raise \
-             A24_MODULE_STOP_GRACE_MS if it needs longer to flush"
+             A24_COMPONENT_STOP_GRACE_MS if it needs longer to flush"
         );
     }
     let cut = r.abandoned.unwrap_or(0) + r.never_sent.unwrap_or(0);
@@ -2019,7 +2019,7 @@ sys.exit(0)
         let text = logs.text();
         assert!(
             text.contains("did not exit within its stop grace")
-                && text.contains("A24_MODULE_STOP_GRACE_MS"),
+                && text.contains("A24_COMPONENT_STOP_GRACE_MS"),
             "no warning that the grace was too short:\n{text}"
         );
     }

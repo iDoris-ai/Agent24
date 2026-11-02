@@ -48,6 +48,9 @@ const r = (method: HttpMethod, template: string, timeoutMs?: number): ProxyRoute
  *   DELETE /api/v1/attached/{name}           -> IpcChannels.AgentEarUnpair (agentear only)
  *   PATCH  /api/v1/os/{name}                 -> IpcChannels.OsModuleSetEnabled
  *   POST   /api/v1/os/{name}/stop
+ *   POST   /api/v1/comm/import               -> IpcChannels.CommHomeImport
+ *   PUT    /api/v1/comm/relay                -> IpcChannels.CommRelaySet
+ *   POST   /api/v1/comm/unlock               -> IpcChannels.CommUnlock
  */
 export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   // IL-13: host-only lifecycle API; Admin credentials never enter Electron.
@@ -98,15 +101,24 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   // communication (Hyphae)
   r('GET', '/api/v1/comm/identity'),
   r('POST', '/api/v1/comm/identity'), // [E]
-  r('POST', '/api/v1/comm/import'), // [E]
-  r('PUT', '/api/v1/comm/relay'), // [E]
   r('POST', '/api/v1/comm/relay/probe'), // [E]
   r('GET', '/api/v1/comm/contact'),
+  r('GET', '/api/v1/comm/history'),
+  // NOT here on purpose, each has its own validated IPC in main:
+  //   POST /api/v1/comm/identity/export  (CommIdentityExport: native confirm, own password window, save dialog)
+  //   POST /api/v1/comm/identity/import  (CommImportPick + CommIdentityImport: native open dialog, own password window)
+  //   POST /api/v1/comm/contact          (CommContactAdd)
+  //   POST /api/v1/comm/send             (CommSend)
+  //   POST /api/v1/comm/import           (CommHomeImport: native folder picker + confirm, own password window)
+  //   PUT  /api/v1/comm/relay            (CommRelaySet: validated ws(s):// list, native confirm when it changes)
+  //   POST /api/v1/comm/unlock           (CommUnlock: own password window)
+  // The proxy forwards with the host's ProductHost credential, which the
+  // daemon's presence check does not constrain, so an Elevated write must not
+  // be reachable here with a body of the page's choosing.
   r('GET', '/api/v1/comm/relay'),
   r('GET', '/api/v1/comm/daemon'),
   r('POST', '/api/v1/comm/daemon/start'), // [E]
   r('POST', '/api/v1/comm/daemon/stop'), // [E]
-  r('POST', '/api/v1/comm/unlock'), // [E]
 ]
 
 /** A path segment value a `{param}` may bind: no traversal, no separators,
