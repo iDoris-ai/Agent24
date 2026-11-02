@@ -245,30 +245,50 @@ pub(super) fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, StateError> 
     }
 }
 
-/// [`read_optional`] with a size cap and a regular-file requirement: an
-/// oversize file or a FIFO/device is `Invalid` (never read whole, never
-/// blocks), so a hostile file cannot stall or balloon startup.
+/// [`read_optional`] with a size cap, for state a hostile file could replace.
+/// One fd does everything: opened `O_NONBLOCK|O_NOFOLLOW` (a FIFO never
+/// blocks, a symlink is refused), `fstat` must say regular file within `max`,
+/// and the read itself is bounded. Only ENOENT is `Ok(None)`; every other
+/// failure is `Invalid`, never a fall back to an uncapped read.
 pub(super) fn read_optional_capped(path: &Path, max: u64) -> Result<Option<Vec<u8>>, StateError> {
-    match fs::metadata(path) {
-        Ok(m) if !m.is_file() || m.len() > max => {
+    use std::os::unix::fs::OpenOptionsExt;
+    let flags = rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOFOLLOW;
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags.bits() as i32)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
             return Err(StateError::Invalid(format!(
-                "{} is not a regular file within {max} bytes",
+                "cannot open {}: {e}",
                 path.display()
             )));
         }
-        Ok(_) => {}
-        Err(_) => return read_optional(path),
+    };
+    let meta = file
+        .metadata()
+        .map_err(|e| StateError::Invalid(e.to_string()))?;
+    read_capped(file, meta.is_file(), meta.len(), max).map(Some)
+}
+
+/// The checks after `fstat`, split out so a test can feed a reader that
+/// grows after the stat.
+fn read_capped(r: impl Read, is_file: bool, len: u64, max: u64) -> Result<Vec<u8>, StateError> {
+    if !is_file || len > max {
+        return Err(StateError::Invalid(format!(
+            "not a regular file within {max} bytes"
+        )));
     }
-    let file = fs::File::open(path).map_err(|e| StateError::Invalid(e.to_string()))?;
     let mut bytes = Vec::new();
-    // The file may grow after the stat: the read itself is bounded too.
-    file.take(max + 1)
+    r.take(max + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| StateError::Invalid(e.to_string()))?;
     if bytes.len() as u64 > max {
         return Err(StateError::Invalid("file grew past the size cap".into()));
     }
-    Ok(Some(bytes))
+    Ok(bytes)
 }
 
 pub(super) fn parse_json<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, StateError> {
@@ -461,5 +481,46 @@ mod tests {
         let dir = snapshot_dir(td.path(), &id);
         std::os::unix::fs::symlink(td.path().join("nowhere"), dir.join(STORE_FILE)).unwrap();
         assert!(verify_complete(td.path(), &id, "a1").is_err());
+    }
+}
+
+#[cfg(test)]
+mod capped_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn a_file_that_grows_after_fstat_is_refused() {
+        // fstat said 3 bytes; the reader yields far more.
+        let grown = io::repeat(b'x');
+        assert!(read_capped(grown, true, 3, 16).is_err());
+        assert_eq!(read_capped(&b"abc"[..], true, 3, 16).unwrap(), b"abc");
+        assert!(
+            read_capped(&b"abc"[..], false, 3, 16).is_err(),
+            "not a file"
+        );
+        assert!(
+            read_capped(&b"abc"[..], true, 17, 16).is_err(),
+            "stat too big"
+        );
+    }
+
+    #[test]
+    fn symlink_and_missing_and_dangling() {
+        let td = tempfile::tempdir().unwrap();
+        let real = td.path().join("real");
+        fs::write(&real, b"{}").unwrap();
+        let link = td.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(read_optional_capped(&link, 16).is_err(), "symlink refused");
+        let dangling = td.path().join("dangling");
+        std::os::unix::fs::symlink(td.path().join("nowhere"), &dangling).unwrap();
+        assert!(read_optional_capped(&dangling, 16).is_err());
+        assert!(
+            read_optional_capped(&td.path().join("absent"), 16)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(read_optional_capped(&real, 16).unwrap().unwrap(), b"{}");
     }
 }

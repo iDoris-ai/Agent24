@@ -46,8 +46,20 @@ pub fn decide(
     // (D8); a finished one is a read-only check.
     let verdict = startup_replay(ops, &req).verdict();
     let (marker, manifest) = match (existing, verdict) {
-        (Ok(Some(m)), _) => {
+        (Ok(Some(mut m)), verdict) => {
             let manifest = manifest_of(data_dir, m.snapshot_id.as_deref());
+            // The first failure's code stays (the file is not rewritten), but
+            // the report must not be rosier than this start's own check.
+            if let Verdict::Dock(now) = &verdict
+                && (now.migrations == MigrationsState::Unknown
+                    || matches!(
+                        now.rollback,
+                        RollbackState::Failed | RollbackState::InProgress
+                    ))
+            {
+                m.rollback = now.rollback;
+                m.observed_migrations = None;
+            }
             (m, manifest)
         }
         (Ok(None), Verdict::Proceed) => return None,
@@ -82,8 +94,27 @@ pub fn decide(
     Some(Docking { marker, manifest })
 }
 
+/// Replay itself failed (panic, cancelled task): nothing is known, so dock
+/// with an in-memory marker and write nothing.
+#[must_use]
+pub fn fail_closed(current: BinaryIdentity) -> Docking {
+    let reason = DockReason {
+        code: DockCode::GuardInvalid,
+        phase: DockPhase::Restoring,
+        rollback: RollbackState::Failed,
+        retry_allowed: false,
+        migrations: MigrationsState::Unknown,
+    };
+    Docking {
+        marker: build_marker(reason, None, None, current),
+        manifest: None,
+    }
+}
+
 fn manifest_of(data_dir: &Path, id: Option<&str>) -> Option<Manifest> {
-    let id = id.filter(|id| id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))?;
+    let id = id.filter(|id| {
+        !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })?;
     read_manifest(&snapshot_dir(data_dir, id).join("manifest.json")).ok()
 }
 
@@ -164,6 +195,10 @@ mod tests {
         fn fsync_dir(&self, d: &Path) -> io::Result<()> {
             *self.0.borrow_mut() += 1;
             RealOps.fsync_dir(d)
+        }
+        fn copy_new_synced(&self, a: &Path, b: &Path) -> io::Result<()> {
+            *self.0.borrow_mut() += 1;
+            RealOps.copy_new_synced(a, b)
         }
         fn remove_file(&self, p: &Path) -> io::Result<()> {
             *self.0.borrow_mut() += 1;
@@ -267,5 +302,81 @@ mod tests {
                 .observed_migrations
                 .is_none()
         );
+    }
+
+    /// A Migrating log: the first start restores (that is the recovery), writes
+    /// the marker and docks; every later start, now over a Restored log, only
+    /// re-verifies: zero file operations, no database opened or created.
+    #[test]
+    fn t6_migrating_then_restored_logs_never_mutate_on_repeat() {
+        let td = tempfile::tempdir().unwrap();
+        let snap = test_empty_snapshot(td.path(), "a1");
+        let mut log = GuardLog::new("a1".into(), id("old"));
+        log.snapshot_id = Some(snap);
+        persist(&RealOps, td.path(), &log).unwrap();
+        for p in [Phase::Snapshotted, Phase::Migrating] {
+            advance(&RealOps, td.path(), &mut log, p).unwrap();
+        }
+        let first = decide(&RealOps, td.path(), &|| id("old")).unwrap();
+        assert_eq!(first.marker.error_code, DockCode::MigrationFailed);
+        assert_eq!(first.marker.rollback, RollbackState::Restored);
+        assert_eq!(
+            guard_log::read(td.path()).unwrap().unwrap().phase,
+            Phase::Restored
+        );
+        let ops = CountingOps::default();
+        for sha in ["old", "old", "other"] {
+            let again = decide(&ops, td.path(), &|| id(sha)).unwrap();
+            assert_eq!(again.marker, first.marker);
+        }
+        assert_eq!(*ops.0.borrow(), 0, "re-verification performs no mutation");
+        assert!(!td.path().join(STORE_FILE).exists());
+        assert!(!td.path().join(MEMORY_FILE).exists());
+    }
+
+    /// M2: a marker that says Restored is not repeated blindly: if this
+    /// start's own check fails (snapshot gone), the report is downgraded to
+    /// unknown while the marker file keeps its first-failure code.
+    #[test]
+    fn a_broken_snapshot_downgrades_a_restored_marker_in_memory() {
+        let td = tempfile::tempdir().unwrap();
+        let snap = test_empty_snapshot(td.path(), "a1");
+        let mut log = GuardLog::new("a1".into(), id("old"));
+        log.snapshot_id = Some(snap.clone());
+        persist(&RealOps, td.path(), &log).unwrap();
+        for p in [Phase::Snapshotted, Phase::Migrating] {
+            advance(&RealOps, td.path(), &mut log, p).unwrap();
+        }
+        let first = decide(&RealOps, td.path(), &|| id("old")).unwrap();
+        assert!(first.marker.observed_migrations.is_some());
+        let before = fs::read(marker_path(td.path())).unwrap();
+        fs::remove_file(snapshot_dir(td.path(), &snap).join("manifest.json")).unwrap();
+        let now = decide(&RealOps, td.path(), &|| id("old")).unwrap();
+        assert_eq!(
+            now.marker.error_code,
+            DockCode::MigrationFailed,
+            "first code stays"
+        );
+        assert_ne!(now.marker.rollback, RollbackState::Restored);
+        assert!(now.marker.observed_migrations.is_none());
+        assert_eq!(
+            fs::read(marker_path(td.path())).unwrap(),
+            before,
+            "file untouched"
+        );
+    }
+
+    #[test]
+    fn an_empty_snapshot_id_names_no_manifest() {
+        let td = tempfile::tempdir().unwrap();
+        let snap = test_empty_snapshot(td.path(), "a1");
+        // A manifest sitting where an empty id would resolve to.
+        fs::copy(
+            snapshot_dir(td.path(), &snap).join("manifest.json"),
+            td.path().join("migration-snapshots").join("manifest.json"),
+        )
+        .unwrap();
+        assert!(manifest_of(td.path(), Some("")).is_none());
+        assert!(manifest_of(td.path(), Some(&snap)).is_some(), "control");
     }
 }

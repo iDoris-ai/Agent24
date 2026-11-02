@@ -253,6 +253,32 @@ pub struct MigrationMarker {
     pub observed_migrations: Option<PairMark>,
 }
 
+/// Longest identifier a marker may carry (attempt id, snapshot id, version).
+const ID_MAX: usize = 128;
+
+impl MigrationMarker {
+    /// Identifiers are short and plain: they reach the diagnostics body and
+    /// name a directory, so anything else is a hostile marker.
+    fn check_identifiers(&self) -> Result<(), StateError> {
+        let ok = |s: &str, extra: &[u8]| {
+            !s.is_empty()
+                && s.len() <= ID_MAX
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || extra.contains(&b))
+        };
+        let good = ok(&self.attempt_id, b"-")
+            && self.snapshot_id.as_deref().is_none_or(|s| ok(s, b"-"))
+            && ok(&self.failed_binary.version, b"-.+");
+        if good {
+            Ok(())
+        } else {
+            Err(StateError::Invalid(
+                "marker identifier out of bounds".into(),
+            ))
+        }
+    }
+}
+
 #[must_use]
 pub fn marker_path(data_dir: &Path) -> PathBuf {
     data_dir.join(MARKER_FILE)
@@ -288,6 +314,7 @@ pub fn read_marker(data_dir: &Path) -> Result<Option<MigrationMarker>, StateErro
             m.format_version
         )));
     }
+    m.check_identifiers()?;
     Ok(Some(m))
 }
 
@@ -576,5 +603,26 @@ mod tests {
                 .success()
         );
         assert!(read_marker(td.path()).is_err(), "fifo");
+    }
+
+    #[test]
+    fn hostile_identifiers_are_marker_invalid() {
+        let td = tempfile::tempdir().unwrap();
+        let p = marker_path(td.path());
+        let edits: [fn(&mut MigrationMarker); 5] = [
+            |m| m.attempt_id = "../../etc".into(),
+            |m| m.attempt_id = "a".repeat(129),
+            |m| m.snapshot_id = Some(String::new()),
+            |m| m.snapshot_id = Some("x/y".into()),
+            |m| m.failed_binary.version = "1.0 /Users/jason".into(),
+        ];
+        for edit in edits {
+            let mut m = marker();
+            edit(&mut m);
+            fs::write(&p, serde_json::to_vec(&m).unwrap()).unwrap();
+            assert!(read_marker(td.path()).is_err());
+        }
+        fs::write(&p, serde_json::to_vec(&marker()).unwrap()).unwrap();
+        assert!(read_marker(td.path()).unwrap().is_some());
     }
 }

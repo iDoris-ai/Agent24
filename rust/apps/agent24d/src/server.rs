@@ -2047,7 +2047,7 @@ pub async fn serve(
     if !ephemeral
         && let Some(dir) = agent24_protocol::state_file::state_dir()
         && let Some(docking) =
-            crate::docked_startup::pre_start(crate::migration_coordinator::ENABLED, &dir).await
+            crate::docked_startup::pre_start(crate::docked_startup::guard_enabled(), &dir).await
     {
         let launch = crate::docked_startup::Launch {
             data_dir: &dir,
@@ -2056,7 +2056,6 @@ pub async fn serve(
             enroll: mode != StartupMode::Legacy,
             generation: daemon_generation,
             capabilities: capability_store,
-            product_host_token,
             ready: match host_ready.take() {
                 Some(writer) => crate::docked_startup::ReadyOut::Host(writer),
                 None => crate::docked_startup::ReadyOut::Stdout,
