@@ -533,6 +533,48 @@ describe('Restore from backup (CommImportPick / CommIdentityImport)', () => {
     expect((await call(IpcChannels.CommIdentityImport, 'f'.repeat(32), 'alice', false)).data.error.code).toBe('ticket_expired')
     expect(seen).toHaveLength(0)
   })
+  it('L-5: an expired ticket is dropped for good, even if the clock is later wound back', async () => {
+    const t0 = 1_700_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+    try {
+      const { ticket } = await pick()
+      now.mockReturnValue(t0 + 5 * 60_000 + 1)
+      expect((await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)).data.error.code).toBe('ticket_expired')
+      now.mockReturnValue(t0 + 1000) // inside the original window again
+      expect((await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)).data.error.code).toBe('ticket_expired')
+      expect(promptRestorePassword).not.toHaveBeenCalled()
+    } finally {
+      now.mockRestore()
+    }
+  })
+  it.each([
+    ['is cancelled', () => showOpenDialog.mockResolvedValueOnce({ canceled: true, filePaths: [] })],
+    ['picks a file that is not a backup', () => { fs.writeFileSync(SECOND, 'hello\n'); showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [SECOND] }) }],
+    ['throws', () => showOpenDialog.mockRejectedValueOnce(new Error('boom'))],
+  ])('L-5: starting a new pick invalidates the old ticket even if the new pick %s', async (_name, arrange) => {
+    const { ticket } = await pick()
+    arrange()
+    await call(IpcChannels.CommImportPick)
+    typing('restore-pass-1')
+    expect((await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)).data.error.code).toBe('ticket_expired')
+    expect(seen).toHaveLength(0)
+  })
+  it('L-5: a flow that ends while a new pick dialog is open cannot put its old ticket back', async () => {
+    const first = await pick()
+    let release!: () => void
+    promptRestorePassword.mockImplementationOnce(() => new Promise((resolve) => { release = () => resolve(null) }))
+    const running = call(IpcChannels.CommIdentityImport, first.ticket, 'alice', false)
+    await new Promise((r) => setTimeout(r, 20))
+    let finishPick!: (v: unknown) => void
+    showOpenDialog.mockImplementationOnce(() => new Promise((resolve) => { finishPick = resolve }))
+    const picking = call(IpcChannels.CommImportPick)
+    await new Promise((r) => setTimeout(r, 20))
+    release() // the old flow is cancelled while the new dialog is still open
+    expect((await running).data.error.code).toBe('cancelled')
+    finishPick({ canceled: true, filePaths: [] })
+    await picking
+    expect((await call(IpcChannels.CommIdentityImport, first.ticket, 'alice', false)).data.error.code).toBe('ticket_expired')
+  })
   it('cancelling the open dialog yields no ticket and nothing else happens', async () => {
     showOpenDialog.mockResolvedValueOnce({ canceled: true, filePaths: [] })
     expect(await call(IpcChannels.CommImportPick)).toEqual({ ok: false, cancelled: true })
@@ -789,15 +831,61 @@ describe('L4: whole-home import, relay list and unlock (dedicated IPC)', () => {
     expect((await call(IpcChannels.CommRelaySet, ['wss://a.example'])).data.error.code).toBe('cancelled')
     expect(seen).toHaveLength(0)
     showMessageBox.mockClear()
-    expect((await call(IpcChannels.CommRelaySet, ['wss://old.example'])).ok).toBe(true)
+    const same = await call(IpcChannels.CommRelaySet, ['wss://old.example'])
+    expect(same.ok).toBe(true)
+    // L-8: no dialog and NO daemon write; the answer is the current configuration
     expect(showMessageBox).not.toHaveBeenCalled()
+    expect(seen).toHaveLength(0)
+    expect(same.data).toEqual({ ok: true, data: { relays: ['wss://old.example'], source: 'config', configured: true } })
+    // the stored list is compared in normalized form
+    currentRelays = { relays: ['wss://Old.Example/'], configured: true }
+    expect((await call(IpcChannels.CommRelaySet, ['wss://old.example'])).ok).toBe(true)
+    expect(seen).toHaveLength(0)
+    // an unconfigured daemon always needs the write
+    currentRelays = { relays: ['wss://old.example'], configured: false }
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    await call(IpcChannels.CommRelaySet, ['wss://old.example'])
     expect(seen).toHaveLength(1)
+  })
+  it('L-9: ws:// is accepted for loopback hosts only', async () => {
+    showMessageBox.mockResolvedValue({ response: 0 })
+    const list = ['ws://localhost', 'ws://127.0.0.1:9', 'ws://127.8.8.8', 'ws://[::1]:7777']
+    expect((await call(IpcChannels.CommRelaySet, list)).ok).toBe(true)
+    expect(JSON.parse(seen[0]!.body).relays).toEqual(list)
+    showMessageBox.mockReset()
+  })
+  it('M-1: the dialog shows every relay in full, one per line, even for 8 maximum-length URLs', async () => {
+    const urls = Array.from({ length: 8 }, (_, i) => `wss://r.example/${String(i).repeat(3)}${'p'.repeat(256 - 'wss://r.example/'.length - 3)}`)
+    expect(urls.every((u) => u.length === 256)).toBe(true)
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    expect((await call(IpcChannels.CommRelaySet, urls)).ok).toBe(true)
+    const detail = (showMessageBox.mock.calls.at(-1)!.at(-1) as { detail: string }).detail
+    const lines = detail.split('\n').slice(0, 8)
+    expect(lines).toEqual(urls) // nothing clipped, nothing hidden, same order
+    expect(detail).not.toContain('truncated')
+    expect(JSON.parse(seen[0]!.body).relays).toEqual(urls)
+  })
+  it('M-2: the dialog and the daemon get the normalized form', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    await call(IpcChannels.CommRelaySet, ['WSS://Relay.Example:443/Path'])
+    expect((showMessageBox.mock.calls.at(-1)!.at(-1) as { detail: string }).detail.startsWith('wss://relay.example/Path\n')).toBe(true)
+    expect(JSON.parse(seen[0]!.body)).toEqual({ relays: ['wss://relay.example/Path'] })
   })
   it.each([
     ['not an array', 'wss://a.example'],
     ['empty', []],
     ['nine entries', Array.from({ length: 9 }, (_, i) => `wss://r${i}.example`)],
     ['https scheme', ['https://a.example']],
+    ['ws:// to a non-loopback host', ['ws://relay.example']],
+    ['ws:// to a lookalike of localhost', ['ws://localhost.evil.example']],
+    ['Cyrillic homoglyph host', ['wss://\u0440elay.example']],
+    ['RLO in the path', ['wss://relay.example/\u202Egpj']],
+    ['zero-width space', ['wss://relay\u200B.example']],
+    ['fragment', ['wss://relay.example/#frag']],
+    ['query string', ['wss://relay.example/?q=1']],
+    ['userinfo', ['user@relay.example', 'wss://user@relay.example']],
+    ['257-character url', [`wss://r.example/${'p'.repeat(257 - 'wss://r.example/'.length)}`]],
+    ['eight valid and one hidden over-long url', [...Array.from({ length: 7 }, (_, i) => `wss://r${i}.example`), `wss://r.example/${'p'.repeat(300)}`]],
     ['no scheme', ['a.example']],
     ['credentials in the url', ['wss://user:pw@a.example']],
     ['whitespace', ['wss://a.example /x']],

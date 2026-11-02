@@ -1403,7 +1403,7 @@ export interface paths {
         put?: never;
         /**
          * Back up an identity's private key to a password-encrypted file
-         * @description Needs Hyphae v0.28.0 or newer (`409 hyphae_too_old` otherwise, decided from the installed binary's own `--help`). Runs `hyphae identity export --format ncryptsec --password-stdin` (no `--out`) with the keystore password (from the system keychain) and `backup_password` on stdin, one per line; Hyphae answers with the NIP-49 `ncryptsec1…` ciphertext on stdout, so the plaintext key never enters the daemon. The daemon validates it strictly (bech32 checksum, HRP, payload length, version, log_n <= 19), opens it with `backup_password` and checks it derives the identity's npub (a backup that would not restore is never written), and only then creates the file itself, relative to a directory descriptor pinned before the export: exclusive create of a random staging name (mode 0600), write, fsync, `linkat` to `path` (which never replaces anything), unlink the staging name, fsync the directory. After publishing it checks that the final name is the very inode it wrote (`fstatat` without following links, compared by device and inode) and takes the file back if not. On file systems without hard links (FAT, exFAT, some SMB mounts; `linkat` fails with EPERM, ENOTSUP, EOPNOTSUPP, EXDEV or EMLINK) it renames the staging file with `RENAME_EXCL` (macOS) or `RENAME_NOREPLACE` (Linux), which also never overwrites; if that is unsupported too the answer is `422 filesystem_unsupported`. An existing target of any kind is refused with `409 conflict` and `data.reason = "target_exists"`. `path` must be absolute and outside the Hyphae data directory. Neither the key, the backup nor the backup password is part of the response or a log line. Only the desktop's ProductHost credential may call it (legacy shared-token mode and every other audience get `403`), because the caller chooses the password that encrypts the key. One export runs at a time (`409` with `data.reason = "export_in_progress"`). The desktop does not expose it through the renderer proxy; its main process confirms natively, collects the password in its own window and picks `path` with a native save dialog. There is no CLI command yet (it needs the CORE-2d presence proof for CommWrite).
+         * @description Needs Hyphae v0.28.0 or newer (`409 hyphae_too_old` otherwise, decided from the installed binary's own `--help`). Runs `hyphae identity export --format ncryptsec --password-stdin` (no `--out`) with the keystore password (from the system keychain) and `backup_password` on stdin, one per line; Hyphae answers with the NIP-49 `ncryptsec1…` ciphertext on stdout, so the plaintext key never enters the daemon. The daemon validates it strictly (bech32 checksum, HRP, payload length, version, log_n <= 19), opens it with `backup_password` and checks it derives the identity's npub (a backup that would not restore is never written), and only then creates the file itself, relative to a directory descriptor pinned before the export: exclusive create of a random staging name (mode 0600), write, fsync, `linkat` to `path` (which never replaces anything), unlink the staging name, fsync the directory. After publishing it checks that the final name is the very inode it wrote (`fstatat` without following links, compared by device and inode) and takes the file back if not. On file systems without hard links (FAT, exFAT, some SMB mounts; `linkat` fails with EPERM, ENOTSUP, EOPNOTSUPP, EXDEV or EMLINK) it renames the staging file with `RENAME_EXCL` (macOS) or `RENAME_NOREPLACE` (Linux), which also never overwrites; if that is unsupported too (exFAT on macOS) it creates the final name directly with `O_EXCL` (never replacing anything; a crash mid-write can leave a partial, undecryptable file) and only if that is refused as well the answer is `422 filesystem_unsupported`. EPERM/EACCES from any of these steps is `422 permission_denied`. An existing target of any kind is refused with `409 conflict` and `data.reason = "target_exists"`. `path` must be absolute and outside the Hyphae data directory. Neither the key, the backup nor the backup password is part of the response or a log line. Only the desktop's ProductHost credential may call it (legacy shared-token mode and every other audience get `403`), because the caller chooses the password that encrypts the key. One export runs at a time (`409` with `data.reason = "export_in_progress"`). The desktop does not expose it through the renderer proxy; its main process confirms natively, collects the password in its own window and picks `path` with a native save dialog. There is no CLI command yet (it needs the CORE-2d presence proof for CommWrite).
          */
         post: operations["exportCommIdentity"];
         delete?: never;
@@ -1493,7 +1493,10 @@ export interface paths {
         };
         /** List configured relays */
         get: operations["listCommRelays"];
-        /** Replace the relay list (full replace, at most 8) */
+        /**
+         * Replace the relay list (full replace, at most 8)
+         * @description Each URL: 1..256 characters of printable ASCII, `wss://` (or `ws://` for loopback hosts only: localhost, 127.0.0.0/8, [::1]), a host, no userinfo, no query string, no fragment (`400 invalid`).
+         */
         put: operations["setCommRelays"];
         post?: never;
         delete?: never;
@@ -3578,7 +3581,7 @@ export interface components {
          * @description Closed set (COMM-HYPHAE.md section 4).
          * @enum {string}
          */
-        CommErrorCode: "hyphae_unsupported_platform" | "hyphae_download_failed" | "hyphae_hash_mismatch" | "binary_rejected" | "unsupported_platform" | "locked" | "not_configured" | "invalid" | "not_found" | "confirm_required" | "conflict" | "network" | "partial" | "timeout" | "upstream" | "hyphae_too_old" | "bad_backup_password" | "invalid_key" | "nickname_exists" | "keystore_locked" | "nickname_too_long" | "still_terminating" | "filesystem_unsupported";
+        CommErrorCode: "hyphae_unsupported_platform" | "hyphae_download_failed" | "hyphae_hash_mismatch" | "binary_rejected" | "unsupported_platform" | "locked" | "not_configured" | "invalid" | "not_found" | "confirm_required" | "conflict" | "network" | "partial" | "timeout" | "upstream" | "hyphae_too_old" | "bad_backup_password" | "invalid_key" | "nickname_exists" | "keystore_locked" | "nickname_too_long" | "still_terminating" | "filesystem_unsupported" | "permission_denied";
         /** @description Hyphae's own failure envelope shape, NOT the kernel `Error`: comm routes answer `{ok:false,error,message,data?}`. */
         CommError: {
             /** @constant */
@@ -6907,7 +6910,7 @@ export interface operations {
                     "application/json": components["schemas"]["CommError"];
                 };
             };
-            /** @description `filesystem_unsupported`: the destination's file system supports neither hard links nor an exclusive rename; choose another folder */
+            /** @description `filesystem_unsupported` (the destination's file system cannot publish a file safely; choose another folder) or `permission_denied` (the folder is not writable) */
             422: {
                 headers: {
                     [name: string]: unknown;

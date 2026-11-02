@@ -74,27 +74,57 @@ export function backupFileStem(nickname: string): string {
 }
 
 export const MAX_RELAYS = 8
-const MAX_RELAY_URL_LENGTH = 512
+/** Longest relay URL, raw and normalized. The confirmation dialog shows every
+ *  URL in full, so the whole list always fits in it: MAX_RELAYS lines of at most
+ *  this many characters. Mirrors the daemon's `MAX_RELAY_URL_BYTES`. */
+export const MAX_RELAY_URL_LENGTH = 256
+/** What the relay confirmation can show without truncating anything. */
+export const RELAY_DIALOG_MAX_CHARS = MAX_RELAYS * (MAX_RELAY_URL_LENGTH + 1)
+
+const PRINTABLE_ASCII = /^[\x21-\x7e]+$/
+
+function isLoopbackHost(hostname: string): boolean {
+  if (hostname === 'localhost' || hostname === '[::1]') return true
+  const v4 = /^(\d{1,3})\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.exec(hostname)
+  return v4 !== null && Number(v4[1]) === 127
+}
 
 /**
- * The relay list the page asked for, or null if any part is unusable: 1..8
- * distinct `ws://` / `wss://` URLs with a host, no credentials, no whitespace or
- * control characters. The strings are returned exactly as given (the daemon
- * gets what was validated, not a re-serialised form).
+ * One relay URL in the form that is both shown and sent, or null if unusable:
+ * printable ASCII only in the raw text (so no homoglyph, bidi or zero-width
+ * character can be hidden in it), `wss://` (or `ws://` for loopback only), a
+ * host, no userinfo, no query, no fragment. `URL` normalizes (lower-case host,
+ * punycode, default port dropped); a bare "/" path is dropped again so a plain
+ * `wss://host` stays `wss://host`.
+ */
+export function normalizeRelayUrl(entry: unknown): string | null {
+  if (typeof entry !== 'string' || entry.length > MAX_RELAY_URL_LENGTH || !PRINTABLE_ASCII.test(entry)) return null
+  if (entry.includes('?') || entry.includes('#') || entry.includes('@')) return null
+  let url: URL
+  try { url = new URL(entry) } catch { return null }
+  if (!/^wss?:\/\//i.test(entry)) return null
+  if (!url.hostname || url.username || url.password || url.search || url.hash) return null
+  if (url.protocol === 'ws:' && !isLoopbackHost(url.hostname)) return null
+  if (url.protocol !== 'ws:' && url.protocol !== 'wss:') return null
+  const href = url.pathname === '/' ? url.href.slice(0, -1) : url.href
+  return href.length <= MAX_RELAY_URL_LENGTH ? href : null
+}
+
+/**
+ * The relay list the page asked for in normalized form, or null if any part is
+ * unusable: 1..8 distinct valid relays (see {@link normalizeRelayUrl}).
  */
 export function parseRelayList(value: unknown): string[] | null {
   if (!Array.isArray(value) || value.length < 1 || value.length > MAX_RELAYS) return null
   const seen = new Set<string>()
+  const out: string[] = []
   for (const entry of value) {
-    if (typeof entry !== 'string' || entry.length === 0 || entry.length > MAX_RELAY_URL_LENGTH) return null
-    // eslint-disable-next-line no-control-regex
-    if (/[\s\u0000-\u001f\u007f-\u009f]/.test(entry)) return null
-    let url: URL
-    try { url = new URL(entry) } catch { return null }
-    if (url.protocol !== 'wss:' && url.protocol !== 'ws:') return null
-    if (!url.hostname || url.username || url.password) return null
-    if (!/^wss?:\/\//.test(entry) || seen.has(entry)) return null
-    seen.add(entry)
+    const normalized = normalizeRelayUrl(entry)
+    if (normalized === null || seen.has(normalized)) return null
+    seen.add(normalized)
+    out.push(normalized)
   }
-  return [...value] as string[]
+  // Defensive: the dialog lists one line per relay and must never truncate.
+  if (out.join('\n').length > RELAY_DIALOG_MAX_CHARS) return null
+  return out
 }

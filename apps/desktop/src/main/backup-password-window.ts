@@ -28,6 +28,11 @@ const SINGLE_FIELD = {
   homeImport: { title: 'backupPw.homeTitle', rules: 'backupPw.homeRules', label: 'backupPw.homePassword', busy: 'backupPw.working' },
 } as const
 
+/** A restore password may be at most what the backup rules allow (1024 bytes);
+ *  a keystore password (unlock, home import) up to the daemon's PASSWORD_MAX. */
+export const KEYSTORE_PASSWORD_MAX_BYTES = 4096
+const maxBytes = (mode: BackupPasswordMode): number => (mode === 'restore' ? 1024 : KEYSTORE_PASSWORD_MAX_BYTES)
+
 const titleKey = (mode: BackupPasswordMode) => (mode === 'export' ? 'backupPw.title' : SINGLE_FIELD[mode].title)
 
 export interface BackupWindowOptions {
@@ -127,8 +132,8 @@ function openPasswordWindow<T>(
       if (mode === 'export') {
         if (first !== second) { event.sender.send(BACKUP_PW_ERROR, mt('backupPw.mismatch')); return }
         if (!isSafeBackupPassword(first)) { event.sender.send(BACKUP_PW_ERROR, mt('backupPw.invalid')); return }
-      } else if (!first || Buffer.byteLength(first, 'utf8') > 1024 || /[\r\n\0]/.test(first)) {
-        event.sender.send(BACKUP_PW_ERROR, mt('backupPw.restoreInvalid'))
+      } else if (!first || Buffer.byteLength(first, 'utf8') > maxBytes(mode) || /[\r\n\0]/.test(first)) {
+        event.sender.send(BACKUP_PW_ERROR, mt(mode === 'restore' ? 'backupPw.restoreInvalid' : 'backupPw.passwordInvalid'))
         return
       }
       working = true

@@ -13,7 +13,7 @@ import { daemonCliEndpoint, daemonConnection, getBackendEndpoint } from '../back
 import { findAllowedRoute, proxyError, proxyRequest, timeoutFor, withKnowledgeBinding } from '../backend-proxy'
 import type { KnowledgeController } from '../knowledge-settings'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
-import { backupFileStem, isSafeBackupPassword, isSafeMessage, isSafeName, isValidNpub, parseRelayList } from '../comm-validate'
+import { backupFileStem, isSafeBackupPassword, isSafeMessage, isSafeName, isValidNpub, normalizeRelayUrl, parseRelayList } from '../comm-validate'
 import { readBackupFile } from '../backup-file'
 import {
   promptBackupPassword as openBackupPasswordWindow,
@@ -249,6 +249,8 @@ const EXPORT_TIMEOUT_MS = 90_000
  */
 interface PendingBackup { id: string; ncryptsec: string; expires: number; attemptsLeft: number }
 let pendingBackup: PendingBackup | null = null
+/** Bumped by every new pick: flows started under an older one can never put their ticket back. */
+let backupEpoch = 0
 const IMPORT_TICKET_TTL_MS = 5 * 60_000
 const IMPORT_MAX_ATTEMPTS = 3
 
@@ -626,6 +628,10 @@ export function registerIpcHandlers(options: {
   // password in its own window (with an in-window "decrypting…" state and
   // retry on a wrong password) and calls the daemon.
   handle(IpcChannels.CommImportPick, async (event): Promise<CommImportPickResult> => {
+    // Starting a new pick ends the old selection at once, whatever this pick
+    // turns out to be (cancelled, unreadable, not a backup).
+    const epoch = ++backupEpoch
+    pendingBackup = null
     const win = BrowserWindow.fromWebContents(event.sender)
     const options: Electron.OpenDialogOptions = {
       title: mt('comm.restoreOpen'),
@@ -643,8 +649,9 @@ export function registerIpcHandlers(options: {
     // Read ONCE, here: from now on only these bytes are used, never the path.
     const read = readBackupFile(file)
     if (!read.ok) return { ok: false, cancelled: false, message: mt('err.invalidBackupFile') }
+    // Another pick started while the dialog was open: this one is stale.
+    if (epoch !== backupEpoch) return { ok: false, cancelled: true }
     const ticket = randomBytes(16).toString('hex')
-    // Replaces any older selection, which thereby stops working.
     pendingBackup = { id: ticket, ncryptsec: read.ncryptsec, expires: Date.now() + IMPORT_TICKET_TTL_MS, attemptsLeft: IMPORT_MAX_ATTEMPTS }
     return { ok: true, ticket, fileName: path.basename(file) }
   })
@@ -654,10 +661,12 @@ export function registerIpcHandlers(options: {
         return invalidRequest('invalid restore request')
       }
       const entry = pendingBackup
+      if (entry && entry.expires < Date.now()) pendingBackup = null // expired: drop the bytes
       if (!entry || entry.id !== ticket || entry.expires < Date.now()) {
         return { ok: false, status: 410, data: { error: { code: 'ticket_expired', message: mt('err.noBackupTicket') } } }
       }
       pendingBackup = null // consumed: re-armed below only on a non-success
+      const epoch = backupEpoch
       const win = BrowserWindow.fromWebContents(event.sender)
       // This flow itself uses one attempt; every further try inside the open
       // window uses another, so the window cannot be used to bypass the limit
@@ -703,7 +712,7 @@ export function registerIpcHandlers(options: {
       // but only a few times, never past the original expiry, and never over a
       // newer pick.
       const finished = result !== null && result.ok
-      if (!finished && pendingBackup === null && budget > 0 && entry.expires > Date.now()) {
+      if (!finished && epoch === backupEpoch && pendingBackup === null && budget > 0 && entry.expires > Date.now()) {
         pendingBackup = { ...entry, attemptsLeft: budget }
       }
       return result ?? cancelled()
@@ -789,12 +798,16 @@ export function registerIpcHandlers(options: {
       if (!list) return invalidRequest('invalid relay list')
       const current = await proxyToBackend({ method: 'GET', path: '/api/v1/comm/relay' })
       const existing = (current.data as { data?: { relays?: unknown; configured?: unknown } } | null)?.data
+      // Compared in normalized form (the daemon stores what main sent).
       const unchanged = current.ok && existing?.configured === true && Array.isArray(existing.relays) &&
-        existing.relays.length === list.length && existing.relays.every((url, i) => url === list[i])
-      if (!unchanged) {
-        const ok = await confirmNative(event, mt('comm.relaySet', { count: list.length }), `${clip(list.join('\n'), 800)}\n\n${mt('comm.relaySetDetail')}`)
-        if (!ok) return cancelled()
-      }
+        existing.relays.length === list.length && existing.relays.every((url, i) => normalizeRelayUrl(url) === list[i])
+      // Nothing to change: no dialog, no PUT (a PUT restarts the daemon); the
+      // current configuration is the answer.
+      if (unchanged) return current
+      // One line per relay, every URL in full and exactly as it will be sent
+      // (parseRelayList bounds the whole list, so nothing is ever clipped).
+      const ok = await confirmNative(event, mt('comm.relaySet', { count: list.length }), `${list.join('\n')}\n\n${mt('comm.relaySetDetail')}`)
+      if (!ok) return cancelled()
       return proxyToBackend({ method: 'PUT', path: '/api/v1/comm/relay', body: { relays: list } })
     }),
   )

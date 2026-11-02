@@ -2778,8 +2778,10 @@ paths:
         following links, compared by device and inode) and takes the file back if not. On file systems
         without hard links (FAT, exFAT, some SMB mounts; `linkat` fails with EPERM, ENOTSUP, EOPNOTSUPP,
         EXDEV or EMLINK) it renames the staging file with `RENAME_EXCL` (macOS) or `RENAME_NOREPLACE`
-        (Linux), which also never overwrites; if that is unsupported too the answer is
-        `422 filesystem_unsupported`.
+        (Linux), which also never overwrites; if that is unsupported too (exFAT on macOS) it creates the final
+        name directly with `O_EXCL` (never replacing anything; a crash mid-write can leave a partial, undecryptable
+        file) and only if that is refused as well the answer is `422 filesystem_unsupported`. EPERM/EACCES from
+        any of these steps is `422 permission_denied`.
         An existing target of any kind is refused with `409 conflict` and `data.reason = "target_exists"`.
         `path` must be absolute and outside the Hyphae data directory. Neither the key, the backup nor the
         backup password is part of the response or a log line. Only the desktop's ProductHost credential may
@@ -2834,7 +2836,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/CommError"
         "422":
-          description: "`filesystem_unsupported`: the destination's file system supports neither hard links nor an exclusive rename; choose another folder"
+          description: "`filesystem_unsupported` (the destination's file system cannot publish a file safely; choose another folder) or `permission_denied` (the folder is not writable)"
           content:
             application/json:
               schema:
@@ -3093,6 +3095,9 @@ paths:
       operationId: setCommRelays
       tags: [comm]
       summary: Replace the relay list (full replace, at most 8)
+      description: >-
+        Each URL: 1..256 characters of printable ASCII, `wss://` (or `ws://` for loopback hosts only:
+        localhost, 127.0.0.0/8, [::1]), a host, no userinfo, no query string, no fragment (`400 invalid`).
       requestBody:
         required: true
         content:
@@ -3101,7 +3106,7 @@ paths:
               type: object
               required: [relays]
               properties:
-                relays: { type: array, maxItems: 8, items: { type: string } }
+                relays: { type: array, minItems: 1, maxItems: 8, items: { type: string, minLength: 1, maxLength: 256, pattern: '^[!-~]+$' } }
       responses:
         "200":
           description: Hyphae envelope `{ok:true,data}`
@@ -7082,7 +7087,7 @@ components:
     CommErrorCode:
       type: string
       description: Closed set (COMM-HYPHAE.md section 4).
-      enum: [hyphae_unsupported_platform, hyphae_download_failed, hyphae_hash_mismatch, binary_rejected, unsupported_platform, locked, not_configured, invalid, not_found, confirm_required, conflict, network, partial, timeout, upstream, hyphae_too_old, bad_backup_password, invalid_key, nickname_exists, keystore_locked, nickname_too_long, still_terminating, filesystem_unsupported]
+      enum: [hyphae_unsupported_platform, hyphae_download_failed, hyphae_hash_mismatch, binary_rejected, unsupported_platform, locked, not_configured, invalid, not_found, confirm_required, conflict, network, partial, timeout, upstream, hyphae_too_old, bad_backup_password, invalid_key, nickname_exists, keystore_locked, nickname_too_long, still_terminating, filesystem_unsupported, permission_denied]
     CommError:
       type: object
       description: >-

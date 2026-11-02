@@ -183,6 +183,28 @@ describe('unlock and home-import password windows (L4)', () => {
     emit(BACKUP_PW_SUBMIT, fromWindow(windows[1]!), 'old-pass', 'old-pass')
     await expect(other).resolves.toBe('home:old-pass')
   })
+  it('L-7: keystore passwords may be up to 4096 bytes; the invalid text is not the restore text', async () => {
+    for (const run of [promptUnlockPassword, promptHomeImportPassword]) {
+      const work = vi.fn(async () => ({ done: true as const, value: 1 }))
+      const result = run(null, work)
+      const w = windows.at(-1)!
+      const tooLong = 'x'.repeat(4097)
+      emit(BACKUP_PW_SUBMIT, fromWindow(w), tooLong, tooLong)
+      expect(work).not.toHaveBeenCalled()
+      expect(w.webContents.sent.at(-1)).toEqual([BACKUP_PW_ERROR, 'Enter the password (one line, at most 4096 bytes)'])
+      const ok = 'é'.repeat(2048) // exactly 4096 UTF-8 bytes
+      emit(BACKUP_PW_SUBMIT, fromWindow(w), ok, ok)
+      await expect(result).resolves.toBe(1)
+      expect(work).toHaveBeenCalledWith(ok)
+    }
+  })
+  it('L-7: the restore window still stops at 1024 bytes with its own text', () => {
+    void promptRestorePassword(null, async () => ({ done: true as const, value: 1 }))
+    const w = windows.at(-1)!
+    const long = 'x'.repeat(1025)
+    emit(BACKUP_PW_SUBMIT, fromWindow(w), long, long)
+    expect(w.webContents.sent.at(-1)).toEqual([BACKUP_PW_ERROR, 'Enter the backup password (one line, at most 1024 bytes)'])
+  })
   it('rejects an empty or multi-line password in main', async () => {
     const work = vi.fn(async () => ({ done: true as const, value: 1 }))
     void promptUnlockPassword(null, work)
