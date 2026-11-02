@@ -14,6 +14,7 @@
 pub mod client;
 pub mod data_dir;
 pub mod events;
+pub mod shutdown_bounds;
 pub mod state_file;
 pub mod types;
 pub mod version;

@@ -28,9 +28,9 @@ fn workspace_recovery_instant_at(
 
 // A shutdown's budgets and deadlines — the HTTP drain's fixed 1.5s, the
 // out-of-process modules' drain and stop grace (tunable: `A24_MODULE_DRAIN_MS`,
-// `A24_MODULE_STOP_GRACE_MS`), the time to put the summary on disk, and the
+// `A24_COMPONENT_STOP_GRACE_MS`), the time to put the summary on disk, and the
 // watchdog after all of them — live in `crate::lifecycle` (SHUT-1b). At the
-// defaults `kill -TERM` ends the process within 2s (TASKS B2).
+// defaults `kill -TERM` ends the process within 16.5s, or about 50.6s while a managed iDoris holds the summary open (ADR-038 D5 raised the stop grace to 15s; TASKS B2's 2s now holds only with a lowered grace).
 
 #[derive(Clone)]
 pub struct AppState {
@@ -56,6 +56,10 @@ pub struct AppState {
     pub router: Arc<ModelRouter>,
     pub idoris_host: Option<Arc<agent24d::idoris_host::IdorisHost>>,
     pub idoris_unavailable: bool,
+    /// Where the Hyphae daemon supervisor lives, once `serve` has one (`/api/v1/components`).
+    pub comm_slot: Option<Arc<crate::comm_routes::CommDaemonSlot>>,
+    /// What the desktop reported about the components it owns (ADR-038 D5).
+    pub component_reports: Arc<crate::component_routes::ComponentReports>,
     pub managed_idoris: Option<Arc<agent24d::managed_idoris::ManagedIdoris>>,
     pub tools: Arc<agent24_tools::ToolRegistry>,
     /// H2: the user's risk overrides. Held here as well as inside the registry
@@ -283,6 +287,20 @@ impl Shutdown {
     #[must_use]
     pub fn child_token(&self) -> CancellationToken {
         self.token.child_token()
+    }
+
+    /// Resolves when in-flight model calls of modules and attached modules must be
+    /// cancelled: the drain plus the per-call cancel grace
+    /// ([`crate::lifecycle::CALL_CANCEL_GRACE`], ADR-038 D6), capped by the stop grace when that
+    /// is shorter and never stretched by it. Attached modules get no SIGTERM, so a 15s stop
+    /// grace must not keep their calls alive. Stored
+    /// instant, like [`Shutdown::modules_cut_off`].
+    pub fn calls_cut_off(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let shutdown = self.clone();
+        async move {
+            shutdown.token.cancelled().await;
+            tokio::time::sleep_until(shutdown.deadlines().calls).await;
+        }
     }
 
     /// Resolves when a module still being stopped by `os disable` must be
@@ -708,6 +726,8 @@ impl AppState {
             managed_idoris: None,
             idoris_host: None,
             idoris_unavailable: false,
+            comm_slot: None,
+            component_reports: Arc::default(),
             tools,
             broker,
             module_approval_broker,
@@ -1021,10 +1041,17 @@ async fn auth(State(state): State<AppState>, req: Request<Body>, next: Next) -> 
 /// it: it would let any local process produce a backup it can decrypt.
 fn host_only_route(method: &Method, path: &str) -> bool {
     method == Method::POST
-        && matches!(
+        && (matches!(
             path,
             "/api/v1/comm/identity/export" | "/api/v1/comm/identity/import"
-        )
+        ) || is_component_report(path))
+}
+
+/// `/api/v1/components/{id}/report`: the desktop's status push (ADR-038 D5).
+fn is_component_report(path: &str) -> bool {
+    path.strip_prefix("/api/v1/components/")
+        .and_then(|rest| rest.strip_suffix("/report"))
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
 /// Single shared token. Does not consult the route catalog or assurance levels,
@@ -1423,6 +1450,11 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
     }
     let kernel = Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/components", get(crate::component_routes::list))
+        .route(
+            "/api/v1/components/{id}/report",
+            post(crate::component_routes::report),
+        )
         .route("/api/v1/idoris/status", get(crate::idoris_routes::status))
         .route(
             "/api/v1/idoris/install",
@@ -1893,6 +1925,12 @@ pub async fn serve(
     let shutdown = Shutdown::with_params(cancel.clone(), params);
     let idoris_root =
         agent24_idoris::install::default_install_root().map_err(std::io::Error::other)?;
+    // ADR-038 D1: releases live under <data dir>/components/idoris; the legacy
+    // root above keeps only state and any not-yet-migrated release.
+    let idoris_install_root = agent24_idoris::install::managed_root(
+        &agent24_protocol::state_file::state_dir()
+            .ok_or_else(|| std::io::Error::other("data directory is unavailable"))?,
+    );
     if !ephemeral {
         shutdown
             .idoris_budget
@@ -2041,6 +2079,30 @@ pub async fn serve(
             (String::new(), Some(store), bearer)
         }
     };
+    // CORE-5 5f-3: a marker or an unfinished upgrade docks here, before any
+    // store, task or listener of the business daemon exists. `ENABLED` is
+    // false, so this is skipped and startup is exactly the code below.
+    if !ephemeral
+        && let Some(dir) = agent24_protocol::state_file::state_dir()
+        && let Some(docking) =
+            crate::docked_startup::pre_start(crate::docked_startup::guard_enabled(), &dir).await
+    {
+        let launch = crate::docked_startup::Launch {
+            data_dir: &dir,
+            port,
+            auth_mode,
+            enroll: mode != StartupMode::Legacy,
+            generation: daemon_generation,
+            capabilities: capability_store,
+            ready: match host_ready.take() {
+                Some(writer) => crate::docked_startup::ReadyOut::Host(writer),
+                None => crate::docked_startup::ReadyOut::Stdout,
+            },
+            shutdown,
+            lock: _singleton,
+        };
+        return crate::docked_startup::serve_docked(launch, docking).await;
+    }
     // Store: file-backed under ~/.agent24 (ephemeral instances get :memory:)
     let store = if ephemeral {
         Store::open_memory().await.map_err(std::io::Error::other)?
@@ -2088,6 +2150,7 @@ pub async fn serve(
     let mut idoris_host = if let Some(managed) = &managed_idoris {
         match agent24d::idoris_host::IdorisHost::system(
             idoris_root,
+            idoris_install_root,
             managed.clone(),
             router.clone(),
         ) {
@@ -2814,7 +2877,7 @@ pub async fn serve(
         let shutdown = shutdown.clone();
         async move {
             shutdown.token().cancelled().await;
-            tokio::time::sleep_until(shutdown.deadlines().modules).await;
+            tokio::time::sleep_until(shutdown.deadlines().calls + crate::lifecycle::CONFIRM).await;
         }
     };
     let (usage_recorder, usage_writer) =
@@ -2829,7 +2892,7 @@ pub async fn serve(
     let model_deps = crate::model_callback::ModelCallbackDeps {
         router: state.router.clone(),
         usage: usage_recorder.clone(),
-        cancel_root: crate::model_callback::spawn_cancel_root(shutdown.modules_cut_off()),
+        cancel_root: crate::model_callback::spawn_cancel_root(shutdown.calls_cut_off()),
         admission: crate::model_callback::ModelAdmission::new(
             crate::model_callback::MODEL_MAX_IN_FLIGHT_GLOBAL,
             crate::model_callback::MODEL_MAX_IN_FLIGHT_PER_MODULE,
@@ -3096,6 +3159,7 @@ pub async fn serve(
     // there was nothing to stop.
     let comm_router =
         crate::comm_routes::build(&state_dir, params.stop_grace, &comm_daemon_slot).await;
+    state.comm_slot = Some(Arc::clone(&comm_daemon_slot));
     if state.auth_mode == AuthMode::Capabilities {
         // Package modules register an ANY-method proxy for their namespace.
         // Bind that registered surface and the exact manifest, not enabled flags.
@@ -3765,7 +3829,7 @@ pub(crate) mod tests {
     /// the module's `Generation` as part of stopping it — design
     /// §3.3's OWN "代次撤销" row, pre-existing `os-proto` machinery that
     /// independently cancels an in-flight model call within tens of
-    /// milliseconds of the SAME `spawn_cancel_root(shutdown.modules_cut_off())`
+    /// milliseconds of the SAME `spawn_cancel_root(shutdown.calls_cut_off())`
     /// cut-off. Measured with a real subprocess module (SIGTERM-ignoring, one
     /// proxied request kept in flight so its own drain doesn't finish early)
     /// and a real hung TCP provider: correct code closes the provider
@@ -3780,7 +3844,7 @@ pub(crate) mod tests {
     /// `shutdown.modules_cut_off()`, e.g. `shutdown.token().cancelled()` to
     /// fire at the START of shutdown instead of at cut-off) — turns it red.
     #[test]
-    fn the_model_callback_cancel_root_is_spawned_from_modules_cut_off() {
+    fn the_model_callback_cancel_root_is_spawned_from_calls_cut_off() {
         // Scoped to `serve()`'s OWN body — never to the whole file, which
         // would make this test tautological (the string above, in this
         // test's own source, would always make a whole-file `.contains`
@@ -3797,9 +3861,9 @@ pub(crate) mod tests {
             .expect("function must be brace-terminated");
         let body = &body[..end];
         assert!(
-            body.contains("spawn_cancel_root(shutdown.modules_cut_off())"),
+            body.contains("spawn_cancel_root(shutdown.calls_cut_off())"),
             "serve() must build ModelCallbackDeps.cancel_root as \
-             spawn_cancel_root(shutdown.modules_cut_off()) — design \
+             spawn_cancel_root(shutdown.calls_cut_off()) — design \
              docs/design/ME4-S2-model-callback.md §3.3"
         );
     }
@@ -4298,6 +4362,36 @@ pub(crate) mod tests {
         shutdown.modules_cut_off().await;
         let p = crate::lifecycle::Params::default();
         assert_eq!(began.elapsed(), p.drain + p.stop_grace);
+    }
+
+    /// In-flight model calls (and the usage recorder) are cut off at the drain plus the 2s
+    /// call-cancel grace, however long the stop grace is: attached modules get no SIGTERM,
+    /// so the 15s a package gets to flush must not keep their calls alive (ADR-038 D5/D6).
+    #[tokio::test(start_paused = true)]
+    async fn model_calls_are_cut_off_by_the_cancel_grace_not_the_stop_grace() {
+        let shutdown = Shutdown::new(CancellationToken::new());
+        let began = tokio::time::Instant::now();
+        let _ = shutdown.deadlines();
+        shutdown.token().cancel();
+        shutdown.calls_cut_off().await;
+        let p = crate::lifecycle::Params::default();
+        assert_eq!(
+            began.elapsed(),
+            p.drain + crate::lifecycle::CALL_CANCEL_GRACE
+        );
+        assert!(
+            began.elapsed() < p.drain + p.stop_grace,
+            "not the stop grace"
+        );
+        // a stop grace shorter than the cancel grace still ends it first
+        let short = crate::lifecycle::Params {
+            drain: Duration::from_millis(100),
+            stop_grace: Duration::from_millis(500),
+        };
+        assert_eq!(
+            short.deadlines(began).calls - began,
+            Duration::from_millis(600)
+        );
     }
 
     /// The shutdown waits for the stops `os disable` began, not only for the

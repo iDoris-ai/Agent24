@@ -10,8 +10,8 @@ import { checkOpenDesignSource, writeOpenDesignSourceStamp } from './open-design
 
 const execFileAsync = promisify(execFile)
 
-export const OPEN_DESIGN_SHA = '34bc2ba810cf894daff6a7c1736d1cef6c7726b1'
-export const OPEN_DESIGN_PIN_VERSION = '0.22.2'
+export const OPEN_DESIGN_SHA = '89d83b8c22871aaafc91afabfa1925564609e0db'
+export const OPEN_DESIGN_PIN_VERSION = '0.26.1'
 
 function requireAbsolutePath(value, label) {
   if (typeof value !== 'string' || value.length === 0 || !path.isAbsolute(value)) {

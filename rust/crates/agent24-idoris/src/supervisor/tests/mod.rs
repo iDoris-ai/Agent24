@@ -3,6 +3,12 @@
 use super::*;
 use crate::IdorisLock;
 
+const FIXTURE_FILES: [&str; 3] = [
+    "idoris",
+    "config/catalog.yaml",
+    "config/routing-policy.yaml",
+];
+
 fn healthy() -> serde_json::Value {
     serde_json::json!({
         "status": "ok", "service": "idoris", "version": "0.4.0",
@@ -115,7 +121,8 @@ impl Fixture {
     }
     async fn config(&self) -> StartConfig {
         let components = ComponentsDir::new(&self.root, &self.root.join("components")).unwrap();
-        let installed = InstalledVersion::fixture(self.root.join("release")).unwrap();
+        let installed =
+            InstalledVersion::fixture(self.root.join("release"), &FIXTURE_FILES).unwrap();
         let data = DataPaths {
             db: self.root.join("db.sqlite3"),
             state: self.root.join("state"),
@@ -562,7 +569,8 @@ async fn real_v040_ready_then_stop() {
     .unwrap();
     fs::remove_file(fixture.root.join("components/scenario.json")).unwrap();
     let mut config = fixture.config().await;
-    config.installed = InstalledVersion::fixture(fs::canonicalize(release).unwrap()).unwrap();
+    config.installed =
+        InstalledVersion::fixture(fs::canonicalize(release).unwrap(), &FIXTURE_FILES).unwrap();
     config.ports = Ports::default();
     config.timings = Timings::default();
     config.diagnostic_output = false;
@@ -662,8 +670,7 @@ async fn pre_cancel_and_token_deadline_fail_without_downgrade() {
 
 #[test]
 fn health_uses_lock_minimum_minor_and_allows_newer_minor() {
-    let mut lock: IdorisLock =
-        serde_json::from_str(include_str!("../../../idoris.lock.json")).unwrap();
+    let mut lock = IdorisLock::parse(include_str!("../../../idoris.lock.json")).unwrap();
     lock.min_contract_minor = 3;
     let mut body = healthy();
     body["contract_version"] = serde_json::json!("1.2.99");

@@ -47,6 +47,8 @@ tags:
     description: Health, version, and process-level daemon endpoints.
   - name: attached
     description: Attached module registrations and control.
+  - name: components
+    description: Component lifecycle state (ADR-038 D5).
   - name: timings
     description: Model-call timing rows and summaries.
   - name: chat
@@ -490,6 +492,72 @@ paths:
                 $ref: "#/components/schemas/Error"
         "503":
           $ref: "#/components/responses/ProviderUnavailable"
+
+  /components:
+    get:
+      operationId: listComponents
+      x-milestone: ADR-038-C3a
+      tags: [components]
+      summary: Lifecycle state of every component (ADR-038 D5)
+      description: |
+        One status model for iDoris, Hyphae, attached modules, Documents, Knowledge and Open
+        Design (whose state the desktop reports). Needs `components.read`; Creative tokens are
+        refused (403). The ProductHost audience, and legacy mode (one shared token that already
+        reads every full status route), get `ComponentView`. Every other audience gets
+        `ComponentRedactedView`: id, version, state and provides only, with no install path, pid,
+        port, error message, team id or commit. A first-party token carries only the operations it
+        was issued with, so one issued by an older daemon gets 403 here until it is re-issued. The older status routes (`/idoris/status`,
+        `/comm/daemon`, `/os`) are unchanged.
+      responses:
+        "200":
+          description: Components; each item is the full or the redacted variant by audience
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComponentList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /components/{id}/report:
+    post:
+      operationId: reportComponentState
+      x-milestone: ADR-038-C3a
+      tags: [components]
+      summary: The desktop reports the state of a component it owns (ADR-038 D5)
+      description: |
+        ProductHost audience only; legacy mode, first-party and Creative tokens get 403. Accepted
+        only for components whose state the desktop owns (today `open-design`); any other id is
+        404. The first report, or the first after the previous one expired, is taken as the
+        baseline. Otherwise whatever legal state is reported is stored and refreshes the report
+        (the daemon only aggregates); one that does not follow the last live report by a D5 edge
+        is logged and marked for the host as `detail.unexpected_transition` `{from, to}` on the
+        component. An unknown id is 404 before the body is read. A report expires 90 seconds after it was
+        received, after which the component reads `absent` with reason `not_reported`; the
+        desktop must re-send within that time.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ComponentReport"
+      responses:
+        "204":
+          description: Recorded
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
 
   /decide/profile:
     get:
@@ -1588,7 +1656,7 @@ paths:
       summary: The shutdown budgets in effect and the previous shutdown (authenticated)
       description: |
         SHUT-1c. The out-of-process modules' drain and stop grace
-        (`A24_MODULE_DRAIN_MS`, `A24_MODULE_STOP_GRACE_MS`), the exit bound
+        (`A24_MODULE_DRAIN_MS`, `A24_COMPONENT_STOP_GRACE_MS`), the exit bound
         they give, values that were rejected, and what this daemon found of
         the one before it — so a budget that is too tight can be found and
         adjusted. agent24d only.
@@ -3258,7 +3326,7 @@ paths:
       description: >-
         Always returns 200 when comm is not configured, with process.state not_configured.
         data.installable indicates a platform with both release asset and non-null lock hash.
-        data.installed_version is the component tag (v0.28.1) after full hash revalidation,
+        data.installed_version is the component tag (v0.29.0) after full hash revalidation,
         or null when absent or rejected. Developer and sibling binaries do not count as installed components.
       responses:
         "200":
@@ -4556,7 +4624,7 @@ components:
     IdorisStatus:
       type: object
       additionalProperties: false
-      required: [state, version, data_port, admin_port, roles, last_error, current_operation, verification, budget_suggestion, budget_unavailable_reason]
+      required: [state, version, data_port, admin_port, roles, last_error, current_operation, verification, budget_suggestion, budget_unavailable_reason, migration_pending, last_migration_error]
       properties:
         state:
           type: string
@@ -4583,6 +4651,13 @@ components:
         budget_unavailable_reason:
           type: [string, "null"]
           enum: [hardware_memory_unavailable, hardware_probe_failed, host_unavailable, null]
+        migration_pending:
+          type: boolean
+          description: The installed release is outside the ADR-038 managed root; the next Install re-downloads it there. The current install keeps working meanwhile.
+        last_migration_error:
+          anyOf:
+            - $ref: "#/components/schemas/IdorisErrorCode"
+            - type: "null"
     IdorisOperation:
       type: object
       additionalProperties: false
@@ -4611,7 +4686,7 @@ components:
       properties:
         installed_version:
           type: string
-          example: v0.28.1
+          example: v0.29.0
         path:
           type: string
           description: Absolute installed component path
@@ -4716,6 +4791,64 @@ components:
       required: [modules]
       properties:
         modules: { type: array, items: { $ref: "#/components/schemas/AttachedView" } }
+    ComponentState:
+      type: string
+      enum: [absent, installing, installed, starting, ready, degraded, stopping, stopped, incompatible, failed]
+    ComponentProvide:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string, description: Capability id (ADR-038 D9) }
+        name:
+          type: object
+          description: Localized display name, when the component's lock carries one
+          required: [zh, en, th]
+          properties:
+            zh: { type: string }
+            en: { type: string }
+            th: { type: string }
+    ComponentView:
+      type: object
+      description: Host view of one component.
+      required: [id, version, state, form, provides]
+      properties:
+        id: { type: string }
+        version: { type: [string, "null"] }
+        state: { $ref: "#/components/schemas/ComponentState" }
+        form:
+          type: string
+          enum: [resident, sidecar, cli, attach, remote, mcp]
+        provides: { type: array, items: { $ref: "#/components/schemas/ComponentProvide" } }
+        reason: { type: string, description: Short machine-readable cause; host only }
+        detail: { type: object, additionalProperties: true, description: "Ports, contract expectation, counters, messages; host only" }
+    ComponentRedactedView:
+      type: object
+      description: What every audience other than the host sees. No path, pid, port, message, team id or commit.
+      required: [id, version, state, provides]
+      properties:
+        id: { type: string }
+        version: { type: [string, "null"] }
+        state: { $ref: "#/components/schemas/ComponentState" }
+        provides: { type: array, items: { $ref: "#/components/schemas/ComponentProvide" } }
+    ComponentList:
+      type: object
+      required: [components]
+      properties:
+        components:
+          type: array
+          items:
+            # anyOf, not oneOf: a full view also satisfies the redacted schema.
+            anyOf:
+              - $ref: "#/components/schemas/ComponentView"
+              - $ref: "#/components/schemas/ComponentRedactedView"
+    ComponentReport:
+      type: object
+      additionalProperties: false
+      required: [state]
+      properties:
+        state: { $ref: "#/components/schemas/ComponentState" }
+        version: { type: string, minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9._+-]+$", description: Kept from the previous report when omitted }
+        reason: { type: string, maxLength: 256, description: No control characters; shown to the host only }
     AttachedUpdate:
       type: object
       required: [enabled]
@@ -4773,7 +4906,7 @@ components:
           type: integer
           minimum: 0
           maximum: 60000
-          description: From SIGTERM to the process gone, at the latest (2000 at the defaults).
+          description: From SIGTERM to the process gone, at the latest (16500 at the defaults, with no managed iDoris holding the shutdown open).
         config_warnings:
           type: array
           items:

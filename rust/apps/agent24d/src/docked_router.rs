@@ -29,9 +29,9 @@ use crate::migration_guard::dock::{
 use crate::migration_guard::manifest::{DbRecord, Manifest};
 use agent24_domain::http::error_response;
 
-/// `GET /api/v1/diagnostics/migration`. `error_summary` is the marker's bounded
-/// summary, capped at [`SUMMARY_MAX_CHARS`] here; it is NOT scrubbed on this
-/// side. The marker writer (5f-3) must build it from a closed set of messages.
+/// `GET /api/v1/diagnostics/migration`. `error_summary` is the closed-set text
+/// of the marker's `error_code` ([`DockCode::summary`]); the text stored in the
+/// marker file is ignored, so a hand-edited marker cannot put anything here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrationDiagnostics {
     pub attempt_id: String,
@@ -47,6 +47,7 @@ pub struct MigrationDiagnostics {
 }
 
 /// Read-side cap for `error_summary` (the marker type documents only "bounded").
+#[cfg(test)]
 pub const SUMMARY_MAX_CHARS: usize = 256;
 
 impl MigrationDiagnostics {
@@ -62,7 +63,7 @@ impl MigrationDiagnostics {
             code: m.error_code,
             rollback: m.rollback,
             retry_allowed: false,
-            error_summary: m.error_summary.chars().take(SUMMARY_MAX_CHARS).collect(),
+            error_summary: m.error_code.summary().to_owned(),
         }
     }
 }
@@ -628,23 +629,16 @@ mod tests {
         );
     }
 
-    /// A long or hostile marker summary is capped on a char boundary on read.
+    /// The stored summary is never served: the closed-set text of the code is.
     #[test]
-    fn long_or_hostile_summary_is_capped() {
+    fn stored_summary_text_is_ignored() {
         let mut m = marker();
-        for raw in [
-            "é".repeat(10_000),
-            format!("{} /Users/jason/secret.db", "x".repeat(5_000)),
-            "日本語".repeat(500),
-        ] {
-            m.error_summary = raw.clone();
+        for raw in ["é".repeat(10_000), "RAW /Users/jason/secret.db".to_owned()] {
+            m.error_summary = raw;
             let d = MigrationDiagnostics::from_marker(&m);
-            assert_eq!(d.error_summary.chars().count(), SUMMARY_MAX_CHARS);
-            assert!(raw.starts_with(&d.error_summary));
-            assert!(!d.error_summary.contains("secret.db"));
+            assert_eq!(d.error_summary, m.error_code.summary());
+            assert!(d.error_summary.chars().count() <= SUMMARY_MAX_CHARS);
         }
-        m.error_summary = "short".into();
-        assert_eq!(MigrationDiagnostics::from_marker(&m).error_summary, "short");
     }
 
     /// Full method matrix, no token: GET/HEAD reach the route's own gate, every

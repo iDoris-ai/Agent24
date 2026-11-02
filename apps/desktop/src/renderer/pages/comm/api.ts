@@ -215,6 +215,26 @@ function isUnlockResult(value: unknown): value is CommUnlockResult {
   return isRecord(value) && value['unlocked'] === true && typeof value['remembered'] === 'boolean'
 }
 
+/**
+ * Deadline for plain HTTP reads and writes through the generic proxy only.
+ * Never put it over an IPC that waits for a person (install, export, restore,
+ * unlock, home import, file pick): main keeps working after the page gives up,
+ * and the page would then show a failure for something that goes on to succeed.
+ */
+export const COMM_HTTP_TIMEOUT_MS = 90_000
+
+function withHttpTimeout<T>(work: Promise<T> | T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const pending = Promise.resolve(work)
+  void pending.catch(() => undefined)
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new CommApiError(translate(communicationMessages, 'error.timeout'), 504, 'timeout'))
+    }, COMM_HTTP_TIMEOUT_MS)
+  })
+  return Promise.race([pending, timeout]).finally(() => clearTimeout(timer))
+}
+
 async function request<T>(
   method: 'GET' | 'POST' | 'PUT',
   path: string,
@@ -223,8 +243,9 @@ async function request<T>(
 ): Promise<T> {
   let response: unknown
   try {
-    response = await window.agent24.backendProxy({ method, path, ...(body === undefined ? {} : { body }) })
-  } catch {
+    response = await withHttpTimeout(window.agent24.backendProxy({ method, path, ...(body === undefined ? {} : { body }) }))
+  } catch (error) {
+    if (error instanceof CommApiError) throw error
     throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)
   }
   return decodeEnvelope(response, validate)
@@ -287,7 +308,8 @@ async function viaIpc<T>(call: () => Promise<unknown>, validate: (value: unknown
   let response: unknown
   try {
     response = await call()
-  } catch {
+  } catch (error) {
+    if (error instanceof CommApiError) throw error
     throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)
   }
   return decodeEnvelope(response, validate)
@@ -391,6 +413,14 @@ export const exportCommIdentity = (nickname: string): Promise<CommExportResult> 
       warnings: exportWarnings(data['warnings']),
     }))
 
+/** Ask main to show the file just exported. Any other path is refused. */
+export function revealCommExport(filePath: string): Promise<void> {
+  return viaIpc(
+    () => window.agent24.commRevealExport(filePath),
+    (value): value is { path: string } => isRecord(value) && value['path'] === filePath,
+  ).then(() => undefined)
+}
+
 export type CommPickResult = { ticket: string; fileName: string } | null
 
 /** Native "choose a backup" dialog (in main, which reads and validates the file right away). Only the file NAME and an opaque ticket come back. */
@@ -398,7 +428,8 @@ export async function pickCommBackup(): Promise<CommPickResult> {
   let result: unknown
   try {
     result = await window.agent24.commImportPick()
-  } catch {
+  } catch (error) {
+    if (error instanceof CommApiError) throw error
     throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)
   }
   if (isRecord(result) && result['ok'] === true && string(result['ticket']) && string(result['fileName'])) {
