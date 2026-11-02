@@ -15,7 +15,7 @@ function seedValidSource(root) {
     'open-design',
     'open-design-web-standalone',
   ]) fs.mkdirSync(path.join(root, relative), { recursive: true })
-  fs.writeFileSync(path.join(root, 'app/package.json'), JSON.stringify({ version: '0.22.2' }))
+  fs.writeFileSync(path.join(root, 'app/package.json'), JSON.stringify({ version: '0.26.1' }))
   for (const relative of [
     'app/prebundled/agent24-headless.cjs',
     'app/prebundled/agent24-headless.mjs',
@@ -39,7 +39,7 @@ test('stages a valid tree with a direct in-tree relative symlink', () => {
     seedValidSource(tmp)
     fs.writeFileSync(path.join(tmp, 'open-design/target.txt'), 'ok')
     fs.symlinkSync('target.txt', path.join(tmp, 'open-design/link.txt'))
-    assert.match(runStage(tmp), /Staged Open Design 0\.22\.2 resources/)
+    assert.match(runStage(tmp), /Staged Open Design 0\.26\.1 resources/)
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
   }

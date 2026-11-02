@@ -1,9 +1,15 @@
 {
-  "schema": 1,
-  "tag": "v0.4.0",
-  "commit": "20136552cac476ccf6f266a3210a1a021c717ea3",
+  "schema": 2,
+  "id": "idoris",
+  "version": "v0.4.0",
+  "source": {
+    "repo": "https://github.com/iDoris-ai/iDoris",
+    "commit": "20136552cac476ccf6f266a3210a1a021c717ea3"
+  },
+  "contract": { "name": "idoris-http", "major": 1, "min_minor": 1, "tested": "1.1.0" },
+  "release_url_base": "https://github.com/iDoris-ai/iDoris/releases/download",
   "assets": {
-    "aarch64-apple-darwin": {
+    "darwin-arm64": {
       "name": "idoris-v0.4.0-aarch64-apple-darwin.tar.gz",
       "sha256": "ab46e0180090ef5143b8fb6ea98b0333f2ef9c3a137bab2dc3cf7307960476d5",
       "files": [
@@ -12,20 +18,30 @@
         "config/routing-policy.yaml",
         "config/components/omlx.yaml",
         "config/components/subscription.yaml"
-      ]
+      ],
+      "executables": ["idoris"]
     }
   },
-  "team_id": "HYAP444FN9",
-  "contract_major": 1,
-  "min_contract_minor": 1,
-  "tested_contract_version": "1.1.0",
-  "capabilities": [
+  "signing": { "macos_team_id": "HYAP444FN9", "notarized": true },
+  "provides": [
+    {
+      "id": "model-gateway",
+      "name": { "zh": "本地模型网关", "en": "Local model gateway", "th": "เกตเวย์โมเดลภายในเครื่อง" },
+      "summary": {
+        "zh": "把本机和订阅的模型统一成一个 OpenAI 兼容入口，并按策略路由。",
+        "en": "One OpenAI-compatible entry point over local and subscription models, with policy routing.",
+        "th": "จุดเชื่อมต่อที่เข้ากันได้กับ OpenAI สำหรับโมเดลในเครื่องและโมเดลแบบสมัครสมาชิก พร้อมการกำหนดเส้นทางตามนโยบาย"
+      },
+      "tools": []
+    }
+  ],
+  "requires": { "kernel": [], "operations": [] },
+  "assurance": [
     { "id": "L1", "source": "https://github.com/iDoris-ai/iDoris/pull/594; https://github.com/iDoris-ai/iDoris/pull/591" },
     { "id": "L2", "source": "https://github.com/iDoris-ai/iDoris/pull/590; https://github.com/iDoris-ai/iDoris/pull/594" },
     { "id": "L3", "source": "https://github.com/iDoris-ai/iDoris/pull/589" },
     { "id": "L4", "source": "https://github.com/iDoris-ai/iDoris/pull/591; https://github.com/iDoris-ai/iDoris/pull/594" },
     { "id": "L5", "source": "https://github.com/iDoris-ai/iDoris/pull/586" },
     { "id": "L6", "source": "https://github.com/iDoris-ai/iDoris/releases/tag/v0.4.0; Developer ID notarization 71b37549-168c-44e6-8b66-970a3b949121" }
-  ],
-  "release_url_base": "https://github.com/iDoris-ai/iDoris/releases/download"
+  ]
 }

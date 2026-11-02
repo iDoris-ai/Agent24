@@ -54,15 +54,9 @@ const DEFAULT_PORT = 7456
 const DEFAULT_READY_TIMEOUT_MS = 15_000
 const CHECKOUT_STOP_TIMEOUT_MS = 5_000
 const HEADLESS_STOP_TIMEOUT_MS = 60_000
-export const OPEN_DESIGN_PIN_VERSION = '0.22.2'
-// v2 (Opus review of #670, 2026-10-05): the fork's agent24-headless.cjs now
-// accepts an explicit resourceSafeBase (fork PR iDoris-ai/open-design-
-// agent24#7, not yet merged/pinned — see the on-demand branch below for why
-// this constant is bumped here ahead of that pin update). NOTE: this makes
-// the on-demand path incompatible with the CURRENTLY pinned fork commit
-// (still protocol v1) until the fork PR merges and OPEN_DESIGN_SHA is
-// re-pinned — intentional per review instruction ("pin 暂不改...先写好代码与
-// 测试"), not an oversight.
+export const OPEN_DESIGN_PIN_VERSION = '0.26.1'
+// Headless protocol v2. The pinned fork (packaged 0.26.1) accepts an explicit
+// resourceSafeBase; the ready payload's pinVersion must match this constant.
 const AGENT24_HEADLESS_PROTOCOL = 2
 
 export const CREATIVE_SESSION_PARTITION = 'persist:agent24-creative'

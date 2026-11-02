@@ -8,16 +8,12 @@ const NAME: &str = "component.bin";
 const PAYLOAD: &[u8] = b"locked component";
 
 fn cache(root: &Path) -> PathBuf {
-    let path = root.join("idoris/component-cache/hyphae");
+    let path = root.join("components/hyphae/cache");
     fs::create_dir_all(&path).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        for dir in [
-            root.join("idoris"),
-            root.join("idoris/component-cache"),
-            path.clone(),
-        ] {
+        for dir in [root.join("components/hyphae"), path.clone()] {
             fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
         }
     }

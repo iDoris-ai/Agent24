@@ -422,4 +422,5 @@ D4 原文写「退出码只区分 0、1、2」，这和 Hyphae 现有的语义�
 - 旧 release 路径登记到 `legacy-install.deletable.json`，**不删**；删除另由用户触发的 `agent24 idoris gc` 执行，且只删登记过的路径。
 
 ### 7.10 开放项（r4 登记，不阻塞 C1）
-- iDoris 的 schema 2 锁现在是 `notarized: false`。打开它要先解决：tar.gz 里的裸二进制没有 staple，`spctl --type install` 需要在线查票据，离线首次安装会失败；要定「在线查不到时是拒绝还是降级为只验签名」的规则，再把 `notarized` 置 true。作为 C1 之后的跟进项。
+- iDoris 的 schema 2 锁现在是 `notarized: true`（已落地）。规则：公证检查（`spctl --type install`，需在线查票据）只在**安装时**做（`VerifyMode::Install`）；启动、恢复、状态复查只做 sha256 与离线 codesign 检查（`VerifyMode::AtRest`），离线也能启动。离线首次安装会失败（下载本来就要网络，接受）。
+- 例外：旧回执没有 `notarized_verified_at`（安装时公证校验的记录）时，启动只做 AtRest 检查，不会因此被拦；公证检查在**下一次显式 Install** 时补做并写入回执。
