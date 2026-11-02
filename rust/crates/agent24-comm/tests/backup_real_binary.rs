@@ -212,7 +212,7 @@ async fn export_then_restore_round_trips_through_the_real_binary() {
     let (status, body) = post(
         &b.app,
         "/identity/import",
-        json!({"nickname": "restored", "path": backup, "backup_password": BACKUP_PW}),
+        json!({"nickname": "restored", "ncryptsec": ncs(&backup), "backup_password": BACKUP_PW}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -244,7 +244,7 @@ async fn export_then_restore_round_trips_through_the_real_binary() {
     let (status, body) = post(
         &b.app,
         "/identity/import",
-        json!({"nickname": "other", "path": backup, "backup_password": "wrong passphrase"}),
+        json!({"nickname": "other", "ncryptsec": ncs(&backup), "backup_password": "wrong passphrase"}),
     )
     .await;
     assert_eq!(
@@ -256,7 +256,7 @@ async fn export_then_restore_round_trips_through_the_real_binary() {
     let (status, body) = post(
         &b.app,
         "/identity/import",
-        json!({"nickname": "restored", "path": backup, "backup_password": BACKUP_PW}),
+        json!({"nickname": "restored", "ncryptsec": ncs(&backup), "backup_password": BACKUP_PW}),
     )
     .await;
     assert_eq!(
@@ -268,7 +268,7 @@ async fn export_then_restore_round_trips_through_the_real_binary() {
     let (status, body) = post(
         &b.app,
         "/identity/import",
-        json!({"nickname": "twin", "path": backup, "backup_password": BACKUP_PW}),
+        json!({"nickname": "twin", "ncryptsec": ncs(&backup), "backup_password": BACKUP_PW}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -287,7 +287,7 @@ async fn export_then_restore_round_trips_through_the_real_binary() {
     let (status, body) = post(
         &b.app,
         "/identity/import",
-        json!({"nickname": "j", "path": junk, "backup_password": BACKUP_PW}),
+        json!({"nickname": "j", "ncryptsec": ncs(&junk), "backup_password": BACKUP_PW}),
     )
     .await;
     assert_eq!(
@@ -297,7 +297,7 @@ async fn export_then_restore_round_trips_through_the_real_binary() {
 
     // ---- restore into a home that already has a keystore ------------------
     let c = new_home(&bin, true, Some("local")).await;
-    let (status, body) = post(&c.app, "/identity/import", json!({"nickname": "restored", "path": backup, "backup_password": BACKUP_PW, "default": true})).await;
+    let (status, body) = post(&c.app, "/identity/import", json!({"nickname": "restored", "ncryptsec": ncs(&backup), "backup_password": BACKUP_PW, "default": true})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let listed = identities(&c).await;
     assert_eq!(listed.len(), 2);
@@ -321,7 +321,7 @@ async fn export_then_restore_round_trips_through_the_real_binary() {
         let (status, body) = post(
             &c.app,
             "/identity/import",
-            json!({"nickname": "other", "path": backup, "backup_password": bp}),
+            json!({"nickname": "other", "ncryptsec": ncs(&backup), "backup_password": bp}),
         )
         .await;
         assert_eq!(
@@ -364,7 +364,7 @@ async fn both_endpoints_say_hyphae_too_old_on_the_previous_release() {
     let (status, body) = post(
         &h.app,
         "/identity/import",
-        json!({"nickname": "x", "path": file, "backup_password": BACKUP_PW}),
+        json!({"nickname": "x", "ncryptsec": ncs(&file), "backup_password": BACKUP_PW}),
     )
     .await;
     assert_eq!(
@@ -378,4 +378,9 @@ async fn both_endpoints_say_hyphae_too_old_on_the_previous_release() {
         1,
         "nothing was written"
     );
+}
+
+/// The `ncryptsec1…` line of a backup file, as the desktop sends it on restore.
+fn ncs(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path).unwrap().trim().to_owned()
 }

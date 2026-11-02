@@ -18,20 +18,32 @@ export const BACKUP_PW_BUSY = 'backup-password:busy'
 const escapeHtml = (text: string): string =>
   text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 
-export type BackupPasswordMode = 'export' | 'restore'
+/** `export` asks for a NEW password twice; the others ask once for an existing one. */
+export type BackupPasswordMode = 'export' | 'restore' | 'unlock' | 'homeImport'
+
+/** Wording of the single-field modes (message keys in main-i18n). */
+const SINGLE_FIELD = {
+  restore: { title: 'backupPw.restoreTitle', rules: 'backupPw.restoreRules', label: 'backupPw.restorePassword', busy: 'backupPw.decrypting' },
+  unlock: { title: 'backupPw.unlockTitle', rules: 'backupPw.unlockRules', label: 'backupPw.unlockPassword', busy: 'backupPw.working' },
+  homeImport: { title: 'backupPw.homeTitle', rules: 'backupPw.homeRules', label: 'backupPw.homePassword', busy: 'backupPw.working' },
+} as const
+
+const titleKey = (mode: BackupPasswordMode) => (mode === 'export' ? 'backupPw.title' : SINGLE_FIELD[mode].title)
 
 export interface BackupWindowOptions {
   /** Restore mode: tell the user the restored identity will become the default. */
   willBeDefault?: boolean
   /** Could not find out whether a default identity exists: say it MAY become the default. */
   mayBeDefault?: boolean
+  /** Unlock mode: say the password will be saved in the system keychain. */
+  remember?: boolean
 }
 
 export function backupPasswordHtml(mode: BackupPasswordMode = 'export', options: BackupWindowOptions = {}): string {
   const t = (key: Parameters<typeof mt>[0]): string => escapeHtml(mt(key))
   return `<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
-<title>${t(mode === 'export' ? 'backupPw.title' : 'backupPw.restoreTitle')}</title>
+<title>${t(titleKey(mode))}</title>
 <style>
 body{font:13px -apple-system,system-ui,sans-serif;margin:0;padding:18px;color:#1d1d1f;background:#fff}
 @media (prefers-color-scheme: dark){body{color:#f5f5f7;background:#2a2a2c}input{background:#1c1c1e;color:#f5f5f7}}
@@ -44,10 +56,11 @@ ${mode === 'export' ? `<h1>${t('backupPw.title')}</h1>
 <p class="rules">${t('backupPw.rules')}</p>
 <label>${t('backupPw.password')}<input id="p1" type="password" autocomplete="new-password" autofocus></label>
 <label>${t('backupPw.repeat')}<input id="p2" type="password" autocomplete="new-password"></label>
-<p class="warn">${t('backupPw.warning')}</p>` : `<h1>${t('backupPw.restoreTitle')}</h1>
-<p class="rules">${t('backupPw.restoreRules')}</p>
+<p class="warn">${t('backupPw.warning')}</p>` : `<h1>${t(SINGLE_FIELD[mode].title)}</h1>
+<p class="rules">${t(SINGLE_FIELD[mode].rules)}</p>
 ${options.willBeDefault ? `<p class="warn">${t('backupPw.willBeDefault')}</p>` : options.mayBeDefault ? `<p class="warn">${t('backupPw.mayBeDefault')}</p>` : ''}
-<label>${t('backupPw.restorePassword')}<input id="p1" type="password" autocomplete="off" autofocus></label>`}
+${options.remember ? `<p class="warn">${t('backupPw.willRemember')}</p>` : ''}
+<label>${t(SINGLE_FIELD[mode].label)}<input id="p1" type="password" autocomplete="off" autofocus></label>`}
 <p id="err" role="alert"></p>
 <div class="row"><button type="button" id="cancel">${t('backupPw.cancel')}</button><button type="submit" id="go">${t('backupPw.submit')}</button></div>
 </form></body></html>`
@@ -58,7 +71,7 @@ type Outcome<T> = { done: true; value: T } | { done: false; error: string }
 /**
  * Opens the password window (modal over `parent`). In `export` mode it asks
  * for a new password twice and resolves with it (or null on cancel). In
- * `restore` mode it asks once, shows a "decrypting…" state while `work` runs
+ * the other modes it asks once, shows a "decrypting…" state while `work` runs
  * with that password, lets the user retry in place if `work` says so, and
  * resolves with the final value (or null on cancel). The password is
  * validated here, in main, against the same rules as the daemon.
@@ -72,14 +85,14 @@ function openPasswordWindow<T>(
   return new Promise((resolve) => {
     const win = new BrowserWindow({
       width: 460,
-      height: mode === 'export' ? 400 : 280,
+      height: mode === 'export' ? 400 : 300,
       ...(parent ? { parent, modal: true } : {}),
       show: false,
       resizable: false,
       minimizable: false,
       maximizable: false,
       fullscreenable: false,
-      title: mt(mode === 'export' ? 'backupPw.title' : 'backupPw.restoreTitle'),
+      title: mt(titleKey(mode)),
       webPreferences: {
         preload: path.join(__dirname, 'backup-password-preload.js'),
         contextIsolation: true,
@@ -119,7 +132,7 @@ function openPasswordWindow<T>(
         return
       }
       working = true
-      if (mode === 'restore') event.sender.send(BACKUP_PW_BUSY, mt('backupPw.decrypting'))
+      if (mode !== 'export') event.sender.send(BACKUP_PW_BUSY, mt(SINGLE_FIELD[mode].busy))
       let password: string | null = first
       work(password).then(
         (outcome) => {
@@ -176,4 +189,24 @@ export function promptRestorePassword<T>(
   options: BackupWindowOptions = {},
 ): Promise<T | null> {
   return openPasswordWindow<T>(parent, 'restore', work, options)
+}
+
+/**
+ * Asks once for the Hyphae keystore password to unlock communication and runs
+ * `work` with it (retry in place on a wrong password). The page never sees it.
+ */
+export function promptUnlockPassword<T>(
+  parent: BrowserWindow | null,
+  work: (password: string) => Promise<Outcome<T>>,
+  options: BackupWindowOptions = {},
+): Promise<T | null> {
+  return openPasswordWindow<T>(parent, 'unlock', work, options)
+}
+
+/** Asks once for the password of the Hyphae home being imported. */
+export function promptHomeImportPassword<T>(
+  parent: BrowserWindow | null,
+  work: (password: string) => Promise<Outcome<T>>,
+): Promise<T | null> {
+  return openPasswordWindow<T>(parent, 'homeImport', work)
 }

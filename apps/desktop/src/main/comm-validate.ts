@@ -72,3 +72,29 @@ export function backupFileStem(nickname: string): string {
   const stem = nickname.replace(/[^\p{L}\p{M}\p{N}]+/gu, '_').replace(/^[._]+|[._]+$/g, '')
   return stem || 'agent24-identity'
 }
+
+export const MAX_RELAYS = 8
+const MAX_RELAY_URL_LENGTH = 512
+
+/**
+ * The relay list the page asked for, or null if any part is unusable: 1..8
+ * distinct `ws://` / `wss://` URLs with a host, no credentials, no whitespace or
+ * control characters. The strings are returned exactly as given (the daemon
+ * gets what was validated, not a re-serialised form).
+ */
+export function parseRelayList(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_RELAYS) return null
+  const seen = new Set<string>()
+  for (const entry of value) {
+    if (typeof entry !== 'string' || entry.length === 0 || entry.length > MAX_RELAY_URL_LENGTH) return null
+    // eslint-disable-next-line no-control-regex
+    if (/[\s\u0000-\u001f\u007f-\u009f]/.test(entry)) return null
+    let url: URL
+    try { url = new URL(entry) } catch { return null }
+    if (url.protocol !== 'wss:' && url.protocol !== 'ws:') return null
+    if (!url.hostname || url.username || url.password) return null
+    if (!/^wss?:\/\//.test(entry) || seen.has(entry)) return null
+    seen.add(entry)
+  }
+  return [...value] as string[]
+}

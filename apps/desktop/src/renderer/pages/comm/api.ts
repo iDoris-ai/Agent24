@@ -248,30 +248,13 @@ export const startCommDaemon = (): Promise<CommDaemonStatus> =>
 export const stopCommDaemon = (): Promise<CommDaemonStatus> =>
   request('POST', '/api/v1/comm/daemon/stop', isDaemonStatus)
 
-/** Unlock is deliberately sent once. Password is only present in this IPC body and is never logged or persisted here. */
-export async function unlockComm(password: string, remember = false): Promise<CommUnlockResult> {
-  let response: unknown
-  try {
-    response = await window.agent24.backendProxy({
-      method: 'POST',
-      path: '/api/v1/comm/unlock',
-      body: { password, remember },
-    })
-  } catch {
-    // IPC/native errors can contain implementation details; keep this path
-    // generic so a rejected call can never echo a password into UI text.
-    throw new CommApiError(translate(communicationMessages, 'api.unlockFailed'), 0)
-  }
-
-  try {
-    return decodeEnvelope(response, isUnlockResult)
-  } catch (error) {
-    if (error instanceof CommApiError && password && error.message.includes(password)) {
-      throw new CommApiError(translate(communicationMessages, 'api.unlockFailed'), error.status, error.code)
-    }
-    throw error
-  }
-}
+/**
+ * Unlock goes through a dedicated IPC: main asks for the keystore password in
+ * its own isolated window (and retries a wrong one there), so this page never
+ * holds the password. A dismissed window rejects with code `cancelled`.
+ */
+export const unlockComm = (remember = false): Promise<CommUnlockResult> =>
+  viaIpc(() => window.agent24.commUnlock(remember), isUnlockResult)
 
 export type CommInstallResult = components['schemas']['CommInstallResult']
 function isInstallResult(value: unknown): value is CommInstallResult {
@@ -291,27 +274,13 @@ export const createCommIdentity = (nickname: string) =>
   request('POST', '/api/v1/comm/identity', (value): value is { nickname: string; npub: string } =>
     isRecord(value) && string(value['nickname']) && string(value['npub']), { nickname, default: true })
 
-/** Replaces the whole relay list server-side; callers pass the full ordered list. */
+/** Replaces the whole relay list server-side; callers pass the full ordered list. Main validates it and confirms natively when it changes. */
 export const setCommRelay = (relays: string[]) =>
-  request('PUT', '/api/v1/comm/relay', isRelayConfig, { relays })
+  viaIpc(() => window.agent24.commRelaySet(relays), isRelayConfig)
 
 export const probeCommRelay = (url: string) =>
   request('POST', '/api/v1/comm/relay/probe', (value): value is { url: string | null; connected: boolean; error: string | null } =>
     isRecord(value) && nullableString(value['url']) && typeof value['connected'] === 'boolean' && nullableString(value['error']), { url })
-
-export async function importCommIdentity(from: string, password: string) {
-  try {
-    return await request('POST', '/api/v1/comm/import', (value): value is { identities: number; contacts: number; outbox: number; db_files: string[] } =>
-      isRecord(value) && typeof value['identities'] === 'number' && typeof value['contacts'] === 'number' &&
-      typeof value['outbox'] === 'number' && Array.isArray(value['db_files']) && value['db_files'].every(string),
-    { from, ...(password ? { password } : {}), confirm: true })
-  } catch (error) {
-    if (password && error instanceof CommApiError && error.message.includes(password)) {
-      throw new CommApiError(translate(communicationMessages, 'api.importFailed'), error.status, error.code)
-    }
-    throw error
-  }
-}
 
 /** Elevated writes go through dedicated, validated IPC in main, never the generic proxy. */
 async function viaIpc<T>(call: () => Promise<unknown>, validate: (value: unknown) => value is T): Promise<T> {
@@ -323,6 +292,16 @@ async function viaIpc<T>(call: () => Promise<unknown>, validate: (value: unknown
   }
   return decodeEnvelope(response, validate)
 }
+
+/**
+ * Imports a whole Hyphae HOME. The page supplies nothing: main shows the native
+ * folder picker and a confirmation, then asks for that home's keystore password
+ * in its own window. A declined step rejects with code `cancelled`.
+ */
+export const importCommHome = () =>
+  viaIpc(() => window.agent24.commHomeImport(), (value): value is { identities: number; contacts: number; outbox: number; db_files: string[] } =>
+    isRecord(value) && typeof value['identities'] === 'number' && typeof value['contacts'] === 'number' &&
+    typeof value['outbox'] === 'number' && Array.isArray(value['db_files']) && value['db_files'].every(string))
 
 export const addCommContact = (nickname: string, npub: string, role: string) =>
   viaIpc(() => window.agent24.commContactAdd(nickname, npub, role),
@@ -414,7 +393,7 @@ export const exportCommIdentity = (nickname: string): Promise<CommExportResult> 
 
 export type CommPickResult = { ticket: string; fileName: string } | null
 
-/** Native "choose a backup" dialog (in main). Only the file NAME and an opaque ticket come back. */
+/** Native "choose a backup" dialog (in main, which reads and validates the file right away). Only the file NAME and an opaque ticket come back. */
 export async function pickCommBackup(): Promise<CommPickResult> {
   let result: unknown
   try {
@@ -424,6 +403,10 @@ export async function pickCommBackup(): Promise<CommPickResult> {
   }
   if (isRecord(result) && result['ok'] === true && string(result['ticket']) && string(result['fileName'])) {
     return { ticket: result['ticket'], fileName: result['fileName'] }
+  }
+  // Main read the file at once and it was not a usable backup.
+  if (isRecord(result) && result['ok'] === false && result['cancelled'] === false && string(result['message'])) {
+    throw new CommApiError(result['message'], 400, 'invalid_key')
   }
   return null
 }

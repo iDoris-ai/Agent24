@@ -55,7 +55,7 @@ vi.mock('electron', () => ({
 
 import { setMainLocale } from './main-i18n'
 import {
-  BACKUP_PW_BUSY, BACKUP_PW_CANCEL, BACKUP_PW_ERROR, BACKUP_PW_SUBMIT, backupPasswordHtml, promptBackupPassword, promptRestorePassword,
+  BACKUP_PW_BUSY, BACKUP_PW_CANCEL, BACKUP_PW_ERROR, BACKUP_PW_SUBMIT, backupPasswordHtml, promptBackupPassword, promptHomeImportPassword, promptRestorePassword, promptUnlockPassword,
 } from './backup-password-window'
 
 const emit = (channel: string, event: unknown, ...args: unknown[]) => {
@@ -147,6 +147,49 @@ describe('backup password window', () => {
     const b = promptBackupPassword(null)
     windows[1]!.close()
     await expect(b).resolves.toBeNull()
+  })
+})
+
+describe('unlock and home-import password windows (L4)', () => {
+  it('both ask once with their own wording, no script, in en/zh/th', () => {
+    for (const mode of ['unlock', 'homeImport'] as const) {
+      const html = backupPasswordHtml(mode)
+      expect(html).toContain('id="p1"')
+      expect(html).not.toContain('id="p2"')
+      expect(html).not.toMatch(/<script/i)
+      expect(html).toContain("default-src 'none'")
+    }
+    expect(backupPasswordHtml('unlock')).toContain('Unlock communication')
+    expect(backupPasswordHtml('homeImport')).toContain('Import a Hyphae folder')
+    setMainLocale('zh')
+    expect(backupPasswordHtml('unlock')).toContain('解锁通信')
+    expect(backupPasswordHtml('homeImport')).toContain('导入 Hyphae 文件夹')
+    setMainLocale('th')
+    expect(backupPasswordHtml('unlock')).toContain('ปลดล็อกการสื่อสาร')
+    expect(backupPasswordHtml('homeImport')).toContain('นำเข้าโฟลเดอร์ Hyphae')
+  })
+  it('unlock says the password will be saved in the keychain only when asked to remember', () => {
+    expect(backupPasswordHtml('unlock', { remember: true })).toContain('saved in your system keychain')
+    expect(backupPasswordHtml('unlock')).not.toContain('saved in your system keychain')
+  })
+  it('runs the work with the typed password and resolves with its result', async () => {
+    const work = vi.fn(async (pw: string) => ({ done: true as const, value: `unlocked:${pw}` }))
+    const result = promptUnlockPassword(null, work)
+    const w = windows[0]!
+    emit(BACKUP_PW_SUBMIT, fromWindow(w), 'ks-pass', 'ks-pass')
+    await expect(result).resolves.toBe('unlocked:ks-pass')
+    expect(w.webContents.sent[0]).toEqual([BACKUP_PW_BUSY, 'Working…'])
+    const other = promptHomeImportPassword(null, async (pw) => ({ done: true as const, value: `home:${pw}` }))
+    emit(BACKUP_PW_SUBMIT, fromWindow(windows[1]!), 'old-pass', 'old-pass')
+    await expect(other).resolves.toBe('home:old-pass')
+  })
+  it('rejects an empty or multi-line password in main', async () => {
+    const work = vi.fn(async () => ({ done: true as const, value: 1 }))
+    void promptUnlockPassword(null, work)
+    const w = windows[0]!
+    for (const bad of ['', 'a\nb']) emit(BACKUP_PW_SUBMIT, fromWindow(w), bad, bad)
+    expect(work).not.toHaveBeenCalled()
+    expect(w.webContents.sent.every(([channel]) => channel === BACKUP_PW_ERROR)).toBe(true)
   })
 })
 

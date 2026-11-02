@@ -2774,6 +2774,12 @@ paths:
         restore is never written), and only then creates the file itself, relative to a directory descriptor
         pinned before the export: exclusive create of a random staging name (mode 0600), write, fsync,
         `linkat` to `path` (which never replaces anything), unlink the staging name, fsync the directory.
+        After publishing it checks that the final name is the very inode it wrote (`fstatat` without
+        following links, compared by device and inode) and takes the file back if not. On file systems
+        without hard links (FAT, exFAT, some SMB mounts; `linkat` fails with EPERM, ENOTSUP, EOPNOTSUPP,
+        EXDEV or EMLINK) it renames the staging file with `RENAME_EXCL` (macOS) or `RENAME_NOREPLACE`
+        (Linux), which also never overwrites; if that is unsupported too the answer is
+        `422 filesystem_unsupported`.
         An existing target of any kind is refused with `409 conflict` and `data.reason = "target_exists"`.
         `path` must be absolute and outside the Hyphae data directory. Neither the key, the backup nor the
         backup password is part of the response or a log line. Only the desktop's ProductHost credential may
@@ -2827,6 +2833,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CommError"
+        "422":
+          description: "`filesystem_unsupported`: the destination's file system supports neither hard links nor an exclusive rename; choose another folder"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommError"
         "423":
           $ref: "#/components/responses/CommLocked"
         "502":
@@ -2844,8 +2856,10 @@ paths:
       x-comm-tier: CommWrite
       x-operation-level: elevated
       description: >-
-        Needs Hyphae v0.28.0 or newer (`409 hyphae_too_old` otherwise). Reads `path` (an absolute path to a
-        regular file, not a symlink, at most 4 KiB, one `ncryptsec1…` line) and runs
+        Needs Hyphae v0.28.0 or newer (`409 hyphae_too_old` otherwise). Takes the backup text itself in `ncryptsec`
+        (one `ncryptsec1…` token of at most 200 ASCII characters, no whitespace or line break; the desktop's main
+        process reads and validates the file the user picked, then sends its content, so the daemon never opens a
+        path the caller names; the bech32 structure is checked too) and runs
         `hyphae identity import --nickname=<n> --password-stdin --ncryptsec-stdin [--default]` with stdin
         `keystore password`, `backup_password`, `ncryptsec1…` (one per line, in that order). The keystore
         password comes from the system keychain; when no identity exists yet a fresh one is generated and
@@ -2862,11 +2876,17 @@ paths:
           application/json:
             schema:
               type: object
-              required: [nickname, path, backup_password]
+              required: [nickname, ncryptsec, backup_password]
               additionalProperties: false
               properties:
                 nickname: { type: string, maxLength: 128, description: "No control or invisible formatting characters; at most 128 characters and 512 UTF-8 bytes (`400 nickname_too_long`)." }
-                path: { type: string }
+                ncryptsec:
+                  type: string
+                  writeOnly: true
+                  minLength: 10
+                  maxLength: 200
+                  pattern: '^ncryptsec1[!-~]*$'
+                  description: The NIP-49 backup text (ciphertext, still protected by the backup password); never returned or logged.
                 backup_password:
                   type: string
                   writeOnly: true
@@ -2884,7 +2904,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/CommOk"
         "400":
-          description: "`invalid` (including an unusable backup password or path), `bad_backup_password`, `invalid_key`"
+          description: "`invalid` (including an unusable backup password), `bad_backup_password`, `invalid_key`"
           content:
             application/json:
               schema:
@@ -7062,7 +7082,7 @@ components:
     CommErrorCode:
       type: string
       description: Closed set (COMM-HYPHAE.md section 4).
-      enum: [hyphae_unsupported_platform, hyphae_download_failed, hyphae_hash_mismatch, binary_rejected, unsupported_platform, locked, not_configured, invalid, not_found, confirm_required, conflict, network, partial, timeout, upstream, hyphae_too_old, bad_backup_password, invalid_key, nickname_exists, keystore_locked, nickname_too_long, still_terminating]
+      enum: [hyphae_unsupported_platform, hyphae_download_failed, hyphae_hash_mismatch, binary_rejected, unsupported_platform, locked, not_configured, invalid, not_found, confirm_required, conflict, network, partial, timeout, upstream, hyphae_too_old, bad_backup_password, invalid_key, nickname_exists, keystore_locked, nickname_too_long, still_terminating, filesystem_unsupported]
     CommError:
       type: object
       description: >-

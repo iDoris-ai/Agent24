@@ -843,7 +843,10 @@ async fn identity_npub(runner: &HyphaeRunner, nickname: &str) -> Result<Option<S
 #[serde(deny_unknown_fields)]
 struct IdentityImportReq {
     nickname: String,
-    path: String,
+    /// The `ncryptsec1…` backup text itself (one line). The desktop reads and
+    /// validates the file the user picked and sends its content, so the daemon
+    /// never opens a path the caller names.
+    ncryptsec: String,
     backup_password: UnlockSecret,
     #[serde(default)]
     default: bool,
@@ -868,10 +871,10 @@ async fn import_identity(
     let (runner, password_store, home) = state.require_ready()?;
     invalid_if_bad_name("nickname", &req.nickname)?;
     check_nickname_len(&req.nickname)?;
-    invalid_if_blank("path", &req.path)?;
+    let ncryptsec = crate::export::parse_backup_text(&req.ncryptsec)?;
     crate::export::validate_restore_password(&req.backup_password.0)?;
-    let ncryptsec = crate::export::read_backup_file(Path::new(&req.path))?;
     crate::export::require_feature(runner, crate::export::Feature::Import).await?;
+    crate::export::check_backup_structure(ncryptsec)?;
 
     let guard = runner.keystore_lock().acquire().await;
     let existing = resolve_account(home).await?;
@@ -895,7 +898,7 @@ async fn import_identity(
             (pending, password, true)
         }
     };
-    let stdin = crate::export::import_stdin(&keystore_password, &req.backup_password.0, &ncryptsec);
+    let stdin = crate::export::import_stdin(&keystore_password, &req.backup_password.0, ncryptsec);
     drop(keystore_password);
     let stdin = match stdin {
         Ok(stdin) => stdin,
@@ -2050,7 +2053,7 @@ echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2
             app,
             "POST",
             "/identity/import",
-            Some(json!({"nickname": nickname, "path": path.to_str().unwrap(), "backup_password": pw, "default": default})),
+            Some(json!({"nickname": nickname, "ncryptsec": std::fs::read_to_string(path).unwrap().trim(), "backup_password": pw, "default": default})),
         )
         .await
     }
@@ -2334,7 +2337,7 @@ echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2
             ),
             (
                 "/identity/import",
-                json!({"nickname": "a\nb", "path": "/tmp/x", "backup_password": "x"}),
+                json!({"nickname": "a\nb", "ncryptsec": "ncryptsec1x", "backup_password": "x"}),
             ),
         ] {
             let (s, b) = call(app.clone(), "POST", uri, Some(body)).await;
@@ -2359,7 +2362,7 @@ echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2
                 ("/contact", json!({"nickname": name, "npub": npub})),
                 (
                     "/identity/import",
-                    json!({"nickname": name, "path": file, "backup_password": "x"}),
+                    json!({"nickname": name, "ncryptsec": std::fs::read_to_string(&file).unwrap().trim(), "backup_password": "x"}),
                 ),
                 (
                     "/identity/export",
@@ -2718,7 +2721,7 @@ echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2
                 ("/contact", json!({"nickname": name, "npub": npub})),
                 (
                     "/identity/import",
-                    json!({"nickname": name, "path": file, "backup_password": "x"}),
+                    json!({"nickname": name, "ncryptsec": std::fs::read_to_string(&file).unwrap().trim(), "backup_password": "x"}),
                 ),
                 (
                     "/identity/export",
@@ -2774,34 +2777,49 @@ echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2
     }
 
     #[tokio::test]
-    async fn restore_refuses_bad_files_and_passwords_before_running_hyphae() {
+    async fn restore_refuses_bad_text_and_passwords_before_running_hyphae() {
         let tmp = tempfile::tempdir().unwrap();
         let fake = Fake::new(tmp.path());
         let state = ready_state_with_identity(tmp.path(), &fake.script()).await;
         let app = router(state);
-        let good = write_backup(tmp.path());
-        let plain = tmp.path().join("plain.txt");
-        std::fs::write(&plain, "hello\n").unwrap();
-        let link = tmp.path().join("link.ncryptsec");
-        std::os::unix::fs::symlink(&good, &link).unwrap();
-        let big = tmp.path().join("big.ncryptsec");
-        std::fs::write(&big, format!("ncryptsec1{}", "q".repeat(5000))).unwrap();
-        for (path, expect) in [
-            (&plain, "invalid_key"),
-            (&link, "invalid"),
-            (&big, "invalid"),
-            (&tmp.path().join("missing.ncryptsec"), "not_found"),
+        let spec = crate::export::testkit::SPEC_NCRYPTSEC;
+        let post_text = |text: String, pw: &'static str| {
+            let app = app.clone();
+            async move {
+                call(
+                    app,
+                    "POST",
+                    "/identity/import",
+                    Some(json!({"nickname": "r4", "ncryptsec": text, "backup_password": pw})),
+                )
+                .await
+            }
+        };
+        for bad in [
+            "hello".to_owned(),
+            String::new(),
+            format!("{spec}\n"),
+            format!("{spec}\nsecond"),
+            format!("{spec} "),
+            format!("ncryptsec1{}", "q".repeat(5000)),
         ] {
-            let (s, b) = import_call(app.clone(), "r4", path, "backup-pass-1", false).await;
-            assert!(s.is_client_error(), "{path:?} {b:?}");
-            assert_eq!(b["error"], expect, "{path:?}");
+            let (s, b) = post_text(bad.clone(), "backup-pass-1").await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad:?} {b:?}");
+            assert_eq!(b["error"], "invalid_key", "{bad:?}");
         }
+        // the old `path` field is gone: unknown fields are refused
+        let (s, _) = call(
+            app.clone(),
+            "POST",
+            "/identity/import",
+            Some(json!({"nickname": "r4", "path": "/tmp/x", "ncryptsec": spec, "backup_password": "backup-pass-1"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
         for bad in ["", "two\nlines", "cr\rhere", "nul\u{0}here"] {
-            let (s, b) = import_call(app.clone(), "r4", &good, bad, false).await;
+            let (s, b) = post_text(spec.to_owned(), bad).await;
             assert_eq!(s, StatusCode::BAD_REQUEST, "{bad:?} {b:?}");
         }
-        let (s, _) = import_call(app, "r4", Path::new("relative"), "x", false).await;
-        assert_eq!(s, StatusCode::BAD_REQUEST);
         assert!(fake.calls().is_empty());
     }
 

@@ -1403,7 +1403,7 @@ export interface paths {
         put?: never;
         /**
          * Back up an identity's private key to a password-encrypted file
-         * @description Needs Hyphae v0.28.0 or newer (`409 hyphae_too_old` otherwise, decided from the installed binary's own `--help`). Runs `hyphae identity export --format ncryptsec --password-stdin` (no `--out`) with the keystore password (from the system keychain) and `backup_password` on stdin, one per line; Hyphae answers with the NIP-49 `ncryptsec1…` ciphertext on stdout, so the plaintext key never enters the daemon. The daemon validates it strictly (bech32 checksum, HRP, payload length, version, log_n <= 19), opens it with `backup_password` and checks it derives the identity's npub (a backup that would not restore is never written), and only then creates the file itself, relative to a directory descriptor pinned before the export: exclusive create of a random staging name (mode 0600), write, fsync, `linkat` to `path` (which never replaces anything), unlink the staging name, fsync the directory. An existing target of any kind is refused with `409 conflict` and `data.reason = "target_exists"`. `path` must be absolute and outside the Hyphae data directory. Neither the key, the backup nor the backup password is part of the response or a log line. Only the desktop's ProductHost credential may call it (legacy shared-token mode and every other audience get `403`), because the caller chooses the password that encrypts the key. One export runs at a time (`409` with `data.reason = "export_in_progress"`). The desktop does not expose it through the renderer proxy; its main process confirms natively, collects the password in its own window and picks `path` with a native save dialog. There is no CLI command yet (it needs the CORE-2d presence proof for CommWrite).
+         * @description Needs Hyphae v0.28.0 or newer (`409 hyphae_too_old` otherwise, decided from the installed binary's own `--help`). Runs `hyphae identity export --format ncryptsec --password-stdin` (no `--out`) with the keystore password (from the system keychain) and `backup_password` on stdin, one per line; Hyphae answers with the NIP-49 `ncryptsec1…` ciphertext on stdout, so the plaintext key never enters the daemon. The daemon validates it strictly (bech32 checksum, HRP, payload length, version, log_n <= 19), opens it with `backup_password` and checks it derives the identity's npub (a backup that would not restore is never written), and only then creates the file itself, relative to a directory descriptor pinned before the export: exclusive create of a random staging name (mode 0600), write, fsync, `linkat` to `path` (which never replaces anything), unlink the staging name, fsync the directory. After publishing it checks that the final name is the very inode it wrote (`fstatat` without following links, compared by device and inode) and takes the file back if not. On file systems without hard links (FAT, exFAT, some SMB mounts; `linkat` fails with EPERM, ENOTSUP, EOPNOTSUPP, EXDEV or EMLINK) it renames the staging file with `RENAME_EXCL` (macOS) or `RENAME_NOREPLACE` (Linux), which also never overwrites; if that is unsupported too the answer is `422 filesystem_unsupported`. An existing target of any kind is refused with `409 conflict` and `data.reason = "target_exists"`. `path` must be absolute and outside the Hyphae data directory. Neither the key, the backup nor the backup password is part of the response or a log line. Only the desktop's ProductHost credential may call it (legacy shared-token mode and every other audience get `403`), because the caller chooses the password that encrypts the key. One export runs at a time (`409` with `data.reason = "export_in_progress"`). The desktop does not expose it through the renderer proxy; its main process confirms natively, collects the password in its own window and picks `path` with a native save dialog. There is no CLI command yet (it needs the CORE-2d presence proof for CommWrite).
          */
         post: operations["exportCommIdentity"];
         delete?: never;
@@ -1423,7 +1423,7 @@ export interface paths {
         put?: never;
         /**
          * Restore an identity from an encrypted (NIP-49) backup file
-         * @description Needs Hyphae v0.28.0 or newer (`409 hyphae_too_old` otherwise). Reads `path` (an absolute path to a regular file, not a symlink, at most 4 KiB, one `ncryptsec1…` line) and runs `hyphae identity import --nickname=<n> --password-stdin --ncryptsec-stdin [--default]` with stdin `keystore password`, `backup_password`, `ncryptsec1…` (one per line, in that order). The keystore password comes from the system keychain; when no identity exists yet a fresh one is generated and promoted exactly like `POST /comm/identity` does for the first identity. The comm daemon is restarted if the restored identity becomes the default. Only the desktop's ProductHost credential may call it (legacy mode and every other audience get `403`). Errors carry stable codes: `bad_backup_password` (400), `invalid_key` (400), `nickname_exists` (409), `keystore_locked` (423, also what Hyphae's plain `auth_error` on import means), `hyphae_too_old` (409). Restoring a key that is already stored is not an error: it answers 200 with `data.status = "already_present"`, plus `nickname` and `npub` of the existing identity when known. There is no CLI command yet (CORE-2d).
+         * @description Needs Hyphae v0.28.0 or newer (`409 hyphae_too_old` otherwise). Takes the backup text itself in `ncryptsec` (one `ncryptsec1…` token of at most 200 ASCII characters, no whitespace or line break; the desktop's main process reads and validates the file the user picked, then sends its content, so the daemon never opens a path the caller names; the bech32 structure is checked too) and runs `hyphae identity import --nickname=<n> --password-stdin --ncryptsec-stdin [--default]` with stdin `keystore password`, `backup_password`, `ncryptsec1…` (one per line, in that order). The keystore password comes from the system keychain; when no identity exists yet a fresh one is generated and promoted exactly like `POST /comm/identity` does for the first identity. The comm daemon is restarted if the restored identity becomes the default. Only the desktop's ProductHost credential may call it (legacy mode and every other audience get `403`). Errors carry stable codes: `bad_backup_password` (400), `invalid_key` (400), `nickname_exists` (409), `keystore_locked` (423, also what Hyphae's plain `auth_error` on import means), `hyphae_too_old` (409). Restoring a key that is already stored is not an error: it answers 200 with `data.status = "already_present"`, plus `nickname` and `npub` of the existing identity when known. There is no CLI command yet (CORE-2d).
          */
         post: operations["importCommIdentity"];
         delete?: never;
@@ -3578,7 +3578,7 @@ export interface components {
          * @description Closed set (COMM-HYPHAE.md section 4).
          * @enum {string}
          */
-        CommErrorCode: "hyphae_unsupported_platform" | "hyphae_download_failed" | "hyphae_hash_mismatch" | "binary_rejected" | "unsupported_platform" | "locked" | "not_configured" | "invalid" | "not_found" | "confirm_required" | "conflict" | "network" | "partial" | "timeout" | "upstream" | "hyphae_too_old" | "bad_backup_password" | "invalid_key" | "nickname_exists" | "keystore_locked" | "nickname_too_long" | "still_terminating";
+        CommErrorCode: "hyphae_unsupported_platform" | "hyphae_download_failed" | "hyphae_hash_mismatch" | "binary_rejected" | "unsupported_platform" | "locked" | "not_configured" | "invalid" | "not_found" | "confirm_required" | "conflict" | "network" | "partial" | "timeout" | "upstream" | "hyphae_too_old" | "bad_backup_password" | "invalid_key" | "nickname_exists" | "keystore_locked" | "nickname_too_long" | "still_terminating" | "filesystem_unsupported";
         /** @description Hyphae's own failure envelope shape, NOT the kernel `Error`: comm routes answer `{ok:false,error,message,data?}`. */
         CommError: {
             /** @constant */
@@ -6907,6 +6907,15 @@ export interface operations {
                     "application/json": components["schemas"]["CommError"];
                 };
             };
+            /** @description `filesystem_unsupported`: the destination's file system supports neither hard links nor an exclusive rename; choose another folder */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
             423: components["responses"]["CommLocked"];
             502: components["responses"]["CommBadGateway"];
             503: components["responses"]["CommUnavailable"];
@@ -6925,7 +6934,8 @@ export interface operations {
                 "application/json": {
                     /** @description No control or invisible formatting characters; at most 128 characters and 512 UTF-8 bytes (`400 nickname_too_long`). */
                     nickname: string;
-                    path: string;
+                    /** @description The NIP-49 backup text (ciphertext, still protected by the backup password); never returned or logged. */
+                    ncryptsec: string;
                     /** @description The password the backup was made with. A single line (no CR, LF or NUL). */
                     backup_password: string;
                     /** @default false */
@@ -6943,7 +6953,7 @@ export interface operations {
                     "application/json": components["schemas"]["CommOk"];
                 };
             };
-            /** @description `invalid` (including an unusable backup password or path), `bad_backup_password`, `invalid_key` */
+            /** @description `invalid` (including an unusable backup password), `bad_backup_password`, `invalid_key` */
             400: {
                 headers: {
                     [name: string]: unknown;

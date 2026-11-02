@@ -71,6 +71,13 @@ const api = {
   commIdentityImport: (ticket: string, nickname: string, makeDefault: boolean): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.CommIdentityImport, ticket, nickname, makeDefault),
 
+  /** Elevated: main shows a native folder picker and confirm, then asks for the keystore password in its own window. The page supplies nothing. */
+  commHomeImport: (): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.CommHomeImport),
+  /** Elevated: replaces the relay list. Main validates the URLs and confirms natively when the list changes. */
+  commRelaySet: (relays: string[]): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.CommRelaySet, relays),
+  /** Elevated: main asks for the keystore password in its own window; the page only says whether to remember it. */
+  commUnlock: (remember: boolean): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.CommUnlock, remember),
+
   osModuleSetEnabled: (name: string, enabled: boolean): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.OsModuleSetEnabled, name, enabled),
   /** A-3: elevated; disables/enables AgentEar (the name is fixed in main).

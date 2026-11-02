@@ -13,10 +13,13 @@ import { daemonCliEndpoint, daemonConnection, getBackendEndpoint } from '../back
 import { findAllowedRoute, proxyError, proxyRequest, timeoutFor, withKnowledgeBinding } from '../backend-proxy'
 import type { KnowledgeController } from '../knowledge-settings'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
-import { backupFileStem, isSafeBackupPassword, isSafeMessage, isSafeName, isValidNpub } from '../comm-validate'
+import { backupFileStem, isSafeBackupPassword, isSafeMessage, isSafeName, isValidNpub, parseRelayList } from '../comm-validate'
+import { readBackupFile } from '../backup-file'
 import {
   promptBackupPassword as openBackupPasswordWindow,
   promptRestorePassword as openRestorePasswordWindow,
+  promptUnlockPassword as openUnlockPasswordWindow,
+  promptHomeImportPassword as openHomeImportPasswordWindow,
 } from '../backup-password-window'
 import { mt, setMainLocale, isMainLocale } from '../main-i18n'
 import { readOmlxSettingsKey } from '../omlx-settings-key'
@@ -236,13 +239,15 @@ const EXPORT_TIMEOUT_MS = 90_000
 
 /**
  * Restore: the one pending backup selection, an opaque ticket standing for a
- * file the user picked. It is consumed when used. After a result that is not a
+ * backup the user picked. The file is read and validated once, when picked
+ * (backup-file.ts), and its ciphertext is held here in memory: the ticket binds
+ * to those bytes, not to a path, so nothing can be swapped in afterwards. It is consumed when used. After a result that is not a
  * success it is re-armed (same ticket, SAME expiry: the TTL is never extended)
  * at most IMPORT_MAX_ATTEMPTS times in total, and only if the user has not
  * picked a different file in the meantime (a newer pick replaces it, so an older
  * flow can never put its own ticket back).
  */
-interface PendingBackup { id: string; path: string; expires: number; attemptsLeft: number }
+interface PendingBackup { id: string; ncryptsec: string; expires: number; attemptsLeft: number }
 let pendingBackup: PendingBackup | null = null
 const IMPORT_TICKET_TTL_MS = 5 * 60_000
 const IMPORT_MAX_ATTEMPTS = 3
@@ -350,9 +355,15 @@ export function registerIpcHandlers(options: {
   promptBackupPassword?: (parent: BrowserWindow | null) => Promise<string | null>
   /** Test seam: the main-owned restore-password window. */
   promptRestorePassword?: typeof openRestorePasswordWindow
+  /** Test seam: the main-owned unlock-password window. */
+  promptUnlockPassword?: typeof openUnlockPasswordWindow
+  /** Test seam: the main-owned password window for importing a Hyphae folder. */
+  promptHomeImportPassword?: typeof openHomeImportPasswordWindow
 }): void {
   const promptBackupPassword = options.promptBackupPassword ?? openBackupPasswordWindow
   const promptRestorePassword = options.promptRestorePassword ?? openRestorePasswordWindow
+  const promptUnlockPassword = options.promptUnlockPassword ?? openUnlockPasswordWindow
+  const promptHomeImportPassword = options.promptHomeImportPassword ?? openHomeImportPasswordWindow
   const knowledge = options.knowledge ?? (() => null)
   omlxSettingsPath = options.omlxSettingsPath
   const handle: typeof ipcMain.handle = (channel, listener) => ipcMain.handle(channel, options.guard(listener))
@@ -608,9 +619,9 @@ export function registerIpcHandlers(options: {
     }),
   )
 
-  // Restore from an encrypted backup. Step 1 (native open dialog) hands the page
-  // only a file NAME and a single-use ticket; the path and the contents never
-  // leave main. Step 2 takes the ticket, the nickname the page collected and
+  // Restore from an encrypted backup. Step 1 (native open dialog) reads the
+  // file at once and hands the page only a file NAME and a single-use ticket;
+  // the path and the contents never leave main. Step 2 takes the ticket, the nickname the page collected and
   // whether it should become the default; main then asks for the backup
   // password in its own window (with an in-window "decrypting…" state and
   // retry on a wrong password) and calls the daemon.
@@ -629,9 +640,12 @@ export function registerIpcHandlers(options: {
     }
     const file = picked.filePaths[0]
     if (picked.canceled || !file) return { ok: false, cancelled: true }
+    // Read ONCE, here: from now on only these bytes are used, never the path.
+    const read = readBackupFile(file)
+    if (!read.ok) return { ok: false, cancelled: false, message: mt('err.invalidBackupFile') }
     const ticket = randomBytes(16).toString('hex')
     // Replaces any older selection, which thereby stops working.
-    pendingBackup = { id: ticket, path: file, expires: Date.now() + IMPORT_TICKET_TTL_MS, attemptsLeft: IMPORT_MAX_ATTEMPTS }
+    pendingBackup = { id: ticket, ncryptsec: read.ncryptsec, expires: Date.now() + IMPORT_TICKET_TTL_MS, attemptsLeft: IMPORT_MAX_ATTEMPTS }
     return { ok: true, ticket, fileName: path.basename(file) }
   })
   handle(IpcChannels.CommIdentityImport, (event, ticket: unknown, nickname: unknown, makeDefault: unknown): Promise<BackendProxyResponse> =>
@@ -673,7 +687,7 @@ export function registerIpcHandlers(options: {
         }
         const response = await proxyToBackend({
           method: 'POST', path: '/api/v1/comm/identity/import',
-          body: { nickname, path: entry.path, backup_password: backupPassword, default: makeDefault },
+          body: { nickname, ncryptsec: entry.ncryptsec, backup_password: backupPassword, default: makeDefault },
         }, EXPORT_TIMEOUT_MS)
         // A wrong password, or input the daemon found unusable (`invalid`), is
         // handled inside the window so the user can fix it; everything else ends it.
@@ -725,6 +739,87 @@ export function registerIpcHandlers(options: {
     // The daemon allows 5 s per relay + 10 s (8 relays max).
     return proxyToBackend({ method: 'POST', path: '/api/v1/comm/send', body: { to, content, encrypt: true } }, 90_000)
   })
+
+  // The other elevated comm routes that used to ride the generic proxy (L4):
+  // importing a whole Hyphae HOME, replacing the relay list, and unlock. The
+  // page supplies no path and no password; main picks the folder, validates the
+  // list and collects the password in its own isolated window.
+  //
+  // Whole-HOME import copies private keys, so main shows the folder picker
+  // (the page never names the path) and a native confirm that shows the folder.
+  handle(IpcChannels.CommHomeImport, (event): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      const win = BrowserWindow.fromWebContents(event.sender)
+      const options: Electron.OpenDialogOptions = { title: mt('comm.homePick'), properties: ['openDirectory'] }
+      let picked: Electron.OpenDialogReturnValue
+      try {
+        picked = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+      } catch {
+        return { ok: false, status: 500, data: { error: { code: 'dialog_failed', message: 'the file dialog could not open' } } }
+      }
+      const dir = picked.filePaths[0]
+      if (picked.canceled || !dir) return cancelled()
+      let usable = false
+      try { usable = path.isAbsolute(dir) && !hasControlChars(dir) && fs.statSync(dir).isDirectory() } catch { /* not usable */ }
+      if (!usable) return invalidRequest(mt('err.invalidHomeDir'))
+      const ok = await confirmNative(event, mt('comm.homeImport', { dir: clip(dir, 200) }), mt('comm.homeImportDetail'))
+      if (!ok) return cancelled()
+      const result = await promptHomeImportPassword<BackendProxyResponse>(win, async (password) => {
+        const response = await proxyToBackend({
+          method: 'POST', path: '/api/v1/comm/import',
+          body: { from: dir, password, confirm: true },
+        }, EXPORT_TIMEOUT_MS)
+        const body = response.data as { error?: unknown; message?: unknown } | null
+        // A wrong keystore password is retried inside the window.
+        if (body?.error === 'locked' && !(typeof body.message === 'string' && body.message.includes('keychain_unavailable'))) {
+          return { done: false, error: mt('backupPw.unlockWrong') }
+        }
+        return { done: true, value: response }
+      })
+      return result ?? cancelled()
+    }),
+  )
+
+  // The relay list is replaced as a whole (the daemon restarts). Main validates
+  // the URLs and asks natively when this would CHANGE the list (the current
+  // list is read from the daemon here, not taken from the page).
+  handle(IpcChannels.CommRelaySet, (event, relays: unknown): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      const list = parseRelayList(relays)
+      if (!list) return invalidRequest('invalid relay list')
+      const current = await proxyToBackend({ method: 'GET', path: '/api/v1/comm/relay' })
+      const existing = (current.data as { data?: { relays?: unknown; configured?: unknown } } | null)?.data
+      const unchanged = current.ok && existing?.configured === true && Array.isArray(existing.relays) &&
+        existing.relays.length === list.length && existing.relays.every((url, i) => url === list[i])
+      if (!unchanged) {
+        const ok = await confirmNative(event, mt('comm.relaySet', { count: list.length }), `${clip(list.join('\n'), 800)}\n\n${mt('comm.relaySetDetail')}`)
+        if (!ok) return cancelled()
+      }
+      return proxyToBackend({ method: 'PUT', path: '/api/v1/comm/relay', body: { relays: list } })
+    }),
+  )
+
+  // Unlock: the keystore password is typed into main's own window and goes
+  // straight to the daemon, so the page (which could be compromised) never sees
+  // it. A wrong password is retried in the same window.
+  handle(IpcChannels.CommUnlock, (event, remember: unknown): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      if (remember !== undefined && typeof remember !== 'boolean') return invalidRequest('invalid remember flag')
+      const keep = remember === true
+      const win = BrowserWindow.fromWebContents(event.sender)
+      const result = await promptUnlockPassword<BackendProxyResponse>(win, async (password) => {
+        const response = await proxyToBackend({
+          method: 'POST', path: '/api/v1/comm/unlock', body: { password, remember: keep },
+        })
+        const body = response.data as { error?: unknown; message?: unknown } | null
+        if (body?.error === 'locked' && !(typeof body.message === 'string' && body.message.includes('keychain_unavailable'))) {
+          return { done: false, error: mt('backupPw.unlockWrong') }
+        }
+        return { done: true, value: response }
+      }, { remember: keep })
+      return result ?? cancelled()
+    }),
+  )
 
   // A1: POST /api/v1/approvals/{id} — an elevated operation, so it is not on
   // the generic proxy. The native dialog shows the daemon's OWN record of the
