@@ -341,6 +341,8 @@ Agent24 自己的三语在 `apps/desktop/src/renderer/App.i18n.ts`：`en`、`zh`
 
 ## 需要 jason 拍板的问题
 
+> **已拍板（2026-11-02，jason）**：以下 1–6 全部按推荐执行；产品名定为「iDoris Design」，旁边小字「基于 Open Design」。小人采用重描方案：以 `logo-welcome.png` 为底，降采样并量化调色板，得到像素网格，再修出待机、思考、成功、出错四种状态，深浅两种背景都要验证；先给 jason 确认，再替换。ODX-1 开工。
+
 1. **小人谁来画。** 推荐：ODX-6 先用本文的 SVG 草稿顶上，发布前用 `logo-welcome.png` 重描一版同构图的像素图替换草稿。不做 8×9 宠物图集，除非还要把默认关闭的浮动宠物也换成她。
 2. **分享和云功能留不留。** 推荐：这一轮关掉入口（`DisabledCloudAccount`），源码留着，等 iDoris 身份接上 `IdentityBridge` 再决定删不删。不要在升级里保留「登录 OD 才能分享」。
 3. **对外名字。** 推荐：页面内「iDoris Design · 基于 Open Design」；Agent24 侧栏维持「Design」；包名继续 `open-design`。
