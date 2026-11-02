@@ -34,7 +34,7 @@ use agent24_protocol::state_file::AuthMode;
 /// There is no connection to watch: the report is a plain HTTP POST.
 pub const REPORT_TTL: Duration = Duration::from_secs(90);
 /// The ids of the components this daemon lists itself. No attached module may take one:
-/// `attached::parse_manifest` refuses them, and [`attach_items`] drops same-named entries
+/// `attached::register` refuses them for new registrations, and [`attach_items`] drops same-named entries
 /// from registrations that predate the rule. Pinned by a test.
 pub(crate) const BUILTIN_COMPONENT_IDS: &[&str] =
     &["idoris", "hyphae", "documents", "knowledge", "open-design"];

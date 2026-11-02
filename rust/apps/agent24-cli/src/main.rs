@@ -1287,8 +1287,9 @@ async fn cmd_chat(req: ChatRequest) -> Result<(), String> {
 
 #[derive(Subcommand)]
 enum ComponentsAction {
-    /// One line per component: id, state, version and the capabilities it provides. A client
-    /// that is not the desktop sees the redacted view (no reasons, ports or paths).
+    /// One line per component: id, state, version and the capabilities it provides. With a
+    /// capability token the daemon returns the redacted view (no reasons, ports or paths); in
+    /// legacy auth mode it returns the full view, which `--json` prints whole.
     List {
         /// 原样输出完整 JSON 响应
         #[arg(long)]

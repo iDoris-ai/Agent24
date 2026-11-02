@@ -4837,7 +4837,8 @@ components:
         components:
           type: array
           items:
-            oneOf:
+            # anyOf, not oneOf: a full view also satisfies the redacted schema.
+            anyOf:
               - $ref: "#/components/schemas/ComponentView"
               - $ref: "#/components/schemas/ComponentRedactedView"
     ComponentReport:

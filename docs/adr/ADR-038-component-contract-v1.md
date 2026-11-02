@@ -239,7 +239,7 @@ CLI 绑定额外规定（和 `agent24-comm/src/runner.rs` 现有约定一致）�
 
 状态暴露：
 - 状态统一通过 `GET /api/v1/components` 对客户端暴露。能力中心、通信页、本地模型页都从这里读状态，不再各写一套（现有 `/api/v1/idoris/status`、`/api/v1/comm`、`/api/v1/os` 保留为兼容别名，内部读同一份）。
-- 这条路由登记 CORE-2 `Operation::ComponentsRead`，`AssuranceLevel::Standard`，**不进** `creative_allowlist`。
+- 这条路由登记 CORE-2 `Operation::ComponentsRead`，`AssuranceLevel::Everyday`，**不进** `creative_allowlist`。
 - **按 audience 脱敏**：host audience 看全量；其他 audience 只返回 `{ id, version, state, provides }`。安装路径、pid、端口、错误详情（`message` 可能带 relay URL）、团队 ID、commit 只给 host。
 - **Open Design 的状态由桌面上报**：Electron main 的 `open-design-component.ts` 和 `CreativeServeWeb` 掌握 OD 的安装与运行状态，daemon 不知道。桌面通过 `POST /api/v1/components/{id}/report`（host audience 专用，`Operation::ComponentsReport`）把状态推给 daemon，daemon 只汇总。v1 不把 OD 的下载迁进 daemon；迁移另立任务。
 
