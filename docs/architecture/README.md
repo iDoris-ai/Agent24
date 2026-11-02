@@ -53,7 +53,7 @@
 
 | 主题 | 架构说明 | ADR | 设计与规格 |
 |---|---|---|---|
-| 通信（Hyphae、Nostr） | [分层总览](../ARCHITECTURE-LAYERS.md) | 暂无独立 ADR | [COMM-HYPHAE](../design/COMM-HYPHAE.md)、[HYPHAE-CLI-INTEGRATION](../design/HYPHAE-CLI-INTEGRATION.md)、[F4 Nostr 通道](../specs/F4-nostr-channel.md)；[COMM-FRIENDS 好友机制](../design/COMM-FRIENDS.md)（设计稿，待拍板） |
+| 通信（Hyphae、Nostr） | [分层总览](../ARCHITECTURE-LAYERS.md) | 暂无独立 ADR | [COMM-HYPHAE](../design/COMM-HYPHAE.md)、[HYPHAE-CLI-INTEGRATION](../design/HYPHAE-CLI-INTEGRATION.md)、[F4 Nostr 通道](../specs/F4-nostr-channel.md)；[COMM-FRIENDS 好友机制](../design/COMM-FRIENDS.md)（设计稿，已拍板 2026-11-02，排在 ADR-038 C1–C3 之后） |
 | 桌面、TUI、移动 | [分层总览 L7](../ARCHITECTURE-LAYERS.md) | 日志 ADR-027（部分被 ADR-037 取代）、ADR-037 | [Windows 移植](../design/WINDOWS-PORT.md)；[多平台发布计划](../Deployment/RESEARCH.md) |
 
 ### 模型与硬件

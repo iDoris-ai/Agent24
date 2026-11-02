@@ -125,7 +125,7 @@
   4. **T01-E 收口**（[HYPHAE-CLI-INTEGRATION](../design/HYPHAE-CLI-INTEGRATION.md)）：冻结当前 F4b 白名单入站 gated-run 路径、不再扩展。→ 波次 B。
   5. **收口后的入站高层授权与持久化**（待立项，责任仓 Agent24）：入站触发 run、request / run 持久化、能力授权（与 C5 对齐），是四仓联调验收（UI / T21 / T22）的前置。← T01-E。→ 波次 B / C。
   6. **可发布性**（[COMM-HYPHAE](../design/COMM-HYPHAE.md) §9 的 G3 / R4，已在 [Deployment/TASKS.md](../Deployment/TASKS.md) 立项）：**DEP-C8** 把 `hyphae.lock.json` 升级到含 daemon 锁的版本（Hyphae #104 之后）→ **DEP-C9** 发布包加入 `hyphae` 二进制并做干净机器验收。→ 波次 A / B。
-  7. **COMM-FRIENDS 好友机制**（设计稿 [COMM-FRIENDS](../design/COMM-FRIENDS.md)，2026-11-02，待 jason 拍板 §8）：申请 / 同意 / 删除 / 屏蔽 + 陌生人消息分流 + 地址发现（链接、二维码）；分片 CF-1…CF-7 与 Hyphae HY-F1…F3，分片表与依赖见该文 §10。不依赖 ADR-041 落地。→ 波次待排（拍板后）。
+  7. **COMM-FRIENDS 好友机制**（设计稿 [COMM-FRIENDS](../design/COMM-FRIENDS.md)，已拍板 2026-11-02，§8 六条全按推荐）：申请 / 同意 / 删除 / 屏蔽 + 陌生人消息分流 + 地址发现（链接、二维码）；分片 CF-1…CF-7（CF-5 拆 a/b，共 8 片）与 Hyphae HY-F1…F3，分片表与依赖见该文 §10。不依赖 ADR-041 落地。→ 排在 ADR-038 C1–C3 之后，波次随 C3 完成时再定。
 - **依赖**：收口后的入站授权 ← T01-E、C5；DEP-C9 ← DEP-C8；O-4 渠道接入 ← COMM-7；COMM-FRIENDS CF-* ← #1535（已合）。
 
 ### C9 语音（AgentEar）

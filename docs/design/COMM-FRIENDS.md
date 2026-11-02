@@ -2,8 +2,8 @@
 
 索引：[架构总入口](../architecture/README.md) · [ADR 索引](../adr/README.md)
 
-状态：**设计稿 r1，已拍板（2026-11-02，jason：§8 六条全部按推荐）** · 只写设计，不含实现；实现排在 ADR-038 C1–C3 之后（见 §10）
-上位：[ADR-039 概念模型](../adr/ADR-039-concept-model.md)（不发明新顶层名词：好友、陌生人、屏蔽都是「通信」这项能力里联系人的**状态**，不是新概念）；[ADR-041 入站事件与准入](../adr/ADR-041-inbound-events-admission-and-work-items.md)（好友 / 陌生人属于**通道准入**，不是执行授权）
+状态：**设计稿 r2，已拍板（2026-11-02，jason：§8 六条全部按推荐）** · 只写设计，不含实现；实现排在 ADR-038 C1–C3 之后（见 §10）。r2 = Sonnet 评审（2 High、9 Medium、6 Low）处置：Q3 收窄到裸 Hyphae 对端、状态机补全、自动转移的写入规则、去重改为 event_id seen-set、CF-1/2/3 边界。
+上位：[ADR-039 概念模型](../adr/ADR-039-concept-model.md) §5 末句「不允许为新东西发明新的顶层名词」：好友、陌生人、屏蔽都是「通信」这项能力里联系人的**状态**，不是新概念）；[ADR-041 入站事件与准入](../adr/ADR-041-inbound-events-admission-and-work-items.md)（好友 / 陌生人属于**通道准入**，不是执行授权）
 基线：Agent24 `63a480ae`（含 [#1535](https://github.com/iDoris-ai/Agent24/pull/1535) 通信页可用性 + NIP-49 备份）；Hyphae **v0.28.1**（`44189b8e`）。现状设计见 [COMM-HYPHAE](COMM-HYPHAE.md)、[HYPHAE-CLI-INTEGRATION](HYPHAE-CLI-INTEGRATION.md)、[F4 Nostr 通道](../specs/F4-nostr-channel.md)。
 路线图：本文 §10（`docs/agent/roadmap.md` 已标注「本文档描述的不是当前在做的事」，不往里写；组件视图见 [COMPONENT-ROADMAP §C8](../agent/COMPONENT-ROADMAP.md)）。
 
@@ -58,32 +58,50 @@
 
 ### 3.2 状态机
 
-每个对端 npub 一条记录，状态如下。没有记录 = 陌生人。
+每个对端 npub 一条记录，状态如下。没有记录 = 陌生人。「已删除」在转移上和陌生人完全一样，只多保留 `name` 和 `removed_at` 便于识别。
 
 ```
-                 发出申请                    收到 accept / 对方普通回复(Q3)
-  陌生人 ───────────────▶ 申请中(我发出) ──────────────────────────▶ 好友
-   │  ▲                       │ 撤回 / 超时(30 天)                   │  ▲
-   │  └───────────────────────┘                                     │  │ 再次申请并通过
-   │     收到 request                   我同意                        ▼  │
-   └──────────────────────▶ 申请中(我收到) ───────────────────────▶ 好友 ──删除──▶ 已删除
-                               │ 我拒绝 / 对方 withdraw / 超时
-                               ▼
-                             陌生人（记 declined_at，用于限频）
+  陌生人 / 已删除 ──发出申请──▶ 申请中(我发出)
+  陌生人 / 已删除 ──收到 request──▶ 申请中(我收到)
 
-  任何状态 ──屏蔽──▶ 已屏蔽 ──解除屏蔽──▶ 陌生人（若原本是好友，解除后仍需重新申请）
+  申请中(我发出) ──收到 accept(id 匹配)──▶ 好友
+  申请中(我发出) ──收到 request（两边同时申请）──▶ 好友（并回 accept）
+  申请中(我发出) ──裸 Hyphae 对端的普通回复(Q3，见 §3.4)──▶ 好友（并补发 accept）
+  申请中(我发出) ──收到 decline(id 匹配)──▶ 申请中(我发出)，记 peer_declined_at，界面显示「对方拒绝」
+  申请中(我发出) ──撤回──▶ 陌生人
+  申请中(我发出) ──30 天未回应（扫描时惰性判定）──▶ 陌生人
+
+  申请中(我收到) ──我同意 / 我点「加为好友」（两者同一个动作）──▶ 好友（并发 accept）
+  申请中(我收到) ──我拒绝──▶ 陌生人，记 declined_at
+  申请中(我收到) ──收到 withdraw(id 匹配)──▶ 陌生人
+  申请中(我收到) ──30 天未处理（扫描时惰性判定）──▶ 陌生人
+
+  好友 ──删除──▶ 已删除
+  任何状态 ──屏蔽──▶ 已屏蔽（申请中的记录静默丢弃，不发任何消息）
+  已屏蔽 ──解除屏蔽──▶ 陌生人（原本是好友也要重新申请）
 ```
 
 | 状态 | 含义 | 本地记录 |
 |---|---|---|
-| 陌生人 | 没有关系 | 无记录，或只有 `declined_at` / `last_request_at` |
-| 申请中（我发出） | 我发了 `request`，等对方 | `request_id`、`sent_at` |
+| 陌生人 | 没有关系 | 无记录，或只有 `declined_at` / `last_request_at` / `speaks_protocol` |
+| 申请中（我发出） | 我发了 `request`，等对方 | `request_id`、`sent_at`、可选 `peer_declined_at` |
 | 申请中（我收到） | 对方发了 `request`，等我 | `request_id`、`note`、`name`、`received_at` |
 | 好友 | 双方（据我所知）互为好友 | `since`、`name`、Hyphae 联系人昵称 |
 | 已删除 | 我删了对方；对方可能还把我当好友 | `removed_at`，保留 `name` 便于识别 |
 | 已屏蔽 | 不看、不收、不回 | `blocked_at` |
 
-**两边同时申请**：我在「申请中（我发出）」时收到对方的 `request`，直接变好友并回 `accept`（双方意愿都明确了，不需要再点一次）。
+每条记录另有一个布尔 `speaks_protocol`：只要从这个 npub 收到过**任何一条**合规的 `agent24.friend/*` 消息就置 true，永不清零（删除、屏蔽、解除都不清）。它只用来判断 Q3 适不适用（§3.4）。
+
+**自动转移时写什么、发什么**（评审 M1）：
+
+| 转移 | 写 Hyphae `contact add` | 发 `accept` | 需要再次确认吗 |
+|---|---|---|---|
+| 用户点「同意」/「加为好友」（申请中·我收到 → 好友） | 是 | 是，`id` = 对方的 request id | 是：主进程原生确认（写 keystore） |
+| 收到 `accept`（申请中·我发出 → 好友） | 是 | 否 | 否 |
+| 两边同时申请（申请中·我发出 + 收到 request → 好友） | 是 | 是，`id` = 对方的 request id | 否 |
+| Q3 裸对端普通回复（申请中·我发出 → 好友） | 是 | 是，`id` = **我自己**的 request id（对方没发过 request，没有别的 id 可引用） | 否 |
+
+规则：用户点「加为好友」时过的那一次主进程原生确认，就是对上面三种**无需再确认**的后续动作的授权——它们都只是「我申请的这段关系成立了」的结果，`contact add` 写的也是用户当时亲手填的那个 npub。**两端都在变成好友的那一刻各自执行 `contact add`**，所以互为好友后双方 keystore 里都有对方。`contact add` 失败（keystore 锁住、昵称撞名已按 §4 规则规避）时状态照常变好友，记一条待补写，下次扫描重试；发不出 `accept` 时按 COMM-HYPHAE §5.3 入 outbox，不回滚状态。
 
 ### 3.3 消息协议：带类型的 NIP-44 加密消息
 
@@ -96,18 +114,20 @@ agent24.friend/v1
 
 | `type` | 发送时机 | 字段 | 收到后的处理 |
 |---|---|---|---|
-| `request` | 用户点「加为好友」 | `id`（16 hex，随机）、`name`（≤ 64 字）、`note`（≤ 200 字，可空）、`ts` | 陌生人 / 已删除 → 申请中（我收到）；申请中（我发出）→ 好友并回 `accept`；好友 → 回 `accept`（对方可能重装了）；已屏蔽 → 丢弃；申请中（我收到）→ 覆盖旧申请（同一 npub 只保留一条） |
-| `accept` | 用户点「同意」 | `id`（对应的 request id）、`name`、`ts` | 申请中（我发出）且 `id` 匹配 → 好友；其他状态 → 忽略并记日志（防止凭空「被同意」） |
-| `decline` | **可选**，用户选「拒绝并告知」（Q2） | `id`、`ts` | 申请中（我发出）且 `id` 匹配 → 陌生人，界面显示「对方拒绝」；其他 → 忽略 |
+| `request` | 用户点「加为好友」 | `id`（16 hex，随机）、`name`（≤ 64 字）、`note`（≤ 200 字，可空）、`ts` | 陌生人 / 已删除 → 申请中（我收到），但 `declined_at` 在 7 天内的静默丢弃（§3.8）；申请中（我发出）→ 好友并回 `accept`；好友 → 回 `accept`（对方可能重装了）；已屏蔽 → 丢弃；申请中（我收到）→ 覆盖旧申请（同一 npub 只保留一条） |
+| `accept` | 用户点「同意」；或 §3.2 表里的两种自动补发 | `id`（对应的 request id；Q3 补发时是**我自己**的 request id）、`name`、`ts` | 申请中（我发出）且 `id` 匹配 → 好友；其他状态或 `id` 不匹配 → 忽略并记日志（防止凭空「被同意」） |
+| `decline` | **可选**，用户选「拒绝并告知」（Q2） | `id`、`ts` | 申请中（我发出）且 `id` 匹配 → 仍是申请中（我发出），记 `peer_declined_at`，界面显示「对方拒绝」，7 天内不能重发；其他 → 忽略 |
 | `withdraw` | 用户撤回申请 | `id`、`ts` | 申请中（我收到）且 `id` 匹配 → 陌生人，静默移除；其他 → 忽略 |
+
+任何一种类型只要解析合规，就把该 npub 的 `speaks_protocol` 置 true（即使随后因状态不符被忽略）。
 
 规则：
 - 没有单独的 `card` 类型：profile 卡片就是 `request` / `accept` 里的 `name`（将来可加 `avatar_sha256` 之类字段，v1 不做）。**不用 Hyphae `profile publish`**，那是公开发到 relay 的，谁都能读；好友之间的名片应该走加密消息。
 - 整条明文上限 4 KiB，`name` / `note` 过 #1535 的昵称规则（拒绝 Cc / Cf 控制字符，保留 ZWNJ / ZWJ），JSON 禁止重复键、禁止未知顶层字段以外的解析歧义；任何一处不合规 → 当作**普通文本**进陌生人消息（不丢，但不改状态），这样格式错误不会变成拒绝服务。
 - 发送用 `agent msg --content-file`（v0.28.1 已有，同时解决 COMM-HYPHAE G9「正文进 argv」），不用 `--content`。
-- 事件 id 就是去重键。Agent24 保存已处理的 `event_id` 窗口和 `last_created_at` 游标（§3.6）。同一申请重放不会二次改状态。
+- 事件 id 就是去重键。Agent24 在 `friends.json` 里持久化一个有上限的已处理 `event_id` 集合（LRU，2 000 条），**不用 `created_at` 当游标**（它是发送方自报的时间，可伪造、可乱序；同秒多条也分不开）。同一申请重放不会二次改状态。扫描方式见 §6。
 - **与 Hyphae 的共存**：`agent24.` 前缀不以 `hyphae.` 开头，Hyphae 按 `AgentRouteDirect` 当普通聊天落库，`history inbox` 原样返回，**Agent24 的 `GET /comm/history` 把这些行过滤掉并交给状态机**。Hyphae 不需要新增字段或子命令就能跑通；要它配合的只有：承诺不占用 `agent24.` 命名空间并写进 wire contract，TUI 显示时把这类行折叠成一句人话（§9 HY-F3）。
-- **对端不是 Agent24**（裸 Hyphae CLI / TUI 用户）：他看到的是上面那段 JSON 文本，`note` 是人话，能看懂；他直接回一句话 → 按 Q3 当作同意。
+- **对端不是 Agent24**（裸 Hyphae CLI / TUI 用户）：在 HY-F3 把这类行折叠之前，他看到的就是上面那两行原文（前缀 + JSON），`note` 是人话，能看懂；他直接回一句话 → 按 Q3 当作同意。我们补发的 `accept` 他同样会以原文看到一次，这是 HY-F3 之前接受的体验代价。
 
 备选（否决）：
 - **Hyphae 原生前缀 `hyphae.friend/v1` + Hyphae 状态机 + `contact request/accept` 子命令**。好处是 TUI 也能用；代价是 Hyphae 要做一套状态机、存储、JSON 契约（L），Agent24 还是要再包一层。好友是产品层的事，Hyphae 的定位是传输（HYPHAE-CLI-INTEGRATION「接线原则」1）。v2 若 TUI 也要好友再议。
@@ -120,11 +140,14 @@ agent24.friend/v1
 |---|---|---|---|
 | 好友 | 进主列表（按对端分会话） | 通知 | 能 |
 | 申请中（我收到） | 挂在申请卡片下作为「附言」，同意后并入会话 | 和申请一起通知一次 | 同意后才能回 |
-| 申请中（我发出） | **按 Q3**：默认视为对方同意 → 变好友，并补发一条 `accept` 让对方同步 | 通知 | 能 |
+| 申请中（我发出），对端 `speaks_protocol=false`（裸 Hyphae 用户） | **按 Q3**：视为对方同意 → 变好友，`contact add`，并补发一条 `accept`（`id` 为我的 request id）让对方同步 | 通知 | 能 |
+| 申请中（我发出），对端 `speaks_protocol=true`（是 Agent24，或曾发过任何协议消息，包括 `decline`） | **Q3 不适用**：状态不变，仍是申请中；消息进陌生人消息列表。Agent24 对端只有发 `accept` 才算同意 | 不通知 | 能回（回复不改变关系） |
 | 陌生人 / 已删除 | 进**陌生人消息**列表：按对端折叠，显示名字（若曾是好友）或 npub 短码 + 预览；每个对端最多保留最近 20 条，列表最多 200 个对端，超出按时间淘汰 | **不通知**，只在入口显示数量 | 能回（回复不改变关系；界面提示「对方不是好友」并给「加为好友」） |
 | 已屏蔽 | **静默丢弃**：不进任何列表、不计数、不通知 | 无 | 不显示，自然不能回 |
 
 「只接收好友消息」开关（默认关）：开了以后陌生人消息也静默丢弃，但**好友申请仍然收**（否则永远加不了新朋友）；入口显示「已过滤 N 条」。
+
+Q3 的边界（评审 H2）：Q3 只补「对端是裸 Hyphae 用户、发不出 `accept`」这一个缺口。一旦对端发过任何一条 `agent24.friend/*`，它就被认定为会说协议，之后只认 `accept`。已知的不对称：Agent24 对端**静默**拒绝了我（没发 `decline`，所以我这边 `speaks_protocol` 仍是 false），之后又主动给我发普通消息——我这边会按 Q3 变好友并补发 `accept`，对方的 Agent24 收到这条 `accept` 时 `id` 不匹配会忽略，对方那边我仍是陌生人。这是可接受的：对方主动发消息本身就表示愿意联系，而对方那边的关系不会被我单方面改变。
 
 ### 3.5 删除与屏蔽的语义
 
@@ -156,7 +179,7 @@ Nostr 的限制要写在界面里：屏蔽只在**这台设备的 Agent24** 生�
 
 **推荐 v1 做 B，C 列为 v2**（Q5）。理由：#1535 刚把备份流程做扎实，加一个文件是 S 级；C 要 Hyphae 新协议和冲突合并，而现在连第二台设备的场景都没验证过。
 
-状态存储说明：COMM-HYPHAE §2 定了「comm 不另存消息，Hyphae 的文件是唯一来源」。好友表不是消息，是关系状态，Agent24 自己存不违反这条；但要在 COMM-HYPHAE §2 补一行「关系状态在 `comm/friends.json`」。ADR-041 落地后，入站去重游标并入 `inbound_events`，好友表仍独立（它是准入表的「名单」数据来源之一，见 §3.9）。
+状态存储说明：COMM-HYPHAE §2 定了「comm 不另存消息，Hyphae 的文件是唯一来源」。好友表不是消息，是关系状态，Agent24 自己存不违反这条；但要在 COMM-HYPHAE §2 补一行「关系状态在 `comm/friends.json`」。ADR-041 落地后，已处理 `event_id` 集合并入 `inbound_events` 的去重，好友表仍独立（它是准入表的「名单」数据来源之一，见 §3.9）。
 
 ### 3.7 地址发现：第一次怎么拿到对方
 
@@ -174,8 +197,8 @@ Nostr 的限制要写在界面里：屏蔽只在**这台设备的 Agent24** 生�
 
 Nostr 密钥免费、无限，所以限频对「换一个 key 再发」无效；防线是**陌生人永远不通知 + 列表有上限**，限频只是辅助。
 
-- 发出申请：同一对端 24 小时内最多 1 条（被拒绝后 7 天内不能再发）；全局每小时最多 20 条（防被攻破的 renderer 拿本机当发件机，呼应 #1535 残余风险 1）。
-- 收到申请：同一对端只保留一条（新的覆盖旧的）；待处理申请最多 100 条，超过的进陌生人消息列表尾部。
+- 发出申请：同一对端 24 小时内最多 1 条；收到过对方 `decline` 的（`peer_declined_at`），7 天内不能再发——**这条 7 天规则只在真的收到 `decline` 时生效**，对方静默不回只受 24 小时规则约束；全局每小时最多 20 条（防被攻破的 renderer 拿本机当发件机，呼应 #1535 残余风险 1）。
+- 收到申请：我拒绝过的对端（`declined_at`），7 天内它再发的 `request` **静默丢弃**（不进待处理、不进陌生人消息、不通知），7 天后再发的照常显示；同一对端只保留一条（新的覆盖旧的）；待处理申请最多 100 条，超过的进陌生人消息列表尾部。
 - 陌生人消息：§3.4 的 20 条 / 200 个对端上限；预览只取前 80 字，去控制字符。
 - `request` 的 `note` 展示时当作不可信文本：去控制字符、不渲染链接、不自动预览。
 - 申请和同意在桌面端都经**主进程原生确认框**（和 #1535 的加联系人一致），因为同意会写 keystore（`contact add`）。
@@ -216,7 +239,7 @@ Nostr 密钥免费、无限，所以限频对「换一个 key 再发」无效；
 | 方法 + 路径 | 请求 | 说明 |
 |---|---|---|
 | `GET /comm/friends?state=` | — | 列表，`state` 可选 `friend \| requested_out \| requested_in \| removed \| blocked` |
-| `POST /comm/friends/request` | `{to, note?}`，`to` 接受 npub / nprofile / nostr: URI / nip05 | 发 `request`，写申请中（我发出）。桌面经主进程确认 |
+| `POST /comm/friends/request` | `{to, note?}`，`to` 接受 npub / nprofile / nostr: URI / nip05 | 发 `request`，写申请中（我发出）。对端已在申请中（我收到）时**等同 `accept`**（界面上的「加为好友」和「同意」是同一个动作）。桌面经主进程确认 |
 | `POST /comm/friends/{npub}/accept` | — | 发 `accept`，`contact add`，写好友。桌面经主进程确认 |
 | `POST /comm/friends/{npub}/decline` | `{notify?: bool}` | 默认不发消息；`notify=true` 发 `decline` |
 | `POST /comm/friends/{npub}/withdraw` | — | 发 `withdraw` |
@@ -233,9 +256,10 @@ CLI：`agent24 comm friend list|add|accept|decline|withdraw|remove|block|unblock
 
 ## 6. 入站扫描怎么跑
 
-- 由 comm 模块在 daemon `running` 时每 30 s（和 Hyphae `--watch-interval` 同步）执行 `history inbox --limit 200`，按 `created_at` 升序处理 `> last_created_at` 的行，同秒的按 `event_id` 窗口去重。没有 daemon 时由 `POST /comm/inbox/pull` 后顺带扫一次。
-- `history inbox` 没有游标是实打实的缺口：200 条以内够用，积压超过 200 条就可能漏协议消息。所以 §9 请 Hyphae 加 `--after-id`（群聊 history 已有同款）。在那之前，扫描发现「第 200 条仍比游标新」时记一条 `catch_up.incomplete` 风格的告警并提示用户刷新，不静默。
-- ADR-041 D1 落地后，这个扫描就是「Hyphae 收件箱由 daemon 主动拉取写入 `inbound_events`」那条适配器，好友协议消息的 `disposition` 记为 `protocol`，不进准入。
+- 由 comm 模块在 daemon `running` 时每 30 s（和 Hyphae `--watch-interval` 同步）执行 `history inbox --limit 200`，**每次都拿最新 200 条**，逐条查 `friends.json` 里持久化的已处理 `event_id` 集合（有上限的 LRU，2 000 条）：没见过的交给状态机并记入集合；见过的跳过。处理顺序按 `created_at` 升序只是为了让「先 request 后 withdraw」这类成对消息按发送顺序落地，`created_at` **不做游标、不做过滤条件**。没有 daemon 时由 `POST /comm/inbox/pull` 后顺带扫一次。
+- 同一次扫描里也要惰性判定超时：申请中的记录 `sent_at` / `received_at` 超过 30 天的转为陌生人（§3.2）；不另起定时器。
+- `history inbox` 没有游标是实打实的缺口：一次拉 200 条足够日常，但两次扫描之间积压超过 200 条就可能漏掉协议消息。所以 §9 请 Hyphae 加 `--after-id`（群聊 history 已有同款）。在那之前，扫描发现「第 200 条（最旧的那条）也没见过」时记一条 `catch_up.incomplete` 风格的告警并提示用户刷新，不静默。
+- ADR-041 D1 落地后，这个扫描就是「Hyphae 收件箱由 daemon 主动拉取写入 `inbound_events`」那条适配器，seen-set 并入 `inbound_events` 的 `id` 去重，好友协议消息的 `disposition` 记为 `protocol`，不进准入。
 
 ## 7. 测试判据
 
@@ -244,10 +268,21 @@ CLI：`agent24 comm friend list|add|accept|decline|withdraw|remove|block|unblock
 | 两套临时 HOME + 本地 relay：A 申请 → B 同意 → 两边 `GET /comm/friends` 都是 `friend`，B 的 keystore 里多了 A 的联系人 | 不发 `accept` 时 A 仍是 `requested_out` |
 | A 删除 B 后，B 发消息出现在 A 的 `bucket=strangers`，`bucket=friends` 里没有 | 删除前同一条消息在 `friends` 里 |
 | A 屏蔽 B 后，B 的消息和申请在 A 的任何 bucket 里都不出现，`messages.db` 里仍然有（证明是客户端过滤） | 解除屏蔽后再发一条能出现 |
-| 两边同时申请 → 两边都直接变好友，各收到一条 `accept` | — |
+| 两边同时申请 → 两边都直接变好友，各收到一条 `accept`，两边 keystore 里各多一条联系人 | — |
 | `accept` 的 `id` 不匹配 → 状态不变 | 匹配的 `id` → 变好友 |
+| **Q3 适用**：A 申请裸 Hyphae 用户 B（B 从未发过协议消息），B 用 `hyphae agent msg` 回一句普通文本 → A 变 `friend`，A 的 keystore 多了 B，B 收到一条 `accept` 且其 `id` 等于 A 的 request id | B 不回 → A 仍是 `requested_out` |
+| **Q3 不适用**：A 申请 Agent24 用户 B，B 发了 `decline`（带告知），之后 B 又发普通文本 → A 仍是 `requested_out`（带 `peer_declined_at`），那条文本在 A 的 `bucket=strangers` | 同场景 B 发 `accept` → A 变 `friend` |
+| B 曾发过任何协议消息（例如一条被忽略的 `withdraw`）后再发普通文本 → A 仍是 `requested_out` | — |
+| A 删除 B 后再对 B 发申请 → A 是 `requested_out`，记录保留原 `name` | — |
+| A 删除 B 后收到 B 的 `request` → A 是 `requested_in` | — |
+| A 在 `requested_in` 时点「加为好友」→ 等同「同意」：变 `friend`、`contact add`、发 `accept` | — |
+| A 在 `requested_in` 或 `requested_out` 时屏蔽 B → 直接 `blocked`，不发任何消息，pending 记录消失 | 解除屏蔽后 B 是陌生人，需要重新申请 |
+| A 拒绝 B（不告知）后 B 在 7 天内再发 `request` → A 这边什么都不出现；第 8 天再发 → 出现在待处理 | — |
+| A 收到 B 的 `decline` 后 7 天内对 B 发申请 → `rate_limited`；没收到 `decline` 只受 24 小时规则限制 | — |
+| 30 天超时：把 `sent_at` 改成 31 天前，跑一次扫描 → `requested_out` 变陌生人；29 天 → 不变 | — |
 | 畸形 JSON（重复键、超 4 KiB、控制字符）→ 当普通文本进陌生人消息，状态不变 | 合规 JSON → 状态变化 |
-| 重放同一 `event_id` 的 `request` 十次 → 只有一条申请 | — |
+| 重放同一 `event_id` 的 `request` 十次 → 只有一条申请；重启 daemon 后再重放 → 仍只有一条（seen-set 已持久化） | 不同 `event_id`、相同内容的 `request` → 覆盖为新申请（同一 npub 只留一条） |
+| seen-set 塞满 2 000 条后再来 1 条 → 最旧的被淘汰，新的被记住 | — |
 | zero-run：发 20 条申请 / 同意 / 陌生人消息，runs Δ=0、模型 stub=0、`A24_NOSTR_ALLOWED_NPUBS` 文件和环境不变 | F4b 开 flag 的正对照 runs Δ=1（沿用 COMM-5b T3） |
 | 备份：导出含好友表的联系人包 → 全新 HOME 恢复 → 好友列表一致 | 不导入时为空 |
 
@@ -259,7 +294,7 @@ CLI：`agent24 comm friend list|add|accept|decline|withdraw|remove|block|unblock
 |---|---|---|---|
 | Q1 | 协议归谁：Agent24 自己的 `agent24.friend/v1` 明文前缀（Hyphae 当普通消息落库，Agent24 解析），还是让 Hyphae 做原生 `hyphae.friend` 状态机和子命令 | **Agent24 自己做**，Hyphae 只做 §9 的三处小配合 | 好友是产品层概念，Hyphae 定位是传输；Hyphae 原生要 L 级改动，还得等它发版锁 hash |
 | Q2 | 拒绝申请要不要告诉对方 | **默认不告知**，提供「拒绝并告知」为可选 | 微信、Telegram、LINE、Signal 都不告知；不告知让申请方分不清拒绝 / 没看 / 屏蔽，是保护被申请方 |
-| Q3 | 我发出申请后，对方没回 `accept` 但直接回了一句话，算不算同意 | **算**，自动变好友并补发 `accept` | 对方可能是裸 Hyphae TUI 用户，发不出 `accept`；jason 的原话「申请其实就是第一条消息，对方回了就是同意」 |
+| Q3 | 我发出申请后，对方没回 `accept` 但直接回了一句话，算不算同意 | **算，但只对从未发过任何 `agent24.friend/*` 消息的对端（裸 Hyphae 用户）**；自动变好友并补发 `accept`。Agent24 对端只认 `accept` | 对方可能是裸 Hyphae TUI 用户，发不出 `accept`；jason 的原话「申请其实就是第一条消息，对方回了就是同意」。收窄是为了不让「静默拒绝后随口说一句」变成好友（评审 H2） |
 | Q4 | 已有联系人怎么算 | **默认算好友**，记来源 `migrated_from_contact` | 它们是手填加的、正在聊的；标陌生人是倒退 |
 | Q5 | 好友关系存哪 | **v1 本地 + 纳入备份**（和 `ncryptsec` 并列一个加密的联系人包）；NIP-51 加密列表列 v2 | 复用 #1535 的备份流程是 S 级；NIP-51 要 Hyphae 新协议和多设备冲突规则，现在没有多设备场景 |
 | Q6 | NIP-05 用户名要不要做，以及 iDoris 要不要给用户发 `name@idoris.ai` | **v1 不做解析，只做链接和二维码**；`@idoris.ai` 作为 iDoris 的产品项单独立项 | NIP-05 解析在 Agent24 里受 comm crate 禁 HTTP 的约束，放 Hyphae 更顺；但先验证好友流程本身，再谈域名身份 |
@@ -271,7 +306,7 @@ CLI：`agent24 comm friend list|add|accept|decline|withdraw|remove|block|unblock
 | 编号 | 内容 | 规模 | 为什么 |
 |---|---|---|---|
 | HY-F1 | `contact remove --nickname N`（可顺带 `contact update`） | S | 删好友 / 屏蔽后 keystore 里的条目没法清；现在只能留着不显示 |
-| HY-F2 | `history inbox --after-id <id>`（和 `groupchat history` 同款游标） | S | 协议消息扫描没有游标，积压超过 `--limit` 会漏 |
+| HY-F2 | `history inbox --after-id <id>`（和 `groupchat history` 同款游标） | S | 现在每 30 s 全量拉 200 条靠 seen-set 去重；有游标后只拉增量，而且两次扫描之间积压超过 200 条也不会漏 |
 | HY-F3 | wire contract 写明 `agent24.` 明文前缀归 Agent24，Hyphae 不解析、不占用；TUI 显示这类行时折叠成「[Agent24 好友申请] <note>」 | S（文档 + TUI 一处） | 裸 TUI 用户不至于看到一坨 JSON；两仓命名空间不撞 |
 | HY-F4（v2） | `contact resolve --nip05 name@domain` | S | Agent24 comm crate 禁 HTTP 客户端 |
 | HY-F5（v2） | NIP-51 follow set 的发布 / 拉取（NIP-44 加密 content） | M | 多设备同步好友表 |
@@ -279,17 +314,17 @@ CLI：`agent24 comm friend list|add|accept|decline|withdraw|remove|block|unblock
 
 ## 10. 工作量与路线图
 
-**结论：工作量大**——Agent24 7 片（daemon 4、桌面 2、测试 1）+ Hyphae 3 片（v1），超过 4 片，且涉及双仓契约。按 COMM-HYPHAE §8 的习惯，每片约 300 行一个 PR；S ≈ 1–2 天，M ≈ 3–5 天，L ≈ 一周以上。开发派 Sonnet / Codex，Opus 只做验收。
+**结论：工作量大**——Agent24 8 片（CF-1、2、3 纯 daemon；CF-4、6 daemon + 桌面；CF-5a、5b 桌面；CF-7 测试）+ Hyphae 3 片（v1），超过 4 片，且涉及双仓契约。按 COMM-HYPHAE §8 的习惯，每片约 300 行一个 PR；S ≈ 1–2 天，M ≈ 3–5 天，L ≈ 一周以上。开发派 Sonnet / Codex，Opus 只做验收。
 
 | 编号 | 仓 | 交付 | 规模 | 依赖 | 可证伪验收 |
 |---|---|---|---|---|---|
-| CF-1 | Agent24 daemon | 好友表（`comm/friends.json`，原子写）、状态机、`/comm/friends*` 路由与 CLI、同意时 `contact add`、迁移（§4）、限频 | M | 无 | 状态机表驱动用例全覆盖 §3.2；并发 10 次 accept 只写一条联系人；迁移后 `contact list` 每项对应一条 `friend` |
-| CF-2 | Agent24 daemon | 协议编解码（§3.3）、`--content-file` 发送、入站扫描与游标（§6）、`GET /comm/history` 过滤协议行 | M | CF-1；HY-F3 文档（非阻塞） | §7 前六行；畸形样本 20 个全部当普通文本 |
-| CF-3 | Agent24 daemon | `bucket=` 分流、陌生人上限与淘汰、屏蔽静默丢弃、「只接收好友消息」开关 | S | CF-1 | §7 第 2、3 行；200 个对端 + 1 时最旧的被淘汰 |
+| CF-1 | Agent24 daemon | 好友表（`comm/friends.json`，原子写，含 seen-set 与 `speaks_protocol`）、状态机（§3.2 全部转移，作为纯函数）、**不涉及发送的**路由与 CLI（`GET /comm/friends`、`remove`、`block` / `unblock`、`PATCH`、`settings`）、变好友时的 `contact add`、迁移（§4）、限频计数 | M | 无 | 状态机表驱动用例覆盖 §3.2 每一条转移和 §3.8 的两条 7 天规则；并发 10 次「变好友」只写一条联系人；迁移后 `contact list` 每项对应一条 `friend`；本片**不发任何 Nostr 消息**（假二进制断言 `agent msg` 调用数为 0） |
+| CF-2 | Agent24 daemon | 协议编解码（§3.3）、`--content-file` 发送、入站扫描与 seen-set 去重（§6）、`GET /comm/history` 过滤协议行；**需要发送的路由**（`request`、`accept`、`decline`、`withdraw`）随本片落地 | M | CF-1；HY-F3 文档（非阻塞） | §7 第 1、4–11、13–18 行；畸形样本 20 个全部当普通文本 |
+| CF-3 | Agent24 daemon | `bucket=` 分流、陌生人上限与淘汰、屏蔽静默丢弃、「只接收好友消息」开关 | S | CF-2 | §7 第 2、3、12 行；200 个对端 + 1 时最旧的被淘汰 |
 | CF-4 | Agent24 daemon + 桌面 | 地址解析（npub / nprofile / nostr: / hex）、分享链接、二维码生成与从图片读取 | S | 无 | 四种输入解析到同一 pubkey；nprofile 的 relay 提示经 ws/wss 校验；坏二维码报 `invalid` |
 | CF-5a | 桌面 | 好友列表、「加为好友」流程（主进程确认）、收到的申请卡片（同意 / 拒绝）、发出的申请（撤回） | M | CF-1、CF-2、CF-4 | 页面测试：五种状态各有对应视图；没有「已读」「已送达」文案 |
 | CF-5b | 桌面 | 陌生人消息入口与折叠列表、屏蔽列表与解除、设置开关、联系人表从界面移除 | S | CF-3、CF-5a | 陌生人消息不触发系统通知；屏蔽者在任何视图不出现 |
-| CF-6 | Agent24 daemon + 桌面 | 备份：导出 / 恢复加密联系人包，复用 #1535 的口令窗口和写文件流程 | S | CF-1；Q5 | §7 最后一行；包里没有私钥 |
+| CF-6 | Agent24 daemon + 桌面 | 备份：导出 / 恢复加密联系人包，复用 #1535 的口令窗口和写文件流程 | S | CF-1 | §7 最后一行；包里没有私钥 |
 | CF-7 | Agent24 | 测试：zero-run 样本扩展、两 HOME + 本地 relay 联调、文档（COMM-HYPHAE §2 补一行、用户文档写明 `p` 标签可见与屏蔽仅本机） | M | CF-2、CF-3 | §7 zero-run 行，正对照 runs Δ=1 |
 | HY-F1 / F2 / F3 | Hyphae | 见 §9 | S × 3 | 无 | 各自 `--json` 契约测试；lock 升级走 DEP-C8 流程 |
 
@@ -297,13 +332,14 @@ CLI：`agent24 comm friend list|add|accept|decline|withdraw|remove|block|unblock
 
 ```
 CF-1 → CF-2 → CF-3 → CF-5b
-         ↘ CF-5a ↗        CF-4 → CF-5a
-CF-1 → CF-6（等 Q5）
+CF-1 → CF-2 → CF-5a ← CF-4
+CF-3 + CF-5a → CF-5b
+CF-1 → CF-6
 CF-2 + CF-3 → CF-7
 HY-F3（文档）→ CF-2 对齐命名空间；HY-F1 / HY-F2 到位后各自在 CF-1 / CF-2 里补接线（不阻塞）
 ```
 
-排序建议：先拍板 §8 → CF-1、CF-4 并行（互不依赖）→ CF-2 → CF-3 → CF-5a → CF-5b → CF-7 → CF-6。Hyphae 三片同步提，赶上下一次 lock 升级就接，赶不上也不等。
+排序建议（§8 已拍板）：CF-1、CF-4 并行（互不依赖）→ CF-2 → CF-3 → CF-5a → CF-5b → CF-7 → CF-6。Hyphae 三片同步提，赶上下一次 lock 升级就接，赶不上也不等。整条线排在 ADR-038 C1–C3 之后。
 
 与其他线的关系：不依赖 ADR-041 落地（它还是提议，且新表要等 CORE-5 5f–5g）；ADR-041 落地时按 §3.10 第 3 条和 §6 最后一条并入，不返工状态机。不依赖 T01 / NIP-17。
 
