@@ -10,6 +10,7 @@ pub mod download;
 pub mod install;
 pub mod lock;
 pub mod sign;
+pub mod state;
 pub mod storage;
 
 use std::path::Path;
@@ -21,6 +22,7 @@ pub use download::{
 };
 pub use install::run_install_child;
 pub use lock::{ComponentLock, LockError};
+pub use state::{ComponentState, Form};
 
 /// Fetch a pinned release asset using the fixed GitHub host policy, for callers
 /// that carry their own digest instead of a `ComponentLock` (Hyphae, schema 1,

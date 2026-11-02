@@ -21,6 +21,11 @@ use std::time::Duration;
 pub const HTTP_GRACE: Duration = Duration::from_millis(1500);
 /// After a module's stop grace: time to confirm its group is gone.
 pub const CONFIRM: Duration = Duration::from_millis(200);
+/// How long an in-flight model call of a module or attached module gets to wind down once
+/// the shutdown's drain is over (ADR-038 D6's cancel grace; `Params::deadlines` caps it at
+/// the stop grace when that is shorter). Independent of the stop grace:
+/// attached modules are never sent SIGTERM, so the 15s a package gets to flush is not theirs.
+pub const CALL_CANCEL_GRACE: Duration = Duration::from_secs(2);
 /// After the modules' deadline: time to put the summary on disk.
 pub const PERSIST: Duration = Duration::from_millis(200);
 /// After the later of the HTTP and persistence deadlines: the runtime's own
@@ -31,14 +36,26 @@ pub const WATCHDOG_MARGIN: Duration = Duration::from_millis(300);
 /// outgrow the margin the watchdog leaves it (review of #188, L-1).
 pub const RUNTIME_TEARDOWN: Duration = WATCHDOG_MARGIN;
 const _: () = assert!(RUNTIME_TEARDOWN.as_millis() <= WATCHDOG_MARGIN.as_millis());
+// The CLI's wait and the plist's ExitTimeOut are derived from `agent24_protocol::shutdown_bounds`;
+// the tail it assumes after the module budgets must cover what this file adds.
+const _: () = assert!(
+    CONFIRM.as_millis()
+        + PERSIST.as_millis()
+        + WATCHDOG_MARGIN.as_millis()
+        + RUNTIME_TEARDOWN.as_millis()
+        <= agent24_protocol::shutdown_bounds::TAIL_MS as u128
+);
 
 pub const DRAIN_ENV: &str = "A24_MODULE_DRAIN_MS";
-pub const GRACE_ENV: &str = "A24_MODULE_STOP_GRACE_MS";
+/// ADR-038 D5: the stop grace is a *component* property (default 15s).
+pub const GRACE_ENV: &str = "A24_COMPONENT_STOP_GRACE_MS";
+/// The pre-ADR-038 name, honoured for one release with a deprecation warning.
+pub const GRACE_ENV_LEGACY: &str = "A24_MODULE_STOP_GRACE_MS";
 const DRAIN_DEFAULT_MS: u64 = 800;
-const DRAIN_MAX_MS: u64 = 10_000;
-const GRACE_DEFAULT_MS: u64 = 500;
+const DRAIN_MAX_MS: u64 = agent24_protocol::shutdown_bounds::DRAIN_MAX_MS;
+const GRACE_DEFAULT_MS: u64 = 15_000;
 const GRACE_MIN_MS: u64 = 100;
-const GRACE_MAX_MS: u64 = 5_000;
+const GRACE_MAX_MS: u64 = agent24_protocol::shutdown_bounds::GRACE_MAX_MS;
 
 /// How long a shutdown gives each out-of-process module: to finish what it
 /// has (`drain`), then to exit on SIGTERM before SIGKILL (`stop_grace`).
@@ -65,6 +82,17 @@ impl Params {
     /// is used, and the warning is kept for the live report (SHUT-1c).
     pub fn from_env(get: impl Fn(&str) -> Option<String>) -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
+        // New name wins; the legacy alias is used (with a warning) only when
+        // the new one is unset.
+        let grace_name = if get(GRACE_ENV).is_none() && get(GRACE_ENV_LEGACY).is_some() {
+            warnings.push(format!(
+                "{GRACE_ENV_LEGACY} is deprecated and will be removed next release; \
+                 use {GRACE_ENV}"
+            ));
+            GRACE_ENV_LEGACY
+        } else {
+            GRACE_ENV
+        };
         let mut read = |name: &str, min: u64, max: u64, default: u64| {
             let Some(raw) = get(name) else {
                 return Duration::from_millis(default);
@@ -81,7 +109,7 @@ impl Params {
             }
         };
         let drain = read(DRAIN_ENV, 0, DRAIN_MAX_MS, DRAIN_DEFAULT_MS);
-        let stop_grace = read(GRACE_ENV, GRACE_MIN_MS, GRACE_MAX_MS, GRACE_DEFAULT_MS);
+        let stop_grace = read(grace_name, GRACE_MIN_MS, GRACE_MAX_MS, GRACE_DEFAULT_MS);
         (Self { drain, stop_grace }, warnings)
     }
 
@@ -91,9 +119,11 @@ impl Params {
     pub fn from_process_env() -> (Self, Vec<String>) {
         let drain = std::env::var(DRAIN_ENV).ok();
         let grace = std::env::var(GRACE_ENV).ok();
+        let grace_legacy = std::env::var(GRACE_ENV_LEGACY).ok();
         Self::from_env(move |name| match name {
             DRAIN_ENV => drain.clone(),
             GRACE_ENV => grace.clone(),
+            GRACE_ENV_LEGACY => grace_legacy.clone(),
             _ => None,
         })
     }
@@ -106,9 +136,11 @@ impl Params {
         let modules = began + self.drain + self.stop_grace + CONFIRM;
         let persist = modules + PERSIST;
         let watchdog = http.max(persist) + WATCHDOG_MARGIN;
+        let calls = began + self.drain + CALL_CANCEL_GRACE.min(self.stop_grace);
         Deadlines {
             began,
             http,
+            calls,
             modules,
             persist,
             watchdog,
@@ -130,6 +162,9 @@ pub struct Deadlines {
     pub began: tokio::time::Instant,
     /// The HTTP drain ends.
     pub http: tokio::time::Instant,
+    /// In-flight model calls of modules and attached modules are cancelled, and the usage
+    /// recorder stops [`CONFIRM`] later. Not tied to the stop grace.
+    pub calls: tokio::time::Instant,
     /// Modules still stopping are left to the drop of their supervisors.
     pub modules: tokio::time::Instant,
     /// The summary is on disk, or not.
@@ -329,7 +364,7 @@ fn write_durable(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), (bool, std:
 /// not the bound this actually has to beat** (round 2 caught it): the module
 /// budgets are user-tunable up to `DRAIN_MAX_MS`/`GRACE_MAX_MS`, so the real
 /// worst case is `DRAIN_MAX_MS + GRACE_MAX_MS + CONFIRM + PERSIST +
-/// WATCHDOG_MARGIN + RUNTIME_TEARDOWN` ≈ 16s, not ~0.5s — the const
+/// WATCHDOG_MARGIN + RUNTIME_TEARDOWN` ≈ 41s (ADR-038 D5 raised the grace cap), not ~0.5s — the const
 /// assertion below ties this constant to that real bound (not just a
 /// comment that can drift), the same way `RUNTIME_TEARDOWN` is already tied
 /// to `WATCHDOG_MARGIN` above. A fresh temp file this young might not be
@@ -340,7 +375,7 @@ fn write_durable(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), (bool, std:
 /// by waiting a bit longer — nothing else ever creates, reads, or races for
 /// a name matching this pattern, and this is a startup sweep for disk
 /// litter, not anything latency-sensitive.
-const ORPHAN_MIN_AGE: Duration = Duration::from_secs(30);
+const ORPHAN_MIN_AGE: Duration = Duration::from_secs(60);
 const _: () = assert!(
     ORPHAN_MIN_AGE.as_millis()
         > (DRAIN_MAX_MS as u128
@@ -903,21 +938,46 @@ mod tests {
         }
         let (p, w) = Params::from_env(env(&[(GRACE_ENV, "50")]));
         assert_eq!(p.stop_grace, Duration::from_millis(GRACE_DEFAULT_MS));
-        assert!(w[0].contains("100..=5000"), "{}", w[0]);
+        assert!(w[0].contains("100..=30000"), "{}", w[0]);
+
+        // ADR-038 D5: the default is 15s and the cap is at least 15s.
+        const { assert!(GRACE_DEFAULT_MS == 15_000 && GRACE_MAX_MS >= 15_000) };
+        let (p, w) = Params::from_env(env(&[(GRACE_ENV, "15000")]));
+        assert_eq!(p.stop_grace, Duration::from_millis(15_000));
+        assert!(w.is_empty());
+        let (_, w) = Params::from_env(env(&[(GRACE_ENV, "30001")]));
+        assert_eq!(w.len(), 1);
+
+        // The legacy name is an alias: honoured, with a deprecation warning...
+        let (p, w) = Params::from_env(env(&[(GRACE_ENV_LEGACY, "1200")]));
+        assert_eq!(p.stop_grace, Duration::from_millis(1200));
+        assert_eq!(w.len(), 1);
+        assert!(
+            w[0].contains("deprecated") && w[0].contains(GRACE_ENV),
+            "{}",
+            w[0]
+        );
+        // ...but the new name wins when both are set, with no warning.
+        let (p, w) = Params::from_env(env(&[(GRACE_ENV, "2000"), (GRACE_ENV_LEGACY, "1200")]));
+        assert_eq!(p.stop_grace, Duration::from_millis(2000));
+        assert!(w.is_empty());
     }
 
     /// At the defaults a shutdown ends within 2s, as TASKS B2 asks; raised
     /// budgets raise the bound honestly; the smallest budgets never end it
     /// before the HTTP drain's 1.5s.
     #[tokio::test(start_paused = true)]
-    async fn the_deadlines_follow_the_budgets_and_2s_holds_at_the_defaults() {
+    async fn the_deadlines_follow_the_budgets_and_16s_holds_at_the_defaults() {
         let t0 = tokio::time::Instant::now();
         let d = Params::default().deadlines(t0);
         assert_eq!(d.http - t0, Duration::from_millis(1500));
-        assert_eq!(d.modules - t0, Duration::from_millis(1500));
-        assert_eq!(d.persist - t0, Duration::from_millis(1700));
-        assert_eq!(d.watchdog - t0, Duration::from_millis(2000));
-        assert_eq!(Params::default().exit_bound(), Duration::from_millis(2000));
+        assert_eq!(d.modules - t0, Duration::from_millis(16_000));
+        assert_eq!(d.persist - t0, Duration::from_millis(16_200));
+        assert_eq!(d.watchdog - t0, Duration::from_millis(16_500));
+        assert_eq!(
+            Params::default().exit_bound(),
+            Duration::from_millis(16_500)
+        );
 
         let raised = Params {
             drain: Duration::from_secs(5),
@@ -1271,7 +1331,7 @@ mod tests {
         assert!(!r.ephemeral);
         assert_eq!(
             (r.drain_ms, r.stop_grace_ms, r.exit_bound_ms),
-            (800, 500, 2000)
+            (800, 15_000, 16_500)
         );
         assert_eq!(r.config_warnings.len(), 1);
         assert_eq!(r.previous, "unconfirmed");
@@ -1356,8 +1416,8 @@ mod tests {
         assert_eq!(
             v["params"],
             serde_json::json!({
-                "drain_ms": 800, "stop_grace_ms": 500, "http_deadline_ms": 1500,
-                "module_deadline_ms": 1500, "persist_deadline_ms": 1700, "watchdog_ms": 2000
+                "drain_ms": 800, "stop_grace_ms": 15_000, "http_deadline_ms": 1500,
+                "module_deadline_ms": 16_000, "persist_deadline_ms": 16_200, "watchdog_ms": 16_500
             })
         );
     }

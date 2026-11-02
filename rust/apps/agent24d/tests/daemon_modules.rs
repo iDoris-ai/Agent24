@@ -144,6 +144,10 @@ fn start(home: &Path) -> Daemon {
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
+        // These tests are about the shutdown sequence at a short budget (and, through
+        // `exit_bound_ms`, that the daemon reads the new env name); the 15s default of
+        // ADR-038 D5 is pinned by the lifecycle unit tests.
+        .env("A24_COMPONENT_STOP_GRACE_MS", "500")
         .args(["serve", "--port", "0"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
