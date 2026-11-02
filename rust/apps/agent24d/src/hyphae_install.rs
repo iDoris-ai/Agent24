@@ -62,7 +62,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     #[ignore = "downloads the pinned v0.29.0 darwin-arm64 binary from GitHub"]
-    async fn real_github_v0_28_1_darwin_arm64_matches_lock() {
+    async fn real_github_v0_29_0_darwin_arm64_matches_lock() {
         let dir = tempfile::tempdir().unwrap();
         let release = HyphaeRelease::embedded().unwrap();
         let lock = HyphaeLock::embedded().unwrap();
