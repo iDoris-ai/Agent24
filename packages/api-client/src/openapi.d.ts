@@ -1623,7 +1623,7 @@ export interface paths {
         };
         /**
          * Hyphae daemon status (process, relay probe, catch-up)
-         * @description Always returns 200 when comm is not configured, with process.state not_configured. data.installable indicates a platform with both release asset and non-null lock hash. data.installed_version is the component tag (v0.28.1) after full hash revalidation, or null when absent or rejected. Developer and sibling binaries do not count as installed components.
+         * @description Always returns 200 when comm is not configured, with process.state not_configured. data.installable indicates a platform with both release asset and non-null lock hash. data.installed_version is the component tag (v0.29.0) after full hash revalidation, or null when absent or rejected. Developer and sibling binaries do not count as installed components.
          */
         get: operations["getCommDaemon"];
         put?: never;
@@ -2223,7 +2223,7 @@ export interface components {
             setup_code?: "unreachable" | "auth_required" | "auth_failed" | "not_omlx" | "model_not_found" | "invalid_endpoint" | "invalid_role" | "out_dir_not_empty" | "validation_failed" | "write_failed" | "invalid_api_key_input";
         };
         CommInstallResult: {
-            /** @example v0.28.1 */
+            /** @example v0.29.0 */
             installed_version: string;
             /** @description Absolute installed component path */
             path: string;
