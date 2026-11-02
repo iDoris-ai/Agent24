@@ -30,8 +30,27 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use agent24_comm::VerifiedBinary;
 use agent24_comm::binary::Sha256Digest;
+use agent24_comm::{BinaryError, HYPHAE_LOCK_JSON, VerifiedBinary};
+use agent24_components::{ComponentLock, LockError};
+
+/// Test view of the embedded schema-2 Hyphae lock: the published (signed, for
+/// macOS) asset digest per platform. Production reads the same lock in agent24d.
+pub struct HyphaeLock(pub ComponentLock);
+
+impl HyphaeLock {
+    pub fn embedded() -> Result<Self, LockError> {
+        ComponentLock::parse(HYPHAE_LOCK_JSON).map(Self)
+    }
+
+    pub fn expected_for(&self, platform: &str) -> Result<Sha256Digest, BinaryError> {
+        let asset = self
+            .0
+            .asset_for(platform)
+            .ok_or_else(|| BinaryError::NoLockForPlatform(platform.into()))?;
+        Sha256Digest::from_hex(&asset.sha256)
+    }
+}
 
 /// Local runs may opt out; CI must exercise the real binary.
 #[track_caller]

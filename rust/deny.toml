@@ -15,6 +15,13 @@ allow = [
   "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
+# CC0-1.0 (public-domain dedication, FSF Free/Libre, Apache-2.0 compatible) is allowed
+# only for these crates: secp256k1 verifies that a decrypted NIP-49 backup derives the
+# identity's npub (agent24-comm export/restore, #1535). Not added to `allow` globally.
+exceptions = [
+  { allow = ["CC0-1.0"], crate = "secp256k1" },
+  { allow = ["CC0-1.0"], crate = "secp256k1-sys" },
+]
 
 [bans]
 multiple-versions = "warn"

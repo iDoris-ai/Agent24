@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+agent24-components = { path = "../agent24-components" }
 agent24-hw = { path = "../agent24-hw" }
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
@@ -13,12 +14,8 @@ thiserror = "2"
 semver = "1"
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-sha2 = "0.10"
-subtle = "2"
 tokio = { version = "1", features = ["macros", "rt", "time", "process", "io-util", "sync"] }
 tokio-util = "0.7"
-flate2 = "1"
-tar = { version = "0.4", default-features = false }
 fs2 = "0.4"
 tempfile = "3"
 rustix = { version = "1", features = ["fs", "process"] }
@@ -33,6 +30,10 @@ libproc = "0.14"
 keyring = { version = "3.6", default-features = false, features = ["apple-native"] }
 
 [dev-dependencies]
+sha2 = "0.10"
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
+agent24-components = { path = "../agent24-components", features = ["test-support"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "test-util"] }
 
 [lints]

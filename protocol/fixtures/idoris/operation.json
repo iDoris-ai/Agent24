@@ -5,7 +5,6 @@
   "result": "succeeded",
   "error_code": null,
   "cancellable": false,
-  "idempotency_key": "fixture-connect",
   "verification": {
     "model_id": "real-model",
     "record_id": "record-fixture",

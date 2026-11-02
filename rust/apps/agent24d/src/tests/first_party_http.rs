@@ -933,3 +933,92 @@ async fn http_rejects_and_deletes_token_after_peer_exec() {
     );
     drop(stream);
 }
+
+/// I-1 L2: the HTTP rejection of an elevated iDoris install or connect is
+/// what records the daemon's summary; without it nothing can be approved.
+#[tokio::test]
+async fn idoris_install_and_connect_record_their_summary_at_the_http_boundary() {
+    struct Capture(std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl PresenceProvider for Capture {
+        async fn confirm(
+            &self,
+            req: PresenceRequest,
+            _cancel: CancellationToken,
+        ) -> PresenceOutcome {
+            self.0.lock().unwrap().push(req.summary);
+            PresenceOutcome::Allowed
+        }
+    }
+    let connect = serde_json::json!({
+        "endpoint": "http://127.0.0.1:8088", "daily_model": "daily-real",
+        "consent": {"share_omlx_key": true, "daily_model": "daily-real"}
+    })
+    .to_string();
+    for (path, body, expected) in [
+        (
+            "/api/v1/idoris/install",
+            r#"{"consent":true}"#.to_owned(),
+            "install the locked iDoris release",
+        ),
+        (
+            "/api/v1/idoris/connect",
+            connect,
+            "daily model: \"daily-real\"",
+        ),
+    ] {
+        let (mut state, token) = setup().await;
+        let capture = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+        state.presence_provider = Some(capture.clone());
+        let router = build_router(state.clone());
+        let rejected = router
+            .clone()
+            .oneshot(request(&token.secret, "POST", path, &body, None))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(error_code(rejected).await, "presence_required", "{path}");
+        let secret = grant(&state, &token, "POST", path, &body).await;
+        let summaries = capture.0.lock().unwrap().clone();
+        assert_eq!(summaries.len(), 1, "{path}");
+        assert!(summaries[0].contains(expected), "{path}: {}", summaries[0]);
+        // The approved request passes the gate (the handler answers).
+        let approved = router
+            .oneshot(request(&token.secret, "POST", path, &body, Some(&secret)))
+            .await
+            .unwrap();
+        assert_ne!(approved.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+}
+
+/// I-1 B1: a grant binds method, path and body. A query string changes what
+/// `/candidates` does (`endpoint=` probes another port with the oMLX key),
+/// so a granted request carrying one is refused and the grant survives.
+#[tokio::test]
+async fn elevation_grant_refuses_a_query_string() {
+    let (state, token) = setup().await;
+    let router = build_router(state.clone());
+    let path = "/api/v1/idoris/omlx/candidates";
+    let secret = grant(&state, &token, "GET", path, "").await;
+    let get = |uri: &str| {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", token.secret.as_str()),
+            )
+            .header("X-Agent24-Elevation", secret.as_str())
+            .body(Body::empty())
+            .unwrap()
+    };
+    let swapped = router
+        .clone()
+        .oneshot(get(&format!("{path}?endpoint=http://127.0.0.1:9")))
+        .await
+        .unwrap();
+    assert_eq!(swapped.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_code(swapped).await, "elevation_invalid");
+    let bare = router.oneshot(get(path)).await.unwrap();
+    assert_ne!(bare.status(), StatusCode::FORBIDDEN);
+}

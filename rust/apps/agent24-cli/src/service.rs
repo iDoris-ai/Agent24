@@ -52,6 +52,11 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
+/// Seconds launchd waits after SIGTERM before it SIGKILLs the daemon. Its default is 20, which
+/// is less than the daemon's stop grace allows (ADR-038 D5: 15s by default, tunable up);
+/// derived from the same worst-case bound the daemon and `agent24 daemon stop` use.
+const EXIT_TIMEOUT: u64 = agent24_protocol::shutdown_bounds::WAIT_SECS;
+
 /// Render the LaunchAgent plist.
 ///
 /// `ThrottleInterval` is 10s: launchd's own minimum, and enough that a daemon
@@ -103,6 +108,8 @@ pub fn render_plist(
     </dict>
     <key>ThrottleInterval</key>
     <integer>10</integer>
+    <key>ExitTimeOut</key>
+    <integer>{EXIT_TIMEOUT}</integer>
     <key>ProcessType</key>
     <string>Background</string>
 {env_block}    <key>StandardOutPath</key>
@@ -118,7 +125,7 @@ pub fn render_plist(
 /// Config the daemon reads from the environment. launchd gives a LaunchAgent
 /// NONE of the login shell's environment, so without capturing these the 24/7
 /// daemon silently behaves differently from a manually started one.
-pub const PASSTHROUGH_VARS: [&str; 22] = [
+pub const PASSTHROUGH_VARS: [&str; 23] = [
     // MAINT-03: the data root (`daemon.json`, `agent24.db`, `logs/`, the tool
     // workspace). Without it a LaunchAgent-started daemon keeps using
     // `~/.agent24` while the CLI that ran `service install` and the desktop app
@@ -159,6 +166,8 @@ pub const PASSTHROUGH_VARS: [&str; 22] = [
     // raised ones gets them only through here — and only after `agent24 service
     // install` is re-run, since this is a snapshot.
     "A24_MODULE_DRAIN_MS",
+    "A24_COMPONENT_STOP_GRACE_MS",
+    // Deprecated alias of the above (ADR-038 D5), kept for one release.
     "A24_MODULE_STOP_GRACE_MS",
     // FU-64 §B: the idle-connection-pool age cap. Best-effort only (see the
     // design doc), but still a knob that must reach the daemon.
@@ -372,6 +381,16 @@ mod tests {
         assert!(p.contains("<key>SuccessfulExit</key>\n        <false/>"));
         // crash loops back off
         assert!(p.contains("<key>ThrottleInterval</key>"));
+        // launchd's default ExitTimeOut (20s) would SIGKILL a daemon inside its own 15s
+        // stop grace plus drain; the plist carries the derived bound instead.
+        assert!(
+            p.contains(&format!(
+                "<key>ExitTimeOut</key>\n    <integer>{}</integer>",
+                agent24_protocol::shutdown_bounds::WAIT_SECS
+            )),
+            "{p}"
+        );
+        const { assert!(EXIT_TIMEOUT > 20) };
         // output survives for diagnosis
         assert!(p.contains("/logs/out.log"));
         assert!(p.contains("/logs/err.log"));
@@ -627,6 +646,12 @@ mod tests {
                             && !matches!(
                                 name.as_str(),
                                 "HOME" | "PATH" | "LOCALAPPDATA" | "IDORIS_API_KEY"
+                                // opt-in #[ignore] real-filesystem test switch
+                                // (agent24-comm export.rs); the daemon never reads it
+                                    | "A24_FS_TEST_DIRS"
+                                // debug-only seam behind `--features test-enrollment`
+                                // (a compile_error in release); never set in a LaunchAgent
+                                    | "AGENT24_TEST_MIGRATION_GUARD"
                             )
                         {
                             found.push(name);

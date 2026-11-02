@@ -83,7 +83,15 @@ pub trait Provisioner: Send + Sync {
         archive: &VerifiedArchive,
         cancel: &CancellationToken,
     ) -> Result<InstalledVersion, Code>;
-    async fn verify(&self, record: &Installation) -> Result<InstalledVersion, Code>;
+    async fn verify(
+        &self,
+        record: &Installation,
+        mode: VerifyMode,
+    ) -> Result<InstalledVersion, Code>;
+    /// Create the state directories (`data/`, `instances/`) below the state root.
+    async fn prepare_state(&self, _root: &Path) -> Result<(), Code> {
+        Ok(())
+    }
     async fn upstream_key(&self) -> Result<Option<ApiKey>, Code>;
     async fn budget(&self, core: Option<u64>) -> Result<SetupBudget, Code>;
 }
@@ -98,7 +106,7 @@ impl Provisioner for SystemProvisioner {
     ) -> Result<VerifiedArchive, Code> {
         download_locked_asset(
             IdorisLock::embedded(),
-            "aarch64-apple-darwin",
+            agent24_idoris::host_triple().ok_or(Code::NotInstalled)?,
             &root.join("cache"),
             &DownloadOptions {
                 progress: Some(progress),
@@ -124,7 +132,7 @@ impl Provisioner for SystemProvisioner {
         options.child_args = vec!["__idoris-install-child".into()];
         install_locked_asset(
             IdorisLock::embedded(),
-            "aarch64-apple-darwin",
+            agent24_idoris::host_triple().ok_or(Code::NotInstalled)?,
             archive,
             &options,
             Codesign,
@@ -133,10 +141,17 @@ impl Provisioner for SystemProvisioner {
         .await
         .map_err(install_code)
     }
-    async fn verify(&self, r: &Installation) -> Result<InstalledVersion, Code> {
+    async fn prepare_state(&self, root: &Path) -> Result<(), Code> {
+        let root = root.to_owned();
+        tokio::task::spawn_blocking(move || agent24_idoris::install::prepare_state_dirs(&root))
+            .await
+            .map_err(|_| Code::NotInstalled)?
+            .map_err(install_code)
+    }
+    async fn verify(&self, r: &Installation, mode: VerifyMode) -> Result<InstalledVersion, Code> {
         let r = r.clone();
         tokio::task::spawn_blocking(move || {
-            InstalledVersion::verify_existing(
+            agent24_idoris::install::verify_existing(
                 &r.release_dir,
                 IdorisLock::embedded(),
                 &VerifiedArchive {
@@ -144,6 +159,7 @@ impl Provisioner for SystemProvisioner {
                     sha256: String::new(),
                 },
                 &Codesign,
+                mode,
             )
         })
         .await
@@ -169,6 +185,52 @@ impl Provisioner for SystemProvisioner {
         .await
         .map_err(|_| Code::NotConfigured)?
     }
+}
+/// The only legacy paths that may ever be listed as deletable (H2 allow-list): a release
+/// directory `<old_root>/<major.minor.patch>` or a verified archive
+/// `<old_root>/cache/<name>.verified`, each directly below the canonical old root and
+/// not a symlink. Everything else under the old root (`data/`, `instances/`,
+/// `transactions/`, `installation.json`, `operations.json`, the root itself) is state
+/// and never matches.
+pub(super) fn legacy_deletable(old_root: &Path, candidates: &[&Path]) -> Vec<PathBuf> {
+    let Ok(old_root) = std::fs::canonicalize(old_root) else {
+        return Vec::new();
+    };
+    let release_name = |name: &str| {
+        let parts: Vec<_> = name.split('.').collect();
+        parts.len() == 3
+            && parts.iter().all(|p| {
+                !p.is_empty()
+                    && p.bytes().all(|b| b.is_ascii_digit())
+                    && (p.len() == 1 || !p.starts_with('0'))
+            })
+    };
+    // Canonical on both sides, and the cache itself must be a real directory: a symlinked
+    // `cache` could otherwise make any directory look like "the cache".
+    let cache = std::fs::symlink_metadata(old_root.join("cache"))
+        .ok()
+        .filter(|m| m.file_type().is_dir())
+        .and_then(|_| std::fs::canonicalize(old_root.join("cache")).ok());
+    candidates
+        .iter()
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?;
+            if std::fs::symlink_metadata(path)
+                .ok()?
+                .file_type()
+                .is_symlink()
+            {
+                return None;
+            }
+            let parent = std::fs::canonicalize(path.parent()?).ok()?;
+            let release = parent == old_root && release_name(name);
+            let cached = cache.as_ref() == Some(&parent)
+                && name.len() > ".verified".len()
+                && name.ends_with(".verified")
+                && !name.starts_with('.');
+            (release || cached).then(|| parent.join(name))
+        })
+        .collect()
 }
 fn install_code(e: InstallError) -> Code {
     match e {
@@ -383,22 +445,147 @@ impl IdorisHost {
     async fn execute_install(&self, id: &str, cancel: &CancellationToken) -> Result<(), Code> {
         let old = self.inner.lock().await.installation.clone();
         self.phase(id, Phase::Verifying).await;
+        // ADR-038 D1: releases live under the managed root. A receipt that still
+        // points at the legacy tree is migrated by re-downloading (never moved);
+        // the legacy copy keeps serving until the new one has verified.
+        let mut migrating = false;
         if let Some(old) = &old {
+            // An explicit Install is the moment to be online: without an install-time
+            // notarization record, check it in full (`Install`); with one, the at-rest
+            // checks are enough to call the install intact.
+            let mode = if old.notarized_verified_at.is_some() {
+                VerifyMode::AtRest
+            } else {
+                VerifyMode::Install
+            };
             let valid = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Code::Cancelled),
-                verified = self.provisioner.verify(old) => verified.is_ok(),
+                verified = self.provisioner.verify(old, mode) => verified.is_ok(),
             };
             if valid {
-                return Ok(());
+                if self.in_managed_root(old) {
+                    if mode == VerifyMode::Install {
+                        self.record_notarization(old).await?;
+                    }
+                    return Ok(());
+                }
+                migrating = true;
             }
         }
+        let result = self.download_and_install(id, old.clone(), cancel).await;
+        match result {
+            // A failed migration must not turn a working legacy install into a failed one.
+            Err(code) if migrating && code != Code::Cancelled => {
+                tracing::warn!(
+                    ?code,
+                    "iDoris managed-root migration failed; legacy install kept"
+                );
+                self.inner.lock().await.migration_error = Some(code);
+                Ok(())
+            }
+            Ok(()) if migrating => {
+                self.inner.lock().await.migration_error = None;
+                if let Some(old) = &old {
+                    self.queue_legacy_deletable(old);
+                }
+                Ok(())
+            }
+            other => other,
+        }
+    }
+    /// Stamp a receipt whose full install-time check has just passed.
+    async fn record_notarization(&self, old: &Installation) -> Result<(), Code> {
+        if !IdorisLock::embedded().component_notarized() {
+            return Ok(());
+        }
+        let mut record = old.clone();
+        record.notarized_verified_at = Some(chrono::Utc::now().to_rfc3339());
+        let mut i = self.inner.lock().await;
+        write_json(&self.root.join("installation.json"), &record)?;
+        i.installation = Some(record);
+        Ok(())
+    }
+    /// A receipt is current when its release lives under the (canonical) managed root and,
+    /// if it recorded one, was installed under that same root.
+    pub(super) fn in_managed_root(&self, r: &Installation) -> bool {
+        r.release_dir.starts_with(&self.install_root)
+            && r.install_root
+                .as_ref()
+                .is_none_or(|recorded| *recorded == self.install_root)
+    }
+    /// Remember the superseded legacy paths. They are NOT yet deletable: the running
+    /// supervisor may still be executing from them (and auto-restarts onto them) until it
+    /// is stopped or restarted from the new receipt. `finalize_legacy_marks` publishes them
+    /// once nothing holds them.
+    fn queue_legacy_deletable(&self, old: &Installation) {
+        let _ = write_json(
+            &self.root.join("legacy-install.pending.json"),
+            &serde_json::json!({"schema": 1, "paths": [old.release_dir, old.archive_path]}),
+        );
+    }
+    /// Publish queued legacy paths as deletable, only when the receipt already points at the
+    /// managed root and no running instance holds them. The marker is advisory: any future
+    /// `agent24 idoris gc` MUST re-validate every path with [`legacy_deletable`] (or
+    /// stricter), MUST exclude any path held by a running instance, and never trust this file.
+    pub(super) fn finalize_legacy_marks(&self, inner: &Inner) {
+        let pending_path = self.root.join("legacy-install.pending.json");
+        let Ok(body) = std::fs::read(&pending_path) else {
+            return;
+        };
+        let Ok(pending) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            return;
+        };
+        let Ok(queued) = serde_json::from_value::<Vec<PathBuf>>(pending["paths"].clone()) else {
+            return;
+        };
+        if !inner
+            .installation
+            .as_ref()
+            .is_some_and(|r| self.in_managed_root(r))
+        {
+            return;
+        }
+        let held = inner.supervisor.is_some()
+            && inner
+                .supervisor_release
+                .as_ref()
+                .is_some_and(|dir| queued.contains(dir));
+        if held {
+            return;
+        }
+        let candidates: Vec<&Path> = queued.iter().map(PathBuf::as_path).collect();
+        let paths = legacy_deletable(&self.root, &candidates);
+        if !paths.is_empty()
+            && write_json(
+                &self.root.join("legacy-install.deletable.json"),
+                &serde_json::json!({
+                    "schema": 1,
+                    "advisory": "re-validate every path before deleting and exclude any path held by a running instance; see legacy_deletable()",
+                    "superseded_by": self.install_root,
+                    "paths": paths,
+                }),
+            )
+            .is_err()
+        {
+            return;
+        }
+        let _ = std::fs::remove_file(pending_path);
+    }
+    async fn download_and_install(
+        &self,
+        id: &str,
+        old: Option<Installation>,
+        cancel: &CancellationToken,
+    ) -> Result<(), Code> {
         check_cancel(cancel)?;
         self.phase(id, Phase::Downloading).await;
         let (sender, mut progress) = watch::channel(DownloadProgress::default());
         self.download_progress(id, DownloadProgress::default())
             .await;
-        let download = self.provisioner.download(&self.root, cancel, sender);
+        let download = self
+            .provisioner
+            .download(&self.install_root, cancel, sender);
         tokio::pin!(download);
         let mut progress_open = true;
         let archive = loop {
@@ -423,8 +610,9 @@ impl IdorisHost {
         self.phase(id, Phase::Installing).await;
         let installed = self
             .provisioner
-            .install(&self.root, &archive, cancel)
+            .install(&self.install_root, &archive, cancel)
             .await?;
+        self.provisioner.prepare_state(&self.root).await?;
         check_cancel(cancel)?;
         let record = old.unwrap_or(Installation {
             version: IdorisLock::embedded().tag.trim_start_matches('v').into(),
@@ -440,10 +628,17 @@ impl IdorisHost {
             omlx_key_id: None,
             desired_running: false,
             verification: None,
+            install_root: None,
+            notarized_verified_at: None,
         });
         let record = Installation {
             release_dir: installed.directory().into(),
             archive_path: archive.path,
+            install_root: Some(self.install_root.clone()),
+            // The installer just ran the full check, notarization included.
+            notarized_verified_at: IdorisLock::embedded()
+                .component_notarized()
+                .then(|| chrono::Utc::now().to_rfc3339()),
             ..record
         };
         let mut i = self.inner.lock().await;
@@ -476,7 +671,7 @@ impl IdorisHost {
             biased;
             _ = cancel.cancelled() => return Err(Code::Cancelled),
             prepared = async {
-        let installed = self.provisioner.verify(&previous).await?;
+        let installed = self.provisioner.verify(&previous, VerifyMode::AtRest).await?;
         let budget = self
             .provisioner
             .budget(request.core_reserved_bytes.or(previous.core_reserved_bytes))
@@ -707,6 +902,7 @@ impl IdorisHost {
             self.router.replace_idoris(gateway);
             i.installation = Some(pending.candidate.clone());
             i.supervisor = new_supervisor.take();
+            i.supervisor_release = Some(pending.candidate.release_dir.clone());
             i.generation = Some(id.to_owned());
             drop(i);
             self.monitor(
@@ -842,7 +1038,10 @@ impl IdorisHost {
             serde_json::from_slice(&body).map_err(|_| Code::PersistenceFailed)?;
         pending.previous.validate()?;
         pending.candidate.validate()?;
-        let installed = self.provisioner.verify(&pending.previous).await?;
+        let installed = self
+            .provisioner
+            .verify(&pending.previous, VerifyMode::AtRest)
+            .await?;
         let keys = Keys::new(
             &installed,
             &self.root.join("data/idoris.sqlite3"),

@@ -7,7 +7,7 @@ import { registerCliTool } from './ipc/cli-tool'
 import { initMainLocale, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
-import { BackendManager, daemonConnection, setBundledPackaged } from './backend-manager'
+import { BackendManager, daemonAuthMode, daemonConnection, onDaemonReady, setBundledPackaged } from './backend-manager'
 import { PresencePoller, defaultPresenceDeps, showPresenceDialog } from './presence-poller'
 import { AgentEarEventBridge } from './agentear-events'
 import { documentsEvent } from './documents'
@@ -23,8 +23,10 @@ import {
   classifyCreativeUrl,
 } from './creative-serve-web'
 import { OpenDesignComponentInstaller } from './open-design-component'
+import { OpenDesignStatusReporter, mapOpenDesignReport, postOpenDesignReport } from './open-design-report'
 import { KnowledgeHost } from './knowledge-host'
 import { KnowledgeLoginStore } from './knowledge-logins'
+import { KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
 
 const isDev = process.env.NODE_ENV === 'development'
 setBundledPackaged(app.isPackaged)
@@ -87,9 +89,12 @@ let cliCheckTicks = 0
 let creativeServeWeb: CreativeServeWeb | null = null
 // KB-HOST-01: Knowledge logins and the daemon's private Knowledge interface.
 let knowledgeHost: KnowledgeHost | null = null
+let knowledge: KnowledgeController | null = null
 // CORE-2 AgentEar S3: long-polls the daemon for native confirmation challenges.
 let presencePoller: PresencePoller | null = null
 let openDesignComponent: OpenDesignComponentInstaller | null = null
+let openDesignReporter: OpenDesignStatusReporter | null = null
+let stopOpenDesignReady: (() => void) | null = null
 let creativeView: WebContentsView | null = null
 let creativeOrigin: string | null = null
 const creativeViewFence = new CreativeViewRequestFence()
@@ -287,6 +292,27 @@ app.whenReady().then(async () => {
     pinVersion: OPEN_DESIGN_PIN_VERSION,
     component: openDesignComponent ?? undefined,
   })
+  // ADR-038 C3b: main owns the ProductHost credential and reports Open Design.
+  // The renderer never receives this client or the report route.
+  openDesignReporter = new OpenDesignStatusReporter({
+    snapshot: () => {
+      const install = openDesignComponent?.status()
+      return mapOpenDesignReport({
+        installState: install?.state ?? 'unavailable',
+        reason: install?.reason ?? install?.error,
+        version: openDesignComponent?.reportedVersion() ?? null,
+        sidecar: creativeServeWeb?.headlessSidecarState() ?? null,
+      })
+    },
+    connection: daemonConnection,
+    authMode: daemonAuthMode,
+    send: postOpenDesignReport,
+  })
+  creativeServeWeb.onStatus(() => openDesignReporter?.notify())
+  openDesignReporter.start()
+  // Ready lands after start(), and a restarted daemon has not seen the last
+  // payload. reportNow skips dedupe and ends a 403/404 suspension.
+  stopOpenDesignReady = onDaemonReady(() => openDesignReporter?.reportNow())
   // Dev-only: show the real app icon in the dock immediately, without
   // waiting for an electron-builder packaged build (which is where mac.icon
   // in package.json normally takes effect).
@@ -313,9 +339,13 @@ app.whenReady().then(async () => {
   presencePoller.start()
   // safeStorage needs the app ready. The logins load once, here, before
   // anything can change them; the reason is logged, never the contents.
-  knowledgeHost = new KnowledgeHost(new KnowledgeLoginStore(app.getPath('userData'), safeStorage))
+  const loginStore = new KnowledgeLoginStore(app.getPath('userData'), safeStorage)
+  knowledgeHost = new KnowledgeHost(loginStore)
   const knowledgeLogins = knowledgeHost.start()
   if (!knowledgeLogins.ok) console.warn(`[knowledge] logins unavailable: ${knowledgeLogins.reason}`)
+  // The user's Knowledge settings drive the one binding; Off keeps it inactive.
+  knowledge = new KnowledgeController(knowledgeHost, loginStore, new KnowledgeSettingsStore(app.getPath('userData')))
+  void knowledge.apply()
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     callback({
       responseHeaders: {
@@ -332,7 +362,7 @@ app.whenReady().then(async () => {
     })
   })
 
-  registerIpcHandlers({ guard })
+  registerIpcHandlers({ guard, knowledge: () => knowledge })
   cliTool = registerCliTool({
     guard, executable: process.execPath, resources: process.resourcesPath, packaged: app.isPackaged,
     changed: refreshTray,
@@ -362,6 +392,7 @@ app.whenReady().then(async () => {
     return openDesignComponent?.status() ?? { state: 'unavailable', reason: 'Open Design component installer is unavailable' }
   }))
   openDesignComponent?.onProgress((status) => {
+    openDesignReporter?.notify()
     if (mainWin && !mainWin.isDestroyed()) {
       mainWin.webContents.send(IpcChannels.OpenDesignComponentProgress, status)
     }
@@ -400,6 +431,7 @@ app.whenReady().then(async () => {
     // Replays the wanted Knowledge bindings on a restarted daemon and retries
     // changes that did not land.
     knowledgeHost?.sync()
+    void knowledge?.tick()
   }, 4_000)
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -455,6 +487,9 @@ app.on('before-quit', () => {
 
 app.on('will-quit', () => {
   if (trayTimer) { clearInterval(trayTimer); trayTimer = null }
+  stopOpenDesignReady?.()
+  stopOpenDesignReady = null
+  openDesignReporter?.stop()
   agentEarBridge.stop()
   agentEarLog.stop()
   backendManager.stop()

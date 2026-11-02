@@ -11,12 +11,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod common;
+
 use agent24_comm::{
-    Account, CommState, Envelope, HyphaeLock, HyphaeRunner, Invocation, MemoryPasswordStore,
-    Password, PasswordStore, VerifiedBinary, current_platform, router,
+    Account, CommState, Envelope, HyphaeRunner, Invocation, MemoryPasswordStore, Password,
+    PasswordStore, VerifiedBinary, current_platform, router,
 };
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use common::HyphaeLock;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 

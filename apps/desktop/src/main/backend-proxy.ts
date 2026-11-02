@@ -48,8 +48,14 @@ const r = (method: HttpMethod, template: string, timeoutMs?: number): ProxyRoute
  *   DELETE /api/v1/attached/{name}           -> IpcChannels.AgentEarUnpair (agentear only)
  *   PATCH  /api/v1/os/{name}                 -> IpcChannels.OsModuleSetEnabled
  *   POST   /api/v1/os/{name}/stop
+ *   POST   /api/v1/comm/import               -> IpcChannels.CommHomeImport
+ *   PUT    /api/v1/comm/relay                -> IpcChannels.CommRelaySet
+ *   POST   /api/v1/comm/unlock               -> IpcChannels.CommUnlock
+ *   POST   /api/v1/components/{id}/report    -> main only (open-design-report.ts)
  */
 export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
+  // ADR-038 C3b: read-only component list. The host report POST stays in main.
+  r('GET', '/api/v1/components'),
   // IL-13: host-only lifecycle API; Admin credentials never enter Electron.
   r('GET', '/api/v1/idoris/status'),
   r('GET', '/api/v1/idoris/omlx/candidates'),
@@ -64,6 +70,9 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('GET', '/api/modules'),
   r('GET', '/api/v1/models'),
   r('POST', '/api/v1/chat', CHAT_TIMEOUT_MS),
+  // A real session for the main chat, so its turns can go to /runs too
+  // (Knowledge on; Everyday in route_policy.rs).
+  r('POST', '/api/v1/sessions'),
   r('GET', '/api/v1/usage'),
   // runs
   r('GET', '/api/v1/runs'),
@@ -94,12 +103,25 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('PUT', '/api/v1/memory/settings'), // [E]
   // communication (Hyphae)
   r('GET', '/api/v1/comm/identity'),
+  r('POST', '/api/v1/comm/identity'), // [E]
+  r('POST', '/api/v1/comm/relay/probe'), // [E]
   r('GET', '/api/v1/comm/contact'),
+  r('GET', '/api/v1/comm/history'),
+  // NOT here on purpose, each has its own validated IPC in main:
+  //   POST /api/v1/comm/identity/export  (CommIdentityExport: native confirm, own password window, save dialog)
+  //   POST /api/v1/comm/identity/import  (CommImportPick + CommIdentityImport: native open dialog, own password window)
+  //   POST /api/v1/comm/contact          (CommContactAdd)
+  //   POST /api/v1/comm/send             (CommSend)
+  //   POST /api/v1/comm/import           (CommHomeImport: native folder picker + confirm, own password window)
+  //   PUT  /api/v1/comm/relay            (CommRelaySet: validated ws(s):// list, native confirm when it changes)
+  //   POST /api/v1/comm/unlock           (CommUnlock: own password window)
+  // The proxy forwards with the host's ProductHost credential, which the
+  // daemon's presence check does not constrain, so an Elevated write must not
+  // be reachable here with a body of the page's choosing.
   r('GET', '/api/v1/comm/relay'),
   r('GET', '/api/v1/comm/daemon'),
   r('POST', '/api/v1/comm/daemon/start'), // [E]
   r('POST', '/api/v1/comm/daemon/stop'), // [E]
-  r('POST', '/api/v1/comm/unlock'), // [E]
 ]
 
 /** A path segment value a `{param}` may bind: no traversal, no separators,
@@ -294,4 +316,20 @@ export function proxyRequest(
 /** Effective deadline for a request that already passed the allowlist. */
 export function timeoutFor(route: ProxyRoute | null): number {
   return route?.timeoutMs ?? PROXY_TIMEOUT_MS
+}
+
+/** The run a renderer creates names the Knowledge binding main says, never
+ * one of its own: on the route `POST /api/v1/runs` matched,
+ * `knowledge_binding_id` is dropped and set to `binding` when there is one
+ * (decision 2026-10-30-main-chat-knowledge-path). A body that is no JSON
+ * object there is refused (null): the daemon would also read a positional
+ * array, binding field included. */
+export function withKnowledgeBinding(route: ProxyRoute, req: BackendProxyRequest, binding: string | null): BackendProxyRequest | null {
+  const body = req.body
+  const creates = route.method === 'POST' && route.template === '/api/v1/runs'
+  if (!creates) return req
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return null
+  const rest = { ...(body as Record<string, unknown>) }
+  delete rest['knowledge_binding_id']
+  return { ...req, body: binding === null ? rest : { ...rest, knowledge_binding_id: binding } }
 }

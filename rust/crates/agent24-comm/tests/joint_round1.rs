@@ -40,10 +40,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+mod common;
+
 use agent24_comm::{
-    Envelope, ExitClass, HyphaeLock, HyphaeRunner, Invocation, Password, VerifiedBinary,
-    current_platform, parse_envelope,
+    Envelope, ExitClass, HyphaeRunner, Invocation, Password, VerifiedBinary, current_platform,
+    parse_envelope,
 };
+use common::HyphaeLock;
 use serde_json::Value;
 
 const PASSWORD_A: &str = "joint-round1-a-synthetic-9f2c";

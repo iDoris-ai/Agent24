@@ -1,21 +1,24 @@
 name: Hyphae lock verify
 
-# COMM-1a/COMM-1b (docs/design/COMM-HYPHAE.md §8.1): `hyphae.lock.json`
-# records a sha256 per platform, produced by a documented, supposedly
-# reproducible build recipe (`GOTOOLCHAIN=... CGO_ENABLED=0 GOOS=<os>
-# GOARCH=<arch> go build -trimpath -buildvcs=false -ldflags='-buildid='`).
-# This job is the thing that actually proves that for linux-x64: it checks
-# out Hyphae at the lock's `source_sha`, builds linux-x64 with the lock's own
-# recipe (verbatim, with `<os>`/`<arch>` substituted — so a recipe edit is
-# honored automatically, not just a hash edit), and fails if the result
-# doesn't match `hyphae.lock.json`'s `linux-x64` entry byte-for-byte.
+# COMM-1a/COMM-1b + ADR-038 C1b: `hyphae.lock.json` is Hyphae's published schema-2
+# ComponentLock. Its `reproducible.recipe` is a documented, reproducible build; this
+# job proves it: check out Hyphae at `source.commit`, build one platform with the
+# recipe verbatim (`<os>`/`<arch>` substituted, including its `-X main.version=<tag>`),
+# and compare against the lock — every value read from the lock, none duplicated here:
+#   - linux-x64 (unsigned): the build must equal `assets.linux-x64.sha256`, which must
+#     in turn equal `reproducible.unsigned_sha256.linux-x64`;
+#   - darwin-arm64 (Developer ID signed + notarized, which changes the bytes): the build
+#     must equal `reproducible.unsigned_sha256.darwin-arm64`, never the signed asset hash.
+# It then publishes, for the Rust test jobs, the binary Agent24 really installs: the
+# reproduced one for linux (identical to the asset), and for macOS the published signed
+# asset downloaded from `release_url_base/version/assets.<platform>.name` and checked
+# against `assets.<platform>.sha256`.
 #
 # Triggered on changes to the lock file itself, and also on changes to this
 # workflow file — the latter so that the job actually *runs* (and so proves
 # itself) the first time this workflow is introduced, rather than sitting
 # dormant until some future, unrelated lock edit.
-# CI also calls this workflow for linux-x64 and darwin-arm64; both use the
-# same locked recipe and publish a verified binary for the Rust test jobs.
+# CI also calls this workflow for linux-x64 and darwin-arm64.
 
 on:
   push:
@@ -65,18 +68,39 @@ jobs:
             *) echo "::error::unsupported platform: $HYPHAE_PLATFORM"; exit 1 ;;
           esac
           LOCK=agent24/rust/crates/agent24-comm/hyphae.lock.json
-          SOURCE_SHA=$(jq -r '.source_sha' "$LOCK")
-          EXPECTED=$(jq -r --arg platform "$HYPHAE_PLATFORM" '.binaries[$platform]' "$LOCK")
-          LOCK_GO=$(jq -r '.go' "$LOCK")
-          RECIPE=$(jq -r '.recipe' "$LOCK")
+          if [ "$(jq -r '.schema' "$LOCK")" != 2 ]; then
+            echo "::error::hyphae.lock.json must be schema 2"
+            exit 1
+          fi
+          SOURCE_SHA=$(jq -r '.source.commit' "$LOCK")
+          VERSION=$(jq -r '.version' "$LOCK")
+          ASSET_SHA=$(jq -r --arg p "$HYPHAE_PLATFORM" '.assets[$p].sha256 // empty' "$LOCK")
+          ASSET_NAME=$(jq -r --arg p "$HYPHAE_PLATFORM" '.assets[$p].name // empty' "$LOCK")
+          UNSIGNED_SHA=$(jq -r --arg p "$HYPHAE_PLATFORM" '.reproducible.unsigned_sha256[$p] // empty' "$LOCK")
+          ASSET_URL="$(jq -r '.release_url_base | rtrimstr("/")' "$LOCK")/$VERSION/$ASSET_NAME"
+          LOCK_GO=$(jq -r '.reproducible.toolchain' "$LOCK")
+          RECIPE=$(jq -r '.reproducible.recipe' "$LOCK")
+          case "$HYPHAE_PLATFORM" in
+            # Unsigned platform: the published asset IS the reproduced build.
+            linux-*)
+              if [ "$UNSIGNED_SHA" != "$ASSET_SHA" ]; then
+                echo "::error::unsigned $HYPHAE_PLATFORM: reproducible.unsigned_sha256 ($UNSIGNED_SHA) must equal assets sha256 ($ASSET_SHA)"
+                exit 1
+              fi
+              EXPECTED=$ASSET_SHA ;;
+            # Signed platform: reproduce the pre-signing bytes.
+            darwin-*) EXPECTED=$UNSIGNED_SHA ;;
+          esac
           if ! printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::error::hyphae.lock.json source_sha must be a full 40-character commit SHA"
+            echo "::error::hyphae.lock.json source.commit must be a full 40-character commit SHA"
             exit 1
           fi
-          if ! printf '%s' "$EXPECTED" | grep -Eq '^[0-9a-f]{64}$'; then
-            echo "::error::hyphae.lock.json has no valid $HYPHAE_PLATFORM sha256"
-            exit 1
-          fi
+          for value in "$EXPECTED" "$ASSET_SHA"; do
+            if ! printf '%s' "$value" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "::error::hyphae.lock.json has no valid $HYPHAE_PLATFORM sha256 (asset or unsigned)"
+              exit 1
+            fi
+          done
           if ! printf '%s' "$LOCK_GO" | grep -Eq '^go[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "::error::hyphae.lock.json has invalid go version: $LOCK_GO"
             exit 1
@@ -85,19 +109,25 @@ jobs:
             echo "::error::recipe does not pin GOTOOLCHAIN to the lock's go version ($LOCK_GO)"
             exit 1
           fi
+          if ! printf '%s' "$RECIPE" | grep -Fq -- "-X main.version=$VERSION"; then
+            echo "::error::recipe does not inject the lock's version ($VERSION) via -X main.version"
+            exit 1
+          fi
           {
             echo "source_sha=$SOURCE_SHA"
             echo "go_version=${LOCK_GO#go}"
             echo "expected=$EXPECTED"
+            echo "asset_sha=$ASSET_SHA"
+            echo "asset_url=$ASSET_URL"
             echo "goos=$GOOS"
             echo "goarch=$GOARCH"
             echo "recipe<<HYPHAE_RECIPE_EOF"
             echo "$RECIPE"
             echo "HYPHAE_RECIPE_EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "locked source_sha=$SOURCE_SHA expected $HYPHAE_PLATFORM=$EXPECTED"
+          echo "locked source.commit=$SOURCE_SHA reproduce $HYPHAE_PLATFORM=$EXPECTED (asset $ASSET_SHA)"
 
-      - name: Checkout Hyphae at the locked source_sha
+      - name: Checkout Hyphae at the locked source.commit
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
         with:
           repository: iDoris-ai/Hyphae
@@ -130,27 +160,50 @@ jobs:
           sh -c "$cmd"
           test -f hyphae || { echo "::error::recipe did not produce ./hyphae"; exit 1; }
 
-      - name: Compare sha256 to hyphae.lock.json
+      - name: Compare reproduced sha256 to hyphae.lock.json
         env:
           EXPECTED: ${{ steps.lock.outputs.expected }}
         run: |
           set -euo pipefail
           if [ -z "$EXPECTED" ] || [ "$EXPECTED" = "null" ]; then
-            echo "::error::hyphae.lock.json has no recorded $HYPHAE_PLATFORM hash to verify against"
+            echo "::error::hyphae.lock.json has no recorded $HYPHAE_PLATFORM reproduction hash"
             exit 1
           fi
           actual=$(sha256sum hyphae-src/hyphae | awk '{print $1}')
           echo "expected=$EXPECTED"
           echo "actual=$actual"
           if [ "$actual" != "$EXPECTED" ]; then
-            echo "::error::$HYPHAE_PLATFORM build (sha256 $actual) does not match hyphae.lock.json's recorded hash ($EXPECTED)"
+            echo "::error::$HYPHAE_PLATFORM build (sha256 $actual) does not reproduce hyphae.lock.json ($EXPECTED)"
             exit 1
           fi
           echo "$HYPHAE_PLATFORM reproducible build matches hyphae.lock.json ($actual)"
+
+      # What the test jobs run must be what Agent24 installs: on a signed platform that
+      # is the published signed asset, not the unsigned reproduction above.
+      - name: Fetch the published signed asset
+        if: startsWith(env.HYPHAE_PLATFORM, 'darwin-')
+        env:
+          ASSET_URL: ${{ steps.lock.outputs.asset_url }}
+          ASSET_SHA: ${{ steps.lock.outputs.asset_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p published
+          curl -fsSL --proto '=https' --retry 3 -o published/hyphae "$ASSET_URL"
+          printf '%s  %s\n' "$ASSET_SHA" published/hyphae | sha256sum --check
+          echo "published $HYPHAE_PLATFORM asset matches hyphae.lock.json ($ASSET_SHA)"
+
+      - name: Select the binary for the test jobs
+        run: |
+          set -euo pipefail
+          mkdir -p verified
+          case "$HYPHAE_PLATFORM" in
+            darwin-*) cp published/hyphae verified/hyphae ;;
+            *) cp hyphae-src/hyphae verified/hyphae ;;
+          esac
 
       - name: Upload verified Hyphae
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: hyphae-${{ env.HYPHAE_PLATFORM }}
-          path: hyphae-src/hyphae
+          path: verified/hyphae
           if-no-files-found: error

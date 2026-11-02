@@ -7,9 +7,13 @@ import type { NavPrefs } from '../renderer/capabilities/types'
 import {
   IpcChannels,
   type BackendEndpointResult,
+  type CommImportPickResult,
   type CliToolStatus,
   type CliInstallResult,
   type DocumentsEvent,
+  type KnowledgeConfigureInput,
+  type KnowledgeSettingsResult,
+  type KnowledgeStatus,
   type DocumentsImportProgress,
   type DocumentsRequest,
   type DocumentsResponse,
@@ -50,6 +54,33 @@ const api = {
   approvalDecide: (id: string, decision: ApprovalDecisionInput): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.ApprovalDecide, id, decision),
   /** A1: elevated; main asks the user in a native dialog before sending. */
+  commInstall: (): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.CommInstall),
+  /** Elevated; the page sends only the nickname. Main confirms natively, collects the backup password in its own isolated window, lets the user pick the file, and the daemon writes an NIP-49 encrypted backup there (0600, never overwriting). Resolves with `{nickname,npub,path,format}` only. */
+  commIdentityExport: (nickname: string): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommIdentityExport, nickname),
+  /** Reveal the file just exported. `filePath` must be exactly that path; main refuses any other. */
+  commRevealExport: (filePath: string): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommRevealExport, filePath),
+  /** Elevated comm write, validated in main (not on the generic proxy). */
+  commContactAdd: (nickname: string, npub: string, role: string): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommContactAdd, nickname, npub, role),
+  /** Elevated comm write, validated in main (not on the generic proxy). */
+  commSend: (to: string, content: string): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommSend, to, content),
+
+  /** Native open dialog for a `.ncryptsec` backup. Resolves with a file NAME and a single-use ticket (never the path or contents). */
+  commImportPick: (): Promise<CommImportPickResult> => ipcRenderer.invoke(IpcChannels.CommImportPick),
+  /** Restore the picked backup under `nickname`. Main asks for the backup password in its own window; the page never sees it. */
+  commIdentityImport: (ticket: string, nickname: string, makeDefault: boolean): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommIdentityImport, ticket, nickname, makeDefault),
+
+  /** Elevated: main shows a native folder picker and confirm, then asks for the keystore password in its own window. The page supplies nothing. */
+  commHomeImport: (): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.CommHomeImport),
+  /** Elevated: replaces the relay list. Main validates the URLs and confirms natively when the list changes. */
+  commRelaySet: (relays: string[]): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.CommRelaySet, relays),
+  /** Elevated: main asks for the keystore password in its own window; the page only says whether to remember it. */
+  commUnlock: (remember: boolean): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.CommUnlock, remember),
+
   osModuleSetEnabled: (name: string, enabled: boolean): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.OsModuleSetEnabled, name, enabled),
   /** A-3: elevated; disables/enables AgentEar (the name is fixed in main).
@@ -114,6 +145,14 @@ const api = {
   },
   modelCallSnapshot: (): Promise<ModelCallEnvelope[]> =>
     ipcRenderer.invoke(IpcChannels.ModelCallSnapshot),
+  // Knowledge settings: the key goes in, never comes back (main/knowledge-settings.ts).
+  knowledge: {
+    status: (): Promise<KnowledgeStatus> => ipcRenderer.invoke(IpcChannels.KnowledgeStatus),
+    configure: (input: KnowledgeConfigureInput): Promise<KnowledgeSettingsResult> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeConfigure, input),
+    setEnabled: (enabled: boolean): Promise<KnowledgeSettingsResult> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeSetEnabled, enabled),
+  },
   // ADR-DOC-01 D5: the Documenting OS, by operation, never by path.
   documents: {
     request: <R extends DocumentsRequest>(req: R): Promise<DocumentsResponse<R['op']>> =>

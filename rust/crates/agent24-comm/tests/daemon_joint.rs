@@ -30,13 +30,16 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod common;
+
 use agent24_comm::{
-    CommState, DaemonCtx, HyphaeDaemonSupervisor, HyphaeLock, HyphaeRunner, MemoryPasswordStore,
+    CommState, DaemonCtx, HyphaeDaemonSupervisor, HyphaeRunner, MemoryPasswordStore,
     VerifiedBinary, current_platform, parse_envelope, router,
 };
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use common::HyphaeLock;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 

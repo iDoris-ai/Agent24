@@ -1,17 +1,18 @@
 //! Hash-verified Hyphae binaries.
 //!
-//! `hyphae.lock.json` (embedded via `include_str!`) records, per platform,
-//! the sha256 of a Hyphae binary built with a fixed, reproducible recipe
-//! (COMM-HYPHAE.md §8.1). [`VerifiedBinary::install`] is the *only* way to
-//! obtain a [`VerifiedBinary`]: it reads the candidate binary into memory
-//! once, hashes those bytes, and — only on a match — has an isolated child
-//! write a copy, re-verifies it, and publishes it as mode 0500 in `install_dir`.
-//! A copy that already exists there is
+//! `hyphae.lock.json` is Hyphae's published schema-2 `ComponentLock` (ADR-038 D2,
+//! copied byte for byte). This crate only *embeds* it ([`HYPHAE_LOCK_JSON`]): it
+//! must stay free of HTTP clients (COMM-5b), so the strict parser lives in
+//! `agent24-components` and agent24d is the one that reads digests, the release
+//! location and the signing policy out of it. [`VerifiedBinary::install`] is the
+//! *only* way to obtain a [`VerifiedBinary`]: it reads the candidate binary into
+//! memory once, hashes those bytes, and — only on a match with the caller's
+//! expected digest — has an isolated child write a copy, re-verifies it, and
+//! publishes it as mode 0500 in `install_dir`. A copy that already exists there is
 //! re-hashed on every call; a mismatch there is a hard error (a tampered
 //! copy), never a silent overwrite (COMM-0 r2 decision M9: no TOCTOU window
 //! between verifying and executing).
 
-use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -20,8 +21,9 @@ use std::process::{Command, Stdio};
 
 use sha2::{Digest, Sha256};
 
-/// The lock file this crate ships, embedded at compile time.
-const LOCK_JSON: &str = include_str!("../hyphae.lock.json");
+/// Hyphae's published `hyphae.lock.json` (schema 2), embedded at compile time.
+/// Parse it with `agent24_components::ComponentLock::parse`; nothing here reads it.
+pub const HYPHAE_LOCK_JSON: &str = include_str!("../hyphae.lock.json");
 
 /// A sha256 digest, compared by raw bytes (not string case).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,7 +67,7 @@ pub fn sha256_of(bytes: &[u8]) -> Sha256Digest {
     Sha256Digest(out)
 }
 
-/// Returns the current platform in the `hyphae.lock.json` key format
+/// Returns the current platform in the lock's `<os>-<arch>` key format
 /// (`darwin-arm64`, `linux-x64`, ...).
 pub fn current_platform() -> String {
     let os = match std::env::consts::OS {
@@ -78,51 +80,6 @@ pub fn current_platform() -> String {
         other => other,
     };
     format!("{os}-{arch}")
-}
-
-/// The parsed contents of `hyphae.lock.json`.
-#[derive(serde::Deserialize)]
-pub struct HyphaeLock {
-    pub schema: u32,
-    pub source_sha: String,
-    pub go: String,
-    pub recipe: String,
-    pub binaries: BTreeMap<String, Option<String>>,
-}
-
-impl HyphaeLock {
-    /// Parses the lock file embedded in this binary at compile time.
-    pub fn embedded() -> Result<Self, BinaryError> {
-        serde_json::from_str(LOCK_JSON).map_err(|_| BinaryError::BadLockHash)
-    }
-
-    /// The expected digest for `platform`, or an error if the platform is
-    /// absent or recorded as `null` (not yet verified for that platform).
-    pub fn expected_for(&self, platform: &str) -> Result<Sha256Digest, BinaryError> {
-        match self.binaries.get(platform) {
-            Some(Some(hex)) => Sha256Digest::from_hex(hex),
-            _ => Err(BinaryError::NoLockForPlatform(platform.to_string())),
-        }
-    }
-
-    /// Test-only: builds a lock whose only entry is `platform -> sha`,
-    /// standing in for the embedded lock. This lets tests exercise the real
-    /// `install` → `expected_for` flow against a locally-built fake binary,
-    /// or against a legitimate-but-unreproducible reference binary, without
-    /// the production lock ever being overridable (there is no non-test path
-    /// to this constructor).
-    #[cfg(any(test, feature = "test-lock-override"))]
-    pub fn override_for_test(platform: &str, sha: Sha256Digest) -> Self {
-        let mut binaries = BTreeMap::new();
-        binaries.insert(platform.to_string(), Some(sha.to_hex()));
-        Self {
-            schema: 1,
-            source_sha: "test-override".to_string(),
-            go: "test-override".to_string(),
-            recipe: "test-override".to_string(),
-            binaries,
-        }
-    }
 }
 
 /// A Hyphae binary whose bytes have been verified against an expected
@@ -494,30 +451,6 @@ mod tests {
     fn debug_shows_hex_not_bytes() {
         let digest = Sha256Digest::from_hex(SAMPLE_SHA).unwrap();
         assert_eq!(format!("{digest:?}"), format!("Sha256Digest({SAMPLE_SHA})"));
-    }
-
-    #[test]
-    fn embedded_lock_parses_and_resolves_baseline_platform() {
-        let lock = HyphaeLock::embedded().unwrap();
-        assert_eq!(lock.source_sha, "076a5205f0f45539082538c8f10ea3db69b7a8f1");
-        let expected = lock.expected_for("darwin-arm64").unwrap();
-        assert_eq!(
-            expected.to_hex(),
-            "9bfa2e3e3cd68738654cd54112c696f94ecbb9707a211cc80f5aafc92784523f"
-        );
-    }
-
-    #[test]
-    fn embedded_lock_reports_missing_platform() {
-        let lock = HyphaeLock::embedded().unwrap();
-        assert!(matches!(
-            lock.expected_for("darwin-x64"),
-            Err(BinaryError::NoLockForPlatform(p)) if p == "darwin-x64"
-        ));
-        assert!(matches!(
-            lock.expected_for("freebsd-x64"),
-            Err(BinaryError::NoLockForPlatform(_))
-        ));
     }
 
     async fn write_fixture(dir: &Path, name: &str, content: &[u8]) -> PathBuf {

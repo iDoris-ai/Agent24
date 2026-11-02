@@ -133,6 +133,63 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/diagnostics/migration": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Failed-migration details (docked daemon only)
+         * @description Served by the docked router only. Needs a first-party token (`diagnostic.read`, daily level). Without a capability authority the route answers 503 `diagnostics_unavailable`.
+         */
+        get: operations["getMigrationDiagnostics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/diagnostics/migration/snapshots": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Snapshot metadata of the failed attempt (docked daemon only)
+         * @description Ids, sizes, hashes and restore progress; never file contents.
+         */
+        get: operations["getMigrationSnapshots"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/diagnostics/migration/space": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Last disk-space probe of the failed attempt (docked daemon only) */
+        get: operations["getMigrationSpace"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/chat": {
         parameters: {
             query?: never;
@@ -149,6 +206,61 @@ export interface paths {
          *     `run.started` / `model.delta` / `run.completed` events for it.
          */
         post: operations["postChat"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/components": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Lifecycle state of every component (ADR-038 D5)
+         * @description One status model for iDoris, Hyphae, attached modules, Documents, Knowledge and Open
+         *     Design (whose state the desktop reports). Needs `components.read`; Creative tokens are
+         *     refused (403). The ProductHost audience, and legacy mode (one shared token that already
+         *     reads every full status route), get `ComponentView`. Every other audience gets
+         *     `ComponentRedactedView`: id, version, state and provides only, with no install path, pid,
+         *     port, error message, team id or commit. A first-party token carries only the operations it
+         *     was issued with, so one issued by an older daemon gets 403 here until it is re-issued. The older status routes (`/idoris/status`,
+         *     `/comm/daemon`, `/os`) are unchanged.
+         */
+        get: operations["listComponents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/components/{id}/report": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * The desktop reports the state of a component it owns (ADR-038 D5)
+         * @description ProductHost audience only; legacy mode, first-party and Creative tokens get 403. Accepted
+         *     only for components whose state the desktop owns (today `open-design`); any other id is
+         *     404. The first report, or the first after the previous one expired, is taken as the
+         *     baseline. Otherwise whatever legal state is reported is stored and refreshes the report
+         *     (the daemon only aggregates); one that does not follow the last live report by a D5 edge
+         *     is logged and marked for the host as `detail.unexpected_transition` `{from, to}` on the
+         *     component. An unknown id is 404 before the body is read. A report expires 90 seconds after it was
+         *     received, after which the component reads `absent` with reason `not_reported`; the
+         *     desktop must re-send within that time.
+         */
+        post: operations["reportComponentState"];
         delete?: never;
         options?: never;
         head?: never;
@@ -741,7 +853,7 @@ export interface paths {
         /**
          * The shutdown budgets in effect and the previous shutdown (authenticated)
          * @description SHUT-1c. The out-of-process modules' drain and stop grace
-         *     (`A24_MODULE_DRAIN_MS`, `A24_MODULE_STOP_GRACE_MS`), the exit bound
+         *     (`A24_MODULE_DRAIN_MS`, `A24_COMPONENT_STOP_GRACE_MS`), the exit bound
          *     they give, values that were rejected, and what this daemon found of
          *     the one before it — so a budget that is too tight can be found and
          *     adjusted. agent24d only.
@@ -1335,6 +1447,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/comm/identity/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Back up an identity's private key to a password-encrypted file
+         * @description Needs Hyphae v0.28.0 or newer (`409 hyphae_too_old` otherwise, decided from the installed binary's own `--help`). Runs `hyphae identity export --format ncryptsec --password-stdin` (no `--out`) with the keystore password (from the system keychain) and `backup_password` on stdin, one per line; Hyphae answers with the NIP-49 `ncryptsec1…` ciphertext on stdout, so the plaintext key never enters the daemon. The daemon validates it strictly (bech32 checksum, HRP, payload length, version, log_n <= 19), opens it with `backup_password` and checks it derives the identity's npub (a backup that would not restore is never written), and only then creates the file itself, relative to a directory descriptor pinned before the export: exclusive create of a random staging name (mode 0600), write, fsync, `linkat` to `path` (which never replaces anything), unlink the staging name, fsync the directory. After publishing it checks that the final name is the very inode it wrote (`fstatat` without following links, compared by device and inode); if it is not, the file at that name is left untouched and the answer is `409 publish_conflict`. On file systems without hard links (FAT, exFAT, some SMB mounts; `linkat` fails with EPERM, ENOTSUP, EOPNOTSUPP, EXDEV or EMLINK) it renames the staging file with `RENAME_EXCL` (macOS) or `RENAME_NOREPLACE` (Linux), which also never overwrites; if that is unsupported too (exFAT on macOS) it creates the final name directly with `O_EXCL` (never replacing anything; a crash mid-write can leave a partial, undecryptable file) and only if that is refused as well the answer is `422 filesystem_unsupported`. On such file systems there is no atomic publish: a crash mid-write can leave a partial, undecryptable file at the final name (a failed write removes it, and the error names it if it cannot). After publishing the final name must still be the file Agent24 wrote; if another file appeared there it is NEVER deleted or replaced and the answer is `409 publish_conflict`. EPERM/EACCES from any of these steps is `422 permission_denied`. An existing target of any kind is refused with `409 conflict` and `data.reason = "target_exists"`. `path` must be absolute and outside the Hyphae data directory. Neither the key, the backup nor the backup password is part of the response or a log line. Only the desktop's ProductHost credential may call it (legacy shared-token mode and every other audience get `403`), because the caller chooses the password that encrypts the key. One export runs at a time (`409` with `data.reason = "export_in_progress"`). The desktop does not expose it through the renderer proxy; its main process confirms natively, collects the password in its own window and picks `path` with a native save dialog. There is no CLI command yet (it needs the CORE-2d presence proof for CommWrite).
+         */
+        post: operations["exportCommIdentity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comm/identity/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Restore an identity from an encrypted (NIP-49) backup file
+         * @description Needs Hyphae v0.28.0 or newer (`409 hyphae_too_old` otherwise). Takes the backup text itself in `ncryptsec` (one `ncryptsec1…` token of at most 200 ASCII characters, no whitespace or line break; the desktop's main process reads and validates the file the user picked, then sends its content, so the daemon never opens a path the caller names; the bech32 structure is checked too) and runs `hyphae identity import --nickname=<n> --password-stdin --ncryptsec-stdin [--default]` with stdin `keystore password`, `backup_password`, `ncryptsec1…` (one per line, in that order). The keystore password comes from the system keychain; when no identity exists yet a fresh one is generated and promoted exactly like `POST /comm/identity` does for the first identity. The comm daemon is restarted if the restored identity becomes the default. Only the desktop's ProductHost credential may call it (legacy mode and every other audience get `403`). Errors carry stable codes: `bad_backup_password` (400), `invalid_key` (400), `nickname_exists` (409), `keystore_locked` (423, also what Hyphae's plain `auth_error` on import means), `hyphae_too_old` (409). Restoring a key that is already stored is not an error: it answers 200 with `data.status = "already_present"`, plus `nickname` and `npub` of the existing identity when known. There is no CLI command yet (CORE-2d).
+         */
+        post: operations["importCommIdentity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/comm/identity/default": {
         parameters: {
             query?: never;
@@ -1396,7 +1548,10 @@ export interface paths {
         };
         /** List configured relays */
         get: operations["listCommRelays"];
-        /** Replace the relay list (full replace, at most 8) */
+        /**
+         * Replace the relay list (full replace, at most 8)
+         * @description Each URL: 1..256 characters of printable ASCII, `wss://` (or `ws://` for loopback hosts only: localhost, 127.0.0.0/8, [::1]), a host, no userinfo, no query string, no fragment (`400 invalid`).
+         */
         put: operations["setCommRelays"];
         post?: never;
         delete?: never;
@@ -1439,6 +1594,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/comm/install": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Download and set up the pinned Hyphae release
+         * @description Host-only elevated operation: downloads and installs executable code. No request body or URL overrides. HTTPS redirects are host allowlisted and SHA-256 comes from the embedded upstream lock. Repeated installs reverify existing bytes. The daemon rebuilds comm state without restarting. CLI `agent24 comm install --json` prints the data object from this envelope to stdout; progress is suppressed in JSON mode. Otherwise progress is written to stderr. If restart_required is true, reason explains why communication could not be rebuilt.
+         */
+        post: operations["installCommComponent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/comm/daemon": {
         parameters: {
             query?: never;
@@ -1446,7 +1621,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Hyphae daemon status (process, relay probe, catch-up) */
+        /**
+         * Hyphae daemon status (process, relay probe, catch-up)
+         * @description Always returns 200 when comm is not configured, with process.state not_configured. data.installable indicates a platform the lock has an asset for. data.installed_version is the component tag (v0.30.0) after full hash revalidation, or null when absent or rejected. Developer and sibling binaries do not count as installed components. data.rejection (see HyphaeRejection) is always present: why the last start or install rebuild refused the Hyphae binary it found (signature_rejected: the at-rest code-signature check failed; hash_mismatch: the SHA-256 differs from the lock), or null when nothing was refused (including when nothing is installed). It is cleared by the next start or rebuild that does not refuse a binary.
+         */
         get: operations["getCommDaemon"];
         put?: never;
         post?: never;
@@ -2025,6 +2203,9 @@ export interface components {
             budget_suggestion: components["schemas"]["IdorisBudgetSuggestion"] | null;
             /** @enum {string|null} */
             budget_unavailable_reason: "hardware_memory_unavailable" | "hardware_probe_failed" | "host_unavailable" | null;
+            /** @description The installed release is outside the ADR-038 managed root; the next Install re-downloads it there. The current install keeps working meanwhile. */
+            migration_pending: boolean;
+            last_migration_error: components["schemas"]["IdorisErrorCode"] | null;
         };
         IdorisOperation: {
             operation_id: string;
@@ -2036,12 +2217,18 @@ export interface components {
             result: "succeeded" | "failed" | "cancelled" | null;
             error_code: components["schemas"]["IdorisErrorCode"] | null;
             cancellable: boolean;
-            idempotency_key: string;
             download_progress?: components["schemas"]["IdorisDownloadProgress"];
             verification?: components["schemas"]["IdorisVerification"];
-            request_fingerprint?: string;
             /** @enum {string} */
             setup_code?: "unreachable" | "auth_required" | "auth_failed" | "not_omlx" | "model_not_found" | "invalid_endpoint" | "invalid_role" | "out_dir_not_empty" | "validation_failed" | "write_failed" | "invalid_api_key_input";
+        };
+        CommInstallResult: {
+            /** @example v0.30.0 */
+            installed_version: string;
+            /** @description Absolute installed component path */
+            path: string;
+            restart_required: boolean;
+            reason: string | null;
         };
         DomainOsView: {
             name: string;
@@ -2101,6 +2288,55 @@ export interface components {
         AttachedList: {
             modules: components["schemas"]["AttachedView"][];
         };
+        /**
+         * @description Why agent24d refused the Hyphae binary at its last start or install rebuild: signature_rejected (D2a at-rest check: Developer ID requirement, Team ID, Hardened Runtime, or the checker could not run) or hash_mismatch (SHA-256 differs from the lock). Null when nothing was refused. Exposed as GET /comm/daemon data.rejection and, host view only, as the hyphae item's reason (state failed) in GET /components.
+         * @enum {string|null}
+         */
+        HyphaeRejection: "signature_rejected" | "hash_mismatch" | null;
+        /** @enum {string} */
+        ComponentState: "absent" | "installing" | "installed" | "starting" | "ready" | "degraded" | "stopping" | "stopped" | "incompatible" | "failed";
+        ComponentProvide: {
+            /** @description Capability id (ADR-038 D9) */
+            id: string;
+            /** @description Localized display name, when the component's lock carries one */
+            name?: {
+                zh: string;
+                en: string;
+                th: string;
+            };
+        };
+        /** @description Host view of one component. */
+        ComponentView: {
+            id: string;
+            version: string | null;
+            state: components["schemas"]["ComponentState"];
+            /** @enum {string} */
+            form: "resident" | "sidecar" | "cli" | "attach" | "remote" | "mcp";
+            provides: components["schemas"]["ComponentProvide"][];
+            /** @description Short machine-readable cause; host only. For hyphae with state failed this includes signature_rejected and hash_mismatch (see HyphaeRejection); a Hyphae that is simply not installed is state absent with no reason. */
+            reason?: string;
+            /** @description Ports, contract expectation, counters, messages; host only */
+            detail?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description What every audience other than the host sees. No path, pid, port, message, team id or commit. */
+        ComponentRedactedView: {
+            id: string;
+            version: string | null;
+            state: components["schemas"]["ComponentState"];
+            provides: components["schemas"]["ComponentProvide"][];
+        };
+        ComponentList: {
+            components: (components["schemas"]["ComponentView"] | components["schemas"]["ComponentRedactedView"])[];
+        };
+        ComponentReport: {
+            state: components["schemas"]["ComponentState"];
+            /** @description Kept from the previous report when omitted */
+            version?: string;
+            /** @description No control characters; shown to the host only */
+            reason?: string;
+        };
         AttachedUpdate: {
             enabled: boolean;
         };
@@ -2138,7 +2374,7 @@ export interface components {
             evidence_dir?: string;
             drain_ms: number;
             stop_grace_ms: number;
-            /** @description From SIGTERM to the process gone, at the latest (2000 at the defaults). */
+            /** @description From SIGTERM to the process gone, at the latest (16500 at the defaults, with no managed iDoris holding the shutdown open). */
             exit_bound_ms: number;
             config_warnings: string[];
             /** @description Open enum: no_history | clean | unreadable | cleanup_failed | unconfirmed. */
@@ -2163,8 +2399,17 @@ export interface components {
             memory: number;
         };
         Health: {
-            /** @constant */
-            status: "ok";
+            /**
+             * @description `ok` (HTTP 200) or `migration_failed` (HTTP 503, docked). Treat any other value as not reusable.
+             * @enum {string}
+             */
+            status: "ok" | "migration_failed";
+            /**
+             * @description Present only while docked.
+             * @constant
+             */
+            startup_state?: "docked";
+            reason?: components["schemas"]["HealthReason"];
             version: string;
             /**
              * @description Open enum — clients must tolerate unknown values
@@ -2175,6 +2420,61 @@ export interface components {
             /** @description Wire protocol version (`PROTOCOL_VERSION`, currently 1). Increment by 1 when a wire change is incompatible (a field removed or renamed, a changed meaning, or a difference a peer must refuse). Adding an optional field does not bump this. Shells refuse a daemon whose value differs from their own, and treat a missing value as an old daemon. */
             protocol_version: number;
             migrations: components["schemas"]["HealthMigrations"];
+        };
+        /**
+         * @description Stable public reason code. Never carries paths or raw errors.
+         * @enum {string}
+         */
+        DockCode: "interrupted" | "migration_failed" | "rollback_failed" | "guard_invalid" | "persist_failed" | "marker_invalid" | "space_insufficient" | "space_budget_unknown";
+        /** @enum {string} */
+        DockPhase: "preflight" | "migrating" | "fts_rebuild" | "restoring";
+        /** @enum {string} */
+        RollbackState: "not_needed" | "in_progress" | "restored" | "failed";
+        /** @enum {string} */
+        DockDatabase: "store" | "memory";
+        HealthReason: {
+            code: components["schemas"]["DockCode"];
+            phase: components["schemas"]["DockPhase"];
+            rollback: components["schemas"]["RollbackState"];
+            /**
+             * @description Retry is closed (CORE-5 Q2).
+             * @constant
+             */
+            retry_allowed: false;
+            /**
+             * @description `verified`: `Health.migrations` is the real post-restore value. `unknown`: it is reported as 0/0, not a watermark.
+             * @enum {string}
+             */
+            migrations: "verified" | "unknown";
+        };
+        MigrationDiagnostics: {
+            attempt_id: string;
+            snapshot_id: string | null;
+            failed_version: string;
+            database: components["schemas"]["DockDatabase"] | null;
+            migration_version: number | null;
+            phase: components["schemas"]["DockPhase"];
+            code: components["schemas"]["DockCode"];
+            rollback: components["schemas"]["RollbackState"];
+            /** @constant */
+            retry_allowed: false;
+            /** @description The marker's bounded summary, capped at 256 characters on read. Not scrubbed here: the marker writer must build it from a closed set of messages. */
+            error_summary: string;
+        };
+        SnapshotDiagnostics: {
+            snapshot_id: string | null;
+            restore: components["schemas"]["RollbackState"];
+            files: {
+                database: components["schemas"]["DockDatabase"];
+                existed: boolean;
+                bytes: number | null;
+                sha256: string | null;
+            }[];
+        };
+        SpaceDiagnostics: {
+            available_bytes: number | null;
+            budget_bytes: number | null;
+            failures: components["schemas"]["DockCode"][];
         };
         ChatMessage: {
             /**
@@ -2290,6 +2590,27 @@ export interface components {
             started_at: string | null;
             /** Format: date-time */
             ended_at: string | null;
+            /**
+             * @description Only on `GET /api/v1/runs/{id}`, never in a list. Null when the
+             *     run has no Knowledge binding. What the run's Knowledge tools did,
+             *     told from its stored tool calls, never from the answer's text: an
+             *     answer may name sources the run never read.
+             */
+            knowledge?: components["schemas"]["RunKnowledge"] | null;
+        };
+        RunKnowledge: {
+            /** @description Some `knowledge_search` or `knowledge_read` call of the run completed. */
+            searched: boolean;
+            /**
+             * @description Each chunk a completed `knowledge_read` named, in the order first
+             *     read. Such a read completes only with that chunk of that
+             *     document, so the run read these back, as a citation or as
+             *     current text.
+             */
+            read_chunks: {
+                knowledge_id: string;
+                chunk_id: string;
+            }[];
         };
         /**
          * @description K1-6b.5c-2: an allowlisted view of a run for peer bridges, never a
@@ -3367,7 +3688,7 @@ export interface components {
          * @description Closed set (COMM-HYPHAE.md section 4).
          * @enum {string}
          */
-        CommErrorCode: "binary_rejected" | "unsupported_platform" | "locked" | "not_configured" | "invalid" | "not_found" | "confirm_required" | "conflict" | "network" | "partial" | "timeout" | "upstream";
+        CommErrorCode: "hyphae_unsupported_platform" | "hyphae_download_failed" | "hyphae_hash_mismatch" | "hyphae_signature_rejected" | "binary_rejected" | "unsupported_platform" | "locked" | "not_configured" | "invalid" | "not_found" | "confirm_required" | "conflict" | "network" | "partial" | "timeout" | "upstream" | "hyphae_too_old" | "bad_backup_password" | "invalid_key" | "nickname_exists" | "keystore_locked" | "nickname_too_long" | "still_terminating" | "filesystem_unsupported" | "permission_denied" | "publish_conflict";
         /** @description Hyphae's own failure envelope shape, NOT the kernel `Error`: comm routes answer `{ok:false,error,message,data?}`. */
         CommError: {
             /** @constant */
@@ -3382,6 +3703,17 @@ export interface components {
             /** @constant */
             ok: true;
             data: unknown;
+        };
+        /** @description GET /comm/daemon: the Hyphae daemon status (`process`, `relay_probe`, `catch_up`) with the fields agent24d adds about the installed component. */
+        CommDaemonOk: components["schemas"]["CommOk"] & {
+            data?: {
+                installable: boolean;
+                /** @example v0.30.0 */
+                installed_version: string | null;
+                rejection: components["schemas"]["HyphaeRejection"];
+            } & {
+                [key: string]: unknown;
+            };
         };
         CommGroup: {
             group_id: string;
@@ -3580,6 +3912,33 @@ export interface components {
         };
         /** @description payload_too_large: the request exceeded the daemon-wide body limit */
         PayloadTooLarge: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description unauthorized (401): missing, unknown, expired or revoked bearer */
+        Unauthorized: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description forbidden (403): the token may not call this operation */
+        Forbidden: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description diagnostics_unavailable (503): no capability authority, so the diagnostics routes stay closed */
+        DiagnosticsUnavailable: {
             headers: {
                 [name: string]: unknown;
             };
@@ -4086,7 +4445,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Daemon is alive */
+            /** @description Daemon is alive (`status` is `ok`) */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -4095,6 +4454,84 @@ export interface operations {
                     "application/json": components["schemas"]["Health"];
                 };
             };
+            /** @description Docked after a failed database migration (`status` is `migration_failed`). Only this route and the diagnostics routes are served; every other path is 404. Clients must not reuse a daemon whose status is anything but `ok`. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Health"];
+                };
+            };
+        };
+    };
+    getMigrationDiagnostics: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Scrubbed marker contents */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MigrationDiagnostics"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            503: components["responses"]["DiagnosticsUnavailable"];
+        };
+    };
+    getMigrationSnapshots: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Snapshot metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SnapshotDiagnostics"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            503: components["responses"]["DiagnosticsUnavailable"];
+        };
+    };
+    getMigrationSpace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cached space probe */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SpaceDiagnostics"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            503: components["responses"]["DiagnosticsUnavailable"];
         };
     };
     postChat: {
@@ -4130,6 +4567,56 @@ export interface operations {
                 };
             };
             503: components["responses"]["ProviderUnavailable"];
+        };
+    };
+    listComponents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Components; each item is the full or the redacted variant by audience */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ComponentList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    reportComponentState: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ComponentReport"];
+            };
+        };
+        responses: {
+            /** @description Recorded */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
         };
     };
     getDecideProfile: {
@@ -6543,6 +7030,142 @@ export interface operations {
             504: components["responses"]["CommTimeout"];
         };
     };
+    exportCommIdentity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description No control or invisible formatting characters; at most 128 characters and 512 UTF-8 bytes (`400 nickname_too_long`). */
+                    nickname: string;
+                    path: string;
+                    /** @description Encrypts the backup. At least 8 characters and at most 1024 UTF-8 bytes (the byte limit is enforced by the server), a single line (no CR, LF or NUL) and not whitespace only. Lose it and the backup cannot be restored; it is not stored. */
+                    backup_password: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Backup written; data is `{nickname, npub, path, format:"ncryptsec"}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            /** @description Not the desktop ProductHost credential (or legacy auth mode) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+            404: components["responses"]["CommNotFound"];
+            /** @description `conflict` (`target_exists`, `export_in_progress`), `publish_conflict` (another file appeared at the destination; left untouched) or `hyphae_too_old` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+            /** @description `filesystem_unsupported` (the destination's file system cannot publish a file safely; choose another folder) or `permission_denied` (the folder is not writable) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    importCommIdentity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description No control or invisible formatting characters; at most 128 characters and 512 UTF-8 bytes (`400 nickname_too_long`). */
+                    nickname: string;
+                    /** @description The NIP-49 backup text (ciphertext, still protected by the backup password); never returned or logged. */
+                    ncryptsec: string;
+                    /** @description The password the backup was made with. A single line (no CR, LF or NUL). */
+                    backup_password: string;
+                    /** @default false */
+                    default?: boolean;
+                };
+            };
+        };
+        responses: {
+            /** @description `data` is `{status:"imported", nickname, npub, default}` or `{status:"already_present", nickname?, npub?}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            /** @description `invalid` (including an unusable backup password), `bad_backup_password`, `invalid_key` */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+            /** @description Not the desktop ProductHost credential (or legacy auth mode) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+            404: components["responses"]["CommNotFound"];
+            /** @description `nickname_exists`, `hyphae_too_old` or `conflict` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+            /** @description `keystore_locked` or `locked` */
+            423: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
     useCommIdentity: {
         parameters: {
             query?: never;
@@ -6797,6 +7420,57 @@ export interface operations {
             504: components["responses"]["CommTimeout"];
         };
     };
+    installCommComponent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hyphae installed and comm state rebuilt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @constant */
+                        ok: true;
+                        data: components["schemas"]["CommInstallResult"];
+                    };
+                };
+            };
+            /** @description hyphae_unsupported_platform (the lock has no asset for this platform) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+            /** @description hyphae_hash_mismatch (downloaded or installed bytes do not match the lock's SHA-256), or hyphae_signature_rejected (macOS: the bytes match but the Developer ID / Hardened Runtime / notarization check failed; notarization is an online check, so offline is the usual cause). Messages are fixed texts without paths or tool output. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+            /** @description hyphae_download_failed (network, cancellation, storage or shutdown) */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommError"];
+                };
+            };
+        };
+    };
     getCommDaemon: {
         parameters: {
             query?: never;
@@ -6806,13 +7480,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Hyphae envelope `{ok:true,data}` */
+            /** @description Hyphae envelope `{ok:true,data}` plus agent24d's component fields */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["CommOk"];
+                    "application/json": components["schemas"]["CommDaemonOk"];
                 };
             };
             409: components["responses"]["CommConflict"];

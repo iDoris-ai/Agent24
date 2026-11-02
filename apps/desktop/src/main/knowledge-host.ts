@@ -35,6 +35,13 @@ type Failure = 'not_started' | 'invalid_binding' | 'login_unavailable' | 'creden
 
 export type HostResult = { ok: true } | { ok: false; reason: Failure }
 
+/** Where an active binding's calls go: the Knowledge server's API base and the
+ * knowledge bases they may search. From trusted settings only, never a renderer. */
+export interface KnowledgeEndpoint {
+  endpoint: string
+  knowledgeBaseIds: readonly string[]
+}
+
 /** One request to the daemon: its status and the `error.code` of its body. */
 export type HostTransport = (connection: DaemonConnection, method: 'PUT' | 'DELETE', path: string, body?: string)
   => Promise<{ status: number; code?: string }>
@@ -80,12 +87,17 @@ export interface KnowledgeHostDeps {
 export class KnowledgeHost {
   private started: LoadResult | null = null
   // Bindings that should be active in the daemon, with their current C.
-  private readonly wanted = new Map<string, { credential: KnowledgeCredential | null }>()
+  private readonly wanted = new Map<string, { endpoint: KnowledgeEndpoint | null; credential: KnowledgeCredential | null }>()
   private readonly locks = new Map<string, Promise<unknown>>()
   private connectionKey: string | null = null
+  // Bindings whose activation the daemon on this connection has taken.
+  private readonly confirmed = new Set<string>()
   // Bindings whose daemon record may differ from `wanted`, and those queued to be fixed.
   private unsynced = new Set<string>()
   private readonly reconciling = new Set<string>()
+  // Bumped for a binding by every deactivate: an activation called before it
+  // and still queued then does nothing.
+  private readonly drops = new Map<string, number>()
   private readonly deps: Required<KnowledgeHostDeps>
 
   constructor(private readonly logins: KnowledgeLoginStore, deps: KnowledgeHostDeps = {}) {
@@ -115,6 +127,7 @@ export class KnowledgeHost {
     if (key !== this.connectionKey) {
       this.connectionKey = key
       this.unsynced = new Set(this.wanted.keys())
+      this.confirmed.clear()
     }
     for (const bindingId of this.unsynced) {
       if (this.reconciling.has(bindingId)) continue
@@ -126,19 +139,40 @@ export class KnowledgeHost {
     }
   }
 
-  activate(bindingId: string): Promise<HostResult> {
+  /** Activates `bindingId`, with the endpoint its calls use; without one the
+   * daemon refuses every call of the binding. */
+  activate(bindingId: string, endpoint: KnowledgeEndpoint | null = null): Promise<HostResult> {
+    const copy = endpoint && { endpoint: endpoint.endpoint, knowledgeBaseIds: [...endpoint.knowledgeBaseIds] }
+    const drops = this.drops.get(bindingId) ?? 0
     return this.operate(bindingId, async () => {
+      // An Off since the call wins, even over an activation queued behind a refresh.
+      if ((this.drops.get(bindingId) ?? 0) !== drops) return failure('binding_inactive')
       // Activating drops C in the daemon; it is pushed again afterwards.
-      this.wanted.set(bindingId, { credential: null })
-      return this.track(bindingId, await this.send(bindingId, 'PUT', ''))
+      this.wanted.set(bindingId, { endpoint: copy, credential: null })
+      this.confirmed.delete(bindingId)
+      return this.track(bindingId, await this.activation(bindingId))
     })
   }
 
-  deactivate(bindingId: string): Promise<HostResult> {
-    return this.operate(bindingId, async () => {
-      this.wanted.delete(bindingId)
-      return this.track(bindingId, await this.send(bindingId, 'DELETE', ''))
-    })
+  /** Whether the daemon on this connection has `bindingId` active, as wanted.
+   * Checks the connection first: a restarted daemon has nothing active yet,
+   * even before the timer's `sync()` notices it. */
+  isActive(bindingId: string): boolean {
+    this.sync()
+    return this.wanted.has(bindingId) && this.confirmed.has(bindingId)
+  }
+
+  /** Drops `bindingId` at once, ahead of anything queued for it (Off): it
+   * is no longer wanted, so a queued push, replay or activation sends
+   * nothing, and an activation still being retried stops. */
+  async deactivate(bindingId: string): Promise<HostResult> {
+    if (!validBindingId(bindingId)) return failure('invalid_binding')
+    if (!this.started) return failure('not_started')
+    this.drops.set(bindingId, (this.drops.get(bindingId) ?? 0) + 1)
+    this.wanted.delete(bindingId)
+    this.confirmed.delete(bindingId)
+    this.sync()
+    return this.track(bindingId, await this.send(bindingId, 'DELETE', ''))
   }
 
   pushCredential(bindingId: string, credential: KnowledgeCredential): Promise<HostResult> {
@@ -232,7 +266,7 @@ export class KnowledgeHost {
     const unsynced = this.unsynced
     if (!unsynced.has(bindingId)) return
     const wanted = this.wanted.get(bindingId)
-    const result = await this.send(bindingId, wanted ? 'PUT' : 'DELETE', '')
+    const result = wanted ? await this.activation(bindingId) : await this.send(bindingId, 'DELETE', '')
     if (!result.ok) {
       // A refusal will not change by asking again.
       if (!PASSING.includes(result.reason)) unsynced.delete(bindingId)
@@ -246,10 +280,23 @@ export class KnowledgeHost {
     unsynced.delete(bindingId)
   }
 
-  /** Sends one change, again under a new number while the daemon calls it stale. */
+  /** Sends the wanted activation, and records it as taken by this connection. */
+  private async activation(bindingId: string): Promise<HostResult> {
+    const key = this.connectionKey
+    const result = await this.send(bindingId, 'PUT', '', activationBody(this.wanted.get(bindingId)?.endpoint ?? null))
+    if (result.ok && key === this.connectionKey && this.wanted.has(bindingId)) this.confirmed.add(bindingId)
+    return result
+  }
+
+  /** Sends one change, again under a new number while the daemon calls it
+   * stale. A PUT stops once its binding is no longer the one wanted. */
   private async send(bindingId: string, method: 'PUT' | 'DELETE', suffix: string, body?: string): Promise<HostResult> {
     let last: Failure = 'stale_sequence'
+    const entry = this.wanted.get(bindingId)
     for (let attempt = 0; attempt < MAX_STALE_RETRIES; attempt++) {
+      // Overtaken: a later change of the binding wins, so a stale retry of
+      // an Off never drops an activation that came after it.
+      if (this.wanted.get(bindingId) !== entry || (method === 'PUT' && entry === undefined)) return failure('binding_inactive')
       const conn = this.deps.connection()
       if (!conn) return failure('daemon_unavailable')
       const path = `${BINDINGS}/${encodeURIComponent(bindingId)}${suffix}?seq=${this.deps.clock.next()}`
@@ -276,6 +323,10 @@ function classify(response: { status: number; code?: string }): Failure {
   if (response.code === 'binding_inactive') return 'binding_inactive'
   if (response.status === 503) return 'daemon_unavailable'
   return 'refused'
+}
+
+function activationBody(endpoint: KnowledgeEndpoint | null): string | undefined {
+  return endpoint ? JSON.stringify({ endpoint: endpoint.endpoint, knowledge_base_ids: endpoint.knowledgeBaseIds }) : undefined
 }
 
 function credentialBody(credential: KnowledgeCredential): string {

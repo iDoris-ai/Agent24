@@ -9,16 +9,32 @@ import { idorisErrors } from './IdorisPanel.i18n'
 
 type Status = components['schemas']['IdorisStatus']
 type Operation = components['schemas']['IdorisOperation']
-const initial: Status = { state: 'not_installed', version: null, data_port: null, admin_port: null, roles: [], last_error: null, current_operation: null, verification: null, budget_suggestion: null, budget_unavailable_reason: 'hardware_memory_unavailable' }
+const initial: Status = { state: 'not_installed', version: null, data_port: null, admin_port: null, roles: [], last_error: null, migration_pending: false, last_migration_error: null, current_operation: null, verification: null, budget_suggestion: null, budget_unavailable_reason: 'hardware_memory_unavailable' }
 const installed: Status = { ...initial, state: 'not_configured', version: '0.4.0' }
 const running: Status = { ...installed, state: 'running', data_port: 8740, admin_port: 8741, roles: ['daily'] }
 const candidate = (endpoint: string) => ({ endpoint, identity: 'omlx', authentication: 'ready', models: ['real/daily', 'real/deep'] })
-const operation = (action: Operation['action']): Operation => ({ operation_id: 'op-1', action, phase: 'queued', result: null, error_code: null, cancellable: true, idempotency_key: 'test' })
+const operation = (action: Operation['action']): Operation => ({ operation_id: 'op-1', action, phase: 'queued', result: null, error_code: null, cancellable: true })
 let status: Status
 let op: Operation
 let candidates: unknown
 let failure: string | null
+function idorisComponent(current: Status) {
+  const base = { id: 'idoris', version: current.version, form: 'resident', provides: [{ id: 'localModels' }] }
+  switch (current.state) {
+    case 'not_installed': return { ...base, state: 'absent' }
+    case 'not_configured': return { ...base, state: 'installed', reason: 'not_configured' }
+    case 'stopped': return { ...base, state: 'stopped' }
+    case 'starting': return { ...base, state: 'starting' }
+    case 'running': return { ...base, state: 'ready' }
+    case 'failed': return { ...base, state: 'failed' }
+    case 'instance_conflict': return { ...base, state: 'failed', reason: 'instance_conflict' }
+    default: return { ...base, state: 'failed' }
+  }
+}
 const respond = async (req: BackendProxyRequest) => {
+  if (req.path === '/api/v1/components' || req.path.startsWith('/api/v1/components?')) {
+    return { ok: true, status: 200, data: { components: [idorisComponent(status)] } }
+  }
   if (req.path.endsWith('/status')) return { ok: true, status: 200, data: status }
   if (req.path.includes('/omlx/candidates')) return { ok: true, status: 200, data: candidates }
   if (req.method === 'GET') return { ok: true, status: 200, data: op }
@@ -120,10 +136,13 @@ describe('iDoris daemon projection', () => {
     await waitFor(() => expect(proxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/idoris/install', body: { consent: true }, idempotencyKey: expect.any(String) })))
     expect(await screen.findByRole('button', { name: 'Cancel' })).toBeEnabled()
   })
-  it.each<Status['state']>(['not_configured', 'stopped', 'starting', 'running', 'failed', 'instance_conflict'])('renders daemon state %s', async (state) => {
+  it.each<[Status['state'], string]>([
+    ['not_configured', 'installed'], ['stopped', 'stopped'], ['starting', 'starting'],
+    ['running', 'ready'], ['failed', 'failed'], ['instance_conflict', 'failed'],
+  ])('renders component state for daemon %s', async (state, componentState) => {
     status = { ...running, state, last_error: state === 'instance_conflict' ? 'instance_conflict' : null }
     render(<IdorisPanel />)
-    expect(await screen.findByTestId('idoris-state')).toHaveAttribute('data-state', state)
+    expect(await screen.findByTestId('idoris-state')).toHaveAttribute('data-state', componentState)
     expect(screen.getByText(/0.4.0/)).toBeInTheDocument()
   })
   it('polls install phases and cancels the current daemon operation', async () => {
@@ -224,7 +243,7 @@ describe('iDoris daemon projection', () => {
     await screen.findByRole('button', { name: 'Stop' }); click('Stop')
     await screen.findByRole('progressbar')
     expect(proxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/idoris/stop', idempotencyKey: expect.any(String) }))
-    expect(screen.getByTestId('idoris-state')).toHaveAttribute('data-state', 'running')
+    expect(screen.getByTestId('idoris-state')).toHaveAttribute('data-state', 'ready')
   })
   it('does not connect unknown services even when they advertise models', async () => {
     status = installed; candidates = { key_from_local_settings: false, candidates: [{ ...candidate('http://127.0.0.1:8088'), identity: 'unknown_service' }] }

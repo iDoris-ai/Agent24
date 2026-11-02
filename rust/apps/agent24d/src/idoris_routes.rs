@@ -36,6 +36,8 @@ pub async fn status(State(state): State<AppState>) -> Response {
             verification: None,
             budget_suggestion: None,
             budget_unavailable_reason: Some("host_unavailable".into()),
+            migration_pending: false,
+            last_migration_error: None,
         },
     };
     Json(status).into_response()
@@ -57,7 +59,7 @@ async fn submit(state: AppState, headers: HeaderMap, action: Action) -> Response
         Err(_) => return failure(Code::InvalidRequest),
     };
     match host.submit(action, key).await {
-        Ok(op) => (axum::http::StatusCode::ACCEPTED, Json(op)).into_response(),
+        Ok(op) => (axum::http::StatusCode::ACCEPTED, Json(op.view())).into_response(),
         Err(code) => failure(code),
     }
 }
@@ -80,7 +82,7 @@ pub async fn install(
     };
     let key = headers.get("Idempotency-Key").and_then(|k| k.to_str().ok());
     match host.install(request, key).await {
-        Ok(op) => (axum::http::StatusCode::ACCEPTED, Json(op)).into_response(),
+        Ok(op) => (axum::http::StatusCode::ACCEPTED, Json(op.view())).into_response(),
         Err(code) => failure(code),
     }
 }
@@ -97,7 +99,7 @@ pub async fn connect(
     };
     let key = headers.get("Idempotency-Key").and_then(|k| k.to_str().ok());
     match host.connect(request, key).await {
-        Ok(op) => (axum::http::StatusCode::ACCEPTED, Json(op)).into_response(),
+        Ok(op) => (axum::http::StatusCode::ACCEPTED, Json(op.view())).into_response(),
         Err(code) => failure(code),
     }
 }
@@ -123,7 +125,7 @@ pub async fn operation(State(state): State<AppState>, Path(id): Path<String>) ->
         return failure(Code::NotFound);
     };
     match host.operation(&id).await {
-        Ok(op) => Json(op).into_response(),
+        Ok(op) => Json(op.view()).into_response(),
         Err(code) => failure(code),
     }
 }
@@ -132,7 +134,7 @@ pub async fn cancel(State(state): State<AppState>, Path(id): Path<String>) -> Re
         return failure(Code::NotFound);
     };
     match host.cancel(&id).await {
-        Ok(op) => Json(op).into_response(),
+        Ok(op) => Json(op.view()).into_response(),
         Err(code) => failure(code),
     }
 }
@@ -188,7 +190,13 @@ mod tests {
                     &method,
                     &path.replace("operations/missing", "operations/{id}"),
                 ),
-                crate::capabilities::Operation::from_action("idoris.lifecycle")
+                crate::capabilities::Operation::from_action(
+                    if method == Method::GET && !path.ends_with("/candidates") {
+                        "idoris.read"
+                    } else {
+                        "idoris.lifecycle"
+                    }
+                )
             );
         }
     }
@@ -202,7 +210,13 @@ mod tests {
             ManagedIdoris::new(state.router.clone(), temp.path().join("connection.json")).unwrap(),
         );
         state.idoris_host = Some(
-            IdorisHost::system(temp.path().to_path_buf(), managed, state.router.clone()).unwrap(),
+            IdorisHost::system(
+                temp.path().to_path_buf(),
+                temp.path().to_path_buf(),
+                managed,
+                state.router.clone(),
+            )
+            .unwrap(),
         );
         let app = crate::server::build_router(state);
         for (path, body, expected, code) in [

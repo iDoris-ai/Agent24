@@ -836,8 +836,8 @@ EOF 时以 `0` 退出（正常、预期的关闭，不是崩溃）——两种�
 
 ### 7.3 SIGTERM / SIGKILL
 
-守护进程停止一个模块时：先 SIGTERM，等待一段宽限期（daemon 整体停机时默认 `A24_MODULE_STOP_GRACE_MS
-= 500ms`，可调 100–5000ms；单模块级停止另有默认 3 秒的宽限），宽限期满后 SIGKILL 整个进程组。
+守护进程停止一个模块时：先 SIGTERM，等待一段宽限期（daemon 整体停机时默认 `A24_COMPONENT_STOP_GRACE_MS
+= 15000ms`（旧名 `A24_MODULE_STOP_GRACE_MS` 为别名，保留一版；ADR-038 D5），可调 100–30000ms；单模块级停止另有默认 3 秒的宽限），宽限期满后 SIGKILL 整个进程组。
 daemon 整体停机时还有一段更早的 drain 期（默认 `A24_MODULE_DRAIN_MS = 800ms`，可调至 10 秒）——
 这段时间内代理层不再准入新请求，但回调通道仍然服务在途请求的回调。**模块收到 SIGTERM 后应尽快
 flush 掉能 flush 的状态并退出**——默认参数下从 SIGTERM 到 SIGKILL 大约有几百毫秒到几秒的窗口，

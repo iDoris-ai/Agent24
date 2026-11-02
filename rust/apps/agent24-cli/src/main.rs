@@ -70,6 +70,12 @@ enum Command {
     },
     /// List models known to the daemon
     Models,
+    /// Lifecycle state of every component: iDoris, Hyphae, attached modules, Documents,
+    /// Knowledge, Open Design (ADR-038 D5)
+    Components {
+        #[command(subcommand)]
+        action: ComponentsAction,
+    },
     /// Install, run and connect managed iDoris through the daemon
     Idoris {
         #[command(subcommand)]
@@ -369,6 +375,11 @@ enum OsAttachAction {
 /// `agent24 comm …` (COMM-2a/2b; COMM-HYPHAE.md §4's CLI/REST 1:1 mapping).
 #[derive(Subcommand)]
 enum CommAction {
+    /// Download, verify, and set up the pinned Hyphae component
+    Install {
+        #[arg(long)]
+        json: bool,
+    },
     /// 群聊管理与消息投递
     Groups {
         #[command(subcommand)]
@@ -617,7 +628,7 @@ fn shutdown_lines(r: &agent24_protocol::ShutdownReport) -> Vec<String> {
     if let Some(last) = &r.last_shutdown {
         if !last.killed_after_grace.is_empty() {
             out.push(format!(
-                "  SIGKILLed after their stop grace: {} — raise A24_MODULE_STOP_GRACE_MS \
+                "  SIGKILLed after their stop grace: {} — raise A24_COMPONENT_STOP_GRACE_MS \
                  (then re-run `agent24 service install` for the launchd service)",
                 last.killed_after_grace.join(", ")
             ));
@@ -720,6 +731,7 @@ fn parse_ready_state(value: &serde_json::Value, pid: u32) -> Result<DaemonState,
         auth_mode,
         protocol_version,
         enroll_endpoint: value["enroll_endpoint"].as_str().map(str::to_owned),
+        startup_state: None,
     };
     state
         .validate()
@@ -1267,6 +1279,68 @@ async fn cmd_chat(req: ChatRequest) -> Result<(), String> {
             }
             Err(format!("daemon returned {status}: {body}"))
         }
+        Err(e) => Err(e.to_string()),
+    };
+    finish(ep).await;
+    out
+}
+
+#[derive(Subcommand)]
+enum ComponentsAction {
+    /// One line per component: id, state, version and the capabilities it provides. With a
+    /// capability token the daemon returns the redacted view (no reasons, ports or paths); in
+    /// legacy auth mode it returns the full view, which `--json` prints whole.
+    List {
+        /// 原样输出完整 JSON 响应
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+fn component_lines(body: &serde_json::Value) -> Vec<String> {
+    body["components"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|c| {
+                    let provides: Vec<&str> = c["provides"]
+                        .as_array()
+                        .map(|p| p.iter().filter_map(|p| p["id"].as_str()).collect())
+                        .unwrap_or_default();
+                    format!(
+                        "{:<12} {:<12} {:<10} {}",
+                        c["id"].as_str().unwrap_or("?"),
+                        c["state"].as_str().unwrap_or("?"),
+                        c["version"].as_str().unwrap_or("-"),
+                        provides.join(",")
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn cmd_components(action: ComponentsAction) -> Result<(), String> {
+    let ComponentsAction::List { json } = action;
+    let ep = connect().await?;
+    let result = bearer(&ep, client().get(format!("{}/api/v1/components", ep.base)))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+    let out = match result {
+        Ok(res) if res.status().is_success() => {
+            let body: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+            if json {
+                println!("{body}");
+            } else {
+                for line in component_lines(&body) {
+                    println!("{line}");
+                }
+            }
+            Ok(())
+        }
+        Ok(res) => Err(format!("daemon returned {}", res.status())),
         Err(e) => Err(e.to_string()),
     };
     finish(ep).await;
@@ -1957,7 +2031,11 @@ async fn cmd_comm(action: CommAction, json: bool) -> Result<(), String> {
     // `send`/`outbox retry` can take up to `5s × 8 relays + 10s = 50s`
     // server-side (COMM-HYPHAE.md §3); give those two a generous timeout too
     // rather than the default 15s.
-    let timeout = if matches!(action, CommAction::Unlock { .. }) {
+    let installing = matches!(action, CommAction::Install { .. });
+    let install_json = matches!(action, CommAction::Install { json: true });
+    let timeout = if installing {
+        Duration::from_secs(360)
+    } else if matches!(action, CommAction::Unlock { .. }) {
         Duration::from_secs(30)
     } else if matches!(action, CommAction::Import { .. }) {
         Duration::from_secs(120)
@@ -1973,15 +2051,23 @@ async fn cmd_comm(action: CommAction, json: bool) -> Result<(), String> {
     } else {
         Duration::from_secs(15)
     };
+    let json = json || install_json;
+    if installing && !json {
+        eprintln!("正在下载并校验 Hyphae，随后设置通信服务…");
+    }
     let (method, path, body) = comm_request(action)?;
     let mut body = CommRequestBody(body);
 
     let ep = connect().await.map_err(|e| {
         format!("{e}\n  `agent24 comm` always goes through the daemon — there is no offline path")
     })?;
-    let result = execute_comm(&ep, method, &path, &mut body, timeout, json).await;
+    let result = execute_comm(&ep, method, &path, &mut body, timeout, json && !installing).await;
     finish(ep).await;
-    println!("{}", result?);
+    let output = result?;
+    if installing && !json {
+        eprintln!("Hyphae 安装完成。");
+    }
+    println!("{output}");
     Ok(())
 }
 
@@ -1989,6 +2075,11 @@ fn comm_request(
     action: CommAction,
 ) -> Result<(reqwest::Method, String, Option<serde_json::Value>), String> {
     Ok(match action {
+        CommAction::Install { .. } => (
+            reqwest::Method::POST,
+            "/api/v1/comm/install".to_owned(),
+            None,
+        ),
         CommAction::Groups { action } => comm_groups::request(action),
         CommAction::Import { from, yes, dry_run } => {
             let password = if dry_run {
@@ -2738,11 +2829,12 @@ fn print_os(list: &agent24_protocol::DomainOsList) {
 /// release its singleton lock before giving up and saying so. `POST
 /// /shutdown` returns as soon as shutdown is REQUESTED — draining modules,
 /// persisting the shutdown summary and the runtime's own teardown all still
-/// run after that. `lifecycle.rs`'s real worst case is ~15.7s (10s drain +
-/// 5s stop grace + ~0.5s persistence/teardown margin, modules draining
-/// concurrently via a `JoinSet`, not sequentially); 30s leaves close to a
-/// full extra margin over that on top.
-const STOP_CONFIRM_BUDGET: Duration = Duration::from_secs(30);
+/// run after that. The budgets are tunable, so the bound is the worst case with
+/// every knob at its cap (10s drain + 30s stop grace, or a managed iDoris's 50s,
+/// plus ~1s of tail), plus a margin: `agent24_protocol::shutdown_bounds`, shared
+/// with the daemon's `lifecycle.rs` and the LaunchAgent's `ExitTimeOut`.
+const STOP_CONFIRM_BUDGET: Duration =
+    Duration::from_secs(agent24_protocol::shutdown_bounds::WAIT_SECS);
 
 /// Waits until the daemon that was just asked to stop has actually released
 /// its singleton lock — the SAME lock `agent24 daemon start` will contend
@@ -3013,6 +3105,7 @@ async fn main() -> std::process::ExitCode {
         Command::Service { action } => cmd_service(action),
         Command::Tui => cmd_tui().await,
         Command::Os { action } => cmd_os(action).await,
+        Command::Components { action } => cmd_components(action).await,
         Command::Documents { action } => documents::cmd_documents(action).await,
         Command::Comm { action, json } => cmd_comm(action, json).await,
         Command::ModuleConsents { action } => module_tools::run(action).await,
@@ -3053,6 +3146,20 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn components_list_prints_id_state_version_and_capabilities() {
+        let body = serde_json::json!({"components": [
+            {"id": "hyphae", "state": "ready", "version": "v0.28.1",
+             "provides": [{"id": "nostr-dm"}, {"id": "nostr-group"}]},
+            {"id": "open-design", "state": "absent", "version": null, "provides": []},
+        ]});
+        let lines = component_lines(&body);
+        assert!(lines[0].starts_with("hyphae") && lines[0].ends_with("nostr-dm,nostr-group"));
+        assert!(lines[0].contains(" ready ") && lines[0].contains("v0.28.1"));
+        assert!(lines[1].contains(" absent ") && lines[1].contains(" - "));
+        assert!(component_lines(&serde_json::json!({})).is_empty());
+    }
 
     /// No HOME, no store to reach: the command stands (ADR-K1-03 §3, review
     /// G3; the `A24_OS_PACKAGES` install the CLI documents for containers),
@@ -3723,6 +3830,29 @@ mod tests {
     }
 
     #[test]
+    fn comm_install_has_json_mode_and_no_url_or_hash_overrides() {
+        let cli = Cli::try_parse_from(["agent24", "comm", "install", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Comm {
+                action: CommAction::Install { json: true },
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "agent24",
+                "comm",
+                "install",
+                "--url",
+                "https://evil.invalid"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["agent24", "comm", "install", "--sha256", "abc"]).is_err());
+    }
+
+    #[test]
     fn comm_unlock_has_only_the_remember_flag() {
         let cli = Cli::try_parse_from(["agent24", "comm", "unlock", "--remember"]).unwrap();
         assert!(matches!(
@@ -3889,7 +4019,7 @@ mod tests {
         assert!(lines.contains("drain 800ms · stop grace 500ms · exits within 2000ms of SIGTERM"));
         assert!(lines.contains("! A24_MODULE_DRAIN_MS"));
         assert!(lines.contains("previous shutdown: clean (1120ms)"));
-        assert!(lines.contains("slow — raise A24_MODULE_STOP_GRACE_MS"));
+        assert!(lines.contains("slow — raise A24_COMPONENT_STOP_GRACE_MS"));
         assert!(lines.contains("busy (3) — raise A24_MODULE_DRAIN_MS"));
 
         let unconfirmed = agent24_protocol::ShutdownReport {

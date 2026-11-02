@@ -8,6 +8,15 @@
 #   SKIP_NOTARIZE=1        只签名不公证（本地快速试；此时不做 spctl 的 Notarized 断言）
 #   CARGO_TARGET_DIR       Rust 产物目录（默认 rust/target）；产物会被复制到 rust/target/release 供打包引用
 #   AGENT24_ARCH           目标架构，默认 arm64（可选 x64，需在对应机器/交叉工具链上）
+#   A24_RELEASE_TAG        【必填】本次要发布的 GitHub release tag（如 v0.6.0-preview.20261028.10）。
+#                          Open Design 按需组件的下载 URL = releases/download/<tag>/<资产>，写进包内清单；
+#                          不会回退到 package.json 的版本（那个 tag 不存在，用户会 404）。
+#   A24_OPEN_DESIGN_SOURCE_DIR  Open Design 源码 checkout，默认 ~/Dev/auraai/open-design-agent24，必须在固定 sha
+#   A24_OPEN_DESIGN_RESOURCES_DIR  可选：已用 prepare-open-design-linux-resources.mjs 备好的 Resources 目录，
+#                          设了就跳过 tools-pack 与 prepare（省约 5 分钟，复跑时用）。
+#                          源码 checkout 仍要干净且 HEAD 等于 pin：后面会重建原生模块。
+#   A24_DMG_MAX_MB         DMG 体积上限，默认 250（防止 Open Design 被重新打进包）
+# 产物：release/*.dmg（只含清单）与 .open-design-component-dist/open-design-*.tar.gz（要上传到同一 release 的资产）
 set -euo pipefail
 
 SIGN_IDENTITY="${AGENT24_SIGN_IDENTITY:-Developer ID Application: Huifeng Jiao (HYAP444FN9)}"
@@ -17,11 +26,44 @@ ARCH="${AGENT24_ARCH:-arm64}"
 DESKTOP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd "$DESKTOP_DIR/../.." && pwd)"
 VERIFY="$REPO_ROOT/scripts/verify-mac-signing.sh"
+OD_RELEASE="$DESKTOP_DIR/scripts/open-design-mac-release.mjs"
+OD_SOURCE_DIR="${A24_OPEN_DESIGN_SOURCE_DIR:-$HOME/Dev/auraai/open-design-agent24}"
+OD_WORK_DIR="$DESKTOP_DIR/.open-design-build"
+OD_STAGE_DIR="$DESKTOP_DIR/.open-design-resources"
+OD_MANIFEST_DIR="$DESKTOP_DIR/.open-design-component"        # 唯一被 extraResources 打进包的目录：只放清单
+OD_TARBALL_DIR="$DESKTOP_DIR/.open-design-component-dist"    # tarball 放这里，绝不能在上面那个目录里（C1）
+ENTITLEMENTS="$DESKTOP_DIR/build/entitlements.mac.plist"
 
 step() { printf '\n==> %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# verify 的行为测试用 A24_OD_SKIP_CODESIGN=1 跳过 tarball 解包后的 codesign。
+# 正式发布不能继承这个开关：非空直接退出。调用 verify 时还会再把它清空。
+if [[ -n "${A24_OD_SKIP_CODESIGN:-}" ]]; then
+  die "A24_OD_SKIP_CODESIGN 不能用于正式发布（当前：${A24_OD_SKIP_CODESIGN}）"
+fi
+
+# 公共实现是 open-design-mac-release.mjs 的 checkOpenDesignSource：
+# git status --porcelain 为空，且 HEAD 等于 pin。prepare 写 stamp 前、
+# rebuild-open-design-native 入口也会调它。复用 Resources 只跳过 tools-pack / prepare。
+require_open_design_source() {
+  node "$OD_RELEASE" check-source "$OD_SOURCE_DIR" >/dev/null \
+    || die "Open Design 源码不在固定 sha，或工作区不干净：$OD_SOURCE_DIR"
+}
+
+# 调用方点名了 checkout 时先检查，放在「只能在 macOS」之前：复用路径的集成反例
+# 在 Linux 上也能对脏工作区失败，而不会被平台检查挡住。没点名时仍走下面的 Darwin 检查。
+if [[ -n "${A24_OPEN_DESIGN_SOURCE_DIR:-}" ]]; then
+  require_open_design_source
+fi
+
 [[ "$(uname -s)" == "Darwin" ]] || die "只能在 macOS 上运行"
+
+# 默认 checkout（未设置 A24_OPEN_DESIGN_SOURCE_DIR）也要查。上面查过的再查一次，结果相同。
+# 放在签名身份和 cargo 之前，脏 pin 不必等 keychain。
+[[ -n "${A24_RELEASE_TAG:-}" ]] || die "必须设置 A24_RELEASE_TAG（本次发布的 GitHub tag，如 v0.6.0-preview.20261028.10）。清单里的下载 URL 要指向真实存在的 release，不能默认用 package.json 的版本"
+OD_APP_VERSION="$(node "$OD_RELEASE" version "$A24_RELEASE_TAG")" || exit 1
+require_open_design_source
 
 step "0/6 前置检查"
 security find-identity -v -p codesigning | grep -F "${SIGN_IDENTITY}" >/dev/null \
@@ -30,6 +72,7 @@ if [[ "${SKIP_NOTARIZE:-0}" != "1" ]]; then
   xcrun notarytool history --keychain-profile "${NOTARY_PROFILE}" >/dev/null \
     || die "notarytool profile 不可用：${NOTARY_PROFILE}（见 docs/Deployment/MACOS-SIGNING.md）"
 fi
+echo "release tag: $A24_RELEASE_TAG  -> 组件清单版本 $OD_APP_VERSION"
 # electron-builder 的 identity 不能带 "Developer ID Application:" 前缀
 BUILDER_IDENTITY="${SIGN_IDENTITY#Developer ID Application: }"
 # S3：cargo 产物路径按 <target>/release 读取，下面两种环境会导致读到陈旧产物或解析错目录
@@ -57,12 +100,82 @@ cd "$DESKTOP_DIR"
 pnpm --filter @agent24/node-daemon build
 pnpm build
 
+step "2b/6 Open Design 按需组件（darwin-${ARCH}：构建 → 签名原生模块 → 公证 → 打 tarball + 清单）"
+[[ "${ARCH}" == "arm64" ]] || die "Open Design 组件目前只支持 arm64（AGENT24_ARCH=${ARCH}）"
+# 先清掉陈旧产物：旧清单 / 旧 tarball 绝不能混进这次的包
+rm -rf "$OD_MANIFEST_DIR" "$OD_TARBALL_DIR" "$OD_STAGE_DIR"
+if [[ -n "${A24_OPEN_DESIGN_RESOURCES_DIR:-}" ]]; then
+  OD_RESOURCES="$A24_OPEN_DESIGN_RESOURCES_DIR"
+  # 复用跳过了 check-source。stamp 是这份树的出处，必须和 pin 一致。
+  node "$OD_RELEASE" check-resources "$OD_RESOURCES" >/dev/null || die "复用的 Open Design Resources 缺少 .agent24-od-source.json，或 sha / 版本 / 内容摘要与 pin 不符：$OD_RESOURCES"
+  echo "复用已备好的 Open Design Resources：$OD_RESOURCES"
+else
+  rm -rf "$OD_WORK_DIR"
+  mkdir -p "$OD_WORK_DIR"
+  ( cd "$OD_SOURCE_DIR" && pnpm --filter @open-design/tools-pack dev mac build --to app --portable \
+      --namespace agent24-release --dir "$OD_WORK_DIR/pack" --json > "$OD_WORK_DIR/tools-pack.json" )
+  OD_APP="$(find "$OD_WORK_DIR/pack" -type d -name 'Open Design.app' -path '*/builder/mac-arm64/*' -print -quit)"
+  [[ -n "$OD_APP" ]] || die "tools-pack 没有产出 Open Design.app"
+  OD_RESOURCES="$OD_APP/Contents/Resources"
+  node "$DESKTOP_DIR/scripts/prepare-open-design-linux-resources.mjs" "$OD_SOURCE_DIR" "$OD_RESOURCES"
+fi
+A24_OPEN_DESIGN_RESOURCES_DIR="$OD_RESOURCES" pnpm stage:open-design
+# 与 release-desktop.yml 的 prune 步骤一致（只删可证明运行时不加载的东西）
+find "$OD_STAGE_DIR" -name '*.map' -delete
+rm -rf "$OD_STAGE_DIR/app/node_modules/@open-design/web" "$OD_STAGE_DIR/app/node_modules/next" \
+  "$OD_STAGE_DIR/app/node_modules/@next" "$OD_STAGE_DIR/app/node_modules/openai" \
+  "$OD_STAGE_DIR/app/node_modules/react" "$OD_STAGE_DIR/app/node_modules/react-dom"
+A24_OPEN_DESIGN_SOURCE_DIR="$OD_SOURCE_DIR" pnpm rebuild:open-design-native
+# 组件的 daemon 跑在 app 自己的二进制里（ELECTRON_RUN_AS_NODE），app 开了 Hardened Runtime 且没有
+# disable-library-validation，所以组件里每个 .node/.dylib 必须同 Team ID 签名，否则下载成功也加载不了
+node "$OD_RELEASE" sign "$OD_STAGE_DIR" "$SIGN_IDENTITY" "$ENTITLEMENTS"
+# 先打 tar，再从这份 tar 解出副本去做公证 zip。两边不再同时读可变的 stage，
+# 公证登记的字节就是用户稍后下载的那一份。
+A24_OD_REPOSITORY=iDoris-ai/Agent24 A24_OD_STAGE_DIR="$OD_STAGE_DIR" A24_OD_PACK_OUT_DIR="$OD_MANIFEST_DIR" A24_OD_TARBALL_OUT_DIR="$OD_TARBALL_DIR" \
+  A24_OD_APP_VERSION="$OD_APP_VERSION" A24_OD_PLATFORM=darwin A24_OD_ARCH="${ARCH}" pnpm pack:open-design
+OD_TARBALL="$(find "$OD_TARBALL_DIR" -maxdepth 1 -name 'open-design-*.tar.gz' -print -quit)"
+[[ -f "$OD_TARBALL" ]] || die "未生成 Open Design tarball"
+echo "open-design tarball: $OD_TARBALL"
+if [[ "${SKIP_NOTARIZE:-0}" != "1" ]]; then
+  # 组件由 app 自己 fetch，没有 quarantine 标记，Gatekeeper 不会评估它，加载只看 Team ID。
+  # 仍提交公证：zip 里的 Mach-O 会按 cdhash 登记公证票据，用户若改用浏览器手动下载资产（带 quarantine）也能放行。
+  # 松散文件无法 staple，所以这只是登记，没有产物要回写。
+  # zip 的输入是 tarball 的解压副本，不是 stage 目录本身。
+  OD_NOTARY_SRC="$OD_WORK_DIR/open-design-notarize-src"
+  mkdir -p "$OD_WORK_DIR"
+  rm -rf "$OD_NOTARY_SRC"
+  mkdir -p "$OD_NOTARY_SRC"
+  tar -xzf "$OD_TARBALL" -C "$OD_NOTARY_SRC"
+  [[ -n "$(find "$OD_NOTARY_SRC" -type f -print -quit)" ]] || die "从 tarball 解出的公证副本是空的"
+  OD_NOTARY_ZIP="$OD_WORK_DIR/open-design-notarize.zip"
+  rm -f "$OD_NOTARY_ZIP"
+  ditto -c -k --sequesterRsrc "$OD_NOTARY_SRC" "$OD_NOTARY_ZIP"
+  OD_SUBMIT_JSON="$OD_WORK_DIR/open-design-notarize-submit.json"
+  xcrun notarytool submit "$OD_NOTARY_ZIP" --keychain-profile "${NOTARY_PROFILE}" --wait --output-format json | tee "$OD_SUBMIT_JSON"
+  OD_STATUS="$(/usr/bin/plutil -extract status raw -o - "$OD_SUBMIT_JSON")"
+  OD_SUB_ID="$(/usr/bin/plutil -extract id raw -o - "$OD_SUBMIT_JSON")"
+  if [[ "$OD_STATUS" != "Accepted" ]]; then
+    xcrun notarytool log "$OD_SUB_ID" --keychain-profile "${NOTARY_PROFILE}" || true
+    die "Open Design 组件公证未通过：status=$OD_STATUS id=$OD_SUB_ID"
+  fi
+  echo "Open Design 组件公证 submission id: $OD_SUB_ID"
+  rm -f "$OD_NOTARY_ZIP"
+  rm -rf "$OD_NOTARY_SRC"
+fi
+
 step "3/6 electron-builder 打包 + 签名（${ARCH}，Hardened Runtime）"
 rm -rf "$DESKTOP_DIR/release"
 pnpm exec electron-builder --mac "--${ARCH}" -c.mac.identity="$BUILDER_IDENTITY"
 DMG="$(find "$DESKTOP_DIR/release" -maxdepth 1 -name '*.dmg' -print | head -n1)"
 [[ -f "$DMG" ]] || die "未生成 dmg"
 echo "dmg: $DMG"
+
+step "3b/6 验证 Open Design 不在包内、只带清单（C1）"
+# 启动检查已经拒绝非空的 A24_OD_SKIP_CODESIGN。这里再清空后调用，
+# 避免 verify 继承测试开关、跳过 tarball 解包后的 codesign。
+A24_OD_SKIP_CODESIGN= bash "$DESKTOP_DIR/scripts/verify-mac-open-design.sh" \
+  "$(find "$DESKTOP_DIR/release" -maxdepth 2 -type d -name 'Agent24.app' -print -quit)" \
+  "$DMG" "$OD_TARBALL_DIR" "$OD_APP_VERSION"
 
 if [[ "${SKIP_NOTARIZE:-0}" == "1" ]]; then
   step "4-5/6 已跳过公证与 staple（SKIP_NOTARIZE=1）"
@@ -92,3 +205,6 @@ bash "$VERIFY" ${EXPECT[@]+"${EXPECT[@]}"} --arch "${ARCH}" "$DMG"
 ( cd "$DESKTOP_DIR/release" && shasum -a 256 "$(basename "$DMG")" > SHA256SUMS && cat SHA256SUMS )
 echo
 echo "完成：$DMG"
+echo "Open Design 组件资产（须上传到 release ${A24_RELEASE_TAG}）：$OD_TARBALL"
+echo "gh release upload \"${A24_RELEASE_TAG}\" \"${OD_TARBALL}\" -R iDoris-ai/Agent24"
+echo "必做：出 preview 前，必须在当前 head 的签名包上，用本地测试源重跑一遍下载 → 安装 → 启动（见 docs/Deployment/MACOS-SIGNING.md）"

@@ -354,6 +354,22 @@ describe('App', () => {
       (c) => c[0].path === '/api/v1/chat',
     )?.[0].body.session_id
     expect(secondSessionId).toBe(firstSessionId)
+
+    // Issue #1517: an explicit new chat still works inside the always-mounted
+    // page, and switching pages afterwards keeps the NEW conversation.
+    fireEvent.click(screen.getByRole('button', { name: '新对话' }))
+    expect(screen.queryByText('hello there')).not.toBeInTheDocument()
+    mockBackendProxy.mockClear()
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), { target: { value: 'fresh topic' } })
+    fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('fresh topic')).toBeInTheDocument())
+    const thirdSessionId = mockBackendProxy.mock.calls.find(
+      (c) => c[0].path === '/api/v1/chat',
+    )?.[0].body.session_id
+    expect(thirdSessionId).not.toBe(firstSessionId)
+    fireEvent.click(screen.getByRole('button', { name: '能力中心' }))
+    fireEvent.click(within(screen.getByRole('navigation', { name: '主导航' })).getByRole('button', { name: '助手' }))
+    await waitFor(() => expect(screen.getByText('fresh topic')).toBeVisible())
   })
 })
 
@@ -417,7 +433,10 @@ describe('App navigation integration', () => {
       expect(screen.getByRole('tab', { name: tab, selected: true })).toBeInTheDocument()
       expect(screen.getByRole('tabpanel', { name: tab })).toBeInTheDocument()
       if (tab === 'Activity') expect(screen.getByRole('group', { name: 'Activity summary' })).toBeInTheDocument()
-      else expect(screen.getByLabelText('Language')).toBeInTheDocument()
+      else {
+        expect(screen.getByLabelText('Language')).toBeInTheDocument()
+        expect(document.getElementById('settings-pinned-slots')).not.toHaveAttribute('data-highlighted')
+      }
       expect(screen.queryByRole('navigation', { name: 'Breadcrumb' })).not.toBeInTheDocument()
     }
     fireEvent.click(screen.getByRole('tab', { name: 'Activity' }))
@@ -427,6 +446,7 @@ describe('App navigation integration', () => {
     expect(screen.getByText('Settings', { selector: '.page-title' })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: 'General', selected: true })).toBeInTheDocument()
     expect(screen.getByTestId('slot-count')).toHaveTextContent('3')
+    expect(document.getElementById('settings-pinned-slots')).toHaveAttribute('data-highlighted', 'true')
   })
 
   it('opens the Voice capability from its Settings tab', async () => {
@@ -449,21 +469,27 @@ describe('App navigation integration', () => {
     }
   })
 
-  it('keeps default status labels when iDoris and Hyphae status cannot be obtained', async () => {
+  it('shows an explicit unavailable status when the component list cannot be read', async () => {
     mockBackendProxy.mockResolvedValue({ ok: false, status: 503, data: null })
     await act(async () => { render(<App />) })
     await act(async () => { center() })
-    for (const name of ['Local models', 'Communication']) {
-      expect(row(name).getByText('Open', { selector: '.cap-status' })).toBeInTheDocument()
+    for (const name of ['Local models', 'Communication', 'Voice']) {
+      expect(row(name).getByText('Status unavailable', { selector: '.cap-status' })).toBeInTheDocument()
     }
   })
 
   it('shows approval badges and known iDoris and Hyphae status in the center', async () => {
     mockBackendProxy.mockImplementation(({ path }: { path: string }) => Promise.resolve({ ok: true, status: 200, data:
       path.includes('/approvals?') ? { approvals: [{ id: 'one' }, { id: 'two' }] }
+        : path === '/api/v1/components' ? {
+          components: [
+            { id: 'idoris', version: '0.4.0', state: 'installed', reason: 'not_configured', form: 'cli', provides: [] },
+            { id: 'hyphae', version: '1', state: 'ready', form: 'resident', provides: [] },
+          ],
+        }
         : path === '/api/v1/idoris/status' ? {
           state: 'not_configured', version: '0.4.0', data_port: null, admin_port: null,
-          roles: [], last_error: null, current_operation: null, verification: null,
+          roles: [], last_error: null, migration_pending: false, last_migration_error: null, current_operation: null, verification: null,
           budget_suggestion: null, budget_unavailable_reason: 'hardware_memory_unavailable',
         } satisfies IdorisStatus
         : path === '/api/v1/comm/daemon' ? { ok: true, data: {

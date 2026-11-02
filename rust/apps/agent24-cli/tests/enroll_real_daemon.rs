@@ -142,6 +142,34 @@ impl Host {
         (status, serde_json::from_str(body).unwrap())
     }
 
+    /// Run the real CLI with `args`, under the same isolation as [`Self::add`].
+    fn cli(&self, args: &[&str]) -> Output {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_agent24"))
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", self._home.path())
+            .env(
+                "AGENT24D_BIN",
+                self._home.path().join("no-ephemeral-daemon"),
+            )
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("real CLI exceeded integration deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child.wait_with_output().unwrap()
+    }
+
     fn add(&self) -> Output {
         let manifest = self._home.path().join("agentear.yml");
         std::fs::write(&manifest, manifest_text("agentear")).unwrap();
@@ -235,4 +263,46 @@ fn real_capabilities_attach_deny_has_no_registration() {
     let (status, list) = host.request("GET", "/api/v1/attached", &Value::Null);
     assert_eq!(status, 200);
     assert!(list["modules"].as_array().unwrap().is_empty());
+}
+
+/// I-1: `idoris status` enrols with the real daemon and reads the everyday
+/// status route with the first-party token, without an approval.
+#[test]
+fn real_capabilities_idoris_status_json() {
+    let host = Host::start("deny");
+    let out = host.cli(&["idoris", "status", "--json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout={stdout} stderr={stderr}");
+    assert_eq!(out.stdout.iter().filter(|b| **b == b'\n').count(), 1);
+    let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let (status, baseline) = host.request("GET", "/api/v1/idoris/status", &Value::Null);
+    assert_eq!(status, 200, "baseline ProductHost status: {baseline}");
+    assert_eq!(body["state"], baseline["state"], "{body}");
+    assert!(!stderr.contains("Waiting for approval"), "{stderr}");
+}
+
+/// I-1: an elevated iDoris route through the real daemon's presence path.
+/// Approved, the request reaches the lifecycle handler; denied, it does not.
+#[test]
+fn real_capabilities_idoris_stop_elevates() {
+    for decision in ["allow", "deny"] {
+        let host = Host::start(decision);
+        let out = host.cli(&["idoris", "stop", "--json"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Waiting for approval in the Agent24 app"),
+            "{stderr}"
+        );
+        let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+        if decision == "allow" {
+            assert!(out.status.success(), "stdout={stdout} stderr={stderr}");
+            assert_eq!(body["action"], "stop", "{body}");
+            assert_eq!(body["result"], "succeeded", "{body}");
+        } else {
+            assert!(!out.status.success(), "stdout={stdout}");
+            assert_eq!(body["error"]["code"], "presence_denied", "{body}");
+        }
+    }
 }

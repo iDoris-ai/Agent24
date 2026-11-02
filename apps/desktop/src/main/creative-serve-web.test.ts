@@ -409,6 +409,7 @@ describe('CreativeServeWeb', () => {
       { state: 'ready', origin: 'http://127.0.0.1:17456' },
     ])
     expect(spawnFn).toHaveBeenCalledTimes(1)
+    expect(service.headlessSidecarState()).toBeNull()
     await service.stop()
   })
 
@@ -481,6 +482,68 @@ describe('CreativeServeWeb', () => {
       resourceSafeBase: fs.realpathSync(componentDir),
     })
     await service.stop()
+  })
+
+  it('reports headless sidecar phases and clears them after a clean stop', async () => {
+    const { resources: componentDir, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const child = new FakeChild()
+    const service = new CreativeServeWeb(
+      {
+        stateRoot,
+        runtimeExecutable,
+        readyTimeoutMs: 500,
+        component: { status: () => ({ state: 'installed', dir: componentDir }) },
+      },
+      vi.fn(() => child as unknown as ChildProcess) as never,
+      vi.fn(async () => new Response('{}', { status: 200 })),
+    )
+    const starting = service.start()
+    expect(service.headlessSidecarState()).toBe('starting')
+    child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
+    expect(service.headlessSidecarState()).toBe('ready')
+    child.emit('exit', 1, null)
+    expect(service.headlessSidecarState()).toBe('failed')
+    expect(service.status()).toEqual({ state: 'stopped' })
+  })
+
+  it('reports stopped after a clean headless stop, then starting on the next launch', async () => {
+    const { resources: componentDir, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const first = new FakeChild()
+    const second = new FakeChild()
+    second.pid = 4322
+    const children = [first, second]
+    let spawned = 0
+    const service = new CreativeServeWeb(
+      {
+        stateRoot,
+        runtimeExecutable,
+        readyTimeoutMs: 500,
+        component: { status: () => ({ state: 'installed', dir: componentDir }) },
+      },
+      vi.fn(() => children[spawned++] as unknown as ChildProcess) as never,
+      vi.fn(async () => new Response('{}', { status: 200 })),
+    )
+    const phases: Array<string | null> = []
+    service.onStatus(() => { phases.push(service.headlessSidecarState()) })
+    const starting = service.start()
+    first.stdout.write(`${JSON.stringify(headlessReady(first.pid, 17456, 17457))}\n`)
+    await starting
+    const stopping = service.stop()
+    expect(service.headlessSidecarState()).toBe('stopping')
+    expect(service.status()).toEqual({ state: 'stopped' })
+    await stopping
+    expect(service.headlessSidecarState()).toBe('stopped')
+    expect(phases.at(-1)).toBe('stopped')
+    expect(phases).not.toContain(null)
+
+    const again = service.start()
+    expect(service.headlessSidecarState()).toBe('starting')
+    second.stdout.write(`${JSON.stringify(headlessReady(second.pid, 17458, 17459, 'creative-2'))}\n`)
+    await expect(again).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17458' })
+    expect(service.headlessSidecarState()).toBe('ready')
+    await service.stop()
+    expect(service.headlessSidecarState()).toBe('stopped')
   })
 
   it('C1: Design still starts when resourcesPath is unset entirely (proves no dependency on a writable — or any — app resources dir for the on-demand path)', async () => {

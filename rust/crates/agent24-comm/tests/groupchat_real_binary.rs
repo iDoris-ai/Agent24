@@ -17,12 +17,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent24_comm::{
-    CommState, HyphaeLock, HyphaeRunner, MemoryPasswordStore, VerifiedBinary, current_platform,
-    router,
+    CommState, HyphaeRunner, MemoryPasswordStore, VerifiedBinary, current_platform, router,
 };
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use common::HyphaeLock;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 

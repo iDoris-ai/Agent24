@@ -1,5 +1,7 @@
 # ADR-DOC-01：Documenting 的定位、进程形态与对外暴露（H1 / H2）
 
+索引：[架构总入口](../../architecture/README.md)・[ADR 索引](../../adr/README.md)
+
 > **状态**：**Accepted**（2026-10-07）。两项生效条件都已满足：
 > - jason 在 [#733](https://github.com/iDoris-ai/Agent24/pull/733#issuecomment-6038721787) 确认了平台优先级、分工、验收口径，并要求按 #735 对齐安全模式；
 > - PR-Daemon 在 #733 给出 APPROVE（针对 `dabc2c3`）。
