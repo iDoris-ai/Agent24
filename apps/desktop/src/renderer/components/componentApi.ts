@@ -8,7 +8,12 @@ export interface ComponentProvide {
   id: string
 }
 
-/** Host or redacted row. `form` and `reason` are present only on the host view. */
+/**
+ * Full or redacted row. `form` and `reason` are present only on the full view:
+ * a ProductHost audience, and legacy mode when the request carries no finer
+ * audience. A redacted audience omits both. `reason` is also absent when the
+ * daemon has none.
+ */
 export interface ComponentView {
   id: string
   version: string | null

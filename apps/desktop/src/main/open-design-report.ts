@@ -25,8 +25,10 @@ export interface OpenDesignReportInput {
   reason?: string
   version?: string | null
   /**
-   * Sidecar lifecycle of the creative view's headless instance.
-   * Null when that instance is not in a run (never started, or not headless).
+   * Sidecar lifecycle from `CreativeServeWeb.headlessSidecarState()`.
+   * Null before the first packaged headless launch, for a dev checkout,
+   * and when start bails before a headless process exists. After a run
+   * this is `stopped` or `failed`, not null.
    * Ignored unless the component itself is `installed`.
    */
   sidecar?: SidecarState | null
