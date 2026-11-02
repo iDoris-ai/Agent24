@@ -34,11 +34,22 @@ export interface OpenDesignReportInput {
   sidecar?: SidecarState | null
 }
 
-/** No control characters, at most 256 chars — the daemon rejects anything else. */
+/** The daemon caps `reason` at 256 UTF-8 bytes (`component_routes.rs`), not characters. */
+export const REPORT_REASON_MAX_BYTES = 256
+
+/** No control characters, at most 256 UTF-8 bytes, never cut inside a code point. */
 export function sanitizeReportReason(reason: string | undefined): string | undefined {
   if (!reason) return undefined
   // eslint-disable-next-line no-control-regex
-  const cleaned = reason.replace(/[\u0000-\u001f\u007f-\u009f]/g, '').slice(0, 256)
+  const stripped = reason.replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
+  let cleaned = ''
+  let bytes = 0
+  for (const codePoint of stripped) {
+    const size = Buffer.byteLength(codePoint, 'utf8')
+    if (bytes + size > REPORT_REASON_MAX_BYTES) break
+    cleaned += codePoint
+    bytes += size
+  }
   return cleaned.length > 0 ? cleaned : undefined
 }
 
@@ -106,8 +117,15 @@ export function mapOpenDesignReport(input: OpenDesignReportInput): OpenDesignRep
   return report
 }
 
+/** Whole-request deadline. `timeout` below only covers an idle socket, so a trickling response would never end. */
+export const REPORT_DEADLINE_MS = 10_000
+
 /** POST the report with main's daemon credential. Resolves with the HTTP status; network errors reject. */
-export function postOpenDesignReport(connection: DaemonConnection, body: OpenDesignReport): Promise<number> {
+export function postOpenDesignReport(
+  connection: DaemonConnection,
+  body: OpenDesignReport,
+  deadlineMs: number = REPORT_DEADLINE_MS,
+): Promise<number> {
   const payload = JSON.stringify(body)
   return new Promise((resolve, reject) => {
     const req = http.request({
@@ -126,6 +144,9 @@ export function postOpenDesignReport(connection: DaemonConnection, body: OpenDes
       res.on('error', () => reject(new Error('open-design report response failed')))
       res.on('end', () => resolve(res.statusCode ?? 0))
     })
+    const deadline = setTimeout(() => req.destroy(new Error('open-design report missed its deadline')), deadlineMs)
+    deadline.unref?.()
+    req.on('close', () => clearTimeout(deadline))
     req.on('error', reject)
     req.on('timeout', () => req.destroy(new Error('open-design report timed out')))
     req.end(payload)

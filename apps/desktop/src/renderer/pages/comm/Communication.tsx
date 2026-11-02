@@ -179,6 +179,7 @@ export default function CommunicationPage() {
   const relayUrl = (selectedRelay && relayOptions.includes(selectedRelay) ? selectedRelay : '')
     || (relays?.configured ? relays.relays[0] : '') || defaults[0]?.url || ''
   const sequence = useRef(0)
+  const followTick = useRef(0)
   const mounted = useRef(false)
 
   const refresh = useCallback(async () => {
@@ -251,12 +252,13 @@ export default function CommunicationPage() {
       ticks += 1
       if (ticks > POLL_MAX_TICKS) { clearInterval(timer); return }
       const token = sequence.current
+      const tick = ++followTick.current // a slower earlier tick must not overwrite a later one
       pollCommStatus().then((next) => { if (mounted.current) setDaemon(next) }).catch(() => undefined)
       listComponents().then((list) => {
-        if (!mounted.current || token !== sequence.current) return
+        if (!mounted.current || token !== sequence.current || tick !== followTick.current) return
         setHyphaePhase({ kind: 'ready', component: list.find((item) => item.id === 'hyphae') ?? null })
       }).catch(() => {
-        if (!mounted.current || token !== sequence.current) return
+        if (!mounted.current || token !== sequence.current || tick !== followTick.current) return
         setHyphaePhase({ kind: 'error' })
       })
     }, POLL_INTERVAL_MS)

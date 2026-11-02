@@ -17,7 +17,9 @@ import {
   OPEN_DESIGN_REPORT_PATH,
   OpenDesignStatusReporter,
   mapOpenDesignReport,
+  REPORT_REASON_MAX_BYTES,
   postOpenDesignReport,
+  sanitizeReportReason,
   type OpenDesignReport,
   type OpenDesignReportInput,
 } from './open-design-report'
@@ -402,5 +404,46 @@ describe('postOpenDesignReport', () => {
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()))
     }
+  })
+
+  it('gives up at the whole-request deadline even while the response keeps trickling', async () => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(204, { 'Transfer-Encoding': 'chunked' })
+      // One byte well inside the idle timeout, forever: only a total deadline ends this.
+      const drip = setInterval(() => res.write(' '), 20)
+      res.on('close', () => clearInterval(drip))
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const port = (server.address() as AddressInfo).port
+      const started = Date.now()
+      await expect(postOpenDesignReport(
+        { port, authHeaders: { Authorization: 'Bearer host' } },
+        { state: 'stopped', version: VERSION },
+        200,
+      )).rejects.toThrow()
+      expect(Date.now() - started).toBeLessThan(2_000)
+    } finally {
+      server.closeAllConnections()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+})
+
+describe('sanitizeReportReason', () => {
+  it('caps the reason at 256 UTF-8 bytes, not characters, and never splits a code point', () => {
+    const cjk = sanitizeReportReason('中'.repeat(100))!
+    expect(Buffer.byteLength(cjk, 'utf8')).toBeLessThanOrEqual(REPORT_REASON_MAX_BYTES)
+    expect(cjk).toBe('中'.repeat(85))
+    const emoji = sanitizeReportReason('a' + '😀'.repeat(100))!
+    expect(Buffer.byteLength(emoji, 'utf8')).toBeLessThanOrEqual(REPORT_REASON_MAX_BYTES)
+    expect(emoji).toBe('a' + '😀'.repeat(63))
+    expect(sanitizeReportReason('x'.repeat(300))).toBe('x'.repeat(256))
+  })
+
+  it('drops control characters and returns nothing for an empty result', () => {
+    expect(sanitizeReportReason('bad\u0000\nline')).toBe('badline')
+    expect(sanitizeReportReason('\u0007')).toBeUndefined()
+    expect(sanitizeReportReason(undefined)).toBeUndefined()
   })
 })
