@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
-use agent24_idoris::install::{InstallError, SignatureVerifier};
+use agent24_idoris::install::{InstallError, SignatureVerifier, VerifyMode};
 use flate2::{Compression, write::GzEncoder};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -32,6 +32,23 @@ struct FixtureRuntime {
     lock: IdorisLock,
     gate: AtomicBool,
 }
+/// Gatekeeper that can be taken offline: while `offline` is set, any demand for a
+/// notarization verdict fails, exactly like `spctl` without a network.
+#[derive(Clone, Default)]
+struct Gatekeeper(Arc<AtomicBool>);
+impl SignatureVerifier for Gatekeeper {
+    fn verify(
+        &self,
+        _: &Path,
+        required: &agent24_idoris::install::SigningRequirement,
+    ) -> Result<(), InstallError> {
+        if required.notarized && self.0.load(Ordering::SeqCst) {
+            Err(InstallError::NotNotarized)
+        } else {
+            Ok(())
+        }
+    }
+}
 struct AcceptSignature;
 impl SignatureVerifier for AcceptSignature {
     fn verify(
@@ -61,6 +78,7 @@ impl Runtime for FixtureRuntime {
                 sha256: String::new(),
             },
             &AcceptSignature,
+            VerifyMode::AtRest,
         )
         .unwrap();
         let mut config = StartConfig::new(
@@ -178,6 +196,7 @@ impl Fixture {
             desired_running: true,
             verification: None,
             install_root: None,
+            notarized_verified_at: None,
         };
         let runtime = Arc::new(FixtureRuntime {
             lock,
@@ -632,9 +651,7 @@ async fn real_v040_install_existing_start_running_stop() {
         managed,
         router,
         Arc::new(SmokeRuntime {
-            system: SystemRuntime {
-                secrets: secrets.clone(),
-            },
+            system: SystemRuntime::new(secrets.clone()),
         }),
         secrets,
     )
@@ -654,6 +671,7 @@ async fn real_v040_install_existing_start_running_stop() {
         desired_running: true,
         verification: None,
         install_root: None,
+        notarized_verified_at: None,
     })
     .await
     .unwrap();
@@ -1212,4 +1230,37 @@ async fn stop_preserves_an_unverified_live_leftover_without_signalling() {
     assert_eq!(owner.host.status().await.state, State::Running);
     assert!(owner.host.router.idoris_gateway().is_ok());
     owner.host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn start_verification_works_offline() {
+    let f = Fixture::new().await;
+    let gatekeeper = Gatekeeper::default();
+    gatekeeper.0.store(true, Ordering::SeqCst); // no network: Gatekeeper cannot answer
+    let runtime = SystemRuntime {
+        secrets: Arc::new(KeychainSource(f.keychain.clone())),
+        signature: Arc::new(gatekeeper.clone()),
+        lock: Arc::new(f.runtime.lock.clone()),
+    };
+    // Sanity: the lock demands notarization, and the offline Gatekeeper refuses it.
+    assert!(IdorisLock::embedded().component_notarized());
+    assert!(matches!(
+        agent24_idoris::install::verify_existing(
+            &f.record.release_dir,
+            &f.runtime.lock,
+            &VerifiedArchive {
+                path: f.record.archive_path.clone(),
+                sha256: String::new(),
+            },
+            &gatekeeper,
+            VerifyMode::Install,
+        ),
+        Err(InstallError::NotNotarized)
+    ));
+    // The real start path (`SystemRuntime::config`) still verifies and builds a config.
+    runtime
+        .config(&f.host.root, &f.record, CancellationToken::new())
+        .await
+        .map(|_| ())
+        .unwrap_or_else(|code| panic!("offline start must work, got {code:?}"));
 }

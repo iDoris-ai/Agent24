@@ -3,6 +3,22 @@
 use crate::install::InstallError;
 use std::{io, path::Path, process::Command};
 
+/// When a verification runs decides how much of D2a it may require.
+///
+/// `Install` is the full check, run while downloading and installing (the network is
+/// there anyway): digests, the Developer ID codesign requirement, Team ID, Hardened
+/// Runtime and, when the lock says `notarized`, Gatekeeper's online notarization verdict.
+///
+/// `AtRest` is for everything after that (start, restore, status re-checks): digests plus
+/// the fully offline codesign checks. It never asks Gatekeeper, so a machine without a
+/// network can still start what it already installed; notarization is trusted from the
+/// install-time record (`notarized_verified_at` in the host receipt).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyMode {
+    Install,
+    AtRest,
+}
+
 /// What the lock demands of every listed executable.
 #[derive(Debug, Clone, Copy)]
 pub struct SigningRequirement<'a> {

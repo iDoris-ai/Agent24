@@ -9,7 +9,7 @@ pub use agent24_components::{
         InstallError, InstallOptions, InstalledVersion, MAX_UNPACKED_BYTES, OperationLock,
         operation_lock, private_dir, run_install_child,
     },
-    sign::{Codesign, SignatureVerifier, SigningRequirement},
+    sign::{Codesign, SignatureVerifier, SigningRequirement, VerifyMode},
 };
 use std::{
     io,
@@ -63,16 +63,19 @@ pub async fn install_locked_asset(
 }
 
 /// Revalidate a saved installation against the pinned archive before execution.
+/// Use `VerifyMode::AtRest` for start and restore (no network needed) and
+/// `VerifyMode::Install` only as part of an explicit Install.
 pub fn verify_existing(
     directory: &Path,
     lock: &IdorisLock,
     archive: &VerifiedArchive,
     signature: &dyn SignatureVerifier,
+    mode: VerifyMode,
 ) -> Result<InstalledVersion, InstallError> {
     let platform = crate::host_triple()
         .and_then(platform_of)
         .ok_or(InstallError::UnsupportedPlatform)?;
-    verify_existing_on(platform, directory, lock, archive, signature)
+    verify_existing_on(platform, directory, lock, archive, signature, mode)
 }
 
 /// `verify_existing` for an explicit platform key (`darwin-arm64`).
@@ -82,6 +85,7 @@ pub fn verify_existing_on(
     lock: &IdorisLock,
     archive: &VerifiedArchive,
     signature: &dyn SignatureVerifier,
+    mode: VerifyMode,
 ) -> Result<InstalledVersion, InstallError> {
     InstalledVersion::verify_existing(
         directory,
@@ -89,5 +93,6 @@ pub fn verify_existing_on(
         platform,
         archive,
         signature,
+        mode,
     )
 }

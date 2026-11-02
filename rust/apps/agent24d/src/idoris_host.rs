@@ -5,7 +5,7 @@ use crate::managed_idoris::{
 use agent24_idoris::{
     IdorisLock,
     download::VerifiedArchive,
-    install::{Codesign, InstalledVersion},
+    install::{Codesign, InstalledVersion, SignatureVerifier, VerifyMode},
     keychain::{Keychain, KeychainError, SystemKeychain},
     omlx_probe::{ApiKey, Endpoint, OmlxProbe, ProbeStatus},
     setup::Role,
@@ -58,6 +58,11 @@ pub struct Installation {
     /// written before ADR-038 D1.
     #[serde(default)]
     pub install_root: Option<PathBuf>,
+    /// When an explicit Install last verified notarization online (RFC 3339). Start trusts
+    /// this together with the digests and the offline codesign checks; without it the next
+    /// explicit Install redoes the check, and Start is never blocked for that reason.
+    #[serde(default)]
+    pub notarized_verified_at: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -389,6 +394,19 @@ pub trait Runtime: Send + Sync {
 }
 pub struct SystemRuntime {
     pub secrets: Arc<dyn SecretSource>,
+    /// Injectable so tests can simulate a machine without Gatekeeper access.
+    pub signature: Arc<dyn SignatureVerifier + Send + Sync>,
+    /// The pinned lock; tests substitute a fixture archive's digest.
+    pub lock: Arc<IdorisLock>,
+}
+impl SystemRuntime {
+    pub fn new(secrets: Arc<dyn SecretSource>) -> Self {
+        Self {
+            secrets,
+            signature: Arc::new(Codesign),
+            lock: Arc::new(IdorisLock::embedded().clone()),
+        }
+    }
 }
 #[async_trait]
 impl Runtime for SystemRuntime {
@@ -403,15 +421,19 @@ impl Runtime for SystemRuntime {
         }
         let dir = r.release_dir.clone();
         let archive = r.archive_path.clone();
+        let signature = self.signature.clone();
+        let lock = self.lock.clone();
         let installed = tokio::task::spawn_blocking(move || {
+            // Start must work offline: digests plus offline codesign only, never Gatekeeper.
             agent24_idoris::install::verify_existing(
                 &dir,
-                IdorisLock::embedded(),
+                &lock,
                 &VerifiedArchive {
                     path: archive,
                     sha256: String::new(),
                 },
-                &Codesign,
+                signature.as_ref(),
+                VerifyMode::AtRest,
             )
         })
         .await
@@ -560,9 +582,7 @@ impl IdorisHost {
             root,
             managed,
             router,
-            Arc::new(SystemRuntime {
-                secrets: secrets.clone(),
-            }),
+            Arc::new(SystemRuntime::new(secrets.clone())),
             secrets,
         )?;
         Arc::get_mut(&mut host)

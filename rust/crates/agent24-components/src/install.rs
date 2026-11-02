@@ -3,7 +3,7 @@
 use crate::{
     download::{MAX_ARCHIVE_BYTES, VerifiedArchive, hash_matches},
     lock::{Asset, ComponentLock, clean_relative},
-    sign::{SignatureVerifier, SigningRequirement},
+    sign::{SignatureVerifier, SigningRequirement, VerifyMode},
     storage::{open_regular, private_directory},
 };
 use flate2::read::MultiGzDecoder;
@@ -132,6 +132,7 @@ impl InstalledVersion {
         platform: &str,
         archive: &VerifiedArchive,
         signature: &dyn SignatureVerifier,
+        mode: VerifyMode,
     ) -> Result<Self, InstallError> {
         signature.check_platform()?;
         let asset = lock
@@ -148,7 +149,7 @@ impl InstalledVersion {
         };
         let expected = scan_archive(&request, &bytes, false, &cancel)?;
         verify_tree(directory, &expected, &asset.executables, true, &cancel)?;
-        verify_signatures(directory, lock, platform, asset, signature)?;
+        verify_signatures(directory, lock, platform, asset, signature, mode)?;
         Ok(Self {
             directory: fs::canonicalize(directory)?,
             primary: asset.executables[0].clone(),
@@ -173,6 +174,7 @@ fn verify_signatures(
     platform: &str,
     asset: &Asset,
     signature: &dyn SignatureVerifier,
+    mode: VerifyMode,
 ) -> Result<(), InstallError> {
     if !platform.starts_with("darwin-") {
         // Linux and others: sha256 plus reproducible-build data only (D2a).
@@ -188,7 +190,8 @@ fn verify_signatures(
     }
     let required = SigningRequirement {
         team_id: &signing.macos_team_id,
-        notarized: signing.notarized,
+        // Only an install-time check may reach out to Gatekeeper.
+        notarized: signing.notarized && mode == VerifyMode::Install,
     };
     for executable in &asset.executables {
         signature.verify(&directory.join(executable), &required)?;
@@ -307,7 +310,14 @@ fn install_blocking(
     if fs::symlink_metadata(&version).is_ok() {
         let expected = scan_archive(&request, &bytes, false, cancel)?;
         verify_tree(&version, &expected, &asset.executables, true, cancel)?;
-        verify_signatures(&version, lock, platform, asset, signature)?;
+        verify_signatures(
+            &version,
+            lock,
+            platform,
+            asset,
+            signature,
+            VerifyMode::Install,
+        )?;
         check_cancel(cancel)?;
         return Ok(InstalledVersion {
             directory: version,
@@ -351,14 +361,28 @@ fn install_blocking(
     }
     sync_dirs(staging.path())?;
     // Verify before the final directory exists: a failing signature never leaves one.
-    verify_signatures(staging.path(), lock, platform, asset, signature)?;
+    verify_signatures(
+        staging.path(),
+        lock,
+        platform,
+        asset,
+        signature,
+        VerifyMode::Install,
+    )?;
     check_cancel(cancel)?;
     fs::rename(staging.path(), &version)?;
     // Verify again at the final path, under the same operation lock. On failure roll
     // back, and keep the original error even if the rollback itself fails.
     let result = (|| {
         File::open(&root)?.sync_all()?;
-        verify_signatures(&version, lock, platform, asset, signature)?;
+        verify_signatures(
+            &version,
+            lock,
+            platform,
+            asset,
+            signature,
+            VerifyMode::Install,
+        )?;
         check_cancel(cancel)?;
         Ok(InstalledVersion {
             directory: version.clone(),
@@ -964,6 +988,7 @@ mod tests {
             "darwin-arm64",
             &archive,
             &AcceptSignature,
+            VerifyMode::AtRest,
         )
         .unwrap();
         installed.verify_for_launch().unwrap();
@@ -1042,7 +1067,7 @@ mod tests {
             seen: Default::default(),
             fail_on: None,
         };
-        verify_signatures(dir, &lock, "darwin-arm64", asset, &ok).unwrap();
+        verify_signatures(dir, &lock, "darwin-arm64", asset, &ok, VerifyMode::Install).unwrap();
         assert_eq!(
             *ok.seen.lock().unwrap(),
             [dir.join("demo"), dir.join("helper")]
@@ -1053,7 +1078,7 @@ mod tests {
             fail_on: Some("helper"),
         };
         assert!(matches!(
-            verify_signatures(dir, &lock, "darwin-arm64", asset, &bad),
+            verify_signatures(dir, &lock, "darwin-arm64", asset, &bad, VerifyMode::Install),
             Err(InstallError::SignatureMismatch)
         ));
     }
@@ -1068,13 +1093,84 @@ mod tests {
         };
         lock.signing = None;
         assert!(matches!(
-            verify_signatures(Path::new("/v"), &lock, "darwin-arm64", &asset, &never),
+            verify_signatures(
+                Path::new("/v"),
+                &lock,
+                "darwin-arm64",
+                &asset,
+                &never,
+                VerifyMode::Install
+            ),
             Err(InstallError::ManifestViolation(_))
         ));
         let mut lock = two_executables();
         lock.signing.as_mut().unwrap().macos_team_id = "bad".into();
-        assert!(verify_signatures(Path::new("/v"), &lock, "darwin-arm64", &asset, &never).is_err());
+        assert!(
+            verify_signatures(
+                Path::new("/v"),
+                &lock,
+                "darwin-arm64",
+                &asset,
+                &never,
+                VerifyMode::Install
+            )
+            .is_err()
+        );
         assert!(never.seen.lock().unwrap().is_empty());
+    }
+
+    /// Fails whenever notarization is demanded, like spctl without a network.
+    struct Offline;
+    impl SignatureVerifier for Offline {
+        fn verify(&self, _: &Path, required: &SigningRequirement) -> Result<(), InstallError> {
+            if required.notarized {
+                Err(InstallError::NotNotarized)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn only_install_mode_asks_for_notarization() {
+        let mut lock = two_executables();
+        lock.signing.as_mut().unwrap().notarized = true;
+        let asset = &lock.assets["darwin-arm64"];
+        let dir = Path::new("/v");
+        // Offline: the full install-time check is rejected...
+        assert!(matches!(
+            verify_signatures(
+                dir,
+                &lock,
+                "darwin-arm64",
+                asset,
+                &Offline,
+                VerifyMode::Install
+            ),
+            Err(InstallError::NotNotarized)
+        ));
+        // ...while the at-rest check (start, restore) still passes without a network.
+        verify_signatures(
+            dir,
+            &lock,
+            "darwin-arm64",
+            asset,
+            &Offline,
+            VerifyMode::AtRest,
+        )
+        .unwrap();
+        // A lock that is not notarized never asks, in either mode.
+        lock.signing.as_mut().unwrap().notarized = false;
+        let asset = &lock.assets["darwin-arm64"];
+        verify_signatures(
+            dir,
+            &lock,
+            "darwin-arm64",
+            asset,
+            &Offline,
+            VerifyMode::Install,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1085,7 +1181,15 @@ mod tests {
             seen: Default::default(),
             fail_on: Some("demo"),
         };
-        verify_signatures(Path::new("/v"), &lock, "linux-x64", asset, &never).unwrap();
+        verify_signatures(
+            Path::new("/v"),
+            &lock,
+            "linux-x64",
+            asset,
+            &never,
+            VerifyMode::Install,
+        )
+        .unwrap();
         assert!(never.seen.lock().unwrap().is_empty());
     }
 

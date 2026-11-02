@@ -315,6 +315,29 @@ fn a_failing_signature_never_creates_the_final_directory() {
     f.clean();
 }
 
+/// Gatekeeper unreachable: any demand for a notarization verdict fails.
+struct OfflineGatekeeper;
+impl SignatureVerifier for OfflineGatekeeper {
+    fn verify(&self, _: &Path, required: &SigningRequirement) -> Result<(), InstallError> {
+        if required.notarized {
+            Err(InstallError::NotNotarized)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn install_demands_notarization_and_rejects_when_gatekeeper_is_unreachable() {
+    let f = Fixture::new(None);
+    assert!(f.lock.component_notarized());
+    assert!(matches!(
+        f.install_with(OfflineGatekeeper),
+        Err(InstallError::NotNotarized)
+    ));
+    f.clean();
+}
+
 #[test]
 fn child_failure_cleans_staging() {
     let mut f = Fixture::new(None);

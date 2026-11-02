@@ -216,6 +216,14 @@ impl IdorisLock {
         lock
     }
 
+    /// Whether the lock demands a notarization verdict at install time.
+    pub fn component_notarized(&self) -> bool {
+        self.component
+            .signing
+            .as_ref()
+            .is_some_and(|signing| signing.notarized)
+    }
+
     pub fn asset_for(&self, target_triple: &str) -> Option<&LockedAsset> {
         self.assets.get(target_triple)
     }

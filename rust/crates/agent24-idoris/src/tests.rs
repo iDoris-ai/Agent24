@@ -209,6 +209,7 @@ fn verify_existing_on_a_platform_without_an_asset_is_unsupported() {
         IdorisLock::embedded(),
         &archive,
         &Never,
+        agent24_components::sign::VerifyMode::AtRest,
     );
     assert!(matches!(
         result,

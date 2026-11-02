@@ -58,6 +58,7 @@ struct Provision {
     key_waiting: AtomicBool,
     budget_unavailable: AtomicBool,
     fail_install: AtomicBool,
+    signature: Gatekeeper,
     install_roots: SyncMutex<Vec<PathBuf>>,
 }
 fn copy_release(from: &Path, to: &Path) {
@@ -86,7 +87,7 @@ impl Provisioner for Provision {
         let profile = serde_json::from_value(json!({"total_mem_bytes": total, "avail_mem_bytes": total, "arch":"aarch64", "cpu_cores":8, "accelerator":"metal", "os":"macos"})).unwrap();
         agent24_hw::HardwareReport::new(profile, None).idoris_budget_suggestion()
     }
-    async fn verify(&self, r: &Installation) -> Result<InstalledVersion, Code> {
+    async fn verify(&self, r: &Installation, mode: VerifyMode) -> Result<InstalledVersion, Code> {
         self.verifications.fetch_add(1, Ordering::SeqCst);
         agent24_idoris::install::verify_existing(
             &r.release_dir,
@@ -95,7 +96,8 @@ impl Provisioner for Provision {
                 path: r.archive_path.clone(),
                 sha256: String::new(),
             },
-            &AcceptSignature,
+            &self.signature,
+            mode,
         )
         .map_err(|_| Code::NotInstalled)
     }
@@ -146,9 +148,9 @@ impl Provisioner for Provision {
                 release_dir: release,
                 ..self.record.clone()
             };
-            return self.verify(&record).await;
+            return self.verify(&record, VerifyMode::Install).await;
         }
-        self.verify(&self.record).await
+        self.verify(&self.record, VerifyMode::Install).await
     }
     async fn upstream_key(&self) -> Result<Option<ApiKey>, Code> {
         if self.gate.load(Ordering::SeqCst) {
@@ -195,6 +197,7 @@ impl ConnectedFixture {
             key_waiting: AtomicBool::new(false),
             budget_unavailable: AtomicBool::new(false),
             fail_install: AtomicBool::new(false),
+            signature: Gatekeeper::default(),
             install_roots: SyncMutex::new(Vec::new()),
         });
         let data = Arc::new(Store::default());
@@ -887,7 +890,11 @@ async fn restore_after_crash_between_commit_issue_and_connect_journal_removal() 
     assert_eq!(x.f.complete(&first).await.result, Some(Outcome::Succeeded));
     let previous = x.f.host.inner.lock().await.installation.clone().unwrap();
     x.f.host.shutdown().await.unwrap();
-    let installed = x.provision.verify(&previous).await.unwrap();
+    let installed = x
+        .provision
+        .verify(&previous, VerifyMode::AtRest)
+        .await
+        .unwrap();
     let keys = Keys::new(
         &installed,
         &x.f.host.root.join("data/idoris.sqlite3"),
@@ -1145,9 +1152,7 @@ async fn real_v040_install_reverify_and_connect_when_omlx_available() {
         root.clone(),
         managed,
         router,
-        Arc::new(SystemRuntime {
-            secrets: secrets.clone(),
-        }),
+        Arc::new(SystemRuntime::new(secrets.clone())),
         secrets,
     )
     .unwrap()
@@ -1592,4 +1597,70 @@ fn deletable_allow_list_accepts_only_release_dirs_and_verified_archives() {
         crate::idoris_host::provision::legacy_deletable(&old.join("absent"), &[ok[0].as_path()])
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn install_without_a_notarization_record_fails_closed_when_gatekeeper_is_offline() {
+    let x = ConnectedFixture::new().await;
+    x.f.install().await; // receipt without notarized_verified_at
+    x.provision.signature.0.store(true, Ordering::SeqCst);
+    let op =
+        x.f.host
+            .install(InstallRequest { consent: true }, Some("offline-1"))
+            .await
+            .unwrap();
+    let done = x.f.complete(&op).await;
+    assert_eq!(done.result, Some(Outcome::Failed));
+    assert!(
+        x.f.host
+            .inner
+            .lock()
+            .await
+            .installation
+            .as_ref()
+            .unwrap()
+            .notarized_verified_at
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn install_with_a_notarization_record_is_intact_offline() {
+    let x = ConnectedFixture::new().await;
+    let mut record = x.f.record.clone();
+    record.notarized_verified_at = Some("2026-11-02T00:00:00+00:00".into());
+    x.f.host.record_installation(record).await.unwrap();
+    x.provision.signature.0.store(true, Ordering::SeqCst);
+    run_install(&x, "offline-2").await;
+    assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn an_online_install_stamps_the_receipt_once() {
+    let x = ConnectedFixture::new().await;
+    x.f.install().await;
+    run_install(&x, "online-1").await;
+    assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 0);
+    let stamped =
+        x.f.host
+            .inner
+            .lock()
+            .await
+            .installation
+            .as_ref()
+            .unwrap()
+            .notarized_verified_at
+            .clone()
+            .expect("full check passed, receipt must record it");
+    let saved: Installation =
+        serde_json::from_slice(&fs::read(x.f.host.root.join("installation.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        saved.notarized_verified_at.as_deref(),
+        Some(stamped.as_str())
+    );
+    // The next install trusts the record: at-rest checks only, even with Gatekeeper gone.
+    x.provision.signature.0.store(true, Ordering::SeqCst);
+    run_install(&x, "online-2").await;
+    assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 0);
 }

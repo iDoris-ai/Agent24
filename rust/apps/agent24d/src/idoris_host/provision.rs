@@ -83,7 +83,11 @@ pub trait Provisioner: Send + Sync {
         archive: &VerifiedArchive,
         cancel: &CancellationToken,
     ) -> Result<InstalledVersion, Code>;
-    async fn verify(&self, record: &Installation) -> Result<InstalledVersion, Code>;
+    async fn verify(
+        &self,
+        record: &Installation,
+        mode: VerifyMode,
+    ) -> Result<InstalledVersion, Code>;
     /// Create the state directories (`data/`, `instances/`) below the state root.
     async fn prepare_state(&self, _root: &Path) -> Result<(), Code> {
         Ok(())
@@ -144,7 +148,7 @@ impl Provisioner for SystemProvisioner {
             .map_err(|_| Code::NotInstalled)?
             .map_err(install_code)
     }
-    async fn verify(&self, r: &Installation) -> Result<InstalledVersion, Code> {
+    async fn verify(&self, r: &Installation, mode: VerifyMode) -> Result<InstalledVersion, Code> {
         let r = r.clone();
         tokio::task::spawn_blocking(move || {
             agent24_idoris::install::verify_existing(
@@ -155,6 +159,7 @@ impl Provisioner for SystemProvisioner {
                     sha256: String::new(),
                 },
                 &Codesign,
+                mode,
             )
         })
         .await
@@ -439,13 +444,24 @@ impl IdorisHost {
         // the legacy copy keeps serving until the new one has verified.
         let mut migrating = false;
         if let Some(old) = &old {
+            // An explicit Install is the moment to be online: without an install-time
+            // notarization record, check it in full (`Install`); with one, the at-rest
+            // checks are enough to call the install intact.
+            let mode = if old.notarized_verified_at.is_some() {
+                VerifyMode::AtRest
+            } else {
+                VerifyMode::Install
+            };
             let valid = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Code::Cancelled),
-                verified = self.provisioner.verify(old) => verified.is_ok(),
+                verified = self.provisioner.verify(old, mode) => verified.is_ok(),
             };
             if valid {
                 if self.in_managed_root(old) {
+                    if mode == VerifyMode::Install {
+                        self.record_notarization(old).await?;
+                    }
                     return Ok(());
                 }
                 migrating = true;
@@ -471,6 +487,18 @@ impl IdorisHost {
             }
             other => other,
         }
+    }
+    /// Stamp a receipt whose full install-time check has just passed.
+    async fn record_notarization(&self, old: &Installation) -> Result<(), Code> {
+        if !IdorisLock::embedded().component_notarized() {
+            return Ok(());
+        }
+        let mut record = old.clone();
+        record.notarized_verified_at = Some(chrono::Utc::now().to_rfc3339());
+        let mut i = self.inner.lock().await;
+        write_json(&self.root.join("installation.json"), &record)?;
+        i.installation = Some(record);
+        Ok(())
     }
     /// A receipt is current when its release lives under the (canonical) managed root and,
     /// if it recorded one, was installed under that same root.
@@ -555,11 +583,16 @@ impl IdorisHost {
             desired_running: false,
             verification: None,
             install_root: None,
+            notarized_verified_at: None,
         });
         let record = Installation {
             release_dir: installed.directory().into(),
             archive_path: archive.path,
             install_root: Some(self.install_root.clone()),
+            // The installer just ran the full check, notarization included.
+            notarized_verified_at: IdorisLock::embedded()
+                .component_notarized()
+                .then(|| chrono::Utc::now().to_rfc3339()),
             ..record
         };
         let mut i = self.inner.lock().await;
@@ -592,7 +625,7 @@ impl IdorisHost {
             biased;
             _ = cancel.cancelled() => return Err(Code::Cancelled),
             prepared = async {
-        let installed = self.provisioner.verify(&previous).await?;
+        let installed = self.provisioner.verify(&previous, VerifyMode::AtRest).await?;
         let budget = self
             .provisioner
             .budget(request.core_reserved_bytes.or(previous.core_reserved_bytes))
@@ -958,7 +991,10 @@ impl IdorisHost {
             serde_json::from_slice(&body).map_err(|_| Code::PersistenceFailed)?;
         pending.previous.validate()?;
         pending.candidate.validate()?;
-        let installed = self.provisioner.verify(&pending.previous).await?;
+        let installed = self
+            .provisioner
+            .verify(&pending.previous, VerifyMode::AtRest)
+            .await?;
         let keys = Keys::new(
             &installed,
             &self.root.join("data/idoris.sqlite3"),
