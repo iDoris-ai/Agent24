@@ -685,6 +685,11 @@ export function registerIpcHandlers(options: {
       const mayBeDefault = !willBeDefault && !listed.ok
       const result = await promptRestorePassword<BackendProxyResponse>(win, async (backupPassword) => {
         submits += 1
+        // A newer pick (even a cancelled one) ended this selection: this window
+        // must not submit the old backup, on the first try or on a retry.
+        if (epoch !== backupEpoch) {
+          return { done: true, value: { ok: false, status: 409, data: { error: { code: 'superseded', message: mt('err.backupSuperseded') } } } }
+        }
         if (entry.expires < Date.now()) {
           return { done: true, value: { ok: false, status: 410, data: { error: { code: 'ticket_expired', message: mt('err.noBackupTicket') } } } }
         }

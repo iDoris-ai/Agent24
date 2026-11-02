@@ -559,6 +559,31 @@ describe('Restore from backup (CommImportPick / CommIdentityImport)', () => {
     expect((await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)).data.error.code).toBe('ticket_expired')
     expect(seen).toHaveLength(0)
   })
+  it('a window that waits for a password cannot submit the old backup after a newer pick was started and cancelled', async () => {
+    const first = await pick()
+    let submit!: (pw: string) => Promise<{ done: boolean; value?: any }> // eslint-disable-line @typescript-eslint/no-explicit-any
+    let windowOpen!: () => void
+    let closeWindow!: (v: null) => void
+    const opened = new Promise<void>((r) => { windowOpen = r })
+    promptRestorePassword.mockImplementationOnce(async (_w: unknown, work: typeof submit) => {
+      submit = work
+      windowOpen()
+      return new Promise((resolve) => { closeWindow = resolve }) // the window just sits there
+    })
+    const running = call(IpcChannels.CommIdentityImport, first.ticket, 'alice', false)
+    await opened
+    showOpenDialog.mockResolvedValueOnce({ canceled: true, filePaths: [] })
+    expect(await call(IpcChannels.CommImportPick)).toEqual({ ok: false, cancelled: true })
+    // the user now types the password into the OLD window, first try and retry
+    for (let i = 0; i < 2; i += 1) {
+      const outcome = await submit('restore-pass-1')
+      expect(outcome.done).toBe(true)
+      expect(outcome.value.data.error.code).toBe('superseded')
+    }
+    expect(seen).toHaveLength(0) // no daemon request was made
+    closeWindow(null)
+    await running
+  })
   it('L-5: a flow that ends while a new pick dialog is open cannot put its old ticket back', async () => {
     const first = await pick()
     let release!: () => void

@@ -2780,7 +2780,11 @@ paths:
         EXDEV or EMLINK) it renames the staging file with `RENAME_EXCL` (macOS) or `RENAME_NOREPLACE`
         (Linux), which also never overwrites; if that is unsupported too (exFAT on macOS) it creates the final
         name directly with `O_EXCL` (never replacing anything; a crash mid-write can leave a partial, undecryptable
-        file) and only if that is refused as well the answer is `422 filesystem_unsupported`. EPERM/EACCES from
+        file) and only if that is refused as well the answer is `422 filesystem_unsupported`. On such file systems
+        there is no atomic publish: a crash mid-write can leave a partial, undecryptable file at the final name
+        (a failed write removes it, and the error names it if it cannot). After publishing the final name must
+        still be the file Agent24 wrote; if another file appeared there it is NEVER deleted or replaced and the
+        answer is `409 publish_conflict`. EPERM/EACCES from
         any of these steps is `422 permission_denied`.
         An existing target of any kind is refused with `409 conflict` and `data.reason = "target_exists"`.
         `path` must be absolute and outside the Hyphae data directory. Neither the key, the backup nor the
@@ -2830,7 +2834,7 @@ paths:
           $ref: "#/components/responses/CommNotFound"
         "409":
           description: >-
-            `conflict` (`target_exists`, `export_in_progress`) or `hyphae_too_old`
+            `conflict` (`target_exists`, `export_in_progress`), `publish_conflict` (another file appeared at the destination; left untouched) or `hyphae_too_old`
           content:
             application/json:
               schema:
@@ -7087,7 +7091,7 @@ components:
     CommErrorCode:
       type: string
       description: Closed set (COMM-HYPHAE.md section 4).
-      enum: [hyphae_unsupported_platform, hyphae_download_failed, hyphae_hash_mismatch, binary_rejected, unsupported_platform, locked, not_configured, invalid, not_found, confirm_required, conflict, network, partial, timeout, upstream, hyphae_too_old, bad_backup_password, invalid_key, nickname_exists, keystore_locked, nickname_too_long, still_terminating, filesystem_unsupported, permission_denied]
+      enum: [hyphae_unsupported_platform, hyphae_download_failed, hyphae_hash_mismatch, binary_rejected, unsupported_platform, locked, not_configured, invalid, not_found, confirm_required, conflict, network, partial, timeout, upstream, hyphae_too_old, bad_backup_password, invalid_key, nickname_exists, keystore_locked, nickname_too_long, still_terminating, filesystem_unsupported, permission_denied, publish_conflict]
     CommError:
       type: object
       description: >-
