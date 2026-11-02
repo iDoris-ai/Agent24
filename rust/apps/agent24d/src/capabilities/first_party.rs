@@ -48,10 +48,22 @@ pub struct FirstPartyAuthority {
     grants: Mutex<HashMap<[u8; 32], Grant>>,
     request_summaries: Mutex<HashMap<String, RequestSummary>>,
     module_surfaces: Mutex<Arc<Vec<super::delegation::ModuleSurface>>>,
+    /// Docked daemon (CORE-5 Q3): tokens carry only `HealthRead` and
+    /// `DiagnosticRead`, whatever else the route policy lists.
+    docked: bool,
 }
 impl FirstPartyAuthority {
+    /// The authority of a docked daemon: it can enrol a shell, but what it
+    /// issues reaches nothing beyond the docked diagnostics.
+    pub fn new_docked(store: CapabilityStore) -> Self {
+        Self {
+            docked: true,
+            ..Self::new(store)
+        }
+    }
     pub fn new(store: CapabilityStore) -> Self {
         Self {
+            docked: false,
             store,
             provider: Mutex::new(None),
             grants: Mutex::new(HashMap::new()),
@@ -343,12 +355,16 @@ impl FirstPartyAuthority {
                     // challenges: a first-party shell must never reach it,
                     // or an enrolled CLI could approve itself (#1447 F1).
                     // `presence_desktop::gate` is the second, independent layer.
-                    allowed_operations: policies()
-                        .iter()
-                        .map(|p| p.operation)
-                        .filter(|op| !op.is_presence_channel())
-                        .chain([Operation::ModuleRoute])
-                        .collect(),
+                    allowed_operations: if self.docked {
+                        [Operation::HealthRead, Operation::DiagnosticRead].into()
+                    } else {
+                        policies()
+                            .iter()
+                            .map(|p| p.operation)
+                            .filter(|op| !op.is_presence_channel())
+                            .chain([Operation::ModuleRoute])
+                            .collect()
+                    },
                 },
             )
             .map_err(|_| EnrollErrorCode::Internal)?;
@@ -716,6 +732,44 @@ mod tests {
             .elevate(peer, id, request(), tx, CancellationToken::new())
             .await
             .unwrap()
+    }
+    /// CORE-5 M4: a docked authority issues exactly HealthRead + DiagnosticRead.
+    #[test]
+    fn docked_tokens_reach_only_health_and_diagnostics() {
+        let store = CapabilityStore::new("g");
+        let token = FirstPartyAuthority::new_docked(store.clone())
+            .issue(&test_peer("g"))
+            .unwrap();
+        let allowed: Vec<_> = policies()
+            .iter()
+            .map(|p| p.operation)
+            .filter(|op| {
+                store
+                    .validate_bearer(&token.secret, *op, &Resource::global(), unix_now())
+                    .is_ok()
+            })
+            .collect();
+        assert!(allowed.contains(&Operation::DiagnosticRead));
+        assert!(
+            allowed
+                .iter()
+                .all(|op| matches!(op, Operation::HealthRead | Operation::DiagnosticRead)),
+            "{allowed:?}"
+        );
+        let normal = FirstPartyAuthority::new(store.clone())
+            .issue(&test_peer("g"))
+            .unwrap();
+        assert!(
+            store
+                .validate_bearer(
+                    &normal.secret,
+                    Operation::ModelsRead,
+                    &Resource::global(),
+                    unix_now()
+                )
+                .is_ok(),
+            "control: a normal token still reaches more"
+        );
     }
     #[tokio::test(start_paused = true)]
     async fn daily_token_ttl_ignores_wall_clock_jumps() {
