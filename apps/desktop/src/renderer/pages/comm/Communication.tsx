@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   CommApiError,
-  createCommIdentity, importCommIdentity, setCommRelay, probeCommRelay,
+  createCommIdentity, importCommHome, setCommRelay, probeCommRelay,
   getCommStatus,
   installComm,
   addCommContact,
@@ -108,16 +108,12 @@ export default function CommunicationPage() {
   const [notConfigured, setNotConfigured] = useState<{ kind: 'binary' | 'identity' | 'config'; detail: string } | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [pending, setPending] = useState<WriteAction | null>(null)
-  const [password, setPassword] = useState('')
   const [remember, setRemember] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [warnings, setWarnings] = useState<string[]>([])
   const [nickname, setNickname] = useState('')
   const [importOpen, setImportOpen] = useState(false)
-  const [importFrom, setImportFrom] = useState('')
-  const [importPassword, setImportPassword] = useState('')
-  const [importConfirmed, setImportConfirmed] = useState(false)
   const defaults = getDefaultRelays()
   const [selectedRelay, setSelectedRelay] = useState('')
   const [handshakeFailed, setHandshakeFailed] = useState(false)
@@ -213,9 +209,6 @@ export default function CommunicationPage() {
     setActionError(null)
     setNotice(null)
     if (action === 'unlock') setUnlockError(null)
-    const submittedPassword = action === 'unlock' ? password : action === 'import' ? importPassword : ''
-    if (action === 'unlock') setPassword('')
-    if (action === 'import') setImportPassword('')
     try {
       if (action === 'install') {
         const result = await installComm()
@@ -225,7 +218,7 @@ export default function CommunicationPage() {
       } else if (action === 'create') {
         await createCommIdentity(nickname.trim())
       } else if (action === 'import') {
-        await importCommIdentity(importFrom.trim(), submittedPassword)
+        await importCommHome()
       } else if (action === 'relay') {
         // PUT replaces the whole list server-side (and restarts the daemon):
         // keep the existing entries, and skip the write if nothing changes.
@@ -245,7 +238,7 @@ export default function CommunicationPage() {
         await stopCommDaemon()
         if (mounted.current && token === sequence.current) setNotice(t('notice.stop'))
       } else {
-        const result = await unlockComm(submittedPassword, remember)
+        const result = await unlockComm(remember)
         if (mounted.current && token === sequence.current) {
           setNotice(result.remembered ? t('notice.remembered') : t('notice.session'))
           setUnlockFailed(false)
@@ -255,22 +248,20 @@ export default function CommunicationPage() {
       if (mounted.current && token === sequence.current) {
         const code = typeof error === 'object' && error !== null && 'code' in error
           ? error.code : undefined
+        // Dismissing a native step (folder picker, confirm, password window) is not an error.
+        if (code === 'cancelled') return
         if (action === 'unlock') {
           setUnlockFailed(true)
-          // A rejected password is an expected answer, not a service fault.
-          if (code === 'locked' && !messageOf(error, submittedPassword).includes('keychain_unavailable')) {
-            setUnlockError(t('error.passwordIncorrect'))
-            return
-          }
+          // A rejected password is retried inside main's window; reaching here
+          // means the keystore could not be unlocked for another reason.
         }
         const knownCodes = ['binary_rejected', 'not_configured', 'locked', 'password_rejected', 'keychain_unavailable']
         const reason = typeof code === 'string' && knownCodes.includes(code)
           ? t('error.reasonPrefix', { code, reason: reasonLabel(code) }) : ''
-        setActionError(`${reason}${messageOf(error, submittedPassword)}`)
+        setActionError(`${reason}${messageOf(error)}`)
       }
     } finally {
       if (mounted.current) {
-        if (action === 'unlock') setPassword('')
         setPending(null)
         void refresh()
       }
@@ -293,6 +284,9 @@ export default function CommunicationPage() {
     if (code === 'hyphae_too_old') return t('error.hyphaeTooOld')
     if (code === 'nickname_exists') return t('restore.nicknameExists')
     if (code === 'invalid_key') return t('restore.invalidKey')
+    if (code === 'publish_conflict') return t('export.publishConflict')
+    if (code === 'permission_denied') return t('export.permissionDenied')
+    if (code === 'filesystem_unsupported') return t('export.filesystemUnsupported')
     if (code === 'keystore_locked') return t('restore.keystoreLocked')
     return messageOf(error)
   }
@@ -466,13 +460,10 @@ export default function CommunicationPage() {
           </form>
           <button type="button" disabled={pending !== null} onClick={() => setImportOpen(!importOpen)}>{t('wizard.importKey')}</button>
           {restoreUi}
-          {importOpen && <form className="comm-setup-form" onSubmit={(event) => { event.preventDefault(); void runAction('import') }}>
+          {importOpen && <div className="comm-setup-form">
             <p className="comm-muted">{t('wizard.importGuide')}</p>
-            <label>{t('wizard.importFrom')}<input value={importFrom} onChange={(event) => setImportFrom(event.target.value)} /></label>
-            <label>{t('wizard.importPassword')}<input type="password" autoComplete="off" value={importPassword} onChange={(event) => setImportPassword(event.target.value)} /></label>
-            <label><input type="checkbox" checked={importConfirmed} onChange={(event) => setImportConfirmed(event.target.checked)} />{t('wizard.importConfirm')}</label>
-            <button disabled={pending !== null || refreshing || !importFrom.trim() || !importConfirmed}>{t('wizard.import')}</button>
-          </form>}
+            <button type="button" disabled={pending !== null || refreshing} onClick={() => void runAction('import')}>{t('wizard.import')}</button>
+          </div>}
         </>}
         {(setupState === 'no_relay' || setupState === 'ready') && <form className="comm-setup-form" onSubmit={(event) => { event.preventDefault(); void runAction('relay') }}>
           <label>{t('wizard.relayServer')}<select value={relayUrl} onChange={(event) => setSelectedRelay(event.target.value)}>
@@ -592,9 +583,8 @@ export default function CommunicationPage() {
         </div>
         {showUnlock && <form className="comm-unlock" aria-label={t('unlock.title')} onSubmit={(event) => { event.preventDefault(); void runAction('unlock') }}>
           <p className="comm-muted comm-unlock-explain">{t('unlock.explain')}</p>
-          <label>{t('password.label')}<input type="password" autoComplete="off" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
           <label className="comm-checkbox"><input type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} />{t('password.remember')}</label>
-          <button type="submit" disabled={pending !== null || password.length === 0}>{pending === 'unlock' ? t('action.unlocking') : t('action.unlock')}</button>
+          <button type="submit" disabled={pending !== null}>{pending === 'unlock' ? t('action.unlocking') : t('action.unlock')}</button>
           {unlockError && <p role="alert" className="comm-unlock-error">{unlockError}</p>}
         </form>}
       </section>

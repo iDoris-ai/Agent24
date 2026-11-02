@@ -188,20 +188,17 @@ describe('CommunicationPage', () => {
     expect(screen.queryByText('已停止重试')).not.toBeInTheDocument()
   })
 
-  it('clears unlock password on success and failure and defaults remember to false', async () => {
+  it('unlock asks main (which owns the password window) and defaults remember to false', async () => {
     success()
     vi.mocked(getCommStatus).mockResolvedValue(lockedStatus)
     render(<CommunicationPage />)
-    const input = await screen.findByLabelText('Keystore 口令') as HTMLInputElement
-    fireEvent.change(input, { target: { value: 'secret-pass' } })
+    expect(screen.queryByLabelText('Keystore 口令')).toBeNull()
+    fireEvent.click(await screen.findByRole('button', { name: '解锁' }))
+    await waitFor(() => expect(unlockComm).toHaveBeenCalledWith(false))
+    vi.mocked(unlockComm).mockRejectedValueOnce(new CommApiError('window closed', 499, 'cancelled'))
     fireEvent.click(screen.getByRole('button', { name: '解锁' }))
-    await waitFor(() => expect(unlockComm).toHaveBeenCalledWith('secret-pass', false))
-    await waitFor(() => expect(input.value).toBe(''))
-    vi.mocked(unlockComm).mockRejectedValueOnce(new Error('locked'))
-    fireEvent.change(input, { target: { value: 'another-secret' } })
-    fireEvent.click(screen.getByRole('button', { name: '解锁' }))
-    await waitFor(() => expect(input.value).toBe(''))
-    expect(screen.getByRole('alert')).not.toHaveTextContent('another-secret')
+    await waitFor(() => expect(unlockComm).toHaveBeenCalledTimes(2))
+    expect(screen.queryByRole('alert')).toBeNull()
   })
 
   it('prevents duplicate daemon actions while the write is pending', async () => {
@@ -226,12 +223,10 @@ describe('CommunicationPage', () => {
     const storageSet = vi.spyOn(Storage.prototype, 'setItem')
     render(<CommunicationPage />)
     await screen.findByText('npub1alice')
-    fireEvent.change(await screen.findByLabelText('Keystore 口令'), { target: { value: 'do-not-store' } })
-    fireEvent.click(screen.getByRole('button', { name: '解锁' }))
+    fireEvent.click(await screen.findByRole('button', { name: '解锁' }))
     await waitFor(() => expect(unlockComm).toHaveBeenCalled())
     expect(fetchSpy).not.toHaveBeenCalled()
     expect(storageSet).not.toHaveBeenCalled()
-    expect(screen.queryByText('do-not-store')).not.toBeInTheDocument()
   })
 })
 
@@ -264,19 +259,18 @@ describe('CommunicationPage usability', () => {
     success()
     vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, ...process } })
     render(<CommunicationPage />)
-    expect(await screen.findByLabelText('Keystore password')).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Unlock' })).toBeInTheDocument()
+    expect(screen.queryByLabelText('Keystore password')).toBeNull()
     expect(screen.getByText(/generated and kept in the system keychain automatically/)).toBeInTheDocument()
   })
 
-  it('says the password is incorrect instead of the service-locked wording', async () => {
+  it('shows a keychain failure from unlock instead of staying silent', async () => {
     success()
     vi.mocked(getCommStatus).mockResolvedValue(lockedStatus)
-    vi.mocked(unlockComm).mockRejectedValueOnce(new CommApiError('password verification failed', 423, 'locked'))
+    vi.mocked(unlockComm).mockRejectedValueOnce(new CommApiError('keychain_unavailable: denied', 423, 'locked'))
     render(<CommunicationPage />)
-    fireEvent.change(await screen.findByLabelText('Keystore password'), { target: { value: 'guess' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Unlock' }))
-    expect(await screen.findByText('The password is incorrect')).toBeInTheDocument()
-    expect(screen.queryByText(/service is locked/)).toBeNull()
+    fireEvent.click(await screen.findByRole('button', { name: 'Unlock' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('keychain_unavailable')
   })
 
   it('shows a spinner while starting, polls until running, and shows no spinner once running', async () => {

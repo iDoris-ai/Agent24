@@ -48,6 +48,10 @@ keyring = { version = "3.6", default-features = false, features = [
 # §4.1 step 2) — `fs` is rustix's gate for `rustix::fs::flock` (and the dir-fd file ops in
 # `export.rs`).
 rustix = { version = "0.38", features = ["process", "fs"] }
+# rustix 1.x only for `renameat_with` (RENAME_EXCL on macOS / RENAME_NOREPLACE on
+# Linux, the exclusive-rename fallback in `export.rs`); 0.38 has it on Linux only.
+# Already in the dependency tree via other crates.
+rustix1 = { package = "rustix", version = "1", features = ["fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
