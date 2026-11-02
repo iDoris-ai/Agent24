@@ -49,6 +49,9 @@ impl SignatureVerifier for Gatekeeper {
         }
     }
 }
+/// Fixtures verify the darwin-arm64 asset on every host OS (the lock only has that one),
+/// with injected verifiers instead of real codesign/spctl.
+const TEST_PLATFORM: &str = "darwin-arm64";
 struct AcceptSignature;
 impl SignatureVerifier for AcceptSignature {
     fn verify(
@@ -70,7 +73,8 @@ impl Runtime for FixtureRuntime {
         while self.gate.load(Ordering::SeqCst) {
             tokio::select! { _ = cancel.cancelled() => return Err(Code::Cancelled), _ = tokio::time::sleep(Duration::from_millis(5)) => {} }
         }
-        let installed = agent24_idoris::install::verify_existing(
+        let installed = agent24_idoris::install::verify_existing_on(
+            TEST_PLATFORM,
             &r.release_dir,
             &self.lock,
             &VerifiedArchive {
@@ -1241,11 +1245,13 @@ async fn start_verification_works_offline() {
         secrets: Arc::new(KeychainSource(f.keychain.clone())),
         signature: Arc::new(gatekeeper.clone()),
         lock: Arc::new(f.runtime.lock.clone()),
+        platform: Some(TEST_PLATFORM),
     };
     // Sanity: the lock demands notarization, and the offline Gatekeeper refuses it.
     assert!(IdorisLock::embedded().component_notarized());
     assert!(matches!(
-        agent24_idoris::install::verify_existing(
+        agent24_idoris::install::verify_existing_on(
+            TEST_PLATFORM,
             &f.record.release_dir,
             &f.runtime.lock,
             &VerifiedArchive {

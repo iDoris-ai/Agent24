@@ -401,6 +401,9 @@ pub struct SystemRuntime {
     pub signature: Arc<dyn SignatureVerifier + Send + Sync>,
     /// The pinned lock; tests substitute a fixture archive's digest.
     pub lock: Arc<IdorisLock>,
+    /// Platform key whose asset is verified. `None` (production) means this host's
+    /// platform; tests inject `darwin-arm64` so they behave the same on every OS.
+    pub platform: Option<&'static str>,
 }
 impl SystemRuntime {
     pub fn new(secrets: Arc<dyn SecretSource>) -> Self {
@@ -408,6 +411,7 @@ impl SystemRuntime {
             secrets,
             signature: Arc::new(Codesign),
             lock: Arc::new(IdorisLock::embedded().clone()),
+            platform: None,
         }
     }
 }
@@ -426,18 +430,30 @@ impl Runtime for SystemRuntime {
         let archive = r.archive_path.clone();
         let signature = self.signature.clone();
         let lock = self.lock.clone();
+        let platform = self.platform;
         let installed = tokio::task::spawn_blocking(move || {
             // Start must work offline: digests plus offline codesign only, never Gatekeeper.
-            agent24_idoris::install::verify_existing(
-                &dir,
-                &lock,
-                &VerifiedArchive {
-                    path: archive,
-                    sha256: String::new(),
-                },
-                signature.as_ref(),
-                VerifyMode::AtRest,
-            )
+            let archive = VerifiedArchive {
+                path: archive,
+                sha256: String::new(),
+            };
+            match platform {
+                Some(platform) => agent24_idoris::install::verify_existing_on(
+                    platform,
+                    &dir,
+                    &lock,
+                    &archive,
+                    signature.as_ref(),
+                    VerifyMode::AtRest,
+                ),
+                None => agent24_idoris::install::verify_existing(
+                    &dir,
+                    &lock,
+                    &archive,
+                    signature.as_ref(),
+                    VerifyMode::AtRest,
+                ),
+            }
         })
         .await
         .map_err(|_| Code::StartFailed)?
