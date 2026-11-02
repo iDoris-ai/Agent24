@@ -427,3 +427,9 @@ D4 原文写「退出码只区分 0、1、2」，这和 Hyphae 现有的语义�
 ### 7.10 开放项（r4 登记，不阻塞 C1）
 - iDoris 的 schema 2 锁现在是 `notarized: true`（已落地）。规则：公证检查（`spctl --type install`，需在线查票据）只在**安装时**做（`VerifyMode::Install`）；启动、恢复、状态复查只做 sha256 与离线 codesign 检查（`VerifyMode::AtRest`），离线也能启动。离线首次安装会失败（下载本来就要网络，接受）。
 - 例外：旧回执没有 `notarized_verified_at`（安装时公证校验的记录）时，启动只做 AtRest 检查，不会因此被拦；公证检查在**下一次显式 Install** 时补做并写入回执。
+
+### 7.11 C1b 落地（Agent24 侧，2026-11-02）
+- Hyphae 锁换成 v0.30.0 发布的 schema 2 锁（逐字节复制），用 `ComponentLock` 严格解析，`hyphae.release.json` 删除，schema 1 读取（`migrate_schema1`）与 `fetch_verified` 一并删除。`agent24-comm` 只嵌入锁文本：它不能依赖带 reqwest 的 `agent24-components`（COMM-5b 边界），解析在 agent24d；comm 的测试以 dev-dependency 使用同一解析器。
+- D2 订正两处，均为对已发布锁的兼容，不放宽安全判定：`provides[].name` / `summary` 改为可选（Hyphae 的锁只带 id）；`contract.tested` 与契约检查接受 `major.minor`（§7.2 CLI 的 `contract_version` 格式）和 `major.minor.patch` 两种写法。
+- 验签点：安装（含重装已存在的副本）走 `VerifyMode::Install`；agent24d 每次构建 comm 状态（启动、安装后热重建）对实际执行的那份副本走 `VerifyMode::AtRest`。`GET /comm/daemon` 的状态复查只做 sha256，不跑 codesign（每次轮询起子进程不划算；sha256 等于锁里签名后的摘要已蕴含签名字节未变）。Linux 返回显式的 `UnsignedPlatform`。
+- `stop_grace_ms`（15000）暂未接线：Hyphae 守护进程的停止宽限仍用全局 `lifecycle::Params::stop_grace`，因为 agent24d 的关停总预算按全局值算，单组件更长的宽限会被总预算截断。留待 D5 生命周期统一时按组件接入（iDoris 锁的同名字段同样未用）。
