@@ -58,6 +58,9 @@ function hyphaeLabel(component: ComponentView, t: (key: keyof typeof communicati
     if (component.reason === 'gave_up') return t('process.gaveUp')
     if (component.reason === 'backoff') return t('process.backoff')
     if (component.reason === 'starting') return t('process.starting')
+    // The daemon refused the binary it found at start (ADR-038 §7.11).
+    if (component.reason === 'signature_rejected') return t('component.signatureRejected')
+    if (component.reason === 'hash_mismatch') return t('component.hashMismatch')
     return t('component.failed')
   }
   if (component.state === 'installing') return t('component.installing')

@@ -65,7 +65,79 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 /// or its mailbox is already closed and `start()` fails cleanly without
 /// spawning anything (`agent24-comm`'s own `daemon.rs` doc comments cover
 /// that part).
-pub struct CommDaemonSlot(Mutex<CommDaemonSlotState>, CancellationToken);
+pub struct CommDaemonSlot(
+    Mutex<CommDaemonSlotState>,
+    CancellationToken,
+    Mutex<Option<Rejection>>,
+);
+
+/// Why the last attempt to bring Hyphae up refused the binary it found. A stable,
+/// path-free code: `GET /api/v1/components` (host view) shows it as the Hyphae item's
+/// `reason` with state `failed`, and `GET /api/v1/comm/daemon` as `data.rejection`.
+/// Cleared by the next attempt that does not reject a binary (a successful start, or
+/// nothing installed at all), so it never outlives the file it describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Rejection {
+    /// The bytes matched the lock but D2a refused them (codesign requirement, Team ID,
+    /// Hardened Runtime, or the checker could not run).
+    SignatureRejected,
+    /// The binary's SHA-256 is not the one the lock pins.
+    HashMismatch,
+}
+
+impl Rejection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SignatureRejected => "signature_rejected",
+            Self::HashMismatch => "hash_mismatch",
+        }
+    }
+}
+
+/// A failed build of the comm state: the (log-only) message, and the stable
+/// [`Rejection`] when the failure was the binary itself being refused.
+#[derive(Debug)]
+struct BuildFailure {
+    reason: String,
+    rejection: Option<Rejection>,
+}
+
+impl BuildFailure {
+    fn rejected(rejection: Rejection, reason: String) -> Self {
+        Self {
+            reason,
+            rejection: Some(rejection),
+        }
+    }
+}
+
+impl From<String> for BuildFailure {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            rejection: None,
+        }
+    }
+}
+
+impl From<&str> for BuildFailure {
+    fn from(reason: &str) -> Self {
+        reason.to_owned().into()
+    }
+}
+
+/// `BinaryError::HashMismatch` is the lock refusing the bytes; anything else
+/// (missing file, I/O) is not a verdict on the binary.
+fn binary_failure(e: agent24_comm::BinaryError) -> BuildFailure {
+    let reason = format!("Hyphae binary verification failed: {e}");
+    match e {
+        agent24_comm::BinaryError::HashMismatch { .. } => {
+            BuildFailure::rejected(Rejection::HashMismatch, reason)
+        }
+        _ => reason.into(),
+    }
+}
 
 enum CommDaemonSlotState {
     Empty,
@@ -81,6 +153,7 @@ impl CommDaemonSlot {
         Self(
             Mutex::new(CommDaemonSlotState::Empty),
             CancellationToken::new(),
+            Mutex::new(None),
         )
     }
 
@@ -98,6 +171,8 @@ impl CommDaemonSlot {
             CommDaemonSlotState::Closed => false,
             _ => {
                 *guard = CommDaemonSlotState::Registered(handle);
+                // A verified binary now owns the slot: no earlier refusal applies.
+                self.set_rejection(None);
                 true
             }
         }
@@ -115,6 +190,21 @@ impl CommDaemonSlot {
             CommDaemonSlotState::Registered(handle) => Ok(Some(handle.clone())),
             CommDaemonSlotState::Empty => Ok(None),
         }
+    }
+
+    /// Why the last build refused the binary, if it did (see [`Rejection`]).
+    pub fn rejection(&self) -> Option<Rejection> {
+        *self
+            .2
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_rejection(&self, rejection: Option<Rejection>) {
+        *self
+            .2
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = rejection;
     }
 
     /// The registered supervisor, if any (read-only; status for `/api/v1/components`).
@@ -153,7 +243,8 @@ impl Default for CommDaemonSlot {
 async fn resolve_source_path(
     state_dir: &Path,
     lock: &HyphaeLock,
-) -> Result<Option<PathBuf>, String> {
+    platform: &str,
+) -> Result<Option<PathBuf>, BuildFailure> {
     let primary = std::env::var_os("A24_HYPHAE_BIN").map(PathBuf::from);
     let deprecated = std::env::var_os("A24_SPEAKER_BIN").map(PathBuf::from);
     if primary.is_none() && deprecated.is_some() {
@@ -168,7 +259,7 @@ async fn resolve_source_path(
         &lock.installed_path(state_dir),
         sibling,
         lock,
-        &current_platform(),
+        platform,
     )
     .await
 }
@@ -180,7 +271,7 @@ async fn resolve_candidates(
     sibling: Option<PathBuf>,
     lock: &HyphaeLock,
     platform: &str,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<PathBuf>, BuildFailure> {
     if let Some(path) = primary.or(deprecated) {
         return Ok(Some(path));
     }
@@ -194,12 +285,15 @@ async fn resolve_candidates(
                 .map_err(|e| e.to_string())?;
             let expected = lock.expected_for(platform).map_err(|e| e.to_string())?;
             if agent24_comm::binary::sha256_of(&bytes) != expected {
-                return Err("installed Hyphae component does not match the locked SHA-256".into());
+                return Err(BuildFailure::rejected(
+                    Rejection::HashMismatch,
+                    "installed Hyphae component does not match the locked SHA-256".into(),
+                ));
             }
             Ok(Some(component.to_path_buf()))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(sibling.filter(|p| p.is_file())),
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(e.to_string().into()),
     }
 }
 
@@ -213,6 +307,13 @@ struct CommPaths<'a> {
     autostart_path: &'a Path,
 }
 
+/// What a binary is checked against: the lock, the D2a verifier, the lock platform.
+struct Verification<'a> {
+    lock: &'a HyphaeLock,
+    verifier: &'a Verifier,
+    platform: &'a str,
+}
+
 async fn build_ready_state(
     source: &Path,
     paths: &CommPaths<'_>,
@@ -224,9 +325,13 @@ async fn build_ready_state(
     // default (500ms vs. this crate's unvalidated 5s).
     grace: Duration,
     slot: &CommDaemonSlot,
-    lock: &HyphaeLock,
-    verifier: &Verifier,
-) -> Result<CommState, String> {
+    check: &Verification<'_>,
+) -> Result<CommState, BuildFailure> {
+    let Verification {
+        lock,
+        verifier,
+        platform,
+    } = *check;
     let CommPaths {
         home,
         install_dir,
@@ -240,25 +345,29 @@ async fn build_ready_state(
     tokio::fs::create_dir_all(home)
         .await
         .map_err(|e| format!("creating {}: {e}", home.display()))?;
-    let platform = current_platform();
     let expected = lock
-        .expected_for(&platform)
+        .expected_for(platform)
         .map_err(|e| format!("no verified Hyphae binary for platform {platform}: {e}"))?;
     let bin = VerifiedBinary::install(&source, expected, install_dir)
         .await
-        .map_err(|e| format!("Hyphae binary verification failed: {e}"))?;
+        .map_err(binary_failure)?;
     // ADR-038 D2a `AtRest`, on the exact copy that will run: offline (no Gatekeeper
     // round-trip), so an installed Hyphae still starts without a network. Notarization
     // was established by the install-time check. Linux: sha256 above is the whole check.
     crate::hyphae_install::verify_signature(
         lock,
-        &platform,
+        platform,
         bin.path(),
         verifier,
         VerifyMode::AtRest,
     )
     .await
-    .map_err(|e| format!("Hyphae signature verification failed: {e}"))?;
+    .map_err(|e| {
+        BuildFailure::rejected(
+            Rejection::SignatureRejected,
+            format!("Hyphae signature verification failed: {e}"),
+        )
+    })?;
     let runner = Arc::new(HyphaeRunner::new(bin, home.to_path_buf(), DEFAULT_TIMEOUT));
     // COMM-4a §6.1 "孤儿识别": before this `agent24d` ever spawns a Hyphae
     // daemon of its own, clean up one left behind by a previous `agent24d`
@@ -367,6 +476,7 @@ pub async fn build(state_dir: &Path, grace: Duration, slot: &Arc<CommDaemonSlot>
         slot: slot.clone(),
         lock,
         verifier: Arc::new(agent24_components::sign::Codesign),
+        platform: current_platform(),
         password_store: select_password_store(),
         routes: RwLock::new(Router::new()),
         installation: AsyncMutex::new(()),
@@ -382,6 +492,8 @@ struct CommRuntime {
     lock: HyphaeLock,
     /// D2a verifier (codesign/spctl); only consulted for macOS assets.
     verifier: Verifier,
+    /// The lock platform this daemon runs as (`current_platform()` in production).
+    platform: String,
     password_store: Result<Arc<dyn PasswordStore>, String>,
     routes: RwLock<Router>,
     installation: AsyncMutex<()>,
@@ -401,12 +513,28 @@ impl CommRuntime {
         }
     }
 
+    /// Build the comm state and record on the slot why a binary was refused, or that
+    /// none was: every outcome other than a rejection clears an earlier one.
     async fn try_build_state(&self) -> Result<CommState, String> {
+        match self.build_state_or_failure().await {
+            Ok(state) => {
+                self.slot.set_rejection(None);
+                Ok(state)
+            }
+            Err(failure) => {
+                self.slot.set_rejection(failure.rejection);
+                Err(failure.reason)
+            }
+        }
+    }
+
+    async fn build_state_or_failure(&self) -> Result<CommState, BuildFailure> {
         let password_store = match &self.password_store {
             Ok(store) => store.clone(),
-            Err(reason) => return Err(reason.clone()),
+            Err(reason) => return Err(reason.clone().into()),
         };
-        let Some(source) = resolve_source_path(&self.state_dir, &self.lock).await? else {
+        let Some(source) = resolve_source_path(&self.state_dir, &self.lock, &self.platform).await?
+        else {
             return Ok(CommState::unconfigured(
                 "no Hyphae binary is configured; download and set up Hyphae",
             ));
@@ -425,8 +553,11 @@ impl CommRuntime {
             password_store,
             self.grace,
             &self.slot,
-            &self.lock,
-            &self.verifier,
+            &Verification {
+                lock: &self.lock,
+                verifier: &self.verifier,
+                platform: &self.platform,
+            },
         )
         .await
     }
@@ -439,7 +570,7 @@ impl CommRuntime {
             &self.lock.installed_path(&self.state_dir),
             None,
             &self.lock,
-            &current_platform(),
+            &self.platform,
         )
         .await
         .ok()
@@ -451,7 +582,7 @@ impl CommRuntime {
         let _install = self.installation.lock().await;
         let path = crate::hyphae_install::install(
             &self.lock,
-            &current_platform(),
+            &self.platform,
             &self.state_dir,
             &self.verifier,
             &self.slot.1,
@@ -541,11 +672,9 @@ async fn component_status(State(runtime): State<Arc<CommRuntime>>) -> Response {
             "relay_probe": null, "catch_up": {"state": "unknown", "last_incomplete_at_ms": null},
         }});
     }
-    value["data"]["installable"] = runtime
-        .lock
-        .expected_for(&current_platform())
-        .is_ok()
-        .into();
+    value["data"]["installable"] = runtime.lock.expected_for(&runtime.platform).is_ok().into();
+    // Stable code for a refused binary (`signature_rejected` | `hash_mismatch`), or null.
+    value["data"]["rejection"] = json!(runtime.slot.rejection());
     value["data"]["installed_version"] = json!(runtime.installed_version().await);
     Json(value).into_response()
 }
@@ -571,6 +700,11 @@ fn install_failure(message: String) -> (StatusCode, Json<Value>) {
 const NEEDS_NETWORK: &str = "Hyphae's notarization could not be confirmed: verifying \
      notarization needs internet access. Connect to the internet and install again.";
 
+/// `codesign` (or `spctl`) never produced a verdict: it could not be started, or the
+/// check died before Gatekeeper was asked. Connectivity is not the problem here.
+const CHECKER_UNAVAILABLE: &str = "Hyphae was not installed: the system signature checker \
+     could not be run. See the agent24d log.";
+
 /// Map an installation failure to a stable code and a fixed, path-free message.
 ///
 /// `POST /comm/install` is host-only (ProductHost / legacy token; FirstPartyShell
@@ -591,12 +725,28 @@ fn install_error(error: InstallError) -> (StatusCode, Json<Value>) {
             "hyphae_hash_mismatch",
             "the Hyphae binary does not match the pinned SHA-256".into(),
         ),
-        // D2a: the bytes matched the lock, but Gatekeeper's verdict could not be had or
-        // was negative; offline is the common case (and a spctl deadline is offline too).
-        InstallError::Signature(SignError::NotNotarized | SignError::Io(_)) => (
+        // D2a: the bytes matched the lock, but Gatekeeper's verdict was negative or its
+        // online lookup stalled past the deadline; offline is the common cause of both.
+        InstallError::Signature(SignError::NotNotarized) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             "hyphae_signature_rejected",
             NEEDS_NETWORK.into(),
+        ),
+        InstallError::Signature(SignError::NotarizationCheckFailed(e))
+            if e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "hyphae_signature_rejected",
+                NEEDS_NETWORK.into(),
+            )
+        }
+        // No verdict at all: spctl could not be started, or `codesign` could not be run /
+        // finish (`Io`), so Gatekeeper never ran and "needs internet" would be a guess.
+        InstallError::Signature(SignError::NotarizationCheckFailed(_) | SignError::Io(_)) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "hyphae_signature_rejected",
+            CHECKER_UNAVAILABLE.into(),
         ),
         InstallError::Signature(_) => (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -652,7 +802,7 @@ mod install_error_tests {
     fn signature_failures_have_their_own_code_and_offline_says_so() {
         for offline in [
             SignError::NotNotarized,
-            SignError::Io(std::io::Error::new(
+            SignError::NotarizationCheckFailed(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "/usr/sbin/spctl did not finish within 60s",
             )),
@@ -661,6 +811,28 @@ mod install_error_tests {
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
             assert_eq!(code, "hyphae_signature_rejected");
             assert!(message.contains("needs internet access"), "{message}");
+        }
+        // #1551 L2: Gatekeeper never ran (codesign could not be spawned or timed out, or
+        // spctl could not be started): same code, but not blamed on the network.
+        for no_verdict in [
+            SignError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "/usr/bin/codesign did not finish within 60s",
+            )),
+            SignError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No such file or directory",
+            )),
+            SignError::NotarizationCheckFailed(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No such file or directory",
+            )),
+        ] {
+            let (status, code, message) = map(InstallError::Signature(no_verdict));
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(code, "hyphae_signature_rejected");
+            assert_eq!(message, CHECKER_UNAVAILABLE);
+            assert!(!message.contains("internet"), "{message}");
         }
         for rejected in [
             SignError::SignatureMismatch,
@@ -880,17 +1052,26 @@ mod hy1_regression_tests {
     const FIXTURE: &[u8] = b"#!/bin/sh\necho '{\"ok\":true,\"data\":[]}'\n";
 
     async fn runtime(dir: &Path) -> Arc<CommRuntime> {
-        let platform = current_platform();
+        // Fixture scripts carry no signature; the policy itself is tested in
+        // hyphae_install.rs. This accepts every executable it is shown.
+        runtime_with(
+            dir,
+            &current_platform(),
+            Arc::new(agent24_components::sign::Unsigned),
+        )
+        .await
+    }
+
+    async fn runtime_with(dir: &Path, platform: &str, verifier: Verifier) -> Arc<CommRuntime> {
         let lock =
-            HyphaeLock::override_for_test(&platform, agent24_comm::binary::sha256_of(FIXTURE));
+            HyphaeLock::override_for_test(platform, agent24_comm::binary::sha256_of(FIXTURE));
         let runtime = Arc::new(CommRuntime {
             state_dir: dir.to_path_buf(),
             grace: Duration::from_millis(50),
             slot: Arc::new(CommDaemonSlot::new()),
             lock,
-            // Fixture scripts carry no signature; the policy itself is tested in
-            // hyphae_install.rs. This accepts every executable it is shown.
-            verifier: Arc::new(agent24_components::sign::Unsigned),
+            verifier,
+            platform: platform.to_owned(),
             password_store: Ok(Arc::new(MemoryPasswordStore::new())),
             routes: RwLock::new(agent24_comm::router(CommState::unconfigured(
                 "no Hyphae binary is configured",
@@ -1134,7 +1315,8 @@ mod hy1_regression_tests {
             let err = resolve_candidates(None, None, &component, Some(sibling), &lock, &platform)
                 .await
                 .unwrap_err();
-            assert!(err.contains("regular file"), "{err}");
+            assert!(err.reason.contains("regular file"), "{err:?}");
+            assert_eq!(err.rejection, None, "not a verdict on the bytes");
         }
     }
 
@@ -1147,5 +1329,188 @@ mod hy1_regression_tests {
         let (status, result) = request(&app, "POST", "/api/v1/comm/install").await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(result["error"], "hyphae_download_failed");
+    }
+
+    /// A D2a verifier that refuses (as `codesign` would for a wrong Team ID) until told
+    /// otherwise, so one runtime can go from rejected to recovered.
+    #[derive(Default)]
+    struct Switch {
+        refuse: std::sync::atomic::AtomicBool,
+    }
+    impl agent24_components::SignatureVerifier for Switch {
+        fn verify(
+            &self,
+            _: &Path,
+            _: &agent24_components::SigningRequirement,
+        ) -> Result<(), SignError> {
+            if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(SignError::SignatureMismatch)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// The startup path of [`build`]: build the state once and publish its routes.
+    async fn start(runtime: &Arc<CommRuntime>) {
+        let state = runtime.build_state().await;
+        *runtime.routes.write().await = agent24_comm::router(state);
+    }
+
+    /// `GET /api/v1/components` through the real router, as the host and as a
+    /// first-party (redacted) caller, sharing `runtime`'s slot.
+    async fn components(runtime: &Arc<CommRuntime>) -> (Value, Value) {
+        use crate::enroll_api::EnrollAuthority;
+        let (mut state, host, _creative) = crate::server::tests::capability_state().await;
+        state.comm_slot = Some(runtime.slot.clone());
+        let first_party = state
+            .first_party
+            .as_ref()
+            .unwrap()
+            .issue(&crate::capabilities::first_party::test_peer("daemon-test"))
+            .unwrap()
+            .secret
+            .to_string();
+        let app = crate::server::build_router(state);
+        let mut out = Vec::new();
+        for token in [host, first_party] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/components")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            let hyphae = body["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == "hyphae")
+                .cloned()
+                .unwrap();
+            out.push(hyphae);
+        }
+        (out.remove(0), out.remove(0))
+    }
+
+    async fn install_fixture(runtime: &CommRuntime, dir: &Path, bytes: &[u8]) {
+        let installed = runtime.lock.installed_path(dir);
+        tokio::fs::create_dir_all(installed.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&installed, bytes).await.unwrap();
+    }
+
+    async fn shutdown(runtime: &CommRuntime) {
+        if let Some(handle) = runtime.slot.close() {
+            handle.shutdown(tokio::time::Instant::now()).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_signature_reads_failed_signature_rejected_and_recovers_after_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let switch = Arc::new(Switch::default());
+        switch
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // darwin-arm64 on every host, so the (fake) codesign check runs even on Linux CI.
+        let runtime = runtime_with(dir.path(), "darwin-arm64", switch.clone()).await;
+        install_fixture(&runtime, dir.path(), FIXTURE).await;
+        start(&runtime).await;
+        assert_eq!(runtime.slot.rejection(), Some(Rejection::SignatureRejected));
+
+        let (host, redacted) = components(&runtime).await;
+        assert_eq!(host["state"], "failed");
+        assert_eq!(host["reason"], "signature_rejected");
+        // Redacted keeps only {id, version, state, provides}: no reason.
+        let keys: Vec<_> = redacted.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys, ["id", "provides", "state", "version"]);
+        assert_eq!(redacted["state"], "failed");
+
+        let app = runtime_router(runtime.clone());
+        let (status, daemon) = request(&app, "GET", "/api/v1/comm/daemon").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(daemon["data"]["rejection"], "signature_rejected");
+        assert_eq!(daemon["data"]["process"]["state"], "not_configured");
+
+        // The checker now accepts it: a host install rebuilds and clears the rejection.
+        switch
+            .refuse
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let (status, installed) = request(&app, "POST", "/api/v1/comm/install").await;
+        assert_eq!(status, StatusCode::OK, "{installed}");
+        assert_eq!(installed["data"]["restart_required"], false);
+        assert_eq!(runtime.slot.rejection(), None);
+        let (host, _) = components(&runtime).await;
+        assert_ne!(host["state"], "failed", "{host}");
+        assert_ne!(host["state"], "absent", "{host}");
+        assert!(host.get("reason").is_none_or(|r| r != "signature_rejected"));
+        let (_, daemon) = request(&app, "GET", "/api/v1/comm/daemon").await;
+        assert_eq!(daemon["data"]["rejection"], Value::Null);
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test]
+    async fn wrong_sha_reads_failed_hash_mismatch_and_recovers_on_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime(dir.path()).await;
+        install_fixture(&runtime, dir.path(), b"tampered").await;
+        start(&runtime).await;
+
+        let (host, redacted) = components(&runtime).await;
+        assert_eq!(host["state"], "failed");
+        assert_eq!(host["reason"], "hash_mismatch");
+        assert_eq!(redacted["state"], "failed");
+        assert!(redacted.get("reason").is_none());
+        let app = runtime_router(runtime.clone());
+        let (_, daemon) = request(&app, "GET", "/api/v1/comm/daemon").await;
+        assert_eq!(daemon["data"]["rejection"], "hash_mismatch");
+        assert_eq!(daemon["data"]["installed_version"], Value::Null);
+
+        // The right bytes are back: the next start clears it.
+        install_fixture(&runtime, dir.path(), FIXTURE).await;
+        start(&runtime).await;
+        assert_eq!(runtime.slot.rejection(), None);
+        let (host, _) = components(&runtime).await;
+        assert_ne!(host["state"], "failed", "{host}");
+        let (_, daemon) = request(&app, "GET", "/api/v1/comm/daemon").await;
+        assert_eq!(daemon["data"]["rejection"], Value::Null);
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test]
+    async fn not_installed_stays_absent_and_a_later_absence_clears_a_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime(dir.path()).await;
+        start(&runtime).await;
+        let (host, redacted) = components(&runtime).await;
+        assert_eq!(host["state"], "absent");
+        assert!(host.get("reason").is_none(), "{host}");
+        assert_eq!(redacted["state"], "absent");
+        let app = runtime_router(runtime.clone());
+        let (_, daemon) = request(&app, "GET", "/api/v1/comm/daemon").await;
+        assert_eq!(daemon["data"]["rejection"], Value::Null);
+
+        // Rejected, then the bad file is deleted: back to plain `absent`, not `failed`.
+        install_fixture(&runtime, dir.path(), b"tampered").await;
+        start(&runtime).await;
+        assert_eq!(runtime.slot.rejection(), Some(Rejection::HashMismatch));
+        tokio::fs::remove_file(runtime.lock.installed_path(dir.path()))
+            .await
+            .unwrap();
+        start(&runtime).await;
+        let (host, _) = components(&runtime).await;
+        assert_eq!(host["state"], "absent");
+        assert!(host.get("reason").is_none(), "{host}");
     }
 }

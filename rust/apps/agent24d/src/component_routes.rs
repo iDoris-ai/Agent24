@@ -241,6 +241,15 @@ fn hyphae_item(state: &AppState) -> Item {
             "min_minor": lock.contract.min_minor,
         }}));
     });
+    // A binary the last start (or install rebuild) refused is `failed` with the stable
+    // code, ahead of any supervisor left registered from before. Host view only: the
+    // redacted view drops `reason`. Not installed at all keeps the plain `absent`.
+    if let Some(rejection) = state.comm_slot.as_ref().and_then(|slot| slot.rejection()) {
+        return item.with(|i| {
+            i.state = ComponentState::Failed;
+            i.reason = Some(rejection.as_str().to_owned());
+        });
+    }
     let Some(daemon) = state.comm_slot.as_ref().and_then(|slot| slot.current()) else {
         return item;
     };
