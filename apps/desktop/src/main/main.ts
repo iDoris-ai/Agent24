@@ -7,7 +7,7 @@ import { registerCliTool } from './ipc/cli-tool'
 import { initMainLocale, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
-import { BackendManager, daemonConnection, setBundledPackaged } from './backend-manager'
+import { BackendManager, daemonAuthMode, daemonConnection, onDaemonReady, setBundledPackaged } from './backend-manager'
 import { PresencePoller, defaultPresenceDeps, showPresenceDialog } from './presence-poller'
 import { AgentEarEventBridge } from './agentear-events'
 import { documentsEvent } from './documents'
@@ -94,6 +94,7 @@ let knowledge: KnowledgeController | null = null
 let presencePoller: PresencePoller | null = null
 let openDesignComponent: OpenDesignComponentInstaller | null = null
 let openDesignReporter: OpenDesignStatusReporter | null = null
+let stopOpenDesignReady: (() => void) | null = null
 let creativeView: WebContentsView | null = null
 let creativeOrigin: string | null = null
 const creativeViewFence = new CreativeViewRequestFence()
@@ -304,10 +305,14 @@ app.whenReady().then(async () => {
       })
     },
     connection: daemonConnection,
+    authMode: daemonAuthMode,
     send: postOpenDesignReport,
   })
   creativeServeWeb.onStatus(() => openDesignReporter?.notify())
   openDesignReporter.start()
+  // Ready lands after start(), and a restarted daemon has not seen the last
+  // payload. reportNow skips dedupe and ends a 403/404 suspension.
+  stopOpenDesignReady = onDaemonReady(() => openDesignReporter?.reportNow())
   // Dev-only: show the real app icon in the dock immediately, without
   // waiting for an electron-builder packaged build (which is where mac.icon
   // in package.json normally takes effect).
@@ -482,6 +487,8 @@ app.on('before-quit', () => {
 
 app.on('will-quit', () => {
   if (trayTimer) { clearInterval(trayTimer); trayTimer = null }
+  stopOpenDesignReady?.()
+  stopOpenDesignReady = null
   openDesignReporter?.stop()
   agentEarBridge.stop()
   agentEarLog.stop()

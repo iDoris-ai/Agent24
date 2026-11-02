@@ -140,6 +140,32 @@ describe('A1 renderer call sites are covered by the allowlist (positive control)
   }
 })
 
+describe('open-design report route stays out of renderer and preload source', () => {
+  function productionSources(dir: string): string[] {
+    const out: string[] = []
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) out.push(...productionSources(full))
+      else if (/\.(ts|tsx)$/.test(entry.name) && !/\.(test|spec)\./.test(entry.name)) out.push(full)
+    }
+    return out
+  }
+
+  it('does not mention components/open-design/report or /report', () => {
+    const files = [
+      ...productionSources(path.join(__dirname, '../renderer')),
+      path.join(__dirname, 'preload.ts'),
+      path.join(__dirname, 'backup-password-preload.ts'),
+    ]
+    expect(files.length).toBeGreaterThan(10)
+    const hits = files.filter((file) => {
+      const text = fs.readFileSync(file, 'utf8')
+      return text.includes('components/open-design/report') || text.includes('/report')
+    })
+    expect(hits).toEqual([])
+  })
+})
+
 describe('A2 proxyRequest', () => {
   const servers: http.Server[] = []
   afterEach(async () => {

@@ -2,7 +2,7 @@
 // daemon. The renderer never sees this path or the ProductHost credential.
 
 import http from 'node:http'
-import type { DaemonConnection } from './backend-manager'
+import type { DaemonAuthMode, DaemonConnection } from './backend-manager'
 import type { OpenDesignComponentState } from './open-design-component'
 import type { SidecarState } from './sidecar-contract'
 import type { ComponentState } from '../shared/component-state'
@@ -133,25 +133,45 @@ export function postOpenDesignReport(connection: DaemonConnection, body: OpenDes
 export interface OpenDesignReporterDeps {
   snapshot: () => OpenDesignReport
   connection: () => DaemonConnection | null
+  /**
+   * Auth mode of the daemon `connection()` would reach. Null while that
+   * daemon is not up. Anything other than `capabilities` is not reported.
+   */
+  authMode?: () => DaemonAuthMode | null
   send: (connection: DaemonConnection, body: OpenDesignReport) => Promise<number>
   log?: (message: string) => void
+  /** Legacy-mode skip. Defaults to console.info. Failures stay on `log`. */
+  info?: (message: string) => void
 }
 
 /**
- * Reports on start and on every mapped-state change, and repeats the current
- * state every {@link OPEN_DESIGN_HEARTBEAT_MS}. A failed attempt is logged and
- * retried on the next change or heartbeat. `stop` clears the timer.
+ * Reports on start, on every mapped-state change, and again every
+ * {@link OPEN_DESIGN_HEARTBEAT_MS}. `reportNow` sends even when the payload
+ * matches the last success; backend ready uses it so a new daemon is not
+ * stuck until the next heartbeat. A daemon that is not in capabilities mode
+ * is not reported (one info line). HTTP 403/404 stops reporting until the
+ * next `reportNow` (one warn). Other failures are logged and retried on the
+ * next change or heartbeat. `stop` clears the timer.
  */
 export class OpenDesignStatusReporter {
   private timer: ReturnType<typeof setInterval> | null = null
   private stopped = true
   private lastPayload = ''
   private lastOk = false
+  /** Quiet until the next `reportNow`: legacy mode, or a 403/404 from this daemon. */
+  private blocked: 'auth' | 'route' | null = null
+  private authSkipLogged = false
+  /** Bumped by `reportNow` so an in-flight attempt cannot re-block the new daemon. */
+  private epoch = 0
   private chain: Promise<void> = Promise.resolve()
   private readonly log: (message: string) => void
+  private readonly info: (message: string) => void
+  private readonly authMode: () => DaemonAuthMode | null
 
   constructor(private readonly deps: OpenDesignReporterDeps) {
     this.log = deps.log ?? ((message) => console.warn(`[open-design-report] ${message}`))
+    this.info = deps.info ?? ((message) => console.info(`[open-design-report] ${message}`))
+    this.authMode = deps.authMode ?? (() => 'capabilities')
   }
 
   start(): void {
@@ -170,6 +190,18 @@ export class OpenDesignStatusReporter {
     this.enqueue(this.deps.snapshot(), false)
   }
 
+  /**
+   * Send the current snapshot now, even when it matches the last accepted
+   * report. Backend ready calls this: that daemon has not seen the payload,
+   * and a 403/404 suspension ends here.
+   */
+  reportNow(): void {
+    if (this.stopped) return
+    this.epoch += 1
+    this.blocked = null
+    this.enqueue(this.deps.snapshot(), true)
+  }
+
   stop(): void {
     this.stopped = true
     if (this.timer) {
@@ -180,15 +212,26 @@ export class OpenDesignStatusReporter {
 
   private enqueue(body: OpenDesignReport, force: boolean): void {
     const payload = JSON.stringify(body)
-    this.chain = this.chain.then(() => this.send(body, payload, force)).catch((error: unknown) => {
+    const epoch = this.epoch
+    this.chain = this.chain.then(() => this.send(body, payload, force, epoch)).catch((error: unknown) => {
       this.lastOk = false
       this.log(`open-design report failed: ${error instanceof Error ? error.message : String(error)}`)
     })
   }
 
-  private async send(body: OpenDesignReport, payload: string, force: boolean): Promise<void> {
-    if (this.stopped) return
+  private async send(body: OpenDesignReport, payload: string, force: boolean, epoch: number): Promise<void> {
+    if (this.stopped || epoch !== this.epoch || this.blocked) return
     if (!force && payload === this.lastPayload && this.lastOk) return
+    const mode = this.authMode()
+    if (mode !== null && mode !== 'capabilities') {
+      this.lastOk = false
+      this.blocked = 'auth'
+      if (!this.authSkipLogged) {
+        this.authSkipLogged = true
+        this.info(`open-design report skipped: daemon auth mode is ${mode}, not capabilities`)
+      }
+      return
+    }
     const connection = this.deps.connection()
     if (!connection) {
       this.lastOk = false
@@ -203,12 +246,18 @@ export class OpenDesignStatusReporter {
       this.log(`open-design report failed: ${error instanceof Error ? error.message : String(error)}`)
       return
     }
+    if (this.stopped || epoch !== this.epoch) return
     if (status === 204) {
       this.lastPayload = payload
       this.lastOk = true
       return
     }
     this.lastOk = false
+    if (status === 403 || status === 404) {
+      this.blocked = 'route'
+      this.log(`open-design report stopped: HTTP ${status}`)
+      return
+    }
     this.log(`open-design report failed: HTTP ${status}`)
   }
 }

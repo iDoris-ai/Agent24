@@ -594,8 +594,9 @@ export class CreativeServeWeb {
       }
       this.observeRetainedOwner(child)
     } else if (headless) {
-      // The instance is no longer in a run. A null phase reports `installed`.
-      this.headlessPhase = null
+      // A clean stop stays on the sidecar state `stopped`. D5 accepts
+      // stopping → stopped, and the next launch is stopped → starting.
+      this.headlessPhase = 'stopped'
       this.emitStatus()
     }
     return this.status()

@@ -10,7 +10,7 @@ import {
   revealCommExport,
   CommApiError, type CommDaemonStatus,
 } from './api'
-import type { ComponentView } from '../../components/componentApi'
+import { listComponents, type ComponentView } from '../../components/componentApi'
 
 const hyphaeBox = vi.hoisted(() => ({
   mode: 'ready' as 'ready' | 'error' | 'missing',
@@ -333,6 +333,42 @@ describe('CommunicationPage usability', () => {
     const calls = vi.mocked(getCommStatus).mock.calls.length
     await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
     expect(vi.mocked(getCommStatus).mock.calls.length).toBe(calls)
+  })
+
+  it('drops a component poll that resolves after a newer refresh', async () => {
+    success()
+    vi.useFakeTimers()
+    const startingComponent: ComponentView = { ...readyHyphae, state: 'starting' }
+    const readyComponent: ComponentView = { ...readyHyphae, state: 'ready' }
+    vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, state: 'starting' } })
+    const release: { poll?: (list: ComponentView[]) => void } = {}
+    vi.mocked(listComponents)
+      .mockImplementationOnce(async () => [startingComponent])
+      .mockImplementationOnce(() => new Promise((resolve) => { release.poll = resolve }))
+      .mockImplementationOnce(async () => [readyComponent])
+    try {
+      render(<CommunicationPage />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(10) })
+      expect(screen.getByText('Starting…')).toBeInTheDocument()
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(1000) })
+      expect(release.poll).toEqual(expect.any(Function))
+
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Refresh' })) })
+      expect(screen.getByText('Running')).toBeInTheDocument()
+      expect(screen.getByText('Running')).toHaveAttribute('data-state', 'ready')
+
+      await act(async () => { release.poll?.([startingComponent]) })
+      expect(screen.getByText('Running')).toHaveAttribute('data-state', 'ready')
+      expect(screen.queryByText('Starting…')).not.toBeInTheDocument()
+    } finally {
+      vi.mocked(listComponents).mockReset()
+      vi.mocked(listComponents).mockImplementation(async () => {
+        if (hyphaeBox.mode === 'error') throw new Error('components down')
+        if (hyphaeBox.mode === 'missing') return []
+        return [hyphaeBox.component]
+      })
+    }
   })
 
   it('stops polling after about 30 seconds and when unmounted', async () => {

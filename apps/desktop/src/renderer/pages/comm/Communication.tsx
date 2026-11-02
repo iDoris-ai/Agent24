@@ -250,10 +250,15 @@ export default function CommunicationPage() {
     const timer = setInterval(() => {
       ticks += 1
       if (ticks > POLL_MAX_TICKS) { clearInterval(timer); return }
+      const token = sequence.current
       pollCommStatus().then((next) => { if (mounted.current) setDaemon(next) }).catch(() => undefined)
       listComponents().then((list) => {
-        if (mounted.current) setHyphaePhase({ kind: 'ready', component: list.find((item) => item.id === 'hyphae') ?? null })
-      }).catch(() => { if (mounted.current) setHyphaePhase({ kind: 'error' }) })
+        if (!mounted.current || token !== sequence.current) return
+        setHyphaePhase({ kind: 'ready', component: list.find((item) => item.id === 'hyphae') ?? null })
+      }).catch(() => {
+        if (!mounted.current || token !== sequence.current) return
+        setHyphaePhase({ kind: 'error' })
+      })
     }, POLL_INTERVAL_MS)
     return () => clearInterval(timer)
   }, [processState, componentFollow])

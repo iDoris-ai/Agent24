@@ -1,8 +1,17 @@
+import { EventEmitter } from 'node:events'
 import http from 'node:http'
+import type { ChildProcess } from 'node:child_process'
 import type { AddressInfo } from 'node:net'
+import { PassThrough } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import {
+  BackendManager,
+  daemonAuthMode,
+  daemonConnection,
+  onDaemonReady,
+  type ExternalDaemonSource,
+} from './backend-manager'
 import type { OpenDesignComponentState } from './open-design-component'
-import type { SidecarState } from './sidecar-contract'
 import {
   OPEN_DESIGN_HEARTBEAT_MS,
   OPEN_DESIGN_REPORT_PATH,
@@ -12,6 +21,8 @@ import {
   type OpenDesignReport,
   type OpenDesignReportInput,
 } from './open-design-report'
+import { CLIENT_PROTOCOL_VERSION } from './protocol-compatibility'
+import type { SidecarState } from './sidecar-contract'
 
 const VERSION = '0.26.1'
 
@@ -75,8 +86,10 @@ describe('OpenDesignStatusReporter', () => {
     let connection: { port: number; authHeaders: Record<string, string> } | null = {
       port: 9, authHeaders: { Authorization: 'Bearer host' },
     }
+    let authMode: 'legacy' | 'capabilities' | null = 'capabilities'
     const sent: OpenDesignReport[] = []
     const logs: string[] = []
+    const infos: string[] = []
     const send = vi.fn(async (_connection: unknown, reportBody: OpenDesignReport) => {
       sent.push(reportBody)
       return 204
@@ -84,16 +97,20 @@ describe('OpenDesignStatusReporter', () => {
     const reporter = new OpenDesignStatusReporter({
       snapshot: () => body,
       connection: () => connection,
+      authMode: () => authMode,
       send,
       log: (message) => { logs.push(message) },
+      info: (message) => { infos.push(message) },
     })
     return {
       reporter,
       sent,
       logs,
+      infos,
       send,
       setBody: (next: OpenDesignReport) => { body = next },
       setConnection: (next: typeof connection) => { connection = next },
+      setAuthMode: (next: typeof authMode) => { authMode = next },
     }
   }
 
@@ -131,19 +148,19 @@ describe('OpenDesignStatusReporter', () => {
     expect(() => reporter.notify()).not.toThrow()
     await flush()
     expect(logs.some((line) => line.includes('socket hang up'))).toBe(true)
-    send.mockResolvedValueOnce(403)
+    send.mockResolvedValueOnce(500)
     expect(() => reporter.notify()).not.toThrow()
     await flush()
-    expect(logs.some((line) => line.includes('403'))).toBe(true)
+    expect(logs.some((line) => line.includes('500'))).toBe(true)
     setConnection(null)
     reporter.notify()
     await flush()
     expect(logs.some((line) => line.includes('not up'))).toBe(true)
     setConnection({ port: 9, authHeaders: { Authorization: 'Bearer host' } })
-    send.mockResolvedValueOnce(404)
+    send.mockResolvedValueOnce(502)
     await vi.advanceTimersByTimeAsync(OPEN_DESIGN_HEARTBEAT_MS)
     await flush()
-    expect(logs.some((line) => line.includes('404'))).toBe(true)
+    expect(logs.some((line) => line.includes('502'))).toBe(true)
     send.mockResolvedValueOnce(204)
     await vi.advanceTimersByTimeAsync(OPEN_DESIGN_HEARTBEAT_MS)
     await flush()
@@ -165,6 +182,191 @@ describe('OpenDesignStatusReporter', () => {
     await vi.advanceTimersByTimeAsync(OPEN_DESIGN_HEARTBEAT_MS * 3)
     await flush()
     expect(sent).toEqual([{ state: 'absent' }])
+  })
+
+  it('reportNow sends again when that payload was already accepted', async () => {
+    const { reporter, sent } = harness()
+    reporter.start()
+    await flush()
+    expect(sent).toEqual([{ state: 'absent' }])
+    reporter.notify()
+    await flush()
+    expect(sent).toHaveLength(1)
+    reporter.reportNow()
+    await flush()
+    expect(sent).toEqual([{ state: 'absent' }, { state: 'absent' }])
+  })
+
+  it('does not report when the daemon is not in capabilities mode, and logs that once', async () => {
+    vi.useFakeTimers()
+    const { reporter, send, infos, logs, setAuthMode } = harness()
+    setAuthMode('legacy')
+    reporter.start()
+    await flush()
+    expect(send).not.toHaveBeenCalled()
+    expect(infos).toEqual(['open-design report skipped: daemon auth mode is legacy, not capabilities'])
+    expect(logs).toEqual([])
+    reporter.notify()
+    await vi.advanceTimersByTimeAsync(OPEN_DESIGN_HEARTBEAT_MS * 2)
+    await flush()
+    reporter.reportNow()
+    await flush()
+    expect(send).not.toHaveBeenCalled()
+    expect(infos).toHaveLength(1)
+    setAuthMode('capabilities')
+    reporter.reportNow()
+    await flush()
+    expect(send).toHaveBeenCalledTimes(1)
+  })
+
+  it('stops after HTTP 403 or 404 until the next reportNow, and warns once per suspension', async () => {
+    vi.useFakeTimers()
+    const { reporter, send, logs, setBody } = harness({ state: 'installed', version: VERSION })
+    reporter.start()
+    await flush()
+    expect(send).toHaveBeenCalledTimes(1)
+
+    setBody({ state: 'ready', version: VERSION })
+    send.mockResolvedValueOnce(403)
+    reporter.notify()
+    await flush()
+    expect(logs.filter((line) => line.includes('403'))).toHaveLength(1)
+
+    reporter.notify()
+    await vi.advanceTimersByTimeAsync(OPEN_DESIGN_HEARTBEAT_MS * 2)
+    await flush()
+    expect(send).toHaveBeenCalledTimes(2)
+    expect(logs.filter((line) => line.includes('403'))).toHaveLength(1)
+
+    send.mockResolvedValueOnce(204)
+    reporter.reportNow()
+    await flush()
+    expect(send).toHaveBeenCalledTimes(3)
+
+    setBody({ state: 'degraded', version: VERSION })
+    send.mockResolvedValueOnce(404)
+    reporter.notify()
+    await flush()
+    expect(logs.filter((line) => line.includes('404'))).toHaveLength(1)
+    const calls = send.mock.calls.length
+    await vi.advanceTimersByTimeAsync(OPEN_DESIGN_HEARTBEAT_MS)
+    await flush()
+    expect(send).toHaveBeenCalledTimes(calls)
+
+    send.mockResolvedValueOnce(204)
+    reporter.reportNow()
+    await flush()
+    expect(send).toHaveBeenCalledTimes(calls + 1)
+  })
+})
+
+describe('Open Design report follows daemon ready', () => {
+  function childAnnouncing(ready: Record<string, unknown>): ChildProcess {
+    const stdout = new PassThrough()
+    const child = new EventEmitter() as unknown as ChildProcess
+    Object.assign(child, { pid: 7, stdout, stderr: null, kill: vi.fn().mockReturnValue(true) })
+    setImmediate(() => stdout.write(`${JSON.stringify({ type: 'ready', ...ready })}\n`))
+    return child
+  }
+
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 10; i += 1) await Promise.resolve()
+  }
+
+  function external(read: ExternalDaemonSource['read']): ExternalDaemonSource {
+    return {
+      read,
+      checkHealth: async () => true,
+      fetchHealth: async () => ({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
+    }
+  }
+
+  it('reports once when the daemon is ready, again on the restarted connection, and dedupe does not swallow either', async () => {
+    vi.useRealTimers()
+    const sent: Array<{ port: number; body: OpenDesignReport }> = []
+    const reporter = new OpenDesignStatusReporter({
+      snapshot: () => ({ state: 'installed', version: VERSION }),
+      connection: daemonConnection,
+      authMode: daemonAuthMode,
+      send: async (connection, body) => {
+        sent.push({ port: connection.port, body })
+        return 204
+      },
+    })
+    const children: ChildProcess[] = []
+    const manager = new BackendManager({
+      external: external(() => null),
+      authMode: 'capabilities',
+      spawnProcess: () => {
+        const child = childAnnouncing({
+          port: 4500 + children.length,
+          auth_mode: 'capabilities',
+          product_host_token: `tok-${children.length}`,
+        })
+        children.push(child)
+        return child
+      },
+    })
+    const stopReady = onDaemonReady(() => reporter.reportNow())
+    try {
+      reporter.start()
+      await manager.start()
+      await vi.waitFor(() => expect(sent).toEqual([{ port: 4500, body: { state: 'installed', version: VERSION } }]))
+      await settle()
+      reporter.notify()
+      await settle()
+      expect(sent).toHaveLength(1)
+
+      manager.restart()
+      await vi.waitFor(() => expect(sent.map((item) => item.port)).toEqual([4500, 4501]))
+      await settle()
+      expect(sent[1]?.body).toEqual({ state: 'installed', version: VERSION })
+      reporter.notify()
+      await settle()
+      expect(sent).toHaveLength(2)
+    } finally {
+      stopReady()
+      reporter.stop()
+      manager.stop()
+    }
+  })
+
+  it('does not post while a reused legacy daemon is the connection, and says so once', async () => {
+    vi.useRealTimers()
+    const sent: number[] = []
+    const infos: string[] = []
+    const reporter = new OpenDesignStatusReporter({
+      snapshot: () => ({ state: 'installed', version: VERSION }),
+      connection: daemonConnection,
+      authMode: daemonAuthMode,
+      send: async () => {
+        sent.push(1)
+        return 204
+      },
+      info: (message) => { infos.push(message) },
+    })
+    const manager = new BackendManager({
+      external: external(() => ({ port: 4600, token: 'legacy-token', pid: 9, authMode: 'legacy' })),
+      authMode: 'capabilities',
+      spawnProcess: vi.fn(),
+    })
+    const stopReady = onDaemonReady(() => reporter.reportNow())
+    try {
+      reporter.start()
+      await manager.start()
+      await settle()
+      expect(daemonAuthMode()).toBe('legacy')
+      expect(sent).toEqual([])
+      expect(infos).toEqual(['open-design report skipped: daemon auth mode is legacy, not capabilities'])
+      reporter.notify()
+      await settle()
+      expect(sent).toEqual([])
+      expect(infos).toHaveLength(1)
+    } finally {
+      stopReady()
+      reporter.stop()
+      manager.stop()
+    }
   })
 })
 
