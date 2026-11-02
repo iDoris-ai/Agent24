@@ -12,7 +12,9 @@ import {
   listCommIdentities,
   pickCommBackup,
   restoreCommIdentity,
+  revealCommExport,
   sendCommMessage,
+  withCommTimeout,
   listCommRelays,
   startCommDaemon,
   stopCommDaemon,
@@ -111,6 +113,7 @@ export default function CommunicationPage() {
   const [remember, setRemember] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [exportedPath, setExportedPath] = useState<string | null>(null)
   const [warnings, setWarnings] = useState<string[]>([])
   const [nickname, setNickname] = useState('')
   const [importOpen, setImportOpen] = useState(false)
@@ -208,37 +211,38 @@ export default function CommunicationPage() {
     setPending(action)
     setActionError(null)
     setNotice(null)
+    setExportedPath(null)
     if (action === 'unlock') setUnlockError(null)
     try {
       if (action === 'install') {
-        const result = await installComm()
+        const result = await withCommTimeout(installComm())
         if (mounted.current && token === sequence.current) {
           setNotice(result.restart_required ? t('notice.restart', { reason: result.reason ?? '' }) : t('notice.installed'))
         }
       } else if (action === 'create') {
-        await createCommIdentity(nickname.trim())
+        await withCommTimeout(createCommIdentity(nickname.trim()))
       } else if (action === 'import') {
-        await importCommHome()
+        await withCommTimeout(importCommHome())
       } else if (action === 'relay') {
         // PUT replaces the whole list server-side (and restarts the daemon):
         // keep the existing entries, and skip the write if nothing changes.
         const existing = relays?.configured ? relays.relays : []
         if (existing[0] !== relayUrl) {
-          await setCommRelay([relayUrl, ...existing.filter((url) => url !== relayUrl)].slice(0, 8))
+          await withCommTimeout(setCommRelay([relayUrl, ...existing.filter((url) => url !== relayUrl)].slice(0, 8)))
         }
         setHandshakeFailed(true)
-        const probe = await probeCommRelay(relayUrl)
+        const probe = await withCommTimeout(probeCommRelay(relayUrl))
         if (probe.connected) setHandshakeFailed(false)
         if (!probe.connected) throw new Error(`${t('probe.failure')}${probe.error ? `: ${probe.error}` : ''}`)
         if (mounted.current && token === sequence.current) setNotice(t('probe.success'))
       } else if (action === 'start') {
-        await startCommDaemon()
+        await withCommTimeout(startCommDaemon())
         if (mounted.current && token === sequence.current) setNotice(t('notice.start'))
       } else if (action === 'stop') {
-        await stopCommDaemon()
+        await withCommTimeout(stopCommDaemon())
         if (mounted.current && token === sequence.current) setNotice(t('notice.stop'))
       } else {
-        const result = await unlockComm(remember)
+        const result = await withCommTimeout(unlockComm(remember))
         if (mounted.current && token === sequence.current) {
           setNotice(result.remembered ? t('notice.remembered') : t('notice.session'))
           setUnlockFailed(false)
@@ -296,8 +300,9 @@ export default function CommunicationPage() {
     setPending('restore')
     setActionError(null)
     setNotice(null)
+    setExportedPath(null)
     try {
-      const picked = await pickCommBackup()
+      const picked = await withCommTimeout(pickCommBackup())
       if (picked && mounted.current) {
         setRestore(picked)
         // A nickname suggested from the file name; the user can change it.
@@ -318,9 +323,10 @@ export default function CommunicationPage() {
     setPending('restore')
     setActionError(null)
     setNotice(null)
+    setExportedPath(null)
     try {
       // The backup password is asked for by the main process, not by this page.
-      const result = await restoreCommIdentity(restore.ticket, restoreNickname.trim(), restoreDefault)
+      const result = await withCommTimeout(restoreCommIdentity(restore.ticket, restoreNickname.trim(), restoreDefault))
       if (mounted.current) {
         setNotice(result.status === 'already_present'
           ? (result.nickname ? t('restore.alreadyAs', { nickname: result.nickname }) : t('restore.already'))
@@ -352,11 +358,13 @@ export default function CommunicationPage() {
     setPending('export')
     setActionError(null)
     setNotice(null)
+    setExportedPath(null)
     setWarnings([])
     try {
       // The backup password is asked for by the main process, not by this page.
-      const result = await exportCommIdentity(name)
+      const result = await withCommTimeout(exportCommIdentity(name))
       if (mounted.current) {
+        setExportedPath(result.path)
         setNotice(t('export.done', { path: result.path }))
         // The backup is saved either way; these say what could not be confirmed.
         setWarnings(result.warnings.map((w) => (w.code === 'cleanup_failed'
@@ -372,6 +380,14 @@ export default function CommunicationPage() {
     }
   }
 
+  const revealExported = async (filePath: string) => {
+    try {
+      await withCommTimeout(revealCommExport(filePath))
+    } catch (error) {
+      if (mounted.current) setActionError(errorText(error))
+    }
+  }
+
   const submitContact = async () => {
     if (pending) return
     const npubValue = contactNpub.trim()
@@ -380,8 +396,9 @@ export default function CommunicationPage() {
     setPending('contact')
     setActionError(null)
     setNotice(null)
+    setExportedPath(null)
     try {
-      await addCommContact(contactName.trim(), npubValue, contactRole.trim())
+      await withCommTimeout(addCommContact(contactName.trim(), npubValue, contactRole.trim()))
       if (mounted.current) {
         setContactName(''); setContactNpub(''); setContactRole('')
         setNotice(t('contact.added'))
@@ -405,8 +422,9 @@ export default function CommunicationPage() {
     setPending('send')
     setActionError(null)
     setNotice(null)
+    setExportedPath(null)
     try {
-      const result = await sendCommMessage(to, messageText)
+      const result = await withCommTimeout(sendCommMessage(to, messageText))
       if (mounted.current) {
         setMessageText('')
         setNotice(result.published_to > 0 ? t('message.sent', { count: result.published_to }) : t('message.queued'))
@@ -418,6 +436,9 @@ export default function CommunicationPage() {
     }
   }
 
+  const serviceStoppable = daemon?.process.state === 'running'
+    || daemon?.process.state === 'starting'
+    || daemon?.process.state === 'backoff'
   const needsUnlock = daemon !== null && (daemon.process.state === 'locked'
     || daemon.process.reason === 'password_rejected' || daemon.process.reason === 'keychain_unavailable')
   const showUnlock = needsUnlock || unlockFailed
@@ -443,15 +464,18 @@ export default function CommunicationPage() {
       {loadError && <div role="alert" className="comm-alert">{loadError}</div>}
       {actionError && <div role="alert" className="comm-alert">{t('error.action', { message: actionError })}</div>}
       {pending === 'install' && <p role="status">{t('action.installing')}</p>}
-      {notice && <div role="status" className="comm-notice">{notice}</div>}
+      {notice && <div role="status" className="comm-notice">
+        <span>{notice}</span>
+        {exportedPath && <button type="button" onClick={() => void revealExported(exportedPath)}>{t('export.reveal')}</button>}
+      </div>}
       {warnings.map((warning) => <div key={warning} role="status" className="comm-warning">{warning}</div>)}
 
       {setupState && <section className="comm-card" data-testid="comm-setup" data-state={setupState} aria-label={t('wizard.title')}>
         <h2>{t('wizard.title')}</h2>
         <ol className="comm-steps">
-          <li aria-current={setupState === 'not_installed' || setupState === 'installing' ? 'step' : undefined}>{t('wizard.download')}{setupState !== 'not_installed' && setupState !== 'installing' ? ' ✓' : ''}</li>
-          <li aria-current={setupState === 'no_identity' ? 'step' : undefined}>{t('wizard.identity')}{setupState === 'no_relay' || setupState === 'ready' ? ' ✓' : ''}</li>
-          <li aria-current={setupState === 'no_relay' ? 'step' : undefined}>{t('wizard.relay')}{setupState === 'ready' && !handshakeFailed ? ' ✓' : ''}</li>
+          <li aria-current={setupState === 'not_installed' || setupState === 'installing' ? 'step' : undefined}>{t('wizard.download')}{setupState !== 'not_installed' && setupState !== 'installing' ? <span className="comm-step-mark"> ✓</span> : null}</li>
+          <li aria-current={setupState === 'no_identity' ? 'step' : undefined}>{t('wizard.identity')}{setupState === 'no_relay' || setupState === 'ready' ? <span className="comm-step-mark"> ✓</span> : null}</li>
+          <li aria-current={setupState === 'no_relay' ? 'step' : undefined}>{t('wizard.relay')}{setupState === 'ready' && !handshakeFailed ? <span className="comm-step-mark"> ✓</span> : null}</li>
         </ol>
         {setupState === 'no_identity' && <>
           <form className="comm-setup-form" onSubmit={(event) => { event.preventDefault(); void runAction('create') }}>
@@ -579,7 +603,7 @@ export default function CommunicationPage() {
         <DaemonStatusView status={daemon} fresh={isFresh} />
         <div className="comm-actions">
           <button type="button" onClick={() => void runAction('start')} disabled={pending !== null}>{t('action.start')}</button>
-          <button type="button" onClick={() => void runAction('stop')} disabled={pending !== null}>{t('action.stop')}</button>
+          <button type="button" onClick={() => void runAction('stop')} disabled={pending !== null || !serviceStoppable} title={serviceStoppable ? undefined : t('action.stopIdle')}>{t('action.stop')}</button>
         </div>
         {showUnlock && <form className="comm-unlock" aria-label={t('unlock.title')} onSubmit={(event) => { event.preventDefault(); void runAction('unlock') }}>
           <p className="comm-muted comm-unlock-explain">{t('unlock.explain')}</p>

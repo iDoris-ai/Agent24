@@ -237,6 +237,28 @@ function isBackendProxyRequest(req: unknown): req is BackendProxyRequest {
 /** The daemon's whole export budget is 30 s for Hyphae's run plus one in-daemon scrypt check; this stays well above it. */
 const EXPORT_TIMEOUT_MS = 90_000
 
+/** A native step (password window, save dialog) or a daemon call that never settled. */
+class OperationTimeout extends Error {
+  constructor() { super('timeout') }
+}
+
+/** Resolves or rejects with `work`, or rejects with {@link OperationTimeout} when `ms` elapses. */
+function deadline<T>(ms: number, work: Promise<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new OperationTimeout()), ms)
+    work.then(
+      (value) => { clearTimeout(timer); resolve(value) },
+      (error: unknown) => { clearTimeout(timer); reject(error instanceof Error ? error : new Error(String(error))) },
+    )
+  })
+}
+
+function asTimeout(error: unknown): BackendProxyResponse | null {
+  return error instanceof OperationTimeout
+    ? proxyError('timeout', 'no answer within the time limit')
+    : null
+}
+
 /**
  * Restore: the one pending backup selection, an opaque ticket standing for a
  * backup the user picked. The file is read and validated once, when picked
@@ -249,6 +271,26 @@ const EXPORT_TIMEOUT_MS = 90_000
  */
 interface PendingBackup { id: string; ncryptsec: string; expires: number; attemptsLeft: number }
 let pendingBackup: PendingBackup | null = null
+/**
+ * The path the daemon confirmed for the last successful key backup.
+ * `CommRevealExport` accepts only this exact string, so the renderer cannot
+ * point `showItemInFolder` at an arbitrary file.
+ */
+let lastExportedPath: string | null = null
+
+/** Test-only: forget the reveal target so cases do not leak into each other. */
+export function resetLastCommExportForTests(): void {
+  lastExportedPath = null
+}
+
+function exportResultPath(response: BackendProxyResponse): string | null {
+  const body = response.data
+  if (!response.ok || typeof body !== 'object' || body === null) return null
+  const record = body as { ok?: unknown; data?: unknown }
+  if (record.ok !== true || typeof record.data !== 'object' || record.data === null) return null
+  const reported = (record.data as { path?: unknown }).path
+  return typeof reported === 'string' && reported.length > 0 ? reported : null
+}
 /** Bumped by every new pick: flows started under an older one can never put their ticket back. */
 let backupEpoch = 0
 const IMPORT_TICKET_TTL_MS = 5 * 60_000
@@ -361,11 +403,17 @@ export function registerIpcHandlers(options: {
   promptUnlockPassword?: typeof openUnlockPasswordWindow
   /** Test seam: the main-owned password window for importing a Hyphae folder. */
   promptHomeImportPassword?: typeof openHomeImportPasswordWindow
+  /**
+   * Live budget for the export IPC (password window, save dialog, daemon).
+   * Tests shrink `current`; production leaves it at {@link EXPORT_TIMEOUT_MS}.
+   */
+  exportTimeoutMs?: { current: number }
 }): void {
   const promptBackupPassword = options.promptBackupPassword ?? openBackupPasswordWindow
   const promptRestorePassword = options.promptRestorePassword ?? openRestorePasswordWindow
   const promptUnlockPassword = options.promptUnlockPassword ?? openUnlockPasswordWindow
   const promptHomeImportPassword = options.promptHomeImportPassword ?? openHomeImportPasswordWindow
+  const exportTimeout = options.exportTimeoutMs ?? { current: EXPORT_TIMEOUT_MS }
   const knowledge = options.knowledge ?? (() => null)
   omlxSettingsPath = options.omlxSettingsPath
   const handle: typeof ipcMain.handle = (channel, listener) => ipcMain.handle(channel, options.guard(listener))
@@ -573,25 +621,46 @@ export function registerIpcHandlers(options: {
     exclusive(async () => {
       // The page asks only for "export this identity". The backup password is
       // collected below by a window main owns, never by or through the page.
+      // Every await is bounded: a native call that never settles (password
+      // window closed without `closed`, save dialog cancelled but not resolved,
+      // daemon answered but the proxy promise stuck) would otherwise leave the
+      // renderer's `pending` set and disable Stop / Restore.
       if (!isSafeName(nickname, 128)) return invalidRequest('invalid nickname')
       // 1. The identity must exist before the user is asked anything.
-      const listed = await proxyToBackend({ method: 'GET', path: '/api/v1/comm/identity' })
+      let listed: BackendProxyResponse
+      try {
+        listed = await deadline(EXPORT_TIMEOUT_MS, proxyToBackend({ method: 'GET', path: '/api/v1/comm/identity' }))
+      } catch (error) {
+        return asTimeout(error) ?? proxyError('proxy_failed', 'the identity list failed')
+      }
       const identities = (listed.data as { data?: unknown } | null)?.data
       if (!listed.ok || !Array.isArray(identities) ||
           !identities.some((i) => (i as { nickname?: unknown } | null)?.nickname === nickname)) {
         return { ok: false, status: 404, data: { error: { code: 'identity_not_found', message: mt('err.identityNotFound') } } }
       }
       // 2. Risk confirmation.
-      const ok = await confirmNative(event, mt('comm.export', { name: clip(nickname, 80) }), mt('comm.exportDetail'))
-      if (!ok) return cancelled()
       const win = BrowserWindow.fromWebContents(event.sender)
+      const parent = win && !win.isDestroyed() ? win : null
+      let ok = false
+      try {
+        ok = await deadline(exportTimeout.current, confirmNative(event, mt('comm.export', { name: clip(nickname, 80) }), mt('comm.exportDetail')))
+      } catch (error) {
+        return asTimeout(error) ?? cancelled()
+      }
+      if (!ok) return cancelled()
       // 3. Backup password, in main's own isolated window.
-      let backupPassword: string | null = await promptBackupPassword(win)
+      let backupPassword: string | null
+      try {
+        backupPassword = await deadline(exportTimeout.current, promptBackupPassword(parent))
+      } catch (error) {
+        return asTimeout(error) ?? proxyError('proxy_failed', 'the backup password window failed')
+      }
       if (backupPassword === null) return cancelled()
       try {
         if (!isSafeBackupPassword(backupPassword)) return invalidRequest('invalid backup password')
-        // 4. Where to save.
-        const options: Electron.SaveDialogOptions = {
+        // 4. Where to save. A destroyed parent makes showSaveDialog hang, so
+        // drop it and let the dialog stand on its own.
+        const saveOptions: Electron.SaveDialogOptions = {
           title: mt('comm.exportSave'),
           // Downloads, not Documents (which is often iCloud-synced).
           defaultPath: path.join(app.getPath('downloads'), `${backupFileStem(nickname)}.ncryptsec`),
@@ -599,9 +668,11 @@ export function registerIpcHandlers(options: {
         }
         let picked: Electron.SaveDialogReturnValue
         try {
-          picked = win ? await dialog.showSaveDialog(win, options) : await dialog.showSaveDialog(options)
-        } catch {
-          return { ok: false, status: 500, data: { error: { code: 'dialog_failed', message: 'the file dialog could not open' } } }
+          const saveParent = parent && !parent.isDestroyed() ? parent : null
+          const pendingDialog = saveParent ? dialog.showSaveDialog(saveParent, saveOptions) : dialog.showSaveDialog(saveOptions)
+          picked = await deadline(exportTimeout.current, pendingDialog)
+        } catch (error) {
+          return asTimeout(error) ?? { ok: false, status: 500, data: { error: { code: 'dialog_failed', message: 'the file dialog could not open' } } }
         }
         if (picked.canceled || !picked.filePath) return cancelled()
         // The daemon never overwrites (O_EXCL) and says so; checking here too
@@ -609,17 +680,37 @@ export function registerIpcHandlers(options: {
         if (pathExists(picked.filePath)) {
           return { ok: false, status: 409, data: { error: { code: 'target_exists', message: mt('err.targetExists') } } }
         }
-        // 5. The daemon.
-        return await proxyToBackend({
-          method: 'POST', path: '/api/v1/comm/identity/export',
-          body: { nickname, path: picked.filePath, backup_password: backupPassword },
-        }, EXPORT_TIMEOUT_MS)
+        // 5. The daemon. Its body already carries `path`; return that body
+        // unchanged so the renderer can show where the file was saved.
+        let response: BackendProxyResponse
+        try {
+          response = await deadline(exportTimeout.current, proxyToBackend({
+            method: 'POST', path: '/api/v1/comm/identity/export',
+            body: { nickname, path: picked.filePath, backup_password: backupPassword },
+          }, exportTimeout.current))
+        } catch (error) {
+          return asTimeout(error) ?? proxyError('proxy_failed', 'the export request failed')
+        }
+        const reported = exportResultPath(response)
+        if (reported !== null && reported === picked.filePath) lastExportedPath = reported
+        return response
       } finally {
         // Best effort (JS strings are immutable): drop main's only reference.
         backupPassword = null
       }
     }),
   )
+
+  // The page learns the saved path from the export result and may ask to reveal
+  // it. Anything other than that exact path is refused: a compromised renderer
+  // must not be able to open an arbitrary location.
+  handle(IpcChannels.CommRevealExport, (_event, requested: unknown): BackendProxyResponse => {
+    if (typeof requested !== 'string' || lastExportedPath === null || requested !== lastExportedPath) {
+      return { ok: false, status: 403, data: { error: { code: 'forbidden', message: 'only the file just exported can be shown' } } }
+    }
+    shell.showItemInFolder(lastExportedPath)
+    return { ok: true, status: 200, data: { ok: true, data: { path: lastExportedPath } } }
+  })
 
   // Restore from an encrypted backup. Step 1 (native open dialog) reads the
   // file at once and hands the page only a file NAME and a single-use ticket;

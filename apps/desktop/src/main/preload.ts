@@ -58,6 +58,9 @@ const api = {
   /** Elevated; the page sends only the nickname. Main confirms natively, collects the backup password in its own isolated window, lets the user pick the file, and the daemon writes an NIP-49 encrypted backup there (0600, never overwriting). Resolves with `{nickname,npub,path,format}` only. */
   commIdentityExport: (nickname: string): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.CommIdentityExport, nickname),
+  /** Reveal the file just exported. `filePath` must be exactly that path; main refuses any other. */
+  commRevealExport: (filePath: string): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommRevealExport, filePath),
   /** Elevated comm write, validated in main (not on the generic proxy). */
   commContactAdd: (nickname: string, npub: string, role: string): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.CommContactAdd, nickname, npub, role),

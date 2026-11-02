@@ -3,8 +3,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   CommApiError,
   addCommContact,
+  COMM_IPC_TIMEOUT_MS,
   exportCommIdentity,
   listCommHistory,
+  revealCommExport,
   pickCommBackup,
   restoreCommIdentity,
   sendCommMessage,
@@ -216,6 +218,26 @@ describe('COMM contact, send, history and export wrappers', () => {
     expect(commIdentityExport).toHaveBeenCalledTimes(2)
     expect(commIdentityExport.mock.calls.every((c) => c.length === 1 && c[0] === 'alice')).toBe(true)
     expect(proxy).not.toHaveBeenCalled()
+  })
+
+  it('rejects an export IPC that never returns, so the page can clear pending', async () => {
+    vi.useFakeTimers()
+    try {
+      const commIdentityExport = vi.fn(() => new Promise(() => {}))
+      window.agent24 = { ...window.agent24, commIdentityExport } as never
+      const pending = exportCommIdentity('alice').then(() => 'ok' as const, (error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(COMM_IPC_TIMEOUT_MS)
+      await expect(pending).resolves.toMatchObject({ code: 'timeout' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('asks main to reveal exactly the path the page was given', async () => {
+    const commRevealExport = vi.fn(async () => successful({ path: '/Users/x/Downloads/alice.ncryptsec' }))
+    window.agent24 = { ...window.agent24, commRevealExport } as never
+    await revealCommExport('/Users/x/Downloads/alice.ncryptsec')
+    expect(commRevealExport).toHaveBeenCalledWith('/Users/x/Downloads/alice.ncryptsec')
   })
 })
 

@@ -215,6 +215,24 @@ function isUnlockResult(value: unknown): value is CommUnlockResult {
   return isRecord(value) && value['unlocked'] === true && typeof value['remembered'] === 'boolean'
 }
 
+/** Same budget as the main-process export IPC. A call that never settles must not leave the page's `pending` set. */
+export const COMM_IPC_TIMEOUT_MS = 90_000
+
+export function withCommTimeout<T>(work: Promise<T> | T, ms = COMM_IPC_TIMEOUT_MS): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  // IPC mocks (and a few Electron APIs) may return a plain value. Adopt either
+  // shape so a sync result is not mistaken for a transport failure.
+  const pending = Promise.resolve(work)
+  // A rejection that arrives after the deadline must not become unhandled.
+  void pending.catch(() => undefined)
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new CommApiError(translate(communicationMessages, 'error.timeout'), 504, 'timeout'))
+    }, ms)
+  })
+  return Promise.race([pending, timeout]).finally(() => clearTimeout(timer))
+}
+
 async function request<T>(
   method: 'GET' | 'POST' | 'PUT',
   path: string,
@@ -223,8 +241,9 @@ async function request<T>(
 ): Promise<T> {
   let response: unknown
   try {
-    response = await window.agent24.backendProxy({ method, path, ...(body === undefined ? {} : { body }) })
-  } catch {
+    response = await withCommTimeout(window.agent24.backendProxy({ method, path, ...(body === undefined ? {} : { body }) }))
+  } catch (error) {
+    if (error instanceof CommApiError) throw error
     throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)
   }
   return decodeEnvelope(response, validate)
@@ -264,7 +283,7 @@ function isInstallResult(value: unknown): value is CommInstallResult {
 
 export async function installComm(): Promise<CommInstallResult> {
   // Main owns the elevated native confirmation and the fixed installation URL.
-  const response: unknown = await window.agent24.commInstall()
+  const response: unknown = await withCommTimeout(window.agent24.commInstall())
   return decodeEnvelope(response, isInstallResult)
 }
 
@@ -286,8 +305,9 @@ export const probeCommRelay = (url: string) =>
 async function viaIpc<T>(call: () => Promise<unknown>, validate: (value: unknown) => value is T): Promise<T> {
   let response: unknown
   try {
-    response = await call()
-  } catch {
+    response = await withCommTimeout(call())
+  } catch (error) {
+    if (error instanceof CommApiError) throw error
     throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)
   }
   return decodeEnvelope(response, validate)
@@ -391,14 +411,23 @@ export const exportCommIdentity = (nickname: string): Promise<CommExportResult> 
       warnings: exportWarnings(data['warnings']),
     }))
 
+/** Ask main to show the file just exported. Any other path is refused. */
+export function revealCommExport(filePath: string): Promise<void> {
+  return viaIpc(
+    () => window.agent24.commRevealExport(filePath),
+    (value): value is { path: string } => isRecord(value) && value['path'] === filePath,
+  ).then(() => undefined)
+}
+
 export type CommPickResult = { ticket: string; fileName: string } | null
 
 /** Native "choose a backup" dialog (in main, which reads and validates the file right away). Only the file NAME and an opaque ticket come back. */
 export async function pickCommBackup(): Promise<CommPickResult> {
   let result: unknown
   try {
-    result = await window.agent24.commImportPick()
-  } catch {
+    result = await withCommTimeout(window.agent24.commImportPick())
+  } catch (error) {
+    if (error instanceof CommApiError) throw error
     throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)
   }
   if (isRecord(result) && result['ok'] === true && string(result['ticket']) && string(result['fileName'])) {

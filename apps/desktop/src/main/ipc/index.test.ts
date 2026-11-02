@@ -14,6 +14,8 @@ const handlers = new Map<string, (event: unknown, ...args: unknown[]) => unknown
 const showMessageBox = vi.fn()
 const showSaveDialog = vi.fn()
 const showOpenDialog = vi.fn()
+const showItemInFolder = vi.fn()
+const exportTimeoutMs = { current: 90_000 }
 const promptBackupPassword = vi.fn()
 const promptRestorePassword = vi.fn()
 const promptUnlockPassword = vi.fn()
@@ -25,7 +27,7 @@ vi.mock('electron', () => ({
   BrowserWindow: { fromWebContents: () => null },
   dialog: { showMessageBox: (...a: unknown[]) => showMessageBox(...a), showOpenDialog: (...a: unknown[]) => showOpenDialog(...a), showSaveDialog: (...a: unknown[]) => showSaveDialog(...a) },
   ipcMain: { handle: (channel: string, fn: (event: unknown, ...args: unknown[]) => unknown) => { handlers.set(channel, fn) } },
-  shell: { openExternal: vi.fn(() => Promise.resolve()) },
+  shell: { openExternal: vi.fn(() => Promise.resolve()), showItemInFolder: (...a: unknown[]) => showItemInFolder(...a) },
 }))
 
 vi.mock('node:child_process', async (orig) => ({
@@ -45,7 +47,7 @@ vi.mock('../backend-manager', () => ({
 
 import { IpcChannels } from '../../shared/ipc-types'
 import { createIpcGuard } from './guard'
-import { reachesHostInterface, reachesPresenceChannel, registerIpcHandlers } from './index'
+import { reachesHostInterface, reachesPresenceChannel, registerIpcHandlers, resetLastCommExportForTests } from './index'
 
 const APP_URL = 'file:///app/renderer/index.html'
 const mainFrame = { url: APP_URL }
@@ -148,6 +150,9 @@ beforeAll(async () => {
         res.end(JSON.stringify({ modules: attachedModules }))
       } else if (req.method === 'GET' && req.url === '/api/v1/os') {
         res.end(JSON.stringify({ modules: [{ name: 'sin90', enabled: false, version: '0.5.0' }] }))
+      } else if (req.method === 'POST' && req.url === '/api/v1/comm/identity/export') {
+        const body = JSON.parse(Buffer.concat(chunks).toString()) as { nickname?: string; path?: string }
+        res.end(JSON.stringify({ ok: true, data: { nickname: body.nickname, npub: 'npub1alice', path: body.path, format: 'ncryptsec' } }))
       } else res.end(JSON.stringify({ ok: true, echoed: req.url }))
     })
   })
@@ -160,6 +165,7 @@ beforeAll(async () => {
     promptRestorePassword: (...a: unknown[]) => promptRestorePassword(...a) as never,
     promptUnlockPassword: (...a: unknown[]) => promptUnlockPassword(...a) as never,
     promptHomeImportPassword: (...a: unknown[]) => promptHomeImportPassword(...a) as never,
+    exportTimeoutMs,
     guard: createIpcGuard({
       getMainWindow: () => mainWindow as never,
       isTrustedUrl: (u) => u === APP_URL,
@@ -191,6 +197,9 @@ beforeEach(() => {
   promptHomeImportPassword.mockReset()
   currentRelays = { relays: ['wss://old.example'], configured: true }
   showOpenDialog.mockReset()
+  showItemInFolder.mockReset()
+  exportTimeoutMs.current = 90_000
+  resetLastCommExportForTests()
   execFileMock.mockReset()
 })
 
@@ -452,6 +461,54 @@ describe('CommIdentityExport elevated IPC', () => {
     expect(result.data.error.code).toBe('target_exists')
     noDaemonCall()
     expect(fs.readFileSync(existing, 'utf8')).toBe('precious')
+  })
+  it('returns the daemon path to the renderer, and reveal accepts only that path', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockResolvedValueOnce(PW)
+    const saved = path.join(settingsDir, 'shown-alice.ncryptsec')
+    showSaveDialog.mockResolvedValueOnce({ canceled: false, filePath: saved })
+    const result = await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(result.ok).toBe(true)
+    expect(result.data.data).toMatchObject({ nickname: 'alice', npub: 'npub1alice', path: saved, format: 'ncryptsec' })
+    const wrong = await call(IpcChannels.CommRevealExport, '/etc/passwd')
+    expect(wrong.ok).toBe(false)
+    expect(showItemInFolder).not.toHaveBeenCalled()
+    const revealed = await call(IpcChannels.CommRevealExport, saved)
+    expect(revealed.ok).toBe(true)
+    expect(showItemInFolder).toHaveBeenCalledTimes(1)
+    expect(showItemInFolder).toHaveBeenCalledWith(saved)
+    const omitted = await call(IpcChannels.CommRevealExport)
+    expect(omitted.ok).toBe(false)
+    expect(showItemInFolder).toHaveBeenCalledTimes(1)
+  })
+  it('a cancelled save does not become a path the page can reveal', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockResolvedValueOnce(PW)
+    showSaveDialog.mockResolvedValueOnce({ canceled: true })
+    const result = await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(result.data.error.code).toBe('cancelled')
+    const revealed = await call(IpcChannels.CommRevealExport, path.join(settingsDir, 'alice.ncryptsec'))
+    expect(revealed.ok).toBe(false)
+    expect(showItemInFolder).not.toHaveBeenCalled()
+    noDaemonCall()
+  })
+  it('a password window that never closes still settles the IPC', async () => {
+    exportTimeoutMs.current = 200
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockReturnValueOnce(new Promise(() => {}))
+    const result = await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(result.data.error.code).toBe('timeout')
+    expect(showSaveDialog).not.toHaveBeenCalled()
+    noDaemonCall()
+  })
+  it('a save dialog that never closes still settles the IPC', async () => {
+    exportTimeoutMs.current = 200
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockResolvedValueOnce(PW)
+    showSaveDialog.mockReturnValueOnce(new Promise(() => {}))
+    const result = await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(result.data.error.code).toBe('timeout')
+    noDaemonCall()
   })
   it('a password the window returns but main finds unusable is refused before the save dialog', async () => {
     showMessageBox.mockResolvedValueOnce({ response: 0 })

@@ -112,14 +112,21 @@ function openPasswordWindow<T>(
     const contents = win.webContents
     let settled = false
     let working = false
+    // Set while the window is already closing, so finish() does not call close()
+    // again (that re-enters this handler, and a throw would skip resolve()).
+    let closing = false
 
     const finish = (value: T | null): void => {
       if (settled) return
       settled = true
       ipcMain.removeListener(BACKUP_PW_SUBMIT, onSubmit)
       ipcMain.removeListener(BACKUP_PW_CANCEL, onCancel)
-      if (!win.isDestroyed()) win.close()
+      // Resolve before close(). close() can throw once the window is going
+      // away, and that used to skip resolve() and leave the IPC pending.
       resolve(value)
+      if (closing || win.isDestroyed()) return
+      closing = true
+      try { win.close() } catch { /* already closing */ }
     }
     // Only THIS window's top frame may speak on these channels.
     const fromWindow = (event: IpcMainEvent): boolean =>
@@ -171,9 +178,18 @@ function openPasswordWindow<T>(
       if (working) {
         event.preventDefault()
         if (!contents.isDestroyed()) contents.send(BACKUP_PW_BUSY, mt('backupPw.wait'))
+        return
       }
+      // Settle on `close`, not only `closed`. A modal window torn down with its
+      // parent can emit `close` and never `closed`, which left this promise
+      // pending and the communication page's buttons stuck.
+      closing = true
+      finish(null)
     })
-    win.on('closed', () => finish(null))
+    win.on('closed', () => {
+      closing = true
+      finish(null)
+    })
     win.once('ready-to-show', () => win.show())
     void win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(backupPasswordHtml(mode, options))}`).catch(() => finish(null))
   })

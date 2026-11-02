@@ -148,6 +148,12 @@ describe('backup password window', () => {
     windows[1]!.close()
     await expect(b).resolves.toBeNull()
   })
+
+  it('resolves null when the window starts closing even if closed never follows', async () => {
+    const result = promptBackupPassword(null)
+    windows[0]!.handlers.get('close')?.()
+    await expect(result).resolves.toBeNull()
+  })
 })
 
 describe('unlock and home-import password windows (L4)', () => {
