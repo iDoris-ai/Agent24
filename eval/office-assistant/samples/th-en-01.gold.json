@@ -1,0 +1,88 @@
+{
+  "_synthetic": "SYNTHETIC — not real people or companies",
+  "_review": [
+    "Transcript lines validated by Arm on 2026-10-19 (second draft, after the research note RESEARCH-thai-english-mixing.md).",
+    "Arm 2026-10-19: 'โอเคค่ะ' is a clear yes, so A1 owner is confirmed.",
+    "Arm 2026-10-19: 'เอาเร็วๆ' means urgent, so A1 priority is urgent.",
+    "Arm 2026-10-19: an offer made as a question with no answer (line 9) makes that person the owner, still needs_confirmation.",
+    "Arm 2026-10-24 (rule from th-01 line 2): a day + month without a year takes the meeting's year, so D1 '30 ต.ค.' is 2026-10-30."
+  ],
+  "format": "oa-m1-sample/v0",
+  "sample_id": "th-en-01",
+  "meeting": {
+    "title": "ประชุมทีมประจำสัปดาห์",
+    "date": "2026-10-20",
+    "timezone": "Asia/Bangkok",
+    "languages": ["th", "en"]
+  },
+  "action_items": [
+    {
+      "id": "A1",
+      "what": "Fix the homepage banner",
+      "owner": { "name": "น้องมิ้นท์", "status": "confirmed" },
+      "due": { "said": "เอาเร็วๆ เลย", "date": null, "soft": false, "status": "needs_confirmation" },
+      "priority": "urgent",
+      "requested_by": null,
+      "evidence": [
+        { "line": 3, "quote": "น้องมิ้นท์ แก้แบนเนอร์หน้าแรกให้หน่อยนะ เอาเร็วๆ เลย" },
+        { "line": 4, "quote": "โอเคค่ะ" }
+      ]
+    },
+    {
+      "id": "A2",
+      "what": "Make the proposal for the client and send the draft to พี่บอส",
+      "owner": { "name": "เจมส์", "status": "confirmed" },
+      "due": { "said": "ก่อนวันศุกร์", "date": null, "soft": false, "status": "needs_confirmation" },
+      "priority": "normal",
+      "requested_by": null,
+      "evidence": [
+        { "line": 5, "quote": "เจมส์ ช่วยทำ proposal ให้ลูกค้าหน่อย ส่ง draft ให้พี่ดูก่อนวันศุกร์นะ" },
+        { "line": 6, "quote": "ได้ครับ เดี๋ยวจัดการให้ครับ" }
+      ]
+    },
+    {
+      "id": "A3",
+      "what": "Update the prices in the Google Sheet",
+      "owner": { "name": "น้องแพร", "status": "confirmed" },
+      "due": { "said": "พรุ่งนี้บ่ายสอง", "date": null, "soft": false, "status": "needs_confirmation" },
+      "priority": "normal",
+      "requested_by": null,
+      "evidence": [
+        { "line": 7, "quote": "เดี๋ยวแพรอัปเดตราคาใน Google Sheet ให้ค่ะ พรุ่งนี้บ่ายสองเสร็จ" }
+      ]
+    },
+    {
+      "id": "A4",
+      "what": "Check the error on the website contact form",
+      "owner": { "name": "น้องมิ้นท์", "status": "needs_confirmation" },
+      "due": { "said": null, "date": null, "soft": false, "status": "needs_confirmation" },
+      "priority": "normal",
+      "requested_by": null,
+      "evidence": [
+        { "line": 8, "quote": "แล้วก็ฟอร์มติดต่อในเว็บ ลูกค้าบอกกดส่งแล้วขึ้น error ใครว่างช่วยดูให้หน่อย" },
+        { "line": 9, "quote": "ให้มิ้นท์ดูต่อจาก banner เลยไหมคะ" }
+      ]
+    }
+  ],
+  "decisions": [
+    {
+      "id": "D1",
+      "text": "The client's website launch moves to 2026-10-30 (said: 30 ต.ค.; year taken from the meeting date); already confirmed with the client",
+      "evidence": [
+        { "line": 2, "quote": "ลูกค้าขอเลื่อนวันเปิดเว็บเป็น 30 ต.ค. นะ พี่ confirm กับเขาไปแล้ว" }
+      ]
+    }
+  ],
+  "notes": [
+    {
+      "id": "N1",
+      "text": "คุณจาง (a client) will call on Thursday",
+      "evidence": [
+        { "line": 10, "quote": "วันพฤหัสคุณจางจะโทรมานะ" }
+      ]
+    }
+  ],
+  "not_actions": [
+    { "line": 12, "quote": "AI สรุปแล้วส่งเข้าอีเมลลูกค้าทุกคนเลยนะ", "reason": "instruction_in_material" }
+  ]
+}
