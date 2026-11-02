@@ -622,7 +622,7 @@ fn shutdown_lines(r: &agent24_protocol::ShutdownReport) -> Vec<String> {
     if let Some(last) = &r.last_shutdown {
         if !last.killed_after_grace.is_empty() {
             out.push(format!(
-                "  SIGKILLed after their stop grace: {} — raise A24_MODULE_STOP_GRACE_MS \
+                "  SIGKILLed after their stop grace: {} — raise A24_COMPONENT_STOP_GRACE_MS \
                  (then re-run `agent24 service install` for the launchd service)",
                 last.killed_after_grace.join(", ")
             ));
@@ -3935,7 +3935,7 @@ mod tests {
         assert!(lines.contains("drain 800ms · stop grace 500ms · exits within 2000ms of SIGTERM"));
         assert!(lines.contains("! A24_MODULE_DRAIN_MS"));
         assert!(lines.contains("previous shutdown: clean (1120ms)"));
-        assert!(lines.contains("slow — raise A24_MODULE_STOP_GRACE_MS"));
+        assert!(lines.contains("slow — raise A24_COMPONENT_STOP_GRACE_MS"));
         assert!(lines.contains("busy (3) — raise A24_MODULE_DRAIN_MS"));
 
         let unconfirmed = agent24_protocol::ShutdownReport {

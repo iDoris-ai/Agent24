@@ -317,7 +317,7 @@ hyphae daemon --identity <default> --password-stdin --notify=false --auto-reply=
 - **孤儿识别**：spawn 时把 `DaemonPidFile` 写入 `hyphae-daemon.pid`，其中记录进程启动时间：macOS 取 `proc_pidinfo` 的 `pbi_start_tvsec`，Linux 取 `/proc/<pid>/stat` 第 22 字段。agent24d 启动时，只有当 pid 存活**且**启动时间与文件记录一致，才认定为孤儿，对其 `killpg`（先 TERM 后 KILL）。这样不会误杀复用了同一 pid 的无关进程。
 
 ### 6.2 停止与 agent24d 关机（COMM-4a）
-- **stop**：对进程组发 SIGTERM（Hyphae 以 `signal.NotifyContext` 处理，实测退出码 0），宽限 `A24_MODULE_STOP_GRACE_MS` 后发 SIGKILL，再按 `REAP_TIMEOUT` 回收。
+- **stop**：对进程组发 SIGTERM（Hyphae 以 `signal.NotifyContext` 处理，实测退出码 0），宽限 `A24_COMPONENT_STOP_GRACE_MS`（旧名 `A24_MODULE_STOP_GRACE_MS` 为别名，保留一版） 后发 SIGKILL，再按 `REAP_TIMEOUT` 回收。
 - **关机**：comm 的停止并入 SHUT-1b 的模块停止阶段，在 `last-shutdown.json` 的 `records[]` 里记一条，`name` 为 `comm.hyphae`。
 - **崩溃**：agent24d 崩溃后，由下次启动时的孤儿清理兜底。
 - **autostart**：第一次手动 start 成功后，`daemon.autostart` 置为 true；手动 stop 后置为 false。

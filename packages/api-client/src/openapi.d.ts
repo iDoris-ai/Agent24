@@ -798,7 +798,7 @@ export interface paths {
         /**
          * The shutdown budgets in effect and the previous shutdown (authenticated)
          * @description SHUT-1c. The out-of-process modules' drain and stop grace
-         *     (`A24_MODULE_DRAIN_MS`, `A24_MODULE_STOP_GRACE_MS`), the exit bound
+         *     (`A24_MODULE_DRAIN_MS`, `A24_COMPONENT_STOP_GRACE_MS`), the exit bound
          *     they give, values that were rejected, and what this daemon found of
          *     the one before it — so a budget that is too tight can be found and
          *     adjusted. agent24d only.
@@ -2270,7 +2270,7 @@ export interface components {
             evidence_dir?: string;
             drain_ms: number;
             stop_grace_ms: number;
-            /** @description From SIGTERM to the process gone, at the latest (2000 at the defaults). */
+            /** @description From SIGTERM to the process gone, at the latest (16500 at the defaults). */
             exit_bound_ms: number;
             config_warnings: string[];
             /** @description Open enum: no_history | clean | unreadable | cleanup_failed | unconfirmed. */

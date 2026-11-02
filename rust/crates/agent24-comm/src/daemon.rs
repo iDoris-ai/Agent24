@@ -60,7 +60,7 @@ pub const READY_AFTER_DEFAULT: Duration = Duration::from_secs(3);
 /// Kept only for callers outside `agent24d` (and as the orphan-reap grace
 /// before a [`Ctx`] exists at all): it used to be the ONE grace this whole
 /// crate read, via its own raw, unvalidated parse of
-/// `A24_MODULE_STOP_GRACE_MS` with a 5s default — while `agent24d`'s own
+/// `A24_MODULE_STOP_GRACE_MS` with a 5s default (now `A24_COMPONENT_STOP_GRACE_MS`, 15s, ADR-038 D5) — while `agent24d`'s own
 /// `lifecycle::Params` reads the exact same variable with a 500ms default
 /// and a 100ms..=5000ms clamp. Two different numbers under one variable name
 /// meant a running daemon's actual stop grace silently disagreed with the
@@ -69,11 +69,28 @@ pub const READY_AFTER_DEFAULT: Duration = Duration::from_secs(3);
 /// even been sent SIGKILL.
 #[must_use]
 pub fn stop_grace() -> Duration {
-    std::env::var("A24_MODULE_STOP_GRACE_MS")
-        .ok()
+    let (grace, legacy) = grace_from(|name| std::env::var(name).ok());
+    if legacy {
+        tracing::warn!("A24_MODULE_STOP_GRACE_MS is deprecated; use A24_COMPONENT_STOP_GRACE_MS");
+    }
+    grace
+}
+
+/// [`stop_grace`] over an injected environment: the grace, and whether it came from the
+/// deprecated name (used only when the new one is unset). An unparsable value is the default.
+fn grace_from(get: impl Fn(&str) -> Option<String>) -> (Duration, bool) {
+    let (raw, legacy) = match get("A24_COMPONENT_STOP_GRACE_MS") {
+        Some(raw) => (Some(raw), false),
+        None => {
+            let raw = get("A24_MODULE_STOP_GRACE_MS");
+            let legacy = raw.is_some();
+            (raw, legacy)
+        }
+    };
+    let grace = raw
         .and_then(|s| s.parse().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(5))
+        .map_or(Duration::from_secs(15), Duration::from_millis);
+    (grace, legacy)
 }
 
 // ---------------------------------------------------------------------
@@ -2837,5 +2854,44 @@ mod tests {
             Some(format!("down-{i}"))
         };
         assert_eq!(probe.error, expected_error, "torn write: {probe:?}");
+    }
+}
+
+#[cfg(test)]
+mod grace_tests {
+    use super::*;
+
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_owned())
+        }
+    }
+
+    #[test]
+    fn the_default_is_15s_the_new_name_wins_and_the_old_one_is_an_alias() {
+        assert_eq!(grace_from(env(&[])), (Duration::from_secs(15), false));
+        assert_eq!(
+            grace_from(env(&[("A24_COMPONENT_STOP_GRACE_MS", "2000")])),
+            (Duration::from_secs(2), false)
+        );
+        assert_eq!(
+            grace_from(env(&[("A24_MODULE_STOP_GRACE_MS", "3000")])),
+            (Duration::from_secs(3), true),
+            "the alias works, and says it is the alias"
+        );
+        assert_eq!(
+            grace_from(env(&[
+                ("A24_COMPONENT_STOP_GRACE_MS", "2000"),
+                ("A24_MODULE_STOP_GRACE_MS", "3000")
+            ])),
+            (Duration::from_secs(2), false)
+        );
+        assert_eq!(
+            grace_from(env(&[("A24_COMPONENT_STOP_GRACE_MS", "soon")])).0,
+            Duration::from_secs(15)
+        );
     }
 }

@@ -30,7 +30,7 @@ fn workspace_recovery_instant_at(
 // out-of-process modules' drain and stop grace (tunable: `A24_MODULE_DRAIN_MS`,
 // `A24_MODULE_STOP_GRACE_MS`), the time to put the summary on disk, and the
 // watchdog after all of them — live in `crate::lifecycle` (SHUT-1b). At the
-// defaults `kill -TERM` ends the process within 2s (TASKS B2).
+// defaults `kill -TERM` ends the process within 16.5s (ADR-038 D5 raised the stop grace to 15s; TASKS B2's 2s now holds only with a lowered grace).
 
 #[derive(Clone)]
 pub struct AppState {
