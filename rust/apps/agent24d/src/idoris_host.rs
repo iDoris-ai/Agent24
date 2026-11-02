@@ -54,6 +54,10 @@ pub struct Installation {
     pub desired_running: bool,
     #[serde(default)]
     pub verification: Option<VerificationReceipt>,
+    /// Managed root (canonical) the release was installed under; absent in receipts
+    /// written before ADR-038 D1.
+    #[serde(default)]
+    pub install_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -221,6 +225,12 @@ pub struct Status {
     pub verification: Option<VerificationReceipt>,
     pub budget_suggestion: Option<agent24_hw::IdorisBudgetSuggestion>,
     pub budget_unavailable_reason: Option<String>,
+    /// The saved release is outside the managed root; the next Install migrates it.
+    #[serde(default)]
+    pub migration_pending: bool,
+    /// Why the last migration attempt failed; the legacy install keeps working.
+    #[serde(default)]
+    pub last_migration_error: Option<Code>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -485,6 +495,7 @@ struct Inner {
     supervisor: Option<Supervisor>,
     generation: Option<String>,
     closing: bool,
+    migration_error: Option<Code>,
 }
 pub struct IdorisHost {
     /// State: installation receipt, `data/`, `instances/`, operation journal.
@@ -524,6 +535,16 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Code> {
     };
     write().map_err(|_| Code::PersistenceFailed)
 }
+/// Create the parent of the managed root and canonicalize it, so `starts_with` on a
+/// receipt's canonical `release_dir` is canonical-to-canonical even when the data
+/// directory is a symlink. The leaf itself is left to the installer (it must be 0700).
+pub fn canonical_install_root(path: &Path) -> io::Result<PathBuf> {
+    let (Some(parent), Some(leaf)) = (path.parent(), path.file_name()) else {
+        return Err(io::Error::other("install root has no parent"));
+    };
+    std::fs::create_dir_all(parent)?;
+    Ok(std::fs::canonicalize(parent)?.join(leaf))
+}
 impl IdorisHost {
     /// `root` holds state (receipt, data, instances); releases go to `install_root`,
     /// the ADR-038 managed root `<data dir>/components/idoris`.
@@ -534,6 +555,7 @@ impl IdorisHost {
         router: Arc<ModelRouter>,
     ) -> io::Result<Arc<Self>> {
         let secrets: Arc<dyn SecretSource> = Arc::new(KeychainSource(Arc::new(SystemKeychain)));
+        let install_root = canonical_install_root(&install_root)?;
         let mut host = Self::open(
             root,
             managed,
@@ -608,6 +630,7 @@ impl IdorisHost {
                 supervisor: None,
                 generation: None,
                 closing: false,
+                migration_error: None,
             }),
         }))
     }
@@ -644,6 +667,8 @@ impl IdorisHost {
             verification: r.and_then(|r| r.verification.clone()),
             budget_suggestion: None,
             budget_unavailable_reason: None,
+            migration_pending: r.is_some_and(|r| !self.in_managed_root(r)),
+            last_migration_error: i.migration_error,
         };
         drop(i);
         if status.state == State::NotConfigured

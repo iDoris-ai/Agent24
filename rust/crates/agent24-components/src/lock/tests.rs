@@ -105,6 +105,8 @@ fn rejects_invalid_values() {
             "/release_url_base",
             json!("https://evil.invalid/example/demo/releases/download"),
         ),
+        ("/assets/darwin-arm64/files", json!(["demo", "a\nb"])),
+        ("/assets/darwin-arm64/files", json!(["demo", "a\u{7f}b"])),
         ("/provides/0/id", json!("X")),
         ("/provides/0/id", json!("a")),
     ];

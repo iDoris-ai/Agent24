@@ -80,6 +80,22 @@ const PLATFORM_TRIPLES: [(&str, &str); 4] = [
     ("linux-x64", "x86_64-unknown-linux-gnu"),
 ];
 
+/// Rust target triple of a host (`std::env::consts` OS and ARCH values), if iDoris
+/// publishes for that platform family.
+pub fn triple_for(os: &str, arch: &str) -> Option<&'static str> {
+    let key = agent24_components::lock::platform_key(os, arch)?;
+    PLATFORM_TRIPLES
+        .iter()
+        .find(|(p, _)| *p == key)
+        .map(|(_, t)| *t)
+}
+
+/// The triple of this host. The lock decides whether an asset exists for it, so an
+/// Intel Mac gets `UnsupportedPlatform` instead of an arm64 binary it cannot run.
+pub fn host_triple() -> Option<&'static str> {
+    triple_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
 /// Platform key (`darwin-arm64`) for a Rust target triple, if iDoris knows it.
 pub fn platform_of(triple: &str) -> Option<&'static str> {
     PLATFORM_TRIPLES

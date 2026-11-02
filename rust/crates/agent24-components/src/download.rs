@@ -23,7 +23,7 @@ use url::Url;
 pub const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 // GitHub release asset hosts: https://docs.github.com/en/rest/releases/assets
 // and the iDoris v0.4.0 asset's observed 302 on 2026-10-28:
-// github.com/component-ai/component/releases/download/v0.4.0/
+// github.com/iDoris-ai/iDoris/releases/download/v0.4.0/
 // idoris-v0.4.0-aarch64-apple-darwin.tar.gz -> release-assets.githubusercontent.com.
 // objects.githubusercontent.com is GitHub's other release object host.
 pub const RELEASE_HOSTS: &[&str] = &[

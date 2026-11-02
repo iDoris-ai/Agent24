@@ -160,7 +160,9 @@ pub fn platform_key_from_triple(triple: &str) -> Option<String> {
 
 /// Safe relative path inside an artifact.
 pub(crate) fn clean_relative(path: &str) -> bool {
-    !path.contains(['\\', '\0']) && path.split('/').all(|p| !matches!(p, "" | "." | ".."))
+    !path.contains(['\\', '\0'])
+        && !path.chars().any(char::is_control)
+        && path.split('/').all(|p| !matches!(p, "" | "." | ".."))
 }
 
 impl ComponentLock {
@@ -309,7 +311,10 @@ impl ComponentLock {
 
     /// The only reader of schema-1 locks (iDoris shape). `id`, `provides` and
     /// `requires` did not exist in schema 1, so the caller supplies them; nothing
-    /// else is guessed. Delete this once no schema-1 file remains (ADR-038 D2).
+    /// else is guessed. No shipped lock is schema 1 any more (iDoris moved in C1b'),
+    /// so this survives only to test the migration; Hyphae's schema-1 lock is read by
+    /// agent24-comm. Delete it with its tests once C1b has moved Hyphae.
+    #[cfg(test)]
     pub fn migrate_schema1(
         json: &str,
         id: &str,
@@ -378,8 +383,7 @@ impl ComponentLock {
             assets,
             signing: Some(Signing {
                 macos_team_id: v1.team_id,
-                // `spctl --assess --type execute` rejects every bare CLI binary, even
-                // Apple's own, so the notarization gate cannot be on for these assets.
+                // Schema 1 never recorded notarization; the caller sets it afterwards.
                 notarized: false,
             }),
             reproducible: None,

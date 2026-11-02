@@ -102,7 +102,7 @@ impl Provisioner for SystemProvisioner {
     ) -> Result<VerifiedArchive, Code> {
         download_locked_asset(
             IdorisLock::embedded(),
-            "aarch64-apple-darwin",
+            agent24_idoris::host_triple().ok_or(Code::NotInstalled)?,
             &root.join("cache"),
             &DownloadOptions {
                 progress: Some(progress),
@@ -128,7 +128,7 @@ impl Provisioner for SystemProvisioner {
         options.child_args = vec!["__idoris-install-child".into()];
         install_locked_asset(
             IdorisLock::embedded(),
-            "aarch64-apple-darwin",
+            agent24_idoris::host_triple().ok_or(Code::NotInstalled)?,
             archive,
             &options,
             Codesign,
@@ -180,6 +180,46 @@ impl Provisioner for SystemProvisioner {
         .await
         .map_err(|_| Code::NotConfigured)?
     }
+}
+/// The only legacy paths that may ever be listed as deletable (H2 allow-list): a release
+/// directory `<old_root>/<major.minor.patch>` or a verified archive
+/// `<old_root>/cache/<name>.verified`, each directly below the canonical old root and
+/// not a symlink. Everything else under the old root (`data/`, `instances/`,
+/// `transactions/`, `installation.json`, `operations.json`, the root itself) is state
+/// and never matches.
+pub(super) fn legacy_deletable(old_root: &Path, candidates: &[&Path]) -> Vec<PathBuf> {
+    let Ok(old_root) = std::fs::canonicalize(old_root) else {
+        return Vec::new();
+    };
+    let release_name = |name: &str| {
+        let parts: Vec<_> = name.split('.').collect();
+        parts.len() == 3
+            && parts.iter().all(|p| {
+                !p.is_empty()
+                    && p.bytes().all(|b| b.is_ascii_digit())
+                    && (p.len() == 1 || !p.starts_with('0'))
+            })
+    };
+    candidates
+        .iter()
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?;
+            if std::fs::symlink_metadata(path)
+                .ok()?
+                .file_type()
+                .is_symlink()
+            {
+                return None;
+            }
+            let parent = std::fs::canonicalize(path.parent()?).ok()?;
+            let release = parent == old_root && release_name(name);
+            let cached = parent == old_root.join("cache")
+                && name.len() > ".verified".len()
+                && name.ends_with(".verified")
+                && !name.starts_with('.');
+            (release || cached).then(|| parent.join(name))
+        })
+        .collect()
 }
 fn install_code(e: InstallError) -> Code {
     match e {
@@ -405,7 +445,7 @@ impl IdorisHost {
                 verified = self.provisioner.verify(old) => verified.is_ok(),
             };
             if valid {
-                if old.release_dir.starts_with(&self.install_root) {
+                if self.in_managed_root(old) {
                     return Ok(());
                 }
                 migrating = true;
@@ -419,9 +459,11 @@ impl IdorisHost {
                     ?code,
                     "iDoris managed-root migration failed; legacy install kept"
                 );
+                self.inner.lock().await.migration_error = Some(code);
                 Ok(())
             }
             Ok(()) if migrating => {
+                self.inner.lock().await.migration_error = None;
                 if let Some(old) = &old {
                     self.mark_legacy_deletable(old);
                 }
@@ -430,16 +472,30 @@ impl IdorisHost {
             other => other,
         }
     }
-    /// Record the superseded legacy paths without deleting anything (`agent24 idoris gc`
-    /// is the only thing that may remove them). Best effort: the marker is advisory.
+    /// A receipt is current when its release lives under the (canonical) managed root and,
+    /// if it recorded one, was installed under that same root.
+    pub(super) fn in_managed_root(&self, r: &Installation) -> bool {
+        r.release_dir.starts_with(&self.install_root)
+            && r.install_root
+                .as_ref()
+                .is_none_or(|recorded| *recorded == self.install_root)
+    }
+    /// Record the superseded legacy paths without deleting anything. The file is
+    /// advisory only: any future `agent24 idoris gc` MUST re-validate every path with
+    /// [`legacy_deletable`] (or stricter) and never trust this file's contents.
     fn mark_legacy_deletable(&self, old: &Installation) {
-        let paths: Vec<_> = [&old.release_dir, &old.archive_path]
-            .into_iter()
-            .filter(|p| !p.starts_with(&self.install_root))
-            .collect();
+        let paths = legacy_deletable(&self.root, &[&old.release_dir, &old.archive_path]);
+        if paths.is_empty() {
+            return;
+        }
         let _ = write_json(
             &self.root.join("legacy-install.deletable.json"),
-            &serde_json::json!({"schema": 1, "superseded_by": self.install_root, "paths": paths}),
+            &serde_json::json!({
+                "schema": 1,
+                "advisory": "re-validate every path before deleting; see legacy_deletable()",
+                "superseded_by": self.install_root,
+                "paths": paths,
+            }),
         );
     }
     async fn download_and_install(
@@ -498,10 +554,12 @@ impl IdorisHost {
             omlx_key_id: None,
             desired_running: false,
             verification: None,
+            install_root: None,
         });
         let record = Installation {
             release_dir: installed.directory().into(),
             archive_path: archive.path,
+            install_root: Some(self.install_root.clone()),
             ..record
         };
         let mut i = self.inner.lock().await;

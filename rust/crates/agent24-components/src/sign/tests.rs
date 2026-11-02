@@ -61,10 +61,12 @@ fn healthy(program: &str, args: &[&str]) -> io::Result<CommandOutput> {
 #[test]
 fn requirement_has_the_mandatory_leading_equals() {
     // Without the `=`, codesign reads the value as a file path (#1533).
-    assert_eq!(
-        team_requirement("HYAP444FN9"),
-        "=anchor apple generic and certificate leaf[subject.OU] = \"HYAP444FN9\""
-    );
+    let req = team_requirement("HYAP444FN9");
+    assert!(req.starts_with("=anchor apple generic and "));
+    // Developer ID only: both chain markers, then the team.
+    assert!(req.contains("certificate 1[field.1.2.840.113635.100.6.2.6] exists"));
+    assert!(req.contains("certificate leaf[field.1.2.840.113635.100.6.1.13] exists"));
+    assert!(req.ends_with("certificate leaf[subject.OU] = \"HYAP444FN9\""));
 }
 
 #[cfg(target_os = "macos")]
@@ -217,14 +219,17 @@ mod macos {
         assert_eq!(spctl.1[..3], ["--assess", "--type", "execute"]);
     }
 
-    /// Real spctl on a notarized CLI; skipped where the release artifact is absent.
+    /// Real spctl on a notarized CLI. Run with
+    /// `A24_TEST_NOTARIZED_BIN=/path/to/notarized-cli cargo test -- --ignored`;
+    /// ignored (not silently passing) when no such binary is supplied.
     #[test]
+    #[ignore = "needs A24_TEST_NOTARIZED_BIN"]
     fn real_spctl_accepts_notarized_cli_and_rejects_adhoc_copy() {
-        let cli = Path::new("/Users/jason/Dev/auraai/Agent24/.wt/rel/dist/mac-cli/agent24");
-        if !cli.exists() {
-            eprintln!("skipped: {} not present", cli.display());
-            return;
-        }
+        let cli = PathBuf::from(
+            std::env::var_os("A24_TEST_NOTARIZED_BIN")
+                .expect("set A24_TEST_NOTARIZED_BIN to a notarized Mach-O CLI"),
+        );
+        let cli = cli.as_path();
         let assess = |path: &Path| {
             SystemRunner
                 .run(
@@ -260,6 +265,72 @@ mod macos {
             "{}",
             bad.stderr
         );
+    }
+
+    /// Developer-ID-signed but never notarized: Gatekeeper must not say Notarized.
+    /// `A24_TEST_DEVID_IDENTITY` is a codesign identity (it may prompt for the keychain).
+    #[test]
+    #[ignore = "needs A24_TEST_DEVID_IDENTITY"]
+    fn real_spctl_rejects_developer_id_signed_but_not_notarized() {
+        let identity = std::env::var("A24_TEST_DEVID_IDENTITY")
+            .expect("set A24_TEST_DEVID_IDENTITY to a Developer ID Application identity");
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("true");
+        std::fs::copy("/usr/bin/true", &exe).unwrap();
+        let signed = Command::new(CODESIGN)
+            .args(["--force", "--options", "runtime", "-s", &identity])
+            .arg(&exe)
+            .output()
+            .unwrap();
+        assert!(signed.status.success(), "{signed:?}");
+        let verdict = SystemRunner
+            .run(
+                SPCTL,
+                &[
+                    "--assess",
+                    "--type",
+                    "install",
+                    "-vv",
+                    &exe.to_string_lossy(),
+                ],
+            )
+            .unwrap();
+        assert!(!notarized_verdict(&verdict.stderr), "{}", verdict.stderr);
+        assert!(!verdict.stderr.contains("source=Notarized Developer ID"));
+        // The whole verifier agrees: signature fine, notarization refused.
+        let team = identity
+            .rsplit('(')
+            .next()
+            .unwrap()
+            .trim_end_matches(')')
+            .to_owned();
+        let result = Codesign.verify(
+            &exe,
+            &SigningRequirement {
+                team_id: &team,
+                notarized: true,
+            },
+        );
+        assert!(
+            matches!(result, Err(InstallError::NotNotarized)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn junk_team_ids_never_reach_codesign() {
+        for junk in ["", "short", "hyap444fn9", "HYAP444FN9\"x", "HYAP444FN99"] {
+            let fake = Fake::new(healthy);
+            let req = SigningRequirement {
+                team_id: junk,
+                notarized: false,
+            };
+            assert!(matches!(
+                run(&fake, &req),
+                Err(InstallError::SignatureMismatch)
+            ));
+            assert!(fake.calls.borrow().is_empty(), "codesign ran for {junk:?}");
+        }
     }
 
     #[test]
@@ -302,10 +373,13 @@ mod macos {
         ));
         // Without the leading `=` codesign would treat the text as a file path.
         let no_equals = team_requirement("HYAP444FN9").replacen('=', "", 1);
-        assert!(!matches!(
-            verifier.check_requirement(&exe, &no_equals, false),
-            Err(InstallError::SignatureMismatch)
-        ));
+        assert!(
+            matches!(
+                verifier.check_requirement(&exe, &no_equals, false),
+                Err(InstallError::SignatureCheckFailed(_))
+            ),
+            "a requirement without the leading `=` must fail as a tool error"
+        );
         // A missing file is a tool failure that says so.
         assert!(matches!(
             verifier.check_requirement(&dir.path().join("absent"), "=identifier \"x\"", false),

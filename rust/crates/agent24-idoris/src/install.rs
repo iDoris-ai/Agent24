@@ -69,10 +69,24 @@ pub fn verify_existing(
     archive: &VerifiedArchive,
     signature: &dyn SignatureVerifier,
 ) -> Result<InstalledVersion, InstallError> {
+    let platform = crate::host_triple()
+        .and_then(platform_of)
+        .ok_or(InstallError::UnsupportedPlatform)?;
+    verify_existing_on(platform, directory, lock, archive, signature)
+}
+
+/// `verify_existing` for an explicit platform key (`darwin-arm64`).
+pub fn verify_existing_on(
+    platform: &str,
+    directory: &Path,
+    lock: &IdorisLock,
+    archive: &VerifiedArchive,
+    signature: &dyn SignatureVerifier,
+) -> Result<InstalledVersion, InstallError> {
     InstalledVersion::verify_existing(
         directory,
         &lock.to_component(),
-        "darwin-arm64",
+        platform,
         archive,
         signature,
     )

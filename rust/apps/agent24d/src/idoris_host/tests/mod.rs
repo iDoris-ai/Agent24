@@ -177,6 +177,7 @@ impl Fixture {
             omlx_key_id: None,
             desired_running: true,
             verification: None,
+            install_root: None,
         };
         let runtime = Arc::new(FixtureRuntime {
             lock,
@@ -652,6 +653,7 @@ async fn real_v040_install_existing_start_running_stop() {
         omlx_key_id: None,
         desired_running: true,
         verification: None,
+        install_root: None,
     })
     .await
     .unwrap();

@@ -36,6 +36,8 @@ pub async fn status(State(state): State<AppState>) -> Response {
             verification: None,
             budget_suggestion: None,
             budget_unavailable_reason: Some("host_unavailable".into()),
+            migration_pending: false,
+            last_migration_error: None,
         },
     };
     Json(status).into_response()

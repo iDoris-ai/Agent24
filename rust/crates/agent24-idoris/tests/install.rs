@@ -102,14 +102,14 @@ impl Fixture {
         }
     }
     fn install(&self, signature: bool) -> Result<std::path::PathBuf, InstallError> {
-        install_locked_asset(
-            &self.lock,
-            TRIPLE,
-            &self.archive,
-            &self.opts,
-            Signature(signature),
-        )
-        .map(|installed| installed.directory().to_owned())
+        self.install_with(Signature(signature))
+    }
+    fn install_with(
+        &self,
+        signature: impl SignatureVerifier + Send + 'static,
+    ) -> Result<std::path::PathBuf, InstallError> {
+        install_locked_asset(&self.lock, TRIPLE, &self.archive, &self.opts, signature)
+            .map(|installed| installed.directory().to_owned())
     }
     fn clean(&self) {
         assert!(!self.opts.root.join("0.4.0").exists());
@@ -282,6 +282,39 @@ fn signature_failure_rolls_back_new_but_preserves_existing_version() {
     assert!(installed.exists());
 }
 
+/// Verifier that records whether the final version directory exists while it runs.
+struct WatchesFinalDir {
+    final_dir: std::path::PathBuf,
+    saw_final: std::sync::Mutex<Vec<bool>>,
+}
+impl SignatureVerifier for WatchesFinalDir {
+    fn verify(&self, _: &Path, _: &SigningRequirement) -> Result<(), InstallError> {
+        self.saw_final.lock().unwrap().push(self.final_dir.exists());
+        Err(InstallError::SignatureMismatch)
+    }
+}
+
+#[test]
+fn a_failing_signature_never_creates_the_final_directory() {
+    let f = Fixture::new(None);
+    let watcher = std::sync::Arc::new(WatchesFinalDir {
+        final_dir: f.opts.root.join("0.4.0"),
+        saw_final: Default::default(),
+    });
+    struct Shared(std::sync::Arc<WatchesFinalDir>);
+    impl SignatureVerifier for Shared {
+        fn verify(&self, p: &Path, r: &SigningRequirement) -> Result<(), InstallError> {
+            self.0.verify(p, r)
+        }
+    }
+    let result = f.install_with(Shared(watcher.clone()));
+    assert!(matches!(result, Err(InstallError::SignatureMismatch)));
+    // Verified once, inside staging, before the rename: no final directory then or after.
+    assert_eq!(*watcher.saw_final.lock().unwrap(), [false]);
+    assert!(!f.opts.root.join("0.4.0").exists());
+    f.clean();
+}
+
 #[test]
 fn child_failure_cleans_staging() {
     let mut f = Fixture::new(None);
@@ -333,14 +366,14 @@ async fn real_v0_4_0_download_install_and_l6() {
     let archive = download_locked_asset(
         lock,
         TRIPLE,
-        &dir.path().join("idoris/cache"),
+        &dir.path().join("components/idoris/cache"),
         &DownloadOptions::default(),
         &CancellationToken::new(),
     )
     .await
     .unwrap();
     let opts = InstallOptions::new(
-        dir.path().join("idoris"),
+        dir.path().join("components/idoris"),
         env!("CARGO_BIN_EXE_idoris-install-child"),
     );
     let installed = install_async(
@@ -358,7 +391,7 @@ async fn real_v0_4_0_download_install_and_l6() {
             &installed.binary(),
             &SigningRequirement {
                 team_id: &lock.team_id,
-                notarized: false,
+                notarized: true,
             },
         )
         .unwrap();
@@ -551,6 +584,8 @@ fn concurrent_second_installer_gets_busy() {
         });
         ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let second = f.install(true);
+        // Verification runs twice per install: in staging, then at the final path.
+        release_tx.send(()).unwrap();
         release_tx.send(()).unwrap();
         assert!(matches!(second, Err(InstallError::Busy)));
         first.join().unwrap().unwrap();

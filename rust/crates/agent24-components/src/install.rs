@@ -174,14 +174,18 @@ fn verify_signatures(
     asset: &Asset,
     signature: &dyn SignatureVerifier,
 ) -> Result<(), InstallError> {
-    let Some(signing) = lock
-        .signing
-        .as_ref()
-        .filter(|_| platform.starts_with("darwin-"))
-    else {
+    if !platform.starts_with("darwin-") {
         // Linux and others: sha256 plus reproducible-build data only (D2a).
         return Ok(());
-    };
+    }
+    // A macOS asset without a signing section is never installable (fail closed).
+    let signing = lock
+        .signing
+        .as_ref()
+        .ok_or_else(|| violation("unsigned macOS asset"))?;
+    if !crate::sign::valid_team_id(&signing.macos_team_id) {
+        return Err(violation("invalid signing team"));
+    }
     let required = SigningRequirement {
         team_id: &signing.macos_team_id,
         notarized: signing.notarized,
@@ -346,9 +350,12 @@ fn install_blocking(
         File::open(&path)?.sync_all()?;
     }
     sync_dirs(staging.path())?;
+    // Verify before the final directory exists: a failing signature never leaves one.
+    verify_signatures(staging.path(), lock, platform, asset, signature)?;
     check_cancel(cancel)?;
     fs::rename(staging.path(), &version)?;
-    // Keep rollback under the same operation lock, including signature failure.
+    // Verify again at the final path, under the same operation lock. On failure roll
+    // back, and keep the original error even if the rollback itself fails.
     let result = (|| {
         File::open(&root)?.sync_all()?;
         verify_signatures(&version, lock, platform, asset, signature)?;
@@ -360,8 +367,7 @@ fn install_blocking(
         })
     })();
     if result.is_err() {
-        fs::remove_dir_all(&version)?;
-        File::open(&root)?.sync_all()?;
+        let _ = fs::remove_dir_all(&version).and_then(|()| File::open(&root)?.sync_all());
     }
     result
 }
@@ -596,6 +602,7 @@ fn clean_path(name: &str, directory: bool) -> Result<&str, InstallError> {
     };
     if name.is_empty()
         || name.contains(['\\', '\0'])
+        || name.chars().any(char::is_control)
         || name.split('/').any(|s| matches!(s, "" | "." | ".."))
     {
         return Err(violation(format!("unsafe path: {name}")));
@@ -1049,6 +1056,25 @@ mod tests {
             verify_signatures(dir, &lock, "darwin-arm64", asset, &bad),
             Err(InstallError::SignatureMismatch)
         ));
+    }
+
+    #[test]
+    fn darwin_without_signing_or_with_a_bad_team_fails_closed() {
+        let mut lock = two_executables();
+        let asset = lock.assets["darwin-arm64"].clone();
+        let never = Recording {
+            seen: Default::default(),
+            fail_on: None,
+        };
+        lock.signing = None;
+        assert!(matches!(
+            verify_signatures(Path::new("/v"), &lock, "darwin-arm64", &asset, &never),
+            Err(InstallError::ManifestViolation(_))
+        ));
+        let mut lock = two_executables();
+        lock.signing.as_mut().unwrap().macos_team_id = "bad".into();
+        assert!(verify_signatures(Path::new("/v"), &lock, "darwin-arm64", &asset, &never).is_err());
+        assert!(never.seen.lock().unwrap().is_empty());
     }
 
     #[test]

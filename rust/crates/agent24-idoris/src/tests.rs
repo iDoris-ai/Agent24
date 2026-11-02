@@ -165,3 +165,53 @@ fn duplicate_assurance_levels_are_rejected() {
     value["assurance"].as_array_mut().unwrap().push(first);
     assert!(IdorisLock::parse(&value.to_string()).is_err());
 }
+
+#[test]
+fn host_platform_selects_the_asset_and_unknown_hosts_get_none() {
+    assert_eq!(triple_for("macos", "aarch64"), Some("aarch64-apple-darwin"));
+    assert_eq!(triple_for("macos", "x86_64"), Some("x86_64-apple-darwin"));
+    assert_eq!(
+        triple_for("linux", "x86_64"),
+        Some("x86_64-unknown-linux-gnu")
+    );
+    assert_eq!(triple_for("windows", "x86_64"), None);
+    // The shipped lock only has an arm64 macOS asset: Intel Macs are unsupported.
+    let lock = IdorisLock::embedded();
+    assert!(
+        lock.asset_for(triple_for("macos", "aarch64").unwrap())
+            .is_some()
+    );
+    assert!(
+        lock.asset_for(triple_for("macos", "x86_64").unwrap())
+            .is_none()
+    );
+}
+
+#[test]
+fn verify_existing_on_a_platform_without_an_asset_is_unsupported() {
+    struct Never;
+    impl agent24_components::sign::SignatureVerifier for Never {
+        fn verify(
+            &self,
+            _: &std::path::Path,
+            _: &agent24_components::sign::SigningRequirement,
+        ) -> Result<(), crate::install::InstallError> {
+            unreachable!()
+        }
+    }
+    let archive = crate::download::VerifiedArchive {
+        path: "/nonexistent".into(),
+        sha256: String::new(),
+    };
+    let result = crate::install::verify_existing_on(
+        "darwin-x64",
+        std::path::Path::new("/nonexistent"),
+        IdorisLock::embedded(),
+        &archive,
+        &Never,
+    );
+    assert!(matches!(
+        result,
+        Err(crate::install::InstallError::UnsupportedPlatform)
+    ));
+}

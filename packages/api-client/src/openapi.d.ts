@@ -2145,6 +2145,9 @@ export interface components {
             budget_suggestion: components["schemas"]["IdorisBudgetSuggestion"] | null;
             /** @enum {string|null} */
             budget_unavailable_reason: "hardware_memory_unavailable" | "hardware_probe_failed" | "host_unavailable" | null;
+            /** @description The installed release is outside the ADR-038 managed root; the next Install re-downloads it there. The current install keeps working meanwhile. */
+            migration_pending: boolean;
+            last_migration_error: components["schemas"]["IdorisErrorCode"] | null;
         };
         IdorisOperation: {
             operation_id: string;

@@ -22,7 +22,7 @@
       "executables": ["idoris"]
     }
   },
-  "signing": { "macos_team_id": "HYAP444FN9", "notarized": false },
+  "signing": { "macos_team_id": "HYAP444FN9", "notarized": true },
   "provides": [
     {
       "id": "model-gateway",
