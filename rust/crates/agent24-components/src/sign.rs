@@ -131,16 +131,29 @@ impl<R: CommandRunner> SignatureVerifier for CodesignWith<R> {
             return Err(InstallError::HardenedRuntimeMissing);
         }
         if required.notarized {
-            // Gatekeeper's verdict, not `stapler validate` (which only checks a ticket exists).
+            // `--type execute` rejects every bare command-line binary ("does not seem to
+            // be an app"), notarized or not; `--type install` is the Gatekeeper verdict
+            // for those. Bundles keep `execute`. The verdict text is parsed, not just the
+            // exit status: it must say accepted by a Notarized Developer ID.
+            let kind = if deep { "execute" } else { "install" };
             let verdict = self
                 .0
-                .run(SPCTL, &["--assess", "--type", "execute", &path])?;
-            if !verdict.success {
+                .run(SPCTL, &["--assess", "--type", kind, "-vv", &path])?;
+            if !(verdict.success && notarized_verdict(&verdict.stderr)) {
                 return Err(InstallError::NotNotarized);
             }
         }
         Ok(())
     }
+}
+
+fn notarized_verdict(output: &str) -> bool {
+    output
+        .lines()
+        .any(|l| l.trim_end().ends_with(": accepted") || l.trim() == "accepted")
+        && output
+            .lines()
+            .any(|l| l.trim() == "source=Notarized Developer ID")
 }
 
 /// `CodeDirectory v=20500 size=… flags=0x10000(runtime) hashes=…`

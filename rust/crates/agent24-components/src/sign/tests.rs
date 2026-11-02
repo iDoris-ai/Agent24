@@ -46,9 +46,13 @@ const REQ: SigningRequirement = SigningRequirement {
     notarized: true,
 };
 
+const SPCTL_OK: &str = "/x/demo: accepted\nsource=Notarized Developer ID\n";
+
 fn healthy(program: &str, args: &[&str]) -> io::Result<CommandOutput> {
     if program == CODESIGN && args.contains(&"-dv") {
         ok(DETAILS_OK)
+    } else if program == SPCTL {
+        ok(SPCTL_OK)
     } else {
         ok("")
     }
@@ -92,7 +96,8 @@ mod macos {
         assert_eq!(calls[0].0, CODESIGN);
         assert_eq!(calls[1].1[0], "-dv");
         assert_eq!(calls[2].0, SPCTL);
-        assert_eq!(calls[2].1[..3], ["--assess", "--type", "execute"]);
+        // Bare executables are assessed as `install`; `execute` rejects them.
+        assert_eq!(calls[2].1[..3], ["--assess", "--type", "install"]);
     }
 
     #[test]
@@ -130,7 +135,7 @@ mod macos {
             if p == CODESIGN && a.contains(&"-dv") {
                 ok(&DETAILS_OK.replace("HYAP444FN9", "OTHERTEAM1"))
             } else {
-                ok("")
+                healthy(p, a)
             }
         });
         assert!(matches!(
@@ -152,7 +157,7 @@ mod macos {
                 if p == CODESIGN && a.contains(&"-dv") {
                     ok(&details)
                 } else {
-                    ok("")
+                    healthy(p, a)
                 }
             });
             assert!(
@@ -166,7 +171,7 @@ mod macos {
             if p == CODESIGN && a.contains(&"-dv") {
                 ok(&details)
             } else {
-                ok("")
+                healthy(p, a)
             }
         });
         run(&fake, &REQ).unwrap();
@@ -182,6 +187,79 @@ mod macos {
             }
         });
         assert!(matches!(run(&fake, &REQ), Err(InstallError::NotNotarized)));
+    }
+
+    #[test]
+    fn notarization_needs_the_verdict_text_not_just_exit_zero() {
+        for text in [
+            "",
+            "/x/demo: accepted\nsource=Developer ID\n",
+            "/x/demo: accepted\n",
+            "/x/demo: rejected\nsource=Notarized Developer ID\n",
+        ] {
+            let text = text.to_owned();
+            let fake = Fake::new(
+                move |p, a| {
+                    if p == SPCTL { ok(&text) } else { healthy(p, a) }
+                },
+            );
+            assert!(matches!(run(&fake, &REQ), Err(InstallError::NotNotarized)));
+        }
+    }
+
+    #[test]
+    fn bundles_are_assessed_as_execute() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::new(healthy);
+        CodesignWith(&fake).verify(dir.path(), &REQ).unwrap();
+        let calls = fake.calls.borrow();
+        let spctl = calls.iter().find(|(p, _)| p == SPCTL).unwrap();
+        assert_eq!(spctl.1[..3], ["--assess", "--type", "execute"]);
+    }
+
+    /// Real spctl on a notarized CLI; skipped where the release artifact is absent.
+    #[test]
+    fn real_spctl_accepts_notarized_cli_and_rejects_adhoc_copy() {
+        let cli = Path::new("/Users/jason/Dev/auraai/Agent24/.wt/rel/dist/mac-cli/agent24");
+        if !cli.exists() {
+            eprintln!("skipped: {} not present", cli.display());
+            return;
+        }
+        let assess = |path: &Path| {
+            SystemRunner
+                .run(
+                    SPCTL,
+                    &[
+                        "--assess",
+                        "--type",
+                        "install",
+                        "-vv",
+                        &path.to_string_lossy(),
+                    ],
+                )
+                .unwrap()
+        };
+        let good = assess(cli);
+        assert!(
+            good.success && notarized_verdict(&good.stderr),
+            "{}",
+            good.stderr
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("agent24");
+        std::fs::copy(cli, &copy).unwrap();
+        let signed = Command::new(CODESIGN)
+            .args(["--force", "-s", "-"])
+            .arg(&copy)
+            .output()
+            .unwrap();
+        assert!(signed.status.success());
+        let bad = assess(&copy);
+        assert!(
+            !(bad.success && notarized_verdict(&bad.stderr)),
+            "{}",
+            bad.stderr
+        );
     }
 
     #[test]
