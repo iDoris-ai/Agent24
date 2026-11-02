@@ -479,7 +479,7 @@ describe('App navigation integration', () => {
       path.includes('/approvals?') ? { approvals: [{ id: 'one' }, { id: 'two' }] }
         : path === '/api/v1/idoris/status' ? {
           state: 'not_configured', version: '0.4.0', data_port: null, admin_port: null,
-          roles: [], last_error: null, current_operation: null, verification: null,
+          roles: [], last_error: null, migration_pending: false, last_migration_error: null, current_operation: null, verification: null,
           budget_suggestion: null, budget_unavailable_reason: 'hardware_memory_unavailable',
         } satisfies IdorisStatus
         : path === '/api/v1/comm/daemon' ? { ok: true, data: {
