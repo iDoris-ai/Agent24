@@ -32,6 +32,11 @@ use agent24_protocol::state_file::AuthMode;
 /// silent desktop (crashed, quit) reads as "not reporting" rather than as a stale `ready`.
 /// There is no connection to watch: the report is a plain HTTP POST.
 pub const REPORT_TTL: Duration = Duration::from_secs(90);
+/// The ids of the components this daemon lists itself. No attached module may take one:
+/// `attached::parse_manifest` refuses them, and [`attach_items`] drops same-named entries
+/// from registrations that predate the rule. Pinned by a test.
+pub(crate) const BUILTIN_COMPONENT_IDS: &[&str] =
+    &["idoris", "hyphae", "documents", "knowledge", "open-design"];
 /// Components whose state the desktop owns. Anything else is the daemon's to say.
 const DESKTOP_OWNED: &[&str] = &["open-design"];
 
@@ -263,10 +268,14 @@ fn attach_state(
 }
 
 fn attach_items(state: &AppState) -> Vec<Item> {
-    let mut modules = state.attach_registry.snapshot();
+    attach_items_from(state.attach_registry.snapshot())
+}
+
+fn attach_items_from(mut modules: Vec<(String, bool, Option<DrainState>)>) -> Vec<Item> {
     modules.sort_by(|a, b| a.0.cmp(&b.0));
     modules
         .into_iter()
+        .filter(|(name, ..)| !BUILTIN_COMPONENT_IDS.contains(&name.as_str()))
         .map(|(name, disabled, drain)| {
             let (mapped, reason) = attach_state(disabled, drain);
             Item::new(&name, Form::Attach, mapped).with(|i| i.reason = reason.map(str::to_owned))
@@ -336,6 +345,9 @@ fn open_design_item(state: &AppState, now: Instant) -> Item {
             i.state = r.state;
             i.version = r.version;
             i.reason = r.reason;
+            i.detail = r
+                .unexpected
+                .map(|(from, to)| json!({"unexpected_transition": {"from": from, "to": to}}));
         }),
         None => item.with(|i| i.reason = Some("not_reported".into())),
     }
@@ -401,13 +413,16 @@ pub struct Reported {
     state: ComponentState,
     version: Option<String>,
     reason: Option<String>,
+    /// Set when this report did not follow the last live one by a D5 edge. Host-only.
+    unexpected: Option<(ComponentState, ComponentState)>,
     at: Instant,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReportError {
     UnknownComponent,
-    BadTransition(ComponentState, ComponentState),
+    /// Not a state this form ever shows (cannot happen for the sidecar form today).
+    IllegalState(ComponentState),
 }
 
 /// What the desktop last said about the components it owns, in memory only. An entry older than
@@ -423,37 +438,58 @@ impl ComponentReports {
             .cloned()
     }
 
-    /// Record a report. With nothing live to compare to (first report, or the last one
-    /// expired) the state is taken as the baseline; against a live one it must be a D5
-    /// transition for the sidecar form, or the same state again (a heartbeat). Nothing is
-    /// stored on refusal.
-    fn report(&self, id: &str, body: ReportBody, now: Instant) -> Result<(), ReportError> {
+    /// Record a report. The daemon only aggregates (D5): whatever the desktop says is
+    /// stored and the TTL refreshed, or a restarted desktop would leave a stale state on
+    /// show. A state that does not follow the last live one by a D5 edge (or the same state
+    /// again) is still stored, logged, and marked in `detail.unexpected_transition`; with
+    /// nothing live to compare to, the report is a baseline. Returns the unexpected edge.
+    fn report(
+        &self,
+        id: &str,
+        body: ReportBody,
+        now: Instant,
+    ) -> Result<Option<(ComponentState, ComponentState)>, ReportError> {
         if !DESKTOP_OWNED.contains(&id) {
             return Err(ReportError::UnknownComponent);
+        }
+        if !Form::Sidecar.allows(body.state) {
+            return Err(ReportError::IllegalState(body.state));
         }
         let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let prev = map
             .get(id)
             .filter(|r| now.duration_since(r.at) < REPORT_TTL);
-        if let Some(prev) = prev
-            && prev.state != body.state
-            && !Form::Sidecar.can_transition(prev.state, body.state)
-        {
-            return Err(ReportError::BadTransition(prev.state, body.state));
-        }
-        let version = body
-            .version
-            .or_else(|| prev.and_then(|p| p.version.clone()));
+        let unexpected = prev
+            .filter(|p| p.state != body.state && !Form::Sidecar.can_transition(p.state, body.state))
+            .map(|p| (p.state, body.state));
+        // A version describes an installation; absent or mid-install has none to inherit.
+        let keeps_version = !matches!(
+            body.state,
+            ComponentState::Absent | ComponentState::Installing
+        );
+        let version = body.version.or_else(|| {
+            prev.and_then(|p| p.version.clone())
+                .filter(|_| keeps_version)
+        });
         map.insert(
             id.to_owned(),
             Reported {
                 state: body.state,
                 version,
                 reason: body.reason,
+                unexpected,
                 at: now,
             },
         );
-        Ok(())
+        if let Some((from, to)) = unexpected {
+            tracing::warn!(
+                component = id,
+                ?from,
+                ?to,
+                "desktop reported an unexpected transition"
+            );
+        }
+        Ok(unexpected)
     }
 }
 
@@ -464,6 +500,14 @@ pub async fn report(
     Path(id): Path<String>,
     req: Request<Body>,
 ) -> Response {
+    // The id first: an unknown component is 404 whatever the body looks like.
+    if !DESKTOP_OWNED.contains(&id.as_str()) {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "No component reported by the desktop has this id",
+        );
+    }
     let bytes = match read_body_or_response(req).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -486,16 +530,16 @@ pub async fn report(
         );
     }
     match state.component_reports.report(&id, body, Instant::now()) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(ReportError::UnknownComponent) => error_response(
             StatusCode::NOT_FOUND,
             "not_found",
             "No component reported by the desktop has this id",
         ),
-        Err(ReportError::BadTransition(from, to)) => error_response(
-            StatusCode::CONFLICT,
-            "invalid_transition",
-            &format!("{from:?} -> {to:?} is not a lifecycle transition").to_lowercase(),
+        Err(ReportError::IllegalState(state)) => error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &format!("{state:?} is not a state this component shows").to_lowercase(),
         ),
     }
 }

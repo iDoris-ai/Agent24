@@ -21,6 +21,10 @@ use std::time::Duration;
 pub const HTTP_GRACE: Duration = Duration::from_millis(1500);
 /// After a module's stop grace: time to confirm its group is gone.
 pub const CONFIRM: Duration = Duration::from_millis(200);
+/// How long an in-flight model call of a module or attached module gets to wind down once
+/// the shutdown's drain is over (ADR-038 D6's cancel grace). Independent of the stop grace:
+/// attached modules are never sent SIGTERM, so the 15s a package gets to flush is not theirs.
+pub const CALL_CANCEL_GRACE: Duration = Duration::from_secs(2);
 /// After the modules' deadline: time to put the summary on disk.
 pub const PERSIST: Duration = Duration::from_millis(200);
 /// After the later of the HTTP and persistence deadlines: the runtime's own
@@ -31,6 +35,15 @@ pub const WATCHDOG_MARGIN: Duration = Duration::from_millis(300);
 /// outgrow the margin the watchdog leaves it (review of #188, L-1).
 pub const RUNTIME_TEARDOWN: Duration = WATCHDOG_MARGIN;
 const _: () = assert!(RUNTIME_TEARDOWN.as_millis() <= WATCHDOG_MARGIN.as_millis());
+// The CLI's wait and the plist's ExitTimeOut are derived from `agent24_protocol::shutdown_bounds`;
+// the tail it assumes after the module budgets must cover what this file adds.
+const _: () = assert!(
+    CONFIRM.as_millis()
+        + PERSIST.as_millis()
+        + WATCHDOG_MARGIN.as_millis()
+        + RUNTIME_TEARDOWN.as_millis()
+        <= agent24_protocol::shutdown_bounds::TAIL_MS as u128
+);
 
 pub const DRAIN_ENV: &str = "A24_MODULE_DRAIN_MS";
 /// ADR-038 D5: the stop grace is a *component* property (default 15s).
@@ -38,10 +51,10 @@ pub const GRACE_ENV: &str = "A24_COMPONENT_STOP_GRACE_MS";
 /// The pre-ADR-038 name, honoured for one release with a deprecation warning.
 pub const GRACE_ENV_LEGACY: &str = "A24_MODULE_STOP_GRACE_MS";
 const DRAIN_DEFAULT_MS: u64 = 800;
-const DRAIN_MAX_MS: u64 = 10_000;
+const DRAIN_MAX_MS: u64 = agent24_protocol::shutdown_bounds::DRAIN_MAX_MS;
 const GRACE_DEFAULT_MS: u64 = 15_000;
 const GRACE_MIN_MS: u64 = 100;
-const GRACE_MAX_MS: u64 = 30_000;
+const GRACE_MAX_MS: u64 = agent24_protocol::shutdown_bounds::GRACE_MAX_MS;
 
 /// How long a shutdown gives each out-of-process module: to finish what it
 /// has (`drain`), then to exit on SIGTERM before SIGKILL (`stop_grace`).
@@ -122,9 +135,11 @@ impl Params {
         let modules = began + self.drain + self.stop_grace + CONFIRM;
         let persist = modules + PERSIST;
         let watchdog = http.max(persist) + WATCHDOG_MARGIN;
+        let calls = began + self.drain + CALL_CANCEL_GRACE.min(self.stop_grace);
         Deadlines {
             began,
             http,
+            calls,
             modules,
             persist,
             watchdog,
@@ -146,6 +161,9 @@ pub struct Deadlines {
     pub began: tokio::time::Instant,
     /// The HTTP drain ends.
     pub http: tokio::time::Instant,
+    /// In-flight model calls of modules and attached modules are cancelled, and the usage
+    /// recorder stops [`CONFIRM`] later. Not tied to the stop grace.
+    pub calls: tokio::time::Instant,
     /// Modules still stopping are left to the drop of their supervisors.
     pub modules: tokio::time::Instant,
     /// The summary is on disk, or not.

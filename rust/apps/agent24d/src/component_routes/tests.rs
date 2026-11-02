@@ -211,6 +211,19 @@ async fn only_the_host_reports_and_only_for_desktop_owned_components() {
         "refused reports store nothing"
     );
 
+    // 404 comes before the body is looked at
+    assert_eq!(
+        call(
+            &app,
+            Method::POST,
+            "/api/v1/components/nope/report",
+            Some(&host),
+            "not json"
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
     for id in ["idoris", "hyphae", "documents", "knowledge", "nope"] {
         let path = format!("/api/v1/components/{id}/report");
         assert_eq!(
@@ -241,11 +254,18 @@ async fn only_the_host_reports_and_only_for_desktop_owned_components() {
 }
 
 #[tokio::test]
-async fn reports_follow_d5_and_an_invalid_transition_stores_nothing() {
-    let (app, host, ..) = app().await;
+async fn any_legal_state_is_stored_and_an_unexpected_edge_is_marked() {
+    let (app, host, _, first_party) = app().await;
     let post = |body: &'static str| {
         let (app, host) = (app.clone(), host.clone());
         async move { call(&app, Method::POST, OD, Some(&host), body).await }
+    };
+    let get = || {
+        let (app, host) = (app.clone(), host.clone());
+        async move {
+            let (_, now) = call(&app, Method::GET, GET, Some(&host), "").await;
+            find(&now, "open-design").clone()
+        }
     };
     // First report is the baseline, whatever it is.
     assert_eq!(
@@ -254,44 +274,46 @@ async fn reports_follow_d5_and_an_invalid_transition_stores_nothing() {
             .0,
         StatusCode::NO_CONTENT
     );
-    // installed -> ready skips `starting`: refused, 409, nothing stored.
-    let (status, body) = post(r#"{"state":"ready"}"#).await;
-    assert_eq!(
-        (status, body["error"]["code"].as_str()),
-        (StatusCode::CONFLICT, Some("invalid_transition"))
-    );
-    let (_, now) = call(&app, Method::GET, GET, Some(&host), "").await;
-    assert_eq!(find(&now, "open-design")["state"], "installed");
-    // the table's path works, and the version survives a report that omits it
-    for state in [
-        "starting", "ready", "degraded", "ready", "stopping", "stopped",
-    ] {
-        assert_eq!(
-            post(match state {
-                "starting" => r#"{"state":"starting"}"#,
-                "ready" => r#"{"state":"ready"}"#,
-                "degraded" => r#"{"state":"degraded","reason":"probe"}"#,
-                "stopping" => r#"{"state":"stopping"}"#,
-                _ => r#"{"state":"stopped"}"#,
-            })
-            .await
-            .0,
-            StatusCode::NO_CONTENT,
-            "{state}"
-        );
-    }
-    let (_, now) = call(&app, Method::GET, GET, Some(&host), "").await;
-    let od = find(&now, "open-design");
+    assert!(get().await.get("detail").is_none());
+    // installed -> ready skips `starting`: accepted and shown (never a stale installed),
+    // marked for the host, and the version survives a report that omits it.
+    assert_eq!(post(r#"{"state":"ready"}"#).await.0, StatusCode::NO_CONTENT);
+    let od = get().await;
     assert_eq!(
         (od["state"].as_str(), od["version"].as_str()),
-        (Some("stopped"), Some("od1234567"))
+        (Some("ready"), Some("od1234567"))
     );
-    // a heartbeat (same state) is fine; stopped -> ready is not
+    assert_eq!(
+        od["detail"]["unexpected_transition"],
+        json!({"from": "installed", "to": "ready"})
+    );
+    // a legal edge clears the mark
+    assert_eq!(
+        post(r#"{"state":"degraded","reason":"probe"}"#).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(get().await.get("detail").is_none());
+    // paths missing from the table (stopped -> absent, ready -> stopped) are stored too
     assert_eq!(
         post(r#"{"state":"stopped"}"#).await.0,
         StatusCode::NO_CONTENT
     );
-    assert_eq!(post(r#"{"state":"ready"}"#).await.0, StatusCode::CONFLICT);
+    assert_eq!(
+        get().await["detail"]["unexpected_transition"]["to"],
+        "stopped"
+    );
+    assert_eq!(
+        post(r#"{"state":"absent"}"#).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let od = get().await;
+    assert_eq!(od["state"], "absent");
+    assert_eq!(od["version"], Value::Null, "absent carries no version");
+    // the mark is host-only
+    assert_eq!(post(r#"{"state":"ready"}"#).await.0, StatusCode::NO_CONTENT);
+    let (_, fp) = call(&app, Method::GET, GET, Some(&first_party), "").await;
+    assert!(!fp.to_string().contains("unexpected"), "{fp}");
+    // the redacted view never shows the mark
 }
 
 #[test]
@@ -315,32 +337,41 @@ fn a_report_expires_after_the_ttl_and_the_next_one_is_a_baseline() {
         reports.current("open-design", t0 + REPORT_TTL).is_none(),
         "gone at the TTL"
     );
-    // within the TTL installed -> ready is refused; after it there is nothing to compare to
-    assert_eq!(
-        reports.report(
-            "open-design",
-            body(ComponentState::Ready),
-            t0 + Duration::from_secs(30)
-        ),
-        Err(ReportError::BadTransition(
-            ComponentState::Installed,
-            ComponentState::Ready
-        ))
+    // within the TTL installed -> ready is stored but unexpected; after it, a baseline
+    let r30 = reports.report(
+        "open-design",
+        body(ComponentState::Ready),
+        t0 + Duration::from_secs(30),
     );
-    reports
-        .report("open-design", body(ComponentState::Ready), t0 + REPORT_TTL)
-        .unwrap();
+    assert_eq!(
+        r30,
+        Ok(Some((ComponentState::Installed, ComponentState::Ready)))
+    );
+    // that report renewed the TTL: it is live at t0+30+TTL-1 and expired at t0+30+TTL
+    let live = t0 + Duration::from_secs(30) + REPORT_TTL;
+    assert!(
+        reports
+            .current("open-design", live - Duration::from_secs(1))
+            .is_some()
+    );
+    assert!(reports.current("open-design", live).is_none());
+    assert_eq!(
+        reports.report("open-design", body(ComponentState::Stopped), live),
+        Ok(None),
+        "nothing live to compare to"
+    );
+    let t0 = live;
     // a heartbeat renews it
     reports
         .report(
             "open-design",
             body(ComponentState::Ready),
-            t0 + REPORT_TTL * 2 - Duration::from_secs(1),
+            t0 + REPORT_TTL - Duration::from_secs(1),
         )
         .unwrap();
     assert!(
         reports
-            .current("open-design", t0 + REPORT_TTL * 2 + Duration::from_secs(30))
+            .current("open-design", t0 + REPORT_TTL + Duration::from_secs(30))
             .is_some()
     );
     assert_eq!(
@@ -461,4 +492,25 @@ fn knowledge_is_ready_only_while_a_binding_is_active() {
     assert!(registry.any_active());
     registry.apply("host", "b", 2, Change::Deactivate).unwrap();
     assert!(!registry.any_active());
+}
+
+#[test]
+fn attached_entries_named_like_a_builtin_component_are_not_listed() {
+    let modules = [
+        "open-design",
+        "agentear",
+        "knowledge",
+        "hyphae",
+        "documents",
+        "idoris",
+    ]
+    .map(|n| (n.to_owned(), false, Some(DrainState::Running)))
+    .to_vec();
+    let items = attach_items_from(modules);
+    let ids: Vec<_> = items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["agentear"],
+        "a forged entry is dropped, a real one stays"
+    );
 }

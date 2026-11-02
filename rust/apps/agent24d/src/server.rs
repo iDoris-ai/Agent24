@@ -289,6 +289,19 @@ impl Shutdown {
         self.token.child_token()
     }
 
+    /// Resolves when in-flight model calls of modules and attached modules must be
+    /// cancelled: the drain plus the per-call cancel grace
+    /// ([`crate::lifecycle::CALL_CANCEL_GRACE`], ADR-038 D6), never the stop grace. Attached
+    /// modules get no SIGTERM, so a 15s stop grace must not keep their calls alive. Stored
+    /// instant, like [`Shutdown::modules_cut_off`].
+    pub fn calls_cut_off(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let shutdown = self.clone();
+        async move {
+            shutdown.token.cancelled().await;
+            tokio::time::sleep_until(shutdown.deadlines().calls).await;
+        }
+    }
+
     /// Resolves when a module still being stopped by `os disable` must be
     /// killed: the budget any module gets once the shutdown begins — its
     /// drain and its stop grace — so a disable's longer drain neither holds
@@ -2863,7 +2876,7 @@ pub async fn serve(
         let shutdown = shutdown.clone();
         async move {
             shutdown.token().cancelled().await;
-            tokio::time::sleep_until(shutdown.deadlines().modules).await;
+            tokio::time::sleep_until(shutdown.deadlines().calls + crate::lifecycle::CONFIRM).await;
         }
     };
     let (usage_recorder, usage_writer) =
@@ -2878,7 +2891,7 @@ pub async fn serve(
     let model_deps = crate::model_callback::ModelCallbackDeps {
         router: state.router.clone(),
         usage: usage_recorder.clone(),
-        cancel_root: crate::model_callback::spawn_cancel_root(shutdown.modules_cut_off()),
+        cancel_root: crate::model_callback::spawn_cancel_root(shutdown.calls_cut_off()),
         admission: crate::model_callback::ModelAdmission::new(
             crate::model_callback::MODEL_MAX_IN_FLIGHT_GLOBAL,
             crate::model_callback::MODEL_MAX_IN_FLIGHT_PER_MODULE,
@@ -3815,7 +3828,7 @@ pub(crate) mod tests {
     /// the module's `Generation` as part of stopping it — design
     /// §3.3's OWN "代次撤销" row, pre-existing `os-proto` machinery that
     /// independently cancels an in-flight model call within tens of
-    /// milliseconds of the SAME `spawn_cancel_root(shutdown.modules_cut_off())`
+    /// milliseconds of the SAME `spawn_cancel_root(shutdown.calls_cut_off())`
     /// cut-off. Measured with a real subprocess module (SIGTERM-ignoring, one
     /// proxied request kept in flight so its own drain doesn't finish early)
     /// and a real hung TCP provider: correct code closes the provider
@@ -3830,7 +3843,7 @@ pub(crate) mod tests {
     /// `shutdown.modules_cut_off()`, e.g. `shutdown.token().cancelled()` to
     /// fire at the START of shutdown instead of at cut-off) — turns it red.
     #[test]
-    fn the_model_callback_cancel_root_is_spawned_from_modules_cut_off() {
+    fn the_model_callback_cancel_root_is_spawned_from_calls_cut_off() {
         // Scoped to `serve()`'s OWN body — never to the whole file, which
         // would make this test tautological (the string above, in this
         // test's own source, would always make a whole-file `.contains`
@@ -3847,9 +3860,9 @@ pub(crate) mod tests {
             .expect("function must be brace-terminated");
         let body = &body[..end];
         assert!(
-            body.contains("spawn_cancel_root(shutdown.modules_cut_off())"),
+            body.contains("spawn_cancel_root(shutdown.calls_cut_off())"),
             "serve() must build ModelCallbackDeps.cancel_root as \
-             spawn_cancel_root(shutdown.modules_cut_off()) — design \
+             spawn_cancel_root(shutdown.calls_cut_off()) — design \
              docs/design/ME4-S2-model-callback.md §3.3"
         );
     }
@@ -4348,6 +4361,36 @@ pub(crate) mod tests {
         shutdown.modules_cut_off().await;
         let p = crate::lifecycle::Params::default();
         assert_eq!(began.elapsed(), p.drain + p.stop_grace);
+    }
+
+    /// In-flight model calls (and the usage recorder) are cut off at the drain plus the 2s
+    /// call-cancel grace, however long the stop grace is: attached modules get no SIGTERM,
+    /// so the 15s a package gets to flush must not keep their calls alive (ADR-038 D5/D6).
+    #[tokio::test(start_paused = true)]
+    async fn model_calls_are_cut_off_by_the_cancel_grace_not_the_stop_grace() {
+        let shutdown = Shutdown::new(CancellationToken::new());
+        let began = tokio::time::Instant::now();
+        let _ = shutdown.deadlines();
+        shutdown.token().cancel();
+        shutdown.calls_cut_off().await;
+        let p = crate::lifecycle::Params::default();
+        assert_eq!(
+            began.elapsed(),
+            p.drain + crate::lifecycle::CALL_CANCEL_GRACE
+        );
+        assert!(
+            began.elapsed() < p.drain + p.stop_grace,
+            "not the stop grace"
+        );
+        // a stop grace shorter than the cancel grace still ends it first
+        let short = crate::lifecycle::Params {
+            drain: Duration::from_millis(100),
+            stop_grace: Duration::from_millis(500),
+        };
+        assert_eq!(
+            short.deadlines(began).calls - began,
+            Duration::from_millis(600)
+        );
     }
 
     /// The shutdown waits for the stops `os disable` began, not only for the

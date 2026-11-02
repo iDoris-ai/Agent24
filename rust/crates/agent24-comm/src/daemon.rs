@@ -52,47 +52,6 @@ const LOG_TRUNCATE_CAP: u64 = 5 * 1024 * 1024;
 /// callers (`comm_routes.rs`) use this constant.
 pub const READY_AFTER_DEFAULT: Duration = Duration::from_secs(3);
 
-/// How long `kill_group_gracefully` waits after SIGTERM before SIGKILL, as a
-/// **fallback default only** — `agent24d` passes the already-validated
-/// `agent24d::lifecycle::Params::stop_grace` into [`Ctx::grace`] instead of
-/// calling this.
-///
-/// Kept only for callers outside `agent24d` (and as the orphan-reap grace
-/// before a [`Ctx`] exists at all): it used to be the ONE grace this whole
-/// crate read, via its own raw, unvalidated parse of
-/// `A24_MODULE_STOP_GRACE_MS` with a 5s default (now `A24_COMPONENT_STOP_GRACE_MS`, 15s, ADR-038 D5) — while `agent24d`'s own
-/// `lifecycle::Params` reads the exact same variable with a 500ms default
-/// and a 100ms..=5000ms clamp. Two different numbers under one variable name
-/// meant a running daemon's actual stop grace silently disagreed with the
-/// SHUT-1b deadline computed from the OTHER number (PR #626 review, High
-/// #2): `agent24d`'s shutdown could reach its watchdog before Hyphae had
-/// even been sent SIGKILL.
-#[must_use]
-pub fn stop_grace() -> Duration {
-    let (grace, legacy) = grace_from(|name| std::env::var(name).ok());
-    if legacy {
-        tracing::warn!("A24_MODULE_STOP_GRACE_MS is deprecated; use A24_COMPONENT_STOP_GRACE_MS");
-    }
-    grace
-}
-
-/// [`stop_grace`] over an injected environment: the grace, and whether it came from the
-/// deprecated name (used only when the new one is unset). An unparsable value is the default.
-fn grace_from(get: impl Fn(&str) -> Option<String>) -> (Duration, bool) {
-    let (raw, legacy) = match get("A24_COMPONENT_STOP_GRACE_MS") {
-        Some(raw) => (Some(raw), false),
-        None => {
-            let raw = get("A24_MODULE_STOP_GRACE_MS");
-            let legacy = raw.is_some();
-            (raw, legacy)
-        }
-    };
-    let grace = raw
-        .and_then(|s| s.parse().ok())
-        .map_or(Duration::from_secs(15), Duration::from_millis);
-    (grace, legacy)
-}
-
 // ---------------------------------------------------------------------
 // pid file + orphan liveness
 // ---------------------------------------------------------------------
@@ -1594,7 +1553,7 @@ async fn run_actor(
     let mut phase = Phase::Idle;
     // PR #626 review, High #2: the SAME already-validated grace every other
     // out-of-process module's stop uses, handed in by `agent24d` — never
-    // this crate's own unvalidated `stop_grace()` read of the raw env var.
+    // this crate's own raw read of the stop-grace env var (removed; `agent24d::lifecycle::Params` is the only reader).
     let grace = ctx.grace;
     // PR #626 review, Medium #3: set the moment a MANUAL `Cmd::Start` spawns
     // a child (fresh or while already `has_child`), cleared the moment that
@@ -2854,44 +2813,5 @@ mod tests {
             Some(format!("down-{i}"))
         };
         assert_eq!(probe.error, expected_error, "torn write: {probe:?}");
-    }
-}
-
-#[cfg(test)]
-mod grace_tests {
-    use super::*;
-
-    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        move |name| {
-            pairs
-                .iter()
-                .find(|(k, _)| *k == name)
-                .map(|(_, v)| (*v).to_owned())
-        }
-    }
-
-    #[test]
-    fn the_default_is_15s_the_new_name_wins_and_the_old_one_is_an_alias() {
-        assert_eq!(grace_from(env(&[])), (Duration::from_secs(15), false));
-        assert_eq!(
-            grace_from(env(&[("A24_COMPONENT_STOP_GRACE_MS", "2000")])),
-            (Duration::from_secs(2), false)
-        );
-        assert_eq!(
-            grace_from(env(&[("A24_MODULE_STOP_GRACE_MS", "3000")])),
-            (Duration::from_secs(3), true),
-            "the alias works, and says it is the alias"
-        );
-        assert_eq!(
-            grace_from(env(&[
-                ("A24_COMPONENT_STOP_GRACE_MS", "2000"),
-                ("A24_MODULE_STOP_GRACE_MS", "3000")
-            ])),
-            (Duration::from_secs(2), false)
-        );
-        assert_eq!(
-            grace_from(env(&[("A24_COMPONENT_STOP_GRACE_MS", "soon")])).0,
-            Duration::from_secs(15)
-        );
     }
 }

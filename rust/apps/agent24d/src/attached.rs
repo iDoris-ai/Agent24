@@ -78,6 +78,12 @@ fn parse_manifest(yaml: &str) -> Result<agent24_domain::DomainOsManifest, String
             manifest.name()
         ));
     }
+    if crate::component_routes::BUILTIN_COMPONENT_IDS.contains(&manifest.name()) {
+        return Err(format!(
+            "module name {:?} is the id of a built-in component",
+            manifest.name()
+        ));
+    }
     Ok(manifest)
 }
 
@@ -1088,6 +1094,34 @@ mod tests {
         let m = manifest("attached", None, &[]);
         let err = register(&path, &m, false, |_| false, |_| {}).unwrap_err();
         assert!(matches!(err, RegisterError::InvalidManifest(_)));
+    }
+
+    #[test]
+    fn a_builtin_component_id_cannot_be_attached() {
+        // The list is pinned here so adding a component to `/api/v1/components` is a
+        // deliberate edit of both.
+        assert_eq!(
+            crate::component_routes::BUILTIN_COMPONENT_IDS,
+            ["idoris", "hyphae", "documents", "knowledge", "open-design"]
+        );
+        for name in crate::component_routes::BUILTIN_COMPONENT_IDS {
+            let dir = tmp();
+            let path = dir.join("attached.json");
+            let err =
+                register(&path, &manifest(name, None, &[]), false, |_| false, |_| {}).unwrap_err();
+            assert!(matches!(err, RegisterError::InvalidManifest(_)), "{name}");
+            assert!(!path.exists(), "{name}");
+        }
+        let dir = tmp();
+        let path = dir.join("attached.json");
+        register(
+            &path,
+            &manifest("agentear", None, &[]),
+            false,
+            |_| false,
+            |_| {},
+        )
+        .unwrap();
     }
 
     #[test]

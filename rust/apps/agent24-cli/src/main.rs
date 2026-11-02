@@ -2828,11 +2828,12 @@ fn print_os(list: &agent24_protocol::DomainOsList) {
 /// release its singleton lock before giving up and saying so. `POST
 /// /shutdown` returns as soon as shutdown is REQUESTED — draining modules,
 /// persisting the shutdown summary and the runtime's own teardown all still
-/// run after that. `lifecycle.rs`'s real worst case is ~15.7s (10s drain +
-/// 5s stop grace + ~0.5s persistence/teardown margin, modules draining
-/// concurrently via a `JoinSet`, not sequentially); 30s leaves close to a
-/// full extra margin over that on top.
-const STOP_CONFIRM_BUDGET: Duration = Duration::from_secs(30);
+/// run after that. The budgets are tunable, so the bound is the worst case with
+/// every knob at its cap (10s drain + 30s stop grace, or a managed iDoris's 50s,
+/// plus ~1s of tail), plus a margin: `agent24_protocol::shutdown_bounds`, shared
+/// with the daemon's `lifecycle.rs` and the LaunchAgent's `ExitTimeOut`.
+const STOP_CONFIRM_BUDGET: Duration =
+    Duration::from_secs(agent24_protocol::shutdown_bounds::WAIT_SECS);
 
 /// Waits until the daemon that was just asked to stop has actually released
 /// its singleton lock — the SAME lock `agent24 daemon start` will contend

@@ -252,8 +252,10 @@ export interface paths {
          * @description ProductHost audience only; legacy mode, first-party and Creative tokens get 403. Accepted
          *     only for components whose state the desktop owns (today `open-design`); any other id is
          *     404. The first report, or the first after the previous one expired, is taken as the
-         *     baseline. Otherwise `state` must be the same state (a heartbeat) or a D5 transition
-         *     (409 `invalid_transition`, nothing stored). A report expires 90 seconds after it was
+         *     baseline. Otherwise whatever legal state is reported is stored and refreshes the report
+         *     (the daemon only aggregates); one that does not follow the last live report by a D5 edge
+         *     is logged and marked for the host as `detail.unexpected_transition` `{from, to}` on the
+         *     component. An unknown id is 404 before the body is read. A report expires 90 seconds after it was
          *     received, after which the component reads `absent` with reason `not_reported`; the
          *     desktop must re-send within that time.
          */
@@ -4598,15 +4600,6 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
-            /** @description invalid_transition: the reported state does not follow the last live report */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
         };
     };
     getDecideProfile: {

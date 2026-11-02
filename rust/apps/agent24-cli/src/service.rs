@@ -52,6 +52,11 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
+/// Seconds launchd waits after SIGTERM before it SIGKILLs the daemon. Its default is 20, which
+/// is less than the daemon's stop grace allows (ADR-038 D5: 15s by default, tunable up);
+/// derived from the same worst-case bound the daemon and `agent24 daemon stop` use.
+const EXIT_TIMEOUT: u64 = agent24_protocol::shutdown_bounds::WAIT_SECS;
+
 /// Render the LaunchAgent plist.
 ///
 /// `ThrottleInterval` is 10s: launchd's own minimum, and enough that a daemon
@@ -103,6 +108,8 @@ pub fn render_plist(
     </dict>
     <key>ThrottleInterval</key>
     <integer>10</integer>
+    <key>ExitTimeOut</key>
+    <integer>{EXIT_TIMEOUT}</integer>
     <key>ProcessType</key>
     <string>Background</string>
 {env_block}    <key>StandardOutPath</key>
@@ -374,6 +381,16 @@ mod tests {
         assert!(p.contains("<key>SuccessfulExit</key>\n        <false/>"));
         // crash loops back off
         assert!(p.contains("<key>ThrottleInterval</key>"));
+        // launchd's default ExitTimeOut (20s) would SIGKILL a daemon inside its own 15s
+        // stop grace plus drain; the plist carries the derived bound instead.
+        assert!(
+            p.contains(&format!(
+                "<key>ExitTimeOut</key>\n    <integer>{}</integer>",
+                agent24_protocol::shutdown_bounds::WAIT_SECS
+            )),
+            "{p}"
+        );
+        const { assert!(EXIT_TIMEOUT > 20) };
         // output survives for diagnosis
         assert!(p.contains("/logs/out.log"));
         assert!(p.contains("/logs/err.log"));
