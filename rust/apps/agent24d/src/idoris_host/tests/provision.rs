@@ -1397,6 +1397,10 @@ async fn legacy_fixture() -> (ConnectedFixture, PathBuf, Installation) {
     (x, managed, legacy)
 }
 async fn legacy_receipt(x: &ConnectedFixture) -> Installation {
+    legacy_receipt_with(x, false).await
+}
+/// `startable` keeps the key and components dir so the fixture instance can actually run.
+async fn legacy_receipt_with(x: &ConnectedFixture, startable: bool) -> Installation {
     let root = &x.f.host.root;
     let release = root.join("0.4.0");
     copy_release(&x.f.record.release_dir, &release);
@@ -1408,9 +1412,18 @@ async fn legacy_receipt(x: &ConnectedFixture) -> Installation {
     let mut record = x.f.record.clone();
     record.release_dir = release;
     record.archive_path = archive;
-    record.key_id = None;
-    record.components_dir = None;
+    if !startable {
+        record.key_id = None;
+        record.components_dir = None;
+    }
     record.desired_running = false;
+    if startable {
+        // The fixture instance reads its data key from the (test) keychain.
+        x.data.entries.lock().unwrap().insert(
+            record.key_id.clone().unwrap(),
+            Zeroizing::new(format!("idk_{}", "a".repeat(64))),
+        );
+    }
     x.f.host.record_installation(record.clone()).await.unwrap();
     record
 }
@@ -1663,4 +1676,67 @@ async fn an_online_install_stamps_the_receipt_once() {
     x.provision.signature.0.store(true, Ordering::SeqCst);
     run_install(&x, "online-2").await;
     assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_running_legacy_instance_is_not_deletable_until_it_has_left_the_old_release() {
+    let mut x = ConnectedFixture::new().await;
+    let legacy = legacy_receipt_with(&x, true).await;
+    let managed = x.f.host.root.join("managed");
+    Arc::get_mut(&mut x.f.host).unwrap().install_root = managed.clone();
+    let marker = x.f.host.root.join("legacy-install.deletable.json");
+    let pending = x.f.host.root.join("legacy-install.pending.json");
+
+    let start = x.f.host.submit(Action::Start, None).await.unwrap();
+    assert_eq!(x.f.complete(&start).await.result, Some(Outcome::Succeeded));
+    assert_eq!(
+        x.f.host.inner.lock().await.supervisor_release.as_ref(),
+        Some(&legacy.release_dir)
+    );
+
+    // Migrate while the old instance runs: the receipt moves, the process does not.
+    run_install(&x, "mig-running").await;
+    let record = x.f.host.inner.lock().await.installation.clone().unwrap();
+    assert_eq!(record.release_dir, managed.join("v0.4.0"));
+    assert!(!marker.exists(), "an in-use release must not be listed");
+    assert!(pending.exists(), "the paths wait in the queue");
+
+    // Stopped: nothing holds the old release any more, so it is published.
+    let stop = x.f.host.submit(Action::Stop, None).await.unwrap();
+    assert_eq!(x.f.complete(&stop).await.result, Some(Outcome::Succeeded));
+    assert_eq!(
+        deletable_paths(&x),
+        [legacy.release_dir.clone(), legacy.archive_path.clone()]
+    );
+    assert!(!pending.exists());
+
+    // Restarting runs from the new release.
+    let start = x.f.host.submit(Action::Start, None).await.unwrap();
+    assert_eq!(x.f.complete(&start).await.result, Some(Outcome::Succeeded));
+    assert_eq!(
+        x.f.host.inner.lock().await.supervisor_release,
+        Some(managed.join("v0.4.0"))
+    );
+    let stop = x.f.host.submit(Action::Stop, None).await.unwrap();
+    assert_eq!(x.f.complete(&stop).await.result, Some(Outcome::Succeeded));
+}
+
+#[tokio::test]
+async fn a_restart_onto_the_new_release_publishes_the_queued_legacy_paths() {
+    let mut x = ConnectedFixture::new().await;
+    let legacy = legacy_receipt_with(&x, true).await;
+    let managed = x.f.host.root.join("managed");
+    Arc::get_mut(&mut x.f.host).unwrap().install_root = managed.clone();
+    let start = x.f.host.submit(Action::Start, None).await.unwrap();
+    assert_eq!(x.f.complete(&start).await.result, Some(Outcome::Succeeded));
+    run_install(&x, "mig-running-2").await;
+    assert!(!x.f.host.root.join("legacy-install.deletable.json").exists());
+    // Replace the process by stopping and starting again from the new receipt.
+    for action in [Action::Stop, Action::Start] {
+        let op = x.f.host.submit(action, None).await.unwrap();
+        assert_eq!(x.f.complete(&op).await.result, Some(Outcome::Succeeded));
+    }
+    assert_eq!(deletable_paths(&x)[0], legacy.release_dir);
+    let stop = x.f.host.submit(Action::Stop, None).await.unwrap();
+    assert_eq!(x.f.complete(&stop).await.result, Some(Outcome::Succeeded));
 }

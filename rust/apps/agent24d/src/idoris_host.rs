@@ -518,6 +518,9 @@ struct Inner {
     generation: Option<String>,
     closing: bool,
     migration_error: Option<Code>,
+    /// Release directory the running supervisor was started from (it keeps using it, and
+    /// auto-restarts onto it, until stopped or restarted from a newer receipt).
+    supervisor_release: Option<PathBuf>,
 }
 pub struct IdorisHost {
     /// State: installation receipt, `data/`, `instances/`, operation journal.
@@ -651,6 +654,7 @@ impl IdorisHost {
                 generation: None,
                 closing: false,
                 migration_error: None,
+                supervisor_release: None,
             }),
         }))
     }
@@ -943,6 +947,7 @@ impl IdorisHost {
         {
             let mut i = self.inner.lock().await;
             i.supervisor = Some(supervisor);
+            i.supervisor_release = Some(record.release_dir.clone());
             i.generation = Some(id.to_owned());
         }
         self.monitor(
@@ -1220,6 +1225,8 @@ impl IdorisHost {
             },
             Err(_) => State::Failed,
         };
+        // After every operation: if a migrated-away release is no longer in use, publish it.
+        self.finalize_legacy_marks(&i);
         if let Some(op) = i.operations.get_mut(id) {
             op.phase = if matches!(action, Action::Install | Action::Connect) && result.is_ok() {
                 Phase::Done

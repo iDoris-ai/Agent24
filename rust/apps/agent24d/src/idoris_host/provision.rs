@@ -481,7 +481,7 @@ impl IdorisHost {
             Ok(()) if migrating => {
                 self.inner.lock().await.migration_error = None;
                 if let Some(old) = &old {
-                    self.mark_legacy_deletable(old);
+                    self.queue_legacy_deletable(old);
                 }
                 Ok(())
             }
@@ -508,23 +508,63 @@ impl IdorisHost {
                 .as_ref()
                 .is_none_or(|recorded| *recorded == self.install_root)
     }
-    /// Record the superseded legacy paths without deleting anything. The file is
-    /// advisory only: any future `agent24 idoris gc` MUST re-validate every path with
-    /// [`legacy_deletable`] (or stricter) and never trust this file's contents.
-    fn mark_legacy_deletable(&self, old: &Installation) {
-        let paths = legacy_deletable(&self.root, &[&old.release_dir, &old.archive_path]);
-        if paths.is_empty() {
+    /// Remember the superseded legacy paths. They are NOT yet deletable: the running
+    /// supervisor may still be executing from them (and auto-restarts onto them) until it
+    /// is stopped or restarted from the new receipt. `finalize_legacy_marks` publishes them
+    /// once nothing holds them.
+    fn queue_legacy_deletable(&self, old: &Installation) {
+        let _ = write_json(
+            &self.root.join("legacy-install.pending.json"),
+            &serde_json::json!({"schema": 1, "paths": [old.release_dir, old.archive_path]}),
+        );
+    }
+    /// Publish queued legacy paths as deletable, only when the receipt already points at the
+    /// managed root and no running instance holds them. The marker is advisory: any future
+    /// `agent24 idoris gc` MUST re-validate every path with [`legacy_deletable`] (or
+    /// stricter), MUST exclude any path held by a running instance, and never trust this file.
+    pub(super) fn finalize_legacy_marks(&self, inner: &Inner) {
+        let pending_path = self.root.join("legacy-install.pending.json");
+        let Ok(body) = std::fs::read(&pending_path) else {
+            return;
+        };
+        let Ok(pending) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            return;
+        };
+        let Ok(queued) = serde_json::from_value::<Vec<PathBuf>>(pending["paths"].clone()) else {
+            return;
+        };
+        if !inner
+            .installation
+            .as_ref()
+            .is_some_and(|r| self.in_managed_root(r))
+        {
             return;
         }
-        let _ = write_json(
-            &self.root.join("legacy-install.deletable.json"),
-            &serde_json::json!({
-                "schema": 1,
-                "advisory": "re-validate every path before deleting; see legacy_deletable()",
-                "superseded_by": self.install_root,
-                "paths": paths,
-            }),
-        );
+        let held = inner.supervisor.is_some()
+            && inner
+                .supervisor_release
+                .as_ref()
+                .is_some_and(|dir| queued.contains(dir));
+        if held {
+            return;
+        }
+        let candidates: Vec<&Path> = queued.iter().map(PathBuf::as_path).collect();
+        let paths = legacy_deletable(&self.root, &candidates);
+        if !paths.is_empty()
+            && write_json(
+                &self.root.join("legacy-install.deletable.json"),
+                &serde_json::json!({
+                    "schema": 1,
+                    "advisory": "re-validate every path before deleting and exclude any path held by a running instance; see legacy_deletable()",
+                    "superseded_by": self.install_root,
+                    "paths": paths,
+                }),
+            )
+            .is_err()
+        {
+            return;
+        }
+        let _ = std::fs::remove_file(pending_path);
     }
     async fn download_and_install(
         &self,
@@ -856,6 +896,7 @@ impl IdorisHost {
             self.router.replace_idoris(gateway);
             i.installation = Some(pending.candidate.clone());
             i.supervisor = new_supervisor.take();
+            i.supervisor_release = Some(pending.candidate.release_dir.clone());
             i.generation = Some(id.to_owned());
             drop(i);
             self.monitor(
