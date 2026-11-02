@@ -251,6 +251,7 @@ CLI 绑定额外规定（和 `agent24-comm/src/runner.rs` 现有约定一致）�
   - CLI 绑定先发 SIGTERM，**2 秒**后发 SIGKILL（这是单次调用的取消宽限，不是 D5 的停组件宽限）；
   - JSON-RPC 绑定发 `$/cancelRequest`（`os-proto/module.rs` 现有名字）。
 - 超时后结果算「未知」，处理方式沿用 ADR-K1-01 §2.5：会改变状态的调用不自动重试。
+- **关停时的模型调用**：daemon 关停后，模块和 attach 模块在途的模型调用在 `drain + 2 秒`（本条的取消宽限，`lifecycle::CALL_CANCEL_GRACE`）被取消，早于 D5 的 15 秒停组件宽限。所以进程外包在停止宽限期内**不能**再发起模型调用，这是有意的：宽限期只用来落盘，不用来继续推理；attach 模块不会收到 SIGTERM，更不该被 15 秒拖住。
 
 ### D7 授权
 
