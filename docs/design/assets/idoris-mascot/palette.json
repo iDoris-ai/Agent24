@@ -1,0 +1,338 @@
+{
+  "source": "apps/desktop/src/renderer/assets/logo-welcome.png",
+  "grid": {
+    "width": 48,
+    "height": 66
+  },
+  "character": {
+    "width": 44,
+    "height": 64,
+    "x": 2,
+    "y": 1
+  },
+  "sampling": "每个格子取不透明像素的众数，再归入原图里真实出现过的颜色",
+  "outline": {
+    "hex": "#FFFFFF",
+    "opacity": 0.7,
+    "note": "深色轮廓外侧 1px 半透明白，浅底上几乎看不见，深底上把黑发和羽绒服分开"
+  },
+  "colors": [
+    {
+      "id": "black",
+      "hex": "#000000",
+      "role": "瞳孔、眉毛、最深的缝",
+      "cells": 302
+    },
+    {
+      "id": "ink",
+      "hex": "#252525",
+      "role": "头发和羽绒服（原图里出现最多的深色）",
+      "cells": 1241
+    },
+    {
+      "id": "silver",
+      "hex": "#A0A0A0",
+      "role": "袖标金属边、帽檐灰",
+      "cells": 60
+    },
+    {
+      "id": "white",
+      "hex": "#FEFEFE",
+      "role": "兜帽、内衬、眼白、胸口标签",
+      "cells": 191
+    },
+    {
+      "id": "skin",
+      "hex": "#F9D7B9",
+      "role": "皮肤亮部",
+      "cells": 149
+    },
+    {
+      "id": "skin_deep",
+      "hex": "#F3C59E",
+      "role": "皮肤暗部",
+      "cells": 5
+    },
+    {
+      "id": "blush",
+      "hex": "#E79B75",
+      "role": "腮红和嘴",
+      "cells": 9
+    },
+    {
+      "id": "orange",
+      "hex": "#F77315",
+      "role": "拉链、发绳、袖口、漂浮像素、状态标记",
+      "cells": 20
+    }
+  ],
+  "overlays": {
+    "idle": [],
+    "thinking": [
+      {
+        "x": 16,
+        "y": 0,
+        "color": "orange"
+      },
+      {
+        "x": 20,
+        "y": 0,
+        "color": "orange"
+      },
+      {
+        "x": 24,
+        "y": 0,
+        "color": "orange"
+      },
+      {
+        "x": 13,
+        "y": 25,
+        "color": "black"
+      },
+      {
+        "x": 14,
+        "y": 25,
+        "color": "black"
+      },
+      {
+        "x": 15,
+        "y": 25,
+        "color": "black"
+      },
+      {
+        "x": 13,
+        "y": 26,
+        "color": "skin"
+      },
+      {
+        "x": 14,
+        "y": 26,
+        "color": "skin"
+      },
+      {
+        "x": 15,
+        "y": 26,
+        "color": "skin"
+      },
+      {
+        "x": 13,
+        "y": 27,
+        "color": "skin"
+      },
+      {
+        "x": 22,
+        "y": 25,
+        "color": "black"
+      },
+      {
+        "x": 23,
+        "y": 25,
+        "color": "black"
+      },
+      {
+        "x": 24,
+        "y": 25,
+        "color": "black"
+      },
+      {
+        "x": 25,
+        "y": 25,
+        "color": "black"
+      },
+      {
+        "x": 26,
+        "y": 25,
+        "color": "black"
+      },
+      {
+        "x": 22,
+        "y": 26,
+        "color": "skin"
+      }
+    ],
+    "success": [
+      {
+        "x": 13,
+        "y": 25,
+        "color": "black"
+      },
+      {
+        "x": 14,
+        "y": 25,
+        "color": "skin"
+      },
+      {
+        "x": 15,
+        "y": 25,
+        "color": "black"
+      },
+      {
+        "x": 13,
+        "y": 26,
+        "color": "skin"
+      },
+      {
+        "x": 14,
+        "y": 26,
+        "color": "black"
+      },
+      {
+        "x": 15,
+        "y": 26,
+        "color": "skin"
+      },
+      {
+        "x": 13,
+        "y": 27,
+        "color": "skin"
+      },
+      {
+        "x": 22,
+        "y": 24,
+        "color": "black"
+      },
+      {
+        "x": 26,
+        "y": 24,
+        "color": "black"
+      },
+      {
+        "x": 22,
+        "y": 25,
+        "color": "skin"
+      },
+      {
+        "x": 23,
+        "y": 25,
+        "color": "skin"
+      },
+      {
+        "x": 24,
+        "y": 25,
+        "color": "black"
+      },
+      {
+        "x": 25,
+        "y": 25,
+        "color": "skin"
+      },
+      {
+        "x": 26,
+        "y": 25,
+        "color": "skin"
+      },
+      {
+        "x": 22,
+        "y": 26,
+        "color": "skin"
+      },
+      {
+        "x": 1,
+        "y": 0,
+        "color": "orange"
+      },
+      {
+        "x": 0,
+        "y": 1,
+        "color": "orange"
+      },
+      {
+        "x": 1,
+        "y": 1,
+        "color": "orange"
+      },
+      {
+        "x": 2,
+        "y": 1,
+        "color": "orange"
+      },
+      {
+        "x": 1,
+        "y": 2,
+        "color": "orange"
+      }
+    ],
+    "error": [
+      {
+        "x": 15,
+        "y": 23,
+        "color": "black"
+      },
+      {
+        "x": 16,
+        "y": 23,
+        "color": "black"
+      },
+      {
+        "x": 17,
+        "y": 24,
+        "color": "black"
+      },
+      {
+        "x": 25,
+        "y": 23,
+        "color": "black"
+      },
+      {
+        "x": 26,
+        "y": 23,
+        "color": "black"
+      },
+      {
+        "x": 21,
+        "y": 25,
+        "color": "black"
+      },
+      {
+        "x": 23,
+        "y": 35,
+        "color": "skin"
+      },
+      {
+        "x": 24,
+        "y": 35,
+        "color": "skin"
+      },
+      {
+        "x": 22,
+        "y": 34,
+        "color": "ink"
+      },
+      {
+        "x": 23,
+        "y": 34,
+        "color": "ink"
+      },
+      {
+        "x": 24,
+        "y": 34,
+        "color": "ink"
+      },
+      {
+        "x": 25,
+        "y": 34,
+        "color": "ink"
+      },
+      {
+        "x": 26,
+        "y": 34,
+        "color": "ink"
+      },
+      {
+        "x": 0,
+        "y": 24,
+        "color": "orange"
+      },
+      {
+        "x": 0,
+        "y": 25,
+        "color": "orange"
+      },
+      {
+        "x": 0,
+        "y": 27,
+        "color": "orange"
+      }
+    ]
+  }
+}
