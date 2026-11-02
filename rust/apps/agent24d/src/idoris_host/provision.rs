@@ -136,7 +136,7 @@ impl Provisioner for SystemProvisioner {
     async fn verify(&self, r: &Installation) -> Result<InstalledVersion, Code> {
         let r = r.clone();
         tokio::task::spawn_blocking(move || {
-            InstalledVersion::verify_existing(
+            agent24_idoris::install::verify_existing(
                 &r.release_dir,
                 IdorisLock::embedded(),
                 &VerifiedArchive {

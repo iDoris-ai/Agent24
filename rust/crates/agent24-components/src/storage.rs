@@ -1,4 +1,6 @@
 //! File-descriptor checks shared by the download and installation boundaries.
+//! Managed layout (ADR-038 D1): `<data>/components/<id>/<version>/`, with the
+//! per-component root (`components/<id>`) owning the operation lock and cache.
 
 use rustix::fs::{Mode, OFlags, open};
 use std::{
@@ -7,7 +9,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
+pub fn open_regular(path: &Path) -> io::Result<File> {
     // NONBLOCK also prevents a substituted FIFO from blocking before fstat.
     let file = File::from(open(
         path,
@@ -37,7 +39,7 @@ fn owned(metadata: &fs::Metadata) -> bool {
     }
 }
 
-pub(crate) fn private_directory(path: &Path) -> io::Result<()> {
+pub fn private_directory(path: &Path) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -70,6 +72,10 @@ pub(crate) fn private_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Validate and create a cache path inside a managed component root, i.e. below
+/// `<...>/components/<id>/`. Returns the canonical component root, which owns
+/// the operation lock. Every directory from the component root down is opened
+/// without following links and must be owned by us with mode 0700.
 pub(crate) fn prepare_cache(path: &Path) -> io::Result<PathBuf> {
     if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(io::Error::new(
@@ -79,15 +85,18 @@ pub(crate) fn prepare_cache(path: &Path) -> io::Result<PathBuf> {
     }
     let root = path
         .ancestors()
-        .find(|p| p.file_name().is_some_and(|n| n == "idoris"))
+        .find(|p| {
+            p.parent()
+                .and_then(Path::file_name)
+                .is_some_and(|n| n == "components")
+        })
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "cache must be inside the idoris tree",
+                "cache must be inside a components/<id> tree",
             )
         })?;
     // Only the external parent may contain platform aliases such as /var.
-    // Every directory inside the managed tree is opened without following links.
     if let Some(parent) = root.parent() {
         fs::create_dir_all(parent)?;
     }

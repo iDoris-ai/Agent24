@@ -34,7 +34,11 @@ struct FixtureRuntime {
 }
 struct AcceptSignature;
 impl SignatureVerifier for AcceptSignature {
-    fn verify(&self, _: &Path, _: &str) -> Result<(), InstallError> {
+    fn verify(
+        &self,
+        _: &Path,
+        _: &agent24_idoris::install::SigningRequirement,
+    ) -> Result<(), InstallError> {
         Ok(())
     }
 }
@@ -49,7 +53,7 @@ impl Runtime for FixtureRuntime {
         while self.gate.load(Ordering::SeqCst) {
             tokio::select! { _ = cancel.cancelled() => return Err(Code::Cancelled), _ = tokio::time::sleep(Duration::from_millis(5)) => {} }
         }
-        let installed = InstalledVersion::verify_existing(
+        let installed = agent24_idoris::install::verify_existing(
             &r.release_dir,
             &self.lock,
             &VerifiedArchive {

@@ -73,7 +73,7 @@ impl Provisioner for Provision {
     }
     async fn verify(&self, r: &Installation) -> Result<InstalledVersion, Code> {
         self.verifications.fetch_add(1, Ordering::SeqCst);
-        InstalledVersion::verify_existing(
+        agent24_idoris::install::verify_existing(
             &r.release_dir,
             &self.lock,
             &VerifiedArchive {

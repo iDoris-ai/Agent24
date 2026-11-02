@@ -394,7 +394,7 @@ impl Runtime for SystemRuntime {
         let dir = r.release_dir.clone();
         let archive = r.archive_path.clone();
         let installed = tokio::task::spawn_blocking(move || {
-            InstalledVersion::verify_existing(
+            agent24_idoris::install::verify_existing(
                 &dir,
                 IdorisLock::embedded(),
                 &VerifiedArchive {

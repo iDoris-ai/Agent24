@@ -36,7 +36,9 @@ pub async fn install(
         &asset.url,
         &asset.expected.to_hex(),
         &asset.name,
-        &state_dir.join("idoris/component-cache/hyphae"),
+        // A sibling of `components/hyphae`: that directory is created 0755 by the
+        // binary installer, while a download root must be an owned 0700 directory.
+        &state_dir.join("components/hyphae-cache"),
         &DownloadOptions::default(),
         cancel,
     )

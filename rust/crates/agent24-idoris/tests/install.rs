@@ -5,7 +5,8 @@ use agent24_idoris::{
     IdorisLock,
     download::VerifiedArchive,
     install::{
-        InstallError, InstallOptions, SignatureVerifier, install_locked_asset as install_async,
+        InstallError, InstallOptions, SignatureVerifier, SigningRequirement,
+        install_locked_asset as install_async,
     },
 };
 use flate2::{Compression, write::GzEncoder};
@@ -41,8 +42,8 @@ fn install_locked_asset(
 const TRIPLE: &str = "aarch64-apple-darwin";
 struct Signature(bool);
 impl SignatureVerifier for Signature {
-    fn verify(&self, _: &Path, team: &str) -> Result<(), InstallError> {
-        assert_eq!(team, "HYAP444FN9");
+    fn verify(&self, _: &Path, required: &SigningRequirement) -> Result<(), InstallError> {
+        assert_eq!(required.team_id, "HYAP444FN9");
         if self.0 {
             Ok(())
         } else {
@@ -336,7 +337,15 @@ async fn real_v0_4_0_download_install_and_l6() {
     )
     .await
     .unwrap();
-    Codesign.verify(&installed.binary(), &lock.team_id).unwrap();
+    Codesign
+        .verify(
+            &installed.binary(),
+            &SigningRequirement {
+                team_id: &lock.team_id,
+                notarized: false,
+            },
+        )
+        .unwrap();
     let again = install_async(
         lock,
         TRIPLE,
@@ -482,7 +491,7 @@ fn unsupported_platform_fails_before_creating_install_root() {
         fn check_platform(&self) -> Result<(), InstallError> {
             Err(InstallError::UnsupportedPlatform)
         }
-        fn verify(&self, _: &Path, _: &str) -> Result<(), InstallError> {
+        fn verify(&self, _: &Path, _: &SigningRequirement) -> Result<(), InstallError> {
             panic!("must not run");
         }
     }
@@ -502,7 +511,7 @@ fn concurrent_second_installer_gets_busy() {
         release: mpsc::Receiver<()>,
     }
     impl SignatureVerifier for BlockingSignature {
-        fn verify(&self, _: &Path, _: &str) -> Result<(), InstallError> {
+        fn verify(&self, _: &Path, _: &SigningRequirement) -> Result<(), InstallError> {
             self.ready.send(()).unwrap();
             self.release.recv_timeout(Duration::from_secs(10)).unwrap();
             Ok(())
