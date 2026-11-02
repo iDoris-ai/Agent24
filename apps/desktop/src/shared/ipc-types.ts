@@ -24,6 +24,9 @@ export const IpcChannels = {
   // Private-key backup: native confirm + native save dialog in main; the
   // backend writes the file itself, so the key never crosses IPC.
   CommIdentityExport: 'comm:identity-export',
+  // Show the file from the last successful export in the file manager.
+  // The renderer may pass only that exact path; main ignores every other one.
+  CommRevealExport: 'comm:reveal-export',
   // Elevated comm writes that used to ride the generic proxy. Strictly
   // validated in main; presence binding is pending CORE-7c/CORE-2d.
   CommContactAdd: 'comm:contact-add',
