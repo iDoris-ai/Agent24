@@ -3,8 +3,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   CommApiError,
   addCommContact,
+  COMM_HTTP_TIMEOUT_MS,
   exportCommIdentity,
   listCommHistory,
+  revealCommExport,
   pickCommBackup,
   restoreCommIdentity,
   sendCommMessage,
@@ -216,6 +218,41 @@ describe('COMM contact, send, history and export wrappers', () => {
     expect(commIdentityExport).toHaveBeenCalledTimes(2)
     expect(commIdentityExport.mock.calls.every((c) => c.length === 1 && c[0] === 'alice')).toBe(true)
     expect(proxy).not.toHaveBeenCalled()
+  })
+
+  it('does not race a human-interactive IPC: an export that takes 10 minutes still resolves', async () => {
+    vi.useFakeTimers()
+    try {
+      let finish: (value: unknown) => void = () => {}
+      const commIdentityExport = vi.fn(() => new Promise((resolve) => { finish = resolve }))
+      window.agent24 = { ...window.agent24, commIdentityExport } as never
+      const pending = exportCommIdentity('alice').then((value) => value, (error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(10 * 60_000)
+      finish(successful({ nickname: 'alice', npub: 'npub1alice', path: '/safe/a.ncryptsec', format: 'ncryptsec' }))
+      await expect(pending).resolves.toMatchObject({ path: '/safe/a.ncryptsec' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('still bounds a plain HTTP read that never answers', async () => {
+    vi.useFakeTimers()
+    try {
+      const backendProxy = vi.fn(() => new Promise(() => {}))
+      window.agent24 = { ...window.agent24, backendProxy } as never
+      const pending = listCommContacts().then(() => 'ok' as const, (error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(COMM_HTTP_TIMEOUT_MS)
+      await expect(pending).resolves.toMatchObject({ code: 'timeout' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('asks main to reveal exactly the path the page was given', async () => {
+    const commRevealExport = vi.fn(async () => successful({ path: '/Users/x/Downloads/alice.ncryptsec' }))
+    window.agent24 = { ...window.agent24, commRevealExport } as never
+    await revealCommExport('/Users/x/Downloads/alice.ncryptsec')
+    expect(commRevealExport).toHaveBeenCalledWith('/Users/x/Downloads/alice.ncryptsec')
   })
 })
 

@@ -12,6 +12,7 @@ import {
   listCommIdentities,
   pickCommBackup,
   restoreCommIdentity,
+  revealCommExport,
   sendCommMessage,
   listCommRelays,
   startCommDaemon,
@@ -111,6 +112,7 @@ export default function CommunicationPage() {
   const [remember, setRemember] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [exportedPath, setExportedPath] = useState<string | null>(null)
   const [warnings, setWarnings] = useState<string[]>([])
   const [nickname, setNickname] = useState('')
   const [importOpen, setImportOpen] = useState(false)
@@ -208,6 +210,7 @@ export default function CommunicationPage() {
     setPending(action)
     setActionError(null)
     setNotice(null)
+    setExportedPath(null)
     if (action === 'unlock') setUnlockError(null)
     try {
       if (action === 'install') {
@@ -288,6 +291,7 @@ export default function CommunicationPage() {
     if (code === 'permission_denied') return t('export.permissionDenied')
     if (code === 'filesystem_unsupported') return t('export.filesystemUnsupported')
     if (code === 'keystore_locked') return t('restore.keystoreLocked')
+    if (code === 'export_in_progress' || (code === 'conflict' && messageOf(error).startsWith('export_in_progress'))) return t('error.exportInProgress')
     return messageOf(error)
   }
 
@@ -296,6 +300,7 @@ export default function CommunicationPage() {
     setPending('restore')
     setActionError(null)
     setNotice(null)
+    setExportedPath(null)
     try {
       const picked = await pickCommBackup()
       if (picked && mounted.current) {
@@ -318,6 +323,7 @@ export default function CommunicationPage() {
     setPending('restore')
     setActionError(null)
     setNotice(null)
+    setExportedPath(null)
     try {
       // The backup password is asked for by the main process, not by this page.
       const result = await restoreCommIdentity(restore.ticket, restoreNickname.trim(), restoreDefault)
@@ -352,11 +358,13 @@ export default function CommunicationPage() {
     setPending('export')
     setActionError(null)
     setNotice(null)
+    setExportedPath(null)
     setWarnings([])
     try {
       // The backup password is asked for by the main process, not by this page.
       const result = await exportCommIdentity(name)
       if (mounted.current) {
+        setExportedPath(result.path)
         setNotice(t('export.done', { path: result.path }))
         // The backup is saved either way; these say what could not be confirmed.
         setWarnings(result.warnings.map((w) => (w.code === 'cleanup_failed'
@@ -372,6 +380,14 @@ export default function CommunicationPage() {
     }
   }
 
+  const revealExported = async (filePath: string) => {
+    try {
+      await revealCommExport(filePath)
+    } catch (error) {
+      if (mounted.current) setActionError(errorText(error))
+    }
+  }
+
   const submitContact = async () => {
     if (pending) return
     const npubValue = contactNpub.trim()
@@ -380,6 +396,7 @@ export default function CommunicationPage() {
     setPending('contact')
     setActionError(null)
     setNotice(null)
+    setExportedPath(null)
     try {
       await addCommContact(contactName.trim(), npubValue, contactRole.trim())
       if (mounted.current) {
@@ -405,6 +422,7 @@ export default function CommunicationPage() {
     setPending('send')
     setActionError(null)
     setNotice(null)
+    setExportedPath(null)
     try {
       const result = await sendCommMessage(to, messageText)
       if (mounted.current) {
@@ -418,6 +436,24 @@ export default function CommunicationPage() {
     }
   }
 
+  // `gave_up` has no child but Stop still means something there: it moves the
+  // supervisor to `stopped` and switches autostart off, ending the retry
+  // cycle. `locked` has nothing to stop; Unlock is the way forward.
+  const serviceStoppable = daemon?.process.state === 'running'
+    || daemon?.process.state === 'starting'
+    || daemon?.process.state === 'backoff'
+    || daemon?.process.state === 'gave_up'
+  const stopTitle = serviceStoppable ? undefined
+    : daemon === null ? t('action.stopUnavailable')
+    : daemon.process.state === 'locked' ? t('action.stopLocked')
+    : t('action.stopIdle')
+  const revealLabel = (() => {
+    const hint = typeof navigator === 'undefined' ? '' : (navigator.platform || navigator.userAgent)
+    if (/mac|darwin|iphone|ipad/i.test(hint)) return t('export.revealMac')
+    if (/\bwin/i.test(hint)) return t('export.revealWin')
+    if (/linux|x11|bsd/i.test(hint)) return t('export.revealLinux')
+    return t('export.reveal')
+  })()
   const needsUnlock = daemon !== null && (daemon.process.state === 'locked'
     || daemon.process.reason === 'password_rejected' || daemon.process.reason === 'keychain_unavailable')
   const showUnlock = needsUnlock || unlockFailed
@@ -443,15 +479,18 @@ export default function CommunicationPage() {
       {loadError && <div role="alert" className="comm-alert">{loadError}</div>}
       {actionError && <div role="alert" className="comm-alert">{t('error.action', { message: actionError })}</div>}
       {pending === 'install' && <p role="status">{t('action.installing')}</p>}
-      {notice && <div role="status" className="comm-notice">{notice}</div>}
+      {notice && <div role="status" className="comm-notice">
+        <span>{notice}</span>
+        {exportedPath && <button type="button" onClick={() => void revealExported(exportedPath)}>{revealLabel}</button>}
+      </div>}
       {warnings.map((warning) => <div key={warning} role="status" className="comm-warning">{warning}</div>)}
 
       {setupState && <section className="comm-card" data-testid="comm-setup" data-state={setupState} aria-label={t('wizard.title')}>
         <h2>{t('wizard.title')}</h2>
         <ol className="comm-steps">
-          <li aria-current={setupState === 'not_installed' || setupState === 'installing' ? 'step' : undefined}>{t('wizard.download')}{setupState !== 'not_installed' && setupState !== 'installing' ? ' ✓' : ''}</li>
-          <li aria-current={setupState === 'no_identity' ? 'step' : undefined}>{t('wizard.identity')}{setupState === 'no_relay' || setupState === 'ready' ? ' ✓' : ''}</li>
-          <li aria-current={setupState === 'no_relay' ? 'step' : undefined}>{t('wizard.relay')}{setupState === 'ready' && !handshakeFailed ? ' ✓' : ''}</li>
+          <li aria-current={setupState === 'not_installed' || setupState === 'installing' ? 'step' : undefined}>{t('wizard.download')}{setupState !== 'not_installed' && setupState !== 'installing' ? <span className="comm-step-mark"> ✓</span> : null}</li>
+          <li aria-current={setupState === 'no_identity' ? 'step' : undefined}>{t('wizard.identity')}{setupState === 'no_relay' || setupState === 'ready' ? <span className="comm-step-mark"> ✓</span> : null}</li>
+          <li aria-current={setupState === 'no_relay' ? 'step' : undefined}>{t('wizard.relay')}{setupState === 'ready' && !handshakeFailed ? <span className="comm-step-mark"> ✓</span> : null}</li>
         </ol>
         {setupState === 'no_identity' && <>
           <form className="comm-setup-form" onSubmit={(event) => { event.preventDefault(); void runAction('create') }}>
@@ -579,7 +618,7 @@ export default function CommunicationPage() {
         <DaemonStatusView status={daemon} fresh={isFresh} />
         <div className="comm-actions">
           <button type="button" onClick={() => void runAction('start')} disabled={pending !== null}>{t('action.start')}</button>
-          <button type="button" onClick={() => void runAction('stop')} disabled={pending !== null}>{t('action.stop')}</button>
+          <button type="button" onClick={() => void runAction('stop')} disabled={pending !== null || !serviceStoppable} title={stopTitle}>{t('action.stop')}</button>
         </div>
         {showUnlock && <form className="comm-unlock" aria-label={t('unlock.title')} onSubmit={(event) => { event.preventDefault(); void runAction('unlock') }}>
           <p className="comm-muted comm-unlock-explain">{t('unlock.explain')}</p>
