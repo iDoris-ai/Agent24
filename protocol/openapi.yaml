@@ -4556,7 +4556,7 @@ components:
     IdorisStatus:
       type: object
       additionalProperties: false
-      required: [state, version, data_port, admin_port, roles, last_error, current_operation, verification, budget_suggestion, budget_unavailable_reason]
+      required: [state, version, data_port, admin_port, roles, last_error, current_operation, verification, budget_suggestion, budget_unavailable_reason, migration_pending, last_migration_error]
       properties:
         state:
           type: string
@@ -4583,6 +4583,13 @@ components:
         budget_unavailable_reason:
           type: [string, "null"]
           enum: [hardware_memory_unavailable, hardware_probe_failed, host_unavailable, null]
+        migration_pending:
+          type: boolean
+          description: The installed release is outside the ADR-038 managed root; the next Install re-downloads it there. The current install keeps working meanwhile.
+        last_migration_error:
+          anyOf:
+            - $ref: "#/components/schemas/IdorisErrorCode"
+            - type: "null"
     IdorisOperation:
       type: object
       additionalProperties: false

@@ -762,16 +762,12 @@ mod hy1_regression_tests {
             ))),
             installation: AsyncMutex::new(()),
         });
-        let cache = dir.join("idoris/component-cache/hyphae");
+        let cache = dir.join("components/hyphae-cache");
         tokio::fs::create_dir_all(&cache).await.unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            for path in [
-                dir.join("idoris"),
-                dir.join("idoris/component-cache"),
-                cache.clone(),
-            ] {
+            for path in [cache.clone()] {
                 tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
                     .await
                     .unwrap();
@@ -902,7 +898,7 @@ mod hy1_regression_tests {
             "https://untrusted.invalid/release".into();
         tokio::fs::remove_file(
             dir.path()
-                .join("idoris/component-cache/hyphae/fixture-hyphae.verified"),
+                .join("components/hyphae-cache/fixture-hyphae.verified"),
         )
         .await
         .unwrap();

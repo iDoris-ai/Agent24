@@ -57,6 +57,22 @@ struct Provision {
     no_key: AtomicBool,
     key_waiting: AtomicBool,
     budget_unavailable: AtomicBool,
+    fail_install: AtomicBool,
+    signature: Gatekeeper,
+    install_roots: SyncMutex<Vec<PathBuf>>,
+}
+fn copy_release(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_release(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+    mode(to, 0o700);
 }
 #[async_trait]
 impl Provisioner for Provision {
@@ -71,16 +87,18 @@ impl Provisioner for Provision {
         let profile = serde_json::from_value(json!({"total_mem_bytes": total, "avail_mem_bytes": total, "arch":"aarch64", "cpu_cores":8, "accelerator":"metal", "os":"macos"})).unwrap();
         agent24_hw::HardwareReport::new(profile, None).idoris_budget_suggestion()
     }
-    async fn verify(&self, r: &Installation) -> Result<InstalledVersion, Code> {
+    async fn verify(&self, r: &Installation, mode: VerifyMode) -> Result<InstalledVersion, Code> {
         self.verifications.fetch_add(1, Ordering::SeqCst);
-        InstalledVersion::verify_existing(
+        agent24_idoris::install::verify_existing_on(
+            TEST_PLATFORM,
             &r.release_dir,
             &self.lock,
             &VerifiedArchive {
                 path: r.archive_path.clone(),
                 sha256: String::new(),
             },
-            &AcceptSignature,
+            &self.signature,
+            mode,
         )
         .map_err(|_| Code::NotInstalled)
     }
@@ -112,11 +130,28 @@ impl Provisioner for Provision {
     }
     async fn install(
         &self,
-        _: &Path,
+        root: &Path,
         _: &VerifiedArchive,
         _: &CancellationToken,
     ) -> Result<InstalledVersion, Code> {
-        self.verify(&self.record).await
+        self.install_roots.lock().unwrap().push(root.to_owned());
+        if self.fail_install.load(Ordering::SeqCst) {
+            return Err(Code::NotInstalled);
+        }
+        // A managed root other than the fixture's own receives a fresh copy, like a real install.
+        if Some(root) != self.record.release_dir.parent() {
+            let release = root.join("v0.4.0");
+            // Like the real installer: an existing version directory is verified, not rewritten.
+            if !release.exists() {
+                copy_release(&self.record.release_dir, &release);
+            }
+            let record = Installation {
+                release_dir: release,
+                ..self.record.clone()
+            };
+            return self.verify(&record, VerifyMode::Install).await;
+        }
+        self.verify(&self.record, VerifyMode::Install).await
     }
     async fn upstream_key(&self) -> Result<Option<ApiKey>, Code> {
         if self.gate.load(Ordering::SeqCst) {
@@ -162,6 +197,9 @@ impl ConnectedFixture {
             no_key: AtomicBool::new(false),
             key_waiting: AtomicBool::new(false),
             budget_unavailable: AtomicBool::new(false),
+            fail_install: AtomicBool::new(false),
+            signature: Gatekeeper::default(),
+            install_roots: SyncMutex::new(Vec::new()),
         });
         let data = Arc::new(Store::default());
         let upstream = Arc::new(Store::default());
@@ -853,7 +891,11 @@ async fn restore_after_crash_between_commit_issue_and_connect_journal_removal() 
     assert_eq!(x.f.complete(&first).await.result, Some(Outcome::Succeeded));
     let previous = x.f.host.inner.lock().await.installation.clone().unwrap();
     x.f.host.shutdown().await.unwrap();
-    let installed = x.provision.verify(&previous).await.unwrap();
+    let installed = x
+        .provision
+        .verify(&previous, VerifyMode::AtRest)
+        .await
+        .unwrap();
     let keys = Keys::new(
         &installed,
         &x.f.host.root.join("data/idoris.sqlite3"),
@@ -1111,9 +1153,7 @@ async fn real_v040_install_reverify_and_connect_when_omlx_available() {
         root.clone(),
         managed,
         router,
-        Arc::new(SystemRuntime {
-            secrets: secrets.clone(),
-        }),
+        Arc::new(SystemRuntime::new(secrets.clone())),
         secrets,
     )
     .unwrap()
@@ -1342,4 +1382,416 @@ async fn keychain_lock_before_verification_retains_code_and_compensates() {
     assert!(x.data.entries.lock().unwrap().is_empty());
     x.f.assert_clean();
     x.assert_safe();
+}
+
+/// ADR-038 D1 migration: a receipt pointing at the legacy tree keeps working until
+/// a new copy under the managed root has verified.
+///
+/// Lays the fixture release out like a real legacy install: `<root>/0.4.0` and
+/// `<root>/cache/<asset>.verified`, with the receipt pointing at them.
+async fn legacy_fixture() -> (ConnectedFixture, PathBuf, Installation) {
+    let x = ConnectedFixture::new().await;
+    let managed = x.f.host.root.join("managed");
+    let legacy = legacy_receipt(&x).await;
+    let mut x = x;
+    Arc::get_mut(&mut x.f.host).unwrap().install_root = managed.clone();
+    (x, managed, legacy)
+}
+async fn legacy_receipt(x: &ConnectedFixture) -> Installation {
+    legacy_receipt_with(x, false).await
+}
+/// `startable` keeps the key and components dir so the fixture instance can actually run.
+async fn legacy_receipt_with(x: &ConnectedFixture, startable: bool) -> Installation {
+    let root = &x.f.host.root;
+    let release = root.join("0.4.0");
+    copy_release(&x.f.record.release_dir, &release);
+    let cache = root.join("cache");
+    fs::create_dir_all(&cache).unwrap();
+    mode(&cache, 0o700);
+    let archive = cache.join("idoris-v0.4.0-aarch64-apple-darwin.tar.gz.verified");
+    fs::copy(&x.f.record.archive_path, &archive).unwrap();
+    let mut record = x.f.record.clone();
+    record.release_dir = release;
+    record.archive_path = archive;
+    if !startable {
+        record.key_id = None;
+        record.components_dir = None;
+    }
+    record.desired_running = false;
+    if startable {
+        // The fixture instance reads its data key from the (test) keychain.
+        x.data.entries.lock().unwrap().insert(
+            record.key_id.clone().unwrap(),
+            Zeroizing::new(format!("idk_{}", "a".repeat(64))),
+        );
+    }
+    x.f.host.record_installation(record.clone()).await.unwrap();
+    record
+}
+async fn run_install(x: &ConnectedFixture, key: &str) {
+    let op =
+        x.f.host
+            .install(InstallRequest { consent: true }, Some(key))
+            .await
+            .unwrap();
+    assert_eq!(x.f.complete(&op).await.result, Some(Outcome::Succeeded));
+}
+fn deletable_paths(x: &ConnectedFixture) -> Vec<PathBuf> {
+    let body = fs::read(x.f.host.root.join("legacy-install.deletable.json")).unwrap();
+    let marker: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    serde_json::from_value(marker["paths"].clone()).unwrap()
+}
+
+#[tokio::test]
+async fn legacy_install_is_redownloaded_into_the_managed_root_and_marked_deletable() {
+    let (x, managed, legacy) = legacy_fixture().await;
+    let status = x.f.host.status().await;
+    assert!(status.migration_pending && status.last_migration_error.is_none());
+    run_install(&x, "migrate-1").await;
+    // Downloaded and installed under the managed root, never the legacy one.
+    assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *x.provision.install_roots.lock().unwrap(),
+        std::slice::from_ref(&managed)
+    );
+    let record = x.f.host.inner.lock().await.installation.clone().unwrap();
+    assert_eq!(record.release_dir, managed.join("v0.4.0"));
+    assert_eq!(record.install_root.as_ref(), Some(&managed));
+    let saved: Installation =
+        serde_json::from_slice(&fs::read(x.f.host.root.join("installation.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved.release_dir, record.release_dir);
+    // The old tree is untouched and only *marked* deletable: exactly the release and archive.
+    assert!(legacy.release_dir.join("idoris").exists());
+    assert_eq!(
+        deletable_paths(&x),
+        [legacy.release_dir.clone(), legacy.archive_path.clone()]
+    );
+    assert!(!x.f.host.status().await.migration_pending);
+    // Once migrated, a further install is a no-op verification.
+    run_install(&x, "migrate-2").await;
+    assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn failed_migration_keeps_the_working_legacy_install_and_reports_it() {
+    let (x, managed, legacy) = legacy_fixture().await;
+    x.provision.fail_install.store(true, Ordering::SeqCst);
+    run_install(&x, "migrate-fail").await;
+    assert_eq!(x.provision.install_roots.lock().unwrap().len(), 1);
+    let record = x.f.host.inner.lock().await.installation.clone().unwrap();
+    assert_eq!(
+        record.release_dir, legacy.release_dir,
+        "receipt must still name the legacy copy"
+    );
+    assert!(!x.f.host.root.join("legacy-install.deletable.json").exists());
+    assert!(!managed.join("v0.4.0").exists());
+    let status = x.f.host.status().await;
+    assert!(status.last_error.is_none());
+    assert!(status.migration_pending);
+    assert_eq!(status.last_migration_error, Some(Code::NotInstalled));
+    // A later successful attempt clears the reported error.
+    x.provision.fail_install.store(false, Ordering::SeqCst);
+    run_install(&x, "migrate-retry").await;
+    let status = x.f.host.status().await;
+    assert!(!status.migration_pending && status.last_migration_error.is_none());
+}
+
+#[tokio::test]
+async fn symlinked_data_dir_neither_remigrates_nor_lists_the_in_use_release() {
+    let x = ConnectedFixture::new().await;
+    let legacy = legacy_receipt(&x).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let real = fs::canonicalize(tmp.path()).unwrap().join("real");
+    fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+    let managed =
+        crate::idoris_host::canonical_install_root(&tmp.path().join("link/components/idoris"))
+            .unwrap();
+    assert!(managed.starts_with(&real), "{managed:?} is not canonical");
+    let mut x = x;
+    Arc::get_mut(&mut x.f.host).unwrap().install_root = managed.clone();
+    run_install(&x, "link-1").await;
+    run_install(&x, "link-2").await;
+    run_install(&x, "link-3").await;
+    // One migration, then verification only: the receipt is canonical, so is the root.
+    assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 1);
+    let record = x.f.host.inner.lock().await.installation.clone().unwrap();
+    assert!(record.release_dir.starts_with(&managed));
+    let listed = deletable_paths(&x);
+    assert_eq!(listed, [legacy.release_dir, legacy.archive_path]);
+    assert!(listed.iter().all(|p| !p.starts_with(&real)));
+}
+
+#[tokio::test]
+async fn a_receipt_from_another_install_root_is_migrated_again_without_listing_it() {
+    let (x, managed, _) = legacy_fixture().await;
+    run_install(&x, "root-1").await;
+    {
+        let mut i = x.f.host.inner.lock().await;
+        i.installation.as_mut().unwrap().install_root = Some("/elsewhere/idoris".into());
+    }
+    assert!(x.f.host.status().await.migration_pending);
+    run_install(&x, "root-2").await;
+    assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 2);
+    let record = x.f.host.inner.lock().await.installation.clone().unwrap();
+    assert_eq!(record.install_root.as_ref(), Some(&managed));
+    // The superseded release was under the managed root, not the legacy one: not listed.
+    assert!(deletable_paths(&x).iter().all(|p| !p.starts_with(&managed)));
+}
+
+#[test]
+fn deletable_allow_list_accepts_only_release_dirs_and_verified_archives() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = fs::canonicalize(tmp.path()).unwrap();
+    for dir in [
+        "0.4.0",
+        "cache",
+        "data",
+        "instances",
+        "transactions",
+        "latest",
+        "0.4.0/config",
+        "01.2.3",
+    ] {
+        fs::create_dir_all(old.join(dir)).unwrap();
+    }
+    for file in [
+        "installation.json",
+        "operations.json",
+        "cache/a.tar.gz.verified",
+        "cache/a.tar.gz.part",
+        "cache/.verified",
+        "cache/.hidden.verified",
+    ] {
+        fs::write(old.join(file), b"x").unwrap();
+    }
+    std::os::unix::fs::symlink(old.join("data"), old.join("0.5.0")).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::create_dir(outside.path().join("0.4.0")).unwrap();
+    let ok = [old.join("0.4.0"), old.join("cache/a.tar.gz.verified")];
+    let refused = [
+        old.clone(),
+        old.join("data"),
+        old.join("instances"),
+        old.join("transactions"),
+        old.join("installation.json"),
+        old.join("operations.json"),
+        old.join("latest"),
+        old.join("01.2.3"),
+        old.join("0.4.0/config"),
+        old.join("0.5.0"), // symlink to data/
+        old.join("cache"),
+        old.join("cache/a.tar.gz.part"),
+        old.join("cache/.verified"),
+        old.join("cache/.hidden.verified"),
+        old.join("cache/../data"),
+        old.join("0.4.0/../data"),
+        outside.path().join("0.4.0"),
+        PathBuf::from("/"),
+        PathBuf::new(),
+    ];
+    for path in &refused {
+        assert!(
+            crate::idoris_host::provision::legacy_deletable(&old, &[path.as_path()]).is_empty(),
+            "{path:?} must never be deletable"
+        );
+    }
+    let all: Vec<&Path> = ok
+        .iter()
+        .chain(refused.iter())
+        .map(PathBuf::as_path)
+        .collect();
+    assert_eq!(
+        crate::idoris_host::provision::legacy_deletable(&old, &all),
+        ok
+    );
+    // An unreadable old root yields nothing.
+    assert!(
+        crate::idoris_host::provision::legacy_deletable(&old.join("absent"), &[ok[0].as_path()])
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn install_without_a_notarization_record_fails_closed_when_gatekeeper_is_offline() {
+    let x = ConnectedFixture::new().await;
+    x.f.install().await; // receipt without notarized_verified_at
+    x.provision.signature.0.store(true, Ordering::SeqCst);
+    let op =
+        x.f.host
+            .install(InstallRequest { consent: true }, Some("offline-1"))
+            .await
+            .unwrap();
+    let done = x.f.complete(&op).await;
+    assert_eq!(done.result, Some(Outcome::Failed));
+    assert!(
+        x.f.host
+            .inner
+            .lock()
+            .await
+            .installation
+            .as_ref()
+            .unwrap()
+            .notarized_verified_at
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn install_with_a_notarization_record_is_intact_offline() {
+    let x = ConnectedFixture::new().await;
+    let mut record = x.f.record.clone();
+    record.notarized_verified_at = Some("2026-11-02T00:00:00+00:00".into());
+    x.f.host.record_installation(record).await.unwrap();
+    x.provision.signature.0.store(true, Ordering::SeqCst);
+    run_install(&x, "offline-2").await;
+    assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn an_online_install_stamps_the_receipt_once() {
+    let x = ConnectedFixture::new().await;
+    x.f.install().await;
+    run_install(&x, "online-1").await;
+    assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 0);
+    let stamped =
+        x.f.host
+            .inner
+            .lock()
+            .await
+            .installation
+            .as_ref()
+            .unwrap()
+            .notarized_verified_at
+            .clone()
+            .expect("full check passed, receipt must record it");
+    let saved: Installation =
+        serde_json::from_slice(&fs::read(x.f.host.root.join("installation.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        saved.notarized_verified_at.as_deref(),
+        Some(stamped.as_str())
+    );
+    // The next install trusts the record: at-rest checks only, even with Gatekeeper gone.
+    x.provision.signature.0.store(true, Ordering::SeqCst);
+    run_install(&x, "online-2").await;
+    assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_running_legacy_instance_is_not_deletable_until_it_has_left_the_old_release() {
+    let mut x = ConnectedFixture::new().await;
+    let legacy = legacy_receipt_with(&x, true).await;
+    let managed = x.f.host.root.join("managed");
+    Arc::get_mut(&mut x.f.host).unwrap().install_root = managed.clone();
+    let marker = x.f.host.root.join("legacy-install.deletable.json");
+    let pending = x.f.host.root.join("legacy-install.pending.json");
+
+    let start = x.f.host.submit(Action::Start, None).await.unwrap();
+    assert_eq!(x.f.complete(&start).await.result, Some(Outcome::Succeeded));
+    assert_eq!(
+        x.f.host.inner.lock().await.supervisor_release.as_ref(),
+        Some(&legacy.release_dir)
+    );
+
+    // Migrate while the old instance runs: the receipt moves, the process does not.
+    run_install(&x, "mig-running").await;
+    let record = x.f.host.inner.lock().await.installation.clone().unwrap();
+    assert_eq!(record.release_dir, managed.join("v0.4.0"));
+    assert!(!marker.exists(), "an in-use release must not be listed");
+    assert!(pending.exists(), "the paths wait in the queue");
+
+    // Stopped: nothing holds the old release any more, so it is published.
+    let stop = x.f.host.submit(Action::Stop, None).await.unwrap();
+    assert_eq!(x.f.complete(&stop).await.result, Some(Outcome::Succeeded));
+    assert_eq!(
+        deletable_paths(&x),
+        [legacy.release_dir.clone(), legacy.archive_path.clone()]
+    );
+    assert!(!pending.exists());
+
+    // Restarting runs from the new release.
+    let start = x.f.host.submit(Action::Start, None).await.unwrap();
+    assert_eq!(x.f.complete(&start).await.result, Some(Outcome::Succeeded));
+    assert_eq!(
+        x.f.host.inner.lock().await.supervisor_release,
+        Some(managed.join("v0.4.0"))
+    );
+    let stop = x.f.host.submit(Action::Stop, None).await.unwrap();
+    assert_eq!(x.f.complete(&stop).await.result, Some(Outcome::Succeeded));
+}
+
+#[tokio::test]
+async fn a_restart_onto_the_new_release_publishes_the_queued_legacy_paths() {
+    let mut x = ConnectedFixture::new().await;
+    let legacy = legacy_receipt_with(&x, true).await;
+    let managed = x.f.host.root.join("managed");
+    Arc::get_mut(&mut x.f.host).unwrap().install_root = managed.clone();
+    let start = x.f.host.submit(Action::Start, None).await.unwrap();
+    assert_eq!(x.f.complete(&start).await.result, Some(Outcome::Succeeded));
+    run_install(&x, "mig-running-2").await;
+    assert!(!x.f.host.root.join("legacy-install.deletable.json").exists());
+    // Replace the process by stopping and starting again from the new receipt.
+    for action in [Action::Stop, Action::Start] {
+        let op = x.f.host.submit(action, None).await.unwrap();
+        assert_eq!(x.f.complete(&op).await.result, Some(Outcome::Succeeded));
+    }
+    assert_eq!(deletable_paths(&x)[0], legacy.release_dir);
+    let stop = x.f.host.submit(Action::Stop, None).await.unwrap();
+    assert_eq!(x.f.complete(&stop).await.result, Some(Outcome::Succeeded));
+}
+
+#[test]
+fn cache_guard_is_canonical_and_rejects_foreign_or_symlinked_caches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(tmp.path()).unwrap();
+    let old = base.join("old");
+    fs::create_dir_all(old.join("cache")).unwrap();
+    fs::write(old.join("cache/a.tar.gz.verified"), b"x").unwrap();
+    let ok = old.join("cache/a.tar.gz.verified");
+    let legacy = crate::idoris_host::provision::legacy_deletable;
+    assert_eq!(legacy(&old, &[ok.as_path()]), std::slice::from_ref(&ok));
+    // The same name reached through a non-canonical spelling of the old root still matches.
+    std::os::unix::fs::symlink(&old, base.join("alias")).unwrap();
+    assert_eq!(
+        legacy(&base.join("alias"), &[ok.as_path()]),
+        std::slice::from_ref(&ok)
+    );
+
+    // A cache directory somewhere else is foreign.
+    let foreign = base.join("foreign/cache");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(foreign.join("a.tar.gz.verified"), b"x").unwrap();
+    assert!(legacy(&old, &[foreign.join("a.tar.gz.verified").as_path()]).is_empty());
+
+    // A symlinked cache is refused outright, even when it points at a real cache-like dir.
+    let old2 = base.join("old2");
+    fs::create_dir_all(&old2).unwrap();
+    std::os::unix::fs::symlink(&foreign, old2.join("cache")).unwrap();
+    let via_link = old2.join("cache/a.tar.gz.verified");
+    assert!(
+        legacy(
+            &old2,
+            &[
+                via_link.as_path(),
+                foreign.join("a.tar.gz.verified").as_path()
+            ]
+        )
+        .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn receipt_fields_added_in_c1_are_omitted_when_unset() {
+    let f = Fixture::new().await;
+    let bare = serde_json::to_value(&f.record).unwrap();
+    assert!(bare.get("install_root").is_none() && bare.get("notarized_verified_at").is_none());
+    let mut set = f.record.clone();
+    set.install_root = Some("/x".into());
+    set.notarized_verified_at = Some("2026-11-02T00:00:00+00:00".into());
+    let set = serde_json::to_value(&set).unwrap();
+    assert!(set.get("install_root").is_some() && set.get("notarized_verified_at").is_some());
+    // And a receipt without them (an older daemon's) still loads.
+    serde_json::from_value::<Installation>(bare).unwrap();
 }
