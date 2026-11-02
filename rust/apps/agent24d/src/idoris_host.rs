@@ -403,7 +403,7 @@ pub struct SystemRuntime {
     pub lock: Arc<IdorisLock>,
     /// Platform key whose asset is verified. `None` (production) means this host's
     /// platform; tests inject `darwin-arm64` so they behave the same on every OS.
-    pub platform: Option<&'static str>,
+    pub(crate) platform: Option<&'static str>,
 }
 impl SystemRuntime {
     pub fn new(secrets: Arc<dyn SecretSource>) -> Self {
