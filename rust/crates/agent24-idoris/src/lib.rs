@@ -1,18 +1,18 @@
 //! Pinned iDoris release metadata and launcher contract compatibility.
 
-pub mod download;
-pub mod install;
 pub mod keychain;
 pub mod keys;
 #[cfg(unix)]
 pub mod omlx_probe;
 #[cfg(unix)]
 pub mod setup;
-mod storage;
 pub mod supervisor;
 
+pub mod download;
+pub mod install;
+
+use agent24_components::lock::{ComponentLock, LockError as ComponentLockError};
 use semver::Version;
-use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::OnceLock,
@@ -20,8 +20,10 @@ use std::{
 
 const EMBEDDED: &str = include_str!("../idoris.lock.json");
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// iDoris's view of its schema-2 `ComponentLock`: the generic lock stays the
+/// source of truth, and this keeps the shape the supervisor and host already use
+/// (assets keyed by Rust target triple, L1-L6 under `capabilities`).
+#[derive(Debug, Clone)]
 pub struct IdorisLock {
     pub schema: u32,
     pub tag: String,
@@ -31,20 +33,21 @@ pub struct IdorisLock {
     pub contract_major: u64,
     pub min_contract_minor: u64,
     pub tested_contract_version: String,
+    /// Assurance levels L1-L6 (not capabilities in the ADR-039 sense; the name is
+    /// kept for the existing callers). Lives in `ComponentLock::assurance`.
     pub capabilities: Vec<Capability>,
     pub release_url_base: String,
+    component: ComponentLock,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct LockedAsset {
     pub name: String,
     pub sha256: String,
     pub files: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct Capability {
     pub id: String,
     pub source: String,
@@ -56,6 +59,49 @@ pub enum LockError {
     Json(#[from] serde_json::Error),
     #[error("invalid iDoris lock field: {0}")]
     Invalid(&'static str),
+    #[error("iDoris lock rejected: {0}")]
+    Component(ComponentLockError),
+}
+
+const REPO: &str = "https://github.com/iDoris-ai/iDoris";
+const FILES: [&str; 5] = [
+    "idoris",
+    "config/catalog.yaml",
+    "config/routing-policy.yaml",
+    "config/components/omlx.yaml",
+    "config/components/subscription.yaml",
+];
+
+/// Platform keys iDoris publishes for, with the Rust triple used in asset names.
+const PLATFORM_TRIPLES: [(&str, &str); 4] = [
+    ("darwin-arm64", "aarch64-apple-darwin"),
+    ("darwin-x64", "x86_64-apple-darwin"),
+    ("linux-arm64", "aarch64-unknown-linux-gnu"),
+    ("linux-x64", "x86_64-unknown-linux-gnu"),
+];
+
+/// Rust target triple of a host (`std::env::consts` OS and ARCH values), if iDoris
+/// publishes for that platform family.
+pub fn triple_for(os: &str, arch: &str) -> Option<&'static str> {
+    let key = agent24_components::lock::platform_key(os, arch)?;
+    PLATFORM_TRIPLES
+        .iter()
+        .find(|(p, _)| *p == key)
+        .map(|(_, t)| *t)
+}
+
+/// The triple of this host. The lock decides whether an asset exists for it, so an
+/// Intel Mac gets `UnsupportedPlatform` instead of an arm64 binary it cannot run.
+pub fn host_triple() -> Option<&'static str> {
+    triple_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Platform key (`darwin-arm64`) for a Rust target triple, if iDoris knows it.
+pub fn platform_of(triple: &str) -> Option<&'static str> {
+    PLATFORM_TRIPLES
+        .iter()
+        .find(|(_, t)| *t == triple)
+        .map(|(p, _)| *p)
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -75,91 +121,107 @@ impl IdorisLock {
     }
 
     pub fn parse(json: &str) -> Result<Self, LockError> {
-        let lock: Self = serde_json::from_str(json)?;
-        require(lock.schema == 1, "schema")?;
-        let tag = lock
-            .tag
-            .strip_prefix('v')
-            .ok_or(LockError::Invalid("tag"))?;
-        require(
-            Version::parse(tag).is_ok_and(|v| v.pre.is_empty() && v.build.is_empty()),
-            "tag",
-        )?;
-        let commit = &lock.commit;
-        require(
-            commit.len() == 40
-                && commit
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b"a"[0]..=b"f"[0]).contains(&b)),
-            "commit",
-        )?;
-        let team = &lock.team_id;
-        let is_team_char = |b: u8| b.is_ascii_uppercase() || b.is_ascii_digit();
-        require(
-            team.len() == 10 && team.bytes().all(is_team_char),
-            "team_id",
-        )?;
-        for (triple, asset) in &lock.assets {
+        let component = ComponentLock::parse(json).map_err(|e| match e {
+            ComponentLockError::Json(e) => LockError::Json(e),
+            other => LockError::Component(other),
+        })?;
+        Self::from_component(component)
+    }
+
+    /// iDoris-specific rules on top of the generic validation.
+    pub fn from_component(component: ComponentLock) -> Result<Self, LockError> {
+        require(component.id == "idoris", "id")?;
+        require(component.source.repo == REPO, "source.repo")?;
+        require(component.contract.name == "idoris-http", "contract.name")?;
+        let signing = component
+            .signing
+            .as_ref()
+            .ok_or(LockError::Invalid("signing"))?;
+        let mut assets = BTreeMap::new();
+        for (platform, asset) in &component.assets {
+            let (_, triple) = PLATFORM_TRIPLES
+                .iter()
+                .find(|(p, _)| p == platform)
+                .ok_or(LockError::Invalid("assets.platform"))?;
             require(
-                !triple.is_empty()
-                    && triple.bytes().all(|b| {
-                        b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-')
-                    }),
-                "assets.triple",
-            )?;
-            require(
-                asset.name == format!("idoris-{}-{triple}.tar.gz", lock.tag),
+                asset.name == format!("idoris-{}-{triple}.tar.gz", component.version),
                 "assets.name",
             )?;
-            let hash = &asset.sha256;
-            let is_lower_hex = |b: u8| b.is_ascii_hexdigit() && !b.is_ascii_uppercase();
-            require(
-                hash.len() == 64 && hash.bytes().all(is_lower_hex),
-                "assets.sha256",
-            )?;
-            let mut files = BTreeSet::new();
-            require(!asset.files.is_empty(), "assets.files")?;
-            for file in &asset.files {
-                require(
-                    file.split('/').all(|part| !matches!(part, "" | "." | ".."))
-                        && files.insert(file),
-                    "assets.files",
-                )?;
+            require(asset.files == FILES, "assets.files")?;
+            require(asset.executables == ["idoris"], "assets.executables")?;
+            assets.insert(
+                (*triple).to_owned(),
+                LockedAsset {
+                    name: asset.name.clone(),
+                    sha256: asset.sha256.clone(),
+                    files: asset.files.clone(),
+                },
+            );
+        }
+        let ids: BTreeSet<_> = component.assurance.iter().map(|a| a.id.as_str()).collect();
+        require(
+            component.assurance.len() == 6
+                && ids == BTreeSet::from(["L1", "L2", "L3", "L4", "L5", "L6"]),
+            "assurance",
+        )?;
+        Ok(Self {
+            schema: component.schema,
+            tag: component.version.clone(),
+            commit: component.source.commit.clone(),
+            assets,
+            team_id: signing.macos_team_id.clone(),
+            contract_major: component.contract.major,
+            min_contract_minor: component.contract.min_minor,
+            tested_contract_version: component.contract.tested.clone(),
+            capabilities: component
+                .assurance
+                .iter()
+                .map(|a| Capability {
+                    id: a.id.clone(),
+                    source: a.source.clone(),
+                })
+                .collect(),
+            release_url_base: component.release_url_base.clone(),
+            component,
+        })
+    }
+
+    /// The generic lock the downloader and installer consume, rebuilt from the
+    /// public fields so a mutated view is what gets installed (and is re-validated
+    /// at the installation boundary).
+    pub fn to_component(&self) -> ComponentLock {
+        let mut lock = self.component.clone();
+        lock.version = self.tag.clone();
+        lock.source.commit = self.commit.clone();
+        lock.release_url_base = self.release_url_base.clone();
+        lock.contract.major = self.contract_major;
+        lock.contract.min_minor = self.min_contract_minor;
+        lock.contract.tested = self.tested_contract_version.clone();
+        if let Some(signing) = &mut lock.signing {
+            signing.macos_team_id = self.team_id.clone();
+        }
+        for (triple, view) in &self.assets {
+            let Some(platform) = platform_of(triple) else {
+                continue;
+            };
+            if let Some(asset) = lock.assets.get_mut(platform) {
+                asset.name = view.name.clone();
+                asset.sha256 = view.sha256.clone();
+                asset.files = view.files.clone();
             }
         }
-        require(
-            lock.check_contract(&lock.tested_contract_version).is_ok(),
-            "tested_contract_version",
-        )?;
-        let ids: BTreeSet<_> = lock
-            .capabilities
-            .iter()
-            .map(|cap| cap.id.as_str())
-            .collect();
-        require(
-            lock.capabilities.len() == 6
-                && ids == BTreeSet::from(["L1", "L2", "L3", "L4", "L5", "L6"]),
-            "capabilities",
-        )?;
-        let base = &lock.release_url_base;
-        let url = url::Url::parse(base).map_err(|_| LockError::Invalid("release_url_base"))?;
-        // Url removes an explicit :443, so also check the original authority.
-        require(
-            url.scheme() == "https"
-                && url.host_str() == Some("github.com")
-                && base.split('/').nth(2) == Some("github.com")
-                && (url.path() == "/iDoris-ai/iDoris/releases/download"
-                    || url
-                        .path()
-                        .starts_with("/iDoris-ai/iDoris/releases/download/"))
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.query().is_none()
-                && url.fragment().is_none()
-                && !base.contains(|c: char| c.is_whitespace() || c == '\\'),
-            "release_url_base",
-        )?;
-        Ok(lock)
+        // Platforms removed from the view are removed from the lock.
+        lock.assets
+            .retain(|platform, _| self.assets.keys().any(|t| platform_of(t) == Some(platform)));
+        lock
+    }
+
+    /// Whether the lock demands a notarization verdict at install time.
+    pub fn component_notarized(&self) -> bool {
+        self.component
+            .signing
+            .as_ref()
+            .is_some_and(|signing| signing.notarized)
     }
 
     pub fn asset_for(&self, target_triple: &str) -> Option<&LockedAsset> {

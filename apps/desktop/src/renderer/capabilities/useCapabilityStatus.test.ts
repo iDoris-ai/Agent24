@@ -9,7 +9,7 @@ import { useCapabilityStatus } from './useCapabilityStatus'
 
 const initial: IdorisStatus = {
   state: 'not_installed', version: null, data_port: null, admin_port: null,
-  roles: [], last_error: null, current_operation: null, verification: null,
+  roles: [], last_error: null, migration_pending: false, last_migration_error: null, current_operation: null, verification: null,
   budget_suggestion: null, budget_unavailable_reason: 'hardware_memory_unavailable',
 }
 let status: IdorisStatus

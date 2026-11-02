@@ -9,7 +9,7 @@ import { idorisErrors } from './IdorisPanel.i18n'
 
 type Status = components['schemas']['IdorisStatus']
 type Operation = components['schemas']['IdorisOperation']
-const initial: Status = { state: 'not_installed', version: null, data_port: null, admin_port: null, roles: [], last_error: null, current_operation: null, verification: null, budget_suggestion: null, budget_unavailable_reason: 'hardware_memory_unavailable' }
+const initial: Status = { state: 'not_installed', version: null, data_port: null, admin_port: null, roles: [], last_error: null, migration_pending: false, last_migration_error: null, current_operation: null, verification: null, budget_suggestion: null, budget_unavailable_reason: 'hardware_memory_unavailable' }
 const installed: Status = { ...initial, state: 'not_configured', version: '0.4.0' }
 const running: Status = { ...installed, state: 'running', data_port: 8740, admin_port: 8741, roles: ['daily'] }
 const candidate = (endpoint: string) => ({ endpoint, identity: 'omlx', authentication: 'ready', models: ['real/daily', 'real/deep'] })
