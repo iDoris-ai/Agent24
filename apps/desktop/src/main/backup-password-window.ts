@@ -176,7 +176,14 @@ function openPasswordWindow<T>(
       working = true
       if (mode !== 'export') event.sender.send(BACKUP_PW_BUSY, mt(SINGLE_FIELD[mode].busy))
       let password: string | null = first
-      work(password).then(
+      // A synchronous throw from `work` must still clear `working`, or cancel stays vetoed.
+      let pending: Promise<Outcome<T>>
+      try {
+        pending = work(password)
+      } catch (error) {
+        pending = Promise.reject(error)
+      }
+      pending.then(
         (outcome) => {
           password = null
           working = false

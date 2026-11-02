@@ -26,6 +26,7 @@ const appHandlers = new Map<string, () => void>()
 let parentWindow: { isDestroyed: () => boolean } | null = null
 // When set, the daemon's export route never answers until these are ended.
 let hangExport = false
+let exportReportsPath: string | null = null
 const hungExports: http.ServerResponse[] = []
 
 vi.mock('electron', () => ({
@@ -160,7 +161,7 @@ beforeAll(async () => {
         hungExports.push(res)
       } else if (req.method === 'POST' && req.url === '/api/v1/comm/identity/export') {
         const body = JSON.parse(Buffer.concat(chunks).toString()) as { nickname?: string; path?: string }
-        res.end(JSON.stringify({ ok: true, data: { nickname: body.nickname, npub: 'npub1alice', path: body.path, format: 'ncryptsec' } }))
+        res.end(JSON.stringify({ ok: true, data: { nickname: body.nickname, npub: 'npub1alice', path: exportReportsPath ?? body.path, format: 'ncryptsec' } }))
       } else res.end(JSON.stringify({ ok: true, echoed: req.url }))
     })
   })
@@ -491,6 +492,34 @@ describe('CommIdentityExport elevated IPC', () => {
     const omitted = await call(IpcChannels.CommRevealExport)
     expect(omitted.ok).toBe(false)
     expect(showItemInFolder).toHaveBeenCalledTimes(1)
+  })
+  it('a daemon path that differs from the picked one is not recorded for reveal', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockResolvedValueOnce(PW)
+    const picked = path.join(settingsDir, 'picked-alice.ncryptsec')
+    const elsewhere = path.join(settingsDir, 'elsewhere-alice.ncryptsec')
+    showSaveDialog.mockResolvedValueOnce({ canceled: false, filePath: picked })
+    exportReportsPath = elsewhere
+    try {
+      const result = await call(IpcChannels.CommIdentityExport, 'alice')
+      expect(result.ok).toBe(true)
+    } finally {
+      exportReportsPath = null
+    }
+    for (const target of [elsewhere, picked]) {
+      const revealed = await call(IpcChannels.CommRevealExport, target)
+      expect(revealed.ok).toBe(false)
+    }
+    expect(showItemInFolder).not.toHaveBeenCalled()
+  })
+  it('an unsafe backup password from the window is refused before the save dialog or daemon', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockResolvedValueOnce('short')
+    showSaveDialog.mockClear()
+    const result = await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(result.ok).toBe(false)
+    expect(showSaveDialog).not.toHaveBeenCalled()
+    noDaemonCall()
   })
   it('a cancelled save does not become a path the page can reveal', async () => {
     showMessageBox.mockResolvedValueOnce({ response: 0 })
