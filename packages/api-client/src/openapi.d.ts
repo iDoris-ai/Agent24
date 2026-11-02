@@ -226,7 +226,8 @@ export interface paths {
          *     refused (403). The ProductHost audience, and legacy mode (one shared token that already
          *     reads every full status route), get `ComponentView`. Every other audience gets
          *     `ComponentRedactedView`: id, version, state and provides only, with no install path, pid,
-         *     port, error message, team id or commit. The older status routes (`/idoris/status`,
+         *     port, error message, team id or commit. A first-party token carries only the operations it
+         *     was issued with, so one issued by an older daemon gets 403 here until it is re-issued. The older status routes (`/idoris/status`,
          *     `/comm/daemon`, `/os`) are unchanged.
          */
         get: operations["listComponents"];
@@ -2368,7 +2369,7 @@ export interface components {
             evidence_dir?: string;
             drain_ms: number;
             stop_grace_ms: number;
-            /** @description From SIGTERM to the process gone, at the latest (16500 at the defaults). */
+            /** @description From SIGTERM to the process gone, at the latest (16500 at the defaults, with no managed iDoris holding the shutdown open). */
             exit_bound_ms: number;
             config_warnings: string[];
             /** @description Open enum: no_history | clean | unreadable | cleanup_failed | unconfirmed. */

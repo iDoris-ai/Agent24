@@ -525,11 +525,6 @@ fn concurrent_reports_are_serialised_and_never_misflagged() {
     use std::sync::Arc;
     let reports = Arc::new(ComponentReports::default());
     let t0 = Instant::now();
-    let body = |state| ReportBody {
-        state,
-        version: None,
-        reason: None,
-    };
     reports
         .report(
             "open-design",
