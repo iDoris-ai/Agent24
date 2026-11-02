@@ -14,13 +14,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent24_comm::{
-    CommState, HyphaeDaemonSupervisor, HyphaeLock, HyphaeRunner, KeyringPasswordStore,
-    MemoryPasswordStore, PasswordStore, VerifiedBinary, current_platform,
+    CommState, HyphaeDaemonSupervisor, HyphaeRunner, KeyringPasswordStore, MemoryPasswordStore,
+    PasswordStore, VerifiedBinary, current_platform,
 };
 
-use crate::hyphae_install::InstallError;
-use agent24_comm::release::HyphaeRelease;
-use agent24_components::DownloadError;
+use crate::hyphae_install::{HyphaeLock, InstallError, Verifier};
+use agent24_components::{DownloadError, VerifyMode, install::InstallError as SignError};
 use axum::{
     Json, Router,
     body::Body,
@@ -153,7 +152,6 @@ impl Default for CommDaemonSlot {
 /// Developer overrides precede the verified component, then the sibling binary.
 async fn resolve_source_path(
     state_dir: &Path,
-    release: &HyphaeRelease,
     lock: &HyphaeLock,
 ) -> Result<Option<PathBuf>, String> {
     let primary = std::env::var_os("A24_HYPHAE_BIN").map(PathBuf::from);
@@ -167,7 +165,7 @@ async fn resolve_source_path(
     resolve_candidates(
         primary,
         deprecated,
-        &release.installed_path(state_dir),
+        &lock.installed_path(state_dir),
         sibling,
         lock,
         &current_platform(),
@@ -227,6 +225,7 @@ async fn build_ready_state(
     grace: Duration,
     slot: &CommDaemonSlot,
     lock: &HyphaeLock,
+    verifier: &Verifier,
 ) -> Result<CommState, String> {
     let CommPaths {
         home,
@@ -248,6 +247,18 @@ async fn build_ready_state(
     let bin = VerifiedBinary::install(&source, expected, install_dir)
         .await
         .map_err(|e| format!("Hyphae binary verification failed: {e}"))?;
+    // ADR-038 D2a `AtRest`, on the exact copy that will run: offline (no Gatekeeper
+    // round-trip), so an installed Hyphae still starts without a network. Notarization
+    // was established by the install-time check. Linux: sha256 above is the whole check.
+    crate::hyphae_install::verify_signature(
+        lock,
+        &platform,
+        bin.path(),
+        verifier,
+        VerifyMode::AtRest,
+    )
+    .await
+    .map_err(|e| format!("Hyphae signature verification failed: {e}"))?;
     let runner = Arc::new(HyphaeRunner::new(bin, home.to_path_buf(), DEFAULT_TIMEOUT));
     // COMM-4a §6.1 "孤儿识别": before this `agent24d` ever spawns a Hyphae
     // daemon of its own, clean up one left behind by a previous `agent24d`
@@ -344,12 +355,6 @@ fn select_password_store() -> Result<Arc<dyn PasswordStore>, String> {
 /// Build a comm router that remains available when Hyphae is absent or rejected.
 /// The shutdown slot owns the current supervisor across hot replacements.
 pub async fn build(state_dir: &Path, grace: Duration, slot: &Arc<CommDaemonSlot>) -> Router {
-    let release = match HyphaeRelease::embedded() {
-        Ok(release) => release,
-        Err(e) => {
-            return unconfigured_router(CommState::unconfigured(e.to_string()));
-        }
-    };
     let lock = match HyphaeLock::embedded() {
         Ok(lock) => lock,
         Err(e) => {
@@ -360,8 +365,8 @@ pub async fn build(state_dir: &Path, grace: Duration, slot: &Arc<CommDaemonSlot>
         state_dir: state_dir.to_path_buf(),
         grace,
         slot: slot.clone(),
-        release,
         lock,
+        verifier: Arc::new(agent24_components::sign::Codesign),
         password_store: select_password_store(),
         routes: RwLock::new(Router::new()),
         installation: AsyncMutex::new(()),
@@ -374,8 +379,9 @@ struct CommRuntime {
     state_dir: PathBuf,
     grace: Duration,
     slot: Arc<CommDaemonSlot>,
-    release: HyphaeRelease,
     lock: HyphaeLock,
+    /// D2a verifier (codesign/spctl); only consulted for macOS assets.
+    verifier: Verifier,
     password_store: Result<Arc<dyn PasswordStore>, String>,
     routes: RwLock<Router>,
     installation: AsyncMutex<()>,
@@ -400,8 +406,7 @@ impl CommRuntime {
             Ok(store) => store.clone(),
             Err(reason) => return Err(reason.clone()),
         };
-        let Some(source) = resolve_source_path(&self.state_dir, &self.release, &self.lock).await?
-        else {
+        let Some(source) = resolve_source_path(&self.state_dir, &self.lock).await? else {
             return Ok(CommState::unconfigured(
                 "no Hyphae binary is configured; download and set up Hyphae",
             ));
@@ -421,6 +426,7 @@ impl CommRuntime {
             self.grace,
             &self.slot,
             &self.lock,
+            &self.verifier,
         )
         .await
     }
@@ -430,7 +436,7 @@ impl CommRuntime {
         resolve_candidates(
             None,
             None,
-            &self.release.installed_path(&self.state_dir),
+            &self.lock.installed_path(&self.state_dir),
             None,
             &self.lock,
             &current_platform(),
@@ -438,16 +444,16 @@ impl CommRuntime {
         .await
         .ok()
         .flatten()
-        .map(|_| self.release.tag.clone())
+        .map(|_| self.lock.version().to_owned())
     }
 
     async fn install(&self) -> Result<Value, (StatusCode, Json<Value>)> {
         let _install = self.installation.lock().await;
         let path = crate::hyphae_install::install(
-            &self.release,
             &self.lock,
             &current_platform(),
             &self.state_dir,
+            &self.verifier,
             &self.slot.1,
         )
         .await
@@ -472,7 +478,7 @@ impl CommRuntime {
         };
         *routes = agent24_comm::router(state);
         Ok(json!({"ok": true, "data": {
-            "installed_version": self.release.tag, "path": path,
+            "installed_version": self.lock.version(), "path": path,
             "restart_required": restart_required, "reason": reason,
         }}))
     }
@@ -536,8 +542,8 @@ async fn component_status(State(runtime): State<Arc<CommRuntime>>) -> Response {
         }});
     }
     value["data"]["installable"] = runtime
-        .release
-        .asset_for(&runtime.lock, &current_platform())
+        .lock
+        .expected_for(&current_platform())
         .is_ok()
         .into();
     value["data"]["installed_version"] = json!(runtime.installed_version().await);
@@ -565,10 +571,15 @@ fn install_error(error: InstallError) -> (StatusCode, Json<Value>) {
         InstallError::Download(DownloadError::UnsupportedPlatform) => {
             (StatusCode::CONFLICT, "hyphae_unsupported_platform")
         }
+        // The bytes were rejected: by SHA-256, or (macOS) by the D2a signature check.
         InstallError::Download(DownloadError::HashMismatch)
-        | InstallError::Binary(agent24_comm::BinaryError::HashMismatch { .. }) => {
-            (StatusCode::UNPROCESSABLE_ENTITY, "hyphae_hash_mismatch")
-        }
+        | InstallError::Binary(agent24_comm::BinaryError::HashMismatch { .. })
+        | InstallError::Signature(
+            SignError::SignatureMismatch
+            | SignError::HardenedRuntimeMissing
+            | SignError::NotNotarized
+            | SignError::ManifestViolation(_),
+        ) => (StatusCode::UNPROCESSABLE_ENTITY, "hyphae_hash_mismatch"),
         _ => (StatusCode::BAD_GATEWAY, "hyphae_download_failed"),
     };
     (
@@ -758,16 +769,14 @@ mod hy1_regression_tests {
         let platform = current_platform();
         let lock =
             HyphaeLock::override_for_test(&platform, agent24_comm::binary::sha256_of(FIXTURE));
-        let mut release = HyphaeRelease::embedded().unwrap();
-        release
-            .assets
-            .insert(platform, Some("fixture-hyphae".into()));
         let runtime = Arc::new(CommRuntime {
             state_dir: dir.to_path_buf(),
             grace: Duration::from_millis(50),
             slot: Arc::new(CommDaemonSlot::new()),
-            release,
             lock,
+            // Fixture scripts carry no signature; the policy itself is tested in
+            // hyphae_install.rs. This accepts every executable it is shown.
+            verifier: Arc::new(agent24_components::sign::Unsigned),
             password_store: Ok(Arc::new(MemoryPasswordStore::new())),
             routes: RwLock::new(agent24_comm::router(CommState::unconfigured(
                 "no Hyphae binary is configured",
@@ -819,9 +828,9 @@ mod hy1_regression_tests {
             let (status, installed) = request(&app, "POST", "/api/v1/comm/install").await;
             assert_eq!(status, StatusCode::OK, "{installed}");
             assert_eq!(installed["data"]["restart_required"], false);
-            assert_eq!(installed["data"]["installed_version"], "v0.29.0");
+            assert_eq!(installed["data"]["installed_version"], "v0.30.0");
             assert_eq!(
-                tokio::fs::read(runtime.release.installed_path(dir.path()))
+                tokio::fs::read(runtime.lock.installed_path(dir.path()))
                     .await
                     .unwrap(),
                 FIXTURE
@@ -832,7 +841,7 @@ mod hy1_regression_tests {
             let (status, process) = request(&app, "GET", "/api/v1/comm/daemon").await;
             assert_eq!(status, StatusCode::OK);
             assert_ne!(process["data"]["process"]["state"], "not_configured");
-            assert_eq!(process["data"]["installed_version"], "v0.29.0");
+            assert_eq!(process["data"]["installed_version"], "v0.30.0");
         }
         if let Some(handle) = runtime.slot.close() {
             handle.shutdown(tokio::time::Instant::now()).await;
@@ -852,10 +861,10 @@ mod hy1_regression_tests {
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(body["data"]["restart_required"], false);
         }
-        let install_dir = runtime.release.install_dir(dir.path());
+        let install_dir = runtime.lock.install_dir(dir.path());
         assert!(!install_dir.join("hyphae.installing").exists());
         assert_eq!(
-            tokio::fs::read(runtime.release.installed_path(dir.path()))
+            tokio::fs::read(runtime.lock.installed_path(dir.path()))
                 .await
                 .unwrap(),
             FIXTURE
@@ -871,7 +880,7 @@ mod hy1_regression_tests {
     async fn install_api_rejects_hash_mismatch_and_status_does_not_claim_installed() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = runtime(dir.path()).await;
-        let installed = runtime.release.installed_path(dir.path());
+        let installed = runtime.lock.installed_path(dir.path());
         tokio::fs::create_dir_all(installed.parent().unwrap())
             .await
             .unwrap();
@@ -891,8 +900,9 @@ mod hy1_regression_tests {
         Arc::get_mut(&mut runtime)
             .unwrap()
             .lock
-            .binaries
-            .insert(current_platform(), None);
+            .component_mut()
+            .assets
+            .remove(&current_platform());
         let app = runtime_router(runtime);
         let (_, before) = request(&app, "GET", "/api/v1/comm/daemon").await;
         assert_eq!(before["data"]["installable"], false);
@@ -906,8 +916,11 @@ mod hy1_regression_tests {
     async fn install_api_download_failure_preserves_existing_comm_state() {
         let dir = tempfile::tempdir().unwrap();
         let mut runtime = runtime(dir.path()).await;
-        Arc::get_mut(&mut runtime).unwrap().release.release_url_base =
-            "https://untrusted.invalid/release".into();
+        Arc::get_mut(&mut runtime)
+            .unwrap()
+            .lock
+            .component_mut()
+            .release_url_base = "https://untrusted.invalid/release".into();
         tokio::fs::remove_file(
             dir.path()
                 .join("components/hyphae-cache/fixture-hyphae.verified"),

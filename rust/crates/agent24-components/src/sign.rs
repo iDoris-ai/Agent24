@@ -1,6 +1,6 @@
 //! Signature verification of installed executables (ADR-038 D2a).
 
-use crate::install::InstallError;
+use crate::{install::InstallError, lock::ComponentLock};
 use std::{
     io::{self, Read},
     path::Path,
@@ -30,6 +30,38 @@ pub struct SigningRequirement<'a> {
     pub team_id: &'a str,
     /// `spctl --assess` must also accept it (Gatekeeper verdict, not just a ticket).
     pub notarized: bool,
+}
+
+/// What D2a demands of `platform`'s executables in `mode`, decided from the lock alone.
+///
+/// - `darwin-*`: always `Some`. A lock without `signing` (or with a malformed Team ID)
+///   is refused, never treated as unsigned. Notarization is asked for only in
+///   [`VerifyMode::Install`]; [`VerifyMode::AtRest`] stays offline.
+/// - every other platform: `None`, meaning *this platform has no system signature*
+///   and the sha256 from the lock (plus the reproducible-build CI) is the whole check.
+///   Callers must treat `None` as that explicit decision, not as a skipped step.
+pub fn signing_requirement<'a>(
+    lock: &'a ComponentLock,
+    platform: &str,
+    mode: VerifyMode,
+) -> Result<Option<SigningRequirement<'a>>, InstallError> {
+    if !platform.starts_with("darwin-") {
+        return Ok(None);
+    }
+    let signing = lock
+        .signing
+        .as_ref()
+        .ok_or_else(|| InstallError::ManifestViolation("unsigned macOS asset".into()))?;
+    if !valid_team_id(&signing.macos_team_id) {
+        return Err(InstallError::ManifestViolation(
+            "invalid signing team".into(),
+        ));
+    }
+    Ok(Some(SigningRequirement {
+        team_id: &signing.macos_team_id,
+        // Only an install-time check may reach out to Gatekeeper.
+        notarized: signing.notarized && mode == VerifyMode::Install,
+    }))
 }
 
 pub trait SignatureVerifier {

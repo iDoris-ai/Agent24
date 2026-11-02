@@ -1,12 +1,72 @@
 {
-  "binaries": {
-    "darwin-arm64": "663cd82fb8ef0cfaef16574385cfb6b929c91eb931a7fcf262ff85ec94cb384a",
-    "darwin-x64": null,
-    "linux-arm64": null,
-    "linux-x64": "ba9ee927846ddbb63ff8fb87f30edc08f637d2b78e53f29a41bc76156b8ef14f"
+  "assets": {
+    "darwin-arm64": {
+      "executables": [
+        "hyphae"
+      ],
+      "files": [
+        "hyphae"
+      ],
+      "name": "hyphae-darwin-arm64",
+      "sha256": "a9fbaef99b60f330b834c5eff58ed8e2af1a9ea902ae8f481c43ac2ffd3eb9a4"
+    },
+    "linux-x64": {
+      "executables": [
+        "hyphae"
+      ],
+      "files": [
+        "hyphae"
+      ],
+      "name": "hyphae-linux-amd64",
+      "sha256": "b30fd252b04b19666a111bae0ffa5ab954ccca4a8166e033982a9ae3acd48607"
+    }
   },
-  "go": "go1.26.4",
-  "recipe": "GOTOOLCHAIN=go1.26.4 CGO_ENABLED=0 GOOS=<os> GOARCH=<arch> go build -trimpath -buildvcs=false -ldflags='-buildid=' -o hyphae ./cmd/hyphae",
-  "schema": 1,
-  "source_sha": "560d2bd103d0b7e87c8bd038a0230503924d86ab"
+  "assurance": [],
+  "contract": {
+    "major": 1,
+    "min_minor": 0,
+    "name": "hyphae-cli",
+    "tested": "1.0"
+  },
+  "id": "hyphae",
+  "provides": [
+    {
+      "id": "nostr-dm"
+    },
+    {
+      "id": "nostr-group"
+    },
+    {
+      "id": "nostr-identity"
+    },
+    {
+      "id": "nostr-relay"
+    }
+  ],
+  "release_url_base": "https://github.com/iDoris-ai/Hyphae/releases/download",
+  "reproducible": {
+    "recipe": "GOTOOLCHAIN=go1.26.4 CGO_ENABLED=0 GOOS=<os> GOARCH=<arch> go build -trimpath -buildvcs=false -ldflags='-buildid= -X main.version=v0.30.0' -o hyphae ./cmd/hyphae",
+    "toolchain": "go1.26.4",
+    "unsigned_sha256": {
+      "darwin-arm64": "865531f83fa76b4692fd47f73d352434d98f081271d3acf0d3081e9b327b863c",
+      "linux-x64": "b30fd252b04b19666a111bae0ffa5ab954ccca4a8166e033982a9ae3acd48607"
+    }
+  },
+  "requires": {
+    "kernel": [
+      "events"
+    ],
+    "operations": []
+  },
+  "schema": 2,
+  "signing": {
+    "macos_team_id": "HYAP444FN9",
+    "notarized": true
+  },
+  "source": {
+    "commit": "0e0d4ea46d78675ed3f5c9e02ddc146398860edb",
+    "repo": "https://github.com/iDoris-ai/Hyphae"
+  },
+  "stop_grace_ms": 15000,
+  "version": "v0.30.0"
 }

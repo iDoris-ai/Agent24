@@ -151,8 +151,7 @@ pub async fn download_locked_asset(
 }
 
 /// The generic downloader: GitHub host allow-list, size cap, SHA-256, cancel,
-/// progress and one operation lock per component. Callers without a
-/// `ComponentLock` (Hyphae, schema 1) come in through `fetch_verified`.
+/// progress and one operation lock per component.
 pub async fn download_pinned(
     asset: &PinnedAsset,
     cache_dir: &Path,

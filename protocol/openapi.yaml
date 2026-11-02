@@ -3300,13 +3300,13 @@ paths:
                   data:
                     $ref: "#/components/schemas/CommInstallResult"
         "409":
-          description: hyphae_unsupported_platform (including null lock digests)
+          description: hyphae_unsupported_platform (the lock has no asset for this platform)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/CommError"
         "422":
-          description: hyphae_hash_mismatch (downloaded or installed bytes rejected)
+          description: hyphae_hash_mismatch (downloaded or installed bytes rejected — SHA-256 against the lock, or on macOS the Developer ID / Hardened Runtime / notarization check)
           content:
             application/json:
               schema:
@@ -3325,8 +3325,8 @@ paths:
       summary: Hyphae daemon status (process, relay probe, catch-up)
       description: >-
         Always returns 200 when comm is not configured, with process.state not_configured.
-        data.installable indicates a platform with both release asset and non-null lock hash.
-        data.installed_version is the component tag (v0.29.0) after full hash revalidation,
+        data.installable indicates a platform the lock has an asset for.
+        data.installed_version is the component tag (v0.30.0) after full hash revalidation,
         or null when absent or rejected. Developer and sibling binaries do not count as installed components.
       responses:
         "200":
@@ -4686,7 +4686,7 @@ components:
       properties:
         installed_version:
           type: string
-          example: v0.29.0
+          example: v0.30.0
         path:
           type: string
           description: Absolute installed component path

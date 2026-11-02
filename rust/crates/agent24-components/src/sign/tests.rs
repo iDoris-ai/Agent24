@@ -428,3 +428,36 @@ fn a_hung_tool_is_killed_at_the_deadline_and_fails_closed() {
     .unwrap();
     assert!(!out.success && out.stderr.contains("hi"));
 }
+
+#[test]
+fn signing_requirement_is_decided_by_platform_and_mode() {
+    let mut lock = crate::lock::test_lock();
+    lock.signing.as_mut().unwrap().notarized = true;
+    let install = signing_requirement(&lock, "darwin-arm64", VerifyMode::Install)
+        .unwrap()
+        .unwrap();
+    assert_eq!(install.team_id, "HYAP444FN9");
+    assert!(install.notarized, "install asks Gatekeeper");
+    let at_rest = signing_requirement(&lock, "darwin-arm64", VerifyMode::AtRest)
+        .unwrap()
+        .unwrap();
+    assert!(!at_rest.notarized, "at rest stays offline");
+    // Linux has no system signature: an explicit `None`, for both modes.
+    for mode in [VerifyMode::Install, VerifyMode::AtRest] {
+        assert!(
+            signing_requirement(&lock, "linux-x64", mode)
+                .unwrap()
+                .is_none()
+        );
+    }
+    lock.signing.as_mut().unwrap().macos_team_id = "bad\"team".into();
+    assert!(matches!(
+        signing_requirement(&lock, "darwin-arm64", VerifyMode::AtRest),
+        Err(InstallError::ManifestViolation(_))
+    ));
+    lock.signing = None;
+    assert!(matches!(
+        signing_requirement(&lock, "darwin-arm64", VerifyMode::AtRest),
+        Err(InstallError::ManifestViolation(_))
+    ));
+}

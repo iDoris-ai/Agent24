@@ -15,9 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent24_comm::{
-    Envelope, HyphaeLock, HyphaeRunner, Invocation, RunnerError, Sha256Digest, VerifiedBinary,
-    current_platform,
+    Envelope, HyphaeRunner, Invocation, RunnerError, Sha256Digest, VerifiedBinary, current_platform,
 };
+use common::HyphaeLock;
 
 /// The Hyphae proposal's (unreproducible) acceptance binary — see
 /// `tests/real_binary.rs`. Accepted here too, via the same test-only lock

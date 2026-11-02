@@ -2,9 +2,12 @@
 //!
 //! Run explicitly with `HYPHAE_SOURCE_DIR=/absolute/path/to/agent-speaker \
 //! cargo test -p agent24d --test comm_blackbox -- --ignored --nocapture`.
-//! The test builds lock-verified Hyphae and a relay from that source tree,
-//! starts agent24d and a bare Hyphae peer under temporary homes, and uses one
-//! local counter for the model and MCP module. Missing inputs are failures.
+//! The test builds Hyphae and a relay from that source tree with the lock's recipe
+//! and checks the build against `reproducible.unsigned_sha256` (signing changes the
+//! bytes, so a local build can never equal the signed macOS asset). agent24d itself
+//! only runs the published asset: set `HYPHAE_TEST_BIN` to it (checked against
+//! `assets.<platform>.sha256`); the bare peer runs the local build. One local counter
+//! serves the model and MCP module. Missing inputs are failures.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -17,7 +20,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent24_comm::{HyphaeLock, current_platform};
+use agent24_comm::current_platform;
+use agent24_components::ComponentLock;
 use serde_json::{Value, json};
 
 struct Counter {
@@ -242,7 +246,7 @@ fn http(base: &str, method: &str, path: &str, token: &str, body: Option<&Value>)
     local_http(base, method, path, Some(token), body)
 }
 
-fn build(source: &Path, output: &Path, target: &str) {
+fn build(source: &Path, output: &Path, target: &str, ldflags: &str) {
     let version = Command::new("go")
         .arg("version")
         .output()
@@ -262,7 +266,7 @@ fn build(source: &Path, output: &Path, target: &str) {
             "build",
             "-trimpath",
             "-buildvcs=false",
-            "-ldflags=-buildid=",
+            &format!("-ldflags={ldflags}"),
             "-o",
         ])
         .arg(output)
@@ -408,7 +412,19 @@ fn local_real_peer_reads_are_zero_run_with_same_counter_positive_control() {
     let fixture_bytes = std::fs::read(&fixture_path).expect("Hyphae query fixture is required");
     let fixture: Value =
         serde_json::from_slice(&fixture_bytes).expect("Hyphae public query fixture JSON");
-    let lock = HyphaeLock::embedded().expect("embedded Hyphae lock");
+    let lock = ComponentLock::parse(agent24_comm::HYPHAE_LOCK_JSON).expect("embedded Hyphae lock");
+    let platform = current_platform();
+    let reproducible = lock
+        .reproducible
+        .as_ref()
+        .expect("lock has a reproducible recipe");
+    // The recipe's own -ldflags, verbatim (includes `-X main.version=<tag>`).
+    let ldflags = reproducible
+        .recipe
+        .split_once("-ldflags='")
+        .and_then(|(_, rest)| rest.split_once('\''))
+        .map(|(flags, _)| flags.to_owned())
+        .expect("recipe carries -ldflags='…'");
     let source_sha = Command::new("git")
         .args([
             "-C",
@@ -424,7 +440,7 @@ fn local_real_peer_reads_are_zero_run_with_same_counter_positive_control() {
     );
     assert_eq!(
         String::from_utf8_lossy(&source_sha.stdout).trim(),
-        lock.source_sha,
+        lock.source.commit,
         "Hyphae source must match embedded lock; use the lock-pinned local source revision"
     );
     assert_eq!(
@@ -437,11 +453,22 @@ fn local_real_peer_reads_are_zero_run_with_same_counter_positive_control() {
     let root = tempfile::tempdir().unwrap();
     let bin = root.path().join("hyphae");
     let relay_bin = root.path().join("hyphae-relay");
-    build(&source, &bin, "./cmd/hyphae");
-    build(&source, &relay_bin, "./cmd/hyphae-relay");
-    let hash = agent24_comm::binary::sha256_of(&std::fs::read(&bin).unwrap());
-    let expected = lock.expected_for(&current_platform()).unwrap();
-    assert_eq!(hash, expected, "built Hyphae must match embedded lock");
+    build(&source, &bin, "./cmd/hyphae", &ldflags);
+    build(&source, &relay_bin, "./cmd/hyphae-relay", "-buildid=");
+    let hash = agent24_comm::binary::sha256_of(&std::fs::read(&bin).unwrap()).to_hex();
+    assert_eq!(
+        hash, reproducible.unsigned_sha256[&platform],
+        "built Hyphae must reproduce the lock's unsigned digest"
+    );
+    let published = PathBuf::from(
+        std::env::var("HYPHAE_TEST_BIN")
+            .expect("HYPHAE_TEST_BIN (the published asset) is required"),
+    );
+    assert_eq!(
+        agent24_comm::binary::sha256_of(&std::fs::read(&published).unwrap()).to_hex(),
+        lock.asset_for(&platform).expect("lock asset").sha256,
+        "HYPHAE_TEST_BIN must be the published asset pinned in the lock"
+    );
 
     let samples = serde_json::from_str::<Value>(include_str!(
         "../../../crates/agent24-comm/tests/fixtures/comm_inbound_six.json"
@@ -494,7 +521,7 @@ for line in sys.stdin:
     std::fs::write(&mcp, script).unwrap();
     std::fs::write(home.path().join(".agent24/mcp.json"),serde_json::to_vec(&json!({"mcpServers":{"fixture":{"command":"python3","args":["-u",mcp.to_string_lossy(),model_url]}}})).unwrap()).unwrap();
     let daemon_home = home;
-    let (daemon, port, token) = spawn_agent24d(daemon_home, &model_url, &bin);
+    let (daemon, port, token) = spawn_agent24d(daemon_home, &model_url, &published);
     let base = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(30);
     while local_http(&base, "GET", "/api/v1/health", None, None).0 != 200 {

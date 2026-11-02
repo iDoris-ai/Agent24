@@ -181,39 +181,30 @@ fn platform_keys() {
     assert!(platform_key_from_triple("garbage").is_none());
 }
 
-const V1: &str = r#"{
-  "schema": 1, "tag": "v0.4.0", "commit": "20136552cac476ccf6f266a3210a1a021c717ea3",
-  "assets": { "aarch64-apple-darwin": { "name": "idoris-v0.4.0-aarch64-apple-darwin.tar.gz",
-    "sha256": "ab46e0180090ef5143b8fb6ea98b0333f2ef9c3a137bab2dc3cf7307960476d5", "files": ["idoris"] } },
-  "team_id": "HYAP444FN9", "contract_major": 1, "min_contract_minor": 1,
-  "tested_contract_version": "1.1.0",
-  "capabilities": [ { "id": "L1", "source": "x" } ],
-  "release_url_base": "https://github.com/iDoris-ai/iDoris/releases/download"
-}"#;
-
 #[test]
-fn schema1_is_readable_only_through_the_migration_helper() {
-    assert!(matches!(
-        ComponentLock::parse(V1),
-        Err(LockError::Schema(1))
-    ));
-    let lock = ComponentLock::migrate_schema1(
-        V1,
-        "idoris",
-        "idoris-http",
-        vec![],
-        Requires::default(),
-        &["idoris"],
-    )
-    .unwrap();
-    assert_eq!(lock.schema, 2);
-    assert_eq!(lock.version, "v0.4.0");
-    assert_eq!(lock.assets["darwin-arm64"].executables, ["idoris"]);
-    assert_eq!(lock.assurance[0].id, "L1");
-    assert_eq!(lock.signing.unwrap().macos_team_id, "HYAP444FN9");
-    // A schema-2 document is not a schema-1 document.
-    assert!(
-        ComponentLock::migrate_schema1(TEST_LOCK, "demo", "x", vec![], Requires::default(), &[])
-            .is_err()
+fn cli_major_minor_contract_versions_and_id_only_provides_parse() {
+    // Hyphae's published lock: `tested` is `major.minor`, provides carry ids only.
+    let mut value = set(
+        "/contract",
+        json!({ "name": "hyphae-cli", "major": 1, "min_minor": 0, "tested": "1.0" }),
     );
+    value["provides"] = json!([{ "id": "nostr-dm" }, { "id": "nostr-relay" }]);
+    let lock = parse(&value).unwrap();
+    assert!(
+        lock.provides
+            .iter()
+            .all(|p| p.name.is_none() && p.summary.is_none())
+    );
+    assert!(lock.accepts_contract("1.0") && lock.accepts_contract("1.3"));
+    assert!(lock.accepts_contract("1.3.0"));
+    for bad in [
+        "2.0", "0.9", "1", "1.0.0.0", "1.x", "01.0", "1.0-rc1", "+1.0", "1.0 ",
+    ] {
+        assert!(!lock.accepts_contract(bad), "{bad}");
+    }
+    let value = set("/contract/tested", json!("2.0"));
+    assert!(matches!(
+        parse(&value),
+        Err(LockError::Invalid("contract.tested"))
+    ));
 }
