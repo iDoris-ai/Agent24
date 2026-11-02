@@ -183,10 +183,17 @@ pub async fn install(
     let installed = lock.installed_path(state_dir);
     let install_dir = lock.install_dir(state_dir);
     // Reinstall is idempotent, but an existing binary is never trusted by name: it is
-    // re-hashed and goes through the full install-time signature check again.
+    // re-hashed and goes through the full install-time signature check again. As on a
+    // fresh install, a hashed copy that fails D2a is removed (the stable path is left
+    // for the next start's at-rest check to refuse and report).
     if tokio::fs::try_exists(&installed).await? {
-        VerifiedBinary::install(&installed, expected, &install_dir).await?;
-        verify_signature(lock, platform, &installed, verifier, VerifyMode::Install).await?;
+        let verified = VerifiedBinary::install(&installed, expected, &install_dir).await?;
+        if let Err(e) =
+            verify_signature(lock, platform, &installed, verifier, VerifyMode::Install).await
+        {
+            let _ = tokio::fs::remove_file(verified.path()).await;
+            return Err(e.into());
+        }
         return Ok(installed);
     }
     let archive = download_locked_asset(
@@ -423,6 +430,32 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(left, [".install.lock"], "no executable copy is left behind");
+        // #1551 L1: the reinstall branch (a stable path already exists) cleans up too.
+        std::fs::write(lock.installed_path(dir.path()), FIXTURE).unwrap();
+        let err = install(
+            &lock,
+            "darwin-arm64",
+            dir.path(),
+            &refuse,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            InstallError::Signature(SignError::SignatureMismatch)
+        ));
+        let mut left: Vec<_> = std::fs::read_dir(&install_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [".install.lock", "hyphae"],
+            "reinstall leaves no hashed copy behind either"
+        );
+        std::fs::remove_file(lock.installed_path(dir.path())).unwrap();
         // Linux: same fixture installs with sha256 only, no verifier call at all.
         let lock =
             HyphaeLock::override_for_test("linux-x64", agent24_comm::binary::sha256_of(FIXTURE));

@@ -45,6 +45,11 @@ pub enum InstallError {
     HardenedRuntimeMissing,
     #[error("Gatekeeper does not accept the executable as notarized")]
     NotNotarized,
+    /// `spctl` itself could not be run or did not finish (a deadline is usually a
+    /// network stall: the notarization lookup is online). Kept apart from [`Self::Io`],
+    /// which also covers a `codesign` that never ran, so callers can tell the two apart.
+    #[error("Gatekeeper assessment could not run: {0}")]
+    NotarizationCheckFailed(io::Error),
     #[error("component has no asset or verifier for this platform")]
     UnsupportedPlatform,
     #[error("component installation I/O failed: {0}")]

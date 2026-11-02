@@ -35,6 +35,8 @@ export type CommDaemonProcessState =
 export interface CommDaemonStatus {
   installable?: boolean
   installed_version?: string | null
+  /** Why the daemon refused the Hyphae binary at its last start (signature_rejected | hash_mismatch), or null. */
+  rejection?: string | null
   process: {
     state: CommDaemonProcessState
     generation: number
@@ -200,6 +202,7 @@ function isDaemonStatus(value: unknown): value is CommDaemonStatus {
   return (
     (value['installable'] === undefined || typeof value['installable'] === 'boolean') &&
     (value['installed_version'] === undefined || nullableString(value['installed_version'])) &&
+    (value['rejection'] === undefined || nullableString(value['rejection'])) &&
     string(process['state']) && states.includes(process['state']) &&
     typeof process['generation'] === 'number' && Number.isInteger(process['generation']) &&
     typeof process['consecutive_failures'] === 'number' && Number.isInteger(process['consecutive_failures']) &&

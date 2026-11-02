@@ -264,7 +264,8 @@ impl<R: CommandRunner> SignatureVerifier for CodesignWith<R> {
             let kind = if deep { "execute" } else { "install" };
             let verdict = self
                 .0
-                .run(SPCTL, &["--assess", "--type", kind, "-vv", &path])?;
+                .run(SPCTL, &["--assess", "--type", kind, "-vv", &path])
+                .map_err(InstallError::NotarizationCheckFailed)?;
             if !(verdict.success && notarized_verdict(&verdict.stderr)) {
                 return Err(InstallError::NotNotarized);
             }

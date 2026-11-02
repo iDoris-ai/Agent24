@@ -1623,7 +1623,7 @@ export interface paths {
         };
         /**
          * Hyphae daemon status (process, relay probe, catch-up)
-         * @description Always returns 200 when comm is not configured, with process.state not_configured. data.installable indicates a platform the lock has an asset for. data.installed_version is the component tag (v0.30.0) after full hash revalidation, or null when absent or rejected. Developer and sibling binaries do not count as installed components.
+         * @description Always returns 200 when comm is not configured, with process.state not_configured. data.installable indicates a platform the lock has an asset for. data.installed_version is the component tag (v0.30.0) after full hash revalidation, or null when absent or rejected. Developer and sibling binaries do not count as installed components. data.rejection (see HyphaeRejection) is always present: why the last start or install rebuild refused the Hyphae binary it found (signature_rejected: the at-rest code-signature check failed; hash_mismatch: the SHA-256 differs from the lock), or null when nothing was refused (including when nothing is installed). It is cleared by the next start or rebuild that does not refuse a binary.
          */
         get: operations["getCommDaemon"];
         put?: never;
@@ -2288,6 +2288,11 @@ export interface components {
         AttachedList: {
             modules: components["schemas"]["AttachedView"][];
         };
+        /**
+         * @description Why agent24d refused the Hyphae binary at its last start or install rebuild: signature_rejected (D2a at-rest check: Developer ID requirement, Team ID, Hardened Runtime, or the checker could not run) or hash_mismatch (SHA-256 differs from the lock). Null when nothing was refused. Exposed as GET /comm/daemon data.rejection and, host view only, as the hyphae item's reason (state failed) in GET /components.
+         * @enum {string|null}
+         */
+        HyphaeRejection: "signature_rejected" | "hash_mismatch" | null;
         /** @enum {string} */
         ComponentState: "absent" | "installing" | "installed" | "starting" | "ready" | "degraded" | "stopping" | "stopped" | "incompatible" | "failed";
         ComponentProvide: {
@@ -2308,7 +2313,7 @@ export interface components {
             /** @enum {string} */
             form: "resident" | "sidecar" | "cli" | "attach" | "remote" | "mcp";
             provides: components["schemas"]["ComponentProvide"][];
-            /** @description Short machine-readable cause; host only */
+            /** @description Short machine-readable cause; host only. For hyphae with state failed this includes signature_rejected and hash_mismatch (see HyphaeRejection); a Hyphae that is simply not installed is state absent with no reason. */
             reason?: string;
             /** @description Ports, contract expectation, counters, messages; host only */
             detail?: {
@@ -3698,6 +3703,17 @@ export interface components {
             /** @constant */
             ok: true;
             data: unknown;
+        };
+        /** @description GET /comm/daemon: the Hyphae daemon status (`process`, `relay_probe`, `catch_up`) with the fields agent24d adds about the installed component. */
+        CommDaemonOk: components["schemas"]["CommOk"] & {
+            data?: {
+                installable: boolean;
+                /** @example v0.30.0 */
+                installed_version: string | null;
+                rejection: components["schemas"]["HyphaeRejection"];
+            } & {
+                [key: string]: unknown;
+            };
         };
         CommGroup: {
             group_id: string;
@@ -7464,13 +7480,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Hyphae envelope `{ok:true,data}` */
+            /** @description Hyphae envelope `{ok:true,data}` plus agent24d's component fields */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["CommOk"];
+                    "application/json": components["schemas"]["CommDaemonOk"];
                 };
             };
             409: components["responses"]["CommConflict"];

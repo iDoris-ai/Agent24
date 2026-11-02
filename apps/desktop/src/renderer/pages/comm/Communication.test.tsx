@@ -112,6 +112,24 @@ describe('CommunicationPage', () => {
     expect(screen.queryByText(/raw daemon text/)).not.toBeInTheDocument()
   })
 
+  it.each([
+    ['signature_rejected', '已拒绝：Hyphae 的代码签名未通过校验，未启动'],
+    ['hash_mismatch', '已拒绝：Hyphae 文件与锁定版本不符，未启动'],
+  ])('names a binary the daemon refused at start (%s) instead of a bare "failed"', async (reason, text) => {
+    success()
+    for (const fn of [listCommIdentities, listCommContacts, listCommRelays]) {
+      vi.mocked(fn).mockRejectedValue(new CommApiError('Hyphae signature verification failed', 503, 'binary_rejected'))
+    }
+    vi.mocked(getCommStatus).mockResolvedValue({
+      ...status, installable: true, installed_version: null, rejection: reason,
+      process: { ...status.process, state: 'not_configured', reason: 'binary_rejected' },
+    })
+    hyphaeBox.component = { ...readyHyphae, version: null, state: 'failed', reason }
+    render(<CommunicationPage />)
+    expect(await screen.findByText(text)).toBeInTheDocument()
+    expect(screen.queryByText('故障')).not.toBeInTheDocument()
+  })
+
   it('renders identities, contacts, relay source, and independent status dimensions', async () => {
     success()
     render(<CommunicationPage />)

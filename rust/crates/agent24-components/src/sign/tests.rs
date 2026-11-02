@@ -194,6 +194,32 @@ mod macos {
     }
 
     #[test]
+    fn a_tool_that_never_ran_says_which_tool() {
+        // spctl that cannot finish: the Gatekeeper phase, not a codesign failure.
+        let fake = Fake::new(|p, a| {
+            if p == SPCTL {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "spctl deadline"))
+            } else {
+                healthy(p, a)
+            }
+        });
+        assert!(matches!(
+            run(&fake, &REQ),
+            Err(InstallError::NotarizationCheckFailed(e)) if e.kind() == io::ErrorKind::TimedOut
+        ));
+        // codesign that cannot be spawned stays plain I/O, and Gatekeeper is never asked.
+        let fake = Fake::new(|p, a| {
+            if p == CODESIGN {
+                Err(io::Error::new(io::ErrorKind::NotFound, "no codesign"))
+            } else {
+                healthy(p, a)
+            }
+        });
+        assert!(matches!(run(&fake, &REQ), Err(InstallError::Io(_))));
+        assert!(fake.calls.borrow().iter().all(|(p, _)| p != SPCTL));
+    }
+
+    #[test]
     fn notarization_needs_the_verdict_text_not_just_exit_zero() {
         for text in [
             "",
