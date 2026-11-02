@@ -5,7 +5,8 @@ use agent24_idoris::{
     IdorisLock,
     download::VerifiedArchive,
     install::{
-        InstallError, InstallOptions, SignatureVerifier, install_locked_asset as install_async,
+        InstallError, InstallOptions, SignatureVerifier, SigningRequirement,
+        install_locked_asset as install_async,
     },
 };
 use flate2::{Compression, write::GzEncoder};
@@ -41,8 +42,8 @@ fn install_locked_asset(
 const TRIPLE: &str = "aarch64-apple-darwin";
 struct Signature(bool);
 impl SignatureVerifier for Signature {
-    fn verify(&self, _: &Path, team: &str) -> Result<(), InstallError> {
-        assert_eq!(team, "HYAP444FN9");
+    fn verify(&self, _: &Path, required: &SigningRequirement) -> Result<(), InstallError> {
+        assert_eq!(required.team_id, "HYAP444FN9");
         if self.0 {
             Ok(())
         } else {
@@ -101,14 +102,14 @@ impl Fixture {
         }
     }
     fn install(&self, signature: bool) -> Result<std::path::PathBuf, InstallError> {
-        install_locked_asset(
-            &self.lock,
-            TRIPLE,
-            &self.archive,
-            &self.opts,
-            Signature(signature),
-        )
-        .map(|installed| installed.directory().to_owned())
+        self.install_with(Signature(signature))
+    }
+    fn install_with(
+        &self,
+        signature: impl SignatureVerifier + Send + 'static,
+    ) -> Result<std::path::PathBuf, InstallError> {
+        install_locked_asset(&self.lock, TRIPLE, &self.archive, &self.opts, signature)
+            .map(|installed| installed.directory().to_owned())
     }
     fn clean(&self) {
         assert!(!self.opts.root.join("0.4.0").exists());
@@ -137,14 +138,30 @@ fn append<W: io::Write>(tar: &mut tar::Builder<W>, name: &str, kind: u8, size: u
 }
 
 #[test]
+fn state_dirs_are_created_private_and_apart_from_releases() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("state");
+    agent24_idoris::install::prepare_state_dirs(&root).unwrap();
+    for name in ["", "data", "instances"] {
+        assert_eq!(
+            fs::metadata(root.join(name)).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+    }
+    // Idempotent, and an install root never grows state directories.
+    agent24_idoris::install::prepare_state_dirs(&root).unwrap();
+    let f = Fixture::new(None);
+    f.install(true).unwrap();
+    assert!(!f.opts.root.join("data").exists() && !f.opts.root.join("instances").exists());
+}
+
+#[test]
 fn success_permissions_and_existing_version_reverification() {
     let f = Fixture::new(None);
     let installed = f.install(true).unwrap();
     for (path, mode) in [
         ("", 0o700),
         ("0.4.0", 0o700),
-        ("data", 0o700),
-        ("instances", 0o700),
         ("0.4.0/config", 0o700),
         ("0.4.0/config/components", 0o700),
         ("0.4.0/idoris", 0o500),
@@ -265,6 +282,87 @@ fn signature_failure_rolls_back_new_but_preserves_existing_version() {
     assert!(installed.exists());
 }
 
+/// Verifier that records whether the final version directory exists while it runs.
+struct WatchesFinalDir {
+    final_dir: std::path::PathBuf,
+    saw_final: std::sync::Mutex<Vec<bool>>,
+}
+impl SignatureVerifier for WatchesFinalDir {
+    fn verify(&self, _: &Path, _: &SigningRequirement) -> Result<(), InstallError> {
+        self.saw_final.lock().unwrap().push(self.final_dir.exists());
+        Err(InstallError::SignatureMismatch)
+    }
+}
+
+#[test]
+fn a_failing_signature_never_creates_the_final_directory() {
+    let f = Fixture::new(None);
+    let watcher = std::sync::Arc::new(WatchesFinalDir {
+        final_dir: f.opts.root.join("0.4.0"),
+        saw_final: Default::default(),
+    });
+    struct Shared(std::sync::Arc<WatchesFinalDir>);
+    impl SignatureVerifier for Shared {
+        fn verify(&self, p: &Path, r: &SigningRequirement) -> Result<(), InstallError> {
+            self.0.verify(p, r)
+        }
+    }
+    let result = f.install_with(Shared(watcher.clone()));
+    assert!(matches!(result, Err(InstallError::SignatureMismatch)));
+    // Verified once, inside staging, before the rename: no final directory then or after.
+    assert_eq!(*watcher.saw_final.lock().unwrap(), [false]);
+    assert!(!f.opts.root.join("0.4.0").exists());
+    f.clean();
+}
+
+/// Passes the first verification (in staging), fails the second (after the rename).
+struct FailsAfterRename {
+    calls: std::sync::atomic::AtomicUsize,
+}
+impl SignatureVerifier for FailsAfterRename {
+    fn verify(&self, _: &Path, _: &SigningRequirement) -> Result<(), InstallError> {
+        // One call per executable; iDoris lists one, so call 0 is staging, call 1 is final.
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            Ok(())
+        } else {
+            Err(InstallError::SignatureMismatch)
+        }
+    }
+}
+
+#[test]
+fn a_signature_that_fails_after_the_rename_rolls_the_install_back() {
+    let f = Fixture::new(None);
+    let result = f.install_with(FailsAfterRename {
+        calls: Default::default(),
+    });
+    assert!(matches!(result, Err(InstallError::SignatureMismatch)));
+    f.clean(); // the renamed version directory is gone and no staging is left
+}
+
+/// Gatekeeper unreachable: any demand for a notarization verdict fails.
+struct OfflineGatekeeper;
+impl SignatureVerifier for OfflineGatekeeper {
+    fn verify(&self, _: &Path, required: &SigningRequirement) -> Result<(), InstallError> {
+        if required.notarized {
+            Err(InstallError::NotNotarized)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn install_demands_notarization_and_rejects_when_gatekeeper_is_unreachable() {
+    let f = Fixture::new(None);
+    assert!(f.lock.component_notarized());
+    assert!(matches!(
+        f.install_with(OfflineGatekeeper),
+        Err(InstallError::NotNotarized)
+    ));
+    f.clean();
+}
+
 #[test]
 fn child_failure_cleans_staging() {
     let mut f = Fixture::new(None);
@@ -316,14 +414,14 @@ async fn real_v0_4_0_download_install_and_l6() {
     let archive = download_locked_asset(
         lock,
         TRIPLE,
-        &dir.path().join("idoris/cache"),
+        &dir.path().join("components/idoris/cache"),
         &DownloadOptions::default(),
         &CancellationToken::new(),
     )
     .await
     .unwrap();
     let opts = InstallOptions::new(
-        dir.path().join("idoris"),
+        dir.path().join("components/idoris"),
         env!("CARGO_BIN_EXE_idoris-install-child"),
     );
     let installed = install_async(
@@ -336,7 +434,15 @@ async fn real_v0_4_0_download_install_and_l6() {
     )
     .await
     .unwrap();
-    Codesign.verify(&installed.binary(), &lock.team_id).unwrap();
+    Codesign
+        .verify(
+            &installed.binary(),
+            &SigningRequirement {
+                team_id: &lock.team_id,
+                notarized: true,
+            },
+        )
+        .unwrap();
     let again = install_async(
         lock,
         TRIPLE,
@@ -482,7 +588,7 @@ fn unsupported_platform_fails_before_creating_install_root() {
         fn check_platform(&self) -> Result<(), InstallError> {
             Err(InstallError::UnsupportedPlatform)
         }
-        fn verify(&self, _: &Path, _: &str) -> Result<(), InstallError> {
+        fn verify(&self, _: &Path, _: &SigningRequirement) -> Result<(), InstallError> {
             panic!("must not run");
         }
     }
@@ -502,7 +608,7 @@ fn concurrent_second_installer_gets_busy() {
         release: mpsc::Receiver<()>,
     }
     impl SignatureVerifier for BlockingSignature {
-        fn verify(&self, _: &Path, _: &str) -> Result<(), InstallError> {
+        fn verify(&self, _: &Path, _: &SigningRequirement) -> Result<(), InstallError> {
             self.ready.send(()).unwrap();
             self.release.recv_timeout(Duration::from_secs(10)).unwrap();
             Ok(())
@@ -526,6 +632,8 @@ fn concurrent_second_installer_gets_busy() {
         });
         ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let second = f.install(true);
+        // Verification runs twice per install: in staging, then at the final path.
+        release_tx.send(()).unwrap();
         release_tx.send(()).unwrap();
         assert!(matches!(second, Err(InstallError::Busy)));
         first.join().unwrap().unwrap();

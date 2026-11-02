@@ -1,17 +1,31 @@
-//! Component downloads reuse iDoris's reviewed downloader, including its managed
-//! directory checks, operation lock, cancellation and progress reporting.
+//! Generic component machinery (ADR-038 C1): the schema-2 `ComponentLock`, the
+//! pinned-release downloader, the immutable installer with its hidden-subcommand
+//! writer process, and D2a signature verification. Component crates (agent24-idoris,
+//! later others) depend on this crate, never the other way round.
+//!
+//! C3 plugs the component state machine (`installing -> installed`) in at
+//! `install::verify_signatures`'s call sites; nothing here reports state yet.
 
-pub use agent24_idoris::download::{
-    DownloadError, DownloadOptions, DownloadProgress, MAX_ARCHIVE_BYTES, RELEASE_HOSTS,
-    VerifiedArchive,
-};
-use agent24_idoris::{IdorisLock, LockedAsset, download::download_locked_asset};
+pub mod download;
+pub mod install;
+pub mod lock;
+pub mod sign;
+pub mod storage;
+
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
-/// Fetch a pinned release asset using the fixed GitHub host policy. The cache
-/// must live inside an `idoris` tree so the existing installation lock and
-/// directory checks apply. This adapter does not install an iDoris launcher.
+pub use download::{
+    DownloadError, DownloadOptions, DownloadProgress, MAX_ARCHIVE_BYTES, PinnedAsset,
+    RELEASE_HOSTS, VerifiedArchive, download_locked_asset, download_pinned,
+};
+pub use install::run_install_child;
+pub use lock::{ComponentLock, LockError};
+
+/// Fetch a pinned release asset using the fixed GitHub host policy, for callers
+/// that carry their own digest instead of a `ComponentLock` (Hyphae, schema 1,
+/// until C1b). The cache must live below a managed `components/<id>/` root, which
+/// supplies the per-component operation lock and the directory checks.
 /// URLs must end in `/<tag>/<file_name>`; digests come from the caller's lock.
 pub async fn fetch_verified(
     url: &str,
@@ -24,28 +38,24 @@ pub async fn fetch_verified(
     let (prefix, url_name) = url
         .rsplit_once('/')
         .ok_or(DownloadError::Network("invalid locked URL"))?;
-    let (base, tag) = prefix
+    prefix
         .rsplit_once('/')
         .filter(|(_, tag)| !tag.is_empty())
         .ok_or(DownloadError::Network("invalid locked URL"))?;
     if url_name != file_name {
         return Err(DownloadError::Network("locked asset name differs from URL"));
     }
-    // Only these release fields are read by download_locked_asset. Preserve
-    // its API and implementation rather than splitting its security boundary.
-    let mut lock = IdorisLock::embedded().clone();
-    lock.release_url_base = base.into();
-    lock.tag = tag.into();
-    lock.assets.clear();
-    lock.assets.insert(
-        "component".into(),
-        LockedAsset {
+    download_pinned(
+        &PinnedAsset {
+            url: url.into(),
             name: file_name.into(),
             sha256: expected_sha256.into(),
-            files: Vec::new(),
         },
-    );
-    download_locked_asset(&lock, "component", cache_dir, limits, cancel).await
+        cache_dir,
+        limits,
+        cancel,
+    )
+    .await
 }
 
 #[cfg(test)]

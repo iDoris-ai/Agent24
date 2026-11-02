@@ -4,7 +4,7 @@ import { IdorisError, parseOperation, parseStatus, type IdorisOperation, type Id
 const verification = { model_id: 'model', record_id: 'record', locality: 'loopback', verified_at: '2026-10-28T12:00:00Z' } satisfies NonNullable<IdorisStatus['verification']>
 const status = {
   state: 'not_configured', version: '0.4.0', data_port: 9011, admin_port: 9012,
-  roles: [], last_error: null, current_operation: null, verification,
+  roles: [], last_error: null, migration_pending: false, last_migration_error: null, current_operation: null, verification,
   budget_suggestion: { core_reserved_bytes: 123, idoris_budget_bytes: 456 }, budget_unavailable_reason: null,
 } satisfies IdorisStatus
 const operation = {
