@@ -5,6 +5,11 @@ import { useCapabilityRoute } from '../../capabilities/providers'
 import { useT } from '../../i18n'
 import { settingsMessages } from '../Settings.i18n'
 
+// Route objects whose slot-row landing has already run. The route object only changes
+// on navigate/open, so a Settings tab switch (which remounts this component) sees the
+// same object and does not replay the highlight.
+const landedRoutes = new WeakSet<object>()
+
 /** Pinned-slot count, pin order, and the Overview switch. Writes go through
  *  `NavPrefsContext.setPrefs`; ids that call returns are the unpin notice. */
 export function SidebarPrefs() {
@@ -24,8 +29,11 @@ export function SidebarPrefs() {
   const hasRoom = pinnedCount < prefs.slotCount
 
   // Momentary landmark keyed by route.key: clear after ~2s, or on the first stepper click.
+  // Each route.key lands once: switching Settings tabs remounts this component with the
+  // same key, which must not replay the highlight or pull focus back.
   useEffect(() => {
-    if (!focusSlots || focusKey === undefined) return
+    if (!focusSlots || focusKey === undefined || landedRoutes.has(route)) return
+    landedRoutes.add(route)
     setHighlightedKey(focusKey)
     const row = slotsRowRef.current
     row?.scrollIntoView?.({ block: 'nearest' })
@@ -34,7 +42,7 @@ export function SidebarPrefs() {
       setHighlightedKey(current => (current === focusKey ? undefined : current))
     }, 2000)
     return () => clearTimeout(timer)
-  }, [focusSlots, focusKey])
+  }, [focusSlots, focusKey, route])
 
   function nameFor(id: CapabilityId) {
     const def = defs.find(d => d.id === id)

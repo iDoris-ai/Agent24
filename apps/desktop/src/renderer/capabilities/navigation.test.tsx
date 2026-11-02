@@ -131,6 +131,30 @@ describe('capability routing', () => {
     }
   })
 
+  it('does not replay the pinned-slots landing when the row remounts with the same route', async () => {
+    const scroll = vi.spyOn(HTMLElement.prototype, 'scrollIntoView').mockImplementation(() => {})
+    function Pages({ showPrefs }: { showPrefs: boolean }) {
+      const { open } = useContext(CapabilitiesContext)
+      return <>
+        <CapabilitiesPage onOpenSettings={() => open('settings/general', 'capabilities', { focus: 'slots' })} />
+        {showPrefs && <SidebarPrefs />}
+      </>
+    }
+    window.agent24 = { backendProxy: vi.fn().mockResolvedValue({ ok: false }) } as unknown as Window['agent24']
+    const view = render(<CapabilitiesProvider><Pages showPrefs /></CapabilitiesProvider>)
+    try {
+      fireEvent.click(screen.getByRole('link', { name: 'Settings › General' }))
+      expect(document.getElementById('settings-pinned-slots')).toHaveAttribute('data-highlighted', 'true')
+      // Switching Settings tabs unmounts and remounts the row under the same route.
+      view.rerender(<CapabilitiesProvider><Pages showPrefs={false} /></CapabilitiesProvider>)
+      view.rerender(<CapabilitiesProvider><Pages showPrefs /></CapabilitiesProvider>)
+      expect(document.getElementById('settings-pinned-slots')).not.toHaveAttribute('data-highlighted')
+    } finally {
+      scroll.mockRestore()
+      view.unmount()
+    }
+  })
+
   it('polls manifests through backendProxy, lists dynamic UI in domainOs and never auto-pins it', async () => {
     const backendProxy = vi.fn().mockImplementation(({ path }: { path: string }) => Promise.resolve({ ok: true, data:
       path === '/api/modules' ? [{ id: 'hello', type: 'ui', enabled: true, name: 'Hello' }] : { approvals: [{}, {}] },
