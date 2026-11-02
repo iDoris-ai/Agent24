@@ -57,6 +57,21 @@ struct Provision {
     no_key: AtomicBool,
     key_waiting: AtomicBool,
     budget_unavailable: AtomicBool,
+    fail_install: AtomicBool,
+    install_roots: SyncMutex<Vec<PathBuf>>,
+}
+fn copy_release(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_release(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+    mode(to, 0o700);
 }
 #[async_trait]
 impl Provisioner for Provision {
@@ -112,10 +127,24 @@ impl Provisioner for Provision {
     }
     async fn install(
         &self,
-        _: &Path,
+        root: &Path,
         _: &VerifiedArchive,
         _: &CancellationToken,
     ) -> Result<InstalledVersion, Code> {
+        self.install_roots.lock().unwrap().push(root.to_owned());
+        if self.fail_install.load(Ordering::SeqCst) {
+            return Err(Code::NotInstalled);
+        }
+        // A managed root other than the fixture's own receives a fresh copy, like a real install.
+        if Some(root) != self.record.release_dir.parent() {
+            let release = root.join("v0.4.0");
+            copy_release(&self.record.release_dir, &release);
+            let record = Installation {
+                release_dir: release,
+                ..self.record.clone()
+            };
+            return self.verify(&record).await;
+        }
         self.verify(&self.record).await
     }
     async fn upstream_key(&self) -> Result<Option<ApiKey>, Code> {
@@ -162,6 +191,8 @@ impl ConnectedFixture {
             no_key: AtomicBool::new(false),
             key_waiting: AtomicBool::new(false),
             budget_unavailable: AtomicBool::new(false),
+            fail_install: AtomicBool::new(false),
+            install_roots: SyncMutex::new(Vec::new()),
         });
         let data = Arc::new(Store::default());
         let upstream = Arc::new(Store::default());
@@ -1342,4 +1373,75 @@ async fn keychain_lock_before_verification_retains_code_and_compensates() {
     assert!(x.data.entries.lock().unwrap().is_empty());
     x.f.assert_clean();
     x.assert_safe();
+}
+
+/// ADR-038 D1 migration: a receipt pointing at the legacy tree keeps working until
+/// a new copy under the managed root has verified.
+async fn legacy_fixture() -> (ConnectedFixture, PathBuf) {
+    let mut x = ConnectedFixture::new().await;
+    let managed = x.f.host.root.join("managed");
+    Arc::get_mut(&mut x.f.host).unwrap().install_root = managed.clone();
+    x.f.install().await; // receipt points at <root>/release: the legacy location
+    (x, managed)
+}
+
+#[tokio::test]
+async fn legacy_install_is_redownloaded_into_the_managed_root_and_marked_deletable() {
+    let (x, managed) = legacy_fixture().await;
+    let legacy = x.f.record.release_dir.clone();
+    let op =
+        x.f.host
+            .install(InstallRequest { consent: true }, Some("migrate-1"))
+            .await
+            .unwrap();
+    assert_eq!(x.f.complete(&op).await.result, Some(Outcome::Succeeded));
+    // Downloaded and installed under the managed root, never the legacy one.
+    assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *x.provision.install_roots.lock().unwrap(),
+        std::slice::from_ref(&managed)
+    );
+    let record = x.f.host.inner.lock().await.installation.clone().unwrap();
+    assert_eq!(record.release_dir, managed.join("v0.4.0"));
+    let saved: Installation =
+        serde_json::from_slice(&fs::read(x.f.host.root.join("installation.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved.release_dir, record.release_dir);
+    // The old tree is untouched and only *marked* deletable.
+    assert!(legacy.join("idoris").exists());
+    let marker: serde_json::Value = serde_json::from_slice(
+        &fs::read(x.f.host.root.join("legacy-install.deletable.json")).unwrap(),
+    )
+    .unwrap();
+    let paths = marker["paths"].as_array().unwrap();
+    assert!(paths.contains(&json!(legacy)) && paths.len() == 2);
+    // Once migrated, a further install is a no-op verification.
+    let again =
+        x.f.host
+            .install(InstallRequest { consent: true }, Some("migrate-2"))
+            .await
+            .unwrap();
+    assert_eq!(x.f.complete(&again).await.result, Some(Outcome::Succeeded));
+    assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn failed_migration_keeps_the_working_legacy_install() {
+    let (x, managed) = legacy_fixture().await;
+    x.provision.fail_install.store(true, Ordering::SeqCst);
+    let op =
+        x.f.host
+            .install(InstallRequest { consent: true }, Some("migrate-fail"))
+            .await
+            .unwrap();
+    assert_eq!(x.f.complete(&op).await.result, Some(Outcome::Succeeded));
+    assert_eq!(x.provision.install_roots.lock().unwrap().len(), 1);
+    let record = x.f.host.inner.lock().await.installation.clone().unwrap();
+    assert_eq!(
+        record.release_dir, x.f.record.release_dir,
+        "receipt must still name the legacy copy"
+    );
+    assert!(!x.f.host.root.join("legacy-install.deletable.json").exists());
+    assert!(!managed.join("v0.4.0").exists());
+    assert!(x.f.host.status().await.last_error.is_none());
 }

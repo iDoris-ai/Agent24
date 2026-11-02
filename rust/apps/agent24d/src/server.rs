@@ -1893,6 +1893,12 @@ pub async fn serve(
     let shutdown = Shutdown::with_params(cancel.clone(), params);
     let idoris_root =
         agent24_idoris::install::default_install_root().map_err(std::io::Error::other)?;
+    // ADR-038 D1: releases live under <data dir>/components/idoris; the legacy
+    // root above keeps only state and any not-yet-migrated release.
+    let idoris_install_root = agent24_idoris::install::managed_root(
+        &agent24_protocol::state_file::state_dir()
+            .ok_or_else(|| std::io::Error::other("data directory is unavailable"))?,
+    );
     if !ephemeral {
         shutdown
             .idoris_budget
@@ -2088,6 +2094,7 @@ pub async fn serve(
     let mut idoris_host = if let Some(managed) = &managed_idoris {
         match agent24d::idoris_host::IdorisHost::system(
             idoris_root,
+            idoris_install_root,
             managed.clone(),
             router.clone(),
         ) {

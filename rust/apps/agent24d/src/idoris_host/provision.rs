@@ -84,6 +84,10 @@ pub trait Provisioner: Send + Sync {
         cancel: &CancellationToken,
     ) -> Result<InstalledVersion, Code>;
     async fn verify(&self, record: &Installation) -> Result<InstalledVersion, Code>;
+    /// Create the state directories (`data/`, `instances/`) below the state root.
+    async fn prepare_state(&self, _root: &Path) -> Result<(), Code> {
+        Ok(())
+    }
     async fn upstream_key(&self) -> Result<Option<ApiKey>, Code>;
     async fn budget(&self, core: Option<u64>) -> Result<SetupBudget, Code>;
 }
@@ -132,6 +136,13 @@ impl Provisioner for SystemProvisioner {
         )
         .await
         .map_err(install_code)
+    }
+    async fn prepare_state(&self, root: &Path) -> Result<(), Code> {
+        let root = root.to_owned();
+        tokio::task::spawn_blocking(move || agent24_idoris::install::prepare_state_dirs(&root))
+            .await
+            .map_err(|_| Code::NotInstalled)?
+            .map_err(install_code)
     }
     async fn verify(&self, r: &Installation) -> Result<InstalledVersion, Code> {
         let r = r.clone();
@@ -383,6 +394,10 @@ impl IdorisHost {
     async fn execute_install(&self, id: &str, cancel: &CancellationToken) -> Result<(), Code> {
         let old = self.inner.lock().await.installation.clone();
         self.phase(id, Phase::Verifying).await;
+        // ADR-038 D1: releases live under the managed root. A receipt that still
+        // points at the legacy tree is migrated by re-downloading (never moved);
+        // the legacy copy keeps serving until the new one has verified.
+        let mut migrating = false;
         if let Some(old) = &old {
             let valid = tokio::select! {
                 biased;
@@ -390,15 +405,57 @@ impl IdorisHost {
                 verified = self.provisioner.verify(old) => verified.is_ok(),
             };
             if valid {
-                return Ok(());
+                if old.release_dir.starts_with(&self.install_root) {
+                    return Ok(());
+                }
+                migrating = true;
             }
         }
+        let result = self.download_and_install(id, old.clone(), cancel).await;
+        match result {
+            // A failed migration must not turn a working legacy install into a failed one.
+            Err(code) if migrating && code != Code::Cancelled => {
+                tracing::warn!(
+                    ?code,
+                    "iDoris managed-root migration failed; legacy install kept"
+                );
+                Ok(())
+            }
+            Ok(()) if migrating => {
+                if let Some(old) = &old {
+                    self.mark_legacy_deletable(old);
+                }
+                Ok(())
+            }
+            other => other,
+        }
+    }
+    /// Record the superseded legacy paths without deleting anything (`agent24 idoris gc`
+    /// is the only thing that may remove them). Best effort: the marker is advisory.
+    fn mark_legacy_deletable(&self, old: &Installation) {
+        let paths: Vec<_> = [&old.release_dir, &old.archive_path]
+            .into_iter()
+            .filter(|p| !p.starts_with(&self.install_root))
+            .collect();
+        let _ = write_json(
+            &self.root.join("legacy-install.deletable.json"),
+            &serde_json::json!({"schema": 1, "superseded_by": self.install_root, "paths": paths}),
+        );
+    }
+    async fn download_and_install(
+        &self,
+        id: &str,
+        old: Option<Installation>,
+        cancel: &CancellationToken,
+    ) -> Result<(), Code> {
         check_cancel(cancel)?;
         self.phase(id, Phase::Downloading).await;
         let (sender, mut progress) = watch::channel(DownloadProgress::default());
         self.download_progress(id, DownloadProgress::default())
             .await;
-        let download = self.provisioner.download(&self.root, cancel, sender);
+        let download = self
+            .provisioner
+            .download(&self.install_root, cancel, sender);
         tokio::pin!(download);
         let mut progress_open = true;
         let archive = loop {
@@ -423,8 +480,9 @@ impl IdorisHost {
         self.phase(id, Phase::Installing).await;
         let installed = self
             .provisioner
-            .install(&self.root, &archive, cancel)
+            .install(&self.install_root, &archive, cancel)
             .await?;
+        self.provisioner.prepare_state(&self.root).await?;
         check_cancel(cancel)?;
         let record = old.unwrap_or(Installation {
             version: IdorisLock::embedded().tag.trim_start_matches('v').into(),

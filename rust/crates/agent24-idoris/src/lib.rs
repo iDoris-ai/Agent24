@@ -105,25 +105,6 @@ impl IdorisLock {
     }
 
     pub fn parse(json: &str) -> Result<Self, LockError> {
-        // C1a: the shipped lock is still schema 1, read through the migration helper.
-        // C1b' switches the file to schema 2 and removes this branch.
-        if matches!(
-            ComponentLock::parse(json),
-            Err(ComponentLockError::Schema(1))
-        ) {
-            let component = ComponentLock::migrate_schema1(
-                json,
-                "idoris",
-                "idoris-http",
-                Vec::new(),
-                Default::default(),
-                &["idoris"],
-            )
-            .map_err(LockError::Component)?;
-            let mut lock = Self::from_component(component)?;
-            lock.schema = 1;
-            return Ok(lock);
-        }
         let component = ComponentLock::parse(json).map_err(|e| match e {
             ComponentLockError::Json(e) => LockError::Json(e),
             other => LockError::Component(other),

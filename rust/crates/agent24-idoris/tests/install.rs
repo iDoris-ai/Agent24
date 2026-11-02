@@ -138,14 +138,30 @@ fn append<W: io::Write>(tar: &mut tar::Builder<W>, name: &str, kind: u8, size: u
 }
 
 #[test]
+fn state_dirs_are_created_private_and_apart_from_releases() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("state");
+    agent24_idoris::install::prepare_state_dirs(&root).unwrap();
+    for name in ["", "data", "instances"] {
+        assert_eq!(
+            fs::metadata(root.join(name)).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+    }
+    // Idempotent, and an install root never grows state directories.
+    agent24_idoris::install::prepare_state_dirs(&root).unwrap();
+    let f = Fixture::new(None);
+    f.install(true).unwrap();
+    assert!(!f.opts.root.join("data").exists() && !f.opts.root.join("instances").exists());
+}
+
+#[test]
 fn success_permissions_and_existing_version_reverification() {
     let f = Fixture::new(None);
     let installed = f.install(true).unwrap();
     for (path, mode) in [
         ("", 0o700),
         ("0.4.0", 0o700),
-        ("data", 0o700),
-        ("instances", 0o700),
         ("0.4.0/config", 0o700),
         ("0.4.0/config/components", 0o700),
         ("0.4.0/idoris", 0o500),

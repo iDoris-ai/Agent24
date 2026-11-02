@@ -51,9 +51,6 @@ pub async fn install_locked_asset(
     cancel: &CancellationToken,
 ) -> Result<InstalledVersion, InstallError> {
     let platform = platform_of(triple).ok_or(InstallError::UnsupportedPlatform)?;
-    // C1a: releases still live in the state root, so it still gets its state dirs.
-    signature.check_platform()?;
-    prepare_state_dirs(&opts.root)?;
     agent24_components::install::install_locked_asset(
         &lock.to_component(),
         platform,

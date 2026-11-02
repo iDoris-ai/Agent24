@@ -208,7 +208,13 @@ mod tests {
             ManagedIdoris::new(state.router.clone(), temp.path().join("connection.json")).unwrap(),
         );
         state.idoris_host = Some(
-            IdorisHost::system(temp.path().to_path_buf(), managed, state.router.clone()).unwrap(),
+            IdorisHost::system(
+                temp.path().to_path_buf(),
+                temp.path().to_path_buf(),
+                managed,
+                state.router.clone(),
+            )
+            .unwrap(),
         );
         let app = crate::server::build_router(state);
         for (path, body, expected, code) in [

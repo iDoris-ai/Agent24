@@ -487,7 +487,11 @@ struct Inner {
     closing: bool,
 }
 pub struct IdorisHost {
+    /// State: installation receipt, `data/`, `instances/`, operation journal.
     root: PathBuf,
+    /// Releases and the download cache (ADR-038 D1 managed root). Equal to `root`
+    /// only in tests that never touch the real layout.
+    install_root: PathBuf,
     inner: Mutex<Inner>,
     changed: Notify,
     runtime: Arc<dyn Runtime>,
@@ -521,13 +525,16 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Code> {
     write().map_err(|_| Code::PersistenceFailed)
 }
 impl IdorisHost {
+    /// `root` holds state (receipt, data, instances); releases go to `install_root`,
+    /// the ADR-038 managed root `<data dir>/components/idoris`.
     pub fn system(
         root: PathBuf,
+        install_root: PathBuf,
         managed: Arc<ManagedIdoris>,
         router: Arc<ModelRouter>,
     ) -> io::Result<Arc<Self>> {
         let secrets: Arc<dyn SecretSource> = Arc::new(KeychainSource(Arc::new(SystemKeychain)));
-        Self::open(
+        let mut host = Self::open(
             root,
             managed,
             router,
@@ -535,7 +542,11 @@ impl IdorisHost {
                 secrets: secrets.clone(),
             }),
             secrets,
-        )
+        )?;
+        Arc::get_mut(&mut host)
+            .ok_or_else(|| io::Error::other("host already shared"))?
+            .install_root = install_root;
+        Ok(host)
     }
     pub fn open(
         root: PathBuf,
@@ -576,6 +587,7 @@ impl IdorisHost {
             router.block_idoris("managed iDoris stopped");
         }
         Ok(Arc::new(Self {
+            install_root: root.clone(),
             root,
             runtime,
             secrets,
