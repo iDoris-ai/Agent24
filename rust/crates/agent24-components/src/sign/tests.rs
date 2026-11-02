@@ -1,62 +1,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
-use std::{cell::RefCell, path::PathBuf};
+use std::path::PathBuf;
 
-type Script = Box<dyn Fn(&str, &[&str]) -> io::Result<CommandOutput>>;
-
-/// Records every invocation and answers from a script.
-struct Fake {
-    calls: RefCell<Vec<(String, Vec<String>)>>,
-    script: Script,
-}
-impl Fake {
-    fn new(script: impl Fn(&str, &[&str]) -> io::Result<CommandOutput> + 'static) -> Self {
-        Self {
-            calls: RefCell::new(Vec::new()),
-            script: Box::new(script),
-        }
-    }
-}
-impl CommandRunner for &Fake {
-    fn run(&self, program: &str, args: &[&str]) -> io::Result<CommandOutput> {
-        self.calls.borrow_mut().push((
-            program.into(),
-            args.iter().map(|s| (*s).to_owned()).collect(),
-        ));
-        (self.script)(program, args)
-    }
-}
-
-fn ok(stderr: &str) -> io::Result<CommandOutput> {
-    Ok(CommandOutput {
-        success: true,
-        stderr: stderr.into(),
-    })
-}
-fn fail(stderr: &str) -> io::Result<CommandOutput> {
-    Ok(CommandOutput {
-        success: false,
-        stderr: stderr.into(),
-    })
-}
-
-const DETAILS_OK: &str = "Identifier=demo\nCodeDirectory v=20500 size=900 flags=0x10000(runtime) hashes=20+7 location=embedded\nTeamIdentifier=HYAP444FN9\n";
 const REQ: SigningRequirement = SigningRequirement {
     team_id: "HYAP444FN9",
     notarized: true,
 };
-
-const SPCTL_OK: &str = "/x/demo: accepted\nsource=Notarized Developer ID\n";
-
-fn healthy(program: &str, args: &[&str]) -> io::Result<CommandOutput> {
-    if program == CODESIGN && args.contains(&"-dv") {
-        ok(DETAILS_OK)
-    } else if program == SPCTL {
-        ok(SPCTL_OK)
-    } else {
-        ok("")
-    }
-}
 
 #[test]
 fn requirement_has_the_mandatory_leading_equals() {
@@ -72,6 +21,59 @@ fn requirement_has_the_mandatory_leading_equals() {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
+    use std::cell::RefCell;
+
+    type Script = Box<dyn Fn(&str, &[&str]) -> io::Result<CommandOutput>>;
+
+    /// Records every invocation and answers from a script.
+    struct Fake {
+        calls: RefCell<Vec<(String, Vec<String>)>>,
+        script: Script,
+    }
+    impl Fake {
+        fn new(script: impl Fn(&str, &[&str]) -> io::Result<CommandOutput> + 'static) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                script: Box::new(script),
+            }
+        }
+    }
+    impl CommandRunner for &Fake {
+        fn run(&self, program: &str, args: &[&str]) -> io::Result<CommandOutput> {
+            self.calls.borrow_mut().push((
+                program.into(),
+                args.iter().map(|s| (*s).to_owned()).collect(),
+            ));
+            (self.script)(program, args)
+        }
+    }
+
+    fn ok(stderr: &str) -> io::Result<CommandOutput> {
+        Ok(CommandOutput {
+            success: true,
+            stderr: stderr.into(),
+        })
+    }
+    fn fail(stderr: &str) -> io::Result<CommandOutput> {
+        Ok(CommandOutput {
+            success: false,
+            stderr: stderr.into(),
+        })
+    }
+
+    const DETAILS_OK: &str = "Identifier=demo\nCodeDirectory v=20500 size=900 flags=0x10000(runtime) hashes=20+7 location=embedded\nTeamIdentifier=HYAP444FN9\n";
+
+    const SPCTL_OK: &str = "/x/demo: accepted\nsource=Notarized Developer ID\n";
+
+    fn healthy(program: &str, args: &[&str]) -> io::Result<CommandOutput> {
+        if program == CODESIGN && args.contains(&"-dv") {
+            ok(DETAILS_OK)
+        } else if program == SPCTL {
+            ok(SPCTL_OK)
+        } else {
+            ok("")
+        }
+    }
 
     fn run(fake: &Fake, required: &SigningRequirement) -> Result<(), InstallError> {
         CodesignWith(fake).verify(&PathBuf::from("/x/demo"), required)
@@ -407,4 +409,22 @@ fn runtime_flag_parser_ignores_other_lines() {
         "Identifier=runtime flags=0x10000(runtime)"
     ));
     assert!(!has_runtime_flag("CodeDirectory v=20500 flags=0x0(none)"));
+}
+
+#[test]
+fn a_hung_tool_is_killed_at_the_deadline_and_fails_closed() {
+    use std::time::{Duration, Instant};
+    let started = Instant::now();
+    let err = run_with_deadline("/bin/sleep", &["30"], Duration::from_millis(200)).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    assert!(err.to_string().contains("did not finish"), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    // A tool that finishes in time is unaffected and its stderr is captured.
+    let out = run_with_deadline(
+        "/bin/sh",
+        &["-c", "echo hi >&2; exit 3"],
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    assert!(!out.success && out.stderr.contains("hi"));
 }

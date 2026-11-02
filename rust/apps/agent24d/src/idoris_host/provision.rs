@@ -205,6 +205,12 @@ pub(super) fn legacy_deletable(old_root: &Path, candidates: &[&Path]) -> Vec<Pat
                     && (p.len() == 1 || !p.starts_with('0'))
             })
     };
+    // Canonical on both sides, and the cache itself must be a real directory: a symlinked
+    // `cache` could otherwise make any directory look like "the cache".
+    let cache = std::fs::symlink_metadata(old_root.join("cache"))
+        .ok()
+        .filter(|m| m.file_type().is_dir())
+        .and_then(|_| std::fs::canonicalize(old_root.join("cache")).ok());
     candidates
         .iter()
         .filter_map(|path| {
@@ -218,7 +224,7 @@ pub(super) fn legacy_deletable(old_root: &Path, candidates: &[&Path]) -> Vec<Pat
             }
             let parent = std::fs::canonicalize(path.parent()?).ok()?;
             let release = parent == old_root && release_name(name);
-            let cached = parent == old_root.join("cache")
+            let cached = cache.as_ref() == Some(&parent)
                 && name.len() > ".verified".len()
                 && name.ends_with(".verified")
                 && !name.starts_with('.');

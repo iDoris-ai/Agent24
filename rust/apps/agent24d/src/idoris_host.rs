@@ -56,12 +56,15 @@ pub struct Installation {
     pub verification: Option<VerificationReceipt>,
     /// Managed root (canonical) the release was installed under; absent in receipts
     /// written before ADR-038 D1.
-    #[serde(default)]
+    ///
+    /// Forward-only: omitted when unset, but a receipt written with this (or
+    /// `notarized_verified_at`) set is rejected by older daemons (`deny_unknown_fields`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_root: Option<PathBuf>,
     /// When an explicit Install last verified notarization online (RFC 3339). Start trusts
     /// this together with the digests and the offline codesign checks; without it the next
     /// explicit Install redoes the check, and Start is never blocked for that reason.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notarized_verified_at: Option<String>,
 }
 

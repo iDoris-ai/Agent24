@@ -315,6 +315,31 @@ fn a_failing_signature_never_creates_the_final_directory() {
     f.clean();
 }
 
+/// Passes the first verification (in staging), fails the second (after the rename).
+struct FailsAfterRename {
+    calls: std::sync::atomic::AtomicUsize,
+}
+impl SignatureVerifier for FailsAfterRename {
+    fn verify(&self, _: &Path, _: &SigningRequirement) -> Result<(), InstallError> {
+        // One call per executable; iDoris lists one, so call 0 is staging, call 1 is final.
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            Ok(())
+        } else {
+            Err(InstallError::SignatureMismatch)
+        }
+    }
+}
+
+#[test]
+fn a_signature_that_fails_after_the_rename_rolls_the_install_back() {
+    let f = Fixture::new(None);
+    let result = f.install_with(FailsAfterRename {
+        calls: Default::default(),
+    });
+    assert!(matches!(result, Err(InstallError::SignatureMismatch)));
+    f.clean(); // the renamed version directory is gone and no staging is left
+}
+
 /// Gatekeeper unreachable: any demand for a notarization verdict fails.
 struct OfflineGatekeeper;
 impl SignatureVerifier for OfflineGatekeeper {

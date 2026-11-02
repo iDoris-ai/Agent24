@@ -1740,3 +1740,57 @@ async fn a_restart_onto_the_new_release_publishes_the_queued_legacy_paths() {
     let stop = x.f.host.submit(Action::Stop, None).await.unwrap();
     assert_eq!(x.f.complete(&stop).await.result, Some(Outcome::Succeeded));
 }
+
+#[test]
+fn cache_guard_is_canonical_and_rejects_foreign_or_symlinked_caches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(tmp.path()).unwrap();
+    let old = base.join("old");
+    fs::create_dir_all(old.join("cache")).unwrap();
+    fs::write(old.join("cache/a.tar.gz.verified"), b"x").unwrap();
+    let ok = old.join("cache/a.tar.gz.verified");
+    let legacy = crate::idoris_host::provision::legacy_deletable;
+    assert_eq!(legacy(&old, &[ok.as_path()]), std::slice::from_ref(&ok));
+    // The same name reached through a non-canonical spelling of the old root still matches.
+    std::os::unix::fs::symlink(&old, base.join("alias")).unwrap();
+    assert_eq!(
+        legacy(&base.join("alias"), &[ok.as_path()]),
+        std::slice::from_ref(&ok)
+    );
+
+    // A cache directory somewhere else is foreign.
+    let foreign = base.join("foreign/cache");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(foreign.join("a.tar.gz.verified"), b"x").unwrap();
+    assert!(legacy(&old, &[foreign.join("a.tar.gz.verified").as_path()]).is_empty());
+
+    // A symlinked cache is refused outright, even when it points at a real cache-like dir.
+    let old2 = base.join("old2");
+    fs::create_dir_all(&old2).unwrap();
+    std::os::unix::fs::symlink(&foreign, old2.join("cache")).unwrap();
+    let via_link = old2.join("cache/a.tar.gz.verified");
+    assert!(
+        legacy(
+            &old2,
+            &[
+                via_link.as_path(),
+                foreign.join("a.tar.gz.verified").as_path()
+            ]
+        )
+        .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn receipt_fields_added_in_c1_are_omitted_when_unset() {
+    let f = Fixture::new().await;
+    let bare = serde_json::to_value(&f.record).unwrap();
+    assert!(bare.get("install_root").is_none() && bare.get("notarized_verified_at").is_none());
+    let mut set = f.record.clone();
+    set.install_root = Some("/x".into());
+    set.notarized_verified_at = Some("2026-11-02T00:00:00+00:00".into());
+    let set = serde_json::to_value(&set).unwrap();
+    assert!(set.get("install_root").is_some() && set.get("notarized_verified_at").is_some());
+    // And a receipt without them (an older daemon's) still loads.
+    serde_json::from_value::<Installation>(bare).unwrap();
+}

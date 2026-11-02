@@ -1,7 +1,12 @@
 //! Signature verification of installed executables (ADR-038 D2a).
 
 use crate::install::InstallError;
-use std::{io, path::Path, process::Command};
+use std::{
+    io::{self, Read},
+    path::Path,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
 
 /// When a verification runs decides how much of D2a it may require.
 ///
@@ -42,6 +47,7 @@ impl SignatureVerifier for Unsigned {
     }
 }
 
+#[derive(Debug)]
 pub struct CommandOutput {
     pub success: bool,
     pub stderr: String,
@@ -53,13 +59,59 @@ pub trait CommandRunner {
 }
 
 pub struct SystemRunner;
+
+/// A hung `spctl` (network stall) must not hold the component's operation lock forever.
+pub const TOOL_DEADLINE: Duration = Duration::from_secs(60);
+
 impl CommandRunner for SystemRunner {
     fn run(&self, program: &str, args: &[&str]) -> io::Result<CommandOutput> {
-        let out = Command::new(program).env_clear().args(args).output()?;
-        Ok(CommandOutput {
-            success: out.status.success(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        })
+        run_with_deadline(program, args, TOOL_DEADLINE)
+    }
+}
+
+/// Run a tool with a cleared environment; kill it and fail closed (`TimedOut`) when it
+/// has not finished by the deadline.
+pub fn run_with_deadline(
+    program: &str,
+    args: &[&str],
+    deadline: Duration,
+) -> io::Result<CommandOutput> {
+    let mut child = Command::new(program)
+        .env_clear()
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("missing stderr pipe"))?;
+    // Drain concurrently so a chatty tool cannot block on a full pipe.
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.take(1 << 20).read_to_end(&mut bytes);
+        bytes
+    });
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let bytes = reader.join().unwrap_or_default();
+            return Ok(CommandOutput {
+                success: status.success(),
+                stderr: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+        if started.elapsed() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{program} did not finish within {}s", deadline.as_secs()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
