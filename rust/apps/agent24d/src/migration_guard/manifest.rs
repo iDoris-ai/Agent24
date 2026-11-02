@@ -245,6 +245,32 @@ pub(super) fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, StateError> 
     }
 }
 
+/// [`read_optional`] with a size cap and a regular-file requirement: an
+/// oversize file or a FIFO/device is `Invalid` (never read whole, never
+/// blocks), so a hostile file cannot stall or balloon startup.
+pub(super) fn read_optional_capped(path: &Path, max: u64) -> Result<Option<Vec<u8>>, StateError> {
+    match fs::metadata(path) {
+        Ok(m) if !m.is_file() || m.len() > max => {
+            return Err(StateError::Invalid(format!(
+                "{} is not a regular file within {max} bytes",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(_) => return read_optional(path),
+    }
+    let file = fs::File::open(path).map_err(|e| StateError::Invalid(e.to_string()))?;
+    let mut bytes = Vec::new();
+    // The file may grow after the stat: the read itself is bounded too.
+    file.take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| StateError::Invalid(e.to_string()))?;
+    if bytes.len() as u64 > max {
+        return Err(StateError::Invalid("file grew past the size cap".into()));
+    }
+    Ok(Some(bytes))
+}
+
 pub(super) fn parse_json<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, StateError> {
     serde_json::from_slice(bytes).map_err(|e| StateError::Invalid(e.to_string()))
 }
