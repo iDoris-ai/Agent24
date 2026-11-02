@@ -1,4 +1,5 @@
-.comm-page { display: flex; flex-direction: column; gap: 16px; }
+.comm-page { --comm-step-done: #3dd68c; display: flex; flex-direction: column; gap: 16px; }
+.app.light .comm-page { --comm-step-done: #0c7a42; }
 .comm-heading, .comm-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .comm-heading h1 { margin: 0 0 4px; font-size: 22px; }
 .comm-heading p, .comm-muted { color: var(--muted); font-size: 13px; }
@@ -26,12 +27,13 @@
 .comm-warning { border-radius: 8px; padding: 10px 12px; font-size: 13px; color: var(--warning, #b7791f); background: rgba(183,121,31,.12); }
 .comm-alert, .comm-notice { border-radius: 8px; padding: 10px 12px; font-size: 13px; }
 .comm-alert { color: var(--danger, #d94f4f); background: rgba(217,79,79,.1); }
-.comm-notice { color: var(--success, #42b883); background: rgba(66,184,131,.1); }
+.comm-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--success, #42b883); background: rgba(66,184,131,.1); }
 .comm-fresh-indicator { color: var(--muted); font-size: 12px; }
 @media (max-width: 760px) { .comm-status-grid { grid-template-columns: 1fr; } }
 
 .comm-steps { display: flex; flex-wrap: wrap; gap: 32px; padding-left: 20px; color: var(--muted); }
 .comm-steps [aria-current="step"] { color: var(--text); font-weight: 600; }
+.comm-step-mark { color: var(--comm-step-done); font-weight: 700; }
 .comm-setup-form { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin: 16px 0; }
 .comm-setup-form label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
 .comm-setup-form input, .comm-setup-form select { padding: 8px; max-width: 100%; }

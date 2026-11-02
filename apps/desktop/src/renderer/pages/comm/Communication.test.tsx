@@ -7,15 +7,20 @@ import {
   getCommStatus, listCommContacts, listCommIdentities, listCommRelays,
   startCommDaemon, stopCommDaemon, unlockComm, installComm,
   addCommContact, sendCommMessage, listCommHistory, exportCommIdentity, pickCommBackup, restoreCommIdentity,
+  revealCommExport,
   CommApiError, type CommDaemonStatus,
 } from './api'
 
-vi.mock('./api', async (importActual) => ({
-  CommApiError: (await importActual<typeof import('./api')>()).CommApiError,
-  getCommStatus: vi.fn(), listCommContacts: vi.fn(), listCommIdentities: vi.fn(), listCommRelays: vi.fn(),
-  startCommDaemon: vi.fn(), stopCommDaemon: vi.fn(), unlockComm: vi.fn(), installComm: vi.fn(),
-  addCommContact: vi.fn(), sendCommMessage: vi.fn(), listCommHistory: vi.fn(), exportCommIdentity: vi.fn(), pickCommBackup: vi.fn(), restoreCommIdentity: vi.fn(),
-}))
+vi.mock('./api', async (importActual) => {
+  const actual = await importActual<typeof import('./api')>()
+  return {
+    CommApiError: actual.CommApiError,
+    getCommStatus: vi.fn(), listCommContacts: vi.fn(), listCommIdentities: vi.fn(), listCommRelays: vi.fn(),
+    startCommDaemon: vi.fn(), stopCommDaemon: vi.fn(), unlockComm: vi.fn(), installComm: vi.fn(),
+    addCommContact: vi.fn(), sendCommMessage: vi.fn(), listCommHistory: vi.fn(), exportCommIdentity: vi.fn(), pickCommBackup: vi.fn(), restoreCommIdentity: vi.fn(),
+    revealCommExport: vi.fn().mockResolvedValue(undefined),
+  }
+})
 
 const identity = { nickname: 'alice', npub: 'npub1alice', default: true, encrypted: true }
 const contact = { nickname: 'bob', npub: 'npub1bob', role: 'friend' }
@@ -495,6 +500,7 @@ describe('CommunicationPage usability', () => {
     const wizard = await screen.findByTestId('comm-setup')
     expect(wizard).toHaveAttribute('data-state', 'no_identity')
     fireEvent.click(screen.getByRole('button', { name: 'Restore from backup' }))
+    expect(wizard.querySelectorAll('.comm-step-mark')).toHaveLength(1)
     expect(await screen.findByLabelText('Make it the default identity')).toBeChecked()
     fireEvent.click(screen.getByRole('button', { name: 'Restore' }))
     await waitFor(() => expect(restoreCommIdentity).toHaveBeenCalledWith('tk4', 'first', true))
@@ -521,5 +527,144 @@ describe('CommunicationPage usability', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Export private key backup alice' }))
     expect(await screen.findByText(/saved to \/safe\/a\.ncryptsec/)).toBeInTheDocument()
     expect(document.querySelector('.comm-warning')).toBeNull()
+  })
+
+  it('marks completed setup steps in green and leaves the current step unmarked', async () => {
+    success()
+    render(<CommunicationPage />)
+    const card = await screen.findByTestId('comm-setup')
+    expect(card.querySelectorAll('.comm-step-mark')).toHaveLength(3)
+    expect(card.textContent).toContain('Download Hyphae ✓')
+    expect(card.textContent).toContain('Create identity ✓')
+    expect(card.textContent).toContain('Connect relay ✓')
+  })
+
+  const restoreAndStop = () => ({
+    restore: screen.getByRole('button', { name: 'Restore from backup' }),
+    stop: screen.getByRole('button', { name: 'Stop service' }),
+  })
+
+  it.each([
+    {
+      name: 'success',
+      arm: () => vi.mocked(exportCommIdentity).mockResolvedValueOnce({
+        nickname: 'alice', npub: 'npub1alice', path: '/Users/x/Downloads/alice.ncryptsec', warnings: [],
+      }),
+      pathText: '/Users/x/Downloads/alice.ncryptsec',
+    },
+    {
+      name: 'cancel',
+      arm: () => vi.mocked(exportCommIdentity).mockRejectedValueOnce(new CommApiError('cancelled', 499, 'cancelled')),
+      pathText: null,
+    },
+    {
+      name: 'ipc error',
+      arm: () => vi.mocked(exportCommIdentity).mockRejectedValueOnce(new CommApiError('daemon exploded', 500, 'daemon_error')),
+      pathText: null,
+    },
+  ])('clears pending after export $name so Restore and Stop are usable', async ({ arm, pathText }) => {
+    success()
+    arm()
+    render(<CommunicationPage />)
+    await screen.findByText('npub1alice')
+    fireEvent.click(screen.getByRole('button', { name: 'Export private key backup alice' }))
+    if (pathText) {
+      expect(await screen.findByText(/\/Users\/x\/Downloads\/alice\.ncryptsec/)).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: /^Show in / }))
+      await waitFor(() => expect(revealCommExport).toHaveBeenCalledWith(pathText))
+    } else {
+      await waitFor(() => expect(exportCommIdentity).toHaveBeenCalled())
+    }
+    await waitFor(() => {
+      const { restore, stop } = restoreAndStop()
+      expect(restore).toBeEnabled()
+      expect(stop).toBeEnabled()
+    })
+  })
+
+  it('an export that takes longer than 90 s (a person choosing a password and a folder) is not timed out, and shows the path', async () => {
+    success()
+    let finish: (value: Awaited<ReturnType<typeof exportCommIdentity>>) => void = () => {}
+    vi.mocked(exportCommIdentity).mockImplementation(() => new Promise((resolve) => { finish = resolve }))
+    render(<CommunicationPage />)
+    await screen.findByText('npub1alice')
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByRole('button', { name: 'Export private key backup alice' }))
+    const { restore, stop } = restoreAndStop()
+    await act(async () => { await vi.advanceTimersByTimeAsync(120_000) })
+    expect(restore).toBeDisabled()
+    expect(stop).toBeDisabled()
+    expect(screen.queryByRole('alert')).toBeNull()
+    await act(async () => { finish({ nickname: 'alice', npub: 'npub1alice', path: '/Users/x/Downloads/late.ncryptsec', warnings: [] }) })
+    expect(restore).toBeEnabled()
+    expect(stop).toBeEnabled()
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByRole('status')).toHaveTextContent('/Users/x/Downloads/late.ncryptsec')
+    vi.useRealTimers()
+  })
+
+  it.each([
+    ['MacIntel', 'Show in Finder'],
+    ['Win32', 'Show in File Explorer'],
+    ['Linux x86_64', 'Show in file manager'],
+    ['', 'Show in folder'],
+  ])('labels the reveal button for platform %j as %s', async (platform, label) => {
+    success()
+    vi.spyOn(window.navigator, 'platform', 'get').mockReturnValue(platform)
+    vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue('')
+    vi.mocked(exportCommIdentity).mockResolvedValueOnce({ nickname: 'alice', npub: 'npub1alice', path: '/p/a.ncryptsec', warnings: [] })
+    render(<CommunicationPage />)
+    await screen.findByText('npub1alice')
+    fireEvent.click(screen.getByRole('button', { name: 'Export private key backup alice' }))
+    expect(await screen.findByRole('button', { name: label })).toBeInTheDocument()
+    vi.restoreAllMocks()
+  })
+
+  it('a 409 export_in_progress from the daemon reads as "still finishing"', async () => {
+    success()
+    vi.mocked(exportCommIdentity).mockRejectedValueOnce(new CommApiError('export_in_progress: another key backup is already running', 409, 'conflict'))
+    render(<CommunicationPage />)
+    await screen.findByText('npub1alice')
+    fireEvent.click(screen.getByRole('button', { name: 'Export private key backup alice' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('still finishing')
+  })
+
+  it('explains why Stop is unavailable: locked, no status, or just not running; and allows it after the supervisor gave up', async () => {
+    const stopFor = async (state: CommDaemonStatus['process']['state'] | null) => {
+      cleanup()
+      success()
+      if (state === null) vi.mocked(getCommStatus).mockRejectedValue(new CommApiError('down', 503, 'unavailable'))
+      else vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, state } })
+      render(<CommunicationPage />)
+      return screen.findByRole('button', { name: 'Stop service' })
+    }
+    expect(await stopFor('gave_up')).toBeEnabled()
+    const locked = await stopFor('locked')
+    expect(locked).toBeDisabled()
+    expect(locked).toHaveAttribute('title', expect.stringContaining('Locked'))
+    const unknown = await stopFor(null)
+    expect(unknown).toBeDisabled()
+    expect(unknown).toHaveAttribute('title', expect.stringContaining('unavailable'))
+  })
+
+  it('enables Stop while the service is running, starting, or backing off, and disables it once stopped', async () => {
+    for (const state of ['running', 'starting', 'backoff'] as const) {
+      cleanup()
+      success()
+      vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, state } })
+      render(<CommunicationPage />)
+      const stop = await screen.findByRole('button', { name: 'Stop service' })
+      expect(stop).toBeEnabled()
+      expect(stop).not.toHaveAttribute('title')
+      expect(screen.getByRole('button', { name: 'Start service' })).toBeEnabled()
+    }
+    cleanup()
+    success()
+    vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, state: 'stopped' } })
+    render(<CommunicationPage />)
+    const stop = await screen.findByRole('button', { name: 'Stop service' })
+    expect(stop).toBeDisabled()
+    expect(stop).toHaveAttribute('title', 'Service is not running')
+    expect(screen.getByRole('button', { name: 'Start service' })).toBeEnabled()
   })
 })
