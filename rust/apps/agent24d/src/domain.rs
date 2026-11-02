@@ -198,6 +198,8 @@ const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     // package cannot claim `name: comm` and collide with (or, depending on
     // merge order, shadow) the real mount.
     "comm",
+    // ADR-038 C3: `/api/v1/components` (status of every component) and its report route.
+    "components",
     // D0-3 (`docs/agent/PLAN-DECIDE.md` §1.1): `/api/v1/decide/profile` is
     // kernel code. A domain OS named `decide` would collide with it.
     "decide",

@@ -34,7 +34,8 @@ pub use provision::{
 };
 
 /// Drain (30s), TERM (17s), KILL/reap and scheduling margin.
-pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(50);
+pub const SHUTDOWN_BUDGET: Duration =
+    Duration::from_millis(agent24_protocol::shutdown_bounds::IDORIS_BUDGET_MS);
 
 /// Local, non-sensitive receipt written by the install/connect coordinator (IL-11).
 #[derive(Clone, Serialize, Deserialize)]

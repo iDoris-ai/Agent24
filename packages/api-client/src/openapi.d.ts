@@ -212,6 +212,61 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/components": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Lifecycle state of every component (ADR-038 D5)
+         * @description One status model for iDoris, Hyphae, attached modules, Documents, Knowledge and Open
+         *     Design (whose state the desktop reports). Needs `components.read`; Creative tokens are
+         *     refused (403). The ProductHost audience, and legacy mode (one shared token that already
+         *     reads every full status route), get `ComponentView`. Every other audience gets
+         *     `ComponentRedactedView`: id, version, state and provides only, with no install path, pid,
+         *     port, error message, team id or commit. A first-party token carries only the operations it
+         *     was issued with, so one issued by an older daemon gets 403 here until it is re-issued. The older status routes (`/idoris/status`,
+         *     `/comm/daemon`, `/os`) are unchanged.
+         */
+        get: operations["listComponents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/components/{id}/report": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * The desktop reports the state of a component it owns (ADR-038 D5)
+         * @description ProductHost audience only; legacy mode, first-party and Creative tokens get 403. Accepted
+         *     only for components whose state the desktop owns (today `open-design`); any other id is
+         *     404. The first report, or the first after the previous one expired, is taken as the
+         *     baseline. Otherwise whatever legal state is reported is stored and refreshes the report
+         *     (the daemon only aggregates); one that does not follow the last live report by a D5 edge
+         *     is logged and marked for the host as `detail.unexpected_transition` `{from, to}` on the
+         *     component. An unknown id is 404 before the body is read. A report expires 90 seconds after it was
+         *     received, after which the component reads `absent` with reason `not_reported`; the
+         *     desktop must re-send within that time.
+         */
+        post: operations["reportComponentState"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/decide/profile": {
         parameters: {
             query?: never;
@@ -798,7 +853,7 @@ export interface paths {
         /**
          * The shutdown budgets in effect and the previous shutdown (authenticated)
          * @description SHUT-1c. The out-of-process modules' drain and stop grace
-         *     (`A24_MODULE_DRAIN_MS`, `A24_MODULE_STOP_GRACE_MS`), the exit bound
+         *     (`A24_MODULE_DRAIN_MS`, `A24_COMPONENT_STOP_GRACE_MS`), the exit bound
          *     they give, values that were rejected, and what this daemon found of
          *     the one before it — so a budget that is too tight can be found and
          *     adjusted. agent24d only.
@@ -2233,6 +2288,50 @@ export interface components {
         AttachedList: {
             modules: components["schemas"]["AttachedView"][];
         };
+        /** @enum {string} */
+        ComponentState: "absent" | "installing" | "installed" | "starting" | "ready" | "degraded" | "stopping" | "stopped" | "incompatible" | "failed";
+        ComponentProvide: {
+            /** @description Capability id (ADR-038 D9) */
+            id: string;
+            /** @description Localized display name, when the component's lock carries one */
+            name?: {
+                zh: string;
+                en: string;
+                th: string;
+            };
+        };
+        /** @description Host view of one component. */
+        ComponentView: {
+            id: string;
+            version: string | null;
+            state: components["schemas"]["ComponentState"];
+            /** @enum {string} */
+            form: "resident" | "sidecar" | "cli" | "attach" | "remote" | "mcp";
+            provides: components["schemas"]["ComponentProvide"][];
+            /** @description Short machine-readable cause; host only */
+            reason?: string;
+            /** @description Ports, contract expectation, counters, messages; host only */
+            detail?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description What every audience other than the host sees. No path, pid, port, message, team id or commit. */
+        ComponentRedactedView: {
+            id: string;
+            version: string | null;
+            state: components["schemas"]["ComponentState"];
+            provides: components["schemas"]["ComponentProvide"][];
+        };
+        ComponentList: {
+            components: (components["schemas"]["ComponentView"] | components["schemas"]["ComponentRedactedView"])[];
+        };
+        ComponentReport: {
+            state: components["schemas"]["ComponentState"];
+            /** @description Kept from the previous report when omitted */
+            version?: string;
+            /** @description No control characters; shown to the host only */
+            reason?: string;
+        };
         AttachedUpdate: {
             enabled: boolean;
         };
@@ -2270,7 +2369,7 @@ export interface components {
             evidence_dir?: string;
             drain_ms: number;
             stop_grace_ms: number;
-            /** @description From SIGTERM to the process gone, at the latest (2000 at the defaults). */
+            /** @description From SIGTERM to the process gone, at the latest (16500 at the defaults, with no managed iDoris holding the shutdown open). */
             exit_bound_ms: number;
             config_warnings: string[];
             /** @description Open enum: no_history | clean | unreadable | cleanup_failed | unconfirmed. */
@@ -4452,6 +4551,56 @@ export interface operations {
                 };
             };
             503: components["responses"]["ProviderUnavailable"];
+        };
+    };
+    listComponents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Components; each item is the full or the redacted variant by audience */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ComponentList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    reportComponentState: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ComponentReport"];
+            };
+        };
+        responses: {
+            /** @description Recorded */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
         };
     };
     getDecideProfile: {

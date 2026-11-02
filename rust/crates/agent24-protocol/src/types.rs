@@ -46,9 +46,9 @@ pub struct ShutdownReport {
     pub evidence_dir: Option<String>,
     /// `A24_MODULE_DRAIN_MS` in effect.
     pub drain_ms: u64,
-    /// `A24_MODULE_STOP_GRACE_MS` in effect.
+    /// `A24_COMPONENT_STOP_GRACE_MS` in effect.
     pub stop_grace_ms: u64,
-    /// From SIGTERM to the process gone, at the latest (2000 at the defaults).
+    /// From SIGTERM to the process gone, at the latest (16500 at the defaults, with no managed iDoris holding the shutdown open).
     pub exit_bound_ms: u64,
     /// Values that were rejected (the default used instead), and evidence
     /// that could not be kept.
@@ -74,7 +74,7 @@ pub struct LastShutdown {
     pub began_at_ms: u64,
     pub took_ms: u64,
     /// Modules whose leader was SIGKILLed after its stop grace — raise
-    /// `A24_MODULE_STOP_GRACE_MS` if they need longer.
+    /// `A24_COMPONENT_STOP_GRACE_MS` if they need longer.
     #[serde(default)]
     pub killed_after_grace: Vec<String>,
     /// Modules whose drain ran out with requests still in flight, as

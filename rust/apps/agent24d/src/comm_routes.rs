@@ -118,6 +118,18 @@ impl CommDaemonSlot {
         }
     }
 
+    /// The registered supervisor, if any (read-only; status for `/api/v1/components`).
+    pub fn current(&self) -> Option<Arc<HyphaeDaemonSupervisor>> {
+        match &*self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            CommDaemonSlotState::Registered(handle) => Some(handle.clone()),
+            _ => None,
+        }
+    }
+
     /// Mark the slot closed, cancel downloads, and return the current handle.
     pub fn close(&self) -> Option<Arc<HyphaeDaemonSupervisor>> {
         self.1.cancel();

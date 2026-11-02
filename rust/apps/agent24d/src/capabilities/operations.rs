@@ -49,6 +49,10 @@ pub enum Operation {
     IdorisRead,
     // CORE-5f-2: docked-router migration diagnostics (daily level).
     DiagnosticRead,
+    // ADR-038 D5: the status of every component. Read is Everyday and NOT on the creative
+    // allowlist; report is the desktop's (ProductHost only, enforced at the route).
+    ComponentsRead,
+    ComponentsReport,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,6 +138,8 @@ impl Operation {
             Self::PresenceDecide => "presence.decide",
             Self::IdorisRead => "idoris.read",
             Self::DiagnosticRead => "diagnostic.read",
+            Self::ComponentsRead => "components.read",
+            Self::ComponentsReport => "components.report",
         }
     }
 
@@ -182,6 +188,8 @@ impl Operation {
             "presence.decide" => Self::PresenceDecide,
             "idoris.read" => Self::IdorisRead,
             "diagnostic.read" => Self::DiagnosticRead,
+            "components.read" => Self::ComponentsRead,
+            "components.report" => Self::ComponentsReport,
             "schedule.read" => Self::ScheduleRead,
             "usage.read" => Self::UsageRead,
             "config.read" => Self::ConfigRead,
