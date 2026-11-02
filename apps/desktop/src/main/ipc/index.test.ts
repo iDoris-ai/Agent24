@@ -16,6 +16,8 @@ const showSaveDialog = vi.fn()
 const showOpenDialog = vi.fn()
 const promptBackupPassword = vi.fn()
 const promptRestorePassword = vi.fn()
+const promptUnlockPassword = vi.fn()
+const promptHomeImportPassword = vi.fn()
 const execFileMock = vi.fn()
 
 vi.mock('electron', () => ({
@@ -64,13 +66,15 @@ let attachedFailure: { status: number; code: string } | null = null
 // does `GET /api/v1/comm/identity` report a default identity?
 let identityListHasDefault = true
 let identityListFails = false
+// what GET /api/v1/comm/relay answers
+let currentRelays: { relays: string[]; configured: boolean } = { relays: [], configured: false }
 
 beforeAll(async () => {
   daemon = http.createServer((req, res) => {
     const chunks: Buffer[] = []
     req.on('data', (c: Buffer) => chunks.push(c))
     req.on('end', () => {
-      if (!(req.method === 'GET' && req.url === '/api/v1/comm/identity') && !(req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/')) && !(req.method === 'GET' && req.url === '/api/v1/os') && !(req.method === 'GET' && req.url === '/api/v1/attached')) seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: Buffer.concat(chunks).toString() })
+      if (!(req.method === 'GET' && req.url === '/api/v1/comm/identity') && !(req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/')) && !(req.method === 'GET' && req.url === '/api/v1/os') && !(req.method === 'GET' && req.url === '/api/v1/attached') && !(req.method === 'GET' && req.url === '/api/v1/comm/relay')) seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: Buffer.concat(chunks).toString() })
       res.setHeader('Content-Type', 'application/json')
       if (req.url === '/v1/models' && modelsRequireKey && req.headers.authorization !== `Bearer ${modelsRequireKey}`) {
         res.statusCode = 401
@@ -113,6 +117,20 @@ beforeAll(async () => {
           res.statusCode = 409
           res.end(JSON.stringify({ ok: false, error: 'nickname_exists', message: 'exists' }))
         } else res.end(JSON.stringify({ ok: true, data: { status: 'imported', nickname: 'r1', npub: 'npub1x', default: false } }))
+      } else if (req.method === 'GET' && req.url === '/api/v1/comm/relay') {
+        res.end(JSON.stringify({ ok: true, data: { relays: currentRelays.relays, source: 'config', configured: currentRelays.configured } }))
+      } else if (req.method === 'PUT' && req.url === '/api/v1/comm/relay') {
+        res.end(JSON.stringify({ ok: true, data: { relays: JSON.parse(Buffer.concat(chunks).toString()).relays, source: 'config', configured: true } }))
+      } else if (req.method === 'POST' && req.url === '/api/v1/comm/unlock') {
+        if (Buffer.concat(chunks).toString().includes('wrong-unlock')) {
+          res.statusCode = 423
+          res.end(JSON.stringify({ ok: false, error: 'locked', message: 'password verification failed' }))
+        } else res.end(JSON.stringify({ ok: true, data: { unlocked: true, remembered: false } }))
+      } else if (req.method === 'POST' && req.url === '/api/v1/comm/import') {
+        if (Buffer.concat(chunks).toString().includes('wrong-home')) {
+          res.statusCode = 423
+          res.end(JSON.stringify({ ok: false, error: 'locked', message: 'incorrect password' }))
+        } else res.end(JSON.stringify({ ok: true, data: { identities: 1, contacts: 2, outbox: 0, db_files: [] } }))
       } else if (req.method === 'GET' && req.url === '/api/v1/comm/identity' && identityListFails) {
         res.statusCode = 503
         res.end(JSON.stringify({ ok: false, error: 'unavailable', message: 'down' }))
@@ -140,6 +158,8 @@ beforeAll(async () => {
     omlxCandidatePorts: [endpoint.port],
     promptBackupPassword: (...a: unknown[]) => promptBackupPassword(...a),
     promptRestorePassword: (...a: unknown[]) => promptRestorePassword(...a) as never,
+    promptUnlockPassword: (...a: unknown[]) => promptUnlockPassword(...a) as never,
+    promptHomeImportPassword: (...a: unknown[]) => promptHomeImportPassword(...a) as never,
     guard: createIpcGuard({
       getMainWindow: () => mainWindow as never,
       isTrustedUrl: (u) => u === APP_URL,
@@ -167,6 +187,9 @@ beforeEach(() => {
   showSaveDialog.mockReset()
   promptBackupPassword.mockReset()
   promptRestorePassword.mockReset()
+  promptUnlockPassword.mockReset()
+  promptHomeImportPassword.mockReset()
+  currentRelays = { relays: ['wss://old.example'], configured: true }
   showOpenDialog.mockReset()
   execFileMock.mockReset()
 })
@@ -452,7 +475,14 @@ describe('CommIdentityExport elevated IPC', () => {
 })
 
 describe('Restore from backup (CommImportPick / CommIdentityImport)', () => {
-  const FILE = '/Users/x/Downloads/alice-backup.ncryptsec'
+  const NCS = `ncryptsec1${'q'.repeat(150)}`
+  const FILE = path.join(settingsDir, 'alice-backup.ncryptsec')
+  const SECOND = path.join(settingsDir, 'second.ncryptsec')
+  beforeEach(() => {
+    fs.rmSync(FILE, { force: true }) // a previous test may have left a symlink here
+    fs.writeFileSync(FILE, `${NCS}\n`)
+    fs.writeFileSync(SECOND, `ncryptsec1${'p'.repeat(150)}\n`)
+  })
   /** The real window runs `work` with what the user typed; this stands in for it. */
   const typing = (...passwords: string[]) => promptRestorePassword.mockImplementation(async (_win: unknown, work: (p: string) => Promise<{ done: boolean; value?: unknown; error?: string }>) => {
     for (const pw of passwords) {
@@ -471,9 +501,104 @@ describe('Restore from backup (CommImportPick / CommIdentityImport)', () => {
     expect(result.ok).toBe(true)
     expect(result.fileName).toBe('alice-backup.ncryptsec')
     expect(typeof result.ticket).toBe('string')
-    expect(JSON.stringify(result)).not.toContain('/Users/x')
+    expect(JSON.stringify(result)).not.toContain(settingsDir)
+    expect(JSON.stringify(result)).not.toContain(NCS)
     const opts = showOpenDialog.mock.calls.at(-1)!.at(-1) as { properties: string[] }
     expect(opts.properties).toContain('openFile')
+  })
+  it('L2: the file is read when it is picked; swapping it afterwards changes nothing', async () => {
+    const { ticket } = await pick()
+    fs.writeFileSync(FILE, `ncryptsec1${'z'.repeat(150)}\n`) // swapped after the pick
+    fs.rmSync(FILE)
+    fs.symlinkSync(SECOND, FILE) // and replaced by a link
+    typing('restore-pass-1')
+    await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)
+    expect(JSON.parse(seen[0]!.body).ncryptsec).toBe(NCS)
+    expect(JSON.parse(seen[0]!.body)).not.toHaveProperty('path')
+  })
+  it.each([
+    ['text that is not a backup', () => fs.writeFileSync(FILE, 'hello\n')],
+    ['two lines', () => fs.writeFileSync(FILE, `${NCS}\nsecond\n`)],
+    ['a file over 4 KiB', () => fs.writeFileSync(FILE, `ncryptsec1${'q'.repeat(5000)}`)],
+    ['an empty file', () => fs.writeFileSync(FILE, '')],
+    ['a symlink', () => { fs.rmSync(FILE); fs.symlinkSync(SECOND, FILE) }],
+  ])('L2: %s gets no ticket', async (_name, arrange) => {
+    arrange()
+    const result = await pick()
+    expect(result.ok).toBe(false)
+    expect(result.cancelled).toBe(false)
+    expect(result.ticket).toBeUndefined()
+    expect(typeof result.message).toBe('string')
+    typing('restore-pass-1')
+    expect((await call(IpcChannels.CommIdentityImport, 'f'.repeat(32), 'alice', false)).data.error.code).toBe('ticket_expired')
+    expect(seen).toHaveLength(0)
+  })
+  it('L-5: an expired ticket is dropped for good, even if the clock is later wound back', async () => {
+    const t0 = 1_700_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+    try {
+      const { ticket } = await pick()
+      now.mockReturnValue(t0 + 5 * 60_000 + 1)
+      expect((await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)).data.error.code).toBe('ticket_expired')
+      now.mockReturnValue(t0 + 1000) // inside the original window again
+      expect((await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)).data.error.code).toBe('ticket_expired')
+      expect(promptRestorePassword).not.toHaveBeenCalled()
+    } finally {
+      now.mockRestore()
+    }
+  })
+  it.each([
+    ['is cancelled', () => showOpenDialog.mockResolvedValueOnce({ canceled: true, filePaths: [] })],
+    ['picks a file that is not a backup', () => { fs.writeFileSync(SECOND, 'hello\n'); showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [SECOND] }) }],
+    ['throws', () => showOpenDialog.mockRejectedValueOnce(new Error('boom'))],
+  ])('L-5: starting a new pick invalidates the old ticket even if the new pick %s', async (_name, arrange) => {
+    const { ticket } = await pick()
+    arrange()
+    await call(IpcChannels.CommImportPick)
+    typing('restore-pass-1')
+    expect((await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)).data.error.code).toBe('ticket_expired')
+    expect(seen).toHaveLength(0)
+  })
+  it('a window that waits for a password cannot submit the old backup after a newer pick was started and cancelled', async () => {
+    const first = await pick()
+    let submit!: (pw: string) => Promise<{ done: boolean; value?: any }> // eslint-disable-line @typescript-eslint/no-explicit-any
+    let windowOpen!: () => void
+    let closeWindow!: (v: null) => void
+    const opened = new Promise<void>((r) => { windowOpen = r })
+    promptRestorePassword.mockImplementationOnce(async (_w: unknown, work: typeof submit) => {
+      submit = work
+      windowOpen()
+      return new Promise((resolve) => { closeWindow = resolve }) // the window just sits there
+    })
+    const running = call(IpcChannels.CommIdentityImport, first.ticket, 'alice', false)
+    await opened
+    showOpenDialog.mockResolvedValueOnce({ canceled: true, filePaths: [] })
+    expect(await call(IpcChannels.CommImportPick)).toEqual({ ok: false, cancelled: true })
+    // the user now types the password into the OLD window, first try and retry
+    for (let i = 0; i < 2; i += 1) {
+      const outcome = await submit('restore-pass-1')
+      expect(outcome.done).toBe(true)
+      expect(outcome.value.data.error.code).toBe('superseded')
+    }
+    expect(seen).toHaveLength(0) // no daemon request was made
+    closeWindow(null)
+    await running
+  })
+  it('L-5: a flow that ends while a new pick dialog is open cannot put its old ticket back', async () => {
+    const first = await pick()
+    let release!: () => void
+    promptRestorePassword.mockImplementationOnce(() => new Promise((resolve) => { release = () => resolve(null) }))
+    const running = call(IpcChannels.CommIdentityImport, first.ticket, 'alice', false)
+    await new Promise((r) => setTimeout(r, 20))
+    let finishPick!: (v: unknown) => void
+    showOpenDialog.mockImplementationOnce(() => new Promise((resolve) => { finishPick = resolve }))
+    const picking = call(IpcChannels.CommImportPick)
+    await new Promise((r) => setTimeout(r, 20))
+    release() // the old flow is cancelled while the new dialog is still open
+    expect((await running).data.error.code).toBe('cancelled')
+    finishPick({ canceled: true, filePaths: [] })
+    await picking
+    expect((await call(IpcChannels.CommIdentityImport, first.ticket, 'alice', false)).data.error.code).toBe('ticket_expired')
   })
   it('cancelling the open dialog yields no ticket and nothing else happens', async () => {
     showOpenDialog.mockResolvedValueOnce({ canceled: true, filePaths: [] })
@@ -481,14 +606,14 @@ describe('Restore from backup (CommImportPick / CommIdentityImport)', () => {
     expect(promptRestorePassword).not.toHaveBeenCalled()
     expect(seen).toHaveLength(0)
   })
-  it('restores: the path comes from main, the password from main\'s window, the nickname and default from the page', async () => {
+  it('restores: the backup text was read by main at pick time, the password from main\'s window, the nickname and default from the page', async () => {
     const { ticket } = await pick()
     typing('restore-pass-1')
     const result = await call(IpcChannels.CommIdentityImport, ticket, 'alice', true)
     expect(result.ok).toBe(true)
     expect(seen).toHaveLength(1)
     expect(seen[0]).toMatchObject({ method: 'POST', url: '/api/v1/comm/identity/import', auth: 'Bearer daemon-secret' })
-    expect(JSON.parse(seen[0]!.body)).toEqual({ nickname: 'alice', path: FILE, backup_password: 'restore-pass-1', default: true })
+    expect(JSON.parse(seen[0]!.body)).toEqual({ nickname: 'alice', ncryptsec: NCS, backup_password: 'restore-pass-1', default: true })
     expect(promptRestorePassword).toHaveBeenCalledTimes(1)
   })
   it('a wrong password is retried inside the window; the page only sees the final answer', async () => {
@@ -534,6 +659,13 @@ describe('Restore from backup (CommImportPick / CommIdentityImport)', () => {
     expect(result.ok).toBe(true)
     expect(seen.map((r) => JSON.parse(r.body).backup_password)).toEqual(['bad-input-pass', 'restore-pass-1'])
   })
+  it('an invalid-input answer (empty nickname/password) does not use up an attempt', async () => {
+    const { ticket } = await pick()
+    typing('bad-input-pass', 'bad-input-pass', 'bad-input-pass', 'bad-input-pass', 'restore-pass-1')
+    const result = await call(IpcChannels.CommIdentityImport, ticket, 'alice', false)
+    expect(result.ok).toBe(true)
+    expect(seen).toHaveLength(5)
+  })
   it('a selection survives at most three attempts', async () => {
     const { ticket } = await pick()
     typing() // the user closes the window each time
@@ -565,7 +697,7 @@ describe('Restore from backup (CommImportPick / CommIdentityImport)', () => {
     promptRestorePassword.mockImplementationOnce(() => new Promise((resolve) => { release = () => resolve(null) }))
     const running = call(IpcChannels.CommIdentityImport, first.ticket, 'alice', false)
     await new Promise((r) => setTimeout(r, 20)) // the window for the FIRST selection is open
-    showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: ['/Users/x/Downloads/second.ncryptsec'] })
+    showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [SECOND] })
     const second = await call(IpcChannels.CommImportPick)
     release() // the first flow ends in a cancel
     expect((await running).data.error.code).toBe('cancelled')
@@ -573,7 +705,7 @@ describe('Restore from backup (CommImportPick / CommIdentityImport)', () => {
     expect((await call(IpcChannels.CommIdentityImport, first.ticket, 'alice', false)).data.error.code).toBe('ticket_expired')
     typing('restore-pass-1')
     expect((await call(IpcChannels.CommIdentityImport, second.ticket, 'bob', false)).ok).toBe(true)
-    expect(JSON.parse(seen[0]!.body).path).toBe('/Users/x/Downloads/second.ncryptsec')
+    expect(JSON.parse(seen[0]!.body).ncryptsec).toBe(`ncryptsec1${'p'.repeat(150)}`)
   })
   it('main decides the "will become the default" notice: when asked, OR when there is no default identity yet', async () => {
     identityListHasDefault = false
@@ -654,6 +786,181 @@ describe('Restore from backup (CommImportPick / CommIdentityImport)', () => {
     const result = await call(IpcChannels.CommIdentityImport, { path: '/etc/passwd' }, 'alice', false)
     expect(result.data.error.code).toBe('invalid_request')
     expect(seen).toHaveLength(0)
+  })
+})
+
+describe('L4: whole-home import, relay list and unlock (dedicated IPC)', () => {
+  const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-home-'))
+  const typingHome = (...passwords: string[]) => promptHomeImportPassword.mockImplementation(async (_win: unknown, work: (p: string) => Promise<{ done: boolean; value?: unknown; error?: string }>) => {
+    for (const pw of passwords) {
+      const outcome = await work(pw)
+      if (outcome.done) return outcome.value
+    }
+    return null
+  })
+  const typingUnlock = (...passwords: string[]) => promptUnlockPassword.mockImplementation(async (_win: unknown, work: (p: string) => Promise<{ done: boolean; value?: unknown; error?: string }>) => {
+    for (const pw of passwords) {
+      const outcome = await work(pw)
+      if (outcome.done) return outcome.value
+    }
+    return null
+  })
+
+  it('home import: main picks the folder, confirms natively showing it, then asks for the password itself', async () => {
+    showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [HOME] })
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    typingHome('home-pass-1')
+    const result = await call(IpcChannels.CommHomeImport, '/etc', 'ignored-page-args')
+    expect(result.ok).toBe(true)
+    const dialogOpts = showOpenDialog.mock.calls.at(-1)!.at(-1) as { properties: string[] }
+    expect(dialogOpts.properties).toEqual(['openDirectory'])
+    expect((showMessageBox.mock.calls.at(-1)!.at(-1) as { message: string }).message).toContain(HOME)
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toMatchObject({ method: 'POST', url: '/api/v1/comm/import', auth: 'Bearer daemon-secret' })
+    expect(JSON.parse(seen[0]!.body)).toEqual({ from: HOME, password: 'home-pass-1', confirm: true })
+  })
+  it('home import: declining the folder picker, the confirm or the password window sends nothing', async () => {
+    showOpenDialog.mockResolvedValueOnce({ canceled: true, filePaths: [] })
+    expect((await call(IpcChannels.CommHomeImport)).data.error.code).toBe('cancelled')
+    showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [HOME] })
+    showMessageBox.mockResolvedValueOnce({ response: 1 })
+    expect((await call(IpcChannels.CommHomeImport)).data.error.code).toBe('cancelled')
+    expect(promptHomeImportPassword).not.toHaveBeenCalled()
+    showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [HOME] })
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    typingHome()
+    expect((await call(IpcChannels.CommHomeImport)).data.error.code).toBe('cancelled')
+    expect(seen).toHaveLength(0)
+  })
+  it('home import: a path that is not a folder is refused before the confirm', async () => {
+    showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [path.join(HOME, 'missing')] })
+    showMessageBox.mockClear()
+    expect((await call(IpcChannels.CommHomeImport)).data.error.code).toBe('invalid_request')
+    expect(showMessageBox).not.toHaveBeenCalled()
+    expect(seen).toHaveLength(0)
+  })
+  it('home import: a wrong keystore password is retried inside the window', async () => {
+    showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [HOME] })
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    typingHome('wrong-home', 'home-pass-1')
+    expect((await call(IpcChannels.CommHomeImport)).ok).toBe(true)
+    expect(seen.map((r) => JSON.parse(r.body).password)).toEqual(['wrong-home', 'home-pass-1'])
+  })
+
+  it('relay: a changed list is confirmed natively, then PUT exactly as validated', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    const list = ['wss://a.example', 'ws://localhost:7777']
+    const result = await call(IpcChannels.CommRelaySet, list)
+    expect(result.ok).toBe(true)
+    const opts = showMessageBox.mock.calls.at(-1)!.at(-1) as { message: string; detail: string }
+    expect(opts.detail).toContain('wss://a.example')
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toMatchObject({ method: 'PUT', url: '/api/v1/comm/relay' })
+    expect(JSON.parse(seen[0]!.body)).toEqual({ relays: list })
+  })
+  it('relay: declining the confirm sends nothing; an unchanged list needs no confirm', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 1 })
+    expect((await call(IpcChannels.CommRelaySet, ['wss://a.example'])).data.error.code).toBe('cancelled')
+    expect(seen).toHaveLength(0)
+    showMessageBox.mockClear()
+    const same = await call(IpcChannels.CommRelaySet, ['wss://old.example'])
+    expect(same.ok).toBe(true)
+    // L-8: no dialog and NO daemon write; the answer is the current configuration
+    expect(showMessageBox).not.toHaveBeenCalled()
+    expect(seen).toHaveLength(0)
+    expect(same.data).toEqual({ ok: true, data: { relays: ['wss://old.example'], source: 'config', configured: true } })
+    // the stored list is compared in normalized form
+    currentRelays = { relays: ['wss://Old.Example/'], configured: true }
+    expect((await call(IpcChannels.CommRelaySet, ['wss://old.example'])).ok).toBe(true)
+    expect(seen).toHaveLength(0)
+    // an unconfigured daemon always needs the write
+    currentRelays = { relays: ['wss://old.example'], configured: false }
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    await call(IpcChannels.CommRelaySet, ['wss://old.example'])
+    expect(seen).toHaveLength(1)
+  })
+  it('an @ in the PATH is fine; only userinfo is refused', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    expect((await call(IpcChannels.CommRelaySet, ['wss://x.example/path@tag'])).ok).toBe(true)
+    expect(JSON.parse(seen[0]!.body).relays).toEqual(['wss://x.example/path@tag'])
+  })
+  it('L-9: ws:// is accepted for loopback hosts only', async () => {
+    showMessageBox.mockResolvedValue({ response: 0 })
+    const list = ['ws://localhost', 'ws://127.0.0.1:9', 'ws://127.8.8.8', 'ws://[::1]:7777']
+    expect((await call(IpcChannels.CommRelaySet, list)).ok).toBe(true)
+    expect(JSON.parse(seen[0]!.body).relays).toEqual(list)
+    showMessageBox.mockReset()
+  })
+  it('M-1: the dialog shows every relay in full, one per line, even for 8 maximum-length URLs', async () => {
+    const urls = Array.from({ length: 8 }, (_, i) => `wss://r.example/${String(i).repeat(3)}${'p'.repeat(256 - 'wss://r.example/'.length - 3)}`)
+    expect(urls.every((u) => u.length === 256)).toBe(true)
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    expect((await call(IpcChannels.CommRelaySet, urls)).ok).toBe(true)
+    const detail = (showMessageBox.mock.calls.at(-1)!.at(-1) as { detail: string }).detail
+    const lines = detail.split('\n').slice(0, 8)
+    expect(lines).toEqual(urls) // nothing clipped, nothing hidden, same order
+    expect(detail).not.toContain('truncated')
+    expect(JSON.parse(seen[0]!.body).relays).toEqual(urls)
+  })
+  it('M-2: the dialog and the daemon get the normalized form', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    await call(IpcChannels.CommRelaySet, ['WSS://Relay.Example:443/Path'])
+    expect((showMessageBox.mock.calls.at(-1)!.at(-1) as { detail: string }).detail.startsWith('wss://relay.example/Path\n')).toBe(true)
+    expect(JSON.parse(seen[0]!.body)).toEqual({ relays: ['wss://relay.example/Path'] })
+  })
+  it.each([
+    ['not an array', 'wss://a.example'],
+    ['empty', []],
+    ['nine entries', Array.from({ length: 9 }, (_, i) => `wss://r${i}.example`)],
+    ['https scheme', ['https://a.example']],
+    ['ws:// to a non-loopback host', ['ws://relay.example']],
+    ['ws:// to a lookalike of localhost', ['ws://localhost.evil.example']],
+    ['Cyrillic homoglyph host', ['wss://\u0440elay.example']],
+    ['RLO in the path', ['wss://relay.example/\u202Egpj']],
+    ['zero-width space', ['wss://relay\u200B.example']],
+    ['fragment', ['wss://relay.example/#frag']],
+    ['query string', ['wss://relay.example/?q=1']],
+    ['userinfo', ['user@relay.example', 'wss://user@relay.example']],
+    ['malformed authority [::1]evil', ['ws://[::1]evil']],
+    ['non-numeric port', ['ws://localhost:evil']],
+    ['257-character url', [`wss://r.example/${'p'.repeat(257 - 'wss://r.example/'.length)}`]],
+    ['eight valid and one hidden over-long url', [...Array.from({ length: 7 }, (_, i) => `wss://r${i}.example`), `wss://r.example/${'p'.repeat(300)}`]],
+    ['no scheme', ['a.example']],
+    ['credentials in the url', ['wss://user:pw@a.example']],
+    ['whitespace', ['wss://a.example /x']],
+    ['newline', ['wss://a.example\nwss://b.example']],
+    ['duplicate', ['wss://a.example', 'wss://a.example']],
+    ['non-string entry', [{ url: 'wss://a.example' }]],
+    ['no host', ['wss://']],
+    ['overlong', [`wss://${'a'.repeat(600)}.example`]],
+  ])('relay: refuses %s before any dialog or request', async (_name, list) => {
+    showMessageBox.mockClear()
+    const result = await call(IpcChannels.CommRelaySet, list)
+    expect(result.data.error.code).toBe('invalid_request')
+    expect(showMessageBox).not.toHaveBeenCalled()
+    expect(seen).toHaveLength(0)
+  })
+
+  it('unlock: the password comes from main\'s window; the page only passes the remember flag', async () => {
+    typingUnlock('right-unlock')
+    const result = await call(IpcChannels.CommUnlock, true)
+    expect(result.ok).toBe(true)
+    expect(JSON.parse(seen[0]!.body)).toEqual({ password: 'right-unlock', remember: true })
+    expect(promptUnlockPassword.mock.calls[0]![2]).toEqual({ remember: true })
+  })
+  it('unlock: a wrong password is retried inside the window; closing it is a cancel', async () => {
+    typingUnlock('wrong-unlock', 'right-unlock')
+    expect((await call(IpcChannels.CommUnlock, false)).ok).toBe(true)
+    expect(seen.map((r) => JSON.parse(r.body).password)).toEqual(['wrong-unlock', 'right-unlock'])
+    seen = []
+    typingUnlock()
+    expect((await call(IpcChannels.CommUnlock, false)).data.error.code).toBe('cancelled')
+    expect(seen).toHaveLength(0)
+  })
+  it.each([['a string', 'true'], ['an object', { remember: true }], ['a number', 1]])('unlock: refuses %s as the remember flag before any window', async (_name, flag) => {
+    const result = await call(IpcChannels.CommUnlock, flag)
+    expect(result.data.error.code).toBe('invalid_request')
+    expect(promptUnlockPassword).not.toHaveBeenCalled()
   })
 })
 

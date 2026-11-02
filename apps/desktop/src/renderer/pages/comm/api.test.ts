@@ -9,7 +9,8 @@ import {
   restoreCommIdentity,
   sendCommMessage,
   getCommStatus,
-  importCommIdentity,
+  importCommHome,
+  setCommRelay,
   installComm,
   listCommContacts,
   listCommIdentities,
@@ -83,22 +84,20 @@ describe('COMM typed backend API', () => {
     ])
   })
 
-  it('issues one start, stop, and unlock request with the exact remember option', async () => {
-    const proxy = setProxy(((({ path }: { path: string }) => {
-      if (path.endsWith('/unlock')) return successful({ unlocked: true, remembered: false })
-      return successful(status)
-    }) as never))
+  it('issues one start and stop request through the proxy, and unlock through its own IPC with only the remember flag', async () => {
+    const proxy = setProxy(((() => successful(status)) as never))
+    const commUnlock = vi.fn(async () => successful({ unlocked: true, remembered: false }))
+    window.agent24 = { ...window.agent24, commUnlock } as never
 
     await expect(startCommDaemon()).resolves.toEqual(status)
     await expect(stopCommDaemon()).resolves.toEqual(status)
-    await expect(unlockComm('secret-one')).resolves.toEqual({ unlocked: true, remembered: false })
-    await expect(unlockComm('secret-two', true)).resolves.toEqual({ unlocked: true, remembered: false })
+    await expect(unlockComm()).resolves.toEqual({ unlocked: true, remembered: false })
+    await expect(unlockComm(true)).resolves.toEqual({ unlocked: true, remembered: false })
     expect(proxy.mock.calls.map(([request]) => request)).toEqual([
       { method: 'POST', path: '/api/v1/comm/daemon/start' },
       { method: 'POST', path: '/api/v1/comm/daemon/stop' },
-      { method: 'POST', path: '/api/v1/comm/unlock', body: { password: 'secret-one', remember: false } },
-      { method: 'POST', path: '/api/v1/comm/unlock', body: { password: 'secret-two', remember: true } },
     ])
+    expect(commUnlock.mock.calls).toEqual([[false], [true]])
   })
 
   it('preserves HTTP error code/message including unauthorized responses', async () => {
@@ -146,33 +145,16 @@ describe('COMM typed backend API', () => {
     expect(proxy).toHaveBeenCalledTimes(1)
   })
 
-  it('never reflects the password in unlock errors and does not retry', async () => {
-    const password = 'super-secret-value'
-    const proxy = setProxy((() => ({
-      ok: false,
-      status: 401,
-      data: { error: { code: 'locked', message: `invalid password ${password}` } },
-    })) as never)
-    const log = vi.spyOn(console, 'error')
-
-    let rejection: unknown
-    try {
-      await unlockComm(password, true)
-    } catch (error) {
-      rejection = error
-    }
-    expect(rejection).toBeInstanceOf(CommApiError)
-    expect((rejection as Error).message).not.toContain(password)
-    expect((rejection as CommApiError).code).toBe('locked')
-    expect(proxy).toHaveBeenCalledTimes(1)
-    expect(log).not.toHaveBeenCalled()
-  })
-
-  it('does not reflect a rejected IPC error that happens to contain the password', async () => {
-    const password = 'ipc-secret'
-    const proxy = setProxy((() => Promise.reject(new Error(`native failure: ${password}`))) as never)
-    await expect(unlockComm(password)).rejects.toThrow('Unlock request failed')
-    expect(proxy).toHaveBeenCalledTimes(1)
+  it('unlock never goes through the generic proxy and a dismissed window is a cancelled error', async () => {
+    const proxy = setProxy(() => { throw new Error('generic proxy must not unlock') })
+    const commUnlock = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 499, data: { error: { code: 'cancelled', message: 'c' } } })
+      .mockRejectedValueOnce(new Error('native failure'))
+    window.agent24 = { ...window.agent24, commUnlock } as never
+    await expect(unlockComm()).rejects.toMatchObject({ code: 'cancelled' })
+    await expect(unlockComm()).rejects.toThrow('COMM backend request failed')
+    expect(proxy).not.toHaveBeenCalled()
+    expect(commUnlock).toHaveBeenCalledTimes(2)
   })
 
   it('real daemon error shape {ok:false,error:code,message} keeps both the code and the message', async () => {
@@ -186,13 +168,21 @@ describe('COMM typed backend API', () => {
     expect(failure).toMatchObject({ code: 'not_configured', message: 'no Hyphae binary is configured; set A24_HYPHAE_BIN', status: 409 })
   })
 
-  it('importCommIdentity never reflects the source keystore password in a thrown error', async () => {
-    const password = 'import-secret-pw'
-    setProxy(() => ({ ok: false, status: 409, data: { ok: false, error: 'locked', message: `bad password ${password}` } }))
-    const failure = await importCommIdentity('/Users/alice', password).catch((e: unknown) => e)
-    expect(failure).toBeInstanceOf(CommApiError)
-    expect((failure as Error).message).not.toContain(password)
-    expect(failure).toMatchObject({ code: 'locked', status: 409 })
+  it('whole-home import and the relay list use dedicated IPC with no path or password from the page', async () => {
+    const proxy = setProxy(() => { throw new Error('generic proxy must not import or set relays') })
+    const report = { identities: 1, contacts: 2, outbox: 0, db_files: ['a.db'] }
+    const commHomeImport = vi.fn()
+      .mockResolvedValueOnce(successful(report))
+      .mockResolvedValueOnce({ ok: false, status: 499, data: { error: { code: 'cancelled', message: 'c' } } })
+    const config = { relays: ['wss://r.example'], source: 'config', configured: true }
+    const commRelaySet = vi.fn(async () => successful(config))
+    window.agent24 = { ...window.agent24, commHomeImport, commRelaySet } as never
+    await expect(importCommHome()).resolves.toEqual(report)
+    await expect(importCommHome()).rejects.toMatchObject({ code: 'cancelled' })
+    expect(commHomeImport.mock.calls.every((c) => c.length === 0)).toBe(true)
+    await expect(setCommRelay(['wss://r.example'])).resolves.toEqual(config)
+    expect(commRelaySet).toHaveBeenCalledWith(['wss://r.example'])
+    expect(proxy).not.toHaveBeenCalled()
   })
 })
 
@@ -250,6 +240,11 @@ describe('COMM restore wrappers', () => {
     window.agent24 = { ...window.agent24, commImportPick } as never
     await expect(pickCommBackup()).resolves.toEqual({ ticket: 't1', fileName: 'a.ncryptsec' })
     await expect(pickCommBackup()).resolves.toBeNull()
+  })
+  it('pick reports a file main could not use as a backup', async () => {
+    const commImportPick = vi.fn().mockResolvedValueOnce({ ok: false, cancelled: false, message: 'not a backup' })
+    window.agent24 = { ...window.agent24, commImportPick } as never
+    await expect(pickCommBackup()).rejects.toMatchObject({ code: 'invalid_key', message: 'not a backup' })
   })
   it('restore goes through the dedicated IPC with ticket, nickname and default ONLY (no password)', async () => {
     const proxy = setProxy(() => { throw new Error('generic proxy must not restore keys') })

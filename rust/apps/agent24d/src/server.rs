@@ -4602,10 +4602,14 @@ pub(crate) mod tests {
     /// not a stub handler: the restriction must hold on the actual route.
     #[tokio::test]
     async fn key_backup_restriction_holds_on_the_real_comm_router() {
-        let body = || {
-            Body::from(
-                r#"{"nickname":"a","path":"/tmp/x.ncryptsec","backup_password":"long-enough-1"}"#,
-            )
+        // Export names a path; restore carries the backup text itself (the
+        // desktop reads the file, the daemon never opens a caller-named path).
+        let body = |uri: &str| {
+            Body::from(if uri.ends_with("/export") {
+                r#"{"nickname":"a","path":"/tmp/x.ncryptsec","backup_password":"long-enough-1"}"#
+            } else {
+                r#"{"nickname":"a","ncryptsec":"ncryptsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq","backup_password":"long-enough-1"}"#
+            })
         };
         for uri in [
             "/api/v1/comm/identity/export",
@@ -4617,7 +4621,7 @@ pub(crate) mod tests {
                     .uri(uri)
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
-                    .body(body())
+                    .body(body(uri))
                     .unwrap()
             };
             let dir = tempfile::tempdir().unwrap();

@@ -15,8 +15,11 @@
 //!   and only then creates the file itself, relative to a directory descriptor
 //!   pinned *before* the export: `openat(O_CREAT|O_EXCL|O_NOFOLLOW, 0600)` to a
 //!   random staging name, write, `fsync`, `linkat` to the final name (which
-//!   fails rather than replace anything), unlink the staging name, `fsync` the
-//!   directory. There is no window between "check" and "use" in which a path
+//!   fails rather than replace anything; on file systems without hard links an
+//!   exclusive rename takes over, and failing that `filesystem_unsupported`),
+//!   then prove the final name is the very inode that was written (`fstatat`
+//!   without following links, compared by device and inode; otherwise the name
+//!   is removed again), unlink the staging name, `fsync` the directory. There is no window between "check" and "use" in which a path
 //!   component or the file itself could be swapped: nothing is checked after
 //!   the fact, the daemon creates what it writes.
 //! - The "destination is outside the Hyphae home" check, decided from the
@@ -45,7 +48,7 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -54,7 +57,7 @@ use axum::http::StatusCode;
 use bech32::{Bech32, Hrp};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::fs::{AtFlags, Mode, OFlags};
 use serde_json::{Value, json};
 use unicode_normalization::UnicodeNormalization;
 use zeroize::Zeroizing;
@@ -65,8 +68,6 @@ use crate::runner::{Envelope, HyphaeRunner, Invocation, RunnerError, hold_until_
 
 pub(crate) const BACKUP_PASSWORD_MIN_CHARS: usize = 8;
 pub(crate) const BACKUP_PASSWORD_MAX_BYTES: usize = 1024;
-/// A NIP-49 string is ~163 bytes; anything near this is not a backup.
-pub(crate) const BACKUP_FILE_MAX_BYTES: u64 = 4096;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Hyphae's `{nickname, npub, ncryptsec}` line is 8 KiB at most. This is the
 /// hard size of the preallocated stdout/stderr buffers, which therefore never
@@ -367,8 +368,23 @@ pub(crate) struct Staged {
 #[derive(Default, Clone, Copy)]
 pub(crate) struct Faults {
     pub fail_cleanup: bool,
+    /// Test hook: the write of the last-resort direct create fails.
+    pub fail_final_write: bool,
+    /// Test hook: removing our partial file at the final name fails.
+    pub fail_final_cleanup: bool,
+    /// Test hook: right after publishing, the user's own file takes the final name.
+    pub swap_after_publish: bool,
     pub fail_write: bool,
     pub fail_dir_sync: bool,
+    /// Test hook: replace the staging name with a different file after the
+    /// write was verified and before it is published (M1).
+    pub swap_before_publish: bool,
+    /// Test hook: make `linkat` fail with this errno.
+    pub link_errno: Option<rustix::io::Errno>,
+    /// Test hook: make the exclusive-rename fallback fail with this errno.
+    pub rename_errno: Option<rustix::io::Errno>,
+    /// Test hook: make the last-resort exclusive create fail with this errno.
+    pub create_errno: Option<rustix::io::Errno>,
 }
 
 /// A published backup, plus anything that could not be confirmed afterwards.
@@ -393,6 +409,135 @@ impl PublishOutcome {
             out.push(json!({"code": "durability_unconfirmed"}));
         }
         (!out.is_empty()).then_some(Value::Array(out))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PublishMethod {
+    Linked,
+    Renamed,
+}
+
+enum PublishError {
+    /// The final name appeared in the meantime.
+    Exists,
+    /// This file system can neither hard-link nor rename exclusively.
+    Unsupported,
+    /// The user may not write here (EPERM/EACCES).
+    PermissionDenied,
+    Other,
+}
+
+/// `linkat` failures that mean "this file system has no hard links" (FAT,
+/// exFAT, some SMB/NFS mounts, cross-device mounts) rather than a real error.
+/// EPERM is ambiguous (Linux vfat says EPERM for "no hard links", but so does
+/// a real permission problem): it tries the exclusive rename too, and only if
+/// that is refused as well does it become `permission_denied`.
+fn link_unsupported(e: rustix::io::Errno) -> bool {
+    use rustix::io::Errno;
+    e == Errno::PERM
+        || e == Errno::NOTSUP
+        || e == Errno::OPNOTSUPP
+        || e == Errno::XDEV
+        || e == Errno::MLINK
+}
+
+/// Exclusive-rename failures that mean "not supported here".
+fn rename_unsupported(e: rustix::io::Errno) -> bool {
+    use rustix::io::Errno;
+    e == Errno::INVAL
+        || e == Errno::NOSYS
+        || e == Errno::NOTSUP
+        || e == Errno::OPNOTSUPP
+        || e == Errno::XDEV
+        || e == Errno::MLINK
+}
+
+fn permission_errno(e: rustix::io::Errno) -> bool {
+    e == rustix::io::Errno::PERM || e == rustix::io::Errno::ACCESS
+}
+
+/// `renameat` that fails with `EEXIST` instead of replacing the target
+/// (`renameatx_np(RENAME_EXCL)` on macOS, `renameat2(RENAME_NOREPLACE)` on Linux).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rename_noreplace(
+    dir: &OwnedFd,
+    from: &std::ffi::OsStr,
+    to: &std::ffi::OsStr,
+) -> Result<(), rustix::io::Errno> {
+    use std::os::fd::AsFd;
+    rustix1::fs::renameat_with(
+        dir.as_fd(),
+        from,
+        dir.as_fd(),
+        to,
+        rustix1::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|e| rustix::io::Errno::from_raw_os_error(e.raw_os_error()))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rename_noreplace(
+    _dir: &OwnedFd,
+    _from: &std::ffi::OsStr,
+    _to: &std::ffi::OsStr,
+) -> Result<(), rustix::io::Errno> {
+    Err(rustix::io::Errno::NOSYS)
+}
+
+fn permission_denied() -> CommError {
+    CommError::Coded(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "permission_denied",
+        "Agent24 can't write to this folder; check its permissions".to_owned(),
+    )
+}
+
+fn filesystem_unsupported() -> CommError {
+    CommError::Coded(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "filesystem_unsupported",
+        "this location's file system doesn't support safe backup writes; choose another folder (e.g. on the internal disk)".to_owned(),
+    )
+}
+
+impl Staged {
+    /// Puts the staging file under the final name without ever replacing
+    /// anything: `linkat`, or on file systems without hard links an exclusive
+    /// rename (`RENAME_EXCL` / `RENAME_NOREPLACE`).
+    fn publish_exclusive(&self) -> Result<PublishMethod, PublishError> {
+        let linked = match self.faults.link_errno {
+            Some(e) => Err(e),
+            None => rustix::fs::linkat(
+                &self.dest.parent,
+                self.staging_name.as_os_str(),
+                &self.dest.parent,
+                self.dest.name.as_os_str(),
+                AtFlags::empty(),
+            ),
+        };
+        match linked {
+            Ok(()) => return Ok(PublishMethod::Linked),
+            Err(e) if e == rustix::io::Errno::EXIST => return Err(PublishError::Exists),
+            Err(e) if e == rustix::io::Errno::ACCESS => return Err(PublishError::PermissionDenied),
+            Err(e) if link_unsupported(e) => {}
+            Err(_) => return Err(PublishError::Other),
+        }
+        let renamed = match self.faults.rename_errno {
+            Some(e) => Err(e),
+            None => rename_noreplace(
+                &self.dest.parent,
+                self.staging_name.as_os_str(),
+                self.dest.name.as_os_str(),
+            ),
+        };
+        match renamed {
+            Ok(()) => Ok(PublishMethod::Renamed),
+            Err(e) if e == rustix::io::Errno::EXIST => Err(PublishError::Exists),
+            Err(e) if permission_errno(e) => Err(PublishError::PermissionDenied),
+            Err(e) if rename_unsupported(e) => Err(PublishError::Unsupported),
+            Err(_) => Err(PublishError::Other),
+        }
     }
 }
 
@@ -443,12 +588,16 @@ impl Staged {
     /// Give up: remove whatever sits at the staging name. If that cannot be
     /// done, say a partial encrypted file may remain, and where.
     fn abandon(&self, why: &str) -> CommError {
-        let gone = rustix::fs::statat(
-            &self.dest.parent,
-            self.staging_name.as_os_str(),
-            AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .is_err();
+        // Only "does not exist" counts as gone; EACCES/EIO must still report
+        // the possible leftover.
+        let gone = matches!(
+            rustix::fs::statat(
+                &self.dest.parent,
+                self.staging_name.as_os_str(),
+                AtFlags::SYMLINK_NOFOLLOW,
+            ),
+            Err(rustix::io::Errno::NOENT)
+        );
         if gone || self.unlink_staging() {
             upstream(why)
         } else {
@@ -457,6 +606,148 @@ impl Staged {
                 self.staging_path().display()
             ))
         }
+    }
+
+    /// The final name must be the inode that was written. If it is not,
+    /// something else sits there now (maybe the user's own file, moved in
+    /// between): it is NEVER deleted, only reported.
+    fn verify_final(&self, want: &rustix::fs::Stat) -> Result<(), CommError> {
+        if self.faults.swap_after_publish {
+            // Test hook: the user's own file takes the final name.
+            let _ = rustix::fs::unlinkat(
+                &self.dest.parent,
+                self.dest.name.as_os_str(),
+                AtFlags::empty(),
+            );
+            let _ = std::fs::write(
+                self.dest.parent_path.join(&self.dest.name),
+                b"the user's own file\n",
+            );
+        }
+        if self.is_ours(&self.dest.name, want) {
+            return Ok(());
+        }
+        Err(CommError::Coded(
+            StatusCode::CONFLICT,
+            "publish_conflict",
+            format!(
+                "another file appeared at {}; Agent24 left it untouched; your backup was not saved there",
+                self.dest.parent_path.join(&self.dest.name).display()
+            ),
+        ))
+    }
+
+    /// Is `name` (not followed if a link) the inode `want`?
+    fn is_ours(&self, name: &OsString, want: &rustix::fs::Stat) -> bool {
+        rustix::fs::statat(
+            &self.dest.parent,
+            name.as_os_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .is_ok_and(|st| st.st_dev == want.st_dev && st.st_ino == want.st_ino)
+    }
+
+    /// Remove the staging name, but only if it still is our inode. Returns the
+    /// path if it is ours and could not be removed.
+    fn unlink_staging_if_ours(&self, want: &rustix::fs::Stat) -> Option<PathBuf> {
+        (self.is_ours(&self.staging_name, want) && !self.unlink_staging())
+            .then(|| self.staging_path())
+    }
+
+    /// Last resort for file systems with neither hard links nor an exclusive
+    /// rename (exFAT on macOS): create the FINAL name with
+    /// `O_CREAT|O_EXCL|O_NOFOLLOW` (still never replacing anything, and the
+    /// inode is ours), write, fsync, then the same identity check.
+    ///
+    /// Unlike the staged paths this is NOT atomic: a crash mid-write can leave
+    /// a partial, undecryptable file at the final name. A failed write removes
+    /// it again, but only if the name still is our inode; if it cannot be
+    /// removed the error names the leftover.
+    fn create_exclusive_final(&self, text: &str) -> Result<PublishOutcome, CommError> {
+        use rustix::io::Errno;
+        let opened = match self.faults.create_errno {
+            Some(e) => Err(e),
+            None => rustix::fs::openat(
+                &self.dest.parent,
+                self.dest.name.as_os_str(),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            ),
+        };
+        let fd = match opened {
+            Ok(fd) => fd,
+            Err(e) if e == Errno::EXIST => return Err(target_exists()),
+            Err(e) if permission_errno(e) => return Err(permission_denied()),
+            Err(e)
+                if e == Errno::NOTSUP
+                    || e == Errno::OPNOTSUPP
+                    || e == Errno::INVAL
+                    || e == Errno::NOSYS =>
+            {
+                return Err(filesystem_unsupported());
+            }
+            Err(_) => return Err(upstream("publishing the backup file failed")),
+        };
+        // Best effort: many of these file systems have no owners or modes.
+        let _ = rustix::fs::fchmod(&fd, Mode::RUSR | Mode::WUSR);
+        let final_path = self.dest.parent_path.join(&self.dest.name);
+        let leftover = || {
+            CommError::Upstream(format!(
+                "a partial encrypted backup may remain at {}; it cannot be decrypted; delete it",
+                final_path.display()
+            ))
+        };
+        let mut file = File::from(fd);
+        let written = if self.faults.fail_final_write {
+            Err(std::io::Error::other("injected write failure"))
+        } else {
+            file.write_all(text.as_bytes())
+                .and_then(|()| file.write_all(b"\n"))
+                .and_then(|()| file.sync_all())
+        };
+        // Identity of what we wrote, read AFTER the data is on disk and while
+        // the fd is open: exFAT derives inode numbers from the allocation, so a
+        // number read right after open can differ from the final one.
+        let now = rustix::fs::fstat(&file);
+        if written.is_err() || now.is_err() {
+            // Remove the partial file only while the name is still our inode;
+            // with no identity to prove that, delete nothing.
+            let result = if let Ok(now) = &now
+                && self.is_ours(&self.dest.name, now)
+            {
+                if self.faults.fail_final_cleanup {
+                    Err(())
+                } else {
+                    rustix::fs::unlinkat(
+                        &self.dest.parent,
+                        self.dest.name.as_os_str(),
+                        AtFlags::empty(),
+                    )
+                    .map_err(|_| ())
+                }
+            } else if now.is_err() {
+                Err(())
+            } else {
+                Ok(()) // not ours any more: nothing of ours to remove
+            };
+            drop(file);
+            return Err(match result {
+                Ok(()) => upstream("writing the backup file failed"),
+                Err(()) => leftover(),
+            });
+        }
+        // The fd stays open through the check, so the inode cannot be reused.
+        let Ok(want) = now else {
+            return Err(leftover());
+        };
+        let checked = self.verify_final(&want);
+        drop(file);
+        checked?;
+        let mut outcome = PublishOutcome::default();
+        if self.faults.fail_dir_sync || rustix::fs::fsync(&self.dest.parent).is_err() {
+            outcome.durability_unconfirmed = true;
+        }
+        Ok(outcome)
     }
 
     /// Create the staging file (`O_EXCL|O_NOFOLLOW`, 0600, our inode), write
@@ -488,31 +779,82 @@ impl Staged {
                 .and_then(|()| file.write_all(b"\n"))
                 .and_then(|()| file.sync_all())
         };
-        drop(file);
         if written.is_err() {
+            drop(file);
             return Err(self.abandon("writing the backup file failed"));
         }
-        match rustix::fs::linkat(
-            &self.dest.parent,
-            self.staging_name.as_os_str(),
-            &self.dest.parent,
-            self.dest.name.as_os_str(),
-            AtFlags::empty(),
-        ) {
-            Ok(()) => {}
-            Err(e) if e == rustix::io::Errno::EXIST => {
+        // The identity of the inode we wrote and verified. The fd stays open
+        // until after publishing, so the inode number cannot be recycled.
+        let Ok(want) = rustix::fs::fstat(&file) else {
+            drop(file);
+            return Err(self.abandon("cannot inspect the new backup file"));
+        };
+        if self.faults.swap_before_publish {
+            let _ = rustix::fs::unlinkat(
+                &self.dest.parent,
+                self.staging_name.as_os_str(),
+                AtFlags::empty(),
+            );
+            let _ = std::fs::write(self.staging_path(), b"impostor\n");
+        }
+        let published = self.publish_exclusive();
+        let method = match published {
+            Ok(m) => m,
+            Err(PublishError::Exists) => {
+                drop(file);
                 return Err(match self.abandon("target_exists") {
                     CommError::Upstream(m) if m.contains("may remain") => CommError::Upstream(m),
                     _ => target_exists(),
                 });
             }
-            Err(_) => return Err(self.abandon("publishing the backup file failed")),
+            Err(PublishError::Unsupported) => {
+                drop(file);
+                // Neither a hard link nor an exclusive rename works here
+                // (exFAT on macOS): remove the staging file, then create the
+                // final name directly with O_EXCL as the last resort.
+                if let CommError::Upstream(m) = self.abandon("filesystem_unsupported")
+                    && m.contains("may remain")
+                {
+                    return Err(CommError::Upstream(m));
+                }
+                return self.create_exclusive_final(text);
+            }
+            Err(PublishError::PermissionDenied) => {
+                drop(file);
+                return Err(match self.abandon("permission_denied") {
+                    CommError::Upstream(m) if m.contains("may remain") => CommError::Upstream(m),
+                    _ => permission_denied(),
+                });
+            }
+            Err(PublishError::Other) => {
+                drop(file);
+                return Err(self.abandon("publishing the backup file failed"));
+            }
+        };
+        // `linkat`/`renameat` publish a NAME, not the descriptor we verified.
+        // Prove the final name is that very inode. If not, report it: whatever
+        // sits there is never deleted or replaced (it may be the user's file).
+        let checked = self.verify_final(&want);
+        drop(file);
+        if let Err(e) = checked {
+            let leftover = self.unlink_staging_if_ours(&want);
+            return Err(match (e, leftover) {
+                (CommError::Coded(status, code, msg), Some(staging)) => CommError::Coded(
+                    status,
+                    code,
+                    format!(
+                        "{msg}; a complete encrypted backup may remain at {}",
+                        staging.display()
+                    ),
+                ),
+                (e, _) => e,
+            });
         }
-        // Published and complete; the staging name is now just a second link.
-        // Neither of the two follow-ups below rolls the target back: they are
-        // reported to the caller instead.
+        // Published and complete. After `linkat` the staging name is just a
+        // second link; after the rename fallback there is none. Neither
+        // follow-up below rolls the target back: they are reported instead.
         let mut outcome = PublishOutcome::default();
-        if !self.unlink_staging() {
+        if method == PublishMethod::Linked && !self.unlink_staging() {
             tracing::warn!(
                 path = %self.staging_path().display(),
                 "backup published but its staging link could not be removed"
@@ -638,63 +980,35 @@ pub(crate) async fn export_identity_backup(
 // restore
 // ---------------------------------------------------------------------
 
-/// Reads a backup file safely: absolute path, parent opened once, the file
-/// opened relative to it with `O_NOFOLLOW|O_NONBLOCK` (so a FIFO cannot hang
-/// us), regular file only, at most 4 KiB, a single `ncryptsec1…` line.
-pub(crate) fn read_backup_file(path: &Path) -> Result<String, CommError> {
-    let invalid = |m: &str| CommError::Invalid(m.to_owned());
-    if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
-        return Err(invalid("path must be absolute"));
-    }
-    let name = path
-        .file_name()
-        .ok_or_else(|| invalid("path must name a file"))?;
-    let parent_path = path
-        .parent()
-        .ok_or_else(|| invalid("path must name a file"))?;
-    let parent = rustix::fs::open(
-        parent_path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
+fn invalid_key() -> CommError {
+    CommError::Coded(
+        StatusCode::BAD_REQUEST,
+        "invalid_key",
+        "the text is not an ncryptsec backup".to_owned(),
     )
-    .map_err(|_| invalid("the backup file's folder does not exist"))?;
-    let fd = rustix::fs::openat(
-        &parent,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|e| {
-        if e == rustix::io::Errno::NOENT {
-            CommError::NotFound("backup file not found".to_owned())
-        } else {
-            invalid("cannot open the backup file (it must be a regular file, not a link)")
-        }
-    })?;
-    let st = rustix::fs::fstat(&fd).map_err(|_| invalid("cannot inspect the backup file"))?;
-    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
-        return Err(invalid("the backup must be a regular file"));
+}
+
+/// Strict shape check of the backup text a restore request carries: exactly
+/// one `ncryptsec1…` token of at most 200 ASCII graphic characters, with no
+/// whitespace or line break anywhere (the desktop strips the file's own
+/// trailing newline before sending it). Cheap, so it runs before anything else.
+pub(crate) fn parse_backup_text(text: &str) -> Result<&str, CommError> {
+    if text.is_empty() || text.len() > NCRYPTSEC_MAX_LEN || !text.starts_with(NCRYPTSEC_PREFIX) {
+        return Err(invalid_key());
     }
-    if st.st_size <= 0 || st.st_size as u64 > BACKUP_FILE_MAX_BYTES {
-        return Err(invalid("the backup file has an unexpected size"));
+    if text.contains(|c: char| !c.is_ascii_graphic()) {
+        return Err(invalid_key());
     }
-    let mut text = String::new();
-    File::from(fd)
-        .take(BACKUP_FILE_MAX_BYTES)
-        .read_to_string(&mut text)
-        .map_err(|_| invalid("the backup file is not text"))?;
-    let line = text.strip_suffix('\n').unwrap_or(&text);
-    let line = line.strip_suffix('\r').unwrap_or(line);
-    if !line.starts_with(NCRYPTSEC_PREFIX)
-        || line.contains(|c: char| c.is_whitespace() || !c.is_ascii_graphic())
-    {
-        return Err(CommError::Coded(
-            StatusCode::BAD_REQUEST,
-            "invalid_key",
-            "the file is not an ncryptsec backup".to_owned(),
-        ));
-    }
-    Ok(line.to_owned())
+    Ok(text)
+}
+
+/// The full structural check (bech32 checksum, HRP, payload length, version,
+/// log_n) mapped to a client error. Hyphae decrypts it anyway; this just
+/// refuses obvious garbage before the keystore is touched.
+pub(crate) fn check_backup_structure(text: &str) -> Result<(), CommError> {
+    validate_ncryptsec(text)
+        .map(|_| ())
+        .map_err(|_| invalid_key())
 }
 
 /// What Hyphae's `identity import` stable error codes mean to us.
@@ -1067,7 +1381,7 @@ mod tests {
             Faults {
                 fail_cleanup: true,
                 fail_dir_sync: true,
-                fail_write: false,
+                ..Faults::default()
             },
         );
         assert!(o.cleanup_failed.is_some() && o.durability_unconfirmed);
@@ -1101,6 +1415,403 @@ mod tests {
         // a dangling symlink at the target counts as existing
         std::os::unix::fs::symlink(out.join("nowhere"), out.join("f.ncryptsec")).unwrap();
         assert!(Staged::begin(&out.join("f.ncryptsec"), &home).is_err());
+    }
+
+    #[test]
+    fn permission_problems_are_not_reported_as_an_unsupported_file_system() {
+        use rustix::io::Errno;
+        let code = |e: &CommError| match e {
+            CommError::Coded(_, code, msg) => (*code, msg.clone()),
+            other => panic!("{other:?}"),
+        };
+        // (linkat errno, rename errno): permission wins unless a rename works
+        for (link, rename) in [
+            (Errno::ACCESS, None),
+            (Errno::PERM, Some(Errno::PERM)),
+            (Errno::PERM, Some(Errno::ACCESS)),
+            (Errno::NOTSUP, Some(Errno::ACCESS)),
+            (Errno::XDEV, Some(Errno::PERM)),
+        ] {
+            let (_t, home, out) = sandbox();
+            let err = Staged::begin_with(
+                &out.join("p.ncryptsec"),
+                &home,
+                Faults {
+                    link_errno: Some(link),
+                    rename_errno: rename,
+                    ..Faults::default()
+                },
+            )
+            .unwrap()
+            .write_and_publish(SPEC_NCRYPTSEC)
+            .unwrap_err();
+            let (c, msg) = code(&err);
+            assert_eq!(c, "permission_denied", "{link:?}/{rename:?}");
+            assert!(msg.contains("check its permissions"));
+            assert!(leftovers(&out).is_empty());
+        }
+        // ENOTSUP-like errors stay "unsupported", and a working rename rescues EPERM
+        let (_t, home, out) = sandbox();
+        let err = Staged::begin_with(
+            &out.join("q.ncryptsec"),
+            &home,
+            Faults {
+                link_errno: Some(Errno::NOTSUP),
+                rename_errno: Some(Errno::NOTSUP),
+                create_errno: Some(Errno::NOTSUP),
+                ..Faults::default()
+            },
+        )
+        .unwrap()
+        .write_and_publish(SPEC_NCRYPTSEC)
+        .unwrap_err();
+        assert_eq!(code(&err).0, "filesystem_unsupported");
+        Staged::begin_with(
+            &out.join("r.ncryptsec"),
+            &home,
+            Faults {
+                link_errno: Some(Errno::PERM),
+                ..Faults::default()
+            },
+        )
+        .unwrap()
+        .write_and_publish(SPEC_NCRYPTSEC)
+        .unwrap();
+        assert!(out.join("r.ncryptsec").exists());
+    }
+
+    /// L-2: run with `A24_FS_TEST_DIRS=/Volumes/A24EX/x:/Volumes/A24FAT/x`
+    /// (directories on real exFAT / FAT volumes) and `--ignored`.
+    #[test]
+    #[ignore = "needs real FAT/exFAT directories in A24_FS_TEST_DIRS"]
+    fn publishing_works_on_real_filesystems() {
+        let dirs = std::env::var("A24_FS_TEST_DIRS").expect("A24_FS_TEST_DIRS");
+        for dir in dirs.split(':').filter(|d| !d.is_empty()) {
+            let (_t, home, _out) = sandbox();
+            let out = PathBuf::from(dir);
+            std::fs::create_dir_all(&out).unwrap();
+            let dest = out.join(format!("real-{}.ncryptsec", std::process::id()));
+            let _ = std::fs::remove_file(&dest);
+            let outcome = Staged::begin(&dest, &home)
+                .unwrap()
+                .write_and_publish(SPEC_NCRYPTSEC)
+                .unwrap_or_else(|e| panic!("{dir}: {e:?}"));
+            eprintln!("{dir}: published, outcome {outcome:?}");
+            assert_eq!(
+                std::fs::read_to_string(&dest).unwrap(),
+                format!("{SPEC_NCRYPTSEC}\n")
+            );
+            let stray: Vec<_> = std::fs::read_dir(&out)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(".agent24"))
+                .collect();
+            assert!(stray.is_empty(), "{dir}: {stray:?}");
+            // a second publish to the same name is refused, not replaced
+            assert!(Staged::begin(&dest, &home).is_err());
+            std::fs::remove_file(&dest).unwrap();
+        }
+    }
+
+    fn leftovers(out: &Path) -> Vec<String> {
+        std::fs::read_dir(out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_file_swapped_in_between_write_and_publish_is_reported_and_never_deleted() {
+        let (_t, home, out) = sandbox();
+        let dest = out.join("swap.ncryptsec");
+        let staged = Staged::begin_with(
+            &dest,
+            &home,
+            Faults {
+                swap_before_publish: true,
+                ..Faults::default()
+            },
+        )
+        .unwrap();
+        let err = staged.write_and_publish(SPEC_NCRYPTSEC).unwrap_err();
+        assert!(
+            matches!(&err, CommError::Coded(_, "publish_conflict", _)),
+            "{err:?}"
+        );
+        // what sits at the final name is not ours: left untouched
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "impostor\n");
+    }
+
+    #[test]
+    fn the_users_own_file_that_takes_the_final_name_survives_on_every_tier() {
+        use rustix::io::Errno;
+        let tiers: [(&str, Faults); 3] = [
+            ("linkat", Faults::default()),
+            (
+                "rename",
+                Faults {
+                    link_errno: Some(Errno::NOTSUP),
+                    ..Faults::default()
+                },
+            ),
+            (
+                "direct create",
+                Faults {
+                    link_errno: Some(Errno::NOTSUP),
+                    rename_errno: Some(Errno::NOTSUP),
+                    ..Faults::default()
+                },
+            ),
+        ];
+        for (tier, faults) in tiers {
+            let (_t, home, out) = sandbox();
+            let dest = out.join("mine.ncryptsec");
+            let err = Staged::begin_with(
+                &dest,
+                &home,
+                Faults {
+                    swap_after_publish: true,
+                    ..faults
+                },
+            )
+            .unwrap()
+            .write_and_publish(SPEC_NCRYPTSEC)
+            .unwrap_err();
+            match &err {
+                CommError::Coded(_, "publish_conflict", msg) => {
+                    assert!(msg.contains(&dest.display().to_string()), "{tier}: {msg}");
+                    assert!(msg.contains("left it untouched"), "{tier}: {msg}");
+                    assert!(
+                        msg.contains("your backup was not saved there"),
+                        "{tier}: {msg}"
+                    );
+                }
+                other => panic!("{tier}: {other:?}"),
+            }
+            assert_eq!(
+                std::fs::read_to_string(&dest).unwrap(),
+                "the user's own file\n",
+                "{tier}: the user's file must survive intact"
+            );
+            // our own staging name is gone; nothing else was created
+            assert_eq!(leftovers(&out), vec!["mine.ncryptsec".to_owned()], "{tier}");
+        }
+    }
+
+    #[test]
+    fn a_conflict_whose_staging_cleanup_fails_names_the_staging_file() {
+        let (_t, home, out) = sandbox();
+        let dest = out.join("m.ncryptsec");
+        let err = Staged::begin_with(
+            &dest,
+            &home,
+            Faults {
+                swap_after_publish: true,
+                fail_cleanup: true,
+                ..Faults::default()
+            },
+        )
+        .unwrap()
+        .write_and_publish(SPEC_NCRYPTSEC)
+        .unwrap_err();
+        match &err {
+            CommError::Coded(_, "publish_conflict", msg) => {
+                assert!(
+                    msg.contains("a complete encrypted backup may remain at"),
+                    "{msg}"
+                );
+                assert!(msg.contains(".agent24-backup-"), "{msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "the user's own file\n"
+        );
+    }
+
+    #[test]
+    fn only_a_missing_staging_name_counts_as_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_t, home, out) = sandbox();
+        let staged = Staged::begin(&out.join("g.ncryptsec"), &home).unwrap();
+        // absent: gone, a plain error
+        assert!(!staged.abandon("x").to_string().contains("may remain"));
+        // a staging file that cannot be inspected (EACCES) is NOT "gone"
+        std::fs::write(staged.staging_path(), b"x").unwrap();
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = staged.abandon("x").to_string();
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if rustix::process::geteuid().is_root() {
+            return; // root ignores the mode: nothing to prove here
+        }
+        assert!(blocked.contains("may remain at"), "{blocked}");
+    }
+
+    #[test]
+    fn a_failed_direct_write_removes_only_its_own_partial_file() {
+        use rustix::io::Errno;
+        let faults = |extra: Faults| Faults {
+            link_errno: Some(Errno::NOTSUP),
+            rename_errno: Some(Errno::NOTSUP),
+            ..extra
+        };
+        // cleanup succeeds
+        let (_t, home, out) = sandbox();
+        let err = Staged::begin_with(
+            &out.join("a.ncryptsec"),
+            &home,
+            faults(Faults {
+                fail_final_write: true,
+                ..Faults::default()
+            }),
+        )
+        .unwrap()
+        .write_and_publish(SPEC_NCRYPTSEC)
+        .unwrap_err();
+        assert!(
+            matches!(&err, CommError::Upstream(m) if m.contains("writing the backup file failed")),
+            "{err:?}"
+        );
+        assert!(leftovers(&out).is_empty());
+        // cleanup fails: the leftover is named
+        let (_t, home, out) = sandbox();
+        let dest = out.join("b.ncryptsec");
+        let err = Staged::begin_with(
+            &dest,
+            &home,
+            faults(Faults {
+                fail_final_write: true,
+                fail_final_cleanup: true,
+                ..Faults::default()
+            }),
+        )
+        .unwrap()
+        .write_and_publish(SPEC_NCRYPTSEC)
+        .unwrap_err();
+        match &err {
+            CommError::Upstream(m) => {
+                assert!(
+                    m.contains("a partial encrypted backup may remain at"),
+                    "{m}"
+                );
+                assert!(m.contains(&dest.display().to_string()), "{m}");
+                assert!(m.contains("cannot be decrypted; delete it"), "{m}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(dest.exists());
+    }
+
+    #[test]
+    fn without_hard_links_an_exclusive_rename_publishes_the_file() {
+        use rustix::io::Errno;
+        // every errno that means "no hard links here" takes the fallback
+        for (i, e) in [
+            Errno::PERM,
+            Errno::NOTSUP,
+            Errno::OPNOTSUPP,
+            Errno::XDEV,
+            Errno::MLINK,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (_t, home, out) = sandbox();
+            let dest = out.join(format!("r{i}.ncryptsec"));
+            let outcome = Staged::begin_with(
+                &dest,
+                &home,
+                Faults {
+                    link_errno: Some(e),
+                    ..Faults::default()
+                },
+            )
+            .unwrap()
+            .write_and_publish(SPEC_NCRYPTSEC)
+            .unwrap();
+            assert_eq!(outcome, PublishOutcome::default(), "{e:?}");
+            assert_eq!(
+                std::fs::read_to_string(&dest).unwrap(),
+                format!("{SPEC_NCRYPTSEC}\n")
+            );
+            assert_eq!(std::fs::metadata(&dest).unwrap().nlink(), 1);
+            assert_eq!(leftovers(&out).len(), 1, "no staging name remains");
+        }
+        // an unrelated linkat error is NOT papered over by renaming
+        let (_t, home, out) = sandbox();
+        let staged = Staged::begin_with(
+            &out.join("x.ncryptsec"),
+            &home,
+            Faults {
+                link_errno: Some(Errno::IO),
+                ..Faults::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            staged.write_and_publish(SPEC_NCRYPTSEC),
+            Err(CommError::Upstream(_))
+        ));
+        assert!(leftovers(&out).is_empty());
+    }
+
+    #[test]
+    fn the_exclusive_rename_never_overwrites_and_reports_an_unsupported_fs() {
+        use rustix::io::Errno;
+        // the target appears after begin(): the real rename refuses to replace it
+        let (_t, home, out) = sandbox();
+        let dest = out.join("t.ncryptsec");
+        let staged = Staged::begin_with(
+            &dest,
+            &home,
+            Faults {
+                link_errno: Some(Errno::PERM),
+                ..Faults::default()
+            },
+        )
+        .unwrap();
+        std::fs::write(&dest, "raced in").unwrap();
+        assert!(matches!(
+            staged.write_and_publish(SPEC_NCRYPTSEC),
+            Err(CommError::Conflict(..))
+        ));
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "raced in");
+        assert_eq!(leftovers(&out), vec!["t.ncryptsec".to_owned()]);
+
+        // neither linkat nor the rename works: the dedicated, actionable error
+        for e in [
+            Errno::INVAL,
+            Errno::NOSYS,
+            Errno::NOTSUP,
+            Errno::OPNOTSUPP,
+            Errno::XDEV,
+            Errno::MLINK,
+        ] {
+            let (_t, home, out) = sandbox();
+            let dest = out.join("u.ncryptsec");
+            let err = Staged::begin_with(
+                &dest,
+                &home,
+                Faults {
+                    link_errno: Some(Errno::PERM),
+                    rename_errno: Some(e),
+                    create_errno: Some(Errno::NOTSUP),
+                    ..Faults::default()
+                },
+            )
+            .unwrap()
+            .write_and_publish(SPEC_NCRYPTSEC)
+            .unwrap_err();
+            match &err {
+                CommError::Coded(_, code, msg) => {
+                    assert_eq!(*code, "filesystem_unsupported", "{e:?}");
+                    assert!(msg.contains("choose another folder"));
+                }
+                other => panic!("{e:?}: {other:?}"),
+            }
+            assert!(leftovers(&out).is_empty(), "{e:?}: staging file removed");
+        }
     }
 
     #[test]
@@ -1169,44 +1880,44 @@ mod tests {
     }
 
     #[test]
-    fn restore_reads_only_a_small_regular_ncryptsec_file() {
-        let (_t, _home, out) = sandbox();
-        let good = out.join("ok.ncryptsec");
-        std::fs::write(&good, format!("{SPEC_NCRYPTSEC}\n")).unwrap();
-        assert_eq!(read_backup_file(&good).unwrap(), SPEC_NCRYPTSEC);
-        std::fs::write(out.join("crlf"), format!("{SPEC_NCRYPTSEC}\r\n")).unwrap();
-        assert_eq!(read_backup_file(&out.join("crlf")).unwrap(), SPEC_NCRYPTSEC);
-
+    fn restore_text_must_be_one_clean_ncryptsec_token() {
+        assert_eq!(parse_backup_text(SPEC_NCRYPTSEC).unwrap(), SPEC_NCRYPTSEC);
+        check_backup_structure(SPEC_NCRYPTSEC).unwrap();
+        let big = format!("ncryptsec1{}", "q".repeat(5000));
         for (name, body) in [
-            ("plain", "hello world\n".to_owned()),
+            ("plain", "hello world".to_owned()),
             (
                 "nsec",
-                "nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq\n".to_owned(),
+                "nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq".to_owned(),
             ),
-            ("multi", format!("{SPEC_NCRYPTSEC}\nsecond\n")),
-            ("spaced", format!("{SPEC_NCRYPTSEC} \n")),
+            ("multi", format!("{SPEC_NCRYPTSEC}\nsecond")),
+            ("trailing newline", format!("{SPEC_NCRYPTSEC}\n")),
+            ("crlf", format!("{SPEC_NCRYPTSEC}\r\n")),
+            ("spaced", format!("{SPEC_NCRYPTSEC} ")),
+            ("leading space", format!(" {SPEC_NCRYPTSEC}")),
+            ("nul", format!("{SPEC_NCRYPTSEC}\0")),
+            ("non-ascii", format!("{SPEC_NCRYPTSEC}é")),
             ("empty", String::new()),
-            ("big", format!("ncryptsec1{}", "q".repeat(5000))),
+            ("big", big),
         ] {
-            std::fs::write(out.join(name), body).unwrap();
-            assert!(read_backup_file(&out.join(name)).is_err(), "{name}");
+            let e = parse_backup_text(&body).unwrap_err();
+            assert!(
+                matches!(&e, CommError::Coded(_, "invalid_key", _)),
+                "{name}: {e:?}"
+            );
         }
-        std::os::unix::fs::symlink(&good, out.join("link")).unwrap();
-        assert!(read_backup_file(&out.join("link")).is_err(), "symlink");
-        assert!(read_backup_file(&out).is_err(), "directory");
+        // right shape, wrong checksum: caught by the structural check
+        let mut bad = SPEC_NCRYPTSEC.to_owned();
+        bad.pop();
+        bad.push(if SPEC_NCRYPTSEC.ends_with('q') {
+            'p'
+        } else {
+            'q'
+        });
+        assert!(parse_backup_text(&bad).is_ok());
         assert!(matches!(
-            read_backup_file(&out.join("missing")),
-            Err(CommError::NotFound(_))
+            check_backup_structure(&bad),
+            Err(CommError::Coded(_, "invalid_key", _))
         ));
-        assert!(read_backup_file(Path::new("rel")).is_err());
-        let fifo = out.join("fifo");
-        assert!(
-            std::process::Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(read_backup_file(&fifo).is_err());
     }
 }
