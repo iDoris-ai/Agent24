@@ -5,7 +5,7 @@ use crate::managed_idoris::{
 use agent24_idoris::{
     IdorisLock,
     download::VerifiedArchive,
-    install::{Codesign, InstalledVersion},
+    install::{Codesign, InstalledVersion, SignatureVerifier, VerifyMode},
     keychain::{Keychain, KeychainError, SystemKeychain},
     omlx_probe::{ApiKey, Endpoint, OmlxProbe, ProbeStatus},
     setup::Role,
@@ -54,6 +54,18 @@ pub struct Installation {
     pub desired_running: bool,
     #[serde(default)]
     pub verification: Option<VerificationReceipt>,
+    /// Managed root (canonical) the release was installed under; absent in receipts
+    /// written before ADR-038 D1.
+    ///
+    /// Forward-only: omitted when unset, but a receipt written with this (or
+    /// `notarized_verified_at`) set is rejected by older daemons (`deny_unknown_fields`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_root: Option<PathBuf>,
+    /// When an explicit Install last verified notarization online (RFC 3339). Start trusts
+    /// this together with the digests and the offline codesign checks; without it the next
+    /// explicit Install redoes the check, and Start is never blocked for that reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notarized_verified_at: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -221,6 +233,12 @@ pub struct Status {
     pub verification: Option<VerificationReceipt>,
     pub budget_suggestion: Option<agent24_hw::IdorisBudgetSuggestion>,
     pub budget_unavailable_reason: Option<String>,
+    /// The saved release is outside the managed root; the next Install migrates it.
+    #[serde(default)]
+    pub migration_pending: bool,
+    /// Why the last migration attempt failed; the legacy install keeps working.
+    #[serde(default)]
+    pub last_migration_error: Option<Code>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -379,6 +397,23 @@ pub trait Runtime: Send + Sync {
 }
 pub struct SystemRuntime {
     pub secrets: Arc<dyn SecretSource>,
+    /// Injectable so tests can simulate a machine without Gatekeeper access.
+    pub signature: Arc<dyn SignatureVerifier + Send + Sync>,
+    /// The pinned lock; tests substitute a fixture archive's digest.
+    pub lock: Arc<IdorisLock>,
+    /// Platform key whose asset is verified. `None` (production) means this host's
+    /// platform; tests inject `darwin-arm64` so they behave the same on every OS.
+    pub(crate) platform: Option<&'static str>,
+}
+impl SystemRuntime {
+    pub fn new(secrets: Arc<dyn SecretSource>) -> Self {
+        Self {
+            secrets,
+            signature: Arc::new(Codesign),
+            lock: Arc::new(IdorisLock::embedded().clone()),
+            platform: None,
+        }
+    }
 }
 #[async_trait]
 impl Runtime for SystemRuntime {
@@ -393,16 +428,32 @@ impl Runtime for SystemRuntime {
         }
         let dir = r.release_dir.clone();
         let archive = r.archive_path.clone();
+        let signature = self.signature.clone();
+        let lock = self.lock.clone();
+        let platform = self.platform;
         let installed = tokio::task::spawn_blocking(move || {
-            InstalledVersion::verify_existing(
-                &dir,
-                IdorisLock::embedded(),
-                &VerifiedArchive {
-                    path: archive,
-                    sha256: String::new(),
-                },
-                &Codesign,
-            )
+            // Start must work offline: digests plus offline codesign only, never Gatekeeper.
+            let archive = VerifiedArchive {
+                path: archive,
+                sha256: String::new(),
+            };
+            match platform {
+                Some(platform) => agent24_idoris::install::verify_existing_on(
+                    platform,
+                    &dir,
+                    &lock,
+                    &archive,
+                    signature.as_ref(),
+                    VerifyMode::AtRest,
+                ),
+                None => agent24_idoris::install::verify_existing(
+                    &dir,
+                    &lock,
+                    &archive,
+                    signature.as_ref(),
+                    VerifyMode::AtRest,
+                ),
+            }
         })
         .await
         .map_err(|_| Code::StartFailed)?
@@ -485,9 +536,17 @@ struct Inner {
     supervisor: Option<Supervisor>,
     generation: Option<String>,
     closing: bool,
+    migration_error: Option<Code>,
+    /// Release directory the running supervisor was started from (it keeps using it, and
+    /// auto-restarts onto it, until stopped or restarted from a newer receipt).
+    supervisor_release: Option<PathBuf>,
 }
 pub struct IdorisHost {
+    /// State: installation receipt, `data/`, `instances/`, operation journal.
     root: PathBuf,
+    /// Releases and the download cache (ADR-038 D1 managed root). Equal to `root`
+    /// only in tests that never touch the real layout.
+    install_root: PathBuf,
     inner: Mutex<Inner>,
     changed: Notify,
     runtime: Arc<dyn Runtime>,
@@ -520,22 +579,38 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Code> {
     };
     write().map_err(|_| Code::PersistenceFailed)
 }
+/// Create the parent of the managed root and canonicalize it, so `starts_with` on a
+/// receipt's canonical `release_dir` is canonical-to-canonical even when the data
+/// directory is a symlink. The leaf itself is left to the installer (it must be 0700).
+pub fn canonical_install_root(path: &Path) -> io::Result<PathBuf> {
+    let (Some(parent), Some(leaf)) = (path.parent(), path.file_name()) else {
+        return Err(io::Error::other("install root has no parent"));
+    };
+    std::fs::create_dir_all(parent)?;
+    Ok(std::fs::canonicalize(parent)?.join(leaf))
+}
 impl IdorisHost {
+    /// `root` holds state (receipt, data, instances); releases go to `install_root`,
+    /// the ADR-038 managed root `<data dir>/components/idoris`.
     pub fn system(
         root: PathBuf,
+        install_root: PathBuf,
         managed: Arc<ManagedIdoris>,
         router: Arc<ModelRouter>,
     ) -> io::Result<Arc<Self>> {
         let secrets: Arc<dyn SecretSource> = Arc::new(KeychainSource(Arc::new(SystemKeychain)));
-        Self::open(
+        let install_root = canonical_install_root(&install_root)?;
+        let mut host = Self::open(
             root,
             managed,
             router,
-            Arc::new(SystemRuntime {
-                secrets: secrets.clone(),
-            }),
+            Arc::new(SystemRuntime::new(secrets.clone())),
             secrets,
-        )
+        )?;
+        Arc::get_mut(&mut host)
+            .ok_or_else(|| io::Error::other("host already shared"))?
+            .install_root = install_root;
+        Ok(host)
     }
     pub fn open(
         root: PathBuf,
@@ -576,6 +651,7 @@ impl IdorisHost {
             router.block_idoris("managed iDoris stopped");
         }
         Ok(Arc::new(Self {
+            install_root: root.clone(),
             root,
             runtime,
             secrets,
@@ -596,6 +672,8 @@ impl IdorisHost {
                 supervisor: None,
                 generation: None,
                 closing: false,
+                migration_error: None,
+                supervisor_release: None,
             }),
         }))
     }
@@ -632,6 +710,8 @@ impl IdorisHost {
             verification: r.and_then(|r| r.verification.clone()),
             budget_suggestion: None,
             budget_unavailable_reason: None,
+            migration_pending: r.is_some_and(|r| !self.in_managed_root(r)),
+            last_migration_error: i.migration_error,
         };
         drop(i);
         if status.state == State::NotConfigured
@@ -886,6 +966,7 @@ impl IdorisHost {
         {
             let mut i = self.inner.lock().await;
             i.supervisor = Some(supervisor);
+            i.supervisor_release = Some(record.release_dir.clone());
             i.generation = Some(id.to_owned());
         }
         self.monitor(
@@ -1163,6 +1244,8 @@ impl IdorisHost {
             },
             Err(_) => State::Failed,
         };
+        // After every operation: if a migrated-away release is no longer in use, publish it.
+        self.finalize_legacy_marks(&i);
         if let Some(op) = i.operations.get_mut(id) {
             op.phase = if matches!(action, Action::Install | Action::Connect) && result.is_ok() {
                 Phase::Done

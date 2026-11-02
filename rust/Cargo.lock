@@ -115,11 +115,21 @@ dependencies = [
 name = "agent24-components"
 version = "0.1.0"
 dependencies = [
- "agent24-idoris",
+ "flate2",
+ "fs2",
+ "reqwest",
+ "rustix 1.1.4",
+ "semver",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
+ "subtle",
+ "tar",
  "tempfile",
+ "thiserror 2.0.19",
  "tokio",
  "tokio-util",
+ "url",
 ]
 
 [[package]]
@@ -205,6 +215,7 @@ dependencies = [
 name = "agent24-idoris"
 version = "0.1.0"
 dependencies = [
+ "agent24-components",
  "agent24-hw",
  "base64",
  "flate2",
@@ -219,7 +230,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "subtle",
  "tar",
  "tempfile",
  "thiserror 2.0.19",

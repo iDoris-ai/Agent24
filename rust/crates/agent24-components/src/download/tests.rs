@@ -13,8 +13,9 @@ impl CacheDir {
     fn new() -> Self {
         use std::os::unix::fs::DirBuilderExt;
         let temp = TempDir::new().unwrap();
-        let root = temp.path().join("idoris");
-        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let root = temp.path().join("components").join("demo");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
         let path = root.join("cache");
         fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
         Self { _temp: temp, path }
@@ -24,7 +25,7 @@ impl CacheDir {
     }
 }
 
-const TRIPLE: &str = "aarch64-apple-darwin";
+const TRIPLE: &str = "darwin-arm64";
 const PAYLOAD: &[u8] = b"locked archive bytes";
 
 #[tokio::test(start_paused = true)]
@@ -149,14 +150,18 @@ impl Source for Body {
     }
 }
 
-fn lock() -> IdorisLock {
+fn lock() -> ComponentLock {
     lock_for(PAYLOAD)
 }
 
-fn lock_for(payload: &[u8]) -> IdorisLock {
-    let mut value: serde_json::Value = serde_json::from_str(crate::EMBEDDED).unwrap();
+fn lock_for(payload: &[u8]) -> ComponentLock {
+    let mut value: serde_json::Value = serde_json::from_str(crate::lock::TEST_LOCK).unwrap();
     value["assets"][TRIPLE]["sha256"] = format!("{:x}", Sha256::digest(payload)).into();
-    IdorisLock::parse(&value.to_string()).unwrap()
+    ComponentLock::parse(&value.to_string()).unwrap()
+}
+
+fn pinned(lock: &ComponentLock, platform: &str) -> PinnedAsset {
+    PinnedAsset::from_lock(lock, platform).unwrap()
 }
 
 fn path(dir: &Path, suffix: &str) -> PathBuf {
@@ -188,7 +193,7 @@ async fn run(
     body: Body,
 ) -> Result<VerifiedArchive, DownloadError> {
     let lock = lock();
-    download_with(&lock, TRIPLE, dir, opts, cancel, |url| {
+    download_with(&pinned(&lock, TRIPLE), dir, opts, cancel, |url| {
         assert_eq!(
             url.as_str(),
             lock.asset_url(lock.asset_for(TRIPLE).unwrap())
@@ -289,8 +294,7 @@ async fn cancellation_while_waiting_for_response_cleans_stale_partial() {
     fs::write(path(dir.path(), "part"), b"abandoned").unwrap();
     let cancel = CancellationToken::new();
     let result = download_with(
-        &lock(),
-        TRIPLE,
+        &pinned(&lock(), TRIPLE),
         dir.path(),
         &DownloadOptions::default(),
         &cancel,
@@ -368,8 +372,7 @@ async fn tampered_verified_is_redownloaded_and_stale_partial_is_discarded() {
     fs::write(path(dir.path(), "part"), b"abandoned").unwrap();
     let lock = lock_for(&payload);
     let archive = download_with(
-        &lock,
-        TRIPLE,
+        &pinned(&lock, TRIPLE),
         dir.path(),
         &DownloadOptions::default(),
         &CancellationToken::new(),
@@ -392,8 +395,7 @@ async fn valid_cache_is_rehashed_without_fetching() {
     let dir = CacheDir::new();
     fs::write(path(dir.path(), "verified"), PAYLOAD).unwrap();
     let archive = download_with(
-        &lock(),
-        TRIPLE,
+        &pinned(&lock(), TRIPLE),
         dir.path(),
         &DownloadOptions::default(),
         &CancellationToken::new(),
@@ -414,7 +416,7 @@ async fn unsupported_platform_and_precancel_do_not_fetch() {
     let cancel = CancellationToken::new();
     fn assert_send<T: Send>(_: T) {}
     assert_send(download_locked_asset(
-        IdorisLock::embedded(),
+        &lock(),
         TRIPLE,
         dir.path(),
         &DownloadOptions::default(),
@@ -423,7 +425,7 @@ async fn unsupported_platform_and_precancel_do_not_fetch() {
     assert!(matches!(
         download_locked_asset(
             &lock(),
-            "x86_64-unknown-linux-gnu",
+            "linux-x64",
             dir.path(),
             &DownloadOptions::default(),
             &cancel
@@ -497,32 +499,6 @@ async fn cache_and_archives_have_private_nonexecutable_permissions() {
     assert_eq!(
         fs::metadata(&archive.path).unwrap().permissions().mode() & 0o777,
         0o600
-    );
-}
-
-#[tokio::test]
-#[ignore = "downloads the pinned v0.4.0 archive from GitHub"]
-async fn real_github_v0_4_0_matches_embedded_sha256() {
-    let dir = CacheDir::new();
-    let archive = download_locked_asset(
-        IdorisLock::embedded(),
-        TRIPLE,
-        dir.path(),
-        &DownloadOptions::default(),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    let bytes = fs::read(&archive.path).unwrap();
-    assert_eq!(format!("{:x}", Sha256::digest(&bytes)), archive.sha256);
-    assert_eq!(
-        archive.sha256,
-        IdorisLock::embedded().asset_for(TRIPLE).unwrap().sha256
-    );
-    eprintln!(
-        "verified v0.4.0: {} bytes, sha256 {}",
-        bytes.len(),
-        archive.sha256
     );
 }
 
@@ -714,8 +690,7 @@ async fn download_refuses_a_launcher_operation_already_in_progress() {
     let dir = CacheDir::new();
     let held = operation_lock(dir.path().parent().unwrap()).unwrap();
     let result = download_with(
-        &lock(),
-        TRIPLE,
+        &pinned(&lock(), TRIPLE),
         dir.path(),
         &DownloadOptions::default(),
         &CancellationToken::new(),
@@ -740,10 +715,11 @@ async fn download_refuses_a_launcher_operation_already_in_progress() {
 
 #[tokio::test]
 async fn download_holds_launcher_lock_until_fetch_and_writes_finish() {
-    use crate::install::{InstallError, InstallOptions, SignatureVerifier, install_locked_asset};
+    use crate::install::{InstallError, InstallOptions, install_locked_asset};
+    use crate::sign::{SignatureVerifier, SigningRequirement};
     struct NeverVerify;
     impl SignatureVerifier for NeverVerify {
-        fn verify(&self, _: &Path, _: &str) -> Result<(), InstallError> {
+        fn verify(&self, _: &Path, _: &SigningRequirement) -> Result<(), InstallError> {
             panic!("busy installer must not verify")
         }
     }
@@ -751,26 +727,32 @@ async fn download_holds_launcher_lock_until_fetch_and_writes_finish() {
     let lock = lock();
     let opts = DownloadOptions::default();
     let cancel = CancellationToken::new();
-    download_with(&lock, TRIPLE, dir.path(), &opts, &cancel, |_| async {
-        let root = dir.path().parent().unwrap();
-        let archive = VerifiedArchive {
-            path: path(dir.path(), "verified"),
-            sha256: lock.assets[TRIPLE].sha256.clone(),
-        };
-        assert!(matches!(
-            install_locked_asset(
-                &lock,
-                TRIPLE,
-                &archive,
-                &InstallOptions::new(root, "/usr/bin/false"),
-                NeverVerify,
-                &cancel
-            )
-            .await,
-            Err(InstallError::Busy)
-        ));
-        Ok(Body::new(PAYLOAD))
-    })
+    download_with(
+        &pinned(&lock, TRIPLE),
+        dir.path(),
+        &opts,
+        &cancel,
+        |_| async {
+            let root = dir.path().parent().unwrap();
+            let archive = VerifiedArchive {
+                path: path(dir.path(), "verified"),
+                sha256: lock.assets[TRIPLE].sha256.clone(),
+            };
+            assert!(matches!(
+                install_locked_asset(
+                    &lock,
+                    TRIPLE,
+                    &archive,
+                    &InstallOptions::new(root, "/usr/bin/false"),
+                    NeverVerify,
+                    &cancel
+                )
+                .await,
+                Err(InstallError::Busy)
+            ));
+            Ok(Body::new(PAYLOAD))
+        },
+    )
     .await
     .unwrap();
     assert!(operation_lock(dir.path().parent().unwrap()).is_ok());
@@ -792,7 +774,8 @@ async fn cache_rejects_symlinked_managed_directories() {
         .await
         .is_err()
     );
-    let alias = outside.path().join("idoris");
+    fs::create_dir(outside.path().join("components")).unwrap();
+    let alias = outside.path().join("components").join("demo");
     symlink(dir.path().parent().unwrap(), &alias).unwrap();
     assert!(
         run(
