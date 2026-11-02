@@ -105,10 +105,10 @@ Agent24 现在交付能力的方式各不相同。其中进程外、独立发版
   "id": "hyphae",
   "version": "v0.28.1",
   "source": { "repo": "https://github.com/iDoris-ai/Hyphae", "commit": "44189b8e…" },
-  "contract": { "name": "hyphae-cli", "major": 1, "min_minor": 0, "tested": "1.0.0" },
+  "contract": { "name": "hyphae-cli", "major": 1, "min_minor": 0, "tested": "1.0" },
   "release_url_base": "https://github.com/iDoris-ai/Hyphae/releases/download",
   "assets": {
-    "darwin-arm64": { "name": "…", "sha256": "…", "files": ["hyphae"], "executables": ["hyphae"] }
+    "darwin-arm64": { "name": "hyphae-darwin-arm64", "sha256": "…", "files": ["hyphae"], "executables": ["hyphae"] }
   },
   "signing": { "macos_team_id": "HYAP444FN9", "notarized": true },
   "reproducible": { "toolchain": "go1.26.4", "recipe": "…", "unsigned_sha256": { "darwin-arm64": "…" } },
@@ -126,20 +126,21 @@ Agent24 现在交付能力的方式各不相同。其中进程外、独立发版
 - `id`、`version`、`contract`、`assets`、`provides`、`requires` 是必填字段。`signing` 的必填规则见 D2a；`reproducible` 可以不填，填了就要校验；`assurance` 是 iDoris 那种保障等级（L1–L6 带来源），不是能力，可以为空。
 - **字段名**：提供的能力叫 `provides`，需要本体给的权限叫 `requires`。**锁和清单里不再有叫 `capabilities` 的字段**；ADR-039 §4.1 的消歧规则同样适用于这里。
 - `provides[].id` 是**能力 id**（D9），技能按它声明依赖。`requires.kernel` 对应 `DomainOsManifest.kernel_capabilities`（`events/models/scheduler/policy/memory/approval`），`requires.operations` 对应 CORE-2 的 `Operation`。
-- `assets.<platform>.executables` 列出 D2a 要验签的文件；不填时等于 `files` 里所有 Mach-O / ELF 文件。
+- `assets.<platform>.executables` 列出 D2a 要验签的文件。**r4 订正（§7.7）：必填，不再有「不填等于全部 Mach-O / ELF」的默认值，且每一项必须出现在 `files` 里。**
 - 平台键统一用 `<os>-<arch>`（`darwin-arm64`、`linux-x64` …）。某个平台没有资产，就不写这个键，不写 `null`。读 schema 1 时把 Rust triple（`aarch64-apple-darwin`）转成这个形式，Hyphae 锁里的 `null` 键删掉。
 - `agent24-components` 拥有 `ComponentLock` 类型和通用下载器：GitHub 主机白名单、大小上限、sha256 校验、取消、进度、每个组件一把安装锁。iDoris 和 Hyphae 都改用它，`fetch_verified` 不再借用 iDoris 的锁。
 - **托管根**统一为 `~/.agent24/components/<id>/<version>/`（jason 2026-11-01 拍板）。现状对照：
   - Hyphae 已在 `state_dir/components/hyphae/<tag>`，只差把 `state_dir` 钉到 `~/.agent24`；
   - Open Design 已在 `~/.agent24/components/open-design/<odSha7>-<platform>-<arch>/`。它的版本目录名**保留**这个形式（同一 odSha 换 Electron 版本会换原生模块，目录必须区分），锁里 `version` 记 odSha；
-  - iDoris 现在在 `~/Library/Application Support/Agent24/idoris/<version>`，`install.rs` 的目录权限（0o700）和符号链接拒绝都绑在这个根上。**迁移做法：不搬，重下。** C1 落地后第一次启动把新根建好、重新下载并验签；旧目录标记为可删，`agent24 idoris gc` 清掉。模型文件不在这里（在 `~/.omlx/models/`），不受影响。
+  - iDoris 现在在 `~/Library/Application Support/Agent24/idoris/<version>`，`install.rs` 的目录权限（0o700）和符号链接拒绝都绑在这个根上。**迁移做法：不搬，重下。** r4 订正（§7.6）：不是「第一次启动自动重下」，而是**下一次用户显式点安装时**重下；只有 release 和下载缓存搬到新根，状态文件留在原处；旧目录只登记、不删。模型文件不在这里（在 `~/.omlx/models/`），不受影响。
+  - 下载缓存的根与权限见 §7.8（r4 补充）。
 - 现在的 schema 1 锁文件要能读：先在加载时转换成 schema 2，迁移完成后再删掉转换。
 
 ### D2a 签名验证（v1 就做）
 
 - **macOS**：
   - 锁里有 `signing.macos_team_id` 时，下载后、安装前必须验证**每个可执行文件**：Developer ID 签名有效、团队 ID 与锁一致、启用了 Hardened Runtime；`notarized: true` 时还要验证公证。任何一项不过，都拒绝安装，不留下半安装的目录。
-  - **「每个可执行文件」的定义**：`assets.<platform>.executables` 列出的文件；不填时是 `files` 里所有 Mach-O 文件，加上 `.app` / `.framework` / `.xpc` 目录。单文件用 `codesign --verify --strict -R '=anchor apple generic and certificate leaf[subject.OU] = "<team_id>"'`；bundle 加 `--deep`。Hardened Runtime 看 `codesign -dv` 输出的 `flags=…(runtime)`。公证只用 `spctl --assess --type execute`，不用 `stapler validate`（它只验票据存在，不是 Gatekeeper 判定）。配置文件、模型、数据文件只靠 sha256。
+  - **「每个可执行文件」的定义**：`assets.<platform>.executables` 列出的文件；不填时是 `files` 里所有 Mach-O 文件，加上 `.app` / `.framework` / `.xpc` 目录。单文件用 `codesign --verify --strict -R '=anchor apple generic and certificate leaf[subject.OU] = "<team_id>"'`；bundle 加 `--deep`。Hardened Runtime 看 `codesign -dv` 输出的 `flags=…(runtime)`。公证用 `spctl --assess`，**裸可执行文件用 `--type install`，`.app` bundle 用 `--type execute`**（r4 订正，2026-11-02 实测：`--type execute` 对已公证的裸 CLI 二进制一律拒绝，报「does not seem to be an app」；`--type install` 返回 `accepted, source=Notarized Developer ID`，未 staple 的已公证裸二进制也通过）。不用 `stapler validate`（它只验票据存在，不是 Gatekeeper 判定）。配置文件、模型、数据文件只靠 sha256。`spctl` 的实测依据与判定条件见 §7.5；锁的过渡、签名流程和 `unsigned_sha256` 的产出方式见 §7.4。
   - 实现推广 `agent24-idoris/src/install.rs` 现有的 `SignatureVerifier` / `Codesign`，归到 `agent24-components`。它现在做的是 `codesign --verify --strict` 加团队 ID 要求，并读取 `codesign -dv` 的详情，只验 `idoris` 一个文件，`check_platform` 只接受 `aarch64` macOS。要改三处：按 `executables` 逐个验；加 Hardened Runtime 和 `spctl`；`check_platform` 放开到所有 macOS 架构（darwin-x64 现在会直接 `UnsupportedPlatform`）。
   - 我们自己发布的 macOS 资产（iDoris、Hyphae 等）必须填 `signing`，不填锁就不合法。
 - **签名与可复现构建的关系**：签名会改变字节。锁里 `assets.<platform>.sha256` 是**签名后**制品的摘要，下载校验用它。可复现比对在**签名前**做：发布 CI 记录签名前的摘要到 `reproducible.unsigned_sha256.<platform>`，复现 CI 用同一配方构建后和它比；或者本地 `codesign --remove-signature` 后再哈希。两者都写进锁，各比各的，不混用。Hyphae 现在的锁哈希的是未签名裸二进制，签名后要同时换 `sha256` 和填 `unsigned_sha256`。
@@ -175,7 +176,7 @@ Agent24 现在交付能力的方式各不相同。其中进程外、独立发版
 CLI 绑定额外规定（和 `agent24-comm/src/runner.rs` 现有约定一致）：
 - JSON 输出由环境变量 `HYPHAE_OUTPUT=json`（泛化为 `<ID>_OUTPUT=json`）打开，**不加 `--json` 参数**；`contract`、`health` 是普通子命令；
 - 每次调用的 stdout 只能输出一个 JSON envelope：`{ "ok": true, "data": … }` 或 `{ "ok": false, "error": { "code", "message", "retryable" } }`；告警走 stderr；
-- 退出码只区分成功（0）、业务错误（1）、契约或用法错误（2）；
+- 退出码只区分成功（0）、业务错误（1）、契约或用法错误（2）（见 §7.1 订正：Agent24 只按 envelope 的 `ok` 判断，组件保留自己的退出码语义）；
 - stdin 用来传秘密（现有 `--password-stdin` 模式），秘密不得出现在 argv 或环境变量里。
 
 ### D5 生命周期与健康
@@ -318,7 +319,7 @@ CLI 绑定额外规定（和 `agent24-comm/src/runner.rs` 现有约定一致）�
 |---|---|---|
 | C1 | 在 `agent24-components` 里加 `ComponentLock`（schema 2，`provides` / `requires` / `assurance`）、通用下载器和签名验证（D2a，推广 `SignatureVerifier`：按 `executables` 逐个验、Hardened Runtime、`spctl`、放开架构）；`fetch_verified` 改用它；iDoris 锁升到 schema 2（行为不变，L1–L6 移到 `assurance`），iDoris 迁到新托管根（重下，旧目录标记可删）。**依赖方向反转**：现在 `agent24-components` 依赖 `agent24-idoris`，C1 后 `agent24-idoris` 依赖 `agent24-components`；`run_install_child` 隐藏子命令随下载器一起搬，仍由宿主二进制（`agent24d`）分发，不另起启动器 | Agent24 |
 | C1b | Hyphae 发布流水线加 Developer ID 签名与公证；锁同时换 `sha256`（签名后）和填 `reproducible.unsigned_sha256`（签名前）；Agent24 侧对 Hyphae macOS 资产启用 D2a。**排在 Hyphae 发出签名版之后**，可与 C2 同期 | Hyphae + Agent24 |
-| C2 | Hyphae 新增 `contract`、`health` 子命令（`HYPHAE_OUTPUT=json` 下输出 envelope），统一 envelope 和退出码；Hyphae 锁补 `contract` 字段。**排在 Hyphae relay 上线之后**（jason 拍板） | Hyphae + Agent24 |
+| C2 | Hyphae 新增 `contract`、`health` 子命令（`HYPHAE_OUTPUT=json` 下输出 envelope），统一 envelope 和退出码。Hyphae 锁**仍是 schema 1、不加字段**；Agent24 在 `agent24-comm` 代码里写死对 Hyphae 的契约期望（`name=hyphae-cli`、`major=1`、`min_minor=0`），`contract` 字段等 C1b 的 schema 2 锁再进锁（§7.4）。**排在 Hyphae relay 上线之后**（jason 拍板） | Hyphae + Agent24 |
 | C3 | 新增 `GET /api/v1/components`（含 D9 清单、audience 脱敏、`Operation::ComponentsRead`）和 `POST /api/v1/components/{id}/report`；统一状态机（D5 转移表与映射表）；`GRACE_MAX_MS` 抬到 ≥15 000、默认值与 env 名统一；能力中心、通信页、本地模型页改为读这个接口。**过渡期**：C2 之前 Hyphae 没有 `health`，它的状态由现有 pid 存活判定，只有 `ready / stopped / failed`，没有 `degraded` | Agent24 |
 | C4 | AgentEar：只在 `/api/v1/components` 里登记（attach 子集状态），握手不变；D2/D2a 不适用（见 D2a 缺口说明）；补 §3 用例 2、3、4 | Agent24 |
 | C5 | Knowledge：把 `/system/capabilities` 映射到 D3/D5（远端服务子集） | Agent24 |
@@ -348,3 +349,77 @@ C1 最先做：它不改任何外部行为，而且能马上去掉 `fetch_verifi
 2. 停止宽限期默认 15 秒（单次调用取消宽限 2 秒另计）。
 3. 签名验证放进 v1（D2a）。信任体系（第三方发布者、密钥轮换、吊销）放到 ADR-K1-03 / ME-6。
 4. Hyphae 的 `contract`、`health` 排在 relay 上线之后（C2）。
+
+## 7. r4 补充（2026-11-02，与 Hyphae 对齐 C2 / C1b 时定下的细节）
+
+本节补全 D2、D2a、D4、D5 没写的具体字段。以下内容由 Agent24 作为契约使用方确定，Hyphae 会话已确认，并按此实现 C2。
+
+### 7.1 D4 退出码订正
+D4 原文写「退出码只区分 0、1、2」，这和 Hyphae 现有的语义码冲突：Hyphae 用 2 表示 `network_error`，用 3 表示 `auth_error`。现订正为：**Agent24 只按 envelope 的 `ok` 判断成败，退出码只作参考**；组件保留自己现有的退出码语义。`ok:true` 时退出码必须是 0。
+
+### 7.2 CLI `contract`（D3、D4）
+`<ID>_OUTPUT=json <bin> contract` 的 `data` 字段：
+- `name`：契约名，例如 `hyphae-cli`。
+- `contract_version`：字符串 `"major.minor"`，从 `"1.0"` 开始。删除字段或命令、改名、改变语义时升 major；只做加法时升 minor。
+- `binary_version`：二进制自报的版本。Agent24 **不依赖**它等于 tag，版本判断只看锁里的 sha256 和 `contract_version`。Hyphae 在 C1b 之前固定输出 `"dev"`，C1b 起由发布配方用 `-X` 注入真实 tag，锁里的 `recipe` 同步改。
+- `provides`：能力 id 字符串数组。
+- `commands`：`[{path, flags}]`，`path` 是完整的子命令路径（如 `"identity export"`），`flags` 只写带 `--` 的主名。组件可以输出全部可见子命令，Agent24 按 path 查找，多出的忽略。这项用来替代解析 `--help` 的能力探测。
+- `error_codes`：`[{code, exit}]`，必须是全集。
+- 以上全部必填。输出必须确定：`commands` 按 path 排序，`flags`、`error_codes`、`provides` 按字典序。Agent24 解析 JSON，不做逐字比较。
+
+### 7.3 CLI `health`（D5）
+`data = {status, checks}`：
+- `status` 取 `ok`、`degraded`、`failed` 之一。
+- `checks.keystore = {ok, exists, encrypted, identities}`：只读元数据，不要口令，不加锁，不创建文件。
+- `checks.relays = {ok, items:[{url, reachable, latency_ms?, error?}]}`：检查配置里的全部 relay，并行；单个超时 3 秒，整条命令上限 5 秒。`error` 只能取 `timeout`、`refused`、`dns`、`tls`、`other`。
+- `checks.daemon = {running}`：可选，读取时不能有副作用，检测不了就省略。
+- **只要产出了报告，envelope 就是 `ok:true`，退出码为 0**，即使 `status` 是 `degraded` 或 `failed`。只有体检本身没能跑起来时才返回 `ok:false`。
+- 状态映射（**只对常驻型组件**，即由 Agent24 托管 Hyphae daemon 的情形；按次调用型 CLI 没有 `ready / degraded`，D5 已定，`health` 对它只是诊断信息）：
+  - `health` 的结果是 D5「健康探测连续失败 N 次 → degraded」那条规则的**输入**，不直接改状态：`status:ok` 算一次探测成功；`degraded` 或 `failed` 算一次探测失败，连续 N 次（锁里可配，默认 3）才从 `ready` 进 `degraded`，一次成功就回 `ready`。
+  - `checks.daemon.running=false` 时映射为 `stopped`（daemon 没在跑，不是健康问题），并与 pid 存活判定取一致。
+  - 为什么 `failed` 不直接映射成 D5 的 `failed`：`health` 返回了报告就证明 CLI 本身能跑；`status:failed` 说的是 relay 不可达或 keystore 有问题，这是「组件在跑但服务降级」，不是「组件崩了」。D5 的 `failed` 只留给进程崩溃和启动失败。
+  - `ok:false`（体检没跑起来）按 D6 的错误处理，同样只计一次探测失败。
+
+### 7.4 锁的过渡（D2、D2a）
+- C2 那一版的 Hyphae 锁保持 schema 1，**不加任何字段**（Agent24 用严格解析读 Hyphae 锁）。schema 1 带不了 `contract`，所以 **C2 期间 Agent24 把对 Hyphae 的契约期望写死在 `agent24-comm` 代码里**：`name=hyphae-cli`、`major=1`、`min_minor=0`；D3 的握手检查照常跑，只是期望值来自代码常量而不是锁。锁要到 C1b 的 schema 2 才有 `contract` 字段，届时删掉代码常量。
+- **锁文件归 Agent24**：`rust/crates/agent24-comm/hyphae.lock.json` 仍由 Agent24 拥有，做法和今天一样——逐字节复制 Hyphae release 里发布的 `hyphae.lock.json`，Agent24 侧不改内容，只在 PR 里说明来源。C1b 起复制的是 schema 2 版本。
+- C1b 签名版直接发 schema 2：
+  - **release 资产仍是裸二进制** `hyphae-darwin-arm64`（以及 `hyphae-linux-x64`），和现在一样；tar.gz 只是附加的打包形式，**不进锁**；
+  - `assets.<platform>.sha256` 记**签名后的裸二进制**的摘要，下载校验用它；
+  - `reproducible.unsigned_sha256.<platform>` 记签名前的哈希。**这是对 D2a 的一处明确修订**：D2a 原文要求「发布 CI 记录签名前的摘要」，Hyphae 现在没有能签名的 CI，改为由 Hyphae 本地两次独立构建、结果逐字节一致后产出这个值，复现 CI 比对的仍是它；
+  - `signing = {macos_team_id: "HYAP444FN9", notarized: true}`。
+- 签名位置（jason 2026-11-02 拍板）：在 jason 的笔记本上，用 Agent24 出包的同一套凭据（Developer ID HYAP444FN9，notary profile `apple-notary-HYAP444FN9`），凭据不离开本机。
+- 签名流程：
+  1. Hyphae 产出未签名资产，建 draft release；
+  2. Agent24 在本机给裸二进制签名（`codesign --force --options runtime --timestamp`，纯 Go 二进制不需要 entitlement），zip 后提交 notarytool 公证；签名后的裸二进制替换 draft release 里的同名资产（tar.gz 若要附带也用签名后的二进制重新打），再把 sha256 回传给 Hyphae；
+  3. Hyphae 填写 schema 2 锁，重新生成 SHA256SUMS，转为正式 release；
+  4. Agent24 把发布的 `hyphae.lock.json` 原样复制进 `agent24-comm`。
+- 裸 Mach-O 不能 staple，这不影响校验：D2a 对裸可执行文件用 `spctl --assess --type install`，会在线查公证票据；2026-11-02 实测未 staple 的已公证裸二进制通过（`accepted, source=Notarized Developer ID`），而 `--type execute` 对任何裸 CLI 二进制都报「does not seem to be an app」拒绝，所以 D2a 已订正为按文件类型选 `--type`。
+- 排期（jason 2026-11-02）：C2 先做，C1b 紧随其后。
+
+### 7.5 D2a 公证判定：按文件类型选 `spctl --type`（C1 实现中发现）
+- 裸可执行文件：`spctl --assess --type install <file>`，结果必须同时满足 `accepted` **和** `source=Notarized Developer ID`；少一项都拒绝安装。
+- `.app` bundle：`spctl --assess --type execute <bundle>`，判定条件相同。
+- 实测（2026-11-02）：`--type execute` 对**任何**裸 CLI 二进制都拒绝，包括系统自带的 `/usr/bin/true`，报「does not seem to be an app」；所以 D2a 原文「公证只用 `--type execute`」对裸二进制不可用，已订正。未 staple 的已公证裸二进制走 `--type install` 通过（在线查票据）。
+- `executables` 里每一项按它是文件还是 bundle 分别选 `--type`。
+
+### 7.6 D2 迁移：不自动重下，显式安装时才重下
+- D2 原文「C1 落地后第一次启动把新根建好、重新下载并验签」会绕过安装同意的凭据（ADR-K1-03：安装是用户一次性确认的动作，自动重下没有这份确认）。订正为：**在用户下一次显式点「安装」时重下**。
+- 切换规则：旧副本在新副本校验（sha256 + D2a）通过之前**继续服务**；新安装失败（下载、校验、验签任一不过）时保留旧副本，不留半安装目录，状态不变。
+
+### 7.7 D2 `executables` 必填
+- 去掉「不填等于 `files` 里所有 Mach-O / ELF」的默认值：隐式枚举会让锁里没写的文件被静默验签或静默跳过，评审时看不出来。
+- `executables` 必填；每一项必须出现在同一平台的 `files` 里，否则锁不合法（加载时拒绝）。没有可执行文件的资产（纯数据）写 `[]`。
+
+### 7.8 托管根下的下载缓存
+- 下载缓存的根是 `~/.agent24/components/<id>/`（和 release 目录同根）；当安装目录不归我们管、不能 chmod 时（例如组件自己掌握安装目录），改用 `~/.agent24/components/<id>-cache/`。
+- 缓存根必须以 0700 创建，属主是当前用户；不满足就拒绝使用，不降级。
+- 现状：Hyphae 的缓存原在 `<state_dir>/idoris/component-cache/hyphae`（COMM-HYPHAE §3），C1 起因为上述权限原因搬到 `components/hyphae-cache/`。
+
+### 7.9 iDoris 的迁移边界
+- 只有 **release 目录和下载缓存**搬到 `~/.agent24/components/idoris/`。
+- 状态不搬：`installation.json`、`data/`、`instances/`、`operations.json` 留在原处（`~/Library/Application Support/Agent24/idoris/`）。任何 gc 都必须排除这些状态文件。
+- 旧 release 路径登记到 `legacy-install.deletable.json`，**不删**；删除另由用户触发的 `agent24 idoris gc` 执行，且只删登记过的路径。
+
+### 7.10 开放项（r4 登记，不阻塞 C1）
+- iDoris 的 schema 2 锁现在是 `notarized: false`。打开它要先解决：tar.gz 里的裸二进制没有 staple，`spctl --type install` 需要在线查票据，离线首次安装会失败；要定「在线查不到时是拒绝还是降级为只验签名」的规则，再把 `notarized` 置 true。作为 C1 之后的跟进项。
