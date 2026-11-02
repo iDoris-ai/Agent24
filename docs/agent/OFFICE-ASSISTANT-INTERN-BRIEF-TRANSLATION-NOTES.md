@@ -8,7 +8,7 @@
 |---|---|---|---|
 | [`OFFICE-ASSISTANT-INTERN-BRIEF.md`](OFFICE-ASSISTANT-INTERN-BRIEF.md) | 英文 | 原版（Opus 5.5 起草，作者审定） | **权威版本** |
 | [`OFFICE-ASSISTANT-INTERN-BRIEF.zh-CN.md`](OFFICE-ASSISTANT-INTERN-BRIEF.zh-CN.md) | 中文 | 机器翻译（Claude Opus 5.5），译自英文原版 | 未经人工校对；供中国侧核对"对实习生说了什么" |
-| [`OFFICE-ASSISTANT-INTERN-BRIEF.th.md`](OFFICE-ASSISTANT-INTERN-BRIEF.th.md) | 泰文 | 机器翻译（Claude Opus 5.5），译自英文原版 | 未经母语者校对；文件顶端有泰英双语声明，欢迎实习生本人修正 |
+| [`OFFICE-ASSISTANT-INTERN-BRIEF.th.md`](OFFICE-ASSISTANT-INTERN-BRIEF.th.md) | 泰文 | 机器翻译（Claude Opus 5.5），译自英文原版 | 2026-10-25 已由泰语母语者（实习生 Arm）校对 26 处措辞；文件顶端仍保留泰英双语声明 |
 
 ## 2. 冲突规则
 
@@ -35,17 +35,17 @@
 | 英文 | 泰文版中的括注 |
 |---|---|
 | approval | การอนุมัติ |
-| receipt | บันทึกผลการดำเนินการ |
+| receipt | หลักฐานการทำรายการ |
 | mock connector | ตัวเชื่อมต่อจำลองที่ไม่ติดต่อบริการจริง |
 | connector | ตัวเชื่อมต่อกับบริการภายนอก |
 | LocalOnly | เฉพาะในเครื่องเท่านั้น |
 | kernel | แกนกลางของระบบ |
-| action | การดำเนินการแต่ละขั้น |
+| action | ขั้นตอนการทำงาน |
 | run | การรันหนึ่งครั้ง |
 | transcript | บทถอดความการประชุม |
 | gold standard | คำตอบมาตรฐานที่มนุษย์เขียน |
 | payload | ข้อมูลที่จะถูกส่ง |
-| scope | ขอบเขต |
+| scope | ขอบเขตการเข้าถึง |
 | audit log | บันทึกการตรวจสอบ |
 | credentials / OAuth grant / production data / de-identified | ข้อมูลรับรองตัวตน / การอนุญาต OAuth / ข้อมูลจริงจากระบบที่ใช้งานอยู่ / ลบข้อมูลระบุตัวตนแล้ว |
 | PR、CI、merge、tag、release、branch、commit、push、issue、PR-Daemon、APPROVE | 工程流程词，直接保留英文，仅在首次出现处加少量括注 |
