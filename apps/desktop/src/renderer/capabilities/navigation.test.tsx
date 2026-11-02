@@ -76,6 +76,61 @@ describe('capability routing', () => {
     expect(screen.getByLabelText('Route')).toHaveTextContent(JSON.stringify({ kind: 'page', page: 'capabilities' }))
   })
 
+  it('opens the pinned-slots row from the capabilities slots-full link', () => {
+    const scroll = vi.spyOn(HTMLElement.prototype, 'scrollIntoView').mockImplementation(() => {})
+    function Pages() {
+      const { open } = useContext(CapabilitiesContext)
+      return <>
+        <CapabilitiesPage onOpenSettings={() => open('settings/general', 'capabilities', { focus: 'slots' })} />
+        <SidebarPrefs />
+      </>
+    }
+    window.agent24 = { backendProxy: vi.fn().mockResolvedValue({ ok: false }) } as unknown as Window['agent24']
+    try {
+      render(<CapabilitiesProvider><Pages /></CapabilitiesProvider>)
+      expect(screen.getByText(/All sidebar slots are in use/)).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('link', { name: 'Settings › General' }))
+      const row = document.getElementById('settings-pinned-slots')
+      expect(row).toHaveAttribute('data-highlighted', 'true')
+      expect(row).toHaveAttribute('tabindex', '-1')
+      expect(row).toHaveFocus()
+      expect(row?.contains(screen.getByTestId('slot-count'))).toBe(true)
+      expect(scroll).toHaveBeenCalled()
+    } finally {
+      scroll.mockRestore()
+    }
+  })
+
+  it('clears the pinned-slots highlight after two seconds or the first stepper click', async () => {
+    vi.useFakeTimers()
+    const scroll = vi.spyOn(HTMLElement.prototype, 'scrollIntoView').mockImplementation(() => {})
+    function Pages() {
+      const { open } = useContext(CapabilitiesContext)
+      return <>
+        <CapabilitiesPage onOpenSettings={() => open('settings/general', 'capabilities', { focus: 'slots' })} />
+        <SidebarPrefs />
+      </>
+    }
+    window.agent24 = { backendProxy: vi.fn().mockResolvedValue({ ok: false }) } as unknown as Window['agent24']
+    const view = render(<CapabilitiesProvider><Pages /></CapabilitiesProvider>)
+    try {
+      fireEvent.click(screen.getByRole('link', { name: 'Settings › General' }))
+      const row = document.getElementById('settings-pinned-slots')
+      expect(row).toHaveAttribute('data-highlighted', 'true')
+      await act(async () => { await vi.advanceTimersByTimeAsync(2000) })
+      expect(row).not.toHaveAttribute('data-highlighted')
+
+      fireEvent.click(screen.getByRole('link', { name: 'Settings › General' }))
+      expect(row).toHaveAttribute('data-highlighted', 'true')
+      fireEvent.click(screen.getByRole('button', { name: 'More pinned slots' }))
+      expect(row).not.toHaveAttribute('data-highlighted')
+    } finally {
+      scroll.mockRestore()
+      view.unmount()
+      vi.useRealTimers()
+    }
+  })
+
   it('polls manifests through backendProxy, lists dynamic UI in domainOs and never auto-pins it', async () => {
     const backendProxy = vi.fn().mockImplementation(({ path }: { path: string }) => Promise.resolve({ ok: true, data:
       path === '/api/modules' ? [{ id: 'hello', type: 'ui', enabled: true, name: 'Hello' }] : { approvals: [{}, {}] },

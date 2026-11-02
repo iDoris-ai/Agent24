@@ -1,6 +1,7 @@
-import { useContext, useRef, useState } from 'react'
+import { useContext, useEffect, useRef, useState } from 'react'
 import { CapabilitiesContext, NavPrefsContext, SLOT_MAX, SLOT_MIN, type CapabilityId, type NavPrefsApi } from '../../capabilities/types'
 import { capabilitiesMessages } from '../../capabilities/capabilities.i18n'
+import { useCapabilityRoute } from '../../capabilities/providers'
 import { useT } from '../../i18n'
 import { settingsMessages } from '../Settings.i18n'
 
@@ -9,11 +10,31 @@ import { settingsMessages } from '../Settings.i18n'
 export function SidebarPrefs() {
   const t = useT(settingsMessages)
   const c = useT(capabilitiesMessages)
+  const { route, navigate } = useCapabilityRoute()
   const { defs, moduleInventory } = useContext(CapabilitiesContext)
-  const { prefs, allPinned = prefs.pinned, setPrefs } = useContext(NavPrefsContext)
+  const { prefs, allPinned = prefs.pinned, pinnedCount = allPinned.length, setPrefs } = useContext(NavPrefsContext)
   const [saving, setSaving] = useState(false)
   const [notice, setNotice] = useState<CapabilityId[]>([])
   const savingRef = useRef(false)
+  const slotsRowRef = useRef<HTMLDivElement>(null)
+  const focusSlots = route.kind === 'page' && route.focus === 'slots'
+  const focusKey = route.kind === 'page' ? route.key : undefined
+  const [highlightedKey, setHighlightedKey] = useState<number | undefined>()
+  const highlighted = focusSlots && highlightedKey !== undefined && highlightedKey === focusKey
+  const hasRoom = pinnedCount < prefs.slotCount
+
+  // Momentary landmark keyed by route.key: clear after ~2s, or on the first stepper click.
+  useEffect(() => {
+    if (!focusSlots || focusKey === undefined) return
+    setHighlightedKey(focusKey)
+    const row = slotsRowRef.current
+    row?.scrollIntoView?.({ block: 'nearest' })
+    row?.focus()
+    const timer = setTimeout(() => {
+      setHighlightedKey(current => (current === focusKey ? undefined : current))
+    }, 2000)
+    return () => clearTimeout(timer)
+  }, [focusSlots, focusKey])
 
   function nameFor(id: CapabilityId) {
     const def = defs.find(d => d.id === id)
@@ -37,6 +58,7 @@ export function SidebarPrefs() {
   }
 
   function stepSlots(delta: number) {
+    setHighlightedKey(undefined)
     void commit(prev => ({ ...prev, slotCount: Math.min(SLOT_MAX, Math.max(SLOT_MIN, prev.slotCount + delta)) }))
   }
 
@@ -59,7 +81,13 @@ export function SidebarPrefs() {
     <div className="settings-section">
       <h3>{t('sidebar.title')}</h3>
 
-      <div className="setting-row">
+      <div
+        id="settings-pinned-slots"
+        ref={slotsRowRef}
+        tabIndex={-1}
+        data-highlighted={highlighted ? 'true' : undefined}
+        className="setting-row"
+      >
         <div>
           <label htmlFor="settings-slot-count">{t('sidebar.slots')}</label>
           <p>{t('sidebar.slotsHint', { min: SLOT_MIN, max: SLOT_MAX })}</p>
@@ -72,6 +100,14 @@ export function SidebarPrefs() {
             disabled={saving || prefs.slotCount >= SLOT_MAX} onClick={() => stepSlots(1)}>+</button>
         </div>
       </div>
+      <p className="settings-slots-go">
+        {t('sidebar.slotsPinned', { pinned: pinnedCount, slots: prefs.slotCount })}{' '}
+        <button
+          type="button"
+          className={`btn-link settings-slots-link${hasRoom ? ' is-open' : ' is-quiet'}`}
+          onClick={() => navigate('capabilities')}
+        >{t('sidebar.slotsGoPick')}</button>
+      </p>
 
       <div className="setting-row" style={{ alignItems: 'flex-start' }}>
         <div>

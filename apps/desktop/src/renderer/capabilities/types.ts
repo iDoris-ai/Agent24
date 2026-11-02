@@ -83,9 +83,12 @@ export function clampPrefs(
 /** Where the user came from when a capability page opens (for the breadcrumb). */
 export type OpenOrigin = 'sidebar' | 'capabilities' | 'switcher' | 'other'
 
+/** `focus: 'slots'` asks Settings to land on the pinned-slots row. */
+export type OpenOptions = { focus?: 'slots' }
+
 export interface CapabilitiesApi {
   defs: readonly CapabilityDef[]
-  open: (id: CapabilityId, origin: OpenOrigin) => void
+  open: (id: CapabilityId, origin: OpenOrigin, options?: OpenOptions) => void
   /** Pending approvals count, shown as a badge on Capabilities and Overview. */
   approvalsWaiting: number
   /** Stays true after the first successful manifest load, including while offline. */
