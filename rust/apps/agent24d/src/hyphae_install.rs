@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 /// The only file every Hyphae asset contains: the release asset IS the bare binary.
 const EXECUTABLE: &str = "hyphae";
 
-/// What D2a checks on `/usr/bin/codesign`-capable hosts, shared by install and start.
+/// The D2a verifier (`Codesign` in production, a fake in tests), shared by install and start.
 pub type Verifier = Arc<dyn SignatureVerifier + Send + Sync>;
 
 #[derive(Debug, thiserror::Error)]
