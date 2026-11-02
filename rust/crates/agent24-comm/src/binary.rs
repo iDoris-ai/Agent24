@@ -499,11 +499,11 @@ mod tests {
     #[test]
     fn embedded_lock_parses_and_resolves_baseline_platform() {
         let lock = HyphaeLock::embedded().unwrap();
-        assert_eq!(lock.source_sha, "44189b8e84a9cc01358b7840dde6423d4216a369");
+        assert_eq!(lock.source_sha, "560d2bd103d0b7e87c8bd038a0230503924d86ab");
         let expected = lock.expected_for("darwin-arm64").unwrap();
         assert_eq!(
             expected.to_hex(),
-            "aea3f66b15fdd26e90dde63f3f5d129949421e1f9ec6365444d1fda4e5b9c7e3"
+            "663cd82fb8ef0cfaef16574385cfb6b929c91eb931a7fcf262ff85ec94cb384a"
         );
     }
 

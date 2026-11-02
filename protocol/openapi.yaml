@@ -3258,7 +3258,7 @@ paths:
       description: >-
         Always returns 200 when comm is not configured, with process.state not_configured.
         data.installable indicates a platform with both release asset and non-null lock hash.
-        data.installed_version is the component tag (v0.28.1) after full hash revalidation,
+        data.installed_version is the component tag (v0.29.0) after full hash revalidation,
         or null when absent or rejected. Developer and sibling binaries do not count as installed components.
       responses:
         "200":
@@ -4618,7 +4618,7 @@ components:
       properties:
         installed_version:
           type: string
-          example: v0.28.1
+          example: v0.29.0
         path:
           type: string
           description: Absolute installed component path
