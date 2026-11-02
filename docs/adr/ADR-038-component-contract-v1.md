@@ -348,3 +348,43 @@ C1 最先做：它不改任何外部行为，而且能马上去掉 `fetch_verifi
 2. 停止宽限期默认 15 秒（单次调用取消宽限 2 秒另计）。
 3. 签名验证放进 v1（D2a）。信任体系（第三方发布者、密钥轮换、吊销）放到 ADR-K1-03 / ME-6。
 4. Hyphae 的 `contract`、`health` 排在 relay 上线之后（C2）。
+
+## 7. r4 补充（2026-11-02，与 Hyphae 对齐 C2 / C1b 时定下的细节）
+
+本节补全 D2、D2a、D4、D5 没写的具体字段。以下内容由 Agent24 作为契约使用方确定，Hyphae 会话已确认，并按此实现 C2。
+
+### 7.1 D4 退出码订正
+D4 原文写「退出码只区分 0、1、2」，这和 Hyphae 现有的语义码冲突：Hyphae 用 2 表示 `network_error`，用 3 表示 `auth_error`。现订正为：**Agent24 只按 envelope 的 `ok` 判断成败，退出码只作参考**；组件保留自己现有的退出码语义。`ok:true` 时退出码必须是 0。
+
+### 7.2 CLI `contract`（D3、D4）
+`<ID>_OUTPUT=json <bin> contract` 的 `data` 字段：
+- `name`：契约名，例如 `hyphae-cli`。
+- `contract_version`：字符串 `"major.minor"`，从 `"1.0"` 开始。删除字段或命令、改名、改变语义时升 major；只做加法时升 minor。
+- `binary_version`：二进制自报的版本。Agent24 **不依赖**它等于 tag，版本判断只看锁里的 sha256 和 `contract_version`。Hyphae 在 C1b 之前固定输出 `"dev"`，C1b 起由发布配方用 `-X` 注入真实 tag，锁里的 `recipe` 同步改。
+- `provides`：能力 id 字符串数组。
+- `commands`：`[{path, flags}]`，`path` 是完整的子命令路径（如 `"identity export"`），`flags` 只写带 `--` 的主名。组件可以输出全部可见子命令，Agent24 按 path 查找，多出的忽略。这项用来替代解析 `--help` 的能力探测。
+- `error_codes`：`[{code, exit}]`，必须是全集。
+- 以上全部必填。输出必须确定：`commands` 按 path 排序，`flags`、`error_codes`、`provides` 按字典序。Agent24 解析 JSON，不做逐字比较。
+
+### 7.3 CLI `health`（D5）
+`data = {status, checks}`：
+- `status` 取 `ok`、`degraded`、`failed` 之一。
+- `checks.keystore = {ok, exists, encrypted, identities}`：只读元数据，不要口令，不加锁，不创建文件。
+- `checks.relays = {ok, items:[{url, reachable, latency_ms?, error?}]}`：检查配置里的全部 relay，并行；单个超时 3 秒，整条命令上限 5 秒。`error` 只能取 `timeout`、`refused`、`dns`、`tls`、`other`。
+- `checks.daemon = {running}`：可选，读取时不能有副作用，检测不了就省略。
+- **只要产出了报告，envelope 就是 `ok:true`，退出码为 0**，即使 `status` 是 `degraded` 或 `failed`。只有体检本身没能跑起来时才返回 `ok:false`。
+- 状态映射：`status:ok` → D5 的 `ready`；`degraded` → `degraded`；`failed` → `degraded`。按次调用型组件的映射规则在 C3 实现时细化。
+
+### 7.4 锁的过渡（D2、D2a）
+- C2 那一版的 Hyphae 锁保持 schema 1，**不加任何字段**（Agent24 用严格解析读 Hyphae 锁）。
+- C1b 签名版直接发 schema 2：
+  - `assets.<platform>.sha256` 记签名后的裸二进制；
+  - `reproducible.unsigned_sha256.<platform>` 记签名前的哈希，用 Hyphae 本地两次独立构建结果一致的流程产出；
+  - `signing = {macos_team_id: "HYAP444FN9", notarized: true}`。
+- 签名位置（jason 2026-11-02 拍板）：在 jason 的笔记本上，用 Agent24 出包的同一套凭据（Developer ID HYAP444FN9，notary profile `apple-notary-HYAP444FN9`），凭据不离开本机。
+- 签名流程：
+  1. Hyphae 产出未签名资产，建 draft release；
+  2. Agent24 在本机给裸二进制签名（`codesign --force --options runtime --timestamp`，纯 Go 二进制不需要 entitlement），zip 后提交 notarytool 公证，并用签名后的二进制重新打 tar.gz，上传到 draft release，再把 sha256 回传给 Hyphae；
+  3. Hyphae 填写 schema 2 锁，重新生成 SHA256SUMS，转为正式 release。
+- 裸 Mach-O 不能 staple，这不影响校验：D2a 只用 `spctl --assess --type execute`，会在线查公证票据。
+- 排期（jason 2026-11-02）：C2 先做，C1b 紧随其后。
