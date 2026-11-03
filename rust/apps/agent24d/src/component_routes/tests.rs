@@ -697,6 +697,57 @@ fn documents_d9_missing_or_broken_catalog_is_an_error() {
     let mut value: Value = serde_json::from_str(raw).unwrap();
     value["extra"] = json!(1);
     assert!(DocumentsCatalog::load(Some(&value.to_string())).is_err());
+
+    // One mutation per validate() guard. Dropping that guard makes this case Ok.
+    type CatalogCase = (&'static str, fn(&mut Value));
+    let cases: &[CatalogCase] = &[
+        ("id", |v| {
+            v["id"] = json!("docs");
+            for tool in v["provides"][0]["tools"].as_array_mut().unwrap() {
+                *tool = json!(tool.as_str().unwrap().replacen("documents.", "docs.", 1));
+            }
+        }),
+        ("version", |v| v["version"] = json!("0.1.0 ")),
+        ("name", |v| v["name"]["en"] = json!("")),
+        ("provides", |v| v["provides"] = json!([])),
+        ("provides.id", |v| {
+            let mut second = v["provides"][0].clone();
+            second["tools"] = json!(["documents.other_op"]);
+            v["provides"].as_array_mut().unwrap().push(second);
+        }),
+        ("provides.name", |v| {
+            v["provides"][0]["name"]["en"] = json!("")
+        }),
+        ("provides.summary", |v| {
+            v["provides"][0]["summary"]["zh"] = json!("");
+        }),
+        ("tool-shape", |v| {
+            v["provides"][0]["tools"][0] = json!("documents.Bad")
+        }),
+        ("tool-unique", |v| {
+            let mut second = v["provides"][0].clone();
+            second["id"] = json!("docs-read");
+            v["provides"].as_array_mut().unwrap().push(second);
+        }),
+        ("kernel", |v| v["requires"]["kernel"] = json!(["network"])),
+        ("kernel-unique", |v| {
+            v["requires"]["kernel"] = json!(["events", "events"]);
+        }),
+        ("operations", |v| {
+            v["requires"]["operations"] = json!(["Bad"])
+        }),
+        ("assurance", |v| {
+            v["assurance"] = json!([{"id": "", "source": "x"}]);
+        }),
+    ];
+    for (label, mutate) in cases {
+        let mut value: Value = serde_json::from_str(raw).unwrap();
+        mutate(&mut value);
+        assert!(
+            DocumentsCatalog::load(Some(&value.to_string())).is_err(),
+            "{label} accepted: {value}"
+        );
+    }
 }
 
 #[test]
