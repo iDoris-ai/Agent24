@@ -704,11 +704,13 @@ async fn domain_os_and_mcp_show_up_with_a_list_and_a_d5_state() {
             .count(),
         1
     );
+    // C6 (#1570) fills Documents' provides from its own D9 catalog.
     assert!(
         find(&body, "documents")["provides"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .iter()
+            .any(|p| p["id"] == "documents")
     );
 
     let demo = find(&body, "demo");
@@ -992,5 +994,388 @@ async fn registry_lists_every_capability_id_the_components_emit() {
             covered(&id, &registered),
             "GET /components provides {id}, which is neither registered nor mcp-<server>"
         );
+    }
+}
+
+/// DOC-1-06b §3.1, the seven tools `POST /_a24/tools/{op}` actually dispatches.
+const DOC_TOOLS: &[&str] = &[
+    "documents.extract",
+    "documents.extraction_get",
+    "documents.find",
+    "documents.get",
+    "documents.job_get",
+    "documents.list",
+    "documents.read_range",
+];
+
+fn sorted_tools(names: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
+    let mut names: Vec<String> = names.into_iter().map(|n| n.as_ref().to_owned()).collect();
+    names.sort();
+    names
+}
+
+/// Quoted match arms of `dispatch`'s `match op` in `agent24-documents`.
+fn dispatched_tool_names() -> Vec<String> {
+    let src = include_str!("../../../agent24-documents/src/tools.rs");
+    let start = src.find("match op {").unwrap();
+    let rest = &src[start..];
+    let end = rest.find("_ =>").unwrap();
+    let mut names = Vec::new();
+    for line in rest[..end].lines() {
+        let line = line.trim();
+        let Some(line) = line.strip_prefix('"') else {
+            continue;
+        };
+        let Some((name, tail)) = line.split_once('"') else {
+            continue;
+        };
+        if tail.trim_start().starts_with("=>") {
+            names.push(format!("documents.{name}"));
+        }
+    }
+    sorted_tools(names)
+}
+
+fn mount_report(outcome: MountOutcome) -> crate::domain::MountReport {
+    crate::domain::MountReport {
+        name: "documents".into(),
+        namespace: "/api/v1/documents".into(),
+        version: "9.9.9".into(),
+        enabled_at_start: Some(true),
+        outcome,
+        granted: Vec::new(),
+        resources: crate::domain::ResourceStatus::NotChecked,
+        d9: None,
+    }
+}
+
+fn failure() -> agent24_os_proto::failure::RunFailure {
+    agent24_os_proto::failure::RunFailure::new(
+        agent24_os_proto::failure::FailureKind::Exited,
+        "gone",
+    )
+}
+
+#[test]
+fn documents_d9_catalog_parses_the_module_tools() {
+    let catalog = documents_catalog::DocumentsCatalog::embedded().unwrap();
+    assert_eq!(catalog.id, "documents");
+    assert_eq!(catalog.version, "0.1.0");
+    assert_eq!(catalog.name.en, "Documents");
+    assert_eq!(catalog.name.zh, "文档");
+    assert!(!catalog.name.th.is_empty());
+    assert!(catalog.assurance.is_empty());
+    assert_eq!(catalog.requires.kernel, ["events", "models"]);
+    assert!(catalog.requires.operations.is_empty());
+    let manifest = include_str!("../../../agent24-documents/domain-os.yml");
+    assert!(
+        manifest.contains("version: \"0.1.0\""),
+        "catalog version drifts from domain-os.yml"
+    );
+    assert!(manifest.contains("kernel_capabilities: [events, models]"));
+    assert_eq!(sorted_tools(catalog.tool_names()), DOC_TOOLS);
+    assert_eq!(dispatched_tool_names(), DOC_TOOLS);
+    let item = documents_from(None, None, Ok(catalog));
+    assert_eq!(item.form, Form::Resident);
+    assert_eq!(item.state, ComponentState::Absent);
+    assert_eq!(item.version.as_deref(), Some("0.1.0"));
+    assert!(item.reason.is_none());
+    assert_eq!(item.provides.len(), 1);
+    assert_eq!(item.provides[0].id, "documents");
+    assert_eq!(sorted_tools(item.provides[0].tools.iter()), DOC_TOOLS);
+    assert!(item.form.allows(item.state));
+}
+
+#[test]
+fn documents_d9_missing_or_broken_catalog_is_an_error() {
+    use documents_catalog::DocumentsCatalog;
+    assert!(matches!(
+        DocumentsCatalog::load(None),
+        Err(documents_catalog::CatalogError::Missing)
+    ));
+    for raw in ["", "   ", "{", "[]", "null", "{}"] {
+        assert!(DocumentsCatalog::load(Some(raw)).is_err(), "{raw}");
+    }
+    let raw = include_str!("../../../agent24-documents/component.json");
+    let mut value: Value = serde_json::from_str(raw).unwrap();
+    let provides = value.as_object_mut().unwrap().remove("provides").unwrap();
+    value["capabilities"] = provides;
+    assert!(
+        DocumentsCatalog::load(Some(&value.to_string())).is_err(),
+        "capabilities is not a catalog field"
+    );
+    let mut value: Value = serde_json::from_str(raw).unwrap();
+    value["provides"][0]["id"] = json!("A");
+    assert!(DocumentsCatalog::load(Some(&value.to_string())).is_err());
+    let mut value: Value = serde_json::from_str(raw).unwrap();
+    value["provides"][0]["tools"] = json!([]);
+    assert!(DocumentsCatalog::load(Some(&value.to_string())).is_err());
+    let mut value: Value = serde_json::from_str(raw).unwrap();
+    value["skills"] = json!([{"id": "later"}]);
+    assert!(DocumentsCatalog::load(Some(&value.to_string())).is_err());
+    let mut value: Value = serde_json::from_str(raw).unwrap();
+    value["extra"] = json!(1);
+    assert!(DocumentsCatalog::load(Some(&value.to_string())).is_err());
+
+    // One mutation per validate() guard. Dropping that guard makes this case Ok.
+    type CatalogCase = (&'static str, fn(&mut Value));
+    let cases: &[CatalogCase] = &[
+        ("id", |v| {
+            v["id"] = json!("docs");
+            for tool in v["provides"][0]["tools"].as_array_mut().unwrap() {
+                *tool = json!(tool.as_str().unwrap().replacen("documents.", "docs.", 1));
+            }
+        }),
+        ("version", |v| v["version"] = json!("0.1.0 ")),
+        ("name", |v| v["name"]["en"] = json!("")),
+        ("provides", |v| v["provides"] = json!([])),
+        ("provides.id", |v| {
+            let mut second = v["provides"][0].clone();
+            second["tools"] = json!(["documents.other_op"]);
+            v["provides"].as_array_mut().unwrap().push(second);
+        }),
+        ("provides.name", |v| {
+            v["provides"][0]["name"]["en"] = json!("")
+        }),
+        ("provides.summary", |v| {
+            v["provides"][0]["summary"]["zh"] = json!("");
+        }),
+        ("tool-shape", |v| {
+            v["provides"][0]["tools"][0] = json!("documents.Bad")
+        }),
+        ("tool-unique", |v| {
+            let mut second = v["provides"][0].clone();
+            second["id"] = json!("docs-read");
+            v["provides"].as_array_mut().unwrap().push(second);
+        }),
+        ("kernel", |v| v["requires"]["kernel"] = json!(["network"])),
+        ("kernel-unique", |v| {
+            v["requires"]["kernel"] = json!(["events", "events"]);
+        }),
+        ("operations", |v| {
+            v["requires"]["operations"] = json!(["Bad"])
+        }),
+        ("assurance", |v| {
+            v["assurance"] = json!([{"id": "", "source": "x"}]);
+        }),
+    ];
+    for (label, mutate) in cases {
+        let mut value: Value = serde_json::from_str(raw).unwrap();
+        mutate(&mut value);
+        assert!(
+            DocumentsCatalog::load(Some(&value.to_string())).is_err(),
+            "{label} accepted: {value}"
+        );
+    }
+}
+
+#[test]
+fn documents_d9_broken_catalog_degrades_without_panic() {
+    let broken = documents_catalog::DocumentsCatalog::load(None);
+    let absent = documents_from(None, None, broken);
+    assert_eq!(absent.state, ComponentState::Absent);
+    assert!(absent.provides.is_empty());
+    assert!(absent.version.is_none());
+    assert_eq!(absent.reason.as_deref(), Some("catalog_invalid"));
+    assert_eq!(absent.form, Form::Resident);
+    assert!(absent.form.allows(absent.state));
+
+    let report = mount_report(MountOutcome::Mounted);
+    let running = documents_from(
+        Some(&report),
+        Some(&Supervised::Running),
+        documents_catalog::DocumentsCatalog::load(Some("{")),
+    );
+    assert_eq!(running.state, ComponentState::Ready);
+    assert_eq!(running.version.as_deref(), Some("9.9.9"));
+    assert!(running.provides.is_empty());
+    assert_eq!(running.reason.as_deref(), Some("catalog_invalid"));
+    assert!(running.form.allows(running.state));
+
+    let backoff = Supervised::Backoff {
+        failures: 2,
+        delay: Duration::from_secs(1),
+        last: failure(),
+    };
+    let retrying = documents_from(
+        Some(&report),
+        Some(&backoff),
+        documents_catalog::DocumentsCatalog::load(Some("")),
+    );
+    assert_eq!(retrying.state, ComponentState::Failed);
+    assert_eq!(retrying.reason.as_deref(), Some("restarting"));
+    assert!(retrying.provides.is_empty());
+}
+
+#[test]
+fn documents_d9_states_stay_in_the_resident_subset() {
+    use std::time::Duration as Wait;
+    let gone = failure();
+    let cases = [
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::Starting {
+                attempt: 1,
+                after: None,
+            }),
+            ComponentState::Starting,
+            None,
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::Running),
+            ComponentState::Ready,
+            None,
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::Stopping),
+            ComponentState::Stopping,
+            None,
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::Stopped),
+            ComponentState::Stopped,
+            None,
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::Backoff {
+                failures: 1,
+                delay: Wait::from_secs(1),
+                last: gone.clone(),
+            }),
+            ComponentState::Failed,
+            Some("restarting"),
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::GaveUp {
+                failures: 3,
+                within: Wait::from_secs(60),
+                last: gone,
+            }),
+            ComponentState::Failed,
+            Some("gave_up"),
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::PackageChanged {
+                reason: "digest".into(),
+            }),
+            ComponentState::Failed,
+            Some("package_changed"),
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::StopFailed {
+                error: "busy".into(),
+            }),
+            ComponentState::Failed,
+            Some("stop_failed"),
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::Panicked),
+            ComponentState::Failed,
+            Some("panicked"),
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::Killed),
+            ComponentState::Failed,
+            Some("killed"),
+        ),
+        (MountOutcome::Mounted, None, ComponentState::Ready, None),
+        (
+            MountOutcome::Disabled,
+            Some(Supervised::Running),
+            ComponentState::Stopped,
+            Some("disabled"),
+        ),
+        (
+            MountOutcome::Degraded("disk".into()),
+            None,
+            ComponentState::Failed,
+            Some("degraded"),
+        ),
+        (
+            MountOutcome::Refused("duplicate".into()),
+            None,
+            ComponentState::Failed,
+            Some("refused"),
+        ),
+    ];
+    assert_eq!(documents_form(), Form::Resident);
+    for (outcome, live, want, reason) in cases {
+        let (state, got, detail) = documents_mapped(&outcome, live.as_ref());
+        assert_eq!(state, want, "{outcome:?}");
+        assert_eq!(got, reason, "{outcome:?}");
+        assert!(
+            documents_form().allows(state),
+            "{state:?} is outside the resident subset"
+        );
+        if matches!(
+            outcome,
+            MountOutcome::Degraded(_) | MountOutcome::Refused(_)
+        ) {
+            assert!(detail.is_some());
+        }
+    }
+    let report = mount_report(MountOutcome::Mounted);
+    let item = documents_from(
+        Some(&report),
+        Some(&Supervised::Running),
+        documents_catalog::DocumentsCatalog::embedded(),
+    );
+    assert_eq!(item.state, ComponentState::Ready);
+    assert_eq!(item.version.as_deref(), Some("0.1.0"));
+    assert_eq!(item.form, Form::Resident);
+    assert!(!item.provides.is_empty());
+    assert!(item.form.allows(item.state));
+}
+
+#[tokio::test]
+async fn documents_d9_entry_lists_provides_and_redacts() {
+    let (app, host, _, first_party) = app().await;
+    let (status, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(status, StatusCode::OK);
+    let doc = find(&full, "documents");
+    assert_eq!(doc["state"], "absent");
+    assert_eq!(doc["form"], "resident");
+    assert_eq!(doc["version"], "0.1.0");
+    assert!(doc.get("reason").is_none());
+    assert_eq!(doc["provides"][0]["id"], "documents");
+    assert_eq!(doc["provides"][0]["name"]["en"], "Local documents");
+    let tools = sorted_tools(
+        doc["provides"][0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap()),
+    );
+    assert_eq!(tools, DOC_TOOLS);
+
+    let (status, redacted) = call(&app, Method::GET, GET, Some(&first_party), "").await;
+    assert_eq!(status, StatusCode::OK);
+    let doc = find(&redacted, "documents");
+    let mut keys: Vec<_> = doc.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["id", "provides", "state", "version"]);
+    assert_eq!(doc["provides"][0]["id"], "documents");
+    assert_eq!(
+        sorted_tools(
+            doc["provides"][0]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_str().unwrap())
+        ),
+        DOC_TOOLS
+    );
+    let text = doc.to_string();
+    for leaked in ["reason", "form", "detail", "catalog_invalid", "port", "pid"] {
+        assert!(!text.contains(leaked), "{leaked} leaked: {text}");
     }
 }

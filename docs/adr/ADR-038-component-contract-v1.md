@@ -326,7 +326,7 @@ CLI 绑定额外规定（和 `agent24-comm/src/runner.rs` 现有约定一致）�
 | C3 | 新增 `GET /api/v1/components`（含 D9 清单、audience 脱敏、`Operation::ComponentsRead`）和 `POST /api/v1/components/{id}/report`；统一状态机（D5 转移表与映射表）；`GRACE_MAX_MS` 抬到 ≥15 000、默认值与 env 名统一；能力中心、通信页、本地模型页改为读这个接口。C3b：桌面上报 + 心跳 30s。**过渡期**：C2 之前 Hyphae 没有 `health`，它的状态由现有 pid 存活判定，只有 `ready / stopped / failed`，没有 `degraded` | Agent24 |
 | C4 | AgentEar：只在 `/api/v1/components` 里登记（attach 子集状态），握手不变；D2/D2a 不适用（见 D2a 缺口说明）；补 §3 用例 2、3、4 | Agent24 |
 | C5 | Knowledge：把 `/system/capabilities` 映射到 D3/D5（远端服务子集） | Agent24 |
-| C6 | Documents：补 D9 清单；等它独立发版时再补 D2 的锁 | Agent24 |
+| C6 | Documents：补 D9 清单。**已完成**（2026-11-03）：清单是模块自带的 `rust/apps/agent24-documents/component.json`，编译进 agent24d（不写入 `domain-os.yml`，那份是握手 manifest）。`/components` 用清单的 provides 与 version；形态按 D5 为常驻。D2 的锁等独立发版再补 | Agent24 |
 | C7 | 领域 OS、进程内 DomainModule、MCP：补 D9 清单（MCP 自动生成），状态接入 C3；`REGISTRY.md` 建表。**已完成**（2026-11-03）：登记表见 `docs/capabilities/REGISTRY.md` | Agent24 |
 | C8 | Open Design：桌面经 `POST /api/v1/components/{id}/report` 上报安装与运行状态；随 `SidecarManager` 落地迁到 sidecar 绑定。OD 下载迁进 daemon 不在 v1 | Agent24 |
 
