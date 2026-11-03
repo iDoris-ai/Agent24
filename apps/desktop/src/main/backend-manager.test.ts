@@ -11,6 +11,7 @@ import {
   fetchDaemonHealth,
   readExternalDaemonState,
   BackendManager,
+  DAEMON_EXIT_WAIT_MS,
   selectedBackend,
   resolveNodeEntryFrom,
   resolveRustBinary,
@@ -307,14 +308,56 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
       manager.stop()
     })
 
-    it('a daemon that does not exit in time: the work runs anyway after the timeout', async () => {
+    it('a daemon that does not exit in time: the work is not run (it would hit the lock)', async () => {
       const first = fakeChild(111)
       const spawnProcess = vi.fn().mockReturnValueOnce(first).mockReturnValue(fakeChild(222))
       const manager = new BackendManager({ external: absent(), spawnProcess })
       await manager.start()
       const work = vi.fn(async () => 'late')
-      expect(await manager.whileStopped(work, 20)).toBe('late')
-      expect(work).toHaveBeenCalledOnce()
+      await expect(manager.whileStopped(work, 20)).rejects.toThrow(/did not exit within/)
+      expect(work).not.toHaveBeenCalled()
+      manager.stop()
+    })
+
+    it('waits as long as the CLI waits for a stopping daemon', () => {
+      expect(DAEMON_EXIT_WAIT_MS).toBeGreaterThanOrEqual(55_000)
+    })
+
+    it('a tray start or restart meanwhile spawns nothing until the work is done, then once', async () => {
+      const first = fakeChild(111)
+      const spawnProcess = vi.fn().mockReturnValueOnce(first).mockReturnValue(fakeChild(222))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      await manager.start()
+      let finish!: () => void
+      const running = manager.whileStopped(() => new Promise<void>((r) => { finish = r }))
+      manager.startDaemon()
+      manager.restart()
+      ;(first as unknown as EventEmitter).emit('exit', 0)
+      await vi.waitFor(() => expect(finish).toBeDefined())
+      manager.restart()
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      finish()
+      await running
+      expect(spawnProcess).toHaveBeenCalledTimes(2)
+      manager.stop()
+    })
+
+    it('a tray stop meanwhile is kept: not brought back afterwards', async () => {
+      const first = fakeChild(111)
+      const spawnProcess = vi.fn().mockReturnValueOnce(first).mockReturnValue(fakeChild(222))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      await manager.start()
+      let finish!: () => void
+      const running = manager.whileStopped(() => new Promise<void>((r) => { finish = r }))
+      ;(first as unknown as EventEmitter).emit('exit', 0)
+      await vi.waitFor(() => expect(finish).toBeDefined())
+      manager.stopDaemon()
+      finish()
+      await running
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      expect(manager.status()).toBe('stopped')
+      manager.startDaemon()
+      expect(spawnProcess).toHaveBeenCalledTimes(2)
       manager.stop()
     })
 

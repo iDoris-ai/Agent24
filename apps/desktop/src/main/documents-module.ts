@@ -253,6 +253,8 @@ export type ModuleActionError =
   | 'cli_failed'
   /** The "user uninstalled" marker could not be written. */
   | 'marker_failed'
+  /** The app's daemon did not exit in time, so the CLI was not run. */
+  | 'daemon_running'
 
 export type ModuleActionResult = { ok: true } | { ok: false; code: ModuleActionError; message: string }
 

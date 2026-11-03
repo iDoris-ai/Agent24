@@ -394,6 +394,17 @@ describe('A1 backendProxy allowlist', () => {
       expect(showMessageBox).not.toHaveBeenCalled()
       expect(docUninstall).not.toHaveBeenCalled()
     })
+    it('turning documents off after it was uninstalled is refused (os.json would name a missing module)', async () => {
+      docStatus = { ...docStatus, installed: false }
+      extraOsModules = [{ name: 'documents', enabled: true, version: '0.2.0' }]
+      const res = await call(IpcChannels.OsModuleSetEnabled, 'documents', false)
+      expect(res.data.error.code).toBe('not_installed')
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(seen.some((r) => r.method === 'PATCH')).toBe(false)
+      // Turning it on, or any other module off, is unaffected.
+      showMessageBox.mockResolvedValue({ response: 0 })
+      expect((await call(IpcChannels.OsModuleSetEnabled, 'sin90', false)).ok).toBe(true)
+    })
     it('a CLI failure with an external daemon says how to stop it', async () => {
       docStatus = { ...docStatus, externalDaemon: true }
       showMessageBox.mockResolvedValue({ response: 0 })

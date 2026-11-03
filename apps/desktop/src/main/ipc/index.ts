@@ -1045,6 +1045,12 @@ export function registerIpcHandlers(options: {
     exclusive(async () => {
       if (typeof name !== 'string' || !SAFE_ID.test(name) || name === '.' || name === '..') return invalidRequest('invalid module name')
       if (typeof enabled !== 'boolean') return invalidRequest('enabled must be a boolean')
+      // T1-2: documents uninstalled, but a daemon that has not restarted still
+      // lists it. Turning it off now writes an os.json entry for a module that
+      // is gone, and the next start degrades every module (unknown_disabled).
+      if (name === 'documents' && !enabled && !documentsModule().installed) {
+        return { ok: false, status: 409, data: { error: { code: 'not_installed', message: mt('err.docmodNotInstalled') } } }
+      }
       const list = await proxyToBackend({ method: 'GET', path: '/api/v1/os' })
       const mods = (list.data as { modules?: { name?: unknown; enabled?: unknown; version?: unknown }[] } | null)?.modules
       const mod = list.ok && Array.isArray(mods) ? mods.find((m) => m.name === name) : undefined

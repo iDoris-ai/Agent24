@@ -375,7 +375,12 @@ app.whenReady().then(async () => {
   const documentsModuleAction = async (run: () => Promise<ModuleActionResult>): Promise<ModuleActionResult> => {
     await documentsModuleReady
     const external = backendManager.isExternalDaemon()
-    const result = await backendManager.whileStopped(run)
+    let result: ModuleActionResult
+    try {
+      result = await backendManager.whileStopped(run)
+    } catch (error) {
+      result = { ok: false, code: 'daemon_running', message: error instanceof Error ? error.message : String(error) }
+    }
     if (!external && backendManager.status() !== 'stopped') await daemonReady(30_000)
     return result
   }
