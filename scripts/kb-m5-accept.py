@@ -248,8 +248,9 @@ class Recorder(Quiet):
 FAULT = {}  # "search" / "read" → ("close",) | ("sleep", seconds) | ("tag",) | ("revoke", key)
 SEEN = []  # (time, "search" / "read") of each call the proxy got
 ARRIVED = threading.Event()
-UPSTREAM = []  # ("search" / "read", whether the key was swapped, WeKnora's status or 0) of each call passed on
-FORWARDED = threading.Event()  # set once WeKnora's answer to a call passed on is in
+UPSTREAM = []  # ("search" / "read", key swapped, WeKnora's status or 0, written back to the daemon) per call passed on
+FORWARDED = threading.Event()  # set once a call passed on is done: its answer written back, or that failing
+CASE = [0]  # bumped by clear(): a call still running from an earlier case records nothing
 
 
 class Faulty(Quiet):
@@ -260,6 +261,7 @@ class Faulty(Quiet):
     refuses (the key was revoked)."""
 
     def do_POST(self):
+        case = CASE[0]
         raw = self.body()
         op = urllib.parse.urlsplit(self.path).path.rsplit("/", 1)[-1]
         SEEN.append((time.time(), op))
@@ -280,26 +282,26 @@ class Faulty(Quiet):
         if swapped:
             headers["X-API-Key"] = "sk-revoked-" + secrets.token_hex(8)
         u = urllib.parse.urlsplit(WK)
+        res, wrote = None, False
         try:
             conn = http.client.HTTPConnection(u.hostname, u.port, timeout=60)
             conn.request("POST", self.path, body=raw, headers=headers)
             res = conn.getresponse()
             data = res.read()
             conn.close()
-        except (OSError, http.client.HTTPException):
-            res = None
-        UPSTREAM.append((op, swapped, res.status if res is not None else 0))
-        FORWARDED.set()
-        if res is None:
-            return
-        try:
             self.send_response(res.status)
             self.send_header("Content-Type", res.getheader("Content-Type") or "application/json")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
-        except OSError:
-            pass  # the daemon stopped waiting for it
+            self.wfile.flush()
+            wrote = True
+        except (OSError, http.client.HTTPException):
+            pass  # WeKnora gave no answer, or the daemon stopped waiting for it
+        finally:
+            if case == CASE[0]:
+                UPSTREAM.append((op, swapped, res.status if res is not None else 0, wrote))
+                FORWARDED.set()
 
 
 def serve(handler, port=0):
@@ -534,6 +536,7 @@ def code_of(result):
 
 
 def clear():
+    CASE[0] += 1
     for each in (DUMPS, STAMPS, SEEN, UPSTREAM, ARRIVED, FORWARDED):
         each.clear()
 
@@ -552,8 +555,9 @@ def broken(d, fault, prompt):
 def held(d, then):
     """A run whose search the proxy holds for 5 s; `then()` runs 1 s after the
     search went out, by when an answer not held would have come back and the
-    run gone on. (what `then` returned, the run, the run re-read once WeKnora's
-    answer to the held search is in, a note: "" or why the case cannot pass)."""
+    run gone on. (what `then` returned, the run, the run re-read once the proxy
+    has written WeKnora's answer to the held search back, a note: "" or why
+    the case cannot pass)."""
     FAULT.clear()
     FAULT["search"] = ("sleep", 5)
     clear()
@@ -562,10 +566,11 @@ def held(d, then):
     time.sleep(1)
     did = then(run_id)
     run = d.wait(run_id) if run_id else {}
-    forwarded = FORWARDED.wait(15)
+    FORWARDED.wait(15)
     later = d.call("GET", f"/api/v1/runs/{run_id}")[1] if run_id else {}
     FAULT.clear()
-    note = "" if arrived and forwarded else "search 未到达代理；" if not arrived else "被压住的 search 没有转发完；"
+    late = any(u[:3] == ("search", False, 200) for u in UPSTREAM)
+    note = ("" if late else f"被压住的 search 上游没有回 200，代理记录 {UPSTREAM}；") if arrived else "search 未到达代理；"
     return did, run or {}, later, note
 
 
@@ -651,19 +656,20 @@ def cases(d, lib, real, via):
     sent = next((t for t, op in SEEN if op == "search"), None)
     back = next((t for t, r in zip(STAMPS, DUMPS) if tool_results([r])), None)
     waited = back - sent if sent and back else None
-    forwarded = FORWARDED.wait(30)
+    FORWARDED.wait(30)
+    forwarded = any(u[:3] == ("search", False, 200) for u in UPSTREAM)
     later = d.call("GET", f"/api/v1/runs/{run.get('id')}")[1]
     check("N5", "超时：WeKnora 20 秒才回，工具结果在时限（15 秒加 2 秒余量）内返回 unavailable，run 30 秒内完成，迟到的 200 不改结果",
           run.get("status") == "completed" and code_of((res or [""])[0]) == "unavailable"
           and waited is not None and waited < 19 and took < 30 and forwarded and answer_of(later) == answer_of(run),
-          f"{'' if forwarded else '迟到的应答没有等到；'}状态 {run.get('status')}，工具结果 {(res or [''])[0][:160]!r}，search 发出到结果回到模型 {waited and round(waited, 1)} 秒，run {round(took, 1)} 秒，迟到后回答{'不变' if answer_of(later) == answer_of(run) else '变了'}")
+          f"{'' if forwarded else '上游没有迟到地回 200；'}代理记录 {UPSTREAM}（op、换了 key、上游状态码、写回成功），状态 {run.get('status')}，工具结果 {(res or [''])[0][:160]!r}，search 发出到结果回到模型 {waited and round(waited, 1)} 秒，run {round(took, 1)} 秒，迟到后回答{'不变' if answer_of(later) == answer_of(run) else '变了'}")
 
     (c, craw, at), run, _, note = held(d, lambda rid: d.call("POST", f"/api/v1/runs/{rid}/cancel")[::2] + (time.time(),))
     after = [op for t, op in SEEN if t > at]
     asked = sum(1 for r in DUMPS if r.get("tools"))
     check("N6", "取消：检索还在路上时取消 run，run 终态 cancelled，之后（等到被压住的 search 转发完）不再有 Knowledge 调用，模型不再被调用",
           not note and c in (200, 202, 204) and run.get("status") == "cancelled" and not after and asked == 1,
-          f"{note}cancel {c} {craw[:60]}，状态 {run.get('status')}，取消后代理收到 {after}，带工具的模型请求 {asked} 次")
+          f"{note}代理记录 {UPSTREAM}，cancel {c} {craw[:60]}，状态 {run.get('status')}，取消后代理收到 {after}，带工具的模型请求 {asked} 次")
 
     run, res, _ = broken(d, {"read": ("tag",)}, f"M5-READ {hit.get('knowledge_id')} {hit.get('chunk_id')} {hit.get('content_tag')}")
     check("N7", "stale：按引用读回时这一块已经变了（代理改了期望的 content_tag），工具结果 stale，没有正文",
@@ -690,9 +696,9 @@ def cases(d, lib, real, via):
     why = refusal_of(denied)
     check("N10", "撤权：代理拦下旧 key、WeKnora 回 401/403，工具结果是凭据被拒（unauthorized，或 401 不带信封时的 unavailable/incompatible）、没有证据；推入新 key 后同样的检索恢复",
           (why.get("code") == "unauthorized" or (why.get("code"), why.get("reason")) == ("unavailable", "incompatible"))
-          and not evidence_of(denied) and any(sw and st in (401, 403) for _, sw, st in up1) and s == 204
-          and not any(sw for _, sw, _ in up2) and any(has_fact(h.get("snippet", "")) for h in evidence_of((res2 or [""])[0])),
-          f"旧 key：代理转发 {up1}（op、换了 key、上游状态码），工具结果 {denied[:160]!r}；PUT credential {s} {r[:60]}；新 key：代理转发 {up2}，{(res2 or [''])[0][:120]!r}")
+          and not evidence_of(denied) and any(sw and st in (401, 403) for _, sw, st, _ in up1) and s == 204
+          and not any(sw for _, sw, _, _ in up2) and any(has_fact(h.get("snippet", "")) for h in evidence_of((res2 or [""])[0])),
+          f"旧 key：代理转发 {up1}（op、换了 key、上游状态码、写回成功），工具结果 {denied[:160]!r}；PUT credential {s} {r[:60]}；新 key：代理转发 {up2}，{(res2 or [''])[0][:120]!r}")
     FAULT.clear()
 
     (s, r), run, later, note = held(d, lambda rid: d.host("DELETE")[::2])
@@ -702,7 +708,7 @@ def cases(d, lib, real, via):
           not note and s == 204 and run.get("status") == "completed" and code_of((res or [""])[0]) == "knowledge_call_superseded"
           and not evidence_of((res or [""])[0]) and answer_of(later) == answer_of(run)
           and run2 is None and s2 == 409 and "knowledge_binding_inactive" in raw2,
-          f"{note}DELETE {s} {r[:40]}，状态 {run.get('status')}，工具结果 {(res or [''])[0][:160]!r}，迟到后回答{'不变' if answer_of(later) == answer_of(run) else '变了'}；新 run {s2} {raw2[:100]}")
+          f"{note}代理记录 {UPSTREAM}，DELETE {s} {r[:40]}，状态 {run.get('status')}，工具结果 {(res or [''])[0][:160]!r}，迟到后回答{'不变' if answer_of(later) == answer_of(run) else '变了'}；新 run {s2} {raw2[:100]}")
 
     d.host("PUT", body=endpoint)
     d.host("PUT", "/credential", {"kind": "api_key", "value": new, "expires_at": int(time.time()) + 3600})
