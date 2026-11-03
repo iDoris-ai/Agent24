@@ -118,6 +118,17 @@ describe('ensureBundledDocumentsModule', () => {
     expect(runCli.mock.calls).toEqual([[['os', 'uninstall', 'documents']], [['os', 'install', b]]])
   })
 
+  it('compares the directory the CLI installs into: `..` after a symlink is not folded', async () => {
+    const b = bundle()
+    fs.mkdirSync(path.join(root, 'real', 'sub'), { recursive: true })
+    fs.symlinkSync(path.join(root, 'real', 'sub'), path.join(root, 'link'))
+    // As PathBuf::join: <root>/link/../packages is <root>/real/packages.
+    fs.cpSync(b, path.join(root, 'real', 'packages', 'documents'), { recursive: true })
+    const { d, runCli } = deps({ bundleDir: b, packagesRoot: `${root}/link/../packages` })
+    expect(await ensureBundledDocumentsModule(d)).toBe('up_to_date')
+    expect(runCli).not.toHaveBeenCalled()
+  })
+
   it('a file only on one side → replaced', async () => {
     const b = bundle()
     const pkgs = installedCopy(b)

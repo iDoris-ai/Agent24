@@ -100,7 +100,7 @@ export function manifestVersion(text: string): string | null {
 function listTree(dir: string, rel = ''): string[] | null {
   let entries: fs.Dirent[]
   try {
-    entries = fs.readdirSync(path.join(dir, rel), { withFileTypes: true })
+    entries = fs.readdirSync(rel === '' ? dir : joinLiteral(dir, rel), { withFileTypes: true })
   } catch {
     return null
   }
@@ -127,7 +127,7 @@ export function sameFiles(a: string, b: string): boolean {
   if (left === null || right === null || left.length !== right.length) return false
   if (left.some((name, i) => name !== right[i])) return false
   try {
-    return left.every((name) => name.endsWith('/') || fs.readFileSync(path.join(a, name)).equals(fs.readFileSync(path.join(b, name))))
+    return left.every((name) => name.endsWith('/') || fs.readFileSync(joinLiteral(a, name)).equals(fs.readFileSync(joinLiteral(b, name))))
   } catch {
     return false
   }
