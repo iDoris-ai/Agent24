@@ -387,6 +387,16 @@ describe('A1 backendProxy allowlist', () => {
       expect(showMessageBox).not.toHaveBeenCalled()
       expect(docUninstall).not.toHaveBeenCalled()
     })
+    it('status: os.json turned documents off → turnedOff (the page says "turned off", not the raw module_stopping)', async () => {
+      extraOsModules = [{ name: 'documents', enabled: false, version: '0.2.0' }]
+      expect(await call(IpcChannels.DocumentsModuleStatus)).toEqual({ ...docStatus, turnedOff: true })
+      extraOsModules = [{ name: 'documents', enabled: true, version: '0.2.0' }]
+      expect(await call(IpcChannels.DocumentsModuleStatus)).toEqual({ ...docStatus, turnedOff: false })
+    })
+    it('status: the daemon does not list documents → no turnedOff, only what is on disk', async () => {
+      extraOsModules = []
+      expect(await call(IpcChannels.DocumentsModuleStatus)).toEqual(docStatus)
+    })
     it('uninstall: the daemon does not serve documents → refused without a dialog', async () => {
       extraOsModules = []
       const res = await call(IpcChannels.OsModuleUninstall)

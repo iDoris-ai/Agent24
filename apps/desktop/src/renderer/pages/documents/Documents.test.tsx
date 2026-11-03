@@ -38,7 +38,7 @@ interface Mock {
 }
 
 /** `list` answers from `lists` in turn (the last one repeats); `job` from `jobs`. */
-function mount(opts: { lists?: Array<() => Promise<Res>>; jobs?: Array<() => Promise<Res>>; capabilities?: () => Promise<Res>; moduleStatus?: () => Promise<{ bundled: boolean; installed: boolean; externalDaemon: boolean }> }): Mock {
+function mount(opts: { lists?: Array<() => Promise<Res>>; jobs?: Array<() => Promise<Res>>; capabilities?: () => Promise<Res>; moduleStatus?: () => Promise<{ bundled: boolean; installed: boolean; externalDaemon: boolean; turnedOff?: boolean }> }): Mock {
   const lists = [...(opts.lists ?? [() => ok({ documents: [], next_cursor: null })])]
   const jobs = [...(opts.jobs ?? [])]
   const m: Mock = { request: vi.fn(), importFile: vi.fn(() => Promise.resolve(null)), progress: null, event: null }
@@ -171,6 +171,32 @@ describe('DocumentsPage: the list', () => {
     expect(await screen.findByText('文档模块已停用。到「模块管理」页启用后即可使用。')).toBeInTheDocument()
     expect(screen.queryByText('文档模块未安装')).toBeNull()
     expect(screen.queryByText(/module documents is disabled/)).toBeNull()
+  })
+
+  it('T1-2: turned off while the daemon runs (503 module_stopping, os.json says off): the same notice, no raw error', async () => {
+    const stopping = () => err(503, 'module_stopping', 'this run has stopped and will not restart on its own')
+    mount({
+      capabilities: stopping,
+      lists: [stopping],
+      moduleStatus: () => Promise.resolve({ bundled: true, installed: true, externalDaemon: false, turnedOff: true }),
+    })
+    render(<DocumentsPage />)
+    expect(await screen.findByText('文档模块已停用。到「模块管理」页启用后即可使用。')).toBeInTheDocument()
+    await waitFor(() => expect(screen.getAllByRole('alert')).toHaveLength(1))
+    expect(screen.queryByText(/will not restart on its own/)).toBeNull()
+    expect(screen.queryByText('文档模块未安装')).toBeNull()
+  })
+
+  it('module_stopping while os.json says on (a crash): the raw error stays, no turned-off notice', async () => {
+    const stopping = () => err(503, 'module_stopping', 'this run has stopped and will not restart on its own')
+    mount({
+      capabilities: stopping,
+      lists: [stopping],
+      moduleStatus: () => Promise.resolve({ bundled: true, installed: true, externalDaemon: false, turnedOff: false }),
+    })
+    render(<DocumentsPage />)
+    await waitFor(() => expect(screen.getAllByText(/will not restart on its own/)).toHaveLength(2))
+    expect(screen.queryByText('文档模块已停用。到「模块管理」页启用后即可使用。')).toBeNull()
   })
 
   it('capabilities says no route but the list has a real error: the error is still shown', async () => {

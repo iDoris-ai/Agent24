@@ -110,6 +110,10 @@ export interface DocumentsModuleStatus {
   installed: boolean
   /** The running daemon was started outside the app: restart it with the CLI, not the tray. */
   externalDaemon: boolean
+  /** os.json has documents turned off (as `GET /api/v1/os` reports it); absent when the daemon did not say.
+   * Until the daemon restarts, a module turned off while running answers 503 `module_stopping`,
+   * like a crashed one, not `module_disabled`. */
+  turnedOff?: boolean
 }
 
 /** What the renderer sees of the Knowledge settings: never the key. */

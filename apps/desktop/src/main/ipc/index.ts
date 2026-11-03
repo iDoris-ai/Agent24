@@ -206,6 +206,17 @@ function reachesPrefix(prefix: RegExp, requestPath: string): boolean {
   }
 }
 
+/** How long the Documents page waits for the daemon's module list. */
+const DOCUMENTS_STATUS_TIMEOUT_MS = 5_000
+
+/** The documents entry of `GET /api/v1/os` (os.json as the daemon sees it), or
+ * undefined when the daemon does not list it or did not answer. */
+async function documentsOsEntry(timeoutMs?: number): Promise<{ name?: unknown; enabled?: unknown } | undefined> {
+  const list = await proxyToBackend({ method: 'GET', path: '/api/v1/os' }, timeoutMs)
+  const mods = (list.data as { modules?: { name?: unknown; enabled?: unknown }[] } | null)?.modules
+  return list.ok && Array.isArray(mods) ? mods.find((m) => m.name === 'documents') : undefined
+}
+
 /** Ready-to-use daemon access for main-process code (not allowlisted: callers
  *  here build their own fixed paths). */
 function proxyToBackend(req: BackendProxyRequest, timeoutMs?: number): Promise<BackendProxyResponse> {
@@ -584,7 +595,11 @@ export function registerIpcHandlers(options: {
   handle(IpcChannels.DocumentsRequest, (_event, req: unknown) =>
     documentsCall(req, daemonCliEndpoint),
   )
-  handle(IpcChannels.DocumentsModuleStatus, (): DocumentsModuleStatus => documentsModule())
+  handle(IpcChannels.DocumentsModuleStatus, async (): Promise<DocumentsModuleStatus> => {
+    const status = documentsModule()
+    const mod = await documentsOsEntry(DOCUMENTS_STATUS_TIMEOUT_MS)
+    return mod ? { ...status, turnedOff: mod.enabled === false } : status
+  })
   handle(IpcChannels.DocumentsImportFile, async (event) => {
     const window = BrowserWindow.fromWebContents(event.sender)
     const options: Electron.OpenDialogOptions = {
@@ -1088,9 +1103,7 @@ export function registerIpcHandlers(options: {
       // gone that entry names nothing, and at the next start the daemon
       // degrades EVERY module (domain.rs `unknown_disabled`). The daemon owns
       // os.json, so: turn it on here first, then uninstall.
-      const list = await proxyToBackend({ method: 'GET', path: '/api/v1/os' })
-      const mods = (list.data as { modules?: { name?: unknown; enabled?: unknown }[] } | null)?.modules
-      const mod = list.ok && Array.isArray(mods) ? mods.find((m) => m.name === 'documents') : undefined
+      const mod = await documentsOsEntry()
       if (!mod) {
         return { ok: false, status: 404, data: { error: { code: 'module_unavailable', message: mt('err.moduleUnavailable') } } }
       }
