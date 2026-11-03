@@ -1,5 +1,8 @@
 #![allow(clippy::unwrap_used)]
 use super::*;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 use crate::capabilities::first_party::test_peer;
 use crate::enroll_api::EnrollAuthority;
 use crate::server::{build_router, tests as server_tests};
@@ -577,4 +580,426 @@ fn concurrent_reports_are_serialised_and_never_misflagged() {
         last.state,
         ComponentState::Ready | ComponentState::Degraded
     ));
+}
+
+// ---- Knowledge capabilities probe (ADR-038 C5) -----------------------------------------
+
+use crate::capabilities::unix_now;
+use crate::knowledge_host::{Change, Credential, Endpoint, KnowledgeHostRegistry};
+use crate::knowledge_probe::{KNOWLEDGE_PROBE_TIMEOUT, KNOWLEDGE_PROBE_TTL};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+fn shown(item: &Item) -> Value {
+    render(std::slice::from_ref(item), true)["components"][0].clone()
+}
+
+fn assert_no_canary(item: &Item, canaries: &[&str]) {
+    let host = render(std::slice::from_ref(item), true).to_string();
+    let redacted = render(std::slice::from_ref(item), false).to_string();
+    for canary in canaries {
+        assert!(!host.contains(canary), "{canary} in host view {host}");
+        assert!(
+            !redacted.contains(canary),
+            "{canary} in redacted view {redacted}"
+        );
+    }
+    for leaked in [
+        "detail",
+        "reason",
+        "probed_at",
+        "contract_version",
+        "missing_capabilities",
+        "missing_capability",
+    ] {
+        assert!(
+            !redacted.contains(leaked),
+            "{leaked} in redacted view {redacted}"
+        );
+    }
+}
+
+fn configured(base: &str) -> KnowledgeHostRegistry {
+    let registry = KnowledgeHostRegistry::default();
+    registry
+        .activate(
+            "host",
+            "binding",
+            1,
+            Endpoint {
+                base_url: base.to_owned(),
+                knowledge_base_ids: vec!["kb".into()],
+            },
+        )
+        .unwrap();
+    registry
+}
+
+fn ready_body() -> String {
+    r#"{"code":0,"msg":"LEAK-msg-9f3a","data":{"edition":"lite","x_unknown":1,"integration":{"other":{},"agent24_knowledge":{"protocol_versions":[1,2],"mode":"integration","supported_operations":["search","read","ingest"],"server_version":"0.8.2","future_field":true}}}}"#.to_owned()
+}
+
+#[derive(Clone)]
+enum Script {
+    Reply(u16, String),
+    /// 500 if the request carries a credential header, else `body`.
+    NoAuth(String),
+    Stall,
+    Hold(Arc<AtomicBool>, String),
+    Bearer {
+        secret: String,
+        ok: String,
+        anon: String,
+    },
+}
+
+struct Fake {
+    base: String,
+    hits: Arc<AtomicUsize>,
+}
+
+async fn serve(script: Script) -> Fake {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let script = script.clone();
+            let counter = Arc::clone(&counter);
+            tokio::spawn(async move {
+                let _ = answer(stream, script, &counter).await;
+            });
+        }
+    });
+    Fake {
+        base: format!("http://{addr}/api/v1"),
+        hits,
+    }
+}
+
+async fn answer(mut stream: TcpStream, script: Script, hits: &AtomicUsize) -> std::io::Result<()> {
+    let head = match read_head(&mut stream).await {
+        Some(head) => head,
+        None => return Ok(()),
+    };
+    hits.fetch_add(1, Ordering::SeqCst);
+    if !head.to_ascii_lowercase().contains("system/capabilities") {
+        write_response(&mut stream, 404, "not-found").await?;
+        return Ok(());
+    }
+    match script {
+        Script::Reply(status, body) => write_response(&mut stream, status, &body).await?,
+        Script::NoAuth(body) => {
+            let lower = head.to_ascii_lowercase();
+            if lower.contains("authorization:") || lower.contains("x-api-key:") {
+                write_response(&mut stream, 500, "saw-auth-LEAK").await?;
+            } else {
+                write_response(&mut stream, 200, &body).await?;
+            }
+        }
+        Script::Stall => std::future::pending::<()>().await,
+        Script::Hold(go, body) => {
+            while !go.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            write_response(&mut stream, 200, &body).await?;
+        }
+        Script::Bearer { secret, ok, anon } => {
+            let needle = format!("authorization: bearer {}", secret.to_ascii_lowercase());
+            let body = if head.to_ascii_lowercase().contains(&needle) {
+                ok
+            } else {
+                anon
+            };
+            write_response(&mut stream, 200, &body).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn read_head(stream: &mut TcpStream) -> Option<String> {
+    let mut data = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        if data.windows(4).any(|w| w == b"\r\n\r\n") {
+            return String::from_utf8(data).ok();
+        }
+        if data.len() > 16 * 1024 {
+            return None;
+        }
+        let n = stream.read(&mut buf).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        data.extend_from_slice(&buf[..n]);
+    }
+}
+
+async fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
+    let bytes = format!(
+        "HTTP/1.1 {status} S\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(bytes.as_bytes()).await
+}
+
+#[tokio::test]
+async fn knowledge_without_an_endpoint_is_stopped_and_does_not_probe() {
+    let fake = serve(Script::Reply(200, ready_body())).await;
+    let registry = KnowledgeHostRegistry::default();
+    let item = knowledge_item(&registry, Instant::now()).await;
+    assert_eq!(item.state, ComponentState::Stopped);
+    assert_eq!(item.reason.as_deref(), Some("not_configured"));
+    assert!(item.detail.is_none());
+
+    // Active, but the activation named no endpoint: still not configured.
+    registry
+        .apply("host", "binding", 1, Change::Activate)
+        .unwrap();
+    let item = knowledge_item(&registry, Instant::now()).await;
+    assert_eq!(item.state, ComponentState::Stopped);
+    assert_eq!(item.reason.as_deref(), Some("not_configured"));
+    assert_eq!(fake.hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_complete_capabilities_document_is_ready() {
+    let fake = serve(Script::NoAuth(ready_body())).await;
+    let registry = configured(&fake.base);
+    let item = knowledge_item(&registry, Instant::now()).await;
+    let host = shown(&item);
+    assert_eq!(host["state"], "ready");
+    assert_eq!(host["version"], "0.8.2");
+    assert!(host.get("reason").is_none());
+    assert_eq!(host["detail"]["missing_capabilities"], json!([]));
+    assert!(host["detail"]["probed_at"].as_u64().unwrap() > 0);
+    assert_eq!(host["detail"]["contract_version"]["expected"], "1");
+    assert_eq!(host["detail"]["contract_version"]["actual"], json!([1, 2]));
+    assert_eq!(host["detail"]["contract_version"]["mode"], "integration");
+    assert_no_canary(&item, &["LEAK-msg-9f3a", "future_field", "saw-auth"]);
+    assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_missing_required_operation_is_degraded() {
+    let body = r#"{"code":0,"msg":"LEAK-degraded-msg","data":{"integration":{"agent24_knowledge":{"protocol_versions":[1],"mode":"integration","supported_operations":["search","ingest"],"server_version":"1.2.3"}}}}"#;
+    let fake = serve(Script::Reply(200, body.to_owned())).await;
+    let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
+    let host = shown(&item);
+    assert_eq!(host["state"], "degraded");
+    assert_eq!(host["reason"], "missing_capability:read");
+    assert_eq!(host["detail"]["missing_capabilities"], json!(["read"]));
+    assert_eq!(host["version"], "1.2.3");
+    assert_no_canary(&item, &["LEAK-degraded-msg", "ingest"]);
+    let redacted = render(std::slice::from_ref(&item), false);
+    assert_eq!(redacted["components"][0]["state"], "degraded");
+}
+
+#[tokio::test]
+async fn a_closed_port_is_failed_without_the_os_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let item = knowledge_item(
+        &configured(&format!("http://{addr}/api/v1")),
+        Instant::now(),
+    )
+    .await;
+    let host = shown(&item);
+    assert_eq!(host["state"], "failed");
+    assert_eq!(host["reason"], "unreachable");
+    assert!(host["detail"]["contract_version"].is_null());
+    assert_eq!(host["detail"]["missing_capabilities"], json!([]));
+    let text = host.to_string();
+    for leaked in ["refused", "Connection", "127.0.0.1", "timed out", "Os"] {
+        assert!(!text.contains(leaked), "{leaked} in {text}");
+    }
+}
+
+#[tokio::test]
+async fn an_http_error_body_is_not_copied() {
+    let body = "database password is LEAK-http-body at /Users/secret";
+    let fake = serve(Script::Reply(500, body.to_owned())).await;
+    let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
+    let host = shown(&item);
+    assert_eq!(host["state"], "failed");
+    assert_eq!(host["reason"], "http_500");
+    assert_no_canary(
+        &item,
+        &["LEAK-http-body", "/Users/secret", "password", "database"],
+    );
+}
+
+#[tokio::test]
+async fn an_upstream_error_code_is_kept_and_its_message_is_not() {
+    let body = r#"{"code":401,"msg":"LEAK-upstream-token","data":null}"#;
+    let fake = serve(Script::Reply(200, body.to_owned())).await;
+    let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
+    let host = shown(&item);
+    assert_eq!(host["state"], "failed");
+    assert_eq!(host["reason"], "upstream_401");
+    assert_no_canary(&item, &["LEAK-upstream-token"]);
+}
+
+#[tokio::test]
+async fn a_different_contract_major_is_incompatible() {
+    let body = r#"{"data":{"integration":{"agent24_knowledge":{"protocol_versions":[2,3],"mode":"integration","supported_operations":["search","read"],"server_version":"9.9.9"}}}}"#;
+    let fake = serve(Script::Reply(200, body.to_owned())).await;
+    let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
+    let host = shown(&item);
+    assert_eq!(host["state"], "incompatible");
+    assert_eq!(host["reason"], "component_contract_mismatch");
+    assert_eq!(host["detail"]["contract_version"]["expected"], "1");
+    assert_eq!(host["detail"]["contract_version"]["actual"], json!([2, 3]));
+    assert_eq!(host["detail"]["missing_capabilities"], json!([]));
+    assert_eq!(host["version"], "9.9.9");
+    let redacted = render(std::slice::from_ref(&item), false);
+    assert_eq!(redacted["components"][0]["state"], "incompatible");
+    assert_no_canary(&item, &[]);
+    assert!(
+        !redacted.to_string().contains("component_contract_mismatch"),
+        "{redacted}"
+    );
+}
+
+#[tokio::test]
+async fn standalone_mode_is_incompatible_and_its_version_text_is_not_copied() {
+    let body = r#"{"code":0,"msg":"LEAK-mode-msg","data":{"integration":{"agent24_knowledge":{"protocol_versions":[1],"mode":"standalone","supported_operations":["search","read"],"server_version":"1.0 LEAK-ver-77"}}}}"#;
+    let fake = serve(Script::Reply(200, body.to_owned())).await;
+    let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
+    let host = shown(&item);
+    assert_eq!(host["state"], "incompatible");
+    assert_eq!(host["reason"], "component_contract_mismatch");
+    assert_eq!(host["detail"]["contract_version"]["mode"], "standalone");
+    assert!(host.get("version").is_none() || host["version"].is_null());
+    assert_no_canary(&item, &["LEAK-mode-msg", "LEAK-ver-77"]);
+}
+
+#[tokio::test]
+async fn a_probe_is_reused_until_the_ttl_and_a_deactivation_is_not() {
+    let fake = serve(Script::Reply(200, ready_body())).await;
+    let registry = configured(&fake.base);
+    let t0 = Instant::now();
+    let first = knowledge_item(&registry, t0).await;
+    assert_eq!(first.state, ComponentState::Ready);
+    assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
+    let second = knowledge_item(
+        &registry,
+        t0 + KNOWLEDGE_PROBE_TTL - Duration::from_millis(1),
+    )
+    .await;
+    assert_eq!(second.state, ComponentState::Ready);
+    assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        shown(&first)["detail"]["probed_at"],
+        shown(&second)["detail"]["probed_at"]
+    );
+    let third = knowledge_item(&registry, t0 + KNOWLEDGE_PROBE_TTL).await;
+    assert_eq!(third.state, ComponentState::Ready);
+    assert_eq!(fake.hits.load(Ordering::SeqCst), 2);
+
+    registry
+        .apply("host", "binding", 2, Change::Deactivate)
+        .unwrap();
+    let stopped = knowledge_item(&registry, t0 + KNOWLEDGE_PROBE_TTL).await;
+    assert_eq!(stopped.state, ComponentState::Stopped);
+    assert_eq!(stopped.reason.as_deref(), Some("not_configured"));
+    assert_eq!(fake.hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_component_reads_probe_once() {
+    let go = Arc::new(AtomicBool::new(false));
+    let fake = serve(Script::Hold(Arc::clone(&go), ready_body())).await;
+    let registry = Arc::new(configured(&fake.base));
+    let t0 = Instant::now();
+    let started = Arc::new(AtomicUsize::new(0));
+    let mut joins = Vec::new();
+    for _ in 0..8 {
+        let registry = Arc::clone(&registry);
+        let started = Arc::clone(&started);
+        joins.push(tokio::spawn(async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            knowledge_item(&registry, t0).await
+        }));
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while started.load(Ordering::SeqCst) < 8 {
+        if Instant::now() > deadline {
+            panic!("tasks did not start");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        fake.hits.load(Ordering::SeqCst),
+        1,
+        "concurrent reads shared one probe"
+    );
+    go.store(true, Ordering::SeqCst);
+    for join in joins {
+        let item = join.await.unwrap();
+        assert_eq!(item.state, ComponentState::Ready);
+    }
+    assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stall_fails_as_timeout_without_the_client_error_text() {
+    let fake = serve(Script::Stall).await;
+    let started = Instant::now();
+    let item = tokio::time::timeout(
+        KNOWLEDGE_PROBE_TIMEOUT + Duration::from_secs(2),
+        knowledge_item(&configured(&fake.base), Instant::now()),
+    )
+    .await
+    .unwrap();
+    assert!(started.elapsed() + Duration::from_millis(250) >= KNOWLEDGE_PROBE_TIMEOUT);
+    let host = shown(&item);
+    assert_eq!(host["state"], "failed");
+    assert_eq!(host["reason"], "timeout");
+    let text = host.to_string();
+    for leaked in ["deadline", "exceeded", "transport:", fake.base.as_str()] {
+        assert!(!text.contains(leaked), "{leaked} in {text}");
+    }
+}
+
+#[tokio::test]
+async fn rotating_the_credential_probes_again_and_the_secret_is_not_shown() {
+    let secret = "probe-secret-value";
+    let anon = r#"{"data":{"integration":{"agent24_knowledge":{"protocol_versions":[1],"mode":"integration","supported_operations":["search"],"server_version":"0.1.0"}}}}"#;
+    let ok = ready_body();
+    let fake = serve(Script::Bearer {
+        secret: secret.to_owned(),
+        ok,
+        anon: anon.to_owned(),
+    })
+    .await;
+    let registry = configured(&fake.base);
+    let t0 = Instant::now();
+    let first = knowledge_item(&registry, t0).await;
+    assert_eq!(shown(&first)["state"], "degraded");
+    assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
+    let cached = knowledge_item(&registry, t0 + Duration::from_millis(1)).await;
+    assert_eq!(shown(&cached)["reason"], "missing_capability:read");
+    assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
+
+    registry
+        .push_credential(
+            "host",
+            "binding",
+            2,
+            Credential::Bearer(secret.to_owned()),
+            unix_now() + 600,
+        )
+        .unwrap();
+    let authed = knowledge_item(&registry, t0 + Duration::from_millis(2)).await;
+    let host = shown(&authed);
+    assert_eq!(host["state"], "ready");
+    assert_eq!(fake.hits.load(Ordering::SeqCst), 2);
+    assert_no_canary(&authed, &[secret]);
 }

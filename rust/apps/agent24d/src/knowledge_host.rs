@@ -30,9 +30,10 @@
 //! pin could not match again wherever it was kept, and a run that names a
 //! binding but has no pin is refused, never bound anew.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use agent24_protocol::state_file::AuthMode;
 use axum::body::Body;
@@ -43,6 +44,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::capabilities::{Audience, Authorization, UnixSeconds, unix_now};
+use crate::knowledge_probe::{KnowledgeProbeCache, ProbeTarget, ProbeView};
 use agent24_domain::http::read_body_or_response;
 
 use crate::server::{AppState, error_response};
@@ -185,6 +187,8 @@ pub struct KnowledgeHostRegistry {
     /// Woken on every change applied, so a call in flight can tell at once
     /// that its binding moved (`crate::knowledge_backend`).
     changed: tokio::sync::Notify,
+    /// `/system/capabilities` answers for `GET /api/v1/components` (ADR-038 C5).
+    probes: KnowledgeProbeCache,
 }
 
 impl KnowledgeHostRegistry {
@@ -405,11 +409,61 @@ impl KnowledgeHostRegistry {
         }
     }
 
-    /// Whether any host has any binding active (`/api/v1/components`).
+    /// Whether any host has any binding active.
+    // The component list probes endpoints (C5). Tests still read this flag.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn any_active(&self) -> bool {
         self.entries
             .lock()
             .is_ok_and(|entries| entries.values().any(|entry| entry.active))
+    }
+
+    /// Active bindings that name an endpoint, one per base URL. A URL that has
+    /// a live credential wins over the same URL without one.
+    pub(crate) fn probe_targets(&self, now: UnixSeconds) -> Vec<ProbeTarget> {
+        let Ok(entries) = self.entries.lock() else {
+            return Vec::new();
+        };
+        let mut by_url: BTreeMap<String, ProbeTarget> = BTreeMap::new();
+        for entry in entries.values() {
+            if !entry.active {
+                continue;
+            }
+            let Some(endpoint) = &entry.endpoint else {
+                continue;
+            };
+            let current = entry
+                .credential
+                .clone()
+                .filter(|current| current.expires_at > now);
+            let epoch = current.as_ref().map(|current| current.seq).unwrap_or(0);
+            let credential = current.map(|current| match current.credential {
+                Credential::Bearer(token) => agent24_knowledge::Credential::Bearer(token),
+                Credential::ApiKey(key) => agent24_knowledge::Credential::ApiKey(key),
+            });
+            let base_url = endpoint.base_url.clone();
+            let replace = match by_url.get(&base_url) {
+                None => true,
+                Some(prev) => prev.credential.is_none() && credential.is_some(),
+            };
+            if replace {
+                by_url.insert(
+                    base_url.clone(),
+                    ProbeTarget {
+                        base_url,
+                        credential,
+                        credential_epoch: epoch,
+                    },
+                );
+            }
+        }
+        by_url.into_values().collect()
+    }
+
+    /// D5 remote subset for Knowledge, from a cached capabilities probe.
+    pub(crate) async fn component_status(&self, now: Instant) -> ProbeView {
+        let targets = self.probe_targets(unix_now());
+        self.probes.assess(&targets, now).await
     }
 
     /// Whether `host` has `binding` active.
