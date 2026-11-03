@@ -13,8 +13,10 @@
 #   SHA256SUMS                     (sha256 of the three files above)
 #
 # Usage: stage-documents-module.sh [<cargo release dir>]
-#   default: <repo>/rust/target/release, the directory the mac extraResources
-#   entries for agent24d / agent24 read from.
+#   default: ${CARGO_TARGET_DIR:-<repo>/rust/target}/release, where
+#   `pnpm build:rust:documents` just wrote it (as release-mac.sh reads cargo's
+#   output). Reading anywhere else could pick up an older build and give it a
+#   fresh, valid SHA256SUMS.
 # macOS only: the PDF engine links PDFKit and Vision.
 #
 # A mac build that never ran this ships no Resources/documents-module/ at all:
@@ -25,7 +27,9 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 desktop="$(cd "$here/.." && pwd)"
 repo="$(cd "$desktop/../.." && pwd)"
-cargo_out="${1:-$repo/rust/target/release}"
+[[ -z "${CARGO_TARGET_DIR:-}" || "$CARGO_TARGET_DIR" == /* ]] \
+  || { echo "stage-documents-module: CARGO_TARGET_DIR must be an absolute path (now: $CARGO_TARGET_DIR)" >&2; exit 1; }
+cargo_out="${1:-${CARGO_TARGET_DIR:-$repo/rust/target}/release}"
 module_src="$repo/rust/apps/agent24-documents"
 out="$desktop/.documents-module"
 
