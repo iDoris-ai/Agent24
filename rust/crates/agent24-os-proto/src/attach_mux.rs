@@ -40,7 +40,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::frame::{FrameError, MAX_FRAME_BYTES};
-use crate::rpc::{Ended, ErrorKind, Limits, Methods, RpcError, read_frame_async, serve_until};
+use crate::rpc::{
+    CANCEL_METHOD, Ended, ErrorKind, Limits, Methods, RpcError, read_frame_async, serve_until,
+};
 
 /// The one method a kernel-originated call uses today (§6.1).
 pub const COMMAND_METHOD: &str = "_a24/command/invoke";
@@ -255,8 +257,29 @@ impl KernelCalls {
             // (`agent24d::attach_registry`, review M2) — either way the
             // frame WAS sent and the module's fate for it is unknown.
             Ok(Err(_recv_error)) => Err(KernelCallFailed::ConnectionLost),
-            Err(_elapsed) => Err(KernelCallFailed::Timeout),
+            // ADR-038 D6: JSON-RPC cancel is `$/cancelRequest`, once. The
+            // outcome stays unknown, and this arm does not send the request
+            // again. Not sent on `NotSent` or `ConnectionLost`.
+            Err(_elapsed) => {
+                self.enqueue_cancel(&id);
+                Err(KernelCallFailed::Timeout)
+            }
         }
+    }
+
+    /// A notification: no JSON-RPC `id`, so it is not itself a pending call.
+    /// `try_send`; a closed queue is ignored because the outcome is already
+    /// unknown.
+    fn enqueue_cancel(&self, id: &str) {
+        let Ok(mut line) = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": CANCEL_METHOD,
+            "params": { "id": id },
+        })) else {
+            return;
+        };
+        line.push(b'\n');
+        let _ = self.enqueue_raw(line);
     }
 
     /// A3-3 review M2: externally mark this connection "closed" for the
@@ -282,9 +305,10 @@ impl KernelCalls {
     /// `try_send` `call()` uses (review H1's reasoning applies identically:
     /// a kernel-originated write must not block on queue space).
     ///
-    /// This exists for exactly one caller,
-    /// `agent24d::attach_listener::handle_connection`, and one line: the
-    /// handshake success frame. The bug it closes: writing that frame
+    /// Callers are the handshake success line
+    /// (`agent24d::attach_listener::handle_connection`) and a
+    /// `$/cancelRequest` after a timed-out kernel call. The handshake bug it
+    /// closes: writing that frame
     /// directly to the raw connection BEFORE calling
     /// `agent24d::attach_registry::AttachRegistry::attach_kernel_calls`
     /// leaves a gap — the module has its handshake result and may act on it
@@ -976,6 +1000,15 @@ mod tests {
         assert!(matches!(late_call, Err(KernelCallFailed::Timeout)));
         let request = recv_line(&mut kernel_read).await;
         let late_id = request["id"].as_str().unwrap().to_owned();
+        // ADR-038 D6: the timeout also enqueued `$/cancelRequest`. Drain it
+        // here, or the positive control below would read the cancel.
+        let cancel = recv_line(&mut kernel_read).await;
+        assert_eq!(cancel["method"], "$/cancelRequest");
+        assert!(
+            cancel.get("id").is_none(),
+            "cancel is a notification: {cancel}"
+        );
+        assert_eq!(cancel["params"]["id"], late_id);
         send_line(
             &mut module_write,
             &format!(r#"{{"jsonrpc":"2.0","id":"{late_id}","result":{{"late":true}}}}"#),
