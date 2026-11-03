@@ -23,7 +23,7 @@ use agent24_components::{DownloadError, VerifyMode, install::InstallError as Sig
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Request, State},
+    extract::{MatchedPath, NestedPath, OriginalUri, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -624,6 +624,8 @@ fn unconfigured_router(state: CommState) -> Router {
 
 // Preserve every MatchedPath for CORE-2 authorization while requests use the
 // current comm instance. A fallback would erase those fixed route templates.
+// The placeholder match also captures path parameters; [`forward_comm`] drops
+// those before the live router matches the same path again.
 fn runtime_router(runtime: Arc<CommRuntime>) -> Router {
     let routes = agent24_comm::router(CommState::unconfigured("initializing"))
         .route_layer(middleware::from_fn_with_state(
@@ -632,6 +634,80 @@ fn runtime_router(runtime: Arc<CommRuntime>) -> Router {
         ))
         .route("/install", post(install_component).with_state(runtime));
     Router::new().nest("/api/v1/comm", routes)
+}
+
+/// Outer `MatchedPath`, held aside so the live router's match does not
+/// concatenate onto it. Restored by [`restore_forwarded_matched_path`].
+#[derive(Clone)]
+struct ForwardedMatchedPath(MatchedPath);
+
+/// Drop path parameters captured by the placeholder comm router.
+///
+/// `runtime_router` matches each comm route so CORE-2's auth layer sees a
+/// fixed `MatchedPath`. Axum records the captured parameters in a private
+/// `UrlParams` extension and appends on a second match, so the live router's
+/// `Path` extractor returns 500 (`Expected N but got 2N`). That type is not
+/// public, so the parameters cannot be removed by name. The extensions map
+/// is rebuilt from the values that must survive:
+///
+/// - `Authorization`, inserted by the parent auth layer (it runs after the
+///   outer match and before this middleware). Kernel handlers read it with
+///   `Extension<Authorization>`.
+/// - `OriginalUri` and `NestedPath`, set by axum before this middleware. The
+///   live router will not replace an `OriginalUri` that is already present,
+///   so the client's full URI stays intact.
+/// - `MatchedPath` is stashed as [`ForwardedMatchedPath`], not left as
+///   `MatchedPath`. The live match treats an existing `MatchedPath` as a nest
+///   prefix and concatenates (`append_nested_matched_path`), which would
+///   double `/api/v1/comm/outbox/{event_id}/retry`. Auth has already copied
+///   the outer template; the stash puts that same value back after the live
+///   match.
+fn request_without_outer_path_params(req: Request) -> Request {
+    let (mut parts, body) = req.into_parts();
+    let matched = parts.extensions.remove::<MatchedPath>();
+    let authorization = parts
+        .extensions
+        .remove::<crate::capabilities::Authorization>();
+    let original_uri = parts.extensions.remove::<OriginalUri>();
+    let nested_path = parts.extensions.remove::<NestedPath>();
+    parts.extensions.clear();
+    if let Some(matched) = matched {
+        parts.extensions.insert(ForwardedMatchedPath(matched));
+    }
+    if let Some(authorization) = authorization {
+        parts.extensions.insert(authorization);
+    }
+    if let Some(original_uri) = original_uri {
+        parts.extensions.insert(original_uri);
+    }
+    if let Some(nested_path) = nested_path {
+        parts.extensions.insert(nested_path);
+    }
+    Request::from_parts(parts, body)
+}
+
+/// Put the outer `MatchedPath` back after the live router has matched.
+///
+/// The live match runs before this layer and has already written a fresh
+/// `UrlParams` (one copy) plus its own `MatchedPath`. Replacing that
+/// `MatchedPath` restores the template CORE-2 used.
+async fn restore_forwarded_matched_path(mut req: Request, next: Next) -> Response {
+    if let Some(ForwardedMatchedPath(matched)) =
+        req.extensions_mut().remove::<ForwardedMatchedPath>()
+    {
+        req.extensions_mut().insert(matched);
+    }
+    next.run(req).await
+}
+
+async fn dispatch_inner(routes: Router, req: Request) -> Response {
+    use tower::ServiceExt;
+    let routes = routes.layer(middleware::from_fn(restore_forwarded_matched_path));
+    let req = request_without_outer_path_params(req);
+    match routes.oneshot(req).await {
+        Ok(response) => response,
+        Err(error) => match error {},
+    }
 }
 
 async fn forward_comm(
@@ -646,12 +722,10 @@ async fn forward_comm(
     {
         return component_status(State(runtime)).await;
     }
+    // Hold the read lock for the whole forward so an install's write lock
+    // waits until this request has finished on the router it cloned.
     let routes = runtime.routes.read().await;
-    use tower::ServiceExt;
-    match routes.clone().oneshot(req).await {
-        Ok(res) => res,
-        Err(e) => match e {},
-    }
+    dispatch_inner(routes.clone(), req).await
 }
 
 async fn component_status(State(runtime): State<Arc<CommRuntime>>) -> Response {
@@ -1515,5 +1589,259 @@ mod hy1_regression_tests {
         let (host, _) = components(&runtime).await;
         assert_eq!(host["state"], "absent");
         assert!(host.get("reason").is_none(), "{host}");
+    }
+
+    fn braced_route_templates(source: &str, anchor: &str) -> std::collections::BTreeSet<String> {
+        let start = source
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{anchor} missing"));
+        let body = &source[start..];
+        let end = body
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{anchor} is not brace-terminated"));
+        let body = &body[..end];
+        body.match_indices(".route(")
+            .filter_map(|(offset, _)| {
+                let rest = &body[offset + ".route(".len()..];
+                let rest = &rest[rest.find('"')? + 1..];
+                let path = rest[..rest.find('"')?].to_owned();
+                path.contains('{').then_some(path)
+            })
+            .collect()
+    }
+
+    /// Every `{param}` route merged into `agent24_comm::router`. The scanner
+    /// fails this test when a new one appears and is not listed below.
+    fn path_param_templates() -> std::collections::BTreeSet<String> {
+        let mut routes = braced_route_templates(
+            include_str!("../../../crates/agent24-comm/src/router.rs"),
+            "pub fn router(",
+        );
+        routes.extend(braced_route_templates(
+            include_str!("../../../crates/agent24-comm/src/groupchat.rs"),
+            "pub(crate) fn routes(",
+        ));
+        routes
+    }
+
+    async fn raw_call(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        bearer: Option<&str>,
+        body: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(bearer) = bearer {
+            builder = builder.header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {bearer}"),
+            );
+        }
+        let body = match body {
+            Some(body) => {
+                builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+                Body::from(body.to_owned())
+            }
+            None => Body::empty(),
+        };
+        let response = app
+            .clone()
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        (status, text)
+    }
+
+    #[tokio::test]
+    async fn path_param_routes_through_runtime_router_are_not_path_extractor_500s() {
+        const GID: &str = "0123456789abcdef0123456789abcdef";
+        const LID: &str = "fedcba9876543210fedcba9876543210";
+        // (method, template, concrete uri, json body)
+        let hits = [
+            (
+                "POST",
+                "/outbox/{event_id}/retry",
+                "/api/v1/comm/outbox/evt-1/retry".to_string(),
+                None,
+            ),
+            (
+                "GET",
+                "/groupchat/{group_id}/members",
+                format!("/api/v1/comm/groupchat/{GID}/members"),
+                None,
+            ),
+            (
+                "GET",
+                "/groupchat/{group_id}/invites",
+                format!("/api/v1/comm/groupchat/{GID}/invites"),
+                None,
+            ),
+            (
+                "GET",
+                "/groupchat/{group_id}/messages",
+                format!("/api/v1/comm/groupchat/{GID}/messages"),
+                None,
+            ),
+            (
+                "POST",
+                "/groupchat/{group_id}/messages",
+                format!("/api/v1/comm/groupchat/{GID}/messages"),
+                Some(r#"{"body":"hi"}"#),
+            ),
+            (
+                "GET",
+                "/groupchat/{group_id}/messages/{logical_id}",
+                format!("/api/v1/comm/groupchat/{GID}/messages/{LID}"),
+                None,
+            ),
+            (
+                "POST",
+                "/groupchat/{group_id}/messages/{logical_id}/retry",
+                format!("/api/v1/comm/groupchat/{GID}/messages/{LID}/retry"),
+                Some("{}"),
+            ),
+            (
+                "POST",
+                "/groupchat/invites/{invite_id}/accept",
+                format!("/api/v1/comm/groupchat/invites/{GID}/accept"),
+                Some("{}"),
+            ),
+        ];
+        let tested: std::collections::BTreeSet<String> = hits
+            .iter()
+            .map(|(_, template, _, _)| (*template).to_owned())
+            .collect();
+        assert_eq!(
+            tested,
+            path_param_templates(),
+            "every agent24_comm path-parameter route must be hit through runtime_router"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = runtime_router(runtime(dir.path()).await);
+        for (method, template, uri, body) in hits {
+            let (status, text) = raw_call(&app, method, &uri, None, body).await;
+            assert_ne!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{method} {template} returned the path-extractor 500: {text}"
+            );
+            assert!(
+                !text.contains("Wrong number of path arguments"),
+                "{method} {template}: {text}"
+            );
+            let value: Value = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{method} {template} is not JSON ({e}): {text}"));
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "{method} {template} body={value}"
+            );
+            assert_eq!(value["error"], "not_configured", "{method} {template}");
+        }
+    }
+
+    /// The parent auth layer reads `MatchedPath` before `forward_comm`. A token
+    /// that cannot `comm.write` must still be forbidden on the real template,
+    /// and a host token must reach the handler (409), not the path-extractor 500.
+    #[tokio::test]
+    async fn path_param_route_still_rejects_a_token_without_comm_write() {
+        let (state, host, creative) = crate::server::tests::capability_state().await;
+        let dir = tempfile::tempdir().unwrap();
+        let app = crate::server::build_router_with_modules(
+            state,
+            runtime_router(runtime(dir.path()).await),
+        );
+        let uri = "/api/v1/comm/outbox/evt-1/retry";
+
+        let (status, text) = raw_call(&app, "POST", uri, Some(&creative), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+        let denied: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(denied["error"]["code"], "forbidden");
+
+        let (status, text) = raw_call(&app, "POST", uri, Some(&host), None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{text}");
+        let allowed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(allowed["error"], "not_configured");
+    }
+
+    /// Same double-match as `runtime_router`, on a probe handler that reports
+    /// what survived: one path parameter, the outer `MatchedPath`, and the
+    /// `Authorization` extension inserted the way CORE-2 inserts it.
+    #[tokio::test]
+    async fn forward_keeps_matched_path_and_authorization() {
+        use axum::extract::{Extension, MatchedPath, OriginalUri, Path};
+        use axum::routing::get;
+
+        async fn seen(
+            Path(id): Path<String>,
+            matched: MatchedPath,
+            OriginalUri(original): OriginalUri,
+            nested: axum::extract::NestedPath,
+            Extension(auth): Extension<crate::capabilities::Authorization>,
+        ) -> Json<Value> {
+            Json(json!({
+                "id": id,
+                "matched": matched.as_str(),
+                "original": original.path(),
+                "nested": nested.as_str(),
+                "capability_id": auth.claims.capability_id,
+            }))
+        }
+
+        async fn insert_authorization(mut req: axum::extract::Request, next: Next) -> Response {
+            req.extensions_mut()
+                .insert(crate::capabilities::Authorization {
+                    epoch: 7,
+                    claims: crate::capabilities::CapabilityClaims {
+                        first_party: None,
+                        capability_id: "cap-forward".to_owned(),
+                        audience: crate::capabilities::Audience::ProductHost,
+                        workspace_id: None,
+                        attachment_id: None,
+                        principal_id: None,
+                        daemon_generation: "g".to_owned(),
+                        host_generation: None,
+                        sidecar_generation: None,
+                        created_at: 0,
+                        expires_at: 0,
+                        allowed_operations: std::collections::BTreeSet::new(),
+                    },
+                });
+            next.run(req).await
+        }
+
+        async fn probe_forward(
+            State(inner): State<Router>,
+            req: axum::extract::Request,
+            _next: Next,
+        ) -> Response {
+            dispatch_inner(inner, req).await
+        }
+
+        let inner = Router::new().route("/item/{id}", get(seen));
+        let app = Router::new()
+            .nest(
+                "/api/v1/comm",
+                Router::new()
+                    .route("/item/{id}", get(|| async { StatusCode::NO_CONTENT }))
+                    .route_layer(middleware::from_fn_with_state(inner, probe_forward)),
+            )
+            .layer(middleware::from_fn(insert_authorization));
+
+        let (status, text) = raw_call(&app, "GET", "/api/v1/comm/item/abc", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["id"], "abc");
+        assert_eq!(value["matched"], "/api/v1/comm/item/{id}");
+        assert_eq!(value["original"], "/api/v1/comm/item/abc");
+        assert_eq!(value["nested"], "/api/v1/comm");
+        assert_eq!(value["capability_id"], "cap-forward");
     }
 }
