@@ -181,9 +181,10 @@ fn from_supervised(status: &Supervised) -> (ComponentState, Option<&'static str>
     }
 }
 
-/// The Hyphae daemon, from the supervisor's process state (is the child alive, did it exit;
-/// ADR-038 §7.4: no `health` before C2, so never
-/// `degraded`). A process that died and will be restarted, gave up, or was refused its
+/// The Hyphae daemon, from the supervisor's process state alone (is the child
+/// alive, did it exit). This mapping never returns `degraded`: that comes from
+/// [`overlay_hyphae`] after N consecutive `hyphae health` failures (ADR-038 D5).
+/// A process that died and will be restarted, gave up, or was refused its
 /// password is `failed`; one that is not configured or was stopped is `stopped`.
 fn from_hyphae(process: &str) -> (ComponentState, Option<String>) {
     use ComponentState as S;
@@ -192,6 +193,92 @@ fn from_hyphae(process: &str) -> (ComponentState, Option<String>) {
         "stopped" => (S::Stopped, None),
         "not_configured" => (S::Stopped, Some("not_configured".to_owned())),
         other => (S::Failed, Some(other.to_owned())),
+    }
+}
+
+/// Process state first, then the contract verdict and the health book (ADR-038
+/// D3/D5). A contract mismatch or a handshake that never produced a report wins
+/// over the process string (`gave_up` would otherwise read as `failed`). Health
+/// only moves `running` to `degraded`; a stopped process keeps its process
+/// mapping so a stale book cannot flap the component.
+fn overlay_hyphae(
+    process_state: &str,
+    probe: &agent24_comm::ProbeSnapshot,
+) -> (ComponentState, Option<String>) {
+    use agent24_comm::ContractView;
+    match probe.contract {
+        ContractView::Mismatch => {
+            return (
+                ComponentState::Incompatible,
+                Some("contract_mismatch".into()),
+            );
+        }
+        ContractView::CheckFailed => {
+            return (ComponentState::Failed, Some("contract_check_failed".into()));
+        }
+        ContractView::Unknown | ContractView::Compatible => {}
+    }
+    let (mapped, reason) = from_hyphae(process_state);
+    if process_state == "running" && probe.health.as_ref().is_some_and(|health| health.degraded) {
+        return (ComponentState::Degraded, Some(degraded_reason(probe)));
+    }
+    (mapped, reason)
+}
+
+fn degraded_reason(probe: &agent24_comm::ProbeSnapshot) -> String {
+    let Some(health) = probe.health.as_ref() else {
+        return "health".to_owned();
+    };
+    if health.failed_probes.is_empty() {
+        return "health".to_owned();
+    }
+    let mut names = health.failed_probes.clone();
+    names.sort();
+    names.dedup();
+    names.join(",")
+}
+
+/// Host-only health summary. Probe names and counters only — never a relay URL.
+fn health_json(health: &agent24_comm::HealthView) -> Value {
+    let checks = health
+        .checks
+        .iter()
+        .map(|(name, check)| {
+            (
+                name.clone(),
+                json!({
+                    "ok": check.ok,
+                    "consecutive_failures": check.consecutive_failures,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    json!({
+        "consecutive_failures": health.consecutive_failures,
+        "degraded": health.degraded,
+        "checks": checks,
+    })
+}
+
+fn apply_hyphae_runtime(
+    item: &mut Item,
+    process_state: &str,
+    process_reason: Option<String>,
+    generation: u64,
+    process_failures: u32,
+    probe: &agent24_comm::ProbeSnapshot,
+) {
+    let (mapped, reason) = overlay_hyphae(process_state, probe);
+    item.state = mapped;
+    item.reason = reason.or(process_reason);
+    if let Some(Value::Object(detail)) = item.detail.as_mut() {
+        detail.insert("generation".into(), json!(generation));
+        detail.insert("consecutive_failures".into(), json!(process_failures));
+        if process_state == "running"
+            && let Some(health) = probe.health.as_ref()
+        {
+            detail.insert("health".into(), health_json(health));
+        }
     }
 }
 
@@ -275,18 +362,17 @@ fn hyphae_item(state: &AppState) -> Item {
         return item;
     };
     let process = daemon.status();
-    let (mapped, reason) = from_hyphae(process.state);
+    let probe = daemon.probe_snapshot();
     item.with(|i| {
-        i.state = mapped;
         i.version = Some(lock.version.clone());
-        i.reason = reason.or(process.reason);
-        if let Some(Value::Object(d)) = i.detail.as_mut() {
-            d.insert("generation".into(), json!(process.generation));
-            d.insert(
-                "consecutive_failures".into(),
-                json!(process.consecutive_failures),
-            );
-        }
+        apply_hyphae_runtime(
+            i,
+            process.state,
+            process.reason,
+            process.generation,
+            process.consecutive_failures,
+            &probe,
+        );
     })
 }
 

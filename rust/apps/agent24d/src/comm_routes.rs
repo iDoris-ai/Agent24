@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent24_comm::{
-    CommState, HyphaeDaemonSupervisor, HyphaeRunner, KeyringPasswordStore, MemoryPasswordStore,
-    PasswordStore, VerifiedBinary, current_platform,
+    CommState, ContractExpectation, HyphaeDaemonSupervisor, HyphaeRunner, KeyringPasswordStore,
+    MemoryPasswordStore, PasswordStore, ProbeArm, VerifiedBinary, current_platform,
 };
 
 use crate::hyphae_install::{HyphaeLock, InstallError, Verifier};
@@ -34,6 +34,18 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Lock `contract` plus the production health period. `build_ready_state`
+/// arms every supervisor with this before autostart.
+fn hyphae_probe_arm(lock: &HyphaeLock) -> ProbeArm {
+    let contract = &lock.component().contract;
+    ProbeArm::production(ContractExpectation {
+        name: contract.name.clone(),
+        major: contract.major,
+        min_minor: contract.min_minor,
+        tested: contract.tested.clone(),
+    })
+}
 
 /// Where `agent24d`'s own SHUT-1b stop sequence finds the Hyphae daemon
 /// supervisor `build()` may create — and the ONLY thing that makes "a
@@ -464,6 +476,10 @@ async fn build_ready_state(
             ready_after: agent24_comm::READY_AFTER_DEFAULT,
         },
     ));
+    // D3/D5: handshake before the first start (including autostart below),
+    // then health while the daemon is running. Expectation comes from the
+    // schema-2 lock, not a hardcoded constant.
+    daemon.arm_probe(hyphae_probe_arm(lock));
     // PR #626 review, High #1: registered BEFORE any autostart attempt, and
     // synchronized (via `slot`'s own lock) with agent24d's own SHUT-1b
     // closing action — see `CommDaemonSlot`'s doc comment. A shutdown that
@@ -1101,6 +1117,138 @@ mod password_store_choice_tests {
             classify_password_store_choice(Some(std::ffi::OsStr::new("bogus"))),
             PasswordStoreChoice::Invalid("bogus".to_owned())
         );
+    }
+}
+
+#[cfg(test)]
+mod hyphae_probe_arm_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use agent24_comm::{CONTRACT_TIMEOUT, HEALTH_INTERVAL, HEALTH_TIMEOUT};
+
+    use super::*;
+
+    #[test]
+    fn production_arm_reads_the_embedded_lock() {
+        let lock = HyphaeLock::embedded().expect("embedded hyphae lock");
+        let arm = hyphae_probe_arm(&lock);
+        assert_eq!(arm.expectation.name, "hyphae-cli");
+        assert_eq!(arm.expectation.major, 1);
+        assert_eq!(arm.expectation.min_minor, 0);
+        assert_eq!(arm.expectation.tested, "1.0");
+        assert_eq!(arm.health_interval, HEALTH_INTERVAL);
+        assert_eq!(arm.health_timeout, HEALTH_TIMEOUT);
+        assert_eq!(arm.contract_timeout, CONTRACT_TIMEOUT);
+    }
+
+    /// The same `build_ready_state` that production runs must arm before
+    /// autostart. An incompatible contract then refuses to spawn. Deleting
+    /// `daemon.arm_probe(...)` leaves the contract `Unknown` and, because
+    /// this fixture can satisfy identity/relay/password, starts the daemon.
+    #[tokio::test]
+    async fn build_ready_state_arms_the_probe_and_refuses_an_incompatible_contract() {
+        const SCRIPT: &str = r#"#!/bin/sh
+case "$1" in
+  contract)
+    printf '%s\n' '{"ok":true,"data":{"name":"hyphae-cli","contract_version":"9.0"}}'
+    exit 0
+    ;;
+  identity)
+    printf '%s\n' '{"ok":true,"data":[{"nickname":"alice","npub":"npub1x","default":true,"encrypted":true}]}'
+    exit 0
+    ;;
+  relay)
+    printf '%s\n' '{"ok":true,"data":{"relays":["wss://relay.example"],"source":"config"}}'
+    exit 0
+    ;;
+  daemon)
+    cat > /dev/null
+    touch "$HOME/daemon-started"
+    exec sleep 9999
+    ;;
+esac
+exit 0
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("hyphae-fake.sh");
+        tokio::fs::write(&source, SCRIPT).await.unwrap();
+        let bytes = tokio::fs::read(&source).await.unwrap();
+        let lock =
+            HyphaeLock::override_for_test("linux-x64", agent24_comm::binary::sha256_of(&bytes));
+        let home = dir.path().join("hyphae-home");
+        tokio::fs::create_dir_all(home.join(".hyphae"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            home.join(".hyphae").join("keystore.json"),
+            br#"{"salt":"dGVzdHNhbHQ="}"#,
+        )
+        .await
+        .unwrap();
+        let autostart_path = dir.path().join("daemon-autostart.json");
+        tokio::fs::write(&autostart_path, br#"{"autostart":true}"#)
+            .await
+            .unwrap();
+        let install_dir = dir.path().join("bin");
+        let pid_path = dir.path().join("hyphae-daemon.pid");
+        let log_path = dir.path().join("logs").join("hyphae-daemon.log");
+        let store = Arc::new(MemoryPasswordStore::new());
+        store
+            .put(
+                &agent24_comm::Account::from_salt("dGVzdHNhbHQ="),
+                &agent24_comm::Password::new(b"testpass".to_vec()).unwrap(),
+            )
+            .await
+            .unwrap();
+        let slot = CommDaemonSlot::new();
+        let verifier: Verifier = Arc::new(agent24_components::sign::Unsigned);
+        let state = build_ready_state(
+            &source,
+            &CommPaths {
+                home: &home,
+                install_dir: &install_dir,
+                pid_path: &pid_path,
+                log_path: &log_path,
+                autostart_path: &autostart_path,
+            },
+            store,
+            Duration::from_millis(200),
+            &slot,
+            &Verification {
+                lock: &lock,
+                verifier: &verifier,
+                platform: "linux-x64",
+            },
+        )
+        .await
+        .expect("fixture binary matches the overridden lock");
+        let daemon = slot
+            .current()
+            .expect("build_ready_state registers the supervisor");
+        let snap = daemon.probe_snapshot();
+        let status = daemon.status();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let spawned = home.join("daemon-started").exists();
+        daemon.shutdown(tokio::time::Instant::now()).await;
+        drop(state);
+        assert_eq!(
+            snap.contract,
+            agent24_comm::ContractView::Mismatch,
+            "the supervisor must be armed with the lock contract"
+        );
+        assert!(
+            status
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("contract_mismatch")),
+            "status {status:?}"
+        );
+        assert!(
+            !spawned,
+            "an incompatible contract must not start the daemon"
+        );
+        assert_ne!(status.state, "running");
+        assert_ne!(status.state, "starting");
     }
 }
 
