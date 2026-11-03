@@ -18,7 +18,7 @@
 //!   dropping an `McpServer` kills its child process, so losing the handle
 //!   would silently break every tool it contributed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -50,8 +50,9 @@ const MOUNT_TOTAL_BUDGET: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize, Default)]
 pub struct McpConfig {
-    /// File order, not `BTreeMap` order. A normalized-id collision keeps the
-    /// server written first in `mcp.json`.
+    /// File order, not `BTreeMap` order. A normalized-id collision gives the
+    /// capability id to the server written first in `mcp.json`. The later
+    /// server still connects.
     #[serde(
         rename = "mcpServers",
         default,
@@ -100,7 +101,7 @@ pub fn config_path() -> Option<PathBuf> {
 ///
 /// `serde_json::Map` is a `BTreeMap` in this workspace (`preserve_order` is
 /// off, and `indexmap` is not a dependency). A custom visitor still sees the
-/// parser's order, so the first key written wins a normalized-id collision.
+/// parser's order, so the first key written keeps a normalized capability id.
 fn servers_in_file_order<'de, D>(deserializer: D) -> Result<Vec<(String, ServerEntry)>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -182,16 +183,26 @@ pub struct McpTarget {
 pub(crate) struct McpRecord {
     /// Server name as written in `mcp.json`.
     pub server: String,
-    /// Component id. `mcp-<server>` when that is a legal capability id.
+    /// Component id. `mcp-<server>` when that id is free. `mcp-bad-<hash>` when
+    /// the name is not a legal capability id, or a later server would reuse one.
     pub id: String,
     pub state: ComponentState,
     pub reason: Option<String>,
-    /// Set when `id` is a legal capability id. Absent ids are not provides.
+    /// Set when this server owns a legal capability id. Absent means `/components`
+    /// writes no `provides` for it. Tools are still registered either way.
     pub capability_id: Option<String>,
     /// Qualified tool names from `tools/list`. Empty when the list never arrived.
     pub tools: Vec<String>,
     /// MCP `protocolVersion`, recorded and not compared (D3 does not apply).
     pub protocol_version: Option<String>,
+}
+
+impl McpRecord {
+    /// Capability ids written into `/components` `provides`. Empty when this
+    /// server has no legal id of its own.
+    pub(crate) fn provide_ids(&self) -> Vec<String> {
+        self.capability_id.iter().cloned().collect()
+    }
 }
 
 struct McpSlot {
@@ -272,7 +283,8 @@ impl McpRoster {
 
 /// Capability id for one MCP server (ADR-038 D9): `mcp-<server>`, normalized
 /// onto the capability-id alphabet. `None` when the result is not a legal id
-/// (empty, or longer than 32). Those servers are not given a provides entry.
+/// (empty, or longer than 32). Those servers still connect; they are not given
+/// a provides entry.
 pub(crate) fn mcp_capability_id(server: &str) -> Option<String> {
     let mut body = String::new();
     for c in server.chars() {
@@ -291,13 +303,71 @@ pub(crate) fn mcp_capability_id(server: &str) -> Option<String> {
     capability_id_ok(&id).then_some(id)
 }
 
-fn fallback_component_id(server: &str) -> String {
+pub(crate) fn fallback_component_id(server: &str) -> String {
     let mut hash: u32 = 2_166_136_261;
     for b in server.as_bytes() {
         hash ^= u32::from(*b);
         hash = hash.wrapping_mul(16_777_619);
     }
     format!("mcp-bad-{hash:08x}")
+}
+
+/// An id of the `mcp-bad-<hash>` shape that is not already in `seen`.
+/// `salt` is the server name, or a component id that collided with one.
+pub(crate) fn claim_fallback_id(salt: &str, seen: &mut BTreeSet<String>) -> String {
+    let mut n = 0u32;
+    loop {
+        let flavored = if n == 0 {
+            salt.to_owned()
+        } else {
+            format!("{salt}#{n}")
+        };
+        let id = fallback_component_id(&flavored);
+        n += 1;
+        if seen.insert(id.clone()) {
+            return id;
+        }
+    }
+}
+
+/// `(component id, capability id, duplicate)`.
+///
+/// A legal id that nobody has taken yet is both the component id and the
+/// capability id. Anything else connects under `mcp-bad-<hash>` and provides
+/// nothing. `duplicate` is the later server of a normalized-id pair.
+fn assign_component_id(name: &str, seen: &mut BTreeSet<String>) -> (String, Option<String>, bool) {
+    let legal = mcp_capability_id(name);
+    let duplicate = match &legal {
+        Some(id) => !seen.insert(id.clone()),
+        None => false,
+    };
+    if !duplicate && let Some(id) = legal {
+        return (id.clone(), Some(id), false);
+    }
+    (claim_fallback_id(name, seen), None, duplicate)
+}
+
+/// `None` means the connect ended because the daemon cancelled it, so the row
+/// is `stopped` rather than a start failure. `Cancelled` is always that case.
+/// A spawn, handshake, or `tools/list` error is too, once the token has fired.
+fn connect_fail_reason(err: &McpError, shutdown: bool) -> Option<&'static str> {
+    match err {
+        McpError::Cancelled => None,
+        McpError::Spawn(_, _) => {
+            if shutdown {
+                None
+            } else {
+                Some("spawn_failed")
+            }
+        }
+        McpError::Handshake(_, _) | McpError::Call(_) => {
+            if shutdown {
+                None
+            } else {
+                Some("handshake_failed")
+            }
+        }
+    }
 }
 
 /// Connect every configured server and collect their tools.
@@ -313,72 +383,37 @@ pub async fn mount(
     let roster = Arc::new(McpRoster::default());
     let mut servers = Vec::new();
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
-    let mut seen_tools: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut seen_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut seen_tools: BTreeSet<String> = BTreeSet::new();
+    let mut seen_ids: BTreeSet<String> = BTreeSet::new();
     let deadline = tokio::time::Instant::now() + MOUNT_TOTAL_BUDGET;
     for target in targets {
         let spec = &target.spec;
-        let capability_id = mcp_capability_id(&spec.name);
-        let id = capability_id
-            .clone()
-            .unwrap_or_else(|| fallback_component_id(&spec.name));
-        if !seen_ids.insert(id.clone()) {
-            tracing::error!(
-                "MCP server {} not mounted: capability id {id} is already used",
-                spec.name
-            );
-            // A second row must not reuse the first server's component id.
-            // The fallback id is itself a component id: a later legal id with
-            // the same text is a duplicate, not a second connection.
-            let dup_id = fallback_component_id(&spec.name);
-            seen_ids.insert(dup_id.clone());
-            roster.push(
-                McpRecord {
-                    server: spec.name.clone(),
-                    id: dup_id,
-                    state: ComponentState::Failed,
-                    reason: Some("duplicate_capability_id".to_owned()),
-                    capability_id: None,
-                    tools: Vec::new(),
-                    protocol_version: None,
-                },
-                None,
-            );
-            continue;
-        }
-        if capability_id.is_none() {
-            tracing::error!(
-                "MCP server {} not mounted: its name is not a capability id under mcp-<server>",
-                spec.name
-            );
-            roster.push(
-                McpRecord {
-                    server: spec.name.clone(),
-                    id,
-                    state: ComponentState::Failed,
-                    reason: Some("invalid_capability_id".to_owned()),
-                    capability_id: None,
-                    tools: Vec::new(),
-                    protocol_version: None,
-                },
-                None,
-            );
-            continue;
-        }
+        let (id, capability_id, duplicate) = assign_component_id(&spec.name, &mut seen_ids);
         if !target.enabled {
+            // A disabled duplicate still records why it has no provides. It does
+            // not spawn: `enabled: false` means the user left it out.
+            let reason = if duplicate {
+                "duplicate_capability_id"
+            } else {
+                "disabled"
+            };
             roster.push(
-                McpRecord {
-                    server: spec.name.clone(),
-                    id,
-                    state: ComponentState::Stopped,
-                    reason: Some("disabled".to_owned()),
-                    capability_id,
-                    tools: Vec::new(),
-                    protocol_version: None,
-                },
+                outcome_record(spec, id, capability_id, ComponentState::Stopped, reason),
                 None,
             );
             continue;
+        }
+        if duplicate {
+            tracing::info!(
+                "MCP server {} shares a capability id with an earlier server; connecting \
+                 without provides",
+                spec.name
+            );
+        } else if capability_id.is_none() {
+            tracing::info!(
+                "MCP server {} has no legal capability id; connecting without provides",
+                spec.name
+            );
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -434,7 +469,7 @@ pub async fn mount(
                     server: spec.name.clone(),
                     id: id.clone(),
                     state: ComponentState::Ready,
-                    reason: None,
+                    reason: duplicate.then(|| "duplicate_capability_id".to_owned()),
                     capability_id,
                     tools: qualified,
                     protocol_version,
@@ -450,23 +485,7 @@ pub async fn mount(
                 // is its own arm: treating it as a guard on the if makes the
                 // later match arm unreachable under `-D warnings`.
                 let shutdown = server_cancel.is_cancelled();
-                let fail_reason = match &err {
-                    McpError::Cancelled => None,
-                    McpError::Spawn(_, _) => {
-                        if shutdown {
-                            None
-                        } else {
-                            Some("spawn_failed")
-                        }
-                    }
-                    McpError::Handshake(_, _) | McpError::Call(_) => {
-                        if shutdown {
-                            None
-                        } else {
-                            Some("handshake_failed")
-                        }
-                    }
-                };
+                let fail_reason = connect_fail_reason(&err, shutdown);
                 if let Some(reason) = fail_reason {
                     tracing::error!("MCP server {} not mounted: {err}", spec.name);
                     roster.push(failed_record(spec, id, capability_id, reason), None);
@@ -747,6 +766,38 @@ mod tests {
         assert!(capability_id_ok("mcp-files"));
     }
 
+    /// `Cancelled` is `stopped`, including when the token is already cancelled
+    /// and the error is a spawn or handshake failure rather than `Cancelled`.
+    #[test]
+    fn cancelled_errors_map_to_stopped_not_a_start_failure() {
+        assert_eq!(connect_fail_reason(&McpError::Cancelled, false), None);
+        assert_eq!(connect_fail_reason(&McpError::Cancelled, true), None);
+        assert_eq!(
+            connect_fail_reason(&McpError::Handshake("srv".into(), "bye".into()), true),
+            None
+        );
+        assert_eq!(
+            connect_fail_reason(&McpError::Call("bye".into()), true),
+            None
+        );
+        assert_eq!(
+            connect_fail_reason(&McpError::Spawn("srv".into(), "missing".into()), true),
+            None
+        );
+        assert_eq!(
+            connect_fail_reason(&McpError::Handshake("srv".into(), "bye".into()), false),
+            Some("handshake_failed")
+        );
+        assert_eq!(
+            connect_fail_reason(&McpError::Call("bye".into()), false),
+            Some("handshake_failed")
+        );
+        assert_eq!(
+            connect_fail_reason(&McpError::Spawn("srv".into(), "missing".into()), false),
+            Some("spawn_failed")
+        );
+    }
+
     fn target(name: &str, command: &str, args: Vec<String>, enabled: bool) -> McpTarget {
         McpTarget {
             spec: McpServerSpec::new(name, command, args),
@@ -771,66 +822,175 @@ mod tests {
         assert!(record.tools.is_empty());
     }
 
-    #[tokio::test]
-    async fn an_illegal_name_is_failed_and_does_not_provide() {
-        let targets = vec![target("!!!", "/definitely/not/a/real/binary", vec![], true)];
-        let (_, _, roster) = mount(&targets, &CancellationToken::new()).await;
-        let record = &roster.records()[0];
-        assert_eq!(record.state, ComponentState::Failed);
-        assert_eq!(record.reason.as_deref(), Some("invalid_capability_id"));
-        assert!(record.capability_id.is_none());
-        assert!(record.id.starts_with("mcp-bad-"));
-        assert!(record.tools.is_empty());
+    fn live_target(
+        python: &str,
+        script: &Path,
+        name: &str,
+        stop: &Path,
+        enabled: bool,
+    ) -> McpTarget {
+        target(
+            name,
+            python,
+            vec![
+                "-u".to_owned(),
+                script.to_string_lossy().into_owned(),
+                stop.to_string_lossy().into_owned(),
+            ],
+            enabled,
+        )
     }
 
+    /// A name that does not normalize, a name that is too long, and a second
+    /// server that normalizes onto the first one's id all still connect. Tool
+    /// names stay `mcp_{server}_{tool}`. None of those three writes `provides`.
     #[tokio::test]
-    async fn two_servers_that_normalize_to_one_id_do_not_both_provide_it() {
-        let targets = vec![
-            target("a_b", "/definitely/not/a/real/binary", vec![], false),
-            target("a-b", "/definitely/not/a/real/binary", vec![], true),
-        ];
-        let (servers, _, roster) = mount(&targets, &CancellationToken::new()).await;
-        assert!(servers.is_empty(), "the duplicate must not be connected");
-        let records = roster.records();
-        assert_eq!(records[0].state, ComponentState::Stopped);
-        assert_eq!(records[0].capability_id.as_deref(), Some("mcp-a-b"));
-        assert_eq!(records[1].state, ComponentState::Failed);
+    async fn illegal_and_duplicate_names_still_connect_without_provides() {
+        let dir = tempfile::tempdir().unwrap();
+        let python = real_python();
+        let script = dir.path().join("server.py");
+        std::fs::write(&script, EXIT_FIXTURE).unwrap();
+        let long = "filesystem-readonly-projects-dir";
+        assert!(long.len() > 28);
+        assert!(mcp_capability_id("文件").is_none());
+        assert!(mcp_capability_id(long).is_none());
+        assert_eq!(mcp_capability_id("Files").as_deref(), Some("mcp-files"));
+        let names = ["文件", long, "files", "Files"];
+        let targets: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                live_target(
+                    &python,
+                    &script,
+                    name,
+                    &dir.path().join(format!("stop-{i}")),
+                    true,
+                )
+            })
+            .collect();
+        let (servers, tools, roster) = mount(&targets, &CancellationToken::new()).await;
+        let connected: Vec<_> = servers.iter().map(|s| s.name().to_owned()).collect();
         assert_eq!(
-            records[1].reason.as_deref(),
-            Some("duplicate_capability_id")
+            connected,
+            vec![
+                "文件".to_owned(),
+                long.to_owned(),
+                "files".to_owned(),
+                "Files".to_owned()
+            ],
+            "records={:?}",
+            roster.records()
         );
-        assert!(records[1].capability_id.is_none());
-        assert_ne!(records[0].id, records[1].id);
+        let registered: std::collections::BTreeSet<_> =
+            tools.iter().map(|tool| tool.info().name).collect();
+        let records = roster.records();
+        let expect = |server: &str, tool_prefix: &str, provides: bool, duplicate: bool| {
+            let record = records
+                .iter()
+                .find(|r| r.server == server)
+                .unwrap_or_else(|| panic!("no {server} in {records:?}"));
+            assert_eq!(record.state, ComponentState::Ready, "{server}");
+            assert_eq!(
+                record.tools,
+                vec![
+                    format!("mcp_{tool_prefix}_echo"),
+                    format!("mcp_{tool_prefix}_ping"),
+                ],
+                "{server}"
+            );
+            for tool in &record.tools {
+                assert!(registered.contains(tool), "{tool} was not registered");
+            }
+            if provides {
+                assert_eq!(record.provide_ids(), vec!["mcp-files".to_owned()]);
+                assert_eq!(record.id, "mcp-files");
+                assert!(record.reason.is_none());
+            } else {
+                assert!(
+                    record.provide_ids().is_empty(),
+                    "{server} wrote provides {:?}",
+                    record.provide_ids()
+                );
+                assert!(record.capability_id.is_none());
+                assert!(record.id.starts_with("mcp-bad-"), "{}", record.id);
+                assert_ne!(record.id, "mcp-files");
+            }
+            if duplicate {
+                assert_eq!(
+                    record.reason.as_deref(),
+                    Some("duplicate_capability_id"),
+                    "{server}"
+                );
+            }
+        };
+        // 「文件」sanitizes to `--` (one `-` per non-ASCII character).
+        expect("文件", "--", false, false);
+        expect(long, long, false, false);
+        expect("files", "files", true, false);
+        expect("Files", "Files", false, true);
+        let ids: std::collections::BTreeSet<_> = records.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            records.len(),
+            "component ids collided: {records:?}"
+        );
+        drop(servers);
     }
 
     /// The duplicate row's `mcp-bad-…` id is claimed. A later server whose legal
-    /// id is that same string does not connect under it.
+    /// id is that same string still connects, under a different component id,
+    /// and does not provide.
     #[tokio::test]
     async fn a_duplicate_fallback_id_is_claimed_so_a_later_server_cannot_reuse_it() {
         let second = "Files";
         let fallback = fallback_component_id(second);
         let third = fallback.strip_prefix("mcp-").expect("mcp-bad- shape");
         assert_eq!(mcp_capability_id(third).as_deref(), Some(fallback.as_str()));
-        let targets = vec![
-            target("files", "/definitely/not/a/real/binary", vec![], false),
-            target(second, "/definitely/not/a/real/binary", vec![], true),
-            target(third, "/definitely/not/a/real/binary", vec![], true),
-        ];
-        let (servers, _, roster) = mount(&targets, &CancellationToken::new()).await;
-        assert!(servers.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let python = real_python();
+        let script = dir.path().join("server.py");
+        std::fs::write(&script, EXIT_FIXTURE).unwrap();
+        let names = ["files", second, third];
+        let targets: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                live_target(
+                    &python,
+                    &script,
+                    name,
+                    &dir.path().join(format!("stop-claim-{i}")),
+                    i != 0,
+                )
+            })
+            .collect();
+        let (servers, tools, roster) = mount(&targets, &CancellationToken::new()).await;
+        let connected: Vec<_> = servers.iter().map(|s| s.name().to_owned()).collect();
+        assert_eq!(connected, vec![second.to_owned(), third.to_owned()]);
+        assert!(!tools.is_empty());
         let records = roster.records();
         assert_eq!(records[0].id, "mcp-files");
+        assert_eq!(records[0].state, ComponentState::Stopped);
+        assert_eq!(records[0].reason.as_deref(), Some("disabled"));
         assert_eq!(records[1].id, fallback);
+        assert_eq!(records[1].state, ComponentState::Ready);
         assert_eq!(
             records[1].reason.as_deref(),
             Some("duplicate_capability_id")
         );
+        assert!(records[1].provide_ids().is_empty());
+        assert!(!records[1].tools.is_empty());
+        assert_eq!(records[2].state, ComponentState::Ready);
         assert_eq!(
             records[2].reason.as_deref(),
             Some("duplicate_capability_id")
         );
         assert_ne!(records[2].id, records[1].id);
         assert!(records[2].capability_id.is_none());
+        assert!(records[2].provide_ids().is_empty());
+        assert!(!records[2].tools.is_empty());
+        drop(servers);
     }
 
     /// One tool, then the process ends itself when `stop` appears. No signal:
@@ -1076,20 +1236,28 @@ for line in sys.stdin:
             order,
             vec!["Filesystem".to_owned(), "filesystem".to_owned()]
         );
-        assert!(
-            connected.is_empty(),
-            "swapping the keys must not keep spawning filesystem, got {connected:?}"
+        // The disabled first entry keeps the legal id. The enabled second
+        // server still connects, without that id and without provides.
+        assert_eq!(
+            connected,
+            vec!["filesystem".to_owned()],
+            "records={records:?}"
         );
-        assert!(!fs_swapped.exists());
+        assert_eq!(std::fs::read_to_string(&fs_swapped).unwrap(), "filesystem");
         assert!(!off_swapped.exists());
         assert_eq!(records[0].server, "Filesystem");
+        assert_eq!(records[0].id, "mcp-filesystem");
         assert_eq!(records[0].state, ComponentState::Stopped);
         assert_eq!(records[0].reason.as_deref(), Some("disabled"));
+        assert_eq!(records[1].server, "filesystem");
+        assert_eq!(records[1].state, ComponentState::Ready);
         assert_eq!(
             records[1].reason.as_deref(),
             Some("duplicate_capability_id")
         );
-        assert_ne!(connected, vec!["filesystem".to_owned()]);
+        assert!(records[1].provide_ids().is_empty());
+        assert!(records[1].id.starts_with("mcp-bad-"));
+        assert!(!records[1].tools.is_empty());
     }
 
     const HANG_ON_LIST_FIXTURE: &str = r#"import json,sys,os,time

@@ -8,7 +8,7 @@
 //! attached modules and Documents this route reads the same objects (`IdorisHost`, the comm
 //! daemon supervisor, `AttachRegistry`, `os_reports` + `module_status`) at request time.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -498,34 +498,63 @@ fn os_module_items(state: &AppState) -> Vec<Item> {
 }
 
 /// Configured MCP servers. One provide per legal id, tools from `tools/list`.
-/// D5's MCP subset is what the roster already stored.
+/// D5's MCP subset is what the roster already stored. A server with no
+/// capability id contributes tools to the agent and nothing to `provides`.
 fn mcp_items(state: &AppState) -> Vec<Item> {
     let mut records = state.mcp_roster.records();
     records.sort_by(|a, b| a.id.cmp(&b.id));
     records
         .into_iter()
         .map(|record| {
-            let provides = record
-                .capability_id
-                .map(|id| Provide {
-                    id,
+            // `provide_ids` is the only gate: tools on the record stay off
+            // `provides` when the server has no capability id of its own.
+            let capability = record.provide_ids().into_iter().next();
+            let crate::mcp::McpRecord {
+                server,
+                id,
+                state,
+                reason,
+                tools,
+                protocol_version,
+                ..
+            } = record;
+            let provides = capability
+                .map(|cap| Provide {
+                    id: cap,
                     name: None,
                     summary: None,
-                    tools: record.tools,
+                    tools,
                 })
                 .into_iter()
                 .collect();
-            Item::new(&record.id, Form::Mcp, record.state).with(|i| {
+            Item::new(&id, Form::Mcp, state).with(|i| {
                 i.provides = provides;
-                i.reason = record.reason;
+                i.reason = reason;
                 i.detail = Some(json!({
-                    "server": record.server,
-                    "protocol_version": record.protocol_version,
+                    "server": server,
+                    "protocol_version": protocol_version,
                     "requires": { "kernel": [], "operations": [] },
                 }));
             })
         })
         .collect()
+}
+
+/// Component ids in one list are unique. A later row that reuses an id already
+/// taken (a domain package named `mcp-files` beside the MCP server `files`)
+/// is shown as `mcp-bad-<hash>`. Its reason becomes `duplicate` when it had none.
+fn dedupe_component_ids(items: &mut [Item]) {
+    let mut seen = BTreeSet::new();
+    for item in items.iter_mut() {
+        if seen.insert(item.id.clone()) {
+            continue;
+        }
+        let original = item.id.clone();
+        item.id = crate::mcp::claim_fallback_id(&original, &mut seen);
+        if item.reason.is_none() {
+            item.reason = Some("duplicate".to_owned());
+        }
+    }
 }
 
 /// Knowledge, remote subset: no binding active is `stopped` ("not configured"). There is no
@@ -573,6 +602,7 @@ async fn collect(state: &AppState, now: Instant) -> Vec<Item> {
     items.push(knowledge_item(state));
     items.push(open_design_item(state, now));
     items.extend(mcp_items(state));
+    dedupe_component_ids(&mut items);
     items
 }
 

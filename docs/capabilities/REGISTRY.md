@@ -32,11 +32,13 @@ MCP server 来自用户的 `~/.agent24/mcp.json`，没有锁，不进上表（AD
 1. 把 server 名变成小写。
 2. 不是 `[a-z0-9-]` 的字符换成 `-`。
 3. 去掉首尾的 `-`。
-4. 剩下的一段叫 body。body 为空，或长于 28，就不是合法 id：组件记为 `failed` / `invalid_capability_id`，不出现在 `provides` 里。组件 id 用 `mcp-bad-` 加一个稳定的 8 位十六进制，避免和合法 id 抢同一个名字。这个备用 id 也占住名字：后面再出现同名的合法 id，按重复处理。
+4. 剩下的一段叫 body。body 为空，或长于 28，就不是合法能力 id。这种 server 仍然连接，工具照常注册，名字仍是 `mcp_{server}_{tool}`。它不写入 `provides`。组件 id 用 `mcp-bad-` 加一个稳定的 8 位十六进制，避免和合法 id 抢同一个名字。这个备用 id 也占住名字：后面再出现同名的合法 id，按重复处理。
 5. 否则能力 id 是 `mcp-` 接上 body。组件 id 与能力 id 相同。每个 server 只提供这一项能力。
-6. 两个 server 规范化成同一个 id 时，按 `mcp.json` 里的键序，先写的保留该 id；后一个是 `failed` / `duplicate_capability_id`，不提供能力，也不去连接。不按字典序。
+6. 两个 server 规范化成同一个 id 时，按 `mcp.json` 里的键序，先写的保留该 id 和 `provides`。后一个仍然连接并注册工具，组件 id 用 `mcp-bad-<hash>`，`reason` 为 `duplicate_capability_id`，不写 `provides`。用户关掉的后一个不拉起进程，状态是 `stopped`，reason 仍是 `duplicate_capability_id`。不按字典序。
 
-`provides[].tools` 是现有的限定名 `mcp_{server}_{tool}`，来自该 server 的 `tools/list`。工具名不改。还没拿到列表（关掉、启动失败、名字不合法）时 tools 为空。启动成功之后进程自己退出，列表保留，状态改掉。
+`provides[].tools` 是现有的限定名 `mcp_{server}_{tool}`，来自该 server 的 `tools/list`。工具名不改。还没拿到列表（关掉、启动失败）时 tools 为空。名字不合法或能力 id 重复时，连上了的工具已经注册，只是不写入 `provides`。启动成功之后进程自己退出，列表保留，状态改掉。
+
+`GET /api/v1/components` 列出的组件 id 不重复。和已经出现的 id 撞车时（例如领域包名叫 `mcp-files`，MCP server 又叫 `files`），后出现的那条改用 `mcp-bad-<hash>`。它原来没有 reason 时记 `duplicate`。这不改能力 id：MCP 那条的 `provides` 仍可以是 `mcp-files`。
 
 D5 只用 MCP 子集：`installed / starting / ready / failed / stopped`。这条接入里的对应关系：
 

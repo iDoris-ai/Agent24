@@ -676,7 +676,7 @@ async fn domain_os_and_mcp_show_up_with_a_list_and_a_d5_state() {
             state: ComponentState::Failed,
             reason: Some("invalid_capability_id".to_owned()),
             capability_id: None,
-            tools: Vec::new(),
+            tools: vec!["mcp_--_echo".to_owned()],
             protocol_version: None,
         },
     ]));
@@ -758,7 +758,61 @@ async fn domain_os_and_mcp_show_up_with_a_list_and_a_d5_state() {
     let bad = find(&body, "mcp-bad-00000001");
     assert_eq!(bad["state"], "failed");
     assert_eq!(bad["reason"], "invalid_capability_id");
-    assert!(bad["provides"].as_array().unwrap().is_empty());
+    assert!(
+        bad["provides"].as_array().unwrap().is_empty(),
+        "tools on the record are not provides without a capability id"
+    );
+}
+
+/// A domain package named `mcp-files` and the MCP server `files` would both
+/// otherwise show up as component id `mcp-files`. The later row takes a
+/// `mcp-bad-<hash>` id. The package keeps the name it was installed under.
+#[tokio::test]
+async fn a_package_named_mcp_files_does_not_share_its_id_with_the_mcp_server() {
+    let (mut state, host, _) = server_tests::capability_state().await;
+    state.os_reports = Arc::new(vec![os_report(
+        "mcp-files",
+        MountOutcome::Mounted,
+        d9("mcp-files", false, "pkg-tasks", &[]),
+    )]);
+    state.mcp_roster = Arc::new(crate::mcp::McpRoster::from_records(vec![
+        crate::mcp::McpRecord {
+            server: "files".to_owned(),
+            id: "mcp-files".to_owned(),
+            state: ComponentState::Ready,
+            reason: None,
+            capability_id: Some("mcp-files".to_owned()),
+            tools: vec!["mcp_files_echo".to_owned()],
+            protocol_version: Some("2024-11-05".to_owned()),
+        },
+    ]));
+    let app = build_router(state);
+    let (status, body) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<_> = body["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap().to_owned())
+        .collect();
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(ids.len(), unique.len(), "duplicate component ids: {ids:?}");
+    let package = find(&body, "mcp-files");
+    assert_eq!(package["form"], "resident");
+    assert_eq!(package["provides"][0]["id"], "pkg-tasks");
+    let rewritten = crate::mcp::fallback_component_id("mcp-files");
+    let mcp = find(&body, &rewritten);
+    assert_eq!(mcp["form"], "mcp");
+    assert_eq!(mcp["reason"], "duplicate");
+    assert_eq!(mcp["detail"]["server"], "files");
+    assert_eq!(mcp["provides"][0]["id"], "mcp-files");
+    assert_eq!(mcp["provides"][0]["tools"], json!(["mcp_files_echo"]));
+    assert_eq!(
+        ids.iter().filter(|id| id.as_str() == "mcp-files").count(),
+        1
+    );
 }
 
 #[tokio::test]

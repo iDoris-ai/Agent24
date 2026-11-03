@@ -221,6 +221,16 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
+/// `Cancelled` stays the word `cancelled`. Other MCP failures keep their own text.
+/// The two arms are separate so a cancelled call is not reclassified as a
+/// handshake or call failure by a later edit of the wildcard.
+fn tool_error_for(err: McpError) -> ToolError {
+    match err {
+        McpError::Cancelled => ToolError::Failed("cancelled".to_owned()),
+        err => ToolError::Failed(err.to_string()),
+    }
+}
+
 /// Flatten an MCP tool result into the string the agent loop feeds back.
 pub fn render_result(result: &CallToolResult) -> String {
     let mut out = String::new();
@@ -328,8 +338,7 @@ impl Tool for McpTool {
                 }
                 Ok(render_result(&result))
             }
-            Err(McpError::Cancelled) => Err(ToolError::Failed("cancelled".to_owned())),
-            Err(err) => Err(ToolError::Failed(err.to_string())),
+            Err(err) => Err(tool_error_for(err)),
         }
     }
 }
@@ -365,6 +374,21 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn a_cancelled_mcp_call_maps_to_failed_cancelled() {
+        let err = tool_error_for(McpError::Cancelled);
+        assert!(
+            matches!(err, ToolError::Failed(ref message) if message == "cancelled"),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "failed: cancelled");
+        let other = tool_error_for(McpError::Call("nope".into()));
+        assert!(
+            matches!(other, ToolError::Failed(ref message) if message.contains("nope") && message != "cancelled"),
+            "{other:?}"
+        );
+    }
 
     #[test]
     fn names_are_namespaced_so_servers_cannot_shadow_each_other() {

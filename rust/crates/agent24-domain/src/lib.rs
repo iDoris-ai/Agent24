@@ -1609,6 +1609,47 @@ impl_kind: in_process_crate
         assert!(err.contains("capability id"), "{err}");
     }
 
+    const ONE_TOOL_YAML: &str = "tools:\n  - operation: list-notes\n    description: lists notes\n    \
+         input_schema: {type: object, properties: {}}\n    risk: read\n    \
+         output_privacy: local_only\n    timeout_ms: 5000\n    inline_wait_ms: 1000\n";
+
+    /// A provide may name only tools this module declares (`<module>.<operation>`).
+    /// A foreign or missing tool refuses the manifest.
+    #[test]
+    fn a_provide_lists_only_tools_the_module_declares() {
+        let ok = format!(
+            "{SIN90_YAML}{ONE_TOOL_YAML}provides:\n  - id: sin90-tasks\n    tools: [\"sin90.list-notes\"]\n"
+        );
+        let m = DomainOsManifest::from_yaml(&ok).unwrap();
+        assert_eq!(m.provides()[0].tools(), &["sin90.list-notes".to_owned()]);
+
+        let missing = format!(
+            "{SIN90_YAML}{ONE_TOOL_YAML}provides:\n  - id: sin90-tasks\n    tools: [\"sin90.missing\"]\n"
+        );
+        let err = DomainOsManifest::from_yaml(&missing)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sin90.missing"), "{err}");
+        assert!(err.contains("not a declared"), "{err}");
+
+        let foreign = format!(
+            "{SIN90_YAML}{ONE_TOOL_YAML}provides:\n  - id: sin90-tasks\n    tools: [\"other.list-notes\"]\n"
+        );
+        let err = DomainOsManifest::from_yaml(&foreign)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("other.list-notes"), "{err}");
+    }
+
+    /// The same capability id twice in one manifest is refused, not silently kept.
+    #[test]
+    fn duplicate_provide_ids_in_one_manifest_are_refused() {
+        let yaml = format!("{SIN90_YAML}provides:\n  - id: sin90-tasks\n  - id: sin90-tasks\n");
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(err.contains("sin90-tasks"), "{err}");
+        assert!(err.contains("unique"), "{err}");
+    }
+
     // ---- ME-3a gate 6: manifest schema / protocol versioning ----------------
     //
     // The property under test is NOT "a bad version is rejected" — the strict
