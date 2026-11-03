@@ -1,7 +1,8 @@
 //! `GET /api/v1/components` and `POST /api/v1/components/{id}/report` (ADR-038 D5, C3a).
 //!
 //! One status model for every component. The daemon reads the sources it owns (iDoris, the
-//! Hyphae daemon, attached modules, the Documents package, Knowledge); Open Design is the
+//! Hyphae daemon, attached modules, the Documents package, other domain OS modules, Knowledge,
+//! configured MCP servers); Open Design is the
 //! desktop's, so the desktop reports it and the daemon only remembers the report for a while.
 //! The old status routes stay as they are and are not called from here; for iDoris, Hyphae,
 //! attached modules and Documents this route reads the same objects (`IdorisHost`, the comm
@@ -46,6 +47,10 @@ pub struct Provide {
     id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<Value>,
+    /// Qualified tool names. Omitted when empty so locks that list none keep the
+    /// previous JSON. Part of `provides`, so a redacted audience still sees it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<String>,
 }
 
 /// The host view of one component.
@@ -100,6 +105,7 @@ impl Item {
                     .name
                     .as_ref()
                     .map(|n| json!({"zh": n.zh, "en": n.en, "th": n.th})),
+                tools: p.tools.clone(),
             })
             .collect()
     }
@@ -332,6 +338,115 @@ fn documents_item(state: &AppState) -> Item {
     })
 }
 
+/// Domain OS and in-process modules other than the builtins. Documents stays
+/// on [`documents_item`]. The state map is the same one Documents uses.
+fn os_mapped(
+    outcome: &MountOutcome,
+    live: Option<Supervised>,
+) -> (ComponentState, Option<&'static str>, Option<String>) {
+    match (outcome, live) {
+        (MountOutcome::Mounted, Some(status)) => {
+            let (state, reason) = from_supervised(&status);
+            (state, reason, None)
+        }
+        (MountOutcome::Mounted, None) => (ComponentState::Ready, None, None),
+        (MountOutcome::Disabled, _) => (ComponentState::Stopped, Some("disabled"), None),
+        (MountOutcome::Degraded(why), _) => {
+            (ComponentState::Failed, Some("degraded"), Some(why.clone()))
+        }
+        (MountOutcome::Refused(why), _) => {
+            (ComponentState::Failed, Some("refused"), Some(why.clone()))
+        }
+    }
+}
+
+fn os_module_items(state: &AppState) -> Vec<Item> {
+    let mut reports: Vec<_> = state
+        .os_reports
+        .iter()
+        .filter(|r| !BUILTIN_COMPONENT_IDS.contains(&r.name.as_str()))
+        .collect();
+    reports.sort_by(|a, b| a.name.cmp(&b.name));
+    reports
+        .into_iter()
+        .map(|report| {
+            let live = state
+                .module_status
+                .get(&report.name)
+                .map(|rx| rx.borrow().clone());
+            let (mapped, reason, message) = os_mapped(&report.outcome, live);
+            let d9 = report.d9.as_ref();
+            let provides = d9
+                .map(|d| {
+                    d.provides
+                        .iter()
+                        .map(|p| Provide {
+                            id: p.id.clone(),
+                            name: None,
+                            tools: p.tools.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let binding = d9.map(|d| {
+                if d.in_process {
+                    "in_process"
+                } else {
+                    "package"
+                }
+            });
+            Item::new(&report.name, Form::Resident, mapped).with(|i| {
+                i.version = Some(report.version.clone());
+                i.provides = provides;
+                i.reason = reason.map(str::to_owned);
+                let mut detail = json!({
+                    "requires": {
+                        "kernel": d9.map(|d| d.requires_kernel.clone()).unwrap_or_default(),
+                        "operations": [],
+                    },
+                });
+                if let Some(binding) = binding {
+                    detail["binding"] = json!(binding);
+                }
+                if let Some(message) = message {
+                    detail["message"] = json!(message);
+                }
+                i.detail = Some(detail);
+            })
+        })
+        .collect()
+}
+
+/// Configured MCP servers. One provide per legal id, tools from `tools/list`.
+/// D5's MCP subset is what the roster already stored.
+fn mcp_items(state: &AppState) -> Vec<Item> {
+    let mut records = state.mcp_roster.records();
+    records.sort_by(|a, b| a.id.cmp(&b.id));
+    records
+        .into_iter()
+        .map(|record| {
+            let provides = record
+                .capability_id
+                .map(|id| Provide {
+                    id,
+                    name: None,
+                    tools: record.tools,
+                })
+                .into_iter()
+                .collect();
+            Item::new(&record.id, Form::Mcp, record.state).with(|i| {
+                i.provides = provides;
+                i.reason = record.reason;
+                i.detail = Some(json!({
+                    "server": record.server,
+                    "protocol_version": record.protocol_version,
+                    "requires": { "kernel": [], "operations": [] },
+                }));
+            })
+        })
+        .collect()
+}
+
 /// Knowledge, remote subset: no binding active is `stopped` ("not configured"). There is no
 /// probe yet (C5), so an active binding is `ready` with `probed: false` rather than `degraded`.
 fn knowledge_item(state: &AppState) -> Item {
@@ -373,8 +488,10 @@ async fn collect(state: &AppState, now: Instant) -> Vec<Item> {
     let mut items = vec![idoris_item(state).await, hyphae_item(state)];
     items.extend(attach_items(state));
     items.push(documents_item(state));
+    items.extend(os_module_items(state));
     items.push(knowledge_item(state));
     items.push(open_design_item(state, now));
+    items.extend(mcp_items(state));
     items
 }
 

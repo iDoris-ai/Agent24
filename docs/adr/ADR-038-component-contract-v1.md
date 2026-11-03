@@ -327,7 +327,7 @@ CLI 绑定额外规定（和 `agent24-comm/src/runner.rs` 现有约定一致）�
 | C4 | AgentEar：只在 `/api/v1/components` 里登记（attach 子集状态），握手不变；D2/D2a 不适用（见 D2a 缺口说明）；补 §3 用例 2、3、4 | Agent24 |
 | C5 | Knowledge：把 `/system/capabilities` 映射到 D3/D5（远端服务子集） | Agent24 |
 | C6 | Documents：补 D9 清单；等它独立发版时再补 D2 的锁 | Agent24 |
-| C7 | 领域 OS、进程内 DomainModule、MCP：补 D9 清单（MCP 自动生成），状态接入 C3；`REGISTRY.md` 建表 | Agent24 |
+| C7 | 领域 OS、进程内 DomainModule、MCP：补 D9 清单（MCP 自动生成），状态接入 C3；`REGISTRY.md` 建表。**已完成**（2026-11-03）：登记表见 `docs/capabilities/REGISTRY.md` | Agent24 |
 | C8 | Open Design：桌面经 `POST /api/v1/components/{id}/report` 上报安装与运行状态；随 `SidecarManager` 落地迁到 sidecar 绑定。OD 下载迁进 daemon 不在 v1 | Agent24 |
 
 C1 最先做：它不改任何外部行为，而且能马上去掉 `fetch_verified` 借用 iDoris 锁的问题。C1b、C2 要和 Hyphae 一起做，排在 relay 上线并接好线之后。

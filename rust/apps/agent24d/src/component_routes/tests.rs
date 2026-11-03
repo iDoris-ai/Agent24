@@ -1,10 +1,14 @@
 #![allow(clippy::unwrap_used)]
+use std::sync::Arc;
+
 use super::*;
 use crate::capabilities::first_party::test_peer;
+use crate::domain::MountOutcome;
 use crate::enroll_api::EnrollAuthority;
 use crate::server::{build_router, tests as server_tests};
 use axum::http::{Method, header};
 use http_body_util::BodyExt;
+use serde_json::json;
 use tower::ServiceExt;
 
 async fn call(
@@ -577,4 +581,406 @@ fn concurrent_reports_are_serialised_and_never_misflagged() {
         last.state,
         ComponentState::Ready | ComponentState::Degraded
     ));
+}
+
+fn os_report(
+    name: &str,
+    outcome: crate::domain::MountOutcome,
+    d9: crate::component_manifest::OsD9,
+) -> crate::domain::MountReport {
+    crate::domain::MountReport {
+        name: name.to_owned(),
+        namespace: format!("/api/v1/{name}"),
+        version: "0.1.0".to_owned(),
+        enabled_at_start: Some(!matches!(outcome, crate::domain::MountOutcome::Disabled)),
+        outcome,
+        granted: Vec::new(),
+        resources: crate::domain::ResourceStatus::NotChecked,
+        d9: Some(d9),
+    }
+}
+
+fn d9(
+    name: &str,
+    in_process: bool,
+    provide: &str,
+    kernel: &[&str],
+) -> crate::component_manifest::OsD9 {
+    crate::component_manifest::OsD9 {
+        name: name.to_owned(),
+        in_process,
+        provides: vec![crate::component_manifest::CapProvide {
+            id: provide.to_owned(),
+            tools: vec![format!("{name}.ping")],
+        }],
+        requires_kernel: kernel.iter().map(|s| (*s).to_owned()).collect(),
+    }
+}
+
+#[tokio::test]
+async fn domain_os_and_mcp_show_up_with_a_list_and_a_d5_state() {
+    use agent24_os_proto::supervisor::Status;
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let (_tx, rx) = tokio::sync::watch::channel(Status::Stopped);
+    state.module_status = Arc::new(std::collections::HashMap::from([("sin90".to_owned(), rx)]));
+    state.os_reports = Arc::new(vec![
+        os_report(
+            "documents",
+            MountOutcome::Mounted,
+            d9("documents", false, "should-not-leak", &[]),
+        ),
+        os_report(
+            "demo",
+            MountOutcome::Mounted,
+            d9("demo", true, "demo-tasks", &["events"]),
+        ),
+        os_report(
+            "sin90",
+            MountOutcome::Mounted,
+            d9("sin90", false, "sin90-tasks", &["events"]),
+        ),
+        os_report(
+            "cos72",
+            MountOutcome::Disabled,
+            d9("cos72", false, "cos72-tasks", &[]),
+        ),
+        os_report(
+            "broken",
+            MountOutcome::Degraded("/tmp/secret-os-path".into()),
+            d9("broken", false, "broken-tasks", &["memory"]),
+        ),
+    ]);
+    state.mcp_roster = Arc::new(crate::mcp::McpRoster::from_records(vec![
+        crate::mcp::McpRecord {
+            server: "files".to_owned(),
+            id: "mcp-files".to_owned(),
+            state: ComponentState::Ready,
+            reason: None,
+            capability_id: Some("mcp-files".to_owned()),
+            tools: vec!["mcp_files_echo".to_owned()],
+            protocol_version: Some("2024-11-05".to_owned()),
+        },
+        crate::mcp::McpRecord {
+            server: "!!!".to_owned(),
+            id: "mcp-bad-00000001".to_owned(),
+            state: ComponentState::Failed,
+            reason: Some("invalid_capability_id".to_owned()),
+            capability_id: None,
+            tools: Vec::new(),
+            protocol_version: None,
+        },
+    ]));
+    let app = build_router(state);
+    let (status, body) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<_> = body["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "idoris",
+            "hyphae",
+            "documents",
+            "broken",
+            "cos72",
+            "demo",
+            "sin90",
+            "knowledge",
+            "open-design",
+            "mcp-bad-00000001",
+            "mcp-files",
+        ]
+    );
+    assert_eq!(
+        body["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["id"] == "documents")
+            .count(),
+        1
+    );
+    assert!(
+        find(&body, "documents")["provides"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let demo = find(&body, "demo");
+    assert_eq!(demo["state"], "ready");
+    assert_eq!(demo["form"], "resident");
+    assert_eq!(demo["version"], "0.1.0");
+    assert_eq!(demo["detail"]["binding"], "in_process");
+    assert_eq!(demo["detail"]["requires"]["kernel"], json!(["events"]));
+    assert_eq!(demo["provides"][0]["id"], "demo-tasks");
+    assert_eq!(demo["provides"][0]["tools"], json!(["demo.ping"]));
+
+    let sin90 = find(&body, "sin90");
+    assert_eq!(sin90["state"], "stopped");
+    assert_eq!(sin90["form"], "resident");
+    assert_eq!(sin90["detail"]["binding"], "package");
+    assert_eq!(sin90["provides"][0]["id"], "sin90-tasks");
+
+    let cos72 = find(&body, "cos72");
+    assert_eq!(cos72["state"], "stopped");
+    assert_eq!(cos72["reason"], "disabled");
+
+    let broken = find(&body, "broken");
+    assert_eq!(broken["state"], "failed");
+    assert_eq!(broken["reason"], "degraded");
+    assert_eq!(broken["detail"]["message"], "/tmp/secret-os-path");
+
+    let files = find(&body, "mcp-files");
+    assert_eq!(files["form"], "mcp");
+    assert_eq!(files["state"], "ready");
+    assert_eq!(files["provides"][0]["id"], "mcp-files");
+    assert_eq!(files["provides"][0]["tools"], json!(["mcp_files_echo"]));
+    assert_eq!(files["detail"]["protocol_version"], "2024-11-05");
+    assert_eq!(files["detail"]["requires"]["operations"], json!([]));
+
+    let bad = find(&body, "mcp-bad-00000001");
+    assert_eq!(bad["state"], "failed");
+    assert_eq!(bad["reason"], "invalid_capability_id");
+    assert!(bad["provides"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn os_and_mcp_detail_stays_off_the_redacted_view() {
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let first_party = state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .issue(&test_peer("daemon-test"))
+        .unwrap()
+        .secret
+        .to_string();
+    state.os_reports = Arc::new(vec![os_report(
+        "broken",
+        MountOutcome::Degraded("/tmp/secret-os-path".into()),
+        d9("broken", false, "broken-tasks", &["memory"]),
+    )]);
+    state.mcp_roster = Arc::new(crate::mcp::McpRoster::from_records(vec![
+        crate::mcp::McpRecord {
+            server: "files".to_owned(),
+            id: "mcp-files".to_owned(),
+            state: ComponentState::Failed,
+            reason: Some("spawn_failed".to_owned()),
+            capability_id: Some("mcp-files".to_owned()),
+            tools: vec!["mcp_files_echo".to_owned()],
+            protocol_version: Some("2024-11-05".to_owned()),
+        },
+    ]));
+    let app = build_router(state);
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(
+        find(&full, "broken")["detail"]["message"],
+        "/tmp/secret-os-path"
+    );
+    let (status, redacted) = call(&app, Method::GET, GET, Some(&first_party), "").await;
+    assert_eq!(status, StatusCode::OK);
+    let text = redacted.to_string();
+    for leaked in [
+        "detail",
+        "reason",
+        "form",
+        "/tmp/secret-os-path",
+        "spawn_failed",
+        "protocol_version",
+        "2024-11-05",
+        "requires",
+        "binding",
+        "in_process",
+        "memory",
+    ] {
+        assert!(!text.contains(leaked), "{leaked} leaked: {text}");
+    }
+    assert_eq!(find(&redacted, "broken")["state"], "failed");
+    assert_eq!(
+        find(&redacted, "broken")["provides"][0]["id"],
+        "broken-tasks"
+    );
+    assert_eq!(
+        find(&redacted, "mcp-files")["provides"][0]["tools"],
+        json!(["mcp_files_echo"])
+    );
+    for item in redacted["components"].as_array().unwrap() {
+        let mut keys: Vec<_> = item.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["id", "provides", "state", "version"]);
+    }
+}
+
+fn registered_ids(markdown: &str) -> std::collections::BTreeSet<String> {
+    markdown
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with('|') {
+                return None;
+            }
+            let cell = line.split('|').nth(1)?.trim().trim_matches('`');
+            crate::component_manifest::capability_id_ok(cell).then(|| cell.to_owned())
+        })
+        .collect()
+}
+
+fn mcp_exempt(id: &str) -> bool {
+    id.strip_prefix("mcp-")
+        .is_some_and(|body| crate::mcp::mcp_capability_id(body).as_deref() == Some(id))
+}
+
+fn covered(id: &str, registered: &std::collections::BTreeSet<String>) -> bool {
+    registered.contains(id) || mcp_exempt(id)
+}
+
+fn provide_ids(body: &Value) -> Vec<String> {
+    body["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|c| c["provides"].as_array().unwrap().iter())
+        .map(|p| p["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn registry_lists_every_capability_id_the_components_emit() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let registry_path = root.join("docs/capabilities/REGISTRY.md");
+    let markdown = std::fs::read_to_string(&registry_path).unwrap_or_else(|e| {
+        panic!("reading {}: {e}", registry_path.display());
+    });
+    let registered = registered_ids(&markdown);
+    for id in [
+        "model-gateway",
+        "nostr-dm",
+        "nostr-group",
+        "nostr-identity",
+        "nostr-relay",
+        "documents",
+    ] {
+        assert!(registered.contains(id), "{id} is not in REGISTRY.md");
+    }
+    assert!(
+        !registered.contains("mcp-files"),
+        "MCP ids are generated, not registered"
+    );
+    assert!(mcp_exempt("mcp-files"));
+    assert!(!mcp_exempt("model-gateway"));
+    assert!(!mcp_exempt("mcp-"));
+
+    let mut locks = Vec::new();
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == "target" || name.starts_with('.') {
+                continue;
+            }
+            if path.is_dir() {
+                walk(&path, out);
+            } else if name.ends_with(".lock.json") {
+                out.push(path);
+            }
+        }
+    }
+    walk(&root.join("rust"), &mut locks);
+    assert!(!locks.is_empty(), "expected component locks under rust/");
+    for path in &locks {
+        let text = std::fs::read_to_string(path).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let Some(provides) = value.get("provides").and_then(|p| p.as_array()) else {
+            continue;
+        };
+        for provide in provides {
+            let id = provide["id"].as_str().unwrap();
+            assert!(
+                registered.contains(id),
+                "{} provides {id}, which REGISTRY.md does not list",
+                path.display()
+            );
+        }
+    }
+
+    fn walk_manifests(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == "target" || name.starts_with('.') {
+                continue;
+            }
+            if path.is_dir() {
+                walk_manifests(&path, out);
+            } else if name == "domain-os.yml" {
+                out.push(path);
+            }
+        }
+    }
+    let mut manifests = Vec::new();
+    walk_manifests(&root, &mut manifests);
+    for path in manifests {
+        let text = std::fs::read_to_string(&path).unwrap();
+        if !text
+            .lines()
+            .any(|line| line.trim().starts_with("provides:"))
+        {
+            continue;
+        }
+        let manifest = agent24_domain::DomainOsManifest::from_yaml(&text)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        for provide in manifest.provides() {
+            assert!(
+                registered.contains(provide.id()),
+                "{} provides {}, which REGISTRY.md does not list",
+                path.display(),
+                provide.id()
+            );
+        }
+    }
+
+    let app = build_router(server_tests::state().await);
+    let (_, stock) = call(&app, Method::GET, GET, Some("testtoken"), "").await;
+    for id in provide_ids(&stock) {
+        assert!(
+            covered(&id, &registered),
+            "GET /components provides {id}, which is neither registered nor mcp-<server>"
+        );
+    }
+
+    let mut state = server_tests::state().await;
+    state.mcp_roster = Arc::new(crate::mcp::McpRoster::from_records(vec![
+        crate::mcp::McpRecord {
+            server: "files".to_owned(),
+            id: "mcp-files".to_owned(),
+            state: ComponentState::Ready,
+            reason: None,
+            capability_id: Some("mcp-files".to_owned()),
+            tools: vec!["mcp_files_echo".to_owned()],
+            protocol_version: None,
+        },
+    ]));
+    let app = build_router(state);
+    let (_, with_mcp) = call(&app, Method::GET, GET, Some("testtoken"), "").await;
+    let ids = provide_ids(&with_mcp);
+    assert!(ids.iter().any(|id| id == "mcp-files"));
+    for id in ids {
+        assert!(
+            covered(&id, &registered),
+            "GET /components provides {id}, which is neither registered nor mcp-<server>"
+        );
+    }
 }

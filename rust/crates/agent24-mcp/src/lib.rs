@@ -146,6 +146,20 @@ impl McpServer {
         &self.name
     }
 
+    /// The MCP `protocolVersion` from initialize. Recorded, not compared:
+    /// MCP is exempt from D3's `major.minor` check (ADR-038 D1).
+    pub fn protocol_version(&self) -> Option<String> {
+        self.service
+            .peer_info()
+            .map(|info| info.protocol_version.as_str().to_owned())
+    }
+
+    /// The child closed its stdio. This is the liveness signal C7 records:
+    /// a crash leaves the service handle in place and only the transport ends.
+    pub fn transport_closed(&self) -> bool {
+        self.service.is_transport_closed()
+    }
+
     /// The declared target argument for one of this server's tools, if the user
     /// named one in `mcp.json`.
     pub fn target_arg(&self, remote_tool: &str) -> Option<&str> {

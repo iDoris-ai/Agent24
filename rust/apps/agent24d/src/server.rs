@@ -150,6 +150,10 @@ pub struct AppState {
     /// it contributed. Never read on purpose — its job is to exist (M-E/E1b).
     #[allow(dead_code, reason = "RAII: keeps MCP child processes alive")]
     pub mcp_servers: Arc<Vec<Arc<agent24_mcp::McpServer>>>,
+    /// D5/D9 for every configured MCP server, including ones that failed to
+    /// start or were switched off (ADR-038 C7). Empty until `serve` replaces
+    /// it, before the router clones this state.
+    pub mcp_roster: Arc<crate::mcp::McpRoster>,
     /// Daemon-wide shutdown: handlers derive request tokens from it so
     /// shutdown cancels in-flight provider calls (run-level cancel joins in C2),
     /// and `POST /api/v1/shutdown` requests it.
@@ -722,6 +726,7 @@ impl AppState {
             knowledge_host: Arc::new(crate::knowledge_host::KnowledgeHostRegistry::default()),
             presence_desktop: None,
             mcp_servers: Arc::new(mcp_servers),
+            mcp_roster: Arc::new(crate::mcp::McpRoster::default()),
             router,
             managed_idoris: None,
             idoris_host: None,
@@ -2341,26 +2346,26 @@ pub async fn serve(
     for tool in crate::knowledge_tools::tools(StdArc::clone(&knowledge_host), knowledge_runs) {
         tools = tools.with(tool);
     }
-    let mcp_servers = match crate::mcp::config_path() {
+    let (mcp_servers, mcp_roster) = match crate::mcp::config_path() {
         Some(path) => match crate::mcp::load_config(&path) {
             Ok(cfg) => {
-                let specs = cfg.specs();
-                if specs.is_empty() {
-                    Vec::new()
+                let targets = cfg.targets();
+                if targets.is_empty() {
+                    (Vec::new(), Arc::new(crate::mcp::McpRoster::default()))
                 } else {
-                    let (servers, mcp_tools) = crate::mcp::mount(&specs, &cancel).await;
+                    let (servers, mcp_tools, roster) = crate::mcp::mount(&targets, &cancel).await;
                     for tool in mcp_tools {
                         tools = tools.with(tool);
                     }
-                    servers
+                    (servers, roster)
                 }
             }
             Err(err) => {
                 tracing::error!("ignoring {}: {err}", path.display());
-                Vec::new()
+                (Vec::new(), Arc::new(crate::mcp::McpRoster::default()))
             }
         },
-        None => Vec::new(),
+        None => (Vec::new(), Arc::new(crate::mcp::McpRoster::default())),
     };
 
     // H2: load the user's risk overrides before the registry is frozen, so the
@@ -2413,6 +2418,9 @@ pub async fn serve(
         mcp_servers,
         packages_root: Arc::clone(&packages_root),
     });
+    // Before any clone into the router. `AppState::new` starts this empty so
+    // tests that never mount MCP keep an empty roster.
+    state.mcp_roster = mcp_roster;
     state.knowledge_host = knowledge_host;
     state.managed_idoris = managed_idoris;
     state.idoris_host = idoris_host;
