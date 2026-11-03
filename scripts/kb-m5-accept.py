@@ -531,14 +531,16 @@ def broken(d, fault, prompt):
 
 
 def held(d, then):
-    """A run whose search the proxy holds for 5 s; `then()` runs once the search
-    is out. (the run id, what `then` returned, the run, the run re-read after
-    the held answer came back)."""
+    """A run whose search the proxy holds for 5 s; `then()` runs 1 s after the
+    search went out, by when an answer not held would have come back and the
+    run gone on. (the run id, what `then` returned, the run, the run re-read
+    after the held answer came back)."""
     FAULT.clear()
     FAULT["search"] = ("sleep", 5)
     DUMPS.clear(), STAMPS.clear(), SEEN.clear(), ARRIVED.clear()
     _, run_id, raw = d.start(f"{MARKER} {QUESTION}", BINDING)
     ARRIVED.wait(30)
+    time.sleep(1)
     did = then(run_id)
     run = d.wait(run_id) if run_id else {}
     time.sleep(max(0.0, SEEN[0][0] + 6 - time.time()) if SEEN else 0)
