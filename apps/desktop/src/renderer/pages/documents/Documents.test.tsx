@@ -187,6 +187,30 @@ describe('DocumentsPage: the list', () => {
     expect(screen.queryByText('文档模块未安装')).toBeNull()
   })
 
+  it('T1-2: turned off after capabilities answered (only the list says module_stopping): the notice still shows', async () => {
+    const stopping = () => err(503, 'module_stopping', 'this run has stopped and will not restart on its own')
+    mount({
+      lists: [stopping],
+      moduleStatus: () => Promise.resolve({ bundled: true, installed: true, externalDaemon: false, turnedOff: true }),
+    })
+    render(<DocumentsPage />)
+    expect(await screen.findByText('文档模块已停用。到「模块管理」页启用后即可使用。')).toBeInTheDocument()
+    expect(screen.queryByText(/will not restart on its own/)).toBeNull()
+  })
+
+  it('T1-2: the turned-off notice goes once the list is served again', async () => {
+    const stopping = () => err(503, 'module_stopping', 'this run has stopped and will not restart on its own')
+    const m = mount({
+      lists: [stopping, () => ok({ documents: [doc(1)], next_cursor: null })],
+      moduleStatus: () => Promise.resolve({ bundled: true, installed: true, externalDaemon: false, turnedOff: true }),
+    })
+    render(<DocumentsPage />)
+    expect(await screen.findByText('文档模块已停用。到「模块管理」页启用后即可使用。')).toBeInTheDocument()
+    act(() => m.event?.({ kind: 'document.imported', payload: { document_id: doc(1).document_id } }))
+    await waitFor(() => expect(screen.queryByText('文档模块已停用。到「模块管理」页启用后即可使用。')).toBeNull())
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
   it('module_stopping while os.json says on (a crash): the raw error stays, no turned-off notice', async () => {
     const stopping = () => err(503, 'module_stopping', 'this run has stopped and will not restart on its own')
     mount({

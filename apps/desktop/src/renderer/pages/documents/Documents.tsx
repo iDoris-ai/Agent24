@@ -99,12 +99,16 @@ export default function DocumentsPage() {
     }
     setListMissing(false)
     if (!res.ok) {
-      // Turned off: the notice above says so; no second, raw copy here.
+      // Turned off: said once, as the notice, not as a raw error here; the
+      // module may have been turned off after capabilities answered.
       const off = await turnedOff(res)
       if (gen !== generation.current) return
       setListError(off ? null : describeError(res))
+      if (off) setUnavailable(MODULE_DISABLED)
       return
     }
+    // Serving again (turned back on, daemon restarted): no "turned off" left.
+    setUnavailable((u) => (u === MODULE_DISABLED ? null : u))
     setListError(null)
     setDocs(res.data.documents)
     setMore(res.data.next_cursor ? { gen, cursor: res.data.next_cursor } : null)
