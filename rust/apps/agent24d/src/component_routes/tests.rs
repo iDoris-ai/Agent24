@@ -863,6 +863,36 @@ async fn adr038_case2_protocol_mismatch_is_incompatible_and_sends_no_call() {
     assert!(item.get("reason").is_none(), "{item}");
 }
 
+/// A range that already negotiated must not leave an earlier mismatch in
+/// place when `commit` refuses because the module is disabled. Re-enabling
+/// then shows `stopped`, with no `component_contract_mismatch`.
+#[tokio::test]
+async fn a_legal_handshake_while_disabled_clears_the_contract_mismatch() {
+    let ear = ear().await;
+    let mut bad = open(&ear, Some(json!({"min": 0, "max": 0}))).await;
+    let err = next_frame(&mut bad).await.unwrap();
+    assert_eq!(err["error"]["data"]["kind"], "version_mismatch", "{err}");
+    bad.finish().await;
+    let item = assert_agentear(&components(&ear.state).await, "incompatible");
+    assert_eq!(item["reason"], "component_contract_mismatch");
+
+    ear.set_disabled(true);
+    let mut legal = open(&ear, Some(json!({"min": 1, "max": 1}))).await;
+    let err = next_frame(&mut legal).await.unwrap();
+    assert_eq!(err["error"]["data"]["kind"], "forbidden", "{err}");
+    assert!(
+        next_frame(&mut legal).await.is_none(),
+        "a business frame followed forbidden: {err}"
+    );
+    legal.finish().await;
+
+    ear.set_disabled(false);
+    let item = assert_agentear(&components(&ear.state).await, "stopped");
+    assert_ne!(item["reason"], "component_contract_mismatch");
+    assert!(item.get("reason").is_none(), "{item}");
+    assert!(item.get("detail").is_none(), "{item}");
+}
+
 /// §3 case 3. Unknown fields in the module's command result (and an extra
 /// envelope field) are ignored. The call succeeds and the component stays
 /// `ready`.

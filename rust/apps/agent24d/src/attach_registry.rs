@@ -492,6 +492,10 @@ impl AttachRegistry {
             return Err(CommitRefused::Handshake(HandshakeError::AuthFailed));
         }
         if entry.disabled {
+            // `accept_attached` already agreed the range, or `commit` would
+            // not have been called. An earlier refusal must not still read
+            // as `incompatible` after the user re-enables.
+            entry.contract_mismatch = None;
             return Err(CommitRefused::Handshake(HandshakeError::Forbidden));
         }
         let (number, generation) = entry

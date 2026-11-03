@@ -117,6 +117,9 @@ struct Shared {
     pending: Mutex<PendingState>,
     next_id: AtomicU64,
     stray_responses: AtomicU64,
+    /// Timed-out calls whose `$/cancelRequest` never entered `out_tx`.
+    /// `pending.closed` is not counted: that path sends nothing.
+    cancel_not_queued: AtomicU64,
 }
 
 impl Shared {
@@ -259,7 +262,9 @@ impl KernelCalls {
             Ok(Err(_recv_error)) => Err(KernelCallFailed::ConnectionLost),
             // ADR-038 D6: JSON-RPC cancel is `$/cancelRequest`, once. The
             // outcome stays unknown, and this arm does not send the request
-            // again. Not sent on `NotSent` or `ConnectionLost`.
+            // again. Not sent on `NotSent` or `ConnectionLost`. Also not
+            // sent when `pending.closed` is already set. A failed `try_send`
+            // is counted and logged without the request body.
             Err(_elapsed) => {
                 self.enqueue_cancel(&id);
                 Err(KernelCallFailed::Timeout)
@@ -268,18 +273,35 @@ impl KernelCalls {
     }
 
     /// A notification: no JSON-RPC `id`, so it is not itself a pending call.
-    /// `try_send`; a closed queue is ignored because the outcome is already
-    /// unknown.
+    /// Nothing is sent when `pending.closed` is already set. Otherwise
+    /// `try_send`: a full or disconnected queue is counted and logged
+    /// without the original request body.
     fn enqueue_cancel(&self, id: &str) {
-        let Ok(mut line) = serde_json::to_vec(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": CANCEL_METHOD,
-            "params": { "id": id },
-        })) else {
-            return;
+        let not_queued = {
+            let pending = self
+                .shared
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if pending.closed {
+                return;
+            }
+            let Ok(mut line) = serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": CANCEL_METHOD,
+                "params": { "id": id },
+            })) else {
+                return;
+            };
+            line.push(b'\n');
+            self.out_tx.try_send(line).is_err()
         };
-        line.push(b'\n');
-        let _ = self.enqueue_raw(line);
+        if not_queued {
+            self.shared
+                .cancel_not_queued
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(id, "attach: $/cancelRequest was not queued");
+        }
     }
 
     /// A3-3 review M2: externally mark this connection "closed" for the
@@ -341,6 +363,13 @@ impl KernelCalls {
     #[must_use]
     pub fn stray_responses(&self) -> u64 {
         self.shared.stray_responses.load(Ordering::Relaxed)
+    }
+
+    /// Timed-out calls whose `$/cancelRequest` did not enter the outbound
+    /// queue. A connection that was already closed is not included.
+    #[must_use]
+    pub fn cancel_not_queued(&self) -> u64 {
+        self.shared.cancel_not_queued.load(Ordering::Relaxed)
     }
 }
 
@@ -592,6 +621,7 @@ where
         }),
         next_id: AtomicU64::new(0),
         stray_responses: AtomicU64::new(0),
+        cancel_not_queued: AtomicU64::new(0),
     });
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(OUT_QUEUE_CAPACITY);
     let calls = KernelCalls {
@@ -1716,6 +1746,136 @@ mod review_fixes {
             "the writer task must have been aborted (dropping its out_rx) even though the \
              returned future was dropped before its first poll — otherwise it (and the other \
              two background tasks) leak forever"
+        );
+    }
+
+    /// Nobody is reading `out_tx`. The receiver is returned so the channel
+    /// stays open: a failed `try_send` then means the queue is full, not that
+    /// it was dropped.
+    fn idle_calls(capacity: usize) -> (KernelCalls, mpsc::Receiver<Vec<u8>>) {
+        let shared = Arc::new(Shared {
+            pending: Mutex::new(PendingState {
+                map: HashMap::new(),
+                closed: false,
+            }),
+            next_id: AtomicU64::new(0),
+            stray_responses: AtomicU64::new(0),
+            cancel_not_queued: AtomicU64::new(0),
+        });
+        let (out_tx, out_rx) = mpsc::channel(capacity);
+        (KernelCalls { shared, out_tx }, out_rx)
+    }
+
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Logs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+        type Writer = Logs;
+        fn make_writer(&'a self) -> Logs {
+            self.clone()
+        }
+    }
+
+    fn capture_logs() -> (Logs, tracing::subscriber::DefaultGuard) {
+        let logs = Logs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        (logs, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// The single outbound slot is already holding the request, so the
+    /// timeout's `$/cancelRequest` cannot be queued. The miss is counted
+    /// and logged, and the log does not contain the request body.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_full_queue_counts_a_cancel_that_was_not_sent() {
+        let (logs, _guard) = capture_logs();
+        let (calls, mut rx) = idle_calls(1);
+        let secret = "speak-body-must-not-appear-in-logs";
+        let result = calls
+            .call(
+                "speak",
+                serde_json::json!({"text": secret}),
+                Duration::from_millis(30),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(result, KernelCallFailed::Timeout), "{result}");
+        assert_eq!(calls.cancel_not_queued(), 1);
+        let request = rx.try_recv().expect("the request was queued");
+        let frame: Value = serde_json::from_slice(&request).unwrap();
+        assert_eq!(frame["method"], "speak");
+        assert_eq!(frame["params"]["text"], secret);
+        assert!(rx.try_recv().is_err(), "a cancel frame was queued");
+        let text = logs.text();
+        assert!(
+            text.contains("$/cancelRequest was not queued"),
+            "missing warn: {text}"
+        );
+        assert!(
+            !text.contains(secret),
+            "request body leaked into the log: {text}"
+        );
+    }
+
+    /// The request is already queued when `pending.closed` flips. The
+    /// timeout must not send `$/cancelRequest`, and must not count a miss
+    /// for a send it did not attempt.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_timeout_does_not_send_cancel_when_pending_is_already_closed() {
+        let (calls, mut rx) = idle_calls(4);
+        let calls2 = calls.clone();
+        let call = tokio::spawn(async move {
+            calls2
+                .call(
+                    "speak",
+                    serde_json::json!({"text": "still-open"}),
+                    Duration::from_millis(400),
+                )
+                .await
+        });
+        let request = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("request was not queued")
+            .unwrap();
+        let frame: Value = serde_json::from_slice(&request).unwrap();
+        assert_eq!(frame["method"], "speak");
+        {
+            let mut pending = calls
+                .shared
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            pending.closed = true;
+        }
+        let result = tokio::time::timeout(Duration::from_secs(2), call)
+            .await
+            .expect("timed-out call hung")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(result, KernelCallFailed::Timeout), "{result}");
+        assert_eq!(calls.cancel_not_queued(), 0);
+        assert!(
+            rx.try_recv().is_err(),
+            "a closed connection queued $/cancelRequest"
         );
     }
 }
