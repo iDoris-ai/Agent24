@@ -52,12 +52,12 @@
 | N2 | Off 之后 | DELETE 绑定后，指名该绑定的新 run 在创建时被拒：409 `knowledge_binding_inactive` |
 | N3 | 检索成功之后调 `http_fetch` | 先确认这一轮的检索拿到了证据，随后的 `http_fetch` 被出口策略拒绝（`denied by policy`）：同源例外只放行 Knowledge 自己 |
 | N4 | 断线（#1001 第 2 条） | 代理接了 search 的连接就断开。工具结果 `code` 为 `unavailable`；run 完成，回答里没有样本事实；代理收到的 search 不超过 2 次 |
-| N5 | 超时（第 2 条） | 代理压住 search 20 秒。工具结果为 `unavailable`，从 search 发出到结果回到模型不到 19 秒（daemon 给服务端 15 秒，传输再加 2 秒）；run 30 秒内完成；迟到的应答回来后，回答不变 |
-| N6 | 取消（第 2 条） | 代理压住 search 5 秒，发出 1 秒后取消 run。run 终态 `cancelled`；取消之后代理再没收到调用；带工具的模型请求只有 1 次 |
+| N5 | 超时（第 2 条） | 代理压住 search 20 秒。工具结果为 `unavailable`，从 search 发出到结果回到模型不到 19 秒（daemon 给服务端 15 秒，传输再加 2 秒）；run 30 秒内完成；等到代理把迟到的应答转发完再重读 run，回答不变 |
+| N6 | 取消（第 2 条） | 代理压住 search 5 秒，发出 1 秒后取消 run。search 没到达代理就算 FAIL。run 终态 `cancelled`；等到被压住的 search 转发完，取消之后代理仍没收到别的调用；带工具的模型请求只有 1 次 |
 | N7 | stale（第 2 条） | 按引用读回时，代理改掉期望的 `content_tag`。工具结果为 `stale`，没有 citation |
 | N8 | 提示注入（第 2 条） | 样本里的一行指令要求改检索别的库，再 `http_fetch`，stub 照做。第一次检索的证据都来自本库；改检索的那次被拒（`forbidden`，daemon 先把越界的库过滤掉，范围空了）、没有证据；`http_fetch` 被出口策略拒绝；第一次和最后一次模型请求提供的工具相同 |
-| N9 | 在途 Off（第 3 条） | 代理压住 search 5 秒，发出 1 秒后 DELETE 绑定。这一轮工具结果为 `knowledge_call_superseded`、没有证据；迟到的应答回来后，回答不变；随后指名该绑定的新 run 409 `knowledge_binding_inactive` |
-| N10 | 撤权（第 2 条） | 代理把旧 key 换成 WeKnora 不认的。工具结果被拒、没有证据：fork 对不认的 key 回 401，正文不是错误信封，daemon 按 `unavailable`（`incompatible`）处理；回信封时为 `unauthorized`，两种都算过。推入一把新 key 后，同样的检索拿到含样本事实的证据 |
+| N9 | 在途 Off（第 3 条） | 代理压住 search 5 秒，发出 1 秒后 DELETE 绑定。search 没到达代理就算 FAIL。这一轮工具结果为 `knowledge_call_superseded`、没有证据；等到迟到的应答转发完再重读 run，回答不变；随后指名该绑定的新 run 409 `knowledge_binding_inactive` |
+| N10 | 撤权（第 2 条） | 代理把旧 key 换成 WeKnora 不认的。代理记录里至少有一次换了 key，且 WeKnora 回 401 或 403。工具结果没有证据，`code` 为 `unauthorized`；或者 `code` 为 `unavailable` 且 `reason` 为 `incompatible`：fork 对不认的 key 回 401，正文不是错误信封，daemon 就这样处理。推入一把新 key 后，代理不再换 key，同样的检索拿到含样本事实的证据 |
 | E7 | Off 跨重启 | N2 之后用同一个数据目录重起 daemon，不重新 PUT 绑定，指名它的 run 仍 409 `knowledge_binding_inactive` |
 
 真实模型模式只跑 E0–E3。N4、N5、N6、N7、N9、N10 都做过反面对照：代理不弄坏调用时，这几条全部变 FAIL。

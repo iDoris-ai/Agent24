@@ -248,6 +248,8 @@ class Recorder(Quiet):
 FAULT = {}  # "search" / "read" → ("close",) | ("sleep", seconds) | ("tag",) | ("revoke", key)
 SEEN = []  # (time, "search" / "read") of each call the proxy got
 ARRIVED = threading.Event()
+UPSTREAM = []  # ("search" / "read", whether the key was swapped, WeKnora's status or 0) of each call passed on
+FORWARDED = threading.Event()  # set once WeKnora's answer to a call passed on is in
 
 
 class Faulty(Quiet):
@@ -274,7 +276,8 @@ class Faulty(Quiet):
             rev = body["expected_revision"]
             rev["content_tag"] = rev["content_tag"][:-1] + ("1" if rev["content_tag"].endswith("0") else "0")
             raw = json.dumps(body).encode()
-        if fault[0] == "revoke" and headers.get("X-API-Key") == fault[1]:
+        swapped = fault[0] == "revoke" and headers.get("X-API-Key") == fault[1]
+        if swapped:
             headers["X-API-Key"] = "sk-revoked-" + secrets.token_hex(8)
         u = urllib.parse.urlsplit(WK)
         try:
@@ -283,6 +286,13 @@ class Faulty(Quiet):
             res = conn.getresponse()
             data = res.read()
             conn.close()
+        except (OSError, http.client.HTTPException):
+            res = None
+        UPSTREAM.append((op, swapped, res.status if res is not None else 0))
+        FORWARDED.set()
+        if res is None:
+            return
+        try:
             self.send_response(res.status)
             self.send_header("Content-Type", res.getheader("Content-Type") or "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -509,14 +519,23 @@ def answer_of(run):
     return ((run or {}).get("output") or {}).get("text") or ""
 
 
-def code_of(result):
-    """The `code` of a refused Knowledge tool result, None for any other."""
+def refusal_of(result):
+    """A refused Knowledge tool result as an object, {} for any other."""
     i = result.find("{")
     try:
         got = json.JSONDecoder().raw_decode(result[i:])[0] if i >= 0 else None
     except ValueError:
-        return None
-    return got.get("code") if isinstance(got, dict) and got.get("outcome") == "refused" else None
+        return {}
+    return got if isinstance(got, dict) and got.get("outcome") == "refused" else {}
+
+
+def code_of(result):
+    return refusal_of(result).get("code")
+
+
+def clear():
+    for each in (DUMPS, STAMPS, SEEN, UPSTREAM, ARRIVED, FORWARDED):
+        each.clear()
 
 
 def broken(d, fault, prompt):
@@ -524,7 +543,7 @@ def broken(d, fault, prompt):
     (the run, this turn's tool results, the seconds it took)."""
     FAULT.clear()
     FAULT.update(fault)
-    DUMPS.clear(), STAMPS.clear(), SEEN.clear(), ARRIVED.clear()
+    clear()
     began = time.time()
     _, run, _ = d.ask(prompt, BINDING)
     return run or {}, tool_results(DUMPS), time.time() - began
@@ -533,20 +552,21 @@ def broken(d, fault, prompt):
 def held(d, then):
     """A run whose search the proxy holds for 5 s; `then()` runs 1 s after the
     search went out, by when an answer not held would have come back and the
-    run gone on. (the run id, what `then` returned, the run, the run re-read
-    after the held answer came back)."""
+    run gone on. (what `then` returned, the run, the run re-read once WeKnora's
+    answer to the held search is in, a note: "" or why the case cannot pass)."""
     FAULT.clear()
     FAULT["search"] = ("sleep", 5)
-    DUMPS.clear(), STAMPS.clear(), SEEN.clear(), ARRIVED.clear()
+    clear()
     _, run_id, raw = d.start(f"{MARKER} {QUESTION}", BINDING)
-    ARRIVED.wait(30)
+    arrived = ARRIVED.wait(30)
     time.sleep(1)
     did = then(run_id)
     run = d.wait(run_id) if run_id else {}
-    time.sleep(max(0.0, SEEN[0][0] + 6 - time.time()) if SEEN else 0)
+    forwarded = FORWARDED.wait(15)
     later = d.call("GET", f"/api/v1/runs/{run_id}")[1] if run_id else {}
     FAULT.clear()
-    return run_id, did, run, later
+    note = "" if arrived and forwarded else "search 未到达代理；" if not arrived else "被压住的 search 没有转发完；"
+    return did, run or {}, later, note
 
 
 def cases(d, lib, real, via):
@@ -631,19 +651,19 @@ def cases(d, lib, real, via):
     sent = next((t for t, op in SEEN if op == "search"), None)
     back = next((t for t, r in zip(STAMPS, DUMPS) if tool_results([r])), None)
     waited = back - sent if sent and back else None
-    time.sleep(max(0.0, sent + 21 - time.time()) if sent else 0)
+    forwarded = FORWARDED.wait(30)
     later = d.call("GET", f"/api/v1/runs/{run.get('id')}")[1]
     check("N5", "超时：WeKnora 20 秒才回，工具结果在时限（15 秒加 2 秒余量）内返回 unavailable，run 30 秒内完成，迟到的 200 不改结果",
           run.get("status") == "completed" and code_of((res or [""])[0]) == "unavailable"
-          and waited is not None and waited < 19 and took < 30 and answer_of(later) == answer_of(run),
-          f"状态 {run.get('status')}，工具结果 {(res or [''])[0][:160]!r}，search 发出到结果回到模型 {waited and round(waited, 1)} 秒，run {round(took, 1)} 秒，迟到后回答{'不变' if answer_of(later) == answer_of(run) else '变了'}")
+          and waited is not None and waited < 19 and took < 30 and forwarded and answer_of(later) == answer_of(run),
+          f"{'' if forwarded else '迟到的应答没有等到；'}状态 {run.get('status')}，工具结果 {(res or [''])[0][:160]!r}，search 发出到结果回到模型 {waited and round(waited, 1)} 秒，run {round(took, 1)} 秒，迟到后回答{'不变' if answer_of(later) == answer_of(run) else '变了'}")
 
-    _, (c, craw, at), run, _ = held(d, lambda rid: d.call("POST", f"/api/v1/runs/{rid}/cancel")[::2] + (time.time(),))
+    (c, craw, at), run, _, note = held(d, lambda rid: d.call("POST", f"/api/v1/runs/{rid}/cancel")[::2] + (time.time(),))
     after = [op for t, op in SEEN if t > at]
     asked = sum(1 for r in DUMPS if r.get("tools"))
-    check("N6", "取消：检索还在路上时取消 run，run 终态 cancelled，之后不再有 Knowledge 调用，模型不再被调用",
-          c in (200, 202, 204) and run.get("status") == "cancelled" and not after and asked == 1,
-          f"cancel {c} {craw[:60]}，状态 {run.get('status')}，取消后代理收到 {after}，带工具的模型请求 {asked} 次")
+    check("N6", "取消：检索还在路上时取消 run，run 终态 cancelled，之后（等到被压住的 search 转发完）不再有 Knowledge 调用，模型不再被调用",
+          not note and c in (200, 202, 204) and run.get("status") == "cancelled" and not after and asked == 1,
+          f"{note}cancel {c} {craw[:60]}，状态 {run.get('status')}，取消后代理收到 {after}，带工具的模型请求 {asked} 次")
 
     run, res, _ = broken(d, {"read": ("tag",)}, f"M5-READ {hit.get('knowledge_id')} {hit.get('chunk_id')} {hit.get('content_tag')}")
     check("N7", "stale：按引用读回时这一块已经变了（代理改了期望的 content_tag），工具结果 stale，没有正文",
@@ -661,25 +681,28 @@ def cases(d, lib, real, via):
 
     old, new = lib["key"], retrieve_key(lib)
     run, res, _ = broken(d, {"search": ("revoke", old)}, f"{MARKER} {QUESTION}")
-    denied = (res or [""])[0]
+    denied, up1 = (res or [""])[0], list(UPSTREAM)
     s, _, r = d.host("PUT", "/credential", {"kind": "api_key", "value": new, "expires_at": int(time.time()) + 3600})
     run2, res2, _ = broken(d, {"search": ("revoke", old)}, f"{MARKER} {QUESTION}")
+    up2 = list(UPSTREAM)
     # The fork answers an unknown key with a body that is no error envelope, which
     # the daemon takes as `unavailable` (`incompatible`); with the envelope it is `unauthorized`.
-    check("N10", "撤权：WeKnora 拒收旧 key，工具结果被拒（unauthorized，或 401 不带信封时的 unavailable）、没有证据；推入新 key 后同样的检索恢复",
-          code_of(denied) in ("unauthorized", "unavailable") and not evidence_of(denied) and s == 204
-          and any(has_fact(h.get("snippet", "")) for h in evidence_of((res2 or [""])[0])),
-          f"旧 key：{denied[:160]!r}；PUT credential {s} {r[:60]}；新 key：{(res2 or [''])[0][:120]!r}")
+    why = refusal_of(denied)
+    check("N10", "撤权：代理拦下旧 key、WeKnora 回 401/403，工具结果是凭据被拒（unauthorized，或 401 不带信封时的 unavailable/incompatible）、没有证据；推入新 key 后同样的检索恢复",
+          (why.get("code") == "unauthorized" or (why.get("code"), why.get("reason")) == ("unavailable", "incompatible"))
+          and not evidence_of(denied) and any(sw and st in (401, 403) for _, sw, st in up1) and s == 204
+          and not any(sw for _, sw, _ in up2) and any(has_fact(h.get("snippet", "")) for h in evidence_of((res2 or [""])[0])),
+          f"旧 key：代理转发 {up1}（op、换了 key、上游状态码），工具结果 {denied[:160]!r}；PUT credential {s} {r[:60]}；新 key：代理转发 {up2}，{(res2 or [''])[0][:120]!r}")
     FAULT.clear()
 
-    _, (s, r), run, later = held(d, lambda rid: d.host("DELETE")[::2])
+    (s, r), run, later, note = held(d, lambda rid: d.host("DELETE")[::2])
     res = tool_results(DUMPS)
     s2, run2, raw2 = d.ask(f"{MARKER} {QUESTION}", BINDING)
     check("N9", "在途 Off：检索还在路上时 DELETE 绑定，这一轮工具结果作废（knowledge_call_superseded）、没有证据，迟到的应答不改结果；之后指名它的新 run 409",
-          s == 204 and run.get("status") == "completed" and code_of((res or [""])[0]) == "knowledge_call_superseded"
+          not note and s == 204 and run.get("status") == "completed" and code_of((res or [""])[0]) == "knowledge_call_superseded"
           and not evidence_of((res or [""])[0]) and answer_of(later) == answer_of(run)
           and run2 is None and s2 == 409 and "knowledge_binding_inactive" in raw2,
-          f"DELETE {s} {r[:40]}，状态 {run.get('status')}，工具结果 {(res or [''])[0][:160]!r}，迟到后回答{'不变' if answer_of(later) == answer_of(run) else '变了'}；新 run {s2} {raw2[:100]}")
+          f"{note}DELETE {s} {r[:40]}，状态 {run.get('status')}，工具结果 {(res or [''])[0][:160]!r}，迟到后回答{'不变' if answer_of(later) == answer_of(run) else '变了'}；新 run {s2} {raw2[:100]}")
 
     d.host("PUT", body=endpoint)
     d.host("PUT", "/credential", {"kind": "api_key", "value": new, "expires_at": int(time.time()) + 3600})
