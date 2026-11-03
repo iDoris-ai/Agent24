@@ -11,6 +11,9 @@ import { BackendManager, daemonAuthMode, daemonConnection, onDaemonReady, setBun
 import { PresencePoller, defaultPresenceDeps, showPresenceDialog } from './presence-poller'
 import { AgentEarEventBridge } from './agentear-events'
 import { documentsEvent } from './documents'
+import { cliBinary } from './documents-cli'
+import { bundledModuleOutcome, ensureBundledDocumentsModule, execCli, packagesRootFor, recordOutcome } from './documents-module'
+import { tryDataDir } from './data-dir'
 import { AgentEarEventLog } from './agentear-log'
 import { ModelCallLog } from './model-call-log'
 import { IpcChannels } from '../shared/ipc-types'
@@ -325,7 +328,22 @@ app.whenReady().then(async () => {
   // deciding to reuse vs. spawn) — nothing here awaits it; tray/IPC callers
   // read `backendManager.status()` / `getBackendEndpoint()` live, so this
   // resolving a beat later than the old synchronous spawn is harmless.
-  void backendManager.start()
+  //
+  // T1-1 (#1159 Q1 = A): the documents module the mac app carries is
+  // installed first, so the daemon this start spawns mounts it. Never throws;
+  // a failure is a warning and the daemon starts all the same.
+  void ensureBundledDocumentsModule({
+    bundleDir: app.isPackaged && process.platform === 'darwin'
+      ? path.join(process.resourcesPath, 'documents-module')
+      : null,
+    packagesRoot: packagesRootFor(process.env, tryDataDir()),
+    userDataDir: app.getPath('userData'),
+    runCli: execCli(cliBinary()),
+    warn: (message) => console.warn(message),
+    info: (message) => console.log(message),
+  })
+    .then(recordOutcome)
+    .finally(() => void backendManager.start())
   // CORE-2 AgentEar S3: native confirmation for elevated operations. Idle until
   // the daemon runs in capabilities mode (main then holds the ProductHost
   // token); a daemon without the routes answers 404 and is re-checked rarely.
@@ -362,7 +380,17 @@ app.whenReady().then(async () => {
     })
   })
 
-  registerIpcHandlers({ guard, knowledge: () => knowledge })
+  registerIpcHandlers({
+    guard,
+    knowledge: () => knowledge,
+    // T1-1, §9 Q2: installed this launch, but the daemon is one started
+    // outside the app, which reads installed packages only when it starts.
+    documentsModule: () => {
+      const outcome = bundledModuleOutcome()
+      const changed = outcome === 'installed' || outcome === 'upgraded'
+      return { restartRequired: changed && backendManager.externalDaemonPid() !== null }
+    },
+  })
   cliTool = registerCliTool({
     guard, executable: process.execPath, resources: process.resourcesPath, packaged: app.isPackaged,
     changed: refreshTray,

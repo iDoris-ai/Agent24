@@ -45,6 +45,17 @@ export default function DocumentsPage() {
   const [capsMissing, setCapsMissing] = useState(false)
   const [listMissing, setListMissing] = useState(false)
   const notInstalled = capsMissing || listMissing
+  // T1-1 (§9 Q2): the app installed the module this launch, but the daemon
+  // was started outside it and mounts modules only when it starts.
+  const [restartRequired, setRestartRequired] = useState(false)
+  useEffect(() => {
+    if (!notInstalled) return
+    let live = true
+    api.moduleStatus?.()
+      .then((s) => { if (live) setRestartRequired(s.restartRequired === true) })
+      .catch(() => {})
+    return () => { live = false }
+  }, [api, notInstalled])
   const [open, setOpen] = useState<string | null>(null)
   // The title that opened the details, given focus back when they close;
   // the page's title if a reload has since taken its row away (a document
@@ -133,11 +144,19 @@ export default function DocumentsPage() {
       </div>
       <p style={{ color: 'var(--muted)', fontSize: 12 }}>{t('subtitle')}</p>
       {notInstalled && (
-        <div role="status" style={NOTE}>
-          <div>{t('notInstalled.title')}</div>
-          <div>{t('notInstalled.guide')}</div>
-          <code>{t('notInstalled.command')}</code>
-        </div>
+        restartRequired ? (
+          <div role="status" style={NOTE}>
+            <div>{t('restart.title')}</div>
+            <div>{t('restart.guide')}</div>
+            <code>{t('restart.command')}</code>
+          </div>
+        ) : (
+          <div role="status" style={NOTE}>
+            <div>{t('notInstalled.title')}</div>
+            <div>{t('notInstalled.guide')}</div>
+            <code>{t('notInstalled.command')}</code>
+          </div>
+        )
       )}
       {unavailable && (
         <div role="alert" style={ALERT}>
