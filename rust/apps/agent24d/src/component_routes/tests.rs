@@ -9,6 +9,9 @@ use crate::server::{build_router, tests as server_tests};
 use axum::http::{Method, header};
 use http_body_util::BodyExt;
 use serde_json::json;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 async fn call(
@@ -508,8 +511,15 @@ fn attached_entries_named_like_a_builtin_component_are_not_listed() {
         "documents",
         "idoris",
     ]
-    .map(|n| (n.to_owned(), false, Some(DrainState::Running)))
-    .to_vec();
+    .into_iter()
+    .map(|n| crate::attach_registry::AttachSnap {
+        name: n.to_owned(),
+        version: String::new(),
+        disabled: false,
+        drain: Some(DrainState::Running),
+        mismatch: None,
+    })
+    .collect();
     let items = attach_items_from(modules);
     let ids: Vec<_> = items.iter().map(|i| i.id.as_str()).collect();
     assert_eq!(
@@ -995,6 +1005,367 @@ async fn registry_lists_every_capability_id_the_components_emit() {
             "GET /components provides {id}, which is neither registered nor mcp-<server>"
         );
     }
+}
+
+// ---- ADR-038 C4: AgentEar on GET /api/v1/components, through the real route ----
+
+const LEGACY: &str = "testtoken";
+const MANIFEST: &str = "\
+name: agentear
+version: \"0.26.1\"
+route_namespace: /api/v1/agentear
+event_module: agentear
+data_dir: ~/.agent24/os/agentear/
+impl_kind: attached_process
+kernel_capabilities: [events]
+host_commands: [speak]
+";
+
+struct Ear {
+    state: crate::server::AppState,
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+    token: String,
+    digest: String,
+}
+
+struct Link {
+    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    writer: tokio::net::unix::OwnedWriteHalf,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Ear {
+    fn apply(&mut self, outcome: crate::attached::RegisterOutcome) {
+        let response = match outcome {
+            crate::attached::RegisterOutcome::Created(response)
+            | crate::attached::RegisterOutcome::Rotated { response, .. } => response,
+        };
+        self.token = response.token;
+        self.digest = response.manifest_digest;
+    }
+
+    fn rotate(&mut self) {
+        let registry = std::sync::Arc::clone(&self.state.attach_registry);
+        let outcome = crate::attached::register(
+            &self.path,
+            MANIFEST,
+            false,
+            |_| false,
+            |change| {
+                registry.on_change(change);
+            },
+        )
+        .unwrap();
+        self.apply(outcome);
+    }
+
+    fn set_disabled(&self, disabled: bool) {
+        let registry = std::sync::Arc::clone(&self.state.attach_registry);
+        let found = crate::attached::set_disabled(&self.path, "agentear", disabled, |change| {
+            registry.on_change(change);
+        })
+        .unwrap();
+        assert!(found);
+    }
+}
+
+async fn ear() -> Ear {
+    let state = server_tests::state().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("attached.json");
+    let registry = std::sync::Arc::clone(&state.attach_registry);
+    let outcome = crate::attached::register(
+        &path,
+        MANIFEST,
+        false,
+        |_| false,
+        |change| {
+            registry.on_change(change);
+        },
+    )
+    .unwrap();
+    let mut ear = Ear {
+        state,
+        _dir: dir,
+        path,
+        token: String::new(),
+        digest: String::new(),
+    };
+    ear.apply(outcome);
+    ear
+}
+
+async fn components(state: &crate::server::AppState) -> Value {
+    let app = build_router(state.clone());
+    let (status, body) = call(&app, Method::GET, GET, Some(LEGACY), "").await;
+    assert_eq!(status, StatusCode::OK);
+    body
+}
+
+async fn speak(state: &crate::server::AppState) -> (StatusCode, Value) {
+    let app = build_router(state.clone());
+    call(
+        &app,
+        Method::POST,
+        "/api/v1/os/agentear/commands/speak",
+        Some(LEGACY),
+        r#"{"text":"hi"}"#,
+    )
+    .await
+}
+
+fn assert_agentear(body: &Value, state: &str) -> Value {
+    let item = find(body, "agentear").clone();
+    assert_eq!(item["id"], "agentear");
+    assert_eq!(item["form"], "attach");
+    assert_eq!(item["version"], "0.26.1");
+    assert_eq!(item["provides"], json!([]));
+    assert_eq!(item["state"], state);
+    for banned in ["absent", "installing", "installed"] {
+        assert_ne!(item["state"], banned);
+    }
+    item
+}
+
+async fn open(ear: &Ear, versions: Option<Value>) -> Link {
+    let (kernel, mut module) = UnixStream::pair().unwrap();
+    let registry = std::sync::Arc::clone(&ear.state.attach_registry);
+    let task = tokio::spawn(async move {
+        crate::attach_listener::handle_connection(kernel, &registry, CancellationToken::new())
+            .await;
+    });
+    let mut params = json!({
+        "module": "agentear",
+        "manifest_digest": ear.digest,
+        "auth_token": ear.token,
+        "capabilities": ["events"],
+    });
+    if let Some(versions) = versions {
+        params["protocol_versions"] = versions;
+    }
+    let mut frame = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": "1",
+        "method": "initialize",
+        "params": params,
+    }))
+    .unwrap();
+    frame.push(b'\n');
+    module.write_all(&frame).await.unwrap();
+    let (read, writer) = module.into_split();
+    Link {
+        reader: BufReader::new(read),
+        writer,
+        task,
+    }
+}
+
+async fn next_frame(link: &mut Link) -> Option<Value> {
+    let mut line = String::new();
+    let n = link.reader.read_line(&mut line).await.unwrap();
+    if n == 0 {
+        None
+    } else {
+        Some(serde_json::from_str(line.trim()).unwrap())
+    }
+}
+
+impl Link {
+    async fn finish(mut self) {
+        let _ = self.writer.shutdown().await;
+        drop(self.reader);
+        match tokio::time::timeout(Duration::from_secs(2), self.task).await {
+            Ok(Ok(())) => {}
+            other => panic!("attach connection did not end: {other:?}"),
+        }
+    }
+
+    async fn reply(&mut self, frame: &Value) {
+        let mut line = serde_json::to_vec(frame).unwrap();
+        line.push(b'\n');
+        self.writer.write_all(&line).await.unwrap();
+    }
+}
+
+async fn handshake(ear: &Ear) -> Link {
+    let mut link = open(ear, Some(json!({"min": 1, "max": 1}))).await;
+    let ok = next_frame(&mut link).await.unwrap();
+    assert!(ok.get("result").is_some(), "handshake refused: {ok}");
+    assert!(ok.get("error").is_none(), "{ok}");
+    link
+}
+
+/// D5 attach subset, through register + the real listener + `GET /components`.
+/// Not connected is `stopped`; a finished handshake is `ready`; dropping the
+/// connection (the generation is revoked) is `stopped` again. A second
+/// connection that fails the range check does not cover the live one.
+#[tokio::test]
+async fn agentear_lists_stopped_ready_and_stopped_again() {
+    let ear = ear().await;
+    let item = assert_agentear(&components(&ear.state).await, "stopped");
+    assert!(item.get("reason").is_none());
+    assert!(item.get("detail").is_none());
+
+    let live = handshake(&ear).await;
+    let item = assert_agentear(&components(&ear.state).await, "ready");
+    assert!(item.get("reason").is_none());
+
+    let mut second = open(&ear, Some(json!({"min": 0, "max": 0}))).await;
+    let err = next_frame(&mut second).await.unwrap();
+    assert_eq!(err["error"]["data"]["kind"], "version_mismatch");
+    assert!(next_frame(&mut second).await.is_none(), "{err}");
+    second.finish().await;
+    assert_agentear(&components(&ear.state).await, "ready");
+
+    live.finish().await;
+    let item = assert_agentear(&components(&ear.state).await, "stopped");
+    assert_ne!(item["state"], "stopping");
+    assert_ne!(item["reason"], "component_contract_mismatch");
+}
+
+/// §3 case 2. The peer's protocol range does not overlap (both directions,
+/// and a missing range). State becomes `incompatible`, the wire error stays
+/// `version_mismatch`, and the socket closes with no business frame. A
+/// command route answers `503` and does not retry. Disable wins over the
+/// mismatch. A later good handshake, and a re-registration, clear it.
+#[tokio::test]
+async fn adr038_case2_protocol_mismatch_is_incompatible_and_sends_no_call() {
+    let mut ear = ear().await;
+    let hi = agent24_domain::DAEMON_PROTOCOL_VERSION + 1;
+    let expected = agent24_os_proto::version::kernel_range().to_string();
+    let cases = [
+        (Some(json!({"min": 0, "max": 0})), "[0, 0]".to_owned()),
+        (Some(json!({"min": hi, "max": hi})), format!("[{hi}, {hi}]")),
+        (None, "not_declared".to_owned()),
+    ];
+    for (versions, actual) in cases {
+        let mut link = open(&ear, versions).await;
+        let err = next_frame(&mut link).await.unwrap();
+        assert_eq!(err["error"]["data"]["kind"], "version_mismatch", "{err}");
+        assert!(
+            next_frame(&mut link).await.is_none(),
+            "a business frame followed the handshake error: {err}"
+        );
+        link.finish().await;
+        let item = assert_agentear(&components(&ear.state).await, "incompatible");
+        assert_eq!(item["reason"], "component_contract_mismatch");
+        assert_eq!(item["detail"]["id"], "agentear");
+        assert_eq!(item["detail"]["expected"], expected);
+        assert_eq!(item["detail"]["actual"], actual);
+        let (status, body) = speak(&ear.state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "module_not_ready");
+    }
+
+    ear.set_disabled(true);
+    let item = assert_agentear(&components(&ear.state).await, "stopped");
+    assert_eq!(item["reason"], "disabled");
+    assert!(item.get("detail").is_none());
+    ear.set_disabled(false);
+    assert_agentear(&components(&ear.state).await, "incompatible");
+
+    let live = handshake(&ear).await;
+    assert_agentear(&components(&ear.state).await, "ready");
+    live.finish().await;
+    let item = assert_agentear(&components(&ear.state).await, "stopped");
+    assert!(item.get("reason").is_none(), "{item}");
+
+    let mut again = open(&ear, Some(json!({"min": 0, "max": 0}))).await;
+    let err = next_frame(&mut again).await.unwrap();
+    assert_eq!(err["error"]["data"]["kind"], "version_mismatch");
+    again.finish().await;
+    assert_agentear(&components(&ear.state).await, "incompatible");
+    ear.rotate();
+    let item = assert_agentear(&components(&ear.state).await, "stopped");
+    assert!(item.get("reason").is_none(), "{item}");
+}
+
+/// A range that already negotiated must not leave an earlier mismatch in
+/// place when `commit` refuses because the module is disabled. Re-enabling
+/// then shows `stopped`, with no `component_contract_mismatch`.
+#[tokio::test]
+async fn a_legal_handshake_while_disabled_clears_the_contract_mismatch() {
+    let ear = ear().await;
+    let mut bad = open(&ear, Some(json!({"min": 0, "max": 0}))).await;
+    let err = next_frame(&mut bad).await.unwrap();
+    assert_eq!(err["error"]["data"]["kind"], "version_mismatch", "{err}");
+    bad.finish().await;
+    let item = assert_agentear(&components(&ear.state).await, "incompatible");
+    assert_eq!(item["reason"], "component_contract_mismatch");
+
+    ear.set_disabled(true);
+    let mut legal = open(&ear, Some(json!({"min": 1, "max": 1}))).await;
+    let err = next_frame(&mut legal).await.unwrap();
+    assert_eq!(err["error"]["data"]["kind"], "forbidden", "{err}");
+    assert!(
+        next_frame(&mut legal).await.is_none(),
+        "a business frame followed forbidden: {err}"
+    );
+    legal.finish().await;
+
+    ear.set_disabled(false);
+    let item = assert_agentear(&components(&ear.state).await, "stopped");
+    assert_ne!(item["reason"], "component_contract_mismatch");
+    assert!(item.get("reason").is_none(), "{item}");
+    assert!(item.get("detail").is_none(), "{item}");
+}
+
+/// §3 case 3. Unknown fields in the module's command result (and an extra
+/// envelope field) are ignored. The call succeeds and the component stays
+/// `ready`.
+#[tokio::test]
+async fn adr038_case3_unknown_fields_in_the_command_result_still_work() {
+    let ear = ear().await;
+    let mut link = handshake(&ear).await;
+    let state = ear.state.clone();
+    let http = tokio::spawn(async move { speak(&state).await });
+    let invoke = next_frame(&mut link).await.unwrap();
+    assert_eq!(invoke["method"], "_a24/command/invoke", "{invoke}");
+    link.reply(&json!({
+        "jsonrpc": "2.0",
+        "id": invoke["id"],
+        "result": {"accepted": true, "future_field": 1},
+        "vendor": "x",
+    }))
+    .await;
+    let (status, body) = http.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["accepted"], true);
+    assert_eq!(body["result"]["future_field"], 1);
+    assert_agentear(&components(&ear.state).await, "ready");
+    link.finish().await;
+}
+
+/// §3 case 4, JSON-RPC binding (D6): one invoke, then one `$/cancelRequest`
+/// notification, no retry. The call is `504 timeout` and the component stays
+/// `ready` — the outcome is unknown, not `failed`.
+#[tokio::test]
+async fn adr038_case4_timeout_sends_cancel_and_does_not_retry() {
+    let ear = ear().await;
+    let mut link = handshake(&ear).await;
+    let state = ear.state.clone();
+    let http = tokio::spawn(async move { speak(&state).await });
+    let invoke = next_frame(&mut link).await.unwrap();
+    assert_eq!(invoke["method"], "_a24/command/invoke", "{invoke}");
+    let cancel = tokio::time::timeout(Duration::from_secs(8), next_frame(&mut link))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancel["method"], "$/cancelRequest", "{cancel}");
+    assert!(
+        cancel.get("id").is_none(),
+        "cancel is a notification: {cancel}"
+    );
+    assert_eq!(cancel["params"]["id"], invoke["id"]);
+    let extra = tokio::time::timeout(Duration::from_millis(300), next_frame(&mut link)).await;
+    assert!(extra.is_err(), "a second frame was written: {extra:?}");
+    let (status, body) = http.await.unwrap();
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert_eq!(body["error"]["code"], "timeout");
+    assert_agentear(&components(&ear.state).await, "ready");
+    link.finish().await;
+    assert_agentear(&components(&ear.state).await, "stopped");
 }
 
 /// DOC-1-06b §3.1, the seven tools `POST /_a24/tools/{op}` actually dispatches.
