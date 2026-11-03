@@ -32,9 +32,9 @@ MCP server 来自用户的 `~/.agent24/mcp.json`，没有锁，不进上表（AD
 1. 把 server 名变成小写。
 2. 不是 `[a-z0-9-]` 的字符换成 `-`。
 3. 去掉首尾的 `-`。
-4. 剩下的一段叫 body。body 为空，或长于 28，就不是合法 id：组件记为 `failed` / `invalid_capability_id`，不出现在 `provides` 里。组件 id 用 `mcp-bad-` 加一个稳定的 8 位十六进制，避免和合法 id 抢同一个名字。
+4. 剩下的一段叫 body。body 为空，或长于 28，就不是合法 id：组件记为 `failed` / `invalid_capability_id`，不出现在 `provides` 里。组件 id 用 `mcp-bad-` 加一个稳定的 8 位十六进制，避免和合法 id 抢同一个名字。这个备用 id 也占住名字：后面再出现同名的合法 id，按重复处理。
 5. 否则能力 id 是 `mcp-` 接上 body。组件 id 与能力 id 相同。每个 server 只提供这一项能力。
-6. 两个 server 规范化成同一个 id 时，先出现的保留该 id；后一个是 `failed` / `duplicate_capability_id`，不提供能力，也不去连接。
+6. 两个 server 规范化成同一个 id 时，按 `mcp.json` 里的键序，先写的保留该 id；后一个是 `failed` / `duplicate_capability_id`，不提供能力，也不去连接。不按字典序。
 
 `provides[].tools` 是现有的限定名 `mcp_{server}_{tool}`，来自该 server 的 `tools/list`。工具名不改。还没拿到列表（关掉、启动失败、名字不合法）时 tools 为空。启动成功之后进程自己退出，列表保留，状态改掉。
 
@@ -43,10 +43,10 @@ D5 只用 MCP 子集：`installed / starting / ready / failed / stopped`。这�
 | 发生了什么 | 状态 | `reason`（只给 host） |
 | --- | --- | --- |
 | `enabled: false` | `stopped` | `disabled` |
-| 启动超时，或总预算用完 | `failed` | `start_timeout` |
+| 启动超时，或总预算用完，且取消令牌没有触发 | `failed` | `start_timeout` |
 | 进程起不来 | `failed` | `spawn_failed` |
 | 握手或 `tools/list` 失败 | `failed` | `handshake_failed` |
 | 已经 `ready`（或仍在 `starting`）时进程自己退出 | `failed` | `process_exited` |
-| 本进程取消它（daemon 关闭） | `stopped` | `stopped` |
+| 本进程取消它（daemon 关闭，或取消发生在握手、`tools/list`） | `stopped` | `stopped` |
 
 `protocolVersion` 只记在 host 的 `detail` 里，不比较 major.minor（D3 对 MCP 不适用）。`reason` 里不放路径。配置文件解析失败则整份忽略，不产生组件行。

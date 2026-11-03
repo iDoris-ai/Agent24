@@ -339,8 +339,15 @@ pub async fn connect_and_build_tools(
     spec: &McpServerSpec,
     cancel: CancellationToken,
 ) -> Result<(Arc<McpServer>, Vec<Arc<dyn Tool>>), McpError> {
-    let server = Arc::new(McpServer::connect(spec, cancel).await?);
-    let listed = server.list_tools().await?;
+    let server = Arc::new(McpServer::connect(spec, cancel.clone()).await?);
+    // `list_all_tools` does not watch the token. Without this select, a daemon
+    // shutdown during `tools/list` waits out the connect budget and is recorded
+    // as a start timeout.
+    let listed = tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(McpError::Cancelled),
+        listed = server.list_tools() => listed,
+    }?;
     let tools: Vec<Arc<dyn Tool>> = listed
         .iter()
         .map(|t| Arc::new(McpTool::new(Arc::clone(&server), t)) as Arc<dyn Tool>)

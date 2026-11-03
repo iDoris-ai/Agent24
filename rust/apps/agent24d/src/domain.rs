@@ -1168,7 +1168,9 @@ pub async fn mount_all(
             Build::InProcess(_) => None,
         };
 
-        let refuse = |why: String, reports: &mut Vec<MountReport>| {
+        let refuse = |why: String,
+                      d9: Option<crate::component_manifest::OsD9>,
+                      reports: &mut Vec<MountReport>| {
             tracing::error!("domain OS {name:?} not mounted: {why}");
             reports.push(MountReport {
                 name: name.clone(),
@@ -1182,7 +1184,7 @@ pub async fn mount_all(
                 // Both hold nothing, which is what this field means.)
                 granted: Vec::new(),
                 resources: ResourceStatus::NotChecked,
-                d9: catalogue_d9.clone(),
+                d9,
             });
         };
 
@@ -1195,6 +1197,7 @@ pub async fn mount_all(
                 "the catalogue entry has an empty version; a manifest could not \
                  declare one, and this identity is reported as if it had"
                     .to_owned(),
+                catalogue_d9.clone(),
                 &mut reports,
             );
             continue;
@@ -1205,6 +1208,7 @@ pub async fn mount_all(
                     "the catalogue entry {name:?} is not a usable module name; it \
                      cannot be routed or given a directory"
                 ),
+                catalogue_d9.clone(),
                 &mut reports,
             );
             continue;
@@ -1218,6 +1222,7 @@ pub async fn mount_all(
         if !claimed.insert(name.clone()) {
             refuse(
                 format!("another module already claims the name {name:?}"),
+                catalogue_d9.clone(),
                 &mut reports,
             );
             continue;
@@ -1234,12 +1239,17 @@ pub async fn mount_all(
                     "the name {name:?} is a kernel route segment; mounting it would \
                      panic the daemon on an overlapping route"
                 ),
+                catalogue_d9.clone(),
                 &mut reports,
             );
             continue;
         }
         if attached_names.contains(&name) {
-            refuse("registered as an attached module".to_owned(), &mut reports);
+            refuse(
+                "registered as an attached module".to_owned(),
+                catalogue_d9.clone(),
+                &mut reports,
+            );
             continue;
         }
 
@@ -1336,6 +1346,10 @@ pub async fn mount_all(
         };
 
         let manifest = module.manifest();
+        // Construction succeeded, so the list is known even though the module is
+        // about to be refused. `catalogue_d9` is still `None` for an in-process
+        // entry: that value is only for refusals that happen before `build()`.
+        let manifest_d9 = Some(crate::component_manifest::OsD9::from_manifest(manifest));
         // The catalogue named it before it existed, so the two can disagree — and a
         // module whose manifest claims a DIFFERENT name would be routed under one
         // identity while emitting events under another.
@@ -1345,6 +1359,7 @@ pub async fn mount_all(
                     "the catalogue lists it as {name:?} but its manifest says {:?}",
                     manifest.name()
                 ),
+                manifest_d9.clone(),
                 &mut reports,
             );
             continue;
@@ -1359,6 +1374,7 @@ pub async fn mount_all(
                      manifest says {:?}",
                     manifest.version()
                 ),
+                manifest_d9.clone(),
                 &mut reports,
             );
             continue;
@@ -1370,6 +1386,7 @@ pub async fn mount_all(
                 "a compiled-in module's manifest declares an out-of-process \
                  provider; out-of-process modules are installed as packages"
                     .to_owned(),
+                manifest_d9,
                 &mut reports,
             );
             continue;
@@ -3427,6 +3444,17 @@ raise SystemExit(3)
         let (app, reports) = mount(&[entry(m.clone())], tmp.path(), &hub).await;
 
         assert!(matches!(reports[0].outcome, MountOutcome::Refused(_)));
+        let d9 = reports[0]
+            .d9
+            .as_ref()
+            .expect("refusal after construction still carries the manifest list");
+        assert_eq!(d9.name, "remote");
+        assert!(
+            !d9.in_process,
+            "the manifest declared an out-of-process provider"
+        );
+        assert!(d9.provides.is_empty());
+        assert_eq!(d9.requires_kernel, vec!["events".to_owned()]);
         assert!(m.opened().is_none());
         assert_eq!(m.routes_built(), 0);
         assert!(

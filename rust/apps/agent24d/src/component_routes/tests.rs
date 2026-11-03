@@ -856,6 +856,16 @@ async fn registry_lists_every_capability_id_the_components_emit() {
     let markdown = std::fs::read_to_string(&registry_path).unwrap_or_else(|e| {
         panic!("reading {}: {e}", registry_path.display());
     });
+    let adr040 = std::fs::read_to_string(root.join("docs/adr/ADR-040-skill-contract-v1.md"))
+        .unwrap_or_else(|e| panic!("reading ADR-040: {e}"));
+    assert!(
+        !adr040.contains("尚不存在"),
+        "ADR-040 still says REGISTRY.md does not exist"
+    );
+    assert!(
+        adr040.contains("docs/capabilities/REGISTRY.md") && adr040.contains("已由 ADR-038 C7 建立"),
+        "ADR-040 should say the C7 registry exists"
+    );
     let registered = registered_ids(&markdown);
     for id in [
         "model-gateway",

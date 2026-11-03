@@ -50,8 +50,14 @@ const MOUNT_TOTAL_BUDGET: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize, Default)]
 pub struct McpConfig {
-    #[serde(rename = "mcpServers", default)]
-    pub servers: BTreeMap<String, ServerEntry>,
+    /// File order, not `BTreeMap` order. A normalized-id collision keeps the
+    /// server written first in `mcp.json`.
+    #[serde(
+        rename = "mcpServers",
+        default,
+        deserialize_with = "servers_in_file_order"
+    )]
+    pub servers: Vec<(String, ServerEntry)>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +96,37 @@ pub fn config_path() -> Option<PathBuf> {
     agent24_protocol::state_file::state_dir().map(|d| d.join("mcp.json"))
 }
 
+/// `mcpServers` in the order the keys appear in the file.
+///
+/// `serde_json::Map` is a `BTreeMap` in this workspace (`preserve_order` is
+/// off, and `indexmap` is not a dependency). A custom visitor still sees the
+/// parser's order, so the first key written wins a normalized-id collision.
+fn servers_in_file_order<'de, D>(deserializer: D) -> Result<Vec<(String, ServerEntry)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct FileOrder;
+    impl<'de> serde::de::Visitor<'de> for FileOrder {
+        type Value = Vec<(String, ServerEntry)>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an object of MCP servers in file order")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut servers = Vec::with_capacity(map.size_hint().unwrap_or(0));
+            while let Some(entry) = map.next_entry()? {
+                servers.push(entry);
+            }
+            Ok(servers)
+        }
+    }
+    deserializer.deserialize_map(FileOrder)
+}
+
 /// Parse a config. A malformed file is an error the caller reports and skips —
 /// never a reason to fail startup.
 pub fn parse_config(raw: &str) -> Result<McpConfig, String> {
@@ -119,6 +156,7 @@ impl McpConfig {
     }
 
     /// Every configured server, including ones the user switched off.
+    /// Order is the key order of `mcp.json`.
     pub fn targets(&self) -> Vec<McpTarget> {
         self.servers
             .iter()
@@ -290,10 +328,14 @@ pub async fn mount(
                 spec.name
             );
             // A second row must not reuse the first server's component id.
+            // The fallback id is itself a component id: a later legal id with
+            // the same text is a duplicate, not a second connection.
+            let dup_id = fallback_component_id(&spec.name);
+            seen_ids.insert(dup_id.clone());
             roster.push(
                 McpRecord {
                     server: spec.name.clone(),
-                    id: fallback_component_id(&spec.name),
+                    id: dup_id,
                     state: ComponentState::Failed,
                     reason: Some("duplicate_capability_id".to_owned()),
                     capability_id: None,
@@ -340,14 +382,19 @@ pub async fn mount(
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            tracing::error!(
-                "MCP server {} not mounted: total mount budget {MOUNT_TOTAL_BUDGET:?} exhausted",
-                spec.name
-            );
-            roster.push(
-                failed_record(spec, id, capability_id, "start_timeout"),
-                None,
-            );
+            if cancel.is_cancelled() {
+                tracing::info!("MCP server {} not mounted: cancelled", spec.name);
+                roster.push(stopped_record(spec, id, capability_id), None);
+            } else {
+                tracing::error!(
+                    "MCP server {} not mounted: total mount budget {MOUNT_TOTAL_BUDGET:?} exhausted",
+                    spec.name
+                );
+                roster.push(
+                    failed_record(spec, id, capability_id, "start_timeout"),
+                    None,
+                );
+            }
             continue;
         }
         let budget = CONNECT_TIMEOUT.min(remaining);
@@ -398,23 +445,50 @@ pub async fn mount(
                 tools.extend(kept);
             }
             Ok(Err(err)) => {
-                tracing::error!("MCP server {} not mounted: {err}", spec.name);
-                let reason = match err {
-                    McpError::Spawn(_, _) => "spawn_failed",
-                    McpError::Handshake(_, _) => "handshake_failed",
-                    McpError::Call(_) | McpError::Cancelled => "handshake_failed",
+                // Daemon shutdown is `stopped`, including a handshake error that
+                // rmcp reports while the token is already cancelled. `Cancelled`
+                // is its own arm: treating it as a guard on the if makes the
+                // later match arm unreachable under `-D warnings`.
+                let shutdown = server_cancel.is_cancelled();
+                let fail_reason = match &err {
+                    McpError::Cancelled => None,
+                    McpError::Spawn(_, _) => {
+                        if shutdown {
+                            None
+                        } else {
+                            Some("spawn_failed")
+                        }
+                    }
+                    McpError::Handshake(_, _) | McpError::Call(_) => {
+                        if shutdown {
+                            None
+                        } else {
+                            Some("handshake_failed")
+                        }
+                    }
                 };
-                roster.push(failed_record(spec, id, capability_id, reason), None);
+                if let Some(reason) = fail_reason {
+                    tracing::error!("MCP server {} not mounted: {err}", spec.name);
+                    roster.push(failed_record(spec, id, capability_id, reason), None);
+                } else {
+                    tracing::info!("MCP server {} not mounted: cancelled", spec.name);
+                    roster.push(stopped_record(spec, id, capability_id), None);
+                }
             }
             Err(_) => {
-                tracing::error!(
-                    "MCP server {} not mounted: handshake exceeded its {budget:?} budget",
-                    spec.name
-                );
-                roster.push(
-                    failed_record(spec, id, capability_id, "start_timeout"),
-                    None,
-                );
+                if server_cancel.is_cancelled() {
+                    tracing::info!("MCP server {} not mounted: cancelled", spec.name);
+                    roster.push(stopped_record(spec, id, capability_id), None);
+                } else {
+                    tracing::error!(
+                        "MCP server {} not mounted: handshake exceeded its {budget:?} budget",
+                        spec.name
+                    );
+                    roster.push(
+                        failed_record(spec, id, capability_id, "start_timeout"),
+                        None,
+                    );
+                }
             }
         }
     }
@@ -427,10 +501,24 @@ fn failed_record(
     capability_id: Option<String>,
     reason: &str,
 ) -> McpRecord {
+    outcome_record(spec, id, capability_id, ComponentState::Failed, reason)
+}
+
+fn stopped_record(spec: &McpServerSpec, id: String, capability_id: Option<String>) -> McpRecord {
+    outcome_record(spec, id, capability_id, ComponentState::Stopped, "stopped")
+}
+
+fn outcome_record(
+    spec: &McpServerSpec,
+    id: String,
+    capability_id: Option<String>,
+    state: ComponentState,
+    reason: &str,
+) -> McpRecord {
     McpRecord {
         server: spec.name.clone(),
         id,
-        state: ComponentState::Failed,
+        state,
         reason: Some(reason.to_owned()),
         capability_id,
         tools: Vec::new(),
@@ -715,6 +803,36 @@ mod tests {
         assert_ne!(records[0].id, records[1].id);
     }
 
+    /// The duplicate row's `mcp-bad-…` id is claimed. A later server whose legal
+    /// id is that same string does not connect under it.
+    #[tokio::test]
+    async fn a_duplicate_fallback_id_is_claimed_so_a_later_server_cannot_reuse_it() {
+        let second = "Files";
+        let fallback = fallback_component_id(second);
+        let third = fallback.strip_prefix("mcp-").expect("mcp-bad- shape");
+        assert_eq!(mcp_capability_id(third).as_deref(), Some(fallback.as_str()));
+        let targets = vec![
+            target("files", "/definitely/not/a/real/binary", vec![], false),
+            target(second, "/definitely/not/a/real/binary", vec![], true),
+            target(third, "/definitely/not/a/real/binary", vec![], true),
+        ];
+        let (servers, _, roster) = mount(&targets, &CancellationToken::new()).await;
+        assert!(servers.is_empty());
+        let records = roster.records();
+        assert_eq!(records[0].id, "mcp-files");
+        assert_eq!(records[1].id, fallback);
+        assert_eq!(
+            records[1].reason.as_deref(),
+            Some("duplicate_capability_id")
+        );
+        assert_eq!(
+            records[2].reason.as_deref(),
+            Some("duplicate_capability_id")
+        );
+        assert_ne!(records[2].id, records[1].id);
+        assert!(records[2].capability_id.is_none());
+    }
+
     /// One tool, then the process ends itself when `stop` appears. No signal:
     /// a daemon thread watches the file and calls `os._exit`.
     const EXIT_FIXTURE: &str = r#"import json,sys,os,threading,time
@@ -819,6 +937,226 @@ for line in sys.stdin:
         assert_eq!(ended.state, ComponentState::Stopped);
         assert_eq!(ended.reason.as_deref(), Some("stopped"));
         assert_eq!(ended.tools.len(), 2);
+        drop(servers);
+    }
+
+    /// Speaks MCP and writes `argv[1]` to `argv[2]` as soon as the process starts,
+    /// so a test can see which configured server was actually spawned.
+    const MARKER_FIXTURE: &str = r#"import json,sys
+open(sys.argv[2],"w").write(sys.argv[1])
+for line in sys.stdin:
+    try: req=json.loads(line)
+    except Exception: continue
+    ident=req.get("id")
+    if ident is None: continue
+    method=req.get("method")
+    if method=="initialize":
+        result={"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}
+    elif method=="tools/list":
+        result={"tools":[{"name":"echo","description":"e","inputSchema":{"type":"object","properties":{}}}]}
+    else:
+        result={}
+    print(json.dumps({"jsonrpc":"2.0","id":ident,"result":result}), flush=True)
+"#;
+
+    /// Absolute interpreter. `python3` on this machine is a pyenv shim, and the
+    /// MCP child does not inherit the environment that shim needs, so `pyenv exec`
+    /// can sit there until the connect budget expires.
+    fn real_python() -> String {
+        let out = std::process::Command::new("python3")
+            .arg("-c")
+            .arg("import sys; print(sys.executable)")
+            .output()
+            .expect("python3 -c");
+        assert!(
+            out.status.success(),
+            "python3 -c failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .expect("python path")
+            .trim()
+            .to_owned()
+    }
+
+    fn marker_entry(
+        python: &str,
+        script: &Path,
+        name: &str,
+        marker: &Path,
+        enabled: bool,
+    ) -> String {
+        let python = serde_json::to_string(python).unwrap();
+        let script = serde_json::to_string(&script.to_string_lossy().as_ref()).unwrap();
+        let marker = serde_json::to_string(&marker.to_string_lossy().as_ref()).unwrap();
+        let enabled = if enabled {
+            String::new()
+        } else {
+            r#","enabled":false"#.to_owned()
+        };
+        format!(
+            r#""{name}":{{"command":{python},"args":["-u",{script},{script_name},{marker}]{enabled}}}"#,
+            script_name = serde_json::to_string(name).unwrap(),
+        )
+    }
+
+    /// Disabled `Filesystem` written after enabled `filesystem` must connect
+    /// `filesystem`. Swapping the keys connects the other entry's process
+    /// (here: none, because the first key is the disabled one).
+    #[tokio::test]
+    async fn file_order_not_dictionary_order_decides_which_server_connects() {
+        let dir = tempfile::tempdir().unwrap();
+        let python = real_python();
+        let script = dir.path().join("server.py");
+        std::fs::write(&script, MARKER_FIXTURE).unwrap();
+
+        let mount_raw = |raw: String| async move {
+            let cfg = parse_config(&raw).unwrap();
+            let names: Vec<String> = cfg.targets().iter().map(|t| t.spec.name.clone()).collect();
+            let (servers, _, roster) = mount(&cfg.targets(), &CancellationToken::new()).await;
+            let connected: Vec<String> = servers.iter().map(|s| s.name().to_owned()).collect();
+            drop(servers);
+            (names, connected, roster.records())
+        };
+
+        // Marker names must not differ only by case: the volume is case-insensitive.
+        let fs = dir.path().join("ran-lower");
+        let off = dir.path().join("ran-upper");
+        let filesystem_first = format!(
+            r#"{{"mcpServers":{{{a},{b}}}}}"#,
+            a = marker_entry(&python, &script, "filesystem", &fs, true),
+            b = marker_entry(&python, &script, "Filesystem", &off, false),
+        );
+        let cfg = parse_config(&filesystem_first).unwrap();
+        let preview: Vec<_> = cfg
+            .targets()
+            .iter()
+            .map(|t| {
+                (
+                    t.spec.name.clone(),
+                    t.enabled,
+                    t.spec.command.clone(),
+                    t.spec.args.clone(),
+                )
+            })
+            .collect();
+        assert!(
+            preview[0].1 && preview[0].3.len() == 4,
+            "raw={filesystem_first} preview={preview:?}"
+        );
+        let (order, connected, records) = mount_raw(filesystem_first).await;
+        assert_eq!(
+            order,
+            vec!["filesystem".to_owned(), "Filesystem".to_owned()]
+        );
+        assert_eq!(
+            connected,
+            vec!["filesystem".to_owned()],
+            "records={records:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&fs).unwrap(), "filesystem");
+        assert!(!off.exists(), "the disabled server must not be spawned");
+        assert_eq!(records[0].state, ComponentState::Ready);
+        assert_eq!(records[0].server, "filesystem");
+        assert_eq!(
+            records[1].reason.as_deref(),
+            Some("duplicate_capability_id")
+        );
+        assert_eq!(records[1].server, "Filesystem");
+
+        let fs_swapped = dir.path().join("ran-lower-swapped");
+        let off_swapped = dir.path().join("ran-upper-swapped");
+        let disabled_first = format!(
+            r#"{{"mcpServers":{{{a},{b}}}}}"#,
+            a = marker_entry(&python, &script, "Filesystem", &off_swapped, false),
+            b = marker_entry(&python, &script, "filesystem", &fs_swapped, true),
+        );
+        let (order, connected, records) = mount_raw(disabled_first).await;
+        assert_eq!(
+            order,
+            vec!["Filesystem".to_owned(), "filesystem".to_owned()]
+        );
+        assert!(
+            connected.is_empty(),
+            "swapping the keys must not keep spawning filesystem, got {connected:?}"
+        );
+        assert!(!fs_swapped.exists());
+        assert!(!off_swapped.exists());
+        assert_eq!(records[0].server, "Filesystem");
+        assert_eq!(records[0].state, ComponentState::Stopped);
+        assert_eq!(records[0].reason.as_deref(), Some("disabled"));
+        assert_eq!(
+            records[1].reason.as_deref(),
+            Some("duplicate_capability_id")
+        );
+        assert_ne!(connected, vec!["filesystem".to_owned()]);
+    }
+
+    const HANG_ON_LIST_FIXTURE: &str = r#"import json,sys,os,time
+for line in sys.stdin:
+    try: req=json.loads(line)
+    except Exception: continue
+    ident=req.get("id")
+    if ident is None: continue
+    method=req.get("method")
+    if method=="initialize":
+        result={"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}
+    elif method=="tools/list":
+        open(sys.argv[1],"w").write("listed")
+        while True:
+            time.sleep(0.2)
+            if os.getppid() == 1:
+                os._exit(0)
+    else:
+        result={}
+    print(json.dumps({"jsonrpc":"2.0","id":ident,"result":result}), flush=True)
+"#;
+
+    #[tokio::test]
+    async fn cancelling_during_tools_list_is_stopped_not_a_start_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("hang.py");
+        let listed = dir.path().join("listed");
+        std::fs::write(&script, HANG_ON_LIST_FIXTURE).unwrap();
+        let spec = target(
+            "hang",
+            &real_python(),
+            vec![
+                "-u".to_owned(),
+                script.to_string_lossy().into_owned(),
+                listed.to_string_lossy().into_owned(),
+            ],
+            true,
+        );
+        let cancel = CancellationToken::new();
+        let cancel_for_mount = cancel.clone();
+        let mounted =
+            tokio::spawn(
+                async move { mount(std::slice::from_ref(&spec), &cancel_for_mount).await },
+            );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !listed.exists() {
+            if tokio::time::Instant::now() > deadline {
+                panic!("tools/list did not start");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let started = std::time::Instant::now();
+        cancel.cancel();
+        let (servers, _, roster) = tokio::time::timeout(CONNECT_TIMEOUT / 2, mounted)
+            .await
+            .expect("cancel during tools/list waited on the connect budget")
+            .unwrap();
+        assert!(
+            started.elapsed() < CONNECT_TIMEOUT / 2,
+            "cancel during tools/list took {:?}, past half the connect budget",
+            started.elapsed()
+        );
+        assert!(servers.is_empty());
+        let record = &roster.records()[0];
+        assert_eq!(record.state, ComponentState::Stopped);
+        assert_eq!(record.reason.as_deref(), Some("stopped"));
+        assert!(record.tools.is_empty());
         drop(servers);
     }
 }
