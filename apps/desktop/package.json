@@ -109,7 +109,9 @@
       "entitlementsInherit": "build/entitlements.mac.plist",
       "binaries": [
         "Contents/Resources/backend/agent24d",
-        "Contents/Resources/backend/agent24"
+        "Contents/Resources/backend/agent24",
+        "Contents/Resources/documents-module/bin/agent24-documents",
+        "Contents/Resources/documents-module/bin/agent24-documents-pdfkit"
       ],
       "notarize": false
     },
