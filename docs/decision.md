@@ -1,5 +1,7 @@
 # 决策记录（Decision Log）
 
+索引：[架构总入口](architecture/README.md)・[ADR 索引](adr/README.md)
+
 > 本文档记录 Agent24 框架设计中所有关键决策的论证过程、备选方案、决策依据。
 > 格式参考 ADR (Architecture Decision Records)，按时间倒序追加，已采纳的决策不删除（仅在被推翻时标注 Superseded）。
 > 维护者：jhfnetboy + Claude Code | 起始日期：2026-04-27

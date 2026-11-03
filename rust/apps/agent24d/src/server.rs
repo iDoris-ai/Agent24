@@ -28,9 +28,9 @@ fn workspace_recovery_instant_at(
 
 // A shutdown's budgets and deadlines — the HTTP drain's fixed 1.5s, the
 // out-of-process modules' drain and stop grace (tunable: `A24_MODULE_DRAIN_MS`,
-// `A24_MODULE_STOP_GRACE_MS`), the time to put the summary on disk, and the
+// `A24_COMPONENT_STOP_GRACE_MS`), the time to put the summary on disk, and the
 // watchdog after all of them — live in `crate::lifecycle` (SHUT-1b). At the
-// defaults `kill -TERM` ends the process within 2s (TASKS B2).
+// defaults `kill -TERM` ends the process within 16.5s, or about 50.6s while a managed iDoris holds the summary open (ADR-038 D5 raised the stop grace to 15s; TASKS B2's 2s now holds only with a lowered grace).
 
 #[derive(Clone)]
 pub struct AppState {
@@ -56,6 +56,10 @@ pub struct AppState {
     pub router: Arc<ModelRouter>,
     pub idoris_host: Option<Arc<agent24d::idoris_host::IdorisHost>>,
     pub idoris_unavailable: bool,
+    /// Where the Hyphae daemon supervisor lives, once `serve` has one (`/api/v1/components`).
+    pub comm_slot: Option<Arc<crate::comm_routes::CommDaemonSlot>>,
+    /// What the desktop reported about the components it owns (ADR-038 D5).
+    pub component_reports: Arc<crate::component_routes::ComponentReports>,
     pub managed_idoris: Option<Arc<agent24d::managed_idoris::ManagedIdoris>>,
     pub tools: Arc<agent24_tools::ToolRegistry>,
     /// H2: the user's risk overrides. Held here as well as inside the registry
@@ -283,6 +287,20 @@ impl Shutdown {
     #[must_use]
     pub fn child_token(&self) -> CancellationToken {
         self.token.child_token()
+    }
+
+    /// Resolves when in-flight model calls of modules and attached modules must be
+    /// cancelled: the drain plus the per-call cancel grace
+    /// ([`crate::lifecycle::CALL_CANCEL_GRACE`], ADR-038 D6), capped by the stop grace when that
+    /// is shorter and never stretched by it. Attached modules get no SIGTERM, so a 15s stop
+    /// grace must not keep their calls alive. Stored
+    /// instant, like [`Shutdown::modules_cut_off`].
+    pub fn calls_cut_off(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let shutdown = self.clone();
+        async move {
+            shutdown.token.cancelled().await;
+            tokio::time::sleep_until(shutdown.deadlines().calls).await;
+        }
     }
 
     /// Resolves when a module still being stopped by `os disable` must be
@@ -708,6 +726,8 @@ impl AppState {
             managed_idoris: None,
             idoris_host: None,
             idoris_unavailable: false,
+            comm_slot: None,
+            component_reports: Arc::default(),
             tools,
             broker,
             module_approval_broker,
@@ -1013,7 +1033,29 @@ async fn auth(State(state): State<AppState>, req: Request<Body>, next: Next) -> 
     }
 }
 
-/// Single shared token. Does not consult the route catalog or assurance levels.
+/// Routes that only the desktop's ProductHost may call, in any auth mode.
+/// Private-key backup and restore. Export lets the caller choose the password
+/// that encrypts the key, and restore plants a key of the caller's choosing as
+/// one of the user's identities, so a bearer that merely proves "same user, same machine" (the
+/// legacy shared token, any FirstPartyShell or Creative token) must not reach
+/// it: it would let any local process produce a backup it can decrypt.
+fn host_only_route(method: &Method, path: &str) -> bool {
+    method == Method::POST
+        && (matches!(
+            path,
+            "/api/v1/comm/identity/export" | "/api/v1/comm/identity/import"
+        ) || is_component_report(path))
+}
+
+/// `/api/v1/components/{id}/report`: the desktop's status push (ADR-038 D5).
+fn is_component_report(path: &str) -> bool {
+    path.strip_prefix("/api/v1/components/")
+        .and_then(|rest| rest.strip_suffix("/report"))
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// Single shared token. Does not consult the route catalog or assurance levels,
+/// except for [`host_only_route`]s, which are refused outright.
 async fn legacy_auth(state: AppState, req: Request<Body>, next: Next) -> Response {
     let bearer = req
         .headers()
@@ -1023,6 +1065,13 @@ async fn legacy_auth(state: AppState, req: Request<Body>, next: Next) -> Respons
     if bearer
         .is_some_and(|presented| constant_time_eq(presented.as_bytes(), state.token.as_bytes()))
     {
+        if host_only_route(req.method(), req.uri().path()) {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "Operation not allowed in this auth mode",
+            );
+        }
         next.run(req).await
     } else {
         error_response(
@@ -1148,6 +1197,11 @@ async fn authorize(
         crate::capabilities::unix_now(),
     ) {
         Ok(authorization) => {
+            if host_only_route(method, req.uri().path())
+                && authorization.claims.audience != crate::capabilities::Audience::ProductHost
+            {
+                return error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed");
+            }
             // R5: a Creative token that validates still cannot call a route
             // this mapping newly exposed. Resource scope is not this gate.
             if authorization.claims.audience == crate::capabilities::Audience::CreativeRuntime
@@ -1396,6 +1450,11 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
     }
     let kernel = Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/components", get(crate::component_routes::list))
+        .route(
+            "/api/v1/components/{id}/report",
+            post(crate::component_routes::report),
+        )
         .route("/api/v1/idoris/status", get(crate::idoris_routes::status))
         .route(
             "/api/v1/idoris/install",
@@ -1866,6 +1925,12 @@ pub async fn serve(
     let shutdown = Shutdown::with_params(cancel.clone(), params);
     let idoris_root =
         agent24_idoris::install::default_install_root().map_err(std::io::Error::other)?;
+    // ADR-038 D1: releases live under <data dir>/components/idoris; the legacy
+    // root above keeps only state and any not-yet-migrated release.
+    let idoris_install_root = agent24_idoris::install::managed_root(
+        &agent24_protocol::state_file::state_dir()
+            .ok_or_else(|| std::io::Error::other("data directory is unavailable"))?,
+    );
     if !ephemeral {
         shutdown
             .idoris_budget
@@ -2014,6 +2079,30 @@ pub async fn serve(
             (String::new(), Some(store), bearer)
         }
     };
+    // CORE-5 5f-3: a marker or an unfinished upgrade docks here, before any
+    // store, task or listener of the business daemon exists. `ENABLED` is
+    // false, so this is skipped and startup is exactly the code below.
+    if !ephemeral
+        && let Some(dir) = agent24_protocol::state_file::state_dir()
+        && let Some(docking) =
+            crate::docked_startup::pre_start(crate::docked_startup::guard_enabled(), &dir).await
+    {
+        let launch = crate::docked_startup::Launch {
+            data_dir: &dir,
+            port,
+            auth_mode,
+            enroll: mode != StartupMode::Legacy,
+            generation: daemon_generation,
+            capabilities: capability_store,
+            ready: match host_ready.take() {
+                Some(writer) => crate::docked_startup::ReadyOut::Host(writer),
+                None => crate::docked_startup::ReadyOut::Stdout,
+            },
+            shutdown,
+            lock: _singleton,
+        };
+        return crate::docked_startup::serve_docked(launch, docking).await;
+    }
     // Store: file-backed under ~/.agent24 (ephemeral instances get :memory:)
     let store = if ephemeral {
         Store::open_memory().await.map_err(std::io::Error::other)?
@@ -2061,6 +2150,7 @@ pub async fn serve(
     let mut idoris_host = if let Some(managed) = &managed_idoris {
         match agent24d::idoris_host::IdorisHost::system(
             idoris_root,
+            idoris_install_root,
             managed.clone(),
             router.clone(),
         ) {
@@ -2787,7 +2877,7 @@ pub async fn serve(
         let shutdown = shutdown.clone();
         async move {
             shutdown.token().cancelled().await;
-            tokio::time::sleep_until(shutdown.deadlines().modules).await;
+            tokio::time::sleep_until(shutdown.deadlines().calls + crate::lifecycle::CONFIRM).await;
         }
     };
     let (usage_recorder, usage_writer) =
@@ -2802,7 +2892,7 @@ pub async fn serve(
     let model_deps = crate::model_callback::ModelCallbackDeps {
         router: state.router.clone(),
         usage: usage_recorder.clone(),
-        cancel_root: crate::model_callback::spawn_cancel_root(shutdown.modules_cut_off()),
+        cancel_root: crate::model_callback::spawn_cancel_root(shutdown.calls_cut_off()),
         admission: crate::model_callback::ModelAdmission::new(
             crate::model_callback::MODEL_MAX_IN_FLIGHT_GLOBAL,
             crate::model_callback::MODEL_MAX_IN_FLIGHT_PER_MODULE,
@@ -3069,6 +3159,7 @@ pub async fn serve(
     // there was nothing to stop.
     let comm_router =
         crate::comm_routes::build(&state_dir, params.stop_grace, &comm_daemon_slot).await;
+    state.comm_slot = Some(Arc::clone(&comm_daemon_slot));
     if state.auth_mode == AuthMode::Capabilities {
         // Package modules register an ANY-method proxy for their namespace.
         // Bind that registered surface and the exact manifest, not enabled flags.
@@ -3738,7 +3829,7 @@ pub(crate) mod tests {
     /// the module's `Generation` as part of stopping it — design
     /// §3.3's OWN "代次撤销" row, pre-existing `os-proto` machinery that
     /// independently cancels an in-flight model call within tens of
-    /// milliseconds of the SAME `spawn_cancel_root(shutdown.modules_cut_off())`
+    /// milliseconds of the SAME `spawn_cancel_root(shutdown.calls_cut_off())`
     /// cut-off. Measured with a real subprocess module (SIGTERM-ignoring, one
     /// proxied request kept in flight so its own drain doesn't finish early)
     /// and a real hung TCP provider: correct code closes the provider
@@ -3753,7 +3844,7 @@ pub(crate) mod tests {
     /// `shutdown.modules_cut_off()`, e.g. `shutdown.token().cancelled()` to
     /// fire at the START of shutdown instead of at cut-off) — turns it red.
     #[test]
-    fn the_model_callback_cancel_root_is_spawned_from_modules_cut_off() {
+    fn the_model_callback_cancel_root_is_spawned_from_calls_cut_off() {
         // Scoped to `serve()`'s OWN body — never to the whole file, which
         // would make this test tautological (the string above, in this
         // test's own source, would always make a whole-file `.contains`
@@ -3770,9 +3861,9 @@ pub(crate) mod tests {
             .expect("function must be brace-terminated");
         let body = &body[..end];
         assert!(
-            body.contains("spawn_cancel_root(shutdown.modules_cut_off())"),
+            body.contains("spawn_cancel_root(shutdown.calls_cut_off())"),
             "serve() must build ModelCallbackDeps.cancel_root as \
-             spawn_cancel_root(shutdown.modules_cut_off()) — design \
+             spawn_cancel_root(shutdown.calls_cut_off()) — design \
              docs/design/ME4-S2-model-callback.md §3.3"
         );
     }
@@ -4103,6 +4194,12 @@ pub(crate) mod tests {
                 routes.insert(path.to_owned());
             }
         }
+        // CORE-5f-2: the docked router is a second router, scanned the same way.
+        for path in route_literals(include_str!("docked_router.rs"), "pub fn docked_router") {
+            if let Some(path) = path.strip_prefix("/api/v1") {
+                routes.insert(path.to_owned());
+            }
+        }
         assert!(
             routes.len() >= 20,
             "route scan found only {} paths; build_router_with_modules may have changed shape",
@@ -4265,6 +4362,36 @@ pub(crate) mod tests {
         shutdown.modules_cut_off().await;
         let p = crate::lifecycle::Params::default();
         assert_eq!(began.elapsed(), p.drain + p.stop_grace);
+    }
+
+    /// In-flight model calls (and the usage recorder) are cut off at the drain plus the 2s
+    /// call-cancel grace, however long the stop grace is: attached modules get no SIGTERM,
+    /// so the 15s a package gets to flush must not keep their calls alive (ADR-038 D5/D6).
+    #[tokio::test(start_paused = true)]
+    async fn model_calls_are_cut_off_by_the_cancel_grace_not_the_stop_grace() {
+        let shutdown = Shutdown::new(CancellationToken::new());
+        let began = tokio::time::Instant::now();
+        let _ = shutdown.deadlines();
+        shutdown.token().cancel();
+        shutdown.calls_cut_off().await;
+        let p = crate::lifecycle::Params::default();
+        assert_eq!(
+            began.elapsed(),
+            p.drain + crate::lifecycle::CALL_CANCEL_GRACE
+        );
+        assert!(
+            began.elapsed() < p.drain + p.stop_grace,
+            "not the stop grace"
+        );
+        // a stop grace shorter than the cancel grace still ends it first
+        let short = crate::lifecycle::Params {
+            drain: Duration::from_millis(100),
+            stop_grace: Duration::from_millis(500),
+        };
+        assert_eq!(
+            short.deadlines(began).calls - began,
+            Duration::from_millis(600)
+        );
     }
 
     /// The shutdown waits for the stops `os disable` began, not only for the
@@ -4443,6 +4570,151 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             assert_eq!(res.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn key_backup_is_product_host_only_in_capabilities_mode() {
+        let (state, host, creative) = capability_state().await;
+        let modules = Router::new()
+            .route(
+                "/api/v1/comm/identity/export",
+                axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/api/v1/comm/identity/import",
+                axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+            );
+        let app = build_router_with_modules(state, modules);
+        for (uri, bearer, expected) in [
+            (
+                "/api/v1/comm/identity/export",
+                None,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "/api/v1/comm/identity/export",
+                Some(creative.clone()),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "/api/v1/comm/identity/export",
+                Some(host.clone()),
+                StatusCode::NO_CONTENT,
+            ),
+            (
+                "/api/v1/comm/identity/import",
+                None,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "/api/v1/comm/identity/import",
+                Some(creative),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "/api/v1/comm/identity/import",
+                Some(host),
+                StatusCode::NO_CONTENT,
+            ),
+        ] {
+            let mut req = Request::builder().method(Method::POST).uri(uri);
+            if let Some(bearer) = bearer {
+                req = req.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+            }
+            let res = app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn key_backup_is_refused_in_legacy_mode_even_with_the_right_token() {
+        let modules = Router::new()
+            .route(
+                "/api/v1/comm/identity/export",
+                axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/api/v1/comm/identity/import",
+                axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/api/v1/comm/contact",
+                axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+            );
+        let app = build_router_with_modules(state().await, modules);
+        for (uri, expected) in [
+            ("/api/v1/comm/identity/export", StatusCode::FORBIDDEN),
+            ("/api/v1/comm/identity/import", StatusCode::FORBIDDEN),
+            ("/api/v1/comm/contact", StatusCode::NO_CONTENT), // other routes unchanged
+        ] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, "Bearer testtoken")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), expected, "{uri}");
+        }
+    }
+
+    /// Through the REAL comm router (nested exactly as production nests it),
+    /// not a stub handler: the restriction must hold on the actual route.
+    #[tokio::test]
+    async fn key_backup_restriction_holds_on_the_real_comm_router() {
+        // Export names a path; restore carries the backup text itself (the
+        // desktop reads the file, the daemon never opens a caller-named path).
+        let body = |uri: &str| {
+            Body::from(if uri.ends_with("/export") {
+                r#"{"nickname":"a","path":"/tmp/x.ncryptsec","backup_password":"long-enough-1"}"#
+            } else {
+                r#"{"nickname":"a","ncryptsec":"ncryptsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq","backup_password":"long-enough-1"}"#
+            })
+        };
+        for uri in [
+            "/api/v1/comm/identity/export",
+            "/api/v1/comm/identity/import",
+        ] {
+            let post = |bearer: &str| {
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                    .body(body(uri))
+                    .unwrap()
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let slot = Arc::new(crate::comm_routes::CommDaemonSlot::new());
+
+            // legacy mode, correct token: refused
+            let comm =
+                crate::comm_routes::build(dir.path(), Duration::from_millis(500), &slot).await;
+            let legacy = build_router_with_modules(state().await, comm);
+            let res = legacy.oneshot(post("testtoken")).await.unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+            // capabilities mode: Creative refused, ProductHost reaches the handler
+            // (no Hyphae binary here, so it answers its own not_configured)
+            let (state, host, creative) = capability_state().await;
+            let comm =
+                crate::comm_routes::build(dir.path(), Duration::from_millis(500), &slot).await;
+            let app = build_router_with_modules(state, comm);
+            let res = app.clone().oneshot(post(&creative)).await.unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN);
+            let res = app.oneshot(post(&host)).await.unwrap();
+            assert_ne!(res.status(), StatusCode::FORBIDDEN);
+            assert_eq!(res.status(), StatusCode::CONFLICT);
         }
     }
 
@@ -6115,6 +6387,11 @@ pub(crate) mod tests {
         let (state, _host, creative) = capability_state().await;
         let router = router_with_comm(state);
         for policy in crate::capabilities::policies() {
+            // Docked-only routes are not on the business router; the docked
+            // router's own tests cover Creative there.
+            if policy.operation == crate::capabilities::Operation::DiagnosticRead {
+                continue;
+            }
             let path = concrete_path(policy.template);
             let response = router
                 .clone()
@@ -6625,7 +6902,13 @@ pub(crate) mod tests {
     }
 
     fn method_names(expr: &str) -> Vec<&'static str> {
-        const NAMES: &[&str] = &["get", "post", "put", "patch", "delete", "head"];
+        // Every axum method registrar is recognised, so an extra registration
+        // (`.options(..)`, `any(..)`, `on(..)`) shows up as a (method, path) pair
+        // the catalog does not list instead of being skipped.
+        const NAMES: &[&str] = &[
+            "get", "post", "put", "patch", "delete", "head", "options", "trace", "connect", "any",
+            "on",
+        ];
         let mut found = Vec::new();
         let mut index = 0;
         let mut boundary = true;
@@ -6948,6 +7231,12 @@ pub(crate) mod tests {
             reason: "热切换 comm 前缀挂载；runtime_router 的方法清单由目录扫描覆盖",
         },
         AllowedRegistration {
+            file: "apps/agent24d/src/docked_router.rs",
+            form: "fallback",
+            call: ".fallback(not_found)",
+            reason: "停靠 router 的 404：未登记路径一律 not_found，不进 Operation 目录",
+        },
+        AllowedRegistration {
             file: "apps/agent24d/src/domain.rs",
             form: "nest",
             call: "app.nest(namespace, Router::new().fallback(handler.clone()))",
@@ -7031,6 +7320,7 @@ pub(crate) mod tests {
             "crates/agent24-comm/src/router.rs" => "pub fn router(",
             "crates/agent24-comm/src/groupchat.rs" => "pub(crate) fn routes(",
             "apps/agent24d/src/comm_routes.rs" => "fn runtime_router(",
+            "apps/agent24d/src/docked_router.rs" => "pub fn docked_router",
             _ => return None,
         };
         Some(function_span(src, signature))
@@ -7225,6 +7515,15 @@ pub fn build_router_with_modules() {
 
         let mut registered = kernel.clone();
         registered.extend(comm.iter().cloned());
+        // CORE-5f-2: docked-only routes are catalogued but not mounted on the
+        // business router, so they join the catalog comparison, not the 405 sweep.
+        let docked = parsed_routes(
+            source_of(&files, "apps/agent24d/src/docked_router.rs"),
+            "pub fn docked_router",
+            "",
+        );
+        let business = registered.clone();
+        registered.extend(docked.iter().cloned());
         let catalog = crate::capabilities::policies()
             .iter()
             .map(|policy| (policy.method.to_owned(), policy.template.to_owned()))
@@ -7249,7 +7548,7 @@ pub fn build_router_with_modules() {
         let router = router_with_comm(state);
         let trace = Method::from_bytes(b"TRACE").unwrap();
         let mut templates = BTreeSet::new();
-        for (_, template) in &registered {
+        for (_, template) in &business {
             templates.insert(template.clone());
         }
         for template in templates {
@@ -7280,7 +7579,7 @@ pub fn build_router_with_modules() {
                 .split(',')
                 .map(|part| part.trim().to_owned())
                 .collect::<BTreeSet<_>>();
-            let mut expect = registered
+            let mut expect = business
                 .iter()
                 .filter(|(_, path)| path == &template)
                 .map(|(method_name, _)| method_name.clone())

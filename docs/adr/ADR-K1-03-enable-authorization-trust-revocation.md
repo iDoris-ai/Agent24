@@ -1,5 +1,7 @@
 # ADR-K1-03：启用授权、信任与撤销
 
+索引：[架构总入口](../architecture/README.md)・[ADR 索引](README.md)
+
 > **状态**：**Accepted**（2026-10-08 jason 确认；PR-Daemon 已 APPROVE。实现按 PLAN-KERNEL-K1 §4 切片进行，每片仍须 PR-Daemon APPROVE）
 **范围**：Agent24 通用模块内核；Documenting 是首个消费者
 **依据**：`docs/agent/PLAN-KERNEL-K1.md` §2 第 3 条、§4 K1-3；jason 2026-10-07 对 §2 五组问题的裁决

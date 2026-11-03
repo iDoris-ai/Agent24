@@ -24,22 +24,22 @@
 pub mod binary;
 pub mod daemon;
 pub mod error;
+mod export;
 mod groupchat;
 pub mod import;
 pub mod keystore_lock;
 pub mod npub;
 pub mod password;
 pub mod password_store;
-pub mod release;
 mod restart_policy;
 pub mod router;
 pub mod runner;
 
-pub use binary::{BinaryError, HyphaeLock, Sha256Digest, VerifiedBinary, current_platform};
+pub use binary::{BinaryError, HYPHAE_LOCK_JSON, Sha256Digest, VerifiedBinary, current_platform};
 pub use daemon::{
     CatchUpStatus, Ctx as DaemonCtx, DaemonShutdownOutcome, DaemonStartError, DaemonStatus,
     HyphaeDaemonSupervisor, OrphanOutcome, READY_AFTER_DEFAULT, RelayProbeStatus, ShutdownLeader,
-    read_autostart, reap_orphan, stop_grace,
+    read_autostart, reap_orphan,
 };
 pub use error::CommError;
 pub use import::{ImportReport, ImportRequest, import};

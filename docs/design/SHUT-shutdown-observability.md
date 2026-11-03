@@ -85,7 +85,7 @@
 
 ## 对外语义 / External semantics
 
-- **参数**（沿用 `A24_*` 惯例）：`A24_MODULE_DRAIN_MS`（0–10000，默认 800）、`A24_MODULE_STOP_GRACE_MS`（100–5000，默认 500）。
+- **参数**（沿用 `A24_*` 惯例）：`A24_MODULE_DRAIN_MS`（0–10000，默认 800）、`A24_COMPONENT_STOP_GRACE_MS`（100–30000，默认 15000；旧名 A24_MODULE_STOP_GRACE_MS 为别名，保留一版，ADR-038 D5）。
   **非法值：warn + 用默认值**，并进入实时出口的 `config_warnings`（写明原值、合法范围、生效值）—— 不拒绝启动：CLI 的 `daemon start` 会吞掉 daemon 的 stderr，launchd 下拒绝启动会变成节流的崩溃循环，一个 24/7 的 daemon 不该因为调参打错字而下线。
   两个变量加入 `PASSTHROUGH_VARS`（**在 SHUT-1b**：CLI 有一条扫描 daemon 源码的测试，daemon 读了而透传清单没有的环境变量会让它失败）；文档写明 launchd 服务改了它们要重装服务（`agent24 service install`）才生效。
 - **日志**（tracing，模块名为字段）：

@@ -3,6 +3,7 @@ import { PassThrough } from 'node:stream'
 import type { ChildProcess } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -13,6 +14,8 @@ import {
   canonicalCreativeOrigin,
   classifyCreativeUrl,
   creativeChildEnvironment,
+  resolveBundledAgent24Cli,
+  resolveNodeRuntimeExecutable,
   parseAgent24HeadlessReady,
   resolveAgent24HeadlessLauncher,
   resolveOpenDesignCheckout,
@@ -409,6 +412,7 @@ describe('CreativeServeWeb', () => {
       { state: 'ready', origin: 'http://127.0.0.1:17456' },
     ])
     expect(spawnFn).toHaveBeenCalledTimes(1)
+    expect(service.headlessSidecarState()).toBeNull()
     await service.stop()
   })
 
@@ -481,6 +485,123 @@ describe('CreativeServeWeb', () => {
       resourceSafeBase: fs.realpathSync(componentDir),
     })
     await service.stop()
+  })
+
+  it('hands the bundled agent24 CLI to Open Design as AGENT24_BIN, keeping a user override', async () => {
+    for (const [userBin, expected] of [[undefined, '/Apps/Agent24.app/Contents/Resources/backend/agent24'], ['/opt/mine/agent24', '/opt/mine/agent24']] as const) {
+      const { resources, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+      const child = new FakeChild()
+      const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+      const service = new CreativeServeWeb(
+        {
+          resourcesPath: resources,
+          stateRoot,
+          runtimeExecutable,
+          environment: { PATH: '/usr/bin', ...(userBin ? { AGENT24_BIN: userBin } : {}) },
+          agent24Cli: '/Apps/Agent24.app/Contents/Resources/backend/agent24',
+          readyTimeoutMs: 500,
+        },
+        spawnFn as never,
+        vi.fn(async () => new Response('{}', { status: 200 })),
+      )
+      const starting = service.start()
+      child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
+      await starting
+      const env = (spawnFn.mock.calls[0] as unknown as [string, string[], { env: NodeJS.ProcessEnv }])[2].env
+      expect(env.AGENT24_BIN).toBe(expected)
+      await service.stop()
+    }
+  })
+
+  it('runs Open Design children under the LSUIElement Helper on macOS so none of them gets a Dock tile', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-helper-'))
+    try {
+      const execPath = path.join(root, 'Agent24.app', 'Contents', 'MacOS', 'Agent24')
+      const helper = path.join(root, 'Agent24.app', 'Contents', 'Frameworks', 'Agent24 Helper.app', 'Contents', 'MacOS', 'Agent24 Helper')
+      expect(resolveNodeRuntimeExecutable(execPath, 'darwin')).toBe(execPath)
+      fs.mkdirSync(path.dirname(helper), { recursive: true })
+      fs.writeFileSync(helper, '')
+      expect(resolveNodeRuntimeExecutable(execPath, 'darwin')).toBe(helper)
+      expect(resolveNodeRuntimeExecutable(execPath, 'linux')).toBe(execPath)
+      expect(resolveNodeRuntimeExecutable(execPath, 'win32')).toBe(execPath)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('finds the CLI bundled in Agent24.app and nothing when it is absent', () => {
+    const resources = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-res-'))
+    try {
+      expect(resolveBundledAgent24Cli(resources)).toBeNull()
+      fs.mkdirSync(path.join(resources, 'backend'))
+      fs.writeFileSync(path.join(resources, 'backend', 'agent24'), '')
+      expect(resolveBundledAgent24Cli(resources)).toBe(path.join(resources, 'backend', 'agent24'))
+      expect(resolveBundledAgent24Cli(undefined)).toBeNull()
+    } finally {
+      fs.rmSync(resources, { recursive: true, force: true })
+    }
+  })
+
+  it('reports headless sidecar phases and clears them after a clean stop', async () => {
+    const { resources: componentDir, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const child = new FakeChild()
+    const service = new CreativeServeWeb(
+      {
+        stateRoot,
+        runtimeExecutable,
+        readyTimeoutMs: 500,
+        component: { status: () => ({ state: 'installed', dir: componentDir }) },
+      },
+      vi.fn(() => child as unknown as ChildProcess) as never,
+      vi.fn(async () => new Response('{}', { status: 200 })),
+    )
+    const starting = service.start()
+    expect(service.headlessSidecarState()).toBe('starting')
+    child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
+    expect(service.headlessSidecarState()).toBe('ready')
+    child.emit('exit', 1, null)
+    expect(service.headlessSidecarState()).toBe('failed')
+    expect(service.status()).toEqual({ state: 'stopped' })
+  })
+
+  it('reports stopped after a clean headless stop, then starting on the next launch', async () => {
+    const { resources: componentDir, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const first = new FakeChild()
+    const second = new FakeChild()
+    second.pid = 4322
+    const children = [first, second]
+    let spawned = 0
+    const service = new CreativeServeWeb(
+      {
+        stateRoot,
+        runtimeExecutable,
+        readyTimeoutMs: 500,
+        component: { status: () => ({ state: 'installed', dir: componentDir }) },
+      },
+      vi.fn(() => children[spawned++] as unknown as ChildProcess) as never,
+      vi.fn(async () => new Response('{}', { status: 200 })),
+    )
+    const phases: Array<string | null> = []
+    service.onStatus(() => { phases.push(service.headlessSidecarState()) })
+    const starting = service.start()
+    first.stdout.write(`${JSON.stringify(headlessReady(first.pid, 17456, 17457))}\n`)
+    await starting
+    const stopping = service.stop()
+    expect(service.headlessSidecarState()).toBe('stopping')
+    expect(service.status()).toEqual({ state: 'stopped' })
+    await stopping
+    expect(service.headlessSidecarState()).toBe('stopped')
+    expect(phases.at(-1)).toBe('stopped')
+    expect(phases).not.toContain(null)
+
+    const again = service.start()
+    expect(service.headlessSidecarState()).toBe('starting')
+    second.stdout.write(`${JSON.stringify(headlessReady(second.pid, 17458, 17459, 'creative-2'))}\n`)
+    await expect(again).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17458' })
+    expect(service.headlessSidecarState()).toBe('ready')
+    await service.stop()
+    expect(service.headlessSidecarState()).toBe('stopped')
   })
 
   it('C1: Design still starts when resourcesPath is unset entirely (proves no dependency on a writable — or any — app resources dir for the on-demand path)', async () => {

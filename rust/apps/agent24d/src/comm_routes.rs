@@ -14,17 +14,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent24_comm::{
-    CommState, HyphaeDaemonSupervisor, HyphaeLock, HyphaeRunner, KeyringPasswordStore,
-    MemoryPasswordStore, PasswordStore, VerifiedBinary, current_platform,
+    CommState, HyphaeDaemonSupervisor, HyphaeRunner, KeyringPasswordStore, MemoryPasswordStore,
+    PasswordStore, VerifiedBinary, current_platform,
 };
 
-use crate::hyphae_install::InstallError;
-use agent24_comm::release::HyphaeRelease;
-use agent24_components::DownloadError;
+use crate::hyphae_install::{HyphaeLock, InstallError, Verifier};
+use agent24_components::{DownloadError, VerifyMode, install::InstallError as SignError};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Request, State},
+    extract::{MatchedPath, NestedPath, OriginalUri, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -66,7 +65,82 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 /// or its mailbox is already closed and `start()` fails cleanly without
 /// spawning anything (`agent24-comm`'s own `daemon.rs` doc comments cover
 /// that part).
-pub struct CommDaemonSlot(Mutex<CommDaemonSlotState>, CancellationToken);
+pub struct CommDaemonSlot(
+    Mutex<CommDaemonSlotState>,
+    CancellationToken,
+    Mutex<Option<Rejection>>,
+);
+
+/// Why the last build of the comm state (daemon start, or the rebuild after a host
+/// install) refused the binary it found. A stable, path-free code:
+/// `GET /api/v1/components` (host view) shows it as the Hyphae item's `reason` with
+/// state `failed`, and `GET /api/v1/comm/daemon` as `data.rejection`. Set and cleared
+/// only by those builds: the next one that does not refuse a binary (a successful
+/// start, or nothing installed) clears it. Fixing the file on disk is therefore seen at
+/// the next start or install, not before; an install that fails before its rebuild
+/// leaves it as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Rejection {
+    /// The bytes matched the lock but D2a refused them (codesign requirement, Team ID,
+    /// Hardened Runtime, or the checker could not run).
+    SignatureRejected,
+    /// The binary's SHA-256 is not the one the lock pins.
+    HashMismatch,
+}
+
+impl Rejection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SignatureRejected => "signature_rejected",
+            Self::HashMismatch => "hash_mismatch",
+        }
+    }
+}
+
+/// A failed build of the comm state: the (log-only) message, and the stable
+/// [`Rejection`] when the failure was the binary itself being refused.
+#[derive(Debug)]
+struct BuildFailure {
+    reason: String,
+    rejection: Option<Rejection>,
+}
+
+impl BuildFailure {
+    fn rejected(rejection: Rejection, reason: String) -> Self {
+        Self {
+            reason,
+            rejection: Some(rejection),
+        }
+    }
+}
+
+impl From<String> for BuildFailure {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            rejection: None,
+        }
+    }
+}
+
+impl From<&str> for BuildFailure {
+    fn from(reason: &str) -> Self {
+        reason.to_owned().into()
+    }
+}
+
+/// `BinaryError::HashMismatch` is the lock refusing the bytes; anything else
+/// (missing file, I/O) is not a verdict on the binary.
+fn binary_failure(e: agent24_comm::BinaryError) -> BuildFailure {
+    let reason = format!("Hyphae binary verification failed: {e}");
+    match e {
+        agent24_comm::BinaryError::HashMismatch { .. } => {
+            BuildFailure::rejected(Rejection::HashMismatch, reason)
+        }
+        _ => reason.into(),
+    }
+}
 
 enum CommDaemonSlotState {
     Empty,
@@ -82,6 +156,7 @@ impl CommDaemonSlot {
         Self(
             Mutex::new(CommDaemonSlotState::Empty),
             CancellationToken::new(),
+            Mutex::new(None),
         )
     }
 
@@ -99,6 +174,8 @@ impl CommDaemonSlot {
             CommDaemonSlotState::Closed => false,
             _ => {
                 *guard = CommDaemonSlotState::Registered(handle);
+                // A verified binary now owns the slot: no earlier refusal applies.
+                self.set_rejection(None);
                 true
             }
         }
@@ -115,6 +192,33 @@ impl CommDaemonSlot {
             CommDaemonSlotState::Closed => Err("agent24d is shutting down".into()),
             CommDaemonSlotState::Registered(handle) => Ok(Some(handle.clone())),
             CommDaemonSlotState::Empty => Ok(None),
+        }
+    }
+
+    /// Why the last build refused the binary, if it did (see [`Rejection`]).
+    pub fn rejection(&self) -> Option<Rejection> {
+        *self
+            .2
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_rejection(&self, rejection: Option<Rejection>) {
+        *self
+            .2
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = rejection;
+    }
+
+    /// The registered supervisor, if any (read-only; status for `/api/v1/components`).
+    pub fn current(&self) -> Option<Arc<HyphaeDaemonSupervisor>> {
+        match &*self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            CommDaemonSlotState::Registered(handle) => Some(handle.clone()),
+            _ => None,
         }
     }
 
@@ -141,9 +245,9 @@ impl Default for CommDaemonSlot {
 /// Developer overrides precede the verified component, then the sibling binary.
 async fn resolve_source_path(
     state_dir: &Path,
-    release: &HyphaeRelease,
     lock: &HyphaeLock,
-) -> Result<Option<PathBuf>, String> {
+    platform: &str,
+) -> Result<Option<PathBuf>, BuildFailure> {
     let primary = std::env::var_os("A24_HYPHAE_BIN").map(PathBuf::from);
     let deprecated = std::env::var_os("A24_SPEAKER_BIN").map(PathBuf::from);
     if primary.is_none() && deprecated.is_some() {
@@ -155,10 +259,10 @@ async fn resolve_source_path(
     resolve_candidates(
         primary,
         deprecated,
-        &release.installed_path(state_dir),
+        &lock.installed_path(state_dir),
         sibling,
         lock,
-        &current_platform(),
+        platform,
     )
     .await
 }
@@ -170,7 +274,7 @@ async fn resolve_candidates(
     sibling: Option<PathBuf>,
     lock: &HyphaeLock,
     platform: &str,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<PathBuf>, BuildFailure> {
     if let Some(path) = primary.or(deprecated) {
         return Ok(Some(path));
     }
@@ -184,12 +288,15 @@ async fn resolve_candidates(
                 .map_err(|e| e.to_string())?;
             let expected = lock.expected_for(platform).map_err(|e| e.to_string())?;
             if agent24_comm::binary::sha256_of(&bytes) != expected {
-                return Err("installed Hyphae component does not match the locked SHA-256".into());
+                return Err(BuildFailure::rejected(
+                    Rejection::HashMismatch,
+                    "installed Hyphae component does not match the locked SHA-256".into(),
+                ));
             }
             Ok(Some(component.to_path_buf()))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(sibling.filter(|p| p.is_file())),
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(e.to_string().into()),
     }
 }
 
@@ -203,6 +310,13 @@ struct CommPaths<'a> {
     autostart_path: &'a Path,
 }
 
+/// What a binary is checked against: the lock, the D2a verifier, the lock platform.
+struct Verification<'a> {
+    lock: &'a HyphaeLock,
+    verifier: &'a Verifier,
+    platform: &'a str,
+}
+
 async fn build_ready_state(
     source: &Path,
     paths: &CommPaths<'_>,
@@ -214,8 +328,13 @@ async fn build_ready_state(
     // default (500ms vs. this crate's unvalidated 5s).
     grace: Duration,
     slot: &CommDaemonSlot,
-    lock: &HyphaeLock,
-) -> Result<CommState, String> {
+    check: &Verification<'_>,
+) -> Result<CommState, BuildFailure> {
+    let Verification {
+        lock,
+        verifier,
+        platform,
+    } = *check;
     let CommPaths {
         home,
         install_dir,
@@ -229,13 +348,29 @@ async fn build_ready_state(
     tokio::fs::create_dir_all(home)
         .await
         .map_err(|e| format!("creating {}: {e}", home.display()))?;
-    let platform = current_platform();
     let expected = lock
-        .expected_for(&platform)
+        .expected_for(platform)
         .map_err(|e| format!("no verified Hyphae binary for platform {platform}: {e}"))?;
     let bin = VerifiedBinary::install(&source, expected, install_dir)
         .await
-        .map_err(|e| format!("Hyphae binary verification failed: {e}"))?;
+        .map_err(binary_failure)?;
+    // ADR-038 D2a `AtRest`, on the exact copy that will run: offline (no Gatekeeper
+    // round-trip), so an installed Hyphae still starts without a network. Notarization
+    // was established by the install-time check. Linux: sha256 above is the whole check.
+    crate::hyphae_install::verify_signature(
+        lock,
+        platform,
+        bin.path(),
+        verifier,
+        VerifyMode::AtRest,
+    )
+    .await
+    .map_err(|e| {
+        BuildFailure::rejected(
+            Rejection::SignatureRejected,
+            format!("Hyphae signature verification failed: {e}"),
+        )
+    })?;
     let runner = Arc::new(HyphaeRunner::new(bin, home.to_path_buf(), DEFAULT_TIMEOUT));
     // COMM-4a §6.1 "孤儿识别": before this `agent24d` ever spawns a Hyphae
     // daemon of its own, clean up one left behind by a previous `agent24d`
@@ -332,12 +467,6 @@ fn select_password_store() -> Result<Arc<dyn PasswordStore>, String> {
 /// Build a comm router that remains available when Hyphae is absent or rejected.
 /// The shutdown slot owns the current supervisor across hot replacements.
 pub async fn build(state_dir: &Path, grace: Duration, slot: &Arc<CommDaemonSlot>) -> Router {
-    let release = match HyphaeRelease::embedded() {
-        Ok(release) => release,
-        Err(e) => {
-            return unconfigured_router(CommState::unconfigured(e.to_string()));
-        }
-    };
     let lock = match HyphaeLock::embedded() {
         Ok(lock) => lock,
         Err(e) => {
@@ -348,8 +477,9 @@ pub async fn build(state_dir: &Path, grace: Duration, slot: &Arc<CommDaemonSlot>
         state_dir: state_dir.to_path_buf(),
         grace,
         slot: slot.clone(),
-        release,
         lock,
+        verifier: Arc::new(agent24_components::sign::Codesign),
+        platform: current_platform(),
         password_store: select_password_store(),
         routes: RwLock::new(Router::new()),
         installation: AsyncMutex::new(()),
@@ -362,8 +492,11 @@ struct CommRuntime {
     state_dir: PathBuf,
     grace: Duration,
     slot: Arc<CommDaemonSlot>,
-    release: HyphaeRelease,
     lock: HyphaeLock,
+    /// D2a verifier (codesign/spctl); only consulted for macOS assets.
+    verifier: Verifier,
+    /// The lock platform this daemon runs as (`current_platform()` in production).
+    platform: String,
     password_store: Result<Arc<dyn PasswordStore>, String>,
     routes: RwLock<Router>,
     installation: AsyncMutex<()>,
@@ -383,12 +516,27 @@ impl CommRuntime {
         }
     }
 
+    /// Build the comm state and record on the slot why a binary was refused, or that
+    /// none was: every outcome other than a rejection clears an earlier one.
     async fn try_build_state(&self) -> Result<CommState, String> {
+        match self.build_state_or_failure().await {
+            Ok(state) => {
+                self.slot.set_rejection(None);
+                Ok(state)
+            }
+            Err(failure) => {
+                self.slot.set_rejection(failure.rejection);
+                Err(failure.reason)
+            }
+        }
+    }
+
+    async fn build_state_or_failure(&self) -> Result<CommState, BuildFailure> {
         let password_store = match &self.password_store {
             Ok(store) => store.clone(),
-            Err(reason) => return Err(reason.clone()),
+            Err(reason) => return Err(reason.clone().into()),
         };
-        let Some(source) = resolve_source_path(&self.state_dir, &self.release, &self.lock).await?
+        let Some(source) = resolve_source_path(&self.state_dir, &self.lock, &self.platform).await?
         else {
             return Ok(CommState::unconfigured(
                 "no Hyphae binary is configured; download and set up Hyphae",
@@ -408,7 +556,11 @@ impl CommRuntime {
             password_store,
             self.grace,
             &self.slot,
-            &self.lock,
+            &Verification {
+                lock: &self.lock,
+                verifier: &self.verifier,
+                platform: &self.platform,
+            },
         )
         .await
     }
@@ -418,24 +570,24 @@ impl CommRuntime {
         resolve_candidates(
             None,
             None,
-            &self.release.installed_path(&self.state_dir),
+            &self.lock.installed_path(&self.state_dir),
             None,
             &self.lock,
-            &current_platform(),
+            &self.platform,
         )
         .await
         .ok()
         .flatten()
-        .map(|_| self.release.tag.clone())
+        .map(|_| self.lock.version().to_owned())
     }
 
     async fn install(&self) -> Result<Value, (StatusCode, Json<Value>)> {
         let _install = self.installation.lock().await;
         let path = crate::hyphae_install::install(
-            &self.release,
             &self.lock,
-            &current_platform(),
+            &self.platform,
             &self.state_dir,
+            &self.verifier,
             &self.slot.1,
         )
         .await
@@ -460,7 +612,7 @@ impl CommRuntime {
         };
         *routes = agent24_comm::router(state);
         Ok(json!({"ok": true, "data": {
-            "installed_version": self.release.tag, "path": path,
+            "installed_version": self.lock.version(), "path": path,
             "restart_required": restart_required, "reason": reason,
         }}))
     }
@@ -472,6 +624,8 @@ fn unconfigured_router(state: CommState) -> Router {
 
 // Preserve every MatchedPath for CORE-2 authorization while requests use the
 // current comm instance. A fallback would erase those fixed route templates.
+// The placeholder match also captures path parameters; [`forward_comm`] drops
+// those before the live router matches the same path again.
 fn runtime_router(runtime: Arc<CommRuntime>) -> Router {
     let routes = agent24_comm::router(CommState::unconfigured("initializing"))
         .route_layer(middleware::from_fn_with_state(
@@ -480,6 +634,80 @@ fn runtime_router(runtime: Arc<CommRuntime>) -> Router {
         ))
         .route("/install", post(install_component).with_state(runtime));
     Router::new().nest("/api/v1/comm", routes)
+}
+
+/// Outer `MatchedPath`, held aside so the live router's match does not
+/// concatenate onto it. Restored by [`restore_forwarded_matched_path`].
+#[derive(Clone)]
+struct ForwardedMatchedPath(MatchedPath);
+
+/// Drop path parameters captured by the placeholder comm router.
+///
+/// `runtime_router` matches each comm route so CORE-2's auth layer sees a
+/// fixed `MatchedPath`. Axum records the captured parameters in a private
+/// `UrlParams` extension and appends on a second match, so the live router's
+/// `Path` extractor returns 500 (`Expected N but got 2N`). That type is not
+/// public, so the parameters cannot be removed by name. The extensions map
+/// is rebuilt from the values that must survive:
+///
+/// - `Authorization`, inserted by the parent auth layer (it runs after the
+///   outer match and before this middleware). Kernel handlers read it with
+///   `Extension<Authorization>`.
+/// - `OriginalUri` and `NestedPath`, set by axum before this middleware. The
+///   live router will not replace an `OriginalUri` that is already present,
+///   so the client's full URI stays intact.
+/// - `MatchedPath` is stashed as [`ForwardedMatchedPath`], not left as
+///   `MatchedPath`. The live match treats an existing `MatchedPath` as a nest
+///   prefix and concatenates (`append_nested_matched_path`), which would
+///   double `/api/v1/comm/outbox/{event_id}/retry`. Auth has already copied
+///   the outer template; the stash puts that same value back after the live
+///   match.
+fn request_without_outer_path_params(req: Request) -> Request {
+    let (mut parts, body) = req.into_parts();
+    let matched = parts.extensions.remove::<MatchedPath>();
+    let authorization = parts
+        .extensions
+        .remove::<crate::capabilities::Authorization>();
+    let original_uri = parts.extensions.remove::<OriginalUri>();
+    let nested_path = parts.extensions.remove::<NestedPath>();
+    parts.extensions.clear();
+    if let Some(matched) = matched {
+        parts.extensions.insert(ForwardedMatchedPath(matched));
+    }
+    if let Some(authorization) = authorization {
+        parts.extensions.insert(authorization);
+    }
+    if let Some(original_uri) = original_uri {
+        parts.extensions.insert(original_uri);
+    }
+    if let Some(nested_path) = nested_path {
+        parts.extensions.insert(nested_path);
+    }
+    Request::from_parts(parts, body)
+}
+
+/// Put the outer `MatchedPath` back after the live router has matched.
+///
+/// The live match runs before this layer and has already written a fresh
+/// `UrlParams` (one copy) plus its own `MatchedPath`. Replacing that
+/// `MatchedPath` restores the template CORE-2 used.
+async fn restore_forwarded_matched_path(mut req: Request, next: Next) -> Response {
+    if let Some(ForwardedMatchedPath(matched)) =
+        req.extensions_mut().remove::<ForwardedMatchedPath>()
+    {
+        req.extensions_mut().insert(matched);
+    }
+    next.run(req).await
+}
+
+async fn dispatch_inner(routes: Router, req: Request) -> Response {
+    use tower::ServiceExt;
+    let routes = routes.layer(middleware::from_fn(restore_forwarded_matched_path));
+    let req = request_without_outer_path_params(req);
+    match routes.oneshot(req).await {
+        Ok(response) => response,
+        Err(error) => match error {},
+    }
 }
 
 async fn forward_comm(
@@ -494,12 +722,10 @@ async fn forward_comm(
     {
         return component_status(State(runtime)).await;
     }
+    // Hold the read lock for the whole forward so an install's write lock
+    // waits until this request has finished on the router it cloned.
     let routes = runtime.routes.read().await;
-    use tower::ServiceExt;
-    match routes.clone().oneshot(req).await {
-        Ok(res) => res,
-        Err(e) => match e {},
-    }
+    dispatch_inner(routes.clone(), req).await
 }
 
 async fn component_status(State(runtime): State<Arc<CommRuntime>>) -> Response {
@@ -523,11 +749,9 @@ async fn component_status(State(runtime): State<Arc<CommRuntime>>) -> Response {
             "relay_probe": null, "catch_up": {"state": "unknown", "last_incomplete_at_ms": null},
         }});
     }
-    value["data"]["installable"] = runtime
-        .release
-        .asset_for(&runtime.lock, &current_platform())
-        .is_ok()
-        .into();
+    value["data"]["installable"] = runtime.lock.expected_for(&runtime.platform).is_ok().into();
+    // Stable code for a refused binary (`signature_rejected` | `hash_mismatch`), or null.
+    value["data"]["rejection"] = json!(runtime.slot.rejection());
     value["data"]["installed_version"] = json!(runtime.installed_version().await);
     Json(value).into_response()
 }
@@ -548,21 +772,183 @@ fn install_failure(message: String) -> (StatusCode, Json<Value>) {
     )
 }
 
+/// Notarization (`spctl --type install`) is an online Gatekeeper lookup for a bare,
+/// unstapled Mach-O: a "not notarized" verdict on an offline machine is the usual cause.
+const NEEDS_NETWORK: &str = "Hyphae's notarization could not be confirmed: verifying \
+     notarization needs internet access. Connect to the internet and install again.";
+
+/// `codesign` (or `spctl`) never produced a verdict: it could not be started, or the
+/// check died before Gatekeeper was asked. Connectivity is not the problem here.
+const CHECKER_UNAVAILABLE: &str = "Hyphae was not installed: the system signature checker \
+     could not be run. See the agent24d log.";
+
+/// Map an installation failure to a stable code and a fixed, path-free message.
+///
+/// `POST /comm/install` is host-only (ProductHost / legacy token; FirstPartyShell
+/// tokens cannot elevate it and Creative is excluded), but the host UI still gets no
+/// raw tool output: codesign stderr and I/O errors can carry absolute paths with the
+/// user name. The full error goes to the daemon log only.
 fn install_error(error: InstallError) -> (StatusCode, Json<Value>) {
-    let (status, code) = match &error {
-        InstallError::Download(DownloadError::UnsupportedPlatform) => {
-            (StatusCode::CONFLICT, "hyphae_unsupported_platform")
-        }
+    use std::borrow::Cow;
+    let (status, code, message): (StatusCode, &str, Cow<'static, str>) = match &error {
+        InstallError::Download(DownloadError::UnsupportedPlatform) => (
+            StatusCode::CONFLICT,
+            "hyphae_unsupported_platform",
+            "Hyphae has no pinned release for this platform".into(),
+        ),
         InstallError::Download(DownloadError::HashMismatch)
-        | InstallError::Binary(agent24_comm::BinaryError::HashMismatch { .. }) => {
-            (StatusCode::UNPROCESSABLE_ENTITY, "hyphae_hash_mismatch")
+        | InstallError::Binary(agent24_comm::BinaryError::HashMismatch { .. }) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "hyphae_hash_mismatch",
+            "the Hyphae binary does not match the pinned SHA-256".into(),
+        ),
+        // D2a: the bytes matched the lock, but Gatekeeper's verdict was negative or its
+        // online lookup stalled past the deadline; offline is the common cause of both.
+        InstallError::Signature(SignError::NotNotarized) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "hyphae_signature_rejected",
+            NEEDS_NETWORK.into(),
+        ),
+        InstallError::Signature(SignError::NotarizationCheckFailed(e))
+            if e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "hyphae_signature_rejected",
+                NEEDS_NETWORK.into(),
+            )
         }
-        _ => (StatusCode::BAD_GATEWAY, "hyphae_download_failed"),
+        // No verdict at all: spctl could not be started, or `codesign` could not be run /
+        // finish (`Io`), so Gatekeeper never ran and "needs internet" would be a guess.
+        InstallError::Signature(SignError::NotarizationCheckFailed(_) | SignError::Io(_)) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "hyphae_signature_rejected",
+            CHECKER_UNAVAILABLE.into(),
+        ),
+        InstallError::Signature(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "hyphae_signature_rejected",
+            "the Hyphae binary's code signature does not match the pinned Developer ID; it was \
+             not installed"
+                .into(),
+        ),
+        // Static, path-free reasons are kept; everything else gets a fixed text.
+        InstallError::Download(DownloadError::Network(why)) => (
+            StatusCode::BAD_GATEWAY,
+            "hyphae_download_failed",
+            format!("Hyphae download failed: {why}").into(),
+        ),
+        InstallError::Download(DownloadError::Cancelled) => (
+            StatusCode::BAD_GATEWAY,
+            "hyphae_download_failed",
+            "Hyphae download was cancelled".into(),
+        ),
+        InstallError::Download(DownloadError::Redirect(_)) => (
+            StatusCode::BAD_GATEWAY,
+            "hyphae_download_failed",
+            "Hyphae download was redirected outside the allowed release hosts".into(),
+        ),
+        _ => (
+            StatusCode::BAD_GATEWAY,
+            "hyphae_download_failed",
+            "Hyphae download or installation failed; see the agent24d log".into(),
+        ),
     };
+    tracing::warn!(code, error = %error, "comm: Hyphae installation failed");
     (
         status,
-        Json(json!({"ok": false, "error": code, "message": error.to_string()})),
+        Json(json!({"ok": false, "error": code, "message": message})),
     )
+}
+
+#[cfg(test)]
+mod install_error_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn map(error: InstallError) -> (StatusCode, String, String) {
+        let (status, Json(body)) = install_error(error);
+        (
+            status,
+            body["error"].as_str().unwrap().to_owned(),
+            body["message"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    #[test]
+    fn signature_failures_have_their_own_code_and_offline_says_so() {
+        for offline in [
+            SignError::NotNotarized,
+            SignError::NotarizationCheckFailed(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "/usr/sbin/spctl did not finish within 60s",
+            )),
+        ] {
+            let (status, code, message) = map(InstallError::Signature(offline));
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(code, "hyphae_signature_rejected");
+            assert!(message.contains("needs internet access"), "{message}");
+        }
+        // #1551 L2: Gatekeeper never ran (codesign could not be spawned or timed out, or
+        // spctl could not be started): same code, but not blamed on the network.
+        for no_verdict in [
+            SignError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "/usr/bin/codesign did not finish within 60s",
+            )),
+            SignError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No such file or directory",
+            )),
+            SignError::NotarizationCheckFailed(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No such file or directory",
+            )),
+        ] {
+            let (status, code, message) = map(InstallError::Signature(no_verdict));
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(code, "hyphae_signature_rejected");
+            assert_eq!(message, CHECKER_UNAVAILABLE);
+            assert!(!message.contains("internet"), "{message}");
+        }
+        for rejected in [
+            SignError::SignatureMismatch,
+            SignError::HardenedRuntimeMissing,
+            SignError::ManifestViolation("notarization not required".into()),
+        ] {
+            let (status, code, message) = map(InstallError::Signature(rejected));
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(code, "hyphae_signature_rejected");
+            assert!(!message.contains("internet"), "{message}");
+        }
+        // A real digest mismatch keeps its own code.
+        let (_, code, _) = map(InstallError::Download(DownloadError::HashMismatch));
+        assert_eq!(code, "hyphae_hash_mismatch");
+    }
+
+    #[test]
+    fn messages_never_carry_tool_output_or_paths() {
+        let leaky = "/Users/alice/Library/Agent24/components/hyphae/v0.30.0/hyphae-0123: \
+                     code object is not signed at all";
+        let cases = [
+            InstallError::Signature(SignError::SignatureCheckFailed(leaky.into())),
+            InstallError::Binary(agent24_comm::BinaryError::Missing(
+                "/Users/alice/secret/hyphae".into(),
+            )),
+            InstallError::Io(std::io::Error::other(leaky)),
+            InstallError::Download(DownloadError::Io(std::io::Error::other(leaky))),
+            InstallError::Download(DownloadError::Redirect(
+                "https://evil.invalid/Users/alice".into(),
+            )),
+        ];
+        for error in cases {
+            let (_, code, message) = map(error);
+            assert!(
+                !message.contains("/Users") && !message.contains("alice"),
+                "{code}: {message}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -743,35 +1129,38 @@ mod hy1_regression_tests {
     const FIXTURE: &[u8] = b"#!/bin/sh\necho '{\"ok\":true,\"data\":[]}'\n";
 
     async fn runtime(dir: &Path) -> Arc<CommRuntime> {
-        let platform = current_platform();
+        // Fixture scripts carry no signature; the policy itself is tested in
+        // hyphae_install.rs. This accepts every executable it is shown.
+        runtime_with(
+            dir,
+            &current_platform(),
+            Arc::new(agent24_components::sign::Unsigned),
+        )
+        .await
+    }
+
+    async fn runtime_with(dir: &Path, platform: &str, verifier: Verifier) -> Arc<CommRuntime> {
         let lock =
-            HyphaeLock::override_for_test(&platform, agent24_comm::binary::sha256_of(FIXTURE));
-        let mut release = HyphaeRelease::embedded().unwrap();
-        release
-            .assets
-            .insert(platform, Some("fixture-hyphae".into()));
+            HyphaeLock::override_for_test(platform, agent24_comm::binary::sha256_of(FIXTURE));
         let runtime = Arc::new(CommRuntime {
             state_dir: dir.to_path_buf(),
             grace: Duration::from_millis(50),
             slot: Arc::new(CommDaemonSlot::new()),
-            release,
             lock,
+            verifier,
+            platform: platform.to_owned(),
             password_store: Ok(Arc::new(MemoryPasswordStore::new())),
             routes: RwLock::new(agent24_comm::router(CommState::unconfigured(
                 "no Hyphae binary is configured",
             ))),
             installation: AsyncMutex::new(()),
         });
-        let cache = dir.join("idoris/component-cache/hyphae");
+        let cache = dir.join("components/hyphae-cache");
         tokio::fs::create_dir_all(&cache).await.unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            for path in [
-                dir.join("idoris"),
-                dir.join("idoris/component-cache"),
-                cache.clone(),
-            ] {
+            for path in [cache.clone()] {
                 tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
                     .await
                     .unwrap();
@@ -811,9 +1200,9 @@ mod hy1_regression_tests {
             let (status, installed) = request(&app, "POST", "/api/v1/comm/install").await;
             assert_eq!(status, StatusCode::OK, "{installed}");
             assert_eq!(installed["data"]["restart_required"], false);
-            assert_eq!(installed["data"]["installed_version"], "v0.27.2");
+            assert_eq!(installed["data"]["installed_version"], "v0.30.0");
             assert_eq!(
-                tokio::fs::read(runtime.release.installed_path(dir.path()))
+                tokio::fs::read(runtime.lock.installed_path(dir.path()))
                     .await
                     .unwrap(),
                 FIXTURE
@@ -824,7 +1213,7 @@ mod hy1_regression_tests {
             let (status, process) = request(&app, "GET", "/api/v1/comm/daemon").await;
             assert_eq!(status, StatusCode::OK);
             assert_ne!(process["data"]["process"]["state"], "not_configured");
-            assert_eq!(process["data"]["installed_version"], "v0.27.2");
+            assert_eq!(process["data"]["installed_version"], "v0.30.0");
         }
         if let Some(handle) = runtime.slot.close() {
             handle.shutdown(tokio::time::Instant::now()).await;
@@ -844,10 +1233,10 @@ mod hy1_regression_tests {
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(body["data"]["restart_required"], false);
         }
-        let install_dir = runtime.release.install_dir(dir.path());
+        let install_dir = runtime.lock.install_dir(dir.path());
         assert!(!install_dir.join("hyphae.installing").exists());
         assert_eq!(
-            tokio::fs::read(runtime.release.installed_path(dir.path()))
+            tokio::fs::read(runtime.lock.installed_path(dir.path()))
                 .await
                 .unwrap(),
             FIXTURE
@@ -863,7 +1252,7 @@ mod hy1_regression_tests {
     async fn install_api_rejects_hash_mismatch_and_status_does_not_claim_installed() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = runtime(dir.path()).await;
-        let installed = runtime.release.installed_path(dir.path());
+        let installed = runtime.lock.installed_path(dir.path());
         tokio::fs::create_dir_all(installed.parent().unwrap())
             .await
             .unwrap();
@@ -883,8 +1272,9 @@ mod hy1_regression_tests {
         Arc::get_mut(&mut runtime)
             .unwrap()
             .lock
-            .binaries
-            .insert(current_platform(), None);
+            .component_mut()
+            .assets
+            .remove(&current_platform());
         let app = runtime_router(runtime);
         let (_, before) = request(&app, "GET", "/api/v1/comm/daemon").await;
         assert_eq!(before["data"]["installable"], false);
@@ -898,11 +1288,14 @@ mod hy1_regression_tests {
     async fn install_api_download_failure_preserves_existing_comm_state() {
         let dir = tempfile::tempdir().unwrap();
         let mut runtime = runtime(dir.path()).await;
-        Arc::get_mut(&mut runtime).unwrap().release.release_url_base =
-            "https://untrusted.invalid/release".into();
+        Arc::get_mut(&mut runtime)
+            .unwrap()
+            .lock
+            .component_mut()
+            .release_url_base = "https://untrusted.invalid/release".into();
         tokio::fs::remove_file(
             dir.path()
-                .join("idoris/component-cache/hyphae/fixture-hyphae.verified"),
+                .join("components/hyphae-cache/fixture-hyphae.verified"),
         )
         .await
         .unwrap();
@@ -999,7 +1392,8 @@ mod hy1_regression_tests {
             let err = resolve_candidates(None, None, &component, Some(sibling), &lock, &platform)
                 .await
                 .unwrap_err();
-            assert!(err.contains("regular file"), "{err}");
+            assert!(err.reason.contains("regular file"), "{err:?}");
+            assert_eq!(err.rejection, None, "not a verdict on the bytes");
         }
     }
 
@@ -1012,5 +1406,442 @@ mod hy1_regression_tests {
         let (status, result) = request(&app, "POST", "/api/v1/comm/install").await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(result["error"], "hyphae_download_failed");
+    }
+
+    /// A D2a verifier that refuses (as `codesign` would for a wrong Team ID) until told
+    /// otherwise, so one runtime can go from rejected to recovered.
+    #[derive(Default)]
+    struct Switch {
+        refuse: std::sync::atomic::AtomicBool,
+    }
+    impl agent24_components::SignatureVerifier for Switch {
+        fn verify(
+            &self,
+            _: &Path,
+            _: &agent24_components::SigningRequirement,
+        ) -> Result<(), SignError> {
+            if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(SignError::SignatureMismatch)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// The startup path of [`build`]: build the state once and publish its routes.
+    async fn start(runtime: &Arc<CommRuntime>) {
+        let state = runtime.build_state().await;
+        *runtime.routes.write().await = agent24_comm::router(state);
+    }
+
+    /// `GET /api/v1/components` through the real router, as the host and as a
+    /// first-party (redacted) caller, sharing `runtime`'s slot.
+    async fn components(runtime: &Arc<CommRuntime>) -> (Value, Value) {
+        use crate::enroll_api::EnrollAuthority;
+        let (mut state, host, _creative) = crate::server::tests::capability_state().await;
+        state.comm_slot = Some(runtime.slot.clone());
+        let first_party = state
+            .first_party
+            .as_ref()
+            .unwrap()
+            .issue(&crate::capabilities::first_party::test_peer("daemon-test"))
+            .unwrap()
+            .secret
+            .to_string();
+        let app = crate::server::build_router(state);
+        let mut out = Vec::new();
+        for token in [host, first_party] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/components")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            let hyphae = body["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == "hyphae")
+                .cloned()
+                .unwrap();
+            out.push(hyphae);
+        }
+        (out.remove(0), out.remove(0))
+    }
+
+    async fn install_fixture(runtime: &CommRuntime, dir: &Path, bytes: &[u8]) {
+        let installed = runtime.lock.installed_path(dir);
+        tokio::fs::create_dir_all(installed.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&installed, bytes).await.unwrap();
+    }
+
+    async fn shutdown(runtime: &CommRuntime) {
+        if let Some(handle) = runtime.slot.close() {
+            handle.shutdown(tokio::time::Instant::now()).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_signature_reads_failed_signature_rejected_and_recovers_after_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let switch = Arc::new(Switch::default());
+        switch
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // darwin-arm64 on every host, so the (fake) codesign check runs even on Linux CI.
+        let runtime = runtime_with(dir.path(), "darwin-arm64", switch.clone()).await;
+        install_fixture(&runtime, dir.path(), FIXTURE).await;
+        start(&runtime).await;
+        assert_eq!(runtime.slot.rejection(), Some(Rejection::SignatureRejected));
+
+        let (host, redacted) = components(&runtime).await;
+        assert_eq!(host["state"], "failed");
+        assert_eq!(host["reason"], "signature_rejected");
+        // Redacted keeps only {id, version, state, provides}: no reason.
+        let keys: Vec<_> = redacted.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys, ["id", "provides", "state", "version"]);
+        assert_eq!(redacted["state"], "failed");
+
+        let app = runtime_router(runtime.clone());
+        let (status, daemon) = request(&app, "GET", "/api/v1/comm/daemon").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(daemon["data"]["rejection"], "signature_rejected");
+        assert_eq!(daemon["data"]["process"]["state"], "not_configured");
+
+        // The checker now accepts it: a host install rebuilds and clears the rejection.
+        switch
+            .refuse
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let (status, installed) = request(&app, "POST", "/api/v1/comm/install").await;
+        assert_eq!(status, StatusCode::OK, "{installed}");
+        assert_eq!(installed["data"]["restart_required"], false);
+        assert_eq!(runtime.slot.rejection(), None);
+        let (host, _) = components(&runtime).await;
+        assert_ne!(host["state"], "failed", "{host}");
+        assert_ne!(host["state"], "absent", "{host}");
+        assert!(host.get("reason").is_none_or(|r| r != "signature_rejected"));
+        let (_, daemon) = request(&app, "GET", "/api/v1/comm/daemon").await;
+        assert_eq!(daemon["data"]["rejection"], Value::Null);
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test]
+    async fn wrong_sha_reads_failed_hash_mismatch_and_recovers_on_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime(dir.path()).await;
+        install_fixture(&runtime, dir.path(), b"tampered").await;
+        start(&runtime).await;
+
+        let (host, redacted) = components(&runtime).await;
+        assert_eq!(host["state"], "failed");
+        assert_eq!(host["reason"], "hash_mismatch");
+        assert_eq!(redacted["state"], "failed");
+        assert!(redacted.get("reason").is_none());
+        let app = runtime_router(runtime.clone());
+        let (_, daemon) = request(&app, "GET", "/api/v1/comm/daemon").await;
+        assert_eq!(daemon["data"]["rejection"], "hash_mismatch");
+        assert_eq!(daemon["data"]["installed_version"], Value::Null);
+
+        // The right bytes are back: the next start clears it.
+        install_fixture(&runtime, dir.path(), FIXTURE).await;
+        start(&runtime).await;
+        assert_eq!(runtime.slot.rejection(), None);
+        let (host, _) = components(&runtime).await;
+        assert_ne!(host["state"], "failed", "{host}");
+        let (_, daemon) = request(&app, "GET", "/api/v1/comm/daemon").await;
+        assert_eq!(daemon["data"]["rejection"], Value::Null);
+        shutdown(&runtime).await;
+    }
+
+    #[tokio::test]
+    async fn not_installed_stays_absent_and_a_later_absence_clears_a_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime(dir.path()).await;
+        start(&runtime).await;
+        let (host, redacted) = components(&runtime).await;
+        assert_eq!(host["state"], "absent");
+        assert!(host.get("reason").is_none(), "{host}");
+        assert_eq!(redacted["state"], "absent");
+        let app = runtime_router(runtime.clone());
+        let (_, daemon) = request(&app, "GET", "/api/v1/comm/daemon").await;
+        assert_eq!(daemon["data"]["rejection"], Value::Null);
+
+        // Rejected, then the bad file is deleted: back to plain `absent`, not `failed`.
+        install_fixture(&runtime, dir.path(), b"tampered").await;
+        start(&runtime).await;
+        assert_eq!(runtime.slot.rejection(), Some(Rejection::HashMismatch));
+        tokio::fs::remove_file(runtime.lock.installed_path(dir.path()))
+            .await
+            .unwrap();
+        start(&runtime).await;
+        let (host, _) = components(&runtime).await;
+        assert_eq!(host["state"], "absent");
+        assert!(host.get("reason").is_none(), "{host}");
+    }
+
+    fn braced_route_templates(source: &str, anchor: &str) -> std::collections::BTreeSet<String> {
+        let start = source
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{anchor} missing"));
+        let body = &source[start..];
+        let end = body
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{anchor} is not brace-terminated"));
+        let body = &body[..end];
+        body.match_indices(".route(")
+            .filter_map(|(offset, _)| {
+                let rest = &body[offset + ".route(".len()..];
+                let rest = &rest[rest.find('"')? + 1..];
+                let path = rest[..rest.find('"')?].to_owned();
+                path.contains('{').then_some(path)
+            })
+            .collect()
+    }
+
+    /// Every `{param}` route merged into `agent24_comm::router`. The scanner
+    /// fails this test when a new one appears and is not listed below.
+    fn path_param_templates() -> std::collections::BTreeSet<String> {
+        let mut routes = braced_route_templates(
+            include_str!("../../../crates/agent24-comm/src/router.rs"),
+            "pub fn router(",
+        );
+        routes.extend(braced_route_templates(
+            include_str!("../../../crates/agent24-comm/src/groupchat.rs"),
+            "pub(crate) fn routes(",
+        ));
+        routes
+    }
+
+    async fn raw_call(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        bearer: Option<&str>,
+        body: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(bearer) = bearer {
+            builder = builder.header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {bearer}"),
+            );
+        }
+        let body = match body {
+            Some(body) => {
+                builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+                Body::from(body.to_owned())
+            }
+            None => Body::empty(),
+        };
+        let response = app
+            .clone()
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        (status, text)
+    }
+
+    #[tokio::test]
+    async fn path_param_routes_through_runtime_router_are_not_path_extractor_500s() {
+        const GID: &str = "0123456789abcdef0123456789abcdef";
+        const LID: &str = "fedcba9876543210fedcba9876543210";
+        // (method, template, concrete uri, json body)
+        let hits = [
+            (
+                "POST",
+                "/outbox/{event_id}/retry",
+                "/api/v1/comm/outbox/evt-1/retry".to_string(),
+                None,
+            ),
+            (
+                "GET",
+                "/groupchat/{group_id}/members",
+                format!("/api/v1/comm/groupchat/{GID}/members"),
+                None,
+            ),
+            (
+                "GET",
+                "/groupchat/{group_id}/invites",
+                format!("/api/v1/comm/groupchat/{GID}/invites"),
+                None,
+            ),
+            (
+                "GET",
+                "/groupchat/{group_id}/messages",
+                format!("/api/v1/comm/groupchat/{GID}/messages"),
+                None,
+            ),
+            (
+                "POST",
+                "/groupchat/{group_id}/messages",
+                format!("/api/v1/comm/groupchat/{GID}/messages"),
+                Some(r#"{"body":"hi"}"#),
+            ),
+            (
+                "GET",
+                "/groupchat/{group_id}/messages/{logical_id}",
+                format!("/api/v1/comm/groupchat/{GID}/messages/{LID}"),
+                None,
+            ),
+            (
+                "POST",
+                "/groupchat/{group_id}/messages/{logical_id}/retry",
+                format!("/api/v1/comm/groupchat/{GID}/messages/{LID}/retry"),
+                Some("{}"),
+            ),
+            (
+                "POST",
+                "/groupchat/invites/{invite_id}/accept",
+                format!("/api/v1/comm/groupchat/invites/{GID}/accept"),
+                Some("{}"),
+            ),
+        ];
+        let tested: std::collections::BTreeSet<String> = hits
+            .iter()
+            .map(|(_, template, _, _)| (*template).to_owned())
+            .collect();
+        assert_eq!(
+            tested,
+            path_param_templates(),
+            "every agent24_comm path-parameter route must be hit through runtime_router"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = runtime_router(runtime(dir.path()).await);
+        for (method, template, uri, body) in hits {
+            let (status, text) = raw_call(&app, method, &uri, None, body).await;
+            assert_ne!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{method} {template} returned the path-extractor 500: {text}"
+            );
+            assert!(
+                !text.contains("Wrong number of path arguments"),
+                "{method} {template}: {text}"
+            );
+            let value: Value = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{method} {template} is not JSON ({e}): {text}"));
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "{method} {template} body={value}"
+            );
+            assert_eq!(value["error"], "not_configured", "{method} {template}");
+        }
+    }
+
+    /// The parent auth layer reads `MatchedPath` before `forward_comm`. A token
+    /// that cannot `comm.write` must still be forbidden on the real template,
+    /// and a host token must reach the handler (409), not the path-extractor 500.
+    #[tokio::test]
+    async fn path_param_route_still_rejects_a_token_without_comm_write() {
+        let (state, host, creative) = crate::server::tests::capability_state().await;
+        let dir = tempfile::tempdir().unwrap();
+        let app = crate::server::build_router_with_modules(
+            state,
+            runtime_router(runtime(dir.path()).await),
+        );
+        let uri = "/api/v1/comm/outbox/evt-1/retry";
+
+        let (status, text) = raw_call(&app, "POST", uri, Some(&creative), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+        let denied: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(denied["error"]["code"], "forbidden");
+
+        let (status, text) = raw_call(&app, "POST", uri, Some(&host), None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{text}");
+        let allowed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(allowed["error"], "not_configured");
+    }
+
+    /// Same double-match as `runtime_router`, on a probe handler that reports
+    /// what survived: one path parameter, the outer `MatchedPath`, and the
+    /// `Authorization` extension inserted the way CORE-2 inserts it.
+    #[tokio::test]
+    async fn forward_keeps_matched_path_and_authorization() {
+        use axum::extract::{Extension, MatchedPath, OriginalUri, Path};
+        use axum::routing::get;
+
+        async fn seen(
+            Path(id): Path<String>,
+            matched: MatchedPath,
+            OriginalUri(original): OriginalUri,
+            nested: axum::extract::NestedPath,
+            Extension(auth): Extension<crate::capabilities::Authorization>,
+        ) -> Json<Value> {
+            Json(json!({
+                "id": id,
+                "matched": matched.as_str(),
+                "original": original.path(),
+                "nested": nested.as_str(),
+                "capability_id": auth.claims.capability_id,
+            }))
+        }
+
+        async fn insert_authorization(mut req: axum::extract::Request, next: Next) -> Response {
+            req.extensions_mut()
+                .insert(crate::capabilities::Authorization {
+                    epoch: 7,
+                    claims: crate::capabilities::CapabilityClaims {
+                        first_party: None,
+                        capability_id: "cap-forward".to_owned(),
+                        audience: crate::capabilities::Audience::ProductHost,
+                        workspace_id: None,
+                        attachment_id: None,
+                        principal_id: None,
+                        daemon_generation: "g".to_owned(),
+                        host_generation: None,
+                        sidecar_generation: None,
+                        created_at: 0,
+                        expires_at: 0,
+                        allowed_operations: std::collections::BTreeSet::new(),
+                    },
+                });
+            next.run(req).await
+        }
+
+        async fn probe_forward(
+            State(inner): State<Router>,
+            req: axum::extract::Request,
+            _next: Next,
+        ) -> Response {
+            dispatch_inner(inner, req).await
+        }
+
+        let inner = Router::new().route("/item/{id}", get(seen));
+        let app = Router::new()
+            .nest(
+                "/api/v1/comm",
+                Router::new()
+                    .route("/item/{id}", get(|| async { StatusCode::NO_CONTENT }))
+                    .route_layer(middleware::from_fn_with_state(inner, probe_forward)),
+            )
+            .layer(middleware::from_fn(insert_authorization));
+
+        let (status, text) = raw_call(&app, "GET", "/api/v1/comm/item/abc", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["id"], "abc");
+        assert_eq!(value["matched"], "/api/v1/comm/item/{id}");
+        assert_eq!(value["original"], "/api/v1/comm/item/abc");
+        assert_eq!(value["nested"], "/api/v1/comm");
+        assert_eq!(value["capability_id"], "cap-forward");
     }
 }

@@ -720,6 +720,77 @@ describe('DocumentsPage: a document and its text', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
+  /** Answers `renderPage` from `pages` by page number (a missing page is 404). */
+  function rendering(m: Mock, pages: Record<number, () => Promise<Res>>) {
+    const base = m.request.getMockImplementation() as (req: { op: string; page?: number }) => Promise<Res>
+    m.request.mockImplementation((req: { op: string; page?: number }) => {
+      if (req.op !== 'renderPage') return base(req)
+      const answer = pages[req.page!]
+      return answer ? answer() : err(404, 'not_found', '没有这一页')
+    })
+  }
+  const png = (tag: string) => () => ok({ media_type: 'image/png', bytes: 3, scale: 2, png: tag })
+  const renders = (m: Mock) => m.request.mock.calls.filter(([r]) => r.op === 'renderPage').map(([r]) => r)
+
+  it('shows the head revision\'s first page as rendered, pages through it, and stops at the last', async () => {
+    const m = mount({ lists: [page([1])] })
+    reading(m, [() => ok(detail(1))], [() => ok(text([block('b1', '第一段', 1)]))])
+    rendering(m, { 1: png('UDE='), 2: png('UDI=') })
+    render(<DocumentsPage />)
+    fireEvent.click(await screen.findByRole('button', { name: '通告 1' }))
+    const first = await screen.findByRole('img', { name: '第 1 页原图' })
+    expect(first).toHaveAttribute('src', 'data:image/png;base64,UDE=')
+    expect(renders(m)).toEqual([{ op: 'renderPage', documentId: doc(1).document_id, revision: 2, page: 1, scale: 2 }])
+    expect(screen.getByText('第一段')).toBeInTheDocument() // the text stays
+    const prev = screen.getByRole('button', { name: '上一页' })
+    const next = screen.getByRole('button', { name: '下一页' })
+    expect(prev).toBeDisabled()
+    fireEvent.click(next)
+    expect(await screen.findByRole('img', { name: '第 2 页原图' })).toHaveAttribute('src', 'data:image/png;base64,UDI=')
+    expect(screen.getByText('原页面 · 第 2 页')).toBeInTheDocument()
+    // Page 3 is past the end: page 2 stays, and there is no next page.
+    fireEvent.click(next)
+    await waitFor(() => expect(next).toBeDisabled())
+    expect(screen.getByRole('img', { name: '第 2 页原图' })).toBeInTheDocument()
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    fireEvent.click(prev)
+    expect(await screen.findByRole('img', { name: '第 1 页原图' })).toBeInTheDocument()
+    expect(renders(m).map((r) => r.page)).toEqual([1, 2, 3, 1])
+  })
+
+  it('says why a page could not be rendered, apart from the text, and shows the next one that can', async () => {
+    const m = mount({ lists: [page([1])] })
+    reading(m, [() => ok(detail(1))], [() => ok(text([block('b1', '第一段', 1)]))])
+    rendering(m, { 1: () => err(503, 'engine_unavailable', '渲染引擎不可用'), 2: png('UDI=') })
+    render(<DocumentsPage />)
+    fireEvent.click(await screen.findByRole('button', { name: '通告 1' }))
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('渲染引擎不可用（engine_unavailable）'))
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.getByText('第一段')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '下一页' }))
+    expect(await screen.findByRole('img', { name: '第 2 页原图' })).toBeInTheDocument()
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+  })
+
+  it('a page rendered for a document no longer open is dropped', async () => {
+    const m = mount({ lists: [page([1, 2])] })
+    let late: () => void = () => {}
+    reading(m, [() => ok(detail(1)), () => ok(detail(2))], [() => ok(text([])), () => ok(text([]))])
+    rendering(m, {
+      1: () => (renders(m).length === 1
+        ? new Promise((r) => (late = () => r({ ok: true, status: 200, data: { media_type: 'image/png', bytes: 3, scale: 2, png: 'T0xE' } })))
+        : ok({ media_type: 'image/png', bytes: 3, scale: 2, png: 'TkVX' })),
+    })
+    render(<DocumentsPage />)
+    fireEvent.click(await screen.findByRole('button', { name: '通告 1' }))
+    await waitFor(() => expect(renders(m)).toHaveLength(1))
+    fireEvent.click(screen.getByRole('button', { name: '通告 2' }))
+    expect(await screen.findByRole('img', { name: '第 1 页原图' })).toHaveAttribute('src', 'data:image/png;base64,TkVX')
+    await act(async () => late())
+    expect(screen.getByRole('img', { name: '第 1 页原图' })).toHaveAttribute('src', 'data:image/png;base64,TkVX')
+    expect(renders(m).map((r) => r.documentId)).toEqual([doc(1).document_id, doc(2).document_id])
+  })
+
   it('sizes read as bytes, KB or MB', () => {
     expect([readableSize(512), readableSize(1536), readableSize(3 * 1024 * 1024)]).toEqual(['512 B', '1.5 KB', '3.0 MB'])
   })

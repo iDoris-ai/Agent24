@@ -35,6 +35,8 @@ export type CommDaemonProcessState =
 export interface CommDaemonStatus {
   installable?: boolean
   installed_version?: string | null
+  /** Why the daemon refused the Hyphae binary at its last start (signature_rejected | hash_mismatch), or null. */
+  rejection?: string | null
   process: {
     state: CommDaemonProcessState
     generation: number
@@ -200,6 +202,7 @@ function isDaemonStatus(value: unknown): value is CommDaemonStatus {
   return (
     (value['installable'] === undefined || typeof value['installable'] === 'boolean') &&
     (value['installed_version'] === undefined || nullableString(value['installed_version'])) &&
+    (value['rejection'] === undefined || nullableString(value['rejection'])) &&
     string(process['state']) && states.includes(process['state']) &&
     typeof process['generation'] === 'number' && Number.isInteger(process['generation']) &&
     typeof process['consecutive_failures'] === 'number' && Number.isInteger(process['consecutive_failures']) &&
@@ -215,6 +218,26 @@ function isUnlockResult(value: unknown): value is CommUnlockResult {
   return isRecord(value) && value['unlocked'] === true && typeof value['remembered'] === 'boolean'
 }
 
+/**
+ * Deadline for plain HTTP reads and writes through the generic proxy only.
+ * Never put it over an IPC that waits for a person (install, export, restore,
+ * unlock, home import, file pick): main keeps working after the page gives up,
+ * and the page would then show a failure for something that goes on to succeed.
+ */
+export const COMM_HTTP_TIMEOUT_MS = 90_000
+
+function withHttpTimeout<T>(work: Promise<T> | T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const pending = Promise.resolve(work)
+  void pending.catch(() => undefined)
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new CommApiError(translate(communicationMessages, 'error.timeout'), 504, 'timeout'))
+    }, COMM_HTTP_TIMEOUT_MS)
+  })
+  return Promise.race([pending, timeout]).finally(() => clearTimeout(timer))
+}
+
 async function request<T>(
   method: 'GET' | 'POST' | 'PUT',
   path: string,
@@ -223,8 +246,9 @@ async function request<T>(
 ): Promise<T> {
   let response: unknown
   try {
-    response = await window.agent24.backendProxy({ method, path, ...(body === undefined ? {} : { body }) })
-  } catch {
+    response = await withHttpTimeout(window.agent24.backendProxy({ method, path, ...(body === undefined ? {} : { body }) }))
+  } catch (error) {
+    if (error instanceof CommApiError) throw error
     throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)
   }
   return decodeEnvelope(response, validate)
@@ -248,30 +272,13 @@ export const startCommDaemon = (): Promise<CommDaemonStatus> =>
 export const stopCommDaemon = (): Promise<CommDaemonStatus> =>
   request('POST', '/api/v1/comm/daemon/stop', isDaemonStatus)
 
-/** Unlock is deliberately sent once. Password is only present in this IPC body and is never logged or persisted here. */
-export async function unlockComm(password: string, remember = false): Promise<CommUnlockResult> {
-  let response: unknown
-  try {
-    response = await window.agent24.backendProxy({
-      method: 'POST',
-      path: '/api/v1/comm/unlock',
-      body: { password, remember },
-    })
-  } catch {
-    // IPC/native errors can contain implementation details; keep this path
-    // generic so a rejected call can never echo a password into UI text.
-    throw new CommApiError(translate(communicationMessages, 'api.unlockFailed'), 0)
-  }
-
-  try {
-    return decodeEnvelope(response, isUnlockResult)
-  } catch (error) {
-    if (error instanceof CommApiError && password && error.message.includes(password)) {
-      throw new CommApiError(translate(communicationMessages, 'api.unlockFailed'), error.status, error.code)
-    }
-    throw error
-  }
-}
+/**
+ * Unlock goes through a dedicated IPC: main asks for the keystore password in
+ * its own isolated window (and retries a wrong one there), so this page never
+ * holds the password. A dismissed window rejects with code `cancelled`.
+ */
+export const unlockComm = (remember = false): Promise<CommUnlockResult> =>
+  viaIpc(() => window.agent24.commUnlock(remember), isUnlockResult)
 
 export type CommInstallResult = components['schemas']['CommInstallResult']
 function isInstallResult(value: unknown): value is CommInstallResult {
@@ -291,24 +298,169 @@ export const createCommIdentity = (nickname: string) =>
   request('POST', '/api/v1/comm/identity', (value): value is { nickname: string; npub: string } =>
     isRecord(value) && string(value['nickname']) && string(value['npub']), { nickname, default: true })
 
-/** Replaces the whole relay list server-side; callers pass the full ordered list. */
+/** Replaces the whole relay list server-side; callers pass the full ordered list. Main validates it and confirms natively when it changes. */
 export const setCommRelay = (relays: string[]) =>
-  request('PUT', '/api/v1/comm/relay', isRelayConfig, { relays })
+  viaIpc(() => window.agent24.commRelaySet(relays), isRelayConfig)
 
 export const probeCommRelay = (url: string) =>
   request('POST', '/api/v1/comm/relay/probe', (value): value is { url: string | null; connected: boolean; error: string | null } =>
     isRecord(value) && nullableString(value['url']) && typeof value['connected'] === 'boolean' && nullableString(value['error']), { url })
 
-export async function importCommIdentity(from: string, password: string) {
+/** Elevated writes go through dedicated, validated IPC in main, never the generic proxy. */
+async function viaIpc<T>(call: () => Promise<unknown>, validate: (value: unknown) => value is T): Promise<T> {
+  let response: unknown
   try {
-    return await request('POST', '/api/v1/comm/import', (value): value is { identities: number; contacts: number; outbox: number; db_files: string[] } =>
-      isRecord(value) && typeof value['identities'] === 'number' && typeof value['contacts'] === 'number' &&
-      typeof value['outbox'] === 'number' && Array.isArray(value['db_files']) && value['db_files'].every(string),
-    { from, ...(password ? { password } : {}), confirm: true })
+    response = await call()
   } catch (error) {
-    if (password && error instanceof CommApiError && error.message.includes(password)) {
-      throw new CommApiError(translate(communicationMessages, 'api.importFailed'), error.status, error.code)
-    }
-    throw error
+    if (error instanceof CommApiError) throw error
+    throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)
   }
+  return decodeEnvelope(response, validate)
 }
+
+/**
+ * Imports a whole Hyphae HOME. The page supplies nothing: main shows the native
+ * folder picker and a confirmation, then asks for that home's keystore password
+ * in its own window. A declined step rejects with code `cancelled`.
+ */
+export const importCommHome = () =>
+  viaIpc(() => window.agent24.commHomeImport(), (value): value is { identities: number; contacts: number; outbox: number; db_files: string[] } =>
+    isRecord(value) && typeof value['identities'] === 'number' && typeof value['contacts'] === 'number' &&
+    typeof value['outbox'] === 'number' && Array.isArray(value['db_files']) && value['db_files'].every(string))
+
+export const addCommContact = (nickname: string, npub: string, role: string) =>
+  viaIpc(() => window.agent24.commContactAdd(nickname, npub, role),
+    (value): value is RecordValue => isRecord(value) || value === null)
+
+export interface CommSendResult {
+  published_to: number
+}
+
+export const sendCommMessage = (to: string, content: string): Promise<CommSendResult> =>
+  viaIpc(() => window.agent24.commSend(to, content), (value): value is RecordValue => isRecord(value))
+    .then((data) => ({ published_to: typeof data['published_to'] === 'number' ? data['published_to'] : 0 }))
+
+export interface CommHistoryItem {
+  id: string
+  from: string
+  content: string
+  at: string
+}
+
+function historyTime(raw: unknown): string {
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    return new Date(raw < 1e12 ? raw * 1000 : raw).toLocaleString()
+  }
+  return typeof raw === 'string' ? raw : ''
+}
+
+/** Hyphae's history rows are passed through; keep only what the compact list shows. */
+function toHistoryItems(value: unknown[]): CommHistoryItem[] {
+  const items: CommHistoryItem[] = []
+  for (const row of value) {
+    if (!isRecord(row)) continue
+    const content = [row['content'], row['plaintext']].find(string)
+    if (content === undefined) continue
+    const from = [row['from'], row['sender'], row['sender_npub']].find(string) ?? ''
+    const id = row['id']
+    items.push({
+      id: typeof id === 'string' || typeof id === 'number' ? String(id) : `${items.length}`,
+      from,
+      content,
+      at: historyTime(row['created_at'] ?? row['received_at'] ?? row['time'] ?? row['ts']),
+    })
+  }
+  return items
+}
+
+export const listCommHistory = (limit = 20): Promise<CommHistoryItem[]> =>
+  request('GET', `/api/v1/comm/history?limit=${limit}`, (value): value is unknown[] => Array.isArray(value)).then(toHistoryItems)
+
+/** Things that could not be confirmed AFTER the backup was safely published. */
+export interface CommExportWarning {
+  code: 'cleanup_failed' | 'durability_unconfirmed'
+  path?: string
+}
+
+export interface CommExportResult {
+  nickname: string
+  npub: string
+  path: string
+  warnings: CommExportWarning[]
+}
+
+function exportWarnings(value: unknown): CommExportWarning[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((w): CommExportWarning[] => {
+    if (!isRecord(w)) return []
+    if (w['code'] === 'cleanup_failed') return [{ code: 'cleanup_failed', ...(string(w['path']) ? { path: w['path'] } : {}) }]
+    if (w['code'] === 'durability_unconfirmed') return [{ code: 'durability_unconfirmed' }]
+    return []
+  })
+}
+
+/**
+ * Password-encrypted private-key backup (NIP-49). The page sends ONLY the
+ * nickname: the main process confirms, collects the backup password in its own
+ * isolated window, lets the user pick the file and has the daemon create it
+ * (0600, never overwriting). Only {nickname,npub,path} comes back. A cancelled
+ * step rejects with code `cancelled`; an existing file with `target_exists`.
+ */
+export const exportCommIdentity = (nickname: string): Promise<CommExportResult> =>
+  viaIpc(() => window.agent24.commIdentityExport(nickname), (value): value is RecordValue =>
+    isRecord(value) && string(value['nickname']) && string(value['npub']) && string(value['path']))
+    .then((data) => ({
+      nickname: data['nickname'] as string,
+      npub: data['npub'] as string,
+      path: data['path'] as string,
+      warnings: exportWarnings(data['warnings']),
+    }))
+
+/** Ask main to show the file just exported. Any other path is refused. */
+export function revealCommExport(filePath: string): Promise<void> {
+  return viaIpc(
+    () => window.agent24.commRevealExport(filePath),
+    (value): value is { path: string } => isRecord(value) && value['path'] === filePath,
+  ).then(() => undefined)
+}
+
+export type CommPickResult = { ticket: string; fileName: string } | null
+
+/** Native "choose a backup" dialog (in main, which reads and validates the file right away). Only the file NAME and an opaque ticket come back. */
+export async function pickCommBackup(): Promise<CommPickResult> {
+  let result: unknown
+  try {
+    result = await window.agent24.commImportPick()
+  } catch (error) {
+    if (error instanceof CommApiError) throw error
+    throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)
+  }
+  if (isRecord(result) && result['ok'] === true && string(result['ticket']) && string(result['fileName'])) {
+    return { ticket: result['ticket'], fileName: result['fileName'] }
+  }
+  // Main read the file at once and it was not a usable backup.
+  if (isRecord(result) && result['ok'] === false && result['cancelled'] === false && string(result['message'])) {
+    throw new CommApiError(result['message'], 400, 'invalid_key')
+  }
+  return null
+}
+
+export interface CommRestoreResult {
+  status: 'imported' | 'already_present'
+  nickname: string | null
+  npub: string | null
+}
+
+/**
+ * Restore the picked backup. Main collects the backup password in its own
+ * window; this page never sees it (or the file). A cancelled window rejects
+ * with code `cancelled`.
+ */
+export const restoreCommIdentity = (ticket: string, nickname: string, makeDefault: boolean): Promise<CommRestoreResult> =>
+  viaIpc(() => window.agent24.commIdentityImport(ticket, nickname, makeDefault),
+    (value): value is RecordValue => isRecord(value) && (value['status'] === 'imported' || value['status'] === 'already_present'))
+    .then((data) => ({
+      status: data['status'] as CommRestoreResult['status'],
+      nickname: typeof data['nickname'] === 'string' ? data['nickname'] : null,
+      npub: typeof data['npub'] === 'string' ? data['npub'] : null,
+    }))

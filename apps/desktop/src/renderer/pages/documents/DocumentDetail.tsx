@@ -1,6 +1,7 @@
 // One document's details and the text the OS read from its current revision
 // (ADR-DOC-02 §3, §4): a page of blocks at a time, never all at once. The
-// text is the user's document: it is shown, never logged.
+// text is the user's document: it is shown, never logged. Above it, one
+// page as the OS renders it, so the text can be checked against the page.
 
 import { Fragment, useEffect, useRef, useState } from 'react'
 import type { components } from '@agent24/api-client'
@@ -12,6 +13,9 @@ type Detail = components['schemas']['DocumentDetail']
 type Block = components['schemas']['DocumentsTextBlock']
 
 const ALERT = { color: '#e5534b', fontSize: 13, margin: '8px 0' } as const
+/** Asked for so a page reads sharply on a 2x screen; the OS lowers it until
+ * the PNG fits in 1 MiB (§4) and answers with the scale it used. */
+const PAGE_SCALE = 2
 
 /** A size in bytes, as people read it. */
 export function readableSize(bytes: number): string {
@@ -35,6 +39,44 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
   // one (or after closing) is dropped.
   const generation = useRef(0)
   const heading = useRef<HTMLDivElement>(null)
+  // The page shown: its number, its PNG as a data URL, and the last page once
+  // a later one was found missing. Each render asked for supersedes the one
+  // before, apart from the text's reads.
+  const [pageNo, setPageNo] = useState(1)
+  const [image, setImage] = useState<string | null>(null)
+  const [lastPage, setLastPage] = useState<number | null>(null)
+  const [rendering, setRendering] = useState(false)
+  const [imageError, setImageError] = useState<string | null>(null)
+  const shown = useRef(0)
+
+  /** Renders page `n` of the head revision and shows it if it is still wanted. */
+  const show = async (head: Detail, n: number) => {
+    const ask = ++shown.current
+    setRendering(true)
+    const res = await api.request({
+      op: 'renderPage',
+      documentId: head.document_id,
+      revision: head.head.revision,
+      page: n,
+      scale: PAGE_SCALE,
+    })
+    if (ask !== shown.current) return
+    setRendering(false)
+    if (res.ok) {
+      setPageNo(n)
+      setImage(`data:image/png;base64,${res.data.png}`)
+      setImageError(null)
+      return
+    }
+    // A page past the revision's last is 404 `not_found` (§4): the one shown
+    // is the last. The page count is not known before that.
+    if (n > 1 && res.status === 404 && res.error.code === 'not_found') {
+      setLastPage(n - 1)
+      setImageError(null)
+      return
+    }
+    setImageError(describeError(res))
+  }
 
   /** The next page of the head revision's text, appended. */
   const read = async (gen: number, head: Detail, cursor?: string) => {
@@ -65,6 +107,11 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
     setUnparsed(new Set())
     setMore(null)
     setError(null)
+    setPageNo(1)
+    setImage(null)
+    setLastPage(null)
+    setRendering(false)
+    setImageError(null)
     heading.current?.focus()
     void api.request({ op: 'get', documentId }).then((res) => {
       if (gen !== generation.current) return
@@ -74,11 +121,13 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
       }
       setDetail(res.data)
       void read(gen, res.data)
+      void show(res.data, 1)
     })
     return () => {
       generation.current++
+      shown.current++
     }
-    // `read` checks the generation through the ref; only the document matters.
+    // `read` and `show` check their refs; only the document matters.
   }, [api, documentId])
 
   return (
@@ -100,6 +149,39 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
             importedAt: new Date(detail.created_at).toLocaleString(),
           })}
         </p>
+      )}
+      {detail && (
+        <figure style={{ margin: '8px 0' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <button
+              className="btn btn-ghost"
+              onClick={() => void show(detail, pageNo - 1)}
+              disabled={rendering || pageNo <= 1}
+            >
+              {t('detail.prevPage')}
+            </button>
+            <span style={{ color: 'var(--muted)', fontSize: 12 }}>{t('detail.pageShown', { page: pageNo })}</span>
+            <button
+              className="btn btn-ghost"
+              onClick={() => void show(detail, pageNo + 1)}
+              disabled={rendering || lastPage === pageNo}
+            >
+              {t('detail.nextPage')}
+            </button>
+          </div>
+          {imageError && (
+            <p role="status" style={ALERT}>
+              {imageError}
+            </p>
+          )}
+          {image && (
+            <img
+              src={image}
+              alt={t('detail.pageImage', { page: pageNo })}
+              style={{ display: 'block', maxWidth: '100%', maxHeight: '75vh', marginTop: 8, border: '1px solid var(--border)' }}
+            />
+          )}
+        </figure>
       )}
       {unparsed.size > 0 && <p role="note">{t('detail.partial', { count: unparsed.size })}</p>}
       {error && (

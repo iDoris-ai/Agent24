@@ -55,6 +55,9 @@ export interface DaemonConnection {
 // Null until the CURRENT child's ready line arrives — never a guessed default:
 // a stale fallback port could silently route to the wrong backend (review B5).
 let current: { port: number; auth: DaemonAuth } | null = null
+/** Auth mode of the daemon behind `current`, and only while that connection is usable. */
+let currentAuthMode: DaemonAuthMode | null = null
+const daemonReadyListeners = new Set<() => void>()
 
 export function getBackendEndpoint(): BackendEndpoint | null {
   return current ? { port: current.port } : null
@@ -69,6 +72,44 @@ export function daemonConnection(): DaemonConnection | null {
   if (auth.kind === 'none') return { port, authHeaders: {} }
   if (!auth.token) return null
   return { port, authHeaders: { Authorization: `Bearer ${auth.token}` } }
+}
+
+/**
+ * Fires each time a usable daemon connection is published: the first ready
+ * line, a reused daemon, and every later connection after a restart.
+ * Re-publishing the same port and credential does not fire again.
+ * The listener runs after `daemonConnection()` already returns the new value.
+ */
+export function onDaemonReady(listener: () => void): () => void {
+  daemonReadyListeners.add(listener)
+  return () => { daemonReadyListeners.delete(listener) }
+}
+
+/** Auth mode of the current usable connection. Null when nothing can be called. */
+export function daemonAuthMode(): DaemonAuthMode | null {
+  return daemonConnection() ? currentAuthMode : null
+}
+
+function connectionKey(): string | null {
+  const conn = daemonConnection()
+  if (!conn) return null
+  return `${conn.port}\u0000${conn.authHeaders.Authorization ?? ''}\u0000${currentAuthMode ?? ''}`
+}
+
+function publishConnection(next: { port: number; auth: DaemonAuth } | null, authMode: DaemonAuthMode | null): void {
+  const before = connectionKey()
+  current = next
+  const connected = daemonConnection() !== null
+  currentAuthMode = connected ? authMode : null
+  const after = connectionKey()
+  if (!after || after === before) return
+  for (const listener of [...daemonReadyListeners]) {
+    try {
+      listener()
+    } catch (error) {
+      console.error('[backend] daemon ready listener failed', error)
+    }
+  }
 }
 
 /** The daemon's port and main's credential, for the `agent24` CLI that main
@@ -495,7 +536,7 @@ export class BackendManager {
     this.foreignPid = null
     this.isExternal = true
     this.externalPid = state.pid
-    current = { port: state.port, auth: { kind: 'bearer', token: state.token } }
+    publishConnection({ port: state.port, auth: { kind: 'bearer', token: state.token } }, state.authMode)
     this.lastHealthy = true
     console.log(
       `[backend:${this.kind}] reusing external daemon (pid ${state.pid}, port ${state.port}) — not spawning our own`,
@@ -516,7 +557,7 @@ export class BackendManager {
     this.isExternal = false
     this.externalPid = null
     this.lastHealthy = false
-    current = null
+    publishConnection(null, null)
     if (!already) {
       console.warn(
         `[backend:${this.kind}] refusing external daemon (port ${state.port}): ${JSON.stringify(detail)}`,
@@ -614,11 +655,11 @@ export class BackendManager {
   private disconnectExternal(): void {
     this.isExternal = false
     this.externalPid = null
-    current = null
+    publishConnection(null, null)
   }
 
   private spawnChild(): void {
-    current = null
+    publishConnection(null, null)
     // Any spawn (initial, respawn-after-failure, or an explicit restart)
     // always produces a desktop-owned child — never external past this point.
     this.isExternal = false
@@ -648,7 +689,10 @@ export class BackendManager {
             if (typeof parsed.port === 'number' && this.child === child) {
               const auth: DaemonAuth =
                 this.kind === 'node' ? { kind: 'none' } : { kind: 'bearer', token: readyToken(parsed, this.authMode) }
-              current = { port: parsed.port, auth }
+              publishConnection(
+                { port: parsed.port, auth },
+                this.kind === 'node' ? 'legacy' : this.authMode,
+              )
               console.log(`[backend:${this.kind}] ready on port ${parsed.port}`)
               if (auth.kind === 'bearer' && !auth.token) {
                 console.error(`[backend:${this.kind}] ready line carries no credential for ${this.authMode} mode — requests are refused until restart`)
@@ -672,7 +716,7 @@ export class BackendManager {
       console.warn(`[backend:${this.kind}] exited with code ${String(code)}`)
       if (this.child === child) {
         this.child = null
-        current = null
+        publishConnection(null, null)
       }
     })
     child.on('error', (err) => {
@@ -682,7 +726,7 @@ export class BackendManager {
       console.error(`[backend:${this.kind}] process error`, err)
       if (this.child === child) {
         this.child = null
-        current = null
+        publishConnection(null, null)
       }
     })
   }
@@ -787,7 +831,7 @@ export class BackendManager {
     // Clear immediately: with child already nulled, the exit handler's
     // identity guard will (correctly) skip its own cleanup — without this,
     // stop() would leave a stale dead endpoint exposed forever (review B5)
-    current = null
+    publishConnection(null, null)
   }
 
   stop(): void {

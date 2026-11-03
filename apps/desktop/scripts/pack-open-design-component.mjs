@@ -33,8 +33,8 @@ import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 
-export const OPEN_DESIGN_PIN_VERSION = '0.22.2'
-export const OPEN_DESIGN_SHA = '34bc2ba810cf894daff6a7c1736d1cef6c7726b1'
+export const OPEN_DESIGN_PIN_VERSION = '0.26.1'
+export const OPEN_DESIGN_SHA = 'f5beffcb43f473db26e0127db901127a5db7256d'
 
 function requireDirectory(target, label) {
   const stat = fs.statSync(target, { throwIfNoEntry: false })
@@ -133,7 +133,11 @@ export async function packOpenDesignComponent({
       '-czf', tempAssetPath,
       '-C', stageDir,
       'app', 'open-design', 'open-design-web-standalone',
-    ])
+    ], {
+      // macOS bsdtar otherwise stores xattrs as AppleDouble `._*` members, which
+      // would pollute the component tree (and fail the unknown-file contract).
+      env: { ...process.env, COPYFILE_DISABLE: '1' },
+    })
 
     const sha256 = await sha256File(tempAssetPath)
     const size = fs.statSync(tempAssetPath).size

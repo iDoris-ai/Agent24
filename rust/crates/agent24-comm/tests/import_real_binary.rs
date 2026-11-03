@@ -20,9 +20,10 @@ use std::time::Duration;
 
 use agent24_comm::password_store::{Account, MemoryPasswordStore, PasswordStore};
 use agent24_comm::{
-    HyphaeLock, HyphaeRunner, ImportRequest, Invocation, Password, Sha256Digest, VerifiedBinary,
+    HyphaeRunner, ImportRequest, Invocation, Password, Sha256Digest, VerifiedBinary,
     current_platform, import,
 };
+use common::HyphaeLock;
 
 /// See `tests/real_binary.rs`'s own doc comment: `HYPHAE_TEST_BIN` may be
 /// either the proposal's unreproducible acceptance binary (this hash) or a

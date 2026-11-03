@@ -21,6 +21,26 @@ export const IpcChannels = {
   ApprovalDecide: 'approval:decide',
   OsModuleSetEnabled: 'os-module:set-enabled',
   CommInstall: 'comm:install',
+  // Private-key backup: native confirm + native save dialog in main; the
+  // backend writes the file itself, so the key never crosses IPC.
+  CommIdentityExport: 'comm:identity-export',
+  // Show the file from the last successful export in the file manager.
+  // The renderer may pass only that exact path; main ignores every other one.
+  CommRevealExport: 'comm:reveal-export',
+  // Elevated comm writes that used to ride the generic proxy. Strictly
+  // validated in main; presence binding is pending CORE-7c/CORE-2d.
+  CommContactAdd: 'comm:contact-add',
+  CommSend: 'comm:send',
+  // Restore from an encrypted backup: main picks the file (native open dialog)
+  // and collects the password (its own window); the page only names the identity.
+  CommImportPick: 'comm:import-pick',
+  CommIdentityImport: 'comm:identity-import',
+  // Whole-HOME import, relay list and unlock: elevated, so no longer on the
+  // generic proxy. Main picks the folder, validates the list and collects the
+  // password in its own window; the page supplies none of those.
+  CommHomeImport: 'comm:home-import',
+  CommRelaySet: 'comm:relay-set',
+  CommUnlock: 'comm:unlock',
   // A-3: disable/enable or unpair AgentEar (PATCH / DELETE
   // /api/v1/attached/agentear). The module name is fixed in main; the
   // renderer cannot name another one. Same native-confirm rule as above.
@@ -106,6 +126,15 @@ export interface BackendProxyRequest {
   idempotencyKey?: string
 }
 
+/** Result of the native "choose a backup file" step. Main reads and validates
+ *  the file at once; the page learns only the file NAME (to suggest a
+ *  nickname) and an opaque single-use ticket. The path and the contents stay in
+ *  the main process. `cancelled: false` means the file was not a usable backup. */
+export type CommImportPickResult =
+  | { ok: true; ticket: string; fileName: string }
+  | { ok: false; cancelled: true }
+  | { ok: false; cancelled: false; message: string }
+
 export interface BackendProxyResponse {
   ok: boolean
   status: number
@@ -165,6 +194,8 @@ export interface OpenDesignComponentStatusResult {
   /** SD-01: estimated seconds remaining; `null` while the rate is unknown
    * or zero. */
   etaSeconds?: number | null
+  /** Present when the main process rewrote the download onto a loopback test origin. */
+  overrideActive?: boolean
 }
 
 export interface OmlxDetectResult {

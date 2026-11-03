@@ -55,6 +55,10 @@ pub struct DaemonState {
     /// credential; absent for legacy daemons and for older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enroll_endpoint: Option<String>,
+    /// `"docked"` while the daemon runs only the migration-guard diagnostics
+    /// (CORE-5 D6); absent for a normal daemon. Never a credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_state: Option<String>,
 }
 
 impl DaemonState {
@@ -75,6 +79,7 @@ impl DaemonState {
             auth_mode: AuthMode::LegacySingleToken,
             protocol_version: Some(crate::PROTOCOL_VERSION),
             enroll_endpoint: None,
+            startup_state: None,
         };
         state.validate().map(|()| state)
     }
@@ -96,6 +101,7 @@ impl DaemonState {
             auth_mode: AuthMode::Capabilities,
             protocol_version: Some(crate::PROTOCOL_VERSION),
             enroll_endpoint: None,
+            startup_state: None,
         };
         state.validate().map(|()| state)
     }
@@ -105,6 +111,13 @@ impl DaemonState {
     #[must_use]
     pub fn with_enroll_endpoint(mut self, path: impl Into<String>) -> Self {
         self.enroll_endpoint = Some(path.into());
+        self
+    }
+
+    /// Mark this record as a docked (diagnostics-only) daemon (CORE-5 D6).
+    #[must_use]
+    pub fn docked(mut self) -> Self {
+        self.startup_state = Some("docked".to_owned());
         self
     }
 
@@ -177,10 +190,16 @@ fn hold_lock(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
 }
 
 pub fn write(state: &DaemonState) -> std::io::Result<()> {
-    state.validate().map_err(std::io::Error::other)?;
     let Some(dir) = state_dir() else {
         return Err(std::io::Error::other("HOME not set"));
     };
+    write_in(&dir, state)
+}
+
+/// [`write`] into an explicit directory.
+pub fn write_in(dir: &std::path::Path, state: &DaemonState) -> std::io::Result<()> {
+    state.validate().map_err(std::io::Error::other)?;
+    let dir = dir.to_path_buf();
     std::fs::create_dir_all(&dir)?;
     #[cfg(unix)]
     {
@@ -258,7 +277,14 @@ pub fn read_live() -> Option<DaemonState> {
 /// daemon can never delete a newer daemon's freshly-written state.
 pub fn remove_if_owner(pid: u32) {
     let Some(dir) = state_dir() else { return };
-    let Ok(_lock) = hold_lock(&dir) else { return };
+    remove_if_owner_in(&dir, pid, None);
+}
+
+/// [`remove_if_owner`] in an explicit directory. With `generation`, the file
+/// must also be of that daemon generation, so a same-pid record of another
+/// incarnation is never deleted (CORE-5 D6).
+pub fn remove_if_owner_in(dir: &std::path::Path, pid: u32, generation: Option<&str>) {
+    let Ok(_lock) = hold_lock(dir) else { return };
     let path = dir.join("daemon.json");
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return;
@@ -266,6 +292,7 @@ pub fn remove_if_owner(pid: u32) {
     if let Ok(state) = serde_json::from_str::<DaemonState>(&raw)
         && state.validate().is_ok()
         && state.pid == pid
+        && generation.is_none_or(|g| state.generation == g)
     {
         let _ = std::fs::remove_file(&path);
     }
@@ -361,6 +388,7 @@ mod tests {
             auth_mode: AuthMode::Capabilities,
             protocol_version: Some(crate::PROTOCOL_VERSION),
             enroll_endpoint: None,
+            startup_state: None,
         };
         assert!(with_token.validate().is_err());
         let without_token = DaemonState {
@@ -372,6 +400,7 @@ mod tests {
             auth_mode: AuthMode::LegacySingleToken,
             protocol_version: None,
             enroll_endpoint: None,
+            startup_state: None,
         };
         assert!(without_token.validate().is_err());
     }

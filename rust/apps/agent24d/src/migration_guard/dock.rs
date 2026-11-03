@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use super::atomic::FileOps;
 use super::guard_log::Phase;
 use super::manifest::{
-    BinaryIdentity, FORMAT_VERSION, StateError, parse_json, read_optional, write_json,
+    BinaryIdentity, FORMAT_VERSION, StateError, parse_json, read_optional_capped, write_json,
 };
 use super::replay::{Dock, ReplayOutcome};
 
@@ -43,6 +43,24 @@ pub enum DockCode {
     SpaceInsufficient,
     /// No declared migration budget G, or space cannot be measured (D2).
     SpaceBudgetUnknown,
+}
+
+impl DockCode {
+    /// The only `error_summary` a marker may carry (5f-3 gate): a closed set
+    /// keyed by the stable code, never raw error text, paths or SQL.
+    #[must_use]
+    pub const fn summary(self) -> &'static str {
+        match self {
+            Self::Interrupted => "upgrade interrupted before migration; databases unchanged",
+            Self::MigrationFailed => "migration failed; databases restored from snapshot",
+            Self::RollbackFailed => "restore failed; databases kept disabled, evidence retained",
+            Self::GuardInvalid => "migration guard log unreadable; nothing was touched",
+            Self::PersistFailed => "migration state could not be persisted",
+            Self::MarkerInvalid => "migration marker unreadable or of unknown format",
+            Self::SpaceInsufficient => "free space below the migration budget",
+            Self::SpaceBudgetUnknown => "migration space budget unknown or unmeasurable",
+        }
+    }
 }
 
 /// Where the upgrade stopped (marker `phase`).
@@ -226,12 +244,39 @@ pub struct MigrationMarker {
     pub migration_version: Option<i64>,
     pub phase: DockPhase,
     pub error_code: DockCode,
-    /// Bounded, scrubbed.
+    /// Always [`DockCode::summary`] of `error_code`; [`write_marker`] refuses
+    /// anything else.
     pub error_summary: String,
     pub rollback: RollbackState,
     pub before_migrations: PairMark,
     /// `None` = unknown (restore failed).
     pub observed_migrations: Option<PairMark>,
+}
+
+/// Longest identifier a marker may carry (attempt id, snapshot id, version).
+const ID_MAX: usize = 128;
+
+impl MigrationMarker {
+    /// Identifiers are short and plain: they reach the diagnostics body and
+    /// name a directory, so anything else is a hostile marker.
+    fn check_identifiers(&self) -> Result<(), StateError> {
+        let ok = |s: &str, extra: &[u8]| {
+            !s.is_empty()
+                && s.len() <= ID_MAX
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || extra.contains(&b))
+        };
+        let good = ok(&self.attempt_id, b"-")
+            && self.snapshot_id.as_deref().is_none_or(|s| ok(s, b"-"))
+            && ok(&self.failed_binary.version, b"-.+");
+        if good {
+            Ok(())
+        } else {
+            Err(StateError::Invalid(
+                "marker identifier out of bounds".into(),
+            ))
+        }
+    }
 }
 
 #[must_use]
@@ -244,13 +289,22 @@ pub fn write_marker(
     data_dir: &Path,
     m: &MigrationMarker,
 ) -> Result<(), StateError> {
+    if m.error_summary != m.error_code.summary() {
+        return Err(StateError::Invalid(
+            "error_summary is not the closed-set text for error_code".into(),
+        ));
+    }
     write_json(ops, data_dir, &marker_path(data_dir), m)
 }
 
-/// `Ok(None)` only when the marker is genuinely absent. Corrupt, unknown
-/// format or unreadable is `Err` = dock `marker_invalid`, never "no marker".
+/// A real marker is well under 2 KiB; anything past this is not one.
+pub const MARKER_MAX_BYTES: u64 = 16 * 1024;
+
+/// `Ok(None)` only when the marker is genuinely absent. Corrupt, oversize,
+/// unknown format or unreadable is `Err` = dock `marker_invalid`, never
+/// "no marker".
 pub fn read_marker(data_dir: &Path) -> Result<Option<MigrationMarker>, StateError> {
-    let Some(bytes) = read_optional(&marker_path(data_dir))? else {
+    let Some(bytes) = read_optional_capped(&marker_path(data_dir), MARKER_MAX_BYTES)? else {
         return Ok(None);
     };
     let m: MigrationMarker = parse_json(&bytes)?;
@@ -260,6 +314,7 @@ pub fn read_marker(data_dir: &Path) -> Result<Option<MigrationMarker>, StateErro
             m.format_version
         )));
     }
+    m.check_identifiers()?;
     Ok(Some(m))
 }
 
@@ -451,7 +506,7 @@ mod tests {
             migration_version: None,
             phase: DockPhase::Preflight,
             error_code: DockCode::SpaceInsufficient,
-            error_summary: "free space below budget".into(),
+            error_summary: DockCode::SpaceInsufficient.summary().into(),
             rollback: RollbackState::NotNeeded,
             before_migrations: PairMark {
                 store: ok,
@@ -500,5 +555,74 @@ mod tests {
         fs::remove_dir(&p).unwrap();
         std::os::unix::fs::symlink(td.path().join("nowhere"), &p).unwrap();
         assert!(read_marker(td.path()).is_err(), "dangling symlink");
+    }
+
+    /// 5f-3 gate: the writer refuses any summary outside the closed set.
+    #[test]
+    fn writer_refuses_a_summary_outside_the_closed_set() {
+        let td = tempfile::tempdir().unwrap();
+        let mut m = marker();
+        m.error_summary = "RAW-ERR /Users/jason/.agent24/agent24.db".into();
+        assert!(write_marker(&RealOps, td.path(), &m).is_err());
+        assert!(!marker_path(td.path()).exists());
+        // Another code's text is not this code's text either.
+        m.error_summary = DockCode::RollbackFailed.summary().into();
+        assert!(write_marker(&RealOps, td.path(), &m).is_err());
+        let all = [
+            DockCode::Interrupted,
+            DockCode::MigrationFailed,
+            DockCode::RollbackFailed,
+            DockCode::GuardInvalid,
+            DockCode::PersistFailed,
+            DockCode::MarkerInvalid,
+            DockCode::SpaceInsufficient,
+            DockCode::SpaceBudgetUnknown,
+        ];
+        let texts: std::collections::HashSet<_> = all.iter().map(|c| c.summary()).collect();
+        assert_eq!(texts.len(), all.len(), "one distinct text per code");
+        assert!(texts.iter().all(|t| t.len() <= 80 && !t.contains('/')));
+    }
+
+    /// 5f-3 gate: size cap, exactly at and over the limit; FIFO never blocks.
+    #[test]
+    fn read_marker_enforces_a_size_cap() {
+        let td = tempfile::tempdir().unwrap();
+        let p = marker_path(td.path());
+        let json = serde_json::to_string(&marker()).unwrap();
+        let pad = " ".repeat(MARKER_MAX_BYTES as usize - json.len());
+        fs::write(&p, format!("{json}{pad}")).unwrap();
+        assert!(read_marker(td.path()).unwrap().is_some(), "at the cap");
+        fs::write(&p, format!("{json}{pad} ")).unwrap();
+        assert!(read_marker(td.path()).is_err(), "one byte over");
+        fs::remove_file(&p).unwrap();
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .arg(&p)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(read_marker(td.path()).is_err(), "fifo");
+    }
+
+    #[test]
+    fn hostile_identifiers_are_marker_invalid() {
+        let td = tempfile::tempdir().unwrap();
+        let p = marker_path(td.path());
+        let edits: [fn(&mut MigrationMarker); 5] = [
+            |m| m.attempt_id = "../../etc".into(),
+            |m| m.attempt_id = "a".repeat(129),
+            |m| m.snapshot_id = Some(String::new()),
+            |m| m.snapshot_id = Some("x/y".into()),
+            |m| m.failed_binary.version = "1.0 /Users/jason".into(),
+        ];
+        for edit in edits {
+            let mut m = marker();
+            edit(&mut m);
+            fs::write(&p, serde_json::to_vec(&m).unwrap()).unwrap();
+            assert!(read_marker(td.path()).is_err());
+        }
+        fs::write(&p, serde_json::to_vec(&marker()).unwrap()).unwrap();
+        assert!(read_marker(td.path()).unwrap().is_some());
     }
 }

@@ -21,6 +21,7 @@
     "pack:open-design": "node scripts/pack-open-design-component.mjs",
     "test:stage-open-design": "node --test scripts/stage-open-design-resources.test.mjs",
     "test:pack-open-design": "node --test scripts/pack-open-design-component.test.mjs",
+    "test:open-design-mac-release": "node --test scripts/open-design-mac-release.test.mjs scripts/prepare-open-design-linux-resources.test.mjs scripts/check-open-design-release-asset.test.mjs",
     "build:mac": "pnpm build:rust && pnpm build && electron-builder --mac",
     "build:win": "pnpm build:rust && pnpm build && electron-builder --win",
     "build:linux": "pnpm build:rust && pnpm build && electron-builder --linux",
