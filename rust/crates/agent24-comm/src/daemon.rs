@@ -1864,7 +1864,21 @@ async fn run_actor(
         // The health task probes only while the promoted phase is `running`.
         // Publishing after the arm (not inside it) keeps the actor's select
         // from waiting on `hyphae health`.
-        let _ = running_tx.send(matches!(phase, Phase::Running { .. }));
+        //
+        // `watch::Sender::send` bumps the version even when the bool is
+        // unchanged. That wakes `health_loop` mid-probe, drops the sample,
+        // and the new-run path clears the failure ledger. An idempotent
+        // `start()` while already running must not do that: publish only
+        // when the phase actually crosses into or out of `running`.
+        let now_running = matches!(phase, Phase::Running { .. });
+        running_tx.send_if_modified(|current| {
+            if *current == now_running {
+                false
+            } else {
+                *current = now_running;
+                true
+            }
+        });
     }
 }
 

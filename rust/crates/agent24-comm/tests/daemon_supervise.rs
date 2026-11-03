@@ -1540,6 +1540,159 @@ async fn consecutive_health_failures_degrade_and_one_success_clears() {
     );
 }
 
+/// Idempotent `start()` while a probe is in flight must not publish a fresh
+/// `running` watch value. `watch::Sender::send` would, the health loop would
+/// drop the sample, and `reset_health` would wipe a ledger that is still on
+/// the same generation.
+#[tokio::test]
+async fn idempotent_start_during_an_in_flight_probe_keeps_the_health_ledger() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = script_with(
+        "1.0",
+        r#"    n=0
+    if [ -f "$HOME/health-hits" ]; then n=$(cat "$HOME/health-hits"); fi
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$HOME/health-hits"
+    sleep 1
+    printf '%s\n' '{"ok":true,"data":{"status":"failed","checks":{"relays":{"ok":false}}}}'
+    exit 0"#,
+    );
+    let ctx = make_ctx_with_script(tmp.path(), &script).await;
+    let hits = ctx.home.join("health-hits");
+    let sup = FixtureSupervisor::spawn(ctx);
+    sup.arm_probe(test_arm(
+        Duration::from_millis(50),
+        Duration::from_secs(4),
+        Duration::from_secs(5),
+    ));
+    sup.start().await.unwrap();
+    assert!(
+        wait_until(|| sup.status().state == "running", Duration::from_secs(5)).await,
+        "status {:?}",
+        sup.status()
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let snap = sup.probe_snapshot();
+        let strikes = snap
+            .health
+            .as_ref()
+            .map(|health| health.consecutive_failures)
+            .unwrap_or(0);
+        // The counter is written before `sleep 1`, so hits >= 3 while the
+        // ledger is still at 2 means the third probe is in flight.
+        if strikes == 2 && count_file(&hits) >= 3 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "third probe never overlapped two strikes: hits {} snap {:?}",
+            count_file(&hits),
+            sup.probe_snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let before = sup.probe_snapshot();
+    assert!(
+        before
+            .health
+            .as_ref()
+            .is_some_and(|health| health.consecutive_failures == 2),
+        "precondition lost before start: {before:?}"
+    );
+    sup.start().await.unwrap();
+    // Long enough for a woken health loop to clear the ledger, short enough
+    // that the 1s probe has not finished and replaced it.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let after = sup.probe_snapshot();
+    let health = after.health.as_ref().unwrap_or_else(|| {
+        panic!("idempotent start cleared the health ledger: before {before:?} after {after:?}")
+    });
+    assert!(
+        health.consecutive_failures >= 2,
+        "idempotent start dropped strikes: before {before:?} after {after:?}"
+    );
+}
+
+/// A new process generation (stop, then start) clears the previous run's
+/// health ledger as it enters `running`, before the next sample lands.
+/// Deleting `reset_health` leaves the old strikes in place for the whole
+/// in-flight probe.
+#[tokio::test]
+async fn a_new_generation_clears_the_health_ledger() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = script_with(
+        "1.0",
+        r#"    sleep 1
+    printf '%s\n' '{"ok":true,"data":{"status":"failed","checks":{"relays":{"ok":false}}}}'
+    exit 0"#,
+    );
+    let ctx = make_ctx_with_script(tmp.path(), &script).await;
+    let sup = FixtureSupervisor::spawn(ctx);
+    sup.arm_probe(test_arm(
+        Duration::from_millis(50),
+        Duration::from_secs(4),
+        Duration::from_secs(5),
+    ));
+    sup.start().await.unwrap();
+    assert!(
+        wait_until(
+            || {
+                sup.probe_snapshot()
+                    .health
+                    .as_ref()
+                    .is_some_and(|health| health.consecutive_failures >= 2)
+            },
+            Duration::from_secs(15),
+        )
+        .await,
+        "ledger never reached two strikes: {:?}",
+        sup.probe_snapshot()
+    );
+    let generation = sup.status().generation;
+    assert!(generation >= 1, "status {:?}", sup.status());
+    sup.stop().await;
+    assert_eq!(sup.status().state, "stopped");
+    assert!(
+        sup.probe_snapshot()
+            .health
+            .as_ref()
+            .is_some_and(|health| health.consecutive_failures >= 2),
+        "stop itself must leave the ledger: {:?}",
+        sup.probe_snapshot()
+    );
+    // `stop` replies before the actor publishes `running=false`. Wait so the
+    // health loop parks on that edge; the next `true` is then a new run.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        sup.probe_snapshot().health.is_some(),
+        "ledger disappeared while stopped: {:?}",
+        sup.probe_snapshot()
+    );
+    sup.start().await.unwrap();
+    assert!(
+        wait_until(
+            || {
+                let status = sup.status();
+                status.state == "running" && status.generation > generation
+            },
+            Duration::from_secs(8),
+        )
+        .await,
+        "new generation did not reach running: {:?}",
+        sup.status()
+    );
+    assert!(
+        wait_until(
+            || sup.probe_snapshot().health.is_none(),
+            Duration::from_millis(700),
+        )
+        .await,
+        "new generation kept the previous ledger: {:?}",
+        sup.probe_snapshot()
+    );
+}
+
 #[tokio::test]
 async fn a_health_probe_in_flight_does_not_block_stop() {
     let tmp = tempfile::tempdir().unwrap();

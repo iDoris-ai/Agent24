@@ -379,6 +379,7 @@ D4 原文写「退出码只区分 0、1、2」，这和 Hyphae 现有的语义�
 - **只要产出了报告，envelope 就是 `ok:true`，退出码为 0**，即使 `status` 是 `degraded` 或 `failed`。只有体检本身没能跑起来时才返回 `ok:false`。
 - 状态映射（**只对常驻型组件**，即由 Agent24 托管 Hyphae daemon 的情形；按次调用型 CLI 没有 `ready / degraded`，D5 已定，`health` 对它只是诊断信息）：
   - `health` 的结果是 D5「健康探测连续失败 N 次 → degraded」那条规则的**输入**，不直接改状态：`status:ok` 算一次探测成功；`degraded` 或 `failed` 算一次探测失败，连续 N 次（锁里可配，默认 3）才从 `ready` 进 `degraded`，一次成功就回 `ready`。
+  - **「连续」按整份 health 样本计数，不按单个 check 计数。** 一次 `hyphae health` 调用是一份样本；命令没跑起来（超时、崩溃、没有可读报告）也是一份样本。`status:ok` 把聚合失败次数清零；`status:degraded`、`status:failed`，或命令本身失败，各把聚合次数加一。同一份样本里多个 check 同时失败只加一。下一份样本换成另一个 check 失败（先 `relays` 后 `keystore`）仍接在同一个聚合次数上，不因换了 check 而从零重计。单个 check 自己的连续失败次数只写进宿主视图，不单独触发 `ready → degraded`。
   - `checks.daemon.running=false` 时映射为 `stopped`（daemon 没在跑，不是健康问题），并与 pid 存活判定取一致。
   - 为什么 `failed` 不直接映射成 D5 的 `failed`：`health` 返回了报告就证明 CLI 本身能跑；`status:failed` 说的是 relay 不可达或 keystore 有问题，这是「组件在跑但服务降级」，不是「组件崩了」。D5 的 `failed` 只留给进程崩溃和启动失败。
   - `ok:false`（体检没跑起来）按 D6 的错误处理，同样只计一次探测失败。
