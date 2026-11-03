@@ -15,6 +15,7 @@ import {
   classifyCreativeUrl,
   creativeChildEnvironment,
   resolveBundledAgent24Cli,
+  resolveNodeRuntimeExecutable,
   parseAgent24HeadlessReady,
   resolveAgent24HeadlessLauncher,
   resolveOpenDesignCheckout,
@@ -509,6 +510,22 @@ describe('CreativeServeWeb', () => {
       const env = (spawnFn.mock.calls[0] as unknown as [string, string[], { env: NodeJS.ProcessEnv }])[2].env
       expect(env.AGENT24_BIN).toBe(expected)
       await service.stop()
+    }
+  })
+
+  it('runs Open Design children under the LSUIElement Helper on macOS so none of them gets a Dock tile', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-helper-'))
+    try {
+      const execPath = path.join(root, 'Agent24.app', 'Contents', 'MacOS', 'Agent24')
+      const helper = path.join(root, 'Agent24.app', 'Contents', 'Frameworks', 'Agent24 Helper.app', 'Contents', 'MacOS', 'Agent24 Helper')
+      expect(resolveNodeRuntimeExecutable(execPath, 'darwin')).toBe(execPath)
+      fs.mkdirSync(path.dirname(helper), { recursive: true })
+      fs.writeFileSync(helper, '')
+      expect(resolveNodeRuntimeExecutable(execPath, 'darwin')).toBe(helper)
+      expect(resolveNodeRuntimeExecutable(execPath, 'linux')).toBe(execPath)
+      expect(resolveNodeRuntimeExecutable(execPath, 'win32')).toBe(execPath)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
     }
   })
 
