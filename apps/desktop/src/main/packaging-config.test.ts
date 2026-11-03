@@ -51,3 +51,33 @@ describe('installer excludes node-daemon (ADR-037)', () => {
     }
   })
 })
+
+// T1-1 (#1159 Q1 = A, ADR-DOC-01 D6): the mac installer carries the documents
+// module package staged by scripts/stage-documents-module.sh; Linux/Windows do
+// not (decided 2026-11-03). build:mac stages it before electron-builder runs,
+// so a mac build never packs a stale or missing module by accident.
+describe('mac installer carries the documents module (T1-1)', () => {
+  const isModule = (r: Res): boolean => r.to === 'documents-module'
+
+  it('mac extraResources copies .documents-module to documents-module', () => {
+    const entries = pkg.build.mac.extraResources.filter(isModule)
+    expect(entries).toHaveLength(1)
+    expect(entries[0]!.from).toBe('.documents-module')
+  })
+
+  it('win, linux and the global list do not', () => {
+    for (const list of [pkg.build.extraResources, pkg.build.win.extraResources, pkg.build.linux.extraResources]) {
+      expect(JSON.stringify(list)).not.toMatch(/documents-module/)
+    }
+  })
+
+  it('build:mac builds and stages the module before electron-builder', () => {
+    const steps = pkg.scripts['build:mac']!.split('&&').map((s) => s.trim())
+    const at = (s: string): number => steps.indexOf(s)
+    expect(at('pnpm build:rust:documents')).toBeGreaterThanOrEqual(0)
+    expect(at('pnpm stage:documents')).toBeGreaterThan(at('pnpm build:rust:documents'))
+    expect(at('electron-builder --mac')).toBeGreaterThan(at('pnpm stage:documents'))
+    expect(pkg.scripts['build:win']).not.toMatch(/documents/)
+    expect(pkg.scripts['build:linux']).not.toMatch(/documents/)
+  })
+})
