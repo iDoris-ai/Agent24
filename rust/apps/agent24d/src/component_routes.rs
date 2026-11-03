@@ -24,10 +24,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::capabilities::{Audience, Authorization};
-use crate::domain::MountOutcome;
+use crate::domain::{MountOutcome, MountReport};
 use crate::server::AppState;
 use agent24_components::{ComponentState, Form};
 use agent24_protocol::state_file::AuthMode;
+
+mod documents_catalog;
 
 /// A desktop report is believed for this long. The desktop re-sends on a timer (C3b), so a
 /// silent desktop (crashed, quit) reads as "not reporting" rather than as a stale `ready`.
@@ -46,6 +48,12 @@ pub struct Provide {
     id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<Value>,
+    /// One-line description in zh/en/th. Locks that omit it stay as C3a shipped them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<Value>,
+    /// Tool names this capability exposes (D9). Empty for a lock that lists none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<String>,
 }
 
 /// The host view of one component.
@@ -100,6 +108,8 @@ impl Item {
                     .name
                     .as_ref()
                     .map(|n| json!({"zh": n.zh, "en": n.en, "th": n.th})),
+                summary: None,
+                tools: p.tools.clone(),
             })
             .collect()
     }
@@ -299,21 +309,24 @@ fn attach_items_from(mut modules: Vec<(String, bool, Option<DrainState>)>) -> Ve
         .collect()
 }
 
-/// The Documents package, from the mount report and its supervisor. Not mounted at all is
-/// `absent`: there is no other status source for it.
-fn documents_item(state: &AppState) -> Item {
-    let item = Item::new("documents", Form::Resident, ComponentState::Absent);
-    let Some(report) = state.os_reports.iter().find(|r| r.name == "documents") else {
-        return item;
-    };
-    let live = state
-        .module_status
-        .get("documents")
-        .map(|rx| rx.borrow().clone());
-    let (mapped, reason, detail) = match (&report.outcome, live) {
+/// Documents runs as a supervised out-of-process domain OS (`domain-os.yml`:
+/// `impl_kind: out_of_process_provider`). D5's 常驻型 uses the whole state set,
+/// so the form is [`Form::Resident`]. The supervisor's starting, ready,
+/// stopping and stopped readings all belong to that set.
+fn documents_form() -> Form {
+    Form::Resident
+}
+
+/// Mount outcome plus the supervisor's live status. The state is D5's; the
+/// catalog does not choose it.
+fn documents_mapped(
+    outcome: &MountOutcome,
+    live: Option<&Supervised>,
+) -> (ComponentState, Option<&'static str>, Option<String>) {
+    match (outcome, live) {
         (MountOutcome::Mounted, Some(status)) => {
-            let (s, r) = from_supervised(&status);
-            (s, r, None)
+            let (state, reason) = from_supervised(status);
+            (state, reason, None)
         }
         (MountOutcome::Mounted, None) => (ComponentState::Ready, None, None),
         (MountOutcome::Disabled, _) => (ComponentState::Stopped, Some("disabled"), None),
@@ -323,13 +336,62 @@ fn documents_item(state: &AppState) -> Item {
         (MountOutcome::Refused(why), _) => {
             (ComponentState::Failed, Some("refused"), Some(why.clone()))
         }
-    };
-    item.with(|i| {
-        i.state = mapped;
-        i.version = Some(report.version.clone());
-        i.reason = reason.map(str::to_owned);
-        i.detail = detail.map(|why| json!({"message": why}));
-    })
+    }
+}
+
+/// Fill provides and version from the catalog. A missing or broken catalog
+/// leaves the state alone and the provides empty: listing components must not
+/// panic because the JSON failed to parse.
+fn apply_documents_catalog(
+    item: &mut Item,
+    catalog: Result<documents_catalog::DocumentsCatalog, documents_catalog::CatalogError>,
+) {
+    match catalog {
+        Ok(catalog) => {
+            item.version = Some(catalog.version.clone());
+            item.provides = catalog.into_provides();
+        }
+        Err(err) => {
+            tracing::warn!(%err, "documents component catalog is unusable; provides left empty");
+            if item.reason.is_none() {
+                item.reason = Some("catalog_invalid".into());
+            }
+        }
+    }
+}
+
+fn documents_from(
+    report: Option<&MountReport>,
+    live: Option<&Supervised>,
+    catalog: Result<documents_catalog::DocumentsCatalog, documents_catalog::CatalogError>,
+) -> Item {
+    let mut item = Item::new("documents", documents_form(), ComponentState::Absent);
+    if let Some(report) = report {
+        let (mapped, reason, detail) = documents_mapped(&report.outcome, live);
+        item.state = mapped;
+        item.version = Some(report.version.clone());
+        item.reason = reason.map(str::to_owned);
+        item.detail = detail.map(|why| json!({"message": why}));
+    }
+    apply_documents_catalog(&mut item, catalog);
+    item
+}
+
+/// The Documents package. State comes from the mount report and its supervisor.
+/// Not mounted at all is `absent`. Provides and version come from the D9 catalog.
+fn documents_item(state: &AppState) -> Item {
+    let report = state.os_reports.iter().find(|r| r.name == "documents");
+    let live = report.and_then(|_| {
+        state
+            .module_status
+            .get("documents")
+            .map(|rx| rx.borrow().clone())
+    });
+    documents_from(
+        report,
+        live.as_ref(),
+        documents_catalog::DocumentsCatalog::embedded(),
+    )
 }
 
 /// Knowledge, remote subset (ADR-038 D5, C5). No endpoint is `stopped`. A
