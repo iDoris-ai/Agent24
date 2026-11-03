@@ -752,7 +752,9 @@ export function registerIpcHandlers(options: {
       if (backupPassword === null) return cancelled()
       try {
         if (!isSafeBackupPassword(backupPassword)) return invalidRequest('invalid backup password')
-        if (quitting) return cancelled()
+        // The window the user started from went away while they typed: do not
+        // open a detached dialog and carry on for nobody.
+        if (quitting || (parent && parent.isDestroyed())) return cancelled()
         // 4. Where to save. The password window is already gone. A parent that
         // is still here is brought forward and hosts the sheet; a missing one
         // is app-modal. The sheet has no deadline. Parent `closed` or
@@ -764,6 +766,8 @@ export function registerIpcHandlers(options: {
           filters: [{ name: 'NIP-49 ncryptsec', extensions: ['ncryptsec'] }],
         }
         const anchor = saveDialogParent(parent)
+        // Destroyed while being brought forward: same rule as above, cancel.
+        if (parent && !anchor) return cancelled()
         let picked: Electron.SaveDialogReturnValue
         try {
           const raced = await showSaveDialogUntilGone(anchor, saveOptions)

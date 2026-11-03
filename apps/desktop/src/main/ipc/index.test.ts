@@ -647,33 +647,15 @@ describe('CommIdentityExport elevated IPC', () => {
     }
   })
 
-  it('a destroyed parent still gets an app-modal save dialog, and the export promise settles', async () => {
-    const target = path.join(settingsDir, 'sheet-fallback.ncryptsec')
-    let releaseHung: (() => void) | null = null
-    showSaveDialog.mockImplementation((...args: unknown[]) => {
-      if (args.length === 2) return new Promise((resolve) => { releaseHung = () => resolve({ canceled: true }) })
-      return Promise.resolve({ canceled: false, filePath: target })
-    })
-    parentWindow = trackableParent({ destroyed: true })
+  it('the parent window destroyed between the password step and the save step: cancelled, no dialog, no daemon call', async () => {
+    let parentDestroyed = false
+    parentWindow = { ...trackableParent(), isDestroyed: () => parentDestroyed }
     showMessageBox.mockResolvedValueOnce({ response: 0 })
-    promptBackupPassword.mockResolvedValueOnce(PW)
-    const pending = call(IpcChannels.CommIdentityExport, 'alice')
-    const outcome = await Promise.race([
-      pending.then((result) => result as { ok?: boolean }),
-      new Promise<string>((resolve) => setTimeout(() => resolve('hung'), 200)),
-    ])
-    try {
-      expect(outcome).not.toBe('hung')
-      expect(outcome).toMatchObject({ ok: true })
-      expect(showSaveDialog).toHaveBeenCalledTimes(1)
-      expect(showSaveDialog.mock.calls[0]).toHaveLength(1)
-      expect(parentWindow.calls).toEqual([])
-      expect(appFocus).not.toHaveBeenCalled()
-      expect(seen.filter((r) => r.url === '/api/v1/comm/identity/export')).toHaveLength(1)
-    } finally {
-      releaseHung?.()
-      await pending
-    }
+    promptBackupPassword.mockImplementationOnce(async () => { parentDestroyed = true; return PW })
+    const result = await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(result.data.error.code).toBe('cancelled')
+    expect(showSaveDialog).not.toHaveBeenCalled()
+    expect(seen.filter((r) => r.url === '/api/v1/comm/identity/export')).toHaveLength(0)
   })
 
   it('the save dialog is a sheet on the starting window while it is visible and enabled', async () => {
