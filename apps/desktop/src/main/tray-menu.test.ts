@@ -89,6 +89,8 @@ it('refreshes missing protocol details on locale changes without a new backend s
 })
 
 it('tells the user of a reused (LaunchAgent) daemon how to get Knowledge working', () => {
-  expect(buildTrayView({ ...input, external: true, externalPid: 4242 }).tooltip).toContain('`agent24 service uninstall`')
-  expect(buildTrayView(input).tooltip).not.toContain('service uninstall')
+  const reused = { ...input, external: true, externalPid: 4242 }
+  expect(buildTrayView(reused, 'darwin').tooltip).toContain('`agent24 service uninstall`')
+  expect(buildTrayView(reused, 'win32').tooltip).not.toContain('service uninstall')
+  expect(buildTrayView(input, 'darwin').tooltip).not.toContain('service uninstall')
 })

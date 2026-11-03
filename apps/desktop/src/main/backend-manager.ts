@@ -555,7 +555,9 @@ export class BackendManager {
   private async tryReuseExternal(): Promise<'reused' | 'foreign' | 'absent' | 'incompatible' | 'superseded'> {
     const lifecycle = this.lifecycle
     const state = this.external.read()
-    if (!state) {
+    // A record whose pid is gone is stale: whatever holds its port now gets
+    // neither a probe nor the token (the Rust readers check the same).
+    if (!state || !this.external.isAlive(state.pid)) {
       this.blockedReason = null
       this.foreignPid = null
       return 'absent'

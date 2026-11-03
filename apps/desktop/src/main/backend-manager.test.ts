@@ -162,7 +162,7 @@ function launchAgent(): Pick<ExternalDaemonSource, 'serviceManaged' | 'acceptsTo
     serviceManaged: () => true,
     acceptsToken: vi.fn().mockResolvedValue(true),
     requestShutdown: vi.fn().mockResolvedValue(202),
-    isAlive: () => false,
+    isAlive: () => true,
   }
 }
 
@@ -484,7 +484,7 @@ describe('BackendManager takes over a CLI daemon so Knowledge works (T1-0)', () 
       serviceManaged: () => false,
       acceptsToken: vi.fn().mockResolvedValue(true),
       requestShutdown: vi.fn().mockResolvedValue(202),
-      isAlive: vi.fn().mockReturnValueOnce(true).mockReturnValue(false),
+      isAlive: vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(true).mockReturnValue(false),
       ...over,
     }
   }
@@ -512,7 +512,16 @@ describe('BackendManager takes over a CLI daemon so Knowledge works (T1-0)', () 
     const external = cliDaemon({ requestShutdown: vi.fn().mockResolvedValue(status), isAlive: vi.fn(() => true) })
     const { spawnProcess } = await started(external)
     expect(spawnProcess).toHaveBeenCalledTimes(1)
-    expect(external.isAlive).not.toHaveBeenCalled()
+    expect(external.isAlive).toHaveBeenCalledTimes(1) // the stale-record check only: no wait
+  })
+
+  it('a record whose pid is gone is stale: no probe, no token sent anywhere, spawn once', async () => {
+    const external = cliDaemon({ isAlive: () => false })
+    const { spawnProcess } = await started(external)
+    expect(external.fetchHealth).not.toHaveBeenCalled()
+    expect(external.requestShutdown).not.toHaveBeenCalled()
+    expect(external.acceptsToken).not.toHaveBeenCalled()
+    expect(spawnProcess).toHaveBeenCalledTimes(1)
   })
 
   it('a CLI daemon still alive after the wait does not block the spawn', async () => {
