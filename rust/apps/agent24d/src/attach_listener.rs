@@ -157,7 +157,11 @@ pub async fn run(registry: Arc<AttachRegistry>, path: PathBuf, stop: Cancellatio
     // after an ungraceful exit.
 }
 
-async fn handle_connection(stream: UnixStream, registry: &AttachRegistry, stop: CancellationToken) {
+pub(crate) async fn handle_connection(
+    stream: UnixStream,
+    registry: &AttachRegistry,
+    stop: CancellationToken,
+) {
     // §4.1: same-UID only. The directory is already `0700`, so this is a
     // second line, not the first — same posture as
     // `CallbackListener::accept_one`.
@@ -208,6 +212,17 @@ async fn handle_connection(stream: UnixStream, registry: &AttachRegistry, stop: 
             // Re-checked after the lookup too: `revoke_all` can land between
             // the `is_closed` check above and `expectation`, and the refusal
             // it then causes must not reach the module as `auth_failed`.
+            // D3: a range refusal is also component state `incompatible`.
+            // The wire error stays `version_mismatch` (握手不变).
+            // `accept_attached` already checked the token, so an unknown name
+            // never reaches here. A closed registry is not recorded.
+            if !registry.is_closed()
+                && let HandshakeError::VersionMismatch(mismatch) = &refusal
+                && let Some(name) = claimed_module(&frame)
+            {
+                let (expected, actual) = contract_ends(mismatch);
+                registry.note_contract_mismatch(&name, &expected, &actual);
+            }
             let refusal = if registry.is_closed() {
                 HandshakeError::ShuttingDown
             } else {
@@ -301,6 +316,26 @@ async fn handle_connection(stream: UnixStream, registry: &AttachRegistry, stop: 
     }
     let _ended = serve.await;
     registry.release(&claim.module, &generation);
+}
+
+/// The `params.module` the peer claimed. `None` when the frame is not an
+/// object with a string module — those refusals are not version mismatches.
+fn claimed_module(frame: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(frame).ok()?;
+    value
+        .get("params")?
+        .get("module")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// `(expected, actual)` for the host detail. `expected` is the kernel range.
+fn contract_ends(mismatch: &agent24_os_proto::version::VersionMismatch) -> (String, String) {
+    use agent24_os_proto::version::VersionMismatch;
+    match mismatch {
+        VersionMismatch::NotDeclared { kernel } => (kernel.to_string(), "not_declared".to_owned()),
+        VersionMismatch::NoOverlap { module, kernel } => (kernel.to_string(), module.to_string()),
+    }
 }
 
 async fn write_within(
