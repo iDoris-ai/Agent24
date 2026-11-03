@@ -29,6 +29,9 @@ export default function ModulesManagerPage() {
   const [osToggling, setOsToggling] = useState<string | null>(null)
   const [docStatus, setDocStatus] = useState<DocumentsModuleStatus | null>(null)
   const [docBusy, setDocBusy] = useState(false)
+  // An uninstall/install failure: shown on its own, so it does not hide the
+  // list (or the Install row) the way a failed list read does.
+  const [docError, setDocError] = useState<string | null>(null)
 
   const loadOsSeq = useRef(0)
 
@@ -75,21 +78,26 @@ export default function ModulesManagerPage() {
 
   async function documentsAction(kind: 'uninstall' | 'install') {
     setDocBusy(true)
-    setOsError(null)
-    let failure: string | null = null
+    setDocError(null)
     try {
       await (kind === 'uninstall' ? uninstallDocumentsModule() : installBundledDocumentsModule())
     } catch (e) {
-      failure = t('error.docmod', {
+      setDocError(t('error.docmod', {
         action: t(kind === 'uninstall' ? 'docmod.uninstall' : 'docmod.install'),
         msg: e instanceof Error ? e.message : String(e),
-      })
+      }))
+    } finally {
+      setDocBusy(false)
+      void loadOs()
     }
-    setDocBusy(false)
-    // Reloading clears the error, so the failure is shown after it.
-    await loadOs()
-    if (failure !== null) setOsError(failure)
   }
+
+  /** Uninstalled, but the daemon still serves what it mounted at start. Its
+   * on/off switch is gone too: turning it off now would write an os.json
+   * entry for a module that no longer exists, which degrades every module at
+   * the next start. */
+  const removedPending = (mod: DomainOsView): boolean =>
+    mod.name === DOCUMENTS && docStatus !== null && !docStatus.installed
 
   const restartHint = (): string => t(docStatus?.externalDaemon ? 'docmod.restartCli' : 'docmod.restartTray')
   const PILL = { fontSize: 12, fontWeight: 600, padding: '5px 14px', borderRadius: 20, cursor: 'pointer' } as const
@@ -177,7 +185,7 @@ export default function ModulesManagerPage() {
               background: `${meta.color}22`, color: meta.color, border: `1px solid ${meta.color}44`,
             }}>{meta.label}</span>
             {documentsControls(mod)}
-            <button
+            {!removedPending(mod) && <button
               onClick={() => void toggleOs(mod)}
               disabled={osToggling === mod.name}
               style={{
@@ -188,7 +196,7 @@ export default function ModulesManagerPage() {
               }}
             >
               {osToggling === mod.name ? '…' : mod.enabled ? t('os.disable') : t('os.enable')}
-            </button>
+            </button>}
           </div>
         </div>
         {mod.detail && <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 8 }}>{mod.detail}</div>}
@@ -231,6 +239,11 @@ export default function ModulesManagerPage() {
         {osError && (
           <div style={{ color: '#f44336', fontSize: 12, padding: '8px 12px', marginBottom: 8, background: 'rgba(244,67,54,0.1)', borderRadius: 6, border: '1px solid rgba(244,67,54,0.3)' }}>
             {osError}
+          </div>
+        )}
+        {docError && (
+          <div role="alert" style={{ color: '#f44336', fontSize: 12, padding: '8px 12px', marginBottom: 8, background: 'rgba(244,67,54,0.1)', borderRadius: 6, border: '1px solid rgba(244,67,54,0.3)', whiteSpace: 'pre-line' }}>
+            {docError}
           </div>
         )}
         {osRegistryError && (

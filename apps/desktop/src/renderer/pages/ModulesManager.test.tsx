@@ -127,12 +127,23 @@ describe('ModulesManagerPage — documents uninstall / install (T1-2)', () => {
     await waitFor(() => expect(backendProxy.mock.calls.filter(([r]) => r.path === '/api/v1/os').length).toBe(2))
   })
 
-  it('uninstalled but the daemon still lists it: says to restart, no buttons for it', async () => {
-    mount({ osList: { modules: [DOCS] }, docStatus: () => ({ bundled: true, installed: false, externalDaemon: false }) })
+  it('uninstalled but the daemon still lists it: says to restart, no buttons for it (not even on/off)', async () => {
+    mount({ osList: { modules: [DOCS] }, docStatus: () => ({ bundled: true, installed: false, externalDaemon: true }) })
     expect(await screen.findByText('已卸载，重启 daemon 后生效')).toBeInTheDocument()
-    expect(screen.getByText('在菜单栏图标里选「重启 daemon」。')).toBeInTheDocument()
+    expect(screen.getByText(/agent24 daemon stop && agent24 daemon start/)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '卸载' })).toBeNull()
     expect(screen.queryByRole('button', { name: '安装' })).toBeNull()
+    // Turning it off now would leave os.json naming a module that is gone.
+    expect(screen.queryByRole('button', { name: '停用' })).toBeNull()
+  })
+
+  it('a failed install keeps the Install row, with the error beside it', async () => {
+    const fail = (): Promise<Res> => Promise.resolve({ ok: false, status: 500, data: { error: { code: 'signature_invalid', message: '失败：a sealed resource is missing or invalid' } } })
+    mount({ osList: { modules: [SIN90] }, docStatus: () => ({ bundled: true, installed: false, externalDaemon: false }), install: fail })
+    fireEvent.click(await screen.findByRole('button', { name: '安装' }))
+    expect(await screen.findByText(/安装 documents 失败：.*sealed resource/)).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('button', { name: '安装' })).toBeEnabled())
+    expect(screen.getByText('sin90')).toBeInTheDocument()
   })
 
   it('not installed and the app carries it: an Install row', async () => {

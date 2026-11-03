@@ -428,6 +428,19 @@ const defaultExternalDaemonSource: ExternalDaemonSource = {
   fetchHealth: fetchDaemonHealth,
 }
 
+/** Resolves once `child` has exited (or after `timeoutMs`, whichever is first). */
+function exited(child: ChildProcess, timeoutMs: number): Promise<void> {
+  if (child.exitCode !== null && child.exitCode !== undefined) return Promise.resolve()
+  if (child.signalCode !== null && child.signalCode !== undefined) return Promise.resolve()
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs)
+    child.once('exit', () => {
+      clearTimeout(timer)
+      resolve()
+    })
+  })
+}
+
 export class BackendManager {
   private child: ChildProcess | null = null
   private healthTimer: NodeJS.Timeout | null = null
@@ -673,6 +686,28 @@ export class BackendManager {
       this.killChild()
     }
     this.spawnChild()
+  }
+
+  /**
+   * T1-2: runs `work` with the daemon this app spawned stopped — waited for
+   * until it has exited, so its singleton lock is free — and brings it back
+   * afterwards unless the user had stopped it. A capabilities-mode daemon
+   * holds the lock and gives the CLI no credential, so `agent24 os
+   * install|uninstall` cannot revoke consent while it runs (agent24-cli
+   * `attach_only` → offline store → busy). A reused external daemon is not
+   * ours to stop: `work` just runs, and the CLI reaches it as it can.
+   */
+  async whileStopped<T>(work: () => Promise<T>, exitTimeoutMs = 15_000): Promise<T> {
+    if (this.isExternal || this.disposed) return work()
+    const resume = !this.userStopped
+    const child = this.child
+    this.stopDaemon()
+    if (child) await exited(child, exitTimeoutMs)
+    try {
+      return await work()
+    } finally {
+      if (resume && !this.disposed) this.startDaemon()
+    }
   }
 
   /** Forget a reused external daemon without touching the process itself. */

@@ -411,10 +411,13 @@ const invalidRequest = (message: string): BackendProxyResponse =>
 const moduleActionUnavailable = (): BackendProxyResponse =>
   ({ ok: false, status: 404, data: { error: { code: 'no_bundle', message: mt('err.docmodNoBundle') } } })
 /** A T1-2 action's result as the page reads any IPC answer; the code is passed through. */
-function moduleActionResponse(result: ModuleActionResult): BackendProxyResponse {
+function moduleActionResponse(result: ModuleActionResult, externalDaemon: boolean): BackendProxyResponse {
   if (result.ok) return { ok: true, status: 200, data: { ok: true } }
   const status = result.code === 'already_installed' ? 409 : result.code === 'no_bundle' ? 404 : 500
-  return { ok: false, status, data: { error: { code: result.code, message: mt('err.docmodFailed', { reason: clip(result.message, 300) }) } } }
+  // A daemon started outside the app is not ours to stop; one that holds the
+  // database lock makes the CLI fail, and stopping it is the user's call.
+  const hint = externalDaemon && result.code === 'cli_failed' ? `\n${mt('err.docmodExternal')}` : ''
+  return { ok: false, status, data: { error: { code: result.code, message: `${mt('err.docmodFailed', { reason: clip(result.message, 300) })}${hint}` } } }
 }
 
 export function registerIpcHandlers(options: {
@@ -1074,9 +1077,23 @@ export function registerIpcHandlers(options: {
       if (!documentsModule().installed) {
         return { ok: false, status: 404, data: { error: { code: 'not_installed', message: mt('err.docmodNotInstalled') } } }
       }
+      // Only a module the daemon serves and has switched on. A turned-off one
+      // leaves `documents: {enabled: false}` in os.json; once the package is
+      // gone that entry names nothing, and at the next start the daemon
+      // degrades EVERY module (domain.rs `unknown_disabled`). The daemon owns
+      // os.json, so: turn it on here first, then uninstall.
+      const list = await proxyToBackend({ method: 'GET', path: '/api/v1/os' })
+      const mods = (list.data as { modules?: { name?: unknown; enabled?: unknown }[] } | null)?.modules
+      const mod = list.ok && Array.isArray(mods) ? mods.find((m) => m.name === 'documents') : undefined
+      if (!mod) {
+        return { ok: false, status: 404, data: { error: { code: 'module_unavailable', message: mt('err.moduleUnavailable') } } }
+      }
+      if (mod.enabled !== true) {
+        return { ok: false, status: 409, data: { error: { code: 'module_disabled', message: mt('err.docmodDisabled') } } }
+      }
       const ok = await confirmNative(event, mt('docmod.uninstall'), mt('docmod.uninstallDetail'))
       if (!ok) return cancelled()
-      return moduleActionResponse(await documentsModuleActions.uninstall())
+      return moduleActionResponse(await documentsModuleActions.uninstall(), documentsModule().externalDaemon)
     }),
   )
   handle(IpcChannels.OsModuleInstallBundled, (event): Promise<BackendProxyResponse> =>
@@ -1089,7 +1106,7 @@ export function registerIpcHandlers(options: {
       }
       const ok = await confirmNative(event, mt('docmod.install'), mt('docmod.installDetail'))
       if (!ok) return cancelled()
-      return moduleActionResponse(await documentsModuleActions.install())
+      return moduleActionResponse(await documentsModuleActions.install(), documentsModule().externalDaemon)
     }),
   )
 

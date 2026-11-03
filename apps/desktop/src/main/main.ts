@@ -20,6 +20,7 @@ import {
   execCli,
   installBundledDocumentsModule,
   packagesRootFor,
+  type ModuleActionResult,
   uninstallDocumentsModule,
 } from './documents-module'
 import { tryDataDir } from './data-dir'
@@ -110,6 +111,20 @@ let stopOpenDesignReady: (() => void) | null = null
 let creativeView: WebContentsView | null = null
 let creativeOrigin: string | null = null
 const creativeViewFence = new CreativeViewRequestFence()
+
+/** Resolves once the daemon has announced readiness (now, or within `timeoutMs`). */
+function daemonReady(timeoutMs: number): Promise<void> {
+  if (daemonConnection()) return Promise.resolve()
+  return new Promise((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer)
+      off()
+      resolve()
+    }
+    const timer = setTimeout(done, timeoutMs)
+    const off = onDaemonReady(done)
+  })
+}
 
 function normalizedBounds(bounds: CreativeViewBounds): Electron.Rectangle {
   return {
@@ -357,6 +372,13 @@ app.whenReady().then(async () => {
   }
   const documentsModuleReady = ensureBundledDocumentsModule(documentsDeps)
   backendManager.holdStartUntil(documentsModuleReady)
+  const documentsModuleAction = async (run: () => Promise<ModuleActionResult>): Promise<ModuleActionResult> => {
+    await documentsModuleReady
+    const external = backendManager.isExternalDaemon()
+    const result = await backendManager.whileStopped(run)
+    if (!external && backendManager.status() !== 'stopped') await daemonReady(30_000)
+    return result
+  }
   void backendManager.start()
   // CORE-2 AgentEar S3: native confirmation for elevated operations. Idle until
   // the daemon runs in capabilities mode (main then holds the ProductHost
@@ -403,16 +425,13 @@ app.whenReady().then(async () => {
       ...documentsModuleOnDisk(documentsDeps.bundleDir, documentsDeps.packagesRoot),
       externalDaemon: backendManager.externalDaemonPid() !== null,
     }),
-    // T1-2: after the launch check, never alongside it.
+    // T1-2: after the launch check, never alongside it. The daemon this app
+    // spawned is stopped around the CLI run (it holds the database lock the
+    // CLI needs to revoke consent) and comes back with the change applied;
+    // the page reloads once it is ready again.
     documentsModuleActions: {
-      uninstall: async () => {
-        await documentsModuleReady
-        return uninstallDocumentsModule({ ...documentsDeps, now: () => new Date() })
-      },
-      install: async () => {
-        await documentsModuleReady
-        return installBundledDocumentsModule(documentsDeps)
-      },
+      uninstall: () => documentsModuleAction(() => uninstallDocumentsModule({ ...documentsDeps, now: () => new Date() })),
+      install: () => documentsModuleAction(() => installBundledDocumentsModule(documentsDeps)),
     },
   })
   cliTool = registerCliTool({
