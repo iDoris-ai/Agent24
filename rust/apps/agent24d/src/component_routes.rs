@@ -244,11 +244,22 @@ fn hyphae_item(state: &AppState) -> Item {
     // A binary the last start (or install rebuild) refused is `failed` with the stable
     // code, ahead of any supervisor left registered from before. Host view only: the
     // redacted view drops `reason`. Not installed at all keeps the plain `absent`.
-    if let Some(rejection) = state.comm_slot.as_ref().and_then(|slot| slot.rejection()) {
-        return item.with(|i| {
-            i.state = ComponentState::Failed;
-            i.reason = Some(rejection.as_str().to_owned());
-        });
+    // A start that failed without a binary verdict (missing file, I/O) is the same
+    // `failed`, with `start_failed`: D5 reserves `failed` for a start that did not
+    // come up, and `absent` only for nothing installed. The code carries no path.
+    if let Some(slot) = state.comm_slot.as_ref() {
+        if let Some(rejection) = slot.rejection() {
+            return item.with(|i| {
+                i.state = ComponentState::Failed;
+                i.reason = Some(rejection.as_str().to_owned());
+            });
+        }
+        if slot.start_failed() {
+            return item.with(|i| {
+                i.state = ComponentState::Failed;
+                i.reason = Some("start_failed".into());
+            });
+        }
     }
     let Some(daemon) = state.comm_slot.as_ref().and_then(|slot| slot.current()) else {
         return item;

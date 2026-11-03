@@ -25,10 +25,11 @@ export interface OpenDesignReportInput {
   reason?: string
   version?: string | null
   /**
-   * Sidecar lifecycle from `CreativeServeWeb.headlessSidecarState()`.
+   * Sidecar lifecycle from `CreativeServeWeb.headlessPhaseForReport()`.
    * Null before the first packaged headless launch, for a dev checkout,
-   * and when start bails before a headless process exists. After a run
-   * this is `stopped` or `failed`, not null.
+   * when start bails before a headless process exists, and once the
+   * component leaves `installed` (uninstall, or a download in between).
+   * A clean stop while the component stays installed leaves this `stopped`.
    * Ignored unless the component itself is `installed`.
    */
   sidecar?: SidecarState | null

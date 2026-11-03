@@ -20,6 +20,7 @@ import {
   resolveAgent24HeadlessLauncher,
   resolveOpenDesignCheckout,
 } from './creative-serve-web'
+import { mapOpenDesignReport } from './open-design-report'
 
 class FakeChild extends EventEmitter {
   pid = 4321
@@ -602,6 +603,61 @@ describe('CreativeServeWeb', () => {
     expect(service.headlessSidecarState()).toBe('ready')
     await service.stop()
     expect(service.headlessSidecarState()).toBe('stopped')
+  })
+
+  it('clears a leftover stopped phase when the component leaves installed, so reinstall reports installed', async () => {
+    const { resources: componentDir, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const first = new FakeChild()
+    const second = new FakeChild()
+    second.pid = 4322
+    const children = [first, second]
+    let spawned = 0
+    const service = new CreativeServeWeb(
+      {
+        stateRoot,
+        runtimeExecutable,
+        readyTimeoutMs: 500,
+        component: { status: () => ({ state: 'installed', dir: componentDir }) },
+      },
+      vi.fn(() => children[spawned++] as unknown as ChildProcess) as never,
+      vi.fn(async () => new Response('{}', { status: 200 })),
+    )
+    const starting = service.start()
+    first.stdout.write(`${JSON.stringify(headlessReady(first.pid, 17456, 17457))}\n`)
+    await starting
+    await service.stop()
+    expect(service.headlessSidecarState()).toBe('stopped')
+    // Still installed: a clean stop stays stopped (D5 `installed` + sidecar).
+    expect(service.headlessPhaseForReport('installed')).toBe('stopped')
+    expect(service.headlessSidecarState()).toBe('stopped')
+
+    // Uninstall clears the leftover. The next installed report is `installed`,
+    // which would be `stopped` if the phase were left in place.
+    expect(service.headlessPhaseForReport('not-installed')).toBeNull()
+    expect(service.headlessSidecarState()).toBeNull()
+    expect(mapOpenDesignReport({
+      installState: 'installed',
+      version: OPEN_DESIGN_PIN_VERSION,
+      sidecar: service.headlessSidecarState(),
+    })).toEqual({ state: 'installed', version: OPEN_DESIGN_PIN_VERSION })
+
+    // A later run can stop again. A download that skips `not-installed` clears too.
+    const again = service.start()
+    second.stdout.write(`${JSON.stringify(headlessReady(second.pid, 17458, 17459, 'creative-2'))}\n`)
+    await again
+    await service.stop()
+    expect(service.headlessSidecarState()).toBe('stopped')
+    expect(service.headlessPhaseForReport('downloading')).toBeNull()
+    expect(mapOpenDesignReport({
+      installState: 'downloading',
+      version: OPEN_DESIGN_PIN_VERSION,
+      sidecar: service.headlessSidecarState(),
+    })).toEqual({ state: 'installing' })
+    expect(mapOpenDesignReport({
+      installState: 'installed',
+      version: OPEN_DESIGN_PIN_VERSION,
+      sidecar: service.headlessSidecarState(),
+    })).toEqual({ state: 'installed', version: OPEN_DESIGN_PIN_VERSION })
   })
 
   it('C1: Design still starts when resourcesPath is unset entirely (proves no dependency on a writable — or any — app resources dir for the on-demand path)', async () => {

@@ -302,7 +302,7 @@ app.whenReady().then(async () => {
         installState: install?.state ?? 'unavailable',
         reason: install?.reason ?? install?.error,
         version: openDesignComponent?.reportedVersion() ?? null,
-        sidecar: creativeServeWeb?.headlessSidecarState() ?? null,
+        sidecar: creativeServeWeb?.headlessPhaseForReport(install?.state ?? 'unavailable') ?? null,
       })
     },
     connection: daemonConnection,

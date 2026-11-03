@@ -68,8 +68,23 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct CommDaemonSlot(
     Mutex<CommDaemonSlotState>,
     CancellationToken,
-    Mutex<Option<Rejection>>,
+    Mutex<BuildNote>,
+    /// Stop grace actually given to the Hyphae supervisor. The lock's
+    /// `stop_grace_ms`, or the daemon's global budget when that is shorter.
+    Mutex<Duration>,
 );
+
+/// What the last comm-state build left for `/api/v1/components`.
+/// A D2a verdict and a generic start failure are different signals:
+/// `rejection` is also `GET /api/v1/comm/daemon`'s `data.rejection`
+/// (ADR-038 §7.11), and that field stays null when the binary was not refused.
+#[derive(Debug, Default)]
+struct BuildNote {
+    rejection: Option<Rejection>,
+    /// The build failed, but not with a binary verdict (missing file, I/O).
+    /// Host view: `{state: "failed", reason: "start_failed"}`.
+    start_failed: bool,
+}
 
 /// Why the last build of the comm state (daemon start, or the rebuild after a host
 /// install) refused the binary it found. A stable, path-free code:
@@ -156,7 +171,8 @@ impl CommDaemonSlot {
         Self(
             Mutex::new(CommDaemonSlotState::Empty),
             CancellationToken::new(),
-            Mutex::new(None),
+            Mutex::new(BuildNote::default()),
+            Mutex::new(Duration::ZERO),
         )
     }
 
@@ -175,7 +191,7 @@ impl CommDaemonSlot {
             _ => {
                 *guard = CommDaemonSlotState::Registered(handle);
                 // A verified binary now owns the slot: no earlier refusal applies.
-                self.set_rejection(None);
+                self.note(None, false);
                 true
             }
         }
@@ -197,17 +213,42 @@ impl CommDaemonSlot {
 
     /// Why the last build refused the binary, if it did (see [`Rejection`]).
     pub fn rejection(&self) -> Option<Rejection> {
+        self.note_lock().rejection
+    }
+
+    /// The last build failed without refusing the binary (see [`BuildNote`]).
+    pub fn start_failed(&self) -> bool {
+        self.note_lock().start_failed
+    }
+
+    /// Grace the Hyphae supervisor was given. `Duration::ZERO` until [`build`].
+    /// Test-only: production reads the same value from `CommRuntime.grace`.
+    #[cfg(test)]
+    fn stop_grace(&self) -> Duration {
         *self
-            .2
+            .3
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn set_rejection(&self, rejection: Option<Rejection>) {
-        *self
-            .2
+    fn note_lock(&self) -> std::sync::MutexGuard<'_, BuildNote> {
+        self.2
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = rejection;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn note(&self, rejection: Option<Rejection>, start_failed: bool) {
+        *self.note_lock() = BuildNote {
+            rejection,
+            start_failed,
+        };
+    }
+
+    fn set_stop_grace(&self, grace: Duration) {
+        *self
+            .3
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = grace;
     }
 
     /// The registered supervisor, if any (read-only; status for `/api/v1/components`).
@@ -473,6 +514,11 @@ pub async fn build(state_dir: &Path, grace: Duration, slot: &Arc<CommDaemonSlot>
             return unconfigured_router(CommState::binary_rejected(e.to_string()));
         }
     };
+    // ADR-038 D5: the lock's stop grace, unless the daemon's shutdown budget
+    // (the configured global grace, already capped by `shutdown_bounds::GRACE_MAX_MS`)
+    // is shorter. A longer per-component wait would be cut off at `deadlines.modules`.
+    let grace = component_stop_grace(lock.component().stop_grace_ms, grace, "hyphae");
+    slot.set_stop_grace(grace);
     let runtime = Arc::new(CommRuntime {
         state_dir: state_dir.to_path_buf(),
         grace,
@@ -516,16 +562,21 @@ impl CommRuntime {
         }
     }
 
-    /// Build the comm state and record on the slot why a binary was refused, or that
-    /// none was: every outcome other than a rejection clears an earlier one.
+    /// Build the comm state and record what `/api/v1/components` should show.
+    /// A binary verdict keeps its stable code. Any other failure is D5 `failed`
+    /// with `start_failed` (no path). A build that succeeds, or that finds
+    /// nothing installed, clears both.
     async fn try_build_state(&self) -> Result<CommState, String> {
         match self.build_state_or_failure().await {
             Ok(state) => {
-                self.slot.set_rejection(None);
+                self.slot.note(None, false);
                 Ok(state)
             }
             Err(failure) => {
-                self.slot.set_rejection(failure.rejection);
+                // No verdict: do not leave the slot blank. A blank slot is
+                // `absent` ("not installed"), and this build did fail.
+                self.slot
+                    .note(failure.rejection, failure.rejection.is_none());
                 Err(failure.reason)
             }
         }
@@ -622,6 +673,34 @@ fn unconfigured_router(state: CommState) -> Router {
     Router::new().nest("/api/v1/comm", agent24_comm::router(state))
 }
 
+/// Lock `stop_grace_ms`, clamped to the daemon shutdown budget.
+///
+/// The budget is the configured global stop grace. `Params::from_env` already
+/// caps that at [`agent24_protocol::shutdown_bounds::GRACE_MAX_MS`], which is
+/// what `WORST_CASE_EXIT_MS` assumes. `deadlines.modules` is
+/// `drain + that grace + CONFIRM`, and `kill_group_gracefully` stops waiting
+/// at that instant. A lock value above the budget would be cut there; use the
+/// budget and say so. A lock value within the budget replaces the global one,
+/// including when the global knob was turned up. No lock value keeps the budget.
+/// Does not change `shutdown_bounds` (Hyphae's 15s is under the 30s cap).
+fn component_stop_grace(lock_ms: Option<u64>, budget: Duration, component: &str) -> Duration {
+    let Some(requested) = lock_ms else {
+        return budget;
+    };
+    let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+    let cap_ms = budget_ms.min(agent24_protocol::shutdown_bounds::GRACE_MAX_MS);
+    if requested > cap_ms {
+        tracing::warn!(
+            component,
+            requested_ms = requested,
+            budget_ms = cap_ms,
+            "component stop_grace_ms exceeds the daemon shutdown budget; using the budget"
+        );
+        return Duration::from_millis(cap_ms);
+    }
+    Duration::from_millis(requested)
+}
+
 // Preserve every MatchedPath for CORE-2 authorization while requests use the
 // current comm instance. A fallback would erase those fixed route templates.
 // The placeholder match also captures path parameters; [`forward_comm`] drops
@@ -662,6 +741,10 @@ struct ForwardedMatchedPath(MatchedPath);
 ///   double `/api/v1/comm/outbox/{event_id}/retry`. Auth has already copied
 ///   the outer template; the stash puts that same value back after the live
 ///   match.
+///
+/// When an outer layer starts inserting another extension (a `DefaultBodyLimit`
+/// marker, or `OnUpgrade` for a WebSocket upgrade), add it to this whitelist
+/// in the same change. `extensions.clear()` drops anything not copied back.
 fn request_without_outer_path_params(req: Request) -> Request {
     let (mut parts, body) = req.into_parts();
     let matched = parts.extensions.remove::<MatchedPath>();
@@ -1566,6 +1649,74 @@ mod hy1_regression_tests {
     }
 
     #[tokio::test]
+    async fn non_rejection_start_failure_reads_failed_start_failed_and_absence_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime(dir.path()).await;
+        install_fixture(&runtime, dir.path(), FIXTURE).await;
+        // `create_dir_all(comm/hyphae-home)` cannot make a directory through a file.
+        // Same class as `A24_HYPHAE_BIN` pointing at a missing file: the build
+        // fails, the binary was not refused, and there is no supervisor.
+        tokio::fs::write(dir.path().join("comm"), b"not-a-directory")
+            .await
+            .unwrap();
+        start(&runtime).await;
+        assert_eq!(runtime.slot.rejection(), None);
+        assert!(runtime.slot.start_failed());
+
+        let (host, redacted) = components(&runtime).await;
+        assert_eq!(host["state"], "failed");
+        assert_eq!(host["reason"], "start_failed");
+        assert_eq!(redacted["state"], "failed");
+        assert!(redacted.get("reason").is_none(), "{redacted}");
+        let app = runtime_router(runtime.clone());
+        let (_, daemon) = request(&app, "GET", "/api/v1/comm/daemon").await;
+        assert_eq!(daemon["data"]["rejection"], Value::Null);
+        let (_, identity) = request(&app, "GET", "/api/v1/comm/identity").await;
+        assert_eq!(identity["error"], "binary_rejected");
+
+        // Nothing installed any more: plain `absent`, not a leftover failure.
+        tokio::fs::remove_file(dir.path().join("comm"))
+            .await
+            .unwrap();
+        tokio::fs::remove_file(runtime.lock.installed_path(dir.path()))
+            .await
+            .unwrap();
+        start(&runtime).await;
+        assert!(!runtime.slot.start_failed());
+        let (host, _) = components(&runtime).await;
+        assert_eq!(host["state"], "absent", "{host}");
+        assert!(host.get("reason").is_none(), "{host}");
+    }
+
+    #[test]
+    fn component_stop_grace_uses_the_lock_until_the_shutdown_budget() {
+        assert_eq!(
+            component_stop_grace(Some(15_000), Duration::from_secs(30), "hyphae"),
+            Duration::from_millis(15_000)
+        );
+        assert_eq!(
+            component_stop_grace(Some(15_000), Duration::from_millis(100), "hyphae"),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            component_stop_grace(None, Duration::from_millis(50), "hyphae"),
+            Duration::from_millis(50)
+        );
+    }
+
+    #[tokio::test]
+    async fn hyphae_stop_grace_follows_the_lock_within_the_shutdown_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let wide = Arc::new(CommDaemonSlot::new());
+        let _app = build(dir.path(), Duration::from_secs(30), &wide).await;
+        assert_eq!(wide.stop_grace(), Duration::from_millis(15_000));
+
+        let tight = Arc::new(CommDaemonSlot::new());
+        let _app = build(dir.path(), Duration::from_millis(100), &tight).await;
+        assert_eq!(tight.stop_grace(), Duration::from_millis(100));
+    }
+
+    #[tokio::test]
     async fn not_installed_stays_absent_and_a_later_absence_clears_a_rejection() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = runtime(dir.path()).await;
@@ -1766,6 +1917,43 @@ mod hy1_regression_tests {
         assert_eq!(denied["error"]["code"], "forbidden");
 
         let (status, text) = raw_call(&app, "POST", uri, Some(&host), None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{text}");
+        let allowed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(allowed["error"], "not_configured");
+    }
+
+    /// Same route, through `runtime_router`, for the two callers the creative/host
+    /// case does not cover. A docked shell has no `comm.write`, so the outer
+    /// match must still classify the template and forbid it. A legacy token
+    /// must reach the handler (409), not the path-extractor 500.
+    #[tokio::test]
+    async fn path_param_route_auth_covers_docked_shell_and_legacy_token() {
+        use crate::enroll_api::EnrollAuthority;
+
+        let uri = "/api/v1/comm/outbox/evt-1/retry";
+        let dir = tempfile::tempdir().unwrap();
+        let routes = runtime_router(runtime(dir.path()).await);
+
+        let (state, _host, _creative) = crate::server::tests::capability_state().await;
+        let store = state.capabilities.clone().unwrap();
+        let docked = crate::capabilities::first_party::FirstPartyAuthority::new_docked(store)
+            .issue(&crate::capabilities::first_party::test_peer("daemon-test"))
+            .unwrap()
+            .secret
+            .to_string();
+        let app = crate::server::build_router_with_modules(state, routes.clone());
+        let (status, text) = raw_call(&app, "POST", uri, Some(&docked), None).await;
+        assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+        assert!(!text.contains("Wrong number of path arguments"), "{text}");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+        let denied: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(denied["error"]["code"], "forbidden");
+
+        let legacy = crate::server::tests::state().await;
+        let legacy_app = crate::server::build_router_with_modules(legacy, routes);
+        let (status, text) = raw_call(&legacy_app, "POST", uri, Some("testtoken"), None).await;
+        assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+        assert!(!text.contains("Wrong number of path arguments"), "{text}");
         assert_eq!(status, StatusCode::CONFLICT, "{text}");
         let allowed: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(allowed["error"], "not_configured");

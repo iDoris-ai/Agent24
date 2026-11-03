@@ -286,6 +286,23 @@ export class CreativeServeWeb {
     return this.headlessPhase
   }
 
+  /**
+   * Phase to put on an Open Design report (ADR-038 D5).
+   * Anything other than `installed` — uninstalled, or a download / verify /
+   * pause / failure in between — has no sidecar. The stored phase is cleared
+   * so the next `installed` snapshot is `installed`, not a leftover `stopped`
+   * (`installing → stopped` is not in the D5 table). A clean stop while the
+   * component stays installed keeps `stopped`. Does not emit: the snapshot
+   * that calls this is already the status event.
+   */
+  headlessPhaseForReport(installState: string): SidecarState | null {
+    if (installState !== 'installed') {
+      this.headlessPhase = null
+      return null
+    }
+    return this.headlessPhase
+  }
+
   private emitStatus(): void {
     if (this.statusListeners.size === 0) return
     const snapshot = this.status()
