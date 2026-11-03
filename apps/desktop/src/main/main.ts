@@ -12,7 +12,7 @@ import { PresencePoller, defaultPresenceDeps, showPresenceDialog } from './prese
 import { AgentEarEventBridge } from './agentear-events'
 import { documentsEvent } from './documents'
 import { cliBinary } from './documents-cli'
-import { bundledModuleOutcome, ensureBundledDocumentsModule, execCli, packagesRootFor, recordOutcome } from './documents-module'
+import { CODESIGN, bundledModuleOutcome, ensureBundledDocumentsModule, execCli, packagesRootFor, recordOutcome } from './documents-module'
 import { tryDataDir } from './data-dir'
 import { AgentEarEventLog } from './agentear-log'
 import { ModelCallLog } from './model-call-log'
@@ -336,6 +336,9 @@ app.whenReady().then(async () => {
     bundleDir: app.isPackaged && process.platform === 'darwin'
       ? path.join(process.resourcesPath, 'documents-module')
       : null,
+    // Contents/Resources → the .app whose signature sets the rule.
+    appBundle: app.isPackaged ? path.resolve(process.resourcesPath, '..', '..') : null,
+    codesign: execCli(CODESIGN),
     packagesRoot: packagesRootFor(process.env, tryDataDir()),
     userDataDir: app.getPath('userData'),
     runCli: execCli(cliBinary()),

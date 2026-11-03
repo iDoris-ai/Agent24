@@ -16,10 +16,18 @@
 //
 // Nothing here may stop the app from starting: every failure is one warning
 // in the log and an outcome the Documents page can read; the next launch tries
-// again. The package is checked against its SHA256SUMS before it is installed.
+// again.
+//
+// Before installing, the two programs' code signatures are checked, the rule
+// ADR-038 §4 sets for macOS executables (`codesign --verify --strict -R`, team
+// ID, Hardened Runtime): a hash pinned at staging cannot be used, because
+// electron-builder re-signs every Mach-O in the app, which changes its bytes,
+// and nothing can be written into the app once it is signed. A signed app's
+// programs must carry the app's own team ID and the runtime flag; only an
+// app that is itself ad-hoc signed (an internal test build) settles for a
+// valid signature. An app whose identity cannot be read installs nothing.
 
 import { execFile } from 'node:child_process'
-import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -27,15 +35,19 @@ export const MODULE = 'documents'
 /** Under userData; `{"uninstalledByUser": true}` while the user has it uninstalled. */
 export const MARKER_FILE = 'documents-module.json'
 const MANIFEST = 'domain-os.yml'
-const SUMS = 'SHA256SUMS'
+/** The package's programs, checked before it is installed. */
+const PROGRAMS = ['bin/agent24-documents', 'bin/agent24-documents-pdfkit'] as const
+export const CODESIGN = '/usr/bin/codesign'
 /** Each CLI call; install copies about 10 MB. Past it the call is stopped. */
 export const CLI_TIMEOUT_MS = 60_000
 
 export type BundledModuleOutcome =
   /** The app carries no module (Linux, Windows, a dev run, a build that did not stage it). */
   | 'no_bundle'
-  /** The carried package is unreadable or does not match its SHA256SUMS. */
+  /** The carried package has no readable version. */
   | 'bundle_invalid'
+  /** A program's code signature does not pass (or the app's identity is unreadable). */
+  | 'signature_invalid'
   | 'skipped_user_uninstalled'
   /** The data directory could not be resolved. */
   | 'no_packages_root'
@@ -56,6 +68,10 @@ export type RunCli = (args: string[]) => Promise<CliResult>
 export interface BundledModuleDeps {
   /** Resources/documents-module, or null when the app carries none. */
   bundleDir: string | null
+  /** The app's own bundle (…/Agent24.app), whose signature sets the rule. */
+  appBundle: string | null
+  /** Runs /usr/bin/codesign with these arguments. */
+  codesign: RunCli
   /** `A24_OS_PACKAGES`, else `<data dir>/packages` (agent24-os-packages); null if unresolvable. */
   packagesRoot: string | null
   userDataDir: string
@@ -79,28 +95,42 @@ function readText(file: string): string | null {
   }
 }
 
-/** Every line of SHA256SUMS matches its file, and the manifest and the
- * program it spawns are among them. */
-export function bundleMatchesSums(dir: string): boolean {
-  const sums = readText(path.join(dir, SUMS))
-  if (sums === null) return false
-  const listed = new Set<string>()
-  for (const line of sums.split('\n')) {
-    if (line.trim() === '') continue
-    const m = /^([0-9a-f]{64}) [ *](.+)$/.exec(line)
-    if (!m) return false
-    const rel = m[2]!
-    if (path.isAbsolute(rel) || rel.split('/').includes('..')) return false
-    let digest: string
-    try {
-      digest = createHash('sha256').update(fs.readFileSync(path.join(dir, rel))).digest('hex')
-    } catch {
-      return false
+export type AppIdentity = { kind: 'team'; team: string } | { kind: 'adhoc' }
+
+/** The identity in `codesign -dv` output: a team ID, or ad-hoc; else null. */
+export function parseIdentity(output: string): AppIdentity | null {
+  const team = /^TeamIdentifier=([A-Z0-9]{10})$/m.exec(output)?.[1]
+  if (team) return { kind: 'team', team }
+  if (/^Signature=adhoc$/m.test(output) && /^TeamIdentifier=not set$/m.test(output)) return { kind: 'adhoc' }
+  return null
+}
+
+/** Why the package's programs may not be installed, or null when they may. */
+export async function signatureProblem(
+  bundleDir: string,
+  appBundle: string | null,
+  codesign: RunCli,
+): Promise<string | null> {
+  if (appBundle === null) return 'the app bundle is unknown'
+  const app = await codesign(['-dv', appBundle])
+  const identity = app.code === 0 ? parseIdentity(app.output) : null
+  if (identity === null) return `the app's own signature could not be read: ${lastLine(app.output)}`
+  for (const rel of PROGRAMS) {
+    const file = path.join(bundleDir, rel)
+    if (identity.kind === 'adhoc') {
+      const r = await codesign(['--verify', '--strict', file])
+      if (r.code !== 0) return `${rel}: ${lastLine(r.output)}`
+      continue
     }
-    if (digest !== m[1]) return false
-    listed.add(rel)
+    const requirement = `=anchor apple generic and certificate leaf[subject.OU] = "${identity.team}"`
+    const r = await codesign(['--verify', '--strict', '-R', requirement, file])
+    if (r.code !== 0) return `${rel} is not signed by team ${identity.team}: ${lastLine(r.output)}`
+    const d = await codesign(['-dv', file])
+    if (d.code !== 0 || !/^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*\bruntime\b[^)]*\)/m.test(d.output)) {
+      return `${rel} is not signed with the Hardened Runtime`
+    }
   }
-  return listed.has(MANIFEST) && listed.has('bin/agent24-documents')
+  return null
 }
 
 export function userUninstalled(userDataDir: string): boolean {
@@ -125,8 +155,8 @@ export async function ensureBundledDocumentsModule(deps: BundledModuleDeps): Pro
     const bundled = readText(path.join(deps.bundleDir, MANIFEST))
     if (bundled === null) return 'no_bundle'
     const want = manifestVersion(bundled)
-    if (want === null || !bundleMatchesSums(deps.bundleDir)) {
-      deps.warn(`[documents-module] the bundled package in ${deps.bundleDir} does not match its ${SUMS}; not installing it`)
+    if (want === null) {
+      deps.warn(`[documents-module] the bundled ${MANIFEST} in ${deps.bundleDir} has no version; not installing it`)
       return 'bundle_invalid'
     }
     if (userUninstalled(deps.userDataDir)) return 'skipped_user_uninstalled'
@@ -136,14 +166,22 @@ export async function ensureBundledDocumentsModule(deps: BundledModuleDeps): Pro
     }
     const installedDir = path.join(deps.packagesRoot, MODULE)
     const upgrading = fs.existsSync(installedDir)
+    let have: string | null = null
     if (upgrading) {
       const text = readText(path.join(installedDir, MANIFEST))
-      const have = text === null ? null : manifestVersion(text)
+      have = text === null ? null : manifestVersion(text)
       if (have === null) {
         deps.warn(`[documents-module] ${installedDir} has no readable ${MANIFEST}; leaving it as it is`)
         return 'installed_unreadable'
       }
       if (have === want) return 'up_to_date'
+    }
+    const problem = await signatureProblem(deps.bundleDir, deps.appBundle, deps.codesign)
+    if (problem !== null) {
+      deps.warn(`[documents-module] not installing the bundled documents ${want}: ${problem}`)
+      return 'signature_invalid'
+    }
+    if (upgrading) {
       const removed = await deps.runCli(['os', 'uninstall', MODULE])
       if (removed.code !== 0) {
         deps.warn(`[documents-module] upgrading ${have} → ${want}: os uninstall failed (rc=${removed.code}): ${lastLine(removed.output)}`)
