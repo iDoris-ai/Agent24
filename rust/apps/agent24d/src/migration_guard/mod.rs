@@ -13,6 +13,7 @@ pub mod replay;
 pub mod restore;
 pub mod snapshot;
 pub mod space;
+pub mod startup;
 
 #[cfg(test)]
 mod crash_ops_tests;

@@ -1,5 +1,7 @@
 # ADR-005：Creative capability 与 authority 隔离
 
+索引：[架构总入口](../../architecture/README.md)・[ADR 索引](../../adr/README.md)
+
 > 状态：Accepted / 2026-09-19
 >
 > 触发：5.6-SOL 对抗审查发现当前单 bearer 模型无法兑现 ADR-001 的 authority 承诺

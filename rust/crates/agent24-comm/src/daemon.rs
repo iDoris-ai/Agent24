@@ -52,30 +52,6 @@ const LOG_TRUNCATE_CAP: u64 = 5 * 1024 * 1024;
 /// callers (`comm_routes.rs`) use this constant.
 pub const READY_AFTER_DEFAULT: Duration = Duration::from_secs(3);
 
-/// How long `kill_group_gracefully` waits after SIGTERM before SIGKILL, as a
-/// **fallback default only** — `agent24d` passes the already-validated
-/// `agent24d::lifecycle::Params::stop_grace` into [`Ctx::grace`] instead of
-/// calling this.
-///
-/// Kept only for callers outside `agent24d` (and as the orphan-reap grace
-/// before a [`Ctx`] exists at all): it used to be the ONE grace this whole
-/// crate read, via its own raw, unvalidated parse of
-/// `A24_MODULE_STOP_GRACE_MS` with a 5s default — while `agent24d`'s own
-/// `lifecycle::Params` reads the exact same variable with a 500ms default
-/// and a 100ms..=5000ms clamp. Two different numbers under one variable name
-/// meant a running daemon's actual stop grace silently disagreed with the
-/// SHUT-1b deadline computed from the OTHER number (PR #626 review, High
-/// #2): `agent24d`'s shutdown could reach its watchdog before Hyphae had
-/// even been sent SIGKILL.
-#[must_use]
-pub fn stop_grace() -> Duration {
-    std::env::var("A24_MODULE_STOP_GRACE_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(5))
-}
-
 // ---------------------------------------------------------------------
 // pid file + orphan liveness
 // ---------------------------------------------------------------------
@@ -770,9 +746,11 @@ async fn try_start(
     cmd.stdout(stdout);
     cmd.stderr(stderr);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| DaemonStartError::Failed(e.to_string()))?;
+    let mut child = {
+        let _gate = crate::runner::lock_spawn_gate();
+        cmd.spawn()
+            .map_err(|e| DaemonStartError::Failed(e.to_string()))?
+    };
     let pid = child
         .id()
         .ok_or_else(|| DaemonStartError::Failed("spawned child has no pid".to_owned()))?;
@@ -1575,7 +1553,7 @@ async fn run_actor(
     let mut phase = Phase::Idle;
     // PR #626 review, High #2: the SAME already-validated grace every other
     // out-of-process module's stop uses, handed in by `agent24d` — never
-    // this crate's own unvalidated `stop_grace()` read of the raw env var.
+    // this crate's own raw read of the stop-grace env var (removed: `Params::from_env` is the only reader).
     let grace = ctx.grace;
     // PR #626 review, Medium #3: set the moment a MANUAL `Cmd::Start` spawns
     // a child (fresh or while already `has_child`), cleared the moment that

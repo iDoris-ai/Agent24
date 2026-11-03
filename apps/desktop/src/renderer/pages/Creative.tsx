@@ -63,6 +63,9 @@ function ComponentCard({
   onPause: () => void
 }): JSX.Element {
   const t = useT(creativeMessages)
+  const override = status.overrideActive
+    ? <div className="creative-download-override">{t('download.localOverride')}</div>
+    : null
   if (status.state === 'downloading') {
     const total = status.total ?? 0
     const received = status.received ?? 0
@@ -70,6 +73,7 @@ function ComponentCard({
     const etaText = formatEta(status.etaSeconds)
     return (
       <div className="creative-download">
+        {override}
         <div>{t('download.progress')}</div>
         <div className="progress-bar"><div className="progress-fill" style={{ width: `${pct}%` }} /></div>
         <div className="creative-download-hint">
@@ -87,6 +91,7 @@ function ComponentCard({
     const received = status.received ?? 0
     return (
       <div className="creative-download">
+        {override}
         <div>
           {t('download.paused', { received: formatMb(received), total: formatMb(total) })}
         </div>
@@ -98,6 +103,7 @@ function ComponentCard({
   if (status.state === 'verifying') {
     return (
       <div className="creative-download">
+        {override}
         <div>{t('download.verifying')}</div>
       </div>
     )
@@ -106,6 +112,7 @@ function ComponentCard({
   if (status.state === 'failed') {
     return (
       <div className="creative-download">
+        {override}
         <div>{t('download.failed', { error: status.error ?? t('download.unknownError') })}</div>
         <button className="btn btn-primary" type="button" onClick={onInstall}>{t('action.retry')}</button>
       </div>
@@ -115,6 +122,7 @@ function ComponentCard({
   // 'not-installed' (also the synthesized shape for a needs-download result)
   return (
     <div className="creative-download">
+      {override}
       <div>{t('download.prompt', { size: formatMb(status.size) })}</div>
       <button className="btn btn-primary" type="button" onClick={onInstall}>{t('action.download')}</button>
     </div>

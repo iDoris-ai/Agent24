@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 /// A single process-wide write lock, cheap to clone (an `Arc` underneath) so
 /// every caller that needs to serialize keystore writes — comm's REST
@@ -40,14 +40,16 @@ impl KeystoreWriteLock {
     /// for as long as the keystore-writing invocation is in flight; dropping
     /// it (e.g. at the end of the enclosing `async fn`) releases the lock
     /// for the next writer.
-    pub async fn acquire(&self) -> KeystoreGuard<'_> {
-        KeystoreGuard(self.0.lock().await)
+    pub async fn acquire(&self) -> KeystoreGuard {
+        KeystoreGuard(Arc::clone(&self.0).lock_owned().await)
     }
 }
 
 /// RAII guard returned by [`KeystoreWriteLock::acquire`]. Holds no data of
 /// its own; the lock is released when this is dropped.
-pub struct KeystoreGuard<'a>(#[allow(dead_code)] MutexGuard<'a, ()>);
+/// Owned (`'static`) so that a background reaper can keep holding it after the
+/// request that took it has returned (see `runner::hold_until_reaped`).
+pub struct KeystoreGuard(#[allow(dead_code)] OwnedMutexGuard<()>);
 
 #[cfg(test)]
 mod tests {

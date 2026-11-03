@@ -557,6 +557,15 @@ pub fn register(
     on_commit: impl FnOnce(&Change),
 ) -> Result<RegisterOutcome, RegisterError> {
     let manifest = parse_manifest(manifest_yaml).map_err(RegisterError::InvalidManifest)?;
+    // A NEW registration may not take a built-in component's id. Deliberately not in
+    // `parse_manifest`, which also reads records already on disk: a same-named record from
+    // before this rule must still parse so it can be revoked (`/api/v1/components` hides it).
+    if crate::component_routes::BUILTIN_COMPONENT_IDS.contains(&manifest.name()) {
+        return Err(RegisterError::InvalidManifest(format!(
+            "module name {:?} is the id of a built-in component",
+            manifest.name()
+        )));
+    }
     let name = manifest.name().to_owned();
     let facts = Facts::of(&manifest);
     let digest = manifest_digest(manifest_yaml.as_bytes());
@@ -1088,6 +1097,62 @@ mod tests {
         let m = manifest("attached", None, &[]);
         let err = register(&path, &m, false, |_| false, |_| {}).unwrap_err();
         assert!(matches!(err, RegisterError::InvalidManifest(_)));
+    }
+
+    #[test]
+    fn a_builtin_component_id_cannot_be_attached() {
+        // The list is pinned here so adding a component to `/api/v1/components` is a
+        // deliberate edit of both.
+        assert_eq!(
+            crate::component_routes::BUILTIN_COMPONENT_IDS,
+            ["idoris", "hyphae", "documents", "knowledge", "open-design"]
+        );
+        for name in crate::component_routes::BUILTIN_COMPONENT_IDS {
+            let dir = tmp();
+            let path = dir.join("attached.json");
+            let err =
+                register(&path, &manifest(name, None, &[]), false, |_| false, |_| {}).unwrap_err();
+            assert!(matches!(err, RegisterError::InvalidManifest(_)), "{name}");
+            assert!(!path.exists(), "{name}");
+        }
+        let dir = tmp();
+        let path = dir.join("attached.json");
+        register(
+            &path,
+            &manifest("agentear", None, &[]),
+            false,
+            |_| false,
+            |_| {},
+        )
+        .unwrap();
+    }
+
+    /// A record stored before the rule (a built-in id as its name) still loads and lists,
+    /// can be revoked, and is then gone; a new registration under that name is refused.
+    #[test]
+    fn an_old_record_named_like_a_builtin_component_can_still_be_revoked() {
+        let dir = tmp();
+        let path = dir.join("attached.json");
+        let m = manifest("agentear", None, &[]);
+        register(&path, &m, false, |_| false, |_| {}).unwrap();
+        let old = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("agentear", "hyphae");
+        std::fs::write(&path, old).unwrap();
+        assert_eq!(list(&path).unwrap().len(), 1, "the old record loads");
+        let m = manifest("hyphae", None, &[]);
+        assert!(
+            matches!(
+                register(&path, &m, false, |_| false, |_| {}),
+                Err(RegisterError::InvalidManifest(_))
+            ),
+            "no new registration or rotation under that name"
+        );
+        assert!(
+            revoke(&path, "hyphae", |_| {}).unwrap(),
+            "it can be removed"
+        );
+        assert!(list(&path).unwrap().is_empty());
     }
 
     #[test]

@@ -1,5 +1,7 @@
 # ADR-016: Agent24 迁移至消费 @auraaihq/* 包
 
+索引：[架构总入口](architecture/README.md)・[ADR 索引](adr/README.md)
+
 **状态**: 进行中（migration 分支活跃）
 **日期**: 2026-05-15
 **作者**: jason / jhfnetboy

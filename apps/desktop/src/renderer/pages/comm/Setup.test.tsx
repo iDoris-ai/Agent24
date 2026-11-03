@@ -4,7 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { setLocale } from '../../i18n'
 import CommunicationPage from './Communication'
 
-const fixtures = vi.hoisted(() => ({ aa: '' }))
+const fixtures = vi.hoisted(() => ({ aa: undefined as string | undefined }))
 vi.mock('./relayDefaults', async (original) => {
   const actual = await original<typeof import('./relayDefaults')>()
   return { ...actual, getDefaultRelays: () => actual.getDefaultRelays(fixtures.aa) }
@@ -14,8 +14,11 @@ function setup({ installed = true, identities = [identity], configured = true, c
   const proxy = vi.fn(async ({ method, path, body }: { method: string; path: string; body?: unknown }) => {
     let data: unknown = {}
     if (method === 'GET') {
+      if (path === '/api/v1/components' || path.startsWith('/api/v1/components?')) {
+        return { ok: true, status: 200, data: { components: [{ id: 'hyphae', version: installed ? 'v0.28.1' : null, state: 'stopped', form: 'resident', provides: [] }] } }
+      }
       if (path.endsWith('/daemon')) data = {
-        installable: true, installed_version: installed ? 'v0.27.2' : null,
+        installable: true, installed_version: installed ? 'v0.28.1' : null,
         process: { state: 'stopped', generation: 0, consecutive_failures: 0, reason: null },
         relay_probe: null, catch_up: { state: 'unknown', last_incomplete_at_ms: null },
       }
@@ -29,10 +32,14 @@ function setup({ installed = true, identities = [identity], configured = true, c
     else if (path.endsWith('/import')) data = { identities: 1, contacts: 0, outbox: 0, db_files: [] }
     return { ok: true, status: 200, data: { ok: true, data } }
   })
-  window.agent24 = { ...window.agent24, backendProxy: proxy }
+  // The relay list and the whole-home import have their own IPC (not the generic
+  // proxy); both are recorded on `proxy` so tests can see every write in order.
+  const commRelaySet = vi.fn((relays: string[]) => proxy({ method: 'PUT', path: '/api/v1/comm/relay', body: { relays } }))
+  const commHomeImport = vi.fn(() => proxy({ method: 'POST', path: '/api/v1/comm/import' }))
+  window.agent24 = { ...window.agent24, backendProxy: proxy, commRelaySet, commHomeImport } as never
   return proxy
 }
-beforeEach(() => { setLocale('en'); fixtures.aa = '' })
+beforeEach(() => { setLocale('en'); fixtures.aa = undefined })
 afterEach(() => { cleanup(); vi.restoreAllMocks() })
 
 it.each([
@@ -55,14 +62,21 @@ it('creates a default identity through backendProxy without persisting renderer 
   expect(storageSpy).not.toHaveBeenCalled()
   expect(screen.getByTestId('comm-setup')).toHaveAttribute('data-state', 'no_identity')
 })
-it.each(['', 'wss://aastar.example'])('hides empty AAStar and selects supplied AAStar as default: %s', async (url) => {
-  fixtures.aa = url
+it('offers the Hyphae relay as the only default', async () => {
   setup({ configured: false })
   render(<CommunicationPage />)
-  expect(await screen.findByRole('combobox', { name: 'Relay server' })).toHaveValue(url || 'wss://relay.aastar.io')
-  expect(screen.queryByRole('option', { name: /^AAStar/ }) !== null).toBe(Boolean(url))
+  expect(await screen.findByRole('combobox', { name: 'Relay server' })).toHaveValue('wss://relay.aastar.io')
+  expect(screen.getByRole('option', { name: /^Hyphae \(AAStar\)/ })).toBeInTheDocument()
+  expect(screen.queryByRole('option', { name: /agent-speaker-relay/ })).toBeNull()
 })
-it('saves the selected relay then probes through backendProxy and shows handshake failure', async () => {
+it('offers no default when the relay url is empty', async () => {
+  fixtures.aa = ''
+  setup({ configured: false })
+  render(<CommunicationPage />)
+  await screen.findByRole('combobox', { name: 'Relay server' })
+  expect(screen.queryByRole('option', { name: /^Hyphae/ })).toBeNull()
+})
+it('saves the selected relay (dedicated IPC) then probes through backendProxy and shows handshake failure', async () => {
   const proxy = setup({ configured: false, connected: false })
   render(<CommunicationPage />)
   fireEvent.click(await screen.findByRole('button', { name: 'Connect relay' }))
@@ -106,10 +120,12 @@ it('F1: a failed handshake removes the relay check mark and the "setup is comple
   render(<CommunicationPage />)
   const card = await screen.findByTestId('comm-setup')
   await waitFor(() => expect(card.textContent).toContain('Connect relay ✓'))
+  expect(card.querySelectorAll('.comm-step-mark')).toHaveLength(3)
   expect(card.textContent).toContain('Setup is complete')
   fireEvent.click(screen.getByRole('button', { name: 'Connect relay' }))
   await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('connection refused'))
   expect(card.textContent).not.toContain('Connect relay ✓')
+  expect(card.querySelectorAll('.comm-step-mark')).toHaveLength(2)
   expect(card.textContent).not.toContain('Setup is complete')
   expect(card.textContent).toContain('Relay saved, but the handshake failed')
 })
@@ -125,17 +141,15 @@ it('N2: a stale relay choice no longer offered after refresh falls back to the d
   await waitFor(() => expect(writes(proxy)).toHaveLength(1))
   expect(writes(proxy)).toEqual([{ method: 'POST', path: '/api/v1/comm/relay/probe', body: { url: C } }])
 })
-it('imports an existing Hyphae home with explicit confirmation and clears the password', async () => {
+it('imports an existing Hyphae home through its dedicated IPC: the page supplies no path or password', async () => {
   const proxy = setup({ identities: [] })
   render(<CommunicationPage />)
   fireEvent.click(await screen.findByRole('button', { name: 'Import an existing key' }))
-  fireEvent.change(screen.getByLabelText('Existing Hyphae home'), { target: { value: '/Users/alice' } })
-  const password = screen.getByLabelText('Source keystore password')
-  fireEvent.change(password, { target: { value: 'secret' } })
-  fireEvent.click(screen.getByLabelText('I confirm importing this Hyphae home'))
-  fireEvent.click(screen.getByRole('button', { name: 'Import' }))
-  await waitFor(() => expect(proxy).toHaveBeenCalledWith({ method: 'POST', path: '/api/v1/comm/import', body: { from: '/Users/alice', password: 'secret', confirm: true } }))
-  expect(password).toHaveValue('')
+  expect(screen.queryByLabelText(/keystore password/i)).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'Choose folder and import…' }))
+  await waitFor(() => expect(window.agent24.commHomeImport).toHaveBeenCalledTimes(1))
+  expect(window.agent24.commHomeImport).toHaveBeenCalledWith()
+  expect(proxy).toHaveBeenCalledWith({ method: 'POST', path: '/api/v1/comm/import' })
 })
 
 it('shows installing while native IPC is pending, then derives the next step from refreshed reads', async () => {
@@ -165,18 +179,20 @@ it('shows probe success without treating it as a running daemon', async () => {
   expect(screen.getByText('Stopped')).not.toHaveClass('comm-state-running')
   expect(screen.getByTestId('comm-setup')).toHaveAttribute('data-state', 'no_relay')
 })
-it('keeps setup unchanged and redacts the password when import fails', async () => {
-  const proxy = setup({ identities: [] })
+it('keeps setup unchanged and shows the reason when the home import fails; a declined step is silent', async () => {
+  setup({ identities: [] })
   render(<CommunicationPage />)
   fireEvent.click(await screen.findByRole('button', { name: 'Import an existing key' }))
-  fireEvent.change(screen.getByLabelText('Existing Hyphae home'), { target: { value: '/Users/alice' } })
-  fireEvent.change(screen.getByLabelText('Source keystore password'), { target: { value: 'private-secret' } })
-  fireEvent.click(screen.getByLabelText('I confirm importing this Hyphae home'))
-  proxy.mockResolvedValueOnce({ ok: false, status: 409, data: { ok: false, error: 'locked', message: 'rejected private-secret' } })
-  fireEvent.click(screen.getByRole('button', { name: 'Import' }))
-  expect(await screen.findByRole('alert')).not.toHaveTextContent('private-secret')
-  expect(screen.getByLabelText('Source keystore password')).toHaveValue('')
+  const failing = vi.fn()
+    .mockResolvedValueOnce({ ok: false, status: 409, data: { ok: false, error: 'locked', message: 'keychain_unavailable: denied' } })
+    .mockResolvedValueOnce({ ok: false, status: 499, data: { error: { code: 'cancelled', message: 'c' } } })
+  window.agent24 = { ...window.agent24, commHomeImport: failing } as never
+  fireEvent.click(screen.getByRole('button', { name: 'Choose folder and import…' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent('keychain_unavailable')
   expect(screen.getByTestId('comm-setup')).toHaveAttribute('data-state', 'no_identity')
+  fireEvent.click(screen.getByRole('button', { name: 'Choose folder and import…' }))
+  await waitFor(() => expect(failing).toHaveBeenCalledTimes(2))
+  await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
 })
 it.each([
   ['zh', '显示名', '创建身份'], ['th', 'ชื่อที่แสดง', 'สร้างตัวตน'],

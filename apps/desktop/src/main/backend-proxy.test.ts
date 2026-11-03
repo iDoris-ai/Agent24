@@ -61,6 +61,9 @@ describe('A1 findAllowedRoute', () => {
       ['POST', '/api/v1/capabilities/creative'], ['POST', '/api/v1/capabilities/x/revoke'],
       ['POST', '/api/v1/attached'], ['PATCH', '/api/v1/attached/x'], ['DELETE', '/api/v1/attached/x'],
       ['PATCH', '/api/v1/os/x'], ['POST', '/api/v1/os/x/stop'],
+      ['POST', '/api/v1/components/open-design/report'],
+      ['PUT', '/api/v1/components/open-design/report'],
+      ['GET', '/api/v1/components/open-design/report'],
     ]
     for (const [m, p] of forbidden) expect(isAllowedProxyRoute(m, p), `${m} ${p}`).toBe(false)
     for (const rt of ALLOWED_PROXY_ROUTES) {
@@ -69,9 +72,23 @@ describe('A1 findAllowedRoute', () => {
   })
   it('allows the exact HY-2 setup methods through the proxy', () => {
     for (const [method, route] of [
-      ['POST', 'identity'], ['POST', 'import'], ['PUT', 'relay'], ['POST', 'relay/probe'],
+      ['POST', 'identity'], ['POST', 'relay/probe'], ['GET', 'relay'],
     ]) expect(isAllowedProxyRoute(method, `/api/v1/comm/${route}`)).toBe(true)
     expect(isAllowedProxyRoute('DELETE', '/api/v1/comm/identity')).toBe(false)
+  })
+  it('keeps the Elevated comm writes (contact add, send, key export/restore, home import, unlock) off the proxy; history stays', () => {
+    for (const route of ['contact', 'send', 'identity/export', 'identity/import', 'import', 'unlock']) {
+      expect(isAllowedProxyRoute('POST', `/api/v1/comm/${route}`), route).toBe(false)
+    }
+    expect(isAllowedProxyRoute('PUT', '/api/v1/comm/relay')).toBe(false)
+    expect(isAllowedProxyRoute('GET', '/api/v1/comm/history?limit=20')).toBe(true)
+  })
+  it('lets the renderer read the component list and keeps the host report off the proxy', () => {
+    expect(isAllowedProxyRoute('GET', '/api/v1/components')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/components?audience=host')).toBe(true)
+    expect(isAllowedProxyRoute('POST', '/api/v1/components/open-design/report')).toBe(false)
+    expect(isAllowedProxyRoute('POST', '/api/v1/components/{id}/report')).toBe(false)
+    expect(ALLOWED_PROXY_ROUTES.some((route) => route.template.includes('/report'))).toBe(false)
   })
   it('gives chat a longer deadline than the default', () => {
     expect(findAllowedRoute('POST', '/api/v1/chat')?.timeoutMs).toBe(CHAT_TIMEOUT_MS)
@@ -121,6 +138,32 @@ describe('A1 renderer call sites are covered by the allowlist (positive control)
       void dedicated
     })
   }
+})
+
+describe('open-design report route stays out of renderer and preload source', () => {
+  function productionSources(dir: string): string[] {
+    const out: string[] = []
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) out.push(...productionSources(full))
+      else if (/\.(ts|tsx)$/.test(entry.name) && !/\.(test|spec)\./.test(entry.name)) out.push(full)
+    }
+    return out
+  }
+
+  it('does not mention components/open-design/report or /report', () => {
+    const files = [
+      ...productionSources(path.join(__dirname, '../renderer')),
+      path.join(__dirname, 'preload.ts'),
+      path.join(__dirname, 'backup-password-preload.ts'),
+    ]
+    expect(files.length).toBeGreaterThan(10)
+    const hits = files.filter((file) => {
+      const text = fs.readFileSync(file, 'utf8')
+      return text.includes('components/open-design/report') || text.includes('/report')
+    })
+    expect(hits).toEqual([])
+  })
 })
 
 describe('A2 proxyRequest', () => {

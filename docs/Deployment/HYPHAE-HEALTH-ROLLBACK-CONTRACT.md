@@ -60,7 +60,7 @@ tuple 精确绑定 Agent24 build、平台、client binary/lock、relay binary/lo
   "platform": "darwin-arm64",
   "trust": {"mode": "embedded_independent_pins", "signing_root": null},
   "pins": {
-    "client_current": {"source_sha": "076a5205f0f45539082538c8f10ea3db69b7a8f1", "lock_sha256": null, "archive_sha256": null, "binary_sha256": null},
+    "client_current": {"source_sha": "44189b8e84a9cc01358b7840dde6423d4216a369", "lock_sha256": null, "archive_sha256": null, "binary_sha256": null},
     "client_candidate": {"source_sha": "1df9c6707c4df956bfc8868509bf33c1925bac2d", "lock_sha256": null, "archive_sha256": null, "binary_sha256": null},
     "client_previous": {"source_sha": null, "lock_sha256": null, "archive_sha256": null, "binary_sha256": null},
     "relay_current": {"source_sha": null, "lock_sha256": null, "archive_sha256": null, "binary_sha256": null},

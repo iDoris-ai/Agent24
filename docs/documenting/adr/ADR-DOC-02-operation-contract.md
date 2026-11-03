@@ -1,5 +1,7 @@
 # ADR-DOC-02：DocumentService 操作契约
 
+索引：[架构总入口](../../architecture/README.md)・[ADR 索引](../../adr/README.md)
+
 > **状态**：**Accepted**（2026-10-07）。生效条件都已满足：
 > - PR-Daemon 已 APPROVE（#736；幂等统一修正见 #742）；
 > - jason 已在 [#740](https://github.com/iDoris-ai/Agent24/pull/740#issuecomment-6040439976) 确认；

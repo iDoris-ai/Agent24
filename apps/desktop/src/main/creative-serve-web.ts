@@ -4,6 +4,7 @@ import path from 'node:path'
 import type { Readable } from 'node:stream'
 
 import { assertResourceSafeBaseAncestryIsSafe, verifyEntryFileIntegrity } from './open-design-component'
+import type { SidecarState } from './sidecar-contract'
 
 export type CreativeServeWebState = 'stopped' | 'starting' | 'ready' | 'failed' | 'needs-download'
 
@@ -44,6 +45,36 @@ export interface CreativeServeWebOptions {
    * bundled resources are found, CreativeServeWeb consults this instead of
    * `resourcesPath` to locate the headless launcher + resource root. */
   component?: OpenDesignComponentAccessor
+  /** The `agent24` CLI the Open Design `agent24` runtime should run, passed as
+   * AGENT24_BIN. Defaults to the copy bundled in Agent24.app; null disables. */
+  agent24Cli?: string | null
+}
+
+/**
+ * The executable Open Design's Node children (headless launcher, daemon, web
+ * sidecar) run under ELECTRON_RUN_AS_NODE. On macOS this is the bundle's
+ * `<Name> Helper` (LSUIElement): running the main `Contents/MacOS/<Name>`
+ * directly registers each child as a foreground app, so `next-server` showed up
+ * in the Dock as a generic "exec" tile. Falls back to the main executable.
+ */
+export function resolveNodeRuntimeExecutable(
+  execPath: string = process.execPath,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform !== 'darwin') return execPath
+  const name = path.basename(execPath)
+  const contents = path.dirname(path.dirname(execPath))
+  const helper = path.join(contents, 'Frameworks', `${name} Helper.app`, 'Contents', 'MacOS', `${name} Helper`)
+  return fs.existsSync(helper) ? helper : execPath
+}
+
+/** `Contents/Resources/backend/agent24` inside the running Agent24.app, if present. */
+export function resolveBundledAgent24Cli(
+  resources: string | undefined = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath,
+): string | null {
+  if (!resources) return null
+  const cli = path.join(resources, 'backend', 'agent24')
+  return fs.existsSync(cli) ? cli : null
 }
 
 type SpawnFn = typeof spawn
@@ -54,15 +85,9 @@ const DEFAULT_PORT = 7456
 const DEFAULT_READY_TIMEOUT_MS = 15_000
 const CHECKOUT_STOP_TIMEOUT_MS = 5_000
 const HEADLESS_STOP_TIMEOUT_MS = 60_000
-export const OPEN_DESIGN_PIN_VERSION = '0.22.2'
-// v2 (Opus review of #670, 2026-10-05): the fork's agent24-headless.cjs now
-// accepts an explicit resourceSafeBase (fork PR iDoris-ai/open-design-
-// agent24#7, not yet merged/pinned — see the on-demand branch below for why
-// this constant is bumped here ahead of that pin update). NOTE: this makes
-// the on-demand path incompatible with the CURRENTLY pinned fork commit
-// (still protocol v1) until the fork PR merges and OPEN_DESIGN_SHA is
-// re-pinned — intentional per review instruction ("pin 暂不改...先写好代码与
-// 测试"), not an oversight.
+export const OPEN_DESIGN_PIN_VERSION = '0.26.1'
+// Headless protocol v2. The pinned fork (packaged 0.26.1) accepts an explicit
+// resourceSafeBase; the ready payload's pinVersion must match this constant.
 const AGENT24_HEADLESS_PROTOCOL = 2
 
 export const CREATIVE_SESSION_PARTITION = 'persist:agent24-creative'
@@ -231,9 +256,45 @@ export function creativeChildEnvironment(env: NodeJS.ProcessEnv): NodeJS.Process
 export class CreativeServeWeb {
   private child: CreativeChild | null = null
   private childKind: 'checkout' | 'headless' | null = null
-  private current: CreativeServeWebStatus = { state: 'stopped' }
+  private storedStatus: CreativeServeWebStatus = { state: 'stopped' }
   private starting: Promise<CreativeServeWebStatus> | null = null
   private stopping: Promise<CreativeServeWebStatus> | null = null
+  /** Sidecar lifecycle of the packaged headless instance. Null until that launch begins. */
+  private headlessPhase: SidecarState | null = null
+  private readonly statusListeners = new Set<(status: CreativeServeWebStatus) => void>()
+
+  private get current(): CreativeServeWebStatus {
+    return this.storedStatus
+  }
+
+  private set current(value: CreativeServeWebStatus) {
+    this.storedStatus = value
+    this.emitStatus()
+  }
+
+  /** Fires after every status assignment. Listeners must not throw into the launch path. */
+  onStatus(listener: (status: CreativeServeWebStatus) => void): () => void {
+    this.statusListeners.add(listener)
+    return () => { this.statusListeners.delete(listener) }
+  }
+
+  /**
+   * Sidecar state while the creative view's headless instance is in a run.
+   * Null for the dev checkout and before the first headless launch.
+   */
+  headlessSidecarState(): SidecarState | null {
+    return this.headlessPhase
+  }
+
+  private emitStatus(): void {
+    if (this.statusListeners.size === 0) return
+    const snapshot = this.status()
+    for (const listener of this.statusListeners) {
+      try { listener(snapshot) } catch (error) {
+        console.error('[creative-serve-web] status listener failed', error)
+      }
+    }
+  }
 
   constructor(
     private readonly options: CreativeServeWebOptions = {},
@@ -314,6 +375,7 @@ export class CreativeServeWeb {
             assertResourceSafeBaseAncestryIsSafe(resourceSafeBase)
             verifyEntryFileIntegrity(componentStatus.dir)
           } catch (error) {
+            this.headlessPhase = 'failed'
             this.current = { state: 'failed', error: error instanceof Error ? error.message : String(error) }
             return this.status()
           }
@@ -322,11 +384,13 @@ export class CreativeServeWeb {
         // Installed-but-missing-launcher (e.g. the dir was deleted after the
         // installer last validated it): surface needs-download so the
         // renderer's existing "下载" button doubles as "重新下载", same as
-        // the not-installed/failed branch below.
+        // the not-installed/failed branch below. No headless instance is in a run.
+        this.headlessPhase = null
         this.current = { state: 'needs-download', size: undefined }
         return this.status()
       }
       if (componentStatus.state !== 'unavailable') {
+        this.headlessPhase = null
         this.current = { state: 'needs-download', size: componentStatus.size }
         return this.status()
       }
@@ -365,6 +429,8 @@ export class CreativeServeWeb {
     const port = this.options.port ?? (Number.isInteger(envPort) && envPort > 0 ? envPort : DEFAULT_PORT)
     const nodeBinary = this.options.nodeBinary ?? (environment.A24_OPEN_DESIGN_NODE?.trim() || 'node')
     const readyTimeoutMs = this.options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS
+    // A dev checkout is not the packaged headless sidecar.
+    this.headlessPhase = null
     this.current = { state: 'starting' }
 
     const child = this.spawnFn(
@@ -418,14 +484,17 @@ export class CreativeServeWeb {
     const runtimeExecutable = this.options.runtimeExecutable
     const pinVersion = this.options.pinVersion ?? OPEN_DESIGN_PIN_VERSION
     if (!resourcesPath || !path.isAbsolute(resourcesPath)) {
+      this.headlessPhase = 'failed'
       this.current = { state: 'failed', error: 'Open Design packaged resources path is unavailable' }
       return this.status()
     }
     if (!stateRoot || !path.isAbsolute(stateRoot)) {
+      this.headlessPhase = 'failed'
       this.current = { state: 'failed', error: 'Open Design packaged state root is unavailable' }
       return this.status()
     }
     if (!runtimeExecutable || !path.isAbsolute(runtimeExecutable)) {
+      this.headlessPhase = 'failed'
       this.current = { state: 'failed', error: 'Open Design packaged runtime executable is unavailable' }
       return this.status()
     }
@@ -461,9 +530,14 @@ export class CreativeServeWeb {
     })}\n`, { encoding: 'utf8', mode: 0o600 })
     fs.chmodSync(configPath, 0o600)
 
+    this.headlessPhase = 'starting'
     this.current = { state: 'starting' }
     const childEnv = creativeChildEnvironment(environment)
     childEnv.ELECTRON_RUN_AS_NODE = '1'
+    // Open Design looks `agent24` up on PATH unless AGENT24_BIN says otherwise; a
+    // machine without the CLI installed would otherwise have no Agent24 runtime.
+    const agent24Cli = this.options.agent24Cli !== undefined ? this.options.agent24Cli : resolveBundledAgent24Cli()
+    if (agent24Cli && !childEnv.AGENT24_BIN) childEnv.AGENT24_BIN = agent24Cli
     const child = this.spawnFn(
       runtimeExecutable,
       [headlessEntry, '--config', configPath],
@@ -480,11 +554,16 @@ export class CreativeServeWeb {
       const ready = await this.waitForHeadlessReady(child, readyTimeoutMs, pinVersion, child.pid)
       await this.waitUntilReady(ready.webOrigin, readyTimeoutMs)
       if (this.child !== child) throw new Error('Open Design launch was superseded')
+      this.headlessPhase = 'ready'
       this.current = { state: 'ready', origin: ready.webOrigin }
       child.once('exit', () => {
         if (this.child !== child) return
         this.child = null
         this.childKind = null
+        // stopOnce clears `child` before the exit, so this is a crash, not our stop.
+        if (this.headlessPhase === 'starting' || this.headlessPhase === 'ready' || this.headlessPhase === 'degraded') {
+          this.headlessPhase = 'failed'
+        }
         this.current = { state: 'stopped' }
       })
       return this.status()
@@ -496,6 +575,7 @@ export class CreativeServeWeb {
         this.child = null
         this.childKind = null
       } else {
+        this.headlessPhase = 'failed'
         this.current = {
           state: 'failed',
           error: `Open Design headless launcher did not stop within ${HEADLESS_STOP_TIMEOUT_MS}ms; refusing an owner-only force kill`,
@@ -503,6 +583,7 @@ export class CreativeServeWeb {
         this.observeRetainedOwner(child)
         return this.status()
       }
+      this.headlessPhase = 'failed'
       this.current = {
         state: 'failed',
         error: error instanceof Error ? error.message : String(error),
@@ -525,10 +606,12 @@ export class CreativeServeWeb {
   private async stopOnce(): Promise<CreativeServeWebStatus> {
     const child = this.child
     const kind = this.childKind ?? 'checkout'
+    const headless = kind === 'headless' && child !== null
     this.child = null
     this.childKind = null
     // Do not deduplicate a later restart onto this generation's stale promise.
     this.starting = null
+    if (headless) this.headlessPhase = 'stopping'
     this.current = { state: 'stopped' }
     if (!child) {
       return this.status()
@@ -536,6 +619,7 @@ export class CreativeServeWeb {
 
     const stopped = await this.terminateOwnedChild(child, kind)
     if (!stopped && kind === 'headless') {
+      this.headlessPhase = 'failed'
       this.child = child
       this.childKind = kind
       this.current = {
@@ -543,6 +627,11 @@ export class CreativeServeWeb {
         error: `Open Design headless launcher did not stop within ${HEADLESS_STOP_TIMEOUT_MS}ms; refusing an owner-only force kill`,
       }
       this.observeRetainedOwner(child)
+    } else if (headless) {
+      // A clean stop stays on the sidecar state `stopped`. D5 accepts
+      // stopping → stopped, and the next launch is stopped → starting.
+      this.headlessPhase = 'stopped'
+      this.emitStatus()
     }
     return this.status()
   }
@@ -579,6 +668,9 @@ export class CreativeServeWeb {
       if (this.child !== child) return
       this.child = null
       this.childKind = null
+      // A failed stop/launch stays `failed` until the next headless start.
+      // Anything else means the process is simply gone.
+      if (this.headlessPhase !== 'failed') this.headlessPhase = null
       this.current = { state: 'stopped' }
     })
   }

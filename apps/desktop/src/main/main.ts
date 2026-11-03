@@ -7,7 +7,7 @@ import { registerCliTool } from './ipc/cli-tool'
 import { initMainLocale, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
-import { BackendManager, daemonConnection, setBundledPackaged } from './backend-manager'
+import { BackendManager, daemonAuthMode, daemonConnection, onDaemonReady, setBundledPackaged } from './backend-manager'
 import { PresencePoller, defaultPresenceDeps, showPresenceDialog } from './presence-poller'
 import { AgentEarEventBridge } from './agentear-events'
 import { documentsEvent } from './documents'
@@ -21,8 +21,10 @@ import {
   CreativeServeWeb,
   CreativeViewRequestFence,
   classifyCreativeUrl,
+  resolveNodeRuntimeExecutable,
 } from './creative-serve-web'
 import { OpenDesignComponentInstaller } from './open-design-component'
+import { OpenDesignStatusReporter, mapOpenDesignReport, postOpenDesignReport } from './open-design-report'
 import { KnowledgeHost } from './knowledge-host'
 import { KnowledgeLoginStore } from './knowledge-logins'
 import { KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
@@ -92,6 +94,8 @@ let knowledge: KnowledgeController | null = null
 // CORE-2 AgentEar S3: long-polls the daemon for native confirmation challenges.
 let presencePoller: PresencePoller | null = null
 let openDesignComponent: OpenDesignComponentInstaller | null = null
+let openDesignReporter: OpenDesignStatusReporter | null = null
+let stopOpenDesignReady: (() => void) | null = null
 let creativeView: WebContentsView | null = null
 let creativeOrigin: string | null = null
 const creativeViewFence = new CreativeViewRequestFence()
@@ -285,10 +289,31 @@ app.whenReady().then(async () => {
   creativeServeWeb = new CreativeServeWeb({
     resourcesPath: process.resourcesPath,
     stateRoot: path.join(app.getPath('userData'), 'creative', 'open-design'),
-    runtimeExecutable: process.execPath,
+    runtimeExecutable: resolveNodeRuntimeExecutable(),
     pinVersion: OPEN_DESIGN_PIN_VERSION,
     component: openDesignComponent ?? undefined,
   })
+  // ADR-038 C3b: main owns the ProductHost credential and reports Open Design.
+  // The renderer never receives this client or the report route.
+  openDesignReporter = new OpenDesignStatusReporter({
+    snapshot: () => {
+      const install = openDesignComponent?.status()
+      return mapOpenDesignReport({
+        installState: install?.state ?? 'unavailable',
+        reason: install?.reason ?? install?.error,
+        version: openDesignComponent?.reportedVersion() ?? null,
+        sidecar: creativeServeWeb?.headlessSidecarState() ?? null,
+      })
+    },
+    connection: daemonConnection,
+    authMode: daemonAuthMode,
+    send: postOpenDesignReport,
+  })
+  creativeServeWeb.onStatus(() => openDesignReporter?.notify())
+  openDesignReporter.start()
+  // Ready lands after start(), and a restarted daemon has not seen the last
+  // payload. reportNow skips dedupe and ends a 403/404 suspension.
+  stopOpenDesignReady = onDaemonReady(() => openDesignReporter?.reportNow())
   // Dev-only: show the real app icon in the dock immediately, without
   // waiting for an electron-builder packaged build (which is where mac.icon
   // in package.json normally takes effect).
@@ -368,6 +393,7 @@ app.whenReady().then(async () => {
     return openDesignComponent?.status() ?? { state: 'unavailable', reason: 'Open Design component installer is unavailable' }
   }))
   openDesignComponent?.onProgress((status) => {
+    openDesignReporter?.notify()
     if (mainWin && !mainWin.isDestroyed()) {
       mainWin.webContents.send(IpcChannels.OpenDesignComponentProgress, status)
     }
@@ -462,6 +488,9 @@ app.on('before-quit', () => {
 
 app.on('will-quit', () => {
   if (trayTimer) { clearInterval(trayTimer); trayTimer = null }
+  stopOpenDesignReady?.()
+  stopOpenDesignReady = null
+  openDesignReporter?.stop()
   agentEarBridge.stop()
   agentEarLog.stop()
   backendManager.stop()
