@@ -322,8 +322,8 @@ CLI 绑定额外规定（和 `agent24-comm/src/runner.rs` 现有约定一致）�
 |---|---|---|
 | C1 | 在 `agent24-components` 里加 `ComponentLock`（schema 2，`provides` / `requires` / `assurance`）、通用下载器和签名验证（D2a，推广 `SignatureVerifier`：按 `executables` 逐个验、Hardened Runtime、`spctl`、放开架构）；`fetch_verified` 改用它；iDoris 锁升到 schema 2（行为不变，L1–L6 移到 `assurance`），iDoris 迁到新托管根（重下，旧目录标记可删）。**依赖方向反转**：现在 `agent24-components` 依赖 `agent24-idoris`，C1 后 `agent24-idoris` 依赖 `agent24-components`；`run_install_child` 隐藏子命令随下载器一起搬，仍由宿主二进制（`agent24d`）分发，不另起启动器 | Agent24 |
 | C1b | Hyphae 发布流水线加 Developer ID 签名与公证；锁同时换 `sha256`（签名后）和填 `reproducible.unsigned_sha256`（签名前）；Agent24 侧对 Hyphae macOS 资产启用 D2a。**排在 Hyphae 发出签名版之后**，可与 C2 同期 | Hyphae + Agent24 |
-| C2 | Hyphae 新增 `contract`、`health` 子命令（`HYPHAE_OUTPUT=json` 下输出 envelope），统一 envelope 和退出码。Hyphae 锁**仍是 schema 1、不加字段**；Agent24 在 `agent24-comm` 代码里写死对 Hyphae 的契约期望（`name=hyphae-cli`、`major=1`、`min_minor=0`），`contract` 字段等 C1b 的 schema 2 锁再进锁（§7.4）。**排在 Hyphae relay 上线之后**（jason 拍板） | Hyphae + Agent24 |
-| C3 | 新增 `GET /api/v1/components`（含 D9 清单、audience 脱敏、`Operation::ComponentsRead`）和 `POST /api/v1/components/{id}/report`；统一状态机（D5 转移表与映射表）；`GRACE_MAX_MS` 抬到 ≥15 000、默认值与 env 名统一；能力中心、通信页、本地模型页改为读这个接口。C3b：桌面上报 + 心跳 30s。**过渡期**：C2 之前 Hyphae 没有 `health`，它的状态由现有 pid 存活判定，只有 `ready / stopped / failed`，没有 `degraded` | Agent24 |
+| C2 | Hyphae 的 `contract`、`health`（`HYPHAE_OUTPUT=json` envelope）已接入 Agent24。启动时按锁里的 schema 2 `contract`（`name=hyphae-cli`、`major=1`、`min_minor=0`、`tested=1.0`）做一次握手：不兼容则组件 `incompatible`（reason `contract_mismatch`）且不启动 daemon；兼容但 minor 高于 `tested` 只记日志。daemon `running` 期间每 45 秒调一次 `hyphae health`（不拿 keystore 锁，调用有超时）；relay 等探测连续 3 次失败才把组件标 `degraded`，一次成功回到 `ready`。单次 failed 不改变状态 | Hyphae + Agent24 |
+| C3 | 新增 `GET /api/v1/components`（含 D9 清单、audience 脱敏、`Operation::ComponentsRead`）和 `POST /api/v1/components/{id}/report`；统一状态机（D5 转移表与映射表）；`GRACE_MAX_MS` 抬到 ≥15 000、默认值与 env 名统一；能力中心、通信页、本地模型页改为读这个接口。C3b：桌面上报 + 心跳 30s。Hyphae 的 `degraded` 已由 `hyphae health` 接入（见 C2）：进程 `running` 仍映射为 `ready`，连续 3 次探测失败才到 `degraded`，一次成功回到 `ready`。host 视图 `detail.health` 带各探测项的状态和连续失败次数；redacted 视图没有这些 | Agent24 |
 | C4 | AgentEar：只在 `/api/v1/components` 里登记（attach 子集状态），握手不变；D2/D2a 不适用（见 D2a 缺口说明）；补 §3 用例 2、3、4。**已完成（2026-11-03）**：已登记模块出现在 `GET /api/v1/components`（`form=attach`，attach 子集，清单 version，`provides` 留空——无 D9 目录）；协议区间失配记 `incompatible`，握手线仍是 `version_mismatch`；超时发 `$/cancelRequest` 且不重试。未注册不补 `not_attached` 占位 | Agent24 |
 | C5 | Knowledge：把 `/system/capabilities` 映射到 D3/D5（远端服务子集）。**已完成**（2026-11-03）：已配置 binding 在一个总时限内并发探测该端点，结果按 TTL 缓存且同一指纹只打一次；契约 major 不兼容为 `incompatible`，缺 search/read 为 `degraded`（`missing_capability:<名>`），连不上、超时或 HTTP 非 2xx 为 `failed`（一次即失败，不是连续 N 次），未配置为 `stopped`。`ready` 只表示能力声明完整、契约兼容（host 的 `detail.basis` 为 `capabilities`），不代表依赖健康（READONLY R9.3）。遗留：不探测 §8 就绪（R8.2） | Agent24 |
 | C6 | Documents：补 D9 清单。**已完成**（2026-11-03）：清单是模块自带的 `rust/apps/agent24-documents/component.json`，编译进 agent24d（不写入 `domain-os.yml`，那份是握手 manifest）。`/components` 用清单的 provides 与 version；形态按 D5 为常驻。D2 的锁等独立发版再补 | Agent24 |
@@ -379,12 +379,13 @@ D4 原文写「退出码只区分 0、1、2」，这和 Hyphae 现有的语义�
 - **只要产出了报告，envelope 就是 `ok:true`，退出码为 0**，即使 `status` 是 `degraded` 或 `failed`。只有体检本身没能跑起来时才返回 `ok:false`。
 - 状态映射（**只对常驻型组件**，即由 Agent24 托管 Hyphae daemon 的情形；按次调用型 CLI 没有 `ready / degraded`，D5 已定，`health` 对它只是诊断信息）：
   - `health` 的结果是 D5「健康探测连续失败 N 次 → degraded」那条规则的**输入**，不直接改状态：`status:ok` 算一次探测成功；`degraded` 或 `failed` 算一次探测失败，连续 N 次（锁里可配，默认 3）才从 `ready` 进 `degraded`，一次成功就回 `ready`。
+  - **「连续」按整份 health 样本计数，不按单个 check 计数。** 一次 `hyphae health` 调用是一份样本；命令没跑起来（超时、崩溃、没有可读报告）也是一份样本。`status:ok` 把聚合失败次数清零；`status:degraded`、`status:failed`，或命令本身失败，各把聚合次数加一。同一份样本里多个 check 同时失败只加一。下一份样本换成另一个 check 失败（先 `relays` 后 `keystore`）仍接在同一个聚合次数上，不因换了 check 而从零重计。单个 check 自己的连续失败次数只写进宿主视图，不单独触发 `ready → degraded`。
   - `checks.daemon.running=false` 时映射为 `stopped`（daemon 没在跑，不是健康问题），并与 pid 存活判定取一致。
   - 为什么 `failed` 不直接映射成 D5 的 `failed`：`health` 返回了报告就证明 CLI 本身能跑；`status:failed` 说的是 relay 不可达或 keystore 有问题，这是「组件在跑但服务降级」，不是「组件崩了」。D5 的 `failed` 只留给进程崩溃和启动失败。
   - `ok:false`（体检没跑起来）按 D6 的错误处理，同样只计一次探测失败。
 
 ### 7.4 锁的过渡（D2、D2a）
-- C2 那一版的 Hyphae 锁保持 schema 1，**不加任何字段**（Agent24 用严格解析读 Hyphae 锁）。schema 1 带不了 `contract`，所以 **C2 期间 Agent24 把对 Hyphae 的契约期望写死在 `agent24-comm` 代码里**：`name=hyphae-cli`、`major=1`、`min_minor=0`；D3 的握手检查照常跑，只是期望值来自代码常量而不是锁。锁要到 C1b 的 schema 2 才有 `contract` 字段，届时删掉代码常量。
+- Hyphae 锁已是 schema 2（C1b），带 `contract`。Agent24 用严格解析读嵌入的 `hyphae.lock.json`，握手期望来自这份锁（`name=hyphae-cli`、`major=1`、`min_minor=0`、`tested=1.0`），不在 `agent24-comm` 里写死。C2 早期曾计划锁保持 schema 1、期望写死在代码里；schema 2 落地后那条不再适用。
 - **锁文件归 Agent24**：`rust/crates/agent24-comm/hyphae.lock.json` 仍由 Agent24 拥有，做法和今天一样——逐字节复制 Hyphae release 里发布的 `hyphae.lock.json`，Agent24 侧不改内容，只在 PR 里说明来源。C1b 起复制的是 schema 2 版本。
 - C1b 签名版直接发 schema 2：
   - **release 资产仍是裸二进制** `hyphae-darwin-arm64`（以及 `hyphae-linux-x64`），和现在一样；tar.gz 只是附加的打包形式，**不进锁**；
