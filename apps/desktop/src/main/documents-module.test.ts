@@ -16,6 +16,7 @@ import {
   manifestVersion,
   packagesRootFor,
   parseIdentity,
+  sameFiles,
   signatureProblem,
   type BundledModuleDeps,
   type CliResult,
@@ -46,6 +47,14 @@ function installed(version: string | null): string {
   const pkgs = path.join(root, 'data', 'packages')
   fs.mkdirSync(path.join(pkgs, 'documents'), { recursive: true })
   if (version !== null) fs.writeFileSync(path.join(pkgs, 'documents', 'domain-os.yml'), manifest(version))
+  return pkgs
+}
+
+/** What `os install` leaves: the bundle copied file by file. */
+function installedCopy(src: string): string {
+  const pkgs = path.join(root, 'data', 'packages')
+  fs.mkdirSync(pkgs, { recursive: true })
+  fs.cpSync(src, path.join(pkgs, 'documents'), { recursive: true })
   return pkgs
 }
 
@@ -96,11 +105,42 @@ describe('ensureBundledDocumentsModule', () => {
     expect(vi.mocked(d.info).mock.calls[0]![0]).toBe('[documents-module] installed documents 0.2.0: installed /d/packages/documents')
   })
 
-  it('installed at the same version → nothing runs, not even codesign', async () => {
-    const { d, runCli, codesign } = deps({ packagesRoot: installed('0.2.0') })
+  it('installed and the same files → nothing runs, not even codesign', async () => {
+    const b = bundle()
+    const { d, runCli, codesign } = deps({ bundleDir: b, packagesRoot: installedCopy(b) })
     expect(await ensureBundledDocumentsModule(d)).toBe('up_to_date')
     expect(runCli).not.toHaveBeenCalled()
     expect(codesign).not.toHaveBeenCalled()
+  })
+
+  it('the same version but a program differs (the 11-02 candidate) → os uninstall, then os install', async () => {
+    const b = bundle('0.1.0')
+    const pkgs = installedCopy(b)
+    fs.writeFileSync(path.join(b, 'bin', 'agent24-documents'), 'module program, rebuilt')
+    const { d, runCli } = deps({ bundleDir: b, packagesRoot: pkgs })
+    expect(await ensureBundledDocumentsModule(d)).toBe('upgraded')
+    expect(runCli.mock.calls).toEqual([[['os', 'uninstall', 'documents']], [['os', 'install', b]]])
+  })
+
+  it('compares the directory the CLI installs into: `..` after a symlink is not folded', async () => {
+    const b = bundle()
+    fs.mkdirSync(path.join(root, 'real', 'sub'), { recursive: true })
+    fs.symlinkSync(path.join(root, 'real', 'sub'), path.join(root, 'link'))
+    // As PathBuf::join: <root>/link/../packages is <root>/real/packages.
+    fs.cpSync(b, path.join(root, 'real', 'packages', 'documents'), { recursive: true })
+    const { d, runCli } = deps({ bundleDir: b, packagesRoot: `${root}/link/../packages` })
+    expect(await ensureBundledDocumentsModule(d)).toBe('up_to_date')
+    expect(runCli).not.toHaveBeenCalled()
+  })
+
+  it('a file only on one side → replaced', async () => {
+    const b = bundle()
+    const pkgs = installedCopy(b)
+    fs.writeFileSync(path.join(pkgs, 'documents', 'bin', 'extra'), 'x')
+    expect(await ensureBundledDocumentsModule(deps({ bundleDir: b, packagesRoot: pkgs }).d)).toBe('upgraded')
+    fs.rmSync(path.join(pkgs, 'documents', 'bin', 'extra'))
+    fs.rmSync(path.join(pkgs, 'documents', 'bin', 'agent24-documents-pdfkit'))
+    expect(await ensureBundledDocumentsModule(deps({ bundleDir: b, packagesRoot: pkgs }).d)).toBe('upgraded')
   })
 
   it('installed at another version → os uninstall, then os install', async () => {
@@ -121,7 +161,7 @@ describe('ensureBundledDocumentsModule', () => {
     const { d, runCli, warn } = deps({ packagesRoot: installed('0.1.0'), results: [{ code: 1, output: 'consent store unavailable\n' }] })
     expect(await ensureBundledDocumentsModule(d)).toBe('install_failed')
     expect(runCli).toHaveBeenCalledTimes(1)
-    expect(warn.mock.calls[0]![0]).toMatch(/upgrading 0\.1\.0 → 0\.2\.0: os uninstall failed \(rc=1\): consent store unavailable/)
+    expect(warn.mock.calls[0]![0]).toMatch(/replacing 0\.1\.0 with 0\.2\.0: os uninstall failed \(rc=1\): consent store unavailable/)
   })
 
   it('the user uninstalled it → left uninstalled', async () => {
@@ -425,5 +465,22 @@ describe('documentsModuleOnDisk', () => {
     fs.mkdirSync(pkgs)
     fs.symlinkSync(path.join(root, 'gone'), path.join(pkgs, 'documents'))
     expect(documentsModuleOnDisk(null, pkgs).installed).toBe(true)
+  })
+})
+
+describe('sameFiles', () => {
+  it('entries and bytes, not modes; a symlink is never the same', () => {
+    const b = bundle()
+    const copy = path.join(root, 'copy')
+    fs.cpSync(b, copy, { recursive: true })
+    fs.chmodSync(path.join(copy, 'bin', 'agent24-documents'), 0o755)
+    expect(sameFiles(b, copy)).toBe(true)
+    fs.mkdirSync(path.join(copy, 'empty'))
+    expect(sameFiles(b, copy)).toBe(false)
+    fs.rmdirSync(path.join(copy, 'empty'))
+    fs.rmSync(path.join(copy, 'bin', 'agent24-documents'))
+    fs.symlinkSync(path.join(b, 'bin', 'agent24-documents'), path.join(copy, 'bin', 'agent24-documents'))
+    expect(sameFiles(b, copy)).toBe(false)
+    expect(sameFiles(b, path.join(root, 'missing'))).toBe(false)
   })
 })

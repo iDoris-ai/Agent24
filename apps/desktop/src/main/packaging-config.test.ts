@@ -71,6 +71,24 @@ describe('mac installer carries the documents module (T1-1)', () => {
     }
   })
 
+  it('mac signs both module programs as binaries (T1-3: Hardened Runtime, the app\'s team)', () => {
+    const binaries = (pkg.build.mac as { binaries?: string[] }).binaries ?? []
+    expect(binaries).toEqual(expect.arrayContaining([
+      'Contents/Resources/documents-module/bin/agent24-documents',
+      'Contents/Resources/documents-module/bin/agent24-documents-pdfkit',
+    ]))
+  })
+
+  it('release-mac.sh builds the module, stages it, and only then runs electron-builder (T1-3)', () => {
+    const release = fs.readFileSync(path.join(__dirname, '..', '..', 'scripts', 'release-mac.sh'), 'utf8')
+    const cargo = release.indexOf('-p agent24-documents')
+    const stage = release.indexOf('scripts/stage-documents-module.sh" "$CARGO_OUT"')
+    const builder = release.indexOf('pnpm exec electron-builder')
+    expect(cargo).toBeGreaterThan(-1)
+    expect(stage).toBeGreaterThan(cargo)
+    expect(builder).toBeGreaterThan(stage)
+  })
+
   it('build:mac builds and stages the module before electron-builder', () => {
     const steps = pkg.scripts['build:mac']!.split('&&').map((s) => s.trim())
     const at = (s: string): number => steps.indexOf(s)

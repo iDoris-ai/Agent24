@@ -1,7 +1,7 @@
 # Documenting domain OS (ADR-DOC-01 D3). Identity is derived from `name`:
 # namespace /api/v1/documents, data dir ~/.agent24/os/documents/, events with module `documents`.
 name: documents
-version: "0.1.0"
+version: "0.2.0"
 route_namespace: /api/v1/documents
 event_module: documents
 data_dir: ~/.agent24/os/documents/

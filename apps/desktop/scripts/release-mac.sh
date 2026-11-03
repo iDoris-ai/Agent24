@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # macOS 桌面端一条命令发布流水线（DEP-B2）：
-#   build:rust(release) -> node-daemon -> vite/tsc -> electron-builder(签名) -> notarytool(dmg) -> staple -> 验证
+#   build:rust(release) -> node-daemon -> vite/tsc -> documents 模块 -> electron-builder(签名) -> notarytool(dmg) -> staple -> 验证
 # 用法：bash apps/desktop/scripts/release-mac.sh        （在仓库任意目录执行均可）
 # 环境变量：
 #   AGENT24_SIGN_IDENTITY  签名身份，默认 "Developer ID Application: Huifeng Jiao (HYAP444FN9)"
@@ -81,8 +81,8 @@ BUILDER_IDENTITY="${SIGN_IDENTITY#Developer ID Application: }"
 # 防止环境里的 CSC_* 把签名悄悄切到别的证书 / 或让 electron-builder 去找 p12
 unset CSC_LINK CSC_KEY_PASSWORD CSC_NAME
 
-step "1/6 构建 Rust release（agent24d、agent24）"
-( cd "$REPO_ROOT" && cargo build --release --locked -p agent24d -p agent24-cli --manifest-path rust/Cargo.toml )
+step "1/6 构建 Rust release（agent24d、agent24、agent24-documents）"
+( cd "$REPO_ROOT" && cargo build --release --locked -p agent24d -p agent24-cli -p agent24-documents --manifest-path rust/Cargo.toml )
 CARGO_OUT="${CARGO_TARGET_DIR:-$REPO_ROOT/rust/target}/release"
 # 两个都进包：extraResources 的 backend/agent24d 和 backend/agent24（文档导入调用 agent24）
 for b in agent24d agent24; do
@@ -99,6 +99,16 @@ step "2/6 构建 node-daemon 与桌面端前端/主进程"
 cd "$DESKTOP_DIR"
 pnpm --filter @agent24/node-daemon build
 pnpm build
+
+step "2a/6 documents 模块（T1-1：Resources/documents-module，首次启动由 App 安装）"
+# 与 build:mac 同一个脚本：从 $CARGO_OUT 取 agent24-documents，用 swiftc 编 pdfkit 引擎，
+# 拼进 .documents-module/（先在临时目录拼好再换进去）。两个程序由下一步 electron-builder
+# 以同一 Developer ID、Hardened Runtime 签名（package.json mac.binaries）；
+# 首次启动安装前，App 要求它们的 Team ID 与 App 自身一致并带 runtime（documents-module.ts）。
+bash "$DESKTOP_DIR/scripts/stage-documents-module.sh" "$CARGO_OUT"
+for f in domain-os.yml bin/agent24-documents bin/agent24-documents-pdfkit; do
+  [[ -f "$DESKTOP_DIR/.documents-module/$f" ]] || die "documents 模块缺少 $f（stage-documents-module.sh）"
+done
 
 step "2b/6 Open Design 按需组件（darwin-${ARCH}：构建 → 签名原生模块 → 公证 → 打 tarball + 清单）"
 [[ "${ARCH}" == "arm64" ]] || die "Open Design 组件目前只支持 arm64（AGENT24_ARCH=${ARCH}）"
