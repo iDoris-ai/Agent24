@@ -87,3 +87,8 @@ it('refreshes missing protocol details on locale changes without a new backend s
   expect(view.tooltip).toContain('Protocol unknown (app 1) · pid 4242')
   unsubscribe()
 })
+
+it('tells the user of a reused (LaunchAgent) daemon how to get Knowledge working', () => {
+  expect(buildTrayView({ ...input, external: true, externalPid: 4242 }).tooltip).toContain('`agent24 service uninstall`')
+  expect(buildTrayView(input).tooltip).not.toContain('service uninstall')
+})

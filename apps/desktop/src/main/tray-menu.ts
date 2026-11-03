@@ -42,6 +42,9 @@ export function buildTrayView(input: TrayInput): TrayView {
     ? mt('tray.external', { label: base, pid: input.externalPid ?? '?' })
     : input.foreignPid !== null ? mt('tray.foreign', { label: base, pid: input.foreignPid }) : base
   let tooltip = `Agent24 — ${label.replace(/^[●○✕]\s*/, '')} (${input.backendKind})`
+  // T1-0: a reused external daemon is one the LaunchAgent manages; Knowledge
+  // needs this app's own daemon, so say how to get there.
+  if (input.external) tooltip += '\n' + mt('tray.externalKnowledge')
   const detail = input.status === 'error' ? input.detail : null
   const summary = detail ? mt('tray.protocolShort', {
     daemonVersion: detail.daemonVersion ?? mt('tray.protocolUnknown'),
