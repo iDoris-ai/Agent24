@@ -6,11 +6,17 @@
 // (AGENTS.md), with its consent-revocation gate (ADR-K1-03 §3). Installed is
 // enabled: a module not named in os.json is on (os_config.rs).
 //
-// - Not installed            → install.
-// - Installed, same version  → leave it.
-// - Installed, other version → uninstall, then install (the module's data
+// - Not installed               → install.
+// - Installed, the same files    → leave it.
+// - Installed, any file differs  → uninstall, then install (the module's data
 //   directory is not touched by either; os.json is not touched, so a module
 //   the user turned off stays off).
+//
+// "The same" is the files, not the manifest's `version`: `os install` copies
+// the package byte for byte (install.rs copy_tree), so an installed copy of
+// this very package is identical to it, and the version was never bumped
+// when the programs changed (0.1.0 through all of DOC-1, so a launch after
+// the 11-02 candidate kept the old programs). The version is for the log.
 // - The user uninstalled it  → leave it uninstalled (the marker file below;
 //   T1-2 writes it when the user uninstalls and clears it when they install).
 //
@@ -86,6 +92,45 @@ export function manifestVersion(text: string): string | null {
   const m = /^version:[ \t]*(?:"([^"\n]*)"|'([^'\n]*)'|([^\s#]+))[ \t]*(?:#.*)?$/m.exec(text)
   const v = m ? (m[1] ?? m[2] ?? m[3] ?? '') : ''
   return v === '' ? null : v
+}
+
+/** Every entry under `dir`, relative and sorted, `/` after a directory;
+ * null if one is neither a plain file nor a directory (a symlink: `os install`
+ * never makes one), or the tree cannot be read. */
+function listTree(dir: string, rel = ''): string[] | null {
+  let entries: fs.Dirent[]
+  try {
+    entries = fs.readdirSync(path.join(dir, rel), { withFileTypes: true })
+  } catch {
+    return null
+  }
+  const out: string[] = []
+  for (const e of entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
+    const name = rel === '' ? e.name : `${rel}/${e.name}`
+    if (e.isDirectory()) {
+      const sub = listTree(dir, name)
+      if (sub === null) return null
+      out.push(`${name}/`, ...sub)
+    } else if (e.isFile()) {
+      out.push(name)
+    } else {
+      return null
+    }
+  }
+  return out
+}
+
+/** The same entries, each file byte for byte (modes aside: install clears group/other write). */
+export function sameFiles(a: string, b: string): boolean {
+  const left = listTree(a)
+  const right = listTree(b)
+  if (left === null || right === null || left.length !== right.length) return false
+  if (left.some((name, i) => name !== right[i])) return false
+  try {
+    return left.every((name) => name.endsWith('/') || fs.readFileSync(path.join(a, name)).equals(fs.readFileSync(path.join(b, name))))
+  } catch {
+    return false
+  }
 }
 
 function readText(file: string): string | null {
@@ -190,7 +235,7 @@ export async function ensureBundledDocumentsModule(deps: BundledModuleDeps): Pro
         deps.warn(`[documents-module] ${installedDir} has no readable ${MANIFEST}; leaving it as it is`)
         return 'installed_unreadable'
       }
-      if (have === want) return 'up_to_date'
+      if (sameFiles(deps.bundleDir, installedDir)) return 'up_to_date'
     }
     const problem = await signatureProblem(deps.bundleDir, deps.appBundle, deps.codesign)
     if (problem !== null) {
@@ -200,7 +245,7 @@ export async function ensureBundledDocumentsModule(deps: BundledModuleDeps): Pro
     if (upgrading) {
       const removed = await deps.runCli(['os', 'uninstall', MODULE])
       if (removed.code !== 0) {
-        deps.warn(`[documents-module] upgrading ${have} → ${want}: os uninstall failed (rc=${removed.code}): ${lastLine(removed.output)}`)
+        deps.warn(`[documents-module] replacing ${have} with ${want}: os uninstall failed (rc=${removed.code}): ${lastLine(removed.output)}`)
         return 'install_failed'
       }
     }
