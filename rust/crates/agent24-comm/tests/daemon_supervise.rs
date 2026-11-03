@@ -16,9 +16,9 @@ use std::time::Duration;
 
 use agent24_comm::binary::sha256_of;
 use agent24_comm::{
-    Account, DaemonCtx, DaemonStartError, HyphaeDaemonSupervisor, HyphaeRunner,
-    MemoryPasswordStore, OrphanOutcome, Password, PasswordStore, ShutdownLeader, VerifiedBinary,
-    reap_orphan,
+    Account, ContractExpectation, ContractView, DaemonCtx, DaemonStartError,
+    HyphaeDaemonSupervisor, HyphaeRunner, MemoryPasswordStore, OrphanOutcome, Password,
+    PasswordStore, ProbeArm, ShutdownLeader, VerifiedBinary, reap_orphan,
 };
 
 /// `identity list` / `relay list` answer fixed, valid data; `daemon ...`
@@ -1320,4 +1320,258 @@ async fn start_failure_observation_classifies_pre_marker_runner_timeout() {
     assert!(!home.join("fixture-identity-started").exists());
     assert!(!pid_path.exists());
     eprintln!("negative control: first-poll/worker-pulse/store and outcome: {observation:?}");
+}
+
+// ---------------------------------------------------------------------
+// ADR-038 D3 contract handshake and D5 health polling
+// ---------------------------------------------------------------------
+
+fn test_arm(interval: Duration, health_timeout: Duration, contract_timeout: Duration) -> ProbeArm {
+    ProbeArm {
+        expectation: ContractExpectation {
+            name: "hyphae-cli".into(),
+            major: 1,
+            min_minor: 0,
+            tested: "1.0".into(),
+        },
+        health_interval: interval,
+        health_timeout,
+        contract_timeout,
+    }
+}
+
+fn script_with(contract_version: &str, health_body: &str) -> String {
+    const TEMPLATE: &str = r#"#!/bin/sh
+case "$1" in
+  contract)
+    printf '%s\n' '{"ok":true,"data":{"name":"hyphae-cli","contract_version":"VERSION_SLOT"}}'
+    exit 0
+    ;;
+  identity)
+    printf '%s\n' '{"ok":true,"data":[{"nickname":"alice","npub":"npub1x","default":true,"encrypted":true}]}'
+    exit 0
+    ;;
+  relay)
+    printf '%s\n' '{"ok":true,"data":{"relays":["wss://relay.example"],"source":"config"}}'
+    exit 0
+    ;;
+  health)
+HEALTH_SLOT
+    ;;
+  daemon)
+    cat > /dev/null
+    exec sleep 9999
+    ;;
+esac
+exit 0
+"#;
+    TEMPLATE
+        .replace("VERSION_SLOT", contract_version)
+        .replace("HEALTH_SLOT", health_body)
+}
+
+#[tokio::test]
+async fn contract_mismatch_does_not_start_the_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = make_ctx_with_script(
+        tmp.path(),
+        r#"#!/bin/sh
+case "$1" in
+  contract)
+    printf '%s\n' '{"ok":true,"data":{"name":"hyphae-cli","contract_version":"2.0","future":true}}'
+    exit 0
+    ;;
+  daemon)
+    touch "$HOME/daemon-started"
+    exec sleep 9999
+    ;;
+esac
+exit 0
+"#,
+    )
+    .await;
+    let home = ctx.home.clone();
+    let sup = FixtureSupervisor::spawn(ctx);
+    sup.arm_probe(test_arm(
+        Duration::from_secs(45),
+        Duration::from_secs(8),
+        Duration::from_secs(5),
+    ));
+    let err = sup.start().await.unwrap_err();
+    let DaemonStartError::Failed(message) = err else {
+        panic!("expected Failed, got {err:?}");
+    };
+    assert!(message.contains("contract_mismatch"), "{message}");
+    assert!(
+        !home.join("daemon-started").exists(),
+        "a mismatched contract must not spawn the daemon"
+    );
+    assert_ne!(sup.status().state, "running");
+    assert_eq!(sup.probe_snapshot().contract, ContractView::Mismatch);
+}
+
+#[tokio::test]
+async fn contract_timeout_is_a_failed_check_and_does_not_spawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = make_ctx_with_script(
+        tmp.path(),
+        r#"#!/bin/sh
+case "$1" in
+  contract)
+    sleep 60
+    ;;
+  daemon)
+    touch "$HOME/daemon-started"
+    exec sleep 9999
+    ;;
+esac
+exit 0
+"#,
+    )
+    .await;
+    let home = ctx.home.clone();
+    let sup = FixtureSupervisor::spawn(ctx);
+    sup.arm_probe(test_arm(
+        Duration::from_secs(45),
+        Duration::from_secs(8),
+        Duration::from_millis(200),
+    ));
+    let started = std::time::Instant::now();
+    let err = sup.start().await.unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "contract check must honor its timeout, elapsed {:?}",
+        started.elapsed()
+    );
+    let DaemonStartError::Failed(message) = err else {
+        panic!("expected Failed, got {err:?}");
+    };
+    assert!(message.contains("contract_check_failed"), "{message}");
+    assert!(!home.join("daemon-started").exists());
+    assert_eq!(sup.probe_snapshot().contract, ContractView::CheckFailed);
+}
+
+#[tokio::test]
+async fn a_newer_minor_still_starts_and_is_marked_above_tested() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = script_with(
+        "1.4",
+        r#"    printf '%s\n' '{"ok":true,"data":{"status":"ok","checks":{"relays":{"ok":true},"keystore":{"ok":true}}}}'
+    exit 0"#,
+    );
+    let ctx = make_ctx_with_script(tmp.path(), &script).await;
+    let sup = FixtureSupervisor::spawn(ctx);
+    sup.arm_probe(test_arm(
+        Duration::from_secs(3600),
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+    ));
+    sup.start().await.unwrap();
+    assert!(
+        wait_until(|| sup.status().state == "running", Duration::from_secs(3)).await,
+        "status {:?}",
+        sup.status()
+    );
+    let snap = sup.probe_snapshot();
+    assert_eq!(snap.contract, ContractView::Compatible);
+    assert!(
+        snap.above_tested,
+        "minor above tested is accepted, not rejected"
+    );
+}
+
+#[tokio::test]
+async fn consecutive_health_failures_degrade_and_one_success_clears() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = script_with(
+        "1.0",
+        r#"    if [ -f "$HOME/allow-recover" ]; then
+      printf '%s\n' '{"ok":true,"data":{"status":"ok","checks":{"relays":{"ok":true},"keystore":{"ok":true,"exists":true}}}}'
+    else
+      printf '%s\n' '{"ok":true,"data":{"status":"failed","checks":{"relays":{"ok":false},"keystore":{"ok":true,"exists":true}}}}'
+    fi
+    exit 0"#,
+    );
+    let ctx = make_ctx_with_script(tmp.path(), &script).await;
+    let home = ctx.home.clone();
+    let sup = FixtureSupervisor::spawn(ctx);
+    sup.arm_probe(test_arm(
+        Duration::from_millis(40),
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+    ));
+    sup.start().await.unwrap();
+    assert!(
+        wait_until(
+            || {
+                let Some(health) = sup.probe_snapshot().health else {
+                    return false;
+                };
+                health.degraded
+                    && health.failed_probes.iter().any(|name| name == "relays")
+                    && health
+                        .checks
+                        .get("relays")
+                        .is_some_and(|check| !check.ok && check.consecutive_failures >= 3)
+                    && health.checks.get("keystore").is_some_and(|check| check.ok)
+            },
+            Duration::from_secs(5),
+        )
+        .await,
+        "health never degraded: {:?}",
+        sup.probe_snapshot()
+    );
+    tokio::fs::write(home.join("allow-recover"), b"")
+        .await
+        .unwrap();
+    assert!(
+        wait_until(
+            || {
+                let Some(health) = sup.probe_snapshot().health else {
+                    return false;
+                };
+                !health.degraded && health.consecutive_failures == 0
+            },
+            Duration::from_secs(5),
+        )
+        .await,
+        "one success did not clear degraded: {:?}",
+        sup.probe_snapshot()
+    );
+}
+
+#[tokio::test]
+async fn a_health_probe_in_flight_does_not_block_stop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = script_with(
+        "1.0",
+        r#"    touch "$HOME/health-started"
+    sleep 60
+    exit 0"#,
+    );
+    let ctx = make_ctx_with_script(tmp.path(), &script).await;
+    let home = ctx.home.clone();
+    let sup = FixtureSupervisor::spawn(ctx);
+    sup.arm_probe(test_arm(
+        Duration::from_secs(45),
+        Duration::from_secs(15),
+        Duration::from_secs(5),
+    ));
+    sup.start().await.unwrap();
+    assert!(
+        wait_until(
+            || home.join("health-started").exists() && sup.status().state == "running",
+            Duration::from_secs(3),
+        )
+        .await,
+        "health probe did not start, status {:?}",
+        sup.status()
+    );
+    let started = std::time::Instant::now();
+    sup.stop().await;
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "stop waited on hyphae health: {:?}",
+        started.elapsed()
+    );
 }

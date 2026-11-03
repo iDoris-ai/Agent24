@@ -36,8 +36,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 
+use crate::hyphae_probe::{ProbeArm, ProbeHub, ProbeSnapshot};
 use crate::password_store::{Account, PasswordStore};
 use crate::restart_policy::{Decision, RestartPolicy};
 use crate::runner::{Envelope, HyphaeRunner, Invocation, filtered_env};
@@ -665,7 +666,30 @@ async fn try_start(
     ctx: &Ctx,
     shutdown_deadline: &OnceLock<Instant>,
     log_truncate_generation: &AtomicU64,
+    probe: &ProbeHub,
 ) -> Result<Spawned, DaemonStartError> {
+    // D3: the handshake is the first interaction. No business call, and no
+    // daemon spawn, until `hyphae contract` matches the lock. Unarmed fixtures
+    // skip this; production arms the probe before the first start.
+    if let Some(expected) = probe.expectation() {
+        let timeout = probe.contract_timeout();
+        match crate::hyphae_probe::read_contract(&ctx.runner, timeout).await {
+            Ok((name, version)) => {
+                if !probe.record_compatible(&expected, &name, &version) {
+                    return Err(DaemonStartError::Failed(format!(
+                        "contract_mismatch: expected {} major {} min_minor {} tested {}, got {name} {version}",
+                        expected.name, expected.major, expected.min_minor, expected.tested
+                    )));
+                }
+            }
+            Err(error) => {
+                probe.mark_check_failed();
+                return Err(DaemonStartError::Failed(format!(
+                    "contract_check_failed: {error}"
+                )));
+            }
+        }
+    }
     let identities = read_list(ctx, &["identity", "list"]).await?;
     let nickname = identities
         .as_array()
@@ -1152,6 +1176,9 @@ pub struct HyphaeDaemonSupervisor {
     /// any. Written by the `/relay/probe` route via
     /// [`Self::record_relay_probe`] — this actor never touches it.
     relay_probe: Arc<Mutex<Option<RelayProbeStatus>>>,
+    /// Contract handshake + health book (ADR-038 D3/D5). Shared with the
+    /// health task; the actor only writes it from `try_start`.
+    probe: ProbeHub,
 }
 
 fn set_status(
@@ -1196,13 +1223,23 @@ impl HyphaeDaemonSupervisor {
         let catch_up_scan = Arc::new(AsyncMutex::new(CatchUpScanState::default()));
         let log_truncate_generation = Arc::new(AtomicU64::new(0));
         let relay_probe = Arc::new(Mutex::new(None));
+        let probe = ProbeHub::new();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (running_tx, running_rx) = watch::channel(false);
+        let runner = ctx.runner.clone();
+        tokio::spawn(crate::hyphae_probe::health_loop(
+            runner,
+            probe.clone(),
+            running_rx,
+        ));
         tokio::spawn(run_actor(
             ctx,
             Arc::clone(&log_truncate_generation),
             cmd_rx,
             Arc::clone(&status),
             Arc::clone(&shutdown_deadline),
+            running_tx,
+            probe.clone(),
         ));
         Self {
             cmd_tx,
@@ -1212,7 +1249,20 @@ impl HyphaeDaemonSupervisor {
             catch_up_scan,
             log_truncate_generation,
             relay_probe,
+            probe,
         }
+    }
+
+    /// Arm the D3 handshake and the D5 health poll. Production calls this
+    /// once, before autostart. A later `start` (including a restart) reads it.
+    pub fn arm_probe(&self, arm: ProbeArm) {
+        self.probe.arm(arm);
+    }
+
+    /// Latest contract verdict and health book, for `GET /api/v1/components`.
+    #[must_use]
+    pub fn probe_snapshot(&self) -> ProbeSnapshot {
+        self.probe.snapshot()
     }
 
     /// COMM-4b: the result of the most recent manual relay probe, or `None`
@@ -1351,8 +1401,9 @@ async fn spawn_and_record(
     status: &Mutex<DaemonStatus>,
     failures: u32,
     shutdown_deadline: &OnceLock<Instant>,
+    probe: &ProbeHub,
 ) -> Result<Phase, DaemonStartError> {
-    match try_start(ctx, shutdown_deadline, log_truncate_generation).await {
+    match try_start(ctx, shutdown_deadline, log_truncate_generation, probe).await {
         Ok(mut spawned) => {
             // PR #642 review round 3, High #1: the three call sites below
             // only check `shutdown_deadline` BEFORE this function is even
@@ -1547,6 +1598,8 @@ async fn run_actor(
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     status: Arc<Mutex<DaemonStatus>>,
     shutdown_deadline: Arc<OnceLock<Instant>>,
+    running_tx: watch::Sender<bool>,
+    probe: ProbeHub,
 ) {
     let mut policy = RestartPolicy::new();
     let mut generation: u64 = 0;
@@ -1616,7 +1669,7 @@ async fn run_actor(
                             // the policy exactly as it was; only THIS path
                             // resets it.
                             policy = RestartPolicy::new();
-                            match spawn_and_record(&ctx, &log_truncate_generation, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline).await {
+                            match spawn_and_record(&ctx, &log_truncate_generation, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline, &probe).await {
                                 Ok(p) => {
                                     phase = p;
                                     // PR #626 review, Medium #3: NOT
@@ -1661,7 +1714,7 @@ async fn run_actor(
                             // chase a SECOND generation this restart would
                             // otherwise have just spawned.
                             phase = if shutdown_deadline.get().is_none() {
-                                spawn_and_record(&ctx, &log_truncate_generation, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline)
+                                spawn_and_record(&ctx, &log_truncate_generation, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline, &probe)
                                     .await
                                     .unwrap_or(Phase::Idle)
                             } else {
@@ -1749,7 +1802,7 @@ async fn run_actor(
             () = tokio::time::sleep_until(backoff_deadline.unwrap_or_else(tokio::time::Instant::now)), if backoff_deadline.is_some() => {
                 // PR #626 review, High #2: "关机开始后禁止再 spawn".
                 phase = if shutdown_deadline.get().is_none() {
-                    spawn_and_record(&ctx, &log_truncate_generation, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline)
+                    spawn_and_record(&ctx, &log_truncate_generation, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline, &probe)
                         .await
                         .unwrap_or(Phase::Idle)
                 } else {
@@ -1757,6 +1810,10 @@ async fn run_actor(
                 };
             }
         }
+        // The health task probes only while the promoted phase is `running`.
+        // Publishing after the arm (not inside it) keeps the actor's select
+        // from waiting on `hyphae health`.
+        let _ = running_tx.send(matches!(phase, Phase::Running { .. }));
     }
 }
 
