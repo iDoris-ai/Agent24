@@ -282,12 +282,13 @@ class Faulty(Quiet):
         if swapped:
             headers["X-API-Key"] = "sk-revoked-" + secrets.token_hex(8)
         u = urllib.parse.urlsplit(WK)
-        res, wrote = None, False
+        status, wrote = 0, False  # 0 until WeKnora's whole answer is in hand
         try:
             conn = http.client.HTTPConnection(u.hostname, u.port, timeout=60)
             conn.request("POST", self.path, body=raw, headers=headers)
             res = conn.getresponse()
             data = res.read()
+            status = res.status
             conn.close()
             self.send_response(res.status)
             self.send_header("Content-Type", res.getheader("Content-Type") or "application/json")
@@ -300,7 +301,7 @@ class Faulty(Quiet):
             pass  # WeKnora gave no answer, or the daemon stopped waiting for it
         finally:
             if case == CASE[0]:
-                UPSTREAM.append((op, swapped, res.status if res is not None else 0, wrote))
+                UPSTREAM.append((op, swapped, status, wrote))
                 FORWARDED.set()
 
 
@@ -567,9 +568,10 @@ def held(d, then):
     did = then(run_id)
     run = d.wait(run_id) if run_id else {}
     FORWARDED.wait(15)
+    # Judged before the re-read, so a 200 landing during it cannot vouch for it.
+    late = any(u[:3] == ("search", False, 200) for u in UPSTREAM)
     later = d.call("GET", f"/api/v1/runs/{run_id}")[1] if run_id else {}
     FAULT.clear()
-    late = any(u[:3] == ("search", False, 200) for u in UPSTREAM)
     note = ("" if late else f"被压住的 search 上游没有回 200，代理记录 {UPSTREAM}；") if arrived else "search 未到达代理；"
     return did, run or {}, later, note
 
