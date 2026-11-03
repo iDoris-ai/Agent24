@@ -85,6 +85,13 @@ describe('ensureBundledDocumentsModule', () => {
     expect(warn).not.toHaveBeenCalled()
   })
 
+  it("logs the CLI's `installed <dir>` line, not its trailing hint", async () => {
+    const out = 'installed /d/packages/documents\n  it takes effect at the next daemon start\n  (a daemon started implicitly…)\n'
+    const { d } = deps({ results: [{ code: 0, output: out }] })
+    await ensureBundledDocumentsModule(d)
+    expect(vi.mocked(d.info).mock.calls[0]![0]).toBe('[documents-module] installed documents 0.2.0: installed /d/packages/documents')
+  })
+
   it('installed at the same version → nothing runs, not even codesign', async () => {
     const { d, runCli, codesign } = deps({ packagesRoot: installed('0.2.0') })
     expect(await ensureBundledDocumentsModule(d)).toBe('up_to_date')

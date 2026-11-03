@@ -193,7 +193,8 @@ export async function ensureBundledDocumentsModule(deps: BundledModuleDeps): Pro
       deps.warn(`[documents-module] os install failed (rc=${added.code}): ${lastLine(added.output)}`)
       return 'install_failed'
     }
-    deps.info(`[documents-module] ${upgrading ? 'upgraded to' : 'installed'} documents ${want}: ${lastLine(added.output)}`)
+    const where = /^installed .*$/m.exec(added.output)?.[0] ?? lastLine(added.output)
+    deps.info(`[documents-module] ${upgrading ? 'upgraded to' : 'installed'} documents ${want}: ${where}`)
     return upgrading ? 'upgraded' : 'installed'
   } catch (error) {
     deps.warn(`[documents-module] ${error instanceof Error ? error.message : String(error)}`)
