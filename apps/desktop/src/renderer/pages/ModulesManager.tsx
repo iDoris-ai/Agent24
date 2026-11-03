@@ -1,11 +1,25 @@
 import { useState, useEffect, useRef } from 'react'
-import { listOsModules, setOsModuleEnabled, type DomainOsView } from './agent/api'
+import {
+  documentsModuleStatus,
+  installBundledDocumentsModule,
+  listOsModules,
+  setOsModuleEnabled,
+  uninstallDocumentsModule,
+  type DomainOsView,
+} from './agent/api'
+import type { DocumentsModuleStatus } from '../../shared/ipc-types'
 import { useT } from '../i18n'
 import { modulesManagerMessages } from './ModulesManager.i18n'
 
 // REV-01 (ADR-037 decision 1): the node-daemon-era npm module list / install /
 // marketplace sections are gone; this page now manages only the kernel-mounted
 // domain-OS modules (`GET`/`PATCH /api/v1/os`, e.g. Sin90).
+//
+// T1-2: the documents module the mac app carries can also be uninstalled and
+// installed again here. That changes what is on disk; the daemon lists what
+// it mounted when it started, so until it restarts the two can differ, and
+// the row says so.
+const DOCUMENTS = 'documents'
 export default function ModulesManagerPage() {
   const t = useT(modulesManagerMessages)
   const [osModules, setOsModules] = useState<DomainOsView[]>([])
@@ -13,6 +27,11 @@ export default function ModulesManagerPage() {
   const [osError, setOsError] = useState<string | null>(null)
   const [osRegistryError, setOsRegistryError] = useState<string | null>(null)
   const [osToggling, setOsToggling] = useState<string | null>(null)
+  const [docStatus, setDocStatus] = useState<DocumentsModuleStatus | null>(null)
+  const [docBusy, setDocBusy] = useState(false)
+  // An uninstall/install failure: shown on its own, so it does not hide the
+  // list (or the Install row) the way a failed list read does.
+  const [docError, setDocError] = useState<string | null>(null)
 
   const loadOsSeq = useRef(0)
 
@@ -24,6 +43,9 @@ export default function ModulesManagerPage() {
     const seq = ++loadOsSeq.current
     setOsLoading(true)
     setOsError(null)
+    // Read before the list: a stale `installed` would offer the wrong button.
+    const status = await documentsModuleStatus().catch(() => null)
+    if (seq === loadOsSeq.current) setDocStatus(status)
     try {
       const list = await listOsModules()
       if (seq === loadOsSeq.current) {
@@ -52,6 +74,83 @@ export default function ModulesManagerPage() {
     } finally {
       setOsToggling(null)
     }
+  }
+
+  async function documentsAction(kind: 'uninstall' | 'install') {
+    setDocBusy(true)
+    setDocError(null)
+    try {
+      await (kind === 'uninstall' ? uninstallDocumentsModule() : installBundledDocumentsModule())
+    } catch (e) {
+      setDocError(t('error.docmod', {
+        action: t(kind === 'uninstall' ? 'docmod.uninstall' : 'docmod.install'),
+        msg: e instanceof Error ? e.message : String(e),
+      }))
+    } finally {
+      setDocBusy(false)
+      void loadOs()
+    }
+  }
+
+  /** Uninstalled, but the daemon still serves what it mounted at start. Its
+   * on/off switch is gone too: turning it off now would write an os.json
+   * entry for a module that no longer exists, which degrades every module at
+   * the next start. */
+  const removedPending = (mod: DomainOsView): boolean =>
+    mod.name === DOCUMENTS && docStatus !== null && !docStatus.installed
+
+  const restartHint = (): string => t(docStatus?.externalDaemon ? 'docmod.restartCli' : 'docmod.restartTray')
+  const PILL = { fontSize: 12, fontWeight: 600, padding: '5px 14px', borderRadius: 20, cursor: 'pointer' } as const
+  const NOTE_BADGE = {
+    fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 12,
+    background: 'rgba(224,160,32,0.12)', color: '#e0a020', border: '1px solid rgba(224,160,32,0.25)',
+  } as const
+
+  /** The documents row's own controls: Uninstall while installed; once
+   *  removed, what the daemon still lists goes away when it restarts. */
+  function documentsControls(mod: DomainOsView) {
+    if (mod.name !== DOCUMENTS || docStatus === null) return null
+    if (!docStatus.installed) return <span title={restartHint()} style={NOTE_BADGE}>{t('docmod.removedPending')}</span>
+    return (
+      <button
+        onClick={() => void documentsAction('uninstall')}
+        disabled={docBusy}
+        style={{ ...PILL, background: 'rgba(244,67,54,0.08)', color: '#f44336', border: '1px solid rgba(244,67,54,0.3)' }}
+      >
+        {docBusy ? '…' : t('docmod.uninstallButton')}
+      </button>
+    )
+  }
+
+  /** Documents when the daemon does not list it: installable, or installed
+   *  and waiting for the daemon to restart. */
+  function renderDocumentsAbsent() {
+    if (docStatus === null || osModules.some((m) => m.name === DOCUMENTS)) return null
+    if (!docStatus.installed && !docStatus.bundled) return null
+    return (
+      <div key={DOCUMENTS} style={{ background: 'var(--surface2)', borderRadius: 10, padding: '14px 18px', border: '1px dashed var(--border)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div>
+            <div style={{ fontWeight: 600, fontSize: 14 }}>{DOCUMENTS}</div>
+            <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>
+              {docStatus.installed ? t('docmod.installedPending') : t('docmod.notInstalled')}
+            </div>
+          </div>
+          {docStatus.installed ? (
+            <span title={restartHint()} style={NOTE_BADGE}>{t('os.restartRequired')}</span>
+          ) : (
+            <button
+              onClick={() => void documentsAction('install')}
+              disabled={docBusy}
+              style={{ ...PILL, background: 'rgba(76,175,80,0.15)', color: '#4caf50', border: '1px solid #4caf5066' }}
+            >
+              {docBusy ? '…' : t('docmod.installButton')}
+            </button>
+          )}
+        </div>
+        {docStatus.installed && <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 8 }}>{restartHint()}</div>}
+      </div>
+    )
   }
 
   const OS_STATE_META: Record<string, { label: string; color: string }> = {
@@ -85,7 +184,8 @@ export default function ModulesManagerPage() {
               fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 12,
               background: `${meta.color}22`, color: meta.color, border: `1px solid ${meta.color}44`,
             }}>{meta.label}</span>
-            <button
+            {documentsControls(mod)}
+            {!removedPending(mod) && <button
               onClick={() => void toggleOs(mod)}
               disabled={osToggling === mod.name}
               style={{
@@ -96,10 +196,13 @@ export default function ModulesManagerPage() {
               }}
             >
               {osToggling === mod.name ? '…' : mod.enabled ? t('os.disable') : t('os.enable')}
-            </button>
+            </button>}
           </div>
         </div>
         {mod.detail && <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 8 }}>{mod.detail}</div>}
+        {mod.name === DOCUMENTS && docStatus !== null && !docStatus.installed && (
+          <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 8 }}>{restartHint()}</div>
+        )}
         {mod.granted.length > 0 && (
           <div style={{ marginTop: 6, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
             {mod.granted.map((g) => (
@@ -138,6 +241,11 @@ export default function ModulesManagerPage() {
             {osError}
           </div>
         )}
+        {docError && (
+          <div role="alert" style={{ color: '#f44336', fontSize: 12, padding: '8px 12px', marginBottom: 8, background: 'rgba(244,67,54,0.1)', borderRadius: 6, border: '1px solid rgba(244,67,54,0.3)', whiteSpace: 'pre-line' }}>
+            {docError}
+          </div>
+        )}
         {osRegistryError && (
           <div style={{ color: '#ff9800', fontSize: 12, padding: '8px 12px', marginBottom: 8, background: 'rgba(255,152,0,0.1)', borderRadius: 6, border: '1px solid rgba(255,152,0,0.3)' }}>
             {osRegistryError}
@@ -145,12 +253,16 @@ export default function ModulesManagerPage() {
         )}
         {osLoading ? (
           <div style={{ color: 'var(--muted)', fontSize: 12, padding: '12px 0', textAlign: 'center' }}>{t('loading')}</div>
-        ) : osModules.length === 0 ? (
-          <div style={{ color: 'var(--muted)', fontSize: 12, padding: '12px 0' }}>{t('os.empty')}</div>
         ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {osModules.map((m) => renderOsModule(m))}
-          </div>
+          <>
+            {osModules.length === 0 && (
+              <div style={{ color: 'var(--muted)', fontSize: 12, padding: '12px 0' }}>{t('os.empty')}</div>
+            )}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {osModules.map((m) => renderOsModule(m))}
+              {!osError && renderDocumentsAbsent()}
+            </div>
+          </>
         )}
       </div>
     </div>

@@ -428,6 +428,24 @@ const defaultExternalDaemonSource: ExternalDaemonSource = {
   fetchHealth: fetchDaemonHealth,
 }
 
+/** How long whileStopped() waits for the daemon to exit: past the CLI's own
+ * wait for a stopping daemon (agent24-cli WAIT_SECS, ~55 s), which covers the
+ * daemon's worst-case shutdown (agent24-protocol shutdown_bounds.rs). */
+export const DAEMON_EXIT_WAIT_MS = 60_000
+
+/** True once `child` has exited; false if it has not within `timeoutMs`. */
+function exited(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null && child.exitCode !== undefined) return Promise.resolve(true)
+  if (child.signalCode !== null && child.signalCode !== undefined) return Promise.resolve(true)
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs)
+    child.once('exit', () => {
+      clearTimeout(timer)
+      resolve(true)
+    })
+  })
+}
+
 export class BackendManager {
   private child: ChildProcess | null = null
   private healthTimer: NodeJS.Timeout | null = null
@@ -470,6 +488,8 @@ export class BackendManager {
   // Set by stop() (app quit): start() may still be awaiting its first probe
   // then, and must neither spawn nor arm the health loop afterwards.
   private disposed = false
+  /** Set while whileStopped() runs: whether to bring the daemon back after. */
+  private held: { resume: boolean } | null = null
   // T1-1: what start() waits for before it reuses or spawns anything (the
   // bundled documents module is installed first, so the daemon mounts it).
   // While it is pending, the tray's start / restart / stop only record what
@@ -627,6 +647,10 @@ export class BackendManager {
 
   /** Tray "启动 daemon": clear a prior manual stop and (re)spawn if needed. */
   startDaemon(): void {
+    if (this.held) {
+      this.held.resume = true
+      return
+    }
     this.lifecycle += 1
     // Spawning against an incompatible peer's lock just restarts the failure
     // loop. (A `foreign` peer is different: a manual start is allowed through,
@@ -646,6 +670,7 @@ export class BackendManager {
    * pins the tray to "stopped" and suspends the health loop, exactly as a
    * real stop would, but the external process itself is left untouched. */
   stopDaemon(): void {
+    if (this.held) this.held.resume = false
     this.lifecycle += 1
     this.userStopped = true
     this.lastHealthy = false
@@ -661,6 +686,10 @@ export class BackendManager {
    * reason as stopDaemon() above — "restart" here means "stop reusing it and
    * bring up a desktop-managed one instead". */
   restart(): void {
+    if (this.held) {
+      this.held.resume = true
+      return
+    }
     this.lifecycle += 1
     if (this.blockedReason !== null) return
     this.userStopped = false
@@ -673,6 +702,35 @@ export class BackendManager {
       this.killChild()
     }
     this.spawnChild()
+  }
+
+  /**
+   * T1-2: runs `work` with the daemon this app spawned stopped — waited for
+   * until it has exited, so its singleton lock is free — and brings it back
+   * afterwards unless the user had stopped it. A capabilities-mode daemon
+   * holds the lock and gives the CLI no credential, so `agent24 os
+   * install|uninstall` cannot revoke consent while it runs (agent24-cli
+   * `attach_only` → offline store → busy). A reused external daemon is not
+   * ours to stop: `work` just runs, and the CLI reaches it as it can.
+   */
+  async whileStopped<T>(work: () => Promise<T>, exitTimeoutMs = DAEMON_EXIT_WAIT_MS): Promise<T> {
+    if (this.isExternal || this.disposed) return work()
+    const resume = !this.userStopped
+    const child = this.child
+    this.stopDaemon()
+    // Until `work` is done, the tray only records what the user wants: a
+    // daemon started meanwhile would take the lock the CLI needs.
+    this.held = { resume }
+    try {
+      if (child && !(await exited(child, exitTimeoutMs))) {
+        throw new Error(`the daemon (pid ${String(child.pid)}) did not exit within ${exitTimeoutMs / 1000} s`)
+      }
+      return await work()
+    } finally {
+      const wanted = this.held.resume
+      this.held = null
+      if (wanted && !this.disposed) this.startDaemon()
+    }
   }
 
   /** Forget a reused external daemon without touching the process itself. */

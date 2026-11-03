@@ -283,11 +283,131 @@ export function execCli(bin: string, timeoutMs: number = CLI_TIMEOUT_MS): RunCli
     })
 }
 
-/** The outcome of this launch's check, for the Documents page. */
-let lastOutcome: BundledModuleOutcome | null = null
-export function recordOutcome(outcome: BundledModuleOutcome): void {
-  lastOutcome = outcome
+// ── T1-2: the user uninstalls and installs it from the Modules page ────────
+// Both run the app's CLI, as the launch check does, and take effect when the
+// daemon next starts (the CLI's own rule). Neither touches the module's data
+// (`<data dir>/os/documents`) or os.json.
+
+export type ModuleActionError =
+  /** The app carries no module to install. */
+  | 'no_bundle'
+  | 'no_packages_root'
+  | 'already_installed'
+  | 'signature_invalid'
+  /** The CLI exited non-zero (or could not run); its last line is in the message. */
+  | 'cli_failed'
+  /** The "user uninstalled" marker could not be written. */
+  | 'marker_failed'
+  /** The app's daemon did not exit in time, so the CLI was not run. */
+  | 'daemon_running'
+
+export type ModuleActionResult = { ok: true } | { ok: false; code: ModuleActionError; message: string }
+
+/** True if anything (file, dir, even a dangling symlink) is at `p`: what the CLI counts as installed. */
+function entryExists(p: string): boolean {
+  try {
+    fs.lstatSync(p)
+    return true
+  } catch {
+    return false
+  }
 }
-export function bundledModuleOutcome(): BundledModuleOutcome | null {
-  return lastOutcome
+
+/** What is on disk now, for the Modules and Documents pages. */
+export function documentsModuleOnDisk(
+  bundleDir: string | null,
+  packagesRoot: string | null,
+): { bundled: boolean; installed: boolean } {
+  const text = bundleDir === null ? null : readText(path.join(bundleDir, MANIFEST))
+  return {
+    bundled: text !== null && manifestVersion(text) !== null,
+    installed: packagesRoot !== null && entryExists(joinLiteral(packagesRoot, MODULE)),
+  }
+}
+
+/** Writes `{"uninstalledByUser": true, "at": …}`, whole, then renamed into place. Throws on failure. */
+export function writeUninstalledMarker(userDataDir: string, now: Date): void {
+  fs.mkdirSync(userDataDir, { recursive: true })
+  const file = path.join(userDataDir, MARKER_FILE)
+  const tmp = `${file}.${process.pid}.tmp`
+  fs.writeFileSync(tmp, `${JSON.stringify({ uninstalledByUser: true, at: now.toISOString() })}\n`)
+  fs.renameSync(tmp, file)
+}
+
+/** Removes the marker; a missing one is fine. Throws on any other failure. */
+export function clearUninstalledMarker(userDataDir: string): void {
+  fs.rmSync(path.join(userDataDir, MARKER_FILE), { force: true })
+}
+
+export interface UninstallDeps {
+  userDataDir: string
+  runCli: RunCli
+  warn: (message: string) => void
+  info: (message: string) => void
+  now: () => Date
+}
+
+/** `agent24 os uninstall documents`, marked first so that no later launch puts it back. */
+export async function uninstallDocumentsModule(deps: UninstallDeps): Promise<ModuleActionResult> {
+  const marker = path.join(deps.userDataDir, MARKER_FILE)
+  const hadMarker = entryExists(marker)
+  // Marked before removing: a removal that went through with no marker
+  // would be undone by the next launch.
+  try {
+    writeUninstalledMarker(deps.userDataDir, deps.now())
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    deps.warn(`[documents-module] not uninstalling: could not write ${marker}: ${message}`)
+    return { ok: false, code: 'marker_failed', message }
+  }
+  const r = await deps.runCli(['os', 'uninstall', MODULE])
+  if (r.code !== 0) {
+    // Still installed: take the marker back, or launches would stop upgrading it.
+    if (!hadMarker) {
+      try {
+        clearUninstalledMarker(deps.userDataDir)
+      } catch (error) {
+        deps.warn(`[documents-module] could not remove ${marker}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    const message = `agent24 os uninstall ${MODULE} (rc=${r.code}): ${lastLine(r.output)}`
+    deps.warn(`[documents-module] ${message}`)
+    return { ok: false, code: 'cli_failed', message }
+  }
+  deps.info(`[documents-module] uninstalled by the user: ${lastLine(r.output)}`)
+  return { ok: true }
+}
+
+/** Installs the module the app carries, checked as at launch, then clears the marker. */
+export async function installBundledDocumentsModule(deps: BundledModuleDeps): Promise<ModuleActionResult> {
+  const disk = documentsModuleOnDisk(deps.bundleDir, deps.packagesRoot)
+  if (deps.bundleDir === null || !disk.bundled) {
+    return { ok: false, code: 'no_bundle', message: 'the app carries no documents module' }
+  }
+  if (deps.packagesRoot === null) {
+    return { ok: false, code: 'no_packages_root', message: 'the data directory could not be resolved' }
+  }
+  if (disk.installed) {
+    return { ok: false, code: 'already_installed', message: `${joinLiteral(deps.packagesRoot, MODULE)} is already there` }
+  }
+  const problem = await signatureProblem(deps.bundleDir, deps.appBundle, deps.codesign)
+  if (problem !== null) {
+    deps.warn(`[documents-module] not installing the bundled documents: ${problem}`)
+    return { ok: false, code: 'signature_invalid', message: problem }
+  }
+  const r = await deps.runCli(['os', 'install', deps.bundleDir])
+  if (r.code !== 0) {
+    const message = `agent24 os install (rc=${r.code}): ${lastLine(r.output)}`
+    deps.warn(`[documents-module] ${message}`)
+    return { ok: false, code: 'cli_failed', message }
+  }
+  // Installed either way. A marker left behind only stops later launches
+  // from upgrading it, so this is a warning, not a failure.
+  try {
+    clearUninstalledMarker(deps.userDataDir)
+  } catch (error) {
+    deps.warn(`[documents-module] installed, but could not remove the uninstalled marker: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  deps.info(`[documents-module] installed by the user: ${/^installed .*$/m.exec(r.output)?.[0] ?? lastLine(r.output)}`)
+  return { ok: true }
 }

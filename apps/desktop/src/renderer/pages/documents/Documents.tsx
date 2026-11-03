@@ -8,6 +8,7 @@ import { canCancel, canRetry, cancelImport, describeError, getImportState, nudge
 import DocumentDetail from './DocumentDetail'
 import { useT } from '../../i18n'
 import { documentsMessages } from './Documents.i18n'
+import type { DocumentsModuleStatus } from '../../../shared/ipc-types'
 
 type Doc = components['schemas']['Document']
 
@@ -21,6 +22,10 @@ const STATUS_LABELS: Record<string, 'status.queued' | 'status.running' | 'status
   interrupted: 'status.interrupted',
 }
 const STORAGE_UNAVAILABLE = 'storage-unavailable'
+/** The user turned the module off (503 `module_disabled`): said as a state, with where to turn it on. */
+const MODULE_DISABLED = 'module-disabled'
+const moduleDisabled = (res: { ok: boolean; error?: { code?: string } }): boolean =>
+  !res.ok && res.error?.code === 'module_disabled'
 const NOTE = { color: 'var(--muted)', fontSize: 13, margin: '8px 0' } as const
 /** The daemon has no documents route at all: the module is not
  * installed (it ships outside the installer, ADR-DOC-01 D6). That is a state,
@@ -45,14 +50,15 @@ export default function DocumentsPage() {
   const [capsMissing, setCapsMissing] = useState(false)
   const [listMissing, setListMissing] = useState(false)
   const notInstalled = capsMissing || listMissing
-  // T1-1 (§9 Q2): the app installed the module this launch, but the daemon
-  // was started outside it and mounts modules only when it starts.
-  const [restartRequired, setRestartRequired] = useState(false)
+  // T1-1/T1-2: with no documents route, what is on disk says which note to
+  // show: installed (the daemon mounts it once restarted, §9 Q2), installable
+  // from the Modules page, or neither (a build without the module).
+  const [moduleStatus, setModuleStatus] = useState<DocumentsModuleStatus | null>(null)
   useEffect(() => {
     if (!notInstalled) return
     let live = true
     api.moduleStatus?.()
-      .then((s) => { if (live) setRestartRequired(s.restartRequired === true) })
+      .then((s) => { if (live) setModuleStatus(s) })
       .catch(() => {})
     return () => { live = false }
   }, [api, notInstalled])
@@ -80,7 +86,8 @@ export default function DocumentsPage() {
     }
     setListMissing(false)
     if (!res.ok) {
-      setListError(describeError(res))
+      // Turned off: the notice above says so; no second, raw copy here.
+      setListError(moduleDisabled(res) ? null : describeError(res))
       return
     }
     setListError(null)
@@ -110,6 +117,7 @@ export default function DocumentsPage() {
       if (!live) return
       setCapsMissing(moduleNotInstalled(res))
       if (moduleNotInstalled(res)) setUnavailable(null)
+      else if (moduleDisabled(res)) setUnavailable(MODULE_DISABLED)
       else if (!res.ok) setUnavailable(describeError(res))
       else setUnavailable(res.data.storage.state === 'ready' ? null : STORAGE_UNAVAILABLE)
     })
@@ -144,11 +152,22 @@ export default function DocumentsPage() {
       </div>
       <p style={{ color: 'var(--muted)', fontSize: 12 }}>{t('subtitle')}</p>
       {notInstalled && (
-        restartRequired ? (
+        moduleStatus?.installed ? (
           <div role="status" style={NOTE}>
             <div>{t('restart.title')}</div>
-            <div>{t('restart.guide')}</div>
-            <code>{t('restart.command')}</code>
+            {moduleStatus.externalDaemon ? (
+              <>
+                <div>{t('restart.guide')}</div>
+                <code>{t('restart.command')}</code>
+              </>
+            ) : (
+              <div>{t('restart.tray')}</div>
+            )}
+          </div>
+        ) : moduleStatus?.bundled ? (
+          <div role="status" style={NOTE}>
+            <div>{t('notInstalled.title')}</div>
+            <div>{t('notInstalled.modules')}</div>
           </div>
         ) : (
           <div role="status" style={NOTE}>
@@ -160,7 +179,7 @@ export default function DocumentsPage() {
       )}
       {unavailable && (
         <div role="alert" style={ALERT}>
-          {unavailable === STORAGE_UNAVAILABLE ? t('storage.unavailable') : unavailable}
+          {unavailable === STORAGE_UNAVAILABLE ? t('storage.unavailable') : unavailable === MODULE_DISABLED ? t('disabled.notice') : unavailable}
         </div>
       )}
       <div style={{ display: 'flex', gap: 12, alignItems: 'center', margin: '12px 0' }}>
