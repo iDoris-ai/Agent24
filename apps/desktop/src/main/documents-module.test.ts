@@ -7,7 +7,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   CODESIGN,
   MARKER_FILE,
+  documentsModuleOnDisk,
   ensureBundledDocumentsModule,
+  installBundledDocumentsModule,
+  uninstallDocumentsModule,
+  userUninstalled,
   execCli,
   manifestVersion,
   packagesRootFor,
@@ -307,5 +311,119 @@ describe('execCli', () => {
   it('stops a call past its timeout', async () => {
     const slow = await execCli('/bin/sh', 100)(['-c', 'sleep 5'])
     expect(slow.code).toBeNull()
+  })
+})
+
+// T1-2: uninstall / install again from the Modules page.
+describe('uninstallDocumentsModule', () => {
+  const NOW = new Date('2026-11-03T12:00:00.000Z')
+  function udeps(result: CliResult = { code: 0, output: 'removed documents\n  it takes effect at the next daemon start\n' }) {
+    const runCli = vi.fn(async (_args: string[]) => result)
+    const warn = vi.fn()
+    return { u: { userDataDir: root, runCli, warn, info: vi.fn(), now: () => NOW }, runCli, warn }
+  }
+  const marker = (): unknown => JSON.parse(fs.readFileSync(path.join(root, MARKER_FILE), 'utf8'))
+
+  it('writes the marker, then runs os uninstall documents', async () => {
+    const { u, runCli } = udeps()
+    runCli.mockImplementationOnce(async () => {
+      // Marked before anything is removed.
+      expect(userUninstalled(root)).toBe(true)
+      return { code: 0, output: 'removed documents\n' }
+    })
+    expect(await uninstallDocumentsModule(u)).toEqual({ ok: true })
+    expect(runCli.mock.calls).toEqual([[['os', 'uninstall', 'documents']]])
+    expect(marker()).toEqual({ uninstalledByUser: true, at: '2026-11-03T12:00:00.000Z' })
+  })
+
+  it('the next launch then leaves it uninstalled', async () => {
+    const { u } = udeps()
+    await uninstallDocumentsModule(u)
+    const { d, runCli } = deps()
+    expect(await ensureBundledDocumentsModule(d)).toBe('skipped_user_uninstalled')
+    expect(runCli).not.toHaveBeenCalled()
+  })
+
+  it('CLI fails → its rc and last line come back, and the marker is taken back', async () => {
+    const { u, warn } = udeps({ code: 2, output: 'error: consent revocation failed: store locked\n' })
+    const r = await uninstallDocumentsModule(u)
+    expect(r).toEqual({ ok: false, code: 'cli_failed', message: 'agent24 os uninstall documents (rc=2): error: consent revocation failed: store locked' })
+    expect(fs.existsSync(path.join(root, MARKER_FILE))).toBe(false)
+    expect(warn).toHaveBeenCalledOnce()
+  })
+
+  it('CLI fails with a marker already there → the marker stays', async () => {
+    fs.writeFileSync(path.join(root, MARKER_FILE), '{"uninstalledByUser": true}')
+    const { u } = udeps({ code: 1, output: 'busy\n' })
+    expect((await uninstallDocumentsModule(u)).ok).toBe(false)
+    expect(userUninstalled(root)).toBe(true)
+  })
+
+  it('the marker cannot be written → nothing is uninstalled', async () => {
+    const blocked = path.join(root, 'not-a-dir')
+    fs.writeFileSync(blocked, 'a file where userData should be')
+    const { u, runCli } = udeps()
+    const r = await uninstallDocumentsModule({ ...u, userDataDir: blocked })
+    expect(r).toMatchObject({ ok: false, code: 'marker_failed' })
+    expect(runCli).not.toHaveBeenCalled()
+  })
+})
+
+describe('installBundledDocumentsModule', () => {
+  it('checks signatures, runs os install <bundle>, then clears the marker', async () => {
+    fs.writeFileSync(path.join(root, MARKER_FILE), '{"uninstalledByUser": true}')
+    const { d, runCli, codesign } = deps()
+    expect(await installBundledDocumentsModule(d)).toEqual({ ok: true })
+    expect(codesign).toHaveBeenCalled()
+    expect(runCli.mock.calls).toEqual([[['os', 'install', d.bundleDir]]])
+    expect(fs.existsSync(path.join(root, MARKER_FILE))).toBe(false)
+  })
+
+  it('a signature that does not pass → no install, marker kept', async () => {
+    fs.writeFileSync(path.join(root, MARKER_FILE), '{"uninstalledByUser": true}')
+    const { d, runCli } = deps({ codesign: fakeCodesign(TEAM_APP, RUNTIME, { code: 1, output: 'a sealed resource is missing or invalid' }) })
+    expect(await installBundledDocumentsModule(d)).toMatchObject({ ok: false, code: 'signature_invalid' })
+    expect(runCli).not.toHaveBeenCalled()
+    expect(userUninstalled(root)).toBe(true)
+  })
+
+  it('CLI fails → its rc and last line come back, marker kept', async () => {
+    fs.writeFileSync(path.join(root, MARKER_FILE), '{"uninstalledByUser": true}')
+    const { d } = deps({ results: [{ code: 1, output: 'error: consent revocation failed\n' }] })
+    expect(await installBundledDocumentsModule(d)).toEqual({ ok: false, code: 'cli_failed', message: 'agent24 os install (rc=1): error: consent revocation failed' })
+    expect(userUninstalled(root)).toBe(true)
+  })
+
+  it('already installed → refused before any check', async () => {
+    const pkgs = installed('0.1.0')
+    const { d, runCli, codesign } = deps({ packagesRoot: pkgs })
+    expect(await installBundledDocumentsModule(d)).toMatchObject({ ok: false, code: 'already_installed' })
+    expect(codesign).not.toHaveBeenCalled()
+    expect(runCli).not.toHaveBeenCalled()
+  })
+
+  it('no bundle, or no packages root → refused', async () => {
+    expect(await installBundledDocumentsModule(deps({ bundleDir: null }).d)).toMatchObject({ ok: false, code: 'no_bundle' })
+    expect(await installBundledDocumentsModule(deps({ packagesRoot: null }).d)).toMatchObject({ ok: false, code: 'no_packages_root' })
+  })
+})
+
+describe('documentsModuleOnDisk', () => {
+  it('bundled needs a readable version; installed is any entry under the name', () => {
+    expect(documentsModuleOnDisk(null, null)).toEqual({ bundled: false, installed: false })
+    const b = bundle()
+    const pkgs = path.join(root, 'data', 'packages')
+    expect(documentsModuleOnDisk(b, pkgs)).toEqual({ bundled: true, installed: false })
+    installed(null)
+    expect(documentsModuleOnDisk(b, pkgs)).toEqual({ bundled: true, installed: true })
+    fs.writeFileSync(path.join(b, 'domain-os.yml'), 'name: documents\n')
+    expect(documentsModuleOnDisk(b, pkgs).bundled).toBe(false)
+  })
+
+  it('a dangling symlink counts as installed, as the CLI counts it', () => {
+    const pkgs = path.join(root, 'pk')
+    fs.mkdirSync(pkgs)
+    fs.symlinkSync(path.join(root, 'gone'), path.join(pkgs, 'documents'))
+    expect(documentsModuleOnDisk(null, pkgs).installed).toBe(true)
   })
 })

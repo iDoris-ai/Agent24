@@ -84,6 +84,10 @@ const api = {
 
   osModuleSetEnabled: (name: string, enabled: boolean): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.OsModuleSetEnabled, name, enabled),
+  /** T1-2: elevated; uninstalls the documents module (fixed in main). Main asks first. */
+  osModuleUninstall: (): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.OsModuleUninstall),
+  /** T1-2: elevated; installs the documents module the app carries. Main asks first. */
+  osModuleInstallBundled: (): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.OsModuleInstallBundled),
   /** A-3: elevated; disables/enables AgentEar (the name is fixed in main).
    *  Main asks the user in a native dialog before sending. */
   agentearSetEnabled: (enabled: boolean): Promise<BackendProxyResponse> =>
@@ -158,7 +162,7 @@ const api = {
   documents: {
     request: <R extends DocumentsRequest>(req: R): Promise<DocumentsResponse<R['op']>> =>
       ipcRenderer.invoke(IpcChannels.DocumentsRequest, req),
-    /** T1-1: whether the module the app installed waits for a daemon restart. */
+    /** T1-1/T1-2: the documents module as it is on disk now. */
     moduleStatus: (): Promise<DocumentsModuleStatus> => ipcRenderer.invoke(IpcChannels.DocumentsModuleStatus),
     /** Picks a PDF, JPEG or PNG and imports it; null if the user cancels. */
     importFile: (): Promise<DocumentsResponse<'job'> | null> =>

@@ -20,6 +20,10 @@ export const IpcChannels = {
   // before sending anything.
   ApprovalDecide: 'approval:decide',
   OsModuleSetEnabled: 'os-module:set-enabled',
+  // T1-2: uninstall the documents module / install the one the app carries.
+  // No arguments: the module is fixed in main. Each runs the app's CLI.
+  OsModuleUninstall: 'os-module:uninstall',
+  OsModuleInstallBundled: 'os-module:install-bundled',
   CommInstall: 'comm:install',
   // Private-key backup: native confirm + native save dialog in main; the
   // backend writes the file itself, so the key never crosses IPC.
@@ -97,10 +101,15 @@ export const IpcChannels = {
   KnowledgeSetEnabled: 'knowledge:set-enabled',
 } as const
 
-/** T1-1 (§9 Q2): the app installed its documents module this launch, but the
- * running daemon was started outside the app and mounts it only once restarted. */
+/** T1-1/T1-2: the documents module as it is on disk now. A daemon reads
+ * installed modules only when it starts, so what it lists can lag behind. */
 export interface DocumentsModuleStatus {
-  restartRequired: boolean
+  /** The app carries a module it can install (macOS packaged builds). */
+  bundled: boolean
+  /** `<packages root>/documents` is there. */
+  installed: boolean
+  /** The running daemon was started outside the app: restart it with the CLI, not the tray. */
+  externalDaemon: boolean
 }
 
 /** What the renderer sees of the Knowledge settings: never the key. */

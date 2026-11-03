@@ -12,7 +12,16 @@ import { PresencePoller, defaultPresenceDeps, showPresenceDialog } from './prese
 import { AgentEarEventBridge } from './agentear-events'
 import { documentsEvent } from './documents'
 import { cliBinary } from './documents-cli'
-import { CODESIGN, bundledModuleOutcome, ensureBundledDocumentsModule, execCli, packagesRootFor, recordOutcome } from './documents-module'
+import {
+  CODESIGN,
+  type BundledModuleDeps,
+  documentsModuleOnDisk,
+  ensureBundledDocumentsModule,
+  execCli,
+  installBundledDocumentsModule,
+  packagesRootFor,
+  uninstallDocumentsModule,
+} from './documents-module'
 import { tryDataDir } from './data-dir'
 import { AgentEarEventLog } from './agentear-log'
 import { ModelCallLog } from './model-call-log'
@@ -333,7 +342,7 @@ app.whenReady().then(async () => {
   // installed first, so the daemon this start spawns mounts it: start() waits
   // for it, and tray actions in the meantime only record what the user wants.
   // Never rejects; a failure is a warning and the daemon starts all the same.
-  const documentsModuleReady = ensureBundledDocumentsModule({
+  const documentsDeps: BundledModuleDeps = {
     bundleDir: app.isPackaged && process.platform === 'darwin'
       ? path.join(process.resourcesPath, 'documents-module')
       : null,
@@ -345,7 +354,8 @@ app.whenReady().then(async () => {
     runCli: execCli(cliBinary()),
     warn: (message) => console.warn(message),
     info: (message) => console.log(message),
-  }).then(recordOutcome)
+  }
+  const documentsModuleReady = ensureBundledDocumentsModule(documentsDeps)
   backendManager.holdStartUntil(documentsModuleReady)
   void backendManager.start()
   // CORE-2 AgentEar S3: native confirmation for elevated operations. Idle until
@@ -387,14 +397,22 @@ app.whenReady().then(async () => {
   registerIpcHandlers({
     guard,
     knowledge: () => knowledge,
-    // T1-1, §9 Q2: the bundled module is installed (this launch or an
-    // earlier one), but the daemon is one started outside the app, which reads
-    // installed packages only when it starts. The page asks only while the
-    // daemon has no documents route.
-    documentsModule: () => {
-      const outcome = bundledModuleOutcome()
-      const onDisk = outcome === 'installed' || outcome === 'upgraded' || outcome === 'up_to_date'
-      return { restartRequired: onDisk && backendManager.externalDaemonPid() !== null }
+    // T1-1/T1-2: what is on disk now. A daemon reads installed packages only
+    // when it starts, so the pages compare this with what it serves (§9 Q2).
+    documentsModule: () => ({
+      ...documentsModuleOnDisk(documentsDeps.bundleDir, documentsDeps.packagesRoot),
+      externalDaemon: backendManager.externalDaemonPid() !== null,
+    }),
+    // T1-2: after the launch check, never alongside it.
+    documentsModuleActions: {
+      uninstall: async () => {
+        await documentsModuleReady
+        return uninstallDocumentsModule({ ...documentsDeps, now: () => new Date() })
+      },
+      install: async () => {
+        await documentsModuleReady
+        return installBundledDocumentsModule(documentsDeps)
+      },
     },
   })
   cliTool = registerCliTool({
