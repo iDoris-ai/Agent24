@@ -15,6 +15,14 @@ export const BACKUP_PW_CANCEL = 'backup-password:cancel'
 export const BACKUP_PW_ERROR = 'backup-password:error'
 export const BACKUP_PW_BUSY = 'backup-password:busy'
 
+/**
+ * How long to wait for the password window to disappear after the person has
+ * already submitted or dismissed it. That wait is not a human step (those stay
+ * unbounded). macOS modal sheets sometimes emit only `close`, only `destroyed`,
+ * or nothing we can still hear because the window is already gone.
+ */
+export const WINDOW_GONE_FALLBACK_MS = 2000
+
 const escapeHtml = (text: string): string =>
   text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 
@@ -119,40 +127,87 @@ function openPasswordWindow<T>(
     // finish() does not call close() again (that re-enters the close handler).
     let closing = false
 
-    // The promise settles only when the window is really gone, so the caller
-    // can open the next native window (the save dialog is a sheet on the same
-    // parent) without racing this one's teardown.
+    // BrowserWindow's typed events stop at `closed`. A sheet can also surface
+    // only as `destroyed` (on the window or its webContents).
+    const looseWin = win as unknown as {
+      on(event: string, listener: () => void): void
+      removeListener(event: string, listener: () => void): void
+    }
+    let detachGone: (() => void) | undefined
+
+    // The promise settles once the window is gone, or once the fallback below
+    // fires. Callers open the save dialog next; they must not wait forever on
+    // a `closed` that macOS never sends.
     const release = (): void => {
       if (released) return
       released = true
       if (teardownTimer !== undefined) clearTimeout(teardownTimer)
+      detachGone?.()
       parent?.removeListener('closed', onParentGone)
       app.removeListener('before-quit', onQuit)
+      looseWin.removeListener('destroyed', onWindowDestroyed)
       resolve(outcome)
     }
 
-    // Settles exactly once, whatever happens to the window: submit, cancel,
-    // `close`, `closed`, the web contents going away, the parent going away, or
-    // the app quitting. It never relies on win.close() working: close() may
-    // throw, a close may be vetoed, and a modal window torn down with its parent
-    // can emit `close` and never `closed`.
+    const forceDestroy = (): void => {
+      try { if (!win.isDestroyed()) win.destroy() } catch { /* release anyway */ }
+    }
+
+    // `close` / `closed` / `destroyed`, or the window already destroyed so the
+    // event was missed. Armed before `close()` so a synchronous event is heard.
+    // If none of those happen, the fallback resolves anyway: this wait is not
+    // the person typing.
+    const settleWhenGone = (): void => {
+      if (win.isDestroyed()) { release(); return }
+      let saw = false
+      const done = (): void => {
+        if (saw) return
+        saw = true
+        detachGone?.()
+        detachGone = undefined
+        forceDestroy()
+        release()
+      }
+      const onSignal = (): void => done()
+      detachGone = () => {
+        win.removeListener('close', onSignal)
+        win.removeListener('closed', onSignal)
+        looseWin.removeListener('destroyed', onSignal)
+        contents.removeListener('destroyed', onSignal)
+      }
+      teardownTimer = setTimeout(done, WINDOW_GONE_FALLBACK_MS)
+      win.on('close', onSignal)
+      win.on('closed', onSignal)
+      looseWin.on('destroyed', onSignal)
+      contents.on('destroyed', onSignal)
+      if (win.isDestroyed()) done()
+    }
+
+    // Settles exactly once: submit, cancel, `close`, `closed`, `destroyed`,
+    // the parent going away, or the app quitting. A missed event is not a hang:
+    // `isDestroyed()` is checked before waiting, and again after `close()`.
     const finish = (value: T | null): void => {
       if (settled) return
       settled = true
       outcome = value
       ipcMain.removeListener(BACKUP_PW_SUBMIT, onSubmit)
       ipcMain.removeListener(BACKUP_PW_CANCEL, onCancel)
-      if (win.isDestroyed()) { release(); return }
-      if (!closing) {
-        closing = true
-        try { win.close() } catch { /* the destroy below covers it */ }
-      }
-      // If it is still there on the next tick, destroy it. destroy() cannot be
-      // vetoed and is synchronous, so after it the window is gone.
-      teardownTimer = setTimeout(() => {
-        try { if (!win.isDestroyed()) win.destroy() } catch { /* nothing left to do */ }
+      // Already inside close/closed/destroyed, or the window is already gone.
+      // That event will not be delivered again.
+      if (closing || win.isDestroyed()) {
+        forceDestroy()
         release()
-      }, 0)
+        return
+      }
+      settleWhenGone()
+      closing = true
+      try { win.close() } catch { forceDestroy(); release() }
+      if (win.isDestroyed()) release()
+    }
+    const onWindowDestroyed = (): void => {
+      closing = true
+      finish(null)
+      release()
     }
     const onParentGone = (): void => finish(null)
     const onQuit = (): void => { working = false; finish(null) }
@@ -228,10 +283,8 @@ function openPasswordWindow<T>(
       finish(null)
       release()
     })
-    contents.once('destroyed', () => {
-      closing = true
-      finish(null)
-    })
+    looseWin.on('destroyed', onWindowDestroyed)
+    contents.on('destroyed', onWindowDestroyed)
     win.once('ready-to-show', () => win.show())
     void win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(backupPasswordHtml(mode, options))}`).catch(() => finish(null))
   })

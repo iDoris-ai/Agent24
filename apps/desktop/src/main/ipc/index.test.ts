@@ -23,7 +23,12 @@ const promptHomeImportPassword = vi.fn()
 const execFileMock = vi.fn()
 const appHandlers = new Map<string, () => void>()
 // What BrowserWindow.fromWebContents answers: the window the export started from.
-let parentWindow: { isDestroyed: () => boolean } | null = null
+let parentWindow: {
+  isDestroyed: () => boolean
+  isVisible?: () => boolean
+  isEnabled?: () => boolean
+  isMinimized?: () => boolean
+} | null = null
 // When set, the daemon's export route never answers until these are ended.
 let hangExport = false
 let exportReportsPath: string | null = null
@@ -551,19 +556,49 @@ describe('CommIdentityExport elevated IPC', () => {
     expect(openedWhileWindowUp).toBe(false)
   })
 
-  it('the parent window destroyed between the password step and the save step: cancelled, no dialog, no daemon call', async () => {
-    let parentDestroyed = false
-    parentWindow = { isDestroyed: () => parentDestroyed }
-    showMessageBox.mockResolvedValueOnce({ response: 0 })
-    promptBackupPassword.mockImplementationOnce(async () => { parentDestroyed = true; return PW })
-    const result = await call(IpcChannels.CommIdentityExport, 'alice')
-    expect(result.data.error.code).toBe('cancelled')
-    expect(showSaveDialog).not.toHaveBeenCalled()
-    noDaemonCall()
+  const aliveParent = () => ({ isDestroyed: () => false, isVisible: () => true, isEnabled: () => true, isMinimized: () => false })
+
+  it('a parent that cannot host a sheet still gets a save dialog, and the export promise settles', async () => {
+    const target = path.join(settingsDir, 'sheet-fallback.ncryptsec')
+    const parents = [
+      { isDestroyed: () => false, isVisible: () => false, isEnabled: () => true, isMinimized: () => false },
+      { isDestroyed: () => false, isVisible: () => true, isEnabled: () => false, isMinimized: () => false },
+      { isDestroyed: () => false, isVisible: () => true, isEnabled: () => true, isMinimized: () => true },
+      { isDestroyed: () => true, isVisible: () => true, isEnabled: () => true, isMinimized: () => false },
+    ]
+    for (const parent of parents) {
+      let releaseHung: (() => void) | null = null
+      showSaveDialog.mockReset()
+      showSaveDialog.mockImplementation((...args: unknown[]) => {
+        // Passing a BrowserWindow anchors a macOS sheet. On a hidden, disabled,
+        // minimized, or destroyed parent that promise never settles.
+        if (args.length === 2) return new Promise((resolve) => { releaseHung = () => resolve({ canceled: true }) })
+        return Promise.resolve({ canceled: false, filePath: target })
+      })
+      parentWindow = parent
+      showMessageBox.mockResolvedValueOnce({ response: 0 })
+      promptBackupPassword.mockResolvedValueOnce(PW)
+      const pending = call(IpcChannels.CommIdentityExport, 'alice')
+      const outcome = await Promise.race([
+        pending.then((result) => result as { ok?: boolean }),
+        new Promise<string>((resolve) => setTimeout(() => resolve('hung'), 200)),
+      ])
+      try {
+        expect(outcome).not.toBe('hung')
+        expect(outcome).toMatchObject({ ok: true })
+        expect(showSaveDialog).toHaveBeenCalledTimes(1)
+        expect(showSaveDialog.mock.calls[0]).toHaveLength(1)
+        expect(seen.filter((r) => r.url === '/api/v1/comm/identity/export')).toHaveLength(1)
+      } finally {
+        releaseHung?.()
+        await pending
+        seen = []
+      }
+    }
   })
 
-  it('the save dialog is a sheet on the starting window while it is alive', async () => {
-    parentWindow = { isDestroyed: () => false }
+  it('the save dialog is a sheet on the starting window while it is visible and enabled', async () => {
+    parentWindow = aliveParent()
     showMessageBox.mockResolvedValueOnce({ response: 0 })
     promptBackupPassword.mockResolvedValueOnce(PW)
     showSaveDialog.mockResolvedValueOnce({ canceled: true })

@@ -319,6 +319,23 @@ function pathExists(p: string): boolean {
 
 const SAFE_ID = /^[A-Za-z0-9_.:-]{1,128}$/
 
+/**
+ * Parent for a macOS save sheet. `showSaveDialog(window)` never resolves when
+ * that window is destroyed, hidden, minimized, or still disabled by the
+ * password sheet — the export IPC then stays pending and every button on the
+ * communication page stays disabled. No usable window: the caller omits it
+ * and the dialog is app-modal instead.
+ */
+function saveDialogParent(win: BrowserWindow | null): BrowserWindow | null {
+  if (!win) return null
+  try {
+    if (win.isDestroyed() || !win.isVisible() || win.isMinimized() || !win.isEnabled()) return null
+    return win
+  } catch {
+    return null
+  }
+}
+
 /** Native yes/no for an elevated operation. The text is built here, in main,
  *  so a compromised renderer cannot dress the prompt up. */
 async function confirmNative(event: IpcMainInvokeEvent, message: string, detail: string): Promise<boolean> {
@@ -677,19 +694,21 @@ export function registerIpcHandlers(options: {
       if (backupPassword === null) return cancelled()
       try {
         if (!isSafeBackupPassword(backupPassword)) return invalidRequest('invalid backup password')
-        // The window the user started from went away while they typed: do not
-        // open a detached dialog and carry on for nobody.
-        if (quitting || (parent && parent.isDestroyed())) return cancelled()
-        // 4. Where to save.
+        if (quitting) return cancelled()
+        // 4. Where to save. Only a visible, enabled, non-minimized window can
+        // host the sheet. Anything else gets an app-modal dialog (parent omitted),
+        // which the person can still dismiss. Attaching the sheet to a bad
+        // parent is what left this IPC pending on device.
         const saveOptions: Electron.SaveDialogOptions = {
           title: mt('comm.exportSave'),
           // Downloads, not Documents (which is often iCloud-synced).
           defaultPath: path.join(app.getPath('downloads'), `${backupFileStem(nickname)}.ncryptsec`),
           filters: [{ name: 'NIP-49 ncryptsec', extensions: ['ncryptsec'] }],
         }
+        const anchor = saveDialogParent(parent)
         let picked: Electron.SaveDialogReturnValue
         try {
-          picked = parent ? await dialog.showSaveDialog(parent, saveOptions) : await dialog.showSaveDialog(saveOptions)
+          picked = anchor ? await dialog.showSaveDialog(anchor, saveOptions) : await dialog.showSaveDialog(saveOptions)
         } catch {
           return { ok: false, status: 500, data: { error: { code: 'dialog_failed', message: 'the file dialog could not open' } } }
         }
