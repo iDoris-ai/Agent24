@@ -232,6 +232,7 @@ impl CommDaemonSlot {
     }
 
     /// The last build failed without refusing the binary (see [`BuildNote`]).
+    #[cfg(test)]
     pub fn start_failed(&self) -> bool {
         self.note_lock().start_failed
     }
