@@ -121,6 +121,15 @@ describe('DocumentsPage: the list', () => {
     expect(screen.getByText('还没有文档。')).toBeInTheDocument()
   })
 
+  it('a list that loads again does not take away the storage note (only a turned-off one)', async () => {
+    const m = mount({ capabilities: () => err(503, 'storage_unavailable', 'storage is not available', { retryable: true, cause: 'locked' }) })
+    render(<DocumentsPage />)
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('storage_unavailable：locked'))
+    act(() => m.event?.({ kind: 'document.imported', payload: { document_id: doc(1).document_id } }))
+    await waitFor(() => expect(m.request.mock.calls.filter(([r]) => (r as { op: string }).op === 'list')).toHaveLength(2))
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('storage_unavailable：locked'))
+  })
+
   it('module not installed (no v1 route): neutral note with install guide, import disabled, no red alert', async () => {
     const noRoute = () => err(404, 'not_found', 'No v1 route')
     mount({ capabilities: noRoute, lists: [noRoute] })
