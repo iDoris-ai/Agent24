@@ -290,7 +290,10 @@ impl ComponentLock {
         )?;
         let mut ids = BTreeSet::new();
         for p in &self.provides {
-            // Registered-id check (REGISTRY.md) belongs to the CI added in C7.
+            // Registered-id check lives in docs/capabilities/REGISTRY.md. The drift
+            // test (`registry_lists_every_capability_id_the_components_emit`) reads
+            // this field; the parser only checks the id shape. MCP ids are exempt
+            // and never appear in a lock.
             require(id_ok(&p.id, 2, 32) && ids.insert(&p.id), "provides.id")?;
         }
         Ok(())

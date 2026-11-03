@@ -146,6 +146,20 @@ impl McpServer {
         &self.name
     }
 
+    /// The MCP `protocolVersion` from initialize. Recorded, not compared:
+    /// MCP is exempt from D3's `major.minor` check (ADR-038 D1).
+    pub fn protocol_version(&self) -> Option<String> {
+        self.service
+            .peer_info()
+            .map(|info| info.protocol_version.as_str().to_owned())
+    }
+
+    /// The child closed its stdio. This is the liveness signal C7 records:
+    /// a crash leaves the service handle in place and only the transport ends.
+    pub fn transport_closed(&self) -> bool {
+        self.service.is_transport_closed()
+    }
+
     /// The declared target argument for one of this server's tools, if the user
     /// named one in `mcp.json`.
     pub fn target_arg(&self, remote_tool: &str) -> Option<&str> {
@@ -205,6 +219,16 @@ fn sanitize(s: &str) -> String {
             }
         })
         .collect()
+}
+
+/// `Cancelled` stays the word `cancelled`. Other MCP failures keep their own text.
+/// The two arms are separate so a cancelled call is not reclassified as a
+/// handshake or call failure by a later edit of the wildcard.
+fn tool_error_for(err: McpError) -> ToolError {
+    match err {
+        McpError::Cancelled => ToolError::Failed("cancelled".to_owned()),
+        err => ToolError::Failed(err.to_string()),
+    }
 }
 
 /// Flatten an MCP tool result into the string the agent loop feeds back.
@@ -314,8 +338,7 @@ impl Tool for McpTool {
                 }
                 Ok(render_result(&result))
             }
-            Err(McpError::Cancelled) => Err(ToolError::Failed("cancelled".to_owned())),
-            Err(err) => Err(ToolError::Failed(err.to_string())),
+            Err(err) => Err(tool_error_for(err)),
         }
     }
 }
@@ -325,8 +348,15 @@ pub async fn connect_and_build_tools(
     spec: &McpServerSpec,
     cancel: CancellationToken,
 ) -> Result<(Arc<McpServer>, Vec<Arc<dyn Tool>>), McpError> {
-    let server = Arc::new(McpServer::connect(spec, cancel).await?);
-    let listed = server.list_tools().await?;
+    let server = Arc::new(McpServer::connect(spec, cancel.clone()).await?);
+    // `list_all_tools` does not watch the token. Without this select, a daemon
+    // shutdown during `tools/list` waits out the connect budget and is recorded
+    // as a start timeout.
+    let listed = tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(McpError::Cancelled),
+        listed = server.list_tools() => listed,
+    }?;
     let tools: Vec<Arc<dyn Tool>> = listed
         .iter()
         .map(|t| Arc::new(McpTool::new(Arc::clone(&server), t)) as Arc<dyn Tool>)
@@ -344,6 +374,21 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn a_cancelled_mcp_call_maps_to_failed_cancelled() {
+        let err = tool_error_for(McpError::Cancelled);
+        assert!(
+            matches!(err, ToolError::Failed(ref message) if message == "cancelled"),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "failed: cancelled");
+        let other = tool_error_for(McpError::Call("nope".into()));
+        assert!(
+            matches!(other, ToolError::Failed(ref message) if message.contains("nope") && message != "cancelled"),
+            "{other:?}"
+        );
+    }
 
     #[test]
     fn names_are_namespaced_so_servers_cannot_shadow_each_other() {
