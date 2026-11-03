@@ -409,15 +409,6 @@ impl KnowledgeHostRegistry {
         }
     }
 
-    /// Whether any host has any binding active.
-    // The component list probes endpoints (C5). Tests still read this flag.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn any_active(&self) -> bool {
-        self.entries
-            .lock()
-            .is_ok_and(|entries| entries.values().any(|entry| entry.active))
-    }
-
     /// Active bindings that name an endpoint, one per base URL.
     ///
     /// A live credential beats the same URL with none, because its seq is at
@@ -461,6 +452,8 @@ impl KnowledgeHostRegistry {
                         epoch,
                         owner: owner.clone(),
                         target: ProbeTarget {
+                            host: owner.0.clone(),
+                            binding: owner.1.clone(),
                             base_url,
                             credential,
                             credential_epoch: epoch,
@@ -472,6 +465,33 @@ impl KnowledgeHostRegistry {
         by_url.into_values().map(|choice| choice.target).collect()
     }
 
+    /// The snapshotted target still names an active binding whose endpoint and
+    /// credential epoch have not moved. A probe calls this again before it
+    /// sends, and skips the target when this is false.
+    pub(crate) fn probe_target_current(&self, target: &ProbeTarget) -> bool {
+        let now = unix_now();
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(entry) = entries.get(&(target.host.clone(), target.binding.clone())) else {
+            return false;
+        };
+        if !entry.active {
+            return false;
+        }
+        let Some(endpoint) = &entry.endpoint else {
+            return false;
+        };
+        if endpoint.base_url != target.base_url {
+            return false;
+        }
+        let epoch = entry
+            .credential
+            .as_ref()
+            .filter(|current| current.expires_at > now)
+            .map(|current| current.seq)
+            .unwrap_or(0);
+        epoch == target.credential_epoch
+    }
+
     /// How many component reads are waiting on the current capabilities flight.
     #[cfg(test)]
     pub(crate) fn inflight_receivers(&self) -> usize {
@@ -481,7 +501,14 @@ impl KnowledgeHostRegistry {
     /// D5 remote subset for Knowledge, from a cached capabilities probe.
     pub(crate) async fn component_status(&self, now: Instant) -> ProbeView {
         let targets = self.probe_targets(unix_now());
-        self.probes.assess(&targets, now).await
+        self.assess_snapshot(&targets, now).await
+    }
+
+    /// Probe `targets` as snapshotted. A binding that was deactivated or whose
+    /// credential epoch moved since the snapshot is not called.
+    pub(crate) async fn assess_snapshot(&self, targets: &[ProbeTarget], now: Instant) -> ProbeView {
+        let current = |target: &ProbeTarget| self.probe_target_current(target);
+        self.probes.assess(targets, now, &current).await
     }
 
     /// Whether `host` has `binding` active.

@@ -5,24 +5,35 @@
 //!
 //! - no endpoint configured → `stopped` (`not_configured`)
 //! - TCP/TLS/timeout, or a non-2xx answer → `failed`, reason is a fixed code
-//! - an envelope `code` other than success (`0` / `"ok"`) → `failed`
-//!   (`upstream_<code>`), and `data` is not read as a declaration
+//! - an envelope `code` other than exact success (integer `0`, or `"0"` /
+//!   `"ok"`) → `failed` (`upstream_<code>`), and `data` is not read as a
+//!   declaration. A number that is not that integer (`1.5`, a magnitude
+//!   outside `i64`, `-0.5`) is `upstream_error`
 //! - declaration missing, a required field absent (`protocol_versions`, `mode`,
-//!   `supported_operations`, `server_version`, `limits` — READONLY R9.2), `mode`
-//!   is not `integration`, or major `1` is absent (READONLY R9.4, D3) →
-//!   `incompatible` (`component_contract_mismatch`)
+//!   `supported_operations`, `server_version`, `limits` — READONLY R9.2 — or
+//!   one of `limits`' six schema keys), `mode` is not `integration`, or major
+//!   `1` is absent (READONLY R9.4, D3) → `incompatible`
+//!   (`component_contract_mismatch`)
 //! - major `1` and `integration`, but `search` or `read` is absent (READONLY R9.2;
 //!   OPS-v1 does not add a required operation yet) → `degraded`
 //!   (`missing_capability:<name>`)
-//! - otherwise → `ready`
+//! - otherwise → `ready`. This only means the capability declaration is
+//!   complete and the contract is compatible. It does not mean dependencies
+//!   are healthy (READONLY R9.3). Host detail carries `basis: "capabilities"`.
+//!   §8 `/ready` is not probed
 //!
 //! The client tolerates unknown fields and unknown operation names (D3: minor is
-//! additive). The server's `msg` and body text never leave this module; only
-//! codes do. `server_version` is copied only when it is a short token.
+//! additive), including extra keys inside `limits`. The server's `msg` and body
+//! text never leave this module; only codes do. `server_version` is copied only
+//! when it is a short token. Endpoints are probed together under one deadline.
+//! Each request is sent only after the binding is still active and the
+//! credential epoch is unchanged.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use futures::future::join_all;
 
 use agent24_components::ComponentState;
 use agent24_knowledge::{
@@ -46,12 +57,27 @@ const EXPECTED_PROTOCOL_MAJOR: u64 = 1;
 /// names a stable one when several are missing.
 const REQUIRED_OPERATIONS: [&str; 2] = ["read", "search"];
 
+/// `capabilities.schema.json` `limits.required`. Order is the schema's.
+const LIMIT_KEYS: [&str; 6] = [
+    "max_results",
+    "max_concurrency",
+    "max_deadline_ms",
+    "max_read_bytes",
+    "max_page_limit",
+    "max_snippet_bytes",
+];
+
 const MAX_CAPABILITIES_BYTES: usize = 64 * 1024;
 
-/// One configured endpoint to probe. `credential_epoch` changes when the
-/// credential changes so a cached answer is not reused under another secret.
-/// The epoch is not a secret; the credential is.
+/// One configured endpoint to probe.
+///
+/// The cache and singleflight key is the base URL, `(host, binding)` and
+/// `credential_epoch`. Two bindings can reuse a sequence number; the binding
+/// id keeps their answers apart. The epoch is not a secret, and the credential
+/// itself is not part of the key.
 pub(crate) struct ProbeTarget {
+    pub host: String,
+    pub binding: String,
     pub base_url: String,
     pub credential: Option<Credential>,
     pub credential_epoch: u64,
@@ -109,6 +135,7 @@ impl Judged {
             reason: self.reason.clone(),
             version: self.version.clone(),
             detail: Some(json!({
+                "basis": "capabilities",
                 "probed_at": self.probed_at,
                 "missing_capabilities": self.missing,
                 "contract_version": contract_value(self.contract.as_ref()),
@@ -181,7 +208,12 @@ impl Drop for FlightGuard<'_> {
 }
 
 impl KnowledgeProbeCache {
-    pub(crate) async fn assess(&self, targets: &[ProbeTarget], now: Instant) -> ProbeView {
+    pub(crate) async fn assess(
+        &self,
+        targets: &[ProbeTarget],
+        now: Instant,
+        still_valid: &(dyn Fn(&ProbeTarget) -> bool + Sync),
+    ) -> ProbeView {
         if targets.is_empty() {
             return not_configured();
         }
@@ -223,7 +255,7 @@ impl KnowledgeProbeCache {
                         tx: Some(tx),
                         finished: false,
                     };
-                    let view = probe_all(targets).await;
+                    let view = probe_all(targets, still_valid).await;
                     {
                         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
                         guard.entry = Some(CacheEntry {
@@ -281,17 +313,32 @@ fn not_configured() -> ProbeView {
 fn fingerprint(targets: &[ProbeTarget]) -> String {
     let mut lines: Vec<String> = targets
         .iter()
-        .map(|target| format!("{}\n{}", target.base_url, target.credential_epoch))
+        .map(|target| {
+            format!(
+                "{}\n{}\n{}\n{}",
+                target.base_url, target.host, target.binding, target.credential_epoch
+            )
+        })
         .collect();
     lines.sort();
     lines.join("\n")
 }
 
-async fn probe_all(targets: &[ProbeTarget]) -> ProbeView {
-    let mut parts = Vec::with_capacity(targets.len());
-    for target in targets {
-        parts.push(fetch(target).await);
-    }
+/// Every target shares `KNOWLEDGE_PROBE_TIMEOUT` measured from this call.
+/// A target whose binding was deactivated, or whose credential epoch moved,
+/// is omitted and not requested.
+async fn probe_all(
+    targets: &[ProbeTarget],
+    still_valid: &(dyn Fn(&ProbeTarget) -> bool + Sync),
+) -> ProbeView {
+    let deadline = Instant::now() + KNOWLEDGE_PROBE_TIMEOUT;
+    let judged = join_all(
+        targets
+            .iter()
+            .map(|target| fetch(target, deadline, still_valid)),
+    )
+    .await;
+    let parts: Vec<Judged> = judged.into_iter().flatten().collect();
     fold(&parts)
 }
 
@@ -343,35 +390,41 @@ fn union_degraded(parts: &[Judged]) -> ProbeView {
     .view()
 }
 
-async fn fetch(target: &ProbeTarget) -> Judged {
+async fn fetch(
+    target: &ProbeTarget,
+    deadline: Instant,
+    still_valid: &(dyn Fn(&ProbeTarget) -> bool + Sync),
+) -> Option<Judged> {
+    // After the list handler snapshotted this target, the binding may have
+    // been deactivated or the credential replaced. Do not send the old key.
+    if !still_valid(target) {
+        return None;
+    }
+    let budget = deadline.saturating_duration_since(Instant::now());
+    if budget.is_zero() {
+        return Some(Judged::failed("timeout", probed_at_now()));
+    }
     let built = match &target.credential {
         Some(credential) => HttpTransport::new(HttpTransportConfig {
             base_url: target.base_url.clone(),
             credential: credential.clone(),
             max_response_bytes: MAX_CAPABILITIES_BYTES,
-            connect_timeout: KNOWLEDGE_PROBE_TIMEOUT,
+            connect_timeout: budget,
         }),
-        None => HttpTransport::anonymous(
-            target.base_url.clone(),
-            MAX_CAPABILITIES_BYTES,
-            KNOWLEDGE_PROBE_TIMEOUT,
-        ),
+        None => HttpTransport::anonymous(target.base_url.clone(), MAX_CAPABILITIES_BYTES, budget),
     };
     let transport = match built {
         Ok(transport) => transport,
-        Err(err) => return judge_config(err),
+        Err(err) => return Some(judge_config(err)),
     };
-    match transport
-        .send(
-            KnowledgeOperation::Capabilities,
-            Vec::new(),
-            KNOWLEDGE_PROBE_TIMEOUT,
-        )
+    let judged = match transport
+        .send(KnowledgeOperation::Capabilities, Vec::new(), budget)
         .await
     {
         Ok(response) => judge_response(response.status, &response.body),
         Err(err) => judge_transport(err),
-    }
+    };
+    Some(judged)
 }
 
 fn judge_config(err: HttpConfigError) -> Judged {
@@ -562,10 +615,10 @@ fn parse_data(data: &Value) -> Result<Decl, ParseError> {
         None => return Err(ParseError::NoDeclaration),
     };
     // READONLY R9.2 / capabilities.schema.json: `limits` is required, same as
-    // `server_version`. Absent → incompatible; the wrong JSON type → malformed.
+    // `server_version`. Absent → incompatible; the wrong JSON type, or a schema
+    // key that is not a positive integer → malformed. Extra keys are kept.
     match agent.get("limits") {
-        Some(Value::Object(_)) => {}
-        Some(_) => return Err(ParseError::Malformed),
+        Some(value) => check_limits(value)?,
         None => return Err(ParseError::NoDeclaration),
     }
     Ok(Decl {
@@ -576,15 +629,38 @@ fn parse_data(data: &Value) -> Result<Decl, ParseError> {
     })
 }
 
-/// A numeric or token `code` other than success. Free text becomes
-/// `upstream_error` so the server's sentence is not copied.
+/// Schema `positive_int` for each required `limits` key. Missing → the
+/// declaration is incomplete. Present but not an integer ≥ 1 → malformed.
+/// Keys the schema does not name are ignored (D3: a minor only adds).
+fn check_limits(value: &Value) -> Result<(), ParseError> {
+    let Some(obj) = value.as_object() else {
+        return Err(ParseError::Malformed);
+    };
+    for key in LIMIT_KEYS {
+        match obj.get(key) {
+            None => return Err(ParseError::NoDeclaration),
+            Some(Value::Number(n)) => match n.as_u64() {
+                Some(n) if n >= 1 => {}
+                _ => return Err(ParseError::Malformed),
+            },
+            Some(_) => return Err(ParseError::Malformed),
+        }
+    }
+    Ok(())
+}
+
+/// A numeric or token `code` other than success. Only the integer `0` is a
+/// numeric success. `as_i64` fails for fractions and for magnitudes outside
+/// i64; those are `upstream_error`, not a pass. Free text is also
+/// `upstream_error`, so the server's sentence is not copied.
 fn upstream_code(value: &Value) -> Option<String> {
     let code = value.get("code")?;
     match code {
-        Value::Number(n) => {
-            let n = n.as_i64()?;
-            (n != 0).then(|| format!("upstream_{n}"))
-        }
+        Value::Number(n) => match n.as_i64() {
+            Some(0) => None,
+            Some(n) => Some(format!("upstream_{n}")),
+            None => Some("upstream_error".to_owned()),
+        },
         Value::String(s) if s == "0" || s == "ok" => None,
         Value::String(s) if is_code_token(s) => Some(format!("upstream_{s}")),
         Value::String(_) => Some("upstream_error".to_owned()),
@@ -597,4 +673,41 @@ fn is_code_token(s: &str) -> bool {
         && s.len() <= 64
         && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Credential, ProbeTarget, fingerprint};
+
+    fn target(binding: &str, epoch: u64, secret: &str) -> ProbeTarget {
+        ProbeTarget {
+            host: "host-a".to_owned(),
+            binding: binding.to_owned(),
+            base_url: "http://127.0.0.1:9/api/v1".to_owned(),
+            credential: Some(Credential::Bearer(secret.to_owned())),
+            credential_epoch: epoch,
+        }
+    }
+
+    #[test]
+    fn fingerprint_names_the_binding_and_not_the_secret() {
+        let secret = "fingerprint-secret-value";
+        let fp = fingerprint(std::slice::from_ref(&target("binding-b", 2, secret)));
+        assert!(fp.contains("host-a\nbinding-b\n2"), "{fp}");
+        assert!(fp.contains("http://127.0.0.1:9/api/v1"), "{fp}");
+        assert!(!fp.contains(secret), "{fp}");
+        let other = fingerprint(&[
+            target("binding-b", 2, secret),
+            target("binding-a", 2, "other-secret-value"),
+        ]);
+        let same_shape = fingerprint(&[
+            target("binding-a", 2, "other-secret-value"),
+            target("binding-b", 2, secret),
+        ]);
+        assert_eq!(other, same_shape);
+        assert_ne!(
+            fingerprint(std::slice::from_ref(&target("binding-a", 2, secret))),
+            fingerprint(std::slice::from_ref(&target("binding-b", 2, secret)))
+        );
+    }
 }
