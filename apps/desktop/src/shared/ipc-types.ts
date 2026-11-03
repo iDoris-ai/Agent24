@@ -88,12 +88,20 @@ export const IpcChannels = {
   DocumentsImportProgress: 'documents:import-progress',
   // The OS's job and document events, pushed (ADR-DOC-02 §7; main/documents.ts).
   DocumentsEvent: 'documents:event',
+  // T1-1: what this launch did with the documents module the app carries.
+  DocumentsModuleStatus: 'documents:module-status',
   // Knowledge settings (main/knowledge-settings.ts): the WeKnora endpoint, the
   // knowledge bases and the On/Off switch. The key goes in, never comes back.
   KnowledgeStatus: 'knowledge:status',
   KnowledgeConfigure: 'knowledge:configure',
   KnowledgeSetEnabled: 'knowledge:set-enabled',
 } as const
+
+/** T1-1 (§9 Q2): the app installed its documents module this launch, but the
+ * running daemon was started outside the app and mounts it only once restarted. */
+export interface DocumentsModuleStatus {
+  restartRequired: boolean
+}
 
 /** What the renderer sees of the Knowledge settings: never the key. */
 export interface KnowledgeStatus {

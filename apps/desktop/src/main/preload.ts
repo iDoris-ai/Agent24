@@ -11,6 +11,7 @@ import {
   type CliToolStatus,
   type CliInstallResult,
   type DocumentsEvent,
+  type DocumentsModuleStatus,
   type KnowledgeConfigureInput,
   type KnowledgeSettingsResult,
   type KnowledgeStatus,
@@ -157,6 +158,8 @@ const api = {
   documents: {
     request: <R extends DocumentsRequest>(req: R): Promise<DocumentsResponse<R['op']>> =>
       ipcRenderer.invoke(IpcChannels.DocumentsRequest, req),
+    /** T1-1: whether the module the app installed waits for a daemon restart. */
+    moduleStatus: (): Promise<DocumentsModuleStatus> => ipcRenderer.invoke(IpcChannels.DocumentsModuleStatus),
     /** Picks a PDF, JPEG or PNG and imports it; null if the user cancels. */
     importFile: (): Promise<DocumentsResponse<'job'> | null> =>
       ipcRenderer.invoke(IpcChannels.DocumentsImportFile),

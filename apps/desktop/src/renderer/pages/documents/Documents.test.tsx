@@ -38,7 +38,7 @@ interface Mock {
 }
 
 /** `list` answers from `lists` in turn (the last one repeats); `job` from `jobs`. */
-function mount(opts: { lists?: Array<() => Promise<Res>>; jobs?: Array<() => Promise<Res>>; capabilities?: () => Promise<Res> }): Mock {
+function mount(opts: { lists?: Array<() => Promise<Res>>; jobs?: Array<() => Promise<Res>>; capabilities?: () => Promise<Res>; moduleStatus?: () => Promise<{ restartRequired: boolean }> }): Mock {
   const lists = [...(opts.lists ?? [() => ok({ documents: [], next_cursor: null })])]
   const jobs = [...(opts.jobs ?? [])]
   const m: Mock = { request: vi.fn(), importFile: vi.fn(() => Promise.resolve(null)), progress: null, event: null }
@@ -53,6 +53,7 @@ function mount(opts: { lists?: Array<() => Promise<Res>>; jobs?: Array<() => Pro
     documents: {
       request: m.request,
       importFile: m.importFile,
+      ...(opts.moduleStatus ? { moduleStatus: opts.moduleStatus } : {}),
       onImportProgress: (cb: Mock['progress']) => {
         m.progress = cb
         return () => {
@@ -129,6 +130,27 @@ describe('DocumentsPage: the list', () => {
     expect(screen.getByRole('button', { name: IMPORT.name })).toBeDisabled()
     expect(screen.queryByRole('alert')).toBeNull()
     expect(screen.queryByText(/No v1 route/)).toBeNull()
+  })
+
+  it('module installed by the app this launch but the daemon is external: says to restart the daemon instead', async () => {
+    const noRoute = () => err(404, 'not_found', 'No v1 route')
+    const moduleStatus = vi.fn(() => Promise.resolve({ restartRequired: true }))
+    mount({ capabilities: noRoute, lists: [noRoute], moduleStatus })
+    render(<DocumentsPage />)
+    expect(await screen.findByText('文档模块已安装，重启 daemon 后生效')).toBeInTheDocument()
+    expect(screen.getByText('agent24 daemon stop && agent24 daemon start')).toBeInTheDocument()
+    expect(screen.queryByText('文档模块未安装')).toBeNull()
+    expect(screen.getByRole('button', { name: IMPORT.name })).toBeDisabled()
+  })
+
+  it('module status says no restart is pending: the install guide stays', async () => {
+    const noRoute = () => err(404, 'not_found', 'No v1 route')
+    const moduleStatus = vi.fn(() => Promise.resolve({ restartRequired: false }))
+    mount({ capabilities: noRoute, lists: [noRoute], moduleStatus })
+    render(<DocumentsPage />)
+    expect(await screen.findByText('文档模块未安装')).toBeInTheDocument()
+    await waitFor(() => expect(moduleStatus).toHaveBeenCalled())
+    expect(screen.queryByText('文档模块已安装，重启 daemon 后生效')).toBeNull()
   })
 
   it('capabilities says no route but the list has a real error: the error is still shown', async () => {

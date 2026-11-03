@@ -29,6 +29,7 @@ import { importFile } from '../documents-import'
 import { IpcChannels } from '../../shared/ipc-types'
 import type {
   CommImportPickResult,
+  DocumentsModuleStatus,
   KnowledgeSettingsResult,
   KnowledgeStatus,
   BackendEndpointResult,
@@ -415,6 +416,8 @@ export function registerIpcHandlers(options: {
   guard: IpcGuard
   /** The Knowledge settings, once main has built them. */
   knowledge?: () => KnowledgeController | null
+  /** T1-1: what this launch did with the bundled documents module. */
+  documentsModule?: () => DocumentsModuleStatus
   /** Test seam: the main-owned backup-password window. */
   promptBackupPassword?: (parent: BrowserWindow | null) => Promise<string | null>
   /** Test seam: the main-owned restore-password window. */
@@ -435,6 +438,7 @@ export function registerIpcHandlers(options: {
   const promptHomeImportPassword = options.promptHomeImportPassword ?? openHomeImportPasswordWindow
   const exportTimeout = options.exportTimeoutMs ?? { current: EXPORT_TIMEOUT_MS }
   const knowledge = options.knowledge ?? (() => null)
+  const documentsModule = options.documentsModule ?? ((): DocumentsModuleStatus => ({ restartRequired: false }))
   app.on('before-quit', () => { quitting = true })
   omlxSettingsPath = options.omlxSettingsPath
   const handle: typeof ipcMain.handle = (channel, listener) => ipcMain.handle(channel, options.guard(listener))
@@ -560,6 +564,7 @@ export function registerIpcHandlers(options: {
   handle(IpcChannels.DocumentsRequest, (_event, req: unknown) =>
     documentsCall(req, daemonCliEndpoint),
   )
+  handle(IpcChannels.DocumentsModuleStatus, (): DocumentsModuleStatus => documentsModule())
   handle(IpcChannels.DocumentsImportFile, async (event) => {
     const window = BrowserWindow.fromWebContents(event.sender)
     const options: Electron.OpenDialogOptions = {
