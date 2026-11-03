@@ -146,7 +146,9 @@
   - **修订（David，2026-11-03，T1-1）：随安装包分发的 macOS 二进制改为「pin + 代码签名校验」，原写法是「pin + sha256」。** 原因是 electron-builder 签名时会对 App 里每个 Mach-O 执行 `codesign --force`，字节随之改变；签名后又不能往 App 里写文件，否则 App 自身的签名封存失效。所以打包前算出的二进制 sha256 在正式包里必然对不上。改法与 ADR-038 §4 对 macOS 可执行文件的规则一致：
     - 首次启动安装前，对模块的两个程序跑 `codesign --verify --strict -R`。正式包要求 Team ID 与 App 自身一致，并启用 Hardened Runtime。只有 App 自身是 ad-hoc 签名的内部测试包，才只要求签名有效。读不到 App 的签名身份时不装。
     - 包内不带 `SHA256SUMS`。manifest 的完整性由内核 discovery 的摘要与 `os install` 的校验覆盖。
-    - pin 指模块版本随 App 版本固定：包内版本与已装版本不同就先卸再装。
+    - pin 指已装的模块与 App 带的那份一致：包内与已装的文件清单或任一文件的字节不同，就先验签、再卸、再装；全同就不动。
+      - **再修订（2026-11-03，T1-1 补）**：原写「包内版本与已装版本不同就先卸再装」。`domain-os.yml` 的 version 在整个 DOC-1 期间都是 0.1.0，二进制改了很多次也没跟着改，所以从 11-02 的候选包换新 App 时会留下旧程序。`os install` 逐字节拷贝，已装的就是包内那份的副本，比文件就能判断。version 只用于日志和 `os list` 显示，这次提到 0.2.0。证据裁决（R0 一致）：`~/.claude/decisions/2026-11-03-documents-module-upgrade-rule/`。
+      - 卸再装会撤销该模块的 consent（`agent24 os uninstall`，ADR-K1-03 §3）。consent 记录带模块版本，换了包就重新确认，是原设计的本意。
     - 已知缺口：ad-hoc 分支不认证发布者；不防同一 uid 的攻击者（与 ADR-038 §7.11(b) 一致）。
     - 证据裁决记录：`~/.claude/decisions/2026-11-03-documents-module-integrity/`（主会话、Codex、Fable 的 R0 与裁决）。
   - 这个机制目前没有（属于 Agent24 依赖，发布前需要，跟踪于 #735）。
