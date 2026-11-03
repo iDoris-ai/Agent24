@@ -557,25 +557,17 @@ fn dedupe_component_ids(items: &mut [Item]) {
     }
 }
 
-/// Knowledge, remote subset: no binding active is `stopped` ("not configured"). There is no
-/// probe yet (C5), so an active binding is `ready` with `probed: false` rather than `degraded`.
-fn knowledge_item(state: &AppState) -> Item {
-    let active = state.knowledge_host.any_active();
-    Item::new(
-        "knowledge",
-        Form::Remote,
-        if active {
-            ComponentState::Ready
-        } else {
-            ComponentState::Stopped
-        },
-    )
-    .with(|i| {
-        if active {
-            i.detail = Some(json!({"probed": false}));
-        } else {
-            i.reason = Some("not_configured".into());
-        }
+/// Knowledge, remote subset (ADR-038 D5, C5). No endpoint is `stopped`. A
+/// configured binding is whatever the cached `/system/capabilities` probe said.
+async fn knowledge_item(
+    registry: &crate::knowledge_host::KnowledgeHostRegistry,
+    now: Instant,
+) -> Item {
+    let view = registry.component_status(now).await;
+    Item::new("knowledge", Form::Remote, view.state).with(|i| {
+        i.version = view.version;
+        i.reason = view.reason;
+        i.detail = view.detail;
     })
 }
 
@@ -599,7 +591,7 @@ async fn collect(state: &AppState, now: Instant) -> Vec<Item> {
     items.extend(attach_items(state));
     items.push(documents_item(state));
     items.extend(os_module_items(state));
-    items.push(knowledge_item(state));
+    items.push(knowledge_item(&state.knowledge_host, now).await);
     items.push(open_design_item(state, now));
     items.extend(mcp_items(state));
     dedupe_component_ids(&mut items);

@@ -297,6 +297,25 @@ async fn get_capabilities_has_no_body_and_carries_bearer() {
     );
     assert!(!seen.head.contains("x-api-key:"), "{}", seen.head);
     assert!(!seen.head.contains("content-type:"), "{}", seen.head);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn anonymous_get_sends_no_credential_header() {
+    let mut stub = Stub::start(Script::Respond(response("200 OK", "", b"{}"))).await;
+    let t = HttpTransport::anonymous(stub.base.clone(), LIMIT, Duration::from_secs(5)).unwrap();
+    t.send(KnowledgeOperation::Capabilities, Vec::new(), LONG)
+        .await
+        .unwrap();
+    let seen = stub.requests.recv().await.unwrap();
+    assert!(
+        seen.head
+            .starts_with("get /api/v1/system/capabilities http/1.1\r\n"),
+        "{}",
+        seen.head
+    );
+    assert!(!seen.head.contains("authorization:"), "{}", seen.head);
+    assert!(!seen.head.contains("x-api-key:"), "{}", seen.head);
+    assert!(!seen.head.contains("bearer"), "{}", seen.head);
     assert!(seen.body.is_empty());
 }
 
