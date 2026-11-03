@@ -2,6 +2,7 @@
 // only this window's own webContents can use.
 import fs from 'node:fs'
 import path from 'node:path'
+import util from 'node:util'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const h = vi.hoisted(() => {
@@ -302,23 +303,33 @@ describe('the password promise always settles, and only once the window is gone'
     await expect(result).resolves.toBe('good-pass-1')
   })
 
-  it('after submit, silence is not settled on the next tick; the 2s fallback settles it', async () => {
+  it('after submit, silence is not settled on the next tick; the 2s fallback destroys the window before it resolves', async () => {
     vi.useFakeTimers()
     try {
       const result = promptBackupPassword(null)
       const w = windows[0]!
+      const order: string[] = []
       // Native close/destroy report nothing and do not mark the window gone.
       w.close = () => {}
-      w.destroy = () => { w.destroyCalls += 1 }
+      w.destroy = () => {
+        w.destroyCalls += 1
+        // Read the promise state at the destroy call, not in a later microtask.
+        // Resolving first and destroying after still runs destroy before `then`.
+        order.push(util.inspect(result).includes('<pending>') ? 'destroy' : 'destroy-after-resolve')
+      }
       emit(BACKUP_PW_SUBMIT, fromWindow(w), 'good-pass-1', 'good-pass-1')
       let settled = false
-      void result.then(() => { settled = true })
+      void result.then(() => { order.push('resolve'); settled = true })
       await Promise.resolve()
       await vi.advanceTimersByTimeAsync(0)
       expect(settled).toBe(false)
+      expect(order).toEqual([])
       await vi.advanceTimersByTimeAsync(WINDOW_GONE_FALLBACK_MS - 1)
       expect(settled).toBe(false)
+      expect(order).toEqual([])
       await vi.advanceTimersByTimeAsync(1)
+      expect(order).toEqual(['destroy', 'resolve'])
+      expect(w.destroyCalls).toBe(1)
       expect(settled).toBe(true)
       await expect(result).resolves.toBe('good-pass-1')
     } finally {

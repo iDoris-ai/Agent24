@@ -320,20 +320,78 @@ function pathExists(p: string): boolean {
 const SAFE_ID = /^[A-Za-z0-9_.:-]{1,128}$/
 
 /**
- * Parent for a macOS save sheet. `showSaveDialog(window)` never resolves when
- * that window is destroyed, hidden, minimized, or still disabled by the
- * password sheet — the export IPC then stays pending and every button on the
- * communication page stays disabled. No usable window: the caller omits it
- * and the dialog is app-modal instead.
+ * Parent for the export save sheet. Called only after the password window has
+ * settled, so a parent that sheet left disabled is ours to turn back on.
+ * A minimized or hidden parent is restored and shown, then focused, and hosts
+ * the sheet. Omitting it (app-modal) is only for a parent that is already
+ * gone: on macOS that dialog can sit behind other windows or the Dock, and
+ * the export IPC never settles.
  */
 function saveDialogParent(win: BrowserWindow | null): BrowserWindow | null {
   if (!win) return null
   try {
-    if (win.isDestroyed() || !win.isVisible() || win.isMinimized() || !win.isEnabled()) return null
+    if (win.isDestroyed()) return null
+    if (win.isMinimized()) win.restore()
+    if (!win.isVisible()) win.show()
+    if (!win.isEnabled()) win.setEnabled(true)
+    app.focus({ steal: true })
+    win.focus()
+    if (win.isDestroyed()) return null
     return win
   } catch {
     return null
   }
+}
+
+/**
+ * The save sheet has no deadline (it is a human step). It still has to settle:
+ * if its parent closes, or the app starts to quit, treat that as a cancel.
+ * Listeners come off either way, and a dialog that rejects afterwards is
+ * swallowed here so it cannot escape as an unhandled rejection.
+ */
+function showSaveDialogUntilGone(
+  anchor: BrowserWindow | null,
+  options: Electron.SaveDialogOptions,
+): Promise<Electron.SaveDialogReturnValue | 'abandoned'> {
+  let detach = (): void => {}
+  let markAbandoned = (): void => {}
+  const abandoned = new Promise<'abandoned'>((resolve) => {
+    markAbandoned = () => resolve('abandoned')
+    const onParentClosed = (): void => resolve('abandoned')
+    const onQuit = (): void => resolve('abandoned')
+    let watchingParent = false
+    if (anchor) {
+      try {
+        if (!anchor.isDestroyed()) {
+          anchor.on('closed', onParentClosed)
+          watchingParent = true
+        }
+      } catch { /* this parent cannot be watched */ }
+    }
+    app.on('before-quit', onQuit)
+    detach = () => {
+      if (watchingParent && anchor) {
+        try { anchor.removeListener('closed', onParentClosed) } catch { /* already gone */ }
+      }
+      app.removeListener('before-quit', onQuit)
+    }
+  })
+  const dialogOutcome = Promise.resolve()
+    .then(() => (anchor === null ? dialog.showSaveDialog(options) : dialog.showSaveDialog(anchor, options)))
+    .then(
+      (value) => ({ ok: true as const, value }),
+      (error: unknown) => ({ ok: false as const, error }),
+    )
+  return Promise.race([
+    dialogOutcome.then((outcome) => ({ source: 'dialog' as const, outcome })),
+    abandoned.then(() => ({ source: 'abandoned' as const })),
+  ]).then((winner) => {
+    markAbandoned()
+    detach()
+    if (winner.source === 'abandoned') return 'abandoned'
+    if (!winner.outcome.ok) throw winner.outcome.error
+    return winner.outcome.value
+  })
 }
 
 /** Native yes/no for an elevated operation. The text is built here, in main,
@@ -695,10 +753,10 @@ export function registerIpcHandlers(options: {
       try {
         if (!isSafeBackupPassword(backupPassword)) return invalidRequest('invalid backup password')
         if (quitting) return cancelled()
-        // 4. Where to save. Only a visible, enabled, non-minimized window can
-        // host the sheet. Anything else gets an app-modal dialog (parent omitted),
-        // which the person can still dismiss. Attaching the sheet to a bad
-        // parent is what left this IPC pending on device.
+        // 4. Where to save. The password window is already gone. A parent that
+        // is still here is brought forward and hosts the sheet; a missing one
+        // is app-modal. The sheet has no deadline. Parent `closed` or
+        // `before-quit` ends it as a cancel so the lock cannot stick.
         const saveOptions: Electron.SaveDialogOptions = {
           title: mt('comm.exportSave'),
           // Downloads, not Documents (which is often iCloud-synced).
@@ -708,7 +766,9 @@ export function registerIpcHandlers(options: {
         const anchor = saveDialogParent(parent)
         let picked: Electron.SaveDialogReturnValue
         try {
-          picked = anchor ? await dialog.showSaveDialog(anchor, saveOptions) : await dialog.showSaveDialog(saveOptions)
+          const raced = await showSaveDialogUntilGone(anchor, saveOptions)
+          if (raced === 'abandoned') return cancelled()
+          picked = raced
         } catch {
           return { ok: false, status: 500, data: { error: { code: 'dialog_failed', message: 'the file dialog could not open' } } }
         }
