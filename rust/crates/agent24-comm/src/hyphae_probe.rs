@@ -777,6 +777,23 @@ exit 0
         assert!(matches!(sample, HealthSample::Report { success: true, .. }));
     }
 
+    #[tokio::test]
+    async fn an_empty_contract_name_is_a_failed_check_not_a_parsed_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = install_script(
+            tmp.path(),
+            r#"#!/bin/sh
+printf '%s\n' '{"ok":true,"data":{"name":"","contract_version":"1.0"}}'
+exit 0
+"#,
+        )
+        .await;
+        let err = read_contract(&runner, Duration::from_secs(2))
+            .await
+            .expect_err("an empty name is not a contract we can judge");
+        assert!(err.contains("empty"), "{err}");
+    }
+
     async fn install_script(dir: &Path, script: &str) -> HyphaeRunner {
         let source = dir.join("hyphae-fake.sh");
         tokio::fs::write(&source, script).await.unwrap();
