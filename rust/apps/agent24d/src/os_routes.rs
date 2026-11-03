@@ -1455,6 +1455,7 @@ mod tests {
             } else {
                 ResourceStatus::NotChecked
             },
+            d9: None,
         }
     }
 
@@ -1631,6 +1632,7 @@ mod tests {
             outcome: MountOutcome::Degraded("could not be constructed: manifest invalid".into()),
             granted: Vec::new(),
             resources: ResourceStatus::NotChecked,
+            d9: None,
         };
         let v = view(&r, true, true, None, None);
         assert_eq!(v.name, "sin90");
@@ -1655,6 +1657,7 @@ mod tests {
             outcome: MountOutcome::Disabled,
             granted: Vec::new(),
             resources: ResourceStatus::NotChecked,
+            d9: None,
         };
         let v = view(&r, false, true, None, None);
         assert_eq!(v.state, "disabled");

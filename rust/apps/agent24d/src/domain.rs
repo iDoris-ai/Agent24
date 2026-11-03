@@ -497,6 +497,10 @@ pub struct MountReport {
     /// Whether the module's declared `requires_models` are actually there
     /// (ME-2's "缺资源明确报错").
     pub resources: ResourceStatus,
+    /// D9 list from the manifest, when this pass has read one (ADR-038 C7).
+    /// `None` for an in-process module that was refused or disabled before
+    /// construction: its manifest does not exist until it is built.
+    pub d9: Option<crate::component_manifest::OsD9>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1154,8 +1158,19 @@ pub async fn mount_all(
         let version = entry.version.clone();
         let namespace = agent24_domain::DomainOsManifest::declared_namespace(&name);
         let enabled_at_start = registry.ok().map(|c| c.is_enabled(&name));
+        // A package's manifest was read at discovery, so its list is known even
+        // when the user switched it off. An in-process manifest appears only
+        // after construction.
+        let catalogue_d9 = match &entry.build {
+            Build::Package(package) => Some(crate::component_manifest::OsD9::from_manifest(
+                &package.manifest,
+            )),
+            Build::InProcess(_) => None,
+        };
 
-        let refuse = |why: String, reports: &mut Vec<MountReport>| {
+        let refuse = |why: String,
+                      d9: Option<crate::component_manifest::OsD9>,
+                      reports: &mut Vec<MountReport>| {
             tracing::error!("domain OS {name:?} not mounted: {why}");
             reports.push(MountReport {
                 name: name.clone(),
@@ -1169,6 +1184,7 @@ pub async fn mount_all(
                 // Both hold nothing, which is what this field means.)
                 granted: Vec::new(),
                 resources: ResourceStatus::NotChecked,
+                d9,
             });
         };
 
@@ -1181,6 +1197,7 @@ pub async fn mount_all(
                 "the catalogue entry has an empty version; a manifest could not \
                  declare one, and this identity is reported as if it had"
                     .to_owned(),
+                catalogue_d9.clone(),
                 &mut reports,
             );
             continue;
@@ -1191,6 +1208,7 @@ pub async fn mount_all(
                     "the catalogue entry {name:?} is not a usable module name; it \
                      cannot be routed or given a directory"
                 ),
+                catalogue_d9.clone(),
                 &mut reports,
             );
             continue;
@@ -1204,6 +1222,7 @@ pub async fn mount_all(
         if !claimed.insert(name.clone()) {
             refuse(
                 format!("another module already claims the name {name:?}"),
+                catalogue_d9.clone(),
                 &mut reports,
             );
             continue;
@@ -1220,12 +1239,17 @@ pub async fn mount_all(
                     "the name {name:?} is a kernel route segment; mounting it would \
                      panic the daemon on an overlapping route"
                 ),
+                catalogue_d9.clone(),
                 &mut reports,
             );
             continue;
         }
         if attached_names.contains(&name) {
-            refuse("registered as an attached module".to_owned(), &mut reports);
+            refuse(
+                "registered as an attached module".to_owned(),
+                catalogue_d9.clone(),
+                &mut reports,
+            );
             continue;
         }
 
@@ -1250,6 +1274,7 @@ pub async fn mount_all(
                 outcome: MountOutcome::Degraded(reason),
                 granted: Vec::new(),
                 resources: ResourceStatus::NotChecked,
+                d9: catalogue_d9.clone(),
             });
             continue;
         }
@@ -1264,6 +1289,7 @@ pub async fn mount_all(
                 outcome: MountOutcome::Disabled,
                 granted: Vec::new(),
                 resources: ResourceStatus::NotChecked,
+                d9: catalogue_d9.clone(),
             });
             continue;
         }
@@ -1313,12 +1339,17 @@ pub async fn mount_all(
                     outcome: MountOutcome::Degraded(reason),
                     granted: Vec::new(),
                     resources: ResourceStatus::NotChecked,
+                    d9: None,
                 });
                 continue;
             }
         };
 
         let manifest = module.manifest();
+        // Construction succeeded, so the list is known even though the module is
+        // about to be refused. `catalogue_d9` is still `None` for an in-process
+        // entry: that value is only for refusals that happen before `build()`.
+        let manifest_d9 = Some(crate::component_manifest::OsD9::from_manifest(manifest));
         // The catalogue named it before it existed, so the two can disagree — and a
         // module whose manifest claims a DIFFERENT name would be routed under one
         // identity while emitting events under another.
@@ -1328,6 +1359,7 @@ pub async fn mount_all(
                     "the catalogue lists it as {name:?} but its manifest says {:?}",
                     manifest.name()
                 ),
+                manifest_d9.clone(),
                 &mut reports,
             );
             continue;
@@ -1342,6 +1374,7 @@ pub async fn mount_all(
                      manifest says {:?}",
                     manifest.version()
                 ),
+                manifest_d9.clone(),
                 &mut reports,
             );
             continue;
@@ -1353,6 +1386,7 @@ pub async fn mount_all(
                 "a compiled-in module's manifest declares an out-of-process \
                  provider; out-of-process modules are installed as packages"
                     .to_owned(),
+                manifest_d9,
                 &mut reports,
             );
             continue;
@@ -1390,6 +1424,7 @@ pub async fn mount_all(
                 // a LIVE module holds, and nothing else.
                 granted: Vec::new(),
                 resources: ResourceStatus::NotChecked,
+                d9: Some(crate::component_manifest::OsD9::from_manifest(manifest)),
             });
             continue;
         }
@@ -1467,6 +1502,7 @@ pub async fn mount_all(
             outcome: MountOutcome::Mounted,
             granted: granted_names,
             resources,
+            d9: Some(crate::component_manifest::OsD9::from_manifest(manifest)),
         });
     }
 
@@ -1732,6 +1768,8 @@ async fn mount_package(
     // Unchanged (Codex round 2 High 2): `Refused`/`Degraded` never had a
     // `KernelCtx` handed over, so `granted` stays `Vec::new()` for both — only
     // the `Mounted` branch, built separately below, carries `granted_names`.
+    let manifest = &package.manifest;
+    let d9 = Some(crate::component_manifest::OsD9::from_manifest(manifest));
     let report = |outcome: MountOutcome, resources: ResourceStatus| MountReport {
         name: name.clone(),
         namespace: namespace.clone(),
@@ -1740,8 +1778,8 @@ async fn mount_package(
         outcome,
         granted: Vec::new(),
         resources,
+        d9: d9.clone(),
     };
-    let manifest = &package.manifest;
     let refused = |why: String| {
         tracing::error!("domain OS {name:?} not mounted: {why}");
         report(MountOutcome::Refused(why), ResourceStatus::NotChecked)
@@ -1967,19 +2005,11 @@ async fn mount_package(
     let app = agent24_os_proto::proxy::mount(app, &namespace, current);
     // Only THIS branch — a module actually started — carries `granted_names`;
     // `report`'s own default (used by `refused`/`degraded` above) stays
-    // `Vec::new()` (Codex round 2 High 2).
-    (
-        app,
-        MountReport {
-            name,
-            namespace,
-            version,
-            enabled_at_start,
-            outcome: MountOutcome::Mounted,
-            granted: granted_names,
-            resources,
-        },
-    )
+    // `Vec::new()` (Codex round 2 High 2). The D9 list is the manifest's, on
+    // every outcome.
+    let mut mounted = report(MountOutcome::Mounted, resources);
+    mounted.granted = granted_names;
+    (app, mounted)
 }
 
 #[cfg(test)]
@@ -3305,6 +3335,64 @@ raise SystemExit(3)
         );
     }
 
+    /// Switching a package off does not drop its D9 list: the manifest was
+    /// already read, and `/components` still has to say what it would provide.
+    #[tokio::test]
+    async fn a_disabled_package_still_carries_its_manifest_capabilities() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "remote");
+        let yml = packages.join("remote").join("domain-os.yml");
+        let mut text = std::fs::read_to_string(&yml).unwrap();
+        text.push_str("provides:\n  - id: remote-ping\n");
+        std::fs::write(&yml, text).unwrap();
+        let hub = crate::events::EventsHub::default();
+        let cfg = config_from(r#"{"domainOs": {"remote": {"enabled": false}}}"#);
+        let (_, reports, _) = mount_all(
+            &discovered(&packages),
+            &tmp.path().join("os"),
+            &hub,
+            Ok(&cfg),
+            &no_models(),
+            None,
+            Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        assert_eq!(reports[0].outcome, MountOutcome::Disabled);
+        let d9 = reports[0]
+            .d9
+            .as_ref()
+            .expect("disabled package still has D9");
+        assert!(!d9.in_process);
+        assert_eq!(d9.provides.len(), 1);
+        assert_eq!(d9.provides[0].id, "remote-ping");
+        assert!(d9.provides[0].tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mounted_in_process_module_reports_its_declared_capabilities() {
+        let yaml = format!(
+            "{}\nprovides:\n  - id: demo-tasks\n",
+            manifest_yaml("demo", "in_process_crate")
+        );
+        let module = FakeModule::from_yaml(&yaml, false);
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let (_, reports) = mount(&[entry(module)], tmp.path(), &hub).await;
+        assert!(matches!(reports[0].outcome, MountOutcome::Mounted));
+        let d9 = reports[0]
+            .d9
+            .as_ref()
+            .expect("mounted in-process module carries D9");
+        assert!(d9.in_process);
+        assert_eq!(d9.provides.len(), 1);
+        assert_eq!(d9.provides[0].id, "demo-tasks");
+        assert!(d9.provides[0].tools.is_empty());
+        assert_eq!(d9.requires_kernel, vec!["events".to_owned()]);
+    }
+
     /// A daemon that cannot start processes still mounts everything else; each
     /// package degrades to the kernel's 503, with the reason in its report.
     #[tokio::test]
@@ -3329,6 +3417,12 @@ raise SystemExit(3)
             MountOutcome::Degraded(why) => assert!(why.contains("not ours"), "{why}"),
             other => panic!("expected Degraded, got {other:?}"),
         }
+        let d9 = reports[0]
+            .d9
+            .as_ref()
+            .expect("a package report carries its manifest list");
+        assert!(!d9.in_process);
+        assert!(d9.provides.is_empty());
         assert_eq!(
             get(&app, "/api/v1/remote/hi").await.status(),
             StatusCode::SERVICE_UNAVAILABLE
@@ -3350,6 +3444,17 @@ raise SystemExit(3)
         let (app, reports) = mount(&[entry(m.clone())], tmp.path(), &hub).await;
 
         assert!(matches!(reports[0].outcome, MountOutcome::Refused(_)));
+        let d9 = reports[0]
+            .d9
+            .as_ref()
+            .expect("refusal after construction still carries the manifest list");
+        assert_eq!(d9.name, "remote");
+        assert!(
+            !d9.in_process,
+            "the manifest declared an out-of-process provider"
+        );
+        assert!(d9.provides.is_empty());
+        assert_eq!(d9.requires_kernel, vec!["events".to_owned()]);
         assert!(m.opened().is_none());
         assert_eq!(m.routes_built(), 0);
         assert!(
