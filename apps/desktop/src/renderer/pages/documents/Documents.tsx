@@ -22,8 +22,6 @@ const STATUS_LABELS: Record<string, 'status.queued' | 'status.running' | 'status
   interrupted: 'status.interrupted',
 }
 const STORAGE_UNAVAILABLE = 'storage-unavailable'
-/** The user turned the module off (503 `module_disabled`): said as a state, with where to turn it on. */
-const MODULE_DISABLED = 'module-disabled'
 const moduleDisabled = (res: { ok: boolean; error?: { code?: string } }): boolean =>
   !res.ok && res.error?.code === 'module_disabled'
 const NOTE = { color: 'var(--muted)', fontSize: 13, margin: '8px 0' } as const
@@ -45,6 +43,18 @@ export default function DocumentsPage() {
   const [loadingMore, setLoadingMore] = useState(false)
   const [listError, setListError] = useState<string | null>(null)
   const [unavailable, setUnavailable] = useState<string | null>(null)
+  // The user turned the module off (503 `module_disabled`, or os.json says
+  // so): said as a state, with where to turn it on. Requests are numbered as
+  // they are sent, and only the newest one heard from decides, so a slow
+  // capabilities reply cannot undo what a later list said, or the reverse.
+  const [off, setOff] = useState(false)
+  const sent = useRef(0)
+  const heard = useRef(0)
+  const offFrom = useCallback((stamp: number, value: boolean) => {
+    if (stamp < heard.current) return
+    heard.current = stamp
+    setOff(value)
+  }, [])
   // Each endpoint reports on its own; the notice is shown while either says
   // "no route", and never hides another endpoint's real error.
   const [capsMissing, setCapsMissing] = useState(false)
@@ -54,6 +64,19 @@ export default function DocumentsPage() {
   // show: installed (the daemon mounts it once restarted, §9 Q2), installable
   // from the Modules page, or neither (a build without the module).
   const [moduleStatus, setModuleStatus] = useState<DocumentsModuleStatus | null>(null)
+  /** Turned off while the daemon runs. The kernel mounts the 503
+   * `module_disabled` route only at start-up, so until the next restart a
+   * module stopped by Disable answers 503 `module_stopping`, the same as one
+   * that crashed; os.json, read by main, tells the two apart. */
+  const turnedOff = useCallback(
+    async (res: { ok: boolean; status?: number; error?: { code?: string } }): Promise<boolean> => {
+      if (moduleDisabled(res)) return true
+      if (res.ok || res.status !== 503) return false
+      const status = await api.moduleStatus?.().catch(() => null)
+      return status?.turnedOff === true
+    },
+    [api],
+  )
   useEffect(() => {
     if (!notInstalled) return
     let live = true
@@ -77,6 +100,7 @@ export default function DocumentsPage() {
     const gen = ++generation.current
     setLoadingMore(false)
     setMore(null) // no paging until the new first page is here
+    const stamp = ++sent.current
     const res = await api.request({ op: 'list' })
     if (gen !== generation.current) return
     if (moduleNotInstalled(res)) {
@@ -86,14 +110,19 @@ export default function DocumentsPage() {
     }
     setListMissing(false)
     if (!res.ok) {
-      // Turned off: the notice above says so; no second, raw copy here.
-      setListError(moduleDisabled(res) ? null : describeError(res))
+      // Turned off: said once, as the notice, not as a raw error here; the
+      // module may have been turned off after capabilities answered.
+      const isOff = await turnedOff(res)
+      if (gen !== generation.current) return
+      setListError(isOff ? null : describeError(res))
+      if (isOff) offFrom(stamp, true)
       return
     }
+    offFrom(stamp, false) // serving again (turned back on, daemon restarted)
     setListError(null)
     setDocs(res.data.documents)
     setMore(res.data.next_cursor ? { gen, cursor: res.data.next_cursor } : null)
-  }, [api])
+  }, [api, turnedOff, offFrom])
 
   /** The next page, appended; one at a time, and only to its own list. */
   const loadMore = async () => {
@@ -113,11 +142,14 @@ export default function DocumentsPage() {
 
   useEffect(() => {
     let live = true
-    void api.request({ op: 'capabilities' }).then((res) => {
+    const stamp = ++sent.current
+    void api.request({ op: 'capabilities' }).then(async (res) => {
+      if (!live) return
+      const isOff = await turnedOff(res)
       if (!live) return
       setCapsMissing(moduleNotInstalled(res))
-      if (moduleNotInstalled(res)) setUnavailable(null)
-      else if (moduleDisabled(res)) setUnavailable(MODULE_DISABLED)
+      offFrom(stamp, isOff)
+      if (moduleNotInstalled(res) || isOff) setUnavailable(null)
       else if (!res.ok) setUnavailable(describeError(res))
       else setUnavailable(res.data.storage.state === 'ready' ? null : STORAGE_UNAVAILABLE)
     })
@@ -125,7 +157,7 @@ export default function DocumentsPage() {
       live = false
       generation.current++ // drop replies still in flight
     }
-  }, [api])
+  }, [api, turnedOff, offFrom])
 
   // The OS's events are hints (ADR-DOC-02 §7): a job event reads that job
   // now, a new document reloads the list (an import from anywhere).
@@ -177,9 +209,9 @@ export default function DocumentsPage() {
           </div>
         )
       )}
-      {unavailable && (
+      {(off || unavailable) && (
         <div role="alert" style={ALERT}>
-          {unavailable === STORAGE_UNAVAILABLE ? t('storage.unavailable') : unavailable === MODULE_DISABLED ? t('disabled.notice') : unavailable}
+          {off ? t('disabled.notice') : unavailable === STORAGE_UNAVAILABLE ? t('storage.unavailable') : unavailable}
         </div>
       )}
       <div style={{ display: 'flex', gap: 12, alignItems: 'center', margin: '12px 0' }}>
