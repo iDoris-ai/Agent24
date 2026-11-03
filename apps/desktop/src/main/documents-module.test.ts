@@ -110,7 +110,7 @@ describe('ensureBundledDocumentsModule', () => {
     const { d, runCli, warn } = deps({ packagesRoot: installed('0.1.0'), codesign })
     expect(await ensureBundledDocumentsModule(d)).toBe('signature_invalid')
     expect(runCli).not.toHaveBeenCalled()
-    expect(warn.mock.calls[0]![0]).toMatch(/not signed by team HYAP444FN9: test-requirement/)
+    expect(warn.mock.calls[0]![0]).toMatch(/not installing the bundled documents 0\.2\.0: .*test-requirement/)
   })
 
   it('the uninstall of an upgrade fails → no install, a warning, no throw', async () => {
@@ -184,6 +184,7 @@ describe('signatureProblem', () => {
     expect(await signatureProblem(dir, '/A/Agent24.app', codesign)).toBeNull()
     const verifies = codesign.mock.calls.map(([a]) => a).filter((a) => a[0] === '--verify')
     expect(verifies).toEqual([
+      ['--verify', '--strict', '-R', '=anchor apple generic and certificate leaf[subject.OU] = "HYAP444FN9"', '/A/Agent24.app'],
       ['--verify', '--strict', '-R', '=anchor apple generic and certificate leaf[subject.OU] = "HYAP444FN9"', `${dir}/bin/agent24-documents`],
       ['--verify', '--strict', '-R', '=anchor apple generic and certificate leaf[subject.OU] = "HYAP444FN9"', `${dir}/bin/agent24-documents-pdfkit`],
     ])
@@ -199,14 +200,31 @@ describe('signatureProblem', () => {
     expect(await signatureProblem(dir, '/A/Agent24.app', codesign)).toBeNull()
     const verifies = codesign.mock.calls.map(([a]) => a).filter((a) => a[0] === '--verify')
     expect(verifies).toEqual([
+      ['--verify', '--strict', '/A/Agent24.app'],
       ['--verify', '--strict', `${dir}/bin/agent24-documents`],
       ['--verify', '--strict', `${dir}/bin/agent24-documents-pdfkit`],
     ])
   })
 
-  it('an ad-hoc app: an invalid signature is refused', async () => {
-    const codesign = fakeCodesign(ADHOC_APP, RUNTIME, { code: 1, output: 'invalid signature (code or signature have been modified)\n' })
+  it('an ad-hoc app: an invalid signature on a program is refused', async () => {
+    const codesign = vi.fn(async (args: string[]): Promise<CliResult> => {
+      if (args[0] === '-dv') return { code: 0, output: ADHOC_APP }
+      if (args[args.length - 1]!.endsWith('.app')) return { code: 0, output: '' }
+      return { code: 1, output: 'invalid signature (code or signature have been modified)\n' }
+    })
     expect(await signatureProblem(dir, '/A/Agent24.app', codesign)).toMatch(/agent24-documents: invalid signature/)
+  })
+
+  it("the app's own seal is checked first: a modified manifest beside valid programs is refused", async () => {
+    const codesign = vi.fn(async (args: string[]): Promise<CliResult> => {
+      if (args[0] === '-dv') return { code: 0, output: TEAM_APP }
+      if (args[args.length - 1]!.endsWith('.app')) {
+        return { code: 1, output: '/A/Agent24.app: a sealed resource is missing or invalid\nfile modified: …/documents-module/domain-os.yml\n' }
+      }
+      return { code: 0, output: '' }
+    })
+    expect(await signatureProblem(dir, '/A/Agent24.app', codesign)).toMatch(/app's signature does not verify: file modified: .*domain-os\.yml/)
+    expect(codesign.mock.calls.filter(([a]) => a[0] === '--verify')).toHaveLength(1)
   })
 
   it("an app whose identity cannot be read installs nothing (not taken for ad-hoc)", async () => {
@@ -228,10 +246,11 @@ describe('parseIdentity', () => {
 })
 
 describe('signatureProblem against the real codesign (macOS)', () => {
-  it.runIf(process.platform === 'darwin')('an ad-hoc signed program passes, a modified one does not', async () => {
+  it.runIf(process.platform === 'darwin')('a sealed ad-hoc app passes; a modified program or manifest does not', async () => {
     const app = path.join(root, 'X.app')
-    const dir = path.join(root, 'module')
+    const dir = path.join(app, 'Contents', 'Resources', 'documents-module')
     fs.mkdirSync(path.join(dir, 'bin'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'domain-os.yml'), manifest('0.2.0'))
     for (const name of ['agent24-documents', 'agent24-documents-pdfkit']) {
       fs.copyFileSync('/usr/bin/true', path.join(dir, 'bin', name))
       execFileSync(CODESIGN, ['--force', '--sign', '-', path.join(dir, 'bin', name)])
@@ -244,8 +263,12 @@ describe('signatureProblem against the real codesign (macOS)', () => {
     )
     execFileSync(CODESIGN, ['--force', '--sign', '-', app])
     expect(await signatureProblem(dir, app, execCli(CODESIGN))).toBeNull()
+    fs.appendFileSync(path.join(dir, 'domain-os.yml'), 'args: ["-c", "evil"]\n')
+    expect(await signatureProblem(dir, app, execCli(CODESIGN))).toMatch(/app's signature does not verify/)
+    execFileSync(CODESIGN, ['--force', '--sign', '-', app]) // reseal with the new manifest
+    expect(await signatureProblem(dir, app, execCli(CODESIGN))).toBeNull()
     fs.appendFileSync(path.join(dir, 'bin', 'agent24-documents-pdfkit'), 'x')
-    expect(await signatureProblem(dir, app, execCli(CODESIGN))).toMatch(/agent24-documents-pdfkit/)
+    expect(await signatureProblem(dir, app, execCli(CODESIGN))).toMatch(/does not verify|agent24-documents-pdfkit/)
   })
 })
 
@@ -262,7 +285,9 @@ describe('manifestVersion', () => {
 describe('packagesRootFor', () => {
   it('A24_OS_PACKAGES wins, as for the CLI and the daemon; else <data dir>/packages', () => {
     expect(packagesRootFor({ A24_OS_PACKAGES: '/p' }, '/d')).toBe('/p')
-    expect(packagesRootFor({}, '/d')).toBe(path.join('/d', 'packages'))
+    expect(packagesRootFor({}, '/d')).toBe('/d/packages')
+    // Joined literally like Rust's PathBuf::join: `..` is not folded.
+    expect(packagesRootFor({}, '/x/link/../d')).toBe('/x/link/../d/packages')
     expect(packagesRootFor({}, null)).toBeNull()
     expect(packagesRootFor({ A24_OS_PACKAGES: '' }, '/d')).toBeNull()
   })

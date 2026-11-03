@@ -30,6 +30,7 @@
 import { execFile } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
+import { joinLiteral } from './data-dir'
 
 export const MODULE = 'documents'
 /** Under userData; `{"uninstalledByUser": true}` while the user has it uninstalled. */
@@ -105,7 +106,13 @@ export function parseIdentity(output: string): AppIdentity | null {
   return null
 }
 
-/** Why the package's programs may not be installed, or null when they may. */
+function teamRequirement(team: string): string {
+  return `=anchor apple generic and certificate leaf[subject.OU] = "${team}"`
+}
+
+/** Why the package may not be installed, or null when it may. The programs
+ * are also checked one by one: once installed, they run from the packages
+ * root, outside the app's seal. */
 export async function signatureProblem(
   bundleDir: string,
   appBundle: string | null,
@@ -115,6 +122,15 @@ export async function signatureProblem(
   const app = await codesign(['-dv', appBundle])
   const identity = app.code === 0 ? parseIdentity(app.output) : null
   if (identity === null) return `the app's own signature could not be read: ${lastLine(app.output)}`
+  // The app's own seal covers everything in Resources/documents-module — the
+  // manifest (which names what the daemon spawns) and any file added beside
+  // the two programs — not only the programs checked one by one below.
+  const sealed = await codesign(
+    identity.kind === 'team'
+      ? ['--verify', '--strict', '-R', teamRequirement(identity.team), appBundle]
+      : ['--verify', '--strict', appBundle],
+  )
+  if (sealed.code !== 0) return `the app's signature does not verify: ${lastLine(sealed.output)}`
   for (const rel of PROGRAMS) {
     const file = path.join(bundleDir, rel)
     if (identity.kind === 'adhoc') {
@@ -122,8 +138,7 @@ export async function signatureProblem(
       if (r.code !== 0) return `${rel}: ${lastLine(r.output)}`
       continue
     }
-    const requirement = `=anchor apple generic and certificate leaf[subject.OU] = "${identity.team}"`
-    const r = await codesign(['--verify', '--strict', '-R', requirement, file])
+    const r = await codesign(['--verify', '--strict', '-R', teamRequirement(identity.team), file])
     if (r.code !== 0) return `${rel} is not signed by team ${identity.team}: ${lastLine(r.output)}`
     const d = await codesign(['-dv', file])
     if (d.code !== 0 || !/^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*\bruntime\b[^)]*\)/m.test(d.output)) {
@@ -164,11 +179,12 @@ export async function ensureBundledDocumentsModule(deps: BundledModuleDeps): Pro
       deps.warn('[documents-module] the data directory could not be resolved; not installing the documents module')
       return 'no_packages_root'
     }
-    const installedDir = path.join(deps.packagesRoot, MODULE)
+    // Joined literally, as the CLI's PathBuf::join does (no `..` folding).
+    const installedDir = joinLiteral(deps.packagesRoot, MODULE)
     const upgrading = fs.existsSync(installedDir)
     let have: string | null = null
     if (upgrading) {
-      const text = readText(path.join(installedDir, MANIFEST))
+      const text = readText(joinLiteral(installedDir, MANIFEST))
       have = text === null ? null : manifestVersion(text)
       if (have === null) {
         deps.warn(`[documents-module] ${installedDir} has no readable ${MANIFEST}; leaving it as it is`)
@@ -206,7 +222,7 @@ export async function ensureBundledDocumentsModule(deps: BundledModuleDeps): Pro
 export function packagesRootFor(env: NodeJS.ProcessEnv, dataDir: string | null): string | null {
   const over = env['A24_OS_PACKAGES']
   if (over !== undefined) return over === '' ? null : over
-  return dataDir === null ? null : path.join(dataDir, 'packages')
+  return dataDir === null ? null : joinLiteral(dataDir, 'packages')
 }
 
 /** Runs `bin` with a timeout; never rejects. */

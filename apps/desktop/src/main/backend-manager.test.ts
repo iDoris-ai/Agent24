@@ -192,6 +192,74 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
     }
   })
 
+  // T1-1: start() waits for the bundled documents module to be installed.
+  describe('start gate (T1-1)', () => {
+    function gate() {
+      let open!: () => void
+      const promise = new Promise<void>((resolve) => { open = resolve })
+      return { promise, open }
+    }
+    const absent = () => withProbe({ read: () => null, checkHealth: vi.fn().mockResolvedValue(false) })
+
+    it('spawns only after the gate opens', async () => {
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      const g = gate()
+      manager.holdStartUntil(g.promise)
+      const starting = manager.start()
+      await Promise.resolve()
+      expect(spawnProcess).not.toHaveBeenCalled()
+      g.open()
+      await starting
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      manager.stop()
+    })
+
+    it('a tray stop while held keeps the daemon down', async () => {
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      const g = gate()
+      manager.holdStartUntil(g.promise)
+      const starting = manager.start()
+      manager.stopDaemon()
+      g.open()
+      await starting
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(manager.status()).toBe('stopped')
+      manager.startDaemon()
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      manager.stop()
+    })
+
+    it('a tray restart or start while held spawns nothing early, and once after the gate', async () => {
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      const g = gate()
+      manager.holdStartUntil(g.promise)
+      const starting = manager.start()
+      manager.stopDaemon()
+      manager.restart()
+      manager.startDaemon()
+      expect(spawnProcess).not.toHaveBeenCalled()
+      g.open()
+      await starting
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      manager.stop()
+    })
+
+    it('quitting while held spawns nothing', async () => {
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      const g = gate()
+      manager.holdStartUntil(g.promise)
+      const starting = manager.start()
+      manager.stop()
+      g.open()
+      await starting
+      expect(spawnProcess).not.toHaveBeenCalled()
+    })
+  })
+
   it('daemon.json present and healthy → reuses it, never spawns', async () => {
     const spawnProcess = vi.fn(() => fakeChild(111))
     const external: ExternalDaemonSource = {

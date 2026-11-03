@@ -470,6 +470,12 @@ export class BackendManager {
   // Set by stop() (app quit): start() may still be awaiting its first probe
   // then, and must neither spawn nor arm the health loop afterwards.
   private disposed = false
+  // T1-1: what start() waits for before it reuses or spawns anything (the
+  // bundled documents module is installed first, so the daemon mounts it).
+  // While it is pending, the tray's start / restart / stop only record what
+  // the user wants; nothing is spawned ahead of it.
+  private startGate: Promise<unknown> | null = null
+  private gateOpen = true
 
   constructor(deps: BackendManagerDeps = {}) {
     this.kind = selectedBackend(deps.isPackaged ?? true, deps.resolveNode)
@@ -480,13 +486,29 @@ export class BackendManager {
     this.authMode = deps.authMode ?? selectedAuthMode(this.kind)
   }
 
+  /** T1-1: start() waits for `gate` (which must not reject) before it does
+   * anything. Call before start(). */
+  holdStartUntil(gate: Promise<unknown>): void {
+    this.startGate = gate
+    this.gateOpen = false
+  }
+
   async start(): Promise<void> {
-    // Only "nothing to reuse" may spawn. An incompatible or foreign daemon
-    // already holds the singleton lock; spawning fails and the health loop
-    // would retry forever.
-    const reuse = await this.tryReuseExternal()
-    if (this.disposed) return
-    if (reuse === 'absent') this.spawnChild()
+    if (this.startGate) {
+      await this.startGate.catch(() => {})
+      this.gateOpen = true
+      if (this.disposed) return
+    }
+    // A tray stop while start() was held: stay down until the user starts it
+    // (the health loop below already leaves a user-stopped daemon alone).
+    if (!this.userStopped) {
+      // Only "nothing to reuse" may spawn. An incompatible or foreign daemon
+      // already holds the singleton lock; spawning fails and the health loop
+      // would retry forever.
+      const reuse = await this.tryReuseExternal()
+      if (this.disposed) return
+      if (reuse === 'absent') this.spawnChild()
+    }
     this.healthTimer = setInterval(() => { void this.tick() }, HEALTH_INTERVAL_MS)
   }
 
@@ -612,6 +634,7 @@ export class BackendManager {
     if (this.blockedReason !== null) return
     this.userStopped = false
     this.failureCount = 0
+    if (!this.gateOpen) return // start() spawns once its gate opens
     if (!this.child && !this.isExternal) this.spawnChild()
   }
 
@@ -643,6 +666,7 @@ export class BackendManager {
     this.userStopped = false
     this.failureCount = 0
     this.lastHealthy = false
+    if (!this.gateOpen) return // start() spawns once its gate opens
     if (this.isExternal) {
       this.disconnectExternal()
     } else {
