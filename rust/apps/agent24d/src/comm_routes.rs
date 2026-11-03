@@ -72,6 +72,10 @@ pub struct CommDaemonSlot(
     /// Stop grace actually given to the Hyphae supervisor. The lock's
     /// `stop_grace_ms`, or the daemon's global budget when that is shorter.
     Mutex<Duration>,
+    /// Times this slot has locked [`BuildNote`]. Unit tests assert one GET
+    /// takes the lock once for both marks. Absent from the release binary.
+    #[cfg(test)]
+    std::sync::atomic::AtomicUsize,
 );
 
 /// What the last comm-state build left for `/api/v1/components`.
@@ -111,6 +115,15 @@ impl Rejection {
             Self::HashMismatch => "hash_mismatch",
         }
     }
+}
+
+/// One read of `BuildNote`. The two marks are written together, so a GET
+/// has to observe them together. Two locks can both miss if a new note is
+/// written between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BuildMark {
+    Rejected(Rejection),
+    StartFailed,
 }
 
 /// A failed build of the comm state: the (log-only) message, and the stable
@@ -173,6 +186,8 @@ impl CommDaemonSlot {
             CancellationToken::new(),
             Mutex::new(BuildNote::default()),
             Mutex::new(Duration::ZERO),
+            #[cfg(test)]
+            std::sync::atomic::AtomicUsize::new(0),
         )
     }
 
@@ -221,6 +236,18 @@ impl CommDaemonSlot {
         self.note_lock().start_failed
     }
 
+    /// Rejection and start-failure from the same [`BuildNote`] lock.
+    pub(crate) fn build_mark(&self) -> Option<BuildMark> {
+        let note = self.note_lock();
+        if let Some(rejection) = note.rejection {
+            Some(BuildMark::Rejected(rejection))
+        } else if note.start_failed {
+            Some(BuildMark::StartFailed)
+        } else {
+            None
+        }
+    }
+
     /// Grace the Hyphae supervisor was given. `Duration::ZERO` until [`build`].
     /// Test-only: production reads the same value from `CommRuntime.grace`.
     #[cfg(test)]
@@ -232,9 +259,16 @@ impl CommDaemonSlot {
     }
 
     fn note_lock(&self) -> std::sync::MutexGuard<'_, BuildNote> {
+        #[cfg(test)]
+        self.4.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.2
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    fn build_note_locks(&self) -> usize {
+        self.4.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn note(&self, rejection: Option<Rejection>, start_failed: bool) {
@@ -1686,6 +1720,32 @@ mod hy1_regression_tests {
         let (host, _) = components(&runtime).await;
         assert_eq!(host["state"], "absent", "{host}");
         assert!(host.get("reason").is_none(), "{host}");
+    }
+
+    #[tokio::test]
+    async fn components_reads_both_build_marks_under_one_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime(dir.path()).await;
+        install_fixture(&runtime, dir.path(), FIXTURE).await;
+        tokio::fs::write(dir.path().join("comm"), b"not-a-directory")
+            .await
+            .unwrap();
+        start(&runtime).await;
+        assert_eq!(runtime.slot.rejection(), None);
+        assert!(runtime.slot.start_failed());
+
+        let before = runtime.slot.build_note_locks();
+        let (host, redacted) = components(&runtime).await;
+        let locks = runtime.slot.build_note_locks() - before;
+        assert_eq!(host["state"], "failed");
+        assert_eq!(host["reason"], "start_failed");
+        assert_eq!(redacted["state"], "failed");
+        // Host and redacted each call `hyphae_item` once. `rejection()` then
+        // `start_failed()` would lock twice per call, so this would be 4.
+        assert_eq!(
+            locks, 2,
+            "rejection and start_failed must share one BuildNote lock, got {locks}"
+        );
     }
 
     #[test]

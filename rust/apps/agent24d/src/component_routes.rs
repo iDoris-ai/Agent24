@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::capabilities::{Audience, Authorization};
+use crate::comm_routes::BuildMark;
 use crate::domain::MountOutcome;
 use crate::server::AppState;
 use agent24_components::{ComponentState, Form};
@@ -248,16 +249,15 @@ fn hyphae_item(state: &AppState) -> Item {
     // `failed`, with `start_failed`: D5 reserves `failed` for a start that did not
     // come up, and `absent` only for nothing installed. The code carries no path.
     if let Some(slot) = state.comm_slot.as_ref() {
-        if let Some(rejection) = slot.rejection() {
+        // One `BuildNote` lock. Two reads can both miss if `note()` lands
+        // between them, and this GET would fall through to the supervisor or `absent`.
+        if let Some(mark) = slot.build_mark() {
             return item.with(|i| {
                 i.state = ComponentState::Failed;
-                i.reason = Some(rejection.as_str().to_owned());
-            });
-        }
-        if slot.start_failed() {
-            return item.with(|i| {
-                i.state = ComponentState::Failed;
-                i.reason = Some("start_failed".into());
+                i.reason = Some(match mark {
+                    BuildMark::Rejected(rejection) => rejection.as_str().to_owned(),
+                    BuildMark::StartFailed => "start_failed".into(),
+                });
             });
         }
     }

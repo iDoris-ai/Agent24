@@ -590,6 +590,9 @@ describe('CreativeServeWeb', () => {
     await starting
     const stopping = service.stop()
     expect(service.headlessSidecarState()).toBe('stopping')
+    // Stop clears `this.child` before the process is gone. An upgrade snapshot
+    // in that window must not drop `stopping`.
+    expect(service.headlessPhaseForReport('downloading')).toBe('stopping')
     expect(service.status()).toEqual({ state: 'stopped' })
     await stopping
     expect(service.headlessSidecarState()).toBe('stopped')
@@ -658,6 +661,54 @@ describe('CreativeServeWeb', () => {
       version: OPEN_DESIGN_PIN_VERSION,
       sidecar: service.headlessSidecarState(),
     })).toEqual({ state: 'installed', version: OPEN_DESIGN_PIN_VERSION })
+  })
+
+  it('keeps a live ready phase through an upgrade, and records a crash during that upgrade as failed', async () => {
+    const { resources: componentDir, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const child = new FakeChild()
+    const service = new CreativeServeWeb(
+      {
+        stateRoot,
+        runtimeExecutable,
+        readyTimeoutMs: 500,
+        component: { status: () => ({ state: 'installed', dir: componentDir }) },
+      },
+      vi.fn(() => child as unknown as ChildProcess) as never,
+      vi.fn(async () => new Response('{}', { status: 200 })),
+    )
+    // main.ts reports on every status assignment. While an upgrade is in
+    // progress that snapshot still sees `downloading`, not `installed`.
+    let installState = 'installed'
+    service.onStatus(() => { service.headlessPhaseForReport(installState) })
+
+    const starting = service.start()
+    child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
+    await starting
+    expect(service.headlessSidecarState()).toBe('ready')
+
+    installState = 'downloading'
+    expect(service.headlessPhaseForReport('downloading')).toBe('ready')
+    expect(service.headlessPhaseForReport('verifying')).toBe('ready')
+    expect(service.headlessSidecarState()).toBe('ready')
+
+    child.emit('exit', 1, null)
+    expect(service.headlessSidecarState()).toBe('failed')
+    // The crash's own status event already called headlessPhaseForReport('downloading').
+    // A later progress tick must still see the failure, and so must the
+    // snapshot once the install is back.
+    expect(service.headlessPhaseForReport('downloading')).toBe('failed')
+    expect(service.headlessPhaseForReport('paused')).toBe('failed')
+    expect(service.headlessPhaseForReport('installed')).toBe('failed')
+    expect(mapOpenDesignReport({
+      installState: 'installed',
+      version: OPEN_DESIGN_PIN_VERSION,
+      sidecar: service.headlessSidecarState(),
+    })).toEqual({ state: 'failed', version: OPEN_DESIGN_PIN_VERSION })
+
+    // Uninstall still drops a failed phase whose child is gone.
+    expect(service.headlessPhaseForReport('not-installed')).toBeNull()
+    expect(service.headlessSidecarState()).toBeNull()
+    expect(service.headlessPhaseForReport('unavailable')).toBeNull()
   })
 
   it('C1: Design still starts when resourcesPath is unset entirely (proves no dependency on a writable — or any — app resources dir for the on-demand path)', async () => {

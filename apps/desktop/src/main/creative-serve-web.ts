@@ -288,17 +288,32 @@ export class CreativeServeWeb {
 
   /**
    * Phase to put on an Open Design report (ADR-038 D5).
-   * Anything other than `installed` — uninstalled, or a download / verify /
-   * pause / failure in between — has no sidecar. The stored phase is cleared
-   * so the next `installed` snapshot is `installed`, not a leftover `stopped`
-   * (`installing → stopped` is not in the D5 table). A clean stop while the
-   * component stays installed keeps `stopped`. Does not emit: the snapshot
-   * that calls this is already the status event.
+   *
+   * A non-`installed` snapshot drops only a terminal leftover. `stopped` is
+   * one: the run is over, and the next `installed` snapshot must be
+   * `installed`, not `installing → stopped`. `failed` with no child is the
+   * other, and only once the component itself is gone (`not-installed` /
+   * `unavailable`) — a reinstall then reports `installed`.
+   *
+   * An upgrade (`downloading` / `verifying` / `paused`, or the installer's
+   * own `failed`) does not drop `failed`. The crash's status event reports
+   * through this method while the install is still in progress; clearing it
+   * there would make the following `installed` snapshot say `installed`.
+   * `starting` / `ready` / `degraded` / `stopping` are a live run, so they
+   * stay even when `this.child` was already cleared for a stop in progress.
+   * A clean stop while the component stays installed keeps `stopped`.
+   * Does not emit: the snapshot that calls this is already the status event.
    */
   headlessPhaseForReport(installState: string): SidecarState | null {
     if (installState !== 'installed') {
-      this.headlessPhase = null
-      return null
+      const phase = this.headlessPhase
+      const componentGone = installState === 'not-installed' || installState === 'unavailable'
+      const leftover = phase === 'stopped'
+        || (phase === 'failed' && this.child === null && componentGone)
+      if (leftover) {
+        this.headlessPhase = null
+        return null
+      }
     }
     return this.headlessPhase
   }
