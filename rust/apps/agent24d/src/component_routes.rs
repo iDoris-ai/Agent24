@@ -308,14 +308,36 @@ fn attach_items(state: &AppState) -> Vec<Item> {
     attach_items_from(state.attach_registry.snapshot())
 }
 
-fn attach_items_from(mut modules: Vec<(String, bool, Option<DrainState>)>) -> Vec<Item> {
-    modules.sort_by(|a, b| a.0.cmp(&b.0));
+fn attach_items_from(mut modules: Vec<crate::attach_registry::AttachSnap>) -> Vec<Item> {
+    // D9 has no catalog for an attached module: no component lock (D2 does
+    // not apply), `kernel_capabilities` are `requires` (ADR-039 §4), and
+    // `docs/capabilities/REGISTRY.md` is C7. `provides` stays empty.
+    modules.sort_by(|a, b| a.name.cmp(&b.name));
     modules
         .into_iter()
-        .filter(|(name, ..)| !BUILTIN_COMPONENT_IDS.contains(&name.as_str()))
-        .map(|(name, disabled, drain)| {
-            let (mapped, reason) = attach_state(disabled, drain);
-            Item::new(&name, Form::Attach, mapped).with(|i| i.reason = reason.map(str::to_owned))
+        .filter(|module| !BUILTIN_COMPONENT_IDS.contains(&module.name.as_str()))
+        .map(|module| {
+            let (mapped, reason) = attach_state(module.disabled, module.drain);
+            // A user-disabled module stays `stopped`. The mismatch is kept
+            // and shows again once the module is re-enabled.
+            let mismatch = module.mismatch.filter(|_| !module.disabled);
+            Item::new(&module.name, Form::Attach, mapped).with(|item| {
+                if !module.version.is_empty() {
+                    item.version = Some(module.version);
+                }
+                if let Some(mismatch) = mismatch {
+                    item.state = ComponentState::Incompatible;
+                    item.reason = Some("component_contract_mismatch".to_owned());
+                    let id = item.id.clone();
+                    item.detail = Some(json!({
+                        "id": id,
+                        "expected": mismatch.expected,
+                        "actual": mismatch.actual,
+                    }));
+                } else {
+                    item.reason = reason.map(str::to_owned);
+                }
+            })
         })
         .collect()
 }
