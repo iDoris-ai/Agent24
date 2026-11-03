@@ -61,7 +61,7 @@ pnpm typecheck && pnpm lint && pnpm test
 
 ## 提交与 PR
 - commit author：
-  - jason 派发给编码代理的任务，author 用 `jhfnetboy <jhfnetboy@gmail.com>`（CLA 检查）；
+  - jason 派发给编码代理的任务，author 用 `jhfnetboy <firsttorch66@gmail.com>`（CLA 检查）；
   - 已自行签署 CLA 的协作者，用**本人身份**提交本人负责的工作（例如 David：`stoptheworld-java <183781976+stoptheworld-java@users.noreply.github.com>`，负责 Documenting），不改用 jason 的身份；
   - 任何情况下都不要把 Codex/AI 写成 author，AI 协作只写在 `Co-Authored-By` 尾注里。
 - commit message、PR 标题与正文用中文；标题格式 `<type>(<scope>): <任务ID> —— <摘要>`。
