@@ -36,7 +36,7 @@ permissions:
   contents: read
 
 env:
-  OPEN_DESIGN_SHA: 47339655eba8b8984bb6dac5a305695fcba9e08b
+  OPEN_DESIGN_SHA: 72fd808f8e91626c25dc00632731ed9844b2df01
 
 concurrency:
   group: release-desktop-${{ github.workflow }}-${{ github.ref }}
