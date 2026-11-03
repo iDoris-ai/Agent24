@@ -84,8 +84,9 @@ pub enum ContractView {
     CheckFailed,
 }
 
-/// One named probe (`relays`, `keystore`, `daemon`, or `health` when the command
-/// itself did not finish).
+/// One row in the host health summary. `relays` and `keystore` are probes.
+/// `daemon` is the optional `running` flag: shown, never a strike. `health`
+/// is the row used when the command itself did not finish.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckView {
     pub ok: bool,
@@ -314,7 +315,7 @@ pub(crate) async fn read_contract(
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum HealthSample {
     /// The command returned `ok:true` and a readable report. `success` is
-    /// `status == ok` and every tracked check passed.
+    /// `status == ok` only (ADR-038 §7.3). `checks.daemon` is display data.
     Report {
         success: bool,
         checks: BTreeMap<String, bool>,
@@ -342,13 +343,12 @@ fn parse_health(data: &Value) -> HealthSample {
         return HealthSample::Unrun;
     }
     let checks = checks_of(data);
-    let failed = checks.values().any(|ok| !ok);
-    // `checks.daemon.running == false` is a failed probe named `daemon`, not a
-    // D5 `stopped`. The supervisor's own pid is what says the process is gone;
-    // this flag only disagrees with that, and one disagreement must not flip
-    // the component (the same N-strike rule as `relays`).
+    // ADR-038 §7.3: `status:ok` is one success; `degraded` or `failed` is one
+    // failure. `checks.daemon.running` is not part of that vote and is not a
+    // named failure. Whether the process is stopped is the supervisor's phase.
+    // The flag stays in `checks` so the host view can show it.
     HealthSample::Report {
-        success: status == "ok" && !failed,
+        success: status == "ok",
         checks,
     }
 }
@@ -384,7 +384,9 @@ fn observe_health(health: &mut HealthView, sample: HealthSample) {
             for (name, ok) in &checks {
                 let entry = health.checks.entry(name.clone()).or_default();
                 entry.ok = *ok;
-                if *ok {
+                // `daemon.running` is display only. It must not accumulate a
+                // strike or land in `failed_probes` (ADR-038 §7.3).
+                if *ok || name == "daemon" {
                     entry.consecutive_failures = 0;
                 } else {
                     entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
@@ -400,6 +402,14 @@ fn observe_health(health: &mut HealthView, sample: HealthSample) {
                 entry.consecutive_failures = 0;
             }
             if success {
+                // A check the report omitted did not fail this time. Leaving
+                // the old `ok:false` would show a strike the sample cleared.
+                for (name, entry) in health.checks.iter_mut() {
+                    if !checks.contains_key(name) {
+                        entry.ok = true;
+                        entry.consecutive_failures = 0;
+                    }
+                }
                 health.consecutive_failures = 0;
                 health.degraded = false;
                 health.failed_probes.clear();
@@ -601,21 +611,102 @@ mod tests {
     }
 
     #[test]
-    fn daemon_running_false_is_a_probe_named_daemon() {
+    fn daemon_running_false_is_display_only_and_does_not_decide_the_sample() {
         let mut checks = BTreeMap::new();
         checks.insert("daemon".into(), false);
+        checks.insert("relays".into(), true);
         let sample = parse_health(&serde_json::json!({
-            "status": "failed",
-            "checks": {"daemon": {"running": false}, "extra": {"ignored": true}, "note": "x"},
+            "status": "ok",
+            "checks": {
+                "daemon": {"running": false},
+                "relays": {"ok": true},
+                "extra": {"ignored": true},
+                "note": "x"
+            },
             "future": 1
         }));
         assert_eq!(
             sample,
             HealthSample::Report {
-                success: false,
+                success: true,
                 checks
             }
         );
+
+        // `status:failed` is still one failure, but the name is not `daemon`.
+        let sample = parse_health(&serde_json::json!({
+            "status": "failed",
+            "checks": {"daemon": {"running": false}}
+        }));
+        let mut health = HealthView::default();
+        observe_health(&mut health, sample);
+        assert!(!health.degraded);
+        assert!(!health.failed_probes.iter().any(|name| name == "daemon"));
+        assert!(!health.checks["daemon"].ok);
+        assert_eq!(health.checks["daemon"].consecutive_failures, 0);
+    }
+
+    #[test]
+    fn daemon_running_false_with_status_ok_stays_ready_after_three_samples() {
+        let mut health = HealthView::default();
+        for _ in 0..HEALTH_FAILURES_BEFORE_DEGRADED {
+            let sample = parse_health(&serde_json::json!({
+                "status": "ok",
+                "checks": {
+                    "daemon": {"running": false},
+                    "relays": {"ok": true},
+                    "keystore": {"ok": true}
+                }
+            }));
+            observe_health(&mut health, sample);
+        }
+        assert!(
+            !health.degraded,
+            "daemon.running=false must not turn a status:ok sample into a failure"
+        );
+        assert_eq!(health.consecutive_failures, 0);
+        assert!(health.failed_probes.is_empty());
+        assert!(!health.checks["daemon"].ok);
+        assert_eq!(health.checks["daemon"].consecutive_failures, 0);
+        assert!(health.checks["relays"].ok);
+    }
+
+    #[test]
+    fn a_successful_sample_clears_checks_it_does_not_mention() {
+        let mut health = HealthView::default();
+        let mut checks = BTreeMap::new();
+        checks.insert("relays".into(), false);
+        checks.insert("daemon".into(), false);
+        observe_health(
+            &mut health,
+            HealthSample::Report {
+                success: false,
+                checks,
+            },
+        );
+        assert!(!health.checks["relays"].ok);
+        assert!(health.checks["relays"].consecutive_failures >= 1);
+        assert!(!health.checks["daemon"].ok);
+
+        let mut checks = BTreeMap::new();
+        checks.insert("keystore".into(), true);
+        observe_health(
+            &mut health,
+            HealthSample::Report {
+                success: true,
+                checks,
+            },
+        );
+        assert!(
+            health.checks["relays"].ok && health.checks["relays"].consecutive_failures == 0,
+            "an omitted relays row must not keep the old strike: {:?}",
+            health.checks["relays"]
+        );
+        assert!(health.checks["daemon"].ok);
+        assert_eq!(health.checks["daemon"].consecutive_failures, 0);
+        assert!(health.checks["keystore"].ok);
+        assert!(!health.degraded);
+        assert_eq!(health.consecutive_failures, 0);
     }
 
     #[test]

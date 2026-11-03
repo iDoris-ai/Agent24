@@ -1575,3 +1575,200 @@ async fn a_health_probe_in_flight_does_not_block_stop() {
         started.elapsed()
     );
 }
+
+fn count_file(path: &Path) -> u64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Crash, then the backoff restart's `hyphae contract` fails three different
+/// ways. Each one must come back to `backoff` instead of sticking at `Idle`.
+#[tokio::test]
+async fn contract_check_failures_on_backoff_keep_restarting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = make_ctx_with_script(
+        tmp.path(),
+        r#"#!/bin/sh
+case "$1" in
+  contract)
+    n=0
+    if [ -f "$HOME/contract-hits" ]; then n=$(cat "$HOME/contract-hits"); fi
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$HOME/contract-hits"
+    if [ "$n" -eq 1 ] || [ "$n" -ge 5 ]; then
+      printf '%s\n' '{"ok":true,"data":{"name":"hyphae-cli","contract_version":"1.0"}}'
+      exit 0
+    fi
+    if [ "$n" -eq 2 ]; then
+      printf '%s\n' 'not-json'
+      exit 0
+    fi
+    if [ "$n" -eq 3 ]; then
+      printf '%s\n' '{"ok":true,"data":{"name":"","contract_version":"1.0"}}'
+      exit 0
+    fi
+    sleep 60
+    exit 0
+    ;;
+  identity)
+    printf '%s\n' '{"ok":true,"data":[{"nickname":"alice","npub":"npub1x","default":true,"encrypted":true}]}'
+    exit 0
+    ;;
+  relay)
+    printf '%s\n' '{"ok":true,"data":{"relays":["wss://relay.example"],"source":"config"}}'
+    exit 0
+    ;;
+  health)
+    printf '%s\n' '{"ok":true,"data":{"status":"ok","checks":{"relays":{"ok":true}}}}'
+    exit 0
+    ;;
+  daemon)
+    cat > /dev/null
+    n=0
+    if [ -f "$HOME/daemon-spawns" ]; then n=$(cat "$HOME/daemon-spawns"); fi
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$HOME/daemon-spawns"
+    exec sleep 9999
+    ;;
+esac
+exit 0
+"#,
+    )
+    .await;
+    let hits = ctx.home.join("contract-hits");
+    let spawns = ctx.home.join("daemon-spawns");
+    let pid_path = ctx.pid_path.clone();
+    let sup = FixtureSupervisor::spawn(ctx);
+    sup.arm_probe(test_arm(
+        Duration::from_secs(3600),
+        Duration::from_secs(2),
+        // Long enough for a loaded machine to get `/bin/sh` out of dyld.
+        // The fourth handshake still sleeps past it, so it counts as a timeout.
+        Duration::from_secs(8),
+    ));
+    sup.start().await.unwrap();
+    assert!(
+        wait_until(|| sup.status().state == "running", Duration::from_secs(3)).await,
+        "status {:?}",
+        sup.status()
+    );
+    assert_eq!(count_file(&spawns), 1);
+    kill_minus_9(read_pid(&pid_path).await);
+    assert!(
+        wait_until(
+            || count_file(&hits) >= 4
+                && count_file(&spawns) == 1
+                && sup.status().state != "gave_up",
+            Duration::from_secs(25),
+        )
+        .await,
+        "bad JSON, empty name, and timeout did not stay on backoff: hits {} spawns {} status {:?}",
+        count_file(&hits),
+        count_file(&spawns),
+        sup.status()
+    );
+    assert!(
+        wait_until(
+            || sup.status().state == "running"
+                && count_file(&hits) >= 5
+                && count_file(&spawns) == 2,
+            Duration::from_secs(25),
+        )
+        .await,
+        "restart did not recover after the handshake could run: hits {} spawns {} status {:?}",
+        count_file(&hits),
+        count_file(&spawns),
+        sup.status()
+    );
+    assert_eq!(sup.probe_snapshot().contract, ContractView::Compatible);
+}
+
+/// Mismatch on the backoff restart stops. It must not spawn and must not
+/// schedule another attempt.
+#[tokio::test]
+async fn contract_mismatch_on_backoff_stays_idle_and_does_not_spawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = make_ctx_with_script(
+        tmp.path(),
+        r#"#!/bin/sh
+case "$1" in
+  contract)
+    n=0
+    if [ -f "$HOME/contract-hits" ]; then n=$(cat "$HOME/contract-hits"); fi
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$HOME/contract-hits"
+    if [ "$n" -eq 1 ]; then
+      printf '%s\n' '{"ok":true,"data":{"name":"hyphae-cli","contract_version":"1.0"}}'
+      exit 0
+    fi
+    printf '%s\n' '{"ok":true,"data":{"name":"hyphae-cli","contract_version":"9.0"}}'
+    exit 0
+    ;;
+  identity)
+    printf '%s\n' '{"ok":true,"data":[{"nickname":"alice","npub":"npub1x","default":true,"encrypted":true}]}'
+    exit 0
+    ;;
+  relay)
+    printf '%s\n' '{"ok":true,"data":{"relays":["wss://relay.example"],"source":"config"}}'
+    exit 0
+    ;;
+  health)
+    printf '%s\n' '{"ok":true,"data":{"status":"ok","checks":{"relays":{"ok":true}}}}'
+    exit 0
+    ;;
+  daemon)
+    cat > /dev/null
+    n=0
+    if [ -f "$HOME/daemon-spawns" ]; then n=$(cat "$HOME/daemon-spawns"); fi
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$HOME/daemon-spawns"
+    exec sleep 9999
+    ;;
+esac
+exit 0
+"#,
+    )
+    .await;
+    let hits = ctx.home.join("contract-hits");
+    let spawns = ctx.home.join("daemon-spawns");
+    let pid_path = ctx.pid_path.clone();
+    let sup = FixtureSupervisor::spawn(ctx);
+    sup.arm_probe(test_arm(
+        Duration::from_secs(3600),
+        Duration::from_secs(2),
+        // A loaded machine can sit in dyld for a few seconds before `/bin/sh`
+        // runs the fixture. The response itself is immediate.
+        Duration::from_secs(8),
+    ));
+    sup.start().await.unwrap();
+    assert!(
+        wait_until(|| sup.status().state == "running", Duration::from_secs(3)).await,
+        "status {:?}",
+        sup.status()
+    );
+    assert_eq!(count_file(&spawns), 1);
+    kill_minus_9(read_pid(&pid_path).await);
+    assert!(
+        wait_until(
+            || count_file(&hits) >= 2 && sup.probe_snapshot().contract == ContractView::Mismatch,
+            Duration::from_secs(15),
+        )
+        .await,
+        "mismatch handshake did not run: hits {} snap {:?} status {:?}",
+        count_file(&hits),
+        sup.probe_snapshot(),
+        sup.status()
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        count_file(&hits),
+        2,
+        "mismatch must not schedule another handshake"
+    );
+    assert_eq!(count_file(&spawns), 1, "mismatch must not spawn the daemon");
+    assert_eq!(sup.probe_snapshot().contract, ContractView::Mismatch);
+    assert_eq!(sup.status().state, "gave_up");
+    assert_eq!(sup.status().consecutive_failures, 1);
+}

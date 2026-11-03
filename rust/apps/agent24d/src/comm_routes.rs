@@ -1024,6 +1024,116 @@ mod hyphae_probe_arm_tests {
         assert_eq!(arm.health_timeout, HEALTH_TIMEOUT);
         assert_eq!(arm.contract_timeout, CONTRACT_TIMEOUT);
     }
+
+    /// The same `build_ready_state` that production runs must arm before
+    /// autostart. An incompatible contract then refuses to spawn. Deleting
+    /// `daemon.arm_probe(...)` leaves the contract `Unknown` and, because
+    /// this fixture can satisfy identity/relay/password, starts the daemon.
+    #[tokio::test]
+    async fn build_ready_state_arms_the_probe_and_refuses_an_incompatible_contract() {
+        const SCRIPT: &str = r#"#!/bin/sh
+case "$1" in
+  contract)
+    printf '%s\n' '{"ok":true,"data":{"name":"hyphae-cli","contract_version":"9.0"}}'
+    exit 0
+    ;;
+  identity)
+    printf '%s\n' '{"ok":true,"data":[{"nickname":"alice","npub":"npub1x","default":true,"encrypted":true}]}'
+    exit 0
+    ;;
+  relay)
+    printf '%s\n' '{"ok":true,"data":{"relays":["wss://relay.example"],"source":"config"}}'
+    exit 0
+    ;;
+  daemon)
+    cat > /dev/null
+    touch "$HOME/daemon-started"
+    exec sleep 9999
+    ;;
+esac
+exit 0
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("hyphae-fake.sh");
+        tokio::fs::write(&source, SCRIPT).await.unwrap();
+        let bytes = tokio::fs::read(&source).await.unwrap();
+        let lock =
+            HyphaeLock::override_for_test("linux-x64", agent24_comm::binary::sha256_of(&bytes));
+        let home = dir.path().join("hyphae-home");
+        tokio::fs::create_dir_all(home.join(".hyphae"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            home.join(".hyphae").join("keystore.json"),
+            br#"{"salt":"dGVzdHNhbHQ="}"#,
+        )
+        .await
+        .unwrap();
+        let autostart_path = dir.path().join("daemon-autostart.json");
+        tokio::fs::write(&autostart_path, br#"{"autostart":true}"#)
+            .await
+            .unwrap();
+        let install_dir = dir.path().join("bin");
+        let pid_path = dir.path().join("hyphae-daemon.pid");
+        let log_path = dir.path().join("logs").join("hyphae-daemon.log");
+        let store = Arc::new(MemoryPasswordStore::new());
+        store
+            .put(
+                &agent24_comm::Account::from_salt("dGVzdHNhbHQ="),
+                &agent24_comm::Password::new(b"testpass".to_vec()).unwrap(),
+            )
+            .await
+            .unwrap();
+        let slot = CommDaemonSlot::new();
+        let verifier: Verifier = Arc::new(agent24_components::sign::Unsigned);
+        let state = build_ready_state(
+            &source,
+            &CommPaths {
+                home: &home,
+                install_dir: &install_dir,
+                pid_path: &pid_path,
+                log_path: &log_path,
+                autostart_path: &autostart_path,
+            },
+            store,
+            Duration::from_millis(200),
+            &slot,
+            &Verification {
+                lock: &lock,
+                verifier: &verifier,
+                platform: "linux-x64",
+            },
+        )
+        .await
+        .expect("fixture binary matches the overridden lock");
+        let daemon = slot
+            .current()
+            .expect("build_ready_state registers the supervisor");
+        let snap = daemon.probe_snapshot();
+        let status = daemon.status();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let spawned = home.join("daemon-started").exists();
+        daemon.shutdown(tokio::time::Instant::now()).await;
+        drop(state);
+        assert_eq!(
+            snap.contract,
+            agent24_comm::ContractView::Mismatch,
+            "the supervisor must be armed with the lock contract"
+        );
+        assert!(
+            status
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("contract_mismatch")),
+            "status {status:?}"
+        );
+        assert!(
+            !spawned,
+            "an incompatible contract must not start the daemon"
+        );
+        assert_ne!(status.state, "running");
+        assert_ne!(status.state, "starting");
+    }
 }
 
 /// PR #626 review, High #1: `CommDaemonSlot`'s whole job is to make the

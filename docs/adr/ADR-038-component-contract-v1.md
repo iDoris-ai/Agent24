@@ -384,7 +384,7 @@ D4 原文写「退出码只区分 0、1、2」，这和 Hyphae 现有的语义�
   - `ok:false`（体检没跑起来）按 D6 的错误处理，同样只计一次探测失败。
 
 ### 7.4 锁的过渡（D2、D2a）
-- C2 那一版的 Hyphae 锁保持 schema 1，**不加任何字段**（Agent24 用严格解析读 Hyphae 锁）。schema 1 带不了 `contract`，所以 **C2 期间 Agent24 把对 Hyphae 的契约期望写死在 `agent24-comm` 代码里**：`name=hyphae-cli`、`major=1`、`min_minor=0`；D3 的握手检查照常跑，只是期望值来自代码常量而不是锁。锁要到 C1b 的 schema 2 才有 `contract` 字段，届时删掉代码常量。
+- Hyphae 锁已是 schema 2（C1b），带 `contract`。Agent24 用严格解析读嵌入的 `hyphae.lock.json`，握手期望来自这份锁（`name=hyphae-cli`、`major=1`、`min_minor=0`、`tested=1.0`），不在 `agent24-comm` 里写死。C2 早期曾计划锁保持 schema 1、期望写死在代码里；schema 2 落地后那条不再适用。
 - **锁文件归 Agent24**：`rust/crates/agent24-comm/hyphae.lock.json` 仍由 Agent24 拥有，做法和今天一样——逐字节复制 Hyphae release 里发布的 `hyphae.lock.json`，Agent24 侧不改内容，只在 PR 里说明来源。C1b 起复制的是 schema 2 版本。
 - C1b 签名版直接发 schema 2：
   - **release 资产仍是裸二进制** `hyphae-darwin-arm64`（以及 `hyphae-linux-x64`），和现在一样；tar.gz 只是附加的打包形式，**不进锁**；

@@ -1212,6 +1212,50 @@ fn status_for_start_error(
     set_status(status, state, generation, failures, Some(reason));
 }
 
+/// Timeout, bad JSON, or an empty name: the handshake produced no report.
+/// A mismatch is a different string and must not take this path.
+fn is_contract_check_failed(error: &DaemonStartError) -> bool {
+    matches!(
+        error,
+        DaemonStartError::Failed(reason) if reason.starts_with("contract_check_failed")
+    )
+}
+
+/// Backoff restart only. A handshake that did not run is one
+/// [`RestartPolicy::failed`] and returns to `Backoff` until the breaker.
+/// The caller has already recorded `gave_up` via [`status_for_start_error`];
+/// this overwrites it when another attempt is still allowed.
+fn phase_after_contract_check_failure(
+    status: &Mutex<DaemonStatus>,
+    policy: &mut RestartPolicy,
+    generation: u64,
+) -> Phase {
+    match policy.failed(Instant::now()) {
+        Decision::RestartAfter(delay) => {
+            set_status(
+                status,
+                "backoff",
+                generation,
+                policy.consecutive_failures(),
+                None,
+            );
+            Phase::Backoff {
+                deadline: tokio::time::Instant::now() + delay,
+            }
+        }
+        Decision::GiveUp { .. } => {
+            set_status(
+                status,
+                "gave_up",
+                generation,
+                policy.consecutive_failures(),
+                Some("restart_backoff_exhausted".to_owned()),
+            );
+            Phase::Idle
+        }
+    }
+}
+
 impl HyphaeDaemonSupervisor {
     /// Starts the background actor (in `Stopped` state; it spawns nothing
     /// until [`Self::start`] is called).
@@ -1801,10 +1845,17 @@ async fn run_actor(
 
             () = tokio::time::sleep_until(backoff_deadline.unwrap_or_else(tokio::time::Instant::now)), if backoff_deadline.is_some() => {
                 // PR #626 review, High #2: "关机开始后禁止再 spawn".
+                // A contract handshake that did not produce a report (timeout,
+                // bad JSON, empty name) is transient: stay on RestartPolicy.
+                // Mismatch stays Idle and does not spawn again.
                 phase = if shutdown_deadline.get().is_none() {
-                    spawn_and_record(&ctx, &log_truncate_generation, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline, &probe)
-                        .await
-                        .unwrap_or(Phase::Idle)
+                    match spawn_and_record(&ctx, &log_truncate_generation, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline, &probe).await {
+                        Ok(started) => started,
+                        Err(error) if is_contract_check_failed(&error) => {
+                            phase_after_contract_check_failure(&status, &mut policy, generation)
+                        }
+                        Err(_) => Phase::Idle,
+                    }
                 } else {
                     Phase::Idle
                 };
