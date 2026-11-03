@@ -86,13 +86,14 @@ async fn the_host_sees_everything_and_open_design_is_absent_until_reported() {
     let idoris = find(&body, "idoris");
     assert_eq!(idoris["form"], "resident");
     assert_eq!(idoris["provides"][0]["id"], "model-gateway");
-    // C1b: the lock's contract travels in the detail, and Hyphae has no `health`.
+    // C1b: the lock's contract travels in the detail. No supervisor means no health book.
     let hyphae = find(&body, "hyphae");
     assert_eq!(hyphae["state"], "absent");
     assert_eq!(
         hyphae["detail"]["contract"],
         json!({"name": "hyphae-cli", "major": 1, "min_minor": 0})
     );
+    assert!(hyphae["detail"].get("health").is_none());
     let provided: Vec<_> = hyphae["provides"]
         .as_array()
         .unwrap()
@@ -1049,6 +1050,216 @@ async fn registry_lists_every_capability_id_the_components_emit() {
             "GET /components provides {id}, which is neither registered nor mcp-<server>"
         );
     }
+}
+
+fn health_book(degraded: bool, strikes: u32, relays_ok: bool) -> agent24_comm::HealthView {
+    use agent24_comm::{CheckView, HealthView};
+    let mut checks = std::collections::BTreeMap::new();
+    checks.insert(
+        "relays".into(),
+        CheckView {
+            ok: relays_ok,
+            consecutive_failures: if relays_ok { 0 } else { strikes },
+        },
+    );
+    checks.insert(
+        "keystore".into(),
+        CheckView {
+            ok: true,
+            consecutive_failures: 0,
+        },
+    );
+    HealthView {
+        consecutive_failures: if relays_ok { 0 } else { strikes },
+        degraded,
+        failed_probes: if relays_ok {
+            Vec::new()
+        } else {
+            vec!["relays".into()]
+        },
+        checks,
+    }
+}
+
+fn probe_of(
+    contract: agent24_comm::ContractView,
+    health: Option<agent24_comm::HealthView>,
+) -> agent24_comm::ProbeSnapshot {
+    agent24_comm::ProbeSnapshot {
+        contract,
+        above_tested: false,
+        health,
+    }
+}
+
+fn hyphae_with(
+    process: &str,
+    process_reason: Option<&str>,
+    probe: agent24_comm::ProbeSnapshot,
+) -> Item {
+    let lock = crate::hyphae_install::HyphaeLock::embedded().unwrap();
+    let component = lock.component();
+    let mut item = Item::new("hyphae", Form::Resident, ComponentState::Absent).with(|item| {
+        item.provides = Item::provides_of(component);
+        item.version = Some(component.version.clone());
+        item.detail = Some(json!({
+            "contract": {
+                "name": component.contract.name,
+                "major": component.contract.major,
+                "min_minor": component.contract.min_minor,
+            }
+        }));
+    });
+    apply_hyphae_runtime(
+        &mut item,
+        process,
+        process_reason.map(str::to_owned),
+        7,
+        0,
+        &probe,
+    );
+    item
+}
+
+#[test]
+fn one_health_failure_stays_ready_until_the_book_says_degraded() {
+    use ComponentState as S;
+    use agent24_comm::ContractView;
+
+    let untouched = hyphae_with("running", None, probe_of(ContractView::Compatible, None));
+    assert_eq!(untouched.state, S::Ready, "no sample yet is still ready");
+    assert!(
+        render(&[untouched], true)["components"][0]["detail"]
+            .get("health")
+            .is_none()
+    );
+
+    let one = hyphae_with(
+        "running",
+        None,
+        probe_of(ContractView::Compatible, Some(health_book(false, 1, false))),
+    );
+    assert_eq!(one.state, S::Ready);
+    assert!(one.reason.is_none());
+    let body = render(&[one], true);
+    let health = &body["components"][0]["detail"]["health"];
+    assert_eq!(health["degraded"], false);
+    assert_eq!(health["consecutive_failures"], 1);
+    assert_eq!(health["checks"]["relays"]["ok"], false);
+    assert_eq!(health["checks"]["relays"]["consecutive_failures"], 1);
+    assert_eq!(health["checks"]["keystore"]["consecutive_failures"], 0);
+    assert_eq!(body["components"][0]["detail"]["consecutive_failures"], 0);
+    assert!(!body.to_string().contains("wss://"));
+
+    let nth = hyphae_with(
+        "running",
+        None,
+        probe_of(ContractView::Compatible, Some(health_book(true, 3, false))),
+    );
+    assert_eq!(nth.state, S::Degraded);
+    assert_eq!(nth.reason.as_deref(), Some("relays"));
+
+    let mut both = health_book(true, 3, false);
+    both.failed_probes = vec!["keystore".into(), "relays".into()];
+    both.checks.get_mut("keystore").unwrap().ok = false;
+    let named = hyphae_with(
+        "running",
+        None,
+        probe_of(ContractView::Compatible, Some(both)),
+    );
+    assert_eq!(named.reason.as_deref(), Some("keystore,relays"));
+
+    let back = hyphae_with(
+        "running",
+        None,
+        probe_of(ContractView::Compatible, Some(health_book(false, 0, true))),
+    );
+    assert_eq!(back.state, S::Ready);
+    let body = render(&[back], true);
+    assert_eq!(body["components"][0]["detail"]["health"]["degraded"], false);
+    assert_eq!(
+        body["components"][0]["detail"]["health"]["consecutive_failures"],
+        0
+    );
+    assert_eq!(
+        body["components"][0]["detail"]["health"]["checks"]["relays"]["ok"],
+        true
+    );
+}
+
+#[test]
+fn contract_mismatch_is_incompatible_even_when_the_process_gave_up() {
+    use agent24_comm::ContractView;
+    let item = hyphae_with(
+        "gave_up",
+        Some("contract_mismatch: expected hyphae-cli major 1, got hyphae-cli 2.0"),
+        probe_of(ContractView::Mismatch, None),
+    );
+    assert_eq!(item.state, ComponentState::Incompatible);
+    assert_eq!(item.reason.as_deref(), Some("contract_mismatch"));
+}
+
+#[test]
+fn contract_check_failure_is_failed_without_claiming_incompatible() {
+    use agent24_comm::ContractView;
+    let item = hyphae_with(
+        "gave_up",
+        Some("contract_check_failed: timed out"),
+        probe_of(ContractView::CheckFailed, None),
+    );
+    assert_eq!(item.state, ComponentState::Failed);
+    assert_eq!(item.reason.as_deref(), Some("contract_check_failed"));
+}
+
+#[test]
+fn a_stopped_process_ignores_a_stale_degraded_health_book() {
+    use agent24_comm::ContractView;
+    let item = hyphae_with(
+        "stopped",
+        None,
+        probe_of(ContractView::Compatible, Some(health_book(true, 3, false))),
+    );
+    assert_eq!(item.state, ComponentState::Stopped);
+    assert!(item.reason.is_none());
+    assert!(
+        render(&[item], true)["components"][0]["detail"]
+            .get("health")
+            .is_none()
+    );
+}
+
+#[test]
+fn redacted_components_omit_the_health_summary() {
+    use agent24_comm::ContractView;
+    let item = hyphae_with(
+        "running",
+        None,
+        probe_of(ContractView::Compatible, Some(health_book(true, 3, false))),
+    );
+    let full = render(std::slice::from_ref(&item), true);
+    let redacted = render(&[item], false);
+    let text = redacted.to_string();
+    assert_eq!(redacted["components"][0]["state"], "degraded");
+    assert!(text.contains("nostr-relay"));
+    for forbidden in [
+        "consecutive_failures",
+        "relays",
+        "detail",
+        "health",
+        "contract_mismatch",
+        "reason",
+        "keystore",
+    ] {
+        assert!(
+            !text.contains(forbidden),
+            "{forbidden} leaked into the redacted view: {text}"
+        );
+    }
+    assert_eq!(
+        full["components"][0]["detail"]["health"]["checks"]["relays"]["consecutive_failures"],
+        3
+    );
+    assert_eq!(full["components"][0]["reason"], "relays");
 }
 
 // ---- Knowledge capabilities probe (ADR-038 C5) -----------------------------------------
