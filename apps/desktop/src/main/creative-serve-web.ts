@@ -45,6 +45,18 @@ export interface CreativeServeWebOptions {
    * bundled resources are found, CreativeServeWeb consults this instead of
    * `resourcesPath` to locate the headless launcher + resource root. */
   component?: OpenDesignComponentAccessor
+  /** The `agent24` CLI the Open Design `agent24` runtime should run, passed as
+   * AGENT24_BIN. Defaults to the copy bundled in Agent24.app; null disables. */
+  agent24Cli?: string | null
+}
+
+/** `Contents/Resources/backend/agent24` inside the running Agent24.app, if present. */
+export function resolveBundledAgent24Cli(
+  resources: string | undefined = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath,
+): string | null {
+  if (!resources) return null
+  const cli = path.join(resources, 'backend', 'agent24')
+  return fs.existsSync(cli) ? cli : null
 }
 
 type SpawnFn = typeof spawn
@@ -504,6 +516,10 @@ export class CreativeServeWeb {
     this.current = { state: 'starting' }
     const childEnv = creativeChildEnvironment(environment)
     childEnv.ELECTRON_RUN_AS_NODE = '1'
+    // Open Design looks `agent24` up on PATH unless AGENT24_BIN says otherwise; a
+    // machine without the CLI installed would otherwise have no Agent24 runtime.
+    const agent24Cli = this.options.agent24Cli !== undefined ? this.options.agent24Cli : resolveBundledAgent24Cli()
+    if (agent24Cli && !childEnv.AGENT24_BIN) childEnv.AGENT24_BIN = agent24Cli
     const child = this.spawnFn(
       runtimeExecutable,
       [headlessEntry, '--config', configPath],

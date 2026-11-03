@@ -3,6 +3,7 @@ import { PassThrough } from 'node:stream'
 import type { ChildProcess } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -13,6 +14,7 @@ import {
   canonicalCreativeOrigin,
   classifyCreativeUrl,
   creativeChildEnvironment,
+  resolveBundledAgent24Cli,
   parseAgent24HeadlessReady,
   resolveAgent24HeadlessLauncher,
   resolveOpenDesignCheckout,
@@ -482,6 +484,45 @@ describe('CreativeServeWeb', () => {
       resourceSafeBase: fs.realpathSync(componentDir),
     })
     await service.stop()
+  })
+
+  it('hands the bundled agent24 CLI to Open Design as AGENT24_BIN, keeping a user override', async () => {
+    for (const [userBin, expected] of [[undefined, '/Apps/Agent24.app/Contents/Resources/backend/agent24'], ['/opt/mine/agent24', '/opt/mine/agent24']] as const) {
+      const { resources, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+      const child = new FakeChild()
+      const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+      const service = new CreativeServeWeb(
+        {
+          resourcesPath: resources,
+          stateRoot,
+          runtimeExecutable,
+          environment: { PATH: '/usr/bin', ...(userBin ? { AGENT24_BIN: userBin } : {}) },
+          agent24Cli: '/Apps/Agent24.app/Contents/Resources/backend/agent24',
+          readyTimeoutMs: 500,
+        },
+        spawnFn as never,
+        vi.fn(async () => new Response('{}', { status: 200 })),
+      )
+      const starting = service.start()
+      child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
+      await starting
+      const env = (spawnFn.mock.calls[0] as unknown as [string, string[], { env: NodeJS.ProcessEnv }])[2].env
+      expect(env.AGENT24_BIN).toBe(expected)
+      await service.stop()
+    }
+  })
+
+  it('finds the CLI bundled in Agent24.app and nothing when it is absent', () => {
+    const resources = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-res-'))
+    try {
+      expect(resolveBundledAgent24Cli(resources)).toBeNull()
+      fs.mkdirSync(path.join(resources, 'backend'))
+      fs.writeFileSync(path.join(resources, 'backend', 'agent24'), '')
+      expect(resolveBundledAgent24Cli(resources)).toBe(path.join(resources, 'backend', 'agent24'))
+      expect(resolveBundledAgent24Cli(undefined)).toBeNull()
+    } finally {
+      fs.rmSync(resources, { recursive: true, force: true })
+    }
   })
 
   it('reports headless sidecar phases and clears them after a clean stop', async () => {
