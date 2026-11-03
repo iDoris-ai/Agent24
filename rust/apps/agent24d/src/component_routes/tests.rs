@@ -1003,3 +1003,97 @@ async fn rotating_the_credential_probes_again_and_the_secret_is_not_shown() {
     assert_eq!(fake.hits.load(Ordering::SeqCst), 2);
     assert_no_canary(&authed, &[secret]);
 }
+
+/// Each `parse_data` rejection (missing declaration or a malformed field).
+/// A guard that instead accepts the document turns that row `ready`.
+#[tokio::test]
+async fn an_unusable_capabilities_declaration_is_not_ready() {
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            "missing_agent",
+            r#"{"code":0,"msg":"LEAK-parse","data":{"integration":{}}}"#,
+            "incompatible",
+            "component_contract_mismatch",
+        ),
+        (
+            "agent_not_object",
+            r#"{"code":0,"msg":"LEAK-parse","data":{"integration":{"agent24_knowledge":[]}}}"#,
+            "failed",
+            "malformed",
+        ),
+        (
+            "empty_versions",
+            r#"{"code":0,"msg":"LEAK-parse","data":{"integration":{"agent24_knowledge":{"protocol_versions":[],"mode":"integration","supported_operations":["search","read"],"server_version":"1.0.0"}}}}"#,
+            "incompatible",
+            "component_contract_mismatch",
+        ),
+        (
+            "zero_version",
+            r#"{"code":0,"msg":"LEAK-parse","data":{"integration":{"agent24_knowledge":{"protocol_versions":[0],"mode":"integration","supported_operations":["search","read"]}}}}"#,
+            "failed",
+            "malformed",
+        ),
+        (
+            "versions_not_array",
+            r#"{"code":0,"msg":"LEAK-parse","data":{"integration":{"agent24_knowledge":{"protocol_versions":"1","mode":"integration","supported_operations":["search","read"]}}}}"#,
+            "failed",
+            "malformed",
+        ),
+        (
+            "versions_absent",
+            r#"{"code":0,"msg":"LEAK-parse","data":{"integration":{"agent24_knowledge":{"mode":"integration","supported_operations":["search","read"],"server_version":"1.0.0"}}}}"#,
+            "incompatible",
+            "component_contract_mismatch",
+        ),
+        (
+            "mode_not_string",
+            r#"{"code":0,"msg":"LEAK-parse","data":{"integration":{"agent24_knowledge":{"protocol_versions":[1],"mode":1,"supported_operations":["search","read"]}}}}"#,
+            "failed",
+            "malformed",
+        ),
+        (
+            "mode_absent",
+            r#"{"code":0,"msg":"LEAK-parse","data":{"integration":{"agent24_knowledge":{"protocol_versions":[1],"supported_operations":["search","read"],"server_version":"1.0.0"}}}}"#,
+            "incompatible",
+            "component_contract_mismatch",
+        ),
+        (
+            "op_not_string",
+            r#"{"code":0,"msg":"LEAK-parse","data":{"integration":{"agent24_knowledge":{"protocol_versions":[1],"mode":"integration","supported_operations":[1]}}}}"#,
+            "failed",
+            "malformed",
+        ),
+        (
+            "ops_not_array",
+            r#"{"code":0,"msg":"LEAK-parse","data":{"integration":{"agent24_knowledge":{"protocol_versions":[1],"mode":"integration","supported_operations":"search"}}}}"#,
+            "failed",
+            "malformed",
+        ),
+        (
+            "ops_absent",
+            r#"{"code":0,"msg":"LEAK-parse","data":{"integration":{"agent24_knowledge":{"protocol_versions":[1],"mode":"integration","server_version":"1.0.0"}}}}"#,
+            "incompatible",
+            "component_contract_mismatch",
+        ),
+        (
+            "version_not_string",
+            r#"{"code":0,"msg":"LEAK-parse","data":{"integration":{"agent24_knowledge":{"protocol_versions":[1],"mode":"integration","supported_operations":["search","read"],"server_version":1}}}}"#,
+            "failed",
+            "malformed",
+        ),
+    ];
+    for (label, body, state, reason) in cases {
+        let fake = serve(Script::Reply(200, (*body).to_owned())).await;
+        let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
+        let host = shown(&item);
+        assert_eq!(host["state"], *state, "{label}");
+        assert_eq!(host["reason"], *reason, "{label}");
+        assert!(
+            !host.to_string().contains("LEAK-parse"),
+            "{label} copied the message"
+        );
+        let redacted = render(std::slice::from_ref(&item), false).to_string();
+        assert!(!redacted.contains("LEAK-parse"), "{label}");
+        assert!(!redacted.contains(*reason), "{label} reason in redacted");
+    }
+}
