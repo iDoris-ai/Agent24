@@ -73,8 +73,8 @@ pub struct CommDaemonSlot(
     /// `stop_grace_ms`, or the daemon's global budget when that is shorter.
     Mutex<Duration>,
     /// Times this slot has locked [`BuildNote`]. Unit tests assert one GET
-    /// takes the lock once for both marks. Absent from the release binary.
-    #[cfg(test)]
+    /// takes the lock once for both marks. Kept in release builds: the
+    /// route-catalog source scan cannot skip `#[cfg(test)]` on a tuple field.
     std::sync::atomic::AtomicUsize,
 );
 
@@ -186,7 +186,6 @@ impl CommDaemonSlot {
             CancellationToken::new(),
             Mutex::new(BuildNote::default()),
             Mutex::new(Duration::ZERO),
-            #[cfg(test)]
             std::sync::atomic::AtomicUsize::new(0),
         )
     }
@@ -260,8 +259,7 @@ impl CommDaemonSlot {
     }
 
     fn note_lock(&self) -> std::sync::MutexGuard<'_, BuildNote> {
-        #[cfg(test)]
-        self.4.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.4.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.2
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -269,7 +267,7 @@ impl CommDaemonSlot {
 
     #[cfg(test)]
     fn build_note_locks(&self) -> usize {
-        self.4.load(std::sync::atomic::Ordering::SeqCst)
+        self.4.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn note(&self, rejection: Option<Rejection>, start_failed: bool) {
