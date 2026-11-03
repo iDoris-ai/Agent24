@@ -21,6 +21,7 @@ import {
   CreativeServeWeb,
   CreativeViewRequestFence,
   classifyCreativeUrl,
+  resolveNodeRuntimeExecutable,
 } from './creative-serve-web'
 import { OpenDesignComponentInstaller } from './open-design-component'
 import { OpenDesignStatusReporter, mapOpenDesignReport, postOpenDesignReport } from './open-design-report'
@@ -288,7 +289,7 @@ app.whenReady().then(async () => {
   creativeServeWeb = new CreativeServeWeb({
     resourcesPath: process.resourcesPath,
     stateRoot: path.join(app.getPath('userData'), 'creative', 'open-design'),
-    runtimeExecutable: process.execPath,
+    runtimeExecutable: resolveNodeRuntimeExecutable(),
     pinVersion: OPEN_DESIGN_PIN_VERSION,
     component: openDesignComponent ?? undefined,
   })

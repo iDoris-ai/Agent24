@@ -50,6 +50,24 @@ export interface CreativeServeWebOptions {
   agent24Cli?: string | null
 }
 
+/**
+ * The executable Open Design's Node children (headless launcher, daemon, web
+ * sidecar) run under ELECTRON_RUN_AS_NODE. On macOS this is the bundle's
+ * `<Name> Helper` (LSUIElement): running the main `Contents/MacOS/<Name>`
+ * directly registers each child as a foreground app, so `next-server` showed up
+ * in the Dock as a generic "exec" tile. Falls back to the main executable.
+ */
+export function resolveNodeRuntimeExecutable(
+  execPath: string = process.execPath,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform !== 'darwin') return execPath
+  const name = path.basename(execPath)
+  const contents = path.dirname(path.dirname(execPath))
+  const helper = path.join(contents, 'Frameworks', `${name} Helper.app`, 'Contents', 'MacOS', `${name} Helper`)
+  return fs.existsSync(helper) ? helper : execPath
+}
+
 /** `Contents/Resources/backend/agent24` inside the running Agent24.app, if present. */
 export function resolveBundledAgent24Cli(
   resources: string | undefined = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath,
