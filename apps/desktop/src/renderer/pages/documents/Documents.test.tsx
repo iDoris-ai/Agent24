@@ -220,6 +220,39 @@ describe('DocumentsPage: the list', () => {
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
+  it('T1-2: a slow capabilities reply from before the module was turned off does not take the notice away', async () => {
+    const stopping = () => err(503, 'module_stopping', 'this run has stopped and will not restart on its own')
+    let answerCaps: (r: Res) => void = () => {}
+    mount({
+      capabilities: () => new Promise<Res>((r) => { answerCaps = r }),
+      lists: [stopping],
+      moduleStatus: () => Promise.resolve({ bundled: true, installed: true, externalDaemon: false, turnedOff: true }),
+    })
+    render(<DocumentsPage />)
+    expect(await screen.findByText('文档模块已停用。到「模块管理」页启用后即可使用。')).toBeInTheDocument()
+    await act(async () => answerCaps({ ok: true, status: 200, data: { storage: { state: 'ready' } } }))
+    expect(screen.getByText('文档模块已停用。到「模块管理」页启用后即可使用。')).toBeInTheDocument()
+  })
+
+  it('T1-2: a slow "turned off" for capabilities does not bring the notice back after a newer list was served', async () => {
+    const stopping = () => err(503, 'module_stopping', 'this run has stopped and will not restart on its own')
+    const statusFor = { bundled: true, installed: true, externalDaemon: false, turnedOff: true }
+    let answerCapsStatus: (s: typeof statusFor) => void = () => {}
+    let calls = 0
+    const m = mount({
+      capabilities: stopping,
+      lists: [stopping, () => ok({ documents: [doc(1)], next_cursor: null })],
+      // The first ask is the capabilities reply's (its effect runs first); it is held back.
+      moduleStatus: () => (++calls === 1 ? new Promise((r) => { answerCapsStatus = r }) : Promise.resolve(statusFor)),
+    })
+    render(<DocumentsPage />)
+    expect(await screen.findByText('文档模块已停用。到「模块管理」页启用后即可使用。')).toBeInTheDocument()
+    act(() => m.event?.({ kind: 'document.imported', payload: { document_id: doc(1).document_id } }))
+    await waitFor(() => expect(screen.queryByText('文档模块已停用。到「模块管理」页启用后即可使用。')).toBeNull())
+    await act(async () => answerCapsStatus(statusFor))
+    expect(screen.queryByText('文档模块已停用。到「模块管理」页启用后即可使用。')).toBeNull()
+  })
+
   it('module_stopping while os.json says on (a crash): the raw error stays, no turned-off notice', async () => {
     const stopping = () => err(503, 'module_stopping', 'this run has stopped and will not restart on its own')
     mount({
