@@ -253,6 +253,13 @@ describe('DocumentsPage: the list', () => {
     expect(screen.queryByText('文档模块已停用。到「模块管理」页启用后即可使用。')).toBeNull()
   })
 
+  it('T1-2: capabilities alone saying "turned off" is enough (the list failed some other way)', async () => {
+    mount({ capabilities: () => err(503, 'module_disabled', 'module documents is disabled'), lists: [() => err(500, 'internal', 'list exploded')] })
+    render(<DocumentsPage />)
+    expect(await screen.findByText('文档模块已停用。到「模块管理」页启用后即可使用。')).toBeInTheDocument()
+    expect(screen.getByText(/list exploded/)).toBeInTheDocument()
+  })
+
   it('module_stopping while os.json says on (a crash): the raw error stays, no turned-off notice', async () => {
     const stopping = () => err(503, 'module_stopping', 'this run has stopped and will not restart on its own')
     mount({
