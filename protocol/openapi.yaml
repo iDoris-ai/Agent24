@@ -3332,13 +3332,18 @@ paths:
         data.installable indicates a platform the lock has an asset for.
         data.installed_version is the component tag (v0.30.0) after full hash revalidation,
         or null when absent or rejected. Developer and sibling binaries do not count as installed components.
+        data.rejection (see HyphaeRejection) is always present: why the last start or
+        install rebuild refused the Hyphae binary it found (signature_rejected: the
+        at-rest code-signature check failed; hash_mismatch: the SHA-256 differs from the
+        lock), or null when nothing was refused (including when nothing is installed).
+        It is cleared by the next start or rebuild that does not refuse a binary.
       responses:
         "200":
-          description: Hyphae envelope `{ok:true,data}`
+          description: Hyphae envelope `{ok:true,data}` plus agent24d's component fields
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/CommOk"
+                $ref: "#/components/schemas/CommDaemonOk"
         "409":
           $ref: "#/components/responses/CommConflict"
         "503":
@@ -4795,6 +4800,15 @@ components:
       required: [modules]
       properties:
         modules: { type: array, items: { $ref: "#/components/schemas/AttachedView" } }
+    HyphaeRejection:
+      type: [string, "null"]
+      enum: [signature_rejected, hash_mismatch, null]
+      description: >-
+        Why agent24d refused the Hyphae binary at its last start or install rebuild:
+        signature_rejected (D2a at-rest check: Developer ID requirement, Team ID, Hardened
+        Runtime, or the checker could not run) or hash_mismatch (SHA-256 differs from the
+        lock). Null when nothing was refused. Exposed as GET /comm/daemon data.rejection and,
+        host view only, as the hyphae item's reason (state failed) in GET /components.
     ComponentState:
       type: string
       enum: [absent, installing, installed, starting, ready, degraded, stopping, stopped, incompatible, failed]
@@ -4823,7 +4837,12 @@ components:
           type: string
           enum: [resident, sidecar, cli, attach, remote, mcp]
         provides: { type: array, items: { $ref: "#/components/schemas/ComponentProvide" } }
-        reason: { type: string, description: Short machine-readable cause; host only }
+        reason:
+          type: string
+          description: >-
+            Short machine-readable cause; host only. For hyphae with state failed this
+            includes signature_rejected and hash_mismatch (see HyphaeRejection); a Hyphae
+            that is simply not installed is state absent with no reason.
         detail: { type: object, additionalProperties: true, description: "Ports, contract expectation, counters, messages; host only" }
     ComponentRedactedView:
       type: object
@@ -7248,6 +7267,22 @@ components:
       properties:
         ok: { type: boolean, const: true }
         data: {}
+    CommDaemonOk:
+      description: >-
+        GET /comm/daemon: the Hyphae daemon status (`process`, `relay_probe`, `catch_up`)
+        with the fields agent24d adds about the installed component.
+      allOf:
+        - $ref: "#/components/schemas/CommOk"
+        - type: object
+          properties:
+            data:
+              type: object
+              additionalProperties: true
+              required: [installable, installed_version, rejection]
+              properties:
+                installable: { type: boolean }
+                installed_version: { type: [string, "null"], example: v0.30.0 }
+                rejection: { $ref: "#/components/schemas/HyphaeRejection" }
     CommGroup:
       type: object
       required: [group_id, name, state, creator_npub, members, updated_at]
