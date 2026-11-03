@@ -32,7 +32,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
 use agent24_protocol::state_file::AuthMode;
@@ -418,14 +418,22 @@ impl KnowledgeHostRegistry {
             .is_ok_and(|entries| entries.values().any(|entry| entry.active))
     }
 
-    /// Active bindings that name an endpoint, one per base URL. A URL that has
-    /// a live credential wins over the same URL without one.
+    /// Active bindings that name an endpoint, one per base URL.
+    ///
+    /// A live credential beats the same URL with none, because its seq is at
+    /// least 1. Several live credentials use the greatest seq, then the
+    /// greatest `(host, binding)`. `HashMap` iteration order is not the rule.
+    /// A poisoned `entries` lock still yields the records (`into_inner`); an
+    /// empty list would show a configured binding as `stopped`.
     pub(crate) fn probe_targets(&self, now: UnixSeconds) -> Vec<ProbeTarget> {
-        let Ok(entries) = self.entries.lock() else {
-            return Vec::new();
-        };
-        let mut by_url: BTreeMap<String, ProbeTarget> = BTreeMap::new();
-        for entry in entries.values() {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        struct Choice {
+            epoch: u64,
+            owner: (String, String),
+            target: ProbeTarget,
+        }
+        let mut by_url: BTreeMap<String, Choice> = BTreeMap::new();
+        for (owner, entry) in entries.iter() {
             if !entry.active {
                 continue;
             }
@@ -444,20 +452,30 @@ impl KnowledgeHostRegistry {
             let base_url = endpoint.base_url.clone();
             let replace = match by_url.get(&base_url) {
                 None => true,
-                Some(prev) => prev.credential.is_none() && credential.is_some(),
+                Some(prev) => (epoch, owner) > (prev.epoch, &prev.owner),
             };
             if replace {
                 by_url.insert(
                     base_url.clone(),
-                    ProbeTarget {
-                        base_url,
-                        credential,
-                        credential_epoch: epoch,
+                    Choice {
+                        epoch,
+                        owner: owner.clone(),
+                        target: ProbeTarget {
+                            base_url,
+                            credential,
+                            credential_epoch: epoch,
+                        },
                     },
                 );
             }
         }
-        by_url.into_values().collect()
+        by_url.into_values().map(|choice| choice.target).collect()
+    }
+
+    /// How many component reads are waiting on the current capabilities flight.
+    #[cfg(test)]
+    pub(crate) fn inflight_receivers(&self) -> usize {
+        self.probes.inflight_receivers()
     }
 
     /// D5 remote subset for Knowledge, from a cached capabilities probe.

@@ -214,7 +214,7 @@ CLI 绑定额外规定（和 `agent24-comm/src/runner.rs` 现有约定一致）�
 - 常驻型（iDoris serve、Hyphae daemon、sidecar）：全集。
 - 按次调用型 CLI：没有 `starting / ready / degraded / stopping / stopped`，只用 `absent / installing / installed / incompatible / failed`。
 - attach（AgentEar）：没有 `absent / installing / installed`（Agent24 不管安装）；未连接显示为 `stopped`，连接中 `starting`，握手过 `ready`，连接断开回 `stopped`。
-- 远端服务（Knowledge）：没有 `absent / installing / installed / stopping`；未配置显示为 `stopped`，连接失败 `failed`，探测失败 `degraded`。
+- 远端服务（Knowledge）：没有 `absent / installing / installed / stopping`；未配置显示为 `stopped`，连不上、超时或 HTTP 非 2xx 为 `failed`，缺 search/read 为 `degraded`。
 - MCP：`installed / starting / ready / failed / stopped`。
 
 与现有三套状态的映射（C3 实现时用这张表，不另造）：

@@ -635,8 +635,15 @@ fn configured(base: &str) -> KnowledgeHostRegistry {
     registry
 }
 
+/// `limits` from `protocol/knowledge/fixtures/v1/capabilities.integration.json`
+/// (the object `capabilities.schema.json` requires next to `server_version`).
+const SCHEMA_LIMITS: &str = r#""limits":{"max_results":50,"max_concurrency":4,"max_deadline_ms":30000,"max_read_bytes":262144,"max_page_limit":100,"max_snippet_bytes":2048}"#;
+
 fn ready_body() -> String {
-    r#"{"code":0,"msg":"LEAK-msg-9f3a","data":{"edition":"lite","x_unknown":1,"integration":{"other":{},"agent24_knowledge":{"protocol_versions":[1,2],"mode":"integration","supported_operations":["search","read","ingest"],"server_version":"0.8.2","future_field":true}}}}"#.to_owned()
+    format!(
+        r#"{{"code":0,"msg":"LEAK-msg-9f3a","data":{{"edition":"lite","x_unknown":1,"integration":{{"other":{{}},"agent24_knowledge":{{"protocol_versions":[1,2],"mode":"integration","supported_operations":["search","read","ingest"],"server_version":"0.8.2",{limits},"future_field":true}}}}}}}}"#,
+        limits = SCHEMA_LIMITS,
+    )
 }
 
 #[derive(Clone)]
@@ -786,7 +793,10 @@ async fn a_complete_capabilities_document_is_ready() {
 
 #[tokio::test]
 async fn a_missing_required_operation_is_degraded() {
-    let body = r#"{"code":0,"msg":"LEAK-degraded-msg","data":{"integration":{"agent24_knowledge":{"protocol_versions":[1],"mode":"integration","supported_operations":["search","ingest"],"server_version":"1.2.3"}}}}"#;
+    let body = format!(
+        r#"{{"code":0,"msg":"LEAK-degraded-msg","data":{{"integration":{{"agent24_knowledge":{{"protocol_versions":[1],"mode":"integration","supported_operations":["search","ingest"],"server_version":"1.2.3",{limits}}}}}}}}}"#,
+        limits = SCHEMA_LIMITS,
+    );
     let fake = serve(Script::Reply(200, body.to_owned())).await;
     let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
     let host = shown(&item);
@@ -847,7 +857,10 @@ async fn an_upstream_error_code_is_kept_and_its_message_is_not() {
 
 #[tokio::test]
 async fn a_different_contract_major_is_incompatible() {
-    let body = r#"{"data":{"integration":{"agent24_knowledge":{"protocol_versions":[2,3],"mode":"integration","supported_operations":["search","read"],"server_version":"9.9.9"}}}}"#;
+    let body = format!(
+        r#"{{"data":{{"integration":{{"agent24_knowledge":{{"protocol_versions":[2,3],"mode":"integration","supported_operations":["search","read"],"server_version":"9.9.9",{limits}}}}}}}}}"#,
+        limits = SCHEMA_LIMITS,
+    );
     let fake = serve(Script::Reply(200, body.to_owned())).await;
     let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
     let host = shown(&item);
@@ -868,7 +881,10 @@ async fn a_different_contract_major_is_incompatible() {
 
 #[tokio::test]
 async fn standalone_mode_is_incompatible_and_its_version_text_is_not_copied() {
-    let body = r#"{"code":0,"msg":"LEAK-mode-msg","data":{"integration":{"agent24_knowledge":{"protocol_versions":[1],"mode":"standalone","supported_operations":["search","read"],"server_version":"1.0 LEAK-ver-77"}}}}"#;
+    let body = format!(
+        r#"{{"code":0,"msg":"LEAK-mode-msg","data":{{"integration":{{"agent24_knowledge":{{"protocol_versions":[1],"mode":"standalone","supported_operations":["search","read"],"server_version":"1.0 LEAK-ver-77",{limits}}}}}}}}}"#,
+        limits = SCHEMA_LIMITS,
+    );
     let fake = serve(Script::Reply(200, body.to_owned())).await;
     let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
     let host = shown(&item);
@@ -971,7 +987,10 @@ async fn a_stall_fails_as_timeout_without_the_client_error_text() {
 #[tokio::test]
 async fn rotating_the_credential_probes_again_and_the_secret_is_not_shown() {
     let secret = "probe-secret-value";
-    let anon = r#"{"data":{"integration":{"agent24_knowledge":{"protocol_versions":[1],"mode":"integration","supported_operations":["search"],"server_version":"0.1.0"}}}}"#;
+    let anon = format!(
+        r#"{{"data":{{"integration":{{"agent24_knowledge":{{"protocol_versions":[1],"mode":"integration","supported_operations":["search"],"server_version":"0.1.0",{limits}}}}}}}}}"#,
+        limits = SCHEMA_LIMITS,
+    );
     let ok = ready_body();
     let fake = serve(Script::Bearer {
         secret: secret.to_owned(),
@@ -1081,6 +1100,24 @@ async fn an_unusable_capabilities_declaration_is_not_ready() {
             "failed",
             "malformed",
         ),
+        (
+            "server_version_absent",
+            r#"{"code":0,"msg":"LEAK-parse","data":{"integration":{"agent24_knowledge":{"protocol_versions":[1],"mode":"integration","supported_operations":["search","read"],"limits":{"max_results":50,"max_concurrency":4,"max_deadline_ms":30000,"max_read_bytes":262144,"max_page_limit":100,"max_snippet_bytes":2048}}}}}"#,
+            "incompatible",
+            "component_contract_mismatch",
+        ),
+        (
+            "limits_absent",
+            r#"{"code":0,"msg":"LEAK-parse","data":{"integration":{"agent24_knowledge":{"protocol_versions":[1],"mode":"integration","supported_operations":["search","read"],"server_version":"1.0.0"}}}}"#,
+            "incompatible",
+            "component_contract_mismatch",
+        ),
+        (
+            "limits_not_object",
+            r#"{"code":0,"msg":"LEAK-parse","data":{"integration":{"agent24_knowledge":{"protocol_versions":[1],"mode":"integration","supported_operations":["search","read"],"server_version":"1.0.0","limits":1}}}}"#,
+            "failed",
+            "malformed",
+        ),
     ];
     for (label, body, state, reason) in cases {
         let fake = serve(Script::Reply(200, (*body).to_owned())).await;
@@ -1096,4 +1133,111 @@ async fn an_unusable_capabilities_declaration_is_not_ready() {
         assert!(!redacted.contains("LEAK-parse"), "{label}");
         assert!(!redacted.contains(*reason), "{label} reason in redacted");
     }
+}
+
+/// HTTP 200 with a non-success envelope code. `data` is an object, so parsing
+/// it would miss the upstream failure.
+#[tokio::test]
+async fn an_upstream_code_with_a_data_object_is_not_a_declaration() {
+    let body = r#"{"code":401,"msg":"LEAK-data-object","data":{}}"#;
+    let fake = serve(Script::Reply(200, body.to_owned())).await;
+    let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
+    let host = shown(&item);
+    assert_eq!(host["state"], "failed");
+    assert_eq!(host["reason"], "upstream_401");
+    assert_no_canary(&item, &["LEAK-data-object"]);
+}
+
+/// The task that became the probe leader is aborted while the remote is held.
+/// The waiter must probe again and observe the remote, not a synthetic failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aborted_probe_leader_lets_the_waiter_reach_ready() {
+    let go = Arc::new(AtomicBool::new(false));
+    let fake = serve(Script::Hold(Arc::clone(&go), ready_body())).await;
+    let registry = Arc::new(configured(&fake.base));
+    let t0 = Instant::now();
+
+    let leader = {
+        let registry = Arc::clone(&registry);
+        tokio::spawn(async move { knowledge_item(&registry, t0).await })
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while fake.hits.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < deadline, "leader did not reach the remote");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let mut waiter = {
+        let registry = Arc::clone(&registry);
+        tokio::spawn(async move { knowledge_item(&registry, t0).await })
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while registry.inflight_receivers() < 1 {
+        assert!(
+            Instant::now() < deadline,
+            "waiter did not join the flight, hits={}",
+            fake.hits.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        fake.hits.load(Ordering::SeqCst),
+        1,
+        "waiter probed before the leader was cancelled"
+    );
+
+    leader.abort();
+    match leader.await {
+        Err(err) => assert!(err.is_cancelled(), "{err}"),
+        Ok(_) => panic!("leader finished instead of being cancelled"),
+    }
+
+    let second = async {
+        while fake.hits.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    // `&mut waiter` so a losing branch does not abort the task.
+    tokio::select! {
+        biased;
+        joined = &mut waiter => {
+            panic!("waiter finished before probing again: {:?}", joined.map(|item| item.state));
+        }
+        () = second => {}
+        () = tokio::time::sleep(Duration::from_secs(2)) => {
+            panic!(
+                "waiter did not probe again, hits={}",
+                fake.hits.load(Ordering::SeqCst)
+            );
+        }
+    }
+
+    go.store(true, Ordering::SeqCst);
+    let item = tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.state, ComponentState::Ready);
+    assert!(item.reason.is_none());
+}
+
+#[test]
+fn adr_038_d5_names_timeout_and_http_errors_as_failed() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../docs/adr/ADR-038-component-contract-v1.md");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let line = text
+        .lines()
+        .find(|line| line.contains("远端服务（Knowledge）"))
+        .unwrap();
+    assert!(line.contains("超时"), "{line}");
+    assert!(line.contains("非 2xx"), "{line}");
+    assert!(line.contains("`failed`"), "{line}");
+    assert!(line.contains("`degraded`"), "{line}");
+    assert!(line.contains("search"), "{line}");
+    assert!(line.contains("read"), "{line}");
+    assert!(
+        !line.contains("探测失败"),
+        "probe failure is not the degraded bucket: {line}"
+    );
 }

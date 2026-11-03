@@ -1138,3 +1138,128 @@ async fn a_session_holding_knowledge_results_without_a_pin_is_refused() {
         "another tool's results: {body}"
     );
 }
+
+fn activate_with_credential(
+    registry: &KnowledgeHostRegistry,
+    binding: &str,
+    url: &str,
+    activate_seq: u64,
+    credential_seq: u64,
+    secret: &str,
+    expires: UnixSeconds,
+) {
+    registry
+        .activate(
+            "host",
+            binding,
+            activate_seq,
+            Endpoint {
+                base_url: url.to_owned(),
+                knowledge_base_ids: vec!["kb".into()],
+            },
+        )
+        .unwrap();
+    registry
+        .push_credential(
+            "host",
+            binding,
+            credential_seq,
+            Credential::Bearer(secret.to_owned()),
+            expires,
+        )
+        .unwrap();
+}
+
+/// Same base URL, two live credentials. The greatest seq is the one probed.
+/// Repeating with fresh maps catches a choice that follows `HashMap` order.
+#[test]
+fn the_same_base_url_keeps_the_highest_credential_seq() {
+    let now = unix_now();
+    let later = now + 600;
+    let url = "http://127.0.0.1:9/api/v1";
+    for n in 0..16 {
+        let registry = KnowledgeHostRegistry::default();
+        let low_name = format!("low{n}");
+        let high_name = format!("high{n}");
+        let (low_binding, high_binding) = if n % 2 == 0 {
+            (&low_name, &high_name)
+        } else {
+            (&high_name, &low_name)
+        };
+        activate_with_credential(&registry, low_binding, url, 1, 2, "low-secret", later);
+        activate_with_credential(&registry, high_binding, url, 3, 9, "high-secret", later);
+        let targets = registry.probe_targets(now);
+        assert_eq!(targets.len(), 1, "round {n}");
+        assert_eq!(targets[0].credential_epoch, 9, "round {n}");
+        assert_eq!(
+            targets[0].credential.as_ref(),
+            Some(&agent24_knowledge::Credential::Bearer("high-secret".into())),
+            "round {n}"
+        );
+    }
+
+    // Equal seq: greatest (host, binding), not whichever record was visited first.
+    for n in 0..16 {
+        let registry = KnowledgeHostRegistry::default();
+        let left = format!("a{n}");
+        let right = format!("b{n}");
+        activate_with_credential(&registry, &left, url, 1, 4, "left-secret", later);
+        activate_with_credential(&registry, &right, url, 2, 4, "right-secret", later);
+        let targets = registry.probe_targets(now);
+        assert_eq!(targets.len(), 1, "tie {n}");
+        assert_eq!(targets[0].credential_epoch, 4, "tie {n}");
+        assert_eq!(
+            targets[0].credential.as_ref(),
+            Some(&agent24_knowledge::Credential::Bearer(
+                "right-secret".into()
+            )),
+            "tie {n}"
+        );
+    }
+
+    // A live credential still beats the same URL with none.
+    let registry = KnowledgeHostRegistry::default();
+    registry
+        .activate(
+            "host",
+            "bare",
+            1,
+            Endpoint {
+                base_url: url.to_owned(),
+                knowledge_base_ids: vec!["kb".into()],
+            },
+        )
+        .unwrap();
+    activate_with_credential(&registry, "with-c", url, 1, 2, "only-secret", later);
+    let targets = registry.probe_targets(now);
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].credential_epoch, 2);
+}
+
+#[test]
+fn a_poisoned_entries_lock_still_lists_probe_targets() {
+    let registry = KnowledgeHostRegistry::default();
+    registry
+        .activate(
+            "host",
+            "b1",
+            1,
+            Endpoint {
+                base_url: "http://127.0.0.1:9/api/v1".to_owned(),
+                knowledge_base_ids: vec!["kb".into()],
+            },
+        )
+        .unwrap();
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = registry.entries.lock().unwrap();
+        panic!("poison entries");
+    }));
+    assert!(poisoned.is_err());
+    let targets = registry.probe_targets(0);
+    assert_eq!(
+        targets.len(),
+        1,
+        "a poisoned entries lock must not look unconfigured"
+    );
+    assert_eq!(targets[0].base_url, "http://127.0.0.1:9/api/v1");
+}

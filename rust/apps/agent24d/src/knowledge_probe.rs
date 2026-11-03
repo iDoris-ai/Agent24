@@ -5,8 +5,12 @@
 //!
 //! - no endpoint configured → `stopped` (`not_configured`)
 //! - TCP/TLS/timeout, or a non-2xx answer → `failed`, reason is a fixed code
-//! - declaration missing, `mode` is not `integration`, or major `1` is absent
-//!   (READONLY R9.4, D3) → `incompatible` (`component_contract_mismatch`)
+//! - an envelope `code` other than success (`0` / `"ok"`) → `failed`
+//!   (`upstream_<code>`), and `data` is not read as a declaration
+//! - declaration missing, a required field absent (`protocol_versions`, `mode`,
+//!   `supported_operations`, `server_version`, `limits` — READONLY R9.2), `mode`
+//!   is not `integration`, or major `1` is absent (READONLY R9.4, D3) →
+//!   `incompatible` (`component_contract_mismatch`)
 //! - major `1` and `integration`, but `search` or `read` is absent (READONLY R9.2;
 //!   OPS-v1 does not add a required operation yet) → `degraded`
 //!   (`missing_capability:<name>`)
@@ -139,7 +143,9 @@ struct CacheInner {
 }
 
 /// Shared by every `GET /api/v1/components`. One in-flight probe per endpoint
-/// set; callers that arrive while it runs wait for that answer.
+/// set; callers that arrive while it runs wait for that answer. A cancelled
+/// leader only removes its flight. It does not publish a failure; waiters
+/// enter `assess` again.
 #[derive(Default)]
 pub(crate) struct KnowledgeProbeCache {
     inner: Mutex<CacheInner>,
@@ -157,6 +163,9 @@ impl Drop for FlightGuard<'_> {
         if self.finished {
             return;
         }
+        // The leader was cancelled before it published. Drop the flight and
+        // close the channel with no value. A synthetic `transport` failure
+        // would be this task's cancellation, not the remote's answer.
         let Some(tx) = self.tx.take() else {
             return;
         };
@@ -167,7 +176,7 @@ impl Drop for FlightGuard<'_> {
             .unwrap_or_else(PoisonError::into_inner);
         guard.flights.remove(&self.fingerprint);
         drop(guard);
-        let _ = tx.send(Some(Judged::failed("transport", probed_at_now()).view()));
+        drop(tx);
     }
 }
 
@@ -177,63 +186,85 @@ impl KnowledgeProbeCache {
             return not_configured();
         }
         let fingerprint = fingerprint(targets);
-        enum Role {
-            Hit(ProbeView),
-            Wait(watch::Receiver<Option<ProbeView>>),
-            Lead(watch::Sender<Option<ProbeView>>),
-        }
-        let role = {
-            let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(entry) = &guard.entry
-                && entry.fingerprint == fingerprint
-                && now.saturating_duration_since(entry.at) < KNOWLEDGE_PROBE_TTL
-            {
-                Role::Hit(entry.view.clone())
-            } else if let Some(tx) = guard.flights.get(&fingerprint) {
-                Role::Wait(tx.subscribe())
-            } else {
-                let (tx, _rx) = watch::channel(None);
-                guard.flights.insert(fingerprint.clone(), tx.clone());
-                Role::Lead(tx)
+        loop {
+            enum Role {
+                Hit(ProbeView),
+                Wait(watch::Receiver<Option<ProbeView>>),
+                Lead(watch::Sender<Option<ProbeView>>),
             }
-        };
-        match role {
-            Role::Hit(view) => view,
-            Role::Wait(rx) => wait_flight(rx).await,
-            Role::Lead(tx) => {
-                let mut flight = FlightGuard {
-                    cache: self,
-                    fingerprint: fingerprint.clone(),
-                    tx: Some(tx),
-                    finished: false,
-                };
-                let view = probe_all(targets).await;
+            let role = {
+                let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(entry) = &guard.entry
+                    && entry.fingerprint == fingerprint
+                    && now.saturating_duration_since(entry.at) < KNOWLEDGE_PROBE_TTL
                 {
-                    let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-                    guard.entry = Some(CacheEntry {
+                    Role::Hit(entry.view.clone())
+                } else if let Some(tx) = guard.flights.get(&fingerprint) {
+                    Role::Wait(tx.subscribe())
+                } else {
+                    let (tx, _rx) = watch::channel(None);
+                    guard.flights.insert(fingerprint.clone(), tx.clone());
+                    Role::Lead(tx)
+                }
+            };
+            match role {
+                Role::Hit(view) => return view,
+                Role::Wait(rx) => {
+                    if let Some(view) = wait_flight(rx).await {
+                        return view;
+                    }
+                    // The leader left without a result. Try again: hit a
+                    // newer cache entry, wait on a new leader, or lead.
+                }
+                Role::Lead(tx) => {
+                    let mut flight = FlightGuard {
+                        cache: self,
                         fingerprint: fingerprint.clone(),
-                        at: now,
-                        view: view.clone(),
-                    });
-                    guard.flights.remove(&fingerprint);
+                        tx: Some(tx),
+                        finished: false,
+                    };
+                    let view = probe_all(targets).await;
+                    {
+                        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+                        guard.entry = Some(CacheEntry {
+                            fingerprint: fingerprint.clone(),
+                            at: now,
+                            view: view.clone(),
+                        });
+                        guard.flights.remove(&fingerprint);
+                    }
+                    if let Some(tx) = flight.tx.take() {
+                        let _ = tx.send(Some(view.clone()));
+                    }
+                    flight.finished = true;
+                    return view;
                 }
-                if let Some(tx) = flight.tx.take() {
-                    let _ = tx.send(Some(view.clone()));
-                }
-                flight.finished = true;
-                view
             }
         }
     }
+
+    /// Receivers parked on the current flight. Tests use this to abort the
+    /// leader only after a waiter has subscribed.
+    #[cfg(test)]
+    pub(crate) fn inflight_receivers(&self) -> usize {
+        let guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .flights
+            .values()
+            .map(watch::Sender::receiver_count)
+            .sum()
+    }
 }
 
-async fn wait_flight(mut rx: watch::Receiver<Option<ProbeView>>) -> ProbeView {
+/// `None` when the leader closed the channel without publishing. The last
+/// published value still counts if the send won the race with the drop.
+async fn wait_flight(mut rx: watch::Receiver<Option<ProbeView>>) -> Option<ProbeView> {
     loop {
         if let Some(view) = rx.borrow().clone() {
-            return view;
+            return Some(view);
         }
         if rx.changed().await.is_err() {
-            return Judged::failed("transport", probed_at_now()).view();
+            return rx.borrow().clone();
         }
     }
 }
@@ -462,22 +493,21 @@ fn probed_at_now() -> u64 {
 
 fn parse(body: &[u8]) -> Result<Decl, ParseError> {
     let value: Value = serde_json::from_slice(body).map_err(|_| ParseError::Malformed)?;
+    // A non-success envelope is the upstream's answer. `data: {}` (or a
+    // document that is not a declaration) must not be judged as the contract.
+    if let Some(code) = upstream_code(&value) {
+        return Err(ParseError::Upstream(code));
+    }
     if let Some(data) = value.get("data") {
-        if !data.is_null() {
-            return parse_data(data);
+        if data.is_null() {
+            return Err(ParseError::NoDeclaration);
         }
-        return match upstream_code(&value) {
-            Some(code) => Err(ParseError::Upstream(code)),
-            None => Err(ParseError::NoDeclaration),
-        };
+        return parse_data(data);
     }
     if value.get("integration").is_some() {
         return parse_data(&value);
     }
-    match upstream_code(&value) {
-        Some(code) => Err(ParseError::Upstream(code)),
-        None => Err(ParseError::NoDeclaration),
-    }
+    Err(ParseError::NoDeclaration)
 }
 
 fn parse_data(data: &Value) -> Result<Decl, ParseError> {
@@ -529,8 +559,15 @@ fn parse_data(data: &Value) -> Result<Decl, ParseError> {
     let server_version = match agent.get("server_version") {
         Some(Value::String(version)) => Some(version.clone()),
         Some(_) => return Err(ParseError::Malformed),
-        None => None,
+        None => return Err(ParseError::NoDeclaration),
     };
+    // READONLY R9.2 / capabilities.schema.json: `limits` is required, same as
+    // `server_version`. Absent → incompatible; the wrong JSON type → malformed.
+    match agent.get("limits") {
+        Some(Value::Object(_)) => {}
+        Some(_) => return Err(ParseError::Malformed),
+        None => return Err(ParseError::NoDeclaration),
+    }
     Ok(Decl {
         majors,
         mode,
