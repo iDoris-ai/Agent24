@@ -658,6 +658,45 @@ describe('CommIdentityExport elevated IPC', () => {
     expect(seen.filter((r) => r.url === '/api/v1/comm/identity/export')).toHaveLength(0)
   })
 
+  it('the parent destroyed or throwing while saveDialogParent brings it forward: cancelled, no dialog, no daemon call', async () => {
+    const noExport = () => expect(seen.filter((r) => r.url === '/api/v1/comm/identity/export')).toHaveLength(0)
+
+    // Still alive at the check before saveDialogParent. restore() destroys it
+    // while the window is being brought forward, so the anchor comes back null.
+    let destroyedOnRestore = false
+    const minimized = trackableParent({ minimized: true })
+    parentWindow = {
+      ...minimized,
+      isDestroyed: () => destroyedOnRestore,
+      restore: () => {
+        minimized.calls.push('restore')
+        destroyedOnRestore = true
+      },
+    }
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockResolvedValueOnce(PW)
+    const restored = await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(restored.data.error.code).toBe('cancelled')
+    expect(showSaveDialog).not.toHaveBeenCalled()
+    expect(minimized.calls).toContain('restore')
+    noExport()
+
+    resetLastCommExportForTests()
+    showSaveDialog.mockClear()
+    // focus() throws inside saveDialogParent. Same cancel, still no dialog.
+    const throwing = trackableParent()
+    parentWindow = {
+      ...throwing,
+      focus: () => { throw new Error('focus failed during restore') },
+    }
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockResolvedValueOnce(PW)
+    const focused = await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(focused.data.error.code).toBe('cancelled')
+    expect(showSaveDialog).not.toHaveBeenCalled()
+    noExport()
+  })
+
   it('the save dialog is a sheet on the starting window while it is visible and enabled', async () => {
     parentWindow = aliveParent()
     showMessageBox.mockResolvedValueOnce({ response: 0 })
