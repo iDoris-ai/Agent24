@@ -112,6 +112,7 @@ DEFAULT_MODEL=qwen3.8:27b OMLX_URL=http://127.0.0.1:1 /Applications/Agent24.app/
 ### 1.4 WeKnora 和样本知识库
 
 - 一个 WeKnora fork（`a24/develop`）实例。官方镜像里没有 Agent24 用的接口，不能用。起法见 `docs/agent/KB-M5-ACCEPTANCE.md` 的「WeKnora 怎么起」：用 fork 的 `scripts/agent24/probe/build-local-app.sh` 构建镜像，app 容器设 `AGENT24_KNOWLEDGE_TAG_KEY`。
+- **建数据用 standalone，Agent24 连 integration。** 同一个数据库上起两个 app：standalone app 用来建库、导入 S01、建检索密钥，Web 界面也在这里；integration app（`AGENT24_KNOWLEDGE_MODE=integration`）只给 Agent24 用。下文 D-02 填的接口地址是 **integration app** 的地址。App 只认 integration 模式的服务端，填 standalone 的地址，知识库会被判为不兼容，E、W、F、G 组都会失败。
 - 里面要有一个导入了 S01 样本的知识库，再加一把**只对这个库有效**的检索密钥。W-01 还要用到第二个库的 ID（随便一个别的库）。
 - 由 Knowledge 线准备演示栈，交给你四样东西：接口地址、知识库 ID、检索密钥，以及**访问方式**。**密钥不要写进仓库和 PR**。
 - 访问方式：演示栈跑在 Knowledge 线的构建机上，只监听那台机器的本机端口。设置页只接受 https 或 `http://127.0.0.1`，所以要先把端口转发到你自己机器的 127.0.0.1。两种做法，验收前和 Knowledge 线约定用哪一种：
