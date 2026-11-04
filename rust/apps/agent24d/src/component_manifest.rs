@@ -145,6 +145,10 @@ mod tests {
             if !capability_id_ok(id) || id == "id" {
                 continue;
             }
+            assert!(
+                cells.len() > 5,
+                "REGISTRY.md row has too few columns for the 提供方 column (index 5): {line}"
+            );
             seen.push((id.to_owned(), cells[5].to_owned()));
         }
         let mut table: Vec<_> = REGISTERED_PROVIDERS

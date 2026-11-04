@@ -515,10 +515,7 @@ pub(crate) fn documents_provide_ids() -> Vec<String> {
 fn documents_item(state: &AppState) -> Item {
     // A package that only borrowed the name (refused as `reserved_component_name`)
     // is not Documents; it is listed on its own row by `os_module_items`.
-    let report = state
-        .os_reports
-        .iter()
-        .find(|r| r.name == "documents" && !squats_builtin_name(&r.outcome));
+    let report = documents_report(state);
     let live = report.and_then(|_| {
         state
             .module_status
@@ -567,14 +564,34 @@ fn squats_builtin_name(outcome: &MountOutcome) -> bool {
     )
 }
 
+fn is_refused(outcome: &MountOutcome) -> bool {
+    matches!(
+        outcome,
+        MountOutcome::Refused(_) | MountOutcome::RefusedFor(..)
+    )
+}
+
+/// The report [`documents_item`] describes: the first one named `documents`
+/// that is not a name squatter.
+fn documents_report(state: &AppState) -> Option<&MountReport> {
+    state
+        .os_reports
+        .iter()
+        .find(|r| r.name == "documents" && !squats_builtin_name(&r.outcome))
+}
+
 fn os_module_items(state: &AppState) -> Vec<Item> {
+    let documents = documents_report(state).map(std::ptr::from_ref);
     let mut reports: Vec<_> = state
         .os_reports
         .iter()
-        // A squatter keeps its row (the id is made unique by `dedupe_component_ids`),
-        // so a refused package is never invisible.
+        // A refused package keeps its row even when it carries a builtin name
+        // (a squatter, or a second directory with the same name), so a refusal
+        // is never invisible; `dedupe_component_ids` makes its id unique. The
+        // builtin's own report is not listed twice.
         .filter(|r| {
-            squats_builtin_name(&r.outcome) || !BUILTIN_COMPONENT_IDS.contains(&r.name.as_str())
+            !BUILTIN_COMPONENT_IDS.contains(&r.name.as_str())
+                || (is_refused(&r.outcome) && documents != Some(std::ptr::from_ref(*r)))
         })
         .collect();
     reports.sort_by(|a, b| a.name.cmp(&b.name));
@@ -623,7 +640,7 @@ fn os_module_items(state: &AppState) -> Vec<Item> {
                 if let Some(message) = message {
                     detail["message"] = json!(message);
                 }
-                if squats_builtin_name(&report.outcome) {
+                if BUILTIN_COMPONENT_IDS.contains(&report.name.as_str()) {
                     detail["package"] = json!(report.name);
                 }
                 i.detail = Some(detail);

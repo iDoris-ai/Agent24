@@ -565,7 +565,7 @@ fn component_name_allowed(name: &str) -> bool {
 /// A module's `provides` against REGISTRY.md and the ids earlier modules took.
 fn capability_refusal(
     d9: &crate::component_manifest::OsD9,
-    claimed_caps: &std::collections::BTreeMap<String, String>,
+    reports: &[MountReport],
 ) -> Option<(RefusalReason, String)> {
     if let Some(id) = d9.reserved_capability() {
         return Some((
@@ -577,28 +577,35 @@ fn capability_refusal(
             ),
         ));
     }
+    // An id is held by an earlier module that was NOT refused, whatever else
+    // happened to it (mounted, disabled, degraded). A module refused later for
+    // another reason (a manifest that disagrees with its entry, say) holds
+    // nothing, so it cannot make a valid later package look like a duplicate.
     d9.provides.iter().find_map(|p| {
-        claimed_caps
-            .get(&p.id)
-            .filter(|owner| **owner != d9.name)
+        reports
+            .iter()
+            .filter(|r| {
+                !matches!(
+                    r.outcome,
+                    MountOutcome::Refused(_) | MountOutcome::RefusedFor(..)
+                )
+            })
+            .find(|r| {
+                r.name != d9.name
+                    && r.d9
+                        .as_ref()
+                        .is_some_and(|other| other.provides.iter().any(|q| q.id == p.id))
+            })
             .map(|owner| {
                 (
                     RefusalReason::DuplicateCapabilityId,
-                    format!("capability id {:?} is already declared by {owner:?}", p.id),
+                    format!(
+                        "capability id {:?} is already declared by {:?}",
+                        p.id, owner.name
+                    ),
                 )
             })
     })
-}
-
-fn claim_capabilities(
-    d9: &crate::component_manifest::OsD9,
-    claimed_caps: &mut std::collections::BTreeMap<String, String>,
-) {
-    for p in &d9.provides {
-        claimed_caps
-            .entry(p.id.clone())
-            .or_insert_with(|| d9.name.clone());
-    }
 }
 
 /// Whether a module's declared resources are present.
@@ -1153,11 +1160,8 @@ pub async fn mount_all(
     // erase path has an explicit list instead of prefix-matching storage keys.
     let mut partitions = crate::os_memory::OsMemoryCatalog::default();
     let mut claimed: BTreeSet<String> = BTreeSet::new();
-    // Capability id -> the module that declared it first. Ids are global
-    // (REGISTRY.md); the first module in catalogue order keeps one, a later one
-    // declaring it is refused, as the second MCP server with the same id is.
-    let mut claimed_caps: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
+    // Capability ids are global (REGISTRY.md): the first module in catalogue
+    // order that is not refused keeps one, see [`capability_refusal`].
 
     // A name in the file that no build provides is a typo, and the two halves of
     // that mistake are NOT equally dangerous.
@@ -1361,7 +1365,7 @@ pub async fn mount_all(
         // Admission, like the checks above: a disabled package is refused too,
         // so "disabled" cannot hide it.
         if let Some(d9) = &catalogue_d9
-            && let Some((reason, why)) = capability_refusal(d9, &claimed_caps)
+            && let Some((reason, why)) = capability_refusal(d9, &reports)
         {
             refuse_with(
                 MountOutcome::RefusedFor(reason, why),
@@ -1372,10 +1376,6 @@ pub async fn mount_all(
             );
             continue;
         }
-        if let Some(d9) = &catalogue_d9 {
-            claim_capabilities(d9, &mut claimed_caps);
-        }
-
         // POLICY: an unreadable registry, then the user's switch. Neither
         // CONSTRUCTS anything — which is what lets a user switch off a module whose
         // constructor is what breaks the daemon.
@@ -1516,7 +1516,7 @@ pub async fn mount_all(
         }
 
         if let Some(d9) = &manifest_d9
-            && let Some((reason, why)) = capability_refusal(d9, &claimed_caps)
+            && let Some((reason, why)) = capability_refusal(d9, &reports)
         {
             refuse_with(
                 MountOutcome::RefusedFor(reason, why),
@@ -1525,10 +1525,6 @@ pub async fn mount_all(
             );
             continue;
         }
-        if let Some(d9) = &manifest_d9 {
-            claim_capabilities(d9, &mut claimed_caps);
-        }
-
         let granted = Grants::granting(manifest.kernel_capabilities(), KERNEL_GRANTS);
         let granted_names: Vec<String> = granted.iter().map(|c| c.as_str().to_owned()).collect();
 
@@ -3790,6 +3786,46 @@ raise SystemExit(3)
         assert!(refused("gamma"));
         // gamma was refused, so it never claimed `gamma-own`.
         assert!(!refused("delta"), "{:?}", outcome_of(&reports, "delta"));
+    }
+
+    /// F1 (#1578): a module refused for another reason holds no capability id.
+    /// `alpha` declares `shared-cap` and is then refused (a package whose
+    /// manifest says in-process); `beta` declaring the same id must mount.
+    #[tokio::test]
+    async fn a_module_refused_for_another_reason_does_not_hold_its_capability_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let alpha_yaml = format!(
+            "{}\nprovides:\n  - id: shared-cap\n",
+            manifest_yaml("alpha", "in_process_crate")
+        );
+        let alpha = Installed {
+            name: "alpha".to_owned(),
+            version: "0.1.0".to_owned(),
+            build: Build::Package(Box::new(Package {
+                manifest: DomainOsManifest::from_yaml(&alpha_yaml).unwrap(),
+                dir: tmp.path().join("alpha"),
+                digest: "sha256:00".to_owned(),
+            })),
+        };
+        let beta = FakeModule::from_yaml(
+            &format!(
+                "{}\nprovides:\n  - id: shared-cap\n",
+                manifest_yaml("beta", "in_process_crate")
+            ),
+            false,
+        );
+        let (_, reports) = mount(&[alpha, entry(beta)], tmp.path(), &hub).await;
+        assert!(
+            matches!(outcome_of(&reports, "alpha"), MountOutcome::Refused(_)),
+            "{:?}",
+            outcome_of(&reports, "alpha")
+        );
+        assert!(
+            matches!(outcome_of(&reports, "beta"), MountOutcome::Mounted),
+            "{:?}",
+            outcome_of(&reports, "beta")
+        );
     }
 
     /// A daemon that cannot start processes still mounts everything else; each
