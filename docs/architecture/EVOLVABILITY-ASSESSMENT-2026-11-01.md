@@ -5,6 +5,8 @@
 > 对应 main `bb434b61`。这是三步评审的最终版：Opus 初评 → Codex gpt-6-astra 独立评估 → Fable 裁判对照代码整合。
 > 输入：[Opus 初评](EVOLVABILITY-ASSESSMENT-2026-11-01-opus.md)、[Codex astra 评估](EVOLVABILITY-ASSESSMENT-2026-11-01-codex-astra.md)。
 > 裁判只做静态核查（grep / 读源码），不构建、不测试。
+>
+> **附注（2026-11-05）**：本评估写于 main `bb434b61`，之后有几条事实变了。表中「`fetch_verified` 依赖 iDoris 锁结构：成立」已被 ADR-038 C1（#1539）修掉：`ComponentLock` 和下载器在 `agent24-components`，`idoris` 反过来依赖它，`fetch_verified` 已不存在；Hyphae 锁已有 schema-2 契约、签名和能力字段，但运行期契约检查仍未接。「ARCHITECTURE-LAYERS.md 过时」一条已由架构优化方案第 0 期 S0-5 重新生成处理，见 [ARCHITECTURE-LAYERS.md](../ARCHITECTURE-LAYERS.md) 与 `scripts/gen-layer-deps.py`。行号漂移（`main.rs:111` 现为 `:114` 等）见 R3 §4.2。本文正文不改。
 
 ## 结论
 
