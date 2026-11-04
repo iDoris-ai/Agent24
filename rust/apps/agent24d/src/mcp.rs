@@ -569,9 +569,62 @@ fn watch_liveness(
 
 #[cfg(test)]
 mod tests {
+
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    fn record(id: &str, state: ComponentState, reason: Option<&str>) -> McpRecord {
+        McpRecord {
+            server: id.to_owned(),
+            id: id.to_owned(),
+            state,
+            reason: reason.map(str::to_owned),
+            capability_id: None,
+            tools: Vec::new(),
+            protocol_version: None,
+        }
+    }
+
+    /// `note_liveness` only moves `starting` and `ready`. A terminal row keeps the
+    /// state and reason it already has: a late "the child ended" must not turn a
+    /// `disabled` stop or a `start_timeout` failure into something else.
+    #[test]
+    fn note_liveness_leaves_terminal_rows_alone() {
+        let roster = McpRoster::from_records(vec![
+            record("a-disabled", ComponentState::Stopped, Some("disabled")),
+            record("b-timeout", ComponentState::Failed, Some("start_timeout")),
+            record("c-ready", ComponentState::Ready, None),
+            record("d-starting", ComponentState::Starting, None),
+        ]);
+        for id in ["a-disabled", "b-timeout", "c-ready", "d-starting"] {
+            roster.note_liveness(id, false);
+            roster.note_liveness(id, true);
+        }
+        let by_id = |id: &str| roster.records().into_iter().find(|r| r.id == id).unwrap();
+        let a = by_id("a-disabled");
+        assert_eq!(
+            (a.state, a.reason.as_deref()),
+            (ComponentState::Stopped, Some("disabled"))
+        );
+        let b = by_id("b-timeout");
+        assert_eq!(
+            (b.state, b.reason.as_deref()),
+            (ComponentState::Failed, Some("start_timeout"))
+        );
+        // Positive control: a live row does move (to failed first; the second,
+        // stopped_by_us call then finds it terminal and leaves it failed).
+        let c = by_id("c-ready");
+        assert_eq!(
+            (c.state, c.reason.as_deref()),
+            (ComponentState::Failed, Some("process_exited"))
+        );
+        let d = by_id("d-starting");
+        assert_eq!(
+            (d.state, d.reason.as_deref()),
+            (ComponentState::Failed, Some("process_exited"))
+        );
+    }
 
     #[test]
     fn parses_the_ecosystem_standard_shape() {
