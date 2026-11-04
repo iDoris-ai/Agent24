@@ -1077,6 +1077,37 @@ describe('CreativeServeWeb', () => {
       await service.stop()
     })
 
+    it('an explicit stop during a degraded restart cancels the relaunch', async () => {
+      let healthy = true
+      const fetchFn = vi.fn(async () => new Response('{}', { status: healthy ? 200 : 502 }))
+      const { service, launch, spawnFn } = managed({
+        sidecarTimings: { healthIntervalMs: 20, healthTimeoutMs: 15, termGraceMs: 100 },
+      }, fetchFn, [new FakeChild(), new FakeChild()])
+      await launch(0)
+      healthy = false
+      await vi.waitFor(() => expect(service.headlessSidecarState()).toBe('degraded'))
+      const showing = service.start()
+      await service.stop()
+      await showing
+      expect(spawnFn).toHaveBeenCalledOnce()
+    })
+
+    it('an explicit stop also cancels a show queued behind the restart', async () => {
+      let healthy = true
+      const fetchFn = vi.fn(async () => new Response('{}', { status: healthy ? 200 : 502 }))
+      const { service, launch, spawnFn } = managed({
+        sidecarTimings: { healthIntervalMs: 20, healthTimeoutMs: 15, termGraceMs: 100 },
+      }, fetchFn, [new FakeChild(), new FakeChild()])
+      await launch(0)
+      healthy = false
+      await vi.waitFor(() => expect(service.headlessSidecarState()).toBe('degraded'))
+      const first = service.start()
+      const queued = service.start()
+      await service.stop()
+      await Promise.all([first, queued])
+      expect(spawnFn).toHaveBeenCalledOnce()
+    })
+
     it('quit during a degraded restart does not relaunch', async () => {
       let healthy = true
       const fetchFn = vi.fn(async () => new Response('{}', { status: healthy ? 200 : 502 }))

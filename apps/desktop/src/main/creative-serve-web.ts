@@ -240,6 +240,7 @@ export class CreativeServeWeb {
   private starting: Promise<CreativeServeWebStatus> | null = null
   private stopping: Promise<CreativeServeWebStatus> | null = null
   private closed = false
+  private explicitStops = 0
   private readonly statusListeners = new Set<(status: CreativeServeWebStatus) => void>()
 
   // --- packaged headless instance: everything about its process is the manager's ---
@@ -387,12 +388,16 @@ export class CreativeServeWeb {
   start(): Promise<CreativeServeWebStatus> {
     // After `shutdown()` nothing may launch again, including restarts queued behind a stop.
     if (this.closed) return Promise.resolve(this.status())
-    if (this.stopping) return this.stopping.then(() => this.start())
+    // A show waiting on a stop yields to any explicit `stop()` issued after it, and does not
+    // retry a stop that left the run degraded.
+    if (this.stopping) return this.stopping.then(this.afterStop(this.explicitStops))
     if (this.starting) return this.starting
     if (this.child) return Promise.resolve(this.status())
     const live = this.manager.status().state
-    // A show lazily replaces a degraded run through the normal, deduplicated stop flow.
-    if (live === 'degraded') return this.stop().then(() => this.start())
+    // A show lazily replaces a degraded run through the normal, deduplicated stop flow. An
+    // explicit `stop()` meanwhile cancels the replacement, and a stop that leaves the run
+    // degraded is not retried.
+    if (live === 'degraded') return this.stopOnceShared().then(this.afterStop(this.explicitStops))
     if (live === 'ready' || live === 'healthy') return Promise.resolve(this.status())
 
     const pending = this.startOnce()
@@ -656,6 +661,12 @@ export class CreativeServeWeb {
     }
   }
 
+  private afterStop(stops: number): () => Promise<CreativeServeWebStatus> {
+    return () => (stops !== this.explicitStops || this.manager.status().state === 'degraded'
+      ? Promise.resolve(this.status())
+      : this.start())
+  }
+
   /** Stops for good: used by app quit, so a later or queued `start()` cannot relaunch. */
   shutdown(): Promise<CreativeServeWebStatus> {
     this.closed = true
@@ -663,6 +674,11 @@ export class CreativeServeWeb {
   }
 
   async stop(): Promise<CreativeServeWebStatus> {
+    this.explicitStops += 1
+    return this.stopOnceShared()
+  }
+
+  private stopOnceShared(): Promise<CreativeServeWebStatus> {
     if (this.stopping) return this.stopping
     const pending = this.stopOnce()
     this.stopping = pending
