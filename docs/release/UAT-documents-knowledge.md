@@ -40,11 +40,20 @@
 ### 1.1 机器和数据
 
 - Apple Silicon 的 Mac，macOS 14 或更新。
-- **先备份**，两处都要备份：数据目录 `~/.agent24`，以及 App 的 userData 目录（知识库设置、已保存的密钥、documents 卸载标记都在这里，不在 `~/.agent24`）：
+- **先备份**，两处都要备份：数据目录 `~/.agent24`，以及 App 的 userData 目录（知识库设置、已保存的密钥、documents 卸载标记都在这里，不在 `~/.agent24`）。
+  - userData 的目录名取自 App 包内 `package.json` 的 `name`，因为打包后那份 `package.json` 里没有 `productName`。所以目录是 `@agent24/desktop`，不是 `Agent24`。2026-11-04 在 ad-hoc 包的真机上核实过：卸载标记就落在这个目录里。
+  - 先确认这个目录存在，下面各处用 `$UD` 指代它：
+
+  ```sh
+  UD="$HOME/Library/Application Support/@agent24/desktop"
+  ls -d "$UD"
+  ```
+
+  - `ls` 报 `No such file` 时，用 `ls ~/Library/Application\ Support | grep -i agent24` 找出实际的目录，改掉 `UD`，并把这件事记进结果。然后备份：
 
   ```sh
   cp -R ~/.agent24 ~/agent24-backup-uat
-  cp -R "$HOME/Library/Application Support/@agent24/desktop" ~/agent24-backup-uat-userdata
+  cp -R "$UD" ~/agent24-backup-uat-userdata
   ```
 
   测完想回到原状态，见第 13 节最后一段。
@@ -94,10 +103,11 @@ DEFAULT_MODEL=qwen3.8:27b OMLX_URL=http://127.0.0.1:1 /Applications/Agent24.app/
   ```sh
   export PATH=/Applications/Agent24.app/Contents/Resources/backend:$PATH
   dm() { grep -E '\[documents-module\]|spawned pid|ready on port|taking over|refused shutdown|reusing external|not accepted by port' ~/agent24-uat/app.log; }
-  MK="$HOME/Library/Application Support/@agent24/desktop/documents-module.json"
+  UD="$HOME/Library/Application Support/@agent24/desktop"
+  MK="$UD/documents-module.json"
   ```
 
-  `MK` 找不到时，用 `find ~/Library/Application\ Support -maxdepth 3 -name documents-module.json` 找。
+  `UD` 用 1.1 里核实过的目录。
 
 ### 1.4 WeKnora 和样本知识库
 
@@ -140,7 +150,7 @@ DEFAULT_MODEL=qwen3.8:27b OMLX_URL=http://127.0.0.1:1 /Applications/Agent24.app/
 
 | # | 场景 | 操作 | 预期 | 结果 |
 |---|---|---|---|---|
-| C-01 | 导入 PDF | 「文档」页点「导入文件（PDF、JPEG、PNG）」，选 `s01-02-en-epa-boil-water.pdf` | 最终状态是「已导入」，过程中可能闪过「上传 N%」「导入中」（本机导入很快，看不到也算对）。列表里有这份文档，显示标题、格式和导入时间 | |
+| C-01 | 导入 PDF | 「文档」页点「导入文件（PDF、JPEG、PNG）」，选 `s01-02-en-epa-boil-water.pdf` | 最终状态是「已导入」，过程中可能闪过「上传 37%」这类上传进度（界面文字是 `import.uploading`：「上传 {percent}%」）和「导入中」（本机导入很快，看不到也算对）。列表里有这份文档，显示标题、格式和导入时间 | |
 | C-02 | 读正文和原页面图 | 点开这份文档，翻到第 2、3 页，再在第 3 页点「下一页」 | 详情里有元信息（格式 · 大小 · 第 1 版 · 导入时间）和正文。正文上方是「原页面 · 第 1 页」和整页图。翻页时图和页码跟着变；在第 3 页「下一页」变灰；「上一页」能翻回 | |
 | C-03 | 换一份文档从第 1 页开始 | 先导入 `s01-03-zh-holiday-2026.pdf`（E-03 也要用）。打开 EPA 那份翻到第 3 页，直接点列表里的 s01-03 | 从第 1 页开始，不残留上一份的图 | |
 | C-04 | 扫描件靠 OCR 出字 | 导入 `s01-06-zh-holiday-2026-scan.jpg`，点开 | 导入成功，正文里有「春节」等文字（图片没有文本层，这些字只能来自 OCR）。刚导入时正文可能要等几秒才出来 | |
@@ -274,9 +284,9 @@ G 组：G-01 _ G-02 _ G-02b _ G-03 _ G-04 _
 S 项与原因：
 ```
 
-**回到测前状态**：先 ⌘Q 退出 App，确认 `agent24 daemon status` 是 `not running`，然后把 1.1 的两份备份拷回原处：
+**回到测前状态**：先 ⌘Q 退出 App，确认 `agent24 daemon status` 是 `not running`，然后把 1.1 的两份备份拷回原处（`UD` 用 1.1 里核实过的目录）：
 
 ```sh
 rm -rf ~/.agent24 && cp -R ~/agent24-backup-uat ~/.agent24
-rm -rf "$HOME/Library/Application Support/@agent24/desktop" && cp -R ~/agent24-backup-uat-userdata "$HOME/Library/Application Support/@agent24/desktop"
+rm -rf "$UD" && cp -R ~/agent24-backup-uat-userdata "$UD"
 ```
