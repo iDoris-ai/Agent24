@@ -83,6 +83,12 @@ function trackableParent(state: { minimized?: boolean; visible?: boolean; enable
 let hangExport = false
 let exportReportsPath: string | null = null
 const hungExports: http.ServerResponse[] = []
+// T1-2: the documents module as main sees it, and its two actions.
+let docStatus = { bundled: true, installed: true, externalDaemon: false }
+// What else GET /api/v1/os lists (documents, for the uninstall checks).
+let extraOsModules: { name: string; enabled: boolean; version: string }[] = []
+const docUninstall = vi.fn()
+const docInstall = vi.fn()
 
 vi.mock('electron', () => ({
   app: {
@@ -217,7 +223,7 @@ beforeAll(async () => {
       } else if (req.method === 'PATCH' && req.url?.startsWith('/api/v1/attached/')) {
         res.end(JSON.stringify({ modules: attachedModules }))
       } else if (req.method === 'GET' && req.url === '/api/v1/os') {
-        res.end(JSON.stringify({ modules: [{ name: 'sin90', enabled: false, version: '0.5.0' }] }))
+        res.end(JSON.stringify({ modules: [{ name: 'sin90', enabled: false, version: '0.5.0' }, ...extraOsModules] }))
       } else if (req.method === 'POST' && req.url === '/api/v1/comm/identity/export' && hangExport) {
         hungExports.push(res)
       } else if (req.method === 'POST' && req.url === '/api/v1/comm/identity/export') {
@@ -236,6 +242,8 @@ beforeAll(async () => {
     promptUnlockPassword: (...a: unknown[]) => promptUnlockPassword(...a) as never,
     promptHomeImportPassword: (...a: unknown[]) => promptHomeImportPassword(...a) as never,
     exportTimeoutMs,
+    documentsModule: () => docStatus,
+    documentsModuleActions: { uninstall: () => docUninstall(), install: () => docInstall() },
     guard: createIpcGuard({
       getMainWindow: () => mainWindow as never,
       isTrustedUrl: (u) => u === APP_URL,
@@ -257,6 +265,7 @@ beforeEach(() => {
   seen = []
   attachedModules = [{ name: 'agentear', attach_status: 'attached' }, { name: 'other', attach_status: 'attached' }]
   attachedFailure = null
+  extraOsModules = []
   identityListHasDefault = true
   identityListFails = false
   showMessageBox.mockReset()
@@ -392,6 +401,117 @@ describe('A1 backendProxy allowlist', () => {
       }
       expect(showMessageBox).not.toHaveBeenCalled()
       expect(seen).toHaveLength(0)
+    })
+  })
+
+  describe('T1-2: OsModuleUninstall / OsModuleInstallBundled (native confirm, then the CLI)', () => {
+    beforeEach(() => {
+      docStatus = { bundled: true, installed: true, externalDaemon: false }
+      extraOsModules = [{ name: 'documents', enabled: true, version: '0.2.0' }]
+      docUninstall.mockReset().mockResolvedValue({ ok: true })
+      docInstall.mockReset().mockResolvedValue({ ok: true })
+    })
+    it('uninstall: confirmed → runs, ok', async () => {
+      showMessageBox.mockResolvedValue({ response: 0 })
+      const res = await call(IpcChannels.OsModuleUninstall)
+      expect(res.ok).toBe(true)
+      expect(docUninstall).toHaveBeenCalledOnce()
+      const opts = showMessageBox.mock.calls[0]!.at(-1) as { message: string; detail: string }
+      expect(opts.message).toContain('documents')
+      expect(opts.detail).toContain('Imported documents stay')
+    })
+    it('uninstall: cancelled → nothing runs', async () => {
+      showMessageBox.mockResolvedValue({ response: 1 })
+      const res = await call(IpcChannels.OsModuleUninstall)
+      expect(res.data.error.code).toBe('cancelled')
+      expect(docUninstall).not.toHaveBeenCalled()
+    })
+    it('uninstall: not installed → refused without a dialog', async () => {
+      docStatus = { ...docStatus, installed: false }
+      const res = await call(IpcChannels.OsModuleUninstall)
+      expect(res.data.error.code).toBe('not_installed')
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(docUninstall).not.toHaveBeenCalled()
+    })
+    it("uninstall: the CLI's failure code and message are passed through", async () => {
+      showMessageBox.mockResolvedValue({ response: 0 })
+      docUninstall.mockResolvedValue({ ok: false, code: 'cli_failed', message: 'agent24 os uninstall documents (rc=2): store locked' })
+      const res = await call(IpcChannels.OsModuleUninstall)
+      expect(res.ok).toBe(false)
+      expect(res.data.error.code).toBe('cli_failed')
+      expect(res.data.error.message).toContain('(rc=2): store locked')
+    })
+    it('uninstall: turned off in the daemon → refused without a dialog (os.json would name a missing module)', async () => {
+      extraOsModules = [{ name: 'documents', enabled: false, version: '0.2.0' }]
+      const res = await call(IpcChannels.OsModuleUninstall)
+      expect(res.data.error.code).toBe('module_disabled')
+      expect(res.data.error.message).toContain('Turn it on first')
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(docUninstall).not.toHaveBeenCalled()
+    })
+    it('status: os.json turned documents off → turnedOff (the page says "turned off", not the raw module_stopping)', async () => {
+      extraOsModules = [{ name: 'documents', enabled: false, version: '0.2.0' }]
+      expect(await call(IpcChannels.DocumentsModuleStatus)).toEqual({ ...docStatus, turnedOff: true })
+      extraOsModules = [{ name: 'documents', enabled: true, version: '0.2.0' }]
+      expect(await call(IpcChannels.DocumentsModuleStatus)).toEqual({ ...docStatus, turnedOff: false })
+    })
+    it('status: the daemon does not list documents → no turnedOff, only what is on disk', async () => {
+      extraOsModules = []
+      expect(await call(IpcChannels.DocumentsModuleStatus)).toEqual(docStatus)
+    })
+    it('uninstall: the daemon does not serve documents → refused without a dialog', async () => {
+      extraOsModules = []
+      const res = await call(IpcChannels.OsModuleUninstall)
+      expect(res.data.error.code).toBe('module_unavailable')
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(docUninstall).not.toHaveBeenCalled()
+    })
+    it('turning documents off after it was uninstalled is refused (os.json would name a missing module)', async () => {
+      docStatus = { ...docStatus, installed: false }
+      extraOsModules = [{ name: 'documents', enabled: true, version: '0.2.0' }]
+      const res = await call(IpcChannels.OsModuleSetEnabled, 'documents', false)
+      expect(res.data.error.code).toBe('not_installed')
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(seen.some((r) => r.method === 'PATCH')).toBe(false)
+      // Turning it on, or any other module off, is unaffected.
+      showMessageBox.mockResolvedValue({ response: 0 })
+      expect((await call(IpcChannels.OsModuleSetEnabled, 'sin90', false)).ok).toBe(true)
+    })
+    it('a CLI failure with an external daemon says how to stop it', async () => {
+      docStatus = { ...docStatus, externalDaemon: true }
+      showMessageBox.mockResolvedValue({ response: 0 })
+      docUninstall.mockResolvedValue({ ok: false, code: 'cli_failed', message: 'busy: daemon.singleton.lock is held' })
+      const res = await call(IpcChannels.OsModuleUninstall)
+      expect(res.data.error.message).toContain('busy: daemon.singleton.lock is held')
+      expect(res.data.error.message).toContain('agent24 daemon stop')
+    })
+    it('install: confirmed → runs, ok', async () => {
+      docStatus = { ...docStatus, installed: false }
+      showMessageBox.mockResolvedValue({ response: 0 })
+      const res = await call(IpcChannels.OsModuleInstallBundled)
+      expect(res.ok).toBe(true)
+      expect(docInstall).toHaveBeenCalledOnce()
+    })
+    it('install: cancelled → nothing runs', async () => {
+      docStatus = { ...docStatus, installed: false }
+      showMessageBox.mockResolvedValue({ response: 1 })
+      expect((await call(IpcChannels.OsModuleInstallBundled)).data.error.code).toBe('cancelled')
+      expect(docInstall).not.toHaveBeenCalled()
+    })
+    it('install: already installed, or no bundle → refused without a dialog', async () => {
+      expect((await call(IpcChannels.OsModuleInstallBundled)).data.error.code).toBe('already_installed')
+      docStatus = { bundled: false, installed: false, externalDaemon: false }
+      expect((await call(IpcChannels.OsModuleInstallBundled)).data.error.code).toBe('no_bundle')
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(docInstall).not.toHaveBeenCalled()
+    })
+    it("install: a signature failure's code is passed through", async () => {
+      docStatus = { ...docStatus, installed: false }
+      showMessageBox.mockResolvedValue({ response: 0 })
+      docInstall.mockResolvedValue({ ok: false, code: 'signature_invalid', message: 'a sealed resource is missing or invalid' })
+      const res = await call(IpcChannels.OsModuleInstallBundled)
+      expect(res.data.error.code).toBe('signature_invalid')
+      expect(res.data.error.message).toContain('a sealed resource is missing or invalid')
     })
   })
 

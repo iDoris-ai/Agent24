@@ -8,6 +8,7 @@ import { canCancel, canRetry, cancelImport, describeError, getImportState, nudge
 import DocumentDetail from './DocumentDetail'
 import { useT } from '../../i18n'
 import { documentsMessages } from './Documents.i18n'
+import type { DocumentsModuleStatus } from '../../../shared/ipc-types'
 
 type Doc = components['schemas']['Document']
 
@@ -21,6 +22,8 @@ const STATUS_LABELS: Record<string, 'status.queued' | 'status.running' | 'status
   interrupted: 'status.interrupted',
 }
 const STORAGE_UNAVAILABLE = 'storage-unavailable'
+const moduleDisabled = (res: { ok: boolean; error?: { code?: string } }): boolean =>
+  !res.ok && res.error?.code === 'module_disabled'
 const NOTE = { color: 'var(--muted)', fontSize: 13, margin: '8px 0' } as const
 /** The daemon has no documents route at all: the module is not
  * installed (it ships outside the installer, ADR-DOC-01 D6). That is a state,
@@ -40,11 +43,48 @@ export default function DocumentsPage() {
   const [loadingMore, setLoadingMore] = useState(false)
   const [listError, setListError] = useState<string | null>(null)
   const [unavailable, setUnavailable] = useState<string | null>(null)
+  // The user turned the module off (503 `module_disabled`, or os.json says
+  // so): said as a state, with where to turn it on. Requests are numbered as
+  // they are sent, and only the newest one heard from decides, so a slow
+  // capabilities reply cannot undo what a later list said, or the reverse.
+  const [off, setOff] = useState(false)
+  const sent = useRef(0)
+  const heard = useRef(0)
+  const offFrom = useCallback((stamp: number, value: boolean) => {
+    if (stamp < heard.current) return
+    heard.current = stamp
+    setOff(value)
+  }, [])
   // Each endpoint reports on its own; the notice is shown while either says
   // "no route", and never hides another endpoint's real error.
   const [capsMissing, setCapsMissing] = useState(false)
   const [listMissing, setListMissing] = useState(false)
   const notInstalled = capsMissing || listMissing
+  // T1-1/T1-2: with no documents route, what is on disk says which note to
+  // show: installed (the daemon mounts it once restarted, §9 Q2), installable
+  // from the Modules page, or neither (a build without the module).
+  const [moduleStatus, setModuleStatus] = useState<DocumentsModuleStatus | null>(null)
+  /** Turned off while the daemon runs. The kernel mounts the 503
+   * `module_disabled` route only at start-up, so until the next restart a
+   * module stopped by Disable answers 503 `module_stopping`, the same as one
+   * that crashed; os.json, read by main, tells the two apart. */
+  const turnedOff = useCallback(
+    async (res: { ok: boolean; status?: number; error?: { code?: string } }): Promise<boolean> => {
+      if (moduleDisabled(res)) return true
+      if (res.ok || res.status !== 503) return false
+      const status = await api.moduleStatus?.().catch(() => null)
+      return status?.turnedOff === true
+    },
+    [api],
+  )
+  useEffect(() => {
+    if (!notInstalled) return
+    let live = true
+    api.moduleStatus?.()
+      .then((s) => { if (live) setModuleStatus(s) })
+      .catch(() => {})
+    return () => { live = false }
+  }, [api, notInstalled])
   const [open, setOpen] = useState<string | null>(null)
   // The title that opened the details, given focus back when they close;
   // the page's title if a reload has since taken its row away (a document
@@ -60,6 +100,7 @@ export default function DocumentsPage() {
     const gen = ++generation.current
     setLoadingMore(false)
     setMore(null) // no paging until the new first page is here
+    const stamp = ++sent.current
     const res = await api.request({ op: 'list' })
     if (gen !== generation.current) return
     if (moduleNotInstalled(res)) {
@@ -69,13 +110,19 @@ export default function DocumentsPage() {
     }
     setListMissing(false)
     if (!res.ok) {
-      setListError(describeError(res))
+      // Turned off: said once, as the notice, not as a raw error here; the
+      // module may have been turned off after capabilities answered.
+      const isOff = await turnedOff(res)
+      if (gen !== generation.current) return
+      setListError(isOff ? null : describeError(res))
+      if (isOff) offFrom(stamp, true)
       return
     }
+    offFrom(stamp, false) // serving again (turned back on, daemon restarted)
     setListError(null)
     setDocs(res.data.documents)
     setMore(res.data.next_cursor ? { gen, cursor: res.data.next_cursor } : null)
-  }, [api])
+  }, [api, turnedOff, offFrom])
 
   /** The next page, appended; one at a time, and only to its own list. */
   const loadMore = async () => {
@@ -95,10 +142,14 @@ export default function DocumentsPage() {
 
   useEffect(() => {
     let live = true
-    void api.request({ op: 'capabilities' }).then((res) => {
+    const stamp = ++sent.current
+    void api.request({ op: 'capabilities' }).then(async (res) => {
+      if (!live) return
+      const isOff = await turnedOff(res)
       if (!live) return
       setCapsMissing(moduleNotInstalled(res))
-      if (moduleNotInstalled(res)) setUnavailable(null)
+      offFrom(stamp, isOff)
+      if (moduleNotInstalled(res) || isOff) setUnavailable(null)
       else if (!res.ok) setUnavailable(describeError(res))
       else setUnavailable(res.data.storage.state === 'ready' ? null : STORAGE_UNAVAILABLE)
     })
@@ -106,7 +157,7 @@ export default function DocumentsPage() {
       live = false
       generation.current++ // drop replies still in flight
     }
-  }, [api])
+  }, [api, turnedOff, offFrom])
 
   // The OS's events are hints (ADR-DOC-02 §7): a job event reads that job
   // now, a new document reloads the list (an import from anywhere).
@@ -133,15 +184,34 @@ export default function DocumentsPage() {
       </div>
       <p style={{ color: 'var(--muted)', fontSize: 12 }}>{t('subtitle')}</p>
       {notInstalled && (
-        <div role="status" style={NOTE}>
-          <div>{t('notInstalled.title')}</div>
-          <div>{t('notInstalled.guide')}</div>
-          <code>{t('notInstalled.command')}</code>
-        </div>
+        moduleStatus?.installed ? (
+          <div role="status" style={NOTE}>
+            <div>{t('restart.title')}</div>
+            {moduleStatus.externalDaemon ? (
+              <>
+                <div>{t('restart.guide')}</div>
+                <code>{t('restart.command')}</code>
+              </>
+            ) : (
+              <div>{t('restart.tray')}</div>
+            )}
+          </div>
+        ) : moduleStatus?.bundled ? (
+          <div role="status" style={NOTE}>
+            <div>{t('notInstalled.title')}</div>
+            <div>{t('notInstalled.modules')}</div>
+          </div>
+        ) : (
+          <div role="status" style={NOTE}>
+            <div>{t('notInstalled.title')}</div>
+            <div>{t('notInstalled.guide')}</div>
+            <code>{t('notInstalled.command')}</code>
+          </div>
+        )
       )}
-      {unavailable && (
+      {(off || unavailable) && (
         <div role="alert" style={ALERT}>
-          {unavailable === STORAGE_UNAVAILABLE ? t('storage.unavailable') : unavailable}
+          {off ? t('disabled.notice') : unavailable === STORAGE_UNAVAILABLE ? t('storage.unavailable') : unavailable}
         </div>
       )}
       <div style={{ display: 'flex', gap: 12, alignItems: 'center', margin: '12px 0' }}>

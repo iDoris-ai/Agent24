@@ -3,7 +3,7 @@
 // every call goes through the IPC proxy — never a direct fetch.
 
 import type { components } from '@agent24/api-client'
-import type { ApprovalDecisionInput } from '../../../shared/ipc-types'
+import type { ApprovalDecisionInput, DocumentsModuleStatus } from '../../../shared/ipc-types'
 
 export type RunStatus =
   | 'queued'
@@ -251,6 +251,19 @@ export const setOsModuleEnabled = async (name: string, enabled: boolean): Promis
   if (!res.ok) throw new Error(errorMessage(res))
   return res.data as DomainOsList
 }
+
+// T1-2: the documents module the app carries. Each is elevated: main asks in a
+// native dialog. Resolves false if the user cancelled, true once done.
+const moduleAction = async (call: () => Promise<{ ok: boolean; status: number; data: unknown }>): Promise<boolean> => {
+  const res = await call()
+  if ((res.data as { error?: { code?: string } } | null)?.error?.code === 'cancelled') return false
+  if (!res.ok) throw new Error(errorMessage(res))
+  return true
+}
+export const uninstallDocumentsModule = (): Promise<boolean> => moduleAction(() => window.agent24.osModuleUninstall())
+export const installBundledDocumentsModule = (): Promise<boolean> => moduleAction(() => window.agent24.osModuleInstallBundled())
+// async: a build without the bridge rejects, never throws in the caller.
+export const documentsModuleStatus = async (): Promise<DocumentsModuleStatus> => window.agent24.documents.moduleStatus()
 
 // ── M1-T10/T11: personal memory (generated api-client types) ───────────────
 // Mirrors `rust/apps/agent24d/src/memory_routes.rs`'s `MemoryAssertion`/

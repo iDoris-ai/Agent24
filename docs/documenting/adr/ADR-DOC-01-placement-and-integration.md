@@ -96,7 +96,7 @@
 1. **申请与授权**：manifest 用 `tools:` 段申请工具，必须和内核授权取交集。启用 OS 时，用户要确认工具清单。
 2. **风险等级**：
    - 非第一方模块的工具默认按 `External` 处理，模块自己声明的等级只当作猜测（与 MCP 一致）。
-   - `Read` / `WriteLocal` 只授予两类工具：**随安装包分发、pin + sha256 校验过的第一方 package**，或者**用户在启用时逐个确认过的工具**。
+   - `Read` / `WriteLocal` 只授予两类工具：**随安装包分发、pin + 校验过的第一方 package**（macOS 二进制校验代码签名，见 D6 的 2026-11-03 修订），或者**用户在启用时逐个确认过的工具**。
    - 用户覆盖时只能收紧。
    - DOC-1 期间还没有“第一方默认安装”（D6），Documenting 自己的工具也因此是 `External`，每次调用都要审批，除非用户在启用时逐个确认过。这一点如实写进 DOC-1 的验收说明。
 3. **调用通道**：
@@ -142,7 +142,15 @@
 
 ### D6 默认安装与引擎
 
-- **OS 本体**：小体积的 Rust 二进制，作为第一方 package 随安装包分发（pin + sha256），首次启动时自动 install 并 enable。
+- **OS 本体**：小体积的 Rust 二进制，作为第一方 package 随安装包分发（pin + 代码签名校验，见下面 2026-11-03 的修订），首次启动时自动 install 并 enable。
+  - **修订（David，2026-11-03，T1-1）：随安装包分发的 macOS 二进制改为「pin + 代码签名校验」，原写法是「pin + sha256」。** 原因是 electron-builder 签名时会对 App 里每个 Mach-O 执行 `codesign --force`，字节随之改变；签名后又不能往 App 里写文件，否则 App 自身的签名封存失效。所以打包前算出的二进制 sha256 在正式包里必然对不上。改法与 ADR-038 §4 对 macOS 可执行文件的规则一致：
+    - 首次启动安装前，对模块的两个程序跑 `codesign --verify --strict -R`。正式包要求 Team ID 与 App 自身一致，并启用 Hardened Runtime。只有 App 自身是 ad-hoc 签名的内部测试包，才只要求签名有效。读不到 App 的签名身份时不装。
+    - 包内不带 `SHA256SUMS`。manifest 的完整性由内核 discovery 的摘要与 `os install` 的校验覆盖。
+    - pin 指已装的模块与 App 带的那份一致：包内与已装的文件清单或任一文件的字节不同，就先验签、再卸、再装；全同就不动。
+      - **再修订（2026-11-03，T1-1 补）**：原写「包内版本与已装版本不同就先卸再装」。`domain-os.yml` 的 version 在整个 DOC-1 期间都是 0.1.0，二进制改了很多次也没跟着改，所以从 11-02 的候选包换新 App 时会留下旧程序。`os install` 逐字节拷贝，已装的就是包内那份的副本，比文件就能判断。version 只用于日志和 `os list` 显示，这次提到 0.2.0。证据裁决（R0 一致）：`~/.claude/decisions/2026-11-03-documents-module-upgrade-rule/`。
+      - 卸再装会撤销该模块的 consent（`agent24 os uninstall`，ADR-K1-03 §3）。consent 记录带模块版本，换了包就重新确认，是原设计的本意。
+    - 已知缺口：ad-hoc 分支不认证发布者；不防同一 uid 的攻击者（与 ADR-038 §7.11(b) 一致）。
+    - 证据裁决记录：`~/.claude/decisions/2026-11-03-documents-module-integrity/`（主会话、Codex、Fable 的 R0 与裁决）。
   - 这个机制目前没有（属于 Agent24 依赖，发布前需要，跟踪于 #735）。
   - DOC-1 用现有的 `agent24 os install`。
   - **开发阶段的手动安装和正式发行的默认安装分开验收。** 手动 install 不能冒充“默认可用”。

@@ -16,13 +16,15 @@
     "build": "pnpm --filter @agent24/data-dir build && vite build && tsc -p tsconfig.electron.json && node scripts/ensure-open-design-component-dir.mjs",
     "build:rust:debug": "cargo build -p agent24d -p agent24-cli --manifest-path ../../rust/Cargo.toml",
     "build:rust": "cargo build --release -p agent24d -p agent24-cli --manifest-path ../../rust/Cargo.toml",
+    "build:rust:documents": "cargo build --release -p agent24-documents --manifest-path ../../rust/Cargo.toml",
+    "stage:documents": "bash scripts/stage-documents-module.sh",
     "stage:open-design": "node scripts/stage-open-design-resources.mjs",
     "rebuild:open-design-native": "node scripts/rebuild-open-design-native.mjs",
     "pack:open-design": "node scripts/pack-open-design-component.mjs",
     "test:stage-open-design": "node --test scripts/stage-open-design-resources.test.mjs",
     "test:pack-open-design": "node --test scripts/pack-open-design-component.test.mjs",
     "test:open-design-mac-release": "node --test scripts/open-design-mac-release.test.mjs scripts/prepare-open-design-linux-resources.test.mjs scripts/check-open-design-release-asset.test.mjs",
-    "build:mac": "pnpm build:rust && pnpm build && electron-builder --mac",
+    "build:mac": "pnpm build:rust && pnpm build:rust:documents && pnpm stage:documents && pnpm build && electron-builder --mac",
     "build:win": "pnpm build:rust && pnpm build && electron-builder --win",
     "build:linux": "pnpm build:rust && pnpm build && electron-builder --linux",
     "typecheck": "pnpm --filter @agent24/data-dir build && tsc --noEmit -p tsconfig.renderer.json && tsc --noEmit -p tsconfig.electron.json",
@@ -91,6 +93,13 @@
         {
           "from": "../../rust/target/release/agent24",
           "to": "backend/agent24"
+        },
+        {
+          "from": ".documents-module",
+          "to": "documents-module",
+          "filter": [
+            "**/*"
+          ]
         }
       ],
       "identity": "Huifeng Jiao (HYAP444FN9)",
@@ -100,7 +109,9 @@
       "entitlementsInherit": "build/entitlements.mac.plist",
       "binaries": [
         "Contents/Resources/backend/agent24d",
-        "Contents/Resources/backend/agent24"
+        "Contents/Resources/backend/agent24",
+        "Contents/Resources/documents-module/bin/agent24-documents",
+        "Contents/Resources/documents-module/bin/agent24-documents-pdfkit"
       ],
       "notarize": false
     },
