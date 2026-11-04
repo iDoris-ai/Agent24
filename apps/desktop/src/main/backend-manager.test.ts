@@ -381,6 +381,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
     it('a reused external daemon is not stopped', async () => {
       const spawnProcess = vi.fn(() => fakeChild(111))
       const external: ExternalDaemonSource = {
+        ...launchAgent(),
         read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }),
         checkHealth: vi.fn().mockResolvedValue(true),
         fetchHealth: vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
