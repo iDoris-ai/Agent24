@@ -13,6 +13,7 @@ dev-dependencies 里的依赖。crate 自己依赖自己（测试用的 feature 
 crate 归层写在下面的 LAYER 表里，这是人工判断，不是 cargo 能算出来的。
 新增 crate 如果没有出现在 LAYER 里，脚本会报错，逼着补归层。
 cargo 可用 CARGO_TARGET_DIR 指到仓库外；本脚本只读 metadata，不会构建。
+cargo 缺失或运行失败时给出说明并以退出码 2 退出；--write 先写临时文件再 rename。
 """
 import json
 import os
@@ -75,12 +76,19 @@ def layer_key(name):
 
 
 def load():
-    env = dict(os.environ)
-    out = subprocess.run(
-        ["cargo", "metadata", "--no-deps", "--format-version", "1",
-         "--manifest-path", os.path.join(REPO, "rust", "Cargo.toml")],
-        check=True, capture_output=True, text=True, env=env,
-    ).stdout
+    try:
+        out = subprocess.run(
+            ["cargo", "metadata", "--no-deps", "--format-version", "1",
+             "--manifest-path", os.path.join(REPO, "rust", "Cargo.toml")],
+            check=True, capture_output=True, text=True,
+        ).stdout
+    except FileNotFoundError:
+        sys.stderr.write("找不到 cargo：请先安装 Rust 工具链（rustup），再重新运行本脚本。\n")
+        sys.exit(2)
+    except subprocess.CalledProcessError as e:
+        sys.stderr.write("cargo metadata 运行失败，无法生成依赖表。cargo 的输出：\n"
+                         + (e.stderr or "").strip() + "\n")
+        sys.exit(2)
     return json.loads(out)
 
 
@@ -150,8 +158,10 @@ def main():
             sys.exit(1)
         print("依赖表与 cargo metadata 一致")
     elif mode == "--write":
-        with open(DOC, "w", encoding="utf-8") as f:
+        tmp = DOC + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write(head + BEGIN + "\n" + table + "\n" + END + tail)
+        os.replace(tmp, DOC)
         print("已重写", DOC)
     else:
         sys.exit("未知参数：" + mode)

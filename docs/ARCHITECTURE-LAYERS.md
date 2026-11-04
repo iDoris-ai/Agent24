@@ -32,7 +32,7 @@
 │ ② 进程外领域 OS ✅（ME-3/ME-4/K1：Sin90 / Cos72 / Documents）          │
 │ ③ 附着模块 ✅（A3：AgentEar，CORE-2 登记）                             │
 │ ④ Sidecar 集成（Open Design）：现行 ✅ SidecarManager 托管 + ACP 桥；   │
-│    目标形态 🟡 + agent24-sidecar-host + CreativeRuntime                │
+│    sidecar-host 已冻结（Q1=(b)，#1580/#1584），Windows 排期后再议      │
 │ （另：MCP server 的工具 ✅ → 包装成普通 Tool 走同一条审批流水线）       │
 └──────────────┬───────────────────────────────────────────────────────┘
 ┌──────────────▼──────── L5 组合根：agent24d ────────────────────────────┐
@@ -196,9 +196,22 @@ python3 scripts/gen-layer-deps.py --check   # 与 cargo metadata 不一致时退
 
 ### L4 运行时内核 — `agent24-agent`
 
-run 管理器与 agent loop。正常依赖：core / memory / models / protocol / store / tools / workspace。审批门由 agent24d 组合 `agent24-policy` 后注入，`agent24-agent` 自身只在测试里依赖 policy。
+run 管理器与 agent loop。依赖见 §1.1 的生成表。审批门由 agent24d 组合 `agent24-policy` 后注入，`agent24-agent` 自身只在测试里依赖 policy。
 
 **取消**：模型调用、工具执行、审批等待、session 锁和有界的记忆写入这类长等待，都显式与 `CancellationToken` 竞速；少量短的持久化 await（起止状态迁移、写消息）不竞速，只在边界前后检查取消。工具调用全部落库、事件化，被拒绝的全部审计。
+
+### L4½ 领域 OS 运行时 — `os-proto`、`os-fd`、`os-packages`、`os-sdk`
+
+> 原编号 L5½（2026-11-05 改为 L4½）。这组 crate 只依赖 `domain` 和本组内部，**不依赖 L5**，被 L5（agent24d）和 L6（documents）同时依赖，所以是 L4 与 L5 之间共用的下层。旧编号让人以为它在 L5 之上，是误导（R1 §3.1）。
+
+| crate | 职责 |
+|---|---|
+| `agent24-os-proto` | 内核↔进程外模块协议：版本协商、分帧、握手、启动（trampoline，经 `command-fds` 做 fd 继承）、监管（熔断 / 重启 / 停止记录）、受约束的入站代理 |
+| `agent24-os-fd` | 把内核继承下来的监听 fd 安全地接管成 socket |
+| `agent24-os-packages` | 领域 OS 包的发现与原子安装（`agent24 os install`） |
+| `agent24-os-sdk` | 给模块作者的 Rust SDK（`Module` / `ModuleBuilder` 与五个 typed client）；daemon 只在测试中依赖它 |
+
+权威：[SPEC-ME3-OUT-OF-PROCESS](specs/SPEC-ME3-OUT-OF-PROCESS.md)、[WIRE-OOP-MODULE](specs/WIRE-OOP-MODULE.md)、[ME4-S3 os-sdk](design/ME4-S3-os-sdk.md)。
 
 ### L5 组合根 — `rust/apps/agent24d`
 
@@ -215,34 +228,22 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 - **模块工具（K1）** ✅：`module_tool_runtime.rs` 把进程外模块声明的工具以 `ModuleToolRuntime` 接进 `agent24-tools` 的注册表，授权、撤销通知、结果上限（64 KiB）见 [ADR-K1-01](adr/ADR-K1-01-module-tool-contract.md)；Documents 是第一个消费方。
 - **组件托管**：`idoris_host` / `managed_idoris`（iDoris 安装、监督、网关发布）、`hyphae_install`（Hyphae 按需安装，用 `agent24-components` 的 `download_locked_asset`）、`knowledge_host` / `knowledge_backend` / `knowledge_tools`（Knowledge 宿主接口与工具）、`hardware` / `decide_routes`。
 - **统一组件状态**：`component_routes.rs`（`GET /api/v1/components`、`POST /api/v1/components/{id}/report`，ADR-038 C3a，#1545）聚合 iDoris、Hyphae、attached、Documents、Knowledge 的状态；Open Design 的状态由桌面 main 上报（C3b，#1549）。docked 诊断 router（`docked_router.rs`，CORE-5f）只在停靠态提供，且在 `ENABLED=false` 之后。
-- **迁移协调器（CORE-5）** 🟡：`migration_coordinator.rs:20` 是 `ENABLED = false`，`run` 没有调用方；`main.rs:114` 有编译期断言 `assert!(!migration_coordinator::ENABLED)` 把它钉死。5f 的停靠类型、router 和启动接线已合入 main（`server.rs` 的 `docked_startup::pre_start`，#1528、#1540），但都在 `ENABLED` 后面，`pre_start` 因 guard 为 false 直接跳过。`migration_guard/` 是快照 / 回滚等配套。剩 5g / 5h / 5i（见 [CORE-5 设计](agent/CORE-5-MIGRATION-GUARD-DESIGN.md)）。
+- **迁移协调器（CORE-5）** 🟡：`migration_coordinator.rs:20` 是 `ENABLED = false`，`run` 没有调用方；`main.rs:116` 有编译期断言 `assert!(!migration_coordinator::ENABLED)` 把它钉死。5f 的停靠类型、router 和启动接线已合入 main（`server.rs` 的 `docked_startup::pre_start`，#1528、#1540），但都在 `ENABLED` 后面，`pre_start` 因 guard 为 false 直接跳过。`migration_guard/` 是快照 / 回滚等配套。剩 5g / 5h / 5i（见 [CORE-5 设计](agent/CORE-5-MIGRATION-GUARD-DESIGN.md)）。
 - **附着注册表**：A3 模块的监听 socket、握手、代际簿记、反向命令。
 
 **agent24d 的体量与瘦身（Q3 选 (B)，2026-11-04 拍板）**
 
-agent24d 非测试代码约 26,300 行，`server.rs` 一个文件 8,734 行（3,813 行之前是生产代码，`serve()` 一个函数就有约 1,530 行），分组见 R1 §4（`docs/architecture/review-2026-11-03/R1-MODULE-MAP.md`，在分支 `docs/arch-review-r1-module-map` 上，尚未合入 main）和 [方案 §5 Q3](tracking/2026-11-04/ARCH-OPTIMIZATION-PLAN.md)。结论：
+agent24d 非测试代码 27,915 行（`163dd2d3` 上用 R1 的 `loc.py` 重算，口径见 [ARCH-OPTIMIZATION-PLAN §4.3](tracking/2026-11-04/ARCH-OPTIMIZATION-PLAN.md)；R1 §1.1 原值 26,296）。`server.rs` 的构成：真正的路由「组合」只有一小段，`serve()` 一个函数就有约 1,530 行启动序列。分组见 R1 §4（`docs/architecture/review-2026-11-03/R1-MODULE-MAP.md`，在分支 `docs/arch-review-r1-module-map` 上，尚未合入 main）和 [方案 §5 Q3](tracking/2026-11-04/ARCH-OPTIMIZATION-PLAN.md)。结论：
 
 - **下沉三块**，每块都是业务逻辑，不是接线：
-  - iDoris 托管（`idoris_host`、`provision`、`managed_idoris`，约 2,640 行）→ `agent24-idoris`；
-  - Knowledge 宿主（`knowledge_host` / `backend` / `store` / `tools`，约 1,340 行）→ `agent24-knowledge`；
-  - attach 子系统（`attached`、`attach_registry`、`attach_listener`、`attach_commands` 等，约 1,520 行，整体迁，不单拆注册表）→ 新建 `agent24-attach`。
+  - iDoris 托管（`idoris_host`、`provision`、`managed_idoris`，约 2,500 行）→ `agent24-idoris`；
+  - Knowledge 宿主（`knowledge_host` / `backend` / `store` / `tools`，约 1,800 行，含 C5 探测）→ `agent24-knowledge`；
+  - attach 子系统（`attached`、`attach_registry`、`attach_listener`、`attach_commands` 等，约 1,500 行，整体迁，不单拆注册表）→ 新建 `agent24-attach`。
 - **鉴权留在 agent24d 核心，不抽 `agent24-auth`**（方案原 S2-5 已取消）。R1 §4 指出这块（约 4,900 行，含 `server.rs:1025-1418` 的鉴权中间件）依赖 `os-proc` 和 `crate::capabilities`，handler 与中间件接线必须留在 agent24d。
+- 以上三个数字按方案 §4.3（S2-2 / S2-3 / S2-4）写，口径见 ARCH-OPTIMIZATION-PLAN §4.3；下沉后 agent24d 约降到 22,000 行。attach 排在 S2-1、S2-2 之后。
 - 三块下沉后**仍然编译进同一个 agent24d 进程**，只是代码归属变了，不增加进程，也不改对外 API。HTTP handler 留在 agent24d。
 - 每期先移动、后修行为，同一个 PR 不混；前置是本文（新边界先写进文档）。迁移落地之前，上文各 crate 的依赖以当前 main 为准；下沉后依赖表用脚本重新生成。
 - `comm_routes` 中的 `CommDaemonSlot` 与 `hyphae_install` 是否下沉另议，不在 Q3 范围内。
-
-### L4½ 领域 OS 运行时 — `os-proto`、`os-fd`、`os-packages`、`os-sdk`
-
-> 原编号 L5½（2026-11-05 改为 L4½）。这组 crate 只依赖 `domain` 和本组内部，**不依赖 L5**，被 L5（agent24d）和 L6（documents）同时依赖，所以是 L4 与 L5 之间共用的下层。旧编号让人以为它在 L5 之上，是误导（R1 §3.1）。
-
-| crate | 职责 |
-|---|---|
-| `agent24-os-proto` | 内核↔进程外模块协议：版本协商、分帧、握手、启动（trampoline，经 `command-fds` 做 fd 继承）、监管（熔断 / 重启 / 停止记录）、受约束的入站代理 |
-| `agent24-os-fd` | 把内核继承下来的监听 fd 安全地接管成 socket |
-| `agent24-os-packages` | 领域 OS 包的发现与原子安装（`agent24 os install`） |
-| `agent24-os-sdk` | 给模块作者的 Rust SDK（`Module` / `ModuleBuilder` 与五个 typed client）；daemon 只在测试中依赖它 |
-
-权威：[SPEC-ME3-OUT-OF-PROCESS](specs/SPEC-ME3-OUT-OF-PROCESS.md)、[WIRE-OOP-MODULE](specs/WIRE-OOP-MODULE.md)、[ME4-S3 os-sdk](design/ME4-S3-os-sdk.md)。
 
 ### L6 扩展面 — 四类"外挂"
 
@@ -347,7 +348,7 @@ agent24d 非测试代码约 26,300 行，`server.rs` 一个文件 8,734 行（3,
 
 1. **边界**：照 [ADR-001](open-design-workspace/design/ADR-001-INTEGRATION-BOUNDARIES.md) 写一份。Agent24 是唯一 AI 控制面，第三方只是工作区，不拿工具权限。
 2. **源码**：fork + pin，本仓库只放契约、宿主、桥、pin、集成测试；Apache-2.0 记得保留 NOTICE。
-3. **进程**：用 `SidecarManager`（C8 起 Open Design 已走它）：每个工具只写自己的 launcher、health 和 tree controller（参考 `open-design-sidecar.ts`）。目标再接 `agent24-sidecar-host`（Windows 与父进程死亡监视）。
+3. **进程**：用 `SidecarManager`（C8 起 Open Design 已走它）：每个工具只写自己的 launcher、health 和 tree controller（参考 `open-design-sidecar.ts`）。`agent24-sidecar-host`（Windows Job Object 与父进程死亡监视）已冻结（Q1=(b)，OD 由 SidecarManager 托管，#1580/#1584），Windows 排期后再议。
 4. **运行时协议**：能说 ACP 就复用 `agent24 acp`；否则写一个同样"只做映射、不持有权限"的桥。
 5. **权限**：一个 workspace + 一个限定在该 workspace 的短期令牌。前提是 capability 的路由级资源授权已实现、并已在产品路径启用（见 §5 第一行）。
 6. **验收与落地**：精确 SHA 的 E2E（M10 用的 harness 保存在 PR #654 的 `refs/pull/654/head`）；锁定 main、打 tag、合并预演、合并后再跑 gate（[M10 落地指南](design/OPEN-DESIGN-M10-MAIN-LANDING-GUIDE.md)，现作为 M10 的历史审计记录保留）。
@@ -371,7 +372,7 @@ agent24d 非测试代码约 26,300 行，`server.rs` 一个文件 8,734 行（3,
 - 🟡 进程内 DomainModule 挂载缝已实现，但当前没有生产内置模块。
 - 🟡 `agent24-sidecar-host`（Rust，Windows Job Object / 父进程死亡监视）未接入 Desktop，没有任何 Rust 消费者，Q1 = (b) 后冻结。Open Design 已由 `SidecarManager`（TS）托管（C8，#1580、#1584）；Windows 暂不支持。
 - 🟡 `agent24 acp` 不传 `workspace_id`，Open Design 的 run 不是 workspace-bound。
-- 🟡 **CORE-5 迁移协调器未接线**：`migration_coordinator::ENABLED = false`（`:20`），`main.rs:114` 的编译期断言保证没人悄悄打开；`run` 没有调用方。5f（停靠类型、router、启动接线）已合入 main，但都在 `ENABLED` 后面；剩 5g 外壳识别、5h 安装器回退、5i 授权 retry。
+- 🟡 **CORE-5 迁移协调器未接线**：`migration_coordinator::ENABLED = false`（`:20`），`main.rs:116` 的编译期断言保证没人悄悄打开；`run` 没有调用方。5f（停靠类型、router、启动接线）已合入 main，但都在 `ENABLED` 后面；剩 5g 外壳识别、5h 安装器回退、5i 授权 retry。
 - 🟡 **ADR-038 收尾**：C1–C8 已全部完成（Open Design 按 Q1 = (b) 由 `SidecarManager` 托管）。仍未做的是运行期契约检查（Agent24 侧没有向 Hyphae 做 `hyphae-cli` 契约握手，只有 iDoris 做 `check_contract`）；Hyphae 锁只有 darwin-arm64 和 linux-x64 两个平台。
 - 🟡 `agent24-decide`：只有契约、规则后端和 profile 路由；`DecisionLog` 无实现，agent loop 无调用点（D1）。
 - 🟡 `agent24-hw`：runtimes 未探测，能力梯 / 解析器未做。
