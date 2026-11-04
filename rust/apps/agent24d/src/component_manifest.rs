@@ -31,10 +31,6 @@ pub(crate) const REGISTERED_PROVIDERS: &[(&str, &str)] = &[
     ("documents", "documents"),
 ];
 
-/// Prefix of the refusal text for a reserved capability id. `/components` turns it
-/// into the reason `reserved_capability_id`.
-pub(crate) const RESERVED_WHY: &str = "reserved_capability_id";
-
 /// Whether module `owner` may not declare capability `id` in its `domain-os.yml`.
 /// Reserved: `mcp-*` (generated for MCP servers), a builtin component id, and a
 /// registered id whose registry provider is another module.
@@ -49,18 +45,12 @@ pub(crate) fn capability_id_reserved(owner: &str, id: &str) -> bool {
 }
 
 impl OsD9 {
-    /// The refusal text when this module declares a reserved capability id.
-    pub(crate) fn reserved_refusal(&self) -> Option<String> {
-        let id = self
-            .provides
+    /// The first declared capability id this module may not declare.
+    pub(crate) fn reserved_capability(&self) -> Option<&str> {
+        self.provides
             .iter()
             .map(|p| p.id.as_str())
-            .find(|id| capability_id_reserved(&self.name, id))?;
-        Some(format!(
-            "{RESERVED_WHY}: capability id {id:?} is reserved (REGISTRY.md provider, builtin \
-             component or mcp-*); module {:?} may not declare it",
-            self.name
-        ))
+            .find(|id| capability_id_reserved(&self.name, id))
     }
 
     /// The same record with no capabilities, for a refused module: it provides nothing.

@@ -883,18 +883,23 @@ async fn component_ids_are_unique_across_builtin_attach_os_and_mcp() {
     assert_eq!(find(&body, "agentear")["form"], "attach");
 }
 
-/// A package refused for a reserved capability id is `failed` with reason
-/// `reserved_capability_id` and lists no provider; another refusal keeps `refused`.
+/// A refused package is `failed` with the reason of its refusal and lists no
+/// provider; a plain refusal keeps `refused`.
 #[tokio::test]
-async fn a_reserved_capability_refusal_is_failed_with_its_own_reason() {
+async fn a_refused_package_is_failed_with_its_own_reason() {
+    use crate::domain::RefusalReason::{DuplicateCapabilityId, ReservedCapabilityId};
     let (mut state, host, _) = server_tests::capability_state().await;
     let bad = d9("squatter", false, "model-gateway", &[]);
-    let why = bad.reserved_refusal().unwrap();
     state.os_reports = Arc::new(vec![
         os_report(
             "squatter",
-            MountOutcome::Refused(why),
+            MountOutcome::RefusedFor(ReservedCapabilityId, "x".into()),
             bad.without_provides(),
+        ),
+        os_report(
+            "second",
+            MountOutcome::RefusedFor(DuplicateCapabilityId, "y".into()),
+            d9("second", false, "taken", &[]).without_provides(),
         ),
         os_report(
             "other",
@@ -908,7 +913,51 @@ async fn a_reserved_capability_refusal_is_failed_with_its_own_reason() {
     assert_eq!(squatter["state"], "failed");
     assert_eq!(squatter["reason"], "reserved_capability_id");
     assert_eq!(squatter["provides"], json!([]));
+    assert_eq!(find(&body, "second")["reason"], "duplicate_capability_id");
     assert_eq!(find(&body, "other")["reason"], "refused");
+}
+
+/// A package named like a builtin is refused, but it stays on `/components`
+/// under a fallback id, so it is not invisible, and it does not take over the
+/// builtin's own row.
+#[tokio::test]
+async fn a_package_squatting_a_builtin_name_is_listed_under_a_fallback_id() {
+    use crate::domain::RefusalReason::ReservedComponentName;
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let reports: Vec<_> = ["hyphae", "documents"]
+        .into_iter()
+        .map(|name| {
+            os_report(
+                name,
+                MountOutcome::RefusedFor(ReservedComponentName, "builtin name".into()),
+                d9(name, false, "nostr-dm", &[]).without_provides(),
+            )
+        })
+        .collect();
+    state.os_reports = Arc::new(reports);
+    let app = build_router(state);
+    let (_, body) = call(&app, Method::GET, GET, Some(&host), "").await;
+    let rows = body["components"].as_array().unwrap();
+    let ids: Vec<_> = rows.iter().map(|c| c["id"].as_str().unwrap()).collect();
+    let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+    assert_eq!(ids.len(), unique.len(), "{ids:?}");
+    let squatters: Vec<_> = rows
+        .iter()
+        .filter(|c| c["reason"] == "reserved_component_name")
+        .collect();
+    assert_eq!(squatters.len(), 2, "{ids:?}");
+    for row in &squatters {
+        assert_eq!(row["state"], "failed");
+        assert_eq!(row["provides"], json!([]));
+        assert_ne!(row["id"], row["detail"]["package"], "{row}");
+        assert!(row["id"].as_str().unwrap().starts_with("mcp-bad-"), "{row}");
+    }
+    // The builtins keep their own rows and are not described by the squatters.
+    assert_ne!(find(&body, "hyphae")["reason"], "reserved_component_name");
+    assert_ne!(
+        find(&body, "documents")["reason"],
+        "reserved_component_name"
+    );
 }
 
 #[tokio::test]

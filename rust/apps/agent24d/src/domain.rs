@@ -522,6 +522,91 @@ pub enum MountOutcome {
     /// provided (a compiled-in module declaring an out-of-process provider, a
     /// package on disk declaring an in-process crate).
     Refused(String),
+    /// Refused for a reason `/components` reports by name (`failed` plus the
+    /// reason's code), not just `refused`. Like [`Self::Refused`]: no routes.
+    RefusedFor(RefusalReason, String),
+}
+
+/// Why a package was refused at admission, for the reasons that have a code of
+/// their own in `/api/v1/components`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// `provides` names an id REGISTRY.md reserves (see
+    /// [`crate::component_manifest::capability_id_reserved`]).
+    ReservedCapabilityId,
+    /// A user-installed package named like a builtin component, and not the
+    /// bundled Documents package.
+    ReservedComponentName,
+    /// Another module, earlier in the catalogue, already declared the same id.
+    DuplicateCapabilityId,
+}
+
+impl RefusalReason {
+    /// The `reason` string `/components` shows.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ReservedCapabilityId => "reserved_capability_id",
+            Self::ReservedComponentName => "reserved_component_name",
+            Self::DuplicateCapabilityId => "duplicate_capability_id",
+        }
+    }
+}
+
+/// `sha256:` digest of the `domain-os.yml` this daemon is built with for the
+/// Documents package. Documents is a real package in the same repository and is
+/// the only package allowed to carry a builtin component name; it is recognised
+/// by this digest, because a name alone is chosen by whoever installs the package.
+fn bundled_documents_digest() -> String {
+    agent24_os_proto::manifest::manifest_digest(include_bytes!(
+        "../../agent24-documents/domain-os.yml"
+    ))
+}
+
+/// Whether a package may carry the name `name` (a builtin component id needs
+/// the bundled Documents manifest).
+fn component_name_allowed(name: &str, digest: &str) -> bool {
+    !crate::component_routes::BUILTIN_COMPONENT_IDS.contains(&name)
+        || (name == "documents" && digest == bundled_documents_digest())
+}
+
+/// A module's `provides` against REGISTRY.md and the ids earlier modules took.
+fn capability_refusal(
+    d9: &crate::component_manifest::OsD9,
+    claimed_caps: &std::collections::BTreeMap<String, String>,
+) -> Option<(RefusalReason, String)> {
+    if let Some(id) = d9.reserved_capability() {
+        return Some((
+            RefusalReason::ReservedCapabilityId,
+            format!(
+                "capability id {id:?} is reserved (REGISTRY.md provider, builtin component or \
+                 mcp-*); module {:?} may not declare it",
+                d9.name
+            ),
+        ));
+    }
+    d9.provides.iter().find_map(|p| {
+        claimed_caps
+            .get(&p.id)
+            .filter(|owner| **owner != d9.name)
+            .map(|owner| {
+                (
+                    RefusalReason::DuplicateCapabilityId,
+                    format!("capability id {:?} is already declared by {owner:?}", p.id),
+                )
+            })
+    })
+}
+
+fn claim_capabilities(
+    d9: &crate::component_manifest::OsD9,
+    claimed_caps: &mut std::collections::BTreeMap<String, String>,
+) {
+    for p in &d9.provides {
+        claimed_caps
+            .entry(p.id.clone())
+            .or_insert_with(|| d9.name.clone());
+    }
 }
 
 /// Whether a module's declared resources are present.
@@ -1076,6 +1161,11 @@ pub async fn mount_all(
     // erase path has an explicit list instead of prefix-matching storage keys.
     let mut partitions = crate::os_memory::OsMemoryCatalog::default();
     let mut claimed: BTreeSet<String> = BTreeSet::new();
+    // Capability id -> the module that declared it first. Ids are global
+    // (REGISTRY.md); the first module in catalogue order keeps one, a later one
+    // declaring it is refused, as the second MCP server with the same id is.
+    let mut claimed_caps: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
 
     // A name in the file that no build provides is a typo, and the two halves of
     // that mistake are NOT equally dangerous.
@@ -1168,16 +1258,16 @@ pub async fn mount_all(
             Build::InProcess(_) => None,
         };
 
-        let refuse = |why: String,
-                      d9: Option<crate::component_manifest::OsD9>,
-                      reports: &mut Vec<MountReport>| {
-            tracing::error!("domain OS {name:?} not mounted: {why}");
+        let refuse_with = |outcome: MountOutcome,
+                           d9: Option<crate::component_manifest::OsD9>,
+                           reports: &mut Vec<MountReport>| {
+            tracing::error!("domain OS {name:?} not mounted: {outcome:?}");
             reports.push(MountReport {
                 name: name.clone(),
                 namespace: namespace.clone(),
                 version: version.clone(),
                 enabled_at_start,
-                outcome: MountOutcome::Refused(why),
+                outcome,
                 // Nothing was handed a `KernelCtx`, so it holds nothing. (For a
                 // pre-construction refusal no manifest was read either; for a
                 // post-construction one the grants were computable but never given.
@@ -1186,6 +1276,11 @@ pub async fn mount_all(
                 resources: ResourceStatus::NotChecked,
                 d9,
             });
+        };
+        let refuse = |why: String,
+                      d9: Option<crate::component_manifest::OsD9>,
+                      reports: &mut Vec<MountReport>| {
+            refuse_with(MountOutcome::Refused(why), d9, reports);
         };
 
         // IDENTITY. The catalogue names a module before any manifest exists, so the
@@ -1228,6 +1323,25 @@ pub async fn mount_all(
             continue;
         }
 
+        // A user-installed package may not carry a builtin component name:
+        // `/components` lists the builtins itself, and a package named `hyphae`
+        // would otherwise pass for the provider of Hyphae's capabilities. The
+        // bundled Documents package is the one exception (by digest).
+        if let Build::Package(package) = &entry.build
+            && !component_name_allowed(&name, &package.digest)
+        {
+            refuse_with(
+                MountOutcome::RefusedFor(
+                    RefusalReason::ReservedComponentName,
+                    format!("the package name {name:?} is a builtin component id"),
+                ),
+                catalogue_d9
+                    .clone()
+                    .map(crate::component_manifest::OsD9::without_provides),
+                &mut reports,
+            );
+            continue;
+        }
         // ADMISSION, before policy. A name that could never be mounted is refused
         // whether or not the user switched it on, because "disabled" would
         // otherwise CONCEAL it: turning it back on would fail in a way the earlier
@@ -1253,20 +1367,23 @@ pub async fn mount_all(
             continue;
         }
         // A user-installed manifest may not declare a reserved capability id
-        // (docs/capabilities/REGISTRY.md). Admission, like the checks above: a
-        // disabled package is refused too, so "disabled" cannot hide it.
-        if let Some(why) = catalogue_d9
-            .as_ref()
-            .and_then(crate::component_manifest::OsD9::reserved_refusal)
+        // (docs/capabilities/REGISTRY.md), nor one an earlier module declared.
+        // Admission, like the checks above: a disabled package is refused too,
+        // so "disabled" cannot hide it.
+        if let Some(d9) = &catalogue_d9
+            && let Some((reason, why)) = capability_refusal(d9, &claimed_caps)
         {
-            refuse(
-                why,
+            refuse_with(
+                MountOutcome::RefusedFor(reason, why),
                 catalogue_d9
                     .clone()
                     .map(crate::component_manifest::OsD9::without_provides),
                 &mut reports,
             );
             continue;
+        }
+        if let Some(d9) = &catalogue_d9 {
+            claim_capabilities(d9, &mut claimed_caps);
         }
 
         // POLICY: an unreadable registry, then the user's switch. Neither
@@ -1408,16 +1525,18 @@ pub async fn mount_all(
             continue;
         }
 
-        if let Some(why) = manifest_d9
-            .as_ref()
-            .and_then(crate::component_manifest::OsD9::reserved_refusal)
+        if let Some(d9) = &manifest_d9
+            && let Some((reason, why)) = capability_refusal(d9, &claimed_caps)
         {
-            refuse(
-                why,
+            refuse_with(
+                MountOutcome::RefusedFor(reason, why),
                 manifest_d9.map(crate::component_manifest::OsD9::without_provides),
                 &mut reports,
             );
             continue;
+        }
+        if let Some(d9) = &manifest_d9 {
+            claim_capabilities(d9, &mut claimed_caps);
         }
 
         let granted = Grants::granting(manifest.kernel_capabilities(), KERNEL_GRANTS);
@@ -3458,10 +3577,8 @@ raise SystemExit(3)
             )
             .await;
             match &reports[0].outcome {
-                MountOutcome::Refused(why) => {
-                    assert!(why.starts_with("reserved_capability_id"), "{id}: {why}");
-                }
-                other => panic!("{id} (enabled={enabled}): expected Refused, got {other:?}"),
+                MountOutcome::RefusedFor(RefusalReason::ReservedCapabilityId, _) => {}
+                other => panic!("{id} (enabled={enabled}): expected RefusedFor, got {other:?}"),
             }
             assert!(reports[0].d9.as_ref().unwrap().provides.is_empty(), "{id}");
             assert_eq!(
@@ -3516,10 +3633,8 @@ raise SystemExit(3)
         );
         let (_, reports) = mount(&[entry(bad.clone())], tmp.path(), &hub).await;
         match &reports[0].outcome {
-            MountOutcome::Refused(why) => {
-                assert!(why.starts_with("reserved_capability_id"), "{why}")
-            }
-            other => panic!("expected Refused, got {other:?}"),
+            MountOutcome::RefusedFor(RefusalReason::ReservedCapabilityId, _) => {}
+            other => panic!("expected RefusedFor, got {other:?}"),
         }
         assert!(reports[0].d9.as_ref().unwrap().provides.is_empty());
         assert!(bad.opened().is_none(), "a refused module opens no store");
@@ -3538,6 +3653,120 @@ raise SystemExit(3)
             "{:?}",
             reports[0].outcome
         );
+    }
+
+    /// `mount_all` over `packages` with the knobs the tests above use.
+    async fn mount_packages(tmp: &Path, packages: &Path, cfg: &str) -> Vec<MountReport> {
+        let hub = crate::events::EventsHub::default();
+        let cfg = config_from(cfg);
+        let (_, reports, _) = mount_all(
+            &discovered(packages),
+            &tmp.join("os"),
+            &hub,
+            Ok(&cfg),
+            &no_models(),
+            None,
+            Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        reports
+    }
+
+    fn append_provides(packages: &Path, name: &str, ids: &[&str]) {
+        let yml = packages.join(name).join("domain-os.yml");
+        let mut text = std::fs::read_to_string(&yml).unwrap();
+        text.push_str("provides:\n");
+        for id in ids {
+            text.push_str(&format!("  - id: {id}\n"));
+        }
+        std::fs::write(&yml, text).unwrap();
+    }
+
+    fn outcome_of<'a>(reports: &'a [MountReport], name: &str) -> &'a MountOutcome {
+        &reports.iter().find(|r| r.name == name).unwrap().outcome
+    }
+
+    /// A user package cannot take a builtin component's name to pass for its
+    /// provider: `hyphae` declaring `nostr-dm` is refused for the NAME, with or
+    /// without the capability, and also when disabled.
+    #[tokio::test]
+    async fn a_package_named_like_a_builtin_component_is_refused() {
+        for (name, enabled) in [
+            ("hyphae", true),
+            ("idoris", true),
+            ("knowledge", true),
+            ("open-design", true),
+            ("documents", true),
+            ("hyphae", false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let packages = tmp.path().join("packages");
+            write_package(&packages, name);
+            append_provides(&packages, name, &["nostr-dm"]);
+            let cfg = format!(r#"{{"domainOs": {{"{name}": {{"enabled": {enabled}}}}}}}"#);
+            let reports = mount_packages(tmp.path(), &packages, &cfg).await;
+            assert!(
+                matches!(
+                    outcome_of(&reports, name),
+                    MountOutcome::RefusedFor(RefusalReason::ReservedComponentName, _)
+                ),
+                "{name} (enabled={enabled}): {:?}",
+                outcome_of(&reports, name)
+            );
+            assert!(reports[0].d9.as_ref().unwrap().provides.is_empty());
+        }
+    }
+
+    /// The real Documents package (the manifest bytes this daemon is built
+    /// with) is recognised by digest and not refused for its name. Positive
+    /// control for the test above.
+    #[tokio::test]
+    async fn the_bundled_documents_package_keeps_its_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "documents");
+        let bundled = include_bytes!("../../agent24-documents/domain-os.yml");
+        std::fs::write(packages.join("documents").join("domain-os.yml"), bundled).unwrap();
+        let reports = mount_packages(tmp.path(), &packages, "{}").await;
+        assert_eq!(reports.len(), 1);
+        assert!(
+            !matches!(
+                reports[0].outcome,
+                MountOutcome::Refused(_) | MountOutcome::RefusedFor(..)
+            ),
+            "{:?}",
+            reports[0].outcome
+        );
+    }
+
+    /// Capability ids are global: the second package declaring one is refused.
+    /// The first keeps it (catalogue order), a refused one claims nothing, and
+    /// an unrelated id is unaffected.
+    #[tokio::test]
+    async fn a_second_package_declaring_the_same_capability_id_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packages = tmp.path().join("packages");
+        for name in ["alpha", "beta", "gamma", "delta"] {
+            write_package(&packages, name);
+        }
+        append_provides(&packages, "alpha", &["shared-tasks"]);
+        append_provides(&packages, "beta", &["shared-tasks"]);
+        append_provides(&packages, "gamma", &["shared-tasks", "gamma-own"]);
+        append_provides(&packages, "delta", &["gamma-own"]);
+        let reports = mount_packages(tmp.path(), &packages, "{}").await;
+        let refused = |name: &str| {
+            matches!(
+                outcome_of(&reports, name),
+                MountOutcome::RefusedFor(RefusalReason::DuplicateCapabilityId, _)
+            )
+        };
+        assert!(!refused("alpha"), "{:?}", outcome_of(&reports, "alpha"));
+        assert!(refused("beta"));
+        assert!(refused("gamma"));
+        // gamma was refused, so it never claimed `gamma-own`.
+        assert!(!refused("delta"), "{:?}", outcome_of(&reports, "delta"));
     }
 
     /// A daemon that cannot start processes still mounts everything else; each

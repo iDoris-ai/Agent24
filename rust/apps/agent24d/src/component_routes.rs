@@ -456,6 +456,11 @@ fn documents_mapped(
         (MountOutcome::Refused(why), _) => {
             (ComponentState::Failed, Some("refused"), Some(why.clone()))
         }
+        (MountOutcome::RefusedFor(reason, why), _) => (
+            ComponentState::Failed,
+            Some(reason.code()),
+            Some(why.clone()),
+        ),
     }
 }
 
@@ -500,7 +505,12 @@ fn documents_from(
 /// The Documents package. State comes from the mount report and its supervisor.
 /// Not mounted at all is `absent`. Provides and version come from the D9 catalog.
 fn documents_item(state: &AppState) -> Item {
-    let report = state.os_reports.iter().find(|r| r.name == "documents");
+    // A package that only borrowed the name (refused as `reserved_component_name`)
+    // is not Documents; it is listed on its own row by `os_module_items`.
+    let report = state
+        .os_reports
+        .iter()
+        .find(|r| r.name == "documents" && !squats_builtin_name(&r.outcome));
     let live = report.and_then(|_| {
         state
             .module_status
@@ -533,14 +543,31 @@ fn os_mapped(
         (MountOutcome::Refused(why), _) => {
             (ComponentState::Failed, Some("refused"), Some(why.clone()))
         }
+        (MountOutcome::RefusedFor(reason, why), _) => (
+            ComponentState::Failed,
+            Some(reason.code()),
+            Some(why.clone()),
+        ),
     }
+}
+
+/// Refused because a user package took a builtin component's name.
+fn squats_builtin_name(outcome: &MountOutcome) -> bool {
+    matches!(
+        outcome,
+        MountOutcome::RefusedFor(crate::domain::RefusalReason::ReservedComponentName, _)
+    )
 }
 
 fn os_module_items(state: &AppState) -> Vec<Item> {
     let mut reports: Vec<_> = state
         .os_reports
         .iter()
-        .filter(|r| !BUILTIN_COMPONENT_IDS.contains(&r.name.as_str()))
+        // A squatter keeps its row (the id is made unique by `dedupe_component_ids`),
+        // so a refused package is never invisible.
+        .filter(|r| {
+            squats_builtin_name(&r.outcome) || !BUILTIN_COMPONENT_IDS.contains(&r.name.as_str())
+        })
         .collect();
     reports.sort_by(|a, b| a.name.cmp(&b.name));
     reports
@@ -550,12 +577,7 @@ fn os_module_items(state: &AppState) -> Vec<Item> {
                 .module_status
                 .get(&report.name)
                 .map(|rx| rx.borrow().clone());
-            let (mapped, mut reason, message) = os_mapped(&report.outcome, live);
-            if matches!(&report.outcome, MountOutcome::Refused(why)
-                if why.starts_with(crate::component_manifest::RESERVED_WHY))
-            {
-                reason = Some("reserved_capability_id");
-            }
+            let (mapped, reason, message) = os_mapped(&report.outcome, live);
             let d9 = report.d9.as_ref();
             let provides = d9
                 .map(|d| {
@@ -592,6 +614,9 @@ fn os_module_items(state: &AppState) -> Vec<Item> {
                 }
                 if let Some(message) = message {
                     detail["message"] = json!(message);
+                }
+                if squats_builtin_name(&report.outcome) {
+                    detail["package"] = json!(report.name);
                 }
                 i.detail = Some(detail);
             })
