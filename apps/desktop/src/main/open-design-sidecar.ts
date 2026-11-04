@@ -281,7 +281,12 @@ const INERT_TREE: SidecarTreeController = { signal: async () => {}, isEmpty: asy
 const STDERR_TAIL_BYTES = 2_000
 const READY_LINE_LIMIT_BYTES = 16_384
 
-/** Fail closed: a pid file alone never grants signal authority. */
+/**
+ * Reports, never signals, a launcher left over from an earlier app run.
+ * A pid file plus a `ps` snapshot cannot prove the group is still ours by the time a
+ * signal lands (the id can be reused in between), so cross-run cleanup is left to a
+ * lifetime-bound supervisor (sidecar-host). This only logs what it finds.
+ */
 export function reapStaleLauncher(
   pidFile: string,
   plan: OpenDesignLaunchPlan,
@@ -296,17 +301,13 @@ export function reapStaleLauncher(
     if (!Number.isSafeInteger(pid) || pid < 2 || pid === process.pid) return
     kill(-pid, 0)
     const expected = `${pid} ${plan.runtimeExecutable} ${plan.headlessEntry} --config ${plan.configPath}`
-    // Only a live leader with the exact launcher command line proves ownership. A
-    // leaderless group has no such proof: a command line that merely mentions an app
-    // directory is not evidence, so it is left alone (fail closed) and only logged.
     try { kill(pid, 0) } catch (error) {
       if (errnoCode(error) === 'ESRCH') logger.warn('open-design.stale-group-unverified', { pid })
       return
     }
     if (ps(pid).trim().replace(/^([0-9]+)\s+/, '$1 ') !== expected) return
-    kill(-pid, 'SIGKILL')
-    fs.unlinkSync(pidFile)
-  } catch { /* Missing, dead, inaccessible or unverifiable: never guess ownership. */ }
+    logger.warn('open-design.stale-launcher-running', { pid })
+  } catch { /* Missing, dead, inaccessible or unverifiable: nothing to report. */ }
 }
 
 export class OpenDesignLauncher implements SidecarLauncher {

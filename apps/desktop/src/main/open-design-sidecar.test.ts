@@ -427,20 +427,21 @@ describe('PR1580 launcher regressions', () => {
     child.emit('exit', 0, null)
     expect(fs.existsSync(file)).toBe(false)
   })
-  it('F2 reaps only a live group with an exact ps launcher identity before spawn', () => {
+  it('F2 only reports a live leftover launcher and never signals it', () => {
+    // A pid file and a ps snapshot cannot prove the id still names our group when the
+    // signal lands, so a leftover launcher from an earlier run is logged, not killed.
     const current = plan()
     fs.mkdirSync(current.runtimeRoot, { recursive: true })
     const file = path.join(current.runtimeRoot, 'open-design.pgid')
     fs.writeFileSync(file, '4321')
     const kill = vi.fn()
+    const warn = vi.fn()
     const ps = vi.fn(() => ` 4321 ${current.runtimeExecutable} ${current.headlessEntry} --config ${current.configPath}\n`)
-    const spawn = vi.fn(() => {
-      expect(kill).toHaveBeenCalledWith(-4321, 'SIGKILL')
-      return new FakeChild() as unknown as ChildProcess
-    })
-    const launcher = new OpenDesignLauncher(() => current, spawn as never, okFetch(), logger, 'linux', kill, ps)
+    const launcher = new OpenDesignLauncher(() => current, vi.fn(() => new FakeChild() as unknown as ChildProcess) as never, okFetch(), { info: vi.fn(), warn }, 'linux', kill, ps)
     void launcher.launch().ready.catch(() => {})
     expect(ps).toHaveBeenCalledExactlyOnceWith(4321)
+    expect(kill.mock.calls.filter(([pid, signal]) => signal === 'SIGKILL' && pid === -4321)).toEqual([])
+    expect(warn).toHaveBeenCalledWith('open-design.stale-launcher-running', { pid: 4321 })
   })
   it.each(['missing', 'invalid', 'dead', 'permission', 'wrong-command', 'wrong-group', 'ps-failed'])('F2 refuses stale reap when %s', (cause) => {
     const current = plan()
