@@ -91,6 +91,22 @@ for b in agent24d agent24; do
   [[ -f "$APP/Contents/Resources/backend/$b" ]] || fail "缺少 Contents/Resources/backend/$b"
   check_bin "$APP/Contents/Resources/backend/$b"
 done
+# T1-3：随包的 documents 模块。App 首次启动时按 ADR-038 §4 验这两个程序
+# （Team ID 与 App 一致、带 runtime），过不了就不装，所以这里先按同一规则断言。
+APP_TEAM="$(codesign -dv "$APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+DOCMOD="$APP/Contents/Resources/documents-module"
+[[ -f "$DOCMOD/domain-os.yml" ]] || fail "缺少 Contents/Resources/documents-module/domain-os.yml"
+for b in agent24-documents agent24-documents-pdfkit; do
+  f="$DOCMOD/bin/$b"
+  [[ -f "$f" ]] || fail "缺少 Contents/Resources/documents-module/bin/$b"
+  check_bin "$f"
+  if [[ "$APP_TEAM" =~ ^[A-Z0-9]{10}$ ]]; then
+    codesign --verify --strict -R "=anchor apple generic and certificate leaf[subject.OU] = \"$APP_TEAM\"" "$f" 2>&1 \
+      || { echo "TEAM-MISMATCH  documents-module/bin/$b（App 的 Team ID：$APP_TEAM）"; BAD=1; }
+  elif [[ "$EXPECT_NOTARIZED" == 1 ]]; then
+    echo "App 没有 Team ID（$APP_TEAM）"; BAD=1
+  fi
+done
 # 其余 Resources 下的 Mach-O（含 .node / 辅助二进制），逐个必须已签
 while IFS= read -r f; do
   [[ "$f" == "$APP/Contents/Resources/backend/agent24d" || "$f" == "$APP/Contents/Resources/backend/agent24" ]] && continue

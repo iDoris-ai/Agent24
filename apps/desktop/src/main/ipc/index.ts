@@ -26,9 +26,11 @@ import { readOmlxSettingsKey } from '../omlx-settings-key'
 import type { IpcGuard } from './guard'
 import { documentsCall } from '../documents'
 import { importFile } from '../documents-import'
+import type { ModuleActionResult } from '../documents-module'
 import { IpcChannels } from '../../shared/ipc-types'
 import type {
   CommImportPickResult,
+  DocumentsModuleStatus,
   KnowledgeSettingsResult,
   KnowledgeStatus,
   BackendEndpointResult,
@@ -202,6 +204,17 @@ function reachesPrefix(prefix: RegExp, requestPath: string): boolean {
   } catch {
     return false
   }
+}
+
+/** How long the Documents page waits for the daemon's module list. */
+const DOCUMENTS_STATUS_TIMEOUT_MS = 5_000
+
+/** The documents entry of `GET /api/v1/os` (os.json as the daemon sees it), or
+ * undefined when the daemon does not list it or did not answer. */
+async function documentsOsEntry(timeoutMs?: number): Promise<{ name?: unknown; enabled?: unknown } | undefined> {
+  const list = await proxyToBackend({ method: 'GET', path: '/api/v1/os' }, timeoutMs)
+  const mods = (list.data as { modules?: { name?: unknown; enabled?: unknown }[] } | null)?.modules
+  return list.ok && Array.isArray(mods) ? mods.find((m) => m.name === 'documents') : undefined
 }
 
 /** Ready-to-use daemon access for main-process code (not allowlisted: callers
@@ -481,6 +494,18 @@ const cancelled = (): BackendProxyResponse =>
 const invalidRequest = (message: string): BackendProxyResponse =>
   ({ ok: false, status: 400, data: { error: { code: 'invalid_request', message } } })
 
+const moduleActionUnavailable = (): BackendProxyResponse =>
+  ({ ok: false, status: 404, data: { error: { code: 'no_bundle', message: mt('err.docmodNoBundle') } } })
+/** A T1-2 action's result as the page reads any IPC answer; the code is passed through. */
+function moduleActionResponse(result: ModuleActionResult, externalDaemon: boolean): BackendProxyResponse {
+  if (result.ok) return { ok: true, status: 200, data: { ok: true } }
+  const status = result.code === 'already_installed' ? 409 : result.code === 'no_bundle' ? 404 : 500
+  // A daemon started outside the app is not ours to stop; one that holds the
+  // database lock makes the CLI fail, and stopping it is the user's call.
+  const hint = externalDaemon && result.code === 'cli_failed' ? `\n${mt('err.docmodExternal')}` : ''
+  return { ok: false, status, data: { error: { code: result.code, message: `${mt('err.docmodFailed', { reason: clip(result.message, 300) })}${hint}` } } }
+}
+
 export function registerIpcHandlers(options: {
   /** Test seam: where to look for the user's `~/.omlx/settings.json`. */
   omlxSettingsPath?: string
@@ -490,6 +515,13 @@ export function registerIpcHandlers(options: {
   guard: IpcGuard
   /** The Knowledge settings, once main has built them. */
   knowledge?: () => KnowledgeController | null
+  /** T1-1/T1-2: the documents module as it is on disk now. */
+  documentsModule?: () => DocumentsModuleStatus
+  /** T1-2: uninstall it / install the one the app carries (the app's CLI). */
+  documentsModuleActions?: {
+    uninstall: () => Promise<ModuleActionResult>
+    install: () => Promise<ModuleActionResult>
+  }
   /** Test seam: the main-owned backup-password window. */
   promptBackupPassword?: (parent: BrowserWindow | null) => Promise<string | null>
   /** Test seam: the main-owned restore-password window. */
@@ -510,6 +542,9 @@ export function registerIpcHandlers(options: {
   const promptHomeImportPassword = options.promptHomeImportPassword ?? openHomeImportPasswordWindow
   const exportTimeout = options.exportTimeoutMs ?? { current: EXPORT_TIMEOUT_MS }
   const knowledge = options.knowledge ?? (() => null)
+  const documentsModule = options.documentsModule
+    ?? ((): DocumentsModuleStatus => ({ bundled: false, installed: false, externalDaemon: false }))
+  const documentsModuleActions = options.documentsModuleActions ?? null
   app.on('before-quit', () => { quitting = true })
   omlxSettingsPath = options.omlxSettingsPath
   const handle: typeof ipcMain.handle = (channel, listener) => ipcMain.handle(channel, options.guard(listener))
@@ -635,6 +670,11 @@ export function registerIpcHandlers(options: {
   handle(IpcChannels.DocumentsRequest, (_event, req: unknown) =>
     documentsCall(req, daemonCliEndpoint),
   )
+  handle(IpcChannels.DocumentsModuleStatus, async (): Promise<DocumentsModuleStatus> => {
+    const status = documentsModule()
+    const mod = await documentsOsEntry(DOCUMENTS_STATUS_TIMEOUT_MS)
+    return mod ? { ...status, turnedOff: mod.enabled === false } : status
+  })
   handle(IpcChannels.DocumentsImportFile, async (event) => {
     const window = BrowserWindow.fromWebContents(event.sender)
     const options: Electron.OpenDialogOptions = {
@@ -1103,6 +1143,12 @@ export function registerIpcHandlers(options: {
     exclusive(async () => {
       if (typeof name !== 'string' || !SAFE_ID.test(name) || name === '.' || name === '..') return invalidRequest('invalid module name')
       if (typeof enabled !== 'boolean') return invalidRequest('enabled must be a boolean')
+      // T1-2: documents uninstalled, but a daemon that has not restarted still
+      // lists it. Turning it off now writes an os.json entry for a module that
+      // is gone, and the next start degrades every module (unknown_disabled).
+      if (name === 'documents' && !enabled && !documentsModule().installed) {
+        return { ok: false, status: 409, data: { error: { code: 'not_installed', message: mt('err.docmodNotInstalled') } } }
+      }
       const list = await proxyToBackend({ method: 'GET', path: '/api/v1/os' })
       const mods = (list.data as { modules?: { name?: unknown; enabled?: unknown; version?: unknown }[] } | null)?.modules
       const mod = list.ok && Array.isArray(mods) ? mods.find((m) => m.name === name) : undefined
@@ -1120,6 +1166,49 @@ export function registerIpcHandlers(options: {
       )
       if (!ok) return cancelled()
       return proxyToBackend({ method: 'PATCH', path: `/api/v1/os/${encodeURIComponent(name)}`, body: { enabled } })
+    }),
+  )
+
+  // T1-2: uninstall the documents module, or install the one the app carries.
+  // The page names nothing: the module is fixed here. Each is confirmed in a
+  // native dialog, then runs the app's CLI (`agent24 os uninstall|install`),
+  // the same code the CLI user runs; the daemon picks it up when it next
+  // starts. Uninstall leaves the module's data; the app then stops
+  // installing it at launch until the user installs it here again.
+  handle(IpcChannels.OsModuleUninstall, (event): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      if (!documentsModuleActions) return moduleActionUnavailable()
+      if (!documentsModule().installed) {
+        return { ok: false, status: 404, data: { error: { code: 'not_installed', message: mt('err.docmodNotInstalled') } } }
+      }
+      // Only a module the daemon serves and has switched on. A turned-off one
+      // leaves `documents: {enabled: false}` in os.json; once the package is
+      // gone that entry names nothing, and at the next start the daemon
+      // degrades EVERY module (domain.rs `unknown_disabled`). The daemon owns
+      // os.json, so: turn it on here first, then uninstall.
+      const mod = await documentsOsEntry()
+      if (!mod) {
+        return { ok: false, status: 404, data: { error: { code: 'module_unavailable', message: mt('err.moduleUnavailable') } } }
+      }
+      if (mod.enabled !== true) {
+        return { ok: false, status: 409, data: { error: { code: 'module_disabled', message: mt('err.docmodDisabled') } } }
+      }
+      const ok = await confirmNative(event, mt('docmod.uninstall'), mt('docmod.uninstallDetail'))
+      if (!ok) return cancelled()
+      return moduleActionResponse(await documentsModuleActions.uninstall(), documentsModule().externalDaemon)
+    }),
+  )
+  handle(IpcChannels.OsModuleInstallBundled, (event): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      if (!documentsModuleActions) return moduleActionUnavailable()
+      const status = documentsModule()
+      if (!status.bundled) return moduleActionUnavailable()
+      if (status.installed) {
+        return { ok: false, status: 409, data: { error: { code: 'already_installed', message: mt('err.docmodAlreadyInstalled') } } }
+      }
+      const ok = await confirmNative(event, mt('docmod.install'), mt('docmod.installDetail'))
+      if (!ok) return cancelled()
+      return moduleActionResponse(await documentsModuleActions.install(), documentsModule().externalDaemon)
     }),
   )
 

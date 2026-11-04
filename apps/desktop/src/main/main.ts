@@ -11,6 +11,19 @@ import { BackendManager, daemonAuthMode, daemonConnection, onDaemonReady, setBun
 import { PresencePoller, defaultPresenceDeps, showPresenceDialog } from './presence-poller'
 import { AgentEarEventBridge } from './agentear-events'
 import { documentsEvent } from './documents'
+import { cliBinary } from './documents-cli'
+import {
+  CODESIGN,
+  type BundledModuleDeps,
+  documentsModuleOnDisk,
+  ensureBundledDocumentsModule,
+  execCli,
+  installBundledDocumentsModule,
+  packagesRootFor,
+  type ModuleActionResult,
+  uninstallDocumentsModule,
+} from './documents-module'
+import { tryDataDir } from './data-dir'
 import { AgentEarEventLog } from './agentear-log'
 import { ModelCallLog } from './model-call-log'
 import { IpcChannels } from '../shared/ipc-types'
@@ -103,6 +116,20 @@ let creativeOrigin: string | null = null
 // The sidecar instance the view last loaded; a new instance forces a reload even on the same port.
 let creativeLoadedInstanceId: string | null = null
 const creativeViewFence = new CreativeViewRequestFence()
+
+/** Resolves once the daemon has announced readiness (now, or within `timeoutMs`). */
+function daemonReady(timeoutMs: number): Promise<void> {
+  if (daemonConnection()) return Promise.resolve()
+  return new Promise((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer)
+      off()
+      resolve()
+    }
+    const timer = setTimeout(done, timeoutMs)
+    const off = onDaemonReady(done)
+  })
+}
 
 function normalizedBounds(bounds: CreativeViewBounds): Electron.Rectangle {
   return {
@@ -337,6 +364,38 @@ app.whenReady().then(async () => {
   // deciding to reuse vs. spawn) — nothing here awaits it; tray/IPC callers
   // read `backendManager.status()` / `getBackendEndpoint()` live, so this
   // resolving a beat later than the old synchronous spawn is harmless.
+  //
+  // T1-1 (#1159 Q1 = A): the documents module the mac app carries is
+  // installed first, so the daemon this start spawns mounts it: start() waits
+  // for it, and tray actions in the meantime only record what the user wants.
+  // Never rejects; a failure is a warning and the daemon starts all the same.
+  const documentsDeps: BundledModuleDeps = {
+    bundleDir: app.isPackaged && process.platform === 'darwin'
+      ? path.join(process.resourcesPath, 'documents-module')
+      : null,
+    // Contents/Resources → the .app whose signature sets the rule.
+    appBundle: app.isPackaged ? path.resolve(process.resourcesPath, '..', '..') : null,
+    codesign: execCli(CODESIGN),
+    packagesRoot: packagesRootFor(process.env, tryDataDir()),
+    userDataDir: app.getPath('userData'),
+    runCli: execCli(cliBinary()),
+    warn: (message) => console.warn(message),
+    info: (message) => console.log(message),
+  }
+  const documentsModuleReady = ensureBundledDocumentsModule(documentsDeps)
+  backendManager.holdStartUntil(documentsModuleReady)
+  const documentsModuleAction = async (run: () => Promise<ModuleActionResult>): Promise<ModuleActionResult> => {
+    await documentsModuleReady
+    const external = backendManager.isExternalDaemon()
+    let result: ModuleActionResult
+    try {
+      result = await backendManager.whileStopped(run)
+    } catch (error) {
+      result = { ok: false, code: 'daemon_running', message: error instanceof Error ? error.message : String(error) }
+    }
+    if (!external && backendManager.status() !== 'stopped') await daemonReady(30_000)
+    return result
+  }
   void backendManager.start()
   // CORE-2 AgentEar S3: native confirmation for elevated operations. Idle until
   // the daemon runs in capabilities mode (main then holds the ProductHost
@@ -374,7 +433,24 @@ app.whenReady().then(async () => {
     })
   })
 
-  registerIpcHandlers({ guard, knowledge: () => knowledge })
+  registerIpcHandlers({
+    guard,
+    knowledge: () => knowledge,
+    // T1-1/T1-2: what is on disk now. A daemon reads installed packages only
+    // when it starts, so the pages compare this with what it serves (§9 Q2).
+    documentsModule: () => ({
+      ...documentsModuleOnDisk(documentsDeps.bundleDir, documentsDeps.packagesRoot),
+      externalDaemon: backendManager.externalDaemonPid() !== null,
+    }),
+    // T1-2: after the launch check, never alongside it. The daemon this app
+    // spawned is stopped around the CLI run (it holds the database lock the
+    // CLI needs to revoke consent) and comes back with the change applied;
+    // the page reloads once it is ready again.
+    documentsModuleActions: {
+      uninstall: () => documentsModuleAction(() => uninstallDocumentsModule({ ...documentsDeps, now: () => new Date() })),
+      install: () => documentsModuleAction(() => installBundledDocumentsModule(documentsDeps)),
+    },
+  })
   cliTool = registerCliTool({
     guard, executable: process.execPath, resources: process.resourcesPath, packaged: app.isPackaged,
     changed: refreshTray,

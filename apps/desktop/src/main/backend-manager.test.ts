@@ -14,6 +14,7 @@ import {
   requestDaemonShutdown,
   readExternalDaemonState,
   BackendManager,
+  DAEMON_EXIT_WAIT_MS,
   selectedBackend,
   resolveNodeEntryFrom,
   resolveRustBinary,
@@ -207,6 +208,191 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
       manager.stop()
       vi.useRealTimers()
     }
+  })
+
+  // T1-1: start() waits for the bundled documents module to be installed.
+  describe('start gate (T1-1)', () => {
+    function gate() {
+      let open!: () => void
+      const promise = new Promise<void>((resolve) => { open = resolve })
+      return { promise, open }
+    }
+    const absent = () => withProbe({ read: () => null, checkHealth: vi.fn().mockResolvedValue(false) })
+
+    it('spawns only after the gate opens', async () => {
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      const g = gate()
+      manager.holdStartUntil(g.promise)
+      const starting = manager.start()
+      await Promise.resolve()
+      expect(spawnProcess).not.toHaveBeenCalled()
+      g.open()
+      await starting
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      manager.stop()
+    })
+
+    it('a tray stop while held keeps the daemon down', async () => {
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      const g = gate()
+      manager.holdStartUntil(g.promise)
+      const starting = manager.start()
+      manager.stopDaemon()
+      g.open()
+      await starting
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(manager.status()).toBe('stopped')
+      manager.startDaemon()
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      manager.stop()
+    })
+
+    it('a tray restart or start while held spawns nothing early, and once after the gate', async () => {
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      const g = gate()
+      manager.holdStartUntil(g.promise)
+      const starting = manager.start()
+      manager.stopDaemon()
+      manager.restart()
+      manager.startDaemon()
+      expect(spawnProcess).not.toHaveBeenCalled()
+      g.open()
+      await starting
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      manager.stop()
+    })
+
+    it('quitting while held spawns nothing', async () => {
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      const g = gate()
+      manager.holdStartUntil(g.promise)
+      const starting = manager.start()
+      manager.stop()
+      g.open()
+      await starting
+      expect(spawnProcess).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('whileStopped (T1-2)', () => {
+    const absent = () => withProbe({ read: () => null, checkHealth: vi.fn().mockResolvedValue(false) })
+
+    it('stops its own daemon, waits for it to exit, runs the work, then starts it again', async () => {
+      const first = fakeChild(111)
+      const spawnProcess = vi.fn().mockReturnValueOnce(first).mockReturnValue(fakeChild(222))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      await manager.start()
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      const seen: string[] = []
+      const work = vi.fn(async () => { seen.push('work'); return 'done' })
+      const running = manager.whileStopped(work)
+      await Promise.resolve()
+      expect(first.kill).toHaveBeenCalledWith('SIGTERM')
+      // The lock is held until the process is gone: nothing runs before that.
+      expect(work).not.toHaveBeenCalled()
+      seen.push('exit')
+      ;(first as unknown as EventEmitter).emit('exit', 0)
+      expect(await running).toBe('done')
+      expect(seen).toEqual(['exit', 'work'])
+      expect(spawnProcess).toHaveBeenCalledTimes(2)
+      manager.stop()
+    })
+
+    it('a daemon the user had stopped stays stopped', async () => {
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      await manager.start()
+      manager.stopDaemon()
+      expect(await manager.whileStopped(async () => 1)).toBe(1)
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      expect(manager.status()).toBe('stopped')
+      manager.stop()
+    })
+
+    it('the work failing still brings the daemon back', async () => {
+      const first = fakeChild(111)
+      const spawnProcess = vi.fn().mockReturnValueOnce(first).mockReturnValue(fakeChild(222))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      await manager.start()
+      const running = manager.whileStopped(async () => { throw new Error('boom') })
+      ;(first as unknown as EventEmitter).emit('exit', 0)
+      await expect(running).rejects.toThrow('boom')
+      expect(spawnProcess).toHaveBeenCalledTimes(2)
+      manager.stop()
+    })
+
+    it('a daemon that does not exit in time: the work is not run (it would hit the lock)', async () => {
+      const first = fakeChild(111)
+      const spawnProcess = vi.fn().mockReturnValueOnce(first).mockReturnValue(fakeChild(222))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      await manager.start()
+      const work = vi.fn(async () => 'late')
+      await expect(manager.whileStopped(work, 20)).rejects.toThrow(/did not exit within/)
+      expect(work).not.toHaveBeenCalled()
+      manager.stop()
+    })
+
+    it('waits as long as the CLI waits for a stopping daemon', () => {
+      expect(DAEMON_EXIT_WAIT_MS).toBeGreaterThanOrEqual(55_000)
+    })
+
+    it('a tray start or restart meanwhile spawns nothing until the work is done, then once', async () => {
+      const first = fakeChild(111)
+      const spawnProcess = vi.fn().mockReturnValueOnce(first).mockReturnValue(fakeChild(222))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      await manager.start()
+      let finish!: () => void
+      const running = manager.whileStopped(() => new Promise<void>((r) => { finish = r }))
+      manager.startDaemon()
+      manager.restart()
+      ;(first as unknown as EventEmitter).emit('exit', 0)
+      await vi.waitFor(() => expect(finish).toBeDefined())
+      manager.restart()
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      finish()
+      await running
+      expect(spawnProcess).toHaveBeenCalledTimes(2)
+      manager.stop()
+    })
+
+    it('a tray stop meanwhile is kept: not brought back afterwards', async () => {
+      const first = fakeChild(111)
+      const spawnProcess = vi.fn().mockReturnValueOnce(first).mockReturnValue(fakeChild(222))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      await manager.start()
+      let finish!: () => void
+      const running = manager.whileStopped(() => new Promise<void>((r) => { finish = r }))
+      ;(first as unknown as EventEmitter).emit('exit', 0)
+      await vi.waitFor(() => expect(finish).toBeDefined())
+      manager.stopDaemon()
+      finish()
+      await running
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      expect(manager.status()).toBe('stopped')
+      manager.startDaemon()
+      expect(spawnProcess).toHaveBeenCalledTimes(2)
+      manager.stop()
+    })
+
+    it('a reused external daemon is not stopped', async () => {
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const external: ExternalDaemonSource = {
+        ...launchAgent(),
+        read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }),
+        checkHealth: vi.fn().mockResolvedValue(true),
+        fetchHealth: vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
+      }
+      const manager = new BackendManager({ external, spawnProcess })
+      await manager.start()
+      expect(await manager.whileStopped(async () => 'ran')).toBe('ran')
+      expect(manager.isExternalDaemon()).toBe(true)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      manager.stop()
+    })
   })
 
   it('daemon.json present and healthy → reuses it, never spawns', async () => {

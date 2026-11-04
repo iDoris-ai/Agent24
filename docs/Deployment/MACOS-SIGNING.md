@@ -53,6 +53,7 @@ SKIP_NOTARIZE=1 bash apps/desktop/scripts/release-mac.sh   # 只签名，本地�
 - 公证放在脚本里调 `notarytool --keychain-profile`：凭据留在 keychain，与 10-16 手工流程完全一致，且**公证对象是 dmg 本身**（内含 app 的票据一并登记），再 `staple` 到 dmg，离线机器打开 dmg 也能通过。
 - 因此 `package.json` 里 `mac.notarize=false`，签名由 electron-builder 完成（`hardenedRuntime`、`entitlements`、`entitlementsInherit`、`binaries`、`dmg.sign`）。
 - `mac.binaries` 显式列出 `Contents/Resources/backend/agent24d` 和 `Contents/Resources/backend/agent24`（路径相对 `.app`）。桌面端的文档导入和文档操作都调用打进包里的 `agent24` CLI（DOC-1-43、DOC-1-45），所以它和 `agent24d` 一样要签名、启用 Hardened Runtime。
+- `mac.binaries` 还列出 documents 模块的两个程序 `Contents/Resources/documents-module/bin/agent24-documents`、`…/agent24-documents-pdfkit`（T1-3）。见下一节。
 
 ### Entitlements（`apps/desktop/build/entitlements.mac.plist`）
 
@@ -71,6 +72,16 @@ bash scripts/sign-cli-mac.sh bin/sin90 bin/cos72  # 或显式传入路径
 `codesign --force --options runtime --timestamp` → 打 zip → `notarytool submit --wait` → 输出 `dist/mac-cli/`（二进制、zip、`notarize-submission.json`、`SHA256SUMS`）。
 
 **裸二进制不能 staple**：票据只能附着在 `.app/.pkg/.dmg`。分发 zip 即可：用户（浏览器下载带 quarantine）首次运行时 Gatekeeper 在线查询票据；完全离线机器首次运行会被拦。要离线可用，请把 CLI 装进 `.pkg` 或 dmg 再公证 staple（未做）。`tar` 解压或 `curl` 下载不带 quarantine，不触发 Gatekeeper，行为与未签名一致。
+
+## documents 模块（随包分发，T1-1 / T1-3）
+
+App 把 documents OS 模块带在 `Contents/Resources/documents-module/`（`domain-os.yml`、`bin/agent24-documents`、`bin/agent24-documents-pdfkit`），首次启动、daemon 启动之前用包内 `agent24 os install` 装进模块目录（ADR-DOC-01 D6）。
+
+- `release-mac.sh` 第 1 步多编 `-p agent24-documents`；第 2a 步调 `scripts/stage-documents-module.sh`，从 `$CARGO_OUT` 取 `agent24-documents`，用 `swiftc` 编 pdfkit 引擎（macOS 13 以上），拼进 `apps/desktop/.documents-module/`。
+- 第 3 步 electron-builder 用同一个 Developer ID、启用 Hardened Runtime 给两个程序签名（`mac.binaries`）。签名会改写字节，所以包内不带 `SHA256SUMS`；App 安装前改为验代码签名：先验 App 自身的封存，再要求两个程序满足 `anchor apple generic and certificate leaf[subject.OU] = "<App 的 Team ID>"` 且 flags 含 `runtime`。过不了就不装，只记一行 warn。
+- 第 6 步 `verify-mac-signing.sh` 按同一规则断言：三个文件都在，两个程序带 `runtime`，并且 Team ID 与 App 一致（`TEAM-MISMATCH` 即失败）。App 没有 Team ID 时，只有带 `--expect-notarized` 才算失败。
+- 体积：模块约十几 MB，DMG 仍受 `A24_DMG_MAX_MB`（默认 250）约束。
+- 验收（任务书 T1-3）：`codesign -dv --verbose=2` 对两个程序显示 Developer ID 与 Hardened Runtime；`spctl -a -t exec -vv` 对 App 通过；再用正式包做 T1-1 验收 (2)(3)、T1-2 验收 (2)(3)(4)。
 
 ## Open Design 按需组件（darwin-arm64）
 
