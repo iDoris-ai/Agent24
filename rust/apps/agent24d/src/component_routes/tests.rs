@@ -4073,3 +4073,24 @@ async fn a_credential_that_moves_during_the_ready_request_makes_the_answer_stale
     assert_eq!(fake.ready_hits(), 1, "§8 went out");
     assert!(assessed.stale, "its answer was used although the key moved");
 }
+
+// ---- #1579 review: F2 ----
+
+/// `1e-400` underflows to `0.0` as a float, but its text is not zero: it is a
+/// fraction, not the integer 0, so it is not success. A zero mantissa still is.
+#[tokio::test]
+async fn an_envelope_code_that_underflows_to_zero_is_not_success() {
+    for code in ["1e-400", "-1e-400", "0.000001e-400", "5E-999"] {
+        let fake = serve(Script::Reply(200, with_code(code))).await;
+        let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
+        let host = shown(&item);
+        assert_eq!(host["state"], "failed", "code {code}");
+        assert_eq!(host["reason"], "upstream_error", "code {code}");
+        assert_no_canary(&item, &["LEAK-union"]);
+    }
+    for code in ["0e-400", "0.0e-400", "-0.0E999"] {
+        let fake = serve(Script::Reply(200, with_code(code))).await;
+        let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
+        assert_eq!(shown(&item)["state"], "ready", "code {code}");
+    }
+}

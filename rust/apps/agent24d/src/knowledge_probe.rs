@@ -758,7 +758,7 @@ fn parse(body: &[u8]) -> Result<Decl, ParseError> {
     let value: Value = serde_json::from_slice(body).map_err(|_| ParseError::Malformed)?;
     // A non-success envelope is the upstream's answer. `data: {}` (or a
     // document that is not a declaration) must not be judged as the contract.
-    if let Some(code) = upstream_code(&value) {
+    if let Some(code) = upstream_code(&value, raw_code(body).as_deref()) {
         return Err(ParseError::Upstream(code));
     }
     if let Some(data) = value.get("data") {
@@ -876,14 +876,37 @@ fn integral(n: &Number) -> Option<i128> {
     (f.is_finite() && f.fract() == 0.0 && f.abs() < EXACT).then_some(f as i128)
 }
 
+/// The text of the envelope's top-level `code`, as sent. A `Number` has already
+/// lost it (`1e-400` is `0.0`).
+fn raw_code(body: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Top<'a> {
+        #[serde(borrow)]
+        code: Option<&'a serde_json::value::RawValue>,
+    }
+    let top: Top<'_> = serde_json::from_slice(body).ok()?;
+    top.code.map(|raw| raw.get().to_owned())
+}
+
+/// Whether a JSON number's text has a nonzero digit before any exponent: the
+/// value is not zero, whatever a float made of it.
+fn nonzero_mantissa(text: &str) -> bool {
+    text.split(['e', 'E'])
+        .next()
+        .is_some_and(|mantissa| mantissa.bytes().any(|b| (b'1'..=b'9').contains(&b)))
+}
+
 /// A numeric or token `code` other than success. Only the integer `0` (however
 /// it is written: `0`, `-0`, `0.0`, `0e5`) is a numeric success. A fraction or
 /// a magnitude [`integral`] cannot read is `upstream_error`, not a pass. Free text is also
 /// `upstream_error`, so the server's sentence is not copied.
-fn upstream_code(value: &Value) -> Option<String> {
+fn upstream_code(value: &Value, raw: Option<&str>) -> Option<String> {
     let code = value.get("code")?;
     match code {
         Value::Number(n) => match integral(n) {
+            // `1e-400` reads as `0.0` once it is a float. Its text says it is
+            // not zero (a fraction too small for f64), so it is not success.
+            Some(0) if raw.is_some_and(nonzero_mantissa) => Some("upstream_error".to_owned()),
             Some(0) => None,
             Some(n) => Some(format!("upstream_{n}")),
             None => Some("upstream_error".to_owned()),

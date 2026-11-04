@@ -41,6 +41,8 @@ use crate::knowledge_host::{
 const DEADLINE_MS: u64 = 15_000;
 const TRANSPORT_SLACK: Duration = Duration::from_secs(2);
 const MAX_CONCURRENCY: u64 = 4;
+/// How many times the D3 gate is run for a run whose endpoint changes under it.
+const GATE_ROUNDS: usize = 3;
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -158,26 +160,41 @@ impl DaemonKnowledgeBackend {
         run_id: &str,
         operation: &str,
     ) -> Result<(RunBinding, BindingNow), Failure> {
-        let (pin, now) = self.binding(run_id).await?;
+        let mut current = self.binding(run_id).await?;
         if !self.contract_gate {
-            return Ok((pin, now));
+            return Ok(current);
         }
-        let base_url = now
-            .endpoint
-            .as_ref()
-            .ok_or(local(LocalReason::ProfileInactive, false))?
-            .base_url
-            .clone();
-        match self
-            .registry
-            .contract_gate(&base_url, operation, std::time::Instant::now())
-            .await
-        {
-            ContractGate::Open => {}
-            ContractGate::Incompatible => return Err(local(LocalReason::Incompatible, false)),
-            ContractGate::NoDeclaration => return Err(local(LocalReason::NotReady, true)),
+        for _ in 0..GATE_ROUNDS {
+            let base_url = current
+                .1
+                .endpoint
+                .as_ref()
+                .ok_or(local(LocalReason::ProfileInactive, false))?
+                .base_url
+                .clone();
+            match self
+                .registry
+                .contract_gate(&base_url, operation, std::time::Instant::now())
+                .await
+            {
+                ContractGate::Open => {}
+                ContractGate::Incompatible => return Err(local(LocalReason::Incompatible, false)),
+                ContractGate::NoDeclaration => return Err(local(LocalReason::NotReady, true)),
+            }
+            let again = self.binding(run_id).await?;
+            // Only an endpoint and activation that passed the gate are used. If
+            // the run now names another one, that one has not been checked:
+            // go round again for it instead of sending to it.
+            let same = again.1.generation == current.1.generation
+                && again.1.endpoint.as_ref().map(|e| e.base_url.as_str())
+                    == Some(base_url.as_str());
+            if same {
+                return Ok(again);
+            }
+            current = again;
         }
-        self.binding(run_id).await
+        // The run kept moving between endpoints while the gate waited.
+        Err(local(LocalReason::NotReady, true))
     }
 
     /// The run's binding as it is now, or why the call cannot go out.

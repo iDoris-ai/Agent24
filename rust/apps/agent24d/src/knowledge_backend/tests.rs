@@ -919,3 +919,82 @@ async fn a_credential_revoked_while_the_gate_waits_is_not_sent() {
         "a transport was built from the old key"
     );
 }
+
+/// `Runs` that runs `hook` when it is asked the `at`-th time (1-based).
+struct HookRuns {
+    runs: Runs,
+    asked: AtomicUsize,
+    at: usize,
+    hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+#[async_trait]
+impl RunSelector for HookRuns {
+    async fn knowledge_binding_id(&self, run_id: &str) -> Option<String> {
+        if self.asked.fetch_add(1, Ordering::SeqCst) + 1 == self.at
+            && let Some(hook) = self.hook.lock().unwrap().take()
+        {
+            hook();
+        }
+        self.runs.knowledge_binding_id(run_id).await
+    }
+}
+
+/// F1 of #1579: the run is re-pinned to another endpoint between the gate and
+/// the second read of the binding. That endpoint has not passed the gate, so
+/// nothing may be sent to it. Here it is incompatible: the gate runs again for
+/// it and refuses.
+#[tokio::test]
+async fn an_endpoint_the_run_moved_to_after_the_gate_is_gated_before_anything_is_sent() {
+    let (a, _, _) =
+        capabilities_server(200, capabilities_document("[1]", r#"["search","read"]"#)).await;
+    let (b, _, business_b) =
+        capabilities_server(200, capabilities_document("[2]", r#"["search","read"]"#)).await;
+    let registry = Arc::new(KnowledgeHostRegistry::default());
+    let endpoint = |base: &str| Endpoint {
+        base_url: base.to_owned(),
+        knowledge_base_ids: vec!["kb-a".into()],
+    };
+    registry.activate(HOST, BINDING, 5, endpoint(&a)).unwrap();
+    push(&registry, 6, "key-1");
+    let pin = |generation| RunBinding {
+        host: HOST.into(),
+        binding: BINDING.into(),
+        generation,
+    };
+    registry.pin_run(RUN, pin(5));
+    // The second time the backend asks which binding the run names (after the
+    // gate for A), the run is moved to B.
+    let swap = {
+        let registry = Arc::clone(&registry);
+        let b = b.clone();
+        Box::new(move || {
+            registry.activate(HOST, BINDING, 8, endpoint(&b)).unwrap();
+            push(&registry, 9, "key-2");
+            registry.pin_run(RUN, pin(8));
+        }) as Box<dyn FnOnce() + Send>
+    };
+    let runs = HookRuns {
+        runs: Runs(HashMap::from([(RUN.to_owned(), BINDING.to_owned())])),
+        asked: AtomicUsize::new(0),
+        at: 2,
+        hook: Mutex::new(Some(swap)),
+    };
+    let server = Arc::new(Server {
+        answer: Answer::Fixture("search.ok.json"),
+        during: Mutex::new(None),
+        sent: Mutex::new(Vec::new()),
+    });
+    let to = Arc::clone(&server);
+    let connect: Box<Connect> = Box::new(move |_base, _credential| {
+        let transport: Arc<dyn KnowledgeTransport> = to.clone();
+        Some(transport)
+    });
+    let backend =
+        DaemonKnowledgeBackend::with_connect(Arc::clone(&registry), Arc::new(runs), connect)
+            .gated();
+    let result = backend.search(RUN, query(None)).await;
+    refused_as(&result, LocalReason::Incompatible, false);
+    assert!(server.sent.lock().unwrap().is_empty(), "a request left");
+    assert_eq!(business_b.load(Ordering::SeqCst), 0);
+}
