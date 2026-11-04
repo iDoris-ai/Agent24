@@ -220,7 +220,7 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 
 **agent24d 的体量与瘦身（Q3 选 (B)，2026-11-04 拍板）**
 
-agent24d 非测试代码约 26,300 行，`server.rs` 一个文件 8,734 行（3,813 行之前是生产代码，`serve()` 一个函数就有约 1,530 行），分组见 [R1 §4](architecture/review-2026-11-03/R1-MODULE-MAP.md)（该文件在分支 `docs/arch-review-r1-module-map` 上）和 [方案 §5 Q3](tracking/2026-11-04/ARCH-OPTIMIZATION-PLAN.md)。结论：
+agent24d 非测试代码约 26,300 行，`server.rs` 一个文件 8,734 行（3,813 行之前是生产代码，`serve()` 一个函数就有约 1,530 行），分组见 R1 §4（`docs/architecture/review-2026-11-03/R1-MODULE-MAP.md`，在分支 `docs/arch-review-r1-module-map` 上，尚未合入 main）和 [方案 §5 Q3](tracking/2026-11-04/ARCH-OPTIMIZATION-PLAN.md)。结论：
 
 - **下沉三块**，每块都是业务逻辑，不是接线：
   - iDoris 托管（`idoris_host`、`provision`、`managed_idoris`，约 2,640 行）→ `agent24-idoris`；
