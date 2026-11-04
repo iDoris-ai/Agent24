@@ -553,21 +553,13 @@ impl RefusalReason {
     }
 }
 
-/// `sha256:` digest of the `domain-os.yml` this daemon is built with for the
-/// Documents package. Documents is a real package in the same repository and is
-/// the only package allowed to carry a builtin component name; it is recognised
-/// by this digest, because a name alone is chosen by whoever installs the package.
-fn bundled_documents_digest() -> String {
-    agent24_os_proto::manifest::manifest_digest(include_bytes!(
-        "../../agent24-documents/domain-os.yml"
-    ))
-}
-
-/// Whether a package may carry the name `name` (a builtin component id needs
-/// the bundled Documents manifest).
-fn component_name_allowed(name: &str, digest: &str) -> bool {
-    !crate::component_routes::BUILTIN_COMPONENT_IDS.contains(&name)
-        || (name == "documents" && digest == bundled_documents_digest())
+/// Whether a package may carry the name `name`. Every builtin component name is
+/// closed to user packages except `documents`: Documents is installed by the
+/// desktop from its own bundle, which may be a different build from this daemon,
+/// so nothing about the package (digest, version) is compared. What it may
+/// declare is limited instead: see [`crate::component_manifest::capability_id_reserved`].
+fn component_name_allowed(name: &str) -> bool {
+    name == "documents" || !crate::component_routes::BUILTIN_COMPONENT_IDS.contains(&name)
 }
 
 /// A module's `provides` against REGISTRY.md and the ids earlier modules took.
@@ -1327,9 +1319,7 @@ pub async fn mount_all(
         // `/components` lists the builtins itself, and a package named `hyphae`
         // would otherwise pass for the provider of Hyphae's capabilities. The
         // bundled Documents package is the one exception (by digest).
-        if let Build::Package(package) = &entry.build
-            && !component_name_allowed(&name, &package.digest)
-        {
+        if matches!(entry.build, Build::Package(_)) && !component_name_allowed(&name) {
             refuse_with(
                 MountOutcome::RefusedFor(
                     RefusalReason::ReservedComponentName,
@@ -3698,7 +3688,6 @@ raise SystemExit(3)
             ("idoris", true),
             ("knowledge", true),
             ("open-design", true),
-            ("documents", true),
             ("hyphae", false),
         ] {
             let tmp = tempfile::tempdir().unwrap();
@@ -3719,16 +3708,22 @@ raise SystemExit(3)
         }
     }
 
-    /// The real Documents package (the manifest bytes this daemon is built
-    /// with) is recognised by digest and not refused for its name. Positive
-    /// control for the test above.
+    /// Documents is installed by the desktop and may come from another build, so
+    /// a `documents` package is admitted whatever its manifest bytes are (here
+    /// they differ from the bundled file). Positive control for the name test.
     #[tokio::test]
-    async fn the_bundled_documents_package_keeps_its_name() {
+    async fn a_documents_package_with_a_different_digest_still_mounts() {
         let tmp = tempfile::tempdir().unwrap();
         let packages = tmp.path().join("packages");
         write_package(&packages, "documents");
+        append_provides(&packages, "documents", &["documents"]);
         let bundled = include_bytes!("../../agent24-documents/domain-os.yml");
-        std::fs::write(packages.join("documents").join("domain-os.yml"), bundled).unwrap();
+        let installed = std::fs::read(packages.join("documents").join("domain-os.yml")).unwrap();
+        assert_ne!(
+            installed,
+            bundled.to_vec(),
+            "the fixture must differ from the bundled file"
+        );
         let reports = mount_packages(tmp.path(), &packages, "{}").await;
         assert_eq!(reports.len(), 1);
         assert!(
@@ -3739,6 +3734,34 @@ raise SystemExit(3)
             "{:?}",
             reports[0].outcome
         );
+        assert_eq!(reports[0].d9.as_ref().unwrap().provides.len(), 1);
+    }
+
+    /// A `documents` package may declare only what the compiled-in Documents D9
+    /// catalog provides. Anything beyond it is a reserved capability id.
+    #[tokio::test]
+    async fn a_documents_package_declaring_another_capability_is_refused() {
+        for extra in [
+            "nostr-dm",
+            "model-gateway",
+            "mcp-files",
+            "not-in-the-catalog",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let packages = tmp.path().join("packages");
+            write_package(&packages, "documents");
+            append_provides(&packages, "documents", &["documents", extra]);
+            let reports = mount_packages(tmp.path(), &packages, "{}").await;
+            assert!(
+                matches!(
+                    reports[0].outcome,
+                    MountOutcome::RefusedFor(RefusalReason::ReservedCapabilityId, _)
+                ),
+                "{extra}: {:?}",
+                reports[0].outcome
+            );
+            assert!(reports[0].d9.as_ref().unwrap().provides.is_empty());
+        }
     }
 
     /// Capability ids are global: the second package declaring one is refused.

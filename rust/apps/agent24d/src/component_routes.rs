@@ -502,6 +502,14 @@ fn documents_from(
     item
 }
 
+/// The capability ids in the compiled-in Documents D9 catalog (`component.json`).
+/// Empty when the catalog is unusable, which makes every declared id reserved.
+pub(crate) fn documents_provide_ids() -> Vec<String> {
+    documents_catalog::DocumentsCatalog::embedded()
+        .map(|catalog| catalog.into_provides().into_iter().map(|p| p.id).collect())
+        .unwrap_or_default()
+}
+
 /// The Documents package. State comes from the mount report and its supervisor.
 /// Not mounted at all is `absent`. Provides and version come from the D9 catalog.
 fn documents_item(state: &AppState) -> Item {

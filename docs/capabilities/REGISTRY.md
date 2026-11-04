@@ -24,7 +24,7 @@ Hyphae 的锁只带 id，没有三语名。上表的中文、英文、泰文是�
 保留 id 与重名：`domain-os.yml` 的 `provides[].id` 不能是 `mcp-*`、内置组件 id，也不能是上表里提供方不是本模块的 id。能力 id 全局唯一：两个用户包声明同一个普通 id 时，目录顺序里先出现的保留它，后一个被拒绝。
 
 - 能力 id 违规：挂载时拒绝，`/api/v1/components` 里是 `failed`，`reason` 为 `reserved_capability_id`（保留）或 `duplicate_capability_id`（重复），不列任何 `provides`。被拒绝的模块不占 id。
-- 用户包不能叫内置组件的名字（`idoris`、`hyphae`、`documents`、`knowledge`、`open-design`），否则用户可以靠包名冒充登记表上的提供方。这样的包在准入阶段被拒绝，`reason` 为 `reserved_component_name`。它仍出现在 `/components`，组件 id 与内置行重名，按 `mcp-bad-<hash>` 规则改写，原包名在 `detail.package`。唯一的例外是随本仓库发布的 Documents 包：按 `domain-os.yml` 的 digest 认出（与 agent24d 编译进去的那份相同），不按名字。
+- 用户包不能叫内置组件的名字（`idoris`、`hyphae`、`knowledge`、`open-design`），否则用户可以靠包名冒充登记表上的提供方。这样的包在准入阶段被拒绝，`reason` 为 `reserved_component_name`。它仍出现在 `/components`，组件 id 与内置行重名，按 `mcp-bad-<hash>` 规则改写，原包名在 `detail.package`。例外是 `documents`：它由桌面从安装包装入，可能与 daemon 不是同一次构建，所以照常准入、不比对 digest；但它声明的每个能力 id 必须在编译进来的 Documents D9 清单（`component.json`）的 `provides` 里，超出的按 `reserved_capability_id` 拒绝。
 - 禁用的包同样被拒绝（准入在启停之前）。进程内模块要先 `build()` 才拿得到 manifest，而禁用的模块不调 `build()`，所以进程内模块的能力 id 检查只在启用时进行。
 - 代码里的提供方对照表是 `component_manifest::REGISTERED_PROVIDERS`，由测试 `registered_providers_match_registry_md` 与本表的「提供方」列对账。
 

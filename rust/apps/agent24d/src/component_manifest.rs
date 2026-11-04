@@ -35,6 +35,11 @@ pub(crate) const REGISTERED_PROVIDERS: &[(&str, &str)] = &[
 /// Reserved: `mcp-*` (generated for MCP servers), a builtin component id, and a
 /// registered id whose registry provider is another module.
 pub(crate) fn capability_id_reserved(owner: &str, id: &str) -> bool {
+    // The Documents package comes from the desktop bundle and may be another
+    // build than this daemon, so it is held to the compiled-in D9 catalog.
+    if owner == "documents" {
+        return !crate::component_routes::documents_provide_ids().contains(&id.to_owned());
+    }
     if id.starts_with("mcp-") {
         return true;
     }
