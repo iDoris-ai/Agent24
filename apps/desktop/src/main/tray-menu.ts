@@ -26,7 +26,7 @@ export type TrayItem = { type: 'separator' } | { label: string; enabled: false }
 
 export interface TrayView { title: string; tooltip: string; items: TrayItem[] }
 
-export function buildTrayView(input: TrayInput): TrayView {
+export function buildTrayView(input: TrayInput, platform: NodeJS.Platform = process.platform): TrayView {
   const cliItems: TrayItem[] = []
   const cli = input.cliTool
   if (cli && (cli.state === 'missing' || cli.state === 'outdated' || cli.state === 'unknown')) {
@@ -42,6 +42,9 @@ export function buildTrayView(input: TrayInput): TrayView {
     ? mt('tray.external', { label: base, pid: input.externalPid ?? '?' })
     : input.foreignPid !== null ? mt('tray.foreign', { label: base, pid: input.foreignPid }) : base
   let tooltip = `Agent24 — ${label.replace(/^[●○✕]\s*/, '')} (${input.backendKind})`
+  // T1-0: on macOS a reused external daemon is one the LaunchAgent manages;
+  // Knowledge needs this app's own daemon, so say how to get there.
+  if (input.external && platform === 'darwin') tooltip += '\n' + mt('tray.externalKnowledge')
   const detail = input.status === 'error' ? input.detail : null
   const summary = detail ? mt('tray.protocolShort', {
     daemonVersion: detail.daemonVersion ?? mt('tray.protocolUnknown'),
