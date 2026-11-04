@@ -8,6 +8,8 @@
 >
 > Open Design 基线：`open-design-v0.22.2@73953213a6fec2c8092e8e77d229a3074aa828a9`
 
+> **编号说明**：本目录的 ADR-001 至 ADR-006 自成一套编号，与 `docs/decision.md` 的同号 ADR 无关。规范写法是 **ADR-OD-001 至 ADR-OD-006**；文件名和标题保留旧号，避免已有链接断掉。新文字请写 ADR-OD-00x，规则见 [ADR 索引](../../adr/README.md)「发号规则」。
+
 本目录是 Agent24 × Open Design 集成的契约权威来源。实现分支只能消费这里冻结的接口；不能在代码中另行发明 workspace 字段、路径传递、审批 authority 或 sidecar 生命周期语义。
 
 ## 文档

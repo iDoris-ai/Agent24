@@ -1,5 +1,7 @@
 # Agent24 向 Super Agent 框架演进：初稿（Fable，2026-11-01）
 
+> **编号说明**：本文里的「ADR-040」至「ADR-044」是 Fable 初稿的编号，规范写法为 DRAFT-F040 至 DRAFT-F044，与 `docs/adr/` 下的最终 ADR 不是一回事；对照见 [ADR 索引](../../adr/README.md) 末尾「初稿」表。
+
 > 三步评审的第一步：Fable 初稿 → Codex（gpt-6-astra）独立评估 → Fable 裁判整合。
 > 对应 main `09cdad8f`（本工作树基线）。只做静态核查（grep / 读文件），不构建、不运行。
 > 来源编号 S1–S20 见 [SOURCES.md](SOURCES.md)。名词按 ADR-039：对外只说 Agent24、能力、技能；对内用组件、运行形态、工具、资源。

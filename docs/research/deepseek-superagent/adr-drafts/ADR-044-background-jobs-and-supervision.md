@@ -1,5 +1,7 @@
 # ADR-044：后台作业与监督回路（草案）
 
+> **初稿编号：DRAFT-F044**（Fable 初稿）。本文标题里的「ADR-04x」是初稿当时的编号，与 `docs/adr/` 下的同号 ADR 不是一回事；最终版是 ADR-043（[后台作业、并发与监督](../../../adr/ADR-043-background-jobs-concurrency-and-supervision.md)）。编号规则见 [ADR 索引](../../../adr/README.md)。
+
 - 状态：**提议**（2026-11-01，Fable 初稿，待 Codex 挑战与 jason 拍板）
 - 上位：[ADR-039](../../../adr/ADR-039-concept-model.md) §2.1（本体负责调度）、规则 3（系统不得静默修改技能）；ADR-026 硬约束 2（fail-closed）
 - 相关：ADR-K1-01 §2.4（`pending` 作业句柄契约）、ADR-K1-02 §2.2（后台传播继承来源）、`agent24-agent/src/self_wake.rs`（H5）、`agent24-policy/src/guardian.rs`（M-D/D3）、CORE-5 5f（`/health` 契约）、`docs/design/SHUT-shutdown-observability.md`

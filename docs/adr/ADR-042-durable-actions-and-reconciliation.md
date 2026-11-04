@@ -2,7 +2,7 @@
 
 索引：[架构总入口](../architecture/README.md)・[ADR 索引](README.md)
 
-- 状态：**提议**（2026-11-01，三步评审终稿，待 jason 拍板）
+- 状态：**部分接受**（2026-11-04 订正，jason 拍板，Q9）：**先接受 D3（模块工具调用默认不进队列，一条窄例外）、D4（不声明跨系统 exactly-once）这两条边界条款**，用来防止后续 PR 越界；D1、D2、D5 仍是提议，实施排在 ADR-041b 工单之后。原状态：提议（2026-11-01，三步评审终稿）
 - 上位：[ADR-039](ADR-039-concept-model.md) §2.1（本体负责审批与审计、调度）；ADR-026 硬约束 2（fail-closed）
 - 相关：ADR-K1-01 §2.4–2.6（有界调用、结果未知、不自动重试）——**本 ADR 是 §2.6 预留的「另开 ADR」，范围只到 D3**；[ADR-038](ADR-038-component-contract-v1.md) D6、D9；[ADR-041](ADR-041-inbound-events-admission-and-work-items.md) D8（完成条件）；CORE-5 §3 T9（掉电验收方法）；`docs/design/COMM-HYPHAE.md` §5（消息四层、outbox）
 - 依据：[演进终稿](../research/deepseek-superagent/SUPERAGENT-EVOLUTION-2026-11-01.md) §2 裁决 5；文章 S1「为什么数据库和 Outbox 比更多 Prompt 更关键」与故障表；原型 `docs/007-architecture.md` Effects / Outbox、`docs/008-cookbook.md` §5、`docs/003-execution.md` Stored work / Channel failure；[SOURCES](../research/deepseek-superagent/SOURCES.md) S1、S2、S6
