@@ -1,6 +1,7 @@
 import {
   createOwnership,
   MemoryEndpointHandoff,
+  type SidecarEndpoint,
   type SidecarEndpointHandoff,
   type SidecarOwnership,
   type SidecarState,
@@ -13,7 +14,7 @@ export interface SidecarChild {
   readonly signalCode: NodeJS.Signals | null
   onExit(listener: (code: number | null) => void): () => void
 }
-export interface SidecarReady { readonly endpoint: { readonly origin: string; readonly secret: string } }
+export interface SidecarReady { readonly endpoint: SidecarEndpoint }
 export interface SidecarLaunch {
   readonly child: SidecarChild
   readonly processGroupId?: number
@@ -118,11 +119,20 @@ export const exactTreeStopper: SidecarStopper = {
 /** Reject endpoint records that would expose a non-local or ambiguous target. */
 export function validateReady(ready: SidecarReady): void {
   const endpoint = ready?.endpoint
-  if (typeof endpoint?.secret !== 'string' || endpoint.secret.length === 0) {
-    throw new Error('sidecar readiness secret is empty')
+  if (endpoint?.auth !== undefined && endpoint.auth !== 'none' && endpoint.auth !== 'secret') {
+    throw new Error('sidecar endpoint auth mode is invalid')
   }
-  if (Buffer.byteLength(endpoint.secret, 'utf8') < 32 || /[\s\p{Cc}]/u.test(endpoint.secret)) {
-    throw new Error('sidecar readiness secret is weak')
+  if (endpoint?.auth === 'none') {
+    // An unauthenticated endpoint carries no secret; a stray one means the launcher
+    // and the manager disagree about what is protecting the port.
+    if (endpoint.secret !== undefined) throw new Error('sidecar endpoint without auth must not carry a secret')
+  } else {
+    if (typeof endpoint?.secret !== 'string' || endpoint.secret.length === 0) {
+      throw new Error('sidecar readiness secret is empty')
+    }
+    if (Buffer.byteLength(endpoint.secret, 'utf8') < 32 || /[\s\p{Cc}]/u.test(endpoint.secret)) {
+      throw new Error('sidecar readiness secret is weak')
+    }
   }
   if (typeof endpoint.origin !== 'string') throw new Error('sidecar endpoint origin is invalid')
   const url = new URL(endpoint.origin)
@@ -149,7 +159,8 @@ type ActiveSidecar = {
 }
 
 export class SidecarManager {
-  private state: SidecarState = 'stopped'
+  private currentState: SidecarState = 'stopped'
+  private readonly statusListeners = new Set<(status: SidecarStatus) => void>()
   private active: ActiveSidecar | null = null
   private timer: NodeJS.Timeout | null = null
   private failures = 0
@@ -168,12 +179,45 @@ export class SidecarManager {
     validateSpec(spec)
   }
 
+  private get state(): SidecarState {
+    return this.currentState
+  }
+
+  /** Every transition goes through here so `onStatus` sees all of them, in order. */
+  private set state(next: SidecarState) {
+    if (this.currentState === next) return
+    this.currentState = next
+    if (this.statusListeners.size === 0) return
+    const snapshot = this.status()
+    const listeners = [...this.statusListeners]
+    queueMicrotask(() => {
+      for (const listener of listeners) {
+        try { listener(snapshot) } catch (error) {
+          this.logger.warn('sidecar.status_listener_failed', {
+            sidecarId: this.spec.sidecarId,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+      }
+    })
+  }
+
+  /** Fires after each state change (not on repeats). A throwing listener cannot disturb the state machine. */
+  onStatus(listener: (status: SidecarStatus) => void): () => void {
+    this.statusListeners.add(listener)
+    return () => { this.statusListeners.delete(listener) }
+  }
+
   status(): SidecarStatus {
     return { state: this.state, sidecarId: this.spec.sidecarId, instanceId: this.active?.owner.instanceId }
   }
 
   async start(): Promise<SidecarStatus> {
-    if (this.state !== 'stopped' || this.detached.size !== 0) return this.status()
+    // `failed` is restartable only once nothing of the old instance remains: a crash whose
+    // cleanup finished, or a start that failed and was cleaned up. A retained owner (a stop
+    // that could not empty the tree) still blocks, so a new child never shares its port/data.
+    const restartableFailure = this.state === 'failed' && this.active === null && this.detached.size === 0
+    if ((this.state !== 'stopped' && !restartableFailure) || this.detached.size !== 0) return this.status()
     const token = ++this.generation
     this.state = 'starting'
     this.failures = 0
@@ -223,8 +267,10 @@ export class SidecarManager {
       this.timer = setInterval(() => { void this.probe(attempt!).catch(() => {}) }, this.spec.healthIntervalMs)
     } catch (error) {
       if (cleaningCancelledAttempt) throw error
-      if (attempt?.exited) {
+      // An exit caused by our own stop is a cancellation, not a failure of this start.
+      if (attempt?.exited && this.isCurrent(token, attempt)) {
         await this.stopActive(attempt)
+        if (this.generation !== token) return this.cancelled()
         throw error
       }
       const cancelled = attempt
@@ -237,6 +283,7 @@ export class SidecarManager {
       this.state = 'failed'
       this.logger.warn('sidecar.failed', { sidecarId: this.spec.sidecarId })
       if (attempt) await this.stopActive(attempt)
+      if (this.generation !== token) return this.cancelled()
       throw error
     }
     return this.status()
@@ -307,7 +354,6 @@ export class SidecarManager {
         this.detached.delete(active)
         active.removeExit?.()
         active.removeExit = undefined
-        if (!this.active && this.detached.size === 0 && this.state === 'stopping' && this.generation > active.token) this.state = 'stopped'
       },
       (error) => {
         if (this.active === active) this.state = 'failed'
@@ -343,6 +389,9 @@ export class SidecarManager {
   private handleExit(active: ActiveSidecar): void {
     if (this.active !== active || active.exited) return
     active.exited = true
+    // The child leaving because we asked it to (stop in progress) is the expected path of
+    // `stopping -> stopped`, not a crash: no `failed`, no second cleanup.
+    if (active.stopPromise) return
     if (this.timer) clearInterval(this.timer)
     this.timer = null
     this.handoff.clear(active.owner.instanceId)
