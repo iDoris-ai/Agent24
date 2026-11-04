@@ -504,7 +504,7 @@ const shutdown = createCreativeShutdown({
       console.error('[main] failed to tear down the Creative view before quit', error)
     }
   },
-  stop: async () => { await creativeServeWeb?.stop() },
+  stop: async () => { await creativeServeWeb?.shutdown() },
   cleanup: () => {
     if (trayTimer) { clearInterval(trayTimer); trayTimer = null }
     stopOpenDesignReady?.()
@@ -515,11 +515,7 @@ const shutdown = createCreativeShutdown({
     backendManager.stop()
   },
   quit: () => app.quit(),
-  exit: (code) => app.exit(code),
 })
-for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
-  process.on(signal, () => shutdown.signal(signal))
-}
 app.on('before-quit', shutdown.beforeQuit)
 app.on('will-quit', shutdown.willQuit)
 
