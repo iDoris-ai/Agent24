@@ -208,3 +208,21 @@ fn cli_major_minor_contract_versions_and_id_only_provides_parse() {
         Err(LockError::Invalid("contract.tested"))
     ));
 }
+
+#[test]
+fn health_failures_before_degraded_is_optional_and_typed() {
+    assert_eq!(
+        parse(&base()).unwrap().health_failures_before_degraded,
+        None
+    );
+    let mut value = base();
+    value["health_failures_before_degraded"] = json!(5);
+    assert_eq!(
+        parse(&value).unwrap().health_failures_before_degraded,
+        Some(5)
+    );
+    value["health_failures_before_degraded"] = json!("five");
+    assert!(parse(&value).is_err());
+    value["health_failures_before_degraded"] = json!(-1);
+    assert!(parse(&value).is_err());
+}

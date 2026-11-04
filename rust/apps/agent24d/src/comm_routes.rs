@@ -45,6 +45,33 @@ fn hyphae_probe_arm(lock: &HyphaeLock) -> ProbeArm {
         min_minor: contract.min_minor,
         tested: contract.tested.clone(),
     })
+    .with_failures_before_degraded(health_failure_threshold(
+        lock.component().health_failures_before_degraded,
+        "hyphae",
+    ))
+}
+
+/// Bounds for the lock's `health_failures_before_degraded`. One failed sample
+/// is already a lossy-link false alarm (ADR-038 §7.3), and more than ten samples
+/// at 45 s would take over seven minutes to notice a dead relay.
+const HEALTH_FAILURES_MIN: u32 = 1;
+const HEALTH_FAILURES_MAX: u32 = 10;
+
+/// Lock value, clamped to `[1, 10]`. No lock value keeps the ADR default (3).
+fn health_failure_threshold(lock_value: Option<u32>, component: &str) -> u32 {
+    let Some(requested) = lock_value else {
+        return agent24_comm::HEALTH_FAILURES_BEFORE_DEGRADED;
+    };
+    let clamped = requested.clamp(HEALTH_FAILURES_MIN, HEALTH_FAILURES_MAX);
+    if clamped != requested {
+        tracing::warn!(
+            component,
+            requested,
+            used = clamped,
+            "component health_failures_before_degraded is out of range; clamped"
+        );
+    }
+    clamped
 }
 
 /// Where `agent24d`'s own SHUT-1b stop sequence finds the Hyphae daemon
@@ -1909,6 +1936,31 @@ mod hy1_regression_tests {
             component_stop_grace(None, Duration::from_millis(50), "hyphae"),
             Duration::from_millis(50)
         );
+    }
+
+    #[test]
+    fn health_failure_threshold_defaults_and_clamps() {
+        assert_eq!(health_failure_threshold(None, "hyphae"), 3);
+        assert_eq!(health_failure_threshold(Some(5), "hyphae"), 5);
+        assert_eq!(health_failure_threshold(Some(0), "hyphae"), 1);
+        assert_eq!(health_failure_threshold(Some(1), "hyphae"), 1);
+        assert_eq!(health_failure_threshold(Some(10), "hyphae"), 10);
+        assert_eq!(health_failure_threshold(Some(11), "hyphae"), 10);
+        assert_eq!(health_failure_threshold(Some(u32::MAX), "hyphae"), 10);
+    }
+
+    #[test]
+    fn probe_arm_reads_the_threshold_from_the_lock() {
+        let mut lock = HyphaeLock::embedded().unwrap();
+        assert_eq!(
+            hyphae_probe_arm(&lock).failures_before_degraded,
+            3,
+            "the shipped lock does not set it"
+        );
+        lock.component_mut().health_failures_before_degraded = Some(5);
+        assert_eq!(hyphae_probe_arm(&lock).failures_before_degraded, 5);
+        lock.component_mut().health_failures_before_degraded = Some(99);
+        assert_eq!(hyphae_probe_arm(&lock).failures_before_degraded, 10);
     }
 
     #[tokio::test]
