@@ -60,7 +60,7 @@ Agent24 现在交付能力的方式各不相同。其中进程外、独立发版
 - 进程内 DomainModule（`agent24-domain`）：有挂载缝，但没有生产模块；
 - 领域 OS（Sin90 / Cos72）：走 `os-proto` 握手；
 - MCP server：从 `~/.agent24/mcp.json` 挂载，工具经 `agent24-mcp` 包装成普通 Tool；
-- Open Design：sidecar，由 `CreativeServeWeb` 托管；`SidecarManager` 已实现但产品路径未使用。
+- Open Design：sidecar，打包模式由 `SidecarManager` 托管（C8，2026-11-04）；`CreativeServeWeb` 只选启动方式和下载前置。`agent24-sidecar-host` 尚未接线，Windows 暂不支持。
 
 ## 2. 决策
 
@@ -171,7 +171,7 @@ Agent24 现在交付能力的方式各不相同。其中进程外、独立发版
 | **JSON-RPC attach / 领域 OS** | 版本来自 `initialize.protocol_versions` 区间；**能力清单来自 manifest（D9）**。`initialize.capabilities` 是模块向内核**请求**的 `events/models/…`，对应 `requires.kernel`，不是提供项 | `os-proto` initialize（AgentEar、Sin90/Cos72），不改 |
 | **进程内** | 组件 crate 导出 D9 清单常量，启动时登记到 `/api/v1/components`；无运行时版本检查（D3） | `agent24-domain` DomainModule 挂载缝 |
 | **MCP** | 版本：MCP `initialize` 的 `protocolVersion`（只记录，不比对 `major.minor`）；能力：`tools/list` 自动生成 D9 清单 | `agent24-mcp` |
-| **sidecar** | 托管进程就绪后，走 HTTP 绑定或 ACP 握手；安装状态由桌面上报（D5） | Open Design（`CreativeServeWeb` / `agent24 acp`），目标是 `SidecarManager` |
+| **sidecar** | 托管进程就绪后，走 HTTP 绑定或 ACP 握手；安装状态由桌面上报（D5） | Open Design（`SidecarManager` 托管 / `agent24 acp`） |
 
 CLI 绑定额外规定（和 `agent24-comm/src/runner.rs` 现有约定一致）：
 - JSON 输出由环境变量 `HYPHAE_OUTPUT=json`（泛化为 `<ID>_OUTPUT=json`）打开，**不加 `--json` 参数**；`contract`、`health` 是普通子命令；
@@ -328,7 +328,7 @@ CLI 绑定额外规定（和 `agent24-comm/src/runner.rs` 现有约定一致）�
 | C5 | Knowledge：把 `/system/capabilities` 映射到 D3/D5（远端服务子集）。**已完成**（2026-11-03）：已配置 binding 在一个总时限内并发探测该端点，结果按 TTL 缓存且同一指纹只打一次；契约 major 不兼容为 `incompatible`，缺 search/read 为 `degraded`（`missing_capability:<名>`），连不上、超时或 HTTP 非 2xx 为 `failed`（一次即失败，不是连续 N 次），未配置为 `stopped`。`ready` 只表示能力声明完整、契约兼容（host 的 `detail.basis` 为 `capabilities`），不代表依赖健康（READONLY R9.3）。遗留：不探测 §8 就绪（R8.2） | Agent24 |
 | C6 | Documents：补 D9 清单。**已完成**（2026-11-03）：清单是模块自带的 `rust/apps/agent24-documents/component.json`，编译进 agent24d（不写入 `domain-os.yml`，那份是握手 manifest）。`/components` 用清单的 provides 与 version；形态按 D5 为常驻。D2 的锁等独立发版再补 | Agent24 |
 | C7 | 领域 OS、进程内 DomainModule、MCP：补 D9 清单（MCP 自动生成），状态接入 C3；`REGISTRY.md` 建表。**已完成**（2026-11-03）：登记表见 `docs/capabilities/REGISTRY.md` | Agent24 |
-| C8 | Open Design：桌面经 `POST /api/v1/components/{id}/report` 上报安装与运行状态；随 `SidecarManager` 落地迁到 sidecar 绑定。OD 下载迁进 daemon 不在 v1 | Agent24 |
+| C8 | Open Design：桌面经 `POST /api/v1/components/{id}/report` 上报安装与运行状态；随 `SidecarManager` 落地迁到 sidecar 绑定。**已完成**（2026-11-04，主片 PR-1）：打包模式的进程由 `SidecarManager` 托管（`open-design-sidecar.ts`：launcher / health / POSIX 进程组 tree controller），上报的运行态由 manager 状态派生（`healthy` 映射为 `ready`，`degraded` 照实报）。崩溃后懒重启，自动有界重启另开一片。checkout 模式仍在 `CreativeServeWeb`（可选的 PR-2）。OD 下载迁进 daemon 不在 v1 | Agent24 |
 
 C1 最先做：它不改任何外部行为，而且能马上去掉 `fetch_verified` 借用 iDoris 锁的问题。C1b、C2 要和 Hyphae 一起做，排在 relay 上线并接好线之后。
 

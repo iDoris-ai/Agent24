@@ -21,6 +21,9 @@ import {
   CreativeServeWeb,
   CreativeViewRequestFence,
   classifyCreativeUrl,
+  CREATIVE_QUIT_STOP_BUDGET_MS,
+  shouldReloadCreativeView,
+  stopWithin,
   resolveNodeRuntimeExecutable,
 } from './creative-serve-web'
 import { OpenDesignComponentInstaller } from './open-design-component'
@@ -98,6 +101,10 @@ let openDesignReporter: OpenDesignStatusReporter | null = null
 let stopOpenDesignReady: (() => void) | null = null
 let creativeView: WebContentsView | null = null
 let creativeOrigin: string | null = null
+// The sidecar instance the view last loaded; a new instance forces a reload even on the same port.
+let creativeLoadedInstanceId: string | null = null
+// before-quit stops Creative (bounded) before the app is allowed to exit.
+let creativeQuitState: 'idle' | 'stopping' | 'done' = 'idle'
 const creativeViewFence = new CreativeViewRequestFence()
 
 function normalizedBounds(bounds: CreativeViewBounds): Electron.Rectangle {
@@ -174,7 +181,14 @@ async function showCreativeView(
 
   creativeView.setBounds(normalizedBounds(bounds))
   const current = creativeView.webContents.getURL()
-  if (forceReload || classifyCreativeUrl(current, status.origin) !== 'same-origin') {
+  if (shouldReloadCreativeView({
+    forceReload,
+    currentUrl: current,
+    origin: status.origin,
+    loadedInstanceId: creativeLoadedInstanceId,
+    instanceId: status.instanceId,
+  })) {
+    creativeLoadedInstanceId = status.instanceId ?? null
     await creativeView.webContents.loadURL(status.origin)
   }
   return { ok: true, origin: status.origin }
@@ -476,7 +490,7 @@ function refreshTray(): void {
         : { label: item.label, enabled: false })))
 }
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
   isQuitting = true
   // M5: cancel an in-flight Open Design component download rather than
   // leaving it (and its partial files) orphaned past app exit.
@@ -484,6 +498,31 @@ app.on('before-quit', () => {
   // Stop answering challenges before the daemon goes away; not awaited (a
   // dialog that cannot be closed must not hold up quit).
   void presencePoller?.stop()
+  // Open Design's process tree must not outlive the app. will-quit does not wait, so stop it here,
+  // bounded: 15 s grace + 5 s kill is the sidecar's own budget; 22 s is the hard ceiling.
+  const creative = creativeServeWeb
+  if (creativeQuitState !== 'done' && creative?.hasLiveProcess()) {
+    event.preventDefault()
+    if (creativeQuitState === 'idle') {
+      creativeQuitState = 'stopping'
+      try {
+        hideCreativeView()
+        if (creativeView && !creativeView.webContents.isDestroyed()) {
+          mainWin?.contentView.removeChildView(creativeView)
+          creativeView.webContents.close()
+        }
+        creativeView = null
+        creativeLoadedInstanceId = null
+      } catch (error) {
+        console.error('[main] failed to tear down the Creative view before quit', error)
+      }
+      void stopWithin(creative, CREATIVE_QUIT_STOP_BUDGET_MS).then((stopped) => {
+        if (!stopped) console.error('[main] Open Design did not stop within the quit budget')
+        creativeQuitState = 'done'
+        app.quit()
+      })
+    }
+  }
 })
 
 app.on('will-quit', () => {
