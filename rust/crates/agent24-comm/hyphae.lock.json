@@ -8,7 +8,7 @@
         "hyphae"
       ],
       "name": "hyphae-darwin-arm64",
-      "sha256": "a9fbaef99b60f330b834c5eff58ed8e2af1a9ea902ae8f481c43ac2ffd3eb9a4"
+      "sha256": "7a079c5d43d6179dda0e46f05d0c31d991c0b7ada42a41b862d508a09e67b172"
     },
     "linux-x64": {
       "executables": [
@@ -18,7 +18,7 @@
         "hyphae"
       ],
       "name": "hyphae-linux-amd64",
-      "sha256": "b30fd252b04b19666a111bae0ffa5ab954ccca4a8166e033982a9ae3acd48607"
+      "sha256": "096d9664fb4ab7ebf2bb11204bb78e076cf45b58c140e8a753e5d247f008b838"
     }
   },
   "assurance": [],
@@ -45,11 +45,11 @@
   ],
   "release_url_base": "https://github.com/iDoris-ai/Hyphae/releases/download",
   "reproducible": {
-    "recipe": "GOTOOLCHAIN=go1.26.4 CGO_ENABLED=0 GOOS=<os> GOARCH=<arch> go build -trimpath -buildvcs=false -ldflags='-buildid= -X main.version=v0.30.0' -o hyphae ./cmd/hyphae",
+    "recipe": "GOTOOLCHAIN=go1.26.4 CGO_ENABLED=0 GOOS=<os> GOARCH=<arch> go build -trimpath -buildvcs=false -ldflags='-buildid= -X main.version=v0.30.1' -o hyphae ./cmd/hyphae",
     "toolchain": "go1.26.4",
     "unsigned_sha256": {
-      "darwin-arm64": "865531f83fa76b4692fd47f73d352434d98f081271d3acf0d3081e9b327b863c",
-      "linux-x64": "b30fd252b04b19666a111bae0ffa5ab954ccca4a8166e033982a9ae3acd48607"
+      "darwin-arm64": "8a06c75e5f72ebd2f838fa5281bafd2072dd80166734f55083ca4fbc72884c59",
+      "linux-x64": "096d9664fb4ab7ebf2bb11204bb78e076cf45b58c140e8a753e5d247f008b838"
     }
   },
   "requires": {
@@ -64,9 +64,9 @@
     "notarized": true
   },
   "source": {
-    "commit": "0e0d4ea46d78675ed3f5c9e02ddc146398860edb",
+    "commit": "068e2d2e5a657bbf87204b3892451e8a280ac3a7",
     "repo": "https://github.com/iDoris-ai/Hyphae"
   },
   "stop_grace_ms": 15000,
-  "version": "v0.30.0"
+  "version": "v0.30.1"
 }
