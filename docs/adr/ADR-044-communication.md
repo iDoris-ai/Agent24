@@ -4,7 +4,7 @@
 
 - 状态：**提议**（2026-11-05，草案；待评审后接受）
 - 编号：ADR-044，ADR 索引是唯一发号处（[架构优化方案](../tracking/2026-11-04/ARCH-OPTIMIZATION-PLAN.md) 的 S0-3 / A5）。`docs/research/deepseek-superagent/SUPERAGENT-EVOLUTION-2026-11-01-codex-astra.md:109,145` 里另有一份叫「ADR-044」的 Codex 稿，按 S0-3 改记为 `DRAFT-C04x`，与本篇无关。
-- 依赖：本篇的编号登记和 ADR 索引订正依赖 S0-3 PR（分支 `docs/p0-adr-status-numbering`）合入；在它合入前，`docs/adr/README.md` 里没有 ADR-044 一行。
+- 登记：S0-3（#1596）已合入，索引里的 ADR-044 一行由 S0-7 PR 补上。
 - 上位：ADR-037 决策 1、6（`docs/decision.md:1605-1612`）；[ADR-038](ADR-038-component-contract-v1.md)；[ADR-039](ADR-039-concept-model.md)；[ADR-041](ADR-041-inbound-events-admission-and-work-items.md)
 - 吸收：[COMM-HYPHAE](../design/COMM-HYPHAE.md) §0 的已定决策；[F4 Nostr 通道](../specs/F4-nostr-channel.md) 的已定决策；[COMM-FRIENDS](../design/COMM-FRIENDS.md) 的已拍板决策。合入后这三份改称「实施说明」，决策以本篇为准，冲突时以本篇为准。
 - 依据：R3 §3.A（分析报告 `docs/architecture/review-2026-11-03/R3-ADR-AND-DOCS.md`，在分支 `docs/arch-review-r3-adr-docs`，尚未合入 main）。本篇引用的 C01–C31、X1–X19 是 R3 的编号。R3 的行号取自它的基线提交 `9865d7a0`；我对 main（`f818b0bf`）抽查了标 **（main 已核）** 的几处，其余行号以 R3 为准，评审时请以 main 为准。
