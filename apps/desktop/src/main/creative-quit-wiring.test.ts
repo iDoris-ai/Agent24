@@ -3,7 +3,7 @@ import { createCreativeShutdown } from './creative-quit'
 import { CREATIVE_QUIT_STOP_BUDGET_MS } from './creative-serve-web'
 import { OPEN_DESIGN_KILL_AFTER_MS, OPEN_DESIGN_TERM_GRACE_MS } from './open-design-sidecar'
 
-afterEach(() => vi.useRealTimers())
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks() })
 function fixture(stop = vi.fn(async () => {})) {
   const deps = { prepare: vi.fn(), stop, cleanup: vi.fn(), quit: vi.fn(), exit: vi.fn() }
   return { deps, shutdown: createCreativeShutdown(deps) }
@@ -71,5 +71,20 @@ describe('N4 shared shutdown', () => {
     shutdown.signal('SIGTERM')
     await vi.waitFor(() => expect(deps.exit).toHaveBeenCalledWith(143))
     expect(deps.cleanup).toHaveBeenCalledOnce()
+  })
+  it('still stops, cleans up and exits when prepare throws', async () => {
+    const { deps, shutdown } = fixture()
+    deps.prepare.mockImplementation(() => { throw new Error('prepare failed') })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    shutdown.signal('SIGTERM')
+    await vi.waitFor(() => expect(deps.exit).toHaveBeenCalledWith(143))
+    expect(deps.stop).toHaveBeenCalledOnce()
+    expect(deps.cleanup).toHaveBeenCalledOnce()
+  })
+  it('still exits when cleanup throws', async () => {
+    const { deps, shutdown } = fixture()
+    deps.cleanup.mockImplementation(() => { throw new Error('cleanup failed') })
+    shutdown.signal('SIGINT')
+    await vi.waitFor(() => expect(deps.exit).toHaveBeenCalledWith(130))
   })
 })

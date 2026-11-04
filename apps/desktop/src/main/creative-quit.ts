@@ -16,8 +16,11 @@ export function createCreativeShutdown(deps: {
   const run = (): Promise<void> => {
     shutdown ??= Promise.resolve().then(async () => {
       try {
-        deps.prepare()
-        await stopWithin({ stop: deps.stop }, CREATIVE_QUIT_STOP_BUDGET_MS)
+        // A failing teardown step must not skip stopping Open Design.
+        try { deps.prepare() } catch (error) { console.error('[main] quit preparation failed', error) }
+        if (!await stopWithin({ stop: deps.stop }, CREATIVE_QUIT_STOP_BUDGET_MS)) {
+          console.warn(`[main] Open Design did not stop cleanly within ${CREATIVE_QUIT_STOP_BUDGET_MS} ms`)
+        }
       } finally {
         try { deps.cleanup() } finally { done = true }
       }
