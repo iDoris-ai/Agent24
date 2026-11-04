@@ -1,5 +1,7 @@
 # ADR-041：入站事件与准入（草案）
 
+> **初稿编号：DRAFT-F041**（Fable 初稿）。本文标题里的「ADR-04x」是初稿当时的编号，与 `docs/adr/` 下的同号 ADR 不是一回事；最终版是 ADR-041（[入站事件、准入与工单](../../../adr/ADR-041-inbound-events-admission-and-work-items.md)，与初稿 DRAFT-F042 合并）。编号规则见 [ADR 索引](../../../adr/README.md)。
+
 - 状态：**提议**（2026-11-01，Fable 初稿，待 Codex 挑战与 jason 拍板）
 - 上位：[ADR-039](../../../adr/ADR-039-concept-model.md) 规则 1（能力向本体发事件，由本体按触发规则、经审批决定）；[ADR-037](../../../decision.md) 决策 2（常驻 daemon）
 - 相关：ADR-038 D9（组件清单）、ADR-K1-02 §2.1.1（分类 / 处理模式 / 授权三维度）、ADR-040（主动技能）、ADR-042（工单）
