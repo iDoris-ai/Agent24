@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import type { ChildProcess } from 'node:child_process'
@@ -9,6 +10,8 @@ import {
   deriveStatus,
   daemonStatePath,
   fetchDaemonHealth,
+  daemonAcceptsToken,
+  requestDaemonShutdown,
   readExternalDaemonState,
   BackendManager,
   DAEMON_EXIT_WAIT_MS,
@@ -153,9 +156,23 @@ describe('readExternalDaemonState (DEP-A5 daemon.json discovery)', () => {
   })
 })
 
-/** A source whose reuse probe is its plain `checkHealth`, on this app's own protocol. */
-function withProbe(src: Omit<ExternalDaemonSource, 'fetchHealth'>): ExternalDaemonSource {
+/** The pre-T1-0 world: a daemon the LaunchAgent manages, whose token its port
+ * accepts — so a healthy legacy record is reused, never taken over. */
+function launchAgent(): Pick<ExternalDaemonSource, 'serviceManaged' | 'acceptsToken' | 'requestShutdown' | 'isAlive'> {
   return {
+    serviceManaged: () => true,
+    acceptsToken: vi.fn().mockResolvedValue(true),
+    requestShutdown: vi.fn().mockResolvedValue(202),
+    isAlive: () => true,
+  }
+}
+
+/** A source whose reuse probe is its plain `checkHealth`, on this app's own protocol. */
+function withProbe(
+  src: Omit<ExternalDaemonSource, 'fetchHealth' | keyof ReturnType<typeof launchAgent>>,
+): ExternalDaemonSource {
+  return {
+    ...launchAgent(),
     ...src,
     fetchHealth: async (endpoint) => ({
       ok: await src.checkHealth(endpoint),
@@ -364,6 +381,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
     it('a reused external daemon is not stopped', async () => {
       const spawnProcess = vi.fn(() => fakeChild(111))
       const external: ExternalDaemonSource = {
+        ...launchAgent(),
         read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }),
         checkHealth: vi.fn().mockResolvedValue(true),
         fetchHealth: vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
@@ -380,6 +398,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
   it('daemon.json present and healthy → reuses it, never spawns', async () => {
     const spawnProcess = vi.fn(() => fakeChild(111))
     const external: ExternalDaemonSource = {
+      ...launchAgent(),
       read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }),
       checkHealth: vi.fn().mockResolvedValue(true),
       fetchHealth: vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
@@ -403,6 +422,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
     const child = fakeChild(222)
     const spawnProcess = vi.fn(() => child)
     const external: ExternalDaemonSource = {
+      ...launchAgent(),
       read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }),
       checkHealth: vi.fn().mockResolvedValue(false),
       fetchHealth: vi.fn().mockResolvedValue({ ok: false, protocolVersion: null }),
@@ -420,6 +440,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
   it('no daemon.json at all → falls back to spawning its own', async () => {
     const spawnProcess = vi.fn(() => fakeChild(333))
     const external: ExternalDaemonSource = {
+      ...launchAgent(),
       read: () => null,
       checkHealth: vi.fn(),
       fetchHealth: vi.fn(),
@@ -438,6 +459,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
   it('stopDaemon() on a reused external daemon disconnects but never kills it', async () => {
     const spawnProcess = vi.fn(() => fakeChild(111))
     const external: ExternalDaemonSource = {
+      ...launchAgent(),
       read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }),
       checkHealth: vi.fn().mockResolvedValue(true),
       fetchHealth: vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
@@ -463,6 +485,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
   it('stop() (app quit) on a reused external daemon disconnects but never kills it', async () => {
     const spawnProcess = vi.fn(() => fakeChild(111))
     const external: ExternalDaemonSource = {
+      ...launchAgent(),
       read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }),
       checkHealth: vi.fn().mockResolvedValue(true),
       fetchHealth: vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
@@ -481,6 +504,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
     const child = fakeChild(111)
     const spawnProcess = vi.fn(() => child)
     const external: ExternalDaemonSource = {
+      ...launchAgent(),
       read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }),
       checkHealth: vi.fn().mockResolvedValue(true),
       fetchHealth: vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
@@ -510,6 +534,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
     try {
       const spawnProcess = vi.fn(() => fakeChild(111))
       const external: ExternalDaemonSource = {
+        ...launchAgent(),
         read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }),
         checkHealth: vi.fn().mockResolvedValue(true),
         fetchHealth: fetchDaemonHealth,
@@ -547,6 +572,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
       const fetchHealth = vi.fn().mockResolvedValue({ ok: true, protocolVersion: null })
       const spawnProcess = vi.fn(() => fakeChild(111))
       const external: ExternalDaemonSource = {
+        ...launchAgent(),
         read: () => ({ port: 5555, token: 'tok', pid: 4242 }),
         checkHealth: vi.fn(),
         fetchHealth,
@@ -575,6 +601,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
     const fetchHealth = vi.fn().mockResolvedValue({ ok: false, protocolVersion: null })
     const spawnProcess = vi.fn(() => fakeChild(111))
     const external: ExternalDaemonSource = {
+      ...launchAgent(),
       read: () => ({ port: 5555, token: 'tok', pid: 4242 }),
       checkHealth: vi.fn().mockResolvedValue(false),
       fetchHealth,
@@ -598,6 +625,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
     try {
       const spawnProcess = vi.fn(() => fakeChild(111))
       const external: ExternalDaemonSource = {
+        ...launchAgent(),
         read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }),
         checkHealth: vi.fn(),
         fetchHealth: fetchDaemonHealth,
@@ -622,6 +650,136 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
       warn.mockRestore()
       vi.unstubAllGlobals()
     }
+  })
+})
+
+describe('BackendManager takes over a CLI daemon so Knowledge works (T1-0)', () => {
+  const record: ExternalDaemonState = { port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }
+  const child = (): ChildProcess => Object.assign(new EventEmitter(), { pid: 111, stdout: null, stderr: null, kill: vi.fn() }) as unknown as ChildProcess
+  let logged: () => string
+  beforeEach(() => {
+    const spies = [vi.spyOn(console, 'log').mockImplementation(() => {}), vi.spyOn(console, 'warn').mockImplementation(() => {})]
+    logged = () => spies.flatMap((spy) => spy.mock.calls.flat()).join('\n')
+  })
+  afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers() })
+  function cliDaemon(over: Partial<ExternalDaemonSource> = {}): ExternalDaemonSource {
+    return {
+      read: () => record,
+      checkHealth: vi.fn().mockResolvedValue(true),
+      fetchHealth: vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
+      serviceManaged: () => false,
+      acceptsToken: vi.fn().mockResolvedValue(true),
+      requestShutdown: vi.fn().mockResolvedValue(202),
+      isAlive: vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(true).mockReturnValue(false),
+      ...over,
+    }
+  }
+  async function started(external: ExternalDaemonSource, authMode: DaemonAuthMode = 'capabilities') {
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external, spawnProcess, authMode })
+    await manager.start()
+    const reused = manager.isExternalDaemon()
+    manager.stop()
+    return { spawnProcess, reused }
+  }
+
+  it('asks the CLI daemon to shut down with its token, waits for it to exit, then spawns its own once', async () => {
+    const external = cliDaemon()
+    const { spawnProcess, reused } = await started(external)
+    expect(reused).toBe(false)
+    expect(external.requestShutdown).toHaveBeenCalledWith({ port: 5555 }, 'tok')
+    expect(external.isAlive).toHaveBeenCalledWith(4242)
+    expect(external.acceptsToken).not.toHaveBeenCalled()
+    expect(spawnProcess).toHaveBeenCalledTimes(1)
+    expect(logged()).toContain('taking over CLI daemon (pid 4242, port 5555)')
+  })
+
+  it.each([401, 404, null])('a shutdown answered %s still spawns, without waiting', async (status) => {
+    const external = cliDaemon({ requestShutdown: vi.fn().mockResolvedValue(status), isAlive: vi.fn(() => true) })
+    const { spawnProcess } = await started(external)
+    expect(spawnProcess).toHaveBeenCalledTimes(1)
+    expect(external.isAlive).toHaveBeenCalledTimes(1) // the stale-record check only: no wait
+  })
+
+  it('a record whose pid is gone is stale: no probe, no token sent anywhere, spawn once', async () => {
+    const external = cliDaemon({ isAlive: () => false })
+    const { spawnProcess } = await started(external)
+    expect(external.fetchHealth).not.toHaveBeenCalled()
+    expect(external.requestShutdown).not.toHaveBeenCalled()
+    expect(external.acceptsToken).not.toHaveBeenCalled()
+    expect(spawnProcess).toHaveBeenCalledTimes(1)
+  })
+
+  it('a CLI daemon still alive after the wait does not block the spawn', async () => {
+    vi.useFakeTimers()
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: cliDaemon({ isAlive: () => true }), spawnProcess, authMode: 'capabilities' })
+    const starting = manager.start()
+    await vi.advanceTimersByTimeAsync(9_000)
+    expect(spawnProcess).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1_500)
+    await starting
+    manager.stop()
+    expect(spawnProcess).toHaveBeenCalledTimes(1)
+    expect(logged()).toContain('pid 4242 still running')
+  })
+
+  it('a LaunchAgent daemon, or any for a legacy-mode app, is reused once its port accepts the token', async () => {
+    for (const [external, authMode] of [[cliDaemon({ serviceManaged: () => true }), 'capabilities'], [cliDaemon(), 'legacy']] as const) {
+      const spawnProcess = vi.fn(child)
+      const manager = new BackendManager({ external, spawnProcess, authMode })
+      await manager.start()
+      expect(manager.isExternalDaemon()).toBe(true)
+      manager.stop()
+      expect(external.acceptsToken).toHaveBeenCalledWith({ port: 5555 }, 'tok')
+      expect(external.requestShutdown).not.toHaveBeenCalled()
+      expect(spawnProcess).not.toHaveBeenCalled()
+    }
+  })
+
+  it('a capability-mode record stays foreign: never shut down, never spawned over', async () => {
+    const external = cliDaemon({ read: () => ({ ...record, authMode: 'capabilities' }) })
+    const { spawnProcess } = await started(external)
+    expect(external.requestShutdown).not.toHaveBeenCalled()
+    expect(spawnProcess).not.toHaveBeenCalled()
+  })
+
+  describe('a forged daemon.json naming a port whose /health says 200 (#1187)', () => {
+    let server: http.Server
+    const seen: string[] = []
+    beforeEach(async () => {
+      seen.length = 0
+      server = http.createServer((req, res) => {
+        seen.push(`${req.method} ${req.url} ${req.headers.authorization ?? '-'}`)
+        if (req.url !== '/api/v1/health') return void res.writeHead(404).end()
+        res.writeHead(200).end(JSON.stringify({ status: 'ok', protocol_version: CLIENT_PROTOCOL_VERSION }))
+      })
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    })
+    afterEach(() => new Promise((resolve) => server.close(resolve)))
+    const forged = (serviceManaged: boolean): ExternalDaemonSource => ({
+      read: () => ({ ...record, port: (server.address() as { port: number }).port, token: 'forged' }),
+      checkHealth: vi.fn().mockResolvedValue(false),
+      fetchHealth: fetchDaemonHealth,
+      serviceManaged: () => serviceManaged,
+      acceptsToken: daemonAcceptsToken,
+      requestShutdown: requestDaemonShutdown,
+      isAlive: () => true,
+    })
+
+    it('takeover: only /health and one /shutdown reach it, then the app spawns its own', async () => {
+      const { spawnProcess } = await started(forged(false))
+      expect(seen).toEqual(['GET /api/v1/health -', 'POST /api/v1/shutdown Bearer forged'])
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+    })
+
+    it('LaunchAgent: the port refuses the token, so it is not reused and nothing else gets the token', async () => {
+      const { spawnProcess, reused } = await started(forged(true))
+      expect(seen).toEqual(['GET /api/v1/health -', 'GET /api/v1/os Bearer forged'])
+      expect(reused).toBe(false)
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      expect(logged()).toContain('token not accepted by port')
+    })
   })
 })
 
@@ -688,6 +846,7 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
       return child
     })
     const external: ExternalDaemonSource = {
+      ...launchAgent(),
       read: () => (externalAvailable
         ? { port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }
         : null),
@@ -746,6 +905,7 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const spawnProcess = vi.fn(() => fakeChild(111))
     const external: ExternalDaemonSource = {
+      ...launchAgent(),
       read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }),
       checkHealth: vi.fn().mockResolvedValue(false),
       fetchHealth: vi.fn().mockResolvedValue({
@@ -798,6 +958,7 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
     const fetchHealth = vi.fn(async () => ({ ok: true, protocolVersion: live }))
     const spawnProcess = vi.fn(() => fakeChild(111))
     const external: ExternalDaemonSource = {
+      ...launchAgent(),
       read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }),
       checkHealth: vi.fn().mockResolvedValue(true),
       fetchHealth,
@@ -833,6 +994,7 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
     const fetchHealth = vi.fn(async () => health)
     const spawnProcess = vi.fn(() => fakeChild(111))
     const external: ExternalDaemonSource = {
+      ...launchAgent(),
       read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }),
       checkHealth: vi.fn().mockResolvedValue(false),
       fetchHealth,

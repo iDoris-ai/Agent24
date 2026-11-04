@@ -1,6 +1,6 @@
 # Knowledge 写操作语义契约 v1 · 规范核心（CONTRACT-OPS-v1）
 
-> **状态**：规范核心 v1（草案），待 fork 侧维护者（David）评审；评审通过前不授权任何实现。
+> **状态**：规范核心 v1，已评审合入；KB-R1/R2 **没有实施**本文：Agent24 没有写操作入口，WeKnora 集成模式只放行 ready、search、read 三条路由。实现另开任务（11-11 后）。条款按 READONLY r8 写成，现行 READONLY 为 r10。
 > **日期**：2026-10-20 · **依据**：`docs/knowledge/CONTRACT-READONLY-v1.md` r8（下称 READONLY，规则写作 R*n.m*）；`CONTRACT-STATE-v1.md`（STATE 规范核心 v1（同批），条款写作 S*n.m*）、`CONTRACT-UI-BRIDGE-v1.md`（UI-BRIDGE 规范核心 v1（同批），条款写作 U*n.m*），依赖登记在 §9· **Issue**：#1013 ③（KB-CT-03）。
 > 由完整版 `ab/weknora-03c-ops`（#1075 的分支）压缩而来。本文只写对外行为与不变式；实现机制交给代码与测试证明（§11）。
 

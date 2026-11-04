@@ -34,7 +34,10 @@ import {
   CreativeServeWeb,
   CreativeViewRequestFence,
   classifyCreativeUrl,
+  loadCreativeView,
+  resolveNodeRuntimeExecutable,
 } from './creative-serve-web'
+import { createCreativeShutdown } from './creative-quit'
 import { OpenDesignComponentInstaller } from './open-design-component'
 import { OpenDesignStatusReporter, mapOpenDesignReport, postOpenDesignReport } from './open-design-report'
 import { KnowledgeHost } from './knowledge-host'
@@ -110,6 +113,8 @@ let openDesignReporter: OpenDesignStatusReporter | null = null
 let stopOpenDesignReady: (() => void) | null = null
 let creativeView: WebContentsView | null = null
 let creativeOrigin: string | null = null
+// The sidecar instance the view last loaded; a new instance forces a reload even on the same port.
+let creativeLoadedInstanceId: string | null = null
 const creativeViewFence = new CreativeViewRequestFence()
 
 /** Resolves once the daemon has announced readiness (now, or within `timeoutMs`). */
@@ -199,10 +204,17 @@ async function showCreativeView(
   }
 
   creativeView.setBounds(normalizedBounds(bounds))
-  const current = creativeView.webContents.getURL()
-  if (forceReload || classifyCreativeUrl(current, status.origin) !== 'same-origin') {
-    await creativeView.webContents.loadURL(status.origin)
-  }
+  const view = creativeView
+  await loadCreativeView({
+    forceReload,
+    currentUrl: view.webContents.getURL(),
+    origin: status.origin,
+    loadedInstanceId: creativeLoadedInstanceId,
+    instanceId: status.instanceId,
+    loadURL: (url) => view.webContents.loadURL(url),
+    isCurrent: () => creativeView === view && creativeViewFence.isCurrent(requestGeneration),
+    rememberInstance: (instanceId) => { creativeLoadedInstanceId = instanceId },
+  })
   return { ok: true, origin: status.origin }
 }
 
@@ -315,7 +327,7 @@ app.whenReady().then(async () => {
   creativeServeWeb = new CreativeServeWeb({
     resourcesPath: process.resourcesPath,
     stateRoot: path.join(app.getPath('userData'), 'creative', 'open-design'),
-    runtimeExecutable: process.execPath,
+    runtimeExecutable: resolveNodeRuntimeExecutable(),
     pinVersion: OPEN_DESIGN_PIN_VERSION,
     component: openDesignComponent ?? undefined,
   })
@@ -328,7 +340,7 @@ app.whenReady().then(async () => {
         installState: install?.state ?? 'unavailable',
         reason: install?.reason ?? install?.error,
         version: openDesignComponent?.reportedVersion() ?? null,
-        sidecar: creativeServeWeb?.headlessSidecarState() ?? null,
+        sidecar: creativeServeWeb?.headlessPhaseForReport(install?.state ?? 'unavailable') ?? null,
       })
     },
     connection: daemonConnection,
@@ -551,26 +563,37 @@ function refreshTray(): void {
         : { label: item.label, enabled: false })))
 }
 
-app.on('before-quit', () => {
-  isQuitting = true
-  // M5: cancel an in-flight Open Design component download rather than
-  // leaving it (and its partial files) orphaned past app exit.
-  openDesignComponent?.abort('Agent24 is quitting')
-  // Stop answering challenges before the daemon goes away; not awaited (a
-  // dialog that cannot be closed must not hold up quit).
-  void presencePoller?.stop()
+const shutdown = createCreativeShutdown({
+  prepare: () => {
+    isQuitting = true
+    openDesignComponent?.abort('Agent24 is quitting')
+    void presencePoller?.stop()
+    try {
+      hideCreativeView()
+      if (creativeView && !creativeView.webContents.isDestroyed()) {
+        mainWin?.contentView.removeChildView(creativeView)
+        creativeView.webContents.close()
+      }
+      creativeView = null
+      creativeLoadedInstanceId = null
+    } catch (error) {
+      console.error('[main] failed to tear down the Creative view before quit', error)
+    }
+  },
+  stop: async () => { await creativeServeWeb?.shutdown() },
+  cleanup: () => {
+    if (trayTimer) { clearInterval(trayTimer); trayTimer = null }
+    stopOpenDesignReady?.()
+    stopOpenDesignReady = null
+    openDesignReporter?.stop()
+    agentEarBridge.stop()
+    agentEarLog.stop()
+    backendManager.stop()
+  },
+  quit: () => app.quit(),
 })
-
-app.on('will-quit', () => {
-  if (trayTimer) { clearInterval(trayTimer); trayTimer = null }
-  stopOpenDesignReady?.()
-  stopOpenDesignReady = null
-  openDesignReporter?.stop()
-  agentEarBridge.stop()
-  agentEarLog.stop()
-  backendManager.stop()
-  void creativeServeWeb?.stop()
-})
+app.on('before-quit', shutdown.beforeQuit)
+app.on('will-quit', shutdown.willQuit)
 
 // window-all-closed fires only if tray is null (i.e., user chose Quit from
 // tray menu), because win.on('close') hides and prevents close while tray active.

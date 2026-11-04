@@ -491,6 +491,11 @@ struct RawManifest {
     /// means "no module Agent tools", never "all of them".
     #[serde(default)]
     tools: Vec<tool::RawToolDeclaration>,
+    /// D9 provides (ADR-038 C7). Optional so a manifest written before the field
+    /// existed still loads: absence means the package has not declared capabilities,
+    /// not that every capability is provided. Ids use the capability-id rule.
+    #[serde(default)]
+    provides: Vec<RawProvide>,
     /// Declared here ONLY so `deny_unknown_fields` does not reject the very
     /// fields step one just read. Their values are consumed by
     /// [`ManifestEnvelope`]; re-reading them here would be reading the same
@@ -537,8 +542,49 @@ pub struct DomainOsManifest {
     spawn: Option<SpawnCommand>,
     host_commands: Vec<String>,
     tools: Vec<tool::ToolDeclaration>,
+    provides: Vec<CapabilityProvide>,
     /// The kernel protocol the manifest requires; 0 when it names none.
     min_daemon_protocol: u64,
+}
+
+/// One capability a domain OS declares in its manifest (ADR-038 D9).
+///
+/// `tools` names the module tools that belong to this capability, each already
+/// qualified as `<module>.<operation>`. Empty means the capability exposes no
+/// agent tool. This is not an authorization input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityProvide {
+    id: String,
+    tools: Vec<String>,
+}
+
+impl CapabilityProvide {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn tools(&self) -> &[String] {
+        &self.tools
+    }
+}
+
+/// ADR-038 D9 capability id: `[a-z0-9][a-z0-9-]{1,31}`.
+fn valid_capability_id(id: &str) -> bool {
+    (2..=32).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && id
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+#[derive(Deserialize)]
+struct RawProvide {
+    id: String,
+    #[serde(default)]
+    tools: Vec<String>,
 }
 
 /// Names that are not usable as a directory on Windows regardless of extension.
@@ -961,6 +1007,34 @@ impl DomainOsManifest {
             )));
         }
         let tools = tool::validate_tools(raw.tools)?;
+        let qualified: std::collections::BTreeSet<String> = tools
+            .iter()
+            .map(|t| format!("{}.{}", raw.name, t.operation()))
+            .collect();
+        let mut seen_ids = std::collections::BTreeSet::new();
+        let mut provides = Vec::with_capacity(raw.provides.len());
+        for p in raw.provides {
+            if !valid_capability_id(&p.id) || !seen_ids.insert(p.id.clone()) {
+                return Err(DomainError::Manifest(format!(
+                    "provides id {:?} is not a capability id (2-32 chars of [a-z0-9-], \
+                     starting with a letter or digit, unique in this manifest)",
+                    p.id
+                )));
+            }
+            for tool_name in &p.tools {
+                if !qualified.contains(tool_name) {
+                    return Err(DomainError::Manifest(format!(
+                        "provides id {:?} lists tool {tool_name:?}, which is not a declared \
+                         module tool ({}.<operation>)",
+                        p.id, raw.name
+                    )));
+                }
+            }
+            provides.push(CapabilityProvide {
+                id: p.id,
+                tools: p.tools,
+            });
+        }
 
         Ok(Self {
             name: raw.name,
@@ -975,6 +1049,7 @@ impl DomainOsManifest {
             impl_kind: raw.impl_kind,
             spawn: raw.spawn,
             tools,
+            provides,
             min_daemon_protocol: min_protocol.unwrap_or(0),
         })
     }
@@ -1081,6 +1156,12 @@ impl DomainOsManifest {
     /// for why declaring a tool here grants nothing by itself.
     pub fn tools(&self) -> &[tool::ToolDeclaration] {
         &self.tools
+    }
+
+    /// Capabilities this module declares (D9). Empty when the manifest has no
+    /// `provides` — the package has not declared any, which is not an error.
+    pub fn provides(&self) -> &[CapabilityProvide] {
+        &self.provides
     }
 
     /// Whether the module speaks the protocol that grants need (K1-6a-G
@@ -1511,6 +1592,62 @@ impl_kind: in_process_crate
         assert_eq!(m.impl_kind(), ImplKind::InProcessCrate);
         assert_eq!(m.kernel_capabilities(), &[Capability::Events]);
         assert_eq!(m.ui_entry(), None);
+        assert!(m.provides().is_empty());
+    }
+
+    #[test]
+    fn provides_follow_the_capability_id_rule_and_old_manifests_omit_them() {
+        let ok = format!("{SIN90_YAML}provides:\n  - id: sin90-tasks\n");
+        let m = DomainOsManifest::from_yaml(&ok).unwrap();
+        assert_eq!(m.provides().len(), 1);
+        assert_eq!(m.provides()[0].id(), "sin90-tasks");
+        assert!(m.provides()[0].tools().is_empty());
+
+        let bad = format!("{SIN90_YAML}provides:\n  - id: Sin90\n");
+        let err = DomainOsManifest::from_yaml(&bad).unwrap_err().to_string();
+        assert!(err.contains("Sin90"), "{err}");
+        assert!(err.contains("capability id"), "{err}");
+    }
+
+    const ONE_TOOL_YAML: &str = "tools:\n  - operation: list-notes\n    description: lists notes\n    \
+         input_schema: {type: object, properties: {}}\n    risk: read\n    \
+         output_privacy: local_only\n    timeout_ms: 5000\n    inline_wait_ms: 1000\n";
+
+    /// A provide may name only tools this module declares (`<module>.<operation>`).
+    /// A foreign or missing tool refuses the manifest.
+    #[test]
+    fn a_provide_lists_only_tools_the_module_declares() {
+        let ok = format!(
+            "{SIN90_YAML}{ONE_TOOL_YAML}provides:\n  - id: sin90-tasks\n    tools: [\"sin90.list-notes\"]\n"
+        );
+        let m = DomainOsManifest::from_yaml(&ok).unwrap();
+        assert_eq!(m.provides()[0].tools(), &["sin90.list-notes".to_owned()]);
+
+        let missing = format!(
+            "{SIN90_YAML}{ONE_TOOL_YAML}provides:\n  - id: sin90-tasks\n    tools: [\"sin90.missing\"]\n"
+        );
+        let err = DomainOsManifest::from_yaml(&missing)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sin90.missing"), "{err}");
+        assert!(err.contains("not a declared"), "{err}");
+
+        let foreign = format!(
+            "{SIN90_YAML}{ONE_TOOL_YAML}provides:\n  - id: sin90-tasks\n    tools: [\"other.list-notes\"]\n"
+        );
+        let err = DomainOsManifest::from_yaml(&foreign)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("other.list-notes"), "{err}");
+    }
+
+    /// The same capability id twice in one manifest is refused, not silently kept.
+    #[test]
+    fn duplicate_provide_ids_in_one_manifest_are_refused() {
+        let yaml = format!("{SIN90_YAML}provides:\n  - id: sin90-tasks\n  - id: sin90-tasks\n");
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(err.contains("sin90-tasks"), "{err}");
+        assert!(err.contains("unique"), "{err}");
     }
 
     // ---- ME-3a gate 6: manifest schema / protocol versioning ----------------

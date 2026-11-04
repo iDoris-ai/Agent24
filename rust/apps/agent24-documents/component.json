@@ -1,0 +1,28 @@
+{
+  "id": "documents",
+  "version": "0.2.0",
+  "name": { "zh": "文档", "en": "Documents", "th": "เอกสาร" },
+  "provides": [
+    {
+      "id": "documents",
+      "name": { "zh": "本地文档", "en": "Local documents", "th": "เอกสารในเครื่อง" },
+      "summary": {
+        "zh": "在本机列出、阅读文档，提交抽取后查看进度和结果。",
+        "en": "List and read documents on this machine, submit an extraction, then check progress and the result.",
+        "th": "แสดงรายการและอ่านเอกสารในเครื่อง ส่งงานดึงข้อมูล แล้วตรวจความคืบหน้าและผล"
+      },
+      "tools": [
+        "documents.list",
+        "documents.get",
+        "documents.read_range",
+        "documents.find",
+        "documents.extract",
+        "documents.job_get",
+        "documents.extraction_get"
+      ]
+    }
+  ],
+  "requires": { "kernel": ["events", "models"], "operations": [] },
+  "assurance": [],
+  "skills": []
+}

@@ -1,10 +1,10 @@
 # Knowledge 只读接入契约 v1（CONTRACT-READONLY-v1）
 
-> **状态**：**草案（Draft）**，待 fork 侧维护者（David）评审（文档 PR，base `ab/weknora`）。评审通过前不授权任何实现。
+> **状态**：v1 r10，已随 KB-R1/R2 实施（KB-R1：wire 类型与传输层；KB-R2：主对话的 search 与 read）。§0.3 的草案期已结束，语义变更按该节升主版本。服务端的已知差距见 §13。例外：KB-R2 的客户端只发单次 search 与 read，没有 R3.7 的跨 `score_space` 分组合并，也没有 R8、R9 的就绪探测、能力发现与兼容判定（CONTRACT-STATE §12）；开发者预览用 retrieve key 和样本数据，R1.3 的用户级凭据签发没有实施（#992、KB-C1-03）。
 > **版本**：契约 v1（报文字段 `protocol_version: 1`），文档修订 r10 · **日期**：2026-10-22 · **作者**：David Xu
 > **Issue**：#1011（KB-CT-02a），阶段 #1000；探测依据 iDoris-ai/WeKnora#5。
 > **依据**：任务方案 v2.1（方案全文见 #986 第一条评论）。每条规则后方括号里是来源：决策 `[D1]`–`[D8]`（方案 §1），或任务条目与方案章节（如 `[KB-C1-04]`、`[KB-C1-01b-b]`、`[方案 §4]`）。
-> `[新设]` 表示本文新设计、在决策与方案里都找不到依据的规则；与其他标签并列（如 `[D1+新设]`）时，表示在该依据之上新增的部分。所有 `[新设]` 都待本 PR 评审（§12 #15）。
+> `[新设]` 表示本文新设计、在决策与方案里都找不到依据的规则；与其他标签并列（如 `[D1+新设]`）时，表示在该依据之上新增的部分。所有 `[新设]` 已随 #1044 及后续修订评审合入（§12 #15）。
 > **探测证据**：WeKnora 仓库 `docs/agent24/CAPABILITY-MATRIX.md`（KB-CT-01 PR①，iDoris-ai/WeKnora#7，以合入版为准；第 5 轮评审的遗留项见 iDoris-ai/WeKnora#8），下文"矩阵 #n"指其第 n 项。
 > **受测 SHA**：WeKnora `4b363d153122797c857871ce7e4bb63626efc637`（`a24/develop` = 上游 v0.8.2 + 2 个 Agent24 提交，Go 源码与 v0.8.2 相同）。
 > 文中 WeKnora 的 `file:line` 都按此 SHA，路径相对 WeKnora 仓库根目录。矩阵是静态源码阅读，运行证据待 KB-CT-01 PR② 产出；两者冲突时先回写矩阵，再按 §0.3 修订本文。
@@ -363,7 +363,7 @@ Provider 的本地结果（同时写宿主侧日志；服务端只有观察到�
 | 12 | **read 也必须带 `scope`**（R2.5、R4.1），目标资源须在 E 内 | 按本文 | 本 PR 评审 |
 | 13 | **服务端端点只接受单一 score_space，Provider 层按 R3.7 补齐与轮转合并** | 按本文 | 本 PR 评审 |
 | 14 | **文档级 read 只比较 `source_revision` 与 `index_build_id`**（R4.3、R4.5），翻页中单个分块被编辑不算 stale | 按本文 | 本 PR 评审 |
-| 15 | 所有标 `[新设]` 的规则 | 按本文 | 本 PR 评审 |
+| 15 | 所有标 `[新设]` 的规则 | 按本文 | #1044 已评审 |
 | 16 | **v1 只收 `text` 分块**（R3.8）：FAQ、图片 OCR / 描述、表格摘要类内容在 v1 搜不到，是用户可见的范围取舍 | 按本文 | 已定（David，2026-10-17） |
 | 17 | **local-managed 宿主可否持有本实例的 HMAC / JWT_SECRET**（R1.4），是对 D2"绝不下发"的收窄解释 | 可以持有，限本实例专属、只用于本实例（R1.4） | 已定（David，2026-10-17） |
 | 18 | **#1012 的取消夹具**由三部分组成：一条线上成功响应、一条 Provider 本地 `cancelled` 结果、一条"迟到响应被丢弃"的测试用例；不进 Go 端编码测试 | 按本文 | #1012 |
@@ -394,3 +394,4 @@ r9 用由内容派生的标识换掉了"可证明的构建归属"（KB-C1-01c �
 - r8（2026-10-17）：按 #1012 待决问题的裁定修订（按 David 2026-10-17 授权的夜间规则，由 Opus 和 Sonnet 代替 Grok 和 Codex 盲选，两票一致才执行；PR 合入前请 David 确认。裁定见 [#1012 评论](https://github.com/iDoris-ai/Agent24/issues/1012#issuecomment-6224023854)）。R3.5 的 `partial_failures[].reason` 增加 `not_ready`、`overloaded`，与 R3.7(b) 及 §6 一致（兼容新增），并写明 `code` 为 `timeout` 当且仅当 `reason` 为 `timeout`；§6 表逐码写明 `reason` 必填、条件必填、可选或禁止，R6.1 注明以 §6 为准；文件头修订号改为当前值；§6 的 `unavailable` 在 `retryable` 为 false 时必须带不可重试的 reason；R4.5 写明 `next_cursor` 也用于翻页；R4.1 的 `page.limit` 可选；R6.1 写明回显为 `null` 的情形（含请求体能解析但 `request_id` / `generation` 本身缺失或不合法）；R8.4 新增 KB 级 `reason` `operation_disabled`（`operations.X` 为 `disabled` 时使用，不可重试，排在原因顺序第一位；§12 #19，David 2026-10-17 定），并写明 `dependency` 当且仅当 `operations.X` 为 `not_ready`；§12 新增 #19、#20（#20 待决，给出 v1 默认值，覆盖 search 与 read）。§6 中 `unavailable` 在 `retryable` 为 false 时 reason 必填一项不在 Q3 裁定原文里，是 #1012 第 2 轮评审补充的（与 R3.4 一致）。PR-Daemon 评审后再补（按 Grok、Opus 盲选一致执行，David 已确认，见 [#1012 评论](https://github.com/iDoris-ai/Agent24/issues/1012#issuecomment-6239062330)，2026-10-18）：R7.2、R7.3 写明回显为 `null` 的错误信封按发起它的 HTTP 交换配对；R6.4 写明 `protocol_version` 先判，R6.1 相应允许 `unsupported_protocol_version` 回显 `null`；R4.5 写明 `expected_revision` 与游标同时出现时的判定顺序；R3.5 区分 `dependency` 与 `not_ready`；R8.4 写明 disabled 时 KB 级 `state` 为 `not_ready`；#20 的 v1 默认改为新增的 `forbidden/operation_disabled`，并写明判定位置（#20 已定）。影响夹具：是，#1012 清单改为 r8，新增一个带 `overloaded` 的 partial 夹具、一个 `operation_disabled` 的就绪夹具、#20 默认值的 search 与 read 两个 `operation_disabled` 夹具，以及一个解析前就失败、回显为 `null` 的 `unauthorized` 夹具。
 - r9（2026-10-21）：KB-C1-01c ③ 改用内容寻址（WeKnora#38，设计经 Grok 与 Codex 两轮双审，David 选定并确认）。新增 `content_tag`（分块完整正文的带密钥摘要），出现在 hit.revision、segment、单分块 `expected_revision` 与 stale 详情（`current_content_tag`）；"活动构建"改为"有构建时的可服务分块集合"，`index_build_id`、`source_revision` 改为由内容派生的带密钥摘要（R5.1）；单分块 read 先判可服务、再比 `content_tag`，其他分块增删不影响（R4.3、R4.4、R6.4）；`chunk_revision` 只作参考（R5.2）；snippet 与 `content_tag` 同源（R3.8、R3.9）；文档级翻页每页同快照重算（R4.5）；引用只来自单分块 read（R4.7）；cancelled 不可服务、文档级 read 为 `index_failed`，deleting 视同已删除（R2.6、R4.4、R8.4）；就绪按"有构建"重写判定（R8.4）；审计不记 `content_tag`（R10.1、R10.3）；locator 恒为 `valid: false`（R3.10）；新增 §13 已知差距。PR 双审第 1、2 轮补充：R5.1 写明各标识的输入组成与 HMAC 编码；R3.5、R8.4 不计入 deleting；单分块 `expected_revision` 的 `chunk_revision` 允许 null；夹具新增 read.stale-chunk-overwritten、read.document-empty。依 §0.3 草案期条款，评审通过前不升主版本（`protocol_version` 仍为 1）。影响夹具：是（同一 PR 更新清单与 schema）。
 - r10（2026-10-22）：草稿（draft，含已发布后改回草稿的手工知识）与状态无法识别的文档视同不存在：read 为 `not_found`，就绪与 partial 判定不计入（R2.6、R3.5、R8.4、§6），与 deleting 一致；文档判定对带与不带 `chunk_id` 的 read 都先于锚点与修订（R2.6、R4.4、R6.4）；这些文档没有可服务分块，search 也不返回（R2.6）；草稿以知识行的 parse_status 为准，元数据里的草稿状态不单独作判据；§13 记下发布与改回草稿的上游竞态（parse_status 被写回 completed 时文档照常可服务）；David 定（WeKnora#66 评审闸门）。依 §0.3 草案期条款不升主版本。影响夹具：清单 `contract_revision` 改为 r10，夹具内容不变。
+- 2026-11-01（修订号不变）：只改状态行，写明已实施、草案期结束。语义不变，影响夹具：否。

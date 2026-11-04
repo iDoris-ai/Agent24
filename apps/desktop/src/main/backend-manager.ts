@@ -24,6 +24,9 @@ import { joinLiteral, tryDataDir } from './data-dir'
 const HEALTH_INTERVAL_MS = 5_000
 const HEALTH_TIMEOUT_MS = 3_000
 const MAX_HEALTH_FAILURES = 3
+// T1-0: how long a takeover waits for the CLI daemon to exit after `/shutdown`.
+const TAKEOVER_WAIT_MS = 10_000
+const TAKEOVER_POLL_MS = 200
 
 
 export type BackendKind = 'node' | 'rust'
@@ -319,6 +322,16 @@ export interface ExternalDaemonSource {
   checkHealth(endpoint: BackendEndpoint | null): Promise<boolean>
   /** Body of `GET /api/v1/health`, including the protocol version. */
   fetchHealth(endpoint: BackendEndpoint): Promise<DaemonHealthProbe>
+  /** True while `agent24 service install`'s LaunchAgent plist exists. Only a
+   * conservative "do not take over" signal, not proof of who started it. */
+  serviceManaged(): boolean
+  /** `GET /api/v1/os` with the record's token answers 200 with a `modules` array. */
+  acceptsToken(endpoint: BackendEndpoint, token: string): Promise<boolean>
+  /** `POST /api/v1/shutdown` with the record's token, as `agent24 daemon stop`
+   * sends it: the HTTP status, or null when nothing answered. */
+  requestShutdown(endpoint: BackendEndpoint, token: string): Promise<number | null>
+  /** Whether a process with this pid still exists. */
+  isAlive(pid: number): boolean
 }
 
 /** Constructor-injectable seams. Both default to the real implementations —
@@ -422,10 +435,46 @@ function readyToken(ready: ReadyLine, authMode: DaemonAuthMode): string {
   return legacy && typeof ready.token === 'string' ? ready.token : ''
 }
 
+/** Mirrors `agent24-cli`'s `service::plist_path()`. */
+function launchAgentPlistExists(): boolean {
+  const home = process.env['HOME']
+  return home !== undefined && fs.existsSync(path.join(home, 'Library', 'LaunchAgents', 'ai.auraai.agent24.plist'))
+}
+
+async function fetchWithToken(endpoint: BackendEndpoint, route: string, token: string, method = 'GET'): Promise<Response | null> {
+  return fetch(`http://127.0.0.1:${endpoint.port}${route}`, {
+    method, headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
+  }).catch(() => null)
+}
+
+export async function daemonAcceptsToken(endpoint: BackendEndpoint, token: string): Promise<boolean> {
+  const response = await fetchWithToken(endpoint, '/api/v1/os', token)
+  if (response?.status !== 200) return false
+  const body = (await response.json().catch(() => null)) as { modules?: unknown } | null
+  return Array.isArray(body?.modules)
+}
+
+export async function requestDaemonShutdown(endpoint: BackendEndpoint, token: string): Promise<number | null> {
+  return (await fetchWithToken(endpoint, '/api/v1/shutdown', token, 'POST'))?.status ?? null
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
 const defaultExternalDaemonSource: ExternalDaemonSource = {
   read: readExternalDaemonState,
   checkHealth,
   fetchHealth: fetchDaemonHealth,
+  serviceManaged: launchAgentPlistExists,
+  acceptsToken: daemonAcceptsToken,
+  requestShutdown: requestDaemonShutdown,
+  isAlive: processAlive,
 }
 
 /** How long whileStopped() waits for the daemon to exit: past the CLI's own
@@ -540,12 +589,17 @@ export class BackendManager {
    * The version recorded in daemon.json is named in that error; it is not a
    * reason to skip the probe. A healthy capability-mode daemon belongs to
    * another host: its authority never reaches this file, and spawning our own
-   * would only lose the lock, so that is `foreign`. `absent` (no record, or
-   * the probe did not connect) is the only outcome that may spawn. */
+   * would only lose the lock, so that is `foreign`. A healthy legacy daemon is
+   * taken over (T1-0) unless the LaunchAgent manages it or this app runs in
+   * legacy mode; then it is reused once its token is proven on that port.
+   * `absent` (no record, the probe did not connect, a takeover, or a token the
+   * port refused) is the only outcome that may spawn. */
   private async tryReuseExternal(): Promise<'reused' | 'foreign' | 'absent' | 'incompatible' | 'superseded'> {
     const lifecycle = this.lifecycle
     const state = this.external.read()
-    if (!state) {
+    // A record whose pid is gone is stale: whatever holds its port now gets
+    // neither a probe nor the token (the Rust readers check the same).
+    if (!state || !this.external.isAlive(state.pid)) {
       this.blockedReason = null
       this.foreignPid = null
       return 'absent'
@@ -576,6 +630,19 @@ export class BackendManager {
       return 'foreign'
     }
     this.foreignPid = null
+    // T1-0: Knowledge needs a capability-mode daemon this app hosts. A
+    // LaunchAgent-managed one is left alone: launchd would only restart it.
+    if (this.kind === 'rust' && this.authMode === 'capabilities' && !this.external.serviceManaged()) {
+      return this.takeoverExternal(state, lifecycle)
+    }
+    // #1187: /health takes no credential; prove the token on that port first.
+    const accepted = await this.external.acceptsToken({ port: state.port }, state.token)
+    if (lifecycle !== this.lifecycle) return 'superseded'
+    if (!accepted) {
+      console.warn(`[backend:${this.kind}] daemon.json token not accepted by port ${state.port}; not reusing`)
+      this.disconnectExternal()
+      return 'absent'
+    }
     this.isExternal = true
     this.externalPid = state.pid
     publishConnection({ port: state.port, auth: { kind: 'bearer', token: state.token } }, state.authMode)
@@ -584,6 +651,30 @@ export class BackendManager {
       `[backend:${this.kind}] reusing external daemon (pid ${state.pid}, port ${state.port}) — not spawning our own`,
     )
     return 'reused'
+  }
+
+  /** T1-0: ask a CLI-started legacy daemon to shut down with its own token,
+   * then wait (bounded) for its process to exit — it drops daemon.json and its
+   * port when shutdown starts, but holds the singleton lock until exit. Every
+   * outcome lets the caller spawn; a lock still held is the health loop's. */
+  private async takeoverExternal(state: ExternalDaemonState, lifecycle: number): Promise<'absent' | 'superseded'> {
+    this.disconnectExternal()
+    console.log(`[backend:${this.kind}] taking over CLI daemon (pid ${state.pid}, port ${state.port}) so Knowledge can work — asking it to shut down`)
+    const status = await this.external.requestShutdown({ port: state.port }, state.token)
+    if (lifecycle !== this.lifecycle) return 'superseded'
+    if (status === null || status < 200 || status > 299) {
+      console.warn(`[backend:${this.kind}] CLI daemon refused shutdown (${status ?? 'no answer'}); starting our own anyway`)
+      return 'absent'
+    }
+    const deadline = Date.now() + TAKEOVER_WAIT_MS
+    while (this.external.isAlive(state.pid) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, TAKEOVER_POLL_MS))
+      if (lifecycle !== this.lifecycle) return 'superseded'
+    }
+    if (this.external.isAlive(state.pid)) {
+      console.warn(`[backend:${this.kind}] CLI daemon pid ${state.pid} still running after ${TAKEOVER_WAIT_MS} ms; starting our own anyway`)
+    }
+    return 'absent'
   }
 
   /** Live `/health` disagreed. The recorded version is only named in the hint. */
@@ -664,9 +755,9 @@ export class BackendManager {
 
   /** Tray "停止 daemon": for a daemon this manager spawned, kill the child and
    * keep it down (no auto-respawn) — unchanged from before DEP-A5.
-   * For a reused *external* daemon (DEP-A5 requirement #2), "stop" must never
-   * kill it — it belongs to `agent24 daemon start` (or another owner), not to
-   * this app. Instead this only forgets the connection: `userStopped` still
+   * For a reused *external* daemon (DEP-A5 requirement #2; since T1-0 one the
+   * LaunchAgent manages, or any for a legacy-mode app), "stop" must never kill
+   * it — it is not this app's. Instead this only forgets the connection: `userStopped` still
    * pins the tray to "stopped" and suspends the health loop, exactly as a
    * real stop would, but the external process itself is left untouched. */
   stopDaemon(): void {
@@ -923,8 +1014,8 @@ export class BackendManager {
       clearInterval(this.healthTimer)
       this.healthTimer = null
     }
-    // App exit must never kill a daemon this manager didn't spawn (DEP-A5
-    // requirement #2) — just stop watching it and let it keep running.
+    // App exit must never kill a reused external daemon (DEP-A5 requirement
+    // #2) — just stop watching it. A daemon taken over (T1-0) is replaced by our child.
     if (this.isExternal) {
       this.disconnectExternal()
       return

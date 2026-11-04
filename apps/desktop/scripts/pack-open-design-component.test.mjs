@@ -50,7 +50,7 @@ test('packs a content-addressed tarball (separate dir) and a matching manifest',
     assert.equal(manifest.arch, 'x64')
     assert.match(
       manifest.url,
-      /^https:\/\/github\.com\/iDoris-ai\/Agent24\/releases\/download\/v0\.6\.0\/open-design-0\.26\.1-89d83b8-linux-x64-[0-9a-f]{12}\.tar\.gz$/,
+      /^https:\/\/github\.com\/iDoris-ai\/Agent24\/releases\/download\/v0\.6\.0\/open-design-0\.26\.1-f5beffc-linux-x64-[0-9a-f]{12}\.tar\.gz$/,
     )
     assert.equal(typeof manifest.sha256, 'string')
     assert.equal(manifest.sha256.length, 64)

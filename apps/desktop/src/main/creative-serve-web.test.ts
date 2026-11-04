@@ -3,22 +3,49 @@ import { PassThrough } from 'node:stream'
 import type { ChildProcess } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   CreativeServeWeb,
   CreativeViewRequestFence,
   OPEN_DESIGN_PIN_VERSION,
+  shouldReloadCreativeView,
+  loadCreativeView,
+  stopWithin,
   canonicalCreativeOrigin,
   classifyCreativeUrl,
   creativeChildEnvironment,
+  resolveBundledAgent24Cli,
+  resolveNodeRuntimeExecutable,
   parseAgent24HeadlessReady,
   resolveAgent24HeadlessLauncher,
   resolveOpenDesignCheckout,
 } from './creative-serve-web'
+import { mapOpenDesignReport } from './open-design-report'
+
+const allChildren: FakeChild[] = []
 
 class FakeChild extends EventEmitter {
+  /** Group members besides the launcher (daemon, web) are modelled as one flag. */
+  groupAlive = true
+  /** A launcher that ignores SIGTERM (stuck shutdown). */
+  ignoreTerm = false
+  /** Descendants that survive the launcher's own exit. */
+  orphansOnTerm = false
+  signals: Array<[number, string | number]> = []
+  constructor() {
+    super()
+    allChildren.push(this)
+  }
+
+  exitNow(code = 0): void {
+    if (this.exitCode !== null) return
+    this.exitCode = code
+    queueMicrotask(() => this.emit('exit', code, null))
+  }
+
   pid = 4321
   stdout = new PassThrough()
   stderr = new PassThrough()
@@ -33,6 +60,35 @@ class FakeChild extends EventEmitter {
 }
 
 const tempDirs: string[] = []
+
+function esrch(): Error {
+  return Object.assign(new Error('kill ESRCH'), { code: 'ESRCH' })
+}
+
+// The sidecar path signals by pid and pgid through process.kill. Never let a fake pid reach a real
+// process: a spy models the kernel for the registered FakeChild instances and rejects the rest.
+beforeEach(() => {
+  allChildren.length = 0
+  vi.spyOn(process, 'kill').mockImplementation(((target: number, signal?: string | number) => {
+    const pid = Math.abs(target)
+    const child = allChildren.find((candidate) => candidate.pid === pid)
+    if (!child) throw esrch()
+    child.signals.push([target, signal ?? 'SIGTERM'])
+    if (target > 0) {
+      if (signal === 'SIGTERM' && !child.ignoreTerm) {
+        child.exitNow()
+        if (!child.orphansOnTerm) child.groupAlive = false
+      }
+      return true
+    }
+    if (!child.groupAlive) throw esrch()
+    if (signal === 'SIGKILL') {
+      child.groupAlive = false
+      child.exitNow(137)
+    }
+    return true
+  }) as typeof process.kill)
+})
 
 function materializeCheckout(root: string): string {
   fs.mkdirSync(path.join(root, 'apps/daemon/bin'), { recursive: true })
@@ -94,6 +150,8 @@ function headlessReady(ownerPid: number, webPort: number, daemonPort: number, in
 }
 
 afterEach(() => {
+  vi.restoreAllMocks()
+  vi.useRealTimers()
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true })
 })
 
@@ -278,7 +336,7 @@ describe('CreativeServeWeb', () => {
     const starting = service.start()
     child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
 
-    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456', instanceId: expect.any(String) })
     const configPath = path.join(stateRoot, 'agent24-headless.json')
     expect(spawnFn).toHaveBeenCalledWith(
       runtimeExecutable,
@@ -290,6 +348,8 @@ describe('CreativeServeWeb', () => {
           OPENAI_API_KEY: 'provider-secret',
           ELECTRON_RUN_AS_NODE: '1',
         },
+        // The launcher leads its own process group so the tree can be reaped without touching ours.
+        detached: true,
       }),
     )
     expect(JSON.parse(fs.readFileSync(configPath, 'utf8'))).toEqual({
@@ -302,9 +362,11 @@ describe('CreativeServeWeb', () => {
       // Legacy bundled-resources path: no resourceSafeBase (the fork's v1
       // runtimeExecutable-derived default still applies).
     })
-    expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:17456/api/ready')
+    expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:17456/api/ready', expect.objectContaining({ signal: expect.any(AbortSignal) }))
     await service.stop()
-    expect(child.kill).toHaveBeenCalledWith('SIGTERM')
+    // Graceful stop signals the launcher pid only, never the group.
+    expect(child.signals).toEqual([[-4321, 0], [4321, 'SIGTERM'], [-4321, 0]])
+    expect(child.kill).not.toHaveBeenCalled()
   })
 
   it('fails closed on an invalid packaged ready line before probing the web origin', async () => {
@@ -320,7 +382,8 @@ describe('CreativeServeWeb', () => {
     child.stdout.write(`${JSON.stringify({ ...headlessReady(child.pid, 17456, 17457), webOrigin: 'http://example.com:17456' })}\n`)
     await expect(starting).resolves.toMatchObject({ state: 'failed', error: expect.stringContaining('127.0.0.1') })
     expect(fetchFn).not.toHaveBeenCalled()
-    expect(child.kill).toHaveBeenCalledWith('SIGTERM')
+    expect(child.signals.filter(([, signal]) => signal !== 0)[0]).toEqual([4321, 'SIGTERM'])
+    expect(service.headlessSidecarState()).toBe('failed')
   })
 
   it('allows restart after the packaged owner exits by signal during readiness', async () => {
@@ -343,18 +406,22 @@ describe('CreativeServeWeb', () => {
     first.emit('exit', null, 'SIGTERM')
     await expect(staleStart).resolves.toMatchObject({ state: 'failed', error: expect.stringContaining('exited before ready') })
     expect(first.kill).not.toHaveBeenCalled()
+    // The launcher died by itself; whatever it left in its group is reaped by pgid.
+    expect(first.signals).toContainEqual([-4321, 'SIGKILL'])
     const restarted = service.start()
     second.stdout.write(`${JSON.stringify(headlessReady(second.pid, 17458, 17459, 'creative-2'))}\n`)
-    await expect(restarted).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17458' })
+    await expect(restarted).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17458', instanceId: expect.any(String) })
     expect(spawnFn).toHaveBeenCalledTimes(2)
     await service.stop()
   })
 
-  it('serializes starts behind a slow packaged stop and never force-kills only the owner', async () => {
+  it('serializes starts behind a slow packaged stop, then SIGKILLs the whole group after the grace period', async () => {
     const { resources, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
     const child = new FakeChild()
-    child.kill = vi.fn(() => true)
-    const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+    child.ignoreTerm = true
+    const next = new FakeChild()
+    next.pid = 4322
+    const spawnFn = vi.fn().mockReturnValueOnce(child as unknown as ChildProcess).mockReturnValueOnce(next as unknown as ChildProcess)
     const service = new CreativeServeWeb(
       { resourcesPath: resources, stateRoot, runtimeExecutable, readyTimeoutMs: 500 },
       spawnFn as never,
@@ -362,30 +429,55 @@ describe('CreativeServeWeb', () => {
     )
     const starting = service.start()
     child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17460, 17461, 'creative-slow'))}\n`)
-    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17460' })
+    await expect(starting).resolves.toMatchObject({ state: 'ready', origin: 'http://127.0.0.1:17460' })
 
     vi.useFakeTimers()
-    try {
-      const stopping = service.stop()
-      const concurrentStart = service.start()
-      expect(spawnFn).toHaveBeenCalledTimes(1)
-      await vi.advanceTimersByTimeAsync(60_000)
-      const failed = {
-        state: 'failed',
-        error: 'Open Design headless launcher did not stop within 60000ms; refusing an owner-only force kill',
-      }
-      await expect(stopping).resolves.toEqual(failed)
-      await expect(concurrentStart).resolves.toEqual(failed)
-      expect(spawnFn).toHaveBeenCalledTimes(1)
-      expect(child.kill).toHaveBeenCalledWith('SIGTERM')
-      expect(child.kill).not.toHaveBeenCalledWith('SIGKILL')
+    const stopping = service.stop()
+    const concurrentStart = service.start()
+    expect(spawnFn).toHaveBeenCalledTimes(1)
+    expect(service.headlessSidecarState()).toBe('stopping')
+    // Inside the 15 s grace nothing but the launcher's SIGTERM has been sent.
+    await vi.advanceTimersByTimeAsync(14_000)
+    expect(child.signals.filter(([, signal]) => signal === 'SIGKILL')).toEqual([])
+    await vi.advanceTimersByTimeAsync(1_000)
+    await expect(stopping).resolves.toEqual({ state: 'stopped' })
+    expect(child.signals.filter(([, signal]) => signal !== 0)).toEqual([[4321, 'SIGTERM'], [-4321, 'SIGKILL']])
+    expect(child.kill).not.toHaveBeenCalled()
+    // The queued start proceeds only after the stop settled, and gets a fresh launch.
+    expect(spawnFn).toHaveBeenCalledTimes(2)
+    expect(service.headlessSidecarState()).toBe('starting')
+    vi.useRealTimers()
+    next.stdout.write(`${JSON.stringify(headlessReady(next.pid, 17462, 17463, 'creative-next'))}\n`)
+    await expect(concurrentStart).resolves.toMatchObject({ state: 'ready', origin: 'http://127.0.0.1:17462' })
+    await service.stop()
+  })
 
-      child.exitCode = 0
-      child.emit('exit', 0, null)
-      expect(service.status()).toEqual({ state: 'stopped' })
-    } finally {
-      vi.useRealTimers()
-    }
+  it('reports failed and refuses to start over an instance whose group cannot be emptied', async () => {
+    const { resources, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const child = new FakeChild()
+    child.ignoreTerm = true
+    // SIGKILL "succeeds" but the group never empties (an uninterruptible member).
+    vi.mocked(process.kill).mockImplementation(((target: number, signal?: string | number) => {
+      child.signals.push([target, signal ?? 'SIGTERM'])
+      if (target < 0 && signal === 0) return true
+      return true
+    }) as typeof process.kill)
+    const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+    const service = new CreativeServeWeb(
+      { resourcesPath: resources, stateRoot, runtimeExecutable, readyTimeoutMs: 500, sidecarTimings: { termGraceMs: 20, killAfterMs: 20 } },
+      spawnFn as never,
+      vi.fn(async () => new Response('{}', { status: 200 })),
+    )
+    const starting = service.start()
+    child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17460, 17461))}\n`)
+    await starting
+
+    await expect(service.stop()).resolves.toMatchObject({ state: 'failed', error: expect.stringContaining('did not exit') })
+    expect(service.headlessSidecarState()).toBe('failed')
+    expect(service.hasLiveProcess()).toBe(true)
+    // The retained owner blocks a replacement: no second launch while the old tree may still run.
+    await expect(service.start()).resolves.toMatchObject({ state: 'failed', error: expect.stringContaining('has not stopped') })
+    expect(spawnFn).toHaveBeenCalledTimes(1)
   })
 
   it('shares one in-flight launch across concurrent start calls', async () => {
@@ -470,7 +562,7 @@ describe('CreativeServeWeb', () => {
 
     const starting = service.start()
     child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
-    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456', instanceId: expect.any(String) })
     expect(spawnFn).toHaveBeenCalledWith(
       runtimeExecutable,
       [path.join(componentDir, 'app', 'prebundled', 'agent24-headless.cjs'), '--config', path.join(stateRoot, 'agent24-headless.json')],
@@ -482,6 +574,61 @@ describe('CreativeServeWeb', () => {
       resourceSafeBase: fs.realpathSync(componentDir),
     })
     await service.stop()
+  })
+
+  it('hands the bundled agent24 CLI to Open Design as AGENT24_BIN, keeping a user override', async () => {
+    for (const [userBin, expected] of [[undefined, '/Apps/Agent24.app/Contents/Resources/backend/agent24'], ['/opt/mine/agent24', '/opt/mine/agent24']] as const) {
+      const { resources, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+      const child = new FakeChild()
+      const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+      const service = new CreativeServeWeb(
+        {
+          resourcesPath: resources,
+          stateRoot,
+          runtimeExecutable,
+          environment: { PATH: '/usr/bin', ...(userBin ? { AGENT24_BIN: userBin } : {}) },
+          agent24Cli: '/Apps/Agent24.app/Contents/Resources/backend/agent24',
+          readyTimeoutMs: 500,
+        },
+        spawnFn as never,
+        vi.fn(async () => new Response('{}', { status: 200 })),
+      )
+      const starting = service.start()
+      child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
+      await starting
+      const env = (spawnFn.mock.calls[0] as unknown as [string, string[], { env: NodeJS.ProcessEnv }])[2].env
+      expect(env.AGENT24_BIN).toBe(expected)
+      await service.stop()
+    }
+  })
+
+  it('runs Open Design children under the LSUIElement Helper on macOS so none of them gets a Dock tile', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-helper-'))
+    try {
+      const execPath = path.join(root, 'Agent24.app', 'Contents', 'MacOS', 'Agent24')
+      const helper = path.join(root, 'Agent24.app', 'Contents', 'Frameworks', 'Agent24 Helper.app', 'Contents', 'MacOS', 'Agent24 Helper')
+      expect(resolveNodeRuntimeExecutable(execPath, 'darwin')).toBe(execPath)
+      fs.mkdirSync(path.dirname(helper), { recursive: true })
+      fs.writeFileSync(helper, '')
+      expect(resolveNodeRuntimeExecutable(execPath, 'darwin')).toBe(helper)
+      expect(resolveNodeRuntimeExecutable(execPath, 'linux')).toBe(execPath)
+      expect(resolveNodeRuntimeExecutable(execPath, 'win32')).toBe(execPath)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('finds the CLI bundled in Agent24.app and nothing when it is absent', () => {
+    const resources = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-res-'))
+    try {
+      expect(resolveBundledAgent24Cli(resources)).toBeNull()
+      fs.mkdirSync(path.join(resources, 'backend'))
+      fs.writeFileSync(path.join(resources, 'backend', 'agent24'), '')
+      expect(resolveBundledAgent24Cli(resources)).toBe(path.join(resources, 'backend', 'agent24'))
+      expect(resolveBundledAgent24Cli(undefined)).toBeNull()
+    } finally {
+      fs.rmSync(resources, { recursive: true, force: true })
+    }
   })
 
   it('reports headless sidecar phases and clears them after a clean stop', async () => {
@@ -500,9 +647,10 @@ describe('CreativeServeWeb', () => {
     const starting = service.start()
     expect(service.headlessSidecarState()).toBe('starting')
     child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
-    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
-    expect(service.headlessSidecarState()).toBe('ready')
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456', instanceId: expect.any(String) })
+    expect(service.headlessSidecarState()).toBe('healthy')
     child.emit('exit', 1, null)
+    await Promise.resolve()
     expect(service.headlessSidecarState()).toBe('failed')
     expect(service.status()).toEqual({ state: 'stopped' })
   })
@@ -531,6 +679,9 @@ describe('CreativeServeWeb', () => {
     await starting
     const stopping = service.stop()
     expect(service.headlessSidecarState()).toBe('stopping')
+    // Stop clears `this.child` before the process is gone. An upgrade snapshot
+    // in that window must not drop `stopping`.
+    expect(service.headlessPhaseForReport('downloading')).toBe('stopping')
     expect(service.status()).toEqual({ state: 'stopped' })
     await stopping
     expect(service.headlessSidecarState()).toBe('stopped')
@@ -540,10 +691,116 @@ describe('CreativeServeWeb', () => {
     const again = service.start()
     expect(service.headlessSidecarState()).toBe('starting')
     second.stdout.write(`${JSON.stringify(headlessReady(second.pid, 17458, 17459, 'creative-2'))}\n`)
-    await expect(again).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17458' })
-    expect(service.headlessSidecarState()).toBe('ready')
+    await expect(again).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17458', instanceId: expect.any(String) })
+    expect(service.headlessSidecarState()).toBe('healthy')
     await service.stop()
     expect(service.headlessSidecarState()).toBe('stopped')
+  })
+
+  it('clears a leftover stopped phase when the component leaves installed, so reinstall reports installed', async () => {
+    const { resources: componentDir, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const first = new FakeChild()
+    const second = new FakeChild()
+    second.pid = 4322
+    const children = [first, second]
+    let spawned = 0
+    const service = new CreativeServeWeb(
+      {
+        stateRoot,
+        runtimeExecutable,
+        readyTimeoutMs: 500,
+        component: { status: () => ({ state: 'installed', dir: componentDir }) },
+      },
+      vi.fn(() => children[spawned++] as unknown as ChildProcess) as never,
+      vi.fn(async () => new Response('{}', { status: 200 })),
+    )
+    const starting = service.start()
+    first.stdout.write(`${JSON.stringify(headlessReady(first.pid, 17456, 17457))}\n`)
+    await starting
+    await service.stop()
+    expect(service.headlessSidecarState()).toBe('stopped')
+    // Still installed: a clean stop stays stopped (D5 `installed` + sidecar).
+    expect(service.headlessPhaseForReport('installed')).toBe('stopped')
+    expect(service.headlessSidecarState()).toBe('stopped')
+
+    // Uninstall clears the leftover. The next installed report is `installed`,
+    // which would be `stopped` if the phase were left in place.
+    expect(service.headlessPhaseForReport('not-installed')).toBeNull()
+    expect(service.headlessSidecarState()).toBeNull()
+    expect(mapOpenDesignReport({
+      installState: 'installed',
+      version: OPEN_DESIGN_PIN_VERSION,
+      sidecar: service.headlessSidecarState(),
+    })).toEqual({ state: 'installed', version: OPEN_DESIGN_PIN_VERSION })
+
+    // A later run can stop again. A download that skips `not-installed` clears too.
+    const again = service.start()
+    second.stdout.write(`${JSON.stringify(headlessReady(second.pid, 17458, 17459, 'creative-2'))}\n`)
+    await again
+    await service.stop()
+    expect(service.headlessSidecarState()).toBe('stopped')
+    expect(service.headlessPhaseForReport('downloading')).toBeNull()
+    expect(mapOpenDesignReport({
+      installState: 'downloading',
+      version: OPEN_DESIGN_PIN_VERSION,
+      sidecar: service.headlessSidecarState(),
+    })).toEqual({ state: 'installing' })
+    expect(mapOpenDesignReport({
+      installState: 'installed',
+      version: OPEN_DESIGN_PIN_VERSION,
+      sidecar: service.headlessSidecarState(),
+    })).toEqual({ state: 'installed', version: OPEN_DESIGN_PIN_VERSION })
+  })
+
+  it('keeps a live ready phase through an upgrade, and records a crash during that upgrade as failed', async () => {
+    const { resources: componentDir, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const child = new FakeChild()
+    const service = new CreativeServeWeb(
+      {
+        stateRoot,
+        runtimeExecutable,
+        readyTimeoutMs: 500,
+        component: { status: () => ({ state: 'installed', dir: componentDir }) },
+      },
+      vi.fn(() => child as unknown as ChildProcess) as never,
+      vi.fn(async () => new Response('{}', { status: 200 })),
+    )
+    // main.ts reports on every status assignment. While an upgrade is in
+    // progress that snapshot still sees `downloading`, not `installed`.
+    let installState = 'installed'
+    service.onStatus(() => { service.headlessPhaseForReport(installState) })
+
+    const starting = service.start()
+    child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
+    await starting
+    expect(service.headlessSidecarState()).toBe('healthy')
+
+    installState = 'downloading'
+    expect(service.headlessPhaseForReport('downloading')).toBe('healthy')
+    expect(service.headlessPhaseForReport('verifying')).toBe('healthy')
+    expect(service.headlessSidecarState()).toBe('healthy')
+
+    child.emit('exit', 1, null)
+    await Promise.resolve()
+    expect(service.headlessSidecarState()).toBe('failed')
+    // The crash's own status event already called headlessPhaseForReport('downloading').
+    // A later progress tick must still see the failure, and so must the
+    // snapshot once the install is back.
+    expect(service.headlessPhaseForReport('downloading')).toBe('failed')
+    expect(service.headlessPhaseForReport('paused')).toBe('failed')
+    expect(service.headlessPhaseForReport('installed')).toBe('failed')
+    expect(mapOpenDesignReport({
+      installState: 'installed',
+      version: OPEN_DESIGN_PIN_VERSION,
+      sidecar: service.headlessSidecarState(),
+    })).toEqual({ state: 'failed', version: OPEN_DESIGN_PIN_VERSION })
+
+    // Uninstall drops a failed phase only once the manager no longer owns the dead instance.
+    expect(service.headlessPhaseForReport('not-installed')).toBe('failed')
+    await vi.waitFor(() => expect(service.hasLiveProcess()).toBe(false))
+    expect(service.headlessPhaseForReport('not-installed')).toBeNull()
+    expect(service.headlessSidecarState()).toBeNull()
+    expect(service.headlessPhaseForReport('unavailable')).toBeNull()
   })
 
   it('C1: Design still starts when resourcesPath is unset entirely (proves no dependency on a writable — or any — app resources dir for the on-demand path)', async () => {
@@ -568,7 +825,7 @@ describe('CreativeServeWeb', () => {
     )
     const starting = service.start()
     child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
-    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456', instanceId: expect.any(String) })
     await service.stop()
   })
 
@@ -602,7 +859,7 @@ describe('CreativeServeWeb', () => {
 
     const starting = service.start()
     child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
-    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456', instanceId: expect.any(String) })
     const realBase = fs.realpathSync(componentDir)
     const configPath = path.join(stateRoot, 'agent24-headless.json')
     expect(JSON.parse(fs.readFileSync(configPath, 'utf8'))).toMatchObject({
@@ -729,6 +986,294 @@ describe('CreativeServeWeb', () => {
     await expect(service.start()).resolves.toEqual({
       state: 'failed',
       error: 'Open Design web bundle is not built; run pnpm --filter @open-design/web build',
+    })
+  })
+
+  describe('Open Design under SidecarManager (C8)', () => {
+    function managed(options: Partial<ConstructorParameters<typeof CreativeServeWeb>[0]> = {}, fetchFn?: typeof fetch, children: FakeChild[] = [new FakeChild()]) {
+      const { resources, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+      children.forEach((child, index) => { child.pid = 4321 + index })
+      let spawned = 0
+      const spawnFn = vi.fn(() => children[spawned++] as unknown as ChildProcess)
+      const service = new CreativeServeWeb(
+        { resourcesPath: resources, stateRoot, runtimeExecutable, readyTimeoutMs: 500, ...options },
+        spawnFn as never,
+        fetchFn ?? vi.fn(async () => new Response('{}', { status: 200 })),
+      )
+      const launch = async (index: number, instance = `creative-${index}`) => {
+        const starting = service.start()
+        const child = children[index]
+        child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456 + index * 2, 17457 + index * 2, instance))}\n`)
+        return starting
+      }
+      return { service, spawnFn, children, launch }
+    }
+
+    it('gives every launch a new instanceId, including after a crash that reuses the same port', async () => {
+      const { service, launch, children } = managed({}, undefined, [new FakeChild(), new FakeChild()])
+      const first = await launch(0)
+      expect(first).toMatchObject({ state: 'ready', instanceId: expect.any(String) })
+      children[0].exitNow(1)
+      await vi.waitFor(() => expect(service.hasLiveProcess()).toBe(false))
+      expect(service.status()).toEqual({ state: 'stopped' })
+      // The crash tree was reaped by group, not just the launcher pid.
+      expect(children[0].signals).toContainEqual([-4321, 'SIGKILL'])
+
+      const second = await launch(1)
+      expect(second.state).toBe('ready')
+      expect(second.instanceId).not.toBe(first.instanceId)
+      await service.stop()
+    })
+
+    it('publishes a crash through onStatus without waiting for a heartbeat', async () => {
+      const { service, launch, children } = managed()
+      await launch(0)
+      const seen: string[] = []
+      service.onStatus((status) => seen.push(`${status.state}:${service.headlessSidecarState()}`))
+      children[0].exitNow(1)
+      await vi.waitFor(() => expect(seen).toContain('stopped:failed'))
+      expect(service.headlessSidecarState()).toBe('failed')
+    })
+
+    it('reports degraded after repeated health failures, never restarts, and recovers on the next success', async () => {
+      let healthy = true
+      const fetchFn = vi.fn(async () => (healthy ? new Response('{}', { status: 200 }) : new Response('', { status: 503 })))
+      const { service, launch, spawnFn, children } = managed({ sidecarTimings: { healthIntervalMs: 20, healthTimeoutMs: 15 } }, fetchFn as never)
+      await launch(0)
+      expect(service.status()).not.toHaveProperty('degraded')
+      healthy = false
+      await vi.waitFor(() => expect(service.status()).toMatchObject({ state: 'ready', degraded: true }), { timeout: 2_000 })
+      expect(service.headlessSidecarState()).toBe('degraded')
+      // Still the same instance, same process: no restart on degraded.
+      expect(spawnFn).toHaveBeenCalledTimes(1)
+      expect(children[0].signals.filter(([, signal]) => signal !== 0)).toEqual([])
+      healthy = true
+      await vi.waitFor(() => expect(service.status()).not.toHaveProperty('degraded'), { timeout: 2_000 })
+      expect(service.status().state).toBe('ready')
+      await service.stop()
+    })
+
+    it.each([false, true])('show restarts degraded once (concurrent shows: %s)', async (concurrent) => {
+      let healthy = true
+      const fetchFn = vi.fn(async () => new Response('{}', { status: healthy ? 200 : 502 }))
+      const { service, launch, spawnFn, children } = managed({
+        sidecarTimings: { healthIntervalMs: 20, healthTimeoutMs: 15, termGraceMs: 100 },
+      }, fetchFn, [new FakeChild(), new FakeChild()])
+      const first = await launch(0)
+      healthy = false
+      await vi.waitFor(() => expect(service.headlessSidecarState()).toBe('degraded'))
+      children[0].ignoreTerm = true
+      const showing = service.start()
+      const secondShow = concurrent ? service.start() : showing
+      await vi.waitFor(() => expect(spawnFn).toHaveBeenCalledTimes(2))
+      healthy = true
+      children[1].stdout.write(`${JSON.stringify(headlessReady(children[1].pid, 17458, 17459, 'replacement'))}\n`)
+      const [second, repeated] = await Promise.all([showing, secondShow])
+      expect(second).toMatchObject({ state: 'ready', instanceId: expect.any(String) })
+      expect(second.instanceId).not.toBe(first.instanceId)
+      expect(repeated.instanceId).toBe(second.instanceId)
+      expect(children[0].signals.filter(([, signal]) => signal !== 0)).toEqual([[4321, 'SIGTERM'], [-4321, 'SIGKILL']])
+      expect(spawnFn).toHaveBeenCalledTimes(2)
+      await service.stop()
+    })
+
+    it('an explicit stop during a degraded restart cancels the relaunch', async () => {
+      let healthy = true
+      const fetchFn = vi.fn(async () => new Response('{}', { status: healthy ? 200 : 502 }))
+      const { service, launch, spawnFn } = managed({
+        sidecarTimings: { healthIntervalMs: 20, healthTimeoutMs: 15, termGraceMs: 100 },
+      }, fetchFn, [new FakeChild(), new FakeChild()])
+      await launch(0)
+      healthy = false
+      await vi.waitFor(() => expect(service.headlessSidecarState()).toBe('degraded'))
+      const showing = service.start()
+      await service.stop()
+      await showing
+      expect(spawnFn).toHaveBeenCalledOnce()
+    })
+
+    it('an explicit stop also cancels a show queued behind the restart', async () => {
+      let healthy = true
+      const fetchFn = vi.fn(async () => new Response('{}', { status: healthy ? 200 : 502 }))
+      const { service, launch, spawnFn } = managed({
+        sidecarTimings: { healthIntervalMs: 20, healthTimeoutMs: 15, termGraceMs: 100 },
+      }, fetchFn, [new FakeChild(), new FakeChild()])
+      await launch(0)
+      healthy = false
+      await vi.waitFor(() => expect(service.headlessSidecarState()).toBe('degraded'))
+      const first = service.start()
+      const queued = service.start()
+      await service.stop()
+      await Promise.all([first, queued])
+      expect(spawnFn).toHaveBeenCalledOnce()
+    })
+
+    it('quit during a degraded restart does not relaunch', async () => {
+      let healthy = true
+      const fetchFn = vi.fn(async () => new Response('{}', { status: healthy ? 200 : 502 }))
+      const { service, launch, spawnFn } = managed({
+        sidecarTimings: { healthIntervalMs: 20, healthTimeoutMs: 15, termGraceMs: 100 },
+      }, fetchFn, [new FakeChild(), new FakeChild()])
+      await launch(0)
+      healthy = false
+      await vi.waitFor(() => expect(service.headlessSidecarState()).toBe('degraded'))
+      const showing = service.start()
+      await service.shutdown()
+      await showing
+      expect(spawnFn).toHaveBeenCalledOnce()
+      expect((await service.start()).instanceId).toBeUndefined()
+      expect(spawnFn).toHaveBeenCalledOnce()
+    })
+
+    it.each(['ready', 'healthy'] as const)('show reuses a %s instance', async (state) => {
+      const fetchFn = vi.fn(async () => new Response('{}', { status: state === 'healthy' ? 200 : 502 }))
+        .mockResolvedValueOnce(new Response('{}', { status: 200 }))
+      const { service, launch, spawnFn } = managed({ sidecarTimings: { healthIntervalMs: 1_000 } }, fetchFn)
+      const first = await launch(0)
+      if (state === 'healthy') await vi.waitFor(() => expect(service.headlessSidecarState()).toBe('healthy'))
+      expect(service.headlessSidecarState()).toBe(state)
+      expect((await service.start()).instanceId).toBe(first.instanceId)
+      expect(spawnFn).toHaveBeenCalledOnce()
+      await service.stop()
+    })
+
+    it('probes /api/ready through the web origin for health, with a bounded request', async () => {
+      const fetchFn = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => new Response('{}', { status: 200 }))
+      const { service, launch } = managed({ sidecarTimings: { healthIntervalMs: 20 } }, fetchFn as never)
+      await launch(0)
+      await vi.waitFor(() => expect(fetchFn.mock.calls.some(([, init]) => init?.signal instanceof AbortSignal)).toBe(true))
+      expect(fetchFn.mock.calls.every(([url]) => url === 'http://127.0.0.1:17456/api/ready')).toBe(true)
+      await service.stop()
+    })
+
+    it('fails with "unsupported platform" on win32 without spawning or writing the launcher config', async () => {
+      const { resources, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+      const spawnFn = vi.fn()
+      const service = new CreativeServeWeb(
+        { resourcesPath: resources, stateRoot, runtimeExecutable },
+        spawnFn as never,
+        vi.fn(),
+        { platform: 'win32' },
+      )
+      await expect(service.start()).resolves.toEqual({ state: 'failed', error: 'unsupported platform' })
+      expect(spawnFn).not.toHaveBeenCalled()
+      expect(fs.existsSync(path.join(stateRoot, 'agent24-headless.json'))).toBe(false)
+    })
+
+    it('a stop that arrives during launch cancels it instead of reporting failed', async () => {
+      const { service, children } = managed()
+      const starting = service.start()
+      const stopped = service.stop()
+      await expect(stopped).resolves.toEqual({ state: 'stopped' })
+      await expect(starting).resolves.toEqual({ state: 'stopped' })
+      expect(service.headlessSidecarState()).toBe('stopped')
+      expect(children[0].signals.some(([, signal]) => signal === 'SIGTERM')).toBe(true)
+    })
+
+    it('keeps all three states stopped when stop arrives during failed-start cleanup', async () => {
+      const { service, children } = managed({ sidecarTimings: { termGraceMs: 1_000 } })
+      const child = children[0]
+      child.ignoreTerm = true
+      const starting = service.start()
+      child.stdout.write(`${JSON.stringify({ ...headlessReady(child.pid, 17456, 17457), pinVersion: 'other' })}\n`)
+      await vi.waitFor(() => expect(child.signals).toContainEqual([child.pid, 'SIGTERM']))
+      expect(service.headlessSidecarState()).toBe('failed')
+      const stopping = service.stop()
+      child.groupAlive = false
+      child.exitNow()
+      await stopping
+      await expect(starting).resolves.toEqual({ state: 'stopped' })
+      expect(service.status()).toEqual({ state: 'stopped' })
+      expect(service.headlessSidecarState()).toBe('stopped')
+      expect(mapOpenDesignReport({ installState: 'installed', sidecar: service.headlessPhaseForReport('installed') }).state).toBe('stopped')
+      expect(service.hasLiveProcess()).toBe(false)
+    })
+
+    it('a normal stop never passes through failed', async () => {
+      const { service, launch } = managed()
+      await launch(0)
+      const phases: Array<string | null> = []
+      const pairs: string[] = []
+      service.onStatus((status) => { phases.push(service.headlessSidecarState()); pairs.push(`${status.state}:${service.headlessSidecarState()}`) })
+      await service.stop()
+      // A reporter never sees a live phase next to a stopped status.
+      expect(pairs.filter((pair) => pair.startsWith('stopped:') && pair !== 'stopped:stopping' && pair !== 'stopped:stopped')).toEqual([])
+      expect(phases).not.toContain('failed')
+      expect(phases).toContain('stopping')
+      expect(phases.at(-1)).toBe('stopped')
+    })
+
+    it('stopping a launch that failed and left nothing keeps the failed phase (no unplanned failed -> stopped)', async () => {
+      const { service, children } = managed()
+      const starting = service.start()
+      children[0].stdout.write(`${JSON.stringify({ ...headlessReady(children[0].pid, 17456, 17457), pinVersion: 'other' })}\n`)
+      await expect(starting).resolves.toMatchObject({ state: 'failed', error: expect.stringContaining('pin version') })
+      expect(service.hasLiveProcess()).toBe(false)
+      await service.stop()
+      expect(service.headlessSidecarState()).toBe('failed')
+    })
+
+    it('hasLiveProcess is false for a clean stop and for a failure that left nothing, true while a tree remains', async () => {
+      const { service, launch } = managed()
+      expect(service.hasLiveProcess()).toBe(false)
+      await launch(0)
+      expect(service.hasLiveProcess()).toBe(true)
+      await service.stop()
+      expect(service.hasLiveProcess()).toBe(false)
+    })
+  })
+
+  describe('stopWithin', () => {
+    it('resolves true when the stop finishes inside the budget', async () => {
+      await expect(stopWithin({ stop: async () => ({ state: 'stopped' }) }, 1_000)).resolves.toBe(true)
+    })
+
+    it('gives up after the budget when the stop hangs, and does not reject when it throws', async () => {
+      vi.useFakeTimers()
+      const hanging = stopWithin({ stop: () => new Promise(() => {}) }, 22_000)
+      await vi.advanceTimersByTimeAsync(22_000)
+      await expect(hanging).resolves.toBe(false)
+      vi.useRealTimers()
+      await expect(stopWithin({ stop: async () => { throw new Error('boom') } }, 1_000)).resolves.toBe(false)
+    })
+  })
+
+  describe('shouldReloadCreativeView', () => {
+    const base = { forceReload: false, currentUrl: 'http://127.0.0.1:17456/', origin: 'http://127.0.0.1:17456', loadedInstanceId: 'a', instanceId: 'a' as string | undefined }
+
+    it('retries loading on the next show after navigation fails', async () => {
+      let loadedInstanceId: string | null = 'a'
+      const loadURL = vi.fn().mockRejectedValueOnce(new Error('navigation failed')).mockResolvedValue(undefined)
+      const show = () => loadCreativeView({
+        ...base, instanceId: 'b', loadedInstanceId, loadURL,
+        isCurrent: () => true,
+        rememberInstance: (id) => { loadedInstanceId = id },
+      })
+      await expect(show()).rejects.toThrow('navigation failed')
+      expect(loadedInstanceId).toBe('a')
+      await show()
+      expect(loadURL).toHaveBeenCalledTimes(2)
+      expect(loadedInstanceId).toBe('b')
+    })
+
+    it('does not remember a successful navigation from a superseded view request', async () => {
+      const rememberInstance = vi.fn()
+      await loadCreativeView({ ...base, instanceId: 'b', loadURL: async () => {}, isCurrent: () => false, rememberInstance })
+      expect(rememberInstance).not.toHaveBeenCalled()
+    })
+
+    it('keeps the page for the same instance on the same origin', () => {
+      expect(shouldReloadCreativeView(base)).toBe(false)
+    })
+
+    it('reloads when a new instance reuses the old port', () => {
+      expect(shouldReloadCreativeView({ ...base, instanceId: 'b' })).toBe(true)
+    })
+
+    it('still reloads on force, on a different origin, and ignores instance for a checkout (no instanceId)', () => {
+      expect(shouldReloadCreativeView({ ...base, forceReload: true })).toBe(true)
+      expect(shouldReloadCreativeView({ ...base, currentUrl: 'about:blank' })).toBe(true)
+      expect(shouldReloadCreativeView({ ...base, instanceId: undefined, loadedInstanceId: null })).toBe(false)
     })
   })
 })

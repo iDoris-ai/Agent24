@@ -6,7 +6,7 @@
 //! (§4.1: "可多次 accept").
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use agent24_os_proto::attach_mux::serve_attached;
@@ -157,7 +157,11 @@ pub async fn run(registry: Arc<AttachRegistry>, path: PathBuf, stop: Cancellatio
     // after an ungraceful exit.
 }
 
-async fn handle_connection(stream: UnixStream, registry: &AttachRegistry, stop: CancellationToken) {
+pub(crate) async fn handle_connection(
+    stream: UnixStream,
+    registry: &AttachRegistry,
+    stop: CancellationToken,
+) {
     // §4.1: same-UID only. The directory is already `0700`, so this is a
     // second line, not the first — same posture as
     // `CallbackListener::accept_one`.
@@ -202,7 +206,7 @@ async fn handle_connection(stream: UnixStream, registry: &AttachRegistry, stop: 
         return;
     }
 
-    let claim = match accept_attached(&frame, &|name| registry.expectation(name)) {
+    let claim = match check_frame(registry, &frame, &|name| registry.expectation(name)) {
         Ok(claim) => claim,
         Err(refusal) => {
             // Re-checked after the lookup too: `revoke_all` can land between
@@ -301,6 +305,62 @@ async fn handle_connection(stream: UnixStream, registry: &AttachRegistry, stop: 
     }
     let _ended = serve.await;
     registry.release(&claim.module, &generation);
+}
+
+/// The pure check plus the D3 side effect of a range refusal. `lookup` is
+/// [`AttachRegistry::expectation`] in production; a test passes a wrapper to put
+/// a rotation between the lookup and the note.
+///
+/// The token_id the check judged against is remembered, and the mismatch is
+/// recorded against that registration only: a rotation that lands after the
+/// lookup must not move the mismatch onto the new one (ADR-038 §3 case 2,
+/// #1572 L1). `accept_attached` already checked the token, so an unknown name
+/// never reaches the note. A closed registry is not recorded.
+fn check_frame(
+    registry: &AttachRegistry,
+    frame: &[u8],
+    lookup: &dyn Fn(&str) -> Option<agent24_os_proto::initialize::AttachedExpectation>,
+) -> Result<agent24_os_proto::initialize::AttachedAccepted, HandshakeError> {
+    let used_token = std::sync::Mutex::new(None::<String>);
+    let result = accept_attached(frame, &|name| {
+        let expectation = lookup(name);
+        if let Some(e) = &expectation {
+            *used_token.lock().unwrap_or_else(PoisonError::into_inner) = Some(e.token_id.clone());
+        }
+        expectation
+    });
+    if let Err(HandshakeError::VersionMismatch(mismatch)) = &result
+        && !registry.is_closed()
+        && let Some(name) = claimed_module(frame)
+        && let Some(token_id) = used_token
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    {
+        let (expected, actual) = contract_ends(mismatch);
+        registry.note_contract_mismatch(&name, &token_id, &expected, &actual);
+    }
+    result
+}
+
+/// The `params.module` the peer claimed. `None` when the frame is not an
+/// object with a string module — those refusals are not version mismatches.
+fn claimed_module(frame: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(frame).ok()?;
+    value
+        .get("params")?
+        .get("module")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// `(expected, actual)` for the host detail. `expected` is the kernel range.
+fn contract_ends(mismatch: &agent24_os_proto::version::VersionMismatch) -> (String, String) {
+    use agent24_os_proto::version::VersionMismatch;
+    match mismatch {
+        VersionMismatch::NotDeclared { kernel } => (kernel.to_string(), "not_declared".to_owned()),
+        VersionMismatch::NoOverlap { module, kernel } => (kernel.to_string(), module.to_string()),
+    }
 }
 
 async fn write_within(
@@ -506,5 +566,72 @@ mod tests {
              `auth_failed` — the presented token was perfectly valid: {v}"
         );
         assert_ne!(v["error"]["data"]["kind"], "auth_failed");
+    }
+
+    /// #1572 L1 through the listener's own check: the lookup returns the old
+    /// registration, a rotation lands, then the refusal is noted. The new
+    /// registration must stay clean. (If the note re-looked-up the token after
+    /// the check, it would use the new one and this goes red.)
+    #[tokio::test]
+    async fn a_rotation_between_lookup_and_note_does_not_mark_the_new_registration() {
+        let registry = crate::attach_registry::AttachRegistry::new(test_attach_deps().await);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attached.json");
+        let yaml = "name: agentear\nversion: \"1\"\nroute_namespace: /api/v1/agentear\n\
+                     event_module: agentear\ndata_dir: ~/.agent24/os/agentear/\n\
+                     impl_kind: attached_process\nkernel_capabilities: [events]\n";
+        let register = || {
+            crate::attached::register(
+                &path,
+                yaml,
+                false,
+                |_| false,
+                |change| {
+                    registry.on_change(change);
+                },
+            )
+            .unwrap()
+        };
+        let crate::attached::RegisterOutcome::Created(resp) = register() else {
+            panic!("expected Created");
+        };
+        let frame_for = |resp: &agent24_protocol::AttachedAddResponse| {
+            serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "1",
+                "method": "initialize",
+                "params": {
+                    "protocol_versions": {"min": 0, "max": 0},
+                    "module": "agentear",
+                    "manifest_digest": resp.manifest_digest,
+                    "auth_token": resp.token,
+                    "capabilities": ["events"],
+                }
+            }))
+            .unwrap()
+        };
+        let old_token = registry.expectation("agentear").unwrap().token_id;
+        let rotated = std::cell::RefCell::new(None);
+        let result = check_frame(&registry, &frame_for(&resp), &|name| {
+            let seen = registry.expectation(name);
+            let outcome = register();
+            *rotated.borrow_mut() = Some(match outcome {
+                crate::attached::RegisterOutcome::Created(r)
+                | crate::attached::RegisterOutcome::Rotated { response: r, .. } => r,
+            });
+            seen
+        });
+        assert!(matches!(result, Err(HandshakeError::VersionMismatch(_))));
+        let new_token = registry.expectation("agentear").unwrap().token_id;
+        assert_ne!(old_token, new_token, "the rotation really happened");
+        assert_eq!(registry.snapshot()[0].mismatch, None);
+
+        // Positive control: the same refusal with no rotation in between is recorded.
+        let new_resp = rotated.borrow_mut().take().unwrap();
+        let result = check_frame(&registry, &frame_for(&new_resp), &|n| {
+            registry.expectation(n)
+        });
+        assert!(matches!(result, Err(HandshakeError::VersionMismatch(_))));
+        assert!(registry.snapshot()[0].mismatch.is_some());
     }
 }

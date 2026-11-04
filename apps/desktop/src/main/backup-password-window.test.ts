@@ -2,6 +2,7 @@
 // only this window's own webContents can use.
 import fs from 'node:fs'
 import path from 'node:path'
+import util from 'node:util'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const h = vi.hoisted(() => {
@@ -54,6 +55,9 @@ type Listener = (event: unknown, ...args: unknown[]) => void
       this.handlers.set(event, (...a) => { for (const f of this.listeners.get(event) ?? []) f(...a) })
     }
     once(event: string, fn: (...a: unknown[]) => void) { this.on(event, fn) }
+    removeListener(event: string, fn: (...a: unknown[]) => void) {
+      this.listeners.set(event, (this.listeners.get(event) ?? []).filter((f) => f !== fn))
+    }
     show() {}
     isDestroyed() { return this.closed }
     close() {
@@ -83,7 +87,7 @@ vi.mock('electron', () => ({
 
 import { setMainLocale } from './main-i18n'
 import {
-  BACKUP_PW_BUSY, BACKUP_PW_CANCEL, BACKUP_PW_ERROR, BACKUP_PW_SUBMIT, backupPasswordHtml, promptBackupPassword, promptHomeImportPassword, promptRestorePassword, promptUnlockPassword,
+  BACKUP_PW_BUSY, BACKUP_PW_CANCEL, BACKUP_PW_ERROR, BACKUP_PW_SUBMIT, WINDOW_GONE_FALLBACK_MS, backupPasswordHtml, promptBackupPassword, promptHomeImportPassword, promptRestorePassword, promptUnlockPassword,
 } from './backup-password-window'
 
 const emit = (channel: string, event: unknown, ...args: unknown[]) => {
@@ -202,12 +206,11 @@ describe('the password promise always settles, and only once the window is gone'
     const result = promptBackupPassword(null)
     const w = windows[0]!
     w.closeMode = 'event-only'
+    let destroyedWhenSettled = false
+    void result.then(() => { destroyedWhenSettled = w.isDestroyed() })
     emit(BACKUP_PW_SUBMIT, fromWindow(w), 'good-pass-1', 'good-pass-1')
-    let settled = false
-    void result.then(() => { settled = true })
-    await Promise.resolve()
-    expect(settled).toBe(false) // not before the window is gone
     await expect(result).resolves.toBe('good-pass-1')
+    expect(destroyedWhenSettled).toBe(true)
     expect(w.isDestroyed()).toBe(true)
   })
 
@@ -272,6 +275,81 @@ describe('the password promise always settles, and only once the window is gone'
     await result
     expect(parent.listeners.get('closed') ?? []).toHaveLength(0)
     expect(fakeApp.listeners.get('before-quit') ?? []).toHaveLength(0)
+  })
+
+  // The field hang: after Submit the sheet emits `destroyed` (or nothing we
+  // still have a listener for) and `closed` never comes. The promise must
+  // still settle, or the export IPC never returns.
+  it('a window `destroyed` event, with no close and no closed, settles', async () => {
+    const result = promptBackupPassword(null)
+    const w = windows[0]!
+    w.closeMode = 'event-only'
+    for (const fn of w.listeners.get('destroyed') ?? []) fn()
+    const outcome = await Promise.race([
+      result.then(() => 'settled' as const),
+      new Promise<'hung'>((resolve) => setTimeout(() => resolve('hung'), 50)),
+    ])
+    expect(outcome).toBe('settled')
+    await expect(result).resolves.toBeNull()
+  })
+
+  it('an already-destroyed window (close/closed already missed) still returns the submitted password', async () => {
+    const result = promptBackupPassword(null)
+    const w = windows[0]!
+    w.closed = true
+    w.close = () => { throw new Error('Object has been destroyed') }
+    w.destroy = () => { throw new Error('Object has been destroyed') }
+    emit(BACKUP_PW_SUBMIT, fromWindow(w), 'good-pass-1', 'good-pass-1')
+    await expect(result).resolves.toBe('good-pass-1')
+  })
+
+  it('after submit, silence is not settled on the next tick; the 2s fallback destroys the window before it resolves', async () => {
+    vi.useFakeTimers()
+    try {
+      const result = promptBackupPassword(null)
+      const w = windows[0]!
+      const order: string[] = []
+      // Native close/destroy report nothing and do not mark the window gone.
+      w.close = () => {}
+      w.destroy = () => {
+        w.destroyCalls += 1
+        // Read the promise state at the destroy call, not in a later microtask.
+        // Resolving first and destroying after still runs destroy before `then`.
+        order.push(util.inspect(result).includes('<pending>') ? 'destroy' : 'destroy-after-resolve')
+      }
+      emit(BACKUP_PW_SUBMIT, fromWindow(w), 'good-pass-1', 'good-pass-1')
+      let settled = false
+      void result.then(() => { order.push('resolve'); settled = true })
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(settled).toBe(false)
+      expect(order).toEqual([])
+      await vi.advanceTimersByTimeAsync(WINDOW_GONE_FALLBACK_MS - 1)
+      expect(settled).toBe(false)
+      expect(order).toEqual([])
+      await vi.advanceTimersByTimeAsync(1)
+      expect(order).toEqual(['destroy', 'resolve'])
+      expect(w.destroyCalls).toBe(1)
+      expect(settled).toBe(true)
+      await expect(result).resolves.toBe('good-pass-1')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('the open password window has no deadline while the person is still typing', async () => {
+    vi.useFakeTimers()
+    try {
+      const result = promptBackupPassword(null)
+      let settled = false
+      void result.then(() => { settled = true })
+      await vi.advanceTimersByTimeAsync(WINDOW_GONE_FALLBACK_MS)
+      expect(settled).toBe(false)
+      windows[0]!.close()
+      await expect(result).resolves.toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

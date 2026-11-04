@@ -280,6 +280,12 @@ describe('Open Design report follows daemon ready', () => {
       read,
       checkHealth: async () => true,
       fetchHealth: async () => ({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
+      // A LaunchAgent-managed daemon that accepts its recorded token, so the
+      // legacy record below is reused (not taken over) as before T1-0.
+      serviceManaged: () => true,
+      acceptsToken: async () => true,
+      requestShutdown: async () => 202,
+      isAlive: () => true,
     }
   }
 

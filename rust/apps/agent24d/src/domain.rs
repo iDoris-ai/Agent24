@@ -497,6 +497,10 @@ pub struct MountReport {
     /// Whether the module's declared `requires_models` are actually there
     /// (ME-2's "缺资源明确报错").
     pub resources: ResourceStatus,
+    /// D9 list from the manifest, when this pass has read one (ADR-038 C7).
+    /// `None` for an in-process module that was refused or disabled before
+    /// construction: its manifest does not exist until it is built.
+    pub d9: Option<crate::component_manifest::OsD9>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -518,6 +522,90 @@ pub enum MountOutcome {
     /// provided (a compiled-in module declaring an out-of-process provider, a
     /// package on disk declaring an in-process crate).
     Refused(String),
+    /// Refused for a reason `/components` reports by name (`failed` plus the
+    /// reason's code), not just `refused`. Like [`Self::Refused`]: no routes.
+    RefusedFor(RefusalReason, String),
+}
+
+/// Why a package was refused at admission, for the reasons that have a code of
+/// their own in `/api/v1/components`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// `provides` names an id REGISTRY.md reserves (see
+    /// [`crate::component_manifest::capability_id_reserved`]).
+    ReservedCapabilityId,
+    /// A user-installed package named like a builtin component, and not the
+    /// bundled Documents package.
+    ReservedComponentName,
+    /// Another module, earlier in the catalogue, already declared the same id.
+    DuplicateCapabilityId,
+}
+
+impl RefusalReason {
+    /// The `reason` string `/components` shows.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ReservedCapabilityId => "reserved_capability_id",
+            Self::ReservedComponentName => "reserved_component_name",
+            Self::DuplicateCapabilityId => "duplicate_capability_id",
+        }
+    }
+}
+
+/// Whether a package may carry the name `name`. Every builtin component name is
+/// closed to user packages except `documents`: Documents is installed by the
+/// desktop from its own bundle, which may be a different build from this daemon,
+/// so nothing about the package (digest, version) is compared. What it may
+/// declare is limited instead: see [`crate::component_manifest::capability_id_reserved`].
+fn component_name_allowed(name: &str) -> bool {
+    name == "documents" || !crate::component_routes::BUILTIN_COMPONENT_IDS.contains(&name)
+}
+
+/// A module's `provides` against REGISTRY.md and the ids earlier modules took.
+fn capability_refusal(
+    d9: &crate::component_manifest::OsD9,
+    reports: &[MountReport],
+) -> Option<(RefusalReason, String)> {
+    if let Some(id) = d9.reserved_capability() {
+        return Some((
+            RefusalReason::ReservedCapabilityId,
+            format!(
+                "capability id {id:?} is reserved (REGISTRY.md provider, builtin component or \
+                 mcp-*); module {:?} may not declare it",
+                d9.name
+            ),
+        ));
+    }
+    // An id is held by an earlier module that was NOT refused, whatever else
+    // happened to it (mounted, disabled, degraded). A module refused later for
+    // another reason (a manifest that disagrees with its entry, say) holds
+    // nothing, so it cannot make a valid later package look like a duplicate.
+    d9.provides.iter().find_map(|p| {
+        reports
+            .iter()
+            .filter(|r| {
+                !matches!(
+                    r.outcome,
+                    MountOutcome::Refused(_) | MountOutcome::RefusedFor(..)
+                )
+            })
+            .find(|r| {
+                r.name != d9.name
+                    && r.d9
+                        .as_ref()
+                        .is_some_and(|other| other.provides.iter().any(|q| q.id == p.id))
+            })
+            .map(|owner| {
+                (
+                    RefusalReason::DuplicateCapabilityId,
+                    format!(
+                        "capability id {:?} is already declared by {:?}",
+                        p.id, owner.name
+                    ),
+                )
+            })
+    })
 }
 
 /// Whether a module's declared resources are present.
@@ -1072,6 +1160,8 @@ pub async fn mount_all(
     // erase path has an explicit list instead of prefix-matching storage keys.
     let mut partitions = crate::os_memory::OsMemoryCatalog::default();
     let mut claimed: BTreeSet<String> = BTreeSet::new();
+    // Capability ids are global (REGISTRY.md): the first module in catalogue
+    // order that is not refused keeps one, see [`capability_refusal`].
 
     // A name in the file that no build provides is a typo, and the two halves of
     // that mistake are NOT equally dangerous.
@@ -1154,22 +1244,39 @@ pub async fn mount_all(
         let version = entry.version.clone();
         let namespace = agent24_domain::DomainOsManifest::declared_namespace(&name);
         let enabled_at_start = registry.ok().map(|c| c.is_enabled(&name));
+        // A package's manifest was read at discovery, so its list is known even
+        // when the user switched it off. An in-process manifest appears only
+        // after construction.
+        let catalogue_d9 = match &entry.build {
+            Build::Package(package) => Some(crate::component_manifest::OsD9::from_manifest(
+                &package.manifest,
+            )),
+            Build::InProcess(_) => None,
+        };
 
-        let refuse = |why: String, reports: &mut Vec<MountReport>| {
-            tracing::error!("domain OS {name:?} not mounted: {why}");
+        let refuse_with = |outcome: MountOutcome,
+                           d9: Option<crate::component_manifest::OsD9>,
+                           reports: &mut Vec<MountReport>| {
+            tracing::error!("domain OS {name:?} not mounted: {outcome:?}");
             reports.push(MountReport {
                 name: name.clone(),
                 namespace: namespace.clone(),
                 version: version.clone(),
                 enabled_at_start,
-                outcome: MountOutcome::Refused(why),
+                outcome,
                 // Nothing was handed a `KernelCtx`, so it holds nothing. (For a
                 // pre-construction refusal no manifest was read either; for a
                 // post-construction one the grants were computable but never given.
                 // Both hold nothing, which is what this field means.)
                 granted: Vec::new(),
                 resources: ResourceStatus::NotChecked,
+                d9,
             });
+        };
+        let refuse = |why: String,
+                      d9: Option<crate::component_manifest::OsD9>,
+                      reports: &mut Vec<MountReport>| {
+            refuse_with(MountOutcome::Refused(why), d9, reports);
         };
 
         // IDENTITY. The catalogue names a module before any manifest exists, so the
@@ -1181,6 +1288,7 @@ pub async fn mount_all(
                 "the catalogue entry has an empty version; a manifest could not \
                  declare one, and this identity is reported as if it had"
                     .to_owned(),
+                catalogue_d9.clone(),
                 &mut reports,
             );
             continue;
@@ -1191,6 +1299,7 @@ pub async fn mount_all(
                     "the catalogue entry {name:?} is not a usable module name; it \
                      cannot be routed or given a directory"
                 ),
+                catalogue_d9.clone(),
                 &mut reports,
             );
             continue;
@@ -1204,11 +1313,29 @@ pub async fn mount_all(
         if !claimed.insert(name.clone()) {
             refuse(
                 format!("another module already claims the name {name:?}"),
+                catalogue_d9.clone(),
                 &mut reports,
             );
             continue;
         }
 
+        // A user-installed package may not carry a builtin component name:
+        // `/components` lists the builtins itself, and a package named `hyphae`
+        // would otherwise pass for the provider of Hyphae's capabilities. The
+        // bundled Documents package is the one exception (by digest).
+        if matches!(entry.build, Build::Package(_)) && !component_name_allowed(&name) {
+            refuse_with(
+                MountOutcome::RefusedFor(
+                    RefusalReason::ReservedComponentName,
+                    format!("the package name {name:?} is a builtin component id"),
+                ),
+                catalogue_d9
+                    .clone()
+                    .map(crate::component_manifest::OsD9::without_provides),
+                &mut reports,
+            );
+            continue;
+        }
         // ADMISSION, before policy. A name that could never be mounted is refused
         // whether or not the user switched it on, because "disabled" would
         // otherwise CONCEAL it: turning it back on would fail in a way the earlier
@@ -1220,15 +1347,35 @@ pub async fn mount_all(
                     "the name {name:?} is a kernel route segment; mounting it would \
                      panic the daemon on an overlapping route"
                 ),
+                catalogue_d9.clone(),
                 &mut reports,
             );
             continue;
         }
         if attached_names.contains(&name) {
-            refuse("registered as an attached module".to_owned(), &mut reports);
+            refuse(
+                "registered as an attached module".to_owned(),
+                catalogue_d9.clone(),
+                &mut reports,
+            );
             continue;
         }
-
+        // A user-installed manifest may not declare a reserved capability id
+        // (docs/capabilities/REGISTRY.md), nor one an earlier module declared.
+        // Admission, like the checks above: a disabled package is refused too,
+        // so "disabled" cannot hide it.
+        if let Some(d9) = &catalogue_d9
+            && let Some((reason, why)) = capability_refusal(d9, &reports)
+        {
+            refuse_with(
+                MountOutcome::RefusedFor(reason, why),
+                catalogue_d9
+                    .clone()
+                    .map(crate::component_manifest::OsD9::without_provides),
+                &mut reports,
+            );
+            continue;
+        }
         // POLICY: an unreadable registry, then the user's switch. Neither
         // CONSTRUCTS anything — which is what lets a user switch off a module whose
         // constructor is what breaks the daemon.
@@ -1250,6 +1397,7 @@ pub async fn mount_all(
                 outcome: MountOutcome::Degraded(reason),
                 granted: Vec::new(),
                 resources: ResourceStatus::NotChecked,
+                d9: catalogue_d9.clone(),
             });
             continue;
         }
@@ -1264,6 +1412,7 @@ pub async fn mount_all(
                 outcome: MountOutcome::Disabled,
                 granted: Vec::new(),
                 resources: ResourceStatus::NotChecked,
+                d9: catalogue_d9.clone(),
             });
             continue;
         }
@@ -1313,12 +1462,17 @@ pub async fn mount_all(
                     outcome: MountOutcome::Degraded(reason),
                     granted: Vec::new(),
                     resources: ResourceStatus::NotChecked,
+                    d9: None,
                 });
                 continue;
             }
         };
 
         let manifest = module.manifest();
+        // Construction succeeded, so the list is known even though the module is
+        // about to be refused. `catalogue_d9` is still `None` for an in-process
+        // entry: that value is only for refusals that happen before `build()`.
+        let manifest_d9 = Some(crate::component_manifest::OsD9::from_manifest(manifest));
         // The catalogue named it before it existed, so the two can disagree — and a
         // module whose manifest claims a DIFFERENT name would be routed under one
         // identity while emitting events under another.
@@ -1328,6 +1482,7 @@ pub async fn mount_all(
                     "the catalogue lists it as {name:?} but its manifest says {:?}",
                     manifest.name()
                 ),
+                manifest_d9.clone(),
                 &mut reports,
             );
             continue;
@@ -1342,6 +1497,7 @@ pub async fn mount_all(
                      manifest says {:?}",
                     manifest.version()
                 ),
+                manifest_d9.clone(),
                 &mut reports,
             );
             continue;
@@ -1353,11 +1509,22 @@ pub async fn mount_all(
                 "a compiled-in module's manifest declares an out-of-process \
                  provider; out-of-process modules are installed as packages"
                     .to_owned(),
+                manifest_d9.clone(),
                 &mut reports,
             );
             continue;
         }
 
+        if let Some(d9) = &manifest_d9
+            && let Some((reason, why)) = capability_refusal(d9, &reports)
+        {
+            refuse_with(
+                MountOutcome::RefusedFor(reason, why),
+                manifest_d9.map(crate::component_manifest::OsD9::without_provides),
+                &mut reports,
+            );
+            continue;
+        }
         let granted = Grants::granting(manifest.kernel_capabilities(), KERNEL_GRANTS);
         let granted_names: Vec<String> = granted.iter().map(|c| c.as_str().to_owned()).collect();
 
@@ -1390,6 +1557,7 @@ pub async fn mount_all(
                 // a LIVE module holds, and nothing else.
                 granted: Vec::new(),
                 resources: ResourceStatus::NotChecked,
+                d9: Some(crate::component_manifest::OsD9::from_manifest(manifest)),
             });
             continue;
         }
@@ -1467,6 +1635,7 @@ pub async fn mount_all(
             outcome: MountOutcome::Mounted,
             granted: granted_names,
             resources,
+            d9: Some(crate::component_manifest::OsD9::from_manifest(manifest)),
         });
     }
 
@@ -1732,6 +1901,8 @@ async fn mount_package(
     // Unchanged (Codex round 2 High 2): `Refused`/`Degraded` never had a
     // `KernelCtx` handed over, so `granted` stays `Vec::new()` for both — only
     // the `Mounted` branch, built separately below, carries `granted_names`.
+    let manifest = &package.manifest;
+    let d9 = Some(crate::component_manifest::OsD9::from_manifest(manifest));
     let report = |outcome: MountOutcome, resources: ResourceStatus| MountReport {
         name: name.clone(),
         namespace: namespace.clone(),
@@ -1740,8 +1911,8 @@ async fn mount_package(
         outcome,
         granted: Vec::new(),
         resources,
+        d9: d9.clone(),
     };
-    let manifest = &package.manifest;
     let refused = |why: String| {
         tracing::error!("domain OS {name:?} not mounted: {why}");
         report(MountOutcome::Refused(why), ResourceStatus::NotChecked)
@@ -1967,19 +2138,11 @@ async fn mount_package(
     let app = agent24_os_proto::proxy::mount(app, &namespace, current);
     // Only THIS branch — a module actually started — carries `granted_names`;
     // `report`'s own default (used by `refused`/`degraded` above) stays
-    // `Vec::new()` (Codex round 2 High 2).
-    (
-        app,
-        MountReport {
-            name,
-            namespace,
-            version,
-            enabled_at_start,
-            outcome: MountOutcome::Mounted,
-            granted: granted_names,
-            resources,
-        },
-    )
+    // `Vec::new()` (Codex round 2 High 2). The D9 list is the manifest's, on
+    // every outcome.
+    let mut mounted = report(MountOutcome::Mounted, resources);
+    mounted.granted = granted_names;
+    (app, mounted)
 }
 
 #[cfg(test)]
@@ -3305,6 +3468,366 @@ raise SystemExit(3)
         );
     }
 
+    /// Switching a package off does not drop its D9 list: the manifest was
+    /// already read, and `/components` still has to say what it would provide.
+    #[tokio::test]
+    async fn a_disabled_package_still_carries_its_manifest_capabilities() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "remote");
+        let yml = packages.join("remote").join("domain-os.yml");
+        let mut text = std::fs::read_to_string(&yml).unwrap();
+        text.push_str("provides:\n  - id: remote-ping\n");
+        std::fs::write(&yml, text).unwrap();
+        let hub = crate::events::EventsHub::default();
+        let cfg = config_from(r#"{"domainOs": {"remote": {"enabled": false}}}"#);
+        let (_, reports, _) = mount_all(
+            &discovered(&packages),
+            &tmp.path().join("os"),
+            &hub,
+            Ok(&cfg),
+            &no_models(),
+            None,
+            Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        assert_eq!(reports[0].outcome, MountOutcome::Disabled);
+        let d9 = reports[0]
+            .d9
+            .as_ref()
+            .expect("disabled package still has D9");
+        assert!(!d9.in_process);
+        assert_eq!(d9.provides.len(), 1);
+        assert_eq!(d9.provides[0].id, "remote-ping");
+        assert!(d9.provides[0].tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mounted_in_process_module_reports_its_declared_capabilities() {
+        let yaml = format!(
+            "{}\nprovides:\n  - id: demo-tasks\n",
+            manifest_yaml("demo", "in_process_crate")
+        );
+        let module = FakeModule::from_yaml(&yaml, false);
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let (_, reports) = mount(&[entry(module)], tmp.path(), &hub).await;
+        assert!(matches!(reports[0].outcome, MountOutcome::Mounted));
+        let d9 = reports[0]
+            .d9
+            .as_ref()
+            .expect("mounted in-process module carries D9");
+        assert!(d9.in_process);
+        assert_eq!(d9.provides.len(), 1);
+        assert_eq!(d9.provides[0].id, "demo-tasks");
+        assert!(d9.provides[0].tools.is_empty());
+        assert_eq!(d9.requires_kernel, vec!["events".to_owned()]);
+    }
+
+    /// `domain-os.yml` is user-installed, so its `provides` cannot take an id the
+    /// registry or a builtin owns. Refused (not degraded, not mounted), also when
+    /// the user switched the package off, and it lists no capability.
+    #[tokio::test]
+    async fn a_package_declaring_a_reserved_capability_id_is_refused() {
+        for (id, enabled) in [
+            ("model-gateway", true),
+            ("nostr-dm", true),
+            ("mcp-files", true),
+            ("knowledge", true),
+            ("documents", true),
+            ("model-gateway", false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let packages = tmp.path().join("packages");
+            write_package(&packages, "remote");
+            let yml = packages.join("remote").join("domain-os.yml");
+            let mut text = std::fs::read_to_string(&yml).unwrap();
+            text.push_str(&format!("provides:\n  - id: {id}\n"));
+            std::fs::write(&yml, text).unwrap();
+            let hub = crate::events::EventsHub::default();
+            let cfg = config_from(&format!(
+                r#"{{"domainOs": {{"remote": {{"enabled": {enabled}}}}}}}"#
+            ));
+            let (app, reports, _) = mount_all(
+                &discovered(&packages),
+                &tmp.path().join("os"),
+                &hub,
+                Ok(&cfg),
+                &no_models(),
+                None,
+                Err("no process host in this test"),
+                &test_approval_broker(&hub).await,
+                test_callback_deps().await,
+            )
+            .await;
+            match &reports[0].outcome {
+                MountOutcome::RefusedFor(RefusalReason::ReservedCapabilityId, _) => {}
+                other => panic!("{id} (enabled={enabled}): expected RefusedFor, got {other:?}"),
+            }
+            assert!(reports[0].d9.as_ref().unwrap().provides.is_empty(), "{id}");
+            assert_eq!(
+                get(&app, "/api/v1/remote/hi").await.status(),
+                StatusCode::NOT_FOUND,
+                "{id}: a refused package has no routes"
+            );
+        }
+    }
+
+    /// Positive control for the test above: an ordinary id still mounts, so the
+    /// refusal is about the id and not about `provides` in general.
+    #[tokio::test]
+    async fn a_package_declaring_an_ordinary_capability_id_is_not_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "remote");
+        let yml = packages.join("remote").join("domain-os.yml");
+        let mut text = std::fs::read_to_string(&yml).unwrap();
+        text.push_str("provides:\n  - id: remote-ping\n");
+        std::fs::write(&yml, text).unwrap();
+        let hub = crate::events::EventsHub::default();
+        let cfg = config_from(r#"{"domainOs": {"remote": {"enabled": false}}}"#);
+        let (_, reports, _) = mount_all(
+            &discovered(&packages),
+            &tmp.path().join("os"),
+            &hub,
+            Ok(&cfg),
+            &no_models(),
+            None,
+            Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        assert_eq!(reports[0].outcome, MountOutcome::Disabled);
+        assert_eq!(reports[0].d9.as_ref().unwrap().provides.len(), 1);
+    }
+
+    /// The same rule for a compiled-in module, found after construction. And the
+    /// registry's own provider is allowed its id: `documents` declares `documents`.
+    #[tokio::test]
+    async fn an_in_process_module_declaring_a_reserved_capability_id_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let bad = FakeModule::from_yaml(
+            &format!(
+                "{}\nprovides:\n  - id: model-gateway\n",
+                manifest_yaml("demo", "in_process_crate")
+            ),
+            false,
+        );
+        let (_, reports) = mount(&[entry(bad.clone())], tmp.path(), &hub).await;
+        match &reports[0].outcome {
+            MountOutcome::RefusedFor(RefusalReason::ReservedCapabilityId, _) => {}
+            other => panic!("expected RefusedFor, got {other:?}"),
+        }
+        assert!(reports[0].d9.as_ref().unwrap().provides.is_empty());
+        assert!(bad.opened().is_none(), "a refused module opens no store");
+
+        let own = FakeModule::from_yaml(
+            &format!(
+                "{}\nprovides:\n  - id: documents\n",
+                manifest_yaml("documents", "in_process_crate")
+            ),
+            false,
+        );
+        let tmp2 = tempfile::tempdir().unwrap();
+        let (_, reports) = mount(&[entry(own)], tmp2.path(), &hub).await;
+        assert!(
+            matches!(reports[0].outcome, MountOutcome::Mounted),
+            "{:?}",
+            reports[0].outcome
+        );
+    }
+
+    /// `mount_all` over `packages` with the knobs the tests above use.
+    async fn mount_packages(tmp: &Path, packages: &Path, cfg: &str) -> Vec<MountReport> {
+        let hub = crate::events::EventsHub::default();
+        let cfg = config_from(cfg);
+        let (_, reports, _) = mount_all(
+            &discovered(packages),
+            &tmp.join("os"),
+            &hub,
+            Ok(&cfg),
+            &no_models(),
+            None,
+            Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        reports
+    }
+
+    fn append_provides(packages: &Path, name: &str, ids: &[&str]) {
+        let yml = packages.join(name).join("domain-os.yml");
+        let mut text = std::fs::read_to_string(&yml).unwrap();
+        text.push_str("provides:\n");
+        for id in ids {
+            text.push_str(&format!("  - id: {id}\n"));
+        }
+        std::fs::write(&yml, text).unwrap();
+    }
+
+    fn outcome_of<'a>(reports: &'a [MountReport], name: &str) -> &'a MountOutcome {
+        &reports.iter().find(|r| r.name == name).unwrap().outcome
+    }
+
+    /// A user package cannot take a builtin component's name to pass for its
+    /// provider: `hyphae` declaring `nostr-dm` is refused for the NAME, with or
+    /// without the capability, and also when disabled.
+    #[tokio::test]
+    async fn a_package_named_like_a_builtin_component_is_refused() {
+        for (name, enabled) in [
+            ("hyphae", true),
+            ("idoris", true),
+            ("knowledge", true),
+            ("open-design", true),
+            ("hyphae", false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let packages = tmp.path().join("packages");
+            write_package(&packages, name);
+            append_provides(&packages, name, &["nostr-dm"]);
+            let cfg = format!(r#"{{"domainOs": {{"{name}": {{"enabled": {enabled}}}}}}}"#);
+            let reports = mount_packages(tmp.path(), &packages, &cfg).await;
+            assert!(
+                matches!(
+                    outcome_of(&reports, name),
+                    MountOutcome::RefusedFor(RefusalReason::ReservedComponentName, _)
+                ),
+                "{name} (enabled={enabled}): {:?}",
+                outcome_of(&reports, name)
+            );
+            assert!(reports[0].d9.as_ref().unwrap().provides.is_empty());
+        }
+    }
+
+    /// Documents is installed by the desktop and may come from another build, so
+    /// a `documents` package is admitted whatever its manifest bytes are (here
+    /// they differ from the bundled file). Positive control for the name test.
+    #[tokio::test]
+    async fn a_documents_package_with_a_different_digest_still_mounts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "documents");
+        append_provides(&packages, "documents", &["documents"]);
+        let bundled = include_bytes!("../../agent24-documents/domain-os.yml");
+        let installed = std::fs::read(packages.join("documents").join("domain-os.yml")).unwrap();
+        assert_ne!(
+            installed,
+            bundled.to_vec(),
+            "the fixture must differ from the bundled file"
+        );
+        let reports = mount_packages(tmp.path(), &packages, "{}").await;
+        assert_eq!(reports.len(), 1);
+        assert!(
+            !matches!(
+                reports[0].outcome,
+                MountOutcome::Refused(_) | MountOutcome::RefusedFor(..)
+            ),
+            "{:?}",
+            reports[0].outcome
+        );
+        assert_eq!(reports[0].d9.as_ref().unwrap().provides.len(), 1);
+    }
+
+    /// A `documents` package may declare only what the compiled-in Documents D9
+    /// catalog provides. Anything beyond it is a reserved capability id.
+    #[tokio::test]
+    async fn a_documents_package_declaring_another_capability_is_refused() {
+        for extra in [
+            "nostr-dm",
+            "model-gateway",
+            "mcp-files",
+            "not-in-the-catalog",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let packages = tmp.path().join("packages");
+            write_package(&packages, "documents");
+            append_provides(&packages, "documents", &["documents", extra]);
+            let reports = mount_packages(tmp.path(), &packages, "{}").await;
+            assert!(
+                matches!(
+                    reports[0].outcome,
+                    MountOutcome::RefusedFor(RefusalReason::ReservedCapabilityId, _)
+                ),
+                "{extra}: {:?}",
+                reports[0].outcome
+            );
+            assert!(reports[0].d9.as_ref().unwrap().provides.is_empty());
+        }
+    }
+
+    /// Capability ids are global: the second package declaring one is refused.
+    /// The first keeps it (catalogue order), a refused one claims nothing, and
+    /// an unrelated id is unaffected.
+    #[tokio::test]
+    async fn a_second_package_declaring_the_same_capability_id_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packages = tmp.path().join("packages");
+        for name in ["alpha", "beta", "gamma", "delta"] {
+            write_package(&packages, name);
+        }
+        append_provides(&packages, "alpha", &["shared-tasks"]);
+        append_provides(&packages, "beta", &["shared-tasks"]);
+        append_provides(&packages, "gamma", &["shared-tasks", "gamma-own"]);
+        append_provides(&packages, "delta", &["gamma-own"]);
+        let reports = mount_packages(tmp.path(), &packages, "{}").await;
+        let refused = |name: &str| {
+            matches!(
+                outcome_of(&reports, name),
+                MountOutcome::RefusedFor(RefusalReason::DuplicateCapabilityId, _)
+            )
+        };
+        assert!(!refused("alpha"), "{:?}", outcome_of(&reports, "alpha"));
+        assert!(refused("beta"));
+        assert!(refused("gamma"));
+        // gamma was refused, so it never claimed `gamma-own`.
+        assert!(!refused("delta"), "{:?}", outcome_of(&reports, "delta"));
+    }
+
+    /// F1 (#1578): a module refused for another reason holds no capability id.
+    /// `alpha` declares `shared-cap` and is then refused (a package whose
+    /// manifest says in-process); `beta` declaring the same id must mount.
+    #[tokio::test]
+    async fn a_module_refused_for_another_reason_does_not_hold_its_capability_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let alpha_yaml = format!(
+            "{}\nprovides:\n  - id: shared-cap\n",
+            manifest_yaml("alpha", "in_process_crate")
+        );
+        let alpha = Installed {
+            name: "alpha".to_owned(),
+            version: "0.1.0".to_owned(),
+            build: Build::Package(Box::new(Package {
+                manifest: DomainOsManifest::from_yaml(&alpha_yaml).unwrap(),
+                dir: tmp.path().join("alpha"),
+                digest: "sha256:00".to_owned(),
+            })),
+        };
+        let beta = FakeModule::from_yaml(
+            &format!(
+                "{}\nprovides:\n  - id: shared-cap\n",
+                manifest_yaml("beta", "in_process_crate")
+            ),
+            false,
+        );
+        let (_, reports) = mount(&[alpha, entry(beta)], tmp.path(), &hub).await;
+        assert!(
+            matches!(outcome_of(&reports, "alpha"), MountOutcome::Refused(_)),
+            "{:?}",
+            outcome_of(&reports, "alpha")
+        );
+        assert!(
+            matches!(outcome_of(&reports, "beta"), MountOutcome::Mounted),
+            "{:?}",
+            outcome_of(&reports, "beta")
+        );
+    }
+
     /// A daemon that cannot start processes still mounts everything else; each
     /// package degrades to the kernel's 503, with the reason in its report.
     #[tokio::test]
@@ -3329,6 +3852,12 @@ raise SystemExit(3)
             MountOutcome::Degraded(why) => assert!(why.contains("not ours"), "{why}"),
             other => panic!("expected Degraded, got {other:?}"),
         }
+        let d9 = reports[0]
+            .d9
+            .as_ref()
+            .expect("a package report carries its manifest list");
+        assert!(!d9.in_process);
+        assert!(d9.provides.is_empty());
         assert_eq!(
             get(&app, "/api/v1/remote/hi").await.status(),
             StatusCode::SERVICE_UNAVAILABLE
@@ -3350,6 +3879,17 @@ raise SystemExit(3)
         let (app, reports) = mount(&[entry(m.clone())], tmp.path(), &hub).await;
 
         assert!(matches!(reports[0].outcome, MountOutcome::Refused(_)));
+        let d9 = reports[0]
+            .d9
+            .as_ref()
+            .expect("refusal after construction still carries the manifest list");
+        assert_eq!(d9.name, "remote");
+        assert!(
+            !d9.in_process,
+            "the manifest declared an out-of-process provider"
+        );
+        assert!(d9.provides.is_empty());
+        assert_eq!(d9.requires_kernel, vec!["events".to_owned()]);
         assert!(m.opened().is_none());
         assert_eq!(m.routes_built(), 0);
         assert!(
