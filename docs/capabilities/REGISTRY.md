@@ -11,7 +11,7 @@ ADR-038 D9 与 ADR-039 的能力 id 登记表。能力 id 的字符集是 `[a-z0
 | `nostr-group` | Nostr 群组 | Nostr group | กลุ่ม Nostr | hyphae | 常驻 CLI（resident） | `rust/crates/agent24-comm/hyphae.lock.json` | 已接入 | 2026-11-03 |
 | `nostr-identity` | Nostr 身份 | Nostr identity | ตัวตน Nostr | hyphae | 常驻 CLI（resident） | `rust/crates/agent24-comm/hyphae.lock.json` | 已接入 | 2026-11-03 |
 | `nostr-relay` | Nostr 中继 | Nostr relay | รีเลย์ Nostr | hyphae | 常驻 CLI（resident） | `rust/crates/agent24-comm/hyphae.lock.json` | 已接入 | 2026-11-03 |
-| `documents` | 文档 | Documents | เอกสาร | documents | 常驻进程外（resident） | `rust/apps/agent24-documents/domain-os.yml`（免锁，ADR-038 D2；能力 id 见 ADR-040） | 已登记。本切片不改 Documents 的清单输出 | 2026-11-03 |
+| `documents` | 文档 | Documents | เอกสาร | documents | 常驻进程外（resident） | `rust/apps/agent24-documents/component.json`（免锁，ADR-038 D2；D9 清单，编译进 agent24d；握手 manifest 另见 `domain-os.yml`） | 已登记。本切片不改 Documents 的清单输出 | 2026-11-03 |
 
 Hyphae 的锁只带 id，没有三语名。上表的中文、英文、泰文是登记表补上的显示名，不回写锁（ADR-038 §7.4：锁按发布字节复制）。
 

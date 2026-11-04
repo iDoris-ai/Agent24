@@ -18,7 +18,7 @@
 2. [架构分层总览](../ARCHITECTURE-LAYERS.md)：L0 到 L7 各层是什么、依赖关系、未完成清单。
 3. [可进化性评估（终稿）](EVOLVABILITY-ASSESSMENT-2026-11-01.md)：现在的结构能不能支撑持续进化、组件换了影响谁、自进化和训练的缺口。
 4. [Super Agent 演进（终稿）](../research/deepseek-superagent/SUPERAGENT-EVOLUTION-2026-11-01.md)：向持续工作的 Super Agent 演进要补哪些机制，对应 ADR-040 至 ADR-043。
-5. [ADR-038 组件契约 v1](../adr/ADR-038-component-contract-v1.md)：组件怎么声明、授权、签名。草案 r3。
+5. [ADR-038 组件契约 v1](../adr/ADR-038-component-contract-v1.md)：组件怎么声明、授权、签名。已接受（r5）。
 
 ## 按层和子系统
 
@@ -55,7 +55,7 @@
 
 | 主题 | 架构说明 | ADR | 设计与规格 |
 |---|---|---|---|
-| 通信（Hyphae、Nostr） | [分层总览](../ARCHITECTURE-LAYERS.md) | 暂无独立 ADR | [COMM-HYPHAE](../design/COMM-HYPHAE.md)、[HYPHAE-CLI-INTEGRATION](../design/HYPHAE-CLI-INTEGRATION.md)、[F4 Nostr 通道](../specs/F4-nostr-channel.md)；[COMM-FRIENDS 好友机制](../design/COMM-FRIENDS.md)（设计稿，已拍板 2026-11-02，排在 ADR-038 C1–C3 之后） |
+| 通信（Hyphae、Nostr） | [分层总览](../ARCHITECTURE-LAYERS.md) | [ADR-044 通信](../adr/ADR-044-communication.md)（提议） | [COMM-HYPHAE](../design/COMM-HYPHAE.md)、[HYPHAE-CLI-INTEGRATION](../design/HYPHAE-CLI-INTEGRATION.md)、[F4 Nostr 通道](../specs/F4-nostr-channel.md)；[COMM-FRIENDS 好友机制](../design/COMM-FRIENDS.md)（设计稿，已拍板 2026-11-02，排在 ADR-038 C1–C3 之后） |
 | 桌面、TUI、移动 | [分层总览 L7](../ARCHITECTURE-LAYERS.md) | 日志 ADR-027（部分被 ADR-037 取代）、ADR-037 | [Windows 移植](../design/WINDOWS-PORT.md)；[多平台发布计划](../Deployment/RESEARCH.md) |
 
 ### 模型与硬件
