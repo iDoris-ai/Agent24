@@ -28,7 +28,7 @@
 ### D1 适用范围：只约束新增路由
 
 - 「新增」指本 ADR 合入之后新加的 `(方法, 路径)`。已有的全部冻结：路径、参数名、单复数一律不改，除非另立 ADR 并承担 wire 不兼容的后果。
-- 冻结不等于合规。凡是不符合 D2 的旧路由，都列在 §4 的例外表里；例外表只能删，不能加（D8）。
+- 冻结不等于合规。凡是不符合 D2 的旧路由，都列在 §4 的例外表里；例外表只能删，不能加（D9）。
 - 适用面是所有对客户端可见的 HTTP 路由：OpenAPI 里的，以及 `UNDOCUMENTED_KERNEL_ROUTES`（`server.rs:4120`）里的、`MODULE_SURFACE_PATHS`（`server.rs:4135`）里的。
 
 ### D2 命名规则（新路由）
@@ -38,11 +38,11 @@
 | N1 | 路径段小写字母、数字、连字符：`^[a-z][a-z0-9]*(-[a-z0-9]+)*$`。不用下划线，不用大写 | `/standing-grants`，不要 `/standing_grants` |
 | N2 | 相邻两段不得同名，集合名不得与所在命名空间同名（叠词） | 不要 `/documents/documents` |
 | N3 | 路径参数名只能是 `{id}`，或 `{<单数名词>_id}`、`{<单数名词>_name}`、`{<单数名词>_no}`（snake_case）。`_name` 用于以名字为键的资源，`_no` 用于序号（版本号、页码） | `/runs/{id}`、`/documents/{document_id}/revisions/{revision_no}` |
-| N4 | 一条路径只有一个参数时可以写 `{id}`；有两个以上参数时，每个都必须带名词前缀，不得出现裸 `{id}` | `/groupchat/{group_id}/messages/{message_id}` |
+| N4 | 一条路径只有一个参数时可以写 `{id}`；有两个以上参数时，每个都必须带名词前缀，不得出现裸 `{id}` | `/groupchat/{group_id}/messages/{logical_id}` |
 | N5 | 集合用复数名词；整个守护进程或整个用户只有一个实例的资源（单例）用单数名词，并且不带 `{id}` | `/schedules`、`/usage`、`/health` |
 | N6 | 集合名、资源名是名词，不是动词。创建和删除用 `POST`、`DELETE` 加集合，不写 `/create`、`/delete` | 不要 `/runs/start` |
 | N7 | 对已有资源的非 CRUD 动作写成 `POST /<集合>/{id}/<动作>`，动作是单个小写动词（多词用连字符），放在路径末尾，不再往下嵌套 | `POST /runs/{id}/cancel` |
-| N8 | 长耗时、要查进度或可取消的动作，不要做顶级动词，改成「操作资源」：`POST /<域>/operations` 返回 `{id}`，之后 `GET`、`POST .../{id}/cancel` | 先例：`/idoris/operations/{id}`、`/documents/jobs/{job_id}` |
+| N8 | 长耗时、要查进度或可取消的动作，不要做顶级动词，改成「操作资源」：`POST /<域>/operations` 返回 `{id}`，之后 `GET`、`POST .../{id}/cancel` | 先例：`/idoris/operations/{id}`(`/documents/jobs/{job_id}` 也是这个写法,但属于历史写法,不当作先例) |
 | N9 | 新增「模块类」资源（原来会放进 `/os`、`/attached`、`/module-*` 的东西）一律放在 `/components/{id}/...` 下；**不再新增顶级前缀**，也不再往这 5 个旧前缀里加子路由 | `/components/{id}/report` |
 | N10 | 顶级前缀只能是 §4.3 列出的 30 个。要新增顶级前缀，先改本 ADR | — |
 | N11 | 每条新路由同时要有：OpenAPI 条目、`route_policy.rs` 的行和 `Operation`（`rust/apps/agent24d/src/capabilities/route_policy.rs:62`）、一个 tag。这三项已有各自的门禁，本 ADR 不重复 | — |
@@ -93,7 +93,18 @@ N5 的「单数还是复数」无法由机器判断，归评审；其余规则�
 - 进程外模块挂在 `/api/v1/<namespace>/`，命名空间用模块名，规则同 N1。
 - 模块自己的集合名按 N2 不得与命名空间同名；`documents` 模块的 `/documents/documents` 是已有的例外，冻结。
 
-### D8 例外表只减不增
+### D8 动态挂载的模块命名空间 `/api/v1/<ns>/**`
+
+这一类不在 OpenAPI 的 path 列表里，也不是内置路由的字面量，单独说明：
+
+- 来源：进程外或包形式的模块，在内核启动时按各自的 manifest 注册一条覆盖整个命名空间的任意方法代理（`rust/apps/agent24d/src/server.rs:3172` 起的 Package modules 代理；命名空间必须恰好等于由模块名派生的值，`agent24-domain/src/lib.rs:877-879`）。
+- **N10 不适用**：顶级前缀白名单只管内置路由。模块命名空间不用改本 ADR，由组件 manifest 的命名空间登记，并受上面「命名空间必须由模块名派生」的检查约束。命名空间本身按 N1 取名（小写连字符）。
+- **N1 至 N4 对子路径建议适用，属于建议级**：模块作者在自己的 `<ns>/**` 下应遵守，但门禁**只查内置路由**（§5），不扫模块源码里的路由；`documents` 的 `_a24` 路由是 D6 的单独扫描，不算在内。
+- **N9 的边界**：N9 管的是内核自己新增的路由，不让它再长出新的顶级「模块类」前缀。动态挂载的模块命名空间本来就是每个模块一个顶级前缀，不违反 N9；但内核不得借「命名空间」之名新增内置的 `/<ns>/...` 路由。
+- **D7 的边界**：D7（集合名不与命名空间同名）同样是建议级，只对新写的模块有意义，门禁不查。
+- 已有的 `/documents/*`、`/sin90/*` 是这一类的实例：documents 的叠词记在 §4.2，sin90 按 D5。
+
+### D9 例外表只减不增
 
 - §4 的例外表是冻结范围的完整清单。路由被删除或改名时，从表里删掉对应行。
 - 往表里加行，等于承认新的违规，必须另立 ADR。门禁据此运行（§5 C7）。
@@ -145,6 +156,7 @@ N5 的「单数还是复数」无法由机器判断，归评审；其余规则�
 
 - 单复数混用（N5）：`/comm/identity`、`/comm/contact`、`/comm/relay`、`/comm/groupchat`、`/os`、`/attached` 用单数。
 - 顶级动词（D3）：`/idoris/*`、`/comm/*` 里的 install、connect、start、stop、unlock、send 等。
+- 顶级动词的归属：`/comm/outbox/clear`、`/comm/inbox/pull`、`/comm/daemon/start`、`/comm/daemon/stop`（`agent24-comm/src/router.rs:179-186`）与 `/idoris/*` 的动词一样，归 D3 冻结，不进 §4.1 至 §4.4 的机器检查。
 - 两套审批面 `/approvals` 与 `/module-approvals` 并存，是有意的（`server.rs` 在注册处有注释）。
 - `/comm/identity/default` 的 operationId 是 `useCommIdentity`，路径与动作不符。
 
@@ -174,7 +186,7 @@ N5 的「单数还是复数」无法由机器判断，归评审；其余规则�
 - 把 `/schedules/{id}/run_now` 从例外表里临时删掉，断言门禁失败，证明例外表不是摆设。
 - 往例外表里放一条不存在的路径，断言 C7 失败。
 
-C1 至 C7 之外，N5、N6、N7、N8、D3 由评审把关，PR 模板可以加一句提醒，不进门禁。
+C1 至 C7 之外，N5、N6、N7、N8、D3、D7、D8 的子路径部分由评审把关，PR 模板可以加一句提醒，不进门禁。
 
 ## 6. 后果
 
