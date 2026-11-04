@@ -471,6 +471,11 @@ fn documents_mapped(
         (MountOutcome::Refused(why), _) => {
             (ComponentState::Failed, Some("refused"), Some(why.clone()))
         }
+        (MountOutcome::RefusedFor(reason, why), _) => (
+            ComponentState::Failed,
+            Some(reason.code()),
+            Some(why.clone()),
+        ),
     }
 }
 
@@ -557,10 +562,20 @@ fn documents_from(
     item
 }
 
+/// The capability ids in the compiled-in Documents D9 catalog (`component.json`).
+/// Empty when the catalog is unusable, which makes every declared id reserved.
+pub(crate) fn documents_provide_ids() -> Vec<String> {
+    documents_catalog::DocumentsCatalog::embedded()
+        .map(|catalog| catalog.into_provides().into_iter().map(|p| p.id).collect())
+        .unwrap_or_default()
+}
+
 /// The Documents package. State comes from the mount report and its supervisor.
 /// Not mounted at all is `absent`. Provides and version come from the D9 catalog.
 fn documents_item(state: &AppState) -> Item {
-    let report = state.os_reports.iter().find(|r| r.name == "documents");
+    // A package that only borrowed the name (refused as `reserved_component_name`)
+    // is not Documents; it is listed on its own row by `os_module_items`.
+    let report = documents_report(state);
     let live = report.and_then(|_| {
         state
             .module_status
@@ -593,14 +608,51 @@ fn os_mapped(
         (MountOutcome::Refused(why), _) => {
             (ComponentState::Failed, Some("refused"), Some(why.clone()))
         }
+        (MountOutcome::RefusedFor(reason, why), _) => (
+            ComponentState::Failed,
+            Some(reason.code()),
+            Some(why.clone()),
+        ),
     }
 }
 
+/// Refused because a user package took a builtin component's name.
+fn squats_builtin_name(outcome: &MountOutcome) -> bool {
+    matches!(
+        outcome,
+        MountOutcome::RefusedFor(crate::domain::RefusalReason::ReservedComponentName, _)
+    )
+}
+
+fn is_refused(outcome: &MountOutcome) -> bool {
+    matches!(
+        outcome,
+        MountOutcome::Refused(_) | MountOutcome::RefusedFor(..)
+    )
+}
+
+/// The report [`documents_item`] describes: the first one named `documents`
+/// that is not a name squatter.
+fn documents_report(state: &AppState) -> Option<&MountReport> {
+    state
+        .os_reports
+        .iter()
+        .find(|r| r.name == "documents" && !squats_builtin_name(&r.outcome))
+}
+
 fn os_module_items(state: &AppState) -> Vec<Item> {
+    let documents = documents_report(state).map(std::ptr::from_ref);
     let mut reports: Vec<_> = state
         .os_reports
         .iter()
-        .filter(|r| !BUILTIN_COMPONENT_IDS.contains(&r.name.as_str()))
+        // A refused package keeps its row even when it carries a builtin name
+        // (a squatter, or a second directory with the same name), so a refusal
+        // is never invisible; `dedupe_component_ids` makes its id unique. The
+        // builtin's own report is not listed twice.
+        .filter(|r| {
+            !BUILTIN_COMPONENT_IDS.contains(&r.name.as_str())
+                || (is_refused(&r.outcome) && documents != Some(std::ptr::from_ref(*r)))
+        })
         .collect();
     reports.sort_by(|a, b| a.name.cmp(&b.name));
     reports
@@ -648,6 +700,9 @@ fn os_module_items(state: &AppState) -> Vec<Item> {
                 }
                 if let Some(message) = message {
                     detail["message"] = json!(message);
+                }
+                if BUILTIN_COMPONENT_IDS.contains(&report.name.as_str()) {
+                    detail["package"] = json!(report.name);
                 }
                 i.detail = Some(detail);
             })

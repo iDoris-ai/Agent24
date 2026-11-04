@@ -143,7 +143,9 @@ fn view(
         (MountOutcome::Mounted, None) => ("mounted", None),
         (MountOutcome::Disabled, _) => ("disabled", None),
         (MountOutcome::Degraded(why), _) => ("degraded", Some(why.clone())),
-        (MountOutcome::Refused(why), _) => ("refused", Some(why.clone())),
+        (MountOutcome::Refused(why) | MountOutcome::RefusedFor(_, why), _) => {
+            ("refused", Some(why.clone()))
+        }
     };
     let (resources, missing_models) = match &report.resources {
         ResourceStatus::NotChecked => ("not_checked", Vec::new()),
@@ -170,7 +172,13 @@ fn view(
         report.enabled_at_start
     };
     let restart_required = match running_enabled {
-        _ if matches!(report.outcome, MountOutcome::Refused(_)) => false,
+        _ if matches!(
+            report.outcome,
+            MountOutcome::Refused(_) | MountOutcome::RefusedFor(..)
+        ) =>
+        {
+            false
+        }
         // A disable left it with no supervisor that can bring it back: a
         // later enable changes the config, not that — nor does fixing the
         // registry (review of SUP-5, rounds 5 and 6).
@@ -926,7 +934,9 @@ async fn patch_os_at(
             state.os_reports.iter().filter(|r| r.name == name).collect();
         if let [only] = same_name.as_slice() {
             match &only.outcome {
-                MountOutcome::Refused(why) => return admission_refused_response(why),
+                MountOutcome::Refused(why) | MountOutcome::RefusedFor(_, why) => {
+                    return admission_refused_response(why);
+                }
                 MountOutcome::Disabled => {
                     if let Some(dir) = state.package_dirs.get(&name)
                         && let Some(blocked) = rescan_disabled_package(&state, &name, dir).await

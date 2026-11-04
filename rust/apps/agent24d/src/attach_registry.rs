@@ -769,7 +769,12 @@ impl AttachRegistry {
     /// registered (ADR-038 §3 case 2). An unknown name is ignored, so this
     /// cannot tell a caller whether a name exists. A live `Running`
     /// generation is left alone. A registry closed for shutdown is left alone.
-    pub fn note_contract_mismatch(&self, name: &str, expected: &str, actual: &str) {
+    ///
+    /// `token_id` is the one the refusing check looked up. Under the lock it
+    /// must still be the entry's token_id, as in [`Self::commit`]: a rotation
+    /// between the check and this call replaced the registration, and a
+    /// refusal that belongs to the old one is dropped (#1572 L1).
+    pub fn note_contract_mismatch(&self, name: &str, token_id: &str, expected: &str, actual: &str) {
         let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if state.deps.is_none() {
             return;
@@ -777,6 +782,9 @@ impl AttachRegistry {
         let Some(entry) = state.entries.get_mut(name) else {
             return;
         };
+        if entry.token_id != token_id {
+            return;
+        }
         if entry
             .last_generation
             .as_ref()
@@ -1007,6 +1015,26 @@ mod tests {
                 },
             },
         }
+    }
+
+    /// #1572 L1. The check judged against the old token and refused with
+    /// VersionMismatch; a rotation lands; only then the listener notes it. The
+    /// refusal belongs to the old registration and must not mark the new one.
+    #[tokio::test]
+    async fn a_mismatch_from_a_rotated_away_token_is_dropped() {
+        let registry = AttachRegistry::new(deps().await);
+        let (_, old_token) = register(&registry, "agentear", &["events"]);
+        let looked_up = registry.expectation("agentear").unwrap().token_id;
+        assert_eq!(looked_up, old_token);
+        let (_, new_token) = register(&registry, "agentear", &["events"]);
+        assert_ne!(old_token, new_token);
+
+        registry.note_contract_mismatch("agentear", &looked_up, "[1, 1]", "[0, 0]");
+        assert_eq!(registry.snapshot()[0].mismatch, None);
+
+        // Positive control: the current token still records.
+        registry.note_contract_mismatch("agentear", &new_token, "[1, 1]", "[0, 0]");
+        assert!(registry.snapshot()[0].mismatch.is_some());
     }
 
     #[tokio::test]

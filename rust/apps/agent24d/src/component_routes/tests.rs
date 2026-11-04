@@ -806,6 +806,245 @@ async fn a_package_named_mcp_files_does_not_share_its_id_with_the_mcp_server() {
     );
 }
 
+/// Component ids are unique across every source at once: the five builtins, an
+/// attached module, domain packages and MCP servers. Each collision below is a
+/// different pair: attach/os (`agentear`), os/mcp (`mcp-files`), an os row that
+/// sits on the fallback id the MCP row would take, and a package named like a
+/// builtin (which is not listed at all).
+#[tokio::test]
+async fn component_ids_are_unique_across_builtin_attach_os_and_mcp() {
+    let mut state = ear().await.state;
+    let taken = crate::mcp::fallback_component_id("mcp-files");
+    state.os_reports = Arc::new(vec![
+        os_report(
+            "agentear",
+            MountOutcome::Mounted,
+            d9("agentear", false, "pkg-ear", &[]),
+        ),
+        os_report(
+            "mcp-files",
+            MountOutcome::Mounted,
+            d9("mcp-files", false, "pkg-files", &[]),
+        ),
+        os_report(
+            &taken,
+            MountOutcome::Mounted,
+            d9(&taken, false, "pkg-taken", &[]),
+        ),
+        os_report(
+            "idoris",
+            MountOutcome::Mounted,
+            d9("idoris", false, "pkg-idoris", &[]),
+        ),
+        os_report(
+            "knowledge",
+            MountOutcome::Mounted,
+            d9("knowledge", false, "pkg-know", &[]),
+        ),
+    ]);
+    state.mcp_roster = Arc::new(crate::mcp::McpRoster::from_records(vec![
+        crate::mcp::McpRecord {
+            server: "files".to_owned(),
+            id: "mcp-files".to_owned(),
+            state: ComponentState::Ready,
+            reason: None,
+            capability_id: Some("mcp-files".to_owned()),
+            tools: Vec::new(),
+            protocol_version: None,
+        },
+    ]));
+    let app = build_router(state);
+    let (status, body) = call(&app, Method::GET, GET, Some("testtoken"), "").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<String> = body["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap().to_owned())
+        .collect();
+    let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+    assert_eq!(ids.len(), unique.len(), "duplicate component ids: {ids:?}");
+    // The sources are all present, so the uniqueness above is not vacuous.
+    for id in [
+        "idoris",
+        "hyphae",
+        "documents",
+        "knowledge",
+        "open-design",
+        "agentear",
+        "mcp-files",
+        taken.as_str(),
+    ] {
+        assert!(ids.iter().any(|i| i == id), "{id} missing from {ids:?}");
+    }
+    // 5 builtins + attach + 3 os rows (the two builtin-named packages are
+    // dropped) + 1 mcp row = 10. Nothing was swallowed by the dedupe.
+    assert_eq!(ids.len(), 10, "{ids:?}");
+    assert_eq!(find(&body, "agentear")["form"], "attach");
+}
+
+/// A refused package is `failed` with the reason of its refusal and lists no
+/// provider; a plain refusal keeps `refused`.
+#[tokio::test]
+async fn a_refused_package_is_failed_with_its_own_reason() {
+    use crate::domain::RefusalReason::{DuplicateCapabilityId, ReservedCapabilityId};
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let bad = d9("squatter", false, "model-gateway", &[]);
+    state.os_reports = Arc::new(vec![
+        os_report(
+            "squatter",
+            MountOutcome::RefusedFor(ReservedCapabilityId, "x".into()),
+            bad.without_provides(),
+        ),
+        os_report(
+            "second",
+            MountOutcome::RefusedFor(DuplicateCapabilityId, "y".into()),
+            d9("second", false, "taken", &[]).without_provides(),
+        ),
+        os_report(
+            "other",
+            MountOutcome::Refused("duplicate".into()),
+            d9("other", false, "other-tasks", &[]),
+        ),
+    ]);
+    let app = build_router(state);
+    let (_, body) = call(&app, Method::GET, GET, Some(&host), "").await;
+    let squatter = find(&body, "squatter");
+    assert_eq!(squatter["state"], "failed");
+    assert_eq!(squatter["reason"], "reserved_capability_id");
+    assert_eq!(squatter["provides"], json!([]));
+    assert_eq!(find(&body, "second")["reason"], "duplicate_capability_id");
+    assert_eq!(find(&body, "other")["reason"], "refused");
+}
+
+/// A package named like a builtin is refused, but it stays on `/components`
+/// under a fallback id, so it is not invisible, and it does not take over the
+/// builtin's own row.
+#[tokio::test]
+async fn a_package_squatting_a_builtin_name_is_listed_under_a_fallback_id() {
+    use crate::domain::RefusalReason::ReservedComponentName;
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let reports: Vec<_> = ["hyphae", "documents"]
+        .into_iter()
+        .map(|name| {
+            os_report(
+                name,
+                MountOutcome::RefusedFor(ReservedComponentName, "builtin name".into()),
+                d9(name, false, "nostr-dm", &[]).without_provides(),
+            )
+        })
+        .collect();
+    state.os_reports = Arc::new(reports);
+    let app = build_router(state);
+    let (_, body) = call(&app, Method::GET, GET, Some(&host), "").await;
+    let rows = body["components"].as_array().unwrap();
+    let ids: Vec<_> = rows.iter().map(|c| c["id"].as_str().unwrap()).collect();
+    let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+    assert_eq!(ids.len(), unique.len(), "{ids:?}");
+    let squatters: Vec<_> = rows
+        .iter()
+        .filter(|c| c["reason"] == "reserved_component_name")
+        .collect();
+    assert_eq!(squatters.len(), 2, "{ids:?}");
+    for row in &squatters {
+        assert_eq!(row["state"], "failed");
+        assert_eq!(row["provides"], json!([]));
+        assert_ne!(row["id"], row["detail"]["package"], "{row}");
+        assert!(row["id"].as_str().unwrap().starts_with("mcp-bad-"), "{row}");
+    }
+    // The builtins keep their own rows and are not described by the squatters.
+    assert_ne!(find(&body, "hyphae")["reason"], "reserved_component_name");
+    assert_ne!(
+        find(&body, "documents")["reason"],
+        "reserved_component_name"
+    );
+}
+
+/// F2 (#1578): two directories named `hyphae`. The first is refused for its
+/// name, the second runs into the duplicate-name check and gets a plain
+/// `Refused`. Both stay on `/components` under unique ids. A second package
+/// named `documents` (plain `Refused`) is listed too, without displacing the
+/// real Documents row.
+#[tokio::test]
+async fn every_refused_package_has_a_row_even_with_a_builtin_name() {
+    use crate::domain::RefusalReason::ReservedComponentName;
+    let (mut state, host, _) = server_tests::capability_state().await;
+    state.os_reports = Arc::new(vec![
+        os_report(
+            "hyphae",
+            MountOutcome::RefusedFor(ReservedComponentName, "builtin name".into()),
+            d9("hyphae", false, "nostr-dm", &[]).without_provides(),
+        ),
+        os_report(
+            "hyphae",
+            MountOutcome::Refused("another module already claims the name \"hyphae\"".into()),
+            d9("hyphae", false, "nostr-dm", &[]),
+        ),
+        os_report(
+            "documents",
+            MountOutcome::Mounted,
+            d9("documents", false, "documents", &[]),
+        ),
+        os_report(
+            "documents",
+            MountOutcome::Refused("another module already claims the name \"documents\"".into()),
+            d9("documents", false, "documents", &[]),
+        ),
+    ]);
+    let app = build_router(state);
+    let (_, body) = call(&app, Method::GET, GET, Some(&host), "").await;
+    let rows = body["components"].as_array().unwrap();
+    let ids: Vec<_> = rows.iter().map(|c| c["id"].as_str().unwrap()).collect();
+    let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+    assert_eq!(ids.len(), unique.len(), "{ids:?}");
+    let package_rows = |name: &str| -> Vec<&Value> {
+        rows.iter()
+            .filter(|c| c["detail"]["package"] == name)
+            .collect()
+    };
+    let hyphae = package_rows("hyphae");
+    assert_eq!(hyphae.len(), 2, "{ids:?}");
+    let mut reasons: Vec<_> = hyphae
+        .iter()
+        .map(|r| r["reason"].as_str().unwrap())
+        .collect();
+    reasons.sort_unstable();
+    assert_eq!(reasons, ["refused", "reserved_component_name"]);
+    for row in &hyphae {
+        assert_eq!(row["state"], "failed");
+        assert_ne!(row["id"], "hyphae");
+    }
+    let documents = package_rows("documents");
+    assert_eq!(documents.len(), 1, "{ids:?}");
+    assert_eq!(documents[0]["reason"], "refused");
+    // The real Documents row is still the mounted one.
+    assert_eq!(find(&body, "documents")["form"], "resident");
+    assert_ne!(find(&body, "documents")["state"], "failed");
+}
+
+/// The Documents package refused for its own reasons is the Documents row, not
+/// a second extra row beside it.
+#[tokio::test]
+async fn a_refused_documents_package_is_not_listed_twice() {
+    use crate::domain::RefusalReason::ReservedCapabilityId;
+    let (mut state, host, _) = server_tests::capability_state().await;
+    state.os_reports = Arc::new(vec![os_report(
+        "documents",
+        MountOutcome::RefusedFor(ReservedCapabilityId, "x".into()),
+        d9("documents", false, "nostr-dm", &[]).without_provides(),
+    )]);
+    let app = build_router(state);
+    let (_, body) = call(&app, Method::GET, GET, Some(&host), "").await;
+    let rows = body["components"].as_array().unwrap();
+    assert_eq!(
+        rows.iter()
+            .filter(|c| c["detail"]["package"] == "documents")
+            .count(),
+        0
+    );
+    assert_eq!(find(&body, "documents")["reason"], "reserved_capability_id");
+}
+
 #[tokio::test]
 async fn os_and_mcp_detail_stays_off_the_redacted_view() {
     let (mut state, host, _) = server_tests::capability_state().await;
