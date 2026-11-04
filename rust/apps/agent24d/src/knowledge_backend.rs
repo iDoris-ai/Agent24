@@ -33,7 +33,7 @@ use serde::de::DeserializeOwned;
 
 use crate::capabilities::unix_now;
 use crate::knowledge_host::{
-    BindingNow, Credential, KnowledgeHostRegistry, KnowledgeRefusal, RunBinding,
+    BindingNow, ContractGate, Credential, KnowledgeHostRegistry, KnowledgeRefusal, RunBinding,
 };
 
 /// What the server is given to answer in, and the transport's own bound on
@@ -78,6 +78,10 @@ pub struct DaemonKnowledgeBackend {
     runs: Arc<dyn RunSelector>,
     connect: Box<Connect>,
     transports: Mutex<HashMap<(String, String), Cached>>,
+    /// Whether a call first reads the capability probe (ADR-038 D3). On for
+    /// the daemon; the seam constructor leaves it off because its tests name
+    /// endpoints no probe can reach.
+    contract_gate: bool,
 }
 
 fn http_transport(
@@ -111,7 +115,14 @@ struct Sent {
 
 impl DaemonKnowledgeBackend {
     pub fn new(registry: Arc<KnowledgeHostRegistry>, runs: Arc<dyn RunSelector>) -> Self {
-        Self::with_connect(registry, runs, Box::new(http_transport))
+        Self::with_connect(registry, runs, Box::new(http_transport)).gated()
+    }
+
+    /// Calls are held until the probe cache says the contract fits.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn gated(mut self) -> Self {
+        self.contract_gate = true;
+        self
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -125,6 +136,27 @@ impl DaemonKnowledgeBackend {
             runs,
             connect,
             transports: Mutex::new(HashMap::new()),
+            contract_gate: false,
+        }
+    }
+
+    /// D3: no business call before the version check. The probe cache is the
+    /// one `GET /api/v1/components` reads; an expired entry runs one probe
+    /// (the same singleflight). An `incompatible` contract, or no declaration
+    /// yet, refuses the call here, with a fixed code and nothing sent: `incompatible`
+    /// (not retryable) or `not_ready` (retryable).
+    async fn contract_fits(&self, operation: &str) -> Result<(), Failure> {
+        if !self.contract_gate {
+            return Ok(());
+        }
+        match self
+            .registry
+            .contract_gate(operation, std::time::Instant::now())
+            .await
+        {
+            ContractGate::Open => Ok(()),
+            ContractGate::Incompatible => Err(local(LocalReason::Incompatible, false)),
+            ContractGate::NoDeclaration => Err(local(LocalReason::NotReady, true)),
         }
     }
 
@@ -333,6 +365,7 @@ impl KnowledgeBackend for DaemonKnowledgeBackend {
         query: SearchQuery,
     ) -> Result<(SearchRequest, SearchResponse), Failure> {
         let (pin, now) = self.binding(run_id).await?;
+        self.contract_fits("search").await?;
         let (transport, credential_seq, allowed) = self.transport(&pin, &now)?;
         let generation = now.generation;
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -400,6 +433,7 @@ impl KnowledgeBackend for DaemonKnowledgeBackend {
         query: ReadQuery,
     ) -> Result<(ReadRequest, ReadResponse), Failure> {
         let (pin, now) = self.binding(run_id).await?;
+        self.contract_fits("read").await?;
         let (transport, credential_seq, allowed) = self.transport(&pin, &now)?;
         let generation = now.generation;
         let request_id = uuid::Uuid::new_v4().to_string();

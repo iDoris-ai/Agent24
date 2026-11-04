@@ -56,6 +56,10 @@ pub struct Provide {
     /// Tool names this capability exposes (D9). Empty for a lock that lists none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<String>,
+    /// `unavailable` when the component's own report omits a capability this
+    /// build expects (ADR-038 D9). Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    availability: Option<&'static str>,
 }
 
 /// The host view of one component.
@@ -112,6 +116,7 @@ impl Item {
                     .map(|n| json!({"zh": n.zh, "en": n.en, "th": n.th})),
                 summary: None,
                 tools: p.tools.clone(),
+                availability: None,
             })
             .collect()
     }
@@ -459,17 +464,54 @@ fn documents_mapped(
     }
 }
 
-/// Fill provides and version from the catalog. A missing or broken catalog
-/// leaves the state alone and the provides empty: listing components must not
-/// panic because the JSON failed to parse.
+/// Fill provides from the catalog and check it against what the mount report
+/// says is running (ADR-038 D9: the compiled catalog is the expectation, the
+/// report is the actual).
+///
+/// - `version` is the report's; the catalog's goes to `detail.expected_version`.
+///   With no report there is no runtime, and the catalog's version is shown.
+/// - A report version that differs, or a capability the manifest declares
+///   without a tool the catalog expects, is `component_contract_mismatch` and
+///   `incompatible` while the module is mounted.
+/// - A capability the catalog expects and a non-empty manifest list omits is
+///   `unavailable`. Extra capabilities in the manifest are ignored.
+///
+/// A missing or broken catalog leaves the state alone and the provides empty:
+/// listing components must not panic because the JSON failed to parse.
 fn apply_documents_catalog(
     item: &mut Item,
     catalog: Result<documents_catalog::DocumentsCatalog, documents_catalog::CatalogError>,
+    report: Option<&MountReport>,
 ) {
     match catalog {
         Ok(catalog) => {
-            item.version = Some(catalog.version.clone());
+            let runtime = report.map(|report| report.version.as_str());
+            let actual = report
+                .and_then(|report| report.d9.as_ref())
+                .map(|d9| d9.provides.as_slice());
+            let checked = catalog.check(runtime, actual);
+            if runtime.is_none() {
+                item.version = Some(catalog.version.clone());
+            }
+            let mut detail = match item.detail.take() {
+                Some(Value::Object(map)) => map,
+                _ => serde_json::Map::new(),
+            };
+            detail.insert("expected_version".to_owned(), json!(catalog.version));
+            let mounted = report.is_some_and(|r| matches!(r.outcome, MountOutcome::Mounted));
+            if let (Some(mismatch), true) = (checked.mismatch, mounted) {
+                item.state = ComponentState::Incompatible;
+                item.reason = Some("component_contract_mismatch".to_owned());
+                detail.insert("id".to_owned(), json!(item.id));
+                detail.extend(mismatch.into_detail());
+            }
+            item.detail = Some(Value::Object(detail));
             item.provides = catalog.into_provides();
+            for provide in &mut item.provides {
+                if checked.unavailable.contains(&provide.id) {
+                    provide.availability = Some("unavailable");
+                }
+            }
         }
         Err(err) => {
             tracing::warn!(%err, "documents component catalog is unusable; provides left empty");
@@ -493,7 +535,7 @@ fn documents_from(
         item.reason = reason.map(str::to_owned);
         item.detail = detail.map(|why| json!({"message": why}));
     }
-    apply_documents_catalog(&mut item, catalog);
+    apply_documents_catalog(&mut item, catalog, report);
     item
 }
 
@@ -561,6 +603,7 @@ fn os_module_items(state: &AppState) -> Vec<Item> {
                             name: None,
                             summary: None,
                             tools: p.tools.clone(),
+                            availability: None,
                         })
                         .collect()
                 })
@@ -621,6 +664,7 @@ fn mcp_items(state: &AppState) -> Vec<Item> {
                     name: None,
                     summary: None,
                     tools,
+                    availability: None,
                 })
                 .into_iter()
                 .collect();

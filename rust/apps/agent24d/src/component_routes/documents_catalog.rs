@@ -17,6 +17,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::Provide;
+use crate::component_manifest::CapProvide;
 
 /// Kernel grants a domain OS may ask for (ADR-038 D2, `requires.kernel`).
 const KERNEL: &[&str] = &[
@@ -79,6 +80,54 @@ pub(super) struct Requires {
 pub(super) struct Assurance {
     pub(super) id: String,
     pub(super) source: String,
+}
+
+/// What [`DocumentsCatalog::check`] found.
+#[derive(Debug, Default)]
+pub(super) struct Checked {
+    pub(super) mismatch: Option<Mismatch>,
+    /// Capability ids the catalog expects and the manifest's list omits.
+    pub(super) unavailable: BTreeSet<String>,
+}
+
+/// A `component_contract_mismatch` (ADR-038 D3, D9): version first.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Mismatch {
+    Version {
+        expected: String,
+        actual: String,
+    },
+    Tools {
+        capability: String,
+        expected: Vec<String>,
+        actual: Vec<String>,
+        missing: Vec<String>,
+    },
+}
+
+impl Mismatch {
+    /// `expected` / `actual` as D3 wants them in the error, plus what is
+    /// specific to the kind.
+    pub(super) fn into_detail(self) -> serde_json::Map<String, Value> {
+        let value = match self {
+            Self::Version { expected, actual } => {
+                json!({"expected": expected, "actual": actual, "kind": "version"})
+            }
+            Self::Tools {
+                capability,
+                expected,
+                actual,
+                missing,
+            } => json!({
+                "expected": expected, "actual": actual, "kind": "tools",
+                "capability": capability, "missing": missing,
+            }),
+        };
+        match value {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        }
+    }
 }
 
 fn require(ok: bool, field: &'static str) -> Result<(), CatalogError> {
@@ -206,6 +255,48 @@ impl DocumentsCatalog {
         Ok(())
     }
 
+    /// D9 expected-vs-actual. `runtime_version` is the mount report's,
+    /// `actual` the manifest's capability list (`None` when no manifest was
+    /// read; an empty list means the package declared none, which says nothing
+    /// about what it provides, so nothing is checked against it).
+    pub(super) fn check(
+        &self,
+        runtime_version: Option<&str>,
+        actual: Option<&[CapProvide]>,
+    ) -> Checked {
+        let mut checked = Checked::default();
+        if let Some(runtime) = runtime_version.filter(|runtime| *runtime != self.version) {
+            checked.mismatch = Some(Mismatch::Version {
+                expected: self.version.clone(),
+                actual: runtime.to_owned(),
+            });
+        }
+        let Some(actual) = actual.filter(|actual| !actual.is_empty()) else {
+            return checked;
+        };
+        for expected in &self.provides {
+            let Some(found) = actual.iter().find(|cap| cap.id == expected.id) else {
+                checked.unavailable.insert(expected.id.clone());
+                continue;
+            };
+            let missing: Vec<String> = expected
+                .tools
+                .iter()
+                .filter(|tool| !found.tools.contains(tool))
+                .cloned()
+                .collect();
+            if !missing.is_empty() && checked.mismatch.is_none() {
+                checked.mismatch = Some(Mismatch::Tools {
+                    capability: expected.id.clone(),
+                    expected: expected.tools.clone(),
+                    actual: found.tools.clone(),
+                    missing,
+                });
+            }
+        }
+        checked
+    }
+
     #[cfg(test)]
     pub(super) fn tool_names(&self) -> Vec<&str> {
         self.provides
@@ -222,6 +313,7 @@ impl DocumentsCatalog {
                 name: Some(item.name.wire()),
                 summary: Some(item.summary.wire()),
                 tools: item.tools,
+                availability: None,
             })
             .collect()
     }

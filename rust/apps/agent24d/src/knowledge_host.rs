@@ -35,6 +35,7 @@ use std::fmt;
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
+use agent24_components::ComponentState;
 use agent24_protocol::state_file::AuthMode;
 use axum::body::Body;
 use axum::extract::rejection::{PathRejection, QueryRejection};
@@ -189,6 +190,49 @@ pub struct KnowledgeHostRegistry {
     changed: tokio::sync::Notify,
     /// `/system/capabilities` answers for `GET /api/v1/components` (ADR-038 C5).
     probes: KnowledgeProbeCache,
+}
+
+/// How many times `assess_snapshot` takes a fresh snapshot after a target
+/// failed its re-check.
+const SNAPSHOT_ATTEMPTS: usize = 3;
+
+/// Probes `targets`; whenever one failed its re-check, `retake` supplies a new
+/// snapshot, up to [`SNAPSHOT_ATTEMPTS`] tries in all.
+pub(crate) async fn assess_until_fresh(
+    cache: &KnowledgeProbeCache,
+    targets: &[ProbeTarget],
+    now: Instant,
+    current: &(dyn Fn(&ProbeTarget) -> bool + Sync),
+    retake: &(dyn Fn() -> Vec<ProbeTarget> + Sync),
+) -> ProbeView {
+    let mut retaken;
+    let mut snapshot = targets;
+    for attempt in 0..SNAPSHOT_ATTEMPTS {
+        let assessed = cache.assess(snapshot, now, current).await;
+        if !assessed.stale {
+            return assessed.view;
+        }
+        if attempt + 1 < SNAPSHOT_ATTEMPTS {
+            retaken = retake();
+            snapshot = &retaken;
+        }
+    }
+    ProbeView {
+        state: ComponentState::Failed,
+        reason: Some("binding_changed".to_owned()),
+        version: None,
+        detail: None,
+    }
+}
+
+/// Whether a business call may leave (`KnowledgeHostRegistry::contract_gate`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContractGate {
+    Open,
+    /// The declaration says the contract does not fit, or lacks the operation.
+    Incompatible,
+    /// No declaration has been obtained.
+    NoDeclaration,
 }
 
 impl KnowledgeHostRegistry {
@@ -505,10 +549,48 @@ impl KnowledgeHostRegistry {
     }
 
     /// Probe `targets` as snapshotted. A binding that was deactivated or whose
-    /// credential epoch moved since the snapshot is not called.
+    /// credential epoch moved since the snapshot is not called, and the answer
+    /// that left it out is not used (N1 of #1571: it could read `ready` for an
+    /// endpoint that fails now): the snapshot is taken again. If the bindings
+    /// keep moving through every retry, the answer is `failed`
+    /// (`binding_changed`), never a stale `ready` or `stopped`.
     pub(crate) async fn assess_snapshot(&self, targets: &[ProbeTarget], now: Instant) -> ProbeView {
-        let current = |target: &ProbeTarget| self.probe_target_current(target);
-        self.probes.assess(targets, now, &current).await
+        assess_until_fresh(
+            &self.probes,
+            targets,
+            now,
+            &|target| self.probe_target_current(target),
+            &|| self.probe_targets(unix_now()),
+        )
+        .await
+    }
+
+    /// D3: no business call before the version check. Reads the same probe
+    /// cache as `GET /api/v1/components` (an expired entry runs one probe, in
+    /// the same singleflight) and answers whether `operation` (`search` or
+    /// `read`) may go out.
+    pub(crate) async fn contract_gate(&self, operation: &str, now: Instant) -> ContractGate {
+        let view = self.component_status(now).await;
+        match view.state {
+            ComponentState::Incompatible => ContractGate::Incompatible,
+            // No capability declaration was obtained: unreachable, rejected,
+            // unreadable, or nothing configured.
+            ComponentState::Failed | ComponentState::Stopped => ContractGate::NoDeclaration,
+            ComponentState::Degraded => {
+                let lacks = view
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail.get("missing_capabilities"))
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|missing| missing.iter().any(|name| name == operation));
+                if lacks {
+                    ContractGate::Incompatible
+                } else {
+                    ContractGate::Open
+                }
+            }
+            _ => ContractGate::Open,
+        }
     }
 
     /// Whether `host` has `binding` active.
