@@ -242,7 +242,7 @@ flowchart TB
 | **S2-3** Knowledge 宿主下沉 | `knowledge_host/backend/probe/store` 迁入 `agent24-knowledge`；决定 `provider/`（~4,100 行）接线或冻结 | `d/knowledge_*.rs`、`agent24-knowledge` | L | Q3；**AGENTS.md：凭据类须等 APPROVE** | agent24d 减 ~1,800 行；C5 探测测试原样通过 | 中：凭据路径 | Grok（Opus 评审） |
 | **S2-4** attach 抽 crate | 新 `agent24-attach`；先抽 events / model_callback 需要的 trait | `d/attached*.rs`、`d/attach_*.rs`、`d/agentear_timings.rs` | L | S2-1 | agent24d 减 ~1,500 行；C4 用例（失配、取消）原样通过 | 中 | Grok |
 | **S2-5** 鉴权抽 `agent24-auth` | capabilities / enroll / presence 业务下沉，handler 与中间件接线留 agent24d | `d/capabilities/*`、`d/enroll_*.rs`、`d/presence_desktop.rs` | L | S1-2、S2-1；建议排在最后 | agent24d 再减 ~4,000 行；enroll / presence / mint 全部黑盒测试通过 | **高**：安全核心 | 拍板 → Grok（Opus 评审，外审 APPROVE） |
-| **[注：Q1 (b) 后 OD 停止语义改为 TERM→15s→SIGKILL 整组，见 C8 设计]** **S2-6** 进程组终止原语 | Rust 一个 `kill_group_gracefully`（放 os-proc / sys），os-proto、comm、idoris、sidecar-host 共用；TS 一个，backend-manager 与 creative-serve-web 共用（是否强杀作为参数，OD 保持「不强杀」） | 5 个 Rust crate、3 个 TS 模块 | M | #1580（C8，OD 停止语义已定；原 S1-6 作废）；Q13 | 同一组回收 / 超时 / 僵尸测试跑在共用实现上；各调用点超时值显式传入 | 中：统一会改变行为 | Grok |
+| **[注：Q1 (b) 后 OD 停止语义改为 TERM→15s→SIGKILL 整组，见 C8 设计]** **S2-6** 进程组终止原语 | Rust 一个 `kill_group_gracefully`（放 os-proc / sys），os-proto、comm、idoris、sidecar-host 共用；TS 一个，backend-manager 与 creative-serve-web 共用（是否强杀作为参数；OD 现为 TERM→15s→SIGKILL 整组） | 5 个 Rust crate、3 个 TS 模块 | M | #1580（C8，OD 停止语义已定；原 S1-6 作废）；Q13 | 同一组回收 / 超时 / 僵尸测试跑在共用实现上；各调用点超时值显式传入 | 中：统一会改变行为 | Grok |
 | S2-7（按 Q5） | CLI 补齐：`knowledge` 绑定/凭据、`comm identity export/import` | `agent24-cli` | M | Q5 | release 用例可走 CLI | 中 | 拍板 → Grok |
 
 ### 4.4 依赖顺序一览
@@ -251,7 +251,7 @@ flowchart TB
 第 0 期（可并行）：S0-3 → S0-4；S0-1；S0-2；S0-5；S0-6；S0-7
                      ↑Q12            ↑Q8/Q9 ↑Q1/Q13      ↑Q11 ↑Q4
 第 1 期：S1-1、S1-3、S1-4、S1-5 可立即并行（最多 3 个 Grok 并发）
-         S1-2 等 Q2；S1-6 等 Q1（与 S0-2 同步）；S1-7 等 Q1
+         S1-2 等 Q2；~~S1-6 等 Q1~~（作废，见 #1580）；S1-7 等 Q1
 第 2 期：S2-1 → S2-4、S2-5；S2-2、S2-3 可与 S2-1 错开；S2-6 在 #1580 后（原 S1-6 作废）；S2-5 最后
 ```
 
