@@ -103,8 +103,8 @@ pub struct HttpTransport {
     client: Client,
     /// Normalized base without a trailing `/`; an operation path is appended.
     base: String,
-    auth_name: HeaderName,
-    auth_value: HeaderValue,
+    /// Absent for [`HttpTransport::anonymous`]: no credential header is sent.
+    auth: Option<(HeaderName, HeaderValue)>,
     max_response_bytes: usize,
 }
 
@@ -112,7 +112,7 @@ impl fmt::Debug for HttpTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HttpTransport")
             .field("base", &self.base)
-            .field("auth_name", &self.auth_name)
+            .field("auth", &self.auth.as_ref().map(|(name, _)| name))
             .field("max_response_bytes", &self.max_response_bytes)
             .finish_non_exhaustive()
     }
@@ -120,26 +120,50 @@ impl fmt::Debug for HttpTransport {
 
 impl HttpTransport {
     pub fn new(config: HttpTransportConfig) -> Result<Self, HttpConfigError> {
-        let base = validate_base_url(&config.base_url)?;
-        if config.max_response_bytes == 0 || config.connect_timeout.is_zero() {
+        let auth = credential_header(&config.credential)?;
+        Self::build(
+            config.base_url,
+            Some(auth),
+            config.max_response_bytes,
+            config.connect_timeout,
+        )
+    }
+
+    /// No `Authorization` or `X-API-Key` header. Same URL, redirect, proxy and
+    /// deadline rules as [`HttpTransport::new`]. A component probe uses this
+    /// before a credential exists, and it must not invent one (READONLY R9.5).
+    pub fn anonymous(
+        base_url: String,
+        max_response_bytes: usize,
+        connect_timeout: Duration,
+    ) -> Result<Self, HttpConfigError> {
+        Self::build(base_url, None, max_response_bytes, connect_timeout)
+    }
+
+    fn build(
+        base_url: String,
+        auth: Option<(HeaderName, HeaderValue)>,
+        max_response_bytes: usize,
+        connect_timeout: Duration,
+    ) -> Result<Self, HttpConfigError> {
+        let base = validate_base_url(&base_url)?;
+        if max_response_bytes == 0 || connect_timeout.is_zero() {
             return Err(HttpConfigError::InvalidLimit);
         }
-        let (auth_name, auth_value) = credential_header(&config.credential)?;
         let client = Client::builder()
             .use_rustls_tls()
             .min_tls_version(tls::Version::TLS_1_2)
             .no_proxy()
             .redirect(redirect::Policy::none())
             .referer(false)
-            .connect_timeout(config.connect_timeout)
+            .connect_timeout(connect_timeout)
             .build()
             .map_err(|_| HttpConfigError::Client)?;
         Ok(Self {
             client,
             base,
-            auth_name,
-            auth_value,
-            max_response_bytes: config.max_response_bytes,
+            auth,
+            max_response_bytes,
         })
     }
 
@@ -156,8 +180,10 @@ impl HttpTransport {
         let mut request = self
             .client
             .request(method, format!("{}{}", self.base, op.path()))
-            .header(ACCEPT, "application/json")
-            .header(self.auth_name.clone(), self.auth_value.clone());
+            .header(ACCEPT, "application/json");
+        if let Some((name, value)) = &self.auth {
+            request = request.header(name.clone(), value.clone());
+        }
         if op.has_body() {
             request = request.header(CONTENT_TYPE, "application/json").body(body);
         }

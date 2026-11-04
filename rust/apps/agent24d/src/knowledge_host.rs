@@ -30,10 +30,12 @@
 //! pin could not match again wherever it was kept, and a run that names a
 //! binding but has no pin is refused, never bound anew.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
+use std::time::Instant;
 
+use agent24_components::ComponentState;
 use agent24_protocol::state_file::AuthMode;
 use axum::body::Body;
 use axum::extract::rejection::{PathRejection, QueryRejection};
@@ -43,6 +45,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::capabilities::{Audience, Authorization, UnixSeconds, unix_now};
+use crate::knowledge_probe::{Assessed, KnowledgeProbeCache, ProbeTarget, ProbeView};
 use agent24_domain::http::read_body_or_response;
 
 use crate::server::{AppState, error_response};
@@ -185,6 +188,53 @@ pub struct KnowledgeHostRegistry {
     /// Woken on every change applied, so a call in flight can tell at once
     /// that its binding moved (`crate::knowledge_backend`).
     changed: tokio::sync::Notify,
+    /// `/system/capabilities` answers for `GET /api/v1/components` (ADR-038 C5).
+    probes: KnowledgeProbeCache,
+}
+
+/// How many times `assess_snapshot` takes a fresh snapshot after a target
+/// failed its re-check.
+const SNAPSHOT_ATTEMPTS: usize = 3;
+
+/// Probes `targets`; whenever one failed its re-check, `retake` supplies a new
+/// snapshot, up to [`SNAPSHOT_ATTEMPTS`] tries in all. `gate_url` is passed to
+/// the cache (see `KnowledgeProbeCache::assess_for`).
+pub(crate) async fn assess_until_fresh(
+    cache: &KnowledgeProbeCache,
+    targets: &[ProbeTarget],
+    now: Instant,
+    current: &(dyn Fn(&ProbeTarget) -> bool + Sync),
+    retake: &(dyn Fn() -> Vec<ProbeTarget> + Sync),
+    gate_url: Option<&str>,
+) -> Assessed {
+    let mut retaken;
+    let mut snapshot = targets;
+    for attempt in 0..SNAPSHOT_ATTEMPTS {
+        let assessed = cache.assess_for(snapshot, now, current, gate_url).await;
+        if !assessed.stale {
+            return assessed;
+        }
+        if attempt + 1 < SNAPSHOT_ATTEMPTS {
+            retaken = retake();
+            snapshot = &retaken;
+        }
+    }
+    Assessed::without_urls(ProbeView {
+        state: ComponentState::Failed,
+        reason: Some("binding_changed".to_owned()),
+        version: None,
+        detail: None,
+    })
+}
+
+/// Whether a business call may leave (`KnowledgeHostRegistry::contract_gate`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContractGate {
+    Open,
+    /// The declaration says the contract does not fit, or lacks the operation.
+    Incompatible,
+    /// No declaration has been obtained.
+    NoDeclaration,
 }
 
 impl KnowledgeHostRegistry {
@@ -405,11 +455,168 @@ impl KnowledgeHostRegistry {
         }
     }
 
-    /// Whether any host has any binding active (`/api/v1/components`).
-    pub fn any_active(&self) -> bool {
-        self.entries
-            .lock()
-            .is_ok_and(|entries| entries.values().any(|entry| entry.active))
+    /// Active bindings that name an endpoint, one per base URL.
+    ///
+    /// A live credential beats the same URL with none, because its seq is at
+    /// least 1. Several live credentials use the greatest seq, then the
+    /// greatest `(host, binding)`. `HashMap` iteration order is not the rule.
+    /// A poisoned `entries` lock still yields the records (`into_inner`); an
+    /// empty list would show a configured binding as `stopped`.
+    pub(crate) fn probe_targets(&self, now: UnixSeconds) -> Vec<ProbeTarget> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        struct Choice {
+            epoch: u64,
+            owner: (String, String),
+            target: ProbeTarget,
+        }
+        let mut by_url: BTreeMap<String, Choice> = BTreeMap::new();
+        for (owner, entry) in entries.iter() {
+            if !entry.active {
+                continue;
+            }
+            let Some(endpoint) = &entry.endpoint else {
+                continue;
+            };
+            let current = entry
+                .credential
+                .clone()
+                .filter(|current| current.expires_at > now);
+            let epoch = current.as_ref().map(|current| current.seq).unwrap_or(0);
+            let credential = current.map(|current| match current.credential {
+                Credential::Bearer(token) => agent24_knowledge::Credential::Bearer(token),
+                Credential::ApiKey(key) => agent24_knowledge::Credential::ApiKey(key),
+            });
+            let base_url = endpoint.base_url.clone();
+            let replace = match by_url.get(&base_url) {
+                None => true,
+                Some(prev) => (epoch, owner) > (prev.epoch, &prev.owner),
+            };
+            if replace {
+                by_url.insert(
+                    base_url.clone(),
+                    Choice {
+                        epoch,
+                        owner: owner.clone(),
+                        target: ProbeTarget {
+                            host: owner.0.clone(),
+                            binding: owner.1.clone(),
+                            base_url,
+                            credential,
+                            credential_epoch: epoch,
+                        },
+                    },
+                );
+            }
+        }
+        by_url.into_values().map(|choice| choice.target).collect()
+    }
+
+    /// The snapshotted target still names an active binding whose endpoint and
+    /// credential epoch have not moved. A probe calls this again before it
+    /// sends, and skips the target when this is false.
+    pub(crate) fn probe_target_current(&self, target: &ProbeTarget) -> bool {
+        let now = unix_now();
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(entry) = entries.get(&(target.host.clone(), target.binding.clone())) else {
+            return false;
+        };
+        if !entry.active {
+            return false;
+        }
+        let Some(endpoint) = &entry.endpoint else {
+            return false;
+        };
+        if endpoint.base_url != target.base_url {
+            return false;
+        }
+        let epoch = entry
+            .credential
+            .as_ref()
+            .filter(|current| current.expires_at > now)
+            .map(|current| current.seq)
+            .unwrap_or(0);
+        epoch == target.credential_epoch
+    }
+
+    /// How many component reads are waiting on the current capabilities flight.
+    #[cfg(test)]
+    pub(crate) fn inflight_receivers(&self) -> usize {
+        self.probes.inflight_receivers()
+    }
+
+    /// D5 remote subset for Knowledge, from a cached capabilities probe.
+    pub(crate) async fn component_status(&self, now: Instant) -> ProbeView {
+        let targets = self.probe_targets(unix_now());
+        self.assess_snapshot(&targets, now).await
+    }
+
+    /// Probe `targets` as snapshotted. A binding that was deactivated or whose
+    /// credential epoch moved since the snapshot is not called, and the answer
+    /// that left it out is not used (N1 of #1571: it could read `ready` for an
+    /// endpoint that fails now): the snapshot is taken again. If the bindings
+    /// keep moving through every retry, the answer is `failed`
+    /// (`binding_changed`), never a stale `ready` or `stopped`.
+    pub(crate) async fn assess_snapshot(&self, targets: &[ProbeTarget], now: Instant) -> ProbeView {
+        self.assess_snapshot_for(targets, now, None).await.view
+    }
+
+    async fn assess_snapshot_for(
+        &self,
+        targets: &[ProbeTarget],
+        now: Instant,
+        gate_url: Option<&str>,
+    ) -> Assessed {
+        assess_until_fresh(
+            &self.probes,
+            targets,
+            now,
+            &|target| self.probe_target_current(target),
+            &|| self.probe_targets(unix_now()),
+            gate_url,
+        )
+        .await
+    }
+
+    /// D3: no business call before the version check. Reads the same probe
+    /// cache as `GET /api/v1/components` (an expired entry runs one probe, in
+    /// the same singleflight) but looks only at `base_url`, the endpoint this
+    /// call goes to: another binding's failure or mismatch does not refuse it.
+    /// `operation` is `search` or `read`.
+    pub(crate) async fn contract_gate(
+        &self,
+        base_url: &str,
+        operation: &str,
+        now: Instant,
+    ) -> ContractGate {
+        let targets = self.probe_targets(unix_now());
+        let assessed = self
+            .assess_snapshot_for(&targets, now, Some(base_url))
+            .await;
+        let Some(view) = assessed.per_url.get(base_url) else {
+            // This endpoint was not probed: it left the snapshot, or the
+            // bindings kept moving.
+            return ContractGate::NoDeclaration;
+        };
+        match view.state {
+            ComponentState::Incompatible => ContractGate::Incompatible,
+            // No capability declaration was obtained: unreachable, rejected,
+            // unreadable.
+            ComponentState::Failed | ComponentState::Stopped => ContractGate::NoDeclaration,
+            ComponentState::Degraded => {
+                let lacks = view
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail.get("missing_capabilities"))
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|missing| missing.iter().any(|name| name == operation));
+                if lacks {
+                    ContractGate::Incompatible
+                } else {
+                    ContractGate::Open
+                }
+            }
+            _ => ContractGate::Open,
+        }
     }
 
     /// Whether `host` has `binding` active.

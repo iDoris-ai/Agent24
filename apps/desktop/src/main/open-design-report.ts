@@ -25,10 +25,16 @@ export interface OpenDesignReportInput {
   reason?: string
   version?: string | null
   /**
-   * Sidecar lifecycle from `CreativeServeWeb.headlessSidecarState()`.
+   * Sidecar lifecycle from `CreativeServeWeb.headlessPhaseForReport()`, derived
+   * from the `SidecarManager` state that hosts the packaged instance (C8).
+   * `healthy` reports as `ready`; `degraded` is reported as such.
    * Null before the first packaged headless launch, for a dev checkout,
-   * and when start bails before a headless process exists. After a run
-   * this is `stopped` or `failed`, not null.
+   * and when start bails before a headless process exists. A leftover
+   * `stopped` is cleared once the component leaves `installed`. A `failed`
+   * whose instance the manager no longer owns is cleared only when the component itself
+   * is gone, so a crash during an upgrade is still `failed` when the
+   * install returns. A live phase stays through a download. A clean stop
+   * while the component stays installed leaves this `stopped`.
    * Ignored unless the component itself is `installed`.
    */
   sidecar?: SidecarState | null

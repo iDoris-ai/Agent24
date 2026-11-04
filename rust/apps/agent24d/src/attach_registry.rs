@@ -228,6 +228,24 @@ fn build_grant(name: &str, manifest: &DomainOsManifest, deps: &AttachDeps) -> Gr
     }
 }
 
+/// ADR-038 D3: the host `detail` for a protocol-range refusal. Named fields
+/// so `expected` and `actual` cannot be swapped at a call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContractMismatch {
+    pub expected: String,
+    pub actual: String,
+}
+
+/// One registered module, as `GET /api/v1/components` reads it.
+#[derive(Debug, Clone)]
+pub(crate) struct AttachSnap {
+    pub name: String,
+    pub version: String,
+    pub disabled: bool,
+    pub drain: Option<DrainState>,
+    pub mismatch: Option<ContractMismatch>,
+}
+
 /// One registered module's live state: the record facts a handshake
 /// re-checks (§4.3 ②), whether it is disabled (§5.3), its
 /// [`AttachSlot`], and the [`Grant`] §3.4 says to reuse or rebuild.
@@ -252,6 +270,15 @@ struct Entry {
     /// `Running` once it leaves it (§5.3: no drain, no resume), so
     /// `DrainState::Running` is exactly "this is the current connection".
     last_generation: Option<(u64, Arc<Generation>)>,
+    /// Manifest revision (`DomainOsManifest::version`), shown as this
+    /// component's `version`. Not the protocol range: that check stays on
+    /// the handshake wire (ADR-038 D4, 握手不变).
+    version: String,
+    /// Last handshake that failed the protocol-range check (ADR-038 §3 case
+    /// 2). Cleared by a successful [`AttachRegistry::commit`] and by a new
+    /// registration. Not recorded, and not reported, while a generation is
+    /// [`DrainState::Running`].
+    contract_mismatch: Option<ContractMismatch>,
     /// A3-3: the current connection's [`KernelCalls`] handle, installed by
     /// [`AttachRegistry::attach_kernel_calls`] once `serve_attached` has
     /// actually built one (strictly after `commit` installs `last_generation`
@@ -386,6 +413,8 @@ impl AttachRegistry {
                     host_commands,
                     last_generation: None,
                     live_calls: None,
+                    version: entry.manifest.version().to_owned(),
+                    contract_mismatch: None,
                 },
             );
         }
@@ -463,6 +492,10 @@ impl AttachRegistry {
             return Err(CommitRefused::Handshake(HandshakeError::AuthFailed));
         }
         if entry.disabled {
+            // `accept_attached` already agreed the range, or `commit` would
+            // not have been called. An earlier refusal must not still read
+            // as `incompatible` after the user re-enables.
+            entry.contract_mismatch = None;
             return Err(CommitRefused::Handshake(HandshakeError::Forbidden));
         }
         let (number, generation) = entry
@@ -470,6 +503,9 @@ impl AttachRegistry {
             .install()
             .map_err(|_slot_busy| CommitRefused::Handshake(HandshakeError::Busy))?;
         entry.last_generation = Some((number, generation.clone()));
+        // A range refusal from an earlier attempt must not outlive a
+        // handshake that just succeeded.
+        entry.contract_mismatch = None;
         let methods = (entry.grant.methods_for)(&generation);
         Ok((number, generation, methods))
     }
@@ -702,19 +738,64 @@ impl AttachRegistry {
         }
     }
 
-    /// Every registered module as `(name, disabled, state of its last generation)`, for
-    /// `/api/v1/components`. Reads the in-memory entries at call time, never `attached.json`.
+    /// Every registered module, for `/api/v1/components`. Reads the in-memory
+    /// entries at call time, never `attached.json`. A `Running` generation
+    /// hides a recorded mismatch: a second, refused connection must not
+    /// cover a live module.
     #[must_use]
-    pub fn snapshot(&self) -> Vec<(String, bool, Option<DrainState>)> {
+    pub fn snapshot(&self) -> Vec<AttachSnap> {
         let state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         state
             .entries
             .iter()
             .map(|(name, e)| {
                 let drain = e.last_generation.as_ref().map(|(_, g)| g.state());
-                (name.clone(), e.disabled, drain)
+                let mismatch = match drain {
+                    Some(DrainState::Running) => None,
+                    _ => e.contract_mismatch.clone(),
+                };
+                AttachSnap {
+                    name: name.clone(),
+                    version: e.version.clone(),
+                    disabled: e.disabled,
+                    drain,
+                    mismatch,
+                }
             })
             .collect()
+    }
+
+    /// Record a protocol-range refusal for a module that is already
+    /// registered (ADR-038 §3 case 2). An unknown name is ignored, so this
+    /// cannot tell a caller whether a name exists. A live `Running`
+    /// generation is left alone. A registry closed for shutdown is left alone.
+    ///
+    /// `token_id` is the one the refusing check looked up. Under the lock it
+    /// must still be the entry's token_id, as in [`Self::commit`]: a rotation
+    /// between the check and this call replaced the registration, and a
+    /// refusal that belongs to the old one is dropped (#1572 L1).
+    pub fn note_contract_mismatch(&self, name: &str, token_id: &str, expected: &str, actual: &str) {
+        let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.deps.is_none() {
+            return;
+        }
+        let Some(entry) = state.entries.get_mut(name) else {
+            return;
+        };
+        if entry.token_id != token_id {
+            return;
+        }
+        if entry
+            .last_generation
+            .as_ref()
+            .is_some_and(|(_, generation)| generation.state() == DrainState::Running)
+        {
+            return;
+        }
+        entry.contract_mismatch = Some(ContractMismatch {
+            expected: expected.to_owned(),
+            actual: actual.to_owned(),
+        });
     }
 
     /// The `on_commit` hook for [`crate::attached::register`]/`revoke`/
@@ -785,6 +866,8 @@ impl AttachRegistry {
                         entry.token_sha256 = token_sha256;
                         entry.token_id = token_id.to_owned();
                         entry.host_commands = manifest.host_commands().to_vec();
+                        entry.version = manifest.version().to_owned();
+                        entry.contract_mismatch = None;
                         // Review M4: mirrors what `crate::attached::register`
                         // just wrote to disk — a rotation PRESERVES
                         // `disabled`, it does not clear it (an AgentEar
@@ -803,6 +886,8 @@ impl AttachRegistry {
                             host_commands: manifest.host_commands().to_vec(),
                             last_generation: None,
                             live_calls: None,
+                            version: manifest.version().to_owned(),
+                            contract_mismatch: None,
                         });
                     }
                 }
@@ -930,6 +1015,26 @@ mod tests {
                 },
             },
         }
+    }
+
+    /// #1572 L1. The check judged against the old token and refused with
+    /// VersionMismatch; a rotation lands; only then the listener notes it. The
+    /// refusal belongs to the old registration and must not mark the new one.
+    #[tokio::test]
+    async fn a_mismatch_from_a_rotated_away_token_is_dropped() {
+        let registry = AttachRegistry::new(deps().await);
+        let (_, old_token) = register(&registry, "agentear", &["events"]);
+        let looked_up = registry.expectation("agentear").unwrap().token_id;
+        assert_eq!(looked_up, old_token);
+        let (_, new_token) = register(&registry, "agentear", &["events"]);
+        assert_ne!(old_token, new_token);
+
+        registry.note_contract_mismatch("agentear", &looked_up, "[1, 1]", "[0, 0]");
+        assert_eq!(registry.snapshot()[0].mismatch, None);
+
+        // Positive control: the current token still records.
+        registry.note_contract_mismatch("agentear", &new_token, "[1, 1]", "[0, 0]");
+        assert!(registry.snapshot()[0].mismatch.is_some());
     }
 
     #[tokio::test]
