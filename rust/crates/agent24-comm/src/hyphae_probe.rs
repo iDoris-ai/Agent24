@@ -517,16 +517,20 @@ pub(crate) async fn health_loop(
                 }
                 continue;
             };
+            // `biased`: a `running` change that is ready together with a sample
+            // wins, so a sample from the previous generation is never written
+            // into the book `spawn_and_record` just cleared for the new one.
             tokio::select! {
-                sample = probe_health_with_timeout(&runner, timeout) => {
-                    hub.observe_health(sample);
-                }
+                biased;
                 result = running.changed() => {
                     if result.is_err() {
                         return;
                     }
                     // Left `running` mid-probe. Dropping the probe kills its child.
                     break;
+                }
+                sample = probe_health_with_timeout(&runner, timeout) => {
+                    hub.observe_health(sample);
                 }
             }
             if !*running.borrow() {
