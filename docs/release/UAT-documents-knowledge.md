@@ -40,7 +40,14 @@
 ### 1.1 机器和数据
 
 - Apple Silicon 的 Mac，macOS 14 或更新。
-- **先备份**：`cp -R ~/.agent24 ~/agent24-backup-uat`。测完想回到原状态，退出 App 后把它拷回去。
+- **先备份**，两处都要备份：数据目录 `~/.agent24`，以及 App 的 userData 目录（知识库设置、已保存的密钥、documents 卸载标记都在这里，不在 `~/.agent24`）：
+
+  ```sh
+  cp -R ~/.agent24 ~/agent24-backup-uat
+  cp -R "$HOME/Library/Application Support/@agent24/desktop" ~/agent24-backup-uat-userdata
+  ```
+
+  测完想回到原状态，见第 13 节最后一段。
 - 确认没有装 Agent24 服务（F-04 会临时装一次）。贴回：
 
   ```sh
@@ -56,8 +63,10 @@
 ```sh
 mkdir -p ~/agent24-uat/samples
 for d in docs/documenting/samples/s01/*/; do n=$(basename "$d"); for f in "$d"source.pdf "$d"source.jpg; do [ -f "$f" ] && cp "$f" ~/agent24-uat/samples/"$n.${f##*.}"; done; done
-ls ~/agent24-uat/samples   # 8 个文件
+ls ~/agent24-uat/samples
 ```
+
+最后一行应列出 8 个文件。
 
 下面用到的几份：
 
@@ -72,19 +81,23 @@ ls ~/agent24-uat/samples   # 8 个文件
 
 知识库问答要一个能调用工具的本地模型。我们回归时用的是 Ollama 上的 `qwen3.8:27b`（11434 端口）。没有本地模型时，第 A–C 组和第 F 组里不问问题的步骤照样能做。
 
-下文「启动 App」一律指在终端里这样启动，日志会写进 `~/agent24-uat/app.log`。终端不要关，退出 App 用 ⌘Q：
+下文「按 1.3 启动」一律指在终端 1 里这样启动。日志写进 `~/agent24-uat/app.log`，**每次启动都覆盖上一次的**，所以下面查日志看的都只是这一次启动。终端不要关，退出 App 用 ⌘Q：
 
 ```sh
 mkdir -p ~/agent24-uat
-DEFAULT_MODEL=qwen3.8:27b OMLX_URL=http://127.0.0.1:1 /Applications/Agent24.app/Contents/MacOS/Agent24 2>&1 | tee -a ~/agent24-uat/app.log
+DEFAULT_MODEL=qwen3.8:27b OMLX_URL=http://127.0.0.1:1 /Applications/Agent24.app/Contents/MacOS/Agent24 2>&1 | tee ~/agent24-uat/app.log
 ```
 
 - 用 oMLX 的话，把两个变量换成你平时的设置。
-- 再开一个终端（下文叫「终端 2」）跑命令。用 `dm` 查日志：
+- 再开一个终端（下文叫「终端 2」）跑命令。先把 App 自带的 `agent24` 命令放进 PATH，再定义查日志的 `dm` 和卸载标记的位置 `MK`：
 
   ```sh
+  export PATH=/Applications/Agent24.app/Contents/Resources/backend:$PATH
   dm() { grep -E '\[documents-module\]|spawned pid|ready on port|taking over|refused shutdown|reusing external|not accepted by port' ~/agent24-uat/app.log; }
+  MK="$HOME/Library/Application Support/@agent24/desktop/documents-module.json"
   ```
+
+  `MK` 找不到时，用 `find ~/Library/Application\ Support -maxdepth 3 -name documents-module.json` 找。
 
 ### 1.4 WeKnora 和样本知识库
 
@@ -97,21 +110,16 @@ DEFAULT_MODEL=qwen3.8:27b OMLX_URL=http://127.0.0.1:1 /Applications/Agent24.app/
 
 | # | 场景 | 操作 | 预期 | 结果 |
 |---|---|---|---|---|
-| A-01 | 正式签名与公证 | 用浏览器下载 DMG（这样会带 quarantine，是真实用户的路径），先和 SHA256SUMS 比对，再拖进「应用程序」。双击打开一次，然后 ⌘Q。终端贴回：`spctl -a -vv /Applications/Agent24.app; xcrun stapler validate /Applications/Agent24.app` | 首次打开只有「从互联网下载」的常规确认，**没有**「无法验证开发者」或「已损坏」。`spctl` 输出 `accepted` 和 `source=Notarized Developer ID`，`stapler` 输出 `worked` | |
-| A-02 | 从 v0.6.0-preview 升级（模块随 App 升级） | 前置：上一版装过手动的 documents 模块，并导入过文档。没装过就跳到 A-03，本条记 S。按 1.3 启动新 App，终端 2 贴回 `dm` 和 `grep '^version' ~/.agent24/packages/documents/domain-os.yml` | 日志有 `[documents-module] upgraded to documents 0.2.0: installed …/.agent24/packages/documents`；版本是 `version: "0.2.0"`。「能力中心 → 工具 → 模块管理」里 documents 是 `v0.2.0`、「已挂载」。「文档」页里以前导入的文档都在，点开有文字、有原页面图 | |
-| A-03 | 首次安装（全新数据目录） | ⌘Q。终端 1：`AGENT24_DATA_DIR=$HOME/agent24-uat/fresh /Applications/Agent24.app/Contents/MacOS/Agent24 2>&1 \| tee ~/agent24-uat/fresh.log`。终端 2：`grep documents-module ~/agent24-uat/fresh.log` | 日志有 `[documents-module] installed documents 0.2.0: installed …/agent24-uat/fresh/packages/documents`。「文档」页**不显示**「文档模块未安装」，能导入一份 PDF 并打开。做完 ⌘Q，`rm -rf ~/agent24-uat/fresh` | |
+| A-01 | 正式签名与公证 | 用浏览器下载 DMG（这样会带 quarantine，是真实用户的路径），先和 SHA256SUMS 比对，再拖进「应用程序」。双击打开一次，然后 ⌘Q。终端贴回：`spctl -a -vv /Applications/Agent24.app; xcrun stapler validate <下载的 DMG>` | 首次打开只有「从互联网下载」的常规确认，**没有**「无法验证开发者」或「已损坏」。`spctl` 输出 `accepted` 和 `source=Notarized Developer ID`，`stapler` 输出 `worked`。流水线只对 DMG 公证、钉票据，所以 `stapler` 验的是 DMG，不是 App | |
+| A-02 | 从 v0.6.0-preview 升级（模块随 App 升级） | 前置：上一版装过手动的 documents 模块，并导入过文档。没装过就跳到 A-03，本条记 S。按 1.3 启动新 App，终端 2 贴回 `dm` 和 `grep '^version' ~/.agent24/packages/documents/domain-os.yml` | 日志有 `[documents-module] upgraded to documents 0.2.0: installed …/.agent24/packages/documents`；版本是 `version: "0.2.0"`。「能力中心 → 工具 → 模块管理」里 documents 是 `v0.2.0`、「已挂载」。「文档」页里以前导入的文档都在，点开有文字、有原页面图。升级前 documents 若是停用的，升级后仍是「已停用」（升级不改启用状态） | |
+| A-03 | 首次安装（全新数据目录） | ⌘Q。终端 2 先贴回 `ls "$MK" 2>&1`，应是 `No such file`。卸载标记在 userData 里，不跟数据目录走：标记在的话，换了数据目录 App 也不会装，这条就判读不了。然后终端 1：`AGENT24_DATA_DIR=$HOME/agent24-uat/fresh /Applications/Agent24.app/Contents/MacOS/Agent24 2>&1 \| tee ~/agent24-uat/fresh.log`。终端 2：`grep documents-module ~/agent24-uat/fresh.log` | 日志有 `[documents-module] installed documents 0.2.0: installed …/agent24-uat/fresh/packages/documents`。「文档」页**不显示**「文档模块未安装」，能导入一份 PDF 并打开。做完 ⌘Q，`rm -rf ~/agent24-uat/fresh` | |
 | A-04 | 模块程序带正式签名 | 终端 2 贴回：`for f in agent24-documents agent24-documents-pdfkit; do codesign -dv /Applications/Agent24.app/Contents/Resources/documents-module/bin/$f 2>&1 \| grep -E 'TeamIdentifier\|flags'; done; codesign -dv /Applications/Agent24.app 2>&1 \| grep TeamIdentifier` | 两个模块程序的 TeamIdentifier 与 App 相同，flags 里有 `runtime`。App 安装模块前会检查这两点，不满足就不装 | |
 | A-05 | 已是最新时不重装 | 按 1.3 再启动一次，终端 2 贴回 `dm \| tail -3` | 这次**没有**新的 `upgraded` 或 `installed` 行，只有 `spawned pid`、`ready on port` | |
 | A-06 | 模块装不上不挡启动 | ⌘Q。终端 1：`mkdir -p ~/agent24-uat/ro && chmod 500 ~/agent24-uat/ro && AGENT24_DATA_DIR=$HOME/agent24-uat/ro-data A24_OS_PACKAGES=$HOME/agent24-uat/ro/packages /Applications/Agent24.app/Contents/MacOS/Agent24 2>&1 \| tee ~/agent24-uat/ro.log`。⚠️ 这是一整行，粘贴时别被折成两行 | App 照常打开。日志有一行 `[documents-module] os install failed (rc=…)`，后面照常 `spawned pid`、`ready on port`。「文档」页显示「文档模块未安装」和「到「模块管理」页安装（Agent24 自带这个模块），装好后重启 daemon。」。做完 ⌘Q，`chmod 700 ~/agent24-uat/ro && rm -rf ~/agent24-uat/ro ~/agent24-uat/ro-data` | |
 
 ## 3. B 组：模块管理（停用、卸载、装回）
 
-全程用默认数据目录，按 1.3 启动。卸载标记文件：
-
-```sh
-MK="$HOME/Library/Application Support/@agent24/desktop/documents-module.json"
-# 找不到时：find ~/Library/Application\ Support -maxdepth 3 -name documents-module.json
-```
+全程用默认数据目录，按 1.3 启动。`MK` 是 1.3 里定义的卸载标记位置。
 
 | # | 场景 | 操作 | 预期 | 结果 |
 |---|---|---|---|---|
@@ -128,14 +136,14 @@ MK="$HOME/Library/Application Support/@agent24/desktop/documents-module.json"
 
 | # | 场景 | 操作 | 预期 | 结果 |
 |---|---|---|---|---|
-| C-01 | 导入 PDF | 「文档」页点「导入文件（PDF、JPEG、PNG）」，选 `s01-02-en-epa-boil-water.pdf` | 先显示「上传 N%」「导入中」，然后变成「已导入」。列表里有这份文档，显示标题、格式和导入时间 | |
+| C-01 | 导入 PDF | 「文档」页点「导入文件（PDF、JPEG、PNG）」，选 `s01-02-en-epa-boil-water.pdf` | 最终状态是「已导入」，过程中可能闪过「上传 N%」「导入中」（本机导入很快，看不到也算对）。列表里有这份文档，显示标题、格式和导入时间 | |
 | C-02 | 读正文和原页面图 | 点开这份文档，翻到第 2、3 页，再在第 3 页点「下一页」 | 详情里有元信息（格式 · 大小 · 第 1 版 · 导入时间）和正文。正文上方是「原页面 · 第 1 页」和整页图。翻页时图和页码跟着变；在第 3 页「下一页」变灰；「上一页」能翻回 | |
-| C-03 | 换一份文档从第 1 页开始 | 停在第 3 页时，直接点列表里另一份文档 | 从第 1 页开始，不残留上一份的图 | |
+| C-03 | 换一份文档从第 1 页开始 | 先导入 `s01-03-zh-holiday-2026.pdf`（E-03 也要用）。打开 EPA 那份翻到第 3 页，直接点列表里的 s01-03 | 从第 1 页开始，不残留上一份的图 | |
 | C-04 | 扫描件靠 OCR 出字 | 导入 `s01-06-zh-holiday-2026-scan.jpg`，点开 | 导入成功，正文里有「春节」等文字（图片没有文本层，这些字只能来自 OCR）。刚导入时正文可能要等几秒才出来 | |
 | C-05 | PNG | 把扫描件转成 PNG（`sips -s format png ~/agent24-uat/samples/s01-06-zh-holiday-2026-scan.jpg --out ~/agent24-uat/scan.png`）再导入 | 同 C-04 | |
 | C-06 | 中文、带空格的文件名 | 把 `s01-01-zh-sh-fee-2025.pdf` 复制成 `工本费 通知.pdf` 再导入 | 导入成功，标题就是 `工本费 通知.pdf` | |
 | C-07 | 重复导入同一个文件 | 再导入一次 C-01 的同一个文件 | 不会多出一份重复的文档（拿回的是原来的导入） | |
-| C-08 | 取消、重试 | 导入一个较大的 PDF（几十 MB），在「上传」或「导入中」时点「取消」；再对已取消的导入点「重试」 | 取消后状态是「已取消」；重试后重新导入并成功。本机导入很快，抢不到时机就记 S，这部分由 `doc1-r6-accept.sh` 的 C1–C5 覆盖 | |
+| C-08 | 取消、重试 | 导入一个较大的 PDF（几十 MB）。上传完、状态是「排队中」或「导入中」时，点「取消」（上传阶段没有这个按钮）；再对已取消的导入点「重试」 | 取消后状态是「已取消」；重试后重新导入并成功。本机导入很快，抢不到时机就记 S。脚本覆盖的是取消一个已失败的导入再重试（`doc1-r6-accept.sh` 的 C3、C4）；取消运行中的导入只有模块测试覆盖 | |
 | C-09 | 关闭详情 | 点「关闭」 | 详情关闭，回到列表，页面上没有报错 | |
 
 ## 5. D 组：知识库设置
@@ -147,29 +155,38 @@ MK="$HOME/Library/Application Support/@agent24/desktop/documents-module.json"
 | D-01 | 地址校验 | 地址分别填 `http://localhost:<端口>/api/v1` 和 `http://192.168.x.x:<端口>/api/v1`（任意局域网地址），其余填对，点「保存」 | 都保存不了，提示「请检查地址（https，或本机 http://127.0.0.1）、知识库 ID 和密钥。」。只接受 https，或回环 IP 字面量的 http | |
 | D-02 | 正常保存 | 填 1.4 拿到的地址（`https://…/api/v1`，或 `http://127.0.0.1:<端口>/api/v1`）、知识库 ID、检索密钥，勾上「在主对话中使用知识库」，保存 | 显示「已保存。」，状态行「已开启：主对话可以检索这些知识库。」 | |
 | D-03 | 密钥不回显 | 离开设置页再回来 | 密钥框是空的，下面写「已保存密钥，留空则保持不变。」；不改密钥直接保存，之后问答照常可用 | |
-| D-04 | 没填全 | 清空知识库 ID，开关保持勾上，保存 | 状态行「已开启，但地址、知识库或密钥还没填全。」。做完填回去并保存 | |
+| D-04 | 没填全不覆盖原设置 | 清空知识库 ID，开关保持勾上，点「保存」；然后离开设置页再回来 | 保存不了，提示「请检查地址（https，或本机 http://127.0.0.1）、知识库 ID 和密钥。」。回来后知识库 ID 还是原来的，状态行仍是「已开启：主对话可以检索这些知识库。」，原设置没被改掉 | |
 
 ## 6. E 组：主对话里的知识库问答（要模型和 WeKnora）
 
 前置：D-02 已保存、开关开着，App 按 1.3 启动（App 自己起的 daemon）。每题开一个「新对话」。
 
+**怎么判**：回答正文是模型写的，模型可能凭常识答对，也可能自己写出「来源」两个字。所以判断知识库**有没有用上**，只看回答**下方**那一行小字，那是 App 按这一轮实际读回了什么生成的。知识库开着且生效时，每条回答下方都有其中一行：
+- 「经知识库检索回答（agent 模式）」：这一轮检索了，并读回了原文。
+- 「⚠️ 这次回答没有检索知识库，不是依据知识库的内容。」
+- 「⚠️ 这次检索了知识库，但没有读回原文，回答没有经过知识库核对。」
+
+另外两种情况：
+- 下方可能还多一行「⚠️ 以下来源本次没有读到，不能当作来源：…」，说明正文里列的这些来源这一轮没读过。
+- 整轮失败时，回答本身就是「⚠️ 知识库回答失败：…」。
+
 | # | 场景 | 操作 | 预期 | 结果 |
 |---|---|---|---|---|
-| E-01 | 中文问答带来源 | 问「上海居民身份证到期换领的工本费是多少？」 | 答 20 元/证。回答末尾有「来源」，列出 s01-01 的条目；回答下方有「经知识库检索回答（agent 模式）」（Answered with Knowledge (agent mode)） | |
-| E-02 | 英文原题 | 问「Can the tap water be drunk during the boil water notice?」 | 答要先煮沸（煮沸 3 分钟），来源是 `s01-02-en-epa-boil-water.pdf` | |
-| E-03 | 答案能在原文里核对 | 问「2026 年元旦放假是哪几天？」，再到「文档」页打开 `s01-03-zh-holiday-2026.pdf` 对照 | 回答带来源 s01-03，日期与原文一致 | |
+| E-01 | 中文问答带来源 | 问「上海居民身份证到期换领的工本费是多少？」 | 下方是「经知识库检索回答（agent 模式）」（Answered with Knowledge (agent mode)），没有「以下来源本次没有读到」。正文答 20 元/证，末尾「来源」列出 s01-01 | |
+| E-02 | 英文原题 | 问「Can the tap water be drunk during the boil water notice?」 | 下方是「经知识库检索回答」。正文说要先煮沸（煮沸 3 分钟），来源是 `s01-02-en-epa-boil-water.pdf` | |
+| E-03 | 答案能在原文里核对 | 问「2026 年元旦放假是哪几天？」，再到「文档」页打开 C-03 导入的 `s01-03-zh-holiday-2026.pdf` 对照 | 下方是「经知识库检索回答」，来源是 s01-03，日期与原文一致 | |
 | E-04 | 新对话不带上一段 | E-01 之后点「新对话」，问「我上一个问题问的是什么？」 | 回答说没有上一个问题，或者不知道；不会提到工本费（上一段的上下文没有带过来） | |
-| E-05 | 只有读回了原文才标注 | 新对话里问一句和样本无关的话，比如「用一句话介绍你自己」 | 知识库开着时，每条回答下方都有一行标注。没检索时是「⚠️ 这次回答没有检索知识库，不是依据知识库的内容。」；检索了但没读回原文时是「⚠️ 这次检索了知识库，但没有读回原文，回答没有经过知识库核对。」。只有读回了原文，才显示「经知识库检索回答（agent 模式）」，这时回答末尾有来源。**不能**出现没有来源却标着「经知识库检索回答」的回答 | |
+| E-05 | 标注跟着实际情况走 | 新对话里问一句和样本无关的话，比如「用一句话介绍你自己」 | 下方有上面三行里的一行，大概率是「⚠️ 这次回答没有检索知识库…」。模型若真去检索并读回了原文，显示「经知识库检索回答」也对。**不能**一行标注都没有 | |
 | E-06 | 不再出现 500 | 新对话里再问一次 E-01 | 正常回答，没有 500「no user query」 | |
-| E-07 | 关闭跨重启仍关闭 | 设置里取消「在主对话中使用知识库」并保存；⌘Q，按 1.3 重新启动，再问 E-01 | 设置页仍是「已关闭：主对话不使用知识库。」。回答没有来源，也没有「经知识库检索回答」。做完勾回来并保存 | |
+| E-07 | 关闭跨重启仍关闭 | 设置里取消「在主对话中使用知识库」并保存；⌘Q，按 1.3 重新启动，再问 E-01 | 设置页仍是「已关闭：主对话不使用知识库。」。回答下方没有任何知识库标注行：既没有「经知识库检索回答」，也没有 ⚠️ 提示。做完勾回来并保存 | |
 
 ## 7. W 组：WeKnora 侧的权限（要模型和 WeKnora）
 
 | # | 场景 | 操作 | 预期 | 结果 |
 |---|---|---|---|---|
-| W-01 | 密钥只对它的库有效 | 设置里把知识库 ID 换成另一个库的 ID，密钥不变，保存。新对话问 E-01 | 答不出 20 元，没有来自另一个库的来源。回答下方**不出现**「经知识库检索回答」，会出现一条 ⚠️ 提示。做完把 ID 改回来 | |
-| W-02 | 密钥失效 | 在设置里把检索密钥改错一个字符并保存，新对话问 E-01 | 同 W-01：没有来源，也没有「经知识库检索回答」，有 ⚠️ 提示，App 不会报错退出。做完换回有效密钥 | |
-| W-03 | 知识库服务停了 | 停掉 WeKnora（或断开端口转发），新对话问 E-01；然后恢复，再问一次 | 停掉时回答下方有 ⚠️ 提示（未检索到或知识库回答失败），不会编出带来源的答案；恢复后再问，正常带来源 | |
+| W-01 | 密钥只对它的库有效 | 设置里把知识库 ID 换成另一个库的 ID，密钥不变，保存。新对话问 E-01 | 下方**不是**「经知识库检索回答」，而是一条 ⚠️ 提示；或者整轮是「⚠️ 知识库回答失败：…」。正文可能凭常识答出 20 元，这不算失败，判定只看下方这一行。做完把 ID 改回来 | |
+| W-02 | 密钥失效 | 在设置里把检索密钥改错一个字符并保存，新对话问 E-01 | 同 W-01，App 不会报错退出。做完换回有效密钥 | |
+| W-03 | 知识库服务停了 | 停掉 WeKnora（或断开端口转发），新对话问 E-01；然后恢复，再开新对话问一次 | 停掉时同 W-01；恢复后下方是「经知识库检索回答」 | |
 
 W 组的细节（断线、超时、取消、内容变化、提示注入、撤权、关闭后在途调用作废）由 `kb-m5-accept.py` 的 N4–N10、E7 覆盖（第 8 节），这里只看用户能察觉的结果。
 
@@ -177,19 +194,20 @@ W 组的细节（断线、超时、取消、内容变化、提示注入、撤权
 
 | # | 场景 | 操作 | 预期 | 结果 |
 |---|---|---|---|---|
-| F-01 | 接管命令行起的 daemon，知识库生效 | ⌘Q。终端 2：`agent24 daemon start; agent24 daemon status`，记下 pid。按 1.3 启动 App，终端 2 贴回 `dm \| tail -3; agent24 daemon status; ps -p <旧 pid> \|\| echo old-gone`。然后新对话问 E-01 | 日志有 `taking over CLI daemon (pid <旧 pid>, port …) so Knowledge can work`，随后 `spawned pid`、`ready on port`；status 显示新的 pid；打印 `old-gone`。问答带来源和「经知识库检索回答」，**不出现**「知识库已开启但当前未生效」 | |
+| F-01 | 接管命令行起的 daemon，知识库生效 | ⌘Q。终端 2：`agent24 daemon start; agent24 daemon status`，记下 pid。按 1.3 启动 App，终端 2 贴回 `dm \| tail -3; agent24 daemon status; ps -p <旧 pid> \|\| echo old-gone`。然后新对话问 E-01 | 日志有 `taking over CLI daemon (pid <旧 pid>, port …) so Knowledge can work`，随后 `spawned pid`、`ready on port`；status 显示新的 pid；打印 `old-gone`。回答下方是「经知识库检索回答」，**不出现**「知识库已开启但当前未生效」 | |
 | F-02 | App 开着时命令行停不了它 | 终端 2：`agent24 daemon stop; echo rc=$?` | 报 `host authority unavailable`，rc 不为 0，daemon 仍在跑。这是预期 | |
 | F-03 | 退出 App，daemon 跟着退 | ⌘Q，等 5 秒。终端 2：`agent24 daemon status; ls ~/.agent24/daemon.json 2>&1` | `not running`、`No such file` | |
-| F-04 | 装了服务的用户不被接管 | 终端 2：`agent24 service install; sleep 3; agent24 daemon status`。按 1.3 启动 App，鼠标悬停菜单栏图标；新对话问 E-01 | 菜单栏提示里有「外部 daemon · pid …」，并说明 `agent24 service install` 起的 daemon 上知识库不生效、要先 `agent24 service uninstall`。日志有 `reusing external daemon`，**没有** `taking over`。回答是普通回答，下方有「⚠️ 知识库已开启但当前未生效，这次回答没有使用知识库。如果 daemon 是 `agent24 service install` 装的，请运行 `agent24 service uninstall` 后重新打开 Agent24…」 | |
-| F-05 | 卸掉服务再打开就接管 | ⌘Q。终端 2：`agent24 service uninstall; ls ~/Library/LaunchAgents/ai.auraai.agent24.plist 2>&1`。按 1.3 启动，问 E-01 | plist 已不在。日志是 `taking over …`（服务卸掉时 daemon 还在跑）或直接 `spawned pid`。问答带来源，没有「未生效」 | |
+| F-04 | 装了服务的用户不被接管 | 终端 2：`agent24 service install; sleep 3; agent24 daemon status`。按 1.3 启动 App，终端 2 贴回 `dm`；鼠标悬停菜单栏图标；新对话问 E-01 | 菜单栏提示里有「外部 daemon · pid …」，并说明 `agent24 service install` 起的 daemon 上知识库不生效、要先 `agent24 service uninstall`。这次启动的日志有 `reusing external daemon`，**没有** `taking over`。回答是普通回答，下方有「⚠️ 知识库已开启但当前未生效，这次回答没有使用知识库。如果 daemon 是 `agent24 service install` 装的，请运行 `agent24 service uninstall` 后重新打开 Agent24…」 | |
+| F-05 | 卸掉服务再打开就接管 | ⌘Q。终端 2：`agent24 service uninstall; ls ~/Library/LaunchAgents/ai.auraai.agent24.plist 2>&1`。按 1.3 启动，问 E-01 | plist 已不在。日志是 `taking over …`（服务卸掉时 daemon 还在跑）或直接 `spawned pid`。回答下方是「经知识库检索回答」，没有「未生效」 | |
 
 ## 9. G 组：跨线联合（两条线第一次在同一个包里）
 
 | # | 场景 | 操作 | 预期 | 结果 |
 |---|---|---|---|---|
-| G-01 | 命令行 daemon 在跑时第一次启动新 App：模块安装和接管同时发生 | 前置：B-04 卸掉 documents 后清掉标记（`rm "$MK"`），或者用 A-02 那种还没升级的数据。⌘Q。终端 2：`agent24 daemon start`。按 1.3 启动 App，贴回 `dm` 的最后 5 行 | 日志里既有 `[documents-module] installed …`（或 `upgraded to …`），也有 `taking over CLI daemon …`，最后是 `spawned pid`、`ready on port`。「模块管理」里 documents「已挂载」，「文档」页可用；问 E-01 带来源 | |
-| G-02 | 装了服务的用户卸载模块 | 在 F-04 的状态下（服务在跑、App 复用外部 daemon），「模块管理」点 documents 的「卸载」 | 不执行卸载，提示「daemon 是在 Agent24 之外启动的。请先停止它（agent24 daemon stop），重试，再启动它。」。做完 `agent24 service uninstall` 收尾 | |
-| G-03 | 文档模块停用，不影响知识库 | 停用 documents（B-01），新对话问 E-01；然后重新启用 | 知识库问答照常带来源 | |
+| G-01 | 命令行 daemon 在跑时第一次启动新 App：模块安装和接管同时发生 | 前置：B-04 卸掉 documents 后清掉标记（`rm "$MK"`），或者用 A-02 那种还没升级的数据。⌘Q。终端 2：`agent24 daemon start`。按 1.3 启动 App，贴回 `dm` 的最后 5 行 | 日志里既有 `[documents-module] installed …`（或 `upgraded to …`），也有 `taking over CLI daemon …`，最后是 `spawned pid`、`ready on port`。「模块管理」里 documents「已挂载」，「文档」页可用；问 E-01，回答下方是「经知识库检索回答」 | |
+| G-02 | 装了服务的用户卸载模块 | ⌘Q。终端 2：`agent24 service install`。按 1.3 启动 App（会复用外部 daemon，同 F-04）。「模块管理」点 documents 的「卸载」并确认，终端 2 贴回 `ls ~/.agent24/packages; cat "$MK"` | 卸载照常执行，确认框同 B-04。App 不会去停外部 daemon，所以 documents 一行显示「已卸载，重启 daemon 后生效」，鼠标悬停提示「daemon 是在 Agent24 之外启动的，请重启它：…」。`packages` 里没有 `documents`，标记文件已写 | |
+| G-02b | 收尾：卸掉服务、装回模块 | ⌘Q。终端 2：`agent24 service uninstall`。按 1.3 启动，「模块管理」点「安装」并确认 | 启动后 documents 是「未安装…」（标记生效，不自动装回）；点「安装」后回到「已挂载」 | |
+| G-03 | 文档模块停用，不影响知识库 | 停用 documents（B-01），新对话问 E-01；然后重新启用 | 回答下方照常是「经知识库检索回答」 | |
 | G-04 | 同一会话里来回用 | 在「文档」页导入一份 PDF 并打开，切到助手问 E-02，再回「文档」页翻页 | 全程没有报错弹窗；两边各自正常 | |
 
 ## 10. 自动化用例（发布负责人在 release head 上跑，jason 可选）
@@ -198,9 +216,17 @@ W 组的细节（断线、超时、取消、内容变化、提示注入、撤权
 
 | 脚本 | 覆盖 | 用例文档 | 最近一次结果 |
 |---|---|---|---|
-| `scripts/doc1-r6-accept.sh --bin <release 二进制> --old <上一版二进制> --next` | 文档 CLI 与桌面共用的导入、读取、取消、重试、查找、渲染、抽取，以及升级和退回 | `docs/documenting/acceptance/R6-RELEASE-USECASES.md` | 7f8c41e5：60 PASS、1 KNOWN（T1，#705）、0 FAIL（没带 `--old`） |
-| `python3 -I scripts/kb-r1-accept.py --old … --new …` | 桌面托管 daemon 的鉴权、knowledge binding 的激活与停用、非宿主调用被拒 | `docs/agent/KB-R1-ACCEPTANCE.md` | 7f8c41e5：21 PASS、4 FAIL，4 条都是已知项（W2r、W3r、W5r 的反面对照已过时，W4b 来自 #1497） |
-| `python3 -I scripts/kb-m5-accept.py --bin … --weknora …` | 样本库端到端：检索、读回、引用、同源例外，以及断线、超时、取消、内容变化、提示注入、在途关闭、撤权、关闭跨重启 | `docs/agent/KB-M5-ACCEPTANCE.md` | #1561 head 757ecc9e：18/18 PASS（stub 模型） |
+| `scripts/doc1-r6-accept.sh --bin <目录> --old <上一版的目录> --next` | 文档 CLI 与桌面共用的导入、读取、取消、重试、查找、渲染、抽取，以及升级和退回 | `docs/documenting/acceptance/R6-RELEASE-USECASES.md` | 7f8c41e5：60 PASS、1 KNOWN（T1，#705）、0 FAIL（没带 `--old`） |
+| `python3 -I scripts/kb-r1-accept.py --old <目录> --new <目录>` | 桌面托管 daemon 的鉴权、knowledge binding 的激活与停用、非宿主调用被拒 | `docs/agent/KB-R1-ACCEPTANCE.md` | 7f8c41e5：21 PASS、4 FAIL，4 条都是已知项（W2r、W3r、W5r 的反面对照已过时，W4b 来自 #1497） |
+| `python3 -I scripts/kb-m5-accept.py --bin <目录> --weknora <地址>` | 样本库端到端：检索、读回、引用、同源例外，以及断线、超时、取消、内容变化、提示注入、在途关闭、撤权、关闭跨重启 | `docs/agent/KB-M5-ACCEPTANCE.md` | #1561 head 757ecc9e：18/18 PASS（stub 模型） |
+
+参数里的「目录」是一个装着 `agent24`、`agent24d`、`agent24-documents` 三个程序的目录（kb-m5 只要 `agent24d`）。用包内的二进制时，三个程序在 App 里分在两处，要先拷到一个目录：
+
+```sh
+mkdir -p ~/agent24-uat/bin
+cp /Applications/Agent24.app/Contents/Resources/backend/agent24 /Applications/Agent24.app/Contents/Resources/backend/agent24d ~/agent24-uat/bin/
+cp /Applications/Agent24.app/Contents/Resources/documents-module/bin/agent24-documents ~/agent24-uat/bin/
+```
 
 **要求**：
 - 发布时用 release head 和包内的二进制重跑这三个脚本。
@@ -215,9 +241,8 @@ W 组的细节（断线、超时、取消、内容变化、提示注入、撤权
 - 命令行 `agent24 daemon stop` 停不了 App 起的或接管后的 daemon（F-02）；退出 App 时 daemon 跟着退出（F-03）。
 - 用 `agent24 service install` 装了服务的用户，知识库不生效，要 `service uninstall` 后重开 App（F-04）。
 - 卸载、安装 documents 时，App 会先停自己起的 daemon，跑完再拉起，中间几秒连不上。
-- 换包（升级、重新安装）会撤销 documents 模块的授权。
+- 升级 documents，或者在模块管理页重新安装，会撤销它的授权。重装同一个包、模块文件没变时不撤销。
 - 详情页：中间某页渲染失败会挡住后面的页（正常文档碰不到）；没有缩放、标注、选区。
-- 模块未安装时「文档」页仍显示「导入文件」按钮（A-06 时能看到），点了会失败。不阻塞。
 - 换地址或换知识库后，桌面会开新会话；daemon 重启后，旧会话第一次用知识库时会换成新会话，上下文不带过去。用过知识库的会话不能再调 `http_fetch` 这类外发工具。
 
 ## 12. 不在本次验收范围
@@ -240,9 +265,14 @@ D 组：D-01 _ D-02 _ D-03 _ D-04 _
 E 组：E-01 _ E-02 _ E-03 _ E-04 _ E-05 _ E-06 _ E-07 _
 W 组：W-01 _ W-02 _ W-03 _
 F 组：F-01 _ F-02 _ F-03 _ F-04 _ F-05 _
-G 组：G-01 _ G-02 _ G-03 _ G-04 _
+G 组：G-01 _ G-02 _ G-02b _ G-03 _ G-04 _
 ❌ 项与截图：
 S 项与原因：
 ```
 
-测完把 `~/agent24-backup-uat` 拷回 `~/.agent24` 即可回到测前状态（先 ⌘Q 退出 App，并确认 `agent24 daemon status` 是 `not running`）。
+**回到测前状态**：先 ⌘Q 退出 App，确认 `agent24 daemon status` 是 `not running`，然后把 1.1 的两份备份拷回原处：
+
+```sh
+rm -rf ~/.agent24 && cp -R ~/agent24-backup-uat ~/.agent24
+rm -rf "$HOME/Library/Application Support/@agent24/desktop" && cp -R ~/agent24-backup-uat-userdata "$HOME/Library/Application Support/@agent24/desktop"
+```
