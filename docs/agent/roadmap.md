@@ -1,5 +1,7 @@
 # Agent24 Roadmap — Milestone → Feature
 
+> **历史，现行跟踪见 [docs/tracking/](../tracking/2026-11-05/MILESTONES-AND-TASKS.md)**（2026-11-05 起，三份带日期的跟踪文档；最新日期目录为准）。本文不再更新，下文「唯一权威」等自述作废。
+
 ## 🧭 2026-10-03：Open Design 集成线 M10 已落地 → 下一阶段
 
 M10（Open Design × Agent24 集成）已于 2026-10-03 经 #660 落地 main（merge commit `ce861e4`），设计记录经 #662 补落。
