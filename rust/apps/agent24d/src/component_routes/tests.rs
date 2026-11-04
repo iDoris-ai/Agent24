@@ -806,6 +806,111 @@ async fn a_package_named_mcp_files_does_not_share_its_id_with_the_mcp_server() {
     );
 }
 
+/// Component ids are unique across every source at once: the five builtins, an
+/// attached module, domain packages and MCP servers. Each collision below is a
+/// different pair: attach/os (`agentear`), os/mcp (`mcp-files`), an os row that
+/// sits on the fallback id the MCP row would take, and a package named like a
+/// builtin (which is not listed at all).
+#[tokio::test]
+async fn component_ids_are_unique_across_builtin_attach_os_and_mcp() {
+    let mut state = ear().await.state;
+    let taken = crate::mcp::fallback_component_id("mcp-files");
+    state.os_reports = Arc::new(vec![
+        os_report(
+            "agentear",
+            MountOutcome::Mounted,
+            d9("agentear", false, "pkg-ear", &[]),
+        ),
+        os_report(
+            "mcp-files",
+            MountOutcome::Mounted,
+            d9("mcp-files", false, "pkg-files", &[]),
+        ),
+        os_report(
+            &taken,
+            MountOutcome::Mounted,
+            d9(&taken, false, "pkg-taken", &[]),
+        ),
+        os_report(
+            "idoris",
+            MountOutcome::Mounted,
+            d9("idoris", false, "pkg-idoris", &[]),
+        ),
+        os_report(
+            "knowledge",
+            MountOutcome::Mounted,
+            d9("knowledge", false, "pkg-know", &[]),
+        ),
+    ]);
+    state.mcp_roster = Arc::new(crate::mcp::McpRoster::from_records(vec![
+        crate::mcp::McpRecord {
+            server: "files".to_owned(),
+            id: "mcp-files".to_owned(),
+            state: ComponentState::Ready,
+            reason: None,
+            capability_id: Some("mcp-files".to_owned()),
+            tools: Vec::new(),
+            protocol_version: None,
+        },
+    ]));
+    let app = build_router(state);
+    let (status, body) = call(&app, Method::GET, GET, Some("testtoken"), "").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<String> = body["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap().to_owned())
+        .collect();
+    let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+    assert_eq!(ids.len(), unique.len(), "duplicate component ids: {ids:?}");
+    // The sources are all present, so the uniqueness above is not vacuous.
+    for id in [
+        "idoris",
+        "hyphae",
+        "documents",
+        "knowledge",
+        "open-design",
+        "agentear",
+        "mcp-files",
+        taken.as_str(),
+    ] {
+        assert!(ids.iter().any(|i| i == id), "{id} missing from {ids:?}");
+    }
+    // 5 builtins + attach + 3 os rows (the two builtin-named packages are
+    // dropped) + 1 mcp row = 10. Nothing was swallowed by the dedupe.
+    assert_eq!(ids.len(), 10, "{ids:?}");
+    assert_eq!(find(&body, "agentear")["form"], "attach");
+}
+
+/// A package refused for a reserved capability id is `failed` with reason
+/// `reserved_capability_id` and lists no provider; another refusal keeps `refused`.
+#[tokio::test]
+async fn a_reserved_capability_refusal_is_failed_with_its_own_reason() {
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let bad = d9("squatter", false, "model-gateway", &[]);
+    let why = bad.reserved_refusal().unwrap();
+    state.os_reports = Arc::new(vec![
+        os_report(
+            "squatter",
+            MountOutcome::Refused(why),
+            bad.without_provides(),
+        ),
+        os_report(
+            "other",
+            MountOutcome::Refused("duplicate".into()),
+            d9("other", false, "other-tasks", &[]),
+        ),
+    ]);
+    let app = build_router(state);
+    let (_, body) = call(&app, Method::GET, GET, Some(&host), "").await;
+    let squatter = find(&body, "squatter");
+    assert_eq!(squatter["state"], "failed");
+    assert_eq!(squatter["reason"], "reserved_capability_id");
+    assert_eq!(squatter["provides"], json!([]));
+    assert_eq!(find(&body, "other")["reason"], "refused");
+}
+
 #[tokio::test]
 async fn os_and_mcp_detail_stays_off_the_redacted_view() {
     let (mut state, host, _) = server_tests::capability_state().await;

@@ -21,6 +21,8 @@ Hyphae 的锁只带 id，没有三语名。上表的中文、英文、泰文是�
 
 `GET /api/v1/components` 给每个非内置模块一条 resident 记录。`detail.binding` 是 `in_process` 或 `package`（只给 host）。进程内模块没有自己的进程：挂上之后是 `ready`。进程外模块跟监管进程的状态走，和 Documents 同一张 D5 映射；用户关掉的是 `stopped`，原因 `disabled`。
 
+保留 id：`domain-os.yml` 的 `provides[].id` 不能是 `mcp-*`、内置组件 id，也不能是上表里提供方不是本模块的 id（`documents` 只有名为 `documents` 的模块能声明）。违反的模块在挂载时被拒绝，`/api/v1/components` 里是 `failed`，`reason` 为 `reserved_capability_id`，不列任何 `provides`。禁用的包同样被拒绝。代码里的对照表是 `component_manifest::REGISTERED_PROVIDERS`，由测试 `registered_providers_match_registry_md` 与本表的「提供方」列对账。
+
 内置 id（`idoris`、`hyphae`、`documents`、`knowledge`、`open-design`）不从模块报告再列一次。Documents 的条目仍由它自己的映射负责。
 
 ## MCP

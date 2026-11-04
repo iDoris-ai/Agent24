@@ -550,7 +550,12 @@ fn os_module_items(state: &AppState) -> Vec<Item> {
                 .module_status
                 .get(&report.name)
                 .map(|rx| rx.borrow().clone());
-            let (mapped, reason, message) = os_mapped(&report.outcome, live);
+            let (mapped, mut reason, message) = os_mapped(&report.outcome, live);
+            if matches!(&report.outcome, MountOutcome::Refused(why)
+                if why.starts_with(crate::component_manifest::RESERVED_WHY))
+            {
+                reason = Some("reserved_capability_id");
+            }
             let d9 = report.d9.as_ref();
             let provides = d9
                 .map(|d| {

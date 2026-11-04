@@ -6,7 +6,7 @@
 //! (§4.1: "可多次 accept").
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use agent24_os_proto::attach_mux::serve_attached;
@@ -206,7 +206,17 @@ pub(crate) async fn handle_connection(
         return;
     }
 
-    let claim = match accept_attached(&frame, &|name| registry.expectation(name)) {
+    // The token_id the pure check judged against. A refusal is recorded against
+    // THIS registration only, so a rotation that lands after the check cannot
+    // move the mismatch onto the new one (ADR-038 §3 case 2, #1572 L1).
+    let used_token = std::sync::Mutex::new(None::<String>);
+    let claim = match accept_attached(&frame, &|name| {
+        let expectation = registry.expectation(name);
+        if let Some(e) = &expectation {
+            *used_token.lock().unwrap_or_else(PoisonError::into_inner) = Some(e.token_id.clone());
+        }
+        expectation
+    }) {
         Ok(claim) => claim,
         Err(refusal) => {
             // Re-checked after the lookup too: `revoke_all` can land between
@@ -219,9 +229,13 @@ pub(crate) async fn handle_connection(
             if !registry.is_closed()
                 && let HandshakeError::VersionMismatch(mismatch) = &refusal
                 && let Some(name) = claimed_module(&frame)
+                && let Some(token_id) = used_token
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take()
             {
                 let (expected, actual) = contract_ends(mismatch);
-                registry.note_contract_mismatch(&name, &expected, &actual);
+                registry.note_contract_mismatch(&name, &token_id, &expected, &actual);
             }
             let refusal = if registry.is_closed() {
                 HandshakeError::ShuttingDown

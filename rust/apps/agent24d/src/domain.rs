@@ -1252,6 +1252,22 @@ pub async fn mount_all(
             );
             continue;
         }
+        // A user-installed manifest may not declare a reserved capability id
+        // (docs/capabilities/REGISTRY.md). Admission, like the checks above: a
+        // disabled package is refused too, so "disabled" cannot hide it.
+        if let Some(why) = catalogue_d9
+            .as_ref()
+            .and_then(crate::component_manifest::OsD9::reserved_refusal)
+        {
+            refuse(
+                why,
+                catalogue_d9
+                    .clone()
+                    .map(crate::component_manifest::OsD9::without_provides),
+                &mut reports,
+            );
+            continue;
+        }
 
         // POLICY: an unreadable registry, then the user's switch. Neither
         // CONSTRUCTS anything — which is what lets a user switch off a module whose
@@ -1386,7 +1402,19 @@ pub async fn mount_all(
                 "a compiled-in module's manifest declares an out-of-process \
                  provider; out-of-process modules are installed as packages"
                     .to_owned(),
-                manifest_d9,
+                manifest_d9.clone(),
+                &mut reports,
+            );
+            continue;
+        }
+
+        if let Some(why) = manifest_d9
+            .as_ref()
+            .and_then(crate::component_manifest::OsD9::reserved_refusal)
+        {
+            refuse(
+                why,
+                manifest_d9.map(crate::component_manifest::OsD9::without_provides),
                 &mut reports,
             );
             continue;
@@ -3391,6 +3419,125 @@ raise SystemExit(3)
         assert_eq!(d9.provides[0].id, "demo-tasks");
         assert!(d9.provides[0].tools.is_empty());
         assert_eq!(d9.requires_kernel, vec!["events".to_owned()]);
+    }
+
+    /// `domain-os.yml` is user-installed, so its `provides` cannot take an id the
+    /// registry or a builtin owns. Refused (not degraded, not mounted), also when
+    /// the user switched the package off, and it lists no capability.
+    #[tokio::test]
+    async fn a_package_declaring_a_reserved_capability_id_is_refused() {
+        for (id, enabled) in [
+            ("model-gateway", true),
+            ("nostr-dm", true),
+            ("mcp-files", true),
+            ("knowledge", true),
+            ("documents", true),
+            ("model-gateway", false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let packages = tmp.path().join("packages");
+            write_package(&packages, "remote");
+            let yml = packages.join("remote").join("domain-os.yml");
+            let mut text = std::fs::read_to_string(&yml).unwrap();
+            text.push_str(&format!("provides:\n  - id: {id}\n"));
+            std::fs::write(&yml, text).unwrap();
+            let hub = crate::events::EventsHub::default();
+            let cfg = config_from(&format!(
+                r#"{{"domainOs": {{"remote": {{"enabled": {enabled}}}}}}}"#
+            ));
+            let (app, reports, _) = mount_all(
+                &discovered(&packages),
+                &tmp.path().join("os"),
+                &hub,
+                Ok(&cfg),
+                &no_models(),
+                None,
+                Err("no process host in this test"),
+                &test_approval_broker(&hub).await,
+                test_callback_deps().await,
+            )
+            .await;
+            match &reports[0].outcome {
+                MountOutcome::Refused(why) => {
+                    assert!(why.starts_with("reserved_capability_id"), "{id}: {why}");
+                }
+                other => panic!("{id} (enabled={enabled}): expected Refused, got {other:?}"),
+            }
+            assert!(reports[0].d9.as_ref().unwrap().provides.is_empty(), "{id}");
+            assert_eq!(
+                get(&app, "/api/v1/remote/hi").await.status(),
+                StatusCode::NOT_FOUND,
+                "{id}: a refused package has no routes"
+            );
+        }
+    }
+
+    /// Positive control for the test above: an ordinary id still mounts, so the
+    /// refusal is about the id and not about `provides` in general.
+    #[tokio::test]
+    async fn a_package_declaring_an_ordinary_capability_id_is_not_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "remote");
+        let yml = packages.join("remote").join("domain-os.yml");
+        let mut text = std::fs::read_to_string(&yml).unwrap();
+        text.push_str("provides:\n  - id: remote-ping\n");
+        std::fs::write(&yml, text).unwrap();
+        let hub = crate::events::EventsHub::default();
+        let cfg = config_from(r#"{"domainOs": {"remote": {"enabled": false}}}"#);
+        let (_, reports, _) = mount_all(
+            &discovered(&packages),
+            &tmp.path().join("os"),
+            &hub,
+            Ok(&cfg),
+            &no_models(),
+            None,
+            Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        assert_eq!(reports[0].outcome, MountOutcome::Disabled);
+        assert_eq!(reports[0].d9.as_ref().unwrap().provides.len(), 1);
+    }
+
+    /// The same rule for a compiled-in module, found after construction. And the
+    /// registry's own provider is allowed its id: `documents` declares `documents`.
+    #[tokio::test]
+    async fn an_in_process_module_declaring_a_reserved_capability_id_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let bad = FakeModule::from_yaml(
+            &format!(
+                "{}\nprovides:\n  - id: model-gateway\n",
+                manifest_yaml("demo", "in_process_crate")
+            ),
+            false,
+        );
+        let (_, reports) = mount(&[entry(bad.clone())], tmp.path(), &hub).await;
+        match &reports[0].outcome {
+            MountOutcome::Refused(why) => {
+                assert!(why.starts_with("reserved_capability_id"), "{why}")
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert!(reports[0].d9.as_ref().unwrap().provides.is_empty());
+        assert!(bad.opened().is_none(), "a refused module opens no store");
+
+        let own = FakeModule::from_yaml(
+            &format!(
+                "{}\nprovides:\n  - id: documents\n",
+                manifest_yaml("documents", "in_process_crate")
+            ),
+            false,
+        );
+        let tmp2 = tempfile::tempdir().unwrap();
+        let (_, reports) = mount(&[entry(own)], tmp2.path(), &hub).await;
+        assert!(
+            matches!(reports[0].outcome, MountOutcome::Mounted),
+            "{:?}",
+            reports[0].outcome
+        );
     }
 
     /// A daemon that cannot start processes still mounts everything else; each
