@@ -4,6 +4,7 @@
 
 - 状态：**提议**（2026-11-05，草案；待评审后接受）
 - 编号：ADR-044，ADR 索引是唯一发号处（[架构优化方案](../tracking/2026-11-04/ARCH-OPTIMIZATION-PLAN.md) 的 S0-3 / A5）。`docs/research/deepseek-superagent/SUPERAGENT-EVOLUTION-2026-11-01-codex-astra.md:109,145` 里另有一份叫「ADR-044」的 Codex 稿，按 S0-3 改记为 `DRAFT-C04x`，与本篇无关。
+- 依赖：本篇的编号登记和 ADR 索引订正依赖 S0-3 PR（分支 `docs/p0-adr-status-numbering`）合入；在它合入前，`docs/adr/README.md` 里没有 ADR-044 一行。
 - 上位：ADR-037 决策 1、6（`docs/decision.md:1605-1612`）；[ADR-038](ADR-038-component-contract-v1.md)；[ADR-039](ADR-039-concept-model.md)；[ADR-041](ADR-041-inbound-events-admission-and-work-items.md)
 - 吸收：[COMM-HYPHAE](../design/COMM-HYPHAE.md) §0 的已定决策；[F4 Nostr 通道](../specs/F4-nostr-channel.md) 的已定决策；[COMM-FRIENDS](../design/COMM-FRIENDS.md) 的已拍板决策。合入后这三份改称「实施说明」，决策以本篇为准，冲突时以本篇为准。
 - 依据：R3 §3.A（分析报告 `docs/architecture/review-2026-11-03/R3-ADR-AND-DOCS.md`，在分支 `docs/arch-review-r3-adr-docs`，尚未合入 main）。本篇引用的 C01–C31、X1–X19 是 R3 的编号。R3 的行号取自它的基线提交 `9865d7a0`；我对 main（`f818b0bf`）抽查了标 **（main 已核）** 的几处，其余行号以 R3 为准，评审时请以 main 为准。
@@ -45,7 +46,7 @@
 **X7 结论（jason 2026-11-04）：agent 的 Nostr 身份，以通讯专用目录 `<data>/comm/hyphae-home` 里的钥匙库为准。旧的 nostr-bridge 不再是身份来源，以后并入 comm。**
 
 - 专用 HOME `<state_dir>/comm/hyphae-home/`。旧 `~/.hyphae` 只能经 `agent24 comm import --from` 显式导入，用户确认后**复制**（`daemon.rs` 设 HOME 和 cwd；`import.rs`）。
-- 默认身份只有一个来源：`identity list` 里 `default:true` 的一项。Hyphae 的文件是消息的唯一来源，comm 不另存消息；Agent24 只存关系状态。
+- 默认身份只有一个来源：`identity list` 里 `default:true` 的一项（`daemon.rs:698`、`router.rs:829` **（main 已核）**）。Hyphae 的文件是消息的唯一来源，comm 不另存消息；Agent24 只存关系状态。
 - nostr-bridge 过去不覆盖 HOME（`speaker.ts` 里 grep `HOME` 零命中 **（main 已核）**），实际用哪份 HOME 取决于运行环境。决定之后：**身份只认 comm 的钥匙库**；桥在并入之前不得自己生成或持有另一套身份，需要身份时只能从 comm 取（实现见 §3 待办 T2）。
 - 私钥备份和恢复用 NIP-49 `ncryptsec`；备份文件由 daemon 自己写（`O_EXCL|O_NOFOLLOW`，0600）（`export.rs`，#1535）。这条原先只在 PR 里，现在补进决策。
 
@@ -67,6 +68,7 @@
 | Nostr 入站消息（Hyphae 收件箱、nostr-bridge） | Hyphae 收件箱无准入；桥在桥内判名单，F4b 默认冻结 | 经 ADR-041 D1 写入 `inbound_events`，由 D3 准入决定 |
 | 语音输入（AgentEar） | ADR-041 已列为第六条路径 | 同上 |
 | 远程 @agent 消息 | 尚无实现 | 同上；没有单独的旁路 |
+| 微信桥（wechat-bridge） | 桥内判 uid 名单；微信里回 y/n 解决审批（ADR-041 §1） | **开发工具，不进产品构建，产品构建里不得启动。** 开发态下也不得绕过准入：它要触发 agent 干活，目标写法是和 nostr-bridge 一样只做传输，把消息作为 `source = wechat` 的事件交给 ADR-041 的准入，名单与去重由 daemon 持有。在它改成这样之前，开发态的桥内名单只算开发便利，不算产品行为 |
 | 手机遥控（ADR-037 决策 6） | 设计文档不存在（C29） | 遥控只是准入的**一种来源**，配对设备身份由准入表的名单承载；ADR-037 决策 6 里「独立的授权入口」按本条理解为「准入的一个来源」，不是绕过准入的第二条路 |
 
 - **基础通信保持 zero-run**：收发消息、联系人、relay 管理不触发任何 run。结构约束保留：comm 依赖图有白名单，禁止 HTTP 客户端 crate，`CommState` 不含 Store、ModelRouter（`agent24-comm/tests/comm_dependency_allowlist.rs`、`tests/comm_zero_run.rs`；C06）。
@@ -75,7 +77,7 @@
 - **Q6 (c) 桥的归宿**：
   - nostr-bridge **并入 comm**（成为 comm 的入站适配器，写 `inbound_events`，对应 ADR-041 D1、C30）。
   - wechat-bridge **维持开发工具**，不进产品路径。
-  - **在并入之前，产品构建禁止桥使用 legacy 全权 token。** 现状：桥从 `daemon.json` 读 `port` 和 `token`（`packages/nostr-bridge/src/config.ts:112-135` **（main 已核）**），在 `AuthMode::LegacySingleToken`（`rust/apps/agent24d/src/server.rs:720` **（main 已核）**）下这个 token 是全权的。产品构建要么不启动桥，要么给桥发 CORE-2 按组件的受限令牌（ADR-038 D7：组件不得持有 legacy 全权 token）。这条是约束，代码尚未实现，见待办 T3。
+  - **在并入之前，产品构建禁止桥使用 legacy 全权 token。** 现状：桥从 `daemon.json` 读 `port` 和 `token`（`packages/nostr-bridge/src/config.ts:125-140` 的 `discoverDaemon` **（main 已核）**），在 `AuthMode::LegacySingleToken`（`rust/apps/agent24d/src/server.rs:720` **（main 已核）**）下这个 token 是全权的。产品构建要么不启动桥，要么给桥发 CORE-2 按组件的受限令牌（ADR-038 D7：组件不得持有 legacy 全权 token）。这条是约束，代码尚未实现，见待办 T3。
 
 ### D6 消息状态语义与可靠性（C11、C12、C13、C19）
 
@@ -88,9 +90,8 @@
 ### D7 网络与 relay（C17、C18）
 
 - `source != "config"` 时当作未配置，daemon 启动时总是显式传 relay。桌面预填的默认 relay 是 Hyphae 自建的 `wss://relay.aastar.io`（`relayDefaults.ts:2` **（main 已核）**，#1529）；设置 relay 前弹原生确认。
-- 「公共 relay 算不算暗中回落」（X12）：桌面路径有确认框，视为不是暗中；CLI 与 headless 的默认值**未定义**，列入待办 T4，在定义之前 headless 不预填 relay。
+- 「公共 relay 算不算暗中回落」（X12）：现状是桌面路径预填并有确认框，CLI 与 headless 的默认值未定义。这是否算暗中回落、headless 默认用什么，由 T4 决定，本篇不定。
 - Windows 在 DEP-A7 之前一律返回 `unsupported_platform`。
-- Hyphae 自建 relay 上线并接线测通，是下一版发布的闸门（项目记忆 2026-10-31），不用临时 relay。
 
 ### D8 应用层协议与命名空间（C22、C23、C25–C28、C26）
 
@@ -119,7 +120,7 @@
 | X9 | R3 X9 | `COMM-HYPHAE.md:467` 说锁停在 `a4aa606`、G2「没有结构化健康状态」；现在锁是 v0.30.1，且已有 `contract`/`health`（C2）。G1–G9 状态要回写 | 文档 |
 | X14 | R3 X14 | R3 说 `stop_grace_ms` 没接线；ADR-038 §7.11 记录 Hyphae 守护进程已消费该字段，X14 的「没有接线」已过期。`COMM-HYPHAE.md:320` 只提环境变量，补上锁字段的说明 | 文档 |
 | X15 | R3 X15 | `COMM-FRIENDS.md:182` 要求在 `COMM-HYPHAE.md` §2 补一行「关系状态在 `comm/friends.json`」，还没补 | 文档 |
-| X16 | R3 X16 | 各文档引用的 Hyphae 版本基线不一致：`COMM-HYPHAE.md:5`（`a4aa606`）、`COMM-FRIENDS.md:7`（v0.28.1）、`ADR-038:107`（`44189b8e`，示例值）。统一为「以 `hyphae.lock.json` 为准」 | 文档 |
+| X16 | R3 X16 | 各文档引用的 Hyphae 版本基线不一致：`COMM-HYPHAE.md:5`（`a4aa606`）、`COMM-FRIENDS.md:7`（v0.28.1）、ADR-038 r5 稿 `:135`（`44189b8e`，示例值，r5 已加注）。统一为「以 `hyphae.lock.json` 为准」 | 文档 |
 
 由本篇新增的待办（不是 R3 编号）：
 
@@ -127,13 +128,15 @@
 |---|---|---|
 | T1 | `HYPHAE-NETWORK-DELIVERY.md:10,25,31` 的「随包交付」改成按需下载（X1 结论） | 文档 |
 | T2 | 桥并入 comm 前，桥不得持有独立身份；并入后删除桥里的 `SPEAKER_BIN` 查找（X6 随之消失）、桥内名单与内存去重（ADR-041 D1） | 代码 |
-| T3 | 产品构建禁止桥用 legacy 全权 token：不启动桥，或发受限令牌。需要一个测试钉住（产品构建下 legacy token 访问 comm 写路由被拒或桥不启动） | 代码 |
+| T3 | 产品构建禁止桥用 legacy 全权 token。**眼下唯一能落地的做法是产品构建不启动桥**；「按组件发受限令牌」依赖 ADR-038 的 C9（D7 `requires` 授权接线，待排、未定期），在 C9 之前做不了。同样地，**F4b（`A24_NOSTR_F4B_INBOUND=1`）仅限开发态，产品构建不得开启**，否则桥会在准入之外直接触发 run。需要测试钉住：产品构建下桥不启动、F4b 开关不生效 | 代码 |
 | T4 | 定义 CLI 与 headless 场景的默认 relay（X12） | 决策 |
 | T5 | ADR-037 决策 6 的措辞与 D5 对齐（遥控是准入的一种来源）；`decision.md` 的订正归 S0-1 | 文档 |
 
 **R3 里的其余未决项，本篇不定**：X6 随 T2 消失；X10（非目标与实际不一致、是否公开广播）、X13（send 在场证明，等 CORE-2d / 7c）、X17（T01 协议）、X18（COMM-6/7 完成证据缺失）、X19（COMM-FRIENDS 开放问题）。
 
 ## 4. 与 ADR-041 的边界
+
+**ADR-041 D1 写的「nostr-bridge 与 wechat-bridge 改为只做传输，名单与去重搬进 daemon」，其中 wechat-bridge 的部分以本篇为准**：wechat-bridge 维持开发工具，不进产品路径（Q6 (c)），不是产品里要迁移的适配器。ADR-041 待回写。ADR-041 的开放问题 Q4（`:133`，桥的名单搬进 daemon 的行为差异）与 X7（身份来源）同题，待回写；回写前以本篇 D3、D5 为准。
 
 两份 ADR 管不同的东西，不重叠：
 
@@ -172,7 +175,7 @@ Windows 在 DEP-A7 之前不支持，放开时要补 env 白名单（`COMM-HYPHA
 ## 9. 关联与取代
 
 - 取代：`COMM-HYPHAE.md` §0 的「已定决策」、`F4-nostr-channel.md` 的决策节、`COMM-FRIENDS.md` §8 的已拍板节，三者降为实施说明（文头加注由后续文档片做，本篇不改）。
-- 与 ADR-037 决策 1（常驻 daemon）、决策 6（遥控）一致，见 D5 与 T5。
+- 与 ADR-037 决策 1（常驻 daemon）一致。对决策 6（遥控）做**收窄订正**：遥控不是「独立的授权入口」，而是准入的一种来源，待 T5 回写 `decision.md`，回写前以本篇 D5 为准。
 - 与 ADR-038 的关系：Hyphae 是该 ADR 的第一个按次调用型加常驻型组件；锁、签名、契约版本、状态机全按它。
 - 与 ADR-039 的关系：通信是能力，不是技能；能力不能指定技能。
 - 与 ADR-041 的关系：见 §4。
