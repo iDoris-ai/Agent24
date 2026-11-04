@@ -1640,6 +1640,8 @@ enum Script {
     /// 500 if the request carries a credential header, else `body`.
     NoAuth(String),
     Stall,
+    /// 500 until the flag is set, then `body`.
+    Switch(Arc<AtomicBool>, String),
     Hold(Arc<AtomicBool>, String),
     Bearer {
         secret: String,
@@ -1654,9 +1656,45 @@ enum Script {
     },
 }
 
+/// What the fake answers on `POST .../agent24/knowledge/ready` (§8).
+#[derive(Clone)]
+enum ReadyMode {
+    /// `live` and both operations `ready`, echoing the request id.
+    Ready,
+    /// `live`, but `operations.search` is `not_ready`.
+    SearchNotReady,
+    /// `live` is false.
+    NotLive,
+    /// `ready` for search and read, with another request id.
+    WrongEcho,
+    /// A non-2xx answer.
+    Status(u16),
+    Garbage,
+    Stall,
+}
+
+/// The ready endpoint's counters. Its requests do not count in `Fake::hits`.
+#[derive(Clone)]
+struct ReadyCtl {
+    mode: Arc<std::sync::Mutex<ReadyMode>>,
+    hits: Arc<AtomicUsize>,
+    /// Header block and body of every ready request.
+    seen: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+}
+
 struct Fake {
     base: String,
     hits: Arc<AtomicUsize>,
+    ready: ReadyCtl,
+}
+
+impl Fake {
+    fn ready_mode(&self, mode: ReadyMode) {
+        *self.ready.mode.lock().unwrap() = mode;
+    }
+    fn ready_hits(&self) -> usize {
+        self.ready.hits.load(Ordering::SeqCst)
+    }
 }
 
 async fn serve(script: Script) -> Fake {
@@ -1664,6 +1702,12 @@ async fn serve(script: Script) -> Fake {
     let addr = listener.local_addr().unwrap();
     let hits = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&hits);
+    let ready = ReadyCtl {
+        mode: Arc::new(std::sync::Mutex::new(ReadyMode::Ready)),
+        hits: Arc::new(AtomicUsize::new(0)),
+        seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let ctl = ready.clone();
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -1671,22 +1715,37 @@ async fn serve(script: Script) -> Fake {
             };
             let script = script.clone();
             let counter = Arc::clone(&counter);
+            let ctl = ctl.clone();
             tokio::spawn(async move {
-                let _ = answer(stream, script, &counter).await;
+                let _ = answer(stream, script, &counter, &ctl).await;
             });
         }
     });
     Fake {
         base: format!("http://{addr}/api/v1"),
         hits,
+        ready,
     }
 }
 
-async fn answer(mut stream: TcpStream, script: Script, hits: &AtomicUsize) -> std::io::Result<()> {
-    let head = match read_head(&mut stream).await {
-        Some(head) => head,
+async fn answer(
+    mut stream: TcpStream,
+    script: Script,
+    hits: &AtomicUsize,
+    ready: &ReadyCtl,
+) -> std::io::Result<()> {
+    let (head, body) = match read_request(&mut stream).await {
+        Some(request) => request,
         None => return Ok(()),
     };
+    if head
+        .to_ascii_lowercase()
+        .contains("agent24/knowledge/ready")
+    {
+        ready.hits.fetch_add(1, Ordering::SeqCst);
+        ready.seen.lock().unwrap().push((head, body.clone()));
+        return answer_ready(&mut stream, ready, &body).await;
+    }
     hits.fetch_add(1, Ordering::SeqCst);
     if !head.to_ascii_lowercase().contains("system/capabilities") {
         write_response(&mut stream, 404, "not-found").await?;
@@ -1703,6 +1762,13 @@ async fn answer(mut stream: TcpStream, script: Script, hits: &AtomicUsize) -> st
             }
         }
         Script::Stall => std::future::pending::<()>().await,
+        Script::Switch(up, body) => {
+            if up.load(Ordering::SeqCst) {
+                write_response(&mut stream, 200, &body).await?;
+            } else {
+                write_response(&mut stream, 500, "down").await?;
+            }
+        }
         Script::Hold(go, body) => {
             while !go.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1744,12 +1810,13 @@ fn bearer_body(head: &str, pairs: &[(String, String)], fallback: &str) -> String
     fallback.to_owned()
 }
 
-async fn read_head(stream: &mut TcpStream) -> Option<String> {
+/// Header block and body. The body is read up to `content-length`.
+async fn read_request(stream: &mut TcpStream) -> Option<(String, String)> {
     let mut data = Vec::new();
     let mut buf = [0u8; 1024];
-    loop {
-        if data.windows(4).any(|w| w == b"\r\n\r\n") {
-            return String::from_utf8(data).ok();
+    let split = loop {
+        if let Some(at) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+            break at + 4;
         }
         if data.len() > 16 * 1024 {
             return None;
@@ -1759,6 +1826,59 @@ async fn read_head(stream: &mut TcpStream) -> Option<String> {
             return None;
         }
         data.extend_from_slice(&buf[..n]);
+    };
+    let head = String::from_utf8(data[..split].to_vec()).ok()?;
+    let wanted = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    while data.len() < split + wanted {
+        let n = stream.read(&mut buf).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n]);
+    }
+    let body = String::from_utf8(data[split..].to_vec()).ok()?;
+    Some((head, body))
+}
+
+async fn answer_ready(
+    stream: &mut TcpStream,
+    ready: &ReadyCtl,
+    request: &str,
+) -> std::io::Result<()> {
+    let mode = ready.mode.lock().unwrap().clone();
+    let id = serde_json::from_str::<Value>(request)
+        .ok()
+        .and_then(|v| v["request_id"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let body = |id: &str, live: bool, search: &str| {
+        json!({
+            "protocol_version": 1, "request_id": id, "generation": 1, "live": live,
+            "operations": {
+                "search": {"state": search}, "read": {"state": "ready"},
+                "ingest": {"state": "disabled", "reason": "read_only_v1"},
+            },
+        })
+        .to_string()
+    };
+    match mode {
+        ReadyMode::Ready => write_response(stream, 200, &body(&id, true, "ready")).await,
+        ReadyMode::SearchNotReady => {
+            write_response(stream, 200, &body(&id, true, "not_ready")).await
+        }
+        ReadyMode::NotLive => write_response(stream, 200, &body(&id, false, "ready")).await,
+        ReadyMode::WrongEcho => {
+            write_response(stream, 200, &body("another-request", true, "ready")).await
+        }
+        ReadyMode::Status(status) => write_response(stream, status, "LEAK-ready-body").await,
+        ReadyMode::Garbage => write_response(stream, 200, "not json LEAK-ready-body").await,
+        ReadyMode::Stall => std::future::pending().await,
     }
 }
 
@@ -2453,18 +2573,21 @@ async fn a_revoked_credential_is_not_sent_from_the_snapshotted_target() {
     registry
         .apply("host", "binding", 3, Change::RevokeCredential)
         .unwrap();
+    // The old target is not sent (the fake answers 500 to any credential
+    // header), and its answer is not used: the snapshot is taken again, now
+    // anonymous, and that one request is the only one the server sees.
     let view = registry.assess_snapshot(&targets, Instant::now()).await;
+    assert_eq!(view.state, ComponentState::Ready, "{view:?}");
     assert_eq!(
         fake.hits.load(Ordering::SeqCst),
-        0,
-        "the revoked credential was sent"
+        1,
+        "the revoked credential was sent, or the retake did not probe"
     );
-    assert_eq!(view.state, ComponentState::Stopped);
-    assert_eq!(view.reason.as_deref(), Some("not_configured"));
+    assert_eq!(fake.ready_hits(), 0, "no credential, no §8 probe");
 
     let fresh = knowledge_item(&registry, Instant::now()).await;
     assert_eq!(fresh.state, ComponentState::Ready);
-    assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.hits.load(Ordering::SeqCst), 1, "served from the cache");
     assert_no_canary(&fresh, &[secret]);
 }
 
@@ -2503,8 +2626,9 @@ async fn a_numeric_code_that_is_not_exactly_zero_is_upstream_error() {
     );
     for (code, label) in [
         ("1.5", "one-and-a-half"),
-        ("18446744073709551615", "u64-max"),
         ("-0.5", "neg-half"),
+        // A JSON integer, but past 2^53 a float names no single integer.
+        ("1e30", "past-exact-float"),
     ] {
         let body = format!(
             r#"{{"code":{code},"msg":"LEAK-num-{label}","data":{{"integration":{{"agent24_knowledge":{{{declaration}}}}}}}}}"#
@@ -2548,6 +2672,9 @@ fn adr_038_d5_names_timeout_and_http_errors_as_failed() {
     assert!(line.contains("R9.3"), "{line}");
     assert!(line.contains("不代表依赖健康"), "{line}");
     assert!(line.contains("§8"), "{line}");
+    assert!(line.contains("not_ready"), "{line}");
+    assert!(line.contains("`detail.basis` 为 `ready`"), "{line}");
+    assert!(line.contains("D3"), "{line}");
     assert!(
         !line.contains("探测失败"),
         "probe failure is not the degraded bucket: {line}"
@@ -2560,7 +2687,25 @@ fn adr_038_d5_names_timeout_and_http_errors_as_failed() {
     assert!(c5.contains("capabilities"), "{c5}");
     assert!(c5.contains("R9.3"), "{c5}");
     assert!(c5.contains("§8"), "{c5}");
-    assert!(c5.contains("遗留"), "{c5}");
+    assert!(c5.contains("not_ready"), "{c5}");
+    assert!(c5.contains("D3"), "{c5}");
+    assert!(!c5.contains("遗留：不探测"), "§8 is probed now: {c5}");
+    for needle in ["审计", "R10", "4 秒", "逐 URL"] {
+        assert!(c5.contains(needle), "{needle} not in {c5}");
+    }
+    let c6 = text
+        .lines()
+        .find(|line| line.starts_with("| C6 |"))
+        .unwrap();
+    for needle in [
+        "expected_version",
+        "component_contract_mismatch",
+        "unavailable",
+        "update_available",
+        "已落地",
+    ] {
+        assert!(c6.contains(needle), "{needle} not in {c6}");
+    }
 }
 
 // ---- ADR-038 C4: AgentEar on GET /api/v1/components, through the real route ----
@@ -2942,32 +3087,91 @@ fn sorted_tools(names: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String>
 }
 
 /// Quoted match arms of `dispatch`'s `match op` in `agent24-documents`.
+///
+/// A small scanner, not line matching: it skips comments, strings and char
+/// literals while it counts braces, takes only the string patterns that sit
+/// directly in the `match op { .. }` block (depth 1, so a nested `match`'s arms
+/// are not ours), and lets `=>` follow on a later line or after `|` alternatives.
 fn dispatched_tool_names() -> Vec<String> {
     let src = include_str!("../../../agent24-documents/src/tools.rs");
-    let start = src.find("match op {").unwrap();
-    let rest = &src[start..];
-    let end = rest.find("_ =>").unwrap();
+    sorted_tools(match_op_arms(src))
+}
+
+fn match_op_arms(src: &str) -> Vec<String> {
+    let start = src.find("match op {").unwrap() + "match op {".len();
+    let bytes = src.as_bytes();
+    let mut i = start;
+    let mut depth = 1usize;
+    // Strings seen at depth 1 since the last `=>` or `,`: one arm's patterns.
+    let mut pending: Vec<String> = Vec::new();
     let mut names = Vec::new();
-    for line in rest[..end].lines() {
-        let line = line.trim();
-        let Some(line) = line.strip_prefix('"') else {
-            continue;
-        };
-        let Some((name, tail)) = line.split_once('"') else {
-            continue;
-        };
-        if tail.trim_start().starts_with("=>") {
-            names.push(format!("documents.{name}"));
+    while i < bytes.len() && depth > 0 {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let end = src[i + 2..].find("*/").unwrap();
+                i += end + 4;
+            }
+            b'"' => {
+                let mut j = i + 1;
+                let mut text = String::new();
+                while bytes[j] != b'"' {
+                    if bytes[j] == b'\\' {
+                        j += 1;
+                    }
+                    text.push(bytes[j] as char);
+                    j += 1;
+                }
+                if depth == 1 {
+                    pending.push(text);
+                }
+                i = j + 1;
+            }
+            b'\'' => {
+                // A char literal ('x', '\n'), not a lifetime ('a).
+                let rest = &bytes[i + 1..];
+                let len = match rest {
+                    [b'\\', _, b'\'', ..] => 4,
+                    [_, b'\'', ..] => 3,
+                    _ => 1,
+                };
+                i += len;
+            }
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                i += 1;
+            }
+            b'=' if depth == 1 && bytes.get(i + 1) == Some(&b'>') => {
+                names.extend(pending.drain(..).map(|name| format!("documents.{name}")));
+                i += 2;
+            }
+            b',' if depth == 1 => {
+                pending.clear();
+                i += 1;
+            }
+            _ => i += 1,
         }
     }
-    sorted_tools(names)
+    names
 }
 
 fn mount_report(outcome: MountOutcome) -> crate::domain::MountReport {
+    mount_report_at(outcome, "9.9.9")
+}
+
+fn mount_report_at(outcome: MountOutcome, version: &str) -> crate::domain::MountReport {
     crate::domain::MountReport {
         name: "documents".into(),
         namespace: "/api/v1/documents".into(),
-        version: "9.9.9".into(),
+        version: version.into(),
         enabled_at_start: Some(true),
         outcome,
         granted: Vec::new(),
@@ -2994,12 +3198,28 @@ fn documents_d9_catalog_parses_the_module_tools() {
     assert!(catalog.assurance.is_empty());
     assert_eq!(catalog.requires.kernel, ["events", "models"]);
     assert!(catalog.requires.operations.is_empty());
-    let manifest = include_str!("../../../agent24-documents/domain-os.yml");
-    assert!(
-        manifest.contains("version: \"0.1.0\""),
+    // domain-os.yml is parsed, not searched: a comment or another key that
+    // happens to contain the text cannot satisfy it.
+    let manifest: serde_yaml::Value =
+        serde_yaml::from_str(include_str!("../../../agent24-documents/domain-os.yml")).unwrap();
+    assert_eq!(
+        manifest["version"].as_str(),
+        Some(catalog.version.as_str()),
         "catalog version drifts from domain-os.yml"
     );
-    assert!(manifest.contains("kernel_capabilities: [events, models]"));
+    let mut kernel: Vec<&str> = manifest["kernel_capabilities"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap())
+        .collect();
+    kernel.sort_unstable();
+    let mut wanted: Vec<&str> = catalog.requires.kernel.iter().map(String::as_str).collect();
+    wanted.sort_unstable();
+    assert_eq!(
+        kernel, wanted,
+        "requires.kernel drifts from kernel_capabilities"
+    );
     assert_eq!(sorted_tools(catalog.tool_names()), DOC_TOOLS);
     assert_eq!(dispatched_tool_names(), DOC_TOOLS);
     let item = documents_from(None, None, Ok(catalog));
@@ -3010,6 +3230,18 @@ fn documents_d9_catalog_parses_the_module_tools() {
     assert_eq!(item.provides.len(), 1);
     assert_eq!(item.provides[0].id, "documents");
     assert_eq!(sorted_tools(item.provides[0].tools.iter()), DOC_TOOLS);
+    let raw: Value =
+        serde_json::from_str(include_str!("../../../agent24-documents/component.json")).unwrap();
+    assert_eq!(
+        item.provides[0].summary.as_ref(),
+        Some(&raw["provides"][0]["summary"]),
+        "summary is the catalog's, all three languages"
+    );
+    assert!(
+        item.provides[0].summary.as_ref().unwrap()["th"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty())
+    );
     assert!(item.form.allows(item.state));
 }
 
@@ -3081,6 +3313,16 @@ fn documents_d9_missing_or_broken_catalog_is_an_error() {
         }),
         ("operations", |v| {
             v["requires"]["operations"] = json!(["Bad"])
+        }),
+        ("operations-unique", |v| {
+            v["requires"]["operations"] = json!(["list", "list"]);
+        }),
+        // Well formed, but not `<this component's id>.<operation>`.
+        ("tool-component", |v| {
+            v["provides"][0]["tools"][0] = json!("sin90.list");
+        }),
+        ("tool-no-dot", |v| {
+            v["provides"][0]["tools"][0] = json!("list");
         }),
         ("assurance", |v| {
             v["assurance"] = json!([{"id": "", "source": "x"}]);
@@ -3250,7 +3492,7 @@ fn documents_d9_states_stay_in_the_resident_subset() {
             assert!(detail.is_some());
         }
     }
-    let report = mount_report(MountOutcome::Mounted);
+    let report = mount_report_at(MountOutcome::Mounted, "0.1.0");
     let item = documents_from(
         Some(&report),
         Some(&Supervised::Running),
@@ -3304,5 +3546,858 @@ async fn documents_d9_entry_lists_provides_and_redacts() {
     let text = doc.to_string();
     for leaked in ["reason", "form", "detail", "catalog_invalid", "port", "pid"] {
         assert!(!text.contains(leaked), "{leaked} leaked: {text}");
+    }
+}
+
+// ---- L3: §8 readiness, stale snapshots, JSON number values, D3 gate ----
+
+fn limits_with(value: &str) -> String {
+    SCHEMA_LIMITS.replacen("\"max_results\":50", &format!("\"max_results\":{value}"), 1)
+}
+
+fn document_with_limits(limits: &str) -> String {
+    format!(
+        r#"{{"code":0,"msg":"LEAK-num","data":{{"integration":{{"agent24_knowledge":{{"protocol_versions":[1],"mode":"integration","supported_operations":["search","read"],"server_version":"1.0.0",{limits}}}}}}}}}"#
+    )
+}
+
+fn with_code(code: &str) -> String {
+    document_with_ops(r#""search","read""#).replacen("\"code\":0", &format!("\"code\":{code}"), 1)
+}
+
+/// JSON Schema counts `-0`, `0.0` and `0e5` as the integer 0: still success.
+#[tokio::test]
+async fn an_envelope_code_zero_is_success_in_any_integer_spelling() {
+    for code in ["0", "-0", "0.0", "-0.0", "0e5", "0E0"] {
+        let fake = serve(Script::Reply(200, with_code(code))).await;
+        let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
+        assert_eq!(shown(&item)["state"], "ready", "code {code}");
+    }
+    // Not zero, however it is written.
+    for (code, reason) in [
+        ("1.0", "upstream_1"),
+        ("1e3", "upstream_1000"),
+        ("-2.0", "upstream_-2"),
+    ] {
+        let fake = serve(Script::Reply(200, with_code(code))).await;
+        let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
+        let host = shown(&item);
+        assert_eq!(host["state"], "failed", "code {code}");
+        assert_eq!(host["reason"], reason, "code {code}");
+    }
+}
+
+/// `positive_int` is an integer value >= 1: `1e3` and `1.0` pass, `0.0`, `-0`
+/// and `0.5` do not.
+#[tokio::test]
+async fn limits_are_positive_integers_by_value() {
+    for value in ["1e3", "1.0", "50.0", "2E1"] {
+        let fake = serve(Script::Reply(
+            200,
+            document_with_limits(&limits_with(value)),
+        ))
+        .await;
+        let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
+        assert_eq!(shown(&item)["state"], "ready", "max_results {value}");
+    }
+    for value in ["0.0", "-0", "0e3", "0.5", "-1.0"] {
+        let fake = serve(Script::Reply(
+            200,
+            document_with_limits(&limits_with(value)),
+        ))
+        .await;
+        let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
+        let host = shown(&item);
+        assert_eq!(host["state"], "failed", "max_results {value}");
+        assert_eq!(host["reason"], "malformed", "max_results {value}");
+    }
+}
+
+fn with_credential(base: &str, secret: &str) -> KnowledgeHostRegistry {
+    let registry = configured(base);
+    push_bearer(&registry, "binding", 2, secret);
+    registry
+}
+
+#[tokio::test]
+async fn a_credential_and_a_ready_service_is_ready_on_the_ready_probe() {
+    let secret = "LEAK-ready-secret";
+    let fake = serve(Script::Reply(200, ready_body())).await;
+    let registry = with_credential(&fake.base, secret);
+    let item = knowledge_item(&registry, Instant::now()).await;
+    let host = shown(&item);
+    assert_eq!(host["state"], "ready");
+    assert_eq!(host["detail"]["basis"], "ready");
+    assert_eq!(fake.hits.load(Ordering::SeqCst), 1, "capabilities once");
+    assert_eq!(fake.ready_hits(), 1);
+    let seen = fake.ready.seen.lock().unwrap().clone();
+    let (head, body) = &seen[0];
+    assert!(
+        head.starts_with("POST /api/v1/agent24/knowledge/ready "),
+        "{head}"
+    );
+    assert!(
+        head.to_ascii_lowercase()
+            .contains(&format!("bearer {}", secret.to_ascii_lowercase()))
+    );
+    let body: Value = serde_json::from_str(body).unwrap();
+    assert_eq!(body["protocol_version"], 1);
+    assert!(body["request_id"].as_str().is_some_and(|id| !id.is_empty()));
+    assert!(body.get("scope").is_none(), "R8.2: scope is optional");
+    assert_no_canary(&item, &[secret]);
+}
+
+#[tokio::test]
+async fn no_credential_means_no_ready_probe_and_the_basis_stays_capabilities() {
+    let fake = serve(Script::Reply(200, ready_body())).await;
+    let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
+    let host = shown(&item);
+    assert_eq!(host["state"], "ready");
+    assert_eq!(host["detail"]["basis"], "capabilities");
+    assert_eq!(fake.ready_hits(), 0);
+}
+
+/// Not ready is `degraded`/`not_ready` for every way the answer can fail to say
+/// "live and search and read ready"; the body text never reaches the view.
+#[tokio::test]
+async fn a_ready_probe_that_does_not_say_ready_is_degraded_not_ready() {
+    let modes = [
+        ("search not_ready", ReadyMode::SearchNotReady),
+        ("not live", ReadyMode::NotLive),
+        ("wrong echo", ReadyMode::WrongEcho),
+        ("http 503", ReadyMode::Status(503)),
+        ("http 401", ReadyMode::Status(401)),
+        ("garbage", ReadyMode::Garbage),
+    ];
+    for (label, mode) in modes {
+        let fake = serve(Script::Reply(200, ready_body())).await;
+        fake.ready_mode(mode);
+        let registry = with_credential(&fake.base, "LEAK-nr-secret");
+        let item = knowledge_item(&registry, Instant::now()).await;
+        let host = shown(&item);
+        assert_eq!(host["state"], "degraded", "{label}");
+        assert_eq!(host["reason"], "not_ready", "{label}");
+        assert_eq!(host["detail"]["basis"], "ready", "{label}");
+        assert_eq!(fake.ready_hits(), 1, "{label}");
+        assert_no_canary(&item, &["LEAK-ready-body", "LEAK-nr-secret"]);
+    }
+}
+
+#[tokio::test]
+async fn a_ready_probe_that_never_answers_is_degraded_inside_the_shared_deadline() {
+    let fake = serve(Script::Reply(200, ready_body())).await;
+    fake.ready_mode(ReadyMode::Stall);
+    let registry = with_credential(&fake.base, "LEAK-stall-secret");
+    let started = Instant::now();
+    let item = tokio::time::timeout(
+        KNOWLEDGE_PROBE_TIMEOUT + Duration::from_secs(2),
+        knowledge_item(&registry, Instant::now()),
+    )
+    .await
+    .unwrap();
+    assert!(started.elapsed() < KNOWLEDGE_PROBE_TIMEOUT + Duration::from_millis(1500));
+    let host = shown(&item);
+    assert_eq!(host["state"], "degraded");
+    assert_eq!(host["reason"], "not_ready");
+}
+
+/// "Capabilities first": an incompatible or incomplete declaration is the
+/// answer, and the service is not asked about readiness.
+#[tokio::test]
+async fn the_ready_probe_waits_for_a_compatible_declaration() {
+    let incompatible =
+        ready_body().replace("\"protocol_versions\":[1,2]", "\"protocol_versions\":[2]");
+    let fake = serve(Script::Reply(200, incompatible)).await;
+    let item = knowledge_item(&with_credential(&fake.base, "LEAK-s1"), Instant::now()).await;
+    assert_eq!(shown(&item)["state"], "incompatible");
+    assert_eq!(shown(&item)["detail"]["basis"], "capabilities");
+    assert_eq!(fake.ready_hits(), 0);
+
+    let fake = serve(Script::Reply(200, document_with_ops(r#""search""#))).await;
+    let item = knowledge_item(&with_credential(&fake.base, "LEAK-s2"), Instant::now()).await;
+    assert_eq!(shown(&item)["reason"], "missing_capability:read");
+    assert_eq!(shown(&item)["detail"]["basis"], "capabilities");
+    assert_eq!(fake.ready_hits(), 0);
+
+    let fake = serve(Script::Reply(500, "x".into())).await;
+    let item = knowledge_item(&with_credential(&fake.base, "LEAK-s3"), Instant::now()).await;
+    assert_eq!(shown(&item)["state"], "failed");
+    assert_eq!(fake.ready_hits(), 0);
+}
+
+/// A credential that moves between the capabilities answer and the §8 request
+/// is not sent again: the stale answer is dropped and the snapshot retaken.
+#[tokio::test]
+async fn the_ready_probe_rechecks_the_credential_before_sending() {
+    use crate::knowledge_probe::KnowledgeProbeCache;
+    let fake = serve(Script::Reply(200, ready_body())).await;
+    let registry = with_credential(&fake.base, "LEAK-moves-secret");
+    let targets = registry.probe_targets(unix_now());
+    let cache = KnowledgeProbeCache::default();
+    // Valid for the capabilities request, revoked by the time §8 would go.
+    let calls = AtomicUsize::new(0);
+    let current =
+        |_: &crate::knowledge_probe::ProbeTarget| calls.fetch_add(1, Ordering::SeqCst) == 0;
+    let assessed = cache.assess(&targets, Instant::now(), &current).await;
+    assert!(assessed.stale);
+    assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fake.ready_hits(),
+        0,
+        "the key went out again after it moved"
+    );
+}
+
+/// N1 of #1571. B's credential moved after the snapshot, so B's target was
+/// dropped and the answer was A's `ready`. B is a failing endpoint: the answer
+/// must be B's, from a new snapshot.
+#[tokio::test]
+async fn a_target_that_failed_the_recheck_is_probed_again_not_dropped() {
+    let a = serve(Script::Reply(200, ready_body())).await;
+    let b = serve(Script::Reply(500, "boom".into())).await;
+    let registry = KnowledgeHostRegistry::default();
+    bind(&registry, "a", 1, &a.base);
+    bind(&registry, "b", 1, &b.base);
+    push_bearer(&registry, "b", 2, "LEAK-b-old");
+    let snapshot = registry.probe_targets(unix_now());
+    assert_eq!(snapshot.len(), 2);
+    push_bearer(&registry, "b", 3, "LEAK-b-new");
+    let view = registry.assess_snapshot(&snapshot, Instant::now()).await;
+    assert_eq!(view.state, ComponentState::Failed, "{view:?}");
+    assert_eq!(view.reason.as_deref(), Some("http_500"));
+    assert_eq!(
+        b.hits.load(Ordering::SeqCst),
+        1,
+        "only the retaken snapshot sent"
+    );
+    assert_eq!(
+        b.ready_hits(),
+        0,
+        "a 500 capabilities answer is not asked about §8"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_answer_is_not_cached_and_bindings_that_keep_moving_fail_closed() {
+    use crate::knowledge_host::assess_until_fresh;
+    use crate::knowledge_probe::KnowledgeProbeCache;
+    let fake = serve(Script::Reply(200, ready_body())).await;
+    let registry = configured(&fake.base);
+    let targets = registry.probe_targets(unix_now());
+    let cache = KnowledgeProbeCache::default();
+
+    let stale = cache.assess(&targets, Instant::now(), &|_| false).await;
+    assert!(stale.stale);
+    assert_eq!(fake.hits.load(Ordering::SeqCst), 0);
+    let fresh = cache.assess(&targets, Instant::now(), &|_| true).await;
+    assert!(!fresh.stale);
+    assert_eq!(fresh.view.state, ComponentState::Ready);
+    assert_eq!(
+        fake.hits.load(Ordering::SeqCst),
+        1,
+        "the stale answer was cached"
+    );
+
+    let retakes = AtomicUsize::new(0);
+    let view = assess_until_fresh(
+        &KnowledgeProbeCache::default(),
+        &targets,
+        Instant::now(),
+        &|_| false,
+        &|| {
+            retakes.fetch_add(1, Ordering::SeqCst);
+            registry.probe_targets(unix_now())
+        },
+        None,
+    )
+    .await
+    .view;
+    assert_eq!(view.state, ComponentState::Failed);
+    assert_eq!(view.reason.as_deref(), Some("binding_changed"));
+    assert_eq!(
+        retakes.load(Ordering::SeqCst),
+        2,
+        "first try uses the given snapshot"
+    );
+}
+
+#[tokio::test]
+async fn the_contract_gate_reads_the_probe_cache_and_reprobes_after_the_ttl() {
+    use crate::knowledge_host::ContractGate;
+    let fake = serve(Script::Reply(200, ready_body())).await;
+    let registry = with_credential(&fake.base, "LEAK-gate-secret");
+    let url = fake.base.as_str();
+    let t0 = Instant::now();
+    assert_eq!(
+        registry.contract_gate(url, "search", t0).await,
+        ContractGate::Open
+    );
+    assert_eq!(
+        registry.contract_gate(url, "read", t0).await,
+        ContractGate::Open
+    );
+    assert_eq!(
+        fake.hits.load(Ordering::SeqCst),
+        1,
+        "the second call is a cache hit"
+    );
+    // The components list shares that entry.
+    let item = knowledge_item(&registry, t0).await;
+    assert_eq!(item.state, ComponentState::Ready);
+    assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
+    let later = t0 + KNOWLEDGE_PROBE_TTL + Duration::from_secs(1);
+    assert_eq!(
+        registry.contract_gate(url, "search", later).await,
+        ContractGate::Open
+    );
+    assert_eq!(
+        fake.hits.load(Ordering::SeqCst),
+        2,
+        "an expired entry probes once"
+    );
+}
+
+#[tokio::test]
+async fn the_contract_gate_refuses_incompatible_missing_and_unknown() {
+    use crate::knowledge_host::ContractGate;
+    let t0 = Instant::now();
+    let incompatible =
+        ready_body().replace("\"protocol_versions\":[1,2]", "\"protocol_versions\":[2]");
+    let fake = serve(Script::Reply(200, incompatible)).await;
+    let registry = configured(&fake.base);
+    assert_eq!(
+        registry.contract_gate(&fake.base, "search", t0).await,
+        ContractGate::Incompatible
+    );
+
+    // Declaration lacks `read`: read is refused, search is not.
+    let fake = serve(Script::Reply(200, document_with_ops(r#""search""#))).await;
+    let registry = configured(&fake.base);
+    assert_eq!(
+        registry.contract_gate(&fake.base, "read", t0).await,
+        ContractGate::Incompatible
+    );
+    assert_eq!(
+        registry.contract_gate(&fake.base, "search", t0).await,
+        ContractGate::Open
+    );
+
+    // No declaration yet: unreachable, or not a declaration at all.
+    let fake = serve(Script::Reply(500, "x".into())).await;
+    let registry = configured(&fake.base);
+    assert_eq!(
+        registry.contract_gate(&fake.base, "search", t0).await,
+        ContractGate::NoDeclaration
+    );
+    // Nothing configured, or an endpoint that is not one of the bindings'.
+    assert_eq!(
+        KnowledgeHostRegistry::default()
+            .contract_gate("http://unconfigured/api/v1", "search", t0)
+            .await,
+        ContractGate::NoDeclaration
+    );
+    assert_eq!(
+        registry
+            .contract_gate("http://other/api/v1", "search", t0)
+            .await,
+        ContractGate::NoDeclaration
+    );
+
+    // A service that answers but is not ready is still a compatible contract.
+    let fake = serve(Script::Reply(200, ready_body())).await;
+    fake.ready_mode(ReadyMode::SearchNotReady);
+    let registry = with_credential(&fake.base, "LEAK-gate-2");
+    assert_eq!(
+        registry.contract_gate(&fake.base, "search", t0).await,
+        ContractGate::Open
+    );
+}
+
+/// H1: one binding's failed or incompatible endpoint must not refuse a call that
+/// goes to another binding's good endpoint, and its own calls are still refused.
+#[tokio::test]
+async fn the_gate_looks_only_at_the_endpoint_the_call_goes_to() {
+    use crate::knowledge_host::ContractGate;
+    let t0 = Instant::now();
+    let good = serve(Script::Reply(200, ready_body())).await;
+    let down = serve(Script::Reply(500, "x".into())).await;
+    let incompatible = serve(Script::Reply(
+        200,
+        ready_body().replace("\"protocol_versions\":[1,2]", "\"protocol_versions\":[2]"),
+    ))
+    .await;
+    let registry = KnowledgeHostRegistry::default();
+    bind(&registry, "good", 1, &good.base);
+    bind(&registry, "down", 1, &down.base);
+    bind(&registry, "wrong", 1, &incompatible.base);
+    // The folded view the list shows is the worst of the three.
+    assert_eq!(
+        knowledge_item(&registry, t0).await.state,
+        ComponentState::Incompatible
+    );
+    for op in ["search", "read"] {
+        assert_eq!(
+            registry.contract_gate(&good.base, op, t0).await,
+            ContractGate::Open,
+            "{op}"
+        );
+        assert_eq!(
+            registry.contract_gate(&down.base, op, t0).await,
+            ContractGate::NoDeclaration,
+            "{op}"
+        );
+        assert_eq!(
+            registry.contract_gate(&incompatible.base, op, t0).await,
+            ContractGate::Incompatible,
+            "{op}"
+        );
+    }
+    // One probe round served all of that.
+    assert_eq!(good.hits.load(Ordering::SeqCst), 1);
+}
+
+/// M2: a failed reading closes the gate for a few seconds, not for a whole TTL.
+#[tokio::test]
+async fn a_failed_reading_is_reprobed_after_a_short_ttl_not_the_full_one() {
+    use crate::knowledge_host::ContractGate;
+    use crate::knowledge_probe::KNOWLEDGE_PROBE_FAILED_TTL;
+    let up = Arc::new(AtomicBool::new(false));
+    let fake = serve(Script::Switch(Arc::clone(&up), ready_body())).await;
+    let registry = configured(&fake.base);
+    let t0 = Instant::now();
+    assert_eq!(
+        registry.contract_gate(&fake.base, "search", t0).await,
+        ContractGate::NoDeclaration
+    );
+    up.store(true, Ordering::SeqCst);
+    let soon = t0 + KNOWLEDGE_PROBE_FAILED_TTL - Duration::from_secs(1);
+    assert_eq!(
+        registry.contract_gate(&fake.base, "search", soon).await,
+        ContractGate::NoDeclaration
+    );
+    assert_eq!(
+        fake.hits.load(Ordering::SeqCst),
+        1,
+        "inside the short window: cached"
+    );
+    let after = t0 + KNOWLEDGE_PROBE_FAILED_TTL + Duration::from_secs(1);
+    assert!(after < t0 + KNOWLEDGE_PROBE_TTL);
+    assert_eq!(
+        registry.contract_gate(&fake.base, "search", after).await,
+        ContractGate::Open
+    );
+    assert_eq!(
+        fake.hits.load(Ordering::SeqCst),
+        2,
+        "reprobed, and it recovered"
+    );
+    // The list is unchanged by this: it keeps the full TTL for a failure.
+    let down = serve(Script::Reply(500, "x".into())).await;
+    let registry = configured(&down.base);
+    knowledge_item(&registry, t0).await;
+    knowledge_item(&registry, after).await;
+    assert_eq!(down.hits.load(Ordering::SeqCst), 1);
+}
+
+// ---- L3: D9 expected-vs-actual for Documents (ADR-038 C6) ----
+
+fn embedded_tools() -> Vec<String> {
+    DOC_TOOLS.iter().map(|t| (*t).to_owned()).collect()
+}
+
+fn report_with(
+    outcome: MountOutcome,
+    version: &str,
+    provides: Vec<crate::component_manifest::CapProvide>,
+) -> crate::domain::MountReport {
+    let mut report = mount_report_at(outcome, version);
+    report.d9 = Some(crate::component_manifest::OsD9 {
+        name: "documents".into(),
+        in_process: false,
+        provides,
+        requires_kernel: vec!["events".into(), "models".into()],
+    });
+    report
+}
+
+fn declared(id: &str, tools: Vec<String>) -> crate::component_manifest::CapProvide {
+    crate::component_manifest::CapProvide {
+        id: id.into(),
+        tools,
+    }
+}
+
+fn running(report: &crate::domain::MountReport) -> Item {
+    documents_from(
+        Some(report),
+        Some(&Supervised::Running),
+        documents_catalog::DocumentsCatalog::embedded(),
+    )
+}
+
+/// `version` is what runs; the catalog's goes to `detail.expected_version`.
+#[test]
+fn documents_version_is_the_runtime_and_the_catalog_is_the_expectation() {
+    let ok = running(&mount_report_at(MountOutcome::Mounted, "0.1.0"));
+    assert_eq!(ok.state, ComponentState::Ready);
+    assert_eq!(ok.version.as_deref(), Some("0.1.0"));
+    assert!(ok.reason.is_none());
+    assert_eq!(ok.detail.as_ref().unwrap()["expected_version"], "0.1.0");
+
+    let drifted = running(&mount_report_at(MountOutcome::Mounted, "9.9.9"));
+    // A different version is not a contract mismatch (M4 of the L3 review): a
+    // package fetched on demand can be ahead of or behind this daemon.
+    assert_eq!(drifted.state, ComponentState::Ready);
+    assert!(drifted.reason.is_none());
+    assert_eq!(
+        drifted.version.as_deref(),
+        Some("9.9.9"),
+        "the runtime's, not the catalog's"
+    );
+    let detail = drifted.detail.as_ref().unwrap();
+    assert_eq!(detail["expected_version"], "0.1.0");
+    assert_eq!(detail["actual_version"], "9.9.9");
+    assert_eq!(detail["update_available"], true);
+    assert!(detail.get("expected").is_none() && detail.get("kind").is_none());
+    assert!(
+        ok.detail
+            .as_ref()
+            .unwrap()
+            .get("update_available")
+            .is_none()
+    );
+    assert!(drifted.form.allows(drifted.state));
+
+    // No report: nothing is running to compare. The catalog's version is shown
+    // and the state stays `absent`.
+    let none = documents_from(None, None, documents_catalog::DocumentsCatalog::embedded());
+    assert_eq!(none.state, ComponentState::Absent);
+    assert_eq!(none.version.as_deref(), Some("0.1.0"));
+    assert_eq!(none.detail.as_ref().unwrap()["expected_version"], "0.1.0");
+}
+
+/// The tool mismatch overrides a live `ready` or `degraded` only (L4): a package
+/// that is off, never mounted, starting or restarting keeps the state that says
+/// what it is doing.
+#[test]
+fn a_documents_tool_mismatch_overrides_only_a_live_reading() {
+    let cases: Vec<(MountOutcome, Option<Supervised>, ComponentState)> = vec![
+        (MountOutcome::Disabled, None, ComponentState::Stopped),
+        (
+            MountOutcome::Degraded("disk".into()),
+            None,
+            ComponentState::Failed,
+        ),
+        (
+            MountOutcome::Refused("dup".into()),
+            None,
+            ComponentState::Failed,
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::Starting {
+                attempt: 1,
+                after: None,
+            }),
+            ComponentState::Starting,
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::Stopping),
+            ComponentState::Stopping,
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::Stopped),
+            ComponentState::Stopped,
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::Panicked),
+            ComponentState::Failed,
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::Running),
+            ComponentState::Incompatible,
+        ),
+        (MountOutcome::Mounted, None, ComponentState::Incompatible),
+    ];
+    for (outcome, live, want) in cases {
+        let report = report_with(
+            outcome.clone(),
+            "0.1.0",
+            vec![declared("documents", vec![])],
+        );
+        let item = documents_from(
+            Some(&report),
+            live.as_ref(),
+            documents_catalog::DocumentsCatalog::embedded(),
+        );
+        assert_eq!(item.state, want, "{outcome:?} {live:?}");
+        let flagged = item.reason.as_deref() == Some("component_contract_mismatch");
+        assert_eq!(
+            flagged,
+            want == ComponentState::Incompatible,
+            "{outcome:?} {live:?}"
+        );
+    }
+}
+
+/// A package that is off, or never mounted, keeps its state under a version drift.
+#[test]
+fn a_documents_version_drift_does_not_override_disabled_degraded_or_refused() {
+    for (outcome, state, reason) in [
+        (MountOutcome::Disabled, ComponentState::Stopped, "disabled"),
+        (
+            MountOutcome::Degraded("disk".into()),
+            ComponentState::Failed,
+            "degraded",
+        ),
+        (
+            MountOutcome::Refused("dup".into()),
+            ComponentState::Failed,
+            "refused",
+        ),
+    ] {
+        let item = running(&mount_report_at(outcome.clone(), "9.9.9"));
+        assert_eq!(item.state, state, "{outcome:?}");
+        assert_eq!(item.reason.as_deref(), Some(reason), "{outcome:?}");
+        assert_eq!(item.version.as_deref(), Some("9.9.9"));
+        assert_eq!(item.detail.as_ref().unwrap()["update_available"], true);
+    }
+}
+
+#[test]
+fn a_capability_the_manifest_omits_is_unavailable_and_extras_are_ignored() {
+    // The manifest lists another capability only: ours is `unavailable`, the
+    // state does not change (D9: actual is a subset of expected).
+    let report = report_with(
+        MountOutcome::Mounted,
+        "0.1.0",
+        vec![declared("other-cap", vec!["documents.list".into()])],
+    );
+    let item = running(&report);
+    assert_eq!(item.state, ComponentState::Ready);
+    assert!(item.reason.is_none());
+    assert_eq!(item.provides[0].availability, Some("unavailable"));
+    assert_eq!(
+        serde_json::to_value(&item.provides[0]).unwrap()["availability"],
+        "unavailable"
+    );
+
+    // Everything expected is declared, plus an extra: nothing is flagged and
+    // the extra is not shown.
+    let report = report_with(
+        MountOutcome::Mounted,
+        "0.1.0",
+        vec![
+            declared("documents", embedded_tools()),
+            declared("extra-cap", vec![]),
+        ],
+    );
+    let item = running(&report);
+    assert_eq!(item.state, ComponentState::Ready);
+    assert_eq!(item.provides.len(), 1);
+    assert_eq!(item.provides[0].availability, None);
+    assert!(
+        serde_json::to_value(&item.provides[0])
+            .unwrap()
+            .get("availability")
+            .is_none()
+    );
+
+    // A package that declares no capabilities says nothing either way.
+    let item = running(&report_with(MountOutcome::Mounted, "0.1.0", vec![]));
+    assert_eq!(item.provides[0].availability, None);
+    assert_eq!(item.state, ComponentState::Ready);
+}
+
+#[test]
+fn a_declared_capability_without_an_expected_tool_is_a_contract_mismatch() {
+    let mut tools = embedded_tools();
+    tools.retain(|t| t != "documents.find");
+    let report = report_with(
+        MountOutcome::Mounted,
+        "0.1.0",
+        vec![declared("documents", tools)],
+    );
+    let item = running(&report);
+    assert_eq!(item.state, ComponentState::Incompatible);
+    assert_eq!(item.reason.as_deref(), Some("component_contract_mismatch"));
+    let detail = item.detail.as_ref().unwrap();
+    assert_eq!(detail["kind"], "tools");
+    assert_eq!(detail["capability"], "documents");
+    assert_eq!(detail["missing"], json!(["documents.find"]));
+    assert_eq!(
+        item.provides[0].availability, None,
+        "the capability is there, its contract is not"
+    );
+
+    // A drifted version alongside it is only added to the detail.
+    let report = report_with(
+        MountOutcome::Mounted,
+        "9.9.9",
+        vec![declared("documents", vec![])],
+    );
+    let item = running(&report);
+    let detail = item.detail.as_ref().unwrap();
+    assert_eq!(item.state, ComponentState::Incompatible);
+    assert_eq!(detail["kind"], "tools");
+    assert_eq!(detail["actual_version"], "9.9.9");
+    assert_eq!(detail["update_available"], true);
+}
+
+/// The package we ship agrees with the catalog compiled into the daemon:
+/// same version, and nothing flagged against its own manifest.
+#[test]
+fn the_shipped_documents_manifest_matches_the_catalog() {
+    let manifest = agent24_domain::DomainOsManifest::from_yaml(include_str!(
+        "../../../agent24-documents/domain-os.yml"
+    ))
+    .unwrap();
+    let d9 = crate::component_manifest::OsD9::from_manifest(&manifest);
+    let catalog = documents_catalog::DocumentsCatalog::embedded().unwrap();
+    let checked = catalog.check(Some(manifest.version()), Some(&d9.provides));
+    assert_eq!(checked.mismatch, None);
+    assert!(checked.unavailable.is_empty());
+}
+
+#[tokio::test]
+async fn documents_expected_vs_actual_reaches_the_list_and_hides_detail_from_others() {
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let first_party = state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .issue(&test_peer("daemon-test"))
+        .unwrap()
+        .secret
+        .to_string();
+    state.os_reports = Arc::new(vec![report_with(
+        MountOutcome::Mounted,
+        "9.9.9",
+        vec![declared("other-cap", vec![])],
+    )]);
+    let app = build_router(state);
+    let (status, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(status, StatusCode::OK);
+    let doc = find(&full, "documents");
+    assert_eq!(doc["state"], "ready");
+    assert!(doc.get("reason").is_none());
+    assert_eq!(doc["version"], "9.9.9");
+    assert_eq!(doc["detail"]["expected_version"], "0.1.0");
+    assert_eq!(doc["detail"]["update_available"], true);
+    assert_eq!(doc["provides"][0]["availability"], "unavailable");
+
+    let (_, redacted) = call(&app, Method::GET, GET, Some(&first_party), "").await;
+    let doc = find(&redacted, "documents");
+    assert_eq!(doc["state"], "ready");
+    assert_eq!(doc["version"], "9.9.9");
+    let text = doc.to_string();
+    for leaked in [
+        "expected_version",
+        "actual_version",
+        "update_available",
+        "detail",
+        "reason",
+    ] {
+        assert!(!text.contains(leaked), "{leaked} in {text}");
+    }
+}
+
+/// The scanner that reads `dispatch`'s arms: the shapes the old line matcher
+/// missed.
+#[test]
+fn the_match_op_scanner_handles_wrapped_arrows_alternatives_and_nested_matches() {
+    let src = r#"
+        fn d(op: &str) {
+            match op {
+                // "commented" => 1,
+                "a" => x(),
+                "b"
+                    => y(),
+                "c" | "d" => {
+                    match inner { "nested" => 1, _ => 2 }
+                    z("not-an-arm")
+                }
+                "e" /* c */ => w('"'),
+                _ => v(),
+            }
+            match other { "outside" => 1, _ => 2 }
+        }
+    "#;
+    assert_eq!(
+        sorted_tools(match_op_arms(src)),
+        sorted_tools([
+            "documents.a",
+            "documents.b",
+            "documents.c",
+            "documents.d",
+            "documents.e"
+        ])
+    );
+}
+
+// ---- L3 review round: L1, L2 ----
+
+/// L1: 2^53 itself is not a safe integer for a float; the bound is strict.
+#[tokio::test]
+async fn a_float_at_two_to_the_53_is_not_read_as_an_integer() {
+    for (value, ready) in [
+        ("9007199254740991.0", true),
+        ("9007199254740992.0", false),
+        ("1e16", false),
+    ] {
+        let fake = serve(Script::Reply(
+            200,
+            document_with_limits(&limits_with(value)),
+        ))
+        .await;
+        let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
+        let host = shown(&item);
+        if ready {
+            assert_eq!(host["state"], "ready", "{value}");
+        } else {
+            assert_eq!(host["reason"], "malformed", "{value}");
+        }
+    }
+}
+
+/// L2: the key moves while the §8 request is out. Its answer must not be used.
+#[tokio::test]
+async fn a_credential_that_moves_during_the_ready_request_makes_the_answer_stale() {
+    use crate::knowledge_probe::KnowledgeProbeCache;
+    let fake = serve(Script::Reply(200, ready_body())).await;
+    let registry = with_credential(&fake.base, "LEAK-during-secret");
+    let targets = registry.probe_targets(unix_now());
+    let cache = KnowledgeProbeCache::default();
+    // Valid before the capabilities request and before §8; revoked after it.
+    let calls = AtomicUsize::new(0);
+    let current =
+        |_: &crate::knowledge_probe::ProbeTarget| calls.fetch_add(1, Ordering::SeqCst) < 2;
+    let assessed = cache.assess(&targets, Instant::now(), &current).await;
+    assert_eq!(fake.ready_hits(), 1, "§8 went out");
+    assert!(assessed.stale, "its answer was used although the key moved");
+}
+
+// ---- #1579 review: F2 ----
+
+/// `1e-400` underflows to `0.0` as a float, but its text is not zero: it is a
+/// fraction, not the integer 0, so it is not success. A zero mantissa still is.
+#[tokio::test]
+async fn an_envelope_code_that_underflows_to_zero_is_not_success() {
+    for code in ["1e-400", "-1e-400", "0.000001e-400", "5E-999"] {
+        let fake = serve(Script::Reply(200, with_code(code))).await;
+        let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
+        let host = shown(&item);
+        assert_eq!(host["state"], "failed", "code {code}");
+        assert_eq!(host["reason"], "upstream_error", "code {code}");
+        assert_no_canary(&item, &["LEAK-union"]);
+    }
+    for code in ["0e-400", "0.0e-400", "-0.0E999"] {
+        let fake = serve(Script::Reply(200, with_code(code))).await;
+        let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
+        assert_eq!(shown(&item)["state"], "ready", "code {code}");
     }
 }
