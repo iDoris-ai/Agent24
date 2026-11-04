@@ -1070,6 +1070,8 @@ fn health_book(degraded: bool, strikes: u32, relays_ok: bool) -> agent24_comm::H
         },
     );
     HealthView {
+        // These books model a run that has already passed once.
+        confirmed: true,
         consecutive_failures: if relays_ok { 0 } else { strikes },
         degraded,
         failed_probes: if relays_ok {
@@ -1086,6 +1088,7 @@ fn probe_of(
     health: Option<agent24_comm::HealthView>,
 ) -> agent24_comm::ProbeSnapshot {
     agent24_comm::ProbeSnapshot {
+        health_armed: false,
         contract,
         above_tested: false,
         health,
@@ -1119,6 +1122,71 @@ fn hyphae_with(
         &probe,
     );
     item
+}
+
+fn armed_probe_of(health: Option<agent24_comm::HealthView>) -> agent24_comm::ProbeSnapshot {
+    agent24_comm::ProbeSnapshot {
+        health_armed: true,
+        ..probe_of(agent24_comm::ContractView::Compatible, health)
+    }
+}
+
+/// ADR-038 D5: `starting -> ready` is the first passing health probe.
+#[test]
+fn armed_probe_holds_starting_until_the_first_passing_sample() {
+    use ComponentState as S;
+
+    // Running, armed, no sample yet.
+    let none = hyphae_with("running", None, armed_probe_of(None));
+    assert_eq!(none.state, S::Starting);
+    assert!(none.reason.is_none());
+
+    // First sample passed.
+    let mut passed = health_book(false, 0, true);
+    passed.confirmed = true;
+    let ready = hyphae_with("running", None, armed_probe_of(Some(passed)));
+    assert_eq!(ready.state, S::Ready);
+
+    // A failure after a pass is the ordinary N-strike rule, still ready.
+    let after = hyphae_with(
+        "running",
+        None,
+        armed_probe_of(Some(health_book(false, 1, false))),
+    );
+    assert_eq!(after.state, S::Ready);
+}
+
+#[test]
+fn failed_first_samples_stay_starting_then_degrade_on_the_nth() {
+    use ComponentState as S;
+
+    let mut one = health_book(false, 1, false);
+    one.confirmed = false;
+    let item = hyphae_with("running", None, armed_probe_of(Some(one)));
+    assert_eq!(item.state, S::Starting, "one failed first sample");
+    let body = render(&[item], true);
+    assert_eq!(
+        body["components"][0]["detail"]["health"]["consecutive_failures"], 1,
+        "the host view still shows the strike"
+    );
+
+    let mut n = health_book(true, 3, false);
+    n.confirmed = false;
+    let item = hyphae_with("running", None, armed_probe_of(Some(n)));
+    assert_eq!(item.state, S::Degraded);
+    assert_eq!(item.reason.as_deref(), Some("relays"));
+}
+
+#[test]
+fn unarmed_probe_keeps_running_as_ready() {
+    use ComponentState as S;
+    use agent24_comm::ContractView;
+
+    let item = hyphae_with("running", None, probe_of(ContractView::Compatible, None));
+    assert_eq!(item.state, S::Ready, "fixtures never arm a probe");
+    // Armed but the process is not running: the process mapping wins.
+    let stopped = hyphae_with("stopped", None, armed_probe_of(None));
+    assert_eq!(stopped.state, S::Stopped);
 }
 
 #[test]

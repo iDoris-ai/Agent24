@@ -1477,6 +1477,12 @@ async fn spawn_and_record(
                 ));
             }
             *generation += 1;
+            // The health book belongs to one generation. Clear it here, in the
+            // actor and before the status is ever written as `starting` or
+            // `running`, so `GET /components` cannot pair the new process with the
+            // last run's `confirmed`/`degraded`. `health_loop` only resets after it
+            // sees the `running` publish, and a watch coalesces true->false->true.
+            probe.reset_health();
             match ps_lstart(spawned.pid).await {
                 Some(marker) => {
                     if let Err(e) = write_pid_file(
@@ -1758,9 +1764,18 @@ async fn run_actor(
                             // chase a SECOND generation this restart would
                             // otherwise have just spawned.
                             phase = if shutdown_deadline.get().is_none() {
-                                spawn_and_record(&ctx, &log_truncate_generation, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline, &probe)
-                                    .await
-                                    .unwrap_or(Phase::Idle)
+                                // Same rule as the backoff restart: a handshake that
+                                // did not run is transient and goes through
+                                // `RestartPolicy`; a mismatch stays Idle.
+                                match spawn_and_record(&ctx, &log_truncate_generation, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline, &probe).await {
+                                    Ok(started) => started,
+                                    // A shutdown that began during the failed handshake
+                                    // must not schedule another attempt.
+                                    Err(error) if is_contract_check_failed(&error) && shutdown_deadline.get().is_none() => {
+                                        phase_after_contract_check_failure(&status, &mut policy, generation)
+                                    }
+                                    Err(_) => Phase::Idle,
+                                }
                             } else {
                                 Phase::Idle
                             };
