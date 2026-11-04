@@ -25,8 +25,7 @@ import type {
 // resourceSafeBase; the ready payload's pinVersion must match the host's pin.
 export const AGENT24_HEADLESS_PROTOCOL = 2
 
-/** Total readiness budget; the launcher's two phases (ready line, /api/ready) get 14 s each. */
-export const OPEN_DESIGN_READY_TIMEOUT_MS = 30_000
+/** Each readiness phase (ready line, /api/ready); the total budget is two phases plus 2 s. */
 export const OPEN_DESIGN_READY_PHASE_TIMEOUT_MS = 14_000
 export const OPEN_DESIGN_HEALTH_INTERVAL_MS = 10_000
 export const OPEN_DESIGN_HEALTH_TIMEOUT_MS = 3_000

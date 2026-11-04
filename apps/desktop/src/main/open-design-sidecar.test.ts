@@ -440,7 +440,8 @@ describe('PR1580 launcher regressions', () => {
     const launcher = new OpenDesignLauncher(() => current, vi.fn(() => new FakeChild() as unknown as ChildProcess) as never, okFetch(), { info: vi.fn(), warn }, 'linux', kill, ps)
     void launcher.launch().ready.catch(() => {})
     expect(ps).toHaveBeenCalledExactlyOnceWith(4321)
-    expect(kill.mock.calls.filter(([pid, signal]) => signal === 'SIGKILL' && pid === -4321)).toEqual([])
+    // Diagnostics only probe (signal 0); any real signal on this path is a regression.
+    expect(kill.mock.calls.every(([, signal]) => signal === 0)).toBe(true)
     expect(warn).toHaveBeenCalledWith('open-design.stale-launcher-running', { pid: 4321 })
   })
   it.each(['missing', 'invalid', 'dead', 'permission', 'wrong-command', 'wrong-group', 'ps-failed'])('F2 refuses stale reap when %s', (cause) => {
