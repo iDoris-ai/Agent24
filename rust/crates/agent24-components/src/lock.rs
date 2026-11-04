@@ -28,6 +28,10 @@ pub struct ComponentLock {
     pub reproducible: Option<Reproducible>,
     #[serde(default)]
     pub stop_grace_ms: Option<u64>,
+    /// Consecutive failed health samples before `ready -> degraded` (ADR-038 D5,
+    /// "N 锁里可配，默认 3"). Absent keeps the default; the consumer clamps the range.
+    #[serde(default)]
+    pub health_failures_before_degraded: Option<u32>,
     /// Capabilities (能力) this component provides. Not an authorization input (D7).
     pub provides: Vec<Provides>,
     /// Kernel permissions the component asks for (D7). Not a capability token list.

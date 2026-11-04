@@ -1337,6 +1337,7 @@ fn test_arm(interval: Duration, health_timeout: Duration, contract_timeout: Dura
         health_interval: interval,
         health_timeout,
         contract_timeout,
+        failures_before_degraded: agent24_comm::HEALTH_FAILURES_BEFORE_DEGRADED,
     }
 }
 
@@ -1538,6 +1539,46 @@ async fn consecutive_health_failures_degrade_and_one_success_clears() {
         "one success did not clear degraded: {:?}",
         sup.probe_snapshot()
     );
+}
+
+/// The arm's threshold (from the lock) decides when `degraded` lands, and a run
+/// that never passed a sample is not `confirmed`.
+#[tokio::test]
+async fn armed_failure_threshold_degrades_at_n_and_first_failures_are_unconfirmed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = script_with(
+        "1.0",
+        r#"    printf '%s\n' '{"ok":true,"data":{"status":"failed","checks":{"relays":{"ok":false}}}}'
+    exit 0"#,
+    );
+    let ctx = make_ctx_with_script(tmp.path(), &script).await;
+    let sup = FixtureSupervisor::spawn(ctx);
+    let mut arm = test_arm(
+        Duration::from_millis(300),
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+    );
+    arm.failures_before_degraded = 2;
+    sup.arm_probe(arm);
+    assert!(sup.probe_snapshot().health_armed);
+    sup.start().await.unwrap();
+    let mut first_degraded = None;
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(8) {
+        if let Some(health) = sup.probe_snapshot().health
+            && health.degraded
+        {
+            first_degraded = Some(health);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let health = first_degraded.expect("never degraded");
+    assert_eq!(
+        health.consecutive_failures, 2,
+        "degrades at the armed N, not 3"
+    );
+    assert!(!health.confirmed, "no sample ever passed");
 }
 
 /// Idempotent `start()` while a probe is in flight must not publish a fresh
@@ -1924,4 +1965,183 @@ exit 0
     assert_eq!(sup.probe_snapshot().contract, ContractView::Mismatch);
     assert_eq!(sup.status().state, "gave_up");
     assert_eq!(sup.status().consecutive_failures, 1);
+}
+
+/// A config change restarts the daemon; if the new generation's handshake
+/// does not run (bad JSON, then empty name) it must go through `RestartPolicy`
+/// back to `backoff` and recover, not stick at `Idle`.
+#[tokio::test]
+async fn contract_check_failure_on_config_change_goes_to_backoff_and_recovers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = make_ctx_with_script(
+        tmp.path(),
+        r#"#!/bin/sh
+case "$1" in
+  contract)
+    n=0
+    if [ -f "$HOME/contract-hits" ]; then n=$(cat "$HOME/contract-hits"); fi
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$HOME/contract-hits"
+    if [ "$n" -eq 1 ] || [ "$n" -ge 4 ]; then
+      printf '%s\n' '{"ok":true,"data":{"name":"hyphae-cli","contract_version":"1.0"}}'
+      exit 0
+    fi
+    if [ "$n" -eq 2 ]; then
+      printf '%s\n' 'not-json'
+      exit 0
+    fi
+    printf '%s\n' '{"ok":true,"data":{"name":"","contract_version":"1.0"}}'
+
+    exit 0
+    ;;
+  identity)
+    printf '%s\n' '{"ok":true,"data":[{"nickname":"alice","npub":"npub1x","default":true,"encrypted":true}]}'
+    exit 0
+    ;;
+  relay)
+    printf '%s\n' '{"ok":true,"data":{"relays":["wss://relay.example"],"source":"config"}}'
+    exit 0
+    ;;
+  health)
+    printf '%s\n' '{"ok":true,"data":{"status":"ok","checks":{"relays":{"ok":true}}}}'
+    exit 0
+    ;;
+  daemon)
+    cat > /dev/null
+    n=0
+    if [ -f "$HOME/daemon-spawns" ]; then n=$(cat "$HOME/daemon-spawns"); fi
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$HOME/daemon-spawns"
+    exec sleep 9999
+    ;;
+esac
+exit 0
+"#,
+    )
+    .await;
+    let hits = ctx.home.join("contract-hits");
+    let spawns = ctx.home.join("daemon-spawns");
+    let sup = FixtureSupervisor::spawn(ctx);
+    sup.arm_probe(test_arm(
+        Duration::from_secs(3600),
+        Duration::from_secs(2),
+        Duration::from_secs(8),
+    ));
+    sup.start().await.unwrap();
+    assert!(
+        wait_until(|| sup.status().state == "running", Duration::from_secs(3)).await,
+        "status {:?}",
+        sup.status()
+    );
+    assert_eq!(count_file(&spawns), 1);
+    sup.on_config_changed().await;
+    assert!(
+        wait_until(
+            || count_file(&hits) >= 2
+                && count_file(&spawns) == 1
+                && matches!(sup.status().state, "backoff" | "starting" | "running"),
+            Duration::from_secs(10),
+        )
+        .await,
+        "bad JSON on config change: hits {} spawns {} status {:?}",
+        count_file(&hits),
+        count_file(&spawns),
+        sup.status()
+    );
+    assert_eq!(
+        sup.status().state,
+        "backoff",
+        "must wait in backoff, not sit at Idle"
+    );
+    assert!(
+        wait_until(
+            || sup.status().state == "running"
+                && count_file(&hits) >= 4
+                && count_file(&spawns) == 2,
+            Duration::from_secs(25),
+        )
+        .await,
+        "config-change restart did not recover: hits {} spawns {} status {:?}",
+        count_file(&hits),
+        count_file(&spawns),
+        sup.status()
+    );
+    assert_eq!(sup.probe_snapshot().contract, ContractView::Compatible);
+}
+
+/// Mismatch on the config-change restart still stops: no spawn, no retry.
+#[tokio::test]
+async fn contract_mismatch_on_config_change_stays_idle_and_does_not_spawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = make_ctx_with_script(
+        tmp.path(),
+        r#"#!/bin/sh
+case "$1" in
+  contract)
+    n=0
+    if [ -f "$HOME/contract-hits" ]; then n=$(cat "$HOME/contract-hits"); fi
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$HOME/contract-hits"
+    if [ "$n" -eq 1 ] || [ "$n" -ge 99 ]; then
+      printf '%s\n' '{"ok":true,"data":{"name":"hyphae-cli","contract_version":"1.0"}}'
+      exit 0
+    fi
+    printf '%s\n' '{"ok":true,"data":{"name":"hyphae-cli","contract_version":"9.0"}}'
+    exit 0
+    exit 0
+    ;;
+  identity)
+    printf '%s\n' '{"ok":true,"data":[{"nickname":"alice","npub":"npub1x","default":true,"encrypted":true}]}'
+    exit 0
+    ;;
+  relay)
+    printf '%s\n' '{"ok":true,"data":{"relays":["wss://relay.example"],"source":"config"}}'
+    exit 0
+    ;;
+  health)
+    printf '%s\n' '{"ok":true,"data":{"status":"ok","checks":{"relays":{"ok":true}}}}'
+    exit 0
+    ;;
+  daemon)
+    cat > /dev/null
+    n=0
+    if [ -f "$HOME/daemon-spawns" ]; then n=$(cat "$HOME/daemon-spawns"); fi
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$HOME/daemon-spawns"
+    exec sleep 9999
+    ;;
+esac
+exit 0
+"#,
+    )
+    .await;
+    let hits = ctx.home.join("contract-hits");
+    let spawns = ctx.home.join("daemon-spawns");
+    let sup = FixtureSupervisor::spawn(ctx);
+    sup.arm_probe(test_arm(
+        Duration::from_secs(3600),
+        Duration::from_secs(2),
+        Duration::from_secs(8),
+    ));
+    sup.start().await.unwrap();
+    assert!(
+        wait_until(|| sup.status().state == "running", Duration::from_secs(3)).await,
+        "status {:?}",
+        sup.status()
+    );
+    sup.on_config_changed().await;
+    assert!(
+        wait_until(
+            || count_file(&hits) >= 2 && sup.probe_snapshot().contract == ContractView::Mismatch,
+            Duration::from_secs(15),
+        )
+        .await,
+        "mismatch handshake did not run: hits {} status {:?}",
+        count_file(&hits),
+        sup.status()
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(count_file(&hits), 2, "mismatch must not schedule a retry");
+    assert_eq!(count_file(&spawns), 1, "mismatch must not spawn the daemon");
+    assert_eq!(sup.status().state, "gave_up");
 }

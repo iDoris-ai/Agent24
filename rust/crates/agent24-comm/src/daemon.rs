@@ -1758,9 +1758,16 @@ async fn run_actor(
                             // chase a SECOND generation this restart would
                             // otherwise have just spawned.
                             phase = if shutdown_deadline.get().is_none() {
-                                spawn_and_record(&ctx, &log_truncate_generation, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline, &probe)
-                                    .await
-                                    .unwrap_or(Phase::Idle)
+                                // Same rule as the backoff restart: a handshake that
+                                // did not run is transient and goes through
+                                // `RestartPolicy`; a mismatch stays Idle.
+                                match spawn_and_record(&ctx, &log_truncate_generation, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline, &probe).await {
+                                    Ok(started) => started,
+                                    Err(error) if is_contract_check_failed(&error) => {
+                                        phase_after_contract_check_failure(&status, &mut policy, generation)
+                                    }
+                                    Err(_) => Phase::Idle,
+                                }
                             } else {
                                 Phase::Idle
                             };

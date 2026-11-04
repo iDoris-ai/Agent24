@@ -58,6 +58,8 @@ pub struct ProbeArm {
     pub health_interval: Duration,
     pub health_timeout: Duration,
     pub contract_timeout: Duration,
+    /// Consecutive failed samples before `ready -> degraded` (lock-configurable).
+    pub failures_before_degraded: u32,
 }
 
 impl ProbeArm {
@@ -68,7 +70,16 @@ impl ProbeArm {
             health_interval: HEALTH_INTERVAL,
             health_timeout: HEALTH_TIMEOUT,
             contract_timeout: CONTRACT_TIMEOUT,
+            failures_before_degraded: HEALTH_FAILURES_BEFORE_DEGRADED,
         }
+    }
+
+    /// Replace the degrade threshold (a lock value). Zero is treated as one:
+    /// a threshold that can never be met would hide every failure.
+    #[must_use]
+    pub fn with_failures_before_degraded(mut self, n: u32) -> Self {
+        self.failures_before_degraded = n.max(1);
+        self
     }
 }
 
@@ -105,6 +116,10 @@ impl Default for CheckView {
 /// Latest health book. Host view only; the redacted component view never sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HealthView {
+    /// `true` once a sample of this run reported `status:ok` (ADR-038 D5: the
+    /// first passing probe is what takes `starting` to `ready`). Never cleared
+    /// by a later failure: after that, the failure rule decides `degraded`.
+    pub confirmed: bool,
     pub consecutive_failures: u32,
     pub degraded: bool,
     /// Probe names that failed on the sample which last moved the counter. Sorted.
@@ -115,6 +130,10 @@ pub struct HealthView {
 /// What [`crate::daemon::HyphaeDaemonSupervisor::probe_snapshot`] returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeSnapshot {
+    /// `true` once a production (or test) arm exists: the health task is, or will
+    /// be, probing. Without it `health` stays `None` forever and a running
+    /// process cannot be held in `starting`.
+    pub health_armed: bool,
     pub contract: ContractView,
     pub above_tested: bool,
     pub health: Option<HealthView>,
@@ -123,6 +142,7 @@ pub struct ProbeSnapshot {
 impl Default for ProbeSnapshot {
     fn default() -> Self {
         Self {
+            health_armed: false,
             contract: ContractView::Unknown,
             above_tested: false,
             health: None,
@@ -158,7 +178,18 @@ impl ProbeHub {
     }
 
     pub(crate) fn snapshot(&self) -> ProbeSnapshot {
-        lock(&self.inner.state).clone()
+        let armed = lock(&self.inner.control).is_some();
+        let mut snapshot = lock(&self.inner.state).clone();
+        snapshot.health_armed = armed;
+        snapshot
+    }
+
+    fn failure_threshold(&self) -> u32 {
+        lock(&self.inner.control)
+            .as_ref()
+            .map_or(HEALTH_FAILURES_BEFORE_DEGRADED, |arm| {
+                arm.failures_before_degraded.max(1)
+            })
     }
 
     pub(crate) fn expectation(&self) -> Option<ContractExpectation> {
@@ -208,9 +239,10 @@ impl ProbeHub {
     }
 
     pub(crate) fn observe_health(&self, sample: HealthSample) {
+        let threshold = self.failure_threshold();
         let mut state = lock(&self.inner.state);
         let health = state.health.get_or_insert_with(HealthView::default);
-        observe_health(health, sample);
+        observe_health(health, sample, threshold);
     }
 }
 
@@ -371,13 +403,13 @@ fn checks_of(data: &Value) -> BTreeMap<String, bool> {
     out
 }
 
-fn observe_health(health: &mut HealthView, sample: HealthSample) {
+fn observe_health(health: &mut HealthView, sample: HealthSample, threshold: u32) {
     match sample {
         HealthSample::Unrun => {
             let entry = health.checks.entry("health".to_owned()).or_default();
             entry.ok = false;
             entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-            note_failure(health, vec!["health".to_owned()]);
+            note_failure(health, vec!["health".to_owned()], threshold);
         }
         HealthSample::Report { success, checks } => {
             let mut failed = Vec::new();
@@ -410,17 +442,18 @@ fn observe_health(health: &mut HealthView, sample: HealthSample) {
                         entry.consecutive_failures = 0;
                     }
                 }
+                health.confirmed = true;
                 health.consecutive_failures = 0;
                 health.degraded = false;
                 health.failed_probes.clear();
             } else {
-                note_failure(health, failed);
+                note_failure(health, failed, threshold);
             }
         }
     }
 }
 
-fn note_failure(health: &mut HealthView, mut names: Vec<String>) {
+fn note_failure(health: &mut HealthView, mut names: Vec<String>, threshold: u32) {
     if names.is_empty() {
         names.push("health".to_owned());
     }
@@ -428,7 +461,7 @@ fn note_failure(health: &mut HealthView, mut names: Vec<String>) {
     names.dedup();
     health.consecutive_failures = health.consecutive_failures.saturating_add(1);
     health.failed_probes = names;
-    if health.consecutive_failures >= HEALTH_FAILURES_BEFORE_DEGRADED {
+    if health.consecutive_failures >= threshold {
         health.degraded = true;
     }
 }
@@ -551,6 +584,41 @@ mod tests {
     }
 
     #[test]
+    fn threshold_comes_from_the_arm_and_zero_means_one() {
+        assert_eq!(
+            ProbeArm::production(expected()).failures_before_degraded,
+            HEALTH_FAILURES_BEFORE_DEGRADED
+        );
+        let arm = ProbeArm::production(expected()).with_failures_before_degraded(0);
+        assert_eq!(arm.failures_before_degraded, 1);
+        let hub = ProbeHub::new();
+        hub.arm(ProbeArm::production(expected()).with_failures_before_degraded(2));
+        hub.observe_health(relay_failure());
+        assert!(!hub.snapshot().health.unwrap().degraded);
+        hub.observe_health(relay_failure());
+        assert!(
+            hub.snapshot().health.unwrap().degraded,
+            "second failure of two"
+        );
+    }
+
+    #[test]
+    fn first_success_confirms_and_a_later_failure_does_not_unconfirm() {
+        let hub = ProbeHub::new();
+        assert!(!hub.snapshot().health_armed);
+        hub.arm(ProbeArm::production(expected()));
+        assert!(hub.snapshot().health_armed);
+        hub.observe_health(relay_failure());
+        assert!(!hub.snapshot().health.unwrap().confirmed);
+        hub.observe_health(all_ok());
+        assert!(hub.snapshot().health.unwrap().confirmed);
+        hub.observe_health(relay_failure());
+        assert!(hub.snapshot().health.unwrap().confirmed);
+        hub.reset_health();
+        assert!(hub.snapshot().health.is_none());
+    }
+
+    #[test]
     fn health_period_and_threshold_match_the_adr_defaults() {
         assert!(
             (Duration::from_secs(30)..=Duration::from_secs(60)).contains(&HEALTH_INTERVAL),
@@ -570,7 +638,11 @@ mod tests {
     #[test]
     fn one_failed_sample_is_not_degraded_and_the_nth_is_and_one_success_clears_it() {
         let mut health = HealthView::default();
-        observe_health(&mut health, relay_failure());
+        observe_health(
+            &mut health,
+            relay_failure(),
+            HEALTH_FAILURES_BEFORE_DEGRADED,
+        );
         assert!(!health.degraded, "a single relay failure must not degrade");
         assert_eq!(health.consecutive_failures, 1);
         assert_eq!(health.failed_probes, vec!["relays".to_owned()]);
@@ -578,16 +650,24 @@ mod tests {
         assert_eq!(health.checks["keystore"].consecutive_failures, 0);
 
         for n in 2..HEALTH_FAILURES_BEFORE_DEGRADED {
-            observe_health(&mut health, relay_failure());
+            observe_health(
+                &mut health,
+                relay_failure(),
+                HEALTH_FAILURES_BEFORE_DEGRADED,
+            );
             assert!(!health.degraded, "failure {n} is still under the threshold");
         }
-        observe_health(&mut health, relay_failure());
+        observe_health(
+            &mut health,
+            relay_failure(),
+            HEALTH_FAILURES_BEFORE_DEGRADED,
+        );
         assert!(health.degraded);
         assert_eq!(health.consecutive_failures, HEALTH_FAILURES_BEFORE_DEGRADED);
         assert_eq!(health.failed_probes, vec!["relays".to_owned()]);
         assert!(health.checks["relays"].consecutive_failures >= HEALTH_FAILURES_BEFORE_DEGRADED);
 
-        observe_health(&mut health, all_ok());
+        observe_health(&mut health, all_ok(), HEALTH_FAILURES_BEFORE_DEGRADED);
         assert!(!health.degraded, "one success returns to ready");
         assert_eq!(health.consecutive_failures, 0);
         assert!(health.failed_probes.is_empty());
@@ -598,13 +678,17 @@ mod tests {
     #[test]
     fn a_health_command_failure_counts_as_one_strike_named_health() {
         let mut health = HealthView::default();
-        observe_health(&mut health, HealthSample::Unrun);
+        observe_health(
+            &mut health,
+            HealthSample::Unrun,
+            HEALTH_FAILURES_BEFORE_DEGRADED,
+        );
         assert!(!health.degraded);
         assert_eq!(health.consecutive_failures, 1);
         assert_eq!(health.failed_probes, vec!["health".to_owned()]);
         assert_eq!(health.checks["health"].consecutive_failures, 1);
 
-        observe_health(&mut health, all_ok());
+        observe_health(&mut health, all_ok(), HEALTH_FAILURES_BEFORE_DEGRADED);
         assert_eq!(health.consecutive_failures, 0);
         assert!(health.checks["health"].ok);
         assert_eq!(health.checks["health"].consecutive_failures, 0);
@@ -639,7 +723,7 @@ mod tests {
             "checks": {"daemon": {"running": false}}
         }));
         let mut health = HealthView::default();
-        observe_health(&mut health, sample);
+        observe_health(&mut health, sample, HEALTH_FAILURES_BEFORE_DEGRADED);
         assert!(!health.degraded);
         assert!(!health.failed_probes.iter().any(|name| name == "daemon"));
         assert!(!health.checks["daemon"].ok);
@@ -658,7 +742,7 @@ mod tests {
                     "keystore": {"ok": true}
                 }
             }));
-            observe_health(&mut health, sample);
+            observe_health(&mut health, sample, HEALTH_FAILURES_BEFORE_DEGRADED);
         }
         assert!(
             !health.degraded,
@@ -683,6 +767,7 @@ mod tests {
                 success: false,
                 checks,
             },
+            HEALTH_FAILURES_BEFORE_DEGRADED,
         );
         assert!(!health.checks["relays"].ok);
         assert!(health.checks["relays"].consecutive_failures >= 1);
@@ -696,6 +781,7 @@ mod tests {
                 success: true,
                 checks,
             },
+            HEALTH_FAILURES_BEFORE_DEGRADED,
         );
         assert!(
             health.checks["relays"].ok && health.checks["relays"].consecutive_failures == 0,
@@ -839,7 +925,7 @@ exit 0
         );
         assert_eq!(sample, HealthSample::Unrun);
         let mut health = HealthView::default();
-        observe_health(&mut health, sample);
+        observe_health(&mut health, sample, HEALTH_FAILURES_BEFORE_DEGRADED);
         assert!(!health.degraded);
         assert_eq!(health.consecutive_failures, 1);
 

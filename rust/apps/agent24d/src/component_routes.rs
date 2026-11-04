@@ -200,7 +200,7 @@ fn from_hyphae(process: &str) -> (ComponentState, Option<String>) {
 /// Process state first, then the contract verdict and the health book (ADR-038
 /// D3/D5). A contract mismatch or a handshake that never produced a report wins
 /// over the process string (`gave_up` would otherwise read as `failed`). Health
-/// only moves `running` to `degraded`; a stopped process keeps its process
+/// moves `running` to `degraded`, and holds it in `starting` until the first passing sample; a stopped process keeps its process
 /// mapping so a stale book cannot flap the component.
 fn overlay_hyphae(
     process_state: &str,
@@ -222,6 +222,16 @@ fn overlay_hyphae(
     let (mapped, reason) = from_hyphae(process_state);
     if process_state == "running" && probe.health.as_ref().is_some_and(|health| health.degraded) {
         return (ComponentState::Degraded, Some(degraded_reason(probe)));
+    }
+    // ADR-038 D5: `starting -> ready` is "健康探测首次通过". With a probe armed, a
+    // running process that has no passing sample yet is still `starting`; the
+    // first N failures stay `starting` too, then the rule above says `degraded`.
+    // Without an arm (fixtures, old path) nothing probes, so keep `ready`.
+    if process_state == "running"
+        && probe.health_armed
+        && !probe.health.as_ref().is_some_and(|health| health.confirmed)
+    {
+        return (ComponentState::Starting, None);
     }
     (mapped, reason)
 }
