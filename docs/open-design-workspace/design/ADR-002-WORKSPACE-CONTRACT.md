@@ -2,6 +2,8 @@
 
 索引：[架构总入口](../../architecture/README.md)・[ADR 索引](../../adr/README.md)
 
+> 规范编号：ADR-OD-002（文件名与标题保留旧号以保持链接；新文字请写 ADR-OD-002。与 `docs/decision.md` 的 ADR-002 无关）
+>
 > 状态：Accepted / P0 frozen
 >
 > 覆盖：A24-OD-01、A24-OD-02

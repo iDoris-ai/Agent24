@@ -11,7 +11,7 @@
 ## ADR-001：从 xiaoheishu/desktop 借鉴而非从零开发
 
 **日期**：2026-04-27
-**状态**：✅ 采纳
+**状态**：⛔ 被替代（事实取代）（2026-11-04 订正，架构优化第 0 期 S0-1）：`vendor/xiaoheishu` 只在 `.gitmodules:1-3` 登记、没有代码引用，桌面是独立实现；架构由 ADR-026（Rust 内核 + 独立外壳）取代。原状态：✅ 采纳
 
 ### 背景
 
@@ -133,7 +133,7 @@
 ## ADR-005：iDoris-SDK 不收纳 publishers，每个 publisher 独立 npm 包
 
 **日期**：2026-04-27
-**状态**：✅ 采纳
+**状态**：🗄 废弃（2026-11-04 订正，架构优化第 0 期 S0-1）：本仓库从未实现（没有任何 `publish-*` 包）；微信桥已在本仓重写为 `@agent24/wechat-bridge`（见 ADR-012/013 的订正）。原状态：✅ 采纳
 
 ### 背景
 
@@ -163,7 +163,7 @@
 ## ADR-006：npm scope 用 `@auraaihq`
 
 **日期**：2026-04-27
-**状态**：✅ 采纳
+**状态**：⛔ 被替代（事实取代）（2026-11-04 订正，架构优化第 0 期 S0-1）：本仓库所有包都是 private `@agent24/*`（`packages/*/package.json:2`），`@auraaihq/*` 只剩 `packages/node-daemon/src/module-discovery.ts:26` 一个 scope 常量；随 ADR-016P 一起被 ADR-026 取代。原状态：✅ 采纳
 
 ### 备选
 
@@ -227,7 +227,7 @@
 ## ADR-008：模型包不存权重，只放 metadata
 
 **日期**：2026-04-27
-**状态**：✅ 采纳
+**状态**：🗄 废弃（2026-11-04 订正，架构优化第 0 期 S0-1）：本仓库从未实现（没有 `@auraaihq/models-*`，也没有 node-llama-cpp）；模型选型已归 iDoris，见 ADR-036。原状态：✅ 采纳
 
 ### 背景
 
@@ -266,7 +266,7 @@
 ## ADR-009：SkillBank 与 Evolver 是互补的两个独立包，不合并
 
 **日期**：2026-04-27
-**状态**：✅ 采纳
+**状态**：🗄 废弃（2026-11-04 订正，架构优化第 0 期 S0-1）：两个包从未实现；技能方向由 ADR-040 重新定义。原状态：✅ 采纳
 
 ### 背景
 
@@ -352,7 +352,7 @@ M0 阶段**不写接口**，先：
 ## ADR-012：iDoris-SDK 不合并进 @auraaihq/sdk
 
 **日期**：2026-04-27
-**状态**：✅ 采纳
+**状态**：⛔ 被替代（事实取代）（2026-11-04 订正，架构优化第 0 期 S0-1）：微信桥在本仓重写为 `@agent24/wechat-bridge`（`packages/wechat-bridge/package.json:2`，#78），对接 agent24d v1 API；「iDoris」现在指模型网关（ADR-032）。取代者：ADR-026、ADR-032。原状态：✅ 采纳
 
 ### 背景
 
@@ -402,7 +402,7 @@ iDoris-SDK (@agent-wechat/core)        ← 协议层 SDK，独立存在
 ## ADR-013：iDoris-SDK 合并进 auraai-packages monorepo（M2 执行）
 
 **日期**：2026-04-27
-**状态**：✅ 采纳（修正 ADR-012 的回答范围）
+**状态**：⛔ 被替代（事实取代）（2026-11-04 订正，架构优化第 0 期 S0-1）：同 ADR-012，取代者 ADR-026、ADR-032。原状态：✅ 采纳（修正 ADR-012 的回答范围）
 
 ### 背景
 
@@ -439,7 +439,7 @@ ADR-012 答的是"iDoris-SDK 合并进 `@auraaihq/sdk` 单个包"——这个不
 ## ADR-014：Agent24 在 M3 后被 @auraaihq/skills-* + skill-bank + evolver 替代
 
 **日期**：2026-04-27
-**状态**：✅ 采纳（M3 执行）
+**状态**：⛔ 被替代（事实取代）（2026-11-04 订正，架构优化第 0 期 S0-1）：本仓库就是 Agent24 主产品（Rust 内核 + 外壳，ADR-026、ADR-037），文中的 `skills/`、`hooks/`、`install.sh` 都不存在；技能方向见 ADR-040。原状态：✅ 采纳（M3 执行）
 
 ### 背景
 
@@ -489,7 +489,7 @@ M3 执行迁移。在那之前 Agent24 保持现状。
 ## ADR-015：M3 后 Agent24 改名为 Agent24
 
 **日期**：2026-04-27
-**状态**：✅ 采纳（M3 末执行，依赖 ADR-014 完成）
+**状态**：⛔ 被替代（事实取代）（2026-11-04 订正，架构优化第 0 期 S0-1）：依赖的 ADR-014 没有发生；「去掉 Desktop、架构不绑桌面」的意图已由 ADR-027、ADR-037 承接。原状态：✅ 采纳（M3 末执行，依赖 ADR-014 完成）
 
 ### 背景
 
@@ -537,7 +537,7 @@ Agent24 应用形态可能演化为：
 ## ADR-016：模块安全与权限模型
 
 **日期**：2026-04-27
-**状态**：✅ 采纳（M1 设计模块加载器时落地）
+**状态**：⛔ 被替代（事实取代）（2026-11-04 订正，架构优化第 0 期 S0-1）：Node 模块加载器已从桌面删除（#1371）；现行权限模型是 ADR-K1-01、ADR-K1-03（`rust/apps/agent24d/src/module_tool_runtime.rs`、`consent_routes.rs`）加 ADR-038 的签名验证。与 docs/ 下的 ADR-016P（消费 @auraaihq 包）是两份无关的决策。原状态：✅ 采纳（M1 设计模块加载器时落地）
 
 ### 背景
 
@@ -764,7 +764,7 @@ M2 开始引入能力模块，每个模块都需要调用 LLM。备选方案：
 ## ADR-021：一站式安装 — Zero-CLI Onboarding
 
 **日期**：2026-05-09
-**状态**：✅ 采纳（M2 实现 Onboarding Wizard，M3 完善 Ollama 捆绑）
+**状态**：🗄 废弃（2026-11-04 订正，架构优化第 0 期 S0-1）：`ollama-manager`、`hardware-detect`、`onboarding/` 这些文件在全部 git 历史里都没有出现过；硬件探测归 ADR-036（`agent24-hw`），模型归 iDoris。原状态：✅ 采纳（M2 实现 Onboarding Wizard，M3 完善 Ollama 捆绑）
 
 ### 背景
 
@@ -914,7 +914,7 @@ ADR-020 选择了 Node.js + 内置 http（M2 过渡）。但 ADR-022 确定 MLX 
 ## ADR-024：工作流引擎 — asyncio.Queue + Step 模式
 
 **日期**：2026-05-09
-**状态**：✅ 采纳
+**状态**：⛔ 被替代（事实取代）（2026-11-04 订正，架构优化第 0 期 S0-1）：ADR-026 头部写「ADR-024 部分 Superseded」（`docs/ADR-026-rust-core-polyglot.md:8`）；原计划承接的 `agent24-workflow` crate 不存在，OpenAPI 没有 `/api/v1/workflow/*`。取代者：ADR-026。原状态：✅ 采纳
 
 ### 背景
 
@@ -1020,7 +1020,7 @@ ADR-018 当年选 Tauri，核心理由是 Rust-on-device 一致性、包体积�
 ## ADR-028：记忆架构 — 可进化 / 可替换 / 可组合的分层模型（M-D 重做）
 
 **日期**：2026-08-21
-**状态**：🟡 暂定 / 需 spike（2026-08-21 经 Codex 对抗式复审后从"采纳 85%"下调——见文末「Codex 复审收口」；保留本地优先+无强制外部服务的约束，但**不冻结**当前层边界、两列"双时相"、全局文件权威、crate 拆分）。实现分期见 `docs/specs/SPEC-MEMORY.md`
+**状态**：✅ 已接受（2026-11-04 订正，架构优化第 0 期 S0-1）：以文末「Codex 复审收口」段为正文，接受三份权威 + 可重建投影 + 单 crate + 强制 owner + 双区间时相；上面的「决策」段（四层、拆 4 个 crate）被收口段取代，只作历史保留。spike 已随 #116、#117 合入。Condenser 拆分、投影 generation、向量 / oMLX、`memory rebuild` 的对外语义仍不冻结，属开放问题。ArtifactStore、Consolidator 底座保留，不在产品路径。原状态：🟡 暂定 / 需 spike（2026-08-21 经 Codex 对抗式复审后从"采纳 85%"下调——见文末「Codex 复审收口」；保留本地优先+无强制外部服务的约束，但**不冻结**当前层边界、两列"双时相"、全局文件权威、crate 拆分）。实现分期见 `docs/specs/SPEC-MEMORY.md`
 
 ### 背景
 
@@ -1029,6 +1029,8 @@ ADR-018 当年选 Tauri，核心理由是 Rust-on-device 一致性、包体积�
 调研了业界最先进方案（对源码逐条核实，报告见研究目录）：mem0（两阶段 LLM 写 + 可插拔后端）、letta/MemGPT（core/recall/archival 自编辑 block）、cognee（ECL 任务管线）、graphiti（双时相知识图）、basic-memory（markdown 真源 + SQLite 索引）、codex（Rust rollout-trace + AGENTS.md）、cline（Memory Bank 约定）、aider（排序压缩 repo-map）、OpenHands（事件流 + 可插拔 Condenser）、Claude Code（一文件一事实 + 索引）。**收敛结论**：记忆 = 4 类角色（工作/情景/语义/程序）；分水岭是"写策略"（显式编辑 / LLM 抽取对照 / 自动压缩，最好三者组合）；本地优先系统靠 文件+SQL，"聪明召回"才要向量/图。
 
 ### 决策
+
+> 2026-11-04 起本段被文末「Codex 复审收口」取代，只作历史保留，见本 ADR 状态行。
 
 **四层记忆模型，每层一个 trait 缝、独立可换、独立可发**（"可组合"=facade 组合各层；"可替换"=每层 trait 后换实现；"可进化"=可新增层或策略而不动其余）：
 
@@ -1079,7 +1081,7 @@ Codex 对抗式复审（读了全部 9 仓库 checked-out 源码，`CODEX-REVIEW
 ## ADR-029：Agent24 内核 ↔ 领域 OS（Sin90 / Cos72…）边界 + DomainModule 挂载缝
 
 **日期**：2026-08-21
-**状态**：✅ 采纳（边界原则）；`DomainModule` 挂载缝为实现工作项（收口 #103/#104 推迟的"真正的模块挂载 seam" + Sin90KernelCtx）
+**状态**：✅ 采纳（边界原则）。（2026-11-04 订正，架构优化第 0 期 S0-1）：`DomainModule` 挂载缝已实现（`rust/crates/agent24-domain/src/lib.rs:1483` 的 `DomainModule`，挂载方 `rust/apps/agent24d/src/domain.rs:58`）。原后半句：`DomainModule` 挂载缝为实现工作项（收口 #103/#104 推迟的"真正的模块挂载 seam" + Sin90KernelCtx）
 
 ### 背景
 
@@ -1366,7 +1368,7 @@ SPEC-MD-ME §5 的 ME-3 行写的是「经 MCP/协议」，那是立项时的猜
 ## ADR-033：`agent24-decide` 位于 L3，D0-1 只定契约、不接入任何调用点
 
 **日期**：2026-10-07
-**状态**：✅ 采纳（D0-1，见 [`docs/agent/PLAN-DECIDE.md`](agent/PLAN-DECIDE.md) D0-1 行；方案见 [`docs/research/DECISION-MODELS.md`](research/DECISION-MODELS.md) §7.3）
+**状态**：✅ 采纳。（2026-11-04 订正，架构优化第 0 期 S0-1）：第 3 点「agent24d 不感知这个 crate」只适用于 D0-1；D0-3 起 agent24d 接入（`rust/apps/agent24d/src/decide_routes.rs:14`，路由 `server.rs:1489` 的 `/api/v1/decide/profile`）。原状态：✅ 采纳（D0-1，见 [`docs/agent/PLAN-DECIDE.md`](agent/PLAN-DECIDE.md) D0-1 行；方案见 [`docs/research/DECISION-MODELS.md`](research/DECISION-MODELS.md) §7.3）
 
 ### 背景
 
@@ -1505,7 +1507,7 @@ argv 会暴露给 process listing；env 容易被继承/诊断 dump；0600 普�
 ## ADR-037：产品形态与进程模型 —— agent24d 是本体，外壳都是客户端
 
 **日期**：2026-10-26
-**状态**：🟡 提议（产品方向由 jason 2026-10-26 拍板；本文待 Codex 挑战与 clestons 评审，批准前不派生产实现）
+**状态**：✅ 已接受（决策 1–5）；决策 6 待遥控设计（`REMOTE-CONTROL-HYPHAE.md` 尚未写）（2026-11-04 订正，架构优化第 0 期 S0-1）。按本文实施的 PR 已有 #1292 #1295 #1301 #1364 #1371 #1378 #1428 #1528 #1540（R3 报告 §1.1，分支 `docs/arch-review-r3-adr-docs`），「批准前不派生产实现」已不成立。决策 6 补充：遥控是 ADR-041 准入的一类来源，不单开执行入口（jason 2026-11-04 拍板 X11）。背景段描述的是基线 `3a433bb0` 的事实，之后的差异见同一报告 §1.A.6.3。原状态：🟡 提议（产品方向由 jason 2026-10-26 拍板；本文待 Codex 挑战与 clestons 评审，批准前不派生产实现）
 **事实基线**：main `3a433bb0` 只读调查，逐条证据见 [`docs/tracking/2026-10-26/SOURCE-ADR-037-facts.md`](tracking/2026-10-26/SOURCE-ADR-037-facts.md)。这份清单随本 PR 入库。
 
 ### 背景

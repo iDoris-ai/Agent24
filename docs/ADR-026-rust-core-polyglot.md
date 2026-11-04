@@ -6,7 +6,7 @@
 **日期**: 2026-07-23
 **作者**: jason / Claude Code
 **取代**: ADR-023（后端切 Python FastAPI）→ 标记 Superseded；ADR-024 部分 Superseded
-**修订**: ADR-016（消费 @auraaihq/* 包）→ 范围收缩，见 §6
+**修订**: ADR-016P（消费 @auraaihq/* 包，`docs/ADR-016-consume-auraai-packages.md`）→ 范围收缩，见 §6
 
 ---
 
@@ -195,9 +195,9 @@ agent24d ──► OpenAI-compat HTTP ──► oMLX（serving，现状已如此
 
 现有 LLM Gateway 已把 oMLX 当 OpenAI-compat HTTP 服务调用，证明**无需为调 MLX 而把主后端迁 Python**——ADR-023 的核心动机不成立。
 
-## 6. ADR-016 范围收缩（止损重复投资）
+## 6. ADR-016P 范围收缩（止损重复投资）
 
-| ADR-016 项 | 与 Rust 内核关系 | 修订 |
+| ADR-016P 项 | 与 Rust 内核关系 | 修订 |
 |---|---|---|
 | `@auraaihq/sdk`（类型） | 冗余——类型真源改为 `protocol/` schema；TS 客户端由 OpenAPI 自动生成（仓库内构建产物，不发布 npm） | 🛑 摒弃：冻结现状不再消费；模块作者改用官方 MCP TS SDK |
 | `@auraaihq/idoris`（TS AI 网关） | 冲突——智能路由是内核职责 | ⚠️ 降级为薄 adapter/客户端，不做路由 |
@@ -226,7 +226,7 @@ agent24d ──► OpenAI-compat HTTP ──► oMLX（serving，现状已如此
 
 | 里程碑 | 内容 | 完成判据（DoD） |
 |---|---|---|
-| **M-A 契约冻结 + 仓库重构**（~3-4周） | 本 ADR 定稿；ADR-023 标 Superseded；ADR-016 按 §6 收缩（sdk 摒弃）；建 `protocol/`（openapi.json + events.schema.json + module.schema.json）；仓库重构为目标 monorepo 布局（`apps/desktop` + `packages/node-daemon` + `rust/` 占位）；**Node daemon 加 `/api/v1/*` + WS 事件薄适配层，成为 agent24d 协议的 mock/参考实现**；contract tests 对 mock 全绿 | UI 全部改走 v1 协议；日常开发在 mock 上无阻塞继续 |
+| **M-A 契约冻结 + 仓库重构**（~3-4周） | 本 ADR 定稿；ADR-023 标 Superseded；ADR-016P 按 §6 收缩（sdk 摒弃）；建 `protocol/`（openapi.json + events.schema.json + module.schema.json）；仓库重构为目标 monorepo 布局（`apps/desktop` + `packages/node-daemon` + `rust/` 占位）；**Node daemon 加 `/api/v1/*` + WS 事件薄适配层，成为 agent24d 协议的 mock/参考实现**；contract tests 对 mock 全绿 | UI 全部改走 v1 协议；日常开发在 mock 上无阻塞继续 |
 | **M-B Rust 最小 daemon**（~4-6周） | Cargo workspace；agent24d 实现 health/chat（先做 oMLX 透传）/events；动态端口+token；BackendManager 加 `AGENT24_BACKEND=node\|rust` 开关；CLI 骨架 | 同一套 contract tests 双后端全绿；Electron UI 零改动可切换 |
 | **M-C Agent Loop + 调度** | Session/Run/Task 状态机；ToolCall；取消/恢复；**cron 式工作流调度器**；基础权限审批+审计；SQLite 持久化；`agent24 tui` 最小版（runs 监控 + 审批） | `agent24 run "每天8点抓RSS摘要推送"` 无人值守长期运行；SSH 登录后可用 TUI 审批 |
 | **M-D 记忆 + 模型分层** | Memory L0-L1、上下文压缩；三层路由落地；Python Worker 接入（serving 先行，LoRA 训练后置） | 日常流程 ≥80% 调用命中本地小模型 |
@@ -237,7 +237,7 @@ agent24d ──► OpenAI-compat HTTP ──► oMLX（serving，现状已如此
 
 | 风险 | 缓解 |
 |---|---|
-| 单人带宽：ADR-016 迁移 + Rust 内核并发推进超载 | M-A 先止损收缩 ADR-016；Rust 侧每里程碑保持最小可交付 |
+| 单人带宽：ADR-016P 迁移 + Rust 内核并发推进超载 | M-A 先止损收缩 ADR-016P；Rust 侧每里程碑保持最小可交付 |
 | Rust 学习曲线拖慢迭代 | M-B 刻意最小化（3 个端点）；核心复杂度后置到 M-C |
 | Rig breaking changes | 仅 adapter 层依赖，core 零依赖 Rig |
 | 双后端并存期行为漂移 | 同一 contract tests 双跑；漂移即 CI 红 |
@@ -249,5 +249,5 @@ agent24d ──► OpenAI-compat HTTP ──► oMLX（serving，现状已如此
 - Rig: github.com/0xPlaygrounds/rig（MIT）
 - MCP Rust SDK: github.com/modelcontextprotocol/rust-sdk（rmcp）
 - Goose / VT Code / Codex CLI / Pi：仅架构参考
-- 本仓库：ADR-016（`docs/ADR-016-consume-auraai-packages.md`）、ADR-017/019/022/023/024（`docs/decision.md`）
+- 本仓库：ADR-016P（`docs/ADR-016-consume-auraai-packages.md`）、ADR-017/019/022/023/024（`docs/decision.md`）
 - Brood: `protocol/PGL/CONTEXT.md`（AgentStore 承载要求）

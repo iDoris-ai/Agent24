@@ -1,5 +1,7 @@
 # ADR-043：待执行动作与对账（草案）
 
+> 初稿编号 **DRAFT-F043**（F = Fable 初稿，2026-11-04 起）。文件名与标题保留旧号；最终版是 [ADR-042](../../../adr/ADR-042-durable-actions-and-reconciliation.md)，与这里的编号不一一对应。
+
 - 状态：**提议**（2026-11-01，Fable 初稿，待 Codex 挑战与 jason 拍板）
 - 上位：[ADR-039](../../../adr/ADR-039-concept-model.md) §2.1（本体负责审批与审计）；ADR-026 硬约束 2（fail-closed）
 - 相关：ADR-K1-01 §2.4–2.6（有界调用、结果未知、不自动重试）、ADR-042（工单完成条件）、CORE-5（掉电验收方法 T9）、`docs/design/COMM-HYPHAE.md` §5（消息四层、outbox）

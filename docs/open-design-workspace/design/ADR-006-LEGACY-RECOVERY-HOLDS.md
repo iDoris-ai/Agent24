@@ -2,6 +2,8 @@
 
 索引：[架构总入口](../../architecture/README.md)・[ADR 索引](../../adr/README.md)
 
+> 规范编号：ADR-OD-006（文件名与标题保留旧号以保持链接；新文字请写 ADR-OD-006。与 `docs/decision.md` 的 ADR-006 无关）
+>
 > 状态：Accepted / frozen for incremental G4 implementation
 >
 > 接受依据：项目 owner 已批准 P0–P9 计划与阶段门禁后的自动推进；后续切片不得偏离本 ADR，重大设计变化仍需重新确认。

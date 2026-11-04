@@ -2,7 +2,7 @@
 
 索引：[架构总入口](../architecture/README.md)・[ADR 索引](README.md)
 
-- 状态：**提议**（2026-11-01，三步评审终稿，待 jason 拍板）
+- 状态：**部分接受**（2026-11-04 订正，架构优化第 0 期 S0-1）：**D1（后台作业）与 D3（`/health` 指标，先只含 `running_jobs`、`budget`）已接受**；D2、D4–D7 仍为**提议**。D1 先落不依赖 ADR-042 的最小版本，打破与 042 的循环依赖（ADR-042 §6 Q1）。依据：方案 Q9 推荐、jason 2026-11-04 拍板。原状态：提议（2026-11-01，三步评审终稿，待 jason 拍板）
 - 上位：[ADR-039](ADR-039-concept-model.md) §2.1（本体负责调度）、§3 规则 3（系统不得静默修改技能）；ADR-026 硬约束 2（fail-closed）
 - 相关：ADR-K1-01 §2.4（`pending` 作业句柄契约）；ADR-K1-02 §2.2（后台传播继承来源）；`agent24-agent/src/self_wake.rs`；`agent24-policy/src/guardian.rs`；CORE-5 5f（`/health` 契约）；`docs/design/SHUT-shutdown-observability.md`；[ADR-040](ADR-040-skill-contract-v1.md) D5（提案收件箱）；[ADR-041](ADR-041-inbound-events-admission-and-work-items.md)；[ADR-042](ADR-042-durable-actions-and-reconciliation.md)
 - 依据：[演进终稿](../research/deepseek-superagent/SUPERAGENT-EVOLUTION-2026-11-01.md) §2 裁决 12、14；文章 S1「上下文、后台执行与 Watchdog 如何落地」；原型 `docs/003-execution.md` Background work / Concurrency；原文 §4.1 全双工、§6 Watchdog；[SOURCES](../research/deepseek-superagent/SOURCES.md) S1、S2、S14

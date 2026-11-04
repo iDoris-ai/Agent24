@@ -2,7 +2,9 @@
 
 索引：[架构总入口](../../architecture/README.md)・[ADR 索引](../../adr/README.md)
 
-> **状态**：**Accepted**（2026-10-08）。三项条件都已满足：
+> **状态**：**搁置**（2026-11-04 订正，架构优化第 0 期 S0-1）：等 #692 格式矩阵冻结后再评估。至今没有实现：documents 的引擎只有 PDFKit（`rust/apps/agent24-documents/src/engine.rs:1-4`，`engine/` 下只有 `pdfkit.rs`），`rust/` 下 superdoc、soffice、libreoffice 都是 0 处。下面是原状态。
+>
+> **原状态**：**Accepted**（2026-10-08）。三项条件都已满足：
 > - 引擎方向由 jason 拍板：只用 SuperDoc 的 headless SDK（[#696 决策记录](https://github.com/iDoris-ai/Agent24/issues/696#issuecomment-6056284819)）；
 > - David 评审同意（[#696](https://github.com/iDoris-ai/Agent24/issues/696#issuecomment-6064088128)）；
 > - PR-Daemon 在 #796 给出 APPROVE（针对 `3722775`）。

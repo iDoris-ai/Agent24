@@ -2,6 +2,8 @@
 
 > 状态：P0 frozen / SOL Gate PASS
 >
+> 编号：本目录的 ADR-001 至 ADR-006 自成一套，规范编号是 ADR-OD-001 至 ADR-OD-006（2026-11-04 起，见 [ADR 索引](../../adr/README.md)「编号与冲突」）。文件名和标题保留旧号以保持链接；新文字请写 ADR-OD-00x，避免与 `docs/decision.md` 的 ADR-001 至 ADR-006 混淆。
+>
 > 日期：2026-09-19
 >
 > Agent24 基线：`69baf50d62e6e3db5ca41a8882d35deb45ea3454`
