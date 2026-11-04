@@ -481,37 +481,24 @@ describe('N1–N3 review guards', () => {
     fs.writeFileSync(file, record)
     return { current, file }
   }
-  it('N2 reaps a leaderless group only when every member belongs to this app', () => {
-    const { current, file } = stale()
-    const kill = vi.fn((pid: number) => { if (pid === 4321) throw errno('ESRCH') })
-    const ps = vi.fn()
-    reapStaleLauncher(file, current, kill, ps, () => `5001 4321 node ${current.runtimeRoot}/web.js\n5002 4321 daemon --data ${current.dataRoot}\n7000 7000 unrelated`, logger)
-    expect(kill).toHaveBeenCalledWith(-4321, 'SIGKILL')
-    expect(ps).not.toHaveBeenCalled()
-    expect(fs.existsSync(file)).toBe(false)
-  })
-  it.each(['mixed', 'tampered', 'empty', 'malformed', 'leader-reused', 'ps-denied', 'leader-permission'])('N2 refuses unverified group: %s', (cause) => {
+  it.each(['leader-gone', 'tampered', 'leader-permission'])('N2 never reaps a leaderless or unprovable group: %s', (cause) => {
+    // A group whose leader is gone has no ownership proof: member command lines that merely
+    // mention the app's directories are not evidence, so nothing is signalled.
     const { current, file } = stale(cause === 'tampered' ? '9999' : '4321')
     const kill = vi.fn((pid: number, _signal: NodeJS.Signals | 0) => { if (pid > 0) throw errno(cause === 'leader-permission' ? 'EPERM' : 'ESRCH') })
-    const warn = vi.fn()
-    const members = () => {
-      if (cause === 'ps-denied') throw new Error('denied')
-      if (cause === 'empty') return ''
-      if (cause === 'tampered') return '9998 9999 node /other-app/runtime/web.js'
-      return `5001 4321 node ${current.runtimeRoot}/web.js\n${cause === 'malformed' ? 'unparseable' : cause === 'leader-reused' ? `4321 4321 node ${current.runtimeRoot}` : '5002 4321 unrelated'}`
-    }
-    reapStaleLauncher(file, current, kill, vi.fn(), members, { info: vi.fn(), warn })
+    const ps = vi.fn(); const warn = vi.fn()
+    reapStaleLauncher(file, current, kill, ps, { info: vi.fn(), warn })
     expect(kill.mock.calls.filter(([, signal]) => signal === 'SIGKILL')).toEqual([])
+    expect(ps).not.toHaveBeenCalled()
     expect(fs.existsSync(file)).toBe(true)
-    if (['mixed', 'tampered', 'empty', 'malformed', 'leader-reused'].includes(cause)) expect(warn).toHaveBeenCalled()
+    if (cause !== 'leader-permission') expect(warn).toHaveBeenCalled()
   })
   it.each(['1', '0', '1e3', '01', '-5'])('N3 rejects pid file %s before any kill or process inspection', (record) => {
     const { current, file } = stale(record)
-    const kill = vi.fn(); const ps = vi.fn(); const members = vi.fn()
-    reapStaleLauncher(file, current, kill, ps, members, logger)
+    const kill = vi.fn(); const ps = vi.fn()
+    reapStaleLauncher(file, current, kill, ps, logger)
     expect(kill).not.toHaveBeenCalled()
     expect(ps).not.toHaveBeenCalled()
-    expect(members).not.toHaveBeenCalled()
   })
   it('N3 late old launcher exit preserves the new pid file', () => {
     const current = plan(); const old = new FakeChild()
