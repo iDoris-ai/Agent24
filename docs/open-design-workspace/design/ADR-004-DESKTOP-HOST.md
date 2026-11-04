@@ -2,6 +2,8 @@
 
 索引：[架构总入口](../../architecture/README.md)・[ADR 索引](../../adr/README.md)
 
+> 规范编号：**ADR-OD-004**（文件名和标题保留旧号以免断链；与 `docs/decision.md` 的 ADR-004 无关，见 [ADR 索引](../../adr/README.md)）
+>
 > 状态：Accepted / P0 frozen
 >
 > 依赖：`a24.workspace.v1`、`agent24.open-design.v1`

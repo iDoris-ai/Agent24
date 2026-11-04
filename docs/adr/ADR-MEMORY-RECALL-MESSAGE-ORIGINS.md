@@ -2,7 +2,7 @@
 
 索引：[架构总入口](../architecture/README.md)・[ADR 索引](README.md)
 
-**PROPOSED / 待外审接受，2026-10-26 修订（原 DRAFT 2026-10-23）。** 本修订在精确 head 上被 clestons APPROVE，即作为 R05 的外审接受记录。接受的是设计，不等于 H03 全部验收；第 6 节列出仍开着的硬门。
+**已接受（设计；#1248），2026-10-26 修订，2026-11-04 订正状态行**（原：PROPOSED / 待外审接受）。第 6 节的「仍开着」清单已过时（其中三项已关），重写为「已落地 / 仍开着」两张表另排；G1（`recall_ref` 未对照账本，`agent24-agent/src/lib.rs:556-570`）是唯一仍碰发送安全的缺口，单独开一片。 本修订在精确 head 上被 clestons APPROVE，即作为 R05 的外审接受记录。接受的是设计，不等于 H03 全部验收；第 6 节列出仍开着的硬门。
 
 实现基线是 `origin/ab/memory-p1` 的 `b9e4eb5f059e1d406e562cfbd4ec368ef5b5fc1e`（#1205 merge）。原稿的源码快照 `c19771dc4b82e79c03313a6d9018b94d3f1be7ac` 已过期。本稿静态检查，不声称运行测试。旧 #1094 来源草案仅归档，不继承其批准或迁移编号。细节契约在 `docs/agent/R05-1-EXACT-CONTRACT.md` 到 `R05-5-SEND-TRIM-AND-HOSTSYSTEM.md`，本稿只引用，不复述。
 

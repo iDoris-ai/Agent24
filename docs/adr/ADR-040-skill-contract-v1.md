@@ -2,7 +2,7 @@
 
 索引：[架构总入口](../architecture/README.md)・[ADR 索引](README.md)
 
-- 状态：**提议**（2026-11-01，三步评审终稿，待 jason 拍板）
+- 状态：**已接受（作为设计约束）**（2026-11-04 订正，jason 拍板，Q9）。ADR-038 C7 已完成（#1575，`docs/capabilities/REGISTRY.md` 已建），原先的阻塞解除，`requires` 非空可用。仍是零代码：技能加载器、版本表、评测跑器未实施；D6 主动技能 v1 不做。原状态：提议（2026-11-01，三步评审终稿）
 - 上位：[ADR-039 概念模型](ADR-039-concept-model.md) §2.3、§3 规则 3、§6
 - 相关：[ADR-038 组件契约 v1](ADR-038-component-contract-v1.md) D8、D9（能力 id、`skills` 占位）；`docs/specs/SPEC-SKILL-DISTRIBUTION.md`（三来源与版本播种，设计定稿未实现）；issue #1037；ADR-K1-03（逐工具授权）；[ADR-041](ADR-041-inbound-events-admission-and-work-items.md)（主动技能的触发来源）
 - 依据：[演进终稿](../research/deepseek-superagent/SUPERAGENT-EVOLUTION-2026-11-01.md) §2 裁决 9、§4 第 ⑦ 条；原型 `docs/004-prompts.md` Versions、`docs/002-authorization.md` Accept mode（[SOURCES](../research/deepseek-superagent/SOURCES.md) S2、S4）
