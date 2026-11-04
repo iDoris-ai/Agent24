@@ -1053,6 +1053,90 @@ describe('CreativeServeWeb', () => {
       await service.stop()
     })
 
+    it.each([false, true])('show restarts degraded once (concurrent shows: %s)', async (concurrent) => {
+      let healthy = true
+      const fetchFn = vi.fn(async () => new Response('{}', { status: healthy ? 200 : 502 }))
+      const { service, launch, spawnFn, children } = managed({
+        sidecarTimings: { healthIntervalMs: 20, healthTimeoutMs: 15, termGraceMs: 100 },
+      }, fetchFn, [new FakeChild(), new FakeChild()])
+      const first = await launch(0)
+      healthy = false
+      await vi.waitFor(() => expect(service.headlessSidecarState()).toBe('degraded'))
+      children[0].ignoreTerm = true
+      const showing = service.start()
+      const secondShow = concurrent ? service.start() : showing
+      await vi.waitFor(() => expect(spawnFn).toHaveBeenCalledTimes(2))
+      healthy = true
+      children[1].stdout.write(`${JSON.stringify(headlessReady(children[1].pid, 17458, 17459, 'replacement'))}\n`)
+      const [second, repeated] = await Promise.all([showing, secondShow])
+      expect(second).toMatchObject({ state: 'ready', instanceId: expect.any(String) })
+      expect(second.instanceId).not.toBe(first.instanceId)
+      expect(repeated.instanceId).toBe(second.instanceId)
+      expect(children[0].signals.filter(([, signal]) => signal !== 0)).toEqual([[4321, 'SIGTERM'], [-4321, 'SIGKILL']])
+      expect(spawnFn).toHaveBeenCalledTimes(2)
+      await service.stop()
+    })
+
+    it('an explicit stop during a degraded restart cancels the relaunch', async () => {
+      let healthy = true
+      const fetchFn = vi.fn(async () => new Response('{}', { status: healthy ? 200 : 502 }))
+      const { service, launch, spawnFn } = managed({
+        sidecarTimings: { healthIntervalMs: 20, healthTimeoutMs: 15, termGraceMs: 100 },
+      }, fetchFn, [new FakeChild(), new FakeChild()])
+      await launch(0)
+      healthy = false
+      await vi.waitFor(() => expect(service.headlessSidecarState()).toBe('degraded'))
+      const showing = service.start()
+      await service.stop()
+      await showing
+      expect(spawnFn).toHaveBeenCalledOnce()
+    })
+
+    it('an explicit stop also cancels a show queued behind the restart', async () => {
+      let healthy = true
+      const fetchFn = vi.fn(async () => new Response('{}', { status: healthy ? 200 : 502 }))
+      const { service, launch, spawnFn } = managed({
+        sidecarTimings: { healthIntervalMs: 20, healthTimeoutMs: 15, termGraceMs: 100 },
+      }, fetchFn, [new FakeChild(), new FakeChild()])
+      await launch(0)
+      healthy = false
+      await vi.waitFor(() => expect(service.headlessSidecarState()).toBe('degraded'))
+      const first = service.start()
+      const queued = service.start()
+      await service.stop()
+      await Promise.all([first, queued])
+      expect(spawnFn).toHaveBeenCalledOnce()
+    })
+
+    it('quit during a degraded restart does not relaunch', async () => {
+      let healthy = true
+      const fetchFn = vi.fn(async () => new Response('{}', { status: healthy ? 200 : 502 }))
+      const { service, launch, spawnFn } = managed({
+        sidecarTimings: { healthIntervalMs: 20, healthTimeoutMs: 15, termGraceMs: 100 },
+      }, fetchFn, [new FakeChild(), new FakeChild()])
+      await launch(0)
+      healthy = false
+      await vi.waitFor(() => expect(service.headlessSidecarState()).toBe('degraded'))
+      const showing = service.start()
+      await service.shutdown()
+      await showing
+      expect(spawnFn).toHaveBeenCalledOnce()
+      expect((await service.start()).instanceId).toBeUndefined()
+      expect(spawnFn).toHaveBeenCalledOnce()
+    })
+
+    it.each(['ready', 'healthy'] as const)('show reuses a %s instance', async (state) => {
+      const fetchFn = vi.fn(async () => new Response('{}', { status: state === 'healthy' ? 200 : 502 }))
+        .mockResolvedValueOnce(new Response('{}', { status: 200 }))
+      const { service, launch, spawnFn } = managed({ sidecarTimings: { healthIntervalMs: 1_000 } }, fetchFn)
+      const first = await launch(0)
+      if (state === 'healthy') await vi.waitFor(() => expect(service.headlessSidecarState()).toBe('healthy'))
+      expect(service.headlessSidecarState()).toBe(state)
+      expect((await service.start()).instanceId).toBe(first.instanceId)
+      expect(spawnFn).toHaveBeenCalledOnce()
+      await service.stop()
+    })
+
     it('probes /api/ready through the web origin for health, with a bounded request', async () => {
       const fetchFn = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => new Response('{}', { status: 200 }))
       const { service, launch } = managed({ sidecarTimings: { healthIntervalMs: 20 } }, fetchFn as never)
