@@ -44,9 +44,9 @@ r5 不改任何决策，只做三件事：把 §7（r4）的订正回写进 D2 /
 | 4 | D2a「发布 CI 记录签名前摘要」与 §7.4 本地两次构建冲突 | 改为本地两次独立构建逐字节一致后产出 | D2a |
 | 5 | `provides` 三语 `name`/`summary`/`tools` 与 §7.11「可选」冲突 | D2 示例与 D9 标可选；`tools` 缺失时 D9 的工具名比对跳过（Hyphae 现状），不判 `incompatible` | D2、D9 |
 | 6 | `notarized` 示例可选，D2a「`true` 时还要验公证」；§7.11 已禁止关闭 | macOS 资产必须 `notarized: true`，写 `false` 直接拒绝（`sign.rs:62-66`） | D2、D2a |
-| 7 | `component_contract_mismatch` / `incompatible` | 已落地一部分：Hyphae（C2）、Documents（C6）、AgentEar（C4）、Knowledge（C5）会产出。**iDoris 契约失配仍映射为 `failed`**（`component_routes.rs` 的 iDoris 分支没有 `Incompatible`），这是已知缺口，正文标注，不阻塞接受 | D3 |
+| 7 | `component_contract_mismatch` / `incompatible` | 已落地一部分：Hyphae（C2）、Documents（C6）、AgentEar（C4）、Knowledge（C5）会产出。**iDoris 契约失配仍映射为 `failed`**（`component_routes.rs` 的 iDoris 分支没有 `Incompatible`），这是已知缺口，正文标注，归方案 S1-4，不阻塞接受 | D3 |
 | 8 | `degraded` 没有来源 | 已落地：Hyphae 由 `hyphae health` 连续失败产出（C2/C3），Knowledge 缺能力产出（C5）。无需改正文，C 表已记录 | §4 |
-| 9 | 映射表落点：Rust 映射函数是死代码，实际在 TS | D5 映射表标注「`downloading`/`verifying` 在桌面 `open-design-report.ts` 映射为 installing」；Rust `from_sidecar` / `from_open_design`（`state.rs:114,130`）只被测试引用，保留为对照用例，是否删除归第 1 期 | D5 |
+| 9 | 映射表落点：Rust 映射函数是死代码，实际在 TS | D5 映射表标注「`downloading`/`verifying` 在桌面 `open-design-report.ts` 映射为 installing」；Rust `from_sidecar` / `from_open_design`（`state.rs:114,130`）只被测试引用，保留为对照用例，是否删除归 S1-7 | D5 |
 | 10 | 宽限期「锁里可配」但锁字段没有消费方 | Hyphae 已消费（§7.11）；iDoris 的同名字段未用。正文改为「按组件接入，iDoris 暂未」 | D5 |
 | 11 | D6 CLI「先 SIGTERM，2 秒后 SIGKILL」，代码直接 SIGKILL 进程组 | 按 Q13 (b) 改正文：按次 CLI 不需要落盘，直接 SIGKILL 进程组（`agent24-comm/src/runner.rs:269-285`） | D6、§3 用例 4 |
 | 12 | D7 授权按 `requires`，无代码读取 | D7 标「待接线」：`requires` 目前只被解析和校验（`lock.rs`、`documents_catalog.rs`），不参与授权，授权仍走 `Grants` 现有逻辑 | D7 |
@@ -151,12 +151,12 @@ Agent24 在 ADR-038 起草时（r4 之前）交付能力的方式各不相同。
 }
 ```
 
-- `id`、`version`、`contract`、`assets`、`provides`、`requires` 是必填字段。`signing` 的必填规则见 D2a（macOS 资产必须填，且 `notarized` 必须为 `true`，写 `false` 直接拒绝）；`reproducible` 可以不填，填了就要校验；`provides[].name`、`summary`、`tools` 可选（r4 §7.11）；示例里的 `// …` 只是注释，真实锁是纯 JSON；`assurance` 是 iDoris 那种保障等级（L1–L6 带来源），不是能力，可以为空。
+- `schema`、`id`、`version`、`source`、`contract`、`release_url_base`、`assets`、`provides`、`requires` 是必填字段（`lock.rs:15-37`）。可选字段另有 `health_failures_before_degraded`（D5 健康探测连续失败次数，缺省 3，消费方夹到 1–10）和 `stop_grace_ms`。`signing` 的必填规则见 D2a（macOS 资产必须填，且 `notarized` 必须为 `true`，写 `false` 直接拒绝）；`reproducible` 可以不填，填了就要校验；`provides[].name`、`summary`、`tools` 可选（r4 §7.11）；示例里的 `// …` 只是注释，真实锁是纯 JSON；示例里的 `version`、`commit`、哈希等都是示例值，实际见 `rust/crates/agent24-comm/hyphae.lock.json`；`assurance` 是 iDoris 那种保障等级（L1–L6 带来源），不是能力，可以为空。
 - **字段名**：提供的能力叫 `provides`，需要本体给的权限叫 `requires`。**锁和清单里不再有叫 `capabilities` 的字段**；ADR-039 §4.1 的消歧规则同样适用于这里。
 - `provides[].id` 是**能力 id**（D9），技能按它声明依赖。`requires.kernel` 对应 `DomainOsManifest.kernel_capabilities`（`events/models/scheduler/policy/memory/approval`），`requires.operations` 对应 CORE-2 的 `Operation`。
 - `assets.<platform>.executables` 列出 D2a 要验签的文件。**r4 订正（§7.7）：必填，不再有「不填等于全部 Mach-O / ELF」的默认值，且每一项必须出现在 `files` 里。**
 - 平台键统一用 `<os>-<arch>`（`darwin-arm64`、`linux-x64` …）。某个平台没有资产，就不写这个键，不写 `null`。Rust triple（`aarch64-apple-darwin`）在需要时转成这个形式；锁里不写 `null` 键。
-- `agent24-components` 拥有 `ComponentLock` 类型和通用下载器：GitHub 主机白名单、大小上限、sha256 校验、取消、进度、每个组件一把安装锁。iDoris 和 Hyphae 都用它，`fetch_verified` 已删除。边界（r4 §7.11）：`agent24-comm` 不依赖带 reqwest 的 `agent24-components`，只嵌入 Hyphae 的锁文本，解析在 agent24d；comm 的测试以 dev-dependency 使用同一解析器。
+- `agent24-components` 拥有 `ComponentLock` 类型和通用下载器：GitHub 主机白名单、大小上限、sha256 校验、取消、进度、每个组件一把安装锁。iDoris 直接用它；Hyphae 的锁由 agent24d 解析（r4 §7.11）：`agent24-comm` 不依赖带 reqwest 的 `agent24-components`，只嵌入锁文本，comm 的测试以 dev-dependency 使用同一解析器。`fetch_verified` 已删除。
 - **托管根**统一为 `~/.agent24/components/<id>/<version>/`（jason 2026-11-01 拍板）。现状对照：
   - Hyphae 已在 `state_dir/components/hyphae/<tag>`，只差把 `state_dir` 钉到 `~/.agent24`；
   - Open Design 已在 `~/.agent24/components/open-design/<odSha7>-<platform>-<arch>/`。它的版本目录名**保留**这个形式（同一 odSha 换 Electron 版本会换原生模块，目录必须区分），锁里 `version` 记 odSha；
@@ -184,7 +184,7 @@ Agent24 在 ADR-038 起草时（r4 之前）交付能力的方式各不相同。
   - 按次调用型 CLI：安装时和每次 daemon 启动时各跑一次 `contract`，不是每次调用都跑；
   - 远端服务：每次建立连接时。
 - 版本不兼容时，统一报错 `component_contract_mismatch`，带上 `{id, expected, actual}`。组件状态置为 `incompatible`，不尝试降级运行。
-  - 落地情况（r5）：Hyphae、Documents、AgentEar、Knowledge 已按此产出。**iDoris 的 `/health` `contract_version` 失配目前映射为 `failed`，不是 `incompatible`**，这是已知缺口，随第 1 期组件统一补。
+  - 落地情况（r5）：Hyphae、Documents、AgentEar、Knowledge 已按此产出。**iDoris 的 `/health` `contract_version` 失配目前映射为 `failed`，不是 `incompatible`**，这是已知缺口，由方案 S1-4（`from_idoris` 加 `Incompatible`，同时统一契约阈值）补。
 - 在版本检查之前，组件不得接到任何业务调用。
 - **进程内组件免本条运行时检查**：它和本体一起编译，失配编不过去。只要 D9 清单和 manifest `version`。
 - **MCP 免本条**：见 D1。
@@ -246,7 +246,7 @@ CLI 绑定额外规定（和 `agent24-comm/src/runner.rs` 现有约定一致）�
 - 远端服务（Knowledge）：没有 `absent / installing / installed / stopping`；未配置显示为 `stopped`，连不上、超时或 HTTP 非 2xx 为 `failed`（一次即 `failed`，不适用常驻型「连续失败 N 次才 degraded」），缺 search/read 为 `degraded`。有凭据时，能力声明兼容且完整之后再探 §8 就绪（`POST /agent24/knowledge/ready`，R8.2）：`live` 且 `search`、`read` 都 `ready` 才是 `ready`（host 的 `detail.basis` 为 `ready`）；就绪探针失败、非 2xx、`not_ready` 或 `disabled`、回显不符，统一为 `degraded`（reason `not_ready`）。没有凭据不探 §8，`ready` 只表示能力声明完整且契约兼容（`detail.basis` 为 `capabilities`），不代表依赖健康（READONLY R9.3）。能力声明为 `incompatible` 的服务，D3 要求在版本检查通过前不接业务调用：search/read 读同一份探测缓存，`incompatible`、缺该操作、或还没拿到能力声明时在本地拒绝（`incompatible` / `not_ready`），不发远端请求。
 - MCP：`installed / starting / ready / failed / stopped`。
 
-与现有三套状态的映射。**落点（r5）**：OD 的 `not-installed / paused / downloading / verifying / unavailable` 由桌面 `open-design-report.ts` 映射后再上报；Rust 的 `state.rs` `from_sidecar` / `from_open_design`（`:114,130`）没有产品调用，只被 `state/tests.rs` 引用，不是权威映射，是否删除归第 1 期：
+与现有三套状态的映射。**落点（r5）**：OD 的 `not-installed / paused / downloading / verifying / unavailable` 由桌面 `open-design-report.ts` 映射后再上报；Rust 的 `state.rs` `from_sidecar` / `from_open_design`（`:114,130`）没有产品调用，只被 `state/tests.rs` 引用，不是权威映射，是否删除归 S1-7（休眠代码收窄）；进程组终止原语统一见 S2-6：
 
 | 现有 | 来源 | 映射到 |
 |---|---|---|
@@ -279,7 +279,7 @@ CLI 绑定额外规定（和 `agent24-comm/src/runner.rs` 现有约定一致）�
 - 错误统一成 `{ code, message, retryable }` 三元组。`code` 用组件自己的命名空间，例如 `hyphae.relay_unreachable`。Agent24 只认 D3/D5 定义的通用码，其余原样透传给上层；`message` 不得包含秘密，脱敏规则见 D5。
 - 每次调用都有超时，由 Agent24 设定。超时后：
   - HTTP 绑定断开连接；
-  - CLI 绑定**直接对进程组发 SIGKILL**，再有界等待回收（`agent24-comm/src/runner.rs:269-285` `kill_and_reap`，回收窗口 2 秒）。r5 按 jason 2026-11-04 的 Q13 (b) 订正：按次调用的 CLI 不需要落盘，现行行为稳定，不引入 SIGTERM 阶段。第 1 期统一进程组终止原语（S2-6）时再评估；
+  - CLI 绑定**直接对进程组发 SIGKILL**，再有界等待回收（`agent24-comm/src/runner.rs:269-285` `kill_and_reap`，回收窗口 2 秒）。r5 按 jason 2026-11-04 的 Q13 (b) 订正：按次调用的 CLI 不需要落盘，现行行为稳定，不引入 SIGTERM 阶段。方案 S2-6 统一进程组终止原语时再评估；
   - 需要落盘的常驻组件走 D5 的停组件宽限（SIGTERM → 15 秒 → SIGKILL），与本条无关；
   - JSON-RPC 绑定发 `$/cancelRequest`（`os-proto/module.rs` 现有名字）。
 - 超时后结果算「未知」，处理方式沿用 ADR-K1-01 §2.5：会改变状态的调用不自动重试。
@@ -287,7 +287,7 @@ CLI 绑定额外规定（和 `agent24-comm/src/runner.rs` 现有约定一致）�
 
 ### D7 授权（**待接线**）
 
-> r5 状态：`requires` 目前只被解析和校验（`lock.rs`、`documents_catalog.rs`），**没有授权路径读取它**，授权仍走 `Grants` 现有逻辑。下面是目标语义，接线在第 1 期之后单独排片，不属于 C1–C8。
+> r5 状态：`requires` 目前只被解析和校验（`lock.rs`、`documents_catalog.rs`），**没有授权路径读取它**，授权仍走 `Grants` 现有逻辑。下面是目标语义，**未排期（C9）**：接线不属于 C1–C8，也不在方案第 0–2 期的分片里，见 §4 末尾的 C9 行。
 
 - 组件能调用的宿主接口 = 锁 / 清单里 `requires` 的声明 ∩ 宿主愿意给的（`Grants::granting` 现有逻辑）∩ 用户按 ADR-K1-03 确认的。三者任一缺失即拒绝。令牌由 CORE-2 按组件发放，组件不得持有 legacy 全权 token。
 - `provides` **不参与授权**。它只用于能力中心展示和技能依赖解析（D9）。
@@ -358,15 +358,16 @@ CLI 绑定额外规定（和 `agent24-comm/src/runner.rs` 现有约定一致）�
 
 | 片 | 内容 | 涉及仓库 |
 |---|---|---|
-| C1 | 在 `agent24-components` 里加 `ComponentLock`（schema 2，`provides` / `requires` / `assurance`）、通用下载器和签名验证（D2a，推广 `SignatureVerifier`：按 `executables` 逐个验、Hardened Runtime、`spctl`、放开架构）；`fetch_verified` 改用它；iDoris 锁升到 schema 2（行为不变，L1–L6 移到 `assurance`），iDoris 迁到新托管根（重下，旧目录标记可删）。**依赖方向反转**：现在 `agent24-components` 依赖 `agent24-idoris`，C1 后 `agent24-idoris` 依赖 `agent24-components`；`run_install_child` 隐藏子命令随下载器一起搬，仍由宿主二进制（`agent24d`）分发，不另起启动器 | Agent24 |
-| C1b | Hyphae 发布流水线加 Developer ID 签名与公证；锁同时换 `sha256`（签名后）和填 `reproducible.unsigned_sha256`（签名前）；Agent24 侧对 Hyphae macOS 资产启用 D2a。**排在 Hyphae 发出签名版之后**，可与 C2 同期 | Hyphae + Agent24 |
-| C2 | Hyphae 的 `contract`、`health`（`HYPHAE_OUTPUT=json` envelope）已接入 Agent24。启动时按锁里的 schema 2 `contract`（`name=hyphae-cli`、`major=1`、`min_minor=0`、`tested=1.0`）做一次握手：不兼容则组件 `incompatible`（reason `contract_mismatch`）且不启动 daemon；兼容但 minor 高于 `tested` 只记日志。daemon `running` 期间每 45 秒调一次 `hyphae health`（不拿 keystore 锁，调用有超时）；relay 等探测连续 3 次失败才把组件标 `degraded`，一次成功回到 `ready`。单次 failed 不改变状态 | Hyphae + Agent24 |
-| C3 | 新增 `GET /api/v1/components`（含 D9 清单、audience 脱敏、`Operation::ComponentsRead`）和 `POST /api/v1/components/{id}/report`；统一状态机（D5 转移表与映射表）；`GRACE_MAX_MS` 抬到 ≥15 000、默认值与 env 名统一；能力中心、通信页、本地模型页改为读这个接口。C3b：桌面上报 + 心跳 30s。Hyphae 的 `degraded` 已由 `hyphae health` 接入（见 C2）：进程 `running` 且已挂探测时，首份探测成功前是 `starting`（D5「健康探测首次通过才 ready」；L1），头几份就失败也按连续 N 次进 `degraded`；未挂探测（fixture、旧路径）仍直接映射为 `ready`。N 取锁的可选字段 `health_failures_before_degraded`（缺省 3，范围夹到 1–10）；一次成功回到 `ready`。host 视图 `detail.health` 带各探测项的状态和连续失败次数；redacted 视图没有这些 | Agent24 |
+| C1 | 在 `agent24-components` 里加 `ComponentLock`（schema 2，`provides` / `requires` / `assurance`）、通用下载器和签名验证（D2a，推广 `SignatureVerifier`：按 `executables` 逐个验、Hardened Runtime、`spctl`、放开架构）；`fetch_verified` 改用它；iDoris 锁升到 schema 2（行为不变，L1–L6 移到 `assurance`），iDoris 迁到新托管根（重下，旧目录标记可删）。**依赖方向反转**：现在 `agent24-components` 依赖 `agent24-idoris`，C1 后 `agent24-idoris` 依赖 `agent24-components`；`run_install_child` 隐藏子命令随下载器一起搬，仍由宿主二进制（`agent24d`）分发，不另起启动器。**已完成**（#1539，2026-11-02） | Agent24 |
+| C1b | Hyphae 发布流水线加 Developer ID 签名与公证；锁同时换 `sha256`（签名后）和填 `reproducible.unsigned_sha256`（签名前）；Agent24 侧对 Hyphae macOS 资产启用 D2a。**排在 Hyphae 发出签名版之后**，可与 C2 同期。**已完成**（Agent24 侧 #1551，2026-11-02；启动验签拒绝信号 #1552，2026-11-02） | Hyphae + Agent24 |
+| C2 | Hyphae 的 `contract`、`health`（`HYPHAE_OUTPUT=json` envelope）已接入 Agent24。启动时按锁里的 schema 2 `contract`（`name=hyphae-cli`、`major=1`、`min_minor=0`、`tested=1.0`）做一次握手：不兼容则组件 `incompatible`（reason `contract_mismatch`）且不启动 daemon；兼容但 minor 高于 `tested` 只记日志。daemon `running` 期间每 45 秒调一次 `hyphae health`（不拿 keystore 锁，调用有超时）；relay 等探测连续 3 次失败才把组件标 `degraded`，一次成功回到 `ready`。单次 failed 不改变状态。**已完成**（Hyphae 侧锁升级 #1546，2026-11-02；Agent24 侧握手与 `hyphae health` 探测 #1574，2026-11-04） | Hyphae + Agent24 |
+| C3 | 新增 `GET /api/v1/components`（含 D9 清单、audience 脱敏、`Operation::ComponentsRead`）和 `POST /api/v1/components/{id}/report`；统一状态机（D5 转移表与映射表）；`GRACE_MAX_MS` 抬到 ≥15 000、默认值与 env 名统一；能力中心、通信页、本地模型页改为读这个接口。C3b：桌面上报 + 心跳 30s。Hyphae 的 `degraded` 已由 `hyphae health` 接入（见 C2）：进程 `running` 且已挂探测时，首份探测成功前是 `starting`（D5「健康探测首次通过才 ready」；L1），头几份就失败也按连续 N 次进 `degraded`；未挂探测（fixture、旧路径）仍直接映射为 `ready`。N 取锁的可选字段 `health_failures_before_degraded`（缺省 3，范围夹到 1–10）；一次成功回到 `ready`。host 视图 `detail.health` 带各探测项的状态和连续失败次数；redacted 视图没有这些。**已完成**（C3a #1545，C3b #1549，均 2026-11-02；Hyphae `degraded` 随 #1574） | Agent24 |
 | C4 | AgentEar：只在 `/api/v1/components` 里登记（attach 子集状态），握手不变；D2/D2a 不适用（见 D2a 缺口说明）；补 §3 用例 2、3、4。**已完成（2026-11-03）**：已登记模块出现在 `GET /api/v1/components`（`form=attach`，attach 子集，清单 version，`provides` 留空——无 D9 目录）；协议区间失配记 `incompatible`，握手线仍是 `version_mismatch`；超时发 `$/cancelRequest` 且不重试。未注册不补 `not_attached` 占位 | Agent24 |
 | C5 | Knowledge：把 `/system/capabilities` 映射到 D3/D5（远端服务子集）。**已完成**（2026-11-03）：已配置 binding 在一个总时限内并发探测该端点，结果按 TTL 缓存且同一指纹只打一次；契约 major 不兼容为 `incompatible`，缺 search/read 为 `degraded`（`missing_capability:<名>`），连不上、超时或 HTTP 非 2xx 为 `failed`（一次即失败，不是连续 N 次），未配置为 `stopped`。有凭据时再探 §8 就绪（R8.2）：`live` 且 search/read 都 `ready` 才是 `ready`（`detail.basis` 为 `ready`），否则 `degraded`（`not_ready`）；没有凭据不探，`ready` 只表示能力声明完整、契约兼容（`detail.basis` 为 `capabilities`），不代表依赖健康（READONLY R9.3）。D3 业务调用闸：search/read 在本地读同一份探测缓存，`incompatible`、缺该操作、没拿到声明时不发远端请求。闸门只看这次调用所属 endpoint（base URL）的那一份读数，缓存里除合并视图外还存逐 URL 的结果，一个 binding 的失败或失配不会拒绝另一个 binding 的调用；组件列表仍显示合并视图。闸门读到本 endpoint 的 `failed` 时，缓存只沿用 4 秒，不是 30 秒。**§8 就绪探测会让服务端留下审计记录（READONLY R10）**，探测频率受 TTL 约束：每个已激活且有凭据的 endpoint 至多每 30 秒一次（`failed` 的短窗口只重探能力声明，只有声明兼容才发 §8）；同一轮探测由 singleflight 合并，组件列表与闸门共用 | Agent24 |
 | C6 | Documents：补 D9 清单。**已完成**（2026-11-03）：清单是模块自带的 `rust/apps/agent24-documents/component.json`，编译进 agent24d（不写入 `domain-os.yml`，那份是握手 manifest）。`/components` 用清单的 provides 与 version；形态按 D5 为常驻。D2 的锁等独立发版再补。**D9 expected-vs-actual 已落地**：`version` 显示 mount report 的运行时版本，清单版本在 host 的 `detail.expected_version`；版本不一致**不改状态**（按需下载的包可能比本体新或旧），只在 `detail` 加 `actual_version` 和 `update_available: true`；manifest 声明了该能力却缺清单里的工具名，为 `incompatible` / `component_contract_mismatch`（`detail` 带 `expected`/`actual`/`missing`），且只覆盖实时状态为 `ready` 或 `degraded` 的读数；清单期望的能力不在 manifest 的非空 `provides` 里，该项标 `availability: unavailable`，manifest 多出的能力忽略。manifest 没声明 `provides`（Documents 现状）不做能力比对 | Agent24 |
 | C7 | 领域 OS、进程内 DomainModule、MCP：补 D9 清单（MCP 自动生成），状态接入 C3；`REGISTRY.md` 建表。**已完成**（2026-11-03）：登记表见 `docs/capabilities/REGISTRY.md` | Agent24 |
 | C8 | Open Design：桌面经 `POST /api/v1/components/{id}/report` 上报安装与运行状态；打包模式迁到 `SidecarManager`（TS）托管。**已完成**（2026-11-04，#1580 主片，#1584 e2e 跟进；jason 拍板 Q1 = (b)，设计见 [C8-SIDECAR-DESIGN](../tracking/2026-11-04/C8-SIDECAR-DESIGN.md)）。Rust 的 `agent24-sidecar-host` 这次不接：打包模式的进程由 `SidecarManager` 托管（`open-design-sidecar.ts`：launcher / health / POSIX 进程组 tree controller），上报的运行态由 manager 状态派生（`healthy` 映射为 `ready`，`degraded` 照实报）。崩溃后懒重启，自动有界重启另开一片。SIGTERM / SIGINT / SIGHUP 由 Electron 转为 app.quit，经 before-quit / will-quit 共享同一次 22 s 有界 stop，不使用 128+n 退出码（只在 macOS 打包版上实测；应用就绪前或主进程卡死时收到的信号不保证走到退出流程，遗留进程按崩溃处理）。degraded 时再次打开视图会先停止旧实例再启动新实例。运行目录记录 launcher pgid；下次启动时发现上次留下的 launcher 只记日志、不发信号（pid 文件加 ps 快照证明不了信号落地时组号还属于我们）；新实例照常启动并覆盖 pgid 记录，所以应用崩溃或被 SIGKILL 后遗留的 OD 进程在 sidecar-host 接管前只能手工清理。重复退出事件仍等待同一次有界 stop，不会因第二次信号立即退出。另一个已知风险：强杀走 POSIX 进程组，组长退出后，「组非空」探测和 SIGKILL 之间组号可能被复用，没有原子手段消除；普通桌面负载下概率很低，彻底解决要靠生命周期绑定的监督进程（sidecar-host，Linux 可用 pidfd）。SIGKILL / 崩溃无法执行退出处理；身份无法确认（含 launcher 已退出仅剩子进程）时宁可保留，绝不猜测误杀。checkout 模式仍在 `CreativeServeWeb`（可选的 PR-2）。OD 下载迁进 daemon 不在 v1 | Agent24 |
+| C9 | D7 `requires` 授权接线：令牌按 `requires` ∩ grants ∩ 同意发放，组件不再持有 legacy 全权 token。**待排，未定期** | Agent24 |
 
 **C1–C8 全部完成（r5，2026-11-05）。** 没有挂账的迁移片；各片内的已知缺口（iDoris 失配映射、code-page 比对、`agent24 idoris gc`、D7 接线、D10 实现）在对应条款里标注。
 
@@ -386,7 +387,7 @@ C1 最先做：它不改任何外部行为，而且能马上去掉 `fetch_verifi
   - `lifecycle.rs` 的宽限上限要抬，影响现有领域 OS 的停止时长。
 - **风险**：契约名和 major 的划分如果太粗，「换品牌」仍然要写适配器。v1 接受这一点，不追求零适配。
 
-## 6. 已拍板（jason，2026-11-01）
+## 6. 已拍板（jason，2026-11-01 与 2026-11-04）
 
 1. 托管根统一为 `~/.agent24/components/<id>/<version>/`（Open Design 的版本目录名保留 `<odSha7>-<platform>-<arch>`）。
 2. 停止宽限期默认 15 秒（单次调用取消宽限 2 秒另计）。

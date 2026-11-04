@@ -18,7 +18,7 @@
 2. [架构分层总览](../ARCHITECTURE-LAYERS.md)：L0 到 L7 各层是什么、依赖关系、未完成清单。
 3. [可进化性评估（终稿）](EVOLVABILITY-ASSESSMENT-2026-11-01.md)：现在的结构能不能支撑持续进化、组件换了影响谁、自进化和训练的缺口。
 4. [Super Agent 演进（终稿）](../research/deepseek-superagent/SUPERAGENT-EVOLUTION-2026-11-01.md)：向持续工作的 Super Agent 演进要补哪些机制，对应 ADR-040 至 ADR-043。
-5. [ADR-038 组件契约 v1](../adr/ADR-038-component-contract-v1.md)：组件怎么声明、授权、签名。草案 r3。
+5. [ADR-038 组件契约 v1](../adr/ADR-038-component-contract-v1.md)：组件怎么声明、授权、签名。已接受（r5）。
 
 ## 按层和子系统
 
