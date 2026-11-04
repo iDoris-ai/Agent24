@@ -9,7 +9,7 @@
 | 统计区间 | 首期没有上一期 sha，取「最近两周」：`--since=2026-10-22`（区间内最早的主线提交 `2a67f8914`）到 `f818b0bf` |
 | 数据来源 | 本地 git：`git log --first-parent --merges`（§1、§2）；`git tag`（§2）。没有访问 GitHub，所以不含评审状态、CI 结果和 issue |
 | 生成方式 | §1 由脚本 `scripts/gen-tracking-merges.py` 生成；§2 的版本和 release 合并由 `git tag -l --format='%(refname:short)|%(creatordate:short)' 'v0.6.0-preview.*'` 与同一条 `git log` 中的 `release/*`、`integrate/*` 分支筛出；其余各节手写 |
-| 节奏 | 每两周或每次 release 出一期（Q11）。下期的 `--since` 改为本期的 HEAD sha（`git log <上期sha>..HEAD --first-parent --merges` 的形式，脚本的 `--since` 参数可换成日期） |
+| 节奏 | 每两周或每次 release 出一期（Q11）。下期用 `python3 scripts/gen-tracking-merges.py --from-sha f818b0bfd7f53cdf15fd0265bbb56f4bb8cb9e8b`（范围 `<上期sha>..HEAD`，首期没有上期所以用了 `--since`） |
 
 ## 0. 本期一句话
 

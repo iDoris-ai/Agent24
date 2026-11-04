@@ -29,17 +29,17 @@
 
 | 方向 | 里程碑 | 集成分支 | 目标 | 状态 | 依赖 | 计划文档 |
 |---|---|---|---|---|---|---|
-| 架构优化（本期总纲） | 第 0 期：文档与 ADR 收口 | `docs/p0-*`（逐片分支） | 把文档与 ADR 订正到与代码一致，补通讯 ADR、路由约定、跟踪文档 | DOING（7 片） | 无 | [方案 §4.1](../2026-11-04/ARCH-OPTIMIZATION-PLAN.md) |
+| 架构优化（本期总纲） | 第 0 期：文档与 ADR 收口 | `docs/p0-*`（逐片分支） | 把文档与 ADR 订正到与代码一致，补通讯 ADR、路由约定、跟踪文档 | 已推分支，评审中（7 片） | 无 | [方案 §4.1](../2026-11-04/ARCH-OPTIMIZATION-PLAN.md) |
 | 架构优化 | 第 1 期：低风险结构调整 | 待定 | OpenAPI 漂移、签名单源、`daemon.json` 单一解析器、状态映射、OD pin 单源、休眠代码、OS 包完整性 | READY（等第 0 期腾出评审） | 无硬依赖 | 方案 §4.2 |
 | 架构优化 | 第 2 期：agent24d 瘦身 | 待定 | 拆 `server.rs`，下沉 iDoris / Knowledge / attach，进程组终止原语 | BACKLOG | S0-5 先把新边界写进文档 | 方案 §4.3 |
 | 组件统一 | ADR-038 / ADR-039 收尾 | `main` | 组件契约、清单、统一状态面；运行期契约检查接线 | C1–C8 DONE；ADR 订正 DOING（S0-2） | S0-2 | [ADR-038](../../adr/ADR-038-component-contract-v1.md)、[COMPONENT-ROADMAP](../../agent/COMPONENT-ROADMAP.md) |
-| 通讯（Hyphae） | COMM 系列、好友机制 | `ab/comm`（main 领先 2487，该分支领先 11） | 常规通信先做；好友机制之后；ADR-044 | DOING；ADR-044 在 S0-4 | Q12 已定 | [COMM-HYPHAE](../../design/COMM-HYPHAE.md)、[COMM-FRIENDS](../../design/COMM-FRIENDS.md) |
-| 决策模型 | D0–D3 | `ab/decide`（main 领先 2462，分支领先 25） | 决策服务 D0 契约 / 规则后端已有，D1 接线未排期 | 未核实当前排期 | — | [PLAN-DECIDE](../../agent/PLAN-DECIDE.md) |
+| 通讯（Hyphae） | COMM 系列、好友机制 | `ab/comm`（落后 main 两千多提交（2487），该分支领先 11；需先吸收 main 或归档） | 常规通信先做；好友机制之后；ADR-044 | DOING；ADR-044 在 S0-4 | Q12 已定 | [COMM-HYPHAE](../../design/COMM-HYPHAE.md)、[COMM-FRIENDS](../../design/COMM-FRIENDS.md) |
+| 决策模型 | D0–D3 | `ab/decide`（落后 main 两千多提交（2462），分支领先 25；需先吸收 main 或归档） | 决策服务 D0 契约 / 规则后端已有，D1 接线未排期 | 未核实当前排期 | — | [PLAN-DECIDE](../../agent/PLAN-DECIDE.md) |
 | 记忆 | P1 | `ab/memory-p1`（本次未列出远端分支，**未核实**） | 个人记忆生命周期与清除权 | 未核实；MEMORY-P1 设计 ADR 拟接受（S0-1） | S0-1 | [PLAN-MEMORY-P1](../../agent/PLAN-MEMORY-P1.md) |
 | 内核 | K1 / CORE-2 / CORE-5 | `ab/kernel`（main 领先 457，分支领先 1） | CORE-5 剩 5g 外壳识别、5h 安装器回退、5i 授权 retry；CORE-2 余项与 AgentEar 纵切 | 在 jason 自己的线上 | — | [CORE-5 设计](../../agent/CORE-5-MIGRATION-GUARD-DESIGN.md)、[CORE-2 AgentEar 纵切](../../agent/CORE-2-AGENTEAR-SLICE.md) |
 | Documenting | T1 | `ab/documenting`（main 领先 138，分支领先 0） | David 负责；已集成合并 #1591 | 已合入 main | — | `docs/documenting/` |
 | 知识库 | WeKnora | `ab/weknora`（main 领先 135，分支领先 0） | David 负责；已集成合并 #1589 | 已合入 main | — | [ADR-KB-01](../../knowledge/ADR-KB-01-SINGLE-CONVERSATION.md) |
-| 其他集成分支 | maint / office-assistant | `ab/maint`（分支领先 2）、`ab/office-assistant`（分支领先 27） | 本期未核实内容 | 未核实 | — | — |
+| 其他集成分支 | maint / office-assistant / 其余 | `ab/maint`（分支领先 2）、`ab/office-assistant`（分支领先 27）、`ab/kernel-22-egress-exec-memory`、`ab/documenting-adr039-1159-rulings`、`ab/weknora-03a-state-machine`、`ab/weknora-03b-ui-bridge`、`ab/weknora-03c-ops`（后五个未逐个核实领先 / 落后数） | 本期未核实内容 | 未核实 | — | — |
 
 ## 2. 按方向的任务表
 
@@ -51,13 +51,13 @@
 
 | 任务 id | 标题 | 状态 | 负责 | PR / 分支 | 验收（摘自方案 §4.1） |
 |---|---|---|---|---|---|
-| S0-1 | ADR 状态一次性订正 | DOING | Remote | 待开 | 索引每行状态与文首一致；`CORE-5-…:200` 与 `decision.md:1508` 不再矛盾；每个「取代」写明取代者。前置 Q8、Q9 已定 |
-| S0-2 | ADR-038 r5 订正稿 | DOING | Remote | 待开 | R3 §1.A.1.5 的 16 条逐条有处置；`registry_lists_every_capability_id_the_components_emit` 仍绿。C8 按 Q1 (b) 改写 |
-| S0-3 | 编号别名 | DOING | Remote | 待开 | 不改任何文件名；`git grep 'ADR-00[1-6]-[A-Z]'` 链接数不变（23）；索引写明唯一发号处、下一号 ADR-044 |
-| S0-4 | 通讯 ADR-044 草案 | DOING | Remote | 待开 | 每条决策有出处 file:line；X1 / X7 / X11 有结论；与 ADR-041 边界写清。前置 Q12 已定、S0-3 |
-| S0-5 | ARCHITECTURE-LAYERS 重新生成 | DOING（已推送，PR 待开） | Remote（本机子代理） | 分支 `docs/p0-layers-regen` | 依赖表与 `cargo metadata --no-deps` 输出逐行一致，脚本 `scripts/gen-layer-deps.py` |
-| S0-6 | 三份跟踪文档首期 | DOING（本文件所属） | Remote | 分支 `docs/p0-tracking-first-issue` | 三份都带数据来源 / 生成方式 / HEAD sha；PROGRESS §1 由 `git log --merges` 生成；方案 §4 的分片进本表 |
-| S0-7 | 路由命名约定（ADR-045） | DOING | Remote | 待开 | 约定可被一个门禁测试检查（新增路径不得含下划线、参数名在白名单内）。前置 Q4 已定：只约束新路由 |
+| S0-1 | ADR 状态一次性订正 | 已推分支，评审中 | Remote | 分支 `docs/p0-adr-status-numbering`（PR 待开） | 索引每行状态与文首一致；`CORE-5-…:200` 与 `decision.md:1508` 不再矛盾；每个「取代」写明取代者。前置 Q8、Q9 已定 |
+| S0-2 | ADR-038 r5 订正稿 | 已推分支，评审中 | Remote | 分支 `docs/p0-adr-038-r5`（PR 待开） | R3 §1.A.1.5 的 16 条逐条有处置；`registry_lists_every_capability_id_the_components_emit` 仍绿。C8 按 Q1 (b) 改写 |
+| S0-3 | 编号别名 | 已推分支，评审中 | Remote | 分支 `docs/p0-adr-status-numbering`（PR 待开） | 不改任何文件名；`git grep 'ADR-00[1-6]-[A-Z]'` 链接数不变（23）；索引写明唯一发号处、下一号 ADR-044 |
+| S0-4 | 通讯 ADR-044 草案 | 已推分支，评审中 | Remote | 分支 `docs/p0-adr-044-communication`（PR 待开） | 每条决策有出处 file:line；X1 / X7 / X11 有结论；与 ADR-041 边界写清。前置 Q12 已定、S0-3 |
+| S0-5 | ARCHITECTURE-LAYERS 重新生成 | 已推分支，评审中 | 本机子代理 | 分支 `docs/p0-layers-regen`（PR 待开） | 依赖表与 `cargo metadata --no-deps` 输出逐行一致，脚本 `scripts/gen-layer-deps.py` |
+| S0-6 | 三份跟踪文档首期 | 已推分支，评审中 | 本机子代理 | 分支 `docs/p0-tracking-first-issue`（PR 待开） | 三份都带数据来源 / 生成方式 / HEAD sha；PROGRESS §1 由 `git log --merges` 生成；方案 §4 的分片进本表 |
+| S0-7 | 路由命名约定（ADR-045） | 已推分支，评审中 | Remote | 分支 `docs/p0-adr-045-route-naming`（PR 待开） | 约定可被一个门禁测试检查（新增路径不得含下划线、参数名在白名单内）。前置 Q4 已定：只约束新路由 |
 | S0-8（可后置） | KB-HOST-01 落成 ADR-KB-02；iDoris 托管 ADR（O3）；ADR-035 标部分取代 | BACKLOG | Remote | — | 仓内有凭据交接与授权归属的正文。前置 S0-3 |
 
 #### 第 1 期：低风险结构调整
@@ -76,14 +76,14 @@
 
 #### 第 2 期：agent24d 瘦身（Q3 = (B)）
 
-前置：S0-5 完成。每片先移动、后修行为，同一 PR 不混。
+前置：S0-5 完成。每片先移动、后修行为，同一 PR 不混。**S2-4 排在 S2-1、S2-2 之后**（方案 §4.3：S2-4 依赖 S2-1，且与 S2-2 错开以减少冲突）。
 
 | 任务 id | 标题 | 状态 | 负责 | PR | 验收 |
 |---|---|---|---|---|---|
 | S2-1 | 拆 `server.rs` | BACKLOG | Remote + Grok 收尾 | — | `serve()` < 300 行；启动黑盒测试全绿；源码断言测试同步更新 |
 | S2-2 | iDoris 托管下沉 `agent24-idoris` | BACKLOG | Grok | — | agent24d 减约 2,500 行；idoris 自身测试覆盖原用例 |
 | S2-3 | Knowledge 宿主下沉 `agent24-knowledge` | BACKLOG | Grok（Opus 评审；凭据类须等 PR-Daemon APPROVE） | — | agent24d 减约 1,800 行；C5 探测测试原样通过 |
-| S2-4 | attach 新建 `agent24-attach` | BACKLOG | Grok | — | agent24d 减约 1,500 行；C4 用例原样通过 |
+| S2-4 | attach 新建 `agent24-attach`（排在 S2-1、S2-2 之后） | BACKLOG | Grok | — | agent24d 减约 1,500 行；C4 用例原样通过 |
 | S2-5 | 鉴权抽 `agent24-auth` | CANCELLED：Q3 = (B)，鉴权留 agent24d 核心 | — | — | — |
 | S2-6 | 进程组终止原语统一 | BACKLOG（#1580 已合，前置已满足；Q13 选 (b)） | Grok | — | 同一组回收 / 超时 / 僵尸测试跑在共用实现上 |
 | S2-7 | CLI 补齐（Q5 = (b)） | BACKLOG | Grok | — | 先补 Comm 私钥备份恢复和 Knowledge 绑定，release 用例可走 CLI；OD 下载与 presence 留桌面并在 `AGENTS.md` 写明例外 |
