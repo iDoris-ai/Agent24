@@ -1,14 +1,16 @@
 # Knowledge M5：样本库端到端验收用例（#1001 退出验收 1）
 
 - **对象**：在主对话里检索样本知识库，按证据作答，并给出来源。这是 11-11 版本的主线（M1–M5）。
-- **怎么跑**：先在本机起一个 WeKnora，见下面「WeKnora 怎么起」；然后在本 checkout 里运行：
+- **怎么跑**：先在本机起 WeKnora，同一个数据库上要有两个 app，一个是 standalone 模式，一个是 integration 模式，见下面「WeKnora 怎么起」。然后在本 checkout 里运行：
 
   ```
-  python3 -I scripts/kb-m5-accept.py --bin <含 agent24d 的目录> --weknora http://127.0.0.1:<app 端口> [--work <目录>] \
-      [--model-url <Ollama 地址> --model <模型名>]
+  python3 -I scripts/kb-m5-accept.py --bin <含 agent24d 的目录> \
+      --weknora http://127.0.0.1:<standalone app 端口> --agent24-weknora http://127.0.0.1:<integration app 端口> \
+      [--work <目录>] [--model-url <Ollama 地址> --model <模型名>]
   ```
 
   - `--bin` 指向 `cargo build -p agent24d` 的产物目录。
+  - `--weknora` 是 standalone 的 app，脚本在这里注册、建库、上传、建 key。`--agent24-weknora` 是同一数据库上的 integration app，绑定的端点经故障代理转到这里。daemon 只认 `mode` 为 `integration` 的服务端（CONTRACT-READONLY R9.4，`knowledge_probe.rs`），所以脚本建完数据后先查 `--agent24-weknora` 的 `GET /api/v1/system/capabilities`，不是 integration 就停下并说明原因。
   - 不带 `--model-url` 时，模型是脚本内置的 stub（只监听本机 loopback），结果可重复。带上之后，用指定的 Ollama 模型作答（例如开发期的 Modal 代理），中间经过一个记录器，用来取得模型看到的工具结果。
   - 脚本逐条打出 PASS 或 FAIL，并在工作目录里写 `report.md`。只要有一条 FAIL，就以非 0 退出。
 - **按桌面的做法走**：
@@ -30,7 +32,7 @@
   - 一把只对这个知识库有效的 retrieve key。
 
   v0.8.x 即使只做关键词检索也要 embedding，所以脚本在 `127.0.0.1:11434` 起一个伪 Ollama，返回按文本哈希得出的固定向量。这个端口必须空闲。
-- **故障代理**：绑定的端点不是 WeKnora 本身，而是脚本在回环上起的一个代理 `Faulty`。它默认把每个调用原样转给 `--weknora`，负例 N4–N10 时才按用例弄坏 search 或 read：
+- **故障代理**：绑定的端点不是 WeKnora 本身，而是脚本在回环上起的一个代理 `Faulty`。它默认把每个调用原样转给 `--agent24-weknora`。daemon 自己的探测（`GET /system/capabilities`、`POST /agent24/knowledge/ready`）只透传，不记录、不弄坏。负例 N4–N10 时才按用例弄坏 search 或 read：
   - 接了连接不回就断开；
   - 先压住若干秒再转发；
   - 改掉 read 期望的 `content_tag`，相当于这一块在被引用之后变了；
@@ -66,7 +68,10 @@
 - 用 WeKnora fork `a24/develop` 本地构建的 app 镜像，构建脚本是 `scripts/agent24/probe/build-local-app.sh`。官方镜像里没有 `/api/v1/agent24/knowledge/*`。
 - app 容器要设置 `AGENT24_KNOWLEDGE_TAG_KEY`，值为 standard base64、至少 32 字节。没有这个变量时，search 和 read 都关闭，返回 `forbidden`/`operation_disabled`。
 - 设置方法：在栈目录里另写一个 compose 覆盖文件，把 app 的 image 换成本地构建的 tag，并加上这个变量，然后执行 `docker compose -f docker-compose.yml -f <覆盖文件> up -d --no-build app`。
-- 不要用独立模式之外的 `AGENT24_KNOWLEDGE_MODE`：集成模式下注册、建库等接口都返回 404，脚本没法建数据。
+- 建数据用 standalone，Agent24 连 integration，两个 app 用同一个数据库：
+  - standalone app 保持默认，不设 `AGENT24_KNOWLEDGE_MODE`。脚本在这里建数据。集成模式下注册、建库等接口都返回 404，所以建数据不能放在 integration app 上。
+  - integration app 设 `AGENT24_KNOWLEDGE_MODE=integration`，只放行 health、capabilities、ready、search、read 五条路由。它要求 RBAC 开着（`tenant.enable_rbac` 默认就是开）、`tenant.enable_cross_tenant_access` 为 false，并且 `AGENT24_KNOWLEDGE_TAG_KEY` 和 standalone app 取同一个值，content_tag 才对得上。
+  - 做法：在覆盖文件里从 `app` 派生一个服务（`extends: {file: docker-compose.yml, service: app}`），image 用同一个本地 tag，换 `container_name` 和宿主端口（`ports: !override`），加上上面两个变量和 `AUTO_MIGRATE=false`（迁移交给 standalone app 做）。然后执行 `docker compose -f docker-compose.yml -f <覆盖文件> up -d --no-build app <新服务名>`。
 
 ## 结果
 见 PR 正文中贴出的 `report.md`。
