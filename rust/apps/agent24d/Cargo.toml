@@ -47,7 +47,7 @@ http-body-util = "0.1"
 rand = "0.9"
 zeroize = "1"
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 # ME4-4.2.3b (design §6.5): `GET /api/v1/usage?module=` reads the raw query
 # string itself (via `axum::extract::RawQuery`) rather than axum's `Query`
 # extractor, so a malformed `module`-less query never turns into a 400 (v2
