@@ -26,6 +26,7 @@ pub mod daemon;
 pub mod error;
 mod export;
 mod groupchat;
+mod hyphae_probe;
 pub mod import;
 pub mod keystore_lock;
 pub mod npub;
@@ -42,6 +43,11 @@ pub use daemon::{
     read_autostart, reap_orphan,
 };
 pub use error::CommError;
+pub use hyphae_probe::{
+    CONTRACT_TIMEOUT, CheckView, ContractExpectation, ContractView,
+    HEALTH_FAILURES_BEFORE_DEGRADED, HEALTH_INTERVAL, HEALTH_TIMEOUT, HealthView, ProbeArm,
+    ProbeSnapshot,
+};
 pub use import::{ImportReport, ImportRequest, import};
 pub use keystore_lock::{KeystoreGuard, KeystoreWriteLock};
 pub use npub::is_valid_npub;

@@ -69,7 +69,7 @@ impl HyphaeLock {
         &self.0
     }
 
-    /// Release tag (`v0.30.0`); also the managed-root version directory.
+    /// Release tag (`v0.30.1`); also the managed-root version directory.
     pub fn version(&self) -> &str {
         &self.0.version
     }
@@ -261,29 +261,29 @@ mod tests {
     }
 
     #[test]
-    fn embedded_lock_is_the_signed_v0_30_0_release() {
+    fn embedded_lock_is_the_signed_v0_30_1_release() {
         // Byte-for-byte the published release file (ADR-038 §7.4).
         assert_eq!(
             agent24_comm::binary::sha256_of(HYPHAE_LOCK_JSON.as_bytes()).to_hex(),
-            "55c4d493dacf60ecbfc4f42571aa5f140ab80c30dad4013acf6340eab8e2e1cf"
+            "0a3d77d3f50582b4690946000c5e4f7da185403f14e3f2da282a6abeb990bf6f"
         );
         let lock = HyphaeLock::embedded().unwrap();
         let c = lock.component();
         assert_eq!(c.schema, 2);
-        assert_eq!(lock.version(), "v0.30.0");
-        assert_eq!(c.source.commit, "0e0d4ea46d78675ed3f5c9e02ddc146398860edb");
+        assert_eq!(lock.version(), "v0.30.1");
+        assert_eq!(c.source.commit, "068e2d2e5a657bbf87204b3892451e8a280ac3a7");
         assert_eq!(
             lock.expected_for("darwin-arm64").unwrap().to_hex(),
-            "a9fbaef99b60f330b834c5eff58ed8e2af1a9ea902ae8f481c43ac2ffd3eb9a4"
+            "7a079c5d43d6179dda0e46f05d0c31d991c0b7ada42a41b862d508a09e67b172"
         );
         assert_eq!(
             lock.expected_for("linux-x64").unwrap().to_hex(),
-            "b30fd252b04b19666a111bae0ffa5ab954ccca4a8166e033982a9ae3acd48607"
+            "096d9664fb4ab7ebf2bb11204bb78e076cf45b58c140e8a753e5d247f008b838"
         );
         assert_eq!(c.assets["linux-x64"].name, "hyphae-linux-amd64");
         assert_eq!(
             c.asset_url(&c.assets["darwin-arm64"]),
-            "https://github.com/iDoris-ai/Hyphae/releases/download/v0.30.0/hyphae-darwin-arm64"
+            "https://github.com/iDoris-ai/Hyphae/releases/download/v0.30.1/hyphae-darwin-arm64"
         );
         let signing = c.signing.as_ref().unwrap();
         assert_eq!(signing.macos_team_id, "HYAP444FN9");
@@ -299,7 +299,7 @@ mod tests {
             repro.unsigned_sha256["linux-x64"],
             c.assets["linux-x64"].sha256
         );
-        assert!(repro.recipe.contains("-X main.version=v0.30.0"));
+        assert!(repro.recipe.contains("-X main.version=v0.30.1"));
         assert_eq!(c.stop_grace_ms, Some(15000));
         assert!(c.accepts_contract(&c.contract.tested));
         assert!(matches!(
@@ -472,8 +472,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "downloads the pinned v0.30.0 asset from GitHub; on macOS also runs codesign + spctl"]
-    async fn real_github_v0_30_0_matches_lock_and_signature() {
+    #[ignore = "downloads the pinned v0.30.1 asset from GitHub; on macOS also runs codesign + spctl"]
+    async fn real_github_v0_30_1_matches_lock_and_signature() {
         let dir = tempfile::tempdir().unwrap();
         let lock = HyphaeLock::embedded().unwrap();
         let platform = agent24_comm::current_platform();
@@ -500,7 +500,7 @@ mod tests {
             assert_eq!(at_rest, SignatureCheck::UnsignedPlatform);
         }
         eprintln!(
-            "verified Hyphae v0.30.0 {platform}: {} bytes, sha256 {}, install-time signature ok, at rest {at_rest:?}",
+            "verified Hyphae v0.30.1 {platform}: {} bytes, sha256 {}, install-time signature ok, at rest {at_rest:?}",
             bytes.len(),
             digest.to_hex()
         );

@@ -3,7 +3,13 @@ import { randomUUID } from 'node:crypto'
 /** Dynamic values are kept in main-process memory and never serialized to the renderer. */
 export interface SidecarEndpoint {
   readonly origin: string
-  readonly secret: string
+  /**
+   * `'secret'` (default): the endpoint is authenticated and `secret` is required.
+   * `'none'`: the sidecar's loopback port does not authenticate (Open Design today);
+   * no secret is carried, and none is invented to satisfy the contract.
+   */
+  readonly auth?: 'none' | 'secret'
+  readonly secret?: string
 }
 
 export interface SidecarEndpointHandoff {

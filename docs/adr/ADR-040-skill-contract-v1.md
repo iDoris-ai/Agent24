@@ -11,7 +11,7 @@
 
 ADR-039 已定义技能：从用户目标出发、按步骤组合多项能力；内容有说明、步骤、依赖的能力、评测用例、版本；本身不持有权限；是自进化的主要对象，改动必须有版本、通过评测、经过审批、可回滚。
 
-现状：没有加载器（`rust/` 下 `skill` 零命中；#1037 OPEN）；`SPEC-SKILL-DISTRIBUTION.md` 定了三来源（内置 / 分发 / 用户，优先级用户 > 分发 > 内置，同名整体取代）与版本播种规则，未实现；`agent24-memory::knowledge` 有 propose → 人工 approve 的收件箱可复用；能力 id 登记表 `docs/capabilities/REGISTRY.md` **尚不存在**，由 ADR-038 C7 建。
+现状：没有加载器（`rust/` 下 `skill` 零命中；#1037 OPEN）；`SPEC-SKILL-DISTRIBUTION.md` 定了三来源（内置 / 分发 / 用户，优先级用户 > 分发 > 内置，同名整体取代）与版本播种规则，未实现；`agent24-memory::knowledge` 有 propose → 人工 approve 的收件箱可复用；能力 id 登记表 `docs/capabilities/REGISTRY.md` 已由 ADR-038 C7 建立（`model-gateway`、Hyphae 的四个 `nostr-*`、`documents`；`mcp-<server>` 自动生成，不逐条入表）。
 
 上午的可进化性评估建议 5 写「评测门槛以后再加」，与随后接受的 ADR-039 规则 3 矛盾。本 ADR 服从 ADR-039：评测是激活前置。
 

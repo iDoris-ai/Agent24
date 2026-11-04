@@ -20,8 +20,8 @@
 ┌──────────────────────── L7 外壳（入口）────────────────────────────┐
 │ apps/desktop（Electron main）                                       │
 │   BackendManager ✅ 拉起 daemon：Unix 默认 capability 模式，Windows 用 legacy │
-│   CreativeServeWeb ✅ 直接拉起 Open Design + Creative WebContentsView │
-│   SidecarManager 🟡（通用 sidecar 规格，产品路径未使用）               │
+│   CreativeServeWeb ✅ 选启动方式 + Creative WebContentsView            │
+│   SidecarManager ✅ 托管 Open Design（POSIX 独立进程组；C8）           │
 │ agent24-cli（含 `agent24 acp` ✅ ACP→REST/WS 映射桥）                  │
 │ packages/：api-client（生成客户端）· contract-tests · nostr/wechat 桥 │
 │            · node-daemon（v1 协议的 mock / 参考实现 daemon）          │
@@ -31,8 +31,8 @@
 │ ① 进程内 DomainModule 🟡（挂载缝已实现；当前无生产内置模块）           │
 │ ② 进程外领域 OS ✅（ME-3/ME-4/K1：Sin90 / Cos72 / Documents）          │
 │ ③ 附着模块 ✅（A3：AgentEar，CORE-2 登记）                             │
-│ ④ Sidecar 集成（Open Design）：现行 ✅ CreativeServeWeb + ACP 桥；      │
-│    目标形态 🟡 SidecarManager + agent24-sidecar-host + CreativeRuntime │
+│ ④ Sidecar 集成（Open Design）：现行 ✅ SidecarManager 托管 + ACP 桥；   │
+│    目标形态 🟡 + agent24-sidecar-host + CreativeRuntime                │
 │ （另：MCP server 的工具 ✅ → 包装成普通 Tool 走同一条审批流水线）       │
 └──────────────┬───────────────────────────────────────────────────────┘
 ┌──────────────▼──────── L5½ 领域 OS 运行时（agent24d 依赖）────────────┐
@@ -204,7 +204,7 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 
 | 方面 | 现行产品路径 ✅ | 目标形态（ADR-004/005）🟡 |
 |---|---|---|
-| 进程托管 | Electron main 的 `CreativeServeWeb` 直接拉起：checkout 模式 `node … od.mjs`，打包模式拉起 headless launcher | 通用 `SidecarManager`（TS）+ `agent24-sidecar-host`（Rust，Windows Job Object / POSIX 进程组归属与回收） |
+| 进程托管 | **打包模式**：`CreativeServeWeb` 选启动方式和下载前置，进程交给 `SidecarManager`（TS）托管（C8）：launcher 以 `detached` 拉起，POSIX 独立进程组；就绪、健康检查（`GET /api/ready`，连续 3 次失败报 `degraded`，不自动重启）、停止（TERM 只发 launcher，15 s 宽限后对整个进程组 SIGKILL）、崩溃后整组回收都由 manager 负责；崩溃后懒重启（下次打开或点重启）。**checkout 模式**仍由 `CreativeServeWeb` 直接拉起 `node … od.mjs`。**Windows 暂不支持**（launcher 返回 `unsupported platform`，Job Object 留给 sidecar-host）。端点不鉴权（`auth: 'none'`）。已知缺口：OD daemon 自己 detach 的 agent 子进程在强杀时可能残留；Electron 被 SIGKILL 时进程组会留下 | 在此基础上接 `agent24-sidecar-host`（Rust，Windows Job Object / 父进程死亡监视），并补自动有界重启（ADR-004 §6） |
 | 分发（2026-10-05 裁决） | **不再打进安装包**（曾把 AppImage 从 146MB 顶到 934MB、deb 从 101MB 顶到 622MB）；电子打包只带一个小 manifest，首次点开 Design 页时由 `open-design-component.ts` 按需下载、校验 sha256、解压、再启动 | 同左 |
 | 界面 | Creative 页是 `WebContentsView`，使用**全局持久**的 session 分区 `persist:agent24-creative`，带同源导航拦截和请求代际栅栏 | 按 app 实例 + workspace 派生的**非持久**分区，detach / 切换时清除 cookie、localStorage、cache、service worker（ADR-004） |
 | 运行时协议 | Open Design 每个会话拉起 `agent24 acp`，把 ACP 会话/提示映射成 REST/WS run，执行仍在 agent24d | 同左 |
@@ -217,7 +217,7 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 
 ### L7 外壳
 
-- **apps/desktop（Electron）**：唯一的桌面 main 进程。`BackendManager` 托管 agent24d（Unix 默认 capability 模式）；`CreativeServeWeb` 托管 Open Design；`SidecarManager` 已实现但产品路径未使用。
+- **apps/desktop（Electron）**：唯一的桌面 main 进程。`BackendManager` 托管 agent24d（Unix 默认 capability 模式）；`SidecarManager` 托管 Open Design 的 headless 进程（C8），`CreativeServeWeb` 负责选启动方式、下载前置和对外状态；`agent24-sidecar-host` 尚未接线。
 - **agent24-cli**：v1 协议客户端（capability 模式下先 `enroll`，需要时 `elevate`）；`agent24 acp` 是 ACP-over-stdio 映射桥，不持有执行逻辑。
 - **packages/**：
   - `api-client`：由 OpenAPI 生成的 TS 客户端；
@@ -289,7 +289,7 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 
 1. **边界**：照 [ADR-001](open-design-workspace/design/ADR-001-INTEGRATION-BOUNDARIES.md) 写一份。Agent24 是唯一 AI 控制面，第三方只是工作区，不拿工具权限。
 2. **源码**：fork + pin，本仓库只放契约、宿主、桥、pin、集成测试；Apache-2.0 记得保留 NOTICE。
-3. **进程**：目标是 `SidecarManager` + `agent24-sidecar-host`。今天 Open Design 用的是专门写的 `CreativeServeWeb`，第二个工具不应再复制一份。
+3. **进程**：用 `SidecarManager`（C8 起 Open Design 已走它）：每个工具只写自己的 launcher、health 和 tree controller（参考 `open-design-sidecar.ts`）。目标再接 `agent24-sidecar-host`（Windows 与父进程死亡监视）。
 4. **运行时协议**：能说 ACP 就复用 `agent24 acp`；否则写一个同样"只做映射、不持有权限"的桥。
 5. **权限**：一个 workspace + 一个限定在该 workspace 的短期令牌。前提是 capability 的路由级资源授权已实现、并已在产品路径启用（见 §5 第一行）。
 6. **验收与落地**：精确 SHA 的 E2E（M10 用的 harness 保存在 PR #654 的 `refs/pull/654/head`）；锁定 main、打 tag、合并预演、合并后再跑 gate（[M10 落地指南](design/OPEN-DESIGN-M10-MAIN-LANDING-GUIDE.md)，现作为 M10 的历史审计记录保留）。
