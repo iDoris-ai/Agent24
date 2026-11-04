@@ -3191,7 +3191,7 @@ fn failure() -> agent24_os_proto::failure::RunFailure {
 fn documents_d9_catalog_parses_the_module_tools() {
     let catalog = documents_catalog::DocumentsCatalog::embedded().unwrap();
     assert_eq!(catalog.id, "documents");
-    assert_eq!(catalog.version, "0.1.0");
+    assert_eq!(catalog.version, "0.2.0");
     assert_eq!(catalog.name.en, "Documents");
     assert_eq!(catalog.name.zh, "文档");
     assert!(!catalog.name.th.is_empty());
@@ -3225,7 +3225,7 @@ fn documents_d9_catalog_parses_the_module_tools() {
     let item = documents_from(None, None, Ok(catalog));
     assert_eq!(item.form, Form::Resident);
     assert_eq!(item.state, ComponentState::Absent);
-    assert_eq!(item.version.as_deref(), Some("0.1.0"));
+    assert_eq!(item.version.as_deref(), Some("0.2.0"));
     assert!(item.reason.is_none());
     assert_eq!(item.provides.len(), 1);
     assert_eq!(item.provides[0].id, "documents");
@@ -3492,14 +3492,14 @@ fn documents_d9_states_stay_in_the_resident_subset() {
             assert!(detail.is_some());
         }
     }
-    let report = mount_report_at(MountOutcome::Mounted, "0.1.0");
+    let report = mount_report_at(MountOutcome::Mounted, "0.2.0");
     let item = documents_from(
         Some(&report),
         Some(&Supervised::Running),
         documents_catalog::DocumentsCatalog::embedded(),
     );
     assert_eq!(item.state, ComponentState::Ready);
-    assert_eq!(item.version.as_deref(), Some("0.1.0"));
+    assert_eq!(item.version.as_deref(), Some("0.2.0"));
     assert_eq!(item.form, Form::Resident);
     assert!(!item.provides.is_empty());
     assert!(item.form.allows(item.state));
@@ -3513,7 +3513,7 @@ async fn documents_d9_entry_lists_provides_and_redacts() {
     let doc = find(&full, "documents");
     assert_eq!(doc["state"], "absent");
     assert_eq!(doc["form"], "resident");
-    assert_eq!(doc["version"], "0.1.0");
+    assert_eq!(doc["version"], "0.2.0");
     assert!(doc.get("reason").is_none());
     assert_eq!(doc["provides"][0]["id"], "documents");
     assert_eq!(doc["provides"][0]["name"]["en"], "Local documents");
@@ -4038,11 +4038,11 @@ fn running(report: &crate::domain::MountReport) -> Item {
 /// `version` is what runs; the catalog's goes to `detail.expected_version`.
 #[test]
 fn documents_version_is_the_runtime_and_the_catalog_is_the_expectation() {
-    let ok = running(&mount_report_at(MountOutcome::Mounted, "0.1.0"));
+    let ok = running(&mount_report_at(MountOutcome::Mounted, "0.2.0"));
     assert_eq!(ok.state, ComponentState::Ready);
-    assert_eq!(ok.version.as_deref(), Some("0.1.0"));
+    assert_eq!(ok.version.as_deref(), Some("0.2.0"));
     assert!(ok.reason.is_none());
-    assert_eq!(ok.detail.as_ref().unwrap()["expected_version"], "0.1.0");
+    assert_eq!(ok.detail.as_ref().unwrap()["expected_version"], "0.2.0");
 
     let drifted = running(&mount_report_at(MountOutcome::Mounted, "9.9.9"));
     // A different version is not a contract mismatch (M4 of the L3 review): a
@@ -4055,7 +4055,7 @@ fn documents_version_is_the_runtime_and_the_catalog_is_the_expectation() {
         "the runtime's, not the catalog's"
     );
     let detail = drifted.detail.as_ref().unwrap();
-    assert_eq!(detail["expected_version"], "0.1.0");
+    assert_eq!(detail["expected_version"], "0.2.0");
     assert_eq!(detail["actual_version"], "9.9.9");
     assert_eq!(detail["update_available"], true);
     assert!(detail.get("expected").is_none() && detail.get("kind").is_none());
@@ -4072,8 +4072,8 @@ fn documents_version_is_the_runtime_and_the_catalog_is_the_expectation() {
     // and the state stays `absent`.
     let none = documents_from(None, None, documents_catalog::DocumentsCatalog::embedded());
     assert_eq!(none.state, ComponentState::Absent);
-    assert_eq!(none.version.as_deref(), Some("0.1.0"));
-    assert_eq!(none.detail.as_ref().unwrap()["expected_version"], "0.1.0");
+    assert_eq!(none.version.as_deref(), Some("0.2.0"));
+    assert_eq!(none.detail.as_ref().unwrap()["expected_version"], "0.2.0");
 }
 
 /// The tool mismatch overrides a live `ready` or `degraded` only (L4): a package
@@ -4126,7 +4126,7 @@ fn a_documents_tool_mismatch_overrides_only_a_live_reading() {
     for (outcome, live, want) in cases {
         let report = report_with(
             outcome.clone(),
-            "0.1.0",
+            "0.2.0",
             vec![declared("documents", vec![])],
         );
         let item = documents_from(
@@ -4174,7 +4174,7 @@ fn a_capability_the_manifest_omits_is_unavailable_and_extras_are_ignored() {
     // state does not change (D9: actual is a subset of expected).
     let report = report_with(
         MountOutcome::Mounted,
-        "0.1.0",
+        "0.2.0",
         vec![declared("other-cap", vec!["documents.list".into()])],
     );
     let item = running(&report);
@@ -4190,7 +4190,7 @@ fn a_capability_the_manifest_omits_is_unavailable_and_extras_are_ignored() {
     // the extra is not shown.
     let report = report_with(
         MountOutcome::Mounted,
-        "0.1.0",
+        "0.2.0",
         vec![
             declared("documents", embedded_tools()),
             declared("extra-cap", vec![]),
@@ -4208,7 +4208,7 @@ fn a_capability_the_manifest_omits_is_unavailable_and_extras_are_ignored() {
     );
 
     // A package that declares no capabilities says nothing either way.
-    let item = running(&report_with(MountOutcome::Mounted, "0.1.0", vec![]));
+    let item = running(&report_with(MountOutcome::Mounted, "0.2.0", vec![]));
     assert_eq!(item.provides[0].availability, None);
     assert_eq!(item.state, ComponentState::Ready);
 }
@@ -4219,7 +4219,7 @@ fn a_declared_capability_without_an_expected_tool_is_a_contract_mismatch() {
     tools.retain(|t| t != "documents.find");
     let report = report_with(
         MountOutcome::Mounted,
-        "0.1.0",
+        "0.2.0",
         vec![declared("documents", tools)],
     );
     let item = running(&report);
@@ -4286,7 +4286,7 @@ async fn documents_expected_vs_actual_reaches_the_list_and_hides_detail_from_oth
     assert_eq!(doc["state"], "ready");
     assert!(doc.get("reason").is_none());
     assert_eq!(doc["version"], "9.9.9");
-    assert_eq!(doc["detail"]["expected_version"], "0.1.0");
+    assert_eq!(doc["detail"]["expected_version"], "0.2.0");
     assert_eq!(doc["detail"]["update_available"], true);
     assert_eq!(doc["provides"][0]["availability"], "unavailable");
 
