@@ -320,4 +320,203 @@ describe('SidecarManager', () => {
     expect(manager.status()).toMatchObject({ state: 'healthy', instanceId: current?.instanceId })
     await manager.stop()
   })
+
+  describe('C8 additions', () => {
+    const okEndpoint = { origin: 'http://127.0.0.1:4312', secret: 's'.repeat(32) }
+    function controllable() {
+      let exit!: (code: number | null) => void
+      const c = { pid: 60, exitCode: null as number | null, signalCode: null, onExit: (listener: (code: number | null) => void) => { exit = listener; return () => {} } }
+      return { child: c, exit: (code: number | null) => exit(code) }
+    }
+
+    it('onStatus reports each transition once, in order, and never repeats a state', async () => {
+      const manager = new SidecarManager(spec, { launch: () => ({ child, processGroupId: 42, dedicatedProcessGroup: true, tree, ready }) }, { check: vi.fn().mockResolvedValue(true) }, { stop: vi.fn().mockResolvedValue(undefined) })
+      const seen: string[] = []
+      manager.onStatus((status) => seen.push(status.state))
+      await manager.start()
+      await new Promise((resolve) => setTimeout(resolve, 250)) // two more successful probes: healthy -> healthy is not an event
+      await manager.stop()
+      expect(seen).toEqual(['starting', 'ready', 'healthy', 'stopping', 'stopped'])
+    })
+
+    it('onStatus carries the instance id once the child is owned, and unsubscribing stops delivery', async () => {
+      const manager = new SidecarManager(spec, { launch: () => ({ child, processGroupId: 42, dedicatedProcessGroup: true, tree, ready }) }, { check: vi.fn().mockResolvedValue(true) }, { stop: vi.fn().mockResolvedValue(undefined) })
+      const seen: Array<string | undefined> = []
+      const off = manager.onStatus((status) => { if (status.state === 'healthy') seen.push(status.instanceId) })
+      await manager.start()
+      expect(seen).toEqual([manager.status().instanceId])
+      off()
+      await manager.stop(); await manager.start()
+      expect(seen).toHaveLength(1)
+      await manager.stop()
+    })
+
+    it('a throwing status listener cannot disturb the state machine or other listeners', async () => {
+      const logger = { info: vi.fn(), warn: vi.fn() }
+      const manager = new SidecarManager(spec, { launch: () => ({ child, processGroupId: 42, dedicatedProcessGroup: true, tree, ready }) }, { check: vi.fn().mockResolvedValue(true) }, { stop: vi.fn().mockResolvedValue(undefined) }, undefined, logger)
+      const after = vi.fn()
+      manager.onStatus(() => { throw new Error('listener bug') })
+      manager.onStatus(after)
+      await expect(manager.start()).resolves.toMatchObject({ state: 'healthy' })
+      expect(after).toHaveBeenCalled()
+      expect(logger.warn).toHaveBeenCalledWith('sidecar.status_listener_failed', expect.objectContaining({ error: 'listener bug' }))
+      await manager.stop()
+    })
+
+    it('restarts from failed once a crash has been fully cleaned up, with a new instance', async () => {
+      const first = controllable()
+      const launcher: SidecarLauncher = { launch: vi.fn().mockReturnValueOnce({ child: first.child, processGroupId: 60, dedicatedProcessGroup: true, tree, ready }).mockReturnValueOnce({ child: childFor(61), processGroupId: 61, dedicatedProcessGroup: true, tree, ready }) }
+      const manager = new SidecarManager(spec, launcher, { check: vi.fn().mockResolvedValue(true) }, { stop: vi.fn().mockResolvedValue(undefined) })
+      const states: string[] = []
+      manager.onStatus((status) => states.push(status.state))
+      await manager.start()
+      const crashed = manager.status().instanceId
+      first.exit(1)
+      await vi.waitFor(() => expect(manager.status()).toEqual({ state: 'failed', sidecarId: 'creative', instanceId: undefined }))
+      await expect(manager.start()).resolves.toMatchObject({ state: 'healthy' })
+      expect(manager.status().instanceId).not.toBe(crashed)
+      expect(launcher.launch).toHaveBeenCalledTimes(2)
+      // failed -> starting directly; no unplanned failed -> stopped in between.
+      expect(states.slice(states.indexOf('failed'), states.indexOf('failed') + 2)).toEqual(['failed', 'starting'])
+      await manager.stop()
+    })
+
+    it('does not start over a failed instance that is still owned (crash cleanup not finished)', async () => {
+      const first = controllable()
+      const stuck = deferred<void>()
+      const slowTree: SidecarTreeController = { signal: vi.fn(() => stuck.promise), isEmpty: vi.fn().mockResolvedValue(false) }
+      const launcher: SidecarLauncher = { launch: vi.fn(() => ({ child: first.child, processGroupId: 60, dedicatedProcessGroup: true, tree: slowTree, ready })) }
+      const manager = new SidecarManager({ ...spec, shutdown: { termGraceMs: 1, killAfterMs: 50 } }, launcher, { check: vi.fn().mockResolvedValue(true) })
+      await manager.start()
+      first.exit(1)
+      await vi.waitFor(() => expect(slowTree.signal).toHaveBeenCalled())
+      const owner = manager.status().instanceId
+      expect(manager.status().state).toBe('failed')
+      expect(owner).toBeDefined()
+      await expect(manager.start()).resolves.toMatchObject({ state: 'failed', instanceId: owner })
+      expect(launcher.launch).toHaveBeenCalledOnce()
+      stuck.resolve()
+    })
+
+    it('accepts an unauthenticated endpoint only with auth "none" and no secret', async () => {
+      expect(() => validateReady({ endpoint: { origin: 'http://127.0.0.1:4312', auth: 'none' } })).not.toThrow()
+      expect(() => validateReady({ endpoint: { origin: 'http://127.0.0.1:4312', auth: 'none', secret: 'x' } })).toThrow('must not carry a secret')
+      expect(() => validateReady({ endpoint: { origin: 'http://127.0.0.1:4312', auth: 'secret' } })).toThrow('secret is empty')
+      expect(() => validateReady({ endpoint: { origin: 'http://127.0.0.1:4312' } })).toThrow('secret is empty')
+      expect(() => validateReady({ endpoint: { origin: 'http://127.0.0.1:4312', auth: 'maybe' as never } })).toThrow('auth mode is invalid')
+      expect(() => validateReady({ endpoint: { ...okEndpoint, secret: 'short' } })).toThrow('weak')
+      // The origin rules apply to unauthenticated endpoints too.
+      expect(() => validateReady({ endpoint: { origin: 'http://example.com:4312', auth: 'none' } })).toThrow('loopback')
+    })
+
+    it('publishes an origin-only endpoint for auth "none"', async () => {
+      const handoff = new MemoryEndpointHandoff()
+      const manager = new SidecarManager(
+        spec,
+        { launch: () => ({ child, processGroupId: 42, dedicatedProcessGroup: true, tree, ready: Promise.resolve({ endpoint: { origin: 'http://127.0.0.1:4312', auth: 'none' as const } }) }) },
+        { check: vi.fn().mockResolvedValue(true) }, { stop: vi.fn().mockResolvedValue(undefined) }, handoff,
+      )
+      await manager.start()
+      expect(handoff.current()?.endpoint).toEqual({ origin: 'http://127.0.0.1:4312', auth: 'none' })
+      await manager.stop()
+    })
+
+    it('a child leaving because of our own stop is not a crash: no failed state, stopping -> stopped', async () => {
+      const target = controllable()
+      const exitingTree: SidecarTreeController = { signal: vi.fn(async () => { target.exit(0) }), isEmpty: vi.fn().mockResolvedValue(true) }
+      const manager = new SidecarManager(spec, { launch: () => ({ child: target.child, processGroupId: 60, dedicatedProcessGroup: true, tree: exitingTree, ready }) }, { check: vi.fn().mockResolvedValue(true) })
+      const states: string[] = []
+      await manager.start()
+      manager.onStatus((status) => states.push(status.state))
+      await manager.stop()
+      expect(states).toEqual(['stopping', 'stopped'])
+    })
+
+    it('a stop that arrives while readiness is pending is a cancellation even if the child then exits', async () => {
+      const target = controllable()
+      const pending = deferred<SidecarReady>()
+      const exitingTree: SidecarTreeController = { signal: vi.fn(async () => { target.exit(0) }), isEmpty: vi.fn().mockResolvedValue(true) }
+      const manager = new SidecarManager({ ...spec, readyTimeoutMs: 1_000 }, { launch: () => ({ child: target.child, processGroupId: 60, dedicatedProcessGroup: true, tree: exitingTree, ready: pending.promise }) }, { check: vi.fn() })
+      const starting = manager.start()
+      await manager.stop()
+      pending.reject(new Error('launcher exited before ready'))
+      await expect(starting).resolves.toMatchObject({ state: 'stopped' })
+    })
+  })
+})
+
+describe('PR1580 lifecycle regressions', () => {
+  const launch = () => ({ child, processGroupId: 42, dedicatedProcessGroup: true, tree, ready })
+  it('F1 readiness resolving during stop never republishes the endpoint', async () => {
+    const pending = deferred<SidecarReady>(); const stopping = deferred<void>()
+    const handoff = new MemoryEndpointHandoff()
+    const manager = new SidecarManager(spec, { launch: () => ({ ...launch(), ready: pending.promise }) }, { check: vi.fn() }, { stop: () => stopping.promise }, handoff)
+    const start = manager.start(); const stop = manager.stop()
+    pending.resolve(await ready)
+    await start
+    stopping.resolve(); await stop
+    expect(handoff.current()).toBeNull()
+    expect(manager.status().state).not.toBe('ready')
+  })
+  it('F3 stopped listener can restart and stop the new instance', async () => {
+    const stopper = { stop: vi.fn().mockResolvedValue(undefined) }
+    const manager = new SidecarManager(spec, { launch }, { check: vi.fn().mockResolvedValue(true) }, stopper)
+    await manager.start()
+    let restarted: Promise<unknown> | undefined
+    const remove = manager.onStatus((status) => {
+      if (status.state === 'stopped') {
+        remove()
+        const starting = manager.start()
+        restarted = Promise.all([starting, manager.stop()])
+      }
+    })
+    await manager.stop(); await restarted
+    expect(stopper.stop).toHaveBeenCalledTimes(2)
+    expect(manager.status().state).toBe('stopped')
+  })
+  it('F4 starting listener stop awaits the launched instance cleanup', async () => {
+    const cleanup = deferred<void>()
+    const stopper = { stop: vi.fn(() => cleanup.promise) }
+    const manager = new SidecarManager(spec, { launch }, { check: vi.fn() }, stopper)
+    let stopped = false
+    manager.onStatus((status) => { if (status.state === 'starting') void manager.stop().then(() => { stopped = true }) })
+    const start = manager.start()
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(stopped).toBe(false)
+    expect(stopper.stop).toHaveBeenCalledOnce()
+    cleanup.resolve(); await start
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(stopped).toBe(true)
+  })
+  it('M10b F7 rejects wrong pgid and retains detached cleanup for retry', async () => {
+    const stopper = { stop: vi.fn().mockRejectedValueOnce(new Error('cleanup failed')).mockResolvedValue(undefined) }
+    const manager = new SidecarManager(spec, { launch: () => ({ ...launch(), processGroupId: 99 }) }, { check: vi.fn() }, stopper)
+    await expect(manager.start()).rejects.toThrow('cleanup failed')
+    await expect(manager.start()).resolves.toMatchObject({ state: 'failed' })
+    await manager.stop()
+    expect(stopper.stop).toHaveBeenCalledTimes(2)
+    const clean = new SidecarManager(spec, { launch: () => ({ ...launch(), processGroupId: 99 }) }, { check: vi.fn() }, stopper)
+    await expect(clean.start()).rejects.toThrow('not an owned child group')
+  })
+  it('M17 overlapping health intervals do not re-enter a probe', async () => {
+    vi.useFakeTimers()
+    const pending = deferred<boolean>()
+    const health = { check: vi.fn().mockResolvedValueOnce(true).mockImplementation(() => pending.promise) }
+    const manager = new SidecarManager({ ...spec, healthIntervalMs: 10, healthTimeoutMs: 100 }, { launch }, health, { stop: vi.fn().mockResolvedValue(undefined) })
+    try {
+      await manager.start(); await vi.advanceTimersByTimeAsync(40)
+      expect(health.check).toHaveBeenCalledTimes(2)
+      pending.resolve(true); await manager.stop()
+    } finally { vi.useRealTimers() }
+  })
+  it('M20 stopActive clears the installed health interval', async () => {
+    vi.useFakeTimers()
+    const clear = vi.spyOn(globalThis, 'clearInterval')
+    const manager = new SidecarManager(spec, { launch }, { check: vi.fn().mockResolvedValue(true) }, { stop: vi.fn().mockResolvedValue(undefined) })
+    try {
+      await manager.start(); await manager.stop()
+      expect(clear).toHaveBeenCalled()
+      expect(vi.getTimerCount()).toBe(0)
+    } finally { clear.mockRestore(); vi.useRealTimers() }
+  })
 })
