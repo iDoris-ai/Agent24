@@ -80,7 +80,10 @@
 
 ## 跟踪文档
 
-仓库目前没有「架构 + 方案 / 里程碑 / 进度」三份带日期的统一跟踪文档（`docs/tracking/2026-10-26/` 下只有一份[事实清单](../tracking/2026-10-26/SOURCE-ADR-037-facts.md)）。现有的跟踪文档：
+现行跟踪是 `docs/tracking/<日期>/` 下三份带日期的快照，最新日期目录为准（每两周或每次 release 一期）：
 
-- 状态权威：[tasks](../agent/tasks.md)、[progress](../agent/progress.md)、[roadmap](../agent/roadmap.md)、[followups](../agent/followups.md)
-- 更早的里程碑线：[specs/TASKS.md](../specs/TASKS.md)、[ROADMAP](../ROADMAP.md)、[PLAN](../PLAN.md)
+- 首期（2026-11-05）：[架构与方案](../tracking/2026-11-05/ARCH-AND-PLAN.md)、[里程碑与任务](../tracking/2026-11-05/MILESTONES-AND-TASKS.md)、[进度](../tracking/2026-11-05/PROGRESS.md)
+- 总纲：[架构优化方案（2026-11-04）](../tracking/2026-11-04/ARCH-OPTIMIZATION-PLAN.md)；[ADR-037 事实清单](../tracking/2026-10-26/SOURCE-ADR-037-facts.md)
+- 历史（不再更新）：[tasks](../agent/tasks.md)、[progress](../agent/progress.md)、[roadmap](../agent/roadmap.md)
+- 仍在用的明细账：[followups](../agent/followups.md)（append-only）、[COMPONENT-ROADMAP](../agent/COMPONENT-ROADMAP.md)
+- 更早的里程碑线（已作废）：[specs/TASKS.md](../specs/TASKS.md)、[ROADMAP](../ROADMAP.md)、[PLAN](../PLAN.md)
