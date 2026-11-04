@@ -47,7 +47,7 @@
 | 长期记忆与上下文 | **部分有** | [`SessionMemory`](rust/crates/agent24-agent/src/session_memory.rs:60) 直接持有 `KvStore`／`SessionLog`，召回调用具体 FTS；agent loop 已消费召回。FTS 有重建，但不等于向量模型迁移或可移植恢复包。 |
 | 记忆升级保护 | **部分有，未接生产** | [`migration_coordinator.rs`](rust/apps/agent24d/src/migration_coordinator.rs:20) 为 `ENABLED=false`；`server.rs:521` 打不开记忆仍返回 `None`。 |
 | 工具契约与权限 | **有，覆盖仍需逐路径验收** | K1-01..04；`module_tool_runtime.rs::invoke` 校验运行代际和获准制品，已有同意与撤销接线。不能照抄早期 ADR 中“尚无实现”的历史描述。 |
-| 技能安装与升级 | **没有完整实现** | 对 `rust/`、`apps/desktop/`、`packages/` 检索未发现 `SkillLoader`／`SkillRegistry`／`skill_loader`；ADR-039 明确 DRAFT-C040 待写。 |
+| 技能安装与升级 | **没有完整实现** | 对 `rust/`、`apps/desktop/`、`packages/` 检索未发现 `SkillLoader`／`SkillRegistry`／`skill_loader`；ADR-039 明确 ADR-040 待写。 |
 | 多 agent | **部分有** | `agent24-agent/src/subagent.rs` 的 Explorer 有独立上下文、只读工具、禁止递归及预算；`server.rs:2233` 已接线。它不是可写、可恢复的通用并行执行体系。 |
 | 监督与自进化 | **部分有监督基础，无完整进化闭环** | `agent24-policy/src/guardian.rs` 是工具风险评估，默认需显式启用；它不是检查工作进展的独立监督循环。技能变更闭环未发现。 |
 | 评测 | **部分有** | `eval/decide/`、`agent24-memory/src/eval*.rs`、`packages/documents-accept/` 已有专项基础；尚未发现覆盖事件准入到最终验收的统一评测。 |

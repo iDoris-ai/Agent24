@@ -11,7 +11,7 @@
 ## ADR-001：从 xiaoheishu/desktop 借鉴而非从零开发
 
 **日期**：2026-04-27
-**状态**：⛔ 被事实取代（原：✅ 采纳。`vendor/xiaoheishu` 只登记在 `.gitmodules:1-3`，没有检出，`apps/` 里零引用，desktop 是独立实现。取代者：ADR-026 Rust Core 与 ADR-037 本体/外壳划分。2026-11-04 订正，见 [ADR 索引](adr/README.md)）
+**状态**：⛔ 废弃（从未实现通用抽取。原：✅ 采纳。`vendor/xiaoheishu` 的 gitlink 仍在（`git ls-files -s vendor/xiaoheishu` 为 160000），`README.md:277` 仍把它当参考引入的子模块，但没有任何代码按本 ADR 抽出通用部分，`apps/` 里零引用，desktop 是独立实现。2026-11-04 订正）
 
 ### 背景
 
@@ -163,7 +163,7 @@
 ## ADR-006：npm scope 用 `@auraaihq`
 
 **日期**：2026-04-27
-**状态**：⛔ 被事实取代（原：✅ 采纳。本仓所有包名是 `@agent24/*`（private，`packages/*/package.json:2`）。取代者：ADR-026 §6 收缩 ADR-016（docs/）后的仓内私有包命名。2026-11-04 订正）
+**状态**：⚠️ 部分被替代（范围收缩。原：✅ 采纳。本仓自有包名已是 `@agent24/*`（private，`packages/*/package.json:2`），但 `@auraaihq` scope 仍在用，例如 `@auraaihq/boxlite-client`（ADR-026 §6 标「继续」）和 `packages/node-daemon/src/module-discovery.ts:26` 的 scope 常量。没有单独的取代者。2026-11-04 订正）
 
 ### 备选
 
@@ -352,7 +352,7 @@ M0 阶段**不写接口**，先：
 ## ADR-012：iDoris-SDK 不合并进 @auraaihq/sdk
 
 **日期**：2026-04-27
-**状态**：⛔ 被事实取代（原：✅ 采纳。微信桥已在本仓重写为 `@agent24/wechat-bridge`（private，#78，`packages/wechat-bridge/package.json:2-5`）；「iDoris」现指模型网关，见 ADR-032。取代者：#78。2026-11-04 订正）
+**状态**：⛔ 被替代（原：✅ 采纳。取代者：ADR-013，它改为把 iDoris-SDK 合并进 auraai-packages；而 ADR-013 本身已因 ADR-026 §6 废弃。2026-11-04 订正）
 
 ### 背景
 
@@ -402,7 +402,7 @@ iDoris-SDK (@agent-wechat/core)        ← 协议层 SDK，独立存在
 ## ADR-013：iDoris-SDK 合并进 auraai-packages monorepo（M2 执行）
 
 **日期**：2026-04-27
-**状态**：✅ 采纳（修正 ADR-012 的回答范围）；⛔ 2026-11-04 订正：被事实取代，同 ADR-012，取代者 #78（`@agent24/wechat-bridge`），不再合并进 `@auraaihq/*` 包仓
+**状态**：✅ 采纳（修正 ADR-012 的回答范围）；⛔ 2026-11-04 订正：废弃（方向被 ADR-026 §6 放弃，ADR-016P 的消费方案收缩）
 
 ### 背景
 
@@ -439,7 +439,7 @@ ADR-012 答的是"iDoris-SDK 合并进 `@auraaihq/sdk` 单个包"——这个不
 ## ADR-014：Agent24 在 M3 后被 @auraaihq/skills-* + skill-bank + evolver 替代
 
 **日期**：2026-04-27
-**状态**：⛔ 被事实取代（原：✅ 采纳（M3 执行）。本仓就是 Agent24 主产品，正文里的 `skills/`、`hooks/`、`install.sh` 都不存在。取代者：ADR-026 Rust Core 与 ADR-037。2026-11-04 订正）
+**状态**：⛔ 被替代（事实取代；原：✅ 采纳（M3 执行）。本仓就是 Agent24 主产品，正文里的 `skills/`、`hooks/`、`install.sh` 都不存在。取代者：ADR-026 Rust Core 与 ADR-037。2026-11-04 订正）
 
 ### 背景
 
@@ -489,7 +489,7 @@ M3 执行迁移。在那之前 Agent24 保持现状。
 ## ADR-015：M3 后 Agent24 改名为 Agent24
 
 **日期**：2026-04-27
-**状态**：⛔ 被事实取代（原：✅ 采纳（M3 末执行，依赖 ADR-014 完成）。依赖的 ADR-014 没有发生，改名意图由 ADR-027、ADR-037 另行落地。取代者：ADR-037。2026-11-04 订正）
+**状态**：⛔ 被替代（事实取代；原：✅ 采纳（M3 末执行，依赖 ADR-014 完成）。依赖的 ADR-014 没有发生。取代者：ADR-037。2026-11-04 订正）
 
 ### 背景
 
@@ -537,7 +537,7 @@ Agent24 应用形态可能演化为：
 ## ADR-016：模块安全与权限模型
 
 **日期**：2026-04-27
-**状态**：⛔ 被事实取代（原：✅ 采纳（M1 设计模块加载器时落地）。Node 模块加载器已从 desktop 删除（#1371）；`worker_thread` 与 keytar 零命中。取代者：[ADR-K1-01](adr/ADR-K1-01-module-tool-contract.md)、[ADR-K1-03](adr/ADR-K1-03-enable-authorization-trust-revocation.md) 与 [ADR-038](adr/ADR-038-component-contract-v1.md) 的签名验证。2026-11-04 订正）
+**状态**：⚠️ 实现路线已被替换（原：✅ 采纳（M1 设计模块加载器时落地）。Node 模块加载器已从 desktop 删除（#1371），`worker_thread` 与 keytar 零命中；现行实现路线是 [ADR-K1-01](adr/ADR-K1-01-module-tool-contract.md)、[ADR-K1-03](adr/ADR-K1-03-enable-authorization-trust-revocation.md) 与 [ADR-038](adr/ADR-038-component-contract-v1.md)。这三份没有正式取代本 ADR，权限分级的原则部分仍可引用。2026-11-04 订正）
 
 ### 背景
 
@@ -914,7 +914,7 @@ ADR-020 选择了 Node.js + 内置 http（M2 过渡）。但 ADR-022 确定 MLX 
 ## ADR-024：工作流引擎 — asyncio.Queue + Step 模式
 
 **日期**：2026-05-09
-**状态**：⛔ 被事实取代（原：✅ 采纳。ADR-026 已写「ADR-024 部分 Superseded」（`ADR-026-rust-core-polyglot.md:8`）；`agent24-workflow` crate 不存在，OpenAPI 无 `/api/v1/workflow/run`。取代者：ADR-026。2026-11-04 订正）
+**状态**：⚠️ 部分被替代（原：✅ 采纳。ADR-026 已写「ADR-024 部分 Superseded」（`ADR-026-rust-core-polyglot.md:8`）；`agent24-workflow` crate 不存在，OpenAPI 无 `/api/v1/workflow/run`。取代者：ADR-026。2026-11-04 订正）
 
 ### 背景
 

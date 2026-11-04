@@ -6,7 +6,7 @@
 
 - **唯一发号处**：新 ADR 的编号只在本页领取，不要自己挑号。**下一个可用编号是 ADR-046**；ADR-044（通讯）和 ADR-045（路由命名约定）已分配给 2026-11-04 起的第 0 期另外两片，见末尾「发号规则」。
 - 共 **62** 条 ADR：`docs/adr/` 下 12 个文件、13 条（ADR-041 拆成 041a、041b 两条），仓库其他位置 49 条（ADR-KB-01 拆成 01a、01b 两条）；见各表「位置」，文件均未移动。另有 5 份已被取代的初稿，单列在末尾，不计入总数。
-- 状态分七档：已接受 / 部分接受 / 提议 / 草案 / **被替代**（写明取代者）/ **废弃**（从未实现、方向已被取代）/ **搁置**（等外部条件再评估）；文件里读不到就写「未标」。「原文」列出的是文件原话，供核对；2026-11-04 订正过的行，文件首的状态行已同步改过，两处一致。
+- 状态分八档：已接受 / 部分接受 / 提议 / 草案 / **被替代**（含事实取代，写明取代者）/ **部分被替代**（范围收缩，或实现路线被替换但没有正式取代者）/ **废弃**（从未实现，或方向被放弃）/ **搁置**（等外部条件再评估）；索引与文件头用词一致；文件里读不到就写「未标」。「原文」列出的是文件原话，供核对；2026-11-04 订正过的行，文件首的状态行已同步改过，两处一致。
 - `docs/decision.md` 是一份**合订的决策日志**，ADR-001 至 ADR-037（缺 ADR-026）都在里面，没有单独文件，所以这些行都链到同一个文件，用编号在文内查找。
 - 关联列里，ADR-xxx 指同一编号体系里的 ADR；有重号的编号会带上位置，详见末尾「编号与冲突」。
 
@@ -27,7 +27,7 @@
 | ADR-026 | [Agent24 采用 Rust Core + Polyglot Worker 架构](../ADR-026-rust-core-polyglot.md) | 已接受（原文：采纳） | docs/ | 内核用 Rust，Python 只做 ML Worker；含 §6.5 的 11 条设计硬约束（第 2 条：审批请求-响应、fail-closed） | 取代 ADR-023、部分取代 ADR-024；收缩 ADR-016（docs/）；[分层总览](../ARCHITECTURE-LAYERS.md)；ADR-017、ADR-019、ADR-022 |
 | ADR-003 | [模块按「服务对象」分三层（Base/Community/Personal）](../decision.md) | 已接受（原文：采纳） | 日志 | 主分类按服务对象，用前缀区分基础、社区和个人模块 | ADR-002 |
 | ADR-002 | [从「裁剪」改为「模块化适配层」](../decision.md) | 已接受（原文：采纳（已修正初版方案）） | 日志 | 内核加三层模块，能力都做成可插拔，不裁掉原有能力 | ADR-001、ADR-003 |
-| ADR-001 | [从 xiaoheishu/desktop 借鉴而非从零开发](../decision.md) | 被替代（取代者：ADR-026、ADR-037；`vendor/xiaoheishu` 未检出、apps/ 零引用） | 日志 | 把 xiaoheishu 当子模块引入，抽出通用部分，场景功能以后独立发包 | ADR-002 |
+| ADR-001 | [从 xiaoheishu/desktop 借鉴而非从零开发](../decision.md) | 废弃（从未实现通用抽取；`vendor/xiaoheishu` gitlink 仍在，README.md:277 仍当子模块引用） | 日志 | 把 xiaoheishu 当子模块引入，抽出通用部分，场景功能以后独立发包 | ADR-002 |
 | ADR-010 | [先做参考实现 + 渐进提取，不一开始就定接口](../decision.md) | 已接受（原文：采纳） | 日志 | M0 不写接口，等做出参考实现后再提取规格 | ADR-011 |
 | ADR-011 | [跨切关注点初步规划](../decision.md) | 已接受（原文：采纳（M1+ 细化）） | 日志 | 发现、信任、权限等七项先定起步策略，细项以后再补 | ADR-010 |
 
@@ -72,7 +72,7 @@
 | ADR-041b | [工单、授权依据与订阅（D5–D9）](ADR-041-inbound-events-admission-and-work-items.md) | 提议（拆分后的 041b） | adr/ | 工单是跨 run 的工作单元，授权依据不可变且不是许可；订阅只加上下文；就绪、交付、验收分开记 | ADR-039、ADR-040、ADR-042、ADR-K1-02；ADR-037、ADR-038、ADR-K1-03、ADR-MEMORY-P1 |
 | ADR-042 | [待执行动作与对账](ADR-042-durable-actions-and-reconciliation.md) | 部分接受（D3、D4 边界条款已接受，其余提议） | adr/ | 先存后做，统一待执行动作与对账（即 K1-01 §2.6 预留的另开 ADR，范围到 D3） | ADR-K1-01、ADR-041、ADR-026；ADR-038、ADR-039、ADR-043 |
 | ADR-043 | [后台作业、并发与监督回路](ADR-043-background-jobs-concurrency-and-supervision.md) | 部分接受（D1、D3 已接受，其余提议） | adr/ | 后台作业句柄、并发槽，以及按实质进展监督的回路；系统不得静默改技能 | ADR-K1-01、ADR-040、ADR-041；ADR-026、ADR-037、ADR-039、ADR-042、ADR-K1-02、DRAFT-F044 |
-| ADR-016 | [模块安全与权限模型](../decision.md) | 被替代（取代者：ADR-K1-01、ADR-K1-03、ADR-038 签名验证；Node 模块加载器已删，#1371） | 日志 | 起步用线程沙箱和清单权限，签名与虚拟机沙箱往后放 | 与 docs/ 下同号 ADR-016 重号，见末尾；ADR-011 |
+| ADR-016 | [模块安全与权限模型](../decision.md) | 实现路线已被替换（现行路线是 ADR-K1-01、ADR-K1-03、ADR-038；它们没有正式取代本篇） | 日志 | 起步用线程沙箱和清单权限，签名与虚拟机沙箱往后放 | 与 docs/ 下同号 ADR-016 重号，见末尾；ADR-011 |
 | ADR-017 | [数据隐私与轨迹共享](../decision.md) | 已接受（原文：采纳） | 日志 | 轨迹默认只留本地；共享技能必须显式开启，且不上传原始轨迹 | ADR-K1-02 |
 | ADR-019 | [LLM Gateway 模式](../decision.md) | 已接受（原文：采纳） | 日志 | 能力模块不直连 LLM API，经注入的网关 | ADR-032；ADR-017 |
 
@@ -92,11 +92,11 @@
 | 编号 | 标题 | 状态 | 位置 | 一句话决策 | 关联 |
 |---|---|---|---|---|---|
 | ADR-007 | [混合 Monorepo 策略](../decision.md) | 已接受（原文：采纳） | 日志 | 单仓按可拆边界分目录，用 pnpm workspace，半年内不拆 | ADR-013 |
-| ADR-012 | [iDoris-SDK 不合并进 @auraaihq/sdk](../decision.md) | 被替代（取代者：#78，微信桥在本仓重写为 `@agent24/wechat-bridge`） | 日志 | 微信桥不并进 @auraaihq/sdk，改由适配模块实现框架接口 | ADR-013 |
-| ADR-013 | [iDoris-SDK 合并进 auraai-packages monorepo](../decision.md) | 被替代（取代者：#78，同 ADR-012） | 日志 | 修正前条范围：M2 迁进单体仓库并改名，不并进单个 SDK | ADR-012；ADR-007 |
+| ADR-012 | [iDoris-SDK 不合并进 @auraaihq/sdk](../decision.md) | 被替代（取代者：ADR-013） | 日志 | 微信桥不并进 @auraaihq/sdk，改由适配模块实现框架接口 | ADR-013 |
+| ADR-013 | [iDoris-SDK 合并进 auraai-packages monorepo](../decision.md) | 废弃（方向被 ADR-026 §6 放弃） | 日志 | 修正前条范围：M2 迁进单体仓库并改名，不并进单个 SDK | ADR-012；ADR-007 |
 | ADR-014 | [Agent24 在 M3 后被 @auraaihq/skills-* + skill-bank + evolver 替代](../decision.md) | 被替代（取代者：ADR-026、ADR-037；本仓就是 Agent24 主产品） | 日志 | M3 前保持现状，届时把技能迁成包；迁完旧仓库归档 | ADR-015 |
 | ADR-015 | [M3 后 Agent24 改名](../decision.md) | 被替代（取代者：ADR-037；依赖的 ADR-014 没有发生） | 日志 | 前条完成后立即改仓库名，并避免架构只绑桌面 | ADR-014 |
-| ADR-006 | [npm scope 用 `@auraaihq`](../decision.md) | 被替代（取代者：ADR-026 §6；本仓包名是 `@agent24/*`） | 日志 | 包统一用 `@auraaihq` scope | ADR-016（docs/） |
+| ADR-006 | [npm scope 用 `@auraaihq`](../decision.md) | 部分被替代（范围收缩：自有包名 `@agent24/*`，`@auraaihq` scope 仍在用，如 boxlite-client；无单一取代者） | 日志 | 包统一用 `@auraaihq` scope | ADR-016（docs/） |
 | ADR-016 | [Agent24 迁移至消费 @auraaihq/* 包](../ADR-016-consume-auraai-packages.md) | 被替代（取代者：ADR-026 §6；别名 ADR-016P；原为「进行中」） | docs/ | 改为消费 @auraaihq/* 包，自己只留 Electron 外壳 | ADR-026；与日志里的 ADR-016 重号，见末尾 |
 
 ## 6. 通信与外壳
@@ -116,7 +116,7 @@
 | 编号 | 标题 | 状态 | 位置 | 一句话决策 | 关联 |
 |---|---|---|---|---|---|
 | ADR-022 | [LLM 运行时默认 MLX，UI 可切换](../decision.md) | 已接受（原文：采纳，已收窄） | 日志 | 默认 MLX 只在 Apple Silicon 成立；实际是 oMLX 的 HTTP 服务；其他平台由 iDoris 按档位选 | ADR-036、ADR-037；ADR-019、ADR-023 |
-| ADR-024 | [工作流引擎：asyncio.Queue + Step 模式](../decision.md) | 被替代（取代者：ADR-026，`ADR-026-rust-core-polyglot.md:8`） | 日志 | 工作流采用队列加步骤，不用外部调度服务，任务记在本地库 | ADR-026 |
+| ADR-024 | [工作流引擎：asyncio.Queue + Step 模式](../decision.md) | 部分被替代（取代者：ADR-026，`ADR-026-rust-core-polyglot.md:8`） | 日志 | 工作流采用队列加步骤，不用外部调度服务，任务记在本地库 | ADR-026 |
 | ADR-025 | [内存管理：串行 LLM 推理 + 模型热切换限制](../decision.md) | 已接受（原文：采纳） | 日志 | 大模型推理同时只跑一个，换模型先卸载，内存过低就暂停新任务 | ADR-036 |
 
 ## 8. 演进（Super Agent）
@@ -182,7 +182,7 @@ Fable 初稿的五份 ADR 草案，原样保留、不再更新，最终版见上
 | 编号 | 用途 | 状态 |
 |---|---|---|
 | ADR-044 | 通讯（Hyphae / Nostr） | 已分配，第 0 期 S0-4 起草 |
-| ADR-045 | 路由命名约定 | 已分配，第 0 期 S0-7 起草 |
+| ADR-045 | 路由命名约定 | 已分配，见 `docs/p0-adr-045-route-naming` 分支 |
 
 - 别名只加不改：已有文件名一个都不改，规范名只用在新写的文字里，旧文字下次修改时顺手改。别名一览：ADR-OD-001 至 ADR-OD-006（Open Design 目录里的 ADR-001 至 ADR-006）、ADR-016P（docs/ 下的消费 @auraaihq 包）、DRAFT-F04x、DRAFT-C04x（研究初稿）。
 - 新文字里裸写 `ADR-001` 至 `ADR-006` 时，必须带路径或写成 `ADR-OD-00x`；不带前缀的 ADR-00x 只指 `docs/decision.md`。
@@ -191,8 +191,8 @@ Fable 初稿的五份 ADR 草案，原样保留、不再更新，最终版见上
 
 2026-11-04（第 0 期 S0-1、S0-3）按 R3 报告（分支 `docs/arch-review-r3-adr-docs` 上的 R3-ADR-AND-DOCS.md，§1.1、§1.B.6）与 jason 对 Q8、Q9、Q10 的拍板一次性订正状态和编号：
 - 037、028、MEMORY-P1、R05 改已接受；KB-01、041 各拆两条；040 接受为设计约束；042、043 部分接受（Q9）。
-- 日志 ADR-001、006、012、013、014、015、016、024 和 docs/ADR-016 改被替代并写明取代者；005、008、009、021 改废弃；DOC-03 改搁置。
-- ADR-038 的状态由第 0 期 S0-2（订正稿）处理，本次不动，仍按文首写「草案」。
+- 日志 ADR-012、014、015 和 docs/ADR-016 改被替代并写明取代者；006、016、024 改部分被替代或实现路线被替换；001、005、008、009、013、021 改废弃；DOC-03 改搁置。
+- ADR-038 的状态由 #1592（S0-2）改为已接受，本次不动；索引里 038 的行以 #1592 为准。
 - 本表每一行的状态与对应文件文首一致。
 
 以下是 2026-11-01 的核对记录：
