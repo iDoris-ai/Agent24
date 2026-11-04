@@ -2145,3 +2145,145 @@ exit 0
     assert_eq!(count_file(&spawns), 1, "mismatch must not spawn the daemon");
     assert_eq!(sup.status().state, "gave_up");
 }
+
+/// A new generation starts with an empty health book. The previous run's
+/// `confirmed` must not be visible while the new process is `starting` or
+/// `running` and has not produced a sample of its own (ADR-038 D5).
+#[tokio::test]
+async fn new_generation_clears_the_previous_health_book_before_it_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = make_ctx_with_script(tmp.path(), r#"#!/bin/sh
+case "$1" in
+  contract)
+    printf '%s\n' '{"ok":true,"data":{"name":"hyphae-cli","contract_version":"1.0"}}'
+    exit 0
+    ;;
+  identity)
+    printf '%s\n' '{"ok":true,"data":[{"nickname":"alice","npub":"npub1x","default":true,"encrypted":true}]}'
+    exit 0
+    ;;
+  relay)
+    printf '%s\n' '{"ok":true,"data":{"relays":["wss://relay.example"],"source":"config"}}'
+    exit 0
+    ;;
+  health)
+    if [ -f "$HOME/hold" ]; then sleep 60; fi
+    printf '%s\n' '{"ok":true,"data":{"status":"ok","checks":{"relays":{"ok":true}}}}'
+    exit 0
+    ;;
+  daemon)
+    cat > /dev/null
+    exec sleep 9999
+    ;;
+esac
+exit 0
+"#).await;
+    let home = ctx.home.clone();
+    let pid_path = ctx.pid_path.clone();
+    let sup = FixtureSupervisor::spawn(ctx);
+    sup.arm_probe(test_arm(
+        Duration::from_secs(3600),
+        Duration::from_secs(30),
+        Duration::from_secs(8),
+    ));
+    sup.start().await.unwrap();
+    assert!(
+        wait_until(
+            || sup.probe_snapshot().health.is_some_and(|h| h.confirmed),
+            Duration::from_secs(5),
+        )
+        .await,
+        "first generation never confirmed: {:?}",
+        sup.probe_snapshot()
+    );
+    // The second generation's `hyphae health` hangs: it never contributes a sample.
+    tokio::fs::write(home.join("hold"), b"").await.unwrap();
+    kill_minus_9(read_pid(&pid_path).await);
+    let mut saw_new_generation = false;
+    let mut saw_running = false;
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(10)
+        && !(saw_running && started.elapsed() > Duration::from_secs(3))
+    {
+        let status = sup.status();
+        let snapshot = sup.probe_snapshot();
+        if status.generation >= 2 && matches!(status.state, "starting" | "running") {
+            saw_new_generation = true;
+            saw_running |= status.state == "running";
+            assert!(
+                snapshot.health.is_none(),
+                "generation {} is {} with the old health book {:?}",
+                status.generation,
+                status.state,
+                snapshot.health
+            );
+            assert!(snapshot.health_armed);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        saw_new_generation && saw_running,
+        "restart never ran: {:?}",
+        sup.status()
+    );
+}
+
+/// Shutdown that begins while a config-change handshake is failing must not
+/// leave the actor in `backoff` with a retry scheduled.
+#[tokio::test]
+async fn shutdown_during_a_failing_config_change_handshake_does_not_enter_backoff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = make_ctx_with_script(tmp.path(), r#"#!/bin/sh
+case "$1" in
+  contract)
+    n=0
+    if [ -f "$HOME/contract-hits" ]; then n=$(cat "$HOME/contract-hits"); fi
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$HOME/contract-hits"
+    if [ "$n" -eq 1 ]; then
+      printf '%s\n' '{"ok":true,"data":{"name":"hyphae-cli","contract_version":"1.0"}}'
+      exit 0
+    fi
+    sleep 2
+    printf '%s\n' 'not-json'
+    exit 0
+    ;;
+  identity)
+    printf '%s\n' '{"ok":true,"data":[{"nickname":"alice","npub":"npub1x","default":true,"encrypted":true}]}'
+    exit 0
+    ;;
+  relay)
+    printf '%s\n' '{"ok":true,"data":{"relays":["wss://relay.example"],"source":"config"}}'
+    exit 0
+    ;;
+  health)
+    printf '%s\n' '{"ok":true,"data":{"status":"ok","checks":{"relays":{"ok":true}}}}'
+    exit 0
+    ;;
+  daemon)
+    cat > /dev/null
+    exec sleep 9999
+    ;;
+esac
+exit 0
+"#).await;
+    let sup = std::sync::Arc::new(FixtureSupervisor::spawn(ctx));
+    sup.arm_probe(test_arm(
+        Duration::from_secs(3600),
+        Duration::from_secs(2),
+        Duration::from_secs(8),
+    ));
+    sup.start().await.unwrap();
+    assert!(wait_until(|| sup.status().state == "running", Duration::from_secs(3)).await);
+    let changing = {
+        let sup = sup.clone();
+        tokio::spawn(async move { sup.on_config_changed().await })
+    };
+    // The second handshake sleeps 2s before answering with bad JSON.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let _ = sup
+        .shutdown(tokio::time::Instant::now() + TEST_GRACE * 4)
+        .await;
+    changing.await.unwrap();
+    assert_ne!(sup.status().state, "backoff", "{:?}", sup.status());
+}
