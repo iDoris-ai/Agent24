@@ -1,53 +1,75 @@
-import fs from 'node:fs'
-import path from 'node:path'
-import { describe, expect, it } from 'vitest'
-
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createCreativeShutdown } from './creative-quit'
 import { CREATIVE_QUIT_STOP_BUDGET_MS } from './creative-serve-web'
 import { OPEN_DESIGN_KILL_AFTER_MS, OPEN_DESIGN_TERM_GRACE_MS } from './open-design-sidecar'
 
-// main.ts boots Electron at import and is excluded from vitest, so the wiring is checked by reading it.
-const source = fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8')
-
-describe('Creative lifecycle wiring in main', () => {
-  it('the quit budget is 22 s and covers the sidecar grace plus kill phases', () => {
+afterEach(() => vi.useRealTimers())
+function fixture(stop = vi.fn(async () => {})) {
+  const deps = { prepare: vi.fn(), stop, cleanup: vi.fn(), quit: vi.fn(), exit: vi.fn() }
+  return { deps, shutdown: createCreativeShutdown(deps) }
+}
+describe('N4 shared shutdown', () => {
+  it('keeps the 22 second budget above the process tree shutdown budget', () => {
     expect(CREATIVE_QUIT_STOP_BUDGET_MS).toBe(22_000)
     expect(CREATIVE_QUIT_STOP_BUDGET_MS).toBeGreaterThan(OPEN_DESIGN_TERM_GRACE_MS + OPEN_DESIGN_KILL_AFTER_MS)
   })
-
-  it('before-quit holds the quit, stops Creative within the budget, then quits again', () => {
-    const start = source.indexOf("app.on('before-quit'")
-    const end = source.indexOf("app.on('will-quit'")
-    expect(start).toBeGreaterThan(-1)
-    expect(end).toBeGreaterThan(start)
-    const handler = source.slice(start, end)
-    expect(handler).toContain('(event)')
-    expect(handler).toContain('creative?.hasLiveProcess()')
-    expect(handler).toContain('event.preventDefault()')
-    expect(handler).toContain('stopWithin(creative, CREATIVE_QUIT_STOP_BUDGET_MS)')
-    expect(handler).toContain("creativeQuitState = 'done'")
-    expect(handler.indexOf("creativeQuitState = 'done'")).toBeLessThan(handler.indexOf('app.quit()'))
+  it.each([['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]] as const)('cleans up before exiting on %s', async (signal, code) => {
+    const { deps, shutdown } = fixture()
+    shutdown.signal(signal)
+    await vi.waitFor(() => expect(deps.exit).toHaveBeenCalledExactlyOnceWith(code))
+    expect(deps.prepare).toHaveBeenCalledOnce()
+    expect(deps.stop).toHaveBeenCalledOnce()
+    expect(deps.cleanup).toHaveBeenCalledOnce()
+    expect(deps.prepare.mock.invocationCallOrder[0]).toBeLessThan(deps.stop.mock.invocationCallOrder[0])
+    expect(deps.stop.mock.invocationCallOrder[0]).toBeLessThan(deps.cleanup.mock.invocationCallOrder[0])
+    expect(deps.cleanup.mock.invocationCallOrder[0]).toBeLessThan(deps.exit.mock.invocationCallOrder[0])
   })
-
-  it('will-quit still stops the backend after Creative, so Open Design goes first', () => {
-    const willQuit = source.slice(source.indexOf("app.on('will-quit'"))
-    expect(willQuit).toContain('backendManager.stop()')
-    expect(willQuit).toContain('creativeServeWeb?.stop()')
+  it('bounds a hanging stop and then runs cleanup', async () => {
+    vi.useFakeTimers()
+    const { deps, shutdown } = fixture(vi.fn(() => new Promise<void>(() => {})))
+    shutdown.signal('SIGTERM')
+    await vi.advanceTimersByTimeAsync(21_999)
+    expect(deps.cleanup).not.toHaveBeenCalled()
+    expect(deps.exit).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(deps.cleanup).toHaveBeenCalledOnce()
+    expect(deps.exit).toHaveBeenCalledWith(143)
   })
-
-  it('the view reloads when the sidecar instance changes', () => {
-    const show = source.slice(source.indexOf('async function showCreativeView'), source.indexOf('async function restartCreativeView'))
-    expect(show).toContain('loadCreativeView({')
-    expect(show).toContain('loadedInstanceId: creativeLoadedInstanceId')
-    expect(show).toContain('instanceId: status.instanceId')
-    expect(show).toContain('creativeLoadedInstanceId = instanceId')
+  it('a second signal exits immediately with the first signal code', () => {
+    const { deps, shutdown } = fixture(vi.fn(() => new Promise<void>(() => {})))
+    shutdown.signal('SIGHUP')
+    shutdown.signal('SIGINT')
+    expect(deps.exit).toHaveBeenCalledExactlyOnceWith(129)
+    expect(deps.cleanup).not.toHaveBeenCalled()
   })
-})
-
-it('F2 handles TERM INT and HUP with a shared bounded stop before exit', () => {
-  const handler = source.slice(source.indexOf('let signalShutdown:'), source.indexOf("app.on('before-quit'"))
-  expect(handler).toContain("['SIGTERM', 'SIGINT', 'SIGHUP']")
-  expect(handler).toContain('process.on(signal,')
-  expect(handler).toContain('signalShutdown ??=')
-  expect(handler).toContain('await stopWithin(creative, CREATIVE_QUIT_STOP_BUDGET_MS)')
-  expect(handler.indexOf('await stopWithin')).toBeLessThan(handler.indexOf('app.exit(0)'))
+  it.each(['beforeQuit', 'willQuit'] as const)('%s shares a single stop and cleanup with signals', async (entry) => {
+    const { deps, shutdown } = fixture()
+    const event = { preventDefault: vi.fn() }
+    shutdown[entry](event)
+    shutdown.beforeQuit(event)
+    shutdown.signal('SIGINT')
+    await vi.waitFor(() => expect(deps.exit).toHaveBeenCalledWith(130))
+    shutdown.willQuit(event)
+    expect(event.preventDefault).toHaveBeenCalledTimes(2)
+    expect(deps.prepare).toHaveBeenCalledOnce()
+    expect(deps.stop).toHaveBeenCalledOnce()
+    expect(deps.cleanup).toHaveBeenCalledOnce()
+    expect(deps.quit).not.toHaveBeenCalled()
+  })
+  it('normal quit resumes once and completed lifecycle events do not block', async () => {
+    const { deps, shutdown } = fixture()
+    const event = { preventDefault: vi.fn() }
+    shutdown.beforeQuit(event)
+    await vi.waitFor(() => expect(deps.quit).toHaveBeenCalledOnce())
+    shutdown.beforeQuit(event)
+    shutdown.willQuit(event)
+    expect(event.preventDefault).toHaveBeenCalledOnce()
+    expect(deps.cleanup).toHaveBeenCalledOnce()
+  })
+  it('still cleans up and exits when stop rejects', async () => {
+    const { deps, shutdown } = fixture(vi.fn(async () => { throw new Error('stop failed') }))
+    shutdown.signal('SIGTERM')
+    await vi.waitFor(() => expect(deps.exit).toHaveBeenCalledWith(143))
+    expect(deps.cleanup).toHaveBeenCalledOnce()
+  })
 })

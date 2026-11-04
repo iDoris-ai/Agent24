@@ -281,12 +281,17 @@ const INERT_TREE: SidecarTreeController = { signal: async () => {}, isEmpty: asy
 const STDERR_TAIL_BYTES = 2_000
 const READY_LINE_LIMIT_BYTES = 16_384
 
+// -g selects sessions on Linux and process groups on macOS; filter a full snapshot instead.
+const listProcesses = (): string => execFileSync('ps', ['-axo', 'pid=,pgid=,command='], { encoding: 'utf8', timeout: 1000 })
+
 /** Fail closed: a pid file alone never grants signal authority. */
 export function reapStaleLauncher(
   pidFile: string,
   plan: OpenDesignLaunchPlan,
   kill: KillFn,
   ps: (pid: number) => string,
+  members: () => string = listProcesses,
+  logger: SidecarLogger = { info: () => {}, warn: () => {} },
 ): void {
   try {
     const record = fs.readFileSync(pidFile, 'utf8')
@@ -295,8 +300,21 @@ export function reapStaleLauncher(
     if (!Number.isSafeInteger(pid) || pid < 2 || pid === process.pid) return
     kill(-pid, 0)
     const expected = `${pid} ${plan.runtimeExecutable} ${plan.headlessEntry} --config ${plan.configPath}`
-    // Require the exact runtime, entry, config and group leader; no substring matching.
-    if (ps(pid).trim().replace(/^([0-9]+)\s+/, '$1 ') !== expected) return
+    // A live leader requires exact identity; leaderless groups require every member to match an app root.
+    let leaderGone = false
+    try { kill(pid, 0) } catch (error) {
+      if (errnoCode(error) !== 'ESRCH') return
+      leaderGone = true
+    }
+    if (leaderGone) {
+      const rows = members().trim().split('\n').filter(Boolean).map((line) => /^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line))
+      const group = rows.filter((row) => row && Number(row[2]) === pid)
+      const roots = [plan.runtimeRoot, plan.dataRoot].filter((root) => path.isAbsolute(root) && root !== path.parse(root).root)
+      if (rows.some((row) => !row) || !group.length || group.some((row) => !row || Number(row[1]) === pid || !roots.some((root) => row[3].includes(root)))) {
+        logger.warn('open-design.stale-group-unverified', { pid })
+        return
+      }
+    } else if (ps(pid).trim().replace(/^([0-9]+)\s+/, '$1 ') !== expected) return
     kill(-pid, 'SIGKILL')
     fs.unlinkSync(pidFile)
   } catch { /* Missing, dead, inaccessible or unverifiable: never guess ownership. */ }
@@ -311,17 +329,20 @@ export class OpenDesignLauncher implements SidecarLauncher {
     private readonly platform: NodeJS.Platform = process.platform,
     private readonly kill: KillFn = (target, signal) => process.kill(target, signal),
     private readonly ps: (pid: number) => string = (pid) => execFileSync('ps', ['-p', String(pid), '-o', 'pgid=,command='], { encoding: 'utf8', timeout: 1000 }),
+    private readonly files: typeof fs = fs,
+    private readonly members: () => string = listProcesses,
   ) {}
 
   launch(): SidecarLaunch {
     // Job Objects are not wired yet (sidecar-host); without a verifiable tree there is no safe stop.
     if (this.platform === 'win32') throw new Error('unsupported platform')
     const plan = this.plan()
+    const fs = this.files
 
     fs.mkdirSync(plan.dataRoot, { recursive: true })
     fs.mkdirSync(plan.runtimeRoot, { recursive: true })
     const pidFile = path.join(plan.runtimeRoot, 'open-design.pgid')
-    reapStaleLauncher(pidFile, plan, this.kill, this.ps)
+    reapStaleLauncher(pidFile, plan, this.kill, this.ps, this.members, this.logger)
     fs.writeFileSync(plan.configPath, `${JSON.stringify(plan.config)}\n`, { encoding: 'utf8', mode: 0o600 })
     fs.chmodSync(plan.configPath, 0o600)
 
@@ -340,7 +361,14 @@ export class OpenDesignLauncher implements SidecarLauncher {
     ) as LaunchedChild
 
     const pid = child.pid
-    if (pid && pid > 1) fs.writeFileSync(pidFile, String(pid), { mode: 0o600 })
+    if (pid && pid >= 2) {
+      try { fs.writeFileSync(pidFile, String(pid), { mode: 0o600 }) } catch (error) {
+        try { this.kill(-pid, 'SIGKILL') } catch (killError) {
+          this.logger.warn('open-design.startup-kill-failed', { error: String(killError) })
+        }
+        throw new Error(`Open Design startup failed: cannot record process group: ${String(error)}`)
+      }
+    }
     const cancellation = new AbortController()
     const adapter = new ChildAdapter(child)
     const tail = { value: '' }

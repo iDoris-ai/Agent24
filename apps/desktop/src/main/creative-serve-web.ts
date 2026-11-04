@@ -156,7 +156,7 @@ export function canonicalCreativeOrigin(raw: string, expectedPort: number): stri
  * Wait for `service.stop()` for at most `budgetMs`; never rejects. Resolves `true` when the stop
  * finished inside the budget. before-quit uses this so a stuck tree cannot hold the app open.
  */
-export async function stopWithin(service: Pick<CreativeServeWeb, 'stop'>, budgetMs: number): Promise<boolean> {
+export async function stopWithin(service: { stop: () => Promise<unknown> }, budgetMs: number): Promise<boolean> {
   let timer: NodeJS.Timeout | undefined
   try {
     return await Promise.race([

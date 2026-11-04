@@ -7,6 +7,7 @@ import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  reapStaleLauncher,
   OpenDesignHealth,
   OpenDesignLauncher,
   PosixProcessGroupTree,
@@ -456,5 +457,69 @@ describe('PR1580 launcher regressions', () => {
     const launcher = new OpenDesignLauncher(() => current, vi.fn(() => new FakeChild()) as never, okFetch(), logger, 'linux', kill, ps)
     void launcher.launch().ready.catch(() => {})
     expect(kill.mock.calls.filter(([, signal]) => signal !== 0)).toEqual([])
+  })
+})
+
+
+describe('N1–N3 review guards', () => {
+  it.each(['ENOSPC', 'EROFS'])('N1 kills the spawned group if pid recording fails: %s', (code) => {
+    const current = plan()
+    const child = new FakeChild()
+    const kill = vi.fn()
+    const files: typeof fs = { ...fs, writeFileSync: (file, ...args) => {
+      if (String(file).endsWith('open-design.pgid')) throw errno(code)
+      fs.writeFileSync(file, ...args)
+    } }
+    const launcher = new OpenDesignLauncher(() => current, vi.fn(() => child) as never, okFetch(), logger, 'linux', kill, vi.fn(), files)
+    expect(() => launcher.launch()).toThrow('Open Design startup failed')
+    expect(kill).toHaveBeenCalledExactlyOnceWith(-5000, 'SIGKILL')
+  })
+  function stale(record = '4321') {
+    const current = plan()
+    fs.mkdirSync(current.runtimeRoot, { recursive: true })
+    const file = path.join(current.runtimeRoot, 'open-design.pgid')
+    fs.writeFileSync(file, record)
+    return { current, file }
+  }
+  it('N2 reaps a leaderless group only when every member belongs to this app', () => {
+    const { current, file } = stale()
+    const kill = vi.fn((pid: number) => { if (pid === 4321) throw errno('ESRCH') })
+    const ps = vi.fn()
+    reapStaleLauncher(file, current, kill, ps, () => `5001 4321 node ${current.runtimeRoot}/web.js\n5002 4321 daemon --data ${current.dataRoot}\n7000 7000 unrelated`, logger)
+    expect(kill).toHaveBeenCalledWith(-4321, 'SIGKILL')
+    expect(ps).not.toHaveBeenCalled()
+    expect(fs.existsSync(file)).toBe(false)
+  })
+  it.each(['mixed', 'tampered', 'empty', 'malformed', 'leader-reused', 'ps-denied', 'leader-permission'])('N2 refuses unverified group: %s', (cause) => {
+    const { current, file } = stale(cause === 'tampered' ? '9999' : '4321')
+    const kill = vi.fn((pid: number, _signal: NodeJS.Signals | 0) => { if (pid > 0) throw errno(cause === 'leader-permission' ? 'EPERM' : 'ESRCH') })
+    const warn = vi.fn()
+    const members = () => {
+      if (cause === 'ps-denied') throw new Error('denied')
+      if (cause === 'empty') return ''
+      if (cause === 'tampered') return '9998 9999 node /other-app/runtime/web.js'
+      return `5001 4321 node ${current.runtimeRoot}/web.js\n${cause === 'malformed' ? 'unparseable' : cause === 'leader-reused' ? `4321 4321 node ${current.runtimeRoot}` : '5002 4321 unrelated'}`
+    }
+    reapStaleLauncher(file, current, kill, vi.fn(), members, { info: vi.fn(), warn })
+    expect(kill.mock.calls.filter(([, signal]) => signal === 'SIGKILL')).toEqual([])
+    expect(fs.existsSync(file)).toBe(true)
+    if (['mixed', 'tampered', 'empty', 'malformed', 'leader-reused'].includes(cause)) expect(warn).toHaveBeenCalled()
+  })
+  it.each(['1', '0', '1e3', '01', '-5'])('N3 rejects pid file %s before any kill or process inspection', (record) => {
+    const { current, file } = stale(record)
+    const kill = vi.fn(); const ps = vi.fn(); const members = vi.fn()
+    reapStaleLauncher(file, current, kill, ps, members, logger)
+    expect(kill).not.toHaveBeenCalled()
+    expect(ps).not.toHaveBeenCalled()
+    expect(members).not.toHaveBeenCalled()
+  })
+  it('N3 late old launcher exit preserves the new pid file', () => {
+    const current = plan(); const old = new FakeChild()
+    void launcherFor(old, current).launcher.launch().ready.catch(() => {})
+    const next = new FakeChild(); next.pid = 5001
+    void launcherFor(next, current).launcher.launch().ready.catch(() => {})
+    old.emit('exit', 0, null)
+    expect(fs.readFileSync(path.join(current.runtimeRoot, 'open-design.pgid'), 'utf8')).toBe('5001')
+    next.emit('exit', 0, null)
   })
 })
