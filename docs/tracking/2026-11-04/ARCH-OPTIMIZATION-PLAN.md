@@ -1,13 +1,13 @@
 # Agent24 架构优化方案（草案）
 
-> **进度（2026-11-04）**：预览版停发，主线转为组件整合与统一。Q1 已拍板 (b)：Open Design 改由 `SidecarManager` 托管（设计见 [C8-SIDECAR-DESIGN.md](C8-SIDECAR-DESIGN.md)，实现 #1580）；本文 S1-6 的「删 SidecarManager」推荐因此作废。ADR-038 C1–C7 及评审遗留（#1570–#1575、#1577–#1579）已合入。第 0/1/2 期其余分片未开工，等 §5 其余问题拍板。
+> **进度（2026-11-04）**：预览版停发，主线转为组件整合与统一。Q1 已拍板 (b)：Open Design 改由 `SidecarManager` 托管（设计见 [C8-SIDECAR-DESIGN.md](C8-SIDECAR-DESIGN.md)，实现 #1580，进行中）；正文里按 (a) 写的推荐（Q1 行、C1、C4、S1-6、S2-6）已逐行加注，依赖 Q1 的 `sidecar-host` 冻结与 S1-7 待重新评估。ADR-038 C1–C7 及评审遗留（#1570–#1575、#1577–#1579）已合入。第 0/1/2 期其余分片未开工，等 §5 其余问题拍板。
 
 | 项 | 内容 |
 |---|---|
 | 日期 | 2026-11-04 |
 | 基线 | `origin/main` @ `163dd2d3`（Merge #1573）。三份报告基于 `9865d7a0`（#1555，2026-11-03 10:32 +0700） |
 | 输入 | R1 `R1-MODULE-MAP.md` + `R1-ROUTES-APPENDIX.md`（`origin/docs/arch-review-r1-module-map`）；R2 `R2-CONCEPT-INVENTORY.md`（`origin/docs/arch-review-r2-concept-inventory`）；R3 `R3-ADR-AND-DOCS.md`（`origin/docs/arch-review-r3-adr-docs`）（均在 `docs/architecture/review-2026-11-03/`，各自分支）；main 上的 `docs/architecture/README.md`、`docs/adr/README.md`、ADR-038、ADR-039、`docs/capabilities/REGISTRY.md` |
-| 核对方式 | 只读：在 `163dd2d3` 的只读 worktree 里 grep / 读源码 / `git diff 9865d7a0..163dd2d3`；行数沿用 R1 的 `scripts/loc.py` 口径（非空、非注释、非测试）。**没有构建、没有跑测试** |
+| 核对方式 | 只读：在 `163dd2d3` 的只读 worktree 里 grep / 读源码 / `git diff 9865d7a0..163dd2d3`；行数沿用 R1 的 `scripts/loc.py` 口径（脚本在 R1 分支）（非空、非注释、非测试）。**没有构建、没有跑测试** |
 | 口径 | 报告与 main 冲突时以 main 为准，标「报告已过时」。`d/` = `rust/apps/agent24d/src/` |
 | 性质 | 草案。只提方案与分片，不做决定；需拍板的集中在 §5 |
 
@@ -161,10 +161,10 @@ flowchart TB
 
 | # | 问题 | 证据 | 影响 | 建议 | 严重度 |
 |---|---|---|---|---|---|
-| C1 | **C8 未完成**：OD 由 `CreativeServeWeb` 托管；`SidecarManager`（TS）与 `agent24-sidecar-host`（Rust）都不在产品路径 | `ADR-038:63, 174, 331`；`apps/desktop/src/main/creative-serve-web.ts:7` 只 import `SidecarState` 类型；`sidecar-manager.ts` 只被测试引用 | ADR-038 v1 无法宣告收口；两套托管器维护成本 | §5 Q1；推荐「把 CreativeServeWeb 定为 v1 sidecar 绑定」（S1-6） | 中 |
+| **[已按 Q1 (b) 改道：C8 由 #1580 实现]** C1 | **C8 未完成**：OD 由 `CreativeServeWeb` 托管；`SidecarManager`（TS）与 `agent24-sidecar-host`（Rust）都不在产品路径 | `ADR-038:63, 174, 331`；`apps/desktop/src/main/creative-serve-web.ts:7` 只 import `SidecarState` 类型；`sidecar-manager.ts` 只被测试引用 | ADR-038 v1 无法宣告收口；两套托管器维护成本 | §5 Q1；推荐「把 CreativeServeWeb 定为 v1 sidecar 绑定」（S1-6） | 中 |
 | C2 | iDoris 契约失配映射 `Failed` 而非 `incompatible`；契约阈值三处不一致（锁 ≥1.1；网关 `contract_version_accepted` ≥1.0.1；supervisor 写死 `major != 1`） | `d/component_routes.rs:142-156`；`agent24-models/src/idoris.rs:480-492`；R2 I-20、R1 B5 | 非托管 iDoris 1.0.x 被网关接受、托管路径拒绝 | 网关改用锁里的 contract；`from_idoris` 加 Incompatible（S1-4） | 中 |
 | C3 | Hyphae 进程态 `starting`、`backoff`、`locked` 仍一律 `failed`（带 reason） | `d/component_routes.rs:190-197` `from_hyphae` 的 `other =>` 分支 | `locked`（口令未解锁）显示为故障；与 D5 的 `starting` 不符 | `starting → Starting`；`locked` 语义见 §5 Q14（S1-4） | 低–中 |
-| C4 | Rust `from_open_design` / `from_sidecar` 无生产调用，且与 TS `mapInstallState` 结论不同 | `agent24-components/src/state.rs:114,130`；R1 E6 | 两份「权威映射」互相矛盾 | 删 Rust 版或改为 TS 映射的 fixture 对照（随 S1-6） | 低 |
+| **[Q1 (b) 下归属待定：随 #1580 后续再定]** C4 | Rust `from_open_design` / `from_sidecar` 无生产调用，且与 TS `mapInstallState` 结论不同 | `agent24-components/src/state.rs:114,130`；R1 E6 | 两份「权威映射」互相矛盾 | 删 Rust 版或改为 TS 映射的 fixture 对照（随 S1-6） | 低 |
 | C5 | **OS 包完整性**：只对 `domain-os.yml` 字节做摘要，可执行文件不哈希不验签；Sin90/Cos72 是外仓二进制，不在 ADR-038 D1 任何免锁豁免里 | `agent24-os-packages/src/discovery.rs:261-266`；R2 I-2 | 外仓二进制无校验（最实的安全缺口） | §5 Q15；推荐先「包内全文件清单摘要，只记录不拒绝」一版 | 高 |
 | C6 | 下载器 / 校验 Rust 与 TS 两套；OD pin 写 4 份 | R1 §5.3 C1/C2、B8/B9；R2 I-1、I-7 | 安全基线漂移；#1555 式多处手改 | v1 只做 OD pin 单源（S1-5）；合并下载器不做（§6） | 中 |
 | C7 | Knowledge 工具以 `"builtin"` 身份注册，不走 K1 逐工具同意 | `d/knowledge_tools.rs:88`；R2 I-6 | 按 ADR-039 它是能力，却以本体身份出现 | §5 Q16 | 低 |
@@ -227,7 +227,7 @@ flowchart TB
 | **S1-3** TS `daemon.json` 单一解析器 | `@agent24/data-dir` 提供 `readDaemonState`，复刻 Rust `state_file.rs` 的 validate 与 `auth_mode` 规则；desktop、两个 bridge、documents-accept 改用；bridge 的 `RunStatus` 改用 api-client 生成类型 | `packages/data-dir`、`apps/desktop/src/main/backend-manager.ts`、`packages/*-bridge/src/{config,agent24}.ts`、`packages/documents-accept/src/client.ts` | M | 无（bridge 行为变化需在 PR 说明） | 共享 fixture 覆盖 legacy / capabilities / 未知 `auth_mode` / 缺 token；bridge 在 capabilities 模式下明确报错而非发空 token | 低–中 | Grok（Opus 评审：鉴权语义） |
 | **S1-4** 状态映射与契约阈值残项 | `from_idoris` 加 Incompatible（`component_contract_mismatch`）；网关 `contract_version_accepted` 改读锁的 contract；supervisor 去掉写死 `major != 1`；Hyphae `starting → Starting`，`locked` 按 Q14；Hyphae 失配 reason 是否统一为 `component_contract_mismatch` 一并定 | `d/component_routes.rs`、`agent24-models/src/idoris.rs`、`agent24-idoris/src/supervisor.rs`、`agent24-idoris/src/lib.rs` | S–M | Q14 | 1.0.x iDoris 在托管与非托管两条路径结论一致（测试）；`/components` 不再出现 `failed/starting` | 低 | Grok |
 | **S1-5** OD pin 单一来源 | 一份 `open-design.lock.json`（或 JSON pin），4 个脚本、`release-desktop.yml` 3 处、`creative-serve-web.ts:88` 的 `OPEN_DESIGN_PIN_VERSION` 都读它，或加一致性测试 | `apps/desktop/scripts/*open-design*`、`.github/workflows/release-desktop.yml`、`creative-serve-web.ts` | S | 无 | 改 pin 只需改一个文件；漏改时测试变红 | 低 | Grok |
-| **S1-6** C8 收尾（推荐方案，见 Q1） | ADR-038 C8 改写为「`CreativeServeWeb` 即 v1 的 sidecar 绑定（ADR-OD-004：Electron main 是唯一 owner）」；删 `SidecarManager` 及其测试（`CreativeServeWeb` 已实现 `SidecarState` 契约）。**不改 OD 的停止语义**：60s 超时后拒绝强杀是有意设计（`creative-serve-web.ts:87, 613`「refusing an owner-only force kill」），只在 ADR 里写明这一例外；删 Rust `from_open_design`/`from_sidecar` 死映射；`agent24-sidecar-host` 按 Q1 冻结 | `apps/desktop/src/main/{creative-serve-web,sidecar-manager,sidecar-contract}.ts`、`agent24-components/src/state.rs`、`ADR-038` §4 | S–M | **Q1**；S0-2 同步改文 | ADR-038 §4 C1–C8 全部「已完成」；仓内只有一份 OD 状态映射（TS `mapInstallState`）；桌面 `pnpm` 测试全绿 | 低–中：只删未用代码和改文，不动产品路径 | 拍板 → Grok |
+| **[作废：Q1 已拍板 (b)，改为 #1580]** **S1-6** C8 收尾（推荐方案，见 Q1） | ADR-038 C8 改写为「`CreativeServeWeb` 即 v1 的 sidecar 绑定（ADR-OD-004：Electron main 是唯一 owner）」；删 `SidecarManager` 及其测试（`CreativeServeWeb` 已实现 `SidecarState` 契约）。**不改 OD 的停止语义**：60s 超时后拒绝强杀是有意设计（`creative-serve-web.ts:87, 613`「refusing an owner-only force kill」），只在 ADR 里写明这一例外；删 Rust `from_open_design`/`from_sidecar` 死映射；`agent24-sidecar-host` 按 Q1 冻结 | `apps/desktop/src/main/{creative-serve-web,sidecar-manager,sidecar-contract}.ts`、`agent24-components/src/state.rs`、`ADR-038` §4 | S–M | **Q1**；S0-2 同步改文 | ADR-038 §4 C1–C8 全部「已完成」；仓内只有一份 OD 状态映射（TS `mapInstallState`）；桌面 `pnpm` 测试全绿 | 低–中：只删未用代码和改文，不动产品路径 | 拍板 → Grok |
 | **S1-7** 休眠代码收窄 | `agent24-worker` 移出默认 members 或标 experimental；`knowledge_store` 删或 feature-gate（随 S2-3 也可）；store allocation / terminal 休眠链 feature-gate（**先和 workspace G 系列计划对齐，不删**）；收窄过宽的 `allow(dead_code)`；`agent24-sidecar-host` 按 Q1 处理 | `rust/Cargo.toml`、`agent24-store/src/lib.rs`、`d/main.rs`、`agent24-workspace` | M | Q1 | `cargo build --workspace` 时间可见下降；`dead_code` 告警重新有意义（去掉 allow 后无新告警或已逐条处置） | 低–中：误删未来切片的底座 | Grok |
 | S1-8（可选） | `os-proc/os-sqlite/os-cwd/os-fd` 改名 `agent24-sys-*` 或合并 | 4 个 crate 及消费者 | M（机械） | **Q7** | 编译通过；`sys-*` 恰为全部允许 `unsafe` 的 crate | 低，收益也低 | 拍板 → Remote（机械改名） |
 
@@ -242,7 +242,7 @@ flowchart TB
 | **S2-3** Knowledge 宿主下沉 | `knowledge_host/backend/probe/store` 迁入 `agent24-knowledge`；决定 `provider/`（~4,100 行）接线或冻结 | `d/knowledge_*.rs`、`agent24-knowledge` | L | Q3；**AGENTS.md：凭据类须等 APPROVE** | agent24d 减 ~1,800 行；C5 探测测试原样通过 | 中：凭据路径 | Grok（Opus 评审） |
 | **S2-4** attach 抽 crate | 新 `agent24-attach`；先抽 events / model_callback 需要的 trait | `d/attached*.rs`、`d/attach_*.rs`、`d/agentear_timings.rs` | L | S2-1 | agent24d 减 ~1,500 行；C4 用例（失配、取消）原样通过 | 中 | Grok |
 | **S2-5** 鉴权抽 `agent24-auth` | capabilities / enroll / presence 业务下沉，handler 与中间件接线留 agent24d | `d/capabilities/*`、`d/enroll_*.rs`、`d/presence_desktop.rs` | L | S1-2、S2-1；建议排在最后 | agent24d 再减 ~4,000 行；enroll / presence / mint 全部黑盒测试通过 | **高**：安全核心 | 拍板 → Grok（Opus 评审，外审 APPROVE） |
-| **S2-6** 进程组终止原语 | Rust 一个 `kill_group_gracefully`（放 os-proc / sys），os-proto、comm、idoris、sidecar-host 共用；TS 一个，backend-manager 与 creative-serve-web 共用（是否强杀作为参数，OD 保持「不强杀」） | 5 个 Rust crate、3 个 TS 模块 | M | S1-6（OD 停止语义先定）；Q13 | 同一组回收 / 超时 / 僵尸测试跑在共用实现上；各调用点超时值显式传入 | 中：统一会改变行为 | Grok |
+| **[注：Q1 (b) 后 OD 停止语义改为 TERM→15s→SIGKILL 整组，见 C8 设计]** **S2-6** 进程组终止原语 | Rust 一个 `kill_group_gracefully`（放 os-proc / sys），os-proto、comm、idoris、sidecar-host 共用；TS 一个，backend-manager 与 creative-serve-web 共用（是否强杀作为参数，OD 保持「不强杀」） | 5 个 Rust crate、3 个 TS 模块 | M | S1-6（OD 停止语义先定）；Q13 | 同一组回收 / 超时 / 僵尸测试跑在共用实现上；各调用点超时值显式传入 | 中：统一会改变行为 | Grok |
 | S2-7（按 Q5） | CLI 补齐：`knowledge` 绑定/凭据、`comm identity export/import` | `agent24-cli` | M | Q5 | release 用例可走 CLI | 中 | 拍板 → Grok |
 
 ### 4.4 依赖顺序一览
@@ -263,7 +263,7 @@ flowchart TB
 
 | # | 问题 | 选项 | 推荐 | 来源 |
 |---|---|---|---|---|
-| **Q1** | **C8 与 sidecar 路线**（含「sidecar 线协议是否冻结」） | (a) 把 `CreativeServeWeb` 定为 v1 sidecar 绑定，ADR-038 C8 就此完成；TS `SidecarManager` 删或并入；Rust `sidecar-host` + `-protocol` 冻结，移出默认 members，只留 Windows CI 编译；线协议冻结在当前 v1 不再演进 (b) 把 `CreativeServeWeb` 重构到 `SidecarManager` 上，再迁 OD (c) 接入 Rust `sidecar-host` 作为桌面托管器 | **(a)**。ADR-OD-004 已定 Electron main 是唯一 owner，产品路径已稳定；(b)(c) 是为一个组件重写托管器，原型阶段不值。Knowledge Lite 真要 sidecar 时再解冻 | R1 Q1、R2 Q5、I-11 |
+| **[已拍板 (b)，2026-11-04]** **Q1** | **C8 与 sidecar 路线**（含「sidecar 线协议是否冻结」） | (a) 把 `CreativeServeWeb` 定为 v1 sidecar 绑定，ADR-038 C8 就此完成；TS `SidecarManager` 删或并入；Rust `sidecar-host` + `-protocol` 冻结，移出默认 members，只留 Windows CI 编译；线协议冻结在当前 v1 不再演进 (b) 把 `CreativeServeWeb` 重构到 `SidecarManager` 上，再迁 OD (c) 接入 Rust `sidecar-host` 作为桌面托管器 | **(a)**。ADR-OD-004 已定 Electron main 是唯一 owner，产品路径已稳定；(b)(c) 是为一个组件重写托管器，原型阶段不值。Knowledge Lite 真要 sidecar 时再解冻 | R1 Q1、R2 Q5、I-11 |
 | **Q2** | 签名收紧后 dev 构建怎么 enroll | (a) 只认 `test-enrollment` feature（`rust/apps/agent24d/Cargo.toml:11`），release 构建不含 (b) 加环境变量 `A24_ENROLL_DEV_TEAM_ID`，仅 debug 构建生效 (c) dev 构建也用 Developer ID 签名 | **(a)**，若 feature 覆盖不了日常 `cargo run` 再加 (b) 且限 `debug_assertions` | R1 Q2 |
 | **Q3** | **agent24d 瘦身边界** | (A) 只拆文件不拆 crate (B) 三刀下沉：iDoris → idoris、Knowledge → knowledge、attach → 新 crate；auth 暂留 (C) B + auth 抽 crate | **(B)**，auth 等 S1-2 落地、CORE-2 稳定后再议。边界规则：「状态机、存储、协议帧下沉；axum handler、中间件接线、启动编排留在 agent24d」 | R1 Q3 |
 | **Q4** | **路由命名约定 + sin90 的 10 个端点** | 约定：(a) 只约束新路由、旧路由冻结 (b) 趁 v1 统一改名（wire 不兼容）。sin90：(i) 迁到 Sin90 仓，本仓只留豁免 (ii) 留本仓 + 跨仓契约测试 (iii) 留本仓并标「外部契约，实现以 Sin90 为准」 | **约定选 (a)；sin90 选 (iii)**，等 Sin90 进入活跃开发再升 (ii)。顺带定 `_a24/*` 为「模块内部通道」进豁免表 | R1 Q4、§7.3 |
