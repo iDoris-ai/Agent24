@@ -17,20 +17,32 @@
 //! - major `1` and `integration`, but `search` or `read` is absent (READONLY R9.2;
 //!   OPS-v1 does not add a required operation yet) → `degraded`
 //!   (`missing_capability:<name>`)
-//! - otherwise → `ready`. This only means the capability declaration is
-//!   complete and the contract is compatible. It does not mean dependencies
-//!   are healthy (READONLY R9.3). Host detail carries `basis: "capabilities"`.
-//!   §8 `/ready` is not probed
+//! - otherwise, with no credential → `ready`. This only means the capability
+//!   declaration is complete and the contract is compatible. It does not mean
+//!   dependencies are healthy (READONLY R9.3). Host detail carries
+//!   `basis: "capabilities"`
+//! - otherwise, with a credential → the declaration is judged first (above);
+//!   only a compatible, complete one goes on to `POST /agent24/knowledge/ready`
+//!   (§8, R8.2: the probe needs a credential). `live` and both `search` and
+//!   `read` `ready` → `ready`; anything else (`not_ready`/`disabled`, `live`
+//!   false, a non-2xx answer, a transport error, an unreadable body, a
+//!   mismatched echo) → `degraded` (`not_ready`). `ingest` is not looked at
+//!   (read-only v1). Host detail carries `basis: "ready"`
 //!
 //! The client tolerates unknown fields and unknown operation names (D3: minor is
 //! additive), including extra keys inside `limits`. The server's `msg` and body
 //! text never leave this module; only codes do. `server_version` is copied only
 //! when it is a short token. Endpoints are probed together under one deadline.
 //! Each request is sent only after the binding is still active and the
-//! credential epoch is unchanged.
+//! credential epoch is unchanged. A target that fails that re-check is not
+//! judged and not cached: [`KnowledgeProbeCache::assess`] reports the answer
+//! as `stale`, and the caller takes a new snapshot (ADR-038 C5, N1 of #1571).
+//!
+//! JSON numbers follow JSON Schema's value rule: `-0`, `1.0` and `1e3` are
+//! integers. [`integral`] is the one place that reads them.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::future::join_all;
@@ -40,12 +52,17 @@ use agent24_knowledge::{
     Credential, HttpConfigError, HttpTransport, HttpTransportConfig, KnowledgeOperation,
     KnowledgeTransport, TransportError,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Number, Value, json};
 use tokio::sync::watch;
 
 /// How long a probe answer is reused. `GET /api/v1/components` must not hit the
 /// remote on every poll.
 pub const KNOWLEDGE_PROBE_TTL: Duration = Duration::from_secs(30);
+
+/// How long the D3 gate trusts a `failed` reading of its own endpoint before it
+/// asks again. A failed endpoint has no declaration, so every call to it is
+/// refused; a long window would keep refusing after it recovered.
+pub const KNOWLEDGE_PROBE_FAILED_TTL: Duration = Duration::from_secs(4);
 
 /// Bound on one capabilities exchange, connect included (D6).
 pub const KNOWLEDGE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -68,6 +85,16 @@ const LIMIT_KEYS: [&str; 6] = [
 ];
 
 const MAX_CAPABILITIES_BYTES: usize = 64 * 1024;
+
+const BASIS_CAPABILITIES: &str = "capabilities";
+const BASIS_READY: &str = "ready";
+
+/// `degraded` reason when §8 says the service is not ready.
+const NOT_READY: &str = "not_ready";
+
+/// `generation` of a readiness probe. It is a probe, not a call under an
+/// activation; the schema wants a positive integer and the server echoes it.
+const READY_PROBE_GENERATION: u64 = 1;
 
 /// One configured endpoint to probe.
 ///
@@ -105,6 +132,8 @@ struct Judged {
     version: Option<String>,
     missing: Vec<String>,
     contract: Option<ContractSeen>,
+    /// What the answer rests on: `capabilities`, or `ready` once §8 was probed.
+    basis: &'static str,
     probed_at: u64,
 }
 
@@ -116,6 +145,7 @@ impl Judged {
             version: None,
             missing: Vec::new(),
             contract: None,
+            basis: BASIS_CAPABILITIES,
             probed_at,
         }
     }
@@ -135,7 +165,7 @@ impl Judged {
             reason: self.reason.clone(),
             version: self.version.clone(),
             detail: Some(json!({
-                "basis": "capabilities",
+                "basis": self.basis,
                 "probed_at": self.probed_at,
                 "missing_capabilities": self.missing,
                 "contract_version": contract_value(self.contract.as_ref()),
@@ -157,16 +187,68 @@ enum ParseError {
     Upstream(String),
 }
 
+/// What [`KnowledgeProbeCache::assess`] hands back. `stale` means a target
+/// failed the re-check before it was sent, so `view` rests on a snapshot that
+/// no longer holds. It was not cached; the caller takes a new snapshot.
+pub(crate) struct Assessed {
+    pub view: ProbeView,
+    /// One answer per probed base URL, for the caller that needs a single
+    /// endpoint's reading (the D3 gate) instead of the folded `view`.
+    pub per_url: Arc<HashMap<String, ProbeView>>,
+    pub stale: bool,
+}
+
+impl Assessed {
+    fn fresh(answer: Answer) -> Self {
+        Self {
+            view: answer.view,
+            per_url: answer.per_url,
+            stale: false,
+        }
+    }
+
+    /// No cache or probe behind it (nothing configured, or the bindings kept
+    /// moving).
+    pub(crate) fn without_urls(view: ProbeView) -> Self {
+        Self {
+            view,
+            per_url: Arc::default(),
+            stale: false,
+        }
+    }
+}
+
+/// What one probe round produced: the folded view the component list shows and
+/// each endpoint's own reading.
+#[derive(Clone)]
+struct Answer {
+    view: ProbeView,
+    per_url: Arc<HashMap<String, ProbeView>>,
+}
+
+impl CacheEntry {
+    fn fresh_for(&self, gate_url: Option<&str>) -> Duration {
+        let failed = gate_url
+            .and_then(|url| self.answer.per_url.get(url))
+            .is_some_and(|view| view.state == ComponentState::Failed);
+        if failed {
+            KNOWLEDGE_PROBE_FAILED_TTL
+        } else {
+            KNOWLEDGE_PROBE_TTL
+        }
+    }
+}
+
 struct CacheEntry {
     fingerprint: String,
     at: Instant,
-    view: ProbeView,
+    answer: Answer,
 }
 
 #[derive(Default)]
 struct CacheInner {
     entry: Option<CacheEntry>,
-    flights: HashMap<String, watch::Sender<Option<ProbeView>>>,
+    flights: HashMap<String, watch::Sender<Option<Answer>>>,
 }
 
 /// Shared by every `GET /api/v1/components`. One in-flight probe per endpoint
@@ -181,7 +263,7 @@ pub(crate) struct KnowledgeProbeCache {
 struct FlightGuard<'a> {
     cache: &'a KnowledgeProbeCache,
     fingerprint: String,
-    tx: Option<watch::Sender<Option<ProbeView>>>,
+    tx: Option<watch::Sender<Option<Answer>>>,
     finished: bool,
 }
 
@@ -208,29 +290,44 @@ impl Drop for FlightGuard<'_> {
 }
 
 impl KnowledgeProbeCache {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn assess(
         &self,
         targets: &[ProbeTarget],
         now: Instant,
         still_valid: &(dyn Fn(&ProbeTarget) -> bool + Sync),
-    ) -> ProbeView {
+    ) -> Assessed {
+        self.assess_for(targets, now, still_valid, None).await
+    }
+
+    /// As [`Self::assess`]. With `gate_url`, an entry whose reading of that
+    /// endpoint is `failed` is reused for [`KNOWLEDGE_PROBE_FAILED_TTL`] only,
+    /// so one failure does not close the D3 gate for a whole
+    /// [`KNOWLEDGE_PROBE_TTL`]. The component list passes `None`.
+    pub(crate) async fn assess_for(
+        &self,
+        targets: &[ProbeTarget],
+        now: Instant,
+        still_valid: &(dyn Fn(&ProbeTarget) -> bool + Sync),
+        gate_url: Option<&str>,
+    ) -> Assessed {
         if targets.is_empty() {
-            return not_configured();
+            return Assessed::without_urls(not_configured());
         }
         let fingerprint = fingerprint(targets);
         loop {
             enum Role {
-                Hit(ProbeView),
-                Wait(watch::Receiver<Option<ProbeView>>),
-                Lead(watch::Sender<Option<ProbeView>>),
+                Hit(Answer),
+                Wait(watch::Receiver<Option<Answer>>),
+                Lead(watch::Sender<Option<Answer>>),
             }
             let role = {
                 let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
                 if let Some(entry) = &guard.entry
                     && entry.fingerprint == fingerprint
-                    && now.saturating_duration_since(entry.at) < KNOWLEDGE_PROBE_TTL
+                    && now.saturating_duration_since(entry.at) < entry.fresh_for(gate_url)
                 {
-                    Role::Hit(entry.view.clone())
+                    Role::Hit(entry.answer.clone())
                 } else if let Some(tx) = guard.flights.get(&fingerprint) {
                     Role::Wait(tx.subscribe())
                 } else {
@@ -240,10 +337,10 @@ impl KnowledgeProbeCache {
                 }
             };
             match role {
-                Role::Hit(view) => return view,
+                Role::Hit(answer) => return Assessed::fresh(answer),
                 Role::Wait(rx) => {
-                    if let Some(view) = wait_flight(rx).await {
-                        return view;
+                    if let Some(answer) = wait_flight(rx).await {
+                        return Assessed::fresh(answer);
                     }
                     // The leader left without a result. Try again: hit a
                     // newer cache entry, wait on a new leader, or lead.
@@ -255,21 +352,31 @@ impl KnowledgeProbeCache {
                         tx: Some(tx),
                         finished: false,
                     };
-                    let view = probe_all(targets, still_valid).await;
+                    let (answer, stale) = probe_all(targets, still_valid).await;
+                    if stale {
+                        // Not the answer for any current set of targets. Leave
+                        // without publishing: the guard drops the flight and
+                        // the waiters go round again.
+                        return Assessed {
+                            view: answer.view,
+                            per_url: answer.per_url,
+                            stale,
+                        };
+                    }
                     {
                         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
                         guard.entry = Some(CacheEntry {
                             fingerprint: fingerprint.clone(),
                             at: now,
-                            view: view.clone(),
+                            answer: answer.clone(),
                         });
                         guard.flights.remove(&fingerprint);
                     }
                     if let Some(tx) = flight.tx.take() {
-                        let _ = tx.send(Some(view.clone()));
+                        let _ = tx.send(Some(answer.clone()));
                     }
                     flight.finished = true;
-                    return view;
+                    return Assessed::fresh(answer);
                 }
             }
         }
@@ -290,7 +397,7 @@ impl KnowledgeProbeCache {
 
 /// `None` when the leader closed the channel without publishing. The last
 /// published value still counts if the send won the race with the drop.
-async fn wait_flight(mut rx: watch::Receiver<Option<ProbeView>>) -> Option<ProbeView> {
+async fn wait_flight(mut rx: watch::Receiver<Option<Answer>>) -> Option<Answer> {
     loop {
         if let Some(view) = rx.borrow().clone() {
             return Some(view);
@@ -326,11 +433,11 @@ fn fingerprint(targets: &[ProbeTarget]) -> String {
 
 /// Every target shares `KNOWLEDGE_PROBE_TIMEOUT` measured from this call.
 /// A target whose binding was deactivated, or whose credential epoch moved,
-/// is omitted and not requested.
+/// is omitted and not requested; the flag says one was.
 async fn probe_all(
     targets: &[ProbeTarget],
     still_valid: &(dyn Fn(&ProbeTarget) -> bool + Sync),
-) -> ProbeView {
+) -> (Answer, bool) {
     let deadline = Instant::now() + KNOWLEDGE_PROBE_TIMEOUT;
     let judged = join_all(
         targets
@@ -338,8 +445,18 @@ async fn probe_all(
             .map(|target| fetch(target, deadline, still_valid)),
     )
     .await;
+    let stale = judged.iter().any(Option::is_none);
+    let per_url: HashMap<String, ProbeView> = targets
+        .iter()
+        .zip(&judged)
+        .filter_map(|(target, judged)| Some((target.base_url.clone(), judged.as_ref()?.view())))
+        .collect();
     let parts: Vec<Judged> = judged.into_iter().flatten().collect();
-    fold(&parts)
+    let answer = Answer {
+        view: fold(&parts),
+        per_url: Arc::new(per_url),
+    };
+    (answer, stale)
 }
 
 fn fold(parts: &[Judged]) -> ProbeView {
@@ -348,6 +465,15 @@ fn fold(parts: &[Judged]) -> ProbeView {
     };
     if worst == 1 {
         return union_degraded(parts);
+    }
+    if worst == 0 {
+        // Several ready endpoints: claim no more than the weakest one proved.
+        let weakest = parts
+            .iter()
+            .rev()
+            .find(|part| part.basis == BASIS_CAPABILITIES)
+            .or_else(|| parts.last());
+        return weakest.map_or_else(not_configured, Judged::view);
     }
     parts
         .iter()
@@ -362,6 +488,7 @@ fn union_degraded(parts: &[Judged]) -> ProbeView {
     let mut version = None;
     let mut contract = None;
     let mut probed_at = 0;
+    let mut basis = BASIS_READY;
     for part in parts {
         if part.state != ComponentState::Degraded {
             continue;
@@ -374,17 +501,23 @@ fn union_degraded(parts: &[Judged]) -> ProbeView {
             contract.clone_from(&part.contract);
         }
         probed_at = part.probed_at;
+        if part.basis == BASIS_CAPABILITIES {
+            basis = BASIS_CAPABILITIES;
+        }
     }
     let missing: Vec<String> = missing.into_iter().collect();
-    let reason = missing
-        .first()
-        .map(|name| format!("missing_capability:{name}"));
+    // A named missing operation says more than "not ready".
+    let reason = Some(missing.first().map_or_else(
+        || NOT_READY.to_owned(),
+        |name| format!("missing_capability:{name}"),
+    ));
     Judged {
         state: ComponentState::Degraded,
         reason,
         version,
         missing,
         contract,
+        basis,
         probed_at,
     }
     .view()
@@ -424,7 +557,81 @@ async fn fetch(
         Ok(response) => judge_response(response.status, &response.body),
         Err(err) => judge_transport(err),
     };
-    Some(judged)
+    // §8 needs a credential (R8.2), and only a declaration that is already
+    // compatible and complete is worth asking the service about.
+    if judged.state != ComponentState::Ready || target.credential.is_none() {
+        return Some(judged);
+    }
+    // Same rule as before the first request: the key goes out again only if
+    // it is still the binding's.
+    if !still_valid(target) {
+        return None;
+    }
+    let judged = probe_ready(&transport, deadline, judged).await;
+    // The service has answered; if the key moved while it did, the answer
+    // belongs to a snapshot that no longer holds.
+    still_valid(target).then_some(judged)
+}
+
+/// `POST /agent24/knowledge/ready` (R8.2, no scope). `judged` is the compatible
+/// declaration it refines.
+async fn probe_ready(transport: &HttpTransport, deadline: Instant, judged: Judged) -> Judged {
+    let budget = deadline.saturating_duration_since(Instant::now());
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let ready = if budget.is_zero() {
+        false
+    } else {
+        let body = json!({
+            "protocol_version": EXPECTED_PROTOCOL_MAJOR,
+            "request_id": request_id,
+            "generation": READY_PROBE_GENERATION,
+        });
+        match transport
+            .send(
+                KnowledgeOperation::Ready,
+                body.to_string().into_bytes(),
+                budget,
+            )
+            .await
+        {
+            Ok(response) => {
+                (200..300).contains(&response.status) && ready_ok(&response.body, &request_id)
+            }
+            Err(_) => false,
+        }
+    };
+    if ready {
+        return Judged {
+            basis: BASIS_READY,
+            probed_at: probed_at_now(),
+            ..judged
+        };
+    }
+    Judged {
+        state: ComponentState::Degraded,
+        reason: Some(NOT_READY.to_owned()),
+        basis: BASIS_READY,
+        probed_at: probed_at_now(),
+        ..judged
+    }
+}
+
+/// R8.2: the process is live and both operations this build calls are `ready`.
+/// `ingest` is `disabled` in read-only v1 and is not looked at. The echoed
+/// `request_id` must be ours.
+fn ready_ok(body: &[u8], request_id: &str) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let operation_ready = |name: &str| {
+        value
+            .pointer(&format!("/operations/{name}/state"))
+            .and_then(Value::as_str)
+            == Some("ready")
+    };
+    value.get("request_id").and_then(Value::as_str) == Some(request_id)
+        && value.get("live").and_then(Value::as_bool) == Some(true)
+        && REQUIRED_OPERATIONS.into_iter().all(operation_ready)
 }
 
 fn judge_config(err: HttpConfigError) -> Judged {
@@ -480,6 +687,7 @@ fn judge_decl(decl: Decl, probed_at: u64) -> Judged {
             version,
             missing,
             contract,
+            basis: BASIS_CAPABILITIES,
             probed_at,
         };
     }
@@ -492,6 +700,7 @@ fn judge_decl(decl: Decl, probed_at: u64) -> Judged {
         version,
         missing,
         contract,
+        basis: BASIS_CAPABILITIES,
         probed_at,
     }
 }
@@ -503,6 +712,7 @@ fn incompatible(contract: Option<ContractSeen>, version: Option<String>, probed_
         version,
         missing: Vec::new(),
         contract,
+        basis: BASIS_CAPABILITIES,
         probed_at,
     }
 }
@@ -548,7 +758,7 @@ fn parse(body: &[u8]) -> Result<Decl, ParseError> {
     let value: Value = serde_json::from_slice(body).map_err(|_| ParseError::Malformed)?;
     // A non-success envelope is the upstream's answer. `data: {}` (or a
     // document that is not a declaration) must not be judged as the contract.
-    if let Some(code) = upstream_code(&value) {
+    if let Some(code) = upstream_code(&value, raw_code(body).as_deref()) {
         return Err(ParseError::Upstream(code));
     }
     if let Some(data) = value.get("data") {
@@ -639,7 +849,7 @@ fn check_limits(value: &Value) -> Result<(), ParseError> {
     for key in LIMIT_KEYS {
         match obj.get(key) {
             None => return Err(ParseError::NoDeclaration),
-            Some(Value::Number(n)) => match n.as_u64() {
+            Some(Value::Number(n)) => match integral(n) {
                 Some(n) if n >= 1 => {}
                 _ => return Err(ParseError::Malformed),
             },
@@ -649,14 +859,54 @@ fn check_limits(value: &Value) -> Result<(), ParseError> {
     Ok(())
 }
 
-/// A numeric or token `code` other than success. Only the integer `0` is a
-/// numeric success. `as_i64` fails for fractions and for magnitudes outside
-/// i64; those are `upstream_error`, not a pass. Free text is also
+/// The integer a JSON number stands for, by JSON Schema's value rule: `-0`,
+/// `1.0` and `1e3` are integers, `1.5` is not. `None` for a fraction, a
+/// non-finite value, or a magnitude the exact range below cannot hold (2^53 and
+/// up: a float no longer names one integer).
+fn integral(n: &Number) -> Option<i128> {
+    if let Some(i) = n.as_i64() {
+        return Some(i128::from(i));
+    }
+    if let Some(u) = n.as_u64() {
+        return Some(i128::from(u));
+    }
+    const EXACT: f64 = 9_007_199_254_740_992.0; // 2^53
+    let f = n.as_f64()?;
+    // `-0.0` has no fraction and is `0`.
+    (f.is_finite() && f.fract() == 0.0 && f.abs() < EXACT).then_some(f as i128)
+}
+
+/// The text of the envelope's top-level `code`, as sent. A `Number` has already
+/// lost it (`1e-400` is `0.0`).
+fn raw_code(body: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Top<'a> {
+        #[serde(borrow)]
+        code: Option<&'a serde_json::value::RawValue>,
+    }
+    let top: Top<'_> = serde_json::from_slice(body).ok()?;
+    top.code.map(|raw| raw.get().to_owned())
+}
+
+/// Whether a JSON number's text has a nonzero digit before any exponent: the
+/// value is not zero, whatever a float made of it.
+fn nonzero_mantissa(text: &str) -> bool {
+    text.split(['e', 'E'])
+        .next()
+        .is_some_and(|mantissa| mantissa.bytes().any(|b| (b'1'..=b'9').contains(&b)))
+}
+
+/// A numeric or token `code` other than success. Only the integer `0` (however
+/// it is written: `0`, `-0`, `0.0`, `0e5`) is a numeric success. A fraction or
+/// a magnitude [`integral`] cannot read is `upstream_error`, not a pass. Free text is also
 /// `upstream_error`, so the server's sentence is not copied.
-fn upstream_code(value: &Value) -> Option<String> {
+fn upstream_code(value: &Value, raw: Option<&str>) -> Option<String> {
     let code = value.get("code")?;
     match code {
-        Value::Number(n) => match n.as_i64() {
+        Value::Number(n) => match integral(n) {
+            // `1e-400` reads as `0.0` once it is a float. Its text says it is
+            // not zero (a fraction too small for f64), so it is not success.
+            Some(0) if raw.is_some_and(nonzero_mantissa) => Some("upstream_error".to_owned()),
             Some(0) => None,
             Some(n) => Some(format!("upstream_{n}")),
             None => Some("upstream_error".to_owned()),

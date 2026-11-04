@@ -546,7 +546,10 @@ async fn the_real_transport_goes_to_the_activated_endpoint() {
         },
     );
     let runs = Runs(HashMap::from([(RUN.to_owned(), BINDING.to_owned())]));
-    let backend = DaemonKnowledgeBackend::new(registry, Arc::new(runs));
+    // The seam constructor keeps the D3 gate off: this test is about the
+    // transport, and the gate would refuse first (no declaration to read).
+    let backend =
+        DaemonKnowledgeBackend::with_connect(registry, Arc::new(runs), Box::new(http_transport));
     let result = backend.search(RUN, query(None)).await;
     assert!(
         matches!(
@@ -558,4 +561,440 @@ async fn the_real_transport_goes_to_the_activated_endpoint() {
         ),
         "{result:?}"
     );
+}
+
+/// A loopback server for `GET /system/capabilities`: the probe the D3 gate
+/// reads. Counts its requests.
+async fn capabilities_server(
+    status: u16,
+    body: String,
+) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/api/v1", listener.local_addr().unwrap());
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    let business = Arc::new(AtomicUsize::new(0));
+    let business_counter = Arc::clone(&business);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let body = body.clone();
+            let counter = Arc::clone(&counter);
+            let business = Arc::clone(&business_counter);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                // Only the capabilities request counts; a §8 ready probe may follow.
+                let head = String::from_utf8_lossy(&buf[..n]);
+                if head.contains("/system/capabilities") {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                } else if head.contains("/agent24/knowledge/search")
+                    || head.contains("/agent24/knowledge/read")
+                {
+                    business.fetch_add(1, Ordering::SeqCst);
+                }
+                let reply = format!(
+                    "HTTP/1.1 {status} S\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    (base, hits, business)
+}
+
+fn capabilities_document(majors: &str, operations: &str) -> String {
+    format!(
+        r#"{{"code":0,"msg":"ok","data":{{"integration":{{"agent24_knowledge":{{"protocol_versions":{majors},"mode":"integration","supported_operations":{operations},"server_version":"1.0.0","limits":{{"max_results":50,"max_concurrency":4,"max_deadline_ms":30000,"max_read_bytes":262144,"max_page_limit":100,"max_snippet_bytes":2048}}}}}}}}}}"#
+    )
+}
+
+/// `setup`, but the endpoint is a loopback server the D3 gate can probe, and
+/// the gate is on. `Server` still plays the business endpoints.
+fn gated_setup(base: &str, answer: Answer) -> Setup {
+    let registry = Arc::new(KnowledgeHostRegistry::default());
+    let endpoint = Endpoint {
+        base_url: base.to_owned(),
+        knowledge_base_ids: vec!["kb-a".into(), "kb-b".into()],
+    };
+    registry.activate(HOST, BINDING, 5, endpoint).unwrap();
+    push(&registry, 6, "key-1");
+    registry.pin_run(
+        RUN,
+        RunBinding {
+            host: HOST.into(),
+            binding: BINDING.into(),
+            generation: 5,
+        },
+    );
+    let server = Arc::new(Server {
+        answer,
+        during: Mutex::new(None),
+        sent: Mutex::new(Vec::new()),
+    });
+    let connects = Arc::new(AtomicUsize::new(0));
+    let (to, count) = (Arc::clone(&server), Arc::clone(&connects));
+    let connect: Box<Connect> = Box::new(move |_base, _credential| {
+        count.fetch_add(1, Ordering::SeqCst);
+        let transport: Arc<dyn KnowledgeTransport> = to.clone();
+        Some(transport)
+    });
+    let runs = Runs(HashMap::from([(RUN.to_owned(), BINDING.to_owned())]));
+    let backend =
+        DaemonKnowledgeBackend::with_connect(Arc::clone(&registry), Arc::new(runs), connect)
+            .gated();
+    Setup {
+        registry,
+        server,
+        connects,
+        backend,
+    }
+}
+
+fn read_query() -> ReadQuery {
+    ReadQuery {
+        knowledge_id: "doc-1".into(),
+        chunk_id: None,
+        content_tag: None,
+        cursor: None,
+    }
+}
+
+fn refused_as(result: &Result<impl std::fmt::Debug, Failure>, want: LocalReason, retryable: bool) {
+    assert!(
+        matches!(result, Err(Failure::Local(Refusal { reason, retryable: r })) if *reason == want && *r == retryable),
+        "{result:?}"
+    );
+}
+
+/// ADR-038 D3: no business call before the version check.
+#[tokio::test]
+async fn an_incompatible_contract_refuses_search_and_read_before_anything_is_sent() {
+    let (base, hits, _) =
+        capabilities_server(200, capabilities_document("[2]", r#"["search","read"]"#)).await;
+    let s = gated_setup(&base, Answer::Fixture("search.ok.json"));
+    refused_as(
+        &s.backend.search(RUN, query(None)).await,
+        LocalReason::Incompatible,
+        false,
+    );
+    refused_as(
+        &s.backend.read(RUN, read_query()).await,
+        LocalReason::Incompatible,
+        false,
+    );
+    assert!(s.server.sent.lock().unwrap().is_empty(), "a request left");
+    assert_eq!(
+        s.connects.load(Ordering::SeqCst),
+        0,
+        "a transport was built"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "both calls read one cached probe"
+    );
+}
+
+#[tokio::test]
+async fn no_declaration_yet_refuses_with_a_retryable_not_ready() {
+    let (base, _, _) = capabilities_server(500, "down".into()).await;
+    let s = gated_setup(&base, Answer::Fixture("search.ok.json"));
+    refused_as(
+        &s.backend.search(RUN, query(None)).await,
+        LocalReason::NotReady,
+        true,
+    );
+    refused_as(
+        &s.backend.read(RUN, read_query()).await,
+        LocalReason::NotReady,
+        true,
+    );
+    assert!(s.server.sent.lock().unwrap().is_empty());
+    assert_eq!(s.connects.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_compatible_contract_lets_the_call_through_on_one_probe() {
+    let (base, hits, _) =
+        capabilities_server(200, capabilities_document("[1]", r#"["search","read"]"#)).await;
+    let s = gated_setup(&base, Answer::Fixture("search.ok.json"));
+    s.backend.search(RUN, query(None)).await.unwrap();
+    s.backend.search(RUN, query(None)).await.unwrap();
+    assert_eq!(s.server.sent.lock().unwrap().len(), 2);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "the second call read the cache"
+    );
+}
+
+/// The declaration lacks `read`: that call is refused, search still goes.
+#[tokio::test]
+async fn an_operation_the_declaration_lacks_is_refused_locally() {
+    let (base, _, _) =
+        capabilities_server(200, capabilities_document("[1]", r#"["search"]"#)).await;
+    let s = gated_setup(&base, Answer::Fixture("search.ok.json"));
+    refused_as(
+        &s.backend.read(RUN, read_query()).await,
+        LocalReason::Incompatible,
+        false,
+    );
+    assert!(s.server.sent.lock().unwrap().is_empty());
+    s.backend.search(RUN, query(None)).await.unwrap();
+    assert_eq!(s.server.sent.lock().unwrap().len(), 1);
+}
+
+/// M3: the constructor the daemon uses is the gated one. Nothing here goes
+/// through `with_connect`, so the real HTTP transport is what would carry a
+/// business request if the gate were off.
+fn production_backend(base: &str) -> (Arc<KnowledgeHostRegistry>, DaemonKnowledgeBackend) {
+    let registry = Arc::new(KnowledgeHostRegistry::default());
+    let endpoint = Endpoint {
+        base_url: base.to_owned(),
+        knowledge_base_ids: vec!["kb-a".into()],
+    };
+    registry.activate(HOST, BINDING, 1, endpoint).unwrap();
+    push(&registry, 2, "key-1");
+    registry.pin_run(
+        RUN,
+        RunBinding {
+            host: HOST.into(),
+            binding: BINDING.into(),
+            generation: 1,
+        },
+    );
+    let runs = Runs(HashMap::from([(RUN.to_owned(), BINDING.to_owned())]));
+    let backend = DaemonKnowledgeBackend::new(Arc::clone(&registry), Arc::new(runs));
+    (registry, backend)
+}
+
+#[tokio::test]
+async fn new_refuses_locally_when_the_endpoint_is_incompatible_or_unreachable() {
+    let (base, _, business) =
+        capabilities_server(200, capabilities_document("[2]", r#"["search","read"]"#)).await;
+    let (_registry, backend) = production_backend(&base);
+    refused_as(
+        &backend.search(RUN, query(None)).await,
+        LocalReason::Incompatible,
+        false,
+    );
+    refused_as(
+        &backend.read(RUN, read_query()).await,
+        LocalReason::Incompatible,
+        false,
+    );
+    assert_eq!(
+        business.load(Ordering::SeqCst),
+        0,
+        "a business request left"
+    );
+
+    let (base, _, business) = capabilities_server(500, "down".into()).await;
+    let (_registry, backend) = production_backend(&base);
+    refused_as(
+        &backend.search(RUN, query(None)).await,
+        LocalReason::NotReady,
+        true,
+    );
+    assert_eq!(business.load(Ordering::SeqCst), 0);
+
+    // A port nothing listens on: no declaration, so refused before any request.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/api/v1", closed.local_addr().unwrap());
+    drop(closed);
+    let (_registry, backend) = production_backend(&base);
+    refused_as(
+        &backend.read(RUN, read_query()).await,
+        LocalReason::NotReady,
+        true,
+    );
+}
+
+/// H1 through the backend: another binding's dead endpoint does not refuse a
+/// run bound to a good one.
+#[tokio::test]
+async fn a_run_on_a_good_endpoint_is_not_refused_for_another_bindings_bad_one() {
+    let (good, _, business) =
+        capabilities_server(200, capabilities_document("[1]", r#"["search","read"]"#)).await;
+    let (bad, _, _) = capabilities_server(500, "down".into()).await;
+    let (registry, backend) = production_backend(&good);
+    registry
+        .activate(
+            HOST,
+            "b2",
+            1,
+            Endpoint {
+                base_url: bad,
+                knowledge_base_ids: vec!["kb-x".into()],
+            },
+        )
+        .unwrap();
+    // The good endpoint passes the gate and the request goes out. The loopback
+    // server answers it with a capabilities document, so the call itself fails
+    // past the gate; what counts is that the business request left.
+    let _ = backend.search(RUN, query(None)).await;
+    assert!(
+        business.load(Ordering::SeqCst) >= 1,
+        "the call did not reach the good endpoint"
+    );
+}
+
+/// A capabilities server that holds every answer until `release` is set, and
+/// says when the first request arrived.
+async fn held_capabilities_server(
+    body: String,
+) -> (
+    String,
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::AtomicBool;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/api/v1", listener.local_addr().unwrap());
+    let arrived = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let (seen, go) = (Arc::clone(&arrived), Arc::clone(&release));
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (body, seen, go) = (body.clone(), Arc::clone(&seen), Arc::clone(&go));
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                seen.store(true, Ordering::SeqCst);
+                while !go.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 S\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    (base, arrived, release)
+}
+
+/// M1: the gate can wait seconds. A credential revoked meanwhile must not be
+/// the one the request goes out with: the binding is read again after the gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_credential_revoked_while_the_gate_waits_is_not_sent() {
+    let (base, arrived, release) =
+        held_capabilities_server(capabilities_document("[1]", r#"["search","read"]"#)).await;
+    let s = Arc::new(gated_setup(&base, Answer::Fixture("search.ok.json")));
+    let call = {
+        let s = Arc::clone(&s);
+        tokio::spawn(async move { s.backend.search(RUN, query(None)).await })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !arrived.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the probe never started"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    s.registry
+        .apply(HOST, BINDING, 7, Change::RevokeCredential)
+        .unwrap();
+    release.store(true, Ordering::SeqCst);
+    let result = tokio::time::timeout(Duration::from_secs(6), call)
+        .await
+        .unwrap()
+        .unwrap();
+    refused_as(&result, LocalReason::NotReady, true);
+    assert!(s.server.sent.lock().unwrap().is_empty(), "a request left");
+    assert_eq!(
+        s.connects.load(Ordering::SeqCst),
+        0,
+        "a transport was built from the old key"
+    );
+}
+
+/// `Runs` that runs `hook` when it is asked the `at`-th time (1-based).
+struct HookRuns {
+    runs: Runs,
+    asked: AtomicUsize,
+    at: usize,
+    hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+#[async_trait]
+impl RunSelector for HookRuns {
+    async fn knowledge_binding_id(&self, run_id: &str) -> Option<String> {
+        if self.asked.fetch_add(1, Ordering::SeqCst) + 1 == self.at
+            && let Some(hook) = self.hook.lock().unwrap().take()
+        {
+            hook();
+        }
+        self.runs.knowledge_binding_id(run_id).await
+    }
+}
+
+/// F1 of #1579: the run is re-pinned to another endpoint between the gate and
+/// the second read of the binding. That endpoint has not passed the gate, so
+/// nothing may be sent to it. Here it is incompatible: the gate runs again for
+/// it and refuses.
+#[tokio::test]
+async fn an_endpoint_the_run_moved_to_after_the_gate_is_gated_before_anything_is_sent() {
+    let (a, _, _) =
+        capabilities_server(200, capabilities_document("[1]", r#"["search","read"]"#)).await;
+    let (b, _, business_b) =
+        capabilities_server(200, capabilities_document("[2]", r#"["search","read"]"#)).await;
+    let registry = Arc::new(KnowledgeHostRegistry::default());
+    let endpoint = |base: &str| Endpoint {
+        base_url: base.to_owned(),
+        knowledge_base_ids: vec!["kb-a".into()],
+    };
+    registry.activate(HOST, BINDING, 5, endpoint(&a)).unwrap();
+    push(&registry, 6, "key-1");
+    let pin = |generation| RunBinding {
+        host: HOST.into(),
+        binding: BINDING.into(),
+        generation,
+    };
+    registry.pin_run(RUN, pin(5));
+    // The second time the backend asks which binding the run names (after the
+    // gate for A), the run is moved to B.
+    let swap = {
+        let registry = Arc::clone(&registry);
+        let b = b.clone();
+        Box::new(move || {
+            registry.activate(HOST, BINDING, 8, endpoint(&b)).unwrap();
+            push(&registry, 9, "key-2");
+            registry.pin_run(RUN, pin(8));
+        }) as Box<dyn FnOnce() + Send>
+    };
+    let runs = HookRuns {
+        runs: Runs(HashMap::from([(RUN.to_owned(), BINDING.to_owned())])),
+        asked: AtomicUsize::new(0),
+        at: 2,
+        hook: Mutex::new(Some(swap)),
+    };
+    let server = Arc::new(Server {
+        answer: Answer::Fixture("search.ok.json"),
+        during: Mutex::new(None),
+        sent: Mutex::new(Vec::new()),
+    });
+    let to = Arc::clone(&server);
+    let connect: Box<Connect> = Box::new(move |_base, _credential| {
+        let transport: Arc<dyn KnowledgeTransport> = to.clone();
+        Some(transport)
+    });
+    let backend =
+        DaemonKnowledgeBackend::with_connect(Arc::clone(&registry), Arc::new(runs), connect)
+            .gated();
+    let result = backend.search(RUN, query(None)).await;
+    refused_as(&result, LocalReason::Incompatible, false);
+    assert!(server.sent.lock().unwrap().is_empty(), "a request left");
+    assert_eq!(business_b.load(Ordering::SeqCst), 0);
 }
