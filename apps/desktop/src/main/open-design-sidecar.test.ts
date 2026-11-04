@@ -89,8 +89,7 @@ describe('PosixProcessGroupTree', () => {
   it('sends the graceful signal to the launcher pid only, never to the group', async () => {
     const kill = vi.fn()
     await tree(kill).signal(false)
-    expect(kill).toHaveBeenCalledTimes(1)
-    expect(kill).toHaveBeenCalledWith(4321, 'SIGTERM')
+    expect(kill.mock.calls).toEqual([[-4321, 0], [4321, 'SIGTERM']])
   })
 
   it('sends the forced signal to the negative pgid', async () => {
@@ -389,5 +388,73 @@ describe('Open Design launcher under a real SidecarManager', () => {
     await expect(starting).resolves.toMatchObject({ state: 'healthy', sidecarId: 'open-design' })
     expect(handoff.current()?.endpoint).toEqual({ origin: 'http://127.0.0.1:17456', auth: 'none' })
     await manager.stop()
+  })
+})
+
+describe('PR1580 launcher regressions', () => {
+  it('F6 retires an empty group before graceful TERM even if its pid is reused', async () => {
+    const kill = vi.fn(() => { throw errno('ESRCH') })
+    const tree = new PosixProcessGroupTree(4321, kill)
+    await tree.signal(false)
+    expect(kill).toHaveBeenCalledExactlyOnceWith(-4321, 0)
+    kill.mockClear(); kill.mockImplementation(() => undefined as never)
+    await tree.signal(false)
+    expect(kill).not.toHaveBeenCalled()
+  })
+  it.each(['timeout', 'stop', 'exit'] as const)('F5 aborts hanging readiness fetch on %s within the phase budget', async (cause) => {
+    vi.useFakeTimers()
+    const child = new FakeChild()
+    let signal: AbortSignal | null | undefined
+    const fetchFn: typeof fetch = vi.fn((_url, init) => { signal = init?.signal; return new Promise(() => {}) })
+    const launch = launcherFor(child, plan({ readyPhaseTimeoutMs: 200 }), fetchFn).launcher.launch()
+    const result = expect(launch.ready).rejects.toThrow(cause === 'timeout' ? 'timed out' : 'cancelled')
+    child.stdout.write(readyLine(5000))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(signal).toBeInstanceOf(AbortSignal)
+    if (cause === 'stop') await launch.tree.signal(false)
+    if (cause === 'exit') child.emit('exit', 0, null)
+    await vi.advanceTimersByTimeAsync(200)
+    await result
+    expect(signal?.aborted).toBe(true)
+  })
+  it('F2 records the group and removes its own pid file on exit', async () => {
+    const current = plan(); const child = new FakeChild()
+    const launch = launcherFor(child, current).launcher.launch()
+    void launch.ready.catch(() => {})
+    const file = path.join(current.runtimeRoot, 'open-design.pgid')
+    expect(fs.readFileSync(file, 'utf8')).toBe('5000')
+    child.emit('exit', 0, null)
+    expect(fs.existsSync(file)).toBe(false)
+  })
+  it('F2 reaps only a live group with an exact ps launcher identity before spawn', () => {
+    const current = plan()
+    fs.mkdirSync(current.runtimeRoot, { recursive: true })
+    const file = path.join(current.runtimeRoot, 'open-design.pgid')
+    fs.writeFileSync(file, '4321')
+    const kill = vi.fn()
+    const ps = vi.fn(() => ` 4321 ${current.runtimeExecutable} ${current.headlessEntry} --config ${current.configPath}\n`)
+    const spawn = vi.fn(() => {
+      expect(kill).toHaveBeenCalledWith(-4321, 'SIGKILL')
+      return new FakeChild() as unknown as ChildProcess
+    })
+    const launcher = new OpenDesignLauncher(() => current, spawn as never, okFetch(), logger, 'linux', kill, ps)
+    void launcher.launch().ready.catch(() => {})
+    expect(ps).toHaveBeenCalledExactlyOnceWith(4321)
+  })
+  it.each(['missing', 'invalid', 'dead', 'permission', 'wrong-command', 'wrong-group', 'ps-failed'])('F2 refuses stale reap when %s', (cause) => {
+    const current = plan()
+    fs.mkdirSync(current.runtimeRoot, { recursive: true })
+    const file = path.join(current.runtimeRoot, 'open-design.pgid')
+    if (cause !== 'missing') fs.writeFileSync(file, cause === 'invalid' ? '1' : '4321')
+    const kill = vi.fn((_pid: number, signal: NodeJS.Signals | 0) => {
+      if (signal === 0 && (cause === 'dead' || cause === 'permission')) throw errno(cause === 'dead' ? 'ESRCH' : 'EPERM')
+    })
+    const ps = vi.fn(() => {
+      if (cause === 'ps-failed') throw new Error('ps denied')
+      return `${cause === 'wrong-group' ? 9999 : 4321} ${cause === 'wrong-command' ? '/unrelated' : current.runtimeExecutable} ${current.headlessEntry} --config ${current.configPath}`
+    })
+    const launcher = new OpenDesignLauncher(() => current, vi.fn(() => new FakeChild()) as never, okFetch(), logger, 'linux', kill, ps)
+    void launcher.launch().ready.catch(() => {})
+    expect(kill.mock.calls.filter(([, signal]) => signal !== 0)).toEqual([])
   })
 })

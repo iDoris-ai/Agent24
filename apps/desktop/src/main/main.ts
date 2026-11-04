@@ -490,6 +490,19 @@ function refreshTray(): void {
         : { label: item.label, enabled: false })))
 }
 
+let signalShutdown: Promise<void> | undefined
+for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
+  process.on(signal, () => {
+    signalShutdown ??= (async () => {
+      isQuitting = true
+      const creative = creativeServeWeb
+      if (creative) await stopWithin(creative, CREATIVE_QUIT_STOP_BUDGET_MS)
+      creativeQuitState = 'done'
+      app.exit(0)
+    })()
+  })
+}
+
 app.on('before-quit', (event) => {
   isQuitting = true
   // M5: cancel an in-flight Open Design component download rather than

@@ -362,10 +362,10 @@ describe('CreativeServeWeb', () => {
       // Legacy bundled-resources path: no resourceSafeBase (the fork's v1
       // runtimeExecutable-derived default still applies).
     })
-    expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:17456/api/ready')
+    expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:17456/api/ready', expect.objectContaining({ signal: expect.any(AbortSignal) }))
     await service.stop()
     // Graceful stop signals the launcher pid only, never the group.
-    expect(child.signals).toEqual([[4321, 'SIGTERM'], [-4321, 0]])
+    expect(child.signals).toEqual([[-4321, 0], [4321, 'SIGTERM'], [-4321, 0]])
     expect(child.kill).not.toHaveBeenCalled()
   })
 
@@ -382,7 +382,7 @@ describe('CreativeServeWeb', () => {
     child.stdout.write(`${JSON.stringify({ ...headlessReady(child.pid, 17456, 17457), webOrigin: 'http://example.com:17456' })}\n`)
     await expect(starting).resolves.toMatchObject({ state: 'failed', error: expect.stringContaining('127.0.0.1') })
     expect(fetchFn).not.toHaveBeenCalled()
-    expect(child.signals[0]).toEqual([4321, 'SIGTERM'])
+    expect(child.signals.filter(([, signal]) => signal !== 0)[0]).toEqual([4321, 'SIGTERM'])
     expect(service.headlessSidecarState()).toBe('failed')
   })
 
@@ -650,6 +650,7 @@ describe('CreativeServeWeb', () => {
     await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456', instanceId: expect.any(String) })
     expect(service.headlessSidecarState()).toBe('healthy')
     child.emit('exit', 1, null)
+    await Promise.resolve()
     expect(service.headlessSidecarState()).toBe('failed')
     expect(service.status()).toEqual({ state: 'stopped' })
   })
@@ -780,6 +781,7 @@ describe('CreativeServeWeb', () => {
     expect(service.headlessSidecarState()).toBe('healthy')
 
     child.emit('exit', 1, null)
+    await Promise.resolve()
     expect(service.headlessSidecarState()).toBe('failed')
     // The crash's own status event already called headlessPhaseForReport('downloading').
     // A later progress tick must still see the failure, and so must the

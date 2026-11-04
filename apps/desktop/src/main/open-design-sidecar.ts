@@ -1,4 +1,4 @@
-import type { ChildProcess, spawn } from 'node:child_process'
+import { execFileSync, type ChildProcess, type spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import type { Readable } from 'node:stream'
@@ -197,6 +197,7 @@ export class PosixProcessGroupTree implements SidecarTreeController {
   async signal(force: boolean): Promise<void> {
     if (this.retired) return
     if (!force) {
+      if (await this.isEmpty()) return
       try { this.kill(this.pid, 'SIGTERM') } catch (error) {
         if (errnoCode(error) !== 'ESRCH') throw error
       }
@@ -280,6 +281,27 @@ const INERT_TREE: SidecarTreeController = { signal: async () => {}, isEmpty: asy
 const STDERR_TAIL_BYTES = 2_000
 const READY_LINE_LIMIT_BYTES = 16_384
 
+/** Fail closed: a pid file alone never grants signal authority. */
+export function reapStaleLauncher(
+  pidFile: string,
+  plan: OpenDesignLaunchPlan,
+  kill: KillFn,
+  ps: (pid: number) => string,
+): void {
+  try {
+    const record = fs.readFileSync(pidFile, 'utf8')
+    if (!/^[1-9][0-9]*$/.test(record)) return
+    const pid = Number(record)
+    if (!Number.isSafeInteger(pid) || pid < 2 || pid === process.pid) return
+    kill(-pid, 0)
+    const expected = `${pid} ${plan.runtimeExecutable} ${plan.headlessEntry} --config ${plan.configPath}`
+    // Require the exact runtime, entry, config and group leader; no substring matching.
+    if (ps(pid).trim().replace(/^([0-9]+)\s+/, '$1 ') !== expected) return
+    kill(-pid, 'SIGKILL')
+    fs.unlinkSync(pidFile)
+  } catch { /* Missing, dead, inaccessible or unverifiable: never guess ownership. */ }
+}
+
 export class OpenDesignLauncher implements SidecarLauncher {
   constructor(
     private readonly plan: () => OpenDesignLaunchPlan,
@@ -288,6 +310,7 @@ export class OpenDesignLauncher implements SidecarLauncher {
     private readonly logger: SidecarLogger,
     private readonly platform: NodeJS.Platform = process.platform,
     private readonly kill: KillFn = (target, signal) => process.kill(target, signal),
+    private readonly ps: (pid: number) => string = (pid) => execFileSync('ps', ['-p', String(pid), '-o', 'pgid=,command='], { encoding: 'utf8', timeout: 1000 }),
   ) {}
 
   launch(): SidecarLaunch {
@@ -297,6 +320,8 @@ export class OpenDesignLauncher implements SidecarLauncher {
 
     fs.mkdirSync(plan.dataRoot, { recursive: true })
     fs.mkdirSync(plan.runtimeRoot, { recursive: true })
+    const pidFile = path.join(plan.runtimeRoot, 'open-design.pgid')
+    reapStaleLauncher(pidFile, plan, this.kill, this.ps)
     fs.writeFileSync(plan.configPath, `${JSON.stringify(plan.config)}\n`, { encoding: 'utf8', mode: 0o600 })
     fs.chmodSync(plan.configPath, 0o600)
 
@@ -315,23 +340,33 @@ export class OpenDesignLauncher implements SidecarLauncher {
     ) as LaunchedChild
 
     const pid = child.pid
+    if (pid && pid > 1) fs.writeFileSync(pidFile, String(pid), { mode: 0o600 })
+    const cancellation = new AbortController()
     const adapter = new ChildAdapter(child)
     const tail = { value: '' }
     child.stderr.on('data', (chunk: Buffer | string) => {
       tail.value = (tail.value + chunk.toString()).slice(-STDERR_TAIL_BYTES)
     })
     adapter.onExit((code) => {
+      cancellation.abort()
+      try {
+        if (fs.readFileSync(pidFile, 'utf8') === String(pid)) fs.unlinkSync(pidFile)
+      } catch { /* Missing record is already retired. */ }
       this.logger.warn('open-design.exited', { code: code ?? -1, stderr: tail.value.trim() })
     })
 
-    const ready = this.waitForReady(child, adapter, plan, tail)
+    const ready = this.waitForReady(child, adapter, plan, tail, cancellation.signal)
     const hasPid = typeof pid === 'number' && Number.isInteger(pid) && pid > 1
+    const group = hasPid ? new PosixProcessGroupTree(pid, this.kill) : INERT_TREE
     return {
       child: adapter,
       processGroupId: hasPid ? pid : undefined,
       dedicatedProcessGroup: hasPid,
       // Without a pid nothing was spawned, so there is nothing to signal; the manager rejects the launch.
-      tree: hasPid ? new PosixProcessGroupTree(pid, this.kill) : INERT_TREE,
+      tree: hasPid ? {
+        signal: async (force) => { cancellation.abort(); await group.signal(force) },
+        isEmpty: () => group.isEmpty(),
+      } : INERT_TREE,
       ready,
     }
   }
@@ -341,12 +376,13 @@ export class OpenDesignLauncher implements SidecarLauncher {
     adapter: ChildAdapter,
     plan: OpenDesignLaunchPlan,
     tail: { value: string },
+    signal: AbortSignal,
   ): Promise<SidecarReady> {
     if (!Number.isInteger(child.pid) || !child.pid || child.pid < 1) {
       throw new Error('Open Design headless launcher did not provide a pid')
     }
     const ready = await this.readReadyLine(child, plan, tail)
-    await this.pollApiReady(ready.webOrigin, plan.readyPhaseTimeoutMs, adapter)
+    await this.pollApiReady(ready.webOrigin, plan.readyPhaseTimeoutMs, adapter, signal)
     // Open Design's loopback port does not authenticate (see ADR-038 C8 notes): say so, do not fake a secret.
     return { endpoint: { origin: ready.webOrigin, auth: 'none' } }
   }
@@ -400,22 +436,43 @@ export class OpenDesignLauncher implements SidecarLauncher {
     })
   }
 
-  private async pollApiReady(origin: string, timeoutMs: number, adapter: ChildAdapter): Promise<void> {
-    const deadline = Date.now() + timeoutMs
+  private async pollApiReady(origin: string, timeoutMs: number, adapter: ChildAdapter, signal: AbortSignal): Promise<void> {
+    const controller = new AbortController()
     let lastError = 'not ready'
-    while (Date.now() < deadline) {
-      if (adapter.exited) throw new Error('Open Design headless launcher exited before ready')
-      try {
-        const response = await this.fetchFn(`${origin}/api/ready`)
-        if (response.ok) return
-        lastError = `HTTP ${response.status}`
-      } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error)
+    const cancel = () => controller.abort(new Error('Open Design headless launcher exited before ready or cancelled'))
+    signal.addEventListener('abort', cancel, { once: true })
+    if (signal.aborted || adapter.exited) cancel()
+    const timer = setTimeout(() => controller.abort(new Error(`Open Design /api/ready timed out: ${lastError}`)), timeoutMs)
+    let removeAbort = () => {}
+    const aborted = new Promise<never>((_resolve, reject) => {
+      const fail = () => reject(controller.signal.reason)
+      controller.signal.addEventListener('abort', fail, { once: true })
+      removeAbort = () => controller.signal.removeEventListener('abort', fail)
+      if (controller.signal.aborted) fail()
+    })
+    try {
+      while (true) {
+        try {
+          const response = await Promise.race([this.fetchFn(`${origin}/api/ready`, { signal: controller.signal }), aborted])
+          void response.body?.cancel().catch(() => {})
+          if (response.ok) return
+          lastError = `HTTP ${response.status}`
+        } catch (error) {
+          if (controller.signal.aborted) throw controller.signal.reason
+          lastError = error instanceof Error ? error.message : String(error)
+        }
+        let delay: ReturnType<typeof setTimeout> | undefined
+        try {
+          await Promise.race([new Promise<void>((resolve) => { delay = setTimeout(resolve, 100) }), aborted])
+        } finally { clearTimeout(delay) }
       }
-      await new Promise((resolve) => setTimeout(resolve, 100))
+    } finally {
+      clearTimeout(timer)
+      removeAbort()
+      signal.removeEventListener('abort', cancel)
     }
-    throw new Error(`Open Design /api/ready timed out: ${lastError}`)
   }
+
 }
 
 /** Presents a `ChildProcess` as the manager's `SidecarChild`; also guarantees an `error` listener exists. */

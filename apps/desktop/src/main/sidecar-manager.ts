@@ -189,14 +189,17 @@ export class SidecarManager {
     this.currentState = next
     if (this.statusListeners.size === 0) return
     const snapshot = this.status()
-    for (const listener of [...this.statusListeners]) {
-      try { listener(snapshot) } catch (error) {
-        this.logger.warn('sidecar.status_listener_failed', {
-          sidecarId: this.spec.sidecarId,
-          error: error instanceof Error ? error.message : String(error),
-        })
+    const listeners = [...this.statusListeners]
+    queueMicrotask(() => {
+      for (const listener of listeners) {
+        try { listener(snapshot) } catch (error) {
+          this.logger.warn('sidecar.status_listener_failed', {
+            sidecarId: this.spec.sidecarId,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
       }
-    }
+    })
   }
 
   /** Fires after each state change (not on repeats). A throwing listener cannot disturb the state machine. */
@@ -351,7 +354,6 @@ export class SidecarManager {
         this.detached.delete(active)
         active.removeExit?.()
         active.removeExit = undefined
-        if (!this.active && this.detached.size === 0 && this.state === 'stopping' && this.generation > active.token) this.state = 'stopped'
       },
       (error) => {
         if (this.active === active) this.state = 'failed'

@@ -444,3 +444,79 @@ describe('SidecarManager', () => {
     })
   })
 })
+
+describe('PR1580 lifecycle regressions', () => {
+  const launch = () => ({ child, processGroupId: 42, dedicatedProcessGroup: true, tree, ready })
+  it('F1 readiness resolving during stop never republishes the endpoint', async () => {
+    const pending = deferred<SidecarReady>(); const stopping = deferred<void>()
+    const handoff = new MemoryEndpointHandoff()
+    const manager = new SidecarManager(spec, { launch: () => ({ ...launch(), ready: pending.promise }) }, { check: vi.fn() }, { stop: () => stopping.promise }, handoff)
+    const start = manager.start(); const stop = manager.stop()
+    pending.resolve(await ready)
+    await start
+    stopping.resolve(); await stop
+    expect(handoff.current()).toBeNull()
+    expect(manager.status().state).not.toBe('ready')
+  })
+  it('F3 stopped listener can restart and stop the new instance', async () => {
+    const stopper = { stop: vi.fn().mockResolvedValue(undefined) }
+    const manager = new SidecarManager(spec, { launch }, { check: vi.fn().mockResolvedValue(true) }, stopper)
+    await manager.start()
+    let restarted: Promise<unknown> | undefined
+    const remove = manager.onStatus((status) => {
+      if (status.state === 'stopped') {
+        remove()
+        const starting = manager.start()
+        restarted = Promise.all([starting, manager.stop()])
+      }
+    })
+    await manager.stop(); await restarted
+    expect(stopper.stop).toHaveBeenCalledTimes(2)
+    expect(manager.status().state).toBe('stopped')
+  })
+  it('F4 starting listener stop awaits the launched instance cleanup', async () => {
+    const cleanup = deferred<void>()
+    const stopper = { stop: vi.fn(() => cleanup.promise) }
+    const manager = new SidecarManager(spec, { launch }, { check: vi.fn() }, stopper)
+    let stopped = false
+    manager.onStatus((status) => { if (status.state === 'starting') void manager.stop().then(() => { stopped = true }) })
+    const start = manager.start()
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(stopped).toBe(false)
+    expect(stopper.stop).toHaveBeenCalledOnce()
+    cleanup.resolve(); await start
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(stopped).toBe(true)
+  })
+  it('M10b F7 rejects wrong pgid and retains detached cleanup for retry', async () => {
+    const stopper = { stop: vi.fn().mockRejectedValueOnce(new Error('cleanup failed')).mockResolvedValue(undefined) }
+    const manager = new SidecarManager(spec, { launch: () => ({ ...launch(), processGroupId: 99 }) }, { check: vi.fn() }, stopper)
+    await expect(manager.start()).rejects.toThrow('cleanup failed')
+    await expect(manager.start()).resolves.toMatchObject({ state: 'failed' })
+    await manager.stop()
+    expect(stopper.stop).toHaveBeenCalledTimes(2)
+    const clean = new SidecarManager(spec, { launch: () => ({ ...launch(), processGroupId: 99 }) }, { check: vi.fn() }, stopper)
+    await expect(clean.start()).rejects.toThrow('not an owned child group')
+  })
+  it('M17 overlapping health intervals do not re-enter a probe', async () => {
+    vi.useFakeTimers()
+    const pending = deferred<boolean>()
+    const health = { check: vi.fn().mockResolvedValueOnce(true).mockImplementation(() => pending.promise) }
+    const manager = new SidecarManager({ ...spec, healthIntervalMs: 10, healthTimeoutMs: 100 }, { launch }, health, { stop: vi.fn().mockResolvedValue(undefined) })
+    try {
+      await manager.start(); await vi.advanceTimersByTimeAsync(40)
+      expect(health.check).toHaveBeenCalledTimes(2)
+      pending.resolve(true); await manager.stop()
+    } finally { vi.useRealTimers() }
+  })
+  it('M20 stopActive clears the installed health interval', async () => {
+    vi.useFakeTimers()
+    const clear = vi.spyOn(globalThis, 'clearInterval')
+    const manager = new SidecarManager(spec, { launch }, { check: vi.fn().mockResolvedValue(true) }, { stop: vi.fn().mockResolvedValue(undefined) })
+    try {
+      await manager.start(); await manager.stop()
+      expect(clear).toHaveBeenCalled()
+      expect(vi.getTimerCount()).toBe(0)
+    } finally { clear.mockRestore(); vi.useRealTimers() }
+  })
+})

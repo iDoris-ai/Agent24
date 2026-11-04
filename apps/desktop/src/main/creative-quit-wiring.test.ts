@@ -42,3 +42,12 @@ describe('Creative lifecycle wiring in main', () => {
     expect(show).toContain('creativeLoadedInstanceId = instanceId')
   })
 })
+
+it('F2 handles TERM INT and HUP with a shared bounded stop before exit', () => {
+  const handler = source.slice(source.indexOf('let signalShutdown:'), source.indexOf("app.on('before-quit'"))
+  expect(handler).toContain("['SIGTERM', 'SIGINT', 'SIGHUP']")
+  expect(handler).toContain('process.on(signal,')
+  expect(handler).toContain('signalShutdown ??=')
+  expect(handler).toContain('await stopWithin(creative, CREATIVE_QUIT_STOP_BUDGET_MS)')
+  expect(handler.indexOf('await stopWithin')).toBeLessThan(handler.indexOf('app.exit(0)'))
+})
