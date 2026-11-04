@@ -36,9 +36,9 @@ describe('Creative lifecycle wiring in main', () => {
 
   it('the view reloads when the sidecar instance changes', () => {
     const show = source.slice(source.indexOf('async function showCreativeView'), source.indexOf('async function restartCreativeView'))
-    expect(show).toContain('shouldReloadCreativeView({')
+    expect(show).toContain('loadCreativeView({')
     expect(show).toContain('loadedInstanceId: creativeLoadedInstanceId')
     expect(show).toContain('instanceId: status.instanceId')
-    expect(show).toContain('creativeLoadedInstanceId = status.instanceId ?? null')
+    expect(show).toContain('creativeLoadedInstanceId = instanceId')
   })
 })

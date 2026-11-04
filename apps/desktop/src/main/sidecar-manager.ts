@@ -267,6 +267,7 @@ export class SidecarManager {
       // An exit caused by our own stop is a cancellation, not a failure of this start.
       if (attempt?.exited && this.isCurrent(token, attempt)) {
         await this.stopActive(attempt)
+        if (this.generation !== token) return this.cancelled()
         throw error
       }
       const cancelled = attempt
@@ -279,6 +280,7 @@ export class SidecarManager {
       this.state = 'failed'
       this.logger.warn('sidecar.failed', { sidecarId: this.spec.sidecarId })
       if (attempt) await this.stopActive(attempt)
+      if (this.generation !== token) return this.cancelled()
       throw error
     }
     return this.status()

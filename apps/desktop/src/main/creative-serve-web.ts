@@ -184,6 +184,16 @@ export function shouldReloadCreativeView(input: {
   return classifyCreativeUrl(input.currentUrl, input.origin) !== 'same-origin'
 }
 
+export async function loadCreativeView(input: Parameters<typeof shouldReloadCreativeView>[0] & {
+  loadURL: (url: string) => Promise<unknown>
+  isCurrent: () => boolean
+  rememberInstance: (instanceId: string | null) => void
+}): Promise<void> {
+  if (!shouldReloadCreativeView(input)) return
+  await input.loadURL(input.origin)
+  if (input.isCurrent()) input.rememberInstance(input.instanceId ?? null)
+}
+
 export function classifyCreativeUrl(candidate: string, allowedOrigin: string): CreativeUrlDisposition {
   let url: URL
   let allowed: URL
@@ -226,6 +236,7 @@ export class CreativeServeWeb {
   /** Dev checkout child only. The packaged headless instance lives in `manager`. */
   private child: CreativeChild | null = null
   private storedStatus: CreativeServeWebStatus = { state: 'stopped' }
+  private startGeneration = 0
   private starting: Promise<CreativeServeWebStatus> | null = null
   private stopping: Promise<CreativeServeWebStatus> | null = null
   private readonly statusListeners = new Set<(status: CreativeServeWebStatus) => void>()
@@ -612,8 +623,10 @@ export class CreativeServeWeb {
     // which both the status and the derived phase read `starting`.
     this.storedStatus = { state: 'starting' }
     this.launching = true
+    const generation = ++this.startGeneration
     try {
       const result = await this.manager.start()
+      if (generation !== this.startGeneration) return this.status()
       if (result.state === 'stopped') return this.status() // superseded by stop()
       if (result.state !== 'ready' && result.state !== 'healthy' && result.state !== 'degraded') {
         // start() declines while an earlier instance is still owned (its stop failed).
@@ -629,11 +642,12 @@ export class CreativeServeWeb {
       this.emitStatus()
       return this.status()
     } catch (error) {
+      if (generation !== this.startGeneration) return this.status()
       // The manager already reaped (or retained and reported) the tree before rethrowing.
       this.current = { state: 'failed', error: error instanceof Error ? error.message : String(error) }
       return this.status()
     } finally {
-      this.launching = false
+      if (generation === this.startGeneration) this.launching = false
     }
   }
 
@@ -649,6 +663,8 @@ export class CreativeServeWeb {
   }
 
   private async stopOnce(): Promise<CreativeServeWebStatus> {
+    this.startGeneration += 1
+    this.launching = false
     const child = this.child
     this.child = null
     // Do not deduplicate a later restart onto this generation's stale promise.

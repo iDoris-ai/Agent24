@@ -12,6 +12,7 @@ import {
   CreativeViewRequestFence,
   OPEN_DESIGN_PIN_VERSION,
   shouldReloadCreativeView,
+  loadCreativeView,
   stopWithin,
   canonicalCreativeOrigin,
   classifyCreativeUrl,
@@ -1083,6 +1084,25 @@ describe('CreativeServeWeb', () => {
       expect(children[0].signals.some(([, signal]) => signal === 'SIGTERM')).toBe(true)
     })
 
+    it('keeps all three states stopped when stop arrives during failed-start cleanup', async () => {
+      const { service, children } = managed({ sidecarTimings: { termGraceMs: 1_000 } })
+      const child = children[0]
+      child.ignoreTerm = true
+      const starting = service.start()
+      child.stdout.write(`${JSON.stringify({ ...headlessReady(child.pid, 17456, 17457), pinVersion: 'other' })}\n`)
+      await vi.waitFor(() => expect(child.signals).toContainEqual([child.pid, 'SIGTERM']))
+      expect(service.headlessSidecarState()).toBe('failed')
+      const stopping = service.stop()
+      child.groupAlive = false
+      child.exitNow()
+      await stopping
+      await expect(starting).resolves.toEqual({ state: 'stopped' })
+      expect(service.status()).toEqual({ state: 'stopped' })
+      expect(service.headlessSidecarState()).toBe('stopped')
+      expect(mapOpenDesignReport({ installState: 'installed', sidecar: service.headlessPhaseForReport('installed') }).state).toBe('stopped')
+      expect(service.hasLiveProcess()).toBe(false)
+    })
+
     it('a normal stop never passes through failed', async () => {
       const { service, launch } = managed()
       await launch(0)
@@ -1134,6 +1154,27 @@ describe('CreativeServeWeb', () => {
 
   describe('shouldReloadCreativeView', () => {
     const base = { forceReload: false, currentUrl: 'http://127.0.0.1:17456/', origin: 'http://127.0.0.1:17456', loadedInstanceId: 'a', instanceId: 'a' as string | undefined }
+
+    it('retries loading on the next show after navigation fails', async () => {
+      let loadedInstanceId: string | null = 'a'
+      const loadURL = vi.fn().mockRejectedValueOnce(new Error('navigation failed')).mockResolvedValue(undefined)
+      const show = () => loadCreativeView({
+        ...base, instanceId: 'b', loadedInstanceId, loadURL,
+        isCurrent: () => true,
+        rememberInstance: (id) => { loadedInstanceId = id },
+      })
+      await expect(show()).rejects.toThrow('navigation failed')
+      expect(loadedInstanceId).toBe('a')
+      await show()
+      expect(loadURL).toHaveBeenCalledTimes(2)
+      expect(loadedInstanceId).toBe('b')
+    })
+
+    it('does not remember a successful navigation from a superseded view request', async () => {
+      const rememberInstance = vi.fn()
+      await loadCreativeView({ ...base, instanceId: 'b', loadURL: async () => {}, isCurrent: () => false, rememberInstance })
+      expect(rememberInstance).not.toHaveBeenCalled()
+    })
 
     it('keeps the page for the same instance on the same origin', () => {
       expect(shouldReloadCreativeView(base)).toBe(false)

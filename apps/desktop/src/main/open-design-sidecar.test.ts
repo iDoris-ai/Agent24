@@ -121,6 +121,22 @@ describe('PosixProcessGroupTree', () => {
     await expect(tree(kill).signal(true)).resolves.toBeUndefined()
   })
 
+  it('retires permanently after SIGKILL ESRCH even when the pgid is reused', async () => {
+    const kill = vi.fn((_pid: number, signal: NodeJS.Signals | 0) => {
+      if (signal === 'SIGKILL') throw errno('ESRCH')
+      return true
+    })
+    const t = tree(kill)
+    await t.signal(true)
+    expect(kill).toHaveBeenLastCalledWith(-4321, 'SIGKILL')
+    kill.mockImplementation(() => true)
+    kill.mockClear()
+    await t.signal(true)
+    await t.signal(false)
+    await expect(t.isEmpty()).resolves.toBe(true)
+    expect(kill).not.toHaveBeenCalled()
+  })
+
   it('never SIGKILLs a group that is already gone', async () => {
     const kill = vi.fn((): boolean => { throw errno('ESRCH') })
     await tree(kill).signal(true)

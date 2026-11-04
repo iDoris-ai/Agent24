@@ -22,7 +22,7 @@ import {
   CreativeViewRequestFence,
   classifyCreativeUrl,
   CREATIVE_QUIT_STOP_BUDGET_MS,
-  shouldReloadCreativeView,
+  loadCreativeView,
   stopWithin,
   resolveNodeRuntimeExecutable,
 } from './creative-serve-web'
@@ -180,17 +180,17 @@ async function showCreativeView(
   }
 
   creativeView.setBounds(normalizedBounds(bounds))
-  const current = creativeView.webContents.getURL()
-  if (shouldReloadCreativeView({
+  const view = creativeView
+  await loadCreativeView({
     forceReload,
-    currentUrl: current,
+    currentUrl: view.webContents.getURL(),
     origin: status.origin,
     loadedInstanceId: creativeLoadedInstanceId,
     instanceId: status.instanceId,
-  })) {
-    creativeLoadedInstanceId = status.instanceId ?? null
-    await creativeView.webContents.loadURL(status.origin)
-  }
+    loadURL: (url) => view.webContents.loadURL(url),
+    isCurrent: () => creativeView === view && creativeViewFence.isCurrent(requestGeneration),
+    rememberInstance: (instanceId) => { creativeLoadedInstanceId = instanceId },
+  })
   return { ok: true, origin: status.origin }
 }
 

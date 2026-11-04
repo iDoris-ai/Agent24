@@ -206,6 +206,7 @@ export class PosixProcessGroupTree implements SidecarTreeController {
     if (await this.isEmpty()) return
     try { this.kill(-this.pid, 'SIGKILL') } catch (error) {
       if (errnoCode(error) !== 'ESRCH') throw error
+      this.retired = true
     }
   }
 
