@@ -69,6 +69,8 @@ healthy → degraded → restarting → starting
 任何非 stopped 状态 → stopping → stopped
 ```
 
+> **实现状态（C8，2026-11-04）**：TS `SidecarManager` 已托管 Open Design 打包模式，但 `restart` 字段**尚未实现**，状态里也没有 `restarting`。当前是**懒重启**：崩溃后进入 `failed` 并整组回收，下次 `creativeShow` 或用户点「重启」时 `failed → starting`；`degraded` 只上报，不重启。下文「异常退出才 restart」和 §6 的自动有界重启、状态推送另开一片。
+
 不变量：
 
 - `ready` 同时要求合法 handshake、预期版本和 loopback endpoint；`healthy` 还要求 health probe 成功。

@@ -226,7 +226,12 @@ export interface paths {
          *     refused (403). The ProductHost audience, and legacy mode (one shared token that already
          *     reads every full status route), get `ComponentView`. Every other audience gets
          *     `ComponentRedactedView`: id, version, state and provides only, with no install path, pid,
-         *     port, error message, team id or commit. A first-party token carries only the operations it
+         *     port, error message, team id, commit, or Hyphae health probes. While the Hyphae daemon is
+         *     running, the host view's `detail.health` lists each probe (`relays`, `keystore`, `daemon`,
+         *     or `health` when the command itself did not finish) with `ok` and `consecutive_failures`.
+         *     Three consecutive failures set state `degraded` and `reason` to those probe names; one
+         *     success returns to `ready`. A contract mismatch is state `incompatible` with reason
+         *     `contract_mismatch`, and the daemon is not started. A first-party token carries only the operations it
          *     was issued with, so one issued by an older daemon gets 403 here until it is re-issued. The older status routes (`/idoris/status`,
          *     `/comm/daemon`, `/os`) are unchanged.
          */
@@ -2313,14 +2318,14 @@ export interface components {
             /** @enum {string} */
             form: "resident" | "sidecar" | "cli" | "attach" | "remote" | "mcp";
             provides: components["schemas"]["ComponentProvide"][];
-            /** @description Short machine-readable cause; host only. For hyphae with state failed this includes signature_rejected and hash_mismatch (see HyphaeRejection); a Hyphae that is simply not installed is state absent with no reason. */
+            /** @description Short machine-readable cause; host only. For hyphae with state failed this includes signature_rejected, hash_mismatch (see HyphaeRejection), and contract_check_failed (the contract command did not return a readable envelope). State incompatible uses contract_mismatch. State degraded lists the failed probe names (for example relays), never a relay URL. A Hyphae that is simply not installed is state absent with no reason. */
             reason?: string;
-            /** @description Ports, contract expectation, counters, messages; host only */
+            /** @description Ports, contract expectation, counters, messages; host only. For Hyphae, detail.health is {consecutive_failures, degraded, checks: {probe: {ok, consecutive_failures}}} and never includes relay URLs. detail.consecutive_failures remains the daemon restart counter, separate from detail.health.consecutive_failures. */
             detail?: {
                 [key: string]: unknown;
             };
         };
-        /** @description What every audience other than the host sees. No path, pid, port, message, team id or commit. */
+        /** @description What every audience other than the host sees. No path, pid, port, message, team id, commit, or Hyphae health probes. */
         ComponentRedactedView: {
             id: string;
             version: string | null;
@@ -5266,8 +5271,17 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
-            /** @description knowledge_binding_inactive: the product host has no active Knowledge binding by that id */
+            /** @description knowledge_binding_inactive: the product host has no active Knowledge binding by that id. knowledge_session_rebound: the session's runs used another activation of that binding, or it holds Knowledge results from before a daemon restart; start a new session. Also returned for a session not yet pinned once the daemon has reached its limit of pinned sessions; then a new session is refused too, until the daemon restarts. */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description source_policy_unavailable: a run named a Knowledge binding, and the tool result origins of its session could not be read */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

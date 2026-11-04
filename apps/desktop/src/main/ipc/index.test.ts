@@ -21,9 +21,64 @@ const promptRestorePassword = vi.fn()
 const promptUnlockPassword = vi.fn()
 const promptHomeImportPassword = vi.fn()
 const execFileMock = vi.fn()
-const appHandlers = new Map<string, () => void>()
+const appListeners = new Map<string, Set<() => void>>()
+const appFocus = vi.fn()
+function listenApp(event: string, fn: () => void): void {
+  let set = appListeners.get(event)
+  if (!set) {
+    set = new Set()
+    appListeners.set(event, set)
+  }
+  set.add(fn)
+}
+function unlistenApp(event: string, fn: () => void): void {
+  appListeners.get(event)?.delete(fn)
+}
+function emitApp(event: string): void {
+  for (const fn of [...(appListeners.get(event) ?? [])]) fn()
+}
 // What BrowserWindow.fromWebContents answers: the window the export started from.
-let parentWindow: { isDestroyed: () => boolean } | null = null
+type ExportParent = {
+  isDestroyed: () => boolean
+  isVisible: () => boolean
+  isEnabled: () => boolean
+  isMinimized: () => boolean
+  restore: () => void
+  show: () => void
+  focus: () => void
+  setEnabled: (enabled: boolean) => void
+  on: (event: string, fn: () => void) => void
+  removeListener: (event: string, fn: () => void) => void
+  emit: (event: string) => void
+  listenerCount: (event: string) => number
+  calls: string[]
+}
+let parentWindow: ExportParent | null = null
+function trackableParent(state: { minimized?: boolean; visible?: boolean; enabled?: boolean; destroyed?: boolean } = {}): ExportParent {
+  const listeners = new Map<string, Array<() => void>>()
+  let minimized = state.minimized ?? false
+  let visible = state.visible ?? true
+  let enabled = state.enabled ?? true
+  const destroyed = state.destroyed ?? false
+  const calls: string[] = []
+  return {
+    calls,
+    isDestroyed: () => destroyed,
+    isMinimized: () => minimized,
+    isVisible: () => visible,
+    isEnabled: () => enabled,
+    restore: () => { calls.push('restore'); minimized = false },
+    show: () => { calls.push('show'); visible = true },
+    setEnabled: (value: boolean) => { calls.push('setEnabled'); enabled = value },
+    focus: () => { calls.push('parent.focus') },
+    on: (event: string, fn: () => void) => { listeners.set(event, [...(listeners.get(event) ?? []), fn]) },
+    removeListener: (event: string, fn: () => void) => {
+      listeners.set(event, (listeners.get(event) ?? []).filter((f) => f !== fn))
+    },
+    emit: (event: string) => { for (const fn of [...(listeners.get(event) ?? [])]) fn() },
+    listenerCount: (event: string) => (listeners.get(event) ?? []).length,
+  }
+}
 // When set, the daemon's export route never answers until these are ended.
 let hangExport = false
 let exportReportsPath: string | null = null
@@ -36,7 +91,13 @@ const docUninstall = vi.fn()
 const docInstall = vi.fn()
 
 vi.mock('electron', () => ({
-  app: { getVersion: () => '0.0.0-test', getPath: () => settingsDir, on: (event: string, fn: () => void) => { appHandlers.set(event, fn) } },
+  app: {
+    getVersion: () => '0.0.0-test',
+    getPath: () => settingsDir,
+    on: (event: string, fn: () => void) => { listenApp(event, fn) },
+    removeListener: (event: string, fn: () => void) => { unlistenApp(event, fn) },
+    focus: (opts?: { steal: boolean }) => { appFocus(opts) },
+  },
   BrowserWindow: { fromWebContents: () => parentWindow },
   dialog: { showMessageBox: (...a: unknown[]) => showMessageBox(...a), showOpenDialog: (...a: unknown[]) => showOpenDialog(...a), showSaveDialog: (...a: unknown[]) => showSaveDialog(...a) },
   ipcMain: { handle: (channel: string, fn: (event: unknown, ...args: unknown[]) => unknown) => { handlers.set(channel, fn) } },
@@ -218,6 +279,7 @@ beforeEach(() => {
   showItemInFolder.mockReset()
   exportTimeoutMs.current = 90_000
   parentWindow = null
+  appFocus.mockReset()
   hangExport = false
   for (const r of hungExports.splice(0)) r.end(JSON.stringify({ ok: true, data: {} }))
   resetLastCommExportForTests()
@@ -671,19 +733,92 @@ describe('CommIdentityExport elevated IPC', () => {
     expect(openedWhileWindowUp).toBe(false)
   })
 
+  const aliveParent = () => trackableParent()
+
+  it('a living parent is restored, shown, re-enabled and focused, then hosts the save sheet', async () => {
+    const cases: { state: { minimized?: boolean; visible?: boolean; enabled?: boolean }; calls: string[] }[] = [
+      { state: { minimized: true, visible: true, enabled: true }, calls: ['restore', 'app.focus', 'parent.focus', 'save', 'sheet'] },
+      { state: { minimized: false, visible: false, enabled: true }, calls: ['show', 'app.focus', 'parent.focus', 'save', 'sheet'] },
+      { state: { minimized: false, visible: true, enabled: false }, calls: ['setEnabled', 'app.focus', 'parent.focus', 'save', 'sheet'] },
+      { state: { minimized: true, visible: false, enabled: false }, calls: ['restore', 'show', 'setEnabled', 'app.focus', 'parent.focus', 'save', 'sheet'] },
+    ]
+    for (const item of cases) {
+      const parent = trackableParent(item.state)
+      parentWindow = parent
+      appFocus.mockReset()
+      appFocus.mockImplementation(() => { parent.calls.push('app.focus') })
+      showSaveDialog.mockReset()
+      showSaveDialog.mockImplementationOnce(async (first: unknown) => {
+        parent.calls.push('save')
+        parent.calls.push(first === parent ? 'sheet' : 'app-modal')
+        return { canceled: true }
+      })
+      showMessageBox.mockResolvedValueOnce({ response: 0 })
+      promptBackupPassword.mockResolvedValueOnce(PW)
+      const result = await call(IpcChannels.CommIdentityExport, 'alice')
+      expect(result.data.error.code).toBe('cancelled')
+      expect(parent.isMinimized()).toBe(false)
+      expect(parent.isVisible()).toBe(true)
+      expect(parent.isEnabled()).toBe(true)
+      expect(showSaveDialog.mock.calls[0]?.[0]).toBe(parent)
+      expect(appFocus).toHaveBeenCalledWith({ steal: true })
+      expect(parent.calls).toEqual(item.calls)
+      expect(parent.listenerCount('closed')).toBe(0)
+    }
+  })
+
   it('the parent window destroyed between the password step and the save step: cancelled, no dialog, no daemon call', async () => {
     let parentDestroyed = false
-    parentWindow = { isDestroyed: () => parentDestroyed }
+    parentWindow = { ...trackableParent(), isDestroyed: () => parentDestroyed }
     showMessageBox.mockResolvedValueOnce({ response: 0 })
     promptBackupPassword.mockImplementationOnce(async () => { parentDestroyed = true; return PW })
     const result = await call(IpcChannels.CommIdentityExport, 'alice')
     expect(result.data.error.code).toBe('cancelled')
     expect(showSaveDialog).not.toHaveBeenCalled()
-    noDaemonCall()
+    expect(seen.filter((r) => r.url === '/api/v1/comm/identity/export')).toHaveLength(0)
   })
 
-  it('the save dialog is a sheet on the starting window while it is alive', async () => {
-    parentWindow = { isDestroyed: () => false }
+  it('the parent destroyed or throwing while saveDialogParent brings it forward: cancelled, no dialog, no daemon call', async () => {
+    const noExport = () => expect(seen.filter((r) => r.url === '/api/v1/comm/identity/export')).toHaveLength(0)
+
+    // Still alive at the check before saveDialogParent. restore() destroys it
+    // while the window is being brought forward, so the anchor comes back null.
+    let destroyedOnRestore = false
+    const minimized = trackableParent({ minimized: true })
+    parentWindow = {
+      ...minimized,
+      isDestroyed: () => destroyedOnRestore,
+      restore: () => {
+        minimized.calls.push('restore')
+        destroyedOnRestore = true
+      },
+    }
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockResolvedValueOnce(PW)
+    const restored = await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(restored.data.error.code).toBe('cancelled')
+    expect(showSaveDialog).not.toHaveBeenCalled()
+    expect(minimized.calls).toContain('restore')
+    noExport()
+
+    resetLastCommExportForTests()
+    showSaveDialog.mockClear()
+    // focus() throws inside saveDialogParent. Same cancel, still no dialog.
+    const throwing = trackableParent()
+    parentWindow = {
+      ...throwing,
+      focus: () => { throw new Error('focus failed during restore') },
+    }
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockResolvedValueOnce(PW)
+    const focused = await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(focused.data.error.code).toBe('cancelled')
+    expect(showSaveDialog).not.toHaveBeenCalled()
+    noExport()
+  })
+
+  it('the save dialog is a sheet on the starting window while it is visible and enabled', async () => {
+    parentWindow = aliveParent()
     showMessageBox.mockResolvedValueOnce({ response: 0 })
     promptBackupPassword.mockResolvedValueOnce(PW)
     showSaveDialog.mockResolvedValueOnce({ canceled: true })
@@ -691,9 +826,72 @@ describe('CommIdentityExport elevated IPC', () => {
     expect(showSaveDialog.mock.calls[0]![0]).toBe(parentWindow)
   })
 
+  it('closing the parent or quitting while the save sheet is open cancels, releases the lock, and drops the listeners', async () => {
+    const hangDialog = () => {
+      let rejectDialog: (error: unknown) => void = () => {}
+      let opened = false
+      showSaveDialog.mockReset()
+      showSaveDialog.mockImplementationOnce(() => {
+        opened = true
+        return new Promise((_resolve, reject) => { rejectDialog = reject })
+      })
+      return {
+        opened: () => opened,
+        reject: (error: unknown) => rejectDialog(error),
+      }
+    }
+    const settle = async (pending: Promise<unknown>) => {
+      const outcome = await Promise.race([
+        pending.then((result) => result as { data: { error?: { code?: string } } }),
+        new Promise<string>((resolve) => setTimeout(() => resolve('hung'), 500)),
+      ])
+      expect(outcome).not.toBe('hung')
+      return outcome as { data: { error?: { code?: string } } }
+    }
+
+    parentWindow = trackableParent()
+    const firstDialog = hangDialog()
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockResolvedValueOnce(PW)
+    const first = call(IpcChannels.CommIdentityExport, 'alice')
+    await until(() => firstDialog.opened())
+    const listening = parentWindow.listenerCount('closed')
+    parentWindow.emit('closed')
+    const closedResult = await settle(first)
+    expect(closedResult.data.error?.code).toBe('cancelled')
+    expect(listening).toBe(1)
+    expect(parentWindow.listenerCount('closed')).toBe(0)
+    expect(appListeners.get('before-quit')?.size).toBe(1)
+    firstDialog.reject(new Error('sheet died with its parent'))
+    await new Promise((r) => setImmediate(r))
+    showMessageBox.mockResolvedValueOnce({ response: 1 })
+    const afterClose = await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(afterClose.data.error.code).not.toBe('busy')
+
+    resetLastCommExportForTests()
+    parentWindow = trackableParent()
+    const quitDialog = hangDialog()
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    promptBackupPassword.mockResolvedValueOnce(PW)
+    const second = call(IpcChannels.CommIdentityExport, 'alice')
+    await until(() => quitDialog.opened())
+    expect(appListeners.get('before-quit')?.size).toBe(2)
+    emitApp('before-quit')
+    const quitResult = await settle(second)
+    expect(quitResult.data.error?.code).toBe('cancelled')
+    expect(parentWindow.listenerCount('closed')).toBe(0)
+    expect(appListeners.get('before-quit')?.size).toBe(1)
+    quitDialog.reject(new Error('sheet died because the app quit'))
+    await new Promise((r) => setImmediate(r))
+    showMessageBox.mockResolvedValueOnce({ response: 1 })
+    const afterQuit = await call(IpcChannels.CommIdentityExport, 'alice')
+    expect(afterQuit.data.error.code).not.toBe('busy')
+    noDaemonCall()
+  })
+
   it('quitting the app during the password step stops the flow before the save dialog', async () => {
     showMessageBox.mockResolvedValueOnce({ response: 0 })
-    promptBackupPassword.mockImplementationOnce(async () => { appHandlers.get('before-quit')!(); return PW })
+    promptBackupPassword.mockImplementationOnce(async () => { emitApp('before-quit'); return PW })
     const result = await call(IpcChannels.CommIdentityExport, 'alice')
     expect(result.data.error.code).toBe('cancelled')
     expect(showSaveDialog).not.toHaveBeenCalled()

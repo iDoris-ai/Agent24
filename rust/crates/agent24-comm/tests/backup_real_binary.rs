@@ -1,9 +1,9 @@
 //! Key backup (`identity export`) and restore (`identity import`) against the
-//! REAL released Hyphae v0.30.0 (the build pinned in `hyphae.lock.json`), and
+//! REAL released Hyphae v0.30.1 (the build pinned in `hyphae.lock.json`), and
 //! `hyphae_too_old` against the previous release v0.27.2. Ignored in normal
 //! runs; every home is an isolated temp dir.
 //!
-//! - `HYPHAE_TEST_BIN`: the released v0.30.0 (checked against the embedded lock).
+//! - `HYPHAE_TEST_BIN`: the released v0.30.1 (checked against the embedded lock).
 //! - `HYPHAE_OLD_BIN`: v0.27.2 (no non-interactive export, no `identity import`).
 //! - `HYPHAE_EXPORT_OUT`: optional directory in which the exported backup
 //!   (password `backup passphrase 1`) is left, for an independent decrypt.
@@ -66,7 +66,7 @@ async fn new_home(source: &Path, lock_pinned: bool, create: Option<&str>) -> Hom
             .unwrap();
         assert_eq!(
             digest, expected,
-            "HYPHAE_TEST_BIN must be the locked v0.30.0 build"
+            "HYPHAE_TEST_BIN must be the locked v0.30.1 build"
         );
     }
     let verified = install(source, digest, tmp.path()).await;
@@ -158,7 +158,7 @@ fn preview_bin() -> PathBuf {
 }
 
 #[tokio::test]
-#[ignore = "requires the locked Hyphae v0.30.0; set HYPHAE_TEST_BIN and pass --ignored"]
+#[ignore = "requires the locked Hyphae v0.30.1; set HYPHAE_TEST_BIN and pass --ignored"]
 async fn export_then_restore_round_trips_through_the_real_binary() {
     let bin = preview_bin();
     let a = new_home(&bin, true, Some("exp")).await;

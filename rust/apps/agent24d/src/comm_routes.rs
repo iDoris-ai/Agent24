@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent24_comm::{
-    CommState, HyphaeDaemonSupervisor, HyphaeRunner, KeyringPasswordStore, MemoryPasswordStore,
-    PasswordStore, VerifiedBinary, current_platform,
+    CommState, ContractExpectation, HyphaeDaemonSupervisor, HyphaeRunner, KeyringPasswordStore,
+    MemoryPasswordStore, PasswordStore, ProbeArm, VerifiedBinary, current_platform,
 };
 
 use crate::hyphae_install::{HyphaeLock, InstallError, Verifier};
@@ -23,7 +23,7 @@ use agent24_components::{DownloadError, VerifyMode, install::InstallError as Sig
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Request, State},
+    extract::{MatchedPath, NestedPath, OriginalUri, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -34,6 +34,45 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Lock `contract` plus the production health period. `build_ready_state`
+/// arms every supervisor with this before autostart.
+fn hyphae_probe_arm(lock: &HyphaeLock) -> ProbeArm {
+    let contract = &lock.component().contract;
+    ProbeArm::production(ContractExpectation {
+        name: contract.name.clone(),
+        major: contract.major,
+        min_minor: contract.min_minor,
+        tested: contract.tested.clone(),
+    })
+    .with_failures_before_degraded(health_failure_threshold(
+        lock.component().health_failures_before_degraded,
+        "hyphae",
+    ))
+}
+
+/// Bounds for the lock's `health_failures_before_degraded`. One failed sample
+/// is already a lossy-link false alarm (ADR-038 §7.3), and more than ten samples
+/// at 45 s would take over seven minutes to notice a dead relay.
+const HEALTH_FAILURES_MIN: u32 = 1;
+const HEALTH_FAILURES_MAX: u32 = 10;
+
+/// Lock value, clamped to `[1, 10]`. No lock value keeps the ADR default (3).
+fn health_failure_threshold(lock_value: Option<u32>, component: &str) -> u32 {
+    let Some(requested) = lock_value else {
+        return agent24_comm::HEALTH_FAILURES_BEFORE_DEGRADED;
+    };
+    let clamped = requested.clamp(HEALTH_FAILURES_MIN, HEALTH_FAILURES_MAX);
+    if clamped != requested {
+        tracing::warn!(
+            component,
+            requested,
+            used = clamped,
+            "component health_failures_before_degraded is out of range; clamped"
+        );
+    }
+    clamped
+}
 
 /// Where `agent24d`'s own SHUT-1b stop sequence finds the Hyphae daemon
 /// supervisor `build()` may create — and the ONLY thing that makes "a
@@ -68,8 +107,27 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct CommDaemonSlot(
     Mutex<CommDaemonSlotState>,
     CancellationToken,
-    Mutex<Option<Rejection>>,
+    Mutex<BuildNote>,
+    /// Stop grace actually given to the Hyphae supervisor. The lock's
+    /// `stop_grace_ms`, or the daemon's global budget when that is shorter.
+    Mutex<Duration>,
+    /// Times this slot has locked [`BuildNote`]. Unit tests assert one GET
+    /// takes the lock once for both marks. Kept in release builds: the
+    /// route-catalog source scan cannot skip `#[cfg(test)]` on a tuple field.
+    std::sync::atomic::AtomicUsize,
 );
+
+/// What the last comm-state build left for `/api/v1/components`.
+/// A D2a verdict and a generic start failure are different signals:
+/// `rejection` is also `GET /api/v1/comm/daemon`'s `data.rejection`
+/// (ADR-038 §7.11), and that field stays null when the binary was not refused.
+#[derive(Debug, Default)]
+struct BuildNote {
+    rejection: Option<Rejection>,
+    /// The build failed, but not with a binary verdict (missing file, I/O).
+    /// Host view: `{state: "failed", reason: "start_failed"}`.
+    start_failed: bool,
+}
 
 /// Why the last build of the comm state (daemon start, or the rebuild after a host
 /// install) refused the binary it found. A stable, path-free code:
@@ -96,6 +154,15 @@ impl Rejection {
             Self::HashMismatch => "hash_mismatch",
         }
     }
+}
+
+/// One read of `BuildNote`. The two marks are written together, so a GET
+/// has to observe them together. Two locks can both miss if a new note is
+/// written between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BuildMark {
+    Rejected(Rejection),
+    StartFailed,
 }
 
 /// A failed build of the comm state: the (log-only) message, and the stable
@@ -156,7 +223,9 @@ impl CommDaemonSlot {
         Self(
             Mutex::new(CommDaemonSlotState::Empty),
             CancellationToken::new(),
-            Mutex::new(None),
+            Mutex::new(BuildNote::default()),
+            Mutex::new(Duration::ZERO),
+            std::sync::atomic::AtomicUsize::new(0),
         )
     }
 
@@ -175,7 +244,7 @@ impl CommDaemonSlot {
             _ => {
                 *guard = CommDaemonSlotState::Registered(handle);
                 // A verified binary now owns the slot: no earlier refusal applies.
-                self.set_rejection(None);
+                self.note(None, false);
                 true
             }
         }
@@ -197,17 +266,61 @@ impl CommDaemonSlot {
 
     /// Why the last build refused the binary, if it did (see [`Rejection`]).
     pub fn rejection(&self) -> Option<Rejection> {
+        self.note_lock().rejection
+    }
+
+    /// The last build failed without refusing the binary (see [`BuildNote`]).
+    #[cfg(test)]
+    pub fn start_failed(&self) -> bool {
+        self.note_lock().start_failed
+    }
+
+    /// Rejection and start-failure from the same [`BuildNote`] lock.
+    pub(crate) fn build_mark(&self) -> Option<BuildMark> {
+        let note = self.note_lock();
+        if let Some(rejection) = note.rejection {
+            Some(BuildMark::Rejected(rejection))
+        } else if note.start_failed {
+            Some(BuildMark::StartFailed)
+        } else {
+            None
+        }
+    }
+
+    /// Grace the Hyphae supervisor was given. `Duration::ZERO` until [`build`].
+    /// Test-only: production reads the same value from `CommRuntime.grace`.
+    #[cfg(test)]
+    fn stop_grace(&self) -> Duration {
         *self
-            .2
+            .3
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn set_rejection(&self, rejection: Option<Rejection>) {
-        *self
-            .2
+    fn note_lock(&self) -> std::sync::MutexGuard<'_, BuildNote> {
+        self.4.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.2
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = rejection;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    fn build_note_locks(&self) -> usize {
+        self.4.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn note(&self, rejection: Option<Rejection>, start_failed: bool) {
+        *self.note_lock() = BuildNote {
+            rejection,
+            start_failed,
+        };
+    }
+
+    fn set_stop_grace(&self, grace: Duration) {
+        *self
+            .3
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = grace;
     }
 
     /// The registered supervisor, if any (read-only; status for `/api/v1/components`).
@@ -390,6 +503,10 @@ async fn build_ready_state(
             ready_after: agent24_comm::READY_AFTER_DEFAULT,
         },
     ));
+    // D3/D5: handshake before the first start (including autostart below),
+    // then health while the daemon is running. Expectation comes from the
+    // schema-2 lock, not a hardcoded constant.
+    daemon.arm_probe(hyphae_probe_arm(lock));
     // PR #626 review, High #1: registered BEFORE any autostart attempt, and
     // synchronized (via `slot`'s own lock) with agent24d's own SHUT-1b
     // closing action — see `CommDaemonSlot`'s doc comment. A shutdown that
@@ -473,6 +590,11 @@ pub async fn build(state_dir: &Path, grace: Duration, slot: &Arc<CommDaemonSlot>
             return unconfigured_router(CommState::binary_rejected(e.to_string()));
         }
     };
+    // ADR-038 D5: the lock's stop grace, unless the daemon's shutdown budget
+    // (the configured global grace, already capped by `shutdown_bounds::GRACE_MAX_MS`)
+    // is shorter. A longer per-component wait would be cut off at `deadlines.modules`.
+    let grace = component_stop_grace(lock.component().stop_grace_ms, grace, "hyphae");
+    slot.set_stop_grace(grace);
     let runtime = Arc::new(CommRuntime {
         state_dir: state_dir.to_path_buf(),
         grace,
@@ -516,16 +638,21 @@ impl CommRuntime {
         }
     }
 
-    /// Build the comm state and record on the slot why a binary was refused, or that
-    /// none was: every outcome other than a rejection clears an earlier one.
+    /// Build the comm state and record what `/api/v1/components` should show.
+    /// A binary verdict keeps its stable code. Any other failure is D5 `failed`
+    /// with `start_failed` (no path). A build that succeeds, or that finds
+    /// nothing installed, clears both.
     async fn try_build_state(&self) -> Result<CommState, String> {
         match self.build_state_or_failure().await {
             Ok(state) => {
-                self.slot.set_rejection(None);
+                self.slot.note(None, false);
                 Ok(state)
             }
             Err(failure) => {
-                self.slot.set_rejection(failure.rejection);
+                // No verdict: do not leave the slot blank. A blank slot is
+                // `absent` ("not installed"), and this build did fail.
+                self.slot
+                    .note(failure.rejection, failure.rejection.is_none());
                 Err(failure.reason)
             }
         }
@@ -622,8 +749,38 @@ fn unconfigured_router(state: CommState) -> Router {
     Router::new().nest("/api/v1/comm", agent24_comm::router(state))
 }
 
+/// Lock `stop_grace_ms`, clamped to the daemon shutdown budget.
+///
+/// The budget is the configured global stop grace. `Params::from_env` already
+/// caps that at [`agent24_protocol::shutdown_bounds::GRACE_MAX_MS`], which is
+/// what `WORST_CASE_EXIT_MS` assumes. `deadlines.modules` is
+/// `drain + that grace + CONFIRM`, and `kill_group_gracefully` stops waiting
+/// at that instant. A lock value above the budget would be cut there; use the
+/// budget and say so. A lock value within the budget replaces the global one,
+/// including when the global knob was turned up. No lock value keeps the budget.
+/// Does not change `shutdown_bounds` (Hyphae's 15s is under the 30s cap).
+fn component_stop_grace(lock_ms: Option<u64>, budget: Duration, component: &str) -> Duration {
+    let Some(requested) = lock_ms else {
+        return budget;
+    };
+    let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+    let cap_ms = budget_ms.min(agent24_protocol::shutdown_bounds::GRACE_MAX_MS);
+    if requested > cap_ms {
+        tracing::warn!(
+            component,
+            requested_ms = requested,
+            budget_ms = cap_ms,
+            "component stop_grace_ms exceeds the daemon shutdown budget; using the budget"
+        );
+        return Duration::from_millis(cap_ms);
+    }
+    Duration::from_millis(requested)
+}
+
 // Preserve every MatchedPath for CORE-2 authorization while requests use the
 // current comm instance. A fallback would erase those fixed route templates.
+// The placeholder match also captures path parameters; [`forward_comm`] drops
+// those before the live router matches the same path again.
 fn runtime_router(runtime: Arc<CommRuntime>) -> Router {
     let routes = agent24_comm::router(CommState::unconfigured("initializing"))
         .route_layer(middleware::from_fn_with_state(
@@ -632,6 +789,84 @@ fn runtime_router(runtime: Arc<CommRuntime>) -> Router {
         ))
         .route("/install", post(install_component).with_state(runtime));
     Router::new().nest("/api/v1/comm", routes)
+}
+
+/// Outer `MatchedPath`, held aside so the live router's match does not
+/// concatenate onto it. Restored by [`restore_forwarded_matched_path`].
+#[derive(Clone)]
+struct ForwardedMatchedPath(MatchedPath);
+
+/// Drop path parameters captured by the placeholder comm router.
+///
+/// `runtime_router` matches each comm route so CORE-2's auth layer sees a
+/// fixed `MatchedPath`. Axum records the captured parameters in a private
+/// `UrlParams` extension and appends on a second match, so the live router's
+/// `Path` extractor returns 500 (`Expected N but got 2N`). That type is not
+/// public, so the parameters cannot be removed by name. The extensions map
+/// is rebuilt from the values that must survive:
+///
+/// - `Authorization`, inserted by the parent auth layer (it runs after the
+///   outer match and before this middleware). Kernel handlers read it with
+///   `Extension<Authorization>`.
+/// - `OriginalUri` and `NestedPath`, set by axum before this middleware. The
+///   live router will not replace an `OriginalUri` that is already present,
+///   so the client's full URI stays intact.
+/// - `MatchedPath` is stashed as [`ForwardedMatchedPath`], not left as
+///   `MatchedPath`. The live match treats an existing `MatchedPath` as a nest
+///   prefix and concatenates (`append_nested_matched_path`), which would
+///   double `/api/v1/comm/outbox/{event_id}/retry`. Auth has already copied
+///   the outer template; the stash puts that same value back after the live
+///   match.
+///
+/// When an outer layer starts inserting another extension (a `DefaultBodyLimit`
+/// marker, or `OnUpgrade` for a WebSocket upgrade), add it to this whitelist
+/// in the same change. `extensions.clear()` drops anything not copied back.
+fn request_without_outer_path_params(req: Request) -> Request {
+    let (mut parts, body) = req.into_parts();
+    let matched = parts.extensions.remove::<MatchedPath>();
+    let authorization = parts
+        .extensions
+        .remove::<crate::capabilities::Authorization>();
+    let original_uri = parts.extensions.remove::<OriginalUri>();
+    let nested_path = parts.extensions.remove::<NestedPath>();
+    parts.extensions.clear();
+    if let Some(matched) = matched {
+        parts.extensions.insert(ForwardedMatchedPath(matched));
+    }
+    if let Some(authorization) = authorization {
+        parts.extensions.insert(authorization);
+    }
+    if let Some(original_uri) = original_uri {
+        parts.extensions.insert(original_uri);
+    }
+    if let Some(nested_path) = nested_path {
+        parts.extensions.insert(nested_path);
+    }
+    Request::from_parts(parts, body)
+}
+
+/// Put the outer `MatchedPath` back after the live router has matched.
+///
+/// The live match runs before this layer and has already written a fresh
+/// `UrlParams` (one copy) plus its own `MatchedPath`. Replacing that
+/// `MatchedPath` restores the template CORE-2 used.
+async fn restore_forwarded_matched_path(mut req: Request, next: Next) -> Response {
+    if let Some(ForwardedMatchedPath(matched)) =
+        req.extensions_mut().remove::<ForwardedMatchedPath>()
+    {
+        req.extensions_mut().insert(matched);
+    }
+    next.run(req).await
+}
+
+async fn dispatch_inner(routes: Router, req: Request) -> Response {
+    use tower::ServiceExt;
+    let routes = routes.layer(middleware::from_fn(restore_forwarded_matched_path));
+    let req = request_without_outer_path_params(req);
+    match routes.oneshot(req).await {
+        Ok(response) => response,
+        Err(error) => match error {},
+    }
 }
 
 async fn forward_comm(
@@ -646,12 +881,10 @@ async fn forward_comm(
     {
         return component_status(State(runtime)).await;
     }
+    // Hold the read lock for the whole forward so an install's write lock
+    // waits until this request has finished on the router it cloned.
     let routes = runtime.routes.read().await;
-    use tower::ServiceExt;
-    match routes.clone().oneshot(req).await {
-        Ok(res) => res,
-        Err(e) => match e {},
-    }
+    dispatch_inner(routes.clone(), req).await
 }
 
 async fn component_status(State(runtime): State<Arc<CommRuntime>>) -> Response {
@@ -914,6 +1147,138 @@ mod password_store_choice_tests {
     }
 }
 
+#[cfg(test)]
+mod hyphae_probe_arm_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use agent24_comm::{CONTRACT_TIMEOUT, HEALTH_INTERVAL, HEALTH_TIMEOUT};
+
+    use super::*;
+
+    #[test]
+    fn production_arm_reads_the_embedded_lock() {
+        let lock = HyphaeLock::embedded().expect("embedded hyphae lock");
+        let arm = hyphae_probe_arm(&lock);
+        assert_eq!(arm.expectation.name, "hyphae-cli");
+        assert_eq!(arm.expectation.major, 1);
+        assert_eq!(arm.expectation.min_minor, 0);
+        assert_eq!(arm.expectation.tested, "1.0");
+        assert_eq!(arm.health_interval, HEALTH_INTERVAL);
+        assert_eq!(arm.health_timeout, HEALTH_TIMEOUT);
+        assert_eq!(arm.contract_timeout, CONTRACT_TIMEOUT);
+    }
+
+    /// The same `build_ready_state` that production runs must arm before
+    /// autostart. An incompatible contract then refuses to spawn. Deleting
+    /// `daemon.arm_probe(...)` leaves the contract `Unknown` and, because
+    /// this fixture can satisfy identity/relay/password, starts the daemon.
+    #[tokio::test]
+    async fn build_ready_state_arms_the_probe_and_refuses_an_incompatible_contract() {
+        const SCRIPT: &str = r#"#!/bin/sh
+case "$1" in
+  contract)
+    printf '%s\n' '{"ok":true,"data":{"name":"hyphae-cli","contract_version":"9.0"}}'
+    exit 0
+    ;;
+  identity)
+    printf '%s\n' '{"ok":true,"data":[{"nickname":"alice","npub":"npub1x","default":true,"encrypted":true}]}'
+    exit 0
+    ;;
+  relay)
+    printf '%s\n' '{"ok":true,"data":{"relays":["wss://relay.example"],"source":"config"}}'
+    exit 0
+    ;;
+  daemon)
+    cat > /dev/null
+    touch "$HOME/daemon-started"
+    exec sleep 9999
+    ;;
+esac
+exit 0
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("hyphae-fake.sh");
+        tokio::fs::write(&source, SCRIPT).await.unwrap();
+        let bytes = tokio::fs::read(&source).await.unwrap();
+        let lock =
+            HyphaeLock::override_for_test("linux-x64", agent24_comm::binary::sha256_of(&bytes));
+        let home = dir.path().join("hyphae-home");
+        tokio::fs::create_dir_all(home.join(".hyphae"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            home.join(".hyphae").join("keystore.json"),
+            br#"{"salt":"dGVzdHNhbHQ="}"#,
+        )
+        .await
+        .unwrap();
+        let autostart_path = dir.path().join("daemon-autostart.json");
+        tokio::fs::write(&autostart_path, br#"{"autostart":true}"#)
+            .await
+            .unwrap();
+        let install_dir = dir.path().join("bin");
+        let pid_path = dir.path().join("hyphae-daemon.pid");
+        let log_path = dir.path().join("logs").join("hyphae-daemon.log");
+        let store = Arc::new(MemoryPasswordStore::new());
+        store
+            .put(
+                &agent24_comm::Account::from_salt("dGVzdHNhbHQ="),
+                &agent24_comm::Password::new(b"testpass".to_vec()).unwrap(),
+            )
+            .await
+            .unwrap();
+        let slot = CommDaemonSlot::new();
+        let verifier: Verifier = Arc::new(agent24_components::sign::Unsigned);
+        let state = build_ready_state(
+            &source,
+            &CommPaths {
+                home: &home,
+                install_dir: &install_dir,
+                pid_path: &pid_path,
+                log_path: &log_path,
+                autostart_path: &autostart_path,
+            },
+            store,
+            Duration::from_millis(200),
+            &slot,
+            &Verification {
+                lock: &lock,
+                verifier: &verifier,
+                platform: "linux-x64",
+            },
+        )
+        .await
+        .expect("fixture binary matches the overridden lock");
+        let daemon = slot
+            .current()
+            .expect("build_ready_state registers the supervisor");
+        let snap = daemon.probe_snapshot();
+        let status = daemon.status();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let spawned = home.join("daemon-started").exists();
+        daemon.shutdown(tokio::time::Instant::now()).await;
+        drop(state);
+        assert_eq!(
+            snap.contract,
+            agent24_comm::ContractView::Mismatch,
+            "the supervisor must be armed with the lock contract"
+        );
+        assert!(
+            status
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("contract_mismatch")),
+            "status {status:?}"
+        );
+        assert!(
+            !spawned,
+            "an incompatible contract must not start the daemon"
+        );
+        assert_ne!(status.state, "running");
+        assert_ne!(status.state, "starting");
+    }
+}
+
 /// PR #626 review, High #1: `CommDaemonSlot`'s whole job is to make the
 /// outcome of a `register`/`close` race depend on ORDER, never on which one
 /// happened to look first and guess wrong. Proven directly and
@@ -1126,7 +1491,7 @@ mod hy1_regression_tests {
             let (status, installed) = request(&app, "POST", "/api/v1/comm/install").await;
             assert_eq!(status, StatusCode::OK, "{installed}");
             assert_eq!(installed["data"]["restart_required"], false);
-            assert_eq!(installed["data"]["installed_version"], "v0.30.0");
+            assert_eq!(installed["data"]["installed_version"], "v0.30.1");
             assert_eq!(
                 tokio::fs::read(runtime.lock.installed_path(dir.path()))
                     .await
@@ -1139,7 +1504,7 @@ mod hy1_regression_tests {
             let (status, process) = request(&app, "GET", "/api/v1/comm/daemon").await;
             assert_eq!(status, StatusCode::OK);
             assert_ne!(process["data"]["process"]["state"], "not_configured");
-            assert_eq!(process["data"]["installed_version"], "v0.30.0");
+            assert_eq!(process["data"]["installed_version"], "v0.30.1");
         }
         if let Some(handle) = runtime.slot.close() {
             handle.shutdown(tokio::time::Instant::now()).await;
@@ -1492,6 +1857,125 @@ mod hy1_regression_tests {
     }
 
     #[tokio::test]
+    async fn non_rejection_start_failure_reads_failed_start_failed_and_absence_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime(dir.path()).await;
+        install_fixture(&runtime, dir.path(), FIXTURE).await;
+        // `create_dir_all(comm/hyphae-home)` cannot make a directory through a file.
+        // Same class as `A24_HYPHAE_BIN` pointing at a missing file: the build
+        // fails, the binary was not refused, and there is no supervisor.
+        tokio::fs::write(dir.path().join("comm"), b"not-a-directory")
+            .await
+            .unwrap();
+        start(&runtime).await;
+        assert_eq!(runtime.slot.rejection(), None);
+        assert!(runtime.slot.start_failed());
+
+        let (host, redacted) = components(&runtime).await;
+        assert_eq!(host["state"], "failed");
+        assert_eq!(host["reason"], "start_failed");
+        assert_eq!(redacted["state"], "failed");
+        assert!(redacted.get("reason").is_none(), "{redacted}");
+        let app = runtime_router(runtime.clone());
+        let (_, daemon) = request(&app, "GET", "/api/v1/comm/daemon").await;
+        assert_eq!(daemon["data"]["rejection"], Value::Null);
+        let (_, identity) = request(&app, "GET", "/api/v1/comm/identity").await;
+        assert_eq!(identity["error"], "binary_rejected");
+
+        // Nothing installed any more: plain `absent`, not a leftover failure.
+        tokio::fs::remove_file(dir.path().join("comm"))
+            .await
+            .unwrap();
+        tokio::fs::remove_file(runtime.lock.installed_path(dir.path()))
+            .await
+            .unwrap();
+        start(&runtime).await;
+        assert!(!runtime.slot.start_failed());
+        let (host, _) = components(&runtime).await;
+        assert_eq!(host["state"], "absent", "{host}");
+        assert!(host.get("reason").is_none(), "{host}");
+    }
+
+    #[tokio::test]
+    async fn components_reads_both_build_marks_under_one_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime(dir.path()).await;
+        install_fixture(&runtime, dir.path(), FIXTURE).await;
+        tokio::fs::write(dir.path().join("comm"), b"not-a-directory")
+            .await
+            .unwrap();
+        start(&runtime).await;
+        assert_eq!(runtime.slot.rejection(), None);
+        assert!(runtime.slot.start_failed());
+
+        let before = runtime.slot.build_note_locks();
+        let (host, redacted) = components(&runtime).await;
+        let locks = runtime.slot.build_note_locks() - before;
+        assert_eq!(host["state"], "failed");
+        assert_eq!(host["reason"], "start_failed");
+        assert_eq!(redacted["state"], "failed");
+        // Host and redacted each call `hyphae_item` once. `rejection()` then
+        // `start_failed()` would lock twice per call, so this would be 4.
+        assert_eq!(
+            locks, 2,
+            "rejection and start_failed must share one BuildNote lock, got {locks}"
+        );
+    }
+
+    #[test]
+    fn component_stop_grace_uses_the_lock_until_the_shutdown_budget() {
+        assert_eq!(
+            component_stop_grace(Some(15_000), Duration::from_secs(30), "hyphae"),
+            Duration::from_millis(15_000)
+        );
+        assert_eq!(
+            component_stop_grace(Some(15_000), Duration::from_millis(100), "hyphae"),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            component_stop_grace(None, Duration::from_millis(50), "hyphae"),
+            Duration::from_millis(50)
+        );
+    }
+
+    #[test]
+    fn health_failure_threshold_defaults_and_clamps() {
+        assert_eq!(health_failure_threshold(None, "hyphae"), 3);
+        assert_eq!(health_failure_threshold(Some(5), "hyphae"), 5);
+        assert_eq!(health_failure_threshold(Some(0), "hyphae"), 1);
+        assert_eq!(health_failure_threshold(Some(1), "hyphae"), 1);
+        assert_eq!(health_failure_threshold(Some(10), "hyphae"), 10);
+        assert_eq!(health_failure_threshold(Some(11), "hyphae"), 10);
+        assert_eq!(health_failure_threshold(Some(u32::MAX), "hyphae"), 10);
+    }
+
+    #[test]
+    fn probe_arm_reads_the_threshold_from_the_lock() {
+        let mut lock = HyphaeLock::embedded().unwrap();
+        assert_eq!(
+            hyphae_probe_arm(&lock).failures_before_degraded,
+            3,
+            "the shipped lock does not set it"
+        );
+        lock.component_mut().health_failures_before_degraded = Some(5);
+        assert_eq!(hyphae_probe_arm(&lock).failures_before_degraded, 5);
+        lock.component_mut().health_failures_before_degraded = Some(99);
+        assert_eq!(hyphae_probe_arm(&lock).failures_before_degraded, 10);
+    }
+
+    #[tokio::test]
+    async fn hyphae_stop_grace_follows_the_lock_within_the_shutdown_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let wide = Arc::new(CommDaemonSlot::new());
+        let _app = build(dir.path(), Duration::from_secs(30), &wide).await;
+        assert_eq!(wide.stop_grace(), Duration::from_millis(15_000));
+
+        let tight = Arc::new(CommDaemonSlot::new());
+        let _app = build(dir.path(), Duration::from_millis(100), &tight).await;
+        assert_eq!(tight.stop_grace(), Duration::from_millis(100));
+    }
+
+    #[tokio::test]
     async fn not_installed_stays_absent_and_a_later_absence_clears_a_rejection() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = runtime(dir.path()).await;
@@ -1515,5 +1999,296 @@ mod hy1_regression_tests {
         let (host, _) = components(&runtime).await;
         assert_eq!(host["state"], "absent");
         assert!(host.get("reason").is_none(), "{host}");
+    }
+
+    fn braced_route_templates(source: &str, anchor: &str) -> std::collections::BTreeSet<String> {
+        let start = source
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{anchor} missing"));
+        let body = &source[start..];
+        let end = body
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{anchor} is not brace-terminated"));
+        let body = &body[..end];
+        body.match_indices(".route(")
+            .filter_map(|(offset, _)| {
+                let rest = &body[offset + ".route(".len()..];
+                let rest = &rest[rest.find('"')? + 1..];
+                let path = rest[..rest.find('"')?].to_owned();
+                path.contains('{').then_some(path)
+            })
+            .collect()
+    }
+
+    /// Every `{param}` route merged into `agent24_comm::router`. The scanner
+    /// fails this test when a new one appears and is not listed below.
+    fn path_param_templates() -> std::collections::BTreeSet<String> {
+        let mut routes = braced_route_templates(
+            include_str!("../../../crates/agent24-comm/src/router.rs"),
+            "pub fn router(",
+        );
+        routes.extend(braced_route_templates(
+            include_str!("../../../crates/agent24-comm/src/groupchat.rs"),
+            "pub(crate) fn routes(",
+        ));
+        routes
+    }
+
+    async fn raw_call(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        bearer: Option<&str>,
+        body: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(bearer) = bearer {
+            builder = builder.header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {bearer}"),
+            );
+        }
+        let body = match body {
+            Some(body) => {
+                builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+                Body::from(body.to_owned())
+            }
+            None => Body::empty(),
+        };
+        let response = app
+            .clone()
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        (status, text)
+    }
+
+    #[tokio::test]
+    async fn path_param_routes_through_runtime_router_are_not_path_extractor_500s() {
+        const GID: &str = "0123456789abcdef0123456789abcdef";
+        const LID: &str = "fedcba9876543210fedcba9876543210";
+        // (method, template, concrete uri, json body)
+        let hits = [
+            (
+                "POST",
+                "/outbox/{event_id}/retry",
+                "/api/v1/comm/outbox/evt-1/retry".to_string(),
+                None,
+            ),
+            (
+                "GET",
+                "/groupchat/{group_id}/members",
+                format!("/api/v1/comm/groupchat/{GID}/members"),
+                None,
+            ),
+            (
+                "GET",
+                "/groupchat/{group_id}/invites",
+                format!("/api/v1/comm/groupchat/{GID}/invites"),
+                None,
+            ),
+            (
+                "GET",
+                "/groupchat/{group_id}/messages",
+                format!("/api/v1/comm/groupchat/{GID}/messages"),
+                None,
+            ),
+            (
+                "POST",
+                "/groupchat/{group_id}/messages",
+                format!("/api/v1/comm/groupchat/{GID}/messages"),
+                Some(r#"{"body":"hi"}"#),
+            ),
+            (
+                "GET",
+                "/groupchat/{group_id}/messages/{logical_id}",
+                format!("/api/v1/comm/groupchat/{GID}/messages/{LID}"),
+                None,
+            ),
+            (
+                "POST",
+                "/groupchat/{group_id}/messages/{logical_id}/retry",
+                format!("/api/v1/comm/groupchat/{GID}/messages/{LID}/retry"),
+                Some("{}"),
+            ),
+            (
+                "POST",
+                "/groupchat/invites/{invite_id}/accept",
+                format!("/api/v1/comm/groupchat/invites/{GID}/accept"),
+                Some("{}"),
+            ),
+        ];
+        let tested: std::collections::BTreeSet<String> = hits
+            .iter()
+            .map(|(_, template, _, _)| (*template).to_owned())
+            .collect();
+        assert_eq!(
+            tested,
+            path_param_templates(),
+            "every agent24_comm path-parameter route must be hit through runtime_router"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = runtime_router(runtime(dir.path()).await);
+        for (method, template, uri, body) in hits {
+            let (status, text) = raw_call(&app, method, &uri, None, body).await;
+            assert_ne!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{method} {template} returned the path-extractor 500: {text}"
+            );
+            assert!(
+                !text.contains("Wrong number of path arguments"),
+                "{method} {template}: {text}"
+            );
+            let value: Value = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{method} {template} is not JSON ({e}): {text}"));
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "{method} {template} body={value}"
+            );
+            assert_eq!(value["error"], "not_configured", "{method} {template}");
+        }
+    }
+
+    /// The parent auth layer reads `MatchedPath` before `forward_comm`. A token
+    /// that cannot `comm.write` must still be forbidden on the real template,
+    /// and a host token must reach the handler (409), not the path-extractor 500.
+    #[tokio::test]
+    async fn path_param_route_still_rejects_a_token_without_comm_write() {
+        let (state, host, creative) = crate::server::tests::capability_state().await;
+        let dir = tempfile::tempdir().unwrap();
+        let app = crate::server::build_router_with_modules(
+            state,
+            runtime_router(runtime(dir.path()).await),
+        );
+        let uri = "/api/v1/comm/outbox/evt-1/retry";
+
+        let (status, text) = raw_call(&app, "POST", uri, Some(&creative), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+        let denied: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(denied["error"]["code"], "forbidden");
+
+        let (status, text) = raw_call(&app, "POST", uri, Some(&host), None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{text}");
+        let allowed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(allowed["error"], "not_configured");
+    }
+
+    /// Same route, through `runtime_router`, for the two callers the creative/host
+    /// case does not cover. A docked shell has no `comm.write`, so the outer
+    /// match must still classify the template and forbid it. A legacy token
+    /// must reach the handler (409), not the path-extractor 500.
+    #[tokio::test]
+    async fn path_param_route_auth_covers_docked_shell_and_legacy_token() {
+        use crate::enroll_api::EnrollAuthority;
+
+        let uri = "/api/v1/comm/outbox/evt-1/retry";
+        let dir = tempfile::tempdir().unwrap();
+        let routes = runtime_router(runtime(dir.path()).await);
+
+        let (state, _host, _creative) = crate::server::tests::capability_state().await;
+        let store = state.capabilities.clone().unwrap();
+        let docked = crate::capabilities::first_party::FirstPartyAuthority::new_docked(store)
+            .issue(&crate::capabilities::first_party::test_peer("daemon-test"))
+            .unwrap()
+            .secret
+            .to_string();
+        let app = crate::server::build_router_with_modules(state, routes.clone());
+        let (status, text) = raw_call(&app, "POST", uri, Some(&docked), None).await;
+        assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+        assert!(!text.contains("Wrong number of path arguments"), "{text}");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+        let denied: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(denied["error"]["code"], "forbidden");
+
+        let legacy = crate::server::tests::state().await;
+        let legacy_app = crate::server::build_router_with_modules(legacy, routes);
+        let (status, text) = raw_call(&legacy_app, "POST", uri, Some("testtoken"), None).await;
+        assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+        assert!(!text.contains("Wrong number of path arguments"), "{text}");
+        assert_eq!(status, StatusCode::CONFLICT, "{text}");
+        let allowed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(allowed["error"], "not_configured");
+    }
+
+    /// Same double-match as `runtime_router`, on a probe handler that reports
+    /// what survived: one path parameter, the outer `MatchedPath`, and the
+    /// `Authorization` extension inserted the way CORE-2 inserts it.
+    #[tokio::test]
+    async fn forward_keeps_matched_path_and_authorization() {
+        use axum::extract::{Extension, MatchedPath, OriginalUri, Path};
+        use axum::routing::get;
+
+        async fn seen(
+            Path(id): Path<String>,
+            matched: MatchedPath,
+            OriginalUri(original): OriginalUri,
+            nested: axum::extract::NestedPath,
+            Extension(auth): Extension<crate::capabilities::Authorization>,
+        ) -> Json<Value> {
+            Json(json!({
+                "id": id,
+                "matched": matched.as_str(),
+                "original": original.path(),
+                "nested": nested.as_str(),
+                "capability_id": auth.claims.capability_id,
+            }))
+        }
+
+        async fn insert_authorization(mut req: axum::extract::Request, next: Next) -> Response {
+            req.extensions_mut()
+                .insert(crate::capabilities::Authorization {
+                    epoch: 7,
+                    claims: crate::capabilities::CapabilityClaims {
+                        first_party: None,
+                        capability_id: "cap-forward".to_owned(),
+                        audience: crate::capabilities::Audience::ProductHost,
+                        workspace_id: None,
+                        attachment_id: None,
+                        principal_id: None,
+                        daemon_generation: "g".to_owned(),
+                        host_generation: None,
+                        sidecar_generation: None,
+                        created_at: 0,
+                        expires_at: 0,
+                        allowed_operations: std::collections::BTreeSet::new(),
+                    },
+                });
+            next.run(req).await
+        }
+
+        async fn probe_forward(
+            State(inner): State<Router>,
+            req: axum::extract::Request,
+            _next: Next,
+        ) -> Response {
+            dispatch_inner(inner, req).await
+        }
+
+        let inner = Router::new().route("/item/{id}", get(seen));
+        let app = Router::new()
+            .nest(
+                "/api/v1/comm",
+                Router::new()
+                    .route("/item/{id}", get(|| async { StatusCode::NO_CONTENT }))
+                    .route_layer(middleware::from_fn_with_state(inner, probe_forward)),
+            )
+            .layer(middleware::from_fn(insert_authorization));
+
+        let (status, text) = raw_call(&app, "GET", "/api/v1/comm/item/abc", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["id"], "abc");
+        assert_eq!(value["matched"], "/api/v1/comm/item/{id}");
+        assert_eq!(value["original"], "/api/v1/comm/item/abc");
+        assert_eq!(value["nested"], "/api/v1/comm");
+        assert_eq!(value["capability_id"], "cap-forward");
     }
 }
