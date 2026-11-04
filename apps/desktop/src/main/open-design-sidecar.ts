@@ -451,7 +451,7 @@ export class OpenDesignLauncher implements SidecarLauncher {
       if (controller.signal.aborted) fail()
     })
     try {
-      while (true) {
+      for (;;) {
         try {
           const response = await Promise.race([this.fetchFn(`${origin}/api/ready`, { signal: controller.signal }), aborted])
           void response.body?.cancel().catch(() => {})
