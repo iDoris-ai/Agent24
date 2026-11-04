@@ -261,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_lock_is_the_signed_v0_30_0_release() {
+    fn embedded_lock_is_the_signed_v0_30_1_release() {
         // Byte-for-byte the published release file (ADR-038 §7.4).
         assert_eq!(
             agent24_comm::binary::sha256_of(HYPHAE_LOCK_JSON.as_bytes()).to_hex(),
@@ -473,7 +473,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "downloads the pinned v0.30.1 asset from GitHub; on macOS also runs codesign + spctl"]
-    async fn real_github_v0_30_0_matches_lock_and_signature() {
+    async fn real_github_v0_30_1_matches_lock_and_signature() {
         let dir = tempfile::tempdir().unwrap();
         let lock = HyphaeLock::embedded().unwrap();
         let platform = agent24_comm::current_platform();
