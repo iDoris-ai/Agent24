@@ -239,6 +239,7 @@ export class CreativeServeWeb {
   private startGeneration = 0
   private starting: Promise<CreativeServeWebStatus> | null = null
   private stopping: Promise<CreativeServeWebStatus> | null = null
+  private closed = false
   private readonly statusListeners = new Set<(status: CreativeServeWebStatus) => void>()
 
   // --- packaged headless instance: everything about its process is the manager's ---
@@ -384,11 +385,15 @@ export class CreativeServeWeb {
   }
 
   start(): Promise<CreativeServeWebStatus> {
+    // After `shutdown()` nothing may launch again, including restarts queued behind a stop.
+    if (this.closed) return Promise.resolve(this.status())
     if (this.stopping) return this.stopping.then(() => this.start())
     if (this.starting) return this.starting
     if (this.child) return Promise.resolve(this.status())
     const live = this.manager.status().state
-    if (live === 'ready' || live === 'healthy' || live === 'degraded') return Promise.resolve(this.status())
+    // A show lazily replaces a degraded run through the normal, deduplicated stop flow.
+    if (live === 'degraded') return this.stop().then(() => this.start())
+    if (live === 'ready' || live === 'healthy') return Promise.resolve(this.status())
 
     const pending = this.startOnce()
     this.starting = pending
@@ -649,6 +654,12 @@ export class CreativeServeWeb {
     } finally {
       if (generation === this.startGeneration) this.launching = false
     }
+  }
+
+  /** Stops for good: used by app quit, so a later or queued `start()` cannot relaunch. */
+  shutdown(): Promise<CreativeServeWebStatus> {
+    this.closed = true
+    return this.stop()
   }
 
   async stop(): Promise<CreativeServeWebStatus> {
