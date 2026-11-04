@@ -1,6 +1,6 @@
 # Agent24 架构优化方案（草案）
 
-> **进度（2026-11-04）**：预览版停发，主线转为组件整合与统一。Q1 已拍板 (b)：Open Design 改由 `SidecarManager` 托管（设计见 [C8-SIDECAR-DESIGN.md](C8-SIDECAR-DESIGN.md)，实现 #1580，进行中）；正文里按 (a) 写的推荐（Q1 行、C1、C4、S1-6、S2-6）已逐行加注，依赖 Q1 的 `sidecar-host` 冻结与 S1-7 待重新评估。ADR-038 C1–C7 及评审遗留（#1570–#1575、#1577–#1579）已合入。第 0/1/2 期其余分片未开工，等 §5 其余问题拍板。
+> **进度（2026-11-04）**：预览版停发，主线转为组件整合与统一。Q1 已拍板 (b)（本文 Q1 的 (b)，不同于 PLAN-OD-NEXT F11.4 的 (b)）：Open Design 改由 `SidecarManager` 托管（设计见 [C8-SIDECAR-DESIGN.md](C8-SIDECAR-DESIGN.md)，实现 #1580，进行中）；正文里按 (a) 写的推荐（Q1 行、C1、C4、S1-6、S2-6）已逐行加注，依赖 Q1 的 `sidecar-host` 冻结与 S1-7 待重新评估。ADR-038 C1–C7 及评审遗留（#1570–#1575、#1577–#1579）已合入。第 0/1/2 期其余分片未开工，等 §5 其余问题拍板。
 
 | 项 | 内容 |
 |---|---|
@@ -99,7 +99,7 @@ flowchart TB
 | **拆文件不拆 crate** | `server.rs`：`serve()` 按子系统拆启动步骤；鉴权中间件移到 `capabilities/` | agent24d 内部 | — | R1 §4 server.rs 构成表 |
 | **反转/去重** | os-proc 的签名要求改用 `components::sign::team_requirement` / `valid_team_id` | — | os-proc 不宜依赖 components（components 带 reqwest）。**建议把这两个纯函数下沉到 os-proc（或新 sys crate），由 components 反过来复用** | R1 §5.1 A3；`agent24-components/src/sign.rs:178,187` |
 | **改编号** | L5½ → L4½（或「L5 之下的共用运行时」） | 文档 | — | R1 §3.1：被 L5 与 L6 共同依赖 |
-| **冻结/移出** | `agent24-sidecar-host` + `-protocol` | 默认 workspace → 冻结（视 §5 Q1） | — | R1 §6.2、§9 #7 |
+| **冻结/移出** | `agent24-sidecar-host` + `-protocol` | 默认 workspace → 冻结（视 §5 Q1；**Q1 已拍板 (b)，见顶部，待重新评估**） | — | R1 §6.2、§9 #7 |
 | **保留为例外** | `agent24-comm` 自带 axum REST 面 | 不动，在 LAYERS 文档里写成显式例外 | — | R1 §3.3 #1；comm 的 zero-run 依赖白名单（`agent24-comm/tests/comm_dependency_allowlist.rs`）让它下沉路由的收益很小 |
 
 瘦身目标（第二期结束）：agent24d 非测试行从 27,915 降到约 22,000（减 iDoris ~2,500 + Knowledge ~1,800 + attach ~1,500）。第三期 auth 抽出后约 17,000–18,000。
@@ -242,7 +242,7 @@ flowchart TB
 | **S2-3** Knowledge 宿主下沉 | `knowledge_host/backend/probe/store` 迁入 `agent24-knowledge`；决定 `provider/`（~4,100 行）接线或冻结 | `d/knowledge_*.rs`、`agent24-knowledge` | L | Q3；**AGENTS.md：凭据类须等 APPROVE** | agent24d 减 ~1,800 行；C5 探测测试原样通过 | 中：凭据路径 | Grok（Opus 评审） |
 | **S2-4** attach 抽 crate | 新 `agent24-attach`；先抽 events / model_callback 需要的 trait | `d/attached*.rs`、`d/attach_*.rs`、`d/agentear_timings.rs` | L | S2-1 | agent24d 减 ~1,500 行；C4 用例（失配、取消）原样通过 | 中 | Grok |
 | **S2-5** 鉴权抽 `agent24-auth` | capabilities / enroll / presence 业务下沉，handler 与中间件接线留 agent24d | `d/capabilities/*`、`d/enroll_*.rs`、`d/presence_desktop.rs` | L | S1-2、S2-1；建议排在最后 | agent24d 再减 ~4,000 行；enroll / presence / mint 全部黑盒测试通过 | **高**：安全核心 | 拍板 → Grok（Opus 评审，外审 APPROVE） |
-| **[注：Q1 (b) 后 OD 停止语义改为 TERM→15s→SIGKILL 整组，见 C8 设计]** **S2-6** 进程组终止原语 | Rust 一个 `kill_group_gracefully`（放 os-proc / sys），os-proto、comm、idoris、sidecar-host 共用；TS 一个，backend-manager 与 creative-serve-web 共用（是否强杀作为参数，OD 保持「不强杀」） | 5 个 Rust crate、3 个 TS 模块 | M | S1-6（OD 停止语义先定）；Q13 | 同一组回收 / 超时 / 僵尸测试跑在共用实现上；各调用点超时值显式传入 | 中：统一会改变行为 | Grok |
+| **[注：Q1 (b) 后 OD 停止语义改为 TERM→15s→SIGKILL 整组，见 C8 设计]** **S2-6** 进程组终止原语 | Rust 一个 `kill_group_gracefully`（放 os-proc / sys），os-proto、comm、idoris、sidecar-host 共用；TS 一个，backend-manager 与 creative-serve-web 共用（是否强杀作为参数，OD 保持「不强杀」） | 5 个 Rust crate、3 个 TS 模块 | M | #1580（C8，OD 停止语义已定；原 S1-6 作废）；Q13 | 同一组回收 / 超时 / 僵尸测试跑在共用实现上；各调用点超时值显式传入 | 中：统一会改变行为 | Grok |
 | S2-7（按 Q5） | CLI 补齐：`knowledge` 绑定/凭据、`comm identity export/import` | `agent24-cli` | M | Q5 | release 用例可走 CLI | 中 | 拍板 → Grok |
 
 ### 4.4 依赖顺序一览
@@ -252,7 +252,7 @@ flowchart TB
                      ↑Q12            ↑Q8/Q9 ↑Q1/Q13      ↑Q11 ↑Q4
 第 1 期：S1-1、S1-3、S1-4、S1-5 可立即并行（最多 3 个 Grok 并发）
          S1-2 等 Q2；S1-6 等 Q1（与 S0-2 同步）；S1-7 等 Q1
-第 2 期：S2-1 → S2-4、S2-5；S2-2、S2-3 可与 S2-1 错开；S2-6 在 S1-6 后；S2-5 最后
+第 2 期：S2-1 → S2-4、S2-5；S2-2、S2-3 可与 S2-1 错开；S2-6 在 #1580 后（原 S1-6 作废）；S2-5 最后
 ```
 
 ---

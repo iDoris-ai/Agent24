@@ -1,5 +1,7 @@
 # C8 设计：Open Design 托管改为经过 `SidecarManager`
 
+> 实现以 #1580 为准（例如退出等待落在新增的 `creative-quit.ts`，不在 `main.ts` before-quit）。
+
 > 基线：origin/main `163dd2d3`（2026-11-04）。只读调研，没有改任何文件。
 > 名称说明：`docs/agent/PLAN-OD-NEXT.md` F11.4 里，"迁到 SidecarManager + agent24-sidecar-host"写的是 (a)，"保留 CreativeServeWeb"写的是 (b)。本文按 jason 的原话理解：**只用 TS 的 `SidecarManager`，这次不接 Rust 的 `agent24-sidecar-host`**。如果 jason 指的是 F11.4 那个 (b)，本文不适用。
 
