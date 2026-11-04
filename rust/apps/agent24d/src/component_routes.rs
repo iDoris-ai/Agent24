@@ -470,9 +470,13 @@ fn documents_mapped(
 ///
 /// - `version` is the report's; the catalog's goes to `detail.expected_version`.
 ///   With no report there is no runtime, and the catalog's version is shown.
-/// - A report version that differs, or a capability the manifest declares
-///   without a tool the catalog expects, is `component_contract_mismatch` and
-///   `incompatible` while the module is mounted.
+///   A different version does not change the state: the package is installed on
+///   demand and can be ahead of or behind this daemon, so `detail` gets
+///   `actual_version` and `update_available: true` and nothing else.
+/// - A capability the manifest declares without a tool the catalog expects is
+///   `component_contract_mismatch` and `incompatible`, but only over a live
+///   `ready` or `degraded` reading: the process states that follow it
+///   (starting, stopping, failed, stopped) say more about what is happening.
 /// - A capability the catalog expects and a non-empty manifest list omits is
 ///   `unavailable`. Extra capabilities in the manifest are ignored.
 ///
@@ -498,8 +502,12 @@ fn apply_documents_catalog(
                 _ => serde_json::Map::new(),
             };
             detail.insert("expected_version".to_owned(), json!(catalog.version));
-            let mounted = report.is_some_and(|r| matches!(r.outcome, MountOutcome::Mounted));
-            if let (Some(mismatch), true) = (checked.mismatch, mounted) {
+            if let Some((_, running)) = checked.version_drift {
+                detail.insert("actual_version".to_owned(), json!(running));
+                detail.insert("update_available".to_owned(), json!(true));
+            }
+            let live = matches!(item.state, ComponentState::Ready | ComponentState::Degraded);
+            if let (Some(mismatch), true) = (checked.mismatch, live) {
                 item.state = ComponentState::Incompatible;
                 item.reason = Some("component_contract_mismatch".to_owned());
                 detail.insert("id".to_owned(), json!(item.id));

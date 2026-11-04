@@ -140,24 +140,44 @@ impl DaemonKnowledgeBackend {
         }
     }
 
-    /// D3: no business call before the version check. The probe cache is the
-    /// one `GET /api/v1/components` reads; an expired entry runs one probe
-    /// (the same singleflight). An `incompatible` contract, or no declaration
-    /// yet, refuses the call here, with a fixed code and nothing sent: `incompatible`
-    /// (not retryable) or `not_ready` (retryable).
-    async fn contract_fits(&self, operation: &str) -> Result<(), Failure> {
+    /// The run's binding as it is now, held until the contract fits (D3: no
+    /// business call before the version check).
+    ///
+    /// The gate reads the probe cache `GET /api/v1/components` reads; an
+    /// expired entry runs one probe (the same singleflight), which can take
+    /// seconds. It looks only at the endpoint this run's binding names. An
+    /// `incompatible` contract, or no declaration yet, refuses the call here,
+    /// with a fixed code and nothing sent: `incompatible` (not retryable) or
+    /// `not_ready` (retryable).
+    ///
+    /// The binding is resolved again after the gate: the credential, the
+    /// activation or the endpoint may have moved while it waited, and the
+    /// snapshot taken before it must not be the one that is sent.
+    async fn gated_binding(
+        &self,
+        run_id: &str,
+        operation: &str,
+    ) -> Result<(RunBinding, BindingNow), Failure> {
+        let (pin, now) = self.binding(run_id).await?;
         if !self.contract_gate {
-            return Ok(());
+            return Ok((pin, now));
         }
+        let base_url = now
+            .endpoint
+            .as_ref()
+            .ok_or(local(LocalReason::ProfileInactive, false))?
+            .base_url
+            .clone();
         match self
             .registry
-            .contract_gate(operation, std::time::Instant::now())
+            .contract_gate(&base_url, operation, std::time::Instant::now())
             .await
         {
-            ContractGate::Open => Ok(()),
-            ContractGate::Incompatible => Err(local(LocalReason::Incompatible, false)),
-            ContractGate::NoDeclaration => Err(local(LocalReason::NotReady, true)),
+            ContractGate::Open => {}
+            ContractGate::Incompatible => return Err(local(LocalReason::Incompatible, false)),
+            ContractGate::NoDeclaration => return Err(local(LocalReason::NotReady, true)),
         }
+        self.binding(run_id).await
     }
 
     /// The run's binding as it is now, or why the call cannot go out.
@@ -240,12 +260,15 @@ impl DaemonKnowledgeBackend {
         let deadline = Duration::from_millis(DEADLINE_MS) + TRANSPORT_SLACK;
         // A change to the binding while the call is out abandons it there
         // and then (S4.5): the transport's future is dropped.
+        // Not even the first poll of `send` if the binding already moved.
+        self.still_current(&sent, request_id)?;
         let answer = tokio::select! {
-            answer = transport.send(op, body, deadline) => answer,
+            biased;
             () = self.until_moved(&sent, request_id) => {
                 return Err(self.still_current(&sent, request_id).err()
                     .unwrap_or_else(|| cancelled(request_id, sent.generation, 0)));
             }
+            answer = transport.send(op, body, deadline) => answer,
         };
         self.still_current(&sent, request_id)?;
         let answer = answer.map_err(|e| match e {
@@ -364,8 +387,7 @@ impl KnowledgeBackend for DaemonKnowledgeBackend {
         run_id: &str,
         query: SearchQuery,
     ) -> Result<(SearchRequest, SearchResponse), Failure> {
-        let (pin, now) = self.binding(run_id).await?;
-        self.contract_fits("search").await?;
+        let (pin, now) = self.gated_binding(run_id, "search").await?;
         let (transport, credential_seq, allowed) = self.transport(&pin, &now)?;
         let generation = now.generation;
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -432,8 +454,7 @@ impl KnowledgeBackend for DaemonKnowledgeBackend {
         run_id: &str,
         query: ReadQuery,
     ) -> Result<(ReadRequest, ReadResponse), Failure> {
-        let (pin, now) = self.binding(run_id).await?;
-        self.contract_fits("read").await?;
+        let (pin, now) = self.gated_binding(run_id, "read").await?;
         let (transport, credential_seq, allowed) = self.transport(&pin, &now)?;
         let generation = now.generation;
         let request_id = uuid::Uuid::new_v4().to_string();

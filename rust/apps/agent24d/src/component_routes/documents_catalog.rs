@@ -85,44 +85,32 @@ pub(super) struct Assurance {
 /// What [`DocumentsCatalog::check`] found.
 #[derive(Debug, Default)]
 pub(super) struct Checked {
-    pub(super) mismatch: Option<Mismatch>,
+    /// A capability the manifest declares lacks a tool the catalog expects:
+    /// `component_contract_mismatch` (ADR-038 D9).
+    pub(super) mismatch: Option<ToolsMismatch>,
+    /// `(expected, actual)` when the running version is not the catalog's.
+    /// Not a contract mismatch: a package that is downloaded on demand can be
+    /// newer or older than this daemon, so this only says an update is due.
+    pub(super) version_drift: Option<(String, String)>,
     /// Capability ids the catalog expects and the manifest's list omits.
     pub(super) unavailable: BTreeSet<String>,
 }
 
-/// A `component_contract_mismatch` (ADR-038 D3, D9): version first.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum Mismatch {
-    Version {
-        expected: String,
-        actual: String,
-    },
-    Tools {
-        capability: String,
-        expected: Vec<String>,
-        actual: Vec<String>,
-        missing: Vec<String>,
-    },
+pub(super) struct ToolsMismatch {
+    capability: String,
+    expected: Vec<String>,
+    actual: Vec<String>,
+    missing: Vec<String>,
 }
 
-impl Mismatch {
-    /// `expected` / `actual` as D3 wants them in the error, plus what is
-    /// specific to the kind.
+impl ToolsMismatch {
+    /// `expected` / `actual` as D3 wants them in the error, plus the kind.
     pub(super) fn into_detail(self) -> serde_json::Map<String, Value> {
-        let value = match self {
-            Self::Version { expected, actual } => {
-                json!({"expected": expected, "actual": actual, "kind": "version"})
-            }
-            Self::Tools {
-                capability,
-                expected,
-                actual,
-                missing,
-            } => json!({
-                "expected": expected, "actual": actual, "kind": "tools",
-                "capability": capability, "missing": missing,
-            }),
-        };
+        let value = json!({
+            "expected": self.expected, "actual": self.actual, "kind": "tools",
+            "capability": self.capability, "missing": self.missing,
+        });
         match value {
             Value::Object(map) => map,
             _ => serde_json::Map::new(),
@@ -266,10 +254,7 @@ impl DocumentsCatalog {
     ) -> Checked {
         let mut checked = Checked::default();
         if let Some(runtime) = runtime_version.filter(|runtime| *runtime != self.version) {
-            checked.mismatch = Some(Mismatch::Version {
-                expected: self.version.clone(),
-                actual: runtime.to_owned(),
-            });
+            checked.version_drift = Some((self.version.clone(), runtime.to_owned()));
         }
         let Some(actual) = actual.filter(|actual| !actual.is_empty()) else {
             return checked;
@@ -286,7 +271,7 @@ impl DocumentsCatalog {
                 .cloned()
                 .collect();
             if !missing.is_empty() && checked.mismatch.is_none() {
-                checked.mismatch = Some(Mismatch::Tools {
+                checked.mismatch = Some(ToolsMismatch {
                     capability: expected.id.clone(),
                     expected: expected.tools.clone(),
                     actual: found.tools.clone(),

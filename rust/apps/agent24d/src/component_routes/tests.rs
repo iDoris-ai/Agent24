@@ -1333,6 +1333,8 @@ enum Script {
     /// 500 if the request carries a credential header, else `body`.
     NoAuth(String),
     Stall,
+    /// 500 until the flag is set, then `body`.
+    Switch(Arc<AtomicBool>, String),
     Hold(Arc<AtomicBool>, String),
     Bearer {
         secret: String,
@@ -1453,6 +1455,13 @@ async fn answer(
             }
         }
         Script::Stall => std::future::pending::<()>().await,
+        Script::Switch(up, body) => {
+            if up.load(Ordering::SeqCst) {
+                write_response(&mut stream, 200, &body).await?;
+            } else {
+                write_response(&mut stream, 500, "down").await?;
+            }
+        }
         Script::Hold(go, body) => {
             while !go.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2374,6 +2383,9 @@ fn adr_038_d5_names_timeout_and_http_errors_as_failed() {
     assert!(c5.contains("not_ready"), "{c5}");
     assert!(c5.contains("D3"), "{c5}");
     assert!(!c5.contains("遗留：不探测"), "§8 is probed now: {c5}");
+    for needle in ["审计", "R10", "4 秒", "逐 URL"] {
+        assert!(c5.contains(needle), "{needle} not in {c5}");
+    }
     let c6 = text
         .lines()
         .find(|line| line.starts_with("| C6 |"))
@@ -2382,6 +2394,7 @@ fn adr_038_d5_names_timeout_and_http_errors_as_failed() {
         "expected_version",
         "component_contract_mismatch",
         "unavailable",
+        "update_available",
         "已落地",
     ] {
         assert!(c6.contains(needle), "{needle} not in {c6}");
@@ -3488,8 +3501,10 @@ async fn a_stale_answer_is_not_cached_and_bindings_that_keep_moving_fail_closed(
             retakes.fetch_add(1, Ordering::SeqCst);
             registry.probe_targets(unix_now())
         },
+        None,
     )
-    .await;
+    .await
+    .view;
     assert_eq!(view.state, ComponentState::Failed);
     assert_eq!(view.reason.as_deref(), Some("binding_changed"));
     assert_eq!(
@@ -3504,12 +3519,16 @@ async fn the_contract_gate_reads_the_probe_cache_and_reprobes_after_the_ttl() {
     use crate::knowledge_host::ContractGate;
     let fake = serve(Script::Reply(200, ready_body())).await;
     let registry = with_credential(&fake.base, "LEAK-gate-secret");
+    let url = fake.base.as_str();
     let t0 = Instant::now();
     assert_eq!(
-        registry.contract_gate("search", t0).await,
+        registry.contract_gate(url, "search", t0).await,
         ContractGate::Open
     );
-    assert_eq!(registry.contract_gate("read", t0).await, ContractGate::Open);
+    assert_eq!(
+        registry.contract_gate(url, "read", t0).await,
+        ContractGate::Open
+    );
     assert_eq!(
         fake.hits.load(Ordering::SeqCst),
         1,
@@ -3521,7 +3540,7 @@ async fn the_contract_gate_reads_the_probe_cache_and_reprobes_after_the_ttl() {
     assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
     let later = t0 + KNOWLEDGE_PROBE_TTL + Duration::from_secs(1);
     assert_eq!(
-        registry.contract_gate("search", later).await,
+        registry.contract_gate(url, "search", later).await,
         ContractGate::Open
     );
     assert_eq!(
@@ -3540,7 +3559,7 @@ async fn the_contract_gate_refuses_incompatible_missing_and_unknown() {
     let fake = serve(Script::Reply(200, incompatible)).await;
     let registry = configured(&fake.base);
     assert_eq!(
-        registry.contract_gate("search", t0).await,
+        registry.contract_gate(&fake.base, "search", t0).await,
         ContractGate::Incompatible
     );
 
@@ -3548,11 +3567,11 @@ async fn the_contract_gate_refuses_incompatible_missing_and_unknown() {
     let fake = serve(Script::Reply(200, document_with_ops(r#""search""#))).await;
     let registry = configured(&fake.base);
     assert_eq!(
-        registry.contract_gate("read", t0).await,
+        registry.contract_gate(&fake.base, "read", t0).await,
         ContractGate::Incompatible
     );
     assert_eq!(
-        registry.contract_gate("search", t0).await,
+        registry.contract_gate(&fake.base, "search", t0).await,
         ContractGate::Open
     );
 
@@ -3560,12 +3579,19 @@ async fn the_contract_gate_refuses_incompatible_missing_and_unknown() {
     let fake = serve(Script::Reply(500, "x".into())).await;
     let registry = configured(&fake.base);
     assert_eq!(
-        registry.contract_gate("search", t0).await,
+        registry.contract_gate(&fake.base, "search", t0).await,
+        ContractGate::NoDeclaration
+    );
+    // Nothing configured, or an endpoint that is not one of the bindings'.
+    assert_eq!(
+        KnowledgeHostRegistry::default()
+            .contract_gate("http://unconfigured/api/v1", "search", t0)
+            .await,
         ContractGate::NoDeclaration
     );
     assert_eq!(
-        KnowledgeHostRegistry::default()
-            .contract_gate("search", t0)
+        registry
+            .contract_gate("http://other/api/v1", "search", t0)
             .await,
         ContractGate::NoDeclaration
     );
@@ -3575,9 +3601,95 @@ async fn the_contract_gate_refuses_incompatible_missing_and_unknown() {
     fake.ready_mode(ReadyMode::SearchNotReady);
     let registry = with_credential(&fake.base, "LEAK-gate-2");
     assert_eq!(
-        registry.contract_gate("search", t0).await,
+        registry.contract_gate(&fake.base, "search", t0).await,
         ContractGate::Open
     );
+}
+
+/// H1: one binding's failed or incompatible endpoint must not refuse a call that
+/// goes to another binding's good endpoint, and its own calls are still refused.
+#[tokio::test]
+async fn the_gate_looks_only_at_the_endpoint_the_call_goes_to() {
+    use crate::knowledge_host::ContractGate;
+    let t0 = Instant::now();
+    let good = serve(Script::Reply(200, ready_body())).await;
+    let down = serve(Script::Reply(500, "x".into())).await;
+    let incompatible = serve(Script::Reply(
+        200,
+        ready_body().replace("\"protocol_versions\":[1,2]", "\"protocol_versions\":[2]"),
+    ))
+    .await;
+    let registry = KnowledgeHostRegistry::default();
+    bind(&registry, "good", 1, &good.base);
+    bind(&registry, "down", 1, &down.base);
+    bind(&registry, "wrong", 1, &incompatible.base);
+    // The folded view the list shows is the worst of the three.
+    assert_eq!(
+        knowledge_item(&registry, t0).await.state,
+        ComponentState::Incompatible
+    );
+    for op in ["search", "read"] {
+        assert_eq!(
+            registry.contract_gate(&good.base, op, t0).await,
+            ContractGate::Open,
+            "{op}"
+        );
+        assert_eq!(
+            registry.contract_gate(&down.base, op, t0).await,
+            ContractGate::NoDeclaration,
+            "{op}"
+        );
+        assert_eq!(
+            registry.contract_gate(&incompatible.base, op, t0).await,
+            ContractGate::Incompatible,
+            "{op}"
+        );
+    }
+    // One probe round served all of that.
+    assert_eq!(good.hits.load(Ordering::SeqCst), 1);
+}
+
+/// M2: a failed reading closes the gate for a few seconds, not for a whole TTL.
+#[tokio::test]
+async fn a_failed_reading_is_reprobed_after_a_short_ttl_not_the_full_one() {
+    use crate::knowledge_host::ContractGate;
+    use crate::knowledge_probe::KNOWLEDGE_PROBE_FAILED_TTL;
+    let up = Arc::new(AtomicBool::new(false));
+    let fake = serve(Script::Switch(Arc::clone(&up), ready_body())).await;
+    let registry = configured(&fake.base);
+    let t0 = Instant::now();
+    assert_eq!(
+        registry.contract_gate(&fake.base, "search", t0).await,
+        ContractGate::NoDeclaration
+    );
+    up.store(true, Ordering::SeqCst);
+    let soon = t0 + KNOWLEDGE_PROBE_FAILED_TTL - Duration::from_secs(1);
+    assert_eq!(
+        registry.contract_gate(&fake.base, "search", soon).await,
+        ContractGate::NoDeclaration
+    );
+    assert_eq!(
+        fake.hits.load(Ordering::SeqCst),
+        1,
+        "inside the short window: cached"
+    );
+    let after = t0 + KNOWLEDGE_PROBE_FAILED_TTL + Duration::from_secs(1);
+    assert!(after < t0 + KNOWLEDGE_PROBE_TTL);
+    assert_eq!(
+        registry.contract_gate(&fake.base, "search", after).await,
+        ContractGate::Open
+    );
+    assert_eq!(
+        fake.hits.load(Ordering::SeqCst),
+        2,
+        "reprobed, and it recovered"
+    );
+    // The list is unchanged by this: it keeps the full TTL for a failure.
+    let down = serve(Script::Reply(500, "x".into())).await;
+    let registry = configured(&down.base);
+    knowledge_item(&registry, t0).await;
+    knowledge_item(&registry, after).await;
+    assert_eq!(down.hits.load(Ordering::SeqCst), 1);
 }
 
 // ---- L3: D9 expected-vs-actual for Documents (ADR-038 C6) ----
@@ -3626,11 +3738,10 @@ fn documents_version_is_the_runtime_and_the_catalog_is_the_expectation() {
     assert_eq!(ok.detail.as_ref().unwrap()["expected_version"], "0.1.0");
 
     let drifted = running(&mount_report_at(MountOutcome::Mounted, "9.9.9"));
-    assert_eq!(drifted.state, ComponentState::Incompatible);
-    assert_eq!(
-        drifted.reason.as_deref(),
-        Some("component_contract_mismatch")
-    );
+    // A different version is not a contract mismatch (M4 of the L3 review): a
+    // package fetched on demand can be ahead of or behind this daemon.
+    assert_eq!(drifted.state, ComponentState::Ready);
+    assert!(drifted.reason.is_none());
     assert_eq!(
         drifted.version.as_deref(),
         Some("9.9.9"),
@@ -3638,9 +3749,16 @@ fn documents_version_is_the_runtime_and_the_catalog_is_the_expectation() {
     );
     let detail = drifted.detail.as_ref().unwrap();
     assert_eq!(detail["expected_version"], "0.1.0");
-    assert_eq!(detail["id"], "documents");
-    assert_eq!(detail["expected"], "0.1.0");
-    assert_eq!(detail["actual"], "9.9.9");
+    assert_eq!(detail["actual_version"], "9.9.9");
+    assert_eq!(detail["update_available"], true);
+    assert!(detail.get("expected").is_none() && detail.get("kind").is_none());
+    assert!(
+        ok.detail
+            .as_ref()
+            .unwrap()
+            .get("update_available")
+            .is_none()
+    );
     assert!(drifted.form.allows(drifted.state));
 
     // No report: nothing is running to compare. The catalog's version is shown
@@ -3651,8 +3769,75 @@ fn documents_version_is_the_runtime_and_the_catalog_is_the_expectation() {
     assert_eq!(none.detail.as_ref().unwrap()["expected_version"], "0.1.0");
 }
 
-/// A package that is off, or never mounted, is not made `incompatible` by a
-/// version that never ran.
+/// The tool mismatch overrides a live `ready` or `degraded` only (L4): a package
+/// that is off, never mounted, starting or restarting keeps the state that says
+/// what it is doing.
+#[test]
+fn a_documents_tool_mismatch_overrides_only_a_live_reading() {
+    let cases: Vec<(MountOutcome, Option<Supervised>, ComponentState)> = vec![
+        (MountOutcome::Disabled, None, ComponentState::Stopped),
+        (
+            MountOutcome::Degraded("disk".into()),
+            None,
+            ComponentState::Failed,
+        ),
+        (
+            MountOutcome::Refused("dup".into()),
+            None,
+            ComponentState::Failed,
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::Starting {
+                attempt: 1,
+                after: None,
+            }),
+            ComponentState::Starting,
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::Stopping),
+            ComponentState::Stopping,
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::Stopped),
+            ComponentState::Stopped,
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::Panicked),
+            ComponentState::Failed,
+        ),
+        (
+            MountOutcome::Mounted,
+            Some(Supervised::Running),
+            ComponentState::Incompatible,
+        ),
+        (MountOutcome::Mounted, None, ComponentState::Incompatible),
+    ];
+    for (outcome, live, want) in cases {
+        let report = report_with(
+            outcome.clone(),
+            "0.1.0",
+            vec![declared("documents", vec![])],
+        );
+        let item = documents_from(
+            Some(&report),
+            live.as_ref(),
+            documents_catalog::DocumentsCatalog::embedded(),
+        );
+        assert_eq!(item.state, want, "{outcome:?} {live:?}");
+        let flagged = item.reason.as_deref() == Some("component_contract_mismatch");
+        assert_eq!(
+            flagged,
+            want == ComponentState::Incompatible,
+            "{outcome:?} {live:?}"
+        );
+    }
+}
+
+/// A package that is off, or never mounted, keeps its state under a version drift.
 #[test]
 fn a_documents_version_drift_does_not_override_disabled_degraded_or_refused() {
     for (outcome, state, reason) in [
@@ -3672,7 +3857,7 @@ fn a_documents_version_drift_does_not_override_disabled_degraded_or_refused() {
         assert_eq!(item.state, state, "{outcome:?}");
         assert_eq!(item.reason.as_deref(), Some(reason), "{outcome:?}");
         assert_eq!(item.version.as_deref(), Some("9.9.9"));
-        assert!(item.detail.as_ref().unwrap().get("actual").is_none());
+        assert_eq!(item.detail.as_ref().unwrap()["update_available"], true);
     }
 }
 
@@ -3742,15 +3927,18 @@ fn a_declared_capability_without_an_expected_tool_is_a_contract_mismatch() {
         "the capability is there, its contract is not"
     );
 
-    // The version is checked first, and a drifted version is reported as such.
-    let mut both = embedded_tools();
-    both.clear();
+    // A drifted version alongside it is only added to the detail.
     let report = report_with(
         MountOutcome::Mounted,
         "9.9.9",
-        vec![declared("documents", both)],
+        vec![declared("documents", vec![])],
     );
-    assert_eq!(running(&report).detail.as_ref().unwrap()["kind"], "version");
+    let item = running(&report);
+    let detail = item.detail.as_ref().unwrap();
+    assert_eq!(item.state, ComponentState::Incompatible);
+    assert_eq!(detail["kind"], "tools");
+    assert_eq!(detail["actual_version"], "9.9.9");
+    assert_eq!(detail["update_available"], true);
 }
 
 /// The package we ship agrees with the catalog compiled into the daemon:
@@ -3788,22 +3976,24 @@ async fn documents_expected_vs_actual_reaches_the_list_and_hides_detail_from_oth
     let (status, full) = call(&app, Method::GET, GET, Some(&host), "").await;
     assert_eq!(status, StatusCode::OK);
     let doc = find(&full, "documents");
-    assert_eq!(doc["state"], "incompatible");
-    assert_eq!(doc["reason"], "component_contract_mismatch");
+    assert_eq!(doc["state"], "ready");
+    assert!(doc.get("reason").is_none());
     assert_eq!(doc["version"], "9.9.9");
     assert_eq!(doc["detail"]["expected_version"], "0.1.0");
+    assert_eq!(doc["detail"]["update_available"], true);
     assert_eq!(doc["provides"][0]["availability"], "unavailable");
 
     let (_, redacted) = call(&app, Method::GET, GET, Some(&first_party), "").await;
     let doc = find(&redacted, "documents");
-    assert_eq!(doc["state"], "incompatible");
+    assert_eq!(doc["state"], "ready");
     assert_eq!(doc["version"], "9.9.9");
     let text = doc.to_string();
     for leaked in [
         "expected_version",
+        "actual_version",
+        "update_available",
         "detail",
         "reason",
-        "component_contract_mismatch",
     ] {
         assert!(!text.contains(leaked), "{leaked} in {text}");
     }
@@ -3840,4 +4030,46 @@ fn the_match_op_scanner_handles_wrapped_arrows_alternatives_and_nested_matches()
             "documents.e"
         ])
     );
+}
+
+// ---- L3 review round: L1, L2 ----
+
+/// L1: 2^53 itself is not a safe integer for a float; the bound is strict.
+#[tokio::test]
+async fn a_float_at_two_to_the_53_is_not_read_as_an_integer() {
+    for (value, ready) in [
+        ("9007199254740991.0", true),
+        ("9007199254740992.0", false),
+        ("1e16", false),
+    ] {
+        let fake = serve(Script::Reply(
+            200,
+            document_with_limits(&limits_with(value)),
+        ))
+        .await;
+        let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
+        let host = shown(&item);
+        if ready {
+            assert_eq!(host["state"], "ready", "{value}");
+        } else {
+            assert_eq!(host["reason"], "malformed", "{value}");
+        }
+    }
+}
+
+/// L2: the key moves while the §8 request is out. Its answer must not be used.
+#[tokio::test]
+async fn a_credential_that_moves_during_the_ready_request_makes_the_answer_stale() {
+    use crate::knowledge_probe::KnowledgeProbeCache;
+    let fake = serve(Script::Reply(200, ready_body())).await;
+    let registry = with_credential(&fake.base, "LEAK-during-secret");
+    let targets = registry.probe_targets(unix_now());
+    let cache = KnowledgeProbeCache::default();
+    // Valid before the capabilities request and before §8; revoked after it.
+    let calls = AtomicUsize::new(0);
+    let current =
+        |_: &crate::knowledge_probe::ProbeTarget| calls.fetch_add(1, Ordering::SeqCst) < 2;
+    let assessed = cache.assess(&targets, Instant::now(), &current).await;
+    assert_eq!(fake.ready_hits(), 1, "§8 went out");
+    assert!(assessed.stale, "its answer was used although the key moved");
 }

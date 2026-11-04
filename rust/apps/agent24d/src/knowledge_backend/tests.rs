@@ -565,12 +565,17 @@ async fn the_real_transport_goes_to_the_activated_endpoint() {
 
 /// A loopback server for `GET /system/capabilities`: the probe the D3 gate
 /// reads. Counts its requests.
-async fn capabilities_server(status: u16, body: String) -> (String, Arc<AtomicUsize>) {
+async fn capabilities_server(
+    status: u16,
+    body: String,
+) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/api/v1", listener.local_addr().unwrap());
     let hits = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&hits);
+    let business = Arc::new(AtomicUsize::new(0));
+    let business_counter = Arc::clone(&business);
     tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
@@ -578,12 +583,18 @@ async fn capabilities_server(status: u16, body: String) -> (String, Arc<AtomicUs
             };
             let body = body.clone();
             let counter = Arc::clone(&counter);
+            let business = Arc::clone(&business_counter);
             tokio::spawn(async move {
                 let mut buf = [0u8; 2048];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 // Only the capabilities request counts; a §8 ready probe may follow.
-                if String::from_utf8_lossy(&buf[..n]).contains("/system/capabilities") {
+                let head = String::from_utf8_lossy(&buf[..n]);
+                if head.contains("/system/capabilities") {
                     counter.fetch_add(1, Ordering::SeqCst);
+                } else if head.contains("/agent24/knowledge/search")
+                    || head.contains("/agent24/knowledge/read")
+                {
+                    business.fetch_add(1, Ordering::SeqCst);
                 }
                 let reply = format!(
                     "HTTP/1.1 {status} S\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -593,7 +604,7 @@ async fn capabilities_server(status: u16, body: String) -> (String, Arc<AtomicUs
             });
         }
     });
-    (base, hits)
+    (base, hits, business)
 }
 
 fn capabilities_document(majors: &str, operations: &str) -> String {
@@ -663,7 +674,7 @@ fn refused_as(result: &Result<impl std::fmt::Debug, Failure>, want: LocalReason,
 /// ADR-038 D3: no business call before the version check.
 #[tokio::test]
 async fn an_incompatible_contract_refuses_search_and_read_before_anything_is_sent() {
-    let (base, hits) =
+    let (base, hits, _) =
         capabilities_server(200, capabilities_document("[2]", r#"["search","read"]"#)).await;
     let s = gated_setup(&base, Answer::Fixture("search.ok.json"));
     refused_as(
@@ -691,7 +702,7 @@ async fn an_incompatible_contract_refuses_search_and_read_before_anything_is_sen
 
 #[tokio::test]
 async fn no_declaration_yet_refuses_with_a_retryable_not_ready() {
-    let (base, _) = capabilities_server(500, "down".into()).await;
+    let (base, _, _) = capabilities_server(500, "down".into()).await;
     let s = gated_setup(&base, Answer::Fixture("search.ok.json"));
     refused_as(
         &s.backend.search(RUN, query(None)).await,
@@ -709,7 +720,7 @@ async fn no_declaration_yet_refuses_with_a_retryable_not_ready() {
 
 #[tokio::test]
 async fn a_compatible_contract_lets_the_call_through_on_one_probe() {
-    let (base, hits) =
+    let (base, hits, _) =
         capabilities_server(200, capabilities_document("[1]", r#"["search","read"]"#)).await;
     let s = gated_setup(&base, Answer::Fixture("search.ok.json"));
     s.backend.search(RUN, query(None)).await.unwrap();
@@ -725,7 +736,8 @@ async fn a_compatible_contract_lets_the_call_through_on_one_probe() {
 /// The declaration lacks `read`: that call is refused, search still goes.
 #[tokio::test]
 async fn an_operation_the_declaration_lacks_is_refused_locally() {
-    let (base, _) = capabilities_server(200, capabilities_document("[1]", r#"["search"]"#)).await;
+    let (base, _, _) =
+        capabilities_server(200, capabilities_document("[1]", r#"["search"]"#)).await;
     let s = gated_setup(&base, Answer::Fixture("search.ok.json"));
     refused_as(
         &s.backend.read(RUN, read_query()).await,
@@ -735,4 +747,175 @@ async fn an_operation_the_declaration_lacks_is_refused_locally() {
     assert!(s.server.sent.lock().unwrap().is_empty());
     s.backend.search(RUN, query(None)).await.unwrap();
     assert_eq!(s.server.sent.lock().unwrap().len(), 1);
+}
+
+/// M3: the constructor the daemon uses is the gated one. Nothing here goes
+/// through `with_connect`, so the real HTTP transport is what would carry a
+/// business request if the gate were off.
+fn production_backend(base: &str) -> (Arc<KnowledgeHostRegistry>, DaemonKnowledgeBackend) {
+    let registry = Arc::new(KnowledgeHostRegistry::default());
+    let endpoint = Endpoint {
+        base_url: base.to_owned(),
+        knowledge_base_ids: vec!["kb-a".into()],
+    };
+    registry.activate(HOST, BINDING, 1, endpoint).unwrap();
+    push(&registry, 2, "key-1");
+    registry.pin_run(
+        RUN,
+        RunBinding {
+            host: HOST.into(),
+            binding: BINDING.into(),
+            generation: 1,
+        },
+    );
+    let runs = Runs(HashMap::from([(RUN.to_owned(), BINDING.to_owned())]));
+    let backend = DaemonKnowledgeBackend::new(Arc::clone(&registry), Arc::new(runs));
+    (registry, backend)
+}
+
+#[tokio::test]
+async fn new_refuses_locally_when_the_endpoint_is_incompatible_or_unreachable() {
+    let (base, _, business) =
+        capabilities_server(200, capabilities_document("[2]", r#"["search","read"]"#)).await;
+    let (_registry, backend) = production_backend(&base);
+    refused_as(
+        &backend.search(RUN, query(None)).await,
+        LocalReason::Incompatible,
+        false,
+    );
+    refused_as(
+        &backend.read(RUN, read_query()).await,
+        LocalReason::Incompatible,
+        false,
+    );
+    assert_eq!(
+        business.load(Ordering::SeqCst),
+        0,
+        "a business request left"
+    );
+
+    let (base, _, business) = capabilities_server(500, "down".into()).await;
+    let (_registry, backend) = production_backend(&base);
+    refused_as(
+        &backend.search(RUN, query(None)).await,
+        LocalReason::NotReady,
+        true,
+    );
+    assert_eq!(business.load(Ordering::SeqCst), 0);
+
+    // A port nothing listens on: no declaration, so refused before any request.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/api/v1", closed.local_addr().unwrap());
+    drop(closed);
+    let (_registry, backend) = production_backend(&base);
+    refused_as(
+        &backend.read(RUN, read_query()).await,
+        LocalReason::NotReady,
+        true,
+    );
+}
+
+/// H1 through the backend: another binding's dead endpoint does not refuse a
+/// run bound to a good one.
+#[tokio::test]
+async fn a_run_on_a_good_endpoint_is_not_refused_for_another_bindings_bad_one() {
+    let (good, _, business) =
+        capabilities_server(200, capabilities_document("[1]", r#"["search","read"]"#)).await;
+    let (bad, _, _) = capabilities_server(500, "down".into()).await;
+    let (registry, backend) = production_backend(&good);
+    registry
+        .activate(
+            HOST,
+            "b2",
+            1,
+            Endpoint {
+                base_url: bad,
+                knowledge_base_ids: vec!["kb-x".into()],
+            },
+        )
+        .unwrap();
+    // The good endpoint passes the gate and the request goes out. The loopback
+    // server answers it with a capabilities document, so the call itself fails
+    // past the gate; what counts is that the business request left.
+    let _ = backend.search(RUN, query(None)).await;
+    assert!(
+        business.load(Ordering::SeqCst) >= 1,
+        "the call did not reach the good endpoint"
+    );
+}
+
+/// A capabilities server that holds every answer until `release` is set, and
+/// says when the first request arrived.
+async fn held_capabilities_server(
+    body: String,
+) -> (
+    String,
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::AtomicBool;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/api/v1", listener.local_addr().unwrap());
+    let arrived = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let (seen, go) = (Arc::clone(&arrived), Arc::clone(&release));
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (body, seen, go) = (body.clone(), Arc::clone(&seen), Arc::clone(&go));
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                seen.store(true, Ordering::SeqCst);
+                while !go.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 S\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    (base, arrived, release)
+}
+
+/// M1: the gate can wait seconds. A credential revoked meanwhile must not be
+/// the one the request goes out with: the binding is read again after the gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_credential_revoked_while_the_gate_waits_is_not_sent() {
+    let (base, arrived, release) =
+        held_capabilities_server(capabilities_document("[1]", r#"["search","read"]"#)).await;
+    let s = Arc::new(gated_setup(&base, Answer::Fixture("search.ok.json")));
+    let call = {
+        let s = Arc::clone(&s);
+        tokio::spawn(async move { s.backend.search(RUN, query(None)).await })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !arrived.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the probe never started"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    s.registry
+        .apply(HOST, BINDING, 7, Change::RevokeCredential)
+        .unwrap();
+    release.store(true, Ordering::SeqCst);
+    let result = tokio::time::timeout(Duration::from_secs(6), call)
+        .await
+        .unwrap()
+        .unwrap();
+    refused_as(&result, LocalReason::NotReady, true);
+    assert!(s.server.sent.lock().unwrap().is_empty(), "a request left");
+    assert_eq!(
+        s.connects.load(Ordering::SeqCst),
+        0,
+        "a transport was built from the old key"
+    );
 }

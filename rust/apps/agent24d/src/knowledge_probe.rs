@@ -42,7 +42,7 @@
 //! integers. [`integral`] is the one place that reads them.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::future::join_all;
@@ -58,6 +58,11 @@ use tokio::sync::watch;
 /// How long a probe answer is reused. `GET /api/v1/components` must not hit the
 /// remote on every poll.
 pub const KNOWLEDGE_PROBE_TTL: Duration = Duration::from_secs(30);
+
+/// How long the D3 gate trusts a `failed` reading of its own endpoint before it
+/// asks again. A failed endpoint has no declaration, so every call to it is
+/// refused; a long window would keep refusing after it recovered.
+pub const KNOWLEDGE_PROBE_FAILED_TTL: Duration = Duration::from_secs(4);
 
 /// Bound on one capabilities exchange, connect included (D6).
 pub const KNOWLEDGE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -187,25 +192,63 @@ enum ParseError {
 /// no longer holds. It was not cached; the caller takes a new snapshot.
 pub(crate) struct Assessed {
     pub view: ProbeView,
+    /// One answer per probed base URL, for the caller that needs a single
+    /// endpoint's reading (the D3 gate) instead of the folded `view`.
+    pub per_url: Arc<HashMap<String, ProbeView>>,
     pub stale: bool,
 }
 
 impl Assessed {
-    fn fresh(view: ProbeView) -> Self {
-        Self { view, stale: false }
+    fn fresh(answer: Answer) -> Self {
+        Self {
+            view: answer.view,
+            per_url: answer.per_url,
+            stale: false,
+        }
+    }
+
+    /// No cache or probe behind it (nothing configured, or the bindings kept
+    /// moving).
+    pub(crate) fn without_urls(view: ProbeView) -> Self {
+        Self {
+            view,
+            per_url: Arc::default(),
+            stale: false,
+        }
+    }
+}
+
+/// What one probe round produced: the folded view the component list shows and
+/// each endpoint's own reading.
+#[derive(Clone)]
+struct Answer {
+    view: ProbeView,
+    per_url: Arc<HashMap<String, ProbeView>>,
+}
+
+impl CacheEntry {
+    fn fresh_for(&self, gate_url: Option<&str>) -> Duration {
+        let failed = gate_url
+            .and_then(|url| self.answer.per_url.get(url))
+            .is_some_and(|view| view.state == ComponentState::Failed);
+        if failed {
+            KNOWLEDGE_PROBE_FAILED_TTL
+        } else {
+            KNOWLEDGE_PROBE_TTL
+        }
     }
 }
 
 struct CacheEntry {
     fingerprint: String,
     at: Instant,
-    view: ProbeView,
+    answer: Answer,
 }
 
 #[derive(Default)]
 struct CacheInner {
     entry: Option<CacheEntry>,
-    flights: HashMap<String, watch::Sender<Option<ProbeView>>>,
+    flights: HashMap<String, watch::Sender<Option<Answer>>>,
 }
 
 /// Shared by every `GET /api/v1/components`. One in-flight probe per endpoint
@@ -220,7 +263,7 @@ pub(crate) struct KnowledgeProbeCache {
 struct FlightGuard<'a> {
     cache: &'a KnowledgeProbeCache,
     fingerprint: String,
-    tx: Option<watch::Sender<Option<ProbeView>>>,
+    tx: Option<watch::Sender<Option<Answer>>>,
     finished: bool,
 }
 
@@ -247,29 +290,44 @@ impl Drop for FlightGuard<'_> {
 }
 
 impl KnowledgeProbeCache {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn assess(
         &self,
         targets: &[ProbeTarget],
         now: Instant,
         still_valid: &(dyn Fn(&ProbeTarget) -> bool + Sync),
     ) -> Assessed {
+        self.assess_for(targets, now, still_valid, None).await
+    }
+
+    /// As [`Self::assess`]. With `gate_url`, an entry whose reading of that
+    /// endpoint is `failed` is reused for [`KNOWLEDGE_PROBE_FAILED_TTL`] only,
+    /// so one failure does not close the D3 gate for a whole
+    /// [`KNOWLEDGE_PROBE_TTL`]. The component list passes `None`.
+    pub(crate) async fn assess_for(
+        &self,
+        targets: &[ProbeTarget],
+        now: Instant,
+        still_valid: &(dyn Fn(&ProbeTarget) -> bool + Sync),
+        gate_url: Option<&str>,
+    ) -> Assessed {
         if targets.is_empty() {
-            return Assessed::fresh(not_configured());
+            return Assessed::without_urls(not_configured());
         }
         let fingerprint = fingerprint(targets);
         loop {
             enum Role {
-                Hit(ProbeView),
-                Wait(watch::Receiver<Option<ProbeView>>),
-                Lead(watch::Sender<Option<ProbeView>>),
+                Hit(Answer),
+                Wait(watch::Receiver<Option<Answer>>),
+                Lead(watch::Sender<Option<Answer>>),
             }
             let role = {
                 let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
                 if let Some(entry) = &guard.entry
                     && entry.fingerprint == fingerprint
-                    && now.saturating_duration_since(entry.at) < KNOWLEDGE_PROBE_TTL
+                    && now.saturating_duration_since(entry.at) < entry.fresh_for(gate_url)
                 {
-                    Role::Hit(entry.view.clone())
+                    Role::Hit(entry.answer.clone())
                 } else if let Some(tx) = guard.flights.get(&fingerprint) {
                     Role::Wait(tx.subscribe())
                 } else {
@@ -279,10 +337,10 @@ impl KnowledgeProbeCache {
                 }
             };
             match role {
-                Role::Hit(view) => return Assessed::fresh(view),
+                Role::Hit(answer) => return Assessed::fresh(answer),
                 Role::Wait(rx) => {
-                    if let Some(view) = wait_flight(rx).await {
-                        return Assessed::fresh(view);
+                    if let Some(answer) = wait_flight(rx).await {
+                        return Assessed::fresh(answer);
                     }
                     // The leader left without a result. Try again: hit a
                     // newer cache entry, wait on a new leader, or lead.
@@ -294,27 +352,31 @@ impl KnowledgeProbeCache {
                         tx: Some(tx),
                         finished: false,
                     };
-                    let (view, stale) = probe_all(targets, still_valid).await;
+                    let (answer, stale) = probe_all(targets, still_valid).await;
                     if stale {
                         // Not the answer for any current set of targets. Leave
                         // without publishing: the guard drops the flight and
                         // the waiters go round again.
-                        return Assessed { view, stale };
+                        return Assessed {
+                            view: answer.view,
+                            per_url: answer.per_url,
+                            stale,
+                        };
                     }
                     {
                         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
                         guard.entry = Some(CacheEntry {
                             fingerprint: fingerprint.clone(),
                             at: now,
-                            view: view.clone(),
+                            answer: answer.clone(),
                         });
                         guard.flights.remove(&fingerprint);
                     }
                     if let Some(tx) = flight.tx.take() {
-                        let _ = tx.send(Some(view.clone()));
+                        let _ = tx.send(Some(answer.clone()));
                     }
                     flight.finished = true;
-                    return Assessed::fresh(view);
+                    return Assessed::fresh(answer);
                 }
             }
         }
@@ -335,7 +397,7 @@ impl KnowledgeProbeCache {
 
 /// `None` when the leader closed the channel without publishing. The last
 /// published value still counts if the send won the race with the drop.
-async fn wait_flight(mut rx: watch::Receiver<Option<ProbeView>>) -> Option<ProbeView> {
+async fn wait_flight(mut rx: watch::Receiver<Option<Answer>>) -> Option<Answer> {
     loop {
         if let Some(view) = rx.borrow().clone() {
             return Some(view);
@@ -375,7 +437,7 @@ fn fingerprint(targets: &[ProbeTarget]) -> String {
 async fn probe_all(
     targets: &[ProbeTarget],
     still_valid: &(dyn Fn(&ProbeTarget) -> bool + Sync),
-) -> (ProbeView, bool) {
+) -> (Answer, bool) {
     let deadline = Instant::now() + KNOWLEDGE_PROBE_TIMEOUT;
     let judged = join_all(
         targets
@@ -384,8 +446,17 @@ async fn probe_all(
     )
     .await;
     let stale = judged.iter().any(Option::is_none);
+    let per_url: HashMap<String, ProbeView> = targets
+        .iter()
+        .zip(&judged)
+        .filter_map(|(target, judged)| Some((target.base_url.clone(), judged.as_ref()?.view())))
+        .collect();
     let parts: Vec<Judged> = judged.into_iter().flatten().collect();
-    (fold(&parts), stale)
+    let answer = Answer {
+        view: fold(&parts),
+        per_url: Arc::new(per_url),
+    };
+    (answer, stale)
 }
 
 fn fold(parts: &[Judged]) -> ProbeView {
@@ -496,7 +567,10 @@ async fn fetch(
     if !still_valid(target) {
         return None;
     }
-    Some(probe_ready(&transport, deadline, judged).await)
+    let judged = probe_ready(&transport, deadline, judged).await;
+    // The service has answered; if the key moved while it did, the answer
+    // belongs to a snapshot that no longer holds.
+    still_valid(target).then_some(judged)
 }
 
 /// `POST /agent24/knowledge/ready` (R8.2, no scope). `judged` is the compatible
@@ -787,8 +861,8 @@ fn check_limits(value: &Value) -> Result<(), ParseError> {
 
 /// The integer a JSON number stands for, by JSON Schema's value rule: `-0`,
 /// `1.0` and `1e3` are integers, `1.5` is not. `None` for a fraction, a
-/// non-finite value, or a magnitude the exact range below cannot hold (past
-/// 2^53 a float no longer names one integer).
+/// non-finite value, or a magnitude the exact range below cannot hold (2^53 and
+/// up: a float no longer names one integer).
 fn integral(n: &Number) -> Option<i128> {
     if let Some(i) = n.as_i64() {
         return Some(i128::from(i));
@@ -799,7 +873,7 @@ fn integral(n: &Number) -> Option<i128> {
     const EXACT: f64 = 9_007_199_254_740_992.0; // 2^53
     let f = n.as_f64()?;
     // `-0.0` has no fraction and is `0`.
-    (f.is_finite() && f.fract() == 0.0 && f.abs() <= EXACT).then_some(f as i128)
+    (f.is_finite() && f.fract() == 0.0 && f.abs() < EXACT).then_some(f as i128)
 }
 
 /// A numeric or token `code` other than success. Only the integer `0` (however
