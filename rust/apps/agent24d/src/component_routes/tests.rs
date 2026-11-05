@@ -462,7 +462,7 @@ fn the_mapping_rows() {
         ("not_configured", S::Stopped),
         ("backoff", S::Failed),
         ("gave_up", S::Failed),
-        ("locked", S::Failed),
+        ("locked", S::Stopped),
     ] {
         let (mapped, _) = from_hyphae(process);
         assert_eq!(mapped, want, "{process}");
@@ -478,9 +478,9 @@ fn the_mapping_rows() {
         (IdorisState::Failed, S::Failed),
         (IdorisState::InstanceConflict, S::Failed),
     ] {
-        assert_eq!(from_idoris(state, false).0, want);
+        assert_eq!(from_idoris(state, false, None).0, want);
         assert_eq!(
-            from_idoris(state, true).0,
+            from_idoris(state, true, None).0,
             S::Installing,
             "an install in flight wins"
         );
@@ -1503,7 +1503,7 @@ fn contract_mismatch_is_incompatible_even_when_the_process_gave_up() {
         probe_of(ContractView::Mismatch, None),
     );
     assert_eq!(item.state, ComponentState::Incompatible);
-    assert_eq!(item.reason.as_deref(), Some("contract_mismatch"));
+    assert_eq!(item.reason.as_deref(), Some("component_contract_mismatch"));
 }
 
 #[test]
@@ -4399,5 +4399,44 @@ async fn an_envelope_code_that_underflows_to_zero_is_not_success() {
         let fake = serve(Script::Reply(200, with_code(code))).await;
         let item = knowledge_item(&configured(&fake.base), Instant::now()).await;
         assert_eq!(shown(&item)["state"], "ready", "code {code}");
+    }
+}
+
+#[test]
+fn s1_4_idoris_contract_mismatch_is_incompatible() {
+    use agent24d::idoris_host::Code;
+    assert_eq!(
+        from_idoris(IdorisState::Failed, false, Some(Code::ContractMismatch)),
+        (
+            ComponentState::Incompatible,
+            Some("component_contract_mismatch")
+        )
+    );
+    assert_eq!(
+        from_idoris(IdorisState::Failed, true, Some(Code::ContractMismatch)).0,
+        ComponentState::Installing
+    );
+    assert_eq!(
+        from_idoris(IdorisState::Stopped, false, Some(Code::ContractMismatch)).0,
+        ComponentState::Stopped
+    );
+}
+
+#[test]
+fn s1_4_components_render_hyphae_lifecycle() {
+    for (process, expected, reason) in [
+        ("starting", "starting", None),
+        ("locked", "stopped", Some("locked")),
+        ("backoff", "failed", Some("backoff")),
+    ] {
+        let (state, why) = from_hyphae(process);
+        let item = Item::new("hyphae", Form::Resident, state).with(|i| i.reason = why);
+        let payload = render(&[item], true);
+        assert_eq!(payload["components"][0]["state"], expected, "{process}");
+        assert_eq!(
+            payload["components"][0]["reason"],
+            json!(reason),
+            "{process}"
+        );
     }
 }

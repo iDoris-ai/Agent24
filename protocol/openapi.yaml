@@ -1253,6 +1253,22 @@ paths:
                       $ref: "#/components/schemas/Approval"
 
   /approvals/{id}:
+    get:
+      operationId: getApproval
+      x-milestone: M-C
+      tags: [approvals]
+      summary: Fetch one approval by id
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: The approval
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Approval"
+        "404":
+          $ref: "#/components/responses/NotFound"
     post:
       operationId: decideApproval
       x-milestone: M-C
@@ -2049,6 +2065,7 @@ paths:
 
   /sin90/directions:
     get:
+      x-external-contract: iDoris-ai/Sin90
       operationId: sin90ListDirections
       tags: [sin90]
       summary: List Sin90 directions (newest first)
@@ -2066,6 +2083,7 @@ paths:
                     items: { $ref: "#/components/schemas/Sin90Direction" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
     post:
+      x-external-contract: iDoris-ai/Sin90
       operationId: sin90CreateDirection
       tags: [sin90]
       summary: Create a Sin90 direction
@@ -2091,6 +2109,7 @@ paths:
 
   /sin90/schedule-blocks:
     get:
+      x-external-contract: iDoris-ai/Sin90
       operationId: sin90ListBlocks
       tags: [sin90]
       summary: List Sin90 schedule blocks (newest first)
@@ -2108,6 +2127,7 @@ paths:
                     items: { $ref: "#/components/schemas/Sin90ScheduleBlock" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
     post:
+      x-external-contract: iDoris-ai/Sin90
       operationId: sin90CreateBlock
       tags: [sin90]
       summary: Create a Sin90 schedule block
@@ -2135,6 +2155,7 @@ paths:
 
   /sin90/schedule-blocks/{id}:
     patch:
+      x-external-contract: iDoris-ai/Sin90
       operationId: sin90TransitionBlock
       tags: [sin90]
       summary: Transition a schedule block (started/completed/skipped)
@@ -2170,6 +2191,7 @@ paths:
 
   /sin90/proposals:
     get:
+      x-external-contract: iDoris-ai/Sin90
       operationId: sin90ListProposals
       tags: [sin90]
       summary: List Sin90 proposals (newest first)
@@ -2187,6 +2209,7 @@ paths:
                     items: { $ref: "#/components/schemas/Sin90StoredProposal" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
     post:
+      x-external-contract: iDoris-ai/Sin90
       operationId: sin90SubmitProposal
       tags: [sin90]
       summary: Submit a Sin90 proposal (persisted pending; idempotent on id)
@@ -2216,6 +2239,7 @@ paths:
 
   /sin90/proposals/{id}:
     get:
+      x-external-contract: iDoris-ai/Sin90
       operationId: sin90GetProposal
       tags: [sin90]
       summary: Read one proposal by id (ops + receipt once applied)
@@ -2235,6 +2259,7 @@ paths:
 
   /sin90/proposals/{id}/accept:
     post:
+      x-external-contract: iDoris-ai/Sin90
       operationId: sin90AcceptProposal
       tags: [sin90]
       summary: Accept + apply a pending proposal (CAS-idempotent)
@@ -2264,6 +2289,7 @@ paths:
 
   /sin90/attention:
     get:
+      x-external-contract: iDoris-ai/Sin90
       operationId: sin90Attention
       tags: [sin90]
       summary: Attention reconciliation for a window (pure event replay)

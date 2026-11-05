@@ -234,9 +234,10 @@ impl IdorisLock {
     }
 
     pub fn check_contract(&self, contract_version: &str) -> Result<(), ContractMismatch> {
-        if Version::parse(contract_version)
-            .is_ok_and(|v| v.major == self.contract_major && v.minor >= self.min_contract_minor)
-        {
+        if Version::parse(contract_version).is_ok_and(|v| {
+            // A pre-release contract is not the released one it names; build metadata is.
+            v.pre.is_empty() && v.major == self.contract_major && v.minor >= self.min_contract_minor
+        }) {
             Ok(())
         } else {
             Err(ContractMismatch {

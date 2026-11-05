@@ -144,7 +144,11 @@ fn render(items: &[Item], full: bool) -> Value {
 
 /// iDoris's lifecycle state. D5's table does not list it; the same definitions apply. An
 /// install in flight is `installing` whatever the stored state says.
-fn from_idoris(state: IdorisState, installing: bool) -> (ComponentState, Option<&'static str>) {
+fn from_idoris(
+    state: IdorisState,
+    installing: bool,
+    error: Option<agent24d::idoris_host::Code>,
+) -> (ComponentState, Option<&'static str>) {
     use ComponentState as S;
     if installing {
         return (S::Installing, None);
@@ -155,6 +159,13 @@ fn from_idoris(state: IdorisState, installing: bool) -> (ComponentState, Option<
         IdorisState::Stopped => (S::Stopped, None),
         IdorisState::Starting => (S::Starting, None),
         IdorisState::Running => (S::Ready, None),
+        // `ContractMismatch` comes from the supervisor's `/health` check as a whole: a wrong
+        // contract version, but also a wrong `service`, an empty `instance_id` or dev-no-key.
+        // Each means the installed binary is not the one this daemon can drive, so all are
+        // `incompatible` rather than a crash.
+        IdorisState::Failed if error == Some(agent24d::idoris_host::Code::ContractMismatch) => {
+            (S::Incompatible, Some("component_contract_mismatch"))
+        }
         IdorisState::Failed => (S::Failed, None),
         IdorisState::InstanceConflict => (S::Failed, Some("instance_conflict")),
     }
@@ -190,12 +201,14 @@ fn from_supervised(status: &Supervised) -> (ComponentState, Option<&'static str>
 /// The Hyphae daemon, from the supervisor's process state alone (is the child
 /// alive, did it exit). This mapping never returns `degraded`: that comes from
 /// [`overlay_hyphae`] after N consecutive `hyphae health` failures (ADR-038 D5).
-/// A process that died and will be restarted, gave up, or was refused its
-/// password is `failed`; one that is not configured or was stopped is `stopped`.
+/// A process that died and will be restarted or gave up is `failed`; one that
+/// needs its password, is not configured, or was stopped is `stopped`.
 fn from_hyphae(process: &str) -> (ComponentState, Option<String>) {
     use ComponentState as S;
     match process {
         "running" => (S::Ready, None),
+        "starting" => (S::Starting, None),
+        "locked" => (S::Stopped, Some("locked".to_owned())),
         "stopped" => (S::Stopped, None),
         "not_configured" => (S::Stopped, Some("not_configured".to_owned())),
         other => (S::Failed, Some(other.to_owned())),
@@ -216,7 +229,7 @@ fn overlay_hyphae(
         ContractView::Mismatch => {
             return (
                 ComponentState::Incompatible,
-                Some("contract_mismatch".into()),
+                Some("component_contract_mismatch".into()),
             );
         }
         ContractView::CheckFailed => {
@@ -320,7 +333,7 @@ async fn idoris_item(state: &AppState) -> Item {
             .is_ok_and(|op| op.action == Action::Install),
         None => false,
     };
-    let (mapped, reason) = from_idoris(status.state, installing);
+    let (mapped, reason) = from_idoris(status.state, installing, status.last_error);
     item.with(|i| {
         i.provides = provides;
         i.state = mapped;
