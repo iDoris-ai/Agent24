@@ -1,13 +1,21 @@
-#![allow(dead_code)]
-use crate::{
-    LeaseKind, LegacyRecoveryHold, WorkspaceInstant, WorkspaceKind, WorkspaceLeaseRow,
-    WorkspaceResult, WorkspaceRow, WorkspaceStoreError, workspace_decode_support,
-};
-use agent24_protocol::{
-    ApprovalStatus, Decision, ErrorBody, Run, RunInput, RunOutput, RunStatus, Usage, WorkspaceId,
-};
+#![cfg_attr(
+    feature = "dormant-workspace",
+    allow(
+        dead_code,
+        reason = "dormant-workspace: legacy terminal reads have no caller until workspace G composes a terminal; decode_run stays live without this feature"
+    )
+)]
+#[cfg(feature = "dormant-workspace")]
+use crate::{LeaseKind, LegacyRecoveryHold, WorkspaceKind, WorkspaceLeaseRow, WorkspaceRow};
+use crate::{WorkspaceInstant, WorkspaceResult, WorkspaceStoreError, workspace_decode_support};
+#[cfg(feature = "dormant-workspace")]
+use agent24_protocol::{ApprovalStatus, Decision};
+use agent24_protocol::{ErrorBody, Run, RunInput, RunOutput, RunStatus, Usage, WorkspaceId};
+#[cfg(feature = "dormant-workspace")]
 use serde_json::{Map, Value};
-use sqlx::{Row, Sqlite, Transaction, sqlite::SqliteRow};
+use sqlx::sqlite::SqliteRow;
+#[cfg(feature = "dormant-workspace")]
+use sqlx::{Row, Sqlite, Transaction};
 fn bad(table: &'static str, field: &'static str) -> WorkspaceStoreError {
     workspace_decode_support::bad_table(table, field)
 }
@@ -61,6 +69,7 @@ fn run_status(row: &SqliteRow) -> WorkspaceResult<RunStatus> {
     serde_json::from_value(serde_json::Value::String(text(row, "runs", "status")?))
         .map_err(|_| bad("runs", "status"))
 }
+#[cfg(feature = "dormant-workspace")]
 fn approval_status(row: &SqliteRow) -> WorkspaceResult<ApprovalStatus> {
     serde_json::from_value(serde_json::Value::String(text(row, "approvals", "status")?))
         .map_err(|_| bad("approvals", "status"))
@@ -104,6 +113,7 @@ pub(crate) fn decode_run(row: &SqliteRow) -> WorkspaceResult<TerminalRunFacts> {
         created_at,
     })
 }
+#[cfg(feature = "dormant-workspace")]
 pub(crate) async fn read_terminal_run_tx(
     tx: &mut Transaction<'_, Sqlite>,
     run_id: &str,
@@ -123,6 +133,7 @@ pub(crate) async fn read_terminal_run_tx(
         .ok_or_else(|| bad("runs", "id"))
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "dormant-workspace")]
 pub(crate) struct TerminalCohortFacts {
     pub(crate) cohort_id: String,
     pub(crate) migration_version: u64,
@@ -131,6 +142,7 @@ pub(crate) struct TerminalCohortFacts {
     pub(crate) created_at: WorkspaceInstant,
     pub(crate) completed_at: Option<WorkspaceInstant>,
 }
+#[cfg(feature = "dormant-workspace")]
 pub(crate) async fn read_cohort_tx(
     tx: &mut Transaction<'_, Sqlite>,
     hold: &LegacyRecoveryHold,
@@ -176,6 +188,7 @@ pub(crate) async fn read_cohort_tx(
     Ok(facts)
 }
 #[derive(Debug, Clone, PartialEq)]
+#[cfg(feature = "dormant-workspace")]
 pub(crate) struct TerminalApprovalFacts {
     pub(crate) id: String,
     pub(crate) run_id: String,
@@ -192,6 +205,7 @@ pub(crate) struct TerminalApprovalFacts {
     pub(crate) expires_at: WorkspaceInstant,
     pub(crate) decided_at: Option<WorkspaceInstant>,
 }
+#[cfg(feature = "dormant-workspace")]
 fn decode_approval(row: &SqliteRow) -> WorkspaceResult<TerminalApprovalFacts> {
     let created_at = instant(row, "approvals", "created_at")?;
     let expires_at = instant(row, "approvals", "expires_at")?;
@@ -227,6 +241,7 @@ fn decode_approval(row: &SqliteRow) -> WorkspaceResult<TerminalApprovalFacts> {
         decided_at,
     })
 }
+#[cfg(feature = "dormant-workspace")]
 pub(crate) async fn read_approval_tx(
     tx: &mut Transaction<'_, Sqlite>,
     approval_id: &str,
@@ -246,6 +261,7 @@ pub(crate) async fn read_approval_tx(
         .then_some(facts)
         .ok_or_else(|| bad("approvals", "id"))
 }
+#[cfg(feature = "dormant-workspace")]
 pub(crate) async fn read_pending_approvals_tx(
     tx: &mut Transaction<'_, Sqlite>,
     run_id: &str,
@@ -269,6 +285,7 @@ pub(crate) async fn read_pending_approvals_tx(
         })
         .collect()
 }
+#[cfg(feature = "dormant-workspace")]
 pub(crate) async fn read_all_approvals_tx(
     tx: &mut Transaction<'_, Sqlite>,
     run_id: &str,
@@ -292,6 +309,7 @@ pub(crate) async fn read_all_approvals_tx(
         })
         .collect()
 }
+#[cfg(feature = "dormant-workspace")]
 pub(crate) async fn read_workspace_tx(
     tx: &mut Transaction<'_, Sqlite>,
     hold: &LegacyRecoveryHold,
@@ -311,6 +329,7 @@ pub(crate) async fn read_workspace_tx(
     }
     Ok(workspace)
 }
+#[cfg(feature = "dormant-workspace")]
 pub(crate) async fn read_run_lease_tx(
     tx: &mut Transaction<'_, Sqlite>,
     hold: &LegacyRecoveryHold,
@@ -345,8 +364,10 @@ pub(crate) async fn read_run_lease_tx(
     Ok(Some(lease))
 }
 #[rustfmt::skip]
+#[cfg(feature = "dormant-workspace")]
 pub(crate) async fn read_run_lease_history_tx(tx: &mut Transaction<'_, Sqlite>, hold: &LegacyRecoveryHold) -> WorkspaceResult<Vec<WorkspaceLeaseRow>> { sqlx::query("SELECT * FROM workspace_leases WHERE owner_id=? COLLATE BINARY AND kind='run' COLLATE BINARY ORDER BY lease_id COLLATE BINARY").bind(hold.run_id()).fetch_all(&mut **tx).await.map_err(|_| WorkspaceStoreError::Database)?.iter().map(WorkspaceLeaseRow::decode).collect() }
 #[derive(Debug, Clone, PartialEq)]
+#[cfg(feature = "dormant-workspace")]
 pub(crate) struct TerminalAuditFacts {
     pub(crate) seq: i64,
     pub(crate) ts: WorkspaceInstant,
@@ -356,12 +377,14 @@ pub(crate) struct TerminalAuditFacts {
     pub(crate) prev_hash: String,
     pub(crate) hash: String,
 }
+#[cfg(feature = "dormant-workspace")]
 fn valid_hash(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
+#[cfg(feature = "dormant-workspace")]
 fn decode_audit(row: &SqliteRow) -> WorkspaceResult<TerminalAuditFacts> {
     let seq = row
         .try_get::<i64, _>("seq")
@@ -386,6 +409,7 @@ fn decode_audit(row: &SqliteRow) -> WorkspaceResult<TerminalAuditFacts> {
     }
     Ok(facts)
 }
+#[cfg(feature = "dormant-workspace")]
 pub(crate) async fn read_audit_tx(
     tx: &mut Transaction<'_, Sqlite>,
     seq: i64,
@@ -404,6 +428,7 @@ pub(crate) async fn read_audit_tx(
 }
 /// Looks up only the canonical terminal record.  Retrying terminalization must
 /// never treat a merely similar audit entry as evidence of a prior apply.
+#[cfg(feature = "dormant-workspace")]
 pub(crate) async fn read_exact_terminal_audits_tx(
     tx: &mut Transaction<'_, Sqlite>,
     ts: &WorkspaceInstant,
@@ -423,6 +448,7 @@ pub(crate) async fn read_exact_terminal_audits_tx(
     .map_err(|_| WorkspaceStoreError::Database)?;
     rows.iter().map(decode_audit).collect()
 }
+#[cfg(feature = "dormant-workspace")]
 pub(crate) async fn verify_audit_tx(
     tx: &mut Transaction<'_, Sqlite>,
     expected: &TerminalAuditFacts,
@@ -450,6 +476,7 @@ pub(crate) async fn verify_audit_tx(
     Ok(())
 }
 #[derive(Debug, Clone, PartialEq)]
+#[cfg(feature = "dormant-workspace")]
 pub(crate) struct TerminalReleaseSnapshot {
     pub(crate) run: TerminalRunFacts,
     pub(crate) hold: LegacyRecoveryHold,
@@ -462,6 +489,7 @@ pub(crate) struct TerminalReleaseSnapshot {
 }
 
 #[cfg(test)]
+#[cfg(feature = "dormant-workspace")]
 mod tests {
     #![allow(clippy::unwrap_used)]
 

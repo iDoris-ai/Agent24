@@ -4,7 +4,7 @@ version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Agent24 ML worker client (M-D/D4a): Rust-side wire contract + HTTP client for the Python ML worker (embedding/whisper; LoRA training later)"
+description = "experimental: Agent24 ML worker client (M-D/D4a). Rust-side wire contract + HTTP client for a Python ML worker that has no product caller. Not a workspace default-member (S1-7)."
 
 [dependencies]
 agent24-protocol = { path = "../agent24-protocol" }

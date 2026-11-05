@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::WorkspaceError;
 use std::fs::File;
 
@@ -107,6 +105,10 @@ impl ManagedParent {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "G1 managed-parent mkdir; allocation create_for_intent and root tests are the callers"
+    )]
     pub(crate) fn create_root(&self, name: &str) -> Result<PinnedWorkspaceRoot> {
         validate_name(name)?;
         match fs::mkdirat(&self.file, name, Mode::RWXU) {

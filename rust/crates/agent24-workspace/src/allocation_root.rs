@@ -4,8 +4,6 @@
 //! Its input is the exact persisted intent snapshot a later composition layer
 //! must supply; its output is only an owned directory handle and evidence.
 
-#![allow(dead_code)] // Dormant until the later store-composition slice owns it.
-
 use crate::{
     WorkspaceError,
     root::{ManagedParent, RootIdentity},
@@ -64,6 +62,10 @@ impl AllocationRootIntent {
         &self.locator
     }
 
+    #[allow(
+        dead_code,
+        reason = "G1 host admission reads the generation; resolve_host_root is the caller"
+    )]
     pub(crate) fn root_generation(&self) -> &str {
         &self.root_generation
     }
@@ -89,6 +91,10 @@ pub(crate) struct PinnedAllocationRoot {
 
 impl PinnedAllocationRoot {
     /// Create the locator only for this exact intent and immediately pin it.
+    #[allow(
+        dead_code,
+        reason = "G1 allocation root creation; tests and later G slices are the callers"
+    )]
     pub(crate) fn create_for_intent(
         parent: &ManagedParent,
         intent: AllocationRootIntent,
@@ -116,6 +122,10 @@ impl PinnedAllocationRoot {
     }
 
     #[cfg(unix)]
+    #[allow(
+        dead_code,
+        reason = "G1 pinned-root proof; create_for_intent and its tests read it"
+    )]
     pub(crate) fn identity(&self) -> RootIdentity {
         self.identity
     }
@@ -169,6 +179,10 @@ fn from_workspace_root(
 }
 
 #[cfg(unix)]
+#[allow(
+    dead_code,
+    reason = "G1 allocation root creation body; PinnedAllocationRoot::create_for_intent is the caller"
+)]
 fn create_for_intent(
     parent: &ManagedParent,
     intent: AllocationRootIntent,

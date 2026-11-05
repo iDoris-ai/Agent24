@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::{
     LegacyRecoveryHold, RecoveryState, WorkspaceInstant, WorkspaceLeaseRow, WorkspaceResult,
     WorkspaceStoreError, terminal_helpers::TerminalReleaseSnapshot,

@@ -174,6 +174,8 @@ pub(crate) async fn strict_audit_tail_tx(
 }
 
 impl StrictAuditTail {
+    /// Next hash-chained tuple. Only the dormant G3 retention writer calls this.
+    #[cfg(feature = "dormant-workspace")]
     pub(crate) fn prospective(
         &self,
         ts: &str,
@@ -403,7 +405,7 @@ impl Store {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "dormant-workspace"))]
 mod tests {
     use super::*;
 

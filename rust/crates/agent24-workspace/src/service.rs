@@ -1,6 +1,9 @@
 //! Trusted composition of persisted workspace root evidence with pinned filesystem roots.
-
-#![allow(dead_code)] // Dormant until the host admission/lease slice wires the service.
+//!
+//! `compose`, `bind_run_authority`, and the pinned read/write path are on the
+//! product path (`agent24d` startup, the agent loop, local tools). Host-lease
+//! admission beyond that binding is still unwired; unused items carry their own
+//! allow instead of a file-wide one.
 
 use agent24_store::{Store, WorkspaceInstant, WorkspaceLeaseId, WorkspaceStoreError};
 use std::path::{Component, Path, PathBuf};
@@ -68,6 +71,10 @@ pub struct WorkspaceRunAuthority {
 /// Run `WorkspaceHandle`. Keeping the descriptor alive pins the object identity;
 /// the path is retained only for the future trusted host handoff.
 #[cfg(unix)]
+#[allow(
+    dead_code,
+    reason = "G1 host admission result; product path stops at compose, tests and later G slices construct it"
+)]
 pub(crate) struct ResolvedHostWorkspaceRoot {
     workspace_id: WorkspaceId,
     root_generation: String,
@@ -98,6 +105,10 @@ impl WorkspaceService {
     /// Lifecycle, TTL, capability, and lease admission intentionally remain out
     /// of this slice.
     #[cfg(unix)]
+    #[allow(
+        dead_code,
+        reason = "G1 host admission is not on the product path; tests and later G slices call it"
+    )]
     pub(crate) async fn resolve_host_root(
         &self,
         workspace_id: &WorkspaceId,
@@ -381,12 +392,20 @@ fn store_now() -> Result<WorkspaceInstant> {
         .map_err(|_| WorkspaceError::InfrastructureUnavailable { reason: "clock" })
 }
 
+#[allow(
+    dead_code,
+    reason = "test clock helper for workspace composition; not on the product path"
+)]
 fn store_instant_from_epoch_millis(millis: u64) -> Result<WorkspaceInstant> {
     let text = agent24_core::util::iso8601_from_epoch_millis(millis);
     WorkspaceInstant::parse(&text).map_err(|_| WorkspaceError::RootUnavailable { reason: "clock" })
 }
 
 #[cfg(unix)]
+#[allow(
+    dead_code,
+    reason = "G1 host-root view; only resolve_host_root tests read these until the G slices bind a run"
+)]
 impl ResolvedHostWorkspaceRoot {
     pub(crate) fn workspace_id(&self) -> &WorkspaceId {
         &self.workspace_id
