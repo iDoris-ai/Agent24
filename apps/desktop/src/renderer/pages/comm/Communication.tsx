@@ -52,7 +52,10 @@ function hyphaeStoppable(component: ComponentView | null): boolean {
 function hyphaeLabel(component: ComponentView, t: (key: keyof typeof communicationMessages.en, vars?: Record<string, string | number>) => string): string {
   if (component.state === 'ready') return t('process.running')
   if (component.state === 'starting') return t('process.starting')
-  if (component.state === 'stopped') return component.reason === 'not_configured' ? t('process.notConfigured') : t('process.stopped')
+  if (component.state === 'stopped') {
+    if (component.reason === 'locked') return t('process.locked')
+    return component.reason === 'not_configured' ? t('process.notConfigured') : t('process.stopped')
+  }
   if (component.state === 'failed') {
     if (component.reason === 'locked') return t('process.locked')
     if (component.reason === 'gave_up') return t('process.gaveUp')
@@ -512,7 +515,7 @@ export default function CommunicationPage() {
   const serviceStoppable = hyphaeStoppable(hyphae)
   const stopTitle = serviceStoppable ? undefined
     : hyphaePhase.kind !== 'ready' || hyphae === null ? t('action.stopUnavailable')
-    : hyphae.state === 'failed' && hyphae.reason === 'locked' ? t('action.stopLocked')
+    : (hyphae.state === 'stopped' || hyphae.state === 'failed') && hyphae.reason === 'locked' ? t('action.stopLocked')
     : t('action.stopIdle')
   const revealLabel = (() => {
     const hint = typeof navigator === 'undefined' ? '' : (navigator.platform || navigator.userAgent)

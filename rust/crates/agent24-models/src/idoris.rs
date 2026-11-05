@@ -243,8 +243,10 @@ impl IdorisGateway {
             .map_err(response_error)?;
         if identity.service == "idoris" && !contract_version_accepted(&identity.contract_version) {
             return Err(invalid(&format!(
-                "iDoris contract_version {:?} not supported: expected 1.x and >= 1.0.1",
-                identity.contract_version
+                "iDoris contract_version {:?} not supported: expected major {}, minor >= {}",
+                identity.contract_version,
+                agent24_idoris::IdorisLock::embedded().contract_major,
+                agent24_idoris::IdorisLock::embedded().min_contract_minor
             )));
         }
         if identity.service != "idoris"
@@ -474,22 +476,11 @@ fn gateway_body(req: &CompletionRequest, role: &str) -> serde_json::Value {
     body
 }
 
-/// 契约版本检查：major == 1 且 (minor, patch) >= (0, 1)，即 1.x 且 >= 1.0.1。
-/// 必须恰为 `主.次.修` 三段十进制整数；多余段、前导 `v`、空串一律拒绝。
-/// 预发布/构建后缀（如 `-rc1`、`+build`）保守起见一律拒绝。
+/// Managed and external iDoris use the same pinned contract requirements.
 fn contract_version_accepted(v: &str) -> bool {
-    let mut parts = v.split('.');
-    let mut next = || -> Option<u64> {
-        let p = parts.next()?;
-        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        p.parse().ok()
-    };
-    let (Some(major), Some(minor), Some(patch)) = (next(), next(), next()) else {
-        return false;
-    };
-    parts.next().is_none() && major == 1 && (minor, patch) >= (0, 1)
+    agent24_idoris::IdorisLock::embedded()
+        .check_contract(v)
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -547,7 +538,7 @@ mod tests {
                     sent.take().unwrap().send(()).unwrap();
                     std::future::pending::<()>().await;
                 }
-                let body = r#"{"service":"idoris","version":"0.3.0","contract_version":"1.0.1","instance_id":"fixture","dev_no_key_enabled":false}"#;
+                let body = serde_json::json!({"service":"idoris","version":"0.3.0","contract_version":agent24_idoris::IdorisLock::embedded().tested_contract_version,"instance_id":"fixture","dev_no_key_enabled":false}).to_string();
                 socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
             }
         });
@@ -593,11 +584,32 @@ mod tests {
     }
 
     #[test]
-    fn contract_version_range_is_1x_at_least_1_0_1() {
-        for ok in ["1.0.1", "1.0.2", "1.1.0", "1.9.3"] {
+    fn s1_4_gateway_contract_matches_managed_lock() {
+        for version in [
+            "1.0.0",
+            "1.0.1",
+            "1.0.99",
+            "1.1.0",
+            "1.9.3",
+            "2.0.0",
+            "1.1.0-rc1",
+            "1.1.0+build",
+            "invalid",
+        ] {
+            assert_eq!(
+                contract_version_accepted(version),
+                agent24_idoris::IdorisLock::embedded()
+                    .check_contract(version)
+                    .is_ok(),
+                "{version}"
+            );
+        }
+        for ok in ["1.1.0", "1.9.3"] {
             assert!(contract_version_accepted(ok), "should accept {ok:?}");
         }
-        for bad in ["1.0.0", "0.9.9", "2.0.0", "1.1", "v1.1.0", "1.1.0-rc1", ""] {
+        for bad in [
+            "1.0.0", "1.0.1", "1.0.99", "0.9.9", "2.0.0", "1.1", "v1.1.0", "",
+        ] {
             assert!(!contract_version_accepted(bad), "should reject {bad:?}");
         }
     }
