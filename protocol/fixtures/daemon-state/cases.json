@@ -322,6 +322,126 @@
         "outcome": "rejected",
         "reason": "invalid"
       }
+    },
+    {
+      "name": "port 4321.0 (float form)",
+      "text": "{\"port\":4321.0,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"g\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "port 4.321e3 (exponent form)",
+      "text": "{\"port\":4.321e3,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"g\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "port -0",
+      "text": "{\"port\":-0,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"g\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "port 4321.0000000000001",
+      "text": "{\"port\":4321.0000000000001,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"g\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "pid 999.0",
+      "text": "{\"port\":4321,\"pid\":999.0,\"version\":\"v\",\"token\":\"t\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "token with lone surrogate",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"\\ud800\",\"generation\":\"g\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "version with lone surrogate",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"\\ud800\",\"token\":\"t\",\"generation\":\"g\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "lone trailing surrogate in a known field (generation)",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"\\udc00\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "valid surrogate pair is fine",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"\\ud83d\\ude00\",\"token\":\"t\",\"generation\":\"g\"}",
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "t"
+      }
+    },
+    {
+      "name": "escaped backslash before ud800 is not a surrogate",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"\\\\ud800\",\"token\":\"t\",\"generation\":\"g\"}",
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "t"
+      }
+    },
+    {
+      "name": "protocol_version null is accepted",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"g\",\"protocol_version\":null}",
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "t"
+      }
+    },
+    {
+      "name": "auth_mode in serde map form {legacy_single_token:null}",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"g\",\"auth_mode\":{\"legacy_single_token\":null}}",
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "t"
+      }
+    },
+    {
+      "name": "lone surrogate inside an unknown field is ignored (serde skips it)",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"g\",\"extra\":\"\\ud800\"}",
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "t"
+      }
+    },
+    {
+      "name": "lone trailing surrogate inside an unknown field is ignored",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"g\",\"extra\":\"\\udc00\"}",
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "t"
+      }
+    },
+    {
+      "name": "float in an unknown field is ignored",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"g\",\"extra\":1.5e3}",
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "t"
+      }
     }
   ]
 }

@@ -46,7 +46,14 @@ export type DaemonStateReason =
 
 export type DaemonStateResult =
   | { ok: true; state: DaemonState }
-  | { ok: false; reason: DaemonStateReason; message: string }
+  | {
+      ok: false
+      reason: DaemonStateReason
+      message: string
+      /** Present when the record was refused but still names a plausible port and pid, so a caller can
+       * tell "a daemon we cannot read is running" from "no daemon". Never a credential. */
+      endpoint?: { port: number; pid: number }
+    }
 
 const fail = (reason: DaemonStateReason, message: string): DaemonStateResult => ({ ok: false, reason, message })
 
@@ -57,38 +64,98 @@ function isUint(v: unknown, max: number): v is number {
 const KNOWN_FIELDS = new Set([
   'port', 'token', 'pid', 'version', 'generation', 'auth_mode', 'protocol_version', 'enroll_endpoint', 'startup_state',
 ])
+/** Known fields whose string value Rust decodes (and so rejects when it holds a lone surrogate). */
+const STRING_FIELDS = new Set(['token', 'version', 'generation', 'auth_mode', 'enroll_endpoint', 'startup_state'])
 
-/** First known top-level key that appears more than once in already-valid JSON text, else null.
- * Keys are compared after JSON string decoding (`"p\u006frt"` is `port`), like serde. */
-function duplicateKnownKey(raw: string): string | null {
+interface TopLevelScan {
+  /** First known top-level key that appears more than once, else null. */
+  duplicate: string | null
+  /** Raw number literal text of each top-level key whose value is a number. */
+  numbers: Map<string, string>
+  /** A known string field whose value holds a lone surrogate escape (serde_json refuses it; JSON.parse does not). */
+  loneSurrogate: string | null
+}
+
+/** True when a raw JSON string literal (with quotes) holds an unpaired \uD800-\uDFFF escape. */
+function hasLoneSurrogate(literal: string): boolean {
+  for (let k = 0; k < literal.length; k++) {
+    if (literal[k] !== '\\') continue
+    if (literal[k + 1] !== 'u') {
+      k++
+      continue
+    }
+    const code = parseInt(literal.slice(k + 2, k + 6), 16)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const low = /^\\u([dD][c-fC-F][0-9a-fA-F]{2})/.exec(literal.slice(k + 6, k + 12))
+      if (!low) return true
+      k += 11
+    } else if (code >= 0xdc00 && code <= 0xdfff) return true
+    else k += 5
+  }
+  return false
+}
+
+/** Lexical pass over text that JSON.parse already accepted. JSON.parse hides what serde sees:
+ * repeated keys (last wins), number spelling (`4321.0`, `4.321e3`, `-0` all become integers)
+ * and lone surrogates. Keys are compared after JSON string decoding (`"p\\u006frt"` is `port`). */
+function scanTopLevel(raw: string): TopLevelScan {
+  const out: TopLevelScan = { duplicate: null, numbers: new Map(), loneSurrogate: null }
   const seen = new Set<string>()
   let depth = 0
   let expectKey = false
+  let key: string | null = null
   for (let i = 0; i < raw.length; i++) {
-    const ch = raw[i]
+    const ch = raw[i] as string
     if (ch === '"') {
       let j = i + 1
       while (raw[j] !== '"') j += raw[j] === '\\' ? 2 : 1
       if (depth === 1 && expectKey) {
-        const key = JSON.parse(raw.slice(i, j + 1)) as string
+        key = JSON.parse(raw.slice(i, j + 1)) as string
         expectKey = false
         if (KNOWN_FIELDS.has(key)) {
-          if (seen.has(key)) return key
+          if (seen.has(key) && out.duplicate === null) out.duplicate = key
           seen.add(key)
         }
+      } else if (depth === 1 && key !== null) {
+        if (STRING_FIELDS.has(key) && out.loneSurrogate === null && hasLoneSurrogate(raw.slice(i, j + 1))) out.loneSurrogate = key
+        key = null
       }
       i = j
     } else if (ch === '{' || ch === '[') {
       depth++
       expectKey = depth === 1 && ch === '{'
+      if (depth > 1) key = null
     } else if (ch === '}' || ch === ']') depth--
-    else if (ch === ',' && depth === 1) expectKey = true
+    else if (ch === ',' && depth === 1) {
+      expectKey = true
+      key = null
+    } else if (depth === 1 && key !== null && (ch === '-' || (ch >= '0' && ch <= '9'))) {
+      const m = /^[-+0-9.eE]+/.exec(raw.slice(i)) as RegExpExecArray
+      out.numbers.set(key, m[0])
+      i += m[0].length - 1
+      key = null
+    }
   }
-  return null
+  return out
 }
 
-/** Pure parse + validate of the file's text. Messages never contain field values (the file holds a bearer). */
+/** Pure parse + validate of the file's text. A refused record that still names a
+ * port and a pid carries them in `endpoint` (see {@link DaemonStateResult}). Messages never contain field values (the file holds a bearer). */
 export function parseDaemonState(raw: string): DaemonStateResult {
+  const r = parseStrict(raw)
+  if (r.ok) return r
+  try {
+    const o = JSON.parse(raw) as Record<string, unknown> | null
+    if (o && typeof o === 'object' && isUint(o['port'], 0xffff) && isUint(o['pid'], 0xffff_ffff)) {
+      return { ...r, endpoint: { port: o['port'], pid: o['pid'] } }
+    }
+  } catch {
+    /* not JSON: no endpoint */
+  }
+  return r
+}
+
+function parseStrict(raw: string): DaemonStateResult {
   let json: unknown
   try {
     json = JSON.parse(raw)
@@ -96,10 +163,14 @@ export function parseDaemonState(raw: string): DaemonStateResult {
     return fail('malformed', 'not valid JSON')
   }
   if (typeof json !== 'object' || json === null || Array.isArray(json)) return fail('malformed', 'not a JSON object')
-  // JSON.parse lets a later duplicate silently win; Rust serde rejects a repeated
-  // known field, so must we (else {"auth_mode":"capabilities",…,"auth_mode":"legacy_single_token"} passes here only).
-  const dup = duplicateKnownKey(raw)
-  if (dup !== null) return fail('invalid', `duplicate field ${dup}`)
+  const scan = scanTopLevel(raw)
+  if (scan.duplicate !== null) return fail('invalid', `duplicate field ${scan.duplicate}`)
+  // port/pid/protocol_version are unsigned integers in serde: only a plain digit run is one.
+  for (const k of ['port', 'pid', 'protocol_version']) {
+    const lit = scan.numbers.get(k)
+    if (lit !== undefined && !/^(0|[1-9][0-9]*)$/.test(lit)) return fail('invalid', `${k} is not a plain unsigned integer`)
+  }
+  if (scan.loneSurrogate !== null) return fail('invalid', `${scan.loneSurrogate} holds a lone surrogate`)
   const o = json as Record<string, unknown>
 
   if (!isUint(o['port'], 0xffff)) return fail('invalid', 'port missing or not a u16')
@@ -116,7 +187,12 @@ export function parseDaemonState(raw: string): DaemonStateResult {
   const generation = strOrDefault('generation')
   if (generation === null) return fail('invalid', 'generation is not a string')
 
-  const mode = o['auth_mode']
+  let mode = o['auth_mode']
+  // serde also reads a unit variant in its map form: {"capabilities": null}.
+  if (typeof mode === 'object' && mode !== null && !Array.isArray(mode)) {
+    const entries = Object.entries(mode)
+    if (entries.length === 1 && entries[0]?.[1] === null) mode = entries[0][0]
+  }
   let authMode: DaemonAuthModeName
   if (mode === undefined || mode === 'legacy_single_token') authMode = 'legacy_single_token'
   else if (mode === 'capabilities') authMode = 'capabilities'
@@ -139,17 +215,23 @@ export function parseDaemonState(raw: string): DaemonStateResult {
     state[field] = v
   }
 
-  // validate()
-  if (state.enrollEndpoint !== undefined && authMode !== 'capabilities') {
-    return fail('inconsistent', 'enroll_endpoint is valid only in capabilities auth mode')
-  }
-  if (authMode === 'legacy_single_token') {
-    if (token === '') return fail('inconsistent', 'legacy_single_token auth mode requires a non-empty token')
-  } else {
-    if (token !== '') return fail('inconsistent', 'capabilities auth mode must not contain a token')
-    if (generation === '') return fail('inconsistent', 'capabilities auth mode requires a daemon generation')
-  }
+  const inconsistent = validateState(state)
+  if (inconsistent !== null) return fail('inconsistent', inconsistent)
   return { ok: true, state }
+}
+
+/** Mirror of Rust `DaemonState::validate()`: null when consistent, else the reason. */
+function validateState(state: DaemonState): string | null {
+  if (state.enrollEndpoint !== undefined && state.authMode !== 'capabilities') {
+    return 'enroll_endpoint is valid only in capabilities auth mode'
+  }
+  if (state.authMode === 'legacy_single_token') {
+    if (state.token === '') return 'legacy_single_token auth mode requires a non-empty token'
+  } else {
+    if (state.token !== '') return 'capabilities auth mode must not contain a token'
+    if (state.generation === '') return 'capabilities auth mode requires a daemon generation'
+  }
+  return null
 }
 
 /** `<data_dir>/daemon.json` (throws DataDirError when the root is unresolvable). */
@@ -172,6 +254,8 @@ export type DaemonBearer = { ok: true; token: string } | { ok: false; message: s
 
 /** Mirror of Rust `bearer_token()`: only a legacy record yields a bearer; capabilities fails closed. */
 export function daemonBearer(state: DaemonState): DaemonBearer {
+  // Like Rust: re-validate, so a hand-built or mutated state cannot yield a bearer.
+  if (validateState(state) !== null) return { ok: false, message: 'invalid daemon discovery state' }
   if (state.authMode === 'capabilities') {
     return { ok: false, message: 'daemon is in capabilities auth mode: host authority is not in daemon.json' }
   }

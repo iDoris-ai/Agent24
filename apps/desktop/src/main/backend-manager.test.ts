@@ -117,7 +117,8 @@ describe('readExternalDaemonState (DEP-A5 daemon.json discovery)', () => {
 
   it('refuses an unknown auth_mode (no longer read as capabilities), and reads a record without one as legacy', () => {
     writeState({ port: 1, token: 'x', pid: 2, version: 'v', auth_mode: 'something_new' })
-    expect(readExternalDaemonState()).toBeNull()
+    // Refused, but still a pid and port: reported as rejected (never reusable, never a token), not as "nothing there".
+    expect(readExternalDaemonState()).toEqual({ port: 1, token: '', pid: 2, authMode: 'capabilities', rejected: expect.stringContaining('auth_mode') })
     writeState({ port: 1, token: 'x', pid: 2, version: 'v' })
     expect(readExternalDaemonState()?.authMode).toBe('legacy')
   })
@@ -134,7 +135,10 @@ describe('readExternalDaemonState (DEP-A5 daemon.json discovery)', () => {
         fs.mkdirSync(dir, { recursive: true })
         fs.writeFileSync(path.join(dir, 'daemon.json'), c.text ?? JSON.stringify(c.json))
         const got = readExternalDaemonState()
-        if (c.expect.outcome === 'rejected') expect(got).toBeNull()
+        if (c.expect.outcome === 'rejected') {
+          // Never reusable: no record, or a `rejected` one carrying no token.
+          if (got !== null) expect(got).toMatchObject({ rejected: expect.any(String), token: '' })
+        }
         else if (c.expect.outcome === 'capabilities') expect(got).toMatchObject({ authMode: 'capabilities', token: '' })
         else expect(got).toMatchObject({ authMode: 'legacy', token: c.expect.bearer })
       })
@@ -917,6 +921,56 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
     expect(children[1].kill).toHaveBeenCalledWith('SIGTERM')
 
     manager.stop()
+  })
+
+  it('a live daemon whose daemon.json the strict parser refuses (unknown auth_mode) is incompatible, never spawned over', async () => {
+    vi.useFakeTimers()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const spawnProcess = vi.fn(() => fakeChild(111))
+    const external: ExternalDaemonSource = {
+      ...launchAgent(),
+      read: () => ({ port: 5555, token: '', pid: 4242, authMode: 'capabilities', rejected: 'unknown auth_mode' }),
+      checkHealth: vi.fn().mockResolvedValue(false),
+      isAlive: () => true,
+      fetchHealth: vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
+    }
+    const manager = new BackendManager({ external, spawnProcess })
+    try {
+      await manager.start()
+      expect(external.fetchHealth).toHaveBeenCalledWith({ port: 5555 })
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(manager.isExternalDaemon()).toBe(false)
+      expect(getBackendEndpoint()).toBeNull()
+      expect(manager.status()).toBe('error')
+      expect(manager.statusDetail()).toMatchObject({ kind: 'protocol_mismatch', pid: 4242, reason: 'unknown auth_mode' })
+      for (let i = 0; i < MAX_HEALTH_FAILURES + 2; i++) await vi.advanceTimersByTimeAsync(HEALTH_INTERVAL_MS)
+      expect(spawnProcess).not.toHaveBeenCalled()
+    } finally {
+      manager.stop()
+      warn.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it('a refused record whose pid is alive stays incompatible even when /health does not answer', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const spawnProcess = vi.fn(() => fakeChild(111))
+    const external: ExternalDaemonSource = {
+      ...launchAgent(),
+      read: () => ({ port: 5555, token: '', pid: 4242, authMode: 'capabilities', rejected: 'unknown auth_mode' }),
+      checkHealth: vi.fn().mockResolvedValue(false),
+      isAlive: () => true,
+      fetchHealth: vi.fn().mockResolvedValue({ ok: false, protocolVersion: null }),
+    }
+    const manager = new BackendManager({ external, spawnProcess })
+    try {
+      await manager.start()
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(manager.status()).toBe('error')
+    } finally {
+      manager.stop()
+      warn.mockRestore()
+    }
   })
 
   it('does not spawn over an incompatible external daemon, and the health loop does not retry', async () => {

@@ -362,7 +362,11 @@ mod tests {
             match expect["outcome"].as_str().unwrap() {
                 "legacy" => {
                     let s = parsed.unwrap_or_else(|e| panic!("{name}: {e}"));
-                    assert_eq!(s.bearer_token(), Ok(expect["bearer"].as_str().unwrap()), "{name}");
+                    assert_eq!(
+                        s.bearer_token(),
+                        Ok(expect["bearer"].as_str().unwrap()),
+                        "{name}"
+                    );
                 }
                 "capabilities" => {
                     let s = parsed.unwrap_or_else(|e| panic!("{name}: {e}"));

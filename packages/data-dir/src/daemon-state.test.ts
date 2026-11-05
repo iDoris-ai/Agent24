@@ -74,4 +74,20 @@ describe('daemon-state: fields and files', () => {
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  it('a refused record that still names port and pid carries them as endpoint (never the token)', () => {
+    const r = parseDaemonState(JSON.stringify({ port: 7, pid: 8, version: 'v', token: 's3cr3t', auth_mode: 'future_mode' }))
+    expect(r).toMatchObject({ ok: false, reason: 'invalid', endpoint: { port: 7, pid: 8 } })
+    expect(JSON.stringify(r)).not.toContain('s3cr3t')
+    expect(parseDaemonState('{not json')).not.toHaveProperty('endpoint')
+    expect(parseDaemonState(JSON.stringify({ pid: 8, token: 't', version: 'v' }))).not.toHaveProperty('endpoint')
+  })
+
+  it('daemonBearer re-validates like Rust bearer_token(): a mutated state yields no bearer', () => {
+    const r = parseDaemonState(JSON.stringify({ port: 1, pid: 2, version: 'v', token: 't' }))
+    if (!r.ok) throw new Error('fixture')
+    expect(daemonBearer(r.state)).toEqual({ ok: true, token: 't' })
+    expect(daemonBearer({ ...r.state, enrollEndpoint: '/e' }).ok).toBe(false)
+    expect(daemonBearer({ ...r.state, authMode: 'capabilities', generation: '' }).ok).toBe(false)
+  })
 })

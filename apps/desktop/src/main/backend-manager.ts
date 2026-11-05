@@ -37,6 +37,8 @@ export interface BackendStatusDetail {
   readonly clientVersion: number
   readonly recordedVersion?: number
   readonly pid: number
+  /** Set when daemon.json was refused by the strict parser (e.g. an auth_mode this app does not know). */
+  readonly reason?: string
 }
 
 export interface BackendEndpoint {
@@ -263,6 +265,9 @@ export interface ExternalDaemonState {
   authMode: DaemonAuthMode
   /** Absent when daemon.json was written before version negotiation. */
   protocolVersion?: number
+  /** The strict parser refused this record but it still names a pid and port: never reusable,
+   * yet a live daemon may hold the singleton lock, so it must not read as "nothing there". */
+  rejected?: string
 }
 
 /** One `GET /api/v1/health`. `protocolVersion: null` means the field is absent. */
@@ -289,7 +294,13 @@ export function readExternalDaemonState(): ExternalDaemonState | null {
   // record that fails its validation — including an unknown `auth_mode`, which
   // this function used to treat as "capabilities" — is nothing to reuse.
   const read = readDaemonState(statePath)
-  if (!read.ok) return null
+  if (!read.ok) {
+    // File absent / unreadable / not a daemon record: nothing there. A refused record that
+    // still names a pid and port (a newer auth_mode, a bad field) is a daemon we cannot
+    // talk to, which is a different thing: callers probe it and must not spawn over it.
+    if (read.endpoint === undefined) return null
+    return { port: read.endpoint.port, pid: read.endpoint.pid, token: '', authMode: 'capabilities', rejected: read.message }
+  }
   const { state } = read
   // Only a legacy record shares its token through this file; capability mode
   // keeps host authority private (token is '' there, by validation).
@@ -594,6 +605,12 @@ export class BackendManager {
     }
     const health = await this.external.fetchHealth({ port: state.port })
     if (lifecycle !== this.lifecycle) return 'superseded'
+    if (state.rejected !== undefined) {
+      // A live pid wrote a record this app refuses to parse. It holds the singleton
+      // lock, so spawning would loop forever: report it, never `absent`. Never reused.
+      this.foreignPid = null
+      return this.refuseExternal(state, health.ok ? health.protocolVersion : null)
+    }
     if (!health.ok) {
       // Nothing answered. A leftover daemon.json must not block spawn, and a
       // peer that previously blocked us has released the lock.
@@ -670,8 +687,10 @@ export class BackendManager {
     const detail: BackendStatusDetail = {
       kind: 'protocol_mismatch', daemonVersion, clientVersion: CLIENT_PROTOCOL_VERSION,
       recordedVersion: state.protocolVersion, pid: state.pid,
+      ...(state.rejected === undefined ? {} : { reason: state.rejected }),
     }
     const already = this.blockedReason?.pid === detail.pid
+      && this.blockedReason.reason === detail.reason
       && this.blockedReason.daemonVersion === detail.daemonVersion
       && this.blockedReason.recordedVersion === detail.recordedVersion
     this.blockedReason = detail
