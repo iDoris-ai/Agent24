@@ -159,6 +159,10 @@ fn from_idoris(
         IdorisState::Stopped => (S::Stopped, None),
         IdorisState::Starting => (S::Starting, None),
         IdorisState::Running => (S::Ready, None),
+        // `ContractMismatch` comes from the supervisor's `/health` check as a whole: a wrong
+        // contract version, but also a wrong `service`, an empty `instance_id` or dev-no-key.
+        // Each means the installed binary is not the one this daemon can drive, so all are
+        // `incompatible` rather than a crash.
         IdorisState::Failed if error == Some(agent24d::idoris_host::Code::ContractMismatch) => {
             (S::Incompatible, Some("component_contract_mismatch"))
         }
