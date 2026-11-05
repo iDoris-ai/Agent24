@@ -6,6 +6,8 @@ import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
+import { OPEN_DESIGN_PIN_VERSION } from './pack-open-design-component.mjs'
+
 const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 const stageScript = path.join(scriptDir, 'stage-open-design-resources.mjs')
 
@@ -15,7 +17,7 @@ function seedValidSource(root) {
     'open-design',
     'open-design-web-standalone',
   ]) fs.mkdirSync(path.join(root, relative), { recursive: true })
-  fs.writeFileSync(path.join(root, 'app/package.json'), JSON.stringify({ version: '0.26.1' }))
+  fs.writeFileSync(path.join(root, 'app/package.json'), JSON.stringify({ version: OPEN_DESIGN_PIN_VERSION }))
   for (const relative of [
     'app/prebundled/agent24-headless.cjs',
     'app/prebundled/agent24-headless.mjs',
@@ -39,7 +41,7 @@ test('stages a valid tree with a direct in-tree relative symlink', () => {
     seedValidSource(tmp)
     fs.writeFileSync(path.join(tmp, 'open-design/target.txt'), 'ok')
     fs.symlinkSync('target.txt', path.join(tmp, 'open-design/link.txt'))
-    assert.match(runStage(tmp), /Staged Open Design 0\.26\.1 resources/)
+    assert.ok(runStage(tmp).includes(`Staged Open Design ${OPEN_DESIGN_PIN_VERSION} resources`))
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
   }

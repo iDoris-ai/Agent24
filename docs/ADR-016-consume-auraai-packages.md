@@ -2,7 +2,8 @@
 
 索引：[架构总入口](architecture/README.md)・[ADR 索引](adr/README.md)
 
-**状态**: 进行中（migration 分支活跃）
+**规范编号**: ADR-016P（P = packages；与 `docs/decision.md` 里的 ADR-016「模块安全与权限模型」无关）
+**状态**: 被替代（2026-11-04 订正；原：进行中（migration 分支活跃））。取代者：ADR-026 §6 收缩了本 ADR 的范围，ADR-037 决策 1（REV-01，#1371）完成清理。证据：所有 `package.json` 零 `@auraaihq/*` 依赖，迁移分支已不存在；唯一残留是 `packages/node-daemon/src/module-discovery.ts:26` 的 scope 常量
 **日期**: 2026-05-15
 **作者**: jason / jhfnetboy
 

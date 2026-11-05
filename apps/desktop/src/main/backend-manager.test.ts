@@ -13,6 +13,7 @@ import {
   daemonAcceptsToken,
   requestDaemonShutdown,
   readExternalDaemonState,
+  processAlive,
   BackendManager,
   DAEMON_EXIT_WAIT_MS,
   selectedBackend,
@@ -88,9 +89,9 @@ describe('readExternalDaemonState (DEP-A5 daemon.json discovery)', () => {
   })
 
   it('keeps protocol_version when daemon.json has it, and leaves it off when the file is old', () => {
-    writeState({ port: 4321, token: 'abc', pid: 999, protocol_version: 1 })
+    writeState({ port: 4321, token: 'abc', pid: 999, version: 'v', protocol_version: 1 })
     expect(readExternalDaemonState()).toEqual({ port: 4321, token: 'abc', pid: 999, authMode: 'legacy', protocolVersion: 1 })
-    writeState({ port: 4321, token: 'abc', pid: 999 })
+    writeState({ port: 4321, token: 'abc', pid: 999, version: 'v' })
     expect(readExternalDaemonState()?.protocolVersion).toBeUndefined()
   })
 
@@ -111,15 +112,38 @@ describe('readExternalDaemonState (DEP-A5 daemon.json discovery)', () => {
   })
 
   it('marks a capability-mode record, which shares no token', () => {
-    writeState({ port: 1, pid: 2, auth_mode: 'capabilities', generation: 'g1' })
+    writeState({ port: 1, pid: 2, version: 'v', auth_mode: 'capabilities', generation: 'g1' })
     expect(readExternalDaemonState()).toEqual({ port: 1, token: '', pid: 2, authMode: 'capabilities' })
   })
 
-  it('treats an unknown auth_mode as not shareable, and a record without one as legacy', () => {
-    writeState({ port: 1, token: 'x', pid: 2, auth_mode: 'something_new' })
-    expect(readExternalDaemonState()?.authMode).toBe('capabilities')
-    writeState({ port: 1, token: 'x', pid: 2 })
+  it('refuses an unknown auth_mode (no longer read as capabilities), and reads a record without one as legacy', () => {
+    writeState({ port: 1, token: 'x', pid: 2, version: 'v', auth_mode: 'something_new' })
+    // Refused, but still a pid and port: reported as rejected (never reusable, never a token), not as "nothing there".
+    expect(readExternalDaemonState()).toEqual({ port: 1, token: '', pid: 2, authMode: 'capabilities', rejected: expect.stringContaining('auth_mode') })
+    writeState({ port: 1, token: 'x', pid: 2, version: 'v' })
     expect(readExternalDaemonState()?.authMode).toBe('legacy')
+  })
+
+  // The shared daemon.json fixture (protocol/fixtures/daemon-state): data-dir, documents-accept and both bridges run the same file.
+  describe('shared fixture', () => {
+    const fixture = path.join(__dirname, '../../../../protocol/fixtures/daemon-state/cases.json')
+    const cases = (JSON.parse(fs.readFileSync(fixture, 'utf8')) as {
+      cases: Array<{ name: string; json?: unknown; text?: string; expect: { outcome: 'legacy' | 'capabilities' | 'rejected'; bearer?: string } }>
+    }).cases
+    for (const c of cases) {
+      it(c.name, () => {
+        const dir = path.join(tmpHome, '.agent24')
+        fs.mkdirSync(dir, { recursive: true })
+        fs.writeFileSync(path.join(dir, 'daemon.json'), c.text ?? JSON.stringify(c.json))
+        const got = readExternalDaemonState()
+        if (c.expect.outcome === 'rejected') {
+          // Never reusable: no record, or a `rejected` one carrying no token.
+          if (got !== null) expect(got).toMatchObject({ rejected: expect.any(String), token: '' })
+        }
+        else if (c.expect.outcome === 'capabilities') expect(got).toMatchObject({ authMode: 'capabilities', token: '' })
+        else expect(got).toMatchObject({ authMode: 'legacy', token: c.expect.bearer })
+      })
+    }
   })
 
   it('returns null when HOME is unset — mirrors the Rust state_dir() contract', () => {
@@ -150,7 +174,7 @@ describe('readExternalDaemonState (DEP-A5 daemon.json discovery)', () => {
     writeState({ port: 1111, token: 'home', pid: 1 })
     const dataDir = path.join(tmpHome, 'isolated')
     fs.mkdirSync(dataDir, { recursive: true })
-    fs.writeFileSync(path.join(dataDir, 'daemon.json'), JSON.stringify({ port: 2222, token: 'iso', pid: 2 }))
+    fs.writeFileSync(path.join(dataDir, 'daemon.json'), JSON.stringify({ port: 2222, token: 'iso', pid: 2, version: 'v' }))
     process.env['AGENT24_DATA_DIR'] = dataDir
     expect(readExternalDaemonState()).toEqual({ port: 2222, token: 'iso', pid: 2, authMode: 'legacy' })
   })
@@ -898,6 +922,145 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
     expect(children[1].kill).toHaveBeenCalledWith('SIGTERM')
 
     manager.stop()
+  })
+
+  it('a live daemon whose daemon.json the strict parser refuses (unknown auth_mode) is incompatible, never spawned over', async () => {
+    vi.useFakeTimers()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const spawnProcess = vi.fn(() => fakeChild(111))
+    const external: ExternalDaemonSource = {
+      ...launchAgent(),
+      read: () => ({ port: 5555, token: '', pid: 4242, authMode: 'capabilities', rejected: 'unknown auth_mode' }),
+      checkHealth: vi.fn().mockResolvedValue(false),
+      isAlive: () => true,
+      fetchHealth: vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
+    }
+    const manager = new BackendManager({ external, spawnProcess })
+    try {
+      await manager.start()
+      expect(external.fetchHealth).toHaveBeenCalledWith({ port: 5555 })
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(manager.isExternalDaemon()).toBe(false)
+      expect(getBackendEndpoint()).toBeNull()
+      expect(manager.status()).toBe('error')
+      expect(manager.statusDetail()).toMatchObject({ kind: 'protocol_mismatch', pid: 4242, reason: 'unknown auth_mode' })
+      for (let i = 0; i < MAX_HEALTH_FAILURES + 2; i++) await vi.advanceTimersByTimeAsync(HEALTH_INTERVAL_MS)
+      expect(spawnProcess).not.toHaveBeenCalled()
+    } finally {
+      manager.stop()
+      warn.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it('a refused record whose pid is alive stays incompatible even when /health does not answer', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const spawnProcess = vi.fn(() => fakeChild(111))
+    const external: ExternalDaemonSource = {
+      ...launchAgent(),
+      read: () => ({ port: 5555, token: '', pid: 4242, authMode: 'capabilities', rejected: 'unknown auth_mode' }),
+      checkHealth: vi.fn().mockResolvedValue(false),
+      isAlive: () => true,
+      fetchHealth: vi.fn().mockResolvedValue({ ok: false, protocolVersion: null }),
+    }
+    const manager = new BackendManager({ external, spawnProcess })
+    try {
+      await manager.start()
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(manager.status()).toBe('error')
+    } finally {
+      manager.stop()
+      warn.mockRestore()
+    }
+  })
+
+  describe('a refused daemon.json (rejected) and who may spawn', () => {
+    const rejected = (pid: number): ExternalDaemonState => ({ port: 5555, token: '', pid, authMode: 'capabilities', rejected: 'unknown auth_mode' })
+    const silent = { ok: false, protocolVersion: null }
+
+    it('processAlive: pid 0 (own process group), pid 1 (EPERM) and junk are never a daemon; a real pid is', () => {
+      expect(processAlive(0)).toBe(false)
+      expect(processAlive(1)).toBe(false)
+      expect(processAlive(-5)).toBe(false)
+      expect(processAlive(Number.NaN)).toBe(false)
+      expect(processAlive(process.pid)).toBe(true)
+    })
+
+    for (const pid of [0, 1]) {
+      it(`pid ${pid} is no live daemon: the record is stale and the manager spawns`, async () => {
+        const spawnProcess = vi.fn(() => fakeChild(111))
+        const external: ExternalDaemonSource = {
+          ...launchAgent(), read: () => rejected(pid), checkHealth: vi.fn(), isAlive: processAlive, fetchHealth: vi.fn(),
+        }
+        const manager = new BackendManager({ external, spawnProcess })
+        await manager.start()
+        expect(spawnProcess).toHaveBeenCalledTimes(1)
+        expect(external.fetchHealth).not.toHaveBeenCalled()
+        manager.stop()
+      })
+    }
+
+    it('a dead pid is stale: spawns (a live-pid-only guard would let this regress silently)', async () => {
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const external: ExternalDaemonSource = {
+        ...launchAgent(), read: () => rejected(4242), checkHealth: vi.fn(), isAlive: () => false, fetchHealth: vi.fn(),
+      }
+      const manager = new BackendManager({ external, spawnProcess })
+      await manager.start()
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      manager.stop()
+    })
+
+    it('silent /health: ticks never spawn, but after 3 silent probes the tray start works and the detail says to delete daemon.json', async () => {
+      vi.useFakeTimers()
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const external: ExternalDaemonSource = {
+        ...launchAgent(), read: () => rejected(4242), checkHealth: vi.fn(), isAlive: () => true, fetchHealth: vi.fn().mockResolvedValue(silent),
+      }
+      const manager = new BackendManager({ external, spawnProcess })
+      try {
+        await manager.start() // probe 1
+        expect(manager.statusDetail()?.hint).toBeUndefined()
+        manager.startDaemon()
+        expect(spawnProcess).not.toHaveBeenCalled() // still blocked: too early
+        await vi.advanceTimersByTimeAsync(HEALTH_INTERVAL_MS) // probe 2
+        expect(spawnProcess).not.toHaveBeenCalled()
+        await vi.advanceTimersByTimeAsync(HEALTH_INTERVAL_MS) // probe 3
+        expect(spawnProcess).not.toHaveBeenCalled() // the automatic loop never spawns
+        expect(manager.statusDetail()).toMatchObject({ reason: 'unknown auth_mode', hint: 'delete_daemon_json' })
+        manager.startDaemon()
+        expect(spawnProcess).toHaveBeenCalledTimes(1)
+      } finally {
+        manager.stop()
+        warn.mockRestore()
+        vi.useRealTimers()
+      }
+    })
+
+    it('an answering /health resets the count: the tray start stays blocked', async () => {
+      vi.useFakeTimers()
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const fetchHealth = vi.fn().mockResolvedValue(silent)
+      const external: ExternalDaemonSource = {
+        ...launchAgent(), read: () => rejected(4242), checkHealth: vi.fn(), isAlive: () => true, fetchHealth,
+      }
+      const manager = new BackendManager({ external, spawnProcess })
+      try {
+        await manager.start()
+        await vi.advanceTimersByTimeAsync(HEALTH_INTERVAL_MS)
+        fetchHealth.mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION })
+        await vi.advanceTimersByTimeAsync(HEALTH_INTERVAL_MS * 3)
+        manager.startDaemon()
+        expect(spawnProcess).not.toHaveBeenCalled()
+        expect(manager.statusDetail()?.hint).toBeUndefined()
+      } finally {
+        manager.stop()
+        warn.mockRestore()
+        vi.useRealTimers()
+      }
+    })
   })
 
   it('does not spawn over an incompatible external daemon, and the health loop does not retry', async () => {

@@ -228,6 +228,46 @@ pub fn start_time(_pid: i32) -> io::Result<ProcStart> {
     ))
 }
 
+/// The one Apple Developer ID Team ID that signs every first-party Agent24
+/// binary. Lock files, release scripts and package metadata repeat this value;
+/// `tests/team_id_consistency.rs` fails if any of them drifts from it.
+pub const DEVELOPER_ID_TEAM_ID: &str = "HYAP444FN9";
+
+/// The code requirement for "signed by this Developer ID team", shared by the
+/// install-time check (`agent24-components`, which prefixes the `=` that
+/// `codesign -R` needs) and the enrol-time check below, so the two cannot drift.
+///
+/// It demands the Developer ID chain markers (intermediate
+/// 1.2.840.113635.100.6.2.6 and the Developer ID Application leaf
+/// 1.2.840.113635.100.6.1.13), so a Mac App Store or Apple Development
+/// certificate of the same team does not pass.
+pub fn developer_id_requirement(team_id: &str) -> Result<String, InvalidTeamId> {
+    if !valid_team_id(team_id) {
+        // The id is interpolated into a code requirement: never pass junk through.
+        return Err(InvalidTeamId);
+    }
+    Ok(format!(
+        "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
+         and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
+         and certificate leaf[subject.OU] = \"{team_id}\""
+    ))
+}
+
+/// Not a ten-character `[A-Z0-9]` Apple Team ID. Returned instead of panicking
+/// because the value comes from lock files and configuration, and a security
+/// check must fail closed (reject) rather than abort the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidTeamId;
+
+/// Apple Team IDs are ten upper-case letters or digits. The one rule for both
+/// install-time and enrol-time checks.
+pub fn valid_team_id(team_id: &str) -> bool {
+    team_id.len() == 10
+        && team_id
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn verify_code_identity(
     _token: AuditToken,
@@ -246,9 +286,6 @@ pub fn verify_code_identity(
     use security_framework::os::macos::code_signing::{
         Flags, GuestAttributes, SecCode, SecRequirement,
     };
-    if !team_id.bytes().all(|b| b.is_ascii_alphanumeric()) || team_id.is_empty() {
-        return Err(IdentityError::RequirementFailed);
-    }
     let mut attributes = GuestAttributes::new();
     use core_foundation::{base::TCFType, data::CFData};
     let bytes: Vec<u8> = token.0.iter().flat_map(|v| v.to_ne_bytes()).collect();
@@ -256,10 +293,10 @@ pub fn verify_code_identity(
     attributes.set_audit_token(data.as_concrete_TypeRef());
     let code = SecCode::copy_guest_with_attribues(None, &attributes, Flags::NONE)
         .map_err(|_| IdentityError::SignatureInvalid)?;
-    let requirement: SecRequirement =
-        format!("anchor apple generic and certificate leaf[subject.OU] = \"{team_id}\"")
-            .parse()
-            .map_err(|_| IdentityError::RequirementFailed)?;
+    let requirement: SecRequirement = developer_id_requirement(team_id)
+        .map_err(|_| IdentityError::RequirementFailed)?
+        .parse()
+        .map_err(|_| IdentityError::RequirementFailed)?;
     // SecCode validates both the signature and the requirement before we read
     // identifier/path metadata. A failed certificate trust requirement does
     // not mean that the executable is unsigned or its signature is corrupt.
@@ -458,6 +495,73 @@ mod tests {
             .is_ok()
         );
     }
+    #[test]
+    fn developer_id_requirement_demands_chain_markers_and_team() {
+        let req = developer_id_requirement(DEVELOPER_ID_TEAM_ID).unwrap();
+        assert!(req.starts_with("anchor apple generic and "));
+        assert!(req.contains("certificate 1[field.1.2.840.113635.100.6.2.6] exists"));
+        assert!(req.contains("certificate leaf[field.1.2.840.113635.100.6.1.13] exists"));
+        assert!(req.ends_with("certificate leaf[subject.OU] = \"HYAP444FN9\""));
+    }
+
+    #[test]
+    fn developer_id_requirement_rejects_malformed_team_ids() {
+        for junk in [
+            "",
+            "short",
+            "hyap444fn9",
+            "HYAP444FN99",
+            "HYAP444FN\"",
+            "HYAP444FN9\" or true",
+            "Apple",
+        ] {
+            assert_eq!(
+                developer_id_requirement(junk),
+                Err(InvalidTeamId),
+                "{junk:?}"
+            );
+        }
+    }
+
+    /// S1-2 review F1: the enrol path must build its requirement from
+    /// `developer_id_requirement` and no other literal, or the install and
+    /// enrol checks can drift apart again.
+    #[test]
+    fn enrol_check_uses_the_shared_requirement_and_no_other_literal() {
+        let full = include_str!("lib.rs");
+        let src = &full[..full.find("#[cfg(test)]\nmod tests").unwrap()];
+        let needle = ["anchor", " apple"].concat();
+        assert_eq!(
+            src.matches(needle.as_str()).count(),
+            1,
+            "exactly one literal"
+        );
+        let at = src.find(needle.as_str()).unwrap();
+        let start = src.find("pub fn developer_id_requirement").unwrap();
+        let end = start + src[start..].find("\n}\n").unwrap();
+        assert!(
+            (start..end).contains(&at),
+            "literal lives in developer_id_requirement"
+        );
+        let v = src.find("pub fn verify_code_identity(").unwrap();
+        let macos = v + src[v + 1..].find("pub fn verify_code_identity(").unwrap() + 1;
+        let body = &src[macos..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains("developer_id_requirement(team_id)"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn developer_id_requirement_parses_as_a_sec_requirement() {
+        use security_framework::os::macos::code_signing::SecRequirement;
+        assert!(
+            developer_id_requirement(DEVELOPER_ID_TEAM_ID)
+                .unwrap()
+                .parse::<SecRequirement>()
+                .is_ok()
+        );
+    }
+
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn code_identity_is_unsupported() {

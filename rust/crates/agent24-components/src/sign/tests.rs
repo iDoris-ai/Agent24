@@ -7,10 +7,22 @@ const REQ: SigningRequirement = SigningRequirement {
     notarized: true,
 };
 
+/// S1-2 / E1: install-time and enrol-time use the very same requirement text.
+#[test]
+fn install_requirement_is_the_enrol_requirement() {
+    assert_eq!(
+        team_requirement(agent24_os_proc::DEVELOPER_ID_TEAM_ID).unwrap(),
+        format!(
+            "={}",
+            agent24_os_proc::developer_id_requirement("HYAP444FN9").unwrap()
+        )
+    );
+}
+
 #[test]
 fn requirement_has_the_mandatory_leading_equals() {
     // Without the `=`, codesign reads the value as a file path (#1533).
-    let req = team_requirement("HYAP444FN9");
+    let req = team_requirement("HYAP444FN9").unwrap();
     assert!(req.starts_with("=anchor apple generic and "));
     // Developer ID only: both chain markers, then the team.
     assert!(req.contains("certificate 1[field.1.2.840.113635.100.6.2.6] exists"));
@@ -86,7 +98,7 @@ mod macos {
         let calls = fake.calls.borrow();
         let args = &calls[0].1;
         let at = args.iter().position(|a| a == "-R").unwrap();
-        assert_eq!(args[at + 1], team_requirement("HYAP444FN9"));
+        assert_eq!(args[at + 1], team_requirement("HYAP444FN9").unwrap());
         assert!(args.contains(&"--strict".to_owned()));
         assert!(!args.contains(&"--deep".to_owned()));
     }
@@ -396,11 +408,11 @@ mod macos {
             .unwrap();
         // An unmet Team ID requirement: "unmet", never a file error.
         assert!(matches!(
-            verifier.check_requirement(&exe, &team_requirement("HYAP444FN9"), false),
+            verifier.check_requirement(&exe, &team_requirement("HYAP444FN9").unwrap(), false),
             Err(InstallError::SignatureMismatch)
         ));
         // Without the leading `=` codesign would treat the text as a file path.
-        let no_equals = team_requirement("HYAP444FN9").replacen('=', "", 1);
+        let no_equals = team_requirement("HYAP444FN9").unwrap().replacen('=', "", 1);
         assert!(
             matches!(
                 verifier.check_requirement(&exe, &no_equals, false),

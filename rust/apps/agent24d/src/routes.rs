@@ -1105,7 +1105,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
         let fixture = axum::Router::new()
-            .route("/health", axum::routing::get(|| async { Json(serde_json::json!({"service":"idoris","version":"0.3.1-fixture","contract_version":"1.0.1","instance_id":"fixture-instance","dev_no_key_enabled":false})) }))
+            .route("/health", axum::routing::get(|| async { Json(serde_json::json!({"service":"idoris","version":"0.3.1-fixture","contract_version":agent24_idoris::IdorisLock::embedded().tested_contract_version,"instance_id":"fixture-instance","dev_no_key_enabled":false})) }))
             .route("/v1/chat/completions", axum::routing::post(move || { let count=count.clone(); async move {
                 count.fetch_add(1, Ordering::SeqCst);
                 ([("x-idoris-record-id", RECORD),("x-idoris-served-locality","loopback")], Json(serde_json::json!({"model":"fixture-real","choices":[{"message":{"role":"assistant","content":"receipt answer"}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}})))

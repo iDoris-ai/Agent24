@@ -1,5 +1,7 @@
 # ADR-040：技能契约 v1（草案）
 
+> **初稿编号：DRAFT-F040**（Fable 初稿）。本文标题里的「ADR-04x」是初稿当时的编号，与 `docs/adr/` 下的同号 ADR 不是一回事；最终版是 ADR-040（[技能契约 v1](../../../adr/ADR-040-skill-contract-v1.md)）。编号规则见 [ADR 索引](../../../adr/README.md)。
+
 - 状态：**提议**（2026-11-01，Fable 初稿，待 Codex 挑战与 jason 拍板）
 - 上位：[ADR-039 概念模型](../../../adr/ADR-039-concept-model.md) §2.3、§3 规则 3、§6
 - 相关：[ADR-038 组件契约 v1](../../../adr/ADR-038-component-contract-v1.md) D9（能力 id、`skills` 占位）、`docs/specs/SPEC-SKILL-DISTRIBUTION.md`（三来源与版本播种，设计定稿未实现）、issue #1037、ADR-K1-03（逐工具授权）

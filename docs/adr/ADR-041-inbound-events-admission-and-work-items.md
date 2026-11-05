@@ -2,7 +2,7 @@
 
 索引：[架构总入口](../architecture/README.md)・[ADR 索引](README.md)
 
-- 状态：**提议**（2026-11-01，三步评审终稿，待 jason 拍板）
+- 状态：**拆分为两份**（2026-11-04 订正，jason 拍板，Q9）。**ADR-041a「入站事件与准入」= D1–D4、D10：已接受**；**ADR-041b「工单、授权依据与订阅」= D5–D9：提议**。拆分只改状态，不改文件名和条款编号。Q12 X11 另有要求：所有外部触发 agent 干活的入口（Nostr 入站、语音输入、远程 @agent 消息、手机遥控）统一走本 ADR 的准入关卡，遥控只是准入的一种来源。原状态：提议（2026-11-01，三步评审终稿）
 - 上位：[ADR-039](ADR-039-concept-model.md) §2.1（本体职责）、§3 规则 1（能力向本体发事件，由本体按触发规则、经审批决定）、§4「资源」、§5 第三问；ADR-037 决策 2（常驻 daemon）
 - 相关：[ADR-038](ADR-038-component-contract-v1.md) D9（组件清单）；ADR-K1-02 §2.1.1（分类 / 处理模式 / 授权三维度）；ADR-K1-03 §1、§3（逐工具授权、撤销）；ADR-MEMORY-P1 §9④（在途与外部副本）；[ADR-040](ADR-040-skill-contract-v1.md) D6（主动技能）；[ADR-042](ADR-042-durable-actions-and-reconciliation.md)（交付记录）
 - 依据：[演进终稿](../research/deepseek-superagent/SUPERAGENT-EVOLUTION-2026-11-01.md) §2 裁决 1、2、4、10、11；原型 `docs/001-domain.md`、`002-authorization.md`、`003-execution.md`（固定提交 `6337fc8`，裁判全文读过）；[SOURCES](../research/deepseek-superagent/SOURCES.md) S3、S4、S6

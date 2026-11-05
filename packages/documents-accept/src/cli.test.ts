@@ -260,7 +260,7 @@ describe('main', () => {
     const calls: Call[] = []
     vi.stubGlobal('fetch', fakeFetch(daemon(odd), calls))
     const state = path.join(temp(), 'daemon.json')
-    fs.writeFileSync(state, JSON.stringify({ port: 1, token: 'tok-9f3a1c' }))
+    fs.writeFileSync(state, JSON.stringify({ port: 1, token: 'tok-9f3a1c', pid: 1, version: '0.0.0' }))
     return { state, calls }
   }
 

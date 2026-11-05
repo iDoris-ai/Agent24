@@ -172,24 +172,16 @@ pub struct CodesignWith<R>(pub R);
 
 /// The requirement for "signed by this Developer ID team". The leading `=` is
 /// mandatory: without it codesign reads the value as a file path (#1533).
-/// It also demands the Developer ID chain markers (intermediate 1.2.840.113635.100.6.2.6
-/// and the Developer ID Application leaf 1.2.840.113635.100.6.1.13), so a Mac App Store or
-/// development certificate of the same team does not pass.
-pub fn team_requirement(team_id: &str) -> String {
-    format!(
-        "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
-         and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
-         and certificate leaf[subject.OU] = \"{team_id}\""
-    )
+/// The requirement text itself is `agent24_os_proc::developer_id_requirement`,
+/// the same one the daemon applies at enrol time (S1-2 / E1).
+pub fn team_requirement(team_id: &str) -> Result<String, InstallError> {
+    agent24_os_proc::developer_id_requirement(team_id)
+        .map(|r| format!("={r}"))
+        .map_err(|_| InstallError::SignatureMismatch)
 }
 
-/// Apple Team IDs are ten upper-case letters or digits.
-pub fn valid_team_id(team_id: &str) -> bool {
-    team_id.len() == 10
-        && team_id
-            .bytes()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-}
+/// Apple Team IDs are ten upper-case letters or digits (the shared os-proc rule).
+pub use agent24_os_proc::valid_team_id;
 
 impl<R: CommandRunner> CodesignWith<R> {
     /// One `codesign --verify --strict -R` run. A requirement that is not met is
@@ -233,13 +225,9 @@ impl<R: CommandRunner> SignatureVerifier for CodesignWith<R> {
     }
     fn verify(&self, executable: &Path, required: &SigningRequirement) -> Result<(), InstallError> {
         self.check_platform()?;
-        if !valid_team_id(required.team_id) {
-            // The id is interpolated into a codesign requirement: never pass junk through.
-            return Err(InstallError::SignatureMismatch);
-        }
         // Bundles (.app/.framework/.xpc directories) need --deep.
         let deep = executable.is_dir();
-        self.check_requirement(executable, &team_requirement(required.team_id), deep)?;
+        self.check_requirement(executable, &team_requirement(required.team_id)?, deep)?;
         let path = executable.to_string_lossy();
         let details = self.0.run(CODESIGN, &["-dv", "--verbose=4", &path])?;
         if !details.success {

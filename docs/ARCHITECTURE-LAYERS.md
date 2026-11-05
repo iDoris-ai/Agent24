@@ -2,7 +2,7 @@
 
 索引：[架构总入口](architecture/README.md)・[ADR 索引](adr/README.md)
 
-> 初稿写于 2026-10-03（main `122fff7`）。**2026-11-01 更新：对应 main `bb434b61`，这次是「对照代码的事实修正」**——只改与代码不符的状态、依赖图和未完成清单，结构不动。
+> 初稿写于 2026-10-03（main `122fff7`）。**2026-11-05 重新生成：对应 main `f818b0bf`**（架构优化方案第 0 期 S0-5，[方案 §4.1](tracking/2026-11-04/ARCH-OPTIMIZATION-PLAN.md)）。依赖表由 `scripts/gen-layer-deps.py` 从 `cargo metadata` 生成；其余文字按 R1 / R3 两份梳理报告（`docs/architecture/review-2026-11-03/`，在分支 `docs/arch-review-r1-module-map`、`docs/arch-review-r3-adr-docs` 上）逐条订正，冲突处以 main 代码为准。上一版是 2026-11-01（`bb434b61`）。
 > 本文是**导航性总览**：解释各层是什么、彼此什么关系、将来扩展会互相影响到哪里。
 > 每一层的权威细节在文中链接的 ADR / spec / 设计文档里；两者冲突时，以那些文档和**代码**为准，并回来修正本文。
 
@@ -24,7 +24,7 @@
 │   SidecarManager ✅ 托管 Open Design（POSIX 独立进程组；C8）           │
 │ agent24-cli（含 `agent24 acp` ✅ ACP→REST/WS 映射桥）                  │
 │ packages/：api-client（生成客户端）· contract-tests · nostr/wechat 桥 │
-│            · node-daemon（v1 协议的 mock / 参考实现 daemon）          │
+│            · node-daemon（开发用旧 API mock，只覆盖 v1 的 4/124 个 op） │
 └──────────────┬───────────────────────────────────────────────────────┘
                │ REST / WS + bearer（capability 令牌；legacy 单 token 仍可用）
 ┌──────────────▼──────────── L6 扩展面（四类"外挂"）────────────────────┐
@@ -32,18 +32,19 @@
 │ ② 进程外领域 OS ✅（ME-3/ME-4/K1：Sin90 / Cos72 / Documents）          │
 │ ③ 附着模块 ✅（A3：AgentEar，CORE-2 登记）                             │
 │ ④ Sidecar 集成（Open Design）：现行 ✅ SidecarManager 托管 + ACP 桥；   │
-│    目标形态 🟡 + agent24-sidecar-host + CreativeRuntime                │
+│    sidecar-host 已冻结（Q1=(b)，#1580/#1584），Windows 排期后再议      │
 │ （另：MCP server 的工具 ✅ → 包装成普通 Tool 走同一条审批流水线）       │
-└──────────────┬───────────────────────────────────────────────────────┘
-┌──────────────▼──────── L5½ 领域 OS 运行时（agent24d 依赖）────────────┐
-│ os-proto（启动/握手/监管/受约束代理/分帧）· os-fd（继承 fd 接管）      │
-│ os-packages（包发现与原子安装）· os-sdk（给模块作者的 SDK）            │
 └──────────────┬───────────────────────────────────────────────────────┘
 ┌──────────────▼──────── L5 组合根：agent24d ────────────────────────────┐
 │ v1 API、领域 OS 挂载与监管、附着注册表、审批/调度/推理/记忆回调        │
 │ capability 令牌 ✅（Desktop 默认；一方外壳 enroll/elevate；默认拒绝）   │
 │   路由级资源授权 📐 未实现；CLI/--auth-mode 缺省仍是 legacy 单 token    │
 │ 组件托管：iDoris 托管、Hyphae 按需安装、Knowledge 宿主接口、模块工具 K1 │
+│ 统一组件状态 /api/v1/components（ADR-038 C3）                          │
+└──────────────┬───────────────────────────────────────────────────────┘
+┌──────────────▼──────── L4½ 领域 OS 运行时（L5 与 L6 共用）──────────┐
+│ os-proto（启动/握手/监管/受约束代理/分帧）· os-fd（继承 fd 接管）      │
+│ os-packages（包发现与原子安装）· os-sdk（给模块作者的 SDK）            │
 └──────────────┬───────────────────────────────────────────────────────┘
 ┌──────────────▼──────── L4 运行时内核：agent24-agent ───────────────────┐
 │ run 生命周期 + agent loop                                               │
@@ -51,13 +52,15 @@
 ┌──────────────▼──────── L3 内核能力服务 ────────────────────────────────┐
 │ models（网关 + TaskProfile 路由） tools（工具流水线）                   │
 │ policy（fail-closed 审批 + 可选 Guardian） memory（M-D）                │
-│ scheduler · mcp · comm（Hyphae） · hw · decide 🟡 · components · idoris │
-│ knowledge · worker 🟡（ML Worker 契约，无消费者）                        │
+│ scheduler · mcp · comm（Hyphae，例外：自带 REST 面） · hw · decide 🟡    │
+│ components（通用组件机制）· idoris（建在 components 之上）             │
+│ knowledge · worker 🟡（ML Worker 契约，无消费者）· documents-client      │
 └──────────────┬───────────────────────────────────────────────────────┘
 ┌──────────────▼──────── L2 权威与持久化 ────────────────────────────────┐
 │ store：SQLite + 哈希链审计 + workspace 注册表/租约/分配/保留/恢复       │
 │ workspace：WorkspaceService / WorkspaceHandle（描述符钉住的根）          │
 │   └ os-cwd：post-fork fchdir，把子进程 cwd 钉在 workspace 内             │
+│ 平台原语：os-proc（进程身份，CORE-2）· os-sqlite（SQLite 在线备份）     │
 └──────────────┬───────────────────────────────────────────────────────┘
 ┌──────────────▼──────── L1 纯领域核心：agent24-core ────────────────────┐
 │ 零框架依赖的状态机（ADR-026）                                           │
@@ -68,35 +71,66 @@
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.1 真实依赖图（`cargo metadata`，只计正常依赖，省略 `agent24-` 前缀）
+### 1.1 真实依赖图（`cargo metadata`，省略 `agent24-` 前缀）
 
-| crate | 依赖 |
-|---|---|
-| protocol / sidecar-host-protocol / os-fd / os-cwd / os-proc / os-sqlite / worker / comm / hw / knowledge / documents-client | （无内部依赖） |
-| core、domain | protocol |
-| models | domain, protocol |
-| idoris | hw |
-| components | idoris |
-| decide | hw |
-| store | core, protocol |
-| workspace | core, protocol, store, os-cwd |
-| tools | domain, protocol, store, workspace |
-| memory | core, models, store |
-| policy | core, domain, models, protocol, store, tools |
-| scheduler | core, protocol, store |
-| mcp | domain, protocol, tools |
-| agent | core, domain, memory, models, protocol, scheduler, store, tools, workspace（policy 仅 dev 依赖：审批门由 agent24d 注入） |
-| os-proto | domain, os-fd |
-| os-packages | domain, os-proto |
-| os-sdk | os-proto |
-| documents（`apps/agent24-documents`，进程外领域 OS 二进制） | os-sdk |
-| **agent24d** | agent, comm, components, core, decide, domain, hw, idoris, knowledge, mcp, memory, models, os-packages, os-proc, os-proto, os-sqlite, policy, protocol, scheduler, store, tools, workspace（os-sdk 仅 dev 依赖） |
-| agent24-cli | documents-client, hw, mcp, os-packages, protocol, store（`decide export`/`delete` 直接读写 `agent24.db`，不经过 daemon，见 ADR-034） |
-| agent24-sidecar-host | sidecar-host-protocol（**没有任何 app 依赖它，Desktop 也不调用**） |
+下表由脚本生成，不手改。重新生成：
 
-依赖方向一律向下，没有向上依赖。`agent24d` 是内核运行时的组合根，`comm` 编译进 agent24d（但不依赖其它内部 crate）；`worker` 当前没有消费者；`decide` 只被 agent24d 的 `GET /api/v1/decide/profile` 消费（D0-1，见下）；`hw` 被 decide / idoris / agent24d / agent24-cli 依赖；`components` 的下载器借用 `idoris`（见 §7）；`knowledge` 被 agent24d 的 Knowledge 宿主接口和工具使用；`agent24-sidecar-host` 是另一个独立的二进制组合根，只依赖自己的协议 crate。
+```
+python3 scripts/gen-layer-deps.py --write   # 重写两个标记之间的内容
+python3 scripts/gen-layer-deps.py --check   # 与 cargo metadata 不一致时退出码为 1
+```
 
-> 表由 `cargo metadata --no-deps` 重新生成（只计正常依赖，2026-11-01）。
+数据来源是 `cargo metadata --no-deps --format-version 1 --manifest-path rust/Cargo.toml`（2026-11-05，main `f818b0bf`）。"正常依赖"不含 dev-dependencies，"仅 dev 依赖"是只出现在 dev-dependencies 里的内部依赖。「层」一列是人工归层，写在脚本的 `LAYER` 表里，新增 crate 没归层脚本会报错。
+
+<!-- BEGIN GENERATED: layer-deps (scripts/gen-layer-deps.py) -->
+| crate | 层 | 正常依赖 | 仅 dev 依赖 |
+|---|---|---|---|
+| domain | L0 | protocol | — |
+| protocol | L0 | （无） | knowledge |
+| sidecar-host-protocol | L0 | （无） | — |
+| core | L1 | protocol | — |
+| os-cwd | L2 | （无） | — |
+| store | L2 | core, protocol | decide |
+| workspace | L2 | core, os-cwd, protocol, store | — |
+| os-proc | L2（平台原语） | （无） | — |
+| os-sqlite | L2（平台原语） | （无） | — |
+| components | L3 | os-proc | — |
+| decide | L3 | hw | — |
+| hw | L3 | （无） | — |
+| idoris | L3 | components, hw | — |
+| knowledge | L3 | （无） | — |
+| mcp | L3 | domain, protocol, tools | — |
+| memory | L3 | core, models, store | — |
+| models | L3 | domain, idoris, protocol | — |
+| policy | L3 | core, domain, models, protocol, store, tools | — |
+| scheduler | L3 | core, protocol, store | — |
+| tools | L3 | domain, protocol, store, workspace | — |
+| worker | L3 | protocol | — |
+| comm | L3（例外：自带 REST 面） | （无） | components |
+| documents-client | L3（客户端库） | （无） | — |
+| agent | L4 | core, domain, memory, models, protocol, scheduler, store, tools, workspace | policy |
+| os-fd | L4½ | （无） | — |
+| os-packages | L4½ | domain, os-proto | — |
+| os-proto | L4½ | domain, os-fd | — |
+| os-sdk | L4½ | os-proto | — |
+| **agent24d** | L5 | agent, comm, components, core, decide, domain, hw, idoris, knowledge, mcp, memory, models, os-packages, os-proc, os-proto, os-sqlite, policy, protocol, scheduler, store, tools, workspace | os-sdk |
+| documents | L6 | os-sdk | domain, os-proto |
+| sidecar-host | L6 | sidecar-host-protocol | — |
+| cli | L7 | documents-client, hw, mcp, os-packages, protocol, store | — |
+
+共 32 个 crate（`cargo metadata` 的 workspace member 数）。
+<!-- END GENERATED: layer-deps -->
+
+读表时的几点说明（手写，依赖表变了要回来核对）：
+
+- 依赖方向一律向下，正常依赖里没有环，也没有下层依赖上层（R1 §3.2 用 DFS 核过）。dev 依赖里有两条反向，只影响测试：`protocol` → `knowledge`、`store` → `decide`。
+- `idoris` 依赖 `components`，不是反过来：`ComponentLock` 和通用下载器在 `components`，iDoris 的 `IdorisLock` 是它之上的视图（ADR-038 C1，#1539；原先 11-01 版写成「`components` 借用 `idoris`」，已不成立，`fetch_verified` 在全仓已不存在）。
+- `agent24d` 是内核运行时的组合根，没有 crate 反向依赖它。`comm` 编译进 `agent24d`，且不依赖其它内部 crate。
+- `worker` 依赖 `protocol`，但没有任何 crate 依赖它。`decide` 只被 `agent24d` 的 `GET /api/v1/decide/profile` 消费。
+- `agent24-cli` 直接链接 `store`（`decide export`/`delete` 直接读写 `agent24.db`，不经过 daemon，见 ADR-034），也直接链接 `os-packages`、`mcp`、`hw`。
+- `sidecar-host` 只依赖自己的协议 crate，没有任何 app 依赖它，Desktop 也不调用。
+- `os-proc`、`os-sqlite` 是操作系统原语，不是领域 OS；`os-` 前缀有两种意思（见 §2 L4½ 的说明和 Q7 的结论：不改名，文档里写清）。
+- `documents-client` 是 L6 组件 documents 的客户端库，只被 CLI 使用，暂放 L3。
 
 ---
 
@@ -119,7 +153,7 @@
 
 零框架依赖的状态机（run、审批等的合法迁移）。store 的普通逐行迁移（如 `transition_run`）调用 core 状态机校验；批量恢复 / 超时类路径（孤儿 run 清扫、审批超时 / 中止）以带条件的 SQL 直接编码允许的迁移边。见 [ADR-026](ADR-026-rust-core-polyglot.md)。
 
-### L2 权威与持久化 — `agent24-store`、`agent24-workspace`、`agent24-os-cwd`
+### L2 权威与持久化 — `agent24-store`、`agent24-workspace`、`agent24-os-cwd`（另有平台原语 `os-proc`、`os-sqlite`）
 
 - **store**：sqlx + SQLite；哈希链审计日志；以及 M10 带进来的 workspace 权威数据：
   - 注册表与租约；
@@ -132,6 +166,10 @@
   - **workspace-bound run**（带 `workspace_id`）：`fs_read` / `fs_write` 的路径经 `WorkspaceHandle` 在钉住的根内解析；`shell_exec` **只**把子进程 cwd 钉在 workspace 根并照常走审批，**不是 OS 沙箱**，命令本身仍可访问根目录之外（ADR-002）。每次需要时重新校验 run / 租约 / workspace 事实。
   - **legacy run**（不带 `workspace_id`，今天的默认情况）：工具上下文是 `ToolContext::legacy`，文件工具退回到工具自身配置的 allowlist 根目录，shell 退回到配置的 `workdir`。
 - **os-cwd**（Unix-only）：只在 fork 之后、exec 之前做 `fchdir(2)`，让子进程 cwd 就是被钉住的目录。
+- **os-proc**（平台原语）：内核侧的进程身份原语（CORE-2 D5），agent24d 的 enroll 端点用它校验对端代码签名身份（macOS）。无内部依赖，只被 agent24d 使用。
+- **os-sqlite**（平台原语）：SQLite 在线备份，直接用 sqlx 已持有的连接句柄。唯一的生产调用方是 CORE-5 的 `migration_guard/snapshot.rs`，随 `ENABLED=false` 一起休眠。
+
+`os-proc`、`os-sqlite` 的 `os` 是「操作系统」，与 L4½ 的 `os-proto` / `os-sdk` / `os-packages` 里的 `os`（「领域 OS」）不是一回事。Q7 已拍板不改名，只在这里写清（R1 §6.1）。
 
 权威：[ADR-002 Workspace 契约](open-design-workspace/design/ADR-002-WORKSPACE-CONTRACT.md)、[ADR-006 Legacy recovery holds](open-design-workspace/design/ADR-006-LEGACY-RECOVERY-HOLDS.md)、[G1/G2 scratch service plan](open-design-workspace/design/G1-G2-SCRATCH-SERVICE-PLAN.md)。
 
@@ -147,38 +185,24 @@
 | `agent24-memory` | M-D 记忆：D1 的 `KvStore` + `CanonicalSession`，以及 artifact / assertion / condenser / consolidator / event / knowledge / retriever / vector / writer 等高层模块 | agent loop **已消费** D1 的 `KvStore` / `CanonicalSession`，并在每次 run 前用 `retriever().search_any` 做跨会话 recall（`agent24-agent/src/session_memory.rs`，受个人记忆暂停开关和预算约束）；event 层被领域 OS 的 memory 回调使用；consolidator 等其余高层是否已被 agent loop 消费未核实 |
 | `agent24-scheduler` | cron / every / at 调度 | 先推进 `next_run_at` 再触发；跳过漏掉的 tick；连续失败自动禁用；ME-4 起可把触发投递给模块 |
 | `agent24-mcp` | 外部 MCP server 适配 | 外部工具包装成普通 `Tool`，与内建工具走同一条审批流水线 |
-| `agent24-comm` | Hyphae（Nostr）CLI 调用、keystore 串行化、密码存储、REST 路由与 daemon 状态 | 二进制哈希校验、密码只走 stdin（[COMM-HYPHAE](design/COMM-HYPHAE.md)） |
+| `agent24-comm`（**显式例外**） | Hyphae（Nostr）CLI 调用、keystore 串行化、密码存储、daemon 监管、NIP-49 备份恢复、群聊，**以及自带的 axum REST 路由** | 锁里的 sha256 加 macOS 签名或公证校验（D2a），拒绝原因 `signature_rejected` / `hash_mismatch`；密码只走 stdin（[COMM-HYPHAE](design/COMM-HYPHAE.md)）。**例外**：L3 里只有它自带对外 REST 面（`comm/src/router.rs`；axum 依赖见 `comm/Cargo.toml`），路由前缀 `/api/v1/comm` 却由 agent24d 的 `comm_routes.rs` 挂载；别的 L3 crate 都只给 trait / 类型，路由留在 L5。这是已知例外，不要照着新增；Q6 已拍板旧 nostr-bridge 以后并入 comm（R1 §3.3） |
 | `agent24-worker` 🟡 | Python ML Worker（embedding / whisper）的 Rust 侧 wire 契约 + HTTP 客户端 | workspace 内没有任何 crate 依赖它 |
-| `agent24-idoris` ✅ | iDoris 托管：固定版本的 release 元数据（`idoris.lock.json`）、下载校验、安装、钥匙串、监督进程（supervisor）、oMLX 探测 | agent24d 的 `idoris_host` / `managed_idoris` 组合它，并把网关接进 `ModelRouter`；只依赖 `agent24-hw` |
-| `agent24-components` ✅ | 组件安装器：`fetch_verified` 按锁定的 URL + sha256 下载并校验发布包 | **借用 iDoris 的下载器和锁结构**（缓存目录必须在 `idoris` 树内），不安装 iDoris 启动器；Hyphae 的按需安装（`agent24d/src/hyphae_install.rs`）走它 |
+| `agent24-documents-client` | L6 组件 documents 的 HTTP 客户端库 | 无内部依赖，只被 `agent24-cli` 使用；归 L3 是本文的暂定放法（R1 §3.1） |
+| `agent24-idoris` ✅ | iDoris 托管：`idoris.lock.json`（schema 2，是 `ComponentLock` 之上的视图）、钥匙串、监督进程（supervisor）、oMLX 探测、运行期契约检查（`check_contract`） | 依赖 `agent24-components` 和 `agent24-hw`；下载、安装、验签用 components（`download.rs` / `install.rs` 只剩薄封装）；agent24d 的 `idoris_host` / `managed_idoris` 组合它并把网关接进 `ModelRouter` |
+| `agent24-components` ✅ | 通用组件机制（ADR-038 C1 / C3）：schema-2 `ComponentLock`、通用下载器（`download_locked_asset` / `download_pinned`）、不可变安装器、macOS 签名或公证校验（`SignatureVerifier`，Install / AtRest 两种模式）、组件状态机 `ComponentState` | **没有内部依赖**，被 `idoris` 和 agent24d 的 `hyphae_install.rs` 使用（C1，#1539）；Hyphae 的按需安装走它。`fetch_verified` 已不存在 |
 | `agent24-knowledge` ✅ | Knowledge v1 wire 类型、HTTP 传输、Mock、Provider 与工具调用层 | agent24d 提供宿主接口（`knowledge_host`，仅 ProductHost 可用）、后端（`knowledge_backend`）和 `knowledge_search` / `knowledge_read` 工具；仅绑定了 Knowledge 的 run 才会拿到这些工具；crate 内 Provider 尚未接线（见 `knowledge_backend.rs` 注释） |
 | `agent24-hw` ✅ | 硬件探测与内存账（HW-1，[ADR-036](decision.md)，设计 [HW-TIERS](design/HW-TIERS-capability-hardware-matrix.md)）：`HardwareProfile` v2（芯片、统一内存、GPU wired 上限、独显、**全部挂载卷**含外接盘、模型目录所在盘余量、电池）+ `HardwareProbe`/`SystemProbe`/`FakeHardwareProbe` + `HwLevel::L1..L6` + `usable_bytes` 预算（`A24_HW_BUDGET_CAP_GB` 可压低以模拟小内存机） | 只依赖 serde/serde_json/sysinfo，不依赖任何其它内部 crate；外部命令（sysctl/sw_vers/pmset/nvidia-smi）全带 2s 超时、失败为 `None`；agent24d 启动时写 `~/.agent24/hardware.json`（`hardware.rs`），`agent24 hw probe` 打印；**runtimes 未探测、能力梯/解析器未做**；HTTP 侧只有经 decide 暴露的 `GET /api/v1/decide/profile` |
 | `agent24-decide` 🟡 | 决策服务（D0-1，[ADR-033](decision.md)）：`DecisionRequest`/`Question`/`Decision` 等类型 + `DecisionBackend` trait + `RuleBackend` + 级联 `DecisionService`；接口形状照 Jev `/v1/systemone`（choice/noul/score + 校准概率）。D0-2（[ADR-034](decision.md)）追加 `log` 模块：决策日志的 `DecisionLog` trait + DTO（`LogEntry`/`OutcomeEntry`/`ExportFilter`/`DeleteSelector`） | 只依赖 `agent24-hw`（硬件探测与分档，ADR-036）；**agent24d 只用它服务 `GET /api/v1/decide/profile`（`decide_routes.rs`），agent loop 里没有调用点**；`DecisionLog` 无实现，等 D1 接线（记住意图 + 召回门控）时才有人实现 `DecisionLog`（预期落在 `agent24d`，ADR-034）。CLI 的 `decide export`/`delete` 直接读写 `agent24.db` |
 
 ### L4 运行时内核 — `agent24-agent`
 
-run 管理器与 agent loop。正常依赖：core / memory / models / protocol / store / tools / workspace。审批门由 agent24d 组合 `agent24-policy` 后注入，`agent24-agent` 自身只在测试里依赖 policy。
+run 管理器与 agent loop。依赖见 §1.1 的生成表。审批门由 agent24d 组合 `agent24-policy` 后注入，`agent24-agent` 自身只在测试里依赖 policy。
 
 **取消**：模型调用、工具执行、审批等待、session 锁和有界的记忆写入这类长等待，都显式与 `CancellationToken` 竞速；少量短的持久化 await（起止状态迁移、写消息）不竞速，只在边界前后检查取消。工具调用全部落库、事件化，被拒绝的全部审计。
 
-### L5 组合根 — `rust/apps/agent24d`
+### L4½ 领域 OS 运行时 — `os-proto`、`os-fd`、`os-packages`、`os-sdk`
 
-内核运行时的组合根：
-
-- **对外 API**：v1 REST + WS（runs、sessions、approvals、comm、os、attached…）。workspace 目前**没有**对外 REST 路由（产品构造、host lease、resolve 都未开放），只能经内部 run 准入路径使用。
-- **鉴权模式**：
-  - `legacy_single_token`（`agent24d serve` 的缺省值）✅：生成一个全权 bearer，写进 `~/.agent24/daemon.json`。Windows 上的 Desktop 和 Node mock daemon 走这条路径。
-  - `capabilities` ✅（Unix 上 Desktop 的默认：`backend-manager.ts` 的 `selectedAuthMode`，以 `--auth-mode capabilities --host-bootstrap-stdio` 拉起）：`daemon.json` 不含凭据，`ProductHost` 只经私有 ready pipe 交给宿主父进程。已实现：令牌库、`CreativeRuntime` 的 mint / 吊销（claims 含 workspace / attachment / principal）、TTL 与代际、**默认拒绝**的全量路由映射（`src/capabilities/route_policy.rs`、`server.rs` 的 `required_operation`）。
-  - **CORE-2 一方外壳登记** ✅（[CORE-2-ENROLL-DESIGN](agent/CORE-2-ENROLL-DESIGN.md)、[CORE-2-AGENTEAR-SLICE](agent/CORE-2-AGENTEAR-SLICE.md)）：`--enroll-endpoint` 开启 `<data_dir>/enroll.sock`（`enroll_endpoint.rs`），校验对端代码签名身份（`agent24-os-proc`，macOS）后签发 `FirstPartyShell` 的日常令牌（`first_party.rs`，TTL 1 小时）；提升级操作需 `elevate`，由独立的在场确认（`presence.rs`）换取 60 秒、单次使用的 grant。CLI 侧见 `agent24-cli/src/enroll.rs`。
-  - **尚未实现**（📐，见 [ADR-005](open-design-workspace/design/ADR-005-CAPABILITY-AUTHORITY.md)）：从请求中提取 workspace / session / run 资源并校验、durable 的 session / run 归属、事件过滤与每次发送前复验、broker / handoff。`CreativeRuntime` 令牌仍只放行 `GET /api/v1/models`（`creative_route_permitted`），新映射的路由对它保持关闭。Desktop 的通用 `backendProxy` 隔离见 [PLAN-OD-NEXT](agent/PLAN-OD-NEXT.md) F11.0，是否已完成未核实。`agent24 acp` 是否在 capability 模式下可用未核实。
-- **领域 OS 挂载**（`src/domain.rs`）：进程内模块的授权上限 `KERNEL_GRANTS` = Events / Memory / Approval；进程外模块 `KERNEL_OOP_GRANTS` 再多 Scheduler / Models。
-- **回调面**：审批、调度、推理、记忆回调（ME-4），见 [PLAN-ME4-OS-CAPABILITIES](agent/PLAN-ME4-OS-CAPABILITIES.md)。
-- **模块工具（K1）** ✅：`module_tool_runtime.rs` 把进程外模块声明的工具以 `ModuleToolRuntime` 接进 `agent24-tools` 的注册表，授权、撤销通知、结果上限（64 KiB）见 [ADR-K1-01](adr/ADR-K1-01-module-tool-contract.md)；Documents 是第一个消费方。
-- **组件托管**：`idoris_host` / `managed_idoris`（iDoris 安装、监督、网关发布）、`hyphae_install`（Hyphae 按需安装）、`knowledge_host` / `knowledge_backend` / `knowledge_tools`（Knowledge 宿主接口与工具）、`hardware` / `decide_routes`。
-- **迁移协调器（CORE-5）** 🟡：`migration_coordinator.rs` 已实现，但 `ENABLED = false`，生产启动不调用 `run`；`main.rs` 有编译期断言 `assert!(!migration_coordinator::ENABLED)` 把它钉死。`migration_guard/` 是快照 / 回滚等配套。
-- **附着注册表**：A3 模块的监听 socket、握手、代际簿记、反向命令。
-
-### L5½ 领域 OS 运行时 — `os-proto`、`os-fd`、`os-packages`、`os-sdk`
+> 原编号 L5½（2026-11-05 改为 L4½）。这组 crate 只依赖 `domain` 和本组内部，**不依赖 L5**，被 L5（agent24d）和 L6（documents）同时依赖，所以是 L4 与 L5 之间共用的下层。旧编号让人以为它在 L5 之上，是误导（R1 §3.1）。
 
 | crate | 职责 |
 |---|---|
@@ -189,9 +213,41 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 
 权威：[SPEC-ME3-OUT-OF-PROCESS](specs/SPEC-ME3-OUT-OF-PROCESS.md)、[WIRE-OOP-MODULE](specs/WIRE-OOP-MODULE.md)、[ME4-S3 os-sdk](design/ME4-S3-os-sdk.md)。
 
+### L5 组合根 — `rust/apps/agent24d`
+
+内核运行时的组合根：
+
+- **对外 API**：v1 REST + WS（runs、sessions、approvals、comm、os、attached…）。workspace 目前**没有**对外 REST 路由（产品构造、host lease、resolve 都未开放），只能经内部 run 准入路径使用。
+- **鉴权模式**：
+  - `legacy_single_token`（`agent24d serve` 的缺省值）✅：生成一个全权 bearer，写进 `~/.agent24/daemon.json`。Windows 上的 Desktop 和 Node mock daemon 走这条路径。
+  - `capabilities` ✅（Unix 上 Desktop 的默认：`backend-manager.ts` 的 `selectedAuthMode`，以 `--auth-mode capabilities --host-bootstrap-stdio` 拉起）：`daemon.json` 不含凭据，`ProductHost` 只经私有 ready pipe 交给宿主父进程。已实现：令牌库、`CreativeRuntime` 的 mint / 吊销（claims 含 workspace / attachment / principal）、TTL 与代际、**默认拒绝**的全量路由映射（`src/capabilities/route_policy.rs` 的 `required_operation`）。
+  - **CORE-2 一方外壳登记** ✅（[CORE-2-ENROLL-DESIGN](agent/CORE-2-ENROLL-DESIGN.md)、[CORE-2-AGENTEAR-SLICE](agent/CORE-2-AGENTEAR-SLICE.md)）：`--enroll-endpoint` 开启 `<data_dir>/enroll.sock`（`enroll_endpoint.rs`），校验对端代码签名身份（`agent24-os-proc`，macOS）后签发 `FirstPartyShell` 的日常令牌（`first_party.rs`，TTL 1 小时）；提升级操作需 `elevate`，由独立的在场确认（`presence.rs`）换取 60 秒、单次使用的 grant。CLI 侧见 `agent24-cli/src/enroll.rs`。
+  - **尚未实现**（📐，见 [ADR-005](open-design-workspace/design/ADR-005-CAPABILITY-AUTHORITY.md)）：从请求中提取 workspace / session / run 资源并校验、durable 的 session / run 归属、事件过滤与每次发送前复验、broker / handoff。`CreativeRuntime` 令牌仍只放行 `GET /api/v1/models`（`creative_route_permitted`），新映射的路由对它保持关闭。Desktop 的 `backendProxy` 已有路由白名单（`backend-proxy.ts` 的 `ALLOWED_PROXY_ROUTES`），提升级操作走专用 IPC，不经代理；是否满足 [PLAN-OD-NEXT](agent/PLAN-OD-NEXT.md) F11.0 的全部验收未核实。`agent24 acp` 在 capability 模式下代码路径存在（CLI 的 `Endpoint` 持有 enroll 会话），真机未核实。
+- **领域 OS 挂载**（`src/domain.rs`）：进程内模块的授权上限 `KERNEL_GRANTS` = Events / Memory / Approval；进程外模块 `KERNEL_OOP_GRANTS` 再多 Scheduler / Models。
+- **回调面**：审批、调度、推理、记忆回调（ME-4），见 [PLAN-ME4-OS-CAPABILITIES](agent/PLAN-ME4-OS-CAPABILITIES.md)。
+- **模块工具（K1）** ✅：`module_tool_runtime.rs` 把进程外模块声明的工具以 `ModuleToolRuntime` 接进 `agent24-tools` 的注册表，授权、撤销通知、结果上限（64 KiB）见 [ADR-K1-01](adr/ADR-K1-01-module-tool-contract.md)；Documents 是第一个消费方。
+- **组件托管**：`idoris_host` / `managed_idoris`（iDoris 安装、监督、网关发布）、`hyphae_install`（Hyphae 按需安装，用 `agent24-components` 的 `download_locked_asset`）、`knowledge_host` / `knowledge_backend` / `knowledge_tools`（Knowledge 宿主接口与工具）、`hardware` / `decide_routes`。
+- **统一组件状态**：`component_routes.rs`（`GET /api/v1/components`、`POST /api/v1/components/{id}/report`，ADR-038 C3a，#1545）聚合 iDoris、Hyphae、attached、Documents、Knowledge 的状态；Open Design 的状态由桌面 main 上报（C3b，#1549）。docked 诊断 router（`docked_router.rs`，CORE-5f）只在停靠态提供，且在 `ENABLED=false` 之后。
+- **迁移协调器（CORE-5）** 🟡：`migration_coordinator.rs:20` 是 `ENABLED = false`，`run` 没有调用方；`main.rs:116` 有编译期断言 `assert!(!migration_coordinator::ENABLED)` 把它钉死。5f 的停靠类型、router 和启动接线已合入 main（`server.rs` 的 `docked_startup::pre_start`，#1528、#1540），但都在 `ENABLED` 后面，`pre_start` 因 guard 为 false 直接跳过。`migration_guard/` 是快照 / 回滚等配套。剩 5g / 5h / 5i（见 [CORE-5 设计](agent/CORE-5-MIGRATION-GUARD-DESIGN.md)）。
+- **附着注册表**：A3 模块的监听 socket、握手、代际簿记、反向命令。
+
+**agent24d 的体量与瘦身（Q3 选 (B)，2026-11-04 拍板）**
+
+agent24d 非测试代码 27,915 行（`163dd2d3` 上用 R1 的 `loc.py` 重算，口径见 [ARCH-OPTIMIZATION-PLAN §4.3](tracking/2026-11-04/ARCH-OPTIMIZATION-PLAN.md)；R1 §1.1 原值 26,296）。`server.rs` 的构成：真正的路由「组合」只有一小段，`serve()` 一个函数就有约 1,530 行启动序列。分组见 R1 §4（`docs/architecture/review-2026-11-03/R1-MODULE-MAP.md`，在分支 `docs/arch-review-r1-module-map` 上，尚未合入 main）和 [方案 §5 Q3](tracking/2026-11-04/ARCH-OPTIMIZATION-PLAN.md)。结论：
+
+- **下沉三块**，每块都是业务逻辑，不是接线：
+  - iDoris 托管（`idoris_host`、`provision`、`managed_idoris`，约 2,500 行）→ `agent24-idoris`；
+  - Knowledge 宿主（`knowledge_host` / `backend` / `store` / `tools`，约 1,800 行，含 C5 探测）→ `agent24-knowledge`；
+  - attach 子系统（`attached`、`attach_registry`、`attach_listener`、`attach_commands` 等，约 1,500 行，整体迁，不单拆注册表）→ 新建 `agent24-attach`。
+- **鉴权留在 agent24d 核心，不抽 `agent24-auth`**（方案原 S2-5 已取消）。R1 §4 指出这块（约 4,900 行，含 `server.rs:1025-1418` 的鉴权中间件）依赖 `os-proc` 和 `crate::capabilities`，handler 与中间件接线必须留在 agent24d。
+- 以上三个数字按方案 §4.3（S2-2 / S2-3 / S2-4）写，口径见 ARCH-OPTIMIZATION-PLAN §4.3；下沉后 agent24d 约降到 22,000 行。attach 排在 S2-1、S2-2 之后。
+- 三块下沉后**仍然编译进同一个 agent24d 进程**，只是代码归属变了，不增加进程，也不改对外 API。HTTP handler 留在 agent24d。
+- 每期先移动、后修行为，同一个 PR 不混；前置是本文（新边界先写进文档）。迁移落地之前，上文各 crate 的依赖以当前 main 为准；下沉后依赖表用脚本重新生成。
+- `comm_routes` 中的 `CommDaemonSlot` 与 `hyphae_install` 是否下沉另议，不在 Q3 范围内。
+
 ### L6 扩展面 — 四类"外挂"
 
-> 按计划中的 ADR-039（`docs/adr/ADR-039-concept-model.md`，审阅中），下面这四类外挂将来统一归为「组件」，区别只在运行形态（进程内 / 进程外 / 附着 / sidecar）；统一契约见计划中的 ADR-038（组件契约 v1）。本文暂时保留现有分类，便于对照代码。
+> 按 ADR-039（已接受）对外只有「本体 / 能力 / 技能」三个概念；下面四类外挂在实现上都是「组件」（能力的安装包，契约见 [ADR-038](adr/ADR-038-component-contract-v1.md)，C1–C8 已全部完成），区别只在运行形态（进程内 / 进程外 / 附着 / sidecar）。本文暂时保留现有四类分类，便于对照代码。
 
 | 类型 | 例子 | 谁启动进程 | 信任假设 | 通道 | 权威文档 |
 |---|---|---|---|---|---|
@@ -204,10 +260,10 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 
 | 方面 | 现行产品路径 ✅ | 目标形态（ADR-004/005）🟡 |
 |---|---|---|
-| 进程托管 | **打包模式**：`CreativeServeWeb` 选启动方式和下载前置，进程交给 `SidecarManager`（TS）托管（C8）：launcher 以 `detached` 拉起，POSIX 独立进程组；就绪、健康检查（`GET /api/ready`，连续 3 次失败报 `degraded`，不自动重启）、停止（TERM 只发 launcher，15 s 宽限后对整个进程组 SIGKILL）、崩溃后整组回收都由 manager 负责；崩溃后懒重启（下次打开或点重启）。**checkout 模式**仍由 `CreativeServeWeb` 直接拉起 `node … od.mjs`。**Windows 暂不支持**（launcher 返回 `unsupported platform`，Job Object 留给 sidecar-host）。端点不鉴权（`auth: 'none'`）。已知缺口：OD daemon 自己 detach 的 agent 子进程在强杀时可能残留；Electron 被 SIGKILL 时进程组会留下 | 在此基础上接 `agent24-sidecar-host`（Rust，Windows Job Object / 父进程死亡监视），并补自动有界重启（ADR-004 §6） |
+| 进程托管（Q1 = (b)，#1580、#1584） | **打包模式**：`CreativeServeWeb` 选启动方式和下载前置，进程交给 `SidecarManager`（TS）托管（C8，#1580；Open Design 当前 pin 0.26.1，#1544）：launcher 以 `detached` 拉起，POSIX 独立进程组；就绪、健康检查（`GET /api/ready`，连续 3 次失败报 `degraded`，不自动重启）、停止（TERM 只发 launcher，15 s 宽限后对整个进程组 SIGKILL）、崩溃后整组回收都由 manager 负责；崩溃后懒重启（下次打开或点重启）。**checkout 模式**仍由 `CreativeServeWeb` 直接拉起 `node … od.mjs`。**Windows 暂不支持**（launcher 返回 `unsupported platform`，Job Object 留给 sidecar-host）。端点不鉴权（`auth: 'none'`）。已知缺口：OD daemon 自己 detach 的 agent 子进程在强杀时可能残留；Electron 被 SIGKILL 时进程组会留下 | 在此基础上接 `agent24-sidecar-host`（Rust，Windows Job Object / 父进程死亡监视），并补自动有界重启（ADR-004 §6） |
 | 分发（2026-10-05 裁决） | **不再打进安装包**（曾把 AppImage 从 146MB 顶到 934MB、deb 从 101MB 顶到 622MB）；电子打包只带一个小 manifest，首次点开 Design 页时由 `open-design-component.ts` 按需下载、校验 sha256、解压、再启动 | 同左 |
 | 界面 | Creative 页是 `WebContentsView`，使用**全局持久**的 session 分区 `persist:agent24-creative`，带同源导航拦截和请求代际栅栏 | 按 app 实例 + workspace 派生的**非持久**分区，detach / 切换时清除 cookie、localStorage、cache、service worker（ADR-004） |
-| 运行时协议 | Open Design 每个会话拉起 `agent24 acp`，把 ACP 会话/提示映射成 REST/WS run，执行仍在 agent24d | 同左 |
+| 运行时协议 | Open Design 每个会话拉起 `agent24 acp`，把 ACP 会话/提示映射成 REST/WS run，执行仍在 agent24d；桌面把包内 CLI 经 `AGENT24_BIN` 交给 OD（#1555） | 同左 |
 | 凭据 | `agent24 acp` 用 CLI 的 `Endpoint` 令牌：legacy 模式是 daemon.json 里的全权 bearer，capability 模式是 enroll 得到的一方日常令牌（`acp.rs`），都不是受限的 `CreativeRuntime` 令牌 | daemon 以 capability 模式运行，Open Design / ACP 只拿 `CreativeRuntime` 受限令牌；需先实现路由级资源授权、durable 归属、事件过滤、broker / handoff |
 | workspace | `agent24 acp` 建 session / run 时 `workspace_id` 为 `None`，走 legacy 文件权限 | 每个 Open Design 项目绑定一个 scratch workspace，run 是 workspace-bound |
 
@@ -217,14 +273,14 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 
 ### L7 外壳
 
-- **apps/desktop（Electron）**：唯一的桌面 main 进程。`BackendManager` 托管 agent24d（Unix 默认 capability 模式）；`SidecarManager` 托管 Open Design 的 headless 进程（C8），`CreativeServeWeb` 负责选启动方式、下载前置和对外状态；`agent24-sidecar-host` 尚未接线。
+- **apps/desktop（Electron）**：唯一的桌面 main 进程。`BackendManager` 托管 agent24d（Unix 默认 capability 模式）；`SidecarManager` 托管 Open Design 的 headless 进程（C8），`CreativeServeWeb` 负责选启动方式、下载前置和对外状态；组件页读 `/api/v1/components`，OD 状态由 main 上报（C3b）；`agent24-sidecar-host` 尚未接线（Q1 = (b) 后冻结）。
 - **agent24-cli**：v1 协议客户端（capability 模式下先 `enroll`，需要时 `elevate`）；`agent24 acp` 是 ACP-over-stdio 映射桥，不持有执行逻辑。
 - **packages/**：
   - `api-client`：由 OpenAPI 生成的 TS 客户端；
   - `contract-tests`：契约测试；
-  - `nostr-bridge` / `wechat-bridge`：通信桥；
+  - `nostr-bridge` / `wechat-bridge`：通信桥（nostr-bridge 不再是 agent 的 Nostr 身份来源，身份以 `<data>/comm/hyphae-home` 的钥匙库为准，以后并入 comm，Q12 X7 / Q6）；
   - `data-dir`：平台数据目录解析（ADR-037，镜像 `agent24-protocol` 的 `data_dir.rs`）；`documents-accept`：Documenting 验收 harness；
-  - `node-daemon`：v1 协议的 Node 参考 / mock daemon 实现，**不是客户端**。
+  - `node-daemon`：**开发用的旧 API mock**，只实现 124 个 v1 op 中的 4 个（`GET /health`、`/models`、`/usage`、`POST /chat`，`v1/routes.ts:60-89`），其余返回 404，另带一组非 v1 的旧接口；打包构建强制使用 Rust 后端（`backend-manager.ts:173-176`）。**不是客户端**，也不能当 v1 参考实现（R1 §7.4）。
 
 ---
 
@@ -261,12 +317,15 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 4. **文件系统边界**：
    - 🟡 workspace-bound run（仅 Unix；运行时准入、handle、工具接线已实现，但默认 Desktop / ACP 路径还不可达）：`fs_read` / `fs_write` 的路径在描述符钉住的根内解析；`shell_exec` 只用 `fchdir` 钉住 cwd，不是 OS 沙箱；
    - legacy run：靠工具 allowlist 与 `workdir`。
-5. **unsafe 边界** ✅：生产代码只有两处人工审计过的窄 `unsafe`：
-   - `os-cwd`：post-fork 的 `fchdir`；
-   - `os-fd`：接管继承 fd 的所有权。
+5. **unsafe 边界** ✅：工作区默认 `unsafe_code = "forbid"`（`rust/Cargo.toml:49`），只有四个 crate 在各自 `Cargo.toml` 里降为 `deny` 并开了窄例外：
+   - `os-cwd`：post-fork 的 `fchdir`（1 个 `unsafe` 块）；
+   - `os-fd`：接管继承 fd 的所有权（2 个块）；
+   - `os-proc`：进程身份原语（5 处 allow、8 个块）；
+   - `os-sqlite`：SQLite 在线备份的原始句柄调用（1 个块）。
 
-   `os-proto` 的 fork/exec fd 处理交给 `command-fds` crate。
-6. **法律层**：[docs/laws/](laws/README.md)，包括上下文准入（CONTEXT）、记忆隔离（MEMORY）、审批授权（APPROVAL）。改动涉及哪条法律，要在 PR 模板里写明。
+   `os-proto` 的 fork/exec fd 处理交给 `command-fds` crate，自己保持 forbid。前两处经过人工审计；`os-proc`、`os-sqlite` 是否经过同等审计未核实（R1 §8）。
+6. **组件制品边界** ✅：组件发布物按锁定的 sha256 加 macOS Developer ID 签名或公证校验（D2a，`components/src/sign.rs`，Install / AtRest 两种模式），用于 iDoris 和 Hyphae。它**不是**领域 OS 签名（ME-6）。Q15 已拍板：OS 包（Sin90、Cos72 等）也要有文件清单和哈希，哈希不对就拒绝加载，不做「先只记录」的过渡；这一条尚未实现（见 §7）。
+7. **法律层**：[docs/laws/](laws/README.md)，包括上下文准入（CONTEXT）、记忆隔离（MEMORY）、审批授权（APPROVAL）。改动涉及哪条法律，要在 PR 模板里写明。
 
 ---
 
@@ -289,7 +348,7 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 
 1. **边界**：照 [ADR-001](open-design-workspace/design/ADR-001-INTEGRATION-BOUNDARIES.md) 写一份。Agent24 是唯一 AI 控制面，第三方只是工作区，不拿工具权限。
 2. **源码**：fork + pin，本仓库只放契约、宿主、桥、pin、集成测试；Apache-2.0 记得保留 NOTICE。
-3. **进程**：用 `SidecarManager`（C8 起 Open Design 已走它）：每个工具只写自己的 launcher、health 和 tree controller（参考 `open-design-sidecar.ts`）。目标再接 `agent24-sidecar-host`（Windows 与父进程死亡监视）。
+3. **进程**：用 `SidecarManager`（C8 起 Open Design 已走它）：每个工具只写自己的 launcher、health 和 tree controller（参考 `open-design-sidecar.ts`）。`agent24-sidecar-host`（Windows Job Object 与父进程死亡监视）已冻结（Q1=(b)，OD 由 SidecarManager 托管，#1580/#1584），Windows 排期后再议。
 4. **运行时协议**：能说 ACP 就复用 `agent24 acp`；否则写一个同样"只做映射、不持有权限"的桥。
 5. **权限**：一个 workspace + 一个限定在该 workspace 的短期令牌。前提是 capability 的路由级资源授权已实现、并已在产品路径启用（见 §5 第一行）。
 6. **验收与落地**：精确 SHA 的 E2E（M10 用的 harness 保存在 PR #654 的 `refs/pull/654/head`）；锁定 main、打 tag、合并预演、合并后再跑 gate（[M10 落地指南](design/OPEN-DESIGN-M10-MAIN-LANDING-GUIDE.md)，现作为 M10 的历史审计记录保留）。
@@ -297,7 +356,7 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 **M10 的教训**：
 - integration 分支漂得太久：最后 633 个提交、约 200 个叠加 PR；
 - 设计文档没随第一片落地，差点在清理 PR 时丢失；
-- "组件落地"与"产品路径生效"没有分开验收，导致 capability 基础设施 / SidecarManager 落地了却没接线，capability 的路由级授权也还没做完。
+- "组件落地"与"产品路径生效"没有分开验收，导致 capability 基础设施 / SidecarManager 当时落地了却没接线（SidecarManager 已在 C8 接线，capability 路由级授权仍未做完），capability 的路由级授权也还没做完。
 
 下次按切片尽早落 main，ADR 随第一片进 main，并把"产品路径接线"列为单独的验收项。
 
@@ -306,15 +365,15 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 ## 7. 尚未完成、不要误以为已经有的
 
 - 📐 capability 的路由级资源授权（workspace / session / run 资源提取与校验）、durable 归属、事件过滤与复验、broker / handoff；`CreativeRuntime` 仍只能读模型目录。
-- 🟡 capability 模式在 Windows 和 `serve` 缺省路径上不是默认；`agent24 acp` 是否可在 capability 模式使用未核实。
+- 🟡 capability 模式在 Windows 和 `serve` 缺省路径上不是默认；`agent24 acp` 在 capability 模式下代码路径存在（CLI `Endpoint` 带 enroll 会话），真机未核实。
 - 📐 Creative 的按 workspace 非持久 session 分区（现为全局持久分区）。
 - 🟡 workspace-bound run 仅 Unix；Windows 上只有 legacy 路径。
 - 📐 workspace 的产品构造、host lease、续期 / 释放、resolve 等对外路由未开放（`WorkspaceService` 的产品构造按代码注释仍关闭）。
 - 🟡 进程内 DomainModule 挂载缝已实现，但当前没有生产内置模块。
-- 🟡 `SidecarManager` 与 `agent24-sidecar-host` 未接入 Desktop；Open Design 由 `CreativeServeWeb` 托管。
+- 🟡 `agent24-sidecar-host`（Rust，Windows Job Object / 父进程死亡监视）未接入 Desktop，没有任何 Rust 消费者，Q1 = (b) 后冻结。Open Design 已由 `SidecarManager`（TS）托管（C8，#1580、#1584）；Windows 暂不支持。
 - 🟡 `agent24 acp` 不传 `workspace_id`，Open Design 的 run 不是 workspace-bound。
-- 🟡 **CORE-5 迁移协调器未接线**：`migration_coordinator::ENABLED = false`，`main.rs` 的编译期断言保证没人悄悄打开；启动路径不调用它。
-- 🟡 **组件安装器借用 iDoris 的锁结构**：`agent24-components::fetch_verified` 复用 `agent24_idoris` 的下载器、`IdorisLock` 结构和 `idoris` 树内缓存目录的约束，Hyphae 按需下载因此耦合 iDoris；尚无独立的组件锁 / 安装器。
+- 🟡 **CORE-5 迁移协调器未接线**：`migration_coordinator::ENABLED = false`（`:20`），`main.rs:116` 的编译期断言保证没人悄悄打开；`run` 没有调用方。5f（停靠类型、router、启动接线）已合入 main，但都在 `ENABLED` 后面；剩 5g 外壳识别、5h 安装器回退、5i 授权 retry。
+- 🟡 **ADR-038 收尾**：C1–C8 已全部完成（Open Design 按 Q1 = (b) 由 `SidecarManager` 托管）。仍未做的是运行期契约检查（Agent24 侧没有向 Hyphae 做 `hyphae-cli` 契约握手，只有 iDoris 做 `check_contract`）；Hyphae 锁只有 darwin-arm64 和 linux-x64 两个平台。
 - 🟡 `agent24-decide`：只有契约、规则后端和 profile 路由；`DecisionLog` 无实现，agent loop 无调用点（D1）。
 - 🟡 `agent24-hw`：runtimes 未探测，能力梯 / 解析器未做。
 - 🟡 `agent24-knowledge` 的 Provider 未接线，agent24d 当前用自己的后端直连；Knowledge 工具只给绑定了 Knowledge 的 run。
@@ -324,7 +383,10 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 - 📐 Web3（AAStar）身份与结算：Agent24 中没有接线。
 - 📐 OpenAPI 由 Rust 生成（B4）。
 - workspace 只有 scratch 一种受信构造；写回、其它类型、并发策略未定。
-- 📐 领域 OS 签名（ME-6）。
+- 📐 领域 OS 签名（ME-6）。组件签名（D2a）已有，但不覆盖领域 OS 包。
+- 📐 OS 包完整性（Q15）：OS 包的文件清单和哈希校验、哈希不对即拒绝加载，尚未实现。
+- 📐 agent24d 瘦身（Q3 (B)）：iDoris 托管下沉 `agent24-idoris`、Knowledge 宿主下沉 `agent24-knowledge`、attach 新建 `agent24-attach`，尚未动手；鉴权留核心。
+- 📐 通讯入口统一准入（Q12 X11）：Nostr 入站、语音输入、远程 @agent、手机遥控等外部触发 agent 的入口，要统一走 ADR-041 的准入关卡，尚未实现。
 - `docs/laws/` 目前只有上下文、记忆、审批三部法条。
 - Review 遗留：[#661](https://github.com/iDoris-ai/Agent24/issues/661)（Creative view）、[#663](https://github.com/iDoris-ai/Agent24/issues/663)（M10 叠加 PR 遗留）。
 

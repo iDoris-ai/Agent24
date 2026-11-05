@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use sqlx::{Sqlite, Transaction};
 
 use crate::{

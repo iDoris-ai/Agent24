@@ -28,15 +28,13 @@ on:
       - 'apps/desktop/package.json'
       - 'apps/desktop/scripts/prepare-open-design-linux-resources.mjs'
       - 'apps/desktop/scripts/rebuild-open-design-native.mjs'
+      - 'apps/desktop/src/shared/open-design.pin.json'
       - 'apps/desktop/scripts/stage-open-design-resources.mjs'
       - 'apps/desktop/scripts/pack-open-design-component.mjs'
       - 'apps/desktop/scripts/ensure-open-design-component-dir.mjs'
 
 permissions:
   contents: read
-
-env:
-  OPEN_DESIGN_SHA: f5beffcb43f473db26e0127db901127a5db7256d
 
 concurrency:
   group: release-desktop-${{ github.workflow }}-${{ github.ref }}
@@ -52,6 +50,12 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
         with:
           submodules: false
+
+      - name: Load Open Design pin
+        shell: bash
+        run: |
+          echo "OPEN_DESIGN_SHA=$(jq -er '.sha' apps/desktop/src/shared/open-design.pin.json)" >> "$GITHUB_ENV"
+          echo "OPEN_DESIGN_PIN_VERSION=$(jq -er '.version' apps/desktop/src/shared/open-design.pin.json)" >> "$GITHUB_ENV"
 
       - name: Checkout exact reviewed Open Design fork
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
@@ -292,7 +296,7 @@ jobs:
             local manifest
             manifest="$(find "$package_root" -type f -path '*/resources/open-design-component.json' -print -quit)"
             test -n "$manifest"
-            test "$(jq -r '.version' "$manifest")" = "0.26.1"
+            test "$(jq -r '.version' "$manifest")" = "$OPEN_DESIGN_PIN_VERSION"
             test "$(jq -r '.odSha' "$manifest")" = "$OPEN_DESIGN_SHA"
             test "$(jq -r '.platform' "$manifest")" = "linux"
             test "$(jq -r '.arch' "$manifest")" = "x64"
@@ -342,7 +346,7 @@ jobs:
           test -d "$EXTRACT/app"
           test -d "$EXTRACT/open-design"
           test -d "$EXTRACT/open-design-web-standalone"
-          test "$(jq -r '.version' "$EXTRACT/app/package.json")" = "0.26.1"
+          test "$(jq -r '.version' "$EXTRACT/app/package.json")" = "$OPEN_DESIGN_PIN_VERSION"
           for relative in \
             app/prebundled/agent24-headless.cjs \
             app/prebundled/agent24-headless.mjs \

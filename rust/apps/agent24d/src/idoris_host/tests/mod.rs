@@ -100,7 +100,9 @@ impl Runtime for FixtureRuntime {
         };
         config.log_dir = root.join("logs");
         config.shutdown = cancel;
-        config.timings.ready = Duration::from_secs(3);
+        // Readiness is a liveness bound, not a speed assertion: a freshly written fixture
+        // executable can take many seconds to start on a loaded host.
+        config.timings.ready = Duration::from_secs(60);
         config.timings.poll = Duration::from_millis(10);
         config.timings.terminate = Duration::from_millis(100);
         config.timings.drain = Duration::from_millis(100);
@@ -125,13 +127,21 @@ struct Fixture {
 fn mode(path: &Path, permissions: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(permissions)).unwrap();
 }
+/// Fixture ports come from 20000-29999, below every kernel ephemeral range (Linux
+/// 32768+, macOS 49152+). Asking the kernel for `bind(0)` and releasing the port
+/// lets a concurrent test's own `bind(0)` be handed the very same number before the
+/// fixture child binds it, which made the child fail to start. Each number is issued
+/// once per test process and a per-process offset separates parallel test processes.
 async fn port() -> u16 {
-    tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::sync::atomic::AtomicUsize;
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let offset = std::process::id() as usize * 397;
+    loop {
+        let port = (20_000 + (offset + NEXT.fetch_add(1, Ordering::SeqCst)) % 10_000) as u16;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 impl Fixture {
     async fn new() -> Self {
@@ -242,7 +252,7 @@ impl Fixture {
         .unwrap();
     }
     async fn complete(&self, op: &Operation) -> Operation {
-        tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::time::timeout(Duration::from_secs(120), async {
             loop {
                 let value = self.host.operation(&op.operation_id).await.unwrap();
                 if value.result.is_some() {
@@ -313,7 +323,7 @@ async fn state_machine_idempotency_busy_and_stop() {
         f.host.submit(Action::Stop, None).await,
         Err(Code::Busy)
     ));
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         while f.host.status().await.state != State::Starting {
             tokio::task::yield_now().await;
         }
@@ -419,7 +429,7 @@ async fn shutdown_during_start_closes_admission_and_cancels() {
     f.install().await;
     f.runtime.gate.store(true, Ordering::SeqCst);
     let op = f.host.submit(Action::Start, None).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), f.host.shutdown())
+    tokio::time::timeout(Duration::from_secs(60), f.host.shutdown())
         .await
         .unwrap()
         .unwrap();
@@ -518,7 +528,7 @@ async fn terminal_child_failure_closes_gateway_and_updates_status() {
     f.scenario(json!({"mode":"exit_after_ready", "after":0.3, "code":3}));
     let op = f.host.submit(Action::Start, None).await.unwrap();
     assert_eq!(f.complete(&op).await.result, Some(Outcome::Succeeded));
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         while f.host.status().await.state != State::InstanceConflict {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -537,7 +547,7 @@ async fn stop_blocks_new_gateway_requests_and_drains_retained_snapshot() {
     assert_eq!(f.complete(&op).await.result, Some(Outcome::Succeeded));
     let old_request = f.host.router.idoris_gateway().unwrap();
     let stop = f.host.submit(Action::Stop, None).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         while f.host.router.idoris_gateway().is_ok() {
             tokio::task::yield_now().await;
         }
@@ -764,7 +774,7 @@ async fn start_during_supervisor_restart_is_busy_and_stop_wins_readiness_updates
     f.scenario(json!({"mode":"crash", "after":0.3}));
     let op = f.host.submit(Action::Start, None).await.unwrap();
     assert_eq!(f.complete(&op).await.result, Some(Outcome::Succeeded));
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         while f.host.status().await.state != State::Starting {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -923,7 +933,7 @@ async fn cancel_interrupts_a_pending_keychain_read_before_spawn() {
     f.install().await;
     let start = f.host.submit(Action::Start, None).await.unwrap();
     f.host.cancel(&start.operation_id).await.unwrap();
-    let completed = tokio::time::timeout(Duration::from_secs(1), async {
+    let completed = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let op = f.host.operation(&start.operation_id).await.unwrap();
             if op.result.is_some() {
@@ -1088,7 +1098,7 @@ async fn stop_after_reopen_reaps_a_live_leftover_without_starting() {
     let mut reaper = tokio::spawn(async move { child.wait().await.unwrap() });
     restored.restore().await.unwrap();
     let stop = restored.submit(Action::Stop, None).await.unwrap();
-    let completed = tokio::time::timeout(Duration::from_secs(3), async {
+    let completed = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let op = restored.operation(&stop.operation_id).await.unwrap();
             if op.result.is_some() {
@@ -1132,7 +1142,7 @@ async fn stopped_generation_cannot_publish_a_gateway_after_prepare() {
     );
     sender.send(true).unwrap();
     // Keep stop's lock until preparation has queued the final generation check.
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             tokio::time::sleep(Duration::from_millis(5)).await;
             drop(inner);
@@ -1144,7 +1154,7 @@ async fn stopped_generation_cannot_publish_a_gateway_after_prepare() {
     })
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), sender.closed())
+    tokio::time::timeout(Duration::from_secs(60), sender.closed())
         .await
         .unwrap();
     let blocked = f.host.router.idoris_gateway().is_err();

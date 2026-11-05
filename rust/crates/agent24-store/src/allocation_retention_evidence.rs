@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use serde_json::json;
 use sqlx::{Row, Sqlite, Transaction};
 

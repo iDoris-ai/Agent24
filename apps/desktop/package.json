@@ -28,7 +28,7 @@
     "build:win": "pnpm build:rust && pnpm build && electron-builder --win",
     "build:linux": "pnpm build:rust && pnpm build && electron-builder --linux",
     "typecheck": "pnpm --filter @agent24/data-dir build && tsc --noEmit -p tsconfig.renderer.json && tsc --noEmit -p tsconfig.electron.json",
-    "test": "pnpm --filter @agent24/data-dir build && vitest run",
+    "test": "pnpm --filter @agent24/data-dir build && node --test scripts/open-design-pin.test.mjs && vitest run",
     "test:watch": "vitest",
     "release:mac": "bash scripts/release-mac.sh"
   },

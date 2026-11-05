@@ -1340,3 +1340,30 @@ fn only_a_confirmed_foreign_listener_is_a_conflict() {
         Ok(true)
     ));
 }
+
+#[test]
+fn s1_4_health_contract_uses_only_lock_threshold() {
+    let mut lock = IdorisLock::embedded().clone();
+    for major in [1, 2] {
+        lock.contract_major = major;
+        for version in [
+            "1.0.0",
+            "1.0.1",
+            "1.0.99",
+            "1.1.0",
+            "1.9.3",
+            "2.1.0",
+            "1.1.0-rc1",
+            "1.1.0+build",
+            "invalid",
+        ] {
+            let mut body = healthy();
+            body["contract_version"] = serde_json::json!(version);
+            assert_eq!(
+                validate_health(&serde_json::to_vec(&body).unwrap(), &lock).is_ok(),
+                lock.check_contract(version).is_ok(),
+                "major {major}, version {version}"
+            );
+        }
+    }
+}

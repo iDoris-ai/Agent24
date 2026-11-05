@@ -19,11 +19,13 @@ import {
   protocolCompatibility,
   protocolVersionOf,
 } from './protocol-compatibility'
-import { joinLiteral, tryDataDir } from './data-dir'
+import { joinLiteral, readDaemonState, tryDataDir } from './data-dir'
 
 const HEALTH_INTERVAL_MS = 5_000
 const HEALTH_TIMEOUT_MS = 3_000
 const MAX_HEALTH_FAILURES = 3
+/** A refused daemon.json whose /health stays silent this many probes in a row stops blocking manual start/restart. */
+const REJECTED_SILENT_LIMIT = 3
 // T1-0: how long a takeover waits for the CLI daemon to exit after `/shutdown`.
 const TAKEOVER_WAIT_MS = 10_000
 const TAKEOVER_POLL_MS = 200
@@ -37,6 +39,10 @@ export interface BackendStatusDetail {
   readonly clientVersion: number
   readonly recordedVersion?: number
   readonly pid: number
+  /** Set when daemon.json was refused by the strict parser (e.g. an auth_mode this app does not know). */
+  readonly reason?: string
+  /** With `reason`: /health has been silent for a while; the record may be stale, delete daemon.json to recover. */
+  readonly hint?: 'delete_daemon_json'
 }
 
 export interface BackendEndpoint {
@@ -263,6 +269,9 @@ export interface ExternalDaemonState {
   authMode: DaemonAuthMode
   /** Absent when daemon.json was written before version negotiation. */
   protocolVersion?: number
+  /** The strict parser refused this record but it still names a pid and port: never reusable,
+   * yet a live daemon may hold the singleton lock, so it must not read as "nothing there". */
+  rejected?: string
 }
 
 /** One `GET /api/v1/health`. `protocolVersion: null` means the field is absent. */
@@ -285,34 +294,28 @@ export function daemonStatePath(): string | null {
 export function readExternalDaemonState(): ExternalDaemonState | null {
   const statePath = daemonStatePath()
   if (!statePath) return null
-  try {
-    const raw = fs.readFileSync(statePath, 'utf8')
-    const parsed = JSON.parse(raw) as {
-      port?: unknown
-      token?: unknown
-      pid?: unknown
-      auth_mode?: unknown
-      protocol_version?: unknown
-    }
-    if (typeof parsed.port !== 'number' || typeof parsed.pid !== 'number') return null
-    const token = typeof parsed.token === 'string' ? parsed.token : ''
-    // Only a legacy record (or one from before `auth_mode` existed) shares its
-    // token through this file; any other mode keeps host authority private.
-    const legacy = parsed.auth_mode === undefined || parsed.auth_mode === 'legacy_single_token'
-    const state: ExternalDaemonState = {
-      port: parsed.port,
-      token,
-      pid: parsed.pid,
-      authMode: legacy ? 'legacy' : 'capabilities',
-    }
-    const recorded = parsed.protocol_version
-    if (typeof recorded === 'number' && Number.isInteger(recorded) && recorded >= 0) {
-      state.protocolVersion = recorded
-    }
-    return state
-  } catch {
-    return null
+  // The one parser (`@agent24/data-dir`, mirrors Rust `state_file.rs`): a
+  // record that fails its validation — including an unknown `auth_mode`, which
+  // this function used to treat as "capabilities" — is nothing to reuse.
+  const read = readDaemonState(statePath)
+  if (!read.ok) {
+    // File absent / unreadable / not a daemon record: nothing there. A refused record that
+    // still names a pid and port (a newer auth_mode, a bad field) is a daemon we cannot
+    // talk to, which is a different thing: callers probe it and must not spawn over it.
+    if (read.endpoint === undefined) return null
+    return { port: read.endpoint.port, pid: read.endpoint.pid, token: '', authMode: 'capabilities', rejected: read.message }
   }
+  const { state } = read
+  // Only a legacy record shares its token through this file; capability mode
+  // keeps host authority private (token is '' there, by validation).
+  const out: ExternalDaemonState = {
+    port: state.port,
+    token: state.token,
+    pid: state.pid,
+    authMode: state.authMode === 'legacy_single_token' ? 'legacy' : 'capabilities',
+  }
+  if (state.protocolVersion !== undefined) out.protocolVersion = state.protocolVersion
+  return out
 }
 
 /** Discovery + health-probing, factored out so tests can inject both without
@@ -458,7 +461,10 @@ export async function requestDaemonShutdown(endpoint: BackendEndpoint, token: st
   return (await fetchWithToken(endpoint, '/api/v1/shutdown', token, 'POST'))?.status ?? null
 }
 
-function processAlive(pid: number): boolean {
+export function processAlive(pid: number): boolean {
+  // kill(0, 0) signals our own process group and pid 1 answers EPERM: neither is a
+  // daemon that wrote this record (Rust pid_alive treats them as not alive too).
+  if (!Number.isInteger(pid) || pid <= 1) return false
   try {
     process.kill(pid, 0)
     return true
@@ -519,6 +525,8 @@ export class BackendManager {
   // external pid. tick keeps probing: a compatible `/health` clears this and
   // reuses the peer; a failed probe clears it and spawns.
   private blockedReason: BackendStatusDetail | null = null
+  // Consecutive silent /health probes against a refused (unparseable) daemon.json record.
+  private rejectedSilent = 0
   // Set while a healthy capability-mode daemon of another host serves this
   // data dir (see tryReuseExternal); nothing is spawned until it is gone.
   private foreignPid: number | null = null
@@ -597,6 +605,7 @@ export class BackendManager {
   private async tryReuseExternal(): Promise<'reused' | 'foreign' | 'absent' | 'incompatible' | 'superseded'> {
     const lifecycle = this.lifecycle
     const state = this.external.read()
+    if (!state || state.rejected === undefined) this.rejectedSilent = 0
     // A record whose pid is gone is stale: whatever holds its port now gets
     // neither a probe nor the token (the Rust readers check the same).
     if (!state || !this.external.isAlive(state.pid)) {
@@ -606,6 +615,13 @@ export class BackendManager {
     }
     const health = await this.external.fetchHealth({ port: state.port })
     if (lifecycle !== this.lifecycle) return 'superseded'
+    if (state.rejected !== undefined) {
+      // A live pid wrote a record this app refuses to parse. It holds the singleton
+      // lock, so spawning would loop forever: report it, never `absent`. Never reused.
+      this.foreignPid = null
+      this.rejectedSilent = health.ok ? 0 : this.rejectedSilent + 1
+      return this.refuseExternal(state, health.ok ? health.protocolVersion : null)
+    }
     if (!health.ok) {
       // Nothing answered. A leftover daemon.json must not block spawn, and a
       // peer that previously blocked us has released the lock.
@@ -682,8 +698,12 @@ export class BackendManager {
     const detail: BackendStatusDetail = {
       kind: 'protocol_mismatch', daemonVersion, clientVersion: CLIENT_PROTOCOL_VERSION,
       recordedVersion: state.protocolVersion, pid: state.pid,
+      ...(state.rejected === undefined ? {} : { reason: state.rejected }),
+      ...(state.rejected !== undefined && this.rejectedSilent >= REJECTED_SILENT_LIMIT ? { hint: 'delete_daemon_json' as const } : {}),
     }
     const already = this.blockedReason?.pid === detail.pid
+      && this.blockedReason.reason === detail.reason
+      && this.blockedReason.hint === detail.hint
       && this.blockedReason.daemonVersion === detail.daemonVersion
       && this.blockedReason.recordedVersion === detail.recordedVersion
     this.blockedReason = detail
@@ -746,7 +766,7 @@ export class BackendManager {
     // Spawning against an incompatible peer's lock just restarts the failure
     // loop. (A `foreign` peer is different: a manual start is allowed through,
     // and its outcome is re-read on the next probe.)
-    if (this.blockedReason !== null) return
+    if (this.blockedReason !== null && this.blockedReason.hint === undefined) return
     this.userStopped = false
     this.failureCount = 0
     if (!this.gateOpen) return // start() spawns once its gate opens
@@ -782,7 +802,7 @@ export class BackendManager {
       return
     }
     this.lifecycle += 1
-    if (this.blockedReason !== null) return
+    if (this.blockedReason !== null && this.blockedReason.hint === undefined) return
     this.userStopped = false
     this.failureCount = 0
     this.lastHealthy = false

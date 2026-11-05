@@ -33,8 +33,9 @@ import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 
-export const OPEN_DESIGN_PIN_VERSION = '0.26.1'
-export const OPEN_DESIGN_SHA = 'f5beffcb43f473db26e0127db901127a5db7256d'
+const pin = JSON.parse(fs.readFileSync(new URL('../src/shared/open-design.pin.json', import.meta.url), 'utf8'))
+export const OPEN_DESIGN_PIN_VERSION = pin.version
+export const OPEN_DESIGN_SHA = pin.sha
 
 function requireDirectory(target, label) {
   const stat = fs.statSync(target, { throwIfNoEntry: false })

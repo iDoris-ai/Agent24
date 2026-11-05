@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const OPEN_DESIGN_PIN_VERSION = '0.26.1'
+import { OPEN_DESIGN_PIN_VERSION } from './pack-open-design-component.mjs'
 const RESOURCE_TREES = ['app', 'open-design', 'open-design-web-standalone']
 const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 const stageRoot = path.resolve(scriptDir, '../.open-design-resources')

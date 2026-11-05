@@ -166,11 +166,9 @@ pub fn platform_key_from_triple(triple: &str) -> Option<String> {
     platform_key(parts.next()?, arch)
 }
 
-/// Safe relative path inside an artifact.
+/// Safe relative path inside an artifact. Delegates to the shared checker.
 pub(crate) fn clean_relative(path: &str) -> bool {
-    !path.contains(['\\', '\0'])
-        && !path.chars().any(char::is_control)
-        && path.split('/').all(|p| !matches!(p, "" | "." | ".."))
+    crate::integrity::is_safe_relative(path)
 }
 
 impl ComponentLock {

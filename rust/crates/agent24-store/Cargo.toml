@@ -6,6 +6,12 @@ license.workspace = true
 repository.workspace = true
 description = "Agent24 persistence — sqlx SQLite repositories enforcing agent24-core transitions, plus a hash-chained audit log"
 
+[features]
+# G1 allocation journal, G3 retention, and the legacy terminal composition.
+# No production caller. Later workspace G slices turn this on; do not delete
+# the modules (ARCH-OPTIMIZATION-PLAN §6.2, S1-7).
+dormant-workspace = []
+
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tracing = "0.1"
