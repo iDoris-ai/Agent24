@@ -94,7 +94,7 @@ python3 scripts/gen-layer-deps.py --check   # 与 cargo metadata 不一致时退
 | workspace | L2 | core, os-cwd, protocol, store | — |
 | os-proc | L2（平台原语） | （无） | — |
 | os-sqlite | L2（平台原语） | （无） | — |
-| components | L3 | （无） | — |
+| components | L3 | os-proc | — |
 | decide | L3 | hw | — |
 | hw | L3 | （无） | — |
 | idoris | L3 | components, hw | — |

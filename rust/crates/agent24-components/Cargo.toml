@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+agent24-os-proc = { path = "../agent24-os-proc" }
 serde.workspace = true
 serde_json = { workspace = true }
 thiserror = "2"
