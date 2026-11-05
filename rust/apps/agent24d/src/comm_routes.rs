@@ -745,6 +745,10 @@ impl CommRuntime {
     }
 }
 
+/// Only reachable when the embedded Hyphae lock cannot be parsed (see [`build`]), i.e. when
+/// there is nothing pinned to install. `POST /comm/install` is therefore deliberately absent
+/// here: the installer is a method of [`CommRuntime`], which needs that lock. Every other comm
+/// route answers with the `binary_rejected` state instead. (S1-1 / plan B6: expected, not drift.)
 fn unconfigured_router(state: CommState) -> Router {
     Router::new().nest("/api/v1/comm", agent24_comm::router(state))
 }
@@ -1478,6 +1482,42 @@ mod hy1_regression_tests {
         let status = res.status();
         let bytes = axum::body::to_bytes(res.into_body(), 65536).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// B6: with no usable lock there is no installer, so `/comm/install` is not routed
+    /// (404) while the rest of comm still is. `runtime_router` has it (positive control).
+    #[tokio::test]
+    async fn unconfigured_router_has_no_install_route_by_design() {
+        async fn status_of(app: &Router, method: &str, path: &str) -> StatusCode {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+        let app = unconfigured_router(CommState::binary_rejected("bad lock".to_owned()));
+        assert_eq!(
+            status_of(&app, "POST", "/api/v1/comm/install").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_ne!(
+            status_of(&app, "GET", "/api/v1/comm/identity").await,
+            StatusCode::NOT_FOUND,
+            "the rest of comm stays routed"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let live = runtime_router(runtime(dir.path()).await);
+        assert_ne!(
+            status_of(&live, "POST", "/api/v1/comm/install").await,
+            StatusCode::NOT_FOUND,
+            "positive control: the configured router does route it"
+        );
     }
 
     #[tokio::test]

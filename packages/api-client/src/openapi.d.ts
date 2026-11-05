@@ -656,7 +656,8 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** Fetch one approval by id */
+        get: operations["getApproval"];
         put?: never;
         /**
          * Submit the decision for a pending approval
@@ -5404,6 +5405,29 @@ export interface operations {
                     };
                 };
             };
+        };
+    };
+    getApproval: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The approval */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Approval"];
+                };
+            };
+            404: components["responses"]["NotFound"];
         };
     };
     decideApproval: {

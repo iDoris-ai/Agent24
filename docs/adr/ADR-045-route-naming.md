@@ -206,5 +206,5 @@ C1 至 C7 之外，N5、N6、N7、N8、D3、D7、D8 的子路径部分由评审�
 ## 8. 开放问题
 
 1. N3 里 `_name` 和 `_no` 两个后缀是本文的补充（方案只要求「参数名在白名单内」）。如果评审认为只留 `_id` 更干净，就把 `{revision}`、`{page}` 这类序号也改成 `_id` 语义，或者把 `_no` 去掉。
-2. D5 的 `x-external-contract` 标记是 OpenAPI 扩展字段；生成 api-client 时是否会带出，S1-1 实现时核实。
-3. `/comm/install` 在 `unconfigured_router` 里缺失是否预期（方案 S1-1 已列），与命名无关，不在本 ADR 决定。
+2. D5 的 `x-external-contract` 标记是 OpenAPI 扩展字段；生成 api-client 时是否会带出，S1-1 实现时核实。**已核实（S1-1）**：openapi-typescript 7.13 忽略 `x-*`，加标记后 `openapi.d.ts` 无差异。
+3. `/comm/install` 在 `unconfigured_router` 里缺失是否预期（方案 S1-1 已列），与命名无关，不在本 ADR 决定。**已核实（S1-1）**：预期行为，见 `comm_routes.rs` 的 `unconfigured_router` 注释与测试。
