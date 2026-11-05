@@ -112,6 +112,8 @@ function scanTopLevel(raw: string): TopLevelScan {
       if (depth === 1 && expectKey) {
         key = JSON.parse(raw.slice(i, j + 1)) as string
         expectKey = false
+        // serde_json decodes every key it visits (known or not), so a lone surrogate there is an error too.
+        if (out.loneSurrogate === null && hasLoneSurrogate(raw.slice(i, j + 1))) out.loneSurrogate = 'a key'
         if (KNOWN_FIELDS.has(key)) {
           if (seen.has(key) && out.duplicate === null) out.duplicate = key
           seen.add(key)

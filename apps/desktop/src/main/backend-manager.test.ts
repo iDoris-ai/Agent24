@@ -13,6 +13,7 @@ import {
   daemonAcceptsToken,
   requestDaemonShutdown,
   readExternalDaemonState,
+  processAlive,
   BackendManager,
   DAEMON_EXIT_WAIT_MS,
   selectedBackend,
@@ -971,6 +972,95 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
       manager.stop()
       warn.mockRestore()
     }
+  })
+
+  describe('a refused daemon.json (rejected) and who may spawn', () => {
+    const rejected = (pid: number): ExternalDaemonState => ({ port: 5555, token: '', pid, authMode: 'capabilities', rejected: 'unknown auth_mode' })
+    const silent = { ok: false, protocolVersion: null }
+
+    it('processAlive: pid 0 (own process group), pid 1 (EPERM) and junk are never a daemon; a real pid is', () => {
+      expect(processAlive(0)).toBe(false)
+      expect(processAlive(1)).toBe(false)
+      expect(processAlive(-5)).toBe(false)
+      expect(processAlive(Number.NaN)).toBe(false)
+      expect(processAlive(process.pid)).toBe(true)
+    })
+
+    for (const pid of [0, 1]) {
+      it(`pid ${pid} is no live daemon: the record is stale and the manager spawns`, async () => {
+        const spawnProcess = vi.fn(() => fakeChild(111))
+        const external: ExternalDaemonSource = {
+          ...launchAgent(), read: () => rejected(pid), checkHealth: vi.fn(), isAlive: processAlive, fetchHealth: vi.fn(),
+        }
+        const manager = new BackendManager({ external, spawnProcess })
+        await manager.start()
+        expect(spawnProcess).toHaveBeenCalledTimes(1)
+        expect(external.fetchHealth).not.toHaveBeenCalled()
+        manager.stop()
+      })
+    }
+
+    it('a dead pid is stale: spawns (a live-pid-only guard would let this regress silently)', async () => {
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const external: ExternalDaemonSource = {
+        ...launchAgent(), read: () => rejected(4242), checkHealth: vi.fn(), isAlive: () => false, fetchHealth: vi.fn(),
+      }
+      const manager = new BackendManager({ external, spawnProcess })
+      await manager.start()
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      manager.stop()
+    })
+
+    it('silent /health: ticks never spawn, but after 3 silent probes the tray start works and the detail says to delete daemon.json', async () => {
+      vi.useFakeTimers()
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const external: ExternalDaemonSource = {
+        ...launchAgent(), read: () => rejected(4242), checkHealth: vi.fn(), isAlive: () => true, fetchHealth: vi.fn().mockResolvedValue(silent),
+      }
+      const manager = new BackendManager({ external, spawnProcess })
+      try {
+        await manager.start() // probe 1
+        expect(manager.statusDetail()?.hint).toBeUndefined()
+        manager.startDaemon()
+        expect(spawnProcess).not.toHaveBeenCalled() // still blocked: too early
+        await vi.advanceTimersByTimeAsync(HEALTH_INTERVAL_MS) // probe 2
+        expect(spawnProcess).not.toHaveBeenCalled()
+        await vi.advanceTimersByTimeAsync(HEALTH_INTERVAL_MS) // probe 3
+        expect(spawnProcess).not.toHaveBeenCalled() // the automatic loop never spawns
+        expect(manager.statusDetail()).toMatchObject({ reason: 'unknown auth_mode', hint: 'delete_daemon_json' })
+        manager.startDaemon()
+        expect(spawnProcess).toHaveBeenCalledTimes(1)
+      } finally {
+        manager.stop()
+        warn.mockRestore()
+        vi.useRealTimers()
+      }
+    })
+
+    it('an answering /health resets the count: the tray start stays blocked', async () => {
+      vi.useFakeTimers()
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const fetchHealth = vi.fn().mockResolvedValue(silent)
+      const external: ExternalDaemonSource = {
+        ...launchAgent(), read: () => rejected(4242), checkHealth: vi.fn(), isAlive: () => true, fetchHealth,
+      }
+      const manager = new BackendManager({ external, spawnProcess })
+      try {
+        await manager.start()
+        await vi.advanceTimersByTimeAsync(HEALTH_INTERVAL_MS)
+        fetchHealth.mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION })
+        await vi.advanceTimersByTimeAsync(HEALTH_INTERVAL_MS * 3)
+        manager.startDaemon()
+        expect(spawnProcess).not.toHaveBeenCalled()
+        expect(manager.statusDetail()?.hint).toBeUndefined()
+      } finally {
+        manager.stop()
+        warn.mockRestore()
+        vi.useRealTimers()
+      }
+    })
   })
 
   it('does not spawn over an incompatible external daemon, and the health loop does not retry', async () => {

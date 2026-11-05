@@ -442,6 +442,46 @@
         "outcome": "legacy",
         "bearer": "t"
       }
+    },
+    {
+      "name": "lone surrogate in a key",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"\\ud800\":1}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "lone trailing surrogate inside a key",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"x\\udc00y\":\"v\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "two leading surrogates in a row",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"\\ud800\\ud800\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "leading surrogate followed by a plain char",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"\\ud800A\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "protocol_version 1.0",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"protocol_version\":1.0}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
     }
   ]
 }

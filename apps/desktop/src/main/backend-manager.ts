@@ -24,6 +24,8 @@ import { joinLiteral, readDaemonState, tryDataDir } from './data-dir'
 const HEALTH_INTERVAL_MS = 5_000
 const HEALTH_TIMEOUT_MS = 3_000
 const MAX_HEALTH_FAILURES = 3
+/** A refused daemon.json whose /health stays silent this many probes in a row stops blocking manual start/restart. */
+const REJECTED_SILENT_LIMIT = 3
 // T1-0: how long a takeover waits for the CLI daemon to exit after `/shutdown`.
 const TAKEOVER_WAIT_MS = 10_000
 const TAKEOVER_POLL_MS = 200
@@ -39,6 +41,8 @@ export interface BackendStatusDetail {
   readonly pid: number
   /** Set when daemon.json was refused by the strict parser (e.g. an auth_mode this app does not know). */
   readonly reason?: string
+  /** With `reason`: /health has been silent for a while; the record may be stale, delete daemon.json to recover. */
+  readonly hint?: 'delete_daemon_json'
 }
 
 export interface BackendEndpoint {
@@ -457,7 +461,10 @@ export async function requestDaemonShutdown(endpoint: BackendEndpoint, token: st
   return (await fetchWithToken(endpoint, '/api/v1/shutdown', token, 'POST'))?.status ?? null
 }
 
-function processAlive(pid: number): boolean {
+export function processAlive(pid: number): boolean {
+  // kill(0, 0) signals our own process group and pid 1 answers EPERM: neither is a
+  // daemon that wrote this record (Rust pid_alive treats them as not alive too).
+  if (!Number.isInteger(pid) || pid <= 1) return false
   try {
     process.kill(pid, 0)
     return true
@@ -518,6 +525,8 @@ export class BackendManager {
   // external pid. tick keeps probing: a compatible `/health` clears this and
   // reuses the peer; a failed probe clears it and spawns.
   private blockedReason: BackendStatusDetail | null = null
+  // Consecutive silent /health probes against a refused (unparseable) daemon.json record.
+  private rejectedSilent = 0
   // Set while a healthy capability-mode daemon of another host serves this
   // data dir (see tryReuseExternal); nothing is spawned until it is gone.
   private foreignPid: number | null = null
@@ -596,6 +605,7 @@ export class BackendManager {
   private async tryReuseExternal(): Promise<'reused' | 'foreign' | 'absent' | 'incompatible' | 'superseded'> {
     const lifecycle = this.lifecycle
     const state = this.external.read()
+    if (!state || state.rejected === undefined) this.rejectedSilent = 0
     // A record whose pid is gone is stale: whatever holds its port now gets
     // neither a probe nor the token (the Rust readers check the same).
     if (!state || !this.external.isAlive(state.pid)) {
@@ -609,6 +619,7 @@ export class BackendManager {
       // A live pid wrote a record this app refuses to parse. It holds the singleton
       // lock, so spawning would loop forever: report it, never `absent`. Never reused.
       this.foreignPid = null
+      this.rejectedSilent = health.ok ? 0 : this.rejectedSilent + 1
       return this.refuseExternal(state, health.ok ? health.protocolVersion : null)
     }
     if (!health.ok) {
@@ -688,9 +699,11 @@ export class BackendManager {
       kind: 'protocol_mismatch', daemonVersion, clientVersion: CLIENT_PROTOCOL_VERSION,
       recordedVersion: state.protocolVersion, pid: state.pid,
       ...(state.rejected === undefined ? {} : { reason: state.rejected }),
+      ...(state.rejected !== undefined && this.rejectedSilent >= REJECTED_SILENT_LIMIT ? { hint: 'delete_daemon_json' as const } : {}),
     }
     const already = this.blockedReason?.pid === detail.pid
       && this.blockedReason.reason === detail.reason
+      && this.blockedReason.hint === detail.hint
       && this.blockedReason.daemonVersion === detail.daemonVersion
       && this.blockedReason.recordedVersion === detail.recordedVersion
     this.blockedReason = detail
@@ -753,7 +766,7 @@ export class BackendManager {
     // Spawning against an incompatible peer's lock just restarts the failure
     // loop. (A `foreign` peer is different: a manual start is allowed through,
     // and its outcome is re-read on the next probe.)
-    if (this.blockedReason !== null) return
+    if (this.blockedReason !== null && this.blockedReason.hint === undefined) return
     this.userStopped = false
     this.failureCount = 0
     if (!this.gateOpen) return // start() spawns once its gate opens
@@ -789,7 +802,7 @@ export class BackendManager {
       return
     }
     this.lifecycle += 1
-    if (this.blockedReason !== null) return
+    if (this.blockedReason !== null && this.blockedReason.hint === undefined) return
     this.userStopped = false
     this.failureCount = 0
     this.lastHealthy = false
