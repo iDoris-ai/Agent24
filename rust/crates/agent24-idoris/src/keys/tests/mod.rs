@@ -106,11 +106,26 @@ elif command == 'revoke':
         // Cold-starting a fresh script (interpreter start plus the OS scanning a newly
         // written executable) can take many seconds on a loaded macOS runner. Pay that
         // cost here, outside any timeout under test.
-        let warm = std::process::Command::new(&binary)
-            .env_clear()
-            .stdin(std::process::Stdio::null())
-            .status()
-            .unwrap();
+        // Linux refuses to exec a file some process still holds open for writing
+        // (ETXTBSY). A parallel test that forks between our write and close inherits that
+        // descriptor until its own exec, so the first exec of a fresh script can fail
+        // transiently. Retry only that error.
+        let mut attempt = 0;
+        let warm = loop {
+            match std::process::Command::new(&binary)
+                .env_clear()
+                .stdin(std::process::Stdio::null())
+                .status()
+            {
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 50 =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => break other.unwrap(),
+            }
+        };
         assert!(warm.success());
         let store = Arc::new(MemoryKeychain {
             locked,
