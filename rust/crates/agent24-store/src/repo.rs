@@ -179,7 +179,6 @@ pub struct RunPatch {
     pub ended_at: Option<String>,
 }
 
-#[allow(dead_code)]
 pub(crate) async fn transition_run_tx(
     tx: &mut Transaction<'_, Sqlite>,
     id: &str,

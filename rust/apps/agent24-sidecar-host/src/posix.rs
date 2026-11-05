@@ -132,7 +132,6 @@ pub struct OwnedPipes {
     pub stderr: ChildStderr,
 }
 
-#[allow(dead_code)]
 impl OwnedGeneration {
     pub fn launch(spec: LaunchSpec) -> io::Result<Self> {
         if !spec.executable.is_absolute() || !spec.cwd.is_absolute() {

@@ -1,4 +1,4 @@
-#![allow(dead_code, clippy::type_complexity, clippy::items_after_test_module)]
+#![allow(clippy::type_complexity, clippy::items_after_test_module)]
 // Dormant until the future registration writer adopts this transaction helper.
 
 use serde_json::json;

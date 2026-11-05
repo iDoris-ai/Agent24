@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "frozen (ADR-038 Q1=(b)): Open Design is hosted by SidecarManager; this crate is not on the product path"
 
 [dependencies]
 agent24-sidecar-host-protocol = { path = "../../crates/agent24-sidecar-host-protocol" }
