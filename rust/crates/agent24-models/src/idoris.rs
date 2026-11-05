@@ -608,7 +608,15 @@ mod tests {
             assert!(contract_version_accepted(ok), "should accept {ok:?}");
         }
         for bad in [
-            "1.0.0", "1.0.1", "1.0.99", "0.9.9", "2.0.0", "1.1", "v1.1.0", "",
+            "1.0.0",
+            "1.0.1",
+            "1.0.99",
+            "0.9.9",
+            "2.0.0",
+            "1.1",
+            "v1.1.0",
+            "",
+            "1.1.0-rc1",
         ] {
             assert!(!contract_version_accepted(bad), "should reject {bad:?}");
         }
