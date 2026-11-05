@@ -174,7 +174,7 @@ pub(crate) async fn strict_audit_tail_tx(
 }
 
 impl StrictAuditTail {
-    /// Next hash-chained tuple. Only the dormant G3 retention writer calls this.
+    /// Next hash-chained tuple. The G3 retention writer and its expectation helper call this.
     #[cfg(feature = "dormant-workspace")]
     pub(crate) fn prospective(
         &self,

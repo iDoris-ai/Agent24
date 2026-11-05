@@ -75,7 +75,7 @@ impl AllocationFailureReason {
         Ok(Self(value.to_owned()))
     }
 
-    /// Retention audit binds the reason text. Only the dormant G3 writer calls it.
+    /// Reason text for the retention audit detail. The G3 writer calls this.
     #[cfg(feature = "dormant-workspace")]
     pub(crate) fn as_str(&self) -> &str {
         &self.0
