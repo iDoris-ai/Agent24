@@ -2,7 +2,7 @@
 
 索引：[架构总入口](../architecture/README.md)・[ADR 索引](README.md)
 
-- 状态：**提议**（2026-11-05，草案；待评审后接受）
+- 状态：**已接受**（jason 2026-11-05 拍板接受；正文 2026-11-05 经 #1593 评审合入）。§6 待办表里的订正项照常推进，不影响接受
 - 编号：ADR-044，ADR 索引是唯一发号处（[架构优化方案](../tracking/2026-11-04/ARCH-OPTIMIZATION-PLAN.md) 的 S0-3 / A5）。`docs/research/deepseek-superagent/SUPERAGENT-EVOLUTION-2026-11-01-codex-astra.md:109,145` 里另有一份叫「ADR-044」的 Codex 稿，按 S0-3 改记为 `DRAFT-C04x`，与本篇无关。
 - 登记：S0-3（#1596）已合入，索引里的 ADR-044 一行由 S0-7 PR 补上。
 - 上位：ADR-037 决策 1、6（`docs/decision.md:1605-1612`）；[ADR-038](ADR-038-component-contract-v1.md)；[ADR-039](ADR-039-concept-model.md)；[ADR-041](ADR-041-inbound-events-admission-and-work-items.md)
