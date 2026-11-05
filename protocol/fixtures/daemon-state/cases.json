@@ -1,0 +1,303 @@
+{
+  "comment": "Locked cross-language: rust state_file.rs test + TS packages/data-dir daemon-state and every TS reader of daemon.json run these. outcome: legacy (bearer usable) | capabilities (valid, no bearer) | rejected (record refused).",
+  "cases": [
+    {
+      "name": "legacy explicit",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": "legacy-bearer"
+      },
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "legacy-bearer"
+      }
+    },
+    {
+      "name": "legacy: auth_mode absent (pre-capability file)",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "token": "legacy-bearer"
+      },
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "legacy-bearer"
+      }
+    },
+    {
+      "name": "legacy with protocol_version",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": "legacy-bearer",
+        "protocol_version": 1
+      },
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "legacy-bearer"
+      }
+    },
+    {
+      "name": "capabilities: no token, has generation",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "capabilities"
+      },
+      "expect": {
+        "outcome": "capabilities"
+      }
+    },
+    {
+      "name": "capabilities with enroll_endpoint and docked",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "capabilities",
+        "enroll_endpoint": "/x/enroll.sock",
+        "startup_state": "docked"
+      },
+      "expect": {
+        "outcome": "capabilities"
+      }
+    },
+    {
+      "name": "unknown auth_mode",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "something_new",
+        "token": "legacy-bearer"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "auth_mode null",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": null,
+        "token": "legacy-bearer"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "legacy: token missing",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "inconsistent"
+      }
+    },
+    {
+      "name": "legacy: token empty",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": ""
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "inconsistent"
+      }
+    },
+    {
+      "name": "capabilities: carries a token",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "capabilities",
+        "token": "leaked"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "inconsistent"
+      }
+    },
+    {
+      "name": "capabilities: generation missing",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "auth_mode": "capabilities"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "inconsistent"
+      }
+    },
+    {
+      "name": "enroll_endpoint on a legacy record",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": "legacy-bearer",
+        "enroll_endpoint": "/x/enroll.sock"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "inconsistent"
+      }
+    },
+    {
+      "name": "port missing",
+      "json": {
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": "legacy-bearer"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "port out of u16 range",
+      "json": {
+        "port": 70000,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": "legacy-bearer"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "port is a string",
+      "json": {
+        "port": "4321",
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": "legacy-bearer"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "pid negative",
+      "json": {
+        "port": 4321,
+        "pid": -1,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": "legacy-bearer"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "version missing",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": "legacy-bearer"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "token is not a string",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": 7
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "protocol_version is negative",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": "legacy-bearer",
+        "protocol_version": -1
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "not an object",
+      "json": [
+        1,
+        2
+      ],
+      "expect": {
+        "outcome": "rejected",
+        "reason": "malformed"
+      }
+    },
+    {
+      "name": "not JSON",
+      "text": "{not json",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "malformed"
+      }
+    }
+  ]
+}

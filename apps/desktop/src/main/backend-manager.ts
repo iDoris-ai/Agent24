@@ -19,7 +19,7 @@ import {
   protocolCompatibility,
   protocolVersionOf,
 } from './protocol-compatibility'
-import { joinLiteral, tryDataDir } from './data-dir'
+import { joinLiteral, readDaemonState, tryDataDir } from './data-dir'
 
 const HEALTH_INTERVAL_MS = 5_000
 const HEALTH_TIMEOUT_MS = 3_000
@@ -285,34 +285,22 @@ export function daemonStatePath(): string | null {
 export function readExternalDaemonState(): ExternalDaemonState | null {
   const statePath = daemonStatePath()
   if (!statePath) return null
-  try {
-    const raw = fs.readFileSync(statePath, 'utf8')
-    const parsed = JSON.parse(raw) as {
-      port?: unknown
-      token?: unknown
-      pid?: unknown
-      auth_mode?: unknown
-      protocol_version?: unknown
-    }
-    if (typeof parsed.port !== 'number' || typeof parsed.pid !== 'number') return null
-    const token = typeof parsed.token === 'string' ? parsed.token : ''
-    // Only a legacy record (or one from before `auth_mode` existed) shares its
-    // token through this file; any other mode keeps host authority private.
-    const legacy = parsed.auth_mode === undefined || parsed.auth_mode === 'legacy_single_token'
-    const state: ExternalDaemonState = {
-      port: parsed.port,
-      token,
-      pid: parsed.pid,
-      authMode: legacy ? 'legacy' : 'capabilities',
-    }
-    const recorded = parsed.protocol_version
-    if (typeof recorded === 'number' && Number.isInteger(recorded) && recorded >= 0) {
-      state.protocolVersion = recorded
-    }
-    return state
-  } catch {
-    return null
+  // The one parser (`@agent24/data-dir`, mirrors Rust `state_file.rs`): a
+  // record that fails its validation — including an unknown `auth_mode`, which
+  // this function used to treat as "capabilities" — is nothing to reuse.
+  const read = readDaemonState(statePath)
+  if (!read.ok) return null
+  const { state } = read
+  // Only a legacy record shares its token through this file; capability mode
+  // keeps host authority private (token is '' there, by validation).
+  const out: ExternalDaemonState = {
+    port: state.port,
+    token: state.token,
+    pid: state.pid,
+    authMode: state.authMode === 'legacy_single_token' ? 'legacy' : 'capabilities',
   }
+  if (state.protocolVersion !== undefined) out.protocolVersion = state.protocolVersion
+  return out
 }
 
 /** Discovery + health-probing, factored out so tests can inject both without

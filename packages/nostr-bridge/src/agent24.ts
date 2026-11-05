@@ -3,13 +3,18 @@
 // as any other run), and the run's output goes back over Nostr. Mirrors the F3
 // wechat-bridge client; deliberately thin.
 
+import type { components } from '@agent24/api-client'
+
+type RunStatus = components['schemas']['RunStatus']
+type Run = components['schemas']['Run']
+
 export interface DaemonEndpoint {
   base: string
   token: string
 }
 
 export interface RunResult {
-  status: 'completed' | 'failed' | 'cancelled' | 'awaiting_approval' | 'running' | 'queued'
+  status: RunStatus
   text?: string
   error?: string
   runId: string
@@ -55,11 +60,7 @@ export class Agent24Client {
     while (Date.now() < deadline) {
       const res = await fetch(`${this.ep.base}/api/v1/runs/${runId}`, { headers: this.headers() })
       if (!res.ok) return { status: 'failed', error: `run poll failed: HTTP ${res.status}`, runId }
-      const run = (await res.json()) as {
-        status: RunResult['status']
-        output?: { text: string } | null
-        error?: { code: string; message: string } | null
-      }
+      const run = (await res.json()) as Pick<Run, 'status' | 'output' | 'error'>
       switch (run.status) {
         case 'completed':
           return { status: 'completed', text: run.output?.text ?? '', runId }

@@ -5,8 +5,7 @@
 // values (ported from heinu1 / weixin-bot-ilink); the agent24d endpoint is
 // discovered from the daemon's state file, overridable by env.
 
-import fs from 'node:fs'
-import { dataDir, joinLiteral } from '@agent24/data-dir'
+import { dataDir, joinLiteral, requireDaemonBearer } from '@agent24/data-dir'
 
 export const CONFIG = {
   // ── WeChat iLink (official bot API) ──────────────────────────────────────
@@ -66,22 +65,14 @@ export interface DaemonEndpoint {
 }
 
 /** Discover the running agent24d: env first (A24_BASE_URL / A24_TOKEN), else the
- * daemon's state file. Returns null when no daemon can be located. */
+ * daemon's state file via the one shared parser (`@agent24/data-dir`).
+ * Returns null when no daemon can be located (no state file).
+ * Throws DaemonStateError when a state file exists but cannot give this bridge
+ * a bearer (capabilities mode, missing/empty token, invalid or unknown-mode
+ * record): the bridge must fail loudly, never send an empty token. */
 export function discoverDaemon(): DaemonEndpoint | null {
   const envBase = process.env.A24_BASE_URL
-  const envToken = process.env.A24_TOKEN
-  if (envBase) return { base: envBase.replace(/\/+$/, ''), token: envToken ?? '' }
-
-  try {
-    const raw = JSON.parse(fs.readFileSync(CONFIG.DAEMON_STATE_FILE, 'utf8')) as {
-      port?: number
-      token?: string
-    }
-    if (typeof raw.port === 'number') {
-      return { base: `http://127.0.0.1:${raw.port}`, token: raw.token ?? '' }
-    }
-  } catch {
-    /* no state file yet */
-  }
-  return null
+  if (envBase) return { base: envBase.replace(/\/+$/, ''), token: process.env.A24_TOKEN ?? '' }
+  const found = requireDaemonBearer(CONFIG.DAEMON_STATE_FILE)
+  return found && { base: `http://127.0.0.1:${found.port}`, token: found.token }
 }

@@ -88,9 +88,9 @@ describe('readExternalDaemonState (DEP-A5 daemon.json discovery)', () => {
   })
 
   it('keeps protocol_version when daemon.json has it, and leaves it off when the file is old', () => {
-    writeState({ port: 4321, token: 'abc', pid: 999, protocol_version: 1 })
+    writeState({ port: 4321, token: 'abc', pid: 999, version: 'v', protocol_version: 1 })
     expect(readExternalDaemonState()).toEqual({ port: 4321, token: 'abc', pid: 999, authMode: 'legacy', protocolVersion: 1 })
-    writeState({ port: 4321, token: 'abc', pid: 999 })
+    writeState({ port: 4321, token: 'abc', pid: 999, version: 'v' })
     expect(readExternalDaemonState()?.protocolVersion).toBeUndefined()
   })
 
@@ -111,15 +111,34 @@ describe('readExternalDaemonState (DEP-A5 daemon.json discovery)', () => {
   })
 
   it('marks a capability-mode record, which shares no token', () => {
-    writeState({ port: 1, pid: 2, auth_mode: 'capabilities', generation: 'g1' })
+    writeState({ port: 1, pid: 2, version: 'v', auth_mode: 'capabilities', generation: 'g1' })
     expect(readExternalDaemonState()).toEqual({ port: 1, token: '', pid: 2, authMode: 'capabilities' })
   })
 
-  it('treats an unknown auth_mode as not shareable, and a record without one as legacy', () => {
-    writeState({ port: 1, token: 'x', pid: 2, auth_mode: 'something_new' })
-    expect(readExternalDaemonState()?.authMode).toBe('capabilities')
-    writeState({ port: 1, token: 'x', pid: 2 })
+  it('refuses an unknown auth_mode (no longer read as capabilities), and reads a record without one as legacy', () => {
+    writeState({ port: 1, token: 'x', pid: 2, version: 'v', auth_mode: 'something_new' })
+    expect(readExternalDaemonState()).toBeNull()
+    writeState({ port: 1, token: 'x', pid: 2, version: 'v' })
     expect(readExternalDaemonState()?.authMode).toBe('legacy')
+  })
+
+  // The shared daemon.json fixture (protocol/fixtures/daemon-state): data-dir, documents-accept and both bridges run the same file.
+  describe('shared fixture', () => {
+    const fixture = path.join(__dirname, '../../../../protocol/fixtures/daemon-state/cases.json')
+    const cases = (JSON.parse(fs.readFileSync(fixture, 'utf8')) as {
+      cases: Array<{ name: string; json?: unknown; text?: string; expect: { outcome: 'legacy' | 'capabilities' | 'rejected'; bearer?: string } }>
+    }).cases
+    for (const c of cases) {
+      it(c.name, () => {
+        const dir = path.join(tmpHome, '.agent24')
+        fs.mkdirSync(dir, { recursive: true })
+        fs.writeFileSync(path.join(dir, 'daemon.json'), c.text ?? JSON.stringify(c.json))
+        const got = readExternalDaemonState()
+        if (c.expect.outcome === 'rejected') expect(got).toBeNull()
+        else if (c.expect.outcome === 'capabilities') expect(got).toMatchObject({ authMode: 'capabilities', token: '' })
+        else expect(got).toMatchObject({ authMode: 'legacy', token: c.expect.bearer })
+      })
+    }
   })
 
   it('returns null when HOME is unset — mirrors the Rust state_dir() contract', () => {
@@ -150,7 +169,7 @@ describe('readExternalDaemonState (DEP-A5 daemon.json discovery)', () => {
     writeState({ port: 1111, token: 'home', pid: 1 })
     const dataDir = path.join(tmpHome, 'isolated')
     fs.mkdirSync(dataDir, { recursive: true })
-    fs.writeFileSync(path.join(dataDir, 'daemon.json'), JSON.stringify({ port: 2222, token: 'iso', pid: 2 }))
+    fs.writeFileSync(path.join(dataDir, 'daemon.json'), JSON.stringify({ port: 2222, token: 'iso', pid: 2, version: 'v' }))
     process.env['AGENT24_DATA_DIR'] = dataDir
     expect(readExternalDaemonState()).toEqual({ port: 2222, token: 'iso', pid: 2, authMode: 'legacy' })
   })

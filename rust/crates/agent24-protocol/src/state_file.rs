@@ -339,6 +339,42 @@ mod tests {
 
     use super::*;
 
+    /// Locked to the TS parser (`packages/data-dir/src/daemon-state.ts`) by
+    /// the shared fixture: same records accepted / refused, same bearer rule.
+    #[test]
+    fn shared_fixture_agrees_with_the_ts_parser() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../protocol/fixtures/daemon-state/cases.json");
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let cases = doc["cases"].as_array().unwrap();
+        assert!(cases.len() >= 20);
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let raw = match case.get("text") {
+                Some(t) => t.as_str().unwrap().to_owned(),
+                None => case["json"].to_string(),
+            };
+            let expect = &case["expect"];
+            let parsed = serde_json::from_str::<DaemonState>(&raw)
+                .map_err(|e| e.to_string())
+                .and_then(|s| s.validate().map(|()| s));
+            match expect["outcome"].as_str().unwrap() {
+                "legacy" => {
+                    let s = parsed.unwrap_or_else(|e| panic!("{name}: {e}"));
+                    assert_eq!(s.bearer_token(), Ok(expect["bearer"].as_str().unwrap()), "{name}");
+                }
+                "capabilities" => {
+                    let s = parsed.unwrap_or_else(|e| panic!("{name}: {e}"));
+                    assert!(s.auth_mode.is_capabilities(), "{name}");
+                    assert!(s.bearer_token().is_err(), "{name}");
+                }
+                "rejected" => assert!(parsed.is_err(), "{name} must be refused"),
+                other => panic!("{name}: unknown outcome {other}"),
+            }
+        }
+    }
+
     #[test]
     fn state_dir_is_the_data_dir_alias() {
         assert_eq!(state_dir(), crate::data_dir::data_dir().ok());

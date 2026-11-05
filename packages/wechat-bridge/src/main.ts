@@ -17,7 +17,16 @@ import { FileSessionStore } from './session-store.js'
 import { CONFIG, discoverDaemon } from './config.js'
 
 async function main(): Promise<void> {
-  const daemon = discoverDaemon()
+  let daemon: ReturnType<typeof discoverDaemon>
+  try {
+    daemon = discoverDaemon()
+  } catch (err) {
+    // daemon.json exists but yields no bearer (capabilities mode / missing token /
+    // invalid record): refuse to start rather than send unauthenticated requests.
+    console.error(`[wechat] agent24d 状态文件不能用于桥接:${err instanceof Error ? err.message : err}`)
+    console.error('[wechat] 桥接需要 legacy 模式的 daemon(状态文件带 token),或显式设置 A24_BASE_URL / A24_TOKEN。')
+    process.exit(1)
+  }
   if (!daemon) {
     console.error(
       '[wechat] 找不到运行中的 agent24d。先启动它（agent24 daemon start），' +
