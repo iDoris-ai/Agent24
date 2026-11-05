@@ -247,6 +247,18 @@ pub fn validate_section(
             });
         }
     }
+    // A bare name (no `/`) is resolved on PATH at launch (`agent24-os-proto` `launch::resolve`),
+    // so a same-named file in the package would pass this check while a binary outside the
+    // manifest runs. Only a package-relative path with a separator is bound to the listed bytes.
+    if let Some(command) = spawn_command
+        && !command.contains('/')
+    {
+        return Err(IntegrityError::ManifestInvalid {
+            detail: format!(
+                "spawn.command {command} must be a package-relative path such as bin/{command}, not a PATH lookup"
+            ),
+        });
+    }
     if let Some(command) = spawn_command
         && !executables
             .iter()

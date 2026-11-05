@@ -378,6 +378,31 @@ mod tests {
     }
 
     #[test]
+    fn bare_spawn_command_is_rejected_even_when_a_same_named_file_is_listed() {
+        // `sh` in the package root would satisfy "is an integrity executable", but launch
+        // resolves a bare name on PATH and would run an unverified binary outside the package.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_tree(root, "cos72");
+        let yaml = yaml_for("cos72").replace("command: bin/cos72", "command: sh");
+        fs::write(root.join(DOMAIN_OS_YML), yaml).unwrap();
+        fs::write(root.join("sh"), b"not-a-shell").unwrap();
+        let err = generate(root, &["sh".into(), "bin/cos72".into()]).unwrap_err();
+        assert!(err.to_string().contains("package-relative path"), "{err}");
+        // A hand-written section with the same shape is refused by the shared validator too,
+        // which verify and discovery both call.
+        let section = IntegritySection {
+            manifest_file: FILES_JSON_NAME.into(),
+            sha256: "0".repeat(64),
+            files: vec!["sh".into()],
+            executables: vec!["sh".into()],
+        };
+        let err = integrity::validate_section(&section, Some("sh")).unwrap_err();
+        assert!(err.to_string().contains("package-relative path"), "{err}");
+        assert!(integrity::validate_section(&section, Some("./sh")).is_err());
+    }
+
+    #[test]
     fn t2_generate_preserves_flow_yaml_business_fields() {
         let dir = tempfile::tempdir().unwrap();
         write_tree(dir.path(), "cos72");
