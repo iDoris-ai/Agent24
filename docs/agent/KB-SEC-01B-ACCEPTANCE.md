@@ -34,17 +34,19 @@
 
 **说明**：
 - 生产里所有模型调用都是 LocalOnly（`agent24-store/src/source_policy.rs` 的构造器写死了 `mode: LocalOnly`），后面还有一层 `deny_all` 出口门。所以在 Z1 的配置下，就算 LocalOnly 排除失效，远端计数也还是 0。能证明排除本身在起作用的是 L1：它的报错只会出现在「LocalOnly 且没有本地 provider」这个分支（同 `docs/design/K1-06b-egress-matrix.md` §2 末尾的说法）。
+- 依赖检索的用例都先确认 knowledge_search 带回了样本事实。检索失败的结果同样会打上 Unknown 标签，不先确认这一点，后面的拒绝就证明不了是 Knowledge 证据起的作用（见反面对照第三组）。
 - 工具出口只在 run 带着非 Ordinary 来源时才拦。Knowledge 的结果算 Unknown（`Tool::result_source` 的默认值）。knowledge_search 之后再调 Knowledge 照常放行，这是同源例外（`knowledge_tools.rs`）。
 - M1 放在最后跑：召回按提示词做全文检索，它留下的 Unknown 事实里没有 `SEC`，前面用例的提示词召回不到它，所以不会影响这些用例。
 
 ## 反面对照
 
-两次都是在同一棵树上改一行、重编、照原样跑；结果见 PR 正文。
+前两组在同一棵树上改一行、重编，第三组只改脚本副本，都照原样跑；结果见 PR 正文。
 
 | 改动 | 预期 |
 |---|---|
 | `KnowledgeTool` 的 `result_source` 改为 Ordinary（假装 Knowledge 证据是普通资料） | H1、X1、P1、C1、B1、R1、M1 共 7 条变红；其余 9 条照旧通过，因为模型路径不看来源分类，一律 LocalOnly |
 | 路由层 `tier_order` 给 LocalOnly 也排上 Remote | 只有 L1 变红，报错变成出口门拒绝；Z1 照旧是 0，靠的是 `deny_all` |
+| 脚本副本里让假 WeKnora 的 search 一律回 500（daemon 不改） | A1、H1、X1、P1、D1、C1、B1、R1、S1、M1 共 10 条变红；E0、O1、T1、T2、L1、Z1 照旧通过 |
 
 ## 不在这里验的
 

@@ -378,6 +378,14 @@ def results_of(run):
         return [f"<answer: {text[:200]}>"]
 
 
+def got_evidence(run):
+    """The run's first tool answer is a knowledge_search that brought the sample
+    back: a failed search is tagged Unknown too, so a refusal after one would
+    not show what Knowledge evidence does (#1089 review C1)."""
+    r = results_of(run)
+    return bool(r) and FACT in str(r[0]) and '"kind":"knowledge.search"' in str(r[0])
+
+
 def refused(result):
     return str(result).startswith(REFUSED)
 
@@ -401,7 +409,7 @@ def cases(d, wk):
     runs = [d.ask(p, binding=None) for p in ("SEC:fetch", "SEC:mcp", f"SEC:exec FILE={ctl}")]
     r = [x for run in runs for x in results_of(run)]
     check("O1", "对照：没有 Knowledge 证据的 run，http_fetch（到 DNS 这一步）、MCP、shell_exec 都照常放行",
-          len(r) == 3 and not any(refused(x) for x in r) and os.path.exists(ctl) and mcp_calls() == 1,
+          len(r) == 3 and "dns lookup failed" in r[0] and r[1] == "PONG-1089" and os.path.exists(ctl) and mcp_calls() == 1,
           f"{'；'.join(show(run) for run in runs)}；control 文件 {'在' if os.path.exists(ctl) else '不在'}；MCP 收到 {mcp_calls()} 次")
 
     run = d.ask("SEC:ks")
@@ -412,33 +420,34 @@ def cases(d, wk):
 
     run = d.ask("SEC:ks,fetch")
     r = results_of(run)
-    check("H1", "HTTP：有 Knowledge 证据后 http_fetch 在发出前被拒", len(r) == 2 and refused(r[1]), show(run))
+    check("H1", "HTTP：有 Knowledge 证据后 http_fetch 在发出前被拒",
+          got_evidence(run) and len(r) == 2 and refused(r[1]), show(run))
 
     gone = os.path.join(d.data, "workspace", "exec.touched")
     run = d.ask(f"SEC:ks,exec FILE={gone}")
     r = results_of(run)
     check("X1", "Exec：有 Knowledge 证据后 shell_exec 被拒，子进程没跑",
-          len(r) == 2 and refused(r[1]) and not os.path.exists(gone), f"{show(run)}；文件 {'在' if os.path.exists(gone) else '不在'}")
+          got_evidence(run) and len(r) == 2 and refused(r[1]) and not os.path.exists(gone), f"{show(run)}；文件 {'在' if os.path.exists(gone) else '不在'}")
 
     before = mcp_calls()
     run = d.ask("SEC:ks,mcp")
     r = results_of(run)
     check("P1", "MCP：有 Knowledge 证据后 MCP 工具被拒，MCP server 没收到调用",
-          len(r) == 2 and refused(r[1]) and mcp_calls() == before, f"{show(run)}；MCP 调用 {before}→{mcp_calls()}")
+          got_evidence(run) and len(r) == 2 and refused(r[1]) and mcp_calls() == before, f"{show(run)}；MCP 调用 {before}→{mcp_calls()}")
 
     n = len(LOG["local"])
     run = d.ask("SEC:ks,explore")
     r = results_of(run)
     sub = [b for _, _, b in LOG["local"][n:] if b and any("SUB-1089" in text_of(m) for m in b.get("messages") or [])]
     check("D1", "委派：有 Knowledge 证据后 explore 子调用只到本地档",
-          run.get("status") == "completed" and len(r) == 2 and bool(sub), f"{show(run)}；本地档收到子调用 {len(sub)} 次")
+          run.get("status") == "completed" and got_evidence(run) and len(r) == 2 and bool(sub), f"{show(run)}；本地档收到子调用 {len(sub)} 次")
 
     s = d.session()
     first = d.ask("SEC:ks", session=s)
     run = d.ask("SEC:fetch", session=s)
     r = results_of(run)
     check("C1", "续轮：同一会话上一轮有 Knowledge 证据，下一轮 http_fetch 被拒",
-          first.get("status") == "completed" and len(r) == 1 and refused(r[0]), show(run))
+          first.get("status") == "completed" and got_evidence(first) and len(r) == 1 and refused(r[0]), show(run))
 
     tag = str(int(time.time()))
     run = d.ask(f"SEC:ks,wake TAG={tag}")
@@ -451,7 +460,7 @@ def cases(d, wk):
     woken = d.wait(woken["id"]) if woken.get("id") else {}
     r = results_of(woken)
     check("B1", "后台：有 Knowledge 证据的 run 建的 self_wake，被唤醒的 run 里 http_fetch 被拒",
-          run.get("status") == "completed" and woken.get("status") == "completed" and len(r) == 1 and refused(r[0]),
+          got_evidence(run) and woken.get("status") == "completed" and len(r) == 1 and refused(r[0]),
           f"建唤醒的 {show(run)}；被唤醒的 {show(woken)}")
 
     park = os.path.join(d.data, "workspace", "resume.txt")
@@ -462,11 +471,12 @@ def cases(d, wk):
     run = d.wait(run_id)
     r = results_of(run)
     check("R1", "恢复：停在审批上时 daemon 被 kill -9，重启批准后，http_fetch 仍被拒",
-          parked.get("status") == "until" and run.get("status") == "completed" and len(r) == 3 and refused(r[2]),
+          parked.get("status") == "until" and got_evidence(run) and len(r) == 3
+          and str(r[1]).startswith("wrote ") and os.path.exists(park) and refused(r[2]),
           f"停下 {parked.get('status')}；恢复后 {show(run)}")
 
     s = d.session()
-    d.ask("SEC:ks", session=s)
+    first = d.ask("SEC:ks", session=s)
     for i in range(20):
         d.ask(f"SEC: turn {i}", binding=None, session=s)
     deadline = time.time() + 30
@@ -475,7 +485,7 @@ def cases(d, wk):
     while time.time() < deadline and not summaries("local"):
         time.sleep(1)
     check("S1", "摘要：带 Knowledge 证据的会话做压缩，摘要调用只到本地档",
-          bool(summaries("local")) and not summaries("remote"), f"本地档摘要调用 {len(summaries('local'))} 次，远端档 {len(summaries('remote'))} 次")
+          got_evidence(first) and bool(summaries("local")) and not summaries("remote"), f"本地档摘要调用 {len(summaries('local'))} 次，远端档 {len(summaries('remote'))} 次")
 
     # Agent24 -> WeKnora (K1-DEPENDENCIES G1(a), K1-D9).
     searches = sum(1 for op, _ in WK_CALLS if op == "search")
@@ -496,7 +506,7 @@ def cases(d, wk):
     recalled = any("ZEBRA1089" in text_of(m) and text_of(m).startswith("[记忆数据")
                    for _, _, b in LOG["local"][n:] if b for m in b.get("messages") or [])
     check("M1", "记忆：有 Knowledge 证据的 run 记下的事实，在别的会话被召回后，http_fetch 被拒",
-          first.get("status") == "completed" and recalled and len(r) == 1 and refused(r[0]),
+          got_evidence(first) and recalled and len(r) == 1 and refused(r[0]),
           f"记下 {first.get('status')}；召回 {'有' if recalled else '没有'}；{show(run)}")
 
 
