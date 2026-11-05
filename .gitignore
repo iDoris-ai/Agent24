@@ -15,7 +15,8 @@ coverage/
 .vscode/
 .idea/
 *.tsbuildinfo
-rust/target/
+# rust/target 在装了 mbx 的机器上是指向共享缓存的链接，不是目录，不能写成 rust/target/
+rust/target
 CLAUDE.md
 
 # Local-only reference clones for code study (NOT submodules, never committed)
