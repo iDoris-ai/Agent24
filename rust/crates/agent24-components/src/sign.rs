@@ -172,15 +172,10 @@ pub struct CodesignWith<R>(pub R);
 
 /// The requirement for "signed by this Developer ID team". The leading `=` is
 /// mandatory: without it codesign reads the value as a file path (#1533).
-/// It also demands the Developer ID chain markers (intermediate 1.2.840.113635.100.6.2.6
-/// and the Developer ID Application leaf 1.2.840.113635.100.6.1.13), so a Mac App Store or
-/// development certificate of the same team does not pass.
+/// The requirement text itself is `agent24_os_proc::developer_id_requirement`,
+/// the same one the daemon applies at enrol time (S1-2 / E1).
 pub fn team_requirement(team_id: &str) -> String {
-    format!(
-        "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
-         and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
-         and certificate leaf[subject.OU] = \"{team_id}\""
-    )
+    format!("={}", agent24_os_proc::developer_id_requirement(team_id))
 }
 
 /// Apple Team IDs are ten upper-case letters or digits.

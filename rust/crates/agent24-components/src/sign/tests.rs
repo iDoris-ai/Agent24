@@ -7,6 +7,18 @@ const REQ: SigningRequirement = SigningRequirement {
     notarized: true,
 };
 
+/// S1-2 / E1: install-time and enrol-time use the very same requirement text.
+#[test]
+fn install_requirement_is_the_enrol_requirement() {
+    assert_eq!(
+        team_requirement(agent24_os_proc::DEVELOPER_ID_TEAM_ID),
+        format!(
+            "={}",
+            agent24_os_proc::developer_id_requirement("HYAP444FN9")
+        )
+    );
+}
+
 #[test]
 fn requirement_has_the_mandatory_leading_equals() {
     // Without the `=`, codesign reads the value as a file path (#1533).

@@ -228,6 +228,27 @@ pub fn start_time(_pid: i32) -> io::Result<ProcStart> {
     ))
 }
 
+/// The one Apple Developer ID Team ID that signs every first-party Agent24
+/// binary. Lock files, release scripts and package metadata repeat this value;
+/// `tests/team_id_consistency.rs` fails if any of them drifts from it.
+pub const DEVELOPER_ID_TEAM_ID: &str = "HYAP444FN9";
+
+/// The code requirement for "signed by this Developer ID team", shared by the
+/// install-time check (`agent24-components`, which prefixes the `=` that
+/// `codesign -R` needs) and the enrol-time check below, so the two cannot drift.
+///
+/// It demands the Developer ID chain markers (intermediate
+/// 1.2.840.113635.100.6.2.6 and the Developer ID Application leaf
+/// 1.2.840.113635.100.6.1.13), so a Mac App Store or Apple Development
+/// certificate of the same team does not pass.
+pub fn developer_id_requirement(team_id: &str) -> String {
+    format!(
+        "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
+         and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
+         and certificate leaf[subject.OU] = \"{team_id}\""
+    )
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn verify_code_identity(
     _token: AuditToken,
@@ -256,10 +277,9 @@ pub fn verify_code_identity(
     attributes.set_audit_token(data.as_concrete_TypeRef());
     let code = SecCode::copy_guest_with_attribues(None, &attributes, Flags::NONE)
         .map_err(|_| IdentityError::SignatureInvalid)?;
-    let requirement: SecRequirement =
-        format!("anchor apple generic and certificate leaf[subject.OU] = \"{team_id}\"")
-            .parse()
-            .map_err(|_| IdentityError::RequirementFailed)?;
+    let requirement: SecRequirement = developer_id_requirement(team_id)
+        .parse()
+        .map_err(|_| IdentityError::RequirementFailed)?;
     // SecCode validates both the signature and the requirement before we read
     // identifier/path metadata. A failed certificate trust requirement does
     // not mean that the executable is unsigned or its signature is corrupt.
@@ -458,6 +478,26 @@ mod tests {
             .is_ok()
         );
     }
+    #[test]
+    fn developer_id_requirement_demands_chain_markers_and_team() {
+        let req = developer_id_requirement(DEVELOPER_ID_TEAM_ID);
+        assert!(req.starts_with("anchor apple generic and "));
+        assert!(req.contains("certificate 1[field.1.2.840.113635.100.6.2.6] exists"));
+        assert!(req.contains("certificate leaf[field.1.2.840.113635.100.6.1.13] exists"));
+        assert!(req.ends_with("certificate leaf[subject.OU] = \"HYAP444FN9\""));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn developer_id_requirement_parses_as_a_sec_requirement() {
+        use security_framework::os::macos::code_signing::SecRequirement;
+        assert!(
+            developer_id_requirement(DEVELOPER_ID_TEAM_ID)
+                .parse::<SecRequirement>()
+                .is_ok()
+        );
+    }
+
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn code_identity_is_unsupported() {

@@ -116,6 +116,7 @@ dependencies = [
 name = "agent24-components"
 version = "0.1.0"
 dependencies = [
+ "agent24-os-proc",
  "flate2",
  "fs2",
  "reqwest",
@@ -348,6 +349,7 @@ dependencies = [
  "libc",
  "rustix 0.38.44",
  "security-framework 3.7.0",
+ "serde_json",
  "tempfile",
 ]
 
