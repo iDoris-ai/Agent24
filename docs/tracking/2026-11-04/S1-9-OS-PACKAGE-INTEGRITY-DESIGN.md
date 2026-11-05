@@ -2,9 +2,11 @@
 
 状态：设计稿，2026-11-05；本片不改代码。核对基线：`ce85cdffc1193195f9aebb93a8cbbf620ccfe526`。
 
+**适用边界：** 包里自带的清单只能发现字节损坏、部分更新，以及挂载之后被人改过。如果攻击者能写包目录，他可以把文件和 `files.json` 一起改，单靠清单拦不住。这种情况靠两样东西：一是 Agent24 自己持有的可信锁（ComponentLock），锁里记着整包归档的 sha256；二是 §5 的签名。详见 §2「信任边界」。
+
 ## 1. 决策与现状依据
 
-采用 jason 在本任务确认的 Q15 和 11-05 方案 A：OS 包与组件共用完整性机制；先发布生成工具，再由 Sin90/Cos72 携清单发新版，最后 Agent24 强制拒绝。不设只记录模式、用户旁路或旧包宽限期。
+采用 jason 在本任务确认的 Q15 和 11-05 方案 A，并按 jason 11-05 的拍板对可执行文件要求签名（§5）：OS 包与组件共用完整性机制；先发布生成工具，再由 Sin90/Cos72 携清单发新版，最后 Agent24 强制拒绝。不设只记录模式、用户旁路或旧包宽限期。
 
 计划版本差异：当前 §4.2 只列到 S1-8，Q15 仍写“先只记录不拒绝”（`docs/tracking/2026-11-04/ARCH-OPTIMIZATION-PLAN.md:221`、`:280`）。后续已接受的 D10 明确要求直接拒绝（`docs/adr/ADR-038-component-contract-v1.md:333`）；本片依本任务补充的七项要求落实设计，不能照旧推荐实现。
 
@@ -77,7 +79,7 @@ recheck 重做同一全量校验，再比较冻结的 manifest_digest；不使�
 
 ## 4. 拒绝状态与桌面
 
-保持现有 `GET /api/v1/components`，不新增路由；符合 ADR-045 只约束新路由及模块入口归 components 的规则（`docs/adr/ADR-045-route-naming.md:31`、`:50`）。拟扩展 Refused/RefusalReason 与 supervisor 错误承载，使扫描拒绝和重启拒绝保留同一种类型化原因：
+保持现有 `GET /api/v1/components`，不新增路由；符合 ADR-045 只约束新路由及模块入口归 components 的规则（ADR-045 D1 适用范围、N9 模块类资源）。拟扩展 Refused/RefusalReason 与 supervisor 错误承载，使扫描拒绝和重启拒绝保留同一种类型化原因：
 
 | 情形 | state / reason | 桌面主机视图提示 |
 |---|---|---|
@@ -93,9 +95,9 @@ recheck 重做同一全量校验，再比较冻结的 manifest_digest；不使�
 
 重装成功后必须重新扫描并全量验证才清除原因。对外操作错误按 D6 `{code,message,retryable}` 返回（契约出处：`docs/adr/ADR-038-component-contract-v1.md:279`），使用 `os_package.<reason>`、`retryable:false`，避免自动重试掩盖篡改；手动修复后可重试。
 
-## 5. D2a 签名推荐
+## 5. D2a 签名（jason 2026-11-05 已拍板：适用）
 
-推荐适用：Sin90/Cos72 是独立发布的可执行 OS 包，不应因进入 packages 目录而减弱组件校验。macOS 使用共享 SignatureVerifier，逐个验证 executables，要求受宿主发布策略/可信锁指定的 Team ID、Developer ID、Hardened Runtime、公证；不能让包任意自选信任团队。纯数据仅校验哈希；Linux/Windows v1 沿用 D2a 的摘要和可复现构建规则，不新造签名体系（`docs/adr/ADR-038-component-contract-v1.md:167`）。
+适用：Sin90/Cos72 是独立发布的可执行 OS 包，不应因进入 packages 目录而减弱组件校验。macOS 使用共享 SignatureVerifier，逐个验证 executables，要求受宿主发布策略/可信锁指定的 Team ID、Developer ID、Hardened Runtime、公证；不能让包任意自选信任团队。纯数据仅校验哈希；Linux/Windows v1 沿用 D2a 的摘要和可复现构建规则，不新造签名体系（`docs/adr/ADR-038-component-contract-v1.md:167`）。
 
 签名必须在生成清单之前完成，因为签名改变字节；外部 CI 顺序为构建 → 签名/公证及所有会改字节的处理 → 生成清单 → 校验 → 打包 → 计算最终归档 sha256 → 发布并更新可信锁。安装与启动采用 D2a 各自模式，不另定公证离线容错策略。由于 macOS 签名只保护被签的代码，配置及清单的发布来源仍靠外部可信归档摘要，而不是签名替代文件哈希。
 
