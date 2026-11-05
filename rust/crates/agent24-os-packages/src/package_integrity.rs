@@ -14,6 +14,8 @@ use agent24_components::integrity::{
     self, DOMAIN_OS_YML, FILES_JSON_NAME, IntegrityError, IntegritySection,
 };
 use agent24_domain::DomainOsManifest;
+
+const YAML_LIMIT: u64 = DomainOsManifest::MAX_YAML_BYTES as u64;
 use tokio_util::sync::CancellationToken;
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -41,7 +43,7 @@ pub fn verify_if_present(dir: &Path, manifest: &DomainOsManifest) -> Result<(), 
 /// Strict read-only check used by `package-integrity verify`.
 pub fn verify(root: &Path) -> Result<(), IntegrityError> {
     ensure_real_directory(root)?;
-    let bytes = read_regular(&root.join(DOMAIN_OS_YML), DOMAIN_OS_YML)?;
+    let bytes = read_regular(&root.join(DOMAIN_OS_YML), DOMAIN_OS_YML, YAML_LIMIT)?;
     let text = std::str::from_utf8(&bytes).map_err(|_| IntegrityError::ManifestInvalid {
         detail: format!("{DOMAIN_OS_YML} is not valid UTF-8"),
     })?;
@@ -84,7 +86,7 @@ pub fn generate(root: &Path, executables: &[String]) -> Result<(), IntegrityErro
     }
 
     let yaml_path = root.join(DOMAIN_OS_YML);
-    let original = read_regular(&yaml_path, DOMAIN_OS_YML)?;
+    let original = read_regular(&yaml_path, DOMAIN_OS_YML, YAML_LIMIT)?;
     let text =
         String::from_utf8(original.clone()).map_err(|_| IntegrityError::ManifestInvalid {
             detail: format!("{DOMAIN_OS_YML} is not valid UTF-8"),
@@ -166,7 +168,9 @@ pub fn generate(root: &Path, executables: &[String]) -> Result<(), IntegrityErro
     }
 
     let json_path = root.join(FILES_JSON_NAME);
-    let previous_json = fs::read(&json_path).ok();
+    // Backed up only to restore on a failed YAML write; bounded like any other read of it.
+    let previous_json =
+        read_bounded(&json_path, FILES_JSON_NAME, integrity::MAX_FILES_JSON_BYTES).ok();
     let json_existed = previous_json.is_some();
     atomic_write(root, FILES_JSON_NAME, &json)?;
     if let Err(err) = atomic_write(root, DOMAIN_OS_YML, composed.as_bytes()) {
@@ -237,7 +241,7 @@ fn ensure_real_directory(root: &Path) -> Result<(), IntegrityError> {
     Ok(())
 }
 
-fn read_regular(path: &Path, label: &str) -> Result<Vec<u8>, IntegrityError> {
+fn read_regular(path: &Path, label: &str, limit: u64) -> Result<Vec<u8>, IntegrityError> {
     let metadata = fs::symlink_metadata(path).map_err(|err| {
         if err.kind() == io::ErrorKind::NotFound {
             IntegrityError::ManifestInvalid {
@@ -254,9 +258,28 @@ fn read_regular(path: &Path, label: &str) -> Result<Vec<u8>, IntegrityError> {
             detail: format!("{label} is not a regular file"),
         });
     }
-    fs::read(path).map_err(|err| IntegrityError::CheckFailed {
+    read_bounded(path, label, limit)
+}
+
+/// Reads at most `limit + 1` bytes so an oversized or sparse control file is refused
+/// before it is pulled into memory.
+fn read_bounded(path: &Path, label: &str, limit: u64) -> Result<Vec<u8>, IntegrityError> {
+    use std::io::Read as _;
+    let file = File::open(path).map_err(|err| IntegrityError::CheckFailed {
         detail: format!("{label}: {err}"),
-    })
+    })?;
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| IntegrityError::CheckFailed {
+            detail: format!("{label}: {err}"),
+        })?;
+    if bytes.len() as u64 > limit {
+        return Err(IntegrityError::ManifestInvalid {
+            detail: format!("{label} is over the {limit} byte limit"),
+        });
+    }
+    Ok(bytes)
 }
 
 fn restore_files_json(root: &Path, existed: bool, previous: Option<&[u8]>) -> io::Result<()> {
@@ -375,6 +398,23 @@ mod tests {
 
     fn mode_of(path: &Path) -> u32 {
         fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn oversized_yaml_is_refused_without_reading_it_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_tree(root, "cos72");
+        let mut yaml = yaml_for("cos72");
+        yaml.push_str(&format!(
+            "# {}\n",
+            "x".repeat(DomainOsManifest::MAX_YAML_BYTES)
+        ));
+        fs::write(root.join(DOMAIN_OS_YML), yaml).unwrap();
+        let err = verify(root).unwrap_err();
+        assert!(err.to_string().contains("byte limit"), "{err}");
+        let err = generate(root, &["bin/cos72".into()]).unwrap_err();
+        assert!(err.to_string().contains("byte limit"), "{err}");
     }
 
     #[test]
