@@ -7,7 +7,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-import { assetFileName, packOpenDesignComponent, releaseAssetUrl } from './pack-open-design-component.mjs'
+import { OPEN_DESIGN_PIN_VERSION, OPEN_DESIGN_SHA, assetFileName, packOpenDesignComponent, releaseAssetUrl } from './pack-open-design-component.mjs'
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 
@@ -45,12 +45,15 @@ test('packs a content-addressed tarball (separate dir) and a matching manifest',
       arch: 'x64',
     })
 
-    assert.equal(manifest.version, '0.26.1')
+    assert.equal(manifest.version, OPEN_DESIGN_PIN_VERSION)
     assert.equal(manifest.platform, 'linux')
     assert.equal(manifest.arch, 'x64')
-    assert.match(
+    assert.equal(
       manifest.url,
-      /^https:\/\/github\.com\/iDoris-ai\/Agent24\/releases\/download\/v0\.6\.0\/open-design-0\.26\.1-f5beffc-linux-x64-[0-9a-f]{12}\.tar\.gz$/,
+      releaseAssetUrl({ repository: 'iDoris-ai/Agent24', appVersion: '0.6.0', assetName: assetFileName({
+        odVersion: OPEN_DESIGN_PIN_VERSION, odSha: OPEN_DESIGN_SHA,
+        platform: 'linux', arch: 'x64', sha256: manifest.sha256,
+      }) }),
     )
     assert.equal(typeof manifest.sha256, 'string')
     assert.equal(manifest.sha256.length, 64)
