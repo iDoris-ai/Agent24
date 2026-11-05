@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Agent24 domain-OS packages on disk (ME-3a): discovery and atomic install"
 
 [dependencies]
+agent24-components = { path = "../agent24-components" }
 agent24-domain = { path = "../agent24-domain" }
 # ME4-S3 §4.4 (M4): `manifest_digest` moved into proto so the kernel's
 # discovery and a module's handshake compute it with the same function.
@@ -18,6 +19,7 @@ serde_yaml = "0.9"
 rustix = { version = "0.38", features = ["process"] }
 # The manifest digest a module reports in its handshake (SUP-4).
 sha2 = "0.10"
+tokio-util = "0.7"
 
 [dev-dependencies]
 tempfile = "3"

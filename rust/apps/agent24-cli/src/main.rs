@@ -26,6 +26,7 @@ mod enroll;
 mod idoris;
 mod module_tools;
 mod offline_db;
+mod package_integrity;
 mod query;
 mod runs;
 mod schedules;
@@ -132,6 +133,12 @@ enum Command {
     Hw {
         #[command(subcommand)]
         action: HwAction,
+    },
+    /// 生成或校验 OS 包的 files.json（S1-9）。不连接 daemon，也不验签名。
+    #[command(name = "package-integrity")]
+    PackageIntegrity {
+        #[command(subcommand)]
+        action: package_integrity::Action,
     },
     /// 会话：列出或读取一条（只读）
     Session {
@@ -3113,6 +3120,7 @@ async fn main() -> std::process::ExitCode {
         Command::Acp => cmd_acp().await,
         Command::Decide { action } => cmd_decide(action).await,
         Command::Hw { action } => cmd_hw(action),
+        Command::PackageIntegrity { action } => package_integrity::run(action),
         Command::Session { action } => query::session(action).await,
         Command::Run { action } => query::run_cmd(action).await,
         Command::Memory { action } => query::memory(action).await,
@@ -3146,6 +3154,38 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn package_integrity_command_reaches_the_shared_checker() {
+        let missing = tempfile::tempdir().unwrap();
+        let err = package_integrity::run(package_integrity::Action::Verify {
+            root: missing.path().to_path_buf(),
+        })
+        .unwrap_err();
+        assert!(err.contains("integrity_manifest_invalid"), "{err}");
+
+        let cli = Cli::try_parse_from([
+            "agent24",
+            "package-integrity",
+            "generate",
+            "--root",
+            "dist/sin90",
+            "--executable",
+            "bin/sin90",
+            "--executable",
+            "bin/helper",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::PackageIntegrity {
+                action: package_integrity::Action::Generate { root, executable },
+            } => {
+                assert_eq!(root, PathBuf::from("dist/sin90"));
+                assert_eq!(executable, ["bin/sin90", "bin/helper"]);
+            }
+            _ => panic!("package-integrity generate was not parsed"),
+        }
+    }
 
     #[test]
     fn components_list_prints_id_state_version_and_capabilities() {

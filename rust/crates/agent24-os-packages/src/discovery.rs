@@ -216,6 +216,10 @@ fn read_package(dir: &Path) -> std::result::Result<Discovered, String> {
         String::from_utf8(bytes).map_err(|e| format!("{MANIFEST_FILE} is not valid UTF-8: {e}"))?;
 
     let manifest = DomainOsManifest::from_yaml(&text).map_err(|e| e.to_string())?;
+    // S1-9 PR-1: a package that declares integrity is verified in full before
+    // it can become Discovered. A package that does not declare it keeps the
+    // previous manifest-only behaviour. PR-3 replaces this with verify_required.
+    crate::package_integrity::verify_if_present(dir, &manifest).map_err(|e| e.to_string())?;
     Ok(Discovered {
         manifest,
         dir: dir.to_owned(),
