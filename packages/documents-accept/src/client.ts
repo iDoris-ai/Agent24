@@ -2,8 +2,7 @@
 // under /api/v1/documents, with the bearer it wrote to its state file
 // (acceptance README §1). Nothing here reads the data directory or an engine.
 
-import fs from 'node:fs'
-import { dataDir, joinLiteral } from '@agent24/data-dir'
+import { daemonBearer, dataDir, joinLiteral, readDaemonState } from '@agent24/data-dir'
 import { ContractError, conform } from './contract'
 
 export interface Connection {
@@ -17,19 +16,21 @@ export function defaultDaemonStateFile(): string {
   return joinLiteral(dataDir(), 'daemon.json')
 }
 
-/** Reads the daemon's state file: `<data_dir>/daemon.json`, or the one named. */
+/** Reads the daemon's state file: `<data_dir>/daemon.json`, or the one named,
+ * through the one shared parser (`@agent24/data-dir`). Only a legacy record
+ * carries a bearer; capabilities mode and any record that fails its validation
+ * are refused. Messages never say what the file holds: it holds the bearer. */
 export function connect(daemonJson = defaultDaemonStateFile()): Connection {
-  let state: { port?: unknown; token?: unknown } | null
-  try {
-    state = JSON.parse(fs.readFileSync(daemonJson, 'utf8')) as typeof state
-  } catch {
-    // Said without what was read: the file holds the bearer.
-    throw new Error(`${daemonJson}: not a daemon state file that can be read`)
+  const read = readDaemonState(daemonJson)
+  if (!read.ok) {
+    if (read.reason === 'unreadable' || read.reason === 'malformed') {
+      throw new Error(`${daemonJson}: not a daemon state file that can be read`)
+    }
+    throw new Error(`${daemonJson}: not a usable daemon state file (${read.message})`)
   }
-  if (!Number.isInteger(state?.port) || typeof state?.token !== 'string' || state.token === '') {
-    throw new Error(`${daemonJson}: no port and bearer token (a daemon in capability mode has no token)`)
-  }
-  return { base: `http://127.0.0.1:${String(state.port)}/api/v1/documents`, token: state.token }
+  const bearer = daemonBearer(read.state)
+  if (!bearer.ok) throw new Error(`${daemonJson}: no bearer token (${bearer.message})`)
+  return { base: `http://127.0.0.1:${String(read.state.port)}/api/v1/documents`, token: bearer.token }
 }
 
 /** A route that did not answer 2xx: its status, and the error code of its envelope. */

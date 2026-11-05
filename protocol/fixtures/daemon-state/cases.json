@@ -1,0 +1,487 @@
+{
+  "comment": "Locked cross-language: rust state_file.rs test + TS packages/data-dir daemon-state and every TS reader of daemon.json run these. outcome: legacy (bearer usable) | capabilities (valid, no bearer) | rejected (record refused).",
+  "cases": [
+    {
+      "name": "legacy explicit",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": "legacy-bearer"
+      },
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "legacy-bearer"
+      }
+    },
+    {
+      "name": "legacy: auth_mode absent (pre-capability file)",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "token": "legacy-bearer"
+      },
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "legacy-bearer"
+      }
+    },
+    {
+      "name": "legacy with protocol_version",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": "legacy-bearer",
+        "protocol_version": 1
+      },
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "legacy-bearer"
+      }
+    },
+    {
+      "name": "capabilities: no token, has generation",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "capabilities"
+      },
+      "expect": {
+        "outcome": "capabilities"
+      }
+    },
+    {
+      "name": "capabilities with enroll_endpoint and docked",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "capabilities",
+        "enroll_endpoint": "/x/enroll.sock",
+        "startup_state": "docked"
+      },
+      "expect": {
+        "outcome": "capabilities"
+      }
+    },
+    {
+      "name": "unknown auth_mode",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "something_new",
+        "token": "legacy-bearer"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "auth_mode null",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": null,
+        "token": "legacy-bearer"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "legacy: token missing",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "inconsistent"
+      }
+    },
+    {
+      "name": "legacy: token empty",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": ""
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "inconsistent"
+      }
+    },
+    {
+      "name": "capabilities: carries a token",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "capabilities",
+        "token": "leaked"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "inconsistent"
+      }
+    },
+    {
+      "name": "capabilities: generation missing",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "auth_mode": "capabilities"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "inconsistent"
+      }
+    },
+    {
+      "name": "enroll_endpoint on a legacy record",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": "legacy-bearer",
+        "enroll_endpoint": "/x/enroll.sock"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "inconsistent"
+      }
+    },
+    {
+      "name": "port missing",
+      "json": {
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": "legacy-bearer"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "port out of u16 range",
+      "json": {
+        "port": 70000,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": "legacy-bearer"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "port is a string",
+      "json": {
+        "port": "4321",
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": "legacy-bearer"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "pid negative",
+      "json": {
+        "port": 4321,
+        "pid": -1,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": "legacy-bearer"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "version missing",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": "legacy-bearer"
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "token is not a string",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": 7
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "protocol_version is negative",
+      "json": {
+        "port": 4321,
+        "pid": 999,
+        "version": "0.5.0",
+        "generation": "g1",
+        "auth_mode": "legacy_single_token",
+        "token": "legacy-bearer",
+        "protocol_version": -1
+      },
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "not an object",
+      "json": [
+        1,
+        2
+      ],
+      "expect": {
+        "outcome": "rejected",
+        "reason": "malformed"
+      }
+    },
+    {
+      "name": "not JSON",
+      "text": "{not json",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "malformed"
+      }
+    },
+    {
+      "name": "duplicate auth_mode (capabilities then legacy with token)",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"generation\":\"g1\",\"auth_mode\":\"capabilities\",\"auth_mode\":\"legacy_single_token\",\"token\":\"t\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "duplicate token",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"a\",\"token\":\"b\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "duplicate port via escaped key",
+      "text": "{\"port\":1,\"p\\u006frt\":2,\"pid\":999,\"version\":\"v\",\"token\":\"a\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "port 4321.0 (float form)",
+      "text": "{\"port\":4321.0,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"g\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "port 4.321e3 (exponent form)",
+      "text": "{\"port\":4.321e3,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"g\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "port -0",
+      "text": "{\"port\":-0,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"g\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "port 4321.0000000000001",
+      "text": "{\"port\":4321.0000000000001,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"g\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "pid 999.0",
+      "text": "{\"port\":4321,\"pid\":999.0,\"version\":\"v\",\"token\":\"t\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "token with lone surrogate",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"\\ud800\",\"generation\":\"g\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "version with lone surrogate",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"\\ud800\",\"token\":\"t\",\"generation\":\"g\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "lone trailing surrogate in a known field (generation)",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"\\udc00\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "valid surrogate pair is fine",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"\\ud83d\\ude00\",\"token\":\"t\",\"generation\":\"g\"}",
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "t"
+      }
+    },
+    {
+      "name": "escaped backslash before ud800 is not a surrogate",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"\\\\ud800\",\"token\":\"t\",\"generation\":\"g\"}",
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "t"
+      }
+    },
+    {
+      "name": "protocol_version null is accepted",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"g\",\"protocol_version\":null}",
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "t"
+      }
+    },
+    {
+      "name": "auth_mode in serde map form {legacy_single_token:null}",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"g\",\"auth_mode\":{\"legacy_single_token\":null}}",
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "t"
+      }
+    },
+    {
+      "name": "lone surrogate inside an unknown field is ignored (serde skips it)",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"g\",\"extra\":\"\\ud800\"}",
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "t"
+      }
+    },
+    {
+      "name": "lone trailing surrogate inside an unknown field is ignored",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"g\",\"extra\":\"\\udc00\"}",
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "t"
+      }
+    },
+    {
+      "name": "float in an unknown field is ignored",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"generation\":\"g\",\"extra\":1.5e3}",
+      "expect": {
+        "outcome": "legacy",
+        "bearer": "t"
+      }
+    },
+    {
+      "name": "lone surrogate in a key",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"\\ud800\":1}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "lone trailing surrogate inside a key",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"x\\udc00y\":\"v\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "two leading surrogates in a row",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"\\ud800\\ud800\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "leading surrogate followed by a plain char",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"\\ud800A\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "protocol_version 1.0",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"t\",\"protocol_version\":1.0}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    }
+  ]
+}

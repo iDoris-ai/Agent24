@@ -14,6 +14,7 @@
     "js-yaml": "^4.1.0"
   },
   "devDependencies": {
+    "@agent24/api-client": "workspace:*",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^24.0.0",
     "tsx": "^4.7.0",

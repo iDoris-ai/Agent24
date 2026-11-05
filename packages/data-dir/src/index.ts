@@ -93,3 +93,5 @@ export function joinLiteralFor(platform: DataDirPlatform, dir: string, ...parts:
 export function joinLiteral(dir: string, ...parts: string[]): string {
   return joinLiteralFor(currentDataDirPlatform(), dir, ...parts)
 }
+
+export * from './daemon-state'

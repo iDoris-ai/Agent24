@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { ApiError, connect, excerpt } from './client'
 import { ContractError } from './contract'
@@ -10,6 +11,16 @@ const made: string[] = []
 afterEach(() => {
   for (const dir of made.splice(0)) fs.rmSync(dir, { recursive: true, force: true })
 })
+interface DaemonStateCase {
+  name: string
+  json?: unknown
+  text?: string
+  expect: { outcome: 'legacy' | 'capabilities' | 'rejected'; bearer?: string }
+}
+function daemonStateCases(): DaemonStateCase[] {
+  const file = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'protocol', 'fixtures', 'daemon-state', 'cases.json')
+  return (JSON.parse(fs.readFileSync(file, 'utf8')) as { cases: DaemonStateCase[] }).cases
+}
 function stateFile(state: unknown): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'accept-'))
   made.push(dir)
@@ -20,15 +31,32 @@ function stateFile(state: unknown): string {
 
 describe('connect', () => {
   it('takes the port and the bearer from the state file the daemon wrote', () => {
-    expect(connect(stateFile({ port: 51234, token: 'abc', pid: 7 }))).toEqual({ base: 'http://127.0.0.1:51234/api/v1/documents', token: 'abc' })
+    expect(connect(stateFile({ port: 51234, token: 'abc', pid: 7, version: 'v' }))).toEqual({ base: 'http://127.0.0.1:51234/api/v1/documents', token: 'abc' })
   })
 
   it('refuses a state file without a port or a bearer', () => {
-    expect(() => connect(stateFile({ port: 51234 }))).toThrow(/no port and bearer token/)
-    expect(() => connect(stateFile({ port: 51234, token: '' }))).toThrow(/no port and bearer token/)
-    expect(() => connect(stateFile({ port: '51234', token: 'abc' }))).toThrow(/no port and bearer token/)
-    expect(() => connect(stateFile(null))).toThrow(/no port and bearer token/)
+    expect(() => connect(stateFile({ port: 51234, pid: 7, version: 'v' }))).toThrow(/no bearer|not a usable/)
+    expect(() => connect(stateFile({ port: 51234, token: '', pid: 7, version: 'v' }))).toThrow(/no bearer|not a usable/)
+    expect(() => connect(stateFile({ port: '51234', token: 'abc', pid: 7, version: 'v' }))).toThrow(/not a usable/)
+    expect(() => connect(stateFile(null))).toThrow(/can be read/)
   })
+
+  it('says a daemon in capability mode has no bearer', () => {
+    expect(() => connect(stateFile({ port: 1, pid: 2, version: 'v', generation: 'g', auth_mode: 'capabilities' }))).toThrow(/capabilities/)
+  })
+
+  // The shared daemon.json fixture (protocol/fixtures/daemon-state): data-dir, desktop and both bridges run the same one.
+  for (const c of daemonStateCases()) {
+    it(`fixture: ${c.name}`, () => {
+      const file = stateFile(null)
+      fs.writeFileSync(file, c.text ?? JSON.stringify(c.json))
+      if (c.expect.outcome === 'legacy') {
+        expect(connect(file).token).toBe(c.expect.bearer)
+      } else {
+        expect(() => connect(file)).toThrow()
+      }
+    })
+  }
 
   it('says nothing of what a state file it cannot read holds', () => {
     const file = stateFile({})
