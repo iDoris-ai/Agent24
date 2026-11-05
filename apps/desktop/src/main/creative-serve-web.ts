@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
+import openDesignPin from '../shared/open-design.pin.json'
 import path from 'node:path'
 import type { Readable } from 'node:stream'
 
@@ -101,7 +102,7 @@ const DEFAULT_READY_TIMEOUT_MS = 15_000
 const CHECKOUT_STOP_TIMEOUT_MS = 5_000
 /** before-quit waits at most this long for Creative to stop: 15 s grace + 5 s kill + slack. */
 export const CREATIVE_QUIT_STOP_BUDGET_MS = 22_000
-export const OPEN_DESIGN_PIN_VERSION = '0.26.1'
+export const OPEN_DESIGN_PIN_VERSION = openDesignPin.version
 
 export const CREATIVE_SESSION_PARTITION = 'persist:agent24-creative'
 
