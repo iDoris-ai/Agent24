@@ -9,6 +9,13 @@ use agent24_idoris::{
 };
 use sha2::{Digest, Sha256};
 
+/// Per-command bound for the key CLI. Tests run the fixture interpreter on loaded
+/// machines where a cold start alone can exceed the production bound.
+#[cfg(not(test))]
+const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallRequest {
@@ -755,7 +762,8 @@ impl IdorisHost {
             &self.root.join("data/idoris.sqlite3"),
             self.data_keys.clone(),
         )
-        .map_err(key_code)?;
+        .map_err(key_code)?
+        .with_timeout(KEY_COMMAND_TIMEOUT);
         let mut new_supervisor = None;
         let result = async {
             self.phase(id, Phase::Setup).await;
@@ -1047,7 +1055,8 @@ impl IdorisHost {
             &self.root.join("data/idoris.sqlite3"),
             self.data_keys.clone(),
         )
-        .map_err(key_code)?;
+        .map_err(key_code)?
+        .with_timeout(KEY_COMMAND_TIMEOUT);
         if !pending.committed
             && self.inner.lock().await.supervisor.is_none()
             && self

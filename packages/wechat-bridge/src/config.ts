@@ -5,8 +5,7 @@
 // values (ported from heinu1 / weixin-bot-ilink); the agent24d endpoint is
 // discovered from the daemon's state file, overridable by env.
 
-import fs from 'node:fs'
-import { dataDir, joinLiteral } from '@agent24/data-dir'
+import { DaemonStateError, dataDir, joinLiteral, requireDaemonBearer } from '@agent24/data-dir'
 
 export const CONFIG = {
   // ── WeChat iLink (official bot API) ──────────────────────────────────────
@@ -66,22 +65,27 @@ export interface DaemonEndpoint {
 }
 
 /** Discover the running agent24d: env first (A24_BASE_URL / A24_TOKEN), else the
- * daemon's state file. Returns null when no daemon can be located. */
+ * daemon's state file via the one shared parser (`@agent24/data-dir`).
+ * Returns null when no daemon can be located (no state file).
+ * Throws DaemonStateError when a state file exists but cannot give this bridge
+ * a bearer (capabilities mode, missing/empty token, invalid or unknown-mode
+ * record): the bridge must fail loudly, never send an empty token. */
 export function discoverDaemon(): DaemonEndpoint | null {
   const envBase = process.env.A24_BASE_URL
-  const envToken = process.env.A24_TOKEN
-  if (envBase) return { base: envBase.replace(/\/+$/, ''), token: envToken ?? '' }
-
-  try {
-    const raw = JSON.parse(fs.readFileSync(CONFIG.DAEMON_STATE_FILE, 'utf8')) as {
-      port?: number
-      token?: string
+  if (envBase) {
+    // The override must be a complete credential pair: a valid http(s) URL AND a
+    // non-empty A24_TOKEN. Anything less would run unauthenticated business requests.
+    let url: URL
+    try {
+      url = new URL(envBase)
+    } catch {
+      throw new DaemonStateError('A24_BASE_URL is not a valid URL')
     }
-    if (typeof raw.port === 'number') {
-      return { base: `http://127.0.0.1:${raw.port}`, token: raw.token ?? '' }
-    }
-  } catch {
-    /* no state file yet */
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new DaemonStateError('A24_BASE_URL must be http(s)')
+    const token = process.env.A24_TOKEN
+    if (!token || token.trim() === '') throw new DaemonStateError('A24_BASE_URL is set but A24_TOKEN is missing or empty')
+    return { base: envBase.replace(/\/+$/, ''), token }
   }
-  return null
+  const found = requireDaemonBearer(CONFIG.DAEMON_STATE_FILE)
+  return found && { base: `http://127.0.0.1:${found.port}`, token: found.token }
 }

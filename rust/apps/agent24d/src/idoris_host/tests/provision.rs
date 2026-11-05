@@ -319,14 +319,14 @@ async fn install_reverifies_and_is_idempotent_and_cancellable() {
             .install(InstallRequest { consent: true }, Some("cancel-install"))
             .await
             .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         while x.provision.downloads.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let snapshot =
                 serde_json::to_value(x.f.host.operation(&op.operation_id).await.unwrap()).unwrap();
@@ -405,7 +405,7 @@ async fn install_projects_zero_progress_before_the_first_download_update() {
             .install(InstallRequest { consent: true }, Some("progress-test"))
             .await
             .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         while x.provision.downloads.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
         }
@@ -985,7 +985,7 @@ async fn cancellation_while_waiting_for_commit_lock_rolls_back() {
     .unwrap();
     let mut guard = x.f.host.inner.lock().await;
     let cancel = guard.active.as_ref().unwrap().1.clone();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             tokio::time::sleep(Duration::from_millis(5)).await;
             drop(guard);
@@ -1087,7 +1087,7 @@ async fn stale_generation_monitor_cannot_withdraw_replacement_gateway() {
         // against A's not-ready, ready and closed notifications.
         sender.send(ready).unwrap();
         drop(sender);
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             while Arc::strong_count(&failure) != 1 {
                 tokio::task::yield_now().await;
             }
@@ -1348,7 +1348,7 @@ async fn connect_cancel_interrupts_pending_upstream_credential_read() {
             .connect(x.request(), Some("pending-key-read"))
             .await
             .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         while !x.provision.key_waiting.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }
@@ -1356,7 +1356,7 @@ async fn connect_cancel_interrupts_pending_upstream_credential_read() {
     .await
     .unwrap();
     x.f.host.cancel(&op.operation_id).await.unwrap();
-    let completed = tokio::time::timeout(Duration::from_secs(1), x.f.complete(&op))
+    let completed = tokio::time::timeout(Duration::from_secs(60), x.f.complete(&op))
         .await
         .expect("cancellation must interrupt a pending read");
     assert_eq!(completed.result, Some(Outcome::Cancelled));

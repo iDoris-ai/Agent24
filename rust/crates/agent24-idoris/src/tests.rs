@@ -105,7 +105,15 @@ fn contract_requires_the_locked_major_and_minimum_minor() {
         assert_eq!(lock.check_contract(version), Ok(()));
     }
     for version in [
-        "2.0.0", "1.0.9", "garbage", "1.01.0", "1.1", "v1.1.0", "1.1.0 ",
+        "2.0.0",
+        "1.0.9",
+        "garbage",
+        "1.01.0",
+        "1.1",
+        "v1.1.0",
+        "1.1.0 ",
+        "1.1.0-rc1",
+        "1.2.0-alpha.1",
     ] {
         assert_eq!(
             lock.check_contract(version),

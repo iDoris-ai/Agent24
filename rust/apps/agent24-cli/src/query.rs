@@ -98,6 +98,12 @@ pub enum ConsentAction {
 
 #[derive(clap::Subcommand)]
 pub enum ApprovalAction {
+    /// 读取一条 run 审批（run 审批队列，非模块审批）
+    Get {
+        id: String,
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
     /// 模块审批（gate / advise），与 run 审批队列分开
     Module {
         #[command(subcommand)]
@@ -170,6 +176,9 @@ enum Read {
     },
     Consents,
     ConsentExport,
+    Approval {
+        id: String,
+    },
     ModuleApprovals {
         decision: Option<String>,
     },
@@ -268,10 +277,14 @@ pub async fn consent(action: ConsentAction) -> Result<(), String> {
 }
 
 pub async fn approval(action: ApprovalAction) -> Result<(), String> {
-    let ApprovalAction::Module { action } = action;
     let (read, json) = match action {
-        ModuleApprovalAction::List { decision, json } => (Read::ModuleApprovals { decision }, json),
-        ModuleApprovalAction::Get { id, json } => (Read::ModuleApproval { id }, json),
+        ApprovalAction::Get { id, json } => (Read::Approval { id }, json),
+        ApprovalAction::Module { action } => match action {
+            ModuleApprovalAction::List { decision, json } => {
+                (Read::ModuleApprovals { decision }, json)
+            }
+            ModuleApprovalAction::Get { id, json } => (Read::ModuleApproval { id }, json),
+        },
     };
     run(read, json).await
 }
@@ -323,6 +336,7 @@ fn request(read: &Read) -> Result<(reqwest::Method, String, View), String> {
     if let Read::Session { id }
     | Read::Run { id }
     | Read::Schedule { id }
+    | Read::Approval { id }
     | Read::ModuleApproval { id } = read
     {
         reject_blank(id)?;
@@ -453,6 +467,11 @@ fn request(read: &Read) -> Result<(reqwest::Method, String, View), String> {
             reqwest::Method::GET,
             "/api/v1/module-consents/export".to_owned(),
             View::rows("authorizations", &["module", "tool", "host_risk", "status"]),
+        ),
+        Read::Approval { id } => (
+            reqwest::Method::GET,
+            format!("/api/v1/approvals/{}", super::qs_encode(id)),
+            View::one(&["id", "run_id", "kind", "summary", "status"]),
         ),
         Read::ModuleApprovals { decision } => (
             reqwest::Method::GET,
@@ -766,6 +785,13 @@ mod tests {
         "revoked"
     );
     case!(
+        approval_get_encodes_the_path_segment,
+        Read::Approval { id: "a/b".into() },
+        "GET /api/v1/approvals/a%2Fb HTTP/1.1",
+        r#"{"id":"a/b","run_id":"r1","tool_call_id":"t1","kind":"exec","summary":"run ls","payload":{},"available_decisions":["approve","deny"],"status":"pending","decision":null,"expires_at":"2026-10-26T02:00:00Z","created_at":"2026-10-26T01:00:00Z","decided_at":null}"#,
+        "run ls"
+    );
+    case!(
         module_approval_list_sends_decision,
         Read::ModuleApprovals {
             decision: Some("pending".into())
@@ -885,7 +911,7 @@ mod tests {
     /// Exhaustive on purpose (no wildcard): adding a `Read` variant is a
     /// compile error here until its contract is declared. Returns a stable
     /// variant id (0..VARIANTS) used by the completeness check below.
-    const VARIANTS: usize = 18;
+    const VARIANTS: usize = 19;
     fn variant_id(read: &Read) -> usize {
         match read {
             Read::Sessions => 0,
@@ -906,6 +932,7 @@ mod tests {
             Read::ToolOverrides => 15,
             Read::DecideProfile => 16,
             Read::PeerRuns => 17,
+            Read::Approval { .. } => 18,
         }
     }
 
@@ -956,6 +983,7 @@ mod tests {
                 "ModuleAuthorization",
                 Wrap::Named("ModuleAuthorizationList", "exportModuleConsents"),
             ),
+            (Read::Approval { id: id() }, "Approval", Wrap::None),
             (
                 Read::ModuleApprovals { decision: None },
                 "ModuleApproval",
@@ -1178,6 +1206,7 @@ mod tests {
     fn blank_id_is_rejected() {
         for read in [
             Read::Session { id: "  ".into() },
+            Read::Approval { id: " ".into() },
             Read::ModuleApproval { id: " ".into() },
         ] {
             let err = request(&read).unwrap_err();

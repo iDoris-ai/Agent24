@@ -510,6 +510,27 @@ struct RawManifest {
     #[serde(default)]
     #[allow(dead_code)]
     min_daemon_protocol: Option<u32>,
+    /// Optional S1-9 file manifest. Absent means an old package: discovery
+    /// keeps the previous behaviour. Present means the package must verify.
+    #[serde(default, deserialize_with = "present_integrity")]
+    integrity: Option<RawIntegrity>,
+}
+
+/// Wire shape of `domain-os.yml`'s `integrity` section. Security checks live
+/// in the shared components verifier, which runs before a package is accepted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawIntegrity {
+    manifest: String,
+    sha256: String,
+    files: Vec<String>,
+    executables: Vec<String>,
+}
+
+fn present_integrity<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<RawIntegrity>, D::Error> {
+    RawIntegrity::deserialize(deserializer).map(Some)
 }
 
 /// A VALIDATED `domain-os.yml`.
@@ -545,6 +566,38 @@ pub struct DomainOsManifest {
     provides: Vec<CapabilityProvide>,
     /// The kernel protocol the manifest requires; 0 when it names none.
     min_daemon_protocol: u64,
+    integrity: Option<PackageIntegrity>,
+}
+
+/// Optional `integrity` section of `domain-os.yml` (S1-9).
+///
+/// Parsing accepts the shape and rejects unknown fields. Path, digest and
+/// tree checks are the shared verifier, invoked after a successful parse and
+/// before discovery returns the package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageIntegrity {
+    manifest: String,
+    sha256: String,
+    files: Vec<String>,
+    executables: Vec<String>,
+}
+
+impl PackageIntegrity {
+    pub fn manifest_file(&self) -> &str {
+        &self.manifest
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub fn files(&self) -> &[String] {
+        &self.files
+    }
+
+    pub fn executables(&self) -> &[String] {
+        &self.executables
+    }
 }
 
 /// One capability a domain OS declares in its manifest (ADR-038 D9).
@@ -1051,6 +1104,12 @@ impl DomainOsManifest {
             tools,
             provides,
             min_daemon_protocol: min_protocol.unwrap_or(0),
+            integrity: raw.integrity.map(|integrity| PackageIntegrity {
+                manifest: integrity.manifest,
+                sha256: integrity.sha256,
+                files: integrity.files,
+                executables: integrity.executables,
+            }),
         })
     }
 
@@ -1134,6 +1193,12 @@ impl DomainOsManifest {
     #[must_use]
     pub fn spawn(&self) -> Option<&SpawnCommand> {
         self.spawn.as_ref()
+    }
+
+    /// `None` for a package that has not declared file integrity.
+    #[must_use]
+    pub fn integrity(&self) -> Option<&PackageIntegrity> {
+        self.integrity.as_ref()
     }
 
     pub fn is_mountable_in_process(&self) -> bool {
@@ -2904,6 +2969,51 @@ mod tool_manifest_tests {
         }
     }
 }
+#[cfg(test)]
+mod integrity_schema_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    fn base() -> String {
+        "name: cos72\nversion: \"0.1.0\"\nroute_namespace: /api/v1/cos72\n\
+         event_module: cos72\ndata_dir: ~/.agent24/os/cos72/\n\
+         kernel_capabilities: [events]\nimpl_kind: out_of_process_provider\n\
+         spawn:\n  command: bin/cos72\n"
+            .to_owned()
+    }
+
+    #[test]
+    fn an_old_manifest_has_no_integrity_section() {
+        let manifest = DomainOsManifest::from_yaml(&base()).unwrap();
+        assert!(manifest.integrity().is_none());
+    }
+
+    #[test]
+    fn integrity_section_is_kept_and_unknown_fields_are_refused() {
+        let yaml = format!(
+            "{}integrity:\n  manifest: files.json\n  sha256: {}\n  files: [bin/cos72]\n  \
+             executables: [bin/cos72]\n",
+            base(),
+            "ab".repeat(32)
+        );
+        let manifest = DomainOsManifest::from_yaml(&yaml).unwrap();
+        let integrity = manifest.integrity().unwrap();
+        assert_eq!(integrity.manifest_file(), "files.json");
+        assert_eq!(integrity.files(), ["bin/cos72".to_owned()]);
+        assert_eq!(integrity.executables(), ["bin/cos72".to_owned()]);
+
+        let extra = yaml.replace("manifest: files.json", "manifest: files.json\n  extra: 1");
+        let err = DomainOsManifest::from_yaml(&extra).unwrap_err();
+        assert!(err.to_string().contains("extra"), "{err}");
+
+        assert!(DomainOsManifest::from_yaml(&format!("{}integrity: null\n", base())).is_err());
+
+        let typo = format!("{}integrty:\n  manifest: files.json\n", base());
+        let err = DomainOsManifest::from_yaml(&typo).unwrap_err();
+        assert!(err.to_string().contains("integrty"), "{err}");
+    }
+}
+
 mod egress;
 pub use egress::{
     EgressDecision, EgressDestination, EgressGate, EgressPurpose, EgressRequest, EgressResource,

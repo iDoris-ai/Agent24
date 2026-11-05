@@ -23,6 +23,7 @@ import {
   resolveAgent24HeadlessLauncher,
   resolveOpenDesignCheckout,
 } from './creative-serve-web'
+import openDesignPin from '../shared/open-design.pin.json'
 import { mapOpenDesignReport } from './open-design-report'
 
 const allChildren: FakeChild[] = []
@@ -156,6 +157,10 @@ afterEach(() => {
 })
 
 describe('CreativeServeWeb', () => {
+  it('uses the shared release pin for the headless handshake', () => {
+    expect(OPEN_DESIGN_PIN_VERSION).toBe(openDesignPin.version)
+  })
+
   it('invalidates an in-flight view request when the view is hidden', () => {
     const fence = new CreativeViewRequestFence()
     const first = fence.begin()

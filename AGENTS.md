@@ -35,7 +35,9 @@
 - 当前里程碑的任务定义与验收标准只认集成分支上的计划文档（任务 prompt 会指明路径）。prompt 与计划冲突时以计划为准，并在 PR body 里指出冲突。
 
 ## 构建缓存
-- 所有 worktree 共用主 checkout 的 target：cargo 命令前先 `export CARGO_TARGET_DIR=$HOME/Dev/auraai/Agent24/rust/target`（并发构建时 cargo 会自动排队等锁，正常）。**不要**在 worktree 里生成独立的 `rust/target`（每个 5GB+）。
+- jason 的笔记本从 2026-11-05 起由 mbx 接管 cargo：`~/.zshrc` 把 mbx 的 cargo shim 放在 PATH 最前面，直接跑 `cargo …` 就行。各 checkout 和 worktree 的 `rust/target` 都是指向共享缓存 `~/Library/Caches/mbx` 的链接，编译结果跨 worktree 复用，过期和超额由 mbx 自己回收。
+- 在这台机器上**不要设 `CARGO_TARGET_DIR`**。一设，mbx 的托管 target 就被绕过，目录又会各自膨胀。也不要再用主 checkout 共享 target 的旧做法。
+- 用 `mbx doctor` 检查安装，`mbx stats` 看命中率，`mbx gc --dry-run` 预览回收。没装 mbx 的机器（CI、Mac mini）照常用 cargo。
 
 ## 门禁（提交前必须全部通过，PR body 贴结果摘要）
 Rust（在 `rust/` 下）：

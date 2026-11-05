@@ -117,6 +117,23 @@ jobs:
         working-directory: rust
         run: cargo test --workspace -- --show-output
 
+      # S1-7 gated dormant code behind features no default build turns on; keep it compiling (Linux job only).
+      - name: dormant-workspace clippy (agent24-store)
+        working-directory: rust
+        run: cargo clippy -p agent24-store --features dormant-workspace --all-targets -- -D warnings
+
+      - name: dormant-workspace test (agent24-store)
+        working-directory: rust
+        run: cargo test -p agent24-store --features dormant-workspace
+
+      - name: knowledge-store clippy (agent24d)
+        working-directory: rust
+        run: cargo clippy -p agent24d --features knowledge-store --all-targets -- -D warnings
+
+      - name: knowledge-store test (agent24d)
+        working-directory: rust
+        run: cargo test -p agent24d --features knowledge-store --bin agent24d knowledge_store
+
       - name: Real Hyphae unlock
         working-directory: rust
         run: cargo test -p agent24-comm --test unlock_real_binary -- --ignored --nocapture

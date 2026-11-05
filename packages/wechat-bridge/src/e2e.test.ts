@@ -23,7 +23,7 @@ async function harness(plan: Planner, allowed: string[] = ['alice']) {
   const daemon = await new FakeDaemon(plan).listen()
   const client = new ILinkClient('fake-token', ilink.baseUrl)
   const sender = new Sender(client)
-  const agent = new Agent24Client({ base: daemon.baseUrl, token: '' })
+  const agent = new Agent24Client({ base: daemon.baseUrl, token: 'test-bearer' })
   const store: SessionStore = { load: () => new Map(), save: () => {} }
   const bridge = new Bridge(agent, sender, store, new Set(allowed))
   const monitor = new Monitor(client, (msg) => void bridge.handle(msg).catch(() => {}))

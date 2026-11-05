@@ -56,6 +56,9 @@ impl Fixture {
 import json, os, sys, time
 from pathlib import Path
 root = Path(__file__).parent
+if len(sys.argv) < 3:
+    # Warm-up run from the fixture: no state is touched.
+    sys.exit(0)
 mode = (root / 'mode').read_text()
 command = sys.argv[2]
 with (root / 'calls').open('a') as f:
@@ -68,7 +71,7 @@ if command == 'issue':
         print((root / 'issue-reply').read_text())
         sys.exit(0)
     if mode == 'timeout':
-        time.sleep(30)
+        time.sleep(120)
     if mode in ['lost', 'list-fails']:
         print('idk_' + 'a' * 64)
     elif mode == 'oversized':
@@ -100,6 +103,30 @@ elif command == 'revoke':
 "##).unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(dir.path().join("mode"), mode).unwrap();
+        // Cold-starting a fresh script (interpreter start plus the OS scanning a newly
+        // written executable) can take many seconds on a loaded macOS runner. Pay that
+        // cost here, outside any timeout under test.
+        // Linux refuses to exec a file some process still holds open for writing
+        // (ETXTBSY). A parallel test that forks between our write and close inherits that
+        // descriptor until its own exec, so the first exec of a fresh script can fail
+        // transiently. Retry only that error.
+        let mut attempt = 0;
+        let warm = loop {
+            match std::process::Command::new(&binary)
+                .env_clear()
+                .stdin(std::process::Stdio::null())
+                .status()
+            {
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 50 =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => break other.unwrap(),
+            }
+        };
+        assert!(warm.success());
         let store = Arc::new(MemoryKeychain {
             locked,
             ..Default::default()
@@ -108,7 +135,9 @@ elif command == 'revoke':
             binary,
             db_path: dir.path().join("idoris.sqlite3"),
             store: store.clone(),
-            timeout: Duration::from_secs(5),
+            // The timeout only guards against a hung child; it must never be the thing a
+            // slow-but-working fixture trips over. The timeout test shortens it explicitly.
+            timeout: Duration::from_secs(120),
         };
         Self { dir, keys, store }
     }
@@ -172,9 +201,10 @@ async fn lost_issue_result_lists_exact_owner_and_revokes_only_its_key() {
     for mode in ["lost", "unknown", "exit-failure", "oversized", "timeout"] {
         let mut f = Fixture::new(mode, false);
         if mode == "timeout" {
-            // One timeout covers issue, list and revoke, and a fresh script can take
-            // over a second to start under load, so keep it well above that.
-            f.keys.timeout = Duration::from_secs(5);
+            // One timeout covers issue, list and revoke. The script is already warm, so
+            // 10s leaves wide margin for the fast list/revoke calls while the issue call
+            // sleeps for 120s and is guaranteed to hit it.
+            f.keys.timeout = Duration::from_secs(10);
         }
         let error = f.keys.issue("installation", &[]).await.unwrap_err();
         let calls = f.calls();
@@ -271,7 +301,8 @@ async fn cancelled_issuance_keeps_owner_for_startup_compensation() {
         tokio::pin!(issue);
         // Cancel only after the child has received the issuance request.
         let ready = async {
-            tokio::time::timeout(Duration::from_secs(5), async {
+            // Waiting on a condition, not measuring speed: returns as soon as the child ran.
+            tokio::time::timeout(Duration::from_secs(120), async {
                 while !f.dir.path().join("spec").exists() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }

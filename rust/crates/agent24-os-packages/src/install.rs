@@ -374,7 +374,10 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), InstallError> {
     std::fs::create_dir(dst).map_err(|e| {
         InstallError::Filesystem(format!("could not create {}: {e}", dst.display()))
     })?;
-    owner_write_only(dst)?;
+    // Directories are owner-only (0700), the mode `package-integrity generate` sets and
+    // discovery checks for packages that declare `integrity:`; a umask-derived 0755 would
+    // make every such package fail its scan right after install.
+    owner_only_dir(dst)?;
     let entries = std::fs::read_dir(src)
         .map_err(|e| InstallError::Source(format!("could not read {}: {e}", src.display())))?;
     for e in entries {
@@ -414,6 +417,19 @@ fn owner_write_only(path: &Path) -> Result<(), InstallError> {
         )?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn owner_only_dir(path: &Path) -> Result<(), InstallError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        InstallError::Filesystem(format!("could not restrict {}: {e}", path.display()))
+    })
+}
+
+#[cfg(not(unix))]
+fn owner_only_dir(path: &Path) -> Result<(), InstallError> {
+    owner_write_only(path)
 }
 
 #[cfg(not(unix))]

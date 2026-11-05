@@ -8,6 +8,7 @@
 
 pub mod download;
 pub mod install;
+pub mod integrity;
 pub mod lock;
 pub mod sign;
 pub mod state;

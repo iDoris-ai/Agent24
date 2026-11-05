@@ -216,6 +216,10 @@ fn read_package(dir: &Path) -> std::result::Result<Discovered, String> {
         String::from_utf8(bytes).map_err(|e| format!("{MANIFEST_FILE} is not valid UTF-8: {e}"))?;
 
     let manifest = DomainOsManifest::from_yaml(&text).map_err(|e| e.to_string())?;
+    // S1-9 PR-1: a package that declares integrity is verified in full before
+    // it can become Discovered. A package that does not declare it keeps the
+    // previous manifest-only behaviour. PR-3 replaces this with verify_required.
+    crate::package_integrity::verify_if_present(dir, &manifest).map_err(|e| e.to_string())?;
     Ok(Discovered {
         manifest,
         dir: dir.to_owned(),
@@ -258,17 +262,9 @@ pub fn build_tool_registry(found: &[Discovered]) -> (ModuleToolRegistry, Vec<Ref
     (registry, refused)
 }
 
-/// Re-checks the package at `dir` against `expected` (a `ModuleSpec`'s
-/// manifest digest, frozen at mount time). `Ok(())` means manifest-
-/// consistent under THIS check's scope — not a guarantee that nothing about
-/// the package changed: an executable/script/asset changed behind an
-/// unchanged manifest passes this (FU-61's design doc, "范围收窄" — the
-/// digest only ever covered `MANIFEST_FILE`'s bytes, not the whole package
-/// tree). `Err(reason)` covers: the directory no longer exists; it (or its
-/// manifest) is no longer a safe entry to read — this mirrors `scan`'s own
-/// directory-level symlink refusal, which `read_package` alone does not
-/// re-check (it only re-validates the manifest FILE, not the directory it
-/// lives in); or the manifest's digest no longer matches.
+/// Re-read the package and compare the manifest digest frozen at mount time.
+/// Packages declaring integrity also repeat the full payload verification;
+/// legacy packages retain manifest-only checking until PR-3.
 pub fn recheck(dir: &Path, expected: &str) -> Result<(), String> {
     match std::fs::symlink_metadata(dir) {
         Ok(m) if m.is_symlink() => {

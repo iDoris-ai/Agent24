@@ -15,6 +15,7 @@
 
 pub mod discovery;
 pub mod install;
+pub mod package_integrity;
 
 /// The name of the environment variable that overrides the packages root.
 ///

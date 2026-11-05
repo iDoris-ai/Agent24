@@ -3,10 +3,14 @@
 // flow) list/decide approvals. Everything a WeChat message needs to become an
 // agent run and come back.
 
+import type { components } from '@agent24/api-client'
 import { CONFIG, type DaemonEndpoint } from './config.js'
 
+type RunStatus = components['schemas']['RunStatus']
+type Run = components['schemas']['Run']
+
 export interface RunResult {
-  status: 'completed' | 'failed' | 'cancelled' | 'awaiting_approval' | 'running' | 'queued'
+  status: RunStatus
   text?: string
   error?: string
   runId: string
@@ -23,8 +27,9 @@ export class Agent24Client {
   constructor(private readonly ep: DaemonEndpoint) {}
 
   private headers(): Record<string, string> {
-    const h: Record<string, string> = { 'Content-Type': 'application/json' }
-    if (this.ep.token) h.Authorization = `Bearer ${this.ep.token}`
+    // Last line of defence: no bearer, no request (every method builds headers before fetch).
+    if (!this.ep.token) throw new Error('agent24d bearer token missing: refusing to send an unauthenticated request')
+    const h: Record<string, string> = { 'Content-Type': 'application/json', Authorization: `Bearer ${this.ep.token}` }
     return h
   }
 
@@ -59,11 +64,7 @@ export class Agent24Client {
     while (Date.now() < deadline) {
       const res = await fetch(`${this.ep.base}/api/v1/runs/${runId}`, { headers: this.headers() })
       if (!res.ok) return { status: 'failed', error: `run poll failed: HTTP ${res.status}`, runId }
-      const run = (await res.json()) as {
-        status: RunResult['status']
-        output?: { text: string } | null
-        error?: { code: string; message: string } | null
-      }
+      const run = (await res.json()) as Pick<Run, 'status' | 'output' | 'error'>
       switch (run.status) {
         case 'completed':
           return { status: 'completed', text: run.output?.text ?? '', runId }

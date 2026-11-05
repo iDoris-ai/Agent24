@@ -75,7 +75,8 @@ impl AllocationFailureReason {
         Ok(Self(value.to_owned()))
     }
 
-    #[allow(dead_code)]
+    /// Reason text for the retention audit detail. The G3 writer calls this.
+    #[cfg(feature = "dormant-workspace")]
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }

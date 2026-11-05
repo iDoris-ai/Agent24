@@ -19,7 +19,7 @@ const FRAME_DEADLINE: Duration = Duration::from_secs(5);
 /// or hostile peer cannot pile up tasks or exhaust descriptors.
 const MAX_CONCURRENT: usize = 8;
 // Frozen code-signing allowlist from design D5; filenames are not identities.
-const TEAM_ID: &str = "HYAP444FN9";
+const TEAM_ID: &str = agent24_os_proc::DEVELOPER_ID_TEAM_ID;
 const IDENTIFIERS: &[&str] = &["ai.auraai.agent24", "agent24", "agent24d"];
 
 use crate::enroll_api::*;
@@ -832,6 +832,62 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// S1-2 (Q2 = a): the production verifier has no bypass. A peer without an
+    /// audit token, or one whose code is not Developer ID signed (this unsigned
+    /// test binary), is rejected; this holds with or without `test-enrollment`
+    /// because that feature swaps the verifier in `serve`, it never loosens this one.
+    #[test]
+    fn system_verifier_rejects_missing_token_and_unsigned_peer() {
+        assert_eq!(
+            SystemIdentityVerifier.verify(0, None).unwrap_err(),
+            EnrollErrorCode::IdentityRejected
+        );
+        #[cfg(target_os = "macos")]
+        {
+            let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+            let token = agent24_os_proc::peer_audit_token(&a).unwrap();
+            assert_eq!(
+                SystemIdentityVerifier
+                    .verify(token.pid(), Some(token))
+                    .unwrap_err(),
+                EnrollErrorCode::IdentityRejected
+            );
+        }
+    }
+
+    /// The only way past the signature check is the `test-enrollment` feature:
+    /// the substitute verifier is compiled in solely behind that cfg (and the
+    /// feature is a compile error in release, see `main.rs`).
+    #[test]
+    fn the_unsigned_bypass_is_only_reachable_behind_the_feature_cfg() {
+        let full = include_str!("enroll_endpoint.rs");
+        let src = &full[..full.find("mod tests {").unwrap()];
+        let main = include_str!("main.rs");
+        let bypass = "crate::enroll_test_support::";
+        assert_eq!(
+            src.matches(bypass).count(),
+            2,
+            "enabled() + UnsignedIdentity only"
+        );
+        let at = src.find(bypass).unwrap();
+        let gate = src[..at]
+            .rfind("#[cfg(feature = \"test-enrollment\")]")
+            .unwrap();
+        // The gate, `if enabled()` and the substitute sit in one statement.
+        assert!(
+            src[gate..]
+                .lines()
+                .take(12)
+                .any(|l| l.contains("UnsignedIdentity"))
+        );
+        assert!(main.contains(
+            "#[cfg(feature = \"test-enrollment\")]\n#[path = \"../tests/support/enroll.rs\"]\nmod enroll_test_support;"
+        ));
+        assert!(main.contains(
+            "#[cfg(all(feature = \"test-enrollment\", not(debug_assertions)))]\ncompile_error!"
+        ));
+    }
 
     #[test]
     fn a_loose_directory_of_ours_is_tightened_to_0700() {

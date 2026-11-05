@@ -2231,7 +2231,7 @@ mod handler_tests {
         let app = axum::Router::new()
             .route("/health", axum::routing::get(|| async {
                 axum::Json(json!({"service":"idoris", "version":"0.3.1",
-                    "contract_version":"1.0.1", "instance_id":"fixture", "dev_no_key_enabled":false}))
+                    "contract_version":agent24_idoris::IdorisLock::embedded().tested_contract_version, "instance_id":"fixture", "dev_no_key_enabled":false}))
             }))
             .route("/v1/chat/completions", axum::routing::post(move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
                 let captured = captured.clone();

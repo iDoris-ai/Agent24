@@ -1,53 +1,43 @@
 //! Rust-owned lifecycle boundary for the desktop sidecar helper.
 //!
-//! The wire protocol is deliberately kept in `agent24-sidecar-host-protocol`.
-//! Platform lifecycle code lives here so the executable remains a thin entry
-//! point and cannot grow a second protocol implementation.
+//! **frozen (ADR-038 Q1=(b)).** Open Design is hosted by the TypeScript
+//! `SidecarManager` (#1580, #1584). No product crate depends on this one.
+//! Windows CI (`.github/workflows/sidecar-windows.yml`) still compiles and
+//! tests it. The wire protocol stays in `agent24-sidecar-host-protocol`.
+//!
+//! The crate-level `dead_code` allow replaces the per-module allows. Items
+//! here are reached from unit tests and from the Windows target, not from
+//! agent24d, the CLI, or the desktop. Deleting them would drop that CI.
+
+#![allow(
+    dead_code,
+    reason = "frozen (ADR-038 Q1=(b)): kept for Windows CI and unit tests; not on the product path"
+)]
 
 use std::time::{Duration, Instant};
 
-#[allow(dead_code)]
 pub(crate) mod actor;
-#[allow(dead_code)]
 mod cleanup;
-#[allow(dead_code)]
 mod control_io;
-#[allow(dead_code)]
 mod control_worker;
-#[allow(dead_code)]
 mod first_launch_dispatch;
-#[allow(dead_code)]
 mod first_launch_ingress;
-#[allow(dead_code)]
 mod generation_driver;
-#[allow(dead_code)]
 mod generation_harness;
 mod host_ports;
 mod host_session;
 mod host_stdio;
-#[allow(dead_code)]
 mod launch;
-#[allow(dead_code)]
 mod launch_order;
-#[allow(dead_code)]
 mod native_generation;
-#[allow(dead_code)]
 mod outbox;
-#[allow(dead_code)]
 mod output_io;
-#[allow(dead_code)]
 mod output_worker;
-#[allow(dead_code)]
 mod pipe_access;
-#[allow(dead_code)]
 mod pre_owned_cleanup;
-#[allow(dead_code)]
 mod ready_io;
-#[allow(dead_code)]
 mod ready_read_worker;
-#[allow(dead_code)]
 mod stderr_drain_worker;
-#[allow(dead_code)]
 mod worker_slots;
 
 #[cfg(unix)]
@@ -62,7 +52,6 @@ mod windows_test_io;
 #[cfg(windows)]
 pub use owner::{GenerationId, GenerationOwner, OwnedPipes, OwnedProcess};
 
-#[allow(dead_code)]
 pub(crate) mod target;
 
 #[cfg(test)]

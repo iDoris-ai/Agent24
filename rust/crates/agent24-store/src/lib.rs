@@ -9,17 +9,59 @@
 //! compile-time-checked macros + committed `.sqlx` offline data is planned
 //! once the query surface stabilizes at the end of C2 (recorded deviation).
 
+// G1 journal, G3 retention, and legacy terminal composition have no production
+// caller. They stay compiled behind `dormant-workspace` for the workspace G
+// series (G1-G2 scratch plan). Do not delete them. The module-level allow is
+// the whole dormant graph: item-level allows would just restate that.
+#[cfg(feature = "dormant-workspace")]
+#[allow(
+    dead_code,
+    reason = "dormant-workspace: no product caller until the workspace G slices wire this module"
+)]
 mod allocation_commitment;
 mod allocation_intent;
+#[cfg(feature = "dormant-workspace")]
+#[allow(
+    dead_code,
+    reason = "dormant-workspace: no product caller until the workspace G slices wire this module"
+)]
 mod allocation_materialization;
 mod allocation_record;
+#[cfg(feature = "dormant-workspace")]
+#[allow(
+    dead_code,
+    reason = "dormant-workspace: no product caller until the workspace G slices wire this module"
+)]
 mod allocation_registration;
-// The authorized service slice has not wired this internal journal primitive yet.
-#[allow(dead_code)]
+#[cfg(feature = "dormant-workspace")]
+#[allow(
+    dead_code,
+    reason = "dormant-workspace: no product caller until the workspace G slices wire this module"
+)]
 mod allocation_reservation;
+#[cfg(feature = "dormant-workspace")]
+#[allow(
+    dead_code,
+    reason = "dormant-workspace: no product caller until the workspace G slices wire this module"
+)]
 mod allocation_retention_evidence;
+#[cfg(feature = "dormant-workspace")]
+#[allow(
+    dead_code,
+    reason = "dormant-workspace: no product caller until the workspace G slices wire this module"
+)]
 mod allocation_retention_expectation;
+#[cfg(feature = "dormant-workspace")]
+#[allow(
+    dead_code,
+    reason = "dormant-workspace: no product caller until the workspace G slices wire this module"
+)]
 mod allocation_retention_plan;
+#[cfg(feature = "dormant-workspace")]
+#[allow(
+    dead_code,
+    reason = "dormant-workspace: no product caller until the workspace G slices wire this module"
+)]
 mod allocation_retention_writer;
 mod allocation_types;
 mod audit;
@@ -41,9 +83,24 @@ mod run_workspace_terminal;
 pub mod source_policy;
 #[doc(hidden)]
 pub mod sqlite_phase;
+#[cfg(feature = "dormant-workspace")]
+#[allow(
+    dead_code,
+    reason = "dormant-workspace: no product caller until the workspace G slices wire this module"
+)]
 mod terminal_core;
 mod terminal_helpers;
+#[cfg(feature = "dormant-workspace")]
+#[allow(
+    dead_code,
+    reason = "dormant-workspace: no product caller until the workspace G slices wire this module"
+)]
 pub(crate) mod terminal_mutations;
+#[cfg(feature = "dormant-workspace")]
+#[allow(
+    dead_code,
+    reason = "dormant-workspace: no product caller until the workspace G slices wire this module"
+)]
 pub(crate) mod terminal_plan;
 pub mod workspace_api;
 pub mod workspace_decode;

@@ -8,6 +8,7 @@ export {
   dataDir,
   joinLiteral,
   joinLiteralFor,
+  readDaemonState,
   resolveDataDir,
   tryDataDir,
 } from '@agent24/data-dir'

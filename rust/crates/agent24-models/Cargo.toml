@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Agent24 model gateway — minimal ModelProvider trait, OpenAI-compatible adapter, ordered registry (ADR-026: routing/health logic lives above the trait, never inside providers)"
 
 [dependencies]
+agent24-idoris = { path = "../agent24-idoris" }
 agent24-protocol = { path = "../agent24-protocol" }
 agent24-domain = { path = "../agent24-domain" }
 async-trait = "0.1"
