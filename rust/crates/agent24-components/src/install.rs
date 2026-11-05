@@ -2,6 +2,7 @@
 
 use crate::{
     download::{MAX_ARCHIVE_BYTES, VerifiedArchive, hash_matches},
+    integrity::{self, FileDigest},
     lock::{Asset, ComponentLock, clean_relative},
     sign::{SignatureVerifier, VerifyMode},
     storage::{open_regular, private_directory},
@@ -19,7 +20,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub const MAX_UNPACKED_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_UNPACKED_BYTES: u64 = crate::integrity::MAX_PAYLOAD_BYTES;
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
@@ -192,12 +193,6 @@ fn verify_signatures(
 }
 
 type Manifest = BTreeMap<String, FileDigest>;
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileDigest {
-    size: u64,
-    sha256: String,
-}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChildRequest {
@@ -603,40 +598,15 @@ fn check_file_list(files: &[String]) -> Result<(), InstallError> {
 
 /// Executables are read-and-execute only; everything else read-only.
 fn file_mode(executables: &[String], name: &str) -> u32 {
-    if executables.iter().any(|e| e == name) {
-        0o500
-    } else {
-        0o400
-    }
+    integrity::unix_file_mode(executables, name)
 }
 
 fn clean_path(name: &str, directory: bool) -> Result<&str, InstallError> {
-    let name = if directory {
-        name.strip_suffix('/').unwrap_or(name)
-    } else {
-        name
-    };
-    if name.is_empty()
-        || name.contains(['\\', '\0'])
-        || name.chars().any(char::is_control)
-        || name.split('/').any(|s| matches!(s, "" | "." | ".."))
-    {
-        return Err(violation(format!("unsafe path: {name}")));
-    }
-    Ok(name)
+    integrity::clean_path(name, directory).map_err(violation)
 }
 
 fn parent_dirs(files: &[String]) -> BTreeSet<String> {
-    files
-        .iter()
-        .flat_map(|name| {
-            Path::new(name)
-                .ancestors()
-                .skip(1)
-                .filter(|p| !p.as_os_str().is_empty())
-                .map(|p| p.to_string_lossy().into_owned())
-        })
-        .collect()
+    integrity::parent_dirs(files)
 }
 
 fn scan_archive(
@@ -801,66 +771,14 @@ fn verify_tree(
     immutable: bool,
     cancel: &CancellationToken,
 ) -> Result<(), InstallError> {
-    if !fs::symlink_metadata(root)?.is_dir() {
-        return Err(violation("version is not a directory"));
-    }
-    let parents = parent_dirs(&expected.keys().cloned().collect::<Vec<_>>());
-    let mut pending = vec![root.to_path_buf()];
-    let mut seen = BTreeSet::new();
-    while let Some(dir) = pending.pop() {
-        if immutable {
-            check_mode(&dir, 0o700)?;
-        }
-        for entry in fs::read_dir(&dir)? {
-            let path = entry?.path();
-            let name = path
-                .strip_prefix(root)
-                .map_err(io::Error::other)?
-                .to_string_lossy()
-                .into_owned();
-            let metadata = fs::symlink_metadata(&path)?;
-            if metadata.is_dir() && parents.contains(&name) {
-                pending.push(path);
-                continue;
-            }
-            regular_file(&metadata)?;
-            let wanted = expected
-                .get(&name)
-                .ok_or_else(|| violation(format!("unexpected installed file: {name}")))?;
-            if metadata.len() != wanted.size || digest(&mut File::open(&path)?, cancel)? != *wanted
-            {
-                return Err(InstallError::HashMismatch(name));
-            }
-            if immutable {
-                check_mode(&path, file_mode(executables, &name))?;
-            }
-            seen.insert(name);
-        }
-    }
-    if seen.len() != expected.len() {
-        return Err(violation("missing installed file"));
-    }
-    Ok(())
+    integrity::verify_tree(root, expected, executables, immutable, &[], cancel)
+        .map_err(tree_to_install)
 }
 
 fn digest(reader: &mut impl Read, cancel: &CancellationToken) -> Result<FileDigest, InstallError> {
-    let mut hash = Sha256::new();
-    let mut size = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        check_cancel(cancel)?;
-        let n = reader.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        size += n as u64;
-        hash.update(&buffer[..n]);
-    }
-    Ok(FileDigest {
-        size,
-        sha256: format!("{:x}", hash.finalize()),
-    })
+    integrity::digest_reader(reader, cancel).map_err(tree_to_install)
 }
+
 fn regular_file(metadata: &fs::Metadata) -> Result<(), InstallError> {
     if !metadata.is_file() {
         return Err(violation("not an ordinary file"));
@@ -873,6 +791,15 @@ fn regular_file(metadata: &fs::Metadata) -> Result<(), InstallError> {
         }
     }
     Ok(())
+}
+
+fn tree_to_install(err: integrity::TreeError) -> InstallError {
+    match err {
+        integrity::TreeError::Violation(message) => violation(message),
+        integrity::TreeError::HashMismatch(name) => InstallError::HashMismatch(name),
+        integrity::TreeError::Io(err) => InstallError::Io(err),
+        integrity::TreeError::Cancelled => InstallError::Cancelled,
+    }
 }
 pub fn private_dir(path: &Path) -> Result<(), InstallError> {
     let mut builder = fs::DirBuilder::new();
@@ -890,30 +817,7 @@ pub fn private_dir(path: &Path) -> Result<(), InstallError> {
     Ok(())
 }
 fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-    }
-    Ok(())
-}
-fn check_mode(path: &Path, mode: u32) -> Result<(), InstallError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if fs::symlink_metadata(path)?.permissions().mode() & 0o7777 != mode {
-            return Err(violation("installed permissions changed"));
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-    }
-    Ok(())
+    integrity::set_unix_mode(path, mode)
 }
 fn sync_dirs(root: &Path) -> io::Result<()> {
     for entry in fs::read_dir(root)? {
