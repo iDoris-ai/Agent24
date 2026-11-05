@@ -4192,11 +4192,16 @@ pub(crate) mod tests {
 
     const HTTP_METHODS: [&str; 7] = ["get", "put", "post", "delete", "patch", "head", "options"];
 
+    /// Calls other than the HTTP methods that may follow a route at its top level: they
+    /// configure the handler, they do not add or hide a method.
+    const ROUTE_MODIFIERS: [&str; 3] = ["layer", "route_layer", "with_state"];
+
     /// `(METHOD, path)` pairs for the `.route("<path>", <handlers>)` literals inside the
     /// function starting at `anchor`. Methods are the `get(..)`/`post(..)`/... calls at the
     /// top level of the route's own argument list, so `get(a).post(b)` yields both while a
-    /// nested `.layer(..)` argument is not read. A route whose methods cannot be read
-    /// (e.g. `any(..)`, `on(..)`) fails the scan rather than silently dropping out of the gate.
+    /// nested `.layer(..)` argument is not read. The scan is fail-closed: a non-literal path,
+    /// a route with no readable method, or any other top-level call that could add or hide a
+    /// method (`any`, `on`, `merge`, `trace`, ...) panics instead of dropping out of the gate.
     fn route_ops(source: &str, anchor: &str) -> Vec<(String, String)> {
         let start = source
             .find(anchor)
@@ -4208,7 +4213,13 @@ pub(crate) mod tests {
         let mut ops = Vec::new();
         for (offset, _) in body.match_indices(".route(") {
             let args = &body[offset + ".route(".len()..];
-            let open = args.find('"').expect("route path literal") + 1;
+            let trimmed = args.trim_start();
+            assert!(
+                trimmed.starts_with('"'),
+                "route path must be a string literal, got: {:.40}",
+                trimmed
+            );
+            let open = args.len() - trimmed.len() + 1;
             let path_len = args[open..].find('"').expect("route path literal end");
             let path = args[open..open + path_len].to_owned();
             let chars: Vec<char> = args[open + path_len + 1..].chars().collect();
@@ -4219,6 +4230,22 @@ pub(crate) mod tests {
                     while i < chars.len() && chars[i] != '\n' {
                         i += 1;
                     }
+                    continue;
+                }
+                if c == '/' && chars.get(i + 1) == Some(&'*') {
+                    i += 2;
+                    while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                        i += 1;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if c == '"' {
+                    i += 1;
+                    while i < chars.len() && chars[i] != '"' {
+                        i += if chars[i] == '\\' { 2 } else { 1 };
+                    }
+                    i += 1;
                     continue;
                 }
                 if c == '(' {
@@ -4235,12 +4262,17 @@ pub(crate) mod tests {
                     while j < chars.len() && chars[j].is_whitespace() {
                         j += 1;
                     }
-                    if depth == 1
-                        && chars.get(j) == Some(&'(')
-                        && HTTP_METHODS.contains(&ident.as_str())
-                    {
-                        ops.push((ident.to_ascii_uppercase(), path.clone()));
-                        found += 1;
+                    if depth == 1 && chars.get(j) == Some(&'(') {
+                        if HTTP_METHODS.contains(&ident.as_str()) {
+                            ops.push((ident.to_ascii_uppercase(), path.clone()));
+                            found += 1;
+                        } else {
+                            assert!(
+                                ROUTE_MODIFIERS.contains(&ident.as_str()),
+                                "route {path}: unsupported top-level call `{ident}(..)`; the \
+                                 gate cannot tell which methods it serves"
+                            );
+                        }
                     }
                     continue;
                 }
@@ -4414,19 +4446,13 @@ pub(crate) mod tests {
         let openapi = include_str!("../../../../protocol/openapi.yaml")
             .replace("  /comm/groupchat:\n", "  /comm/groupchat-gone:\n");
         let (missing_from_openapi, extra_in_openapi) = route_openapi_mismatches(routes, &openapi);
-        assert!(
-            missing_from_openapi
-                .iter()
-                .all(|op| op.ends_with(" /comm/groupchat")),
-            "{missing_from_openapi:?}"
+        assert_eq!(
+            missing_from_openapi,
+            ["GET /comm/groupchat", "POST /comm/groupchat"]
         );
-        assert!(!missing_from_openapi.is_empty());
-        assert_eq!(missing_from_openapi.len(), extra_in_openapi.len());
-        assert!(
-            extra_in_openapi
-                .iter()
-                .all(|op| op.ends_with(" /comm/groupchat-gone")),
-            "{extra_in_openapi:?}"
+        assert_eq!(
+            extra_in_openapi,
+            ["GET /comm/groupchat-gone", "POST /comm/groupchat-gone"]
         );
     }
 
@@ -4502,13 +4528,34 @@ pub(crate) mod tests {
                 ("DELETE".to_owned(), "/c".to_owned()),
             ]
         );
-        let unreadable = "pub fn r() {\n    x.route(\"/d\", any(h))\n}\n";
-        assert!(std::panic::catch_unwind(|| route_ops(unreadable, "pub fn r(")).is_err());
+        for bad in [
+            ".route(\"/d\", any(h))",
+            ".route(\"/d\", any(h).post(g))",
+            ".route(\"/d\", get(h).on(MethodFilter::DELETE, g))",
+            ".route(\"/d\", get(h).merge(other()))",
+            ".route(\"/d\", get(h).trace(g))",
+            ".route(PATH, get(h))\n        .route(\"/b\", get(h))",
+        ] {
+            let src = format!("pub fn r() {{\n    x\n        {bad}\n}}\n");
+            assert!(
+                std::panic::catch_unwind(|| route_ops(&src, "pub fn r(")).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        // comments and string literals are not code
+        let noisy = "pub fn r() {\n    x.route(\"/e\", get(h) /* any(x) */ // on(y)\n        .layer(L::new(\"on(\")))\n}\n";
+        assert_eq!(
+            route_ops(noisy, "pub fn r("),
+            [("GET".to_owned(), "/e".to_owned())]
+        );
     }
 
-    /// B3 / ADR-045 D6: the documents module's `_a24/*` routes are listed as module-internal
-    /// channels, in both directions (a new `_a24` literal fails, a stale entry fails), and
-    /// they never appear in OpenAPI.
+    /// B3 / ADR-045 D6: the `_a24/*` routes of `router()` in the documents module are listed
+    /// as module-internal channels, in both directions (a new one fails, a stale entry
+    /// fails). Separately, the count of `"/_a24` literals in the whole non-test source of
+    /// `agent24-documents/src/lib.rs` must equal the table size, so an `_a24` route added
+    /// outside `router()` is caught too. They never appear in OpenAPI.
+    /// (Other files of the documents crate are not scanned; `_a24` routes live in `lib.rs`.)
     #[test]
     fn module_internal_channel_routes_match_documents_source() {
         let scan = |source: &str| -> Vec<(String, String)> {
@@ -4538,6 +4585,17 @@ pub(crate) mod tests {
             .replace("\"/_a24/authorization/revoked\"", "\"/gone\"");
         assert_ne!(gone, DOCUMENTS_ROUTE_SOURCE.0);
         assert_ne!(scan(&gone), listed);
+
+        let non_test = DOCUMENTS_ROUTE_SOURCE
+            .0
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split yields at least one part");
+        assert_eq!(
+            non_test.matches("\"/_a24").count(),
+            MODULE_INTERNAL_CHANNEL_ROUTES.len(),
+            "an `_a24` literal outside the table (or outside router()) in agent24-documents/src/lib.rs"
+        );
 
         // every `_a24` route is kept out of the client contract
         let openapi = include_str!("../../../../protocol/openapi.yaml");
