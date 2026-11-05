@@ -4,6 +4,14 @@
 //! Its input is the exact persisted intent snapshot a later composition layer
 //! must supply; its output is only an owned directory handle and evidence.
 
+#![cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "the unix-only G1 callers (pinned roots, host admission) do not compile on Windows yet"
+    )
+)]
+
 use crate::{
     WorkspaceError,
     root::{ManagedParent, RootIdentity},

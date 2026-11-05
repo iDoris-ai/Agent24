@@ -5,6 +5,14 @@
 //! admission beyond that binding is still unwired; unused items carry their own
 //! allow instead of a file-wide one.
 
+#![cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "the unix-only G1 callers (pinned roots, host admission) do not compile on Windows yet"
+    )
+)]
+
 use agent24_store::{Store, WorkspaceInstant, WorkspaceLeaseId, WorkspaceStoreError};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;

@@ -1,3 +1,10 @@
+#![cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "the unix-only G1 callers (pinned roots, host admission) do not compile on Windows yet"
+    )
+)]
 use crate::WorkspaceError;
 use std::fs::File;
 
