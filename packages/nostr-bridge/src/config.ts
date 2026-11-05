@@ -2,7 +2,7 @@
 // agent-speaker CLI (a subprocess — G3), and IN to the local agent24d over its
 // v1 HTTP API (discovered from the daemon's state file, overridable by env).
 
-import { dataDir, joinLiteral, requireDaemonBearer } from '@agent24/data-dir'
+import { DaemonStateError, dataDir, joinLiteral, requireDaemonBearer } from '@agent24/data-dir'
 
 /** Parse a duration env var into a finite positive number of milliseconds.
  *
@@ -127,7 +127,20 @@ export interface DaemonEndpoint {
  * record): the bridge must fail loudly, never send an empty token. */
 export function discoverDaemon(): DaemonEndpoint | null {
   const envBase = process.env.A24_BASE_URL
-  if (envBase) return { base: envBase.replace(/\/+$/, ''), token: process.env.A24_TOKEN ?? '' }
+  if (envBase) {
+    // The override must be a complete credential pair: a valid http(s) URL AND a
+    // non-empty A24_TOKEN. Anything less would run unauthenticated business requests.
+    let url: URL
+    try {
+      url = new URL(envBase)
+    } catch {
+      throw new DaemonStateError('A24_BASE_URL is not a valid URL')
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new DaemonStateError('A24_BASE_URL must be http(s)')
+    const token = process.env.A24_TOKEN
+    if (!token || token.trim() === '') throw new DaemonStateError('A24_BASE_URL is set but A24_TOKEN is missing or empty')
+    return { base: envBase.replace(/\/+$/, ''), token }
+  }
   const found = requireDaemonBearer(CONFIG.DAEMON_STATE_FILE)
   return found && { base: `http://127.0.0.1:${found.port}`, token: found.token }
 }

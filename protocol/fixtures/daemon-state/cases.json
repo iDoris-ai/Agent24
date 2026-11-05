@@ -298,6 +298,30 @@
         "outcome": "rejected",
         "reason": "malformed"
       }
+    },
+    {
+      "name": "duplicate auth_mode (capabilities then legacy with token)",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"generation\":\"g1\",\"auth_mode\":\"capabilities\",\"auth_mode\":\"legacy_single_token\",\"token\":\"t\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "duplicate token",
+      "text": "{\"port\":4321,\"pid\":999,\"version\":\"0.5.0\",\"token\":\"a\",\"token\":\"b\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
+    },
+    {
+      "name": "duplicate port via escaped key",
+      "text": "{\"port\":1,\"p\\u006frt\":2,\"pid\":999,\"version\":\"v\",\"token\":\"a\"}",
+      "expect": {
+        "outcome": "rejected",
+        "reason": "invalid"
+      }
     }
   ]
 }

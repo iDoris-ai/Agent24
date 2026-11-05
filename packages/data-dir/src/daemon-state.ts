@@ -54,6 +54,39 @@ function isUint(v: unknown, max: number): v is number {
   return typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= max
 }
 
+const KNOWN_FIELDS = new Set([
+  'port', 'token', 'pid', 'version', 'generation', 'auth_mode', 'protocol_version', 'enroll_endpoint', 'startup_state',
+])
+
+/** First known top-level key that appears more than once in already-valid JSON text, else null.
+ * Keys are compared after JSON string decoding (`"p\u006frt"` is `port`), like serde. */
+function duplicateKnownKey(raw: string): string | null {
+  const seen = new Set<string>()
+  let depth = 0
+  let expectKey = false
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]
+    if (ch === '"') {
+      let j = i + 1
+      while (raw[j] !== '"') j += raw[j] === '\\' ? 2 : 1
+      if (depth === 1 && expectKey) {
+        const key = JSON.parse(raw.slice(i, j + 1)) as string
+        expectKey = false
+        if (KNOWN_FIELDS.has(key)) {
+          if (seen.has(key)) return key
+          seen.add(key)
+        }
+      }
+      i = j
+    } else if (ch === '{' || ch === '[') {
+      depth++
+      expectKey = depth === 1 && ch === '{'
+    } else if (ch === '}' || ch === ']') depth--
+    else if (ch === ',' && depth === 1) expectKey = true
+  }
+  return null
+}
+
 /** Pure parse + validate of the file's text. Messages never contain field values (the file holds a bearer). */
 export function parseDaemonState(raw: string): DaemonStateResult {
   let json: unknown
@@ -63,6 +96,10 @@ export function parseDaemonState(raw: string): DaemonStateResult {
     return fail('malformed', 'not valid JSON')
   }
   if (typeof json !== 'object' || json === null || Array.isArray(json)) return fail('malformed', 'not a JSON object')
+  // JSON.parse lets a later duplicate silently win; Rust serde rejects a repeated
+  // known field, so must we (else {"auth_mode":"capabilities",…,"auth_mode":"legacy_single_token"} passes here only).
+  const dup = duplicateKnownKey(raw)
+  if (dup !== null) return fail('invalid', `duplicate field ${dup}`)
   const o = json as Record<string, unknown>
 
   if (!isUint(o['port'], 0xffff)) return fail('invalid', 'port missing or not a u16')

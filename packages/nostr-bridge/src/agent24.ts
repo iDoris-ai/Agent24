@@ -24,8 +24,9 @@ export class Agent24Client {
   constructor(private readonly ep: DaemonEndpoint) {}
 
   private headers(): Record<string, string> {
-    const h: Record<string, string> = { 'Content-Type': 'application/json' }
-    if (this.ep.token) h.Authorization = `Bearer ${this.ep.token}`
+    // Last line of defence: no bearer, no request (every method builds headers before fetch).
+    if (!this.ep.token) throw new Error('agent24d bearer token missing: refusing to send an unauthenticated request')
+    const h: Record<string, string> = { 'Content-Type': 'application/json', Authorization: `Bearer ${this.ep.token}` }
     return h
   }
 

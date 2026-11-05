@@ -56,9 +56,23 @@ describe('discoverDaemon (single daemon.json parser)', () => {
     expect(discoverDaemon()).toBeNull()
   })
 
-  it('A24_BASE_URL still overrides the file (tests / non-standard setups)', () => {
+  it('A24_BASE_URL + non-empty A24_TOKEN still overrides the file (tests / non-standard setups)', () => {
     process.env.A24_BASE_URL = 'http://127.0.0.1:9/'
     process.env.A24_TOKEN = 't'
     expect(discoverDaemon()).toEqual({ base: 'http://127.0.0.1:9', token: 't' })
+  })
+
+  it('the override without a usable token or URL fails at startup (no empty-bearer run)', () => {
+    process.env.A24_BASE_URL = 'http://127.0.0.1:9'
+    expect(() => discoverDaemon()).toThrow(/A24_TOKEN/)
+    process.env.A24_TOKEN = ''
+    expect(() => discoverDaemon()).toThrow(/A24_TOKEN/)
+    process.env.A24_TOKEN = '   '
+    expect(() => discoverDaemon()).toThrow(/A24_TOKEN/)
+    process.env.A24_TOKEN = 't'
+    process.env.A24_BASE_URL = 'not a url'
+    expect(() => discoverDaemon()).toThrow(/valid URL/)
+    process.env.A24_BASE_URL = 'ftp://127.0.0.1:9'
+    expect(() => discoverDaemon()).toThrow(/http/)
   })
 })
