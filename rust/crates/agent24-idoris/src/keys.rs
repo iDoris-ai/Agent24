@@ -161,6 +161,15 @@ impl Keys {
         })
     }
 
+    /// Override the per-command bound (default 10s). It is a hung-child guard, so a
+    /// host whose key CLI starts slowly (or a test fixture on a loaded machine) may
+    /// widen it; it never changes what is compensated or revoked on expiry.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
     pub async fn issue(&self, install_id: &str, roles: &[&str]) -> Result<IssuedKey, KeyError> {
         self.issue_transaction(install_id, roles, false).await
     }
