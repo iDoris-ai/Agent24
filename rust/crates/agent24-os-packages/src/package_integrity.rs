@@ -122,6 +122,7 @@ pub fn generate(root: &Path, executables: &[String]) -> Result<(), IntegrityErro
         });
     }
 
+    refuse_stale_temp_files(root)?;
     let cancel = CancellationToken::new();
     let payload = integrity::collect_payload(root, &[DOMAIN_OS_YML, FILES_JSON_NAME], &cancel)
         .map_err(integrity::map_tree_error)?;
@@ -132,14 +133,6 @@ pub fn generate(root: &Path, executables: &[String]) -> Result<(), IntegrityErro
             });
         }
     }
-    integrity::normalize_modes(
-        root,
-        &payload,
-        executables,
-        &[DOMAIN_OS_YML, FILES_JSON_NAME],
-    )
-    .map_err(integrity::map_tree_error)?;
-
     let mut listed_executables = executables.to_vec();
     listed_executables.sort();
     let json = integrity::render_files_json(&payload)?;
@@ -151,6 +144,15 @@ pub fn generate(root: &Path, executables: &[String]) -> Result<(), IntegrityErro
     };
     integrity::validate_section(&section, parsed.spawn().map(|spawn| spawn.command.as_str()))?;
     integrity::verify_files_json(&json, &section)?;
+    // Only after the section validates: a refused package (e.g. a bare spawn.command) must
+    // leave the staging tree's modes as they were.
+    integrity::normalize_modes(
+        root,
+        &payload,
+        executables,
+        &[DOMAIN_OS_YML, FILES_JSON_NAME],
+    )
+    .map_err(integrity::map_tree_error)?;
     let composed = compose_yaml(&business, &integrity_block(&section));
     let republished =
         DomainOsManifest::from_yaml(&composed).map_err(|err| IntegrityError::ManifestInvalid {
@@ -213,9 +215,7 @@ fn verify_declared(
             ),
         });
     }
-    let bytes = fs::read(&path).map_err(|err| IntegrityError::CheckFailed {
-        detail: format!("{FILES_JSON_NAME}: {err}"),
-    })?;
+    let bytes = read_bounded(&path, FILES_JSON_NAME, integrity::MAX_FILES_JSON_BYTES)?;
     let expected = integrity::verify_files_json(&bytes, section)?;
     integrity::verify_tree(
         dir,
@@ -280,6 +280,32 @@ fn read_bounded(path: &Path, label: &str, limit: u64) -> Result<Vec<u8>, Integri
         });
     }
     Ok(bytes)
+}
+
+/// `atomic_write` names its temporaries `.<name>.<pid>.<n>.tmp`. One left by a crashed run
+/// would otherwise be hashed into the next manifest as payload.
+fn refuse_stale_temp_files(root: &Path) -> Result<(), IntegrityError> {
+    let entries = fs::read_dir(root).map_err(|err| IntegrityError::CheckFailed {
+        detail: format!("{}: {err}", root.display()),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| IntegrityError::CheckFailed {
+            detail: err.to_string(),
+        })?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let ours = [DOMAIN_OS_YML, FILES_JSON_NAME]
+            .iter()
+            .any(|control| name.starts_with(&format!(".{control}.")));
+        if ours && name.ends_with(".tmp") {
+            return Err(IntegrityError::ManifestInvalid {
+                detail: format!(
+                    "stale temporary file {name} from an interrupted generate; remove it and retry"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn restore_files_json(root: &Path, existed: bool, previous: Option<&[u8]>) -> io::Result<()> {
@@ -398,6 +424,46 @@ mod tests {
 
     fn mode_of(path: &Path) -> u32 {
         fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn a_generated_package_still_scans_after_os_install() {
+        // #1614 B1: install used to create directories 0755 while verify_tree wants 0700.
+        let staging = tempfile::tempdir().unwrap();
+        write_tree(staging.path(), "cos72");
+        generate(staging.path(), &["bin/cos72".into(), "bin/helper".into()]).unwrap();
+        verify(staging.path()).unwrap();
+        let packages = tempfile::tempdir().unwrap();
+        let root = packages.path().join("packages");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::install::install(staging.path(), &root).unwrap();
+        let scan = crate::discovery::scan(&root);
+        assert_eq!(scan.found.len(), 1, "refused: {:?}", scan.refused);
+    }
+
+    #[test]
+    fn a_refused_generate_leaves_staging_modes_untouched() {
+        // #1614 N1: validation runs before normalize_modes.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_tree(root, "cos72");
+        let yaml = yaml_for("cos72").replace("command: bin/cos72", "command: cos72");
+        fs::write(root.join(DOMAIN_OS_YML), yaml).unwrap();
+        let before = mode_of(&root.join("config/default.json"));
+        assert!(generate(root, &["bin/cos72".into()]).is_err());
+        assert_eq!(mode_of(&root.join("config/default.json")), before);
+    }
+
+    #[test]
+    fn a_stale_temp_file_from_a_crashed_generate_is_refused() {
+        // #1614 N5: it would otherwise be hashed into the manifest as payload.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_tree(root, "cos72");
+        fs::write(root.join(".files.json.4242.0.tmp"), b"{}").unwrap();
+        let err = generate(root, &["bin/cos72".into()]).unwrap_err();
+        assert!(err.to_string().contains("stale temporary file"), "{err}");
     }
 
     #[test]
