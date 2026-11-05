@@ -132,6 +132,8 @@ describe('communication capability status', () => {
     { state: 'stopped', label: '已停止' },
     { state: 'stopped', reason: 'not_configured', label: '未配置' },
     { state: 'failed', reason: 'locked', label: '已锁定' },
+    { state: 'stopped', reason: 'locked', label: '已锁定' },
+    { state: 'incompatible', reason: 'component_contract_mismatch', label: '不兼容' },
     { state: 'failed', reason: 'gave_up', label: '已停止重试' },
     { state: 'failed', reason: 'backoff', label: '重试中…' },
     { state: 'failed', reason: 'starting', label: '正在启动…' },

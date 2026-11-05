@@ -63,7 +63,7 @@ async fn endpoint_with_redirect(
                     requests.iter().filter(|r| r.starts_with("POST ")).count()
                 };
                 let mut body = if health {
-                    serde_json::json!({"service":"idoris","version":"0.3.0","contract_version":"1.0.1","instance_id":"00000000-0000-4000-8000-000000000001","dev_no_key_enabled":false})
+                    serde_json::json!({"service":"idoris","version":"0.3.0","contract_version":agent24_idoris::IdorisLock::embedded().tested_contract_version,"instance_id":"00000000-0000-4000-8000-000000000001","dev_no_key_enabled":false})
                 } else {
                     serde_json::json!({"model":"fixture-model","choices":[{"message":{"role":"assistant","content":content}}],"usage":{"prompt_tokens":1,"completion_tokens":4,"total_tokens":5}})
                 };
@@ -71,6 +71,9 @@ async fn endpoint_with_redirect(
                     match content {
                         "wrong-service" => body["service"] = serde_json::json!("unrelated"),
                         "wrong-contract" => body["contract_version"] = serde_json::json!("0"),
+                        "1.0.0" | "1.0.1" | "1.0.99" => {
+                            body["contract_version"] = serde_json::json!(content)
+                        }
                         "dev-mode" => body["dev_no_key_enabled"] = serde_json::json!(true),
                         _ => {}
                     }
@@ -362,6 +365,9 @@ async fn invalid_evidence_and_credentials_never_fall_back() {
         "redirect",
         "wrong-service",
         "wrong-contract",
+        "1.0.0",
+        "1.0.1",
+        "1.0.99",
         "dev-mode",
         "missing-model",
         "invalid-cache",
@@ -470,7 +476,16 @@ async fn invalid_evidence_and_credentials_never_fall_back() {
         .contains(&case)
         {
             assert!(requests.is_empty(), "{case}");
-        } else if ["wrong-service", "wrong-contract", "dev-mode"].contains(&case) {
+        } else if [
+            "wrong-service",
+            "wrong-contract",
+            "dev-mode",
+            "1.0.0",
+            "1.0.1",
+            "1.0.99",
+        ]
+        .contains(&case)
+        {
             assert_eq!(requests.len(), 1, "{case}");
             assert!(requests[0].starts_with("GET /health "));
             assert!(

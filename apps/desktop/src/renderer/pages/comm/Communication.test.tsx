@@ -52,10 +52,10 @@ const readyHyphae: ComponentView = { id: 'hyphae', version: 'v0.28.1', state: 'r
 function mirrorHyphae(state: CommDaemonStatus['process']['state']) {
   hyphaeBox.mode = 'ready'
   if (state === 'running') hyphaeBox.component = { ...readyHyphae, state: 'ready' }
-  else if (state === 'stopped' || state === 'not_configured') {
+  else if (state === 'stopped' || state === 'not_configured' || state === 'locked') {
     hyphaeBox.component = state === 'not_configured'
       ? { ...readyHyphae, state: 'stopped', reason: 'not_configured' }
-      : { ...readyHyphae, state: 'stopped' }
+      : { ...readyHyphae, state: 'stopped', reason: state === 'locked' ? 'locked' : undefined }
   } else hyphaeBox.component = { ...readyHyphae, state: 'failed', reason: state }
 }
 

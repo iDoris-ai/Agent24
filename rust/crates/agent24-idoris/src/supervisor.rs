@@ -958,7 +958,6 @@ fn validate_health(body: &[u8], lock: &IdorisLock) -> Result<(), SupervisorError
         || value.version != lock.tag.trim_start_matches('v')
         || value.instance_id.trim().is_empty()
         || value.dev_no_key_enabled
-        || semver::Version::parse(&value.contract_version).map_or(true, |v| v.major != 1)
         || lock.check_contract(&value.contract_version).is_err()
     {
         return Err(SupervisorError::Contract);

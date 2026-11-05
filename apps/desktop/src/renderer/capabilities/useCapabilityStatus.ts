@@ -52,6 +52,7 @@ export function useCapabilityStatus(active: boolean) {
     if (component.state === 'ready') return commText('process.running')
     if (component.state === 'starting') return commText('process.starting')
     if (component.state === 'stopped') {
+      if (component.reason === 'locked') return commText('process.locked')
       return component.reason === 'not_configured' ? commText('process.notConfigured') : commText('process.stopped')
     }
     if (component.state === 'failed') {
