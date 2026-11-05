@@ -22,20 +22,27 @@ fn is_team_id(s: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
-/// The value of the real (non-comment) shell assignment `NAME=...`, with the
-/// `${ENV:-default}` wrapper removed. Err when the assignment is absent.
-fn sh_assignment(text: &str, name: &str) -> Result<String, String> {
+/// The values of every real (non-comment) shell assignment `NAME=...`, with the
+/// `${ENV:-default}` wrapper removed. Err when there is none, so a later
+/// assignment cannot hide behind (or be hidden by) the first one.
+fn sh_assignments(text: &str, name: &str) -> Result<Vec<String>, String> {
     let prefix = format!("{name}=");
-    let line = text
+    let mut values = Vec::new();
+    for line in text
         .lines()
         .map(str::trim_start)
-        .find(|l| !l.starts_with('#') && l.starts_with(&prefix))
-        .ok_or_else(|| format!("no `{name}=` assignment"))?;
-    let mut value = line[prefix.len()..].trim().trim_matches('"');
-    if let Some(inner) = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) {
-        value = inner.split_once(":-").ok_or("no `:-` default")?.1;
+        .filter(|l| !l.starts_with('#') && l.starts_with(&prefix))
+    {
+        let mut value = line[prefix.len()..].trim().trim_matches('"');
+        if let Some(inner) = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) {
+            value = inner.split_once(":-").ok_or("no `:-` default")?.1;
+        }
+        values.push(value.to_owned());
     }
-    Ok(value.to_owned())
+    if values.is_empty() {
+        return Err(format!("no `{name}=` assignment"));
+    }
+    Ok(values)
 }
 
 /// "Developer ID Application: Name (TEAM)" or "Name (TEAM)" -> the full text
@@ -50,15 +57,22 @@ fn team_in_identity(identity: &str) -> Result<String, String> {
     Ok(inner.to_owned())
 }
 
-fn sign_identity_team(sh: &str) -> Result<String, String> {
-    team_in_identity(&sh_assignment(sh, "SIGN_IDENTITY")?)
+fn sign_identity_teams(sh: &str) -> Result<Vec<String>, String> {
+    sh_assignments(sh, "SIGN_IDENTITY")?
+        .iter()
+        .map(|v| team_in_identity(v))
+        .collect()
 }
 
-fn notary_team(sh: &str) -> Result<String, String> {
-    sh_assignment(sh, "NOTARY_PROFILE")?
-        .strip_prefix("apple-notary-")
-        .map(str::to_owned)
-        .ok_or_else(|| "NOTARY_PROFILE is not `apple-notary-<TEAM>`".to_owned())
+fn notary_teams(sh: &str) -> Result<Vec<String>, String> {
+    sh_assignments(sh, "NOTARY_PROFILE")?
+        .iter()
+        .map(|v| {
+            v.strip_prefix("apple-notary-")
+                .map(str::to_owned)
+                .ok_or_else(|| "NOTARY_PROFILE is not `apple-notary-<TEAM>`".to_owned())
+        })
+        .collect()
 }
 
 fn mjs_expected_team(mjs: &str) -> Result<String, String> {
@@ -78,15 +92,20 @@ fn mjs_expected_team(mjs: &str) -> Result<String, String> {
 }
 
 fn assert_team(what: &str, found: Result<String, String>) {
-    let team = found.unwrap_or_else(|e| panic!("{what}: {e}"));
-    assert!(
-        is_team_id(&team),
-        "{what}: {team:?} is not a well-formed Team ID"
-    );
-    assert_eq!(
-        team, DEVELOPER_ID_TEAM_ID,
-        "{what} disagrees with DEVELOPER_ID_TEAM_ID"
-    );
+    assert_teams(what, found.map(|t| vec![t]));
+}
+
+fn assert_teams(what: &str, found: Result<Vec<String>, String>) {
+    for team in found.unwrap_or_else(|e| panic!("{what}: {e}")) {
+        assert!(
+            is_team_id(&team),
+            "{what}: {team:?} is not a well-formed Team ID"
+        );
+        assert_eq!(
+            team, DEVELOPER_ID_TEAM_ID,
+            "{what} disagrees with DEVELOPER_ID_TEAM_ID"
+        );
+    }
 }
 
 #[test]
@@ -115,8 +134,8 @@ fn release_scripts_name_the_constant() {
         "apps/desktop/scripts/release-mac.sh",
     ] {
         let sh = read(file);
-        assert_team(&format!("{file} SIGN_IDENTITY"), sign_identity_team(&sh));
-        assert_team(&format!("{file} NOTARY_PROFILE"), notary_team(&sh));
+        assert_teams(&format!("{file} SIGN_IDENTITY"), sign_identity_teams(&sh));
+        assert_teams(&format!("{file} NOTARY_PROFILE"), notary_teams(&sh));
     }
     let file = "apps/desktop/scripts/open-design-mac-release.mjs";
     assert_team(
@@ -142,34 +161,46 @@ fn desktop_package_json_identity_names_the_constant() {
 #[test]
 fn extractors_reject_short_empty_missing_and_commented_values() {
     let good = "SIGN_IDENTITY=\"${AGENT24_SIGN_IDENTITY:-Developer ID Application: X (HYAP444FN9)}\"\nNOTARY_PROFILE=\"${AGENT24_NOTARY_PROFILE:-apple-notary-HYAP444FN9}\"\n";
-    assert_eq!(sign_identity_team(good).unwrap(), DEVELOPER_ID_TEAM_ID);
-    assert_eq!(notary_team(good).unwrap(), DEVELOPER_ID_TEAM_ID);
-    let bad_value = |f: fn(&str) -> Result<String, String>, text: &str| {
-        let team = f(text).unwrap_or_default();
-        !is_team_id(&team) || team != DEVELOPER_ID_TEAM_ID
+    assert_eq!(sign_identity_teams(good).unwrap(), [DEVELOPER_ID_TEAM_ID]);
+    assert_eq!(notary_teams(good).unwrap(), [DEVELOPER_ID_TEAM_ID]);
+    // True when at least one extracted value is not exactly the constant.
+    let bad_value = |f: fn(&str) -> Result<Vec<String>, String>, text: &str| {
+        f(text)
+            .unwrap_or_default()
+            .iter()
+            .any(|t| !is_team_id(t) || t != DEVELOPER_ID_TEAM_ID)
     };
     // short value (the Codex finding: OTHERTEAM is 9 chars)
     assert!(bad_value(
-        sign_identity_team,
+        sign_identity_teams,
         &good.replace("HYAP444FN9)}", "OTHERTEAM)}")
     ));
     assert!(bad_value(
-        notary_team,
+        notary_teams,
         &good.replace("notary-HYAP444FN9", "notary-OTHERTEAM")
     ));
     // empty value
     assert!(bad_value(
-        sign_identity_team,
+        sign_identity_teams,
         &good.replace("(HYAP444FN9)", "()")
     ));
     assert!(bad_value(
-        notary_team,
+        notary_teams,
         &good.replace("notary-HYAP444FN9", "notary-")
+    ));
+    // a second assignment for another team must not hide behind the first
+    assert!(bad_value(
+        sign_identity_teams,
+        &format!("{good}SIGN_IDENTITY=\"Developer ID Application: Y (ABCDE12345)\"\n")
+    ));
+    assert!(bad_value(
+        notary_teams,
+        &format!("{good}NOTARY_PROFILE=apple-notary-ABCDE12345\n")
     ));
     // assignment removed, correct Team ID left only in a comment
     let commented = "# SIGN_IDENTITY=\"x (HYAP444FN9)\"\n# NOTARY_PROFILE=apple-notary-HYAP444FN9\n# default (HYAP444FN9)\n";
-    assert!(sign_identity_team(commented).is_err());
-    assert!(notary_team(commented).is_err());
+    assert!(sign_identity_teams(commented).is_err());
+    assert!(notary_teams(commented).is_err());
     // mjs
     let mjs = "// EXPECTED_TEAM_ID = 'HYAP444FN9'\nexport const EXPECTED_TEAM_ID = 'HYAP444FN9'\n";
     assert_eq!(mjs_expected_team(mjs).unwrap(), DEVELOPER_ID_TEAM_ID);

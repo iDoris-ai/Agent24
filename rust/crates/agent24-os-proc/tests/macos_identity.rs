@@ -78,21 +78,20 @@ fn unsigned_test_process_fails_before_identifier() {
     );
 }
 
+/// "Apple" is not a ten-character Team ID: the shared rule rejects it up front.
 #[test]
-fn apple_team_parameter_reaches_identifier_when_requirement_supported() {
+fn malformed_team_parameter_is_rejected_before_any_signature_work() {
     let (_dir, mut child, token, _stream) = apple_peer();
     let result = agent24_os_proc::verify_code_identity(token, "Apple", &["agent24"]);
     let _ = child.kill();
     child.wait().unwrap();
-    match result {
-        Err(agent24_os_proc::IdentityError::IdentifierNotAllowed) => {}
-        Err(agent24_os_proc::IdentityError::RequirementFailed) => {
-            eprintln!(
-                "SKIP Apple team variant: /usr/bin/nc does not satisfy the Apple generic anchor + leaf OU requirement"
-            );
-        }
-        other => panic!("unexpected Apple team result: {other:?}"),
-    }
+    assert!(
+        matches!(
+            result,
+            Err(agent24_os_proc::IdentityError::RequirementFailed)
+        ),
+        "{result:?}"
+    );
 }
 
 /// Full name of a codesigning identity in the login keychain whose name starts
