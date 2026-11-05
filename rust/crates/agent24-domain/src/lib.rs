@@ -512,7 +512,7 @@ struct RawManifest {
     min_daemon_protocol: Option<u32>,
     /// Optional S1-9 file manifest. Absent means an old package: discovery
     /// keeps the previous behaviour. Present means the package must verify.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_integrity")]
     integrity: Option<RawIntegrity>,
 }
 
@@ -525,6 +525,12 @@ struct RawIntegrity {
     sha256: String,
     files: Vec<String>,
     executables: Vec<String>,
+}
+
+fn present_integrity<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<RawIntegrity>, D::Error> {
+    RawIntegrity::deserialize(deserializer).map(Some)
 }
 
 /// A VALIDATED `domain-os.yml`.
@@ -2999,6 +3005,8 @@ mod integrity_schema_tests {
         let extra = yaml.replace("manifest: files.json", "manifest: files.json\n  extra: 1");
         let err = DomainOsManifest::from_yaml(&extra).unwrap_err();
         assert!(err.to_string().contains("extra"), "{err}");
+
+        assert!(DomainOsManifest::from_yaml(&format!("{}integrity: null\n", base())).is_err());
 
         let typo = format!("{}integrty:\n  manifest: files.json\n", base());
         let err = DomainOsManifest::from_yaml(&typo).unwrap_err();
