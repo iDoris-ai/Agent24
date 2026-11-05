@@ -277,7 +277,7 @@ flowchart TB
 | **Q12** | 通讯 ADR 的三个前置问题 | X1：Hyphae 随包 / 按需；X7：agent 的 Nostr 身份以 nostr-bridge 还是 comm 专用 HOME 为准；X11：入站执行走 T01-E、ADR-041 准入还是 ADR-037 决策 6 遥控 | X1 **按需**（代码现状 #1489，作废 `HYPHAE-NETWORK-DELIVERY.md:10,25,31`）；X7 **comm 专用 HOME 为准**；X11 **ADR-041 准入为唯一入口**，遥控是其上的一类来源 | R3 Q4、Q5；R2 Q7 |
 | **Q13** | ADR-038 D6：CLI 超时 | (a) 改代码：先 SIGTERM，2 秒后 SIGKILL (b) 改正文：直接 SIGKILL 进程组并说明理由 | **(b)**：按次 CLI 无需落盘，现行为已稳定；S2-6 统一原语时再评估 | R3 Q3 |
 | **Q14** | Hyphae `locked`（口令未解锁）在 `/components` 映射成什么；旧路由别名期 | (a) `stopped` + reason `locked` (b) `degraded` (c) 维持 `failed` | **(a)**：不是崩溃，也不是健康下降。旧路由 `/idoris/status`、`/comm/daemon` 继续保留，不设下线期（只要求内部读同一对象） | R2 Q2 |
-| **Q15** | 外仓 OS 包（Sin90、Cos72）完整性 | (a) 现在补：包内全文件清单摘要，先只记录不拒绝，一个版本后改拒绝 (b) 维持发布清单人工 `shasum -c` 到 ME-6 | **(a)**，这是三份报告里唯一现存的「高」且无人认领的安全缺口；排在第 1 期末，规模 M | R2 Q1 |
+| **Q15** **[已改：jason 11-04 拍板直接拒绝、不设只记录期；11-05 定上线顺序 A 并要求签名，见 S1-9 设计稿]** | 外仓 OS 包（Sin90、Cos72）完整性 | (a) 现在补：包内全文件清单摘要，先只记录不拒绝，一个版本后改拒绝 (b) 维持发布清单人工 `shasum -c` 到 ME-6 | **(a)**，这是三份报告里唯一现存的「高」且无人认领的安全缺口；排在第 1 期末，规模 M | R2 Q1 |
 | **Q16** | Knowledge 工具是否从 `builtin` 改为组件工具走 K1 | (a) 改，`knowledge.search` 等走逐工具同意 (b) 不改，在 ADR-039 / KB-02 里写明例外 | **(b)**：只读工具、只给指名 binding 的 run；多一次确认对单一主对话体验代价大。写进 KB-02 | R2 Q3 |
 | Q17（可后置） | 服务能力（iDoris、Hyphae）的首次启用同意 | 沿用各自确认框 / 修订 ADR-K1-03 统一 | **沿用**，只先统一审计字段（K1-04）；见 §6 | R2 Q6 |
 
