@@ -1079,7 +1079,7 @@ Codex 对抗式复审（读了全部 9 仓库 checked-out 源码，`CODEX-REVIEW
 ## ADR-029：Agent24 内核 ↔ 领域 OS（Sin90 / Cos72…）边界 + DomainModule 挂载缝
 
 **日期**：2026-08-21
-**状态**：✅ 采纳（边界原则）；`DomainModule` 挂载缝为实现工作项（收口 #103/#104 推迟的"真正的模块挂载 seam" + Sin90KernelCtx）。2026-11-04 补注：`DomainModule` 挂载缝已实现（`agent24-domain/src/lib.rs:1402`、`agent24d/src/domain.rs:742`），不再是工作项
+**状态**：✅ 采纳（边界原则）；`DomainModule` 挂载缝为实现工作项（收口 #103/#104 推迟的"真正的模块挂载 seam" + Sin90KernelCtx）。2026-11-04 补注：`DomainModule` 挂载缝已实现（`agent24-domain` 的 `DomainModule` trait、`agent24d/src/domain.rs` 的 `Build::InProcess`），不再是工作项
 
 ### 背景
 
