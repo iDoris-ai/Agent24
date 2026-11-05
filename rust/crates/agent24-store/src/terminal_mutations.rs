@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 #[cfg(test)]
 use crate::run_workspace_terminal::read_lease_tx;
 pub(crate) use crate::run_workspace_terminal::{TerminalMutation, release_exact_terminal_lease_tx};

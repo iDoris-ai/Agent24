@@ -1,3 +1,4 @@
+#![cfg(feature = "dormant-workspace")]
 #![allow(clippy::unwrap_used)]
 
 mod common;

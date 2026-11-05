@@ -194,7 +194,6 @@ impl WorkspaceRow {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn project(&self) -> agent24_protocol::Workspace {
         agent24_protocol::Workspace {
             id: self.id.clone(),
