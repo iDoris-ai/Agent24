@@ -665,6 +665,36 @@ describe('finding a conversation (UI-04 T3)', () => {
     expect(names()).toHaveLength(10)
   })
 
+  it('folds the final sigma, and Escape while composing keeps the query (Codex T3-R1)', async () => {
+    many(9)
+    saved.set('chat_g_1', stored('chat_g_1', 'ΛΟΓΟΣ', '2026-11-07T11:00:00.000Z'))
+    render(<ChatHistoryList showChat={showChat} />)
+    const box = await within(await findHistoryList()).findByRole('searchbox', { name: '搜索对话' })
+    fireEvent.change(box, { target: { value: 'Σ' } })
+    expect(within(historyList()).getByRole('button', { name: 'ΛΟΓΟΣ' })).toBeInTheDocument()
+    fireEvent.keyDown(box, { key: 'Escape', isComposing: true })
+    fireEvent.keyDown(box, { key: 'Escape', keyCode: 229 })
+    expect(box).toHaveValue('Σ')
+  })
+
+  it('a rename that takes its row out of the results puts focus in the search box (Codex T3-R1)', async () => {
+    many(9)
+    const w = stored('chat_w_1', 'Weekly', '2026-11-07T11:00:00.000Z')
+    // Found by its title only: its first prompt says something else.
+    w.messages[0] = { ...w.messages[0], content: '帮我整理本周的事' }
+    saved.set(w.id, w)
+    render(<ChatHistoryList showChat={showChat} />)
+    const box = await within(await findHistoryList()).findByRole('searchbox', { name: '搜索对话' })
+    fireEvent.change(box, { target: { value: 'weekly' } })
+    fireEvent.keyDown(within(historyList()).getByRole('button', { name: 'Weekly' }), { key: 'F2' })
+    const input = within(historyList()).getByRole('textbox', { name: '对话标题' })
+    fireEvent.change(input, { target: { value: 'Budget' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(saved.get('chat_w_1')?.title).toBe('Budget'))
+    await waitFor(() => expect(box).toHaveFocus())
+    expect(within(historyList()).getByRole('status')).toHaveTextContent('没有匹配的对话')
+  })
+
   it('a search left typed stops filtering once the list is short enough to lose its box', async () => {
     many(9)
     render(<ChatHistoryList showChat={showChat} />)

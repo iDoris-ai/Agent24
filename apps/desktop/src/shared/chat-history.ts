@@ -74,10 +74,25 @@ const graphemeSegmenter = typeof Intl !== 'undefined' && 'Segmenter' in Intl
 
 /** A conversation's summary, the same in main and in the page. */
 export function chatHistorySummary(r: ChatHistoryRecord): ChatHistorySummary {
-  const first = (r.messages.find(m => m.role === 'user')?.content ?? '').replace(/\s+/g, ' ').trim()
-  const chars = graphemeSegmenter ? Array.from(graphemeSegmenter.segment(first), s => s.segment) : Array.from(first)
+  // Only the start of a prompt is read: a pasted one can run to megabytes,
+  // and main builds a summary of every conversation when it lists them.
+  const content = r.messages.find(m => m.role === 'user')?.content ?? ''
+  const first = content.slice(0, FIRST_PROMPT_CHARS * 32).replace(/\s+/g, ' ').trim()
+  const chars: string[] = []
+  const parts = graphemeSegmenter?.segment(first) ?? null
+  if (parts) {
+    for (const part of parts) {
+      if (chars.length === FIRST_PROMPT_CHARS) break
+      chars.push(part.segment)
+    }
+  } else {
+    for (const ch of first) {
+      if (chars.length === FIRST_PROMPT_CHARS) break
+      chars.push(ch)
+    }
+  }
   return {
     id: r.id, title: r.title, title_source: r.title_source, created_at: r.created_at, updated_at: r.updated_at,
-    first_prompt: chars.slice(0, FIRST_PROMPT_CHARS).join(''),
+    first_prompt: chars.join(''),
   }
 }

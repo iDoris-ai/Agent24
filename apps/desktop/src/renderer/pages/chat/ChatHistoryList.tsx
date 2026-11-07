@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { useT } from '../../i18n'
 import { chatMessages } from '../Chat.i18n'
 import {
@@ -24,11 +24,10 @@ export function shortTime(iso: string): string {
   return `${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`
 }
 
-const fold = (text: string): string => text.normalize('NFKC').toLowerCase()
-/** A conversation matches when its title or first prompt contains the query,
- *  ignoring case and full- or half-width forms. */
-export const matchesQuery = (item: ChatHistorySummary, query: string): boolean =>
-  fold(`${item.title}\n${item.first_prompt}`).includes(fold(oneLine(query)))
+/** Text for matching: full- and half-width forms alike, case ignored (the
+ *  final sigma folded too, which lowercasing alone leaves apart). */
+const fold = (text: string): string => text.normalize('NFKC').toLowerCase().replace(/ς/g, 'σ')
+const haystackOf = (item: ChatHistorySummary): string => fold(`${item.title}\n${item.first_prompt}`)
 
 const clipped = (text: string, chars: number): string => {
   const g = graphemes(text)
@@ -44,17 +43,37 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   const { items, activeId, busy } = useSyncExternalStore(subscribeHistory, getHistoryState)
   useEffect(() => { void refreshHistory() }, [])
   const [query, setQuery] = useState('')
+  const searchRef = useRef<HTMLInputElement>(null)
+  // What each row shows, worked out once per list, not on every keystroke
+  // of a rename or a search. (`t` is new on every render; its text is not.)
+  const untitled = t('newChat')
+  const rows = useMemo(() => {
+    // Titles shared by more than one conversation get their time beside them.
+    const titleCount = new Map<string, number>()
+    for (const item of items) {
+      const name = item.title || untitled
+      titleCount.set(name, (titleCount.get(name) ?? 0) + 1)
+    }
+    return items.map(item => {
+      const name = item.title || untitled
+      const when = shortTime(item.updated_at)
+      const twin = (titleCount.get(name) ?? 0) > 1 && when !== ''
+      return {
+        item, name, when, twin,
+        // Buttons of conversations with the same title say which is which.
+        title: twin ? `${name} ${when}` : name,
+        tip: [name, item.first_prompt && item.first_prompt !== name ? clipped(item.first_prompt, 80) : '', when]
+          .filter(Boolean).join(' · '),
+        haystack: haystackOf(item),
+      }
+    })
+  }, [items, untitled])
   // The search, and so its filter, only while the list is long enough to
   // have one.
   const searchable = items.length > SEARCH_FROM
-  const searching = searchable && oneLine(query) !== ''
-  const shown = searching ? items.filter(item => matchesQuery(item, query)) : items
-  // Titles shared by more than one conversation get their time beside them.
-  const titleCount = new Map<string, number>()
-  for (const item of items) {
-    const title = item.title || t('newChat')
-    titleCount.set(title, (titleCount.get(title) ?? 0) + 1)
-  }
+  const needle = fold(oneLine(query))
+  const searching = searchable && needle !== ''
+  const shown = searching ? rows.filter(row => row.haystack.includes(needle)) : rows
   // The conversation being renamed, the title it had when the box opened,
   // and what has been typed so far. The ref makes Enter followed by the
   // input's blur rename once, not twice.
@@ -77,12 +96,16 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
     // even if the title changed meanwhile (an earlier rename landing). Compared
     // before the cut to 80 characters, so shortening a longer title counts.
     const title = renameTitle(draft)
-    if (save && title && oneLine(draft) !== oneLine(from)) void renameConversation(id, title)
-    // From the keyboard, focus goes back to the conversation's entry.
+    const renamed = save && title && oneLine(draft) !== oneLine(from) ? renameConversation(id, title) : null
+    // From the keyboard, focus goes back to the conversation's entry; to the
+    // search box when the new title took it out of the results.
     if (refocus) {
-      requestAnimationFrame(() => {
-        listRef.current?.querySelector<HTMLButtonElement>(`[data-history-id="${id}"]`)?.focus()
-      })
+      const entry = () => listRef.current?.querySelector<HTMLButtonElement>(`[data-history-id="${id}"]`)
+      requestAnimationFrame(() => entry()?.focus())
+      void renamed?.then(() => requestAnimationFrame(() => {
+        const lost = document.activeElement === null || document.activeElement === document.body
+        if (lost && !entry()) searchRef.current?.focus()
+      }))
     }
   }
   if (items.length === 0) return null
@@ -95,22 +118,17 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
         }}>{t('history.clear')}</button>
       </div>
       {searchable && (
-        <input type="search" className="chat-history-search" aria-label={t('history.search')}
+        <input type="search" className="chat-history-search" aria-label={t('history.search')} ref={searchRef}
           placeholder={t('history.search')} value={query} onChange={e => setQuery(e.target.value)}
           onKeyDown={e => {
+            // Escape during an input method's composition drops the candidate.
+            if (e.nativeEvent.isComposing || e.keyCode === 229) return
             if (e.key === 'Escape' && query !== '') { e.preventDefault(); e.stopPropagation(); setQuery('') }
           }} />
       )}
       {searching && shown.length === 0 && <p className="chat-history-empty" role="status">{t('history.noMatch')}</p>}
       <ul className="chat-history-list" ref={listRef}>
-        {shown.map(item => {
-          const name = item.title || t('newChat')
-          const when = shortTime(item.updated_at)
-          const twin = (titleCount.get(name) ?? 0) > 1
-          // Buttons of conversations with the same title say which is which.
-          const title = twin && when ? `${name} ${when}` : name
-          const tip = [name, item.first_prompt && item.first_prompt !== name ? clipped(item.first_prompt, 80) : '', when]
-            .filter(Boolean).join(' · ')
+        {shown.map(({ item, name, when, twin, title, tip }) => {
           return (
             <li key={item.id} className={`chat-history-item${item.id === activeId ? ' active' : ''}`}>
               {editing === item.id
@@ -132,7 +150,7 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
                   onDoubleClick={() => startEdit(item.id, item.title)}
                   onKeyDown={e => { if (e.key === 'F2') { e.preventDefault(); startEdit(item.id, item.title) } }}>
                   <span className="chat-history-name">{name}</span>
-                  {twin && when && <>{' '}<span className="chat-history-when">{when}</span></>}
+                  {twin && <>{' '}<span className="chat-history-when">{when}</span></>}
                 </button>}
               {editing !== item.id && (
                 <button type="button" className="chat-history-action" aria-label={t('history.rename', { title })}

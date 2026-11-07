@@ -285,6 +285,10 @@ describe('chat history titles (UI-04)', () => {
     expect(store.save(long).first_prompt).toBe(first)
     expect(store.list()[0].first_prompt).toBe(first)
     expect(store.setTitle('chat_a', '名', 'user')?.first_prompt).toBe(first)
+    // A pasted prompt of megabytes still gives its first 200 characters.
+    const huge = record('chat_c', at)
+    huge.messages = [{ role: 'user', content: `开头${'字'.repeat(2_000_000)}`, at, delivered: true }]
+    expect(store.save(huge).first_prompt).toBe(`开头${'字'.repeat(198)}`)
     const none = record('chat_b', at)
     none.messages = []
     expect(store.save(none).first_prompt).toBe('')
