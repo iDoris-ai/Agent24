@@ -48,7 +48,7 @@ export const modulesManagerMessages = defineMessages({
     'os.state.refused': '被拒绝',
     'os.restartRequired': '需重启',
     'os.restartTitle': '配置已改变，需要重启 daemon 才能生效',
-    'os.grantedTitle': '内核授予此模块的能力',
+    'os.grantedTitle': '内核授予此模块的权限（capability token）',
     'os.missingModels': '缺少模型：{models}',
     'os.disable': '停用',
     'os.enable': '启用',

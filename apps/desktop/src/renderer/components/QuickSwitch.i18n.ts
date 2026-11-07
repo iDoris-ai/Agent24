@@ -8,7 +8,7 @@ export const quickSwitchMessages = defineMessages({
   },
   zh: {
     title: '快速切换', search: '搜索能力和操作…', empty: '没有结果',
-    pinned: '能力 · 已钉选', unpinned: '能力 · 未钉选', action: '操作',
+    pinned: '能力 · 已固定', unpinned: '能力 · 未固定', action: '操作',
     activity: '设置 › 活动', general: '设置 › 通用', capabilities: '能力中心',
   },
   th: {

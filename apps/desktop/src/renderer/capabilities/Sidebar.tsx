@@ -22,9 +22,13 @@ export function Sidebar({ activeId, navigate }: { activeId: string; navigate: (p
     {prefs.showOverview && item('home', t('nav.home'), () => navigate('home'), approvalsWaiting)}
     {item('assistant', c('assistant.name'), () => open('assistant', 'sidebar'))}
     <ChatHistoryList showChat={() => open('assistant', 'sidebar')} />
-    <div className="nav-section">{c('pinned', { count: pinnedCount, slots: prefs.slotCount })}</div>
+    {/* David 11-08: the group says what it is, not how full it is; the
+        limit shows only where it stops a pin (Capabilities, Settings). */}
+    <div className="nav-section">{c('pinned')}</div>
     {pinned.map(def => item(def.id, c(def.nameKey), () => open(def.id, 'sidebar')))}
-    {Array.from({ length: Math.max(0, prefs.slotCount - pinnedCount) }, (_, i) => <div className="nav-empty-slot" key={i}>{c('emptySlot')}</div>)}
+    {pinnedCount < prefs.slotCount && (
+      <button className="nav-pin-more" onClick={() => navigate('capabilities')}>{c('pinMore')}</button>
+    )}
     <div className="nav-bottom">
       {item('capabilities', t('nav.capabilities'), () => navigate('capabilities'), approvalsWaiting)}
       {item('settings', t('nav.settings'), () => navigate('settings'))}
