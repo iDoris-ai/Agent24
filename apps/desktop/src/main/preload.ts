@@ -4,6 +4,7 @@
 
 import { contextBridge, ipcRenderer } from 'electron'
 import type { NavPrefs } from '../renderer/capabilities/types'
+import type { ChatHistoryRecord, ChatHistorySummary } from '../shared/chat-history'
 import {
   IpcChannels,
   type BackendEndpointResult,
@@ -37,6 +38,14 @@ import {
 const api = {
   getNavPrefs: (): Promise<NavPrefs> => ipcRenderer.invoke(IpcChannels.NavPrefsGet),
   setNavPrefs: (prefs: NavPrefs): Promise<void> => ipcRenderer.invoke(IpcChannels.NavPrefsSet, prefs),
+  /** UI-02: the main chat's history, kept on this machine. */
+  chatHistory: {
+    list: (): Promise<ChatHistorySummary[]> => ipcRenderer.invoke(IpcChannels.ChatHistoryList),
+    get: (id: string): Promise<ChatHistoryRecord | null> => ipcRenderer.invoke(IpcChannels.ChatHistoryGet, id),
+    save: (record: ChatHistoryRecord): Promise<void> => ipcRenderer.invoke(IpcChannels.ChatHistorySave, record),
+    delete: (id: string): Promise<void> => ipcRenderer.invoke(IpcChannels.ChatHistoryDelete, id),
+    clear: (): Promise<void> => ipcRenderer.invoke(IpcChannels.ChatHistoryClear),
+  },
   onCliToolSettings: (cb: () => void): (() => void) => {
     ipcRenderer.on(IpcChannels.CliToolOpenSettings, cb)
     return () => ipcRenderer.removeListener(IpcChannels.CliToolOpenSettings, cb)
