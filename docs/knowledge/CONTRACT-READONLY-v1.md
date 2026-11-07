@@ -83,6 +83,8 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
   写入、管理、聊天、Agent、记忆类接口一律不在内；写操作留给契约 v2（iDoris-ai/WeKnora#135）。服务端对每个 UI 入口：
   - **自己计算 E**，不沿用上游 API key 的语义。E 只取本租户的知识库，剔除组织共享与共享 Agent 授权（同 R2.7）；白名单为空或 E 为空时返回 `forbidden/empty_scope`，绝不当作「全部」（R2.2–R2.4）。
   - 单个资源落在 E 外时，回应与「不存在」完全相同（同 R2.6）。
+  - **列表类入口只返回 E 内的条目**（知识库、文档、分块、wiki 页、标签列表都是）。总数、分页游标和聚合（如标签计数）也只按 E 计算，不透露 E 外知识库的存在、名称或数量。
+  - 文档可见性同 R2.6：deleting、draft 与状态无法识别的文档，在 UI 的文档列表与详情里也视同不存在（以知识行的 parse_status 为准）。分块列表只给可服务分块（R5.1），与 search、read 一致。
   - **首版只放行页面实际调用的入口**，按方法加路径逐条列在 WeKnora 侧的实现 PR 与 `docs/agent24/` 里。五类是上限，不是必须全部开放。
 
   UI 会话的票据、JWT、校验与撤销规则见 UI-BRIDGE U2–U3。
@@ -410,4 +412,4 @@ r9 用由内容派生的标识换掉了"可证明的构建归属"（KB-C1-01c �
 - r9（2026-10-21）：KB-C1-01c ③ 改用内容寻址（WeKnora#38，设计经 Grok 与 Codex 两轮双审，David 选定并确认）。新增 `content_tag`（分块完整正文的带密钥摘要），出现在 hit.revision、segment、单分块 `expected_revision` 与 stale 详情（`current_content_tag`）；"活动构建"改为"有构建时的可服务分块集合"，`index_build_id`、`source_revision` 改为由内容派生的带密钥摘要（R5.1）；单分块 read 先判可服务、再比 `content_tag`，其他分块增删不影响（R4.3、R4.4、R6.4）；`chunk_revision` 只作参考（R5.2）；snippet 与 `content_tag` 同源（R3.8、R3.9）；文档级翻页每页同快照重算（R4.5）；引用只来自单分块 read（R4.7）；cancelled 不可服务、文档级 read 为 `index_failed`，deleting 视同已删除（R2.6、R4.4、R8.4）；就绪按"有构建"重写判定（R8.4）；审计不记 `content_tag`（R10.1、R10.3）；locator 恒为 `valid: false`（R3.10）；新增 §13 已知差距。PR 双审第 1、2 轮补充：R5.1 写明各标识的输入组成与 HMAC 编码；R3.5、R8.4 不计入 deleting；单分块 `expected_revision` 的 `chunk_revision` 允许 null；夹具新增 read.stale-chunk-overwritten、read.document-empty。依 §0.3 草案期条款，评审通过前不升主版本（`protocol_version` 仍为 1）。影响夹具：是（同一 PR 更新清单与 schema）。
 - r10（2026-10-22）：草稿（draft，含已发布后改回草稿的手工知识）与状态无法识别的文档视同不存在：read 为 `not_found`，就绪与 partial 判定不计入（R2.6、R3.5、R8.4、§6），与 deleting 一致；文档判定对带与不带 `chunk_id` 的 read 都先于锚点与修订（R2.6、R4.4、R6.4）；这些文档没有可服务分块，search 也不返回（R2.6）；草稿以知识行的 parse_status 为准，元数据里的草稿状态不单独作判据；§13 记下发布与改回草稿的上游竞态（parse_status 被写回 completed 时文档照常可服务）；David 定（WeKnora#66 评审闸门）。依 §0.3 草案期条款不升主版本。影响夹具：清单 `contract_revision` 改为 r10，夹具内容不变。
 - 2026-11-01（修订号不变）：只改状态行，写明已实施、草案期结束。语义不变，影响夹具：否。
-- r11（2026-11-08）：UI-BRIDGE 决定 #25 定案（David 确认，证据裁决 R0 一致）。新增 R1.8：C 可签发与撤销 UI 票据，不计入数据操作范围。R2.7 补一句，说明 UI 会话的数据范围与操作清单是两个维度。新增 R2.8：UI 只读展示操作的上限清单与每个入口的义务（自算 E、剔除共享、空集拒绝、越界等同不存在、首版只放行实际用到的入口）。§12 增加 #21。search、read、ready 的报文与语义都不变；影响夹具：清单 `contract_revision` 改为 r11，夹具内容不变。
+- r11（2026-11-08）：UI-BRIDGE 决定 #25 定案（David 确认，证据裁决 R0 一致）。新增 R1.8：C 可签发与撤销 UI 票据，不计入数据操作范围。R2.7 补一句，说明 UI 会话的数据范围与操作清单是两个维度。新增 R2.8：UI 只读展示操作的上限清单与每个入口的义务（自算 E、剔除共享、空集拒绝、越界等同不存在、列表与计数只按 E、文档可见性同 R2.6、分块列表只给可服务分块、首版只放行实际用到的入口）。§12 增加 #21。search、read、ready 的报文与语义都不变；影响夹具：清单 `contract_revision` 改为 r11，夹具内容不变。
