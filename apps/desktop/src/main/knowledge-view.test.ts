@@ -226,17 +226,28 @@ describe('dead proxy for WebRTC TCP (contract decision #30)', () => {
 
   it('does not load a page whose instance was replaced while the proxy was being set', async () => {
     const t = setup()
-    let release!: () => void
-    const gate = new Promise<void>((resolve) => { release = resolve })
+    const releases: Array<() => void> = []
     const original = FakeSession.prototype.setProxy
-    FakeSession.prototype.setProxy = function (this: FakeSession, config: unknown) { this.proxy = config; return gate }
+    FakeSession.prototype.setProxy = function (this: FakeSession, config: unknown) {
+      this.proxy = config
+      return new Promise<void>((resolve) => { releases.push(resolve) })
+    }
     try {
       void t.host.show(BOUNDS)
-      await vi.waitFor(() => expect(t.views).toHaveLength(1))
-      t.host.shutdown()
-      release()
+      await vi.waitFor(() => expect(releases).toHaveLength(1))
+      // A binding change while the first proxy is still pending: a second instance.
+      t.env.binding = 'profile-2'
+      t.host.bindingChanged()
+      await vi.waitFor(() => expect(releases).toHaveLength(2))
+      expect(t.views).toHaveLength(2)
+      releases[0]()
       await flush()
       expect(t.views[0].webContents.loads).toEqual([])
+      releases[1]()
+      await vi.waitFor(() => expect(t.views[1].webContents.loads).toEqual([URL_]))
+      await flush()
+      expect(t.views[0].webContents.loads).toEqual([])
+      expect(t.host.status()).toEqual({ state: 'ready' })
     } finally {
       FakeSession.prototype.setProxy = original
     }
@@ -312,6 +323,10 @@ describe('knowledgeViewTarget (U4.4)', () => {
     expect(knowledgeViewTarget(URL_)).toEqual({ origin: ORIGIN, url: URL_ })
     expect(knowledgeViewTarget('http://127.0.0.1:18282/')).toEqual({ origin: 'http://127.0.0.1:18282', url: 'http://127.0.0.1:18282/' })
     expect(knowledgeViewTarget('http://[::1]:9/x')?.origin).toBe('http://[::1]:9')
+    // A fully qualified name keeps its root dot in the origin (Codex #1647 R1).
+    expect(knowledgeViewTarget('https://kb.example.org./x')?.origin).toBe('https://kb.example.org.')
+    expect(settingsKnowledgeViewTarget('https://kb.example.org./api/v1')?.origin).toBe('https://kb.example.org.')
+    expect(knowledgeViewProxyConfig('https://kb.example.org.', 9).proxyBypassRules).toBe('<-loopback>;kb.example.org.:443')
     for (const bad of ['http://localhost:18282/', 'http://10.0.0.2/', 'file:///etc/passwd', 'agent24://x', 'https://u:p@kb.example.org/',
       'https://kb.example.org/?token=x', 'https://kb.example.org/#t', 'not a url', 42, undefined,
       // Host names the URL parser keeps but the proxy bypass would read as patterns (#1643 PR-Daemon C).

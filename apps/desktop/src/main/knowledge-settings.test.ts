@@ -135,7 +135,7 @@ describe('KnowledgeController (M3)', () => {
   })
 
   it('takes the endpoints and knowledge bases the daemon takes', () => {
-    for (const ok of ['https://kb.example/api/v1', 'http://127.0.0.1:8080/api/v1', 'http://[::1]:9000']) {
+    for (const ok of ['https://kb.example/api/v1', 'http://127.0.0.1:8080/api/v1', 'http://[::1]:9000', 'https://kb.example./api/v1']) {
       expect(validEndpoint(ok), ok).toBe(true)
     }
     for (const bad of ['http://kb.example', 'http://localhost:8080', 'https://u:p@kb.example', 'https://kb.example/?q=1', 'ftp://x', '', 1,

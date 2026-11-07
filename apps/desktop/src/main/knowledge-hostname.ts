@@ -11,7 +11,10 @@ const IPV6 = /^\[[0-9a-f:.]+\]$/
 
 /** `hostname` as `URL` gives it (lower case, IPv6 in brackets). */
 export function isPlainHostname(hostname: string): boolean {
-  if (hostname.length === 0 || hostname.length > 253) return false
   if (IPV4.test(hostname) || IPV6.test(hostname)) return true
-  return hostname.split('.').every((label) => LABEL.test(label))
+  // One trailing root dot is a fully qualified name (`kb.example.org.`); it is
+  // only set aside here, the URL and its origin keep it.
+  const name = hostname.endsWith('.') ? hostname.slice(0, -1) : hostname
+  if (name.length === 0 || name.length > 253) return false
+  return name.split('.').every((label) => LABEL.test(label))
 }
