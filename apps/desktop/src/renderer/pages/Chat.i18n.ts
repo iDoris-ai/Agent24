@@ -3,6 +3,9 @@ import { defineMessages } from '../i18n'
 export const chatMessages = defineMessages({
   en: {
     'newChat': 'New chat',
+    'turns.label': 'Turns in this chat',
+    'turns.mark': 'Turn {n}: {prompt}',
+    'turns.noReply': 'No reply yet',
     'headroom.explanation': 'iDoris needs to use memory reserved for the system to load this model. This may slow down your computer.',
     'headroom.confirm': 'Load anyway',
     'headroom.cancel': 'Cancel',
@@ -34,6 +37,9 @@ export const chatMessages = defineMessages({
   },
   zh: {
     'newChat': '新对话',
+    'turns.label': '本次对话的回合',
+    'turns.mark': '第 {n} 轮：{prompt}',
+    'turns.noReply': '还没有回复',
     'headroom.explanation': 'iDoris 需要占用为系统保留的内存余量才能加载这个模型，可能让电脑变慢。',
     'headroom.confirm': '仍然加载',
     'headroom.cancel': '取消',
@@ -65,6 +71,9 @@ export const chatMessages = defineMessages({
   },
   th: {
     'newChat': 'แชตใหม่',
+    'turns.label': 'รอบการสนทนาในแชตนี้',
+    'turns.mark': 'รอบที่ {n}: {prompt}',
+    'turns.noReply': 'ยังไม่มีคำตอบ',
     'headroom.explanation': 'iDoris ต้องใช้หน่วยความจำที่สำรองไว้สำหรับระบบเพื่อโหลดโมเดลนี้ ซึ่งอาจทำให้คอมพิวเตอร์ของคุณช้าลง',
     'headroom.confirm': 'โหลดต่อไป',
     'headroom.cancel': 'ยกเลิก',
