@@ -26,6 +26,9 @@ permissions:
 
 jobs:
   cla-check:
+    # issue_comment 对普通 issue 上的评论也会触发；action 只认 PR，拿不到 PR 就报错。
+    # 只在 PR 事件、或评论落在 PR 上时才跑（contributor-assistant 官方推荐写法）。
+    if: github.event_name == 'pull_request_target' || (github.event_name == 'issue_comment' && github.event.issue.pull_request)
     runs-on: ubuntu-latest
     steps:
       - name: CLA Assistant
