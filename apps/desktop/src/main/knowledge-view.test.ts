@@ -413,17 +413,34 @@ describe('KnowledgeViewHost', () => {
     expect(ses.cleared).toEqual(ALL_CLEARED)
   })
 
-  it('a page not destroyed in time has its renderer killed, and the partition is cleared again once it goes', async () => {
+  it('a page not destroyed in time has its renderer killed; the partition is cleared once it is gone', async () => {
     const t = setup()
     await t.host.show(BOUNDS)
     const wc = t.views[0].webContents
     wc.asyncClose = true
     t.host.destroyAll('test')
-    const wait = t.timers.find((x) => x.ms === KNOWLEDGE_VIEW_DESTROY_WAIT_MS)
-    expect(wait).toBeDefined()
-    wait!.fn()
+    const waits = () => t.timers.filter((x) => x.ms === KNOWLEDGE_VIEW_DESTROY_WAIT_MS)
+    expect(waits()).toHaveLength(1)
+    waits()[0].fn()
     await flush()
     expect(wc.crashedByHost).toBe(true)
+    // U4.7 ④ before ⑤: nothing is cleared while the page may still be there.
+    expect(t.sessions[0].cleared).toEqual([])
+    wc.finishClose()
+    await flush()
+    expect(t.sessions[0].cleared).toEqual(ALL_CLEARED)
+  })
+
+  it('a page that survives even the kill: the sealed partition is cleared, and again if it ever goes', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    const wc = t.views[0].webContents
+    wc.asyncClose = true
+    t.host.destroyAll('test')
+    t.timers.filter((x) => x.ms === KNOWLEDGE_VIEW_DESTROY_WAIT_MS)[0].fn()
+    await flush()
+    t.timers.filter((x) => x.ms === KNOWLEDGE_VIEW_DESTROY_WAIT_MS)[1].fn()
+    await flush()
     expect(t.sessions[0].cleared).toEqual(ALL_CLEARED)
     wc.finishClose()
     await flush()
@@ -447,6 +464,13 @@ describe('KnowledgeViewHost', () => {
     wc.emit('responsive')
     expect(t.views[0].visible).toBe(true)
     expect(t.host.status()).toEqual({ state: 'ready' })
+    // Recovery ends a hang, not a load failure that happened meanwhile.
+    wc.emit('unresponsive')
+    wc.emit('did-fail-load', {}, -102, 'refused', URL_, true)
+    wc.emit('responsive')
+    expect(t.views[0].visible).toBe(false)
+    expect(t.host.status()).toEqual({ state: 'degraded', code: 'load_failed' })
+    expect(await t.host.show(BOUNDS)).toEqual({ ok: true })
     wc.emit('unresponsive')
     // A route round trip is not a recovery: the hung page stays out of the way.
     t.host.hide()

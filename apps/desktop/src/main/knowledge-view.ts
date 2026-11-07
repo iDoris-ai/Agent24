@@ -462,6 +462,8 @@ export class KnowledgeViewHost {
     view.webContents.on('responsive', () => {
       if (this.instance !== instance || !instance.unresponsive) return
       instance.unresponsive = false
+      // Recovering only ends the hang: a load that failed meanwhile stays failed.
+      if (this.state.state !== 'degraded' || this.state.code !== 'unresponsive') return
       if (this.visible) view.setVisible(true)
       this.setState(this.visible ? { state: 'ready' } : { state: 'hidden' })
     })
@@ -479,6 +481,7 @@ export class KnowledgeViewHost {
    * page's message and Reload button can be seen. */
   private loadFailed(instance: Instance): void {
     instance.loaded = false
+    instance.unresponsive = false
     instance.view.setVisible(false)
     this.setState({ state: 'degraded', code: 'load_failed' })
   }
@@ -546,21 +549,25 @@ export class KnowledgeViewHost {
    * once it is finally destroyed. */
   private async clearWhenGone(instance: Instance, reason: string): Promise<void> {
     const contents = instance.view.webContents
-    if (!contents.isDestroyed()) {
-      const gone = await new Promise<boolean>((resolve) => {
-        const timer = this.setTimer(() => resolve(false), KNOWLEDGE_VIEW_DESTROY_WAIT_MS)
-        contents.once('destroyed', () => {
-          this.clearTimer(timer)
-          resolve(true)
-        })
+    const destroyed = (): Promise<boolean> => new Promise<boolean>((resolve) => {
+      if (contents.isDestroyed()) return resolve(true)
+      const timer = this.setTimer(() => resolve(false), KNOWLEDGE_VIEW_DESTROY_WAIT_MS)
+      contents.once('destroyed', () => {
+        this.clearTimer(timer)
+        resolve(true)
       })
-      if (!gone) {
-        this.log(`[knowledge-view] page not destroyed in time (${reason}); killing its renderer`)
-        try {
-          if (!contents.isDestroyed()) contents.forcefullyCrashRenderer()
-        } catch (error) {
-          this.log(`[knowledge-view] kill renderer failed (${reason}): ${String(error)}`)
-        }
+    })
+    if (!(await destroyed())) {
+      this.log(`[knowledge-view] page not destroyed in time (${reason}); killing its renderer`)
+      try {
+        if (!contents.isDestroyed()) contents.forcefullyCrashRenderer()
+      } catch (error) {
+        this.log(`[knowledge-view] kill renderer failed (${reason}): ${String(error)}`)
+      }
+      if (!(await destroyed())) {
+        // Last resort: the partition is sealed and never used again; clear what
+        // can be cleared now and once more if the page is ever destroyed.
+        this.log(`[knowledge-view] page still not destroyed (${reason}); clearing a sealed partition`)
         contents.once('destroyed', () => { void this.clearPartition(instance, `${reason}, late`) })
       }
     }
