@@ -130,7 +130,7 @@
 ## 8. 接口与交接点
 
 ### 8.1 与 READONLY r8（引用相关条款按 r11，决定 #35）
-- 引用：R1.2、R1.4（UI 会话密钥）；R1.7（C 不进 renderer）；R2.1、R2.3、R2.6（E 的计算、空范围、越界与不存在不可区分）；R2.7（不含下载与 preview）；R4.1、R4.3、R4.5、R4.7（引用 read：单分块 `expected_revision` 必含 `content_tag`、跨页一致；按 r11）；R10.3（`content_tag` 不进日志与审计）；R5.2（引用 ID 不透明）；R6.1（错误信封）；R7.3（`null` 回显按 HTTP 交换配对，适用于签发入口）；R7.5（generation 只回显）；R7.6（在途长请求，U3.4 补上 UI 长连接的关闭）；R7.7；R10.3。
+- 引用：R1.2、R1.4（UI 会话密钥）；R1.7（C 不进 renderer）；R2.1、R2.3、R2.6（E 的计算、空范围、越界与不存在不可区分）；R2.7（不含下载与 preview）；R4.1、R4.3、R4.5、R4.7（引用 read：单分块 `expected_revision` 必含 `content_tag`、跨页一致；按 r11）；R5.2（引用 ID 不透明）；R6.1（错误信封）；R7.3（`null` 回显按 HTTP 交换配对，适用于签发入口）；R7.5（generation 只回显）；R7.6（在途长请求，U3.4 补上 UI 长连接的关闭）；R7.7；R10.3（审计与日志不含凭据与正文，`content_tag` 也不记）。
 - 不修订 READONLY 的：票据失败与族撤销都复用 `credential_invalid`（决定 #5、#20）。
 - 需要 READONLY 下一修订的：新 `reason` `unavailable/credential_near_expiry`（可重试，决定 #29）；引用 ID 字符集（决定 #21）。（决定 #25 已在 READONLY r11 定案：R1.8、R2.8。）
 
@@ -162,7 +162,7 @@
 - #31 恢复与存活策略按 U4.5、U4.8 的数值，可按实测调整。
 - #33 凭据无效类续签也失败（S3.1）：只暂停注入并加遮罩，不关桥、不销毁。
 - #34 全局收紧作废的登录态，在该 profile 解除 `unsaved_settings` 重新绑定（S1.13）后或 profile 移除时销毁。
-- #35 `citation`（及 `return_to_chat_intent` 的引用）补必填 `content_tag`，与 READONLY R4.1、R4.7（r9 起）一致；`chunk_revision` 保留、只作参考；按 §0 变更规则桥报文 `v` 由 1 升为 2（2026-11-08；证据裁决 R1 未收敛，待 David 定）。确认框标题由宿主重新 read 取得，`content_tag` 只覆盖分块正文、不覆盖标题。
+- #35 `citation`（及 `return_to_chat_intent` 的引用）补必填 `content_tag`，与 READONLY R4.1、R4.7（r9 起）一致；`chunk_revision` 保留、只作参考；按 §0 变更规则桥报文 `v` 由 1 升为 2（David 2026-11-08 确认 D，经 General 转达；证据裁决 R1 未收敛）。确认框标题由宿主重新 read 取得，`content_tag` 只覆盖分块正文、不覆盖标题。
 - #25 UI 操作与 C 的关系按 READONLY r11 的 R1.8、R2.8 处理：C 可签发与撤销票据，不计入数据操作范围；`ops` 是独立的只读展示清单（David 2026-11-08 确认，证据裁决 R0 一致）。
 
 ### 9.2 宿主侧 KnowledgeView `closed` 的 `code`（闭集）
