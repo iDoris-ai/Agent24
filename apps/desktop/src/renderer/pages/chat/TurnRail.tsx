@@ -34,10 +34,18 @@ export function TurnRail({ turns, active, onSelect }: {
   useEffect(() => {
     activeRef.current?.scrollIntoView?.({ block: 'nearest' })
   }, [active, turns.length])
+  // Escape closes the card wherever focus is: a card opened by hovering
+  // while typing in the composer must close too.
+  const open = shown !== null
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setShown(null) }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [open])
   const card = shown === null ? undefined : turns[shown.turn]
   return (
-    <div className="turn-rail" ref={railRef} onMouseLeave={() => setShown(null)}
-      onKeyDown={e => { if (e.key === 'Escape') setShown(null) }}>
+    <div className="turn-rail" ref={railRef} onMouseLeave={() => setShown(null)}>
       <nav className="turn-rail-marks" aria-label={t('turns.label')}>
         {turns.map((turn, i) => (
           <button

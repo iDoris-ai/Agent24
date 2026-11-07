@@ -184,11 +184,11 @@ button { cursor: pointer; font-family: var(--font); }
   display: flex; flex-direction: column; max-height: 50vh; overflow-y: auto; scrollbar-width: none;
 }
 /* The collapsed sidebar's expand button sits at the same left edge: keep clear of it. */
-.sidebar-hidden .turn-rail { left: 26px; }
+.sidebar-hidden .turn-rail { left: 24px; }
 .sidebar-hidden .chat-messages { padding-left: 52px; }
 .turn-rail-marks::-webkit-scrollbar { display: none; }
 .turn-rail-mark {
-  display: flex; align-items: center; width: 22px; height: 12px; padding: 0; border: none; background: none;
+  display: flex; align-items: center; flex: 0 0 auto; width: 24px; height: 14px; padding: 0; border: none; background: none;
 }
 .turn-rail-mark::before {
   content: ''; display: block; width: 8px; height: 2px; border-radius: 1px; background: var(--muted); opacity: 0.6;
@@ -198,7 +198,7 @@ button { cursor: pointer; font-family: var(--font); }
 .turn-rail-mark.active::before { width: 16px; background: var(--text); opacity: 1; }
 .turn-rail-mark:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
 .turn-card {
-  position: absolute; left: 22px; transform: translateY(-40%); width: 320px; padding: 10px 12px;
+  position: absolute; left: 24px; transform: translateY(-40%); width: 320px; padding: 10px 12px;
   background: var(--surface2); border: 1px solid var(--border); border-radius: 10px;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35); z-index: 20;
 }

@@ -85,6 +85,16 @@ describe('TurnRail', () => {
     expect(document.activeElement).toBe(mark)
   })
 
+  it('closes a hover card on Escape while focus is elsewhere', () => {
+    render(<><textarea aria-label="composer" /><TurnRail turns={turns} active={0} onSelect={() => {}} /></>)
+    const composer = screen.getByLabelText('composer')
+    act(() => composer.focus())
+    fireEvent.mouseEnter(screen.getAllByRole('button')[0])
+    expect(screen.getByRole('tooltip')).toBeInTheDocument()
+    fireEvent.keyDown(composer, { key: 'Escape' })
+    expect(screen.queryByRole('tooltip')).toBeNull()
+  })
+
   it('keeps the highlighted mark in view as the active turn changes', () => {
     const scroll = vi.spyOn(HTMLElement.prototype, 'scrollIntoView').mockImplementation(() => {})
     const { rerender } = render(<TurnRail turns={turns} active={0} onSelect={() => {}} />)
