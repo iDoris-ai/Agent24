@@ -1,7 +1,7 @@
 # Knowledge UI 身份交换与消息桥契约 v1（CONTRACT-UI-BRIDGE-v1）
 
-> **状态**：规范核心 v1，已评审合入；KB-R1/R2 只实施了长期登录态的本机存储（`knowledge-logins.ts`）和 C 不进 renderer（U1.4）。KnowledgeView、一次性票据、session JWT 与消息桥**没有实施**（11-11 后）。条款按 READONLY r8 写成，现行 READONLY 为 r11（r11 定了决定 #25，见 U1.3）。· **日期**：2026-10-20 · **桥报文** `v: 1`
-> **依据**：`docs/knowledge/CONTRACT-READONLY-v1.md`（下称 READONLY，按 r8）；`docs/knowledge/CONTRACT-STATE-v1.md`（下称 STATE，规范核心 v1，PR #1113；本文依赖它的规则汇总在 §8.2）。
+> **状态**：规范核心 v1，已评审合入；KB-R1/R2 只实施了长期登录态的本机存储（`knowledge-logins.ts`）和 C 不进 renderer（U1.4）。KnowledgeView、一次性票据、session JWT 与消息桥**没有实施**（11-11 后）。条款按 READONLY r8 写成，现行 READONLY 为 r11（r11 定了决定 #25，见 U1.3）；U7 的引用字段按 READONLY r9 起的 `content_tag` 修订（决定 #35）。· **日期**：2026-10-20，修订 2026-11-08 · **桥报文** `v: 2`（决定 #35 按 §0 变更规则递增；`v: 1` 从未实施，宿主不支持；文中其余「v1」指本契约文档版本）
+> **依据**：`docs/knowledge/CONTRACT-READONLY-v1.md`（下称 READONLY，按 r8；例外：引用 read、分块分页与 `content_tag` 的日志规则按现行 r11 的 R4.1、R4.3、R4.5、R4.7、R10.3，决定 #35）；`docs/knowledge/CONTRACT-STATE-v1.md`（下称 STATE，规范核心 v1，PR #1113；本文依赖它的规则汇总在 §8.2）。
 > 由完整版 `ab/weknora-03b-ui-bridge`（#1077 的分支）压缩而来。本文只写对外行为与不变式；实现机制由各实现任务以代码和测试证明。
 > 编号：`R*` 为 READONLY 规则，`S*` 为 STATE 规范核心 v1（同批）的条款，`U*` 为本文规则（沿用完整版编号，空号即已移出规范），`决定 #n` 见 §9.1（已定）与 §9.5（待决）。
 
@@ -116,21 +116,21 @@
 
 ## 7. 消息 schema
 
-- **U7.1** **信封** `{ v, direction, type, id, generation, in_reply_to?, payload }`，每层都不允许多余字段，除注明外必填。`v`：v1 恒为 1。`direction`：`page_to_host` / `host_to_page`，与 `type` 不配即 `schema_violation`。`id`：ULID（`^[0-9A-HJKMNP-TV-Z]{26}$`），文档内唯一。`generation`：1 至 2^53−1，只有 hello 请求可为 0。`in_reply_to`：只能出现在 `reply` 里；触发消息通过 ⑧ 且顶层 `id` 是合法 ULID 时必填并取该 `id`，否则省略（⑥⑦⑧ 一律省略），宿主不编造占位值。
-  - **引用 ID**（`knowledge_base_id`、`knowledge_id`、`chunk_id`、`source_revision`、`index_build_id`）：UTF-8 1–128 字节、不含控制字符，否则 `schema_violation`（软违规）；另默认拒绝含 `/`、`\`、`:`、`..` 或空白的 ID，回 `schema_violation` 但不计违规（与 R5.2 同步前先行采用，决定 #21）。宿主只把它们作为不透明值放进 READONLY 的 read，从不当 URL 或路径解释。`chunk_revision` 为 0 至 2^31−1 的整数。
+- **U7.1** **信封** `{ v, direction, type, id, generation, in_reply_to?, payload }`，每层都不允许多余字段，除注明外必填。`v`：本版恒为 2。`direction`：`page_to_host` / `host_to_page`，与 `type` 不配即 `schema_violation`。`id`：ULID（`^[0-9A-HJKMNP-TV-Z]{26}$`），文档内唯一。`generation`：1 至 2^53−1，只有 hello 请求可为 0。`in_reply_to`：只能出现在 `reply` 里；触发消息通过 ⑧ 且顶层 `id` 是合法 ULID 时必填并取该 `id`，否则省略（⑥⑦⑧ 一律省略），宿主不编造占位值。
+  - **引用 ID**（`knowledge_base_id`、`knowledge_id`、`chunk_id`、`source_revision`、`index_build_id`、`content_tag`）：UTF-8 1–128 字节、不含控制字符，否则 `schema_violation`（软违规）；另默认拒绝含 `/`、`\`、`:`、`..` 或空白的 ID，回 `schema_violation` 但不计违规（与 R5.2 同步前先行采用，决定 #21）。宿主只把它们作为不透明值放进 READONLY 的 read，从不当 URL 或路径解释。`chunk_revision` 为 0 至 2^31−1 的整数。`content_tag` 与 READONLY R10.3 相同，不进宿主日志与审计（U6.8 本来就不记消息体）。
 - **U7.2** **页面→宿主的 payload 与处理**：
   - `status`：`state` ∈ `loading`/`ready`/`error`；`error_code` 只在 `error` 时出现，∈ `unauthorized`/`forbidden`/`not_found`/`unavailable`/`internal`。只用于宿主显示，不触发续期、登录、自查或任何 STATE 事件。
-  - `citation`：六个引用字段全部必填。宿主经 Provider 以当前 generation 做带 `chunk_id` 与 `expected_revision` 的单分块 read（R4.1、R4.7），通过才在引用 UI 显示；不进模型上下文、不进草稿。**存在性不可区分**：read 的 Q 只取引用里的 KB，且该 KB 必须在 binding 最近一次可见集合内（S5.10），否则不发 read，直接回 `done`、`code: "not_found"`，与文档不存在相同。read 失败时 `done` 的 `code` 取 READONLY 的值（如 `stale`、`not_found`）。
+  - `citation`：七个引用字段（`knowledge_base_id`、`knowledge_id`、`chunk_id`、`source_revision`、`index_build_id`、`chunk_revision`、`content_tag`）全部必填。宿主经 Provider 以当前 generation 做带 `chunk_id` 与 `expected_revision` 的单分块 read：`expected_revision` 必须含 `content_tag`，`source_revision`、`index_build_id`、`chunk_revision` 只作参考（R4.1、R4.3）；判定为 200、且跨页时各页 `content_tag` 一致并拿齐整段（R4.5、R4.7），才在引用 UI 显示；不进模型上下文、不进草稿。**存在性不可区分**：read 的 Q 只取引用里的 KB，且该 KB 必须在 binding 最近一次可见集合内（S5.10），否则不发 read，直接回 `done`、`code: "not_found"`，与文档不存在相同。read 失败时 `done` 的 `code` 取 READONLY 的值（如 `stale`、`not_found`）。
   - `cancel`：`target_id`（ULID）。目标是本文档内仍在处理、排队或等待确认的 `citation` / intent 时撤回它：原消息的终态为 `rejected`（`code: "cancelled"`），确认弹窗随之关闭；`cancel` 自身回 `accepted`。目标不存在、属于其他文档或已到终态时回 `accepted`，没有任何效果。
   - `return_to_chat_intent`：`citations` 为 0–8 项引用。只在该 view 最近 5 秒内有激活类用户输入时接受，否则 `forbidden/user_activation_required`；对话内草稿附件累计至多 16 项，超出 `invalid_request/attachment_limit`。接受后宿主只高亮"回到对话"或弹出确认，不自动切换；确认界面列出条数与每条标题，标题由宿主重新 read 取得（纯文本，去控制与 bidi 字符，截断到 120 字符），不用页面给的文字。等待确认至多 60 秒，超时 `forbidden/confirmation_timeout`；用户拒绝 `forbidden/user_declined`，此后 30 秒内的 intent 回 `forbidden/cooldown`。等待确认期间文档切换、view 销毁（含关桥）、binding 离开可服务或准入关闭时，关闭弹窗、释放名额、不加附件，回 `unavailable/not_ready`（前两种情形这条 `reply` 随待发队列清空，不送达）。用户确认后才切回主对话，引用逐项按 `citation` 的方式校验，通过的项**一次性**加入草稿附件——**只有这条路径产生草稿附件**。部分通过时只附加通过的项并回 `done`，`code` 取第一个未通过项的 READONLY 值；全部通过时 `done` 不带 `code`；全部未通过时不加附件，回带该 `code` 的 `done`。**撤回优先**：附件加入之前收到 `cancel` 的 intent，不加任何附件，终态只有 `rejected/cancelled`，部分通过规则不适用；附件加入后 intent 已是 `done`，之后的 `cancel` 按"已到终态"处理。不自动发送、不创建 run、不做审批；v1 不带自由文本（决定 #15）。
   - **桥预算**：`citation` 与 intent 触发的 read（含标题 read）走 Provider 为桥单设的低优先级预算，至多 2 个并发、其余 FIFO 排队，不占主对话知识调用的预算与并发（与 KB-C1-04 的接口）；排队超过 10 秒仍未开始回 `unavailable/overloaded` 并带 `retry_after_ms`。这些 read 是普通 READONLY 请求，响应按 STATE 照常处理。
-- **U7.3** **宿主→页面的 payload**：`hello`：`supported`（整数数组，v1 为 `[1]`）、`view_instance_id`（`^[A-Za-z0-9_-]{22}$`，随机，不同于 `view_secret`，不是秘密）。`state`：`profile_state`（STATE 的状态之一）、`code`（可选，`^[a-z_]{1,64}$`，取 STATE 的本地 `reason`）、`theme`（`light`/`dark`）、`locale`（BCP 47）。`reply`：`result`（`accepted`/`rejected`/`done`）及可选的 `code`、`reason`、`retry_after_ms`、`supported`。宿主发出前同样做禁止键检查，不通过就不发并记日志。
+- **U7.3** **宿主→页面的 payload**：`hello`：`supported`（整数数组，本版为 `[2]`）、`view_instance_id`（`^[A-Za-z0-9_-]{22}$`，随机，不同于 `view_secret`，不是秘密）。`state`：`profile_state`（STATE 的状态之一）、`code`（可选，`^[a-z_]{1,64}$`，取 STATE 的本地 `reason`）、`theme`（`light`/`dark`）、`locale`（BCP 47）。`reply`：`result`（`accepted`/`rejected`/`done`）及可选的 `code`、`reason`、`retry_after_ms`、`supported`。宿主发出前同样做禁止键检查，不通过就不发并记日志。
 - **U7.4** **禁止键**在任意深度生效：键名转小写、去掉 `_` 与 `-` 后与清单项精确相等才算命中，不做子串匹配。清单：`url`、`uri`、`href`、`path`、`file`、`dir`、`cwd`、`command`、`cmd`、`exec`、`executable`、`argv`、`args`、`shell`、`script`、`approval`、`approve`、`decision`、`token`、`jwt`、`ticket`、`secret`、`password`、`authorization`、`cookie`、`origin`、`sender`、`frame`、`webcontents`、`port`、`__proto__`、`constructor`、`prototype`。解析器不给 `__proto__` 等键特殊语义。桥 schema 自身不得定义任何禁止键。内容检查（含 `/`、`\`、`://` 或以 `~`、`.` 开头即 `forbidden_content`，硬违规）只用于自由文本字段，v1 两个方向都没有。
 
 ## 8. 接口与交接点
 
-### 8.1 与 READONLY r8
-- 引用：R1.2、R1.4（UI 会话密钥）；R1.7（C 不进 renderer）；R2.1、R2.3、R2.6（E 的计算、空范围、越界与不存在不可区分）；R2.7（不含下载与 preview）；R4.1、R4.7（引用 read）；R5.2（引用 ID 不透明）；R6.1（错误信封）；R7.3（`null` 回显按 HTTP 交换配对，适用于签发入口）；R7.5（generation 只回显）；R7.6（在途长请求，U3.4 补上 UI 长连接的关闭）；R7.7；R10.3。
+### 8.1 与 READONLY r8（引用相关条款按 r11，决定 #35）
+- 引用：R1.2、R1.4（UI 会话密钥）；R1.7（C 不进 renderer）；R2.1、R2.3、R2.6（E 的计算、空范围、越界与不存在不可区分）；R2.7（不含下载与 preview）；R4.1、R4.3、R4.5、R4.7（引用 read：单分块 `expected_revision` 必含 `content_tag`、跨页一致；按 r11）；R5.2（引用 ID 不透明）；R6.1（错误信封）；R7.3（`null` 回显按 HTTP 交换配对，适用于签发入口）；R7.5（generation 只回显）；R7.6（在途长请求，U3.4 补上 UI 长连接的关闭）；R7.7；R10.3（审计与日志不含凭据与正文，`content_tag` 也不记）。
 - 不修订 READONLY 的：票据失败与族撤销都复用 `credential_invalid`（决定 #5、#20）。
 - 需要 READONLY 下一修订的：新 `reason` `unavailable/credential_near_expiry`（可重试，决定 #29）；引用 ID 字符集（决定 #21）。（决定 #25 已在 READONLY r11 定案：R1.8、R2.8。）
 
@@ -162,6 +162,7 @@
 - #31 恢复与存活策略按 U4.5、U4.8 的数值，可按实测调整。
 - #33 凭据无效类续签也失败（S3.1）：只暂停注入并加遮罩，不关桥、不销毁。
 - #34 全局收紧作废的登录态，在该 profile 解除 `unsaved_settings` 重新绑定（S1.13）后或 profile 移除时销毁。
+- #35 `citation`（及 `return_to_chat_intent` 的引用）补必填 `content_tag`，与 READONLY R4.1、R4.7（r9 起）一致；`chunk_revision` 保留、只作参考；按 §0 变更规则桥报文 `v` 由 1 升为 2（David 2026-11-08 确认 D，经 General 转达；证据裁决 R1 未收敛）。确认框标题由宿主重新 read 取得，`content_tag` 只覆盖分块正文、不覆盖标题。
 - #25 UI 操作与 C 的关系按 READONLY r11 的 R1.8、R2.8 处理：C 可签发与撤销票据，不计入数据操作范围；`ops` 是独立的只读展示清单（David 2026-11-08 确认，证据裁决 R0 一致）。
 
 ### 9.2 宿主侧 KnowledgeView `closed` 的 `code`（闭集）
