@@ -249,10 +249,13 @@ describe('origin policy and CSP (U4.2)', () => {
     expect(out['X-A']).toEqual(['1'])
   })
 
-  it('switches powerful features off in the page, after any server policy', () => {
-    const out = withKnowledgeCsp({ 'permissions-policy': ['geolocation=*, fullscreen=()'], 'X-A': ['1'] }, ORIGIN)
-    expect(out['Permissions-Policy']).toEqual(['geolocation=*, fullscreen=()', KNOWLEDGE_VIEW_PERMISSIONS_POLICY])
+  it('switches powerful features off in the page, in place of any server policy', () => {
+    const headers = { 'permissions-policy': ['geolocation=*, fullscreen=()'], 'Permissions-Policy': ['camera=('], 'X-A': ['1'] }
+    const out = withKnowledgeCsp(headers, ORIGIN)
+    // Only ours: a malformed server member must not take the whole field down.
+    expect(out['Permissions-Policy']).toEqual([KNOWLEDGE_VIEW_PERMISSIONS_POLICY])
     expect(out['permissions-policy']).toBeUndefined()
+    expect(headers['permissions-policy']).toEqual(['geolocation=*, fullscreen=()'])
     for (const feature of ['geolocation', 'camera', 'microphone', 'display-capture', 'usb', 'serial', 'hid', 'bluetooth']) {
       expect(KNOWLEDGE_VIEW_PERMISSIONS_POLICY).toContain(`${feature}=()`)
     }

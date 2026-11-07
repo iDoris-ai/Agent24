@@ -170,7 +170,8 @@ export function knowledgeViewCsp(origin: string): string {
  * permission handlers already refuse them, but a request that never reaches
  * them (David's 11-08 Mac run: geolocation left pending, no answer) is still
  * left open; a feature the document is not allowed to use is refused inside
- * Blink at once (W3C Geolocation: PERMISSION_DENIED), whatever the OS does. */
+ * Blink at once (W3C Geolocation: PERMISSION_DENIED), whatever the OS does.
+ * David's run had no location prompt at all: the request hung before the OS. */
 export const KNOWLEDGE_VIEW_PERMISSIONS_POLICY = [
   'accelerometer', 'ambient-light-sensor', 'bluetooth', 'camera', 'clipboard-read', 'display-capture',
   'geolocation', 'gyroscope', 'hid', 'idle-detection', 'local-fonts', 'magnetometer', 'microphone', 'midi',
@@ -184,17 +185,18 @@ export function withKnowledgeCsp(
 ): Record<string, string[]> {
   const out: Record<string, string[]> = {}
   const csp: string[] = []
-  const policy: string[] = []
   for (const [name, value] of Object.entries(headers ?? {})) {
     const values = Array.isArray(value) ? value : [value]
     if (name.toLowerCase() === 'content-security-policy') csp.push(...values)
-    else if (name.toLowerCase() === 'permissions-policy') policy.push(...values)
+    else if (name.toLowerCase() === 'permissions-policy') continue
     else out[name] = values
   }
   out['Content-Security-Policy'] = [...csp, knowledgeViewCsp(origin)]
-  // Ours goes last: for a feature named twice the last member wins, so the
-  // server can switch more off but none of these back on.
-  out['Permissions-Policy'] = [...policy, KNOWLEDGE_VIEW_PERMISSIONS_POLICY]
+  // The server's own Permissions-Policy is dropped, not merged: the header is
+  // one Structured Fields dictionary, and a single malformed member from the
+  // server would make Blink ignore the whole field, ours included (RFC 8941
+  // §4.2). Ours switches off every permission-gated feature the page has.
+  out['Permissions-Policy'] = [KNOWLEDGE_VIEW_PERMISSIONS_POLICY]
   return out
 }
 
