@@ -259,12 +259,19 @@ describe('chat history titles (UI-04)', () => {
     ['the prompt as source', 'chat_a', '名', 'prompt', 'Invalid chat history title source'],
     ['an empty title', 'chat_a', ' \n ', 'user', 'Invalid chat history title'],
     ['a title that is not text', 'chat_a', 3, 'user', 'Invalid chat history title'],
-    ['an overlong title', 'chat_a', 'x'.repeat(1001), 'user', 'Invalid chat history title'],
+    ['an overlong title', 'chat_a', 'x'.repeat(4001), 'user', 'Invalid chat history title'],
   ])('refuses a retitle with %s and keeps the title', (_name, id, title, source, error) => {
     const store = createChatHistoryStore(dir)
     store.save(record('chat_a', at, '首问'))
     expect(() => store.setTitle(id, title, source)).toThrow(error)
     expect(store.get('chat_a')).toMatchObject({ title: '首问', title_source: 'prompt' })
+  })
+
+  it('takes a rename of 80 long emoji sequences', () => {
+    const store = createChatHistoryStore(dir)
+    store.save(record('chat_a', at, '首问'))
+    const flags = '🏴󠁧󠁢󠁳󠁣󠁴󠁿'.repeat(80) // 14 UTF-16 units each
+    expect(store.setTitle('chat_a', flags, 'user')).toMatchObject({ title: flags })
   })
 
   it('a retitle writes through a fresh temporary file like a save', () => {

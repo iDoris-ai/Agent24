@@ -20,9 +20,10 @@ const MAX_RECORD_BYTES = 8 * 1024 * 1024
  *  left empty: `{"role":"user","content":"","at":"","delivered":true}` is
  *  52; the strings are counted separately below. */
 const MIN_MESSAGE_BYTES = 48
-/** A title set by `setTitle` is at most this many UTF-16 units; the page
- *  keeps a rename to 80 characters, far below it. */
-const MAX_TITLE_UNITS = 1000
+/** A title set by `setTitle` is at most this many UTF-16 units. The page
+ *  keeps a rename to 80 characters; one character (an emoji sequence, a
+ *  flag) can take a dozen units or more, so this leaves room for them. */
+const MAX_TITLE_UNITS = 4000
 
 /** A title replaces the one on file only when its source is at least as
  *  strong: the user's rename over the model's title over the first prompt. */

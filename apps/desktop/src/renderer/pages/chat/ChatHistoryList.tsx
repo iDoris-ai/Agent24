@@ -10,7 +10,7 @@ import {
   renameConversation,
   subscribeHistory,
 } from './history'
-import { RENAME_TITLE_CHARS, renameTitle } from './title'
+import { renameTitle } from './title'
 
 /** UI-03: the main chat's recent conversations, listed in the sidebar under
  *  the assistant. Clicking one shows the chat page with that conversation;
@@ -20,25 +20,28 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   const t = useT(chatMessages)
   const { items, activeId, busy } = useSyncExternalStore(subscribeHistory, getHistoryState)
   useEffect(() => { void refreshHistory() }, [])
-  // The conversation being renamed and what has been typed so far. The ref
-  // makes Enter followed by the input's blur rename once, not twice.
+  // The conversation being renamed, the title it had when the box opened,
+  // and what has been typed so far. The ref makes Enter followed by the
+  // input's blur rename once, not twice.
   const [editing, setEditing] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
-  const editingRef = useRef<string | null>(null)
+  const editingRef = useRef<{ id: string; from: string } | null>(null)
   const listRef = useRef<HTMLUListElement>(null)
   const startEdit = (id: string, title: string) => {
-    editingRef.current = id
+    editingRef.current = { id, from: title }
     setEditing(id)
     setDraft(title)
   }
   const endEdit = (save: boolean, refocus: boolean) => {
-    const id = editingRef.current
-    if (id === null) return
+    const edit = editingRef.current
+    if (edit === null) return
+    const { id, from } = edit
     editingRef.current = null
     setEditing(null)
-    const current = items.find(item => item.id === id)?.title
+    // Only what the user changed: a box left as it opened renames nothing,
+    // even if the title changed meanwhile (an earlier rename landing).
     const title = renameTitle(draft)
-    if (save && title && title !== current) void renameConversation(id, title)
+    if (save && title && title !== renameTitle(from)) void renameConversation(id, title)
     // From the keyboard, focus goes back to the conversation's entry.
     if (refocus) {
       requestAnimationFrame(() => {
@@ -62,9 +65,12 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
             <li key={item.id} className={`chat-history-item${item.id === activeId ? ' active' : ''}`}>
               {editing === item.id
                 ? <input className="chat-history-rename" aria-label={t('history.renameInput')} value={draft}
-                  maxLength={RENAME_TITLE_CHARS * 4} autoFocus onFocus={e => e.currentTarget.select()}
+                  autoFocus onFocus={e => e.currentTarget.select()}
                   onChange={e => setDraft(e.target.value)}
                   onKeyDown={e => {
+                    // Enter and Escape during an input method's composition
+                    // pick or drop a candidate; they are not ours.
+                    if (e.nativeEvent.isComposing || e.keyCode === 229) return
                     if (e.key === 'Enter') { e.preventDefault(); endEdit(true, true) }
                     else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); endEdit(false, true) }
                   }}

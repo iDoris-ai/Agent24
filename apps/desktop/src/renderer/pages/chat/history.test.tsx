@@ -508,6 +508,56 @@ describe('renaming a conversation (UI-04)', () => {
     await waitFor(() => expect(chatHistory.setTitle).toHaveBeenCalledWith('chat_old_1', `${'字'.repeat(79)}👍🏽`, 'user'))
   })
 
+  it('Enter or Escape while an input method composes does not end the rename (Codex R1-2)', async () => {
+    saved.set('chat_old_1', stored('chat_old_1', '旧话题', '2026-11-07T10:00:02.000Z'))
+    renderBoth()
+    await within(await findHistoryList()).findByRole('button', { name: '旧话题' })
+    const input = await rename('旧话题')
+    fireEvent.change(input, { target: { value: 'zhou' } })
+    fireEvent.keyDown(input, { key: 'Enter', isComposing: true })
+    fireEvent.keyDown(input, { key: 'Escape', keyCode: 229 })
+    expect(within(historyList()).getByRole('textbox', { name: '对话标题' })).toBe(input)
+    fireEvent.change(input, { target: { value: '周报' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await within(historyList()).findByRole('button', { name: '周报' })
+    expect(chatHistory.setTitle.mock.calls).toEqual([['chat_old_1', '周报', 'user']])
+  })
+
+  it('a box left as it opened renames nothing, even after an earlier rename lands (Codex R1-1)', async () => {
+    saved.set('chat_old_1', stored('chat_old_1', '旧话题', '2026-11-07T10:00:02.000Z'))
+    renderBoth()
+    await within(await findHistoryList()).findByRole('button', { name: '旧话题' })
+    let answer!: () => void
+    chatHistory.setTitle.mockImplementationOnce((id: string, title: string) => new Promise(r => {
+      answer = () => { saved.set(id, { ...saved.get(id)!, title, title_source: 'user' }); r(summary(saved.get(id)!)) }
+    }))
+    let input = await rename('旧话题')
+    fireEvent.change(input, { target: { value: '新名' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(chatHistory.setTitle).toHaveBeenCalledTimes(1))
+    // Opened again while the rename is on its way: the box still says 旧话题.
+    input = await rename('旧话题')
+    answer()
+    // The row is still being edited: its delete button shows the new title.
+    await within(historyList()).findByRole('button', { name: '删除对话：新名' })
+    fireEvent.blur(input)
+    await new Promise(r => setTimeout(r, 0))
+    expect(chatHistory.setTitle).toHaveBeenCalledTimes(1)
+    expect(saved.get('chat_old_1')?.title).toBe('新名')
+  })
+
+  it('keeps 80 long emoji sequences whole (Codex R1-3)', async () => {
+    saved.set('chat_old_1', stored('chat_old_1', '旧话题', '2026-11-07T10:00:02.000Z'))
+    renderBoth()
+    await within(await findHistoryList()).findByRole('button', { name: '旧话题' })
+    const input = await rename('旧话题')
+    expect(input).not.toHaveAttribute('maxlength')
+    const family = '👨‍👩‍👧‍👦' // 11 UTF-16 units, one character
+    fireEvent.change(input, { target: { value: family.repeat(81) } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(chatHistory.setTitle).toHaveBeenCalledWith('chat_old_1', family.repeat(80), 'user'))
+  })
+
   it('a rename answered after its conversation was deleted does not list it again', async () => {
     saved.set('chat_old_1', stored('chat_old_1', '旧话题', '2026-11-07T10:00:02.000Z'))
     renderBoth()
