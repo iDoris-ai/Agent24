@@ -20,7 +20,7 @@ const { KnowledgeViewHost } = require(path.join(__dirname, '..', 'dist', 'main',
 
 const hits = { A: [], B: [] }
 /** TCP connections opened to the foreign server B and to the fake TURN port. */
-const connections = { B: 0, TURN: 0 }
+const connections = { B: 0, TURN: 0, ICE: 0 }
 
 // Every step that waits on the browser is bounded and named, so a step that
 // never answers on a real machine (a permission or device prompt, say) shows
@@ -57,8 +57,11 @@ const within = (p, ms) => {
     stage('eval'); try { eval('1'); r.eval = 'ran' } catch { r.eval = 'blocked' }
     stage('download'); { const a = document.createElement('a'); a.href = '/download'; a.download = 'x.bin'; document.body.appendChild(a); a.click() }
     // PR-Daemon #1630 C1/R2-6: ways out that bypass webRequest or CSP in some engines.
+    // 'unavailable': no RTCPeerConnection at all (a pass); 'rejected': the API
+    // threw before ICE was tried (proves nothing, so it fails).
     stage('turn')
-    try {
+    if (typeof RTCPeerConnection === 'undefined') r.turn = 'unavailable'
+    else try {
       const pc = new RTCPeerConnection({ iceServers: [{ urls: 'turn:' + TURN + '?transport=tcp', username: 'u', credential: 'p' }] })
       pc.createDataChannel('x')
       const offer = await within(pc.createOffer(), 3000)
@@ -66,7 +69,49 @@ const within = (p, ms) => {
       await new Promise((d) => setTimeout(d, 2000))
       pc.close()
       r.turn = offer === 'timeout' || local === 'timeout' ? 'timeout' : 'ran'
-    } catch { r.turn = 'blocked' }
+    } catch { r.turn = 'rejected' }
+    // ICE-TCP active (decision #30): two local peers agree on a session in the
+    // page, then one is handed a passive TCP candidate at the ICE port, so it
+    // tries an outgoing TCP connection there. Same socket path as TURN-TCP.
+    stage('ice-tcp')
+    if (typeof RTCPeerConnection === 'undefined') r.iceTcp = 'unavailable'
+    else try {
+      const a = new RTCPeerConnection(); const b = new RTCPeerConnection()
+      // Local candidates of the side that dials out: with connections 0, a
+      // TCP-active one gathered means the proxy held it; none gathered means
+      // this row proves nothing (QA reads the row by this field).
+      const gathered = { total: 0, tcpActive: 0, tcpOther: 0 }
+      a.onicecandidate = (e) => {
+        const c = e.candidate
+        if (!c) return
+        gathered.total++
+        if (c.protocol === 'tcp') { if (c.tcpType === 'active') gathered.tcpActive++; else gathered.tcpOther++ }
+      }
+      a.createDataChannel('x')
+      const offer = await within(a.createOffer(), 3000)
+      if (offer === 'timeout') throw new Error('timeout')
+      await within(a.setLocalDescription(offer), 3000)
+      await within(b.setRemoteDescription(offer), 3000)
+      const answer = await within(b.createAnswer(), 3000)
+      if (answer === 'timeout') throw new Error('timeout')
+      await within(b.setLocalDescription(answer), 3000)
+      await within(a.setRemoteDescription(answer), 3000)
+      const [host, port] = ICE.split(':')
+      await within(a.addIceCandidate({ candidate: 'candidate:1 1 tcp 1518280447 ' + host + ' ' + port + ' typ host tcptype passive', sdpMid: '0', sdpMLineIndex: 0 }), 3000)
+      await new Promise((d) => setTimeout(d, 2000))
+      // Read alongside the count: if Chromium never paired the candidate (no
+      // local TCP-active candidate), connections 0 says nothing for this row.
+      r.iceState = a.iceConnectionState
+      r.iceLocal = gathered
+      const stats = await within(a.getStats(), 3000)
+      if (stats !== 'timeout') {
+        let n = 0
+        stats.forEach((v) => { if (v.type === 'local-candidate' && v.protocol === 'tcp' && v.tcpType === 'active') n++ })
+        r.iceLocal.statsTcpActive = n
+      }
+      a.close(); b.close()
+      r.iceTcp = timedOut.includes('ice-tcp') ? 'timeout' : 'ran'
+    } catch (e) { r.iceTcp = timedOut.includes('ice-tcp') ? 'timeout' : 'rejected:' + (e && e.name) }
     // preconnect opens a TCP connection without a request, so it is seen as a
     // connection to B. (dns-prefetch is not probed: with an IP literal there is
     // no lookup, and observing DNS would need a resolver of our own.)
@@ -100,6 +145,7 @@ function server(name, handler) {
 
 let originB = ''
 let turnAddress = ''
+let iceAddress = ''
 async function main() {
   const b = await server('B', (_req, res) => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('B') })
   b.s.on('connection', () => { connections.B++ })
@@ -109,11 +155,16 @@ async function main() {
     t.listen(0, '127.0.0.1', () => resolve(t))
   })
   turnAddress = `127.0.0.1:${turn.address().port}`
+  const ice = await new Promise((resolve) => {
+    const t = net.createServer((socket) => { connections.ICE++; socket.destroy() })
+    t.listen(0, '127.0.0.1', () => resolve(t))
+  })
+  iceAddress = `127.0.0.1:${ice.address().port}`
   const a = await server('A', (req, res) => {
     const url = new URL(req.url, 'http://x')
     if (url.pathname === '/probe.js') {
       res.writeHead(200, { 'content-type': 'text/javascript' })
-      return res.end(`const B = ${JSON.stringify(originB)}; const TURN = ${JSON.stringify(turnAddress)};\n${PROBE}`)
+      return res.end(`const B = ${JSON.stringify(originB)}; const TURN = ${JSON.stringify(turnAddress)}; const ICE = ${JSON.stringify(iceAddress)};\n${PROBE}`)
     }
     if (url.pathname === '/redir') {
       res.writeHead(302, { location: `${originB}/redir-target` })
@@ -156,11 +207,11 @@ async function main() {
 
   const view = () => win.contentView.children.find((c) => c.webContents && c.webContents !== win.webContents)
   const probe = async () => {
-    // The probe's own steps are bounded (about 25 s at worst); past 40 s it
+    // The probe's own steps are bounded (about 55 s at worst, ICE-TCP included); past 70 s it
     // is reported as unfinished with the stage it stopped at, and the run goes on.
     // executeJavaScript itself is raced against the deadline too: a renderer
     // that stops answering must not hold the run.
-    const deadline = Date.now() + 40_000
+    const deadline = Date.now() + 70_000
     const ask = (code) => Promise.race([
       view().webContents.executeJavaScript(code),
       new Promise((d) => setTimeout(() => d(undefined), Math.max(0, deadline - Date.now()))),
@@ -195,8 +246,18 @@ async function main() {
   check('inline eval blocked by the partition CSP', r1.eval === 'blocked', r1.eval)
   check('download prevented', downloads.length === 1 && downloads[0] === 'prevented', downloads)
   // 'ran' means an offer was made and set, so ICE gathering was really tried; a
-  // timeout there proves nothing. 'blocked' (no RTCPeerConnection) is a pass.
-  check('no TURN-over-TCP connection (contract decision #30)', (r1.turn === 'ran' || r1.turn === 'blocked') && connections.TURN === 0, { turn: r1.turn, connections: connections.TURN })
+  // timeout or a rejection there proves nothing. 'unavailable' (no RTCPeerConnection) is a pass.
+  const triedOrAbsent = (v) => v === 'ran' || v === 'unavailable'
+  check('no TURN-over-TCP connection (contract decision #30)', triedOrAbsent(r1.turn) && connections.TURN === 0, { turn: r1.turn, connections: connections.TURN })
+  // PASS/FAIL stays on the count; 'unproven' flags a 0 that no TCP-active
+  // candidate stood behind, so the PASS is not read as "blocked".
+  const iceEvidence = (r, added) => ({
+    ...(added === 0 && r.iceTcp === 'ran' && !(r.iceLocal?.tcpActive > 0) && !(r.iceLocal?.statsTcpActive > 0)
+      ? { unproven: 'no TCP-active local candidate was gathered' } : {}),
+    iceTcp: r.iceTcp, iceState: r.iceState, local: r.iceLocal, connections: added,
+  })
+  check('no ICE-TCP active connection (contract decision #30)', triedOrAbsent(r1.iceTcp) && connections.ICE === 0, iceEvidence(r1, connections.ICE))
+  const webrtcBefore = { TURN: connections.TURN, ICE: connections.ICE }
   // B is plain http and never upgrades, so 'open' cannot happen; what tells is that B saw no connection.
   check('WebSocket to a foreign host refused', r1.ws !== 'open' && connections.B === 0, { ws: r1.ws, connections: connections.B })
   check('302 to a foreign host not followed', r1.redirect === 'blocked' && !hits.B.includes('/redir-target'), r1.redirect)
@@ -227,13 +288,17 @@ async function main() {
   check('second profile uses a different non-persistent partition', partitions.length === 2 && partitions[0] !== partitions[1]
     && partitions.every((p) => !p.startsWith('persist:')), partitions)
   check('second profile sees none of the first one’s storage', r2.before?.local === null && r2.before?.cookie === '', r2.before)
+  // The new partition must get the dead proxy too, not only the first one.
+  check('second profile: no TURN- or ICE-TCP connection either (decision #30)',
+    triedOrAbsent(r2.turn) && triedOrAbsent(r2.iceTcp) && connections.TURN === webrtcBefore.TURN && connections.ICE === webrtcBefore.ICE,
+    { turn: r2.turn, newTurn: connections.TURN - webrtcBefore.TURN, ice: iceEvidence(r2, connections.ICE - webrtcBefore.ICE) })
 
   host.shutdown()
   check('quit destroys the view', win.contentView.children.length === 0)
   const again = await host.show({ x: 0, y: 0, width: 800, height: 600 }, 'dark')
   check('no new view after quit', !again.ok && win.contentView.children.length === 0, again)
 
-  a.s.close(); b.s.close(); turn.close()
+  a.s.close(); b.s.close(); turn.close(); ice.close()
   const failed = checks.filter((ok) => !ok).length
   console.log(`${checks.length - failed}/${checks.length} PASS`)
   app.exit(failed === 0 ? 0 : 1)
