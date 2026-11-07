@@ -89,6 +89,10 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   // with the search box and the list's fold, which are always there.
   const sectionRef = useRef<HTMLElement>(null)
   const focusSoon = (...selectors: string[]) => requestAnimationFrame(() => {
+    // Only focus that was lost (it was on the menu or box that closed): if
+    // the user has put it somewhere since, it stays there.
+    const active = document.activeElement
+    if (active !== null && active !== document.body) return
     for (const selector of [...selectors, '.chat-history-search', '.chat-history-fold']) {
       const el = sectionRef.current?.querySelector<HTMLElement>(selector)
       if (el) { el.focus(); return }

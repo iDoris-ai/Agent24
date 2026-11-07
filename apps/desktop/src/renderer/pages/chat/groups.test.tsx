@@ -307,6 +307,36 @@ describe('focus and placement (UI-06 G2, Codex R1)', () => {
     await waitFor(() => expect(within(groupBox('工作')).getByRole('button', { name: '对话「周报」的操作' })).toHaveFocus())
   })
 
+  it('focus the user has put elsewhere meanwhile is not taken back', async () => {
+    store.createGroup('工作')
+    put('chat_a', '周报')
+    await showList()
+    await within(list()).findByRole('group', { name: '工作' })
+    let land!: () => void
+    bridge.organize.mockImplementationOnce((id: string, p: unknown) => {
+      const answer = store.organize(id, p)
+      return new Promise(r => { land = () => r(answer) })
+    })
+    fireEvent.click(within(openRowMenu('周报')).getByRole('menuitem', { name: '工作' }), { detail: 0 })
+    fireEvent.click(within(list()).getByRole('button', { name: '+ 分组' }))
+    const box = within(list()).getByRole('textbox', { name: '分组名称' })
+    fireEvent.change(box, { target: { value: '写到一半' } })
+    land()
+    await waitFor(() => expect(groupOfStored('chat_a')).not.toBeNull())
+    for (let i = 0; i < 3; i++) await new Promise(r => requestAnimationFrame(r))
+    expect(box).toHaveFocus()
+    expect(store.groups().groups).toHaveLength(1)
+  })
+
+  it('a menu closes when the window is resized', async () => {
+    put('chat_a', '周报')
+    await showList()
+    await within(list()).findByRole('button', { name: '周报' })
+    openRowMenu('周报')
+    fireEvent(window, new Event('resize'))
+    expect(within(list()).queryByRole('menu')).toBeNull()
+  })
+
   it('Escape in a menu opened by a right click focuses that row\'s ⋯', async () => {
     put('chat_a', '周报')
     await showList()

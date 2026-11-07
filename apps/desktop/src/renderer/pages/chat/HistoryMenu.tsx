@@ -42,12 +42,18 @@ export function HistoryMenu({ label, entries, at, onClose }: {
     const x = Math.max(EDGE, Math.min(at.x, window.innerWidth - box.width - EDGE))
     const y = at.y + box.height > window.innerHeight - EDGE ? Math.max(EDGE, window.innerHeight - box.height - EDGE) : at.y
     setPos(p => (p.x === x && p.y === y ? p : { x, y }))
-  }, [at.x, at.y])
+  }, [at.x, at.y, entries.length])
   useLayoutEffect(() => { items()[0]?.focus() }, [])
   useEffect(() => {
     const outside = (e: MouseEvent) => { if (!ref.current?.contains(e.target as Node)) onClose(false) }
+    // A resized window would leave it where it no longer fits: it closes.
+    const resized = () => onClose(false)
     document.addEventListener('mousedown', outside)
-    return () => document.removeEventListener('mousedown', outside)
+    window.addEventListener('resize', resized)
+    return () => {
+      document.removeEventListener('mousedown', outside)
+      window.removeEventListener('resize', resized)
+    }
   }, [onClose])
   const move = (step: number | 'first' | 'last') => {
     const list = items()
