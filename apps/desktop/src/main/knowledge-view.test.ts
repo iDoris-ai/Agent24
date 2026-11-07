@@ -381,6 +381,18 @@ describe('KnowledgeViewHost', () => {
     expect(t.views[1].visible).toBe(true)
   })
 
+  it('a settings change that keeps the binding does not skip a crash backoff', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    t.views[0].webContents.emit('render-process-gone', {}, { reason: 'crashed' })
+    expect(t.timers).toHaveLength(1)
+    t.host.bindingChanged()
+    expect(t.views).toHaveLength(1)
+    t.timers[0].fn()
+    await flush()
+    expect(t.views).toHaveLength(2)
+  })
+
   it('a settings change while hidden creates nothing', async () => {
     const t = setup()
     t.env.binding = null
