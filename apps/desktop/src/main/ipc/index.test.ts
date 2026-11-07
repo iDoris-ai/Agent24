@@ -1847,11 +1847,15 @@ describe('UI-02 chat history IPC', () => {
       messages: [{ role: 'user', content: '你好', at: '2026-11-08T00:00:00.000Z', delivered: true }],
     }
     expect(await call(IpcChannels.ChatHistoryList)).toEqual([])
-    await call(IpcChannels.ChatHistorySave, record)
-    expect(await call(IpcChannels.ChatHistoryList)).toEqual([
-      { id: 'chat_ipc_1', title: '你好', created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z' },
-    ])
-    expect(await call(IpcChannels.ChatHistoryGet, 'chat_ipc_1')).toEqual(record)
+    const summary = { id: 'chat_ipc_1', title: '你好', title_source: 'prompt', created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z' }
+    // A record without title_source (written before UI-04) has the prompt's title.
+    expect(await call(IpcChannels.ChatHistorySave, record)).toEqual(summary)
+    expect(await call(IpcChannels.ChatHistoryList)).toEqual([summary])
+    expect(await call(IpcChannels.ChatHistoryGet, 'chat_ipc_1')).toEqual({ ...record, title_source: 'prompt' })
+    expect(await call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_1', '问候', 'user')).toEqual({ ...summary, title: '问候', title_source: 'user' })
+    expect(await call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_1', '模型', 'model')).toEqual({ ...summary, title: '问候', title_source: 'user' })
+    await expect(call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_1', '名', 'prompt')).rejects.toThrow('Invalid chat history title source')
+    expect(await call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_none', '名', 'user')).toBeNull()
     await expect(call(IpcChannels.ChatHistorySave, { ...record, version: 9 })).rejects.toThrow('Invalid chat history record')
     await expect(call(IpcChannels.ChatHistoryGet, '../ui-prefs')).rejects.toThrow('Invalid chat history id')
     await call(IpcChannels.ChatHistoryDelete, 'chat_ipc_1')

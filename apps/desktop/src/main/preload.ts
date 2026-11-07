@@ -42,9 +42,11 @@ const api = {
   chatHistory: {
     list: (): Promise<ChatHistorySummary[]> => ipcRenderer.invoke(IpcChannels.ChatHistoryList),
     get: (id: string): Promise<ChatHistoryRecord | null> => ipcRenderer.invoke(IpcChannels.ChatHistoryGet, id),
-    save: (record: ChatHistoryRecord): Promise<void> => ipcRenderer.invoke(IpcChannels.ChatHistorySave, record),
+    save: (record: ChatHistoryRecord): Promise<ChatHistorySummary> => ipcRenderer.invoke(IpcChannels.ChatHistorySave, record),
     delete: (id: string): Promise<void> => ipcRenderer.invoke(IpcChannels.ChatHistoryDelete, id),
     clear: (): Promise<void> => ipcRenderer.invoke(IpcChannels.ChatHistoryClear),
+    setTitle: (id: string, title: string, source: 'user' | 'model'): Promise<ChatHistorySummary | null> =>
+      ipcRenderer.invoke(IpcChannels.ChatHistorySetTitle, id, title, source),
   },
   onCliToolSettings: (cb: () => void): (() => void) => {
     ipcRenderer.on(IpcChannels.CliToolOpenSettings, cb)

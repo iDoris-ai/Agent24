@@ -4,6 +4,7 @@
 // that one" requests from the list to the page.
 
 import type { ChatHistoryRecord, ChatHistorySummary } from '../../../shared/chat-history'
+import { renameTitle } from './title'
 
 export interface HistoryState {
   items: ChatHistorySummary[]
@@ -43,8 +44,7 @@ export async function refreshHistory(): Promise<void> {
   if (!list) return
   const newer = state.items.filter(item => (publishedAt.get(item.id) ?? 0) > mark)
   set({
-    items: [...newer, ...list.filter(item => !newer.some(n => n.id === item.id) && !removedSince(item.id, mark))]
-      .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at)),
+    items: byNewest([...newer, ...list.filter(item => !newer.some(n => n.id === item.id) && !removedSince(item.id, mark))]),
   })
 }
 
@@ -69,6 +69,8 @@ const unsaved = new Map<string, { mine: number; record: ChatHistoryRecord }>()
  *  the same order as `seq`) that summary went into the list. */
 const listedAt = new Map<string, number>()
 const publishedAt = new Map<string, number>()
+const byNewest = (items: ChatHistorySummary[]): ChatHistorySummary[] =>
+  items.sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at))
 const realSleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
 let sleep = realSleep
 /** For tests: how a failed save waits before its retry. */
@@ -87,9 +89,10 @@ export async function saveConversation(record: ChatHistoryRecord): Promise<boole
   newestSave.set(record.id, mine)
   unsaved.set(record.id, { mine, record })
   const done = () => { if (unsaved.get(record.id)?.mine === mine) unsaved.delete(record.id) }
+  let written: ChatHistorySummary | undefined
   for (let attempt = 0; ; attempt++) {
     try {
-      await history.save(record)
+      written = await history.save(record)
       break
     } catch {
       if (attempt >= SAVE_RETRY_MS.length) {
@@ -106,13 +109,33 @@ export async function saveConversation(record: ChatHistoryRecord): Promise<boole
   if ((listedAt.get(record.id) ?? 0) > mine || removedSince(record.id, mine)) return true
   listedAt.set(record.id, mine)
   publishedAt.set(record.id, ++seq)
-  // The list is updated from the record itself: reading every conversation
-  // again from disk on each save would cost a full scan per chat turn.
-  const summary = { id: record.id, title: record.title, created_at: record.created_at, updated_at: record.updated_at }
-  set({
-    items: [summary, ...state.items.filter(item => item.id !== record.id)]
-      .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at)),
-  })
+  // The list is updated from what main wrote (which keeps a rename over the
+  // first prompt's title), not by reading every conversation again from
+  // disk: that would cost a full scan per chat turn.
+  const summary = written ?? {
+    id: record.id, title: record.title, title_source: record.title_source,
+    created_at: record.created_at, updated_at: record.updated_at,
+  }
+  set({ items: byNewest([summary, ...state.items.filter(item => item.id !== record.id)]) })
+  return true
+}
+
+/** UI-04: renames a saved conversation. Main keeps it over the first
+ *  prompt's title and the model's, so later saves do not undo it. False when
+ *  there was nothing to keep, or the rename failed; a conversation deleted
+ *  meanwhile stays deleted. */
+export async function renameConversation(id: string, input: string): Promise<boolean> {
+  const title = renameTitle(input)
+  const history = api()
+  if (!title || !history) return false
+  const mine = ++seq
+  const summary = await history.setTitle(id, title, 'user').catch(() => null)
+  if (!summary || removedSince(id, mine)) return false
+  // Main answers in the order it handled the calls, so a save handled before
+  // this rename has already updated the list and one handled after it
+  // returns this title too.
+  publishedAt.set(id, ++seq)
+  set({ items: byNewest([summary, ...state.items.filter(item => item.id !== id)]) })
   return true
 }
 
