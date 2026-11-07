@@ -182,14 +182,31 @@ describe('chat history', () => {
     expect(screen.getByPlaceholderText(/输入消息/)).toHaveValue('草稿')
   })
 
-  it('writes again on the next change after a failed save', async () => {
-    chatHistory.save.mockRejectedValueOnce(new Error('ENOSPC'))
+  it('retries a failed save of the finished reply without another change', async () => {
     renderBoth()
     send('一')
+    await waitFor(() => expect(chatHistory.save).toHaveBeenCalledTimes(1))
+    // The save holding the reply fails once, then succeeds on its own retry.
+    chatHistory.save.mockRejectedValueOnce(new Error('ENOSPC'))
     await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
-    await waitFor(() => expect(chatHistory.save).toHaveBeenCalled())
-    send('二')
-    await waitFor(() => expect([...saved.values()][0]?.messages).toHaveLength(4))
+    await waitFor(() => expect([...saved.values()][0]?.messages).toHaveLength(2), { timeout: 2000 })
+  })
+
+  it('a retry still waiting gives up once the conversation is deleted', async () => {
+    saved.set('chat_a_1', stored('chat_a_1', '话题甲', '2026-11-07T10:00:02.000Z'))
+    renderBoth()
+    fireEvent.click(await within(await findHistoryList()).findByRole('button', { name: '话题甲' }))
+    await waitFor(() => expect(screen.getByText('答：话题甲')).toBeInTheDocument())
+    chatHistory.save.mockRejectedValueOnce(new Error('ENOSPC'))
+    send('再问')
+    await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
+    await waitFor(() => expect(within(historyList()).getByRole('button', { name: '删除对话：话题甲' })).toBeEnabled())
+    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：话题甲' }))
+    // The page left it at once, before the deletion settled.
+    expect(screen.queryByText('答：话题甲')).toBeNull()
+    await waitFor(() => expect(saved.has('chat_a_1')).toBe(false))
+    await new Promise(r => setTimeout(r, 2200))
+    expect(saved.has('chat_a_1')).toBe(false)
   })
 
   it('works without the history bridge: the chat goes on, nothing is listed', async () => {
