@@ -33,11 +33,17 @@ class FakeEmitter {
     return this
   }
   once(event: string, listener: Listener): this {
-    const wrapped: Listener = (...args) => {
+    const wrapped: Listener & { original?: Listener } = (...args) => {
       this.listeners.set(event, (this.listeners.get(event) ?? []).filter((l) => l !== wrapped))
       return listener(...args)
     }
+    wrapped.original = listener
     return this.on(event, wrapped)
+  }
+  removeListener(event: string, listener: Listener): this {
+    // Like Node's EventEmitter: a once() listener is removed by the function given to once().
+    this.listeners.set(event, (this.listeners.get(event) ?? []).filter((l) => l !== listener && (l as { original?: Listener }).original !== listener))
+    return this
   }
   emit(event: string, ...args: unknown[]): void {
     for (const l of this.listeners.get(event) ?? []) l(...args)
@@ -136,6 +142,7 @@ function setup(over: Partial<{ binding: string | null; target: ReturnType<typeof
   const sessions: FakeSession[] = []
   const states: unknown[] = []
   const timers: Array<{ fn: () => void; ms: number }> = []
+  const cleared: number[] = []
   let now = 0
   const env = {
     win: new FakeWindow() as FakeWindow | null,
@@ -153,12 +160,12 @@ function setup(over: Partial<{ binding: string | null; target: ReturnType<typeof
     onState: (s: unknown) => states.push(s),
     now: () => now,
     setTimer: (fn: () => void, ms: number) => { timers.push({ fn, ms }); return timers.length },
-    clearTimer: () => {},
+    clearTimer: (handle: unknown) => { cleared.push(handle as number) },
     log: () => {},
     partitionName: () => `${KNOWLEDGE_VIEW_PARTITION_PREFIX}p${++seq}`,
   } as unknown as KnowledgeViewHostDeps
   const host = new KnowledgeViewHost(deps)
-  return { host, views, sessions, states, timers, env, advance: (ms: number) => { now += ms } }
+  return { host, views, sessions, states, timers, cleared, env, advance: (ms: number) => { now += ms } }
 }
 
 describe('knowledgeViewTarget (U4.4)', () => {
@@ -336,6 +343,7 @@ describe('KnowledgeViewHost', () => {
   it('a binding change ends the instance, clears its partition, and the next one is a new partition', async () => {
     const t = setup()
     await t.host.show(BOUNDS)
+    t.host.hide()
     t.env.binding = 'https://other.example.org/api/v1'
     t.host.bindingChanged()
     expect(t.env.win!.children).toEqual([])
@@ -345,6 +353,27 @@ describe('KnowledgeViewHost', () => {
     await t.host.show(BOUNDS)
     expect(t.views).toHaveLength(2)
     expect(t.views[1].prefs.partition).not.toBe(t.views[0].prefs.partition)
+  })
+
+  it('a binding change while on screen opens the new binding at once, never a blank area', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    t.env.binding = 'https://other.example.org/api/v1'
+    t.host.bindingChanged()
+    expect(t.views[0].webContents.destroyed).toBe(true)
+    expect(t.env.win!.children).toEqual([t.views[1]])
+    expect(t.views[1].visible).toBe(true)
+    await flush()
+    expect(t.host.status()).toEqual({ state: 'ready' })
+  })
+
+  it('Off while on screen says Off at once (U4.8)', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    t.env.binding = null
+    t.host.bindingChanged()
+    expect(t.host.status()).toEqual({ state: 'unavailable', code: 'knowledge_off' })
+    expect(t.views).toHaveLength(1)
   })
 
   it('an unchanged binding keeps the instance', async () => {
@@ -512,9 +541,71 @@ describe('KnowledgeViewHost', () => {
     } finally {
       nextLoad = () => Promise.resolve()
     }
-    // Not marked loaded, so the next show loads again.
+    // The load was not thrown away: the next show uses it, no second navigation.
     expect(await t.host.show(BOUNDS)).toEqual({ ok: true })
-    expect(t.views[0].webContents.loads).toHaveLength(2)
+    expect(t.views[0].webContents.loads).toHaveLength(1)
+    expect(t.host.status()).toEqual({ state: 'ready' })
+  })
+
+  it('a second show during the first load waits for it instead of loading again', async () => {
+    const t = setup()
+    let finish: () => void = () => {}
+    nextLoad = () => new Promise<void>((resolve) => { finish = resolve })
+    try {
+      const first = t.host.show(BOUNDS)
+      const second = t.host.show(BOUNDS)
+      finish()
+      expect(await second).toEqual({ ok: true })
+      expect(await first).toEqual({ ok: false, code: 'superseded' })
+    } finally {
+      nextLoad = () => Promise.resolve()
+    }
+    expect(t.views[0].webContents.loads).toHaveLength(1)
+  })
+
+  it('did-finish-load does not cover a hung page or a failed load with ready', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    const wc = t.views[0].webContents
+    wc.emit('unresponsive')
+    wc.emit('did-finish-load')
+    expect(t.host.status()).toEqual({ state: 'degraded', code: 'unresponsive' })
+    wc.emit('responsive')
+    expect(t.host.status()).toEqual({ state: 'ready' })
+    wc.emit('did-fail-load', {}, -102, 'refused', URL_, true)
+    wc.emit('did-finish-load')
+    expect(t.host.status()).toEqual({ state: 'degraded', code: 'load_failed' })
+    expect(t.views[0].visible).toBe(false)
+  })
+
+  it('events from a replaced instance are ignored (crash, hang)', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    const old = t.views[0].webContents
+    await t.host.reload(BOUNDS)
+    expect(t.views).toHaveLength(2)
+    old.emit('render-process-gone', {}, { reason: 'crashed' })
+    old.emit('unresponsive')
+    expect(t.host.status()).toEqual({ state: 'ready' })
+    expect(t.timers).toHaveLength(0)
+    expect(t.views[1].visible).toBe(true)
+  })
+
+  it('a pending crash rebuild is cancelled when the instance is destroyed', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    t.views[0].webContents.emit('render-process-gone', {}, { reason: 'crashed' })
+    expect(t.timers).toHaveLength(1)
+    t.host.destroyAll('test')
+    expect(t.cleared).toEqual([1])
+  })
+
+  it('destroying an instance removes its listener from the window', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    expect(t.env.win!.listeners.get('closed')).toHaveLength(1)
+    await t.host.reload(BOUNDS)
+    expect(t.env.win!.listeners.get('closed')).toHaveLength(1)
   })
 
   it('a main-frame load failure reported later also steps the view aside', async () => {
@@ -579,7 +670,9 @@ describe('KnowledgeViewHost', () => {
     expect(t.host.status()).toEqual({ state: 'closed', code: 'crash_loop' })
     t.env.binding = 'https://other.example.org/api/v1'
     t.host.bindingChanged()
-    expect(t.host.status()).toEqual({ state: 'hidden' })
+    // On screen, so the new binding's page opens straight away.
+    await flush()
+    expect(t.host.status()).toEqual({ state: 'ready' })
     expect(await t.host.show(BOUNDS)).toEqual({ ok: true })
     // The new binding starts with no crashes counted: one crash is a rebuild, not closed.
     t.views[t.views.length - 1].webContents.emit('render-process-gone', {}, { reason: 'crashed' })

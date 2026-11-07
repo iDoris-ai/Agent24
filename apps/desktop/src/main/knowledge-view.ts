@@ -264,6 +264,10 @@ interface Instance {
   /** Hung (ADR §4): kept per instance so a hide/show round trip does not
    * put the hung page back over the content area. */
   unresponsive: boolean
+  /** The first load in flight; a hide does not cancel it, a second show waits for it. */
+  loading: Promise<boolean> | null
+  /** Removed on destroy, so windows do not collect listeners (one per instance). */
+  onWindowClosed: () => void
 }
 
 /** Main's single owner of KnowledgeView instances (one binding for now). */
@@ -356,21 +360,35 @@ export class KnowledgeViewHost {
       return { ok: true }
     }
     // Taken after any destruction above; a hide or destroy during the load
-    // bumps it again and the stale result is dropped.
+    // bumps it again, and this caller's stale result is dropped. The load
+    // itself carries on: a later show uses it instead of loading again.
     const mine = ++this.request
     this.setState({ state: 'loading' })
-    try {
-      await instance.view.webContents.loadURL(target.url)
-    } catch (error) {
-      // An overtaken or redirected load rejects too; only the live one counts.
-      if (mine !== this.request || this.instance !== instance) return { ok: false, code: 'superseded' }
-      this.log(`[knowledge-view] load failed: ${error instanceof Error ? error.message : String(error)}`)
-      this.loadFailed(instance)
-      return { ok: false, code: 'load_failed' }
-    }
+    const loaded = await this.load(instance)
     if (mine !== this.request || this.instance !== instance) return { ok: false, code: 'superseded' }
-    instance.loaded = true
-    return { ok: true }
+    return loaded ? { ok: true } : { ok: false, code: 'load_failed' }
+  }
+
+  /** The instance's first load, shared by every show while it is in flight. */
+  private load(instance: Instance): Promise<boolean> {
+    if (instance.loading) return instance.loading
+    instance.loading = instance.view.webContents.loadURL(instance.target.url).then(
+      () => {
+        instance.loading = null
+        if (this.instance !== instance) return false
+        instance.loaded = true
+        if (this.visible && this.state.state === 'loading' && !instance.unresponsive) this.setState({ state: 'ready' })
+        return true
+      },
+      (error: unknown) => {
+        instance.loading = null
+        if (this.instance !== instance) return false
+        this.log(`[knowledge-view] load failed: ${error instanceof Error ? error.message : String(error)}`)
+        this.loadFailed(instance)
+        return false
+      },
+    )
+    return instance.loading
   }
 
   setBounds(rawBounds: unknown): void {
@@ -400,12 +418,20 @@ export class KnowledgeViewHost {
    * instance and whatever `closed` or crash count the old one left. */
   bindingChanged(): void {
     const binding = this.deps.binding()
+    let ended = false
     if (this.closed && this.closed.binding !== binding) {
       this.endBinding()
       this.setState({ state: 'hidden' })
+      ended = true
     }
     if (this.crashBinding !== binding) this.crashes = []
-    if (this.instance && this.instance.binding !== binding) this.destroy('binding changed')
+    if (this.instance && this.instance.binding !== binding) {
+      this.destroy('binding changed')
+      ended = true
+    }
+    // On screen: say why at once (Off), or open the new binding's page
+    // (U4.8: the entry states why it is unavailable), never a blank area.
+    if (ended && this.visible && this.bounds) void this.show(this.bounds)
   }
 
   /** Binding-level destruction (U4.8) without closing the door: window teardown, tests. */
@@ -432,15 +458,22 @@ export class KnowledgeViewHost {
     const session = this.deps.sessionFor(partition)
     hardenKnowledgeSession(session, target.origin)
     const view = this.deps.createView(knowledgeViewPreferences(partition, this.deps.packaged))
-    const instance: Instance = { view, session, window: win, binding, target, loaded: false, unresponsive: false }
+    const instance: Instance = {
+      view, session, window: win, binding, target, loaded: false, unresponsive: false, loading: null,
+      onWindowClosed: () => { if (this.instance === instance) this.destroy('window closed') },
+    }
     guardKnowledgeContents(view.webContents, target.origin, () => {
       if (this.instance !== instance) return
       this.log('[knowledge-view] main frame left the allowed origin')
       this.destroy('left the allowed origin')
       this.setState({ state: 'degraded', code: 'navigated_away' })
     })
+    // Only a load that is still the one being waited for becomes `ready`;
+    // a hung page or a failed load keeps its state.
     view.webContents.on('did-finish-load', () => {
-      if (this.instance === instance && this.visible) this.setState({ state: 'ready' })
+      if (this.instance === instance && this.visible && this.state.state === 'loading' && !instance.unresponsive) {
+        this.setState({ state: 'ready' })
+      }
     })
     view.webContents.on('did-fail-load', (_event, code, _description, _url, isMainFrame) => {
       // -3 is an aborted load (a newer navigation took over).
@@ -468,9 +501,7 @@ export class KnowledgeViewHost {
       this.setState(this.visible ? { state: 'ready' } : { state: 'hidden' })
     })
     // The view does not go with its window (Electron resource management).
-    win.once('closed', () => {
-      if (this.instance === instance) this.destroy('window closed')
-    })
+    win.once('closed', instance.onWindowClosed)
     view.setVisible(false)
     win.contentView.addChildView(view)
     this.instance = instance
@@ -521,6 +552,11 @@ export class KnowledgeViewHost {
     const instance = this.instance
     if (!instance) return
     this.instance = null
+    try {
+      instance.window.removeListener('closed', instance.onWindowClosed)
+    } catch {
+      // A destroyed window has no listeners left to remove.
+    }
     const ses = instance.session
     // Sealed first: nothing the closing page still has queued (unload
     // handlers, keepalive) leaves or comes back to refill the partition.
