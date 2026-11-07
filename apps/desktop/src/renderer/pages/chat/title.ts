@@ -15,7 +15,8 @@ export function graphemes(text: string): string[] {
   return segmenter ? Array.from(segmenter.segment(text), s => s.segment) : Array.from(text)
 }
 
-const oneLine = (text: string): string => text.replace(/\s+/g, ' ').trim()
+/** The text on one line: runs of white space as one space, none at the ends. */
+export const oneLine = (text: string): string => text.replace(/\s+/g, ' ').trim()
 
 /** The first prompt as a title: one line, cut to `PROMPT_TITLE_CHARS`
  *  characters with an ellipsis when longer. */

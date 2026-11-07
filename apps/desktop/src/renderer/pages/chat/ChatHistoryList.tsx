@@ -10,7 +10,7 @@ import {
   renameConversation,
   subscribeHistory,
 } from './history'
-import { renameTitle } from './title'
+import { oneLine, renameTitle } from './title'
 
 /** UI-03: the main chat's recent conversations, listed in the sidebar under
  *  the assistant. Clicking one shows the chat page with that conversation;
@@ -39,9 +39,10 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
     editingRef.current = null
     setEditing(null)
     // Only what the user changed: a box left as it opened renames nothing,
-    // even if the title changed meanwhile (an earlier rename landing).
+    // even if the title changed meanwhile (an earlier rename landing). Compared
+    // before the cut to 80 characters, so shortening a longer title counts.
     const title = renameTitle(draft)
-    if (save && title && title !== renameTitle(from)) void renameConversation(id, title)
+    if (save && title && oneLine(draft) !== oneLine(from)) void renameConversation(id, title)
     // From the keyboard, focus goes back to the conversation's entry.
     if (refocus) {
       requestAnimationFrame(() => {

@@ -546,6 +546,16 @@ describe('renaming a conversation (UI-04)', () => {
     expect(saved.get('chat_old_1')?.title).toBe('新名')
   })
 
+  it('shortening a title longer than 80 characters to 80 is a rename (Codex R2-1)', async () => {
+    saved.set('chat_old_1', stored('chat_old_1', '字'.repeat(81), '2026-11-07T10:00:02.000Z'))
+    renderBoth()
+    await within(await findHistoryList()).findByRole('button', { name: '字'.repeat(81) })
+    const input = await rename('字'.repeat(81))
+    fireEvent.change(input, { target: { value: '字'.repeat(80) } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(chatHistory.setTitle).toHaveBeenCalledWith('chat_old_1', '字'.repeat(80), 'user'))
+  })
+
   it('keeps 80 long emoji sequences whole (Codex R1-3)', async () => {
     saved.set('chat_old_1', stored('chat_old_1', '旧话题', '2026-11-07T10:00:02.000Z'))
     renderBoth()
