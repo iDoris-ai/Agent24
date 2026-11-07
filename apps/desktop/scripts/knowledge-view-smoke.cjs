@@ -10,7 +10,7 @@
 //   pnpm exec tsc -p tsconfig.electron.json
 //   pnpm exec electron scripts/knowledge-view-smoke.cjs
 //
-// Prints one line per check and exits non-zero if any fails.
+// Prints one line per check (33) and exits non-zero if any fails.
 
 const http = require('node:http')
 const net = require('node:net')
@@ -186,6 +186,8 @@ async function main() {
   const win = new BrowserWindow({ show: false, width: 900, height: 700 })
   await win.loadURL('about:blank')
   let binding = 'profile-1'
+  const CONTROL = 'profile-control'
+  const controlAsked = []
   const partitions = []
   const downloads = []
   const host = new KnowledgeViewHost({
@@ -197,6 +199,12 @@ async function main() {
       // Registered before the host's own handler, so it reads the outcome in a
       // microtask: still this tick (a prevented DownloadItem is gone on the next).
       ses.on('will-download', (event) => queueMicrotask(() => downloads.push(event.defaultPrevented ? 'prevented' : 'allowed')))
+      // The control profile (see the end): the host still asks for its dead
+      // proxy, this script puts the partition on direct instead.
+      if (binding === CONTROL) {
+        const set = ses.setProxy.bind(ses)
+        ses.setProxy = (config) => { controlAsked.push(config); return set({ mode: 'direct' }) }
+      }
       return ses
     },
     target: () => ({ origin: a.origin, url: `${a.origin}/?${binding}` }),
@@ -238,6 +246,9 @@ async function main() {
   check('no Node in the page', r1.node === 'undefined/undefined/undefined', r1.node)
   check('no host API (no preload)', r1.hostApi === 'undefined', r1.hostApi)
   check('window.open refused, no new window', r1.popup === 'null' && BrowserWindow.getAllWindows().length === 1, r1.popup)
+  // The foreign server B is on loopback too, so from here on the dead proxy
+  // stands in front of it as well: these rows show the layers together. The
+  // control profile at the end shows webRequest and the CSP alone (#1643 PR-Daemon A).
   check('foreign fetch and image blocked', r1.foreignFetch === 'blocked' && r1.foreignImg === 'blocked', [r1.foreignFetch, r1.foreignImg])
   check('foreign origin received nothing', hits.B.length === 0, hits.B)
   check('no frame loaded', !hits.A.includes('/frame'), hits.A)
@@ -292,6 +303,34 @@ async function main() {
   check('second profile: no TURN- or ICE-TCP connection either (decision #30)',
     triedOrAbsent(r2.turn) && triedOrAbsent(r2.iceTcp) && connections.TURN === webrtcBefore.TURN && connections.ICE === webrtcBefore.ICE,
     { turn: r2.turn, newTurn: connections.TURN - webrtcBefore.TURN, ice: iceEvidence(r2, connections.ICE - webrtcBefore.ICE) })
+
+  // Positive control (#1643 PR-Daemon A): a third profile whose partition is
+  // put on direct by this script; the host's CSP, webRequest and permission
+  // refusals stay as they are. The foreign host must still get nothing (that
+  // rests on webRequest and the CSP, not on the proxy), and TURN/ICE-TCP must
+  // now reach their ports: only then do the 0s above mean "the dead proxy held"
+  // rather than "this machine never tries".
+  const base = { TURN: connections.TURN, ICE: connections.ICE, B: connections.B, hitsB: hits.B.length }
+  binding = CONTROL
+  host.bindingChanged()
+  const rc = await probe()
+  check('control probe finished', rc.stage === 'done' && !rc.error && !rc.unfinished && rc.timedOut?.length === 0, { stage: rc.stage, error: rc.error, unfinished: rc.unfinished, timedOut: rc.timedOut })
+  await new Promise((d) => setTimeout(d, 500))
+  const viewOrigin = new URL(a.origin)
+  check('control: the host still asked for its dead proxy', controlAsked.length === 1
+    && JSON.stringify(controlAsked[0]).includes(`<-loopback>;${viewOrigin.host}`), controlAsked)
+  check('control: foreign host refused by webRequest and the CSP alone (no dead proxy)',
+    rc.foreignFetch === 'blocked' && rc.foreignImg === 'blocked' && rc.ws !== 'open' && rc.redirect === 'blocked'
+      && connections.B === base.B && hits.B.length === base.hitsB,
+    { fetch: rc.foreignFetch, img: rc.foreignImg, ws: rc.ws, redirect: rc.redirect, newConnections: connections.B - base.B, newHits: hits.B.slice(base.hitsB) })
+  const controlTurn = connections.TURN - base.TURN
+  const controlIce = connections.ICE - base.ICE
+  check('control: TURN-over-TCP gets out without the dead proxy (so the 0 above is the proxy)', rc.turn === 'ran' && controlTurn >= 1, { turn: rc.turn, connections: controlTurn })
+  // ICE-TCP is conclusive when the control connects, or when the dead-proxy
+  // run had a TCP-active candidate to send and still made no connection.
+  const iceConclusive = controlIce >= 1 || r1.iceLocal?.tcpActive > 0 || r1.iceLocal?.statsTcpActive > 0
+  check('control: the ICE-TCP 0 above is conclusive', rc.iceTcp === 'ran' && iceConclusive,
+    { ...(iceConclusive ? {} : { inconclusive: 'no connection without the proxy and no TCP-active candidate with it' }), control: iceEvidence(rc, controlIce), profile1Local: r1.iceLocal })
 
   host.shutdown()
   check('quit destroys the view', win.contentView.children.length === 0)

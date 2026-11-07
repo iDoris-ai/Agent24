@@ -199,6 +199,47 @@ describe('dead proxy for WebRTC TCP (contract decision #30)', () => {
     expect(knowledgeViewProxyConfig('http://[::1]:7', 9).proxyBypassRules).toBe('<-loopback>;[::1]:7')
     expect(knowledgeViewProxyConfig('https://kb.example.org:8443', 9).proxyBypassRules).toBe('<-loopback>;kb.example.org:8443')
     expect(JSON.stringify(knowledgeViewProxyConfig('https://kb.example.org', 9))).not.toMatch(/direct/i)
+    // Never a pattern in the bypass list, whoever builds the origin.
+    for (const bad of ['https://*', 'https://*.example.org', 'https://a;b.example.org', 'https://a,b.example.org']) {
+      expect(() => knowledgeViewProxyConfig(bad, 9), bad).toThrow(/host name not allowed/)
+    }
+  })
+
+  it('does not load a page whose first load already timed out while the proxy was being set', async () => {
+    const t = setup()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const original = FakeSession.prototype.setProxy
+    FakeSession.prototype.setProxy = function (this: FakeSession, config: unknown) { this.proxy = config; return gate }
+    try {
+      const shown = t.host.show(BOUNDS)
+      await vi.waitFor(() => expect(t.loadTimers).toHaveLength(1))
+      t.loadTimers[0].fn()
+      expect(await shown).toEqual(expect.objectContaining({ ok: false }))
+      release()
+      await flush()
+      expect(t.views[0].webContents.loads).toEqual([])
+    } finally {
+      FakeSession.prototype.setProxy = original
+    }
+  })
+
+  it('does not load a page whose instance was replaced while the proxy was being set', async () => {
+    const t = setup()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const original = FakeSession.prototype.setProxy
+    FakeSession.prototype.setProxy = function (this: FakeSession, config: unknown) { this.proxy = config; return gate }
+    try {
+      void t.host.show(BOUNDS)
+      await vi.waitFor(() => expect(t.views).toHaveLength(1))
+      t.host.shutdown()
+      release()
+      await flush()
+      expect(t.views[0].webContents.loads).toEqual([])
+    } finally {
+      FakeSession.prototype.setProxy = original
+    }
   })
 
   it('loads the page only once the partition proxy is set', async () => {
@@ -272,8 +313,10 @@ describe('knowledgeViewTarget (U4.4)', () => {
     expect(knowledgeViewTarget('http://127.0.0.1:18282/')).toEqual({ origin: 'http://127.0.0.1:18282', url: 'http://127.0.0.1:18282/' })
     expect(knowledgeViewTarget('http://[::1]:9/x')?.origin).toBe('http://[::1]:9')
     for (const bad of ['http://localhost:18282/', 'http://10.0.0.2/', 'file:///etc/passwd', 'agent24://x', 'https://u:p@kb.example.org/',
-      'https://kb.example.org/?token=x', 'https://kb.example.org/#t', 'not a url', 42, undefined]) {
-      expect(knowledgeViewTarget(bad)).toBeNull()
+      'https://kb.example.org/?token=x', 'https://kb.example.org/#t', 'not a url', 42, undefined,
+      // Host names the URL parser keeps but the proxy bypass would read as patterns (#1643 PR-Daemon C).
+      'https://*.example.org/', 'https://a;b.example.org/', 'https://a,*,b.1.2.3.4.sslip.io/', 'https://kb_x.example.org/']) {
+      expect(knowledgeViewTarget(bad), String(bad)).toBeNull()
     }
   })
 
