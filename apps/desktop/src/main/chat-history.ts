@@ -182,7 +182,13 @@ export function createChatHistoryStore(dir: string) {
       precheck(value)
       let record = parseChatHistoryRecord(value)
       const before = current(record.id)
-      if (before && TITLE_RANK[before.title_source] > TITLE_RANK[record.title_source]) {
+      // A save never retitles at its own rank either (PR-Daemon #1640 L3):
+      // titles change through setTitle, so a late retry of an older save
+      // carrying a model or user title cannot undo a newer one. Only the
+      // first prompt's title, recomputed on every save, follows the save.
+      const keep = before && (TITLE_RANK[before.title_source] > TITLE_RANK[record.title_source]
+        || (before.title_source === record.title_source && record.title_source !== 'prompt'))
+      if (before && keep) {
         record = { ...record, title: before.title, title_source: before.title_source }
       }
       write(record)

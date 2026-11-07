@@ -124,19 +124,31 @@ export async function saveConversation(record: ChatHistoryRecord): Promise<boole
  *  prompt's title and the model's, so later saves do not undo it. False when
  *  there was nothing to keep, or the rename failed; a conversation deleted
  *  meanwhile stays deleted. */
-export async function renameConversation(id: string, input: string): Promise<boolean> {
-  const title = renameTitle(input)
+export function renameConversation(id: string, input: string): Promise<boolean> {
+  return retitle(id, renameTitle(input), 'user')
+}
+
+/** UI-04 T2: gives a saved conversation the title the model wrote. Main
+ *  refuses it over a rename, however late it arrives. */
+export function titleConversation(id: string, title: string): Promise<boolean> {
+  return retitle(id, title, 'model')
+}
+
+/** Whether conversations are kept at all (there is a history bridge). */
+export const historyAvailable = (): boolean => api() !== undefined
+
+async function retitle(id: string, title: string, source: 'user' | 'model'): Promise<boolean> {
   const history = api()
   if (!title || !history) return false
   const mine = ++seq
-  const summary = await history.setTitle(id, title, 'user').catch(() => null)
+  const summary = await history.setTitle(id, title, source).catch(() => null)
   if (!summary || removedSince(id, mine)) return false
   // Main answers in the order it handled the calls, so a save handled before
-  // this rename has already updated the list and one handled after it
-  // returns this title too.
+  // this one has already updated the list and one handled after it returns
+  // this title too.
   publishedAt.set(id, ++seq)
   set({ items: byNewest([summary, ...state.items.filter(item => item.id !== id)]) })
-  return true
+  return summary.title_source === source
 }
 
 /** Reads a conversation to open it: its newest record not yet saved if

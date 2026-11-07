@@ -96,7 +96,12 @@ beforeEach(() => {
   saved = new Map()
   waiting = []
   memoryStore()
-  proxy.mockResolvedValue({ ok: true, status: 200, data: { message: { content: 'ack' } } })
+  // A title request (UI-04 T2, tested in title-gen.test.tsx) finds no model
+  // here, so the prompt's title stays; every other call is the chat's.
+  proxy.mockImplementation(async (req: { body?: { messages?: Array<{ role: string }> } }) =>
+    req.body?.messages?.[0]?.role === 'system'
+      ? { ok: false, status: 503, data: { error: { code: 'provider_unavailable', message: 'no local model' } } }
+      : { ok: true, status: 200, data: { message: { content: 'ack' } } })
   Object.defineProperty(window, 'agent24', { value: { backendProxy: proxy, chatHistory }, writable: true, configurable: true })
 })
 afterEach(() => { vi.restoreAllMocks() })

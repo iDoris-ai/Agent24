@@ -8,9 +8,12 @@ import { askWithKnowledge, createChatSession } from './chat-knowledge'
 import { grounding, type Grounding } from './knowledge-grounding'
 import { TurnRail } from './chat/TurnRail'
 import { activeTurn, buildTurns } from './chat/turns'
-import { promptTitle } from './chat/title'
+import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/title'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../shared/chat-history'
-import { loadConversation, registerChatPage, saveConversation, setActiveConversation, setChatBusy } from './chat/history'
+import {
+  getHistoryState, historyAvailable, loadConversation, registerChatPage, saveConversation, setActiveConversation,
+  setChatBusy, titleConversation,
+} from './chat/history'
 
 /** M1-T14: what `/api/v1/chat` ACTUALLY did with an explicit "记住…" turn —
  *  read off the response field, never off the model's own reply text (the
@@ -120,6 +123,9 @@ export default function ChatPage() {
   // Bumped by every switch of conversation (new chat, opening one): a load
   // that finishes after a newer switch is dropped.
   const switchGen = useRef(0)
+  // UI-04 T2: conversations whose title the model has been asked for (or
+  // will not be: one opened from the history), so it is asked once at most.
+  const titleAsked = useRef(new Set<string>())
 
   useEffect(() => { setChatBusy(loading) }, [loading])
 
@@ -140,6 +146,23 @@ export default function ChatPage() {
       if (!ok && lastSaved.current === body) lastSaved.current = ''
     })
   }, [messages, sessionId])
+
+  // UI-04 T2: once a new conversation's first turn is answered (or its
+  // second or third, when the prompts so far were too short to say much),
+  // the model is asked for its title, once, in the background. It goes to
+  // `/api/v1/chat` without `session_id`: no memory, local models only. A
+  // failure leaves the first prompt's title; a rename always wins.
+  useEffect(() => {
+    if (loading || titleAsked.current.has(sessionId) || !historyAvailable()) return
+    const turns = answeredTurns(messages)
+    if (!titleDue(turns)) return
+    titleAsked.current.add(sessionId)
+    const id = sessionId
+    if (getHistoryState().items.find(item => item.id === id)?.title_source === 'user') return
+    void generateTitle(window.agent24.backendProxy, turns).then(title => {
+      if (title) void titleConversation(id, title)
+    })
+  }, [messages, sessionId, loading])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -192,6 +215,8 @@ export default function ChatPage() {
     const record = await loadConversation(id)
     if (!record || requestInFlight.current || gen !== switchGen.current) return
     const restored = fromRecord(record)
+    // Its title was settled when it was new; continuing it asks for none.
+    titleAsked.current.add(record.id)
     stamps.current = record.messages.map(m => m.at)
     lastSaved.current = JSON.stringify(toRecord(record.id, restored, stamps.current))
     setMessages(restored)

@@ -237,6 +237,18 @@ describe('chat history titles (UI-04)', () => {
     expect(onDisk('chat_a')).toMatchObject({ title: '我的', title_source: 'user' })
   })
 
+  it('a save at the same rank as the title on file keeps it, unless that is the prompt\'s (PR-Daemon #1640 L3)', () => {
+    const store = createChatHistoryStore(dir)
+    store.save(record('chat_a', at, '首问'))
+    store.setTitle('chat_a', '新的模型标题', 'model')
+    expect(store.save({ ...record('chat_a', later, '旧的模型标题'), title_source: 'model' })).toMatchObject({ title: '新的模型标题' })
+    store.setTitle('chat_a', '新名', 'user')
+    expect(store.save({ ...record('chat_a', later, '旧名'), title_source: 'user' })).toMatchObject({ title: '新名', title_source: 'user' })
+    const other = createChatHistoryStore(dir)
+    other.save(record('chat_b', at, '首问'))
+    expect(other.save(record('chat_b', later, '首问改了'))).toMatchObject({ title: '首问改了', title_source: 'prompt' })
+  })
+
   it('a save with a stronger title replaces a weaker one on file', () => {
     const store = createChatHistoryStore(dir)
     store.save(record('chat_a', at, '首问'))
