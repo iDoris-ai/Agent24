@@ -101,6 +101,8 @@ class FakeContents extends FakeEmitter {
     this.destroyed = true
     this.emit('destroyed')
   }
+  crashedByHost = false
+  forcefullyCrashRenderer() { this.crashedByHost = true }
   setWindowOpenHandler(l: Listener) { this.openHandler = l }
   setWebRTCIPHandlingPolicy(p: string) { this.webrtc = p }
 }
@@ -411,16 +413,21 @@ describe('KnowledgeViewHost', () => {
     expect(ses.cleared).toEqual(ALL_CLEARED)
   })
 
-  it('clears anyway when the page is not destroyed in time', async () => {
+  it('a page not destroyed in time has its renderer killed, and the partition is cleared again once it goes', async () => {
     const t = setup()
     await t.host.show(BOUNDS)
-    t.views[0].webContents.asyncClose = true
+    const wc = t.views[0].webContents
+    wc.asyncClose = true
     t.host.destroyAll('test')
     const wait = t.timers.find((x) => x.ms === KNOWLEDGE_VIEW_DESTROY_WAIT_MS)
     expect(wait).toBeDefined()
     wait!.fn()
     await flush()
+    expect(wc.crashedByHost).toBe(true)
     expect(t.sessions[0].cleared).toEqual(ALL_CLEARED)
+    wc.finishClose()
+    await flush()
+    expect(t.sessions[0].cleared).toEqual([...ALL_CLEARED, ...ALL_CLEARED])
   })
 
   it('a closed window takes its view down even if nothing shows it again', async () => {
@@ -441,6 +448,11 @@ describe('KnowledgeViewHost', () => {
     expect(t.views[0].visible).toBe(true)
     expect(t.host.status()).toEqual({ state: 'ready' })
     wc.emit('unresponsive')
+    // A route round trip is not a recovery: the hung page stays out of the way.
+    t.host.hide()
+    expect(await t.host.show(BOUNDS)).toEqual({ ok: true })
+    expect(t.views[0].visible).toBe(false)
+    expect(t.host.status()).toEqual({ state: 'degraded', code: 'unresponsive' })
     expect(await t.host.reload(BOUNDS)).toEqual({ ok: true })
     expect(wc.destroyed).toBe(true)
     expect(t.views).toHaveLength(2)

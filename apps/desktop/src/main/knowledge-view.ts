@@ -261,6 +261,9 @@ interface Instance {
   target: KnowledgeViewTarget
   /** The first load of the page finished. */
   loaded: boolean
+  /** Hung (ADR §4): kept per instance so a hide/show round trip does not
+   * put the hung page back over the content area. */
+  unresponsive: boolean
 }
 
 /** Main's single owner of KnowledgeView instances (one binding for now). */
@@ -342,6 +345,11 @@ export class KnowledgeViewHost {
     }
     instance.view.setBackgroundColor(BACKGROUND[this.theme])
     instance.view.setBounds(bounds)
+    if (instance.unresponsive) {
+      instance.view.setVisible(false)
+      this.setState({ state: 'degraded', code: 'unresponsive' })
+      return { ok: true }
+    }
     instance.view.setVisible(true)
     if (instance.loaded) {
       if (this.state.state === 'hidden') this.setState({ state: 'ready' })
@@ -424,7 +432,7 @@ export class KnowledgeViewHost {
     const session = this.deps.sessionFor(partition)
     hardenKnowledgeSession(session, target.origin)
     const view = this.deps.createView(knowledgeViewPreferences(partition, this.deps.packaged))
-    const instance: Instance = { view, session, window: win, binding, target, loaded: false }
+    const instance: Instance = { view, session, window: win, binding, target, loaded: false, unresponsive: false }
     guardKnowledgeContents(view.webContents, target.origin, () => {
       if (this.instance !== instance) return
       this.log('[knowledge-view] main frame left the allowed origin')
@@ -447,11 +455,13 @@ export class KnowledgeViewHost {
     // the page's Reload button can be reached, and comes back if it recovers.
     view.webContents.on('unresponsive', () => {
       if (this.instance !== instance) return
+      instance.unresponsive = true
       view.setVisible(false)
       this.setState({ state: 'degraded', code: 'unresponsive' })
     })
     view.webContents.on('responsive', () => {
-      if (this.instance !== instance || this.state.state !== 'degraded' || this.state.code !== 'unresponsive') return
+      if (this.instance !== instance || !instance.unresponsive) return
+      instance.unresponsive = false
       if (this.visible) view.setVisible(true)
       this.setState(this.visible ? { state: 'ready' } : { state: 'hidden' })
     })
@@ -531,18 +541,33 @@ export class KnowledgeViewHost {
   }
 
   /** Electron destroys a closed page asynchronously; the partition is cleared
-   * after that (or after a bounded wait), never while the page may still write. */
+   * after that, never while the page may still write. A page not gone within
+   * the wait has its renderer killed first, and the partition is cleared again
+   * once it is finally destroyed. */
   private async clearWhenGone(instance: Instance, reason: string): Promise<void> {
     const contents = instance.view.webContents
     if (!contents.isDestroyed()) {
-      await new Promise<void>((resolve) => {
-        const timer = this.setTimer(resolve, KNOWLEDGE_VIEW_DESTROY_WAIT_MS)
+      const gone = await new Promise<boolean>((resolve) => {
+        const timer = this.setTimer(() => resolve(false), KNOWLEDGE_VIEW_DESTROY_WAIT_MS)
         contents.once('destroyed', () => {
           this.clearTimer(timer)
-          resolve()
+          resolve(true)
         })
       })
+      if (!gone) {
+        this.log(`[knowledge-view] page not destroyed in time (${reason}); killing its renderer`)
+        try {
+          if (!contents.isDestroyed()) contents.forcefullyCrashRenderer()
+        } catch (error) {
+          this.log(`[knowledge-view] kill renderer failed (${reason}): ${String(error)}`)
+        }
+        contents.once('destroyed', () => { void this.clearPartition(instance, `${reason}, late`) })
+      }
     }
+    await this.clearPartition(instance, reason)
+  }
+
+  private async clearPartition(instance: Instance, reason: string): Promise<void> {
     const ses = instance.session
     const steps: Array<() => Promise<void>> = [
       () => ses.closeAllConnections(),

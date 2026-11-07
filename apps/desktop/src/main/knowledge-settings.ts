@@ -181,6 +181,9 @@ export class KnowledgeController {
         if (typeof apiKey === 'string') {
           // The login names the endpoint it is for (`key()`).
           await this.logins.put(KNOWLEDGE_BINDING, { profileId: endpoint, material: apiKey, unusable: false, temporary: false })
+          // Counted where the key is written, so a change that is overtaken
+          // after this point still moves the view to a new partition.
+          this.identity++
         }
         try {
           await this.store.save(next)
@@ -196,7 +199,7 @@ export class KnowledgeController {
       return { ok: false, reason: 'not_saved' }
     }
     if (overtaken()) return { ok: false, reason: 'not_saved' }
-    if (typeof apiKey === 'string' || next.endpoint !== this.settings.endpoint) this.identity++
+    if (next.endpoint !== this.settings.endpoint) this.identity++
     this.settings = next
     return this.apply()
   }

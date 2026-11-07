@@ -96,6 +96,36 @@ describe('KnowledgeController (M3)', () => {
     expect(controller.viewBinding()).toBeNull()
   })
 
+  it('a new key moves the view binding even when its change is overtaken after the key was written', async () => {
+    const store = new KnowledgeSettingsStore(dir)
+    const save = store.save.bind(store)
+    let hold = false
+    let release: () => void = () => {}
+    let held = false
+    store.save = async (settings) => {
+      if (hold) {
+        held = true
+        await new Promise<void>((resolve) => { release = resolve })
+      }
+      return save(settings)
+    }
+    const controller = new KnowledgeController(host, logins, store, { nowSeconds: () => now })
+    await controller.configure(GOOD)
+    await controller.setEnabled(true)
+    const first = controller.viewBinding()
+    hold = true
+    const a = controller.configure({ ...GOOD, apiKey: 'sk-NEW' })
+    for (let i = 0; i < 50 && !held; i++) await new Promise((resolve) => setTimeout(resolve, 1))
+    expect(held).toBe(true)
+    hold = false
+    const b = controller.configure({ endpoint: GOOD.endpoint, knowledgeBaseIds: ['kb-a'] })
+    release()
+    await Promise.all([a, b])
+    expect(logins.list().get(KNOWLEDGE_BINDING)?.material).toBe('sk-NEW')
+    expect(controller.viewBinding()).not.toBeNull()
+    expect(controller.viewBinding()).not.toBe(first)
+  })
+
   it('a failing listener does not stop the change', async () => {
     const controller = make()
     controller.onChange(() => { throw new Error('boom') })
