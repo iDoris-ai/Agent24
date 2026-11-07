@@ -252,8 +252,14 @@ describe('origin policy and CSP (U4.2)', () => {
   it('switches powerful features off in the page, in place of any server policy', () => {
     const headers = { 'permissions-policy': ['geolocation=*, fullscreen=()'], 'Permissions-Policy': ['camera=('], 'X-A': ['1'] }
     const out = withKnowledgeCsp(headers, ORIGIN)
-    // Only ours: a malformed server member must not take the whole field down.
+    // A malformed (or loosening) server member must not take the whole field
+    // down: the server's policy is dropped and only ours goes out.
     expect(out['Permissions-Policy']).toEqual([KNOWLEDGE_VIEW_PERMISSIONS_POLICY])
+    // A server that only switches more off keeps those, ahead of ours.
+    expect(withKnowledgeCsp({ 'Permissions-Policy': ['sync-xhr=(), fullscreen=()', 'autoplay=()'] }, ORIGIN)['Permissions-Policy'])
+      .toEqual(['sync-xhr=(), fullscreen=(), autoplay=()', KNOWLEDGE_VIEW_PERMISSIONS_POLICY])
+    expect(withKnowledgeCsp({ 'Permissions-Policy': ['sync-xhr=(), geolocation=(self)'] }, ORIGIN)['Permissions-Policy'])
+      .toEqual([KNOWLEDGE_VIEW_PERMISSIONS_POLICY])
     expect(out['permissions-policy']).toBeUndefined()
     expect(headers['permissions-policy']).toEqual(['geolocation=*, fullscreen=()'])
     for (const feature of ['geolocation', 'camera', 'microphone', 'display-capture', 'usb', 'serial', 'hid', 'bluetooth']) {

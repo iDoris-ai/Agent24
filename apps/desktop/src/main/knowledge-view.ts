@@ -179,24 +179,31 @@ export const KNOWLEDGE_VIEW_PERMISSIONS_POLICY = [
   'window-management',
 ].map((feature) => `${feature}=()`).join(', ')
 
+function serverSwitchOffs(values: string[]): string[] {
+  const members = values.flatMap((v) => v.split(',')).map((m) => m.trim()).filter((m) => m !== '')
+  return members.length > 0 && members.every((m) => /^[a-z][a-z0-9-]*=\(\)$/.test(m)) ? [members.join(', ')] : []
+}
+
 export function withKnowledgeCsp(
   headers: Record<string, string | string[]> | undefined,
   origin: string,
 ): Record<string, string[]> {
   const out: Record<string, string[]> = {}
   const csp: string[] = []
+  const policy: string[] = []
   for (const [name, value] of Object.entries(headers ?? {})) {
     const values = Array.isArray(value) ? value : [value]
     if (name.toLowerCase() === 'content-security-policy') csp.push(...values)
-    else if (name.toLowerCase() === 'permissions-policy') continue
+    else if (name.toLowerCase() === 'permissions-policy') policy.push(...values)
     else out[name] = values
   }
   out['Content-Security-Policy'] = [...csp, knowledgeViewCsp(origin)]
-  // The server's own Permissions-Policy is dropped, not merged: the header is
-  // one Structured Fields dictionary, and a single malformed member from the
-  // server would make Blink ignore the whole field, ours included (RFC 8941
-  // §4.2). Ours switches off every permission-gated feature the page has.
-  out['Permissions-Policy'] = [KNOWLEDGE_VIEW_PERMISSIONS_POLICY]
+  // The header is one Structured Fields dictionary: a single malformed member
+  // from the server would make Blink ignore the whole field, ours included
+  // (RFC 8941 §4.2). So the server's policy is kept only when every member is
+  // a plain switch-off (`feature=()`), which cannot be malformed and can only
+  // restrict more; anything else from the server is dropped. Ours goes last.
+  out['Permissions-Policy'] = [...serverSwitchOffs(policy), KNOWLEDGE_VIEW_PERMISSIONS_POLICY]
   return out
 }
 
