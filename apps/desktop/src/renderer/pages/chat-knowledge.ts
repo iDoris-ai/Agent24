@@ -16,7 +16,7 @@ type Proxy = Window['agent24']['backendProxy']
 /** `knowledge`: what the run's Knowledge tools did, as the daemon tells it
  * (null when the run had no binding). */
 export type KnowledgeTurn =
-  | { kind: 'answer'; text: string; knowledge: RunKnowledge | null }
+  | { kind: 'answer'; text: string; knowledge: RunKnowledge | null; runId: string }
   | { kind: 'failed'; code: string; message: string }
 
 export interface TurnDeps {
@@ -63,7 +63,7 @@ export async function askWithKnowledge(prompt: string, sessionId: string, deps: 
       waiting = approval
       deps.onAwaitingApproval?.(approval)
     }
-    if (run.status === 'completed') return { kind: 'answer', text: run.output?.text ?? '', knowledge: run.knowledge ?? null }
+    if (run.status === 'completed') return { kind: 'answer', text: run.output?.text ?? '', knowledge: run.knowledge ?? null, runId }
     if (run.status === 'failed' || run.status === 'cancelled') return failure(run, `run_${run.status}`)
   }
   // Not left running unseen: the turn gave up on it.

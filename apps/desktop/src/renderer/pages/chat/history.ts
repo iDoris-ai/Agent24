@@ -1,0 +1,188 @@
+// UI-03: the main chat's history, between the sidebar list and the chat page.
+// The list lives in the sidebar, the conversation in the always-mounted chat
+// page; this module carries the list, which conversation is open, and "open
+// that one" requests from the list to the page.
+
+import type { ChatHistoryRecord, ChatHistorySummary } from '../../../shared/chat-history'
+
+export interface HistoryState {
+  items: ChatHistorySummary[]
+  /** The conversation the chat page shows, once it has been saved. Only the
+   *  chat page sets it. */
+  activeId: string | null
+  /** A reply is in flight: the page cannot switch conversations, so the list
+   *  does not offer to, nor to delete the open one or clear everything. */
+  busy: boolean
+}
+
+const initial: HistoryState = { items: [], activeId: null, busy: false }
+let state: HistoryState = initial
+const listeners = new Set<() => void>()
+let opener: ((id: string) => void) | null = null
+let starter: (() => void) | null = null
+
+const api = () => (typeof window === 'undefined' ? undefined : window.agent24?.chatHistory)
+
+function set(patch: Partial<HistoryState>): void {
+  state = { ...state, ...patch }
+  for (const l of listeners) l()
+}
+
+export const getHistoryState = (): HistoryState => state
+export function subscribeHistory(listener: () => void): () => void {
+  listeners.add(listener)
+  return () => listeners.delete(listener)
+}
+
+/** Reads the list again from main. Failures leave the list as it was. A
+ *  read that started before a save or a deletion finished does not undo it:
+ *  entries saved since it started are kept, ones removed since are dropped. */
+export async function refreshHistory(): Promise<void> {
+  const mark = seq
+  const list = await api()?.list().catch(() => null)
+  if (!list) return
+  const newer = state.items.filter(item => (publishedAt.get(item.id) ?? 0) > mark)
+  set({
+    items: [...newer, ...list.filter(item => !newer.some(n => n.id === item.id) && !removedSince(item.id, mark))]
+      .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at)),
+  })
+}
+
+/** Waits before each retry of a failed save. */
+export const SAVE_RETRY_MS = [500, 1500]
+/** Orders saves, deletions and clears. A retry still waiting gives up when
+ *  a newer save of the same conversation was asked for (that one carries
+ *  everything this one did, and must not be overwritten by it), or when
+ *  that conversation was deleted or everything cleared since (it must not
+ *  be written back). */
+let seq = 0
+const newestSave = new Map<string, number>()
+const deletedAt = new Map<string, number>()
+let clearedAt = 0
+const removedSince = (id: string, mark: number): boolean => (deletedAt.get(id) ?? 0) > mark || clearedAt > mark
+const superseded = (id: string, mine: number): boolean => newestSave.get(id) !== mine || removedSince(id, mine)
+/** The newest record of each conversation whose save has not finished yet:
+ *  what is on disk may be older (e.g. while a failed save waits to retry),
+ *  so opening the conversation reads this first. */
+const unsaved = new Map<string, { mine: number; record: ChatHistoryRecord }>()
+/** The save whose summary the list shows, per conversation, and when (in
+ *  the same order as `seq`) that summary went into the list. */
+const listedAt = new Map<string, number>()
+const publishedAt = new Map<string, number>()
+const realSleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
+let sleep = realSleep
+/** For tests: how a failed save waits before its retry. */
+export function setRetrySleepForTests(wait: (ms: number) => Promise<void>): void {
+  sleep = wait
+}
+
+/** The chat page saves a conversation after each change and refreshes the
+ *  list. A failed save is tried again a few times; false when it still
+ *  failed (the page then writes it again on its next change). History is
+ *  best effort; the chat itself goes on. */
+export async function saveConversation(record: ChatHistoryRecord): Promise<boolean> {
+  const history = api()
+  if (!history) return true
+  const mine = ++seq
+  newestSave.set(record.id, mine)
+  unsaved.set(record.id, { mine, record })
+  const done = () => { if (unsaved.get(record.id)?.mine === mine) unsaved.delete(record.id) }
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await history.save(record)
+      break
+    } catch {
+      if (attempt >= SAVE_RETRY_MS.length) {
+        done()
+        return false
+      }
+      await sleep(SAVE_RETRY_MS[attempt])
+      if (superseded(record.id, mine)) return true
+    }
+  }
+  done()
+  // Listed unless a newer save already listed it, or it was deleted or
+  // everything cleared since this save was asked for.
+  if ((listedAt.get(record.id) ?? 0) > mine || removedSince(record.id, mine)) return true
+  listedAt.set(record.id, mine)
+  publishedAt.set(record.id, ++seq)
+  // The list is updated from the record itself: reading every conversation
+  // again from disk on each save would cost a full scan per chat turn.
+  const summary = { id: record.id, title: record.title, created_at: record.created_at, updated_at: record.updated_at }
+  set({
+    items: [summary, ...state.items.filter(item => item.id !== record.id)]
+      .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at)),
+  })
+  return true
+}
+
+/** Reads a conversation to open it: its newest record not yet saved if
+ *  there is one, else the file. Null when it is gone, or was deleted or
+ *  everything cleared while it was being read. */
+export async function loadConversation(id: string): Promise<ChatHistoryRecord | null> {
+  const pending = unsaved.get(id)
+  if (pending) return pending.record
+  const mark = seq
+  const record = (await api()?.get(id).catch(() => null)) ?? null
+  return record && !removedSince(id, mark) ? record : null
+}
+
+export function setActiveConversation(id: string | null): void {
+  if (state.activeId !== id) set({ activeId: id })
+}
+
+export function setChatBusy(busy: boolean): void {
+  if (state.busy !== busy) set({ busy })
+}
+
+/** The chat page registers how to open a conversation and start a new one. */
+export function registerChatPage(open: (id: string) => void, start: () => void): () => void {
+  opener = open
+  starter = start
+  return () => {
+    if (opener === open) opener = null
+    if (starter === start) starter = null
+  }
+}
+
+export function openConversation(id: string): void {
+  opener?.(id)
+}
+
+/** Deletes one conversation; deleting the open one starts a new chat. The
+ *  open one is not deleted while its reply is in flight: the reply would
+ *  save it again. */
+export async function deleteConversation(id: string): Promise<void> {
+  if (state.busy && state.activeId === id) return
+  deletedAt.set(id, ++seq)
+  unsaved.delete(id)
+  // The page leaves the conversation first, synchronously, so nothing sent
+  // while the deletion is on its way can land in it and save it again.
+  if (state.activeId === id) {
+    starter?.()
+    set({ activeId: null })
+  }
+  await api()?.delete(id).catch(() => {})
+  await refreshHistory()
+}
+
+/** Deletes every conversation and starts a new chat; not while a reply is
+ *  in flight, for the same reason. */
+export async function clearConversations(): Promise<void> {
+  if (state.busy) return
+  clearedAt = ++seq
+  unsaved.clear()
+  starter?.()
+  set({ activeId: null })
+  await api()?.clear().catch(() => {})
+  await refreshHistory()
+}
+
+/** For tests: forget everything. */
+export function resetHistoryStore(): void {
+  state = initial
+  unsaved.clear()
+  sleep = realSleep
+  opener = null
+  starter = null
+}

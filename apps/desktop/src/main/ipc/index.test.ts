@@ -1838,6 +1838,31 @@ describe('A4 oMLX IPC hardening', () => {
 // The node-daemon-era `modules:*` IPC (A5 on main) was deleted outright by
 // REV-01 on ab/core: its tests went with the handlers.
 
+describe('UI-02 chat history IPC', () => {
+  it('saves, lists, reads, deletes and clears through the guarded handlers', async () => {
+    fs.rmSync(path.join(settingsDir, 'chat-history'), { recursive: true, force: true })
+    const record = {
+      format: 'agent24.desktop.chat-history', version: 1, id: 'chat_ipc_1', title: '你好',
+      created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z',
+      messages: [{ role: 'user', content: '你好', at: '2026-11-08T00:00:00.000Z', delivered: true }],
+    }
+    expect(await call(IpcChannels.ChatHistoryList)).toEqual([])
+    await call(IpcChannels.ChatHistorySave, record)
+    expect(await call(IpcChannels.ChatHistoryList)).toEqual([
+      { id: 'chat_ipc_1', title: '你好', created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z' },
+    ])
+    expect(await call(IpcChannels.ChatHistoryGet, 'chat_ipc_1')).toEqual(record)
+    await expect(call(IpcChannels.ChatHistorySave, { ...record, version: 9 })).rejects.toThrow('Invalid chat history record')
+    await expect(call(IpcChannels.ChatHistoryGet, '../ui-prefs')).rejects.toThrow('Invalid chat history id')
+    await call(IpcChannels.ChatHistoryDelete, 'chat_ipc_1')
+    expect(await call(IpcChannels.ChatHistoryGet, 'chat_ipc_1')).toBeNull()
+    await call(IpcChannels.ChatHistorySave, record)
+    await call(IpcChannels.ChatHistoryClear)
+    expect(await call(IpcChannels.ChatHistoryList)).toEqual([])
+    fs.rmSync(path.join(settingsDir, 'chat-history'), { recursive: true, force: true })
+  })
+})
+
 describe('D1 navigation preferences IPC', () => {
   it('reads defaults, persists valid preferences and recovers from a damaged file', async () => {
     expect(await call(IpcChannels.NavPrefsGet)).toEqual({ pinned: ['documents', 'design', 'create'], slotCount: 3, showOverview: true })
