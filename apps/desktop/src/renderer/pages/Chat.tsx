@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useMemo } from 'react'
 import { formatReplySuffix, extractServerReported, type ReplyLatency } from './chat-latency'
 import logoWelcome from '../assets/logo-welcome.png'
 import { useT } from '../i18n'
@@ -6,6 +6,8 @@ import { chatMessages } from './Chat.i18n'
 import type { components } from '@agent24/api-client'
 import { askWithKnowledge, createChatSession } from './chat-knowledge'
 import { grounding, type Grounding } from './knowledge-grounding'
+import { TurnRail } from './chat/TurnRail'
+import { activeTurn, buildTurns } from './chat/turns'
 
 /** M1-T14: what `/api/v1/chat` ACTUALLY did with an explicit "记住…" turn —
  *  read off the response field, never off the model's own reply text (the
@@ -57,6 +59,12 @@ export default function ChatPage() {
   // `newChat` below, which swaps in a fresh id.
   const [sessionId, setSessionId] = useState(() => genChatSessionId())
   const bottomRef = useRef<HTMLDivElement>(null)
+  // The turn rail: each turn's prompt element, keyed by message index, and
+  // the turn being read, followed from the scroll position.
+  const messagesRef = useRef<HTMLDivElement>(null)
+  const promptRefs = useRef(new Map<number, HTMLDivElement>())
+  const turns = useMemo(() => buildTurns(messages), [messages])
+  const [currentTurn, setCurrentTurn] = useState(0)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const requestInFlight = useRef(false)
   // Knowledge on: turns go to /runs, in a real session created once.
@@ -71,7 +79,10 @@ export default function ChatPage() {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+    // The page follows the newest turn; so does the rail, even when the chat
+    // is too short to scroll and no scroll event comes.
+    setCurrentTurn(Math.max(0, turns.length - 1))
+  }, [messages, turns])
 
   const send = async (text: string) => {
     if (!text.trim() || requestInFlight.current || awaitingConfirmation) return
@@ -95,6 +106,7 @@ export default function ChatPage() {
     setMessages([])
     setInput('')
     setSessionId(genChatSessionId())
+    setCurrentTurn(0)
     // Knowledge turns run in their own session (`runSession`); a new
     // conversation must not carry the old one's turns into its runs.
     runSession.current = null
@@ -244,6 +256,20 @@ export default function ChatPage() {
     }
   }
 
+  const followScroll = () => {
+    const box = messagesRef.current
+    if (!box) return
+    const tops = turns.map(turn => promptRefs.current.get(turn.messageIndex)?.offsetTop ?? 0)
+    setCurrentTurn(activeTurn(tops, box.scrollTop, box.clientHeight, box.scrollHeight))
+  }
+
+  const jumpToTurn = (turn: number) => {
+    const target = turns[turn]
+    if (!target) return
+    promptRefs.current.get(target.messageIndex)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    setCurrentTurn(turn)
+  }
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
@@ -256,7 +282,8 @@ export default function ChatPage() {
       <div className="chat-toolbar">
         <button className="btn" disabled={loading} onClick={newChat}>{t('newChat')}</button>
       </div>
-      <div className="chat-messages">
+      {turns.length >= 2 && <TurnRail turns={turns} active={currentTurn} onSelect={jumpToTurn} />}
+      <div className="chat-messages" ref={messagesRef} onScroll={followScroll}>
         {messages.length === 0 && (
           <div className="chat-empty">
             <img className="chat-empty-logo" src={logoWelcome} alt="" />
@@ -272,7 +299,9 @@ export default function ChatPage() {
           </div>
         )}
         {messages.map((m, i) => (
-          <div key={i} className={`message ${m.role}`}>
+          <div key={i} className={`message ${m.role}`} ref={m.role === 'user'
+            ? (el: HTMLDivElement | null) => { if (el) promptRefs.current.set(i, el); else promptRefs.current.delete(i) }
+            : undefined}>
             <div className="message-avatar">
               {m.role === 'user' ? '👤' : '🤖'}
             </div>
