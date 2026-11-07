@@ -48,7 +48,10 @@ const PROBE = `
     pc.close()
     r.turn = 'ran'
   } catch { r.turn = 'blocked' }
-  for (const rel of ['preconnect', 'dns-prefetch']) { const l = document.createElement('link'); l.rel = rel; l.href = B; document.head.appendChild(l) }
+  // preconnect opens a TCP connection without a request, so it is seen as a
+  // connection to B. (dns-prefetch is not probed: with an IP literal there is
+  // no lookup, and observing DNS would need a resolver of our own.)
+  { const l = document.createElement('link'); l.rel = 'preconnect'; l.href = B; document.head.appendChild(l) }
   r.ws = await new Promise((d) => {
     try {
       const w = new WebSocket(B.replace(/^http/, 'ws') + '/ws')
@@ -155,7 +158,7 @@ async function main() {
   check('no TURN-over-TCP connection (contract decision #30)', connections.TURN === 0, { turn: r1.turn, connections: connections.TURN })
   check('WebSocket to a foreign host refused', r1.ws !== 'open', r1.ws)
   check('302 to a foreign host not followed', r1.redirect === 'blocked' && !hits.B.includes('/redir-target'), r1.redirect)
-  check('no TCP connection at all to the foreign host (preconnect, dns-prefetch, ws)', connections.B === 0, connections.B)
+  check('no TCP connection at all to the foreign host (preconnect, ws)', connections.B === 0, connections.B)
 
   const wc = view().webContents
   await wc.executeJavaScript(`location.href = ${JSON.stringify(`${originB}/nav`)}`)
@@ -167,15 +170,16 @@ async function main() {
 
   // A second profile: a new instance in a new partition that sees nothing of the first.
   const firstSession = session.fromPartition(partitions[0], { cache: false })
+  const firstView = view()
   binding = 'profile-2'
   host.bindingChanged()
-  check('binding change takes the first instance down', win.contentView.children.length === 0)
+  // On screen, so the host replaces it with the new binding's view at once.
+  check('binding change takes the first instance down', !win.contentView.children.includes(firstView) && win.contentView.children.length === 1)
   // Cleared once the page is destroyed (or after the host's bounded wait).
   await new Promise((d) => setTimeout(d, 2500))
   check('first page destroyed', wc.isDestroyed())
   const cookies1 = await firstSession.cookies.get({})
   check('first partition cleared', cookies1.length === 0, cookies1.length)
-  await host.show({ x: 0, y: 0, width: 800, height: 600 }, 'dark')
   const r2 = await probe()
   check('second profile uses a different non-persistent partition', partitions.length === 2 && partitions[0] !== partitions[1]
     && partitions.every((p) => !p.startsWith('persist:')), partitions)

@@ -367,6 +367,29 @@ describe('KnowledgeViewHost', () => {
     expect(t.host.status()).toEqual({ state: 'ready' })
   })
 
+  it('Off then On again while on screen reopens the page', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    t.env.binding = null
+    t.host.bindingChanged()
+    expect(t.host.status()).toEqual({ state: 'unavailable', code: 'knowledge_off' })
+    t.env.binding = 'https://kb.example.org/api/v1'
+    t.host.bindingChanged()
+    await flush()
+    expect(t.host.status()).toEqual({ state: 'ready' })
+    expect(t.views).toHaveLength(2)
+    expect(t.views[1].visible).toBe(true)
+  })
+
+  it('a settings change while hidden creates nothing', async () => {
+    const t = setup()
+    t.env.binding = null
+    t.host.bindingChanged()
+    t.env.binding = 'https://kb.example.org/api/v1'
+    t.host.bindingChanged()
+    expect(t.views).toHaveLength(0)
+  })
+
   it('Off while on screen says Off at once (U4.8)', async () => {
     const t = setup()
     await t.host.show(BOUNDS)

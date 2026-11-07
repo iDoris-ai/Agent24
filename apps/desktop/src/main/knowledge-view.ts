@@ -431,7 +431,8 @@ export class KnowledgeViewHost {
     }
     // On screen: say why at once (Off), or open the new binding's page
     // (U4.8: the entry states why it is unavailable), never a blank area.
-    if (ended && this.visible && this.bounds) void this.show(this.bounds)
+    // With no instance (Off, then On again) the page is re-evaluated too.
+    if ((ended || !this.instance) && this.visible && this.bounds) void this.show(this.bounds)
   }
 
   /** Binding-level destruction (U4.8) without closing the door: window teardown, tests. */
