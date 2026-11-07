@@ -291,6 +291,22 @@ describe('focus and placement (UI-06 G2, Codex R1)', () => {
     expect(within(list()).getByRole('button', { name: '对话「周报」的操作' })).not.toHaveFocus()
   })
 
+  it('focus waits for a slow move: the ⋯ it goes to is the one in the row\'s new place', async () => {
+    store.createGroup('工作')
+    put('chat_a', '周报')
+    await showList()
+    await within(list()).findByRole('group', { name: '工作' })
+    let land!: () => void
+    bridge.organize.mockImplementationOnce((id: string, p: unknown) => {
+      const answer = store.organize(id, p)
+      return new Promise(r => { land = () => r(answer) })
+    })
+    fireEvent.click(within(openRowMenu('周报')).getByRole('menuitem', { name: '工作' }), { detail: 0 })
+    for (let i = 0; i < 3; i++) await new Promise(r => requestAnimationFrame(r))
+    land()
+    await waitFor(() => expect(within(groupBox('工作')).getByRole('button', { name: '对话「周报」的操作' })).toHaveFocus())
+  })
+
   it('Escape in a menu opened by a right click focuses that row\'s ⋯', async () => {
     put('chat_a', '周报')
     await showList()
