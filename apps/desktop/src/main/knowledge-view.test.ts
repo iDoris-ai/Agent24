@@ -1,3 +1,4 @@
+import net from 'node:net'
 import { describe, expect, it, vi } from 'vitest'
 import {
   KNOWLEDGE_VIEW_DEV_URL_ENV,
@@ -19,6 +20,8 @@ import {
   registerKnowledgeViewIpc,
   withKnowledgeCsp,
   KNOWLEDGE_VIEW_PERMISSIONS_POLICY,
+  knowledgeViewProxyConfig,
+  knowledgeViewBlackhole,
 } from './knowledge-view'
 
 const ORIGIN = 'https://kb.example.org'
@@ -77,6 +80,10 @@ class FakeSession extends FakeEmitter {
   setPermissionRequestHandler(l: Listener) { this.permissionRequest = l }
   setPermissionCheckHandler(l: Listener) { this.permissionCheck = l }
   setDevicePermissionHandler(l: Listener) { this.devicePermission = l }
+  proxy: unknown = null
+  /** Held open by a test to see that nothing loads before the proxy is set. */
+  proxyGate: Promise<void> = Promise.resolve()
+  setProxy(config: unknown) { this.proxy = config; this.log.push('proxy'); return this.proxyGate }
   private record(what: string) { this.cleared.push(what); this.log.push(what); return Promise.resolve() }
   clearStorageData(options?: { storages?: string[] }) { return this.record(options ? `storage:${options.storages?.join(',')}` : 'storage') }
   clearCache() { return this.record('cache') }
@@ -176,10 +183,68 @@ function setup(over: Partial<{ binding: string | null; target: ReturnType<typeof
     clearTimer: (handle: unknown) => { cleared.push(handle as number) },
     log: () => {},
     partitionName: () => `${KNOWLEDGE_VIEW_PARTITION_PREFIX}p${++seq}`,
+    proxyPort: () => Promise.resolve(9),
   } as unknown as KnowledgeViewHostDeps
   const host = new KnowledgeViewHost(deps)
   return { host, views, sessions, states, timers, loadTimers, cleared, env, advance: (ms: number) => { now += ms } }
 }
+
+describe('dead proxy for WebRTC TCP (contract decision #30)', () => {
+  it('sends everything but the exact allowed host:port to the dead proxy, loopback included, no DIRECT', () => {
+    expect(knowledgeViewProxyConfig('https://kb.example.org', 9)).toEqual({
+      mode: 'fixed_servers', proxyRules: 'http://127.0.0.1:9', proxyBypassRules: '<-loopback>;kb.example.org:443',
+    })
+    expect(knowledgeViewProxyConfig('http://127.0.0.1:18282', 9).proxyBypassRules).toBe('<-loopback>;127.0.0.1:18282')
+    expect(knowledgeViewProxyConfig('http://[::1]:7', 9).proxyBypassRules).toBe('<-loopback>;[::1]:7')
+    expect(knowledgeViewProxyConfig('https://kb.example.org:8443', 9).proxyBypassRules).toBe('<-loopback>;kb.example.org:8443')
+    expect(JSON.stringify(knowledgeViewProxyConfig('https://kb.example.org', 9))).not.toMatch(/direct/i)
+  })
+
+  it('loads the page only once the partition proxy is set', async () => {
+    const t = setup()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const original = FakeSession.prototype.setProxy
+    FakeSession.prototype.setProxy = function (this: FakeSession, config: unknown) { this.proxy = config; return gate }
+    try {
+      const shown = t.host.show(BOUNDS)
+      await vi.waitFor(() => expect(t.sessions[0]?.proxy).toEqual(knowledgeViewProxyConfig(ORIGIN, 9)))
+      await new Promise((d) => setTimeout(d, 5))
+      expect(t.views[0].webContents.loads).toEqual([])
+      release()
+      await shown
+      expect(t.views[0].webContents.loads).toEqual([URL_])
+    } finally {
+      FakeSession.prototype.setProxy = original
+    }
+  })
+
+  it('keeps the page unloaded and reports a failed load when the proxy cannot be set', async () => {
+    const t = setup()
+    const original = FakeSession.prototype.setProxy
+    FakeSession.prototype.setProxy = function (this: FakeSession, config: unknown) { this.proxy = config; return Promise.reject(new Error('no proxy')) }
+    try {
+      const result = await t.host.show(BOUNDS)
+      expect(result.ok).toBe(false)
+      expect(t.views[0].webContents.loads).toEqual([])
+      expect(t.states.at(-1)).toMatchObject({ state: 'degraded', code: 'load_failed' })
+    } finally {
+      FakeSession.prototype.setProxy = original
+    }
+  })
+
+  it('has a dead proxy that takes a connection and drops it', async () => {
+    const port = await knowledgeViewBlackhole()
+    expect(await knowledgeViewBlackhole()).toBe(port)
+    const closed = await new Promise<string>((resolve) => {
+      const socket = net.connect(port, '127.0.0.1')
+      socket.on('data', () => resolve('data'))
+      socket.on('close', () => resolve('closed'))
+      socket.on('error', () => resolve('closed'))
+    })
+    expect(closed).toBe('closed')
+  })
+})
 
 describe('knowledgeViewTarget (U4.4)', () => {
   it('takes https, and http only to a loopback IP literal', () => {
@@ -620,7 +685,7 @@ describe('KnowledgeViewHost', () => {
   it('a hide during the load wins over the late load result', async () => {
     const t = setup()
     let finish: () => void = () => {}
-    nextLoad = () => new Promise<void>((resolve) => { finish = resolve })
+    { const pending = new Promise<void>((resolve) => { finish = resolve }); nextLoad = () => pending }
     try {
       const shown = t.host.show(BOUNDS)
       t.host.hide()
@@ -639,7 +704,7 @@ describe('KnowledgeViewHost', () => {
   it('a second show during the first load waits for it instead of loading again', async () => {
     const t = setup()
     let finish: () => void = () => {}
-    nextLoad = () => new Promise<void>((resolve) => { finish = resolve })
+    { const pending = new Promise<void>((resolve) => { finish = resolve }); nextLoad = () => pending }
     try {
       const first = t.host.show(BOUNDS)
       const second = t.host.show(BOUNDS)
@@ -720,6 +785,7 @@ describe('KnowledgeViewHost', () => {
       t.host.hide()
       // Coming back does not start a second load; the first one is still waited for.
       void t.host.show(BOUNDS)
+      await flush() // the page loads once the partition proxy is set (decision #30)
       expect(t.views[0].webContents.loads).toHaveLength(1)
       expect(t.loadTimers.map((x) => x.ms)).toEqual([KNOWLEDGE_VIEW_FIRST_LOAD_TIMEOUT_MS])
       t.loadTimers[0].fn()
@@ -744,7 +810,7 @@ describe('KnowledgeViewHost', () => {
   it('a 4xx/5xx main-frame answer is a failed load with Reload, not ready', async () => {
     const t = setup()
     let finish: () => void = () => {}
-    nextLoad = () => new Promise<void>((resolve) => { finish = resolve })
+    { const pending = new Promise<void>((resolve) => { finish = resolve }); nextLoad = () => pending }
     try {
       const shown = t.host.show(BOUNDS)
       t.views[0].webContents.emit('did-navigate', {}, URL_, 502, 'Bad Gateway')
