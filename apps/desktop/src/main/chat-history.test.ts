@@ -91,6 +91,23 @@ describe('chat history on disk', () => {
     expect(parsed).not.toHaveProperty('extra')
   })
 
+  it('refuses a sparse message list and keeps the previous conversation', () => {
+    const store = createChatHistoryStore(dir)
+    store.save(record('chat_a', '2026-11-08T01:00:00.000Z'))
+    const sparse = record('chat_a', '2026-11-08T02:00:00.000Z')
+    sparse.messages = new Array(3)
+    sparse.messages[0] = { role: 'user', content: 'x', at: '2026-11-08T00:00:00.000Z', delivered: true }
+    expect(() => store.save(sparse)).toThrow('Invalid chat history record')
+    expect(store.get('chat_a')?.updated_at).toBe('2026-11-08T01:00:00.000Z')
+    expect(store.list().map(s => s.id)).toEqual(['chat_a'])
+  })
+
+  it('refuses too many messages before parsing them', () => {
+    const big = record('chat_a', '2026-11-08T01:00:00.000Z')
+    big.messages = Array.from({ length: 100_001 }, () => ({ role: 'user' as const, content: '', at: 'not checked', delivered: true }))
+    expect(() => createChatHistoryStore(dir).save(big)).toThrow('too large')
+  })
+
   it('refuses an oversized record', () => {
     const big = record('chat_a', '2026-11-08T01:00:00.000Z')
     big.messages = [{ role: 'user', content: 'x'.repeat(9 * 1024 * 1024), at: '2026-11-08T00:00:00.000Z', delivered: true }]

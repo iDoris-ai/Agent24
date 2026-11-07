@@ -72,6 +72,8 @@ describe('chat history', () => {
     expect(record.messages.every(m => /Z$/.test(m.at))).toBe(true)
     const item = await within(await screen.findByRole('region', { name: '历史对话' })).findByRole('button', { name: '第一个问题' })
     expect(item).toHaveAttribute('aria-current', 'true')
+    // Saves update the list themselves: the whole list is read once, at mount.
+    expect(chatHistory.list).toHaveBeenCalledTimes(1)
   })
 
   it('opens a saved conversation and continues it under the same session_id', async () => {

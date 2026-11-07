@@ -74,7 +74,13 @@ export async function saveConversation(record: ChatHistoryRecord): Promise<boole
       if (superseded(record.id, mine)) return true
     }
   }
-  await refreshHistory()
+  // The list is updated from the record itself: reading every conversation
+  // again from disk on each save would cost a full scan per chat turn.
+  const summary = { id: record.id, title: record.title, created_at: record.created_at, updated_at: record.updated_at }
+  set({
+    items: [summary, ...state.items.filter(item => item.id !== record.id)]
+      .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at)),
+  })
   return true
 }
 
