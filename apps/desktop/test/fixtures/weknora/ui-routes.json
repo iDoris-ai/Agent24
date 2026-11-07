@@ -1,0 +1,9 @@
+{
+  "source": {
+    "repo": "iDoris-ai/WeKnora",
+    "path": "docs/agent24/ui-routes.json",
+    "commit": null,
+    "note": "Pinned copy of the server's list, replaced verbatim (with its commit) whenever WeKnora changes it."
+  },
+  "routes": []
+}
