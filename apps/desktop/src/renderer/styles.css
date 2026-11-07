@@ -128,15 +128,21 @@ button { cursor: pointer; font-family: var(--font); }
   -webkit-app-region: no-drag;
 }
 .chat-history-item:hover .chat-history-open, .chat-history-item.active .chat-history-open { color: var(--text); }
-.chat-history-delete {
-  width: 28px; padding: 4px 0; background: none; border: none; color: var(--muted); font-size: 14px;
+.chat-history-action {
+  width: 24px; padding: 4px 0; background: none; border: none; color: var(--muted); font-size: 13px;
   opacity: 0; -webkit-app-region: no-drag;
 }
-.chat-history-item:hover .chat-history-delete, .chat-history-delete:focus-visible { opacity: 1; }
-.chat-history-delete:hover { color: var(--text); }
+.chat-history-delete { width: 28px; font-size: 14px; }
+.chat-history-item:hover .chat-history-action, .chat-history-action:focus-visible { opacity: 1; }
+.chat-history-action:hover { color: var(--text); }
 .chat-history-open:disabled, .chat-history-clear:disabled { cursor: default; opacity: 0.4; }
-.chat-history-delete:disabled { cursor: default; }
-.chat-history-item:hover .chat-history-delete:disabled { opacity: 0.4; }
+.chat-history-action:disabled { cursor: default; }
+.chat-history-item:hover .chat-history-action:disabled { opacity: 0.4; }
+.chat-history-rename {
+  flex: 1; min-width: 0; margin: 2px 4px 2px 28px; padding: 3px 4px; font-size: 12.5px;
+  color: var(--text); background: var(--surface); border: 1px solid var(--accent); border-radius: 4px;
+  -webkit-app-region: no-drag;
+}
 .nav-section { font-size: 10px; font-weight: 600; color: var(--muted); padding: 14px 20px 4px; letter-spacing: 0.8px; text-transform: uppercase; }
 
 .sidebar-footer {

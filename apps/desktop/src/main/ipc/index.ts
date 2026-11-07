@@ -657,6 +657,8 @@ export function registerIpcHandlers(options: {
   handle(IpcChannels.ChatHistorySave, (_event, record: unknown) => chatHistory().save(record))
   handle(IpcChannels.ChatHistoryDelete, (_event, id: unknown) => chatHistory().delete(id))
   handle(IpcChannels.ChatHistoryClear, () => chatHistory().clear())
+  handle(IpcChannels.ChatHistorySetTitle, (_event, id: unknown, title: unknown, source: unknown) =>
+    chatHistory().setTitle(id, title, source))
 
   handle(IpcChannels.AppPing, () => 'pong')
   handle(IpcChannels.AppVersion, () => app.getVersion())

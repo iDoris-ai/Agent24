@@ -4,11 +4,13 @@ import path from 'node:path'
 import {
   CHAT_HISTORY_FORMAT,
   CHAT_HISTORY_ID,
+  CHAT_HISTORY_TITLE_SOURCES,
   CHAT_HISTORY_VERSION,
   type ChatHistoryLatency,
   type ChatHistoryMessage,
   type ChatHistoryRecord,
   type ChatHistorySummary,
+  type ChatHistoryTitleSource,
 } from '../shared/chat-history'
 
 /** One conversation's file may not exceed this, so a runaway page cannot
@@ -18,6 +20,15 @@ const MAX_RECORD_BYTES = 8 * 1024 * 1024
  *  left empty: `{"role":"user","content":"","at":"","delivered":true}` is
  *  52; the strings are counted separately below. */
 const MIN_MESSAGE_BYTES = 48
+/** A title set by `setTitle` is at most this many UTF-16 units; the page
+ *  keeps a rename to 80 characters, far below it. */
+const MAX_TITLE_UNITS = 1000
+
+/** A title replaces the one on file only when its source is at least as
+ *  strong: the user's rename over the model's title over the first prompt. */
+const TITLE_RANK: Record<ChatHistoryTitleSource, number> = { prompt: 0, model: 1, user: 2 }
+const isTitleSource = (v: unknown): v is ChatHistoryTitleSource =>
+  typeof v === 'string' && (CHAT_HISTORY_TITLE_SOURCES as readonly string[]).includes(v)
 
 /** A cheap lower bound of the written size, checked before the full parse,
  *  so an oversized save is refused without first parsing and serializing
@@ -76,12 +87,15 @@ function parseMessage(v: unknown): ChatHistoryMessage {
 export function parseChatHistoryRecord(v: unknown): ChatHistoryRecord {
   if (!isObject(v) || v.format !== CHAT_HISTORY_FORMAT || v.version !== CHAT_HISTORY_VERSION
     || typeof v.id !== 'string' || !CHAT_HISTORY_ID.test(v.id) || typeof v.title !== 'string'
+    || (v.title_source !== undefined && !isTitleSource(v.title_source))
     || !isTime(v.created_at) || !isTime(v.updated_at) || !Array.isArray(v.messages)) invalid()
   return {
     format: CHAT_HISTORY_FORMAT,
     version: CHAT_HISTORY_VERSION,
     id: v.id,
     title: v.title,
+    // Files written before the field existed took the first prompt.
+    title_source: v.title_source ?? 'prompt',
     created_at: v.created_at,
     updated_at: v.updated_at,
     // Array.from visits holes as undefined, which parseMessage refuses: a
@@ -89,6 +103,9 @@ export function parseChatHistoryRecord(v: unknown): ChatHistoryRecord {
     messages: Array.from(v.messages as unknown[], parseMessage),
   }
 }
+
+const summaryOf = (r: ChatHistoryRecord): ChatHistorySummary =>
+  ({ id: r.id, title: r.title, title_source: r.title_source, created_at: r.created_at, updated_at: r.updated_at })
 
 /** The main chat's history: one JSON file per conversation under
  *  `<dir>/chat-history/`, written by atomic replacement like nav-prefs.
@@ -116,6 +133,32 @@ export function createChatHistoryStore(dir: string) {
     try { return parseChatHistoryRecord(JSON.parse(fs.readFileSync(file, 'utf8'))) }
     catch { return null }
   }
+  /** The conversation on file under its own id, or null. */
+  const current = (id: string): ChatHistoryRecord | null => {
+    const record = read(fileOf(id))
+    return record && record.id === id ? record : null
+  }
+  const write = (record: ChatHistoryRecord): void => {
+    const body = JSON.stringify(record)
+    if (Buffer.byteLength(body) > MAX_RECORD_BYTES) throw new Error('Chat history record too large')
+    const file = fileOf(record.id)
+    fs.mkdirSync(root, { recursive: true, mode: 0o700 })
+    // A fresh name, created exclusively: never follows or reuses a file
+    // already there, and is ours to remove.
+    const temp = tempOf(record.id)
+    const fd = fs.openSync(temp, 'wx', 0o600)
+    let renamed = false
+    try {
+      try { fs.writeFileSync(fd, body) }
+      finally { fs.closeSync(fd) }
+      fs.renameSync(temp, file)
+      renamed = true
+    } finally {
+      // Ours from the moment it was opened: a failed or partial write
+      // (e.g. a full disk) leaves no piece of the transcript behind.
+      if (!renamed) fs.rmSync(temp, { force: true })
+    }
+  }
   return {
     /** Newest first. */
     list(): ChatHistorySummary[] {
@@ -123,38 +166,43 @@ export function createChatHistoryStore(dir: string) {
         .filter(name => name.endsWith('.json') && CHAT_HISTORY_ID.test(name.slice(0, -5)))
         .flatMap(name => {
           const record = read(path.join(root, name))
-          return record && `${record.id}.json` === name
-            ? [{ id: record.id, title: record.title, created_at: record.created_at, updated_at: record.updated_at }]
-            : []
+          return record && `${record.id}.json` === name ? [summaryOf(record)] : []
         })
         .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at))
     },
     get(id: unknown): ChatHistoryRecord | null {
-      const record = read(fileOf(id))
-      return record && record.id === id ? record : null
+      return current(checkId(id))
     },
-    save(value: unknown): void {
+    /** Writes the conversation and returns its summary as written. The page
+     *  sends the first prompt's title; a stronger title already on file (a
+     *  rename, the model's title) is kept, so neither a later save nor a
+     *  late retry of an older one undoes it. */
+    save(value: unknown): ChatHistorySummary {
       precheck(value)
-      const record = parseChatHistoryRecord(value)
-      const body = JSON.stringify(record)
-      if (Buffer.byteLength(body) > MAX_RECORD_BYTES) throw new Error('Chat history record too large')
-      const file = fileOf(record.id)
-      fs.mkdirSync(root, { recursive: true, mode: 0o700 })
-      // A fresh name, created exclusively: never follows or reuses a file
-      // already there, and is ours to remove.
-      const temp = tempOf(record.id)
-      const fd = fs.openSync(temp, 'wx', 0o600)
-      let renamed = false
-      try {
-        try { fs.writeFileSync(fd, body) }
-        finally { fs.closeSync(fd) }
-        fs.renameSync(temp, file)
-        renamed = true
-      } finally {
-        // Ours from the moment it was opened: a failed or partial write
-        // (e.g. a full disk) leaves no piece of the transcript behind.
-        if (!renamed) fs.rmSync(temp, { force: true })
+      let record = parseChatHistoryRecord(value)
+      const before = current(record.id)
+      if (before && TITLE_RANK[before.title_source] > TITLE_RANK[record.title_source]) {
+        record = { ...record, title: before.title, title_source: before.title_source }
       }
+      write(record)
+      return summaryOf(record)
+    },
+    /** Retitles a conversation already on file: `user` for a rename, `model`
+     *  for a generated title, which never replaces a rename. Returns the
+     *  summary as it now stands, or null when there is no such conversation
+     *  (never creates one: it may have just been deleted). Leaves the
+     *  messages and `updated_at` alone, so a rename does not reorder the list. */
+    setTitle(id: unknown, title: unknown, source: unknown): ChatHistorySummary | null {
+      const own = checkId(id)
+      if (source !== 'user' && source !== 'model') throw new Error('Invalid chat history title source')
+      const text = typeof title === 'string' ? title.replace(/\s+/g, ' ').trim() : ''
+      if (!text || text.length > MAX_TITLE_UNITS) throw new Error('Invalid chat history title')
+      const before = current(own)
+      if (!before) return null
+      if (TITLE_RANK[before.title_source] > TITLE_RANK[source]) return summaryOf(before)
+      const record: ChatHistoryRecord = { ...before, title: text, title_source: source }
+      write(record)
+      return summaryOf(record)
     },
     delete(id: unknown): void {
       const own = checkId(id)

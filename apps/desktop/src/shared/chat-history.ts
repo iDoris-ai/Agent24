@@ -40,14 +40,22 @@ export type ChatHistoryMessage =
     latency: ChatHistoryLatency | null
   }
 
+/** Where a conversation's title came from, strongest first: the user's
+ *  rename, a title the model wrote, or the first prompt cut short. A weaker
+ *  title never replaces a stronger one (main/chat-history.ts). Added within
+ *  version 1: a file without it has the first prompt's title. */
+export type ChatHistoryTitleSource = 'user' | 'model' | 'prompt'
+export const CHAT_HISTORY_TITLE_SOURCES: readonly ChatHistoryTitleSource[] = ['user', 'model', 'prompt']
+
 export interface ChatHistoryRecord {
   format: typeof CHAT_HISTORY_FORMAT
   version: typeof CHAT_HISTORY_VERSION
   id: string
   title: string
+  title_source: ChatHistoryTitleSource
   created_at: string
   updated_at: string
   messages: ChatHistoryMessage[]
 }
 
-export type ChatHistorySummary = Pick<ChatHistoryRecord, 'id' | 'title' | 'created_at' | 'updated_at'>
+export type ChatHistorySummary = Pick<ChatHistoryRecord, 'id' | 'title' | 'title_source' | 'created_at' | 'updated_at'>

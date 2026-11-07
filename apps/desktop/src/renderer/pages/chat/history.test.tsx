@@ -9,21 +9,40 @@ import type { ChatHistoryRecord } from '../../../shared/chat-history'
 
 const proxy = vi.fn()
 let saved: Map<string, ChatHistoryRecord>
-const chatHistory = { list: vi.fn(), get: vi.fn(), save: vi.fn(), delete: vi.fn(), clear: vi.fn() }
+const chatHistory = { list: vi.fn(), get: vi.fn(), save: vi.fn(), delete: vi.fn(), clear: vi.fn(), setTitle: vi.fn() }
+const summary = (r: ChatHistoryRecord) =>
+  ({ id: r.id, title: r.title, title_source: r.title_source, created_at: r.created_at, updated_at: r.updated_at })
+const RANK = { prompt: 0, model: 1, user: 2 } as const
+/** Saves as main does: a stronger title on file is kept (main/chat-history.ts). */
+function put(r: ChatHistoryRecord) {
+  const before = saved.get(r.id)
+  const record = before && RANK[before.title_source] > RANK[r.title_source]
+    ? { ...structuredClone(r), title: before.title, title_source: before.title_source }
+    : structuredClone(r)
+  saved.set(r.id, record)
+  return summary(record)
+}
 /** An in-memory store behind the bridge; reset before every test. */
 function memoryStore() {
   chatHistory.list.mockReset().mockImplementation(async () => [...saved.values()]
-    .map(r => ({ id: r.id, title: r.title, created_at: r.created_at, updated_at: r.updated_at }))
+    .map(summary)
     .sort((a, b) => b.updated_at.localeCompare(a.updated_at)))
   chatHistory.get.mockReset().mockImplementation(async (id: string) => saved.get(id) ?? null)
-  chatHistory.save.mockReset().mockImplementation(async (r: ChatHistoryRecord) => { saved.set(r.id, structuredClone(r)) })
+  chatHistory.save.mockReset().mockImplementation(async (r: ChatHistoryRecord) => put(r))
   chatHistory.delete.mockReset().mockImplementation(async (id: string) => { saved.delete(id) })
   chatHistory.clear.mockReset().mockImplementation(async () => { saved.clear() })
+  chatHistory.setTitle.mockReset().mockImplementation(async (id: string, title: string, source: 'user' | 'model') => {
+    const before = saved.get(id)
+    if (!before) return null
+    if (RANK[before.title_source] > RANK[source]) return summary(before)
+    saved.set(id, { ...before, title, title_source: source })
+    return summary(saved.get(id)!)
+  })
 }
 
 function stored(id: string, title: string, updated: string): ChatHistoryRecord {
   return {
-    format: 'agent24.desktop.chat-history', version: 1, id, title,
+    format: 'agent24.desktop.chat-history', version: 1, id, title, title_source: 'prompt',
     created_at: '2026-11-07T10:00:00.000Z', updated_at: updated,
     messages: [
       { role: 'user', content: title, at: '2026-11-07T10:00:00.000Z', delivered: true },
@@ -54,7 +73,7 @@ function failSave(...nth: number[]) {
   chatHistory.save.mockImplementation(async (r: ChatHistoryRecord) => {
     calls += 1
     if (nth.includes(calls)) throw new Error('ENOSPC')
-    saved.set(r.id, structuredClone(r))
+    return put(r)
   })
 }
 
@@ -404,5 +423,140 @@ describe('chat history', () => {
     send('你好')
     await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
     expect(screen.queryByRole('region', { name: '历史对话' })).toBeNull()
+  })
+})
+
+describe('renaming a conversation (UI-04)', () => {
+  const rename = async (from: string) => {
+    fireEvent.click(within(await findHistoryList()).getByRole('button', { name: `重命名对话：${from}` }))
+    return within(historyList()).getByRole('textbox', { name: '对话标题' }) as HTMLInputElement
+  }
+
+  it('renames with ✎ and Enter; later saves of the conversation keep the new title', async () => {
+    renderBoth()
+    send('第一个问题')
+    await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
+    const id = proxy.mock.calls[0][0].body.session_id
+    await within(await findHistoryList()).findByRole('button', { name: '第一个问题' })
+    const input = await rename('第一个问题')
+    expect(input.value).toBe('第一个问题')
+    fireEvent.change(input, { target: { value: '  周报  草稿 ' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await within(historyList()).findByRole('button', { name: '周报 草稿' })
+    expect(chatHistory.setTitle).toHaveBeenCalledTimes(1)
+    expect(chatHistory.setTitle).toHaveBeenCalledWith(id, '周报 草稿', 'user')
+    await waitFor(() => expect(within(historyList()).getByRole('button', { name: '周报 草稿' })).toHaveFocus())
+    // The next turn saves the first prompt's title again; the rename stays.
+    proxy.mockResolvedValueOnce({ ok: true, status: 200, data: { message: { content: 'ack2' } } })
+    send('第二个问题')
+    await waitFor(() => expect(saved.get(id)?.messages).toHaveLength(4))
+    await waitFor(() => expect(chatHistory.save.mock.calls.at(-1)?.[0].messages).toHaveLength(4))
+    await new Promise(r => setTimeout(r, 0))
+    expect(chatHistory.save.mock.calls.at(-1)?.[0]).toMatchObject({ title: '第一个问题', title_source: 'prompt' })
+    expect(saved.get(id)).toMatchObject({ title: '周报 草稿', title_source: 'user' })
+    expect(within(historyList()).getByRole('button', { name: '周报 草稿' })).toBeInTheDocument()
+    expect(within(historyList()).queryByRole('button', { name: '第一个问题' })).toBeNull()
+  })
+
+  it('Escape, an empty title or the same title change nothing', async () => {
+    saved.set('chat_old_1', stored('chat_old_1', '旧话题', '2026-11-07T10:00:02.000Z'))
+    renderBoth()
+    await within(await findHistoryList()).findByRole('button', { name: '旧话题' })
+    let input = await rename('旧话题')
+    fireEvent.change(input, { target: { value: '不要了' } })
+    fireEvent.keyDown(input, { key: 'Escape' })
+    expect(within(historyList()).queryByRole('textbox')).toBeNull()
+    input = await rename('旧话题')
+    fireEvent.change(input, { target: { value: '   ' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    input = await rename('旧话题')
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await new Promise(r => setTimeout(r, 0))
+    expect(chatHistory.setTitle).not.toHaveBeenCalled()
+    expect(within(historyList()).getByRole('button', { name: '旧话题' })).toBeInTheDocument()
+  })
+
+  it('a double click or F2 starts a rename; leaving the box saves it once', async () => {
+    saved.set('chat_old_1', stored('chat_old_1', '旧话题', '2026-11-07T10:00:02.000Z'))
+    saved.set('chat_old_2', stored('chat_old_2', '另一个', '2026-11-07T09:00:02.000Z'))
+    renderBoth()
+    const list = await findHistoryList()
+    fireEvent.doubleClick(await within(list).findByRole('button', { name: '旧话题' }))
+    let input = within(historyList()).getByRole('textbox', { name: '对话标题' })
+    fireEvent.change(input, { target: { value: '改过的' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    fireEvent.blur(input)
+    await within(historyList()).findByRole('button', { name: '改过的' })
+    fireEvent.keyDown(within(historyList()).getByRole('button', { name: '另一个' }), { key: 'F2' })
+    input = within(historyList()).getByRole('textbox', { name: '对话标题' })
+    fireEvent.change(input, { target: { value: '也改了' } })
+    fireEvent.blur(input)
+    await within(historyList()).findByRole('button', { name: '也改了' })
+    expect(chatHistory.setTitle.mock.calls).toEqual([
+      ['chat_old_1', '改过的', 'user'],
+      ['chat_old_2', '也改了', 'user'],
+    ])
+  })
+
+  it('keeps a rename to 80 characters without splitting one', async () => {
+    saved.set('chat_old_1', stored('chat_old_1', '旧话题', '2026-11-07T10:00:02.000Z'))
+    renderBoth()
+    await within(await findHistoryList()).findByRole('button', { name: '旧话题' })
+    const input = await rename('旧话题')
+    fireEvent.change(input, { target: { value: `${'字'.repeat(79)}👍🏽多余` } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(chatHistory.setTitle).toHaveBeenCalledWith('chat_old_1', `${'字'.repeat(79)}👍🏽`, 'user'))
+  })
+
+  it('a rename answered after its conversation was deleted does not list it again', async () => {
+    saved.set('chat_old_1', stored('chat_old_1', '旧话题', '2026-11-07T10:00:02.000Z'))
+    renderBoth()
+    await within(await findHistoryList()).findByRole('button', { name: '旧话题' })
+    let answer!: (v: unknown) => void
+    chatHistory.setTitle.mockImplementationOnce(() => new Promise(r => { answer = r }))
+    const input = await rename('旧话题')
+    fireEvent.change(input, { target: { value: '新名' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(chatHistory.setTitle).toHaveBeenCalled())
+    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：旧话题' }))
+    await waitFor(() => expect(chatHistory.delete).toHaveBeenCalledWith('chat_old_1'))
+    answer({ ...summary(saved.get('chat_old_1') ?? stored('chat_old_1', '旧话题', '2026-11-07T10:00:02.000Z')), title: '新名', title_source: 'user' })
+    await new Promise(r => setTimeout(r, 0))
+    expect(screen.queryByRole('button', { name: '新名' })).toBeNull()
+    expect(screen.queryByRole('region', { name: '历史对话' })).toBeNull()
+  })
+
+  it('a list read that started before a rename does not undo it', async () => {
+    saved.set('chat_a_1', stored('chat_a_1', '话题甲', '2026-11-07T10:00:02.000Z'))
+    saved.set('chat_b_1', stored('chat_b_1', '话题乙', '2026-11-07T09:00:02.000Z'))
+    renderBoth()
+    await within(await findHistoryList()).findByRole('button', { name: '话题甲' })
+    // Deleting B starts a list read, held here: its snapshot has the old title.
+    const snapshot = await chatHistory.list()
+    let listed!: (v: unknown) => void
+    chatHistory.list.mockImplementationOnce(() => new Promise(r => { listed = r }))
+    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：话题乙' }))
+    await waitFor(() => expect(chatHistory.list).toHaveBeenCalledTimes(3))
+    const input = await rename('话题甲')
+    fireEvent.change(input, { target: { value: '甲改名' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await within(historyList()).findByRole('button', { name: '甲改名' })
+    listed(snapshot.filter((s: { id: string }) => s.id !== 'chat_b_1'))
+    await new Promise(r => setTimeout(r, 0))
+    expect(within(historyList()).getByRole('button', { name: '甲改名' })).toBeInTheDocument()
+    expect(within(historyList()).queryByRole('button', { name: '话题甲' })).toBeNull()
+  })
+
+  it('a failed rename keeps the old title', async () => {
+    saved.set('chat_old_1', stored('chat_old_1', '旧话题', '2026-11-07T10:00:02.000Z'))
+    chatHistory.setTitle.mockRejectedValueOnce(new Error('EACCES'))
+    renderBoth()
+    await within(await findHistoryList()).findByRole('button', { name: '旧话题' })
+    const input = await rename('旧话题')
+    fireEvent.change(input, { target: { value: '新名' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(chatHistory.setTitle).toHaveBeenCalled())
+    await new Promise(r => setTimeout(r, 0))
+    expect(within(historyList()).getByRole('button', { name: '旧话题' })).toBeInTheDocument()
   })
 })

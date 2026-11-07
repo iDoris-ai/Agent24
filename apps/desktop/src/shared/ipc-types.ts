@@ -10,6 +10,7 @@ export const IpcChannels = {
   ChatHistorySave: 'chat-history:save',
   ChatHistoryDelete: 'chat-history:delete',
   ChatHistoryClear: 'chat-history:clear',
+  ChatHistorySetTitle: 'chat-history:set-title',
   CliToolOpenSettings: 'cli-tool:open-settings',
   CliToolStatus: 'cli-tool:status',
   CliToolInstall: 'cli-tool:install',

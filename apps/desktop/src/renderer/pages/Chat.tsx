@@ -8,6 +8,7 @@ import { askWithKnowledge, createChatSession } from './chat-knowledge'
 import { grounding, type Grounding } from './knowledge-grounding'
 import { TurnRail } from './chat/TurnRail'
 import { activeTurn, buildTurns } from './chat/turns'
+import { promptTitle } from './chat/title'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../shared/chat-history'
 import { loadConversation, registerChatPage, saveConversation, setActiveConversation, setChatBusy } from './chat/history'
 
@@ -42,19 +43,18 @@ interface AssistantMessage {
   runId?: string
 }
 
-/** Characters of the first prompt used as a conversation's title. */
-const TITLE_CHARS = 60
-
 /** UI-03: the conversation as the history keeps it. `stamps[i]` is when
  *  message i arrived; the history keeps text, delivery and the latency line,
  *  not the receipt or Knowledge labels. */
 function toRecord(id: string, messages: Message[], stamps: readonly string[]): ChatHistoryRecord {
-  const first = (messages.find(m => m.role === 'user')?.content ?? '').replace(/\s+/g, ' ').trim()
   return {
     format: CHAT_HISTORY_FORMAT,
     version: CHAT_HISTORY_VERSION,
     id,
-    title: first.length > TITLE_CHARS ? `${first.slice(0, TITLE_CHARS)}…` : first,
+    // Always the first prompt's: main keeps a rename or the model's title
+    // already on file over it (UI-04).
+    title: promptTitle(messages.find(m => m.role === 'user')?.content ?? ''),
+    title_source: 'prompt',
     created_at: stamps[0] ?? '',
     updated_at: stamps.slice(0, messages.length).reduce((a, b) => (b > a ? b : a), ''),
     messages: messages.map((m, i) => m.role === 'user'

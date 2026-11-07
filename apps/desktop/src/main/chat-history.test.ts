@@ -15,6 +15,7 @@ function record(id: string, updated: string, title = id): ChatHistoryRecord {
     version: CHAT_HISTORY_VERSION,
     id,
     title,
+    title_source: 'prompt',
     created_at: '2026-11-08T00:00:00.000Z',
     updated_at: updated,
     messages: [
@@ -52,8 +53,8 @@ describe('chat history on disk', () => {
     store.save(record('chat_a', '2026-11-08T03:00:00.000Z', 'renamed'))
     store.save(record('chat_b', '2026-11-08T02:00:00.000Z'))
     expect(store.list()).toEqual([
-      { id: 'chat_a', title: 'renamed', created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T03:00:00.000Z' },
-      { id: 'chat_b', title: 'chat_b', created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T02:00:00.000Z' },
+      { id: 'chat_a', title: 'renamed', title_source: 'prompt', created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T03:00:00.000Z' },
+      { id: 'chat_b', title: 'chat_b', title_source: 'prompt', created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T02:00:00.000Z' },
     ])
     store.delete('chat_a')
     expect(store.get('chat_a')).toBeNull()
@@ -78,12 +79,24 @@ describe('chat history on disk', () => {
     ['a local time without zone', { updated_at: '2026-11-08T09:00:00' }],
     ['a time with an offset', { updated_at: '2026-11-08T09:00:00+08:00' }],
     ['a bad message', { messages: [{ role: 'system', content: 'x', at: '2026-11-08T00:00:00.000Z' }] }],
+    ['an unknown title source', { title_source: 'robot' }],
+    ['a null title source', { title_source: null }],
     ['a user message without delivery', { messages: [{ role: 'user', content: 'x', at: '2026-11-08T00:00:00.000Z' }] }],
   ])('refuses a record with %s and keeps the previous file', (_name, patch) => {
     const store = createChatHistoryStore(dir)
     store.save(record('chat_a', '2026-11-08T01:00:00.000Z'))
     expect(() => store.save({ ...record('chat_a', '2026-11-08T05:00:00.000Z'), ...patch })).toThrow()
     expect(store.get('chat_a')?.updated_at).toBe('2026-11-08T01:00:00.000Z')
+  })
+
+  it('reads a version 1 file written before title_source as the first prompt\'s title', () => {
+    const old: Partial<ChatHistoryRecord> = record('chat_a', '2026-11-08T01:00:00.000Z', '旧标题')
+    delete old.title_source
+    fs.mkdirSync(path.join(dir, 'chat-history'))
+    fs.writeFileSync(path.join(dir, 'chat-history', 'chat_a.json'), JSON.stringify(old))
+    const store = createChatHistoryStore(dir)
+    expect(store.get('chat_a')).toMatchObject({ title: '旧标题', title_source: 'prompt' })
+    expect(store.list()).toEqual([expect.objectContaining({ id: 'chat_a', title_source: 'prompt' })])
   })
 
   it('drops unknown fields instead of storing them', () => {
@@ -187,5 +200,79 @@ describe('chat history on disk', () => {
     expect(store.list().map(s => s.id)).toEqual(['chat_a'])
     expect(store.get('chat_b')).toBeNull()
     expect(store.get('chat_c')).toBeNull()
+  })
+})
+
+describe('chat history titles (UI-04)', () => {
+  const at = '2026-11-08T01:00:00.000Z'
+  const later = '2026-11-08T02:00:00.000Z'
+  const onDisk = (id: string) => JSON.parse(fs.readFileSync(path.join(dir, 'chat-history', `${id}.json`), 'utf8'))
+
+  it('a save returns the summary as written', () => {
+    expect(createChatHistoryStore(dir).save(record('chat_a', at, '问'))).toEqual(
+      { id: 'chat_a', title: '问', title_source: 'prompt', created_at: '2026-11-08T00:00:00.000Z', updated_at: at })
+  })
+
+  it('a rename is kept over every later save of the first prompt\'s title', () => {
+    const store = createChatHistoryStore(dir)
+    store.save(record('chat_a', at, '首问'))
+    expect(store.setTitle('chat_a', ' 周报\n草稿 ', 'user')).toMatchObject({ title: '周报 草稿', title_source: 'user', updated_at: at })
+    // A later save, or a late retry of an older one, carries the first prompt.
+    const summary = store.save(record('chat_a', later, '首问'))
+    expect(summary).toMatchObject({ title: '周报 草稿', title_source: 'user', updated_at: later })
+    expect(onDisk('chat_a')).toMatchObject({ title: '周报 草稿', title_source: 'user', updated_at: later })
+    expect(store.get('chat_a')?.messages).toHaveLength(3)
+    // Renaming again replaces the rename.
+    expect(store.setTitle('chat_a', '又改', 'user')).toMatchObject({ title: '又改', title_source: 'user' })
+  })
+
+  it('the model\'s title replaces the first prompt\'s, and is kept over it, but never over a rename', () => {
+    const store = createChatHistoryStore(dir)
+    store.save(record('chat_a', at, '首问'))
+    expect(store.setTitle('chat_a', '模型标题', 'model')).toMatchObject({ title: '模型标题', title_source: 'model' })
+    expect(store.save(record('chat_a', later, '首问'))).toMatchObject({ title: '模型标题', title_source: 'model' })
+    store.setTitle('chat_a', '我的', 'user')
+    // A model title arriving after the rename is refused; the rename stands.
+    expect(store.setTitle('chat_a', '迟到的模型标题', 'model')).toMatchObject({ title: '我的', title_source: 'user' })
+    expect(onDisk('chat_a')).toMatchObject({ title: '我的', title_source: 'user' })
+  })
+
+  it('a save with a stronger title replaces a weaker one on file', () => {
+    const store = createChatHistoryStore(dir)
+    store.save(record('chat_a', at, '首问'))
+    expect(store.save({ ...record('chat_a', later, '自带'), title_source: 'user' })).toMatchObject({ title: '自带', title_source: 'user' })
+  })
+
+  it('retitles only a conversation on file: never creates one', () => {
+    const store = createChatHistoryStore(dir)
+    expect(store.setTitle('chat_gone', '名', 'user')).toBeNull()
+    expect(fs.existsSync(path.join(dir, 'chat-history', 'chat_gone.json'))).toBe(false)
+    store.save(record('chat_a', at))
+    store.delete('chat_a')
+    expect(store.setTitle('chat_a', '名', 'model')).toBeNull()
+    expect(store.list()).toEqual([])
+  })
+
+  it.each([
+    ['a bad id', '../x', '名', 'user', 'Invalid chat history id'],
+    ['an unknown source', 'chat_a', '名', 'robot', 'Invalid chat history title source'],
+    ['the prompt as source', 'chat_a', '名', 'prompt', 'Invalid chat history title source'],
+    ['an empty title', 'chat_a', ' \n ', 'user', 'Invalid chat history title'],
+    ['a title that is not text', 'chat_a', 3, 'user', 'Invalid chat history title'],
+    ['an overlong title', 'chat_a', 'x'.repeat(1001), 'user', 'Invalid chat history title'],
+  ])('refuses a retitle with %s and keeps the title', (_name, id, title, source, error) => {
+    const store = createChatHistoryStore(dir)
+    store.save(record('chat_a', at, '首问'))
+    expect(() => store.setTitle(id, title, source)).toThrow(error)
+    expect(store.get('chat_a')).toMatchObject({ title: '首问', title_source: 'prompt' })
+  })
+
+  it('a retitle writes through a fresh temporary file like a save', () => {
+    const store = createChatHistoryStore(dir)
+    store.save(record('chat_a', at, '首问'))
+    const open = vi.spyOn(fs, 'openSync')
+    store.setTitle('chat_a', '名', 'user')
+    expect(open).toHaveBeenCalledWith(expect.stringMatching(/chat_a\.json\.[0-9a-f]{12}\.tmp$/), 'wx', 0o600)
+    expect(fs.readdirSync(path.join(dir, 'chat-history'))).toEqual(['chat_a.json'])
   })
 })
