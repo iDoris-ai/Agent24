@@ -19,8 +19,8 @@
 //
 // This slice has no session and no bridge: the ticket/JWT injection is
 // KB-C2-04a and the message bridge KB-C2-04b, which add U4.7 ①–③ in front of
-// the destruction steps here. Until KB-C2-06 (#1625) binds the page address to
-// the Knowledge settings, the address comes from a development-only variable.
+// the destruction steps here. The page address comes from the Knowledge
+// settings (#1625); a development-only variable can override it.
 //
 // Nothing here touches the Creative view: it has its own module, partitions,
 // channels and teardown.
@@ -72,6 +72,37 @@ export function knowledgeViewTarget(value: unknown): KnowledgeViewTarget | null 
   const scheme = url.protocol === 'https:' || (url.protocol === 'http:' && loopback)
   if (!scheme || url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== '') return null
   return { origin: url.origin, url: url.href }
+}
+
+/** KB-C2-02 (WeKnora#134): the embed page is served from the API's own
+ * origin, at its root (v1 has no sub-path deployment). */
+export const KNOWLEDGE_VIEW_EMBED_PATH = '/embed-admin/knowledge-bases'
+
+/** The page for the endpoint saved in the Knowledge settings: its origin plus
+ * the fixed embed path. The allowed origin is the endpoint's origin (U4.4);
+ * nothing else is stored or taken from the server. */
+export function settingsKnowledgeViewTarget(endpoint: unknown): KnowledgeViewTarget | null {
+  if (typeof endpoint !== 'string' || endpoint === '') return null
+  let url: URL
+  try {
+    url = new URL(endpoint)
+  } catch {
+    return null
+  }
+  url.search = ''
+  url.hash = ''
+  url.pathname = '/'
+  const api = knowledgeViewTarget(url.href)
+  return api ? { origin: api.origin, url: api.origin + KNOWLEDGE_VIEW_EMBED_PATH } : null
+}
+
+/** The development variable wins outside a packaged build; otherwise the settings. */
+export function resolveKnowledgeViewTarget(
+  env: Record<string, string | undefined>,
+  packaged: boolean,
+  endpoint: unknown,
+): KnowledgeViewTarget | null {
+  return devKnowledgeViewTarget(env, packaged) ?? settingsKnowledgeViewTarget(endpoint)
 }
 
 /** The development address; a packaged build never reads it. */

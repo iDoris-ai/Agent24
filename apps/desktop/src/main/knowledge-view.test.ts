@@ -7,6 +7,8 @@ import {
   KnowledgeViewHost,
   type KnowledgeViewHostDeps,
   devKnowledgeViewTarget,
+  resolveKnowledgeViewTarget,
+  settingsKnowledgeViewTarget,
   isAllowedDocument,
   isAllowedRequest,
   knowledgeViewCsp,
@@ -177,6 +179,25 @@ describe('knowledgeViewTarget (U4.4)', () => {
       'https://kb.example.org/?token=x', 'https://kb.example.org/#t', 'not a url', 42, undefined]) {
       expect(knowledgeViewTarget(bad)).toBeNull()
     }
+  })
+
+  it('derives the page from the settings endpoint: its origin plus the fixed embed path (#1625)', () => {
+    expect(settingsKnowledgeViewTarget('https://kb.example.org/api/v1')).toEqual({ origin: ORIGIN, url: `${ORIGIN}/embed-admin/knowledge-bases` })
+    expect(settingsKnowledgeViewTarget('http://127.0.0.1:18282/api/v1')).toEqual({
+      origin: 'http://127.0.0.1:18282', url: 'http://127.0.0.1:18282/embed-admin/knowledge-bases',
+    })
+    expect(settingsKnowledgeViewTarget('http://[::1]:9000')?.url).toBe('http://[::1]:9000/embed-admin/knowledge-bases')
+    for (const bad of ['', 'http://10.0.0.2/api/v1', 'http://localhost:18282/api/v1', 'https://u:p@kb.example.org/api/v1', 'file:///x', 'nope', undefined, 7]) {
+      expect(settingsKnowledgeViewTarget(bad)).toBeNull()
+    }
+  })
+
+  it('the development variable overrides the settings only outside a packaged build', () => {
+    const env = { [KNOWLEDGE_VIEW_DEV_URL_ENV]: 'http://127.0.0.1:5000/embed-admin/knowledge-bases' }
+    expect(resolveKnowledgeViewTarget(env, false, 'https://kb.example.org/api/v1')?.origin).toBe('http://127.0.0.1:5000')
+    expect(resolveKnowledgeViewTarget(env, true, 'https://kb.example.org/api/v1')?.origin).toBe(ORIGIN)
+    expect(resolveKnowledgeViewTarget({}, false, 'https://kb.example.org/api/v1')?.origin).toBe(ORIGIN)
+    expect(resolveKnowledgeViewTarget({}, true, '')).toBeNull()
   })
 
   it('reads the development variable only when not packaged', () => {

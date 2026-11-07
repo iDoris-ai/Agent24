@@ -3,6 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import KnowledgePage from './Knowledge'
+import { CapabilitiesContext } from '../capabilities/types'
 import { setLocale } from '../i18n'
 import type { KnowledgeViewState } from '../../shared/ipc-types'
 
@@ -59,11 +60,22 @@ describe('KnowledgePage', () => {
     expect(show.mock.calls[0][1]).toBe('dark')
   })
 
-  it('says why when Knowledge is off, without a reload button', async () => {
+  it('not connected: says so in plain words and offers Settings, not Reload', async () => {
     show.mockResolvedValue({ ok: false, code: 'knowledge_off' })
+    const open = vi.fn()
+    render(<CapabilitiesContext.Provider value={{ defs: [], open, approvalsWaiting: 0 }}><KnowledgePage /></CapabilitiesContext.Provider>)
+    expect(await screen.findByText(/Knowledge is not connected yet/)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Reload' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Open Settings' }))
+    expect(open).toHaveBeenCalledWith('settings/connections', 'other')
+  })
+
+  it('no Settings button once the page is up or merely reloadable', async () => {
     render(<KnowledgePage />)
-    expect(await screen.findByText(/Knowledge is off/)).toBeTruthy()
-    expect(screen.queryByRole('button')).toBeNull()
+    await waitFor(() => expect(show).toHaveBeenCalled())
+    act(() => stateListener?.({ state: 'degraded', code: 'load_failed' }))
+    expect(screen.getByRole('button', { name: 'Reload' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Open Settings' })).toBeNull()
   })
 
   it('offers reload after a crash loop, and reload asks main for a new instance', async () => {

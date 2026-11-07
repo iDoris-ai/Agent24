@@ -45,7 +45,7 @@ import { KnowledgeLoginStore } from './knowledge-logins'
 import { KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
 // KB-C2-03: the KnowledgeView lives in its own module; the lines that wire it
 // in below are additions only and leave the Creative view's paths untouched.
-import { KnowledgeViewHost, devKnowledgeViewTarget, registerKnowledgeViewIpc } from './knowledge-view'
+import { KnowledgeViewHost, registerKnowledgeViewIpc, resolveKnowledgeViewTarget } from './knowledge-view'
 
 const isDev = process.env.NODE_ENV === 'development'
 setBundledPackaged(app.isPackaged)
@@ -471,7 +471,7 @@ app.whenReady().then(async () => {
     window: () => mainWin,
     createView: (webPreferences) => new WebContentsView({ webPreferences }),
     sessionFor: (partition) => session.fromPartition(partition, { cache: false }),
-    target: () => devKnowledgeViewTarget(process.env, app.isPackaged),
+    target: () => resolveKnowledgeViewTarget(process.env, app.isPackaged, knowledge?.status().endpoint),
     binding: () => knowledge?.viewBinding() ?? null,
     packaged: app.isPackaged,
     onState: (state) => {

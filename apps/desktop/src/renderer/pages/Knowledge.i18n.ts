@@ -3,8 +3,8 @@ import { defineMessages } from '../i18n'
 export const knowledgeViewMessages = defineMessages({
   en: {
     'loading': 'Opening the knowledge page…',
-    'unavailable.knowledge_off': 'Knowledge is off. Turn it on and connect a knowledge base in Settings to open this page.',
-    'unavailable.not_configured': 'No knowledge page address is set yet.',
+    'unavailable.knowledge_off': 'Knowledge is not connected yet. Connect your knowledge service and turn it on in Settings to see your materials here.',
+    'unavailable.not_configured': 'The knowledge service address in Settings cannot be opened here. Use an https address, or http on this computer only.',
     'unavailable.partition_limit': 'The knowledge page was reopened too many times. Restart Agent24 to open it again.',
     'unavailable.window_unavailable': 'The Agent24 window is not ready.',
     'degraded.crashed': 'The knowledge page stopped responding. Reopening…',
@@ -13,11 +13,12 @@ export const knowledgeViewMessages = defineMessages({
     'degraded.unresponsive': 'The knowledge page is not responding.',
     'closed.crash_loop': 'The knowledge page keeps crashing, so it was closed.',
     'action.reload': 'Reload',
+    'action.openSettings': 'Open Settings',
   },
   zh: {
     'loading': '正在打开知识页…',
-    'unavailable.knowledge_off': '知识库已关闭。请在设置里打开并连接知识库后再打开此页。',
-    'unavailable.not_configured': '还没有设置知识页地址。',
+    'unavailable.knowledge_off': '还没有连接知识库。请在设置里连接你的知识服务并打开，就能在这里看到自己的资料。',
+    'unavailable.not_configured': '设置里的知识服务地址无法在这里打开。请用 https 地址，或者只在本机用 http。',
     'unavailable.partition_limit': '知识页重新打开的次数太多，请重启 Agent24 后再打开。',
     'unavailable.window_unavailable': 'Agent24 窗口还没准备好。',
     'degraded.crashed': '知识页停止响应，正在重新打开…',
@@ -26,11 +27,12 @@ export const knowledgeViewMessages = defineMessages({
     'degraded.unresponsive': '知识页没有响应。',
     'closed.crash_loop': '知识页反复崩溃，已关闭。',
     'action.reload': '重新加载',
+    'action.openSettings': '打开设置',
   },
   th: {
     'loading': 'กำลังเปิดหน้าคลังความรู้…',
-    'unavailable.knowledge_off': 'คลังความรู้ปิดอยู่ เปิดและเชื่อมต่อคลังความรู้ในการตั้งค่าก่อนเปิดหน้านี้',
-    'unavailable.not_configured': 'ยังไม่ได้ตั้งที่อยู่หน้าคลังความรู้',
+    'unavailable.knowledge_off': 'ยังไม่ได้เชื่อมต่อคลังความรู้ เชื่อมต่อบริการความรู้และเปิดใช้งานในการตั้งค่า แล้วจะเห็นเอกสารของคุณที่นี่',
+    'unavailable.not_configured': 'ที่อยู่บริการความรู้ในการตั้งค่าเปิดที่นี่ไม่ได้ ใช้ที่อยู่ https หรือ http เฉพาะในเครื่องนี้เท่านั้น',
     'unavailable.partition_limit': 'เปิดหน้าคลังความรู้ใหม่หลายครั้งเกินไป รีสตาร์ท Agent24 แล้วเปิดอีกครั้ง',
     'unavailable.window_unavailable': 'หน้าต่าง Agent24 ยังไม่พร้อม',
     'degraded.crashed': 'หน้าคลังความรู้หยุดตอบสนอง กำลังเปิดใหม่…',
@@ -39,5 +41,6 @@ export const knowledgeViewMessages = defineMessages({
     'degraded.unresponsive': 'หน้าคลังความรู้ไม่ตอบสนอง',
     'closed.crash_loop': 'หน้าคลังความรู้ล่มซ้ำ ๆ จึงถูกปิด',
     'action.reload': 'โหลดใหม่',
+    'action.openSettings': 'เปิดการตั้งค่า',
   },
 })

@@ -3,8 +3,9 @@
 // the view, its address and its isolation (main/knowledge-view.ts). The
 // sidebar entry that opens this page comes with #1625.
 
-import { useEffect, useRef, useState } from 'react'
+import { useContext, useEffect, useRef, useState } from 'react'
 import type { KnowledgeViewResult, KnowledgeViewState, KnowledgeViewTheme } from '../../shared/ipc-types'
+import { CapabilitiesContext } from '../capabilities/types'
 import { useT } from '../i18n'
 import { knowledgeViewMessages } from './Knowledge.i18n'
 
@@ -19,6 +20,9 @@ function currentTheme(el: HTMLElement | null): KnowledgeViewTheme {
 }
 
 type Shown = { kind: 'message'; key: string; reloadable: boolean } | null
+
+/** Not bound yet, or Off: the way out is the Knowledge binding in Settings (KB-C1). */
+const SETTINGS_KEYS = new Set(['unavailable.knowledge_off', 'unavailable.not_configured'])
 
 function shownFor(result: KnowledgeViewResult | null, state: KnowledgeViewState | null): Shown {
   if (state) {
@@ -38,6 +42,7 @@ function shownFor(result: KnowledgeViewResult | null, state: KnowledgeViewState 
 
 export default function KnowledgePage(): JSX.Element {
   const t = useT(knowledgeViewMessages)
+  const { open } = useContext(CapabilitiesContext)
   const hostRef = useRef<HTMLDivElement>(null)
   const [result, setResult] = useState<KnowledgeViewResult | null>(null)
   const [state, setState] = useState<KnowledgeViewState | null>(null)
@@ -80,6 +85,9 @@ export default function KnowledgePage(): JSX.Element {
         <div className="knowledge-message" role="status">
           <div>{t(shown.key as Parameters<typeof t>[0])}</div>
           {shown.reloadable && <button className="btn btn-primary" type="button" onClick={reload}>{t('action.reload')}</button>}
+          {SETTINGS_KEYS.has(shown.key) && (
+            <button className="btn btn-primary" type="button" onClick={() => open('settings/connections', 'other')}>{t('action.openSettings')}</button>
+          )}
         </div>
       )}
     </div>
