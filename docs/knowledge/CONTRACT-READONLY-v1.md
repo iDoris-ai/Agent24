@@ -1,7 +1,7 @@
 # Knowledge 只读接入契约 v1（CONTRACT-READONLY-v1）
 
-> **状态**：v1 r10，已随 KB-R1/R2 实施（KB-R1：wire 类型与传输层；KB-R2：主对话的 search 与 read）。§0.3 的草案期已结束，语义变更按该节升主版本。服务端的已知差距见 §13。例外：KB-R2 的客户端只发单次 search 与 read，没有 R3.7 的跨 `score_space` 分组合并，也没有 R8、R9 的就绪探测、能力发现与兼容判定（CONTRACT-STATE §12）；开发者预览用 retrieve key 和样本数据，R1.3 的用户级凭据签发没有实施（#992、KB-C1-03）。
-> **版本**：契约 v1（报文字段 `protocol_version: 1`），文档修订 r10 · **日期**：2026-10-22 · **作者**：David Xu
+> **状态**：v1 r11，已随 KB-R1/R2 实施（KB-R1：wire 类型与传输层；KB-R2：主对话的 search 与 read）。§0.3 的草案期已结束，语义变更按该节升主版本。服务端的已知差距见 §13。例外：KB-R2 的客户端只发单次 search 与 read，没有 R3.7 的跨 `score_space` 分组合并，也没有 R8、R9 的就绪探测、能力发现与兼容判定（CONTRACT-STATE §12）；开发者预览用 retrieve key 和样本数据，R1.3 的用户级凭据签发没有实施（#992、KB-C1-03）。
+> **版本**：契约 v1（报文字段 `protocol_version: 1`），文档修订 r11 · **日期**：2026-11-08 · **作者**：David Xu
 > **Issue**：#1011（KB-CT-02a），阶段 #1000；探测依据 iDoris-ai/WeKnora#5。
 > **依据**：任务方案 v2.1（方案全文见 #986 第一条评论）。每条规则后方括号里是来源：决策 `[D1]`–`[D8]`（方案 §1），或任务条目与方案章节（如 `[KB-C1-04]`、`[KB-C1-01b-b]`、`[方案 §4]`）。
 > `[新设]` 表示本文新设计、在决策与方案里都找不到依据的规则；与其他标签并列（如 `[D1+新设]`）时，表示在该依据之上新增的部分。所有 `[新设]` 已随 #1044 及后续修订评审合入（§12 #15）。
@@ -61,6 +61,7 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
 - **R1.5** [D2] 服务端只信凭据里绑定的 principal。`direct` 模式（直接读 `X-External-User-ID`，`auth.go:580-594`）在集成模式下必须拒绝；改 principal Mode 不算撤权手段（矩阵 #11）。
 - **R1.6** [D2] 防重放要求凭据标识配有撤销或消费机制；只有 jti 字段不算防重放。上游 signed_token 无 jti、无单主体撤销（矩阵 #2、#11）。
 - **R1.7** [D2] 凭据不进 renderer、URL、普通日志，不跨 origin 发送（KB-HOST-01、KB-C1-02b）。
+- **R1.8** [新设，r11] C 还可以用来签发和撤销 UI 票据（`CONTRACT-UI-BRIDGE-v1` U2、U3.7）。这两个用途不算数据操作，不扩大 R2.7 的操作范围；签发时仍按 §2 计算 E，空集即拒（R2.3）。UI 票据换出的 session JWT 不是 C：它不能调用 search 与 read，C 也不能调用 UI 入口（UI-BRIDGE U1.3）（UI-BRIDGE 决定 #25，David 2026-11-08 确认）。
 - **差距**：上游 principal 不参与 KB ACL，不进审计，且决定会话、记忆、MCP OAuth、沙箱凭据归属（矩阵 #2）→ KB-C1-03；集成模式下关闭 direct、限制服务端签发入口 → KB-C1-03、KB-C1-01。
 
 ## 2. 范围语义
@@ -71,7 +72,20 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
 - **R2.4** [D2] **永不回写空数组**：任何一方在收窄后得到空集时，必须拒绝，不得把 `[]` 写进下游请求、凭据或配置。上游在多处把空列表当"全部"或"回退到默认"。
 - **R2.5** [D2+新设] **search 与 read 都必须带 `scope.knowledge_base_ids`**（就绪请求可选，见 R8.2）。Q 缺失、为 `[]` 或无法解析，一律返回 `invalid_request`；C 缺失或无法解析返回 `unauthorized`，`reason: "credential_invalid"`（C 为空集按 R2.2）。Q 与 A ∩ C 部分重叠时按交集执行，响应用 `effective_scope` 回报实际范围，不说明其余 ID 是不存在还是无权；`effective_scope` 比请求范围窄时，Tool 层必须标出"范围已被收窄"。
 - **R2.6** [新设] **越界资源与不存在不可区分**：这里的资源只指 `knowledge_id` 对应的文档。read 的目标文档必须落在 E 内；落在 E 之外时，返回与"不存在"完全相同的 `not_found`（同码、同 message、无 reason）。正在删除（deleting）、草稿（parse_status 为 draft，包括已发布后改回草稿的手工知识）与状态无法识别的文档视同不存在（r9、r10）。这些文档的 parse_status 都不是 completed 或 finalizing，没有构建，也就没有可服务分块（R5.1），所以 search 同样不会返回它们的任何分块（R3.9）；上游把手工知识改回草稿时会同时把 parse_status 写为 draft。**判定以知识行的 parse_status 为准**（r10）：元数据里的草稿状态不单独作为判据，read、search 与就绪用同一个字段，结果彼此一致。文档本身的判定（不存在、越界、正在删除、草稿、状态无法识别）对带与不带 `chunk_id` 的 read 都适用，一律返回 `not_found`，并且先于锚点与修订判定（R6.4，r10）；文档判定通过之后，`chunk_id` 指向的分块问题按锚点校验（R4.4），不走这条。search 结果永远不含 E 之外的资源。示例见 §11.2。
-- **R2.7** [D3/D4] v1 凭据的操作范围只含 search 与 read；下载原件、preview、`/files` 不在 v1 内（矩阵 #5、#6；谁可下载原件待决 #996）。集成模式不消费既存的组织共享与共享 Agent 授权（`internal/application/access/knowledgebase.go:120-154`）。
+- **R2.7** [D3/D4] v1 凭据的操作范围只含 search 与 read；下载原件、preview、`/files` 不在 v1 内（矩阵 #5、#6；谁可下载原件待决 #996）。集成模式不消费既存的组织共享与共享 Agent 授权（`internal/application/access/knowledgebase.go:120-154`）。UI 会话的范围分两个维度，规定见 R2.8：它的**数据范围**（知识库集合）是 C 的子集；它的**操作清单**（`ops`）是 R2.8 列出的一张独立的只读展示清单，不是 search、read 这些操作名的子集。
+- **R2.8** [新设，r11] **UI 只读展示操作**（UI-BRIDGE 决定 #25，David 2026-11-08 确认，证据裁决 R0 一致）。UI session JWT 的 `ops` 只能从下面五类里取，这是上限：
+  - 知识库列表与详情；
+  - 文档列表与详情（不含下载原件、preview、`/files`，同 R2.7）；
+  - 分块列表；
+  - wiki 页列表与读取；
+  - 标签列表。
+
+  写入、管理、聊天、Agent、记忆类接口一律不在内；写操作留给契约 v2（iDoris-ai/WeKnora#135）。服务端对每个 UI 入口：
+  - **自己计算 E**，不沿用上游 API key 的语义。E 只取本租户的知识库，剔除组织共享与共享 Agent 授权（同 R2.7）；白名单为空或 E 为空时返回 `forbidden/empty_scope`，绝不当作「全部」（R2.2–R2.4）。
+  - 单个资源落在 E 外时，回应与「不存在」完全相同（同 R2.6）。
+  - **首版只放行页面实际调用的入口**，按方法加路径逐条列在 WeKnora 侧的实现 PR 与 `docs/agent24/` 里。五类是上限，不是必须全部开放。
+
+  UI 会话的票据、JWT、校验与撤销规则见 UI-BRIDGE U2–U3。
 - **证据与差距**：
   - 上游空白名单 = 全租户：`AllowsKnowledgeBase` / `AllowsKnowledgeBases` 遇空列表返回 true（矩阵 #1，`internal/types/tenant_api_key.go:328-330`、`:345-347`）；`apiKeyAny()`（定义在 `internal/router/rbac.go:226-228`）对任何有效 key 放行（`internal/middleware/api_key_gate.go:149-151`）。
   - hybrid-search 的 `knowledge_base_ids` 为空时回退到路径里的 KB（`internal/application/service/knowledgebase_search.go:134-137`；参数说明见 `internal/types/search.go:244-247`），是 R2.4 的直接风险点。
@@ -369,6 +383,7 @@ Provider 的本地结果（同时写宿主侧日志；服务端只有观察到�
 | 18 | **#1012 的取消夹具**由三部分组成：一条线上成功响应、一条 Provider 本地 `cancelled` 结果、一条"迟到响应被丢弃"的测试用例；不进 Go 端编码测试 | 按本文 | #1012 |
 | 19 | **`operations.X` 为 `disabled` 时，KB 级 X 的 `reason` 取什么**（R8.2、R8.4）：盲选结论分歧 | KB 级 X 为 `not_ready`，`reason` 为新增的 `operation_disabled`（不可重试），排在 R8.4 原因顺序第一位（兼容新增） | 已定（David，2026-10-17） |
 | 20 | **`operations.search` / `operations.read` 为 `disabled` 时，search / read 请求本身返回什么错误码**：契约未定义 | 对应请求返回 `forbidden`，`reason: "operation_disabled"`（不可重试，兼容新增）；判定位置在请求形状之后、计算 E 之前，优先于 `empty_scope`（R6.4） | 已定（David 确认，见 [#1012 评论](https://github.com/iDoris-ai/Agent24/issues/1012#issuecomment-6239062330)；Grok、Opus 盲选一致，2026-10-18） |
+| 21 | **UI 会话的操作清单（`ops`）与 C 的数据操作范围是什么关系**（UI-BRIDGE 决定 #25，原阻塞 KB-C2-01） | 数据范围是 C 的子集；`ops` 是 R2.8 的独立只读展示清单，以五类为上限，首版只放行实际用到的入口；C 可签发与撤销 UI 票据，不计入数据操作范围（R1.8） | 已定（David，2026-11-08；证据裁决 R0 一致，三方选同一项） |
 
 ## 13. 已知差距（r9）
 
@@ -395,3 +410,4 @@ r9 用由内容派生的标识换掉了"可证明的构建归属"（KB-C1-01c �
 - r9（2026-10-21）：KB-C1-01c ③ 改用内容寻址（WeKnora#38，设计经 Grok 与 Codex 两轮双审，David 选定并确认）。新增 `content_tag`（分块完整正文的带密钥摘要），出现在 hit.revision、segment、单分块 `expected_revision` 与 stale 详情（`current_content_tag`）；"活动构建"改为"有构建时的可服务分块集合"，`index_build_id`、`source_revision` 改为由内容派生的带密钥摘要（R5.1）；单分块 read 先判可服务、再比 `content_tag`，其他分块增删不影响（R4.3、R4.4、R6.4）；`chunk_revision` 只作参考（R5.2）；snippet 与 `content_tag` 同源（R3.8、R3.9）；文档级翻页每页同快照重算（R4.5）；引用只来自单分块 read（R4.7）；cancelled 不可服务、文档级 read 为 `index_failed`，deleting 视同已删除（R2.6、R4.4、R8.4）；就绪按"有构建"重写判定（R8.4）；审计不记 `content_tag`（R10.1、R10.3）；locator 恒为 `valid: false`（R3.10）；新增 §13 已知差距。PR 双审第 1、2 轮补充：R5.1 写明各标识的输入组成与 HMAC 编码；R3.5、R8.4 不计入 deleting；单分块 `expected_revision` 的 `chunk_revision` 允许 null；夹具新增 read.stale-chunk-overwritten、read.document-empty。依 §0.3 草案期条款，评审通过前不升主版本（`protocol_version` 仍为 1）。影响夹具：是（同一 PR 更新清单与 schema）。
 - r10（2026-10-22）：草稿（draft，含已发布后改回草稿的手工知识）与状态无法识别的文档视同不存在：read 为 `not_found`，就绪与 partial 判定不计入（R2.6、R3.5、R8.4、§6），与 deleting 一致；文档判定对带与不带 `chunk_id` 的 read 都先于锚点与修订（R2.6、R4.4、R6.4）；这些文档没有可服务分块，search 也不返回（R2.6）；草稿以知识行的 parse_status 为准，元数据里的草稿状态不单独作判据；§13 记下发布与改回草稿的上游竞态（parse_status 被写回 completed 时文档照常可服务）；David 定（WeKnora#66 评审闸门）。依 §0.3 草案期条款不升主版本。影响夹具：清单 `contract_revision` 改为 r10，夹具内容不变。
 - 2026-11-01（修订号不变）：只改状态行，写明已实施、草案期结束。语义不变，影响夹具：否。
+- r11（2026-11-08）：UI-BRIDGE 决定 #25 定案（David 确认，证据裁决 R0 一致）。新增 R1.8：C 可签发与撤销 UI 票据，不计入数据操作范围。R2.7 补一句，说明 UI 会话的数据范围与操作清单是两个维度。新增 R2.8：UI 只读展示操作的上限清单与每个入口的义务（自算 E、剔除共享、空集拒绝、越界等同不存在、首版只放行实际用到的入口）。§12 增加 #21。search、read、ready 的报文与语义都不变；影响夹具：清单 `contract_revision` 改为 r11，夹具内容不变。

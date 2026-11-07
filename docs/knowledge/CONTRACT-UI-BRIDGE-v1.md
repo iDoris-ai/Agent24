@@ -1,6 +1,6 @@
 # Knowledge UI 身份交换与消息桥契约 v1（CONTRACT-UI-BRIDGE-v1）
 
-> **状态**：规范核心 v1，已评审合入；KB-R1/R2 只实施了长期登录态的本机存储（`knowledge-logins.ts`）和 C 不进 renderer（U1.4）。KnowledgeView、一次性票据、session JWT 与消息桥**没有实施**（11-11 后）。条款按 READONLY r8 写成，现行 READONLY 为 r10。· **日期**：2026-10-20 · **桥报文** `v: 1`
+> **状态**：规范核心 v1，已评审合入；KB-R1/R2 只实施了长期登录态的本机存储（`knowledge-logins.ts`）和 C 不进 renderer（U1.4）。KnowledgeView、一次性票据、session JWT 与消息桥**没有实施**（11-11 后）。条款按 READONLY r8 写成，现行 READONLY 为 r11（r11 定了决定 #25，见 U1.3）。· **日期**：2026-10-20 · **桥报文** `v: 1`
 > **依据**：`docs/knowledge/CONTRACT-READONLY-v1.md`（下称 READONLY，按 r8）；`docs/knowledge/CONTRACT-STATE-v1.md`（下称 STATE，规范核心 v1，PR #1113；本文依赖它的规则汇总在 §8.2）。
 > 由完整版 `ab/weknora-03b-ui-bridge`（#1077 的分支）压缩而来。本文只写对外行为与不变式；实现机制由各实现任务以代码和测试证明。
 > 编号：`R*` 为 READONLY 规则，`S*` 为 STATE 规范核心 v1（同批）的条款，`U*` 为本文规则（沿用完整版编号，空号即已移出规范），`决定 #n` 见 §9.1（已定）与 §9.5（待决）。
@@ -33,7 +33,7 @@
 
 - **U1.1** 票据与 session JWT 只由服务端签发；宿主即使按 R1.4 持有实例秘密也不得自签。
 - **U1.2** 页面不可信。页面始终拿不到 C、长期登录态、票据、JWT、`view_secret` 与本地路径；它只知道 generation、不透明的 view 实例 ID 与 `state` 消息里的非秘密信息。
-- **U1.3** 受众隔离：C 与 session JWT（`aud: "agent24-knowledge-view"`）在服务端互不接受。JWT 的范围是 C 的子集，`ops` 只含只读 UI 操作，不含下载原件与 preview（R2.7），不能换票据、签凭据或调用写入与管理接口；READONLY 写明 UI 操作与 C 的关系之前（决定 #25），UI 操作不超出 search/read。
+- **U1.3** 受众隔离：C 与 session JWT（`aud: "agent24-knowledge-view"`）在服务端互不接受。JWT 的范围是 C 的子集，`ops` 只含只读 UI 操作，不含下载原件与 preview（R2.7），不能换票据、签凭据或调用写入与管理接口。UI 操作与 C 的关系按 READONLY R1.8、R2.8（r11，决定 #25）：JWT 的数据范围（知识库集合）是 C 的子集；`ops` 是 R2.8 列出的独立只读展示清单（以五类为上限，不含 preview 与下载原件），服务端对每个 UI 入口自己计算 E，首版只放行页面实际调用的入口。
 - **U1.4** C 不进任何 renderer；票据只在 Provider、main 内存及两者的私有接口里；JWT 只在服务端与 main 内存里。
 - **U1.5** Agent24 自身的 renderer 不参与身份交换：铸票、撤销、作废通知所用的私有接口，经 renderer 可用的任何通用代理（如 `backendProxy`）都到不了；该通道双向认证。
 
@@ -132,7 +132,7 @@
 ### 8.1 与 READONLY r8
 - 引用：R1.2、R1.4（UI 会话密钥）；R1.7（C 不进 renderer）；R2.1、R2.3、R2.6（E 的计算、空范围、越界与不存在不可区分）；R2.7（不含下载与 preview）；R4.1、R4.7（引用 read）；R5.2（引用 ID 不透明）；R6.1（错误信封）；R7.3（`null` 回显按 HTTP 交换配对，适用于签发入口）；R7.5（generation 只回显）；R7.6（在途长请求，U3.4 补上 UI 长连接的关闭）；R7.7；R10.3。
 - 不修订 READONLY 的：票据失败与族撤销都复用 `credential_invalid`（决定 #5、#20）。
-- 需要 READONLY 下一修订的：新 `reason` `unavailable/credential_near_expiry`（可重试，决定 #29）；UI 操作清单与 C 的数据操作范围的关系，以及 C 可用于票据签发与撤销（决定 #25，阻塞 KB-C2-01 实现）；引用 ID 字符集（决定 #21）。
+- 需要 READONLY 下一修订的：新 `reason` `unavailable/credential_near_expiry`（可重试，决定 #29）；引用 ID 字符集（决定 #21）。（决定 #25 已在 READONLY r11 定案：R1.8、R2.8。）
 
 ### 8.2 与 STATE 的交接
 - **binding 状态**：可服务 = `ready`、`degraded`；`loading`、`unavailable` 只暂停注入（U4.8）；`retired` 与 generation 递增（S4.2）触发 binding 级销毁；多个 binding 各自处理（S4.9）；凭据无效类续签也失败（S3.1）按决定 #33。
@@ -162,6 +162,7 @@
 - #31 恢复与存活策略按 U4.5、U4.8 的数值，可按实测调整。
 - #33 凭据无效类续签也失败（S3.1）：只暂停注入并加遮罩，不关桥、不销毁。
 - #34 全局收紧作废的登录态，在该 profile 解除 `unsaved_settings` 重新绑定（S1.13）后或 profile 移除时销毁。
+- #25 UI 操作与 C 的关系按 READONLY r11 的 R1.8、R2.8 处理：C 可签发与撤销票据，不计入数据操作范围；`ops` 是独立的只读展示清单（David 2026-11-08 确认，证据裁决 R0 一致）。
 
 ### 9.2 宿主侧 KnowledgeView `closed` 的 `code`（闭集）
 `session_rejected`、`revocation_mismatch`、`probe_failed`、`empty_scope`、`crash_loop`、`bridge_closed`。`closed` 不自动恢复；binding 级销毁也使它结束。各码的出口（用户操作后新建 view 实例，仍按 U2.1 取得会话）：
@@ -189,7 +190,7 @@
 
 ### 9.5 仍待决（按 v1 默认执行，不得自行放宽；编号沿用完整版 §10）
 - #8、#9 宿主内部谁铸票、私有接口形式、登录态存放（KB-HOST-01；涉及内核接口须知会 jason）。#11 签发权威撤销刷新令牌的接口（#992）。
-- #21 引用 ID 字符集与 R5.2 同步（READONLY 下一修订）。#25 UI 操作与 C 数据操作范围的关系（READONLY 下一修订，阻塞 KB-C2-01 实现）。#29 新 `reason` `credential_near_expiry`（READONLY 下一修订）。
+- #21 引用 ID 字符集与 R5.2 同步（READONLY 下一修订）。#29 新 `reason` `credential_near_expiry`（READONLY 下一修订）。
 - #22–#24、#27、#28、#30、#32 工程值与实测项（intent 窗口与预算、分区上限、`worker-src`、CSP 放宽、服务端记录持久化、WebRTC 残余风险、Node `https` 信任库与代理），由 KB-C2-01/03/04a 实测后定。
 
 ## 10. 非规范材料
