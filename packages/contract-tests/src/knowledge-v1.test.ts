@@ -1,6 +1,6 @@
 // KB-CT-02b (#1012): the Knowledge v1 fixtures (protocol/knowledge/fixtures/v1)
 // must match the digests pinned in their manifest and the schemas in
-// protocol/knowledge/v1 (docs/knowledge/CONTRACT-READONLY-v1.md r10). The Rust
+// protocol/knowledge/v1 (docs/knowledge/CONTRACT-READONLY-v1.md r11). The Rust
 // side (agent24-protocol tests/knowledge_fixtures.rs) checks the same manifest,
 // so changing any fixture byte turns both red. Pure schema test, no daemon.
 
