@@ -165,8 +165,6 @@ export function knowledgeViewCsp(origin: string): string {
   ].join('; ')
 }
 
-/** Adds the partition CSP next to whatever the server sent: browsers enforce
- * every policy present, so the server's own can only tighten it. */
 /** Powerful features switched off in the page itself (UI-BRIDGE U4.2). The
  * permission handlers already refuse them, but a request that never reaches
  * them (David's 11-08 Mac run: geolocation left pending, no answer) is still
@@ -188,6 +186,8 @@ function serverSwitchOffs(values: string[]): string[] {
   return kept.length > 0 ? [kept.join(', ')] : []
 }
 
+/** Adds the partition CSP next to whatever the server sent: browsers enforce
+ * every policy present, so the server's own can only tighten it. */
 export function withKnowledgeCsp(
   headers: Record<string, string | string[]> | undefined,
   origin: string,

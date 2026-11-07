@@ -327,6 +327,10 @@ describe('origin policy and CSP (U4.2)', () => {
       .toEqual(['sync-xhr=()', KNOWLEDGE_VIEW_PERMISSIONS_POLICY])
     expect(withKnowledgeCsp({ 'Permissions-Policy': ['geolocation=*'] }, ORIGIN)['Permissions-Policy'])
       .toEqual([KNOWLEDGE_VIEW_PERMISSIONS_POLICY])
+    // A member is kept only when it is a whole `feature=()`: text before or
+    // after it would make Blink drop the merged field, ours included.
+    expect(withKnowledgeCsp({ 'Permissions-Policy': ['camera=()*, x=()"', '*camera=()'] }, ORIGIN)['Permissions-Policy'])
+      .toEqual([KNOWLEDGE_VIEW_PERMISSIONS_POLICY])
     expect(out['permissions-policy']).toBeUndefined()
     expect(headers['permissions-policy']).toEqual(['geolocation=*, fullscreen=()'])
     for (const feature of ['geolocation', 'camera', 'microphone', 'display-capture', 'usb', 'serial', 'hid', 'bluetooth']) {
