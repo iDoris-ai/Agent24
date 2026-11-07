@@ -192,6 +192,31 @@ describe('chat history', () => {
     await waitFor(() => expect([...saved.values()][0]?.messages).toHaveLength(2), { timeout: 2000 })
   })
 
+  it('a failed older save, retried late, does not overwrite the newer one with the reply', async () => {
+    renderBoth()
+    // The prompt-only save fails; the reply's save then succeeds before the retry.
+    chatHistory.save.mockRejectedValueOnce(new Error('ENOSPC'))
+    send('一')
+    await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
+    await waitFor(() => expect([...saved.values()][0]?.messages).toHaveLength(2))
+    await new Promise(r => setTimeout(r, 700))
+    expect([...saved.values()][0]?.messages).toHaveLength(2)
+    expect(chatHistory.save).toHaveBeenCalledTimes(2)
+  })
+
+  it('deleting another conversation does not cancel a retry', async () => {
+    saved.set('chat_b_1', stored('chat_b_1', '话题乙', '2026-11-07T09:00:02.000Z'))
+    renderBoth()
+    await within(await findHistoryList()).findByRole('button', { name: '话题乙' })
+    send('一')
+    await waitFor(() => expect(chatHistory.save).toHaveBeenCalledTimes(1))
+    chatHistory.save.mockRejectedValueOnce(new Error('ENOSPC'))
+    await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
+    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：话题乙' }))
+    await waitFor(() => expect(saved.has('chat_b_1')).toBe(false))
+    await waitFor(() => expect([...saved.values()][0]?.messages).toHaveLength(2), { timeout: 2000 })
+  })
+
   it('a retry still waiting gives up once the conversation is deleted', async () => {
     saved.set('chat_a_1', stored('chat_a_1', '话题甲', '2026-11-07T10:00:02.000Z'))
     renderBoth()

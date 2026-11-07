@@ -42,9 +42,17 @@ export async function refreshHistory(): Promise<void> {
 
 /** Waits before each retry of a failed save. */
 export const SAVE_RETRY_MS = [500, 1500]
-/** Bumped by every delete and clear: a retry still waiting then gives up,
- *  so it never writes back a conversation just removed. */
-let removals = 0
+/** Orders saves, deletions and clears. A retry still waiting gives up when
+ *  a newer save of the same conversation was asked for (that one carries
+ *  everything this one did, and must not be overwritten by it), or when
+ *  that conversation was deleted or everything cleared since (it must not
+ *  be written back). */
+let seq = 0
+const newestSave = new Map<string, number>()
+const deletedAt = new Map<string, number>()
+let clearedAt = 0
+const superseded = (id: string, mine: number): boolean =>
+  newestSave.get(id) !== mine || (deletedAt.get(id) ?? 0) > mine || clearedAt > mine
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
 /** The chat page saves a conversation after each change and refreshes the
@@ -54,7 +62,8 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 export async function saveConversation(record: ChatHistoryRecord): Promise<boolean> {
   const history = api()
   if (!history) return true
-  const epoch = removals
+  const mine = ++seq
+  newestSave.set(record.id, mine)
   for (let attempt = 0; ; attempt++) {
     try {
       await history.save(record)
@@ -62,7 +71,7 @@ export async function saveConversation(record: ChatHistoryRecord): Promise<boole
     } catch {
       if (attempt >= SAVE_RETRY_MS.length) return false
       await sleep(SAVE_RETRY_MS[attempt])
-      if (removals !== epoch) return true
+      if (superseded(record.id, mine)) return true
     }
   }
   await refreshHistory()
@@ -100,7 +109,7 @@ export function openConversation(id: string): void {
  *  save it again. */
 export async function deleteConversation(id: string): Promise<void> {
   if (state.busy && state.activeId === id) return
-  removals += 1
+  deletedAt.set(id, ++seq)
   // The page leaves the conversation first, synchronously, so nothing sent
   // while the deletion is on its way can land in it and save it again.
   if (state.activeId === id) {
@@ -115,7 +124,7 @@ export async function deleteConversation(id: string): Promise<void> {
  *  in flight, for the same reason. */
 export async function clearConversations(): Promise<void> {
   if (state.busy) return
-  removals += 1
+  clearedAt = ++seq
   starter?.()
   set({ activeId: null })
   await api()?.clear().catch(() => {})
