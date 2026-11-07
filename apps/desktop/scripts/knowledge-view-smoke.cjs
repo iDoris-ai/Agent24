@@ -251,9 +251,12 @@ async function main() {
   check('no TURN-over-TCP connection (contract decision #30)', triedOrAbsent(r1.turn) && connections.TURN === 0, { turn: r1.turn, connections: connections.TURN })
   // PASS/FAIL stays on the count; 'unproven' flags a 0 that no TCP-active
   // candidate stood behind, so the PASS is not read as "blocked".
-  const iceUnproven = connections.ICE === 0 && r1.iceTcp === 'ran' && !(r1.iceLocal?.tcpActive > 0) && !(r1.iceLocal?.statsTcpActive > 0)
-  check('no ICE-TCP active connection (contract decision #30)', triedOrAbsent(r1.iceTcp) && connections.ICE === 0,
-    { ...(iceUnproven ? { unproven: 'no TCP-active local candidate was gathered' } : {}), iceTcp: r1.iceTcp, iceState: r1.iceState, local: r1.iceLocal, connections: connections.ICE })
+  const iceEvidence = (r, added) => ({
+    ...(added === 0 && r.iceTcp === 'ran' && !(r.iceLocal?.tcpActive > 0) && !(r.iceLocal?.statsTcpActive > 0)
+      ? { unproven: 'no TCP-active local candidate was gathered' } : {}),
+    iceTcp: r.iceTcp, iceState: r.iceState, local: r.iceLocal, connections: added,
+  })
+  check('no ICE-TCP active connection (contract decision #30)', triedOrAbsent(r1.iceTcp) && connections.ICE === 0, iceEvidence(r1, connections.ICE))
   const webrtcBefore = { TURN: connections.TURN, ICE: connections.ICE }
   // B is plain http and never upgrades, so 'open' cannot happen; what tells is that B saw no connection.
   check('WebSocket to a foreign host refused', r1.ws !== 'open' && connections.B === 0, { ws: r1.ws, connections: connections.B })
@@ -288,7 +291,7 @@ async function main() {
   // The new partition must get the dead proxy too, not only the first one.
   check('second profile: no TURN- or ICE-TCP connection either (decision #30)',
     triedOrAbsent(r2.turn) && triedOrAbsent(r2.iceTcp) && connections.TURN === webrtcBefore.TURN && connections.ICE === webrtcBefore.ICE,
-    { turn: r2.turn, iceTcp: r2.iceTcp, new: { TURN: connections.TURN - webrtcBefore.TURN, ICE: connections.ICE - webrtcBefore.ICE } })
+    { turn: r2.turn, newTurn: connections.TURN - webrtcBefore.TURN, ice: iceEvidence(r2, connections.ICE - webrtcBefore.ICE) })
 
   host.shutdown()
   check('quit destroys the view', win.contentView.children.length === 0)

@@ -22,6 +22,7 @@ import {
   KNOWLEDGE_VIEW_PERMISSIONS_POLICY,
   knowledgeViewProxyConfig,
   knowledgeViewBlackhole,
+  listenDeadProxy,
 } from './knowledge-view'
 
 const ORIGIN = 'https://kb.example.org'
@@ -236,13 +237,32 @@ describe('dead proxy for WebRTC TCP (contract decision #30)', () => {
   it('has a dead proxy that takes a connection and drops it', async () => {
     const port = await knowledgeViewBlackhole()
     expect(await knowledgeViewBlackhole()).toBe(port)
-    const closed = await new Promise<string>((resolve) => {
+    // Accepted, then dropped with nothing sent: a port nobody listens on
+    // (connection refused) would not pass.
+    const seen = await new Promise<string[]>((resolve) => {
+      const events: string[] = []
       const socket = net.connect(port, '127.0.0.1')
-      socket.on('data', () => resolve('data'))
-      socket.on('close', () => resolve('closed'))
-      socket.on('error', () => resolve('closed'))
+      socket.on('connect', () => events.push('connect'))
+      socket.on('data', () => events.push('data'))
+      socket.on('error', (error: NodeJS.ErrnoException) => events.push(`error:${error.code}`))
+      socket.on('close', () => resolve(events))
     })
-    expect(closed).toBe('closed')
+    expect(seen.filter((e) => e === 'connect' || e === 'data')).toEqual(['connect'])
+    expect(seen[0]).toBe('connect')
+  })
+
+  it('keeps the dead proxy listening through errors once it is up', async () => {
+    const logged: string[] = []
+    const server = await listenDeadProxy((m) => logged.push(m))
+    try {
+      // A failed accept, twice: no uncaught error, the port stays ours.
+      server.emit('error', new Error('EMFILE'))
+      server.emit('error', new Error('EMFILE'))
+      expect(logged).toEqual(['[knowledge-view] dead proxy: EMFILE', '[knowledge-view] dead proxy: EMFILE'])
+      expect(server.listening).toBe(true)
+    } finally {
+      server.close()
+    }
   })
 })
 

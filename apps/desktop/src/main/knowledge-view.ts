@@ -287,19 +287,34 @@ export function knowledgeViewProxyConfig(origin: string, port: number): { mode: 
 let blackhole: Promise<number> | null = null
 
 /** The process's dead proxy: listens on loopback and drops every connection.
- * Started once, never kept the process alive. */
-export function knowledgeViewBlackhole(): Promise<number> {
-  blackhole ??= new Promise<number>((resolve, reject) => {
-    const server = net.createServer((socket) => socket.destroy())
-    server.once('error', (error) => { blackhole = null; reject(error) })
-    server.listen(0, '127.0.0.1', () => {
-      server.unref()
-      const address = server.address()
-      if (typeof address === 'object' && address !== null) resolve(address.port)
-      else { blackhole = null; reject(new Error('no port')) }
-    })
+ * Started once, never kept the process alive. A failure to start lets the next
+ * caller try again; an error once listening (a failed accept, say) is only
+ * logged: the listener stays, since partitions already point at its port. */
+export function knowledgeViewBlackhole(log: (message: string) => void = () => {}): Promise<number> {
+  blackhole ??= listenDeadProxy(log).then((server) => (server.address() as net.AddressInfo).port, (error: unknown) => {
+    blackhole = null
+    throw error
   })
   return blackhole
+}
+
+/** One dead-proxy listener (the singleton above is the one in use). */
+export function listenDeadProxy(log: (message: string) => void): Promise<net.Server> {
+  return new Promise<net.Server>((resolve, reject) => {
+    const server = net.createServer((socket) => socket.destroy())
+    let listening = false
+    server.on('error', (error) => {
+      if (listening) { log(`[knowledge-view] dead proxy: ${error.message}`); return }
+      reject(error)
+    })
+    server.listen(0, '127.0.0.1', () => {
+      listening = true
+      server.unref()
+      const address = server.address()
+      if (typeof address === 'object' && address !== null) resolve(server)
+      else { server.close(); reject(new Error('no port')) }
+    })
+  })
 }
 
 /** Installs the partition-wide refusals. Done before the view exists, so the
@@ -593,7 +608,7 @@ export class KnowledgeViewHost {
     const instance: Instance = {
       view, session, window: win, binding, target, loaded: false, unresponsive: false, loading: null, httpFailed: false,
       onWindowClosed: () => { if (this.instance === instance) this.destroy('window closed') },
-      proxied: (this.deps.proxyPort ?? knowledgeViewBlackhole)().then((port) => session.setProxy(knowledgeViewProxyConfig(target.origin, port))),
+      proxied: (this.deps.proxyPort ?? (() => knowledgeViewBlackhole((m) => this.log(m))))().then((port) => session.setProxy(knowledgeViewProxyConfig(target.origin, port))),
     }
     instance.proxied.catch(() => {}) // surfaced by load(); never an unhandled rejection
     guardKnowledgeContents(view.webContents, target.origin, () => {
