@@ -665,6 +665,16 @@ describe('finding a conversation (UI-04 T3)', () => {
     expect(names()).toHaveLength(10)
   })
 
+  it('a search left typed stops filtering once the list is short enough to lose its box', async () => {
+    many(9)
+    render(<ChatHistoryList showChat={showChat} />)
+    const box = await within(await findHistoryList()).findByRole('searchbox', { name: '搜索对话' })
+    fireEvent.change(box, { target: { value: '话题8' } })
+    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：话题8' }))
+    await waitFor(() => expect(within(historyList()).queryByRole('searchbox')).toBeNull())
+    expect(within(historyList()).getAllByRole('button', { name: /^话题\d$/ })).toHaveLength(8)
+  })
+
   it('conversations with the same title show their time; the tooltip adds the first prompt', async () => {
     const a = stored('chat_a_1', '周报', '2026-11-07T10:00:00.000Z')
     const b = stored('chat_b_1', '周报', '2026-11-08T09:30:00.000Z')
