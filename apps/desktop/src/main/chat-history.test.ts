@@ -352,7 +352,10 @@ describe('chat history groups and archive (UI-06)', () => {
     expect(archived.archived_at).toMatch(/Z$/)
     expect(archived).toMatchObject({ group_id: work.id, updated_at: at })
     // Archiving again keeps the first time.
-    expect(store.organize('chat_a', { archived: true })?.archived_at).toBe(archived.archived_at)
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2027-01-01T00:00:00.000Z'))
+    try { expect(store.organize('chat_a', { archived: true })?.archived_at).toBe(archived.archived_at) }
+    finally { vi.useRealTimers() }
     // The page's save carries neither; a page that sent them is ignored too.
     const summary = store.save({ ...record('chat_a', later), group_id: null, archived_at: null })
     expect(summary).toMatchObject({ group_id: work.id, archived_at: archived.archived_at, updated_at: later })
@@ -380,6 +383,7 @@ describe('chat history groups and archive (UI-06)', () => {
   it.each([
     ['no change', {}],
     ['an unknown field', { title: 'x' }],
+    ['an unknown field beside a known one', { archived: true, title: 'x' }],
     ['a non-boolean archive', { archived: 'yes' }],
     ['a bad group id', { group_id: '../x' }],
     ['not an object', 'archive'],
@@ -435,7 +439,8 @@ describe('chat history groups and archive (UI-06)', () => {
     fs.mkdirSync(path.join(dir, 'chat-history'))
     const file = path.join(dir, 'chat-history', '_groups.json')
     for (const body of ['{', JSON.stringify({ format: 'x', version: 1, groups: [], assistant_collapsed: false, archive_collapsed: true }),
-      JSON.stringify({ format: 'agent24.desktop.chat-groups', version: 1, groups: [{ id: 'grp_a', name: '', created_at: at, collapsed: false }], assistant_collapsed: false, archive_collapsed: true })]) {
+      JSON.stringify({ format: 'agent24.desktop.chat-groups', version: 1, groups: [{ id: 'grp_a', name: '', created_at: at, collapsed: false }], assistant_collapsed: false, archive_collapsed: true }),
+      JSON.stringify({ format: 'agent24.desktop.chat-groups', version: 1, groups: [{ id: 'grp_a', name: '甲', created_at: at, collapsed: false }, { id: 'grp_a', name: '乙', created_at: at, collapsed: false }], assistant_collapsed: false, archive_collapsed: true })]) {
       fs.writeFileSync(file, body)
       expect(createChatHistoryStore(dir).groups().groups).toEqual([])
     }
