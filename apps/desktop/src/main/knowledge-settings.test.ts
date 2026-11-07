@@ -54,6 +54,86 @@ describe('KnowledgeController (M3)', () => {
     fs.rmSync(dir, { recursive: true, force: true })
   })
 
+  it('tells listeners after every change, with the new settings already in effect (KB-C2-03)', async () => {
+    const controller = make()
+    const seen: Array<{ enabled: boolean; endpoint: string }> = []
+    const off = controller.onChange(() => {
+      const s = controller.status()
+      seen.push({ enabled: s.enabled, endpoint: s.endpoint })
+    })
+    await controller.configure(GOOD)
+    await controller.setEnabled(true)
+    await controller.setEnabled(false)
+    expect(seen).toEqual([
+      { enabled: false, endpoint: GOOD.endpoint },
+      { enabled: true, endpoint: GOOD.endpoint },
+      { enabled: false, endpoint: GOOD.endpoint },
+    ])
+    off()
+    await controller.setEnabled(true)
+    expect(seen).toHaveLength(3)
+  })
+
+  it('names a new view binding for a new key or endpoint, none while Off (KB-C2-03)', async () => {
+    const controller = make()
+    expect(controller.viewBinding()).toBeNull()
+    await controller.configure(GOOD)
+    expect(controller.viewBinding()).toBeNull()
+    await controller.setEnabled(true)
+    const first = controller.viewBinding()
+    expect(first).not.toBeNull()
+    expect(first).not.toContain(GOOD.apiKey)
+    expect(first).not.toContain('kb.example')
+    // Same endpoint and knowledge bases, another key: possibly another principal.
+    await controller.configure({ ...GOOD, apiKey: 'sk-OTHER' })
+    const second = controller.viewBinding()
+    expect(second).not.toBeNull()
+    expect(second).not.toBe(first)
+    // Only the knowledge bases change: the same principal, the same binding.
+    await controller.configure({ endpoint: GOOD.endpoint, knowledgeBaseIds: ['kb-a'] })
+    expect(controller.viewBinding()).toBe(second)
+    await controller.setEnabled(false)
+    expect(controller.viewBinding()).toBeNull()
+  })
+
+  it('a new key moves the view binding even when its change is overtaken after the key was written', async () => {
+    const store = new KnowledgeSettingsStore(dir)
+    const save = store.save.bind(store)
+    let hold = false
+    let release: () => void = () => {}
+    let held = false
+    store.save = async (settings) => {
+      if (hold) {
+        held = true
+        await new Promise<void>((resolve) => { release = resolve })
+      }
+      return save(settings)
+    }
+    const controller = new KnowledgeController(host, logins, store, { nowSeconds: () => now })
+    await controller.configure(GOOD)
+    await controller.setEnabled(true)
+    const first = controller.viewBinding()
+    hold = true
+    const a = controller.configure({ ...GOOD, apiKey: 'sk-NEW' })
+    for (let i = 0; i < 50 && !held; i++) await new Promise((resolve) => setTimeout(resolve, 1))
+    expect(held).toBe(true)
+    hold = false
+    const b = controller.configure({ endpoint: GOOD.endpoint, knowledgeBaseIds: ['kb-a'] })
+    release()
+    await Promise.all([a, b])
+    expect(logins.list().get(KNOWLEDGE_BINDING)?.material).toBe('sk-NEW')
+    expect(controller.viewBinding()).not.toBeNull()
+    expect(controller.viewBinding()).not.toBe(first)
+  })
+
+  it('a failing listener does not stop the change', async () => {
+    const controller = make()
+    controller.onChange(() => { throw new Error('boom') })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    expect(await controller.configure(GOOD)).toEqual({ ok: true })
+    warn.mockRestore()
+  })
+
   it('takes the endpoints and knowledge bases the daemon takes', () => {
     for (const ok of ['https://kb.example/api/v1', 'http://127.0.0.1:8080/api/v1', 'http://[::1]:9000']) {
       expect(validEndpoint(ok), ok).toBe(true)

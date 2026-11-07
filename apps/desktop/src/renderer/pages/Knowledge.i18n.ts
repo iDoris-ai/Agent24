@@ -1,0 +1,43 @@
+import { defineMessages } from '../i18n'
+
+export const knowledgeViewMessages = defineMessages({
+  en: {
+    'loading': 'Opening the knowledge page…',
+    'unavailable.knowledge_off': 'Knowledge is off. Turn it on and connect a knowledge base in Settings to open this page.',
+    'unavailable.not_configured': 'No knowledge page address is set yet.',
+    'unavailable.partition_limit': 'The knowledge page was reopened too many times. Restart Agent24 to open it again.',
+    'unavailable.window_unavailable': 'The Agent24 window is not ready.',
+    'degraded.crashed': 'The knowledge page stopped responding. Reopening…',
+    'degraded.navigated_away': 'The knowledge page tried to leave its site and was closed.',
+    'degraded.load_failed': 'The knowledge page could not be loaded.',
+    'degraded.unresponsive': 'The knowledge page is not responding.',
+    'closed.crash_loop': 'The knowledge page keeps crashing, so it was closed.',
+    'action.reload': 'Reload',
+  },
+  zh: {
+    'loading': '正在打开知识页…',
+    'unavailable.knowledge_off': '知识库已关闭。请在设置里打开并连接知识库后再打开此页。',
+    'unavailable.not_configured': '还没有设置知识页地址。',
+    'unavailable.partition_limit': '知识页重新打开的次数太多，请重启 Agent24 后再打开。',
+    'unavailable.window_unavailable': 'Agent24 窗口还没准备好。',
+    'degraded.crashed': '知识页停止响应，正在重新打开…',
+    'degraded.navigated_away': '知识页试图离开自己的站点，已关闭。',
+    'degraded.load_failed': '知识页加载失败。',
+    'degraded.unresponsive': '知识页没有响应。',
+    'closed.crash_loop': '知识页反复崩溃，已关闭。',
+    'action.reload': '重新加载',
+  },
+  th: {
+    'loading': 'กำลังเปิดหน้าคลังความรู้…',
+    'unavailable.knowledge_off': 'คลังความรู้ปิดอยู่ เปิดและเชื่อมต่อคลังความรู้ในการตั้งค่าก่อนเปิดหน้านี้',
+    'unavailable.not_configured': 'ยังไม่ได้ตั้งที่อยู่หน้าคลังความรู้',
+    'unavailable.partition_limit': 'เปิดหน้าคลังความรู้ใหม่หลายครั้งเกินไป รีสตาร์ท Agent24 แล้วเปิดอีกครั้ง',
+    'unavailable.window_unavailable': 'หน้าต่าง Agent24 ยังไม่พร้อม',
+    'degraded.crashed': 'หน้าคลังความรู้หยุดตอบสนอง กำลังเปิดใหม่…',
+    'degraded.navigated_away': 'หน้าคลังความรู้พยายามออกจากเว็บไซต์ของตน จึงถูกปิด',
+    'degraded.load_failed': 'โหลดหน้าคลังความรู้ไม่สำเร็จ',
+    'degraded.unresponsive': 'หน้าคลังความรู้ไม่ตอบสนอง',
+    'closed.crash_loop': 'หน้าคลังความรู้ล่มซ้ำ ๆ จึงถูกปิด',
+    'action.reload': 'โหลดใหม่',
+  },
+})
