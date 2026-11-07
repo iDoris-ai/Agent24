@@ -3,7 +3,7 @@
 // page; this module carries the list, which conversation is open, and "open
 // that one" requests from the list to the page.
 
-import type { ChatHistoryRecord, ChatHistorySummary } from '../../../shared/chat-history'
+import { chatHistorySummary, type ChatHistoryRecord, type ChatHistorySummary } from '../../../shared/chat-history'
 import { renameTitle } from './title'
 
 export interface HistoryState {
@@ -112,10 +112,7 @@ export async function saveConversation(record: ChatHistoryRecord): Promise<boole
   // The list is updated from what main wrote (which keeps a rename over the
   // first prompt's title), not by reading every conversation again from
   // disk: that would cost a full scan per chat turn.
-  const summary = written ?? {
-    id: record.id, title: record.title, title_source: record.title_source,
-    created_at: record.created_at, updated_at: record.updated_at,
-  }
+  const summary = written ?? chatHistorySummary(record)
   set({ items: byNewest([summary, ...state.items.filter(item => item.id !== record.id)]) })
   return true
 }

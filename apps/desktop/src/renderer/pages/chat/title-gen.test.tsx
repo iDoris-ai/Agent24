@@ -5,7 +5,7 @@ import ChatPage from '../Chat'
 import { ChatHistoryList } from './ChatHistoryList'
 import { resetHistoryStore } from './history'
 import { setLocale } from '../../i18n'
-import type { ChatHistoryRecord } from '../../../shared/chat-history'
+import { chatHistorySummary, type ChatHistoryRecord } from '../../../shared/chat-history'
 
 // UI-04 T2: the model titles a new conversation once, in the background.
 
@@ -19,8 +19,7 @@ const titleCalls = () => proxy.mock.calls.map(c => c[0] as Req).filter(isTitle)
 
 let saved: Map<string, ChatHistoryRecord>
 const RANK = { prompt: 0, model: 1, user: 2 } as const
-const summary = (r: ChatHistoryRecord) =>
-  ({ id: r.id, title: r.title, title_source: r.title_source, created_at: r.created_at, updated_at: r.updated_at })
+const summary = chatHistorySummary
 /** Behaves as main/chat-history.ts does: a stronger title on file wins. */
 const chatHistory = {
   list: vi.fn(async () => [...saved.values()].map(summary).sort((a, b) => b.updated_at.localeCompare(a.updated_at))),

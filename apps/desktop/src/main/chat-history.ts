@@ -11,6 +11,7 @@ import {
   type ChatHistoryRecord,
   type ChatHistorySummary,
   type ChatHistoryTitleSource,
+  chatHistorySummary,
 } from '../shared/chat-history'
 
 /** One conversation's file may not exceed this, so a runaway page cannot
@@ -105,8 +106,7 @@ export function parseChatHistoryRecord(v: unknown): ChatHistoryRecord {
   }
 }
 
-const summaryOf = (r: ChatHistoryRecord): ChatHistorySummary =>
-  ({ id: r.id, title: r.title, title_source: r.title_source, created_at: r.created_at, updated_at: r.updated_at })
+const summaryOf = chatHistorySummary
 
 /** The main chat's history: one JSON file per conversation under
  *  `<dir>/chat-history/`, written by atomic replacement like nav-prefs.
