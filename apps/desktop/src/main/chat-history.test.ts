@@ -1,13 +1,13 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createChatHistoryStore, parseChatHistoryRecord } from './chat-history'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../shared/chat-history'
 
 let dir: string
 beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-history-')) })
-afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }) })
+afterEach(() => { vi.restoreAllMocks(); fs.rmSync(dir, { recursive: true, force: true }) })
 
 function record(id: string, updated: string, title = id): ChatHistoryRecord {
   return {
@@ -111,6 +111,22 @@ describe('chat history on disk', () => {
     const mode = fs.statSync(path.join(dir, 'chat-history', 'chat_a.json')).mode & 0o777
     expect(mode).toBe(0o600)
     expect(fs.readdirSync(path.join(dir, 'chat-history')).sort()).toEqual(['chat_a.json', 'chat_a.json.tmp'])
+  })
+
+  it('leaves no partial temporary file when the write fails, and keeps the previous conversation', () => {
+    const store = createChatHistoryStore(dir)
+    store.save(record('chat_a', '2026-11-08T01:00:00.000Z'))
+    const write = fs.writeFileSync
+    vi.spyOn(fs, 'writeFileSync').mockImplementation((target, data, options) => {
+      if (typeof target === 'number') {
+        write(target, String(data).slice(0, 10))
+        throw new Error('ENOSPC: no space left on device')
+      }
+      return write(target, data, options)
+    })
+    expect(() => store.save(record('chat_a', '2026-11-08T02:00:00.000Z'))).toThrow('ENOSPC')
+    expect(fs.readdirSync(path.join(dir, 'chat-history'))).toEqual(['chat_a.json'])
+    expect(store.get('chat_a')?.updated_at).toBe('2026-11-08T01:00:00.000Z')
   })
 
   it('removes the temporary files of interrupted saves on delete and clear', () => {

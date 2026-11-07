@@ -115,14 +115,17 @@ export function createChatHistoryStore(dir: string) {
       // A fresh name, created exclusively: never follows or reuses a file
       // already there, and is ours to remove.
       const temp = tempOf(record.id)
-      let created = false
+      const fd = fs.openSync(temp, 'wx', 0o600)
+      let renamed = false
       try {
-        fs.writeFileSync(temp, body, { mode: 0o600, flag: 'wx' })
-        created = true
+        try { fs.writeFileSync(fd, body) }
+        finally { fs.closeSync(fd) }
         fs.renameSync(temp, file)
-        created = false
+        renamed = true
       } finally {
-        if (created) fs.rmSync(temp, { force: true })
+        // Ours from the moment it was opened: a failed or partial write
+        // (e.g. a full disk) leaves no piece of the transcript behind.
+        if (!renamed) fs.rmSync(temp, { force: true })
       }
     },
     delete(id: unknown): void {
