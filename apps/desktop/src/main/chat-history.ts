@@ -14,6 +14,31 @@ import {
 /** One conversation's file may not exceed this, so a runaway page cannot
  *  fill the disk through one IPC call. */
 const MAX_RECORD_BYTES = 8 * 1024 * 1024
+/** Fewer bytes than the fixed part of any written message, its strings
+ *  left empty: `{"role":"user","content":"","at":"","delivered":true}` is
+ *  52; the strings are counted separately below. */
+const MIN_MESSAGE_BYTES = 48
+
+/** A cheap lower bound of the written size, checked before the full parse,
+ *  so an oversized save is refused without first parsing and serializing
+ *  all of it on the main thread. Never more than the real size (a UTF-16
+ *  unit is at least one UTF-8 byte), so a record that fits is never refused. */
+function precheck(v: unknown): void {
+  if (!isObject(v)) return
+  const strings = (...xs: unknown[]) => xs.reduce<number>((n, x) => n + (typeof x === 'string' ? x.length : 0), 0)
+  let bytes = strings(v.id, v.title, v.created_at, v.updated_at)
+  const tooLarge = () => { if (bytes > MAX_RECORD_BYTES) throw new Error('Chat history record too large') }
+  tooLarge()
+  if (!Array.isArray(v.messages)) return
+  for (const m of v.messages) {
+    bytes += MIN_MESSAGE_BYTES
+    if (isObject(m)) {
+      bytes += strings(m.content, m.at, m.run_id)
+      if (isObject(m.latency)) bytes += strings(m.latency.modelName, m.latency.tier)
+    }
+    tooLarge()
+  }
+}
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 /** ISO 8601 in UTC, as `Date.prototype.toISOString` writes it: no local
@@ -59,7 +84,9 @@ export function parseChatHistoryRecord(v: unknown): ChatHistoryRecord {
     title: v.title,
     created_at: v.created_at,
     updated_at: v.updated_at,
-    messages: v.messages.map(parseMessage),
+    // Array.from visits holes as undefined, which parseMessage refuses: a
+    // sparse array would otherwise be written with nulls and spoil the file.
+    messages: Array.from(v.messages as unknown[], parseMessage),
   }
 }
 
@@ -107,6 +134,7 @@ export function createChatHistoryStore(dir: string) {
       return record && record.id === id ? record : null
     },
     save(value: unknown): void {
+      precheck(value)
       const record = parseChatHistoryRecord(value)
       const body = JSON.stringify(record)
       if (Buffer.byteLength(body) > MAX_RECORD_BYTES) throw new Error('Chat history record too large')

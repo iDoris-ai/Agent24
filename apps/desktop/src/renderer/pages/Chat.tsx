@@ -8,6 +8,8 @@ import { askWithKnowledge, createChatSession } from './chat-knowledge'
 import { grounding, type Grounding } from './knowledge-grounding'
 import { TurnRail } from './chat/TurnRail'
 import { activeTurn, buildTurns } from './chat/turns'
+import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../shared/chat-history'
+import { loadConversation, registerChatPage, saveConversation, setActiveConversation, setChatBusy } from './chat/history'
 
 /** M1-T14: what `/api/v1/chat` ACTUALLY did with an explicit "记住…" turn —
  *  read off the response field, never off the model's own reply text (the
@@ -36,6 +38,41 @@ interface AssistantMessage {
   /** Answered without Knowledge although its switch is On: main had no
    *  binding for a run, so the turn went to `/api/v1/chat`. */
   knowledgeInactive?: boolean
+  /** The run that answered, when the turn went to /runs (Knowledge). */
+  runId?: string
+}
+
+/** Characters of the first prompt used as a conversation's title. */
+const TITLE_CHARS = 60
+
+/** UI-03: the conversation as the history keeps it. `stamps[i]` is when
+ *  message i arrived; the history keeps text, delivery and the latency line,
+ *  not the receipt or Knowledge labels. */
+function toRecord(id: string, messages: Message[], stamps: readonly string[]): ChatHistoryRecord {
+  const first = (messages.find(m => m.role === 'user')?.content ?? '').replace(/\s+/g, ' ').trim()
+  return {
+    format: CHAT_HISTORY_FORMAT,
+    version: CHAT_HISTORY_VERSION,
+    id,
+    title: first.length > TITLE_CHARS ? `${first.slice(0, TITLE_CHARS)}…` : first,
+    created_at: stamps[0] ?? '',
+    updated_at: stamps.slice(0, messages.length).reduce((a, b) => (b > a ? b : a), ''),
+    messages: messages.map((m, i) => m.role === 'user'
+      ? { role: 'user', content: m.content, at: stamps[i], delivered: m.delivery.kind === 'sent' }
+      : { role: 'assistant', content: m.content, at: stamps[i], run_id: m.runId ?? null, latency: m.suffix ?? null }),
+  }
+}
+
+/** A saved conversation back on the page. A prompt that never reached the
+ *  model comes back "not sent", so it is not sent again as context. */
+function fromRecord(record: ChatHistoryRecord): Message[] {
+  return record.messages.map((m): Message => {
+    if (m.role === 'user') return { role: 'user', content: m.content, delivery: { kind: m.delivered ? 'sent' : 'notSent' } }
+    const reply: AssistantMessage = { role: 'assistant', content: m.content }
+    if (m.latency) reply.suffix = { ...m.latency, tier: m.latency.tier === 'local' || m.latency.tier === 'remote' ? m.latency.tier : null }
+    if (m.run_id) reply.runId = m.run_id
+    return reply
+  })
 }
 
 // M1-T12: one id per conversation, sent as `session_id` on every
@@ -76,6 +113,33 @@ export default function ChatPage() {
   // 2026-10-30-knowledge-same-source-egress), so another server gets a new session.
   const runScope = useRef<string | null>(null)
   const awaitingConfirmation = messages.some(m => m.role === 'user' && m.delivery.kind === 'headroom')
+  // UI-03: when each message arrived, and the record last written, so an
+  // unchanged conversation (e.g. one just opened) is not written again.
+  const stamps = useRef<string[]>([])
+  const lastSaved = useRef('')
+  // Bumped by every switch of conversation (new chat, opening one): a load
+  // that finishes after a newer switch is dropped.
+  const switchGen = useRef(0)
+
+  useEffect(() => { setChatBusy(loading) }, [loading])
+
+  // Every change to a conversation with a prompt in it is saved, memory
+  // paused or not (David 11-08).
+  useEffect(() => {
+    if (!messages.some(m => m.role === 'user')) return
+    const now = new Date().toISOString()
+    for (let i = 0; i < messages.length; i++) stamps.current[i] ??= now
+    const record = toRecord(sessionId, messages, stamps.current)
+    const body = JSON.stringify(record)
+    if (body === lastSaved.current) return
+    lastSaved.current = body
+    // The page, not the save's completion, says which conversation is open.
+    setActiveConversation(sessionId)
+    void saveConversation(record).then(ok => {
+      // Failed: write it again on the next change.
+      if (!ok && lastSaved.current === body) lastSaved.current = ''
+    })
+  }, [messages, sessionId])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -103,14 +167,40 @@ export default function ChatPage() {
   // land in the new conversation.
   const newChat = () => {
     if (requestInFlight.current) return
+    switchGen.current += 1
     setMessages([])
     setInput('')
     setSessionId(genChatSessionId())
     setCurrentTurn(0)
+    stamps.current = []
+    lastSaved.current = ''
+    setActiveConversation(null)
     // Knowledge turns run in their own session (`runSession`); a new
     // conversation must not carry the old one's turns into its runs.
     runSession.current = null
   }
+
+  // UI-03: open a saved conversation from the history list. Not while a reply
+  // is in flight, for the same reason as `newChat`. It continues under its
+  // own session_id; Knowledge turns start a new run session.
+  const openSaved = async (id: string) => {
+    if (requestInFlight.current) return
+    const gen = ++switchGen.current
+    // Already open: nothing to load (the page may be newer than the file);
+    // the bump above still drops any other conversation's load under way.
+    if (id === sessionId && messages.length > 0) return
+    const record = await loadConversation(id)
+    if (!record || requestInFlight.current || gen !== switchGen.current) return
+    const restored = fromRecord(record)
+    stamps.current = record.messages.map(m => m.at)
+    lastSaved.current = JSON.stringify(toRecord(record.id, restored, stamps.current))
+    setMessages(restored)
+    setInput('')
+    setSessionId(record.id)
+    runSession.current = null
+    setActiveConversation(record.id)
+  }
+  useEffect(() => registerChatPage(id => void openSaved(id), newChat))
 
   const setDelivery = (index: number, delivery: Delivery) => {
     setMessages(prev => prev.map((m, i) => i === index && m.role === 'user' ? { ...m, delivery } : m))
@@ -241,7 +331,7 @@ export default function ChatPage() {
         const suffix: ReplyLatency = { modelName: null, tier: null, firstTokenMs: null, totalMs: performance.now() - sentAt }
         setDelivery(index, { kind: 'sent' })
         const knowledge = grounding(turn.text, turn.knowledge)
-        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge }])
+        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge, runId: turn.runId }])
       } else {
         setDelivery(index, { kind: 'notSent' })
         setMessages(prev => [...prev, { role: 'assistant', content: t('knowledge.failed', { error: turn.message }) }])
