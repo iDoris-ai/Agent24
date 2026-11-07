@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import ChatPage from '../Chat'
 import { ChatHistoryList } from './ChatHistoryList'
-import { resetHistoryStore } from './history'
+import { resetHistoryStore, setRetrySleepForTests } from './history'
 import { setLocale } from '../../i18n'
 import type { ChatHistoryRecord } from '../../../shared/chat-history'
 
@@ -34,6 +34,30 @@ function stored(id: string, title: string, updated: string): ChatHistoryRecord {
   }
 }
 
+/** Failed saves wait for `retry()` instead of a timer, so tests decide when
+ *  a retry happens, however slow the queries before it are. */
+let waiting: Array<() => void> = []
+function holdRetries() {
+  setRetrySleepForTests(() => new Promise<void>(go => { waiting.push(go) }))
+}
+async function retry() {
+  await waitFor(() => expect(waiting.length).toBeGreaterThan(0))
+  const go = waiting
+  waiting = []
+  go.forEach(g => g())
+  await new Promise(r => setTimeout(r, 0))
+}
+
+/** The nth call to save (1-based) fails once; the others save as usual. */
+function failSave(nth: number) {
+  let calls = 0
+  chatHistory.save.mockImplementation(async (r: ChatHistoryRecord) => {
+    calls += 1
+    if (calls === nth) throw new Error('ENOSPC')
+    saved.set(r.id, structuredClone(r))
+  })
+}
+
 const showChat = vi.fn()
 function renderBoth() {
   return render(<><ChatHistoryList showChat={showChat} /><ChatPage /></>)
@@ -51,6 +75,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   resetHistoryStore()
   saved = new Map()
+  waiting = []
   memoryStore()
   proxy.mockResolvedValue({ ok: true, status: 200, data: { message: { content: 'ack' } } })
   Object.defineProperty(window, 'agent24', { value: { backendProxy: proxy, chatHistory }, writable: true, configurable: true })
@@ -185,38 +210,45 @@ describe('chat history', () => {
   })
 
   it('retries a failed save of the finished reply without another change', async () => {
+    // The save holding the reply (the second) fails once, then succeeds on its own retry.
+    failSave(2)
+    holdRetries()
     renderBoth()
     send('一')
-    await waitFor(() => expect(chatHistory.save).toHaveBeenCalledTimes(1))
-    // The save holding the reply fails once, then succeeds on its own retry.
-    chatHistory.save.mockRejectedValueOnce(new Error('ENOSPC'))
     await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
-    await waitFor(() => expect([...saved.values()][0]?.messages).toHaveLength(2), { timeout: 2000 })
+    await waitFor(() => expect(chatHistory.save).toHaveBeenCalledTimes(2))
+    expect(saved.size).toBe(1)
+    expect([...saved.values()][0].messages).toHaveLength(1)
+    await retry()
+    await waitFor(() => expect([...saved.values()][0]?.messages).toHaveLength(2))
   })
 
   it('a failed older save, retried late, does not overwrite the newer one with the reply', async () => {
-    renderBoth()
     // The prompt-only save fails; the reply's save then succeeds before the retry.
-    chatHistory.save.mockRejectedValueOnce(new Error('ENOSPC'))
+    failSave(1)
+    holdRetries()
+    renderBoth()
     send('一')
     await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
     await waitFor(() => expect([...saved.values()][0]?.messages).toHaveLength(2))
-    await new Promise(r => setTimeout(r, 700))
+    await retry()
     expect([...saved.values()][0]?.messages).toHaveLength(2)
     expect(chatHistory.save).toHaveBeenCalledTimes(2)
   })
 
   it('deleting another conversation does not cancel a retry', async () => {
     saved.set('chat_b_1', stored('chat_b_1', '话题乙', '2026-11-07T09:00:02.000Z'))
+    failSave(2)
+    holdRetries()
     renderBoth()
     await within(await findHistoryList()).findByRole('button', { name: '话题乙' })
     send('一')
-    await waitFor(() => expect(chatHistory.save).toHaveBeenCalledTimes(1))
-    chatHistory.save.mockRejectedValueOnce(new Error('ENOSPC'))
     await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
+    await waitFor(() => expect(chatHistory.save).toHaveBeenCalledTimes(2))
     fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：话题乙' }))
     await waitFor(() => expect(saved.has('chat_b_1')).toBe(false))
-    await waitFor(() => expect([...saved.values()][0]?.messages).toHaveLength(2), { timeout: 2000 })
+    await retry()
+    await waitFor(() => expect([...saved.values()][0]?.messages).toHaveLength(2))
   })
 
   it('a retry still waiting gives up once the conversation is deleted', async () => {
@@ -224,7 +256,8 @@ describe('chat history', () => {
     renderBoth()
     fireEvent.click(await within(await findHistoryList()).findByRole('button', { name: '话题甲' }))
     await waitFor(() => expect(screen.getByText('答：话题甲')).toBeInTheDocument())
-    chatHistory.save.mockRejectedValueOnce(new Error('ENOSPC'))
+    failSave(2)
+    holdRetries()
     send('再问')
     await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
     await waitFor(() => expect(within(historyList()).getByRole('button', { name: '删除对话：话题甲' })).toBeEnabled())
@@ -232,8 +265,97 @@ describe('chat history', () => {
     // The page left it at once, before the deletion settled.
     expect(screen.queryByText('答：话题甲')).toBeNull()
     await waitFor(() => expect(saved.has('chat_a_1')).toBe(false))
-    await new Promise(r => setTimeout(r, 2200))
+    await retry()
     expect(saved.has('chat_a_1')).toBe(false)
+  })
+
+  it('reopening a conversation while its save waits to retry keeps the reply (PR-Daemon B1)', async () => {
+    failSave(2)
+    holdRetries()
+    renderBoth()
+    send('问A')
+    await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
+    await waitFor(() => expect(chatHistory.save).toHaveBeenCalledTimes(2))
+    // On disk: only the prompt; the reply's save waits to retry.
+    expect([...saved.values()][0].messages.map(m => m.content)).toEqual(['问A'])
+    // New chat, then reopen A inside the retry wait: the page gets the
+    // unsaved record with the reply, not the prompt-only file.
+    fireEvent.click(screen.getByRole('button', { name: '新对话' }))
+    fireEvent.click(await within(await findHistoryList()).findByRole('button', { name: '问A' }))
+    await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
+    proxy.mockResolvedValueOnce({ ok: true, status: 200, data: { message: { content: 'ack2' } } })
+    send('第二问')
+    await waitFor(() => expect(proxy).toHaveBeenCalledTimes(2))
+    expect(proxy.mock.calls[1][0].body.messages).toEqual([
+      { role: 'user', content: '问A' }, { role: 'assistant', content: 'ack' }, { role: 'user', content: '第二问' },
+    ])
+    await waitFor(() => expect([...saved.values()][0]?.messages.map(m => m.content)).toEqual(['问A', 'ack', '第二问', 'ack2']))
+    await retry()
+    expect([...saved.values()][0]?.messages.map(m => m.content)).toEqual(['问A', 'ack', '第二问', 'ack2'])
+    expect([...saved.values()][0]?.messages[0]).toMatchObject({ delivered: true })
+  })
+
+  it('a conversation deleted while it is being opened is not opened (L1)', async () => {
+    saved.set('chat_a_1', stored('chat_a_1', '话题甲', '2026-11-07T10:00:02.000Z'))
+    saved.set('chat_b_1', stored('chat_b_1', '话题乙', '2026-11-07T09:00:02.000Z'))
+    let load!: (v: ChatHistoryRecord | null) => void
+    renderBoth()
+    await within(await findHistoryList()).findByRole('button', { name: '话题乙' })
+    chatHistory.get.mockImplementationOnce(() => new Promise(r => { load = r }))
+    fireEvent.click(within(historyList()).getByRole('button', { name: '话题乙' }))
+    const copy = saved.get('chat_b_1')!
+    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：话题乙' }))
+    await waitFor(() => expect(saved.has('chat_b_1')).toBe(false))
+    load(copy)
+    await new Promise(r => setTimeout(r, 0))
+    expect(screen.queryByText('答：话题乙')).toBeNull()
+    send('新的')
+    await waitFor(() => expect(proxy).toHaveBeenCalledTimes(1))
+    expect(saved.has('chat_b_1')).toBe(false)
+  })
+
+  it.each([
+    ['deleted', (title: string) => fireEvent.click(within(historyList()).getByRole('button', { name: `删除对话：${title}` }))],
+    ['cleared', () => { vi.spyOn(window, 'confirm').mockReturnValue(true); fireEvent.click(within(historyList()).getByRole('button', { name: '清空' })) }],
+  ])('the last save, failing and waiting to retry, stays gone once %s (L4)', async (_name, remove) => {
+    // The reply's save (the second) fails and waits to retry.
+    failSave(2)
+    holdRetries()
+    renderBoth()
+    send('问C')
+    await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
+    await waitFor(() => expect(chatHistory.save).toHaveBeenCalledTimes(2))
+    await within(await findHistoryList()).findByRole('button', { name: '问C' })
+    remove('问C')
+    await waitFor(() => expect(saved.size).toBe(0))
+    await retry()
+    expect(saved.size).toBe(0)
+    expect(screen.queryByRole('region', { name: '历史对话' })).toBeNull()
+  })
+
+  it('a save finishing after its conversation was deleted does not list it again', async () => {
+    saved.set('chat_b_1', stored('chat_b_1', '话题乙', '2026-11-07T09:00:02.000Z'))
+    renderBoth()
+    await within(await findHistoryList()).findByRole('button', { name: '话题乙' })
+    let finish!: () => void
+    chatHistory.save.mockImplementationOnce(async (r: ChatHistoryRecord) => {
+      await new Promise<void>(d => { finish = d })
+      saved.set(r.id, structuredClone(r))
+    })
+    send('问D')
+    await waitFor(() => expect(chatHistory.save).toHaveBeenCalledTimes(1))
+    // While that save is in flight the page is busy; delete another, then
+    // check the in-flight one does not resurrect a deleted entry either.
+    await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
+    const id = proxy.mock.calls[0][0].body.session_id as string
+    fireEvent.click(screen.getByRole('button', { name: '新对话' }))
+    await within(historyList()).findByRole('button', { name: '问D' })
+    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：问D' }))
+    await waitFor(() => expect(within(historyList()).queryByRole('button', { name: '问D' })).toBeNull())
+    finish()
+    await new Promise(r => setTimeout(r, 0))
+    expect(within(historyList()).queryByRole('button', { name: '问D' })).toBeNull()
+    expect(id).toMatch(/^chat_/)
   })
 
   it('works without the history bridge: the chat goes on, nothing is listed', async () => {

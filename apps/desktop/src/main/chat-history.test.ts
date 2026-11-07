@@ -102,10 +102,28 @@ describe('chat history on disk', () => {
     expect(store.list().map(s => s.id)).toEqual(['chat_a'])
   })
 
-  it('refuses too many messages before parsing them', () => {
+  it('refuses too many messages before parsing them, but keeps a large record that fits', () => {
+    const store = createChatHistoryStore(dir)
     const big = record('chat_a', '2026-11-08T01:00:00.000Z')
-    big.messages = Array.from({ length: 100_001 }, () => ({ role: 'user' as const, content: '', at: 'not checked', delivered: true }))
+    big.messages = Array.from({ length: 160_000 }, () => ({ role: 'user' as const, content: '', at: '2026-11-08T00:00:00.000Z', delivered: true }))
+    const stringify = vi.spyOn(JSON, 'stringify')
+    expect(() => store.save(big)).toThrow('too large')
+    expect(stringify).not.toHaveBeenCalled()
+    stringify.mockRestore()
+    // 100,001 empty messages write to about 7.8 MB: under the limit, so saved.
+    const fits = record('chat_b', '2026-11-08T01:00:00.000Z')
+    fits.messages = Array.from({ length: 100_001 }, () => ({ role: 'user' as const, content: '', at: '2026-11-08T00:00:00.000Z', delivered: true }))
+    store.save(fits)
+    expect(store.get('chat_b')?.messages).toHaveLength(100_001)
+  })
+
+  it('counts the title and other strings before parsing', () => {
+    const big = record('chat_a', '2026-11-08T01:00:00.000Z')
+    big.title = 'x'.repeat(9 * 1024 * 1024)
+    big.messages = []
+    const parse = vi.spyOn(JSON, 'stringify')
     expect(() => createChatHistoryStore(dir).save(big)).toThrow('too large')
+    expect(parse).not.toHaveBeenCalled()
   })
 
   it('refuses an oversized record', () => {

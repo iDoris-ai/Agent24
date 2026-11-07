@@ -55,8 +55,8 @@ function toRecord(id: string, messages: Message[], stamps: readonly string[]): C
     version: CHAT_HISTORY_VERSION,
     id,
     title: first.length > TITLE_CHARS ? `${first.slice(0, TITLE_CHARS)}…` : first,
-    created_at: stamps[0],
-    updated_at: stamps.slice(0, messages.length).reduce((a, b) => (b > a ? b : a)),
+    created_at: stamps[0] ?? '',
+    updated_at: stamps.slice(0, messages.length).reduce((a, b) => (b > a ? b : a), ''),
     messages: messages.map((m, i) => m.role === 'user'
       ? { role: 'user', content: m.content, at: stamps[i], delivered: m.delivery.kind === 'sent' }
       : { role: 'assistant', content: m.content, at: stamps[i], run_id: m.runId ?? null, latency: m.suffix ?? null }),
@@ -184,7 +184,8 @@ export default function ChatPage() {
   // is in flight, for the same reason as `newChat`. It continues under its
   // own session_id; Knowledge turns start a new run session.
   const openSaved = async (id: string) => {
-    if (requestInFlight.current) return
+    // Already open: nothing to load, and the page may be newer than the file.
+    if (requestInFlight.current || (id === sessionId && messages.length > 0)) return
     const gen = ++switchGen.current
     const record = await loadConversation(id)
     if (!record || requestInFlight.current || gen !== switchGen.current) return

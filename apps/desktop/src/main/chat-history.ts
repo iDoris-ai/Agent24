@@ -14,18 +14,29 @@ import {
 /** One conversation's file may not exceed this, so a runaway page cannot
  *  fill the disk through one IPC call. */
 const MAX_RECORD_BYTES = 8 * 1024 * 1024
-/** At most this many messages in one conversation. */
-const MAX_MESSAGES = 100_000
+/** Fewer bytes than the fixed part of any written message, its strings
+ *  left empty: `{"role":"user","content":"","at":"","delivered":true}` is
+ *  52; the strings are counted separately below. */
+const MIN_MESSAGE_BYTES = 48
 
-/** Cheap checks before the full parse, so an oversized save is refused
- *  without first parsing and serializing all of it on the main thread. */
+/** A cheap lower bound of the written size, checked before the full parse,
+ *  so an oversized save is refused without first parsing and serializing
+ *  all of it on the main thread. Never more than the real size (a UTF-16
+ *  unit is at least one UTF-8 byte), so a record that fits is never refused. */
 function precheck(v: unknown): void {
-  if (!isObject(v) || !Array.isArray(v.messages)) return
-  if (v.messages.length > MAX_MESSAGES) throw new Error('Chat history record too large')
-  let chars = 0
+  if (!isObject(v)) return
+  const strings = (...xs: unknown[]) => xs.reduce<number>((n, x) => n + (typeof x === 'string' ? x.length : 0), 0)
+  let bytes = strings(v.id, v.title, v.created_at, v.updated_at)
+  const tooLarge = () => { if (bytes > MAX_RECORD_BYTES) throw new Error('Chat history record too large') }
+  tooLarge()
+  if (!Array.isArray(v.messages)) return
   for (const m of v.messages) {
-    if (isObject(m) && typeof m.content === 'string') chars += m.content.length
-    if (chars > MAX_RECORD_BYTES) throw new Error('Chat history record too large')
+    bytes += MIN_MESSAGE_BYTES
+    if (isObject(m)) {
+      bytes += strings(m.content, m.at, m.run_id)
+      if (isObject(m.latency)) bytes += strings(m.latency.modelName, m.latency.tier)
+    }
+    tooLarge()
   }
 }
 

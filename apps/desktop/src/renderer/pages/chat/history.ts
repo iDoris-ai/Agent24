@@ -34,10 +34,18 @@ export function subscribeHistory(listener: () => void): () => void {
   return () => listeners.delete(listener)
 }
 
-/** Reads the list again from main. Failures leave the list as it was. */
+/** Reads the list again from main. Failures leave the list as it was. A
+ *  read that started before a save or a deletion finished does not undo it:
+ *  entries saved since it started are kept, ones removed since are dropped. */
 export async function refreshHistory(): Promise<void> {
+  const mark = seq
   const list = await api()?.list().catch(() => null)
-  if (list) set({ items: list })
+  if (!list) return
+  const newer = state.items.filter(item => (listedAt.get(item.id) ?? 0) > mark)
+  set({
+    items: [...newer, ...list.filter(item => !newer.some(n => n.id === item.id) && !removedSince(item.id, mark))]
+      .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at)),
+  })
 }
 
 /** Waits before each retry of a failed save. */
@@ -51,9 +59,20 @@ let seq = 0
 const newestSave = new Map<string, number>()
 const deletedAt = new Map<string, number>()
 let clearedAt = 0
-const superseded = (id: string, mine: number): boolean =>
-  newestSave.get(id) !== mine || (deletedAt.get(id) ?? 0) > mine || clearedAt > mine
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+const removedSince = (id: string, mark: number): boolean => (deletedAt.get(id) ?? 0) > mark || clearedAt > mark
+const superseded = (id: string, mine: number): boolean => newestSave.get(id) !== mine || removedSince(id, mine)
+/** The newest record of each conversation whose save has not finished yet:
+ *  what is on disk may be older (e.g. while a failed save waits to retry),
+ *  so opening the conversation reads this first. */
+const unsaved = new Map<string, { mine: number; record: ChatHistoryRecord }>()
+/** The save whose summary the list shows, per conversation. */
+const listedAt = new Map<string, number>()
+const realSleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
+let sleep = realSleep
+/** For tests: how a failed save waits before its retry. */
+export function setRetrySleepForTests(wait: (ms: number) => Promise<void>): void {
+  sleep = wait
+}
 
 /** The chat page saves a conversation after each change and refreshes the
  *  list. A failed save is tried again a few times; false when it still
@@ -64,16 +83,26 @@ export async function saveConversation(record: ChatHistoryRecord): Promise<boole
   if (!history) return true
   const mine = ++seq
   newestSave.set(record.id, mine)
+  unsaved.set(record.id, { mine, record })
+  const done = () => { if (unsaved.get(record.id)?.mine === mine) unsaved.delete(record.id) }
   for (let attempt = 0; ; attempt++) {
     try {
       await history.save(record)
       break
     } catch {
-      if (attempt >= SAVE_RETRY_MS.length) return false
+      if (attempt >= SAVE_RETRY_MS.length) {
+        done()
+        return false
+      }
       await sleep(SAVE_RETRY_MS[attempt])
       if (superseded(record.id, mine)) return true
     }
   }
+  done()
+  // Listed unless a newer save already listed it, or it was deleted or
+  // everything cleared since this save was asked for.
+  if ((listedAt.get(record.id) ?? 0) > mine || removedSince(record.id, mine)) return true
+  listedAt.set(record.id, mine)
   // The list is updated from the record itself: reading every conversation
   // again from disk on each save would cost a full scan per chat turn.
   const summary = { id: record.id, title: record.title, created_at: record.created_at, updated_at: record.updated_at }
@@ -84,8 +113,15 @@ export async function saveConversation(record: ChatHistoryRecord): Promise<boole
   return true
 }
 
+/** Reads a conversation to open it: its newest record not yet saved if
+ *  there is one, else the file. Null when it is gone, or was deleted or
+ *  everything cleared while it was being read. */
 export async function loadConversation(id: string): Promise<ChatHistoryRecord | null> {
-  return (await api()?.get(id).catch(() => null)) ?? null
+  const pending = unsaved.get(id)
+  if (pending) return pending.record
+  const mark = seq
+  const record = (await api()?.get(id).catch(() => null)) ?? null
+  return record && !removedSince(id, mark) ? record : null
 }
 
 export function setActiveConversation(id: string | null): void {
@@ -116,6 +152,7 @@ export function openConversation(id: string): void {
 export async function deleteConversation(id: string): Promise<void> {
   if (state.busy && state.activeId === id) return
   deletedAt.set(id, ++seq)
+  unsaved.delete(id)
   // The page leaves the conversation first, synchronously, so nothing sent
   // while the deletion is on its way can land in it and save it again.
   if (state.activeId === id) {
@@ -131,6 +168,7 @@ export async function deleteConversation(id: string): Promise<void> {
 export async function clearConversations(): Promise<void> {
   if (state.busy) return
   clearedAt = ++seq
+  unsaved.clear()
   starter?.()
   set({ activeId: null })
   await api()?.clear().catch(() => {})
@@ -140,6 +178,8 @@ export async function clearConversations(): Promise<void> {
 /** For tests: forget everything. */
 export function resetHistoryStore(): void {
   state = initial
+  unsaved.clear()
+  sleep = realSleep
   opener = null
   starter = null
 }
