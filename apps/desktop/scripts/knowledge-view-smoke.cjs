@@ -156,7 +156,8 @@ async function main() {
   check('inline eval blocked by the partition CSP', r1.eval === 'blocked', r1.eval)
   check('download prevented', downloads.length === 1 && downloads[0] === 'prevented', downloads)
   check('no TURN-over-TCP connection (contract decision #30)', connections.TURN === 0, { turn: r1.turn, connections: connections.TURN })
-  check('WebSocket to a foreign host refused', r1.ws !== 'open', r1.ws)
+  // B is plain http and never upgrades, so 'open' cannot happen; what tells is that B saw no connection.
+  check('WebSocket to a foreign host refused', r1.ws !== 'open' && connections.B === 0, { ws: r1.ws, connections: connections.B })
   check('302 to a foreign host not followed', r1.redirect === 'blocked' && !hits.B.includes('/redir-target'), r1.redirect)
   check('no TCP connection at all to the foreign host (preconnect, ws)', connections.B === 0, connections.B)
 
