@@ -180,8 +180,11 @@ export const KNOWLEDGE_VIEW_PERMISSIONS_POLICY = [
 ].map((feature) => `${feature}=()`).join(', ')
 
 function serverSwitchOffs(values: string[]): string[] {
-  const members = values.flatMap((v) => v.split(',')).map((m) => m.trim()).filter((m) => m !== '')
-  return members.length > 0 && members.every((m) => /^[a-z][a-z0-9-]*=\(\)$/.test(m)) ? [members.join(', ')] : []
+  // Each member is kept only when it is exactly `feature=()`; everything else
+  // (a grant, or text that does not parse) is left out, so what goes out is
+  // always well formed and can only switch more off.
+  const kept = values.flatMap((v) => v.split(',')).map((m) => m.trim()).filter((m) => /^[a-z][a-z0-9-]*=\(\)$/.test(m))
+  return kept.length > 0 ? [kept.join(', ')] : []
 }
 
 export function withKnowledgeCsp(
@@ -200,9 +203,8 @@ export function withKnowledgeCsp(
   out['Content-Security-Policy'] = [...csp, knowledgeViewCsp(origin)]
   // The header is one Structured Fields dictionary: a single malformed member
   // from the server would make Blink ignore the whole field, ours included
-  // (RFC 8941 §4.2). So the server's policy is kept only when every member is
-  // a plain switch-off (`feature=()`), which cannot be malformed and can only
-  // restrict more; anything else from the server is dropped. Ours goes last.
+  // (RFC 8941 §4.2). So of the server's policy only its plain switch-offs
+  // (`feature=()`) are passed on; the rest is dropped. Ours goes last.
   out['Permissions-Policy'] = [...serverSwitchOffs(policy), KNOWLEDGE_VIEW_PERMISSIONS_POLICY]
   return out
 }
