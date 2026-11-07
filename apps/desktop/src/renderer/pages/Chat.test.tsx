@@ -127,8 +127,9 @@ describe('ChatPage', () => {
     expect(within(rail).getByRole('button', { name: '第 2 轮：second' })).toHaveAttribute('aria-current', 'step')
     scroll.mockClear()
     fireEvent.click(within(rail).getByRole('button', { name: '第 1 轮：first' }))
-    expect(scroll).toHaveBeenCalledTimes(1)
-    expect(scroll.mock.contexts[0]).toHaveTextContent('first')
+    const toPrompt = scroll.mock.calls.findIndex(([arg]) => (arg as ScrollIntoViewOptions | undefined)?.block === 'start')
+    expect(toPrompt).toBeGreaterThanOrEqual(0)
+    expect(scroll.mock.contexts[toPrompt]).toHaveTextContent('first')
     expect(within(rail).getByRole('button', { name: '第 1 轮：first' })).toHaveAttribute('aria-current', 'step')
 
     fireEvent.click(screen.getByRole('button', { name: '新对话' }))

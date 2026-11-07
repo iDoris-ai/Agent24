@@ -19,9 +19,12 @@ export function buildTurns(messages: ReadonlyArray<{ role: 'user' | 'assistant';
 }
 
 /** The turn being read: the last one whose prompt starts at or above a line
- *  a third of the way down the viewport. `tops` are the prompts' offsets
- *  from the top of the scroll container's content, in turn order. */
-export function activeTurn(tops: readonly number[], scrollTop: number, viewportHeight: number): number {
+ *  a third of the way down the viewport, or the last turn once the chat is
+ *  scrolled to the bottom (a short last turn may never reach that line).
+ *  `tops` are the prompts' offsets from the top of the scroll container's
+ *  content, in turn order. */
+export function activeTurn(tops: readonly number[], scrollTop: number, viewportHeight: number, scrollHeight: number): number {
+  if (tops.length > 0 && scrollTop + viewportHeight >= scrollHeight - 2) return tops.length - 1
   const line = scrollTop + viewportHeight / 3
   let active = 0
   tops.forEach((top, i) => { if (top <= line) active = i })

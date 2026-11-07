@@ -260,7 +260,7 @@ export default function ChatPage() {
     const box = messagesRef.current
     if (!box) return
     const tops = turns.map(turn => promptRefs.current.get(turn.messageIndex)?.offsetTop ?? 0)
-    setCurrentTurn(activeTurn(tops, box.scrollTop, box.clientHeight))
+    setCurrentTurn(activeTurn(tops, box.scrollTop, box.clientHeight, box.scrollHeight))
   }
 
   const jumpToTurn = (turn: number) => {
