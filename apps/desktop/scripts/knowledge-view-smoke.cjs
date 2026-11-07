@@ -29,7 +29,14 @@ const connections = { B: 0, TURN: 0 }
 const PROBE = `
 const stage = (name) => { window.__stage = name }
 const timedOut = []
-const within = (p, ms) => Promise.race([p, new Promise((d) => setTimeout(() => { timedOut.push(window.__stage); d('timeout') }, ms))])
+// Records the step only when its own timer wins, and clears that timer when the
+// step settles first, so a slow probe never blames a step that answered.
+const within = (p, ms) => {
+  const name = window.__stage
+  let timer
+  const late = new Promise((d) => { timer = setTimeout(() => { timedOut.push(name); d('timeout') }, ms) })
+  return Promise.race([Promise.resolve(p).finally(() => clearTimeout(timer)), late])
+}
 ;(async () => {
   const r = {}
   try {
@@ -79,7 +86,7 @@ const within = (p, ms) => Promise.race([p, new Promise((d) => setTimeout(() => {
     r.error = String(e)
   }
   r.stage = window.__stage
-  r.timedOut = timedOut
+  r.timedOut = timedOut.slice()
   window.__probe = r
 })()
 `
