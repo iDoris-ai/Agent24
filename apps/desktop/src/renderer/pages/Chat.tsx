@@ -184,9 +184,11 @@ export default function ChatPage() {
   // is in flight, for the same reason as `newChat`. It continues under its
   // own session_id; Knowledge turns start a new run session.
   const openSaved = async (id: string) => {
-    // Already open: nothing to load, and the page may be newer than the file.
-    if (requestInFlight.current || (id === sessionId && messages.length > 0)) return
+    if (requestInFlight.current) return
     const gen = ++switchGen.current
+    // Already open: nothing to load (the page may be newer than the file);
+    // the bump above still drops any other conversation's load under way.
+    if (id === sessionId && messages.length > 0) return
     const record = await loadConversation(id)
     if (!record || requestInFlight.current || gen !== switchGen.current) return
     const restored = fromRecord(record)

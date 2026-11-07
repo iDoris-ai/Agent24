@@ -41,7 +41,7 @@ export async function refreshHistory(): Promise<void> {
   const mark = seq
   const list = await api()?.list().catch(() => null)
   if (!list) return
-  const newer = state.items.filter(item => (listedAt.get(item.id) ?? 0) > mark)
+  const newer = state.items.filter(item => (publishedAt.get(item.id) ?? 0) > mark)
   set({
     items: [...newer, ...list.filter(item => !newer.some(n => n.id === item.id) && !removedSince(item.id, mark))]
       .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at)),
@@ -65,8 +65,10 @@ const superseded = (id: string, mine: number): boolean => newestSave.get(id) !==
  *  what is on disk may be older (e.g. while a failed save waits to retry),
  *  so opening the conversation reads this first. */
 const unsaved = new Map<string, { mine: number; record: ChatHistoryRecord }>()
-/** The save whose summary the list shows, per conversation. */
+/** The save whose summary the list shows, per conversation, and when (in
+ *  the same order as `seq`) that summary went into the list. */
 const listedAt = new Map<string, number>()
+const publishedAt = new Map<string, number>()
 const realSleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
 let sleep = realSleep
 /** For tests: how a failed save waits before its retry. */
@@ -103,6 +105,7 @@ export async function saveConversation(record: ChatHistoryRecord): Promise<boole
   // everything cleared since this save was asked for.
   if ((listedAt.get(record.id) ?? 0) > mine || removedSince(record.id, mine)) return true
   listedAt.set(record.id, mine)
+  publishedAt.set(record.id, ++seq)
   // The list is updated from the record itself: reading every conversation
   // again from disk on each save would cost a full scan per chat turn.
   const summary = { id: record.id, title: record.title, created_at: record.created_at, updated_at: record.updated_at }

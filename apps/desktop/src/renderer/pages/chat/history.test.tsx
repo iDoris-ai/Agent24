@@ -48,12 +48,12 @@ async function retry() {
   await new Promise(r => setTimeout(r, 0))
 }
 
-/** The nth call to save (1-based) fails once; the others save as usual. */
-function failSave(nth: number) {
+/** These calls to save (1-based) fail; the others save as usual. */
+function failSave(...nth: number[]) {
   let calls = 0
   chatHistory.save.mockImplementation(async (r: ChatHistoryRecord) => {
     calls += 1
-    if (calls === nth) throw new Error('ENOSPC')
+    if (nth.includes(calls)) throw new Error('ENOSPC')
     saved.set(r.id, structuredClone(r))
   })
 }
@@ -356,6 +356,46 @@ describe('chat history', () => {
     await new Promise(r => setTimeout(r, 0))
     expect(within(historyList()).queryByRole('button', { name: '问D' })).toBeNull()
     expect(id).toMatch(/^chat_/)
+  })
+
+  it('clicking the open conversation drops another one still loading', async () => {
+    saved.set('chat_a_1', stored('chat_a_1', '话题甲', '2026-11-07T10:00:02.000Z'))
+    saved.set('chat_b_1', stored('chat_b_1', '话题乙', '2026-11-07T09:00:02.000Z'))
+    renderBoth()
+    fireEvent.click(await within(await findHistoryList()).findByRole('button', { name: '话题甲' }))
+    await waitFor(() => expect(screen.getByText('答：话题甲')).toBeInTheDocument())
+    let load!: (v: ChatHistoryRecord | null) => void
+    chatHistory.get.mockImplementationOnce(() => new Promise(r => { load = r }))
+    fireEvent.click(within(historyList()).getByRole('button', { name: '话题乙' }))
+    fireEvent.click(within(historyList()).getByRole('button', { name: '话题甲' }))
+    load(saved.get('chat_b_1')!)
+    await new Promise(r => setTimeout(r, 0))
+    expect(screen.getByText('答：话题甲')).toBeInTheDocument()
+    expect(screen.queryByText('答：话题乙')).toBeNull()
+  })
+
+  it('a list read that started before a retried save was listed does not undo it', async () => {
+    saved.set('chat_b_1', stored('chat_b_1', '话题乙', '2026-11-07T09:00:02.000Z'))
+    // Both saves of the new conversation fail: nothing of it is on disk yet.
+    failSave(1, 2)
+    holdRetries()
+    renderBoth()
+    await within(await findHistoryList()).findByRole('button', { name: '话题乙' })
+    send('问E')
+    await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
+    await waitFor(() => expect(chatHistory.save).toHaveBeenCalledTimes(2))
+    expect(saved.size).toBe(1)
+    // Deleting B starts a list read, held here: its snapshot has no 问E.
+    let listed!: (v: unknown) => void
+    chatHistory.list.mockImplementationOnce(() => new Promise(r => { listed = r }))
+    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：话题乙' }))
+    await waitFor(() => expect(chatHistory.list).toHaveBeenCalledTimes(2))
+    // Meanwhile the reply's retry succeeds and lists 问E.
+    await retry()
+    await within(historyList()).findByRole('button', { name: '问E' })
+    listed([])
+    await new Promise(r => setTimeout(r, 0))
+    expect(within(historyList()).getByRole('button', { name: '问E' })).toBeInTheDocument()
   })
 
   it('works without the history bridge: the chat goes on, nothing is listed', async () => {
