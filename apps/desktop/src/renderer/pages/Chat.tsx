@@ -9,7 +9,7 @@ import { grounding, type Grounding } from './knowledge-grounding'
 import { TurnRail } from './chat/TurnRail'
 import { activeTurn, buildTurns } from './chat/turns'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../shared/chat-history'
-import { loadConversation, registerChatPage, saveConversation, setActiveConversation } from './chat/history'
+import { loadConversation, registerChatPage, saveConversation, setActiveConversation, setChatBusy } from './chat/history'
 
 /** M1-T14: what `/api/v1/chat` ACTUALLY did with an explicit "记住…" turn —
  *  read off the response field, never off the model's own reply text (the
@@ -117,6 +117,11 @@ export default function ChatPage() {
   // unchanged conversation (e.g. one just opened) is not written again.
   const stamps = useRef<string[]>([])
   const lastSaved = useRef('')
+  // Bumped by every switch of conversation (new chat, opening one): a load
+  // that finishes after a newer switch is dropped.
+  const switchGen = useRef(0)
+
+  useEffect(() => { setChatBusy(loading) }, [loading])
 
   // Every change to a conversation with a prompt in it is saved, memory
   // paused or not (David 11-08).
@@ -128,7 +133,12 @@ export default function ChatPage() {
     const body = JSON.stringify(record)
     if (body === lastSaved.current) return
     lastSaved.current = body
-    void saveConversation(record)
+    // The page, not the save's completion, says which conversation is open.
+    setActiveConversation(sessionId)
+    void saveConversation(record).then(ok => {
+      // Failed: write it again on the next change.
+      if (!ok && lastSaved.current === body) lastSaved.current = ''
+    })
   }, [messages, sessionId])
 
   useEffect(() => {
@@ -157,6 +167,7 @@ export default function ChatPage() {
   // land in the new conversation.
   const newChat = () => {
     if (requestInFlight.current) return
+    switchGen.current += 1
     setMessages([])
     setInput('')
     setSessionId(genChatSessionId())
@@ -174,8 +185,9 @@ export default function ChatPage() {
   // own session_id; Knowledge turns start a new run session.
   const openSaved = async (id: string) => {
     if (requestInFlight.current) return
+    const gen = ++switchGen.current
     const record = await loadConversation(id)
-    if (!record || requestInFlight.current) return
+    if (!record || requestInFlight.current || gen !== switchGen.current) return
     const restored = fromRecord(record)
     stamps.current = record.messages.map(m => m.at)
     lastSaved.current = JSON.stringify(toRecord(record.id, restored, stamps.current))

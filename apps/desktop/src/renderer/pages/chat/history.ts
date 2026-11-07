@@ -7,11 +7,16 @@ import type { ChatHistoryRecord, ChatHistorySummary } from '../../../shared/chat
 
 export interface HistoryState {
   items: ChatHistorySummary[]
-  /** The conversation the chat page shows, once it has been saved. */
+  /** The conversation the chat page shows, once it has been saved. Only the
+   *  chat page sets it. */
   activeId: string | null
+  /** A reply is in flight: the page cannot switch conversations, so the list
+   *  does not offer to, nor to delete the open one or clear everything. */
+  busy: boolean
 }
 
-let state: HistoryState = { items: [], activeId: null }
+const initial: HistoryState = { items: [], activeId: null, busy: false }
+let state: HistoryState = initial
 const listeners = new Set<() => void>()
 let opener: ((id: string) => void) | null = null
 let starter: (() => void) | null = null
@@ -35,15 +40,19 @@ export async function refreshHistory(): Promise<void> {
   if (list) set({ items: list })
 }
 
-/** The chat page saves a conversation after each change and refreshes the list. */
-export async function saveConversation(record: ChatHistoryRecord): Promise<void> {
+/** The chat page saves a conversation after each change and refreshes the
+ *  list. False when the save failed: the page then tries again on its next
+ *  change. History is best effort; the chat itself goes on. */
+export async function saveConversation(record: ChatHistoryRecord): Promise<boolean> {
   const history = api()
-  if (!history) return
+  if (!history) return true
   try {
     await history.save(record)
-    set({ activeId: record.id })
-    await refreshHistory()
-  } catch { /* history is best effort: the chat itself goes on */ }
+  } catch {
+    return false
+  }
+  await refreshHistory()
+  return true
 }
 
 export async function loadConversation(id: string): Promise<ChatHistoryRecord | null> {
@@ -52,6 +61,10 @@ export async function loadConversation(id: string): Promise<ChatHistoryRecord | 
 
 export function setActiveConversation(id: string | null): void {
   if (state.activeId !== id) set({ activeId: id })
+}
+
+export function setChatBusy(busy: boolean): void {
+  if (state.busy !== busy) set({ busy })
 }
 
 /** The chat page registers how to open a conversation and start a new one. */
@@ -68,8 +81,11 @@ export function openConversation(id: string): void {
   opener?.(id)
 }
 
-/** Deletes one conversation; deleting the open one starts a new chat. */
+/** Deletes one conversation; deleting the open one starts a new chat. The
+ *  open one is not deleted while its reply is in flight: the reply would
+ *  save it again. */
 export async function deleteConversation(id: string): Promise<void> {
+  if (state.busy && state.activeId === id) return
   await api()?.delete(id).catch(() => {})
   if (state.activeId === id) {
     set({ activeId: null })
@@ -78,8 +94,10 @@ export async function deleteConversation(id: string): Promise<void> {
   await refreshHistory()
 }
 
-/** Deletes every conversation and starts a new chat. */
+/** Deletes every conversation and starts a new chat; not while a reply is
+ *  in flight, for the same reason. */
 export async function clearConversations(): Promise<void> {
+  if (state.busy) return
   await api()?.clear().catch(() => {})
   set({ activeId: null })
   starter?.()
@@ -88,7 +106,7 @@ export async function clearConversations(): Promise<void> {
 
 /** For tests: forget everything. */
 export function resetHistoryStore(): void {
-  state = { items: [], activeId: null }
+  state = initial
   opener = null
   starter = null
 }

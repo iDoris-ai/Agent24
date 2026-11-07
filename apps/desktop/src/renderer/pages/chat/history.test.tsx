@@ -9,14 +9,16 @@ import type { ChatHistoryRecord } from '../../../shared/chat-history'
 
 const proxy = vi.fn()
 let saved: Map<string, ChatHistoryRecord>
-const chatHistory = {
-  list: vi.fn(async () => [...saved.values()]
+const chatHistory = { list: vi.fn(), get: vi.fn(), save: vi.fn(), delete: vi.fn(), clear: vi.fn() }
+/** An in-memory store behind the bridge; reset before every test. */
+function memoryStore() {
+  chatHistory.list.mockReset().mockImplementation(async () => [...saved.values()]
     .map(r => ({ id: r.id, title: r.title, created_at: r.created_at, updated_at: r.updated_at }))
-    .sort((a, b) => b.updated_at.localeCompare(a.updated_at))),
-  get: vi.fn(async (id: string) => saved.get(id) ?? null),
-  save: vi.fn(async (r: ChatHistoryRecord) => { saved.set(r.id, structuredClone(r)) }),
-  delete: vi.fn(async (id: string) => { saved.delete(id) }),
-  clear: vi.fn(async () => { saved.clear() }),
+    .sort((a, b) => b.updated_at.localeCompare(a.updated_at)))
+  chatHistory.get.mockReset().mockImplementation(async (id: string) => saved.get(id) ?? null)
+  chatHistory.save.mockReset().mockImplementation(async (r: ChatHistoryRecord) => { saved.set(r.id, structuredClone(r)) })
+  chatHistory.delete.mockReset().mockImplementation(async (id: string) => { saved.delete(id) })
+  chatHistory.clear.mockReset().mockImplementation(async () => { saved.clear() })
 }
 
 function stored(id: string, title: string, updated: string): ChatHistoryRecord {
@@ -49,6 +51,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   resetHistoryStore()
   saved = new Map()
+  memoryStore()
   proxy.mockResolvedValue({ ok: true, status: 200, data: { message: { content: 'ack' } } })
   Object.defineProperty(window, 'agent24', { value: { backendProxy: proxy, chatHistory }, writable: true, configurable: true })
 })
@@ -122,6 +125,71 @@ describe('chat history', () => {
     await waitFor(() => expect(chatHistory.clear).toHaveBeenCalledTimes(1))
     expect(confirm).toHaveBeenCalledTimes(2)
     await waitFor(() => expect(screen.queryByRole('region', { name: '历史对话' })).toBeNull())
+  })
+
+  it('does not delete the open conversation or clear while its reply is in flight', async () => {
+    saved.set('chat_a_1', stored('chat_a_1', '话题甲', '2026-11-07T10:00:02.000Z'))
+    saved.set('chat_b_1', stored('chat_b_1', '话题乙', '2026-11-07T09:00:02.000Z'))
+    let reply!: (v: unknown) => void
+    proxy.mockReturnValueOnce(new Promise(r => { reply = r }))
+    renderBoth()
+    fireEvent.click(await within(await findHistoryList()).findByRole('button', { name: '话题甲' }))
+    await waitFor(() => expect(screen.getByText('答：话题甲')).toBeInTheDocument())
+    send('再问一句')
+    await waitFor(() => expect(within(historyList()).getByRole('button', { name: '删除对话：话题甲' })).toBeDisabled())
+    expect(within(historyList()).getByRole('button', { name: '清空' })).toBeDisabled()
+    expect(within(historyList()).getByRole('button', { name: '话题乙' })).toBeDisabled()
+    expect(within(historyList()).getByRole('button', { name: '删除对话：话题乙' })).toBeEnabled()
+
+    reply({ ok: true, status: 200, data: { message: { content: '后来的答' } } })
+    await waitFor(() => expect(saved.get('chat_a_1')?.messages.at(-1)?.content).toBe('后来的答'))
+    await waitFor(() => expect(within(historyList()).getByRole('button', { name: '删除对话：话题甲' })).toBeEnabled())
+  })
+
+  it('a load that finishes after "New chat" is dropped', async () => {
+    saved.set('chat_a_1', stored('chat_a_1', '话题甲', '2026-11-07T10:00:02.000Z'))
+    let load!: (v: ChatHistoryRecord | null) => void
+    chatHistory.get.mockImplementationOnce(() => new Promise(r => { load = r }))
+    renderBoth()
+    fireEvent.click(await within(await findHistoryList()).findByRole('button', { name: '话题甲' }))
+    fireEvent.click(screen.getByRole('button', { name: '新对话' }))
+    load(saved.get('chat_a_1')!)
+    await new Promise(r => setTimeout(r, 0))
+    expect(screen.queryByText('答：话题甲')).toBeNull()
+    send('新话题')
+    await waitFor(() => expect(proxy).toHaveBeenCalledTimes(1))
+    expect(proxy.mock.calls[0][0].body.session_id).not.toBe('chat_a_1')
+    expect(proxy.mock.calls[0][0].body.messages).toEqual([{ role: 'user', content: '新话题' }])
+  })
+
+  it('a save finishing after "New chat" does not mark the old conversation open again', async () => {
+    const pending: Array<() => void> = []
+    chatHistory.save.mockImplementation(async (r: ChatHistoryRecord) => {
+      await new Promise<void>(done => pending.push(done))
+      saved.set(r.id, structuredClone(r))
+    })
+    renderBoth()
+    send('话题丙')
+    await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', { name: '新对话' }))
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), { target: { value: '草稿' } })
+    pending.forEach(done => done())
+    const item = await within(await findHistoryList()).findByRole('button', { name: '话题丙' })
+    expect(item).not.toHaveAttribute('aria-current')
+    // Deleting it now leaves the new chat and its draft alone.
+    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：话题丙' }))
+    await waitFor(() => expect(saved.size).toBe(0))
+    expect(screen.getByPlaceholderText(/输入消息/)).toHaveValue('草稿')
+  })
+
+  it('writes again on the next change after a failed save', async () => {
+    chatHistory.save.mockRejectedValueOnce(new Error('ENOSPC'))
+    renderBoth()
+    send('一')
+    await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
+    await waitFor(() => expect(chatHistory.save).toHaveBeenCalled())
+    send('二')
+    await waitFor(() => expect([...saved.values()][0]?.messages).toHaveLength(4))
   })
 
   it('works without the history bridge: the chat goes on, nothing is listed', async () => {

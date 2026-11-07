@@ -15,14 +15,14 @@ import {
  *  each can be deleted, and all can be cleared after a confirmation. */
 export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   const t = useT(chatMessages)
-  const { items, activeId } = useSyncExternalStore(subscribeHistory, getHistoryState)
+  const { items, activeId, busy } = useSyncExternalStore(subscribeHistory, getHistoryState)
   useEffect(() => { void refreshHistory() }, [])
   if (items.length === 0) return null
   return (
     <section className="chat-history" aria-label={t('history.label')}>
       <div className="chat-history-head">
         <span>{t('history.recent')}</span>
-        <button type="button" className="chat-history-clear" onClick={() => {
+        <button type="button" className="chat-history-clear" disabled={busy} onClick={() => {
           if (window.confirm(t('history.clearConfirm'))) void clearConversations()
         }}>{t('history.clear')}</button>
       </div>
@@ -31,10 +31,11 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
           const title = item.title || t('newChat')
           return (
             <li key={item.id} className={`chat-history-item${item.id === activeId ? ' active' : ''}`}>
-              <button type="button" className="chat-history-open" title={title}
+              <button type="button" className="chat-history-open" title={title} disabled={busy && item.id !== activeId}
                 aria-current={item.id === activeId ? 'true' : undefined}
                 onClick={() => { openConversation(item.id); showChat() }}>{title}</button>
               <button type="button" className="chat-history-delete" aria-label={t('history.delete', { title })}
+                disabled={busy && item.id === activeId}
                 onClick={() => void deleteConversation(item.id)}>×</button>
             </li>
           )
