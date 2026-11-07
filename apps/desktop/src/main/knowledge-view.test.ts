@@ -3,12 +3,12 @@ import {
   KNOWLEDGE_VIEW_DEV_URL_ENV,
   KNOWLEDGE_VIEW_PARTITION_PREFIX,
   MAX_KNOWLEDGE_VIEW_PARTITIONS,
+  KNOWLEDGE_VIEW_DESTROY_WAIT_MS,
   KnowledgeViewHost,
   type KnowledgeViewHostDeps,
   devKnowledgeViewTarget,
   isAllowedDocument,
   isAllowedRequest,
-  knowledgeViewBindingKey,
   knowledgeViewCsp,
   knowledgeViewPreferences,
   knowledgeViewTarget,
@@ -32,6 +32,13 @@ class FakeEmitter {
     this.listeners.set(event, [...(this.listeners.get(event) ?? []), listener])
     return this
   }
+  once(event: string, listener: Listener): this {
+    const wrapped: Listener = (...args) => {
+      this.listeners.set(event, (this.listeners.get(event) ?? []).filter((l) => l !== wrapped))
+      return listener(...args)
+    }
+    return this.on(event, wrapped)
+  }
   emit(event: string, ...args: unknown[]): void {
     for (const l of this.listeners.get(event) ?? []) l(...args)
   }
@@ -54,14 +61,17 @@ class FakeSession extends FakeEmitter {
     onBeforeRequest: (l: Listener) => { this.beforeRequest = l },
     onHeadersReceived: (l: Listener) => { this.headersReceived = l },
   }
-  constructor(readonly partition: string) { super() }
+  /** Calls in order, for checking that cleanup comes after the page is gone. */
+  readonly log: string[]
+  constructor(readonly partition: string, log: string[] = []) { super(); this.log = log }
   setPermissionRequestHandler(l: Listener) { this.permissionRequest = l }
   setPermissionCheckHandler(l: Listener) { this.permissionCheck = l }
   setDevicePermissionHandler(l: Listener) { this.devicePermission = l }
-  clearStorageData(options?: { storages?: string[] }) { this.cleared.push(options ? `storage:${options.storages?.join(',')}` : 'storage'); return Promise.resolve() }
-  clearCache() { this.cleared.push('cache'); return Promise.resolve() }
-  clearAuthCache() { this.cleared.push('auth'); return Promise.resolve() }
-  closeAllConnections() { this.cleared.push('connections'); return Promise.resolve() }
+  private record(what: string) { this.cleared.push(what); this.log.push(what); return Promise.resolve() }
+  clearStorageData(options?: { storages?: string[] }) { return this.record(options ? `storage:${options.storages?.join(',')}` : 'storage') }
+  clearCache() { return this.record('cache') }
+  clearAuthCache() { return this.record('auth') }
+  closeAllConnections() { return this.record('connections') }
   /** What the partition's network filter says about `url`. */
   allows(url: string): boolean {
     let out: { cancel: boolean } | null = null
@@ -80,7 +90,17 @@ class FakeContents extends FakeEmitter {
   getURL() { return this.url }
   loadURL(url: string) { this.loads.push(url); this.url = url; return nextLoad() }
   reload() {}
-  close() { this.destroyed = true }
+  /** Electron destroys a closed page later; tests that care set this. */
+  asyncClose = false
+  closed = false
+  close() {
+    this.closed = true
+    if (!this.asyncClose) this.finishClose()
+  }
+  finishClose() {
+    this.destroyed = true
+    this.emit('destroyed')
+  }
   setWindowOpenHandler(l: Listener) { this.openHandler = l }
   setWebRTCIPHandlingPolicy(p: string) { this.webrtc = p }
 }
@@ -96,7 +116,7 @@ class FakeView {
   setBackgroundColor(c: string) { this.background = c }
 }
 
-class FakeWindow {
+class FakeWindow extends FakeEmitter {
   destroyed = false
   readonly children: FakeView[] = []
   readonly contentView = {
@@ -105,6 +125,9 @@ class FakeWindow {
   }
   isDestroyed() { return this.destroyed }
 }
+
+const ALL_CLEARED = ['connections', 'storage', 'cache', 'auth']
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0))
 
 function setup(over: Partial<{ binding: string | null; target: ReturnType<typeof knowledgeViewTarget>; packaged: boolean }> = {}) {
   const views: FakeView[] = []
@@ -152,13 +175,6 @@ describe('knowledgeViewTarget (U4.4)', () => {
     expect(devKnowledgeViewTarget(env, false)?.url).toBe(URL_)
     expect(devKnowledgeViewTarget(env, true)).toBeNull()
     expect(devKnowledgeViewTarget({}, false)).toBeNull()
-  })
-
-  it('names the binding only while On with a key', () => {
-    expect(knowledgeViewBindingKey({ enabled: true, endpoint: 'https://a/api', hasKey: true })).toBe('https://a/api')
-    expect(knowledgeViewBindingKey({ enabled: false, endpoint: 'https://a/api', hasKey: true })).toBeNull()
-    expect(knowledgeViewBindingKey({ enabled: true, endpoint: 'https://a/api', hasKey: false })).toBeNull()
-    expect(knowledgeViewBindingKey(null)).toBeNull()
   })
 })
 
@@ -322,7 +338,8 @@ describe('KnowledgeViewHost', () => {
     t.host.bindingChanged()
     expect(t.env.win!.children).toEqual([])
     expect(t.views[0].webContents.destroyed).toBe(true)
-    expect(t.sessions[0].cleared).toEqual(['storage', 'cache', 'auth', 'connections'])
+    await flush()
+    expect(t.sessions[0].cleared).toEqual(ALL_CLEARED)
     await t.host.show(BOUNDS)
     expect(t.views).toHaveLength(2)
     expect(t.views[1].prefs.partition).not.toBe(t.views[0].prefs.partition)
@@ -366,9 +383,67 @@ describe('KnowledgeViewHost', () => {
   it('app quit destroys everything', async () => {
     const t = setup()
     await t.host.show(BOUNDS)
-    t.host.destroyAll('app quit')
+    t.host.shutdown()
     expect(t.views[0].webContents.destroyed).toBe(true)
-    expect(t.sessions[0].cleared).toEqual(['storage', 'cache', 'auth', 'connections'])
+    await flush()
+    expect(t.sessions[0].cleared).toEqual(ALL_CLEARED)
+    // ADR §4: no new instance once quitting, whatever the renderer still sends.
+    expect(await t.host.show(BOUNDS)).toEqual({ ok: false, code: 'window_unavailable' })
+    expect(await t.host.reload(BOUNDS)).toEqual({ ok: false, code: 'window_unavailable' })
+    expect(t.views).toHaveLength(1)
+  })
+
+  it('seals the partition first and clears it only after the page is destroyed (U4.7)', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    const wc = t.views[0].webContents
+    const ses = t.sessions[0]
+    wc.asyncClose = true
+    t.env.binding = null
+    t.host.bindingChanged()
+    expect(wc.closed).toBe(true)
+    // Sealed: the closing page's late requests are all cancelled, even to the allowed origin.
+    expect(ses.allows(`${ORIGIN}/keepalive`)).toBe(false)
+    await flush()
+    expect(ses.cleared).toEqual([])
+    wc.finishClose()
+    await flush()
+    expect(ses.cleared).toEqual(ALL_CLEARED)
+  })
+
+  it('clears anyway when the page is not destroyed in time', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    t.views[0].webContents.asyncClose = true
+    t.host.destroyAll('test')
+    const wait = t.timers.find((x) => x.ms === KNOWLEDGE_VIEW_DESTROY_WAIT_MS)
+    expect(wait).toBeDefined()
+    wait!.fn()
+    await flush()
+    expect(t.sessions[0].cleared).toEqual(ALL_CLEARED)
+  })
+
+  it('a closed window takes its view down even if nothing shows it again', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    t.env.win!.emit('closed')
+    expect(t.views[0].webContents.destroyed).toBe(true)
+  })
+
+  it('an unresponsive page steps aside with a typed state and comes back when it recovers', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    const wc = t.views[0].webContents
+    wc.emit('unresponsive')
+    expect(t.views[0].visible).toBe(false)
+    expect(t.host.status()).toEqual({ state: 'degraded', code: 'unresponsive' })
+    wc.emit('responsive')
+    expect(t.views[0].visible).toBe(true)
+    expect(t.host.status()).toEqual({ state: 'ready' })
+    wc.emit('unresponsive')
+    expect(await t.host.reload(BOUNDS)).toEqual({ ok: true })
+    expect(wc.destroyed).toBe(true)
+    expect(t.views).toHaveLength(2)
   })
 
   it('a main frame that commits off-origin ends the instance', async () => {
@@ -456,6 +531,36 @@ describe('KnowledgeViewHost', () => {
     // The user's reload is the way out.
     expect(await t.host.reload(BOUNDS)).toEqual({ ok: true })
     expect(t.views).toHaveLength(5)
+  })
+
+  it('a crash loop belongs to its binding: another binding or Off ends it (§9.2)', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    for (let i = 0; i < 4; i++) {
+      t.views[t.views.length - 1].webContents.emit('render-process-gone', {}, { reason: 'crashed' })
+      if (i < 3) { t.timers[t.timers.length - 1].fn(); await Promise.resolve() }
+    }
+    expect(t.host.status()).toEqual({ state: 'closed', code: 'crash_loop' })
+    t.env.binding = 'https://other.example.org/api/v1'
+    t.host.bindingChanged()
+    expect(t.host.status()).toEqual({ state: 'hidden' })
+    expect(await t.host.show(BOUNDS)).toEqual({ ok: true })
+    // The new binding starts with no crashes counted: one crash is a rebuild, not closed.
+    t.views[t.views.length - 1].webContents.emit('render-process-gone', {}, { reason: 'crashed' })
+    expect(t.host.status()).toEqual({ state: 'degraded', code: 'crashed' })
+  })
+
+  it('Off says Off, not the old crash loop', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    for (let i = 0; i < 4; i++) {
+      t.views[t.views.length - 1].webContents.emit('render-process-gone', {}, { reason: 'crashed' })
+      if (i < 3) { t.timers[t.timers.length - 1].fn(); await Promise.resolve() }
+    }
+    t.env.binding = null
+    expect(await t.host.show(BOUNDS)).toEqual({ ok: false, code: 'knowledge_off' })
+    t.env.binding = 'https://kb.example.org/api/v1'
+    expect(await t.host.show(BOUNDS)).toEqual({ ok: true })
   })
 
   it('crashes outside the ten-minute window do not count', async () => {

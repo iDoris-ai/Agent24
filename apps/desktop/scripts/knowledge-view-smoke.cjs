@@ -82,7 +82,9 @@ async function main() {
     sessionFor: (partition) => {
       partitions.push(partition)
       const ses = session.fromPartition(partition, { cache: false })
-      ses.on('will-download', (event, item) => setImmediate(() => downloads.push(item.getState())))
+      // Registered before the host's own handler, so it reads the outcome in a
+      // microtask: still this tick (a prevented DownloadItem is gone on the next).
+      ses.on('will-download', (event) => queueMicrotask(() => downloads.push(event.defaultPrevented ? 'prevented' : 'allowed')))
       return ses
     },
     target: () => ({ origin: a.origin, url: `${a.origin}/?${binding}` }),
@@ -117,7 +119,7 @@ async function main() {
   check('Worker and Service Worker refused', r1.worker === 'blocked' && r1.serviceWorker === 'blocked', [r1.worker, r1.serviceWorker])
   check('permissions denied', r1.notification === 'denied' && r1.geo.startsWith('denied') && r1.media === 'denied', [r1.notification, r1.geo, r1.media])
   check('inline eval blocked by the partition CSP', r1.eval === 'blocked', r1.eval)
-  check('download cancelled', downloads.length === 1 && downloads[0] === 'cancelled', downloads)
+  check('download prevented', downloads.length === 1 && downloads[0] === 'prevented', downloads)
 
   const wc = view().webContents
   await wc.executeJavaScript(`location.href = ${JSON.stringify(`${originB}/nav`)}`)
@@ -131,8 +133,10 @@ async function main() {
   const firstSession = session.fromPartition(partitions[0], { cache: false })
   binding = 'profile-2'
   host.bindingChanged()
-  check('binding change destroys the first instance', win.contentView.children.length === 0 && wc.isDestroyed())
-  await new Promise((d) => setTimeout(d, 300))
+  check('binding change takes the first instance down', win.contentView.children.length === 0)
+  // Cleared once the page is destroyed (or after the host's bounded wait).
+  await new Promise((d) => setTimeout(d, 2500))
+  check('first page destroyed', wc.isDestroyed())
   const cookies1 = await firstSession.cookies.get({})
   check('first partition cleared', cookies1.length === 0, cookies1.length)
   await host.show({ x: 0, y: 0, width: 800, height: 600 }, 'dark')
@@ -141,8 +145,10 @@ async function main() {
     && partitions.every((p) => !p.startsWith('persist:')), partitions)
   check('second profile sees none of the first one’s storage', r2.before.local === null && r2.before.cookie === '', r2.before)
 
-  host.destroyAll('app quit')
+  host.shutdown()
   check('quit destroys the view', win.contentView.children.length === 0)
+  const again = await host.show({ x: 0, y: 0, width: 800, height: 600 }, 'dark')
+  check('no new view after quit', !again.ok && win.contentView.children.length === 0, again)
 
   a.s.close(); b.s.close()
   const failed = checks.filter((ok) => !ok).length

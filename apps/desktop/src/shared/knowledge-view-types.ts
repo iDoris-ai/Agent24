@@ -27,6 +27,6 @@ export type KnowledgeViewState =
   | { state: 'hidden' }
   | { state: 'loading' }
   | { state: 'ready' }
-  | { state: 'degraded'; code: 'crashed' | 'navigated_away' | 'load_failed' }
+  | { state: 'degraded'; code: 'crashed' | 'navigated_away' | 'load_failed' | 'unresponsive' }
   | { state: 'closed'; code: 'crash_loop' }
   | { state: 'unavailable'; code: 'knowledge_off' | 'not_configured' | 'partition_limit' }

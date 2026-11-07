@@ -45,7 +45,7 @@ import { KnowledgeLoginStore } from './knowledge-logins'
 import { KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
 // KB-C2-03: the KnowledgeView lives in its own module; the lines that wire it
 // in below are additions only and leave the Creative view's paths untouched.
-import { KnowledgeViewHost, devKnowledgeViewTarget, knowledgeViewBindingKey, registerKnowledgeViewIpc } from './knowledge-view'
+import { KnowledgeViewHost, devKnowledgeViewTarget, registerKnowledgeViewIpc } from './knowledge-view'
 
 const isDev = process.env.NODE_ENV === 'development'
 setBundledPackaged(app.isPackaged)
@@ -472,7 +472,7 @@ app.whenReady().then(async () => {
     createView: (webPreferences) => new WebContentsView({ webPreferences }),
     sessionFor: (partition) => session.fromPartition(partition, { cache: false }),
     target: () => devKnowledgeViewTarget(process.env, app.isPackaged),
-    binding: () => knowledgeViewBindingKey(knowledge?.status()),
+    binding: () => knowledge?.viewBinding() ?? null,
     packaged: app.isPackaged,
     onState: (state) => {
       if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.KnowledgeViewState, state)
@@ -615,8 +615,9 @@ const shutdown = createCreativeShutdown({
   quit: () => app.quit(),
 })
 app.on('before-quit', shutdown.beforeQuit)
-// KB-C2-03: app quit is binding-level destruction for the KnowledgeView (U4.8).
-app.on('before-quit', () => knowledgeView?.destroyAll('app quit'))
+// KB-C2-03: app quit is binding-level destruction for the KnowledgeView (U4.8);
+// from here on it refuses to open again (ADR §4: stop new calls, then destroy).
+app.on('before-quit', () => knowledgeView?.shutdown())
 app.on('will-quit', shutdown.willQuit)
 
 // window-all-closed fires only if tray is null (i.e., user chose Quit from

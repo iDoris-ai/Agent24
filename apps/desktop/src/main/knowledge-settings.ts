@@ -120,6 +120,9 @@ export class KnowledgeController {
   private saving: Promise<void> = Promise.resolve()
   private readonly nowSeconds: () => number
   private readonly listeners = new Set<() => void>()
+  /** Bumped when a new key or endpoint is saved: possibly another principal,
+   * so the KnowledgeView must not carry the old page session over. */
+  private identity = 0
 
   constructor(
     private readonly host: KnowledgeHost,
@@ -145,6 +148,13 @@ export class KnowledgeController {
   onChange(listener: () => void): () => void {
     this.listeners.add(listener)
     return () => { this.listeners.delete(listener) }
+  }
+
+  /** What a KnowledgeView instance stands for: the binding as it is now
+   * (endpoint and key included), or none while Off or incomplete. A different
+   * value means a new instance in a new partition (KB-C2-03, U4.1/U4.8). */
+  viewBinding(): string | null {
+    return this.settings.enabled && this.complete() ? `${KNOWLEDGE_BINDING}#${this.identity}` : null
   }
 
   /** The binding a new run is to name, or none while Off or incomplete. */
@@ -186,6 +196,7 @@ export class KnowledgeController {
       return { ok: false, reason: 'not_saved' }
     }
     if (overtaken()) return { ok: false, reason: 'not_saved' }
+    if (typeof apiKey === 'string' || next.endpoint !== this.settings.endpoint) this.identity++
     this.settings = next
     return this.apply()
   }

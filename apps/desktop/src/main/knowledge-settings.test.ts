@@ -74,6 +74,28 @@ describe('KnowledgeController (M3)', () => {
     expect(seen).toHaveLength(3)
   })
 
+  it('names a new view binding for a new key or endpoint, none while Off (KB-C2-03)', async () => {
+    const controller = make()
+    expect(controller.viewBinding()).toBeNull()
+    await controller.configure(GOOD)
+    expect(controller.viewBinding()).toBeNull()
+    await controller.setEnabled(true)
+    const first = controller.viewBinding()
+    expect(first).not.toBeNull()
+    expect(first).not.toContain(GOOD.apiKey)
+    expect(first).not.toContain('kb.example')
+    // Same endpoint and knowledge bases, another key: possibly another principal.
+    await controller.configure({ ...GOOD, apiKey: 'sk-OTHER' })
+    const second = controller.viewBinding()
+    expect(second).not.toBeNull()
+    expect(second).not.toBe(first)
+    // Only the knowledge bases change: the same principal, the same binding.
+    await controller.configure({ endpoint: GOOD.endpoint, knowledgeBaseIds: ['kb-a'] })
+    expect(controller.viewBinding()).toBe(second)
+    await controller.setEnabled(false)
+    expect(controller.viewBinding()).toBeNull()
+  })
+
   it('a failing listener does not stop the change', async () => {
     const controller = make()
     controller.onChange(() => { throw new Error('boom') })

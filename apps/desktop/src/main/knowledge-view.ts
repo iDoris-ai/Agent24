@@ -46,6 +46,8 @@ export const KNOWLEDGE_VIEW_DEV_URL_ENV = 'AGENT24_KNOWLEDGE_VIEW_URL'
 export const KNOWLEDGE_VIEW_MAX_CRASHES = 3
 export const KNOWLEDGE_VIEW_CRASH_WINDOW_MS = 10 * 60_000
 const CRASH_BACKOFF_MS = [1_000, 2_000, 4_000]
+/** How long cleanup waits for the page to be destroyed before clearing anyway. */
+export const KNOWLEDGE_VIEW_DESTROY_WAIT_MS = 2_000
 
 export interface KnowledgeViewTarget {
   /** The exact allowed origin (U4.4). */
@@ -76,12 +78,6 @@ export function knowledgeViewTarget(value: unknown): KnowledgeViewTarget | null 
 export function devKnowledgeViewTarget(env: Record<string, string | undefined>, packaged: boolean): KnowledgeViewTarget | null {
   if (packaged) return null
   return knowledgeViewTarget(env[KNOWLEDGE_VIEW_DEV_URL_ENV])
-}
-
-/** What the view stands for: the Knowledge binding while On and complete, else
- * none. A different value means a different profile, so a new instance. */
-export function knowledgeViewBindingKey(status: { enabled: boolean; endpoint: string; hasKey: boolean } | null | undefined): string | null {
-  return status && status.enabled && status.hasKey && status.endpoint !== '' ? status.endpoint : null
 }
 
 function parse(url: string): URL | null {
@@ -277,7 +273,12 @@ export class KnowledgeViewHost {
   private bounds: KnowledgeViewBounds | null = null
   private theme: KnowledgeViewTheme = 'dark'
   private crashes: number[] = []
-  private closed: 'crash_loop' | null = null
+  /** `closed` belongs to the binding it happened under; another binding, or
+   * Off, ends it (§9.2: binding-level destruction ends `closed`). */
+  private closed: { code: 'crash_loop'; binding: string } | null = null
+  private crashBinding: string | null = null
+  /** App quit: no new instance from here on. */
+  private disposed = false
   private rebuildTimer: unknown = null
   private state: KnowledgeViewState = { state: 'hidden' }
   private readonly now: () => number
@@ -309,14 +310,17 @@ export class KnowledgeViewHost {
     if (rawTheme === 'light' || rawTheme === 'dark') this.theme = rawTheme
 
     const win = this.deps.window()
-    if (!win || win.isDestroyed()) return { ok: false, code: 'window_unavailable' }
-    if (this.closed) return { ok: false, code: this.closed }
+    if (this.disposed || !win || win.isDestroyed()) return { ok: false, code: 'window_unavailable' }
     const binding = this.deps.binding()
     if (binding === null) {
+      this.endBinding()
       this.destroy('knowledge off')
       this.setState({ state: 'unavailable', code: 'knowledge_off' })
       return { ok: false, code: 'knowledge_off' }
     }
+    if (this.closed && this.closed.binding !== binding) this.endBinding()
+    if (this.crashBinding !== binding) this.crashes = []
+    if (this.closed) return { ok: false, code: this.closed.code }
     const target = this.deps.target()
     if (!target) {
       this.destroy('no address')
@@ -378,22 +382,40 @@ export class KnowledgeViewHost {
 
   /** The user's reload: a new instance; also the way out of `closed` (§9.2). */
   async reload(rawBounds: unknown, rawTheme?: unknown): Promise<KnowledgeViewResult> {
-    this.closed = null
-    this.crashes = []
+    if (this.disposed) return { ok: false, code: 'window_unavailable' }
+    this.endBinding()
     this.destroy('reload')
     return this.show(rawBounds, rawTheme)
   }
 
-  /** The Knowledge settings changed: a different binding (or Off) ends the instance. */
+  /** The Knowledge settings changed: a different binding (or Off) ends the
+   * instance and whatever `closed` or crash count the old one left. */
   bindingChanged(): void {
-    if (this.instance && this.instance.binding !== this.deps.binding()) this.destroy('binding changed')
+    const binding = this.deps.binding()
+    if (this.closed && this.closed.binding !== binding) {
+      this.endBinding()
+      this.setState({ state: 'hidden' })
+    }
+    if (this.crashBinding !== binding) this.crashes = []
+    if (this.instance && this.instance.binding !== binding) this.destroy('binding changed')
   }
 
-  /** App quit or window teardown: binding-level destruction (U4.8). */
+  /** Binding-level destruction (U4.8) without closing the door: window teardown, tests. */
   destroyAll(reason: string): void {
+    this.endBinding()
+    this.destroy(reason)
+  }
+
+  /** App quit: destroy, and refuse every later show or reload. */
+  shutdown(): void {
+    this.disposed = true
+    this.destroyAll('app quit')
+  }
+
+  private endBinding(): void {
     this.closed = null
     this.crashes = []
-    this.destroy(reason)
+    this.crashBinding = null
   }
 
   private create(win: BrowserWindow, binding: string, target: KnowledgeViewTarget): Instance {
@@ -419,7 +441,23 @@ export class KnowledgeViewHost {
     view.webContents.on('render-process-gone', (_event, details) => {
       if (this.instance !== instance) return
       this.log(`[knowledge-view] render process gone: ${details.reason}`)
-      this.crashed()
+      this.crashed(instance.binding)
+    })
+    // ADR §4: a hung page is a typed degraded state; the view steps aside so
+    // the page's Reload button can be reached, and comes back if it recovers.
+    view.webContents.on('unresponsive', () => {
+      if (this.instance !== instance) return
+      view.setVisible(false)
+      this.setState({ state: 'degraded', code: 'unresponsive' })
+    })
+    view.webContents.on('responsive', () => {
+      if (this.instance !== instance || this.state.state !== 'degraded' || this.state.code !== 'unresponsive') return
+      if (this.visible) view.setVisible(true)
+      this.setState(this.visible ? { state: 'ready' } : { state: 'hidden' })
+    })
+    // The view does not go with its window (Electron resource management).
+    win.once('closed', () => {
+      if (this.instance === instance) this.destroy('window closed')
     })
     view.setVisible(false)
     win.contentView.addChildView(view)
@@ -436,13 +474,15 @@ export class KnowledgeViewHost {
   }
 
   /** U4.8: view-level handling with backoff; too many crashes close it. */
-  private crashed(): void {
+  private crashed(binding: string): void {
     const now = this.now()
+    if (this.crashBinding !== binding) this.crashes = []
+    this.crashBinding = binding
     this.crashes = this.crashes.filter((at) => now - at < KNOWLEDGE_VIEW_CRASH_WINDOW_MS)
     this.crashes.push(now)
     this.destroy('render process gone')
     if (this.crashes.length > KNOWLEDGE_VIEW_MAX_CRASHES) {
-      this.closed = 'crash_loop'
+      this.closed = { code: 'crash_loop', binding }
       this.setState({ state: 'closed', code: 'crash_loop' })
       return
     }
@@ -456,8 +496,9 @@ export class KnowledgeViewHost {
     }, delay)
   }
 
-  /** U4.7 ④⑤: take the page down, then clear its partition. Never throws;
-   * nothing here reopens the view. */
+  /** U4.7 ④⑤: seal the partition, take the page down, and clear the
+   * partition once the page is gone. Never throws; nothing here reopens the
+   * view. The partition is never used again either way. */
   private destroy(reason: string): void {
     this.request++
     if (this.rebuildTimer !== null) {
@@ -467,6 +508,14 @@ export class KnowledgeViewHost {
     const instance = this.instance
     if (!instance) return
     this.instance = null
+    const ses = instance.session
+    // Sealed first: nothing the closing page still has queued (unload
+    // handlers, keepalive) leaves or comes back to refill the partition.
+    try {
+      ses.webRequest.onBeforeRequest((_details, callback) => callback({ cancel: true }))
+    } catch (error) {
+      this.log(`[knowledge-view] seal partition failed (${reason}): ${String(error)}`)
+    }
     try {
       if (!instance.window.isDestroyed()) instance.window.contentView.removeChildView(instance.view)
     } catch (error) {
@@ -477,21 +526,37 @@ export class KnowledgeViewHost {
     } catch (error) {
       this.log(`[knowledge-view] close page failed (${reason}): ${String(error)}`)
     }
+    void this.clearWhenGone(instance, reason)
+    if (this.state.state !== 'closed') this.setState({ state: 'hidden' })
+  }
+
+  /** Electron destroys a closed page asynchronously; the partition is cleared
+   * after that (or after a bounded wait), never while the page may still write. */
+  private async clearWhenGone(instance: Instance, reason: string): Promise<void> {
+    const contents = instance.view.webContents
+    if (!contents.isDestroyed()) {
+      await new Promise<void>((resolve) => {
+        const timer = this.setTimer(resolve, KNOWLEDGE_VIEW_DESTROY_WAIT_MS)
+        contents.once('destroyed', () => {
+          this.clearTimer(timer)
+          resolve()
+        })
+      })
+    }
     const ses = instance.session
     const steps: Array<() => Promise<void>> = [
+      () => ses.closeAllConnections(),
       () => ses.clearStorageData(),
       () => ses.clearCache(),
       () => ses.clearAuthCache(),
-      () => ses.closeAllConnections(),
     ]
     for (const step of steps) {
       try {
-        void step().catch((error: unknown) => this.log(`[knowledge-view] partition cleanup failed (${reason}): ${String(error)}`))
+        await step()
       } catch (error) {
         this.log(`[knowledge-view] partition cleanup failed (${reason}): ${String(error)}`)
       }
     }
-    if (this.state.state !== 'closed') this.setState({ state: 'hidden' })
   }
 
   private setState(state: KnowledgeViewState): void {
