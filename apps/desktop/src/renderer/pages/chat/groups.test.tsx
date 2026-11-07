@@ -18,6 +18,7 @@ let dir: string
 let store: ReturnType<typeof createChatHistoryStore>
 const wrap = <A extends unknown[], R>(f: (...a: A) => R) => vi.fn(async (...a: A) => f(...a))
 let bridge: Record<string, ReturnType<typeof vi.fn>>
+let groupsBridge: Record<string, ReturnType<typeof vi.fn>>
 
 function record(id: string, prompt: string, at: string): ChatHistoryRecord {
   return {
@@ -38,7 +39,7 @@ beforeEach(() => {
     setTitle: wrap((id: string, t: string, s: string) => store.setTitle(id, t, s)),
     organize: wrap((id: string, p: unknown) => store.organize(id, p)),
   }
-  const chatGroups = {
+  const chatGroups = groupsBridge = {
     get: wrap(() => store.groups()), create: wrap((n: string) => store.createGroup(n)),
     rename: wrap((id: string, n: string) => store.renameGroup(id, n)), delete: wrap((id: string) => store.deleteGroup(id)),
     setCollapsed: wrap((t: string, c: boolean) => store.setCollapsed(t, c)),
@@ -161,9 +162,12 @@ describe('groups in the history list (UI-06 G2)', () => {
     fireEvent.keyDown(within(list()).getByRole('menu'), { key: 'Escape' })
     expect(within(list()).queryByRole('menu')).toBeNull()
     await waitFor(() => expect(dots).toHaveFocus())
-    // A click outside closes it too.
+    // A click outside closes it too, and so does Tab.
     fireEvent.click(dots)
     fireEvent.mouseDown(document.body)
+    expect(within(list()).queryByRole('menu')).toBeNull()
+    fireEvent.click(dots)
+    fireEvent.keyDown(within(list()).getByRole('menu'), { key: 'Tab' })
     expect(within(list()).queryByRole('menu')).toBeNull()
   })
 
@@ -229,6 +233,11 @@ describe('groups in the history list (UI-06 G2)', () => {
     fireEvent.change(box, { target: { value: '项目' } })
     fireEvent.keyDown(box, { key: 'Enter' })
     await within(list()).findByRole('group', { name: '项目' })
+    // Left as it opened: nothing is renamed.
+    fireEvent.doubleClick(within(groupHead('项目')).getByText('项目'))
+    fireEvent.blur(within(list()).getByRole('textbox', { name: '分组名称' }))
+    await new Promise(r => setTimeout(r, 0))
+    expect(groupsBridge.rename).toHaveBeenCalledTimes(1)
     fireEvent.doubleClick(within(groupHead('项目')).getByText('项目'))
     box = within(list()).getByRole('textbox', { name: '分组名称' })
     fireEvent.change(box, { target: { value: '项目二' } })
@@ -286,7 +295,12 @@ describe('dragging a conversation (UI-06 G2)', () => {
     expect(li).toHaveClass('dragging')
     expect(offers(groupHead('生活'))).toBe(true)
     expect(groupHead('生活')).toHaveClass('drop-over')
-    fireEvent.dragLeave(groupHead('生活'), { relatedTarget: document.body })
+    // Moving onto the heading's own name is still over the heading.
+    // (jsdom has no DragEvent to carry where the pointer went.)
+    const leave = (to: Element) => fireEvent(groupHead('生活'), new MouseEvent('dragleave', { bubbles: true, relatedTarget: to }))
+    leave(within(groupHead('生活')).getByText('生活'))
+    expect(groupHead('生活')).toHaveClass('drop-over')
+    leave(document.body)
     expect(groupHead('生活')).not.toHaveClass('drop-over')
     offers(groupHead('生活'))
     fireEvent.drop(groupHead('生活'), { dataTransfer: dt() })
@@ -309,8 +323,9 @@ describe('dragging a conversation (UI-06 G2)', () => {
     drag('周报')
     expect(offers(groupHead('工作'))).toBe(false)
     expect(offers(row('闲聊').closest('li')!)).toBe(false)
-    fireEvent.drop(groupHead('工作'), { dataTransfer: dt() })
-    fireEvent.drop(row('闲聊').closest('li')!, { dataTransfer: dt() })
+    // Not taken: the drop is left to the page, which does nothing with it.
+    expect(fireEvent.drop(groupHead('工作'), { dataTransfer: dt() })).toBe(true)
+    expect(fireEvent.drop(row('闲聊').closest('li')!, { dataTransfer: dt() })).toBe(true)
     fireEvent.dragEnd(row('周报').closest('li')!)
     expect(row('周报').closest('li')).not.toHaveClass('dragging')
     drag('闲聊')
