@@ -7,9 +7,9 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { createChatHistoryStore } from '../../../main/chat-history'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../../shared/chat-history'
 import { ChatHistoryList } from './ChatHistoryList'
-import { resetHistoryStore, saveConversation } from './history'
+import { refreshGroups, resetHistoryStore, saveConversation } from './history'
 import { setLocale } from '../../i18n'
-import { dropChange } from './drop'
+import { DRAG_TYPE, dropChange } from './drop'
 
 // UI-06 G2: groups, folds, the ⋯ menu and dragging in the sidebar list,
 // against main's real store behind a bridge that calls it as IPC does.
@@ -63,7 +63,11 @@ const openRowMenu = (title: string) => {
   fireEvent.click(within(list()).getByRole('button', { name: `对话「${title}」的操作` }))
   return within(list()).getByRole('menu')
 }
-const dt = () => ({ setData: vi.fn(), getData: vi.fn(), dropEffect: 'none', effectAllowed: 'all' })
+/** What a drag carries: by default the conversation this list is dragging
+ *  (its type and id); `''` for something dragged in from elsewhere. */
+let carrying = ''
+const dt = (id = carrying, types = id ? [DRAG_TYPE] : ['Files']) =>
+  ({ setData: vi.fn(), getData: (type: string) => (type === DRAG_TYPE ? id : ''), types, dropEffect: 'none', effectAllowed: 'all' })
 
 describe('groups in the history list (UI-06 G2)', () => {
   it('lists groups above the ungrouped conversations, with their counts; folds keep in main', async () => {
@@ -175,8 +179,12 @@ describe('groups in the history list (UI-06 G2)', () => {
     put('chat_a', '周报')
     await showList()
     await within(list()).findByRole('button', { name: '周报' })
-    fireEvent.click(within(openRowMenu('周报')).getByRole('menuitem', { name: '重命名' }))
+    fireEvent.click(within(openRowMenu('周报')).getByRole('menuitem', { name: '重命名' }), { detail: 0 })
     const input = within(list()).getByRole('textbox', { name: '对话标题' })
+    // Picked from the keyboard, the box keeps the focus it took.
+    await new Promise(r => requestAnimationFrame(r))
+    await new Promise(r => requestAnimationFrame(r))
+    expect(input).toHaveFocus()
     fireEvent.change(input, { target: { value: '月报' } })
     fireEvent.keyDown(input, { key: 'Enter' })
     await waitFor(() => expect(store.get('chat_a')?.title).toBe('月报'))
@@ -268,6 +276,89 @@ describe('groups in the history list (UI-06 G2)', () => {
   })
 })
 
+describe('focus and placement (UI-06 G2, Codex R1)', () => {
+  it('picked from the keyboard, focus goes to the conversation\'s ⋯ where it now is', async () => {
+    store.createGroup('工作')
+    put('chat_a', '周报')
+    await showList()
+    await within(list()).findByRole('group', { name: '工作' })
+    fireEvent.click(within(openRowMenu('周报')).getByRole('menuitem', { name: '工作' }), { detail: 0 })
+    await waitFor(() => expect(within(groupBox('工作')).getByRole('button', { name: '对话「周报」的操作' })).toHaveFocus())
+    // With the mouse, focus is left where the pointer put it.
+    fireEvent.click(within(openRowMenu('周报')).getByRole('menuitem', { name: '移出分组' }), { detail: 1 })
+    await waitFor(() => expect(groupOfStored('chat_a')).toBeNull())
+    await new Promise(r => requestAnimationFrame(r))
+    expect(within(list()).getByRole('button', { name: '对话「周报」的操作' })).not.toHaveFocus()
+  })
+
+  it('Escape in a menu opened by a right click focuses that row\'s ⋯', async () => {
+    put('chat_a', '周报')
+    await showList()
+    fireEvent.contextMenu((await within(list()).findByRole('button', { name: '周报' })).closest('li')!, { clientX: 5, clientY: 5 })
+    fireEvent.keyDown(within(list()).getByRole('menu'), { key: 'Escape' })
+    await waitFor(() => expect(within(list()).getByRole('button', { name: '对话「周报」的操作' })).toHaveFocus())
+  })
+
+  it('a group\'s name box ended from the keyboard puts focus back: the new group\'s ⋯, or "+ 分组"', async () => {
+    put('chat_a', '周报')
+    await showList()
+    fireEvent.click(await within(list()).findByRole('button', { name: '+ 分组' }))
+    let box = within(list()).getByRole('textbox', { name: '分组名称' })
+    fireEvent.change(box, { target: { value: '工作' } })
+    fireEvent.keyDown(box, { key: 'Enter' })
+    await waitFor(() => expect(within(list()).getByRole('button', { name: '分组「工作」的操作' })).toHaveFocus())
+    fireEvent.click(within(list()).getByRole('button', { name: '+ 分组' }))
+    fireEvent.keyDown(within(list()).getByRole('textbox', { name: '分组名称' }), { key: 'Escape' })
+    await waitFor(() => expect(within(list()).getByRole('button', { name: '+ 分组' })).toHaveFocus())
+    // Renamed from its menu: back to its ⋯.
+    fireEvent.click(within(list()).getByRole('button', { name: '分组「工作」的操作' }))
+    fireEvent.click(within(list()).getByRole('menuitem', { name: '重命名分组' }))
+    box = within(list()).getByRole('textbox', { name: '分组名称' })
+    fireEvent.change(box, { target: { value: '项目' } })
+    fireEvent.keyDown(box, { key: 'Enter' })
+    await waitFor(() => expect(within(list()).getByRole('button', { name: '分组「项目」的操作' })).toHaveFocus())
+  })
+
+  it('the entry under focus stays the same action when a group leaves the open menu', async () => {
+    const { groups: [a] } = store.createGroup('甲')
+    store.createGroup('乙')
+    put('chat_a', '周报')
+    await showList()
+    await within(list()).findByRole('group', { name: '乙' })
+    const menu = openRowMenu('周报')
+    within(menu).getByRole('menuitem', { name: '乙' }).focus()
+    store.deleteGroup(a.id)
+    await act(async () => { await refreshGroups() })
+    expect(within(list()).queryByRole('menuitem', { name: '甲' })).toBeNull()
+    expect(document.activeElement).toHaveTextContent('乙')
+  })
+
+  it('a menu that would run past the window\'s bottom or right edge opens inside it', async () => {
+    put('chat_a', '周报')
+    await showList()
+    const li = (await within(list()).findByRole('button', { name: '周报' })).closest('li')!
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ width: 200, height: 300 } as DOMRect)
+    fireEvent.contextMenu(li, { clientX: window.innerWidth - 50, clientY: window.innerHeight - 20 })
+    expect(within(list()).getByRole('menu')).toHaveStyle({
+      left: `${window.innerWidth - 204}px`, top: `${window.innerHeight - 304}px`,
+    })
+  })
+
+  it('deleting a group whose conversations are all archived still asks', async () => {
+    const { groups: [work] } = store.createGroup('工作')
+    put('chat_a', '周报')
+    put('chat_b', '闲聊')
+    store.organize('chat_a', { group_id: work.id, archived: true })
+    await showList()
+    await within(list()).findByRole('group', { name: '工作' })
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    fireEvent.click(within(list()).getByRole('button', { name: '分组「工作」的操作' }))
+    fireEvent.click(within(list()).getByRole('menuitem', { name: '删除分组…' }))
+    expect(confirm).toHaveBeenCalledWith('删除分组「工作」？里面的 1 个对话会回到「最近」，不会删除。')
+    expect(store.groups().groups).toHaveLength(1)
+  })
+})
+
 describe('dragging a conversation (UI-06 G2)', () => {
   const setUp = async () => {
     const { groups: [work] } = store.createGroup('工作')
@@ -281,6 +372,7 @@ describe('dragging a conversation (UI-06 G2)', () => {
   }
   const drag = (title: string) => {
     const li = row(title).closest('li')!
+    carrying = row(title).dataset.historyId!
     const data = dt()
     fireEvent.dragStart(li, { dataTransfer: data })
     return { li, data }
@@ -339,6 +431,30 @@ describe('dragging a conversation (UI-06 G2)', () => {
     expect(bridge.organize).not.toHaveBeenCalled()
     expect(groupOfStored('chat_a')).toBe(work)
     expect(groupOfStored('chat_b')).toBeNull()
+  })
+
+  it('a file or text dragged in, or a drop carrying another conversation, does nothing', async () => {
+    await setUp()
+    drag('闲聊')
+    // Something from elsewhere, while a drag of ours is (still) on record.
+    expect(!fireEvent.dragOver(groupHead('生活'), { dataTransfer: dt('') })).toBe(false)
+    expect(fireEvent.drop(groupHead('生活'), { dataTransfer: dt('') })).toBe(true)
+    drag('闲聊')
+    expect(fireEvent.drop(groupHead('生活'), { dataTransfer: dt('chat_a') })).toBe(true)
+    await new Promise(r => setTimeout(r, 0))
+    expect(bridge.organize).not.toHaveBeenCalled()
+  })
+
+  it('a drag whose row never heard its end is over at the next mouse press', async () => {
+    await setUp()
+    drag('闲聊')
+    expect(row('闲聊').closest('li')).toHaveClass('dragging')
+    fireEvent.mouseDown(document.body)
+    expect(row('闲聊').closest('li')).not.toHaveClass('dragging')
+    expect(offers(groupHead('生活'))).toBe(false)
+    drag('闲聊')
+    fireEvent(window, new Event('dragend'))
+    expect(row('闲聊').closest('li')).not.toHaveClass('dragging')
   })
 
   it('a row being renamed is not draggable', async () => {

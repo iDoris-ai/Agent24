@@ -118,6 +118,9 @@ button { cursor: pointer; font-family: var(--font); }
 .nav-item.active { color: var(--accent); background: var(--accent-dim); }
 .nav-item .icon { font-size: 15px; width: 20px; text-align: center; }
 .chat-history { margin: 2px 0 6px; }
+/* The sidebar is a window drag region: the list's headings, names and rows
+   take clicks, double clicks, right clicks and drops themselves. */
+.chat-history, .chat-history-menu { -webkit-app-region: no-drag; }
 .chat-history-head {
   display: flex; align-items: center; gap: 2px; padding: 6px 20px 2px 14px;
   font-size: 11px; color: var(--muted);
@@ -145,7 +148,7 @@ button { cursor: pointer; font-family: var(--font); }
   border: 1px solid var(--border); border-radius: 3px;
 }
 .chat-history-menu {
-  position: fixed; z-index: 50; min-width: 160px; max-width: 260px; max-height: 60vh; overflow-y: auto; padding: 4px 0;
+  position: fixed; z-index: 50; min-width: 160px; max-width: 260px; max-height: calc(100vh - 8px); overflow-y: auto; padding: 4px 0;
   background: var(--surface); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
   -webkit-app-region: no-drag;
 }

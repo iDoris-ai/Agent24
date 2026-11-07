@@ -723,8 +723,9 @@ describe('finding a conversation (UI-04 T3)', () => {
     fireEvent.keyDown(within(historyList()).getByRole('button', { name: 'Weekly' }), { key: 'F2' })
     const input = within(historyList()).getByRole('textbox', { name: '对话标题' })
     fireEvent.change(input, { target: { value: 'Budget' } })
-    // Tab: the box loses focus, which saves; the row has nothing else to
-    // take it while it is being renamed, so focus leaves with the box.
+    // Leaving the box saves. (jsdom has no Tab traversal: this stands for
+    // focus going nowhere, as it did when Tab moved it to a control of the
+    // row that the new title then filtered out.)
     fireEvent.blur(input)
     await waitFor(() => expect(chatHistory.setTitle).toHaveBeenCalled())
     land()

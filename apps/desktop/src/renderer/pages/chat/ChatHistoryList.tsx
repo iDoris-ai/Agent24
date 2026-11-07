@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type DragEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type DragEvent } from 'react'
 import { useT } from '../../i18n'
 import { chatMessages } from '../Chat.i18n'
 import {
@@ -44,25 +44,30 @@ const clipped = (text: string, chars: number): string => {
 
 /** A one-line box for a group's name: Enter or leaving it keeps what was
  *  typed, Escape drops it; an input method's composition keys are its own. */
-function NameBox({ label, initial, onDone }: { label: string; initial: string; onDone: (name: string | null) => void }) {
+function NameBox({ label, initial, onDone }: {
+  label: string
+  initial: string
+  /** `keyboard`: ended with Enter or Escape, so focus is the list's to place. */
+  onDone: (name: string | null, keyboard: boolean) => void
+}) {
   const [value, setValue] = useState(initial)
   const done = useRef(false)
-  const finish = (name: string | null) => {
+  const finish = (name: string | null, keyboard: boolean) => {
     if (done.current) return
     done.current = true
-    onDone(name)
+    onDone(name, keyboard)
   }
   return <input className="chat-history-rename" aria-label={label} value={value} autoFocus
     onFocus={e => e.currentTarget.select()} onChange={e => setValue(e.target.value)}
     onKeyDown={e => {
       if (e.nativeEvent.isComposing || e.keyCode === 229) return
-      if (e.key === 'Enter') { e.preventDefault(); finish(value) }
-      else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish(null) }
+      if (e.key === 'Enter') { e.preventDefault(); finish(value, true) }
+      else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish(null, true) }
     }}
-    onBlur={() => finish(value)} />
+    onBlur={() => finish(value, false)} />
 }
 
-type Menu = { kind: 'row' | 'group'; id: string; at: { x: number; y: number }; from: HTMLElement | null }
+type Menu = { kind: 'row' | 'group'; id: string; at: { x: number; y: number } }
 type Opener = { currentTarget: HTMLElement; clientX?: number; clientY?: number }
 
 /** UI-03: the main chat's recent conversations, listed in the sidebar under
@@ -79,6 +84,18 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   useEffect(() => { void refreshHistory(); void refreshGroups() }, [])
   const [query, setQuery] = useState('')
   const searchRef = useRef<HTMLInputElement>(null)
+  // Where keyboard focus goes after a menu or a name box closes: the first
+  // of these controls still in the list once it has re-rendered, ending
+  // with the search box and the list's fold, which are always there.
+  const sectionRef = useRef<HTMLElement>(null)
+  const focusSoon = (...selectors: string[]) => requestAnimationFrame(() => {
+    for (const selector of [...selectors, '.chat-history-search', '.chat-history-fold']) {
+      const el = sectionRef.current?.querySelector<HTMLElement>(selector)
+      if (el) { el.focus(); return }
+    }
+  })
+  const rowMenuAt = (id: string) => `[data-row-menu="${id}"]`
+  const groupMenuAt = (id: string) => `[data-group-menu="${id}"]`
   // Archived conversations are not listed with the others (G3 lists them apart).
   const live = useMemo(() => items.filter(item => item.archived_at === null), [items])
   // What each row shows, worked out once per list, not on every keystroke
@@ -154,39 +171,53 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   // A group's name being typed: a new group (`group` null), maybe asked for
   // from a conversation's menu to move it there, or a rename.
   const [naming, setNaming] = useState<{ group: string | null; moving: string | null } | null>(null)
-  const nameDone = async (name: string | null) => {
+  const nameDone = async (name: string | null, keyboard: boolean) => {
     const job = naming
     setNaming(null)
+    if (!job) return
+    // From the keyboard, focus goes back to what asked for the box: the
+    // conversation's ⋯, the group's ⋯, or "+ Group" (the new group's ⋯
+    // once it is made).
+    const back = job.moving ? rowMenuAt(job.moving) : job.group ? groupMenuAt(job.group) : '.chat-history-new-group'
     const text = name === null ? '' : renameTitle(name)
-    if (!job || !text) return
+    if (!text) {
+      if (keyboard) focusSoon(back)
+      return
+    }
     if (job.group !== null) {
       if (text !== groups.find(g => g.id === job.group)?.name) await renameGroup(job.group, text)
+      if (keyboard) focusSoon(back)
       return
     }
     const made = await createGroup(text)
     if (made && job.moving) await moveConversation(job.moving, made)
+    if (keyboard) focusSoon(...(made && !job.moving ? [groupMenuAt(made)] : []), back)
   }
   const removeGroup = (id: string) => {
     const group = groups.find(g => g.id === id)
     if (!group) return
-    // Its conversations stay, back in Recent; only a group holding some asks.
-    const count = rows.filter(row => row.group === id).length
+    // Its conversations stay, back in Recent; only a group holding some
+    // asks. Counted over every conversation, archived ones too.
+    const count = items.filter(item => item.group_id === id).length
     if (count === 0 || window.confirm(t('history.group.deleteConfirm', { name: group.name, count: String(count) }))) {
-      void deleteGroup(id)
+      return deleteGroup(id)
     }
   }
   const remove = (row: Row) => {
-    if (window.confirm(t('history.deleteConfirm', { title: row.title }))) void deleteConversation(row.item.id)
+    if (window.confirm(t('history.deleteConfirm', { title: row.title }))) return deleteConversation(row.item.id)
   }
 
   const [menu, setMenu] = useState<Menu | null>(null)
-  const menuRef = useRef<Menu | null>(null)
-  menuRef.current = menu
-  const closeMenu = useCallback((refocus: boolean) => {
-    const from = menuRef.current?.from
+  /** Closed from the keyboard, focus goes to the ⋯ of the conversation or
+   *  group the menu was for (wherever its row now is), once what was picked
+   *  has been done; a right click's row or heading takes no focus itself. */
+  const closeMenu = (refocus: boolean, after?: Promise<unknown>) => {
+    const open = menu
     setMenu(null)
-    if (refocus) requestAnimationFrame(() => from?.focus())
-  }, [])
+    if (!refocus || !open) return
+    const back = open.kind === 'row' ? rowMenuAt(open.id) : groupMenuAt(open.id)
+    void (after ?? Promise.resolve()).catch(() => {}).then(() => focusSoon(back))
+  }
   /** From its ⋯ button, a menu opens under it; from a right click, where
    *  the pointer is. */
   const openMenu = (kind: Menu['kind'], id: string, e: Opener, pointer = false) => {
@@ -194,29 +225,46 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
     const at = pointer && e.clientX !== undefined && e.clientY !== undefined
       ? { x: e.clientX, y: e.clientY }
       : { x: box.left, y: box.bottom }
-    setMenu({ kind, id, at, from: e.currentTarget })
+    setMenu({ kind, id, at })
   }
   const rowMenu = (row: Row): MenuEntry[] => [
-    { kind: 'item', label: t('history.menu.rename'), onSelect: () => startEdit(row.item.id, row.item.title) },
-    { kind: 'heading', label: t('history.menu.moveTo') },
+    { kind: 'item', key: 'rename', label: t('history.menu.rename'), focuses: true, onSelect: () => startEdit(row.item.id, row.item.title) },
+    { kind: 'heading', key: 'move-to', label: t('history.menu.moveTo') },
     ...groups.filter(g => g.id !== row.group).map((g): MenuEntry => ({
-      kind: 'item', label: g.name, onSelect: () => void moveConversation(row.item.id, g.id),
+      kind: 'item', key: `group:${g.id}`, label: g.name, onSelect: () => moveConversation(row.item.id, g.id),
     })),
-    { kind: 'item', label: t('history.menu.newGroup'), onSelect: () => setNaming({ group: null, moving: row.item.id }) },
+    { kind: 'item', key: 'new-group', label: t('history.menu.newGroup'), focuses: true,
+      onSelect: () => setNaming({ group: null, moving: row.item.id }) },
     ...(row.group !== null
-      ? [{ kind: 'item', label: t('history.menu.ungroup'), onSelect: () => void moveConversation(row.item.id, null) } as const]
+      ? [{ kind: 'item', key: 'ungroup', label: t('history.menu.ungroup'), onSelect: () => moveConversation(row.item.id, null) } as const]
       : []),
-    { kind: 'item', label: t('history.menu.delete'), disabled: busy && row.item.id === activeId, onSelect: () => remove(row) },
+    { kind: 'item', key: 'delete', label: t('history.menu.delete'), disabled: busy && row.item.id === activeId, onSelect: () => remove(row) },
   ]
   const groupMenu = (id: string): MenuEntry[] => [
-    { kind: 'item', label: t('history.group.rename'), onSelect: () => setNaming({ group: id, moving: null }) },
-    { kind: 'item', label: t('history.group.delete'), onSelect: () => removeGroup(id) },
+    { kind: 'item', key: 'rename', label: t('history.group.rename'), focuses: true, onSelect: () => setNaming({ group: id, moving: null }) },
+    { kind: 'item', key: 'delete', label: t('history.group.delete'), onSelect: () => removeGroup(id) },
   ]
 
   // Dragging: the conversation being dragged (what a drag carries cannot be
   // read until the drop), and the target it is over.
   const [dragging, setDragging] = useState<string | null>(null)
   const [over, setOver] = useState<string | null>(null)
+  // A drag ends with `dragend` on its row; when the row was re-rendered
+  // elsewhere meanwhile (a group answer moved it), that never reaches us.
+  // A `dragend` anywhere, or the next mouse press (none comes during a
+  // drag), ends it then; whatever is dropped meanwhile is checked anyway.
+  useEffect(() => {
+    if (dragging === null) return
+    const end = () => { setDragging(null); setOver(null) }
+    window.addEventListener('mousedown', end, true)
+    window.addEventListener('dragend', end, true)
+    return () => {
+      window.removeEventListener('mousedown', end, true)
+      window.removeEventListener('dragend', end, true)
+    }
+  }, [dragging])
+  /** Only our own drag: files or text dragged in from elsewhere are not. */
+  const ours = (e: DragEvent): boolean => Array.from(e.dataTransfer?.types ?? []).includes(DRAG_TYPE)
   const dropProps = (target: DropTarget) => {
     const key = targetKey(target)
     const change = () => {
@@ -226,7 +274,7 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
     return {
       onDragOver: (e: DragEvent) => {
         // Only a drop that would change something is offered.
-        if (!change()?.patch) return
+        if (!ours(e) || !change()?.patch) return
         e.preventDefault()
         if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
         if (over !== key) setOver(key)
@@ -238,7 +286,8 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
         const drop = change()
         setOver(null)
         setDragging(null)
-        if (!drop?.patch) return
+        // The conversation dropped is the one this list started dragging.
+        if (!drop?.patch || !ours(e) || e.dataTransfer.getData(DRAG_TYPE) !== drop.id) return
         e.preventDefault()
         // Moving is undone as easily as it is done: no confirmation.
         if (drop.patch.group_id !== undefined) void moveConversation(drop.id, drop.patch.group_id)
@@ -291,7 +340,7 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
               {groups.find(g => g.id === row.group)?.name}</span></>}
           </button>}
         {!renaming && (
-          <button type="button" className="chat-history-action" aria-label={t('history.menu.label', { title })}
+          <button type="button" className="chat-history-action" aria-label={t('history.menu.label', { title })} data-row-menu={item.id}
             aria-haspopup="menu" aria-expanded={menu?.kind === 'row' && menu.id === item.id}
             onClick={e => openMenu('row', item.id, e)}>⋯</button>
         )}
@@ -302,14 +351,14 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   const menuRow = menu?.kind === 'row' ? rows.find(row => row.item.id === menu.id) : undefined
   const menuGroup = menu?.kind === 'group' ? groups.find(g => g.id === menu.id) : undefined
   return (
-    <section className="chat-history" aria-label={t('history.label')}>
+    <section className="chat-history" aria-label={t('history.label')} ref={sectionRef}>
       <div className={`chat-history-head${over === 'recent' ? ' drop-over' : ''}`} {...dropProps({ kind: 'recent' })}>
         <button type="button" className="chat-history-fold" aria-expanded={!folded}
           aria-label={t(folded ? 'history.fold.show' : 'history.fold.hide')}
           onClick={() => void setCollapsed('assistant', !folded)}>{folded ? '▸' : '▾'}</button>
         <span className="chat-history-head-label">{t('history.recent')}</span>
         {!folded && <>
-          <button type="button" className="chat-history-clear" onClick={() => setNaming({ group: null, moving: null })}>
+          <button type="button" className="chat-history-clear chat-history-new-group" onClick={() => setNaming({ group: null, moving: null })}>
             {t('history.group.new')}</button>
           <button type="button" className="chat-history-clear" disabled={busy} onClick={() => {
             if (window.confirm(t('history.clearConfirm'))) void clearConversations()
@@ -328,7 +377,7 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
         )}
         {naming?.group === null && (
           <div className="chat-history-group-head">
-            <NameBox label={t('history.group.nameInput')} initial="" onDone={name => void nameDone(name)} />
+            <NameBox label={t('history.group.nameInput')} initial="" onDone={(name, keyboard) => void nameDone(name, keyboard)} />
           </div>
         )}
         {searching
@@ -353,11 +402,12 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
                       aria-label={t(group.collapsed ? 'history.group.show' : 'history.group.hide', { name: group.name })}
                       onClick={() => void setCollapsed(group.id, !group.collapsed)}>{group.collapsed ? '▸' : '▾'}</button>
                     {naming?.group === group.id
-                      ? <NameBox label={t('history.group.nameInput')} initial={group.name} onDone={name => void nameDone(name)} />
+                      ? <NameBox label={t('history.group.nameInput')} initial={group.name} onDone={(name, keyboard) => void nameDone(name, keyboard)} />
                       : <span className="chat-history-group-name"
                         onDoubleClick={() => setNaming({ group: group.id, moving: null })}>{group.name}</span>}
                     <span className="chat-history-when">{members.length}</span>
                     <button type="button" className="chat-history-action" aria-label={t('history.group.menu', { name: group.name })}
+                      data-group-menu={group.id}
                       aria-haspopup="menu" aria-expanded={menu?.kind === 'group' && menu.id === group.id}
                       onClick={e => openMenu('group', group.id, e)}>⋯</button>
                   </div>
