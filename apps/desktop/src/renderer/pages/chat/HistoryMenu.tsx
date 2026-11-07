@@ -36,13 +36,16 @@ export function HistoryMenu({ label, entries, at, onClose }: {
   // Kept inside the window: moved up when it would run past the bottom,
   // left when past the right edge, and never taller than the window.
   const [pos, setPos] = useState(at)
+  // Measured again when what it lists changes (a group renamed or added
+  // while it is open can make it wider or taller).
+  const content = entries.map(e => e.label).join('\n')
   useLayoutEffect(() => {
     const box = ref.current?.getBoundingClientRect()
     if (!box) return
     const x = Math.max(EDGE, Math.min(at.x, window.innerWidth - box.width - EDGE))
     const y = at.y + box.height > window.innerHeight - EDGE ? Math.max(EDGE, window.innerHeight - box.height - EDGE) : at.y
     setPos(p => (p.x === x && p.y === y ? p : { x, y }))
-  }, [at.x, at.y, entries.length])
+  }, [at.x, at.y, content])
   useLayoutEffect(() => { items()[0]?.focus() }, [])
   useEffect(() => {
     const outside = (e: MouseEvent) => { if (!ref.current?.contains(e.target as Node)) onClose(false) }

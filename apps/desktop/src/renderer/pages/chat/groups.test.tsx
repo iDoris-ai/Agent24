@@ -390,6 +390,20 @@ describe('focus and placement (UI-06 G2, Codex R1)', () => {
     })
   })
 
+  it('a menu growing wider while open (a group renamed) is moved back inside the window', async () => {
+    const { groups: [work] } = store.createGroup('工作')
+    put('chat_a', '周报')
+    await showList()
+    await within(list()).findByRole('group', { name: '工作' })
+    const rect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ width: 100, height: 100 } as DOMRect)
+    fireEvent.contextMenu(row('周报').closest('li')!, { clientX: window.innerWidth - 150, clientY: 10 })
+    expect(within(list()).getByRole('menu')).toHaveStyle({ left: `${window.innerWidth - 150}px` })
+    rect.mockReturnValue({ width: 250, height: 100 } as DOMRect)
+    store.renameGroup(work.id, '一个长得多的分组名称')
+    await act(async () => { await refreshGroups() })
+    expect(within(list()).getByRole('menu')).toHaveStyle({ left: `${window.innerWidth - 254}px` })
+  })
+
   it('deleting a group whose conversations are all archived still asks', async () => {
     const { groups: [work] } = store.createGroup('工作')
     put('chat_a', '周报')
