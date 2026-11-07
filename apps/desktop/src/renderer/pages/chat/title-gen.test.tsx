@@ -142,6 +142,7 @@ describe('model titles (UI-04 T2)', () => {
     ['no local model', async () => ({ ok: false, status: 503, data: { error: { code: 'provider_unavailable' } } })],
     ['a headroom confirmation', async () => ({ ok: false, status: 409, data: { error: { code: 'idoris_headroom_confirmation_required' } } })],
     ['a broken bridge', async () => { throw new Error('ipc closed') }],
+    ['a failed answer that carries text', async () => ({ ok: false, status: 500, data: { message: { content: '服务出错页' } } })],
     ['only thinking', answer('<think>想了很久，被截断')],
     ['an empty answer', answer('  ')],
   ])('keeps the prompt\'s title, and asks no more, after %s', async (_name, fails) => {
