@@ -406,12 +406,28 @@ describe('KnowledgeViewHost', () => {
     expect(t.views[0].webContents.loads).toHaveLength(2)
   })
 
+  it('a main-frame load failure reported later also steps the view aside', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    t.views[0].webContents.emit('did-fail-load', {}, -3, 'aborted', URL_, true)
+    expect(t.views[0].visible).toBe(true)
+    t.views[0].webContents.emit('did-fail-load', {}, -102, 'refused', `${ORIGIN}/sub`, false)
+    expect(t.views[0].visible).toBe(true)
+    t.views[0].webContents.emit('did-fail-load', {}, -102, 'refused', URL_, true)
+    expect(t.views[0].visible).toBe(false)
+    expect(t.host.status()).toEqual({ state: 'degraded', code: 'load_failed' })
+    expect(await t.host.show(BOUNDS)).toEqual({ ok: true })
+    expect(t.views[0].webContents.loads).toHaveLength(2)
+  })
+
   it('a failed load is reported and retried on the next show', async () => {
     const t = setup()
     nextLoad = () => Promise.reject(new Error('ERR_CONNECTION_REFUSED'))
     try {
       expect(await t.host.show(BOUNDS)).toEqual({ ok: false, code: 'load_failed' })
       expect(t.host.status()).toEqual({ state: 'degraded', code: 'load_failed' })
+      // Out of the way of the page's message and Reload button.
+      expect(t.views[0].visible).toBe(false)
     } finally {
       nextLoad = () => Promise.resolve()
     }

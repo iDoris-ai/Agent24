@@ -353,7 +353,7 @@ export class KnowledgeViewHost {
       // An overtaken or redirected load rejects too; only the live one counts.
       if (mine !== this.request || this.instance !== instance) return { ok: false, code: 'superseded' }
       this.log(`[knowledge-view] load failed: ${error instanceof Error ? error.message : String(error)}`)
-      this.setState({ state: 'degraded', code: 'load_failed' })
+      this.loadFailed(instance)
       return { ok: false, code: 'load_failed' }
     }
     if (mine !== this.request || this.instance !== instance) return { ok: false, code: 'superseded' }
@@ -414,7 +414,7 @@ export class KnowledgeViewHost {
     })
     view.webContents.on('did-fail-load', (_event, code, _description, _url, isMainFrame) => {
       // -3 is an aborted load (a newer navigation took over).
-      if (this.instance === instance && isMainFrame && code !== -3) this.setState({ state: 'degraded', code: 'load_failed' })
+      if (this.instance === instance && isMainFrame && code !== -3) this.loadFailed(instance)
     })
     view.webContents.on('render-process-gone', (_event, details) => {
       if (this.instance !== instance) return
@@ -425,6 +425,14 @@ export class KnowledgeViewHost {
     win.contentView.addChildView(view)
     this.instance = instance
     return instance
+  }
+
+  /** The native view is drawn above the app's page; it steps aside so the
+   * page's message and Reload button can be seen. */
+  private loadFailed(instance: Instance): void {
+    instance.loaded = false
+    instance.view.setVisible(false)
+    this.setState({ state: 'degraded', code: 'load_failed' })
   }
 
   /** U4.8: view-level handling with backoff; too many crashes close it. */
