@@ -46,6 +46,8 @@ export const KNOWLEDGE_VIEW_DEV_URL_ENV = 'AGENT24_KNOWLEDGE_VIEW_URL'
 export const KNOWLEDGE_VIEW_MAX_CRASHES = 3
 export const KNOWLEDGE_VIEW_CRASH_WINDOW_MS = 10 * 60_000
 const CRASH_BACKOFF_MS = [1_000, 2_000, 4_000]
+/** A first load that has not settled by then counts as failed, so Reload is offered. */
+export const KNOWLEDGE_VIEW_FIRST_LOAD_TIMEOUT_MS = 30_000
 /** How long cleanup waits for the page to be destroyed before clearing anyway. */
 export const KNOWLEDGE_VIEW_DESTROY_WAIT_MS = 2_000
 
@@ -299,6 +301,8 @@ interface Instance {
   loading: Promise<boolean> | null
   /** Removed on destroy, so windows do not collect listeners (one per instance). */
   onWindowClosed: () => void
+  /** The main frame's last commit answered 4xx/5xx: an error page is not the knowledge page. */
+  httpFailed: boolean
 }
 
 /** Main's single owner of KnowledgeView instances (one binding for now). */
@@ -403,23 +407,46 @@ export class KnowledgeViewHost {
   /** The instance's first load, shared by every show while it is in flight. */
   private load(instance: Instance): Promise<boolean> {
     if (instance.loading) return instance.loading
-    instance.loading = instance.view.webContents.loadURL(instance.target.url).then(
-      () => {
+    instance.loading = new Promise<boolean>((resolve) => {
+      let settled = false
+      const finish = (error: unknown | null): void => {
+        if (settled) return
+        settled = true
+        this.clearTimer(timer)
         instance.loading = null
-        if (this.instance !== instance) return false
+        if (this.instance !== instance) return resolve(false)
+        const failure = error ?? (instance.httpFailed ? new Error('the server answered with an error page') : null)
+        if (failure) {
+          this.log(`[knowledge-view] load failed: ${failure instanceof Error ? failure.message : String(failure)}`)
+          this.loadFailed(instance)
+          return resolve(false)
+        }
         instance.loaded = true
         if (this.visible && this.state.state === 'loading' && !instance.unresponsive) this.setState({ state: 'ready' })
-        return true
-      },
-      (error: unknown) => {
-        instance.loading = null
-        if (this.instance !== instance) return false
-        this.log(`[knowledge-view] load failed: ${error instanceof Error ? error.message : String(error)}`)
-        this.loadFailed(instance)
-        return false
-      },
-    )
+        resolve(true)
+      }
+      // A load that never settles would leave `loading` up for good, with no
+      // way to Reload; past the limit it counts as failed (PR-Daemon #1634 F1).
+      const timer = this.setTimer(() => {
+        if (settled) return
+        try {
+          if (!instance.view.webContents.isDestroyed()) instance.view.webContents.stop()
+        } catch {
+          // Stopping is best effort; the load is treated as failed either way.
+        }
+        finish(new Error('first load timed out'))
+      }, KNOWLEDGE_VIEW_FIRST_LOAD_TIMEOUT_MS)
+      instance.view.webContents.loadURL(instance.target.url).then(() => finish(null), (error: unknown) => finish(error))
+    })
     return instance.loading
+  }
+
+  /** Shows the page again later without throwing; a failure is a typed state, not a blank area. */
+  private reopen(bounds: KnowledgeViewBounds): void {
+    this.show(bounds).catch((error: unknown) => {
+      this.log(`[knowledge-view] reopen failed: ${error instanceof Error ? error.message : String(error)}`)
+      this.setState({ state: 'degraded', code: 'load_failed' })
+    })
   }
 
   setBounds(rawBounds: unknown): void {
@@ -464,7 +491,7 @@ export class KnowledgeViewHost {
     // (U4.8: the entry states why it is unavailable), never a blank area.
     // With no instance (Off, then On again) the page is re-evaluated too,
     // unless a crash rebuild is already waiting out its backoff.
-    if ((ended || (!this.instance && this.rebuildTimer === null)) && this.visible && this.bounds) void this.show(this.bounds)
+    if ((ended || (!this.instance && this.rebuildTimer === null)) && this.visible && this.bounds) this.reopen(this.bounds)
   }
 
   /** Binding-level destruction (U4.8) without closing the door: window teardown, tests. */
@@ -492,7 +519,7 @@ export class KnowledgeViewHost {
     hardenKnowledgeSession(session, target.origin)
     const view = this.deps.createView(knowledgeViewPreferences(partition, this.deps.packaged))
     const instance: Instance = {
-      view, session, window: win, binding, target, loaded: false, unresponsive: false, loading: null,
+      view, session, window: win, binding, target, loaded: false, unresponsive: false, loading: null, httpFailed: false,
       onWindowClosed: () => { if (this.instance === instance) this.destroy('window closed') },
     }
     guardKnowledgeContents(view.webContents, target.origin, () => {
@@ -500,6 +527,13 @@ export class KnowledgeViewHost {
       this.log('[knowledge-view] main frame left the allowed origin')
       this.destroy('left the allowed origin')
       this.setState({ state: 'degraded', code: 'navigated_away' })
+    })
+    // 4xx/5xx on the main frame: the server's error page is not the knowledge
+    // page, so it counts as a failed load and Reload is offered.
+    view.webContents.on('did-navigate', (_event, _url, httpResponseCode) => {
+      if (this.instance !== instance) return
+      instance.httpFailed = typeof httpResponseCode === 'number' && httpResponseCode >= 400
+      if (instance.httpFailed && instance.loaded) this.loadFailed(instance)
     })
     // Only a load that is still the one being waited for becomes `ready`;
     // a hung page or a failed load keeps its state.
@@ -569,7 +603,7 @@ export class KnowledgeViewHost {
     const delay = CRASH_BACKOFF_MS[Math.min(this.crashes.length - 1, CRASH_BACKOFF_MS.length - 1)]
     this.rebuildTimer = this.setTimer(() => {
       this.rebuildTimer = null
-      if (this.visible && !this.instance && !this.closed) void this.show(this.bounds ?? bounds)
+      if (this.visible && !this.instance && !this.closed) this.reopen(this.bounds ?? bounds)
     }, delay)
   }
 

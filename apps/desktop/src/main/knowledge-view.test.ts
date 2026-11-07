@@ -4,6 +4,7 @@ import {
   KNOWLEDGE_VIEW_PARTITION_PREFIX,
   MAX_KNOWLEDGE_VIEW_PARTITIONS,
   KNOWLEDGE_VIEW_DESTROY_WAIT_MS,
+  KNOWLEDGE_VIEW_FIRST_LOAD_TIMEOUT_MS,
   KnowledgeViewHost,
   type KnowledgeViewHostDeps,
   devKnowledgeViewTarget,
@@ -98,6 +99,8 @@ class FakeContents extends FakeEmitter {
   getURL() { return this.url }
   loadURL(url: string) { this.loads.push(url); this.url = url; return nextLoad() }
   reload() {}
+  stopped = 0
+  stop() { this.stopped++ }
   /** Electron destroys a closed page later; tests that care set this. */
   asyncClose = false
   closed = false
@@ -145,6 +148,7 @@ function setup(over: Partial<{ binding: string | null; target: ReturnType<typeof
   const states: unknown[] = []
   const timers: Array<{ fn: () => void; ms: number }> = []
   const cleared: number[] = []
+  const loadTimers: Array<{ fn: () => void; ms: number }> = []
   let now = 0
   const env = {
     win: new FakeWindow() as FakeWindow | null,
@@ -161,13 +165,19 @@ function setup(over: Partial<{ binding: string | null; target: ReturnType<typeof
     packaged: over.packaged ?? true,
     onState: (s: unknown) => states.push(s),
     now: () => now,
-    setTimer: (fn: () => void, ms: number) => { timers.push({ fn, ms }); return timers.length },
+    // First-load timeouts are kept apart, so the crash and cleanup timers
+    // the other tests count are not mixed with one per load.
+    setTimer: (fn: () => void, ms: number) => {
+      if (ms === KNOWLEDGE_VIEW_FIRST_LOAD_TIMEOUT_MS) { loadTimers.push({ fn, ms }); return -loadTimers.length }
+      timers.push({ fn, ms })
+      return timers.length
+    },
     clearTimer: (handle: unknown) => { cleared.push(handle as number) },
     log: () => {},
     partitionName: () => `${KNOWLEDGE_VIEW_PARTITION_PREFIX}p${++seq}`,
   } as unknown as KnowledgeViewHostDeps
   const host = new KnowledgeViewHost(deps)
-  return { host, views, sessions, states, timers, cleared, env, advance: (ms: number) => { now += ms } }
+  return { host, views, sessions, states, timers, loadTimers, cleared, env, advance: (ms: number) => { now += ms } }
 }
 
 describe('knowledgeViewTarget (U4.4)', () => {
@@ -653,7 +663,7 @@ describe('KnowledgeViewHost', () => {
     t.views[0].webContents.emit('render-process-gone', {}, { reason: 'crashed' })
     expect(t.timers).toHaveLength(1)
     t.host.destroyAll('test')
-    expect(t.cleared).toEqual([1])
+    expect(t.cleared).toContain(1)
   })
 
   it('destroying an instance removes its listener from the window', async () => {
@@ -676,6 +686,70 @@ describe('KnowledgeViewHost', () => {
     expect(t.host.status()).toEqual({ state: 'degraded', code: 'load_failed' })
     expect(await t.host.show(BOUNDS)).toEqual({ ok: true })
     expect(t.views[0].webContents.loads).toHaveLength(2)
+  })
+
+  it('a first load that never settles fails after the limit and can be retried (PR-Daemon #1634 F1)', async () => {
+    const t = setup()
+    nextLoad = () => new Promise<void>(() => {})
+    let shown: Promise<unknown>
+    try {
+      shown = t.host.show(BOUNDS)
+      t.host.hide()
+      // Coming back does not start a second load; the first one is still waited for.
+      void t.host.show(BOUNDS)
+      expect(t.views[0].webContents.loads).toHaveLength(1)
+      expect(t.loadTimers.map((x) => x.ms)).toEqual([KNOWLEDGE_VIEW_FIRST_LOAD_TIMEOUT_MS])
+      t.loadTimers[0].fn()
+      await flush()
+      expect(t.views[0].webContents.stopped).toBe(1)
+      expect(t.host.status()).toEqual({ state: 'degraded', code: 'load_failed' })
+      expect(t.views[0].visible).toBe(false)
+      expect(await shown).toEqual({ ok: false, code: 'superseded' })
+    } finally {
+      nextLoad = () => Promise.resolve()
+    }
+    expect(await t.host.show(BOUNDS)).toEqual({ ok: true })
+    expect(t.views[0].webContents.loads).toHaveLength(2)
+  })
+
+  it('a load that settles in time cancels its timeout', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    expect(t.cleared).toContain(-1)
+  })
+
+  it('a 4xx/5xx main-frame answer is a failed load with Reload, not ready', async () => {
+    const t = setup()
+    let finish: () => void = () => {}
+    nextLoad = () => new Promise<void>((resolve) => { finish = resolve })
+    try {
+      const shown = t.host.show(BOUNDS)
+      t.views[0].webContents.emit('did-navigate', {}, URL_, 502, 'Bad Gateway')
+      finish()
+      expect(await shown).toEqual({ ok: false, code: 'load_failed' })
+    } finally {
+      nextLoad = () => Promise.resolve()
+    }
+    expect(t.host.status()).toEqual({ state: 'degraded', code: 'load_failed' })
+    expect(t.views[0].visible).toBe(false)
+    // Retried on the next show; a 200 this time is ready.
+    const again = t.host.show(BOUNDS)
+    t.views[0].webContents.emit('did-navigate', {}, URL_, 200, 'OK')
+    expect(await again).toEqual({ ok: true })
+    // A later in-page navigation that lands on an error page fails too.
+    t.views[0].webContents.emit('did-navigate', {}, `${ORIGIN}/embed-admin/knowledge-bases/missing`, 404, 'Not Found')
+    expect(t.host.status()).toEqual({ state: 'degraded', code: 'load_failed' })
+  })
+
+  it('a reopen that throws becomes a typed state, not an unhandled rejection or a blank area (F5)', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    t.env.binding = 'https://other.example.org/api/v1'
+    const host = t.host as unknown as { create: () => never }
+    host.create = () => { throw new Error('boom') }
+    t.host.bindingChanged()
+    await flush()
+    expect(t.host.status()).toEqual({ state: 'degraded', code: 'load_failed' })
   })
 
   it('a failed load is reported and retried on the next show', async () => {
