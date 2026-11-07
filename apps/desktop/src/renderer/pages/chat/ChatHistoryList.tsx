@@ -97,16 +97,16 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
     // before the cut to 80 characters, so shortening a longer title counts.
     const title = renameTitle(draft)
     const renamed = save && title && oneLine(draft) !== oneLine(from) ? renameConversation(id, title) : null
-    // From the keyboard, focus goes back to the conversation's entry; to the
-    // search box when the new title took it out of the results.
-    if (refocus) {
-      const entry = () => listRef.current?.querySelector<HTMLButtonElement>(`[data-history-id="${id}"]`)
-      requestAnimationFrame(() => entry()?.focus())
-      void renamed?.then(() => requestAnimationFrame(() => {
-        const lost = document.activeElement === null || document.activeElement === document.body
-        if (lost && !entry()) searchRef.current?.focus()
-      }))
-    }
+    // From the keyboard, focus goes back to the conversation's entry. When
+    // the new title takes the row out of the results and focus went with it
+    // (it was on the row, or on its buttons after Tab), it moves to the
+    // search box.
+    const entry = () => listRef.current?.querySelector<HTMLButtonElement>(`[data-history-id="${id}"]`)
+    if (refocus) requestAnimationFrame(() => entry()?.focus())
+    void renamed?.then(() => requestAnimationFrame(() => {
+      const lost = document.activeElement === null || document.activeElement === document.body
+      if (lost && !entry()) searchRef.current?.focus()
+    }))
   }
   if (items.length === 0) return null
   return (

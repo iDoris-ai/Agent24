@@ -289,6 +289,10 @@ describe('chat history titles (UI-04)', () => {
     const huge = record('chat_c', at)
     huge.messages = [{ role: 'user', content: `开头${'字'.repeat(2_000_000)}`, at, delivered: true }]
     expect(store.save(huge).first_prompt).toBe(`开头${'字'.repeat(198)}`)
+    // White space taking the start of a long prompt is not all there is.
+    const spaced = record('chat_d', at)
+    spaced.messages = [{ role: 'user', content: `${' '.repeat(10_000)}budget\n\n\tupdate${' '.repeat(10_000)}`, at, delivered: true }]
+    expect(store.save(spaced).first_prompt).toBe('budget update')
     const none = record('chat_b', at)
     none.messages = []
     expect(store.save(none).first_prompt).toBe('')

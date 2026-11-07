@@ -695,6 +695,30 @@ describe('finding a conversation (UI-04 T3)', () => {
     expect(within(historyList()).getByRole('status')).toHaveTextContent('没有匹配的对话')
   })
 
+  it('so does a rename left with Tab once it lands (Codex T3-R2)', async () => {
+    many(9)
+    const w = stored('chat_w_1', 'Weekly', '2026-11-07T11:00:00.000Z')
+    w.messages[0] = { ...w.messages[0], content: '帮我整理本周的事' }
+    saved.set(w.id, w)
+    let land!: () => void
+    chatHistory.setTitle.mockImplementationOnce((id: string, title: string) => new Promise(r => {
+      land = () => { saved.set(id, { ...saved.get(id)!, title, title_source: 'user' }); r(summary(saved.get(id)!)) }
+    }))
+    render(<ChatHistoryList showChat={showChat} />)
+    const box = await within(await findHistoryList()).findByRole('searchbox', { name: '搜索对话' })
+    fireEvent.change(box, { target: { value: 'weekly' } })
+    fireEvent.keyDown(within(historyList()).getByRole('button', { name: 'Weekly' }), { key: 'F2' })
+    const input = within(historyList()).getByRole('textbox', { name: '对话标题' })
+    fireEvent.change(input, { target: { value: 'Budget' } })
+    // Tab: the box loses focus to the row's delete button, which saves.
+    const del = within(historyList()).getByRole('button', { name: '删除对话：Weekly' })
+    del.focus()
+    fireEvent.blur(input)
+    await waitFor(() => expect(chatHistory.setTitle).toHaveBeenCalled())
+    land()
+    await waitFor(() => expect(box).toHaveFocus())
+  })
+
   it('a search left typed stops filtering once the list is short enough to lose its box', async () => {
     many(9)
     render(<ChatHistoryList showChat={showChat} />)

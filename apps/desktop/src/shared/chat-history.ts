@@ -72,24 +72,30 @@ const graphemeSegmenter = typeof Intl !== 'undefined' && 'Segmenter' in Intl
   ? new Intl.Segmenter(undefined, { granularity: 'grapheme' })
   : null
 
+/** The text's characters, one at a time, read only as far as asked. */
+function* segmentsOf(text: string): Generator<string> {
+  if (graphemeSegmenter) for (const part of graphemeSegmenter.segment(text)) yield part.segment
+  else yield* text
+}
+
 /** A conversation's summary, the same in main and in the page. */
 export function chatHistorySummary(r: ChatHistoryRecord): ChatHistorySummary {
-  // Only the start of a prompt is read: a pasted one can run to megabytes,
-  // and main builds a summary of every conversation when it lists them.
+  // The first prompt on one line, read only as far as its first 200
+  // characters: a pasted one can run to megabytes, and main builds a summary
+  // of every conversation when it lists them. Runs of white space count as
+  // one space; none at the ends.
   const content = r.messages.find(m => m.role === 'user')?.content ?? ''
-  const first = content.slice(0, FIRST_PROMPT_CHARS * 32).replace(/\s+/g, ' ').trim()
   const chars: string[] = []
-  const parts = graphemeSegmenter?.segment(first) ?? null
-  if (parts) {
-    for (const part of parts) {
+  let space = false
+  for (const ch of segmentsOf(content)) {
+    if (/^\s+$/.test(ch)) { space = chars.length > 0; continue }
+    if (space) {
+      chars.push(' ')
+      space = false
       if (chars.length === FIRST_PROMPT_CHARS) break
-      chars.push(part.segment)
     }
-  } else {
-    for (const ch of first) {
-      if (chars.length === FIRST_PROMPT_CHARS) break
-      chars.push(ch)
-    }
+    chars.push(ch)
+    if (chars.length === FIRST_PROMPT_CHARS) break
   }
   return {
     id: r.id, title: r.title, title_source: r.title_source, created_at: r.created_at, updated_at: r.updated_at,
