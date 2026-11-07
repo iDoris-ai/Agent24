@@ -99,6 +99,13 @@ export const IpcChannels = {
   KnowledgeStatus: 'knowledge:status',
   KnowledgeConfigure: 'knowledge:configure',
   KnowledgeSetEnabled: 'knowledge:set-enabled',
+  // KB-C2-03 (main/knowledge-view.ts): the KnowledgeView container. The page
+  // sends only where to draw it; the address, partition and policy are main's.
+  KnowledgeViewShow: 'knowledge-view:show',
+  KnowledgeViewBounds: 'knowledge-view:bounds',
+  KnowledgeViewHide: 'knowledge-view:hide',
+  KnowledgeViewReload: 'knowledge-view:reload',
+  KnowledgeViewState: 'knowledge-view:state',
 } as const
 
 /** T1-1/T1-2: the documents module as it is on disk now. A daemon reads
@@ -132,6 +139,14 @@ export interface KnowledgeConfigureInput {
   knowledgeBaseIds: string[]
   apiKey?: string
 }
+
+export type {
+  KnowledgeViewBounds,
+  KnowledgeViewFailure,
+  KnowledgeViewResult,
+  KnowledgeViewState,
+  KnowledgeViewTheme,
+} from './knowledge-view-types'
 
 export type KnowledgeSettingsResult = { ok: true } | { ok: false; reason: 'invalid' | 'not_saved' | 'unavailable' }
 

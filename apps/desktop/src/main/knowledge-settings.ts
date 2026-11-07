@@ -119,6 +119,7 @@ export class KnowledgeController {
   private version = 0
   private saving: Promise<void> = Promise.resolve()
   private readonly nowSeconds: () => number
+  private readonly listeners = new Set<() => void>()
 
   constructor(
     private readonly host: KnowledgeHost,
@@ -137,6 +138,13 @@ export class KnowledgeController {
       hasKey: this.key() !== null,
       active: this.bindingForRun() !== null,
     }
+  }
+
+  /** Called whenever the settings in effect may have changed (KB-C2-03: the
+   * KnowledgeView ends with its binding). Returns the unsubscribe. */
+  onChange(listener: () => void): () => void {
+    this.listeners.add(listener)
+    return () => { this.listeners.delete(listener) }
   }
 
   /** The binding a new run is to name, or none while Off or incomplete. */
@@ -207,6 +215,13 @@ export class KnowledgeController {
    * its endpoint and a fresh C, or dropped. Also run once at startup. */
   async apply(): Promise<SettingsResult> {
     this.pushedUntil = 0
+    for (const listener of this.listeners) {
+      try {
+        listener()
+      } catch (error) {
+        console.warn('[knowledge] settings listener failed', error)
+      }
+    }
     if (!this.settings.enabled || !this.complete()) {
       return asResult(await this.host.deactivate(KNOWLEDGE_BINDING))
     }

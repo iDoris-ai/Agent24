@@ -54,6 +54,34 @@ describe('KnowledgeController (M3)', () => {
     fs.rmSync(dir, { recursive: true, force: true })
   })
 
+  it('tells listeners after every change, with the new settings already in effect (KB-C2-03)', async () => {
+    const controller = make()
+    const seen: Array<{ enabled: boolean; endpoint: string }> = []
+    const off = controller.onChange(() => {
+      const s = controller.status()
+      seen.push({ enabled: s.enabled, endpoint: s.endpoint })
+    })
+    await controller.configure(GOOD)
+    await controller.setEnabled(true)
+    await controller.setEnabled(false)
+    expect(seen).toEqual([
+      { enabled: false, endpoint: GOOD.endpoint },
+      { enabled: true, endpoint: GOOD.endpoint },
+      { enabled: false, endpoint: GOOD.endpoint },
+    ])
+    off()
+    await controller.setEnabled(true)
+    expect(seen).toHaveLength(3)
+  })
+
+  it('a failing listener does not stop the change', async () => {
+    const controller = make()
+    controller.onChange(() => { throw new Error('boom') })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    expect(await controller.configure(GOOD)).toEqual({ ok: true })
+    warn.mockRestore()
+  })
+
   it('takes the endpoints and knowledge bases the daemon takes', () => {
     for (const ok of ['https://kb.example/api/v1', 'http://127.0.0.1:8080/api/v1', 'http://[::1]:9000']) {
       expect(validEndpoint(ok), ok).toBe(true)
