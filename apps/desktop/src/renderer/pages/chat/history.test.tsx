@@ -2,16 +2,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import ChatPage from '../Chat'
-import { ChatHistoryList } from './ChatHistoryList'
+import { ChatHistoryList, shortTime } from './ChatHistoryList'
 import { resetHistoryStore, setRetrySleepForTests } from './history'
 import { setLocale } from '../../i18n'
-import type { ChatHistoryRecord } from '../../../shared/chat-history'
+import { chatHistorySummary, type ChatHistoryRecord } from '../../../shared/chat-history'
 
 const proxy = vi.fn()
 let saved: Map<string, ChatHistoryRecord>
 const chatHistory = { list: vi.fn(), get: vi.fn(), save: vi.fn(), delete: vi.fn(), clear: vi.fn(), setTitle: vi.fn() }
-const summary = (r: ChatHistoryRecord) =>
-  ({ id: r.id, title: r.title, title_source: r.title_source, created_at: r.created_at, updated_at: r.updated_at })
+const summary = chatHistorySummary
 const RANK = { prompt: 0, model: 1, user: 2 } as const
 /** Saves as main does: a stronger title on file is kept (main/chat-history.ts). */
 function put(r: ChatHistoryRecord) {
@@ -623,5 +622,69 @@ describe('renaming a conversation (UI-04)', () => {
     await waitFor(() => expect(chatHistory.setTitle).toHaveBeenCalled())
     await new Promise(r => setTimeout(r, 0))
     expect(within(historyList()).getByRole('button', { name: '旧话题' })).toBeInTheDocument()
+  })
+})
+
+describe('finding a conversation (UI-04 T3)', () => {
+  const many = (n: number) => {
+    for (let i = 0; i < n; i++) {
+      const r = stored(`chat_n_${i}`, `话题${i}`, `2026-11-07T0${i % 10}:00:00.000Z`)
+      saved.set(r.id, r)
+    }
+  }
+
+  it('offers a search only with more than 8 conversations', async () => {
+    many(8)
+    const { unmount } = render(<ChatHistoryList showChat={showChat} />)
+    await within(await findHistoryList()).findByRole('button', { name: '话题0' })
+    expect(within(historyList()).queryByRole('searchbox')).toBeNull()
+    unmount()
+    resetHistoryStore()
+    many(9)
+    render(<ChatHistoryList showChat={showChat} />)
+    expect(await within(await findHistoryList()).findByRole('searchbox', { name: '搜索对话' })).toBeInTheDocument()
+  })
+
+  it('matches the title or the first prompt, ignoring case and width; Escape clears', async () => {
+    many(9)
+    const r = stored('chat_x_1', '模型起的名', '2026-11-07T11:00:00.000Z')
+    r.messages[0] = { ...r.messages[0], content: '帮我看看 Weekly Report 的格式' }
+    saved.set(r.id, r)
+    render(<ChatHistoryList showChat={showChat} />)
+    const box = await within(await findHistoryList()).findByRole('searchbox', { name: '搜索对话' })
+    const names = () => within(historyList()).getAllByRole('button').map(b => b.textContent).filter(n => n && n !== '清空' && n !== '✎' && n !== '×')
+    fireEvent.change(box, { target: { value: 'ｗｅｅｋｌｙ　ｒｅｐｏｒｔ' } })
+    expect(names()).toEqual(['模型起的名'])
+    fireEvent.change(box, { target: { value: '话题3' } })
+    expect(names()).toEqual(['话题3'])
+    fireEvent.change(box, { target: { value: '没有这个' } })
+    expect(names()).toEqual([])
+    expect(within(historyList()).getByRole('status')).toHaveTextContent('没有匹配的对话')
+    fireEvent.keyDown(box, { key: 'Escape' })
+    expect(box).toHaveValue('')
+    expect(names()).toHaveLength(10)
+  })
+
+  it('conversations with the same title show their time; the tooltip adds the first prompt', async () => {
+    const a = stored('chat_a_1', '周报', '2026-11-07T10:00:00.000Z')
+    const b = stored('chat_b_1', '周报', '2026-11-08T09:30:00.000Z')
+    b.messages[0] = { ...b.messages[0], content: '写本周周报' }
+    const c = stored('chat_c_1', '请假', '2026-11-06T08:00:00.000Z')
+    for (const r of [a, b, c]) saved.set(r.id, r)
+    render(<ChatHistoryList showChat={showChat} />)
+    const list = await findHistoryList()
+    const later = await within(list).findByRole('button', { name: `周报 ${shortTime(b.updated_at)}` })
+    expect(within(list).getByRole('button', { name: `周报 ${shortTime(a.updated_at)}` })).toBeInTheDocument()
+    expect(within(list).getByRole('button', { name: '请假' })).toBeInTheDocument()
+    expect(within(list).getByRole('button', { name: `删除对话：周报 ${shortTime(b.updated_at)}` })).toBeInTheDocument()
+    expect(later).toHaveAttribute('title', `周报 · 写本周周报 · ${shortTime(b.updated_at)}`)
+    // The first prompt is left out of the tooltip when it is the title.
+    expect(within(list).getByRole('button', { name: '请假' })).toHaveAttribute('title', `请假 · ${shortTime(c.updated_at)}`)
+  })
+
+  it('writes the time as MM-DD HH:mm in local time', () => {
+    const d = new Date(2026, 10, 8, 9, 5)
+    expect(shortTime(d.toISOString())).toBe('11-08 09:05')
+    expect(shortTime('不是时间')).toBe('')
   })
 })

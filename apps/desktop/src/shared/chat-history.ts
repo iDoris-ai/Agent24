@@ -58,4 +58,26 @@ export interface ChatHistoryRecord {
   messages: ChatHistoryMessage[]
 }
 
-export type ChatHistorySummary = Pick<ChatHistoryRecord, 'id' | 'title' | 'title_source' | 'created_at' | 'updated_at'>
+/** What the history list shows and searches: the record without its
+ *  messages, plus the start of its first prompt (UI-04 T3). */
+export interface ChatHistorySummary extends Pick<ChatHistoryRecord, 'id' | 'title' | 'title_source' | 'created_at' | 'updated_at'> {
+  /** The first prompt on one line, at most `FIRST_PROMPT_CHARS` characters. */
+  first_prompt: string
+}
+
+/** Characters of the first prompt a summary carries. */
+export const FIRST_PROMPT_CHARS = 200
+
+const graphemeSegmenter = typeof Intl !== 'undefined' && 'Segmenter' in Intl
+  ? new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+  : null
+
+/** A conversation's summary, the same in main and in the page. */
+export function chatHistorySummary(r: ChatHistoryRecord): ChatHistorySummary {
+  const first = (r.messages.find(m => m.role === 'user')?.content ?? '').replace(/\s+/g, ' ').trim()
+  const chars = graphemeSegmenter ? Array.from(graphemeSegmenter.segment(first), s => s.segment) : Array.from(first)
+  return {
+    id: r.id, title: r.title, title_source: r.title_source, created_at: r.created_at, updated_at: r.updated_at,
+    first_prompt: chars.slice(0, FIRST_PROMPT_CHARS).join(''),
+  }
+}

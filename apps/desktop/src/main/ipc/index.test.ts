@@ -1847,7 +1847,7 @@ describe('UI-02 chat history IPC', () => {
       messages: [{ role: 'user', content: '你好', at: '2026-11-08T00:00:00.000Z', delivered: true }],
     }
     expect(await call(IpcChannels.ChatHistoryList)).toEqual([])
-    const summary = { id: 'chat_ipc_1', title: '你好', title_source: 'prompt', created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z' }
+    const summary = { id: 'chat_ipc_1', title: '你好', title_source: 'prompt', created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z', first_prompt: '你好' }
     // A record without title_source (written before UI-04) has the prompt's title.
     expect(await call(IpcChannels.ChatHistorySave, record)).toEqual(summary)
     expect(await call(IpcChannels.ChatHistoryList)).toEqual([summary])

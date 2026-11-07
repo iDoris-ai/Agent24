@@ -138,6 +138,16 @@ button { cursor: pointer; font-family: var(--font); }
 .chat-history-open:disabled, .chat-history-clear:disabled { cursor: default; opacity: 0.4; }
 .chat-history-action:disabled { cursor: default; }
 .chat-history-item:hover .chat-history-action:disabled { opacity: 0.4; }
+.chat-history-search {
+  display: block; width: calc(100% - 40px); margin: 2px 8px 4px 32px; padding: 3px 6px; font-size: 12px;
+  color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 4px;
+  -webkit-app-region: no-drag;
+}
+.chat-history-empty { padding: 4px 8px 6px 32px; font-size: 12px; color: var(--muted); }
+/* The title takes the room left and is cut short; a twin's time always shows. */
+.chat-history-open { display: flex; align-items: baseline; gap: 4px; }
+.chat-history-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.chat-history-when { flex: 0 0 auto; color: var(--muted); font-size: 11px; }
 .chat-history-rename {
   flex: 1; min-width: 0; margin: 2px 4px 2px 28px; padding: 3px 4px; font-size: 12.5px;
   color: var(--text); background: var(--surface); border: 1px solid var(--accent); border-radius: 4px;

@@ -53,8 +53,8 @@ describe('chat history on disk', () => {
     store.save(record('chat_a', '2026-11-08T03:00:00.000Z', 'renamed'))
     store.save(record('chat_b', '2026-11-08T02:00:00.000Z'))
     expect(store.list()).toEqual([
-      { id: 'chat_a', title: 'renamed', title_source: 'prompt', created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T03:00:00.000Z' },
-      { id: 'chat_b', title: 'chat_b', title_source: 'prompt', created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T02:00:00.000Z' },
+      { id: 'chat_a', title: 'renamed', title_source: 'prompt', created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T03:00:00.000Z', first_prompt: '你好' },
+      { id: 'chat_b', title: 'chat_b', title_source: 'prompt', created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T02:00:00.000Z', first_prompt: '你好' },
     ])
     store.delete('chat_a')
     expect(store.get('chat_a')).toBeNull()
@@ -210,7 +210,7 @@ describe('chat history titles (UI-04)', () => {
 
   it('a save returns the summary as written', () => {
     expect(createChatHistoryStore(dir).save(record('chat_a', at, '问'))).toEqual(
-      { id: 'chat_a', title: '问', title_source: 'prompt', created_at: '2026-11-08T00:00:00.000Z', updated_at: at })
+      { id: 'chat_a', title: '问', title_source: 'prompt', created_at: '2026-11-08T00:00:00.000Z', updated_at: at, first_prompt: '你好' })
   })
 
   it('a rename is kept over every later save of the first prompt\'s title', () => {
@@ -272,6 +272,22 @@ describe('chat history titles (UI-04)', () => {
     store.save(record('chat_a', at, '首问'))
     const flags = '🏴󠁧󠁢󠁳󠁣󠁴󠁿'.repeat(80) // 14 UTF-16 units each
     expect(store.setTitle('chat_a', flags, 'user')).toMatchObject({ title: flags })
+  })
+
+  it('a summary carries the first prompt on one line, cut to 200 characters (UI-04 T3)', () => {
+    const store = createChatHistoryStore(dir)
+    const long = record('chat_a', at)
+    long.messages = [
+      { role: 'assistant', content: '先说话的是助手', at, run_id: null, latency: null },
+      { role: 'user', content: `  第一行\n\n${'字'.repeat(300)}`, at, delivered: true },
+    ]
+    const first = `第一行 ${'字'.repeat(196)}`
+    expect(store.save(long).first_prompt).toBe(first)
+    expect(store.list()[0].first_prompt).toBe(first)
+    expect(store.setTitle('chat_a', '名', 'user')?.first_prompt).toBe(first)
+    const none = record('chat_b', at)
+    none.messages = []
+    expect(store.save(none).first_prompt).toBe('')
   })
 
   it('a retitle writes through a fresh temporary file like a save', () => {
