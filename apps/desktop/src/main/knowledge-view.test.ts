@@ -18,6 +18,7 @@ import {
   normalizeKnowledgeViewBounds,
   registerKnowledgeViewIpc,
   withKnowledgeCsp,
+  KNOWLEDGE_VIEW_PERMISSIONS_POLICY,
 } from './knowledge-view'
 
 const ORIGIN = 'https://kb.example.org'
@@ -246,6 +247,17 @@ describe('origin policy and CSP (U4.2)', () => {
     expect(out['Content-Security-Policy']).toEqual(["script-src 'self'", knowledgeViewCsp(ORIGIN)])
     expect(out['content-security-policy']).toBeUndefined()
     expect(out['X-A']).toEqual(['1'])
+  })
+
+  it('switches powerful features off in the page, after any server policy', () => {
+    const out = withKnowledgeCsp({ 'permissions-policy': ['geolocation=*, fullscreen=()'], 'X-A': ['1'] }, ORIGIN)
+    expect(out['Permissions-Policy']).toEqual(['geolocation=*, fullscreen=()', KNOWLEDGE_VIEW_PERMISSIONS_POLICY])
+    expect(out['permissions-policy']).toBeUndefined()
+    for (const feature of ['geolocation', 'camera', 'microphone', 'display-capture', 'usb', 'serial', 'hid', 'bluetooth']) {
+      expect(KNOWLEDGE_VIEW_PERMISSIONS_POLICY).toContain(`${feature}=()`)
+    }
+    expect(KNOWLEDGE_VIEW_PERMISSIONS_POLICY).not.toMatch(/\*|self/)
+    expect(withKnowledgeCsp(undefined, ORIGIN)['Permissions-Policy']).toEqual([KNOWLEDGE_VIEW_PERMISSIONS_POLICY])
   })
 
   it('has no Node, no preload, sandbox on, and DevTools only in development', () => {

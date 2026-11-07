@@ -166,18 +166,35 @@ export function knowledgeViewCsp(origin: string): string {
 
 /** Adds the partition CSP next to whatever the server sent: browsers enforce
  * every policy present, so the server's own can only tighten it. */
+/** Powerful features switched off in the page itself (UI-BRIDGE U4.2). The
+ * permission handlers already refuse them, but a request that never reaches
+ * them (David's 11-08 Mac run: geolocation left pending, no answer) is still
+ * left open; a feature the document is not allowed to use is refused inside
+ * Blink at once (W3C Geolocation: PERMISSION_DENIED), whatever the OS does. */
+export const KNOWLEDGE_VIEW_PERMISSIONS_POLICY = [
+  'accelerometer', 'ambient-light-sensor', 'bluetooth', 'camera', 'clipboard-read', 'display-capture',
+  'geolocation', 'gyroscope', 'hid', 'idle-detection', 'local-fonts', 'magnetometer', 'microphone', 'midi',
+  'payment', 'publickey-credentials-create', 'publickey-credentials-get', 'screen-wake-lock', 'serial', 'usb',
+  'window-management',
+].map((feature) => `${feature}=()`).join(', ')
+
 export function withKnowledgeCsp(
   headers: Record<string, string | string[]> | undefined,
   origin: string,
 ): Record<string, string[]> {
   const out: Record<string, string[]> = {}
   const csp: string[] = []
+  const policy: string[] = []
   for (const [name, value] of Object.entries(headers ?? {})) {
     const values = Array.isArray(value) ? value : [value]
     if (name.toLowerCase() === 'content-security-policy') csp.push(...values)
+    else if (name.toLowerCase() === 'permissions-policy') policy.push(...values)
     else out[name] = values
   }
   out['Content-Security-Policy'] = [...csp, knowledgeViewCsp(origin)]
+  // Ours goes last: for a feature named twice the last member wins, so the
+  // server can switch more off but none of these back on.
+  out['Permissions-Policy'] = [...policy, KNOWLEDGE_VIEW_PERMISSIONS_POLICY]
   return out
 }
 
