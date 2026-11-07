@@ -104,9 +104,12 @@ export function cleanModelTitle(answer: string): string {
   const text = answer.replace(/<think>[\s\S]*?<\/think>/gi, '')
   // Thinking that never ended: the answer was cut off before the title.
   if (/<think>/i.test(text)) return ''
-  const line = text.split(/\r?\n/).map(l => l.trim()).find(l => l.length > 0) ?? ''
+  // Code fence lines (```text) are wrapping, not the title.
+  const line = text.split(/\r?\n/).map(l => l.trim()).find(l => l.length > 0 && !l.startsWith('```')) ?? ''
+  // Markdown and quotes first, so a label inside them (**Title:**) goes too.
   const bare = line
-    .replace(/^(title|标题|標題)\s*[:：]\s*/i, '')
+    .replace(LEADING, '')
+    .replace(/^(title|标题|標題)\s*[*_]*\s*[:：]\s*[*_]*/i, '')
     .replace(LEADING, '')
     .replace(TRAILING, '')
   return graphemes(oneLine(bare)).slice(0, MODEL_TITLE_CHARS).join('').trim()

@@ -29,6 +29,11 @@ describe('titles written by the model (UI-04 T2)', () => {
     expect(cleanModelTitle('标题：**本周 周报**\n解释：……')).toBe('本周 周报')
     expect(cleanModelTitle('Title: "Weekly report draft".')).toBe('Weekly report draft')
     expect(cleanModelTitle('  \n# 请假流程？\n')).toBe('请假流程')
+    // Codex T2-R1: fences and a label inside markdown.
+    expect(cleanModelTitle('```text\nWeekly report\n```')).toBe('Weekly report')
+    expect(cleanModelTitle('```\n```')).toBe('')
+    expect(cleanModelTitle('**Title:** Weekly report')).toBe('Weekly report')
+    expect(cleanModelTitle('**标题：** 周报草稿')).toBe('周报草稿')
   })
 
   it('gives nothing when thinking never ended, or nothing is left', () => {
