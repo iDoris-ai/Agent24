@@ -4,7 +4,7 @@
 
 import { contextBridge, ipcRenderer } from 'electron'
 import type { NavPrefs } from '../renderer/capabilities/types'
-import type { ChatHistoryRecord, ChatHistorySummary } from '../shared/chat-history'
+import type { ChatGroupsState, ChatHistoryOrganize, ChatHistoryRecord, ChatHistorySummary } from '../shared/chat-history'
 import {
   IpcChannels,
   type BackendEndpointResult,
@@ -47,6 +47,16 @@ const api = {
     clear: (): Promise<void> => ipcRenderer.invoke(IpcChannels.ChatHistoryClear),
     setTitle: (id: string, title: string, source: 'user' | 'model'): Promise<ChatHistorySummary | null> =>
       ipcRenderer.invoke(IpcChannels.ChatHistorySetTitle, id, title, source),
+    organize: (id: string, patch: ChatHistoryOrganize): Promise<ChatHistorySummary | null> =>
+      ipcRenderer.invoke(IpcChannels.ChatHistoryOrganize, id, patch),
+  },
+  chatGroups: {
+    get: (): Promise<ChatGroupsState> => ipcRenderer.invoke(IpcChannels.ChatGroupsGet),
+    create: (name: string): Promise<ChatGroupsState> => ipcRenderer.invoke(IpcChannels.ChatGroupsCreate, name),
+    rename: (id: string, name: string): Promise<ChatGroupsState> => ipcRenderer.invoke(IpcChannels.ChatGroupsRename, id, name),
+    delete: (id: string): Promise<ChatGroupsState> => ipcRenderer.invoke(IpcChannels.ChatGroupsDelete, id),
+    setCollapsed: (target: 'assistant' | 'archive' | string, collapsed: boolean): Promise<ChatGroupsState> =>
+      ipcRenderer.invoke(IpcChannels.ChatGroupsSetCollapsed, target, collapsed),
   },
   onCliToolSettings: (cb: () => void): (() => void) => {
     ipcRenderer.on(IpcChannels.CliToolOpenSettings, cb)

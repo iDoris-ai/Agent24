@@ -158,7 +158,7 @@ describe('model titles (UI-04 T2)', () => {
 
   it('a conversation opened from the history asks for none; a new chat asks for its own', async () => {
     saved.set('chat_old_1', {
-      format: 'agent24.desktop.chat-history', version: 1, id: 'chat_old_1', title: '旧', title_source: 'prompt',
+      format: 'agent24.desktop.chat-history', version: 1, id: 'chat_old_1', title: '旧', title_source: 'prompt', group_id: null, archived_at: null,
       created_at: '2026-11-07T10:00:00.000Z', updated_at: '2026-11-07T10:00:01.000Z',
       messages: [{ role: 'user', content: '旧', at: '2026-11-07T10:00:00.000Z', delivered: true }],
     })

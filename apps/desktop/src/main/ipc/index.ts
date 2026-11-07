@@ -659,6 +659,13 @@ export function registerIpcHandlers(options: {
   handle(IpcChannels.ChatHistoryClear, () => chatHistory().clear())
   handle(IpcChannels.ChatHistorySetTitle, (_event, id: unknown, title: unknown, source: unknown) =>
     chatHistory().setTitle(id, title, source))
+  handle(IpcChannels.ChatHistoryOrganize, (_event, id: unknown, patch: unknown) => chatHistory().organize(id, patch))
+  handle(IpcChannels.ChatGroupsGet, () => chatHistory().groups())
+  handle(IpcChannels.ChatGroupsCreate, (_event, name: unknown) => chatHistory().createGroup(name))
+  handle(IpcChannels.ChatGroupsRename, (_event, id: unknown, name: unknown) => chatHistory().renameGroup(id, name))
+  handle(IpcChannels.ChatGroupsDelete, (_event, id: unknown) => chatHistory().deleteGroup(id))
+  handle(IpcChannels.ChatGroupsSetCollapsed, (_event, target: unknown, collapsed: unknown) =>
+    chatHistory().setCollapsed(target, collapsed))
 
   handle(IpcChannels.AppPing, () => 'pong')
   handle(IpcChannels.AppVersion, () => app.getVersion())

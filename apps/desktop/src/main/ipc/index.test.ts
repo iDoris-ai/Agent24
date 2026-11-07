@@ -1847,15 +1847,25 @@ describe('UI-02 chat history IPC', () => {
       messages: [{ role: 'user', content: '你好', at: '2026-11-08T00:00:00.000Z', delivered: true }],
     }
     expect(await call(IpcChannels.ChatHistoryList)).toEqual([])
-    const summary = { id: 'chat_ipc_1', title: '你好', title_source: 'prompt', created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z', first_prompt: '你好' }
+    const summary = { id: 'chat_ipc_1', title: '你好', title_source: 'prompt', group_id: null, archived_at: null, created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z', first_prompt: '你好' }
     // A record without title_source (written before UI-04) has the prompt's title.
     expect(await call(IpcChannels.ChatHistorySave, record)).toEqual(summary)
     expect(await call(IpcChannels.ChatHistoryList)).toEqual([summary])
-    expect(await call(IpcChannels.ChatHistoryGet, 'chat_ipc_1')).toEqual({ ...record, title_source: 'prompt' })
+    expect(await call(IpcChannels.ChatHistoryGet, 'chat_ipc_1')).toEqual({ ...record, title_source: 'prompt', group_id: null, archived_at: null })
     expect(await call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_1', '问候', 'user')).toEqual({ ...summary, title: '问候', title_source: 'user' })
     expect(await call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_1', '模型', 'model')).toEqual({ ...summary, title: '问候', title_source: 'user' })
     await expect(call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_1', '名', 'prompt')).rejects.toThrow('Invalid chat history title source')
     expect(await call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_none', '名', 'user')).toBeNull()
+    // UI-06: groups and archiving go through the same guarded handlers.
+    const { groups: [group] } = await call(IpcChannels.ChatGroupsCreate, '工作') as { groups: Array<{ id: string; name: string }> }
+    expect(group).toMatchObject({ name: '工作', collapsed: false })
+    expect(await call(IpcChannels.ChatHistoryOrganize, 'chat_ipc_1', { group_id: group.id, archived: true }))
+      .toMatchObject({ group_id: group.id, archived_at: expect.stringMatching(/Z$/) })
+    await expect(call(IpcChannels.ChatHistoryOrganize, 'chat_ipc_1', { group_id: 'grp_none' })).rejects.toThrow('Unknown chat group')
+    expect(await call(IpcChannels.ChatGroupsRename, group.id, '私事')).toMatchObject({ groups: [{ name: '私事' }] })
+    expect(await call(IpcChannels.ChatGroupsSetCollapsed, 'assistant', true)).toMatchObject({ assistant_collapsed: true })
+    expect(await call(IpcChannels.ChatGroupsDelete, group.id)).toMatchObject({ groups: [] })
+    expect(await call(IpcChannels.ChatGroupsGet)).toMatchObject({ groups: [], assistant_collapsed: true, archive_collapsed: true })
     await expect(call(IpcChannels.ChatHistorySave, { ...record, version: 9 })).rejects.toThrow('Invalid chat history record')
     await expect(call(IpcChannels.ChatHistoryGet, '../ui-prefs')).rejects.toThrow('Invalid chat history id')
     await call(IpcChannels.ChatHistoryDelete, 'chat_ipc_1')

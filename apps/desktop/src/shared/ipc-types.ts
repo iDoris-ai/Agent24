@@ -11,6 +11,13 @@ export const IpcChannels = {
   ChatHistoryDelete: 'chat-history:delete',
   ChatHistoryClear: 'chat-history:clear',
   ChatHistorySetTitle: 'chat-history:set-title',
+  // UI-06: groups and archiving in the history list.
+  ChatHistoryOrganize: 'chat-history:organize',
+  ChatGroupsGet: 'chat-groups:get',
+  ChatGroupsCreate: 'chat-groups:create',
+  ChatGroupsRename: 'chat-groups:rename',
+  ChatGroupsDelete: 'chat-groups:delete',
+  ChatGroupsSetCollapsed: 'chat-groups:set-collapsed',
   CliToolOpenSettings: 'cli-tool:open-settings',
   CliToolStatus: 'cli-tool:status',
   CliToolInstall: 'cli-tool:install',

@@ -3,7 +3,9 @@
 // page; this module carries the list, which conversation is open, and "open
 // that one" requests from the list to the page.
 
-import { chatHistorySummary, type ChatHistoryRecord, type ChatHistorySummary } from '../../../shared/chat-history'
+import {
+  chatHistorySummary, type ChatGroupsState, type ChatHistoryOrganize, type ChatHistoryRecord, type ChatHistorySummary,
+} from '../../../shared/chat-history'
 import { renameTitle } from './title'
 
 export interface HistoryState {
@@ -14,9 +16,12 @@ export interface HistoryState {
   /** A reply is in flight: the page cannot switch conversations, so the list
    *  does not offer to, nor to delete the open one or clear everything. */
   busy: boolean
+  /** UI-06: the user's groups and which parts of the list are folded. */
+  groups: ChatGroupsState
 }
 
-const initial: HistoryState = { items: [], activeId: null, busy: false }
+const NO_GROUPS: ChatGroupsState = { groups: [], assistant_collapsed: false, archive_collapsed: true }
+const initial: HistoryState = { items: [], activeId: null, busy: false, groups: NO_GROUPS }
 let state: HistoryState = initial
 const listeners = new Set<() => void>()
 let opener: ((id: string) => void) | null = null
@@ -129,6 +134,87 @@ export function renameConversation(id: string, input: string): Promise<boolean> 
  *  refuses it over a rename, however late it arrives. */
 export function titleConversation(id: string, title: string): Promise<boolean> {
   return retitle(id, title, 'model')
+}
+
+/** UI-06: moves a saved conversation into a group, or out of any (null). */
+export function moveConversation(id: string, groupId: string | null): Promise<boolean> {
+  return organize(id, { group_id: groupId })
+}
+
+/** UI-06: archives a saved conversation. Archiving the open one starts a new
+ *  chat, as deleting it does, and not while its reply is in flight: the
+ *  reply would land in a conversation the list no longer shows. */
+export function archiveConversation(id: string): Promise<boolean> {
+  if (state.busy && state.activeId === id) return Promise.resolve(false)
+  if (state.activeId === id) {
+    starter?.()
+    set({ activeId: null })
+  }
+  return organize(id, { archived: true })
+}
+
+/** UI-06: brings an archived conversation back, into its group if that
+ *  still exists. */
+export function restoreConversation(id: string): Promise<boolean> {
+  return organize(id, { archived: false })
+}
+
+async function organize(id: string, patch: ChatHistoryOrganize): Promise<boolean> {
+  const history = api()
+  if (!history) return false
+  const mine = ++seq
+  const summary = await history.organize(id, patch).catch(() => null)
+  if (!summary || removedSince(id, mine)) return false
+  // Ordered against saves, deletions and list reads as a rename is.
+  publishedAt.set(id, ++seq)
+  set({ items: byNewest([summary, ...state.items.filter(item => item.id !== id)]) })
+  return true
+}
+
+const groupsApi = () => (typeof window === 'undefined' ? undefined : window.agent24?.chatGroups)
+
+/** UI-06: reads the groups again from main; a failure leaves them as they were. */
+export async function refreshGroups(): Promise<void> {
+  const groups = await groupsApi()?.get().catch(() => null)
+  if (groups) set({ groups })
+}
+
+/** Main answers each group change with the groups as they then stand, in
+ *  the order it handled them; the last answer is the newest. */
+let groupSeq = 0
+async function changeGroups(change: () => Promise<ChatGroupsState> | undefined): Promise<boolean> {
+  const mine = ++groupSeq
+  const groups = await Promise.resolve(change()).catch(() => undefined)
+  if (!groups) return false
+  // An answer overtaken by a newer change is not shown: that one's answer
+  // carries this change too, and showing this first would flicker a fold.
+  if (mine === groupSeq) set({ groups })
+  return true
+}
+
+export function createGroup(name: string): Promise<boolean> {
+  const text = renameTitle(name)
+  return text ? changeGroups(() => groupsApi()?.create(text)) : Promise.resolve(false)
+}
+
+export function renameGroup(id: string, name: string): Promise<boolean> {
+  const text = renameTitle(name)
+  return text ? changeGroups(() => groupsApi()?.rename(id, text)) : Promise.resolve(false)
+}
+
+/** Deletes a group; its conversations stay, listed with the others. */
+export function deleteGroup(id: string): Promise<boolean> {
+  return changeGroups(() => groupsApi()?.delete(id))
+}
+
+/** Folds or unfolds a group, the whole list ('assistant') or the archived
+ *  conversations ('archive'). The list folds at once; main keeps it. */
+export function setCollapsed(target: 'assistant' | 'archive' | string, collapsed: boolean): Promise<boolean> {
+  const g = state.groups
+  if (target === 'assistant') set({ groups: { ...g, assistant_collapsed: collapsed } })
+  else if (target === 'archive') set({ groups: { ...g, archive_collapsed: collapsed } })
+  else set({ groups: { ...g, groups: g.groups.map(x => (x.id === target ? { ...x, collapsed } : x)) } })
+  return changeGroups(() => groupsApi()?.setCollapsed(target, collapsed))
 }
 
 /** Whether conversations are kept at all (there is a history bridge). */
