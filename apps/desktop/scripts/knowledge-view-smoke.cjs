@@ -22,45 +22,71 @@ const hits = { A: [], B: [] }
 /** TCP connections opened to the foreign server B and to the fake TURN port. */
 const connections = { B: 0, TURN: 0 }
 
+// Every step that waits on the browser is bounded and named, so a step that
+// never answers on a real machine (a permission or device prompt, say) shows
+// up as 'timeout' in its check and as the last stage, instead of the whole
+// probe going silent (David's first run on a Mac, 2026-11-08).
 const PROBE = `
-(async () => {
+const stage = (name) => { window.__stage = name }
+const timedOut = []
+// Records the step only when its own timer wins, and clears that timer when the
+// step settles first, so a slow probe never blames a step that answered.
+const within = (p, ms) => {
+  const name = window.__stage
+  let timer
+  const late = new Promise((d) => { timer = setTimeout(() => { timedOut.push(name); d('timeout') }, ms) })
+  return Promise.race([Promise.resolve(p).finally(() => clearTimeout(timer)), late])
+}
+;(async () => {
   const r = {}
-  r.before = { local: localStorage.getItem('k'), cookie: document.cookie }
-  r.node = typeof require + '/' + typeof process + '/' + typeof module
-  r.hostApi = typeof window.agent24
-  r.popup = window.open(B + '/popup') === null ? 'null' : 'window'
-  try { await fetch(B + '/fetch'); r.foreignFetch = 'ok' } catch { r.foreignFetch = 'blocked' }
-  await new Promise((done) => { const i = new Image(); i.onload = () => { r.foreignImg = 'loaded'; done() }; i.onerror = () => { r.foreignImg = 'blocked'; done() }; i.src = B + '/img' })
-  const f = document.createElement('iframe'); f.src = '/frame'; document.body.appendChild(f)
-  try { new Worker('/worker.js'); r.worker = 'created' } catch { r.worker = 'blocked' }
-  try { await navigator.serviceWorker.register('/sw.js'); r.serviceWorker = 'registered' } catch { r.serviceWorker = 'blocked' }
-  r.notification = await Notification.requestPermission()
-  r.geo = await new Promise((done) => navigator.geolocation.getCurrentPosition(() => done('granted'), (e) => done('denied:' + e.code)))
-  try { await navigator.mediaDevices.getUserMedia({ audio: true }); r.media = 'granted' } catch (e) { r.media = 'denied' }
-  try { eval('1'); r.eval = 'ran' } catch { r.eval = 'blocked' }
-  const a = document.createElement('a'); a.href = '/download'; a.download = 'x.bin'; document.body.appendChild(a); a.click()
-  // PR-Daemon #1630 C1/R2-6: ways out that bypass webRequest or CSP in some engines.
   try {
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'turn:' + TURN + '?transport=tcp', username: 'u', credential: 'p' }] })
-    pc.createDataChannel('x')
-    await pc.setLocalDescription(await pc.createOffer())
-    await new Promise((d) => setTimeout(d, 2000))
-    pc.close()
-    r.turn = 'ran'
-  } catch { r.turn = 'blocked' }
-  // preconnect opens a TCP connection without a request, so it is seen as a
-  // connection to B. (dns-prefetch is not probed: with an IP literal there is
-  // no lookup, and observing DNS would need a resolver of our own.)
-  { const l = document.createElement('link'); l.rel = 'preconnect'; l.href = B; document.head.appendChild(l) }
-  r.ws = await new Promise((d) => {
+    stage('storage-before'); r.before = { local: localStorage.getItem('k'), cookie: document.cookie }
+    r.node = typeof require + '/' + typeof process + '/' + typeof module
+    r.hostApi = typeof window.agent24
+    stage('popup'); r.popup = window.open(B + '/popup') === null ? 'null' : 'window'
+    stage('foreign-fetch'); r.foreignFetch = await within(fetch(B + '/fetch').then(() => 'ok', () => 'blocked'), 3000)
+    stage('foreign-img'); r.foreignImg = await within(new Promise((done) => { const i = new Image(); i.onload = () => done('loaded'); i.onerror = () => done('blocked'); i.src = B + '/img' }), 3000)
+    // Refused by the partition CSP (frame-src 'none'): Electron logs
+    // ERR_BLOCKED_BY_CSP for /frame, which is the expected outcome.
+    stage('frame'); { const f = document.createElement('iframe'); f.src = '/frame'; document.body.appendChild(f) }
+    stage('worker'); try { new Worker('/worker.js'); r.worker = 'created' } catch { r.worker = 'blocked' }
+    stage('service-worker'); r.serviceWorker = await within(Promise.resolve().then(() => navigator.serviceWorker.register('/sw.js')).then(() => 'registered', () => 'blocked'), 3000)
+    stage('notification'); r.notification = await within(Promise.resolve().then(() => Notification.requestPermission()).catch((e) => 'threw:' + e.name), 3000)
+    stage('geolocation'); r.geo = await within(new Promise((done) => navigator.geolocation.getCurrentPosition(() => done('granted'), (e) => done('denied:' + e.code), { timeout: 2000 })), 3000)
+    stage('media'); r.media = await within(Promise.resolve().then(() => navigator.mediaDevices.getUserMedia({ audio: true })).then(() => 'granted', () => 'denied'), 3000)
+    stage('eval'); try { eval('1'); r.eval = 'ran' } catch { r.eval = 'blocked' }
+    stage('download'); { const a = document.createElement('a'); a.href = '/download'; a.download = 'x.bin'; document.body.appendChild(a); a.click() }
+    // PR-Daemon #1630 C1/R2-6: ways out that bypass webRequest or CSP in some engines.
+    stage('turn')
     try {
-      const w = new WebSocket(B.replace(/^http/, 'ws') + '/ws')
-      w.onopen = () => d('open'); w.onerror = () => d('blocked'); setTimeout(() => d('timeout'), 1500)
-    } catch { d('blocked') }
-  })
-  try { const res = await fetch('/redir'); r.redirect = 'followed:' + res.status } catch { r.redirect = 'blocked' }
-  localStorage.setItem('k', 'v-' + location.search); document.cookie = 'c=1; path=/'
-  r.after = { local: localStorage.getItem('k'), cookie: document.cookie }
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'turn:' + TURN + '?transport=tcp', username: 'u', credential: 'p' }] })
+      pc.createDataChannel('x')
+      const offer = await within(pc.createOffer(), 3000)
+      const local = offer === 'timeout' ? 'timeout' : await within(pc.setLocalDescription(offer).then(() => 'set'), 3000)
+      await new Promise((d) => setTimeout(d, 2000))
+      pc.close()
+      r.turn = offer === 'timeout' || local === 'timeout' ? 'timeout' : 'ran'
+    } catch { r.turn = 'blocked' }
+    // preconnect opens a TCP connection without a request, so it is seen as a
+    // connection to B. (dns-prefetch is not probed: with an IP literal there is
+    // no lookup, and observing DNS would need a resolver of our own.)
+    stage('preconnect'); { const l = document.createElement('link'); l.rel = 'preconnect'; l.href = B; document.head.appendChild(l) }
+    stage('ws')
+    r.ws = await new Promise((d) => {
+      try {
+        const w = new WebSocket(B.replace(/^http/, 'ws') + '/ws')
+        w.onopen = () => d('open'); w.onerror = () => d('blocked'); setTimeout(() => d('timeout'), 1500)
+      } catch { d('blocked') }
+    })
+    stage('redirect'); r.redirect = await within(fetch('/redir').then((res) => 'followed:' + res.status, () => 'blocked'), 3000)
+    stage('storage-after'); localStorage.setItem('k', 'v-' + location.search); document.cookie = 'c=1; path=/'
+    r.after = { local: localStorage.getItem('k'), cookie: document.cookie }
+    stage('done')
+  } catch (e) {
+    r.error = String(e)
+  }
+  r.stage = window.__stage
+  r.timedOut = timedOut.slice()
   window.__probe = r
 })()
 `
@@ -130,12 +156,24 @@ async function main() {
 
   const view = () => win.contentView.children.find((c) => c.webContents && c.webContents !== win.webContents)
   const probe = async () => {
-    for (let i = 0; i < 100; i++) {
-      const r = await view().webContents.executeJavaScript('window.__probe || null')
+    // The probe's own steps are bounded (about 25 s at worst); past 40 s it
+    // is reported as unfinished with the stage it stopped at, and the run goes on.
+    // executeJavaScript itself is raced against the deadline too: a renderer
+    // that stops answering must not hold the run.
+    const deadline = Date.now() + 40_000
+    const ask = (code) => Promise.race([
+      view().webContents.executeJavaScript(code),
+      new Promise((d) => setTimeout(() => d(undefined), Math.max(0, deadline - Date.now()))),
+    ])
+    let stage = null
+    while (Date.now() < deadline) {
+      const r = await ask('window.__probe || null')
       if (r) return r
+      const s = await ask('window.__stage || null')
+      if (s) stage = s
       await new Promise((d) => setTimeout(d, 100))
     }
-    throw new Error('probe did not finish')
+    return { unfinished: true, stage }
   }
 
   const checks = []
@@ -144,6 +182,7 @@ async function main() {
   const first = await host.show({ x: 0, y: 0, width: 800, height: 600 }, 'dark')
   check('show opens in the same window', first.ok && win.contentView.children.length === 1 && BrowserWindow.getAllWindows().length === 1, first)
   const r1 = await probe()
+  check('probe finished', r1.stage === 'done' && !r1.error && !r1.unfinished && r1.timedOut?.length === 0, { stage: r1.stage, error: r1.error, unfinished: r1.unfinished, timedOut: r1.timedOut })
   await new Promise((d) => setTimeout(d, 500))
   check('no Node in the page', r1.node === 'undefined/undefined/undefined', r1.node)
   check('no host API (no preload)', r1.hostApi === 'undefined', r1.hostApi)
@@ -152,10 +191,12 @@ async function main() {
   check('foreign origin received nothing', hits.B.length === 0, hits.B)
   check('no frame loaded', !hits.A.includes('/frame'), hits.A)
   check('Worker and Service Worker refused', r1.worker === 'blocked' && r1.serviceWorker === 'blocked', [r1.worker, r1.serviceWorker])
-  check('permissions denied', r1.notification === 'denied' && r1.geo.startsWith('denied') && r1.media === 'denied', [r1.notification, r1.geo, r1.media])
+  check('permissions denied', r1.notification === 'denied' && r1.geo === 'denied:1' && r1.media === 'denied', [r1.notification, r1.geo, r1.media])
   check('inline eval blocked by the partition CSP', r1.eval === 'blocked', r1.eval)
   check('download prevented', downloads.length === 1 && downloads[0] === 'prevented', downloads)
-  check('no TURN-over-TCP connection (contract decision #30)', connections.TURN === 0, { turn: r1.turn, connections: connections.TURN })
+  // 'ran' means an offer was made and set, so ICE gathering was really tried; a
+  // timeout there proves nothing. 'blocked' (no RTCPeerConnection) is a pass.
+  check('no TURN-over-TCP connection (contract decision #30)', (r1.turn === 'ran' || r1.turn === 'blocked') && connections.TURN === 0, { turn: r1.turn, connections: connections.TURN })
   // B is plain http and never upgrades, so 'open' cannot happen; what tells is that B saw no connection.
   check('WebSocket to a foreign host refused', r1.ws !== 'open' && connections.B === 0, { ws: r1.ws, connections: connections.B })
   check('302 to a foreign host not followed', r1.redirect === 'blocked' && !hits.B.includes('/redir-target'), r1.redirect)
@@ -182,9 +223,10 @@ async function main() {
   const cookies1 = await firstSession.cookies.get({})
   check('first partition cleared', cookies1.length === 0, cookies1.length)
   const r2 = await probe()
+  check('second probe finished', r2.stage === 'done' && !r2.error && !r2.unfinished && r2.timedOut?.length === 0, { stage: r2.stage, error: r2.error, unfinished: r2.unfinished, timedOut: r2.timedOut })
   check('second profile uses a different non-persistent partition', partitions.length === 2 && partitions[0] !== partitions[1]
     && partitions.every((p) => !p.startsWith('persist:')), partitions)
-  check('second profile sees none of the first one’s storage', r2.before.local === null && r2.before.cookie === '', r2.before)
+  check('second profile sees none of the first one’s storage', r2.before?.local === null && r2.before?.cookie === '', r2.before)
 
   host.shutdown()
   check('quit destroys the view', win.contentView.children.length === 0)
