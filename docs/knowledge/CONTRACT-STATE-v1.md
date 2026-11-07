@@ -1,6 +1,6 @@
 # Knowledge profile / Off / 撤权状态机契约 v1（CONTRACT-STATE-v1）
 
-> **状态**：规范核心 v1，已评审合入，随 KB-R1/R2 **部分实施**：Provider 代码在 `agent24_knowledge::provider`（KB-R1），生产路径走 KB-R2 的薄接线，偏离见 §12。条款按 READONLY r8 写成，现行 READONLY 为 r10。· **日期**：2026-10-20 · **Issue**：#1013 ①（KB-CT-03），阶段 #1000
+> **状态**：规范核心 v1，已评审合入，随 KB-R1/R2 **部分实施**：Provider 代码在 `agent24_knowledge::provider`（KB-R1），生产路径走 KB-R2 的薄接线，偏离见 §12。条款按 READONLY r8 写成，现行 READONLY 为 r11。· **日期**：2026-10-20 · **Issue**：#1013 ①（KB-CT-03），阶段 #1000
 > **依据**：`docs/knowledge/CONTRACT-READONLY-v1.md`（下称 READONLY，按 r8），规则写作 `R7.3` 等。本文由完整版 `ab/weknora-03a-state-machine`（#1072 的分支）压缩而来，只写对外行为与不变式，实现机制由实现任务以测试证明。条款沿用完整版编号，空号（如 S1.9、S1.11）即压缩时已删除，不再使用。
 
 ## 0. 范围与边界
