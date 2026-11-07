@@ -204,8 +204,9 @@ export function createChatHistoryStore(dir: string) {
   // clear leave it alone: clearing the history keeps the groups.
   const groupsFile = path.join(root, '_groups.json')
   /** Where a groups file that could not be read is moved before a change
-   *  writes a new one: the user's groups are set aside, not overwritten. */
-  const groupsAside = path.join(root, '_groups.damaged.json')
+   *  writes a new one: the user's groups are set aside, not overwritten,
+   *  each time under a name of its own. */
+  const groupsAside = (): string => path.join(root, `_groups.damaged.${Date.now()}.${randomBytes(4).toString('hex')}.json`)
   const groupsTemp = /^_groups\.json\.[0-9a-f]{12}\.tmp$/
   const noGroups = (): ChatGroupsState => ({ ...GROUPS_DEFAULT, groups: [] })
   /** The groups on file. A missing file is no groups. For showing them, a
@@ -221,7 +222,7 @@ export function createChatHistoryStore(dir: string) {
     }
     try { return parseChatGroups(JSON.parse(text)) }
     catch {
-      if (forChange) fs.renameSync(groupsFile, groupsAside)
+      if (forChange) fs.renameSync(groupsFile, groupsAside())
       return noGroups()
     }
   }
@@ -330,7 +331,9 @@ export function createChatHistoryStore(dir: string) {
     deleteGroup(id: unknown): ChatGroupsState {
       const own = checkGroup(id)
       const state = readGroups(true)
-      if (!state.groups.some(g => g.id === own)) return state
+      // Gone already (maybe a deletion that stopped before its sweep): the
+      // sweep still runs.
+      if (!state.groups.some(g => g.id === own)) { sweepGroupTemps(); return state }
       const after = writeGroups({ ...state, groups: state.groups.filter(g => g.id !== own) })
       sweepGroupTemps()
       return after

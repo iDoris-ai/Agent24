@@ -449,8 +449,13 @@ describe('chat history groups and archive (UI-06)', () => {
     createChatHistoryStore(dir).createGroup('新')
     expect(open).toHaveBeenCalledWith(expect.stringMatching(/_groups\.json\.[0-9a-f]{12}\.tmp$/), 'wx', 0o600)
     expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toMatchObject({ format: 'agent24.desktop.chat-groups', version: 1 })
-    expect(fs.readdirSync(path.join(dir, 'chat-history')).sort()).toEqual(['_groups.damaged.json', '_groups.json'])
-    expect(fs.readFileSync(path.join(dir, 'chat-history', '_groups.damaged.json'), 'utf8')).toBe(damaged)
+    // Damaged again: that one is set aside as well, beside the first.
+    fs.writeFileSync(file, '[')
+    createChatHistoryStore(dir).createGroup('又')
+    const root = path.join(dir, 'chat-history')
+    const aside = fs.readdirSync(root).filter(n => /^_groups\.damaged\.\d+\.[0-9a-f]{8}\.json$/.test(n))
+    expect(aside.map(n => fs.readFileSync(path.join(root, n), 'utf8')).sort()).toEqual([damaged, '['].sort())
+    expect(fs.readdirSync(root)).toHaveLength(3)
   })
 
   it('refuses a group change when the groups file is there but cannot be read', () => {
@@ -478,6 +483,10 @@ describe('chat history groups and archive (UI-06)', () => {
     const stray = () => fs.writeFileSync(path.join(root, '_groups.json.0123456789ab.tmp'), '{"groups":[{"name":"甲"}]}')
     stray()
     fs.writeFileSync(path.join(root, '_groups.json.keep'), 'x')
+    store.deleteGroup(a.id)
+    expect(fs.readdirSync(root).sort()).toEqual(['_groups.json', '_groups.json.keep'])
+    // A deletion asked again after one that stopped before its sweep.
+    stray()
     store.deleteGroup(a.id)
     expect(fs.readdirSync(root).sort()).toEqual(['_groups.json', '_groups.json.keep'])
     stray()
