@@ -18,6 +18,7 @@ import {
   normalizeKnowledgeViewBounds,
   registerKnowledgeViewIpc,
   withKnowledgeCsp,
+  KNOWLEDGE_VIEW_PERMISSIONS_POLICY,
 } from './knowledge-view'
 
 const ORIGIN = 'https://kb.example.org'
@@ -246,6 +247,28 @@ describe('origin policy and CSP (U4.2)', () => {
     expect(out['Content-Security-Policy']).toEqual(["script-src 'self'", knowledgeViewCsp(ORIGIN)])
     expect(out['content-security-policy']).toBeUndefined()
     expect(out['X-A']).toEqual(['1'])
+  })
+
+  it('switches powerful features off in the page, keeping only the server switch-offs', () => {
+    const headers = { 'permissions-policy': ['geolocation=*, fullscreen=()'], 'Permissions-Policy': ['camera=('], 'X-A': ['1'] }
+    const out = withKnowledgeCsp(headers, ORIGIN)
+    // A malformed or granting server member must not go out: only the
+    // server's plain switch-offs pass (fullscreen here), then ours.
+    expect(out['Permissions-Policy']).toEqual(['fullscreen=()', KNOWLEDGE_VIEW_PERMISSIONS_POLICY])
+    // A server that only switches more off keeps those, ahead of ours.
+    expect(withKnowledgeCsp({ 'Permissions-Policy': ['sync-xhr=(), fullscreen=()', 'autoplay=()'] }, ORIGIN)['Permissions-Policy'])
+      .toEqual(['sync-xhr=(), fullscreen=(), autoplay=()', KNOWLEDGE_VIEW_PERMISSIONS_POLICY])
+    expect(withKnowledgeCsp({ 'Permissions-Policy': ['sync-xhr=(), geolocation=(self)'] }, ORIGIN)['Permissions-Policy'])
+      .toEqual(['sync-xhr=()', KNOWLEDGE_VIEW_PERMISSIONS_POLICY])
+    expect(withKnowledgeCsp({ 'Permissions-Policy': ['geolocation=*'] }, ORIGIN)['Permissions-Policy'])
+      .toEqual([KNOWLEDGE_VIEW_PERMISSIONS_POLICY])
+    expect(out['permissions-policy']).toBeUndefined()
+    expect(headers['permissions-policy']).toEqual(['geolocation=*, fullscreen=()'])
+    for (const feature of ['geolocation', 'camera', 'microphone', 'display-capture', 'usb', 'serial', 'hid', 'bluetooth']) {
+      expect(KNOWLEDGE_VIEW_PERMISSIONS_POLICY).toContain(`${feature}=()`)
+    }
+    expect(KNOWLEDGE_VIEW_PERMISSIONS_POLICY).not.toMatch(/\*|self/)
+    expect(withKnowledgeCsp(undefined, ORIGIN)['Permissions-Policy']).toEqual([KNOWLEDGE_VIEW_PERMISSIONS_POLICY])
   })
 
   it('has no Node, no preload, sandbox on, and DevTools only in development', () => {
