@@ -75,6 +75,8 @@ describe('chat history on disk', () => {
     ['another format', { format: 'x' }],
     ['a bad id', { id: '../x' }],
     ['a bad time', { updated_at: 'yesterday' }],
+    ['a local time without zone', { updated_at: '2026-11-08T09:00:00' }],
+    ['a time with an offset', { updated_at: '2026-11-08T09:00:00+08:00' }],
     ['a bad message', { messages: [{ role: 'system', content: 'x', at: '2026-11-08T00:00:00.000Z' }] }],
     ['a user message without delivery', { messages: [{ role: 'user', content: 'x', at: '2026-11-08T00:00:00.000Z' }] }],
   ])('refuses a record with %s and keeps the previous file', (_name, patch) => {
@@ -94,6 +96,36 @@ describe('chat history on disk', () => {
     big.messages = [{ role: 'user', content: 'x'.repeat(9 * 1024 * 1024), at: '2026-11-08T00:00:00.000Z', delivered: true }]
     expect(() => createChatHistoryStore(dir).save(big)).toThrow('too large')
     expect(fs.existsSync(path.join(dir, 'chat-history', 'chat_a.json'))).toBe(false)
+  })
+
+  it('writes through a fresh temporary file, never through one already there', () => {
+    const store = createChatHistoryStore(dir)
+    store.save(record('chat_a', '2026-11-08T01:00:00.000Z'))
+    const outside = path.join(dir, 'outside.txt')
+    fs.writeFileSync(outside, 'keep me')
+    // A planted link at the old fixed temporary name is neither followed nor removed.
+    fs.symlinkSync(outside, path.join(dir, 'chat-history', 'chat_a.json.tmp'))
+    store.save(record('chat_a', '2026-11-08T02:00:00.000Z'))
+    expect(fs.readFileSync(outside, 'utf8')).toBe('keep me')
+    expect(store.get('chat_a')?.updated_at).toBe('2026-11-08T02:00:00.000Z')
+    const mode = fs.statSync(path.join(dir, 'chat-history', 'chat_a.json')).mode & 0o777
+    expect(mode).toBe(0o600)
+    expect(fs.readdirSync(path.join(dir, 'chat-history')).sort()).toEqual(['chat_a.json', 'chat_a.json.tmp'])
+  })
+
+  it('removes the temporary files of interrupted saves on delete and clear', () => {
+    const store = createChatHistoryStore(dir)
+    const root = path.join(dir, 'chat-history')
+    store.save(record('chat_a', '2026-11-08T01:00:00.000Z'))
+    store.save(record('chat_b', '2026-11-08T01:00:00.000Z'))
+    fs.writeFileSync(path.join(root, 'chat_a.json.0123456789ab.tmp'), 'transcript a')
+    fs.writeFileSync(path.join(root, 'chat_b.json.ba9876543210.tmp'), 'transcript b')
+    fs.writeFileSync(path.join(root, 'chat_c.json.aaaaaaaaaaaa.tmp'), 'transcript c')
+    store.delete('chat_a')
+    expect(fs.readdirSync(root).sort()).toEqual(['chat_b.json', 'chat_b.json.ba9876543210.tmp', 'chat_c.json.aaaaaaaaaaaa.tmp'])
+    fs.writeFileSync(path.join(root, 'notes.tmp'), 'keep')
+    store.clear()
+    expect(fs.readdirSync(root)).toEqual(['notes.tmp'])
   })
 
   it('skips damaged or mismatched files when listing and reading', () => {

@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import {
@@ -15,7 +16,10 @@ import {
 const MAX_RECORD_BYTES = 8 * 1024 * 1024
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
-const isTime = (v: unknown): v is string => typeof v === 'string' && v.length <= 40 && !Number.isNaN(Date.parse(v))
+/** ISO 8601 in UTC, as `Date.prototype.toISOString` writes it: no local
+ *  times, so the order and the instant survive a move to another zone. */
+const UTC_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/
+const isTime = (v: unknown): v is string => typeof v === 'string' && UTC_TIME.test(v) && !Number.isNaN(Date.parse(v))
 const isNullableString = (v: unknown): v is string | null => v === null || typeof v === 'string'
 const isNullableNumber = (v: unknown): v is number | null => v === null || (typeof v === 'number' && Number.isFinite(v))
 
@@ -64,9 +68,22 @@ export function parseChatHistoryRecord(v: unknown): ChatHistoryRecord {
  *  A damaged or foreign file is skipped by `list` and reads as missing. */
 export function createChatHistoryStore(dir: string) {
   const root = path.join(dir, 'chat-history')
-  const fileOf = (id: unknown): string => {
+  const checkId = (id: unknown): string => {
     if (typeof id !== 'string' || !CHAT_HISTORY_ID.test(id)) throw new Error('Invalid chat history id')
-    return path.join(root, `${id}.json`)
+    return id
+  }
+  const fileOf = (id: unknown): string => path.join(root, `${checkId(id)}.json`)
+  /** A save's temporary file: `<id>.json.<random>.tmp`. One left by a save
+   *  that died before its rename still holds the conversation, so delete and
+   *  clear remove these too. */
+  const tempOf = (id: string): string => path.join(root, `${id}.json.${randomBytes(6).toString('hex')}.tmp`)
+  const tempOwner = (name: string): string | null => {
+    const m = /^(chat_[a-z0-9_]{1,80})\.json\.[0-9a-f]{12}\.tmp$/.exec(name)
+    return m ? m[1] : null
+  }
+  const names = (): string[] => {
+    try { return fs.readdirSync(root) }
+    catch { return [] }
   }
   const read = (file: string): ChatHistoryRecord | null => {
     try { return parseChatHistoryRecord(JSON.parse(fs.readFileSync(file, 'utf8'))) }
@@ -75,10 +92,7 @@ export function createChatHistoryStore(dir: string) {
   return {
     /** Newest first. */
     list(): ChatHistorySummary[] {
-      let names: string[]
-      try { names = fs.readdirSync(root) }
-      catch { return [] }
-      return names
+      return names()
         .filter(name => name.endsWith('.json') && CHAT_HISTORY_ID.test(name.slice(0, -5)))
         .flatMap(name => {
           const record = read(path.join(root, name))
@@ -97,25 +111,31 @@ export function createChatHistoryStore(dir: string) {
       const body = JSON.stringify(record)
       if (Buffer.byteLength(body) > MAX_RECORD_BYTES) throw new Error('Chat history record too large')
       const file = fileOf(record.id)
-      const temp = `${file}.tmp`
+      fs.mkdirSync(root, { recursive: true, mode: 0o700 })
+      // A fresh name, created exclusively: never follows or reuses a file
+      // already there, and is ours to remove.
+      const temp = tempOf(record.id)
+      let created = false
       try {
-        fs.mkdirSync(root, { recursive: true, mode: 0o700 })
-        fs.writeFileSync(temp, body, { mode: 0o600 })
+        fs.writeFileSync(temp, body, { mode: 0o600, flag: 'wx' })
+        created = true
         fs.renameSync(temp, file)
+        created = false
       } finally {
-        fs.rmSync(temp, { force: true })
+        if (created) fs.rmSync(temp, { force: true })
       }
     },
     delete(id: unknown): void {
-      fs.rmSync(fileOf(id), { force: true })
+      const own = checkId(id)
+      fs.rmSync(fileOf(own), { force: true })
+      for (const name of names()) if (tempOwner(name) === own) fs.rmSync(path.join(root, name), { force: true })
     },
-    /** Removes every conversation this store wrote; leaves anything else alone. */
+    /** Removes every conversation this store wrote, including temporary files
+     *  of interrupted saves; leaves anything else alone. */
     clear(): void {
-      let names: string[]
-      try { names = fs.readdirSync(root) }
-      catch { return }
-      for (const name of names) {
-        if (name.endsWith('.json') && CHAT_HISTORY_ID.test(name.slice(0, -5))) fs.rmSync(path.join(root, name), { force: true })
+      for (const name of names()) {
+        const conversation = name.endsWith('.json') && CHAT_HISTORY_ID.test(name.slice(0, -5))
+        if (conversation || tempOwner(name) !== null) fs.rmSync(path.join(root, name), { force: true })
       }
     },
   }
