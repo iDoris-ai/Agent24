@@ -435,7 +435,7 @@ describe('chat history groups and archive (UI-06)', () => {
     expect(() => store.createGroup('多一个')).toThrow('Too many chat groups')
   })
 
-  it('reads a damaged or foreign groups file as no groups, and writes through a fresh temporary file', () => {
+  it('reads a damaged or foreign groups file as no groups; a change sets it aside, not over it', () => {
     fs.mkdirSync(path.join(dir, 'chat-history'))
     const file = path.join(dir, 'chat-history', '_groups.json')
     for (const body of ['{', JSON.stringify({ format: 'x', version: 1, groups: [], assistant_collapsed: false, archive_collapsed: true }),
@@ -444,10 +444,44 @@ describe('chat history groups and archive (UI-06)', () => {
       fs.writeFileSync(file, body)
       expect(createChatHistoryStore(dir).groups().groups).toEqual([])
     }
+    const damaged = fs.readFileSync(file, 'utf8')
     const open = vi.spyOn(fs, 'openSync')
     createChatHistoryStore(dir).createGroup('新')
     expect(open).toHaveBeenCalledWith(expect.stringMatching(/_groups\.json\.[0-9a-f]{12}\.tmp$/), 'wx', 0o600)
     expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toMatchObject({ format: 'agent24.desktop.chat-groups', version: 1 })
-    expect(fs.readdirSync(path.join(dir, 'chat-history'))).toEqual(['_groups.json'])
+    expect(fs.readdirSync(path.join(dir, 'chat-history')).sort()).toEqual(['_groups.damaged.json', '_groups.json'])
+    expect(fs.readFileSync(path.join(dir, 'chat-history', '_groups.damaged.json'), 'utf8')).toBe(damaged)
+  })
+
+  it('refuses a group change when the groups file is there but cannot be read', () => {
+    const store = createChatHistoryStore(dir)
+    store.createGroup('甲')
+    const file = path.join(dir, 'chat-history', '_groups.json')
+    const before = fs.readFileSync(file, 'utf8')
+    const real = fs.readFileSync
+    vi.spyOn(fs, 'readFileSync').mockImplementation(((f: fs.PathOrFileDescriptor, o?: unknown) => {
+      if (f === file) throw Object.assign(new Error('EACCES'), { code: 'EACCES' })
+      return real(f, o as never)
+    }) as typeof fs.readFileSync)
+    expect(store.groups().groups).toEqual([])
+    for (const change of [() => store.createGroup('乙'), () => store.setCollapsed('assistant', true)]) {
+      expect(change).toThrow('Chat groups unreadable')
+    }
+    vi.restoreAllMocks()
+    expect(fs.readFileSync(file, 'utf8')).toBe(before)
+  })
+
+  it('deleting a group and clearing remove temporary files of interrupted group writes', () => {
+    const store = createChatHistoryStore(dir)
+    const { groups: [a] } = store.createGroup('甲')
+    const root = path.join(dir, 'chat-history')
+    const stray = () => fs.writeFileSync(path.join(root, '_groups.json.0123456789ab.tmp'), '{"groups":[{"name":"甲"}]}')
+    stray()
+    fs.writeFileSync(path.join(root, '_groups.json.keep'), 'x')
+    store.deleteGroup(a.id)
+    expect(fs.readdirSync(root).sort()).toEqual(['_groups.json', '_groups.json.keep'])
+    stray()
+    store.clear()
+    expect(fs.readdirSync(root).sort()).toEqual(['_groups.json', '_groups.json.keep'])
   })
 })

@@ -160,4 +160,37 @@ describe('groups (UI-06 G1)', () => {
     expect(getHistoryState().groups.assistant_collapsed).toBe(false)
     expect(store.groups().assistant_collapsed).toBe(false)
   })
+
+  it('a read that started before a change does not bring back what the change removed', async () => {
+    await createGroup('工作')
+    const work = getHistoryState().groups.groups[0]
+    // Main reads the groups first; that answer is delivered after the deletion's.
+    let read!: () => void
+    groupsBridge.get.mockImplementationOnce(() => {
+      const answer = store.groups()
+      return new Promise(r => { read = () => r(answer) })
+    })
+    const refreshing = refreshGroups()
+    await deleteGroup(work.id)
+    read()
+    await refreshing
+    expect(getHistoryState().groups.groups).toEqual([])
+  })
+
+  it('when the newest change fails, the groups are read again: an earlier one that landed shows', async () => {
+    // Main makes the group; its answer is held until the fold has failed.
+    let made!: () => void
+    groupsBridge.create.mockImplementationOnce((n: string) => {
+      const answer = store.createGroup(n)
+      return new Promise(r => { made = () => r(answer) })
+    })
+    groupsBridge.setCollapsed.mockRejectedValueOnce(new Error('EACCES'))
+    const creating = createGroup('工作')
+    expect(await setCollapsed('assistant', true)).toBe(false)
+    made()
+    await creating
+    expect(getHistoryState().groups.groups.map(g => g.name)).toEqual(['工作'])
+    // The fold shown at once goes back, as main did not keep it.
+    expect(getHistoryState().groups.assistant_collapsed).toBe(false)
+  })
 })

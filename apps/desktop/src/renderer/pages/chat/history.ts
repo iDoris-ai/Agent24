@@ -173,21 +173,31 @@ async function organize(id: string, patch: ChatHistoryOrganize): Promise<boolean
 
 const groupsApi = () => (typeof window === 'undefined' ? undefined : window.agent24?.chatGroups)
 
-/** UI-06: reads the groups again from main; a failure leaves them as they were. */
+/** Main answers each group call with the groups as they then stand, in the
+ *  order it handled them: the last answer is the newest. `groupSeq` counts
+ *  the changes asked for. */
+let groupSeq = 0
+
+/** UI-06: reads the groups again from main; a failure leaves them as they
+ *  were. An answer is shown only when no change was asked for since: that
+ *  change's own answer comes later and is newer. */
 export async function refreshGroups(): Promise<void> {
+  const mark = groupSeq
   const groups = await groupsApi()?.get().catch(() => null)
-  if (groups) set({ groups })
+  if (groups && mark === groupSeq) set({ groups })
 }
 
-/** Main answers each group change with the groups as they then stand, in
- *  the order it handled them; the last answer is the newest. */
-let groupSeq = 0
 async function changeGroups(change: () => Promise<ChatGroupsState> | undefined): Promise<boolean> {
   const mine = ++groupSeq
   const groups = await Promise.resolve(change()).catch(() => undefined)
-  if (!groups) return false
-  // An answer overtaken by a newer change is not shown: that one's answer
-  // carries this change too, and showing this first would flicker a fold.
+  // Only the newest call's answer is shown: it carries every change main
+  // handled before it, and showing an older one first would flicker a fold.
+  // When the newest call fails, the groups are read again, so neither an
+  // older change that did land nor a fold shown before main kept it is lost.
+  if (!groups) {
+    if (mine === groupSeq) await refreshGroups()
+    return false
+  }
   if (mine === groupSeq) set({ groups })
   return true
 }

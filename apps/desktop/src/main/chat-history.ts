@@ -203,14 +203,37 @@ export function createChatHistoryStore(dir: string) {
   // UI-06: the groups file. Its name is not a conversation's, so list and
   // clear leave it alone: clearing the history keeps the groups.
   const groupsFile = path.join(root, '_groups.json')
-  const readGroups = (): ChatGroupsState => {
-    try { return parseChatGroups(JSON.parse(fs.readFileSync(groupsFile, 'utf8'))) }
-    catch { return { ...GROUPS_DEFAULT, groups: [] } }
+  /** Where a groups file that could not be read is moved before a change
+   *  writes a new one: the user's groups are set aside, not overwritten. */
+  const groupsAside = path.join(root, '_groups.damaged.json')
+  const groupsTemp = /^_groups\.json\.[0-9a-f]{12}\.tmp$/
+  const noGroups = (): ChatGroupsState => ({ ...GROUPS_DEFAULT, groups: [] })
+  /** The groups on file. A missing file is no groups. For showing them, a
+   *  damaged one is no groups too; for changing them (`forChange`), it is
+   *  moved aside first, and a file that is there but cannot be read (a
+   *  permission, an I/O error) refuses the change rather than lose it. */
+  const readGroups = (forChange = false): ChatGroupsState => {
+    let text: string
+    try { text = fs.readFileSync(groupsFile, 'utf8') }
+    catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT' || !forChange) return noGroups()
+      throw new Error('Chat groups unreadable')
+    }
+    try { return parseChatGroups(JSON.parse(text)) }
+    catch {
+      if (forChange) fs.renameSync(groupsFile, groupsAside)
+      return noGroups()
+    }
   }
   const writeGroups = (state: ChatGroupsState): ChatGroupsState => {
     const body = JSON.stringify({ format: CHAT_GROUPS_FORMAT, version: CHAT_GROUPS_VERSION, ...state })
     replace(groupsFile, path.join(root, `_groups.json.${randomBytes(6).toString('hex')}.tmp`), body)
     return state
+  }
+  /** Temporary files of group writes that died before their rename: they
+   *  may hold the names of groups deleted since. */
+  const sweepGroupTemps = (): void => {
+    for (const name of names()) if (groupsTemp.test(name)) fs.rmSync(path.join(root, name), { force: true })
   }
   const checkGroup = (id: unknown): string => {
     if (typeof id !== 'string' || !CHAT_GROUP_ID.test(id)) throw new Error('Invalid chat group id')
@@ -286,7 +309,7 @@ export function createChatHistoryStore(dir: string) {
     /** Adds a group at the end; returns the groups as they now stand. */
     createGroup(name: unknown): ChatGroupsState {
       const text = groupName(name)
-      const state = readGroups()
+      const state = readGroups(true)
       if (state.groups.length >= MAX_GROUPS) throw new Error('Too many chat groups')
       const group: ChatGroup = {
         id: `grp_${Date.now().toString(36)}_${randomBytes(4).toString('hex')}`,
@@ -297,7 +320,7 @@ export function createChatHistoryStore(dir: string) {
     renameGroup(id: unknown, name: unknown): ChatGroupsState {
       const own = checkGroup(id)
       const text = groupName(name)
-      const state = readGroups()
+      const state = readGroups(true)
       if (!state.groups.some(g => g.id === own)) return state
       return writeGroups({ ...state, groups: state.groups.map(g => (g.id === own ? { ...g, name: text } : g)) })
     },
@@ -306,15 +329,17 @@ export function createChatHistoryStore(dir: string) {
      *  write that cannot stop halfway. */
     deleteGroup(id: unknown): ChatGroupsState {
       const own = checkGroup(id)
-      const state = readGroups()
+      const state = readGroups(true)
       if (!state.groups.some(g => g.id === own)) return state
-      return writeGroups({ ...state, groups: state.groups.filter(g => g.id !== own) })
+      const after = writeGroups({ ...state, groups: state.groups.filter(g => g.id !== own) })
+      sweepGroupTemps()
+      return after
     },
     /** Folds or unfolds a group, the whole list ('assistant') or the
      *  archived conversations ('archive'). */
     setCollapsed(target: unknown, collapsed: unknown): ChatGroupsState {
       if (typeof collapsed !== 'boolean') throw new Error('Invalid chat history fold')
-      const state = readGroups()
+      const state = readGroups(true)
       if (target === 'assistant') return writeGroups({ ...state, assistant_collapsed: collapsed })
       if (target === 'archive') return writeGroups({ ...state, archive_collapsed: collapsed })
       const own = checkGroup(target)
@@ -350,6 +375,7 @@ export function createChatHistoryStore(dir: string) {
         const conversation = name.endsWith('.json') && CHAT_HISTORY_ID.test(name.slice(0, -5))
         if (conversation || tempOwner(name) !== null) fs.rmSync(path.join(root, name), { force: true })
       }
+      sweepGroupTemps()
     },
   }
 }
