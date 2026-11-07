@@ -1,6 +1,6 @@
 # Knowledge UI 身份交换与消息桥契约 v1（CONTRACT-UI-BRIDGE-v1）
 
-> **状态**：规范核心 v1，已评审合入；KB-R1/R2 只实施了长期登录态的本机存储（`knowledge-logins.ts`）和 C 不进 renderer（U1.4）。KnowledgeView、一次性票据、session JWT 与消息桥**没有实施**（11-11 后）。条款按 READONLY r8 写成，现行 READONLY 为 r11（r11 定了决定 #25，见 U1.3）；U7 的引用字段按 READONLY r9 起的 `content_tag` 修订（决定 #35）。· **日期**：2026-10-20，修订 2026-11-08 · **桥报文** `v: 2`（决定 #35 按 §0 变更规则递增；`v: 1` 从未实施，宿主不支持；文中其余「v1」指本契约文档版本）
+> **状态**：规范核心 v1，已评审合入；KB-R1/R2 只实施了长期登录态的本机存储（`knowledge-logins.ts`）和 C 不进 renderer（U1.4）。KnowledgeView、一次性票据、session JWT 与消息桥**没有实施**（11-11 后）。条款按 READONLY r8 写成，现行 READONLY 为 r11（r11 定了决定 #25，见 U1.3）；U7 的引用字段按 READONLY r9 起的 `content_tag` 修订（决定 #35）；U3.4、U3.8 补服务端重启信号（决定 #36）。· **日期**：2026-10-20，修订 2026-11-08 · **桥报文** `v: 2`（决定 #35 按 §0 变更规则递增；`v: 1` 从未实施，宿主不支持；文中其余「v1」指本契约文档版本）
 > **依据**：`docs/knowledge/CONTRACT-READONLY-v1.md`（下称 READONLY，按 r8；例外：引用 read、分块分页与 `content_tag` 的日志规则按现行 r11 的 R4.1、R4.3、R4.5、R4.7、R10.3，决定 #35）；`docs/knowledge/CONTRACT-STATE-v1.md`（下称 STATE，规范核心 v1，PR #1113；本文依赖它的规则汇总在 §8.2）。
 > 由完整版 `ab/weknora-03b-ui-bridge`（#1077 的分支）压缩而来。本文只写对外行为与不变式；实现机制由各实现任务以代码和测试证明。
 > 编号：`R*` 为 READONLY 规则，`S*` 为 STATE 规范核心 v1（同批）的条款，`U*` 为本文规则（沿用完整版编号，空号即已移出规范），`决定 #n` 见 §9.1（已定）与 §9.5（待决）。
@@ -60,16 +60,17 @@
 - **U3.1** 兑换成功时服务端签发；签名用服务端的 UI 会话密钥，与签发 C 的密钥分开，不是租户 HMAC（R1.2）；local-managed 下由本实例专属秘密派生（R1.4）。
 - **U3.2** 声明：`iss`、`aud`、`sub`、`tenant_id`、`scope.knowledge_base_ids`（兑换时的 E，非空）、`ops`、`iat`、`nbf`、`exp`、`jti`、`ticket_id`、`parent_credential_id`、`binding_tag`、`partition_tag`、`cnf.vph`、`gen`（只记录）。
 - **U3.3** 寿命默认 10 分钟、最长 15 分钟，`exp` 不晚于 C 的到期时间；不发刷新令牌。
-- **U3.4** 服务端在**每个** UI 资源入口校验：签名（算法由服务端固定，拒绝 `none`，不按 header 选算法或密钥）、`aud`、`exp`/`nbf`（容差 ≤30 秒）、`jti` 与族未撤销、C 有效、view 证明与 `cnf.vph` 相符，并按 R2.1 重算 E，资源须在 E 内（越界与不存在不可区分，R2.6）。失败为 `unauthorized`：JWT 过期 → `credential_expired`；C 被撤销 → `credential_revoked`；`jti` 或族被撤销、签名、`aud`、view 证明缺失或不符 → `credential_invalid`。长连接（SSE、WebSocket）最多活到所用 JWT 的 `exp`；族、`jti` 或 C 被撤销时服务端关闭该族的长连接，至迟 60 秒。错误体与响应头不回显 `Authorization` 与 view 证明。服务端另提供只认 JWT 与 view 证明的会话探测入口。
+- **U3.4** 服务端在**每个** UI 资源入口校验：签名（算法由服务端固定，拒绝 `none`，不按 header 选算法或密钥）、`aud`、`exp`/`nbf`（容差 ≤30 秒）、`jti` 与族未撤销、C 有效、view 证明与 `cnf.vph` 相符，并按 R2.1 重算 E，资源须在 E 内（越界与不存在不可区分，R2.6）。失败为 `unauthorized`：JWT 过期 → `credential_expired`；C 被撤销 → `credential_revoked`；`jti` 或族被撤销、签名、`aud`、view 证明缺失或不符 → `credential_invalid`。服务端按 U2.3 末句让重启前签出的 JWT 失效时，同样回 `credential_invalid`，并在 `details` 里带 `restarted: true`（决定 #36）；这个判定排在 view 证明核对之后，view 证明缺失或不符时不带 `restarted`。会话探测入口同此。兑换入口不带这个信号（U2.7 不可区分）。长连接（SSE、WebSocket）最多活到所用 JWT 的 `exp`；族、`jti` 或 C 被撤销时服务端关闭该族的长连接，至迟 60 秒。错误体与响应头不回显 `Authorization` 与 view 证明。服务端另提供只认 JWT 与 view 证明的会话探测入口。
 - **U3.5** 页面里没有 JWT：嵌入页请求不带 `Authorization`，由宿主注入（U4.5）。
 - **U3.6** **续期与换发**由宿主发起，都在同一 view 实例、同一族内按 U2.1 重新铸票兑换，服务端每次重新校验 C 与政策：JWT 用掉约 2/3 寿命时续期；当前 C 被替换（续签，或凭据无效类续签（S3.1）后取得新 C）时换发，换发完成前暂停注入，新 JWT 的 `parent_credential_id` 指向新 C。换发前因旧 C 失效得到的 401 不计入 `revocation_mismatch`。续签不要求撤销旧 C。
 - **U3.7** **族与撤销**：撤销入口按 `ticket_id` 只撤那一张票据及其换出的 JWT，按 `vph` 撤整族；族撤销后同一 `vph` 的兑换与 JWT 一律被拒。撤销入口只接受 Provider 用 C 发起的调用，用 session JWT 一律拒绝。**存在性不可区分**：目标不存在、已过期、已撤销或属于其他 principal 时，响应与撤销成功相同，且对他人的对象没有任何效果。**成功的含义**：属于调用方的目标只有在撤销（含其换出的 JWT）持久生效后才返回成功；执行或持久化失败返回错误，超时或断连按结果未知处理，可幂等重试；成功不构成目标存在或归属的证明，宿主按自己的签发记录判断归属（Grok、Codex 讨论一致）。view 实例销毁时撤整族；撤销有时限、不阻塞销毁，失败时残留 JWT 至多活到 `exp`，且 `view_secret` 已丢弃、无法使用。同时泄露 JWT 与 view 证明时，两者在 `exp` 前可被冒用（所以 U2.5 禁止记录二者）。
 - **U3.8** **UI 路径上的 401**（都不由本文递增 generation；未列出的结果按"超时或 5xx"处理，fail closed）：
+  - **解码**：兑换、会话探测与 UI 资源入口的响应不是 READONLY 响应（U2.7），宿主按本文解码，不能套用 READONLY 错误信封的严格 schema。`unauthorized` 的 `details` 在 R6.1 的字段之外可带 `restarted`（布尔，可选，U3.4）；宿主解码器必须接受并读出它，缺省等同 `false`；`restarted` 存在但不是布尔时，整个响应按未知结果处理。按 READONLY §0.3 忽略未知字段的宽容解码（如 `rust/crates/agent24-knowledge/src/received.rs`）能接受这个响应，但要另加这个字段才读得出；用严格 schema（`protocol/knowledge/v1/error.schema.json` 的 `unauthorized`、`error.rs` 的 `UnauthorizedDetails`）解码或做夹具往返的，必须同步加上这个可选字段。
   - 只有**经过注入**的页面请求得到 401 才触发自查；每个 view 实例单飞、至多每 10 秒一次。JWT 已到或接近到期时直接续期，否则调会话探测。
-  - 探测 `credential_expired` → 续期，不销毁 view。探测 `credential_revoked` → 不据此判定撤权，由 Provider 用当前 C 签一次票，签发响应按 U2.14；签票成功即续期；同一 binding 10 分钟内第 3 次"探测得 `credential_revoked` 而签票成功" → `closed/revocation_mismatch`。探测 `credential_invalid` → view 级处理。探测成功 → 无动作（若此时正因探测失败暂停，按下一条解除）。
+  - 探测 `credential_expired` → 续期，不销毁 view。探测 `credential_revoked` → 不据此判定撤权，由 Provider 用当前 C 签一次票，签发响应按 U2.14；签票成功即续期；同一 binding 10 分钟内第 3 次"探测得 `credential_revoked` 而签票成功" → `closed/revocation_mismatch`。探测 `credential_invalid` → view 级处理；带 `restarted: true` 时同样做 view 级处理（新实例、新 `vph`），不当作续期、不在原族内续发，计不计数见下面「10 分钟」一条。探测成功 → 无动作（若此时正因探测失败暂停，按下一条解除）。
   - 兑换 `credential_invalid` → 第一次改铸新票，连续第二次做 view 级处理；`credential_expired` → 先续 C 再重铸；`credential_revoked` → 由 Provider 用当前 C 签票，按 U2.14；`forbidden/empty_scope` → 见末条。
   - 探测或兑换超时、5xx 或未知 `reason` → 暂停注入并退避重试（兑换不重发同一票据）；连续 3 次 → `closed/probe_failed`；其间任一次得到其他结果，即解除暂停、计数清零，并按该结果处理。
-  - 同一 binding 10 分钟内由 `credential_invalid` 触发的第 2 次 view 级处理不再自动重建 → `closed/session_rejected`，出口见 §9.2，profile 服务状态不变；崩溃、Off→On、端口变化与通道恢复引起的重建不计。
+  - 同一 binding 10 分钟内由 `credential_invalid` 触发的第 2 次 view 级处理不再自动重建 → `closed/session_rejected`，出口见 §9.2，profile 服务状态不变；崩溃、Off→On、端口变化与通道恢复引起的重建不计。探测得到带 `restarted: true` 的 `credential_invalid` 引起的 view 级处理也不计，但同一 binding 10 分钟内至多免计 3 次，超出的照常计数；它与通道恢复发生在同一次重新握手内时，按 U4.8 只做那一次重建（决定 #36）。
   - 当前 C 的签发或兑换得到 `forbidden/empty_scope`：不建 view；已有 view 销毁且不重建，显示"没有可见的知识库"（`closed/empty_scope`）。
 - **U3.9** 服务端不校验 `gen`（R7.5）；generation 由宿主执行：桥拒绝旧 generation 的消息（U6.4 ⑭），generation 递增时 binding 级销毁（U4.8）。
 
@@ -162,6 +163,7 @@
 - #31 恢复与存活策略按 U4.5、U4.8 的数值，可按实测调整。
 - #33 凭据无效类续签也失败（S3.1）：只暂停注入并加遮罩，不关桥、不销毁。
 - #34 全局收紧作废的登录态，在该 profile 解除 `unsaved_settings` 重新绑定（S1.13）后或 profile 移除时销毁。
+- #36 服务端重启信号（#1645）：服务端按 U2.3 末句让重启前签出的 session JWT 失效时，在资源入口与会话探测的 `unauthorized/credential_invalid` 上加 `details.restarted: true`（排在 view 证明核对之后）；兑换不带（U2.7）。宿主照常做 view 级处理，只是不计入 `session_rejected` 计数，同一 binding 10 分钟内至多免计 3 次；宿主按本文解码 UI 路径的响应，必须接受 `restarted`。证据裁决中档，R1 收敛（R0 三方都选这一做法，但 READONLY §0.3「忽略未知字段」与 Agent24 现有严格 schema 存在事实矛盾，进 R1；R1 后仍是这一做法，置信度 70/90/82；宿主侧 Knowledge 独立同意），按 2026-11-08 规则直接执行。U3.8 的解码要求来自 R1。
 - #35 `citation`（及 `return_to_chat_intent` 的引用）补必填 `content_tag`，与 READONLY R4.1、R4.7（r9 起）一致；`chunk_revision` 保留、只作参考；按 §0 变更规则桥报文 `v` 由 1 升为 2（David 2026-11-08 确认 D，经 General 转达；证据裁决 R1 未收敛）。确认框标题由宿主重新 read 取得，`content_tag` 只覆盖分块正文、不覆盖标题。
 - #25 UI 操作与 C 的关系按 READONLY r11 的 R1.8、R2.8 处理：C 可签发与撤销票据，不计入数据操作范围；`ops` 是独立的只读展示清单（David 2026-11-08 确认，证据裁决 R0 一致）。
 
