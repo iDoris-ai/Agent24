@@ -85,7 +85,7 @@ type Opener = { currentTarget: HTMLElement; clientX?: number; clientY?: number }
  *  through them too. */
 export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   const t = useT(chatMessages)
-  const { items, activeId, busy, groups: groupState } = useSyncExternalStore(subscribeHistory, getHistoryState)
+  const { items, activeId, busy, groups: groupState, archiving } = useSyncExternalStore(subscribeHistory, getHistoryState)
   const groups = groupState.groups
   useEffect(() => { void refreshHistory(); void refreshGroups() }, [])
   const [query, setQuery] = useState('')
@@ -157,12 +157,21 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   const listRef = useRef<HTMLDivElement>(null)
   const entry = (id: string) => listRef.current?.querySelector<HTMLButtonElement>(`[data-history-id="${id}"]`)
   const startEdit = (id: string, title: string) => {
-    // Archived conversations are restored or deleted, not renamed.
-    if (items.find(item => item.id === id)?.archived_at != null) return
+    // Archived conversations (or ones being archived) are restored or
+    // deleted, not renamed.
+    if (archiving.includes(id) || items.find(item => item.id === id)?.archived_at != null) return
     editingRef.current = { id, from: title }
     setEditing(id)
     setDraft(title)
   }
+  // A rename open when its conversation is archived is dropped, unsaved.
+  const editedArchived = editing !== null && (archiving.includes(editing)
+    || items.find(item => item.id === editing)?.archived_at != null)
+  useEffect(() => {
+    if (!editedArchived) return
+    editingRef.current = null
+    setEditing(null)
+  }, [editedArchived])
   const endEdit = (save: boolean, refocus: boolean) => {
     const edit = editingRef.current
     if (edit === null) return

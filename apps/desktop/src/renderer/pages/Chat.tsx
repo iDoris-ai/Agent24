@@ -489,7 +489,9 @@ export default function ChatPage() {
       {archived ? (
         <div className="chat-input-bar chat-archived-bar" role="status">
           <span className="chat-archived-notice">{t('archived.notice')}</span>
-          <button className="btn" onClick={() => void restoreConversation(sessionId)}>{t('archived.restore')}</button>
+          {/* Not while main is still archiving it: the page leaves it then. */}
+          <button className="btn" disabled={history.archiving.includes(sessionId)}
+            onClick={() => void restoreConversation(sessionId)}>{t('archived.restore')}</button>
         </div>
       ) : <div className="chat-input-bar">
         <textarea

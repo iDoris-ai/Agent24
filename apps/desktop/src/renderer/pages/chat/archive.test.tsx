@@ -3,13 +3,13 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { createChatHistoryStore } from '../../../main/chat-history'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../../shared/chat-history'
 import ChatPage from '../Chat'
 import { ChatHistoryList } from './ChatHistoryList'
 import { DRAG_TYPE } from './drop'
-import { getHistoryState, resetHistoryStore, setChatBusy, setActiveConversation } from './history'
+import { archiveConversation, getHistoryState, resetHistoryStore, setChatBusy, setActiveConversation } from './history'
 import { setLocale } from '../../i18n'
 
 // UI-06 G3: the archive in the sidebar list and an archived conversation on
@@ -142,6 +142,33 @@ describe('the archive in the history list (UI-06 G3)', () => {
     expect(within(list()).queryByRole('textbox', { name: '对话标题' })).toBeNull()
   })
 
+  it('a rename is not started while a conversation is being archived, and one open is dropped when it is', async () => {
+    put('chat_a', '周报', 2)
+    put('chat_b', '闲聊', 1)
+    await showList()
+    await within(list()).findByRole('button', { name: '周报' })
+    let land!: () => void
+    bridge.organize.mockImplementation((id: string, p: unknown) => {
+      const answer = store.organize(id, p)
+      return new Promise(r => { land = () => r(answer) })
+    })
+    // Being archived: F2 opens nothing.
+    let archivingA!: Promise<boolean>
+    act(() => { archivingA = archiveConversation('chat_a') })
+    fireEvent.keyDown(row('周报'), { key: 'F2' })
+    expect(within(list()).queryByRole('textbox', { name: '对话标题' })).toBeNull()
+    await act(async () => { land(); await archivingA })
+    // A rename open when its conversation is archived (from elsewhere) is dropped, unsaved.
+    fireEvent.keyDown(row('闲聊'), { key: 'F2' })
+    fireEvent.change(within(list()).getByRole('textbox', { name: '对话标题' }), { target: { value: '新名' } })
+    let archivingB!: Promise<boolean>
+    act(() => { archivingB = archiveConversation('chat_b') })
+    await waitFor(() => expect(within(list()).queryByRole('textbox', { name: '对话标题' })).toBeNull())
+    await act(async () => { land(); await archivingB })
+    expect(archivedAt('chat_b')).not.toBeNull()
+    expect(bridge.setTitle).not.toHaveBeenCalled()
+  })
+
   it('deleting an archived conversation asks first', async () => {
     put('chat_a', '周报')
     store.organize('chat_a', { archived: true })
@@ -260,6 +287,8 @@ describe('an archived conversation on the chat page (UI-06 D7)', () => {
     fireEvent.click(within(openRowMenu('周报')).getByRole('menuitem', { name: '归档' }))
     await waitFor(() => expect(screen.getByText('这个对话已归档，只能查看。')).toBeInTheDocument())
     expect(screen.queryByPlaceholderText(/输入消息/)).toBeNull()
+    // Nor restored before main has answered.
+    expect(screen.getByRole('button', { name: '恢复后继续' })).toBeDisabled()
     const sent = proxy.mock.calls.length
     answer(true)
     await waitFor(() => expect(screen.getByPlaceholderText(/输入消息/)).toBeInTheDocument())
