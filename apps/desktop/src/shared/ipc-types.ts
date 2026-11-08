@@ -131,6 +131,13 @@ export const IpcChannels = {
   KnowledgeDraftRemove: 'knowledge-draft:remove',
   // KB-SOP-01a (#1669): may this conversation become a knowledge entry (main asks the user).
   KnowledgeEntryAdmit: 'knowledge-entry:admit',
+  // KB-SOP-01b-2 (#1669): local knowledge entry drafts (main/knowledge-entry-ipc.ts).
+  KnowledgeEntryDraftCreate: 'knowledge-entry:draft-create',
+  KnowledgeEntryDraftList: 'knowledge-entry:draft-list',
+  KnowledgeEntryDraftGet: 'knowledge-entry:draft-get',
+  KnowledgeEntryDraftUpdate: 'knowledge-entry:draft-update',
+  KnowledgeEntryDraftRedact: 'knowledge-entry:draft-redact',
+  KnowledgeEntryDraftWithdraw: 'knowledge-entry:draft-withdraw',
 } as const
 
 /** T1-1/T1-2: the documents module as it is on disk now. A daemon reads
@@ -199,6 +206,56 @@ export type KnowledgeDraftEntry = {
 export type KnowledgeEntryAdmission =
   | { ok: true }
   | { ok: false; reason: 'floor_missing' | 'restricted' | 'unknown' | 'too_many_runs' | 'not_confirmed' | 'not_found' | 'busy' | 'knowledge_off' }
+
+/** KB-SOP-01b-2: one message of the admitted conversation, for choosing the range. */
+export interface KnowledgeEntryMessagePreview {
+  role: 'user' | 'assistant'
+  /** The start of the message on one line. */
+  preview: string
+}
+
+/** What the renderer gets for "沉淀为知识条目": on yes, a one-use ticket
+ *  for the very record main judged, and its messages to choose a range from. */
+export type KnowledgeEntryAdmitAnswer =
+  | { ok: true; ticket: string; messages: KnowledgeEntryMessagePreview[] }
+  | Extract<KnowledgeEntryAdmission, { ok: false }>
+
+export type KnowledgeEntryKind = 'sop' | 'faq' | 'note'
+export type KnowledgeEntryFinding = 'private_key' | 'credential' | 'email' | 'phone' | 'id_card' | 'bank_card' | 'path' | 'internal_address'
+/** `same`: bound to what Knowledge is bound to now; `changed`: another target
+ *  ("需要重新选目标库"); `none`: Knowledge is off or not bound now. */
+export type KnowledgeEntryTarget = 'same' | 'changed' | 'none'
+
+export interface KnowledgeEntryDraftSummary {
+  id: string
+  kind: KnowledgeEntryKind
+  title: string
+  updated_at: string
+  target: KnowledgeEntryTarget
+  /** The post-scan's categories; any one blocks submission. */
+  findings: KnowledgeEntryFinding[]
+}
+
+export interface KnowledgeEntryDraftView extends KnowledgeEntryDraftSummary {
+  body: string
+  conversation_id: string
+  message_from: number
+  message_to: number
+  created_at: string
+  content_sha256: string
+}
+
+/** How the model step went; anything but `drafted` gave the empty template. */
+export type KnowledgeEntryModelOutcome = 'drafted' | 'no_model' | 'needs_confirmation' | 'busy' | 'failed' | 'unusable'
+
+export type KnowledgeEntryDraftCreated =
+  | { ok: true; draft: KnowledgeEntryDraftView; model: KnowledgeEntryModelOutcome; hints: string[] }
+  | { ok: false; reason: 'ticket_expired' | 'invalid_range' | 'too_long' | 'too_many' | 'knowledge_off' | 'busy' | 'not_saved' }
+
+export type KnowledgeEntryDraftSaved =
+  | { ok: true; draft: KnowledgeEntryDraftView }
+  /** `too_long`: redacting would make the body longer than 64 KiB (placeholders are longer than some hits). */
+  | { ok: false; reason: 'not_found' | 'invalid' | 'not_saved' | 'too_long' }
 
 export type KnowledgeSettingsResult = { ok: true } | { ok: false; reason: 'invalid' | 'not_saved' | 'unavailable' }
 
