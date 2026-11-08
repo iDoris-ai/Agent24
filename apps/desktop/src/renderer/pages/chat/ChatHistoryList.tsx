@@ -22,6 +22,8 @@ import { graphemes, oneLine, renameTitle } from './title'
 import { DRAG_TYPE, dropChange, groupOf, targetKey, type DropTarget } from './drop'
 import { HistoryMenu, type MenuEntry } from './HistoryMenu'
 import { useEntryMenu } from './knowledge-entry'
+import { HISTORY_FILTERS, filtersOf, type HistoryFilter } from './filters'
+import { useRunStatuses } from './run-status'
 import type { ChatHistorySummary } from '../../../shared/chat-history'
 
 /** UI-04 T3: with more conversations than this, the list offers a search. */
@@ -149,6 +151,21 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   const needle = fold(oneLine(query))
   const searching = searchable && needle !== ''
   const shown = searching ? rows.filter(row => row.haystack.includes(needle)) : rows
+
+  // M4 A3: the four filters. Each task's status is asked of the daemon and
+  // kept up to date by its events; archived conversations are under "all"
+  // only. Another filter than "all" shows a flat list, searched too.
+  const [filter, setFilter] = useState<HistoryFilter>('all')
+  const taskIds = useMemo(() => live.flatMap(item => item.tasks.map(task => task.run_id)), [live])
+  const statuses = useRunStatuses(taskIds)
+  const under = useMemo(() => new Map(live.map(item => [item.id, filtersOf(item, id => statuses.get(id))])), [live, statuses])
+  const count = (f: HistoryFilter) => live.filter(item => under.get(item.id)?.has(f)).length
+  // Shown only once some conversation has a task or waits on the user:
+  // before that every filter but "all" is empty. Gone, it leaves "all".
+  const hasWork = live.some(item => item.tasks.length > 0 || item.pending.length > 0)
+  useEffect(() => { if (!hasWork) setFilter('all') }, [hasWork])
+  const filtering = hasWork && filter !== 'all'
+  const filtered = filtering ? shown.filter(row => !row.archived && under.get(row.item.id)?.has(filter)) : shown
 
   // The conversation being renamed, the title it had when the box opened,
   // and what has been typed so far. The ref makes Enter followed by the
@@ -430,10 +447,23 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
             <NameBox label={t('history.group.nameInput')} initial="" onDone={(name, keyboard) => void nameDone(name, keyboard)} />
           </div>
         )}
-        {searching
+        {hasWork && (
+          <div className="chat-history-filters" role="group" aria-label={t('history.filter.label')}>
+            {HISTORY_FILTERS.map(f => {
+              const n = f === 'all' ? 0 : count(f)
+              return (
+                <button key={f} type="button" className="chat-history-filter" aria-pressed={filter === f} onClick={() => setFilter(f)}>
+                  {t(`history.filter.${f}`)}{n > 0 && <span className="chat-history-filter-count">({n})</span>}
+                </button>
+              )
+            })}
+          </div>
+        )}
+        {filtering || searching
           ? <>
-            {shown.length === 0 && <p className="chat-history-empty" role="status">{t('history.noMatch')}</p>}
-            <ul className="chat-history-list">{shown.map(renderRow)}</ul>
+            {filtered.length === 0 && <p className="chat-history-empty" role="status">
+              {t(filtering && !searching ? 'history.filter.empty' : 'history.noMatch')}</p>}
+            <ul className="chat-history-list">{filtered.map(renderRow)}</ul>
           </>
           : <>
             {groups.map(group => {

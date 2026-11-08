@@ -27,7 +27,7 @@
 
 import WebSocket from 'ws'
 import { daemonConnection } from './backend-manager'
-import type { ModelCallEnvelope } from '../shared/ipc-types'
+import { RUN_EVENT_TYPES, type ModelCallEnvelope, type RunEvent } from '../shared/ipc-types'
 
 export const AGENTEAR_MODULE_NAME = 'agentear'
 export const AGENTEAR_EVENT_KIND = 'agentear.event'
@@ -115,6 +115,24 @@ export function parseModelCallFrame(raw: string): ModelCallEnvelope | null {
   return payload as unknown as ModelCallEnvelope
 }
 
+/** M4 A3: unwraps one WS text frame to the run it is about, for the
+ *  history list's filters, or null if it is no run or approval event.
+ *  First-party kernel events like `model.call`: `{type, payload}` with the
+ *  run's id at `payload.run_id`. Only the type and the id go on: the rest
+ *  (output, prompts) is not the list's. */
+export function parseRunFrame(raw: string): RunEvent | null {
+  let msg: unknown
+  try {
+    msg = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (!isPlainObject(msg) || !(RUN_EVENT_TYPES as readonly unknown[]).includes(msg['type'])) return null
+  const payload = msg['payload']
+  if (!isPlainObject(payload) || typeof payload['run_id'] !== 'string' || payload['run_id'] === '') return null
+  return { type: msg['type'] as RunEvent['type'], run_id: payload['run_id'] }
+}
+
 /** Reconnecting WS client. Kept deliberately dumb: no queueing, no
  *  persistence (design §7.3/Q4 — Agent24 never persists transcript, and
  *  losing in-flight events across a reconnect is acceptable for this P2
@@ -133,6 +151,8 @@ export class AgentEarEventBridge {
     // Every module's events, for bridges other than AgentEar's (ADR-DOC-01
     // D5: the Documenting OS); optional for the same reason.
     private readonly onModuleEvent?: (event: ModuleEvent) => void,
+    // M4 A3: every run's and approval's change, for the history list.
+    private readonly onRunEvent?: (event: RunEvent) => void,
   ) {}
 
   start(): void {
@@ -182,6 +202,8 @@ export class AgentEarEventBridge {
       if (modelCall !== null) this.onModelCall?.(modelCall)
       const moduleEvent = this.onModuleEvent ? parseModuleFrame(raw) : null
       if (moduleEvent !== null) this.onModuleEvent?.(moduleEvent)
+      const runEvent = this.onRunEvent ? parseRunFrame(raw) : null
+      if (runEvent !== null) this.onRunEvent?.(runEvent)
     })
     socket.on('close', () => {
       if (this.socket === socket) this.socket = null
