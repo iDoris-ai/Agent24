@@ -97,7 +97,7 @@
       }
     },
     "approve_request": {
-      "description": "W8.5: sent by the UI session (request_id, no generation); no separate idempotency key (the key is candidate_id); content_sha256 must equal the candidate's. Approval fields of any kind are not part of the request (W1.6).",
+      "description": "W8.5: sent by the UI session (request_id, no generation); no separate idempotency key (the key is candidate_id); content_sha256 must equal the candidate's. A conforming client sends no approval fields; the server strips approved, author and approver before the shape check and audits them (W1.6), so this schema describes what a client sends.",
       "type": "object", "additionalProperties": false, "required": ["request_id", "candidate_id", "content_sha256"],
       "properties": { "request_id": { "$ref": "#/$defs/request_id" }, "candidate_id": { "$ref": "#/$defs/id" }, "content_sha256": { "$ref": "#/$defs/sha256" } }
     },
@@ -113,7 +113,7 @@
         "source_revision": { "$ref": "#/$defs/id" },
         "job_id": { "description": "null only on a dedup hit (details.outcome existing, W3.5).", "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
         "author_is_approver": { "type": "boolean" },
-        "details": { "type": "object", "additionalProperties": false, "properties": { "outcome": { "const": "existing" }, "replayed": { "const": true } } }
+        "details": { "type": "object", "additionalProperties": false, "properties": { "outcome": { "const": "existing" }, "replayed": { "const": true }, "document_status": { "description": "W3.5: on a dedup hit, the existing document's processing state (its latest job is not returned).", "enum": ["index_pending", "indexed", "index_failed"] } } }
       },
       "if": { "properties": { "job_id": { "type": "null" } } },
       "then": { "required": ["details"], "properties": { "details": { "required": ["outcome"] } } }

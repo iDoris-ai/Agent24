@@ -22,7 +22,7 @@ const FIXTURE_SHA256: [(&str, &str); 2] = [
     ),
     (
         "schema-cases.json",
-        "7165cff286c00eb4b73fa335dcd38e558f881b12d0f6072de1d036c179071348",
+        "cc2f9acf9715fd64524cc32e20c27e738e1d81ed9f4cea940251a1379801db29",
     ),
 ];
 const DEFS: [(&str, &[&str]); 2] = [

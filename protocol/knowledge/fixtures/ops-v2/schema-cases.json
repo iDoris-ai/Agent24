@@ -1019,6 +1019,44 @@
         "status": "returned",
         "return_reason": "reviewer"
       }
+    },
+    {
+      "name": "approve response dedup hit with document status",
+      "schema": "candidate.approve_response",
+      "valid": true,
+      "doc": {
+        "request_id": "req_01HZX3",
+        "authz_version": "az-7",
+        "candidate_id": "cand-1",
+        "status": "approved",
+        "knowledge_id": "doc-12",
+        "source_revision": "srev-1",
+        "job_id": null,
+        "author_is_approver": true,
+        "details": {
+          "outcome": "existing",
+          "document_status": "indexed"
+        }
+      }
+    },
+    {
+      "name": "approve response with an unknown document status",
+      "schema": "candidate.approve_response",
+      "valid": false,
+      "doc": {
+        "request_id": "req_01HZX3",
+        "authz_version": "az-7",
+        "candidate_id": "cand-1",
+        "status": "approved",
+        "knowledge_id": "doc-12",
+        "source_revision": "srev-1",
+        "job_id": null,
+        "author_is_approver": true,
+        "details": {
+          "outcome": "existing",
+          "document_status": "running"
+        }
+      }
     }
   ]
 }

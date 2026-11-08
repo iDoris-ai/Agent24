@@ -25,7 +25,7 @@
 - **W1.5** **结果未知**：写请求（`*.read` 与 `pack.load` 除外；`pack.load` 走 W7.10、W7.12，Off 记 `skipped/knowledge_off`）发出后，服务端结果没有交给调用方的任何路径——generation 作废中止、迟到或 generation 过期的响应被丢弃（S4.6）、追加前复查换码（包括 Off 换成的 `knowledge_off`）——本地结果一律带 `details.write_outcome: "unknown"`（有幂等键的附上键），界面不得声称"未保存"。待决写记录（操作类、请求体、幂等键、`binding_id`）在**发出请求之前**持久化，确认后才发出，持久化失败则不发出（按 STATE §6 得 `local_storage`），得到确定结果后清除；它是宿主侧记录，按 STATE S1.10 的先持久后生效原则处理，不是 STATE 的持久状态，与 0.2、I2 不冲突。重启或 Tool 重试只能在**同一 binding**（同一 `binding_id`）内**用同一键与同一请求体**重发，**不得换新键自动重发**。该 binding 已退役、身份元组（S2.4：principal、端点、租户或实例）任一项已变，或待决时间超过服务端幂等保留期（W3.3）时，宿主不再重发，保持 `unknown` 并提示用户自行确认。
 - **W1.6** **与业务决定无关的机制约束**：
   - 授权只来自 A 与凭据，不从 retrieve 能力、页面角色、上游 RBAC、组织名、License、激活状态或请求体字段（归属、创建人、`approved`、`role`）推导；这些字段被忽略并记审计。
-  - 服务端不信任宿主转述的批准：批准只能是批准人用自己的已认证会话发出的请求（W7.15、W8.5）；请求体里的 `approved`、`author`、`approver` 一律忽略。
+  - 服务端不信任宿主转述的批准：批准只能是批准人用自己的已认证会话发出的请求（W7.15、W8.5）；请求体里的 `approved`、`author`、`approver` 一律忽略：服务端在形状检查（W1.9 ②）之前剥离并记审计，所以它们既不使请求失败，也不生效；合规客户端不发送它们（schema 不列这些字段）。
   - 桥不是写入口：桥消息是闭集，`approval`、`approve`、`decision` 是禁止键（UI-BRIDGE U6.2 不变）。
   - **UI 会话只能做三类写操作**：session JWT 只能执行 `candidate.review`、`candidate.approve`、`entry.withdraw`，且只经集成闸门精确表中为它们列出的 UI 入口；principal 取自该会话所兑换的凭据 C（UI-BRIDGE U2、READONLY R1.5），等同本人的已认证请求；C 解析不出归属用户时得 `forbidden/operation_not_allowed`。每次执行时服务端复验：会话与 C 未撤销、principal 此刻持有该操作类（W2.5）、目标状态（W8.4）。其余写操作用 session JWT 调用得 `unauthorized/credential_invalid`。
   - **残余风险**（写明，不声称已消除）：服务端分不出一次 UI 请求是不是人真的点了按钮，页面内的脚本也能以同一会话发请求。缓解：`candidate.approve` 请求体必须带 `candidate_id` 与 `content_sha256`，由服务端核对候选当前内容（W8.5）；嵌入页 CSP 只允许自身脚本（UIB U4.2）；每次批准进审计。
@@ -147,7 +147,7 @@
   - ⑤ 的顺序（取第一个不成立的）：
     1. `kind` 在 §6 闭集内、长度合规（`invalid_request`）；
     2. `content_sha256` 与服务端按 W8.13 重算的值一致（否则 `invalid_request/content_hash_mismatch`，不保存）；
-    3. `revise` 时目标文档对调用者可见、未下架、不在删除中（否则 `not_found`）且是由候选发布出来的条目文档（`origin: "entry"`；否则 `forbidden/operation_not_allowed`），并且 `expected_source_revision` 等于当前源修订（否则 `stale/base_revision_changed`，附 `current_revision`）；
+    3. `revise` 时目标文档在 `target_knowledge_base_id` 这个 KB 里、对调用者可见、未下架、不在删除中（否则 `not_found`，不区分是哪一项）且是由候选发布出来的条目文档（`origin: "entry"`；否则 `forbidden/operation_not_allowed`），并且 `expected_source_revision` 等于当前源修订（否则 `stale/base_revision_changed`，附 `current_revision`）；
     4. 该主体同时处于 `submitted` 的候选不超过 20 条（否则 `forbidden/quota_exceeded`）。
   - 成功后保存候选，返回 `{candidate_id, status: "submitted", content_sha256, submitted_at}`，`candidate_id` 是服务端生成的 ≥128 bit 随机值。
   - 同一主体在同一目标 KB 上以相同 `mode`、`knowledge_id`、`expected_source_revision`、`content_sha256` 已有 `submitted` 候选时，返回 200 和那一条，带 `details.outcome: "existing"`。
@@ -167,7 +167,7 @@
     1. 候选为 `submitted`（否则 `stale/candidate_not_submitted`）；
     2. 请求里的 `content_sha256` 等于候选的 `content_sha256`（否则 `invalid_request/content_hash_mismatch`，候选不变），且存储的正文按 W8.13 重算仍等于它（否则 `internal`，候选不变，记审计）；
     3. W5.2 的格式与大小检查（不成立时候选 → `returned`，原因为 `unsupported_format` 或 `too_large`）；
-    4. `revise` 时目标文档仍可见、未下架、仍是条目文档（否则 `not_found`，候选 → `returned/target_withdrawn`，文档已删除时为 `target_gone`），当前源修订等于候选的基础修订（否则 `stale/base_revision_changed`，候选 → `returned/conflicted`，见 W8.7）；
+    4. `revise` 时目标文档仍在候选的 `target_knowledge_base_id` 里、仍可见、未下架、仍是条目文档（否则 `not_found`，候选 → `returned/target_withdrawn`，文档已删除时为 `target_gone`），当前源修订等于候选的基础修订（否则 `stale/base_revision_changed`，候选 → `returned/conflicted`，见 W8.7）；
     5. 去重（W3.5）。
   - 全部成立时，**原子地**完成以下几件事（W3.4）：
     - 候选 → `approved`；
@@ -176,7 +176,7 @@
     - 写幂等记录。
 
     以上在同一个数据库事务里完成（原件字节按 W3.4 可先写入存储）；入队在事务之外，入队失败按 W5.7 使 job 进 `failed/enqueue_failed`，候选保持 `approved`，出口是 W5.13 的重新处理。ingest 作业由 standalone 进程执行，它不在时 fail closed（WeKnora#136）。
-  - 返回 `{candidate_id, status: "approved", knowledge_id, source_revision, job_id, author_is_approver}`。去重命中时同样**原子地**把候选转为 `approved`、`knowledge_id` 绑定到已有文档，记批准审计与幂等记录，不建源修订、不建 job，返回 `details.outcome: "existing"` 与已有文档（`job_id: null`）；这样命中的候选不再占 W8.2 的配额，也不能再被批准。
+  - 返回 `{candidate_id, status: "approved", knowledge_id, source_revision, job_id, author_is_approver}`。去重命中时同样**原子地**把候选转为 `approved`、`knowledge_id` 绑定到已有文档，记批准审计与幂等记录，不建源修订、不建 job，返回 `details.outcome: "existing"` 与已有文档（`job_id: null`；按 W3.5 不回他人发起的 job，只在 `details.document_status` 附文档级处理状态）；这样命中的候选不再占 W8.2 的配额，也不能再被批准。
   - 批准与使用是同一个操作，**没有可出示、可过期、可作废的批准记录对象**；`approval.*` 只用于 ContextPack。
   - 宿主或请求体里送来的任何批准字段一律忽略（W1.6）。
   - 处理用的是批准时的当前政策；job 按 W1.3 沿用批准人的授权。
@@ -208,7 +208,7 @@
   - 服务端**不做 Unicode 规范化**，只对收到的确定字节计算；规范形式由客户端在保存草稿时就得到：`title` 不含首尾空白；`kind`、`title`、`body` 都不含 `\r`（含 `\r` 得 `invalid_request`）；三者都必须是合法的 Unicode 标量值序列，不含孤立代理项（JSON 里的 `\uD800` 之类），含孤立代理项的请求在 W1.9 ② 得 `invalid_request`，因为 ECMAScript 会把它转义输出、其他实现可能拒绝解析，两侧算不出同一个 hash。客户端算 hash 前检查（如 `String.prototype.isWellFormed`）。宿主建议在保存草稿时做 NFC 与换行统一，再按存下的文本计算 hash。
   - `content_sha256` = 小写 hex 的 SHA-256(UTF-8(`JSON.stringify([1, kind, title, body])`))。数组首位的 `1` 是方案号；序列化与 ECMAScript `JSON.stringify` 相同（不留空白；非 ASCII 字符原样输出 UTF-8，不转义成 `\u`；控制字符按其规则转义）。
   - 固定样例（含中文、emoji、引号、制表符与控制字符）见 `protocol/knowledge/fixtures/ops-v2/entry-hash.samples.json`，Rust 与 TS 两侧各自重算。改方案要升方案号，按 §0.3 属于语义变更。
-- **W8.14** **机器可验证部分**：请求与响应的 schema 在 `protocol/knowledge/ops-v2/`（`candidate.schema.json`、`entry.schema.json`），用例在 `protocol/knowledge/fixtures/ops-v2/schema-cases.json`；`packages/contract-tests/src/knowledge-ops-v2.test.ts`（Ajv）与 `rust/crates/agent24-protocol/tests/knowledge_ops_v2.rs`（jsonschema）对每条用例给出同一结论，并核对 §6 的枚举与 schema 一致。schema 表达不了的规则（`message_range` 的先后、按字节的大小、受限 Markdown 白名单、不含孤立代理项、hash 本身）由服务端与实现任务的测试证明。
+- **W8.14** **机器可验证部分**：请求与响应的 schema 在 `protocol/knowledge/ops-v2/`（`candidate.schema.json`、`entry.schema.json`），用例在 `protocol/knowledge/fixtures/ops-v2/schema-cases.json`；`packages/contract-tests/src/knowledge-ops-v2.test.ts`（Ajv）与 `rust/crates/agent24-protocol/tests/knowledge_ops_v2.rs`（jsonschema）对每条用例给出同一结论，并核对 §6 的枚举与 schema 一致。schema 表达不了的规则（`message_range` 的先后、按字节的大小、受限 Markdown 白名单、不含孤立代理项、hash 本身、`revise` 的目标文档属于 `target_knowledge_base_id`）由服务端与实现任务的测试证明。
 
 ## 9. 与 READONLY、STATE、UI-BRIDGE 的接口约定
 
