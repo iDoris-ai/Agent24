@@ -2,7 +2,7 @@
 // Chat.tsx calls `apply` when it sends; this file does not send on its own.
 // The notice is fixed Chinese: the model is told the JSON is reference data, not instructions.
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { KnowledgeDraftEntry } from '../../../shared/ipc-types'
 import { defineMessages, useT } from '../../i18n'
 
@@ -44,33 +44,37 @@ function draftApi(): typeof window.agent24.knowledgeDraft | undefined {
 export function useKnowledgeDraft(): {
   entries: KnowledgeDraftEntry[]
   remove: (id: string) => void
-  apply: (request: { messages: Array<{ role: string; content: string }> }) => Promise<void>
+  apply: (request: { messages: Array<{ role: string; content: string }> }) => void
 } {
   const [entries, setEntries] = useState<KnowledgeDraftEntry[]>([])
+  // Ids already sent with a turn: a DraftChanged that left main before their removal must not bring them back.
+  const sent = useRef(new Set<string>())
   useEffect(() => {
     // Absent in a window without the Knowledge preload (and in older test doubles): no draft, nothing sent.
     const api = draftApi()
     if (!api) return
     let gone = false
-    void api.list().then(
-      (next) => { if (!gone) setEntries(next) },
-      () => { /* main is gone; the strip stays empty */ },
-    )
-    const stop = api.onChanged((next) => { if (!gone) setEntries(next) })
+    const accept = (next: KnowledgeDraftEntry[]): void => {
+      if (!gone) setEntries(next.filter((entry) => !sent.current.has(entry.id)))
+    }
+    void api.list().then(accept, () => { /* main is gone; the strip stays empty */ })
+    const stop = api.onChanged(accept)
     return () => { gone = true; stop() }
   }, [])
   const remove = (id: string): void => { void draftApi()?.remove(id) }
-  const apply = async (request: { messages: Array<{ role: string; content: string }> }): Promise<void> => {
+  /** Synchronous (#1624 C3): the chips on screen are what this turn carries; main then drops them by id. */
+  const apply = (request: { messages: Array<{ role: string; content: string }> }): void => {
     const api = draftApi()
-    if (!api) return
-    // A failed take leaves the turn as typed: the draft stays in main for the next one.
-    const taken = await api.take().catch(() => [] as KnowledgeDraftEntry[])
-    if (taken.length === 0) return
+    if (!api || entries.length === 0) return
     for (let i = request.messages.length - 1; i >= 0; i--) {
       if (request.messages[i].role === 'user') {
-        request.messages[i].content = serializeDraft(taken, request.messages[i].content)
+        request.messages[i].content = serializeDraft(entries, request.messages[i].content)
         break
       }
+    }
+    for (const entry of entries) {
+      sent.current.add(entry.id)
+      void api.remove(entry.id).catch(() => { /* main is gone; nothing left to drop */ })
     }
     setEntries([])
   }

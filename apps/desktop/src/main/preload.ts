@@ -216,7 +216,6 @@ const api = {
   knowledgeDraft: {
     list: (): Promise<KnowledgeDraftEntry[]> => ipcRenderer.invoke(IpcChannels.KnowledgeDraftList),
     remove: (id: string): Promise<void> => ipcRenderer.invoke(IpcChannels.KnowledgeDraftRemove, id),
-    take: (): Promise<KnowledgeDraftEntry[]> => ipcRenderer.invoke(IpcChannels.KnowledgeDraftTake),
     onChanged: (cb: (entries: KnowledgeDraftEntry[]) => void): (() => void) => {
       const listener = (_event: unknown, entries: KnowledgeDraftEntry[]): void => cb(entries)
       ipcRenderer.on(IpcChannels.KnowledgeDraftChanged, listener)

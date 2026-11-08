@@ -1265,9 +1265,8 @@ describe('registerKnowledgeViewIpc', () => {
       IpcChannels.KnowledgeViewAnswer,
       IpcChannels.KnowledgeDraftList,
       IpcChannels.KnowledgeDraftRemove,
-      IpcChannels.KnowledgeDraftTake,
     ])
-    expect(guarded).toHaveLength(8)
+    expect(guarded).toHaveLength(7)
     await handlers.get('s')!({}, BOUNDS, 'dark')
     expect(host.show).toHaveBeenCalledWith(BOUNDS, 'dark')
     handlers.get('b')!({}, BOUNDS)
@@ -1702,5 +1701,51 @@ describe('return_to_chat_intent dialog and draft (U7.2)', () => {
     expect(gone.t.host.draftList()).toEqual([])
     expect(gone.drafts().at(-1)).toEqual([IpcChannels.KnowledgeDraftChanged, []])
     expect(gone.viewSent.filter((args) => args[0] === IpcChannels.KnowledgeDraftChanged)).toEqual([])
+  })
+
+  it('#1624 C2: with no live instance, a binding change still drops the draft; the same binding keeps it', async () => {
+    const s = await asked()
+    s.t.host.answerConfirm(s.ask.id, true)
+    await flush()
+    expect(s.t.host.draftList()).toHaveLength(1)
+    // No address: the instance goes, the binding (and the draft) stay.
+    const target = s.t.env.target
+    s.t.env.target = null
+    await s.t.host.show(BOUNDS)
+    expect(s.t.host.status()).toEqual({ state: 'unavailable', code: 'not_configured' })
+    s.t.host.bindingChanged()
+    expect(s.t.host.draftList()).toHaveLength(1)
+    // Hidden: bindingChanged alone must drop it, with no show() behind it.
+    s.t.host.hide()
+    s.t.env.target = target
+    s.t.env.binding = 'https://other.example/api/v1'
+    s.t.host.bindingChanged()
+    expect(s.t.host.draftList()).toEqual([])
+    expect(s.drafts().at(-1)).toEqual([IpcChannels.KnowledgeDraftChanged, []])
+
+    // The same with show() as the first to learn of the change.
+    const viaShow = await asked()
+    viaShow.t.host.answerConfirm(viaShow.ask.id, true)
+    await flush()
+    viaShow.t.env.target = null
+    await viaShow.t.host.show(BOUNDS)
+    viaShow.t.env.binding = 'https://other.example/api/v1'
+    await viaShow.t.host.show(BOUNDS)
+    expect(viaShow.t.host.draftList()).toEqual([])
+  })
+
+  it('#1624 C5: a show while the dialog waits sends the same ask again, and answering it still attaches', async () => {
+    const s = await asked()
+    s.t.host.hide()
+    await s.t.host.show(BOUNDS)
+    const asks = s.confirms()
+    expect(asks).toHaveLength(2)
+    expect(asks[1][1]).toEqual(s.ask)
+    s.t.host.answerConfirm(s.ask.id, true)
+    await flush()
+    expect(s.t.host.draftList()).toHaveLength(1)
+    // Answered: a later show has nothing to send.
+    await s.t.host.show(BOUNDS)
+    expect(s.confirms()).toHaveLength(2)
   })
 })

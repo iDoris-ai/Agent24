@@ -71,15 +71,6 @@ export class KnowledgeDraft {
     this.emit()
   }
 
-  /** Everything that was held, and the store is empty afterwards. */
-  take(): DraftEntry[] {
-    if (this.entries.length === 0) return []
-    const out = this.entries.map(copy)
-    this.entries = []
-    this.emit()
-    return out
-  }
-
   clear(): void {
     if (this.entries.length === 0) return
     this.entries = []

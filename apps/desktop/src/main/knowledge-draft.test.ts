@@ -41,16 +41,6 @@ describe('KnowledgeDraft', () => {
     expect(d.list().map((entry) => entry.id)).toEqual([second.id])
   })
 
-  it('take returns everything and empties the store', () => {
-    const d = new KnowledgeDraft(() => {})
-    d.add([item(1), item(2)])
-    const taken = d.take()
-    expect(taken.map((entry) => entry.ref.chunk_id)).toEqual(['c1', 'c2'])
-    expect(d.list()).toEqual([])
-    expect(d.take()).toEqual([])
-    expect(d.room()).toBe(DRAFT_LIMIT)
-  })
-
   it('onChange runs for a real change, with a snapshot', () => {
     const seen: DraftEntry[][] = []
     const d = new KnowledgeDraft((entries) => { seen.push([...entries]) })
@@ -64,10 +54,9 @@ describe('KnowledgeDraft', () => {
     expect(seen).toHaveLength(2)
     d.remove(d.list()[0].id)
     expect(seen[2]).toHaveLength(1)
-    d.take()
+    d.remove(d.list()[0].id)
     expect(seen[3]).toEqual([])
     const before = seen.length
-    expect(d.take()).toEqual([])
     d.clear()
     expect(seen).toHaveLength(before)
     d.add([item(3)])

@@ -479,6 +479,7 @@ export class KnowledgeBridge {
       const visible = (): boolean => this.visible(ref)
       const outcome = await this.budget.run((signal) => citation.read(generation, ref, signal, visible), abort.signal)
       if (!this.inflight.has(id) || outcome.kind === 'cancelled') return
+      if (outcome.kind === 'overloaded') return this.intentOverloaded(id, document, admittedDocumentId)
       titles.push(outcome.kind === 'done' && outcome.value.ok ? plainTitle(outcome.value.title) : null)
     }
     if (!this.inflight.has(id)) return
@@ -510,30 +511,40 @@ export class KnowledgeBridge {
       return
     }
 
-    const passed: DraftItem[] = []
-    let firstCode: string | null = null
-    const note = (code: string): void => { if (firstCode === null) firstCode = code }
+    // One result per citation, in citation order: the first failure's code is the one the page gets.
+    const results: Array<{ item: DraftItem; ref: CitationRef } | { code: string }> = []
     for (const ref of citations) {
       if (!this.inflight.has(id)) return
-      if (!this.visible(ref)) { note('not_found'); continue }
+      if (!this.visible(ref)) { results.push({ code: 'not_found' }); continue }
       const citation = this.deps.citation
-      if (!citation) { note('not_found'); continue }
+      if (!citation) { results.push({ code: 'not_found' }); continue }
       const visible = (): boolean => this.visible(ref)
       const outcome = await this.budget.run((signal) => citation.read(generation, ref, signal, visible), abort.signal)
       if (!this.inflight.has(id) || outcome.kind === 'cancelled') return
-      if (outcome.kind === 'overloaded') { note('unavailable'); continue }
-      if (outcome.kind === 'failed') { note('internal'); continue }
+      // §9.3 / U7.2 bridge budget: a read still queued after 10 s ends the intent as `overloaded`, nothing attached.
+      if (outcome.kind === 'overloaded') return this.intentOverloaded(id, document, admittedDocumentId)
+      if (outcome.kind === 'failed') { results.push({ code: 'internal' }); continue }
       const value = outcome.value
-      if (value.ok && !visible()) { note('not_found'); continue }
       if (value.ok) {
-        passed.push({
-          title: plainTitle(value.title),
-          text: value.text,
-          ref: { knowledge_base_id: ref.knowledge_base_id, knowledge_id: ref.knowledge_id, chunk_id: ref.chunk_id },
+        results.push({
+          item: {
+            title: plainTitle(value.title),
+            text: value.text,
+            ref: { knowledge_base_id: ref.knowledge_base_id, knowledge_id: ref.knowledge_id, chunk_id: ref.chunk_id },
+          },
+          ref,
         })
         continue
       }
-      note(value.code)
+      results.push({ code: value.code })
+    }
+    // #1624 C1: the set may have changed during a later read; every passed item is asked again just before attaching.
+    const passed: DraftItem[] = []
+    let firstCode: string | null = null
+    for (const result of results) {
+      const code = 'code' in result ? result.code : this.visible(result.ref) ? null : 'not_found'
+      if (code === null && 'item' in result) passed.push(result.item)
+      else if (firstCode === null) firstCode = code
     }
     if (!this.inflight.has(id)) return
     // Terminal from here: a later cancel misses (U7.2, already done once attached).
@@ -551,6 +562,17 @@ export class KnowledgeBridge {
         return
       }
       this.reply(document, id, firstCode === null ? { result: 'done' } : { result: 'done', code: firstCode })
+    })
+  }
+
+  /** §9.3: a bridge read queued past 10 s. Terminal for the intent, no dialog or attachment, no cooldown. */
+  private intentOverloaded(id: string, document: number, admittedDocumentId: string | null): void {
+    const job = this.inflight.get(id)
+    if (!job) return
+    this.inflight.delete(id)
+    job.abort.abort()
+    this.deliver(document, admittedDocumentId, () => {
+      this.reply(document, id, { result: 'rejected', code: 'unavailable', reason: 'overloaded', retry_after_ms: BRIDGE_BACKOFF_MS })
     })
   }
 

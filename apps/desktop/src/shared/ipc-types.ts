@@ -129,7 +129,6 @@ export const IpcChannels = {
   KnowledgeDraftChanged: 'knowledge-draft:changed',
   KnowledgeDraftList: 'knowledge-draft:list',
   KnowledgeDraftRemove: 'knowledge-draft:remove',
-  KnowledgeDraftTake: 'knowledge-draft:take',
 } as const
 
 /** T1-1/T1-2: the documents module as it is on disk now. A daemon reads

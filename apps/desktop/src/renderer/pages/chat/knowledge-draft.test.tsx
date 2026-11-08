@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { KnowledgeDraftEntry } from '../../../shared/ipc-types'
@@ -25,12 +25,6 @@ const remove = vi.fn(async (id: string) => {
   entries = entries.filter((item) => item.id !== id)
   changed?.(entries)
 })
-const take = vi.fn(async () => {
-  const out = entries
-  entries = []
-  changed?.([])
-  return out
-})
 let changed: ((next: KnowledgeDraftEntry[]) => void) | null = null
 
 beforeEach(() => {
@@ -38,14 +32,12 @@ beforeEach(() => {
   changed = null
   list.mockClear()
   remove.mockClear()
-  take.mockClear()
   setLocale('en')
   Object.defineProperty(window, 'agent24', {
     value: {
       knowledgeDraft: {
         list,
         remove,
-        take,
         onChanged: (cb: (next: KnowledgeDraftEntry[]) => void) => { changed = cb; return () => { changed = null } },
       },
     },
@@ -85,7 +77,7 @@ function Probe(props: { request: { messages: Array<{ role: string; content: stri
   return (
     <div>
       <DraftAttachments draft={draft} />
-      <button type="button" onClick={() => { void draft.apply(props.request) }}>send</button>
+      <button type="button" onClick={() => { draft.apply(props.request) }}>send</button>
       <span data-testid="n">{String(draft.entries.length)}</span>
     </div>
   )
@@ -109,14 +101,40 @@ describe('useKnowledgeDraft', () => {
     render(<Probe request={request} />)
     await waitFor(() => expect(screen.getByTestId('n').textContent).toBe('2'))
     fireEvent.click(screen.getByRole('button', { name: 'send' }))
-    await waitFor(() => expect(screen.getByTestId('n').textContent).toBe('0'))
+    // Synchronous (#1624 C3): rewritten before apply returns, no await in between.
     expect(request.messages.map((message) => message.content)).toEqual([
       'first',
       'mid',
       serializeDraft(seed, 'ask'),
       'tail',
     ])
-    expect(take).toHaveBeenCalledTimes(1)
+    expect(remove.mock.calls).toEqual([[ID_A], [ID_B]])
+    await waitFor(() => expect(screen.getByTestId('n').textContent).toBe('0'))
+  })
+
+  it('a DraftChanged sent before the removal does not bring sent entries back', async () => {
+    const seed = [entry({ id: ID_A })]
+    entries = seed
+    // main has not processed the removal yet: the store still holds A when the stale DraftChanged arrives
+    remove.mockImplementationOnce(async () => {})
+    const request = { messages: [{ role: 'user', content: 'ask' }] }
+    render(<Probe request={request} />)
+    await waitFor(() => expect(screen.getByTestId('n').textContent).toBe('1'))
+    fireEvent.click(screen.getByRole('button', { name: 'send' }))
+    await waitFor(() => expect(screen.getByTestId('n').textContent).toBe('0'))
+    const fresh = entry({ id: ID_B, title: 'New' })
+    act(() => { changed?.([...seed, fresh]) })
+    expect(screen.getByTestId('n').textContent).toBe('1')
+    expect(screen.getByText('New')).toBeTruthy()
+  })
+
+  it('with nothing on screen leaves the request as typed and removes nothing', async () => {
+    const request = { messages: [{ role: 'user', content: 'ask' }] }
+    render(<Probe request={request} />)
+    await waitFor(() => expect(list).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'send' }))
+    expect(request.messages[0].content).toBe('ask')
+    expect(remove).not.toHaveBeenCalled()
   })
 })
 

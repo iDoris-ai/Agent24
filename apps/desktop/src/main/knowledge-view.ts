@@ -498,8 +498,14 @@ interface Instance {
 export class KnowledgeViewHost {
   /** U7.2: the conversation's draft attachments. Outlives a view-level rebuild. */
   private readonly draft = new KnowledgeDraft((entries) => { this.sendDraft(entries) })
+  /** The binding the draft's entries were read under; any other binding (or Off) drops them. */
+  private draftBinding: string | null = null
   /** At most one confirmation dialog (U7.2). */
-  private pendingConfirm: { id: string; settle: (value: 'confirmed' | 'declined' | 'aborted') => void } | null = null
+  private pendingConfirm: {
+    id: string
+    ask: Exclude<KnowledgeViewConfirmAsk, null>
+    settle: (value: 'confirmed' | 'declined' | 'aborted') => void
+  } | null = null
   private instance: Instance | null = null
   private partitions = 0
   /** Bumped by every show/hide/destroy; a show that resumes under a later number was overtaken. */
@@ -555,15 +561,18 @@ export class KnowledgeViewHost {
 
     const win = this.deps.window()
     if (this.disposed || !win || win.isDestroyed()) return { ok: false, code: 'window_unavailable' }
+    // #1624 C5: the page came back while a dialog is waiting; the same id, and the bridge's deadline is unchanged.
+    if (this.pendingConfirm) this.sendMain(IpcChannels.KnowledgeViewConfirm, this.pendingConfirm.ask)
     const binding = this.deps.binding()
     if (binding === null) {
-      this.draft.clear()
+      this.clearDraft()
       this.endBinding()
       this.endBridgeCount()
       this.destroy('knowledge off')
       this.setState({ state: 'unavailable', code: 'knowledge_off' })
       return { ok: false, code: 'knowledge_off' }
     }
+    this.dropDraftUnder(binding)
     if (this.closed && this.closed.binding !== binding) this.endBinding()
     if (this.bridgeBinding !== null && this.bridgeBinding !== binding) this.endBridgeCount()
     if (this.crashBinding !== binding) this.crashes = []
@@ -579,7 +588,6 @@ export class KnowledgeViewHost {
       return { ok: false, code: 'not_configured' }
     }
     const current = this.instance
-    if (current && current.binding !== binding) this.draft.clear()
     if (current && (current.binding !== binding || current.window !== win || current.target.url !== target.url
       || current.view.webContents.isDestroyed())) {
       this.destroy('binding, window or address changed')
@@ -716,9 +724,7 @@ export class KnowledgeViewHost {
     const binding = this.deps.binding()
     // #1662 L5: the settings changed (the knowledge bases among them): the strip may show one no longer visible.
     if (this.instance) this.clearCitation(this.instance)
-    if (binding === null || (this.instance && this.instance.binding !== binding) || (this.closed && this.closed.binding !== binding)) {
-      this.draft.clear()
-    }
+    this.dropDraftUnder(binding)
     let ended = false
     if (this.closed && this.closed.binding !== binding) {
       this.endBinding()
@@ -740,7 +746,7 @@ export class KnowledgeViewHost {
 
   /** Binding-level destruction (U4.8) without closing the door: window teardown, tests. */
   destroyAll(reason: string): void {
-    this.draft.clear()
+    this.clearDraft()
     this.endBinding()
     this.destroy(reason)
   }
@@ -760,8 +766,14 @@ export class KnowledgeViewHost {
     this.draft.remove(id)
   }
 
-  draftTake(): DraftEntry[] {
-    return this.draft.take()
+  /** U7.2: the draft belongs to one binding; with no live instance (none shown yet, or `closed`) the check is the same. */
+  private dropDraftUnder(binding: string | null): void {
+    if (binding === null || (this.draftBinding !== null && this.draftBinding !== binding)) this.clearDraft()
+  }
+
+  private clearDraft(): void {
+    this.draftBinding = null
+    this.draft.clear()
   }
 
   /** App quit: destroy, and refuse every later show or reload. */
@@ -826,7 +838,12 @@ export class KnowledgeViewHost {
           activatedAt: () => instance.bridge?.channel.lastActivation() ?? null,
           draftRoom: () => this.draft.room(),
           confirm: (ask, signal) => this.confirmIntent(ask, signal),
-          attach: (items) => this.draft.add(items),
+          attach: (items) => {
+            if (this.draftBinding !== null && this.draftBinding !== instance.binding) this.clearDraft()
+            if (!this.draft.add(items)) return false
+            this.draftBinding = instance.binding
+            return true
+          },
         },
       })
       instance.bridge = { bridge, channel: new KnowledgeBridgeChannel(view.webContents as never, bridge, this.now, this.log) }
@@ -1129,8 +1146,8 @@ export class KnowledgeViewHost {
         finish('aborted')
       }
       signal.addEventListener('abort', onAbort)
-      this.pendingConfirm = { id, settle: finish }
-      const payload: KnowledgeViewConfirmAsk = { id, count: ask.count, titles: ask.titles }
+      const payload = { id, count: ask.count, titles: [...ask.titles] }
+      this.pendingConfirm = { id, ask: payload, settle: finish }
       if (!this.sendMain(IpcChannels.KnowledgeViewConfirm, payload)) finish('unavailable')
     })
   }
@@ -1195,5 +1212,4 @@ export function registerKnowledgeViewIpc(
     if (!draftId(id)) return
     host()?.draftRemove(id)
   }))
-  ipc.handle(IpcChannels.KnowledgeDraftTake, guard(() => host()?.draftTake() ?? []))
 }

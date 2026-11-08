@@ -191,7 +191,7 @@ export default function ChatPage() {
         .map(m => ({ role: m.role, content: m.content })),
       session_id: sessionId,
     }
-    await draft.apply(request)
+    draft.apply(request)
     setMessages(prev => [...prev, userMsg])
     setInput('')
     await requestReply(messages.length, request)

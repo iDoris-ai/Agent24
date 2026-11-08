@@ -1078,6 +1078,70 @@ describe('return_to_chat_intent (U7.2, U6.7, §9.3)', () => {
     expect(t.last()?.payload).toEqual({ result: 'done', code: 'not_found' })
   })
 
+  it('#1624 C1: an item that passed but left the visible set during a later read is dropped, and its code comes first in citation order', async () => {
+    const { h, t, read } = wired()
+    h.setScope(['kb-1', 'kb-2'])
+    const m = t.msg('return_to_chat_intent', { citations: [cite('c-a', 'kb-1'), cite('c-b', 'kb-2'), cite('c-c', 'kb-2')] })
+    t.arrive(m)
+    await read(okRead('old-a', 'A'))
+    await read(okRead('old-b', 'B'))
+    await read(okRead('old-c', 'C'))
+    h.pendingConfirm[0]('confirmed')
+    await flush()
+    await read(okRead('body-a', 'A'))
+    // While b's read runs, settings drop kb-1: a already passed, and must not be attached.
+    h.setScope(['kb-2'])
+    await read({ ok: false, code: 'stale', reason: 'moved' })
+    await read(okRead('body-c', 'C'))
+    expect(h.attached).toEqual([[
+      { title: 'C', text: 'body-c', ref: { knowledge_base_id: 'kb-2', knowledge_id: 'doc-1', chunk_id: 'c-c' } },
+    ]])
+    expect(forId(t, m.id).map((r) => r.payload)).toEqual([{ result: 'accepted' }, { result: 'done', code: 'not_found' }])
+  })
+
+  it('#1624 C4: a title read that waits out the bridge budget ends the intent overloaded, with no dialog and no cooldown', async () => {
+    const { h, t } = wired()
+    t.arrive(t.msg('citation', REF))
+    t.arrive(t.msg('citation', REF))
+    const m = t.msg('return_to_chat_intent', { citations: [REF] })
+    t.arrive(m)
+    expect(h.reads).toHaveLength(2)
+    t.advance(10_000)
+    await flush()
+    expect(forId(t, m.id).map((r) => r.payload)).toEqual([
+      { result: 'accepted' },
+      { result: 'rejected', code: 'unavailable', reason: 'overloaded', retry_after_ms: BRIDGE_BACKOFF_MS },
+    ])
+    expect(h.confirms).toEqual([])
+    expect(h.attached).toEqual([])
+    h.setActivated(t.time())
+    const next = t.msg('return_to_chat_intent', { citations: [] })
+    t.arrive(next)
+    expect(forId(t, next.id).map((r) => r.payload)).toEqual([{ result: 'accepted' }])
+  })
+
+  it('#1624 C4: a validation read that waits out the bridge budget ends the intent overloaded, and nothing is attached', async () => {
+    const { h, t, read } = wired()
+    const m = t.msg('return_to_chat_intent', { citations: [cite('c-a'), cite('c-b')] })
+    t.arrive(m)
+    await read(okRead('old-a', 'A'))
+    await read(okRead('old-b', 'B'))
+    // Two citations take the budget's two slots before the user answers.
+    t.arrive(t.msg('citation', REF))
+    t.arrive(t.msg('citation', REF))
+    h.pendingConfirm[0]('confirmed')
+    await flush()
+    expect(h.reads).toHaveLength(4)
+    t.advance(10_000)
+    await flush()
+    expect(forId(t, m.id).map((r) => r.payload)).toEqual([
+      { result: 'accepted' },
+      { result: 'rejected', code: 'unavailable', reason: 'overloaded', retry_after_ms: BRIDGE_BACKOFF_MS },
+    ])
+    expect(h.attached).toEqual([])
+    expect(h.reads).toHaveLength(4)
+  })
+
   it('when nothing passes, done carries the first failure code and attach is never called', async () => {
     const { h, t, read } = wired()
     const m = t.msg('return_to_chat_intent', { citations: [cite('c-a'), cite('c-b')] })
