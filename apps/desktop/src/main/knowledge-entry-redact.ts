@@ -10,9 +10,21 @@
 //   much is acceptable; leaving a secret is not.
 // - A hit made of placeholders alone is dropped, so redacted text scans clean.
 //   A hit that only touches a placeholder is kept.
+// - A finder whose work at a position is bounded tries every position, inside
+//   its own earlier hits too, so a match that starts inside one hit and runs
+//   past it is still found. A finder that skips ahead skips only what cannot
+//   start such a match.
 // - Linear time on any input up to MAX_REDACT_INPUT: a pass only moves
 //   forward, regexes are sticky and run over one candidate each, and a
 //   position is read a bounded number of times in each pass.
+//
+// Known limit (Codex round 2, M3 不做): some rules look at the character just
+// before a match (a phone is not preceded by a digit, localhost not by a
+// letter or digit). Replacing a hit with a placeholder changes that character,
+// so text right after a hit can match only in the next pass. preRedact scans
+// again up to MAX_PASSES; a longer chain of such hits, each glued to the next
+// (`localhost:1localhost:1…`), stays flagged by postScan: held back, never
+// let through.
 
 export const REDACTION_RULES_VERSION = 1
 
@@ -36,7 +48,7 @@ export interface RedactionHit {
 /** Characters, counted as UTF-16 code units. */
 export const MAX_REDACT_INPUT = 512 * 1024
 
-/** preRedact scans its own output again until it is clean, at most this often. */
+/** preRedact scans its own output again until it is clean, at most this often (see the known limit above). */
 const MAX_PASSES = 4
 
 const LABELS: Record<RedactionCategory, string> = {
@@ -215,6 +227,7 @@ function forwardIndex(hay: string, needle: string, ok: (at: number) => boolean =
 // ---------------------------------------------------------------- private_key
 
 const BEGIN_RE = /-----BEGIN ([A-Z ]{0,40})PRIVATE KEY-----/y
+const END_RE = /-----END ([A-Z ]{0,40})PRIVATE KEY-----/y
 
 function isBase64Char(c: string): boolean {
   return isAsciiAlnum(c) || c === '+' || c === '/' || c === '='
@@ -222,13 +235,33 @@ function isBase64Char(c: string): boolean {
 
 
 /**
- * Every BEGIN … PRIVATE KEY block. It runs through its own END line (the same
- * key type), or, with none, through the last line that reads as key material:
- * the rest of the BEGIN line in base64 words, then lines of one base64 word,
- * `Name: value` headers before them, END lines of another type and single
- * blank lines.
+ * Every BEGIN … PRIVATE KEY block. It runs through the next END line of the
+ * same key type, whatever lies between. With none after it, it runs through
+ * the last line that reads as key material (see pemEnd).
  */
 const privateKeys: Finder = ({ text }, emit) => {
+  // Every END line, by key type, in order: read once, so no BEGIN searches.
+  const ends = new Map<string, number[]>()
+  for (let at = text.indexOf('-----END'); at >= 0; at = text.indexOf('-----END', at + 1)) {
+    END_RE.lastIndex = at
+    const m = END_RE.exec(text)
+    if (!m) continue
+    const list = ends.get(m[1]) ?? []
+    list.push(at + m[0].length)
+    ends.set(m[1], list)
+  }
+  const endAfter = (type: string, from: number): number => {
+    const list = ends.get(type)
+    if (!list) return -1
+    let lo = 0
+    let hi = list.length
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (list[mid] <= from) lo = mid + 1
+      else hi = mid
+    }
+    return lo < list.length ? list[lo] : -1
+  }
   let i = text.indexOf('-----BEGIN')
   while (i >= 0) {
     BEGIN_RE.lastIndex = i
@@ -237,7 +270,10 @@ const privateKeys: Finder = ({ text }, emit) => {
       i = text.indexOf('-----BEGIN', i + 1)
       continue
     }
-    const end = pemEnd(text, i + head[0].length, `-----END ${head[1]}PRIVATE KEY-----`)
+    const bodyStart = i + head[0].length
+    // The first END of this type that starts at or after the body.
+    const closed = endAfter(head[1], bodyStart + `-----END ${head[1]}PRIVATE KEY-----`.length - 1)
+    const end = closed >= 0 ? closed : pemEnd(text, bodyStart)
     emit({ start: i, end })
     i = text.indexOf('-----BEGIN', end)
   }
@@ -245,13 +281,20 @@ const privateKeys: Finder = ({ text }, emit) => {
 
 const OTHER_END_AT = /-----END [A-Z ]{0,40}PRIVATE KEY-----/y
 const PEM_HEADER_AT = /[A-Za-z][A-Za-z0-9-]{0,40}:/y
+/** A body line may hold several base64 words, each at least this long (prose words are shorter). */
+const PEM_WORD_MIN = 16
 
 /**
+ * A block with no END of its type after it: through the last line that reads
+ * as key material. That is the rest of the BEGIN line in base64 words, then
+ * lines of one base64 word or of several long ones, `Name: value` headers
+ * before them, END lines of another type and single blank lines.
+ *
  * Read character by character, so a line is never collected before it is
  * judged: what is taken becomes the block, and what ends it is read only as
- * far as one word (or one END or header).
+ * far as its first word that fails.
  */
-function pemEnd(text: string, bodyStart: number, endLine: string): number {
+function pemEnd(text: string, bodyStart: number): number {
   const n = text.length
   const lineSpace = (c: string): boolean => c !== '\n' && isSpace(c)
   const base64End = (j: number): number => {
@@ -266,12 +309,11 @@ function pemEnd(text: string, bodyStart: number, endLine: string): number {
   }
   let last = bodyStart
   let k = bodyStart
-  // The rest of the BEGIN line: base64 words up to the END or the first other word.
+  // The rest of the BEGIN line: base64 words up to the first other word.
   for (;;) {
     k = restOfLine(k)
     if (k >= n) return last
     if (text[k] === '\n') break
-    if (text.startsWith(endLine, k)) return k + endLine.length
     const e = base64End(k)
     if (e === k || (e < n && !isSpace(text[e]))) return last
     last = e
@@ -288,14 +330,20 @@ function pemEnd(text: string, bodyStart: number, endLine: string): number {
       if (blanks > 1) return last
       continue
     }
-    if (text.startsWith(endLine, k)) return k + endLine.length
     blanks = 0
     const e = base64End(k)
     if (e > k && (e >= n || isSpace(text[e]))) {
-      // One base64 word and nothing after it on the line but its own END.
-      const t = restOfLine(e)
-      if (t < n && text[t] !== '\n') return text.startsWith(endLine, t) ? t + endLine.length : last
-      last = e
+      // Base64 words to the end of the line: one, or several long ones.
+      let end = e
+      let t = restOfLine(e)
+      const long = e - k >= PEM_WORD_MIN
+      while (t < n && text[t] !== '\n') {
+        const w = base64End(t)
+        if (!long || w - t < PEM_WORD_MIN || (w < n && !isSpace(text[w]))) return last
+        end = w
+        t = restOfLine(w)
+      }
+      last = end
       k = t
       sawBody = true
       continue
@@ -335,6 +383,13 @@ interface Literal {
   readonly re: RegExp
   /** The needle is searched in the lowered text. */
   readonly anyCase?: boolean
+  /**
+   * A match may hold the needle again with a longer match after it (only
+   * Bearer: its token is any non-space run), so the next search starts just
+   * after the needle. The others end where their own characters end, so a
+   * needle inside one ends at the same place.
+   */
+  readonly nested?: boolean
 }
 
 const CREDENTIAL_LITERALS: readonly Literal[] = [
@@ -347,7 +402,7 @@ const CREDENTIAL_LITERALS: readonly Literal[] = [
   { needle: 'AKIA', re: /AKIA[0-9A-Z]{16}/y },
   { needle: 'xox', re: /xox[abprs]-[A-Za-z0-9-]{10,}/y },
   // `Bearer` in any ASCII case, as HTTP headers write it.
-  { needle: 'bearer', re: /bearer\s{1,4}\S{16,}/iy, anyCase: true },
+  { needle: 'bearer', re: /bearer\s{1,4}\S{16,}/iy, anyCase: true, nested: true },
 ]
 
 function literalFinder(spec: Literal): Finder {
@@ -359,7 +414,7 @@ function literalFinder(spec: Literal): Finder {
       const m = spec.re.exec(text)
       if (m) {
         emit({ start: i, end: i + m[0].length })
-        i = hay.indexOf(spec.needle, i + m[0].length)
+        i = hay.indexOf(spec.needle, spec.nested ? i + 1 : i + m[0].length)
       } else {
         i = hay.indexOf(spec.needle, i + 1)
       }
@@ -382,8 +437,9 @@ const jwts: Finder = ({ text }, emit) => {
   while (i >= 0) {
     const first = tokenEnd(i + 3)
     let end = -1
+    let second = -1
     if (first - (i + 3) >= 4 && text[first] === '.' && text.startsWith('eyJ', first + 1)) {
-      const second = tokenEnd(first + 4)
+      second = tokenEnd(first + 4)
       if (second - (first + 4) >= 4 && text[second] === '.') {
         const third = tokenEnd(second + 1)
         if (third - (second + 1) >= 4) end = third
@@ -391,7 +447,8 @@ const jwts: Finder = ({ text }, emit) => {
     }
     if (end >= 0) {
       emit({ start: i, end })
-      i = text.indexOf('eyJ', end)
+      // Another JWT may start in the third segment and run past this one.
+      i = text.indexOf('eyJ', second + 1)
     } else {
       // An eyJ later in the same first segment reaches the same `first`, so it fails the same way.
       i = text.indexOf('eyJ', first)
@@ -412,13 +469,28 @@ const ASSIGN_KEYS = [
  */
 function assignmentFinder(key: string): Finder {
   return ({ text, lower }, emit) => {
-    const scanTo = (j: number, stop: (c: string) => boolean): number => {
+    // The run without whitespace that holds `j` ends where the last one did.
+    let runFrom = -1
+    let runTo = -1
+    const wordEnd = (j: number): number => {
+      if (j >= runFrom && j <= runTo) return runTo
       let k = j
-      while (k < text.length && !stop(text[k])) k += 1
+      while (k < text.length && !isSpace(text[k])) k += 1
+      runFrom = j
+      runTo = k
       return k
     }
-    // Each search ends at the next quote of its kind, and any later quoted
-    // value opens with one, so no search runs past the value after it.
+    /** The closing `quote` after `j` on its line, past backslash escapes; -1 when there is none. */
+    const closingQuote = (j: number, quote: string): number => {
+      for (let k = j; k < text.length && text[k] !== '\n'; k += 1) {
+        if (text[k] === '\\') k += 1
+        else if (text[k] === quote) return k
+      }
+      return -1
+    }
+    // A search ends at the next unescaped quote of its kind. A later quoted
+    // value opens with one, after `=` or `:` (so never escaped), so no
+    // search runs past the value after it.
     const valueAt = (afterKey: number): Span | null => {
       let j = afterKey
       if (text[j] === '"' || text[j] === "'") j += 1
@@ -428,20 +500,17 @@ function assignmentFinder(key: string): Finder {
       if (j >= text.length || isSpace(text[j])) return null
       const quote = text[j]
       if (quote === '"' || quote === "'") {
-        const close = scanTo(j + 1, (c) => c === quote || c === '\n')
-        if (close < text.length && text[close] === quote && close > j + 1) return { start: j, end: close + 1 }
+        const close = closingQuote(j + 1, quote)
+        if (close > j + 1) return { start: j, end: close + 1 }
       }
-      return { start: j, end: scanTo(j, isSpace) }
+      return { start: j, end: wordEnd(j) }
     }
     let i = lower.indexOf(key)
     while (i >= 0) {
       const value = valueAt(i + key.length)
-      if (value) {
-        emit(value)
-        i = lower.indexOf(key, value.end)
-      } else {
-        i = lower.indexOf(key, i + 1)
-      }
+      if (value) emit(value)
+      // The next key may sit inside this value and quote a longer one.
+      i = lower.indexOf(key, i + 1)
     }
   }
 }
@@ -501,10 +570,7 @@ const cnPhones: Finder = ({ text }, emit) => {
     if (c !== '+' && c !== '8' && c !== '1') continue
     if (i > 0 && isDigit(text[i - 1])) continue
     const end = cnPhoneAt(text, i)
-    if (end !== null) {
-      emit({ start: i, end })
-      i = end - 1
-    }
+    if (end !== null) emit({ start: i, end })
   }
 }
 
@@ -588,10 +654,7 @@ const ID_CODES = '10X98765432'
 const idCards: Finder = ({ text }, emit) => {
   for (let i = 0; i + 18 <= text.length; i += 1) {
     if (!isDigit(text[i]) || (i > 0 && isAsciiAlnum(text[i - 1]))) continue
-    if (isIdAt(text, i)) {
-      emit({ start: i, end: i + 18 })
-      i += 17
-    }
+    if (isIdAt(text, i)) emit({ start: i, end: i + 18 })
   }
 }
 
@@ -622,10 +685,7 @@ const bankCards: Finder = ({ text }, emit) => {
   for (let i = 0; i < text.length; i += 1) {
     if (!isDigit(text[i]) || (i > 0 && isDigit(text[i - 1]))) continue
     const end = bankCardAt(text, i)
-    if (end !== null) {
-      emit({ start: i, end })
-      i = end - 1
-    }
+    if (end !== null) emit({ start: i, end })
   }
 }
 
@@ -758,10 +818,7 @@ const privateIps: Finder = ({ text }, emit) => {
     if (!isDigit(text[i])) continue
     if (i > 0 && (isDigit(text[i - 1]) || text[i - 1] === '.')) continue
     const end = privateIpAt(text, i)
-    if (end !== null) {
-      emit({ start: i, end })
-      i = end - 1
-    }
+    if (end !== null) emit({ start: i, end })
   }
 }
 

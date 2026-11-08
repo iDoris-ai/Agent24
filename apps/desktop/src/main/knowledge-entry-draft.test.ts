@@ -311,6 +311,37 @@ describe('entry draft store', () => {
     fs.mkdirSync(path.join(root, '_events.jsonl'))
     expect(() => store.withdraw(draft.id)).toThrow()
     expect(store.get(draft.id)).toEqual(draft)
+    expect(fs.readdirSync(root).filter((name) => name.endsWith('.tmp'))).toEqual([])
+  })
+
+  it('records a withdrawal once even when the file cannot be removed afterwards', () => {
+    const store = createEntryDraftStore(dir, clock())
+    const draft = store.create(draftInput())
+    const root = path.join(dir, 'knowledge-entries')
+    const rm = vi.spyOn(fs, 'rmSync').mockImplementation(() => { throw Object.assign(new Error('busy'), { code: 'EBUSY' }) })
+    try {
+      expect(store.withdraw(draft.id)).toBe(true)
+      expect(store.withdraw(draft.id)).toBe(false)
+    } finally {
+      rm.mockRestore()
+    }
+    expect(store.get(draft.id)).toBeNull()
+    expect(store.list()).toEqual([])
+    expect(fs.readFileSync(path.join(root, '_events.jsonl'), 'utf8').trim().split('\n')).toHaveLength(1)
+  })
+
+  it('keeps the draft when it cannot be moved out of the store', () => {
+    const store = createEntryDraftStore(dir, clock())
+    const draft = store.create(draftInput())
+    const root = path.join(dir, 'knowledge-entries')
+    const rename = vi.spyOn(fs, 'renameSync').mockImplementationOnce(() => { throw Object.assign(new Error('busy'), { code: 'EBUSY' }) })
+    try {
+      expect(() => store.withdraw(draft.id)).toThrow('busy')
+    } finally {
+      rename.mockRestore()
+    }
+    expect(store.get(draft.id)).toEqual(draft)
+    expect(fs.existsSync(path.join(root, '_events.jsonl'))).toBe(false)
   })
 
   it('does not touch a file outside the store when the id is illegal', () => {

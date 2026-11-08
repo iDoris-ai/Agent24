@@ -479,6 +479,44 @@ describe('separators (C7, C8)', () => {
   })
 })
 
+// Codex round 2 on #1669.
+describe('round 2: what one hit used to hide', () => {
+  it('a key block runs to its END whatever lines it holds (C1)', () => {
+    const text = '-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAAAAAAAAAAA AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n-----END PRIVATE KEY-----\nafter'
+    expect(redact(text)).toBe('〔已脱敏·私钥〕\nafter')
+    const prose = '-----BEGIN RSA PRIVATE KEY-----\nThe body is below, after a note.\nMIIBogIBAAJB\n-----END RSA PRIVATE KEY-----'
+    expect(redact(prose)).toBe('〔已脱敏·私钥〕')
+  })
+
+  it('without an END, a body line of several long base64 words is key material, prose is not', () => {
+    expect(redact('-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAAAAAAAAAAA AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nok then')).toBe('〔已脱敏·私钥〕\nok then')
+    expect(redact('-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAAAAAAAAAAA and more\nok')).toBe('〔已脱敏·私钥〕\nMC4CAQAwBQYDK2VwBCIEIAAAAAAAAAAA and more\nok')
+  })
+
+  it('a quoted value runs past escaped quotes (C2)', () => {
+    expect(redact('{"password":"abc\\" TOPSECRET tail"}')).toBe('{"password":〔已脱敏·凭据〕}')
+    expect(redact("secret='it\\'s TOPSECRET'")).toBe('secret=〔已脱敏·凭据〕')
+  })
+
+  it('a later key inside an earlier value still has its own value taken (C3)', () => {
+    expect(redact('password=one,password="two TOPSECRET"')).not.toContain('TOPSECRET')
+    expect(redact('token=a,token="b c TOPSECRET" end')).toBe('token=〔已脱敏·凭据〕 end')
+  })
+
+  it('a Bearer, JWT or address that starts inside another and runs past it is taken', () => {
+    expect(redact(`Bearer ${'a'.repeat(17)}bearer TOPSECRETTOPSECRET1 end`)).toBe('〔已脱敏·凭据〕 end')
+    expect(redact('x eyJaaaa.eyJbbbb.cccceyJdddd.eyJeeee.TOPSECRET end')).toBe('x 〔已脱敏·凭据〕 end')
+    expect(redact('go 10.0.0.1:192.168.0.1 now')).toBe('go 〔已脱敏·内网地址〕 now')
+  })
+
+  it('a chain of glued hits longer than the passes stays held back, never let through (C4, known limit)', () => {
+    const short = preRedact('localhost:1'.repeat(3)).text
+    expect(postScan(short)).toEqual([])
+    const long = preRedact('localhost:1'.repeat(8)).text
+    expect(postScan(long).length).toBeGreaterThan(0)
+  })
+})
+
 describe('linear time on adversarial input (C9–C11)', () => {
   const n = MAX_REDACT_INPUT
   const fill = (unit: string, tail = ''): string => unit.repeat(Math.floor((n - tail.length) / unit.length)) + tail
@@ -497,6 +535,14 @@ describe('linear time on adversarial input (C9–C11)', () => {
     ['one-line key bodies', fill('-----BEGIN PRIVATE KEY----- AAAA ')],
     ['hosts', fill('a.lan.')],
     ['placeholders', fill(placeholder('credential'))],
+    // Round 2: finders that now look inside their own hits.
+    ['keys inside one value', fill('pwd=')],
+    ['keys inside one quoted value', `pwd="${fill('pwd="x ', '"').slice(5)}`],
+    ['escaped quotes', fill('pwd="\\"')],
+    ['Bearers inside a Bearer', `Bearer ${fill('bearerx').slice(7)}`],
+    ['chained JWTs', fill('eyJaaaa.')],
+    ['one BEGIN, many ENDs', `-----BEGIN PRIVATE KEY-----\n${fill('-----END PRIVATE KEY-----\n').slice(28)}`],
+    ['BEGINs of many types, no END', fill('-----BEGIN A B C PRIVATE KEY-----\nMIIB MIIB\n')],
   ]
   it.each(cases)('%s', (_name, input) => {
     expect(input.length).toBeLessThanOrEqual(n)
@@ -515,7 +561,7 @@ describe('preRedact output scans clean', () => {
     'password=', 'Token: ', '"secret": "', 'sk-', 'abcdefghijklmnopqrstu', placeholder('credential'), placeholder('path'), '〔已脱敏·',
     ' ', '\n', '\u00a0', '@', 'ex.com', '1380013', '8000', '+44 20 ', '4111 1111 ', '/Users/', '~/', 'C:\\', '\\\\srv\\',
     'eyJ', 'abcd.', '.', '"', "'", ':', '=', '-----BEGIN RSA PRIVATE KEY-----', '-----END RSA PRIVATE KEY-----', 'MIIB',
-    'db.INTERNAL', '10.0.0.1', ':8080', 'localhost:', 'https://', '，', '。',
+    'db.INTERNAL', '10.0.0.1', ':8080', 'localhost:', 'https://', '，', '。', '\\"', 'Bearer ', 'eyJabcd.eyJ',
   ]
   it('for random mixes of the tricky parts', () => {
     let seed = 1669

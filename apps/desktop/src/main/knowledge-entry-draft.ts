@@ -328,21 +328,31 @@ export function createEntryDraftStore(dir: string, now: () => Date = () => new D
       if (!checked) return false
       const current = readDraft(checked)
       if (!current) return false
-      // The event first: a withdrawal whose record could not be written has
-      // not happened, and the draft stays for another try.
+      // The draft leaves the store first, by a rename (one step, undone if
+      // the event cannot be written), so a withdrawal is either recorded and
+      // gone, or neither. Removing the renamed file may still fail; it is a
+      // temp then, outside the store, and the temp sweep takes it later.
       ensureRoot()
-      const events = path.join(root, '_events.jsonl')
-      const line = `${JSON.stringify({
-        at: now().toISOString(),
-        id: current.id,
-        event: 'withdrawn',
-        content_sha256: current.content_sha256,
-      })}\n`
-      const fd = fs.openSync(events, 'a', 0o600)
-      try { fs.writeFileSync(fd, line) }
-      finally { fs.closeSync(fd) }
-      fs.chmodSync(events, 0o600)
-      fs.rmSync(fileOf(checked), { force: true })
+      const aside = path.join(root, `${checked}.withdrawn.tmp`)
+      fs.renameSync(fileOf(checked), aside)
+      try {
+        const events = path.join(root, '_events.jsonl')
+        const line = `${JSON.stringify({
+          at: now().toISOString(),
+          id: current.id,
+          event: 'withdrawn',
+          content_sha256: current.content_sha256,
+        })}\n`
+        const fd = fs.openSync(events, 'a', 0o600)
+        try { fs.writeFileSync(fd, line) }
+        finally { fs.closeSync(fd) }
+        fs.chmodSync(events, 0o600)
+      } catch (err) {
+        fs.renameSync(aside, fileOf(checked))
+        throw err
+      }
+      try { fs.rmSync(aside, { force: true }) }
+      catch { /* swept later as a stale temp */ }
       return true
     },
   }
