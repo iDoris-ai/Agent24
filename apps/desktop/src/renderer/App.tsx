@@ -188,11 +188,10 @@ function AppShell(): JSX.Element {
 
   const pageTitle = selected ? c(selected.nameKey)
     : page === 'capabilities' ? t('nav.capabilities')
-      : page === 'chat' ? c('assistant.name')
-        : page === 'home' ? t('title.home')
+      : page === 'home' ? t('title.home')
           : page === 'settings' ? t('title.settings')
             : page === 'runs' ? t('title.runs') : t('nav.capabilities')
-  const activeId = selected?.id ?? (page === 'chat' ? 'assistant' : page ?? '')
+  const activeId = selected?.id ?? page ?? ''
 
   return (
     <div className={`app${darkMode ? '' : ' light'}`}>
@@ -230,7 +229,7 @@ function AppShell(): JSX.Element {
       <div className={`main${sidebarOpen ? '' : ' sidebar-hidden'}`}>
         <div className="topbar">
           <span className="topbar-title">{pageTitle}</span>
-          {(page === 'chat' || page === 'home') && (
+          {(page === 'assistant' || page === 'home') && (
             <span className="topbar-sub">{llmLabel}</span>
           )}
           <button
@@ -255,7 +254,7 @@ function AppShell(): JSX.Element {
             memory session on every round trip through another page. */}
         <div
           style={
-            page === 'chat'
+            page === 'assistant'
               ? { display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }
               : { display: 'none' }
           }
@@ -287,7 +286,7 @@ function AppShell(): JSX.Element {
         {page === 'settings'         && <SettingsPage key={route.kind === 'page' ? route.key : undefined} initialTab={route.kind === 'page' ? route.initialTab : undefined} />}
         {page === 'capabilities'     && <CapabilitiesPage statusFor={statusFor} onOpenSettings={() => open('settings/general', 'capabilities', { focus: 'slots' })} />}
         {page === 'modules-manager'  && <ModulesManagerPage />}
-        {selected && !['chat', 'documents', 'schedules', 'communication', 'approvals', 'voice', 'creative', 'knowledgeBase', 'models', 'memory', 'modules-manager'].includes(selected.page)
+        {selected && !['assistant', 'documents', 'schedules', 'communication', 'approvals', 'voice', 'creative', 'knowledgeBase', 'models', 'memory', 'modules-manager'].includes(selected.page)
           && <CapabilityPage capability={selected} />}
       </div>
     </div>

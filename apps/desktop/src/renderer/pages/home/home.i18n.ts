@@ -15,8 +15,8 @@ export const homeMessages = defineMessages({
     'live.modules': 'Loaded modules', 'live.ledger': 'Ledger blocks', 'live.illustrative': '{n} (illustrative)',
     'detail.open': 'Open this page →',
 
-    'source.entry': 'A desktop chat', 'source.scheduler': 'A scheduled job', 'source.comm': 'An inbound Hyphae message',
-    'source.entry.back': 'the desktop chat', 'source.scheduler.back': 'the scheduled job', 'source.comm.back': 'the Hyphae sender',
+    'source.entry': 'A desktop conversation', 'source.scheduler': 'A scheduled job', 'source.comm': 'An inbound Hyphae message',
+    'source.entry.back': 'the desktop conversation', 'source.scheduler.back': 'the scheduled job', 'source.comm.back': 'the Hyphae sender',
 
     'stage.intake': '{source} starts a run, entering agent24d over REST / WS',
     'stage.run': 'agent24d creates the run; the core state machine checks the transition and the agent loop spins up',
@@ -107,8 +107,8 @@ export const homeMessages = defineMessages({
     'live.modules': 'โมดูลที่โหลดแล้ว', 'live.ledger': 'บล็อกในบัญชีบันทึก', 'live.illustrative': '{n} (ภาพประกอบ)',
     'detail.open': 'เปิดหน้านี้ →',
 
-    'source.entry': 'แชทบนเดสก์ท็อป', 'source.scheduler': 'งานตามตารางเวลา', 'source.comm': 'ข้อความขาเข้าจาก Hyphae',
-    'source.entry.back': 'แชทบนเดสก์ท็อป', 'source.scheduler.back': 'งานตามตารางเวลา', 'source.comm.back': 'ผู้ส่งทาง Hyphae',
+    'source.entry': 'การสนทนาบนเดสก์ท็อป', 'source.scheduler': 'งานตามตารางเวลา', 'source.comm': 'ข้อความขาเข้าจาก Hyphae',
+    'source.entry.back': 'การสนทนาบนเดสก์ท็อป', 'source.scheduler.back': 'งานตามตารางเวลา', 'source.comm.back': 'ผู้ส่งทาง Hyphae',
 
     'stage.intake': '{source}เริ่ม run หนึ่งครั้ง เข้าสู่ agent24d ผ่าน REST / WS',
     'stage.run': 'agent24d สร้าง run เครื่องสถานะ core ตรวจการเปลี่ยนสถานะ และ agent loop เริ่มหมุน',

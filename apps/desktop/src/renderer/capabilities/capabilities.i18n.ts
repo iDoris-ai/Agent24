@@ -36,7 +36,7 @@ const messages = defineMessages({
   zh: {
     'group.office': '办公', 'group.knowledge': '知识', 'group.creative': '创作',
     'group.domainOs': '领域 OS', 'group.tools': '工具', 'group.services': '服务',
-    'assistant.name': '助手', 'assistant.description': '与你的内置 AI 助手对话。',
+    'assistant.name': '助理', 'assistant.description': '与你的内置 AI 助理对话。',
     'documents.name': '文档', 'documents.description': '导入、阅读和处理文档。',
     'localModels.name': '本地模型', 'localModels.description': '管理本地 AI 模型与 iDoris。',
     'voice.name': '语音', 'voice.description': '通过 Agent24 说话和聆听。',
@@ -47,7 +47,7 @@ const messages = defineMessages({
     'sin90.name': 'Sin90', 'sin90.description': '使用 Sin90 领域 OS。',
     'cos72.name': 'Cos72', 'cos72.description': '使用 Cos72 领域 OS。',
     'tools.name': '工具', 'tools.description': '管理邮件、翻译、Notion 等工具与集成。',
-    'memory.name': '记忆', 'memory.description': '查看和管理助手记住的信息。',
+    'memory.name': '记忆', 'memory.description': '查看和管理助理记住的信息。',
     'schedules.name': '调度', 'schedules.description': '管理定时和周期任务。',
     'approvals.name': '审批', 'approvals.description': '查看等待你审批的操作。',
     'communication.name': '通信', 'communication.description': '管理通信服务和联系人。',
