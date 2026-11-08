@@ -2,8 +2,8 @@
   "source": {
     "repo": "iDoris-ai/WeKnora",
     "path": "docs/agent24/ui-routes.json",
-    "commit": "c533b1a0b02b88718ea92242dd31c32bd40b1a0c",
-    "note": "The host's copy: a subset of the pinned server list at this commit (knowledge-ui-routes.test.ts). C2-01c1/c2 (WeKnora#141, #142)."
+    "commit": "5c914a51e6582f35800fb163355dae6dd147b80f",
+    "note": "The host's copy: a subset of the pinned server list at this commit (knowledge-ui-routes.test.ts). C2-01c1/c2/c3 (WeKnora#141, #142, #143)."
   },
   "routes": [
     {
@@ -35,6 +35,16 @@
       "method": "GET",
       "path": "/api/v1/agent24/knowledge/ui/documents/:knowledge_id/chunks",
       "op": "chunk.list"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent24/knowledge/ui/knowledge-bases/:kb_id/wiki/pages",
+      "op": "wiki.list"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent24/knowledge/ui/knowledge-bases/:kb_id/wiki/pages/*slug",
+      "op": "wiki.get"
     }
   ]
 }

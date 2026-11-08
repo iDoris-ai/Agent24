@@ -36,19 +36,25 @@ describe('the host copy against the server list (#1632 L1)', () => {
     expect(host).toMatchObject({ repo: pinned.repo, path: pinned.path, commit: pinned.commit })
   })
 
-  it('holds the six UI routes of C2-01c1 and c2 (WeKnora#141, #142)', () => {
+  it('holds the eight UI routes of C2-01c1, c2 and c3 (WeKnora#141, #142, #143)', () => {
     const ui = 'http://127.0.0.1:18282/api/v1/agent24/knowledge/ui'
     const o = `${ui}/knowledge-bases`
     const op = (url: string) => matchUiRoute(KNOWLEDGE_UI_ROUTES, 'GET', url)?.op ?? null
-    expect(KNOWLEDGE_UI_ROUTES).toHaveLength(6)
+    expect(KNOWLEDGE_UI_ROUTES).toHaveLength(8)
     expect(op(o)).toBe('kb.list')
     expect(op(`${o}/kb-1`)).toBe('kb.get')
     expect(op(`${o}/kb-1/tags`)).toBe('tag.list')
     expect(op(`${o}/kb-1/documents?page=2`)).toBe('doc.list')
     expect(op(`${ui}/documents/doc-1`)).toBe('doc.get')
     expect(op(`${ui}/documents/doc-1/chunks`)).toBe('chunk.list')
-    // Not (yet) on the list: wiki comes with c3; nothing outside the UI prefix.
+    expect(op(`${o}/kb-1/wiki/pages?page=2`)).toBe('wiki.list')
+    expect(op(`${o}/kb-1/wiki/pages/overview`)).toBe('wiki.get')
+    // A slug may hold slashes (WeKnora#143): the rest of the path is the slug.
+    expect(op(`${o}/kb-1/wiki/pages/entity/acme-corp`)).toBe('wiki.get')
+    // Not on the list: the wiki root, an empty slug, anything outside the UI prefix.
     expect(op(`${o}/kb-1/wiki`)).toBeNull()
+    expect(op(`${o}/kb-1/wiki/pages/`)).toBeNull()
+    expect(op(`${o}/kb-1/wiki/pages/entity%2Facme-corp`)).toBeNull()
     expect(op(`${ui}/documents`)).toBeNull()
     expect(op(`${ui}/documents/doc-1/chunks/c-1`)).toBeNull()
     expect(op('http://127.0.0.1:18282/api/v1/knowledge-bases')).toBeNull()
