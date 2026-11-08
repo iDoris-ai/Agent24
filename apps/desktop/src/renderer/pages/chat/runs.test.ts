@@ -97,6 +97,18 @@ describe('a conversation\'s runs on the page (M4 A2)', () => {
     expect(item('chat_a')?.tasks).toEqual([expect.objectContaining({ run_id: 'run_1', kind: 'task' })])
   })
 
+  it('tries a promotion main could not take again after the next save; one for no conversation is dropped', async () => {
+    await saveConversation(record('chat_a', '周报'))
+    ;(bridge.promoteRun as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('Chat history unreadable'))
+    expect(await promoteRun('chat_a', 'run_1')).toBe(false)
+    expect(await promoteRun('chat_b', 'run_2')).toBe(false)
+    await saveConversation(record('chat_b', '日报'))
+    expect(await saveConversation(record('chat_a', '周报', '2026-11-08T02:00:00.000Z'))).toBe(true)
+    await flush()
+    expect(item('chat_a')?.tasks).toEqual([expect.objectContaining({ run_id: 'run_1' })])
+    expect(item('chat_b')?.tasks).toEqual([])
+  })
+
   it('reads the list again when main\'s own modules change a conversation', async () => {
     const off = subscribeHistory(() => {})
     await saveConversation(record('chat_a', '周报'))
