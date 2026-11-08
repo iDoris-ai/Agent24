@@ -102,6 +102,20 @@ describe('KnowledgeUiInstance', () => {
     expect(t.events).toEqual([{ kind: 'rebuild' }, { kind: 'closed', code: 'session_rejected' }])
   })
 
+  it('handles one self-check once, however many 401s share it', async () => {
+    const t = setup({ probes: [refused('unauthorized', 'credential_invalid')] })
+    await t.ui.start()
+    const a = fetchReq()
+    const b = fetchReq()
+    t.ui.inject(a, WC)
+    t.ui.inject(b, WC)
+    t.ui.responded(a.id, 401)
+    t.ui.responded(b.id, 401)
+    await flush()
+    expect(t.log.filter((l) => l === 'probe')).toHaveLength(1)
+    expect(t.events).toEqual([{ kind: 'rebuild' }])
+  })
+
   it('leaves a restart out of the count (decision #36)', async () => {
     const restarted = refused('unauthorized', 'credential_invalid', true)
     const t = setup({ probes: [restarted, restarted] })
@@ -132,6 +146,8 @@ describe('KnowledgeUiInstance', () => {
       await flush()
     }
     expect(t.events).toEqual([{ kind: 'closed', code: 'revocation_mismatch' }])
+    // The renewal that closed it left a JWT behind; it is not injected.
+    expect(t.ui.inject(fetchReq(), WC)).toEqual({ cancel: true })
     expect(t.log.filter((l) => l === 'issue')).toHaveLength(4) // the first, then one per revoked probe; the third such issue closes
   })
 
