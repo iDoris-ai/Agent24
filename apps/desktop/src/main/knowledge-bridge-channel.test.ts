@@ -94,26 +94,33 @@ describe('KnowledgeBridgeChannel', () => {
     t.contents.emit('did-navigate')
     t.contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
     expect(t.channel.currentDocument()).toBeNull()
-    t.contents.emit('did-stop-loading')
-    expect(t.channel.currentDocument()).toBe(1)
-    t.contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
-    t.contents.emit('did-fail-load', {}, -3, '', '', false)
+    // A sub-frame's abort is not the main frame's.
+    t.contents.emit('did-fail-provisional-load', {}, -3, '', '', false)
     expect(t.channel.currentDocument()).toBeNull()
-    t.contents.emit('did-fail-load', {}, -3, '', '', true)
+    t.contents.emit('did-fail-provisional-load', {}, -3, '', '', true)
     expect(t.channel.currentDocument()).toBe(1)
-    expect(t.docs).toEqual([1, 'left', 'resumed 1', 'left', 'resumed 1'])
-    // After a commit, the stop that follows changes nothing.
-    t.contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
-    t.contents.emit('did-navigate')
-    t.contents.emit('did-stop-loading')
-    expect(t.channel.currentDocument()).toBe(2)
-    expect(t.docs.at(-1)).toBe(2)
+    expect(t.docs).toEqual([1, 'left', 'resumed 1'])
+    // Once resumed, another abort changes nothing.
+    t.contents.emit('did-fail-provisional-load', {}, -3, '', '', true)
+    expect(t.docs).toEqual([1, 'left', 'resumed 1'])
   })
 
-  it('before the first document, a stop gives no document', () => {
+  it('a committed error page (a failure that is not an abort) keeps the bridge off until the next commit', () => {
+    const t = setup()
+    t.contents.emit('did-navigate')
+    t.contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+    t.contents.emit('did-fail-provisional-load', {}, -102, 'ERR_CONNECTION_REFUSED', '', true)
+    t.contents.emit('did-fail-load', {}, -102, 'ERR_CONNECTION_REFUSED', '', true)
+    t.contents.emit('did-stop-loading')
+    expect(t.channel.currentDocument()).toBeNull()
+    t.contents.emit('did-navigate')
+    expect(t.channel.currentDocument()).toBe(2)
+  })
+
+  it('before the first document, an abort gives no document', () => {
     const t = setup()
     t.contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
-    t.contents.emit('did-stop-loading')
+    t.contents.emit('did-fail-provisional-load', {}, -3, '', '', true)
     expect(t.channel.currentDocument()).toBeNull()
   })
 
@@ -141,13 +148,13 @@ describe('KnowledgeBridgeChannel', () => {
     expect(t.arrivals[0]).toMatchObject(expected)
   })
 
-  it('a detached main frame is not the main frame any more', () => {
+  it('a detached frame is a replaced document: no frame, not a sub-frame', () => {
     const t = setup()
     t.contents.emit('did-navigate')
     const old = t.contents.mainFrame
     old.detached = true
     t.channel.request({ webContentsId: 7, frame: old, uploadData: t.body() })
-    expect(t.arrivals[0].mainFrame).toBe(false)
+    expect(t.arrivals[0].mainFrame).toBeNull()
   })
 
   it.each([

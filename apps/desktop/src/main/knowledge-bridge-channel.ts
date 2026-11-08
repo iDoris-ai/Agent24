@@ -13,6 +13,9 @@ import type { BridgeArrival, KnowledgeBridge } from './knowledge-bridge'
 export const BRIDGE_PATH = '/__agent24/bridge'
 const RESERVED_PREFIX = '/__agent24/'
 
+/** net::ERR_ABORTED: a navigation that was cancelled, not one that failed. */
+const ERR_ABORTED = -3
+
 /** U6.1 f: pressing, clicking, touching; not moves, hovers or scrolls. */
 const ACTIVATION = new Set(['mouseDown', 'rawKeyDown', 'keyDown', 'touchStart', 'gestureTap'])
 
@@ -103,19 +106,18 @@ export class KnowledgeBridgeChannel {
       this.pending = false
       this.bridge.newDocument(this.document)
     })
-    // A navigation the guards cancelled (will-navigate, will-frame-navigate,
-    // will-redirect), a download, a 204: nothing committed, the page shown is
-    // still the document it was, and its bridge comes back.
-    const notCommitted = (): void => {
-      if (!this.pending) return
+    // A main-frame navigation cancelled before it committed (the guards'
+    // will-navigate / will-frame-navigate / will-redirect, a download, a 204)
+    // ends as ERR_ABORTED: the page shown is still the document it was, and
+    // its bridge comes back. Anything else (an error page Chromium committed,
+    // which Electron reports without did-navigate) keeps the bridge off until
+    // the next real commit.
+    this.listen('did-fail-provisional-load', (_event: unknown, code: unknown, _description: unknown, _url: unknown, isMainFrame: unknown) => {
+      if (!isMainFrame || code !== ERR_ABORTED || !this.pending) return
       this.pending = false
       if (this.document === 0) return
       this.between = false
       this.bridge.resumeDocument(this.document)
-    }
-    this.listen('did-stop-loading', notCommitted)
-    this.listen('did-fail-load', (_event: unknown, _code: unknown, _description: unknown, _url: unknown, isMainFrame: unknown) => {
-      if (isMainFrame) notCommitted()
     })
     this.listen('input-event', (_event: unknown, input: { type?: string } | undefined) => {
       if (input?.type && ACTIVATION.has(input.type)) this.activatedAt = this.now()
@@ -141,7 +143,10 @@ export class KnowledgeBridgeChannel {
     let documentOrigin: string | null = null
     if (frame && !this.contents.isDestroyed()) {
       try {
-        mainFrame = !frame.detached && sameFrame(frame, this.contents.mainFrame)
+        // A detached frame is a document the navigation already replaced
+        // (unload, keepalive): late, not a sub-frame of this one, so ⑤ drops
+        // it silently instead of ② closing the bridge.
+        mainFrame = frame.detached ? null : sameFrame(frame, this.contents.mainFrame)
         documentOrigin = typeof frame.origin === 'string' ? frame.origin : null
       } catch {
         mainFrame = null
