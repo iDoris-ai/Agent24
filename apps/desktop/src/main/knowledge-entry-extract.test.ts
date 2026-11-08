@@ -32,10 +32,13 @@ describe('sourceMessages: the pre-redaction', () => {
       user('谢谢'),
     ])
     const source = sourceMessages(r, 0, 1)
-    expect(source).toEqual([
-      { role: 'user', text: `我的邮箱 ${placeholder('email')}，密码 password=${placeholder('credential')}` },
-      { role: 'assistant', text: `日志在 ${placeholder('path')}，服务在 ${placeholder('internal_address')}` },
-    ])
+    expect(source).toEqual({
+      clean: true,
+      messages: [
+        { role: 'user', text: `我的邮箱 ${placeholder('email')}，密码 password=${placeholder('credential')}` },
+        { role: 'assistant', text: `日志在 ${placeholder('path')}，服务在 ${placeholder('internal_address')}` },
+      ],
+    })
     const sent = JSON.stringify(source)
     for (const secret of ['alice@example.com', 'hunter2', '/Users/alice', '10.0.0.5']) expect(sent).not.toContain(secret)
   })
@@ -43,7 +46,24 @@ describe('sourceMessages: the pre-redaction', () => {
   it('refuses a range longer than MAX_SOURCE_CHARS instead of cutting it', () => {
     const half = 'a'.repeat(MAX_SOURCE_CHARS / 2 + 1)
     expect(() => sourceMessages(record([user(half), reply(half)]), 0, 1)).toThrow(SourceTooLong)
-    expect(sourceMessages(record([user(half), reply(half)]), 0, 0)).toHaveLength(1)
+    expect(sourceMessages(record([user(half), reply(half)]), 0, 0).messages).toHaveLength(1)
+  })
+
+  // PR-Daemon #1680 N1: the rule table alone stops after 4 passes and left one of each.
+  it('clears what the rule table alone leaves, as 一键脱敏 does', () => {
+    const phones = '+442071234567'.repeat(5)
+    const cards = Array(6).fill('4111111111111111111').join(' ')
+    const source = sourceMessages(record([user(phones), reply(cards)]), 0, 1)
+    expect(source.clean).toBe(true)
+    const sent = JSON.stringify(source)
+    expect(sent).not.toContain('442071234567')
+    expect(sent).not.toContain('4111111111111111111')
+  })
+
+  it('marks a range it cannot clear, so the model never sees it', () => {
+    const source = sourceMessages(record([user('谢谢'), user('+442071234567'.repeat(9))]), 0, 1)
+    expect(source.clean).toBe(false)
+    expect(sourceMessages(record([user('谢谢'), user('+442071234567'.repeat(9))]), 0, 0).clean).toBe(true)
   })
 })
 
@@ -54,10 +74,17 @@ describe('fallbackTitle', () => {
     expect(fallbackTitle('长'.repeat(500), '未命名').length).toBe(MAX_ENTRY_TITLE)
     expect(fallbackTitle('a\ud800', '未命名')).toBe('a�')
   })
+
+  it('is cleared like a message, and the untitled name when it cannot be', () => {
+    const cleared = fallbackTitle('+442071234567'.repeat(5), '未命名')
+    expect(cleared).not.toContain('442071234567')
+    expect(cleared).toContain(placeholder('phone'))
+    expect(fallbackTitle('+442071234567'.repeat(9), '未命名')).toBe('未命名')
+  })
 })
 
 describe('extractEntry: the model step', () => {
-  const source = [{ role: 'user' as const, text: '报销什么时候交？' }, { role: 'assistant' as const, text: '每月 25 日前。' }]
+  const source = { clean: true, messages: [{ role: 'user' as const, text: '报销什么时候交？' }, { role: 'assistant' as const, text: '每月 25 日前。' }] }
 
   it('asks once, with no session_id and no tools, and takes the model draft', async () => {
     const call = vi.fn<ChatCall>(async () => ok(JSON.stringify({ kind: 'faq', title: '报销截止', body: '每月 25 日前交。', hints: ['25 日'] })))
@@ -85,6 +112,12 @@ describe('extractEntry: the model step', () => {
     for (const [call, model] of cases) {
       expect(await extractEntry(source, '未命名知识条目', call)).toEqual({ kind: 'note', title: '未命名知识条目', body: '', hints: [], model })
     }
+  })
+
+  it('does not ask the model about a source that could not be cleared', async () => {
+    const call = vi.fn<ChatCall>(async () => ok(JSON.stringify({ kind: 'faq', title: 't', body: 'b' })))
+    expect(await extractEntry({ ...source, clean: false }, '未命名', call)).toEqual({ kind: 'note', title: '未命名', body: '', hints: [], model: 'held_back' })
+    expect(call).not.toHaveBeenCalled()
   })
 
   it('puts its own title in when the model gave none', async () => {

@@ -1,9 +1,12 @@
 // KB-SOP-01b-2 (#1669): rule table → local model → rule table.
 //
-// 1. Pre-redaction: every message the user chose goes through the fixed rule
-//    table (knowledge-entry-redact.ts) before anything else sees it. Only the
-//    user's and the assistant's text is used, never tool results, memories or
-//    attachments: a history record holds nothing else.
+// 1. Pre-redaction: every message the user chose is cleared the way "一键脱敏"
+//    clears a draft (`clearFindings`: the rule table, then whatever the
+//    post-scan still holds back) before anything else sees it. A range that is
+//    still not clean after that never reaches the model: the user gets the
+//    empty template (`held_back`). Only the user's and the
+//    assistant's text is used, never tool results, memories or attachments: a
+//    history record holds nothing else.
 // 2. The model: the fixed skill (knowledge-entry-skill.ts) over
 //    `/api/v1/chat` without `session_id`, so local models only, no memory, no
 //    tools. When there is no usable answer the user gets an empty template and
@@ -22,8 +25,9 @@ import { clipUnits, extractRequest, parseModelDraft, wellFormed, type SourceMess
  *  range is refused rather than cut: a draft of half a range would mislead. */
 export const MAX_SOURCE_CHARS = 48_000
 
-/** How the model step went; anything but `drafted` gives the empty template. */
-export type ModelOutcome = 'drafted' | 'no_model' | 'needs_confirmation' | 'busy' | 'failed' | 'unusable'
+/** How the model step went; anything but `drafted` gives the empty template.
+ *  `held_back`: the chosen messages could not be cleared, so the model was not asked. */
+export type ModelOutcome = 'drafted' | 'no_model' | 'needs_confirmation' | 'busy' | 'failed' | 'unusable' | 'held_back'
 
 export type ChatCall = (body: unknown) => Promise<BackendProxyResponse>
 
@@ -42,35 +46,43 @@ export class SourceTooLong extends Error {
   }
 }
 
-/** Messages `from`..`to` (inclusive) of `record`, redacted. Throws SourceTooLong. */
-export function sourceMessages(record: ChatHistoryRecord, from: number, to: number): SourceMessage[] {
-  const out: SourceMessage[] = []
+/** The chosen messages, cleared; `clean` is false when the post-scan still finds something in one. */
+export interface Source {
+  messages: SourceMessage[]
+  clean: boolean
+}
+
+/** Messages `from`..`to` (inclusive) of `record`, cleared. Throws SourceTooLong. */
+export function sourceMessages(record: ChatHistoryRecord, from: number, to: number): Source {
+  const messages: SourceMessage[] = []
+  let clean = true
   let total = 0
   for (const message of record.messages.slice(from, to + 1)) {
     let text: string
     try {
-      text = preRedact(message.content).text
+      text = clearFindings(message.content)
+      if (postScan(text).length > 0) clean = false
     } catch {
       throw new SourceTooLong()
     }
     total += text.length
     if (total > MAX_SOURCE_CHARS) throw new SourceTooLong()
-    out.push({ role: message.role, text })
+    messages.push({ role: message.role, text })
   }
-  return out
+  return { messages, clean }
 }
 
 /** A title for a draft the model did not title: the conversation's own,
- *  redacted, on one line; `untitled` when nothing is left. */
+ *  cleared, on one line; `untitled` when nothing is left or it is still not clean. */
 export function fallbackTitle(conversationTitle: string, untitled: string): string {
   let title: string
   try {
-    title = preRedact(wellFormed(conversationTitle)).text.normalize('NFC')
+    title = clearFindings(wellFormed(conversationTitle)).normalize('NFC')
   } catch {
     title = ''
   }
   const line = clipUnits(title.replace(/\s+/g, ' ').trim(), MAX_ENTRY_TITLE).trim()
-  return line.length > 0 ? line : untitled
+  return line.length > 0 && postScan(line).length === 0 ? line : untitled
 }
 
 function errorCode(res: BackendProxyResponse): string | null {
@@ -87,12 +99,13 @@ function outcomeOf(res: BackendProxyResponse): ModelOutcome {
   return 'failed'
 }
 
-/** Asks the local model once. Never throws: a failure is an outcome. */
-export async function extractEntry(source: readonly SourceMessage[], untitledTitle: string, call: ChatCall): Promise<Extraction> {
+/** Asks the local model once, and only about a clean source. Never throws: a failure is an outcome. */
+export async function extractEntry(source: Source, untitledTitle: string, call: ChatCall): Promise<Extraction> {
   const template = (model: ModelOutcome): Extraction => ({ kind: 'note', title: untitledTitle, body: '', hints: [], model })
+  if (!source.clean) return template('held_back')
   let res: BackendProxyResponse
   try {
-    res = await call(extractRequest(source))
+    res = await call(extractRequest(source.messages))
   } catch {
     return template('failed')
   }

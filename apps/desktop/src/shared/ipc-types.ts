@@ -246,7 +246,7 @@ export interface KnowledgeEntryDraftView extends KnowledgeEntryDraftSummary {
 }
 
 /** How the model step went; anything but `drafted` gave the empty template. */
-export type KnowledgeEntryModelOutcome = 'drafted' | 'no_model' | 'needs_confirmation' | 'busy' | 'failed' | 'unusable'
+export type KnowledgeEntryModelOutcome = 'drafted' | 'no_model' | 'needs_confirmation' | 'busy' | 'failed' | 'unusable' | 'held_back'
 
 export type KnowledgeEntryDraftCreated =
   | { ok: true; draft: KnowledgeEntryDraftView; model: KnowledgeEntryModelOutcome; hints: string[] }

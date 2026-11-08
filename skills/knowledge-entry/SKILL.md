@@ -13,9 +13,9 @@ evals: evals/*.jsonl
 
 ## 中文
 
-**做什么**：用户在历史对话上选「沉淀为知识条目」，准入通过（#1669 1a）后选一段消息。桌面端 main 先用固定规则表脱敏（`knowledge-entry-redact.ts`），再把这段对话作为数据交给本机模型（`/api/v1/chat`，不带 `session_id`：只走本地模型、不读写记忆、不提供工具），模型写出类型、标题、正文和提示；main 再用同一张规则表后扫描。
+**做什么**：用户在历史对话上选「沉淀为知识条目」，准入通过（#1669 1a）后选一段消息。桌面端 main 先脱敏：固定规则表（`knowledge-entry-redact.ts`），再把后扫描仍拦下的片段整段换成占位符，和「一键脱敏」同一套；仍清不干净的一段不交给模型，直接给空模板。然后把这段对话作为数据交给本机模型（`/api/v1/chat`，不带 `session_id`：只走本地模型、不读写记忆、不提供工具），模型写出类型、标题、正文和提示；main 再用规则表加更宽的形状做后扫描。
 
-**模型的角色**：只起草和高亮。规则表是唯一的硬闸门：后扫描有命中，草稿就不能提交，模型的输出既不能放行它，也不能让它被拦下（#1667 第 3 件）。`hints` 只在界面上提示用户再看一眼，不阻断任何东西。
+**模型的角色**：只起草和高亮。规则表与后扫描是唯一的硬闸门：后扫描有命中，草稿就不能提交，模型的输出既不能放行它，也不能让它被拦下（#1667 第 3 件）。`hints` 只在界面上提示用户再看一眼，不阻断任何东西。
 
 **模型不可用**（没有本地模型、需要确认资源、忙、超时、答非所问）：给一份可编辑的空模板，并告诉用户原因，不静默失败。
 
@@ -23,7 +23,7 @@ evals: evals/*.jsonl
 
 ## English
 
-What it does: after an admitted conversation (#1669 1a) and a chosen range of messages, desktop main redacts the text with the fixed rule table, hands the conversation to the local model as data (`/api/v1/chat` without `session_id`: local models only, no memory, no tools), and scans the model's answer with the same rule table. The rule table is the only gate; the model drafts and highlights, and can neither pass nor block anything. With no usable model the user gets an empty template to edit and is told why.
+What it does: after an admitted conversation (#1669 1a) and a chosen range of messages, desktop main redacts the text with the fixed rule table and then replaces whatever the post-scan still holds back, as "一键脱敏" does (a range that still is not clean never reaches the model: the user gets the empty template), hands the conversation to the local model as data (`/api/v1/chat` without `session_id`: local models only, no memory, no tools), and scans the model's answer with the rule table and its wider shapes. The rule table and the post-scan are the only gate; the model drafts and highlights, and can neither pass nor block anything. With no usable model the user gets an empty template to edit and is told why.
 
 ## ไทย
 

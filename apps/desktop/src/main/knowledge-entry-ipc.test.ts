@@ -310,6 +310,29 @@ describe('knowledgeEntryDrafts.create', () => {
     expect((await s.drafts.create(sender(1), ticket, { from: 0, to: 0 })).ok).toBe(true)
   })
 
+  // PR-Daemon #1680 N1: judged by what reaches chat, with the two inputs it measured.
+  it('sends chat no number the rule table alone would have left', async () => {
+    const s = drafting()
+    const rec = conversation([user('+442071234567'.repeat(5)), reply(Array(6).fill('4111111111111111111').join(' '))])
+    const out = await s.drafts.create(sender(1), s.drafts.issue(rec, 1), { from: 0, to: 1 })
+    expect(out.ok && out.model).toBe('drafted')
+    const sent = JSON.stringify(s.calls)
+    expect(sent).not.toContain('442071234567')
+    expect(sent).not.toContain('4111111111111111111')
+  })
+
+  it('does not call chat for a range it cannot clear, and gives the empty template', async () => {
+    const s = drafting()
+    const rec = conversation([user('+442071234567'.repeat(9))], '+442071234567'.repeat(9))
+    const out = await s.drafts.create(sender(1), s.drafts.issue(rec, 1), { from: 0, to: 0 })
+    expect(s.chat).not.toHaveBeenCalled()
+    expect(out.ok).toBe(true)
+    if (!out.ok) return
+    expect(out.model).toBe('held_back')
+    expect(out.draft).toMatchObject({ kind: 'note', body: '', findings: [] })
+    expect(out.draft.title).not.toContain('442071234567')
+  })
+
   it('refuses a range too long to draft, a full store, and a second draft while one is being made', async () => {
     const s = drafting()
     const long = conversation([user('a'.repeat(60_000))])

@@ -240,6 +240,20 @@ describe('choosing a range and drafting', () => {
     expect(screen.getByText('来自对话第 1\u20132 条消息')).toBeTruthy()
   })
 
+  it('opens the template main gave when it held the messages back from the model', async () => {
+    const draft = draftView()
+    const current = window.agent24
+    Object.defineProperty(window, 'agent24', {
+      configurable: true,
+      value: { ...current, knowledgeEntry: { ...current.knowledgeEntry, admit, createDraft, getDraft: vi.fn(async () => draft) } },
+    })
+    createDraft.mockResolvedValue({ ok: true, draft, model: 'held_back', hints: [] })
+    render(<Stage />)
+    await reachChoose()
+    fireEvent.click(screen.getByRole('button', { name: '生成草稿' }))
+    expect(await screen.findByText('所选消息里有无法自动脱敏的内容，没有交给本机模型，已给出空模板。')).toBeTruthy()
+  })
+
   it('disables 生成草稿 when from is after to', async () => {
     render(<Stage />)
     await reachChoose()

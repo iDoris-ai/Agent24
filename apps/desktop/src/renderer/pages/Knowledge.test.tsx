@@ -166,7 +166,7 @@ describe('KnowledgePage', () => {
     render(<CapabilitiesContext.Provider value={{ defs: [], open, approvalsWaiting: 0 }}><KnowledgePage /></CapabilitiesContext.Provider>)
     await waitFor(() => expect(show).toHaveBeenCalled())
     act(() => confirmListener?.(ASK))
-    fireEvent.click(screen.getByRole('button', { name: 'Add to chat' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add to conversation' }))
     expect(answer).toHaveBeenCalledWith(ASK.id, true)
     expect(open).toHaveBeenCalledWith('assistant', 'other')
     expect(answer.mock.invocationCallOrder[0]).toBeLessThan(open.mock.invocationCallOrder[0])

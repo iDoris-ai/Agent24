@@ -46,6 +46,7 @@ const draftMessages = defineMessages({
     'model.busy': 'The on-device model is busy. An empty template is ready.',
     'model.failed': 'The on-device model did not answer. An empty template is ready.',
     'model.unusable': 'The on-device model’s answer could not be used. An empty template is ready.',
+    'model.held_back': 'Some private details in the chosen messages could not be hidden automatically, so they were not given to the on-device model. An empty template is ready.',
     'detail.hints': 'The model suggests another look (a hint only; it does not affect submitting): {hints}',
     'action.save': 'Save',
     'action.redact': 'Redact',
@@ -95,6 +96,7 @@ const draftMessages = defineMessages({
     'model.busy': '本机模型正忙，已给出空模板。',
     'model.failed': '本机模型没有答复，已给出空模板。',
     'model.unusable': '本机模型的答复无法使用，已给出空模板。',
+    'model.held_back': '所选消息里有无法自动脱敏的内容，没有交给本机模型，已给出空模板。',
     'detail.hints': '模型提示再看一眼（只是提示，不影响提交）：{hints}',
     'action.save': '保存',
     'action.redact': '一键脱敏',
@@ -144,6 +146,7 @@ const draftMessages = defineMessages({
     'model.busy': 'โมเดลในเครื่องไม่ว่าง จึงให้เทมเพลตว่างไว้',
     'model.failed': 'โมเดลในเครื่องไม่ตอบ จึงให้เทมเพลตว่างไว้',
     'model.unusable': 'คำตอบของโมเดลในเครื่องใช้ไม่ได้ จึงให้เทมเพลตว่างไว้',
+    'model.held_back': 'ข้อความที่เลือกมีข้อมูลส่วนตัวที่ปิดบังอัตโนมัติไม่ได้ จึงไม่ได้ส่งให้โมเดลในเครื่อง และให้เทมเพลตว่างไว้',
     'detail.hints': 'โมเดลแนะนำให้ดูอีกครั้ง (เป็นเพียงคำแนะนำ ไม่กระทบการส่ง): {hints}',
     'action.save': 'บันทึก',
     'action.redact': 'ปิดบังข้อมูล',
@@ -291,6 +294,7 @@ function modelLine(t: Copy, model: KnowledgeEntryModelOutcome): string | null {
     case 'busy': return t('model.busy')
     case 'failed': return t('model.failed')
     case 'unusable': return t('model.unusable')
+    case 'held_back': return t('model.held_back')
   }
 }
 
@@ -298,8 +302,8 @@ function Shell({ children }: { children?: ReactNode }): JSX.Element {
   const t = useT(draftMessages)
   const hidden = useContext(HiddenContext)
   // `.knowledge-confirm` sets `display: flex`, which beats the `[hidden]`
-  // default, so `hidden` alone leaves the panel on screen and focusable
-  // (Codex round 2 C2). The inline `display: none` is what takes it away.
+  // default, so `hidden` alone leaves the panel on screen and focusable.
+  // The inline `display: none` is what takes it away.
   return (
     <section
       className="knowledge-confirm"
@@ -356,7 +360,7 @@ function DraftDetail({ id, created }: { id: string; created?: CreatedNote }): JS
   const [busy, setBusy] = useState(false)
   const flight = useRef(false)
   const mounted = useRef(true)
-  // Set again on every setup: StrictMode runs setup, cleanup, setup (Codex C3).
+  // Set again on every setup: StrictMode runs setup, cleanup, setup.
   useEffect(() => {
     mounted.current = true
     return () => { mounted.current = false }
@@ -527,8 +531,7 @@ const HiddenContext = createContext(false)
 
 /**
  * The drafts list, or one draft. Renders nothing while the panel is closed.
- * `hidden` keeps it mounted under another panel, so unsaved edits stay
- * (Codex C2).
+ * `hidden` keeps it mounted under another panel, so unsaved edits stay.
  */
 export function KnowledgeEntryDraftsPanel({ hidden = false }: { hidden?: boolean }): JSX.Element | null {
   const state = useDraftsPanel()
@@ -537,7 +540,7 @@ export function KnowledgeEntryDraftsPanel({ hidden = false }: { hidden?: boolean
     <HiddenContext.Provider value={hidden}>
       {/* A new detail per draft: the panel stays mounted now, and nothing of
           one draft (fields, busy, a reply still on its way) may carry over to
-          the next (Codex round 2 C1). */}
+          the next. */}
       {state.view === 'list' ? <DraftList /> : <DraftDetail key={state.id} id={state.id} created={state.created} />}
     </HiddenContext.Provider>
   )

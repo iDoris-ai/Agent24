@@ -156,7 +156,7 @@ export function requestEntry(id: string | null): void {
 }
 
 const CREATE_REASONS = new Set<string>(['ticket_expired', 'invalid_range', 'too_long', 'too_many', 'knowledge_off', 'busy', 'not_saved'])
-const DRAFT_MODELS = new Set<KnowledgeEntryModelOutcome>(['drafted', 'no_model', 'needs_confirmation', 'busy', 'failed', 'unusable'])
+const DRAFT_MODELS = new Set<KnowledgeEntryModelOutcome>(['drafted', 'no_model', 'needs_confirmation', 'busy', 'failed', 'unusable', 'held_back'])
 
 function isMessage(value: unknown): value is KnowledgeEntryMessagePreview {
   if (typeof value !== 'object' || value === null) return false
