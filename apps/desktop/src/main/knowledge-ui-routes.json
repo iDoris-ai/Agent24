@@ -2,8 +2,24 @@
   "source": {
     "repo": "iDoris-ai/WeKnora",
     "path": "docs/agent24/ui-routes.json",
-    "commit": null,
-    "note": "Filled from WeKnora C2-01c once it lands; until then no request gets the UI session."
+    "commit": "8477788c97ecdbdeb155fc88da6fe840bec0e89f",
+    "note": "The host's copy: a subset of the pinned server list at this commit (knowledge-ui-routes.test.ts). C2-01c1 (WeKnora#141)."
   },
-  "routes": []
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/api/v1/agent24/knowledge/ui/knowledge-bases",
+      "op": "kb.list"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent24/knowledge/ui/knowledge-bases/:kb_id",
+      "op": "kb.get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent24/knowledge/ui/knowledge-bases/:kb_id/tags",
+      "op": "tag.list"
+    }
+  ]
 }

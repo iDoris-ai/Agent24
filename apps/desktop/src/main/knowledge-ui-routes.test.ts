@@ -27,7 +27,24 @@ describe('the host copy against the server list (#1632 L1)', () => {
     expect(notOnServer([{ ...ROUTES[1], op: 'kb.list' }], ROUTES)).toHaveLength(1)
   })
 
-  it.todo('pins the server list at a WeKnora commit (fill from C2-01c)')
+  it('pins the server list at a WeKnora commit, and the host copy names the same one', () => {
+    const fixture = path.join(__dirname, '../../test/fixtures/weknora/ui-routes.json')
+    const pinned = JSON.parse(readFileSync(fixture, 'utf8')).source
+    const host = JSON.parse(readFileSync(path.join(__dirname, 'knowledge-ui-routes.json'), 'utf8')).source
+    expect(pinned).toMatchObject({ repo: 'iDoris-ai/WeKnora', path: 'docs/agent24/ui-routes.json' })
+    expect(pinned.commit).toMatch(/^[0-9a-f]{40}$/)
+    expect(host).toMatchObject({ repo: pinned.repo, path: pinned.path, commit: pinned.commit })
+  })
+
+  it('holds C2-01c1\'s three UI routes (WeKnora#141)', () => {
+    const o = 'http://127.0.0.1:18282/api/v1/agent24/knowledge/ui/knowledge-bases'
+    const op = (url: string) => matchUiRoute(KNOWLEDGE_UI_ROUTES, 'GET', url)?.op ?? null
+    expect(op(o)).toBe('kb.list')
+    expect(op(`${o}/kb-1`)).toBe('kb.get')
+    expect(op(`${o}/kb-1/tags`)).toBe('tag.list')
+    expect(op(`${o}/kb-1/documents`)).toBeNull()
+    expect(op('http://127.0.0.1:18282/api/v1/knowledge-bases')).toBeNull()
+  })
 })
 
 describe('parseUiRoutes', () => {
@@ -87,8 +104,4 @@ describe('matchUiRoute (U4.5 ④)', () => {
     expect(op('GET', 'not a url')).toBeNull()
   })
 
-  it('ships an empty copy until C2-01c lands: nothing gets the session', () => {
-    expect(KNOWLEDGE_UI_ROUTES).toEqual([])
-    expect(matchUiRoute(KNOWLEDGE_UI_ROUTES, 'GET', `${ORIGIN}/api/v1/knowledge-bases`)).toBeNull()
-  })
 })

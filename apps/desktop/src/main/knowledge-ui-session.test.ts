@@ -53,6 +53,12 @@ describe('readUiError (U3.8 decoding, decision #36)', () => {
     expect(readUiError(expired, 'probe')).toEqual({ kind: 'error', code: 'unauthorized', reason: 'credential_expired', restarted: false, retryAfterMs: null })
   })
 
+  it('takes the R6.1 envelope of a GET entry, whose request_id and generation are null (WeKnora#141)', () => {
+    const body = { request_id: null, generation: null, error: { code: 'unauthorized', message: 'x', details: { reason: 'credential_expired' } } }
+    expect(readUiError(body, 'resource')).toEqual({ kind: 'error', code: 'unauthorized', reason: 'credential_expired', restarted: false, retryAfterMs: null })
+    expect(readUiError({ ...body, request_id: 'r-1', generation: 3 }, 'probe')).toMatchObject({ kind: 'error', reason: 'credential_expired' })
+  })
+
   it('takes unknown fields and gives unknown for a body it cannot read', () => {
     expect(readUiError({ error: { code: 'unavailable', message: 'm', details: { reason: 'overloaded', retry_after_ms: 5, x: 1 } } }, 'exchange'))
       .toEqual({ kind: 'error', code: 'unavailable', reason: 'overloaded', restarted: false, retryAfterMs: 5 })
