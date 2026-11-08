@@ -16,6 +16,14 @@ import {
   type KnowledgeConfigureInput,
   type KnowledgeSettingsResult,
   type KnowledgeStatus,
+  type KnowledgeViewBounds,
+  type KnowledgeViewResult,
+  type KnowledgeViewCitation,
+  type KnowledgeViewConfirmAsk,
+  type KnowledgeDraftEntry,
+  type KnowledgeEntryAdmission,
+  type KnowledgeViewState,
+  type KnowledgeViewTheme,
   type DocumentsImportProgress,
   type DocumentsRequest,
   type DocumentsResponse,
@@ -178,6 +186,47 @@ const api = {
       ipcRenderer.invoke(IpcChannels.KnowledgeConfigure, input),
     setEnabled: (enabled: boolean): Promise<KnowledgeSettingsResult> =>
       ipcRenderer.invoke(IpcChannels.KnowledgeSetEnabled, enabled),
+  },
+  // KB-C2-03: where to draw the KnowledgeView; main owns everything else.
+  knowledgeView: {
+    show: (bounds: KnowledgeViewBounds, theme: KnowledgeViewTheme): Promise<KnowledgeViewResult> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeViewShow, bounds, theme),
+    bounds: (bounds: KnowledgeViewBounds): Promise<void> => ipcRenderer.invoke(IpcChannels.KnowledgeViewBounds, bounds),
+    hide: (): Promise<void> => ipcRenderer.invoke(IpcChannels.KnowledgeViewHide),
+    reload: (bounds: KnowledgeViewBounds, theme: KnowledgeViewTheme): Promise<KnowledgeViewResult> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeViewReload, bounds, theme),
+    onState: (cb: (state: KnowledgeViewState) => void): (() => void) => {
+      const listener = (_event: unknown, state: KnowledgeViewState): void => cb(state)
+      ipcRenderer.on(IpcChannels.KnowledgeViewState, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.KnowledgeViewState, listener)
+    },
+    onCitation: (cb: (citation: KnowledgeViewCitation) => void): (() => void) => {
+      const listener = (_event: unknown, citation: KnowledgeViewCitation): void => cb(citation)
+      ipcRenderer.on(IpcChannels.KnowledgeViewCitation, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.KnowledgeViewCitation, listener)
+    },
+    onConfirm: (cb: (ask: KnowledgeViewConfirmAsk) => void): (() => void) => {
+      const listener = (_event: unknown, ask: KnowledgeViewConfirmAsk): void => cb(ask)
+      ipcRenderer.on(IpcChannels.KnowledgeViewConfirm, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.KnowledgeViewConfirm, listener)
+    },
+    answer: (id: string, confirmed: boolean): Promise<void> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeViewAnswer, id, confirmed),
+  },
+  // KB-C2-04b-2 (U7.2): draft attachments the user confirmed into this chat.
+  knowledgeDraft: {
+    list: (): Promise<KnowledgeDraftEntry[]> => ipcRenderer.invoke(IpcChannels.KnowledgeDraftList),
+    remove: (id: string): Promise<void> => ipcRenderer.invoke(IpcChannels.KnowledgeDraftRemove, id),
+    onChanged: (cb: (entries: KnowledgeDraftEntry[]) => void): (() => void) => {
+      const listener = (_event: unknown, entries: KnowledgeDraftEntry[]): void => cb(entries)
+      ipcRenderer.on(IpcChannels.KnowledgeDraftChanged, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.KnowledgeDraftChanged, listener)
+    },
+  },
+  // KB-SOP-01a (#1669): main checks the conversation, then asks the user itself.
+  knowledgeEntry: {
+    admit: (conversationId: string): Promise<KnowledgeEntryAdmission> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeEntryAdmit, conversationId),
   },
   // ADR-DOC-01 D5: the Documenting OS, by operation, never by path.
   documents: {

@@ -1,7 +1,7 @@
 # Knowledge 只读接入契约 v1（CONTRACT-READONLY-v1）
 
-> **状态**：v1 r10，已随 KB-R1/R2 实施（KB-R1：wire 类型与传输层；KB-R2：主对话的 search 与 read）。§0.3 的草案期已结束，语义变更按该节升主版本。服务端的已知差距见 §13。例外：KB-R2 的客户端只发单次 search 与 read，没有 R3.7 的跨 `score_space` 分组合并，也没有 R8、R9 的就绪探测、能力发现与兼容判定（CONTRACT-STATE §12）；开发者预览用 retrieve key 和样本数据，R1.3 的用户级凭据签发没有实施（#992、KB-C1-03）。
-> **版本**：契约 v1（报文字段 `protocol_version: 1`），文档修订 r10 · **日期**：2026-10-22 · **作者**：David Xu
+> **状态**：v1 r12，已随 KB-R1/R2 实施（KB-R1：wire 类型与传输层；KB-R2：主对话的 search 与 read）。§0.3 的草案期已结束，语义变更按该节升主版本。服务端的已知差距见 §13。例外：KB-R2 的客户端只发单次 search 与 read，没有 R3.7 的跨 `score_space` 分组合并，也没有 R8、R9 的就绪探测、能力发现与兼容判定（CONTRACT-STATE §12）；开发者预览用 retrieve key 和样本数据，R1.3 的用户级凭据签发没有实施（#992、KB-C1-03）。
+> **版本**：契约 v1（报文字段 `protocol_version: 1`），文档修订 r12 · **日期**：2026-11-09 · **作者**：David Xu
 > **Issue**：#1011（KB-CT-02a），阶段 #1000；探测依据 iDoris-ai/WeKnora#5。
 > **依据**：任务方案 v2.1（方案全文见 #986 第一条评论）。每条规则后方括号里是来源：决策 `[D1]`–`[D8]`（方案 §1），或任务条目与方案章节（如 `[KB-C1-04]`、`[KB-C1-01b-b]`、`[方案 §4]`）。
 > `[新设]` 表示本文新设计、在决策与方案里都找不到依据的规则；与其他标签并列（如 `[D1+新设]`）时，表示在该依据之上新增的部分。所有 `[新设]` 已随 #1044 及后续修订评审合入（§12 #15）。
@@ -28,7 +28,7 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
 
 ### 0.3 变更规则
 - **语义变更升主版本**：改字段含义、改范围或 stale 判定、改某个错误码的 `retryable`、删字段、新增或删除错误码（错误码是闭集，客户端按 `code` 分支）→ 新文件 `CONTRACT-READONLY-v2.md` 与 `protocol_version: 2`，v1 保留到双方迁移完成。
-- **兼容新增记为 v1 修订**（r1、r2…）：新增可选字段、新的 `details.reason` 取值、新的能力声明键，以及 `index_state`、`completeness`、就绪 `state` 的新取值。后者之所以算兼容新增，是因为 R6.2 为这些枚举规定了保守兜底。`partial_failures[].code` 是错误码闭集的子集，新增取值属于语义变更。客户端必须忽略未知字段与未知 `reason`。
+- **兼容新增记为 v1 修订**（r1、r2…）：新增可选字段、新的 `details.reason` 取值、新的能力声明键，以及 `index_state`、`completeness`、就绪 `state` 的新取值。后者之所以算兼容新增，是因为 R6.2 为这些枚举规定了保守兜底。`partial_failures[].code` 是错误码闭集的子集，新增取值属于语义变更。客户端必须忽略未知字段与未知 `reason`。ready 与 capabilities 也一样：客户端解析它们时必须忽略未知键（如 R8.2 的新就绪键）和未知枚举值（如 R9.2 `supported_operations` 里的新操作名），就绪 `state` 的未知值按 R6.2 兜底（r12）。这条约束的是接收侧（Agent24 的 `received` 接收模型与就绪、能力探测）；生产方的 wire 类型与 schema 可以保持封闭，新增的键与取值随启用它们的修订一并加入 schema。
 - **草案期**：v1 在评审通过、被 #1012 夹具引用、并且 iDoris-ai/WeKnora#7（矩阵）已合入之前处于草案期；这期间的语义修正记为 v1 修订（r1、r2…），不升主版本。KB-CT-01 PR② 的运行证据推翻某条语义时，也按这条处理。
 - 每次修订在文末变更记录写明日期、修订号、是否影响夹具；影响夹具的修订要同一 PR 更新 #1012 的清单。
 - schema 与本文冲突时，谁都不默认胜出：在同一 PR 里改正错误的一方。
@@ -61,6 +61,7 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
 - **R1.5** [D2] 服务端只信凭据里绑定的 principal。`direct` 模式（直接读 `X-External-User-ID`，`auth.go:580-594`）在集成模式下必须拒绝；改 principal Mode 不算撤权手段（矩阵 #11）。
 - **R1.6** [D2] 防重放要求凭据标识配有撤销或消费机制；只有 jti 字段不算防重放。上游 signed_token 无 jti、无单主体撤销（矩阵 #2、#11）。
 - **R1.7** [D2] 凭据不进 renderer、URL、普通日志，不跨 origin 发送（KB-HOST-01、KB-C1-02b）。
+- **R1.8** [新设，r11] C 还可以用来签发和撤销 UI 票据（`CONTRACT-UI-BRIDGE-v1` U2、U3.7）。这两个用途不算数据操作，不扩大 R2.7 的操作范围；签发时仍按 §2 计算 E，空集即拒（R2.3）。UI 票据换出的 session JWT 不是 C：它不能调用 search 与 read，C 也不能调用 UI 入口（UI-BRIDGE U1.3）（UI-BRIDGE 决定 #25，David 2026-11-08 确认）。UI 会话的 `ops` 里有没有 `candidate.review`、`candidate.approve`、`entry.withdraw`，取决于兑换它的 C 是否持有对应的写能力（R2.7）；具体由 WeKnora#147 与 UI-BRIDGE 的修订定稿，本条只写这层依赖（r12）。
 - **差距**：上游 principal 不参与 KB ACL，不进审计，且决定会话、记忆、MCP OAuth、沙箱凭据归属（矩阵 #2）→ KB-C1-03；集成模式下关闭 direct、限制服务端签发入口 → KB-C1-03、KB-C1-01。
 
 ## 2. 范围语义
@@ -70,8 +71,23 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
 - **R2.3** [D2] **空交集拒绝**：Q 形状合法但 E 为空（包括 A 为空、C 为空集）时，整个请求返回 `forbidden`，`details.reason: "empty_scope"`，不执行检索、不计算 query embedding。示例见 §11.1。`operations.X` 为 `disabled` 时先按 R6.4 返回 `operation_disabled`，不进入本条。
 - **R2.4** [D2] **永不回写空数组**：任何一方在收窄后得到空集时，必须拒绝，不得把 `[]` 写进下游请求、凭据或配置。上游在多处把空列表当"全部"或"回退到默认"。
 - **R2.5** [D2+新设] **search 与 read 都必须带 `scope.knowledge_base_ids`**（就绪请求可选，见 R8.2）。Q 缺失、为 `[]` 或无法解析，一律返回 `invalid_request`；C 缺失或无法解析返回 `unauthorized`，`reason: "credential_invalid"`（C 为空集按 R2.2）。Q 与 A ∩ C 部分重叠时按交集执行，响应用 `effective_scope` 回报实际范围，不说明其余 ID 是不存在还是无权；`effective_scope` 比请求范围窄时，Tool 层必须标出"范围已被收窄"。
-- **R2.6** [新设] **越界资源与不存在不可区分**：这里的资源只指 `knowledge_id` 对应的文档。read 的目标文档必须落在 E 内；落在 E 之外时，返回与"不存在"完全相同的 `not_found`（同码、同 message、无 reason）。正在删除（deleting）、草稿（parse_status 为 draft，包括已发布后改回草稿的手工知识）与状态无法识别的文档视同不存在（r9、r10）。这些文档的 parse_status 都不是 completed 或 finalizing，没有构建，也就没有可服务分块（R5.1），所以 search 同样不会返回它们的任何分块（R3.9）；上游把手工知识改回草稿时会同时把 parse_status 写为 draft。**判定以知识行的 parse_status 为准**（r10）：元数据里的草稿状态不单独作为判据，read、search 与就绪用同一个字段，结果彼此一致。文档本身的判定（不存在、越界、正在删除、草稿、状态无法识别）对带与不带 `chunk_id` 的 read 都适用，一律返回 `not_found`，并且先于锚点与修订判定（R6.4，r10）；文档判定通过之后，`chunk_id` 指向的分块问题按锚点校验（R4.4），不走这条。search 结果永远不含 E 之外的资源。示例见 §11.2。
-- **R2.7** [D3/D4] v1 凭据的操作范围只含 search 与 read；下载原件、preview、`/files` 不在 v1 内（矩阵 #5、#6；谁可下载原件待决 #996）。集成模式不消费既存的组织共享与共享 Agent 授权（`internal/application/access/knowledgebase.go:120-154`）。
+- **R2.6** [新设] **越界资源与不存在不可区分**：这里的资源只指 `knowledge_id` 对应的文档。read 的目标文档必须落在 E 内；落在 E 之外时，返回与"不存在"完全相同的 `not_found`（同码、同 message、无 reason）。正在删除（deleting）、草稿（parse_status 为 draft，包括已发布后改回草稿的手工知识）与状态无法识别的文档视同不存在（r9、r10）。这些文档的 parse_status 都不是 completed 或 finalizing，没有构建，也就没有可服务分块（R5.1），所以 search 同样不会返回它们的任何分块（R3.9）；上游把手工知识改回草稿时会同时把 parse_status 写为 draft。**判定以知识行的 parse_status 为准**（r10）：元数据里的草稿状态不单独作为判据，read、search 与就绪用同一个字段，结果彼此一致。文档本身的判定（不存在、越界、正在删除、草稿、状态无法识别）对带与不带 `chunk_id` 的 read 都适用，一律返回 `not_found`，并且先于锚点与修订判定（R6.4，r10）；文档判定通过之后，`chunk_id` 指向的分块问题按锚点校验（R4.4），不走这条。search 结果永远不含 E 之外的资源。示例见 §11.2。写操作的目标同样适用这条：job、批准记录与 ContextPack 对调用者不可见时（不存在、在 E 外或按 OPS-v2 W1.9 ③(b) 所列的其他情形），回应与「不存在」完全相同（CONTRACT-OPS-v2 I1、W1.9 ③(b)，r12）。
+- **R2.7** [D3/D4+新设] 凭据的操作范围是一份可以按加法扩展的清单（r12，WeKnora#135）。读操作是 search 与 read，对应凭据能力值 `retrieve`，所有凭据都必须带。写操作类按 CONTRACT-OPS-v2 §2，本修订列入 `candidate.propose`、`candidate.review`、`candidate.approve`、`entry.withdraw`，分别对应能力值 `kb_candidate_propose`、`kb_candidate_review`、`kb_candidate_approve`、`kb_entry_withdraw`；操作类不在凭据的操作范围内时返回 `forbidden/operation_not_allowed`（OPS-v2 W1.9 ③(a)）。写操作的数据范围按 R2.1 计算，与读用同一个解析器，不另设写库列表；但凭据的库列表为空，或凭据是全权限 key（上游 FullAccess）时，写的 E 为空，不按「全部库」处理（同 R2.8 的 UI 入口），按 R2.3 拒绝。用户凭据（R1.3）签 `retrieve` 与 `kb_candidate_propose`，不含 `ingest.*`，「用户不直接写」由范围保证。全权限 key（上游 FullAccess）不隐含任何写操作类，写操作只认凭据上列出的能力值。下载原件、preview、`/files` 不在 v1 内（矩阵 #5、#6；谁可下载原件待决 #996）。集成模式不消费既存的组织共享与共享 Agent 授权（`internal/application/access/knowledgebase.go:120-154`）。UI 会话的范围分两个维度，规定见 R2.8：它的**数据范围**（知识库集合）是 C 的子集；它的**操作清单**（`ops`）是 R2.8 列出的一张独立的只读展示清单，不是 search、read 这些操作名的子集；写类 `ops` 不在 R2.8 内，见 R1.8（r12）。
+- **R2.8** [新设，r11] **UI 只读展示操作**（UI-BRIDGE 决定 #25，David 2026-11-08 确认，证据裁决 R0 一致）。UI session JWT 的只读展示 `ops` 只能从下面五类里取，这是上限（r12 起，写类 `ops` 见 R1.8，以 UI-BRIDGE 定稿为准）：
+  - 知识库列表与详情；
+  - 文档列表与详情（不含下载原件、preview、`/files`，同 R2.7）；
+  - 分块列表；
+  - wiki 页列表与读取；
+  - 标签列表。
+
+  写入、管理、聊天、Agent、记忆类接口一律不在这份清单内；写操作类按 CONTRACT-OPS-v2（iDoris-ai/WeKnora#135），UI 会话的 `ops` 能否含 `candidate.review`、`candidate.approve`、`entry.withdraw` 见 R1.8（r12）。服务端对每个 UI 入口：
+  - **自己计算 E**，不沿用上游 API key 的语义。E 只取本租户的知识库，剔除组织共享与共享 Agent 授权（同 R2.7）；白名单为空或 E 为空时返回 `forbidden/empty_scope`，绝不当作「全部」（R2.2–R2.4）。
+  - 单个资源落在 E 外时，回应与「不存在」完全相同（同 R2.6）。
+  - **列表类入口只返回 E 内的条目**（知识库、文档、分块、wiki 页、标签列表都是）。总数、分页游标和聚合（如标签计数）也只按 E 计算，不透露 E 外知识库的存在、名称或数量。
+  - 文档可见性同 R2.6：deleting、draft 与状态无法识别的文档，在 UI 的文档列表与详情里也视同不存在（以知识行的 parse_status 为准）。分块列表只给可服务分块（R5.1），与 search、read 一致。
+  - **首版只放行页面实际调用的入口**，按方法加路径逐条列在 WeKnora 侧的实现 PR 与 `docs/agent24/` 里。五类是上限，不是必须全部开放。
+
+  UI 会话的票据、JWT、校验与撤销规则见 UI-BRIDGE U2–U3。
 - **证据与差距**：
   - 上游空白名单 = 全租户：`AllowsKnowledgeBase` / `AllowsKnowledgeBases` 遇空列表返回 true（矩阵 #1，`internal/types/tenant_api_key.go:328-330`、`:345-347`）；`apiKeyAny()`（定义在 `internal/router/rbac.go:226-228`）对任何有效 key 放行（`internal/middleware/api_key_gate.go:149-151`）。
   - hybrid-search 的 `knowledge_base_ids` 为空时回退到路径里的 KB（`internal/application/service/knowledgebase_search.go:134-137`；参数说明见 `internal/types/search.go:244-247`），是 R2.4 的直接风险点。
@@ -137,7 +153,7 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
 
 ## 6. 错误分类
 
-- **R6.1** [KB-C1-01c①+新设] **信封**：集成端点输出独立的字符串码信封 `{"error": {"code", "message", "hint"?, "details": {"retryable", "request_id", "generation", "reason"?, ...}}}`（`reason` 是否出现以 §6 为准），与 Agent24 现有信封同形。`request_id` 与 `generation` 只在三种情形下可以为 `null`：请求体无法解析时（`invalid_request`）；请求体能解析，但 `request_id` 或 `generation` 本身缺失或不合法时（`invalid_request`，无法回显的那一项为 `null`；`protocol_version` 先判，所以这时也可能是 `unsupported_protocol_version`）；以及按判定顺序（R6.4）在解析请求体之前就失败的 `unauthorized`、`internal`。其余情形必须回显。上游信封不同：`code` 是整数（`internal/errors/errors.go:9` 的 `ErrorCode int`，AppError 见 `:56-61`），没有 `hint`，`details` 里也没有 `retryable`、`request_id`、`generation`，外层还有 `success: false`（`internal/middleware/error_handler.go:23-43`）。上游前端依赖现有信封，所以不改它，只在集成端点另出（KB-C1-01c ①）。
+- **R6.1** [KB-C1-01c①+新设] **信封**：集成端点输出独立的字符串码信封 `{"error": {"code", "message", "hint"?, "details": {"retryable", "request_id", "generation", "reason"?, ...}}}`（`reason` 是否出现以 §6 为准），与 Agent24 现有信封同形。`request_id` 与 `generation` 只在三种情形下可以为 `null`：请求体无法解析时（`invalid_request`）；请求体能解析，但 `request_id` 或 `generation` 本身缺失或不合法时（`invalid_request`，无法回显的那一项为 `null`；`protocol_version` 先判，所以这时也可能是 `unsupported_protocol_version`）；以及按判定顺序（R6.4）在解析请求体之前就失败的 `unauthorized`、`internal`。此外，UI 会话发出的写请求（CONTRACT-OPS-v2 W1.4、W1.6）不带 `generation`，它的任何错误都回显 `generation: null`（OPS-v2 I1，r12）。其余情形必须回显。上游信封不同：`code` 是整数（`internal/errors/errors.go:9` 的 `ErrorCode int`，AppError 见 `:56-61`），没有 `hint`，`details` 里也没有 `retryable`、`request_id`、`generation`，外层还有 `success: false`（`internal/middleware/error_handler.go:23-43`）。上游前端依赖现有信封，所以不改它，只在集成端点另出（KB-C1-01c ①）。
 - **R6.2** [KB-C1-01c①+新设] `code` 是闭集（`partial_failures[].code` 是它的子集），**客户端按 `code` 分支，不按 HTTP 状态分支**，HTTP 状态是建议映射。**未知值兜底**：未知 `code`（含 `partial_failures[].code`）按 `internal` 分支，是否重试以该项自带的 `retryable` 为准，没有 `retryable` 就不重试；未知 `index_state` 按 `stale`；未知 `completeness` 按 `partial`；未知就绪 `state` 按 `not_ready`。这与 `protocol/openapi.yaml` 的开放枚举约定不同，是有意为之：未知错误码可能出自更严格的拒绝，不能按 HTTP 状态猜成可重试。
 - **R6.3** [KB-C1-01c①] `message` 是固定的通用文本，不得含内部错误原文、query、正文、凭据或资源是否存在的提示。上游把 `err.Error()` 原样返回（矩阵 #3，`internal/handler/knowledgebase.go:366-372`）→ KB-C1-01c ①。
 - **R6.4** [新设] **服务端判定顺序**：凭据（`unauthorized`）→ 请求形状（`invalid_request`）→ 操作是否关闭（`forbidden`，`reason: "operation_disabled"`，§12 #20）→ 计算 E（`forbidden`；search 的 `mixed_score_space` 在 E 之后判定）→ 文档（`knowledge_id`）存在且在 E 内（否则 `not_found`；正在删除、草稿与状态无法识别的文档视同不存在，R2.6，r10）→ 锚点与修订（`stale`）→ 执行（`timeout` / `unavailable` / partial）。由此：
@@ -146,7 +162,7 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
   - 带 `chunk_id` 时锚点不成立（不在当前可服务集合里：不存在、已删除、属于其他文档含 E 外文档、文档没有构建、已禁用、非 `text`），返回 `stale`（`anchor_missing`），彼此不可区分；锚点成立但 `content_tag` 不同，返回不带 `reason` 的 `stale`（R4.4，r9）；
   - 不带 `chunk_id`、没有构建且未带 `expected_revision`，返回 `unavailable`（`index_pending` / `index_failed`，R4.4）；
   - 服务端不支持请求的 `protocol_version`：`invalid_request`，`reason: "unsupported_protocol_version"`，`details.supported` 列出支持的版本。`protocol_version` 是请求形状一步的第一项，先于其余形状检查；`request_id`、`generation` 能回显就回显，不能则为 `null`（R6.1）；
-  - 请求形状通过后、计算 E 之前，先判对应操作是否被关闭：`operations.search` / `operations.read` 为 `disabled` 时返回 `forbidden`，`reason: "operation_disabled"`（不可重试），优先于 `empty_scope`，也先于 `operation_not_allowed`（凭据不允许此操作，R2.7）（§12 #20）。
+  - 「操作被关闭」按 R8.2 的就绪键判定，操作与就绪键的对应见 CONTRACT-OPS-v2 W1.4（如 `candidate.*`、`entry.withdraw` → `operations.candidate`，r12）。请求形状通过后、计算 E 之前，先判对应操作是否被关闭：`operations.search` / `operations.read` 为 `disabled` 时返回 `forbidden`，`reason: "operation_disabled"`（不可重试），优先于 `empty_scope`，也先于 `operation_not_allowed`（凭据不允许此操作，R2.7）（§12 #20）。
 
 | code | 建议 HTTP | retryable | 含义与 `details` |
 |---|---|---|---|
@@ -160,6 +176,7 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
 | `internal` | 500 | false | `reason` 禁止。服务端意外故障；客户端遇到未知 `code` 也按此处理。**补充项**，见 §12 |
 | `cancelled` | 不上线 | false | **只出现在客户端本地**（§7）：中止的请求没有响应，服务端不会发出它；#1012 的线上错误 schema 不收录。`details` 另带 `current_generation` |
 
+- 上表对各 `code` 的 `reason` 约束（如 `invalid_request`「其余情况不带」、`stale` 只带 `anchor_missing`）只约束只读操作。写操作按 CONTRACT-OPS-v2 §6 携带新增的 `reason`（按 §0.3 属兼容新增，客户端忽略未知 `reason`）；`not_found` 仍然禁止带 `reason`（OPS-v2 I1，r12）。
 - **R6.5** [D1+新设] `partial` 不是错误码：它是 search 成功响应的 `completeness`（R3.4）。
 - **R6.6** [D1+新设] 重试一律是新请求（新 `request_id`、当前 `generation`），计入同一总预算。`retryable: false` 指不能用同一凭据、同一请求原样重发；换新凭据后发新请求不算自动重试。
 
@@ -177,7 +194,7 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
 ## 8. 就绪
 
 - **R8.1** [KB-C1-01b-b/D8] **health ≠ ready**：无凭据的存活检查用 `/health`，只表示进程存活，不带业务含义。上游 `/health` 写死返回 ok（矩阵 #9，`internal/router/router.go:145-147`）。Lite 的启动握手属于 KB-LITE-01a，不在本文范围。
-- **R8.2** [KB-C1-01b-b/D8+新设] 就绪探针要求凭据，`scope` 可选。不带 scope：只返回 `live`（进程存活，布尔）与 `operations`：`search`、`read`、`ingest` 各有 `state`（`ready` / `not_ready` / `disabled`）与可选 `reason`；`operations` 只反映基础设施（存储、向量库、需要时的 embedding 模型），不依赖任何 KB。只读 v1 下 `ingest` 为 `disabled`。带 scope：另返回 `knowledge_bases`（R8.4）。
+- **R8.2** [KB-C1-01b-b/D8+新设] 就绪探针要求凭据，`scope` 可选。不带 scope：只返回 `live`（进程存活，布尔）与 `operations`：`search`、`read`、`ingest` 各有 `state`（`ready` / `not_ready` / `disabled`）与可选 `reason`；`operations` 只反映基础设施（存储、向量库、需要时的 embedding 模型），不依赖任何 KB。只读 v1 下 `ingest` 为 `disabled`。`operations` 另可带 `candidate`（`state` 为 `ready` / `not_ready` / `disabled`，可带 `reason`；r12，WeKnora#135）：它只反映服务端是否启用候选功能、依赖是否健康，不反映凭据有没有对应能力（凭据缺能力按 R2.7 返回 `operation_not_allowed`）。`disabled`：功能未启用或写入口尚未放开（不可重试）；`not_ready`：存储或数据库依赖不可用（可重试）；`ready`：以上都正常。服务端在 KB-SOP-02（WeKnora#146）启用之后才给出这个键，schema 随之加入；此前响应与 schema 都不带它。按 KB 的 `knowledge_bases[]`（R8.4）不带 `candidate`。带 scope：另返回 `knowledge_bases`（R8.4）。
   **两层关系**：`operations.X` 为 `ready` 只说明基础设施能服务 X；某个 KB 能否服务 X 看它自己的状态。`operations.X` 不是 `ready` 时，所有 KB 的 X 也都不是 `ready`；反之不成立（如 §11.7 里 `operations.search` 为 `ready` 而 `kb-b` 为 `not_ready`）。
 - **R8.3** [KB-C1-01b-b] search 就绪只取决于检索所需的存储、向量库与（需要时）query embedding 模型，不依赖 chat、docreader 或默认 KB，避免与初始化互相等待。
 - **R8.4** [KB-C1-01b-b+新设] **按 KB 就绪**：带 `scope.knowledge_base_ids` 时按 §2 计算 E（规则相同，E 为空返回 `forbidden`）；响应 `knowledge_bases[]` 每项为 `{ "knowledge_base_id", "score_space", "search": { "state", "reason"? }, "read": { "state", "reason"? } }`，只列 E 内的 KB，范围外的 ID 直接省略，不区分不存在与无权。**聚合**：正在删除（deleting）、草稿（draft）与状态无法识别的文档在下列判定中一律不计入（r9、r10）。某 KB 的 search 为 `ready`，当且仅当 `operations.search` 为 `ready`（R8.2），并且满足以下之一：(i) KB 为空（还没有任何文档；正在删除、草稿与状态无法识别的文档不计入，r9、r10）；(ii) KB 内至少一个文档有构建且可服务分块集合非空（R5.1，r9）。read 同理，看 `operations.read`。不为 `ready` 时，按下面的顺序取第一个满足的 `reason`：`operations.X` 为 `disabled`（被关闭，不是故障）→ `operation_disabled`（不可重试，§12 #19）；基础设施不可用 → `dependency`（可重试）；没有文档有构建、且至少一个文档在构建中（pending / processing）→ `index_building`（可重试）；没有文档有构建、也没有在构建中的文档（全部 failed 或 cancelled，r9）→ `index_failed`（不可重试）；有构建但可服务集合都为空（如 FAQ 类 KB、text 分块全部禁用，R3.8）→ `unsupported_kb_type`（不可重试）。示例见 §11.7。`operations.X` 为 `disabled` 时，KB 级 X 的 `state` 为 `not_ready`、`reason` 为 `operation_disabled`，`operation_disabled` 也只在这时出现；`dependency` 当且仅当 `operations.X` 为 `not_ready` 时出现。
@@ -187,7 +204,7 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
 ## 9. 能力发现
 
 - **R9.1** [D8] 能力发现扩展 `/system/capabilities`：在其 `data` 层现有的 `edition`、`capabilities` 之外新增 `integration` 对象（data 结构见 `internal/handler/deployment_capabilities.go:29-39`；外层是 `{code, msg, data}`，见 `:127-133`）。
-- **R9.2** [D8+新设] `integration.agent24_knowledge` 至少包含：`protocol_versions`（支持的契约主版本列表）、`mode`（`integration` / `standalone`）、`supported_operations`（声明支持的操作，与就绪里的 `operations` 对象区分）、`server_version`（服务端版本，满足 R9.5）、`limits`（R3.3、R4.5 的上限）。
+- **R9.2** [D8+新设] `integration.agent24_knowledge` 至少包含：`protocol_versions`（支持的契约主版本列表）、`mode`（`integration` / `standalone`）、`supported_operations`（声明支持的操作，与就绪里的 `operations` 对象区分；服务端启用写操作后可以出现 R2.7 的写操作类名，schema 随启用一并加入，客户端遇到未知值必须忽略，r12）、`server_version`（服务端版本，满足 R9.5）、`limits`（R3.3、R4.5 的上限）。
 - **R9.3** [D8] 能力声明只说明"支持什么"，**不说明依赖是否健康或业务是否就绪**；就绪只看 §8。集成模式下声明必须如实反映已禁用的路由（KB-C1-01）。
 - **R9.4** [D8+新设] **兼容判定**：缺少 `agent24_knowledge` 声明、`mode` 不是 `integration`，或双方没有共同的主版本时，客户端把该 profile 视为不兼容，不连接，也不回退到未版本化的上游接口。有共同版本时取最高的那个。
 - **R9.5** [D8] retrieve 级凭据必须能读到能力声明和服务端版本。上游 `/system/capabilities` 任意 key 可读，但 `/system/info` 要 manage_vector_stores 或 full access（矩阵 #7、#8，`internal/router/routes_auth_tenant.go:252-255`）→ KB-C1-01b-a。
@@ -369,6 +386,8 @@ Provider 的本地结果（同时写宿主侧日志；服务端只有观察到�
 | 18 | **#1012 的取消夹具**由三部分组成：一条线上成功响应、一条 Provider 本地 `cancelled` 结果、一条"迟到响应被丢弃"的测试用例；不进 Go 端编码测试 | 按本文 | #1012 |
 | 19 | **`operations.X` 为 `disabled` 时，KB 级 X 的 `reason` 取什么**（R8.2、R8.4）：盲选结论分歧 | KB 级 X 为 `not_ready`，`reason` 为新增的 `operation_disabled`（不可重试），排在 R8.4 原因顺序第一位（兼容新增） | 已定（David，2026-10-17） |
 | 20 | **`operations.search` / `operations.read` 为 `disabled` 时，search / read 请求本身返回什么错误码**：契约未定义 | 对应请求返回 `forbidden`，`reason: "operation_disabled"`（不可重试，兼容新增）；判定位置在请求形状之后、计算 E 之前，优先于 `empty_scope`（R6.4） | 已定（David 确认，见 [#1012 评论](https://github.com/iDoris-ai/Agent24/issues/1012#issuecomment-6239062330)；Grok、Opus 盲选一致，2026-10-18） |
+| 21 | **UI 会话的操作清单（`ops`）与 C 的数据操作范围是什么关系**（UI-BRIDGE 决定 #25，原阻塞 KB-C2-01） | 数据范围是 C 的子集；`ops` 是 R2.8 的独立只读展示清单，以五类为上限，首版只放行实际用到的入口；C 可签发与撤销 UI 票据，不计入数据操作范围（R1.8） | 已定（David，2026-11-08；证据裁决 R0 一致，三方选同一项） |
+| 22 | **写操作类在凭据上怎么表示**（WeKnora#135，OPS-v2 I1 要求的 READONLY 修订） | 上游能力枚举加 4 个 fork 能力值，与写操作类一一对应；写与读用同一个解析器计算 E，再与 A 的授予（OPS-v2 W2.5）求交集，但库列表为空或 FullAccess 时写的 E 为空；用户凭据签 `retrieve` 与 `kb_candidate_propose`，不签 `ingest`；FullAccess 不隐含写能力（R2.7、R8.2、R9.2） | 已定（证据裁决 R0 一致，三方选同一项，2026-11-09；记录 decisions/2026-11-09-135-scope-repr） |
 
 ## 13. 已知差距（r9）
 
@@ -395,3 +414,5 @@ r9 用由内容派生的标识换掉了"可证明的构建归属"（KB-C1-01c �
 - r9（2026-10-21）：KB-C1-01c ③ 改用内容寻址（WeKnora#38，设计经 Grok 与 Codex 两轮双审，David 选定并确认）。新增 `content_tag`（分块完整正文的带密钥摘要），出现在 hit.revision、segment、单分块 `expected_revision` 与 stale 详情（`current_content_tag`）；"活动构建"改为"有构建时的可服务分块集合"，`index_build_id`、`source_revision` 改为由内容派生的带密钥摘要（R5.1）；单分块 read 先判可服务、再比 `content_tag`，其他分块增删不影响（R4.3、R4.4、R6.4）；`chunk_revision` 只作参考（R5.2）；snippet 与 `content_tag` 同源（R3.8、R3.9）；文档级翻页每页同快照重算（R4.5）；引用只来自单分块 read（R4.7）；cancelled 不可服务、文档级 read 为 `index_failed`，deleting 视同已删除（R2.6、R4.4、R8.4）；就绪按"有构建"重写判定（R8.4）；审计不记 `content_tag`（R10.1、R10.3）；locator 恒为 `valid: false`（R3.10）；新增 §13 已知差距。PR 双审第 1、2 轮补充：R5.1 写明各标识的输入组成与 HMAC 编码；R3.5、R8.4 不计入 deleting；单分块 `expected_revision` 的 `chunk_revision` 允许 null；夹具新增 read.stale-chunk-overwritten、read.document-empty。依 §0.3 草案期条款，评审通过前不升主版本（`protocol_version` 仍为 1）。影响夹具：是（同一 PR 更新清单与 schema）。
 - r10（2026-10-22）：草稿（draft，含已发布后改回草稿的手工知识）与状态无法识别的文档视同不存在：read 为 `not_found`，就绪与 partial 判定不计入（R2.6、R3.5、R8.4、§6），与 deleting 一致；文档判定对带与不带 `chunk_id` 的 read 都先于锚点与修订（R2.6、R4.4、R6.4）；这些文档没有可服务分块，search 也不返回（R2.6）；草稿以知识行的 parse_status 为准，元数据里的草稿状态不单独作判据；§13 记下发布与改回草稿的上游竞态（parse_status 被写回 completed 时文档照常可服务）；David 定（WeKnora#66 评审闸门）。依 §0.3 草案期条款不升主版本。影响夹具：清单 `contract_revision` 改为 r10，夹具内容不变。
 - 2026-11-01（修订号不变）：只改状态行，写明已实施、草案期结束。语义不变，影响夹具：否。
+- r11（2026-11-08）：UI-BRIDGE 决定 #25 定案（David 确认，证据裁决 R0 一致）。新增 R1.8：C 可签发与撤销 UI 票据，不计入数据操作范围。R2.7 补一句，说明 UI 会话的数据范围与操作清单是两个维度。新增 R2.8：UI 只读展示操作的上限清单与每个入口的义务（自算 E、剔除共享、空集拒绝、越界等同不存在、列表与计数只按 E、文档可见性同 R2.6、分块列表只给可服务分块、首版只放行实际用到的入口）。§12 增加 #21。search、read、ready 的报文与语义都不变；影响夹具：清单 `contract_revision` 改为 r11，夹具内容不变。
+- r12（2026-11-09）：WeKnora#135 定案（证据裁决 R0 一致，§12 #22），按 CONTRACT-OPS-v2 I1 为写操作做 READONLY 的配套修订，条目取自 #135 设计稿 §7。R2.7 改为可加法扩展的操作范围：读操作对应 `retrieve`；写操作类 `candidate.propose`、`candidate.review`、`candidate.approve`、`entry.withdraw` 对应 4 个能力值；写与读用同一个解析器计算 E，库列表为空或 FullAccess 时写的 E 为空、按空集拒绝；用户凭据签 `retrieve` 与 `kb_candidate_propose`，不含 `ingest.*`；FullAccess 不隐含写操作类。R8.2 新增就绪键 `operations.candidate` 的语义（只反映服务端，不反映凭据；按 KB 的就绪不带），随 WeKnora#146 启用。R9.2 的 `supported_operations` 启用后可出现写操作类名。§0.3 写明客户端解析 ready、capabilities 时忽略未知键与未知枚举值，这条约束的是接收侧（`received` 模型与探测），生产方的 wire 类型与 schema 可以保持封闭。R2.6 的「越界与不存在不可区分」扩到 job、批准记录与 ContextPack。R6.4 的「操作被关闭」按就绪键判定（对应关系见 OPS-v2 W1.4）。§6 表的 `reason` 约束只管只读操作，`not_found` 仍禁止 `reason`。R6.1 加入 UI 会话写请求的错误回显 `generation: null`。R1.8 写明 UI 会话的写操作 `ops` 取决于 C 的能力（WeKnora#147、UI-BRIDGE 定稿）。search、read、ready 的现有报文与语义都不变，新键与新取值随 #146 进 schema；影响夹具：清单 `contract_revision` 改为 r12，夹具内容不变。 R2.7 末句与 R2.8 开头改为只说只读展示 `ops` 的上限，写类 `ops` 指向 R1.8（#1678 PR-Daemon 建议：原说法与 R1.8 相互矛盾）。

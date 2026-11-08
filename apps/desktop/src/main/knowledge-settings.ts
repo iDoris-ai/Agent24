@@ -20,6 +20,7 @@ import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import type { HostResult, KnowledgeHost } from './knowledge-host'
+import { isPlainHostname } from './knowledge-hostname'
 import type { KnowledgeLoginStore } from './knowledge-logins'
 import type { KnowledgeSettingsResult, KnowledgeStatus } from '../shared/ipc-types'
 
@@ -44,7 +45,8 @@ type SettingsResult = KnowledgeSettingsResult
 const EMPTY: KnowledgeSettings = { enabled: false, endpoint: '', knowledgeBaseIds: [] }
 
 /** The daemon's own rule (knowledge_host.rs `endpoint_of`): `https`, or `http`
- * to a loopback IP literal; no user info, query or fragment. */
+ * to a loopback IP literal; no user info, query or fragment. Stricter on the
+ * host name (isPlainHostname, #1643 PR-Daemon C). */
 export function validEndpoint(value: unknown): value is string {
   if (typeof value !== 'string') return false
   let url: URL
@@ -55,7 +57,7 @@ export function validEndpoint(value: unknown): value is string {
   }
   const loopback = url.hostname === '[::1]' || /^127(\.\d{1,3}){3}$/.test(url.hostname)
   const scheme = url.protocol === 'https:' || (url.protocol === 'http:' && loopback)
-  return scheme && url.username === '' && url.password === '' && url.search === '' && url.hash === ''
+  return scheme && url.username === '' && url.password === '' && url.search === '' && url.hash === '' && isPlainHostname(url.hostname) && url.port !== '0'
 }
 
 export function validKnowledgeBaseIds(value: unknown): value is string[] {
@@ -119,6 +121,10 @@ export class KnowledgeController {
   private version = 0
   private saving: Promise<void> = Promise.resolve()
   private readonly nowSeconds: () => number
+  private readonly listeners = new Set<() => void>()
+  /** Bumped when a new key or endpoint is saved: possibly another principal,
+   * so the KnowledgeView must not carry the old page session over. */
+  private identity = 0
 
   constructor(
     private readonly host: KnowledgeHost,
@@ -137,6 +143,34 @@ export class KnowledgeController {
       hasKey: this.key() !== null,
       active: this.bindingForRun() !== null,
     }
+  }
+
+  /** Called whenever the settings in effect may have changed (KB-C2-03: the
+   * KnowledgeView ends with its binding). Returns the unsubscribe. */
+  onChange(listener: () => void): () => void {
+    this.listeners.add(listener)
+    return () => { this.listeners.delete(listener) }
+  }
+
+  /** What a KnowledgeView instance stands for: the binding as it is now
+   * (endpoint and key included), or none while Off or incomplete. A different
+   * value means a new instance in a new partition (KB-C2-03, U4.1/U4.8). */
+  viewBinding(): string | null {
+    return this.settings.enabled && this.complete() ? `${KNOWLEDGE_BINDING}#${this.identity}` : null
+  }
+
+  /**
+   * KB-C2-04a (design §6, M2 near-equivalents): what the UI session of the
+   * view binding `binding` may use now — C and the generation it stands for —
+   * or null once that is not the binding in effect
+   * (Off, incomplete, another key or endpoint). An older instance never gets
+   * a newer key.
+   */
+  uiSessionInputs(binding: string): { credential: string; generation: number } | null {
+    if (this.viewBinding() !== binding) return null
+    const credential = this.key()
+    // U7.1: generations are 1..2^53-1; identity starts at 0 on every launch.
+    return credential === null ? null : { credential, generation: this.identity + 1 }
   }
 
   /** The binding a new run is to name, or none while Off or incomplete. */
@@ -163,6 +197,9 @@ export class KnowledgeController {
         if (typeof apiKey === 'string') {
           // The login names the endpoint it is for (`key()`).
           await this.logins.put(KNOWLEDGE_BINDING, { profileId: endpoint, material: apiKey, unusable: false, temporary: false })
+          // Counted where the key is written, so a change that is overtaken
+          // after this point still moves the view to a new partition.
+          this.identity++
         }
         try {
           await this.store.save(next)
@@ -178,6 +215,7 @@ export class KnowledgeController {
       return { ok: false, reason: 'not_saved' }
     }
     if (overtaken()) return { ok: false, reason: 'not_saved' }
+    if (next.endpoint !== this.settings.endpoint) this.identity++
     this.settings = next
     return this.apply()
   }
@@ -207,6 +245,13 @@ export class KnowledgeController {
    * its endpoint and a fresh C, or dropped. Also run once at startup. */
   async apply(): Promise<SettingsResult> {
     this.pushedUntil = 0
+    for (const listener of this.listeners) {
+      try {
+        listener()
+      } catch (error) {
+        console.warn('[knowledge] settings listener failed', error)
+      }
+    }
     if (!this.settings.enabled || !this.complete()) {
       return asResult(await this.host.deactivate(KNOWLEDGE_BINDING))
     }

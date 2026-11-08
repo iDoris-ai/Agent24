@@ -63,19 +63,19 @@ describe('capability routing', () => {
       const { open } = useContext(CapabilitiesContext)
       const { route } = useCapabilityRoute()
       return <>
-        {['settings/general', 'settings/activity', 'settings/unknown', 'capabilities'].map(id =>
+        {['settings/general', 'settings/activity', 'settings/connections', 'settings/unknown', 'capabilities'].map(id =>
           <button key={id} onClick={() => open(id, 'switcher')}>{id}</button>)}
         <output aria-label="Route">{JSON.stringify(route)}</output>
       </>
     }
     window.agent24 = { backendProxy: vi.fn().mockResolvedValue({ ok: false }) } as unknown as Window['agent24']
     render(<CapabilitiesProvider><Actions /></CapabilitiesProvider>)
-    for (const [key, initialTab] of ['general', 'activity'].entries()) {
+    for (const [key, initialTab] of ['general', 'activity', 'connections'].entries()) {
       fireEvent.click(screen.getByRole('button', { name: `settings/${initialTab}` }))
       expect(screen.getByLabelText('Route')).toHaveTextContent(JSON.stringify({ kind: 'page', page: 'settings', initialTab, key: key + 1 }))
     }
     fireEvent.click(screen.getByRole('button', { name: 'settings/unknown' }))
-    expect(screen.getByLabelText('Route')).toHaveTextContent('"initialTab":"activity"')
+    expect(screen.getByLabelText('Route')).toHaveTextContent('"initialTab":"connections"')
     fireEvent.click(screen.getByRole('button', { name: 'capabilities' }))
     expect(screen.getByLabelText('Route')).toHaveTextContent(JSON.stringify({ kind: 'page', page: 'capabilities' }))
   })

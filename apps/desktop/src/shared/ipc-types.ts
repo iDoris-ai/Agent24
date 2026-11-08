@@ -113,6 +113,24 @@ export const IpcChannels = {
   KnowledgeStatus: 'knowledge:status',
   KnowledgeConfigure: 'knowledge:configure',
   KnowledgeSetEnabled: 'knowledge:set-enabled',
+  // KB-C2-03 (main/knowledge-view.ts): the KnowledgeView container. The page
+  // sends only where to draw it; the address, partition and policy are main's.
+  KnowledgeViewShow: 'knowledge-view:show',
+  KnowledgeViewBounds: 'knowledge-view:bounds',
+  KnowledgeViewHide: 'knowledge-view:hide',
+  KnowledgeViewReload: 'knowledge-view:reload',
+  KnowledgeViewState: 'knowledge-view:state',
+  // KB-C2-04b-1 (U7.2): one citation's plain text, or null to clear the strip.
+  KnowledgeViewCitation: 'knowledge-view:citation',
+  // KB-C2-04b-2 (U7.2): the confirmation dialog. null closes it.
+  KnowledgeViewConfirm: 'knowledge-view:confirm',
+  KnowledgeViewAnswer: 'knowledge-view:answer',
+  // The conversation's draft attachments. Changed is the full list, main → renderer.
+  KnowledgeDraftChanged: 'knowledge-draft:changed',
+  KnowledgeDraftList: 'knowledge-draft:list',
+  KnowledgeDraftRemove: 'knowledge-draft:remove',
+  // KB-SOP-01a (#1669): may this conversation become a knowledge entry (main asks the user).
+  KnowledgeEntryAdmit: 'knowledge-entry:admit',
 } as const
 
 /** T1-1/T1-2: the documents module as it is on disk now. A daemon reads
@@ -146,6 +164,41 @@ export interface KnowledgeConfigureInput {
   knowledgeBaseIds: string[]
   apiKey?: string
 }
+
+export type {
+  KnowledgeViewBounds,
+  KnowledgeViewFailure,
+  KnowledgeViewResult,
+  KnowledgeViewState,
+  KnowledgeViewTheme,
+} from './knowledge-view-types'
+
+/** Main → renderer. The three ids only: no revision fields (U7.2). null clears the strip. */
+export type KnowledgeViewCitation = {
+  title: string | null
+  text: string
+  ref: { knowledge_base_id: string; knowledge_id: string; chunk_id: string }
+} | null
+
+/** Main → renderer. null closes the dialog (U7.2). */
+export type KnowledgeViewConfirmAsk = {
+  id: string
+  count: number
+  titles: Array<string | null>
+} | null
+
+/** One draft attachment as the renderer sees it (U7.2). */
+export type KnowledgeDraftEntry = {
+  id: string
+  title: string | null
+  text: string
+  ref: { knowledge_base_id: string; knowledge_id: string; chunk_id: string }
+}
+
+/** KB-SOP-01a: the answer to "沉淀为知识条目" (main/knowledge-entry-ipc.ts). */
+export type KnowledgeEntryAdmission =
+  | { ok: true }
+  | { ok: false; reason: 'floor_missing' | 'restricted' | 'unknown' | 'too_many_runs' | 'not_confirmed' | 'not_found' | 'busy' | 'knowledge_off' }
 
 export type KnowledgeSettingsResult = { ok: true } | { ok: false; reason: 'invalid' | 'not_saved' | 'unavailable' }
 

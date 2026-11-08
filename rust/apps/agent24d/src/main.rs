@@ -118,6 +118,7 @@ mod scheduler_callback;
 mod scheduler_deliver;
 mod schedules;
 mod server;
+mod source_floor;
 
 const _: () = assert!(!migration_coordinator::ENABLED);
 mod timing_recorder;
