@@ -6,6 +6,10 @@ import {
   BRIDGE_BURST,
   BRIDGE_DEDUPE_LIMIT,
   BRIDGE_SOFT_LIMIT,
+  INTENT_ACTIVATION_MS,
+  INTENT_ADMISSION_POLL_MS,
+  INTENT_CONFIRM_MS,
+  INTENT_COOLDOWN_MS,
   KnowledgeBridge,
   newUlid,
   type BridgeArrival,
@@ -20,7 +24,12 @@ const ulid = (): string => {
   return ('01J9ZQ3V6R8XKQ4M2N5P7T' + n.padStart(4, '0')).slice(-26)
 }
 
-function setup(opts: { open?: boolean; generation?: number; citation?: NonNullable<ConstructorParameters<typeof KnowledgeBridge>[0]['citation']> } = {}) {
+function setup(opts: {
+  open?: boolean
+  generation?: number
+  citation?: NonNullable<ConstructorParameters<typeof KnowledgeBridge>[0]['citation']>
+  intent?: NonNullable<ConstructorParameters<typeof KnowledgeBridge>[0]['intent']>
+} = {}) {
   let now = 1_000
   const timers: Array<{ at: number; fn: () => void; handle: number }> = []
   let nextHandle = 0
@@ -39,6 +48,7 @@ function setup(opts: { open?: boolean; generation?: number; citation?: NonNullab
     log: (m) => logs.push(m),
     viewInstanceId: 'V'.repeat(22),
     ...(opts.citation ? { citation: opts.citation } : {}),
+    ...(opts.intent ? { intent: opts.intent } : {}),
   })
   bridge.newDocument(1)
   const arrive = (body: unknown, over: Partial<BridgeArrival> = {}): void => {
@@ -55,7 +65,7 @@ function setup(opts: { open?: boolean; generation?: number; citation?: NonNullab
       if (t.at <= now) { timers.splice(timers.indexOf(t), 1); t.fn() }
     }
   }
-  return { bridge, arrive, msg, sent, replies, last, logs, admission, closes: () => closes, advance, setNow: (n: number) => { now = n } }
+  return { bridge, arrive, msg, sent, replies, last, logs, admission, closes: () => closes, advance, setNow: (n: number) => { now = n }, time: () => now }
 }
 
 describe('newUlid', () => {
@@ -807,5 +817,401 @@ describe('citation, cancel, and the in-flight table (U7.2, U6.7, §9.3)', () => 
     expect(t.replies().filter((r) => r.in_reply_to === m.id).map((r) => r.payload)).toEqual([{ result: 'accepted' }])
     expect(c.shown).toEqual([])
     expect(t.closes()).toBe(0)
+  })
+})
+
+function intentHarness(initialActivated: number | null = 1_000) {
+  const base = citationHarness()
+  let activated: number | null = initialActivated
+  let room = 16
+  let allow = true
+  const attached: Array<Array<{ title: string | null; text: string; ref: { knowledge_base_id: string; knowledge_id: string; chunk_id: string } }>> = []
+  const confirms: Array<{ ask: { count: number; titles: Array<string | null> }; signal: AbortSignal }> = []
+  const pendingConfirm: Array<(value: 'confirmed' | 'declined' | 'unavailable') => void> = []
+  const intent = {
+    activatedAt: () => activated,
+    draftRoom: () => room,
+    confirm: (ask: { count: number; titles: Array<string | null> }, signal: AbortSignal) => {
+      confirms.push({ ask, signal })
+      return new Promise<'confirmed' | 'declined' | 'unavailable'>((resolve, reject) => {
+        const fail = (): void => reject(new DOMException('The operation was aborted.', 'AbortError'))
+        if (signal.aborted) { fail(); return }
+        signal.addEventListener('abort', fail)
+        pendingConfirm.push(resolve)
+      })
+    },
+    attach: (items: Array<{ title: string | null; text: string; ref: { knowledge_base_id: string; knowledge_id: string; chunk_id: string } }>) => {
+      attached.push(items.map((item) => ({ title: item.title, text: item.text, ref: { ...item.ref } })))
+      return allow
+    },
+  }
+  return {
+    ...base,
+    intent,
+    confirms,
+    pendingConfirm,
+    attached,
+    setActivated: (value: number | null) => { activated = value },
+    setRoom: (value: number) => { room = value },
+    setAllow: (value: boolean) => { allow = value },
+  }
+}
+
+function reader(h: { pending: Array<(value: ReadValue) => void> }) {
+  let n = 0
+  return async (value: ReadValue): Promise<void> => {
+    expect(h.pending.length).toBe(n + 1)
+    h.pending[n](value)
+    n += 1
+    await flush()
+  }
+}
+
+const cite = (chunk: string, kb = 'kb-1') => ({ ...REF, knowledge_base_id: kb, chunk_id: chunk })
+
+function wired(activated: number | null = 1_000) {
+  const h = intentHarness(activated)
+  const t = setup({ citation: h.citation, intent: h.intent })
+  return { h, t, read: reader(h) }
+}
+
+const forId = (t: ReturnType<typeof setup>, id: string) => t.replies().filter((r) => r.in_reply_to === id)
+
+describe('return_to_chat_intent (U7.2, U6.7, §9.3)', () => {
+  it('no activation, or activation older than 5s, is user_activation_required and takes no slot', () => {
+    const { h, t } = wired(null)
+    for (let i = 0; i < 5; i++) {
+      t.arrive(t.msg('return_to_chat_intent', { citations: [REF] }))
+      expect(t.last()?.payload).toEqual({ result: 'rejected', code: 'forbidden', reason: 'user_activation_required' })
+    }
+    expect(t.closes()).toBe(0)
+    t.arrive(t.msg('status', { state: 'ready' }))
+    expect(t.last()?.payload).toEqual({ result: 'done' })
+    h.setActivated(t.time() - INTENT_ACTIVATION_MS - 1)
+    t.arrive(t.msg('return_to_chat_intent', { citations: [REF] }))
+    expect(t.last()?.payload).toEqual({ result: 'rejected', code: 'forbidden', reason: 'user_activation_required' })
+    h.setActivated(t.time() - INTENT_ACTIVATION_MS)
+    t.arrive(t.msg('return_to_chat_intent', { citations: [] }))
+    expect(t.last()?.payload).toEqual({ result: 'accepted' })
+  })
+
+  it('no dialog could be shown (unavailable): not_ready, and no cooldown, since the user said nothing', async () => {
+    const { h, t } = wired()
+    const m = t.msg('return_to_chat_intent', { citations: [] })
+    t.arrive(m)
+    h.pendingConfirm[0]('unavailable')
+    await flush()
+    expect(forId(t, m.id).map((r) => r.payload)).toEqual([
+      { result: 'accepted' },
+      { result: 'rejected', code: 'unavailable', reason: 'not_ready' },
+    ])
+    h.setActivated(t.time())
+    const next = t.msg('return_to_chat_intent', { citations: [] })
+    t.arrive(next)
+    expect(forId(t, next.id).map((r) => r.payload)).toEqual([{ result: 'accepted' }])
+  })
+
+  it('a validation read that throws counts as internal for that item', async () => {
+    const { h, t } = wired()
+    let n = 0
+    const read = h.citation.read
+    h.citation.read = (g, r, s, v) => (n++ === 1 ? Promise.reject(new Error('boom')) : read(g, r, s, v))
+    const m = t.msg('return_to_chat_intent', { citations: [REF] })
+    t.arrive(m)
+    h.pending[0](okRead())
+    await flush()
+    h.pendingConfirm[0]('confirmed')
+    await flush()
+    await flush()
+    expect(forId(t, m.id).map((r) => r.payload)).toEqual([{ result: 'accepted' }, { result: 'done', code: 'internal' }])
+    expect(h.attached).toEqual([])
+  })
+
+  it('a decline starts a 30s cooldown, and the instant it ends is outside it', async () => {
+    const { h, t } = wired()
+    const m = t.msg('return_to_chat_intent', { citations: [] })
+    t.arrive(m)
+    h.pendingConfirm[0]('declined')
+    await flush()
+    expect(forId(t, m.id).map((r) => r.payload)).toEqual([
+      { result: 'accepted' },
+      { result: 'rejected', code: 'forbidden', reason: 'user_declined' },
+    ])
+    for (let i = 0; i < 5; i++) {
+      h.setActivated(t.time())
+      t.arrive(t.msg('return_to_chat_intent', { citations: [] }))
+      expect(t.last()?.payload).toEqual({ result: 'rejected', code: 'forbidden', reason: 'cooldown' })
+    }
+    expect(t.closes()).toBe(0)
+    t.advance(INTENT_COOLDOWN_MS - 1)
+    h.setActivated(t.time())
+    t.arrive(t.msg('return_to_chat_intent', { citations: [] }))
+    expect(t.last()?.payload).toEqual({ result: 'rejected', code: 'forbidden', reason: 'cooldown' })
+    t.advance(1)
+    h.setActivated(t.time())
+    t.arrive(t.msg('return_to_chat_intent', { citations: [] }))
+    expect(t.last()?.payload).toEqual({ result: 'accepted' })
+  })
+
+  it('more citations than draft room is attachment_limit and takes no slot; an equal count is accepted', () => {
+    const { h, t } = wired()
+    h.setRoom(1)
+    for (let i = 0; i < 5; i++) {
+      t.arrive(t.msg('return_to_chat_intent', { citations: [cite('a'), cite('b')] }))
+      expect(t.last()?.payload).toEqual({ result: 'rejected', code: 'invalid_request', reason: 'attachment_limit' })
+    }
+    expect(h.reads).toEqual([])
+    expect(h.attached).toEqual([])
+    expect(t.closes()).toBe(0)
+    t.arrive(t.msg('return_to_chat_intent', { citations: [cite('c')] }))
+    expect(t.last()?.payload).toEqual({ result: 'accepted' })
+  })
+
+  it('a second intent is ⑯ overloaded, is not remembered, and does not take a slot', () => {
+    const { t } = wired()
+    const first = t.msg('return_to_chat_intent', { citations: [REF] })
+    t.arrive(first)
+    expect(t.last()?.payload).toEqual({ result: 'accepted' })
+    const second = t.msg('return_to_chat_intent', { citations: [cite('c-2')] })
+    t.arrive(second)
+    expect(forId(t, second.id)[0].payload).toEqual({ result: 'rejected', code: 'unavailable', reason: 'overloaded', retry_after_ms: BRIDGE_BACKOFF_MS })
+    expect(t.logs.some((line) => line.includes('step=⑯') && line.includes('reason=overloaded') && line.includes(second.id))).toBe(true)
+    const alongside = t.msg('citation', REF)
+    t.arrive(alongside)
+    expect(t.last()?.payload).toEqual({ result: 'accepted' })
+    expect(t.last()?.in_reply_to).toBe(alongside.id)
+    t.arrive(t.msg('cancel', { target_id: first.id }))
+    t.arrive(second)
+    expect(forId(t, second.id).at(-1)?.payload).toEqual({ result: 'accepted' })
+  })
+
+  it('an intent in flight occupies one of the four slots', () => {
+    const { t } = wired()
+    t.arrive(t.msg('return_to_chat_intent', { citations: [REF] }))
+    for (let i = 0; i < 3; i++) {
+      t.arrive(t.msg('citation', REF))
+      expect(t.last()?.payload).toEqual({ result: 'accepted' })
+    }
+    const blocked = t.msg('citation', REF)
+    t.arrive(blocked)
+    expect(t.last()?.in_reply_to).toBe(blocked.id)
+    expect(t.last()?.payload).toEqual({ result: 'rejected', code: 'unavailable', reason: 'overloaded', retry_after_ms: BRIDGE_BACKOFF_MS })
+  })
+
+  it('title reads skip anything outside the visible set and pass the rest through plainTitle', async () => {
+    const { h, t, read } = wired()
+    t.arrive(t.msg('return_to_chat_intent', { citations: [cite('c-out', 'kb-other'), cite('c-in')] }))
+    expect(h.reads).toHaveLength(1)
+    await read(okRead('discarded', '  Hello\u0000  '))
+    expect(h.confirms[0].ask).toEqual({ count: 2, titles: [null, 'Hello'] })
+    expect(h.reads).toHaveLength(1)
+    expect(h.shown).toEqual([])
+  })
+
+  it('confirmation times out at 60s and not one millisecond earlier', async () => {
+    const { h, t } = wired()
+    const m = t.msg('return_to_chat_intent', { citations: [] })
+    t.arrive(m)
+    t.advance(INTENT_CONFIRM_MS - 1)
+    expect(h.confirms[0].signal.aborted).toBe(false)
+    expect(forId(t, m.id).map((r) => r.payload)).toEqual([{ result: 'accepted' }])
+    t.advance(1)
+    await flush()
+    expect(h.confirms[0].signal.aborted).toBe(true)
+    expect(t.last()?.payload).toEqual({ result: 'rejected', code: 'forbidden', reason: 'confirmation_timeout' })
+    expect(h.attached).toEqual([])
+    h.setActivated(t.time())
+    t.arrive(t.msg('return_to_chat_intent', { citations: [] }))
+    expect(t.last()?.payload).toEqual({ result: 'accepted' })
+  })
+
+  it('confirmed with every citation passing is done with no code, and attach is called once with that set', async () => {
+    const { h, t, read } = wired()
+    const a = cite('c-a')
+    const b = cite('c-b')
+    const m = t.msg('return_to_chat_intent', { citations: [a, b] })
+    t.arrive(m)
+    await read(okRead('old-a', 'Old A'))
+    await read(okRead('old-b', 'Old B'))
+    h.pendingConfirm[0]('confirmed')
+    await flush()
+    await read(okRead('body-a', 'Kept A'))
+    await read(okRead('body-b', 'Kept B'))
+    expect(h.attached).toEqual([[
+      { title: 'Kept A', text: 'body-a', ref: { knowledge_base_id: 'kb-1', knowledge_id: 'doc-1', chunk_id: 'c-a' } },
+      { title: 'Kept B', text: 'body-b', ref: { knowledge_base_id: 'kb-1', knowledge_id: 'doc-1', chunk_id: 'c-b' } },
+    ]])
+    expect(forId(t, m.id).map((r) => r.payload)).toEqual([{ result: 'accepted' }, { result: 'done' }])
+    expect(h.shown).toEqual([])
+  })
+
+  it('a partial pass is done with the first failure code and only the passing items', async () => {
+    const { h, t, read } = wired()
+    const m = t.msg('return_to_chat_intent', { citations: [cite('c-a'), cite('c-b')] })
+    t.arrive(m)
+    await read(okRead('old-a', 'A'))
+    await read(okRead('old-b', 'B'))
+    h.pendingConfirm[0]('confirmed')
+    await flush()
+    await read({ ok: false, code: 'not_found', reason: 'missing' })
+    await read(okRead('kept', 'Kept'))
+    expect(h.attached).toEqual([[
+      { title: 'Kept', text: 'kept', ref: { knowledge_base_id: 'kb-1', knowledge_id: 'doc-1', chunk_id: 'c-b' } },
+    ]])
+    expect(t.last()?.payload).toEqual({ result: 'done', code: 'not_found' })
+  })
+
+  it('when nothing passes, done carries the first failure code and attach is never called', async () => {
+    const { h, t, read } = wired()
+    const m = t.msg('return_to_chat_intent', { citations: [cite('c-a'), cite('c-b')] })
+    t.arrive(m)
+    await read(okRead('old-a', 'A'))
+    await read(okRead('old-b', 'B'))
+    h.pendingConfirm[0]('confirmed')
+    await flush()
+    await read({ ok: false, code: 'stale', reason: 'moved' })
+    await read({ ok: false, code: 'not_found' })
+    expect(h.attached).toEqual([])
+    expect(forId(t, m.id).at(-1)?.payload).toEqual({ result: 'done', code: 'stale' })
+  })
+
+  it('attach returning false is a terminal attachment_limit', async () => {
+    const { h, t, read } = wired()
+    h.setAllow(false)
+    const m = t.msg('return_to_chat_intent', { citations: [REF] })
+    t.arrive(m)
+    await read(okRead('body', 'Title'))
+    h.pendingConfirm[0]('confirmed')
+    await flush()
+    await read(okRead('body', 'Title'))
+    expect(h.attached).toHaveLength(1)
+    expect(forId(t, m.id).map((r) => r.payload)).toEqual([
+      { result: 'accepted' },
+      { result: 'rejected', code: 'invalid_request', reason: 'attachment_limit' },
+    ])
+  })
+
+  it('zero citations are done after confirmation, with no read and no attach', async () => {
+    const { h, t } = wired()
+    const m = t.msg('return_to_chat_intent', { citations: [] })
+    t.arrive(m)
+    expect(h.reads).toEqual([])
+    expect(h.confirms[0].ask).toEqual({ count: 0, titles: [] })
+    h.pendingConfirm[0]('confirmed')
+    await flush()
+    expect(forId(t, m.id).map((r) => r.payload)).toEqual([{ result: 'accepted' }, { result: 'done' }])
+    expect(h.attached).toEqual([])
+    expect(h.shown).toEqual([])
+  })
+
+  it('cancel before attach is cancelled, aborts the dialog, and attaches nothing', async () => {
+    const { h, t, read } = wired()
+    const m = t.msg('return_to_chat_intent', { citations: [REF] })
+    t.arrive(m)
+    await read(okRead('discard', 'Title'))
+    const cancel = t.msg('cancel', { target_id: m.id })
+    t.arrive(cancel)
+    expect(h.confirms[0].signal.aborted).toBe(true)
+    expect(h.attached).toEqual([])
+    expect(t.replies().slice(-3).map((r) => [r.in_reply_to, r.payload])).toEqual([
+      [m.id, { result: 'accepted' }],
+      [m.id, { result: 'rejected', code: 'cancelled' }],
+      [cancel.id, { result: 'accepted' }],
+    ])
+    h.pendingConfirm[0]('confirmed')
+    await flush()
+    expect(h.attached).toEqual([])
+    expect(forId(t, m.id).map((r) => r.payload)).toEqual([
+      { result: 'accepted' },
+      { result: 'rejected', code: 'cancelled' },
+    ])
+  })
+
+  it('cancel after attach only accepts', async () => {
+    const { h, t, read } = wired()
+    const m = t.msg('return_to_chat_intent', { citations: [REF] })
+    t.arrive(m)
+    await read(okRead('old', 'Old'))
+    h.pendingConfirm[0]('confirmed')
+    await flush()
+    await read(okRead('body', 'Kept'))
+    expect(h.attached).toHaveLength(1)
+    const cancel = t.msg('cancel', { target_id: m.id })
+    t.arrive(cancel)
+    expect(forId(t, m.id).map((r) => r.payload)).toEqual([{ result: 'accepted' }, { result: 'done' }])
+    expect(t.last()?.in_reply_to).toBe(cancel.id)
+    expect(t.last()?.payload).toEqual({ result: 'accepted' })
+  })
+
+  it('a document change while waiting sends no reply and aborts the dialog', async () => {
+    const { h, t } = wired()
+    const m = t.msg('return_to_chat_intent', { citations: [] })
+    t.arrive(m)
+    t.bridge.newDocument(2)
+    expect(h.confirms[0].signal.aborted).toBe(true)
+    await flush()
+    expect(forId(t, m.id).map((r) => r.payload)).toEqual([{ result: 'accepted' }])
+    expect(h.attached).toEqual([])
+  })
+
+  it('destroy while waiting sends no reply and aborts the dialog', async () => {
+    const { h, t } = wired()
+    const m = t.msg('return_to_chat_intent', { citations: [] })
+    t.arrive(m)
+    const n = t.replies().length
+    t.bridge.destroy()
+    expect(h.confirms[0].signal.aborted).toBe(true)
+    await flush()
+    expect(t.replies()).toHaveLength(n)
+    expect(forId(t, m.id).map((r) => r.payload)).toEqual([{ result: 'accepted' }])
+    expect(h.attached).toEqual([])
+    expect(t.closes()).toBe(0)
+  })
+
+  it('admission closing while waiting is not_ready, and not before the first poll', async () => {
+    const { h, t } = wired()
+    const m = t.msg('return_to_chat_intent', { citations: [] })
+    t.arrive(m)
+    t.admission.open = false
+    t.advance(INTENT_ADMISSION_POLL_MS - 1)
+    expect(h.confirms[0].signal.aborted).toBe(false)
+    expect(forId(t, m.id).map((r) => r.payload)).toEqual([{ result: 'accepted' }])
+    t.advance(1)
+    await flush()
+    expect(h.confirms[0].signal.aborted).toBe(true)
+    expect(t.last()?.payload).toEqual({ result: 'rejected', code: 'unavailable', reason: 'not_ready' })
+    expect(h.attached).toEqual([])
+  })
+
+  it('title and validation reads use the generation captured at acceptance', async () => {
+    const { h, t, read } = wired()
+    const m = t.msg('return_to_chat_intent', { citations: [REF] })
+    t.arrive(m)
+    expect(h.reads.map((r) => r.generation)).toEqual([5])
+    t.admission.generation = 9
+    await read(okRead('old', 'Old'))
+    h.pendingConfirm[0]('confirmed')
+    await flush()
+    await read(okRead('body', 'Kept'))
+    expect(h.reads.map((r) => r.generation)).toEqual([5, 5])
+    expect(h.attached).toHaveLength(1)
+    expect(forId(t, m.id).at(-1)?.payload).toEqual({ result: 'done' })
+  })
+
+  it('a terminal reply that finishes while away is delivered on resume with the original document_id', async () => {
+    const { h, t } = wired()
+    const doc = t.bridge.currentDocumentId()
+    const m = t.msg('return_to_chat_intent', { citations: [] })
+    t.arrive(m)
+    t.bridge.leaveDocument()
+    h.pendingConfirm[0]('declined')
+    await flush()
+    expect(forId(t, m.id).map((r) => r.payload)).toEqual([{ result: 'accepted' }])
+    t.bridge.resumeDocument(1)
+    expect(forId(t, m.id).map((r) => r.payload)).toEqual([
+      { result: 'accepted' },
+      { result: 'rejected', code: 'forbidden', reason: 'user_declined' },
+    ])
+    expect(forId(t, m.id)[1].document_id).toBe(doc)
   })
 })

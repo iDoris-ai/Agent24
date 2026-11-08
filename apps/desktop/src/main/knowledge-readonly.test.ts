@@ -6,9 +6,11 @@ import {
   READ_MAX_RESPONSE_BYTES,
   READ_MAX_TEXT_BYTES,
   READ_TIMEOUT_MS,
+  READ_TOTAL_MS,
   plainTitle,
   readCitationChunk,
   type CitationRef,
+  type ReadFetch,
   type ReadonlyDeps,
 } from './knowledge-readonly'
 
@@ -422,5 +424,36 @@ describe('readCitationChunk: the visible set is asked before every page (U7.2)',
     const { deps, calls } = client((call) => okPage(call.body))
     expect(await readCitationChunk(deps, 15, REF, new AbortController().signal, () => false)).toEqual({ ok: false, code: 'not_found' })
     expect(calls).toHaveLength(0)
+  })
+
+  it('a citation over many slow pages times out at READ_TOTAL_MS overall (#1662 L4)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    try {
+      // Each page answers after 9 s and says there is more.
+      const fetchImpl: ReadFetch = (async (_url: string, init: RequestInit) => {
+        // A real fetch gives up when its signal aborts.
+        await new Promise<void>((resolve, reject) => {
+          const t = setTimeout(resolve, 9_000)
+          init.signal?.addEventListener('abort', () => { clearTimeout(t); reject(new Error('aborted')) })
+        })
+        const req = JSON.parse(String(init.body))
+        return new Response(JSON.stringify({ protocol_version: 1, request_id: req.request_id, generation: req.generation, effective_scope: { knowledge_base_ids: [REF.knowledge_base_id] }, knowledge_id: REF.knowledge_id, revision: { source_revision: 's', index_build_id: 'i' }, segments: [{ chunk_id: REF.chunk_id, chunk_type: 'text', chunk_revision: 1, content_tag: REF.content_tag, text: 'a' }], truncated: true, next_cursor: 'c' }), { status: 200 })
+      })
+      let calls = 0
+      const counted: ReadFetch = (url, init) => { calls++; return fetchImpl(url, init) }
+      const pending = readCitationChunk({ origin: ORIGIN, credential: () => 'C', fetch: counted, newRequestId: ids() }, 15, REF, new AbortController().signal)
+      // Step the clock; the body stream needs real turns of the event loop between steps.
+      let result: unknown = null
+      void pending.then((r) => { result = r })
+      for (let i = 0; i < (READ_TOTAL_MS + 2_000) / 500 && result === null; i++) {
+        await vi.advanceTimersByTimeAsync(500)
+        await new Promise((r) => setImmediate(r))
+      }
+      expect(result).toEqual({ ok: false, code: 'timeout' })
+      // 9 s pages: the fourth would end past 30 s, so it is cut by the deadline, not by its own 10 s.
+      expect(calls).toBeLessThanOrEqual(4)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

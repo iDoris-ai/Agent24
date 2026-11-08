@@ -10,6 +10,7 @@ import { TurnRail } from './chat/TurnRail'
 import { activeTurn, buildTurns } from './chat/turns'
 import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/title'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../shared/chat-history'
+import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import {
   getHistoryState, historyAvailable, loadConversation, registerChatPage, restoreConversation, saveConversation,
   setActiveConversation, setChatBusy, subscribeHistory, titleConversation,
@@ -116,6 +117,7 @@ export default function ChatPage() {
   const turns = useMemo(() => buildTurns(messages), [messages])
   const [currentTurn, setCurrentTurn] = useState(0)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const draft = useKnowledgeDraft()
   const requestInFlight = useRef(false)
   // Knowledge on: turns go to /runs, in a real session created once.
   const [awaitingApproval, setAwaitingApproval] = useState(false)
@@ -189,6 +191,7 @@ export default function ChatPage() {
         .map(m => ({ role: m.role, content: m.content })),
       session_id: sessionId,
     }
+    await draft.apply(request)
     setMessages(prev => [...prev, userMsg])
     setInput('')
     await requestReply(messages.length, request)
@@ -486,6 +489,7 @@ export default function ChatPage() {
         <div ref={bottomRef} />
       </div>
 
+      {!archived && <DraftAttachments draft={draft} />}
       {archived ? (
         <div className="chat-input-bar chat-archived-bar" role="status">
           <span className="chat-archived-notice">{t('archived.notice')}</span>

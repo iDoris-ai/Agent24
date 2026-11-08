@@ -1260,8 +1260,14 @@ describe('registerKnowledgeViewIpc', () => {
     const host = { show: vi.fn(async () => ({ ok: true })), setBounds: vi.fn(), hide: vi.fn(), reload: vi.fn(async () => ({ ok: true })) }
     registerKnowledgeViewIpc({ handle: (c: string, h: Listener) => { handlers.set(c, h) } } as never, guard,
       { show: 's', bounds: 'b', hide: 'h', reload: 'r' }, () => host as never)
-    expect([...handlers.keys()]).toEqual(['s', 'b', 'h', 'r'])
-    expect(guarded).toHaveLength(4)
+    expect([...handlers.keys()]).toEqual([
+      's', 'b', 'h', 'r',
+      IpcChannels.KnowledgeViewAnswer,
+      IpcChannels.KnowledgeDraftList,
+      IpcChannels.KnowledgeDraftRemove,
+      IpcChannels.KnowledgeDraftTake,
+    ])
+    expect(guarded).toHaveLength(8)
     await handlers.get('s')!({}, BOUNDS, 'dark')
     expect(host.show).toHaveBeenCalledWith(BOUNDS, 'dark')
     handlers.get('b')!({}, BOUNDS)
@@ -1493,6 +1499,9 @@ describe('citation strip (U7.2)', () => {
     const viewSent: unknown[] = []
     ;(contents as unknown as { send: (...args: unknown[]) => void }).send = (...args: unknown[]) => { viewSent.push(args) }
     contents.emit('did-navigate', {}, URL_, 200)
+    // #1662 L5: the commit itself clears the strip first.
+    expect(sent).toEqual([[IpcChannels.KnowledgeViewCitation, null]])
+    sent.length = 0
     const doc = envelopes(contents.mainFrame.scripts).find((m) => m.type === 'hello')?.document_id
     const id = '01J9ZQ3V6R8XKQ4M2N5P7T0099'
     const body = { v: 3, direction: 'page_to_host', type: 'citation', id, generation: 3, document_id: doc, payload: REF }
@@ -1509,6 +1518,22 @@ describe('citation strip (U7.2)', () => {
     expect(contents.mainFrame.scripts.join('\n')).not.toContain('secret-chunk-text')
   })
 
+  it('a new document and a settings change that keeps the binding each clear the strip (#1662 L5)', async () => {
+    const ui = citingUi()
+    const t = setup({ ui: ui.factory })
+    const sent = watch(t.env.win!)
+    await t.host.show(BOUNDS)
+    const contents = t.views[0].webContents
+    sent.length = 0
+    contents.emit('did-navigate', {}, URL_, 200)
+    expect(sent).toEqual([[IpcChannels.KnowledgeViewCitation, null]])
+    sent.length = 0
+    // Same binding (only the knowledge bases moved): the instance stays, the strip goes.
+    t.host.bindingChanged()
+    expect(sent).toEqual([[IpcChannels.KnowledgeViewCitation, null]])
+    expect(t.views).toHaveLength(1)
+  })
+
   it('destroy and a binding change each clear the strip', async () => {
     const ui = citingUi()
     const t = setup({ ui: ui.factory })
@@ -1522,5 +1547,141 @@ describe('citation strip (U7.2)', () => {
     again.env.binding = 'https://other.example/api/v1'
     again.host.bindingChanged()
     expect(sent2[0]).toEqual([IpcChannels.KnowledgeViewCitation, null])
+  })
+})
+
+describe('return_to_chat_intent dialog and draft (U7.2)', () => {
+  const REF = { knowledge_base_id: 'kb-1', knowledge_id: 'doc-1', chunk_id: 'c-1', source_revision: 'r1', index_build_id: 'b1', chunk_revision: 3, content_tag: 'tag-1' }
+  const INTENT_ID = '01J9ZQ3V6R8XKQ4M2N5P7T00A1'
+  const envelopes = (scripts: string[]): Array<Record<string, any>> => scripts.map((s) => {
+    const m = /JSON\.parse\((.*)\) \}\)\)\}catch\{\};undefined$/.exec(s)
+    if (!m) throw new Error('script')
+    return JSON.parse(JSON.parse(m[1]))
+  })
+  const watch = (win: FakeWindow): unknown[][] => {
+    const sent: unknown[][] = []
+    ;(win as unknown as { webContents: { send: (...args: unknown[]) => void } }).webContents = {
+      send: (...args: unknown[]) => { sent.push(args) },
+    }
+    return sent
+  }
+  function intentUi() {
+    let context: KnowledgeViewUiContext | null = null
+    return {
+      context: () => context,
+      factory: (ctx: KnowledgeViewUiContext): KnowledgeViewUi => {
+        context = ctx
+        return {
+          start: async () => true,
+          inject: () => ({ cancel: false, requestHeaders: {}, injected: false }),
+          responded: () => {},
+          destroy: () => {},
+          bridgeAdmission: () => ({ open: true, generation: 3 }),
+          citationScope: () => ['kb-1'],
+          readCitation: async () => ({ ok: true as const, text: 'noted', contentTag: 'tag-1', title: 'Cited' }),
+        }
+      },
+    }
+  }
+  async function shown() {
+    const ui = intentUi()
+    const t = setup({ ui: ui.factory })
+    const sent = watch(t.env.win!)
+    await t.host.show(BOUNDS)
+    const contents = t.views[0].webContents
+    const viewSent: unknown[][] = []
+    ;(contents as unknown as { send: (...args: unknown[]) => void }).send = (...args: unknown[]) => { viewSent.push(args) }
+    contents.emit('did-navigate', {}, URL_, 200)
+    contents.emit('input-event', {}, { type: 'mouseDown' })
+    const doc = envelopes(contents.mainFrame.scripts).find((m) => m.type === 'hello')?.document_id as string
+    const post = (body: unknown): void => {
+      t.sessions[0].beforeRequest?.({ url: `${ORIGIN}/__agent24/bridge`, method: 'POST', webContentsId: contents.id, frame: contents.mainFrame, uploadData: [{ bytes: Buffer.from(JSON.stringify(body)) }] }, () => {})
+    }
+    const confirms = () => sent.filter((args) => args[0] === IpcChannels.KnowledgeViewConfirm)
+    const drafts = () => sent.filter((args) => args[0] === IpcChannels.KnowledgeDraftChanged)
+    return { ui, t, sent, viewSent, doc, post, confirms, drafts }
+  }
+  const intentBody = (doc: string) => ({ v: 3, direction: 'page_to_host', type: 'return_to_chat_intent', id: INTENT_ID, generation: 3, document_id: doc, payload: { citations: [REF] } })
+
+  async function asked() {
+    const s = await shown()
+    s.post(intentBody(s.doc))
+    await flush()
+    const ask = s.confirms()[0]?.[1] as { id: string; count: number; titles: Array<string | null> }
+    return { ...s, ask }
+  }
+
+  it('confirm goes only to the main window, and answering it attaches the draft', async () => {
+    const s = await asked()
+    expect(s.confirms()).toHaveLength(1)
+    expect(s.ask).toMatchObject({ count: 1, titles: ['Cited'] })
+    expect(s.ask.id).toMatch(/^[A-Za-z0-9_-]{22}$/)
+    expect(s.viewSent.filter((args) => args[0] === IpcChannels.KnowledgeViewConfirm)).toEqual([])
+    s.t.host.answerConfirm(s.ask.id, true)
+    await flush()
+    const listed = s.t.host.draftList()
+    expect(listed).toHaveLength(1)
+    expect(listed[0]).toMatchObject({ title: 'Cited', text: 'noted', ref: { knowledge_base_id: 'kb-1', knowledge_id: 'doc-1', chunk_id: 'c-1' } })
+    expect(Object.keys(listed[0].ref).sort()).toEqual(['chunk_id', 'knowledge_base_id', 'knowledge_id'])
+    expect(s.drafts()).toEqual([[IpcChannels.KnowledgeDraftChanged, listed]])
+    expect(s.viewSent.filter((args) => args[0] === IpcChannels.KnowledgeDraftChanged)).toEqual([])
+  })
+
+  it('aborting the dialog sends null and attaches nothing', async () => {
+    const s = await asked()
+    s.post({ v: 3, direction: 'page_to_host', type: 'cancel', id: '01J9ZQ3V6R8XKQ4M2N5P7T00C1', generation: 3, document_id: s.doc, payload: { target_id: INTENT_ID } })
+    await flush()
+    expect(s.confirms().at(-1)?.[1]).toBeNull()
+    expect(s.t.host.draftList()).toEqual([])
+    expect(s.drafts()).toEqual([])
+    expect(s.viewSent.filter((args) => args[0] === IpcChannels.KnowledgeViewConfirm)).toEqual([])
+  })
+
+  it('an invalid answer is ignored, and a later valid one still attaches', async () => {
+    const s = await asked()
+    const handlers = new Map<string, Listener>()
+    registerKnowledgeViewIpc({ handle: (c: string, h: Listener) => { handlers.set(c, h) } } as never, ((h: Listener) => h) as never,
+      { show: 's', bounds: 'b', hide: 'h', reload: 'r' }, () => s.t.host)
+    const answer = handlers.get(IpcChannels.KnowledgeViewAnswer)!
+    await answer({}, 'nope', true)
+    await answer({}, s.ask.id, 'yes')
+    await answer({}, 'A'.repeat(22), true)
+    await flush()
+    expect(s.t.host.draftList()).toEqual([])
+    await answer({}, s.ask.id, true)
+    await flush()
+    expect(s.t.host.draftList()).toHaveLength(1)
+  })
+
+  it('a view-level rebuild keeps the draft; a binding change, Off and destroyAll clear it, and the list reaches the main window', async () => {
+    const s = await asked()
+    s.t.host.answerConfirm(s.ask.id, true)
+    await flush()
+    expect(s.t.host.draftList()).toHaveLength(1)
+    const before = s.drafts().length
+    s.ui.context()!.onEvent({ kind: 'rebuild' })
+    await flush()
+    expect(s.t.host.draftList()).toHaveLength(1)
+    expect(s.drafts()).toHaveLength(before)
+    s.t.env.binding = 'https://other.example/api/v1'
+    s.t.host.bindingChanged()
+    expect(s.t.host.draftList()).toEqual([])
+    expect(s.drafts().at(-1)).toEqual([IpcChannels.KnowledgeDraftChanged, []])
+
+    const off = await asked()
+    off.t.host.answerConfirm(off.ask.id, true)
+    await flush()
+    off.t.env.binding = null
+    off.t.host.bindingChanged()
+    expect(off.t.host.draftList()).toEqual([])
+    expect(off.drafts().at(-1)).toEqual([IpcChannels.KnowledgeDraftChanged, []])
+
+    const gone = await asked()
+    gone.t.host.answerConfirm(gone.ask.id, true)
+    await flush()
+    gone.t.host.destroyAll('test')
+    expect(gone.t.host.draftList()).toEqual([])
+    expect(gone.drafts().at(-1)).toEqual([IpcChannels.KnowledgeDraftChanged, []])
+    expect(gone.viewSent.filter((args) => args[0] === IpcChannels.KnowledgeDraftChanged)).toEqual([])
   })
 })
