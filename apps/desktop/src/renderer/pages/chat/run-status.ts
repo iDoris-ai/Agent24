@@ -68,7 +68,7 @@ function askLater(runId: string): void {
 }
 
 function askAgainNow(): void {
-  const due = [...again].filter(id => wanted.has(id))
+  const due = [...again].filter(id => (wanted.get(id) ?? 0) > 0)
   again.clear()
   for (const id of due) ask(id)
 }
@@ -107,7 +107,7 @@ async function answer(runId: string): Promise<void> {
     }
   } finally {
     asking.delete(runId)
-    if (changedWhileAsking.delete(runId)) ask(runId)
+    if (changedWhileAsking.delete(runId) && (wanted.get(runId) ?? 0) > 0) ask(runId)
     pump()
   }
 }
@@ -118,9 +118,9 @@ function listen(): void {
   if (!onRunEvent) return
   listening = true
   onRunEvent(event => {
-    // Only runs the list knows about are asked again; the event says which
-    // run changed, its answer says how.
-    if (wanted.has(event.run_id)) {
+    // Only runs a list shows are asked again; the event says which run
+    // changed, its answer says how.
+    if ((wanted.get(event.run_id) ?? 0) > 0) {
       lastEvent.set(event.run_id, event.type)
       again.delete(event.run_id)
       ask(event.run_id)
@@ -137,6 +137,16 @@ function listen(): void {
   })
 }
 
+/** No list shows the run any more: it is not asked again. */
+function drop(runId: string): void {
+  wanted.delete(runId)
+  again.delete(runId)
+  lastEvent.delete(runId)
+  changedWhileAsking.delete(runId)
+  const at = queue.indexOf(runId)
+  if (at >= 0) queue.splice(at, 1)
+}
+
 function subscribe(listener: () => void): () => void {
   listeners.add(listener)
   return () => listeners.delete(listener)
@@ -150,18 +160,21 @@ export function useRunStatuses(runIds: readonly string[]): ReadonlyMap<string, R
   useEffect(() => {
     listen()
     for (const runId of runIds) {
-      wanted.set(runId, (wanted.get(runId) ?? 0) + 1)
-      if (!statuses.has(runId)) ask(runId)
+      const was = wanted.get(runId)
+      wanted.set(runId, (was ?? 0) + 1)
+      // Shown anew after no list showed it: what was known may be old, its
+      // events were not listened to meanwhile (Codex A3 r3 C2).
+      if (was === undefined || !statuses.has(runId)) ask(runId)
     }
     return () => {
       for (const runId of runIds) {
         const n = (wanted.get(runId) ?? 1) - 1
-        if (n > 0) { wanted.set(runId, n); continue }
-        wanted.delete(runId)
-        again.delete(runId)
-        lastEvent.delete(runId)
-        const at = queue.indexOf(runId)
-        if (at >= 0) queue.splice(at, 1)
+        wanted.set(runId, n)
+        // Let go only once no list shows it after this commit: when the ids
+        // change, React cleans up before the next effect registers them
+        // again, and a run still shown keeps its wait for an answer and its
+        // last event (Codex A3 r3 C1).
+        if (n === 0) queueMicrotask(() => { if (wanted.get(runId) === 0) drop(runId) })
       }
     }
   }, [key]) // `key` is runIds' content

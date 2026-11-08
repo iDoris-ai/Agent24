@@ -172,6 +172,48 @@ describe('run statuses for the history list (M4 A3)', () => {
     expect(proxy).toHaveBeenCalledTimes(asked)
   })
 
+  it('keeps a run\'s wait when the list\'s ids change and it is still shown (Codex A3 r3 C1)', async () => {
+    answer = async () => ok('awaiting_approval')
+    const { result, rerender } = renderHook(({ ids }) => useRunStatuses(ids), { initialProps: { ids: ['run_1'] } })
+    await flush()
+    act(() => emit({ type: 'approval.resolved', run_id: 'run_1' }))
+    await flush()
+    // Another conversation gets a task meanwhile.
+    rerender({ ids: ['run_1', 'run_2'] })
+    await flush()
+    answer = async () => ok('running')
+    await wait(RETRY_FIRST_MS)
+    expect(result.current.get('run_1')).toBe('running')
+  })
+
+  it('asks again a run shown anew, whose events went unheard meanwhile (Codex A3 r3 C2)', async () => {
+    answer = async () => ok('running')
+    const first = renderHook(() => useRunStatuses(['run_1']))
+    await flush()
+    first.unmount()
+    await flush()
+    // It ends while no list shows it.
+    answer = async () => ok('completed')
+    act(() => emit({ type: 'run.completed', run_id: 'run_1' }))
+    await flush()
+    const { result } = renderHook(() => useRunStatuses(['run_1']))
+    await flush()
+    expect(result.current.get('run_1')).toBe('completed')
+  })
+
+  it('does not ask again, after its answer, a run no list shows any more (Codex A3 r3 C3)', async () => {
+    let late!: (a: Answer) => void
+    answer = () => new Promise(resolve => { late = resolve })
+    const { unmount } = renderHook(() => useRunStatuses(['run_1']))
+    await flush()
+    act(() => emit({ type: 'run.completed', run_id: 'run_1' }))
+    unmount()
+    await flush()
+    await act(async () => { late(ok('completed')) })
+    await flush()
+    expect(proxy).toHaveBeenCalledTimes(1)
+  })
+
   it(`asks at most ${MAX_ASKING} runs at once (Codex A3 C3)`, async () => {
     const pending: ((a: Answer) => void)[] = []
     answer = () => new Promise(resolve => { pending.push(resolve) })
