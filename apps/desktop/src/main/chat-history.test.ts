@@ -627,6 +627,29 @@ describe('runs and waiting items (M4 A2)', () => {
     expect(told).toEqual([expect.objectContaining({ id: 'chat_a', tasks: [expect.objectContaining({ run_id: 'run_1' })] })])
   })
 
+  it('refuses a save or a change, rather than lose its runs, when the file is there but cannot be read (Codex A2 C1)', () => {
+    const store = createChatHistoryStore(dir)
+    store.save(record('chat_a', at))
+    store.promoteRun('chat_a', 'run_1')
+    const file = path.join(dir, 'chat-history', 'chat_a.json')
+    fs.chmodSync(file, 0o000)
+    try {
+      expect(() => store.save(record('chat_a', '2026-11-08T02:00:00.000Z'))).toThrow('Chat history unreadable')
+      expect(() => store.setPending('chat_a', ask())).toThrow('Chat history unreadable')
+      // Only showing it reads it as missing.
+      expect(store.get('chat_a')).toBeNull()
+    } finally { fs.chmodSync(file, 0o600) }
+    expect(onDisk('chat_a').runs).toEqual([expect.objectContaining({ run_id: 'run_1', kind: 'task' })])
+  })
+
+  it('does not count the page\'s runs toward the size a save may write: it never writes them (Codex A2 C3)', () => {
+    const store = createChatHistoryStore(dir)
+    const big = { ...record('chat_a', at), messages: [{ role: 'user' as const, content: 'x'.repeat(8 * 1024 * 1024 - 40_000), at, delivered: true }] }
+    const runs = Array.from({ length: 1000 }, (_, i) => ({ run_id: `r${i}`, kind: 'task' as const, started_at: at }))
+    expect(() => store.save({ ...big, runs })).not.toThrow()
+    expect(onDisk('chat_a').runs).toEqual([])
+  })
+
   it('writes the file 0600 by atomic replacement, leaving no temporary file', () => {
     const store = createChatHistoryStore(dir)
     store.save(record('chat_a', at))

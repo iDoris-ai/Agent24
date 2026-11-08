@@ -78,14 +78,9 @@ function precheck(v: unknown): void {
     }
     tooLarge()
   }
-  for (const list of [v.runs, v.pending]) {
-    if (!Array.isArray(list)) continue
-    for (const item of list) {
-      bytes += MIN_MESSAGE_BYTES
-      if (isObject(item)) bytes += strings(item.run_id, item.id, item.label, item.at, item.started_at)
-      tooLarge()
-    }
-  }
+  // Not the page's runs and waiting items: a save never writes them (M4 A2),
+  // and their counts and sizes are capped by the parse; `write` checks the
+  // real size of what is written (Codex A2 C3).
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -243,13 +238,23 @@ export function createChatHistoryStore(dir: string) {
     try { return fs.readdirSync(root) }
     catch { return [] }
   }
-  const read = (file: string): ChatHistoryRecord | null => {
-    try { return parseChatHistoryRecord(JSON.parse(fs.readFileSync(file, 'utf8'))) }
+  /** A conversation's file, or null when it is missing, damaged or not
+   *  version 2. For a change (`forChange`), a file that is there but cannot
+   *  be read (a permission, an I/O error) refuses the change rather than
+   *  lose what main keeps in it (Codex A2 C1), as the groups do. */
+  const read = (file: string, forChange = false): ChatHistoryRecord | null => {
+    let text: string
+    try { text = fs.readFileSync(file, 'utf8') }
+    catch (e) {
+      if (forChange && (e as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('Chat history unreadable')
+      return null
+    }
+    try { return parseChatHistoryRecord(JSON.parse(text)) }
     catch { return null }
   }
   /** The conversation on file under its own id, or null. */
-  const current = (id: string): ChatHistoryRecord | null => {
-    const record = read(fileOf(id))
+  const current = (id: string, forChange = false): ChatHistoryRecord | null => {
+    const record = read(fileOf(id), forChange)
     return record && record.id === id ? record : null
   }
   /** Writes a file of this store by atomic replacement. */
@@ -279,7 +284,7 @@ export function createChatHistoryStore(dir: string) {
    *  `edit` answers the record to write, or null when nothing changes. A
    *  written change is told to the change listener. */
   const change = (id: string, edit: (record: ChatHistoryRecord) => ChatHistoryRecord | null): ChatHistorySummary | null => {
-    const before = current(id)
+    const before = current(id, true)
     if (!before) return null
     const after = edit(before)
     if (!after) return summaryOf(before)
@@ -363,7 +368,7 @@ export function createChatHistoryStore(dir: string) {
     save(value: unknown): ChatHistorySummary {
       precheck(value)
       let record = parseChatHistoryRecord(value)
-      const before = current(record.id)
+      const before = current(record.id, true)
       // A save never retitles at its own rank either (PR-Daemon #1640 L3):
       // titles change through setTitle, so a late retry of an older save
       // carrying a model or user title cannot undo a newer one. Only the

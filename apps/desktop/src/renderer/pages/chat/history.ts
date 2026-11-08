@@ -137,6 +137,9 @@ export async function saveConversation(record: ChatHistoryRecord): Promise<boole
   // disk: that would cost a full scan per chat turn.
   const summary = written ?? chatHistorySummary(record)
   set({ items: byNewest([summary, ...state.items.filter(item => item.id !== record.id)]) })
+  const waiting = promoteAfterSave.get(record.id)
+  promoteAfterSave.delete(record.id)
+  for (const runId of waiting ?? []) void promoteRun(record.id, runId)
   return true
 }
 
@@ -192,11 +195,21 @@ export async function promoteRun(id: string, runId: string): Promise<boolean> {
   if (!history) return false
   const mine = ++seq
   const summary = await history.promoteRun(id, runId).catch(() => null)
-  if (!summary || removedSince(id, mine)) return false
+  if (removedSince(id, mine)) return false
+  if (!summary) {
+    // Not on file yet: its first save is still being tried (Codex A2 C2).
+    // The run is promoted once that save lands; a run is not seen waiting on
+    // its approval twice.
+    if (unsaved.has(id)) promoteAfterSave.set(id, [...(promoteAfterSave.get(id) ?? []), runId])
+    return false
+  }
   publishedAt.set(id, ++seq)
   set({ items: byNewest([summary, ...state.items.filter(item => item.id !== id)]) })
   return true
 }
+/** Runs whose promotion found their conversation not on file while a save
+ *  of it was still on its way. */
+const promoteAfterSave = new Map<string, string[]>()
 
 async function organize(id: string, patch: ChatHistoryOrganize): Promise<boolean> {
   const history = api()
@@ -362,4 +375,5 @@ export function resetHistoryStore(): void {
   opener = null
   starter = null
   listening = false
+  promoteAfterSave.clear()
 }

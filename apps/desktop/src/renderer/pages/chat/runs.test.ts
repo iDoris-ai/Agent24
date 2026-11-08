@@ -5,13 +5,14 @@ import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createChatHistoryStore, onChatHistoryChange } from '../../../main/chat-history'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord, type ChatHistorySummary } from '../../../shared/chat-history'
-import { deleteConversation, getHistoryState, promoteRun, resetHistoryStore, saveConversation, subscribeHistory } from './history'
+import { deleteConversation, getHistoryState, promoteRun, resetHistoryStore, saveConversation, setRetrySleepForTests, subscribeHistory } from './history'
 
 // M4 A2: the page's side of a conversation's runs, against main's real store
 // behind a bridge that calls it as the IPC handlers and main.ts do.
 
 let dir: string
 let store: ReturnType<typeof createChatHistoryStore>
+let bridge: Record<string, unknown>
 const wrap = <A extends unknown[], R>(f: (...a: A) => R) => vi.fn(async (...a: A) => f(...a))
 
 function record(id: string, prompt: string, at = '2026-11-08T01:00:00.000Z'): ChatHistoryRecord {
@@ -30,7 +31,7 @@ beforeEach(() => {
   const changed = new Set<(s: ChatHistorySummary) => void>()
   // main.ts forwards main's own changes to the window.
   onChatHistoryChange(summary => { for (const cb of changed) cb(summary) })
-  const bridge = {
+  bridge = {
     list: wrap(() => store.list()), get: wrap((id: string) => store.get(id)), save: wrap((r: unknown) => store.save(r)),
     delete: wrap((id: string) => store.delete(id)), clear: wrap(() => store.clear()),
     promoteRun: wrap((id: string, runId: string) => store.promoteRun(id, runId)),
@@ -56,6 +57,21 @@ describe('a conversation\'s runs on the page (M4 A2)', () => {
     await deleteConversation('chat_a')
     expect(await promoted).toBe(false)
     expect(item('chat_a')).toBeUndefined()
+  })
+
+  it('promotes a run once the conversation\'s first save lands, when that save was still being retried (Codex A2 C2)', async () => {
+    let release!: () => void
+    setRetrySleepForTests(() => new Promise<void>(resolve => { release = resolve }))
+    const save = bridge.save as ReturnType<typeof vi.fn>
+    save.mockRejectedValueOnce(new Error('disk busy'))
+    const saved = saveConversation(record('chat_a', '周报'))
+    await flush()
+    // The run waits on its approval while the first save waits to retry.
+    expect(await promoteRun('chat_a', 'run_1')).toBe(false)
+    release()
+    expect(await saved).toBe(true)
+    await flush()
+    expect(item('chat_a')?.tasks).toEqual([expect.objectContaining({ run_id: 'run_1', kind: 'task' })])
   })
 
   it('reads the list again when main\'s own modules change a conversation', async () => {
