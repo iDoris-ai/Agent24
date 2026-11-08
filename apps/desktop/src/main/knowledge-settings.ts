@@ -20,6 +20,7 @@ import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import type { HostResult, KnowledgeHost } from './knowledge-host'
+import { isPlainHostname } from './knowledge-hostname'
 import type { KnowledgeLoginStore } from './knowledge-logins'
 import type { KnowledgeSettingsResult, KnowledgeStatus } from '../shared/ipc-types'
 
@@ -44,7 +45,8 @@ type SettingsResult = KnowledgeSettingsResult
 const EMPTY: KnowledgeSettings = { enabled: false, endpoint: '', knowledgeBaseIds: [] }
 
 /** The daemon's own rule (knowledge_host.rs `endpoint_of`): `https`, or `http`
- * to a loopback IP literal; no user info, query or fragment. */
+ * to a loopback IP literal; no user info, query or fragment. Stricter on the
+ * host name (isPlainHostname, #1643 PR-Daemon C). */
 export function validEndpoint(value: unknown): value is string {
   if (typeof value !== 'string') return false
   let url: URL
@@ -55,7 +57,7 @@ export function validEndpoint(value: unknown): value is string {
   }
   const loopback = url.hostname === '[::1]' || /^127(\.\d{1,3}){3}$/.test(url.hostname)
   const scheme = url.protocol === 'https:' || (url.protocol === 'http:' && loopback)
-  return scheme && url.username === '' && url.password === '' && url.search === '' && url.hash === ''
+  return scheme && url.username === '' && url.password === '' && url.search === '' && url.hash === '' && isPlainHostname(url.hostname) && url.port !== '0'
 }
 
 export function validKnowledgeBaseIds(value: unknown): value is string[] {

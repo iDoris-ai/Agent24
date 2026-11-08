@@ -29,6 +29,7 @@ import { randomBytes } from 'node:crypto'
 import net from 'node:net'
 import type { BrowserWindow, IpcMain, IpcMainInvokeEvent, Session, WebContents, WebContentsView } from 'electron'
 import type { IpcGuard } from './ipc/guard'
+import { isPlainHostname } from './knowledge-hostname'
 import type {
   KnowledgeViewBounds,
   KnowledgeViewResult,
@@ -74,6 +75,7 @@ export function knowledgeViewTarget(value: unknown): KnowledgeViewTarget | null 
   const loopback = url.hostname === '[::1]' || LOOPBACK_HOST.test(url.hostname)
   const scheme = url.protocol === 'https:' || (url.protocol === 'http:' && loopback)
   if (!scheme || url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== '') return null
+  if (!isPlainHostname(url.hostname) || url.port === '0') return null
   return { origin: url.origin, url: url.href }
 }
 
@@ -280,6 +282,10 @@ const BACKGROUND: Record<KnowledgeViewTheme, string> = { light: '#f4f4ef', dark:
 /** The partition's proxy settings for `origin` and the dead proxy's port. */
 export function knowledgeViewProxyConfig(origin: string, port: number): { mode: 'fixed_servers'; proxyRules: string; proxyBypassRules: string } {
   const url = new URL(origin)
+  // Never a pattern in the bypass list: `*` or a `,`/`;` would open it up.
+  if (!isPlainHostname(url.hostname)) throw new Error('knowledge view: host name not allowed in the proxy bypass')
+  // Port 0 in a bypass rule means any port (#1649 PR-Daemon L1).
+  if (url.port === '0') throw new Error('knowledge view: port 0 not allowed in the proxy bypass')
   const hostPort = `${url.hostname}:${url.port || (url.protocol === 'https:' ? '443' : '80')}`
   return { mode: 'fixed_servers', proxyRules: `http://127.0.0.1:${port}`, proxyBypassRules: `<-loopback>;${hostPort}` }
 }
@@ -522,7 +528,7 @@ export class KnowledgeViewHost {
       // Not one request before the dead proxy is in place: a page that loaded
       // first could open TURN-TCP directly (decision #30).
       instance.proxied
-        .then(() => { if (!settled) return instance.view.webContents.loadURL(instance.target.url) })
+        .then(() => { if (!settled && this.instance === instance) return instance.view.webContents.loadURL(instance.target.url) })
         .then(() => finish(null), (error: unknown) => finish(error))
     })
     return instance.loading
