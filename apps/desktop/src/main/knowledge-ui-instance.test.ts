@@ -1,3 +1,5 @@
+import { readdirSync, readFileSync } from 'node:fs'
+import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import type { KnowledgeUiClient, UiCallResult } from './knowledge-ui-client'
 import type { InjectRequest } from './knowledge-ui-inject'
@@ -173,6 +175,36 @@ describe('KnowledgeUiInstance', () => {
     t.ui.responded(r.id, 401)
     await flush()
     expect(t.events).toEqual([])
+  })
+
+  it('never puts C, a ticket, a JWT or the view proof into an event (U2.5)', async () => {
+    const secrets = ['C', 'proof', 'jwt1', 'jwt2', 't1', 't2']
+    const runs = [
+      setup({ probes: [refused('unauthorized', 'credential_invalid')] }),
+      setup({ exchanges: [refused('forbidden', 'empty_scope')] }),
+      setup({ issues: [refused('unauthorized', 'credential_expired')] }),
+    ]
+    for (const t of runs) {
+      if (await t.ui.start()) {
+        const r = fetchReq()
+        t.ui.inject(r, WC)
+        t.ui.responded(r.id, 401)
+        await flush()
+      }
+      expect(t.events).toHaveLength(1)
+      const text = JSON.stringify(t.events)
+      for (const secret of secrets) expect(text).not.toContain(`"${secret}"`)
+      expect(Object.keys(t.events[0]).sort()).toEqual(t.events[0].kind === 'closed' ? ['code', 'kind'] : ['kind'])
+    }
+  })
+
+  it('the UI session modules log nothing at all (U2.5)', () => {
+    const files = readdirSync(__dirname).filter((f) => /^knowledge-ui-[a-z-]+\.ts$/.test(f) && !f.endsWith('.test.ts'))
+    expect(files.length).toBeGreaterThanOrEqual(6)
+    for (const file of files) {
+      const source = readFileSync(path.join(__dirname, file), 'utf8')
+      expect(source, file).not.toMatch(/\bconsole\.|\blog\(|\.log\(|\bwarn\(|\bdebug\(/)
+    }
   })
 
   it('a renewal timer that fires after an event does nothing', async () => {

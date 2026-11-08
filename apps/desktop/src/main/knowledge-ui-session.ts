@@ -1,9 +1,10 @@
 // KB-C2-04a (#1623): the host side of the UI session (CONTRACT-UI-BRIDGE-v1).
-// This file holds the parts that do not talk to the server yet: reading the
+// This file holds the parts that do not talk to the server: reading the
 // exchange, probe and error bodies the way UIB says (U3.8 "解码"), and the
 // per-binding ledger that decides when a view-level rebuild is still automatic
-// (U3.8, decisions #3 and #36). The HTTP calls, injection and renewal come in
-// the same slice once WeKnora C2-01b/c land.
+// (U3.8, decisions #3 and #36). The calls are knowledge-ui-client.ts, one
+// instance's session knowledge-ui-view-session.ts, injection
+// knowledge-ui-inject.ts, and knowledge-ui-instance.ts ties them to the view.
 
 import { UI_OPS, type UiOp } from './knowledge-ui-routes'
 
