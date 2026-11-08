@@ -524,6 +524,14 @@ describe('round 3: a block or JWT that starts inside another', () => {
     expect(redact(text)).toBe('〔已脱敏·私钥〕\nafter')
   })
 
+  it('two blocks of the same type one after the other are each taken to their own END', () => {
+    const block = (body: string) => ['-----BEGIN RSA PRIVATE KEY-----', body, '-----END RSA PRIVATE KEY-----'].join('\n')
+    const text = `${block('A'.repeat(32))}\nmiddle\n${block('B'.repeat(32))}\nafter`
+    // In one scan, not only after preRedact has taken the first block away.
+    expect(categories(text)).toEqual(['private_key', 'private_key'])
+    expect(redact(text)).toBe('〔已脱敏·私钥〕\nmiddle\n〔已脱敏·私钥〕\nafter')
+  })
+
   it('a JWT that starts in the second segment of another is taken (C2)', () => {
     expect(redact('eyJaaaa.eyJbbbb.eyJcccc.TOPSECRET end')).toBe('〔已脱敏·凭据〕 end')
     expect(redact(`eyJxxxx.${JWT} end`)).toBe('〔已脱敏·凭据〕 end')
