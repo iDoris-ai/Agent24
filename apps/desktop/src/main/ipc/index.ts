@@ -9,6 +9,7 @@ import https from 'node:https'
 import { execFile, type ChildProcess } from 'node:child_process'
 import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron'
 import { createNavPrefsStore } from '../nav-prefs'
+import { createChatHistoryStore } from '../chat-history'
 import { daemonCliEndpoint, daemonConnection, getBackendEndpoint } from '../backend-manager'
 import { findAllowedRoute, proxyError, proxyRequest, timeoutFor, withKnowledgeBinding } from '../backend-proxy'
 import type { KnowledgeController } from '../knowledge-settings'
@@ -650,6 +651,12 @@ export function registerIpcHandlers(options: {
   const navPrefs = () => createNavPrefsStore(app.getPath('userData'))
   handle(IpcChannels.NavPrefsGet, () => navPrefs().get())
   handle(IpcChannels.NavPrefsSet, (_event, value: unknown) => navPrefs().set(value))
+  const chatHistory = () => createChatHistoryStore(app.getPath('userData'))
+  handle(IpcChannels.ChatHistoryList, () => chatHistory().list())
+  handle(IpcChannels.ChatHistoryGet, (_event, id: unknown) => chatHistory().get(id))
+  handle(IpcChannels.ChatHistorySave, (_event, record: unknown) => chatHistory().save(record))
+  handle(IpcChannels.ChatHistoryDelete, (_event, id: unknown) => chatHistory().delete(id))
+  handle(IpcChannels.ChatHistoryClear, () => chatHistory().clear())
 
   handle(IpcChannels.AppPing, () => 'pong')
   handle(IpcChannels.AppVersion, () => app.getVersion())
