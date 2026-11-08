@@ -751,7 +751,7 @@ export class KnowledgeViewHost {
     this.destroy(reason)
   }
 
-  /** Renderer answered the confirmation dialog (U7.2). Invalid ids never reach here. */
+  /** Renderer answered the confirmation dialog (U7.2). The IPC handler drops a malformed id or answer before this; an unknown id is ignored here. */
   answerConfirm(id: string, confirmed: boolean): void {
     const pending = this.pendingConfirm
     if (!pending || pending.id !== id) return

@@ -1,5 +1,6 @@
-// KB-C2-04b-2 (#1624): the conversation's draft attachments. Only a confirmed
-// return_to_chat_intent adds to this (U7.2). Nothing here is sent on its own.
+// KB-C2-04b-2 (#1624): the conversation's draft attachments. `add` has one caller,
+// the view's `attach`, which the bridge calls only after the user confirmed a
+// return_to_chat_intent (U7.2). The model sees an entry only when Chat sends a turn.
 
 import { randomBytes } from 'node:crypto'
 
