@@ -58,6 +58,9 @@ function toRecord(id: string, messages: Message[], stamps: readonly string[]): C
     // already on file over it (UI-04).
     title: promptTitle(messages.find(m => m.role === 'user')?.content ?? ''),
     title_source: 'prompt',
+    // Main keeps the group and the archive mark on file (UI-06).
+    group_id: null,
+    archived_at: null,
     created_at: stamps[0] ?? '',
     updated_at: stamps.slice(0, messages.length).reduce((a, b) => (b > a ? b : a), ''),
     messages: messages.map((m, i) => m.role === 'user'

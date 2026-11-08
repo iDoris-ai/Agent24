@@ -15,7 +15,7 @@ function record(id: string, updated: string, title = id): ChatHistoryRecord {
     version: CHAT_HISTORY_VERSION,
     id,
     title,
-    title_source: 'prompt',
+    title_source: 'prompt', group_id: null, archived_at: null,
     created_at: '2026-11-08T00:00:00.000Z',
     updated_at: updated,
     messages: [
@@ -53,8 +53,8 @@ describe('chat history on disk', () => {
     store.save(record('chat_a', '2026-11-08T03:00:00.000Z', 'renamed'))
     store.save(record('chat_b', '2026-11-08T02:00:00.000Z'))
     expect(store.list()).toEqual([
-      { id: 'chat_a', title: 'renamed', title_source: 'prompt', created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T03:00:00.000Z', first_prompt: '你好' },
-      { id: 'chat_b', title: 'chat_b', title_source: 'prompt', created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T02:00:00.000Z', first_prompt: '你好' },
+      { id: 'chat_a', title: 'renamed', title_source: 'prompt', group_id: null, archived_at: null, created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T03:00:00.000Z', first_prompt: '你好' },
+      { id: 'chat_b', title: 'chat_b', title_source: 'prompt', group_id: null, archived_at: null, created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T02:00:00.000Z', first_prompt: '你好' },
     ])
     store.delete('chat_a')
     expect(store.get('chat_a')).toBeNull()
@@ -210,7 +210,7 @@ describe('chat history titles (UI-04)', () => {
 
   it('a save returns the summary as written', () => {
     expect(createChatHistoryStore(dir).save(record('chat_a', at, '问'))).toEqual(
-      { id: 'chat_a', title: '问', title_source: 'prompt', created_at: '2026-11-08T00:00:00.000Z', updated_at: at, first_prompt: '你好' })
+      { id: 'chat_a', title: '问', title_source: 'prompt', group_id: null, archived_at: null, created_at: '2026-11-08T00:00:00.000Z', updated_at: at, first_prompt: '你好' })
   })
 
   it('a rename is kept over every later save of the first prompt\'s title', () => {
@@ -317,5 +317,180 @@ describe('chat history titles (UI-04)', () => {
     store.setTitle('chat_a', '名', 'user')
     expect(open).toHaveBeenCalledWith(expect.stringMatching(/chat_a\.json\.[0-9a-f]{12}\.tmp$/), 'wx', 0o600)
     expect(fs.readdirSync(path.join(dir, 'chat-history'))).toEqual(['chat_a.json'])
+  })
+})
+
+describe('chat history groups and archive (UI-06)', () => {
+  const at = '2026-11-08T01:00:00.000Z'
+  const later = '2026-11-08T02:00:00.000Z'
+  const onDisk = (id: string) => JSON.parse(fs.readFileSync(path.join(dir, 'chat-history', `${id}.json`), 'utf8'))
+
+  it('reads a file without group_id or archived_at as not grouped, not archived', () => {
+    const old: Partial<ChatHistoryRecord> = record('chat_a', at)
+    delete old.group_id
+    delete old.archived_at
+    fs.mkdirSync(path.join(dir, 'chat-history'))
+    fs.writeFileSync(path.join(dir, 'chat-history', 'chat_a.json'), JSON.stringify(old))
+    expect(createChatHistoryStore(dir).get('chat_a')).toMatchObject({ group_id: null, archived_at: null })
+  })
+
+  it.each([
+    ['a bad group id', { group_id: '../x' }],
+    ['a conversation id as group', { group_id: 'chat_a' }],
+    ['a bad archive time', { archived_at: 'yesterday' }],
+  ])('refuses a record with %s', (_name, patch) => {
+    expect(() => parseChatHistoryRecord({ ...record('chat_a', at), ...patch })).toThrow('Invalid chat history record')
+  })
+
+  it('moves and archives through organize; saves never change either, however late', () => {
+    const store = createChatHistoryStore(dir)
+    store.save(record('chat_a', at))
+    const { groups: [work] } = store.createGroup(' 工作\n项目 ')
+    expect(work).toMatchObject({ name: '工作 项目', collapsed: false, id: expect.stringMatching(/^grp_[a-z0-9_]+$/) })
+    expect(store.organize('chat_a', { group_id: work.id })).toMatchObject({ group_id: work.id, archived_at: null, updated_at: at })
+    const archived = store.organize('chat_a', { archived: true })!
+    expect(archived.archived_at).toMatch(/Z$/)
+    expect(archived).toMatchObject({ group_id: work.id, updated_at: at })
+    // Archiving again keeps the first time.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2027-01-01T00:00:00.000Z'))
+    try { expect(store.organize('chat_a', { archived: true })?.archived_at).toBe(archived.archived_at) }
+    finally { vi.useRealTimers() }
+    // The page's save carries neither; a page that sent them is ignored too.
+    const summary = store.save({ ...record('chat_a', later), group_id: null, archived_at: null })
+    expect(summary).toMatchObject({ group_id: work.id, archived_at: archived.archived_at, updated_at: later })
+    expect(onDisk('chat_a')).toMatchObject({ group_id: work.id, archived_at: archived.archived_at })
+    const fresh = store.save({ ...record('chat_b', at), group_id: work.id, archived_at: at })
+    expect(fresh).toMatchObject({ group_id: null, archived_at: null })
+    // Restoring keeps the group, so it goes back where it was; null takes it out.
+    expect(store.organize('chat_a', { archived: false })).toMatchObject({ group_id: work.id, archived_at: null })
+    expect(store.organize('chat_a', { group_id: null })).toMatchObject({ group_id: null })
+    expect(store.list().map(s => [s.id, s.group_id, s.archived_at])).toEqual([['chat_a', null, null], ['chat_b', null, null]])
+  })
+
+  it('organizes only a conversation on file, into a group that exists', () => {
+    const store = createChatHistoryStore(dir)
+    const { groups: [work] } = store.createGroup('工作')
+    expect(store.organize('chat_gone', { archived: true })).toBeNull()
+    expect(fs.existsSync(path.join(dir, 'chat-history', 'chat_gone.json'))).toBe(false)
+    store.save(record('chat_a', at))
+    expect(() => store.organize('chat_a', { group_id: 'grp_never' })).toThrow('Unknown chat group')
+    store.deleteGroup(work.id)
+    expect(() => store.organize('chat_a', { group_id: work.id })).toThrow('Unknown chat group')
+    expect(store.get('chat_a')).toMatchObject({ group_id: null })
+  })
+
+  it.each([
+    ['no change', {}],
+    ['an unknown field', { title: 'x' }],
+    ['an unknown field beside a known one', { archived: true, title: 'x' }],
+    ['a non-boolean archive', { archived: 'yes' }],
+    ['a bad group id', { group_id: '../x' }],
+    ['not an object', 'archive'],
+  ])('refuses organize with %s', (_name, patch) => {
+    const store = createChatHistoryStore(dir)
+    store.save(record('chat_a', at))
+    expect(() => store.organize('chat_a', patch)).toThrow()
+    expect(store.get('chat_a')).toMatchObject({ group_id: null, archived_at: null })
+  })
+
+  it('renames, folds and deletes groups; deleting leaves its conversations alone', () => {
+    const store = createChatHistoryStore(dir)
+    expect(store.groups()).toEqual({ groups: [], assistant_collapsed: false, archive_collapsed: true })
+    store.createGroup('甲')
+    const { groups: [a, b] } = store.createGroup('乙')
+    expect([a.name, b.name]).toEqual(['甲', '乙'])
+    expect(store.renameGroup(b.id, '丙').groups.map(g => g.name)).toEqual(['甲', '丙'])
+    expect(store.setCollapsed(a.id, true).groups[0].collapsed).toBe(true)
+    expect(store.setCollapsed('assistant', true).assistant_collapsed).toBe(true)
+    expect(store.setCollapsed('archive', false).archive_collapsed).toBe(false)
+    store.save(record('chat_a', at))
+    store.organize('chat_a', { group_id: a.id })
+    expect(store.deleteGroup(a.id).groups.map(g => g.name)).toEqual(['丙'])
+    // The conversation is not rewritten: its group just no longer exists.
+    expect(store.get('chat_a')?.group_id).toBe(a.id)
+    // Unknown groups change nothing.
+    expect(store.renameGroup('grp_none', 'x').groups).toHaveLength(1)
+    expect(store.deleteGroup('grp_none').groups).toHaveLength(1)
+    // Survives a new store; clearing the history keeps the groups.
+    store.clear()
+    expect(createChatHistoryStore(dir).groups()).toMatchObject({ groups: [{ name: '丙' }], assistant_collapsed: true, archive_collapsed: false })
+    expect(store.list()).toEqual([])
+  })
+
+  it.each([
+    ['an empty name', () => createChatHistoryStore(dir).createGroup(' \n ')],
+    ['a name that is not text', () => createChatHistoryStore(dir).createGroup(3)],
+    ['an overlong name', () => createChatHistoryStore(dir).createGroup('x'.repeat(1001))],
+    ['a bad group id', () => createChatHistoryStore(dir).renameGroup('../x', 'a')],
+    ['a bad fold target', () => createChatHistoryStore(dir).setCollapsed('../x', true)],
+    ['a non-boolean fold', () => createChatHistoryStore(dir).setCollapsed('assistant', 'yes')],
+  ])('refuses a group change with %s', (_name, change) => {
+    expect(change).toThrow()
+  })
+
+  it('stops at 200 groups', () => {
+    const store = createChatHistoryStore(dir)
+    for (let i = 0; i < 200; i++) store.createGroup(`组${i}`)
+    expect(() => store.createGroup('多一个')).toThrow('Too many chat groups')
+  })
+
+  it('reads a damaged or foreign groups file as no groups; a change sets it aside, not over it', () => {
+    fs.mkdirSync(path.join(dir, 'chat-history'))
+    const file = path.join(dir, 'chat-history', '_groups.json')
+    for (const body of ['{', JSON.stringify({ format: 'x', version: 1, groups: [], assistant_collapsed: false, archive_collapsed: true }),
+      JSON.stringify({ format: 'agent24.desktop.chat-groups', version: 1, groups: [{ id: 'grp_a', name: '', created_at: at, collapsed: false }], assistant_collapsed: false, archive_collapsed: true }),
+      JSON.stringify({ format: 'agent24.desktop.chat-groups', version: 1, groups: [{ id: 'grp_a', name: '甲', created_at: at, collapsed: false }, { id: 'grp_a', name: '乙', created_at: at, collapsed: false }], assistant_collapsed: false, archive_collapsed: true })]) {
+      fs.writeFileSync(file, body)
+      expect(createChatHistoryStore(dir).groups().groups).toEqual([])
+    }
+    const damaged = fs.readFileSync(file, 'utf8')
+    const open = vi.spyOn(fs, 'openSync')
+    createChatHistoryStore(dir).createGroup('新')
+    expect(open).toHaveBeenCalledWith(expect.stringMatching(/_groups\.json\.[0-9a-f]{12}\.tmp$/), 'wx', 0o600)
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toMatchObject({ format: 'agent24.desktop.chat-groups', version: 1 })
+    // Damaged again: that one is set aside as well, beside the first.
+    fs.writeFileSync(file, '[')
+    createChatHistoryStore(dir).createGroup('又')
+    const root = path.join(dir, 'chat-history')
+    const aside = fs.readdirSync(root).filter(n => /^_groups\.damaged\.\d+\.[0-9a-f]{8}\.json$/.test(n))
+    expect(aside.map(n => fs.readFileSync(path.join(root, n), 'utf8')).sort()).toEqual([damaged, '['].sort())
+    expect(fs.readdirSync(root)).toHaveLength(3)
+  })
+
+  it('refuses a group change when the groups file is there but cannot be read', () => {
+    const store = createChatHistoryStore(dir)
+    store.createGroup('甲')
+    const file = path.join(dir, 'chat-history', '_groups.json')
+    const before = fs.readFileSync(file, 'utf8')
+    const real = fs.readFileSync
+    vi.spyOn(fs, 'readFileSync').mockImplementation(((f: fs.PathOrFileDescriptor, o?: unknown) => {
+      if (f === file) throw Object.assign(new Error('EACCES'), { code: 'EACCES' })
+      return real(f, o as never)
+    }) as typeof fs.readFileSync)
+    expect(store.groups().groups).toEqual([])
+    for (const change of [() => store.createGroup('乙'), () => store.setCollapsed('assistant', true)]) {
+      expect(change).toThrow('Chat groups unreadable')
+    }
+    vi.restoreAllMocks()
+    expect(fs.readFileSync(file, 'utf8')).toBe(before)
+  })
+
+  it('deleting a group and clearing remove temporary files of interrupted group writes', () => {
+    const store = createChatHistoryStore(dir)
+    const { groups: [a] } = store.createGroup('甲')
+    const root = path.join(dir, 'chat-history')
+    const stray = () => fs.writeFileSync(path.join(root, '_groups.json.0123456789ab.tmp'), '{"groups":[{"name":"甲"}]}')
+    stray()
+    fs.writeFileSync(path.join(root, '_groups.json.keep'), 'x')
+    store.deleteGroup(a.id)
+    expect(fs.readdirSync(root).sort()).toEqual(['_groups.json', '_groups.json.keep'])
+    // A deletion asked again after one that stopped before its sweep.
+    stray()
+    store.deleteGroup(a.id)
+    expect(fs.readdirSync(root).sort()).toEqual(['_groups.json', '_groups.json.keep'])
+    stray()
+    store.clear()
+    expect(fs.readdirSync(root).sort()).toEqual(['_groups.json', '_groups.json.keep'])
   })
 })

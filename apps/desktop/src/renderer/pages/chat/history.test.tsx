@@ -41,7 +41,7 @@ function memoryStore() {
 
 function stored(id: string, title: string, updated: string): ChatHistoryRecord {
   return {
-    format: 'agent24.desktop.chat-history', version: 1, id, title, title_source: 'prompt',
+    format: 'agent24.desktop.chat-history', version: 1, id, title, title_source: 'prompt', group_id: null, archived_at: null,
     created_at: '2026-11-07T10:00:00.000Z', updated_at: updated,
     messages: [
       { role: 'user', content: title, at: '2026-11-07T10:00:00.000Z', delivered: true },

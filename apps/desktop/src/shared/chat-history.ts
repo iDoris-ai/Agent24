@@ -53,14 +53,53 @@ export interface ChatHistoryRecord {
   id: string
   title: string
   title_source: ChatHistoryTitleSource
+  /** UI-06: the group the user put the conversation in, or null. A group
+   *  that no longer exists counts as none. Added within version 1. */
+  group_id: string | null
+  /** UI-06: when the user archived it (UTC ISO), or null. Added within
+   *  version 1. Only `organize` changes these two; a save keeps them. */
+  archived_at: string | null
   created_at: string
   updated_at: string
   messages: ChatHistoryMessage[]
 }
 
+/** A group's id: only these characters, so it can never be a file name or
+ *  collide with a conversation's id. */
+export const CHAT_GROUP_ID = /^grp_[a-z0-9_]{1,80}$/
+
+/** UI-06: a group the user made in the history list. */
+export interface ChatGroup {
+  id: string
+  name: string
+  created_at: string
+  collapsed: boolean
+}
+
+export const CHAT_GROUPS_FORMAT = 'agent24.desktop.chat-groups'
+export const CHAT_GROUPS_VERSION = 1
+
+/** UI-06: the history list's groups, in the order they were made, and which
+ *  parts of the list are folded. Kept beside the conversations in
+ *  `chat-history/_groups.json`. */
+export interface ChatGroupsState {
+  groups: ChatGroup[]
+  /** The whole list under the assistant is folded. */
+  assistant_collapsed: boolean
+  /** The archived conversations are folded (they start folded). */
+  archive_collapsed: boolean
+}
+
+/** What the page may change about a conversation's place in the list. */
+export interface ChatHistoryOrganize {
+  group_id?: string | null
+  archived?: boolean
+}
+
 /** What the history list shows and searches: the record without its
  *  messages, plus the start of its first prompt (UI-04 T3). */
-export interface ChatHistorySummary extends Pick<ChatHistoryRecord, 'id' | 'title' | 'title_source' | 'created_at' | 'updated_at'> {
+export interface ChatHistorySummary extends Pick<ChatHistoryRecord,
+  'id' | 'title' | 'title_source' | 'group_id' | 'archived_at' | 'created_at' | 'updated_at'> {
   /** The first prompt on one line, at most `FIRST_PROMPT_CHARS` characters. */
   first_prompt: string
 }
@@ -98,7 +137,7 @@ export function chatHistorySummary(r: ChatHistoryRecord): ChatHistorySummary {
     if (chars.length === FIRST_PROMPT_CHARS) break
   }
   return {
-    id: r.id, title: r.title, title_source: r.title_source, created_at: r.created_at, updated_at: r.updated_at,
-    first_prompt: chars.join(''),
+    id: r.id, title: r.title, title_source: r.title_source, group_id: r.group_id, archived_at: r.archived_at,
+    created_at: r.created_at, updated_at: r.updated_at, first_prompt: chars.join(''),
   }
 }
