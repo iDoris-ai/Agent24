@@ -2,13 +2,21 @@ import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import {
+  CHAT_GROUP_ID,
+  CHAT_GROUPS_FORMAT,
+  CHAT_GROUPS_VERSION,
   CHAT_HISTORY_FORMAT,
   CHAT_HISTORY_ID,
+  CHAT_HISTORY_TITLE_SOURCES,
   CHAT_HISTORY_VERSION,
   type ChatHistoryLatency,
   type ChatHistoryMessage,
   type ChatHistoryRecord,
   type ChatHistorySummary,
+  type ChatHistoryTitleSource,
+  type ChatGroup,
+  type ChatGroupsState,
+  chatHistorySummary,
 } from '../shared/chat-history'
 
 /** One conversation's file may not exceed this, so a runaway page cannot
@@ -18,6 +26,16 @@ const MAX_RECORD_BYTES = 8 * 1024 * 1024
  *  left empty: `{"role":"user","content":"","at":"","delivered":true}` is
  *  52; the strings are counted separately below. */
 const MIN_MESSAGE_BYTES = 48
+/** A title set by `setTitle` is at most this many UTF-16 units. The page
+ *  keeps a rename to 80 characters; one character (an emoji sequence, a
+ *  flag) can take a dozen units or more, so this leaves room for them. */
+const MAX_TITLE_UNITS = 4000
+
+/** A title replaces the one on file only when its source is at least as
+ *  strong: the user's rename over the model's title over the first prompt. */
+const TITLE_RANK: Record<ChatHistoryTitleSource, number> = { prompt: 0, model: 1, user: 2 }
+const isTitleSource = (v: unknown): v is ChatHistoryTitleSource =>
+  typeof v === 'string' && (CHAT_HISTORY_TITLE_SOURCES as readonly string[]).includes(v)
 
 /** A cheap lower bound of the written size, checked before the full parse,
  *  so an oversized save is refused without first parsing and serializing
@@ -76,18 +94,56 @@ function parseMessage(v: unknown): ChatHistoryMessage {
 export function parseChatHistoryRecord(v: unknown): ChatHistoryRecord {
   if (!isObject(v) || v.format !== CHAT_HISTORY_FORMAT || v.version !== CHAT_HISTORY_VERSION
     || typeof v.id !== 'string' || !CHAT_HISTORY_ID.test(v.id) || typeof v.title !== 'string'
+    || (v.title_source !== undefined && !isTitleSource(v.title_source))
+    || (v.group_id !== undefined && v.group_id !== null && !(typeof v.group_id === 'string' && CHAT_GROUP_ID.test(v.group_id)))
+    || (v.archived_at !== undefined && v.archived_at !== null && !isTime(v.archived_at))
     || !isTime(v.created_at) || !isTime(v.updated_at) || !Array.isArray(v.messages)) invalid()
   return {
     format: CHAT_HISTORY_FORMAT,
     version: CHAT_HISTORY_VERSION,
     id: v.id,
     title: v.title,
+    // Files written before the field existed took the first prompt.
+    title_source: v.title_source ?? 'prompt',
+    // Nor these two (UI-06): not in a group, not archived.
+    group_id: v.group_id ?? null,
+    archived_at: v.archived_at ?? null,
     created_at: v.created_at,
     updated_at: v.updated_at,
     // Array.from visits holes as undefined, which parseMessage refuses: a
     // sparse array would otherwise be written with nulls and spoil the file.
     messages: Array.from(v.messages as unknown[], parseMessage),
   }
+}
+
+const summaryOf = chatHistorySummary
+
+/** UI-06: how many groups the list keeps, and how long a group's name may
+ *  be (UTF-16 units; the page keeps names far shorter). */
+const MAX_GROUPS = 200
+const MAX_GROUP_NAME_UNITS = 1000
+const GROUPS_DEFAULT: ChatGroupsState = { groups: [], assistant_collapsed: false, archive_collapsed: true }
+
+/** Strict like the conversations: a damaged or foreign file reads as no groups. */
+export function parseChatGroups(v: unknown): ChatGroupsState {
+  if (!isObject(v) || v.format !== CHAT_GROUPS_FORMAT || v.version !== CHAT_GROUPS_VERSION
+    || !Array.isArray(v.groups) || v.groups.length > MAX_GROUPS
+    || typeof v.assistant_collapsed !== 'boolean' || typeof v.archive_collapsed !== 'boolean') invalid()
+  const seen = new Set<string>()
+  const groups = Array.from(v.groups as unknown[], (g): ChatGroup => {
+    if (!isObject(g) || typeof g.id !== 'string' || !CHAT_GROUP_ID.test(g.id) || seen.has(g.id)
+      || typeof g.name !== 'string' || !g.name || g.name.length > MAX_GROUP_NAME_UNITS
+      || !isTime(g.created_at) || typeof g.collapsed !== 'boolean') invalid()
+    seen.add(g.id)
+    return { id: g.id, name: g.name, created_at: g.created_at, collapsed: g.collapsed }
+  })
+  return { groups, assistant_collapsed: v.assistant_collapsed, archive_collapsed: v.archive_collapsed }
+}
+
+const groupName = (name: unknown): string => {
+  const text = typeof name === 'string' ? name.replace(/\s+/g, ' ').trim() : ''
+  if (!text || text.length > MAX_GROUP_NAME_UNITS) throw new Error('Invalid chat group name')
+  return text
 }
 
 /** The main chat's history: one JSON file per conversation under
@@ -116,6 +172,74 @@ export function createChatHistoryStore(dir: string) {
     try { return parseChatHistoryRecord(JSON.parse(fs.readFileSync(file, 'utf8'))) }
     catch { return null }
   }
+  /** The conversation on file under its own id, or null. */
+  const current = (id: string): ChatHistoryRecord | null => {
+    const record = read(fileOf(id))
+    return record && record.id === id ? record : null
+  }
+  /** Writes a file of this store by atomic replacement. */
+  const replace = (file: string, temp: string, body: string): void => {
+    fs.mkdirSync(root, { recursive: true, mode: 0o700 })
+    // A fresh name, created exclusively: never follows or reuses a file
+    // already there, and is ours to remove.
+    const fd = fs.openSync(temp, 'wx', 0o600)
+    let renamed = false
+    try {
+      try { fs.writeFileSync(fd, body) }
+      finally { fs.closeSync(fd) }
+      fs.renameSync(temp, file)
+      renamed = true
+    } finally {
+      // Ours from the moment it was opened: a failed or partial write
+      // (e.g. a full disk) leaves no piece of the transcript behind.
+      if (!renamed) fs.rmSync(temp, { force: true })
+    }
+  }
+  const write = (record: ChatHistoryRecord): void => {
+    const body = JSON.stringify(record)
+    if (Buffer.byteLength(body) > MAX_RECORD_BYTES) throw new Error('Chat history record too large')
+    replace(fileOf(record.id), tempOf(record.id), body)
+  }
+  // UI-06: the groups file. Its name is not a conversation's, so list and
+  // clear leave it alone: clearing the history keeps the groups.
+  const groupsFile = path.join(root, '_groups.json')
+  /** Where a groups file that could not be read is moved before a change
+   *  writes a new one: the user's groups are set aside, not overwritten,
+   *  each time under a name of its own. */
+  const groupsAside = (): string => path.join(root, `_groups.damaged.${Date.now()}.${randomBytes(4).toString('hex')}.json`)
+  const groupsTemp = /^_groups\.json\.[0-9a-f]{12}\.tmp$/
+  const noGroups = (): ChatGroupsState => ({ ...GROUPS_DEFAULT, groups: [] })
+  /** The groups on file. A missing file is no groups. For showing them, a
+   *  damaged one is no groups too; for changing them (`forChange`), it is
+   *  moved aside first, and a file that is there but cannot be read (a
+   *  permission, an I/O error) refuses the change rather than lose it. */
+  const readGroups = (forChange = false): ChatGroupsState => {
+    let text: string
+    try { text = fs.readFileSync(groupsFile, 'utf8') }
+    catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT' || !forChange) return noGroups()
+      throw new Error('Chat groups unreadable')
+    }
+    try { return parseChatGroups(JSON.parse(text)) }
+    catch {
+      if (forChange) fs.renameSync(groupsFile, groupsAside())
+      return noGroups()
+    }
+  }
+  const writeGroups = (state: ChatGroupsState): ChatGroupsState => {
+    const body = JSON.stringify({ format: CHAT_GROUPS_FORMAT, version: CHAT_GROUPS_VERSION, ...state })
+    replace(groupsFile, path.join(root, `_groups.json.${randomBytes(6).toString('hex')}.tmp`), body)
+    return state
+  }
+  /** Temporary files of group writes that died before their rename: they
+   *  may hold the names of groups deleted since. */
+  const sweepGroupTemps = (): void => {
+    for (const name of names()) if (groupsTemp.test(name)) fs.rmSync(path.join(root, name), { force: true })
+  }
+  const checkGroup = (id: unknown): string => {
+    if (typeof id !== 'string' || !CHAT_GROUP_ID.test(id)) throw new Error('Invalid chat group id')
+    return id
+  }
   return {
     /** Newest first. */
     list(): ChatHistorySummary[] {
@@ -123,38 +247,125 @@ export function createChatHistoryStore(dir: string) {
         .filter(name => name.endsWith('.json') && CHAT_HISTORY_ID.test(name.slice(0, -5)))
         .flatMap(name => {
           const record = read(path.join(root, name))
-          return record && `${record.id}.json` === name
-            ? [{ id: record.id, title: record.title, created_at: record.created_at, updated_at: record.updated_at }]
-            : []
+          return record && `${record.id}.json` === name ? [summaryOf(record)] : []
         })
         .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at))
     },
     get(id: unknown): ChatHistoryRecord | null {
-      const record = read(fileOf(id))
-      return record && record.id === id ? record : null
+      return current(checkId(id))
     },
-    save(value: unknown): void {
+    /** Writes the conversation and returns its summary as written. The page
+     *  sends the first prompt's title; a stronger title already on file (a
+     *  rename, the model's title) is kept, so neither a later save nor a
+     *  late retry of an older one undoes it. */
+    save(value: unknown): ChatHistorySummary {
       precheck(value)
-      const record = parseChatHistoryRecord(value)
-      const body = JSON.stringify(record)
-      if (Buffer.byteLength(body) > MAX_RECORD_BYTES) throw new Error('Chat history record too large')
-      const file = fileOf(record.id)
-      fs.mkdirSync(root, { recursive: true, mode: 0o700 })
-      // A fresh name, created exclusively: never follows or reuses a file
-      // already there, and is ours to remove.
-      const temp = tempOf(record.id)
-      const fd = fs.openSync(temp, 'wx', 0o600)
-      let renamed = false
-      try {
-        try { fs.writeFileSync(fd, body) }
-        finally { fs.closeSync(fd) }
-        fs.renameSync(temp, file)
-        renamed = true
-      } finally {
-        // Ours from the moment it was opened: a failed or partial write
-        // (e.g. a full disk) leaves no piece of the transcript behind.
-        if (!renamed) fs.rmSync(temp, { force: true })
+      let record = parseChatHistoryRecord(value)
+      const before = current(record.id)
+      // A save never retitles at its own rank either (PR-Daemon #1640 L3):
+      // titles change through setTitle, so a late retry of an older save
+      // carrying a model or user title cannot undo a newer one. Only the
+      // first prompt's title, recomputed on every save, follows the save.
+      const keep = before && (TITLE_RANK[before.title_source] > TITLE_RANK[record.title_source]
+        || (before.title_source === record.title_source && record.title_source !== 'prompt'))
+      if (before && keep) {
+        record = { ...record, title: before.title, title_source: before.title_source }
       }
+      // Its group and whether it is archived are the user's, changed only
+      // through organize (UI-06): a save, or a late retry of an older one,
+      // keeps what is on file and never sets them.
+      record = { ...record, group_id: before?.group_id ?? null, archived_at: before?.archived_at ?? null }
+      write(record)
+      return summaryOf(record)
+    },
+    /** UI-06: moves a conversation already on file into a group (null: out
+     *  of any) and archives or restores it. Returns its summary as it now
+     *  stands, or null when there is no such conversation (never creates one).
+     *  Leaves the messages and `updated_at` alone: archiving or moving does
+     *  not reorder the list. A group must exist; archiving keeps the group, so
+     *  a restored conversation goes back where it was. */
+    organize(id: unknown, patch: unknown): ChatHistorySummary | null {
+      const own = checkId(id)
+      if (!isObject(patch) || Object.keys(patch).some(k => k !== 'group_id' && k !== 'archived')
+        || (patch.group_id === undefined && patch.archived === undefined)
+        || (patch.archived !== undefined && typeof patch.archived !== 'boolean')) {
+        throw new Error('Invalid chat history change')
+      }
+      if (patch.group_id !== undefined && patch.group_id !== null) {
+        const group = checkGroup(patch.group_id)
+        if (!readGroups().groups.some(g => g.id === group)) throw new Error('Unknown chat group')
+      }
+      const before = current(own)
+      if (!before) return null
+      const record: ChatHistoryRecord = { ...before }
+      if (patch.group_id !== undefined) record.group_id = patch.group_id as string | null
+      if (patch.archived === true) record.archived_at = before.archived_at ?? new Date().toISOString()
+      if (patch.archived === false) record.archived_at = null
+      write(record)
+      return summaryOf(record)
+    },
+    groups(): ChatGroupsState {
+      return readGroups()
+    },
+    /** Adds a group at the end; returns the groups as they now stand. */
+    createGroup(name: unknown): ChatGroupsState {
+      const text = groupName(name)
+      const state = readGroups(true)
+      if (state.groups.length >= MAX_GROUPS) throw new Error('Too many chat groups')
+      const group: ChatGroup = {
+        id: `grp_${Date.now().toString(36)}_${randomBytes(4).toString('hex')}`,
+        name: text, created_at: new Date().toISOString(), collapsed: false,
+      }
+      return writeGroups({ ...state, groups: [...state.groups, group] })
+    },
+    renameGroup(id: unknown, name: unknown): ChatGroupsState {
+      const own = checkGroup(id)
+      const text = groupName(name)
+      const state = readGroups(true)
+      if (!state.groups.some(g => g.id === own)) return state
+      return writeGroups({ ...state, groups: state.groups.map(g => (g.id === own ? { ...g, name: text } : g)) })
+    },
+    /** Removes a group. Its conversations are not touched: one whose group
+     *  no longer exists is listed with the others, so the deletion is one
+     *  write that cannot stop halfway. */
+    deleteGroup(id: unknown): ChatGroupsState {
+      const own = checkGroup(id)
+      const state = readGroups(true)
+      // Gone already (maybe a deletion that stopped before its sweep): the
+      // sweep still runs.
+      if (!state.groups.some(g => g.id === own)) { sweepGroupTemps(); return state }
+      const after = writeGroups({ ...state, groups: state.groups.filter(g => g.id !== own) })
+      sweepGroupTemps()
+      return after
+    },
+    /** Folds or unfolds a group, the whole list ('assistant') or the
+     *  archived conversations ('archive'). */
+    setCollapsed(target: unknown, collapsed: unknown): ChatGroupsState {
+      if (typeof collapsed !== 'boolean') throw new Error('Invalid chat history fold')
+      // Checked before the file is read for a change (PR-Daemon #1647 L1).
+      const own = target === 'assistant' || target === 'archive' ? null : checkGroup(target)
+      const state = readGroups(true)
+      if (target === 'assistant') return writeGroups({ ...state, assistant_collapsed: collapsed })
+      if (target === 'archive') return writeGroups({ ...state, archive_collapsed: collapsed })
+      if (own === null || !state.groups.some(g => g.id === own)) return state
+      return writeGroups({ ...state, groups: state.groups.map(g => (g.id === own ? { ...g, collapsed } : g)) })
+    },
+    /** Retitles a conversation already on file: `user` for a rename, `model`
+     *  for a generated title, which never replaces a rename. Returns the
+     *  summary as it now stands, or null when there is no such conversation
+     *  (never creates one: it may have just been deleted). Leaves the
+     *  messages and `updated_at` alone, so a rename does not reorder the list. */
+    setTitle(id: unknown, title: unknown, source: unknown): ChatHistorySummary | null {
+      const own = checkId(id)
+      if (source !== 'user' && source !== 'model') throw new Error('Invalid chat history title source')
+      const text = typeof title === 'string' ? title.replace(/\s+/g, ' ').trim() : ''
+      if (!text || text.length > MAX_TITLE_UNITS) throw new Error('Invalid chat history title')
+      const before = current(own)
+      if (!before) return null
+      if (TITLE_RANK[before.title_source] > TITLE_RANK[source]) return summaryOf(before)
+      const record: ChatHistoryRecord = { ...before, title: text, title_source: source }
+      write(record)
+      return summaryOf(record)
     },
     delete(id: unknown): void {
       const own = checkId(id)
@@ -168,6 +379,7 @@ export function createChatHistoryStore(dir: string) {
         const conversation = name.endsWith('.json') && CHAT_HISTORY_ID.test(name.slice(0, -5))
         if (conversation || tempOwner(name) !== null) fs.rmSync(path.join(root, name), { force: true })
       }
+      sweepGroupTemps()
     },
   }
 }

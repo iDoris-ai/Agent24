@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo } from 'react'
+import { useState, useRef, useEffect, useMemo, useSyncExternalStore } from 'react'
 import { formatReplySuffix, extractServerReported, type ReplyLatency } from './chat-latency'
 import logoWelcome from '../assets/logo-welcome.png'
 import { useT } from '../i18n'
@@ -8,8 +8,12 @@ import { askWithKnowledge, createChatSession } from './chat-knowledge'
 import { grounding, type Grounding } from './knowledge-grounding'
 import { TurnRail } from './chat/TurnRail'
 import { activeTurn, buildTurns } from './chat/turns'
+import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/title'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../shared/chat-history'
-import { loadConversation, registerChatPage, saveConversation, setActiveConversation, setChatBusy } from './chat/history'
+import {
+  getHistoryState, historyAvailable, loadConversation, registerChatPage, restoreConversation, saveConversation,
+  setActiveConversation, setChatBusy, subscribeHistory, titleConversation,
+} from './chat/history'
 
 /** M1-T14: what `/api/v1/chat` ACTUALLY did with an explicit "记住…" turn —
  *  read off the response field, never off the model's own reply text (the
@@ -42,19 +46,21 @@ interface AssistantMessage {
   runId?: string
 }
 
-/** Characters of the first prompt used as a conversation's title. */
-const TITLE_CHARS = 60
-
 /** UI-03: the conversation as the history keeps it. `stamps[i]` is when
  *  message i arrived; the history keeps text, delivery and the latency line,
  *  not the receipt or Knowledge labels. */
 function toRecord(id: string, messages: Message[], stamps: readonly string[]): ChatHistoryRecord {
-  const first = (messages.find(m => m.role === 'user')?.content ?? '').replace(/\s+/g, ' ').trim()
   return {
     format: CHAT_HISTORY_FORMAT,
     version: CHAT_HISTORY_VERSION,
     id,
-    title: first.length > TITLE_CHARS ? `${first.slice(0, TITLE_CHARS)}…` : first,
+    // Always the first prompt's: main keeps a rename or the model's title
+    // already on file over it (UI-04).
+    title: promptTitle(messages.find(m => m.role === 'user')?.content ?? ''),
+    title_source: 'prompt',
+    // Main keeps the group and the archive mark on file (UI-06).
+    group_id: null,
+    archived_at: null,
     created_at: stamps[0] ?? '',
     updated_at: stamps.slice(0, messages.length).reduce((a, b) => (b > a ? b : a), ''),
     messages: messages.map((m, i) => m.role === 'user'
@@ -95,6 +101,13 @@ export default function ChatPage() {
   // lifetime (M1-T14), so a new conversation is started explicitly via
   // `newChat` below, which swaps in a fresh id.
   const [sessionId, setSessionId] = useState(() => genChatSessionId())
+  // UI-06 D7: the open conversation is archived. It is shown, not continued:
+  // the composer gives way to a note and a way to restore it.
+  const history = useSyncExternalStore(subscribeHistory, getHistoryState)
+  const archived = history.archiving.includes(sessionId)
+    || history.items.some(item => item.id === sessionId && item.archived_at !== null)
+  const archivedRef = useRef(archived)
+  archivedRef.current = archived
   const bottomRef = useRef<HTMLDivElement>(null)
   // The turn rail: each turn's prompt element, keyed by message index, and
   // the turn being read, followed from the scroll position.
@@ -120,6 +133,9 @@ export default function ChatPage() {
   // Bumped by every switch of conversation (new chat, opening one): a load
   // that finishes after a newer switch is dropped.
   const switchGen = useRef(0)
+  // UI-04 T2: conversations whose title the model has been asked for (or
+  // will not be: one opened from the history), so it is asked once at most.
+  const titleAsked = useRef(new Set<string>())
 
   useEffect(() => { setChatBusy(loading) }, [loading])
 
@@ -141,6 +157,23 @@ export default function ChatPage() {
     })
   }, [messages, sessionId])
 
+  // UI-04 T2: once a new conversation's first turn is answered (or its
+  // second or third, when the prompts so far were too short to say much),
+  // the model is asked for its title, once, in the background. It goes to
+  // `/api/v1/chat` without `session_id`: no memory, local models only. A
+  // failure leaves the first prompt's title; a rename always wins.
+  useEffect(() => {
+    if (loading || titleAsked.current.has(sessionId) || !historyAvailable()) return
+    const turns = answeredTurns(messages)
+    if (!titleDue(turns)) return
+    titleAsked.current.add(sessionId)
+    const id = sessionId
+    if (getHistoryState().items.find(item => item.id === id)?.title_source === 'user') return
+    void generateTitle(window.agent24.backendProxy, turns).then(title => {
+      if (title) void titleConversation(id, title)
+    })
+  }, [messages, sessionId, loading])
+
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
     // The page follows the newest turn; so does the rail, even when the chat
@@ -149,7 +182,7 @@ export default function ChatPage() {
   }, [messages, turns])
 
   const send = async (text: string) => {
-    if (!text.trim() || requestInFlight.current || awaitingConfirmation) return
+    if (!text.trim() || requestInFlight.current || awaitingConfirmation || archivedRef.current) return
     const userMsg: Message = { role: 'user', content: text.trim(), delivery: { kind: 'sending' } }
     const request: ChatRequest = {
       messages: [...messages.filter(m => m.role === 'assistant' || m.delivery.kind === 'sent'), userMsg]
@@ -192,6 +225,8 @@ export default function ChatPage() {
     const record = await loadConversation(id)
     if (!record || requestInFlight.current || gen !== switchGen.current) return
     const restored = fromRecord(record)
+    // Its title was settled when it was new; continuing it asks for none.
+    titleAsked.current.add(record.id)
     stamps.current = record.messages.map(m => m.at)
     lastSaved.current = JSON.stringify(toRecord(record.id, restored, stamps.current))
     setMessages(restored)
@@ -207,7 +242,9 @@ export default function ChatPage() {
   }
 
   const requestReply = async (index: number, request: ChatRequest) => {
-    if (requestInFlight.current) return
+    // An archived conversation is read-only (UI-06 D7): nothing is sent, a
+    // retry neither, until it is restored.
+    if (requestInFlight.current || archivedRef.current) return
     requestInFlight.current = true
     setDelivery(index, { kind: 'sending' })
     setLoading(true)
@@ -449,7 +486,14 @@ export default function ChatPage() {
         <div ref={bottomRef} />
       </div>
 
-      <div className="chat-input-bar">
+      {archived ? (
+        <div className="chat-input-bar chat-archived-bar" role="status">
+          <span className="chat-archived-notice">{t('archived.notice')}</span>
+          {/* Not while main is still archiving it: the page leaves it then. */}
+          <button className="btn" disabled={history.archiving.includes(sessionId)}
+            onClick={() => void restoreConversation(sessionId)}>{t('archived.restore')}</button>
+        </div>
+      ) : <div className="chat-input-bar">
         <textarea
           ref={textareaRef}
           className="chat-input"
@@ -466,7 +510,7 @@ export default function ChatPage() {
         >
           ↑
         </button>
-      </div>
+      </div>}
     </div>
   )
 }

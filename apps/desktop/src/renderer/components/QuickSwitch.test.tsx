@@ -158,7 +158,7 @@ describe('QuickSwitch', () => {
 
   it.each([
     ['en', 'Quick switch', 'Search capabilities and actions…', 'Documents', 'Capability · pinned', 'Settings › General', 'No results'],
-    ['zh', '快速切换', '搜索能力和操作…', '文档', '能力 · 已钉选', '设置 › 通用', '没有结果'],
+    ['zh', '快速切换', '搜索能力和操作…', '文档', '能力 · 已固定', '设置 › 通用', '没有结果'],
     ['th', 'สลับด่วน', 'ค้นหาความสามารถและการทำงาน…', 'เอกสาร', 'ความสามารถ · ปักหมุดแล้ว', 'ตั้งค่า › ทั่วไป', 'ไม่พบผลลัพธ์'],
   ] as const)('localizes copy and capability-name search in %s', (locale, title, placeholder, name, pinned, general, empty) => {
     setup()

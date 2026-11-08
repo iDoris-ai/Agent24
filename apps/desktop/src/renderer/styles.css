@@ -88,7 +88,12 @@ button { cursor: pointer; font-family: var(--font); }
 .sidebar-nav { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 0; display: flex; flex-direction: column; }
 .nav-bottom { margin-top: auto; padding-top: 20px; }
 .nav-badge { margin-left: auto; min-width: 20px; border-radius: 12px; padding: 1px 6px; background: var(--accent-dim); color: var(--text); text-align: center; }
-.nav-empty-slot { margin: 4px 16px; padding: 8px 12px; border: 1px dashed var(--border); border-radius: 6px; font-size: 12px; color: var(--muted); }
+.nav-pin-more {
+  display: block; width: calc(100% - 16px); margin: 2px 8px; padding: 6px 12px; text-align: left;
+  background: none; border: none; border-radius: 6px; font-size: 12px; color: var(--muted); opacity: 0.75;
+  -webkit-app-region: no-drag;
+}
+.nav-pin-more:hover, .nav-pin-more:focus-visible { opacity: 1; color: var(--text); background: var(--surface2); }
 .capability-breadcrumb { display: flex; align-items: center; gap: 8px; padding: 12px 24px; font-size: 13px; }
 .capability-breadcrumb button { background: none; border: 0; color: var(--accent); padding: 4px 0; }
 .capability-list { padding-left: 20px; }
@@ -113,10 +118,50 @@ button { cursor: pointer; font-family: var(--font); }
 .nav-item.active { color: var(--accent); background: var(--accent-dim); }
 .nav-item .icon { font-size: 15px; width: 20px; text-align: center; }
 .chat-history { margin: 2px 0 6px; }
+/* The sidebar is a window drag region: the list's headings, names and rows
+   take clicks, double clicks, right clicks and drops themselves. */
+.chat-history, .chat-history-menu { -webkit-app-region: no-drag; }
 .chat-history-head {
-  display: flex; align-items: center; justify-content: space-between; padding: 6px 20px 2px 32px;
+  display: flex; align-items: center; gap: 2px; padding: 6px 20px 2px 14px;
   font-size: 11px; color: var(--muted);
 }
+.chat-history-head-label { flex: 1; min-width: 0; }
+/* UI-06: folds, groups, the ⋯ menu and drag targets. */
+.chat-history-fold {
+  width: 18px; padding: 0; background: none; border: none; color: var(--muted); font-size: 10px;
+  -webkit-app-region: no-drag;
+}
+.chat-history-fold:hover { color: var(--text); }
+.chat-history-group-head {
+  display: flex; align-items: center; gap: 2px; padding: 4px 4px 2px 14px; font-size: 12px; color: var(--muted);
+}
+.chat-history-group-head .chat-history-rename { margin-left: 0; }
+.chat-history-group-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-history-group-head:hover .chat-history-action, .chat-history-head:hover .chat-history-action { opacity: 1; }
+.chat-history-group .chat-history-open { padding-left: 42px; }
+.chat-history-head.drop-over, .chat-history-group-head.drop-over {
+  background: var(--accent-dim); color: var(--text); outline: 1px dashed var(--accent); outline-offset: -1px;
+}
+.chat-history-item.dragging { opacity: 0.5; }
+.chat-history-tag {
+  flex: 0 0 auto; padding: 0 4px; font-size: 10.5px; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 3px;
+}
+.chat-history-menu {
+  position: fixed; z-index: 50; min-width: 160px; max-width: 260px; max-height: calc(100vh - 8px); overflow-y: auto; padding: 4px 0;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  -webkit-app-region: no-drag;
+}
+.chat-history-menu-item {
+  display: block; width: 100%; padding: 5px 12px; background: none; border: none; text-align: left;
+  font-size: 12.5px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.chat-history-menu-item:hover, .chat-history-menu-item:focus-visible { background: var(--surface2); outline: none; }
+.chat-history-menu-item:disabled { opacity: 0.4; cursor: default; background: none; }
+.chat-archived-bar { align-items: center; justify-content: space-between; gap: 12px; }
+.chat-archived-notice { color: var(--muted); font-size: 13px; }
+.chat-history-archive { margin-top: 4px; }
+.chat-history-menu-heading { padding: 6px 12px 2px; font-size: 10.5px; color: var(--muted); }
 .chat-history-clear { background: none; border: none; color: var(--muted); font-size: 11px; padding: 2px 4px; -webkit-app-region: no-drag; }
 .chat-history-clear:hover { color: var(--text); }
 .chat-history-list { list-style: none; max-height: 40vh; overflow-y: auto; }
@@ -128,15 +173,30 @@ button { cursor: pointer; font-family: var(--font); }
   -webkit-app-region: no-drag;
 }
 .chat-history-item:hover .chat-history-open, .chat-history-item.active .chat-history-open { color: var(--text); }
-.chat-history-delete {
-  width: 28px; padding: 4px 0; background: none; border: none; color: var(--muted); font-size: 14px;
+.chat-history-action {
+  width: 24px; padding: 4px 0; background: none; border: none; color: var(--muted); font-size: 13px;
   opacity: 0; -webkit-app-region: no-drag;
 }
-.chat-history-item:hover .chat-history-delete, .chat-history-delete:focus-visible { opacity: 1; }
-.chat-history-delete:hover { color: var(--text); }
+.chat-history-item:hover .chat-history-action, .chat-history-action:focus-visible { opacity: 1; }
+.chat-history-action:hover { color: var(--text); }
 .chat-history-open:disabled, .chat-history-clear:disabled { cursor: default; opacity: 0.4; }
-.chat-history-delete:disabled { cursor: default; }
-.chat-history-item:hover .chat-history-delete:disabled { opacity: 0.4; }
+.chat-history-action:disabled { cursor: default; }
+.chat-history-item:hover .chat-history-action:disabled { opacity: 0.4; }
+.chat-history-search {
+  display: block; width: calc(100% - 40px); margin: 2px 8px 4px 32px; padding: 3px 6px; font-size: 12px;
+  color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 4px;
+  -webkit-app-region: no-drag;
+}
+.chat-history-empty { padding: 4px 8px 6px 32px; font-size: 12px; color: var(--muted); }
+/* The title takes the room left and is cut short; a twin's time always shows. */
+.chat-history-open { display: flex; align-items: baseline; gap: 4px; }
+.chat-history-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.chat-history-when { flex: 0 0 auto; color: var(--muted); font-size: 11px; }
+.chat-history-rename {
+  flex: 1; min-width: 0; margin: 2px 4px 2px 28px; padding: 3px 4px; font-size: 12.5px;
+  color: var(--text); background: var(--surface); border: 1px solid var(--accent); border-radius: 4px;
+  -webkit-app-region: no-drag;
+}
 .nav-section { font-size: 10px; font-weight: 600; color: var(--muted); padding: 14px 20px 4px; letter-spacing: 0.8px; text-transform: uppercase; }
 
 .sidebar-footer {
