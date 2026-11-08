@@ -406,6 +406,11 @@ describe('nothing hides a secret from another rule', () => {
     expect(redact('{"password": "hunter 2 x", "user": "ada"}')).toBe('{"password": 〔已脱敏·凭据〕, "user": "ada"}')
     expect(redact("secret='a b c'")).toBe('secret=〔已脱敏·凭据〕')
   })
+
+  it('a value of punctuation alone is a value, not something already redacted', () => {
+    expect(redact('password=.;.;')).toBe('password=〔已脱敏·凭据〕')
+    expect(redact('pwd: ")"')).toBe('pwd: 〔已脱敏·凭据〕')
+  })
 })
 
 describe('private_key blocks (C3, C4)', () => {
