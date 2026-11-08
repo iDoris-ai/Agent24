@@ -1325,6 +1325,27 @@ describe('bridge wiring (KB-C2-04a-2, U6.1, U6.6)', () => {
     expect(delivered(contents).filter((x) => x.type === 'hello')).toHaveLength(2)
   })
 
+  it('the first state is taken once the session has started, not when the instance is made', async () => {
+    const made: Ui[] = []
+    const factory = (): KnowledgeViewUi => {
+      const u: Ui = {
+        admission: { open: false, generation: 3 },
+        start: async () => { u.admission.open = true; return true },
+        inject: () => ({ cancel: false, requestHeaders: {}, injected: false }),
+        responded: () => {},
+        destroy: () => {},
+        bridgeAdmission: () => u.admission,
+      }
+      made.push(u)
+      return u
+    }
+    const t = setup({ ui: factory })
+    await t.host.show(BOUNDS)
+    const contents = t.views[0].webContents
+    contents.emit('did-navigate', {}, URL_, 200)
+    expect(delivered(contents).filter((m) => m.type === 'state').map((m) => m.payload.profile_state)).toEqual(['ready'])
+  })
+
   it('sends a new state when the theme changes', async () => {
     const u = ui()
     const t = setup({ ui: u.factory })
@@ -1414,7 +1435,6 @@ describe('bridge wiring (KB-C2-04a-2, U6.1, U6.6)', () => {
     const contents = t.views[0].webContents
     u.made[0].admission.open = false
     contents.emit('did-navigate', {}, URL_, 200)
-    expect(delivered(contents).find((m) => m.type === 'state')?.payload.profile_state).toBe('ready')
     post(t, 0, msg())
     expect(delivered(contents).at(-1)?.payload).toEqual({ result: 'rejected', code: 'unavailable', reason: 'not_ready' })
     expect(t.host.status()).toEqual({ state: 'ready' })

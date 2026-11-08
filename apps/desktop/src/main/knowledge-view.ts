@@ -641,6 +641,8 @@ export class KnowledgeViewHost {
       instance.proxied
         .then((): Promise<boolean> | boolean => (current() && instance.ui ? instance.ui.start() : true))
         .then(async (ready): Promise<boolean> => {
+          // The session is there now: the page's first state says so.
+          if (ready && current()) this.sendBridgeState(instance)
           if (ready && current()) {
             instance.navigating = true
             await instance.view.webContents.loadURL(instance.target.url)
