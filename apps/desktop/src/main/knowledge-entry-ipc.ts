@@ -106,7 +106,10 @@ export function knowledgeEntryAdmitter(deps: KnowledgeEntryDeps) {
     } finally {
       asking = false
     }
-    // The conversation may have moved on while the dialog was open: judge it again as it is now.
+    // The conversation may have moved on while the dialog was open: judge it
+    // again as it is now. The dialog named the conversation, not its messages,
+    // so the record judged here is the one drafted; the user reads that draft
+    // before anything is submitted (KB-SOP-01b).
     if (!deps.bound()) return answer({ ok: false, reason: 'knowledge_off' })
     const now = load(id)
     if (!now) return answer({ ok: false, reason: 'not_found' })

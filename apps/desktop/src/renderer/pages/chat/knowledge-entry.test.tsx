@@ -59,10 +59,14 @@ describe('the history list action', () => {
       expect(result.current('chat_abc')).toEqual([])
       unmount()
     }
-    Object.defineProperty(window, 'agent24', { value: { knowledgeEntry: { admit } }, configurable: true })
-    const { result } = renderHook(() => useEntryMenu(), { wrapper: wrapper() })
-    await act(async () => {})
-    expect(result.current('chat_abc')).toEqual([])
+    // No Knowledge bridge, and no preload bridge at all (as in other pages' tests).
+    for (const bridge of [{ knowledgeEntry: { admit } }, undefined]) {
+      Object.defineProperty(window, 'agent24', { value: bridge, configurable: true })
+      const { result, unmount } = renderHook(() => useEntryMenu(), { wrapper: wrapper() })
+      await act(async () => {})
+      expect(result.current('chat_abc')).toEqual([])
+      unmount()
+    }
   })
 
   it('asks again on each press, so a menu opened after Knowledge turned off has no item', async () => {

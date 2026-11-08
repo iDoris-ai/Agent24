@@ -73,7 +73,8 @@ export type EntryAsk =
 
 // Module state, so the list can hand the question to the page without App or
 // Chat carrying it. The question is asked once, from the click, never from a
-// render or an effect (StrictMode runs those twice).
+// render or an effect (StrictMode runs those twice). One renderer has one main
+// window, so one panel state is enough; a second window would share it.
 let current: EntryAsk | null = null
 let asked = 0
 const listeners = new Set<() => void>()
@@ -134,7 +135,8 @@ function useKnowledgeBound(): boolean {
   useEffect(() => {
     let live = true
     const refresh = (): void => {
-      const status = window.agent24.knowledge?.status()
+      // Some pages and tests run without the preload bridge: that is off too.
+      const status = window.agent24?.knowledge?.status?.()
       if (!status) { setBound(false); return }
       status.then((s) => { if (live) setBound(s.active === true) }, () => { if (live) setBound(false) })
     }
