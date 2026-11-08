@@ -575,6 +575,57 @@ describe('citation, cancel, and the in-flight table (U7.2, U6.7, §9.3)', () => 
     expect(windows(BRIDGE_SOFT_LIMIT)).toBe(1)
   })
 
+  it('⑯: within the window, arrivals under the limit count even when they are let through (U6.6: arrived, not refused)', async () => {
+    const run = async (arrivals: number) => {
+      const c = citationHarness()
+      const t = setup({ citation: c.citation })
+      for (let i = 0; i < 4; i++) t.arrive(t.msg('citation', REF))
+      t.arrive(t.msg('citation', REF)) // full: opens ⑯'s window
+      // Four soft violations from elsewhere (⑫), so one more closes.
+      for (let i = 0; i < BRIDGE_SOFT_LIMIT - 1; i++) t.arrive(t.msg('status', { state: 'nope' }))
+      // Two reads finish: the table is no longer full, the window still runs.
+      c.pending[0](okRead())
+      c.pending[1](okRead())
+      await flush()
+      t.advance(BRIDGE_BACKOFF_GRACE_MS)
+      for (let i = 0; i < arrivals; i++) t.arrive(t.msg('status', { state: 'ready' }))
+      const passed = t.replies().slice(-arrivals).every((r) => r.payload.result === 'done')
+      return { closes: t.closes(), passed }
+    }
+    const three = await run(BRIDGE_BACKOFF_STRIKES)
+    expect(three.closes).toBe(1)
+    const two = await run(BRIDGE_BACKOFF_STRIKES - 1)
+    expect(two).toEqual({ closes: 0, passed: true })
+  })
+
+  it('⑯: cancel is not under that limit and never strikes', () => {
+    const c = citationHarness()
+    const t = setup({ citation: c.citation })
+    for (let i = 0; i < 4; i++) t.arrive(t.msg('citation', REF))
+    t.arrive(t.msg('citation', REF))
+    for (let i = 0; i < BRIDGE_SOFT_LIMIT - 1; i++) t.arrive(t.msg('status', { state: 'nope' }))
+    t.advance(BRIDGE_BACKOFF_GRACE_MS)
+    for (let i = 0; i < BRIDGE_BACKOFF_STRIKES; i++) t.arrive(t.msg('cancel', { target_id: newUlid() }))
+    expect(t.closes()).toBe(0)
+  })
+
+  it('⑯: the message whose strike closes the bridge still gets its overloaded first', () => {
+    const c = citationHarness()
+    const t = setup({ citation: c.citation })
+    for (let i = 0; i < 4; i++) t.arrive(t.msg('citation', REF))
+    let last = t.msg('citation', REF)
+    for (let w = 0; w < BRIDGE_SOFT_LIMIT; w++) {
+      t.arrive(t.msg('citation', REF))
+      t.advance(BRIDGE_BACKOFF_GRACE_MS)
+      for (let i = 0; i < BRIDGE_BACKOFF_STRIKES; i++) { last = t.msg('citation', REF); t.arrive(last) }
+      if (w < BRIDGE_SOFT_LIMIT - 1) t.advance(BRIDGE_BACKOFF_MS - BRIDGE_BACKOFF_GRACE_MS)
+    }
+    expect(t.closes()).toBe(1)
+    expect(t.replies().filter((r) => r.in_reply_to === last.id).map((r) => r.payload)).toEqual([
+      { result: 'rejected', code: 'unavailable', reason: 'overloaded', retry_after_ms: BRIDGE_BACKOFF_MS },
+    ])
+  })
+
   it('⑯ full within the grace counts nothing', async () => {
     const c = citationHarness()
     const t = setup({ citation: c.citation })

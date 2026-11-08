@@ -9,6 +9,8 @@ const READ_MAX_BYTES = 65_536
 const READ_DEADLINE_MS = 9_000
 const READ_CODES = new Set(['unauthorized', 'invalid_request', 'forbidden', 'not_found', 'stale', 'timeout', 'unavailable', 'internal'])
 const REASON = /^[a-z_]{1,64}$/
+/** R6.1: the only codes whose envelope may carry a null request_id or generation. */
+const NULL_ECHO = new Set(['invalid_request', 'unauthorized', 'internal'])
 // U+0000–001F, U+007F–009F, and the bidi controls U7.2 names.
 const STRIP = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu
 
@@ -52,10 +54,13 @@ function fail(code: string, reason?: string): ChunkRead {
 /** R6.1 envelope. Unknown code becomes internal (R6.2). Branch on code, not on HTTP status. */
 function readError(body: unknown, requestId: string, generation: number): ChunkRead {
   if (!isObj(body) || !isObj(body.error) || !isObj(body.error.details)) return fail('internal')
-  // R6.1 / R7.3: the envelope echoes this request; null only where R6.1 allows it, paired by this exchange.
+  // R6.1 / R7.3: the envelope echoes this request. null only where R6.1 allows it (a body that
+  // could not be read or echoed: invalid_request; failing before the body: unauthorized, internal),
+  // and then paired by this exchange.
   const details = body.error.details
-  if (details.request_id !== requestId && details.request_id !== null) return fail('internal')
-  if (details.generation !== generation && details.generation !== null) return fail('internal')
+  const nullable = typeof body.error.code === 'string' && NULL_ECHO.has(body.error.code)
+  if (details.request_id !== requestId && !(nullable && details.request_id === null)) return fail('internal')
+  if (details.generation !== generation && !(nullable && details.generation === null)) return fail('internal')
   const raw = body.error.code
   const code = typeof raw === 'string' && READ_CODES.has(raw) ? raw : 'internal'
   const reason = body.error.details.reason
@@ -193,7 +198,9 @@ export async function readCitationChunk(deps: ReadonlyDeps, generation: number, 
     const posted = await post(deps, credential, body, signal)
     if ('ok' in posted) return posted
     // R6.2: an error envelope is read by its code, whatever the HTTP status; a success is only a 200.
-    if (isObj(posted.json) && 'error' in posted.json) return readError(posted.json, requestId, generation)
+    // A success body is known first (§0.3: unknown fields, an `error` among them, are ignored).
+    const success = isObj(posted.json) && 'segments' in posted.json
+    if (!success && isObj(posted.json) && isObj(posted.json.error)) return readError(posted.json, requestId, generation)
     if (posted.status !== 200) return fail('internal')
     const parsed = readPage(posted.json, requestId, generation, ref)
     if (!isPage(parsed)) return parsed

@@ -299,7 +299,16 @@ export class KnowledgeBridge {
     if (this.seenSet.has(message.id)) return this.reject('⑮', document, id, { code: 'invalid_request', reason: 'duplicate_id' }, true)
     // ⑯ in flight (U6.7). `cancel` takes no slot. A full table is uncounted (§9.3),
     // and the id stays out of the dedupe table (U6.4: only what passes ⑯ is remembered).
-    if (message.payload.type !== 'cancel' && this.inflight.size >= BRIDGE_IN_FLIGHT) return this.inflightFull(document, id)
+    if (message.payload.type !== 'cancel') {
+      if (this.inflight.size >= BRIDGE_IN_FLIGHT) return this.inflightFull(document, id)
+      // U6.6: within ⑯'s window every arrival under that limit counts, admitted or not.
+      const b = this.inflightBackoff
+      if (b) {
+        const now = this.deps.now()
+        if (now < b.until) this.strike(b, now)
+        if (this.closed) return
+      }
+    }
     this.remember(message.id)
     this.handle(message, document)
   }
@@ -425,10 +434,12 @@ export class KnowledgeBridge {
   private inflightFull(document: number, id: string | undefined): void {
     const now = this.deps.now()
     const b = this.inflightBackoff
-    if (b && now < b.until) this.strike(b, now)
-    else this.inflightBackoff = { from: now, until: now + BRIDGE_BACKOFF_MS, strikes: 0, struck: false }
+    const within = b !== null && now < b.until
+    if (!within) this.inflightBackoff = { from: now, until: now + BRIDGE_BACKOFF_MS, strikes: 0, struck: false }
     this.log('⑯', id, 'overloaded')
+    // The reply goes first, as for every other refusal: a strike may close the bridge.
     this.reply(document, id, { result: 'rejected', code: 'unavailable', reason: 'overloaded', retry_after_ms: BRIDGE_BACKOFF_MS })
+    if (within) this.strike(b!, now)
   }
 
   private strike(b: Backoff, now: number): void {

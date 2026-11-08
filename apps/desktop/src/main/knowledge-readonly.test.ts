@@ -63,7 +63,6 @@ function okPage(req: Record<string, any>, over: { text?: string; title?: unknown
   const truncated = over.truncated ?? false
   const body: Record<string, unknown> = {
     protocol_version: 1,
-    protocol_version: 1,
     request_id: over.requestId ?? req.request_id,
     generation: over.generation ?? req.generation,
     effective_scope: over.scope ?? { knowledge_base_ids: [REF.knowledge_base_id] },
@@ -157,6 +156,13 @@ describe('readCitationChunk', () => {
     expect(await read(deps)).toEqual({ ok: false, code: 'not_found' })
   })
 
+  it('a 200 success with an extra `error` field is still a success (§0.3)', async () => {
+    for (const extra of [null, { code: 'not_found', details: {} }]) {
+      const { deps } = client((call) => ({ status: 200, json: async () => ({ ...((await okPage(call.body).json()) as object), error: extra }) }))
+      expect(await read(deps)).toMatchObject({ ok: true })
+    }
+  })
+
   it('a success body on another status is internal', async () => {
     const { deps } = client((call) => ({ ...okPage(call.body), status: 203 }))
     expect(await read(deps)).toEqual({ ok: false, code: 'internal' })
@@ -176,7 +182,18 @@ describe('readCitationChunk', () => {
     expect(await read(client(with_('echo', 99)).deps)).toEqual({ ok: false, code: 'internal' })
     expect(await read(client(with_(undefined, 'echo')).deps)).toEqual({ ok: false, code: 'internal' })
     expect(await read(client(with_('echo', undefined)).deps)).toEqual({ ok: false, code: 'internal' })
-    expect(await read(client(with_(null, null)).deps)).toEqual({ ok: false, code: 'not_found' })
+    // not_found has to echo: a null is not R6.1's.
+    expect(await read(client(with_(null, null)).deps)).toEqual({ ok: false, code: 'internal' })
+    expect(await read(client(with_('echo', null)).deps)).toEqual({ ok: false, code: 'internal' })
+    // R6.1's three: invalid_request, and unauthorized / internal before the body is read.
+    for (const code of ['invalid_request', 'unauthorized', 'internal']) {
+      const env = (call: Call) => ({ status: 400, json: async () => ({ error: { code, details: { retryable: false, request_id: null, generation: code === 'invalid_request' ? call.body.generation : null } } }) })
+      expect(await read(client(env).deps)).toEqual({ ok: false, code })
+    }
+    for (const code of ['forbidden', 'stale', 'timeout', 'unavailable']) {
+      const env = () => ({ status: 400, json: async () => ({ error: { code, details: { retryable: false, request_id: null, generation: null } } }) })
+      expect(await read(client(env).deps)).toEqual({ ok: false, code: 'internal' })
+    }
     expect(await read(client(with_('echo', 'echo')).deps)).toEqual({ ok: false, code: 'not_found' })
   })
 
@@ -204,13 +221,13 @@ describe('readCitationChunk', () => {
   })
 
   it('an unknown code becomes internal, and a bad reason is dropped', async () => {
-    const { deps: unknown } = client(() => ({ status: 400, json: async () => ({ error: { code: 'nope', details: { retryable: false, request_id: null, generation: null, reason: 'kept_reason' } } }) }))
+    const { deps: unknown } = client((call) => ({ status: 400, json: async () => ({ error: { code: 'nope', details: { retryable: false, request_id: call.body.request_id, generation: call.body.generation, reason: 'kept_reason' } } }) }))
     expect(await read(unknown)).toEqual({ ok: false, code: 'internal', reason: 'kept_reason' })
-    const { deps: digits } = client(() => ({ status: 400, json: async () => ({ error: { code: 'stale', details: { retryable: false, request_id: null, generation: null, reason: 'a1' } } }) }))
+    const { deps: digits } = client((call) => ({ status: 400, json: async () => ({ error: { code: 'stale', details: { retryable: false, request_id: call.body.request_id, generation: call.body.generation, reason: 'a1' } } }) }))
     expect(await read(digits)).toEqual({ ok: false, code: 'stale' })
-    const { deps: long } = client(() => ({ status: 400, json: async () => ({ error: { code: 'stale', details: { retryable: false, request_id: null, generation: null, reason: 'a'.repeat(65) } } }) }))
+    const { deps: long } = client((call) => ({ status: 400, json: async () => ({ error: { code: 'stale', details: { retryable: false, request_id: call.body.request_id, generation: call.body.generation, reason: 'a'.repeat(65) } } }) }))
     expect(await read(long)).toEqual({ ok: false, code: 'stale' })
-    const { deps: kept } = client(() => ({ status: 400, json: async () => ({ error: { code: 'stale', details: { retryable: false, request_id: null, generation: null, reason: 'a'.repeat(64) } } }) }))
+    const { deps: kept } = client((call) => ({ status: 400, json: async () => ({ error: { code: 'stale', details: { retryable: false, request_id: call.body.request_id, generation: call.body.generation, reason: 'a'.repeat(64) } } }) }))
     expect(await read(kept)).toEqual({ ok: false, code: 'stale', reason: 'a'.repeat(64) })
     const { deps: bare } = client(() => ({ status: 400, json: async () => ({ error: { code: 'stale' } }) }))
     expect(await read(bare)).toEqual({ ok: false, code: 'internal' })
