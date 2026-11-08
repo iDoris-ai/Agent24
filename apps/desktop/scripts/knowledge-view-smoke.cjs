@@ -12,9 +12,13 @@
 //
 // Since KB-C2-04a the host runs the real UI session against A, which also
 // plays WeKnora's ticket/exchange/session/revocation endpoints, and the page
-// checks what its own fetches carry (U4.5).
+// checks what its own fetches carry (U4.5). Since KB-C2-04a-2 the page also
+// talks over the bridge (UIB §6): hello request, hello, a status and its reply,
+// with the reserved POST never reaching A; and main sees the view's input.
+// (A sub-frame sender cannot be made: the page CSP has frame-src 'none'; the
+// unit tests cover that step.)
 //
-// Prints one line per check (36) and exits non-zero if any fails.
+// Prints one line per check (40) and exits non-zero if any fails.
 
 const http = require('node:http')
 
@@ -83,6 +87,27 @@ const within = (p, ms) => {
     const forged = { Authorization: 'Bearer forged', 'X-Agent24-View-Proof': 'forged' }
     stage('ui-allowed'); r.uiAllowed = await within(fetch(UI_LIST, { headers: forged }).then((x) => x.status, () => 'blocked'), 3000)
     stage('ui-plain'); r.uiPlain = await within(fetch('/plain-api', { headers: forged }).then((x) => x.status, () => 'blocked'), 3000)
+    // KB-C2-04a-2: the bridge (UIB §6). The page asks for hello (generation 0),
+    // reads it from the host's dispatched message event, then sends a status
+    // with that generation and waits for its reply. The POST never reaches A.
+    stage('bridge')
+    {
+      const got = []
+      window.addEventListener('message', (e) => { if (e.data && e.data.direction === 'host_to_page') got.push(e.data) })
+      const ulid = (n) => '01J9ZQ3V6R8XKQ4M2N5P7T' + String(n).padStart(4, '0')
+      const post = (m) => fetch('/__agent24/bridge', { method: 'POST', body: JSON.stringify(m) }).then(() => 'reached', () => 'cancelled')
+      const waitFor = (pred) => within(new Promise((d) => { const t0 = Date.now(); const tick = () => (pred() || Date.now() - t0 > 2500 ? d() : setTimeout(tick, 50)); tick() }), 3000)
+      r.bridgePost = await within(post({ v: 2, direction: 'page_to_host', type: 'status', id: ulid(1), generation: 0, payload: { state: 'loading' } }), 3000)
+      await waitFor(() => got.some((m) => m.type === 'hello'))
+      const hello = got.find((m) => m.type === 'hello')
+      r.bridgeHello = hello ? { supported: hello.payload.supported, idOk: /^[A-Za-z0-9_-]{22}$/.test(hello.payload.view_instance_id), generation: hello.generation } : null
+      if (hello) {
+        await within(post({ v: 2, direction: 'page_to_host', type: 'status', id: ulid(2), generation: hello.generation, payload: { state: 'ready' } }), 3000)
+        await waitFor(() => got.some((m) => m.type === 'reply' && m.in_reply_to === ulid(2)))
+        const reply = got.find((m) => m.type === 'reply' && m.in_reply_to === ulid(2))
+        r.bridgeReply = reply ? reply.payload : null
+      }
+    }
     stage('download'); { const a = document.createElement('a'); a.href = '/download'; a.download = 'x.bin'; document.body.appendChild(a); a.click() }
     // PR-Daemon #1630 C1/R2-6: ways out that bypass webRequest or CSP in some engines.
     // 'unavailable': no RTCPeerConnection at all (a pass); 'rejected': the API
@@ -319,6 +344,27 @@ async function main() {
     && [...ui.allowed, ...ui.plain].every((h) => h.authorization !== 'Bearer forged' && h.proof !== 'forged'))
   check('UI session: a path off the allowlist gets no session', r1.uiPlain === 200 && ui.plain.length >= 1
     && ui.plain.every((h) => h.authorization === undefined && h.proof === undefined), { status: r1.uiPlain, seen: ui.plain.length })
+  // KB-C2-04a-2 (design §7). A hello at all means the body came as inline bytes
+  // and the request was taken as the main frame's (otherwise: too_large, or a closed bridge).
+  check('bridge: the reserved POST is taken by the host and never reaches the server', r1.bridgePost === 'cancelled'
+    && !hits.A.some((u) => u.startsWith('/__agent24')), { post: r1.bridgePost, reached: hits.A.filter((u) => u.startsWith('/__agent24')) })
+  check('bridge: hello reaches the page as a dispatched message event, under the page CSP', r1.bridgeHello?.idOk === true
+    && JSON.stringify(r1.bridgeHello.supported) === '[2]' && r1.bridgeHello.generation === 1, r1.bridgeHello)
+  check('bridge: a status with that generation gets its reply', r1.bridgeReply?.result === 'done', r1.bridgeReply)
+  {
+    // U6.1 f: activation-type input on the WebContentsView is seen by main.
+    const seen = []
+    const contents = view().webContents
+    const onInput = (_event, input) => seen.push(input.type)
+    contents.on('input-event', onInput)
+    contents.sendInputEvent({ type: 'mouseDown', x: 10, y: 10, button: 'left', clickCount: 1 })
+    contents.sendInputEvent({ type: 'mouseUp', x: 10, y: 10, button: 'left', clickCount: 1 })
+    contents.sendInputEvent({ type: 'keyDown', keyCode: 'A' })
+    contents.sendInputEvent({ type: 'keyUp', keyCode: 'A' })
+    await new Promise((d) => setTimeout(d, 500))
+    contents.removeListener('input-event', onInput)
+    check('bridge: main sees mouseDown and keyDown on the view (input-event)', seen.includes('mouseDown') && (seen.includes('keyDown') || seen.includes('rawKeyDown')), seen)
+  }
   check('Worker and Service Worker refused', r1.worker === 'blocked' && r1.serviceWorker === 'blocked', [r1.worker, r1.serviceWorker])
   check('permissions denied', r1.notification === 'denied' && r1.geo === 'denied:1' && r1.media === 'denied', [r1.notification, r1.geo, r1.media])
   check('inline eval blocked by the partition CSP', r1.eval === 'blocked', r1.eval)
