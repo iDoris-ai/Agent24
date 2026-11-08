@@ -13,6 +13,13 @@
 // Prints one line per check (33) and exits non-zero if any fails.
 
 const http = require('node:http')
+
+// Loopback the four test servers listen on (decision #30's real-device
+// condition 5: the allowed origin as 127.0.0.1 and as [::1]).
+//   KNOWLEDGE_SMOKE_HOST=::1  → servers on ::1, allowed origin http://[::1]:<port>
+//   anything else or unset    → 127.0.0.1
+const HOST = process.env.KNOWLEDGE_SMOKE_HOST === '::1' ? '::1' : '127.0.0.1'
+const URL_HOST = HOST.includes(':') ? `[${HOST}]` : HOST
 const net = require('node:net')
 const path = require('node:path')
 const { app, BrowserWindow, WebContentsView, session } = require('electron')
@@ -96,8 +103,7 @@ const within = (p, ms) => {
       if (answer === 'timeout') throw new Error('timeout')
       await within(b.setLocalDescription(answer), 3000)
       await within(a.setRemoteDescription(answer), 3000)
-      const [host, port] = ICE.split(':')
-      await within(a.addIceCandidate({ candidate: 'candidate:1 1 tcp 1518280447 ' + host + ' ' + port + ' typ host tcptype passive', sdpMid: '0', sdpMLineIndex: 0 }), 3000)
+      await within(a.addIceCandidate({ candidate: 'candidate:1 1 tcp 1518280447 ' + ICE.host + ' ' + ICE.port + ' typ host tcptype passive', sdpMid: '0', sdpMLineIndex: 0 }), 3000)
       await new Promise((d) => setTimeout(d, 2000))
       // Read alongside the count: if Chromium never paired the candidate (no
       // local TCP-active candidate), connections 0 says nothing for this row.
@@ -139,27 +145,27 @@ const within = (p, ms) => {
 function server(name, handler) {
   return new Promise((resolve) => {
     const s = http.createServer((req, res) => { hits[name].push(req.url); handler(req, res) })
-    s.listen(0, '127.0.0.1', () => resolve({ s, origin: `http://127.0.0.1:${s.address().port}` }))
+    s.listen(0, HOST, () => resolve({ s, origin: `http://${URL_HOST}:${s.address().port}` }))
   })
 }
 
 let originB = ''
 let turnAddress = ''
-let iceAddress = ''
+let iceAddress = { host: '', port: 0 }
 async function main() {
   const b = await server('B', (_req, res) => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('B') })
   b.s.on('connection', () => { connections.B++ })
   originB = b.origin
   const turn = await new Promise((resolve) => {
     const t = net.createServer((socket) => { connections.TURN++; socket.destroy() })
-    t.listen(0, '127.0.0.1', () => resolve(t))
+    t.listen(0, HOST, () => resolve(t))
   })
-  turnAddress = `127.0.0.1:${turn.address().port}`
+  turnAddress = `${URL_HOST}:${turn.address().port}`
   const ice = await new Promise((resolve) => {
     const t = net.createServer((socket) => { connections.ICE++; socket.destroy() })
-    t.listen(0, '127.0.0.1', () => resolve(t))
+    t.listen(0, HOST, () => resolve(t))
   })
-  iceAddress = `127.0.0.1:${ice.address().port}`
+  iceAddress = { host: HOST, port: ice.address().port }
   const a = await server('A', (req, res) => {
     const url = new URL(req.url, 'http://x')
     if (url.pathname === '/probe.js') {
@@ -183,6 +189,7 @@ async function main() {
   })
 
   await app.whenReady()
+  console.log(`loopback ${HOST} (allowed origin ${a.origin})`)
   const win = new BrowserWindow({ show: false, width: 900, height: 700 })
   await win.loadURL('about:blank')
   let binding = 'profile-1'
