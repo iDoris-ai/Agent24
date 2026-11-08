@@ -97,7 +97,8 @@ export interface BridgeDeps {
    */
   citation?: {
     scope: () => readonly string[] | null
-    read: (generation: number, ref: CitationRef, signal: AbortSignal) => Promise<ChunkRead>
+    /** `visible` is the visible set asked again (U7.2); the read checks it before every page. */
+    read: (generation: number, ref: CitationRef, signal: AbortSignal, visible: () => boolean) => Promise<ChunkRead>
     show: (shown: CitationShown) => void
   }
 }
@@ -138,6 +139,8 @@ export class KnowledgeBridge {
   private tokens = BRIDGE_BURST
   private refilledAt: number
   private rateBackoff: Backoff | null = null
+  /** ⑯'s own `overloaded` window: the same backpressure rule as ⑥ (U6.6, same limit). */
+  private inflightBackoff: Backoff | null = null
   private soft: number[] = []
   private versions: number[] = []
   private dropped = new Map<string, number>()
@@ -296,11 +299,7 @@ export class KnowledgeBridge {
     if (this.seenSet.has(message.id)) return this.reject('⑮', document, id, { code: 'invalid_request', reason: 'duplicate_id' }, true)
     // ⑯ in flight (U6.7). `cancel` takes no slot. A full table is uncounted (§9.3),
     // and the id stays out of the dedupe table (U6.4: only what passes ⑯ is remembered).
-    if (message.payload.type !== 'cancel' && this.inflight.size >= BRIDGE_IN_FLIGHT) {
-      this.log('⑯', id, 'overloaded')
-      this.reply(document, id, { result: 'rejected', code: 'unavailable', reason: 'overloaded', retry_after_ms: BRIDGE_BACKOFF_MS })
-      return
-    }
+    if (message.payload.type !== 'cancel' && this.inflight.size >= BRIDGE_IN_FLIGHT) return this.inflightFull(document, id)
     this.remember(message.id)
     this.handle(message, document)
   }
@@ -334,9 +333,8 @@ export class KnowledgeBridge {
     const citation = this.deps.citation
     if (!citation) return this.reply(document, message.id, { result: 'rejected', code: 'unavailable', reason: 'not_ready' })
     const ref = message.payload.citation
-    const scope = citation.scope()
     // U7.2: outside the visible set is the same answer as missing, and no read.
-    if (scope === null || !scope.includes(ref.knowledge_base_id)) {
+    if (!this.visible(ref)) {
       return this.reply(document, message.id, { result: 'done', code: 'not_found' })
     }
     const abort = new AbortController()
@@ -350,7 +348,9 @@ export class KnowledgeBridge {
     const citation = this.deps.citation
     if (!citation) return
     const admittedDocumentId = this.documentId
-    const outcome = await this.budget.run((signal) => citation.read(generation, ref, signal), abort.signal)
+    // The set may change while the read waits or runs (settings): asked again at the start, before every page and before showing.
+    const visible = (): boolean => this.visible(ref)
+    const outcome = await this.budget.run((signal) => citation.read(generation, ref, signal, visible), abort.signal)
     // Already removed (cancel, a new document, destroy): that path owns the reply, or there is none.
     if (!this.inflight.has(id)) return
     this.inflight.delete(id)
@@ -362,6 +362,10 @@ export class KnowledgeBridge {
         return
       }
       const value = outcome.value
+      if (value.ok && !visible()) {
+        this.reply(document, id, { result: 'done', code: 'not_found' })
+        return
+      }
       if (value.ok) {
         if (this.deps.admission().generation >= 1) citation.show({ title: value.title, text: value.text, ref })
         this.reply(document, id, { result: 'done' })
@@ -374,6 +378,12 @@ export class KnowledgeBridge {
       return
     }
     go()
+  }
+
+  /** U7.2: the citation's knowledge base is in the last visible set (settings ∩ the exchange). */
+  private visible(ref: CitationRef): boolean {
+    const scope = this.deps.citation?.scope() ?? null
+    return scope !== null && scope.includes(ref.knowledge_base_id)
   }
 
   /** Abort every in-flight task and drop it, so a later completion sends nothing. */
@@ -405,6 +415,20 @@ export class KnowledgeBridge {
     this.log('⑥', undefined, 'overloaded')
     // ⑥ replies carry no in_reply_to (U7.1): nothing was read.
     this.reply(document, undefined, { result: 'rejected', code: 'unavailable', reason: 'overloaded', retry_after_ms: BRIDGE_BACKOFF_MS })
+  }
+
+  /**
+   * ⑯ full: every such message gets `overloaded` (§9.3, uncounted itself). As
+   * for ⑥, three more past the grace and within `retry_after_ms` are one soft
+   * violation (U6.6: messages under the same limit).
+   */
+  private inflightFull(document: number, id: string | undefined): void {
+    const now = this.deps.now()
+    const b = this.inflightBackoff
+    if (b && now < b.until) this.strike(b, now)
+    else this.inflightBackoff = { from: now, until: now + BRIDGE_BACKOFF_MS, strikes: 0, struck: false }
+    this.log('⑯', id, 'overloaded')
+    this.reply(document, id, { result: 'rejected', code: 'unavailable', reason: 'overloaded', retry_after_ms: BRIDGE_BACKOFF_MS })
   }
 
   private strike(b: Backoff, now: number): void {

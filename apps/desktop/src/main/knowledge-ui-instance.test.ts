@@ -268,7 +268,7 @@ describe('KnowledgeUiInstance', () => {
     const calls: Array<{ url: string; init: RequestInit }> = []
     const fetchImpl: typeof fetch = async (url, init) => {
       calls.push({ url: String(url), init: init ?? {} })
-      return new Response(JSON.stringify({ error: { code: 'not_found', details: { retryable: false } } }), { status: 404 })
+      return new Response(JSON.stringify({ error: { code: 'not_found', details: { retryable: false, request_id: null, generation: null } } }), { status: 404 })
     }
     const t = setup({ fetch: fetchImpl })
     await t.ui.start()

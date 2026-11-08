@@ -50,8 +50,12 @@ function fail(code: string, reason?: string): ChunkRead {
 }
 
 /** R6.1 envelope. Unknown code becomes internal (R6.2). Branch on code, not on HTTP status. */
-function readError(body: unknown): ChunkRead {
+function readError(body: unknown, requestId: string, generation: number): ChunkRead {
   if (!isObj(body) || !isObj(body.error) || !isObj(body.error.details)) return fail('internal')
+  // R6.1 / R7.3: the envelope echoes this request; null only where R6.1 allows it, paired by this exchange.
+  const details = body.error.details
+  if (details.request_id !== requestId && details.request_id !== null) return fail('internal')
+  if (details.generation !== generation && details.generation !== null) return fail('internal')
   const raw = body.error.code
   const code = typeof raw === 'string' && READ_CODES.has(raw) ? raw : 'internal'
   const reason = body.error.details.reason
@@ -69,6 +73,8 @@ interface PageOk {
 /** On 200 every one of these has to hold, or the read is internal. */
 function readPage(body: unknown, requestId: string, generation: number, ref: CitationRef): PageOk | ChunkRead {
   if (!isObj(body)) return fail('internal')
+  // READONLY §0.3: anything but v1 is not read as v1.
+  if (body.protocol_version !== 1) return fail('internal')
   if (body.request_id !== requestId || body.generation !== generation) return fail('internal')
   if (body.knowledge_id !== ref.knowledge_id) return fail('internal')
   if (!Array.isArray(body.segments) || body.segments.length !== 1) return fail('internal')
@@ -90,8 +96,8 @@ function isPage(v: PageOk | ChunkRead): v is PageOk {
   return !('ok' in v)
 }
 
-/** One response body, at most this many bytes: a page's text is capped by max_bytes, the rest is a small envelope. */
-export const READ_MAX_RESPONSE_BYTES = 4 * READ_MAX_BYTES + 16 * 1024
+/** One response body, at most this many bytes: max_bytes of text, each byte up to six once JSON-escaped (`\\u003c`), and the envelope. */
+export const READ_MAX_RESPONSE_BYTES = 6 * READ_MAX_BYTES + 64 * 1024
 
 /** Reads the body under the same timeout and abort as the request; past the cap the read stops. */
 async function readBody(response: Response): Promise<unknown> {
@@ -152,7 +158,11 @@ async function post(deps: ReadonlyDeps, credential: string, body: unknown, signa
   }
 }
 
-export async function readCitationChunk(deps: ReadonlyDeps, generation: number, ref: CitationRef, signal: AbortSignal): Promise<ChunkRead> {
+/**
+ * `visible` is asked again before every page (U7.2: no read outside the last visible set);
+ * once it says no, the answer is `not_found`, the same as a missing document.
+ */
+export async function readCitationChunk(deps: ReadonlyDeps, generation: number, ref: CitationRef, signal: AbortSignal, visible: () => boolean = () => true): Promise<ChunkRead> {
   const credential = deps.credential()
   if (credential === null) return fail('unauthorized')
   const expected: Record<string, unknown> = {
@@ -166,6 +176,7 @@ export async function readCitationChunk(deps: ReadonlyDeps, generation: number, 
   let cursor: string | null = null
   for (let page = 1; page <= READ_MAX_PAGES; page++) {
     if (signal.aborted) return fail('cancelled')
+    if (!visible()) return fail('not_found')
     const requestId = deps.newRequestId()
     const body: Record<string, unknown> = {
       protocol_version: 1,
@@ -181,7 +192,9 @@ export async function readCitationChunk(deps: ReadonlyDeps, generation: number, 
     if (cursor !== null) body.page = { cursor }
     const posted = await post(deps, credential, body, signal)
     if ('ok' in posted) return posted
-    if (posted.status !== 200) return readError(posted.json)
+    // R6.2: an error envelope is read by its code, whatever the HTTP status; a success is only a 200.
+    if (isObj(posted.json) && 'error' in posted.json) return readError(posted.json, requestId, generation)
+    if (posted.status !== 200) return fail('internal')
     const parsed = readPage(posted.json, requestId, generation, ref)
     if (!isPage(parsed)) return parsed
     if (page === 1) title = plainTitle(parsed.titleRaw)

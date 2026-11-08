@@ -307,7 +307,7 @@ export interface KnowledgeViewUi {
   bridgeAdmission(): { open: boolean; generation: number }
   /** U7.2: settings ∩ the exchange, or null when admission is closed or there is no exchange. */
   citationScope(): readonly string[] | null
-  readCitation(generation: number, ref: CitationRef, signal: AbortSignal): Promise<ChunkRead>
+  readCitation(generation: number, ref: CitationRef, signal: AbortSignal, visible: () => boolean): Promise<ChunkRead>
 }
 
 /** U6.6: the third violation closing within this window of one binding is final. */
@@ -787,7 +787,7 @@ export class KnowledgeViewHost {
         log: this.log,
         citation: {
           scope: () => ui.citationScope(),
-          read: (generation, ref, signal) => ui.readCitation(generation, ref, signal),
+          read: (generation, ref, signal, visible) => ui.readCitation(generation, ref, signal, visible),
           show: (shown) => this.showCitation(instance, shown),
         },
       })

@@ -71,6 +71,11 @@ export class BridgeReadBudget {
       if (!job) return
       job.queued = false
       if (job.settled) continue
+      // A queue timer that is due but has not run yet: past 10 s it never starts (U7.2).
+      if (this.deps.now() - job.enqueuedAt >= BRIDGE_READ_QUEUE_MS) {
+        this.settle(job, { kind: 'overloaded' })
+        continue
+      }
       this.clearTimer(job)
       job.running = true
       this.running.add(job)

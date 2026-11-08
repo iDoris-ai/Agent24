@@ -26,7 +26,7 @@ function harness() {
       }
     }
   }
-  return { budget, advance, timers, now: () => now }
+  return { budget, advance, timers, now: () => now, setNow: (n: number) => { now = n } }
 }
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0))
@@ -120,5 +120,34 @@ describe('BridgeReadBudget', () => {
     expect(await h.budget.run(() => { after = true; return Promise.resolve('x') }, new AbortController().signal)).toEqual({ kind: 'cancelled' })
     expect(after).toBe(false)
     h.budget.destroy()
+  })
+
+  it('a queued task past 10 s whose timer has not run yet never starts when a slot frees (U7.2)', async () => {
+    const h = harness()
+    const releases: Array<() => void> = []
+    let started = 0
+    const task = () => { started++; return new Promise<string>((resolve) => releases.push(() => resolve('x'))) }
+    for (let i = 0; i < BRIDGE_READ_CONCURRENCY; i++) void h.budget.run(task, new AbortController().signal)
+    const late = h.budget.run(task, new AbortController().signal)
+    expect(started).toBe(BRIDGE_READ_CONCURRENCY)
+    // The clock passes 10 s but the queue timer has not fired; a slot frees first.
+    h.setNow(BRIDGE_READ_QUEUE_MS)
+    releases[0]()
+    await flush()
+    expect(started).toBe(BRIDGE_READ_CONCURRENCY)
+    expect(await late).toEqual({ kind: 'overloaded' })
+  })
+
+  it('a queued task just under 10 s still starts when a slot frees', async () => {
+    const h = harness()
+    const releases: Array<() => void> = []
+    let started = 0
+    const task = () => { started++; return new Promise<string>((resolve) => releases.push(() => resolve('x'))) }
+    for (let i = 0; i < BRIDGE_READ_CONCURRENCY; i++) void h.budget.run(task, new AbortController().signal)
+    void h.budget.run(task, new AbortController().signal)
+    h.setNow(BRIDGE_READ_QUEUE_MS - 1)
+    releases[0]()
+    await flush()
+    expect(started).toBe(BRIDGE_READ_CONCURRENCY + 1)
   })
 })

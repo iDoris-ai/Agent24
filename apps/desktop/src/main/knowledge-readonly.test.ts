@@ -34,6 +34,11 @@ function ids(): () => string {
 
 interface Call { url: string; init: RequestInit; body: Record<string, any> }
 
+/** An error envelope echoing this call (R6.1); fixtures carry their own request_id. */
+function echo(body: any, call: Call): unknown {
+  return { error: { ...body.error, details: { ...body.error.details, request_id: call.body.request_id, generation: call.body.generation } } }
+}
+
 function client(handler: (call: Call, index: number) => { status: number; json: () => Promise<unknown> } | 'throw' | 'hang'): { deps: ReadonlyDeps; calls: Call[] } {
   const calls: Call[] = []
   const fetchImpl: typeof fetch = (async (url: string, init?: RequestInit) => {
@@ -57,6 +62,7 @@ function client(handler: (call: Call, index: number) => { status: number; json: 
 function okPage(req: Record<string, any>, over: { text?: string; title?: unknown; truncated?: boolean; cursor?: string; contentTag?: string; segments?: unknown; chunkId?: string; chunkType?: string; knowledgeId?: string; scope?: unknown; requestId?: string; generation?: number; textValue?: unknown } = {}): { status: number; json: () => Promise<unknown> } {
   const truncated = over.truncated ?? false
   const body: Record<string, unknown> = {
+    protocol_version: 1,
     protocol_version: 1,
     request_id: over.requestId ?? req.request_id,
     generation: over.generation ?? req.generation,
@@ -145,10 +151,33 @@ describe('readCitationChunk', () => {
     expect(await read(deps)).toEqual({ ok: false, code: 'internal' })
   })
 
-  it('a 200 error envelope is internal, not its code', async () => {
+  it('an error envelope is read by its code even on a 200 (R6.2)', async () => {
     const body = fixture('read.not-found.json').response.body
-    const { deps } = client(() => ({ status: 200, json: async () => body }))
+    const { deps } = client((call) => ({ status: 200, json: async () => echo(body, call) }))
+    expect(await read(deps)).toEqual({ ok: false, code: 'not_found' })
+  })
+
+  it('a success body on another status is internal', async () => {
+    const { deps } = client((call) => ({ ...okPage(call.body), status: 203 }))
     expect(await read(deps)).toEqual({ ok: false, code: 'internal' })
+  })
+
+  it('a 200 that is not protocol_version 1 is internal (§0.3)', async () => {
+    for (const v of [2, undefined, '1']) {
+      const { deps } = client((call) => ({ status: 200, json: async () => ({ ...((await okPage(call.body).json()) as object), protocol_version: v }) }))
+      expect(await read(deps)).toEqual({ ok: false, code: 'internal' })
+    }
+  })
+
+  it('an error envelope has to echo this request; null only where R6.1 allows it', async () => {
+    const base = fixture('read.not-found.json').response.body as any
+    const with_ = (request_id: unknown, generation: unknown) => (call: Call) => ({ status: 404, json: async () => ({ error: { ...base.error, details: { ...base.error.details, request_id: request_id === 'echo' ? call.body.request_id : request_id, generation: generation === 'echo' ? call.body.generation : generation } } }) })
+    expect(await read(client(with_('01JB3R0A1B2C3D4E5F6G7H8J9K', 'echo')).deps)).toEqual({ ok: false, code: 'internal' })
+    expect(await read(client(with_('echo', 99)).deps)).toEqual({ ok: false, code: 'internal' })
+    expect(await read(client(with_(undefined, 'echo')).deps)).toEqual({ ok: false, code: 'internal' })
+    expect(await read(client(with_('echo', undefined)).deps)).toEqual({ ok: false, code: 'internal' })
+    expect(await read(client(with_(null, null)).deps)).toEqual({ ok: false, code: 'not_found' })
+    expect(await read(client(with_('echo', 'echo')).deps)).toEqual({ ok: false, code: 'not_found' })
   })
 
   it('an unreadable body is internal', async () => {
@@ -158,7 +187,7 @@ describe('readCitationChunk', () => {
 
   it('branches on the error code, not the HTTP status', async () => {
     const body = fixture('read.not-found.json').response.body
-    const { deps } = client(() => ({ status: 500, json: async () => body }))
+    const { deps } = client((call) => ({ status: 500, json: async () => echo(body, call) }))
     expect(await read(deps)).toEqual({ ok: false, code: 'not_found' })
   })
 
@@ -170,18 +199,18 @@ describe('readCitationChunk', () => {
     ['read.internal.json', { ok: false, code: 'internal' }],
   ])('error fixture %s', async (name, expected) => {
     const sample = fixture(name)
-    const { deps } = client(() => ({ status: sample.response.status, json: async () => sample.response.body }))
+    const { deps } = client((call) => ({ status: sample.response.status, json: async () => echo(sample.response.body, call) }))
     expect(await read(deps)).toEqual(expected)
   })
 
   it('an unknown code becomes internal, and a bad reason is dropped', async () => {
-    const { deps: unknown } = client(() => ({ status: 400, json: async () => ({ error: { code: 'nope', details: { retryable: false, reason: 'kept_reason' } } }) }))
+    const { deps: unknown } = client(() => ({ status: 400, json: async () => ({ error: { code: 'nope', details: { retryable: false, request_id: null, generation: null, reason: 'kept_reason' } } }) }))
     expect(await read(unknown)).toEqual({ ok: false, code: 'internal', reason: 'kept_reason' })
-    const { deps: digits } = client(() => ({ status: 400, json: async () => ({ error: { code: 'stale', details: { retryable: false, reason: 'a1' } } }) }))
+    const { deps: digits } = client(() => ({ status: 400, json: async () => ({ error: { code: 'stale', details: { retryable: false, request_id: null, generation: null, reason: 'a1' } } }) }))
     expect(await read(digits)).toEqual({ ok: false, code: 'stale' })
-    const { deps: long } = client(() => ({ status: 400, json: async () => ({ error: { code: 'stale', details: { retryable: false, reason: 'a'.repeat(65) } } }) }))
+    const { deps: long } = client(() => ({ status: 400, json: async () => ({ error: { code: 'stale', details: { retryable: false, request_id: null, generation: null, reason: 'a'.repeat(65) } } }) }))
     expect(await read(long)).toEqual({ ok: false, code: 'stale' })
-    const { deps: kept } = client(() => ({ status: 400, json: async () => ({ error: { code: 'stale', details: { retryable: false, reason: 'a'.repeat(64) } } }) }))
+    const { deps: kept } = client(() => ({ status: 400, json: async () => ({ error: { code: 'stale', details: { retryable: false, request_id: null, generation: null, reason: 'a'.repeat(64) } } }) }))
     expect(await read(kept)).toEqual({ ok: false, code: 'stale', reason: 'a'.repeat(64) })
     const { deps: bare } = client(() => ({ status: 400, json: async () => ({ error: { code: 'stale' } }) }))
     expect(await read(bare)).toEqual({ ok: false, code: 'internal' })
@@ -336,5 +365,35 @@ describe('readCitationChunk: the body is read under the same timeout, abort and 
   it('a body that is not UTF-8 is internal', async () => {
     const deps: ReadonlyDeps = { origin: ORIGIN, credential: () => 'C', fetch: streaming([new Uint8Array([0x7b, 0xff, 0x7d])], false), newRequestId: ids() }
     expect(await readCitationChunk(deps, 15, REF, new AbortController().signal)).toEqual({ ok: false, code: 'internal' })
+  })
+
+  it('a page escaped up to six times its text bytes still fits (\\u003c)', async () => {
+    const text = '<'.repeat(65_536)
+    const fetchImpl: typeof fetch = (async (_url: string, init?: RequestInit) => {
+      const req = JSON.parse(String(init?.body))
+      const body = { protocol_version: 1, request_id: req.request_id, generation: req.generation, effective_scope: { knowledge_base_ids: [REF.knowledge_base_id] }, knowledge_id: REF.knowledge_id, revision: { source_revision: 's', index_build_id: 'i' }, segments: [{ chunk_id: REF.chunk_id, chunk_type: 'text', chunk_revision: 1, content_tag: REF.content_tag, text }], truncated: false }
+      // Go's encoder writes < as \u003c: six bytes for one.
+      return new Response(JSON.stringify(body).split('<').join('\\u003c'), { status: 200 })
+    }) as typeof fetch
+    const got = await readCitationChunk({ origin: ORIGIN, credential: () => 'C', fetch: fetchImpl, newRequestId: ids() }, 15, REF, new AbortController().signal)
+    expect(got).toMatchObject({ ok: true, text })
+  })
+})
+
+describe('readCitationChunk: the visible set is asked before every page (U7.2)', () => {
+  it('a set that drops the knowledge base before a page stops the read with not_found, sending nothing more', async () => {
+    let visible = true
+    const { deps, calls } = client((call) => {
+      visible = false
+      return okPage(call.body, { truncated: true })
+    })
+    expect(await readCitationChunk(deps, 15, REF, new AbortController().signal, () => visible)).toEqual({ ok: false, code: 'not_found' })
+    expect(calls).toHaveLength(1)
+  })
+
+  it('not visible from the start sends no request', async () => {
+    const { deps, calls } = client((call) => okPage(call.body))
+    expect(await readCitationChunk(deps, 15, REF, new AbortController().signal, () => false)).toEqual({ ok: false, code: 'not_found' })
+    expect(calls).toHaveLength(0)
   })
 })

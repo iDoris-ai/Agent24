@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
+  BRIDGE_BACKOFF_GRACE_MS,
   BRIDGE_BACKOFF_MS,
+  BRIDGE_BACKOFF_STRIKES,
   BRIDGE_BURST,
   BRIDGE_DEDUPE_LIMIT,
+  BRIDGE_SOFT_LIMIT,
   KnowledgeBridge,
   newUlid,
   type BridgeArrival,
@@ -386,14 +389,14 @@ const flush = () => new Promise((resolve) => setTimeout(resolve, 0))
 type ReadValue = { ok: true; text: string; contentTag: string; title: string | null } | { ok: false; code: string; reason?: string }
 
 function citationHarness(scope0: readonly string[] | null = ['kb-1']) {
-  const reads: Array<{ generation: number; signal: AbortSignal }> = []
+  const reads: Array<{ generation: number; signal: AbortSignal; visible: () => boolean }> = []
   const shown: Array<{ title: string | null; text: string }> = []
   const pending: Array<(value: ReadValue) => void> = []
   let scope = scope0
   const citation = {
     scope: () => scope,
-    read: (generation: number, _ref: typeof REF, signal: AbortSignal) => {
-      reads.push({ generation, signal })
+    read: (generation: number, _ref: typeof REF, signal: AbortSignal, visible: () => boolean) => {
+      reads.push({ generation, signal, visible })
       return new Promise<ReadValue>((resolve) => {
         const finish = (value: ReadValue): void => resolve(value)
         if (signal.aborted) { finish({ ok: false, code: 'cancelled' }); return }
@@ -513,6 +516,74 @@ describe('citation, cancel, and the in-flight table (U7.2, U6.7, §9.3)', () => 
     t.arrive(fifth)
     expect(t.last()?.payload).toEqual({ result: 'accepted' })
     expect(t.last()?.in_reply_to).toBe(fifth.id)
+  })
+
+  it('the visible set is asked again: the read gets it live, and a set changed before showing is not_found, not shown', async () => {
+    const c = citationHarness()
+    const t = setup({ citation: c.citation })
+    const m = t.msg('citation', REF)
+    t.arrive(m)
+    expect(c.reads[0].visible()).toBe(true)
+    // Settings drop the knowledge base while the read runs.
+    c.setScope(['kb-2'])
+    expect(c.reads[0].visible()).toBe(false)
+    c.pending[0](okRead())
+    await flush()
+    expect(t.replies().filter((r) => r.in_reply_to === m.id).map((r) => r.payload)).toEqual([{ result: 'accepted' }, { result: 'done', code: 'not_found' }])
+    expect(c.shown).toEqual([])
+    c.setScope(null)
+    const n = t.msg('citation', REF)
+    t.arrive(n)
+    expect(t.last()?.payload).toEqual({ result: 'done', code: 'not_found' })
+  })
+
+  it('a queued citation whose knowledge base leaves the set never reads', async () => {
+    const c = citationHarness()
+    const read = c.citation.read
+    let started = 0
+    // What the real read does first (knowledge-readonly): ask visible before the request.
+    c.citation.read = (g, r, s, visible) => { started++; return visible() ? read(g, r, s, visible) : Promise.resolve({ ok: false, code: 'not_found' }) }
+    const t = setup({ citation: c.citation })
+    t.arrive(t.msg('citation', REF))
+    t.arrive(t.msg('citation', REF))
+    const third = t.msg('citation', REF)
+    t.arrive(third)
+    expect(started).toBe(2)
+    c.setScope([])
+    c.pending[0](okRead())
+    await flush()
+    await flush()
+    expect(started).toBe(3)
+    expect(c.reads).toHaveLength(2)
+    expect(t.replies().filter((r) => r.in_reply_to === third.id).map((r) => r.payload)).toEqual([{ result: 'accepted' }, { result: 'done', code: 'not_found' }])
+  })
+
+  it('⑯ full: past the grace and within retry_after_ms, three more are one soft violation (U6.6)', async () => {
+    const windows = (n: number) => {
+      const c = citationHarness()
+      const t = setup({ citation: c.citation })
+      for (let i = 0; i < 4; i++) t.arrive(t.msg('citation', REF))
+      for (let w = 0; w < n; w++) {
+        t.arrive(t.msg('citation', REF)) // opens the window, uncounted
+        t.advance(BRIDGE_BACKOFF_GRACE_MS)
+        for (let i = 0; i < BRIDGE_BACKOFF_STRIKES; i++) t.arrive(t.msg('citation', REF))
+        t.advance(BRIDGE_BACKOFF_MS - BRIDGE_BACKOFF_GRACE_MS)
+      }
+      return t.closes()
+    }
+    expect(windows(BRIDGE_SOFT_LIMIT - 1)).toBe(0)
+    expect(windows(BRIDGE_SOFT_LIMIT)).toBe(1)
+  })
+
+  it('⑯ full within the grace counts nothing', async () => {
+    const c = citationHarness()
+    const t = setup({ citation: c.citation })
+    for (let i = 0; i < 4; i++) t.arrive(t.msg('citation', REF))
+    for (let w = 0; w < BRIDGE_SOFT_LIMIT; w++) {
+      for (let i = 0; i < 4; i++) t.arrive(t.msg('citation', REF))
+      t.advance(BRIDGE_BACKOFF_MS)
+    }
+    expect(t.closes()).toBe(0)
   })
 
   it('cancel of a live target sends rejected/cancelled first, then accepted, and takes no slot', async () => {

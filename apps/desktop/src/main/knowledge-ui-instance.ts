@@ -122,13 +122,13 @@ export class KnowledgeUiInstance {
   }
 
   /** One citation's chunk (U7.2). The read uses C and the allowed origin; it logs neither. */
-  readCitation(generation: number, ref: CitationRef, signal: AbortSignal): Promise<ChunkRead> {
+  readCitation(generation: number, ref: CitationRef, signal: AbortSignal, visible?: () => boolean): Promise<ChunkRead> {
     return readCitationChunk({
       origin: this.deps.origin,
       credential: () => this.deps.credential(),
       fetch: this.deps.fetch ?? globalThis.fetch,
       newRequestId: () => newUlid(),
-    }, generation, ref, signal)
+    }, generation, ref, signal, visible)
   }
 
   /** U4.7: stop injecting, forget the JWT, revoke the family (bounded, not awaited). */
