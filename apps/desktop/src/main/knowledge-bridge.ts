@@ -7,12 +7,13 @@
 // `BridgeArrival`s and carries the encoded messages back to the main frame.
 //
 // What the accepted messages then do is the handler's. This slice answers
-// `status`, `cancel` and `citation` (U7.2). `return_to_chat_intent` stays
-// `unavailable/not_ready` until 04b-2 (design §6: when unsure, not ready).
+// `status`, `cancel`, `citation` and, when `intent` is wired, `return_to_chat_intent`
+// (U7.2). Without `intent`, that message stays `unavailable/not_ready`.
 
 import { createHash, randomBytes } from 'node:crypto'
 import { BridgeReadBudget } from './knowledge-bridge-budget'
-import type { ChunkRead, CitationRef } from './knowledge-readonly'
+import type { DraftItem } from './knowledge-draft'
+import { plainTitle, type ChunkRead, type CitationRef } from './knowledge-readonly'
 import {
   BRIDGE_MAX_MESSAGE_BYTES,
   BRIDGE_SUPPORTED,
@@ -47,6 +48,20 @@ export const BRIDGE_HELLO_REQUESTS = 3
 export const BRIDGE_HOST_PER_S = 5
 /** U6.4 ①–⑤: senders tracked for counting, at most. */
 export const BRIDGE_TRACKED_SENDERS = 64
+/** U7.2: an intent is accepted only after activation-type input within this. */
+export const INTENT_ACTIVATION_MS = 5000
+/** U7.2: the confirmation dialog waits at most this long. */
+export const INTENT_CONFIRM_MS = 60_000
+/** U7.2: after the user declines, further intents are refused for this long. */
+export const INTENT_COOLDOWN_MS = 30_000
+/** U7.2: while the dialog is up, admission is polled on this period. */
+export const INTENT_ADMISSION_POLL_MS = 1000
+
+/** What the confirmation dialog is asked to show (U7.2). Titles are the host's own read. */
+export interface IntentAsk {
+  count: number
+  titles: Array<string | null>
+}
 
 /** What the transport knows about one bridge request, from its metadata only (U6.5). */
 export interface BridgeArrival {
@@ -100,6 +115,21 @@ export interface BridgeDeps {
     /** `visible` is the visible set asked again (U7.2); the read checks it before every page. */
     read: (generation: number, ref: CitationRef, signal: AbortSignal, visible: () => boolean) => Promise<ChunkRead>
     show: (shown: CitationShown) => void
+  }
+  /**
+   * U7.2 `return_to_chat_intent`. Without it, the message stays
+   * `unavailable/not_ready` and takes no slot (04b-1).
+   */
+  intent?: {
+    /** `channel.lastActivation()`: the last activation-type input, or null. */
+    activatedAt: () => number | null
+    /** How many more draft attachments fit (16 − current). */
+    draftRoom: () => number
+    /** Shows the dialog. When `signal` aborts, the dialog closes. */
+    /** `unavailable`: no dialog could be shown (no main window, one already up) — not the user's no, so no cooldown. */
+    confirm: (ask: IntentAsk, signal: AbortSignal) => Promise<'confirmed' | 'declined' | 'unavailable'>
+    /** Adds them in one go. False means they would pass 16 (`attachment_limit`). */
+    attach: (items: DraftItem[]) => boolean
   }
 }
 
@@ -155,6 +185,8 @@ export class KnowledgeBridge {
   private readonly inflight = new Map<string, { type: string; document: number; abort: AbortController }>()
   /** Replies finished while the document is pending (R2-1). Dropped by a new document and by destroy. */
   private held: Array<{ document: number; go: () => void }> = []
+  /** U7.2: intents are refused until this instant after the user declines. */
+  private intentCooldownUntil = 0
   private readonly budget: BridgeReadBudget
 
   constructor(private readonly deps: BridgeDeps) {
@@ -301,6 +333,8 @@ export class KnowledgeBridge {
     // and the id stays out of the dedupe table (U6.4: only what passes ⑯ is remembered).
     if (message.payload.type !== 'cancel') {
       if (this.inflight.size >= BRIDGE_IN_FLIGHT) return this.inflightFull(document, id)
+      // U6.7: at most one return_to_chat_intent in flight. Same ⑯ backpressure as a full table.
+      if (message.payload.type === 'return_to_chat_intent' && this.intentInFlight()) return this.inflightFull(document, id)
       // U6.6: within ⑯'s window every arrival under that limit counts, admitted or not.
       const b = this.inflightBackoff
       if (b) {
@@ -321,7 +355,7 @@ export class KnowledgeBridge {
     if (type === 'status') return this.reply(document, message.id, { result: 'done' })
     if (type === 'cancel') return this.cancel(message, document)
     if (type === 'citation') return this.cite(message, document)
-    // `return_to_chat_intent` waits for 04b-2. It does not take a slot here.
+    if (type === 'return_to_chat_intent') return this.intend(message, document)
     this.reply(document, message.id, { result: 'rejected', code: 'unavailable', reason: 'not_ready' })
   }
 
@@ -398,6 +432,216 @@ export class KnowledgeBridge {
   private visible(ref: CitationRef): boolean {
     const scope = this.deps.citation?.scope() ?? null
     return scope !== null && scope.includes(ref.knowledge_base_id)
+  }
+
+  private intentInFlight(): boolean {
+    for (const job of this.inflight.values()) if (job.type === 'intent') return true
+    return false
+  }
+
+  /**
+   * U7.2 admission, after ⑯. Activation, cooldown and the room check take no
+   * slot and are not violations (§9.3). Anything else is accepted and occupies
+   * one in-flight slot (`return_to_chat_intent` ≤ 1, U6.7).
+   */
+  private intend(message: PageMessage, document: number): void {
+    if (message.payload.type !== 'return_to_chat_intent') return
+    const intent = this.deps.intent
+    if (!intent) return this.reply(document, message.id, { result: 'rejected', code: 'unavailable', reason: 'not_ready' })
+    const activated = intent.activatedAt()
+    if (activated === null || this.deps.now() - activated > INTENT_ACTIVATION_MS) {
+      return this.reply(document, message.id, { result: 'rejected', code: 'forbidden', reason: 'user_activation_required' })
+    }
+    if (this.deps.now() < this.intentCooldownUntil) {
+      return this.reply(document, message.id, { result: 'rejected', code: 'forbidden', reason: 'cooldown' })
+    }
+    const citations = message.payload.citations
+    if (citations.length > intent.draftRoom()) {
+      return this.reply(document, message.id, { result: 'rejected', code: 'invalid_request', reason: 'attachment_limit' })
+    }
+    const abort = new AbortController()
+    const generation = this.deps.admission().generation
+    this.inflight.set(message.id, { type: 'intent', document, abort })
+    this.reply(document, message.id, { result: 'accepted' })
+    void this.finishIntent(message.id, document, generation, citations, abort)
+  }
+
+  private async finishIntent(id: string, document: number, generation: number, citations: CitationRef[], abort: AbortController): Promise<void> {
+    const intent = this.deps.intent
+    if (!intent) return
+    const admittedDocumentId = this.documentId
+    const titles: Array<string | null> = []
+    for (const ref of citations) {
+      if (!this.inflight.has(id)) return
+      if (!this.visible(ref)) { titles.push(null); continue }
+      const citation = this.deps.citation
+      if (!citation) { titles.push(null); continue }
+      const visible = (): boolean => this.visible(ref)
+      const outcome = await this.budget.run((signal) => citation.read(generation, ref, signal, visible), abort.signal)
+      if (!this.inflight.has(id) || outcome.kind === 'cancelled') return
+      if (outcome.kind === 'overloaded') return this.intentOverloaded(id, document, admittedDocumentId)
+      titles.push(outcome.kind === 'done' && outcome.value.ok ? plainTitle(outcome.value.title) : null)
+    }
+    if (!this.inflight.has(id)) return
+
+    const decision = await this.waitForConfirm(id, abort, intent, { count: citations.length, titles })
+    if (decision === 'aborted') {
+      if (this.inflight.has(id)) this.inflight.delete(id)
+      return
+    }
+    if (decision === 'timeout') {
+      this.deliver(document, admittedDocumentId, () => {
+        this.reply(document, id, { result: 'rejected', code: 'forbidden', reason: 'confirmation_timeout' })
+      })
+      return
+    }
+    if (decision === 'not_ready' || decision === 'unavailable') {
+      this.inflight.delete(id)
+      this.deliver(document, admittedDocumentId, () => {
+        this.reply(document, id, { result: 'rejected', code: 'unavailable', reason: 'not_ready' })
+      })
+      return
+    }
+    if (decision === 'declined') {
+      this.intentCooldownUntil = this.deps.now() + INTENT_COOLDOWN_MS
+      this.inflight.delete(id)
+      this.deliver(document, admittedDocumentId, () => {
+        this.reply(document, id, { result: 'rejected', code: 'forbidden', reason: 'user_declined' })
+      })
+      return
+    }
+
+    // One result per citation, in citation order: the first failure's code is the one the page gets.
+    const results: Array<{ item: DraftItem; ref: CitationRef } | { code: string }> = []
+    for (const ref of citations) {
+      if (!this.inflight.has(id)) return
+      if (!this.visible(ref)) { results.push({ code: 'not_found' }); continue }
+      const citation = this.deps.citation
+      if (!citation) { results.push({ code: 'not_found' }); continue }
+      const visible = (): boolean => this.visible(ref)
+      const outcome = await this.budget.run((signal) => citation.read(generation, ref, signal, visible), abort.signal)
+      if (!this.inflight.has(id) || outcome.kind === 'cancelled') return
+      // §9.3 / U7.2 bridge budget: a read still queued after 10 s ends the intent as `overloaded`, nothing attached.
+      if (outcome.kind === 'overloaded') return this.intentOverloaded(id, document, admittedDocumentId)
+      if (outcome.kind === 'failed') { results.push({ code: 'internal' }); continue }
+      const value = outcome.value
+      if (value.ok) {
+        results.push({
+          item: {
+            title: plainTitle(value.title),
+            text: value.text,
+            ref: { knowledge_base_id: ref.knowledge_base_id, knowledge_id: ref.knowledge_id, chunk_id: ref.chunk_id },
+          },
+          ref,
+        })
+        continue
+      }
+      results.push({ code: value.code })
+    }
+    // #1624 C1: the set may have changed during a later read; every passed item is asked again just before attaching.
+    const passed: DraftItem[] = []
+    let firstCode: string | null = null
+    for (const result of results) {
+      const code = 'code' in result ? result.code : this.visible(result.ref) ? null : 'not_found'
+      if (code === null && 'item' in result) passed.push(result.item)
+      else if (firstCode === null) firstCode = code
+    }
+    if (!this.inflight.has(id)) return
+    // Terminal from here: a later cancel misses (U7.2, already done once attached).
+    this.inflight.delete(id)
+    if (passed.length === 0) {
+      this.deliver(document, admittedDocumentId, () => {
+        this.reply(document, id, firstCode === null ? { result: 'done' } : { result: 'done', code: firstCode })
+      })
+      return
+    }
+    const attached = intent.attach(passed)
+    this.deliver(document, admittedDocumentId, () => {
+      if (!attached) {
+        this.reply(document, id, { result: 'rejected', code: 'invalid_request', reason: 'attachment_limit' })
+        return
+      }
+      this.reply(document, id, firstCode === null ? { result: 'done' } : { result: 'done', code: firstCode })
+    })
+  }
+
+  /** §9.3: a bridge read queued past 10 s. Terminal for the intent, no dialog or attachment, no cooldown. */
+  private intentOverloaded(id: string, document: number, admittedDocumentId: string | null): void {
+    const job = this.inflight.get(id)
+    if (!job) return
+    this.inflight.delete(id)
+    job.abort.abort()
+    this.deliver(document, admittedDocumentId, () => {
+      this.reply(document, id, { result: 'rejected', code: 'unavailable', reason: 'overloaded', retry_after_ms: BRIDGE_BACKOFF_MS })
+    })
+  }
+
+  /** The dialog, the 60s timeout, and the 1s admission poll (U7.2). The signal abort is someone else's reply. */
+  private waitForConfirm(
+    id: string,
+    abort: AbortController,
+    intent: NonNullable<BridgeDeps['intent']>,
+    ask: IntentAsk,
+  ): Promise<'confirmed' | 'declined' | 'unavailable' | 'timeout' | 'not_ready' | 'aborted'> {
+    return new Promise((resolve) => {
+      let settled = false
+      let reason: 'timeout' | 'not_ready' | null = null
+      let timeout: unknown = null
+      let poll: unknown = null
+      const stop = (): void => {
+        if (timeout !== null) { this.deps.clearTimer(timeout); timeout = null }
+        if (poll !== null) { this.deps.clearTimer(poll); poll = null }
+      }
+      const finish = (value: 'confirmed' | 'declined' | 'unavailable' | 'timeout' | 'not_ready' | 'aborted'): void => {
+        if (settled) return
+        settled = true
+        abort.signal.removeEventListener('abort', onAbort)
+        stop()
+        resolve(value)
+      }
+      const onAbort = (): void => {
+        finish(reason === 'timeout' ? 'timeout' : reason === 'not_ready' ? 'not_ready' : 'aborted')
+      }
+      const pollAdmission = (): void => {
+        poll = null
+        if (settled || !this.inflight.has(id)) return
+        if (this.deps.admission().open) {
+          poll = this.deps.setTimer(pollAdmission, INTENT_ADMISSION_POLL_MS)
+          return
+        }
+        reason = 'not_ready'
+        this.inflight.delete(id)
+        abort.abort()
+      }
+      abort.signal.addEventListener('abort', onAbort)
+      if (abort.signal.aborted) { finish('aborted'); return }
+      timeout = this.deps.setTimer(() => {
+        timeout = null
+        if (settled) return
+        if (!this.inflight.has(id)) { finish('aborted'); return }
+        reason = 'timeout'
+        this.inflight.delete(id)
+        abort.abort()
+      }, INTENT_CONFIRM_MS)
+      poll = this.deps.setTimer(pollAdmission, INTENT_ADMISSION_POLL_MS)
+      intent.confirm(ask, abort.signal).then(
+        (answer) => finish(answer),
+        () => finish(reason === 'timeout' ? 'timeout' : reason === 'not_ready' ? 'not_ready' : 'aborted'),
+      )
+    })
+  }
+
+  /** A terminal reply for `document`, held while a navigation has not committed (U6.3, as a citation's is). */
+  private deliver(document: number, admittedDocumentId: string | null, go: () => void): void {
+    const run = (): void => {
+      if (this.closed || this.document !== document || this.documentId !== admittedDocumentId) return
+      go()
+    }
+    if (this.document === null) {
+      this.held.push({ document, go: run })
+      return
+    }
+    run()
   }
 
   /** Abort every in-flight task and drop it, so a later completion sends nothing. */

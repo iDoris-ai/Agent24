@@ -33,10 +33,11 @@ import { isPlainHostname } from './knowledge-hostname'
 import type { InjectDecision, InjectRequest } from './knowledge-ui-inject'
 import type { UiInstanceEvent } from './knowledge-ui-instance'
 import { UiSessionLedger, UI_SESSION_WINDOW_MS } from './knowledge-ui-session'
-import { KnowledgeBridge, type CitationShown } from './knowledge-bridge'
+import { KnowledgeBridge, type CitationShown, type IntentAsk } from './knowledge-bridge'
+import { KnowledgeDraft, type DraftEntry } from './knowledge-draft'
 import { KnowledgeBridgeChannel, reservedRequest, type BridgeRequestDetails } from './knowledge-bridge-channel'
 import type { ChunkRead, CitationRef } from './knowledge-readonly'
-import { IpcChannels } from '../shared/ipc-types'
+import { IpcChannels, type KnowledgeViewConfirmAsk } from '../shared/ipc-types'
 import type {
   KnowledgeViewBounds,
   KnowledgeViewClosedCode,
@@ -495,6 +496,16 @@ interface Instance {
 
 /** Main's single owner of KnowledgeView instances (one binding for now). */
 export class KnowledgeViewHost {
+  /** U7.2: the conversation's draft attachments. Outlives a view-level rebuild. */
+  private readonly draft = new KnowledgeDraft((entries) => { this.sendDraft(entries) })
+  /** The binding the draft's entries were read under; any other binding (or Off) drops them. */
+  private draftBinding: string | null = null
+  /** At most one confirmation dialog (U7.2). */
+  private pendingConfirm: {
+    id: string
+    ask: Exclude<KnowledgeViewConfirmAsk, null>
+    settle: (value: 'confirmed' | 'declined' | 'aborted') => void
+  } | null = null
   private instance: Instance | null = null
   private partitions = 0
   /** Bumped by every show/hide/destroy; a show that resumes under a later number was overtaken. */
@@ -550,14 +561,18 @@ export class KnowledgeViewHost {
 
     const win = this.deps.window()
     if (this.disposed || !win || win.isDestroyed()) return { ok: false, code: 'window_unavailable' }
+    // #1624 C5: the page came back while a dialog is waiting; the same id, and the bridge's deadline is unchanged.
+    if (this.pendingConfirm) this.sendMain(IpcChannels.KnowledgeViewConfirm, this.pendingConfirm.ask)
     const binding = this.deps.binding()
     if (binding === null) {
+      this.clearDraft()
       this.endBinding()
       this.endBridgeCount()
       this.destroy('knowledge off')
       this.setState({ state: 'unavailable', code: 'knowledge_off' })
       return { ok: false, code: 'knowledge_off' }
     }
+    this.dropDraftUnder(binding)
     if (this.closed && this.closed.binding !== binding) this.endBinding()
     if (this.bridgeBinding !== null && this.bridgeBinding !== binding) this.endBridgeCount()
     if (this.crashBinding !== binding) this.crashes = []
@@ -707,6 +722,9 @@ export class KnowledgeViewHost {
    * instance and whatever `closed` or crash count the old one left. */
   bindingChanged(): void {
     const binding = this.deps.binding()
+    // #1662 L5: the settings changed (the knowledge bases among them): the strip may show one no longer visible.
+    if (this.instance) this.clearCitation(this.instance)
+    this.dropDraftUnder(binding)
     let ended = false
     if (this.closed && this.closed.binding !== binding) {
       this.endBinding()
@@ -728,8 +746,34 @@ export class KnowledgeViewHost {
 
   /** Binding-level destruction (U4.8) without closing the door: window teardown, tests. */
   destroyAll(reason: string): void {
+    this.clearDraft()
     this.endBinding()
     this.destroy(reason)
+  }
+
+  /** Renderer answered the confirmation dialog (U7.2). The IPC handler drops a malformed id or answer before this; an unknown id is ignored here. */
+  answerConfirm(id: string, confirmed: boolean): void {
+    const pending = this.pendingConfirm
+    if (!pending || pending.id !== id) return
+    pending.settle(confirmed ? 'confirmed' : 'declined')
+  }
+
+  draftList(): readonly DraftEntry[] {
+    return this.draft.list()
+  }
+
+  draftRemove(id: string): void {
+    this.draft.remove(id)
+  }
+
+  /** U7.2: the draft belongs to one binding; with no live instance (none shown yet, or `closed`) the check is the same. */
+  private dropDraftUnder(binding: string | null): void {
+    if (binding === null || (this.draftBinding !== null && this.draftBinding !== binding)) this.clearDraft()
+  }
+
+  private clearDraft(): void {
+    this.draftBinding = null
+    this.draft.clear()
   }
 
   /** App quit: destroy, and refuse every later show or reload. */
@@ -790,6 +834,17 @@ export class KnowledgeViewHost {
           read: (generation, ref, signal, visible) => ui.readCitation(generation, ref, signal, visible),
           show: (shown) => this.showCitation(instance, shown),
         },
+        intent: {
+          activatedAt: () => instance.bridge?.channel.lastActivation() ?? null,
+          draftRoom: () => this.draft.room(),
+          confirm: (ask, signal) => this.confirmIntent(ask, signal),
+          attach: (items) => {
+            if (this.draftBinding !== null && this.draftBinding !== instance.binding) this.clearDraft()
+            if (!this.draft.add(items)) return false
+            this.draftBinding = instance.binding
+            return true
+          },
+        },
       })
       instance.bridge = { bridge, channel: new KnowledgeBridgeChannel(view.webContents as never, bridge, this.now, this.log) }
       this.sendBridgeState(instance)
@@ -804,6 +859,8 @@ export class KnowledgeViewHost {
     // page, so it counts as a failed load and Reload is offered.
     view.webContents.on('did-navigate', (_event, _url, httpResponseCode) => {
       if (this.instance !== instance) return
+      // #1662 L5: a new document is a new page; what the old one cited goes.
+      this.clearCitation(instance)
       instance.httpFailed = typeof httpResponseCode === 'number' && httpResponseCode >= 400
       if (instance.httpFailed && instance.loaded) this.loadFailed(instance)
     })
@@ -1068,6 +1125,51 @@ export class KnowledgeViewHost {
     this.sendCitation(instance, null)
   }
 
+  /** U7.2: one dialog. Abort closes it and rejects; a missing window or a dialog already up is `unavailable`. */
+  private confirmIntent(ask: IntentAsk, signal: AbortSignal): Promise<'confirmed' | 'declined' | 'unavailable'> {
+    // Not the user's answer: no dialog could be shown, so no cooldown either.
+    if (this.pendingConfirm) return Promise.resolve('unavailable')
+    if (signal.aborted) return Promise.reject(new DOMException('The operation was aborted.', 'AbortError'))
+    const id = randomBytes(16).toString('base64url')
+    return new Promise((resolve, reject) => {
+      let settled = false
+      const finish = (kind: 'confirmed' | 'declined' | 'unavailable' | 'aborted'): void => {
+        if (settled) return
+        settled = true
+        signal.removeEventListener('abort', onAbort)
+        if (this.pendingConfirm?.id === id) this.pendingConfirm = null
+        if (kind === 'aborted') reject(new DOMException('The operation was aborted.', 'AbortError'))
+        else resolve(kind)
+      }
+      const onAbort = (): void => {
+        this.sendMain(IpcChannels.KnowledgeViewConfirm, null)
+        finish('aborted')
+      }
+      signal.addEventListener('abort', onAbort)
+      const payload = { id, count: ask.count, titles: [...ask.titles] }
+      this.pendingConfirm = { id, ask: payload, settle: finish }
+      if (!this.sendMain(IpcChannels.KnowledgeViewConfirm, payload)) finish('unavailable')
+    })
+  }
+
+  /** U7.2: the draft list, to the main window only. */
+  private sendDraft(entries: readonly DraftEntry[]): void {
+    this.sendMain(IpcChannels.KnowledgeDraftChanged, entries)
+  }
+
+  /** False when there is no main window to take the message. */
+  private sendMain(channel: string, payload: unknown): boolean {
+    const win = this.deps.window()
+    if (!win || win.isDestroyed() || !win.webContents) return false
+    try {
+      win.webContents.send(channel, payload)
+      return true
+    } catch (error) {
+      this.log(`[knowledge-view] send failed: ${error instanceof Error ? error.name : 'error'}`)
+      return false
+    }
+  }
+
   private sendCitation(instance: Instance, payload: { title: string | null; text: string; ref: { knowledge_base_id: string; knowledge_id: string; chunk_id: string } } | null): void {
     if (this.instance !== instance) return
     const win = instance.window
@@ -1080,8 +1182,16 @@ export class KnowledgeViewHost {
   }
 }
 
-/** The four renderer calls, each behind main's sender guard (the Agent24
- * window's main frame only; the KnowledgeView itself can never reach them). */
+/** The renderer calls, each behind main's sender guard (the Agent24
+ * window's main frame only; the KnowledgeView itself can never reach them).
+ * The draft and confirm channels are registered from {@link IpcChannels} so
+ * main.ts does not grow a new argument. */
+const DRAFT_ID = /^[A-Za-z0-9_-]{22}$/
+
+function draftId(value: unknown): value is string {
+  return typeof value === 'string' && DRAFT_ID.test(value)
+}
+
 export function registerKnowledgeViewIpc(
   ipc: Pick<IpcMain, 'handle'>,
   guard: IpcGuard,
@@ -1093,4 +1203,13 @@ export function registerKnowledgeViewIpc(
   ipc.handle(channels.bounds, guard((_event: IpcMainInvokeEvent, bounds: unknown) => { host()?.setBounds(bounds) }))
   ipc.handle(channels.hide, guard(() => { host()?.hide() }))
   ipc.handle(channels.reload, guard((_event: IpcMainInvokeEvent, bounds: unknown, theme: unknown) => host()?.reload(bounds, theme) ?? unavailable))
+  ipc.handle(IpcChannels.KnowledgeViewAnswer, guard((_event: IpcMainInvokeEvent, id: unknown, confirmed: unknown) => {
+    if (!draftId(id) || typeof confirmed !== 'boolean') return
+    host()?.answerConfirm(id, confirmed)
+  }))
+  ipc.handle(IpcChannels.KnowledgeDraftList, guard(() => host()?.draftList() ?? []))
+  ipc.handle(IpcChannels.KnowledgeDraftRemove, guard((_event: IpcMainInvokeEvent, id: unknown) => {
+    if (!draftId(id)) return
+    host()?.draftRemove(id)
+  }))
 }

@@ -19,6 +19,8 @@ import {
   type KnowledgeViewBounds,
   type KnowledgeViewResult,
   type KnowledgeViewCitation,
+  type KnowledgeViewConfirmAsk,
+  type KnowledgeDraftEntry,
   type KnowledgeViewState,
   type KnowledgeViewTheme,
   type DocumentsImportProgress,
@@ -201,6 +203,23 @@ const api = {
       const listener = (_event: unknown, citation: KnowledgeViewCitation): void => cb(citation)
       ipcRenderer.on(IpcChannels.KnowledgeViewCitation, listener)
       return () => ipcRenderer.removeListener(IpcChannels.KnowledgeViewCitation, listener)
+    },
+    onConfirm: (cb: (ask: KnowledgeViewConfirmAsk) => void): (() => void) => {
+      const listener = (_event: unknown, ask: KnowledgeViewConfirmAsk): void => cb(ask)
+      ipcRenderer.on(IpcChannels.KnowledgeViewConfirm, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.KnowledgeViewConfirm, listener)
+    },
+    answer: (id: string, confirmed: boolean): Promise<void> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeViewAnswer, id, confirmed),
+  },
+  // KB-C2-04b-2 (U7.2): draft attachments the user confirmed into this chat.
+  knowledgeDraft: {
+    list: (): Promise<KnowledgeDraftEntry[]> => ipcRenderer.invoke(IpcChannels.KnowledgeDraftList),
+    remove: (id: string): Promise<void> => ipcRenderer.invoke(IpcChannels.KnowledgeDraftRemove, id),
+    onChanged: (cb: (entries: KnowledgeDraftEntry[]) => void): (() => void) => {
+      const listener = (_event: unknown, entries: KnowledgeDraftEntry[]): void => cb(entries)
+      ipcRenderer.on(IpcChannels.KnowledgeDraftChanged, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.KnowledgeDraftChanged, listener)
     },
   },
   // ADR-DOC-01 D5: the Documenting OS, by operation, never by path.
