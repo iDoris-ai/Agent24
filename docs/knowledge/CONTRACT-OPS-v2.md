@@ -52,7 +52,7 @@
 - **W3.1** 必须带 `idempotency_key`（≥128 bit 随机）：`init.default_kb`、`ingest.submit`、`ingest.reprocess`、`pack.draft`、`pack.approve`、`pack.publish`、`candidate.propose` 的提交、`chunk.edit`；缺失为 `invalid_request/idempotency_key_missing`。`candidate.approve` 不另带键：以 `candidate_id` 为键，幂等作用域为 `(tenant, 批准人, candidate.approve, candidate_id)`，指纹含 `content_sha256`。天然幂等、不要求键：`pack.revoke`、`pack.discard`、`candidate.propose` 的撤回、`candidate.review` 的退回、`entry.withdraw`、`document.delete`、`approval.void`（重复执行按 W1.9 例外返回 `already: true`，其他主体 `not_found`；`pack.revoke` 另外对能读到该版本且持有 `pack.revoke` 的其他主体也返回 `already: true`）；`job.cancel` 重复执行按 W5.9 返回 `cancel_effect`。
 - **W3.2** 幂等作用域为 `(tenant, principal, 操作类, idempotency_key)`，并比对请求指纹（操作类、目标、`content_sha256`、影响结果的参数）：同键同指纹已完成 → 首次结果加 `details.replayed: true`，不新建、不重复计费；同键同指纹仍在执行 → `unavailable/request_in_progress`（带 `retry_after_ms`，不触发就绪探测）；同键不同指纹 → `invalid_request/idempotency_key_reused`。不同主体的同一键互不可见。**例外**：使批准作废的拒绝（W7.15）、使候选转为 `returned` 的批准拒绝（W8.5）也写幂等记录，重试得到同一拒绝。
 - **W3.3** 幂等记录与 job / 费用记录至少保留到 job 终态后 90 天；不产生 job 的写入后 90 天；服务端重启不丢；过期后同键视为新请求。
-- **W3.4** **原子性**：保存原件、建立源修订与 job、写幂等记录、内容去重判定、`expected_source_revision` 的比较并设置、`candidate.approve` 的复验、候选状态转移、批准记录与 ingest job 的建立，对外只有"全部完成"或"都未发生"；并发基于同一修订的提交只有一个成功，其余 `stale/base_revision_changed`；并发同键只执行一次。
+- **W3.4** **原子性**：保存原件、建立源修订与 job、写幂等记录、内容去重判定、`expected_source_revision` 的比较并设置、`candidate.approve` 的复验、候选状态转移、批准记录与 ingest job 的建立，对外只有"全部完成"或"都未发生"。「同一个数据库事务」只含数据库里的行（源修订、job、候选、批准审计、幂等记录）：原件字节可以在事务之前写入对象存储，事务失败时这份字节不能从任何读面读到，由清理任务回收；并发基于同一修订的提交只有一个成功，其余 `stale/base_revision_changed`；并发同键只执行一次。
 - **W3.5** **内容去重**（跨请求，与幂等键无关）：键为同一 KB 内的 `content_sha256` 加规范化文件类型；只比对未撤回、未删除、不在删除中的文档；修订已有文档时只与它自己的当前源修订比较；`candidate.approve` 只命中本 KB 中未下架、当前修订有活动构建的 `origin: "entry"` 文档。命中时返回 200、`details.outcome: "existing"`，不新建修订与 job、不改动已有时间戳、写幂等记录；最近 job 由调用者发起时附该 job，否则只附文档级处理状态（`index_pending` / `indexed` / `index_failed`），不回 `job_id` 与 `cost`。命中的文档处于失败或取消时同样 `existing`，不自动重新处理。不跨 KB。
 - **W3.6** 声明的 `content_sha256` 与服务端计算值不符 → `invalid_request/content_hash_mismatch`，不保存。
 - **W3.7** 幂等、指纹与去重不得泄露他人记录或范围外文档：命中时按无命中处理。
@@ -175,8 +175,8 @@
     - 按 W5 建立新源修订与 job：job 操作类为 `candidate.approve`，文档 `origin: "entry"`、带 `kind`，原件是条目正文，规范化文件类型为 Markdown；
     - 写幂等记录。
 
-    以上在同一个数据库事务里完成；入队在事务之外，入队失败按 W5.7 使 job 进 `failed/enqueue_failed`，候选保持 `approved`，出口是 W5.13 的重新处理。ingest 作业由 standalone 进程执行，它不在时 fail closed（WeKnora#136）。
-  - 返回 `{candidate_id, status: "approved", knowledge_id, source_revision, job_id, author_is_approver}`。去重命中时返回 `details.outcome: "existing"` 与已有文档，不建 job。
+    以上在同一个数据库事务里完成（原件字节按 W3.4 可先写入存储）；入队在事务之外，入队失败按 W5.7 使 job 进 `failed/enqueue_failed`，候选保持 `approved`，出口是 W5.13 的重新处理。ingest 作业由 standalone 进程执行，它不在时 fail closed（WeKnora#136）。
+  - 返回 `{candidate_id, status: "approved", knowledge_id, source_revision, job_id, author_is_approver}`。去重命中时同样**原子地**把候选转为 `approved`、`knowledge_id` 绑定到已有文档，记批准审计与幂等记录，不建源修订、不建 job，返回 `details.outcome: "existing"` 与已有文档（`job_id: null`）；这样命中的候选不再占 W8.2 的配额，也不能再被批准。
   - 批准与使用是同一个操作，**没有可出示、可过期、可作废的批准记录对象**；`approval.*` 只用于 ContextPack。
   - 宿主或请求体里送来的任何批准字段一律忽略（W1.6）。
   - 处理用的是批准时的当前政策；job 按 W1.3 沿用批准人的授权。
