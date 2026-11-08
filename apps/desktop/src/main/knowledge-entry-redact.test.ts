@@ -96,6 +96,18 @@ describe('private_key', () => {
 })
 
 describe('credential', () => {
+  it('takes a JWT only with all three segments, and the whole of it', () => {
+    expect(redact(`x ${JWT} y`)).toBe('x 〔已脱敏·凭据〕 y')
+    // Two segments and a third word that is not joined by a dot.
+    expect(categories('eyJabcd.eyJefgh ijklmnop')).toEqual([])
+    expect(categories('eyJabcd.eyJefgh_ijklmnop')).toEqual([])
+    // Each segment needs at least four characters.
+    expect(categories('eyJabc.eyJdefg.hijk')).toEqual([])
+    expect(categories('eyJabcd.eyJefgh.ijk')).toEqual([])
+    // A run of eyJ before a real one does not hide it.
+    expect(redact(`eyJeyJeyJ ${JWT}`)).toBe('eyJeyJeyJ 〔已脱敏·凭据〕')
+  })
+
   it('matches sk-, github, aws, slack, jwt, and bearer tokens', () => {
     const samples = [
       `sk-${'a'.repeat(16)}`,
