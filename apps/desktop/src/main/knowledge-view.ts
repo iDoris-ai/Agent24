@@ -75,7 +75,7 @@ export function knowledgeViewTarget(value: unknown): KnowledgeViewTarget | null 
   const loopback = url.hostname === '[::1]' || LOOPBACK_HOST.test(url.hostname)
   const scheme = url.protocol === 'https:' || (url.protocol === 'http:' && loopback)
   if (!scheme || url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== '') return null
-  if (!isPlainHostname(url.hostname)) return null
+  if (!isPlainHostname(url.hostname) || url.port === '0') return null
   return { origin: url.origin, url: url.href }
 }
 
@@ -284,6 +284,8 @@ export function knowledgeViewProxyConfig(origin: string, port: number): { mode: 
   const url = new URL(origin)
   // Never a pattern in the bypass list: `*` or a `,`/`;` would open it up.
   if (!isPlainHostname(url.hostname)) throw new Error('knowledge view: host name not allowed in the proxy bypass')
+  // Port 0 in a bypass rule means any port (#1649 PR-Daemon L1).
+  if (url.port === '0') throw new Error('knowledge view: port 0 not allowed in the proxy bypass')
   const hostPort = `${url.hostname}:${url.port || (url.protocol === 'https:' ? '443' : '80')}`
   return { mode: 'fixed_servers', proxyRules: `http://127.0.0.1:${port}`, proxyBypassRules: `<-loopback>;${hostPort}` }
 }

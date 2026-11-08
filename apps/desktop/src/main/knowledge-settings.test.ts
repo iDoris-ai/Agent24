@@ -139,7 +139,7 @@ describe('KnowledgeController (M3)', () => {
       expect(validEndpoint(ok), ok).toBe(true)
     }
     for (const bad of ['http://kb.example', 'http://localhost:8080', 'https://u:p@kb.example', 'https://kb.example/?q=1', 'ftp://x', '', 1,
-      'https://*.kb.example', 'https://a;b.kb.example', 'https://a,b.kb.example']) {
+      'https://*.kb.example', 'https://a;b.kb.example', 'https://a,b.kb.example', 'https://kb.example:0/api/v1', 'http://127.0.0.1:0']) {
       expect(validEndpoint(bad), String(bad)).toBe(false)
     }
     expect(validKnowledgeBaseIds(['kb-a'])).toBe(true)

@@ -203,6 +203,7 @@ describe('dead proxy for WebRTC TCP (contract decision #30)', () => {
     for (const bad of ['https://*', 'https://*.example.org', 'https://a;b.example.org', 'https://a,b.example.org']) {
       expect(() => knowledgeViewProxyConfig(bad, 9), bad).toThrow(/host name not allowed/)
     }
+    expect(() => knowledgeViewProxyConfig('http://127.0.0.1:0', 9)).toThrow(/port 0/)
   })
 
   it('does not load a page whose first load already timed out while the proxy was being set', async () => {
@@ -330,7 +331,9 @@ describe('knowledgeViewTarget (U4.4)', () => {
     for (const bad of ['http://localhost:18282/', 'http://10.0.0.2/', 'file:///etc/passwd', 'agent24://x', 'https://u:p@kb.example.org/',
       'https://kb.example.org/?token=x', 'https://kb.example.org/#t', 'not a url', 42, undefined,
       // Host names the URL parser keeps but the proxy bypass would read as patterns (#1643 PR-Daemon C).
-      'https://*.example.org/', 'https://a;b.example.org/', 'https://a,*,b.1.2.3.4.sslip.io/', 'https://kb_x.example.org/']) {
+      'https://*.example.org/', 'https://a;b.example.org/', 'https://a,*,b.1.2.3.4.sslip.io/', 'https://kb_x.example.org/',
+      // Port 0 in the bypass list is any port (#1649 PR-Daemon L1).
+      'https://kb.example.org:0/', 'http://127.0.0.1:0/']) {
       expect(knowledgeViewTarget(bad), String(bad)).toBeNull()
     }
   })

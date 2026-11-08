@@ -57,7 +57,7 @@ export function validEndpoint(value: unknown): value is string {
   }
   const loopback = url.hostname === '[::1]' || /^127(\.\d{1,3}){3}$/.test(url.hostname)
   const scheme = url.protocol === 'https:' || (url.protocol === 'http:' && loopback)
-  return scheme && url.username === '' && url.password === '' && url.search === '' && url.hash === '' && isPlainHostname(url.hostname)
+  return scheme && url.username === '' && url.password === '' && url.search === '' && url.hash === '' && isPlainHostname(url.hostname) && url.port !== '0'
 }
 
 export function validKnowledgeBaseIds(value: unknown): value is string[] {

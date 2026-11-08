@@ -326,11 +326,12 @@ async function main() {
   const controlTurn = connections.TURN - base.TURN
   const controlIce = connections.ICE - base.ICE
   check('control: TURN-over-TCP gets out without the dead proxy (so the 0 above is the proxy)', rc.turn === 'ran' && controlTurn >= 1, { turn: rc.turn, connections: controlTurn })
-  // ICE-TCP is conclusive when the control connects, or when the dead-proxy
-  // run had a TCP-active candidate to send and still made no connection.
-  const iceConclusive = controlIce >= 1 || r1.iceLocal?.tcpActive > 0 || r1.iceLocal?.statsTcpActive > 0
+  // ICE-TCP is conclusive only when the control connects: a TCP-active
+  // candidate alone may be IPv6 and never pair with the IPv4 port the probe
+  // hands it (#1649 PR-Daemon L2).
+  const iceConclusive = controlIce >= 1
   check('control: the ICE-TCP 0 above is conclusive', rc.iceTcp === 'ran' && iceConclusive,
-    { ...(iceConclusive ? {} : { inconclusive: 'no connection without the proxy and no TCP-active candidate with it' }), control: iceEvidence(rc, controlIce), profile1Local: r1.iceLocal })
+    { ...(iceConclusive ? {} : { inconclusive: 'no ICE-TCP connection even without the dead proxy' }), control: iceEvidence(rc, controlIce), profile1Local: r1.iceLocal })
 
   host.shutdown()
   check('quit destroys the view', win.contentView.children.length === 0)
