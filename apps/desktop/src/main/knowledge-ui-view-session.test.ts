@@ -112,6 +112,15 @@ describe('UiViewSession (U2.1, U2.9–U2.12, U3.6–U3.8)', () => {
     expect(t.session.token()).toBeNull()
   })
 
+  it('forgets the JWT on destroy, not only hides it (U2.5)', async () => {
+    const t = setup([{ kind: 'ok', value: SESSION }])
+    await t.session.establish()
+    t.session.destroy()
+    expect(t.session.token()).toBeNull()
+    expect(t.session.exchangedAt()).toBeNull()
+    expect(JSON.stringify(t.session)).not.toContain('jwt')
+  })
+
   it('keeps one exchange in flight per instance', async () => {
     const t = setup([{ kind: 'ok', value: SESSION }])
     const [a, b] = [t.session.establish(), t.session.establish()]
