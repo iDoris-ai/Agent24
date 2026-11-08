@@ -16,7 +16,7 @@ const exchanged = (token: string): UiCallResult<never> =>
 const refused = (code: string, reason: string, restarted = false): UiCallResult<never> =>
   ({ kind: 'refused', error: { kind: 'error', code, reason, restarted, retryAfterMs: null } })
 
-function setup(script: { exchanges?: UiCallResult<never>[]; probes?: UiCallResult<never>[]; issues?: UiCallResult<never>[] } = {}, ledger = new UiSessionLedger()) {
+function setup(script: { exchanges?: UiCallResult<never>[]; probes?: UiCallResult<never>[]; issues?: UiCallResult<never>[]; fetch?: typeof fetch } = {}, ledger = new UiSessionLedger(), selected: () => readonly string[] = () => ['kb-a']) {
   let now = 1000
   let tokens = 0
   const log: string[] = []
@@ -34,11 +34,12 @@ function setup(script: { exchanges?: UiCallResult<never>[]; probes?: UiCallResul
   } as unknown as KnowledgeUiClient
   const make = () => new KnowledgeUiInstance({
     client, bindingTag: 'b'.repeat(43), partition: 'knowledge-view-x', origin: ORIGIN, routes: ROUTES, ledger,
-    credential: () => 'C', generation: () => 1, servable: () => true,
+    credential: () => 'C', selected, generation: () => 1, servable: () => true,
     now: () => now, sleep: async () => {},
     setTimer: (fn, ms) => { const t = { fn, ms, cleared: false }; timers.push(t); return t },
     clearTimer: (h) => { (h as { cleared: boolean }).cleared = true },
     onEvent: (e) => events.push(e), view: VIEW,
+    fetch: script.fetch ?? (async () => { throw new Error('no fetch in this test') }),
   })
   return { ui: make(), make, log, events, timers, advance: (ms: number) => { now += ms } }
 }
@@ -240,6 +241,44 @@ describe('KnowledgeUiInstance', () => {
       const source = readFileSync(path.join(__dirname, file), 'utf8')
       expect(source, file).not.toMatch(/\bconsole\.|\blog\(|\.log\(|\bwarn\(|\bdebug\(/)
     }
+  })
+
+  it('citationScope is the intersection, and null before the exchange or when admission is closed', async () => {
+    const exchangedIds = (ids: string[]): UiCallResult<never> =>
+      ({ kind: 'ok', value: { sessionToken: 'jwt-x', expiresInS: 600, ops: ['kb.list'], knowledgeBaseIds: ids } } as never)
+    const before = setup()
+    expect(before.ui.citationScope()).toBeNull()
+    const t = setup({ exchanges: [exchangedIds(['kb-a', 'kb-z'])] }, new UiSessionLedger(), () => ['kb-z', 'kb-b', 'kb-a'])
+    expect(t.ui.citationScope()).toBeNull()
+    await t.ui.start()
+    expect(t.ui.citationScope()).toEqual(['kb-z', 'kb-a'])
+    const empty = setup({ exchanges: [exchangedIds(['kb-a'])] }, new UiSessionLedger(), () => ['kb-z'])
+    await empty.ui.start()
+    expect(empty.ui.citationScope()).toEqual([])
+    t.advance(600_000)
+    expect(t.ui.citationScope()).toBeNull()
+    const gone = setup({ exchanges: [exchangedIds(['kb-a'])] })
+    await gone.ui.start()
+    expect(gone.ui.citationScope()).toEqual(['kb-a'])
+    gone.ui.destroy()
+    expect(gone.ui.citationScope()).toBeNull()
+  })
+
+  it('readCitation posts the read route with C', async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = []
+    const fetchImpl: typeof fetch = async (url, init) => {
+      calls.push({ url: String(url), init: init ?? {} })
+      const sent = JSON.parse(String(init?.body))
+      return new Response(JSON.stringify({ error: { code: 'not_found', details: { retryable: false, request_id: sent.request_id, generation: sent.generation } } }), { status: 404 })
+    }
+    const t = setup({ fetch: fetchImpl })
+    await t.ui.start()
+    const ref = { knowledge_base_id: 'kb-a', knowledge_id: 'doc-1', chunk_id: 'c-1', source_revision: 's', index_build_id: 'i', chunk_revision: 1, content_tag: 't' }
+    expect(await t.ui.readCitation(1, ref, new AbortController().signal)).toEqual({ ok: false, code: 'not_found' })
+    expect(calls).toHaveLength(1)
+    expect(calls[0].url).toBe(`${ORIGIN}/api/v1/agent24/knowledge/read`)
+    expect((calls[0].init.headers as Record<string, string>)['X-API-Key']).toBe('C')
+    expect(JSON.parse(String(calls[0].init.body)).scope).toEqual({ knowledge_base_ids: ['kb-a'] })
   })
 
   it('a renewal timer that fires after an event does nothing', async () => {

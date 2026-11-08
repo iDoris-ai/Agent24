@@ -120,6 +120,8 @@ export const IpcChannels = {
   KnowledgeViewHide: 'knowledge-view:hide',
   KnowledgeViewReload: 'knowledge-view:reload',
   KnowledgeViewState: 'knowledge-view:state',
+  // KB-C2-04b-1 (U7.2): one citation's plain text, or null to clear the strip.
+  KnowledgeViewCitation: 'knowledge-view:citation',
 } as const
 
 /** T1-1/T1-2: the documents module as it is on disk now. A daemon reads
@@ -161,6 +163,13 @@ export type {
   KnowledgeViewState,
   KnowledgeViewTheme,
 } from './knowledge-view-types'
+
+/** Main → renderer. The three ids only: no revision fields (U7.2). null clears the strip. */
+export type KnowledgeViewCitation = {
+  title: string | null
+  text: string
+  ref: { knowledge_base_id: string; knowledge_id: string; chunk_id: string }
+} | null
 
 export type KnowledgeSettingsResult = { ok: true } | { ok: false; reason: 'invalid' | 'not_saved' | 'unavailable' }
 

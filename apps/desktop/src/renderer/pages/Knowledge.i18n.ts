@@ -21,6 +21,9 @@ export const knowledgeViewMessages = defineMessages({
     'closed.bridge_closed_final': 'The knowledge page was closed again for sending messages Agent24 does not accept. Turn Knowledge off and on in Settings to open it again.',
     'action.reload': 'Reload',
     'action.openSettings': 'Open Settings',
+    'citation.title': 'Citation',
+    'citation.untitled': 'Untitled',
+    'citation.dismiss': 'Close',
   },
   zh: {
     'loading': '正在打开知识页…',
@@ -42,6 +45,9 @@ export const knowledgeViewMessages = defineMessages({
     'closed.bridge_closed_final': '知识页又因发来 Agent24 不接受的消息被关闭。请在设置里把知识库关掉再打开，才能重新打开它。',
     'action.reload': '重新加载',
     'action.openSettings': '打开设置',
+    'citation.title': '引用',
+    'citation.untitled': '无标题',
+    'citation.dismiss': '关闭',
   },
   th: {
     'loading': 'กำลังเปิดหน้าคลังความรู้…',
@@ -63,5 +69,8 @@ export const knowledgeViewMessages = defineMessages({
     'closed.bridge_closed_final': 'หน้าคลังความรู้ถูกปิดอีกครั้งเพราะส่งข้อความที่ Agent24 ไม่รับ ปิดแล้วเปิดคลังความรู้ในการตั้งค่าเพื่อเปิดหน้านี้อีกครั้ง',
     'action.reload': 'โหลดใหม่',
     'action.openSettings': 'เปิดการตั้งค่า',
+    'citation.title': 'การอ้างอิง',
+    'citation.untitled': 'ไม่มีชื่อ',
+    'citation.dismiss': 'ปิด',
   },
 })

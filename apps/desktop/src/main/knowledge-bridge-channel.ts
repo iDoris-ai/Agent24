@@ -9,19 +9,27 @@
 
 import type { BridgeArrival, KnowledgeBridge } from './knowledge-bridge'
 
-/** Reserved on the allowed origin; Weknora confirmed the server never uses `/__agent24/`. */
+/**
+ * Reserved on the allowed origin; Weknora confirmed the server never uses `/__agent24/`.
+ * Only an http(s) request on that origin whose path starts with `/__agent24/` is cancelled.
+ * This does not cover ws, and it does not cover a percent-encoded spelling of the prefix.
+ */
 export const BRIDGE_PATH = '/__agent24/bridge'
 const RESERVED_PREFIX = '/__agent24/'
 
 /** U6.1 f: pressing, clicking, touching; not moves, hovers or scrolls. */
 const ACTIVATION = new Set(['mouseDown', 'rawKeyDown', 'keyDown', 'touchStart', 'gestureTap'])
 
-/** 'bridge' for the channel's POST, 'reserved' for anything else under the prefix (cancelled, never sent), null otherwise. */
+/**
+ * 'bridge' for an http(s) POST to `/__agent24/bridge` on the allowed origin with an empty query.
+ * 'reserved' for any other http(s) request on that origin whose path starts with `/__agent24/`
+ * (cancelled, never sent). null otherwise. Not ws, and not a percent-encoded spelling of the prefix.
+ */
 export function reservedRequest(url: string, method: string, origin: string): 'bridge' | 'reserved' | null {
   let parsed: URL
   try { parsed = new URL(url) } catch { return null }
   if (parsed.origin !== origin) return null
-  // The normalised path: a dotted spelling of the prefix is the prefix.
+  // The URL parser's path. A dotted segment is the same path; a percent-encoded prefix is not claimed here.
   if (!parsed.pathname.startsWith(RESERVED_PREFIX) && parsed.pathname !== RESERVED_PREFIX.slice(0, -1)) return null
   return method === 'POST' && parsed.pathname === BRIDGE_PATH && parsed.search === '' ? 'bridge' : 'reserved'
 }
@@ -31,6 +39,8 @@ export interface BridgeFrame {
   processId: number
   routingId: number
   readonly origin: string
+  /** The frame's top frame. `top === frame` means the frame is top-level (R2-3). */
+  readonly top?: BridgeFrame | null
   readonly detached?: boolean
   executeJavaScript(code: string): Promise<unknown>
   isDestroyed?(): boolean
@@ -71,7 +81,9 @@ function inlineBytes(upload: BridgeRequestDetails['uploadData']): Uint8Array | n
 /** The page side receives `{ type: 'message', data }` on window; the data is the U7.1 envelope. */
 export function dispatchScript(text: string): string {
   // The text is JSON; embedded as a JS string literal and parsed in the page, never evaluated.
-  return `window.dispatchEvent(new MessageEvent('message', { data: JSON.parse(${JSON.stringify(text)}) }));undefined`
+  // The page owns window, JSON and MessageEvent and may make any of them throw; the catch keeps
+  // what it throws in the page, so nothing of the page's size comes back to main (#1661 C-1).
+  return `try{window.dispatchEvent(new MessageEvent('message', { data: JSON.parse(${JSON.stringify(text)}) }))}catch{};undefined`
 }
 
 export class KnowledgeBridgeChannel {
@@ -166,6 +178,8 @@ export class KnowledgeBridgeChannel {
       document: this.currentDocument(),
       bytes: inlineBytes(details.uploadData),
       senderKey: `${details.webContentsId ?? 'none'}:${frame ? `${frame.processId}/${frame.routingId}` : 'noframe'}`,
+      // R2-3: top-level is the frame's own metadata (`top === frame`). No frame is not top-level.
+      topLevel: frame !== null && frame.top === frame,
     }
     this.bridge.receive(arrival)
   }

@@ -18,6 +18,7 @@ import {
   type KnowledgeStatus,
   type KnowledgeViewBounds,
   type KnowledgeViewResult,
+  type KnowledgeViewCitation,
   type KnowledgeViewState,
   type KnowledgeViewTheme,
   type DocumentsImportProgress,
@@ -195,6 +196,11 @@ const api = {
       const listener = (_event: unknown, state: KnowledgeViewState): void => cb(state)
       ipcRenderer.on(IpcChannels.KnowledgeViewState, listener)
       return () => ipcRenderer.removeListener(IpcChannels.KnowledgeViewState, listener)
+    },
+    onCitation: (cb: (citation: KnowledgeViewCitation) => void): (() => void) => {
+      const listener = (_event: unknown, citation: KnowledgeViewCitation): void => cb(citation)
+      ipcRenderer.on(IpcChannels.KnowledgeViewCitation, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.KnowledgeViewCitation, listener)
     },
   },
   // ADR-DOC-01 D5: the Documenting OS, by operation, never by path.

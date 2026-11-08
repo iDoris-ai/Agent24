@@ -10,6 +10,8 @@
 // no longer servable, a C problem and a generation change all end the
 // instance (`unavailable`) instead of pausing it.
 
+import { newUlid } from './knowledge-bridge'
+import { readCitationChunk, type ChunkRead, type CitationRef, type ReadFetch } from './knowledge-readonly'
 import { newViewSecret, partitionTag, type KnowledgeUiClient, type ViewSecret } from './knowledge-ui-client'
 import { decideInjection, InjectedRequests, type InjectDecision, type InjectRequest } from './knowledge-ui-inject'
 import type { UiRoute } from './knowledge-ui-routes'
@@ -35,6 +37,10 @@ export interface KnowledgeUiInstanceDeps {
   routes: readonly UiRoute[]
   ledger: UiSessionLedger
   credential: () => string | null
+  /** Knowledge bases picked in settings (U7.2: the citation set is settings ∩ the exchange). */
+  selected: () => readonly string[]
+  /** The citation read's fetch: `net.fetch` in the app, as for the UI client (#1662 PR-Daemon M1). */
+  fetch: ReadFetch
   generation: () => number
   servable: () => boolean
   now: () => number
@@ -101,6 +107,28 @@ export class KnowledgeUiInstance {
    */
   bridgeAdmission(): { open: boolean; generation: number } {
     return { open: !this.stopped && this.session.injection() !== null, generation: this.deps.generation() }
+  }
+
+  /**
+   * U7.2: null when there is no exchange or admission is closed. Otherwise
+   * settings ∩ the exchange's knowledge bases, in the settings' order (design §4).
+   */
+  citationScope(): readonly string[] | null {
+    if (!this.bridgeAdmission().open) return null
+    const ids = this.session.knowledgeBaseIds()
+    if (ids === null) return null
+    const allowed = new Set(ids)
+    return this.deps.selected().filter((id) => allowed.has(id))
+  }
+
+  /** One citation's chunk (U7.2). The read uses C and the allowed origin; it logs neither. */
+  readCitation(generation: number, ref: CitationRef, signal: AbortSignal, visible?: () => boolean): Promise<ChunkRead> {
+    return readCitationChunk({
+      origin: this.deps.origin,
+      credential: () => this.deps.credential(),
+      fetch: this.deps.fetch,
+      newRequestId: () => newUlid(),
+    }, generation, ref, signal, visible)
   }
 
   /** U4.7: stop injecting, forget the JWT, revoke the family (bounded, not awaited). */

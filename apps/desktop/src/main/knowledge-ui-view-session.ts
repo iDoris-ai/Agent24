@@ -94,6 +94,11 @@ export class UiViewSession {
     return { token: s.sessionToken, proof: view.proof }
   }
 
+  /** The exchange's knowledge bases, or null before an exchange (U7.2 citation scope). */
+  knowledgeBaseIds(): readonly string[] | null {
+    return this.session?.knowledgeBaseIds ?? null
+  }
+
   /** When the current JWT was exchanged (UiSessionLedger's merge rule for restarts). */
   exchangedAt(): number | null {
     return this.session?.exchangedAt ?? null
