@@ -41,6 +41,7 @@ pending: { id: string; kind: 'approval' | 'confirm'; run_id?: string; label: str
 - 只改已经在磁盘上的对话，不新建对话。
 - 不动 `messages` 和 `updated_at`，所以不会让列表重新排序。
 - 参数不合法就抛错；超过上限也抛错：`Too many chat history runs` / `Too many chat history pending items`。
+- runs 满了（1000 条）时（A4，PR-Daemon #1696 L1）：要记的是 task，就去掉最早的一条 answer，给它腾地方；要记的是 answer，或者已经没有 answer 可去掉，仍然抛错。task 有进度卡，不能因为问答多了就记不上。
 
 每次真正写盘的改动，都会告诉 `onChatHistoryChange(listener)` 登记的监听器。参数是改完后的摘要。main.ts 把它用 `chat-history:changed` 事件推给窗口，页面收到后重读一遍列表；这次读跟保存、删除之间的先后顺序，按现有规则处理。
 
@@ -58,11 +59,23 @@ pending: { id: string; kind: 'approval' | 'confirm'; run_id?: string; label: str
 
 A2 已经接上的：Knowledge 那一轮（`pages/chat-knowledge.ts`）。run 建好以后，`onRunStarted` 会告诉页面它的 run_id；轮询看到 `awaiting_approval` 时，页面对本轮所在的对话调 `promoteRun`（`Chat.tsx` 的 `replyWithKnowledge`）。
 
-## 4. A4 接线（A2 不做）
+## 4. 进度卡与「交给助理办」（A4）
 
-(a) 后半句「回复结束后 run 仍在跑」，按现在的代码走不到：Knowledge 那一轮会一直轮询到终态，超过 10 分钟（`MAX_WAIT_MS`）就主动 cancel 这个 run。A2 只做了规则函数和 `promoteRun`，各自有单测。
+**超时不再 cancel 还在跑的 run**（`chat-knowledge.ts`）。Knowledge 那一轮等满 10 分钟（`MAX_WAIT_MS`）时：
+- 等待期间最后一次成功拿到的状态是 `queued`/`running`/`awaiting_approval` → 返回 `ongoing`，不 cancel。页面按 `promotionDue({ status, replyEnded: true })` 调 `promoteRun`，回一句「这个任务我来办，进度在下面」，下一轮换新 session（`runSession` 清空），不跟还在跑的 run 抢同一个 session。
+- 10 分钟里一次状态也没拿到 → 仍然 cancel，报 `run_timeout`。看不见的 run 不留在后台。
 
-A4 有了进度卡、能把进度显示出来以后，再把超时的处理从「cancel」改为「`promotionDue({ status, replyEnded: true })` 成立就 `promoteRun`，不 cancel」。现在就这样接，会留下一个用户看不见的后台任务。
+**进度卡**（`chat/TaskCard.tsx`）。卡片是数据不是消息：不进 `messages`，也不发给模型。当前对话的每个 task（不含 answer）一张，列在对话末尾：
+- 状态与用时：数据来自 `run-status.ts`，跟列表共用一份。先问一次 `GET /api/v1/runs/{id}`，之后按 `/events` 重问，不轮询。用时在本地按秒走，不去问 daemon。窗口关了再开，task 在对话文件里，卡片照样出来，状态重新问。
+- daemon 里没有这个 run：显示「找不到」。
+- 「确认」（`awaiting_approval` 时出现）：按 run_id 在待审批里找到这一条，取第一个不是 deny 的决定，经 main 的确认框（`decideApproval`）提交。拒绝要填理由，仍在审批页做。
+- 「停止」（进行中时出现）：`POST /api/v1/runs/{id}/cancel`。
+- 完成的 run 显示它的回答，**跟聊天里的回答一样过一遍 `grounding`**，用的是 `GET /runs/{id}` 返回的 `knowledge`。run 有知识库记录时显示检索说明；回答里点名、但 run 没读到的来源，标出来，不算来源。
+
+**交给助理办**。每条已发出的用户消息下面有这个按钮（已归档、正在回复时不显示）：
+- 新建一个 session，把这句话作为一个独立的 run 发出去（`POST /api/v1/runs`）。
+- 它跟其他 `/runs` 请求一样经过 main 的 `withKnowledgeBinding`：知识库开着就带上绑定。
+- main 记下这个 task 以后卡片才出现。记不上就 cancel 这个 run，提示「没能交给助理」。
 
 ## 5. 列表的四个筛选（A3）
 

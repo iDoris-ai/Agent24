@@ -11,6 +11,7 @@ import { activeTurn, buildTurns } from './chat/turns'
 import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/title'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
+import { HandOver, TaskCards } from './chat/TaskCard'
 import {
   getHistoryState, historyAvailable, loadConversation, promoteRun, registerChatPage, restoreConversation, saveConversation,
   setActiveConversation, setChatBusy, subscribeHistory, titleConversation,
@@ -385,6 +386,15 @@ export default function ChatPage() {
         setDelivery(index, { kind: 'sent' })
         const knowledge = grounding(turn.text, turn.knowledge)
         setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge, runId: turn.runId }])
+      } else if (turn.kind === 'ongoing') {
+        // M4 A4: the turn stopped waiting, the run goes on as this
+        // conversation's task; its card shows how it does.
+        setDelivery(index, { kind: 'sent' })
+        if (promotionDue({ status: turn.status, replyEnded: true })) void promoteRun(conversation, turn.runId)
+        // The next turn goes to a new session: this one's run is not done,
+        // and a turn beside it would not see its answer (Knowledge's review).
+        runSession.current = null
+        setMessages(prev => [...prev, { role: 'assistant', content: t('task.ongoing') }])
       } else {
         setDelivery(index, { kind: 'notSent' })
         setMessages(prev => [...prev, { role: 'assistant', content: t('knowledge.failed', { error: turn.message }) }])
@@ -463,6 +473,7 @@ export default function ChatPage() {
                 </div>
               )}
               {m.role === 'user' && m.delivery.kind === 'notSent' && <div role="status">{t('status.notSent')}</div>}
+              {m.role === 'user' && m.delivery.kind === 'sent' && !archived && !loading && <HandOver conversation={sessionId} prompt={m.content} />}
               {m.role === 'assistant' && m.suffix && (
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>{formatReplySuffix(m.suffix)}</div>
               )}
@@ -499,6 +510,7 @@ export default function ChatPage() {
             </div>
           </div>
         )}
+        <TaskCards conversation={sessionId} />
         <div ref={bottomRef} />
       </div>
 

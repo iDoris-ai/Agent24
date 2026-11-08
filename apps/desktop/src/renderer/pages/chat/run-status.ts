@@ -9,10 +9,23 @@
 
 import { useEffect, useSyncExternalStore } from 'react'
 import type { RunEvent } from '../../../shared/ipc-types'
+import type { RunKnowledge } from '../knowledge-grounding'
 
 /** The daemon's run status, or `missing` when it has no such run. A run not
  *  asked yet, or whose answer did not come, is not in the map. */
 export type RunStatus = string
+
+/** M4 A4: what a task's card shows of its run. */
+export interface RunView {
+  status: RunStatus
+  started_at: string | null
+  ended_at: string | null
+  error: string | null
+  /** A completed run's answer, and what its Knowledge tools read (null
+   *  without a binding): shown only after `grounding` checked it. */
+  output: string | null
+  knowledge: RunKnowledge | null
+}
 
 /** At most this many runs are asked at once; the others wait their turn. */
 export const MAX_ASKING = 4
@@ -21,6 +34,7 @@ export const MAX_ASKING = 4
 export const RETRY_FIRST_MS = 1_000
 export const RETRY_CAP_MS = 30_000
 
+let views = new Map<string, RunView>()
 let statuses = new Map<string, RunStatus>()
 const listeners = new Set<() => void>()
 /** The runs shown now, with how many lists show each: asked again on their
@@ -51,11 +65,18 @@ let listening = false
 
 const proxy = () => (typeof window === 'undefined' ? undefined : window.agent24?.backendProxy)
 
-function publish(runId: string, status: RunStatus): void {
-  if (statuses.get(runId) === status) return
-  statuses = new Map(statuses).set(runId, status)
+const same = (a: RunView | undefined, b: RunView) =>
+  !!a && a.status === b.status && a.started_at === b.started_at && a.ended_at === b.ended_at && a.error === b.error
+  && a.output === b.output && JSON.stringify(a.knowledge) === JSON.stringify(b.knowledge)
+
+function publish(runId: string, view: RunView): void {
+  if (same(views.get(runId), view)) return
+  views = new Map(views).set(runId, view)
+  if (statuses.get(runId) !== view.status) statuses = new Map(statuses).set(runId, view.status)
   for (const l of listeners) l()
 }
+
+const text = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null)
 
 function askLater(runId: string): void {
   again.add(runId)
@@ -91,15 +112,26 @@ async function answer(runId: string): Promise<void> {
   asking.add(runId)
   try {
     const res = await backend({ method: 'GET', path: `/api/v1/runs/${encodeURIComponent(runId)}` }).catch(() => null)
-    const status = (res?.data as { status?: unknown } | null | undefined)?.status
+    const run = (res?.data ?? null) as {
+      status?: unknown; started_at?: unknown; created_at?: unknown; ended_at?: unknown
+      error?: { message?: unknown } | null; output?: { text?: unknown } | null; knowledge?: RunKnowledge | null
+    } | null
+    const status = run?.status
     if (res?.ok && typeof status === 'string') {
       if (status !== statuses.get(runId)) retryMs = RETRY_FIRST_MS
       eagerSpent = false
-      publish(runId, status)
+      publish(runId, {
+        status,
+        started_at: text(run?.started_at) ?? text(run?.created_at),
+        ended_at: text(run?.ended_at),
+        error: text(run?.error?.message),
+        output: status === 'completed' && typeof run?.output?.text === 'string' ? run.output.text : null,
+        knowledge: status === 'completed' ? run?.knowledge ?? null : null,
+      })
       if (status === 'awaiting_approval' && lastEvent.get(runId) === 'approval.resolved') askLater(runId)
     } else if (res?.status === 404) {
       eagerSpent = false
-      publish(runId, 'missing')
+      publish(runId, { status: 'missing', started_at: null, ended_at: null, error: null, output: null, knowledge: null })
     } else {
       // The daemon away or another error: what was known stays, and the run
       // is asked again on the timer.
@@ -152,10 +184,28 @@ function subscribe(listener: () => void): () => void {
   return () => listeners.delete(listener)
 }
 const snapshot = () => statuses
+const viewSnapshot = () => views
 
 /** The status of each of these runs that is known, asking for the others. */
 export function useRunStatuses(runIds: readonly string[]): ReadonlyMap<string, RunStatus> {
   const known = useSyncExternalStore(subscribe, snapshot)
+  useWanted(runIds)
+  return known
+}
+
+/** M4 A4: what is known of each of these runs, asking for the others. */
+export function useRunViews(runIds: readonly string[]): ReadonlyMap<string, RunView> {
+  const known = useSyncExternalStore(subscribe, viewSnapshot)
+  useWanted(runIds)
+  return known
+}
+
+/** M4 A4: asks for the run again now, e.g. after the user acted on it. */
+export function askRunAgain(runId: string): void {
+  if ((wanted.get(runId) ?? 0) > 0) ask(runId)
+}
+
+function useWanted(runIds: readonly string[]): void {
   const key = runIds.join('\n')
   useEffect(() => {
     listen()
@@ -178,12 +228,12 @@ export function useRunStatuses(runIds: readonly string[]): ReadonlyMap<string, R
       }
     }
   }, [key]) // `key` is runIds' content
-  return known
 }
 
 /** For tests. */
 export function resetRunStatusesForTests(): void {
   statuses = new Map()
+  views = new Map()
   wanted.clear()
   queue.length = 0
   asking.clear()

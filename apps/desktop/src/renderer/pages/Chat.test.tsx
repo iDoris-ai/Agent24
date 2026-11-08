@@ -466,6 +466,61 @@ describe('ChatPage promoting a Knowledge run to a task', () => {
   })
 })
 
+// M4 A4: a Knowledge turn whose run is still going on after the wait is
+// left to go on as the conversation's task, with a card; the next turn starts
+// a new session (Knowledge's review of A4).
+describe('ChatPage with Knowledge when the run outlasts the wait', () => {
+  beforeEach(() => { setLocale('zh') })
+
+  it('leaves the run going on as a task, says so, and asks the next turn in a new session', async () => {
+    const promoteRun = vi.fn().mockResolvedValue(null)
+    // main's summary is left to the page (null), as for a save main did not list
+    const save = vi.fn(async (_record: { id: string }) => null)
+    Object.defineProperty(window, 'agent24', {
+      value: {
+        backendProxy: mockBackendProxy,
+        knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true }) },
+        chatHistory: { list: vi.fn().mockResolvedValue([]), save, promoteRun },
+      },
+      writable: true,
+      configurable: true,
+    })
+    const realNow = Date.now.bind(Date)
+    let skew = 0
+    vi.spyOn(Date, 'now').mockImplementation(() => realNow() + skew)
+    let sessions = 0
+    const runs: { session_id: string }[] = []
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { session_id: string } }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: `s${++sessions}` } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') { runs.push(req.body!); return { ok: true, status: 201, data: { id: `r${runs.length}` } } }
+      if (req.path === '/api/v1/runs/r1') {
+        // The first answer comes, then the wait is over.
+        skew = 11 * 60_000
+        return { ok: true, status: 200, data: { status: 'running', output: null, knowledge: null } }
+      }
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: 'second answer' }, knowledge: null } }
+    })
+    render(<ChatPage />)
+    const send = (text: string) => {
+      const textarea = screen.getByPlaceholderText(/输入消息/)
+      fireEvent.change(textarea, { target: { value: text } })
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    }
+    send('long job')
+    await waitFor(() => expect(screen.getByText(chatMessages.zh['task.ongoing'])).toBeInTheDocument(), { timeout: 4000 })
+    const conversation = save.mock.calls[0][0].id
+    expect(promoteRun).toHaveBeenCalledWith(conversation, 'r1')
+    expect(mockBackendProxy).not.toHaveBeenCalledWith(expect.objectContaining({ path: '/api/v1/runs/r1/cancel' }))
+    skew = 0
+    send('next')
+    await waitFor(() => expect(screen.getByText('second answer')).toBeInTheDocument(), { timeout: 4000 })
+    expect(runs.map(r => r.session_id)).toEqual(['s1', 's2'])
+    // Each prompt sent can be handed to the assistant as a task of its own.
+    expect(screen.getAllByRole('button', { name: chatMessages.zh['task.handOver'] })).toHaveLength(2)
+    vi.restoreAllMocks()
+  })
+})
+
 describe('ChatPage with Knowledge when the answer names sources the run did not read', () => {
   beforeEach(() => { setLocale('zh') })
 
