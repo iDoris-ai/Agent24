@@ -168,9 +168,12 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   const editedArchived = editing !== null && (archiving.includes(editing)
     || items.find(item => item.id === editing)?.archived_at != null)
   useEffect(() => {
-    if (!editedArchived) return
+    if (!editedArchived || editing === null) return
     editingRef.current = null
     setEditing(null)
+    // Focus that went with the box goes to its row's ⋯ (or the search box,
+    // or the list's fold), not to nowhere.
+    focusSoon(rowMenuAt(editing))
   }, [editedArchived])
   const endEdit = (save: boolean, refocus: boolean) => {
     const edit = editingRef.current

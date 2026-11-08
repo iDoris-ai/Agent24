@@ -164,6 +164,7 @@ describe('the archive in the history list (UI-06 G3)', () => {
     let archivingB!: Promise<boolean>
     act(() => { archivingB = archiveConversation('chat_b') })
     await waitFor(() => expect(within(list()).queryByRole('textbox', { name: '对话标题' })).toBeNull())
+    await waitFor(() => expect(document.activeElement).not.toBe(document.body))
     await act(async () => { land(); await archivingB })
     expect(archivedAt('chat_b')).not.toBeNull()
     expect(bridge.setTitle).not.toHaveBeenCalled()
