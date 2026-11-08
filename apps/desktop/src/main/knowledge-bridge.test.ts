@@ -170,13 +170,17 @@ describe('⑥ rate (U6.6, U6.7)', () => {
     for (let i = 0; i < BRIDGE_BURST + 1; i++) t.arrive(t.msg('status', { state: 'ready' }))
     for (let i = 0; i < 5; i++) t.arrive(t.msg('status', { state: 'ready' }))
     expect(t.logs.some((l) => l.includes('closed'))).toBe(false)
-    // Four more windows with three late arrivals each: five soft violations close the bridge.
-    for (let w = 0; w < 5; w++) {
+    // Windows with three late arrivals each: the first window's early ones did
+    // not count, so four windows are four soft violations and the fifth closes.
+    const window = (): void => {
       t.advance(500)
       for (let i = 0; i < 3; i++) t.arrive(t.msg('status', { state: 'ready' }))
       t.advance(500)
       for (let i = 0; i < BRIDGE_BURST + 1; i++) t.arrive(t.msg('status', { state: 'ready' }))
     }
+    for (let w = 0; w < 4; w++) window()
+    expect(t.closes()).toBe(0)
+    window()
     expect(t.closes()).toBe(1)
   })
 })

@@ -51,6 +51,19 @@ const fetchReq = (over: Partial<InjectRequest> = {}): InjectRequest => ({
 const flush = () => new Promise((r) => setTimeout(r, 0))
 
 describe('KnowledgeUiInstance', () => {
+  it('opens the bridge only while it holds a JWT it may inject (design §6, U6.4 ⑬⑭)', async () => {
+    const t = setup()
+    expect(t.ui.bridgeAdmission()).toEqual({ open: false, generation: 1 })
+    await t.ui.start()
+    expect(t.ui.bridgeAdmission()).toEqual({ open: true, generation: 1 })
+    t.advance(600_000)
+    expect(t.ui.bridgeAdmission().open).toBe(false)
+    const u = setup()
+    await u.ui.start()
+    u.ui.destroy()
+    expect(u.ui.bridgeAdmission().open).toBe(false)
+  })
+
   it('gets the first JWT, injects it, and schedules the renewal at 2/3 of its life', async () => {
     const t = setup()
     expect(t.ui.inject(fetchReq(), WC)).toEqual({ cancel: true })

@@ -123,6 +123,8 @@ describe('KnowledgeBridgeChannel', () => {
 
   it.each([
     ['a blob', [{ blobUUID: 'b' }]],
+    ['bytes next to a blob', [{ bytes: Buffer.from('{}'), blobUUID: 'b' }]],
+    ['bytes next to a file', [{ bytes: Buffer.from('{}'), file: '/tmp/x' }]],
     ['a file', [{ file: '/etc/passwd' }]],
     ['several parts', [{ bytes: Buffer.from('{') }, { bytes: Buffer.from('}') }]],
     ['no body', undefined],

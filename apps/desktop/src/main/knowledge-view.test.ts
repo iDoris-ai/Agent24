@@ -1399,6 +1399,8 @@ describe('bridge wiring (KB-C2-04a-2, U6.1, U6.6)', () => {
     const contents = t.views[0].webContents
     contents.emit('did-navigate', {}, URL_, 200)
     const before = contents.mainFrame.scripts.length
+    // The page lingers a moment after close (Electron destroys it later).
+    contents.asyncClose = true
     t.host.destroyAll('test')
     expect(post(t, 0, msg())).toEqual({ cancel: true })
     contents.emit('did-navigate', {}, URL_, 200)
