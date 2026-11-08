@@ -133,6 +133,7 @@ const POLICIES: &[RoutePolicy] = &[
     row("POST", "/api/v1/sessions", Operation::SessionCreate, AssuranceLevel::Everyday),
     row("GET", "/api/v1/sessions", Operation::SessionRead, AssuranceLevel::Everyday),
     row("GET", "/api/v1/sessions/{id}", Operation::SessionRead, AssuranceLevel::Everyday),
+    row("GET", "/api/v1/sessions/{id}/source-floor", Operation::SessionRead, AssuranceLevel::Everyday),
     row("POST", "/api/v1/runs", Operation::RunCreate, AssuranceLevel::Everyday),
     row("GET", "/api/v1/runs", Operation::RunRead, AssuranceLevel::Everyday),
     row("GET", "/api/v1/runs/{id}", Operation::RunRead, AssuranceLevel::Everyday),

@@ -8,6 +8,7 @@ import type { KnowledgeViewCitation, KnowledgeViewConfirmAsk, KnowledgeViewResul
 import { CapabilitiesContext } from '../capabilities/types'
 import { useT } from '../i18n'
 import { knowledgeViewMessages } from './Knowledge.i18n'
+import { KnowledgeEntryPanel, usePendingEntry } from './chat/knowledge-entry'
 
 function rectOf(el: HTMLElement): { x: number; y: number; width: number; height: number } {
   const rect = el.getBoundingClientRect()
@@ -52,6 +53,8 @@ export default function KnowledgePage(): JSX.Element {
   const [state, setState] = useState<KnowledgeViewState | null>(null)
   const [citation, setCitation] = useState<KnowledgeViewCitation>(null)
   const [confirmAsk, setConfirmAsk] = useState<Exclude<KnowledgeViewConfirmAsk, null> | null>(null)
+  // KB-SOP-01a: a conversation the history list asked about ("沉淀为知识条目").
+  const entry = usePendingEntry()
 
   useEffect(() => window.agent24.knowledgeView.onState((next) => setState(next)), [])
   useEffect(() => window.agent24.knowledgeView.onCitation((next) => setCitation(next)), [])
@@ -110,7 +113,8 @@ export default function KnowledgePage(): JSX.Element {
           </div>
         )}
       </div>
-      {confirmAsk && (
+      {entry && <KnowledgeEntryPanel ask={entry} />}
+      {!entry && confirmAsk && (
         <section className="knowledge-confirm" role="dialog" aria-modal="false">
           <p className="knowledge-confirm-count">{t('confirm.count', { count: confirmAsk.count })}</p>
           <ul className="knowledge-confirm-titles">
@@ -122,7 +126,7 @@ export default function KnowledgePage(): JSX.Element {
           <button className="btn" type="button" onClick={() => declineConfirm(confirmAsk.id)}>{t('confirm.decline')}</button>
         </section>
       )}
-      {!confirmAsk && citation && (
+      {!entry && !confirmAsk && citation && (
         <aside className="knowledge-citation" aria-label={t('citation.title')}>
           <div className="knowledge-citation-title">{citation.title ?? t('citation.untitled')}</div>
           <div className="knowledge-citation-text">{citation.text}</div>
