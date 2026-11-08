@@ -92,36 +92,57 @@ describe('KnowledgeBridgeChannel', () => {
   it('a navigation that does not commit gives the shown document its bridge back', () => {
     const t = setup()
     t.contents.emit('did-navigate')
+    // Electron's sequence for a cancelled navigation: start, then only the load stopping.
     t.contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
     expect(t.channel.currentDocument()).toBeNull()
-    // A sub-frame's abort is not the main frame's.
-    t.contents.emit('did-fail-provisional-load', {}, -3, '', '', false)
-    expect(t.channel.currentDocument()).toBeNull()
-    t.contents.emit('did-fail-provisional-load', {}, -3, '', '', true)
+    t.contents.emit('did-stop-loading')
     expect(t.channel.currentDocument()).toBe(1)
     expect(t.docs).toEqual([1, 'left', 'resumed 1'])
-    // Once resumed, another abort changes nothing.
-    t.contents.emit('did-fail-provisional-load', {}, -3, '', '', true)
+    // Once resumed, another stop changes nothing.
+    t.contents.emit('did-stop-loading')
     expect(t.docs).toEqual([1, 'left', 'resumed 1'])
   })
 
-  it('a committed error page (a failure that is not an abort) keeps the bridge off until the next commit', () => {
+  it('a load stopping with no navigation pending changes nothing', () => {
     const t = setup()
     t.contents.emit('did-navigate')
-    t.contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
-    t.contents.emit('did-fail-provisional-load', {}, -102, 'ERR_CONNECTION_REFUSED', '', true)
-    t.contents.emit('did-fail-load', {}, -102, 'ERR_CONNECTION_REFUSED', '', true)
     t.contents.emit('did-stop-loading')
-    expect(t.channel.currentDocument()).toBeNull()
-    t.contents.emit('did-navigate')
-    expect(t.channel.currentDocument()).toBe(2)
+    expect(t.docs).toEqual([1])
+    expect(t.channel.currentDocument()).toBe(1)
   })
 
-  it('before the first document, an abort gives no document', () => {
+  it('a committed error page keeps the bridge off until the next commit, whatever its code', () => {
+    for (const code of [-102, -3]) {
+      const t = setup()
+      t.contents.emit('did-navigate')
+      t.contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+      // A sub-frame's failure is not the main frame's.
+      t.contents.emit('did-fail-provisional-load', {}, code, '', '', false)
+      t.contents.emit('did-fail-provisional-load', {}, code, '', '', true)
+      t.contents.emit('did-fail-load', {}, code, '', '', true)
+      t.contents.emit('did-stop-loading')
+      expect(t.channel.currentDocument()).toBeNull()
+      expect(t.docs).toEqual([1, 'left'])
+      t.contents.emit('did-navigate')
+      expect(t.channel.currentDocument()).toBe(2)
+    }
+  })
+
+  it('a sub-frame failure does not stop a pending main-frame navigation from resuming', () => {
+    const t = setup()
+    t.contents.emit('did-navigate')
+    t.contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+    t.contents.emit('did-fail-provisional-load', {}, -102, '', '', false)
+    t.contents.emit('did-stop-loading')
+    expect(t.channel.currentDocument()).toBe(1)
+  })
+
+  it('before the first document, a cancelled navigation gives no document', () => {
     const t = setup()
     t.contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
-    t.contents.emit('did-fail-provisional-load', {}, -3, '', '', true)
+    t.contents.emit('did-stop-loading')
     expect(t.channel.currentDocument()).toBeNull()
+    expect(t.docs).toEqual(['left'])
   })
 
   it('describes a request from its metadata only', () => {

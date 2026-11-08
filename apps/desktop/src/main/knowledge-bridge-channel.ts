@@ -13,9 +13,6 @@ import type { BridgeArrival, KnowledgeBridge } from './knowledge-bridge'
 export const BRIDGE_PATH = '/__agent24/bridge'
 const RESERVED_PREFIX = '/__agent24/'
 
-/** net::ERR_ABORTED: a navigation that was cancelled, not one that failed. */
-const ERR_ABORTED = -3
-
 /** U6.1 f: pressing, clicking, touching; not moves, hovers or scrolls. */
 const ACTIVATION = new Set(['mouseDown', 'rawKeyDown', 'keyDown', 'touchStart', 'gestureTap'])
 
@@ -106,14 +103,19 @@ export class KnowledgeBridgeChannel {
       this.pending = false
       this.bridge.newDocument(this.document)
     })
-    // A main-frame navigation cancelled before it committed (the guards'
-    // will-navigate / will-frame-navigate / will-redirect, a download, a 204)
-    // ends as ERR_ABORTED: the page shown is still the document it was, and
-    // its bridge comes back. Anything else (an error page Chromium committed,
-    // which Electron reports without did-navigate) keeps the bridge off until
-    // the next real commit.
-    this.listen('did-fail-provisional-load', (_event: unknown, code: unknown, _description: unknown, _url: unknown, isMainFrame: unknown) => {
-      if (!isMainFrame || code !== ERR_ABORTED || !this.pending) return
+    // Electron 34 (WebContents::DidFinishNavigation) reports a main-frame
+    // navigation that never committed — cancelled by the guards'
+    // will-navigate / will-frame-navigate / will-redirect, a download, a 204 —
+    // with no did-navigate and no did-fail-*: only the load stopping. The
+    // page shown is still the document it was, and its bridge comes back.
+    // did-fail-provisional-load fires only for an error page Chromium did
+    // commit (without did-navigate): a document the bridge never met, so it
+    // stays off until the next real commit.
+    this.listen('did-fail-provisional-load', (_event: unknown, _code: unknown, _description: unknown, _url: unknown, isMainFrame: unknown) => {
+      if (isMainFrame) this.pending = false
+    })
+    this.listen('did-stop-loading', () => {
+      if (!this.pending) return
       this.pending = false
       if (this.document === 0) return
       this.between = false
