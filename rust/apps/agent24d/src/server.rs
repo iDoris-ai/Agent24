@@ -5131,7 +5131,7 @@ pub(crate) mod tests {
         );
         state
             .store
-            .grant_module_consent(&summary, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .grant_module_consent(&summary, "2026-10-08T00:00:00Z", "2099-01-01T00:00:00Z")
             .await
             .unwrap();
         let second_summary = agent24_store::ToolPermissionSummary::new(
@@ -5149,7 +5149,7 @@ pub(crate) mod tests {
             .grant_module_consent(
                 &second_summary,
                 "2026-10-08T00:00:00Z",
-                "2026-11-08T00:00:00Z",
+                "2099-01-01T00:00:00Z",
             )
             .await
             .unwrap();

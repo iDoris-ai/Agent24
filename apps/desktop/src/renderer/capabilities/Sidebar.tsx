@@ -3,6 +3,7 @@ import { useT } from '../i18n'
 import { appMessages } from '../App.i18n'
 import { capabilitiesMessages } from './capabilities.i18n'
 import { CapabilitiesContext, NavPrefsContext } from './types'
+import { ChatHistoryList } from '../pages/chat/ChatHistoryList'
 
 export function Sidebar({ activeId, navigate }: { activeId: string; navigate: (page: string) => void }) {
   const { defs, open, approvalsWaiting } = useContext(CapabilitiesContext)
@@ -20,6 +21,7 @@ export function Sidebar({ activeId, navigate }: { activeId: string; navigate: (p
   return <nav className="sidebar-nav" aria-label={c('navigation')}>
     {prefs.showOverview && item('home', t('nav.home'), () => navigate('home'), approvalsWaiting)}
     {item('assistant', c('assistant.name'), () => open('assistant', 'sidebar'))}
+    <ChatHistoryList showChat={() => open('assistant', 'sidebar')} />
     <div className="nav-section">{c('pinned', { count: pinnedCount, slots: prefs.slotCount })}</div>
     {pinned.map(def => item(def.id, c(def.nameKey), () => open(def.id, 'sidebar')))}
     {Array.from({ length: Math.max(0, prefs.slotCount - pinnedCount) }, (_, i) => <div className="nav-empty-slot" key={i}>{c('emptySlot')}</div>)}
