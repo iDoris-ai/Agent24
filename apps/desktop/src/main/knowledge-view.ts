@@ -151,8 +151,8 @@ export function knowledgeViewCsp(origin: string): string {
   // http://[::1]:8443` matches nothing and the page's own scripts are blocked
   // (headless Chromium 153, 11-08; Codex #1654 R1). For such an origin the
   // sources are `'self'`: the main frame never leaves the allowed origin
-  // (guardKnowledgeContents), so 'self' is that origin. v1 has no WebSocket
-  // (UIB v1, design §2.2), so nothing is lost on ws.
+  // (guardKnowledgeContents), so 'self' is that origin. In connect-src 'self'
+  // also matches same-origin ws/wss (CSP3); v1 uses no WebSocket anyway.
   const ipv6 = new URL(origin).hostname.startsWith('[')
   const src = ipv6 ? "'self'" : origin
   const connect = ipv6 ? "'self'" : `${origin} ${origin.replace(/^http/, 'ws')}`
