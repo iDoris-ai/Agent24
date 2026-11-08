@@ -12,7 +12,7 @@ import { SidebarPrefs } from '../pages/settings/SidebarPrefs'
 import { setLocale } from '../i18n'
 
 describe('Sidebar', () => {
-  it('renders fixed entries, ordered pins, empty slots, hidden Overview and approval badges', () => {
+  it('renders fixed entries, ordered pins, a "+ Pin" row while there is room, hidden Overview and approval badges', () => {
     const open = vi.fn()
     const navigate = vi.fn()
     const { rerender } = render(
@@ -23,10 +23,14 @@ describe('Sidebar', () => {
       </CapabilitiesContext.Provider>,
     )
     expect(screen.getAllByRole('button').map(b => b.textContent)).toEqual([
-      'Overview4', 'Assistant', 'Voice', 'Documents', 'Capabilities4', 'Settings',
+      'Overview4', 'Assistant', 'Voice', 'Documents', '+ Pin a capability', 'Capabilities4', 'Settings',
     ])
-    expect(screen.getByText('Pinned 2/3')).toBeInTheDocument()
-    expect(screen.getByText('Empty slot')).toBeInTheDocument()
+    // The group says what it is, not how full it is (David 11-08).
+    expect(screen.getByText('Pinned')).toBeInTheDocument()
+    expect(screen.queryByText(/\d\/\d/)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '+ Pin a capability' }))
+    expect(navigate).toHaveBeenCalledWith('capabilities')
+    navigate.mockClear()
     expect(screen.getByRole('button', { name: 'Voice' })).toHaveAttribute('aria-current', 'page')
     fireEvent.click(screen.getByRole('button', { name: 'Voice' }))
     expect(open).toHaveBeenCalledWith('voice', 'sidebar')
@@ -250,7 +254,7 @@ describe('NavPrefsProvider', () => {
       await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
       expect(setNavPrefs).not.toHaveBeenCalled()
       expect(screen.getByText(`${id} — ${status}`)).toBeInTheDocument()
-      expect(screen.getByText('Pinned 2/2')).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: '+ Pin a capability' })).toBeNull()
       expect(within(screen.getByRole('navigation')).queryByText(/acme/i)).not.toBeInTheDocument()
       await act(async () => { fireEvent.click(screen.getByRole('switch', { name: 'Show Overview in sidebar' })) })
       expect(setNavPrefs).toHaveBeenLastCalledWith({ ...saved, showOverview: false })
@@ -276,7 +280,7 @@ describe('NavPrefsProvider', () => {
     try {
       await act(async () => {})
       expect(setNavPrefs).not.toHaveBeenCalled()
-      expect(screen.getByText('Pinned 2/2')).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: '+ Pin a capability' })).toBeNull()
       manifests = [{ id: 'acme', type: 'ui', name: 'Acme' }]
       await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
       expect(within(screen.getByRole('navigation')).getByRole('button', { name: 'Acme' })).toBeInTheDocument()
@@ -296,12 +300,11 @@ describe('NavPrefsProvider', () => {
     try {
       await act(async () => {})
       expect(setNavPrefs).not.toHaveBeenCalled()
-      expect(screen.getByText('Pinned 2/2')).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: '+ Pin a capability' })).toBeNull()
       expect(screen.queryByText(/no longer installed/)).not.toBeInTheDocument()
       await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
       expect(setNavPrefs).toHaveBeenCalledExactlyOnceWith({ ...saved, pinned: ['documents'] })
-      expect(screen.getByText('Pinned 1/2')).toBeInTheDocument()
-      expect(screen.getByText('Empty slot')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: '+ Pin a capability' })).toBeInTheDocument()
       expect(screen.getByText('acme is no longer installed and was unpinned.')).toBeInTheDocument()
     } finally {
       view.unmount()
@@ -323,7 +326,7 @@ describe('NavPrefsProvider', () => {
       await act(async () => {})
       if (scenario === 'failure then success' || scenario === 'module removed during session') {
         expect(setNavPrefs).not.toHaveBeenCalled()
-        expect(screen.getByText('Pinned 2/2')).toBeInTheDocument()
+        expect(screen.queryByRole('button', { name: '+ Pin a capability' })).toBeNull()
         online = true
         installed = false
         await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
@@ -338,8 +341,7 @@ describe('NavPrefsProvider', () => {
       }
       expect(setNavPrefs).toHaveBeenLastCalledWith({ ...saved, pinned: ['documents'] })
       expect(screen.getByText('acme is no longer installed and was unpinned.')).toBeInTheDocument()
-      expect(screen.getByText('Pinned 1/2')).toBeInTheDocument()
-      expect(screen.getByText('Empty slot')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: '+ Pin a capability' })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Pin Design' })).toBeEnabled()
       await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Pin Design' })) })
       expect(setNavPrefs).toHaveBeenLastCalledWith({ ...saved, pinned: ['documents', 'design'] })
@@ -353,15 +355,14 @@ describe('NavPrefsProvider', () => {
     const setNavPrefs = installPrefs(async () => ({ pinned: ['documents', 'acme'], slotCount: 2, showOverview: true }))
     renderEditor(<><SidebarPrefs /><Sidebar activeId="settings" navigate={vi.fn()} /></>)
     expect(await screen.findByText('acme — Unavailable')).toBeInTheDocument()
-    expect(screen.getByText('Pinned 2/2')).toBeInTheDocument()
-    expect(screen.queryByText('Empty slot')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '+ Pin a capability' })).toBeNull()
     expect(within(screen.getByRole('navigation')).queryByText(/acme/)).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('switch', { name: 'Show Overview in sidebar' }))
     await waitFor(() => expect(setNavPrefs).toHaveBeenLastCalledWith({ pinned: ['documents', 'acme'], slotCount: 2, showOverview: false }))
     fireEvent.click(screen.getByRole('button', { name: 'Unpin acme' }))
     await waitFor(() => expect(setNavPrefs).toHaveBeenLastCalledWith({ pinned: ['documents'], slotCount: 2, showOverview: false }))
     expect(screen.queryByText(/Unavailable/)).not.toBeInTheDocument()
-    expect(screen.getByText('Pinned 1/2')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '+ Pin a capability' })).toBeInTheDocument()
   })
 
   it('F6 retries failed cleanup on the next write, returns dropped ids and localizes the removal notice', async () => {
@@ -389,7 +390,7 @@ describe('NavPrefsProvider', () => {
       expect(setNavPrefs).toHaveBeenLastCalledWith({ pinned: ['documents'], slotCount: 2, showOverview: false })
       expect(screen.getByText('acme is no longer installed and was unpinned.')).toBeInTheDocument()
       act(() => { setLocale('zh') })
-      expect(screen.getByText('acme 已卸载，已取消钉选。')).toBeInTheDocument()
+      expect(screen.getByText('acme 已卸载，已取消固定。')).toBeInTheDocument()
       act(() => { setLocale('th') })
       expect(screen.getByText('acme ไม่ได้ติดตั้งแล้วและถูกเลิกปักหมุด')).toBeInTheDocument()
     } finally {

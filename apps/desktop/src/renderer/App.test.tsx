@@ -391,7 +391,9 @@ describe('App navigation integration', () => {
     expect(nav().getAllByRole('button').map(button => button.textContent)).toEqual([
       'Overview', 'Assistant', 'Documents', 'Design', 'Create', 'Capabilities', 'Settings',
     ])
-    expect(nav().getByText('Pinned 3/3')).toBeInTheDocument()
+    expect(nav().getByText('Pinned')).toBeInTheDocument()
+    // Three of three: the sidebar offers no "+ Pin" row.
+    expect(nav().queryByRole('button', { name: '+ Pin a capability' })).toBeNull()
     center()
     expect(row('Schedules').getByText('Manage recurring and scheduled tasks.')).toBeInTheDocument()
     expect(row('Schedules').getByRole('button', { name: 'Slots full Schedules' })).toBeDisabled()

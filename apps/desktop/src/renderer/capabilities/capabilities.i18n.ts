@@ -31,7 +31,7 @@ const messages = defineMessages({
     'next.domainOs': 'Enable this domain OS in Tools to get started.',
     'next.tools': 'Open Tools',
     'breadcrumb': 'Breadcrumb', 'navigation': 'Main navigation',
-    'pinned': 'Pinned {count}/{slots}', 'emptySlot': 'Empty slot',
+    'pinned': 'Pinned', 'pinMore': '+ Pin a capability',
   },
   zh: {
     'group.office': '办公', 'group.knowledge': '知识', 'group.creative': '创作',
@@ -63,7 +63,7 @@ const messages = defineMessages({
     'next.domainOs': '前往工具，启用此领域 OS。',
     'next.tools': '打开工具',
     'breadcrumb': '面包屑', 'navigation': '主导航',
-    'pinned': '已钉选 {count}/{slots}', 'emptySlot': '空位',
+    'pinned': '已固定', 'pinMore': '+ 固定能力',
   },
   th: {
     'group.office': 'สำนักงาน', 'group.knowledge': 'ความรู้', 'group.creative': 'งานสร้างสรรค์',
@@ -95,7 +95,7 @@ const messages = defineMessages({
     'next.domainOs': 'เปิดใช้งาน Domain OS นี้ในเครื่องมือเพื่อเริ่มต้น',
     'next.tools': 'เปิดเครื่องมือ',
     'breadcrumb': 'เส้นทางนำทาง', 'navigation': 'การนำทางหลัก',
-    'pinned': 'ปักหมุด {count}/{slots}', 'emptySlot': 'ช่องว่าง',
+    'pinned': 'ปักหมุด', 'pinMore': '+ ปักหมุดความสามารถ',
   },
 })
 
