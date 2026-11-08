@@ -169,7 +169,8 @@ export class KnowledgeController {
   uiSessionInputs(binding: string): { credential: string; generation: number } | null {
     if (this.viewBinding() !== binding) return null
     const credential = this.key()
-    return credential === null ? null : { credential, generation: this.identity }
+    // U7.1: generations are 1..2^53-1; identity starts at 0 on every launch.
+    return credential === null ? null : { credential, generation: this.identity + 1 }
   }
 
   /** The binding a new run is to name, or none while Off or incomplete. */

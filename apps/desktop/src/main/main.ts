@@ -499,6 +499,7 @@ app.whenReady().then(async () => {
         onEvent: context.onEvent,
       })
     },
+    locale: () => app.getLocale(),
     onState: (state) => {
       if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.KnowledgeViewState, state)
     },

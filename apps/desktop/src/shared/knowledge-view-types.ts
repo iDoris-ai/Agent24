@@ -11,8 +11,8 @@ export interface KnowledgeViewBounds {
 
 export type KnowledgeViewTheme = 'light' | 'dark'
 
-/** `closed` codes (CONTRACT-UI-BRIDGE-v1 §9.2) this host can reach; `bridge_closed` comes with the bridge. */
-export type KnowledgeViewClosedCode = 'crash_loop' | 'session_rejected' | 'revocation_mismatch' | 'probe_failed' | 'empty_scope'
+/** `closed` codes (CONTRACT-UI-BRIDGE-v1 §9.2), the closed set. */
+export type KnowledgeViewClosedCode = 'crash_loop' | 'session_rejected' | 'revocation_mismatch' | 'probe_failed' | 'empty_scope' | 'bridge_closed'
 
 /** Why the view is not showing; the `closed` codes are §9.2's. */
 export type KnowledgeViewFailure =
@@ -32,5 +32,6 @@ export type KnowledgeViewState =
   | { state: 'loading' }
   | { state: 'ready' }
   | { state: 'degraded'; code: 'crashed' | 'navigated_away' | 'load_failed' | 'unresponsive' | 'session_unavailable' }
-  | { state: 'closed'; code: KnowledgeViewClosedCode }
+  /** `final`: the third bridge closing within 10 minutes; only Knowledge settings open it again (U6.6, decision #17). */
+  | { state: 'closed'; code: KnowledgeViewClosedCode; final?: true }
   | { state: 'unavailable'; code: 'knowledge_off' | 'not_configured' | 'partition_limit' }

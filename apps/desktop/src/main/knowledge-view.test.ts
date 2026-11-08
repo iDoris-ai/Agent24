@@ -109,7 +109,10 @@ class FakeSession extends FakeEmitter {
 let contentsIds = 100
 class FakeContents extends FakeEmitter {
   readonly id = ++contentsIds
-  readonly mainFrame = { processId: 4, routingId: this.id }
+  readonly mainFrame = {
+    processId: 4, routingId: this.id, origin: ORIGIN, detached: false, scripts: [] as string[],
+    executeJavaScript(code: string) { this.scripts.push(code); return Promise.resolve() },
+  }
   destroyed = false
   url = ''
   openHandler: Listener | null = null
@@ -1060,6 +1063,7 @@ describe('UI session wiring (KB-C2-04a, U4.5, U4.7, U3.8)', () => {
         inject: (request, webContentsId) => { m.injected.push({ request: request as unknown as Record<string, unknown>, webContentsId }); return decision },
         responded: (id, status) => { m.responded.push([id, status]) },
         destroy: () => { m.destroyed = true; log.push('ui destroyed') },
+        bridgeAdmission: () => ({ open: true, generation: 1 }),
       }
     }
     return { factory, made, decide: (d: typeof decision) => { decision = d } }
@@ -1266,5 +1270,179 @@ describe('registerKnowledgeViewIpc', () => {
     registerKnowledgeViewIpc({ handle: (c: string, h: Listener) => { handlers.set(c, h) } } as never, ((h: Listener) => h) as never,
       { show: 's', bounds: 'b', hide: 'h', reload: 'r' }, () => null)
     expect(await handlers.get('s')!({}, BOUNDS)).toEqual({ ok: false, code: 'window_unavailable' })
+  })
+})
+
+describe('bridge wiring (KB-C2-04a-2, U6.1, U6.6)', () => {
+  type Ui = KnowledgeViewUi & { admission: { open: boolean; generation: number } }
+  const ui = (): { factory: (c: KnowledgeViewUiContext) => KnowledgeViewUi; made: Ui[] } => {
+    const made: Ui[] = []
+    return {
+      made,
+      factory: () => {
+        const u: Ui = {
+          admission: { open: true, generation: 3 },
+          start: async () => true,
+          inject: () => ({ cancel: false, requestHeaders: {}, injected: false }),
+          responded: () => {},
+          destroy: () => {},
+          bridgeAdmission: () => u.admission,
+        }
+        made.push(u)
+        return u
+      },
+    }
+  }
+  const BRIDGE = `${ORIGIN}/__agent24/bridge`
+  let n = 0
+  const msg = (payload: unknown = { state: 'ready' }, extra: Record<string, unknown> = {}) =>
+    ({ v: 3, direction: 'page_to_host', type: 'status', id: `01J9ZQ3V6R8XKQ4M2N5P7T${String(n++).padStart(4, '0')}`, generation: 3, payload, ...extra })
+  const delivered = (contents: FakeContents) => contents.mainFrame.scripts.map((s) => JSON.parse(JSON.parse(/JSON\.parse\((.*)\) \}\)\);undefined$/.exec(s)![1])))
+  const post = (t: ReturnType<typeof setup>, i: number, body: unknown, over: Record<string, unknown> = {}) => {
+    const contents = t.views[i].webContents
+    // The page echoes the document_id of the newest hello it got (decision #37).
+    const doc = delivered(contents).filter((m) => m.type === 'hello').at(-1)?.document_id
+    if (body && typeof body === 'object' && !('document_id' in (body as object))) (body as Record<string, unknown>).document_id = doc
+    let out: unknown = null
+    t.sessions[i].beforeRequest?.({ url: BRIDGE, method: 'POST', webContentsId: contents.id, frame: contents.mainFrame, uploadData: [{ bytes: Buffer.from(JSON.stringify(body)) }], ...over }, (r: unknown) => { out = r })
+    return out
+  }
+
+  it('takes the reserved POST into the bridge and never lets it out; greets each new document', async () => {
+    const u = ui()
+    const t = setup({ ui: u.factory })
+    await t.host.show(BOUNDS)
+    const contents = t.views[0].webContents
+    contents.emit('did-navigate', {}, URL_, 200)
+    expect(delivered(contents).map((m) => m.type)).toEqual(['hello', 'state'])
+    expect(delivered(contents)[1].payload).toEqual({ profile_state: 'ready', theme: 'dark', locale: 'en' })
+    const m = msg()
+    expect(post(t, 0, m)).toEqual({ cancel: true })
+    expect(delivered(contents).at(-1)).toMatchObject({ type: 'reply', in_reply_to: m.id, generation: 3, payload: { result: 'done' } })
+    // Anything else under the prefix is cancelled too and reaches no bridge.
+    let other: unknown = null
+    t.sessions[0].beforeRequest?.({ url: `${ORIGIN}/__agent24/x`, method: 'GET' }, (r: unknown) => { other = r })
+    expect(other).toEqual({ cancel: true })
+    expect(t.sessions[0].allows(`${ORIGIN}/api/v1/x`)).toBe(true)
+    contents.emit('did-navigate', {}, URL_, 200)
+    expect(delivered(contents).filter((x) => x.type === 'hello')).toHaveLength(2)
+  })
+
+  it('the first state is taken once the session has started, not when the instance is made', async () => {
+    const made: Ui[] = []
+    const factory = (): KnowledgeViewUi => {
+      const u: Ui = {
+        admission: { open: false, generation: 3 },
+        start: async () => { u.admission.open = true; return true },
+        inject: () => ({ cancel: false, requestHeaders: {}, injected: false }),
+        responded: () => {},
+        destroy: () => {},
+        bridgeAdmission: () => u.admission,
+      }
+      made.push(u)
+      return u
+    }
+    const t = setup({ ui: factory })
+    await t.host.show(BOUNDS)
+    const contents = t.views[0].webContents
+    contents.emit('did-navigate', {}, URL_, 200)
+    expect(delivered(contents).filter((m) => m.type === 'state').map((m) => m.payload.profile_state)).toEqual(['ready'])
+  })
+
+  it('sends a new state when the theme changes', async () => {
+    const u = ui()
+    const t = setup({ ui: u.factory })
+    await t.host.show(BOUNDS)
+    const contents = t.views[0].webContents
+    contents.emit('did-navigate', {}, URL_, 200)
+    await t.host.show(BOUNDS, 'light')
+    expect(delivered(contents).at(-1)).toMatchObject({ type: 'state', payload: { theme: 'light' } })
+  })
+
+  it('without a UI session there is no bridge, and the path is still cancelled', async () => {
+    const t = setup()
+    await t.host.show(BOUNDS)
+    t.views[0].webContents.emit('did-navigate', {}, URL_, 200)
+    expect(post(t, 0, msg())).toEqual({ cancel: true })
+    expect(t.views[0].webContents.mainFrame.scripts).toEqual([])
+  })
+
+  it('a violation closes the view as bridge_closed; the third in 10 minutes is final until Knowledge settings', async () => {
+    const u = ui()
+    const t = setup({ ui: u.factory })
+    for (let i = 0; i < 3; i++) {
+      await t.host.reload(BOUNDS)
+      const contents = t.views[i].webContents
+      contents.emit('did-navigate', {}, URL_, 200)
+      post(t, i, msg({ state: 'ready', Frame: 1 }))
+      expect(t.host.status()).toEqual(i < 2 ? { state: 'closed', code: 'bridge_closed' } : { state: 'closed', code: 'bridge_closed', final: true })
+      expect(contents.closed).toBe(true)
+    }
+    // Reload is no way out now, nor is showing again; a page that mounts
+    // again is told the whole state, final included.
+    expect(await t.host.reload(BOUNDS)).toEqual({ ok: false, code: 'bridge_closed' })
+    t.states.length = 0
+    expect(await t.host.show(BOUNDS)).toEqual({ ok: false, code: 'bridge_closed' })
+    expect(t.states).toEqual([{ state: 'closed', code: 'bridge_closed', final: true }])
+    expect(t.views).toHaveLength(3)
+    // Knowledge off and on again: a fresh count.
+    t.env.binding = null
+    await t.host.show(BOUNDS)
+    t.env.binding = 'https://kb.example.org/api/v1'
+    expect(await t.host.show(BOUNDS)).toEqual({ ok: true })
+    t.views[3].webContents.emit('did-navigate', {}, URL_, 200)
+    post(t, 3, msg({ state: 'ready', Frame: 1 }))
+    expect(t.host.status()).toEqual({ state: 'closed', code: 'bridge_closed' })
+  })
+
+  it('closings older than 10 minutes do not count', async () => {
+    const u = ui()
+    const t = setup({ ui: u.factory })
+    for (let i = 0; i < 3; i++) {
+      await t.host.reload(BOUNDS)
+      t.views[i].webContents.emit('did-navigate', {}, URL_, 200)
+      post(t, i, msg({ state: 'ready', Frame: 1 }))
+      t.advance(5 * 60_000 + 1)
+    }
+    expect(t.host.status()).toEqual({ state: 'closed', code: 'bridge_closed' })
+  })
+
+  it('a sub-frame of the view closes it too; another webContents is ignored', async () => {
+    const u = ui()
+    const t = setup({ ui: u.factory })
+    await t.host.show(BOUNDS)
+    const contents = t.views[0].webContents
+    contents.emit('did-navigate', {}, URL_, 200)
+    post(t, 0, msg(), { webContentsId: 999 })
+    expect(t.host.status()).toEqual({ state: 'ready' })
+    post(t, 0, msg(), { frame: { processId: 4, routingId: 12345, origin: ORIGIN } })
+    expect(t.host.status()).toEqual({ state: 'closed', code: 'bridge_closed' })
+  })
+
+  it('the bridge is sealed with the partition on destroy', async () => {
+    const u = ui()
+    const t = setup({ ui: u.factory })
+    await t.host.show(BOUNDS)
+    const contents = t.views[0].webContents
+    contents.emit('did-navigate', {}, URL_, 200)
+    const before = contents.mainFrame.scripts.length
+    // The page lingers a moment after close (Electron destroys it later).
+    contents.asyncClose = true
+    t.host.destroyAll('test')
+    expect(post(t, 0, msg())).toEqual({ cancel: true })
+    contents.emit('did-navigate', {}, URL_, 200)
+    expect(contents.mainFrame.scripts).toHaveLength(before)
+  })
+
+  it('admission closed: not_ready, and the view stays', async () => {
+    const u = ui()
+    const t = setup({ ui: u.factory })
+    await t.host.show(BOUNDS)
+    const contents = t.views[0].webContents
+    u.made[0].admission.open = false
+    contents.emit('did-navigate', {}, URL_, 200)
+    post(t, 0, msg())
+    expect(delivered(contents).at(-1)?.payload).toEqual({ result: 'rejected', code: 'unavailable', reason: 'not_ready' })
+    expect(t.host.status()).toEqual({ state: 'ready' })
   })
 })

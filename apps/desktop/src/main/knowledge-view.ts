@@ -32,7 +32,9 @@ import type { IpcGuard } from './ipc/guard'
 import { isPlainHostname } from './knowledge-hostname'
 import type { InjectDecision, InjectRequest } from './knowledge-ui-inject'
 import type { UiInstanceEvent } from './knowledge-ui-instance'
-import { UiSessionLedger } from './knowledge-ui-session'
+import { UiSessionLedger, UI_SESSION_WINDOW_MS } from './knowledge-ui-session'
+import { KnowledgeBridge } from './knowledge-bridge'
+import { KnowledgeBridgeChannel, reservedRequest, type BridgeRequestDetails } from './knowledge-bridge-channel'
 import type {
   KnowledgeViewBounds,
   KnowledgeViewClosedCode,
@@ -279,6 +281,8 @@ export interface KnowledgeViewHostDeps {
   proxyPort?: () => Promise<number>
   /** KB-C2-04a: the instance's UI session (KnowledgeUiInstance in the app). Without it no page request carries a session. */
   ui?: (context: KnowledgeViewUiContext) => KnowledgeViewUi
+  /** BCP 47 locale for the bridge's `state` (U7.3); 'en' without it. */
+  locale?: () => string
 }
 
 /** What the host hands the UI session of a new instance. */
@@ -297,7 +301,13 @@ export interface KnowledgeViewUi {
   inject(request: InjectRequest, webContentsId: number): InjectDecision
   responded(id: number, statusCode: number | undefined): void
   destroy(): void
+  /** U6.4 ⑬⑭ for the bridge (design §6: open while the session has a JWT it may inject). */
+  bridgeAdmission(): { open: boolean; generation: number }
 }
+
+/** U6.6: the third violation closing within this window of one binding is final. */
+export const KNOWLEDGE_BRIDGE_CLOSE_WINDOW_MS = UI_SESSION_WINDOW_MS
+export const KNOWLEDGE_BRIDGE_CLOSE_LIMIT = 3
 
 // The app's own --bg (styles.css), so the area does not flash while the page loads.
 const BACKGROUND: Record<KnowledgeViewTheme, string> = { light: '#f4f4ef', dark: '#0a0a0a' }
@@ -357,7 +367,7 @@ export function listenDeadProxy(log: (message: string) => void): Promise<net.Ser
 
 /** Installs the partition-wide refusals. Done before the view exists, so the
  * first request already meets them. */
-export function hardenKnowledgeSession(ses: Session, origin: string): void {
+export function hardenKnowledgeSession(ses: Session, origin: string, onBridge: (details: BridgeRequestDetails) => void = () => {}): void {
   ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(false))
   ses.setPermissionCheckHandler(() => false)
   ses.setDevicePermissionHandler(() => false)
@@ -373,7 +383,21 @@ export function hardenKnowledgeSession(ses: Session, origin: string): void {
   ses.serviceWorkers.on('registration-completed', () => {
     void ses.clearStorageData({ storages: ['serviceworkers', 'cachestorage'] }).catch(() => {})
   })
-  ses.webRequest.onBeforeRequest((details, callback) => callback({ cancel: !isAllowedRequest(details.url, origin) }))
+  // The partition's one onBeforeRequest (Electron keeps the last listener
+  // only): the bridge's reserved path first, always cancelled, so it never
+  // reaches the server (U6.1 b); then the origin filter. destroy() replaces
+  // the whole listener, the bridge with it.
+  ses.webRequest.onBeforeRequest((details, callback) => {
+    const reserved = reservedRequest(details.url, details.method, origin)
+    if (reserved === 'bridge') {
+      try {
+        onBridge(details as unknown as BridgeRequestDetails)
+      } catch {
+        // The request is cancelled whatever the bridge made of it.
+      }
+    }
+    callback({ cancel: reserved !== null || !isAllowedRequest(details.url, origin) })
+  })
   ses.webRequest.onHeadersReceived((details, callback) => callback({ responseHeaders: withKnowledgeCsp(details.responseHeaders, origin) }))
 }
 
@@ -460,6 +484,8 @@ interface Instance {
   httpFailed: boolean
   /** KB-C2-04a: the UI session, when the host has one. */
   ui: KnowledgeViewUi | null
+  /** KB-C2-04a-2: the bridge, only with a UI session (no session, nothing to admit). */
+  bridge: { bridge: KnowledgeBridge; channel: KnowledgeBridgeChannel } | null
 }
 
 /** Main's single owner of KnowledgeView instances (one binding for now). */
@@ -474,7 +500,10 @@ export class KnowledgeViewHost {
   private crashes: number[] = []
   /** `closed` belongs to the binding it happened under; another binding, or
    * Off, ends it (§9.2: binding-level destruction ends `closed`). */
-  private closed: { code: KnowledgeViewClosedCode; binding: string } | null = null
+  private closed: { code: KnowledgeViewClosedCode; binding: string; final?: true } | null = null
+  /** U6.6: when the bridge closed for a violation, per binding; a reload does not clear it, Knowledge settings do. */
+  private bridgeCloses: number[] = []
+  private bridgeBinding: string | null = null
   /** U3.8's per-binding counts, for `ledgerBinding`. */
   private ledger = new UiSessionLedger()
   private ledgerBinding: string | null = null
@@ -509,20 +538,29 @@ export class KnowledgeViewHost {
     this.request++
     this.visible = true
     this.bounds = bounds
-    if (rawTheme === 'light' || rawTheme === 'dark') this.theme = rawTheme
+    if ((rawTheme === 'light' || rawTheme === 'dark') && rawTheme !== this.theme) {
+      this.theme = rawTheme
+      if (this.instance) this.sendBridgeState(this.instance)
+    }
 
     const win = this.deps.window()
     if (this.disposed || !win || win.isDestroyed()) return { ok: false, code: 'window_unavailable' }
     const binding = this.deps.binding()
     if (binding === null) {
       this.endBinding()
+      this.endBridgeCount()
       this.destroy('knowledge off')
       this.setState({ state: 'unavailable', code: 'knowledge_off' })
       return { ok: false, code: 'knowledge_off' }
     }
     if (this.closed && this.closed.binding !== binding) this.endBinding()
+    if (this.bridgeBinding !== null && this.bridgeBinding !== binding) this.endBridgeCount()
     if (this.crashBinding !== binding) this.crashes = []
-    if (this.closed) return { ok: false, code: this.closed.code }
+    if (this.closed) {
+      // A page that mounts again learns the whole state, `final` included (U6.6).
+      this.setState({ state: 'closed', code: this.closed.code, ...(this.closed.final ? { final: true as const } : {}) })
+      return { ok: false, code: this.closed.code }
+    }
     const target = this.deps.target()
     if (!target) {
       this.destroy('no address')
@@ -607,6 +645,8 @@ export class KnowledgeViewHost {
       instance.proxied
         .then((): Promise<boolean> | boolean => (current() && instance.ui ? instance.ui.start() : true))
         .then(async (ready): Promise<boolean> => {
+          // The session is there now: the page's first state says so.
+          if (ready && current()) this.sendBridgeState(instance)
           if (ready && current()) {
             instance.navigating = true
             await instance.view.webContents.loadURL(instance.target.url)
@@ -651,6 +691,8 @@ export class KnowledgeViewHost {
   /** The user's reload: a new instance; also the way out of `closed` (§9.2). */
   async reload(rawBounds: unknown, rawTheme?: unknown): Promise<KnowledgeViewResult> {
     if (this.disposed) return { ok: false, code: 'window_unavailable' }
+    // U6.6: past the third bridge closing, Reload is not a way out.
+    if (this.closed?.final && this.closed.binding === this.deps.binding()) return { ok: false, code: this.closed.code }
     this.endBinding()
     this.destroy('reload')
     return this.show(rawBounds, rawTheme)
@@ -667,6 +709,7 @@ export class KnowledgeViewHost {
       ended = true
     }
     if (this.crashBinding !== binding) this.crashes = []
+    if (this.bridgeBinding !== binding) this.endBridgeCount()
     if (this.instance && this.instance.binding !== binding) {
       this.destroy('binding changed')
       ended = true
@@ -690,6 +733,11 @@ export class KnowledgeViewHost {
     this.destroyAll('app quit')
   }
 
+  private endBridgeCount(): void {
+    this.bridgeCloses = []
+    this.bridgeBinding = null
+  }
+
   private endBinding(): void {
     this.closed = null
     this.ledger = new UiSessionLedger()
@@ -702,7 +750,9 @@ export class KnowledgeViewHost {
     const partition = this.partitionName()
     this.partitions++
     const session = this.deps.sessionFor(partition)
-    hardenKnowledgeSession(session, target.origin)
+    // The instance does not exist yet; its bridge is looked up per request.
+    let made: Instance | null = null
+    hardenKnowledgeSession(session, target.origin, (details) => { if (made && this.instance === made) made.bridge?.channel.request(details) })
     const view = this.deps.createView(knowledgeViewPreferences(partition, this.deps.packaged))
     if (this.ledgerBinding !== binding) {
       this.ledger = new UiSessionLedger()
@@ -714,11 +764,26 @@ export class KnowledgeViewHost {
     }) ?? null
     if (ui) wireKnowledgeUi(session, view.webContents, ui)
     const instance: Instance = {
-      view, session, window: win, binding, target, loaded: false, reloadPending: false, navigating: false, unresponsive: false, loading: null, httpFailed: false, ui,
+      view, session, window: win, binding, target, loaded: false, reloadPending: false, navigating: false, unresponsive: false, loading: null, httpFailed: false, ui, bridge: null,
       onWindowClosed: () => { if (this.instance === instance) this.destroy('window closed') },
       proxied: (this.deps.proxyPort ?? (() => knowledgeViewBlackhole((m) => this.log(m))))().then((port) => session.setProxy(knowledgeViewProxyConfig(target.origin, port))),
     }
     instance.proxied.catch(() => {}) // surfaced by load(); never an unhandled rejection
+    made = instance
+    if (ui) {
+      const bridge = new KnowledgeBridge({
+        origin: target.origin,
+        admission: () => ui.bridgeAdmission(),
+        send: (text, document) => instance.bridge?.channel.send(text, document),
+        onClose: () => this.bridgeClosed(instance),
+        now: this.now,
+        setTimer: this.setTimer,
+        clearTimer: this.clearTimer,
+        log: this.log,
+      })
+      instance.bridge = { bridge, channel: new KnowledgeBridgeChannel(view.webContents as never, bridge, this.now, this.log) }
+      this.sendBridgeState(instance)
+    }
     guardKnowledgeContents(view.webContents, target.origin, () => {
       if (this.instance !== instance) return
       this.log('[knowledge-view] main frame left the allowed origin')
@@ -805,6 +870,32 @@ export class KnowledgeViewHost {
     this.setState({ state: 'degraded', code: 'session_unavailable' })
   }
 
+  /** U7.3 `state` for the page: non-secret display hints only. */
+  private sendBridgeState(instance: Instance): void {
+    if (!instance.bridge || !instance.ui) return
+    instance.bridge.bridge.setState({
+      // M2 (design §6): the binding is ready while the session may be used, otherwise unavailable.
+      profile_state: instance.ui.bridgeAdmission().open ? 'ready' : 'unavailable',
+      theme: this.theme,
+      locale: this.deps.locale?.() ?? 'en',
+    })
+  }
+
+  /** U6.6: the bridge closed for a violation: view-level, generation unchanged, `closed/bridge_closed`. */
+  private bridgeClosed(instance: Instance): void {
+    if (this.instance !== instance) return
+    const now = this.now()
+    if (this.bridgeBinding !== instance.binding) this.bridgeCloses = []
+    this.bridgeBinding = instance.binding
+    this.bridgeCloses = this.bridgeCloses.filter((t) => now - t < KNOWLEDGE_BRIDGE_CLOSE_WINDOW_MS)
+    this.bridgeCloses.push(now)
+    const final = this.bridgeCloses.length >= KNOWLEDGE_BRIDGE_CLOSE_LIMIT
+    this.log(`[knowledge-view] closed: bridge_closed${final ? ' (final)' : ''}`)
+    this.destroy('bridge closed')
+    this.closed = { code: 'bridge_closed', binding: instance.binding, ...(final ? { final: true as const } : {}) }
+    this.setState({ state: 'closed', code: 'bridge_closed', ...(final ? { final: true as const } : {}) })
+  }
+
   /** The native view is drawn above the app's page; it steps aside so the
    * page's message and Reload button can be seen. */
   private loadFailed(instance: Instance): void {
@@ -849,6 +940,13 @@ export class KnowledgeViewHost {
     const instance = this.instance
     if (!instance) return
     this.instance = null
+    // The bridge takes and sends nothing more (its listener goes with the seal below).
+    try {
+      instance.bridge?.bridge.destroy()
+      instance.bridge?.channel.dispose()
+    } catch (error) {
+      this.log(`[knowledge-view] end bridge failed (${reason}): ${String(error)}`)
+    }
     // U4.7: injection stops and the family is revoked before the page goes.
     try {
       instance.ui?.destroy()
