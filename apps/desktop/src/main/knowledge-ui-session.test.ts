@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { readUiError, readUiExchange, readUiProbe, UI_SESSION_WINDOW_MS, UiSessionLedger } from './knowledge-ui-session'
+import { readUiError, readUiExchange, readUiProbe, UI_REVOCATION_MISMATCH_LIMIT, UI_SESSION_WINDOW_MS, UiSessionLedger } from './knowledge-ui-session'
 
 const BOUND = ['kb-a', 'kb-b']
 const EXCHANGE = { session_token: 'jwt', expires_in: 600, ops: ['kb.list', 'chunk.list'], effective_scope: { knowledge_base_ids: ['kb-a'] } }
@@ -109,5 +109,23 @@ describe('UiSessionLedger (U3.8, decisions #3 and #36)', () => {
     expect(l.handle({ kind: 'invalid' }, 13 * MIN).action).toBe('closed')
     l.reset()
     expect(l.handle({ kind: 'invalid' }, 14 * MIN).action).toBe('rebuild')
+  })
+
+  it('closes on the third revocation mismatch in a sliding 10 minutes, apart from the view-level counts', () => {
+    const l = new UiSessionLedger()
+    expect(UI_REVOCATION_MISMATCH_LIMIT).toBe(3)
+    expect(l.revocationMismatch(1 * MIN)).toBe('renewed')
+    expect(l.revocationMismatch(2 * MIN)).toBe('renewed')
+    // A credential_invalid in between neither adds to nor clears these.
+    expect(l.handle({ kind: 'invalid' }, 3 * MIN).action).toBe('rebuild')
+    expect(l.revocationMismatch(3 * MIN)).toBe('closed')
+    const m = new UiSessionLedger()
+    m.revocationMismatch(0)
+    m.revocationMismatch(5 * MIN)
+    expect(m.revocationMismatch(10 * MIN)).toBe('renewed') // the first one left the window
+    expect(m.revocationMismatch(11 * MIN)).toBe('closed')
+    m.reset()
+    expect(m.revocationMismatch(12 * MIN)).toBe('renewed')
+    expect(m.handle({ kind: 'invalid' }, 12 * MIN).action).toBe('rebuild')
   })
 })

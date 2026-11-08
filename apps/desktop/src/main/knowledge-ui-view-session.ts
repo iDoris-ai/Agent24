@@ -12,6 +12,8 @@ import type { UiExchange } from './knowledge-ui-session'
 export const UI_UNKNOWN_LIMIT = 3
 /** Back-off between attempts after an unknown outcome or `overloaded`, unless the server names one. */
 export const UI_BACKOFF_MS = 1000
+/** U3.8: a view instance's self-check runs at most this often. */
+export const UI_SELF_CHECK_INTERVAL_MS = 10_000
 
 export interface UiViewSessionDeps {
   client: KnowledgeUiClient
@@ -41,16 +43,44 @@ export type UiSessionOutcome =
   | { kind: 'closed'; code: 'empty_scope' | 'probe_failed' }
   | { kind: 'destroyed' }
 
+/** What a self-check after an injected request's 401 found (U3.8); the establish outcomes come from a renewal. */
+export type UiSelfCheckOutcome =
+  | UiSessionOutcome
+  /** The probe accepted the JWT: nothing to do (a probe-failure pause is lifted). */
+  | { kind: 'ok' }
+  /** Another self-check ran less than UI_SELF_CHECK_INTERVAL_MS ago. */
+  | { kind: 'skipped' }
+  /** The probe said `credential_revoked`, yet issuing with C worked and the view renewed: the host counts it (UiSessionLedger.revocationMismatch). */
+  | { kind: 'revoked_renewed' }
+  /** The probe said `credential_invalid`: view-level handling. `jwtExchangedAt` and `at` feed UiSessionLedger's restart rule. */
+  | { kind: 'session_invalid'; restarted: boolean; jwtExchangedAt: number; at: number }
+
 export class UiViewSession {
   private session: (UiExchange & { exchangedAt: number }) | null = null
   private flight: Promise<UiSessionOutcome> | null = null
   private destroyed = false
+  /** U3.8: injection paused after a probe ended unknown; lifted by any other result. */
+  private paused = false
+  private check: Promise<UiSelfCheckOutcome> | null = null
+  private lastCheckAt: number | null = null
 
   constructor(private readonly deps: UiViewSessionDeps) {}
 
   /** The JWT to inject, if there is one; never logged or passed on (U2.5). */
   token(): string | null {
     return this.destroyed ? null : this.session?.sessionToken ?? null
+  }
+
+  /**
+   * What the injector sends (U4.5 ⑤): the JWT and the view proof, or null while
+   * paused, before the first exchange, once the JWT is past its life, or after
+   * the instance is gone. Never logged or passed on (U2.5).
+   */
+  injection(): { token: string; proof: string } | null {
+    const s = this.session
+    if (this.destroyed || this.paused || !s) return null
+    if (this.deps.now() - s.exchangedAt >= s.expiresInS * 1000) return null
+    return { token: s.sessionToken, proof: this.deps.view.proof }
   }
 
   /** When the current JWT was exchanged (UiSessionLedger's merge rule for restarts). */
@@ -69,6 +99,20 @@ export class UiViewSession {
   establish(): Promise<UiSessionOutcome> {
     this.flight ??= this.run().finally(() => { this.flight = null })
     return this.flight
+  }
+
+  /**
+   * U3.8: an injected request got a 401. One self-check per instance at a time
+   * and at most every UI_SELF_CHECK_INTERVAL_MS: renew if the JWT is at or near
+   * its end, otherwise probe the session and act on the answer.
+   */
+  selfCheck(): Promise<UiSelfCheckOutcome> {
+    if (this.check) return this.check
+    const now = this.deps.now()
+    if (this.lastCheckAt !== null && now - this.lastCheckAt < UI_SELF_CHECK_INTERVAL_MS) return Promise.resolve({ kind: 'skipped' })
+    this.lastCheckAt = now
+    this.check = this.runCheck().finally(() => { this.check = null })
+    return this.check
   }
 
   /** Ends the instance: forget the JWT and revoke the family, bounded, never awaited by teardown (U3.7). */
@@ -132,6 +176,47 @@ export class UiViewSession {
       }
       if (other) return other
     }
+  }
+
+  private async runCheck(): Promise<UiSelfCheckOutcome> {
+    if (this.destroyed) return { kind: 'destroyed' }
+    if (this.needsRenewal()) return this.renew()
+    let unknownInARow = 0
+    for (;;) {
+      const s = this.session
+      if (!s) return this.renew()
+      const probed = await this.deps.client.probe(s.sessionToken, this.deps.view)
+      if (this.destroyed) return { kind: 'destroyed' }
+      if (probed.kind === 'ok') {
+        this.paused = false
+        return { kind: 'ok' }
+      }
+      if (probed.kind === 'refused' && probed.error.code === 'unauthorized') {
+        const { reason, restarted } = probed.error
+        if (reason === 'credential_expired') return this.renew()
+        if (reason === 'credential_revoked') {
+          const renewed = await this.renew()
+          return renewed.kind === 'ready' ? { kind: 'revoked_renewed' } : renewed
+        }
+        if (reason === 'credential_invalid') {
+          // This JWT is dead: nothing more goes out with it while the host rebuilds.
+          this.paused = false
+          if (this.session === s) this.session = null
+          return { kind: 'session_invalid', restarted, jwtExchangedAt: s.exchangedAt, at: this.deps.now() }
+        }
+      }
+      // Timeout, 5xx, an unknown reason or an undecodable `restarted`: pause and back off.
+      this.paused = true
+      if (++unknownInARow >= UI_UNKNOWN_LIMIT) return { kind: 'closed', code: 'probe_failed' }
+      await this.deps.sleep(this.backoff(probed))
+      if (this.destroyed) return { kind: 'destroyed' }
+    }
+  }
+
+  /** A renewal is an establish in the same family; any result other than unknown lifts the pause (U3.8). */
+  private async renew(): Promise<UiSessionOutcome> {
+    this.paused = false
+    return this.establish()
   }
 
   /** null for ok; 'retry' for an outcome U3.8 retries; otherwise how this ends. */

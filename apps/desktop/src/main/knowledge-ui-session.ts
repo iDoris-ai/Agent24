@@ -11,6 +11,8 @@ import { UI_OPS, type UiOp } from './knowledge-ui-routes'
 export const UI_SESSION_WINDOW_MS = 10 * 60 * 1000
 /** Decision #36: restart events left out of the count per binding and window. */
 export const UI_RESTART_EXEMPT_LIMIT = 3
+/** U3.8: the third "probe said revoked, yet issuing with C worked" in the window closes the binding's views. */
+export const UI_REVOCATION_MISMATCH_LIMIT = 3
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 
@@ -101,6 +103,7 @@ export class UiSessionLedger {
   private counted: number[] = []
   private exempted: number[] = []
   private lastRestartEventAt: number | null = null
+  private mismatches: number[] = []
 
   handle(cause: ViewLevelCause, now: number): ViewLevelDecision {
     const since = now - UI_SESSION_WINDOW_MS
@@ -123,10 +126,24 @@ export class UiSessionLedger {
     return { action: this.counted.length >= 2 ? 'closed' : 'rebuild', merged: false, exempt: false }
   }
 
+  /**
+   * U3.8: a probe answered `credential_revoked` and issuing a ticket with the
+   * current C then worked (the view renewed). The third such event for this
+   * binding within the window is `closed/revocation_mismatch`. Kept apart from
+   * the view-level counts above.
+   */
+  revocationMismatch(now: number): 'renewed' | 'closed' {
+    const since = now - UI_SESSION_WINDOW_MS
+    this.mismatches = this.mismatches.filter((t) => t > since)
+    this.mismatches.push(now)
+    return this.mismatches.length >= UI_REVOCATION_MISMATCH_LIMIT ? 'closed' : 'renewed'
+  }
+
   /** The user's way out of `closed` (§9.2) starts the binding afresh. */
   reset(): void {
     this.counted = []
     this.exempted = []
     this.lastRestartEventAt = null
+    this.mismatches = []
   }
 }
