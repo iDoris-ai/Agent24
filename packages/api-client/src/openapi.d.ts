@@ -531,6 +531,33 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sessions/{id}/source-floor": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * How strict a conversation's sources were (read only)
+         * @description KB-SOP-01a (#1669, decision 2026-11-09-floor-read-api). The strictest
+         *     of: the source floor of session {id}; each listed run's own source
+         *     tags; and the current floor of each listed run's session. Restricted
+         *     over unknown over missing over ordinary. A run this daemon has no
+         *     record of, a run without tags, a read that fails, or more than 64
+         *     run_id values is unknown (never cut short). missing means session {id}
+         *     has no floor and nothing listed is stricter. A run's session without a
+         *     floor adds nothing. Writes nothing; carries no conversation content.
+         */
+        get: operations["getSessionSourceFloor"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/runs": {
         parameters: {
             query?: never;
@@ -2617,6 +2644,10 @@ export interface components {
                 knowledge_id: string;
                 chunk_id: string;
             }[];
+        };
+        SessionSourceFloor: {
+            /** @enum {string} */
+            classification: "ordinary" | "restricted" | "unknown" | "missing";
         };
         /**
          * @description K1-6b.5c-2: an allowlisted view of a run for peer bridges, never a
@@ -5213,6 +5244,32 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+        };
+    };
+    getSessionSourceFloor: {
+        parameters: {
+            query?: {
+                /** @description A run to fold in; repeat for several (at most 64). */
+                run_id?: string[];
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The folded classification */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionSourceFloor"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
         };
     };
     listRuns: {
