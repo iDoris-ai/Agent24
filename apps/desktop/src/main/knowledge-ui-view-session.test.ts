@@ -248,6 +248,13 @@ describe('UiViewSession self-check and injection (U3.8, U4.5 ⑤)', () => {
     expect(u.session.injection()).toBeNull()
   })
 
+  it('lifts the pause when a later answer leads to a renewal', async () => {
+    const t = setup([{ kind: 'ok', value: SESSION }, second], { probes: [{ kind: 'unknown' }, refused('unauthorized', 'credential_expired')] })
+    await t.session.establish()
+    expect(await t.session.selfCheck()).toEqual({ kind: 'ready' })
+    expect(t.session.injection()).toEqual({ token: 'jwt2', proof: 'proof' })
+  })
+
   it('stops a self-check when the instance goes', async () => {
     const t = setup([{ kind: 'ok', value: SESSION }], { probes: [{ kind: 'unknown' }, OK] })
     await t.session.establish()
