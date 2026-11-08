@@ -8,6 +8,7 @@
 // the daemon said was decided.
 
 import { useEffect, useSyncExternalStore } from 'react'
+import type { RunEvent } from '../../../shared/ipc-types'
 
 /** The daemon's run status, or `missing` when it has no such run. A run not
  *  asked yet, or whose answer did not come, is not in the map. */
@@ -22,8 +23,9 @@ export const RETRY_CAP_MS = 30_000
 
 let statuses = new Map<string, RunStatus>()
 const listeners = new Set<() => void>()
-/** Every run the list has asked about: asked again on its next change. */
-const wanted = new Set<string>()
+/** The runs shown now, with how many lists show each: asked again on their
+ *  next change; one no list shows any more is not asked again (Codex A3 r2). */
+const wanted = new Map<string, number>()
 /** Runs waiting their turn, and those being asked now; a run that changed
  *  while being asked is asked again once that answer is in, so a late
  *  answer does not stick. */
@@ -35,9 +37,16 @@ const changedWhileAsking = new Set<string>()
  *  said was decided: the run goes back to running only after the tool,
  *  with no event of its own (Codex A3 C1). */
 const again = new Set<string>()
-const settling = new Set<string>()
+/** The last event of each run: an answer still `awaiting_approval` after an
+ *  `approval.resolved` is asked again; after an `approval.required`, it is
+ *  a new approval nobody decided yet (Codex A3 r2). Set by events only, so a
+ *  late answer cannot undo it. */
+const lastEvent = new Map<string, RunEvent['type']>()
 let retryTimer: ReturnType<typeof setTimeout> | null = null
 let retryMs = RETRY_FIRST_MS
+/** An event asks the runs waiting on the timer at once, once until an
+ *  answer comes: while the daemon answers no run, events do not set the pace. */
+let eagerSpent = false
 let listening = false
 
 const proxy = () => (typeof window === 'undefined' ? undefined : window.agent24?.backendProxy)
@@ -54,10 +63,14 @@ function askLater(runId: string): void {
   retryTimer = setTimeout(() => {
     retryTimer = null
     retryMs = Math.min(retryMs * 2, RETRY_CAP_MS)
-    const due = [...again]
-    again.clear()
-    for (const id of due) ask(id)
+    askAgainNow()
   }, retryMs)
+}
+
+function askAgainNow(): void {
+  const due = [...again].filter(id => wanted.has(id))
+  again.clear()
+  for (const id of due) ask(id)
 }
 
 /** Asks for the run's status now, or when a turn is free. */
@@ -81,11 +94,11 @@ async function answer(runId: string): Promise<void> {
     const status = (res?.data as { status?: unknown } | null | undefined)?.status
     if (res?.ok && typeof status === 'string') {
       if (status !== statuses.get(runId)) retryMs = RETRY_FIRST_MS
+      eagerSpent = false
       publish(runId, status)
-      if (status === 'awaiting_approval' && settling.has(runId)) askLater(runId)
-      else settling.delete(runId)
+      if (status === 'awaiting_approval' && lastEvent.get(runId) === 'approval.resolved') askLater(runId)
     } else if (res?.status === 404) {
-      settling.delete(runId)
+      eagerSpent = false
       publish(runId, 'missing')
     } else {
       // The daemon away or another error: what was known stays, and the run
@@ -108,20 +121,18 @@ function listen(): void {
     // Only runs the list knows about are asked again; the event says which
     // run changed, its answer says how.
     if (wanted.has(event.run_id)) {
-      if (event.type === 'approval.resolved') settling.add(event.run_id)
-      else if (event.type !== 'approval.required') settling.delete(event.run_id)
+      lastEvent.set(event.run_id, event.type)
       again.delete(event.run_id)
       ask(event.run_id)
     }
     // An event says the daemon is there: runs whose answer did not come are
-    // asked now rather than at the end of the wait.
-    if (again.size > 0 && retryTimer) {
+    // asked now rather than at the end of the wait, once until an answer
+    // comes; the wait itself goes on doubling.
+    if (again.size > 0 && retryTimer && !eagerSpent) {
+      eagerSpent = true
       clearTimeout(retryTimer)
       retryTimer = null
-      retryMs = RETRY_FIRST_MS
-      const due = [...again]
-      again.clear()
-      for (const id of due) ask(id)
+      askAgainNow()
     }
   })
 }
@@ -139,8 +150,19 @@ export function useRunStatuses(runIds: readonly string[]): ReadonlyMap<string, R
   useEffect(() => {
     listen()
     for (const runId of runIds) {
-      wanted.add(runId)
+      wanted.set(runId, (wanted.get(runId) ?? 0) + 1)
       if (!statuses.has(runId)) ask(runId)
+    }
+    return () => {
+      for (const runId of runIds) {
+        const n = (wanted.get(runId) ?? 1) - 1
+        if (n > 0) { wanted.set(runId, n); continue }
+        wanted.delete(runId)
+        again.delete(runId)
+        lastEvent.delete(runId)
+        const at = queue.indexOf(runId)
+        if (at >= 0) queue.splice(at, 1)
+      }
     }
   }, [key]) // `key` is runIds' content
   return known
@@ -154,7 +176,8 @@ export function resetRunStatusesForTests(): void {
   asking.clear()
   changedWhileAsking.clear()
   again.clear()
-  settling.clear()
+  lastEvent.clear()
+  eagerSpent = false
   if (retryTimer) clearTimeout(retryTimer)
   retryTimer = null
   retryMs = RETRY_FIRST_MS

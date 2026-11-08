@@ -114,6 +114,64 @@ describe('run statuses for the history list (M4 A3)', () => {
     expect(proxy).toHaveBeenCalledTimes(asked)
   })
 
+  it('a late answer does not undo approvals decided while it was on its way (Codex A3 r2 C1)', async () => {
+    let late!: (a: Answer) => void
+    answer = () => new Promise(resolve => { late = resolve })
+    const { result } = renderHook(() => useRunStatuses(['run_1']))
+    await flush()
+    // While the daemon's first answer ("running") is on its way, the run
+    // waits on an approval and the user decides it.
+    act(() => emit({ type: 'approval.required', run_id: 'run_1' }))
+    act(() => emit({ type: 'approval.resolved', run_id: 'run_1' }))
+    answer = async () => ok('awaiting_approval')
+    await act(async () => { late(ok('running')) })
+    await flush()
+    expect(result.current.get('run_1')).toBe('awaiting_approval')
+    answer = async () => ok('running')
+    await wait(RETRY_FIRST_MS)
+    expect(result.current.get('run_1')).toBe('running')
+  })
+
+  it('does not keep asking about a second approval nobody decided, even unseen running between (Codex A3 r2 C3)', async () => {
+    answer = async () => ok('awaiting_approval')
+    renderHook(() => useRunStatuses(['run_1']))
+    await flush()
+    act(() => emit({ type: 'approval.resolved', run_id: 'run_1' }))
+    act(() => emit({ type: 'approval.required', run_id: 'run_1' }))
+    await flush()
+    const asked = proxy.mock.calls.length
+    await wait(60_000)
+    expect(proxy).toHaveBeenCalledTimes(asked)
+  })
+
+  it('stops asking about runs no list shows any more (Codex A3 r2 C2)', async () => {
+    answer = async () => away
+    const { rerender, unmount } = renderHook(({ ids }) => useRunStatuses(ids), { initialProps: { ids: ['run_1', 'run_2'] } })
+    await flush()
+    rerender({ ids: ['run_2'] })
+    await wait(RETRY_FIRST_MS)
+    const later = proxy.mock.calls.slice(2).map(c => c[0].path)
+    expect(later).toContain('/api/v1/runs/run_2')
+    expect(later).not.toContain('/api/v1/runs/run_1')
+    unmount()
+    const asked = proxy.mock.calls.length
+    await wait(120_000)
+    expect(proxy).toHaveBeenCalledTimes(asked)
+  })
+
+  it('while the daemon answers no run, events ask the waiting runs at once only once (Codex A3 r2 C2)', async () => {
+    answer = async () => away
+    renderHook(() => useRunStatuses(['run_1']))
+    await flush()
+    act(() => emit({ type: 'run.started', run_id: 'run_other' }))
+    await flush()
+    const asked = proxy.mock.calls.length
+    expect(asked).toBe(2)
+    for (let i = 0; i < 5; i++) act(() => emit({ type: 'run.started', run_id: 'run_other' }))
+    await flush()
+    expect(proxy).toHaveBeenCalledTimes(asked)
+  })
+
   it(`asks at most ${MAX_ASKING} runs at once (Codex A3 C3)`, async () => {
     const pending: ((a: Answer) => void)[] = []
     answer = () => new Promise(resolve => { pending.push(resolve) })
