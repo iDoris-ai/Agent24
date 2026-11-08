@@ -38,8 +38,6 @@ export const BRIDGE_VIOLATION_WINDOW_MS = 10_000
 export const BRIDGE_SOFT_LIMIT = 5
 /** U6.6: ⑪ is counted apart; this many in the window make one soft violation. */
 export const BRIDGE_VERSION_LIMIT = 5
-export const BRIDGE_MAX_IN_FLIGHT = 4
-export const BRIDGE_MAX_INTENTS = 1
 export const BRIDGE_DEDUPE_LIMIT = 4096
 /** U6.3: hello requests per document. */
 export const BRIDGE_HELLO_REQUESTS = 3
@@ -81,7 +79,7 @@ export interface BridgeDeps {
   viewInstanceId?: string
 }
 
-type Step = '①' | '②' | '③' | '⑤' | '⑥' | '⑦' | '⑧' | '⑨' | '⑪' | '⑫' | '⑬' | '⑭' | '⑮' | '⑯'
+type Step = '①' | '②' | '③' | '⑤' | '⑥' | '⑦' | '⑧' | '⑨' | '⑪' | '⑫' | '⑬' | '⑭' | '⑮'
 
 interface Backoff { from: number; until: number; strikes: number; struck: boolean }
 
@@ -107,13 +105,11 @@ export class KnowledgeBridge {
   // Per document (U6.3: cleared on every new document).
   private seen: string[] = []
   private seenSet = new Set<string>()
-  private inFlight = new Map<string, 'citation' | 'return_to_chat_intent'>()
   private helloRequests = 0
   // Per instance.
   private tokens = BRIDGE_BURST
   private refilledAt: number
   private rateBackoff: Backoff | null = null
-  private flightBackoff: Backoff | null = null
   private soft: number[] = []
   private versions: number[] = []
   private dropped = new Map<string, number>()
@@ -142,7 +138,6 @@ export class KnowledgeBridge {
     this.document = document
     this.seen = []
     this.seenSet.clear()
-    this.inFlight.clear()
     this.helloRequests = 0
     this.queuedHello = false
     this.queuedState = null
@@ -168,7 +163,6 @@ export class KnowledgeBridge {
   destroy(): void {
     this.closed = true
     this.document = null
-    this.inFlight.clear()
     if (this.flushTimer !== null) this.deps.clearTimer(this.flushTimer)
     this.flushTimer = null
   }
@@ -233,14 +227,8 @@ export class KnowledgeBridge {
     if (message.generation !== admission.generation) return this.reject('⑭', document, id, { code: 'invalid_request', reason: 'stale_generation' }, true)
     // ⑮ duplicate.
     if (this.seenSet.has(message.id)) return this.reject('⑮', document, id, { code: 'invalid_request', reason: 'duplicate_id' }, true)
-    // ⑯ in flight.
-    const type = message.payload.type
-    if (type === 'citation' || type === 'return_to_chat_intent') {
-      const intents = [...this.inFlight.values()].filter((t) => t === 'return_to_chat_intent').length
-      if (this.inFlight.size >= BRIDGE_MAX_IN_FLIGHT || (type === 'return_to_chat_intent' && intents >= BRIDGE_MAX_INTENTS)) {
-        return this.flightLimited(now, document, id)
-      }
-    }
+    // ⑯ holds: nothing of this slice stays in flight. 04b's citation reads and
+    // intents bring the table (≤4, intent ≤1, U6.7) with them.
     this.remember(message.id)
     this.handle(message, document)
   }
@@ -279,14 +267,6 @@ export class KnowledgeBridge {
     this.log('⑥', undefined, 'overloaded')
     // ⑥ replies carry no in_reply_to (U7.1): nothing was read.
     this.reply(document, undefined, { result: 'rejected', code: 'unavailable', reason: 'overloaded', retry_after_ms: BRIDGE_BACKOFF_MS })
-  }
-
-  private flightLimited(now: number, document: number, id: string | undefined): void {
-    const b = this.flightBackoff
-    if (b && now < b.until) this.strike(b, now)
-    else this.flightBackoff = { from: now, until: now + BRIDGE_BACKOFF_MS, strikes: 0, struck: false }
-    this.log('⑯', id, 'overloaded')
-    this.reply(document, id, { result: 'rejected', code: 'unavailable', reason: 'overloaded', retry_after_ms: BRIDGE_BACKOFF_MS })
   }
 
   private strike(b: Backoff, now: number): void {
