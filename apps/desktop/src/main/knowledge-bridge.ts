@@ -370,6 +370,11 @@ export class KnowledgeBridge {
         this.reply(document, id, { result: 'rejected', code: 'unavailable', reason: 'overloaded', retry_after_ms: BRIDGE_BACKOFF_MS })
         return
       }
+      // A read that threw: still one terminal reply, never a page left waiting after `accepted`.
+      if (outcome.kind === 'failed') {
+        this.reply(document, id, { result: 'done', code: 'internal' })
+        return
+      }
       const value = outcome.value
       if (value.ok && !visible()) {
         this.reply(document, id, { result: 'done', code: 'not_found' })

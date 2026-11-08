@@ -150,4 +150,13 @@ describe('BridgeReadBudget', () => {
     await flush()
     expect(started).toBe(BRIDGE_READ_CONCURRENCY + 1)
   })
+
+  it('a task that throws without an abort is failed, not cancelled; an aborted one is cancelled', async () => {
+    const h = harness()
+    expect(await h.budget.run(async () => { throw new Error('boom') }, new AbortController().signal)).toEqual({ kind: 'failed' })
+    const abort = new AbortController()
+    const pending = h.budget.run((signal) => new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error('aborted')))), abort.signal)
+    abort.abort()
+    expect(await pending).toEqual({ kind: 'cancelled' })
+  })
 })

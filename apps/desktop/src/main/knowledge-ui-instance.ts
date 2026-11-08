@@ -11,7 +11,7 @@
 // instance (`unavailable`) instead of pausing it.
 
 import { newUlid } from './knowledge-bridge'
-import { readCitationChunk, type ChunkRead, type CitationRef } from './knowledge-readonly'
+import { readCitationChunk, type ChunkRead, type CitationRef, type ReadFetch } from './knowledge-readonly'
 import { newViewSecret, partitionTag, type KnowledgeUiClient, type ViewSecret } from './knowledge-ui-client'
 import { decideInjection, InjectedRequests, type InjectDecision, type InjectRequest } from './knowledge-ui-inject'
 import type { UiRoute } from './knowledge-ui-routes'
@@ -39,8 +39,8 @@ export interface KnowledgeUiInstanceDeps {
   credential: () => string | null
   /** Knowledge bases picked in settings (U7.2: the citation set is settings ∩ the exchange). */
   selected: () => readonly string[]
-  /** Defaults to globalThis.fetch. */
-  fetch?: typeof fetch
+  /** The citation read's fetch: `net.fetch` in the app, as for the UI client (#1662 PR-Daemon M1). */
+  fetch: ReadFetch
   generation: () => number
   servable: () => boolean
   now: () => number
@@ -126,7 +126,7 @@ export class KnowledgeUiInstance {
     return readCitationChunk({
       origin: this.deps.origin,
       credential: () => this.deps.credential(),
-      fetch: this.deps.fetch ?? globalThis.fetch,
+      fetch: this.deps.fetch,
       newRequestId: () => newUlid(),
     }, generation, ref, signal, visible)
   }

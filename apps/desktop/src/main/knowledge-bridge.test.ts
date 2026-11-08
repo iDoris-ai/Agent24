@@ -481,6 +481,17 @@ describe('citation, cancel, and the in-flight table (U7.2, U6.7, §9.3)', () => 
     expect(t.last()?.payload).not.toHaveProperty('reason')
   })
 
+  it('a read that throws still gets one terminal reply: done/internal (#1662 L3)', async () => {
+    const c = citationHarness()
+    c.citation.read = () => Promise.reject(new Error('boom'))
+    const t = setup({ citation: c.citation })
+    const m = t.msg('citation', REF)
+    t.arrive(m)
+    await flush()
+    expect(t.replies().filter((r) => r.in_reply_to === m.id).map((r) => r.payload)).toEqual([{ result: 'accepted' }, { result: 'done', code: 'internal' }])
+    expect(c.shown).toEqual([])
+  })
+
   it('a read that waits out the bridge budget is rejected overloaded', async () => {
     const c = citationHarness()
     const t = setup({ citation: c.citation })

@@ -1065,6 +1065,8 @@ describe('UI session wiring (KB-C2-04a, U4.5, U4.7, U3.8)', () => {
         responded: (id, status) => { m.responded.push([id, status]) },
         destroy: () => { m.destroyed = true; log.push('ui destroyed') },
         bridgeAdmission: () => ({ open: true, generation: 1 }),
+        citationScope: () => null,
+        readCitation: async () => ({ ok: false, code: 'not_found' }),
       }
     }
     return { factory, made, decide: (d: typeof decision) => { decision = d } }
@@ -1288,6 +1290,8 @@ describe('bridge wiring (KB-C2-04a-2, U6.1, U6.6)', () => {
           responded: () => {},
           destroy: () => {},
           bridgeAdmission: () => u.admission,
+          citationScope: () => null,
+          readCitation: async () => ({ ok: false, code: 'not_found' }),
         }
         made.push(u)
         return u
@@ -1339,6 +1343,8 @@ describe('bridge wiring (KB-C2-04a-2, U6.1, U6.6)', () => {
         responded: () => {},
         destroy: () => {},
         bridgeAdmission: () => u.admission,
+        citationScope: () => null,
+        readCitation: async () => ({ ok: false, code: 'not_found' }),
       }
       made.push(u)
       return u

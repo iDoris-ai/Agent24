@@ -39,7 +39,7 @@ function setup(script: { exchanges?: UiCallResult<never>[]; probes?: UiCallResul
     setTimer: (fn, ms) => { const t = { fn, ms, cleared: false }; timers.push(t); return t },
     clearTimer: (h) => { (h as { cleared: boolean }).cleared = true },
     onEvent: (e) => events.push(e), view: VIEW,
-    ...(script.fetch ? { fetch: script.fetch } : {}),
+    fetch: script.fetch ?? (async () => { throw new Error('no fetch in this test') }),
   })
   return { ui: make(), make, log, events, timers, advance: (ms: number) => { now += ms } }
 }

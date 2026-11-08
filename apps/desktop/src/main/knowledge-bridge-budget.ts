@@ -4,7 +4,8 @@
 export const BRIDGE_READ_CONCURRENCY = 2
 export const BRIDGE_READ_QUEUE_MS = 10_000
 
-export type BridgeBudgetResult<T> = { kind: 'done'; value: T } | { kind: 'overloaded' } | { kind: 'cancelled' }
+/** `failed`: the task threw while nobody aborted it; the caller still owes a terminal reply. */
+export type BridgeBudgetResult<T> = { kind: 'done'; value: T } | { kind: 'overloaded' } | { kind: 'cancelled' } | { kind: 'failed' }
 
 interface Job<T> {
   task: (signal: AbortSignal) => Promise<T>
@@ -93,7 +94,7 @@ export class BridgeReadBudget {
     }
     job.task(job.controller.signal).then(
       (value) => { if (!job.settled) this.settle(job, { kind: 'done', value }) },
-      () => { if (!job.settled) this.settle(job, { kind: 'cancelled' }) },
+      () => { if (!job.settled) this.settle(job, job.controller.signal.aborted ? { kind: 'cancelled' } : { kind: 'failed' }) },
     ).finally(() => this.release(job))
   }
 

@@ -498,6 +498,7 @@ app.whenReady().then(async () => {
         clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
         onEvent: context.onEvent,
         selected: () => knowledge?.status().knowledgeBaseIds ?? [],
+        fetch: (url, init) => net.fetch(url, init),
       })
     },
     locale: () => app.getLocale(),

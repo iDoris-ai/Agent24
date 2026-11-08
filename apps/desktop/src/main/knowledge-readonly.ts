@@ -12,6 +12,7 @@ const REASON = /^[a-z_]{1,64}$/
 /** R6.1: the only codes whose envelope may carry a null request_id or generation. */
 const NULL_ECHO = new Set(['invalid_request', 'unauthorized', 'internal'])
 // U+0000–001F, U+007F–009F, and the bidi controls U7.2 names.
+// eslint-disable-next-line no-control-regex -- U7.2 strips control characters on purpose
 const STRIP = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu
 
 export interface CitationRef {
@@ -28,10 +29,13 @@ export type ChunkRead =
   | { ok: true; text: string; contentTag: string; title: string | null }
   | { ok: false; code: string; reason?: string }
 
+/** What the read needs of a fetch: Electron's `net.fetch` in the app (the UI client's, same proxy and CA), a fake in tests. */
+export type ReadFetch = (url: string, init: RequestInit) => Promise<Response>
+
 export interface ReadonlyDeps {
   origin: string
   credential: () => string | null
-  fetch: typeof fetch
+  fetch: ReadFetch
   newRequestId: () => string
 }
 
