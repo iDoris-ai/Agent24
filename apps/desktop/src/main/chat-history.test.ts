@@ -607,9 +607,22 @@ describe('runs and waiting items (M4 A2)', () => {
     expect(() => store.promoteRun('chat_a', 'run_new')).toThrow('Too many chat history runs')
   })
 
+  it('refuses a waiting item past the cap, and a bad id to clear', () => {
+    const store = createChatHistoryStore(dir)
+    store.save(record('chat_a', at))
+    const full = { ...onDisk('chat_a'), pending: Array.from({ length: 100 }, (_, i) => ({ id: `p${i}`, kind: 'confirm', label: 'x', at })) }
+    fs.writeFileSync(path.join(dir, 'chat-history', 'chat_a.json'), JSON.stringify(full))
+    expect(() => store.setPending('chat_a', ask())).toThrow('Too many chat history pending items')
+    // Replacing one already there is no new item.
+    expect(store.setPending('chat_a', { id: 'p0', kind: 'confirm', label: 'y', at })?.pending).toHaveLength(100)
+    expect(() => store.clearPending('chat_a', '../x')).toThrow('Invalid chat history pending item')
+  })
+
   it.each([
     ['a duplicate run', { runs: [{ run_id: 'run_1', kind: 'task', started_at: at }, { run_id: 'run_1', kind: 'answer', started_at: at }] }],
     ['an unknown run kind', { runs: [{ run_id: 'run_1', kind: 'job', started_at: at }] }],
+    ['runs past the cap', { runs: Array.from({ length: 1001 }, (_, i) => ({ run_id: `r${i}`, kind: 'task', started_at: at })) }],
+    ['waiting items past the cap', { pending: Array.from({ length: 101 }, (_, i) => ({ id: `p${i}`, kind: 'confirm', label: 'x', at })) }],
     ['a duplicate waiting item', { pending: [{ id: 'a', kind: 'confirm', label: 'x', at }, { id: 'a', kind: 'confirm', label: 'y', at }] }],
   ])('refuses a file with %s', (_name, patch) => {
     expect(() => parseChatHistoryRecord({ ...record('chat_a', at), ...patch })).toThrow('Invalid chat history record')
