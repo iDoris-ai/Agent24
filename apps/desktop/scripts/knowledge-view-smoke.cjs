@@ -1,0 +1,506 @@
+// KB-C2-03 (#1622) smoke: drives the real KnowledgeViewHost in Electron
+// against two loopback servers — the allowed origin (A) and a foreign one (B)
+// — and checks the exit criteria of #1002 that only a real Chromium can show,
+// plus the PR-Daemon #1630 probes (TURN over TCP, preconnect, ws, 302):
+// no Node/preload/host API in the page, popups/foreign requests/navigation/
+// frames/workers/Service Workers/downloads/permissions refused, and two
+// instances (two profiles) whose partitions see nothing of each other, the
+// first one cleared once it is destroyed.
+//
+//   pnpm exec tsc -p tsconfig.electron.json
+//   pnpm exec electron scripts/knowledge-view-smoke.cjs
+//
+// Since KB-C2-04a the host runs the real UI session against A, which also
+// plays WeKnora's ticket/exchange/session/revocation endpoints, and the page
+// checks what its own fetches carry (U4.5). Since KB-C2-04a-2 the page also
+// talks over the bridge (UIB §6): hello request, hello, a status and its reply,
+// with the reserved POST never reaching A; and main sees the view's input.
+// (A sub-frame sender cannot be made: the page CSP has frame-src 'none'; the
+// unit tests cover that step.)
+//
+// Prints one line per check (42) and exits non-zero if any fails.
+
+const http = require('node:http')
+
+// Loopback the four test servers listen on (decision #30's real-device
+// condition 5: the allowed origin as 127.0.0.1 and as [::1]).
+//   KNOWLEDGE_SMOKE_HOST=::1  → servers on ::1, allowed origin http://[::1]:<port>
+//   anything else or unset    → 127.0.0.1
+const HOST = process.env.KNOWLEDGE_SMOKE_HOST === '::1' ? '::1' : '127.0.0.1'
+const URL_HOST = HOST.includes(':') ? `[${HOST}]` : HOST
+const net = require('node:net')
+const path = require('node:path')
+const { randomUUID } = require('node:crypto')
+const { app, BrowserWindow, WebContentsView, session, net: electronNet } = require('electron')
+const dist = (file) => require(path.join(__dirname, '..', 'dist', 'main', file))
+const { KnowledgeViewHost } = dist('knowledge-view.js')
+const { KnowledgeUiInstance } = dist('knowledge-ui-instance.js')
+const { KnowledgeUiClient, bindingTag } = dist('knowledge-ui-client.js')
+const { KNOWLEDGE_UI_ROUTES } = dist('knowledge-ui-routes.js')
+
+// The UI session A hands out, and what the page's requests carried (U4.5).
+const UI = '/api/v1/agent24/knowledge/ui'
+const SMOKE_C = 'smoke-credential'
+const SMOKE_JWT = 'smoke-session-jwt'
+const ui = { allowed: [], plain: [], exchangeProofs: new Set(), issued: 0 }
+const carried = (req) => ({ authorization: req.headers.authorization, proof: req.headers['x-agent24-view-proof'] })
+
+const hits = { A: [], B: [] }
+/** TCP connections opened to the foreign server B and to the fake TURN port. */
+const connections = { B: 0, TURN: 0, ICE: 0 }
+
+// Every step that waits on the browser is bounded and named, so a step that
+// never answers on a real machine (a permission or device prompt, say) shows
+// up as 'timeout' in its check and as the last stage, instead of the whole
+// probe going silent (David's first run on a Mac, 2026-11-08).
+const PROBE = `
+const stage = (name) => { window.__stage = name }
+const timedOut = []
+// Records the step only when its own timer wins, and clears that timer when the
+// step settles first, so a slow probe never blames a step that answered.
+const within = (p, ms) => {
+  const name = window.__stage
+  let timer
+  const late = new Promise((d) => { timer = setTimeout(() => { timedOut.push(name); d('timeout') }, ms) })
+  return Promise.race([Promise.resolve(p).finally(() => clearTimeout(timer)), late])
+}
+;(async () => {
+  // The bridge's reload reading (below) reloads this page: the probes run once.
+  if (sessionStorage.getItem('smoke-reloaded') === '1') return
+  const r = {}
+  try {
+    stage('storage-before'); r.before = { local: localStorage.getItem('k'), cookie: document.cookie }
+    r.node = typeof require + '/' + typeof process + '/' + typeof module
+    r.hostApi = typeof window.agent24
+    stage('popup'); r.popup = window.open(B + '/popup') === null ? 'null' : 'window'
+    stage('foreign-fetch'); r.foreignFetch = await within(fetch(B + '/fetch').then(() => 'ok', () => 'blocked'), 3000)
+    stage('foreign-img'); r.foreignImg = await within(new Promise((done) => { const i = new Image(); i.onload = () => done('loaded'); i.onerror = () => done('blocked'); i.src = B + '/img' }), 3000)
+    // Refused by the partition CSP (frame-src 'none'): Electron logs
+    // ERR_BLOCKED_BY_CSP for /frame, which is the expected outcome.
+    stage('frame'); { const f = document.createElement('iframe'); f.src = '/frame'; document.body.appendChild(f) }
+    stage('worker'); try { new Worker('/worker.js'); r.worker = 'created' } catch { r.worker = 'blocked' }
+    stage('service-worker'); r.serviceWorker = await within(Promise.resolve().then(() => navigator.serviceWorker.register('/sw.js')).then(() => 'registered', () => 'blocked'), 3000)
+    stage('notification'); r.notification = await within(Promise.resolve().then(() => Notification.requestPermission()).catch((e) => 'threw:' + e.name), 3000)
+    stage('geolocation'); r.geo = await within(new Promise((done) => navigator.geolocation.getCurrentPosition(() => done('granted'), (e) => done('denied:' + e.code), { timeout: 2000 })), 3000)
+    stage('media'); r.media = await within(Promise.resolve().then(() => navigator.mediaDevices.getUserMedia({ audio: true })).then(() => 'granted', () => 'denied'), 3000)
+    stage('eval'); try { eval('1'); r.eval = 'ran' } catch { r.eval = 'blocked' }
+    // KB-C2-04a: the page sends its own credentials; the host must replace them
+    // on the allowlisted path and drop them everywhere else.
+    const forged = { Authorization: 'Bearer forged', 'X-Agent24-View-Proof': 'forged' }
+    stage('ui-allowed'); r.uiAllowed = await within(fetch(UI_LIST, { headers: forged }).then((x) => x.status, () => 'blocked'), 3000)
+    stage('ui-plain'); r.uiPlain = await within(fetch('/plain-api', { headers: forged }).then((x) => x.status, () => 'blocked'), 3000)
+    // KB-C2-04a-2: the bridge (UIB §6). The page asks for hello (generation 0),
+    // reads it from the host's dispatched message event, then sends a status
+    // with that generation and waits for its reply. The POST never reaches A.
+    stage('bridge')
+    {
+      const got = []
+      window.addEventListener('message', (e) => { if (e.data && e.data.direction === 'host_to_page') got.push(e.data) })
+      const ulid = (n) => '01J9ZQ3V6R8XKQ4M2N5P7T' + String(n).padStart(4, '0')
+      const post = (m) => fetch('/__agent24/bridge', { method: 'POST', body: JSON.stringify(m) }).then(() => 'reached', () => 'cancelled')
+      const waitFor = (pred) => within(new Promise((d) => { const t0 = Date.now(); const tick = () => (pred() || Date.now() - t0 > 2500 ? d() : setTimeout(tick, 50)); tick() }), 3000)
+      r.bridgePost = await within(post({ v: 3, direction: 'page_to_host', type: 'status', id: ulid(1), generation: 0, payload: { state: 'loading' } }), 3000)
+      await waitFor(() => got.some((m) => m.type === 'hello'))
+      const hello = got.find((m) => m.type === 'hello')
+      r.bridgeHello = hello ? { supported: hello.payload.supported, idOk: /^[A-Za-z0-9_-]{22}$/.test(hello.payload.view_instance_id), docOk: /^[A-Za-z0-9_-]{22}$/.test(hello.document_id), generation: hello.generation } : null
+      if (hello) {
+        await within(post({ v: 3, direction: 'page_to_host', type: 'status', id: ulid(2), generation: hello.generation, document_id: hello.document_id, payload: { state: 'ready' } }), 3000)
+        await waitFor(() => got.some((m) => m.type === 'reply' && m.in_reply_to === ulid(2)))
+        const reply = got.find((m) => m.type === 'reply' && m.in_reply_to === ulid(2))
+        r.bridgeReply = reply ? reply.payload : null
+      }
+    }
+    stage('download'); { const a = document.createElement('a'); a.href = '/download'; a.download = 'x.bin'; document.body.appendChild(a); a.click() }
+    // PR-Daemon #1630 C1/R2-6: ways out that bypass webRequest or CSP in some engines.
+    // 'unavailable': no RTCPeerConnection at all (a pass); 'rejected': the API
+    // threw before ICE was tried (proves nothing, so it fails).
+    stage('turn')
+    if (typeof RTCPeerConnection === 'undefined') r.turn = 'unavailable'
+    else try {
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'turn:' + TURN + '?transport=tcp', username: 'u', credential: 'p' }] })
+      pc.createDataChannel('x')
+      const offer = await within(pc.createOffer(), 3000)
+      const local = offer === 'timeout' ? 'timeout' : await within(pc.setLocalDescription(offer).then(() => 'set'), 3000)
+      await new Promise((d) => setTimeout(d, 2000))
+      pc.close()
+      r.turn = offer === 'timeout' || local === 'timeout' ? 'timeout' : 'ran'
+    } catch { r.turn = 'rejected' }
+    // ICE-TCP active (decision #30): two local peers agree on a session in the
+    // page, then one is handed a passive TCP candidate at the ICE port, so it
+    // tries an outgoing TCP connection there. Same socket path as TURN-TCP.
+    stage('ice-tcp')
+    if (typeof RTCPeerConnection === 'undefined') r.iceTcp = 'unavailable'
+    else try {
+      const a = new RTCPeerConnection(); const b = new RTCPeerConnection()
+      // Local candidates of the side that dials out: with connections 0, a
+      // TCP-active one gathered means the proxy held it; none gathered means
+      // this row proves nothing (QA reads the row by this field).
+      const gathered = { total: 0, tcpActive: 0, tcpOther: 0 }
+      a.onicecandidate = (e) => {
+        const c = e.candidate
+        if (!c) return
+        gathered.total++
+        if (c.protocol === 'tcp') { if (c.tcpType === 'active') gathered.tcpActive++; else gathered.tcpOther++ }
+      }
+      a.createDataChannel('x')
+      const offer = await within(a.createOffer(), 3000)
+      if (offer === 'timeout') throw new Error('timeout')
+      await within(a.setLocalDescription(offer), 3000)
+      await within(b.setRemoteDescription(offer), 3000)
+      const answer = await within(b.createAnswer(), 3000)
+      if (answer === 'timeout') throw new Error('timeout')
+      await within(b.setLocalDescription(answer), 3000)
+      await within(a.setRemoteDescription(answer), 3000)
+      await within(a.addIceCandidate({ candidate: 'candidate:1 1 tcp 1518280447 ' + ICE.host + ' ' + ICE.port + ' typ host tcptype passive', sdpMid: '0', sdpMLineIndex: 0 }), 3000)
+      await new Promise((d) => setTimeout(d, 2000))
+      // Read alongside the count: if Chromium never paired the candidate (no
+      // local TCP-active candidate), connections 0 says nothing for this row.
+      r.iceState = a.iceConnectionState
+      r.iceLocal = gathered
+      const stats = await within(a.getStats(), 3000)
+      if (stats !== 'timeout') {
+        let n = 0
+        stats.forEach((v) => { if (v.type === 'local-candidate' && v.protocol === 'tcp' && v.tcpType === 'active') n++ })
+        r.iceLocal.statsTcpActive = n
+      }
+      a.close(); b.close()
+      r.iceTcp = timedOut.includes('ice-tcp') ? 'timeout' : 'ran'
+    } catch (e) { r.iceTcp = timedOut.includes('ice-tcp') ? 'timeout' : 'rejected:' + (e && e.name) }
+    // preconnect opens a TCP connection without a request, so it is seen as a
+    // connection to B. (dns-prefetch is not probed: with an IP literal there is
+    // no lookup, and observing DNS would need a resolver of our own.)
+    stage('preconnect'); { const l = document.createElement('link'); l.rel = 'preconnect'; l.href = B; document.head.appendChild(l) }
+    stage('ws')
+    r.ws = await new Promise((d) => {
+      try {
+        const w = new WebSocket(B.replace(/^http/, 'ws') + '/ws')
+        w.onopen = () => d('open'); w.onerror = () => d('blocked'); setTimeout(() => d('timeout'), 1500)
+      } catch { d('blocked') }
+    })
+    stage('redirect'); r.redirect = await within(fetch('/redir').then((res) => 'followed:' + res.status, () => 'blocked'), 3000)
+    stage('storage-after'); localStorage.setItem('k', 'v-' + location.search); document.cookie = 'c=1; path=/'
+    r.after = { local: localStorage.getItem('k'), cookie: document.cookie }
+    stage('done')
+  } catch (e) {
+    r.error = String(e)
+  }
+  r.stage = window.__stage
+  r.timedOut = timedOut.slice()
+  window.__probe = r
+})()
+`
+
+function server(name, handler) {
+  return new Promise((resolve) => {
+    const s = http.createServer((req, res) => { hits[name].push(req.url); handler(req, res) })
+    s.listen(0, HOST, () => resolve({ s, origin: `http://${URL_HOST}:${s.address().port}` }))
+  })
+}
+
+let originB = ''
+let turnAddress = ''
+let iceAddress = { host: '', port: 0 }
+async function main() {
+  const b = await server('B', (_req, res) => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('B') })
+  b.s.on('connection', () => { connections.B++ })
+  originB = b.origin
+  const turn = await new Promise((resolve) => {
+    const t = net.createServer((socket) => { connections.TURN++; socket.destroy() })
+    t.listen(0, HOST, () => resolve(t))
+  })
+  turnAddress = `${URL_HOST}:${turn.address().port}`
+  const ice = await new Promise((resolve) => {
+    const t = net.createServer((socket) => { connections.ICE++; socket.destroy() })
+    t.listen(0, HOST, () => resolve(t))
+  })
+  iceAddress = { host: HOST, port: ice.address().port }
+  const a = await server('A', (req, res) => {
+    const url = new URL(req.url, 'http://x')
+    if (url.pathname === '/probe.js') {
+      res.writeHead(200, { 'content-type': 'text/javascript' })
+      return res.end(`const B = ${JSON.stringify(originB)}; const TURN = ${JSON.stringify(turnAddress)}; const ICE = ${JSON.stringify(iceAddress)}; const UI_LIST = ${JSON.stringify(`${UI}/knowledge-bases`)};\n${PROBE}`)
+    }
+    // WeKnora's UI endpoints, as main calls them (net.fetch, not the page's partition).
+    const json = (status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)) }
+    if (req.method === 'POST' && url.pathname === `${UI}/tickets`) {
+      if (req.headers['x-api-key'] !== SMOKE_C) return json(401, { error: { code: 'unauthorized', details: { reason: 'credential_invalid' } } })
+      ui.issued++
+      return json(200, { ticket: `smoke-ticket-${ui.issued}`, ticket_id: randomUUID(), expires_in: 30 })
+    }
+    if (req.method === 'POST' && url.pathname === `${UI}/exchange`) {
+      ui.exchangeProofs.add(req.headers['x-agent24-view-proof'])
+      return json(200, { session_token: SMOKE_JWT, expires_in: 600, ops: ['kb.list'], effective_scope: { knowledge_base_ids: ['kb-smoke'] } })
+    }
+    if (req.method === 'POST' && url.pathname === `${UI}/revocations`) { res.writeHead(204); return res.end() }
+    if (req.method === 'GET' && url.pathname === `${UI}/session`) return json(200, { expires_in: 300 })
+    if (url.pathname === `${UI}/knowledge-bases`) { ui.allowed.push(carried(req)); return json(200, { items: [] }) }
+    if (url.pathname === '/plain-api') { ui.plain.push(carried(req)); return json(200, {}) }
+    if (url.pathname === '/redir') {
+      res.writeHead(302, { location: `${originB}/redir-target` })
+      return res.end()
+    }
+    if (url.pathname === '/download') {
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-disposition': 'attachment; filename=x.bin' })
+      return res.end('xx')
+    }
+    if (url.pathname === '/worker.js' || url.pathname === '/sw.js') {
+      res.writeHead(200, { 'content-type': 'text/javascript' })
+      return res.end('')
+    }
+    res.writeHead(200, { 'content-type': 'text/html' })
+    res.end('<!doctype html><html><body><p>kb</p><script src="/probe.js"></script></body></html>')
+  })
+
+  await app.whenReady()
+  console.log(`loopback ${HOST} (allowed origin ${a.origin})`)
+  const win = new BrowserWindow({ show: false, width: 900, height: 700 })
+  await win.loadURL('about:blank')
+  let binding = 'profile-1'
+  const CONTROL = 'profile-control'
+  const controlAsked = []
+  const partitions = []
+  const downloads = []
+  const host = new KnowledgeViewHost({
+    window: () => win,
+    createView: (webPreferences) => new WebContentsView({ webPreferences }),
+    sessionFor: (partition) => {
+      partitions.push(partition)
+      const ses = session.fromPartition(partition, { cache: false })
+      // Registered before the host's own handler, so it reads the outcome in a
+      // microtask: still this tick (a prevented DownloadItem is gone on the next).
+      ses.on('will-download', (event) => queueMicrotask(() => downloads.push(event.defaultPrevented ? 'prevented' : 'allowed')))
+      // The control profile (see the end): the host still asks for its dead
+      // proxy, this script puts the partition on direct instead.
+      if (binding === CONTROL) {
+        const set = ses.setProxy.bind(ses)
+        ses.setProxy = (config) => { controlAsked.push(config); return set({ mode: 'direct' }) }
+      }
+      return ses
+    },
+    target: () => ({ origin: a.origin, url: `${a.origin}/?${binding}` }),
+    binding: () => binding,
+    packaged: true,
+    log: () => {},
+    ui: (context) => new KnowledgeUiInstance({
+      client: new KnowledgeUiClient((url, init) => electronNet.fetch(url, init), context.origin),
+      bindingTag: bindingTag('smoke-app-instance', 'default'),
+      partition: context.partition,
+      origin: context.origin,
+      routes: KNOWLEDGE_UI_ROUTES,
+      ledger: context.ledger,
+      credential: () => SMOKE_C,
+      generation: () => 1,
+      servable: () => true,
+      now: () => performance.now(),
+      sleep: (ms) => new Promise((d) => setTimeout(d, ms)),
+      setTimer: (fn, ms) => setTimeout(fn, ms),
+      clearTimer: (handle) => clearTimeout(handle),
+      onEvent: context.onEvent,
+    }),
+  })
+
+  const view = () => win.contentView.children.find((c) => c.webContents && c.webContents !== win.webContents)
+  const probe = async () => {
+    // The probe's own steps are bounded (about 55 s at worst, ICE-TCP included); past 70 s it
+    // is reported as unfinished with the stage it stopped at, and the run goes on.
+    // executeJavaScript itself is raced against the deadline too: a renderer
+    // that stops answering must not hold the run.
+    const deadline = Date.now() + 70_000
+    const ask = (code) => Promise.race([
+      view().webContents.executeJavaScript(code),
+      new Promise((d) => setTimeout(() => d(undefined), Math.max(0, deadline - Date.now()))),
+    ])
+    let stage = null
+    while (Date.now() < deadline) {
+      const r = await ask('window.__probe || null')
+      if (r) return r
+      const s = await ask('window.__stage || null')
+      if (s) stage = s
+      await new Promise((d) => setTimeout(d, 100))
+    }
+    return { unfinished: true, stage }
+  }
+
+  const checks = []
+  const check = (name, ok, detail) => { checks.push(ok); console.log(`${ok ? 'PASS' : 'FAIL'} ${name}${detail === undefined ? '' : ` — ${JSON.stringify(detail)}`}`) }
+
+  const first = await host.show({ x: 0, y: 0, width: 800, height: 600 }, 'dark')
+  check('show opens in the same window', first.ok && win.contentView.children.length === 1 && BrowserWindow.getAllWindows().length === 1, first)
+  const r1 = await probe()
+  check('probe finished', r1.stage === 'done' && !r1.error && !r1.unfinished && r1.timedOut?.length === 0, { stage: r1.stage, error: r1.error, unfinished: r1.unfinished, timedOut: r1.timedOut })
+  await new Promise((d) => setTimeout(d, 500))
+  check('no Node in the page', r1.node === 'undefined/undefined/undefined', r1.node)
+  check('no host API (no preload)', r1.hostApi === 'undefined', r1.hostApi)
+  check('window.open refused, no new window', r1.popup === 'null' && BrowserWindow.getAllWindows().length === 1, r1.popup)
+  // The foreign server B is on loopback too, so from here on the dead proxy
+  // stands in front of it as well: these rows show the layers together. The
+  // control profile at the end shows webRequest and the CSP alone (#1643 PR-Daemon A).
+  check('foreign fetch and image blocked', r1.foreignFetch === 'blocked' && r1.foreignImg === 'blocked', [r1.foreignFetch, r1.foreignImg])
+  check('foreign origin received nothing', hits.B.length === 0, hits.B)
+  check('no frame loaded', !hits.A.includes('/frame'), hits.A)
+  // KB-C2-04a (U4.5): the host's session on the allowlisted fetch, nothing of the page's anywhere.
+  const viewProof = (h) => typeof h.proof === 'string' && /^[A-Za-z0-9_-]{43}$/.test(h.proof) && ui.exchangeProofs.has(h.proof)
+  check('UI session: allowlisted fetch carries the host\'s Bearer and view proof', r1.uiAllowed === 200 && ui.allowed.length >= 1
+    && ui.allowed.every((h) => h.authorization === `Bearer ${SMOKE_JWT}` && viewProof(h)), { status: r1.uiAllowed, issued: ui.issued, seen: ui.allowed.map((h) => ({ bearer: h.authorization === `Bearer ${SMOKE_JWT}`, proof: viewProof(h) })) })
+  check('UI session: the page\'s own Authorization and view proof are stripped', ui.allowed.length + ui.plain.length >= 2
+    && [...ui.allowed, ...ui.plain].every((h) => h.authorization !== 'Bearer forged' && h.proof !== 'forged'))
+  check('UI session: a path off the allowlist gets no session', r1.uiPlain === 200 && ui.plain.length >= 1
+    && ui.plain.every((h) => h.authorization === undefined && h.proof === undefined), { status: r1.uiPlain, seen: ui.plain.length })
+  // KB-C2-04a-2 (design §7). A hello at all means the body came as inline bytes
+  // and the request was taken as the main frame's (otherwise: too_large, or a closed bridge).
+  check('bridge: the reserved POST is taken by the host and never reaches the server', r1.bridgePost === 'cancelled'
+    && !hits.A.some((u) => u.startsWith('/__agent24')), { post: r1.bridgePost, reached: hits.A.filter((u) => u.startsWith('/__agent24')) })
+  check('bridge: hello reaches the page as a dispatched message event, under the page CSP', r1.bridgeHello?.idOk === true
+    && r1.bridgeHello.docOk === true && JSON.stringify(r1.bridgeHello.supported) === '[3]' && r1.bridgeHello.generation === 1, r1.bridgeHello)
+  check('bridge: a status with that generation gets its reply', r1.bridgeReply?.result === 'done', r1.bridgeReply)
+  {
+    // U6.1 f: activation-type input on the WebContentsView is seen by main.
+    const seen = []
+    const contents = view().webContents
+    const onInput = (_event, input) => seen.push(input.type)
+    contents.on('input-event', onInput)
+    contents.sendInputEvent({ type: 'mouseDown', x: 10, y: 10, button: 'left', clickCount: 1 })
+    contents.sendInputEvent({ type: 'mouseUp', x: 10, y: 10, button: 'left', clickCount: 1 })
+    contents.sendInputEvent({ type: 'keyDown', keyCode: 'A' })
+    contents.sendInputEvent({ type: 'keyUp', keyCode: 'A' })
+    await new Promise((d) => setTimeout(d, 500))
+    contents.removeListener('input-event', onInput)
+    check('bridge: main sees mouseDown and keyDown on the view (input-event)', seen.includes('mouseDown') && (seen.includes('keyDown') || seen.includes('rawKeyDown')), seen)
+  }
+  check('Worker and Service Worker refused', r1.worker === 'blocked' && r1.serviceWorker === 'blocked', [r1.worker, r1.serviceWorker])
+  check('permissions denied', r1.notification === 'denied' && r1.geo === 'denied:1' && r1.media === 'denied', [r1.notification, r1.geo, r1.media])
+  check('inline eval blocked by the partition CSP', r1.eval === 'blocked', r1.eval)
+  check('download prevented', downloads.length === 1 && downloads[0] === 'prevented', downloads)
+  // 'ran' means an offer was made and set, so ICE gathering was really tried; a
+  // timeout or a rejection there proves nothing. 'unavailable' (no RTCPeerConnection) is a pass.
+  const triedOrAbsent = (v) => v === 'ran' || v === 'unavailable'
+  check('no TURN-over-TCP connection (contract decision #30)', triedOrAbsent(r1.turn) && connections.TURN === 0, { turn: r1.turn, connections: connections.TURN })
+  // PASS/FAIL stays on the count; 'unproven' flags a 0 that no TCP-active
+  // candidate stood behind, so the PASS is not read as "blocked".
+  const iceEvidence = (r, added) => ({
+    ...(added === 0 && r.iceTcp === 'ran' && !(r.iceLocal?.tcpActive > 0) && !(r.iceLocal?.statsTcpActive > 0)
+      ? { unproven: 'no TCP-active local candidate was gathered' } : {}),
+    iceTcp: r.iceTcp, iceState: r.iceState, local: r.iceLocal, connections: added,
+  })
+  check('no ICE-TCP active connection (contract decision #30)', triedOrAbsent(r1.iceTcp) && connections.ICE === 0, iceEvidence(r1, connections.ICE))
+  const webrtcBefore = { TURN: connections.TURN, ICE: connections.ICE }
+  // B is plain http and never upgrades, so 'open' cannot happen; what tells is that B saw no connection.
+  check('WebSocket to a foreign host refused', r1.ws !== 'open' && connections.B === 0, { ws: r1.ws, connections: connections.B })
+  check('302 to a foreign host not followed', r1.redirect === 'blocked' && !hits.B.includes('/redir-target'), r1.redirect)
+  check('no TCP connection at all to the foreign host (preconnect, ws)', connections.B === 0, connections.B)
+
+  const wc = view().webContents
+  const originOf = (u) => { try { return new URL(u).origin } catch { return null } }
+  await wc.executeJavaScript(`location.href = ${JSON.stringify(`${originB}/nav`)}`)
+  await new Promise((d) => setTimeout(d, 700))
+  check('cross-origin navigation refused', originOf(wc.getURL()) === a.origin && !hits.B.includes('/nav'), wc.getURL())
+  await wc.executeJavaScript(`location.href = 'file:///etc/hosts'`)
+  await new Promise((d) => setTimeout(d, 500))
+  check('file:// navigation refused', originOf(wc.getURL()) === a.origin, wc.getURL())
+
+  // KB-C2-04a-2, Codex 04a-2 #2 and #3. The page sends over the bridge and
+  // reports what it got back (hello first, then a status with that generation).
+  const bridgeTalk = (statusId) => `(async () => {
+    const got = []
+    addEventListener('message', (e) => { if (e.data && e.data.direction === 'host_to_page') got.push(e.data) })
+    const post = (m) => fetch('/__agent24/bridge', { method: 'POST', body: JSON.stringify(m) }).catch(() => {})
+    const waitFor = (pred) => new Promise((d) => { const t0 = Date.now(); const tick = () => (pred() || Date.now() - t0 > 2500 ? d() : setTimeout(tick, 50)); tick() })
+    await post({ v: 3, direction: 'page_to_host', type: 'status', id: '01J9ZQ3V6R8XKQ4M2N5P7T9H00', generation: 0, payload: { state: 'ready' } })
+    await waitFor(() => got.some((m) => m.type === 'hello'))
+    const hello = got.filter((m) => m.type === 'hello').at(-1)
+    if (!hello) return { hello: false }
+    window.__bridgeDoc = hello.document_id
+    await post({ v: 3, direction: 'page_to_host', type: 'status', id: ${JSON.stringify(statusId)}, generation: hello.generation, document_id: hello.document_id, payload: { state: 'ready' } })
+    await waitFor(() => got.some((m) => m.type === 'reply' && m.in_reply_to === ${JSON.stringify(statusId)}))
+    // Every reply to this id, so a second one (an old document's message taken as this one's) shows.
+    await new Promise((d) => setTimeout(d, 500))
+    const replies = got.filter((m) => m.type === 'reply' && m.in_reply_to === ${JSON.stringify(statusId)}).map((m) => m.payload)
+    return { hello: true, generation: hello.generation, document: hello.document_id, reply: replies[0] || null, replies }
+  })()`
+  // #3: the two refused navigations above did not commit; the page still shown keeps its bridge.
+  const afterCancel = await Promise.race([wc.executeJavaScript(bridgeTalk('01J9ZQ3V6R8XKQ4M2N5P7T9H01')), new Promise((d) => setTimeout(() => d('timeout'), 8000))])
+  check('bridge: still answers after refused navigations (they did not commit)', afterCancel?.reply?.result === 'done' && afterCancel.replies.length === 1, afterCancel)
+  // #2 (decision #37): a same-URL reload. The old document sends a status with
+  // id LATE and its own document_id from pagehide (keepalive); the reloaded
+  // document then sends a status with the same id and its new document_id.
+  // Exactly one reply to LATE, 'done', and a new document_id: the old
+  // document's message did not land in the new one (it would have made the
+  // new one's a duplicate_id, or brought a second reply). An observation, not
+  // a proof of timing; the host's rule is the unit-tested document_id match.
+  const LATE = '01J9ZQ3V6R8XKQ4M2N5P7T9H02'
+  await wc.executeJavaScript(`sessionStorage.setItem('smoke-reloaded', '1'); addEventListener('pagehide', () => {
+    fetch('/__agent24/bridge', { method: 'POST', keepalive: true, body: JSON.stringify({ v: 3, direction: 'page_to_host', type: 'status', id: ${JSON.stringify(LATE)}, generation: 1, document_id: window.__bridgeDoc, payload: { state: 'loading' } }) }).catch(() => {})
+  })`)
+  const reloaded = new Promise((d) => { wc.once('did-finish-load', d); setTimeout(d, 8000) })
+  wc.reload()
+  await reloaded
+  await new Promise((d) => setTimeout(d, 1000))
+  const afterReload = await Promise.race([wc.executeJavaScript(bridgeTalk(LATE)), new Promise((d) => setTimeout(() => d('timeout'), 8000))])
+  check('bridge: a late message of the old document is not taken as the reloaded one\'s (same URL, keepalive)', afterReload?.reply?.result === 'done'
+    && afterReload.replies.length === 1 && afterReload.document !== afterCancel?.document, afterReload)
+
+  // A second profile: a new instance in a new partition that sees nothing of the first.
+  const firstSession = session.fromPartition(partitions[0], { cache: false })
+  const firstView = view()
+  binding = 'profile-2'
+  host.bindingChanged()
+  // On screen, so the host replaces it with the new binding's view at once.
+  check('binding change takes the first instance down', !win.contentView.children.includes(firstView) && win.contentView.children.length === 1)
+  // Cleared once the page is destroyed (or after the host's bounded wait).
+  await new Promise((d) => setTimeout(d, 2500))
+  check('first page destroyed', wc.isDestroyed())
+  const cookies1 = await firstSession.cookies.get({})
+  check('first partition cleared', cookies1.length === 0, cookies1.length)
+  const r2 = await probe()
+  check('second probe finished', r2.stage === 'done' && !r2.error && !r2.unfinished && r2.timedOut?.length === 0, { stage: r2.stage, error: r2.error, unfinished: r2.unfinished, timedOut: r2.timedOut })
+  check('second profile uses a different non-persistent partition', partitions.length === 2 && partitions[0] !== partitions[1]
+    && partitions.every((p) => !p.startsWith('persist:')), partitions)
+  check('second profile sees none of the first one’s storage', r2.before?.local === null && r2.before?.cookie === '', r2.before)
+  // The new partition must get the dead proxy too, not only the first one.
+  check('second profile: no TURN- or ICE-TCP connection either (decision #30)',
+    triedOrAbsent(r2.turn) && triedOrAbsent(r2.iceTcp) && connections.TURN === webrtcBefore.TURN && connections.ICE === webrtcBefore.ICE,
+    { turn: r2.turn, newTurn: connections.TURN - webrtcBefore.TURN, ice: iceEvidence(r2, connections.ICE - webrtcBefore.ICE) })
+
+  // Positive control (#1643 PR-Daemon A): a third profile whose partition is
+  // put on direct by this script; the host's CSP, webRequest and permission
+  // refusals stay as they are. The foreign host must still get nothing (that
+  // rests on webRequest and the CSP, not on the proxy), and TURN/ICE-TCP must
+  // now reach their ports: only then do the 0s above mean "the dead proxy held"
+  // rather than "this machine never tries".
+  const base = { TURN: connections.TURN, ICE: connections.ICE, B: connections.B, hitsB: hits.B.length }
+  binding = CONTROL
+  host.bindingChanged()
+  const rc = await probe()
+  check('control probe finished', rc.stage === 'done' && !rc.error && !rc.unfinished && rc.timedOut?.length === 0, { stage: rc.stage, error: rc.error, unfinished: rc.unfinished, timedOut: rc.timedOut })
+  await new Promise((d) => setTimeout(d, 500))
+  const viewOrigin = new URL(a.origin)
+  const asked = controlAsked[0]
+  check('control: the host still asked for its dead proxy', controlAsked.length === 1
+    && asked.mode === 'fixed_servers' && /^http:\/\/127\.0\.0\.1:[1-9][0-9]*$/.test(asked.proxyRules)
+    && asked.proxyBypassRules === `<-loopback>;${viewOrigin.host}`, controlAsked)
+  check('control: foreign host refused by webRequest and the CSP alone (no dead proxy)',
+    rc.foreignFetch === 'blocked' && rc.foreignImg === 'blocked' && rc.ws !== 'open' && rc.redirect === 'blocked'
+      && connections.B === base.B && hits.B.length === base.hitsB,
+    { fetch: rc.foreignFetch, img: rc.foreignImg, ws: rc.ws, redirect: rc.redirect, newConnections: connections.B - base.B, newHits: hits.B.slice(base.hitsB) })
+  const controlTurn = connections.TURN - base.TURN
+  const controlIce = connections.ICE - base.ICE
+  check('control: TURN-over-TCP gets out without the dead proxy (so the 0 above is the proxy)', rc.turn === 'ran' && controlTurn >= 1, { turn: rc.turn, connections: controlTurn })
+  // ICE-TCP is conclusive only when the control connects: a TCP-active
+  // candidate alone may be of the other address family and never pair with
+  // the port the probe hands it (#1649 PR-Daemon L2).
+  const iceConclusive = controlIce >= 1
+  check('control: the ICE-TCP 0 above is conclusive', rc.iceTcp === 'ran' && iceConclusive,
+    { ...(iceConclusive ? {} : { inconclusive: 'no ICE-TCP connection even without the dead proxy' }), control: iceEvidence(rc, controlIce), profile1Local: r1.iceLocal })
+
+  host.shutdown()
+  check('quit destroys the view', win.contentView.children.length === 0)
+  const again = await host.show({ x: 0, y: 0, width: 800, height: 600 }, 'dark')
+  check('no new view after quit', !again.ok && win.contentView.children.length === 0, again)
+
+  a.s.close(); b.s.close(); turn.close(); ice.close()
+  const failed = checks.filter((ok) => !ok).length
+  console.log(`${checks.length - failed}/${checks.length} PASS`)
+  app.exit(failed === 0 ? 0 : 1)
+}
+
+main().catch((error) => { console.error(error); app.exit(2) })

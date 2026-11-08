@@ -1,6 +1,6 @@
 // Agent24 main process entry — M2: integrates BackendManager daemon.
 
-import { app, BrowserWindow, dialog, Menu, Tray, WebContentsView, nativeImage, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, dialog, Menu, Tray, WebContentsView, nativeImage, net, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { registerCliTool } from './ipc/cli-tool'
@@ -42,7 +42,14 @@ import { OpenDesignComponentInstaller } from './open-design-component'
 import { OpenDesignStatusReporter, mapOpenDesignReport, postOpenDesignReport } from './open-design-report'
 import { KnowledgeHost } from './knowledge-host'
 import { KnowledgeLoginStore } from './knowledge-logins'
-import { KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
+import { KNOWLEDGE_BINDING, KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
+import { knowledgeAppInstanceId } from './knowledge-app-instance'
+import { bindingTag, KnowledgeUiClient } from './knowledge-ui-client'
+import { KnowledgeUiInstance } from './knowledge-ui-instance'
+import { KNOWLEDGE_UI_ROUTES } from './knowledge-ui-routes'
+// KB-C2-03: the KnowledgeView lives in its own module; the lines that wire it
+// in below are additions only and leave the Creative view's paths untouched.
+import { KnowledgeViewHost, registerKnowledgeViewIpc, resolveKnowledgeViewTarget } from './knowledge-view'
 
 const isDev = process.env.NODE_ENV === 'development'
 setBundledPackaged(app.isPackaged)
@@ -106,6 +113,7 @@ let creativeServeWeb: CreativeServeWeb | null = null
 // KB-HOST-01: Knowledge logins and the daemon's private Knowledge interface.
 let knowledgeHost: KnowledgeHost | null = null
 let knowledge: KnowledgeController | null = null
+let knowledgeView: KnowledgeViewHost | null = null
 // CORE-2 AgentEar S3: long-polls the daemon for native confirmation challenges.
 let presencePoller: PresencePoller | null = null
 let openDesignComponent: OpenDesignComponentInstaller | null = null
@@ -463,6 +471,48 @@ app.whenReady().then(async () => {
   })
   void cliTool.refresh()
   mainWin = createMainWindow()
+  // KB-C2-04a: main is the UI session's Provider in M2 (design §6).
+  const knowledgeBindingTag = bindingTag(knowledgeAppInstanceId(app.getPath('userData')), KNOWLEDGE_BINDING)
+  knowledgeView = new KnowledgeViewHost({
+    window: () => mainWin,
+    createView: (webPreferences) => new WebContentsView({ webPreferences }),
+    sessionFor: (partition) => session.fromPartition(partition, { cache: false }),
+    target: () => resolveKnowledgeViewTarget(process.env, app.isPackaged, knowledge?.status().endpoint),
+    binding: () => knowledge?.viewBinding() ?? null,
+    packaged: app.isPackaged,
+    ui: (context) => {
+      const inputs = () => knowledge?.uiSessionInputs(context.binding) ?? null
+      return new KnowledgeUiInstance({
+        client: new KnowledgeUiClient((url, init) => net.fetch(url, init), context.origin),
+        bindingTag: knowledgeBindingTag,
+        partition: context.partition,
+        origin: context.origin,
+        routes: KNOWLEDGE_UI_ROUTES,
+        ledger: context.ledger,
+        credential: () => inputs()?.credential ?? null,
+        generation: () => inputs()?.generation ?? -1,
+        servable: () => inputs() !== null,
+        now: () => performance.now(),
+        sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+        setTimer: (fn, ms) => setTimeout(fn, ms),
+        clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+        onEvent: context.onEvent,
+        selected: () => knowledge?.status().knowledgeBaseIds ?? [],
+        fetch: (url, init) => net.fetch(url, init),
+      })
+    },
+    locale: () => app.getLocale(),
+    onState: (state) => {
+      if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.KnowledgeViewState, state)
+    },
+  })
+  knowledge.onChange(() => knowledgeView?.bindingChanged())
+  registerKnowledgeViewIpc(ipcMain, guard, {
+    show: IpcChannels.KnowledgeViewShow,
+    bounds: IpcChannels.KnowledgeViewBounds,
+    hide: IpcChannels.KnowledgeViewHide,
+    reload: IpcChannels.KnowledgeViewReload,
+  }, () => knowledgeView)
   ipcMain.handle(IpcChannels.CreativeShow, guard((_event, bounds: CreativeViewBounds) => showCreativeView(bounds)))
   ipcMain.handle(IpcChannels.CreativeRestart, guard((_event, bounds: CreativeViewBounds) => restartCreativeView(bounds)))
   ipcMain.handle(IpcChannels.CreativeBounds, guard((_event, bounds: CreativeViewBounds) => {
@@ -593,6 +643,9 @@ const shutdown = createCreativeShutdown({
   quit: () => app.quit(),
 })
 app.on('before-quit', shutdown.beforeQuit)
+// KB-C2-03: app quit is binding-level destruction for the KnowledgeView (U4.8);
+// from here on it refuses to open again (ADR §4: stop new calls, then destroy).
+app.on('before-quit', () => knowledgeView?.shutdown())
 app.on('will-quit', shutdown.willQuit)
 
 // window-all-closed fires only if tray is null (i.e., user chose Quit from

@@ -113,6 +113,15 @@ export const IpcChannels = {
   KnowledgeStatus: 'knowledge:status',
   KnowledgeConfigure: 'knowledge:configure',
   KnowledgeSetEnabled: 'knowledge:set-enabled',
+  // KB-C2-03 (main/knowledge-view.ts): the KnowledgeView container. The page
+  // sends only where to draw it; the address, partition and policy are main's.
+  KnowledgeViewShow: 'knowledge-view:show',
+  KnowledgeViewBounds: 'knowledge-view:bounds',
+  KnowledgeViewHide: 'knowledge-view:hide',
+  KnowledgeViewReload: 'knowledge-view:reload',
+  KnowledgeViewState: 'knowledge-view:state',
+  // KB-C2-04b-1 (U7.2): one citation's plain text, or null to clear the strip.
+  KnowledgeViewCitation: 'knowledge-view:citation',
 } as const
 
 /** T1-1/T1-2: the documents module as it is on disk now. A daemon reads
@@ -146,6 +155,21 @@ export interface KnowledgeConfigureInput {
   knowledgeBaseIds: string[]
   apiKey?: string
 }
+
+export type {
+  KnowledgeViewBounds,
+  KnowledgeViewFailure,
+  KnowledgeViewResult,
+  KnowledgeViewState,
+  KnowledgeViewTheme,
+} from './knowledge-view-types'
+
+/** Main → renderer. The three ids only: no revision fields (U7.2). null clears the strip. */
+export type KnowledgeViewCitation = {
+  title: string | null
+  text: string
+  ref: { knowledge_base_id: string; knowledge_id: string; chunk_id: string }
+} | null
 
 export type KnowledgeSettingsResult = { ok: true } | { ok: false; reason: 'invalid' | 'not_saved' | 'unavailable' }
 

@@ -1,0 +1,142 @@
+// @vitest-environment jsdom
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+import KnowledgePage from './Knowledge'
+import { CapabilitiesContext } from '../capabilities/types'
+import { setLocale } from '../i18n'
+import type { KnowledgeViewCitation, KnowledgeViewState } from '../../shared/ipc-types'
+
+const show = vi.fn()
+const bounds = vi.fn()
+const hide = vi.fn()
+const reload = vi.fn()
+let stateListener: ((s: KnowledgeViewState) => void) | null = null
+let citationListener: ((c: KnowledgeViewCitation) => void) | null = null
+let resizeCallback: ResizeObserverCallback | null = null
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  stateListener = null
+  citationListener = null
+  setLocale('en')
+  show.mockResolvedValue({ ok: true })
+  reload.mockResolvedValue({ ok: true })
+  bounds.mockResolvedValue(undefined)
+  hide.mockResolvedValue(undefined)
+  Object.defineProperty(window, 'agent24', {
+    value: {
+      knowledgeView: {
+        show, bounds, hide, reload,
+        onState: (cb: (s: KnowledgeViewState) => void) => { stateListener = cb; return () => { stateListener = null } },
+        onCitation: (cb: (c: KnowledgeViewCitation) => void) => { citationListener = cb; return () => { citationListener = null } },
+      },
+    },
+    configurable: true,
+  })
+  globalThis.ResizeObserver = class {
+    constructor(cb: ResizeObserverCallback) { resizeCallback = cb }
+    observe() {}
+    disconnect() {}
+    unobserve() {}
+  } as unknown as typeof ResizeObserver
+})
+
+describe('KnowledgePage', () => {
+  it('asks main to show the view over its area, with the shell theme, and hides it on unmount', async () => {
+    const { unmount } = render(<div className="app light"><KnowledgePage /></div>)
+    await waitFor(() => expect(show).toHaveBeenCalledTimes(1))
+    const [rect, theme] = show.mock.calls[0]
+    expect(Object.keys(rect).sort()).toEqual(['height', 'width', 'x', 'y'])
+    expect(theme).toBe('light')
+    act(() => { resizeCallback?.([], {} as ResizeObserver) })
+    expect(bounds).toHaveBeenCalled()
+    unmount()
+    expect(hide).toHaveBeenCalledTimes(1)
+    expect(stateListener).toBeNull()
+  })
+
+  it('sends only bounds and theme: no address, partition or token', async () => {
+    render(<KnowledgePage />)
+    await waitFor(() => expect(show).toHaveBeenCalled())
+    expect(show.mock.calls[0]).toHaveLength(2)
+    expect(show.mock.calls[0][1]).toBe('dark')
+  })
+
+  it('not connected: says so in plain words and offers Settings, not Reload', async () => {
+    show.mockResolvedValue({ ok: false, code: 'knowledge_off' })
+    const open = vi.fn()
+    render(<CapabilitiesContext.Provider value={{ defs: [], open, approvalsWaiting: 0 }}><KnowledgePage /></CapabilitiesContext.Provider>)
+    expect(await screen.findByText(/Knowledge is not connected yet/)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Reload' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Open Settings' }))
+    expect(open).toHaveBeenCalledWith('settings/connections', 'other')
+  })
+
+  it('no Settings button once the page is up or merely reloadable', async () => {
+    render(<KnowledgePage />)
+    await waitFor(() => expect(show).toHaveBeenCalled())
+    act(() => stateListener?.({ state: 'degraded', code: 'load_failed' }))
+    expect(screen.getByRole('button', { name: 'Reload' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Open Settings' })).toBeNull()
+  })
+
+  it('offers reload after a crash loop, and reload asks main for a new instance', async () => {
+    render(<KnowledgePage />)
+    await waitFor(() => expect(show).toHaveBeenCalled())
+    act(() => stateListener?.({ state: 'closed', code: 'crash_loop' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Reload' }))
+    await waitFor(() => expect(reload).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.queryByText(/keeps crashing/)).toBeNull())
+  })
+
+  it('shows nothing over the page once it is ready', async () => {
+    render(<KnowledgePage />)
+    act(() => stateListener?.({ state: 'loading' }))
+    expect(screen.getByText(/Opening the knowledge page/)).toBeTruthy()
+    act(() => stateListener?.({ state: 'ready' }))
+    expect(screen.queryByRole('status')).toBeNull()
+  })
+
+  it('renders a citation as text, not HTML', async () => {
+    const { container } = render(<KnowledgePage />)
+    await waitFor(() => expect(show).toHaveBeenCalled())
+    act(() => citationListener?.({
+      title: 'From the page',
+      text: 'line\n<b>bold</b>',
+      ref: { knowledge_base_id: 'kb', knowledge_id: 'k', chunk_id: 'c' },
+    }))
+    expect(screen.getByRole('complementary', { name: 'Citation' })).toBeTruthy()
+    expect(screen.getByText('From the page')).toBeTruthy()
+    const text = container.querySelector('.knowledge-citation-text')
+    expect(text?.textContent).toBe('line\n<b>bold</b>')
+    expect(container.querySelector('.knowledge-citation b')).toBeNull()
+    expect(container.querySelector('.knowledge-page .knowledge-host')).toBeTruthy()
+  })
+
+  it('dismiss clears the strip', async () => {
+    render(<KnowledgePage />)
+    await waitFor(() => expect(show).toHaveBeenCalled())
+    act(() => citationListener?.({ title: 'T', text: 'body', ref: { knowledge_base_id: 'kb', knowledge_id: 'k', chunk_id: 'c' } }))
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+    expect(screen.queryByText('body')).toBeNull()
+    expect(document.querySelector('.knowledge-citation')).toBeNull()
+  })
+
+  it('a null citation clears the strip', async () => {
+    render(<KnowledgePage />)
+    await waitFor(() => expect(show).toHaveBeenCalled())
+    act(() => citationListener?.({ title: 'T', text: 'body', ref: { knowledge_base_id: 'kb', knowledge_id: 'k', chunk_id: 'c' } }))
+    expect(screen.getByText('body')).toBeTruthy()
+    act(() => citationListener?.(null))
+    expect(screen.queryByText('body')).toBeNull()
+  })
+
+  it('an untitled citation shows the fallback', async () => {
+    render(<KnowledgePage />)
+    await waitFor(() => expect(show).toHaveBeenCalled())
+    act(() => citationListener?.({ title: null, text: 'body', ref: { knowledge_base_id: 'kb', knowledge_id: 'k', chunk_id: 'c' } }))
+    expect(screen.getByText('Untitled')).toBeTruthy()
+    expect(screen.getByRole('complementary', { name: 'Citation' })).toBeTruthy()
+  })
+})

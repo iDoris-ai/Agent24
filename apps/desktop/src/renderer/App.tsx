@@ -15,6 +15,7 @@ import CommunicationPage from './pages/comm/Communication'
 import ApprovalsPage from './pages/Approvals'
 import VoicePanel from './pages/voice/VoicePanel'
 import CreativePage from './pages/Creative'
+import KnowledgePage from './pages/Knowledge'
 import MemoryPage from './pages/Memory'
 import DocumentsPage from './pages/documents/Documents'
 import ModulesManagerPage from './pages/ModulesManager'
@@ -280,12 +281,13 @@ function AppShell(): JSX.Element {
         {page === 'approvals'        && <ApprovalsPage />}
         {page === 'voice'            && <VoicePanel />}
         {page === 'creative'         && <CreativePage />}
+        {page === 'knowledgeBase'    && <KnowledgePage />}
         {page === 'models'           && <ModelsPage />}
         {page === 'memory'           && <MemoryPage />}
         {page === 'settings'         && <SettingsPage key={route.kind === 'page' ? route.key : undefined} initialTab={route.kind === 'page' ? route.initialTab : undefined} />}
         {page === 'capabilities'     && <CapabilitiesPage statusFor={statusFor} onOpenSettings={() => open('settings/general', 'capabilities', { focus: 'slots' })} />}
         {page === 'modules-manager'  && <ModulesManagerPage />}
-        {selected && !['chat', 'documents', 'schedules', 'communication', 'approvals', 'voice', 'creative', 'models', 'memory', 'modules-manager'].includes(selected.page)
+        {selected && !['chat', 'documents', 'schedules', 'communication', 'approvals', 'voice', 'creative', 'knowledgeBase', 'models', 'memory', 'modules-manager'].includes(selected.page)
           && <CapabilityPage capability={selected} />}
       </div>
     </div>
