@@ -81,6 +81,25 @@ describe('organizing conversations (UI-06 G1)', () => {
     expect(getHistoryState().activeId).toBeNull()
   })
 
+  it('a reply started while main archives the open conversation keeps it open (read-only)', async () => {
+    const start = vi.fn()
+    registerChatPage(() => {}, start)
+    await saveConversation(record('chat_a', '周报'))
+    setActiveConversation('chat_a')
+    let deliver!: () => void
+    bridge.organize.mockImplementationOnce((id: string, p: unknown) => {
+      const answer = store.organize(id, p)
+      return new Promise(r => { deliver = () => r(answer) })
+    })
+    const archiving = archiveConversation('chat_a')
+    await vi.waitFor(() => expect(bridge.organize).toHaveBeenCalled())
+    setChatBusy(true)
+    deliver()
+    expect(await archiving).toBe(true)
+    expect(start).not.toHaveBeenCalled()
+    expect(getHistoryState().activeId).toBe('chat_a')
+  })
+
   it('a change answered after its conversation was deleted does not list it again', async () => {
     await saveConversation(record('chat_a', '周报'))
     // Main handles the change at once; its answer arrives after the deletion.

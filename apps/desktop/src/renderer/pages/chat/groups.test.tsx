@@ -379,6 +379,21 @@ describe('focus and placement (UI-06 G2, Codex R1)', () => {
     expect(document.activeElement).toHaveTextContent('乙')
   })
 
+  it('when the entry under focus leaves the open menu, focus comes back to its first entry (PR-Daemon #1648 L2)', async () => {
+    store.createGroup('甲')
+    const { groups: [, b] } = store.createGroup('乙')
+    put('chat_a', '周报')
+    await showList()
+    await within(list()).findByRole('group', { name: '乙' })
+    const menu = openRowMenu('周报')
+    within(menu).getByRole('menuitem', { name: '乙' }).focus()
+    store.deleteGroup(b.id)
+    await act(async () => { await refreshGroups() })
+    expect(within(list()).getAllByRole('menuitem')[0]).toHaveFocus()
+    fireEvent.keyDown(within(list()).getByRole('menu'), { key: 'Escape' })
+    expect(within(list()).queryByRole('menu')).toBeNull()
+  })
+
   it('a menu that would run past the window\'s bottom or right edge opens inside it', async () => {
     put('chat_a', '周报')
     await showList()
