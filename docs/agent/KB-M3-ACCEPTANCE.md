@@ -45,7 +45,9 @@
 
 ## 反面对照
 
-把编译产物里的预脱敏改成原样透传（`dist/main/knowledge-entry-extract.js` 的 `sourceMessages`）后重跑，§3 pre-redaction 变成 FAIL，并列出泄露给模型的 10 个原值。这说明这条用例确实依赖预脱敏这一步。
+把编译产物 `dist/main/knowledge-entry-extract.js` 的 `sourceMessages` 改成原样透传，并去掉其后的残留检查（`postScan(text).length > 0` 那一行），然后重跑。§3 pre-redaction 变成 FAIL，并列出泄露给模型的 11 个原值：9 类样例，其中私钥块按行拆成 3 段。这说明这条用例确实依赖预脱敏这一步。
+
+如果只透传、保留残留检查，残留检查会先拦下：模型结果变成 `held_back`，模型一次也没被调用，用到模型的几条用例都会 FAIL。这是 2d 加的第二道闸在起作用。
 
 第二个对照模拟 2d（#1694）之前的行为：把同一个函数改回只跑规则表（`preRedact`），并去掉残留检查。重跑后「six bypass shapes」变成 FAIL，列出 B6 的三类值（`123456789012345`、`daveb6`、`erinb6`）既发给了模型也写进了草稿；B1–B5 不受影响。只改回规则表、保留残留检查时，这条同样 FAIL，原因是模型结果为 `held_back`。
 

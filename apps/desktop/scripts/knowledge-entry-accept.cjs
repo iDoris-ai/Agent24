@@ -211,6 +211,7 @@ async function main() {
     const s = setup(echoModel(calls), 's3')
     const out = await s.drafts.create(sender, s.drafts.issue(sampled, 1), { from: 0, to: 1 })
     assert(out.ok, 'create')
+    assert(out.model === 'drafted' && calls.length === 1, `model ${out.model}`)
     const sent = JSON.stringify(calls[0])
     const leakedToModel = hasAny(sent, originals)
     assert(leakedToModel.length === 0, `sent to the model: ${leakedToModel.join(' | ')}`)
@@ -220,7 +221,10 @@ async function main() {
     const none = setup(async () => ({ ok: false, status: 503, data: { error: { code: 'provider_unavailable' } } }), 's3-title')
     const tpl = await none.drafts.create(sender, none.drafts.issue(sampled, 1), { from: 0, to: 0 })
     assert(tpl.ok && !tpl.draft.title.includes(SAMPLES.email), 'template title redacted')
-    const marks = ['private_key', 'credential', 'email', 'phone', 'id_card', 'bank_card', 'path', 'internal_address'].filter((c) => out.draft.body.includes(placeholder(c)))
+    const categories = ['private_key', 'credential', 'email', 'phone', 'id_card', 'bank_card', 'path', 'internal_address']
+    const marks = categories.filter((c) => out.draft.body.includes(placeholder(c)))
+    const missing = categories.filter((c) => !marks.includes(c))
+    assert(missing.length === 0, `no placeholder for: ${missing.join(', ')}`)
     assert(out.draft.findings.length === 0, `post-scan on the redacted draft: ${out.draft.findings.join(',')}`)
     return `placeholders in the draft: ${marks.join(', ')}`
   })
