@@ -2,8 +2,8 @@
   "source": {
     "repo": "iDoris-ai/WeKnora",
     "path": "docs/agent24/ui-routes.json",
-    "commit": "8477788c97ecdbdeb155fc88da6fe840bec0e89f",
-    "note": "Pinned copy of the server's list, replaced verbatim (with its commit) whenever WeKnora changes it. C2-01c1 (WeKnora#141); commit is the PR head until it merges."
+    "commit": "4633c991264815ea96d9dc1cc6fd80e2235396a1",
+    "note": "Pinned copy of the server's list, replaced verbatim (with its commit) whenever WeKnora changes it. C2-01c1 (WeKnora#141)."
   },
   "routes": [
     {

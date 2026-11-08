@@ -2,7 +2,7 @@
   "source": {
     "repo": "iDoris-ai/WeKnora",
     "path": "docs/agent24/ui-routes.json",
-    "commit": "8477788c97ecdbdeb155fc88da6fe840bec0e89f",
+    "commit": "4633c991264815ea96d9dc1cc6fd80e2235396a1",
     "note": "The host's copy: a subset of the pinned server list at this commit (knowledge-ui-routes.test.ts). C2-01c1 (WeKnora#141)."
   },
   "routes": [
