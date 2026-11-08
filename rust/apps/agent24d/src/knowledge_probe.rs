@@ -927,7 +927,9 @@ fn is_code_token(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Credential, ProbeTarget, fingerprint};
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::{ComponentState, Credential, ProbeTarget, fingerprint, judge_response, ready_ok};
+    use serde_json::{Value, json};
 
     fn target(binding: &str, epoch: u64, secret: &str) -> ProbeTarget {
         ProbeTarget {
@@ -959,5 +961,101 @@ mod tests {
             fingerprint(std::slice::from_ref(&target("binding-a", 2, secret))),
             fingerprint(std::slice::from_ref(&target("binding-b", 2, secret)))
         );
+    }
+
+    // #1675 (READONLY r12 §0.3): the receiving side ignores what a later
+    // server adds to ready and capabilities. These lock the probe's reading
+    // as it is: WeKnora#146 adds `operations.candidate` and write operation
+    // names to `supported_operations`, and a build already shipped must judge
+    // them as it judges today.
+
+    fn ready(operations: Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "protocol_version": 1, "request_id": "req-1", "generation": 1,
+            "live": true, "operations": operations, "x_future": {"a": 1},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn ready_ignores_a_candidate_key_and_unknown_states_outside_search_and_read() {
+        let base = json!({"search": {"state": "ready"}, "read": {"state": "ready"}, "ingest": {"state": "disabled"}});
+        assert!(ready_ok(&ready(base.clone()), "req-1"));
+        for candidate in [
+            json!({"state": "ready"}),
+            json!({"state": "disabled", "reason": "x"}),
+            json!({"state": "warming_up"}),
+            json!("not an object"),
+        ] {
+            let mut ops = base.clone();
+            ops["candidate"] = candidate.clone();
+            ops["pack"] = json!({"state": "not_ready"});
+            assert!(ready_ok(&ready(ops), "req-1"), "candidate = {candidate}");
+        }
+        // `ingest` is not looked at, whatever it says or whether it is there.
+        let mut ops = base.clone();
+        ops["ingest"] = json!({"state": "ready"});
+        assert!(ready_ok(&ready(ops.clone()), "req-1"));
+        ops.as_object_mut().unwrap().remove("ingest");
+        assert!(ready_ok(&ready(ops), "req-1"));
+    }
+
+    #[test]
+    fn ready_reads_an_unknown_state_of_search_or_read_as_not_ready() {
+        for (name, state) in [
+            ("search", "warming_up"),
+            ("read", "ready_soon"),
+            ("search", "READY"),
+        ] {
+            let mut ops = json!({"search": {"state": "ready"}, "read": {"state": "ready"}, "ingest": {"state": "disabled"}});
+            ops[name]["state"] = json!(state);
+            ops["candidate"] = json!({"state": "ready"});
+            assert!(!ready_ok(&ready(ops), "req-1"), "{name} = {state}");
+        }
+    }
+
+    fn capabilities(agent: Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({"code": 0, "data": {"x_upstream": true, "integration": {"agent24_knowledge": agent}}})).unwrap()
+    }
+
+    fn declaration(operations: Value) -> Value {
+        json!({
+            "protocol_versions": [1], "mode": "integration", "supported_operations": operations,
+            "server_version": "0.9.0",
+            "limits": {"max_results": 10, "max_concurrency": 2, "max_deadline_ms": 1000, "max_read_bytes": 4096, "max_page_limit": 5, "max_snippet_bytes": 512},
+        })
+    }
+
+    #[test]
+    fn capabilities_with_write_operations_and_unknown_keys_judge_as_today() {
+        let writes = [
+            "candidate.propose",
+            "candidate.review",
+            "candidate.approve",
+            "entry.withdraw",
+        ];
+        let mut operations = vec![json!("search"), json!("read")];
+        operations.extend(writes.iter().map(|op| json!(op)));
+        let mut agent = declaration(Value::Array(operations));
+        agent["write_limits"] = json!({"max_candidates": 3});
+        agent["limits"]["max_candidate_bytes"] = json!(1024);
+        let judged = judge_response(200, &capabilities(agent));
+        assert_eq!(judged.state, ComponentState::Ready);
+        assert!(judged.missing.is_empty(), "{:?}", judged.missing);
+        assert_eq!(judged.reason, None);
+    }
+
+    #[test]
+    fn a_write_operation_name_never_stands_in_for_search_or_read() {
+        let agent = declaration(json!([
+            "search",
+            "candidate.propose",
+            "kb_candidate_propose",
+            "read_all"
+        ]));
+        let judged = judge_response(200, &capabilities(agent));
+        assert_eq!(judged.state, ComponentState::Degraded);
+        assert_eq!(judged.missing, vec!["read".to_owned()]);
+        assert_eq!(judged.reason.as_deref(), Some("missing_capability:read"));
     }
 }
