@@ -189,6 +189,7 @@ describe('one draft', () => {
       ['busy', '本机模型正忙，已给出空模板。'],
       ['failed', '本机模型没有答复，已给出空模板。'],
       ['unusable', '本机模型的答复无法使用，已给出空模板。'],
+      ['held_back', '所选消息里有无法自动脱敏的内容，没有交给本机模型，已给出空模板。'],
     ]
     for (const [model, words] of cases) {
       await shown(view({ id: model, title: model }), { model, hints: [] })

@@ -18,7 +18,7 @@
 //   forward, regexes are sticky and run over one candidate each, and a
 //   position is read a bounded number of times in each pass.
 //
-// Known limit (Codex round 2, M3 不做): some rules look at the character just
+// Known limit (M3 不做): some rules look at the character just
 // before a match (a phone is not preceded by a digit, localhost not by a
 // letter or digit). Replacing a hit with a placeholder changes that character,
 // so text right after a hit can match only in the next pass. preRedact scans
@@ -547,7 +547,7 @@ function assignmentFinder(key: string): Finder {
         if (close > j + 1) return { start: j, end: close + 1 }
         if (close < 0) {
           // No closing quote anywhere: the value is the next word, however
-          // far (B2, Codex C3). Only the last opening quote of its kind can be
+          // far. Only the last opening quote of its kind can be
           // unclosed, so this runs once per key.
           const word = skipSpaces(text, j + 1, Number.POSITIVE_INFINITY)
           return { start: j, end: word < text.length && !isSpace(text[word]) ? wordEnd(word) : j + 1 }
@@ -574,7 +574,7 @@ function skipSpaces(text: string, j: number, most: number): number {
 /** The password in `scheme://user:password@host` (PR-Daemon N4). */
 const urlPasswords: Finder = ({ text }, emit) => {
   for (let at = text.indexOf('://'); at >= 0; at = text.indexOf('://', at + 1)) {
-    // No length cap (Codex C4). Linear: a scan stops at white space or `/`,
+    // No length cap. Linear: a scan stops at white space or `/`,
     // so it never runs past the next `://`.
     let k = at + 3
     while (k < text.length && isUserinfoChar(text[k]) && text[k] !== ':') k += 1
@@ -991,7 +991,7 @@ function hostFinder(suffix: string): Finder {
   }
 }
 
-/** IPv6 unique local (fc00::/7) and link-local (fe80::/10) addresses, an embedded IPv4 tail included (Codex C5). */
+/** IPv6 unique local (fc00::/7) and link-local (fe80::/10) addresses, an embedded IPv4 tail included. */
 const IPV6_LOCAL = /(?:f[cd][0-9a-f]{2}|fe[89ab][0-9a-f]):(?:[0-9a-f]{0,4}:){1,6}(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-f]{0,4})/y
 
 function isHexOrColon(c: string | undefined): boolean {

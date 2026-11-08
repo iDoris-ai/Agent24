@@ -321,7 +321,7 @@ export function knowledgeEntryDrafts(deps: KnowledgeEntryDraftDeps) {
       const current = changeable(id)
       if (typeof current === 'string') return { ok: false, reason: current }
       // A placeholder can be longer than what it replaces. The title is cut to
-      // its limit; the body is not cut, the user is told instead (Codex C4).
+      // its limit; the body is not cut, the user is told instead.
       const body = clearFindings(current.body)
       if (Buffer.byteLength(body, 'utf8') > MAX_ENTRY_BODY) return { ok: false, reason: 'too_long' }
       return saved(() => {
