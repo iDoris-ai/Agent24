@@ -1093,6 +1093,13 @@ describe('UI session wiring (KB-C2-04a, U4.5, U4.7, U3.8)', () => {
     expect(ui.made).toHaveLength(2)
   })
 
+  it('never loads after a failed start, even one that sent no event', async () => {
+    const ui = fakeUi(async () => false)
+    const t = setup({ ui: ui.factory })
+    expect(await t.host.show(BOUNDS)).toEqual(expect.objectContaining({ ok: false }))
+    expect(t.views[0].webContents.loads).toEqual([])
+  })
+
   it('a session that cannot be had steps aside with Reload, without reopening by itself', async () => {
     const ui = fakeUi(async (context) => { context.onEvent({ kind: 'unavailable' }); return false })
     const t = setup({ ui: ui.factory })
