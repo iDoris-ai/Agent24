@@ -188,6 +188,11 @@ export async function refreshGroups(): Promise<void> {
 }
 
 async function changeGroups(change: () => Promise<ChatGroupsState> | undefined): Promise<boolean> {
+  return (await groupChange(change)) !== null
+}
+
+/** A group change; main's answer, or null when it failed. */
+async function groupChange(change: () => Promise<ChatGroupsState> | undefined): Promise<ChatGroupsState | null> {
   const mine = ++groupSeq
   const groups = await Promise.resolve(change()).catch(() => undefined)
   // Only the newest call's answer is shown: it carries every change main
@@ -196,15 +201,19 @@ async function changeGroups(change: () => Promise<ChatGroupsState> | undefined):
   // older change that did land nor a fold shown before main kept it is lost.
   if (!groups) {
     if (mine === groupSeq) await refreshGroups()
-    return false
+    return null
   }
   if (mine === groupSeq) set({ groups })
-  return true
+  return groups
 }
 
-export function createGroup(name: string): Promise<boolean> {
+/** Adds a group at the end; its id, or null when nothing was made. */
+export async function createGroup(name: string): Promise<string | null> {
   const text = renameTitle(name)
-  return text ? changeGroups(() => groupsApi()?.create(text)) : Promise.resolve(false)
+  if (!text) return null
+  const groups = await groupChange(() => groupsApi()?.create(text))
+  // Main appends: the new one is the last group it answers with.
+  return groups?.groups[groups.groups.length - 1]?.id ?? null
 }
 
 export function renameGroup(id: string, name: string): Promise<boolean> {

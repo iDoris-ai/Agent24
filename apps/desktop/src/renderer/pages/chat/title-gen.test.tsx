@@ -57,6 +57,11 @@ const turn = async (text: string, n: number) => {
   await new Promise(r => setTimeout(r, 0))
 }
 const historyList = () => screen.getByRole('region', { name: '历史对话' })
+/** UI-06 G2: renaming is in a conversation's ⋯ menu. */
+const renameFromMenu = async (title: string) => {
+  fireEvent.click(await within(historyList()).findByRole('button', { name: `对话「${title}」的操作` }))
+  fireEvent.click(within(historyList()).getByRole('menuitem', { name: '重命名' }))
+}
 const sessionId = () => (proxy.mock.calls.map(c => c[0] as Req).find(r => !isTitle(r))!.body!.session_id)!
 
 beforeEach(() => {
@@ -112,7 +117,7 @@ describe('model titles (UI-04 T2)', () => {
     renderBoth()
     await turn('帮我写一份本周的周报', 1)
     await waitFor(() => expect(titleCalls()).toHaveLength(1))
-    fireEvent.click(await within(historyList()).findByRole('button', { name: '重命名对话：帮我写一份本周的周报' }))
+    await renameFromMenu('帮我写一份本周的周报')
     const input = within(historyList()).getByRole('textbox', { name: '对话标题' })
     fireEvent.change(input, { target: { value: '我的周报' } })
     fireEvent.keyDown(input, { key: 'Enter' })
@@ -128,7 +133,7 @@ describe('model titles (UI-04 T2)', () => {
   it('does not ask at all once the user has renamed the conversation', async () => {
     renderBoth()
     await turn('你好', 1)
-    fireEvent.click(await within(historyList()).findByRole('button', { name: '重命名对话：你好' }))
+    await renameFromMenu('你好')
     const input = within(historyList()).getByRole('textbox', { name: '对话标题' })
     fireEvent.change(input, { target: { value: '闲聊' } })
     fireEvent.keyDown(input, { key: 'Enter' })

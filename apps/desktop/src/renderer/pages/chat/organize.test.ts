@@ -124,14 +124,14 @@ describe('groups (UI-06 G1)', () => {
     store.createGroup('旧组')
     await refreshGroups()
     expect(getHistoryState().groups.groups.map(g => g.name)).toEqual(['旧组'])
-    expect(await createGroup('  新\n组 ')).toBe(true)
+    expect(await createGroup('  新\n组 ')).toMatch(/^grp_/)
     const [, added] = getHistoryState().groups.groups
     expect(added.name).toBe('新 组')
     expect(await renameGroup(added.id, '改名')).toBe(true)
     expect(getHistoryState().groups.groups.map(g => g.name)).toEqual(['旧组', '改名'])
     expect(await deleteGroup(added.id)).toBe(true)
     expect(getHistoryState().groups.groups.map(g => g.name)).toEqual(['旧组'])
-    expect(await createGroup('   ')).toBe(false)
+    expect(await createGroup('   ')).toBeNull()
     expect(groupsBridge.create).toHaveBeenCalledTimes(1)
   })
 

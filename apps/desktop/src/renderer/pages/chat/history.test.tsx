@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import ChatPage from '../Chat'
 import { ChatHistoryList, shortTime } from './ChatHistoryList'
-import { resetHistoryStore, setRetrySleepForTests } from './history'
+import { getHistoryState, resetHistoryStore, setRetrySleepForTests } from './history'
 import { setLocale } from '../../i18n'
 import { chatHistorySummary, type ChatHistoryRecord } from '../../../shared/chat-history'
 
@@ -88,6 +88,18 @@ const send = (text: string) => {
 const historyList = () => screen.getByRole('region', { name: '历史对话' })
 const findHistoryList = () => screen.findByRole('region', { name: '历史对话' })
 
+/** UI-06 G2: a conversation's actions are in its ⋯ menu; deleting asks first. */
+const menuOf = (title: string) => {
+  fireEvent.click(within(historyList()).getByRole('button', { name: `对话「${title}」的操作` }))
+  return within(historyList()).getByRole('menu')
+}
+const deleteItem = (title: string) => within(menuOf(title)).getByRole('menuitem', { name: '删除…' })
+function deleteFromMenu(title: string) {
+  vi.spyOn(window, 'confirm').mockReturnValueOnce(true)
+  fireEvent.click(deleteItem(title))
+}
+const renameFromMenu = (title: string) => fireEvent.click(within(menuOf(title)).getByRole('menuitem', { name: '重命名' }))
+
 beforeEach(() => {
   setLocale('zh')
   vi.clearAllMocks()
@@ -154,11 +166,11 @@ describe('chat history', () => {
     fireEvent.click(await within(await findHistoryList()).findByRole('button', { name: '话题甲' }))
     await waitFor(() => expect(screen.getByText('答：话题甲')).toBeInTheDocument())
 
-    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：话题乙' }))
+    deleteFromMenu('话题乙')
     await waitFor(() => expect(within(historyList()).queryByRole('button', { name: '话题乙' })).toBeNull())
     expect(screen.getByText('答：话题甲')).toBeInTheDocument()
 
-    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：话题甲' }))
+    deleteFromMenu('话题甲')
     await waitFor(() => expect(screen.queryByText('答：话题甲')).toBeNull())
     expect(saved.size).toBe(0)
     expect(screen.queryByRole('region', { name: '历史对话' })).toBeNull()
@@ -186,14 +198,14 @@ describe('chat history', () => {
     fireEvent.click(await within(await findHistoryList()).findByRole('button', { name: '话题甲' }))
     await waitFor(() => expect(screen.getByText('答：话题甲')).toBeInTheDocument())
     send('再问一句')
-    await waitFor(() => expect(within(historyList()).getByRole('button', { name: '删除对话：话题甲' })).toBeDisabled())
+    await waitFor(() => expect(deleteItem('话题甲')).toBeDisabled())
     expect(within(historyList()).getByRole('button', { name: '清空' })).toBeDisabled()
     expect(within(historyList()).getByRole('button', { name: '话题乙' })).toBeDisabled()
-    expect(within(historyList()).getByRole('button', { name: '删除对话：话题乙' })).toBeEnabled()
+    expect(deleteItem('话题乙')).toBeEnabled()
 
     reply({ ok: true, status: 200, data: { message: { content: '后来的答' } } })
     await waitFor(() => expect(saved.get('chat_a_1')?.messages.at(-1)?.content).toBe('后来的答'))
-    await waitFor(() => expect(within(historyList()).getByRole('button', { name: '删除对话：话题甲' })).toBeEnabled())
+    await waitFor(() => expect(deleteItem('话题甲')).toBeEnabled())
   })
 
   it('a load that finishes after "New chat" is dropped', async () => {
@@ -227,7 +239,7 @@ describe('chat history', () => {
     const item = await within(await findHistoryList()).findByRole('button', { name: '话题丙' })
     expect(item).not.toHaveAttribute('aria-current')
     // Deleting it now leaves the new chat and its draft alone.
-    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：话题丙' }))
+    deleteFromMenu('话题丙')
     await waitFor(() => expect(saved.size).toBe(0))
     expect(screen.getByPlaceholderText(/输入消息/)).toHaveValue('草稿')
   })
@@ -268,7 +280,7 @@ describe('chat history', () => {
     send('一')
     await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
     await waitFor(() => expect(chatHistory.save).toHaveBeenCalledTimes(2))
-    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：话题乙' }))
+    deleteFromMenu('话题乙')
     await waitFor(() => expect(saved.has('chat_b_1')).toBe(false))
     await retry()
     await waitFor(() => expect([...saved.values()][0]?.messages).toHaveLength(2))
@@ -283,8 +295,8 @@ describe('chat history', () => {
     holdRetries()
     send('再问')
     await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
-    await waitFor(() => expect(within(historyList()).getByRole('button', { name: '删除对话：话题甲' })).toBeEnabled())
-    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：话题甲' }))
+    await waitFor(() => expect(deleteItem('话题甲')).toBeEnabled())
+    deleteFromMenu('话题甲')
     // The page left it at once, before the deletion settled.
     expect(screen.queryByText('答：话题甲')).toBeNull()
     await waitFor(() => expect(saved.has('chat_a_1')).toBe(false))
@@ -327,7 +339,7 @@ describe('chat history', () => {
     chatHistory.get.mockImplementationOnce(() => new Promise(r => { load = r }))
     fireEvent.click(within(historyList()).getByRole('button', { name: '话题乙' }))
     const copy = saved.get('chat_b_1')!
-    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：话题乙' }))
+    deleteFromMenu('话题乙')
     await waitFor(() => expect(saved.has('chat_b_1')).toBe(false))
     load(copy)
     await new Promise(r => setTimeout(r, 0))
@@ -338,7 +350,7 @@ describe('chat history', () => {
   })
 
   it.each([
-    ['deleted', (title: string) => fireEvent.click(within(historyList()).getByRole('button', { name: `删除对话：${title}` }))],
+    ['deleted', (title: string) => deleteFromMenu(title)],
     ['cleared', () => { vi.spyOn(window, 'confirm').mockReturnValue(true); fireEvent.click(within(historyList()).getByRole('button', { name: '清空' })) }],
   ])('the last save, failing and waiting to retry, stays gone once %s (L4)', async (_name, remove) => {
     // The reply's save (the second) fails and waits to retry.
@@ -373,7 +385,7 @@ describe('chat history', () => {
     const id = proxy.mock.calls[0][0].body.session_id as string
     fireEvent.click(screen.getByRole('button', { name: '新对话' }))
     await within(historyList()).findByRole('button', { name: '问D' })
-    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：问D' }))
+    deleteFromMenu('问D')
     await waitFor(() => expect(within(historyList()).queryByRole('button', { name: '问D' })).toBeNull())
     finish()
     await new Promise(r => setTimeout(r, 0))
@@ -411,7 +423,7 @@ describe('chat history', () => {
     // Deleting B starts a list read, held here: its snapshot has no 问E.
     let listed!: (v: unknown) => void
     chatHistory.list.mockImplementationOnce(() => new Promise(r => { listed = r }))
-    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：话题乙' }))
+    deleteFromMenu('话题乙')
     await waitFor(() => expect(chatHistory.list).toHaveBeenCalledTimes(2))
     // Meanwhile the reply's retry succeeds and lists 问E.
     await retry()
@@ -432,11 +444,12 @@ describe('chat history', () => {
 
 describe('renaming a conversation (UI-04)', () => {
   const rename = async (from: string) => {
-    fireEvent.click(within(await findHistoryList()).getByRole('button', { name: `重命名对话：${from}` }))
+    await findHistoryList()
+    renameFromMenu(from)
     return within(historyList()).getByRole('textbox', { name: '对话标题' }) as HTMLInputElement
   }
 
-  it('renames with ✎ and Enter; later saves of the conversation keep the new title', async () => {
+  it('renames from its menu and Enter; later saves of the conversation keep the new title', async () => {
     renderBoth()
     send('第一个问题')
     await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
@@ -542,8 +555,8 @@ describe('renaming a conversation (UI-04)', () => {
     // Opened again while the rename is on its way: the box still says 旧话题.
     input = await rename('旧话题')
     answer()
-    // The row is still being edited: its delete button shows the new title.
-    await within(historyList()).findByRole('button', { name: '删除对话：新名' })
+    // The row is still being edited while the new title lands.
+    await waitFor(() => expect(getHistoryState().items[0]?.title).toBe('新名'))
     fireEvent.blur(input)
     await new Promise(r => setTimeout(r, 0))
     expect(chatHistory.setTitle).toHaveBeenCalledTimes(1)
@@ -582,7 +595,7 @@ describe('renaming a conversation (UI-04)', () => {
     fireEvent.change(input, { target: { value: '新名' } })
     fireEvent.keyDown(input, { key: 'Enter' })
     await waitFor(() => expect(chatHistory.setTitle).toHaveBeenCalled())
-    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：旧话题' }))
+    deleteFromMenu('旧话题')
     await waitFor(() => expect(chatHistory.delete).toHaveBeenCalledWith('chat_old_1'))
     answer({ ...summary(saved.get('chat_old_1') ?? stored('chat_old_1', '旧话题', '2026-11-07T10:00:02.000Z')), title: '新名', title_source: 'user' })
     await new Promise(r => setTimeout(r, 0))
@@ -599,7 +612,7 @@ describe('renaming a conversation (UI-04)', () => {
     const snapshot = await chatHistory.list()
     let listed!: (v: unknown) => void
     chatHistory.list.mockImplementationOnce(() => new Promise(r => { listed = r }))
-    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：话题乙' }))
+    deleteFromMenu('话题乙')
     await waitFor(() => expect(chatHistory.list).toHaveBeenCalledTimes(3))
     const input = await rename('话题甲')
     fireEvent.change(input, { target: { value: '甲改名' } })
@@ -652,7 +665,7 @@ describe('finding a conversation (UI-04 T3)', () => {
     saved.set(r.id, r)
     render(<ChatHistoryList showChat={showChat} />)
     const box = await within(await findHistoryList()).findByRole('searchbox', { name: '搜索对话' })
-    const names = () => within(historyList()).getAllByRole('button').map(b => b.textContent).filter(n => n && n !== '清空' && n !== '✎' && n !== '×')
+    const names = () => within(historyList()).getAllByRole('button').map(b => b.textContent).filter(n => n && !['清空', '+ 分组', '⋯', '▾', '▸'].includes(n))
     fireEvent.change(box, { target: { value: 'ｗｅｅｋｌｙ　ｒｅｐｏｒｔ' } })
     expect(names()).toEqual(['模型起的名'])
     fireEvent.change(box, { target: { value: '话题3' } })
@@ -710,9 +723,9 @@ describe('finding a conversation (UI-04 T3)', () => {
     fireEvent.keyDown(within(historyList()).getByRole('button', { name: 'Weekly' }), { key: 'F2' })
     const input = within(historyList()).getByRole('textbox', { name: '对话标题' })
     fireEvent.change(input, { target: { value: 'Budget' } })
-    // Tab: the box loses focus to the row's delete button, which saves.
-    const del = within(historyList()).getByRole('button', { name: '删除对话：Weekly' })
-    del.focus()
+    // Leaving the box saves. (jsdom has no Tab traversal: this stands for
+    // focus going nowhere, as it did when Tab moved it to a control of the
+    // row that the new title then filtered out.)
     fireEvent.blur(input)
     await waitFor(() => expect(chatHistory.setTitle).toHaveBeenCalled())
     land()
@@ -724,7 +737,7 @@ describe('finding a conversation (UI-04 T3)', () => {
     render(<ChatHistoryList showChat={showChat} />)
     const box = await within(await findHistoryList()).findByRole('searchbox', { name: '搜索对话' })
     fireEvent.change(box, { target: { value: '话题8' } })
-    fireEvent.click(within(historyList()).getByRole('button', { name: '删除对话：话题8' }))
+    deleteFromMenu('话题8')
     await waitFor(() => expect(within(historyList()).queryByRole('searchbox')).toBeNull())
     expect(within(historyList()).getAllByRole('button', { name: /^话题\d$/ })).toHaveLength(8)
   })
@@ -740,7 +753,7 @@ describe('finding a conversation (UI-04 T3)', () => {
     const later = await within(list).findByRole('button', { name: `周报 ${shortTime(b.updated_at)}` })
     expect(within(list).getByRole('button', { name: `周报 ${shortTime(a.updated_at)}` })).toBeInTheDocument()
     expect(within(list).getByRole('button', { name: '请假' })).toBeInTheDocument()
-    expect(within(list).getByRole('button', { name: `删除对话：周报 ${shortTime(b.updated_at)}` })).toBeInTheDocument()
+    expect(within(list).getByRole('button', { name: `对话「周报 ${shortTime(b.updated_at)}」的操作` })).toBeInTheDocument()
     expect(later).toHaveAttribute('title', `周报 · 写本周周报 · ${shortTime(b.updated_at)}`)
     // The first prompt is left out of the tooltip when it is the title.
     expect(within(list).getByRole('button', { name: '请假' })).toHaveAttribute('title', `请假 · ${shortTime(c.updated_at)}`)
