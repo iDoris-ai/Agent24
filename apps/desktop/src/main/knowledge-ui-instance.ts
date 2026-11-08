@@ -24,6 +24,8 @@ export type UiInstanceEvent =
   | { kind: 'closed'; code: 'session_rejected' | 'revocation_mismatch' | 'probe_failed' | 'empty_scope' }
   /** No session can be had for now (C, servability, generation): the view steps aside with Reload. */
   | { kind: 'unavailable' }
+  /** U4.5 "恢复即重载": injection was paused and is back; reload the current document. Not an end. */
+  | { kind: 'reload' }
 
 export interface KnowledgeUiInstanceDeps {
   client: KnowledgeUiClient
@@ -49,6 +51,8 @@ export class KnowledgeUiInstance {
   private readonly session: UiViewSession
   private readonly injected = new InjectedRequests()
   private renewal: unknown = null
+  /** One self-check and its settlement at a time, however many 401s ask for it. */
+  private checking: Promise<void> | null = null
   /** An event went out or the instance was destroyed: nothing is injected any more. */
   private stopped = false
   private destroyed = false
@@ -56,7 +60,6 @@ export class KnowledgeUiInstance {
   constructor(private readonly deps: KnowledgeUiInstanceDeps) {
     this.session = new UiViewSession({
       client: deps.client,
-      view: deps.view ?? newViewSecret(),
       tags: { bindingTag: deps.bindingTag, partitionTag: partitionTag(deps.partition) },
       credential: deps.credential,
       generation: deps.generation,
@@ -64,7 +67,8 @@ export class KnowledgeUiInstance {
       boundKnowledgeBaseIds: deps.knowledgeBaseIds,
       now: deps.now,
       sleep: deps.sleep,
-    })
+      onResume: () => { if (!this.stopped) this.deps.onEvent({ kind: 'reload' }) },
+    }, deps.view ?? newViewSecret())
   }
 
   /** The first JWT (U4.5: the page loads only after it). False when there is none; the event has gone out then. */
@@ -86,8 +90,10 @@ export class KnowledgeUiInstance {
 
   /** A request ended (`onCompleted` with its status, `onErrorOccurred` without): a 401 on an injected one starts the self-check. */
   responded(id: number, statusCode: number | undefined): void {
-    if (!this.injected.take(id) || statusCode !== 401 || this.stopped) return
-    void this.session.selfCheck().then((outcome) => { this.settle(outcome) })
+    if (!this.injected.take(id) || statusCode !== 401 || this.stopped || this.checking) return
+    this.checking = this.session.selfCheck()
+      .then((outcome) => { this.settle(outcome) })
+      .finally(() => { this.checking = null })
   }
 
   /** U4.7: stop injecting, forget the JWT, revoke the family (bounded, not awaited). */

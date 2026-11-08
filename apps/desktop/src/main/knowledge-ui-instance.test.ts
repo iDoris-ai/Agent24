@@ -118,6 +118,28 @@ describe('KnowledgeUiInstance', () => {
     expect(t.events).toEqual([{ kind: 'rebuild' }])
   })
 
+  it('settles a shared self-check once: three 401s are one revocation mismatch, not three (Codex 04a-1 R1 #2)', async () => {
+    const t = setup({ probes: [refused('unauthorized', 'credential_revoked')] })
+    await t.ui.start()
+    const rs = [fetchReq(), fetchReq(), fetchReq()]
+    for (const r of rs) t.ui.inject(r, WC)
+    for (const r of rs) t.ui.responded(r.id, 401)
+    await flush()
+    expect(t.log.filter((l) => l === 'probe')).toHaveLength(1)
+    expect(t.events).toEqual([])
+    expect(t.ui.inject(fetchReq(), WC)).toMatchObject({ injected: true })
+  })
+
+  it('asks the host to reload once injection is back from a pause (U4.5)', async () => {
+    const t = setup({ probes: [{ kind: 'unknown' }, { kind: 'ok', value: { expiresInS: 100 } }] })
+    await t.ui.start()
+    const r = fetchReq()
+    t.ui.inject(r, WC)
+    t.ui.responded(r.id, 401)
+    await flush()
+    expect(t.events).toEqual([{ kind: 'reload' }])
+  })
+
   it('leaves a restart out of the count (decision #36)', async () => {
     const restarted = refused('unauthorized', 'credential_invalid', true)
     const t = setup({ probes: [restarted, restarted] })

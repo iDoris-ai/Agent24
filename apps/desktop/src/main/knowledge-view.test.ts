@@ -1164,6 +1164,29 @@ describe('UI session wiring (KB-C2-04a, U4.5, U4.7, U3.8)', () => {
     expect(ui.made[0].responded).toEqual([[7, 401], [8, undefined]])
   })
 
+  it('reloads the current document when injection resumes, only once it has loaded (U4.5)', async () => {
+    const ui = fakeUi()
+    const t = setup({ ui: ui.factory })
+    let reloads = 0
+    await t.host.show(BOUNDS)
+    t.views[0].webContents.reload = () => { reloads++ }
+    ui.made[0].context.onEvent({ kind: 'reload' })
+    expect(reloads).toBe(1)
+    expect(t.host.status()).toEqual({ state: 'ready' })
+    t.views[0].webContents.destroyed = true
+    ui.made[0].context.onEvent({ kind: 'reload' })
+    expect(reloads).toBe(1)
+  })
+
+  it('lets go of the partition listeners on destroy', async () => {
+    const ui = fakeUi()
+    const t = setup({ ui: ui.factory })
+    await t.host.show(BOUNDS)
+    expect(t.sessions[0].beforeSendHeaders).not.toBeNull()
+    t.host.destroyAll('test')
+    expect([t.sessions[0].beforeSendHeaders, t.sessions[0].completed, t.sessions[0].errorOccurred]).toEqual([null, null, null])
+  })
+
   it('ends the UI session before the page goes (U4.7)', async () => {
     const log: string[] = []
     const ui = fakeUi(async () => true, log)

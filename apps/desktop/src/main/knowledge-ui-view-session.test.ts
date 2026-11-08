@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { KnowledgeUiClient, UiCallResult } from './knowledge-ui-client'
 import { UI_BACKOFF_MS, UI_SELF_CHECK_INTERVAL_MS, UiViewSession, type UiViewSessionDeps } from './knowledge-ui-view-session'
 
-const VIEW = { proof: 'proof', vph: 'v'.repeat(43) }
+const VIEW = { proof: 'view-proof-secret', vph: 'v'.repeat(43) }
 const TAGS = { bindingTag: 'b'.repeat(43), partitionTag: 'p'.repeat(43) }
 const SESSION = { sessionToken: 'jwt', expiresInS: 600, ops: ['kb.list' as const], knowledgeBaseIds: ['kb-a'] }
 const refused = (code: string, reason: string, retryAfterMs: number | null = null, restarted = false): UiCallResult<never> =>
@@ -15,6 +15,8 @@ function setup(exchanges: Array<UiCallResult<typeof SESSION>>, opts: { issues?: 
   let now = 1000
   const env = { generation: 1, servable: true, credential: 'C' as string | null, onIssue: () => {} }
   const sleeps: number[] = []
+  const revokedWith: string[] = []
+  let resumes = 0
   const client = {
     issueTicket: async (cred: string, tags: unknown, generation: number) => {
       log.push(`issue:${cred}:${generation}`)
@@ -34,14 +36,15 @@ function setup(exchanges: Array<UiCallResult<typeof SESSION>>, opts: { issues?: 
       return opts.probes?.shift() ?? { kind: 'unknown' }
     },
     revokeTicket: async (_c: string, id: string) => { log.push(`revokeTicket:${id.slice(-1)}`); return { kind: 'ok', value: null } },
-    revokeFamily: async (_c: string, vph: string) => { log.push(`revokeFamily:${vph === VIEW.vph}`); return { kind: 'ok', value: null } },
+    revokeFamily: async (c: string, vph: string) => { log.push(`revokeFamily:${vph === VIEW.vph}`); revokedWith.push(c); return { kind: 'ok', value: null } },
   } as unknown as KnowledgeUiClient
   const deps: UiViewSessionDeps = {
-    client, view: VIEW, tags: TAGS,
+    client, tags: TAGS,
     credential: () => env.credential, generation: () => env.generation, servable: () => env.servable,
     boundKnowledgeBaseIds: () => ['kb-a'], now: () => now, sleep: async (ms) => { sleeps.push(ms) },
+    onResume: () => { resumes++ },
   }
-  return { session: new UiViewSession(deps), log, tickets, env, sleeps, advance: (ms: number) => { now += ms } }
+  return { session: new UiViewSession(deps, { ...VIEW }), log, tickets, env, sleeps, revokedWith, resumes: () => resumes, advance: (ms: number) => { now += ms } }
 }
 
 describe('UiViewSession (U2.1, U2.9–U2.12, U3.6–U3.8)', () => {
@@ -172,7 +175,7 @@ describe('UiViewSession self-check and injection (U3.8, U4.5 ⑤)', () => {
     const t = setup([{ kind: 'ok', value: SESSION }])
     expect(t.session.injection()).toBeNull()
     await t.session.establish()
-    expect(t.session.injection()).toEqual({ token: 'jwt', proof: 'proof' })
+    expect(t.session.injection()).toEqual({ token: 'jwt', proof: VIEW.proof })
     t.advance(599_999)
     expect(t.session.injection()).not.toBeNull()
     t.advance(1)
@@ -196,7 +199,7 @@ describe('UiViewSession self-check and injection (U3.8, U4.5 ⑤)', () => {
     const t = setup([{ kind: 'ok', value: SESSION }], { probes: [OK] })
     await t.session.establish()
     expect(await t.session.selfCheck()).toEqual({ kind: 'ok' })
-    expect(t.log).toEqual(['issue:C:1', 'exchange:t1', 'probe:jwt:proof'])
+    expect(t.log).toEqual(['issue:C:1', 'exchange:t1', `probe:jwt:${VIEW.proof}`])
   })
 
   it('runs one self-check at a time and at most every 10 seconds', async () => {
@@ -263,7 +266,7 @@ describe('UiViewSession self-check and injection (U3.8, U4.5 ⑤)', () => {
     const t = setup([{ kind: 'ok', value: SESSION }, second], { probes: [{ kind: 'unknown' }, refused('unauthorized', 'credential_expired')] })
     await t.session.establish()
     expect(await t.session.selfCheck()).toEqual({ kind: 'ready' })
-    expect(t.session.injection()).toEqual({ token: 'jwt2', proof: 'proof' })
+    expect(t.session.injection()).toEqual({ token: 'jwt2', proof: VIEW.proof })
   })
 
   it('stops a self-check when the instance goes', async () => {
@@ -272,5 +275,67 @@ describe('UiViewSession self-check and injection (U3.8, U4.5 ⑤)', () => {
     t.session['deps'].sleep = async () => { t.session.destroy() }
     expect(await t.session.selfCheck()).toEqual({ kind: 'destroyed' })
     expect(t.log.filter((l) => l.startsWith('probe:'))).toHaveLength(1)
+  })
+
+  it('stops injecting the moment the binding is not servable or its generation moved (Codex 04a-1 R1 #1)', async () => {
+    const t = setup([{ kind: 'ok', value: SESSION }])
+    await t.session.establish()
+    expect(t.session.injection()).not.toBeNull()
+    t.env.servable = false
+    expect(t.session.injection()).toBeNull()
+    t.env.servable = true
+    t.env.generation = 2
+    expect(t.session.injection()).toBeNull()
+    t.env.generation = 1
+    expect(t.session.injection()).not.toBeNull()
+  })
+
+  it('revokes the family with the C it was issued with, even once the binding has none (Codex 04a-1 R1 #3, U4.7 ③)', async () => {
+    const t = setup([{ kind: 'ok', value: SESSION }])
+    await t.session.establish()
+    t.env.credential = null
+    t.session.destroy()
+    expect(t.revokedWith).toEqual(['C'])
+    // A replaced key: still the family's own C.
+    const u = setup([{ kind: 'ok', value: SESSION }])
+    await u.session.establish()
+    u.env.credential = 'C2'
+    u.session.destroy()
+    expect(u.revokedWith).toEqual(['C'])
+  })
+
+  it('drops the view proof on destroy, not only the JWT (Codex 04a-1 R1 #7, U4.7 ②)', async () => {
+    const t = setup([{ kind: 'ok', value: SESSION }])
+    await t.session.establish()
+    expect(JSON.stringify(t.session)).toContain(VIEW.proof)
+    t.session.destroy()
+    expect(JSON.stringify(t.session)).not.toContain(VIEW.proof)
+    expect(JSON.stringify(t.session)).not.toContain('jwt')
+    expect(JSON.stringify(t.session)).not.toContain('"C"')
+  })
+
+  it('pauses injection while a renewal exchange ends unknown, and resumes with a reload once renewed (Codex 04a-1 R1 #5, #6)', async () => {
+    const t = setup([{ kind: 'ok', value: SESSION }, { kind: 'unknown' }, { kind: 'ok', value: { ...SESSION, sessionToken: 'jwt2' } }])
+    await t.session.establish()
+    expect(t.resumes()).toBe(0)
+    let pausedWhileWaiting: boolean | null = null
+    t.session['deps'].sleep = async () => { pausedWhileWaiting = t.session.injection() === null }
+    t.advance(400_000)
+    expect(await t.session.establish()).toEqual({ kind: 'ready' })
+    expect(pausedWhileWaiting).toBe(true)
+    expect(t.session.injection()).toEqual({ token: 'jwt2', proof: VIEW.proof })
+    expect(t.resumes()).toBe(1)
+  })
+
+  it('a probe that recovers lifts the pause with one reload; a renewal with no pause before it reloads nothing', async () => {
+    const t = setup([{ kind: 'ok', value: SESSION }], { probes: [{ kind: 'unknown' }, { kind: 'ok', value: { expiresInS: 100 } }] })
+    await t.session.establish()
+    expect(await t.session.selfCheck()).toEqual({ kind: 'ok' })
+    expect(t.resumes()).toBe(1)
+    const u = setup([{ kind: 'ok', value: SESSION }, { kind: 'ok', value: SESSION }])
+    await u.session.establish()
+    u.advance(400_000)
+    await u.session.establish()
+    expect(u.resumes()).toBe(0)
   })
 })

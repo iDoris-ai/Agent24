@@ -17,7 +17,6 @@ export const UI_SELF_CHECK_INTERVAL_MS = 10_000
 
 export interface UiViewSessionDeps {
   client: KnowledgeUiClient
-  view: ViewSecret
   tags: { bindingTag: string; partitionTag: string }
   /** The current C, or null when the binding has none. */
   credential: () => string | null
@@ -28,6 +27,8 @@ export interface UiViewSessionDeps {
   boundKnowledgeBaseIds: () => readonly string[]
   now: () => number
   sleep: (ms: number) => Promise<void>
+  /** U4.5 "恢复即重载": injection was paused and is not any more. */
+  onResume?: () => void
 }
 
 export type UiSessionOutcome =
@@ -56,15 +57,23 @@ export type UiSelfCheckOutcome =
   | { kind: 'session_invalid'; restarted: boolean; jwtExchangedAt: number; at: number }
 
 export class UiViewSession {
-  private session: (UiExchange & { exchangedAt: number }) | null = null
+  private session: (UiExchange & { exchangedAt: number; generation: number }) | null = null
+  /** U4.7 ②: dropped on destroy; only the family id (vph) is kept for the revocation. */
+  private view: ViewSecret | null
+  private readonly vph: string
+  /** The C the family's tickets were issued with: the revocation uses it even once the binding moved on (U4.7 ③). */
+  private issuedWith: string | null = null
   private flight: Promise<UiSessionOutcome> | null = null
   private destroyed = false
-  /** U3.8: injection paused after a probe ended unknown; lifted by any other result. */
+  /** U3.8: injection paused after an unknown probe or exchange; lifted by any other result. */
   private paused = false
   private check: Promise<UiSelfCheckOutcome> | null = null
   private lastCheckAt: number | null = null
 
-  constructor(private readonly deps: UiViewSessionDeps) {}
+  constructor(private readonly deps: UiViewSessionDeps, view: ViewSecret) {
+    this.view = view
+    this.vph = view.vph
+  }
 
   /** The JWT to inject, if there is one; never logged or passed on (U2.5). */
   token(): string | null {
@@ -78,9 +87,12 @@ export class UiViewSession {
    */
   injection(): { token: string; proof: string } | null {
     const s = this.session
-    if (this.destroyed || this.paused || !s) return null
+    const view = this.view
+    if (this.destroyed || this.paused || !s || !view) return null
     if (this.deps.now() - s.exchangedAt >= s.expiresInS * 1000) return null
-    return { token: s.sessionToken, proof: this.deps.view.proof }
+    // U4.8: not a request more once the binding is not servable or has moved on.
+    if (!this.deps.servable() || this.deps.generation() !== s.generation) return null
+    return { token: s.sessionToken, proof: view.proof }
   }
 
   /** When the current JWT was exchanged (UiSessionLedger's merge rule for restarts). */
@@ -127,8 +139,10 @@ export class UiViewSession {
     if (this.destroyed) return
     this.destroyed = true
     this.session = null
-    const credential = this.deps.credential()
-    if (credential) void this.deps.client.revokeFamily(credential, this.deps.view.vph)
+    this.view = null
+    const credential = this.issuedWith ?? this.deps.credential()
+    this.issuedWith = null
+    if (credential) void this.deps.client.revokeFamily(credential, this.vph)
   }
 
   private async run(): Promise<UiSessionOutcome> {
@@ -139,9 +153,11 @@ export class UiViewSession {
       const credential = this.deps.credential()
       if (!credential || !this.deps.servable()) return { kind: 'not_servable' }
       const generation = this.deps.generation()
-      const issued = await this.deps.client.issueTicket(credential, { ...this.deps.tags, vph: this.deps.view.vph }, generation)
+      const issued = await this.deps.client.issueTicket(credential, { ...this.deps.tags, vph: this.vph }, generation)
+      if (issued.kind === 'ok') this.issuedWith = credential
       const failed = this.failure(issued)
       if (failed === 'retry') {
+        this.setPaused(true)
         if (++unknownInARow >= UI_UNKNOWN_LIMIT) return { kind: 'closed', code: 'probe_failed' }
         await this.deps.sleep(this.backoff(issued))
         continue
@@ -155,17 +171,20 @@ export class UiViewSession {
       }
       if (this.deps.generation() !== generation) {
         void this.deps.client.revokeTicket(credential, ticket.ticketId)
-        void this.deps.client.revokeFamily(credential, this.deps.view.vph)
+        void this.deps.client.revokeFamily(credential, this.vph)
         return { kind: 'generation_changed' }
       }
       if (!this.deps.servable()) {
         void this.deps.client.revokeTicket(credential, ticket.ticketId)
         return { kind: 'not_servable' }
       }
-      const exchanged = await this.deps.client.exchange(ticket.ticket, this.deps.view, this.deps.boundKnowledgeBaseIds())
+      const view = this.view
+      if (!view) return { kind: 'destroyed' }
+      const exchanged = await this.deps.client.exchange(ticket.ticket, view, this.deps.boundKnowledgeBaseIds())
       if (this.destroyed) return { kind: 'destroyed' }
       if (exchanged.kind === 'ok') {
-        this.session = { ...exchanged.value, exchangedAt: this.deps.now() }
+        this.session = { ...exchanged.value, exchangedAt: this.deps.now(), generation }
+        this.setPaused(false)
         return { kind: 'ready' }
       }
       // From here the ticket is never sent again: a new one is minted (U2.9, C2-01b2 replay).
@@ -177,6 +196,8 @@ export class UiViewSession {
       invalidInARow = 0
       const other = this.failure(exchanged)
       if (other === 'retry') {
+        // U3.8: an exchange that times out or fails unknown pauses injection too.
+        this.setPaused(true)
         if (++unknownInARow >= UI_UNKNOWN_LIMIT) return { kind: 'closed', code: 'probe_failed' }
         await this.deps.sleep(this.backoff(exchanged))
         continue
@@ -192,10 +213,12 @@ export class UiViewSession {
     for (;;) {
       const s = this.session
       if (!s) return this.renew()
-      const probed = await this.deps.client.probe(s.sessionToken, this.deps.view)
+      const view = this.view
+      if (!view) return { kind: 'destroyed' }
+      const probed = await this.deps.client.probe(s.sessionToken, view)
       if (this.destroyed) return { kind: 'destroyed' }
       if (probed.kind === 'ok') {
-        this.paused = false
+        this.setPaused(false)
         return { kind: 'ok' }
       }
       if (probed.kind === 'refused' && probed.error.code === 'unauthorized') {
@@ -207,23 +230,28 @@ export class UiViewSession {
         }
         if (reason === 'credential_invalid') {
           // This JWT is dead: nothing more goes out with it while the host rebuilds.
-          this.paused = false
           if (this.session === s) this.session = null
           return { kind: 'session_invalid', restarted, jwtExchangedAt: s.exchangedAt, at: this.deps.now() }
         }
       }
       // Timeout, 5xx, an unknown reason or an undecodable `restarted`: pause and back off.
-      this.paused = true
+      this.setPaused(true)
       if (++unknownInARow >= UI_UNKNOWN_LIMIT) return { kind: 'closed', code: 'probe_failed' }
       await this.deps.sleep(this.backoff(probed))
       if (this.destroyed) return { kind: 'destroyed' }
     }
   }
 
-  /** A renewal is an establish in the same family; any result other than unknown lifts the pause (U3.8). */
-  private async renew(): Promise<UiSessionOutcome> {
-    this.paused = false
+  /** A renewal is an establish in the same family; the pause is lifted once it brings a new JWT. */
+  private renew(): Promise<UiSessionOutcome> {
     return this.establish()
+  }
+
+  /** Lifting a pause tells the host to reload the document (U4.5). */
+  private setPaused(paused: boolean): void {
+    if (this.paused === paused) return
+    this.paused = paused
+    if (!paused && !this.destroyed) this.deps.onResume?.()
   }
 
   /** null for ok; 'retry' for an outcome U3.8 retries; otherwise how this ends. */

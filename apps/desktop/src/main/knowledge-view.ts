@@ -763,6 +763,11 @@ export class KnowledgeViewHost {
   /** What the UI session's result means for the view (U3.8, §9.2). */
   private uiEvent(instance: Instance, event: UiInstanceEvent): void {
     if (this.instance !== instance) return
+    if (event.kind === 'reload') {
+      // U4.5: what was cancelled while injection was paused is asked for again.
+      if (instance.loaded && !instance.view.webContents.isDestroyed()) instance.view.webContents.reload()
+      return
+    }
     if (event.kind === 'rebuild') {
       // View-level handling: a new instance, new vph; not a crash.
       this.log('[knowledge-view] session rejected; rebuilding the view')
@@ -829,6 +834,12 @@ export class KnowledgeViewHost {
     // U4.7: injection stops and the family is revoked before the page goes.
     try {
       instance.ui?.destroy()
+      // The partition's listeners let go of the instance (and nothing of it is used again).
+      if (instance.ui) {
+        instance.session.webRequest.onBeforeSendHeaders(null)
+        instance.session.webRequest.onCompleted(null)
+        instance.session.webRequest.onErrorOccurred(null)
+      }
     } catch (error) {
       this.log(`[knowledge-view] end UI session failed (${reason}): ${String(error)}`)
     }
