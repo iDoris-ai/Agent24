@@ -119,13 +119,30 @@ describe('KnowledgeBridgeChannel', () => {
       // A sub-frame's failure is not the main frame's.
       t.contents.emit('did-fail-provisional-load', {}, code, '', '', false)
       t.contents.emit('did-fail-provisional-load', {}, code, '', '', true)
-      t.contents.emit('did-fail-load', {}, code, '', '', true)
+      // Electron sends did-fail-load for an error page unless the code is ERR_ABORTED.
+      if (code !== -3) t.contents.emit('did-fail-load', {}, code, '', '', true)
       t.contents.emit('did-stop-loading')
       expect(t.channel.currentDocument()).toBeNull()
       expect(t.docs).toEqual([1, 'left'])
       t.contents.emit('did-navigate')
       expect(t.channel.currentDocument()).toBe(2)
     }
+  })
+
+  it('after a committed error page, a navigation that does not commit brings no document back', () => {
+    const t = setup()
+    t.contents.emit('did-navigate')
+    t.contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+    t.contents.emit('did-fail-provisional-load', {}, -102, '', '', true)
+    t.contents.emit('did-fail-load', {}, -102, '', '', true)
+    t.contents.emit('did-stop-loading')
+    // On the error page, the host reloads; the reload is a 204 and never commits.
+    t.contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+    t.contents.emit('did-stop-loading')
+    expect(t.channel.currentDocument()).toBeNull()
+    expect(t.docs).toEqual([1, 'left', 'left'])
+    t.contents.emit('did-navigate')
+    expect(t.channel.currentDocument()).toBe(2)
   })
 
   it('a sub-frame failure does not stop a pending main-frame navigation from resuming', () => {

@@ -79,6 +79,8 @@ export class KnowledgeBridgeChannel {
   private between = true
   /** A main-frame navigation started and has not committed yet. */
   private pending = false
+  /** The page shown is still `document`: false before the first commit and after a committed error page. */
+  private resumable = false
   private activatedAt: number | null = null
   private disposed = false
   private readonly listeners: Array<[string, (...args: any[]) => void]> = []
@@ -101,6 +103,7 @@ export class KnowledgeBridgeChannel {
       this.document++
       this.between = false
       this.pending = false
+      this.resumable = true
       this.bridge.newDocument(this.document)
     })
     // Electron 34 (WebContents::DidFinishNavigation) reports a main-frame
@@ -112,12 +115,14 @@ export class KnowledgeBridgeChannel {
     // commit (without did-navigate): a document the bridge never met, so it
     // stays off until the next real commit.
     this.listen('did-fail-provisional-load', (_event: unknown, _code: unknown, _description: unknown, _url: unknown, isMainFrame: unknown) => {
-      if (isMainFrame) this.pending = false
+      if (!isMainFrame) return
+      this.pending = false
+      this.resumable = false
     })
     this.listen('did-stop-loading', () => {
       if (!this.pending) return
       this.pending = false
-      if (this.document === 0) return
+      if (!this.resumable) return
       this.between = false
       this.bridge.resumeDocument(this.document)
     })
