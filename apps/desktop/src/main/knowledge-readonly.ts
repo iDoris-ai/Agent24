@@ -2,6 +2,8 @@
 // Nothing in this file writes a log: not the text, not C, not a URL query.
 
 export const READ_TIMEOUT_MS = 10_000
+/** #1662 L4: one citation across all its pages, so a slow server cannot hold a budget slot for 16 × 10 s. */
+export const READ_TOTAL_MS = 30_000
 export const READ_MAX_PAGES = 16
 export const READ_MAX_TEXT_BYTES = 256 * 1024
 
@@ -130,10 +132,10 @@ async function readBody(response: Response): Promise<unknown> {
 class TooLarge extends Error {}
 
 /** One request and its body; the timeout and the caller's abort cover both (R7.1: cancelling aborts the HTTP request). */
-async function post(deps: ReadonlyDeps, credential: string, body: unknown, signal: AbortSignal): Promise<{ status: number; json: unknown } | ChunkRead> {
+async function post(deps: ReadonlyDeps, credential: string, body: unknown, signal: AbortSignal, limitMs: number): Promise<{ status: number; json: unknown } | ChunkRead> {
   if (signal.aborted) return fail('cancelled')
   const timeout = new AbortController()
-  const timer = setTimeout(() => timeout.abort(), READ_TIMEOUT_MS)
+  const timer = setTimeout(() => timeout.abort(), limitMs)
   const onAbort = (): void => timeout.abort()
   signal.addEventListener('abort', onAbort)
   try {
@@ -183,6 +185,7 @@ export async function readCitationChunk(deps: ReadonlyDeps, generation: number, 
   let text = ''
   let title: string | null = null
   let cursor: string | null = null
+  const deadline = Date.now() + READ_TOTAL_MS
   for (let page = 1; page <= READ_MAX_PAGES; page++) {
     if (signal.aborted) return fail('cancelled')
     if (!visible()) return fail('not_found')
@@ -199,7 +202,10 @@ export async function readCitationChunk(deps: ReadonlyDeps, generation: number, 
       deadline_ms: READ_DEADLINE_MS,
     }
     if (cursor !== null) body.page = { cursor }
-    const posted = await post(deps, credential, body, signal)
+    // Each request gets at most 10 s, and never past the citation's own deadline (L4).
+    const left = deadline - Date.now()
+    if (left <= 0) return fail('timeout')
+    const posted = await post(deps, credential, body, signal, Math.min(READ_TIMEOUT_MS, left))
     if ('ok' in posted) return posted
     // R6.2: an error envelope is read by its code, whatever the HTTP status. A success is a 200 whose
     // body passes every check; only that wins over an `error` field (§0.3: unknown fields are ignored).

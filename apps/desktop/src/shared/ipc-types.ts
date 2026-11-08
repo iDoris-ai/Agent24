@@ -122,6 +122,13 @@ export const IpcChannels = {
   KnowledgeViewState: 'knowledge-view:state',
   // KB-C2-04b-1 (U7.2): one citation's plain text, or null to clear the strip.
   KnowledgeViewCitation: 'knowledge-view:citation',
+  // KB-C2-04b-2 (U7.2): the confirmation dialog. null closes it.
+  KnowledgeViewConfirm: 'knowledge-view:confirm',
+  KnowledgeViewAnswer: 'knowledge-view:answer',
+  // The conversation's draft attachments. Changed is the full list, main → renderer.
+  KnowledgeDraftChanged: 'knowledge-draft:changed',
+  KnowledgeDraftList: 'knowledge-draft:list',
+  KnowledgeDraftRemove: 'knowledge-draft:remove',
 } as const
 
 /** T1-1/T1-2: the documents module as it is on disk now. A daemon reads
@@ -170,6 +177,21 @@ export type KnowledgeViewCitation = {
   text: string
   ref: { knowledge_base_id: string; knowledge_id: string; chunk_id: string }
 } | null
+
+/** Main → renderer. null closes the dialog (U7.2). */
+export type KnowledgeViewConfirmAsk = {
+  id: string
+  count: number
+  titles: Array<string | null>
+} | null
+
+/** One draft attachment as the renderer sees it (U7.2). */
+export type KnowledgeDraftEntry = {
+  id: string
+  title: string | null
+  text: string
+  ref: { knowledge_base_id: string; knowledge_id: string; chunk_id: string }
+}
 
 export type KnowledgeSettingsResult = { ok: true } | { ok: false; reason: 'invalid' | 'not_saved' | 'unavailable' }
 

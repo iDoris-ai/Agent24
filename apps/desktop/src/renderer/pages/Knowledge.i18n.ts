@@ -24,6 +24,9 @@ export const knowledgeViewMessages = defineMessages({
     'citation.title': 'Citation',
     'citation.untitled': 'Untitled',
     'citation.dismiss': 'Close',
+    'confirm.count': '{count} selected',
+    'confirm.accept': 'Add to chat',
+    'confirm.decline': 'Not now',
   },
   zh: {
     'loading': '正在打开知识页…',
@@ -48,6 +51,9 @@ export const knowledgeViewMessages = defineMessages({
     'citation.title': '引用',
     'citation.untitled': '无标题',
     'citation.dismiss': '关闭',
+    'confirm.count': '已选 {count} 条',
+    'confirm.accept': '加入对话',
+    'confirm.decline': '先不加入',
   },
   th: {
     'loading': 'กำลังเปิดหน้าคลังความรู้…',
@@ -72,5 +78,8 @@ export const knowledgeViewMessages = defineMessages({
     'citation.title': 'การอ้างอิง',
     'citation.untitled': 'ไม่มีชื่อ',
     'citation.dismiss': 'ปิด',
+    'confirm.count': 'เลือก {count} รายการ',
+    'confirm.accept': 'เพิ่มในแชท',
+    'confirm.decline': 'ยังไม่เพิ่ม',
   },
 })

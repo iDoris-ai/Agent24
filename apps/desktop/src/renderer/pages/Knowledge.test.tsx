@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import KnowledgePage from './Knowledge'
 import { CapabilitiesContext } from '../capabilities/types'
 import { setLocale } from '../i18n'
-import type { KnowledgeViewCitation, KnowledgeViewState } from '../../shared/ipc-types'
+import type { KnowledgeViewCitation, KnowledgeViewConfirmAsk, KnowledgeViewState } from '../../shared/ipc-types'
 
 const show = vi.fn()
 const bounds = vi.fn()
@@ -13,12 +13,15 @@ const hide = vi.fn()
 const reload = vi.fn()
 let stateListener: ((s: KnowledgeViewState) => void) | null = null
 let citationListener: ((c: KnowledgeViewCitation) => void) | null = null
+let confirmListener: ((ask: KnowledgeViewConfirmAsk) => void) | null = null
+const answer = vi.fn()
 let resizeCallback: ResizeObserverCallback | null = null
 
 beforeEach(() => {
   vi.clearAllMocks()
   stateListener = null
   citationListener = null
+  confirmListener = null
   setLocale('en')
   show.mockResolvedValue({ ok: true })
   reload.mockResolvedValue({ ok: true })
@@ -30,6 +33,8 @@ beforeEach(() => {
         show, bounds, hide, reload,
         onState: (cb: (s: KnowledgeViewState) => void) => { stateListener = cb; return () => { stateListener = null } },
         onCitation: (cb: (c: KnowledgeViewCitation) => void) => { citationListener = cb; return () => { citationListener = null } },
+        onConfirm: (cb: (ask: KnowledgeViewConfirmAsk) => void) => { confirmListener = cb; return () => { confirmListener = null } },
+        answer,
       },
     },
     configurable: true,
@@ -137,6 +142,66 @@ describe('KnowledgePage', () => {
     await waitFor(() => expect(show).toHaveBeenCalled())
     act(() => citationListener?.({ title: null, text: 'body', ref: { knowledge_base_id: 'kb', knowledge_id: 'k', chunk_id: 'c' } }))
     expect(screen.getByText('Untitled')).toBeTruthy()
+    expect(screen.getByRole('complementary', { name: 'Citation' })).toBeTruthy()
+  })
+
+  const ASK = { id: 'a'.repeat(22), count: 2, titles: ['Alpha', null] as Array<string | null> }
+
+  it('the confirmation panel shows the count and the titles', async () => {
+    const { container } = render(<KnowledgePage />)
+    await waitFor(() => expect(show).toHaveBeenCalled())
+    act(() => confirmListener?.(ASK))
+    expect(screen.getByRole('dialog')).toBeTruthy()
+    expect(screen.getByText('2 selected')).toBeTruthy()
+    expect(screen.getByText('Alpha')).toBeTruthy()
+    expect(screen.getByText('Untitled')).toBeTruthy()
+    expect(container.querySelector('.knowledge-page > .knowledge-confirm')).toBeTruthy()
+    expect(container.querySelector('.knowledge-host .knowledge-confirm')).toBeNull()
+  })
+
+  it('accept answers true and opens the main chat, in that order', async () => {
+    const open = vi.fn()
+    render(<CapabilitiesContext.Provider value={{ defs: [], open, approvalsWaiting: 0 }}><KnowledgePage /></CapabilitiesContext.Provider>)
+    await waitFor(() => expect(show).toHaveBeenCalled())
+    act(() => confirmListener?.(ASK))
+    fireEvent.click(screen.getByRole('button', { name: 'Add to chat' }))
+    expect(answer).toHaveBeenCalledWith(ASK.id, true)
+    expect(open).toHaveBeenCalledWith('assistant', 'other')
+    expect(answer.mock.invocationCallOrder[0]).toBeLessThan(open.mock.invocationCallOrder[0])
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  it('decline answers false and leaves the chat where it is', async () => {
+    const open = vi.fn()
+    render(<CapabilitiesContext.Provider value={{ defs: [], open, approvalsWaiting: 0 }}><KnowledgePage /></CapabilitiesContext.Provider>)
+    await waitFor(() => expect(show).toHaveBeenCalled())
+    act(() => confirmListener?.(ASK))
+    fireEvent.click(screen.getByRole('button', { name: 'Not now' }))
+    expect(answer).toHaveBeenCalledWith(ASK.id, false)
+    expect(open).not.toHaveBeenCalled()
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  it('a null confirm closes the panel', async () => {
+    render(<KnowledgePage />)
+    await waitFor(() => expect(show).toHaveBeenCalled())
+    act(() => confirmListener?.(ASK))
+    expect(screen.getByRole('dialog')).toBeTruthy()
+    act(() => confirmListener?.(null))
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  it('hides the citation strip while the confirmation panel is showing', async () => {
+    render(<KnowledgePage />)
+    await waitFor(() => expect(show).toHaveBeenCalled())
+    act(() => citationListener?.({ title: 'T', text: 'body', ref: { knowledge_base_id: 'kb', knowledge_id: 'k', chunk_id: 'c' } }))
+    expect(screen.getByRole('complementary', { name: 'Citation' })).toBeTruthy()
+    act(() => confirmListener?.(ASK))
+    expect(screen.getByRole('dialog')).toBeTruthy()
+    expect(screen.queryByRole('complementary', { name: 'Citation' })).toBeNull()
+    expect(screen.queryByText('body')).toBeNull()
+    act(() => confirmListener?.(null))
+    expect(screen.queryByRole('dialog')).toBeNull()
     expect(screen.getByRole('complementary', { name: 'Citation' })).toBeTruthy()
   })
 })

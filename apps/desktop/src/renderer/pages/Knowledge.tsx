@@ -4,7 +4,7 @@
 // sidebar entry that opens this page comes with #1625.
 
 import { useContext, useEffect, useRef, useState } from 'react'
-import type { KnowledgeViewCitation, KnowledgeViewResult, KnowledgeViewState, KnowledgeViewTheme } from '../../shared/ipc-types'
+import type { KnowledgeViewCitation, KnowledgeViewConfirmAsk, KnowledgeViewResult, KnowledgeViewState, KnowledgeViewTheme } from '../../shared/ipc-types'
 import { CapabilitiesContext } from '../capabilities/types'
 import { useT } from '../i18n'
 import { knowledgeViewMessages } from './Knowledge.i18n'
@@ -51,9 +51,11 @@ export default function KnowledgePage(): JSX.Element {
   const [result, setResult] = useState<KnowledgeViewResult | null>(null)
   const [state, setState] = useState<KnowledgeViewState | null>(null)
   const [citation, setCitation] = useState<KnowledgeViewCitation>(null)
+  const [confirmAsk, setConfirmAsk] = useState<Exclude<KnowledgeViewConfirmAsk, null> | null>(null)
 
   useEffect(() => window.agent24.knowledgeView.onState((next) => setState(next)), [])
   useEffect(() => window.agent24.knowledgeView.onCitation((next) => setCitation(next)), [])
+  useEffect(() => window.agent24.knowledgeView.onConfirm((ask) => setConfirmAsk(ask)), [])
 
   useEffect(() => {
     const host = hostRef.current
@@ -84,6 +86,16 @@ export default function KnowledgePage(): JSX.Element {
     void window.agent24.knowledgeView.reload(rectOf(host), currentTheme(host)).then(setResult, () => setResult({ ok: false, code: 'window_unavailable' }))
   }
 
+  const acceptConfirm = (id: string): void => {
+    void window.agent24.knowledgeView.answer(id, true)
+    open('assistant', 'other')
+    setConfirmAsk(null)
+  }
+  const declineConfirm = (id: string): void => {
+    void window.agent24.knowledgeView.answer(id, false)
+    setConfirmAsk(null)
+  }
+
   const shown = shownFor(result, state)
   return (
     <div className="knowledge-page">
@@ -98,7 +110,19 @@ export default function KnowledgePage(): JSX.Element {
           </div>
         )}
       </div>
-      {citation && (
+      {confirmAsk && (
+        <section className="knowledge-confirm" role="dialog" aria-modal="false">
+          <p className="knowledge-confirm-count">{t('confirm.count', { count: confirmAsk.count })}</p>
+          <ul className="knowledge-confirm-titles">
+            {confirmAsk.titles.map((title, index) => (
+              <li key={index}>{title ?? t('citation.untitled')}</li>
+            ))}
+          </ul>
+          <button className="btn btn-primary" type="button" onClick={() => acceptConfirm(confirmAsk.id)}>{t('confirm.accept')}</button>
+          <button className="btn" type="button" onClick={() => declineConfirm(confirmAsk.id)}>{t('confirm.decline')}</button>
+        </section>
+      )}
+      {!confirmAsk && citation && (
         <aside className="knowledge-citation" aria-label={t('citation.title')}>
           <div className="knowledge-citation-title">{citation.title ?? t('citation.untitled')}</div>
           <div className="knowledge-citation-text">{citation.text}</div>
