@@ -4,7 +4,7 @@ import { app, BrowserWindow, dialog, Menu, Tray, WebContentsView, nativeImage, n
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { registerCliTool } from './ipc/cli-tool'
-import { initMainLocale, onMainLocaleChange } from './main-i18n'
+import { getMainLocale, initMainLocale, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonConnection, onDaemonReady, setBundledPackaged } from './backend-manager'
@@ -50,6 +50,10 @@ import { KNOWLEDGE_UI_ROUTES } from './knowledge-ui-routes'
 // KB-C2-03: the KnowledgeView lives in its own module; the lines that wire it
 // in below are additions only and leave the Creative view's paths untouched.
 import { KnowledgeViewHost, registerKnowledgeViewIpc, resolveKnowledgeViewTarget } from './knowledge-view'
+// KB-SOP-01a (#1669): the knowledge entry admission, additions only.
+import { createChatHistoryStore } from './chat-history'
+import { daemonFloorReader } from './knowledge-entry-floor'
+import { registerKnowledgeEntryIpc } from './knowledge-entry-ipc'
 
 const isDev = process.env.NODE_ENV === 'development'
 setBundledPackaged(app.isPackaged)
@@ -513,6 +517,19 @@ app.whenReady().then(async () => {
     hide: IpcChannels.KnowledgeViewHide,
     reload: IpcChannels.KnowledgeViewReload,
   }, () => knowledgeView)
+  registerKnowledgeEntryIpc(ipcMain, guard, {
+    conversation: (id) => createChatHistoryStore(app.getPath('userData')).get(id),
+    reader: daemonFloorReader(),
+    confirm: async (event, ask) => {
+      const win = BrowserWindow.fromWebContents(event.sender)
+      const options: Electron.MessageBoxOptions = {
+        type: 'question', buttons: [ask.confirm, ask.cancel], defaultId: 1, cancelId: 1, message: ask.message, detail: ask.detail, noLink: true,
+      }
+      const result = win ? await dialog.showMessageBox(win, options) : await dialog.showMessageBox(options)
+      return result.response === 0
+    },
+    locale: getMainLocale,
+  })
   ipcMain.handle(IpcChannels.CreativeShow, guard((_event, bounds: CreativeViewBounds) => showCreativeView(bounds)))
   ipcMain.handle(IpcChannels.CreativeRestart, guard((_event, bounds: CreativeViewBounds) => restartCreativeView(bounds)))
   ipcMain.handle(IpcChannels.CreativeBounds, guard((_event, bounds: CreativeViewBounds) => {

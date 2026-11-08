@@ -129,6 +129,8 @@ export const IpcChannels = {
   KnowledgeDraftChanged: 'knowledge-draft:changed',
   KnowledgeDraftList: 'knowledge-draft:list',
   KnowledgeDraftRemove: 'knowledge-draft:remove',
+  // KB-SOP-01a (#1669): may this conversation become a knowledge entry (main asks the user).
+  KnowledgeEntryAdmit: 'knowledge-entry:admit',
 } as const
 
 /** T1-1/T1-2: the documents module as it is on disk now. A daemon reads
@@ -192,6 +194,11 @@ export type KnowledgeDraftEntry = {
   text: string
   ref: { knowledge_base_id: string; knowledge_id: string; chunk_id: string }
 }
+
+/** KB-SOP-01a: the answer to "沉淀为知识条目" (main/knowledge-entry-ipc.ts). */
+export type KnowledgeEntryAdmission =
+  | { ok: true }
+  | { ok: false; reason: 'floor_missing' | 'restricted' | 'unknown' | 'too_many_runs' | 'not_confirmed' | 'not_found' | 'busy' }
 
 export type KnowledgeSettingsResult = { ok: true } | { ok: false; reason: 'invalid' | 'not_saved' | 'unavailable' }
 
