@@ -282,12 +282,13 @@ async function main() {
   check('no TCP connection at all to the foreign host (preconnect, ws)', connections.B === 0, connections.B)
 
   const wc = view().webContents
+  const originOf = (u) => { try { return new URL(u).origin } catch { return null } }
   await wc.executeJavaScript(`location.href = ${JSON.stringify(`${originB}/nav`)}`)
   await new Promise((d) => setTimeout(d, 700))
-  check('cross-origin navigation refused', wc.getURL().startsWith(a.origin) && !hits.B.includes('/nav'), wc.getURL())
+  check('cross-origin navigation refused', originOf(wc.getURL()) === a.origin && !hits.B.includes('/nav'), wc.getURL())
   await wc.executeJavaScript(`location.href = 'file:///etc/hosts'`)
   await new Promise((d) => setTimeout(d, 500))
-  check('file:// navigation refused', wc.getURL().startsWith(a.origin), wc.getURL())
+  check('file:// navigation refused', originOf(wc.getURL()) === a.origin, wc.getURL())
 
   // A second profile: a new instance in a new partition that sees nothing of the first.
   const firstSession = session.fromPartition(partitions[0], { cache: false })
@@ -324,8 +325,10 @@ async function main() {
   check('control probe finished', rc.stage === 'done' && !rc.error && !rc.unfinished && rc.timedOut?.length === 0, { stage: rc.stage, error: rc.error, unfinished: rc.unfinished, timedOut: rc.timedOut })
   await new Promise((d) => setTimeout(d, 500))
   const viewOrigin = new URL(a.origin)
+  const asked = controlAsked[0]
   check('control: the host still asked for its dead proxy', controlAsked.length === 1
-    && JSON.stringify(controlAsked[0]).includes(`<-loopback>;${viewOrigin.host}`), controlAsked)
+    && asked.mode === 'fixed_servers' && /^http:\/\/127\.0\.0\.1:[1-9][0-9]*$/.test(asked.proxyRules)
+    && asked.proxyBypassRules === `<-loopback>;${viewOrigin.host}`, controlAsked)
   check('control: foreign host refused by webRequest and the CSP alone (no dead proxy)',
     rc.foreignFetch === 'blocked' && rc.foreignImg === 'blocked' && rc.ws !== 'open' && rc.redirect === 'blocked'
       && connections.B === base.B && hits.B.length === base.hitsB,
@@ -334,8 +337,8 @@ async function main() {
   const controlIce = connections.ICE - base.ICE
   check('control: TURN-over-TCP gets out without the dead proxy (so the 0 above is the proxy)', rc.turn === 'ran' && controlTurn >= 1, { turn: rc.turn, connections: controlTurn })
   // ICE-TCP is conclusive only when the control connects: a TCP-active
-  // candidate alone may be IPv6 and never pair with the IPv4 port the probe
-  // hands it (#1649 PR-Daemon L2).
+  // candidate alone may be of the other address family and never pair with
+  // the port the probe hands it (#1649 PR-Daemon L2).
   const iceConclusive = controlIce >= 1
   check('control: the ICE-TCP 0 above is conclusive', rc.iceTcp === 'ran' && iceConclusive,
     { ...(iceConclusive ? {} : { inconclusive: 'no ICE-TCP connection even without the dead proxy' }), control: iceEvidence(rc, controlIce), profile1Local: r1.iceLocal })
