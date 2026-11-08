@@ -1,0 +1,789 @@
+{
+  "$comment": "CONTRACT-OPS-v2 §8 schema cases. schema names map to protocol/knowledge/ops-v2/<file>.schema.json#/$defs/<def> (candidate.*, entry.*). Both knowledge-ops-v2.test.ts (Ajv) and knowledge_ops_v2.rs (jsonschema) must give every case its valid verdict.",
+  "cases": [
+    {
+      "name": "submit create",
+      "schema": "candidate.submit_request",
+      "valid": true,
+      "doc": {
+        "idempotency_key": "k7Qx2mN4pR8sT1vW3yZ5bA",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "provenance": {
+          "source": "agent24_conversation",
+          "session_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message_range": [
+            2,
+            7
+          ],
+          "skill_version": "knowledge-entry/1",
+          "redaction_rules_version": 1
+        }
+      }
+    },
+    {
+      "name": "submit revise",
+      "schema": "candidate.submit_request",
+      "valid": true,
+      "doc": {
+        "idempotency_key": "k7Qx2mN4pR8sT1vW3yZ5bA",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "revise",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "provenance": {
+          "source": "agent24_conversation",
+          "session_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message_range": [
+            2,
+            7
+          ],
+          "skill_version": "knowledge-entry/1",
+          "redaction_rules_version": 1
+        },
+        "knowledge_id": "doc-9",
+        "expected_source_revision": "srev-3"
+      }
+    },
+    {
+      "name": "submit revise without base revision",
+      "schema": "candidate.submit_request",
+      "valid": false,
+      "doc": {
+        "idempotency_key": "k7Qx2mN4pR8sT1vW3yZ5bA",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "revise",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "provenance": {
+          "source": "agent24_conversation",
+          "session_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message_range": [
+            2,
+            7
+          ],
+          "skill_version": "knowledge-entry/1",
+          "redaction_rules_version": 1
+        },
+        "knowledge_id": "doc-9"
+      }
+    },
+    {
+      "name": "submit create with knowledge_id",
+      "schema": "candidate.submit_request",
+      "valid": false,
+      "doc": {
+        "idempotency_key": "k7Qx2mN4pR8sT1vW3yZ5bA",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "provenance": {
+          "source": "agent24_conversation",
+          "session_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message_range": [
+            2,
+            7
+          ],
+          "skill_version": "knowledge-entry/1",
+          "redaction_rules_version": 1
+        },
+        "knowledge_id": "doc-9"
+      }
+    },
+    {
+      "name": "submit unknown kind",
+      "schema": "candidate.submit_request",
+      "valid": false,
+      "doc": {
+        "idempotency_key": "k7Qx2mN4pR8sT1vW3yZ5bA",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "kind": "policy",
+        "title": "请假流程 🌿",
+        "body": "## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "provenance": {
+          "source": "agent24_conversation",
+          "session_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message_range": [
+            2,
+            7
+          ],
+          "skill_version": "knowledge-entry/1",
+          "redaction_rules_version": 1
+        }
+      }
+    },
+    {
+      "name": "submit title with leading space",
+      "schema": "candidate.submit_request",
+      "valid": false,
+      "doc": {
+        "idempotency_key": "k7Qx2mN4pR8sT1vW3yZ5bA",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "kind": "sop",
+        "title": " 请假",
+        "body": "## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "provenance": {
+          "source": "agent24_conversation",
+          "session_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message_range": [
+            2,
+            7
+          ],
+          "skill_version": "knowledge-entry/1",
+          "redaction_rules_version": 1
+        }
+      }
+    },
+    {
+      "name": "submit title with CR",
+      "schema": "candidate.submit_request",
+      "valid": false,
+      "doc": {
+        "idempotency_key": "k7Qx2mN4pR8sT1vW3yZ5bA",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "kind": "sop",
+        "title": "a\rb",
+        "body": "## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "provenance": {
+          "source": "agent24_conversation",
+          "session_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message_range": [
+            2,
+            7
+          ],
+          "skill_version": "knowledge-entry/1",
+          "redaction_rules_version": 1
+        }
+      }
+    },
+    {
+      "name": "submit body with CR",
+      "schema": "candidate.submit_request",
+      "valid": false,
+      "doc": {
+        "idempotency_key": "k7Qx2mN4pR8sT1vW3yZ5bA",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "a\r\nb",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "provenance": {
+          "source": "agent24_conversation",
+          "session_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message_range": [
+            2,
+            7
+          ],
+          "skill_version": "knowledge-entry/1",
+          "redaction_rules_version": 1
+        }
+      }
+    },
+    {
+      "name": "submit empty title",
+      "schema": "candidate.submit_request",
+      "valid": false,
+      "doc": {
+        "idempotency_key": "k7Qx2mN4pR8sT1vW3yZ5bA",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "kind": "sop",
+        "title": "",
+        "body": "## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "provenance": {
+          "source": "agent24_conversation",
+          "session_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message_range": [
+            2,
+            7
+          ],
+          "skill_version": "knowledge-entry/1",
+          "redaction_rules_version": 1
+        }
+      }
+    },
+    {
+      "name": "submit uppercase hash",
+      "schema": "candidate.submit_request",
+      "valid": false,
+      "doc": {
+        "idempotency_key": "k7Qx2mN4pR8sT1vW3yZ5bA",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管",
+        "content_sha256": "CD192D152A12CFE33EA1AE7687E0653D911E24971EDFC4BCA2146CF8BBFBF30F",
+        "provenance": {
+          "source": "agent24_conversation",
+          "session_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message_range": [
+            2,
+            7
+          ],
+          "skill_version": "knowledge-entry/1",
+          "redaction_rules_version": 1
+        }
+      }
+    },
+    {
+      "name": "submit short idempotency key",
+      "schema": "candidate.submit_request",
+      "valid": false,
+      "doc": {
+        "idempotency_key": "short",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "provenance": {
+          "source": "agent24_conversation",
+          "session_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message_range": [
+            2,
+            7
+          ],
+          "skill_version": "knowledge-entry/1",
+          "redaction_rules_version": 1
+        }
+      }
+    },
+    {
+      "name": "submit carries an approved flag",
+      "schema": "candidate.submit_request",
+      "valid": false,
+      "doc": {
+        "idempotency_key": "k7Qx2mN4pR8sT1vW3yZ5bA",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "provenance": {
+          "source": "agent24_conversation",
+          "session_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message_range": [
+            2,
+            7
+          ],
+          "skill_version": "knowledge-entry/1",
+          "redaction_rules_version": 1
+        },
+        "approved": true
+      }
+    },
+    {
+      "name": "submit carries expected_policy_version",
+      "schema": "candidate.submit_request",
+      "valid": false,
+      "doc": {
+        "idempotency_key": "k7Qx2mN4pR8sT1vW3yZ5bA",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "provenance": {
+          "source": "agent24_conversation",
+          "session_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message_range": [
+            2,
+            7
+          ],
+          "skill_version": "knowledge-entry/1",
+          "redaction_rules_version": 1
+        },
+        "expected_policy_version": "p1"
+      }
+    },
+    {
+      "name": "submit provenance with conversation text",
+      "schema": "candidate.submit_request",
+      "valid": false,
+      "doc": {
+        "idempotency_key": "k7Qx2mN4pR8sT1vW3yZ5bA",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "provenance": {
+          "source": "agent24_conversation",
+          "session_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message_range": [
+            2,
+            7
+          ],
+          "skill_version": "knowledge-entry/1",
+          "redaction_rules_version": 1,
+          "text": "hi"
+        }
+      }
+    },
+    {
+      "name": "submit provenance session_ref not hex",
+      "schema": "candidate.submit_request",
+      "valid": false,
+      "doc": {
+        "idempotency_key": "k7Qx2mN4pR8sT1vW3yZ5bA",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "provenance": {
+          "source": "agent24_conversation",
+          "session_ref": "chat_abc",
+          "message_range": [
+            2,
+            7
+          ],
+          "skill_version": "knowledge-entry/1",
+          "redaction_rules_version": 1
+        }
+      }
+    },
+    {
+      "name": "submit provenance range of three",
+      "schema": "candidate.submit_request",
+      "valid": false,
+      "doc": {
+        "idempotency_key": "k7Qx2mN4pR8sT1vW3yZ5bA",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "provenance": {
+          "source": "agent24_conversation",
+          "session_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message_range": [
+            1,
+            2,
+            3
+          ],
+          "skill_version": "knowledge-entry/1",
+          "redaction_rules_version": 1
+        }
+      }
+    },
+    {
+      "name": "submit provenance range negative",
+      "schema": "candidate.submit_request",
+      "valid": false,
+      "doc": {
+        "idempotency_key": "k7Qx2mN4pR8sT1vW3yZ5bA",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "provenance": {
+          "source": "agent24_conversation",
+          "session_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message_range": [
+            -1,
+            2
+          ],
+          "skill_version": "knowledge-entry/1",
+          "redaction_rules_version": 1
+        }
+      }
+    },
+    {
+      "name": "submit provenance rules version zero",
+      "schema": "candidate.submit_request",
+      "valid": false,
+      "doc": {
+        "idempotency_key": "k7Qx2mN4pR8sT1vW3yZ5bA",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "provenance": {
+          "source": "agent24_conversation",
+          "session_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message_range": [
+            2,
+            7
+          ],
+          "skill_version": "knowledge-entry/1",
+          "redaction_rules_version": 0
+        }
+      }
+    },
+    {
+      "name": "submit response",
+      "schema": "candidate.submit_response",
+      "valid": true,
+      "doc": {
+        "candidate_id": "cand-1",
+        "status": "submitted",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "submitted_at": "2026-11-09T12:00:00Z"
+      }
+    },
+    {
+      "name": "submit response existing",
+      "schema": "candidate.submit_response",
+      "valid": true,
+      "doc": {
+        "candidate_id": "cand-1",
+        "status": "submitted",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "submitted_at": "2026-11-09T12:00:00Z",
+        "details": {
+          "outcome": "existing"
+        }
+      }
+    },
+    {
+      "name": "submit response other status",
+      "schema": "candidate.submit_response",
+      "valid": false,
+      "doc": {
+        "candidate_id": "cand-1",
+        "status": "approved",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "submitted_at": "2026-11-09T12:00:00Z"
+      }
+    },
+    {
+      "name": "withdraw request",
+      "schema": "candidate.withdraw_request",
+      "valid": true,
+      "doc": {
+        "candidate_id": "cand-1"
+      }
+    },
+    {
+      "name": "withdraw response already",
+      "schema": "candidate.withdraw_response",
+      "valid": true,
+      "doc": {
+        "candidate_id": "cand-1",
+        "status": "withdrawn",
+        "details": {
+          "already": true
+        }
+      }
+    },
+    {
+      "name": "return request with note",
+      "schema": "candidate.return_request",
+      "valid": true,
+      "doc": {
+        "candidate_id": "cand-1",
+        "note": "请补充审批人"
+      }
+    },
+    {
+      "name": "return request note too long",
+      "schema": "candidate.return_request",
+      "valid": false,
+      "doc": {
+        "candidate_id": "cand-1",
+        "note": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+    },
+    {
+      "name": "return response",
+      "schema": "candidate.return_response",
+      "valid": true,
+      "doc": {
+        "candidate_id": "cand-1",
+        "status": "returned",
+        "return_reason": "reviewer"
+      }
+    },
+    {
+      "name": "approve request",
+      "schema": "candidate.approve_request",
+      "valid": true,
+      "doc": {
+        "candidate_id": "cand-1",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f"
+      }
+    },
+    {
+      "name": "approve request without hash",
+      "schema": "candidate.approve_request",
+      "valid": false,
+      "doc": {
+        "candidate_id": "cand-1"
+      }
+    },
+    {
+      "name": "approve request with approved flag",
+      "schema": "candidate.approve_request",
+      "valid": false,
+      "doc": {
+        "candidate_id": "cand-1",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "approved": true
+      }
+    },
+    {
+      "name": "approve request with idempotency key",
+      "schema": "candidate.approve_request",
+      "valid": false,
+      "doc": {
+        "candidate_id": "cand-1",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "idempotency_key": "k7Qx2mN4pR8sT1vW3yZ5bA"
+      }
+    },
+    {
+      "name": "approve response",
+      "schema": "candidate.approve_response",
+      "valid": true,
+      "doc": {
+        "candidate_id": "cand-1",
+        "status": "approved",
+        "knowledge_id": "doc-12",
+        "source_revision": "srev-1",
+        "job_id": "job-5",
+        "author_is_approver": true
+      }
+    },
+    {
+      "name": "approve response dedup hit",
+      "schema": "candidate.approve_response",
+      "valid": true,
+      "doc": {
+        "candidate_id": "cand-1",
+        "status": "approved",
+        "knowledge_id": "doc-12",
+        "source_revision": "srev-1",
+        "job_id": null,
+        "author_is_approver": true,
+        "details": {
+          "outcome": "existing"
+        }
+      }
+    },
+    {
+      "name": "approve response null job without dedup",
+      "schema": "candidate.approve_response",
+      "valid": false,
+      "doc": {
+        "candidate_id": "cand-1",
+        "status": "approved",
+        "knowledge_id": "doc-12",
+        "source_revision": "srev-1",
+        "job_id": null,
+        "author_is_approver": true
+      }
+    },
+    {
+      "name": "approve response missing author_is_approver",
+      "schema": "candidate.approve_response",
+      "valid": false,
+      "doc": {
+        "candidate_id": "cand-1",
+        "status": "approved",
+        "knowledge_id": "doc-12",
+        "source_revision": "srev-1",
+        "job_id": "job-5"
+      }
+    },
+    {
+      "name": "view submitted",
+      "schema": "candidate.view",
+      "valid": true,
+      "doc": {
+        "candidate_id": "cand-1",
+        "status": "submitted",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "正文",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "submitted_at": "2026-11-09T12:00:00Z",
+        "updated_at": "2026-11-09T12:00:00Z"
+      }
+    },
+    {
+      "name": "view returned after deletion",
+      "schema": "candidate.view",
+      "valid": true,
+      "doc": {
+        "candidate_id": "cand-1",
+        "status": "returned",
+        "kind": "sop",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "submitted_at": "2026-11-09T12:00:00Z",
+        "updated_at": "2026-11-09T12:00:00Z",
+        "return_reason": "conflicted"
+      }
+    },
+    {
+      "name": "view returned without reason",
+      "schema": "candidate.view",
+      "valid": false,
+      "doc": {
+        "candidate_id": "cand-1",
+        "status": "returned",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "正文",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "submitted_at": "2026-11-09T12:00:00Z",
+        "updated_at": "2026-11-09T12:00:00Z"
+      }
+    },
+    {
+      "name": "view submitted with reason",
+      "schema": "candidate.view",
+      "valid": false,
+      "doc": {
+        "candidate_id": "cand-1",
+        "status": "submitted",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "正文",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "submitted_at": "2026-11-09T12:00:00Z",
+        "updated_at": "2026-11-09T12:00:00Z",
+        "return_reason": "reviewer"
+      }
+    },
+    {
+      "name": "view approved",
+      "schema": "candidate.view",
+      "valid": true,
+      "doc": {
+        "candidate_id": "cand-1",
+        "status": "approved",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "正文",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "submitted_at": "2026-11-09T12:00:00Z",
+        "updated_at": "2026-11-09T12:00:00Z",
+        "knowledge_id": "doc-12",
+        "source_revision": "srev-1",
+        "author_is_approver": false
+      }
+    },
+    {
+      "name": "view approved missing result",
+      "schema": "candidate.view",
+      "valid": false,
+      "doc": {
+        "candidate_id": "cand-1",
+        "status": "approved",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "正文",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "submitted_at": "2026-11-09T12:00:00Z",
+        "updated_at": "2026-11-09T12:00:00Z"
+      }
+    },
+    {
+      "name": "view later kind",
+      "schema": "candidate.view",
+      "valid": true,
+      "doc": {
+        "candidate_id": "cand-1",
+        "status": "submitted",
+        "kind": "checklist",
+        "title": "请假流程 🌿",
+        "body": "正文",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "create",
+        "submitted_at": "2026-11-09T12:00:00Z",
+        "updated_at": "2026-11-09T12:00:00Z"
+      }
+    },
+    {
+      "name": "view revise without base",
+      "schema": "candidate.view",
+      "valid": false,
+      "doc": {
+        "candidate_id": "cand-1",
+        "status": "submitted",
+        "kind": "sop",
+        "title": "请假流程 🌿",
+        "body": "正文",
+        "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+        "target_knowledge_base_id": "kb-ops-1",
+        "mode": "revise",
+        "submitted_at": "2026-11-09T12:00:00Z",
+        "updated_at": "2026-11-09T12:00:00Z",
+        "knowledge_id": "doc-9"
+      }
+    },
+    {
+      "name": "entry withdraw request",
+      "schema": "entry.withdraw_request",
+      "valid": true,
+      "doc": {
+        "knowledge_id": "doc-12"
+      }
+    },
+    {
+      "name": "entry withdraw response already",
+      "schema": "entry.withdraw_response",
+      "valid": true,
+      "doc": {
+        "knowledge_id": "doc-12",
+        "withdrawn": true,
+        "details": {
+          "already": true
+        }
+      }
+    },
+    {
+      "name": "entry withdraw response false",
+      "schema": "entry.withdraw_response",
+      "valid": false,
+      "doc": {
+        "knowledge_id": "doc-12",
+        "withdrawn": false
+      }
+    }
+  ]
+}

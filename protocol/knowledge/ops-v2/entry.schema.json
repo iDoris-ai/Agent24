@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/iDoris-ai/Agent24/protocol/knowledge/ops-v2/entry.schema.json",
+  "title": "Agent24 Knowledge OPS v2 — entry.withdraw",
+  "description": "Taking a published knowledge entry down (CONTRACT-OPS-v2 W8.10). Naturally idempotent: a repeat answers details.already.",
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "withdraw_request": {
+      "type": "object", "additionalProperties": false, "required": ["knowledge_id"],
+      "properties": { "knowledge_id": { "$ref": "#/$defs/id" } }
+    },
+    "withdraw_response": {
+      "type": "object", "additionalProperties": false, "required": ["knowledge_id", "withdrawn"],
+      "properties": {
+        "knowledge_id": { "$ref": "#/$defs/id" },
+        "withdrawn": { "const": true },
+        "details": { "type": "object", "additionalProperties": false, "properties": { "already": { "const": true } } }
+      }
+    }
+  }
+}

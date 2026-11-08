@@ -1,0 +1,38 @@
+{
+  "$comment": "CONTRACT-OPS-v2 W8.13 hash scheme 1: sha256(UTF-8(JSON.stringify([1, kind, title, body]))), lowercase hex. serialized is the exact string hashed. Both knowledge-ops-v2.test.ts and knowledge_ops_v2.rs recompute every sha256.",
+  "scheme": 1,
+  "samples": [
+    {
+      "name": "ascii-note",
+      "kind": "note",
+      "title": "VPN setup",
+      "body": "1. Open the client\n2. Sign in",
+      "sha256": "dc2552272966f63f77d27dcceb7dd489ccf1129aa70fd803a654542ff679302c",
+      "serialized": "[1,\"note\",\"VPN setup\",\"1. Open the client\\n2. Sign in\"]"
+    },
+    {
+      "name": "zh-sop-emoji",
+      "kind": "sop",
+      "title": "请假流程 🌿",
+      "body": "## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管",
+      "sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+      "serialized": "[1,\"sop\",\"请假流程 🌿\",\"## 步骤\\n\\n1. 打开「人事」系统\\n2. 提交申请 🙂\\n\\n> 审批人：直属主管\"]"
+    },
+    {
+      "name": "faq-empty-body",
+      "kind": "faq",
+      "title": "空正文也可以",
+      "body": "",
+      "sha256": "08edefbebcffd610f7fc1c349e256ff334693c582b681cc8ea49f1d31135a7f9",
+      "serialized": "[1,\"faq\",\"空正文也可以\",\"\"]"
+    },
+    {
+      "name": "control-and-tab",
+      "kind": "note",
+      "title": "引号 \" 与反斜杠 \\",
+      "body": "列1\t列2\n\u0001结尾",
+      "sha256": "b5ab5a1bfb076d71cf540e369d8cbc30a4c13d9bb3ce442c03b6147aeedecf1e",
+      "serialized": "[1,\"note\",\"引号 \\\" 与反斜杠 \\\\\",\"列1\\t列2\\n\\u0001结尾\"]"
+    }
+  ]
+}
