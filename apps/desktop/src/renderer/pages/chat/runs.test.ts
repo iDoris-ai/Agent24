@@ -1,0 +1,70 @@
+// @vitest-environment jsdom
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createChatHistoryStore, onChatHistoryChange } from '../../../main/chat-history'
+import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord, type ChatHistorySummary } from '../../../shared/chat-history'
+import { deleteConversation, getHistoryState, promoteRun, resetHistoryStore, saveConversation, subscribeHistory } from './history'
+
+// M4 A2: the page's side of a conversation's runs, against main's real store
+// behind a bridge that calls it as the IPC handlers and main.ts do.
+
+let dir: string
+let store: ReturnType<typeof createChatHistoryStore>
+const wrap = <A extends unknown[], R>(f: (...a: A) => R) => vi.fn(async (...a: A) => f(...a))
+
+function record(id: string, prompt: string, at = '2026-11-08T01:00:00.000Z'): ChatHistoryRecord {
+  return {
+    format: CHAT_HISTORY_FORMAT, version: CHAT_HISTORY_VERSION, id, title: prompt, title_source: 'prompt',
+    group_id: null, archived_at: null, created_at: at, updated_at: at, runs: [], pending: [],
+    messages: [{ role: 'user', content: prompt, at, delivered: true }],
+  }
+}
+const item = (id: string) => getHistoryState().items.find(i => i.id === id)
+const flush = () => new Promise<void>(resolve => setTimeout(resolve, 0))
+
+beforeEach(() => {
+  dir = fs.mkdtempSync(path.join(os.tmpdir(), 'runs-'))
+  store = createChatHistoryStore(dir)
+  const changed = new Set<(s: ChatHistorySummary) => void>()
+  // main.ts forwards main's own changes to the window.
+  onChatHistoryChange(summary => { for (const cb of changed) cb(summary) })
+  const bridge = {
+    list: wrap(() => store.list()), get: wrap((id: string) => store.get(id)), save: wrap((r: unknown) => store.save(r)),
+    delete: wrap((id: string) => store.delete(id)), clear: wrap(() => store.clear()),
+    promoteRun: wrap((id: string, runId: string) => store.promoteRun(id, runId)),
+    onChanged: (cb: (s: ChatHistorySummary) => void) => { changed.add(cb); return () => changed.delete(cb) },
+  }
+  Object.defineProperty(window, 'agent24', { value: { chatHistory: bridge }, writable: true, configurable: true })
+  resetHistoryStore()
+})
+afterEach(() => { onChatHistoryChange(null); fs.rmSync(dir, { recursive: true, force: true }) })
+
+describe('a conversation\'s runs on the page (M4 A2)', () => {
+  it('promoteRun shows the task from what main wrote', async () => {
+    await saveConversation(record('chat_a', '周报'))
+    expect(item('chat_a')?.tasks).toEqual([])
+    expect(await promoteRun('chat_a', 'run_1')).toBe(true)
+    expect(item('chat_a')?.tasks).toEqual([expect.objectContaining({ run_id: 'run_1', kind: 'task' })])
+  })
+
+  it('promoteRun of a conversation not on file, or deleted meanwhile, shows nothing', async () => {
+    expect(await promoteRun('chat_none', 'run_1')).toBe(false)
+    await saveConversation(record('chat_a', '周报'))
+    const promoted = promoteRun('chat_a', 'run_1')
+    await deleteConversation('chat_a')
+    expect(await promoted).toBe(false)
+    expect(item('chat_a')).toBeUndefined()
+  })
+
+  it('reads the list again when main\'s own modules change a conversation', async () => {
+    const off = subscribeHistory(() => {})
+    await saveConversation(record('chat_a', '周报'))
+    // A schedule's run, recorded by a main module (A5), not by the page.
+    store.appendRun('chat_a', 'run_9', 'schedule')
+    await flush()
+    expect(item('chat_a')?.tasks).toEqual([expect.objectContaining({ run_id: 'run_9', kind: 'schedule' })])
+    off()
+  })
+})

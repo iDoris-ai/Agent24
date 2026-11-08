@@ -1,4 +1,7 @@
 // UI-02: the main chat's history, kept by the desktop app on this machine.
+// M4 A2: version 2 adds the runs each conversation started and what in it
+// waits on the user (docs/ui/ASSISTANT-A.md). There is no version 1 data to
+// keep: a version 1 file is not read and not migrated.
 //
 // A stopgap until the main chat runs through daemon sessions: the file says
 // what it is (`format`, `version`) and stamps every message with a time, and a
@@ -7,7 +10,7 @@
 // purpose rather than guess.
 
 export const CHAT_HISTORY_FORMAT = 'agent24.desktop.chat-history'
-export const CHAT_HISTORY_VERSION = 1
+export const CHAT_HISTORY_VERSION = 2
 
 /** The chat's `session_id` (the daemon's memory key for the conversation)
  *  doubles as the record id. Only these characters, so an id is always a
@@ -42,8 +45,7 @@ export type ChatHistoryMessage =
 
 /** Where a conversation's title came from, strongest first: the user's
  *  rename, a title the model wrote, or the first prompt cut short. A weaker
- *  title never replaces a stronger one (main/chat-history.ts). Added within
- *  version 1: a file without it has the first prompt's title. */
+ *  title never replaces a stronger one (main/chat-history.ts). */
 export type ChatHistoryTitleSource = 'user' | 'model' | 'prompt'
 export const CHAT_HISTORY_TITLE_SOURCES: readonly ChatHistoryTitleSource[] = ['user', 'model', 'prompt']
 
@@ -54,14 +56,65 @@ export interface ChatHistoryRecord {
   title: string
   title_source: ChatHistoryTitleSource
   /** UI-06: the group the user put the conversation in, or null. A group
-   *  that no longer exists counts as none. Added within version 1. */
+   *  that no longer exists counts as none. */
   group_id: string | null
-  /** UI-06: when the user archived it (UTC ISO), or null. Added within
-   *  version 1. Only `organize` changes these two; a save keeps them. */
+  /** UI-06: when the user archived it (UTC ISO), or null. Only `organize`
+   *  changes these two; a save keeps them. */
   archived_at: string | null
   created_at: string
   updated_at: string
   messages: ChatHistoryMessage[]
+  /** M4 A2: the runs this conversation started, oldest first. Main keeps
+   *  them; a save from the page never sets them. */
+  runs: ChatHistoryRun[]
+  /** M4 A2: what in this conversation waits on the user. Main keeps them. */
+  pending: ChatHistoryPending[]
+}
+
+/** M4 A2: what a run is to its conversation. Every run starts as `answer`
+ *  (a reply, never shown as a task); it becomes a `task` only when
+ *  `promotionDue` says so or the user hands it over (A4). `schedule`: a run
+ *  a schedule started, recorded in that schedule's conversation (A5). */
+export type ChatHistoryRunKind = 'answer' | 'task' | 'schedule'
+export const CHAT_HISTORY_RUN_KINDS: readonly ChatHistoryRunKind[] = ['answer', 'task', 'schedule']
+
+export interface ChatHistoryRun {
+  run_id: string
+  kind: ChatHistoryRunKind
+  /** UTC ISO, when the conversation first knew of the run. */
+  started_at: string
+}
+
+/** M4 A2: `approval`: a run waits on an approval; `confirm`: something else
+ *  waits on the user's yes or no (e.g. a Knowledge confirmation, A7). */
+export type ChatHistoryPendingKind = 'approval' | 'confirm'
+export const CHAT_HISTORY_PENDING_KINDS: readonly ChatHistoryPendingKind[] = ['approval', 'confirm']
+
+export interface ChatHistoryPending {
+  /** Unique within the conversation; whoever sets it clears it by it. */
+  id: string
+  kind: ChatHistoryPendingKind
+  run_id?: string
+  /** What the user is asked, as shown in the list. */
+  label: string
+  /** UTC ISO, when it started waiting. */
+  at: string
+}
+
+/** M4 A2: what is seen of a run, for `promotionDue`. `replyEnded`: the page
+ *  stopped waiting for the reply (its stream or its polling ended). */
+export interface ChatHistoryRunObservation {
+  status: string
+  replyEnded: boolean
+}
+
+/** M4 A2: an `answer` run becomes a `task` when it waits on an approval, or
+ *  when the page stopped waiting for its reply and the run still goes on.
+ *  Nothing else promotes a run on its own; the user's "hand it to the
+ *  assistant" (A4) promotes it directly. */
+export function promotionDue(seen: ChatHistoryRunObservation): boolean {
+  if (seen.status === 'awaiting_approval') return true
+  return seen.replyEnded && (seen.status === 'queued' || seen.status === 'running')
 }
 
 /** A group's id: only these characters, so it can never be a file name or
@@ -99,9 +152,12 @@ export interface ChatHistoryOrganize {
 /** What the history list shows and searches: the record without its
  *  messages, plus the start of its first prompt (UI-04 T3). */
 export interface ChatHistorySummary extends Pick<ChatHistoryRecord,
-  'id' | 'title' | 'title_source' | 'group_id' | 'archived_at' | 'created_at' | 'updated_at'> {
+  'id' | 'title' | 'title_source' | 'group_id' | 'archived_at' | 'created_at' | 'updated_at' | 'pending'> {
   /** The first prompt on one line, at most `FIRST_PROMPT_CHARS` characters. */
   first_prompt: string
+  /** M4 A2: the conversation's tasks: its runs other than answers, which the
+   *  list never shows. */
+  tasks: ChatHistoryRun[]
 }
 
 /** Characters of the first prompt a summary carries. */
@@ -139,5 +195,6 @@ export function chatHistorySummary(r: ChatHistoryRecord): ChatHistorySummary {
   return {
     id: r.id, title: r.title, title_source: r.title_source, group_id: r.group_id, archived_at: r.archived_at,
     created_at: r.created_at, updated_at: r.updated_at, first_prompt: chars.join(''),
+    tasks: r.runs.filter(run => run.kind !== 'answer'), pending: r.pending,
   }
 }

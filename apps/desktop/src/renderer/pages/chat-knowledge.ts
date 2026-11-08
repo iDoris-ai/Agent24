@@ -21,6 +21,8 @@ export type KnowledgeTurn =
 
 export interface TurnDeps {
   proxy: Proxy
+  /** M4 A2: told the run's id once the daemon has made it. */
+  onRunStarted?: (runId: string) => void
   /** Told each time the run waits on an approval, and once it no longer does. */
   onAwaitingApproval?: (waiting: boolean) => void
   sleep?: (ms: number) => Promise<void>
@@ -51,6 +53,7 @@ export async function askWithKnowledge(prompt: string, sessionId: string, deps: 
   const created = await deps.proxy({ method: 'POST', path: '/api/v1/runs', body })
   const runId = (created.data as { id?: unknown } | null)?.id
   if (!created.ok || typeof runId !== 'string') return failure(created.data, 'run_not_started')
+  deps.onRunStarted?.(runId)
   const deadline = now() + MAX_WAIT_MS
   let waiting = false
   while (now() < deadline) {

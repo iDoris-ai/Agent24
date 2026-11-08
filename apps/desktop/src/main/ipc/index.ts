@@ -660,6 +660,7 @@ export function registerIpcHandlers(options: {
   handle(IpcChannels.ChatHistorySetTitle, (_event, id: unknown, title: unknown, source: unknown) =>
     chatHistory().setTitle(id, title, source))
   handle(IpcChannels.ChatHistoryOrganize, (_event, id: unknown, patch: unknown) => chatHistory().organize(id, patch))
+  handle(IpcChannels.ChatHistoryPromoteRun, (_event, id: unknown, runId: unknown) => chatHistory().promoteRun(id, runId))
   handle(IpcChannels.ChatGroupsGet, () => chatHistory().groups())
   handle(IpcChannels.ChatGroupsCreate, (_event, name: unknown) => chatHistory().createGroup(name))
   handle(IpcChannels.ChatGroupsRename, (_event, id: unknown, name: unknown) => chatHistory().renameGroup(id, name))

@@ -40,8 +40,22 @@ function set(patch: Partial<HistoryState>): void {
 
 export const getHistoryState = (): HistoryState => state
 export function subscribeHistory(listener: () => void): () => void {
+  listenToMain()
   listeners.add(listener)
   return () => listeners.delete(listener)
+}
+
+/** M4 A2: main's own modules change a conversation's runs and waiting items
+ *  (a schedule's run, a Knowledge confirmation); main tells the window, and
+ *  the list is read again. Such changes are rare, and the read is ordered
+ *  against saves and deletions like any other. */
+let listening = false
+function listenToMain(): void {
+  if (listening) return
+  const onChanged = api()?.onChanged
+  if (!onChanged) return
+  listening = true
+  onChanged(() => { void refreshHistory() })
 }
 
 /** Reads the list again from main. Failures leave the list as it was. A
@@ -168,6 +182,20 @@ export async function archiveConversation(id: string): Promise<boolean> {
  *  still exists. */
 export function restoreConversation(id: string): Promise<boolean> {
   return organize(id, { archived: false })
+}
+
+/** M4 A2: a run of a saved conversation becomes a task (`promotionDue`, or
+ *  the user handed it over). False when there was no such conversation, or
+ *  it failed; a conversation deleted meanwhile stays deleted. */
+export async function promoteRun(id: string, runId: string): Promise<boolean> {
+  const history = api()
+  if (!history) return false
+  const mine = ++seq
+  const summary = await history.promoteRun(id, runId).catch(() => null)
+  if (!summary || removedSince(id, mine)) return false
+  publishedAt.set(id, ++seq)
+  set({ items: byNewest([summary, ...state.items.filter(item => item.id !== id)]) })
+  return true
 }
 
 async function organize(id: string, patch: ChatHistoryOrganize): Promise<boolean> {
@@ -333,4 +361,5 @@ export function resetHistoryStore(): void {
   sleep = realSleep
   opener = null
   starter = null
+  listening = false
 }

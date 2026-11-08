@@ -41,7 +41,7 @@ function memoryStore() {
 
 function stored(id: string, title: string, updated: string): ChatHistoryRecord {
   return {
-    format: 'agent24.desktop.chat-history', version: 1, id, title, title_source: 'prompt', group_id: null, archived_at: null,
+    format: 'agent24.desktop.chat-history', version: 2, id, title, title_source: 'prompt', group_id: null, archived_at: null, runs: [], pending: [],
     created_at: '2026-11-07T10:00:00.000Z', updated_at: updated,
     messages: [
       { role: 'user', content: title, at: '2026-11-07T10:00:00.000Z', delivered: true },
@@ -126,7 +126,7 @@ describe('chat history', () => {
     const sessionId = proxy.mock.calls[0][0].body.session_id
     await waitFor(() => expect(saved.get(sessionId)?.messages).toHaveLength(2))
     const record = saved.get(sessionId)!
-    expect(record).toMatchObject({ format: 'agent24.desktop.chat-history', version: 1, id: sessionId, title: '第一个问题' })
+    expect(record).toMatchObject({ format: 'agent24.desktop.chat-history', version: 2, id: sessionId, title: '第一个问题' })
     expect(record.messages[0]).toMatchObject({ role: 'user', content: '第一个问题', delivered: true })
     expect(record.messages[1]).toMatchObject({ role: 'assistant', content: 'ack', run_id: null })
     expect(record.messages.every(m => /Z$/.test(m.at))).toBe(true)
