@@ -36,13 +36,21 @@ describe('the host copy against the server list (#1632 L1)', () => {
     expect(host).toMatchObject({ repo: pinned.repo, path: pinned.path, commit: pinned.commit })
   })
 
-  it('holds C2-01c1\'s three UI routes (WeKnora#141)', () => {
-    const o = 'http://127.0.0.1:18282/api/v1/agent24/knowledge/ui/knowledge-bases'
+  it('holds the six UI routes of C2-01c1 and c2 (WeKnora#141, #142)', () => {
+    const ui = 'http://127.0.0.1:18282/api/v1/agent24/knowledge/ui'
+    const o = `${ui}/knowledge-bases`
     const op = (url: string) => matchUiRoute(KNOWLEDGE_UI_ROUTES, 'GET', url)?.op ?? null
+    expect(KNOWLEDGE_UI_ROUTES).toHaveLength(6)
     expect(op(o)).toBe('kb.list')
     expect(op(`${o}/kb-1`)).toBe('kb.get')
     expect(op(`${o}/kb-1/tags`)).toBe('tag.list')
-    expect(op(`${o}/kb-1/documents`)).toBeNull()
+    expect(op(`${o}/kb-1/documents?page=2`)).toBe('doc.list')
+    expect(op(`${ui}/documents/doc-1`)).toBe('doc.get')
+    expect(op(`${ui}/documents/doc-1/chunks`)).toBe('chunk.list')
+    // Not (yet) on the list: wiki comes with c3; nothing outside the UI prefix.
+    expect(op(`${o}/kb-1/wiki`)).toBeNull()
+    expect(op(`${ui}/documents`)).toBeNull()
+    expect(op(`${ui}/documents/doc-1/chunks/c-1`)).toBeNull()
     expect(op('http://127.0.0.1:18282/api/v1/knowledge-bases')).toBeNull()
   })
 })
