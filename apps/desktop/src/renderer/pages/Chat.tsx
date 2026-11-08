@@ -9,10 +9,10 @@ import { grounding, type Grounding } from './knowledge-grounding'
 import { TurnRail } from './chat/TurnRail'
 import { activeTurn, buildTurns } from './chat/turns'
 import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/title'
-import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../shared/chat-history'
+import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import {
-  getHistoryState, historyAvailable, loadConversation, registerChatPage, restoreConversation, saveConversation,
+  getHistoryState, historyAvailable, loadConversation, promoteRun, registerChatPage, restoreConversation, saveConversation,
   setActiveConversation, setChatBusy, subscribeHistory, titleConversation,
 } from './chat/history'
 
@@ -62,6 +62,8 @@ function toRecord(id: string, messages: Message[], stamps: readonly string[]): C
     // Main keeps the group and the archive mark on file (UI-06).
     group_id: null,
     archived_at: null,
+    // And its runs and what waits on the user (M4 A2).
+    runs: [], pending: [],
     created_at: stamps[0] ?? '',
     updated_at: stamps.slice(0, messages.length).reduce((a, b) => (b > a ? b : a), ''),
     messages: messages.map((m, i) => m.role === 'user'
@@ -346,13 +348,24 @@ export default function ChatPage() {
   const replyWithKnowledge = async (index: number, request: ChatRequest) => {
     const prompt = request.messages[request.messages.length - 1]?.content ?? ''
     const sentAt = performance.now()
+    const conversation = sessionId
+    let runId: string | null = null
     try {
       const proxy = window.agent24.backendProxy
       const ask = async () => {
         runSession.current ??= await createChatSession(proxy)
         return runSession.current === null
           ? { kind: 'failed' as const, code: 'session_unavailable', message: 'session_unavailable' }
-          : await askWithKnowledge(prompt, runSession.current, { proxy, onAwaitingApproval: setAwaitingApproval }, request.idoris_headroom_confirmed === true)
+          : await askWithKnowledge(prompt, runSession.current, {
+            proxy,
+            onRunStarted: id => { runId = id },
+            // M4 A2: a run that waits on an approval is a task of this
+            // conversation from then on.
+            onAwaitingApproval: waiting => {
+              setAwaitingApproval(waiting)
+              if (runId && promotionDue({ status: waiting ? 'awaiting_approval' : 'running', replyEnded: false })) void promoteRun(conversation, runId)
+            },
+          }, request.idoris_headroom_confirmed === true)
       }
       let turn = await ask()
       // The daemon ties a session to one activation of the binding; after a

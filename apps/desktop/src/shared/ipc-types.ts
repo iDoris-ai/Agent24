@@ -13,6 +13,10 @@ export const IpcChannels = {
   ChatHistorySetTitle: 'chat-history:set-title',
   // UI-06: groups and archiving in the history list.
   ChatHistoryOrganize: 'chat-history:organize',
+  // M4 A2: a run of the conversation becomes a task; main's own changes to
+  // runs and waiting items, pushed to the window.
+  ChatHistoryPromoteRun: 'chat-history:promote-run',
+  ChatHistoryChanged: 'chat-history:changed',
   ChatGroupsGet: 'chat-groups:get',
   ChatGroupsCreate: 'chat-groups:create',
   ChatGroupsRename: 'chat-groups:rename',

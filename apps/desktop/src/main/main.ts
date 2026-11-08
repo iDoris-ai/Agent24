@@ -3,6 +3,7 @@
 import { app, BrowserWindow, dialog, Menu, Tray, WebContentsView, nativeImage, net, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
+import { onChatHistoryChange } from './chat-history'
 import { registerCliTool } from './ipc/cli-tool'
 import { getMainLocale, initMainLocale, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
@@ -445,6 +446,7 @@ app.whenReady().then(async () => {
     })
   })
 
+  onChatHistoryChange(summary => { if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.ChatHistoryChanged, summary) })
   registerIpcHandlers({
     guard,
     knowledge: () => knowledge,

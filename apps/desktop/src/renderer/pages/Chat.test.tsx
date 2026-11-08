@@ -420,6 +420,52 @@ describe('ChatPage with Knowledge', () => {
   })
 })
 
+// M4 A2: a Knowledge turn whose run waits on an approval becomes a task of
+// its conversation (promotionDue); one that just answers stays an answer.
+describe('ChatPage promoting a Knowledge run to a task', () => {
+  beforeEach(() => { setLocale('zh') })
+
+  const page = (statuses: string[]) => {
+    const promoteRun = vi.fn().mockResolvedValue(null)
+    const save = vi.fn(async (record: { id: string }) => ({ id: record.id }))
+    Object.defineProperty(window, 'agent24', {
+      value: {
+        backendProxy: mockBackendProxy,
+        knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true }) },
+        chatHistory: { list: vi.fn().mockResolvedValue([]), save, promoteRun },
+      },
+      writable: true,
+      configurable: true,
+    })
+    let polls = 0
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: 'r1' } }
+      const status = statuses[Math.min(polls++, statuses.length - 1)]
+      return { ok: true, status: 200, data: { status, output: { text: 'done' }, knowledge: null } }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'do it' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    return { promoteRun, save }
+  }
+
+  it('promotes the run of its own conversation once it waits on an approval', async () => {
+    const { promoteRun, save } = page(['awaiting_approval', 'completed'])
+    await waitFor(() => expect(screen.getByText('done')).toBeInTheDocument(), { timeout: 4000 })
+    const conversation = save.mock.calls[0][0].id
+    expect(promoteRun).toHaveBeenCalledTimes(1)
+    expect(promoteRun).toHaveBeenCalledWith(conversation, 'r1')
+  })
+
+  it('leaves a run that only answers an answer', async () => {
+    const { promoteRun } = page(['running', 'completed'])
+    await waitFor(() => expect(screen.getByText('done')).toBeInTheDocument(), { timeout: 4000 })
+    expect(promoteRun).not.toHaveBeenCalled()
+  })
+})
+
 describe('ChatPage with Knowledge when the answer names sources the run did not read', () => {
   beforeEach(() => { setLocale('zh') })
 

@@ -25,7 +25,7 @@ const proxy = vi.fn()
 function record(id: string, prompt: string, at: string): ChatHistoryRecord {
   return {
     format: CHAT_HISTORY_FORMAT, version: CHAT_HISTORY_VERSION, id, title: prompt, title_source: 'prompt',
-    group_id: null, archived_at: null, created_at: at, updated_at: at,
+    group_id: null, archived_at: null, created_at: at, updated_at: at, runs: [], pending: [],
     messages: [{ role: 'user', content: prompt, at, delivered: true }, { role: 'assistant', content: `答：${prompt}`, at, run_id: null, latency: null }],
   }
 }

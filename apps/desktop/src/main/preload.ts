@@ -57,6 +57,13 @@ const api = {
       ipcRenderer.invoke(IpcChannels.ChatHistorySetTitle, id, title, source),
     organize: (id: string, patch: ChatHistoryOrganize): Promise<ChatHistorySummary | null> =>
       ipcRenderer.invoke(IpcChannels.ChatHistoryOrganize, id, patch),
+    promoteRun: (id: string, runId: string): Promise<ChatHistorySummary | null> =>
+      ipcRenderer.invoke(IpcChannels.ChatHistoryPromoteRun, id, runId),
+    onChanged: (cb: (summary: ChatHistorySummary) => void): (() => void) => {
+      const listener = (_event: unknown, summary: ChatHistorySummary): void => cb(summary)
+      ipcRenderer.on(IpcChannels.ChatHistoryChanged, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.ChatHistoryChanged, listener)
+    },
   },
   chatGroups: {
     get: (): Promise<ChatGroupsState> => ipcRenderer.invoke(IpcChannels.ChatGroupsGet),
