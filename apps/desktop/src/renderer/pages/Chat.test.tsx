@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import ChatPage from './Chat'
 import { setLocale } from '../i18n'
 import { chatMessages } from './Chat.i18n'
@@ -105,6 +105,36 @@ describe('ChatPage', () => {
     expect(newBody.session_id).toBeTruthy()
     expect(newBody.session_id).not.toBe(oldBody.session_id)
     expect(newBody.messages).toEqual([{ role: 'user', content: 'new topic' }])
+  })
+
+  // UI-01: the turn rail shows once the chat has two turns; a mark jumps to
+  // its prompt; "New chat" removes it.
+  it('shows the turn rail from the second turn and jumps to a turn on click', async () => {
+    mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { message: { content: 'ack' } } })
+    const scroll = vi.spyOn(HTMLElement.prototype, 'scrollIntoView').mockImplementation(() => {})
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'first' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(mockBackendProxy).toHaveBeenCalledTimes(1))
+    expect(screen.queryByRole('navigation', { name: '本次对话的回合' })).toBeNull()
+
+    fireEvent.change(textarea, { target: { value: 'second' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getAllByText('ack')).toHaveLength(2))
+    const rail = screen.getByRole('navigation', { name: '本次对话的回合' })
+    // The rail follows the newest turn even without a scroll event.
+    expect(within(rail).getByRole('button', { name: '第 2 轮：second' })).toHaveAttribute('aria-current', 'step')
+    scroll.mockClear()
+    fireEvent.click(within(rail).getByRole('button', { name: '第 1 轮：first' }))
+    const toPrompt = scroll.mock.calls.findIndex(([arg]) => (arg as ScrollIntoViewOptions | undefined)?.block === 'start')
+    expect(toPrompt).toBeGreaterThanOrEqual(0)
+    expect(scroll.mock.contexts[toPrompt]).toHaveTextContent('first')
+    expect(within(rail).getByRole('button', { name: '第 1 轮：first' })).toHaveAttribute('aria-current', 'step')
+
+    fireEvent.click(screen.getByRole('button', { name: '新对话' }))
+    expect(screen.queryByRole('navigation', { name: '本次对话的回合' })).toBeNull()
+    scroll.mockRestore()
   })
 
   it('disables the new chat button while a reply is in flight', async () => {

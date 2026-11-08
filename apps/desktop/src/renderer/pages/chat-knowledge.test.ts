@@ -28,7 +28,7 @@ describe('chat-knowledge', () => {
     const knowledge = { searched: true, read_chunks: [{ knowledge_id: 'doc-7', chunk_id: 'chk-71' }] }
     const { calls, proxy } = proxyWith([{ status: 'running' }, { status: 'completed', output: { text: '答案 [来源]' }, knowledge }])
     const turn = await askWithKnowledge('报销流程？', 'sess_1', { proxy, sleep: async () => {} })
-    expect(turn).toEqual({ kind: 'answer', text: '答案 [来源]', knowledge })
+    expect(turn).toEqual({ kind: 'answer', text: '答案 [来源]', knowledge, runId: 'run_1' })
     expect(calls[0]).toEqual({ method: 'POST', path: '/api/v1/runs', body: { prompt: '报销流程？', session_id: 'sess_1' } })
     expect(calls.filter((c) => c.method === 'GET').every((c) => c.path === '/api/v1/runs/run_1')).toBe(true)
   })

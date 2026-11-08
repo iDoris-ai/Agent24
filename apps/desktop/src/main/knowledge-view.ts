@@ -26,6 +26,7 @@
 // channels and teardown.
 
 import { randomBytes } from 'node:crypto'
+import net from 'node:net'
 import type { BrowserWindow, IpcMain, IpcMainInvokeEvent, Session, WebContents, WebContentsView } from 'electron'
 import type { IpcGuard } from './ipc/guard'
 import type {
@@ -164,8 +165,6 @@ export function knowledgeViewCsp(origin: string): string {
   ].join('; ')
 }
 
-/** Adds the partition CSP next to whatever the server sent: browsers enforce
- * every policy present, so the server's own can only tighten it. */
 /** Powerful features switched off in the page itself (UI-BRIDGE U4.2). The
  * permission handlers already refuse them, but a request that never reaches
  * them (David's 11-08 Mac run: geolocation left pending, no answer) is still
@@ -187,6 +186,8 @@ function serverSwitchOffs(values: string[]): string[] {
   return kept.length > 0 ? [kept.join(', ')] : []
 }
 
+/** Adds the partition CSP next to whatever the server sent: browsers enforce
+ * every policy present, so the server's own can only tighten it. */
 export function withKnowledgeCsp(
   headers: Record<string, string | string[]> | undefined,
   origin: string,
@@ -259,10 +260,62 @@ export interface KnowledgeViewHostDeps {
   clearTimer?: (handle: unknown) => void
   log?: (message: string) => void
   partitionName?: () => string
+  /** Port of the dead proxy the partition's other traffic is sent to
+   * (contract decision #30). Defaults to one listener of our own per process. */
+  proxyPort?: () => Promise<number>
 }
 
 // The app's own --bg (styles.css), so the area does not flash while the page loads.
 const BACKGROUND: Record<KnowledgeViewTheme, string> = { light: '#f4f4ef', dark: '#0a0a0a' }
+
+// ── Contract decision #30: TURN over TCP ─────────────────────────────────────
+// WebRTC's TCP (TURN-TCP, ICE-TCP) opens its own sockets: neither webRequest nor
+// the CSP sees them, and `disable_non_proxied_udp` only stops UDP (the 11-08
+// Mac smoke reached a foreign TURN port). Chromium does resolve those sockets
+// through the session's proxy, so the partition gets a fixed proxy that goes
+// nowhere: a listener of ours that drops every connection. The allowed origin
+// alone bypasses it, by exact host:port; `<-loopback>` first, or Chromium would
+// let every loopback address through implicitly. No DIRECT fallback.
+
+/** The partition's proxy settings for `origin` and the dead proxy's port. */
+export function knowledgeViewProxyConfig(origin: string, port: number): { mode: 'fixed_servers'; proxyRules: string; proxyBypassRules: string } {
+  const url = new URL(origin)
+  const hostPort = `${url.hostname}:${url.port || (url.protocol === 'https:' ? '443' : '80')}`
+  return { mode: 'fixed_servers', proxyRules: `http://127.0.0.1:${port}`, proxyBypassRules: `<-loopback>;${hostPort}` }
+}
+
+let blackhole: Promise<number> | null = null
+
+/** The process's dead proxy: listens on loopback and drops every connection.
+ * Started once, never kept the process alive. A failure to start lets the next
+ * caller try again; an error once listening (a failed accept, say) is only
+ * logged: the listener stays, since partitions already point at its port. */
+export function knowledgeViewBlackhole(log: (message: string) => void = () => {}): Promise<number> {
+  blackhole ??= listenDeadProxy(log).then((server) => (server.address() as net.AddressInfo).port, (error: unknown) => {
+    blackhole = null
+    throw error
+  })
+  return blackhole
+}
+
+/** One dead-proxy listener (the singleton above is the one in use). */
+export function listenDeadProxy(log: (message: string) => void): Promise<net.Server> {
+  return new Promise<net.Server>((resolve, reject) => {
+    const server = net.createServer((socket) => socket.destroy())
+    let listening = false
+    server.on('error', (error) => {
+      if (listening) { log(`[knowledge-view] dead proxy: ${error.message}`); return }
+      reject(error)
+    })
+    server.listen(0, '127.0.0.1', () => {
+      listening = true
+      server.unref()
+      const address = server.address()
+      if (typeof address === 'object' && address !== null) resolve(server)
+      else { server.close(); reject(new Error('no port')) }
+    })
+  })
+}
 
 /** Installs the partition-wide refusals. Done before the view exists, so the
  * first request already meets them. */
@@ -329,6 +382,8 @@ interface Instance {
   loading: Promise<boolean> | null
   /** Removed on destroy, so windows do not collect listeners (one per instance). */
   onWindowClosed: () => void
+  /** The partition's dead proxy is in place (decision #30); the page loads only after. */
+  proxied: Promise<void>
   /** The main frame's last commit answered 4xx/5xx: an error page is not the knowledge page. */
   httpFailed: boolean
 }
@@ -464,7 +519,11 @@ export class KnowledgeViewHost {
         }
         finish(new Error('first load timed out'))
       }, KNOWLEDGE_VIEW_FIRST_LOAD_TIMEOUT_MS)
-      instance.view.webContents.loadURL(instance.target.url).then(() => finish(null), (error: unknown) => finish(error))
+      // Not one request before the dead proxy is in place: a page that loaded
+      // first could open TURN-TCP directly (decision #30).
+      instance.proxied
+        .then(() => { if (!settled) return instance.view.webContents.loadURL(instance.target.url) })
+        .then(() => finish(null), (error: unknown) => finish(error))
     })
     return instance.loading
   }
@@ -549,7 +608,9 @@ export class KnowledgeViewHost {
     const instance: Instance = {
       view, session, window: win, binding, target, loaded: false, unresponsive: false, loading: null, httpFailed: false,
       onWindowClosed: () => { if (this.instance === instance) this.destroy('window closed') },
+      proxied: (this.deps.proxyPort ?? (() => knowledgeViewBlackhole((m) => this.log(m))))().then((port) => session.setProxy(knowledgeViewProxyConfig(target.origin, port))),
     }
+    instance.proxied.catch(() => {}) // surfaced by load(); never an unhandled rejection
     guardKnowledgeContents(view.webContents, target.origin, () => {
       if (this.instance !== instance) return
       this.log('[knowledge-view] main frame left the allowed origin')
