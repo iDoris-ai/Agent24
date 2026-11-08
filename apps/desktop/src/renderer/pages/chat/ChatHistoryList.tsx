@@ -157,6 +157,8 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   const listRef = useRef<HTMLDivElement>(null)
   const entry = (id: string) => listRef.current?.querySelector<HTMLButtonElement>(`[data-history-id="${id}"]`)
   const startEdit = (id: string, title: string) => {
+    // Archived conversations are restored or deleted, not renamed.
+    if (items.find(item => item.id === id)?.archived_at != null) return
     editingRef.current = { id, from: title }
     setEditing(id)
     setDraft(title)

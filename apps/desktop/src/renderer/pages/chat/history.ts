@@ -18,10 +18,14 @@ export interface HistoryState {
   busy: boolean
   /** UI-06: the user's groups and which parts of the list are folded. */
   groups: ChatGroupsState
+  /** UI-06 G3: conversations whose archiving main has not answered yet.
+   *  The page treats them as archived already, so nothing is added to one
+   *  meanwhile; a failed archive takes it off again. */
+  archiving: string[]
 }
 
 const NO_GROUPS: ChatGroupsState = { groups: [], assistant_collapsed: false, archive_collapsed: true }
-const initial: HistoryState = { items: [], activeId: null, busy: false, groups: NO_GROUPS }
+const initial: HistoryState = { items: [], activeId: null, busy: false, groups: NO_GROUPS, archiving: [] }
 let state: HistoryState = initial
 const listeners = new Set<() => void>()
 let opener: ((id: string) => void) | null = null
@@ -148,7 +152,11 @@ export function moveConversation(id: string, groupId: string | null): Promise<bo
  *  L2). Should a reply have started meanwhile, it stays open, read-only. */
 export async function archiveConversation(id: string): Promise<boolean> {
   if (state.busy && state.activeId === id) return false
-  const done = await organize(id, { archived: true })
+  set({ archiving: [...state.archiving, id] })
+  const done = await organize(id, { archived: true }).finally(() => {
+    const at = state.archiving.indexOf(id)
+    if (at >= 0) set({ archiving: state.archiving.filter((_, i) => i !== at) })
+  })
   if (done && state.activeId === id && !state.busy) {
     starter?.()
     set({ activeId: null })

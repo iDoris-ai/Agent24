@@ -103,8 +103,9 @@ export default function ChatPage() {
   const [sessionId, setSessionId] = useState(() => genChatSessionId())
   // UI-06 D7: the open conversation is archived. It is shown, not continued:
   // the composer gives way to a note and a way to restore it.
-  const historyItems = useSyncExternalStore(subscribeHistory, () => getHistoryState().items)
-  const archived = historyItems.some(item => item.id === sessionId && item.archived_at !== null)
+  const history = useSyncExternalStore(subscribeHistory, getHistoryState)
+  const archived = history.archiving.includes(sessionId)
+    || history.items.some(item => item.id === sessionId && item.archived_at !== null)
   const archivedRef = useRef(archived)
   archivedRef.current = archived
   const bottomRef = useRef<HTMLDivElement>(null)

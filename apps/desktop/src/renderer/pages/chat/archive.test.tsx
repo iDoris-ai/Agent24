@@ -131,6 +131,17 @@ describe('the archive in the history list (UI-06 G3)', () => {
     expect(archivedAt('chat_b')).toBeNull()
   })
 
+  it('an archived conversation is not renamed by F2 or a double click', async () => {
+    put('chat_a', '周报')
+    store.organize('chat_a', { archived: true })
+    store.setCollapsed('archive', false)
+    await showList()
+    const entry = await within(archive()).findByRole('button', { name: '周报' })
+    fireEvent.keyDown(entry, { key: 'F2' })
+    fireEvent.doubleClick(entry)
+    expect(within(list()).queryByRole('textbox', { name: '对话标题' })).toBeNull()
+  })
+
   it('deleting an archived conversation asks first', async () => {
     put('chat_a', '周报')
     store.organize('chat_a', { archived: true })
@@ -235,6 +246,25 @@ describe('an archived conversation on the chat page (UI-06 D7)', () => {
     expect(archivedAt(id)).not.toBeNull()
     expect(getHistoryState().activeId).toBeNull()
     expect(screen.getByPlaceholderText(/输入消息/)).toBeInTheDocument()
+  })
+
+  it('while main is archiving the open conversation, it is read-only already; a failed archive gives it back', async () => {
+    both()
+    const box = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(box, { target: { value: '周报' } })
+    fireEvent.keyDown(box, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())
+    await waitFor(() => expect(within(list()).getByRole('button', { name: '对话「周报」的操作' })).toBeInTheDocument())
+    let answer!: (fail: boolean) => void
+    bridge.organize.mockImplementationOnce(() => new Promise((ok, no) => { answer = fail => (fail ? no(new Error('EACCES')) : ok(null)) }))
+    fireEvent.click(within(openRowMenu('周报')).getByRole('menuitem', { name: '归档' }))
+    await waitFor(() => expect(screen.getByText('这个对话已归档，只能查看。')).toBeInTheDocument())
+    expect(screen.queryByPlaceholderText(/输入消息/)).toBeNull()
+    const sent = proxy.mock.calls.length
+    answer(true)
+    await waitFor(() => expect(screen.getByPlaceholderText(/输入消息/)).toBeInTheDocument())
+    expect(screen.getByText('ack')).toBeInTheDocument()
+    expect(proxy.mock.calls.length).toBe(sent)
   })
 
   it('a failed archive leaves the open conversation open (PR-Daemon #1647 L2)', async () => {
