@@ -1,13 +1,18 @@
 import { describe, expect, it } from 'vitest'
 import { readUiError, readUiExchange, readUiProbe, UI_REVOCATION_MISMATCH_LIMIT, UI_SESSION_WINDOW_MS, UiSessionLedger } from './knowledge-ui-session'
 
-const BOUND = ['kb-a', 'kb-b']
 const EXCHANGE = { session_token: 'jwt', expires_in: 600, ops: ['kb.list', 'chunk.list'], effective_scope: { knowledge_base_ids: ['kb-a'] } }
 const MIN = 60 * 1000
 
 describe('readUiExchange (Weknora C2-01b2)', () => {
   it('reads the session and ignores unknown fields', () => {
-    expect(readUiExchange({ ...EXCHANGE, extra: 1 }, BOUND)).toEqual({ sessionToken: 'jwt', expiresInS: 600, ops: ['kb.list', 'chunk.list'], knowledgeBaseIds: ['kb-a'] })
+    expect(readUiExchange({ ...EXCHANGE, extra: 1 })).toEqual({ sessionToken: 'jwt', expiresInS: 600, ops: ['kb.list', 'chunk.list'], knowledgeBaseIds: ['kb-a'] })
+  })
+
+  it('takes the scope the server computed from C as it is (U2.1; David 2026-11-08, option C)', () => {
+    // Settings may choose fewer bases than the key sees: the page shows them all.
+    const wide = { ...EXCHANGE, effective_scope: { knowledge_base_ids: ['kb-a', 'kb-z'] } }
+    expect(readUiExchange(wide)?.knowledgeBaseIds).toEqual(['kb-a', 'kb-z'])
   })
 
   it.each([
@@ -17,11 +22,12 @@ describe('readUiExchange (Weknora C2-01b2)', () => {
     ['op outside the closed set', { ...EXCHANGE, ops: ['kb.list', 'search'] }],
     ['duplicate op', { ...EXCHANGE, ops: ['kb.list', 'kb.list'] }],
     ['empty scope', { ...EXCHANGE, effective_scope: { knowledge_base_ids: [] } }],
-    ['scope the settings do not bind', { ...EXCHANGE, effective_scope: { knowledge_base_ids: ['kb-a', 'kb-z'] } }],
+    ['duplicate scope id', { ...EXCHANGE, effective_scope: { knowledge_base_ids: ['kb-a', 'kb-a'] } }],
+    ['non-string scope id', { ...EXCHANGE, effective_scope: { knowledge_base_ids: ['kb-a', 7] } }],
     ['no scope', { ...EXCHANGE, effective_scope: null }],
     ['not an object', 'jwt'],
   ])('refuses %s', (_name, body) => {
-    expect(readUiExchange(body, BOUND)).toBeNull()
+    expect(readUiExchange(body)).toBeNull()
   })
 })
 

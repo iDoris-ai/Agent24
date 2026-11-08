@@ -37,7 +37,6 @@ export interface KnowledgeUiInstanceDeps {
   credential: () => string | null
   generation: () => number
   servable: () => boolean
-  knowledgeBaseIds: () => readonly string[]
   now: () => number
   sleep: (ms: number) => Promise<void>
   setTimer: (fn: () => void, ms: number) => unknown
@@ -64,7 +63,6 @@ export class KnowledgeUiInstance {
       credential: deps.credential,
       generation: deps.generation,
       servable: deps.servable,
-      boundKnowledgeBaseIds: deps.knowledgeBaseIds,
       now: deps.now,
       sleep: deps.sleep,
       onResume: () => { if (!this.stopped) this.deps.onEvent({ kind: 'reload' }) },

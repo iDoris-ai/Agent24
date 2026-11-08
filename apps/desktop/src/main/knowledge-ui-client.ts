@@ -89,9 +89,9 @@ export class KnowledgeUiClient {
   }
 
   /** One attempt only: a ticket is never sent twice (U2.9, C2-01b2 replay). */
-  exchange(ticket: string, view: ViewSecret, boundKnowledgeBaseIds: readonly string[]): Promise<UiCallResult<UiExchange>> {
+  exchange(ticket: string, view: ViewSecret): Promise<UiCallResult<UiExchange>> {
     return this.call('POST', '/exchange', { 'X-Agent24-View-Proof': view.proof }, JSON.stringify({ ticket }), UI_CALL_TIMEOUT_MS, 'exchange',
-      (b) => readUiExchange(b, boundKnowledgeBaseIds))
+      readUiExchange)
   }
 
   probe(sessionToken: string, view: ViewSecret): Promise<UiCallResult<{ expiresInS: number }>> {

@@ -492,7 +492,6 @@ app.whenReady().then(async () => {
         credential: () => inputs()?.credential ?? null,
         generation: () => inputs()?.generation ?? -1,
         servable: () => inputs() !== null,
-        knowledgeBaseIds: () => inputs()?.knowledgeBaseIds ?? [],
         now: () => performance.now(),
         sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
         setTimer: (fn, ms) => setTimeout(fn, ms),

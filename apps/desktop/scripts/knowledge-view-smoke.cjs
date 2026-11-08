@@ -264,7 +264,6 @@ async function main() {
       credential: () => SMOKE_C,
       generation: () => 1,
       servable: () => true,
-      knowledgeBaseIds: () => ['kb-smoke'],
       now: () => performance.now(),
       sleep: (ms) => new Promise((d) => setTimeout(d, ms)),
       setTimer: (fn, ms) => setTimeout(fn, ms),

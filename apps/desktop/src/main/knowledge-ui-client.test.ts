@@ -62,7 +62,7 @@ describe('KnowledgeUiClient (WeKnora#140 shapes)', () => {
 
   it('exchanges with the view proof and the ticket in the body only', async () => {
     const f = fake(200, { session_token: 'jwt', expires_in: 600, ops: ['kb.list'], effective_scope: { knowledge_base_ids: ['kb-a'] } })
-    const result = await new KnowledgeUiClient(f.fetch, ORIGIN).exchange('tkt', VIEW, ['kb-a'])
+    const result = await new KnowledgeUiClient(f.fetch, ORIGIN).exchange('tkt', VIEW)
     expect(result).toEqual({ kind: 'ok', value: { sessionToken: 'jwt', expiresInS: 600, ops: ['kb.list'], knowledgeBaseIds: ['kb-a'] } })
     const [url, init] = f.calls[0]
     expect(url).toBe(`${ORIGIN}/api/v1/agent24/knowledge/ui/exchange`)
@@ -84,7 +84,7 @@ describe('KnowledgeUiClient (WeKnora#140 shapes)', () => {
     const body = { error: { code: 'unauthorized', message: 'm', details: { retryable: false, reason: 'credential_invalid', restarted: true } } }
     expect(await new KnowledgeUiClient(fake(401, body).fetch, ORIGIN).probe('jwt', VIEW))
       .toEqual({ kind: 'refused', error: { kind: 'error', code: 'unauthorized', reason: 'credential_invalid', restarted: true, retryAfterMs: null } })
-    expect(await new KnowledgeUiClient(fake(401, body).fetch, ORIGIN).exchange('t', VIEW, ['kb-a']))
+    expect(await new KnowledgeUiClient(fake(401, body).fetch, ORIGIN).exchange('t', VIEW))
       .toEqual({ kind: 'refused', error: { kind: 'error', code: 'unauthorized', reason: 'credential_invalid', restarted: false, retryAfterMs: null } })
     expect(await new KnowledgeUiClient(fake(503, { error: { code: 'unavailable', message: 'm', details: { reason: 'overloaded' } } }).fetch, ORIGIN).issueTicket('C', TAGS, 1))
       .toMatchObject({ kind: 'refused', error: { code: 'unavailable', reason: 'overloaded' } })
@@ -92,14 +92,14 @@ describe('KnowledgeUiClient (WeKnora#140 shapes)', () => {
 
   it('gives unknown for a dropped connection, an unreadable body or a timeout', async () => {
     const thrown: UiFetch = async () => { throw new Error('ECONNRESET') }
-    expect(await new KnowledgeUiClient(thrown, ORIGIN).exchange('t', VIEW, ['kb-a'])).toEqual({ kind: 'unknown' })
+    expect(await new KnowledgeUiClient(thrown, ORIGIN).exchange('t', VIEW)).toEqual({ kind: 'unknown' })
     const notJson: UiFetch = async () => ({ status: 502, json: async () => { throw new Error('html') } })
     expect(await new KnowledgeUiClient(notJson, ORIGIN).probe('jwt', VIEW)).toEqual({ kind: 'unknown' })
     vi.useFakeTimers()
     try {
       let signal: AbortSignal | undefined
       const hang: UiFetch = (_url, init) => { signal = init.signal; return new Promise((_r, reject) => init.signal.addEventListener('abort', () => reject(new Error('aborted')))) }
-      const pending = new KnowledgeUiClient(hang, ORIGIN).exchange('t', VIEW, ['kb-a'])
+      const pending = new KnowledgeUiClient(hang, ORIGIN).exchange('t', VIEW)
       await vi.advanceTimersByTimeAsync(UI_CALL_TIMEOUT_MS)
       expect(signal?.aborted).toBe(true)
       expect(await pending).toEqual({ kind: 'unknown' })

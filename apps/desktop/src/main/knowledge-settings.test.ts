@@ -102,11 +102,11 @@ describe('KnowledgeController (M3)', () => {
     await controller.setEnabled(true)
     const first = controller.viewBinding()!
     const inputs = controller.uiSessionInputs(first)
-    expect(inputs).toEqual({ credential: GOOD.apiKey, generation: expect.any(Number), knowledgeBaseIds: GOOD.knowledgeBaseIds })
+    expect(inputs).toEqual({ credential: GOOD.apiKey, generation: expect.any(Number) })
     expect(controller.uiSessionInputs('default#999')).toBeNull()
-    // The bases change within the binding: read afresh, not a copy kept alive.
+    // The bases change within the binding: the session's inputs stay (E comes from C, not from the bases).
     await controller.configure({ endpoint: GOOD.endpoint, knowledgeBaseIds: ['kb-a'] })
-    expect(controller.uiSessionInputs(first)?.knowledgeBaseIds).toEqual(['kb-a'])
+    expect(controller.uiSessionInputs(first)).toEqual(inputs)
     // A new key: the old binding gets nothing, not even the new key.
     await controller.configure({ ...GOOD, apiKey: 'sk-OTHER' })
     expect(controller.uiSessionInputs(first)).toBeNull()

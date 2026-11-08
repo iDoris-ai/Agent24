@@ -34,7 +34,7 @@ function setup(script: { exchanges?: UiCallResult<never>[]; probes?: UiCallResul
   } as unknown as KnowledgeUiClient
   const make = () => new KnowledgeUiInstance({
     client, bindingTag: 'b'.repeat(43), partition: 'knowledge-view-x', origin: ORIGIN, routes: ROUTES, ledger,
-    credential: () => 'C', generation: () => 1, servable: () => true, knowledgeBaseIds: () => ['kb-a'],
+    credential: () => 'C', generation: () => 1, servable: () => true,
     now: () => now, sleep: async () => {},
     setTimer: (fn, ms) => { const t = { fn, ms, cleared: false }; timers.push(t); return t },
     clearTimer: (h) => { (h as { cleared: boolean }).cleared = true },

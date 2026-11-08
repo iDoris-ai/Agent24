@@ -161,15 +161,15 @@ export class KnowledgeController {
 
   /**
    * KB-C2-04a (design §6, M2 near-equivalents): what the UI session of the
-   * view binding `binding` may use now — C, the generation it stands for and
-   * the bound knowledge bases — or null once that is not the binding in effect
+   * view binding `binding` may use now — C and the generation it stands for —
+   * or null once that is not the binding in effect
    * (Off, incomplete, another key or endpoint). An older instance never gets
    * a newer key.
    */
-  uiSessionInputs(binding: string): { credential: string; generation: number; knowledgeBaseIds: string[] } | null {
+  uiSessionInputs(binding: string): { credential: string; generation: number } | null {
     if (this.viewBinding() !== binding) return null
     const credential = this.key()
-    return credential === null ? null : { credential, generation: this.identity, knowledgeBaseIds: [...this.settings.knowledgeBaseIds] }
+    return credential === null ? null : { credential, generation: this.identity }
   }
 
   /** The binding a new run is to name, or none while Off or incomplete. */

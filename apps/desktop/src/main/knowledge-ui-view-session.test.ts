@@ -41,7 +41,7 @@ function setup(exchanges: Array<UiCallResult<typeof SESSION>>, opts: { issues?: 
   const deps: UiViewSessionDeps = {
     client, tags: TAGS,
     credential: () => env.credential, generation: () => env.generation, servable: () => env.servable,
-    boundKnowledgeBaseIds: () => ['kb-a'], now: () => now, sleep: async (ms) => { sleeps.push(ms) },
+    now: () => now, sleep: async (ms) => { sleeps.push(ms) },
     onResume: () => { resumes++ },
   }
   return { session: new UiViewSession(deps, { ...VIEW }), log, tickets, env, sleeps, revokedWith, resumes: () => resumes, advance: (ms: number) => { now += ms } }

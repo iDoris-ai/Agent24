@@ -29,10 +29,15 @@ export interface UiExchange {
 /**
  * A 200 from the exchange (Weknora C2-01b2: `{session_token, expires_in, ops,
  * effective_scope: {knowledge_base_ids}}`). Unknown fields are ignored; null
- * when anything the host relies on is off: `ops` outside the closed set, an
- * empty scope, or a knowledge base the settings do not bind. Not injected then.
+ * when anything the host relies on is off: `ops` outside the closed set, or a
+ * scope that is empty, repeats an id or holds a non-string. Not injected then.
+ *
+ * The scope E is the server's to compute from C (U2.1: the ticket carries no
+ * Q), so it is taken as it comes and not held against the bases chosen in
+ * Settings: the knowledge page shows every base the key can see, while chat
+ * retrieval still asks only for the chosen ones (David, 2026-11-08, option C).
  */
-export function readUiExchange(body: unknown, boundKnowledgeBaseIds: readonly string[]): UiExchange | null {
+export function readUiExchange(body: unknown): UiExchange | null {
   if (!isObject(body)) return null
   const { session_token: token, expires_in: expires, ops, effective_scope: scope } = body
   if (typeof token !== 'string' || token === '') return null
@@ -41,7 +46,7 @@ export function readUiExchange(body: unknown, boundKnowledgeBaseIds: readonly st
   if (new Set(ops).size !== ops.length) return null
   const ids = isObject(scope) ? scope.knowledge_base_ids : undefined
   if (!Array.isArray(ids) || ids.length === 0 || ids.some((id) => typeof id !== 'string')) return null
-  if (new Set(ids).size !== ids.length || ids.some((id) => !boundKnowledgeBaseIds.includes(id as string))) return null
+  if (new Set(ids).size !== ids.length) return null
   return { sessionToken: token, expiresInS: expires, ops: ops as UiOp[], knowledgeBaseIds: ids as string[] }
 }
 

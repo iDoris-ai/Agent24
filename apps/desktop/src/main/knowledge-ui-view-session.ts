@@ -24,7 +24,6 @@ export interface UiViewSessionDeps {
   generation: () => number
   /** The binding is servable and admission is open (U2.1 ①, U2.12). */
   servable: () => boolean
-  boundKnowledgeBaseIds: () => readonly string[]
   now: () => number
   sleep: (ms: number) => Promise<void>
   /** U4.5 "恢复即重载": injection was paused and is not any more. */
@@ -180,7 +179,7 @@ export class UiViewSession {
       }
       const view = this.view
       if (!view) return { kind: 'destroyed' }
-      const exchanged = await this.deps.client.exchange(ticket.ticket, view, this.deps.boundKnowledgeBaseIds())
+      const exchanged = await this.deps.client.exchange(ticket.ticket, view)
       if (this.destroyed) return { kind: 'destroyed' }
       if (exchanged.kind === 'ok') {
         this.session = { ...exchanged.value, exchangedAt: this.deps.now(), generation }
