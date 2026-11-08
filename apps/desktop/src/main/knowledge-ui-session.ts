@@ -50,7 +50,7 @@ export function readUiProbe(body: unknown): { expiresInS: number } | null {
 }
 
 export type UiErrorRead =
-  | { kind: 'error'; code: string; reason: string | null; restarted: boolean }
+  | { kind: 'error'; code: string; reason: string | null; restarted: boolean; retryAfterMs: number | null }
   | { kind: 'unknown' }
 
 /**
@@ -70,7 +70,9 @@ export function readUiError(body: unknown, from: 'probe' | 'exchange' | 'resourc
     if (typeof details.restarted !== 'boolean') return { kind: 'unknown' }
     restarted = details.restarted
   }
-  return { kind: 'error', code: error.code, reason, restarted }
+  const after = details.retry_after_ms
+  const retryAfterMs = typeof after === 'number' && Number.isFinite(after) && after >= 0 ? after : null
+  return { kind: 'error', code: error.code, reason, restarted, retryAfterMs }
 }
 
 // ── The per-binding ledger (U3.8, decisions #3 and #36) ─────────────────────

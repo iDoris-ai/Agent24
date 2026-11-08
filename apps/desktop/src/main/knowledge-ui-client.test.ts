@@ -83,9 +83,9 @@ describe('KnowledgeUiClient (WeKnora#140 shapes)', () => {
   it('passes refusals through, restarted only from the probe', async () => {
     const body = { error: { code: 'unauthorized', message: 'm', details: { retryable: false, reason: 'credential_invalid', restarted: true } } }
     expect(await new KnowledgeUiClient(fake(401, body).fetch, ORIGIN).probe('jwt', VIEW))
-      .toEqual({ kind: 'refused', error: { kind: 'error', code: 'unauthorized', reason: 'credential_invalid', restarted: true } })
+      .toEqual({ kind: 'refused', error: { kind: 'error', code: 'unauthorized', reason: 'credential_invalid', restarted: true, retryAfterMs: null } })
     expect(await new KnowledgeUiClient(fake(401, body).fetch, ORIGIN).exchange('t', VIEW, ['kb-a']))
-      .toEqual({ kind: 'refused', error: { kind: 'error', code: 'unauthorized', reason: 'credential_invalid', restarted: false } })
+      .toEqual({ kind: 'refused', error: { kind: 'error', code: 'unauthorized', reason: 'credential_invalid', restarted: false, retryAfterMs: null } })
     expect(await new KnowledgeUiClient(fake(503, { error: { code: 'unavailable', message: 'm', details: { reason: 'overloaded' } } }).fetch, ORIGIN).issueTicket('C', TAGS, 1))
       .toMatchObject({ kind: 'refused', error: { code: 'unavailable', reason: 'overloaded' } })
   })

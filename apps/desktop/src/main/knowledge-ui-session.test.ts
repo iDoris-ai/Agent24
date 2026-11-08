@@ -37,7 +37,7 @@ describe('readUiError (U3.8 decoding, decision #36)', () => {
   const invalid = (details: Record<string, unknown>) => ({ error: { code: 'unauthorized', message: 'x', details: { retryable: false, reason: 'credential_invalid', ...details } } })
 
   it('reads restarted from the probe next to credential_invalid', () => {
-    expect(readUiError(invalid({ restarted: true }), 'probe')).toEqual({ kind: 'error', code: 'unauthorized', reason: 'credential_invalid', restarted: true })
+    expect(readUiError(invalid({ restarted: true }), 'probe')).toEqual({ kind: 'error', code: 'unauthorized', reason: 'credential_invalid', restarted: true, retryAfterMs: null })
     expect(readUiError(invalid({ restarted: false }), 'probe')).toMatchObject({ restarted: false })
     expect(readUiError(invalid({}), 'probe')).toMatchObject({ restarted: false })
   })
@@ -50,12 +50,12 @@ describe('readUiError (U3.8 decoding, decision #36)', () => {
     expect(readUiError(invalid({ restarted: true }), 'exchange')).toMatchObject({ restarted: false })
     expect(readUiError(invalid({ restarted: 'x' }), 'resource')).toMatchObject({ kind: 'error', restarted: false })
     const expired = { error: { code: 'unauthorized', message: 'x', details: { reason: 'credential_expired', restarted: true } } }
-    expect(readUiError(expired, 'probe')).toEqual({ kind: 'error', code: 'unauthorized', reason: 'credential_expired', restarted: false })
+    expect(readUiError(expired, 'probe')).toEqual({ kind: 'error', code: 'unauthorized', reason: 'credential_expired', restarted: false, retryAfterMs: null })
   })
 
   it('takes unknown fields and gives unknown for a body it cannot read', () => {
     expect(readUiError({ error: { code: 'unavailable', message: 'm', details: { reason: 'overloaded', retry_after_ms: 5, x: 1 } } }, 'exchange'))
-      .toEqual({ kind: 'error', code: 'unavailable', reason: 'overloaded', restarted: false })
+      .toEqual({ kind: 'error', code: 'unavailable', reason: 'overloaded', restarted: false, retryAfterMs: 5 })
     for (const bad of [null, {}, { error: {} }, { error: { code: 7 } }, 'x']) expect(readUiError(bad, 'probe')).toEqual({ kind: 'unknown' })
   })
 })
