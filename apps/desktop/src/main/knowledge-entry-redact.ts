@@ -241,26 +241,22 @@ function isBase64Char(c: string): boolean {
  */
 const privateKeys: Finder = ({ text }, emit) => {
   // Every END line, by key type, in order: read once, so no BEGIN searches.
-  const ends = new Map<string, number[]>()
+  // BEGINs come in order too, so each type's cursor only moves forward.
+  const ends = new Map<string, { at: number[]; next: number }>()
   for (let at = text.indexOf('-----END'); at >= 0; at = text.indexOf('-----END', at + 1)) {
     END_RE.lastIndex = at
     const m = END_RE.exec(text)
     if (!m) continue
-    const list = ends.get(m[1]) ?? []
-    list.push(at + m[0].length)
+    const list = ends.get(m[1]) ?? { at: [], next: 0 }
+    list.at.push(at + m[0].length)
     ends.set(m[1], list)
   }
+  /** The end of the first END of `type` that ends after `from`, or -1. */
   const endAfter = (type: string, from: number): number => {
     const list = ends.get(type)
     if (!list) return -1
-    let lo = 0
-    let hi = list.length
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1
-      if (list[mid] <= from) lo = mid + 1
-      else hi = mid
-    }
-    return lo < list.length ? list[lo] : -1
+    while (list.next < list.at.length && list.at[list.next] <= from) list.next += 1
+    return list.next < list.at.length ? list.at[list.next] : -1
   }
   let i = text.indexOf('-----BEGIN')
   while (i >= 0) {
@@ -275,7 +271,9 @@ const privateKeys: Finder = ({ text }, emit) => {
     const closed = endAfter(head[1], bodyStart + `-----END ${head[1]}PRIVATE KEY-----`.length - 1)
     const end = closed >= 0 ? closed : pemEnd(text, bodyStart)
     emit({ start: i, end })
-    i = text.indexOf('-----BEGIN', end)
+    // A block of another type may begin inside this one and end past it. What
+    // pemEnd takes never holds a BEGIN line, so only END-closed blocks repeat.
+    i = text.indexOf('-----BEGIN', i + 1)
   }
 }
 
@@ -437,22 +435,18 @@ const jwts: Finder = ({ text }, emit) => {
   while (i >= 0) {
     const first = tokenEnd(i + 3)
     let end = -1
-    let second = -1
     if (first - (i + 3) >= 4 && text[first] === '.' && text.startsWith('eyJ', first + 1)) {
-      second = tokenEnd(first + 4)
+      const second = tokenEnd(first + 4)
       if (second - (first + 4) >= 4 && text[second] === '.') {
         const third = tokenEnd(second + 1)
         if (third - (second + 1) >= 4) end = third
       }
     }
-    if (end >= 0) {
-      emit({ start: i, end })
-      // Another JWT may start in the third segment and run past this one.
-      i = text.indexOf('eyJ', second + 1)
-    } else {
-      // An eyJ later in the same first segment reaches the same `first`, so it fails the same way.
-      i = text.indexOf('eyJ', first)
-    }
+    if (end >= 0) emit({ start: i, end })
+    // An eyJ later in the same first segment reaches the same `first`, so it
+    // ends where this one does, or fails the same way. One in a later segment
+    // may run past this one.
+    i = text.indexOf('eyJ', first)
   }
 }
 

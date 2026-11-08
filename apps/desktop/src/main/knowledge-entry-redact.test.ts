@@ -517,6 +517,19 @@ describe('round 2: what one hit used to hide', () => {
   })
 })
 
+// Codex round 3 on #1669.
+describe('round 3: a block or JWT that starts inside another', () => {
+  it('a key block of another type that begins inside one and ends past it is taken (C1)', () => {
+    const text = ['-----BEGIN PRIVATE KEY-----', '-----BEGIN RSA PRIVATE KEY-----', 'A'.repeat(32), '-----END PRIVATE KEY-----', 'B'.repeat(32), '-----END RSA PRIVATE KEY-----', 'after'].join('\n')
+    expect(redact(text)).toBe('〔已脱敏·私钥〕\nafter')
+  })
+
+  it('a JWT that starts in the second segment of another is taken (C2)', () => {
+    expect(redact('eyJaaaa.eyJbbbb.eyJcccc.TOPSECRET end')).toBe('〔已脱敏·凭据〕 end')
+    expect(redact(`eyJxxxx.${JWT} end`)).toBe('〔已脱敏·凭据〕 end')
+  })
+})
+
 describe('linear time on adversarial input (C9–C11)', () => {
   const n = MAX_REDACT_INPUT
   const fill = (unit: string, tail = ''): string => unit.repeat(Math.floor((n - tail.length) / unit.length)) + tail
@@ -543,6 +556,8 @@ describe('linear time on adversarial input (C9–C11)', () => {
     ['chained JWTs', fill('eyJaaaa.')],
     ['one BEGIN, many ENDs', `-----BEGIN PRIVATE KEY-----\n${fill('-----END PRIVATE KEY-----\n').slice(28)}`],
     ['BEGINs of many types, no END', fill('-----BEGIN A B C PRIVATE KEY-----\nMIIB MIIB\n')],
+    ['BEGINs inside one closed block', `${fill('-----BEGIN PRIVATE KEY-----\n', '-----END PRIVATE KEY-----')}`],
+    ['BEGINs on one header line', `-----BEGIN PRIVATE KEY-----\nX: ${fill('-----BEGIN PRIVATE KEY----- ').slice(31)}`],
   ]
   it.each(cases)('%s', (_name, input) => {
     expect(input.length).toBeLessThanOrEqual(n)
