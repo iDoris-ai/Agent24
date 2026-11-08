@@ -1627,6 +1627,25 @@ describe('return_to_chat_intent dialog and draft (U7.2)', () => {
     expect(s.viewSent.filter((args) => args[0] === IpcChannels.KnowledgeDraftChanged)).toEqual([])
   })
 
+  it('a second dialog while one is up is unavailable (not the user\'s no), and the first still works', async () => {
+    const s = await asked()
+    const second = await (s.t.host as unknown as { confirmIntent: (ask: { count: number; titles: Array<string | null> }, signal: AbortSignal) => Promise<string> })
+      .confirmIntent({ count: 0, titles: [] }, new AbortController().signal)
+    expect(second).toBe('unavailable')
+    expect(s.confirms()).toHaveLength(1)
+    s.t.host.answerConfirm(s.ask.id, true)
+    await flush()
+    expect(s.t.host.draftList()).toHaveLength(1)
+  })
+
+  it('no main window: the dialog is unavailable, not declined', async () => {
+    const s = await shown()
+    ;(s.t.env as { win: unknown }).win = null
+    const got = await (s.t.host as unknown as { confirmIntent: (ask: { count: number; titles: Array<string | null> }, signal: AbortSignal) => Promise<string> })
+      .confirmIntent({ count: 0, titles: [] }, new AbortController().signal)
+    expect(got).toBe('unavailable')
+  })
+
   it('aborting the dialog sends null and attaches nothing', async () => {
     const s = await asked()
     s.post({ v: 3, direction: 'page_to_host', type: 'cancel', id: '01J9ZQ3V6R8XKQ4M2N5P7T00C1', generation: 3, document_id: s.doc, payload: { target_id: INTENT_ID } })

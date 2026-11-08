@@ -911,6 +911,23 @@ describe('return_to_chat_intent (U7.2, U6.7, §9.3)', () => {
     expect(forId(t, next.id).map((r) => r.payload)).toEqual([{ result: 'accepted' }])
   })
 
+  it('a knowledge base that leaves the visible set during the validation read is not attached (not_found)', async () => {
+    const { h, t } = wired()
+    const m = t.msg('return_to_chat_intent', { citations: [REF] })
+    t.arrive(m)
+    h.pending[0](okRead())
+    await flush()
+    h.pendingConfirm[0]('confirmed')
+    await flush()
+    // The validation read is running; settings drop the knowledge base, then it returns ok.
+    h.setScope([])
+    h.pending[1](okRead())
+    await flush()
+    await flush()
+    expect(forId(t, m.id).map((r) => r.payload)).toEqual([{ result: 'accepted' }, { result: 'done', code: 'not_found' }])
+    expect(h.attached).toEqual([])
+  })
+
   it('a validation read that throws counts as internal for that item', async () => {
     const { h, t } = wired()
     let n = 0
