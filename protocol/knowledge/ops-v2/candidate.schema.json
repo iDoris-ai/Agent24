@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/iDoris-ai/Agent24/protocol/knowledge/ops-v2/candidate.schema.json",
+  "title": "Agent24 Knowledge OPS v2 — knowledge entry candidates",
+  "description": "candidate.propose (submit, withdraw), candidate.review (return), candidate.approve and the candidate view, CONTRACT-OPS-v2 §8. These are what a client must send and may receive; errors use the READONLY error envelope (v1 error.schema.json) with the OPS §6 reasons; an error to a UI session request echoes generation null (W1.4, pending the READONLY revision in I1). Rules a schema cannot express (message_range order, body size in bytes, the restricted Markdown allow-list, no lone surrogates in kind, title and body, the hash itself) are left to the server and its tests (W8.14); knowledge_ops_v2 tests check the schemas, the enums and the hash samples.",
+  "$defs": {
+    "id": { "description": "Opaque server-assigned identifier.", "type": "string", "minLength": 1, "maxLength": 256 },
+    "sha256": { "description": "Lowercase hex SHA-256 (W8.13).", "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "idempotency_key": { "description": "At least 128 random bits, base64url (W3.1).", "type": "string", "pattern": "^[A-Za-z0-9_-]{22,128}$" },
+    "timestamp": { "description": "UTC RFC 3339.", "type": "string", "minLength": 20, "maxLength": 40, "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?Z$" },
+    "kind": { "description": "Request side: the closed v2 set (§6). A view may carry a later kind; clients show an unknown one as other.", "enum": ["sop", "faq", "note"] },
+    "view_kind": { "type": "string", "pattern": "^[a-z][a-z_]{0,31}$" },
+    "title": { "description": "1-200 characters, no leading or trailing whitespace, no CR (W8.2, W8.13).", "type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^\\s\\r](?:[^\\r]*[^\\s\\r])?$" },
+    "body": { "description": "At most 64 KiB of UTF-8 (bytes are checked by the server); no CR (W8.13).", "type": "string", "maxLength": 65536, "pattern": "^[^\\r]*$" },
+    "provenance": {
+      "description": "W8.2: no conversation text; session_ref is an opaque host hash.",
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "session_ref", "message_range", "skill_version", "redaction_rules_version"],
+      "properties": {
+        "source": { "const": "agent24_conversation" },
+        "session_ref": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "message_range": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "integer", "minimum": 0, "maximum": 100000 } },
+        "skill_version": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._/-]{0,63}$" },
+        "redaction_rules_version": { "type": "integer", "minimum": 1, "maximum": 2147483647 }
+      }
+    },
+    "status": { "enum": ["submitted", "approved", "returned", "withdrawn"] },
+    "return_reason": { "enum": ["reviewer", "conflicted", "target_withdrawn", "target_gone", "unsupported_format", "too_large"] },
+    "note": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\r]*$" },
+    "request_id": { "description": "Client-generated, unique per request; echoed back (READONLY R7.2, OPS W1.4).", "type": "string", "minLength": 1, "maxLength": 128 },
+    "generation": { "description": "Provider requests only: the binding generation, echoed and not checked (READONLY R7.2, R7.5). A UI session request carries none (W1.4).", "type": "integer", "minimum": 0 },
+    "authz_version": { "description": "The authorization version the server decided with (W1.2); never cached to skip a decision.", "type": "string", "minLength": 1, "maxLength": 128 },
+    "submit_request": {
+      "type": "object", "additionalProperties": false,
+      "required": ["request_id", "generation", "idempotency_key", "target_knowledge_base_id", "mode", "kind", "title", "body", "content_sha256", "provenance"],
+      "properties": {
+        "request_id": { "$ref": "#/$defs/request_id" },
+        "generation": { "$ref": "#/$defs/generation" },
+        "idempotency_key": { "$ref": "#/$defs/idempotency_key" },
+        "target_knowledge_base_id": { "$ref": "#/$defs/id" },
+        "mode": { "enum": ["create", "revise"] },
+        "knowledge_id": { "$ref": "#/$defs/id" },
+        "expected_source_revision": { "$ref": "#/$defs/id" },
+        "kind": { "$ref": "#/$defs/kind" },
+        "title": { "$ref": "#/$defs/title" },
+        "body": { "$ref": "#/$defs/body" },
+        "content_sha256": { "$ref": "#/$defs/sha256" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      },
+      "if": { "properties": { "mode": { "const": "revise" } } },
+      "then": { "required": ["knowledge_id", "expected_source_revision"] },
+      "else": { "not": { "anyOf": [{ "required": ["knowledge_id"] }, { "required": ["expected_source_revision"] }] } }
+    },
+    "submit_response": {
+      "type": "object", "additionalProperties": false,
+      "required": ["request_id", "generation", "authz_version", "candidate_id", "status", "content_sha256", "submitted_at"],
+      "properties": {
+        "request_id": { "$ref": "#/$defs/request_id" },
+        "generation": { "$ref": "#/$defs/generation" },
+        "authz_version": { "$ref": "#/$defs/authz_version" },
+        "candidate_id": { "$ref": "#/$defs/id" },
+        "status": { "const": "submitted" },
+        "content_sha256": { "$ref": "#/$defs/sha256" },
+        "submitted_at": { "$ref": "#/$defs/timestamp" },
+        "details": { "type": "object", "additionalProperties": false, "properties": { "outcome": { "const": "existing" }, "replayed": { "const": true } } }
+      }
+    },
+    "withdraw_request": {
+      "type": "object", "additionalProperties": false, "required": ["request_id", "generation", "candidate_id"],
+      "properties": { "request_id": { "$ref": "#/$defs/request_id" }, "generation": { "$ref": "#/$defs/generation" }, "candidate_id": { "$ref": "#/$defs/id" } }
+    },
+    "withdraw_response": {
+      "type": "object", "additionalProperties": false, "required": ["request_id", "generation", "authz_version", "candidate_id", "status"],
+      "properties": {
+        "request_id": { "$ref": "#/$defs/request_id" },
+        "generation": { "$ref": "#/$defs/generation" },
+        "authz_version": { "$ref": "#/$defs/authz_version" },
+        "candidate_id": { "$ref": "#/$defs/id" },
+        "status": { "const": "withdrawn" },
+        "details": { "type": "object", "additionalProperties": false, "properties": { "already": { "const": true } } }
+      }
+    },
+    "return_request": {
+      "description": "Sent by the embedded page's UI session (W1.6): request_id, no generation.",
+      "type": "object", "additionalProperties": false, "required": ["request_id", "candidate_id"],
+      "properties": { "request_id": { "$ref": "#/$defs/request_id" }, "candidate_id": { "$ref": "#/$defs/id" }, "note": { "$ref": "#/$defs/note" } }
+    },
+    "return_response": {
+      "type": "object", "additionalProperties": false, "required": ["request_id", "authz_version", "candidate_id", "status", "return_reason"],
+      "properties": {
+        "request_id": { "$ref": "#/$defs/request_id" },
+        "authz_version": { "$ref": "#/$defs/authz_version" },
+        "candidate_id": { "$ref": "#/$defs/id" },
+        "status": { "const": "returned" },
+        "return_reason": { "const": "reviewer" },
+        "details": { "type": "object", "additionalProperties": false, "properties": { "already": { "const": true } } }
+      }
+    },
+    "approve_request": {
+      "description": "W8.5: sent by the UI session (request_id, no generation); no separate idempotency key (the key is candidate_id); content_sha256 must equal the candidate's. A conforming client sends no approval fields; the server strips approved, author and approver before the shape check and audits them (W1.6), so this schema describes what a client sends.",
+      "type": "object", "additionalProperties": false, "required": ["request_id", "candidate_id", "content_sha256"],
+      "properties": { "request_id": { "$ref": "#/$defs/request_id" }, "candidate_id": { "$ref": "#/$defs/id" }, "content_sha256": { "$ref": "#/$defs/sha256" } }
+    },
+    "approve_response": {
+      "type": "object", "additionalProperties": false,
+      "required": ["request_id", "authz_version", "candidate_id", "status", "knowledge_id", "source_revision", "job_id", "author_is_approver"],
+      "properties": {
+        "request_id": { "$ref": "#/$defs/request_id" },
+        "authz_version": { "$ref": "#/$defs/authz_version" },
+        "candidate_id": { "$ref": "#/$defs/id" },
+        "status": { "const": "approved" },
+        "knowledge_id": { "$ref": "#/$defs/id" },
+        "source_revision": { "$ref": "#/$defs/id" },
+        "job_id": { "description": "null only on a dedup hit (details.outcome existing, W3.5).", "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "author_is_approver": { "type": "boolean" },
+        "details": { "type": "object", "additionalProperties": false, "properties": { "outcome": { "const": "existing" }, "replayed": { "const": true }, "document_status": { "description": "W3.5: on a dedup hit, the existing document's processing state (its latest job is not returned).", "enum": ["index_pending", "indexed", "index_failed"] } } }
+      },
+      "if": { "properties": { "job_id": { "type": "null" } } },
+      "then": { "required": ["details"], "properties": { "details": { "required": ["outcome"] } } }
+    },
+    "view": {
+      "description": "One candidate as its author or a reviewer reads it (W8.3). title, body and note are gone once W8.9 deletes them; return_reason only when returned; the result fields only when approved.",
+      "type": "object", "additionalProperties": false,
+      "required": ["candidate_id", "status", "kind", "content_sha256", "target_knowledge_base_id", "mode", "submitted_at", "updated_at"],
+      "properties": {
+        "candidate_id": { "$ref": "#/$defs/id" },
+        "status": { "$ref": "#/$defs/status" },
+        "kind": { "$ref": "#/$defs/view_kind" },
+        "title": { "$ref": "#/$defs/title" },
+        "body": { "$ref": "#/$defs/body" },
+        "content_sha256": { "$ref": "#/$defs/sha256" },
+        "target_knowledge_base_id": { "$ref": "#/$defs/id" },
+        "mode": { "enum": ["create", "revise"] },
+        "knowledge_id": { "$ref": "#/$defs/id" },
+        "base_source_revision": { "$ref": "#/$defs/id" },
+        "return_reason": { "$ref": "#/$defs/return_reason" },
+        "note": { "$ref": "#/$defs/note" },
+        "source_revision": { "$ref": "#/$defs/id" },
+        "author_is_approver": { "type": "boolean" },
+        "submitted_at": { "$ref": "#/$defs/timestamp" },
+        "updated_at": { "$ref": "#/$defs/timestamp" }
+      },
+      "allOf": [
+        { "if": { "properties": { "status": { "const": "returned" } } }, "then": { "required": ["return_reason"] }, "else": { "not": { "anyOf": [{ "required": ["return_reason"] }, { "required": ["note"] }] } } },
+        { "if": { "properties": { "status": { "const": "approved" } } }, "then": { "required": ["knowledge_id", "source_revision", "author_is_approver"] }, "else": { "not": { "anyOf": [{ "required": ["source_revision"] }, { "required": ["author_is_approver"] }] } } },
+        { "if": { "properties": { "mode": { "const": "revise" } } }, "then": { "required": ["knowledge_id", "base_source_revision"] } }
+      ]
+    }
+  }
+}
