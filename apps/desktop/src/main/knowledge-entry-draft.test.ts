@@ -61,17 +61,16 @@ afterEach(() => {
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-// The fixed samples of CONTRACT-OPS-v2 W8.13 (#1668,
-// protocol/knowledge/fixtures/ops-v2/entry-hash.samples.json).
-const W813_SAMPLES = [
-  { kind: 'note', title: 'VPN setup', body: '1. Open the client\n2. Sign in', sha256: 'dc2552272966f63f77d27dcceb7dd489ccf1129aa70fd803a654542ff679302c' },
-  { kind: 'sop', title: '请假流程 🌿', body: '## 步骤\n\n1. 打开「人事」系统\n2. 提交申请 🙂\n\n> 审批人：直属主管', sha256: 'cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f' },
-  { kind: 'faq', title: '空正文也可以', body: '', sha256: '08edefbebcffd610f7fc1c349e256ff334693c582b681cc8ea49f1d31135a7f9' },
-  { kind: 'note', title: '引号 " 与反斜杠 \\', body: '列1\t列2\n\u0001结尾', sha256: 'b5ab5a1bfb076d71cf540e369d8cbc30a4c13d9bb3ce442c03b6147aeedecf1e' },
-] as const
+// The fixed samples of CONTRACT-OPS-v2 W8.13 (#1668), read from the contract's own fixture.
+const W813 = JSON.parse(fs.readFileSync(
+  path.join(__dirname, '..', '..', '..', '..', 'protocol', 'knowledge', 'fixtures', 'ops-v2', 'entry-hash.samples.json'), 'utf8',
+)) as { scheme: number; samples: Array<{ kind: 'sop' | 'faq' | 'note'; title: string; body: string; sha256: string }> }
+const W813_SAMPLES = W813.samples
 
 describe('entryHash (W8.13 scheme 1)', () => {
   it('recomputes every contract sample', () => {
+    expect(W813.scheme).toBe(1)
+    expect(W813_SAMPLES.length).toBeGreaterThanOrEqual(4)
     for (const sample of W813_SAMPLES) expect(entryHash(sample), sample.title).toBe(sample.sha256)
   })
 
