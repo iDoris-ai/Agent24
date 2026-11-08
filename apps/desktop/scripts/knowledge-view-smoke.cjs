@@ -99,12 +99,12 @@ const within = (p, ms) => {
       const ulid = (n) => '01J9ZQ3V6R8XKQ4M2N5P7T' + String(n).padStart(4, '0')
       const post = (m) => fetch('/__agent24/bridge', { method: 'POST', body: JSON.stringify(m) }).then(() => 'reached', () => 'cancelled')
       const waitFor = (pred) => within(new Promise((d) => { const t0 = Date.now(); const tick = () => (pred() || Date.now() - t0 > 2500 ? d() : setTimeout(tick, 50)); tick() }), 3000)
-      r.bridgePost = await within(post({ v: 2, direction: 'page_to_host', type: 'status', id: ulid(1), generation: 0, payload: { state: 'loading' } }), 3000)
+      r.bridgePost = await within(post({ v: 3, direction: 'page_to_host', type: 'status', id: ulid(1), generation: 0, payload: { state: 'loading' } }), 3000)
       await waitFor(() => got.some((m) => m.type === 'hello'))
       const hello = got.find((m) => m.type === 'hello')
-      r.bridgeHello = hello ? { supported: hello.payload.supported, idOk: /^[A-Za-z0-9_-]{22}$/.test(hello.payload.view_instance_id), generation: hello.generation } : null
+      r.bridgeHello = hello ? { supported: hello.payload.supported, idOk: /^[A-Za-z0-9_-]{22}$/.test(hello.payload.view_instance_id), docOk: /^[A-Za-z0-9_-]{22}$/.test(hello.document_id), generation: hello.generation } : null
       if (hello) {
-        await within(post({ v: 2, direction: 'page_to_host', type: 'status', id: ulid(2), generation: hello.generation, payload: { state: 'ready' } }), 3000)
+        await within(post({ v: 3, direction: 'page_to_host', type: 'status', id: ulid(2), generation: hello.generation, document_id: hello.document_id, payload: { state: 'ready' } }), 3000)
         await waitFor(() => got.some((m) => m.type === 'reply' && m.in_reply_to === ulid(2)))
         const reply = got.find((m) => m.type === 'reply' && m.in_reply_to === ulid(2))
         r.bridgeReply = reply ? reply.payload : null
@@ -351,7 +351,7 @@ async function main() {
   check('bridge: the reserved POST is taken by the host and never reaches the server', r1.bridgePost === 'cancelled'
     && !hits.A.some((u) => u.startsWith('/__agent24')), { post: r1.bridgePost, reached: hits.A.filter((u) => u.startsWith('/__agent24')) })
   check('bridge: hello reaches the page as a dispatched message event, under the page CSP', r1.bridgeHello?.idOk === true
-    && JSON.stringify(r1.bridgeHello.supported) === '[2]' && r1.bridgeHello.generation === 1, r1.bridgeHello)
+    && r1.bridgeHello.docOk === true && JSON.stringify(r1.bridgeHello.supported) === '[3]' && r1.bridgeHello.generation === 1, r1.bridgeHello)
   check('bridge: a status with that generation gets its reply', r1.bridgeReply?.result === 'done', r1.bridgeReply)
   {
     // U6.1 f: activation-type input on the WebContentsView is seen by main.
@@ -405,33 +405,39 @@ async function main() {
     addEventListener('message', (e) => { if (e.data && e.data.direction === 'host_to_page') got.push(e.data) })
     const post = (m) => fetch('/__agent24/bridge', { method: 'POST', body: JSON.stringify(m) }).catch(() => {})
     const waitFor = (pred) => new Promise((d) => { const t0 = Date.now(); const tick = () => (pred() || Date.now() - t0 > 2500 ? d() : setTimeout(tick, 50)); tick() })
-    await post({ v: 2, direction: 'page_to_host', type: 'status', id: '01J9ZQ3V6R8XKQ4M2N5P7T9H00', generation: 0, payload: { state: 'ready' } })
+    await post({ v: 3, direction: 'page_to_host', type: 'status', id: '01J9ZQ3V6R8XKQ4M2N5P7T9H00', generation: 0, payload: { state: 'ready' } })
     await waitFor(() => got.some((m) => m.type === 'hello'))
-    const hello = got.find((m) => m.type === 'hello')
+    const hello = got.filter((m) => m.type === 'hello').at(-1)
     if (!hello) return { hello: false }
-    await post({ v: 2, direction: 'page_to_host', type: 'status', id: ${JSON.stringify(statusId)}, generation: hello.generation, payload: { state: 'ready' } })
+    window.__bridgeDoc = hello.document_id
+    await post({ v: 3, direction: 'page_to_host', type: 'status', id: ${JSON.stringify(statusId)}, generation: hello.generation, document_id: hello.document_id, payload: { state: 'ready' } })
     await waitFor(() => got.some((m) => m.type === 'reply' && m.in_reply_to === ${JSON.stringify(statusId)}))
-    const reply = got.find((m) => m.type === 'reply' && m.in_reply_to === ${JSON.stringify(statusId)})
-    return { hello: true, generation: hello.generation, reply: reply ? reply.payload : null }
+    // Every reply to this id, so a second one (an old document's message taken as this one's) shows.
+    await new Promise((d) => setTimeout(d, 500))
+    const replies = got.filter((m) => m.type === 'reply' && m.in_reply_to === ${JSON.stringify(statusId)}).map((m) => m.payload)
+    return { hello: true, generation: hello.generation, document: hello.document_id, reply: replies[0] || null, replies }
   })()`
   // #3: the two refused navigations above did not commit; the page still shown keeps its bridge.
   const afterCancel = await Promise.race([wc.executeJavaScript(bridgeTalk('01J9ZQ3V6R8XKQ4M2N5P7T9H01')), new Promise((d) => setTimeout(() => d('timeout'), 8000))])
-  check('bridge: still answers after refused navigations (they did not commit)', afterCancel?.reply?.result === 'done', afterCancel)
-  // #2: a same-URL reload. The old document sends a status with id LATE from
-  // pagehide (keepalive), then the new document sends a status with the same
-  // id. Had LATE been taken as the new document's, the second one would be a
-  // duplicate_id; 'done' means the old document's message stayed with it.
-  // (Design §3.1 merge condition; Chromium may reuse the main frame.)
+  check('bridge: still answers after refused navigations (they did not commit)', afterCancel?.reply?.result === 'done' && afterCancel.replies.length === 1, afterCancel)
+  // #2 (decision #37): a same-URL reload. The old document sends a status with
+  // id LATE and its own document_id from pagehide (keepalive); the reloaded
+  // document then sends a status with the same id and its new document_id.
+  // Exactly one reply to LATE, 'done', and a new document_id: the old
+  // document's message did not land in the new one (it would have made the
+  // new one's a duplicate_id, or brought a second reply). An observation, not
+  // a proof of timing; the host's rule is the unit-tested document_id match.
   const LATE = '01J9ZQ3V6R8XKQ4M2N5P7T9H02'
   await wc.executeJavaScript(`sessionStorage.setItem('smoke-reloaded', '1'); addEventListener('pagehide', () => {
-    fetch('/__agent24/bridge', { method: 'POST', keepalive: true, body: JSON.stringify({ v: 2, direction: 'page_to_host', type: 'status', id: ${JSON.stringify(LATE)}, generation: 1, payload: { state: 'loading' } }) }).catch(() => {})
+    fetch('/__agent24/bridge', { method: 'POST', keepalive: true, body: JSON.stringify({ v: 3, direction: 'page_to_host', type: 'status', id: ${JSON.stringify(LATE)}, generation: 1, document_id: window.__bridgeDoc, payload: { state: 'loading' } }) }).catch(() => {})
   })`)
   const reloaded = new Promise((d) => { wc.once('did-finish-load', d); setTimeout(d, 8000) })
   wc.reload()
   await reloaded
   await new Promise((d) => setTimeout(d, 1000))
   const afterReload = await Promise.race([wc.executeJavaScript(bridgeTalk(LATE)), new Promise((d) => setTimeout(() => d('timeout'), 8000))])
-  check('bridge: a late message of the old document is not taken as the reloaded one\'s (same URL, keepalive)', afterReload?.reply?.result === 'done', afterReload)
+  check('bridge: a late message of the old document is not taken as the reloaded one\'s (same URL, keepalive)', afterReload?.reply?.result === 'done'
+    && afterReload.replies.length === 1 && afterReload.document !== afterCancel?.document, afterReload)
 
   // A second profile: a new instance in a new partition that sees nothing of the first.
   const firstSession = session.fromPartition(partitions[0], { cache: false })

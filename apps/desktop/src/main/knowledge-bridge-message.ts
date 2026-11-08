@@ -11,11 +11,13 @@ export const BRIDGE_MAX_DEPTH = 4
 export const BRIDGE_MAX_ARRAY = 32
 /** U6.7: a string (key or value), counted in UTF-8 bytes. */
 export const BRIDGE_MAX_STRING_BYTES = 2 * 1024
-/** U7.1: the one protocol version of v1. */
-export const BRIDGE_VERSION = 2
+/** U7.1: the one protocol version (3 since decision #37 added `document_id`). */
+export const BRIDGE_VERSION = 3
 export const BRIDGE_SUPPORTED: readonly number[] = [BRIDGE_VERSION]
 
 export const ULID = /^[0-9A-HJKMNP-TV-Z]{26}$/
+/** U7.1 (decision #37): the host's per-document value, random, not a secret. */
+export const DOCUMENT_ID = /^[A-Za-z0-9_-]{22}$/
 const MAX_GENERATION = Number.MAX_SAFE_INTEGER
 
 /** U7.4: compared after lower-casing and dropping `_` and `-`; never by substring. */
@@ -260,6 +262,15 @@ export function envelopeId(value: Json): string | undefined {
   return isObject(value) && typeof value.id === 'string' && ULID.test(value.id) ? value.id : undefined
 }
 
+/**
+ * ⑤ for what only the body can say (decision #37): the envelope's
+ * `document_id`, or undefined when there is none (a hello request may come
+ * without; ⑫ refuses any other message that lacks it).
+ */
+export function envelopeDocumentId(value: Json): Json | undefined {
+  return isObject(value) && 'document_id' in value ? value.document_id : undefined
+}
+
 /** ⑪: 'missing' falls through to ⑫ (U6.4). */
 export function versionOf(value: Json): 'supported' | 'unsupported' | 'missing' {
   if (!isObject(value) || !('v' in value)) return 'missing'
@@ -268,7 +279,7 @@ export function versionOf(value: Json): 'supported' | 'unsupported' | 'missing' 
 
 /** ⑫: the U7.1 envelope with a page→host type and its payload. */
 export function readPageMessage(value: Json): SchemaRead {
-  if (!isObject(value) || !onlyKeys(value, ['v', 'direction', 'type', 'id', 'generation', 'payload'])) return { ok: false, counted: true }
+  if (!isObject(value) || !onlyKeys(value, ['v', 'direction', 'type', 'id', 'generation', 'payload'], ['document_id'])) return { ok: false, counted: true }
   const { v, direction, type, id, generation } = value
   if (v !== BRIDGE_VERSION || direction !== 'page_to_host' || typeof type !== 'string') return { ok: false, counted: true }
   if (!(PAGE_TYPES as readonly string[]).includes(type) || HOST_TYPES.includes(type)) return { ok: false, counted: true }
@@ -276,6 +287,8 @@ export function readPageMessage(value: Json): SchemaRead {
   if (typeof generation !== 'number' || !Number.isInteger(generation) || generation < 0 || generation > MAX_GENERATION) return { ok: false, counted: true }
   const helloRequest = generation === 0
   if (helloRequest && type !== 'status') return { ok: false, counted: true }
+  // U7.1: required on every page message but a hello request.
+  if ('document_id' in value ? typeof value.document_id !== 'string' || !DOCUMENT_ID.test(value.document_id) : !helloRequest) return { ok: false, counted: true }
   const payload = payloadOf(type as PageType, value.payload)
   if (payload === null) return { ok: false, counted: true }
   if (payload === 'refused') return { ok: false, counted: false }
@@ -298,8 +311,8 @@ export type HostMessage =
  * The wire form of a host message (U7.1, U7.3), or null when it may not be
  * sent: a forbidden key anywhere or over 32 KiB (U7.3: checked before sending).
  */
-export function encodeHostMessage(message: HostMessage, id: string, generation: number): string | null {
-  const envelope: Record<string, unknown> = { v: BRIDGE_VERSION, direction: 'host_to_page', type: message.type, id, generation }
+export function encodeHostMessage(message: HostMessage, id: string, generation: number, documentId: string): string | null {
+  const envelope: Record<string, unknown> = { v: BRIDGE_VERSION, direction: 'host_to_page', type: message.type, id, generation, document_id: documentId }
   if (message.type === 'reply' && message.in_reply_to !== undefined) envelope.in_reply_to = message.in_reply_to
   envelope.payload = message.payload
   if (hasForbiddenKeyDeep(envelope)) return null

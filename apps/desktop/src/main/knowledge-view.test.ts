@@ -1296,10 +1296,13 @@ describe('bridge wiring (KB-C2-04a-2, U6.1, U6.6)', () => {
   const BRIDGE = `${ORIGIN}/__agent24/bridge`
   let n = 0
   const msg = (payload: unknown = { state: 'ready' }, extra: Record<string, unknown> = {}) =>
-    ({ v: 2, direction: 'page_to_host', type: 'status', id: `01J9ZQ3V6R8XKQ4M2N5P7T${String(n++).padStart(4, '0')}`, generation: 3, payload, ...extra })
+    ({ v: 3, direction: 'page_to_host', type: 'status', id: `01J9ZQ3V6R8XKQ4M2N5P7T${String(n++).padStart(4, '0')}`, generation: 3, payload, ...extra })
   const delivered = (contents: FakeContents) => contents.mainFrame.scripts.map((s) => JSON.parse(JSON.parse(/JSON\.parse\((.*)\) \}\)\);undefined$/.exec(s)![1])))
   const post = (t: ReturnType<typeof setup>, i: number, body: unknown, over: Record<string, unknown> = {}) => {
     const contents = t.views[i].webContents
+    // The page echoes the document_id of the newest hello it got (decision #37).
+    const doc = delivered(contents).filter((m) => m.type === 'hello').at(-1)?.document_id
+    if (body && typeof body === 'object' && !('document_id' in (body as object))) (body as Record<string, unknown>).document_id = doc
     let out: unknown = null
     t.sessions[i].beforeRequest?.({ url: BRIDGE, method: 'POST', webContentsId: contents.id, frame: contents.mainFrame, uploadData: [{ bytes: Buffer.from(JSON.stringify(body)) }], ...over }, (r: unknown) => { out = r })
     return out

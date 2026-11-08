@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   BRIDGE_MAX_HOST_MESSAGE_BYTES,
   encodeHostMessage,
+  envelopeDocumentId,
   envelopeId,
   hasForbiddenKey,
   isForbiddenKey,
@@ -15,8 +16,9 @@ const b = (text: string): Uint8Array => Buffer.from(text, 'utf8')
 const parse = (text: string) => parseBridgeJson(b(text))
 const ID = '01J9ZQ3V6R8XKQ4M2N5P7T9W0A'
 const REF = { knowledge_base_id: 'kb-1', knowledge_id: 'doc-1', chunk_id: 'c-1', source_revision: 'r1', index_build_id: 'b1', chunk_revision: 3, content_tag: 'tag-1' }
+const DOC = 'D'.repeat(22)
 const env = (type: string, payload: unknown, extra: Record<string, unknown> = {}) =>
-  ({ v: 2, direction: 'page_to_host', type, id: ID, generation: 1, payload, ...extra })
+  ({ v: 3, direction: 'page_to_host', type, id: ID, generation: 1, document_id: DOC, payload, ...extra })
 const read = (value: unknown) => readPageMessage(JSON.parse(JSON.stringify(value)) as Json)
 
 describe('parseBridgeJson (U6.4 ⑧)', () => {
@@ -81,11 +83,18 @@ describe('forbidden keys (U7.4)', () => {
 
 describe('version and envelope id', () => {
   it('⑪: 2 is supported, anything else is not, missing falls to ⑫', () => {
-    expect(versionOf({ v: 2 })).toBe('supported')
-    expect(versionOf({ v: 3 })).toBe('unsupported')
-    expect(versionOf({ v: '2' })).toBe('unsupported')
+    expect(versionOf({ v: 3 })).toBe('supported')
+    expect(versionOf({ v: 2 })).toBe('unsupported')
+    expect(versionOf({ v: '3' })).toBe('unsupported')
     expect(versionOf({})).toBe('missing')
     expect(versionOf([])).toBe('missing')
+  })
+
+  it('gives the document_id of the envelope as it is, or undefined when there is none', () => {
+    expect(envelopeDocumentId({ document_id: DOC })).toBe(DOC)
+    expect(envelopeDocumentId({ document_id: 1 })).toBe(1)
+    expect(envelopeDocumentId({})).toBeUndefined()
+    expect(envelopeDocumentId([])).toBeUndefined()
   })
 
   it('gives the id only when it is a ULID', () => {
@@ -107,8 +116,9 @@ describe('readPageMessage (U6.4 ⑫, U7.1, U7.2)', () => {
     expect(read(env('return_to_chat_intent', { citations: [] }))).toMatchObject({ ok: true })
   })
 
-  it('a generation-0 status is a hello request; no other type may carry 0', () => {
+  it('a generation-0 status is a hello request, with or without document_id; no other type may carry 0', () => {
     expect(read(env('status', { state: 'loading' }, { generation: 0 }))).toMatchObject({ ok: true, message: { helloRequest: true } })
+    expect(read(env('status', { state: 'loading' }, { generation: 0, document_id: undefined }))).toMatchObject({ ok: true, message: { helloRequest: true } })
     expect(read(env('citation', REF, { generation: 0 }))).toEqual({ ok: false, counted: true })
   })
 
@@ -138,6 +148,11 @@ describe('readPageMessage (U6.4 ⑫, U7.1, U7.2)', () => {
     ['nine citations', env('return_to_chat_intent', { citations: Array(9).fill(REF) })],
     ['a bad citation in an intent', env('return_to_chat_intent', { citations: [REF, { ...REF, chunk_revision: -1 }] })],
     ['payload not an object', env('status', 'ready')],
+    ['no document_id (decision #37)', env('status', { state: 'ready' }, { document_id: undefined })],
+    ['document_id too short', env('status', { state: 'ready' }, { document_id: 'D'.repeat(21) })],
+    ['document_id not base64url', env('status', { state: 'ready' }, { document_id: 'D'.repeat(21) + '+' })],
+    ['document_id not a string', env('status', { state: 'ready' }, { document_id: 1 })],
+    ['a bad document_id on a hello request', env('status', { state: 'ready' }, { generation: 0, document_id: 'x' })],
   ])('counts %s as a schema violation', (_name, value) => {
     expect(read(value)).toEqual({ ok: false, counted: true })
   })
@@ -154,16 +169,16 @@ describe('readPageMessage (U6.4 ⑫, U7.1, U7.2)', () => {
 
 describe('encodeHostMessage (U7.1, U7.3)', () => {
   it('builds the envelope; in_reply_to only on replies', () => {
-    const hello = JSON.parse(encodeHostMessage({ type: 'hello', payload: { supported: [2], view_instance_id: 'A'.repeat(22) } }, ID, 7)!)
-    expect(hello).toEqual({ v: 2, direction: 'host_to_page', type: 'hello', id: ID, generation: 7, payload: { supported: [2], view_instance_id: 'A'.repeat(22) } })
-    const reply = JSON.parse(encodeHostMessage({ type: 'reply', in_reply_to: ID, payload: { result: 'done' } }, ID, 1)!)
+    const hello = JSON.parse(encodeHostMessage({ type: 'hello', payload: { supported: [3], view_instance_id: 'A'.repeat(22) } }, ID, 7, DOC)!)
+    expect(hello).toEqual({ v: 3, direction: 'host_to_page', type: 'hello', id: ID, generation: 7, document_id: DOC, payload: { supported: [3], view_instance_id: 'A'.repeat(22) } })
+    const reply = JSON.parse(encodeHostMessage({ type: 'reply', in_reply_to: ID, payload: { result: 'done' } }, ID, 1, DOC)!)
     expect(reply.in_reply_to).toBe(ID)
-    expect(Object.keys(reply)).toEqual(['v', 'direction', 'type', 'id', 'generation', 'in_reply_to', 'payload'])
+    expect(Object.keys(reply)).toEqual(['v', 'direction', 'type', 'id', 'generation', 'document_id', 'in_reply_to', 'payload'])
   })
 
   it('does not send a forbidden key or more than 32 KiB', () => {
-    expect(encodeHostMessage({ type: 'state', payload: { profile_state: 'ready', theme: 'dark', locale: 'en', ...({ url: 'x' } as object) } as never }, ID, 1)).toBeNull()
+    expect(encodeHostMessage({ type: 'state', payload: { profile_state: 'ready', theme: 'dark', locale: 'en', ...({ url: 'x' } as object) } as never }, ID, 1, DOC)).toBeNull()
     const big = 'x'.repeat(BRIDGE_MAX_HOST_MESSAGE_BYTES)
-    expect(encodeHostMessage({ type: 'state', payload: { profile_state: big, theme: 'dark', locale: 'en' } }, ID, 1)).toBeNull()
+    expect(encodeHostMessage({ type: 'state', payload: { profile_state: big, theme: 'dark', locale: 'en' } }, ID, 1, DOC)).toBeNull()
   })
 })

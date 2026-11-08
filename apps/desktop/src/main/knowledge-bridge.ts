@@ -16,6 +16,7 @@ import {
   BRIDGE_MAX_MESSAGE_BYTES,
   BRIDGE_SUPPORTED,
   encodeHostMessage,
+  envelopeDocumentId,
   envelopeId,
   hasForbiddenKey,
   parseBridgeJson,
@@ -102,6 +103,8 @@ export class KnowledgeBridge {
   private readonly logTag: string
   private closed = false
   private document: number | null = null
+  /** Decision #37: the current document's id, new on every commit; sent in every host message, echoed by the page. */
+  private documentId: string | null = null
   // Per document (U6.3: cleared on every new document).
   private seen: string[] = []
   private seenSet = new Set<string>()
@@ -132,10 +135,16 @@ export class KnowledgeBridge {
     return this.closed
   }
 
+  /** The current document's id (decision #37), null between documents. */
+  currentDocumentId(): string | null {
+    return this.document === null ? null : this.documentId
+  }
+
   /** U6.3: the main frame committed a new document (reloads too). Tables go, and it gets `hello`. */
   newDocument(document: number): void {
     if (this.closed) return
     this.document = document
+    this.documentId = randomBytes(16).toString('base64url')
     this.seen = []
     this.seenSet.clear()
     this.helloRequests = 0
@@ -195,6 +204,12 @@ export class KnowledgeBridge {
     // ⑧ strict JSON.
     const value = parseBridgeJson(bytes)
     if (value === undefined) return this.reject('⑧', document, undefined, { code: 'invalid_request', reason: 'schema_violation' }, true)
+    // ⑤, the part only the body can say (decision #37): a message of another
+    // document — one late from the document this one replaced — goes as
+    // silently as one the metadata already placed elsewhere. Before ⑨, so it
+    // touches neither the tables nor the counts of this document.
+    const documentId = envelopeDocumentId(value)
+    if (documentId !== undefined && documentId !== this.documentId) return this.drop('⑤', arrival)
     const id = envelopeId(value)
     // ⑨ forbidden keys: reply, then close.
     if (hasForbiddenKey(value)) {
@@ -375,9 +390,9 @@ export class KnowledgeBridge {
   }
 
   private emit(message: HostMessage, document: number): void {
-    if (this.closed || document !== this.document) return
+    if (this.closed || document !== this.document || this.documentId === null) return
     const generation = this.deps.admission().generation
-    const text = encodeHostMessage(message, newUlid(), generation)
+    const text = encodeHostMessage(message, newUlid(), generation, this.documentId)
     if (text === null) {
       this.deps.log(`[knowledge-bridge] view=${this.logTag} not sent: ${message.type} failed the host-side check`)
       return

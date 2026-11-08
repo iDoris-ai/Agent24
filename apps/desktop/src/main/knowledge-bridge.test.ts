@@ -42,7 +42,7 @@ function setup(opts: { open?: boolean; generation?: number } = {}) {
     bridge.receive({ fromView: true, mainFrame: true, documentOrigin: ORIGIN, document: 1, bytes, senderKey: 's', ...over })
   }
   const msg = (type: string, payload: unknown, extra: Record<string, unknown> = {}) =>
-    ({ v: 2, direction: 'page_to_host', type, id: ulid(), generation: admission.generation, payload, ...extra })
+    ({ v: 3, direction: 'page_to_host', type, id: ulid(), generation: admission.generation, document_id: bridge.currentDocumentId(), payload, ...extra })
   const replies = () => sent.filter((s) => s.msg.type === 'reply').map((s) => s.msg)
   const last = () => replies().at(-1)
   const advance = (ms: number): void => {
@@ -66,7 +66,8 @@ describe('hello (U6.3, U7.3)', () => {
   it('greets every new document, with the newest state after it', () => {
     const t = setup()
     expect(t.sent.map((s) => s.msg.type)).toEqual(['hello'])
-    expect(t.sent[0].msg).toMatchObject({ v: 2, direction: 'host_to_page', generation: 5, payload: { supported: [2], view_instance_id: 'V'.repeat(22) } })
+    expect(t.sent[0].msg).toMatchObject({ v: 3, direction: 'host_to_page', generation: 5, document_id: t.bridge.currentDocumentId(), payload: { supported: [3], view_instance_id: 'V'.repeat(22) } })
+    expect(t.bridge.currentDocumentId()).toMatch(/^[A-Za-z0-9_-]{22}$/)
     t.bridge.setState({ profile_state: 'ready', theme: 'dark', locale: 'en' })
     t.bridge.newDocument(2)
     expect(t.sent.slice(1).map((s) => [s.msg.type, s.document])).toEqual([['state', 1], ['hello', 2], ['state', 2]])
@@ -142,6 +143,46 @@ describe('U6.4 ①–⑤: silent, some of it a hard violation', () => {
     expect(t.sent.at(-1)?.msg.type).toBe('state')
     t.arrive(m)
     expect(t.last()?.payload.reason).toBe('duplicate_id')
+  })
+
+  it('every document gets a new document_id; every host message carries the current one (decision #37)', () => {
+    const t = setup()
+    const first = t.bridge.currentDocumentId()
+    t.bridge.newDocument(2)
+    const second = t.bridge.currentDocumentId()
+    expect(second).not.toBe(first)
+    expect(t.sent.map((s) => s.msg.document_id)).toEqual([first, second])
+    t.bridge.leaveDocument()
+    expect(t.bridge.currentDocumentId()).toBeNull()
+    t.bridge.resumeDocument(2)
+    expect(t.bridge.currentDocumentId()).toBe(second)
+  })
+
+  it('a message with another document_id goes silently, uncounted, before any table (decision #37)', () => {
+    const t = setup()
+    const old = t.bridge.currentDocumentId()
+    const late = t.msg('status', { state: 'ready' })
+    t.bridge.newDocument(2)
+    // Late from the replaced document, though the metadata says document 2.
+    for (let i = 0; i < 6; i++) t.arrive({ ...late, id: ulid(), document_id: old }, { document: 2 })
+    // Not even a forbidden key or a hello request of the old document counts.
+    t.arrive({ ...t.msg('status', { state: 'ready', url: 'x' }), document_id: old }, { document: 2 })
+    t.arrive({ ...t.msg('status', { state: 'ready' }, { generation: 0 }), document_id: old }, { document: 2 })
+    t.arrive({ ...t.msg('status', { state: 'ready' }), document_id: 'not even an id' }, { document: 2 })
+    expect(t.replies()).toEqual([])
+    expect(t.closes()).toBe(0)
+    expect(t.sent.filter((s) => s.msg.type === 'hello')).toHaveLength(2)
+    // The same id from this document is new to it.
+    t.arrive({ ...late, document_id: t.bridge.currentDocumentId() }, { document: 2 })
+    expect(t.last()).toMatchObject({ in_reply_to: late.id, payload: { result: 'done' } })
+  })
+
+  it('a message without document_id is a schema violation, except a hello request', () => {
+    const t = setup()
+    t.arrive(t.msg('status', { state: 'ready' }, { document_id: undefined }))
+    expect(t.last()?.payload.reason).toBe('schema_violation')
+    t.arrive(t.msg('status', { state: 'loading' }, { generation: 0, document_id: undefined }))
+    expect(t.sent.filter((s) => s.msg.type === 'hello')).toHaveLength(2)
   })
 
   it('between documents nothing is taken', () => {
@@ -225,11 +266,11 @@ describe('⑦–⑫: rejected with a reply', () => {
 
   it('⑪ another version: supported list; five in 10 s make one soft violation', () => {
     const t = setup()
-    const m = t.msg('status', { state: 'ready' }, { v: 3 })
+    const m = t.msg('status', { state: 'ready' }, { v: 2 })
     t.arrive(m)
-    expect(t.last()).toMatchObject({ in_reply_to: m.id, payload: { reason: 'unsupported_protocol_version', supported: [2] } })
+    expect(t.last()).toMatchObject({ in_reply_to: m.id, payload: { reason: 'unsupported_protocol_version', supported: [3] } })
     // 4 more → 1 soft violation; 4 more soft ones from ⑫ close it, one fewer does not.
-    for (let i = 0; i < 4; i++) t.arrive(t.msg('status', { state: 'ready' }, { v: 3 }))
+    for (let i = 0; i < 4; i++) t.arrive(t.msg('status', { state: 'ready' }, { v: 2 }))
     for (let i = 0; i < 3; i++) t.arrive(t.msg('status', { state: 'nope' }))
     expect(t.closes()).toBe(0)
     t.arrive(t.msg('status', { state: 'nope' }))
@@ -279,7 +320,7 @@ describe('⑬–⑯', () => {
     t.arrive(m)
     expect(t.replies().map((r) => r.payload.result === 'done' ? 'done' : r.payload.reason)).toEqual(['done', 'duplicate_id'])
     t.bridge.newDocument(2)
-    t.arrive(m, { document: 2 })
+    t.arrive({ ...m, document_id: t.bridge.currentDocumentId() }, { document: 2 })
     expect(t.last()?.payload.result).toBe('done')
   })
 
