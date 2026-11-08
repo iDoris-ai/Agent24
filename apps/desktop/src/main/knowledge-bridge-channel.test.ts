@@ -185,7 +185,7 @@ describe('KnowledgeBridgeChannel', () => {
     const t = setup()
     t.contents.emit('did-navigate')
     t.channel.request({ webContentsId: 7, frame: t.contents.mainFrame, uploadData: t.body('{"origin":"x"}') })
-    expect(t.arrivals[0]).toEqual({ fromView: true, mainFrame: true, documentOrigin: ORIGIN, document: 1, bytes: Buffer.from('{"origin":"x"}'), senderKey: '7:4/1' })
+    expect(t.arrivals[0]).toEqual({ fromView: true, mainFrame: true, documentOrigin: ORIGIN, document: 1, bytes: Buffer.from('{"origin":"x"}'), senderKey: '7:4/1', topLevel: false })
     // The same routing pair is the same frame, a copy of the object or not.
     t.channel.request({ webContentsId: 7, frame: new FakeFrame(4, 1), uploadData: t.body() })
     expect(t.arrivals[1].mainFrame).toBe(true)
@@ -283,5 +283,28 @@ describe('KnowledgeBridgeChannel', () => {
     t.channel.send('{}', 1)
     expect(t.arrivals).toEqual([])
     expect(t.contents.mainFrame.scripts).toEqual([])
+  })
+
+  it('fills topLevel from the frame: top === frame, another top, or no frame', () => {
+    const t = setup()
+    t.contents.emit('did-navigate')
+    const main = t.contents.mainFrame
+    main.top = main
+    t.channel.request({ webContentsId: 7, frame: main, uploadData: t.body() })
+    expect(t.arrivals[0].topLevel).toBe(true)
+    expect(t.arrivals[0].mainFrame).toBe(true)
+    const other = new FakeFrame(4, 2)
+    other.top = new FakeFrame(9, 9)
+    t.channel.request({ webContentsId: 7, frame: other, uploadData: t.body() })
+    expect(t.arrivals[1].topLevel).toBe(false)
+    expect(t.arrivals[1].mainFrame).toBe(false)
+    const cached = new FakeFrame(4, 3)
+    cached.top = cached
+    t.channel.request({ webContentsId: 7, frame: cached, uploadData: t.body() })
+    expect(t.arrivals[2].mainFrame).toBe(false)
+    expect(t.arrivals[2].topLevel).toBe(true)
+    t.channel.request({ webContentsId: 7, frame: null, uploadData: t.body() })
+    expect(t.arrivals[3].topLevel).toBe(false)
+    expect(t.arrivals[3].mainFrame).toBeNull()
   })
 })

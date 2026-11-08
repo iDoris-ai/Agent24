@@ -1,5 +1,6 @@
 import net from 'node:net'
 import { describe, expect, it, vi } from 'vitest'
+import { IpcChannels } from '../shared/ipc-types'
 import {
   KNOWLEDGE_VIEW_DEV_URL_ENV,
   KNOWLEDGE_VIEW_PARTITION_PREFIX,
@@ -1444,5 +1445,76 @@ describe('bridge wiring (KB-C2-04a-2, U6.1, U6.6)', () => {
     post(t, 0, msg())
     expect(delivered(contents).at(-1)?.payload).toEqual({ result: 'rejected', code: 'unavailable', reason: 'not_ready' })
     expect(t.host.status()).toEqual({ state: 'ready' })
+  })
+})
+
+describe('citation strip (U7.2)', () => {
+  const REF = { knowledge_base_id: 'kb-1', knowledge_id: 'doc-1', chunk_id: 'c-1', source_revision: 'r1', index_build_id: 'b1', chunk_revision: 3, content_tag: 'tag-1' }
+  const envelopes = (scripts: string[]): Array<Record<string, any>> => scripts.map((s) => {
+    const m = /JSON\.parse\((.*)\) \}\)\)\}catch\{\};undefined$/.exec(s)
+    if (!m) throw new Error('script')
+    return JSON.parse(JSON.parse(m[1]))
+  })
+  const watch = (win: FakeWindow): unknown[][] => {
+    const sent: unknown[][] = []
+    ;(win as unknown as { webContents: { send: (...args: unknown[]) => void } }).webContents = {
+      send: (...args: unknown[]) => { sent.push(args) },
+    }
+    return sent
+  }
+  function citingUi() {
+    const reads: number[] = []
+    return {
+      reads,
+      factory: (): KnowledgeViewUi => ({
+        start: async () => true,
+        inject: () => ({ cancel: false, requestHeaders: {}, injected: false }),
+        responded: () => {},
+        destroy: () => {},
+        bridgeAdmission: () => ({ open: true, generation: 3 }),
+        citationScope: () => ['kb-1'],
+        readCitation: async (generation) => { reads.push(generation); return { ok: true, text: 'secret-chunk-text', contentTag: 'tag-1', title: 'Cited' } },
+      }),
+    }
+  }
+
+  it('sends the citation to the main window only, with the three ids', async () => {
+    const ui = citingUi()
+    const t = setup({ ui: ui.factory })
+    const sent = watch(t.env.win!)
+    await t.host.show(BOUNDS)
+    const contents = t.views[0].webContents
+    const viewSent: unknown[] = []
+    ;(contents as unknown as { send: (...args: unknown[]) => void }).send = (...args: unknown[]) => { viewSent.push(args) }
+    contents.emit('did-navigate', {}, URL_, 200)
+    const doc = envelopes(contents.mainFrame.scripts).find((m) => m.type === 'hello')?.document_id
+    const id = '01J9ZQ3V6R8XKQ4M2N5P7T0099'
+    const body = { v: 3, direction: 'page_to_host', type: 'citation', id, generation: 3, document_id: doc, payload: REF }
+    t.sessions[0].beforeRequest?.({ url: `${ORIGIN}/__agent24/bridge`, method: 'POST', webContentsId: contents.id, frame: contents.mainFrame, uploadData: [{ bytes: Buffer.from(JSON.stringify(body)) }] }, () => {})
+    await flush()
+    expect(ui.reads).toEqual([3])
+    expect(sent).toEqual([[IpcChannels.KnowledgeViewCitation, {
+      title: 'Cited',
+      text: 'secret-chunk-text',
+      ref: { knowledge_base_id: 'kb-1', knowledge_id: 'doc-1', chunk_id: 'c-1' },
+    }]])
+    expect(Object.keys((sent[0][1] as { ref: object }).ref).sort()).toEqual(['chunk_id', 'knowledge_base_id', 'knowledge_id'])
+    expect(viewSent).toEqual([])
+    expect(contents.mainFrame.scripts.join('\n')).not.toContain('secret-chunk-text')
+  })
+
+  it('destroy and a binding change each clear the strip', async () => {
+    const ui = citingUi()
+    const t = setup({ ui: ui.factory })
+    const sent = watch(t.env.win!)
+    await t.host.show(BOUNDS)
+    t.host.destroyAll('test')
+    expect(sent).toEqual([[IpcChannels.KnowledgeViewCitation, null]])
+    const again = setup({ ui: citingUi().factory })
+    const sent2 = watch(again.env.win!)
+    await again.host.show(BOUNDS)
+    again.env.binding = 'https://other.example/api/v1'
+    again.host.bindingChanged()
+    expect(sent2[0]).toEqual([IpcChannels.KnowledgeViewCitation, null])
   })
 })

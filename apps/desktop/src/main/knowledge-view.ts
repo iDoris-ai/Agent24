@@ -33,8 +33,10 @@ import { isPlainHostname } from './knowledge-hostname'
 import type { InjectDecision, InjectRequest } from './knowledge-ui-inject'
 import type { UiInstanceEvent } from './knowledge-ui-instance'
 import { UiSessionLedger, UI_SESSION_WINDOW_MS } from './knowledge-ui-session'
-import { KnowledgeBridge } from './knowledge-bridge'
+import { KnowledgeBridge, type CitationShown } from './knowledge-bridge'
 import { KnowledgeBridgeChannel, reservedRequest, type BridgeRequestDetails } from './knowledge-bridge-channel'
+import type { ChunkRead, CitationRef } from './knowledge-readonly'
+import { IpcChannels } from '../shared/ipc-types'
 import type {
   KnowledgeViewBounds,
   KnowledgeViewClosedCode,
@@ -303,6 +305,9 @@ export interface KnowledgeViewUi {
   destroy(): void
   /** U6.4 ⑬⑭ for the bridge (design §6: open while the session has a JWT it may inject). */
   bridgeAdmission(): { open: boolean; generation: number }
+  /** U7.2: settings ∩ the exchange, or null when admission is closed or there is no exchange. */
+  citationScope(): readonly string[] | null
+  readCitation(generation: number, ref: CitationRef, signal: AbortSignal): Promise<ChunkRead>
 }
 
 /** U6.6: the third violation closing within this window of one binding is final. */
@@ -780,6 +785,11 @@ export class KnowledgeViewHost {
         setTimer: this.setTimer,
         clearTimer: this.clearTimer,
         log: this.log,
+        citation: {
+          scope: () => ui.citationScope(),
+          read: (generation, ref, signal) => ui.readCitation(generation, ref, signal),
+          show: (shown) => this.showCitation(instance, shown),
+        },
       })
       instance.bridge = { bridge, channel: new KnowledgeBridgeChannel(view.webContents as never, bridge, this.now, this.log) }
       this.sendBridgeState(instance)
@@ -939,6 +949,7 @@ export class KnowledgeViewHost {
     }
     const instance = this.instance
     if (!instance) return
+    this.clearCitation(instance)
     this.instance = null
     // The bridge takes and sends nothing more (its listener goes with the seal below).
     try {
@@ -1037,6 +1048,35 @@ export class KnowledgeViewHost {
   private setState(state: KnowledgeViewState): void {
     this.state = state
     this.deps.onState?.(state)
+  }
+
+  /** U7.2: the citation strip. Only the main window, and only the three ids. */
+  private showCitation(instance: Instance, shown: CitationShown): void {
+    this.sendCitation(instance, {
+      title: shown.title,
+      text: shown.text,
+      ref: {
+        knowledge_base_id: shown.ref.knowledge_base_id,
+        knowledge_id: shown.ref.knowledge_id,
+        chunk_id: shown.ref.chunk_id,
+      },
+    })
+  }
+
+  /** A destroyed instance, or a binding change that destroys it, clears the strip. */
+  private clearCitation(instance: Instance): void {
+    this.sendCitation(instance, null)
+  }
+
+  private sendCitation(instance: Instance, payload: { title: string | null; text: string; ref: { knowledge_base_id: string; knowledge_id: string; chunk_id: string } } | null): void {
+    if (this.instance !== instance) return
+    const win = instance.window
+    try {
+      if (win.isDestroyed()) return
+      win.webContents?.send(IpcChannels.KnowledgeViewCitation, payload)
+    } catch (error) {
+      this.log(`[knowledge-view] citation failed: ${String(error)}`)
+    }
   }
 }
 

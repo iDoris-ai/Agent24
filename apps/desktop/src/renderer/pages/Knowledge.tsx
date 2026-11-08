@@ -4,7 +4,7 @@
 // sidebar entry that opens this page comes with #1625.
 
 import { useContext, useEffect, useRef, useState } from 'react'
-import type { KnowledgeViewResult, KnowledgeViewState, KnowledgeViewTheme } from '../../shared/ipc-types'
+import type { KnowledgeViewCitation, KnowledgeViewResult, KnowledgeViewState, KnowledgeViewTheme } from '../../shared/ipc-types'
 import { CapabilitiesContext } from '../capabilities/types'
 import { useT } from '../i18n'
 import { knowledgeViewMessages } from './Knowledge.i18n'
@@ -50,8 +50,10 @@ export default function KnowledgePage(): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
   const [result, setResult] = useState<KnowledgeViewResult | null>(null)
   const [state, setState] = useState<KnowledgeViewState | null>(null)
+  const [citation, setCitation] = useState<KnowledgeViewCitation>(null)
 
   useEffect(() => window.agent24.knowledgeView.onState((next) => setState(next)), [])
+  useEffect(() => window.agent24.knowledgeView.onCitation((next) => setCitation(next)), [])
 
   useEffect(() => {
     const host = hostRef.current
@@ -84,15 +86,24 @@ export default function KnowledgePage(): JSX.Element {
 
   const shown = shownFor(result, state)
   return (
-    <div ref={hostRef} className="knowledge-host">
-      {shown && (
-        <div className="knowledge-message" role="status">
-          <div>{t(shown.key as Parameters<typeof t>[0])}</div>
-          {shown.reloadable && <button className="btn btn-primary" type="button" onClick={reload}>{t('action.reload')}</button>}
-          {SETTINGS_KEYS.has(shown.key) && (
-            <button className="btn btn-primary" type="button" onClick={() => open('settings/connections', 'other')}>{t('action.openSettings')}</button>
-          )}
-        </div>
+    <div className="knowledge-page">
+      <div ref={hostRef} className="knowledge-host">
+        {shown && (
+          <div className="knowledge-message" role="status">
+            <div>{t(shown.key as Parameters<typeof t>[0])}</div>
+            {shown.reloadable && <button className="btn btn-primary" type="button" onClick={reload}>{t('action.reload')}</button>}
+            {SETTINGS_KEYS.has(shown.key) && (
+              <button className="btn btn-primary" type="button" onClick={() => open('settings/connections', 'other')}>{t('action.openSettings')}</button>
+            )}
+          </div>
+        )}
+      </div>
+      {citation && (
+        <aside className="knowledge-citation" aria-label={t('citation.title')}>
+          <div className="knowledge-citation-title">{citation.title ?? t('citation.untitled')}</div>
+          <div className="knowledge-citation-text">{citation.text}</div>
+          <button className="btn" type="button" onClick={() => setCitation(null)}>{t('citation.dismiss')}</button>
+        </aside>
       )}
     </div>
   )

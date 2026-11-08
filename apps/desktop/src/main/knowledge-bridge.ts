@@ -6,12 +6,13 @@
 // knowledge-bridge-channel.ts turns the partition's requests into
 // `BridgeArrival`s and carries the encoded messages back to the main frame.
 //
-// What the accepted messages then do is the handler's (04b: citation reads,
-// return to chat). This slice answers `status` and `cancel` itself and has
-// citation and intent wait for 04b: `unavailable/not_ready`, as for a bridge
-// that is not admitted yet (design §6: when unsure, not ready).
+// What the accepted messages then do is the handler's. This slice answers
+// `status`, `cancel` and `citation` (U7.2). `return_to_chat_intent` stays
+// `unavailable/not_ready` until 04b-2 (design §6: when unsure, not ready).
 
 import { createHash, randomBytes } from 'node:crypto'
+import { BridgeReadBudget } from './knowledge-bridge-budget'
+import type { ChunkRead, CitationRef } from './knowledge-readonly'
 import {
   BRIDGE_MAX_MESSAGE_BYTES,
   BRIDGE_SUPPORTED,
@@ -61,6 +62,18 @@ export interface BridgeArrival {
   bytes: Uint8Array | null
   /** For U6.4's per-sender counting of silent drops. */
   senderKey: string
+  /**
+   * R2-3: the frame's `top` is itself. A bfcache or prerender document is
+   * top-level and not the current main frame; that is a silent ⑤, not ②.
+   */
+  topLevel?: boolean
+}
+
+/** What the main window is shown for one citation (U7.2). The renderer gets fewer fields. */
+export interface CitationShown {
+  title: string | null
+  text: string
+  ref: CitationRef
 }
 
 export interface BridgeDeps {
@@ -78,9 +91,21 @@ export interface BridgeDeps {
   log: (message: string) => void
   /** Tests only. */
   viewInstanceId?: string
+  /**
+   * U7.2 citation read. Without it, citation stays `unavailable/not_ready`
+   * (04a-2). The budget is this view's, never the main conversation's.
+   */
+  citation?: {
+    scope: () => readonly string[] | null
+    read: (generation: number, ref: CitationRef, signal: AbortSignal) => Promise<ChunkRead>
+    show: (shown: CitationShown) => void
+  }
 }
 
-type Step = '①' | '②' | '③' | '⑤' | '⑥' | '⑦' | '⑧' | '⑨' | '⑪' | '⑫' | '⑬' | '⑭' | '⑮'
+type Step = '①' | '②' | '③' | '⑤' | '⑥' | '⑦' | '⑧' | '⑨' | '⑪' | '⑫' | '⑬' | '⑭' | '⑮' | '⑯'
+
+/** U6.7: messages in flight per document. `cancel` does not take a slot. */
+const BRIDGE_IN_FLIGHT = 4
 
 interface Backoff { from: number; until: number; strikes: number; struck: boolean }
 
@@ -123,12 +148,18 @@ export class KnowledgeBridge {
   private queuedState: HostMessage | null = null
   private flushTimer: unknown = null
   private lastState: HostMessage | null = null
+  /** ⑯: in flight for the current document. `document` is the one the task was admitted on. */
+  private readonly inflight = new Map<string, { type: string; document: number; abort: AbortController }>()
+  /** Replies finished while the document is pending (R2-1). Dropped by a new document and by destroy. */
+  private held: Array<{ document: number; go: () => void }> = []
+  private readonly budget: BridgeReadBudget
 
   constructor(private readonly deps: BridgeDeps) {
     this.viewInstanceId = deps.viewInstanceId ?? randomBytes(16).toString('base64url')
     this.logTag = createHash('sha256').update('kb-view-v1').update('\0').update(this.viewInstanceId).digest('base64url').slice(0, 16)
     this.refilledAt = deps.now()
     this.hostRefilledAt = deps.now()
+    this.budget = new BridgeReadBudget({ now: deps.now, setTimer: deps.setTimer, clearTimer: deps.clearTimer })
   }
 
   isClosed(): boolean {
@@ -143,6 +174,9 @@ export class KnowledgeBridge {
   /** U6.3: the main frame committed a new document (reloads too). Tables go, and it gets `hello`. */
   newDocument(document: number): void {
     if (this.closed) return
+    // The old document's in-flight reads are aborted and none of their replies go out (U6.3).
+    this.held = []
+    this.failInflight()
     this.document = document
     this.documentId = randomBytes(16).toString('base64url')
     this.seen = []
@@ -157,7 +191,7 @@ export class KnowledgeBridge {
   /** A navigation started: until the next document, nothing is delivered and nothing is taken. */
   leaveDocument(): void {
     this.document = null
-    this.queuedHello = false
+    // R2-1: a hello still waiting on the host budget is sent after resume.
     this.queuedState = null
   }
 
@@ -165,7 +199,13 @@ export class KnowledgeBridge {
   resumeDocument(document: number): void {
     if (this.closed) return
     this.document = document
+    const held = this.held
+    this.held = []
+    for (const item of held) {
+      if (item.document === document) item.go()
+    }
     if (this.lastState) this.queueState(this.lastState)
+    else this.flush()
   }
 
   /** U7.3 `state`; only the newest one waits when the budget is spent. */
@@ -179,6 +219,9 @@ export class KnowledgeBridge {
   destroy(): void {
     this.closed = true
     this.document = null
+    this.held = []
+    this.failInflight()
+    this.budget.destroy()
     if (this.flushTimer !== null) this.deps.clearTimer(this.flushTimer)
     this.flushTimer = null
   }
@@ -189,6 +232,8 @@ export class KnowledgeBridge {
     // ①–⑤: silent; from inside the view ②③ are hard violations (U6.6).
     if (this.closed || !arrival.fromView) return this.drop('①', arrival)
     if (arrival.mainFrame === null) return this.drop('⑤', arrival)
+    // R2-3: top-level but not the current main frame (bfcache, prerender) is silent.
+    if (!arrival.mainFrame && arrival.topLevel === true) return this.drop('⑤', arrival)
     if (!arrival.mainFrame) return this.hard('②', arrival)
     // An origin that cannot be read is not judged against the page.
     if (arrival.documentOrigin === null) return this.drop('⑤', arrival)
@@ -249,8 +294,13 @@ export class KnowledgeBridge {
     if (message.generation !== admission.generation) return this.reject('⑭', document, id, { code: 'invalid_request', reason: 'stale_generation' }, true)
     // ⑮ duplicate.
     if (this.seenSet.has(message.id)) return this.reject('⑮', document, id, { code: 'invalid_request', reason: 'duplicate_id' }, true)
-    // ⑯ holds: nothing of this slice stays in flight. 04b's citation reads and
-    // intents bring the table (≤4, intent ≤1, U6.7) with them.
+    // ⑯ in flight (U6.7). `cancel` takes no slot. A full table is uncounted (§9.3),
+    // and the id stays out of the dedupe table (U6.4: only what passes ⑯ is remembered).
+    if (message.payload.type !== 'cancel' && this.inflight.size >= BRIDGE_IN_FLIGHT) {
+      this.log('⑯', id, 'overloaded')
+      this.reply(document, id, { result: 'rejected', code: 'unavailable', reason: 'overloaded', retry_after_ms: BRIDGE_BACKOFF_MS })
+      return
+    }
     this.remember(message.id)
     this.handle(message, document)
   }
@@ -261,10 +311,76 @@ export class KnowledgeBridge {
     const type = message.payload.type
     // `status` is for the host's display only (U7.2); this slice shows nothing of it.
     if (type === 'status') return this.reply(document, message.id, { result: 'done' })
-    // Nothing of 04a-2 is ever in flight, so a cancel always finds no target (U7.2).
-    if (type === 'cancel') return this.reply(document, message.id, { result: 'accepted' })
-    // Citation and intent come with 04b.
+    if (type === 'cancel') return this.cancel(message, document)
+    if (type === 'citation') return this.cite(message, document)
+    // `return_to_chat_intent` waits for 04b-2. It does not take a slot here.
     this.reply(document, message.id, { result: 'rejected', code: 'unavailable', reason: 'not_ready' })
+  }
+
+  /** U7.2: the target's `rejected/cancelled` goes out first, then this message's `accepted`. A miss is only `accepted`. */
+  private cancel(message: PageMessage, document: number): void {
+    if (message.payload.type !== 'cancel') return
+    const target = this.inflight.get(message.payload.target_id)
+    if (target && target.document === document) {
+      this.inflight.delete(message.payload.target_id)
+      this.reply(document, message.payload.target_id, { result: 'rejected', code: 'cancelled' })
+      target.abort.abort()
+    }
+    this.reply(document, message.id, { result: 'accepted' })
+  }
+
+  private cite(message: PageMessage, document: number): void {
+    if (message.payload.type !== 'citation') return
+    const citation = this.deps.citation
+    if (!citation) return this.reply(document, message.id, { result: 'rejected', code: 'unavailable', reason: 'not_ready' })
+    const ref = message.payload.citation
+    const scope = citation.scope()
+    // U7.2: outside the visible set is the same answer as missing, and no read.
+    if (scope === null || !scope.includes(ref.knowledge_base_id)) {
+      return this.reply(document, message.id, { result: 'done', code: 'not_found' })
+    }
+    const abort = new AbortController()
+    const generation = this.deps.admission().generation
+    this.inflight.set(message.id, { type: 'citation', document, abort })
+    this.reply(document, message.id, { result: 'accepted' })
+    void this.finishCitation(message.id, document, generation, ref, abort)
+  }
+
+  private async finishCitation(id: string, document: number, generation: number, ref: CitationRef, abort: AbortController): Promise<void> {
+    const citation = this.deps.citation
+    if (!citation) return
+    const admittedDocumentId = this.documentId
+    const outcome = await this.budget.run((signal) => citation.read(generation, ref, signal), abort.signal)
+    // Already removed (cancel, a new document, destroy): that path owns the reply, or there is none.
+    if (!this.inflight.has(id)) return
+    this.inflight.delete(id)
+    if (outcome.kind === 'cancelled') return
+    const go = (): void => {
+      if (this.closed || this.document !== document || this.documentId !== admittedDocumentId) return
+      if (outcome.kind === 'overloaded') {
+        this.reply(document, id, { result: 'rejected', code: 'unavailable', reason: 'overloaded', retry_after_ms: BRIDGE_BACKOFF_MS })
+        return
+      }
+      const value = outcome.value
+      if (value.ok) {
+        if (this.deps.admission().generation >= 1) citation.show({ title: value.title, text: value.text, ref })
+        this.reply(document, id, { result: 'done' })
+        return
+      }
+      this.reply(document, id, value.reason ? { result: 'done', code: value.code, reason: value.reason } : { result: 'done', code: value.code })
+    }
+    if (this.document === null) {
+      this.held.push({ document, go })
+      return
+    }
+    go()
+  }
+
+  /** Abort every in-flight task and drop it, so a later completion sends nothing. */
+  private failInflight(): void {
+    const jobs = [...this.inflight.values()]
+    this.inflight.clear()
+    for (const job of jobs) job.abort.abort()
   }
 
   // ── steps ──────────────────────────────────────────────────────────────────
@@ -392,6 +508,10 @@ export class KnowledgeBridge {
   private emit(message: HostMessage, document: number): void {
     if (this.closed || document !== this.document || this.documentId === null) return
     const generation = this.deps.admission().generation
+    if (generation < 1) {
+      this.deps.log(`[knowledge-bridge] view=${this.logTag} not sent: generation`)
+      return
+    }
     const text = encodeHostMessage(message, newUlid(), generation, this.documentId)
     if (text === null) {
       this.deps.log(`[knowledge-bridge] view=${this.logTag} not sent: ${message.type} failed the host-side check`)
