@@ -21,6 +21,7 @@ import {
   type KnowledgeViewCitation,
   type KnowledgeViewConfirmAsk,
   type KnowledgeDraftEntry,
+  type KnowledgeEntryAdmission,
   type KnowledgeViewState,
   type KnowledgeViewTheme,
   type DocumentsImportProgress,
@@ -221,6 +222,11 @@ const api = {
       ipcRenderer.on(IpcChannels.KnowledgeDraftChanged, listener)
       return () => ipcRenderer.removeListener(IpcChannels.KnowledgeDraftChanged, listener)
     },
+  },
+  // KB-SOP-01a (#1669): main checks the conversation, then asks the user itself.
+  knowledgeEntry: {
+    admit: (conversationId: string): Promise<KnowledgeEntryAdmission> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeEntryAdmit, conversationId),
   },
   // ADR-DOC-01 D5: the Documenting OS, by operation, never by path.
   documents: {

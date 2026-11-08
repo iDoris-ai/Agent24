@@ -1066,6 +1066,43 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /sessions/{id}/source-floor:
+    get:
+      operationId: getSessionSourceFloor
+      x-milestone: KB-SOP-01a
+      tags: [sessions]
+      summary: How strict a conversation's sources were (read only)
+      description: |
+        KB-SOP-01a (#1669, decision 2026-11-09-floor-read-api). The strictest
+        of: the source floor of session {id}; each listed run's own source
+        tags; and the current floor of each listed run's session. Restricted
+        over unknown over missing over ordinary. A run this daemon has no
+        record of, a run without tags, a read that fails, or more than 64
+        run_id values is unknown (never cut short). missing means session {id}
+        has no floor and nothing listed is stricter. A run's session without a
+        floor adds nothing. Writes nothing; carries no conversation content.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+        - name: run_id
+          in: query
+          required: false
+          description: A run to fold in; repeat for several (at most 64).
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+      responses:
+        "200":
+          description: The folded classification
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionSourceFloor"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
   /runs:
     post:
       operationId: createRun
@@ -5407,6 +5444,15 @@ components:
                 type: string
               chunk_id:
                 type: string
+
+    SessionSourceFloor:
+      type: object
+      additionalProperties: false
+      required: [classification]
+      properties:
+        classification:
+          type: string
+          enum: [ordinary, restricted, unknown, missing]
 
     PeerRun:
       type: object

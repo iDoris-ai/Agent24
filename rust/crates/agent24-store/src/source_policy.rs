@@ -645,6 +645,19 @@ impl Store {
         Ok(merged)
     }
 
+    /// KB-SOP-01a (#1669): the session's stored floor, read only — it never
+    /// creates or changes the row, unlike [`Self::merge_session_floor`].
+    /// `None` when the session has none.
+    pub async fn session_floor(&self, session_id: &str) -> Result<Option<SourceClassification>> {
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT classification FROM session_source_floor WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(stored.as_deref().map(classification_from_column))
+    }
+
     /// K1-6b.4d (ADR-K1-02 §2.2): record, before the schedule itself is
     /// written, the classification a kernel-created schedule carries from the
     /// run that created it.
@@ -1068,6 +1081,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(other, Ordinary);
+    }
+
+    #[tokio::test]
+    async fn reading_a_session_floor_returns_what_was_merged_and_writes_nothing() {
+        let store = Store::open_memory().await.unwrap();
+        assert_eq!(store.session_floor("none").await.unwrap(), None);
+        store
+            .merge_session_floor("s", SourceClassification::Restricted, false, "t")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.session_floor("s").await.unwrap(),
+            Some(SourceClassification::Restricted)
+        );
+        // Reading a session without a floor creates no row for it.
+        assert_eq!(store.session_floor("none").await.unwrap(), None);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_source_floor")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 
     #[tokio::test]

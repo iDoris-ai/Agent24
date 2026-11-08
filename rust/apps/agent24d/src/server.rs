@@ -1654,6 +1654,11 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             post(crate::runs::create_session).get(crate::runs::list_sessions),
         )
         .route("/api/v1/sessions/{id}", get(crate::runs::get_session))
+        // KB-SOP-01a (#1669): read only; see source_floor.rs.
+        .route(
+            "/api/v1/sessions/{id}/source-floor",
+            get(crate::source_floor::get_source_floor),
+        )
         .route(
             "/api/v1/runs",
             post(crate::runs::create_run).get(crate::runs::list_runs),

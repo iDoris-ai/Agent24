@@ -206,6 +206,15 @@ fn section_3_rows_match_operation_and_level() {
         });
     }
 
+    // KB-SOP-01a (#1669) extends the frozen table: a session's source floor,
+    // read only, for the knowledge entry admission.
+    fixed.push(DesignRow {
+        method: "GET".into(),
+        path: "/sessions/{id}/source-floor".into(),
+        operation: "SessionRead".into(),
+        level: AssuranceLevel::Everyday,
+    });
+
     let mut catalog = BTreeSet::new();
     for policy in policies() {
         assert!(
