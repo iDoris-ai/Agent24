@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { act, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react'
+import { StrictMode } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ReactNode } from 'react'
 
@@ -7,7 +8,8 @@ import KnowledgePage from '../Knowledge'
 import { CapabilitiesContext, type CapabilitiesApi } from '../../capabilities/types'
 import { setLocale } from '../../i18n'
 import type { KnowledgeEntryAdmission } from '../../../shared/ipc-types'
-import { KnowledgeEntryPanel, requestEntry, useEntryMenu, usePendingEntry } from './knowledge-entry'
+import { KNOWLEDGE_PAGE, KnowledgeEntryPanel, requestEntry, useEntryMenu, usePendingEntry } from './knowledge-entry'
+import { CAPABILITIES } from '../../capabilities/registry'
 
 const admit = vi.fn<(id: string) => Promise<KnowledgeEntryAdmission>>()
 const status = vi.fn<() => Promise<{ active: boolean }>>()
@@ -43,8 +45,9 @@ describe('the history list action', () => {
     const [entry] = result.current.item('chat_abc')
     expect(entry).toMatchObject({ kind: 'item', key: 'knowledge-entry', label: '沉淀为知识条目', focuses: true })
     act(() => { void (entry as { onSelect: () => void }).onSelect() })
-    expect(open).toHaveBeenCalledWith('knowledge', 'other')
-    expect(result.current.pending).toBe('chat_abc')
+    expect(open).toHaveBeenCalledWith('knowledgeBase', 'other')
+    expect(result.current.pending).toMatchObject({ id: 'chat_abc' })
+    expect(admit).toHaveBeenCalledTimes(1)
   })
 
   it('does not appear while Knowledge is off, unbound, not yet known or not answering', async () => {
@@ -74,17 +77,29 @@ describe('the history list action', () => {
   })
 })
 
+describe('the Knowledge page id', () => {
+  it('is the registered Knowledge capability', () => {
+    expect(CAPABILITIES.some((c) => c.id === KNOWLEDGE_PAGE)).toBe(true)
+  })
+})
+
 describe('KnowledgeEntryPanel', () => {
-  it('asks main about the conversation by id only and says the answer', async () => {
-    admit.mockResolvedValue({ ok: true })
-    render(<KnowledgeEntryPanel id="chat_abc" />)
+  it('asks main once, from the request, by id only, and says the answer', async () => {
+    let answer: (a: KnowledgeEntryAdmission) => void = () => {}
+    admit.mockImplementation(() => new Promise((resolve) => { answer = resolve }))
+    const { result } = renderHook(() => usePendingEntry())
+    act(() => requestEntry('chat_abc'))
+    // StrictMode mounts twice; the question is still asked once.
+    render(<StrictMode><KnowledgeEntryPanel ask={result.current!} /></StrictMode>)
     expect(screen.getByRole('status')).toHaveTextContent('正在检查这条对话')
     expect(screen.queryByRole('button')).toBeNull()
-    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('可以整理成知识条目'))
+    expect(admit).toHaveBeenCalledTimes(1)
     expect(admit).toHaveBeenCalledWith('chat_abc')
+    await act(async () => answer({ ok: true }))
+    expect(result.current).toEqual({ id: 'chat_abc', state: 'done', answer: { ok: true } })
   })
 
-  it('says each refusal in plain words, with no way to go on anyway (N10c–e)', async () => {
+  it('says each refusal in plain words, with no way to go on anyway (N10c–e)', () => {
     const cases: Array<[KnowledgeEntryAdmission, string]> = [
       [{ ok: false, reason: 'restricted' }, '受限资料'],
       [{ ok: false, reason: 'unknown' }, '无法确认'],
@@ -93,15 +108,36 @@ describe('KnowledgeEntryPanel', () => {
       [{ ok: false, reason: 'knowledge_off' }, '未开启或未绑定'],
     ]
     for (const [answer, words] of cases) {
-      admit.mockResolvedValueOnce(answer)
-      const { unmount } = render(<KnowledgeEntryPanel id="chat_abc" />)
-      await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(words))
+      const { unmount } = render(<KnowledgeEntryPanel ask={{ id: 'c', state: 'done', answer }} />)
+      expect(screen.getByRole('status')).toHaveTextContent(words)
       expect(screen.getAllByRole('button').map((b) => b.textContent)).toEqual(['关闭'])
       unmount()
     }
-    admit.mockRejectedValueOnce(new Error('ipc'))
-    render(<KnowledgeEntryPanel id="chat_abc" />)
-    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('暂时无法检查'))
+    render(<KnowledgeEntryPanel ask={{ id: 'c', state: 'failed' }} />)
+    expect(screen.getByRole('status')).toHaveTextContent('暂时无法检查')
+  })
+
+  it('an answer main never gives reads as a failure, not as an admission', async () => {
+    const { result } = renderHook(() => usePendingEntry())
+    for (const bad of [undefined, { ok: 'yes' }, { ok: false, reason: 'toString' }, { ok: false, reason: 'weird' }]) {
+      admit.mockResolvedValueOnce(bad as unknown as KnowledgeEntryAdmission)
+      act(() => requestEntry('chat_abc'))
+      await waitFor(() => expect(result.current?.state).toBe('failed'))
+    }
+    admit.mockImplementationOnce(() => { throw new Error('no bridge') })
+    act(() => requestEntry('chat_abc'))
+    await waitFor(() => expect(result.current?.state).toBe('failed'))
+  })
+
+  it('a late answer to an earlier question does not overwrite a later one', async () => {
+    const answers: Array<(a: KnowledgeEntryAdmission) => void> = []
+    admit.mockImplementation(() => new Promise((resolve) => { answers.push(resolve) }))
+    const { result } = renderHook(() => usePendingEntry())
+    act(() => requestEntry('chat_a'))
+    act(() => requestEntry('chat_b'))
+    await act(async () => answers[1]({ ok: false, reason: 'restricted' }))
+    await act(async () => answers[0]({ ok: true }))
+    expect(result.current).toEqual({ id: 'chat_b', state: 'done', answer: { ok: false, reason: 'restricted' } })
   })
 
   it('shows on the Knowledge page while asked about, and closes', async () => {

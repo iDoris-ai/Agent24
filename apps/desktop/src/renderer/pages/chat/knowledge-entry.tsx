@@ -5,6 +5,7 @@
 // native dialog (main/knowledge-entry-ipc.ts). Drafting comes with KB-SOP-01b.
 
 import { useContext, useEffect, useState, useSyncExternalStore } from 'react'
+import type { CapabilityId } from '../../capabilities/types'
 import type { KnowledgeEntryAdmission } from '../../../shared/ipc-types'
 import { CapabilitiesContext } from '../../capabilities/types'
 import { defineMessages, useT } from '../../i18n'
@@ -61,14 +62,56 @@ export const knowledgeEntryMessages = defineMessages({
   },
 })
 
-// The conversation the Knowledge page is asked about. Module state, so the
-// list can hand it to the page without App or Chat carrying it.
-let pending: string | null = null
+/** The Knowledge page's capability id (capabilities/registry.ts). */
+export const KNOWLEDGE_PAGE: CapabilityId = 'knowledgeBase'
+
+/** What the Knowledge page shows about the conversation last asked about. */
+export type EntryAsk =
+  | { id: string; state: 'checking' }
+  | { id: string; state: 'done'; answer: KnowledgeEntryAdmission }
+  | { id: string; state: 'failed' }
+
+// Module state, so the list can hand the question to the page without App or
+// Chat carrying it. The question is asked once, from the click, never from a
+// render or an effect (StrictMode runs those twice).
+let current: EntryAsk | null = null
+let asked = 0
 const listeners = new Set<() => void>()
 
-export function requestEntry(id: string | null): void {
-  pending = id
+function publish(next: EntryAsk | null): void {
+  current = next
   for (const listener of listeners) listener()
+}
+
+/** Asks main about conversation `id`; null closes the panel. */
+export function requestEntry(id: string | null): void {
+  const token = ++asked
+  if (id === null) {
+    publish(null)
+    return
+  }
+  publish({ id, state: 'checking' })
+  let reply: Promise<unknown>
+  try {
+    reply = Promise.resolve(window.agent24.knowledgeEntry.admit(id))
+  } catch (err) {
+    reply = Promise.reject(err)
+  }
+  reply.then(
+    (answer) => {
+      if (token !== asked) return
+      publish(isAdmission(answer) ? { id, state: 'done', answer } : { id, state: 'failed' })
+    },
+    () => { if (token === asked) publish({ id, state: 'failed' }) },
+  )
+}
+
+/** Main's answer as the panel can show it; anything else reads as a failure. */
+function isAdmission(value: unknown): value is KnowledgeEntryAdmission {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as { ok?: unknown; reason?: unknown }
+  if (v.ok === true) return true
+  return v.ok === false && typeof v.reason === 'string' && Object.hasOwn(knowledgeEntryMessages.en, `refused.${v.reason}`)
 }
 
 function subscribe(listener: () => void): () => void {
@@ -76,8 +119,8 @@ function subscribe(listener: () => void): () => void {
   return () => { listeners.delete(listener) }
 }
 
-export function usePendingEntry(): string | null {
-  return useSyncExternalStore(subscribe, () => pending)
+export function usePendingEntry(): EntryAsk | null {
+  return useSyncExternalStore(subscribe, () => current)
 }
 
 /**
@@ -123,37 +166,25 @@ export function useEntryMenu(): (id: string) => MenuEntry[] {
     focuses: true,
     onSelect: () => {
       requestEntry(id)
-      open('knowledge', 'other')
+      open(KNOWLEDGE_PAGE, 'other')
     },
   }])
 }
 
-type Shown = { kind: 'checking' } | { kind: 'done'; answer: KnowledgeEntryAdmission } | { kind: 'failed' }
-
 /** The panel on the Knowledge page while a conversation is asked about. */
-export function KnowledgeEntryPanel({ id }: { id: string }): JSX.Element {
+export function KnowledgeEntryPanel({ ask }: { ask: EntryAsk }): JSX.Element {
   const t = useT(knowledgeEntryMessages)
-  const [shown, setShown] = useState<Shown>({ kind: 'checking' })
-  useEffect(() => {
-    let current = true
-    setShown({ kind: 'checking' })
-    window.agent24.knowledgeEntry.admit(id).then(
-      (answer) => { if (current) setShown({ kind: 'done', answer }) },
-      () => { if (current) setShown({ kind: 'failed' }) },
-    )
-    return () => { current = false }
-  }, [id])
-  const text = shown.kind === 'checking'
+  const text = ask.state === 'checking'
     ? t('panel.checking')
-    : shown.kind === 'failed'
+    : ask.state === 'failed'
       ? t('refused.failed')
-      : shown.answer.ok
+      : ask.answer.ok
         ? t('panel.admitted')
-        : t(`refused.${shown.answer.reason}`)
+        : t(`refused.${ask.answer.reason}`)
   return (
     <section className="knowledge-confirm" role="dialog" aria-modal="false" aria-label={t('panel.title')}>
       <p role="status">{text}</p>
-      {shown.kind !== 'checking' && (
+      {ask.state !== 'checking' && (
         <button className="btn" type="button" onClick={() => requestEntry(null)}>{t('action.close')}</button>
       )}
     </section>

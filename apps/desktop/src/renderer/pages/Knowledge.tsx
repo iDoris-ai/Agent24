@@ -113,7 +113,7 @@ export default function KnowledgePage(): JSX.Element {
           </div>
         )}
       </div>
-      {entry && <KnowledgeEntryPanel id={entry} />}
+      {entry && <KnowledgeEntryPanel ask={entry} />}
       {!entry && confirmAsk && (
         <section className="knowledge-confirm" role="dialog" aria-modal="false">
           <p className="knowledge-confirm-count">{t('confirm.count', { count: confirmAsk.count })}</p>

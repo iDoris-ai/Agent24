@@ -1,11 +1,18 @@
 // KB-SOP-01a (#1669): the one IPC call behind "沉淀为知识条目". The renderer
-// names a conversation by id and nothing else; main reads its own copy of
-// the conversation, refuses it in plain words unless the daemon says it is
-// Ordinary (knowledge-entry-admission.ts), and only then asks the user in a
-// native dialog whose text main builds. The renderer gets back only whether
-// the conversation was admitted and why not.
+// names a conversation by id and nothing else in this call; main reads the
+// conversation from the history store, refuses it in plain words unless the
+// daemon says it is Ordinary (knowledge-entry-admission.ts), and only then
+// asks the user in a native dialog whose text main builds. The renderer gets
+// back only whether the conversation was admitted and why not.
 //
-// What comes after an admission (redaction, the local draft) is KB-SOP-01b.
+// Trust: the history file is written by the renderer (ChatHistorySave), text
+// and run ids alike. The classification vouches for where an honest page's
+// replies came from; it cannot stop a compromised renderer that writes
+// arbitrary text into a conversation, which no check of run ids could either.
+//
+// What comes after an admission (redaction, the local draft) is KB-SOP-01b,
+// and it must draft from the record this admission judged (`judge` returns
+// it), never from a later read: the conversation may have moved on since.
 
 import type { IpcMain, IpcMainInvokeEvent } from 'electron'
 import type { ChatHistoryRecord } from '../shared/chat-history'
@@ -68,16 +75,22 @@ export function knowledgeEntryAdmitter(deps: KnowledgeEntryDeps) {
       return null
     }
   }
-  return async (event: IpcMainInvokeEvent, id: unknown): Promise<KnowledgeEntryAdmission> => {
+  /** The admission, and on success the very record it judged. */
+  const judge = async (event: IpcMainInvokeEvent, id: unknown): Promise<{ admission: KnowledgeEntryAdmission; record: ChatHistoryRecord | null }> => {
+    const admission = await decide(event, id)
+    return admission.answer.ok ? { admission: admission.answer, record: admission.record } : { admission: admission.answer, record: null }
+  }
+  const decide = async (event: IpcMainInvokeEvent, id: unknown): Promise<{ answer: KnowledgeEntryAdmission; record: ChatHistoryRecord | null }> => {
+    const answer = (value: KnowledgeEntryAdmission, record: ChatHistoryRecord | null = null) => ({ answer: value, record })
     // The list offers the action only while bound; this holds it to that.
-    if (!deps.bound()) return { ok: false, reason: 'knowledge_off' }
+    if (!deps.bound()) return answer({ ok: false, reason: 'knowledge_off' })
     const record = load(id)
-    if (!record) return { ok: false, reason: 'not_found' }
+    if (!record) return answer({ ok: false, reason: 'not_found' })
     // Refused before anything is asked: the user is told why, not asked to confirm.
     const first = await classify(record, deps.reader)
-    if (!first.ok) return first
+    if (!first.ok) return answer(first)
     // One dialog at a time; a second request is turned away, not queued.
-    if (asking) return { ok: false, reason: 'busy' }
+    if (asking) return answer({ ok: false, reason: 'busy' })
     asking = true
     let confirmed = false
     try {
@@ -94,13 +107,14 @@ export function knowledgeEntryAdmitter(deps: KnowledgeEntryDeps) {
       asking = false
     }
     // The conversation may have moved on while the dialog was open: judge it again as it is now.
-    if (!deps.bound()) return { ok: false, reason: 'knowledge_off' }
+    if (!deps.bound()) return answer({ ok: false, reason: 'knowledge_off' })
     const now = load(id)
-    if (!now) return { ok: false, reason: 'not_found' }
-    return admit(now, deps.reader, confirmed)
+    if (!now) return answer({ ok: false, reason: 'not_found' })
+    return answer(await admit(now, deps.reader, confirmed), now)
   }
+  return { judge, admit: async (event: IpcMainInvokeEvent, id: unknown): Promise<KnowledgeEntryAdmission> => (await judge(event, id)).admission }
 }
 
 export function registerKnowledgeEntryIpc(ipc: Pick<IpcMain, 'handle'>, guard: IpcGuard, deps: KnowledgeEntryDeps): void {
-  ipc.handle(IpcChannels.KnowledgeEntryAdmit, guard(knowledgeEntryAdmitter(deps)))
+  ipc.handle(IpcChannels.KnowledgeEntryAdmit, guard(knowledgeEntryAdmitter(deps).admit))
 }

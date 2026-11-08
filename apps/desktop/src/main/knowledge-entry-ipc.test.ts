@@ -29,7 +29,8 @@ function setup(over: Partial<KnowledgeEntryDeps> & { reading?: FloorReading; ans
     ...over,
     confirm,
   }
-  return { admit: knowledgeEntryAdmitter(deps), confirm, reads, set: (next: ChatHistoryRecord | null) => { record = next } }
+  const admitter = knowledgeEntryAdmitter(deps)
+  return { admit: admitter.admit, judge: admitter.judge, confirm, reads, set: (next: ChatHistoryRecord | null) => { record = next } }
 }
 
 describe('knowledgeEntryAdmitter', () => {
@@ -94,6 +95,21 @@ describe('knowledgeEntryAdmitter', () => {
     await vi.waitFor(() => expect(s.confirm).toHaveBeenCalledTimes(2))
     release(false)
     expect(await next).toEqual({ ok: false, reason: 'not_confirmed' })
+  })
+})
+
+describe('judge', () => {
+  it('hands main the very record it judged, and nothing on a refusal', async () => {
+    const s = setup()
+    const later = conversation([user('怎么请假'), reply('打开人事系统'), user('还有呢'), reply('找主管')])
+    s.confirm.mockImplementation(async () => { s.set(later); return true })
+    const judged = await s.judge(event, 'chat_abc')
+    expect(judged.admission).toEqual({ ok: true })
+    expect(judged.record).toBe(later)
+    const refused = setup({ reading: 'restricted' })
+    expect(await refused.judge(event, 'chat_abc')).toEqual({ admission: { ok: false, reason: 'restricted' }, record: null })
+    const no = setup({ answer: false })
+    expect((await no.judge(event, 'chat_abc')).record).toBeNull()
   })
 })
 
