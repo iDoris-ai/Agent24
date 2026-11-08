@@ -1178,6 +1178,52 @@ describe('UI session wiring (KB-C2-04a, U4.5, U4.7, U3.8)', () => {
     expect(reloads).toBe(1)
   })
 
+  it('a resume during the first load reloads once that load is done; one before loadURL does nothing (U4.5)', async () => {
+    let release: ((ok: boolean) => void) | undefined
+    const ui = fakeUi(() => new Promise<boolean>((resolve) => { release = resolve }))
+    const t = setup({ ui: ui.factory })
+    let finish: () => void = () => {}
+    { const pending = new Promise<void>((resolve) => { finish = resolve }); nextLoad = () => pending }
+    try {
+      const shown = t.host.show(BOUNDS)
+      await vi.waitFor(() => expect(ui.made).toHaveLength(1))
+      let reloads = 0
+      t.views[0].webContents.reload = () => { reloads++ }
+      // Before the first JWT: no page yet, nothing was asked for.
+      await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+      ui.made[0].context.onEvent({ kind: 'reload' })
+      release!(true)
+      await vi.waitFor(() => expect(t.views[0].webContents.loads).toHaveLength(1))
+      // The page's scripts ran into a pause and it lifted before the load finished.
+      ui.made[0].context.onEvent({ kind: 'reload' })
+      ui.made[0].context.onEvent({ kind: 'reload' })
+      expect(reloads).toBe(0)
+      finish()
+      expect(await shown).toEqual({ ok: true })
+      expect(reloads).toBe(1)
+      // Taken: a later load-finished path does not reload again.
+      await flush()
+      expect(reloads).toBe(1)
+    } finally {
+      nextLoad = () => Promise.resolve()
+    }
+  })
+
+  it('a resume before loadURL alone never reloads the page that follows (U4.5)', async () => {
+    let release: ((ok: boolean) => void) | undefined
+    const ui = fakeUi(() => new Promise<boolean>((resolve) => { release = resolve }))
+    const t = setup({ ui: ui.factory })
+    const shown = t.host.show(BOUNDS)
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+    let reloads = 0
+    t.views[0].webContents.reload = () => { reloads++ }
+    ui.made[0].context.onEvent({ kind: 'reload' })
+    release!(true)
+    expect(await shown).toEqual({ ok: true })
+    await flush()
+    expect(reloads).toBe(0)
+  })
+
   it('lets go of the partition listeners on destroy', async () => {
     const ui = fakeUi()
     const t = setup({ ui: ui.factory })

@@ -442,6 +442,11 @@ interface Instance {
   target: KnowledgeViewTarget
   /** The first load of the page finished. */
   loaded: boolean
+  /** U4.5: injection came back from a pause after the first load had begun
+   * but before it finished; the page is reloaded once that load is done. */
+  reloadPending: boolean
+  /** loadURL was called: the page's scripts may already be asking for data. */
+  navigating: boolean
   /** Hung (ADR §4): kept per instance so a hide/show round trip does not
    * put the hung page back over the content area. */
   unresponsive: boolean
@@ -578,6 +583,10 @@ export class KnowledgeViewHost {
         }
         instance.loaded = true
         if (this.visible && this.state.state === 'loading' && !instance.unresponsive) this.setState({ state: 'ready' })
+        if (instance.reloadPending) {
+          instance.reloadPending = false
+          if (!instance.view.webContents.isDestroyed()) instance.view.webContents.reload()
+        }
         resolve(true)
       }
       // A load that never settles would leave `loading` up for good, with no
@@ -598,7 +607,10 @@ export class KnowledgeViewHost {
       instance.proxied
         .then((): Promise<boolean> | boolean => (current() && instance.ui ? instance.ui.start() : true))
         .then(async (ready): Promise<boolean> => {
-          if (ready && current()) await instance.view.webContents.loadURL(instance.target.url)
+          if (ready && current()) {
+            instance.navigating = true
+            await instance.view.webContents.loadURL(instance.target.url)
+          }
           return ready
         })
         .then((ready) => {
@@ -702,7 +714,7 @@ export class KnowledgeViewHost {
     }) ?? null
     if (ui) wireKnowledgeUi(session, view.webContents, ui)
     const instance: Instance = {
-      view, session, window: win, binding, target, loaded: false, unresponsive: false, loading: null, httpFailed: false, ui,
+      view, session, window: win, binding, target, loaded: false, reloadPending: false, navigating: false, unresponsive: false, loading: null, httpFailed: false, ui,
       onWindowClosed: () => { if (this.instance === instance) this.destroy('window closed') },
       proxied: (this.deps.proxyPort ?? (() => knowledgeViewBlackhole((m) => this.log(m))))().then((port) => session.setProxy(knowledgeViewProxyConfig(target.origin, port))),
     }
@@ -765,7 +777,13 @@ export class KnowledgeViewHost {
     if (this.instance !== instance) return
     if (event.kind === 'reload') {
       // U4.5: what was cancelled while injection was paused is asked for again.
-      if (instance.loaded && !instance.view.webContents.isDestroyed()) instance.view.webContents.reload()
+      // During the first load the reload waits for that load to finish; before
+      // loadURL (the first JWT still coming) nothing has been asked for yet.
+      if (instance.loaded) {
+        if (!instance.view.webContents.isDestroyed()) instance.view.webContents.reload()
+      } else if (instance.navigating) {
+        instance.reloadPending = true
+      }
       return
     }
     if (event.kind === 'rebuild') {
