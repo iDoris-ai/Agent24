@@ -6,12 +6,15 @@
   "$defs": {
     "id": { "type": "string", "minLength": 1, "maxLength": 256 },
     "withdraw_request": {
-      "type": "object", "additionalProperties": false, "required": ["knowledge_id"],
-      "properties": { "knowledge_id": { "$ref": "#/$defs/id" } }
+      "description": "Sent by the embedded page's UI session (W1.6): request_id, no generation.",
+      "type": "object", "additionalProperties": false, "required": ["request_id", "knowledge_id"],
+      "properties": { "request_id": { "$ref": "candidate.schema.json#/$defs/request_id" }, "knowledge_id": { "$ref": "#/$defs/id" } }
     },
     "withdraw_response": {
-      "type": "object", "additionalProperties": false, "required": ["knowledge_id", "withdrawn"],
+      "type": "object", "additionalProperties": false, "required": ["request_id", "authz_version", "knowledge_id", "withdrawn"],
       "properties": {
+        "request_id": { "$ref": "candidate.schema.json#/$defs/request_id" },
+        "authz_version": { "$ref": "candidate.schema.json#/$defs/authz_version" },
         "knowledge_id": { "$ref": "#/$defs/id" },
         "withdrawn": { "const": true },
         "details": { "type": "object", "additionalProperties": false, "properties": { "already": { "const": true } } }

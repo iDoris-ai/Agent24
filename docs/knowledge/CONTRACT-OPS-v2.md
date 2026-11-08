@@ -21,7 +21,7 @@
 - **W1.1** 每个写操作由服务端逐请求重新计算授权：principal 只取自凭据（R1.5），E 按 R2.1；操作类必须同时在凭据的操作范围内、且在 A 对目标所在范围的授予里。结果码见 W1.9 ③。
 - **W1.2** 写操作的响应与审计回报当次判定用的 `authz_version`；客户端不得缓存它来跳过判定。粒度为"主体 × 资源"（资源含 KB 与组织级授予），服务端可以保守地多变，多变只会让依赖它的记录更早失效。
 - **W1.3** **后台作业沿用授权**：job 记下建立时的操作类、principal、`credential_id`、目标 KB 与 `authz_version`、`policy_version`、`config_version`、generation（只记录）。每个阶段边界按序复验：① principal 当前仍在目标 KB 上持有**建立该 job 的操作类**；② 建立 job 的凭据未被撤销；③ 当前政策仍允许下一步的目的地与费用。主索引阶段 ①② 不成立 → `cancelled/authorization_revoked`；③ 不成立 → `failed`（`policy_denied` / `budget_exhausted`）；增强阶段不成立只停增强（`stop_reason` 同名）。多项不成立取序号最小者。**凭据过期不算撤销**；**续签替换旧凭据也不算撤销**（等同过期）；只有签发权威对该凭据或其续签后继的撤销使 ② 不成立。撤销事实须可判定到所有引用它的 job 终态且费用 `final`。
-- **W1.4** **客户端准入**：Provider 只在 binding 可服务（含 `degraded`）**且**准入开放（STATE 术语：`persist_pending` 为假、无未解除的待复验、不在作废中）时发出写操作，否则按 STATE §6 给本地结果。另看最近一次就绪结果中操作对应的就绪键：`pack.*` → `operations.pack`；`candidate.*`、`entry.withdraw` → `operations.candidate`；其余新建工作的操作 → `operations.ingest`；`job.*`、`document.*`、`approval.*` 没有对应键。Provider 只发出 `candidate.propose`；`candidate.review`、`candidate.approve`、`entry.withdraw` 由嵌入页的 UI 会话发出（W1.6）。键为 `disabled` → 本地 `unavailable`、`reason: "operation_disabled"`、`retryable: false`（与服务端 W1.9 ② 同义，不新增 code）；新建工作的操作另要求键为 `ready`，`not_ready` 或尚无结果 → 本地 `not_ready`（可重试）。本地拒绝都不发网络请求、不改变 STATE 状态。写请求带 `request_id` 与 `generation`（R7.2），多 binding 时只发往目标 KB 所属的 binding；写操作（含 `pack.load`）的响应都不是 STATE S5.10 的输入，`pack.load` 的 `scope_mismatch` 只按 W7.14 使该包占位。
+- **W1.4** **客户端准入**：Provider 只在 binding 可服务（含 `degraded`）**且**准入开放（STATE 术语：`persist_pending` 为假、无未解除的待复验、不在作废中）时发出写操作，否则按 STATE §6 给本地结果。另看最近一次就绪结果中操作对应的就绪键：`pack.*` → `operations.pack`；`candidate.*`、`entry.withdraw` → `operations.candidate`；其余新建工作的操作 → `operations.ingest`；`job.*`、`document.*`、`approval.*` 没有对应键。Provider 只发出 `candidate.propose`；`candidate.review`、`candidate.approve`、`entry.withdraw` 由嵌入页的 UI 会话发出（W1.6）。键为 `disabled` → 本地 `unavailable`、`reason: "operation_disabled"`、`retryable: false`（与服务端 W1.9 ② 同义，不新增 code）；新建工作的操作另要求键为 `ready`，`not_ready` 或尚无结果 → 本地 `not_ready`（可重试）。本地拒绝都不发网络请求、不改变 STATE 状态。写请求带 `request_id` 与 `generation`（R7.2），多 binding 时只发往目标 KB 所属的 binding；UI 会话发出的写请求（W1.6）只带 `request_id`，不带 `generation`（UI 会话没有宿主侧的 generation，服务端也不回显）；写响应回显 `request_id`（Provider 发出的还回显 `generation`，R7.5）并带 W1.2 的 `authz_version`；§8 的报文形状见 W8.14；写操作（含 `pack.load`）的响应都不是 STATE S5.10 的输入，`pack.load` 的 `scope_mismatch` 只按 W7.14 使该包占位。
 - **W1.5** **结果未知**：写请求（`*.read` 与 `pack.load` 除外；`pack.load` 走 W7.10、W7.12，Off 记 `skipped/knowledge_off`）发出后，服务端结果没有交给调用方的任何路径——generation 作废中止、迟到或 generation 过期的响应被丢弃（S4.6）、追加前复查换码（包括 Off 换成的 `knowledge_off`）——本地结果一律带 `details.write_outcome: "unknown"`（有幂等键的附上键），界面不得声称"未保存"。待决写记录（操作类、请求体、幂等键、`binding_id`）在**发出请求之前**持久化，确认后才发出，持久化失败则不发出（按 STATE §6 得 `local_storage`），得到确定结果后清除；它是宿主侧记录，按 STATE S1.10 的先持久后生效原则处理，不是 STATE 的持久状态，与 0.2、I2 不冲突。重启或 Tool 重试只能在**同一 binding**（同一 `binding_id`）内**用同一键与同一请求体**重发，**不得换新键自动重发**。该 binding 已退役、身份元组（S2.4：principal、端点、租户或实例）任一项已变，或待决时间超过服务端幂等保留期（W3.3）时，宿主不再重发，保持 `unknown` 并提示用户自行确认。
 - **W1.6** **与业务决定无关的机制约束**：
   - 授权只来自 A 与凭据，不从 retrieve 能力、页面角色、上游 RBAC、组织名、License、激活状态或请求体字段（归属、创建人、`approved`、`role`）推导；这些字段被忽略并记审计。
@@ -37,7 +37,7 @@
   - **存在性不可区分的补充**：草稿对 `pack.approve` / `pack.publish` 的"可见"本身就要求在 pack 范围内持有同名操作类且能读全部来源，所以 (c) 不会出现，持有他处授予或读不了来源都得 `not_found`。`candidate.approve` 与 `candidate.review` 的目标是候选，候选可见本身要求调用者在候选的目标 KB 上持有对应操作类，所以 (c) 不会出现；候选指向的修订目标文档在 ⑤ 才检查（W8.5）。`pack.publish` 出示的 `approval_id` 是参数而非目标，在 ④ 之后判定。
   - **唯一例外**：同一主体在保留期内对**自己**已删除（含仍在删除中）、已撤回、已放弃、已作废、已撤销的对象重复执行天然幂等操作，返回 200 与 `details.already: true`（W3.1）。
 - **W1.10** Off、取消选用或停用 profile、注销都**不取消**已建立的 job。注销只撤销该 binding 的长期登录态与 UI 会话族（U4.10、U4.11），**不撤销已签出的凭据 C**，因而不构成 W1.3 ② 的撤销，已建立 job 的授权不变。动作前若受影响 binding 有本宿主发起、未终态或 `cost.final` 为 `false` 的 job，宿主必须提示"有 n 个处理仍在进行、会继续产生费用"并提供先取消的入口（Off 汇总全部 binding）。使 binding 进入 `retired` 的事件（移除 profile、换实例、principal 变化、改端点或租户，S2.4）同样提示：这些 job 仍在服务端运行，退役后宿主无法再读取或取消，需用户自行确认；能预知的（移除 profile、改端点或租户）在动作前提示，其余在发现时提示。以上"不取消"针对远端服务；local-managed 停用或移除时 sidecar 停止（S2.3），其上的 job 随之中断（按 W5.7 恢复或 `failed/interrupted`），提示改为"有 n 个处理将中断"。
-- **W1.11** **矩阵之外的上游写路由一律不开放**：凭据只能执行 §2 的操作类，其他会改变状态的上游路由（含**删除与清空 KB**、移动、复制、批量操作、手工知识更新、标题与图片信息更新、重新生成摘要）对凭据返回 `forbidden/operation_not_allowed`。集成模式下，任何会改变**未下架的 `origin: "entry"` 文档**检索可见内容、所在 KB 或存在与否的路由都按机制拒绝，例外只有 `candidate.approve`（`revise`）、`entry.withdraw` 与同字节同解读方式的 `ingest.reprocess`；上游的手工知识编辑与 `PUT /knowledge/manual/:id` 一类路由不能成为候选或条目的写入路径（它们只看库写权限、带 publish 直接入索引，会绕过 W8.5 的复验）。经本契约之外的途径（如上游管理员路由）删除或清空 KB 时，服务端必须**先**按 W8.10 下架其中未下架的条目文档、把指向它的 `submitted` 候选按 W8.6 退回（原因 `target_gone`，审计原因 `kb_deleted`），再执行（决定 #A14）。
+- **W1.11** **矩阵之外的上游写路由一律不开放**：凭据只能执行 §2 的操作类，其他会改变状态的上游路由（含**删除与清空 KB**、移动、复制、批量操作、手工知识更新、标题与图片信息更新、重新生成摘要）对凭据返回 `forbidden/operation_not_allowed`。集成模式下，任何会改变**未下架的 `origin: "entry"` 文档**检索可见内容、所在 KB 或存在与否的路由都按机制拒绝，例外只有 `candidate.approve`（`revise`）、`entry.withdraw` 与同字节同解读方式的 `ingest.reprocess`；上游的手工知识编辑与 `PUT /knowledge/manual/:id` 一类路由不能成为候选或条目的写入路径（它们只看库写权限、带 publish 直接入索引，会绕过 W8.5 的复验）。经本契约之外的途径（如上游管理员路由）删除或清空 KB 时，服务端必须**先**按 W8.10 下架其中未下架的条目文档、把**以该 KB 为目标的全部** `submitted` 候选（`create` 与 `revise` 都算）按 W8.6 退回（原因 `target_gone`，审计原因 `kb_deleted`），再执行（决定 #A14）。
 
 ## 2. 操作类与授权矩阵
 
@@ -124,7 +124,7 @@
 - **W7.12** 加载响应按 STATE 的接受规则处理，追加进上下文之前再查准入与 generation；Off 之后不注入。
 - **W7.13** 每次加载记审计（请求主体、run、逐包 `pack_id`、`pack_version`、结果与 `reason`），不含包内容。
 - **W7.14** **已注入内容的占位**（决定 #A9）：之后的模型调用里，下列已注入版本换成不含正文的占位：(a) 某次结果点名该 `pack_id` 的 vN 为 `expired` / `invalidated` → 该 `pack_id` 已注入且版本号 ≤ N 的全部版本；(b) 某次结果中该 `pack_id` 以任何结果出现（含逐包跳过）、版本号为 N → 已注入且版本号 **< N** 的旧版本，不以 N 实际注入为前提（被取代的旧版本不再单独复验，一律不再重发；决定 #B24）；(c) 该 `pack_id` 不再出现在结果里（只按 `attached` / `empty` / `skipped` 判定，`failed` 或未发请求不算）→ 全部已注入版本；(d) 某次结果对该 `pack_id` 的 vN 报 `scope_mismatch` → 已注入的 vN 及按 (b) 的更旧版本。(d) 是包级占位：不改 STATE S5.10 的可见集合、不递增 generation、不计入撤权窗口（S3.1）；读者永久读不了某个来源 KB 时，也只会让该包占位，不会计入窗口。来源 KB 的真实收窄仍由对该 KB 的 search、read、带 scope 的就绪（S5.10）发现。`policy_denied`、`over_budget`、`not_yet_valid` 本身不使 N 占位，只豁免 N 自身、不豁免 (b)。判断只依据该包所在 binding 按 W7.12 接受的加载结果，在组装本次模型请求之前执行；占位注明「已被新版取代」「已过期 / 已失效」或「当前无权读取全部来源」，按触发原因如实标注；已占位的不恢复。`failed` 或未发请求不构成新版或包消失的证据，不新增占位，也不恢复旧正文（未知变化不保证即时发现）。包内容作为证据记下**全部**来源 KB（S5.6 允许一条证据记多个 KB），任一被占位规则覆盖即占位。
-- **W7.15** **批准与发布两步**：`pack.approve` 判定（W1.9 ③）批准人在 pack 范围持有 `pack.approve`（与 `candidate.approve` 是不同授予）且能读全部来源，以及 #996 的职责分离，产生 `purpose: "pack.publish"` 的批准记录（绑定 `pack_id`、`pack_version`、`approval_digest`、`policy_version`，有效期与单次使用同 W8.4）。`pack.publish` 由发布人**出示** `approval_id`；发布人不必是起草人或批准人。⑤ 的顺序与结果：批准记录存在、用途与 `pack_id` / `pack_version` 相符、`active` → 否则 `forbidden/approval_invalid`，批准不变；`approval_digest` 一致 → 否则同上；批准人仍持有 `pack.approve` 且能读全部来源 → 否则 `approval_invalid`，批准 `void`；`policy_version` 为当前 → 否则 `stale/policy_changed`，`void`；来源全部仍有效 → 否则 `stale/source_changed|source_withdrawn`，`void`；起草人仍能读全部 `omitted_sources` → 否则 `omitted_source_unreadable`，`void`；摘录、有效期、预算 → 对应 `invalid_request`，`void`；版本号大于该 `pack_id` 所有曾发布版本 → 否则 `stale/version_superseded`，`void`。成功时批准置 `used`，同一 `pack_id` 原 `published` 版本同时变 `superseded`。使批准作废的拒绝写幂等记录（W3.2）。**本人记录的细分**：调用者就是批准人时，`approval_invalid` 改写为 `approval_used` / `approval_expired` / `approval_void`（含本次因批准人失权而作废）/ `approval_mismatch`；他人或不存在的记录只给 `approval_invalid`（决定 #B19）。
+- **W7.15** **批准与发布两步**：`pack.approve` 判定（W1.9 ③）批准人在 pack 范围持有 `pack.approve`（与 `candidate.approve` 是不同授予）且能读全部来源，以及 #996 的职责分离，产生 `purpose: "pack.publish"` 的批准记录（绑定 `pack_id`、`pack_version`、`approval_digest`、`policy_version`；`valid_until` 为签发后 1 小时，单次使用，由发布人出示）。`pack.publish` 由发布人**出示** `approval_id`；发布人不必是起草人或批准人。⑤ 的顺序与结果：批准记录存在、用途与 `pack_id` / `pack_version` 相符、`active` → 否则 `forbidden/approval_invalid`，批准不变；`approval_digest` 一致 → 否则同上；批准人仍持有 `pack.approve` 且能读全部来源 → 否则 `approval_invalid`，批准 `void`；`policy_version` 为当前 → 否则 `stale/policy_changed`，`void`；来源全部仍有效 → 否则 `stale/source_changed|source_withdrawn`，`void`；起草人仍能读全部 `omitted_sources` → 否则 `omitted_source_unreadable`，`void`；摘录、有效期、预算 → 对应 `invalid_request`，`void`；版本号大于该 `pack_id` 所有曾发布版本 → 否则 `stale/version_superseded`，`void`。成功时批准置 `used`，同一 `pack_id` 原 `published` 版本同时变 `superseded`。使批准作废的拒绝写幂等记录（W3.2）。**本人记录的细分**：调用者就是批准人时，`approval_invalid` 改写为 `approval_used` / `approval_expired` / `approval_void`（含本次因批准人失权而作废）/ `approval_mismatch`；他人或不存在的记录只给 `approval_invalid`（决定 #B19）。
 - **W7.16** 每个 `pack_id` 任何时刻至多一个 `published`，同一 `pack_id` 的发布串行；旧版本不能在新版本之后重新发布，恢复旧内容只能以它为底起草新版本。
 
 ## 8. 知识条目：候选、批准与下架
@@ -150,7 +150,7 @@
     3. `revise` 时目标文档对调用者可见、未下架、不在删除中（否则 `not_found`）且是由候选发布出来的条目文档（`origin: "entry"`；否则 `forbidden/operation_not_allowed`），并且 `expected_source_revision` 等于当前源修订（否则 `stale/base_revision_changed`，附 `current_revision`）；
     4. 该主体同时处于 `submitted` 的候选不超过 20 条（否则 `forbidden/quota_exceeded`）。
   - 成功后保存候选，返回 `{candidate_id, status: "submitted", content_sha256, submitted_at}`，`candidate_id` 是服务端生成的 ≥128 bit 随机值。
-  - 同一主体在同一目标 KB 上以相同 `mode`、`knowledge_id`、`content_sha256` 已有 `submitted` 候选时，返回 200 和那一条，带 `details.outcome: "existing"`。
+  - 同一主体在同一目标 KB 上以相同 `mode`、`knowledge_id`、`expected_source_revision`、`content_sha256` 已有 `submitted` 候选时，返回 200 和那一条，带 `details.outcome: "existing"`。
   - 提交**不建 job、不进索引、不产生费用**，也不在目标 KB 里留下任何文档或上游草稿行。
 - **W8.3** **读面隔离**：
   - 候选不出现在 search、read、文档与分块列表、wiki、标签、任何计数与聚合、ContextPack 里，只能经 `candidate.*` 读到。
@@ -161,7 +161,7 @@
   - 转移是比较并设置：并发时只有一个成功，其余得 `stale/candidate_not_submitted`。
   - 同一主体对自己已终态的候选重复执行同一动作（撤回已撤回的、退回已退回的），按 W1.9 例外返回 `already: true`。
   - 候选一旦提交就不能修改；要改，只能撤回后重新提交，得到新的 `candidate_id` 与新的 hash。
-- **W8.5** **批准**（`candidate.approve`，带 `idempotency_key` 与 `candidate_id`）。
+- **W8.5** **批准**（`candidate.approve`；不另带 `idempotency_key`，以 `candidate_id` 为幂等键，见 W3.1）。
   - 由批准人经嵌入页 UI 会话发出（W1.6），请求体必须带 `candidate_id` 与 `content_sha256`。③ 要求批准人此刻在候选的目标 KB 上持有 `candidate.approve`。
   - ⑤ 的顺序（取第一个不成立的）：
     1. 候选为 `submitted`（否则 `stale/candidate_not_submitted`）；
@@ -205,7 +205,7 @@
   - 每条字段：principal、`candidate_id`、`content_sha256`、目标 KB、`mode`、`knowledge_id`、基础修订、`kind`、`return_reason`、`author_is_approver`、`provenance.session_ref`、`skill_version`、`redaction_rules_version`；`entry.withdraw` 另记 `source_revision`。
   - 不记 `title`、`body`、`note`。
 - **W8.13** **条目 hash（方案 1）**：
-  - 服务端**不做 Unicode 规范化**，只对收到的确定字节计算；规范形式由客户端在保存草稿时就得到：`title` 不含首尾空白；`kind`、`title`、`body` 都不含 `\r`（含 `\r` 得 `invalid_request`）。宿主建议在保存草稿时做 NFC 与换行统一，再按存下的文本计算 hash。
+  - 服务端**不做 Unicode 规范化**，只对收到的确定字节计算；规范形式由客户端在保存草稿时就得到：`title` 不含首尾空白；`kind`、`title`、`body` 都不含 `\r`（含 `\r` 得 `invalid_request`）；三者都必须是合法的 Unicode 标量值序列，不含孤立代理项（JSON 里的 `\uD800` 之类），含孤立代理项的请求在 W1.9 ② 得 `invalid_request`，因为 ECMAScript 会把它转义输出、其他实现可能拒绝解析，两侧算不出同一个 hash。客户端算 hash 前检查（如 `String.prototype.isWellFormed`）。宿主建议在保存草稿时做 NFC 与换行统一，再按存下的文本计算 hash。
   - `content_sha256` = 小写 hex 的 SHA-256(UTF-8(`JSON.stringify([1, kind, title, body])`))。数组首位的 `1` 是方案号；序列化与 ECMAScript `JSON.stringify` 相同（不留空白；非 ASCII 字符原样输出 UTF-8，不转义成 `\u`；控制字符按其规则转义）。
   - 固定样例（含中文、emoji、引号、制表符与控制字符）见 `protocol/knowledge/fixtures/ops-v2/entry-hash.samples.json`，Rust 与 TS 两侧各自重算。改方案要升方案号，按 §0.3 属于语义变更。
 - **W8.14** **机器可验证部分**：请求与响应的 schema 在 `protocol/knowledge/ops-v2/`（`candidate.schema.json`、`entry.schema.json`），用例在 `protocol/knowledge/fixtures/ops-v2/schema-cases.json`；`packages/contract-tests/src/knowledge-ops-v2.test.ts`（Ajv）与 `rust/crates/agent24-protocol/tests/knowledge_ops_v2.rs`（jsonschema）对每条用例给出同一结论，并核对 §6 的枚举与 schema 一致。schema 表达不了的规则（`message_range` 的先后、按字节的大小、受限 Markdown 白名单、hash 本身）由服务端与实现任务的测试证明。
@@ -232,7 +232,7 @@
 - #A11 加载类别顺序 `personal` → `org` → `group`。
 - #A12 v2 支持异人审批：候选提交到服务端候选表（#1667 R0 一致 B，`~/.claude/decisions/2026-11-09-m3-intake/`）；跨设备草稿不做（M3 不做）。
 - #A13 Off、切换、注销不取消在途 job，动作前提示并给取消入口；binding 退役同样提示；local-managed 停用或移除会中断 job（W1.10）。
-- #A14 删除或清空 KB 先下架其中未下架的条目、退回指向它们的候选；凭据不能删除或清空 KB（W1.11）。
+- #A14 删除或清空 KB 先下架其中未下架的条目、退回以该 KB 为目标的全部 `submitted` 候选；凭据不能删除或清空 KB（W1.11）。
 - #B1 `authz_version` 粒度为主体 × 资源，可保守多变。 · #B2 后台复验建立 job 的操作类 + 凭据未撤销 + 政策。 · #B3 / #B20 幂等与 job 记录至少 90 天。
 - #B4 去重键为 KB + SHA-256 + 规范化文件类型。 · #B5 命中失败或取消的文档返回 `existing`，不自动重做。 · #B6 `config_version` 不进默认库唯一键。
 - #B7 上游 `finalizing` 映射为 `indexed` + `enrichment: "running"`。 · #B8 取消、失败不回退当前源修订。 · #B9 对无工作的 job 取消返回 200 `cancel_effect: "none"`。
@@ -257,5 +257,6 @@ v1 从未实施，所以下面的改动只在文档层；服务端与客户端�
 6. 撤回拆成两条：候选撤回（作者，`submitted → withdrawn`，W8.8）与已发布条目下架（`entry.withdraw`，W8.10）。
 7. 新增条目 hash 方案 1（W8.13），新增 `stale/candidate_not_submitted`、候选状态与 `return_reason`（§6）。
 8. 宿主义务写明（W8.1）：准入 Ordinary + 显式确认（David 2026-11-09 定）、规则表是唯一硬闸门、只取用户与助手正文。
+9. §8 报文带公共字段（W1.4、W8.14）：Provider 发出的请求带 `request_id` 与 `generation`，UI 会话发出的只带 `request_id`；响应回显 `request_id`（Provider 的还回显 `generation`）并带 `authz_version`（W1.2）。v1 没有 schema，这一条只是把 W1.2、W1.4 写进 schema。
 
 v1 文件改名为本文件（`git mv`），引用已同步；`rust/apps/agent24d/src/knowledge_probe.rs:18` 的注释仍写 OPS-v1，按 M3「不碰 agent24d」约束留到下次修改该文件时一并改。

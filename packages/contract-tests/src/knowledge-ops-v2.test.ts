@@ -23,7 +23,7 @@ const BASE = 'https://github.com/iDoris-ai/Agent24/protocol/knowledge/ops-v2/'
 // Pins both fixture files. Changing one means re-pinning here and in
 // rust/crates/agent24-protocol/tests/knowledge_ops_v2.rs together.
 const FIXTURE_SHA256: Record<string, string> = {
-  'schema-cases.json': '127430af1ff6d883c02fc75bd267ed3377da40d8a3bc8fa1dad72f3552db2f67',
+  'schema-cases.json': '7165cff286c00eb4b73fa335dcd38e558f881b12d0f6072de1d036c179071348',
   'entry-hash.samples.json': 'c8069d60b6ee2e5789aa2cfa7a4dfb1c08228cfef16ca78bbdf8fedc2cbf5b2e',
 }
 const load = (file: string): any => JSON.parse(readFileSync(join(fixtureDir, file), 'utf8'))
