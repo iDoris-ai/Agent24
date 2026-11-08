@@ -74,6 +74,29 @@ describe('a conversation\'s runs on the page (M4 A2)', () => {
     expect(item('chat_a')?.tasks).toEqual([expect.objectContaining({ run_id: 'run_1', kind: 'task' })])
   })
 
+  it('keeps the promotion when the save\'s last try fails before main answers it (Codex A2 r2)', async () => {
+    const releases: (() => void)[] = []
+    setRetrySleepForTests(() => new Promise<void>(resolve => { releases.push(resolve) }))
+    const save = bridge.save as ReturnType<typeof vi.fn>
+    let failLast!: (e: Error) => void
+    save.mockRejectedValueOnce(new Error('disk busy')).mockRejectedValueOnce(new Error('disk busy'))
+      .mockImplementationOnce(() => new Promise((_, reject) => { failLast = reject }))
+    let answer!: (s: null) => void
+    ;(bridge.promoteRun as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise(resolve => { answer = resolve }))
+    const saved = saveConversation(record('chat_a', '周报'))
+    for (let i = 0; i < 2; i++) { await flush(); releases[i]() }
+    await flush()
+    const promoted = promoteRun('chat_a', 'run_1')
+    failLast(new Error('disk busy'))
+    expect(await saved).toBe(false)
+    answer(null)
+    expect(await promoted).toBe(false)
+    // The page writes the conversation again on its next change.
+    expect(await saveConversation(record('chat_a', '周报', '2026-11-08T02:00:00.000Z'))).toBe(true)
+    await flush()
+    expect(item('chat_a')?.tasks).toEqual([expect.objectContaining({ run_id: 'run_1', kind: 'task' })])
+  })
+
   it('reads the list again when main\'s own modules change a conversation', async () => {
     const off = subscribeHistory(() => {})
     await saveConversation(record('chat_a', '周报'))

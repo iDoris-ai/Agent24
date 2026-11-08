@@ -194,13 +194,16 @@ export async function promoteRun(id: string, runId: string): Promise<boolean> {
   const history = api()
   if (!history) return false
   const mine = ++seq
+  // Asked while a save of it was on its way: main may answer that save (even
+  // its last failed try) before this (Codex A2 r2).
+  const saving = unsaved.has(id)
   const summary = await history.promoteRun(id, runId).catch(() => null)
   if (removedSince(id, mine)) return false
   if (!summary) {
     // Not on file yet: its first save is still being tried (Codex A2 C2).
-    // The run is promoted once that save lands; a run is not seen waiting on
-    // its approval twice.
-    if (unsaved.has(id)) promoteAfterSave.set(id, [...(promoteAfterSave.get(id) ?? []), runId])
+    // The run is promoted once a save of it lands; a run is not seen waiting
+    // on its approval twice.
+    if (saving || unsaved.has(id)) promoteAfterSave.set(id, [...(promoteAfterSave.get(id) ?? []), runId])
     return false
   }
   publishedAt.set(id, ++seq)
