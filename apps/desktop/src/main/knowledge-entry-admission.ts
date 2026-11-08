@@ -11,8 +11,13 @@
 //   /api/v1/chat replies merge into the floor of the chat's session_id, which
 //   is the history record's id; a failed Knowledge turn only stores local text.
 // - Every reply with a run id adds that run's classification.
-// - The strictest one wins. A missing floor, a run that cannot be found or
-//   read, or Unknown anywhere refuses.
+// - The strictest one wins. A run that cannot be found or read, or Unknown
+//   anywhere, refuses.
+// - The conversation's own floor must exist only when some reply has no run
+//   id (General 2026-11-09, option ②, #1669): a conversation answered wholly
+//   by Knowledge runs never touched /api/v1/chat, so its floor is missing by
+//   design and its runs say all. A failed Knowledge turn stores local text
+//   without a run id, so it still needs the floor: fail closed.
 
 import type { ChatHistoryRecord } from '../shared/chat-history'
 
@@ -44,6 +49,11 @@ export function replyRuns(record: Pick<ChatHistoryRecord, 'messages'>): string[]
   return [...seen]
 }
 
+/** Whether some reply has no run id, i.e. came from /api/v1/chat or was a failed Knowledge turn. */
+function hasReplyWithoutRun(record: Pick<ChatHistoryRecord, 'messages'>): boolean {
+  return record.messages.some((message) => message.role === 'assistant' && message.run_id === null)
+}
+
 const RANK: Record<FloorReading, number> = { ordinary: 0, missing: 1, unknown: 2, restricted: 3 }
 
 /** The strictest of `readings`; an empty list is Unknown, never Ordinary. */
@@ -71,7 +81,9 @@ export async function classify(record: Pick<ChatHistoryRecord, 'id' | 'messages'
   } catch {
     return { ok: false, reason: 'unknown' }
   }
-  if (!(reading in RANK)) return { ok: false, reason: 'unknown' }
+  if (!Object.hasOwn(RANK, reading)) return { ok: false, reason: 'unknown' }
+  // `missing` is only ever the answer when every listed run is Ordinary.
+  if (reading === 'missing' && runs.length > 0 && !hasReplyWithoutRun(record)) return { ok: true }
   return refuse(reading)
 }
 

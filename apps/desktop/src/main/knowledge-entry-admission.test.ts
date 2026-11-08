@@ -70,6 +70,23 @@ describe('classify (N10a, N10c–h)', () => {
     const conversation = record([user('q'), reply('a')])
     expect(await classify(conversation, { read: vi.fn(async () => { throw new Error('daemon down') }) })).toEqual({ ok: false, reason: 'unknown' })
     expect(await classify(conversation, { read: vi.fn(async () => 'public' as unknown as FloorReading) })).toEqual({ ok: false, reason: 'unknown' })
+    expect(await classify(conversation, { read: vi.fn(async () => 'toString' as unknown as FloorReading) })).toEqual({ ok: false, reason: 'unknown' })
+  })
+
+  it('a conversation answered only by Knowledge runs needs no floor of its own (option ②)', async () => {
+    const d = daemon('missing', { run_1: 'ordinary', run_2: 'ordinary', run_bad: 'restricted' })
+    expect(await classify(record([user('q'), reply('a', 'run_1'), user('q2'), reply('b', 'run_2')]), d.reader)).toEqual({ ok: true })
+    // A stricter run still refuses.
+    expect(await classify(record([user('q'), reply('a', 'run_1'), reply('b', 'run_bad')]), d.reader)).toEqual({ ok: false, reason: 'restricted' })
+    expect(await classify(record([user('q'), reply('a', 'run_1'), reply('b', 'run_gone')]), d.reader)).toEqual({ ok: false, reason: 'unknown' })
+  })
+
+  it('any reply without a run id still needs the floor, a failed Knowledge turn too (option ②)', async () => {
+    const d = daemon('missing', { run_1: 'ordinary' })
+    // e.g. the local text a failed Knowledge turn stores.
+    expect(await classify(record([user('q'), reply('a', 'run_1'), user('q2'), reply('failed')]), d.reader)).toEqual({ ok: false, reason: 'floor_missing' })
+    // Nothing answered at all: there is nothing to vouch for the conversation.
+    expect(await classify(record([user('q')]), d.reader)).toEqual({ ok: false, reason: 'floor_missing' })
   })
 
   it('more runs than the limit are refused without asking, never cut short', async () => {
