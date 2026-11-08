@@ -1,6 +1,6 @@
 # Knowledge UI 身份交换与消息桥契约 v1（CONTRACT-UI-BRIDGE-v1）
 
-> **状态**：规范核心 v1，已评审合入；KB-R1/R2 只实施了长期登录态的本机存储（`knowledge-logins.ts`）和 C 不进 renderer（U1.4）。KnowledgeView、一次性票据、session JWT 与消息桥**没有实施**（11-11 后）。条款按 READONLY r8 写成，现行 READONLY 为 r11（r11 定了决定 #25，见 U1.3）；U7 的引用字段按 READONLY r9 起的 `content_tag` 修订（决定 #35）；U3.4、U3.8 补服务端重启信号（决定 #36）。· **日期**：2026-10-20，修订 2026-11-08 · **桥报文** `v: 2`（决定 #35 按 §0 变更规则递增；`v: 1` 从未实施，宿主不支持；文中其余「v1」指本契约文档版本）
+> **状态**：规范核心 v1，已评审合入；已实施：长期登录态的本机存储（`knowledge-logins.ts`）和 C 不进 renderer（U1.4，KB-R1/R2）；KnowledgeView 容器、分区隔离与死代理（U4.1–U4.4、U4.6–U4.8 中与会话无关的部分，KB-C2-03 #1622 与决定 #30）。一次性票据、session JWT 与注入在 KB-C2-04a（#1623）实施中；消息桥**没有实施**。条款按 READONLY r8 写成，现行 READONLY 为 r11（r11 定了决定 #25，见 U1.3）；U7 的引用字段按 READONLY r9 起的 `content_tag` 修订（决定 #35）；U3.4、U3.8 补服务端重启信号（决定 #36）；决定 #30（WebRTC 的 TCP）按真机读数定案。· **日期**：2026-10-20，修订 2026-11-08 · **桥报文** `v: 2`（决定 #35 按 §0 变更规则递增；`v: 1` 从未实施，宿主不支持；文中其余「v1」指本契约文档版本）
 > **依据**：`docs/knowledge/CONTRACT-READONLY-v1.md`（下称 READONLY，按 r8；例外：引用 read、分块分页与 `content_tag` 的日志规则按现行 r11 的 R4.1、R4.3、R4.5、R4.7、R10.3，决定 #35）；`docs/knowledge/CONTRACT-STATE-v1.md`（下称 STATE，规范核心 v1，PR #1113；本文依赖它的规则汇总在 §8.2）。
 > 由完整版 `ab/weknora-03b-ui-bridge`（#1077 的分支）压缩而来。本文只写对外行为与不变式；实现机制由各实现任务以代码和测试证明。
 > 编号：`R*` 为 READONLY 规则，`S*` 为 STATE 规范核心 v1（同批）的条款，`U*` 为本文规则（沿用完整版编号，空号即已移出规范），`决定 #n` 见 §9.1（已定）与 §9.5（待决）。
@@ -77,7 +77,7 @@
 ## 5. view 实例、注入与销毁
 
 - **U4.1** 每个 view 实例的分区不持久，不跨 binding 共享存储；分区名不由 profile 名、用户路径、URL 或明文 principal 生成。
-- **U4.2** **页面能力下限**：无 Node、无 preload、`contextIsolation` 与 `sandbox` 开启；拒绝 `window.open`、跨 origin 导航、`file://`、自定义协议与下载；不授予任何权限、设备选择、屏幕共享，不自动出示任何客户端证书（不论事件来自 app 还是 view）；生产构建无 DevTools、无远程调试、无 Node 调试与 `RunAsNode` 入口。CSP 下限：资源与连接只来自允许 origin（含其 ws/wss），禁止任何子 frame、Worker、`object`、`<base>`，表单只能提交到允许 origin，`frame-ancestors 'none'`。WebRTC 不暴露非代理 UDP，残余风险见决定 #30。
+- **U4.2** **页面能力下限**：无 Node、无 preload、`contextIsolation` 与 `sandbox` 开启；拒绝 `window.open`、跨 origin 导航、`file://`、自定义协议与下载；不授予任何权限、设备选择、屏幕共享，不自动出示任何客户端证书（不论事件来自 app 还是 view）；生产构建无 DevTools、无远程调试、无 Node 调试与 `RunAsNode` 入口。CSP 下限：资源与连接只来自允许 origin（含其 ws/wss），禁止任何子 frame、Worker、`object`、`<base>`，表单只能提交到允许 origin，`frame-ancestors 'none'`。WebRTC 不暴露非代理 UDP；WebRTC 的 TCP（TURN、ICE-TCP）按决定 #30 送进不通的代理。
 - **U4.3** Service Worker 不得生效：一旦出现注册，立即注销并清除其存储。
 - **U4.4** 允许 origin：remote 只能是可信 profile 配置里的 `https`，证书错误一律拒绝且没有放行入口；`http` 只允许 local-managed 握手记下的 loopback（`127.0.0.1` 或 `[::1]`）；允许 origin 不取自页面或服务端响应。main 自己的兑换与探测请求同样受限。
 - **U4.5** **注入**：宿主先剥除每个请求自带的 `Authorization` 与 view 证明头（大小写不敏感），再只为同时满足下列条件的请求注入 JWT 与 view 证明：① 来自当前 view 实例的主 frame；② 是 fetch/XHR、WebSocket 或白名单内的主文档导航；③ origin 与允许 origin 完全一致（`http`↔`ws`、`https`↔`wss`），且仍是握手时的值；④ 规范化后的 pathname 在 UI 路径前缀白名单内，原始路径不含 `%2f`、`%5c`；⑤ 注入未暂停、Provider 存活信号新鲜（≤1 秒），local-managed 的 sidecar ready 且握手有效。判断不了即不注入。①–④ 成立、只因 ⑤ 不成立的请求被取消，不无认证发出。子资源不注入；重定向逐跳重判，跨 origin 那一跳不带这两个头。首个 JWT 就绪后宿主才加载页面。**恢复即重载**：注入从暂停恢复时重新加载当前文档；只有当这次暂停的全部原因都是"当前 C 被替换"或"存活信号短暂不新鲜"时才不重载。
@@ -166,6 +166,7 @@
 - #35 `citation`（及 `return_to_chat_intent` 的引用）补必填 `content_tag`，与 READONLY R4.1、R4.7（r9 起）一致；`chunk_revision` 保留、只作参考；按 §0 变更规则桥报文 `v` 由 1 升为 2（David 2026-11-08 确认 D，经 General 转达；证据裁决 R1 未收敛）。确认框标题由宿主重新 read 取得，`content_tag` 只覆盖分块正文、不覆盖标题。
 - #36 服务端重启信号（#1645）：服务端按 U2.3 末句让重启前签出的 session JWT 失效时，在资源入口与会话探测的 `unauthorized/credential_invalid` 上加 `details.restarted: true`（排在 view 证明核对之后）；兑换不带（U2.7）。多项失败时的取值顺序见 U3.4（过期优先于重启信号，所以「早于重启且已过期」的 JWT 走续期）。纪元只让重启前签出的 JWT 失效，重启后在原族内铸新票不受它约束：过期后的续期和 U3.6 用掉约 2/3 寿命时的主动续期都会照常成功。这是 C2-01b2 方案 B 的残余（WeKnora 台账 A24-KB-33 已登记），只有三件事同时成立时才有影响：泄露撤族（U2.8）写库失败、重试成功前进程重启、攻击者还能拿到新铸的票据。把纪元判定挪到过期前面补不上这条路。宿主照常做 view 级处理，只是不计入 `session_rejected` 计数，同一 binding 10 分钟（滑动窗口）内至多免计 3 次重启事件（按事件、不按 view 记）；签名密钥须跨重启不变（local-managed 依赖 KB-LITE-01a 持久化）；票据与 JWT 同样不能只靠时间比较认重启。服务端可以借频繁置位，让每 10 分钟至多约 4 次重启事件（每次重建受影响的全部 view）自动恢复而不进入 `session_rejected`；只有服务端能置位，有界，不是绕过路径；宿主按本文解码 UI 路径的响应，必须接受 `restarted`。证据裁决中档，R1 收敛（R0 三方都选这一做法；READONLY §0.3「忽略未知字段」与 Agent24 现有严格 schema 看似冲突，进 R1 核实：严格的是生产端 wire 类型，接收端宽容；R1 后仍是这一做法，置信度 70/90/82；宿主侧 Knowledge 独立同意），按 2026-11-08 规则直接执行。U3.8 的解码要求来自 R1。
 - #25 UI 操作与 C 的关系按 READONLY r11 的 R1.8、R2.8 处理：C 可签发与撤销票据，不计入数据操作范围；`ops` 是独立的只读展示清单（David 2026-11-08 确认，证据裁决 R0 一致）。
+- #30 WebRTC 的 TCP（TURN over TCP、ICE-TCP active）既不经 webRequest，也不受 CSP 约束，`disable_non_proxied_udp` 只管 UDP。宿主给每个 KnowledgeView 分区设固定代理：`proxyRules` 指向 main 自己监听、来连接就断开的本机端口（死代理），不写 DIRECT；`proxyBypassRules` 为 `<-loopback>;<允许 origin 的精确 host:port>`，主机名只能是普通主机名或 IP 字面量，端口不得为 0（bypass 里 0 表示任意端口）；页面的首次加载等代理设好之后才发。允许 origin 是 IPv6 字面量时，CSP 的源写 `'self'`，因为 Chromium 的 CSP 不接受方括号主机。真机读数（2026-11-08 第三包，提交 34c87c4e，`127.0.0.1:port` 与 `[::1]:port` 各跑一遍，均 33/33）：TURN 与 ICE-TCP 的连接数都是 0；同一构建去掉死代理的对照组里，TURN 连上 1 次、ICE-TCP 连上 2 次，说明 0 来自代理；第二个分区同样是 0；没有死代理的对照组里，外部 origin 仍被 webRequest 与 CSP 共同挡住。残余，不在保证范围内：TURN 主机名与 dns-prefetch 的 DNS 解析发生在代理之前；允许的服务端本身可以充当中继。David 2026-11-08 确认修正版 B（经 General 转达；证据裁决大档，三家裁判都把它排第一）。
 
 ### 9.2 宿主侧 KnowledgeView `closed` 的 `code`（闭集）
 `session_rejected`、`revocation_mismatch`、`probe_failed`、`empty_scope`、`crash_loop`、`bridge_closed`。`closed` 不自动恢复；binding 级销毁也使它结束。各码的出口（用户操作后新建 view 实例，仍按 U2.1 取得会话）：
@@ -194,7 +195,7 @@
 ### 9.5 仍待决（按 v1 默认执行，不得自行放宽；编号沿用完整版 §10）
 - #8、#9 宿主内部谁铸票、私有接口形式、登录态存放（KB-HOST-01；涉及内核接口须知会 jason）。#11 签发权威撤销刷新令牌的接口（#992）。
 - #21 引用 ID 字符集与 R5.2 同步（READONLY 下一修订）。#29 新 `reason` `credential_near_expiry`（READONLY 下一修订）。
-- #22–#24、#27、#28、#30、#32 工程值与实测项（intent 窗口与预算、分区上限、`worker-src`、CSP 放宽、服务端记录持久化、WebRTC 残余风险、Node `https` 信任库与代理），由 KB-C2-01/03/04a 实测后定。
+- #22–#24、#27、#28、#32 工程值与实测项（intent 窗口与预算、分区上限、`worker-src`、CSP 放宽、服务端记录持久化、Node `https` 信任库与代理），由 KB-C2-01/03/04a 实测后定。
 
 ## 10. 非规范材料
 
