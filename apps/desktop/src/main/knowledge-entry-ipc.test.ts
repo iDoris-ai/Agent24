@@ -111,6 +111,17 @@ describe('judge', () => {
     const no = setup({ answer: false })
     expect((await no.judge(event, 'chat_abc')).record).toBeNull()
   })
+
+  it('judges the record it hands back: a Restricted run added during the dialog refuses', async () => {
+    // A reader that answers from the runs it is asked about.
+    const reader: AdmissionReader = { read: async (_id, runs) => (runs.includes('run_secret') ? 'restricted' : 'ordinary') }
+    const s = setup({ reader })
+    s.confirm.mockImplementation(async () => {
+      s.set(conversation([user('怎么请假'), reply('打开人事系统'), user('机密呢'), reply('…', 'run_secret')]))
+      return true
+    })
+    expect(await s.judge(event, 'chat_abc')).toEqual({ admission: { ok: false, reason: 'restricted' }, record: null })
+  })
 })
 
 describe('knowledgeEntryAdmitter while Knowledge is off', () => {

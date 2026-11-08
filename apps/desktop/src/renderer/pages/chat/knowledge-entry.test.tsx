@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, renderHook, screen, waitFor, within } from '@testing-library/react'
 import { StrictMode } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ReactNode } from 'react'
@@ -90,13 +90,17 @@ describe('KnowledgeEntryPanel', () => {
     const { result } = renderHook(() => usePendingEntry())
     act(() => requestEntry('chat_abc'))
     // StrictMode mounts twice; the question is still asked once.
-    render(<StrictMode><KnowledgeEntryPanel ask={result.current!} /></StrictMode>)
-    expect(screen.getByRole('status')).toHaveTextContent('正在检查这条对话')
-    expect(screen.queryByRole('button')).toBeNull()
+    expect(result.current).toEqual({ id: 'chat_abc', state: 'checking' })
+    // The page under StrictMode (mounted twice) shows it; nothing asks again.
+    render(<StrictMode><KnowledgePage /></StrictMode>)
+    const panel = await screen.findByRole('dialog', { name: '知识条目' })
+    expect(panel).toHaveTextContent('正在检查这条对话')
+    expect(within(panel).queryByRole('button')).toBeNull()
     expect(admit).toHaveBeenCalledTimes(1)
     expect(admit).toHaveBeenCalledWith('chat_abc')
     await act(async () => answer({ ok: true }))
-    expect(result.current).toEqual({ id: 'chat_abc', state: 'done', answer: { ok: true } })
+    expect(screen.getByRole('dialog', { name: '知识条目' })).toHaveTextContent('可以整理成知识条目')
+    expect(admit).toHaveBeenCalledTimes(1)
   })
 
   it('says each refusal in plain words, with no way to go on anyway (N10c–e)', () => {
