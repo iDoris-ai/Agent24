@@ -197,13 +197,11 @@ export async function readCitationChunk(deps: ReadonlyDeps, generation: number, 
     if (cursor !== null) body.page = { cursor }
     const posted = await post(deps, credential, body, signal)
     if ('ok' in posted) return posted
-    // R6.2: an error envelope is read by its code, whatever the HTTP status; a success is only a 200.
-    // A success body is known first (§0.3: unknown fields, an `error` among them, are ignored).
-    const success = isObj(posted.json) && 'segments' in posted.json
-    if (!success && isObj(posted.json) && isObj(posted.json.error)) return readError(posted.json, requestId, generation)
-    if (posted.status !== 200) return fail('internal')
-    const parsed = readPage(posted.json, requestId, generation, ref)
-    if (!isPage(parsed)) return parsed
+    // R6.2: an error envelope is read by its code, whatever the HTTP status. A success is a 200 whose
+    // body passes every check; only that wins over an `error` field (§0.3: unknown fields are ignored).
+    const envelope = isObj(posted.json) && isObj(posted.json.error)
+    const parsed = posted.status === 200 ? readPage(posted.json, requestId, generation, ref) : fail('internal')
+    if (!isPage(parsed)) return envelope ? readError(posted.json, requestId, generation) : parsed
     if (page === 1) title = plainTitle(parsed.titleRaw)
     text += parsed.text
     if (Buffer.byteLength(text, 'utf8') > READ_MAX_TEXT_BYTES) return fail('internal', 'too_large')

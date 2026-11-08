@@ -163,6 +163,16 @@ describe('readCitationChunk', () => {
     }
   })
 
+  it('an error envelope with an extra segments field is still read by its code, on a 200 or not', async () => {
+    const base = fixture('read.not-found.json').response.body
+    for (const status of [200, 404]) {
+      for (const segments of [null, [], [{ chunk_id: 'x' }]]) {
+        const { deps } = client((call) => ({ status, json: async () => ({ ...(echo(base, call) as object), segments }) }))
+        expect(await read(deps)).toEqual({ ok: false, code: 'not_found' })
+      }
+    }
+  })
+
   it('a success body on another status is internal', async () => {
     const { deps } = client((call) => ({ ...okPage(call.body), status: 203 }))
     expect(await read(deps)).toEqual({ ok: false, code: 'internal' })
