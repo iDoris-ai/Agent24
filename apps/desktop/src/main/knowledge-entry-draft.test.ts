@@ -497,3 +497,92 @@ describe('entry draft store, PR-Daemon round 1', () => {
     }
   })
 })
+
+// Codex review of the round-1 fixes (8d00bd36..b3a9455c).
+describe('entry draft store, Codex on round 1', () => {
+  const asideOf = (root: string, id: string) => path.join(root, `${id}.withdrawn.tmp`)
+
+  it('C1: an unreadable event log puts nothing back and sweeps nothing', () => {
+    const now = { t: Date.UTC(2026, 0, 1) }
+    const store = createEntryDraftStore(dir, () => new Date(now.t))
+    const draft = store.create(draftInput())
+    const root = path.join(dir, 'knowledge-entries')
+    const rm = vi.spyOn(fs, 'rmSync').mockImplementationOnce(() => { throw Object.assign(new Error('busy'), { code: 'EBUSY' }) })
+    try { expect(store.withdraw(draft.id)).toBe(true) } finally { rm.mockRestore() }
+    const old = new Date(now.t - 2 * 60 * 60 * 1000)
+    fs.utimesSync(asideOf(root, draft.id), old, old)
+    now.t += 2 * 60 * 60 * 1000
+    const events = path.join(root, '_events.jsonl')
+    const real = fs.readFileSync
+    const read = vi.spyOn(fs, 'readFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (file === events) throw Object.assign(new Error('io'), { code: 'EIO' })
+      return (real as (...a: unknown[]) => unknown)(file, ...rest)
+    }) as typeof fs.readFileSync)
+    try {
+      expect(store.list()).toEqual([])
+      expect(store.get(draft.id)).toBeNull()
+      expect(fs.existsSync(asideOf(root, draft.id))).toBe(true)
+    } finally {
+      read.mockRestore()
+    }
+    expect(store.list()).toEqual([])
+    expect(fs.existsSync(asideOf(root, draft.id))).toBe(false)
+  })
+
+  it('C2: an event after a torn last line still counts', () => {
+    const store = createEntryDraftStore(dir, clock())
+    const a = store.create(draftInput({ title: 'A' }))
+    const b = store.create(draftInput({ title: 'B' }))
+    const root = path.join(dir, 'knowledge-entries')
+    expect(store.withdraw(a.id)).toBe(true)
+    // The app stopped mid-append once: a torn line with no line break.
+    fs.appendFileSync(path.join(root, '_events.jsonl'), '{"at":"2026-01-01T00:00:00.000Z","id":"ked_')
+    const rm = vi.spyOn(fs, 'rmSync').mockImplementationOnce(() => { throw Object.assign(new Error('busy'), { code: 'EBUSY' }) })
+    try { expect(store.withdraw(b.id)).toBe(true) } finally { rm.mockRestore() }
+    // B's file is still aside, and its event must be read as recorded.
+    expect(store.list()).toEqual([])
+    expect(store.get(b.id)).toBeNull()
+    const lines = fs.readFileSync(path.join(root, '_events.jsonl'), 'utf8').split('\n')
+    expect(lines.filter((l) => l.includes(b.id) && l.endsWith('}'))).toHaveLength(1)
+  })
+
+  it('C6: get, update and withdraw put back an unrecorded aside themselves', () => {
+    for (const act of ['get', 'update', 'withdraw'] as const) {
+      const store = createEntryDraftStore(dir, clock())
+      const draft = store.create(draftInput())
+      const root = path.join(dir, 'knowledge-entries')
+      fs.renameSync(path.join(root, `${draft.id}.json`), asideOf(root, draft.id))
+      const fresh = createEntryDraftStore(dir, clock())
+      if (act === 'get') expect(fresh.get(draft.id)).toEqual(draft)
+      if (act === 'update') expect(fresh.update(draft.id, { title: '改过' }).title).toBe('改过')
+      if (act === 'withdraw') expect(fresh.withdraw(draft.id)).toBe(true)
+      expect(fs.existsSync(asideOf(root, draft.id))).toBe(false)
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('C7: a close that fails after the event was written does not undo the withdrawal', () => {
+    const store = createEntryDraftStore(dir, clock())
+    const draft = store.create(draftInput())
+    const realClose = fs.closeSync
+    let failed = false
+    const close = vi.spyOn(fs, 'closeSync').mockImplementation((fd: number) => {
+      realClose(fd)
+      if (!failed) {
+        failed = true
+        throw Object.assign(new Error('io'), { code: 'EIO' })
+      }
+    })
+    try {
+      expect(store.withdraw(draft.id)).toBe(true)
+    } finally {
+      close.mockRestore()
+    }
+    expect(failed).toBe(true)
+    expect(store.get(draft.id)).toBeNull()
+    expect(store.withdraw(draft.id)).toBe(false)
+    const lines = fs.readFileSync(path.join(dir, 'knowledge-entries', '_events.jsonl'), 'utf8').trim().split('\n')
+    expect(lines).toHaveLength(1)
+  })
+})
+

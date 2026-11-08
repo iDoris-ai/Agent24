@@ -546,8 +546,10 @@ function assignmentFinder(key: string): Finder {
         const close = closingQuote(j + 1, quote)
         if (close > j + 1) return { start: j, end: close + 1 }
         if (close < 0) {
-          // No closing quote anywhere: the value is the next word, wherever it is (B2).
-          const word = skipSpaces(text, j + 1, MAX_GAP)
+          // No closing quote anywhere: the value is the next word, however
+          // far (B2, Codex C3). Only the last opening quote of its kind can be
+          // unclosed, so this runs once per key.
+          const word = skipSpaces(text, j + 1, Number.POSITIVE_INFINITY)
           return { start: j, end: word < text.length && !isSpace(text[word]) ? wordEnd(word) : j + 1 }
         }
       }
@@ -572,13 +574,15 @@ function skipSpaces(text: string, j: number, most: number): number {
 /** The password in `scheme://user:password@host` (PR-Daemon N4). */
 const urlPasswords: Finder = ({ text }, emit) => {
   for (let at = text.indexOf('://'); at >= 0; at = text.indexOf('://', at + 1)) {
+    // No length cap (Codex C4). Linear: a scan stops at white space or `/`,
+    // so it never runs past the next `://`.
     let k = at + 3
-    while (k - at - 3 < 256 && k < text.length && isUserinfoChar(text[k]) && text[k] !== ':') k += 1
+    while (k < text.length && isUserinfoChar(text[k]) && text[k] !== ':') k += 1
     // The user may be empty (`redis://:secret@host`).
     if (text[k] !== ':') continue
     const start = k + 1
     let e = start
-    while (e - start < 256 && e < text.length && isUserinfoChar(text[e])) e += 1
+    while (e < text.length && isUserinfoChar(text[e])) e += 1
     if (e > start && text[e] === '@') emit({ start, end: e })
   }
 }
@@ -987,8 +991,8 @@ function hostFinder(suffix: string): Finder {
   }
 }
 
-/** IPv6 unique local (fc00::/7) and link-local (fe80::/10) addresses. */
-const IPV6_LOCAL = /(?:f[cd][0-9a-f]{2}|fe[89ab][0-9a-f]):(?:[0-9a-f]{0,4}:){1,6}[0-9a-f]{0,4}/y
+/** IPv6 unique local (fc00::/7) and link-local (fe80::/10) addresses, an embedded IPv4 tail included (Codex C5). */
+const IPV6_LOCAL = /(?:f[cd][0-9a-f]{2}|fe[89ab][0-9a-f]):(?:[0-9a-f]{0,4}:){1,6}(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-f]{0,4})/y
 
 function isHexOrColon(c: string | undefined): boolean {
   return isDigit(c) || (c !== undefined && c >= 'a' && c <= 'f') || c === ':'

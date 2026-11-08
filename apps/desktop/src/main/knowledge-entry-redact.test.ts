@@ -708,3 +708,39 @@ describe('PR-Daemon round 1', () => {
   })
 })
 
+// Codex review of the round-1 fixes (8d00bd36..b3a9455c).
+describe('Codex on the PR-Daemon round 1 fixes', () => {
+  const clean = (text: string, secret: string): void => {
+    const out = preRedact(text).text
+    expect(out, JSON.stringify(text.slice(0, 80))).not.toContain(secret)
+  }
+
+  it('C3: takes the word after an unclosed quote however much white space comes first', () => {
+    clean(`password="${' '.repeat(65)}hunter2`, 'hunter2')
+    clean(`password="${'\n'.repeat(500)}hunter2`, 'hunter2')
+  })
+
+  it('C4: takes a URL password of any length', () => {
+    clean(`postgres://u:${'a'.repeat(257)}@host/db`, 'a'.repeat(257))
+    clean(`postgres://${'u'.repeat(300)}:pw9876@host/db`, 'pw9876')
+  })
+
+  it('C4: stays linear on URL-like input without an @', () => {
+    const text = `${'x://'.repeat(60_000)}${'a:'.repeat(60_000)}`
+    const started = Date.now()
+    preRedact(text)
+    postScan(text)
+    expect(Date.now() - started).toBeLessThan(4000)
+  }, 30000)
+
+  it('C5: redacts an IPv6 address with an IPv4 tail whole', () => {
+    expect(preRedact('at fd00::203.0.113.7 now').text).toBe(`at ${placeholder('internal_address')} now`)
+    expect(preRedact('at fe80::1 now').text).toBe(`at ${placeholder('internal_address')} now`)
+  })
+
+  it('C8: a drive path with a forward slash on its own', () => {
+    expect(preRedact('C:/secret.txt').text).toBe(placeholder('path'))
+    expect(preRedact('see C:/secret.txt').text).toBe(`see ${placeholder('path')}`)
+  })
+})
+

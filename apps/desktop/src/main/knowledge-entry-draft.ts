@@ -243,14 +243,23 @@ export function createEntryDraftStore(dir: string, now: () => Date = () => new D
   }
 
   const eventsFile = path.join(root, '_events.jsonl')
+
+  /** Whether the open log is not empty and its last byte is not a line break. */
+  const endsTorn = (fd: number): boolean => {
+    const size = fs.fstatSync(fd).size
+    if (size === 0) return false
+    const last = Buffer.alloc(1)
+    fs.readSync(fd, last, 0, 1, size - 1)
+    return last[0] !== 0x0a
+  }
   const WITHDRAWN_TMP = /^(ked_[a-z0-9]{22})\.withdrawn\.tmp$/
 
-  /** Ids with a recorded withdrawal. */
-  const withdrawnIds = (): Set<string> => {
+  /** Ids with a recorded withdrawal; null when the log is there but cannot be read (Codex C1). */
+  const withdrawnIds = (): Set<string> | null => {
     const ids = new Set<string>()
     let log: string
     try { log = fs.readFileSync(eventsFile, 'utf8') }
-    catch { return ids }
+    catch (err) { return (err as NodeJS.ErrnoException).code === 'ENOENT' ? ids : null }
     for (const line of log.split('\n')) {
       try {
         const event = JSON.parse(line) as { id?: unknown; event?: unknown }
@@ -271,6 +280,8 @@ export function createEntryDraftStore(dir: string, now: () => Date = () => new D
     const aside = all.map((name) => WITHDRAWN_TMP.exec(name)?.[1]).filter((id): id is string => id !== undefined)
     if (aside.length === 0) return
     const recorded = withdrawnIds()
+    // Not knowing what was recorded, put nothing back: a recorded withdrawal stays withdrawn.
+    if (recorded === null) return
     for (const id of aside) {
       if (recorded.has(id) || fs.existsSync(fileOf(id))) continue
       try { fs.renameSync(path.join(root, `${id}.withdrawn.tmp`), fileOf(id)) }
@@ -288,7 +299,10 @@ export function createEntryDraftStore(dir: string, now: () => Date = () => new D
       const aside = WITHDRAWN_TMP.exec(name)?.[1]
       if (aside !== undefined) {
         if (!recordedRead) {
-          for (const id of withdrawnIds()) recorded.add(id)
+          const ids = withdrawnIds()
+          // The log cannot be read: keep every aside until it can.
+          if (ids === null) continue
+          for (const id of ids) recorded.add(id)
           recordedRead = true
         }
         // Not recorded and not put back (the draft exists again): keep it.
@@ -302,6 +316,12 @@ export function createEntryDraftStore(dir: string, now: () => Date = () => new D
         // A temp we cannot stat is left for the next sweep.
       }
     }
+  }
+
+  /** Before reading one draft directly: put it back if it was left aside unrecorded (Codex C6). */
+  const recoverOne = (id: string): void => {
+    const name = `${id}.withdrawn.tmp`
+    if (fs.existsSync(path.join(root, name))) recoverWithdrawals([name])
   }
 
   const readAll = (): EntryDraft[] => {
@@ -348,6 +368,7 @@ export function createEntryDraftStore(dir: string, now: () => Date = () => new D
     update(id: unknown, patch: { kind?: unknown; title?: unknown; body?: unknown }): EntryDraft {
       const checked = checkedId(id)
       if (!checked) fail()
+      recoverOne(checked)
       const current = readDraft(checked)
       if (!current) throw new Error('Entry draft not found')
       const content = checkedContent(
@@ -370,6 +391,7 @@ export function createEntryDraftStore(dir: string, now: () => Date = () => new D
     get(id: unknown): EntryDraft | null {
       const checked = checkedId(id)
       if (!checked) return null
+      recoverOne(checked)
       return readDraft(checked)
     },
 
@@ -380,6 +402,7 @@ export function createEntryDraftStore(dir: string, now: () => Date = () => new D
     withdraw(id: unknown): boolean {
       const checked = checkedId(id)
       if (!checked) return false
+      recoverOne(checked)
       const current = readDraft(checked)
       if (!current) return false
       // The draft leaves the store first, by a rename (one step, undone if
@@ -398,9 +421,17 @@ export function createEntryDraftStore(dir: string, now: () => Date = () => new D
         })}\n`
         // Created 0o600; no step after the append can fail and undo a
         // withdrawal already recorded (PR-Daemon N3).
-        const fd = fs.openSync(eventsFile, 'a', 0o600)
-        try { fs.writeFileSync(fd, line) }
-        finally { fs.closeSync(fd) }
+        const fd = fs.openSync(eventsFile, 'a+', 0o600)
+        try {
+          // A torn last line (the app stopped mid-append) must not swallow
+          // this event: start on a line of its own (Codex C2).
+          fs.writeFileSync(fd, endsTorn(fd) ? `\n${line}` : line)
+        } catch (err) {
+          try { fs.closeSync(fd) } catch { /* the write error is the one to report */ }
+          throw err
+        }
+        // Written: a failed close does not undo it (Codex C7).
+        try { fs.closeSync(fd) } catch { /* recorded already */ }
       } catch (err) {
         fs.renameSync(aside, fileOf(checked))
         throw err
