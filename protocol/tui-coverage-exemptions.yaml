@@ -143,3 +143,6 @@ exemptions:
   - operationId: reportComponentState
     category: visual
     fallback: "桌面主进程专用（ProductHost audience），终端不是 host；CLI 经 agent24 components list 读取状态"
+  - operationId: getSessionSourceFloor
+    category: planned-tui-2
+    fallback: "raw-http，桌面壳在知识条目准入时使用（KB-SOP-01a #1669）；TUI-2 增加对应 agent24 子命令"
