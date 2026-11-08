@@ -96,6 +96,24 @@ describe('run statuses for the history list (M4 A3)', () => {
     expect(proxy).toHaveBeenCalledTimes(asked)
   })
 
+  it('stops asking once the run moved on, also when it later waits on another approval', async () => {
+    answer = async () => ok('awaiting_approval')
+    const { result } = renderHook(() => useRunStatuses(['run_1']))
+    await flush()
+    act(() => emit({ type: 'approval.resolved', run_id: 'run_1' }))
+    await flush()
+    answer = async () => ok('running')
+    await wait(RETRY_FIRST_MS)
+    expect(result.current.get('run_1')).toBe('running')
+    // Its next tool needs an approval too: nobody has decided that one.
+    answer = async () => ok('awaiting_approval')
+    act(() => emit({ type: 'approval.required', run_id: 'run_1' }))
+    await flush()
+    const asked = proxy.mock.calls.length
+    await wait(60_000)
+    expect(proxy).toHaveBeenCalledTimes(asked)
+  })
+
   it(`asks at most ${MAX_ASKING} runs at once (Codex A3 C3)`, async () => {
     const pending: ((a: Answer) => void)[] = []
     answer = () => new Promise(resolve => { pending.push(resolve) })
