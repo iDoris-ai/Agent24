@@ -25,6 +25,14 @@
 // again up to MAX_PASSES; a longer chain of such hits, each glued to the next
 // (`localhost:1localhost:1…`), stays flagged by postScan: held back, never
 // let through.
+//
+// postScan is the rule table plus wider shapes (PR-Daemon B6): 15 or more
+// digits anywhere, home directories and `file:` URLs inside URLs too. So
+// redacted text may still be held back by postScan; the user edits it.
+//
+// Known limit (PR-Daemon N5, M3 不做): a placeholder is longer than some hits,
+// so redacting text near MAX_REDACT_INPUT can grow it past the limit, and
+// postScan then holds the whole text back. A false alarm, not a leak.
 
 export const REDACTION_RULES_VERSION = 1
 
