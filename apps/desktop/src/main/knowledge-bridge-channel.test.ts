@@ -58,11 +58,12 @@ class FakeContents {
 function setup() {
   const contents = new FakeContents()
   const arrivals: BridgeArrival[] = []
-  const docs: Array<number | 'left'> = []
+  const docs: Array<number | string> = []
   const bridge = {
     receive: (a: BridgeArrival) => arrivals.push(a),
     newDocument: (d: number) => docs.push(d),
     leaveDocument: () => docs.push('left'),
+    resumeDocument: (d: number) => docs.push(`resumed ${d}`),
   } as unknown as KnowledgeBridge
   let now = 100
   const logs: string[] = []
@@ -86,6 +87,34 @@ describe('KnowledgeBridgeChannel', () => {
     t.contents.emit('did-navigate')
     expect(t.channel.currentDocument()).toBe(2)
     expect(t.docs).toEqual([1, 'left', 2])
+  })
+
+  it('a navigation that does not commit gives the shown document its bridge back', () => {
+    const t = setup()
+    t.contents.emit('did-navigate')
+    t.contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+    expect(t.channel.currentDocument()).toBeNull()
+    t.contents.emit('did-stop-loading')
+    expect(t.channel.currentDocument()).toBe(1)
+    t.contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+    t.contents.emit('did-fail-load', {}, -3, '', '', false)
+    expect(t.channel.currentDocument()).toBeNull()
+    t.contents.emit('did-fail-load', {}, -3, '', '', true)
+    expect(t.channel.currentDocument()).toBe(1)
+    expect(t.docs).toEqual([1, 'left', 'resumed 1', 'left', 'resumed 1'])
+    // After a commit, the stop that follows changes nothing.
+    t.contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+    t.contents.emit('did-navigate')
+    t.contents.emit('did-stop-loading')
+    expect(t.channel.currentDocument()).toBe(2)
+    expect(t.docs.at(-1)).toBe(2)
+  })
+
+  it('before the first document, a stop gives no document', () => {
+    const t = setup()
+    t.contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+    t.contents.emit('did-stop-loading')
+    expect(t.channel.currentDocument()).toBeNull()
   })
 
   it('describes a request from its metadata only', () => {

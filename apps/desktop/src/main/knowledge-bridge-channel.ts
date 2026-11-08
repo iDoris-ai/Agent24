@@ -77,6 +77,8 @@ export function dispatchScript(text: string): string {
 export class KnowledgeBridgeChannel {
   private document = 0
   private between = true
+  /** A main-frame navigation started and has not committed yet. */
+  private pending = false
   private activatedAt: number | null = null
   private disposed = false
   private readonly listeners: Array<[string, (...args: any[]) => void]> = []
@@ -91,13 +93,29 @@ export class KnowledgeBridgeChannel {
       if (!details?.isMainFrame || details.isSameDocument) return
       // Design §3.1 ⑤: from here to the new document's hello, nothing is taken or delivered.
       this.between = true
+      this.pending = true
       this.bridge.leaveDocument()
     })
     this.listen('did-navigate', () => {
       // U6.3: every committed main-frame document, reloads included.
       this.document++
       this.between = false
+      this.pending = false
       this.bridge.newDocument(this.document)
+    })
+    // A navigation the guards cancelled (will-navigate, will-frame-navigate,
+    // will-redirect), a download, a 204: nothing committed, the page shown is
+    // still the document it was, and its bridge comes back.
+    const notCommitted = (): void => {
+      if (!this.pending) return
+      this.pending = false
+      if (this.document === 0) return
+      this.between = false
+      this.bridge.resumeDocument(this.document)
+    }
+    this.listen('did-stop-loading', notCommitted)
+    this.listen('did-fail-load', (_event: unknown, _code: unknown, _description: unknown, _url: unknown, isMainFrame: unknown) => {
+      if (isMainFrame) notCommitted()
     })
     this.listen('input-event', (_event: unknown, input: { type?: string } | undefined) => {
       if (input?.type && ACTIVATION.has(input.type)) this.activatedAt = this.now()

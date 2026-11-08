@@ -556,7 +556,11 @@ export class KnowledgeViewHost {
     if (this.closed && this.closed.binding !== binding) this.endBinding()
     if (this.bridgeBinding !== null && this.bridgeBinding !== binding) this.endBridgeCount()
     if (this.crashBinding !== binding) this.crashes = []
-    if (this.closed) return { ok: false, code: this.closed.code }
+    if (this.closed) {
+      // A page that mounts again learns the whole state, `final` included (U6.6).
+      this.setState({ state: 'closed', code: this.closed.code, ...(this.closed.final ? { final: true as const } : {}) })
+      return { ok: false, code: this.closed.code }
+    }
     const target = this.deps.target()
     if (!target) {
       this.destroy('no address')

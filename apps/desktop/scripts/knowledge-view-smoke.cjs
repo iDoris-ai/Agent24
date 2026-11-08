@@ -18,7 +18,7 @@
 // (A sub-frame sender cannot be made: the page CSP has frame-src 'none'; the
 // unit tests cover that step.)
 //
-// Prints one line per check (40) and exits non-zero if any fails.
+// Prints one line per check (42) and exits non-zero if any fails.
 
 const http = require('node:http')
 
@@ -65,6 +65,8 @@ const within = (p, ms) => {
   return Promise.race([Promise.resolve(p).finally(() => clearTimeout(timer)), late])
 }
 ;(async () => {
+  // The bridge's reload reading (below) reloads this page: the probes run once.
+  if (sessionStorage.getItem('smoke-reloaded') === '1') return
   const r = {}
   try {
     stage('storage-before'); r.before = { local: localStorage.getItem('k'), cookie: document.cookie }
@@ -395,6 +397,41 @@ async function main() {
   await wc.executeJavaScript(`location.href = 'file:///etc/hosts'`)
   await new Promise((d) => setTimeout(d, 500))
   check('file:// navigation refused', originOf(wc.getURL()) === a.origin, wc.getURL())
+
+  // KB-C2-04a-2, Codex 04a-2 #2 and #3. The page sends over the bridge and
+  // reports what it got back (hello first, then a status with that generation).
+  const bridgeTalk = (statusId) => `(async () => {
+    const got = []
+    addEventListener('message', (e) => { if (e.data && e.data.direction === 'host_to_page') got.push(e.data) })
+    const post = (m) => fetch('/__agent24/bridge', { method: 'POST', body: JSON.stringify(m) }).catch(() => {})
+    const waitFor = (pred) => new Promise((d) => { const t0 = Date.now(); const tick = () => (pred() || Date.now() - t0 > 2500 ? d() : setTimeout(tick, 50)); tick() })
+    await post({ v: 2, direction: 'page_to_host', type: 'status', id: '01J9ZQ3V6R8XKQ4M2N5P7T9H00', generation: 0, payload: { state: 'ready' } })
+    await waitFor(() => got.some((m) => m.type === 'hello'))
+    const hello = got.find((m) => m.type === 'hello')
+    if (!hello) return { hello: false }
+    await post({ v: 2, direction: 'page_to_host', type: 'status', id: ${JSON.stringify(statusId)}, generation: hello.generation, payload: { state: 'ready' } })
+    await waitFor(() => got.some((m) => m.type === 'reply' && m.in_reply_to === ${JSON.stringify(statusId)}))
+    const reply = got.find((m) => m.type === 'reply' && m.in_reply_to === ${JSON.stringify(statusId)})
+    return { hello: true, generation: hello.generation, reply: reply ? reply.payload : null }
+  })()`
+  // #3: the two refused navigations above did not commit; the page still shown keeps its bridge.
+  const afterCancel = await Promise.race([wc.executeJavaScript(bridgeTalk('01J9ZQ3V6R8XKQ4M2N5P7T9H01')), new Promise((d) => setTimeout(() => d('timeout'), 8000))])
+  check('bridge: still answers after refused navigations (they did not commit)', afterCancel?.reply?.result === 'done', afterCancel)
+  // #2: a same-URL reload. The old document sends a status with id LATE from
+  // pagehide (keepalive), then the new document sends a status with the same
+  // id. Had LATE been taken as the new document's, the second one would be a
+  // duplicate_id; 'done' means the old document's message stayed with it.
+  // (Design §3.1 merge condition; Chromium may reuse the main frame.)
+  const LATE = '01J9ZQ3V6R8XKQ4M2N5P7T9H02'
+  await wc.executeJavaScript(`sessionStorage.setItem('smoke-reloaded', '1'); addEventListener('pagehide', () => {
+    fetch('/__agent24/bridge', { method: 'POST', keepalive: true, body: JSON.stringify({ v: 2, direction: 'page_to_host', type: 'status', id: ${JSON.stringify(LATE)}, generation: 1, payload: { state: 'loading' } }) }).catch(() => {})
+  })`)
+  const reloaded = new Promise((d) => { wc.once('did-finish-load', d); setTimeout(d, 8000) })
+  wc.reload()
+  await reloaded
+  await new Promise((d) => setTimeout(d, 1000))
+  const afterReload = await Promise.race([wc.executeJavaScript(bridgeTalk(LATE)), new Promise((d) => setTimeout(() => d('timeout'), 8000))])
+  check('bridge: a late message of the old document is not taken as the reloaded one\'s (same URL, keepalive)', afterReload?.reply?.result === 'done', afterReload)
 
   // A second profile: a new instance in a new partition that sees nothing of the first.
   const firstSession = session.fromPartition(partitions[0], { cache: false })

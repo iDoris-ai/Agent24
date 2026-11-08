@@ -103,6 +103,9 @@ describe('KnowledgeController (M3)', () => {
     const first = controller.viewBinding()!
     const inputs = controller.uiSessionInputs(first)
     expect(inputs).toEqual({ credential: GOOD.apiKey, generation: expect.any(Number) })
+    // U7.1: never 0, also on a fresh launch with the saved settings (identity starts at 0 again).
+    const restarted = make()
+    expect(restarted.uiSessionInputs(restarted.viewBinding()!)?.generation).toBe(1)
     expect(controller.uiSessionInputs('default#999')).toBeNull()
     // The bases change within the binding: the session's inputs stay (E comes from C, not from the bases).
     await controller.configure({ endpoint: GOOD.endpoint, knowledgeBaseIds: ['kb-a'] })

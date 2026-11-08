@@ -152,6 +152,13 @@ export class KnowledgeBridge {
     this.queuedState = null
   }
 
+  /** A navigation that had started did not commit: the document that is still shown is current again, tables as they were. */
+  resumeDocument(document: number): void {
+    if (this.closed) return
+    this.document = document
+    if (this.lastState) this.queueState(this.lastState)
+  }
+
   /** U7.3 `state`; only the newest one waits when the budget is spent. */
   setState(payload: { profile_state: string; code?: string; theme: 'light' | 'dark'; locale: string }): void {
     const message: HostMessage = { type: 'state', payload }
@@ -369,7 +376,7 @@ export class KnowledgeBridge {
 
   private emit(message: HostMessage, document: number): void {
     if (this.closed || document !== this.document) return
-    const generation = Math.max(1, this.deps.admission().generation)
+    const generation = this.deps.admission().generation
     const text = encodeHostMessage(message, newUlid(), generation)
     if (text === null) {
       this.deps.log(`[knowledge-bridge] view=${this.logTag} not sent: ${message.type} failed the host-side check`)

@@ -132,6 +132,18 @@ describe('U6.4 ①–⑤: silent, some of it a hard violation', () => {
     expect(t.sent).toHaveLength(before)
   })
 
+  it('a document resumed after a cancelled navigation keeps its tables and gets the newest state', () => {
+    const t = setup()
+    t.bridge.setState({ profile_state: 'ready', theme: 'dark', locale: 'en' })
+    const m = t.msg('status', { state: 'ready' })
+    t.arrive(m)
+    t.bridge.leaveDocument()
+    t.bridge.resumeDocument(1)
+    expect(t.sent.at(-1)?.msg.type).toBe('state')
+    t.arrive(m)
+    expect(t.last()?.payload.reason).toBe('duplicate_id')
+  })
+
   it('between documents nothing is taken', () => {
     const t = setup()
     t.bridge.leaveDocument()

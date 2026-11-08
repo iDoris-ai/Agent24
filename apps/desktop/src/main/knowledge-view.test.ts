@@ -1375,9 +1375,12 @@ describe('bridge wiring (KB-C2-04a-2, U6.1, U6.6)', () => {
       expect(t.host.status()).toEqual(i < 2 ? { state: 'closed', code: 'bridge_closed' } : { state: 'closed', code: 'bridge_closed', final: true })
       expect(contents.closed).toBe(true)
     }
-    // Reload is no way out now, nor is showing again.
+    // Reload is no way out now, nor is showing again; a page that mounts
+    // again is told the whole state, final included.
     expect(await t.host.reload(BOUNDS)).toEqual({ ok: false, code: 'bridge_closed' })
+    t.states.length = 0
     expect(await t.host.show(BOUNDS)).toEqual({ ok: false, code: 'bridge_closed' })
+    expect(t.states).toEqual([{ state: 'closed', code: 'bridge_closed', final: true }])
     expect(t.views).toHaveLength(3)
     // Knowledge off and on again: a fresh count.
     t.env.binding = null
