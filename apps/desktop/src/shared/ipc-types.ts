@@ -4,6 +4,12 @@
 export const IpcChannels = {
   NavPrefsGet: 'nav-prefs:get',
   NavPrefsSet: 'nav-prefs:set',
+  // UI-02: the main chat's history on this machine (main/chat-history.ts).
+  ChatHistoryList: 'chat-history:list',
+  ChatHistoryGet: 'chat-history:get',
+  ChatHistorySave: 'chat-history:save',
+  ChatHistoryDelete: 'chat-history:delete',
+  ChatHistoryClear: 'chat-history:clear',
   CliToolOpenSettings: 'cli-tool:open-settings',
   CliToolStatus: 'cli-tool:status',
   CliToolInstall: 'cli-tool:install',
