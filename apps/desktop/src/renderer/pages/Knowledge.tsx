@@ -21,15 +21,17 @@ function currentTheme(el: HTMLElement | null): KnowledgeViewTheme {
 
 type Shown = { kind: 'message'; key: string; reloadable: boolean } | null
 
-const CLOSED_CODES = new Set<string>(['crash_loop', 'session_rejected', 'revocation_mismatch', 'probe_failed', 'empty_scope'])
+const CLOSED_CODES = new Set<string>(['crash_loop', 'session_rejected', 'revocation_mismatch', 'probe_failed', 'empty_scope', 'bridge_closed'])
 
 /** Not bound yet, or Off: the way out is the Knowledge binding in Settings (KB-C1). */
-const SETTINGS_KEYS = new Set(['unavailable.knowledge_off', 'unavailable.not_configured'])
+const SETTINGS_KEYS = new Set(['unavailable.knowledge_off', 'unavailable.not_configured', 'closed.bridge_closed_final'])
 
 function shownFor(result: KnowledgeViewResult | null, state: KnowledgeViewState | null): Shown {
   if (state) {
     if (state.state === 'loading') return { kind: 'message', key: 'loading', reloadable: false }
     if (state.state === 'degraded') return { kind: 'message', key: `degraded.${state.code}`, reloadable: state.code !== 'crashed' }
+    // U6.6: past the third bridge closing only Knowledge settings open the page again.
+    if (state.state === 'closed' && state.final) return { kind: 'message', key: 'closed.bridge_closed_final', reloadable: false }
     if (state.state === 'closed') return { kind: 'message', key: `closed.${state.code}`, reloadable: true }
     if (state.state === 'unavailable') return { kind: 'message', key: `unavailable.${state.code}`, reloadable: false }
     if (state.state === 'ready') return null

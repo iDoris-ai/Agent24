@@ -94,6 +94,15 @@ export class KnowledgeUiInstance {
       .finally(() => { this.checking = null })
   }
 
+  /**
+   * The bridge's U6.4 ⑬⑭ in M2 (design §6): admission is open while this
+   * session holds a JWT it may inject now (servable, same generation, not
+   * paused, not past its life); the generation is the binding's.
+   */
+  bridgeAdmission(): { open: boolean; generation: number } {
+    return { open: !this.stopped && this.session.injection() !== null, generation: this.deps.generation() }
+  }
+
   /** U4.7: stop injecting, forget the JWT, revoke the family (bounded, not awaited). */
   destroy(): void {
     if (this.destroyed) return

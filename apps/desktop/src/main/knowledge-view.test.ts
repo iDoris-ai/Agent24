@@ -1060,6 +1060,7 @@ describe('UI session wiring (KB-C2-04a, U4.5, U4.7, U3.8)', () => {
         inject: (request, webContentsId) => { m.injected.push({ request: request as unknown as Record<string, unknown>, webContentsId }); return decision },
         responded: (id, status) => { m.responded.push([id, status]) },
         destroy: () => { m.destroyed = true; log.push('ui destroyed') },
+        bridgeAdmission: () => ({ open: true, generation: 1 }),
       }
     }
     return { factory, made, decide: (d: typeof decision) => { decision = d } }
