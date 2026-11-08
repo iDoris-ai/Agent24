@@ -158,6 +158,9 @@ button { cursor: pointer; font-family: var(--font); }
 }
 .chat-history-menu-item:hover, .chat-history-menu-item:focus-visible { background: var(--surface2); outline: none; }
 .chat-history-menu-item:disabled { opacity: 0.4; cursor: default; background: none; }
+.chat-archived-bar { align-items: center; justify-content: space-between; gap: 12px; }
+.chat-archived-notice { color: var(--muted); font-size: 13px; }
+.chat-history-archive { margin-top: 4px; }
 .chat-history-menu-heading { padding: 6px 12px 2px; font-size: 10.5px; color: var(--muted); }
 .chat-history-clear { background: none; border: none; color: var(--muted); font-size: 11px; padding: 2px 4px; -webkit-app-region: no-drag; }
 .chat-history-clear:hover { color: var(--text); }

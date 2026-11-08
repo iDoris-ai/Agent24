@@ -45,6 +45,10 @@ export function HistoryMenu({ label, entries, at, onClose }: {
     const x = Math.max(EDGE, Math.min(at.x, window.innerWidth - box.width - EDGE))
     const y = at.y + box.height > window.innerHeight - EDGE ? Math.max(EDGE, window.innerHeight - box.height - EDGE) : at.y
     setPos(p => (p.x === x && p.y === y ? p : { x, y }))
+    // The entry under focus may have gone with the change (a group deleted
+    // meanwhile): focus comes back into the menu, so its keys still work.
+    const active = document.activeElement
+    if (active === null || active === document.body) items()[0]?.focus()
   }, [at.x, at.y, content])
   useLayoutEffect(() => { items()[0]?.focus() }, [])
   useEffect(() => {

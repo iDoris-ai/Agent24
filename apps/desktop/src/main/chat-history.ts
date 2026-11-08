@@ -342,11 +342,12 @@ export function createChatHistoryStore(dir: string) {
      *  archived conversations ('archive'). */
     setCollapsed(target: unknown, collapsed: unknown): ChatGroupsState {
       if (typeof collapsed !== 'boolean') throw new Error('Invalid chat history fold')
+      // Checked before the file is read for a change (PR-Daemon #1647 L1).
+      const own = target === 'assistant' || target === 'archive' ? null : checkGroup(target)
       const state = readGroups(true)
       if (target === 'assistant') return writeGroups({ ...state, assistant_collapsed: collapsed })
       if (target === 'archive') return writeGroups({ ...state, archive_collapsed: collapsed })
-      const own = checkGroup(target)
-      if (!state.groups.some(g => g.id === own)) return state
+      if (own === null || !state.groups.some(g => g.id === own)) return state
       return writeGroups({ ...state, groups: state.groups.map(g => (g.id === own ? { ...g, collapsed } : g)) })
     },
     /** Retitles a conversation already on file: `user` for a rename, `model`

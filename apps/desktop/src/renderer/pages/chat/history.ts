@@ -141,16 +141,19 @@ export function moveConversation(id: string, groupId: string | null): Promise<bo
   return organize(id, { group_id: groupId })
 }
 
-/** UI-06: archives a saved conversation. Archiving the open one starts a new
- *  chat, as deleting it does, and not while its reply is in flight: the
- *  reply would land in a conversation the list no longer shows. */
-export function archiveConversation(id: string): Promise<boolean> {
-  if (state.busy && state.activeId === id) return Promise.resolve(false)
-  if (state.activeId === id) {
+/** UI-06: archives a saved conversation. Not the open one while its reply is
+ *  in flight: the reply would land in a conversation the list no longer
+ *  shows. Once main has archived it, the page leaves it for a new chat if it
+ *  is still open and idle; a failed archive leaves it open (PR-Daemon #1647
+ *  L2). Should a reply have started meanwhile, it stays open, read-only. */
+export async function archiveConversation(id: string): Promise<boolean> {
+  if (state.busy && state.activeId === id) return false
+  const done = await organize(id, { archived: true })
+  if (done && state.activeId === id && !state.busy) {
     starter?.()
     set({ activeId: null })
   }
-  return organize(id, { archived: true })
+  return done
 }
 
 /** UI-06: brings an archived conversation back, into its group if that
