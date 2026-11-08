@@ -8,7 +8,7 @@ import { createChatHistoryStore } from '../../../main/chat-history'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../../shared/chat-history'
 import type { RunEvent } from '../../../shared/ipc-types'
 import { ChatHistoryList } from './ChatHistoryList'
-import { refreshHistory, resetHistoryStore } from './history'
+import { refreshGroups, refreshHistory, resetHistoryStore } from './history'
 import { resetRunStatusesForTests } from './run-status'
 import { setLocale } from '../../i18n'
 
@@ -48,7 +48,7 @@ beforeEach(() => {
     delete: wrap((id: string) => store.delete(id)), clear: wrap(() => store.clear()),
     organize: wrap((id: string, p: unknown) => store.organize(id, p)),
   }
-  const chatGroups = { get: wrap(() => store.groups()) }
+  const chatGroups = { get: wrap(() => store.groups()), setCollapsed: wrap((t: string, c: boolean) => store.setCollapsed(t, c)) }
   Object.defineProperty(window, 'agent24', {
     value: {
       chatHistory: bridge, chatGroups, backendProxy: proxy,
@@ -100,10 +100,16 @@ describe('the history list\'s four filters (M4 A3)', () => {
     store.save(record('chat_b', '日报', 3))
     store.promoteRun('chat_a', 'run_a')
     store.promoteRun('chat_b', 'run_b')
+    const { groups: [work] } = store.createGroup('工作')
+    store.organize('chat_a', { group_id: work.id })
     runs = { run_a: 'running', run_b: 'running' }
+    await refreshGroups()
     await showList()
     await waitFor(() => expect(filter(/^进行中/)).toHaveTextContent('进行中(2)'))
+    expect(within(list()).getByRole('group', { name: '工作' })).toBeInTheDocument()
     fireEvent.click(filter(/^进行中/))
+    // Flat: no group around its member.
+    expect(within(list()).queryByRole('group', { name: '工作' })).toBeNull()
     expect(filter(/^进行中/)).toHaveAttribute('aria-pressed', 'true')
     expect(shownTitles()).toEqual(['周报', '日报'])
     expect(within(list()).queryByRole('button', { name: '其他0' })).toBeNull()
@@ -115,6 +121,8 @@ describe('the history list\'s four filters (M4 A3)', () => {
     expect(within(list()).getByRole('status')).toHaveTextContent('这里没有对话')
     fireEvent.click(filter(/^全部/))
     expect(within(list()).getByRole('button', { name: '其他0' })).toBeInTheDocument()
+    // The groups are back, the conversation in its own.
+    expect(within(within(list()).getByRole('group', { name: '工作' })).getByRole('button', { name: '周报' })).toBeInTheDocument()
   })
 
   it('keeps the counts up to date from the daemon\'s events, asking again only the run that changed', async () => {
