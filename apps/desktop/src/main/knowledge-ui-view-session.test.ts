@@ -151,6 +151,17 @@ describe('UiViewSession (U2.1, U2.9–U2.12, U3.6–U3.8)', () => {
     t.advance(1_000)
     expect(t.session.needsRenewal()).toBe(true)
   })
+
+  it('says how long until renewal is due', async () => {
+    const t = setup([{ kind: 'ok', value: SESSION }])
+    expect(t.session.renewalDelay()).toBe(0)
+    await t.session.establish()
+    expect(t.session.renewalDelay()).toBe(400_000)
+    t.advance(399_000)
+    expect(t.session.renewalDelay()).toBe(1_000)
+    t.advance(5_000)
+    expect(t.session.renewalDelay()).toBe(0)
+  })
 })
 
 describe('UiViewSession self-check and injection (U3.8, U4.5 ⑤)', () => {

@@ -95,6 +95,13 @@ export class UiViewSession {
     return this.deps.now() - s.exchangedAt >= (s.expiresInS * 1000 * 2) / 3
   }
 
+  /** Milliseconds until needsRenewal() turns true; 0 when it already is. */
+  renewalDelay(): number {
+    const s = this.session
+    if (!s) return 0
+    return Math.max(0, s.exchangedAt + (s.expiresInS * 1000 * 2) / 3 - this.deps.now())
+  }
+
   /** Mint and exchange, at most one in flight per instance (U2.9). */
   establish(): Promise<UiSessionOutcome> {
     this.flight ??= this.run().finally(() => { this.flight = null })
