@@ -10,7 +10,11 @@
 //   pnpm exec tsc -p tsconfig.electron.json
 //   pnpm exec electron scripts/knowledge-view-smoke.cjs
 //
-// Prints one line per check (33) and exits non-zero if any fails.
+// Since KB-C2-04a the host runs the real UI session against A, which also
+// plays WeKnora's ticket/exchange/session/revocation endpoints, and the page
+// checks what its own fetches carry (U4.5).
+//
+// Prints one line per check (36) and exits non-zero if any fails.
 
 const http = require('node:http')
 
@@ -22,8 +26,20 @@ const HOST = process.env.KNOWLEDGE_SMOKE_HOST === '::1' ? '::1' : '127.0.0.1'
 const URL_HOST = HOST.includes(':') ? `[${HOST}]` : HOST
 const net = require('node:net')
 const path = require('node:path')
-const { app, BrowserWindow, WebContentsView, session } = require('electron')
-const { KnowledgeViewHost } = require(path.join(__dirname, '..', 'dist', 'main', 'knowledge-view.js'))
+const { randomUUID } = require('node:crypto')
+const { app, BrowserWindow, WebContentsView, session, net: electronNet } = require('electron')
+const dist = (file) => require(path.join(__dirname, '..', 'dist', 'main', file))
+const { KnowledgeViewHost } = dist('knowledge-view.js')
+const { KnowledgeUiInstance } = dist('knowledge-ui-instance.js')
+const { KnowledgeUiClient, bindingTag } = dist('knowledge-ui-client.js')
+const { KNOWLEDGE_UI_ROUTES } = dist('knowledge-ui-routes.js')
+
+// The UI session A hands out, and what the page's requests carried (U4.5).
+const UI = '/api/v1/agent24/knowledge/ui'
+const SMOKE_C = 'smoke-credential'
+const SMOKE_JWT = 'smoke-session-jwt'
+const ui = { allowed: [], plain: [], exchangeProofs: new Set(), issued: 0 }
+const carried = (req) => ({ authorization: req.headers.authorization, proof: req.headers['x-agent24-view-proof'] })
 
 const hits = { A: [], B: [] }
 /** TCP connections opened to the foreign server B and to the fake TURN port. */
@@ -62,6 +78,11 @@ const within = (p, ms) => {
     stage('geolocation'); r.geo = await within(new Promise((done) => navigator.geolocation.getCurrentPosition(() => done('granted'), (e) => done('denied:' + e.code), { timeout: 2000 })), 3000)
     stage('media'); r.media = await within(Promise.resolve().then(() => navigator.mediaDevices.getUserMedia({ audio: true })).then(() => 'granted', () => 'denied'), 3000)
     stage('eval'); try { eval('1'); r.eval = 'ran' } catch { r.eval = 'blocked' }
+    // KB-C2-04a: the page sends its own credentials; the host must replace them
+    // on the allowlisted path and drop them everywhere else.
+    const forged = { Authorization: 'Bearer forged', 'X-Agent24-View-Proof': 'forged' }
+    stage('ui-allowed'); r.uiAllowed = await within(fetch(UI_LIST, { headers: forged }).then((x) => x.status, () => 'blocked'), 3000)
+    stage('ui-plain'); r.uiPlain = await within(fetch('/plain-api', { headers: forged }).then((x) => x.status, () => 'blocked'), 3000)
     stage('download'); { const a = document.createElement('a'); a.href = '/download'; a.download = 'x.bin'; document.body.appendChild(a); a.click() }
     // PR-Daemon #1630 C1/R2-6: ways out that bypass webRequest or CSP in some engines.
     // 'unavailable': no RTCPeerConnection at all (a pass); 'rejected': the API
@@ -170,8 +191,23 @@ async function main() {
     const url = new URL(req.url, 'http://x')
     if (url.pathname === '/probe.js') {
       res.writeHead(200, { 'content-type': 'text/javascript' })
-      return res.end(`const B = ${JSON.stringify(originB)}; const TURN = ${JSON.stringify(turnAddress)}; const ICE = ${JSON.stringify(iceAddress)};\n${PROBE}`)
+      return res.end(`const B = ${JSON.stringify(originB)}; const TURN = ${JSON.stringify(turnAddress)}; const ICE = ${JSON.stringify(iceAddress)}; const UI_LIST = ${JSON.stringify(`${UI}/knowledge-bases`)};\n${PROBE}`)
     }
+    // WeKnora's UI endpoints, as main calls them (net.fetch, not the page's partition).
+    const json = (status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)) }
+    if (req.method === 'POST' && url.pathname === `${UI}/tickets`) {
+      if (req.headers['x-api-key'] !== SMOKE_C) return json(401, { error: { code: 'unauthorized', details: { reason: 'credential_invalid' } } })
+      ui.issued++
+      return json(200, { ticket: `smoke-ticket-${ui.issued}`, ticket_id: randomUUID(), expires_in: 30 })
+    }
+    if (req.method === 'POST' && url.pathname === `${UI}/exchange`) {
+      ui.exchangeProofs.add(req.headers['x-agent24-view-proof'])
+      return json(200, { session_token: SMOKE_JWT, expires_in: 600, ops: ['kb.list'], effective_scope: { knowledge_base_ids: ['kb-smoke'] } })
+    }
+    if (req.method === 'POST' && url.pathname === `${UI}/revocations`) { res.writeHead(204); return res.end() }
+    if (req.method === 'GET' && url.pathname === `${UI}/session`) return json(200, { expires_in: 300 })
+    if (url.pathname === `${UI}/knowledge-bases`) { ui.allowed.push(carried(req)); return json(200, { items: [] }) }
+    if (url.pathname === '/plain-api') { ui.plain.push(carried(req)); return json(200, {}) }
     if (url.pathname === '/redir') {
       res.writeHead(302, { location: `${originB}/redir-target` })
       return res.end()
@@ -218,6 +254,22 @@ async function main() {
     binding: () => binding,
     packaged: true,
     log: () => {},
+    ui: (context) => new KnowledgeUiInstance({
+      client: new KnowledgeUiClient((url, init) => electronNet.fetch(url, init), context.origin),
+      bindingTag: bindingTag('smoke-app-instance', 'default'),
+      partition: context.partition,
+      origin: context.origin,
+      routes: KNOWLEDGE_UI_ROUTES,
+      ledger: context.ledger,
+      credential: () => SMOKE_C,
+      generation: () => 1,
+      servable: () => true,
+      now: () => performance.now(),
+      sleep: (ms) => new Promise((d) => setTimeout(d, ms)),
+      setTimer: (fn, ms) => setTimeout(fn, ms),
+      clearTimer: (handle) => clearTimeout(handle),
+      onEvent: context.onEvent,
+    }),
   })
 
   const view = () => win.contentView.children.find((c) => c.webContents && c.webContents !== win.webContents)
@@ -259,6 +311,14 @@ async function main() {
   check('foreign fetch and image blocked', r1.foreignFetch === 'blocked' && r1.foreignImg === 'blocked', [r1.foreignFetch, r1.foreignImg])
   check('foreign origin received nothing', hits.B.length === 0, hits.B)
   check('no frame loaded', !hits.A.includes('/frame'), hits.A)
+  // KB-C2-04a (U4.5): the host's session on the allowlisted fetch, nothing of the page's anywhere.
+  const viewProof = (h) => typeof h.proof === 'string' && /^[A-Za-z0-9_-]{43}$/.test(h.proof) && ui.exchangeProofs.has(h.proof)
+  check('UI session: allowlisted fetch carries the host\'s Bearer and view proof', r1.uiAllowed === 200 && ui.allowed.length >= 1
+    && ui.allowed.every((h) => h.authorization === `Bearer ${SMOKE_JWT}` && viewProof(h)), { status: r1.uiAllowed, issued: ui.issued, seen: ui.allowed.map((h) => ({ bearer: h.authorization === `Bearer ${SMOKE_JWT}`, proof: viewProof(h) })) })
+  check('UI session: the page\'s own Authorization and view proof are stripped', ui.allowed.length + ui.plain.length >= 2
+    && [...ui.allowed, ...ui.plain].every((h) => h.authorization !== 'Bearer forged' && h.proof !== 'forged'))
+  check('UI session: a path off the allowlist gets no session', r1.uiPlain === 200 && ui.plain.length >= 1
+    && ui.plain.every((h) => h.authorization === undefined && h.proof === undefined), { status: r1.uiPlain, seen: ui.plain.length })
   check('Worker and Service Worker refused', r1.worker === 'blocked' && r1.serviceWorker === 'blocked', [r1.worker, r1.serviceWorker])
   check('permissions denied', r1.notification === 'denied' && r1.geo === 'denied:1' && r1.media === 'denied', [r1.notification, r1.geo, r1.media])
   check('inline eval blocked by the partition CSP', r1.eval === 'blocked', r1.eval)

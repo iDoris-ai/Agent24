@@ -1,6 +1,6 @@
 // Agent24 main process entry — M2: integrates BackendManager daemon.
 
-import { app, BrowserWindow, dialog, Menu, Tray, WebContentsView, nativeImage, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, dialog, Menu, Tray, WebContentsView, nativeImage, net, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { registerCliTool } from './ipc/cli-tool'
@@ -42,7 +42,11 @@ import { OpenDesignComponentInstaller } from './open-design-component'
 import { OpenDesignStatusReporter, mapOpenDesignReport, postOpenDesignReport } from './open-design-report'
 import { KnowledgeHost } from './knowledge-host'
 import { KnowledgeLoginStore } from './knowledge-logins'
-import { KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
+import { KNOWLEDGE_BINDING, KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
+import { knowledgeAppInstanceId } from './knowledge-app-instance'
+import { bindingTag, KnowledgeUiClient } from './knowledge-ui-client'
+import { KnowledgeUiInstance } from './knowledge-ui-instance'
+import { KNOWLEDGE_UI_ROUTES } from './knowledge-ui-routes'
 // KB-C2-03: the KnowledgeView lives in its own module; the lines that wire it
 // in below are additions only and leave the Creative view's paths untouched.
 import { KnowledgeViewHost, registerKnowledgeViewIpc, resolveKnowledgeViewTarget } from './knowledge-view'
@@ -467,6 +471,8 @@ app.whenReady().then(async () => {
   })
   void cliTool.refresh()
   mainWin = createMainWindow()
+  // KB-C2-04a: main is the UI session's Provider in M2 (design §6).
+  const knowledgeBindingTag = bindingTag(knowledgeAppInstanceId(app.getPath('userData')), KNOWLEDGE_BINDING)
   knowledgeView = new KnowledgeViewHost({
     window: () => mainWin,
     createView: (webPreferences) => new WebContentsView({ webPreferences }),
@@ -474,6 +480,25 @@ app.whenReady().then(async () => {
     target: () => resolveKnowledgeViewTarget(process.env, app.isPackaged, knowledge?.status().endpoint),
     binding: () => knowledge?.viewBinding() ?? null,
     packaged: app.isPackaged,
+    ui: (context) => {
+      const inputs = () => knowledge?.uiSessionInputs(context.binding) ?? null
+      return new KnowledgeUiInstance({
+        client: new KnowledgeUiClient((url, init) => net.fetch(url, init), context.origin),
+        bindingTag: knowledgeBindingTag,
+        partition: context.partition,
+        origin: context.origin,
+        routes: KNOWLEDGE_UI_ROUTES,
+        ledger: context.ledger,
+        credential: () => inputs()?.credential ?? null,
+        generation: () => inputs()?.generation ?? -1,
+        servable: () => inputs() !== null,
+        now: () => performance.now(),
+        sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+        setTimer: (fn, ms) => setTimeout(fn, ms),
+        clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+        onEvent: context.onEvent,
+      })
+    },
     onState: (state) => {
       if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.KnowledgeViewState, state)
     },

@@ -8,6 +8,8 @@ import {
   KNOWLEDGE_VIEW_FIRST_LOAD_TIMEOUT_MS,
   KnowledgeViewHost,
   type KnowledgeViewHostDeps,
+  type KnowledgeViewUi,
+  type KnowledgeViewUiContext,
   devKnowledgeViewTarget,
   resolveKnowledgeViewTarget,
   settingsKnowledgeViewTarget,
@@ -71,9 +73,15 @@ class FakeSession extends FakeEmitter {
   headersReceived: Listener | null = null
   readonly serviceWorkers = new FakeEmitter()
   readonly cleared: string[] = []
+  beforeSendHeaders: Listener | null = null
+  completed: Listener | null = null
+  errorOccurred: Listener | null = null
   readonly webRequest = {
     onBeforeRequest: (l: Listener) => { this.beforeRequest = l },
     onHeadersReceived: (l: Listener) => { this.headersReceived = l },
+    onBeforeSendHeaders: (l: Listener) => { this.beforeSendHeaders = l },
+    onCompleted: (l: Listener) => { this.completed = l },
+    onErrorOccurred: (l: Listener) => { this.errorOccurred = l },
   }
   /** Calls in order, for checking that cleanup comes after the page is gone. */
   readonly log: string[]
@@ -98,7 +106,10 @@ class FakeSession extends FakeEmitter {
   }
 }
 
+let contentsIds = 100
 class FakeContents extends FakeEmitter {
+  readonly id = ++contentsIds
+  readonly mainFrame = { processId: 4, routingId: this.id }
   destroyed = false
   url = ''
   openHandler: Listener | null = null
@@ -151,7 +162,7 @@ class FakeWindow extends FakeEmitter {
 const ALL_CLEARED = ['connections', 'storage', 'cache', 'auth']
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0))
 
-function setup(over: Partial<{ binding: string | null; target: ReturnType<typeof knowledgeViewTarget>; packaged: boolean }> = {}) {
+function setup(over: Partial<{ binding: string | null; target: ReturnType<typeof knowledgeViewTarget>; packaged: boolean; ui: (c: KnowledgeViewUiContext) => KnowledgeViewUi }> = {}) {
   const views: FakeView[] = []
   const sessions: FakeSession[] = []
   const states: unknown[] = []
@@ -185,6 +196,7 @@ function setup(over: Partial<{ binding: string | null; target: ReturnType<typeof
     log: () => {},
     partitionName: () => `${KNOWLEDGE_VIEW_PARTITION_PREFIX}p${++seq}`,
     proxyPort: () => Promise.resolve(9),
+    ...(over.ui ? { ui: over.ui } : {}),
   } as unknown as KnowledgeViewHostDeps
   const host = new KnowledgeViewHost(deps)
   return { host, views, sessions, states, timers, loadTimers, cleared, env, advance: (ms: number) => { now += ms } }
@@ -1027,6 +1039,209 @@ describe('KnowledgeViewHost', () => {
     await expect(t.host.show({ x: 'a' })).rejects.toThrow('invalid bounds')
     expect(() => t.host.setBounds(null)).toThrow('invalid bounds')
     expect(t.views).toHaveLength(0)
+  })
+})
+
+describe('UI session wiring (KB-C2-04a, U4.5, U4.7, U3.8)', () => {
+  interface Made {
+    context: KnowledgeViewUiContext
+    destroyed: boolean
+    injected: Array<{ request: Record<string, unknown>; webContentsId: number }>
+    responded: Array<[number, number | undefined]>
+  }
+  function fakeUi(start: (context: KnowledgeViewUiContext, made: Made) => Promise<boolean> = async () => true, log: string[] = []) {
+    const made: Made[] = []
+    let decision: { cancel: true } | { cancel: false; requestHeaders: Record<string, string>; injected: boolean } = { cancel: true }
+    const factory = (context: KnowledgeViewUiContext): KnowledgeViewUi => {
+      const m: Made = { context, destroyed: false, injected: [], responded: [] }
+      made.push(m)
+      return {
+        start: () => start(context, m),
+        inject: (request, webContentsId) => { m.injected.push({ request: request as unknown as Record<string, unknown>, webContentsId }); return decision },
+        responded: (id, status) => { m.responded.push([id, status]) },
+        destroy: () => { m.destroyed = true; log.push('ui destroyed') },
+      }
+    }
+    return { factory, made, decide: (d: typeof decision) => { decision = d } }
+  }
+
+  it('loads the page only once the first JWT is there', async () => {
+    let release!: (ok: boolean) => void
+    const ui = fakeUi(() => new Promise<boolean>((resolve) => { release = resolve }))
+    const t = setup({ ui: ui.factory })
+    const shown = t.host.show(BOUNDS)
+    await vi.waitFor(() => expect(ui.made).toHaveLength(1))
+    await flush()
+    expect(t.views[0].webContents.loads).toEqual([])
+    release(true)
+    expect(await shown).toEqual({ ok: true })
+    expect(t.views[0].webContents.loads).toEqual([URL_])
+    expect(ui.made[0].context).toMatchObject({ partition: t.sessions[0].partition, binding: 'https://kb.example.org/api/v1', origin: ORIGIN })
+  })
+
+  it('does not load without a session, and keeps the state the session event set', async () => {
+    const ui = fakeUi(async (context) => { context.onEvent({ kind: 'closed', code: 'empty_scope' }); return false })
+    const t = setup({ ui: ui.factory })
+    expect(await t.host.show(BOUNDS)).toEqual({ ok: false, code: 'superseded' })
+    expect(t.views[0].webContents.loads).toEqual([])
+    expect(t.host.status()).toEqual({ state: 'closed', code: 'empty_scope' })
+    expect(ui.made[0].destroyed).toBe(true)
+    // Closed stays closed for this binding until the way out.
+    expect(await t.host.show(BOUNDS)).toEqual({ ok: false, code: 'empty_scope' })
+    expect(ui.made).toHaveLength(1)
+    await t.host.reload(BOUNDS)
+    expect(ui.made).toHaveLength(2)
+  })
+
+  it('never loads after a failed start, even one that sent no event', async () => {
+    const ui = fakeUi(async () => false)
+    const t = setup({ ui: ui.factory })
+    expect(await t.host.show(BOUNDS)).toEqual(expect.objectContaining({ ok: false }))
+    expect(t.views[0].webContents.loads).toEqual([])
+  })
+
+  it('a session that cannot be had steps aside with Reload, without reopening by itself', async () => {
+    const ui = fakeUi(async (context) => { context.onEvent({ kind: 'unavailable' }); return false })
+    const t = setup({ ui: ui.factory })
+    await t.host.show(BOUNDS)
+    expect(t.host.status()).toEqual({ state: 'degraded', code: 'session_unavailable' })
+    expect(ui.made).toHaveLength(1)
+    expect(ui.made[0].destroyed).toBe(true)
+  })
+
+  it('rebuilds on a view-level event: new instance, new partition, same binding ledger; a new binding gets a new ledger', async () => {
+    const ui = fakeUi()
+    const t = setup({ ui: ui.factory })
+    await t.host.show(BOUNDS)
+    ui.made[0].context.onEvent({ kind: 'rebuild' })
+    await vi.waitFor(() => expect(ui.made).toHaveLength(2))
+    await flush()
+    expect(ui.made[0].destroyed).toBe(true)
+    expect(t.sessions[1].partition).not.toBe(t.sessions[0].partition)
+    expect(ui.made[1].context.ledger).toBe(ui.made[0].context.ledger)
+    expect(t.states).not.toContainEqual({ state: 'degraded', code: 'crashed' })
+    t.env.binding = 'profile-2'
+    t.host.bindingChanged()
+    await vi.waitFor(() => expect(ui.made).toHaveLength(3))
+    expect(ui.made[2].context.ledger).not.toBe(ui.made[1].context.ledger)
+    // An event from an instance that is gone does nothing.
+    ui.made[0].context.onEvent({ kind: 'closed', code: 'probe_failed' })
+    expect(t.host.status()).not.toEqual({ state: 'closed', code: 'probe_failed' })
+  })
+
+  it('the way out of closed starts the binding with a fresh ledger', async () => {
+    const ui = fakeUi()
+    const t = setup({ ui: ui.factory })
+    await t.host.show(BOUNDS)
+    ui.made[0].context.onEvent({ kind: 'closed', code: 'session_rejected' })
+    expect(t.host.status()).toEqual({ state: 'closed', code: 'session_rejected' })
+    await t.host.reload(BOUNDS)
+    expect(ui.made[1].context.ledger).not.toBe(ui.made[0].context.ledger)
+  })
+
+  it('hands every request to the injector with its frame, and applies the decision', async () => {
+    const ui = fakeUi()
+    const t = setup({ ui: ui.factory })
+    await t.host.show(BOUNDS)
+    const ses = t.sessions[0]
+    const contents = t.views[0].webContents
+    const send = (frame: unknown) => {
+      let out: unknown = null
+      ses.beforeSendHeaders?.({ id: 7, webContentsId: contents.id, frame, resourceType: 'xhr', method: 'GET', url: `${ORIGIN}/x`, requestHeaders: { A: '1' } }, (r: unknown) => { out = r })
+      return out
+    }
+    expect(send(contents.mainFrame)).toEqual({ cancel: true })
+    ui.decide({ cancel: false, requestHeaders: { A: '1', Authorization: 'Bearer j' }, injected: true })
+    expect(send({ processId: 4, routingId: contents.id })).toEqual({ requestHeaders: { A: '1', Authorization: 'Bearer j' } })
+    send({ processId: 5, routingId: contents.id })
+    send({ processId: 4, routingId: 1 })
+    send(null)
+    send({ get processId(): number { throw new Error('gone') }, routingId: 1 })
+    expect(ui.made[0].injected.map((i) => i.request.mainFrame)).toEqual([true, true, false, false, null, false])
+    expect(ui.made[0].injected.every((i) => i.webContentsId === contents.id && i.request.id === 7 && i.request.url === `${ORIGIN}/x`)).toBe(true)
+    ses.completed?.({ id: 7, statusCode: 401 })
+    ses.errorOccurred?.({ id: 8 })
+    expect(ui.made[0].responded).toEqual([[7, 401], [8, undefined]])
+  })
+
+  it('reloads the current document when injection resumes, only once it has loaded (U4.5)', async () => {
+    const ui = fakeUi()
+    const t = setup({ ui: ui.factory })
+    let reloads = 0
+    await t.host.show(BOUNDS)
+    t.views[0].webContents.reload = () => { reloads++ }
+    ui.made[0].context.onEvent({ kind: 'reload' })
+    expect(reloads).toBe(1)
+    expect(t.host.status()).toEqual({ state: 'ready' })
+    t.views[0].webContents.destroyed = true
+    ui.made[0].context.onEvent({ kind: 'reload' })
+    expect(reloads).toBe(1)
+  })
+
+  it('a resume during the first load reloads once that load is done; one before loadURL does nothing (U4.5)', async () => {
+    let release: ((ok: boolean) => void) | undefined
+    const ui = fakeUi(() => new Promise<boolean>((resolve) => { release = resolve }))
+    const t = setup({ ui: ui.factory })
+    let finish: () => void = () => {}
+    { const pending = new Promise<void>((resolve) => { finish = resolve }); nextLoad = () => pending }
+    try {
+      const shown = t.host.show(BOUNDS)
+      await vi.waitFor(() => expect(ui.made).toHaveLength(1))
+      let reloads = 0
+      t.views[0].webContents.reload = () => { reloads++ }
+      // Before the first JWT: no page yet, nothing was asked for.
+      await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+      ui.made[0].context.onEvent({ kind: 'reload' })
+      release!(true)
+      await vi.waitFor(() => expect(t.views[0].webContents.loads).toHaveLength(1))
+      // The page's scripts ran into a pause and it lifted before the load finished.
+      ui.made[0].context.onEvent({ kind: 'reload' })
+      ui.made[0].context.onEvent({ kind: 'reload' })
+      expect(reloads).toBe(0)
+      finish()
+      expect(await shown).toEqual({ ok: true })
+      expect(reloads).toBe(1)
+      // Taken: a later load-finished path does not reload again.
+      await flush()
+      expect(reloads).toBe(1)
+    } finally {
+      nextLoad = () => Promise.resolve()
+    }
+  })
+
+  it('a resume before loadURL alone never reloads the page that follows (U4.5)', async () => {
+    let release: ((ok: boolean) => void) | undefined
+    const ui = fakeUi(() => new Promise<boolean>((resolve) => { release = resolve }))
+    const t = setup({ ui: ui.factory })
+    const shown = t.host.show(BOUNDS)
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+    let reloads = 0
+    t.views[0].webContents.reload = () => { reloads++ }
+    ui.made[0].context.onEvent({ kind: 'reload' })
+    release!(true)
+    expect(await shown).toEqual({ ok: true })
+    await flush()
+    expect(reloads).toBe(0)
+  })
+
+  it('lets go of the partition listeners on destroy', async () => {
+    const ui = fakeUi()
+    const t = setup({ ui: ui.factory })
+    await t.host.show(BOUNDS)
+    expect(t.sessions[0].beforeSendHeaders).not.toBeNull()
+    t.host.destroyAll('test')
+    expect([t.sessions[0].beforeSendHeaders, t.sessions[0].completed, t.sessions[0].errorOccurred]).toEqual([null, null, null])
+  })
+
+  it('ends the UI session before the page goes (U4.7)', async () => {
+    const log: string[] = []
+    const ui = fakeUi(async () => true, log)
+    const t = setup({ ui: ui.factory })
+    await t.host.show(BOUNDS)
+    const contents = t.views[0].webContents
+    contents.close = () => { log.push('page closed'); contents.closed = true; contents.finishClose() }
+    t.host.destroyAll('test')
+    expect(log).toEqual(['ui destroyed', 'page closed'])
   })
 })
 

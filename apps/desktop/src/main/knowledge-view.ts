@@ -30,8 +30,12 @@ import net from 'node:net'
 import type { BrowserWindow, IpcMain, IpcMainInvokeEvent, Session, WebContents, WebContentsView } from 'electron'
 import type { IpcGuard } from './ipc/guard'
 import { isPlainHostname } from './knowledge-hostname'
+import type { InjectDecision, InjectRequest } from './knowledge-ui-inject'
+import type { UiInstanceEvent } from './knowledge-ui-instance'
+import { UiSessionLedger } from './knowledge-ui-session'
 import type {
   KnowledgeViewBounds,
+  KnowledgeViewClosedCode,
   KnowledgeViewResult,
   KnowledgeViewState,
   KnowledgeViewTheme,
@@ -273,6 +277,26 @@ export interface KnowledgeViewHostDeps {
   /** Port of the dead proxy the partition's other traffic is sent to
    * (contract decision #30). Defaults to one listener of our own per process. */
   proxyPort?: () => Promise<number>
+  /** KB-C2-04a: the instance's UI session (KnowledgeUiInstance in the app). Without it no page request carries a session. */
+  ui?: (context: KnowledgeViewUiContext) => KnowledgeViewUi
+}
+
+/** What the host hands the UI session of a new instance. */
+export interface KnowledgeViewUiContext {
+  partition: string
+  binding: string
+  origin: string
+  /** Shared by the binding's instances; a new one once the binding ends (U3.8). */
+  ledger: UiSessionLedger
+  onEvent: (event: UiInstanceEvent) => void
+}
+
+/** The host's view of KnowledgeUiInstance. */
+export interface KnowledgeViewUi {
+  start(): Promise<boolean>
+  inject(request: InjectRequest, webContentsId: number): InjectDecision
+  responded(id: number, statusCode: number | undefined): void
+  destroy(): void
 }
 
 // The app's own --bg (styles.css), so the area does not flash while the page loads.
@@ -353,6 +377,35 @@ export function hardenKnowledgeSession(ses: Session, origin: string): void {
   ses.webRequest.onHeadersReceived((details, callback) => callback({ responseHeaders: withKnowledgeCsp(details.responseHeaders, origin) }))
 }
 
+/** The frame a request came from is the page's main frame; null when the request has no frame. */
+function isMainFrameOf(frame: { processId: number; routingId: number } | null | undefined, contents: WebContents): boolean | null {
+  if (!frame) return null
+  try {
+    const main = contents.mainFrame
+    return frame.processId === main.processId && frame.routingId === main.routingId
+  } catch {
+    return false
+  }
+}
+
+/** KB-C2-04a: the partition's injection (U4.5) and the 401 watch on injected requests (U3.8). */
+export function wireKnowledgeUi(ses: Session, contents: WebContents, ui: KnowledgeViewUi): void {
+  ses.webRequest.onBeforeSendHeaders((details, callback) => {
+    const decision = ui.inject({
+      id: details.id,
+      webContentsId: details.webContentsId,
+      mainFrame: isMainFrameOf(details.frame, contents),
+      resourceType: details.resourceType,
+      method: details.method,
+      url: details.url,
+      requestHeaders: details.requestHeaders,
+    }, contents.id)
+    callback(decision.cancel ? { cancel: true } : { requestHeaders: decision.requestHeaders })
+  })
+  ses.webRequest.onCompleted((details) => ui.responded(details.id, details.statusCode))
+  ses.webRequest.onErrorOccurred((details) => ui.responded(details.id, undefined))
+}
+
 /** Per-WebContents refusals; `onLeftOrigin` is the defense in depth for a main
  * frame that commits elsewhere anyway (U4.8 view-level handling). */
 export function guardKnowledgeContents(contents: WebContents, origin: string, onLeftOrigin: () => void): void {
@@ -389,6 +442,11 @@ interface Instance {
   target: KnowledgeViewTarget
   /** The first load of the page finished. */
   loaded: boolean
+  /** U4.5: injection came back from a pause after the first load had begun
+   * but before it finished; the page is reloaded once that load is done. */
+  reloadPending: boolean
+  /** loadURL was called: the page's scripts may already be asking for data. */
+  navigating: boolean
   /** Hung (ADR §4): kept per instance so a hide/show round trip does not
    * put the hung page back over the content area. */
   unresponsive: boolean
@@ -400,6 +458,8 @@ interface Instance {
   proxied: Promise<void>
   /** The main frame's last commit answered 4xx/5xx: an error page is not the knowledge page. */
   httpFailed: boolean
+  /** KB-C2-04a: the UI session, when the host has one. */
+  ui: KnowledgeViewUi | null
 }
 
 /** Main's single owner of KnowledgeView instances (one binding for now). */
@@ -414,7 +474,10 @@ export class KnowledgeViewHost {
   private crashes: number[] = []
   /** `closed` belongs to the binding it happened under; another binding, or
    * Off, ends it (§9.2: binding-level destruction ends `closed`). */
-  private closed: { code: 'crash_loop'; binding: string } | null = null
+  private closed: { code: KnowledgeViewClosedCode; binding: string } | null = null
+  /** U3.8's per-binding counts, for `ledgerBinding`. */
+  private ledger = new UiSessionLedger()
+  private ledgerBinding: string | null = null
   private crashBinding: string | null = null
   /** App quit: no new instance from here on. */
   private disposed = false
@@ -520,6 +583,10 @@ export class KnowledgeViewHost {
         }
         instance.loaded = true
         if (this.visible && this.state.state === 'loading' && !instance.unresponsive) this.setState({ state: 'ready' })
+        if (instance.reloadPending) {
+          instance.reloadPending = false
+          if (!instance.view.webContents.isDestroyed()) instance.view.webContents.reload()
+        }
         resolve(true)
       }
       // A load that never settles would leave `loading` up for good, with no
@@ -534,10 +601,26 @@ export class KnowledgeViewHost {
         finish(new Error('first load timed out'))
       }, KNOWLEDGE_VIEW_FIRST_LOAD_TIMEOUT_MS)
       // Not one request before the dead proxy is in place: a page that loaded
-      // first could open TURN-TCP directly (decision #30).
+      // first could open TURN-TCP directly (decision #30). Nor before the
+      // first JWT (U4.5); without one the UI session's event has set the state.
+      const current = (): boolean => !settled && this.instance === instance
       instance.proxied
-        .then(() => { if (!settled && this.instance === instance) return instance.view.webContents.loadURL(instance.target.url) })
-        .then(() => finish(null), (error: unknown) => finish(error))
+        .then((): Promise<boolean> | boolean => (current() && instance.ui ? instance.ui.start() : true))
+        .then(async (ready): Promise<boolean> => {
+          if (ready && current()) {
+            instance.navigating = true
+            await instance.view.webContents.loadURL(instance.target.url)
+          }
+          return ready
+        })
+        .then((ready) => {
+          if (ready) return finish(null)
+          if (settled) return
+          settled = true
+          this.clearTimer(timer)
+          instance.loading = null
+          resolve(false)
+        }, (error: unknown) => finish(error))
     })
     return instance.loading
   }
@@ -609,6 +692,8 @@ export class KnowledgeViewHost {
 
   private endBinding(): void {
     this.closed = null
+    this.ledger = new UiSessionLedger()
+    this.ledgerBinding = null
     this.crashes = []
     this.crashBinding = null
   }
@@ -619,8 +704,17 @@ export class KnowledgeViewHost {
     const session = this.deps.sessionFor(partition)
     hardenKnowledgeSession(session, target.origin)
     const view = this.deps.createView(knowledgeViewPreferences(partition, this.deps.packaged))
+    if (this.ledgerBinding !== binding) {
+      this.ledger = new UiSessionLedger()
+      this.ledgerBinding = binding
+    }
+    const ui = this.deps.ui?.({
+      partition, binding, origin: target.origin, ledger: this.ledger,
+      onEvent: (event) => this.uiEvent(instance, event),
+    }) ?? null
+    if (ui) wireKnowledgeUi(session, view.webContents, ui)
     const instance: Instance = {
-      view, session, window: win, binding, target, loaded: false, unresponsive: false, loading: null, httpFailed: false,
+      view, session, window: win, binding, target, loaded: false, reloadPending: false, navigating: false, unresponsive: false, loading: null, httpFailed: false, ui,
       onWindowClosed: () => { if (this.instance === instance) this.destroy('window closed') },
       proxied: (this.deps.proxyPort ?? (() => knowledgeViewBlackhole((m) => this.log(m))))().then((port) => session.setProxy(knowledgeViewProxyConfig(target.origin, port))),
     }
@@ -678,6 +772,39 @@ export class KnowledgeViewHost {
     return instance
   }
 
+  /** What the UI session's result means for the view (U3.8, §9.2). */
+  private uiEvent(instance: Instance, event: UiInstanceEvent): void {
+    if (this.instance !== instance) return
+    if (event.kind === 'reload') {
+      // U4.5: what was cancelled while injection was paused is asked for again.
+      // During the first load the reload waits for that load to finish; before
+      // loadURL (the first JWT still coming) nothing has been asked for yet.
+      if (instance.loaded) {
+        if (!instance.view.webContents.isDestroyed()) instance.view.webContents.reload()
+      } else if (instance.navigating) {
+        instance.reloadPending = true
+      }
+      return
+    }
+    if (event.kind === 'rebuild') {
+      // View-level handling: a new instance, new vph; not a crash.
+      this.log('[knowledge-view] session rejected; rebuilding the view')
+      this.destroy('session rejected')
+      if (this.visible && this.bounds) this.reopen(this.bounds)
+      return
+    }
+    if (event.kind === 'closed') {
+      this.log(`[knowledge-view] closed: ${event.code}`)
+      this.destroy(`closed: ${event.code}`)
+      this.closed = { code: event.code, binding: instance.binding }
+      this.setState({ state: 'closed', code: event.code })
+      return
+    }
+    this.log('[knowledge-view] no session for the page')
+    this.destroy('no session')
+    this.setState({ state: 'degraded', code: 'session_unavailable' })
+  }
+
   /** The native view is drawn above the app's page; it steps aside so the
    * page's message and Reload button can be seen. */
   private loadFailed(instance: Instance): void {
@@ -722,6 +849,18 @@ export class KnowledgeViewHost {
     const instance = this.instance
     if (!instance) return
     this.instance = null
+    // U4.7: injection stops and the family is revoked before the page goes.
+    try {
+      instance.ui?.destroy()
+      // The partition's listeners let go of the instance (and nothing of it is used again).
+      if (instance.ui) {
+        instance.session.webRequest.onBeforeSendHeaders(null)
+        instance.session.webRequest.onCompleted(null)
+        instance.session.webRequest.onErrorOccurred(null)
+      }
+    } catch (error) {
+      this.log(`[knowledge-view] end UI session failed (${reason}): ${String(error)}`)
+    }
     try {
       instance.window.removeListener('closed', instance.onWindowClosed)
     } catch {

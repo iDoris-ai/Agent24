@@ -21,6 +21,8 @@ function currentTheme(el: HTMLElement | null): KnowledgeViewTheme {
 
 type Shown = { kind: 'message'; key: string; reloadable: boolean } | null
 
+const CLOSED_CODES = new Set<string>(['crash_loop', 'session_rejected', 'revocation_mismatch', 'probe_failed', 'empty_scope'])
+
 /** Not bound yet, or Off: the way out is the Knowledge binding in Settings (KB-C1). */
 const SETTINGS_KEYS = new Set(['unavailable.knowledge_off', 'unavailable.not_configured'])
 
@@ -33,8 +35,8 @@ function shownFor(result: KnowledgeViewResult | null, state: KnowledgeViewState 
     if (state.state === 'ready') return null
   }
   if (result && !result.ok && result.code !== 'superseded') {
-    if (result.code === 'crash_loop') return { kind: 'message', key: 'closed.crash_loop', reloadable: true }
-    if (result.code === 'load_failed') return { kind: 'message', key: 'degraded.load_failed', reloadable: true }
+    if (CLOSED_CODES.has(result.code)) return { kind: 'message', key: `closed.${result.code}`, reloadable: true }
+    if (result.code === 'load_failed' || result.code === 'session_unavailable') return { kind: 'message', key: `degraded.${result.code}`, reloadable: true }
     return { kind: 'message', key: `unavailable.${result.code}`, reloadable: false }
   }
   return null

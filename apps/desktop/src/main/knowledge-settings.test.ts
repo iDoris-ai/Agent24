@@ -96,6 +96,27 @@ describe('KnowledgeController (M3)', () => {
     expect(controller.viewBinding()).toBeNull()
   })
 
+  it('gives the UI session C, the generation and the knowledge bases only for the binding in effect (KB-C2-04a)', async () => {
+    const controller = make()
+    await controller.configure(GOOD)
+    await controller.setEnabled(true)
+    const first = controller.viewBinding()!
+    const inputs = controller.uiSessionInputs(first)
+    expect(inputs).toEqual({ credential: GOOD.apiKey, generation: expect.any(Number) })
+    expect(controller.uiSessionInputs('default#999')).toBeNull()
+    // The bases change within the binding: the session's inputs stay (E comes from C, not from the bases).
+    await controller.configure({ endpoint: GOOD.endpoint, knowledgeBaseIds: ['kb-a'] })
+    expect(controller.uiSessionInputs(first)).toEqual(inputs)
+    // A new key: the old binding gets nothing, not even the new key.
+    await controller.configure({ ...GOOD, apiKey: 'sk-OTHER' })
+    expect(controller.uiSessionInputs(first)).toBeNull()
+    const second = controller.viewBinding()!
+    expect(controller.uiSessionInputs(second)).toMatchObject({ credential: 'sk-OTHER' })
+    expect(controller.uiSessionInputs(second)!.generation).toBeGreaterThan(inputs!.generation)
+    await controller.setEnabled(false)
+    expect(controller.uiSessionInputs(second)).toBeNull()
+  })
+
   it('a new key moves the view binding even when its change is overtaken after the key was written', async () => {
     const store = new KnowledgeSettingsStore(dir)
     const save = store.save.bind(store)
