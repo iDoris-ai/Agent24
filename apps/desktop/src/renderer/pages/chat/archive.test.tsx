@@ -297,6 +297,27 @@ describe('an archived conversation on the chat page (UI-06 D7)', () => {
     expect(proxy.mock.calls.length).toBe(sent)
   })
 
+  it('a pending headroom confirmation sends nothing once its conversation is being archived (PR-Daemon #1651 L1)', async () => {
+    const chatCalls = () => proxy.mock.calls.filter(([req]) => req.body?.messages?.[0]?.role !== 'system').length
+    proxy.mockImplementationOnce(async () => ({ ok: false, status: 409, data: { error: { code: 'idoris_headroom_confirmation_required' } } }))
+    both()
+    const box = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(box, { target: { value: '周报' } })
+    fireEvent.keyDown(box, { key: 'Enter', shiftKey: false })
+    const confirm = await screen.findByRole('button', { name: '仍然加载' })
+    await waitFor(() => expect(within(list()).getByRole('button', { name: '对话「周报」的操作' })).toBeInTheDocument())
+    let answer!: () => void
+    bridge.organize.mockImplementationOnce(() => new Promise((_, no) => { answer = () => no(new Error('EACCES')) }))
+    fireEvent.click(within(openRowMenu('周报')).getByRole('menuitem', { name: '归档' }))
+    await waitFor(() => expect(screen.getByText('这个对话已归档，只能查看。')).toBeInTheDocument())
+    const before = chatCalls()
+    fireEvent.click(confirm)
+    await new Promise(r => setTimeout(r, 0))
+    expect(chatCalls()).toBe(before)
+    answer()
+    await waitFor(() => expect(screen.getByPlaceholderText(/输入消息/)).toBeInTheDocument())
+  })
+
   it('a failed archive leaves the open conversation open (PR-Daemon #1647 L2)', async () => {
     both()
     const box = screen.getByPlaceholderText(/输入消息/)
