@@ -1297,7 +1297,7 @@ describe('bridge wiring (KB-C2-04a-2, U6.1, U6.6)', () => {
   let n = 0
   const msg = (payload: unknown = { state: 'ready' }, extra: Record<string, unknown> = {}) =>
     ({ v: 3, direction: 'page_to_host', type: 'status', id: `01J9ZQ3V6R8XKQ4M2N5P7T${String(n++).padStart(4, '0')}`, generation: 3, payload, ...extra })
-  const delivered = (contents: FakeContents) => contents.mainFrame.scripts.map((s) => JSON.parse(JSON.parse(/JSON\.parse\((.*)\) \}\)\);undefined$/.exec(s)![1])))
+  const delivered = (contents: FakeContents) => contents.mainFrame.scripts.map((s) => JSON.parse(JSON.parse(/JSON\.parse\((.*)\) \}\)\)\}catch\{\};undefined$/.exec(s)![1])))
   const post = (t: ReturnType<typeof setup>, i: number, body: unknown, over: Record<string, unknown> = {}) => {
     const contents = t.views[i].webContents
     // The page echoes the document_id of the newest hello it got (decision #37).

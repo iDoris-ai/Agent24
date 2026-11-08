@@ -71,7 +71,9 @@ function inlineBytes(upload: BridgeRequestDetails['uploadData']): Uint8Array | n
 /** The page side receives `{ type: 'message', data }` on window; the data is the U7.1 envelope. */
 export function dispatchScript(text: string): string {
   // The text is JSON; embedded as a JS string literal and parsed in the page, never evaluated.
-  return `window.dispatchEvent(new MessageEvent('message', { data: JSON.parse(${JSON.stringify(text)}) }));undefined`
+  // The page owns window, JSON and MessageEvent and may make any of them throw; the catch keeps
+  // what it throws in the page, so nothing of the page's size comes back to main (#1661 C-1).
+  return `try{window.dispatchEvent(new MessageEvent('message', { data: JSON.parse(${JSON.stringify(text)}) }))}catch{};undefined`
 }
 
 export class KnowledgeBridgeChannel {

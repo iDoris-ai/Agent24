@@ -1,3 +1,4 @@
+import { runInNewContext } from 'node:vm'
 import { describe, expect, it } from 'vitest'
 import type { BridgeArrival, KnowledgeBridge } from './knowledge-bridge'
 import { BRIDGE_PATH, dispatchScript, KnowledgeBridgeChannel, reservedRequest, type BridgeFrame } from './knowledge-bridge-channel'
@@ -33,6 +34,24 @@ describe('dispatchScript', () => {
     // eslint-disable-next-line @typescript-eslint/no-implied-eval
     new Function('window', 'MessageEvent', script)(fakeWindow, class { data: unknown; constructor(_t: string, init: { data: unknown }) { this.data = init.data } })
     expect(got).toEqual(JSON.parse(text))
+  })
+
+  it('whatever the page makes throw stays in the page: the script completes as undefined', () => {
+    const big = 'x'.repeat(1 << 20)
+    const thrower = () => { throw big }
+    const Event = class { data: unknown; constructor(_t: string, init: { data: unknown }) { this.data = init.data } }
+    const pages: Array<Record<string, unknown>> = [
+      { window: { dispatchEvent: thrower }, MessageEvent: Event, JSON },
+      { window: { dispatchEvent: () => true }, MessageEvent: thrower, JSON },
+      { window: { dispatchEvent: () => true }, MessageEvent: Event, JSON: { parse: thrower } },
+      { window: {}, MessageEvent: Event, JSON },
+    ]
+    for (const page of pages) {
+      // The completion value is what executeJavaScript would hand back to main.
+      expect(runInNewContext(dispatchScript('{"a":1}'), page)).toBeUndefined()
+    }
+    // A page that dispatches normally hands back nothing either.
+    expect(runInNewContext(dispatchScript('{"a":1}'), { window: { dispatchEvent: () => big }, MessageEvent: Event, JSON })).toBeUndefined()
   })
 })
 
