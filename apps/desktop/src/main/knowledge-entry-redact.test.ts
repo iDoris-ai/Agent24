@@ -4,6 +4,7 @@ import {
   placeholder,
   postScan,
   preRedact,
+  testing,
   type RedactionCategory,
   type RedactionHit,
 } from './knowledge-entry-redact'
@@ -166,8 +167,9 @@ describe('email', () => {
     expect(redact('to first.last+tag@sub.example.co.uk.')).toBe('to 〔已脱敏·邮箱〕.')
   })
 
-  it('does not match text without @', () => {
+  it('does not match text without @, or without a name before it', () => {
     expect(categories('ada.example.com')).toEqual([])
+    expect(categories('write to @example.com')).toEqual([])
     expect(categories('just words')).toEqual([])
   })
 })
@@ -364,4 +366,165 @@ describe('postScan and preRedact', () => {
       expect(Array.isArray(hits)).toBe(true)
     }
   }, 30000)
+})
+
+// Codex round 1 on #1669: each case once left a secret, or took seconds.
+describe('nothing hides a secret from another rule', () => {
+  it('a secret next to a placeholder, or to half of one, is taken (C1)', () => {
+    for (const text of [
+      `password=TOPSECRET${placeholder('credential')}`,
+      'password=TOPSECRET〔已脱敏·',
+      `${placeholder('email')}sk-abcdefghijklmnopqrst`,
+      `${placeholder('phone')}13800138000`,
+    ]) {
+      const out = redact(text)
+      expect(out, text).not.toMatch(/TOPSECRET|abcdefghijklmnop|13800138000/)
+    }
+  })
+
+  it('a value whose key sits inside another hit is still taken (C2)', () => {
+    expect(redact('sk-abcdefghijklmnoppassword=TOPSECRET')).not.toContain('TOPSECRET')
+    expect(redact('password=sk-aaaaaaaaaaaaaaaaaaaa,hunter2')).toBe('password=〔已脱敏·凭据〕')
+    expect(redact('ada@example.com,token=hunter2')).not.toContain('hunter2')
+  })
+
+  it('overlapping hits become one span with the earlier rule’s category', () => {
+    const text = 'see /Users/ada@example.com now'
+    const hits = postScan(text)
+    expect(hits).toEqual([{ category: 'email', start: 4, end: 26 }])
+    expect(redact(text)).toBe('see 〔已脱敏·邮箱〕 now')
+  })
+
+  it('takes the whole of a long token, path or value, not a prefix of it', () => {
+    expect(redact(`k sk-${'a'.repeat(300)} k`)).toBe('k 〔已脱敏·凭据〕 k')
+    expect(redact(`k /Users/${'a'.repeat(1000)} k`)).toBe('k 〔已脱敏·路径〕 k')
+    expect(redact(`password=${'a'.repeat(1000)} k`)).toBe('password=〔已脱敏·凭据〕 k')
+    expect(redact(`Bearer ${'a'.repeat(500)} k`)).toBe('〔已脱敏·凭据〕 k')
+  })
+
+  it('takes a quoted value whole, spaces included', () => {
+    expect(redact('{"password": "hunter 2 x", "user": "ada"}')).toBe('{"password": 〔已脱敏·凭据〕, "user": "ada"}')
+    expect(redact("secret='a b c'")).toBe('secret=〔已脱敏·凭据〕')
+  })
+})
+
+describe('private_key blocks (C3, C4)', () => {
+  const body = ['MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7', 'VJTUt9Us8cKjMzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dVMvDuictGeurT8jNbvJZHtCSuYEvu', 'NMoSfm76oqFvAp8Gy0iz5sxjZmSnXyCdPEovGhLa0VzMaQ8s+CLOyS56YyCFGeJZ']
+
+  it('ends only at an END of the same type', () => {
+    const text = ['-----BEGIN RSA PRIVATE KEY-----', body[0], '-----END EC PRIVATE KEY-----', body[1], '-----END RSA PRIVATE KEY-----', 'after'].join('\n')
+    expect(redact(text)).toBe('〔已脱敏·私钥〕\nafter')
+  })
+
+  it('without an END, takes every line that reads as key material, headers included', () => {
+    const text = ['-----BEGIN PRIVATE KEY-----', ...body, '', 'Thanks, that was the key.'].join('\n')
+    expect(redact(text)).toBe('〔已脱敏·私钥〕\n\nThanks, that was the key.')
+    const encrypted = ['-----BEGIN RSA PRIVATE KEY-----', 'Proc-Type: 4,ENCRYPTED', 'DEK-Info: AES-128-CBC,3F17F5316E2BAC89', '', ...body, 'done here'].join('\n')
+    expect(redact(encrypted)).toBe('〔已脱敏·私钥〕\ndone here')
+  })
+
+  it('takes a key pasted on one line', () => {
+    expect(redact(`k -----BEGIN PRIVATE KEY----- ${body[0]} ${body[1]} -----END PRIVATE KEY----- k`)).toBe('k 〔已脱敏·私钥〕 k')
+    expect(redact(`k -----BEGIN PRIVATE KEY----- ${body[0]} ${body[1]}`)).toBe('k 〔已脱敏·私钥〕')
+  })
+})
+
+describe('whitespace and case (C5, C6)', () => {
+  it('reads whitespace as JavaScript’s \\s does', () => {
+    for (let k = 0; k <= 0xffff; k += 1) {
+      const c = String.fromCharCode(k)
+      expect(testing.isSpace(c), k.toString(16)).toBe(/\s/.test(c))
+    }
+  })
+
+  it('a path after a no-break space, or after one that ends a URL, is taken', () => {
+    expect(redact('see\u00a0/Users/ada/x')).toBe('see\u00a0〔已脱敏·路径〕')
+    expect(redact('https://a.com\u00a0/Users/ada/x')).toBe('https://a.com\u00a0〔已脱敏·路径〕')
+    expect(redact('https://a.com\u3000/Users/ada/x')).toBe('https://a.com\u3000〔已脱敏·路径〕')
+    expect(redact('/Users/ada/x\u00a0after')).toBe('〔已脱敏·路径〕\u00a0after')
+  })
+
+  it('takes host suffixes and localhost in any case', () => {
+    expect(redact('go db.INTERNAL now')).toBe('go 〔已脱敏·内网地址〕 now')
+    expect(redact('go Nas.Local now')).toBe('go 〔已脱敏·内网地址〕 now')
+    expect(redact('go LOCALHOST:3000 now')).toBe('go 〔已脱敏·内网地址〕 now')
+  })
+})
+
+describe('separators (C7, C8)', () => {
+  it('takes mobiles with a separator anywhere and international numbers in groups', () => {
+    expect(redact('call 1-3800138000 now')).toBe('call 〔已脱敏·电话〕 now')
+    expect(redact('call 1 380 0138 000 now')).toBe('call 〔已脱敏·电话〕 now')
+    expect(redact('call +1 415-555-2671 now')).toBe('call 〔已脱敏·电话〕 now')
+    expect(redact('call +44 20 7946 0958 now')).toBe('call 〔已脱敏·电话〕 now')
+    expect(redact('call +1 (415) 555.2671 now')).toBe('call 〔已脱敏·电话〕 now')
+    // Not a number with a dot: an address.
+    expect(categories('go 172.31.255.255 now')).toEqual(['internal_address'])
+  })
+
+  it('takes cards with mixed separators, other groupings, and a number after them', () => {
+    expect(redact('卡 4111 1111-1111 1111 结束')).toBe('卡 〔已脱敏·银行卡号〕 结束')
+    expect(redact('卡 3782 822463 10005 结束')).toBe('卡 〔已脱敏·银行卡号〕 结束')
+    expect(redact('卡 4111 1111 1111 1111 2026 结束')).toBe('卡 〔已脱敏·银行卡号〕 2026 结束')
+    expect(redact('卡 6222 0212 3456 7890 128 结束')).not.toContain('6222')
+  })
+
+  it('does not read a list of small numbers as a card', () => {
+    expect(categories('1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19')).toEqual([])
+  })
+})
+
+describe('linear time on adversarial input (C9–C11)', () => {
+  const n = MAX_REDACT_INPUT
+  const fill = (unit: string, tail = ''): string => unit.repeat(Math.floor((n - tail.length) / unit.length)) + tail
+  const cases: Array<[string, string]> = [
+    ['one JWT through a long run (C9)', fill('sk-eyJa', '.eyJabcd.abcd')],
+    ['BEGINs, then ENDs of another type (C10)', `${'-----BEGIN RSA PRIVATE KEY-----\n'.repeat(8000)}${'-----END EC PRIVATE KEY-----\n'.repeat(8000)}`],
+    ['many hits (C11)', fill('a@b.co ')],
+    ['quoted values never closed', fill('pwd="')],
+    ['quoted values on one line', fill('pwd="x ')],
+    ['UNC near-misses', fill('\\\\a')],
+    ['paths inside URLs', fill('http://x/Users/')],
+    ['card groups', fill('123 ')],
+    ['phone groups', fill('+1 ')],
+    ['one value', `password=${'x'.repeat(n - 9)}`],
+    ['JWT near-misses', fill('eyJaaaa.')],
+    ['one-line key bodies', fill('-----BEGIN PRIVATE KEY----- AAAA ')],
+    ['hosts', fill('a.lan.')],
+    ['placeholders', fill(placeholder('credential'))],
+  ]
+  it.each(cases)('%s', (_name, input) => {
+    expect(input.length).toBeLessThanOrEqual(n)
+    let started = Date.now()
+    postScan(input)
+    expect(Date.now() - started).toBeLessThan(2000)
+    started = Date.now()
+    const out = preRedact(input)
+    expect(Date.now() - started).toBeLessThan(4000)
+    expect(postScan(out.text)).toEqual(out.text.length > n ? [{ category: 'credential', start: 0, end: out.text.length }] : [])
+  }, 30000)
+})
+
+describe('preRedact output scans clean', () => {
+  const pieces = [
+    'password=', 'Token: ', '"secret": "', 'sk-', 'abcdefghijklmnopqrstu', placeholder('credential'), placeholder('path'), '〔已脱敏·',
+    ' ', '\n', '\u00a0', '@', 'ex.com', '1380013', '8000', '+44 20 ', '4111 1111 ', '/Users/', '~/', 'C:\\', '\\\\srv\\',
+    'eyJ', 'abcd.', '.', '"', "'", ':', '=', '-----BEGIN RSA PRIVATE KEY-----', '-----END RSA PRIVATE KEY-----', 'MIIB',
+    'db.INTERNAL', '10.0.0.1', ':8080', 'localhost:', 'https://', '，', '。',
+  ]
+  it('for random mixes of the tricky parts', () => {
+    let seed = 1669
+    const random = (): number => {
+      seed = (seed * 1103515245 + 12345) % 2147483648
+      return seed / 2147483648
+    }
+    for (let round = 0; round < 3000; round += 1) {
+      let text = ''
+      const count = 1 + Math.floor(random() * 14)
+      for (let i = 0; i < count; i += 1) text += pieces[Math.floor(random() * pieces.length)]
+      const out = preRedact(text)
+      expect(postScan(out.text), JSON.stringify(text)).toEqual([])
+      expectShape(postScan(text))
+    }
+  })
 })

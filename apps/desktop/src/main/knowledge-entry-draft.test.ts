@@ -303,6 +303,16 @@ describe('entry draft store', () => {
     expect(fs.readFileSync(events, 'utf8')).toBe(before)
   })
 
+  it('keeps the draft when the withdrawal cannot be recorded', () => {
+    const store = createEntryDraftStore(dir, clock())
+    const draft = store.create(draftInput())
+    const root = path.join(dir, 'knowledge-entries')
+    // A directory where the event log should be: appending to it fails.
+    fs.mkdirSync(path.join(root, '_events.jsonl'))
+    expect(() => store.withdraw(draft.id)).toThrow()
+    expect(store.get(draft.id)).toEqual(draft)
+  })
+
   it('does not touch a file outside the store when the id is illegal', () => {
     const store = createEntryDraftStore(dir)
     const sentinel = path.join(dir, 'x.json')

@@ -328,7 +328,8 @@ export function createEntryDraftStore(dir: string, now: () => Date = () => new D
       if (!checked) return false
       const current = readDraft(checked)
       if (!current) return false
-      fs.rmSync(fileOf(checked), { force: true })
+      // The event first: a withdrawal whose record could not be written has
+      // not happened, and the draft stays for another try.
       ensureRoot()
       const events = path.join(root, '_events.jsonl')
       const line = `${JSON.stringify({
@@ -341,6 +342,7 @@ export function createEntryDraftStore(dir: string, now: () => Date = () => new D
       try { fs.writeFileSync(fd, line) }
       finally { fs.closeSync(fd) }
       fs.chmodSync(events, 0o600)
+      fs.rmSync(fileOf(checked), { force: true })
       return true
     },
   }
