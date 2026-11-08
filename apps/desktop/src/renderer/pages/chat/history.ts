@@ -347,6 +347,7 @@ export function openConversation(id: string): void {
 export async function deleteConversation(id: string): Promise<void> {
   if (state.busy && state.activeId === id) return
   deletedAt.set(id, ++seq)
+  promoteAfterSave.delete(id)
   unsaved.delete(id)
   // The page leaves the conversation first, synchronously, so nothing sent
   // while the deletion is on its way can land in it and save it again.
@@ -363,6 +364,7 @@ export async function deleteConversation(id: string): Promise<void> {
 export async function clearConversations(): Promise<void> {
   if (state.busy) return
   clearedAt = ++seq
+  promoteAfterSave.clear()
   unsaved.clear()
   starter?.()
   set({ activeId: null })
