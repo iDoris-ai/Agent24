@@ -18,10 +18,14 @@ export interface HistoryState {
   busy: boolean
   /** UI-06: the user's groups and which parts of the list are folded. */
   groups: ChatGroupsState
+  /** UI-06 G3: conversations whose archiving main has not answered yet.
+   *  The page treats them as archived already, so nothing is added to one
+   *  meanwhile; a failed archive takes it off again. */
+  archiving: string[]
 }
 
 const NO_GROUPS: ChatGroupsState = { groups: [], assistant_collapsed: false, archive_collapsed: true }
-const initial: HistoryState = { items: [], activeId: null, busy: false, groups: NO_GROUPS }
+const initial: HistoryState = { items: [], activeId: null, busy: false, groups: NO_GROUPS, archiving: [] }
 let state: HistoryState = initial
 const listeners = new Set<() => void>()
 let opener: ((id: string) => void) | null = null
@@ -141,16 +145,23 @@ export function moveConversation(id: string, groupId: string | null): Promise<bo
   return organize(id, { group_id: groupId })
 }
 
-/** UI-06: archives a saved conversation. Archiving the open one starts a new
- *  chat, as deleting it does, and not while its reply is in flight: the
- *  reply would land in a conversation the list no longer shows. */
-export function archiveConversation(id: string): Promise<boolean> {
-  if (state.busy && state.activeId === id) return Promise.resolve(false)
-  if (state.activeId === id) {
+/** UI-06: archives a saved conversation. Not the open one while its reply is
+ *  in flight: the reply would land in a conversation the list no longer
+ *  shows. Once main has archived it, the page leaves it for a new chat if it
+ *  is still open and idle; a failed archive leaves it open (PR-Daemon #1647
+ *  L2). Should a reply have started meanwhile, it stays open, read-only. */
+export async function archiveConversation(id: string): Promise<boolean> {
+  if (state.busy && state.activeId === id) return false
+  set({ archiving: [...state.archiving, id] })
+  const done = await organize(id, { archived: true }).finally(() => {
+    const at = state.archiving.indexOf(id)
+    if (at >= 0) set({ archiving: state.archiving.filter((_, i) => i !== at) })
+  })
+  if (done && state.activeId === id && !state.busy) {
     starter?.()
     set({ activeId: null })
   }
-  return organize(id, { archived: true })
+  return done
 }
 
 /** UI-06: brings an archived conversation back, into its group if that

@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo } from 'react'
+import { useState, useRef, useEffect, useMemo, useSyncExternalStore } from 'react'
 import { formatReplySuffix, extractServerReported, type ReplyLatency } from './chat-latency'
 import logoWelcome from '../assets/logo-welcome.png'
 import { useT } from '../i18n'
@@ -11,8 +11,8 @@ import { activeTurn, buildTurns } from './chat/turns'
 import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/title'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../shared/chat-history'
 import {
-  getHistoryState, historyAvailable, loadConversation, registerChatPage, saveConversation, setActiveConversation,
-  setChatBusy, titleConversation,
+  getHistoryState, historyAvailable, loadConversation, registerChatPage, restoreConversation, saveConversation,
+  setActiveConversation, setChatBusy, subscribeHistory, titleConversation,
 } from './chat/history'
 
 /** M1-T14: what `/api/v1/chat` ACTUALLY did with an explicit "记住…" turn —
@@ -101,6 +101,13 @@ export default function ChatPage() {
   // lifetime (M1-T14), so a new conversation is started explicitly via
   // `newChat` below, which swaps in a fresh id.
   const [sessionId, setSessionId] = useState(() => genChatSessionId())
+  // UI-06 D7: the open conversation is archived. It is shown, not continued:
+  // the composer gives way to a note and a way to restore it.
+  const history = useSyncExternalStore(subscribeHistory, getHistoryState)
+  const archived = history.archiving.includes(sessionId)
+    || history.items.some(item => item.id === sessionId && item.archived_at !== null)
+  const archivedRef = useRef(archived)
+  archivedRef.current = archived
   const bottomRef = useRef<HTMLDivElement>(null)
   // The turn rail: each turn's prompt element, keyed by message index, and
   // the turn being read, followed from the scroll position.
@@ -175,7 +182,7 @@ export default function ChatPage() {
   }, [messages, turns])
 
   const send = async (text: string) => {
-    if (!text.trim() || requestInFlight.current || awaitingConfirmation) return
+    if (!text.trim() || requestInFlight.current || awaitingConfirmation || archivedRef.current) return
     const userMsg: Message = { role: 'user', content: text.trim(), delivery: { kind: 'sending' } }
     const request: ChatRequest = {
       messages: [...messages.filter(m => m.role === 'assistant' || m.delivery.kind === 'sent'), userMsg]
@@ -235,7 +242,9 @@ export default function ChatPage() {
   }
 
   const requestReply = async (index: number, request: ChatRequest) => {
-    if (requestInFlight.current) return
+    // An archived conversation is read-only (UI-06 D7): nothing is sent, a
+    // retry neither, until it is restored.
+    if (requestInFlight.current || archivedRef.current) return
     requestInFlight.current = true
     setDelivery(index, { kind: 'sending' })
     setLoading(true)
@@ -477,7 +486,14 @@ export default function ChatPage() {
         <div ref={bottomRef} />
       </div>
 
-      <div className="chat-input-bar">
+      {archived ? (
+        <div className="chat-input-bar chat-archived-bar" role="status">
+          <span className="chat-archived-notice">{t('archived.notice')}</span>
+          {/* Not while main is still archiving it: the page leaves it then. */}
+          <button className="btn" disabled={history.archiving.includes(sessionId)}
+            onClick={() => void restoreConversation(sessionId)}>{t('archived.restore')}</button>
+        </div>
+      ) : <div className="chat-input-bar">
         <textarea
           ref={textareaRef}
           className="chat-input"
@@ -494,7 +510,7 @@ export default function ChatPage() {
         >
           ↑
         </button>
-      </div>
+      </div>}
     </div>
   )
 }

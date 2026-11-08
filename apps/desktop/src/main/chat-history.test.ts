@@ -458,6 +458,16 @@ describe('chat history groups and archive (UI-06)', () => {
     expect(fs.readdirSync(root)).toHaveLength(3)
   })
 
+  it('a fold with a bad target is refused before the groups file is read for a change (PR-Daemon #1647 L1)', () => {
+    fs.mkdirSync(path.join(dir, 'chat-history'))
+    const file = path.join(dir, 'chat-history', '_groups.json')
+    fs.writeFileSync(file, '{')
+    expect(() => createChatHistoryStore(dir).setCollapsed('../x', true)).toThrow('Invalid chat group id')
+    // Left as it was: not set aside for a change that never happened.
+    expect(fs.readdirSync(path.join(dir, 'chat-history'))).toEqual(['_groups.json'])
+    expect(fs.readFileSync(file, 'utf8')).toBe('{')
+  })
+
   it('refuses a group change when the groups file is there but cannot be read', () => {
     const store = createChatHistoryStore(dir)
     store.createGroup('甲')

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type DragEv
 import { useT } from '../../i18n'
 import { chatMessages } from '../Chat.i18n'
 import {
+  archiveConversation,
   clearConversations,
   createGroup,
   deleteConversation,
@@ -13,6 +14,7 @@ import {
   refreshHistory,
   renameConversation,
   renameGroup,
+  restoreConversation,
   setCollapsed,
   subscribeHistory,
 } from './history'
@@ -76,10 +78,14 @@ type Opener = { currentTarget: HTMLElement; clientX?: number; clientY?: number }
  *  user's groups, folded or not, above the ungrouped conversations; a
  *  conversation moves by dragging it onto a group's heading (or onto
  *  "Recent", out of any) or through its ⋯ menu, also opened by a right
- *  click; the whole list folds. Deleting asks first, as clearing does. */
+ *  click; the whole list folds. Deleting asks first, as clearing does.
+ *  Archived conversations (UI-06 G3) are listed apart, at the bottom under
+ *  "Archived (N)", folded at first; a conversation is archived from its menu
+ *  or by dragging it there, and restored from its menu. A search looks
+ *  through them too. */
 export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   const t = useT(chatMessages)
-  const { items, activeId, busy, groups: groupState } = useSyncExternalStore(subscribeHistory, getHistoryState)
+  const { items, activeId, busy, groups: groupState, archiving } = useSyncExternalStore(subscribeHistory, getHistoryState)
   const groups = groupState.groups
   useEffect(() => { void refreshHistory(); void refreshGroups() }, [])
   const [query, setQuery] = useState('')
@@ -100,7 +106,7 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   })
   const rowMenuAt = (id: string) => `[data-row-menu="${id}"]`
   const groupMenuAt = (id: string) => `[data-group-menu="${id}"]`
-  // Archived conversations are not listed with the others (G3 lists them apart).
+  // Only conversations that are not archived can be dragged.
   const live = useMemo(() => items.filter(item => item.archived_at === null), [items])
   // What each row shows, worked out once per list, not on every keystroke
   // of a rename or a search. (`t` is new on every render; its text is not.)
@@ -108,16 +114,17 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   const rows = useMemo(() => {
     // Titles shared by more than one conversation get their time beside them.
     const titleCount = new Map<string, number>()
-    for (const item of live) {
+    for (const item of items) {
       const name = item.title || untitled
       titleCount.set(name, (titleCount.get(name) ?? 0) + 1)
     }
-    return live.map(item => {
+    return items.map(item => {
       const name = item.title || untitled
       const when = shortTime(item.updated_at)
       const twin = (titleCount.get(name) ?? 0) > 1 && when !== ''
       return {
         item, name, when, twin,
+        archived: item.archived_at !== null,
         group: groupOf(item, groups),
         // Buttons of conversations with the same title say which is which.
         title: twin ? `${name} ${when}` : name,
@@ -126,11 +133,15 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
         haystack: haystackOf(item),
       }
     })
-  }, [live, groups, untitled])
+  }, [items, groups, untitled])
   type Row = (typeof rows)[number]
+  // Archived ones apart: never in a group's rows, count or Recent.
+  const liveRows = rows.filter(row => !row.archived)
+  const archivedRows = rows.filter(row => row.archived)
   // The search, and so its filter, only while the list is long enough to
   // have one; a query left when the box goes is dropped, so it does not
-  // come back with the box (Low U-12).
+  // come back with the box (Low U-12). Archived conversations count: the
+  // search finds them too (D5).
   const searchable = items.length > SEARCH_FROM
   useEffect(() => { if (!searchable) setQuery('') }, [searchable])
   const needle = fold(oneLine(query))
@@ -146,10 +157,24 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   const listRef = useRef<HTMLDivElement>(null)
   const entry = (id: string) => listRef.current?.querySelector<HTMLButtonElement>(`[data-history-id="${id}"]`)
   const startEdit = (id: string, title: string) => {
+    // Archived conversations (or ones being archived) are restored or
+    // deleted, not renamed.
+    if (archiving.includes(id) || items.find(item => item.id === id)?.archived_at != null) return
     editingRef.current = { id, from: title }
     setEditing(id)
     setDraft(title)
   }
+  // A rename open when its conversation is archived is dropped, unsaved.
+  const editedArchived = editing !== null && (archiving.includes(editing)
+    || items.find(item => item.id === editing)?.archived_at != null)
+  useEffect(() => {
+    if (!editedArchived || editing === null) return
+    editingRef.current = null
+    setEditing(null)
+    // Focus that went with the box goes to its row's ⋯ (or the search box,
+    // or the list's fold), not to nowhere.
+    focusSoon(rowMenuAt(editing))
+  }, [editedArchived])
   const endEdit = (save: boolean, refocus: boolean) => {
     const edit = editingRef.current
     if (edit === null) return
@@ -200,8 +225,9 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   const removeGroup = (id: string) => {
     const group = groups.find(g => g.id === id)
     if (!group) return
-    // Its conversations stay, back in Recent; only a group holding some
-    // asks. Counted over every conversation, archived ones too.
+    // Its conversations stay (not archived ones back in Recent, archived
+    // ones in Archived); only a group holding some asks. Counted over every
+    // conversation, archived ones too.
     const count = items.filter(item => item.group_id === id).length
     if (count === 0 || window.confirm(t('history.group.deleteConfirm', { name: group.name, count: String(count) }))) {
       return deleteGroup(id)
@@ -231,7 +257,11 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
       : { x: box.left, y: box.bottom }
     setMenu({ kind, id, at })
   }
-  const rowMenu = (row: Row): MenuEntry[] => [
+  const rowMenu = (row: Row): MenuEntry[] => row.archived ? [
+    // Archived: brought back, or deleted. Its group is kept for its return.
+    { kind: 'item', key: 'restore', label: t('history.menu.restore'), onSelect: () => restoreConversation(row.item.id) },
+    { kind: 'item', key: 'delete', label: t('history.menu.delete'), onSelect: () => remove(row) },
+  ] : [
     { kind: 'item', key: 'rename', label: t('history.menu.rename'), focuses: true, onSelect: () => startEdit(row.item.id, row.item.title) },
     { kind: 'heading', key: 'move-to', label: t('history.menu.moveTo') },
     ...groups.filter(g => g.id !== row.group).map((g): MenuEntry => ({
@@ -242,6 +272,11 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
     ...(row.group !== null
       ? [{ kind: 'item', key: 'ungroup', label: t('history.menu.ungroup'), onSelect: () => moveConversation(row.item.id, null) } as const]
       : []),
+    // The open conversation is not archived or deleted while its reply is
+    // on its way: the reply would land in a conversation the list no longer
+    // shows.
+    { kind: 'item', key: 'archive', label: t('history.menu.archive'), disabled: busy && row.item.id === activeId,
+      onSelect: () => archiveConversation(row.item.id) },
     { kind: 'item', key: 'delete', label: t('history.menu.delete'), disabled: busy && row.item.id === activeId, onSelect: () => remove(row) },
   ]
   const groupMenu = (id: string): MenuEntry[] => [
@@ -273,7 +308,10 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
     const key = targetKey(target)
     const change = () => {
       const item = dragging === null ? undefined : live.find(i => i.id === dragging)
-      return item ? { id: item.id, patch: dropChange(target, item, groups) } : null
+      if (!item) return null
+      // The menu's rule: not the open conversation while its reply is on its way.
+      if (target.kind === 'archive' && busy && item.id === activeId) return null
+      return { id: item.id, patch: dropChange(target, item, groups) }
     }
     return {
       onDragOver: (e: DragEvent) => {
@@ -293,22 +331,25 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
         // The conversation dropped is the one this list started dragging.
         if (!drop?.patch || !ours(e) || e.dataTransfer.getData(DRAG_TYPE) !== drop.id) return
         e.preventDefault()
-        // Moving is undone as easily as it is done: no confirmation.
-        if (drop.patch.group_id !== undefined) void moveConversation(drop.id, drop.patch.group_id)
+        // Moving and archiving are undone as easily as they are done: no
+        // confirmation.
+        if (drop.patch.archived) void archiveConversation(drop.id)
+        else if (drop.patch.group_id !== undefined) void moveConversation(drop.id, drop.patch.group_id)
       },
     }
   }
 
   if (items.length === 0 && groups.length === 0) return null
   const folded = groupState.assistant_collapsed
+  const archiveFolded = groupState.archive_collapsed
 
   const renderRow = (row: Row) => {
-    const { item, name, when, twin, title, tip } = row
+    const { item, name, when, twin, title, tip, archived } = row
     const renaming = editing === item.id
     return (
       <li key={item.id}
         className={`chat-history-item${item.id === activeId ? ' active' : ''}${dragging === item.id ? ' dragging' : ''}`}
-        draggable={!renaming}
+        draggable={!renaming && !archived}
         onDragStart={e => {
           e.dataTransfer?.setData(DRAG_TYPE, item.id)
           if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
@@ -342,6 +383,7 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
             {twin && <>{' '}<span className="chat-history-when">{when}</span></>}
             {searching && row.group !== null && <>{' '}<span className="chat-history-tag">
               {groups.find(g => g.id === row.group)?.name}</span></>}
+            {searching && archived && <>{' '}<span className="chat-history-tag">{t('history.tag.archived')}</span></>}
           </button>}
         {!renaming && (
           <button type="button" className="chat-history-action" aria-label={t('history.menu.label', { title })} data-row-menu={item.id}
@@ -391,7 +433,7 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
           </>
           : <>
             {groups.map(group => {
-              const members = rows.filter(row => row.group === group.id)
+              const members = liveRows.filter(row => row.group === group.id)
               const key = targetKey({ kind: 'group', id: group.id })
               return (
                 <div key={group.id} className="chat-history-group" role="group" aria-label={group.name}>
@@ -419,7 +461,17 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
                 </div>
               )
             })}
-            <ul className="chat-history-list">{rows.filter(row => row.group === null).map(renderRow)}</ul>
+            <ul className="chat-history-list">{liveRows.filter(row => row.group === null).map(renderRow)}</ul>
+            <div className="chat-history-group chat-history-archive" role="group" aria-label={t('history.archive.label')}>
+              <div className={`chat-history-group-head${over === 'archive' ? ' drop-over' : ''}`} {...dropProps({ kind: 'archive' })}>
+                <button type="button" className="chat-history-fold" aria-expanded={!archiveFolded}
+                  aria-label={t(archiveFolded ? 'history.archive.show' : 'history.archive.hide')}
+                  onClick={() => void setCollapsed('archive', !archiveFolded)}>{archiveFolded ? '▸' : '▾'}</button>
+                <span className="chat-history-group-name">{t('history.archive.label')}</span>
+                <span className="chat-history-when">{archivedRows.length}</span>
+              </div>
+              {!archiveFolded && <ul className="chat-history-list">{archivedRows.map(renderRow)}</ul>}
+            </div>
           </>}
       </div>}
       {menu && menuRow && <HistoryMenu label={t('history.menu.label', { title: menuRow.title })}
