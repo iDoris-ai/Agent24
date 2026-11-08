@@ -262,7 +262,7 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   const rowMenu = (row: Row): MenuEntry[] => row.archived ? [
     // Archived: brought back, or deleted. Its group is kept for its return.
     { kind: 'item', key: 'restore', label: t('history.menu.restore'), onSelect: () => restoreConversation(row.item.id) },
-    entryItem(row.item.id),
+    ...entryItem(row.item.id),
     { kind: 'item', key: 'delete', label: t('history.menu.delete'), onSelect: () => remove(row) },
   ] : [
     { kind: 'item', key: 'rename', label: t('history.menu.rename'), focuses: true, onSelect: () => startEdit(row.item.id, row.item.title) },
@@ -275,7 +275,7 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
     ...(row.group !== null
       ? [{ kind: 'item', key: 'ungroup', label: t('history.menu.ungroup'), onSelect: () => moveConversation(row.item.id, null) } as const]
       : []),
-    entryItem(row.item.id),
+    ...entryItem(row.item.id),
     // The open conversation is not archived or deleted while its reply is
     // on its way: the reply would land in a conversation the list no longer
     // shows.

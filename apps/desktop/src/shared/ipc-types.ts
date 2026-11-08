@@ -198,7 +198,7 @@ export type KnowledgeDraftEntry = {
 /** KB-SOP-01a: the answer to "沉淀为知识条目" (main/knowledge-entry-ipc.ts). */
 export type KnowledgeEntryAdmission =
   | { ok: true }
-  | { ok: false; reason: 'floor_missing' | 'restricted' | 'unknown' | 'too_many_runs' | 'not_confirmed' | 'not_found' | 'busy' }
+  | { ok: false; reason: 'floor_missing' | 'restricted' | 'unknown' | 'too_many_runs' | 'not_confirmed' | 'not_found' | 'busy' | 'knowledge_off' }
 
 export type KnowledgeSettingsResult = { ok: true } | { ok: false; reason: 'invalid' | 'not_saved' | 'unavailable' }
 

@@ -25,6 +25,7 @@ function setup(over: Partial<KnowledgeEntryDeps> & { reading?: FloorReading; ans
     conversation: (id) => (id === 'chat_abc' ? record : null),
     reader,
     locale: () => 'zh',
+    bound: () => true,
     ...over,
     confirm,
   }
@@ -96,6 +97,19 @@ describe('knowledgeEntryAdmitter', () => {
   })
 })
 
+describe('knowledgeEntryAdmitter while Knowledge is off', () => {
+  it('refuses before reading anything, and again if it went off during the dialog', async () => {
+    const off = setup({ bound: () => false })
+    expect(await off.admit(event, 'chat_abc')).toEqual({ ok: false, reason: 'knowledge_off' })
+    expect(off.reads).toEqual([])
+    expect(off.confirm).not.toHaveBeenCalled()
+    let on = true
+    const flips = setup({ bound: () => on })
+    flips.confirm.mockImplementation(async () => { on = false; return true })
+    expect(await flips.admit(event, 'chat_abc')).toEqual({ ok: false, reason: 'knowledge_off' })
+  })
+})
+
 describe('shortTitle', () => {
   it('keeps short titles, cuts long ones by character, and names an empty one', () => {
     expect(shortTitle('  请假\n流程 ', '未命名对话')).toBe('请假 流程')
@@ -109,7 +123,7 @@ describe('registerKnowledgeEntryIpc', () => {
   it('handles one channel through the guard', () => {
     const handle = vi.fn()
     const guard = vi.fn(<F,>(f: F) => f)
-    const deps: KnowledgeEntryDeps = { conversation: () => null, reader: { read: async () => 'ordinary' }, confirm: async () => true, locale: () => 'en' }
+    const deps: KnowledgeEntryDeps = { conversation: () => null, reader: { read: async () => 'ordinary' }, confirm: async () => true, locale: () => 'en', bound: () => true }
     registerKnowledgeEntryIpc({ handle } as never, guard as never, deps)
     expect(handle).toHaveBeenCalledTimes(1)
     expect(handle.mock.calls[0][0]).toBe(IpcChannels.KnowledgeEntryAdmit)

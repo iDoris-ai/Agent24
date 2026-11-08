@@ -94,7 +94,7 @@ describe('the archive in the history list (UI-06 G3)', () => {
     await waitFor(() => expect(store.groups().archive_collapsed).toBe(false))
     // An archived row cannot be dragged; its menu restores or deletes.
     expect(row('周报').closest('li')).toHaveAttribute('draggable', 'false')
-    expect(within(openRowMenu('周报')).getAllByRole('menuitem').map(i => i.textContent)).toEqual(['恢复', '沉淀为知识条目', '删除…'])
+    expect(within(openRowMenu('周报')).getAllByRole('menuitem').map(i => i.textContent)).toEqual(['恢复', '删除…'])
   })
 
   it('archived conversations of a group are not in its rows or its count (PR-Daemon #1648 L1)', async () => {

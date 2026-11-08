@@ -23,6 +23,7 @@ export const knowledgeEntryMessages = defineMessages({
     'refused.not_confirmed': 'Nothing was done.',
     'refused.not_found': 'This conversation is no longer here.',
     'refused.busy': 'Another conversation is waiting for your answer. Answer it first.',
+    'refused.knowledge_off': 'Knowledge is off or not bound to a knowledge base. Turn it on in Settings first.',
     'refused.failed': 'This conversation could not be checked. Try again in a moment.',
     'action.close': 'Close',
   },
@@ -38,6 +39,7 @@ export const knowledgeEntryMessages = defineMessages({
     'refused.not_confirmed': '没有做任何操作。',
     'refused.not_found': '这条对话已经不在了。',
     'refused.busy': '另一条对话正在等你确认，请先处理那一条。',
+    'refused.knowledge_off': 'Knowledge 未开启或未绑定知识库，请先在设置里开启。',
     'refused.failed': '暂时无法检查这条对话，请稍后再试。',
     'action.close': '关闭',
   },
@@ -53,6 +55,7 @@ export const knowledgeEntryMessages = defineMessages({
     'refused.not_confirmed': 'ไม่ได้ดำเนินการใด ๆ',
     'refused.not_found': 'ไม่พบบทสนทนานี้แล้ว',
     'refused.busy': 'มีอีกบทสนทนาหนึ่งรอการยืนยันจากคุณอยู่ โปรดตอบบทสนทนานั้นก่อน',
+    'refused.knowledge_off': 'Knowledge ปิดอยู่หรือยังไม่ได้เชื่อมกับฐานความรู้ โปรดเปิดในการตั้งค่าก่อน',
     'refused.failed': 'ยังตรวจสอบบทสนทนานี้ไม่ได้ โปรดลองอีกครั้งในอีกสักครู่',
     'action.close': 'ปิด',
   },
@@ -77,11 +80,42 @@ export function usePendingEntry(): string | null {
   return useSyncExternalStore(subscribe, () => pending)
 }
 
-/** The history list's one new action, for any conversation, archived ones included. */
-export function useEntryMenu(): (id: string) => MenuEntry {
+/**
+ * Whether Knowledge is on and bound now. Main says so only on request, so it
+ * is asked again on mount, when the window comes back, and on every press
+ * that may open a history menu (an open menu takes the change in place).
+ * Not known yet, or the question failed: off.
+ */
+function useKnowledgeBound(): boolean {
+  const [bound, setBound] = useState(false)
+  useEffect(() => {
+    let live = true
+    const refresh = (): void => {
+      const status = window.agent24.knowledge?.status()
+      if (!status) { setBound(false); return }
+      status.then((s) => { if (live) setBound(s.active === true) }, () => { if (live) setBound(false) })
+    }
+    refresh()
+    window.addEventListener('focus', refresh)
+    document.addEventListener('pointerdown', refresh, true)
+    document.addEventListener('contextmenu', refresh, true)
+    return () => {
+      live = false
+      window.removeEventListener('focus', refresh)
+      document.removeEventListener('pointerdown', refresh, true)
+      document.removeEventListener('contextmenu', refresh, true)
+    }
+  }, [])
+  return bound
+}
+
+/** The history list's one new action, for any conversation, archived ones
+ *  included; none at all while Knowledge is off or not bound. */
+export function useEntryMenu(): (id: string) => MenuEntry[] {
   const t = useT(knowledgeEntryMessages)
   const { open } = useContext(CapabilitiesContext)
-  return (id) => ({
+  const bound = useKnowledgeBound()
+  return (id) => (!bound ? [] : [{
     kind: 'item',
     key: 'knowledge-entry',
     label: t('menu.entry'),
@@ -91,7 +125,7 @@ export function useEntryMenu(): (id: string) => MenuEntry {
       requestEntry(id)
       open('knowledge', 'other')
     },
-  })
+  }])
 }
 
 type Shown = { kind: 'checking' } | { kind: 'done'; answer: KnowledgeEntryAdmission } | { kind: 'failed' }

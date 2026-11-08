@@ -529,6 +529,7 @@ app.whenReady().then(async () => {
       return result.response === 0
     },
     locale: getMainLocale,
+    bound: () => knowledge?.status().active === true,
   })
   ipcMain.handle(IpcChannels.CreativeShow, guard((_event, bounds: CreativeViewBounds) => showCreativeView(bounds)))
   ipcMain.handle(IpcChannels.CreativeRestart, guard((_event, bounds: CreativeViewBounds) => restartCreativeView(bounds)))

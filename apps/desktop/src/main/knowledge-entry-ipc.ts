@@ -48,6 +48,8 @@ export interface KnowledgeEntryDeps {
   /** A native yes/no for this sender's window; true only when the user chose yes. */
   confirm: (event: IpcMainInvokeEvent, ask: { message: string; detail: string; confirm: string; cancel: string }) => Promise<boolean>
   locale: () => MainLocale
+  /** Knowledge is on and bound to a knowledge base right now. */
+  bound: () => boolean
 }
 
 export function shortTitle(title: string, untitled: string): string {
@@ -67,6 +69,8 @@ export function knowledgeEntryAdmitter(deps: KnowledgeEntryDeps) {
     }
   }
   return async (event: IpcMainInvokeEvent, id: unknown): Promise<KnowledgeEntryAdmission> => {
+    // The list offers the action only while bound; this holds it to that.
+    if (!deps.bound()) return { ok: false, reason: 'knowledge_off' }
     const record = load(id)
     if (!record) return { ok: false, reason: 'not_found' }
     // Refused before anything is asked: the user is told why, not asked to confirm.
@@ -90,6 +94,7 @@ export function knowledgeEntryAdmitter(deps: KnowledgeEntryDeps) {
       asking = false
     }
     // The conversation may have moved on while the dialog was open: judge it again as it is now.
+    if (!deps.bound()) return { ok: false, reason: 'knowledge_off' }
     const now = load(id)
     if (!now) return { ok: false, reason: 'not_found' }
     return admit(now, deps.reader, confirmed)
