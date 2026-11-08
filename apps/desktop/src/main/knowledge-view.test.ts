@@ -386,6 +386,20 @@ describe('origin policy and CSP (U4.2)', () => {
       expect(csp).toContain(d)
     }
     expect(csp).not.toMatch(/unsafe-eval|\*/)
+    // A loopback IPv4 origin stays an explicit source.
+    expect(knowledgeViewCsp('http://127.0.0.1:18282')).toContain('script-src http://127.0.0.1:18282;')
+  })
+
+  it("uses 'self' for an IPv6 origin, which Chromium's CSP parser cannot take as a host (Codex #1654 R1)", () => {
+    const csp = knowledgeViewCsp('http://[::1]:8443')
+    expect(csp).not.toContain('[')
+    for (const d of ["script-src 'self'", "style-src 'self' 'unsafe-inline'", "img-src 'self' data: blob:", "font-src 'self' data:",
+      "connect-src 'self'", "media-src 'self'", "manifest-src 'self'", "form-action 'self'", "default-src 'none'", "frame-src 'none'",
+      "worker-src 'none'", "frame-ancestors 'none'"]) {
+      expect(csp, d).toContain(d)
+    }
+    expect(csp).not.toMatch(/unsafe-eval|\*|ws:/)
+    expect(knowledgeViewCsp('https://[2001:db8::1]')).toContain("script-src 'self';")
   })
 
   it('adds its CSP next to the server one, never in place of it', () => {

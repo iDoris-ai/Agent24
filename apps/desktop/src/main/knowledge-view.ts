@@ -147,17 +147,25 @@ export function isAllowedRequest(url: string, origin: string): boolean {
  * WeKnora UI (component library inline styles) needs; decision #27 is to be
  * settled with KB-C2-02's page. */
 export function knowledgeViewCsp(origin: string): string {
-  const ws = origin.replace(/^http/, 'ws')
+  // Chromium's CSP parser takes no bracketed IPv6 host: `script-src
+  // http://[::1]:8443` matches nothing and the page's own scripts are blocked
+  // (headless Chromium 153, 11-08; Codex #1654 R1). For such an origin the
+  // sources are `'self'`: the main frame never leaves the allowed origin
+  // (guardKnowledgeContents), so 'self' is that origin. v1 has no WebSocket
+  // (UIB v1, design §2.2), so nothing is lost on ws.
+  const ipv6 = new URL(origin).hostname.startsWith('[')
+  const src = ipv6 ? "'self'" : origin
+  const connect = ipv6 ? "'self'" : `${origin} ${origin.replace(/^http/, 'ws')}`
   return [
     "default-src 'none'",
-    `script-src ${origin}`,
-    `style-src ${origin} 'unsafe-inline'`,
-    `img-src ${origin} data: blob:`,
-    `font-src ${origin} data:`,
-    `connect-src ${origin} ${ws}`,
-    `media-src ${origin}`,
-    `manifest-src ${origin}`,
-    `form-action ${origin}`,
+    `script-src ${src}`,
+    `style-src ${src} 'unsafe-inline'`,
+    `img-src ${src} data: blob:`,
+    `font-src ${src} data:`,
+    `connect-src ${connect}`,
+    `media-src ${src}`,
+    `manifest-src ${src}`,
+    `form-action ${src}`,
     "frame-src 'none'",
     "child-src 'none'",
     "worker-src 'none'",
