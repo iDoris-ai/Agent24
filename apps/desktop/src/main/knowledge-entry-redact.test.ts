@@ -649,6 +649,8 @@ describe('PR-Daemon round 1', () => {
   it('B4: redacts file: URLs and Windows paths that follow a URL', () => {
     leaks('open file:///Users/alice/notes.txt', 'alice')
     leaks('open file:///C:/Users/alice/notes.txt', 'alice')
+    leaks('saved to D:/Projects/alice/plan.txt', 'alice')
+    leaks('open file:///D:/Projects/alice/plan.txt', 'alice')
     leaks('open file://localhost/Users/alice/notes.txt', 'alice')
     leaks('https://example.com,C:\\Users\\alice\\secret.txt', 'alice')
     leaks('see https://example.com/x \\\\fileserver\\share\\alice', 'alice')

@@ -517,31 +517,21 @@ function assignmentFinder(key: string): Finder {
       lineTo = k
       return k
     }
-    const quotes: Record<string, { from: number; to: number; at: number }> = {
-      '"': { from: -1, to: -1, at: -1 },
-      "'": { from: -1, to: -1, at: -1 },
-    }
     /**
      * The closing `quote` at or after `j`, past backslash escapes; -1 when
-     * there is none. `j` is just after an opening quote. A search from inside
-     * an earlier one's stretch gets the same answer: the quote before `j` was
-     * escaped in that search (else it would have ended there), so it reached
-     * `j` in step.
+     * there is none. `j` is just after an opening quote. Linear over all
+     * keys: an opening quote follows `=`, `:` or white space, so it is never
+     * escaped, and a search from an earlier opening quote of the same kind
+     * ends at the latest on it. Searches do not overlap, and only the last
+     * one can run to the end.
      */
     const closingQuote = (j: number, quote: string): number => {
-      const memo = quotes[quote]
-      if (j >= memo.from && j <= memo.to) return memo.at
-      let k = j
-      while (k < text.length) {
+      for (let k = j; k < text.length;) {
         if (text[k] === '\\') k += 2
-        else if (text[k] === quote) break
+        else if (text[k] === quote) return k
         else k += 1
       }
-      const at = k < text.length ? k : -1
-      memo.from = j
-      memo.to = at < 0 ? text.length : at
-      memo.at = at
-      return at
+      return -1
     }
     const valueAt = (afterKey: number): Span | null => {
       let j = afterKey
