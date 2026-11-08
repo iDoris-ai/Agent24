@@ -44,9 +44,10 @@ const MAX_LABEL_UNITS = 1000
 const ITEM_ID = /^[A-Za-z0-9_-]{1,128}$/
 const isItemId = (v: unknown): v is string => typeof v === 'string' && ITEM_ID.test(v)
 
-/** M4 A2: told of every change main's own modules make to a conversation's
- *  runs or waiting items, with its summary as it now stands, so the open
- *  window can show it (main.ts forwards it). */
+/** M4 A2: told of every change written through appendRun, promoteRun,
+ *  setPending or clearPending (main's own modules, and the page's
+ *  promoteRun), with the summary as it now stands, so the open window can
+ *  show it (main.ts forwards it). Not of saves: the page made those. */
 type ChangeListener = (summary: ChatHistorySummary) => void
 let changeListener: ChangeListener | null = null
 export function onChatHistoryChange(listener: ChangeListener | null): void {

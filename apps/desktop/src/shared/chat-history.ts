@@ -71,10 +71,12 @@ export interface ChatHistoryRecord {
   pending: ChatHistoryPending[]
 }
 
-/** M4 A2: what a run is to its conversation. Every run starts as `answer`
- *  (a reply, never shown as a task); it becomes a `task` only when
- *  `promotionDue` says so or the user hands it over (A4). `schedule`: a run
- *  a schedule started, recorded in that schedule's conversation (A5). */
+/** M4 A2: what a run is to its conversation. A reply's run is recorded as
+ *  an `answer` (never shown as a task); an answer becomes a `task` when
+ *  `promotionDue` says so or the user hands it over (A4), and a run the
+ *  conversation did not know yet is then recorded as a task directly.
+ *  `schedule`: a run a schedule started, recorded in that schedule's
+ *  conversation (A5). */
 export type ChatHistoryRunKind = 'answer' | 'task' | 'schedule'
 export const CHAT_HISTORY_RUN_KINDS: readonly ChatHistoryRunKind[] = ['answer', 'task', 'schedule']
 
