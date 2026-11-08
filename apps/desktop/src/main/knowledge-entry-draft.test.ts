@@ -400,3 +400,100 @@ describe('entry draft store', () => {
     expect(fs.readFileSync(youngTmp, 'utf8')).toBe('young')
   })
 })
+
+// PR-Daemon round 1 on #1677 (head 8d00bd36).
+describe('entry draft store, PR-Daemon round 1', () => {
+  it('N1: limits the body by its UTF-8 bytes, not its UTF-16 length', () => {
+    const store = createEntryDraftStore(dir, clock())
+    // 3 bytes each: 21 846 characters are 65 538 bytes.
+    const over = '中'.repeat(Math.floor(MAX_ENTRY_BODY / 3) + 1)
+    expect(over.length).toBeLessThan(MAX_ENTRY_BODY)
+    expect(() => store.create(draftInput({ body: over }))).toThrow()
+    const fits = '中'.repeat(Math.floor(MAX_ENTRY_BODY / 3))
+    expect(store.create(draftInput({ body: fits })).body).toBe(fits)
+    const draft = store.create(draftInput())
+    expect(() => store.update(draft.id, { body: over })).toThrow()
+  })
+
+  it('N2: puts back a draft whose withdrawal was never recorded, and keeps it past the temp sweep', () => {
+    const now = { t: Date.UTC(2026, 0, 1) }
+    const store = createEntryDraftStore(dir, () => new Date(now.t))
+    const draft = store.create(draftInput())
+    const root = path.join(dir, 'knowledge-entries')
+    // The app stopped after the move aside and before the event.
+    fs.renameSync(path.join(root, `${draft.id}.json`), path.join(root, `${draft.id}.withdrawn.tmp`))
+    const old = new Date(now.t - 2 * 60 * 60 * 1000)
+    fs.utimesSync(path.join(root, `${draft.id}.withdrawn.tmp`), old, old)
+    now.t += 2 * 60 * 60 * 1000
+    const again = createEntryDraftStore(dir, () => new Date(now.t))
+    expect(again.list()).toEqual([draft])
+    expect(again.get(draft.id)).toEqual(draft)
+    expect(fs.existsSync(path.join(root, `${draft.id}.withdrawn.tmp`))).toBe(false)
+  })
+
+  it('N2: an unrecorded aside that cannot go back is kept, not swept', () => {
+    const now = { t: Date.UTC(2026, 0, 1) }
+    const store = createEntryDraftStore(dir, () => new Date(now.t))
+    const draft = store.create(draftInput())
+    const root = path.join(dir, 'knowledge-entries')
+    const aside = path.join(root, `${draft.id}.withdrawn.tmp`)
+    fs.copyFileSync(path.join(root, `${draft.id}.json`), aside)
+    const old = new Date(now.t - 2 * 60 * 60 * 1000)
+    fs.utimesSync(aside, old, old)
+    now.t += 2 * 60 * 60 * 1000
+    expect(store.list()).toEqual([draft])
+    expect(fs.existsSync(aside)).toBe(true)
+  })
+
+  it('N2: a recorded withdrawal whose file was left aside stays withdrawn and is swept', () => {
+    const now = { t: Date.UTC(2026, 0, 1) }
+    const store = createEntryDraftStore(dir, () => new Date(now.t))
+    const draft = store.create(draftInput())
+    const root = path.join(dir, 'knowledge-entries')
+    const rm = vi.spyOn(fs, 'rmSync').mockImplementationOnce(() => { throw Object.assign(new Error('busy'), { code: 'EBUSY' }) })
+    try {
+      expect(store.withdraw(draft.id)).toBe(true)
+    } finally {
+      rm.mockRestore()
+    }
+    const aside = path.join(root, `${draft.id}.withdrawn.tmp`)
+    expect(fs.existsSync(aside)).toBe(true)
+    expect(store.list()).toEqual([])
+    const old = new Date(now.t - 2 * 60 * 60 * 1000)
+    fs.utimesSync(aside, old, old)
+    now.t += 2 * 60 * 60 * 1000
+    expect(store.list()).toEqual([])
+    expect(fs.existsSync(aside)).toBe(false)
+    expect(store.get(draft.id)).toBeNull()
+  })
+
+  it('N3: refuses to create when the store cannot be listed, rather than counting no drafts', () => {
+    const store = createEntryDraftStore(dir, clock())
+    store.create(draftInput())
+    const readdir = vi.spyOn(fs, 'readdirSync').mockImplementation(() => { throw Object.assign(new Error('io'), { code: 'EIO' }) })
+    try {
+      expect(() => store.create(draftInput())).toThrow()
+      expect(() => store.list()).toThrow()
+    } finally {
+      readdir.mockRestore()
+    }
+    expect(store.list()).toHaveLength(1)
+  })
+
+  it('N3: a saved draft is never reported as failed by a step after the rename', () => {
+    const store = createEntryDraftStore(dir, clock())
+    const chmod = vi.spyOn(fs, 'chmodSync')
+    try {
+      const draft = store.create(draftInput())
+      const root = path.join(dir, 'knowledge-entries')
+      const calls = chmod.mock.calls.map(([target]) => String(target))
+      expect(calls.every((target) => target === root)).toBe(true)
+      expect((fs.statSync(path.join(root, `${draft.id}.json`)).mode & 0o777)).toBe(0o600)
+      expect(store.withdraw(draft.id)).toBe(true)
+      expect(chmod.mock.calls.map(([target]) => String(target)).every((target) => target === root)).toBe(true)
+      expect((fs.statSync(path.join(root, '_events.jsonl')).mode & 0o777)).toBe(0o600)
+    } finally {
+      chmod.mockRestore()
+    }
+  })
+})

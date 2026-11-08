@@ -20,6 +20,7 @@ export const ENTRY_DRAFT_FORMAT = 'agent24-knowledge-entry-draft'
 export const ENTRY_DRAFT_VERSION = 1
 export const MAX_ENTRY_DRAFTS = 50
 export const MAX_ENTRY_TITLE = 200
+/** UTF-8 bytes of the canonical body (CONTRACT-OPS-v2 W8.2: ≤ 64 KiB of UTF-8). */
 export const MAX_ENTRY_BODY = 64 * 1024
 export const ENTRY_DRAFT_ID = /^ked_[a-z0-9]{22}$/
 
@@ -96,7 +97,7 @@ function checkedContent(kind: unknown, title: unknown, body: unknown): { kind: E
   const canonTitle = canonicalText(title, true)
   const canonBody = canonicalText(body, false)
   if (canonTitle.length < 1 || canonTitle.length > MAX_ENTRY_TITLE) fail()
-  if (canonBody.length > MAX_ENTRY_BODY) fail()
+  if (Buffer.byteLength(canonBody, 'utf8') > MAX_ENTRY_BODY) fail()
   return { kind, title: canonTitle, body: canonBody }
 }
 
@@ -170,9 +171,10 @@ export function createEntryDraftStore(dir: string, now: () => Date = () => new D
     try {
       try { fs.writeFileSync(fd, body) }
       finally { fs.closeSync(fd) }
+      // Opened 0o600 and renamed whole: nothing after the rename can fail
+      // and leave a saved draft looking unsaved (PR-Daemon N3).
       fs.renameSync(temp, file)
       renamed = true
-      fs.chmodSync(file, 0o600)
     } finally {
       if (!renamed) fs.rmSync(temp, { force: true })
     }
@@ -231,15 +233,67 @@ export function createEntryDraftStore(dir: string, now: () => Date = () => new D
     }
   }
 
+  /** No directory yet is an empty store; any other failure is not (PR-Daemon N3: never count drafts as none). */
   const names = (): string[] => {
     try { return fs.readdirSync(root) }
-    catch { return [] }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return []
+      throw err
+    }
+  }
+
+  const eventsFile = path.join(root, '_events.jsonl')
+  const WITHDRAWN_TMP = /^(ked_[a-z0-9]{22})\.withdrawn\.tmp$/
+
+  /** Ids with a recorded withdrawal. */
+  const withdrawnIds = (): Set<string> => {
+    const ids = new Set<string>()
+    let log: string
+    try { log = fs.readFileSync(eventsFile, 'utf8') }
+    catch { return ids }
+    for (const line of log.split('\n')) {
+      try {
+        const event = JSON.parse(line) as { id?: unknown; event?: unknown }
+        if (event.event === 'withdrawn' && typeof event.id === 'string') ids.add(event.id)
+      } catch {
+        // A torn last line is no event.
+      }
+    }
+    return ids
+  }
+
+  /**
+   * A draft moved aside for withdrawal whose event was never written (the app
+   * stopped in between) goes back into the store; only a recorded withdrawal
+   * leaves its file to the temp sweep (PR-Daemon N2).
+   */
+  const recoverWithdrawals = (all: readonly string[]): void => {
+    const aside = all.map((name) => WITHDRAWN_TMP.exec(name)?.[1]).filter((id): id is string => id !== undefined)
+    if (aside.length === 0) return
+    const recorded = withdrawnIds()
+    for (const id of aside) {
+      if (recorded.has(id) || fs.existsSync(fileOf(id))) continue
+      try { fs.renameSync(path.join(root, `${id}.withdrawn.tmp`), fileOf(id)) }
+      catch { /* tried again on the next read */ }
+    }
   }
 
   const sweepTemps = (): void => {
+    recoverWithdrawals(names())
     const cutoff = now().getTime() - TMP_MAX_AGE_MS
+    const recorded = new Set<string>()
+    let recordedRead = false
     for (const name of names()) {
       if (!name.endsWith('.tmp')) continue
+      const aside = WITHDRAWN_TMP.exec(name)?.[1]
+      if (aside !== undefined) {
+        if (!recordedRead) {
+          for (const id of withdrawnIds()) recorded.add(id)
+          recordedRead = true
+        }
+        // Not recorded and not put back (the draft exists again): keep it.
+        if (!recorded.has(aside)) continue
+      }
       const file = path.join(root, name)
       try {
         const st = fs.statSync(file)
@@ -336,17 +390,17 @@ export function createEntryDraftStore(dir: string, now: () => Date = () => new D
       const aside = path.join(root, `${checked}.withdrawn.tmp`)
       fs.renameSync(fileOf(checked), aside)
       try {
-        const events = path.join(root, '_events.jsonl')
         const line = `${JSON.stringify({
           at: now().toISOString(),
           id: current.id,
           event: 'withdrawn',
           content_sha256: current.content_sha256,
         })}\n`
-        const fd = fs.openSync(events, 'a', 0o600)
+        // Created 0o600; no step after the append can fail and undo a
+        // withdrawal already recorded (PR-Daemon N3).
+        const fd = fs.openSync(eventsFile, 'a', 0o600)
         try { fs.writeFileSync(fd, line) }
         finally { fs.closeSync(fd) }
-        fs.chmodSync(events, 0o600)
       } catch (err) {
         fs.renameSync(aside, fileOf(checked))
         throw err

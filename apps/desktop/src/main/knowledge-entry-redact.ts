@@ -103,16 +103,21 @@ export function preRedact(text: string): { text: string; counts: Partial<Record<
   return { text: current, counts }
 }
 
+/**
+ * The check before anything leaves the machine: the rule table, plus wider
+ * shapes that preRedact does not replace (PR-Daemon B6), so it is not just a
+ * second run of the same finders. Any hit holds the text back; the user edits
+ * it. Wider means more false alarms, never fewer hits than preRedact's table.
+ */
 export function postScan(text: string): RedactionHit[] {
   if (text.length > MAX_REDACT_INPUT) return [{ category: 'credential', start: 0, end: text.length }]
-  return scan(text)
+  return scan(text, postScanRules())
 }
 
-function scan(text: string): RedactionHit[] {
+function scan(text: string, rules: readonly Rule[] = redactionRules()): RedactionHit[] {
   const src: Source = { text, lower: asciiLower(text) }
   const marks = placeholderMarks(text)
   const raw: { rank: number; start: number; end: number }[] = []
-  const rules = redactionRules()
   for (let rank = 0; rank < rules.length; rank += 1) {
     for (const find of rules[rank].finders) {
       find(src, (span) => {
@@ -452,20 +457,40 @@ const jwts: Finder = ({ text }, emit) => {
 
 const ASSIGN_KEYS = [
   'access_key', 'access-key', 'accesskey',
-  'password', 'api_key', 'api-key', 'apikey',
-  'passwd', 'secret', 'token', 'pwd',
+  'private_key', 'private-key', 'privatekey',
+  'password', 'passphrase', 'api_key', 'api-key', 'apikey',
+  'passwd', 'secret', 'token', 'pwd', 'credential',
+  'authorization',
 ] as const
 
+/** Keys whose value is the rest of the line: `Authorization: Basic …`. */
+const LINE_VALUE_KEYS = new Set<string>(['authorization'])
+
+/** Most characters of an identifier that a key may sit in (`SECRET_KEY`, `db_password`). */
+const MAX_KEY_RUN = 64
+/** Most white space around the `=` or `:` (PR-Daemon B1). */
+const MAX_GAP = 64
+
+function isKeyChar(c: string | undefined): boolean {
+  return isTokenChar(c) || c === '.'
+}
+
 /**
- * `key = value` and `key: value`, the key in any ASCII case and optionally
- * closed by a quote (`"password": "…"`). The hit is the value only: the whole
- * quoted string on its line, or else the run up to the next whitespace.
+ * `key = value` and `key: value`, the key in any ASCII case, anywhere in an
+ * identifier (`SECRET_KEY=`, `db_password:`) and optionally closed by a quote
+ * (`"password": "…"`). The hit is the value only: a quoted value through its
+ * closing quote, on any later line too; an unclosed quote through the next
+ * word after it; `Authorization` through the end of its line; else the run up
+ * to the next whitespace.
  */
 function assignmentFinder(key: string): Finder {
+  const lineValue = LINE_VALUE_KEYS.has(key)
   return ({ text, lower }, emit) => {
-    // The run without whitespace that holds `j` ends where the last one did.
+    // Each memo holds the last answer and the stretch it holds for: a later
+    // search from inside that stretch gets the same answer.
     let runFrom = -1
     let runTo = -1
+    /** The end of the run without whitespace that holds `j`. */
     const wordEnd = (j: number): number => {
       if (j >= runFrom && j <= runTo) return runTo
       let k = j
@@ -474,30 +499,61 @@ function assignmentFinder(key: string): Finder {
       runTo = k
       return k
     }
-    /** The closing `quote` after `j` on its line, past backslash escapes; -1 when there is none. */
-    const closingQuote = (j: number, quote: string): number => {
-      for (let k = j; k < text.length && text[k] !== '\n'; k += 1) {
-        if (text[k] === '\\') k += 1
-        else if (text[k] === quote) return k
-      }
-      return -1
+    let lineFrom = -1
+    let lineTo = -1
+    const lineEnd = (j: number): number => {
+      if (j >= lineFrom && j <= lineTo) return lineTo
+      let k = j
+      while (k < text.length && text[k] !== '\n' && text[k] !== '\r') k += 1
+      lineFrom = j
+      lineTo = k
+      return k
     }
-    // A search ends at the next unescaped quote of its kind. A later quoted
-    // value opens with one, after `=` or `:` (so never escaped), so no
-    // search runs past the value after it.
+    const quotes: Record<string, { from: number; to: number; at: number }> = {
+      '"': { from: -1, to: -1, at: -1 },
+      "'": { from: -1, to: -1, at: -1 },
+    }
+    /**
+     * The closing `quote` at or after `j`, past backslash escapes; -1 when
+     * there is none. `j` is just after an opening quote. A search from inside
+     * an earlier one's stretch gets the same answer: the quote before `j` was
+     * escaped in that search (else it would have ended there), so it reached
+     * `j` in step.
+     */
+    const closingQuote = (j: number, quote: string): number => {
+      const memo = quotes[quote]
+      if (j >= memo.from && j <= memo.to) return memo.at
+      let k = j
+      while (k < text.length) {
+        if (text[k] === '\\') k += 2
+        else if (text[k] === quote) break
+        else k += 1
+      }
+      const at = k < text.length ? k : -1
+      memo.from = j
+      memo.to = at < 0 ? text.length : at
+      memo.at = at
+      return at
+    }
     const valueAt = (afterKey: number): Span | null => {
       let j = afterKey
+      while (j - afterKey < MAX_KEY_RUN && isKeyChar(text[j])) j += 1
       if (text[j] === '"' || text[j] === "'") j += 1
-      j = skipSpaces(text, j, 3)
+      j = skipSpaces(text, j, MAX_GAP)
       if (text[j] !== ':' && text[j] !== '=') return null
-      j = skipSpaces(text, j + 1, 3)
+      j = skipSpaces(text, j + 1, MAX_GAP)
       if (j >= text.length || isSpace(text[j])) return null
       const quote = text[j]
       if (quote === '"' || quote === "'") {
         const close = closingQuote(j + 1, quote)
         if (close > j + 1) return { start: j, end: close + 1 }
+        if (close < 0) {
+          // No closing quote anywhere: the value is the next word, wherever it is (B2).
+          const word = skipSpaces(text, j + 1, MAX_GAP)
+          return { start: j, end: word < text.length && !isSpace(text[word]) ? wordEnd(word) : j + 1 }
+        }
       }
-      return { start: j, end: wordEnd(j) }
+      return { start: j, end: lineValue ? lineEnd(j) : wordEnd(j) }
     }
     let i = lower.indexOf(key)
     while (i >= 0) {
@@ -513,6 +569,24 @@ function skipSpaces(text: string, j: number, most: number): number {
   let k = j
   while (k - j < most && k < text.length && isSpace(text[k])) k += 1
   return k
+}
+
+/** The password in `scheme://user:password@host` (PR-Daemon N4). */
+const urlPasswords: Finder = ({ text }, emit) => {
+  for (let at = text.indexOf('://'); at >= 0; at = text.indexOf('://', at + 1)) {
+    let k = at + 3
+    while (k - at - 3 < 256 && k < text.length && isUserinfoChar(text[k]) && text[k] !== ':') k += 1
+    // The user may be empty (`redis://:secret@host`).
+    if (text[k] !== ':') continue
+    const start = k + 1
+    let e = start
+    while (e - start < 256 && e < text.length && isUserinfoChar(text[e])) e += 1
+    if (e > start && text[e] === '@') emit({ start, end: e })
+  }
+}
+
+function isUserinfoChar(c: string | undefined): boolean {
+  return c !== undefined && !isSpace(c) && c !== '/' && c !== '@' && c !== '?' && c !== '#'
 }
 
 // ---------------------------------------------------------------------- email
@@ -644,10 +718,12 @@ function intlPhoneAt(text: string, i: number): number | null {
 const ID_WEIGHTS = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]
 const ID_CODES = '10X98765432'
 
-/** GB 11643 eighteen-character numbers with a valid check character. */
+/** GB 11643 eighteen-character numbers with a valid check character, with no digit right before or after. */
 const idCards: Finder = ({ text }, emit) => {
   for (let i = 0; i + 18 <= text.length; i += 1) {
-    if (!isDigit(text[i]) || (i > 0 && isAsciiAlnum(text[i - 1]))) continue
+    // Only a digit next to it makes it part of a longer number; letters do
+    // not (`ID110101…`, PR-Daemon B5).
+    if (!isDigit(text[i]) || (i > 0 && isDigit(text[i - 1]))) continue
     if (isIdAt(text, i)) emit({ start: i, end: i + 18 })
   }
 }
@@ -660,7 +736,7 @@ function isIdAt(text: string, i: number): boolean {
   }
   const last = text[i + 17]
   if (!isDigit(last) && last !== 'X' && last !== 'x') return false
-  if (isAsciiAlnum(text[i + 18])) return false
+  if (isDigit(text[i + 18])) return false
   return last.toUpperCase() === ID_CODES[sum % 11]
 }
 
@@ -736,24 +812,42 @@ function isPathStop(c: string | undefined): boolean {
   return c === undefined || isSpace(c) || PATH_STOP.has(c)
 }
 
-/** Local paths up to the next stop character; not the path part of a URL. */
+/**
+ * Local paths up to the next stop character. A Unix path inside a URL
+ * (`https://host/home/…`) is the URL's own path and is left alone; a `file:`
+ * URL is not a URL here, and a Windows or UNC path is a path wherever it is
+ * (PR-Daemon B4).
+ */
 const paths: Finder = ({ text }, emit) => {
-  const starts = [
+  const unix = [
     ...PATH_PREFIXES.map((prefix) => forwardIndex(text, prefix)),
     forwardIndex(text, '~/', (at) => !isAsciiAlnum(text[at - 1])),
-    windowsStart(text),
+  ]
+  const windows = [
+    windowsStart(text, ':\\'),
+    windowsStart(text, ':/'),
     forwardIndex(text, '\\\\', (at) => uncAt(text, at)),
   ]
   const inUrl = urlContext(text)
   let cursor = 0
   for (;;) {
     let best = -1
-    for (const next of starts) {
-      const at = next(cursor)
-      if (at >= 0 && (best < 0 || at < best)) best = at
+    // Whether a Windows or UNC path starts at `best`: then no URL hides it.
+    let anywhere = false
+    for (const [starts, free] of [[unix, false], [windows, true]] as const) {
+      for (const next of starts) {
+        const at = next(cursor)
+        if (at < 0) continue
+        if (best < 0 || at < best) {
+          best = at
+          anywhere = free
+        } else if (at === best) {
+          anywhere ||= free
+        }
+      }
     }
     if (best < 0) return
-    if (inUrl(best)) {
+    if (!anywhere && inUrl(best)) {
       cursor = best + 1
       continue
     }
@@ -764,9 +858,9 @@ const paths: Finder = ({ text }, emit) => {
   }
 }
 
-/** `X:\` with no letter or digit before the drive letter. */
-function windowsStart(text: string): (from: number) => number {
-  const colon = forwardIndex(text, ':\\', (at) => at > 0 && isAsciiLetter(text[at - 1]) && !isAsciiAlnum(text[at - 2]))
+/** `X:\` or `X:/` (not `X://`) with no letter or digit before the drive letter. */
+function windowsStart(text: string, sep: ':\\' | ':/'): (from: number) => number {
+  const colon = forwardIndex(text, sep, (at) => at > 0 && isAsciiLetter(text[at - 1]) && !isAsciiAlnum(text[at - 2]) && !(sep === ':/' && text[at + 2] === '/'))
   return (from) => {
     const at = colon(from + 1)
     return at < 0 ? -1 : at - 1
@@ -796,17 +890,22 @@ function urlContext(text: string): (start: number) => boolean {
     for (; scanned < start; scanned += 1) {
       const c = text[scanned]
       if (isPathStop(c)) scheme = -1
-      else if (c === ':' && text[scanned + 1] === '/' && text[scanned + 2] === '/') scheme = scanned
+      else if (c === ':' && text[scanned + 1] === '/' && text[scanned + 2] === '/') scheme = isFileScheme(text, scanned) ? -1 : scanned
     }
     return scheme >= 0 && start - scheme <= 2048
   }
+}
+
+/** `file` (any case) ends at `colon` as a whole word. */
+function isFileScheme(text: string, colon: number): boolean {
+  return colon >= 4 && text.slice(colon - 4, colon).toLowerCase() === 'file' && !isAsciiAlnum(text[colon - 5])
 }
 
 // ----------------------------------------------------------- internal_address
 
 const HOST_SUFFIXES = ['.intranet', '.internal', '.local', '.corp', '.lan']
 
-/** Private IPv4: 10/8, 127/8, 192.168/16, 172.16/12, optionally with a port. */
+/** Private IPv4: 10/8, 127/8, 192.168/16, 172.16/12, 169.254/16, 100.64/10, optionally with a port. */
 const privateIps: Finder = ({ text }, emit) => {
   for (let i = 0; i < text.length; i += 1) {
     if (!isDigit(text[i])) continue
@@ -841,9 +940,11 @@ function privateIpAt(text: string, i: number): number | null {
     octets.push(oct.n)
     j = oct.j
   }
-  if (isDigit(text[j]) || text[j] === '.') return null
+  // A dot ends a sentence unless a digit follows (`See 10.0.0.1.`, PR-Daemon N4).
+  if (isDigit(text[j]) || (text[j] === '.' && isDigit(text[j + 1]))) return null
   const [a, b] = octets
   const priv = a === 10 || a === 127 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31)
+    || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127)
   if (!priv) return null
   return portEnd(text, j) ?? j
 }
@@ -877,12 +978,30 @@ function hostFinder(suffix: string): Finder {
     let floor = 0
     for (let i = lower.indexOf(suffix); i >= 0; i = lower.indexOf(suffix, i + 1)) {
       const end = i + suffix.length
-      if (isHostChar(text[end]) || i === 0 || !isAsciiAlnum(text[i - 1])) continue
+      // A root dot (`db.corp./`) still ends the name (PR-Daemon N4).
+      const rootDot = text[end] === '.' && !isHostChar(text[end + 1])
+      if ((isHostChar(text[end]) && !rootDot) || i === 0 || !isAsciiAlnum(text[i - 1])) continue
       let s = i
       while (s > floor && i - s < 300 && isHostChar(text[s - 1])) s -= 1
       emit({ start: s, end })
       floor = end
     }
+  }
+}
+
+/** IPv6 unique local (fc00::/7) and link-local (fe80::/10) addresses. */
+const IPV6_LOCAL = /(?:f[cd][0-9a-f]{2}|fe[89ab][0-9a-f]):(?:[0-9a-f]{0,4}:){1,6}[0-9a-f]{0,4}/y
+
+function isHexOrColon(c: string | undefined): boolean {
+  return isDigit(c) || (c !== undefined && c >= 'a' && c <= 'f') || c === ':'
+}
+
+const localIpv6s: Finder = ({ lower }, emit) => {
+  for (let i = lower.indexOf('f'); i >= 0; i = lower.indexOf('f', i + 1)) {
+    if (i > 0 && (isHexOrColon(lower[i - 1]) || isAsciiLetter(lower[i - 1]))) continue
+    IPV6_LOCAL.lastIndex = i
+    const m = IPV6_LOCAL.exec(lower)
+    if (m) emit({ start: i, end: i + m[0].length })
   }
 }
 
@@ -899,15 +1018,79 @@ let rulesTable: readonly Rule[] | null = null
 function redactionRules(): readonly Rule[] {
   rulesTable ??= [
     { category: 'private_key', finders: [privateKeys] },
-    { category: 'credential', finders: [jwts, ...CREDENTIAL_LITERALS.map(literalFinder), ...ASSIGN_KEYS.map(assignmentFinder)] },
+    { category: 'credential', finders: [jwts, urlPasswords, ...CREDENTIAL_LITERALS.map(literalFinder), ...ASSIGN_KEYS.map(assignmentFinder)] },
     { category: 'email', finders: [emails] },
     { category: 'phone', finders: [cnPhones, intlPhones] },
     { category: 'id_card', finders: [idCards] },
     { category: 'bank_card', finders: [bankCards] },
     { category: 'path', finders: [paths] },
-    { category: 'internal_address', finders: [privateIps, localhosts, ...HOST_SUFFIXES.map(hostFinder)] },
+    { category: 'internal_address', finders: [privateIps, localIpv6s, localhosts, ...HOST_SUFFIXES.map(hostFinder)] },
   ]
   return rulesTable
 }
 
-export const testing = { isSpace }
+// ------------------------------------------------- wider shapes for postScan
+
+/** 15 or more digits in a row, whatever is around them: `id_card` for 17
+ *  digits and a check character or 18 digits, `bank_card` otherwise. */
+const longDigitRuns: (category: 'id_card' | 'bank_card') => Finder = (category) => ({ text }, emit) => {
+  for (let i = 0; i < text.length;) {
+    if (!isDigit(text[i])) {
+      i += 1
+      continue
+    }
+    let k = i
+    while (k < text.length && isDigit(text[k])) k += 1
+    let end = k
+    if (k - i === 17 && (text[k] === 'X' || text[k] === 'x')) end = k + 1
+    const isId = end - i === 18
+    if (end - i >= 15 && isId === (category === 'id_card')) emit({ start: i, end })
+    i = k
+  }
+}
+
+/** Home directories and `file:` URLs wherever they are, URLs included. */
+const widePaths: Finder = ({ text, lower }, emit) => {
+  const starts = [
+    forwardIndex(lower, '/users/'),
+    forwardIndex(lower, '/home/'),
+    forwardIndex(lower, '\\users\\'),
+    // `file:/…` as a word, not `profile:`.
+    forwardIndex(lower, 'file:/', (at) => !isAsciiAlnum(text[at - 1])),
+  ]
+  let cursor = 0
+  for (;;) {
+    let best = -1
+    for (const next of starts) {
+      const at = next(cursor)
+      if (at >= 0 && (best < 0 || at < best)) best = at
+    }
+    if (best < 0) return
+    let end = best
+    while (end < text.length && !isPathStop(text[end])) end += 1
+    if (end > best) emit({ start: best, end })
+    cursor = Math.max(end, best + 1)
+  }
+}
+
+let postScanTable: readonly Rule[] | null = null
+
+/** The rule table with the wider shapes added, each under its own category. */
+function postScanRules(): readonly Rule[] {
+  postScanTable ??= redactionRules().map((rule) => {
+    const wider: Finder[] = rule.category === 'id_card' ? [longDigitRuns('id_card')]
+      : rule.category === 'bank_card' ? [longDigitRuns('bank_card')]
+        : rule.category === 'path' ? [widePaths]
+          : []
+    return { category: rule.category, finders: [...rule.finders, ...wider] }
+  })
+  return postScanTable
+}
+
+/** For tests: the rule table alone, as preRedact sees it (postScan without the wider shapes). */
+function tableScan(text: string): RedactionHit[] {
+  if (text.length > MAX_REDACT_INPUT) return [{ category: 'credential', start: 0, end: text.length }]
+  return scan(text)
+}
+
+export const testing = { isSpace, tableScan }

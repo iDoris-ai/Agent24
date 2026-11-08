@@ -9,6 +9,8 @@ import {
   type RedactionHit,
 } from './knowledge-entry-redact'
 
+const { tableScan } = testing
+
 const JWT = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c'
 const VALID_IDS = ['110101199003078873', '11010519491231002X']
 const DUAL_ID = '110101199001010250'
@@ -26,14 +28,14 @@ function expectShape(hits: RedactionHit[]): void {
 }
 
 function categories(text: string): RedactionCategory[] {
-  const hits = postScan(text)
+  const hits = tableScan(text)
   expectShape(hits)
   return hits.map(hit => hit.category)
 }
 
 function redact(text: string): string {
   const out = preRedact(text)
-  expect(postScan(out.text)).toEqual([])
+  expect(tableScan(out.text)).toEqual([])
   return out.text
 }
 
@@ -51,9 +53,9 @@ describe('placeholder', () => {
 
   it('is not a hit on its own or after preRedact', () => {
     const raw = '前文〔已脱敏·邮箱〕后文〔已脱敏·凭据〕〔已脱敏·私钥〕'
-    expect(postScan(raw)).toEqual([])
+    expect(tableScan(raw)).toEqual([])
     expect(preRedact(raw)).toEqual({ text: raw, counts: {} })
-    expect(postScan(preRedact(`password=${placeholder('credential')}`).text)).toEqual([])
+    expect(tableScan(preRedact(`password=${placeholder('credential')}`).text)).toEqual([])
     expect(redact('ada@example.com 13800138000')).not.toMatch(/ada@|13800138000/)
   })
 })
@@ -80,7 +82,7 @@ describe('private_key', () => {
 
   it('without END matches only the BEGIN line', () => {
     const text = '-----BEGIN EC PRIVATE KEY-----\nkeep this line\nstill here\n'
-    const hits = postScan(text)
+    const hits = tableScan(text)
     expectShape(hits)
     expect(hits).toHaveLength(1)
     expect(text.slice(hits[0].start, hits[0].end)).toBe('-----BEGIN EC PRIVATE KEY-----')
@@ -89,7 +91,7 @@ describe('private_key', () => {
 
   it('does not match the lines that follow a BEGIN with no END', () => {
     const text = '-----BEGIN PRIVATE KEY-----\nnot a key body\n'
-    const hits = postScan(text)
+    const hits = tableScan(text)
     expect(hits).toHaveLength(1)
     expect(text.slice(hits[0].end)).toBe('\nnot a key body\n')
     expect(categories('-----BEGIN PUBLIC KEY-----\nAAA\n-----END PUBLIC KEY-----')).toEqual([])
@@ -146,7 +148,7 @@ describe('credential', () => {
     expect(redact('BEARER abcdefghijklmnopqrstuvwx')).toBe('〔已脱敏·凭据〕')
     // Offsets are those of the original text, whatever its case.
     const text = 'İ x PASSWORD=hunter2'
-    const [hit] = postScan(text)
+    const [hit] = tableScan(text)
     expect(text.slice(hit.start, hit.end)).toBe('hunter2')
   })
 
@@ -210,9 +212,11 @@ describe('id_card', () => {
     expect(categories('110105194912310020')).toEqual([])
   })
 
-  it('does not match when a letter is glued to the number', () => {
-    expect(categories(`A${VALID_IDS[0]}`)).toEqual([])
-    expect(categories(`${VALID_IDS[0]}B`)).toEqual([])
+  it('matches when a letter is glued to the number, not a digit (PR-Daemon B5)', () => {
+    expect(categories(`A${VALID_IDS[0]}`)).toEqual(['id_card'])
+    expect(categories(`${VALID_IDS[0]}B`)).toEqual(['id_card'])
+    expect(categories(`1${VALID_IDS[0]}`)).not.toContain('id_card')
+    expect(categories(`${VALID_IDS[0]}1`)).not.toContain('id_card')
   })
 })
 
@@ -230,7 +234,7 @@ describe('bank_card', () => {
   })
 
   it('does not classify a span already matched as an id card', () => {
-    const hits = postScan(`证件 ${DUAL_ID} 在此`)
+    const hits = tableScan(`证件 ${DUAL_ID} 在此`)
     expectShape(hits)
     expect(hits.map(hit => hit.category)).toEqual(['id_card'])
     expect(redact(`证件 ${DUAL_ID} 在此`)).toBe('证件 〔已脱敏·证件号〕 在此')
@@ -285,12 +289,12 @@ describe('internal_address', () => {
 describe('postScan and preRedact', () => {
   it('returns category, start, and end only, sorted and non-overlapping', () => {
     const text = 'a@b.co then b@c.co and 13800138000'
-    const hits = postScan(text)
+    const hits = tableScan(text)
     expectShape(hits)
     expect(hits.map(hit => hit.category)).toEqual(['email', 'email', 'phone'])
     expect(hits[0].start).toBeLessThan(hits[1].start)
     expect(preRedact('')).toEqual({ text: '', counts: {} })
-    expect(postScan('')).toEqual([])
+    expect(tableScan('')).toEqual([])
   })
 
   it('redacts a mixed conversation to the fixed string', () => {
@@ -306,7 +310,7 @@ describe('postScan and preRedact', () => {
       '临时密钥 〔已脱敏·凭据〕',
       '只连 〔已脱敏·内网地址〕 这台机器',
     ].join('\n')
-    const hits = postScan(mixed)
+    const hits = tableScan(mixed)
     expectShape(hits)
     let rebuilt = ''
     let cursor = 0
@@ -325,7 +329,7 @@ describe('postScan and preRedact', () => {
       path: 1,
       internal_address: 1,
     })
-    expect(postScan(out.text)).toEqual([])
+    expect(tableScan(out.text)).toEqual([])
   })
 
   it('throws from preRedact and reports the whole text from postScan when over the limit', () => {
@@ -359,9 +363,9 @@ describe('postScan and preRedact', () => {
       expect(redacted.text.length).toBeGreaterThan(0)
       // Redacted text is clean, unless placeholders made it longer than the
       // limit: then the whole of it is held back, as any oversized text is.
-      expect(postScan(redacted.text)).toEqual(redacted.text.length > n ? [{ category: 'credential', start: 0, end: redacted.text.length }] : [])
+      expect(tableScan(redacted.text)).toEqual(redacted.text.length > n ? [{ category: 'credential', start: 0, end: redacted.text.length }] : [])
       started = Date.now()
-      const hits = postScan(input)
+      const hits = tableScan(input)
       expect(Date.now() - started).toBeLessThan(2000)
       expect(Array.isArray(hits)).toBe(true)
     }
@@ -390,7 +394,7 @@ describe('nothing hides a secret from another rule', () => {
 
   it('overlapping hits become one span with the earlier rule’s category', () => {
     const text = 'see /Users/ada@example.com now'
-    const hits = postScan(text)
+    const hits = tableScan(text)
     expect(hits).toEqual([{ category: 'email', start: 4, end: 26 }])
     expect(redact(text)).toBe('see 〔已脱敏·邮箱〕 now')
   })
@@ -511,9 +515,9 @@ describe('round 2: what one hit used to hide', () => {
 
   it('a chain of glued hits longer than the passes stays held back, never let through (C4, known limit)', () => {
     const short = preRedact('localhost:1'.repeat(3)).text
-    expect(postScan(short)).toEqual([])
+    expect(tableScan(short)).toEqual([])
     const long = preRedact('localhost:1'.repeat(8)).text
-    expect(postScan(long).length).toBeGreaterThan(0)
+    expect(tableScan(long).length).toBeGreaterThan(0)
   })
 })
 
@@ -570,12 +574,12 @@ describe('linear time on adversarial input (C9–C11)', () => {
   it.each(cases)('%s', (_name, input) => {
     expect(input.length).toBeLessThanOrEqual(n)
     let started = Date.now()
-    postScan(input)
+    tableScan(input)
     expect(Date.now() - started).toBeLessThan(2000)
     started = Date.now()
     const out = preRedact(input)
     expect(Date.now() - started).toBeLessThan(4000)
-    expect(postScan(out.text)).toEqual(out.text.length > n ? [{ category: 'credential', start: 0, end: out.text.length }] : [])
+    expect(tableScan(out.text)).toEqual(out.text.length > n ? [{ category: 'credential', start: 0, end: out.text.length }] : [])
   }, 30000)
 })
 
@@ -597,8 +601,108 @@ describe('preRedact output scans clean', () => {
       const count = 1 + Math.floor(random() * 14)
       for (let i = 0; i < count; i += 1) text += pieces[Math.floor(random() * pieces.length)]
       const out = preRedact(text)
-      expect(postScan(out.text), JSON.stringify(text)).toEqual([])
-      expectShape(postScan(text))
+      expect(tableScan(out.text), JSON.stringify(text)).toEqual([])
+      expectShape(tableScan(text))
     }
   })
 })
+
+// PR-Daemon round 1 on #1677 (head 8d00bd36): each bypass it ran, now redacted.
+describe('PR-Daemon round 1', () => {
+  const leaks = (text: string, secret: string): void => {
+    const out = preRedact(text).text
+    expect(out, JSON.stringify(text)).not.toContain(secret)
+    expect(postScan(text).length, JSON.stringify(text)).toBeGreaterThan(0)
+  }
+
+  it('B1: takes the value after any run of spaces around the separator', () => {
+    leaks('{"password":    "hunter2"}', 'hunter2')
+    leaks('password      =      hunter2', 'hunter2')
+    leaks(`password:${' '.repeat(40)}hunter2`, 'hunter2')
+    leaks('password:\n  hunter2', 'hunter2')
+  })
+
+  it('B2: takes a quoted value across lines, and the next word after a quote that never closes', () => {
+    leaks('password="\nhunter2"', 'hunter2')
+    leaks('password="\nhunter2', 'hunter2')
+    leaks("password='first\nsecond-part'", 'second-part')
+    leaks('password="  hunter2', 'hunter2')
+  })
+
+  it('B2: a quote that never closes on a long line stays linear', () => {
+    const text = 'pwd="'.repeat(100_000)
+    const started = Date.now()
+    preRedact(text)
+    postScan(text)
+    expect(Date.now() - started).toBeLessThan(4000)
+  }, 30000)
+
+  it('B3: finds a key inside a longer name, and authorization, passphrase, private_key', () => {
+    leaks('SECRET_KEY=abc123def456', 'abc123def456')
+    leaks('db_password: s3cr3tvalue', 's3cr3tvalue')
+    leaks('private_key=MIIEvQIBADANBgkqhki', 'MIIEvQIBADANBgkqhki')
+    leaks('passphrase: correct-horse', 'correct-horse')
+    leaks('client_secret = zzz999', 'zzz999')
+    leaks('Authorization: Basic dXNlcjpwYXNz', 'dXNlcjpwYXNz')
+  })
+
+  it('B4: redacts file: URLs and Windows paths that follow a URL', () => {
+    leaks('open file:///Users/alice/notes.txt', 'alice')
+    leaks('open file:///C:/Users/alice/notes.txt', 'alice')
+    leaks('open file://localhost/Users/alice/notes.txt', 'alice')
+    leaks('https://example.com,C:\\Users\\alice\\secret.txt', 'alice')
+    leaks('see https://example.com/x \\\\fileserver\\share\\alice', 'alice')
+  })
+
+  it('B4: still leaves the path part of an ordinary URL to the table', () => {
+    expect(preRedact('https://example.com/var/log').text).toBe('https://example.com/var/log')
+  })
+
+  it('B5: redacts an id number glued to letters, not one glued to digits', () => {
+    leaks(`ID${VALID_IDS[0]}`, VALID_IDS[0])
+    leaks(`${VALID_IDS[0]}abc`, VALID_IDS[0])
+    expect(tableScan(`9${VALID_IDS[0]}`).map((h) => h.category)).not.toContain('id_card')
+  })
+
+  it('B6: postScan holds back shapes the table does not replace', () => {
+    const shapes: Array<[string, RedactionCategory]> = [
+      ['order 123456789012345 shipped', 'bank_card'],
+      [`ref${VALID_IDS[0].slice(0, 17)}9z`, 'id_card'],
+      ['https://example.com/home/alice/', 'path'],
+      ['https://example.com/Users/alice', 'path'],
+      ['see file:/srv/data/x', 'path'],
+    ]
+    for (const [text, category] of shapes) {
+      expect(tableScan(text).map((h) => h.category), text).not.toContain(category)
+      expect(postScan(text).map((h) => h.category), text).toContain(category)
+    }
+  })
+
+  it('B6: postScan never finds less than the table', () => {
+    const text = `password=hunter2 a@b.co ${VISA} /Users/x 10.0.0.1 https://example.com/home/y 12345678901234567`
+    const table = tableScan(text)
+    const wide = postScan(text)
+    for (const hit of table) expect(wide.some((w) => w.start <= hit.start && w.end >= hit.end)).toBe(true)
+    expect(wide.length).toBeGreaterThan(0)
+  })
+
+  it('B6: profile: is not a file: URL', () => {
+    expect(postScan('profile:/x')).toEqual([])
+  })
+
+  it('N4: internal addresses at the end of a sentence, root dots, more private ranges, IPv6', () => {
+    leaks('See 10.0.0.1.', '10.0.0.1')
+    leaks('https://db.corp./x', 'db.corp')
+    leaks('link 169.254.10.20 here', '169.254.10.20')
+    leaks('tailnet 100.66.210.41 here', '100.66.210.41')
+    leaks('ula fd12:3456:789a::1 here', 'fd12:3456:789a::1')
+    leaks('link fe80::1ff:fe23:4567:890a here', 'fe80::1ff:fe23:4567:890a')
+    expect(tableScan('public 100.20.1.1 and 8.8.8.8')).toEqual([])
+  })
+
+  it('N4: the password in a URL with a user', () => {
+    leaks('postgres://u:pw1234@host/db', 'pw1234')
+    leaks('redis://:topsecret@cache:6379', 'topsecret')
+  })
+})
+
