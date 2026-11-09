@@ -13,7 +13,7 @@ import { chatMessages } from '../Chat.i18n'
 import { createChatSession } from '../chat-knowledge'
 import { cancelRun, createRun, decideApproval, listPendingApprovals } from '../agent/api'
 import { grounding } from '../knowledge-grounding'
-import { getHistoryState, promoteRun, subscribeHistory } from './history'
+import { forgetPromotion, getHistoryState, promoteRun, subscribeHistory } from './history'
 import { askRunAgain, useRunViews, type RunView } from './run-status'
 import type { ChatHistoryRun } from '../../../shared/chat-history'
 
@@ -147,6 +147,7 @@ export function HandOver({ conversation, prompt }: { conversation: string; promp
       // Recorded once main has it; the card shows from then on. One that
       // could not be recorded is not left running unseen.
       if (!(await promoteRun(conversation, run.id))) {
+        forgetPromotion(conversation, run.id)
         await cancelRun(run.id).catch(() => {})
         throw new Error('not_recorded')
       }

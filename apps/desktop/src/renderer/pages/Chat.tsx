@@ -13,7 +13,7 @@ import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHisto
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import { HandOver, TaskCards } from './chat/TaskCard'
 import {
-  getHistoryState, historyAvailable, loadConversation, promoteRun, registerChatPage, restoreConversation, saveConversation,
+  forgetPromotion, getHistoryState, historyAvailable, loadConversation, promoteRun, registerChatPage, restoreConversation, saveConversation,
   setActiveConversation, setChatBusy, subscribeHistory, titleConversation,
 } from './chat/history'
 
@@ -392,6 +392,7 @@ export default function ChatPage() {
         // One that could not be recorded has no card: it is stopped, as
         // before A4, rather than left running unseen (Codex A4 C1).
         if (!promotionDue({ status: turn.status, replyEnded: true }) || !(await promoteRun(conversation, turn.runId))) {
+          forgetPromotion(conversation, turn.runId)
           await proxy({ method: 'POST', path: `/api/v1/runs/${encodeURIComponent(turn.runId)}/cancel` }).catch(() => {})
           setDelivery(index, { kind: 'notSent' })
           setMessages(prev => [...prev, { role: 'assistant', content: t('knowledge.failed', { error: 'run_timeout' }) }])

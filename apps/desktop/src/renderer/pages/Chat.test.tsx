@@ -537,6 +537,20 @@ describe('ChatPage with Knowledge when the run outlasts the wait', () => {
     expect(screen.queryByText(chatMessages.zh['task.ongoing'])).not.toBeInTheDocument()
     expect(screen.getByText(/run_timeout/)).toBeInTheDocument()
   })
+
+  it('does not record the run it stopped once main can write again (Codex A4 r2 C1)', async () => {
+    const { promoteRun, clock, send } = page(true)
+    // main cannot write this once: the page tries again after its next save.
+    promoteRun.mockRejectedValueOnce(new Error('disk full'))
+    send('long job')
+    await waitFor(() => expect(screen.getByText(/run_timeout/)).toBeInTheDocument(), { timeout: 4000 })
+    expect(mockBackendProxy).toHaveBeenCalledWith({ method: 'POST', path: '/api/v1/runs/r1/cancel' })
+    // Later saves (the next turn's) promote nothing.
+    clock.skew = 0
+    send('next')
+    await waitFor(() => expect(screen.getByText('second answer')).toBeInTheDocument(), { timeout: 4000 })
+    expect(promoteRun).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('ChatPage with Knowledge when the answer names sources the run did not read', () => {

@@ -8,7 +8,7 @@ import { createChatHistoryStore } from '../../../main/chat-history'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../../shared/chat-history'
 import type { RunEvent } from '../../../shared/ipc-types'
 import { HandOver, TaskCards, elapsed, resetHandOversForTests } from './TaskCard'
-import { refreshHistory, resetHistoryStore } from './history'
+import { refreshHistory, resetHistoryStore, saveConversation } from './history'
 import { resetRunStatusesForTests } from './run-status'
 import { setLocale } from '../../i18n'
 
@@ -204,6 +204,18 @@ describe('hand it to the assistant (M4 A4)', () => {
     fireEvent.click(screen.getByRole('button', { name: '交给助理办' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('没能交给助理')
     expect(proxy).toHaveBeenCalledWith({ method: 'POST', path: '/api/v1/runs/run_new/cancel' })
+  })
+
+  it('does not record the run it stopped once main can write again (Codex A4 r2 C1)', async () => {
+    store.save(record('chat_a', '整理周报'))
+    await refreshHistory()
+    bridge.promoteRun.mockRejectedValueOnce(new Error('disk full'))
+    render(<HandOver conversation="chat_a" prompt="整理周报" />)
+    fireEvent.click(screen.getByRole('button', { name: '交给助理办' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('没能交给助理')
+    expect(await saveConversation(record('chat_a', '整理周报'))).toBe(true)
+    expect(bridge.promoteRun).toHaveBeenCalledTimes(1)
+    expect(store.get('chat_a')?.runs).toEqual([])
   })
 })
 
