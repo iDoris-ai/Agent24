@@ -156,13 +156,21 @@ describe('schedule conversations (M4 A5)', () => {
     })
 
     it('tries the same span again after a catch-up that could not ask the daemon', async () => {
-      const m = homes()
-      await m.catchUp(async () => [])
-      const synced = file().synced_at
-      await expect(m.catchUp(async () => { throw new Error('runs_unavailable_503') })).rejects.toThrow('runs_unavailable_503')
-      expect(file().synced_at).toBe(synced)
-      await m.catchUp(async () => [row('run_1', 'sch_1', 1)])
-      expect(history.list()).toHaveLength(1)
+      vi.useFakeTimers({ toFake: ['Date'] })
+      try {
+        const m = homes()
+        vi.setSystemTime(new Date('2026-11-09T10:00:00Z'))
+        await m.catchUp(async () => [])
+        const synced = file().synced_at
+        vi.setSystemTime(new Date('2026-11-09T11:00:00Z'))
+        await expect(m.catchUp(async () => { throw new Error('runs_unavailable_503') })).rejects.toThrow('runs_unavailable_503')
+        expect(file().synced_at).toBe(synced)
+        vi.setSystemTime(new Date('2026-11-09T12:00:00Z'))
+        await m.catchUp(async () => [{ id: 'run_1', schedule_id: 'sch_1', created_at: '2026-11-09T10:30:00Z' }])
+        expect(history.list()).toHaveLength(1)
+      } finally {
+        vi.useRealTimers()
+      }
     })
 
     it('skips rows that are not runs', async () => {
