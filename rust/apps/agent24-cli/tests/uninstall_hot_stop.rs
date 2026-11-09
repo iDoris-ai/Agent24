@@ -99,7 +99,7 @@ fn write_package(home: &Path, name: &str, slow_exit: bool) -> std::path::PathBuf
             "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
              event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
              kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-             spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n"
+             spawn:\n  command: bin/launch\n"
         ),
     )
     .unwrap();
@@ -158,6 +158,7 @@ while f.readline():
         ),
     )
     .unwrap();
+    agent24_os_packages::test_support::seal_python_script(&dir).unwrap();
     dir
 }
 

@@ -3543,6 +3543,9 @@ mod tests {
             ),
         )
         .unwrap();
+        // In-process manifests have no spawn. The stub exists so the package
+        // carries a native executable in its integrity manifest.
+        agent24_os_packages::test_support::seal_exit_stub(dir, "bin/stub").unwrap();
     }
 
     /// Every directory and file under `root`, in order. Directory entries end

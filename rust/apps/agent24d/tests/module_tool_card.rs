@@ -38,7 +38,7 @@ fn install(home: &Path) {
          event_module: noted\ndata_dir: ~/.agent24/os/noted/\n\
          kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
          min_daemon_protocol: 4\n\
-         spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n\
+         spawn:\n  command: bin/launch\n\
          tools:\n  - operation: list-notes\n    description: lists notes\n    \
          input_schema: {type: object, properties: {}}\n    risk: read\n    \
          output_privacy: local_only\n    resource_kinds: [note]\n    \
@@ -46,35 +46,37 @@ fn install(home: &Path) {
     )
     .unwrap();
     std::fs::write(dir.join("mod.py"), MODULE).unwrap();
+    agent24_os_packages::test_support::seal_python_script(&dir).unwrap();
     // On the grants protocol but never running: no identity, so no card.
-    let dir = home.join(".agent24/packages/idle");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("domain-os.yml"),
-        "name: idle\nversion: \"0.1.0\"\nroute_namespace: /api/v1/idle\n\
-         event_module: idle\ndata_dir: ~/.agent24/os/idle/\n\
-         kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-         min_daemon_protocol: 4\n\
-         spawn:\n  command: \"false\"\n  args: []\n\
-         tools:\n  - operation: list-notes\n    description: lists notes\n    \
-         input_schema: {type: object, properties: {}}\n    risk: read\n    \
-         output_privacy: local_only\n    timeout_ms: 5000\n    inline_wait_ms: 1000\n",
-    )
-    .unwrap();
+    // Exit 1, the same status `false` used to return.
+    seal_idle(home, "idle", true);
     // A tool module on an older protocol (§2.6): never a card.
-    let dir = home.join(".agent24/packages/plain");
+    seal_idle(home, "plain", false);
+}
+
+fn seal_idle(home: &Path, name: &str, grants_protocol: bool) {
+    let dir = home.join(".agent24/packages").join(name);
     std::fs::create_dir_all(&dir).unwrap();
+    let protocol = if grants_protocol {
+        "min_daemon_protocol: 4\n"
+    } else {
+        ""
+    };
     std::fs::write(
         dir.join("domain-os.yml"),
-        "name: plain\nversion: \"0.1.0\"\nroute_namespace: /api/v1/plain\n\
-         event_module: plain\ndata_dir: ~/.agent24/os/plain/\n\
-         kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-         spawn:\n  command: \"false\"\n  args: []\n\
-         tools:\n  - operation: list-notes\n    description: lists notes\n    \
-         input_schema: {type: object, properties: {}}\n    risk: read\n    \
-         output_privacy: local_only\n    timeout_ms: 5000\n    inline_wait_ms: 1000\n",
+        format!(
+            "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+             event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+             kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+             {protocol}\
+             spawn:\n  command: bin/mod\n\
+             tools:\n  - operation: list-notes\n    description: lists notes\n    \
+             input_schema: {{type: object, properties: {{}}}}\n    risk: read\n    \
+             output_privacy: local_only\n    timeout_ms: 5000\n    inline_wait_ms: 1000\n"
+        ),
     )
     .unwrap();
+    agent24_os_packages::test_support::seal_exit_stub(&dir, "bin/mod").unwrap();
 }
 
 struct Daemon {

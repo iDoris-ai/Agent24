@@ -1590,6 +1590,22 @@ mod tests {
         }
     }
 
+    /// #1751 N1. `verify --arch` must refuse an unknown architecture before it
+    /// reads the package. Deleting `check_target_arch(arch)?` in
+    /// [`verify_for_arch`] turns this into a missing-manifest error (the
+    /// directory is empty) and the assertion goes red. The generate-side twin
+    /// above does not cover this entry.
+    #[test]
+    fn verify_for_arch_rejects_unknown_arch_before_reading_package() {
+        let dir = tempfile::tempdir().unwrap();
+        for arch in ["unknown", "arm64", "", "X86_64"] {
+            assert!(
+                matches!(verify_for_arch(dir.path(), arch), Err(IntegrityError::ManifestInvalid { detail }) if detail == "unsupported target architecture (expected aarch64 or x86_64)"),
+                "{arch}"
+            );
+        }
+    }
+
     fn macho_with_entry(command: u32) -> Vec<u8> {
         let mut bytes = macho_header(1, 24);
         bytes.extend_from_slice(&command.to_le_bytes());

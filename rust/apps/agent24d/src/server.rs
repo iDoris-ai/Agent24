@@ -4079,6 +4079,7 @@ pub(crate) mod tests {
             ),
         )
         .unwrap();
+        agent24_os_packages::test_support::seal_exit_stub(&dir, "bin/mod").unwrap();
     }
 
     /// Readiness and a shutdown request cannot both win: requested first, the

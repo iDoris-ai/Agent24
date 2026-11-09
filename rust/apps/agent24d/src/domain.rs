@@ -2676,21 +2676,27 @@ while f.readline():
     fn write_package_with(packages: &Path, name: &str, kernel_capabilities: &str, script: &str) {
         let dir = packages.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("domain-os.yml"),
-            format!(
-                "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
-                 event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
-                 kernel_capabilities: {kernel_capabilities}\nimpl_kind: out_of_process_provider\n\
-                 spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n"
-            ),
-        )
-        .unwrap();
+        let yaml = format!(
+            "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+             event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+             kernel_capabilities: {kernel_capabilities}\nimpl_kind: out_of_process_provider\n\
+             spawn:\n  command: bin/launch\n"
+        );
+        std::fs::write(dir.join("domain-os.yml"), &yaml).unwrap();
         std::fs::write(
             dir.join("mod.py"),
             script.replace("os.environ[\"A24_MODULE_NAME\"]", &format!("{name:?}")),
         )
         .unwrap();
+        // `bin/launch` is a native binary. It execs the system python on
+        // `mod.py` — a test double; the product still rejects `command: python3`.
+        // An unparseable manifest (an unknown capability, for example) is
+        // refused at `from_yaml`, before integrity is read. `generate` uses
+        // that same parser, so it cannot seal one. Leave it unsealed: the
+        // refusal stays the parse error, which is what the test asserts.
+        if agent24_domain::DomainOsManifest::from_yaml(&yaml).is_ok() {
+            agent24_os_packages::test_support::seal_python_script(&dir).unwrap();
+        }
     }
 
     /// The catalogue entries `serve` would make of `packages`.
@@ -3290,7 +3296,7 @@ while f.readline():
                 "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
                  event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
                  kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-                 spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n"
+                 spawn:\n  command: bin/launch\n"
             ),
         )
         .unwrap();
@@ -3315,6 +3321,7 @@ raise SystemExit(3)
             ),
         )
         .unwrap();
+        agent24_os_packages::test_support::seal_python_script(&dir).unwrap();
     }
 
     /// FU-61: the REAL `discovery::recheck`-backed `PackageCheck` built at
@@ -3369,14 +3376,20 @@ raise SystemExit(3)
         // Change the manifest during the backoff window — the package
         // directory itself stays, so an unguarded restart would spawn
         // successfully and only fail much later, at the handshake.
+        let crashy = packages.join("crashy");
+        let yml = crashy.join("domain-os.yml");
+        agent24_os_packages::test_support::make_writable(&yml).unwrap();
         std::fs::write(
-            packages.join("crashy").join("domain-os.yml"),
+            &yml,
             "name: crashy\nversion: \"0.2.0\"\nroute_namespace: /api/v1/crashy\n\
              event_module: crashy\ndata_dir: ~/.agent24/os/crashy/\n\
              kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-             spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n",
+             spawn:\n  command: bin/launch\n",
         )
         .unwrap();
+        // Same launcher and script; only the manifest version moves, so
+        // recheck reports a changed digest rather than a missing seal.
+        agent24_os_packages::test_support::seal(&crashy, &["bin/launch"]).unwrap();
 
         let status = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -3505,7 +3518,7 @@ raise SystemExit(3)
                 "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
                  event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
                  kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-                 spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n\
+                 spawn:\n  command: bin/launch\n\
                  tools:\n  - operation: list-notes\n    description: lists notes\n    \
                  input_schema: {{type: object, properties: {{}}}}\n    risk: read\n    \
                  output_privacy: local_only\n    timeout_ms: 5000\n    inline_wait_ms: 1000\n"
@@ -3518,6 +3531,7 @@ raise SystemExit(3)
              open(os.path.join(os.environ['A24_DATA_DIR'], 'executed'), 'a').write('ran\\n')\n",
         )
         .unwrap();
+        agent24_os_packages::test_support::seal_python_script(&dir).unwrap();
     }
 
     fn catalogue_from_found(
@@ -3649,9 +3663,9 @@ raise SystemExit(3)
             ),
         )
         .unwrap();
-        let source = packages.join(format!("{name}-mod.c"));
-        std::fs::write(
-            &source,
+        agent24_os_packages::test_support::compile_c(
+            &dir,
+            "bin/mod",
             "#include <stdio.h>\n#include <stdlib.h>\n\
              int main(void) {\n\
                const char *d = getenv(\"A24_DATA_DIR\");\n\
@@ -3659,16 +3673,8 @@ raise SystemExit(3)
                  FILE *f = fopen(p, \"a\"); if (f) { fputs(\"ran\\n\", f); fclose(f); } }\n\
                return 3;\n}\n",
         )
-        .unwrap();
-        let built = std::process::Command::new("cc")
-            .arg("-o")
-            .arg(dir.join("bin").join("mod"))
-            .arg(&source)
-            .status()
-            .expect("these tests need a C compiler (`cc`) to build a native module");
-        assert!(built.success(), "cc failed to build the marker module");
-        std::fs::remove_file(&source).unwrap();
-        agent24_os_packages::package_integrity::generate(&dir, &["bin/mod".to_owned()]).unwrap();
+        .expect("these tests need a C compiler (`cc`) to build a native module");
+        agent24_os_packages::test_support::seal(&dir, &["bin/mod"]).unwrap();
         dir
     }
 
@@ -4122,10 +4128,7 @@ raise SystemExit(3)
         let tmp = tempfile::tempdir().unwrap();
         let packages = tmp.path().join("packages");
         write_package(&packages, "remote");
-        let yml = packages.join("remote").join("domain-os.yml");
-        let mut text = std::fs::read_to_string(&yml).unwrap();
-        text.push_str("provides:\n  - id: remote-ping\n");
-        std::fs::write(&yml, text).unwrap();
+        amend_manifest(&packages, "remote", "provides:\n  - id: remote-ping\n");
         let hub = crate::events::EventsHub::default();
         let cfg = config_from(r#"{"domainOs": {"remote": {"enabled": false}}}"#);
         let (_, reports, _) = mount_all(
@@ -4189,10 +4192,7 @@ raise SystemExit(3)
             let tmp = tempfile::tempdir().unwrap();
             let packages = tmp.path().join("packages");
             write_package(&packages, "remote");
-            let yml = packages.join("remote").join("domain-os.yml");
-            let mut text = std::fs::read_to_string(&yml).unwrap();
-            text.push_str(&format!("provides:\n  - id: {id}\n"));
-            std::fs::write(&yml, text).unwrap();
+            amend_manifest(&packages, "remote", &format!("provides:\n  - id: {id}\n"));
             let hub = crate::events::EventsHub::default();
             let cfg = config_from(&format!(
                 r#"{{"domainOs": {{"remote": {{"enabled": {enabled}}}}}}}"#
@@ -4229,10 +4229,7 @@ raise SystemExit(3)
         let tmp = tempfile::tempdir().unwrap();
         let packages = tmp.path().join("packages");
         write_package(&packages, "remote");
-        let yml = packages.join("remote").join("domain-os.yml");
-        let mut text = std::fs::read_to_string(&yml).unwrap();
-        text.push_str("provides:\n  - id: remote-ping\n");
-        std::fs::write(&yml, text).unwrap();
+        amend_manifest(&packages, "remote", "provides:\n  - id: remote-ping\n");
         let hub = crate::events::EventsHub::default();
         let cfg = config_from(r#"{"domainOs": {"remote": {"enabled": false}}}"#);
         let (_, reports, _) = mount_all(
@@ -4307,14 +4304,24 @@ raise SystemExit(3)
         reports
     }
 
-    fn append_provides(packages: &Path, name: &str, ids: &[&str]) {
-        let yml = packages.join(name).join("domain-os.yml");
+    /// Append YAML and seal again. `generate` republishes mode 0400, so the
+    /// file is made writable first.
+    fn amend_manifest(packages: &Path, name: &str, extra: &str) {
+        let dir = packages.join(name);
+        let yml = dir.join("domain-os.yml");
+        agent24_os_packages::test_support::make_writable(&yml).unwrap();
         let mut text = std::fs::read_to_string(&yml).unwrap();
-        text.push_str("provides:\n");
-        for id in ids {
-            text.push_str(&format!("  - id: {id}\n"));
-        }
+        text.push_str(extra);
         std::fs::write(&yml, text).unwrap();
+        agent24_os_packages::test_support::seal(&dir, &["bin/launch"]).unwrap();
+    }
+
+    fn append_provides(packages: &Path, name: &str, ids: &[&str]) {
+        let mut extra = String::from("provides:\n");
+        for id in ids {
+            extra.push_str(&format!("  - id: {id}\n"));
+        }
+        amend_manifest(packages, name, &extra);
     }
 
     fn outcome_of<'a>(reports: &'a [MountReport], name: &str) -> &'a MountOutcome {

@@ -1009,7 +1009,12 @@ fn c4_name_clashes_with_a_package_both_directions() {
         "name: sin90\nversion: \"0.1.0\"\nroute_namespace: /api/v1/sin90\n\
          event_module: sin90\ndata_dir: ~/.agent24/os/sin90/\n\
          kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-         spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"-c\", \"import time; time.sleep(60)\"]\n",
+         spawn:\n  command: bin/launch\n",
+    )
+    .unwrap();
+    agent24_os_packages::test_support::seal_python_argv(
+        &sin90_dir,
+        &["python3", "-I", "-S", "-c", "import time; time.sleep(60)"],
     )
     .unwrap();
 
@@ -1063,7 +1068,12 @@ fn c4_name_clashes_with_a_package_both_directions() {
         "name: agentear\nversion: \"0.1.0\"\nroute_namespace: /api/v1/agentear\n\
          event_module: agentear\ndata_dir: ~/.agent24/os/agentear/\n\
          kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-         spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"-c\", \"import time; time.sleep(60)\"]\n",
+         spawn:\n  command: bin/launch\n",
+    )
+    .unwrap();
+    agent24_os_packages::test_support::seal_python_argv(
+        &agentear_pkg_dir,
+        &["python3", "-I", "-S", "-c", "import time; time.sleep(60)"],
     )
     .unwrap();
 

@@ -45,6 +45,9 @@ fn install_package(home: &Path, daemon_bin: &Path) {
          kernel_capabilities: []\nimpl_kind: attached_process\n",
     )
     .unwrap();
+    // Attached packages have no spawn. The stub is only there so the
+    // integrity manifest has a native executable; the daemon does not run it.
+    agent24_os_packages::test_support::seal_exit_stub(&package, "bin/stub").unwrap();
     let path = package.to_string_lossy();
     let out = cli(home, daemon_bin, &["os", "install", &path]);
     assert!(

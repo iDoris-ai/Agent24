@@ -51,6 +51,8 @@ fs2 = "0.4"
 [dev-dependencies]
 # os_uninstall_consents: a store that opens but refuses the revocation.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+# Native launchers and `files.json` for packages these tests install.
+agent24-os-packages = { path = "../../crates/agent24-os-packages", features = ["test-support"] }
 
 [lints]
 workspace = true
