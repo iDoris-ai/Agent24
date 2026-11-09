@@ -585,8 +585,12 @@ mod tests {
         // The wall clock is past `expires_at`; `confirm`'s timer is not.
         presence.set_expires_at("c1", unix_now());
         assert!(!attachment.answer("c1", &nonce, Decision::Allow));
-        // Settled there and then, and the dialog told to close.
-        assert_eq!(waiter.await.unwrap(), PresenceOutcome::TimedOut);
+        // Settled there and then (not by `confirm`'s 60 s timer), and the
+        // dialog told to close.
+        let outcome = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("settled at once, not after the timer");
+        assert_eq!(outcome.unwrap(), PresenceOutcome::TimedOut);
         assert!(matches!(
             event(&attachment).await,
             Event::Cancel { challenge_id } if challenge_id == "c1"
