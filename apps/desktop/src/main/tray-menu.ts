@@ -23,6 +23,8 @@ export interface TrayInput {
   cliTool?: Pick<CliToolStatus, 'state' | 'version'>
   /** M5 B5: the service daemon is not the bundled version, or its upgrade did not finish. */
   upgrade?: UpgradeHint
+  /** M5 B5: the LaunchAgent's daemon keeps exiting and being started again. */
+  crashLoop?: boolean
 }
 
 export type TrayAction = 'start' | 'disconnect' | 'restart' | 'stop' | 'show' | 'quit' | 'cli-settings'
@@ -55,6 +57,7 @@ export function buildTrayView(input: TrayInput, platform: NodeJS.Platform = proc
   if (input.external && platform === 'darwin') tooltip += '\n' + mt('tray.externalKnowledge')
   const upgrade = input.upgrade
   if (upgrade) tooltip += '\n' + (upgrade.kind === 'needed' ? mt('tray.serviceUpgrade') : mt('tray.serviceUpgradeFailed', { code: upgrade.code }))
+  if (input.crashLoop) tooltip += '\n' + mt('tray.serviceCrashLoop')
   const summary = protocol
     ? mt('tray.protocolShort', {
       daemonVersion: protocol.daemonVersion ?? mt('tray.protocolUnknown'),

@@ -328,6 +328,16 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
       manager.stop()
     })
 
+    it('remembers every daemon it spawned, not only the current one (M5 B5, Codex B5b C1)', async () => {
+      const spawnProcess = vi.fn().mockReturnValueOnce(fakeChild(111)).mockReturnValue(fakeChild(222))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      await manager.start()
+      manager.restart()
+      expect(spawnProcess).toHaveBeenCalledTimes(2)
+      expect([manager.spawned(111), manager.spawned(222), manager.spawned(333)]).toEqual([true, true, false])
+      manager.stop()
+    })
+
     it('a daemon the user had stopped stays stopped', async () => {
       const spawnProcess = vi.fn(() => fakeChild(111))
       const manager = new BackendManager({ external: absent(), spawnProcess })

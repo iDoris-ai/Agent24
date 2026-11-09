@@ -213,3 +213,72 @@ export class ServiceUpgrader {
     return upgradeNeeded(this.deps.bundled(), this.deps.running()) ? { kind: 'needed' } : null
   }
 }
+
+/** `launchctl print`'s own `last exit code = N`; a signal that ended it counts
+ * as not 0 (Codex B5b C2); null when it has not exited or says no number. */
+export function lastExitCode(print: string): number | null {
+  if (/^\tlast terminating signal = /m.test(print)) return -1
+  const code = /^\tlast exit code = (-?\d+)/m.exec(print)?.[1]
+  return code === undefined ? null : Number(code)
+}
+
+export function serviceLastExit(uid: number): Promise<number | null> {
+  return new Promise((resolve) => {
+    execFile('launchctl', ['print', `gui/${uid}/${SERVICE_LABEL}`], { timeout: 10_000 }, (err, stdout) => resolve(err ? null : lastExitCode(stdout)))
+  })
+}
+
+/** The pid on record when it can be the service's daemon: one with an
+ * enrolment socket (a legacy one has none) that this app did not spawn; our
+ * own child writes the socket too (`server.rs`; Codex B5b C1, R3). */
+export function serviceRecordPid(state: { pid: number; enrollEndpoint?: string } | null, spawned: (pid: number) => boolean): number | null {
+  return state && state.enrollEndpoint !== undefined && !spawned(state.pid) ? state.pid : null
+}
+
+export const LOOP_WINDOW_MS = 60_000
+export const LOOP_PIDS = 3
+export const LOOP_DOWN_MS = 30_000
+const EXIT_CHECK_MS = 10_000
+
+/** M5 B5 ②: the LaunchAgent's daemon keeps exiting and launchd keeps starting
+ * it (a failed migration today: CORE-5 is off). Either several daemons on
+ * record within a minute, or no enrolment for 30 s while launchd says the job
+ * last exited not 0. Only while the plist is there and this app is not enrolled. */
+export class CrashLoopDetector {
+  private pids: { pid: number; at: number }[] = []
+  private downSince: number | null = null
+  private exit: number | null = null
+  private exitAt = -Infinity
+
+  constructor(private readonly deps: {
+    now: () => number
+    installed: () => boolean
+    enrolled: () => boolean
+    recordPid: () => number | null
+    lastExit: () => Promise<number | null>
+  }) {}
+
+  async sample(): Promise<void> {
+    const now = this.deps.now()
+    if (!this.deps.installed() || this.deps.enrolled()) {
+      this.pids = []
+      this.downSince = null
+      this.exit = null
+      return
+    }
+    const pid = this.deps.recordPid()
+    if (pid !== null && this.pids.at(-1)?.pid !== pid) this.pids.push({ pid, at: now })
+    this.pids = this.pids.filter((p) => now - p.at < LOOP_WINDOW_MS)
+    this.downSince ??= now
+    if (now - this.exitAt >= EXIT_CHECK_MS) {
+      this.exitAt = now
+      this.exit = await this.deps.lastExit()
+    }
+  }
+
+  looping(): boolean {
+    if (this.downSince === null) return false
+    if (new Set(this.pids.map((p) => p.pid)).size >= LOOP_PIDS) return true
+    return this.deps.now() - this.downSince >= LOOP_DOWN_MS && this.exit !== null && this.exit !== 0
+  }
+}
