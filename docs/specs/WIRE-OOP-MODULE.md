@@ -5,7 +5,8 @@
 >
 > **判据**（`docs/agent/PLAN-ME4-OS-CAPABILITIES.md` §五 T14 原文）：**「不看 SDK 源码能不能写出来」**——
 > `examples/node-module/` 是按本文档从零写的 Node.js 参考实现（不 `require`/`import` 本仓任何 Rust crate，
-> 只用 Node 标准库），`rust/apps/agent24d/tests/me4_node_module_blackbox.rs` 是它的黑盒验收。
+> 只用 Node 标准库）；安装包必须是原生可执行程序；签名按 S1-9 §5 平台策略（Linux/Windows v1 无代码签名），Node 参考实现以附着模块（A3 `attached_process`）方式接入演示线协议，
+> `rust/apps/agent24d/tests/me4_node_module_blackbox.rs` 是它的黑盒验收。
 >
 > **基线**：Agent24 `main@ad8cddb`（2026-09-29）。文中 `file:line` 均按此提交核对；实现演进后行号会漂移，
 > 但字段名、常量值、错误闭集是协议契约，不应无预警变化——变化时按 §1.7「manifest schema 版本」协商。
@@ -103,6 +104,8 @@ daemon 用户一致、组/其他不可写（符号链接只查属主）——这
 文档大小上限：`MAX_YAML_BYTES = 64 * 1024`（64 KiB），解析前检查（`lib.rs:544`）。
 
 ### 1.3 最小示例（进程外，本文的主题形状）
+
+> **注意**：安装的 OS 包必须是原生可执行程序；签名按 S1-9 §5 平台策略（Linux/Windows v1 无代码签名）（`spawn.command` 必须指向包内原生可执行文件，不得使用脚本或裸解释器如 `command: node`）。Node 等解释器参考模块改走附着模块（`attached_process`，见 `docs/design/A3-ATTACHED-MODULE.md`）。下文为进程外包的历史形态字段示例：
 
 ```yaml
 name: node-ref
@@ -877,7 +880,7 @@ flush 掉能 flush 的状态并退出**——默认参数下从 SIGTERM 到 SIGK
 ## 附：与本文档配套的产出物
 
 - 参考实现：`examples/node-module/`（`index.js` + `domain-os.yml` + `README.md`）——纯 Node.js 标准库，
-  未引用本仓任何 Rust crate。
-- 黑盒验收：`rust/apps/agent24d/tests/me4_node_module_blackbox.rs`——真起 `agent24d`、安装这个 Node
-  模块、重启、经内核代理访问其路由、事件出现在 WS、`remember` 后能 `recall`。本机无 `node` 时该测试
+  未引用本仓任何 Rust crate。安装包必须是原生可执行程序；签名按 S1-9 §5 平台策略（Linux/Windows v1 无代码签名），Node 参考实现以附着模块（`attached_process`）方式演示线协议。
+- 黑盒验收：`rust/apps/agent24d/tests/me4_node_module_blackbox.rs`——真起 `agent24d`、通过 REST
+  注册附着模块、启动 Node 模块握手并在同一连接上调用回调（`_a24/events/emit`），事件出现在 WS。本机无 `node` 时该测试
   显式 `eprintln!` 说明原因并跳过（不是静默通过）。
