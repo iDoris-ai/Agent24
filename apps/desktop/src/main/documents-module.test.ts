@@ -50,11 +50,17 @@ function installed(version: string | null): string {
   return pkgs
 }
 
-/** What `os install` leaves: the bundle copied file by file. */
+function addIntegrity(dir: string) {
+  fs.writeFileSync(path.join(dir, 'files.json'), '{}')
+  fs.appendFileSync(path.join(dir, 'domain-os.yml'), 'integrity: {manifest: files.json, sha256: abc}\n')
+}
+
+/** What `os install` leaves: payload and generated metadata. */
 function installedCopy(src: string): string {
   const pkgs = path.join(root, 'data', 'packages')
   fs.mkdirSync(pkgs, { recursive: true })
   fs.cpSync(src, path.join(pkgs, 'documents'), { recursive: true })
+  addIntegrity(path.join(pkgs, 'documents'))
   return pkgs
 }
 
@@ -103,6 +109,61 @@ function expectInstallCalls(calls: string[][][], upgrading = false) {
 }
 
 describe('ensureBundledDocumentsModule', () => {
+  it.each(['legacy', 'missing files', 'directory files', 'missing integrity', 'scalar integrity', 'sequence integrity'])(
+    'incomplete installed integrity → reinstall (%s)', async (kind) => {
+      const b = bundle()
+      const pkgs = installedCopy(b)
+      const copy = path.join(pkgs, 'documents')
+      if (['legacy', 'missing files', 'directory files'].includes(kind)) fs.rmSync(path.join(copy, 'files.json'))
+      if (kind === 'directory files') fs.mkdirSync(path.join(copy, 'files.json'))
+      if (kind !== 'missing files' && kind !== 'directory files') {
+        const integrity = kind === 'scalar integrity' ? 'integrity: bad\n'
+          : kind === 'sequence integrity' ? 'integrity: []\n' : ''
+        fs.writeFileSync(path.join(copy, 'domain-os.yml'), manifest('0.2.0') + integrity)
+      }
+      const { d, runCli } = deps({ bundleDir: b, packagesRoot: pkgs })
+      expect(await ensureBundledDocumentsModule(d)).toBe('upgraded')
+      expectInstallCalls(runCli.mock.calls, true)
+    },
+  )
+
+  it.each([
+    ['custom tag', 'name: !evil documents'],
+    ['standard tag', 'name: !!str documents'],
+    ['anchor', 'name: &name documents'],
+    ['alias', 'name: documents\nextra: *missing'],
+    ['merge key', 'name: documents\n<<: {}'],
+    ['duplicate key', 'name: documents\nname: documents'],
+    ['multiple documents', 'name: documents\n---\nname: documents'],
+    ['warning', '%YAML 1.3\n---\nname: documents'],
+    ['nested tag', 'name: documents\nextra: {value: !!str hello}'],
+  ])('ambiguous YAML → reinstall (%s)', async (_kind, name) => {
+    const b = bundle()
+    // Both sides carry the construct: rejection cannot rely on unequal business fields.
+    fs.writeFileSync(path.join(b, 'domain-os.yml'), name + '\nversion: 0.2.0\n')
+    const pkgs = installedCopy(b)
+    expect(sameFiles(b, path.join(pkgs, 'documents'))).toBe(false)
+    const { d, runCli } = deps({ bundleDir: b, packagesRoot: pkgs })
+    expect(await ensureBundledDocumentsModule(d)).toBe('upgraded')
+    expectInstallCalls(runCli.mock.calls, true)
+  })
+
+  it.each([false, true])('removes stale userData staging before installation and cleans up (manual=%s)', async (manual) => {
+    const staging = path.join(root, 'documents-module-staging')
+    fs.mkdirSync(staging)
+    fs.writeFileSync(path.join(staging, 'stale'), 'crash residue')
+    const { d, runCli } = deps()
+    runCli.mockImplementationOnce(async (args) => {
+      expect(args[3]).toBe(staging)
+      expect(fs.existsSync(path.join(staging, 'stale'))).toBe(false)
+      expect(fs.statSync(staging).mode & 0o777).toBe(0o700)
+      return { code: 0, output: '' }
+    })
+    if (manual) expect(await installBundledDocumentsModule(d)).toEqual({ ok: true })
+    else expect(await ensureBundledDocumentsModule(d)).toBe('installed')
+    expect(fs.existsSync(staging)).toBe(false)
+  })
+
   it('not installed → signatures checked, generate, then os install <copy>', async () => {
     const { d, runCli, warn, codesign } = deps()
     expect(await ensureBundledDocumentsModule(d)).toBe('installed')
@@ -118,7 +179,7 @@ describe('ensureBundledDocumentsModule', () => {
       const tmp = args[3]!
       expect(tmp).not.toBe(d.bundleDir)
       expect(fs.statSync(tmp).mode & 0o777).toBe(0o700)
-      expect(sameFiles(d.bundleDir!, tmp)).toBe(true)
+      expect(fs.readFileSync(path.join(tmp, 'domain-os.yml'))).toEqual(fs.readFileSync(path.join(d.bundleDir!, 'domain-os.yml')))
       fs.writeFileSync(path.join(tmp, 'files.json'), '{}')
       return { code: 0, output: '' }
     })
@@ -181,6 +242,7 @@ describe('ensureBundledDocumentsModule', () => {
     fs.symlinkSync(path.join(root, 'real', 'sub'), path.join(root, 'link'))
     // As PathBuf::join: <root>/link/../packages is <root>/real/packages.
     fs.cpSync(b, path.join(root, 'real', 'packages', 'documents'), { recursive: true })
+    addIntegrity(path.join(root, 'real', 'packages', 'documents'))
     const { d, runCli } = deps({ bundleDir: b, packagesRoot: `${root}/link/../packages` })
     expect(await ensureBundledDocumentsModule(d)).toBe('up_to_date')
     expect(runCli).not.toHaveBeenCalled()
@@ -549,6 +611,7 @@ describe('sameFiles', () => {
     const b = bundle()
     const copy = path.join(root, 'copy')
     fs.cpSync(b, copy, { recursive: true })
+    addIntegrity(copy)
     fs.chmodSync(path.join(copy, 'bin', 'agent24-documents'), 0o755)
     expect(sameFiles(b, copy)).toBe(true)
     fs.mkdirSync(path.join(copy, 'empty'))

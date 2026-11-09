@@ -36,9 +36,8 @@
 import { execFile } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
-import os from 'node:os'
 import { isDeepStrictEqual } from 'node:util'
-import { isMap, isScalar, parseDocument } from 'yaml'
+import { isAlias, isMap, isScalar, parseDocument, visit } from 'yaml'
 import { joinLiteral } from './data-dir'
 
 export const MODULE = 'documents'
@@ -125,19 +124,36 @@ function listTree(dir: string, rel = ''): string[] | null {
 
 /** Parse business fields; reject ambiguous YAML instead of treating it as equal. */
 function businessManifest(bytes: Buffer, installed: boolean): unknown {
-  const doc = parseDocument(bytes.toString('utf8'))
-  if (doc.errors.length || !isMap(doc.contents)
+  const doc = parseDocument(bytes.toString('utf8'), { uniqueKeys: true })
+  visit(doc, {
+    Node(_key, node) {
+      if (isAlias(node) || node.tag !== undefined || node.anchor !== undefined) {
+        throw new Error('unsupported module manifest YAML')
+      }
+    },
+    Pair(_key, pair) {
+      if (isScalar(pair.key) && pair.key.value === '<<') {
+        throw new Error('unsupported module manifest merge key')
+      }
+    },
+  })
+  if (doc.errors.length || doc.warnings.length || !isMap(doc.contents)
     || doc.contents.items.some(({ key }) => !isScalar(key) || typeof key.value !== 'string')) {
     throw new Error('invalid module manifest')
   }
-  if (installed) doc.delete('integrity')
+  if (installed) {
+    if (!isMap(doc.get('integrity', true))) throw new Error('missing module integrity mapping')
+    doc.delete('integrity')
+  }
   return doc.toJS({ mapAsMap: true })
 }
 
 /** Bundle versus installed copy: ignore installed integrity metadata, compare payload bytes. */
 export function sameFiles(a: string, b: string): boolean {
   const left = listTree(a)
-  const right = listTree(b)?.filter((name) => name !== 'files.json') ?? null
+  const installedTree = listTree(b)
+  if (!installedTree?.includes('files.json')) return false
+  const right = installedTree.filter((name) => name !== 'files.json')
   if (left === null || right === null || left.length !== right.length) return false
   if (left.some((name, i) => name !== right[i])) return false
   try {
@@ -231,10 +247,13 @@ function lastLine(output: string): string {
 }
 
 /** Called only after signatures pass. Keep the old installation until generate succeeds. */
-async function installWithIntegrity(bundleDir: string, runCli: RunCli, beforeInstall?: () => Promise<void>): Promise<CliResult> {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agent24-documents-'))
+async function installWithIntegrity(bundleDir: string, userDataDir: string, runCli: RunCli, beforeInstall?: () => Promise<void>): Promise<CliResult> {
+  const tmp = path.join(userDataDir, 'documents-module-staging')
+  fs.mkdirSync(userDataDir, { recursive: true })
+  fs.rmSync(tmp, { recursive: true, force: true })
+  fs.mkdirSync(tmp, { mode: 0o700 })
   try {
-    // Copy entries, not the root: preserve mkdtemp's private 0700 directory mode.
+    // Copy entries, not the root: preserve the staging directory's private 0700 mode.
     for (const name of fs.readdirSync(bundleDir)) {
       fs.cpSync(path.join(bundleDir, name), path.join(tmp, name), { recursive: true })
     }
@@ -285,7 +304,7 @@ export async function ensureBundledDocumentsModule(deps: BundledModuleDeps): Pro
       deps.warn(`[documents-module] not installing the bundled documents ${want}: ${problem}`)
       return 'signature_invalid'
     }
-    const added = await installWithIntegrity(deps.bundleDir, deps.runCli, async () => {
+    const added = await installWithIntegrity(deps.bundleDir, deps.userDataDir, deps.runCli, async () => {
       if (!upgrading) return
       const removed = await deps.runCli(['os', 'uninstall', MODULE])
       if (removed.code !== 0) {
@@ -439,7 +458,7 @@ export async function installBundledDocumentsModule(deps: BundledModuleDeps): Pr
   }
   let r: CliResult
   try {
-    r = await installWithIntegrity(deps.bundleDir, deps.runCli)
+    r = await installWithIntegrity(deps.bundleDir, deps.userDataDir, deps.runCli)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     deps.warn(`[documents-module] ${message}`)
