@@ -1,96 +1,54 @@
-# S1-9 PR-3d：macOS OS 包验签
+# S1-9 PR-3d 第四轮最终验收：合入 main（PR-3c）并修 Codex 四条
 
-> 本文保留前两轮历史；最新调查、debug 开关和验收结果见 [第三轮验收记录](S1-9-PR3D-第三轮验收记录.md)。
+本轮在 `feat/s1-9-pr3d-macos-signature` 上完成 `git merge origin/main`（main 已含 PR-3c #1756，`1ff79230`）。以 PR-3c 的必需清单和类型化原因为准，叠上本分支的宿主验签。第三轮记录里「无 `integrity` 但有 `spawn.command` 时仍验签并放行」已经删除，不再成立。前三轮在沙箱里没有跑完全部门禁，那些数字只作历史，不以它们为通过。
 
-## 设计
+## 冲突怎么解
 
-- 信任文件是 daemon 数据目录下的 `os-trusted-teams.json`，与 packages 路径覆盖无关。只允许 daemon API 修改；CLI 安装和 daemon scan/recheck 读取同一份宿主策略。内置 `HYAP444FN9` 永远在集合中。缺失、损坏或无法读取时仅保留内置团队；损坏记录警告。
-- 更新持有跨进程文件锁，0600 临时文件写入并 fsync，再原子 rename 并 fsync 父目录。三个 CLI 命令经已认证的 daemon 路由；能力路由中写操作为 ModuleAdmin/Elevated，读取为 ModuleRead/Everyday。
-- 每次验签重新读取信任集合，因此取消信任影响下一次 scan/recheck/install，不主动停止已经运行的模块。
-- 共享 `SignatureVerifier` 增加默认拒绝的 `team_id` 方法；Codesign/CodesignWith 负责读取唯一、合法的 TeamIdentifier。包侧先检查团队集合，再调用共享 Developer ID/runtime 验证。对外只返回相对路径、团队与类型化原因，不返回 codesign 原始 stderr。
-- scan/recheck 在完整哈希和原生格式检查后使用 AtRest；安装对复制后的 staging 使用 Install，成功才发布。公证失败提示刚公证的包可能需要等待几分钟。
-- `package-integrity verify` 保持哈希和原生格式自检，不验签，帮助文字说明边界。
-- 单元测试通过显式 Policy 注入接受 verifier。本轮默认特性的 CLI 黑盒测试将封包直接置入 `packages/<name>`，不再以 `os install` 安装 cc stub 作为准备步骤；安装负例明确验证 macOS 拒绝未签名包。本轮未新增运行时验签旁路。
+六个冲突文件：`agent24d` 的 `domain.rs`、`os_routes.rs`、`server.rs`，以及 `agent24-os-packages` 的 `discovery.rs`、`package_integrity.rs`、`test_support.rs`。
 
-## 关键测试
+- 没有 `manifest.integrity()` 时，`verify_contents` 直接返回 `IntegrityError::Missing`。签名策略不能代替清单。`scan`、`recheck`、`scan_one` 都走 `verify_with_policy`，在哈希和原生格式检查之后调用传入的 `signature::Policy`。生产入口 `verify_required` / `scan` / `recheck` / `scan_one` 使用 `Policy::default()`。`enable` 重扫调用 `scan_one_with_policy`，与写配置共用 `os_control` 锁。
+- `SignatureInvalid`、`NotarizationFailed`、`UntrustedTeam`、`SignatureRejected` 的 `reason()` / `code()` 都是 `signature_rejected`（D6 为 `os_package.signature_rejected`）。
+- 公开文案：前三种里，`SignatureInvalid`、`NotarizationFailed`、`SignatureRejected` 的 `public_message()` 精确为 `signature_rejected`，不含路径和 codesign 输出。合法 10 位 Team ID 的 `UntrustedTeam` 为 `signature_rejected: {team}; 如信任该开发者：agent24 os trust-team {team}`。非法团队串退回精确的 `signature_rejected`。`Display` 仍给主机日志全文。`/api/v1/os` 的拒绝行 detail 是 `{reason.code()}: {public_message()}`，因此 ad-hoc 关闭时字面是 `signature_rejected: signature_rejected`。这是和 PR-3c 列表格式共用的结果，没有为了去重去改 view。
+- `test_support` 同时保留 PR-3c 的 `seal_*` / `n1_*`（真实 `discovery::scan`）和本分支的 `compile_c` ad-hoc、`signature_policy`、给进程内单测用的假策略 `scan`。
+- daemon 启动用同一个 `os_signature_policy()` 做 `with_discovered_policy` 和 `retain_rechecked`。`cfg(test)` 的进程内扫描走假策略；真实二进制黑盒由 `tests/support/signature_command.rs` 设置 `A24_TEST_ACCEPT_ADHOC_SIGNATURES=1`。该变量只在 `debug_assertions` 下读取；release 恒拒绝 ad-hoc，变量名不进 release 分支。
 
-- `untrusted_team_is_refused_then_trust_and_untrust_take_effect`：外部团队拒绝 → 显式信任通过 → 撤销拒绝 → 损坏信任文件仍拒绝。
-- `adhoc_unsigned_and_invalid_signature_are_refused`：缺少团队和无效签名均拒绝。
-- `builtin_passes_and_other_platforms_do_not_call_verifier`：内置团队接受；Linux/Windows 不调用 Team 读取或验签。
-- `team_reader_rejects_unsigned_adhoc_duplicate_and_malformed_claims`：假的 CommandRunner 覆盖无签名、ad-hoc、重复、非法 TeamIdentifier。
-- `trust_roundtrip_builtin_and_corruption`：存储往返、0600、格式校验、内置团队不可移除、损坏回退。
-- `scan_recheck_install_modes_and_failed_install_cleanup`：真实原生夹具走 scan/recheck/install，记录公证参数分别为 false/false/true，失败安装不留 staging，发布自检不调用验签。
-- `cancellation_during_team_read_beats_signature_failure`：取消优先。
-- `apple_platform_binary_is_not_implicitly_trusted`：真实 `/usr/bin/true` 拒绝。
-- `trust_team_api_persists_lists_and_protects_builtin`、`trusted_team_commands_parse_and_help_explains_builtin`：API 与 CLI。
+## Codex 终审四条
 
-## 反面对照
+1. **提权。** `agent24 os trust-team` / `untrust-team` 在 `cmd_os` 里提前返回，经 `attach_only_with_enrollment(true)` 和 `send_elevating` 发 PUT/DELETE，空 body。服务端 `resolve_target` 把这两个模板列入 ModuleAdmin 可提权路由，权限与路由策略 §3 的 Elevated 一致。GET 仍是 Everyday，不提权。空 body 的提权摘要由 daemon 生成（`trust OS package team {id}` / `stop trusting OS package team {id}`）。
+2. **信任文件。** 读取在同一个 fd 上 `open(RDONLY|CLOEXEC|NOFOLLOW|NONBLOCK)`，`fstat` 必须是普通文件、属主为当前 uid、mode 不含 group/other 写（与写入 0600 对应，不要求恰好 0600），最长 64KiB。符号链接、他人可写、非普通文件、损坏或过大：只信内置团队并记警告。文件不存在仍静默。
+3. **缺清单。** 见上，无清单即 `IntegrityManifestMissing`，不调用验签。
+4. **原因映射。** 见上，三变体归入 `signature_rejected`。
 
-先将包策略检查留为空实现，运行拒绝测试：未受信团队用例因返回 Ok 导致 unwrap_err 失败；无签名/无效签名用例因没有返回错误而失败。随后执行两项独立变异（均已恢复）：
+## 门禁
 
-1. 删除团队集合限制：`untrusted_team_is_refused_then_trust_and_untrust_take_effect` 返回 Ok，`unwrap_err` 失败，退出码 101。
-2. 保留 Team 读取和集合检查，只将 verifier 的结果改为成功：`adhoc_unsigned_and_invalid_signature_are_refused` 的拒绝断言失败，退出码 101。
-3. 恢复源码后 `cargo test -j 4 -p agent24-os-packages --lib signature::`：6 项通过，退出码 0。
+沙箱外，`rust/` 下，mbx，不设 `CARGO_TARGET_DIR`，`-j 4`，测试前 `ulimit -n 4096`。未起 Docker。前端用 pnpm。
 
-## 拆分建议
-
-变更超过 600 行，建议按依赖顺序拆为三片：信任存储及 CLI/API；共享 Team 读取和 scan/recheck 验签注入；Install 模式和安装清理测试。各片须带自身测试，后两片基于前片。未推送，未开 PR。
-
-
-## 第一轮验证结果（历史，最终状态见第二轮）
-
-命令在 `rust/` 下执行（实际使用等价 `--manifest-path rust/Cargo.toml`）。所有测试前设置 `ulimit -n 4096`，cargo 使用 mbx、`-j 4`，未设置 `CARGO_TARGET_DIR`。
+本会话的 shell 在 fd 3 上继承了一条可读管道。trampoline 必须留下 fd 3（模块监听槽），所以直接在这个 shell 里跑时，`the_daemon_binary_becomes_the_module_and_keeps_its_own_fds_from_it` 会看到 `0 1 2 3`。这不是漏关高位 fd。下面的 daemon / CLI 测试在子进程里关掉 fd 3 再 exec cargo，该项在全量里通过。产品代码没有为这条管道改关闭范围。
 
 | 检查 | 结果 |
 | --- | --- |
-| `cargo test -j 4 -p agent24-components -p agent24-os-packages -p agent24-os-proc` | 在 components 首个测试目标停止：76 通过、5 失败、2 忽略；5 项 download 重定向测试均因 TCP 监听 EPERM |
-| 单独补跑 `cargo test -j 4 -p agent24-os-packages -p agent24-os-proc` | packages 96/96 通过；os-proc 单元测试 8/8 通过；macos_identity 集成 2 通过、2 因 EPERM 失败 |
-| `cargo test -j 4 -p agent24-components sign::tests` | 20 通过、2 忽略；包括新 TeamIdentifier 解析用例 |
-| `cargo test -j 4 -p agent24-cli` | 133 通过、56 失败、6 忽略；逐一检查 56 个失败块，全部包含 Operation not permitted；后续集成目标未执行 |
-| CLI `trusted_team_commands` 定向测试 | 1/1 通过 |
-| `cargo test -j 4 -p agent24-cli --features test-support --test os_uninstall_consents` | 5/5 通过，真实 CLI 安装/卸载夹具 |
-| `cargo test -j 4 -p agent24d` | lib 目标的既有 iDoris 测试长时间等待，未完成；不能报告通过 |
-| daemon `--bin agent24d trust_team_api` 定向测试 | 1/1 通过，不需要绑定端口 |
-| `cargo clippy -j 4 --workspace --all-targets --all-features -- -D warnings` | 通过；首轮的 items-after-test-module 已修正 |
-| `cargo fmt --all --check`、`git diff --check` | 通过 |
+| `cargo test -j 4 -p agent24-os-packages -p agent24-components -p agent24-os-proc -p agent24-os-proto` | 上一会话已绿：components 85 通过 / 2 忽略；os-packages 107 通过（含四个 `n1_*`、t4、信任文件）；os-proc lib 8；macos_identity 4；team_id_consistency 5；os-proto lib 442；doctest 2+6 |
+| `cargo test -j 4 -p agent24d` | 全绿。22 个测试目标合计 1433 通过、0 失败、5 忽略。含 lib 75、bin 单测 1298、`module_tool_card` 5（拒绝行断言）、`trampoline` 2。日志 `/tmp/pr3d-agent24d.log` |
+| `cargo test -j 4 -p agent24-cli` | 全绿。18 个测试目标合计 275 通过、0 失败、6 忽略。含 `capabilities_trust_team_completes_elevation` 与沙箱白名单里的 `uninstall_hot_stop` 两项。日志 `/tmp/pr3d-cli.log` |
+| `cargo fmt --all --check` | 通过 |
+| `cargo clippy -j 4 --workspace --all-targets --all-features -- -D warnings` | 通过（42.59s）。日志 `/tmp/pr3d-clippy.log` |
+| `pnpm gen:api` | 通过，相对索引无 diff |
+| `pnpm lint:openapi` | 通过（valid）。8 条既有 warning：`/os/trusted-teams/{team}` 与 `/{name}/delegation`、`/{name}/stop` 的 ambiguous path，以及 documents 未使用组件 / `unsourced_reason` |
+| `vitest run src/openapi*.test.ts` | 在 `packages/contract-tests` 下展开 glob 后 8 个文件、74 项通过。仓库根的同一命令不会展开 `src/openapi*`（该目录不在根上），vitest 收到字面过滤器并报无文件 |
+| `cargo build -p agent24d -p agent24-cli --release` 后 `strings` | 通过（1m26s）。`strings -a` 在 `rust/target/release/agent24d` 和 `rust/target/release/agent24` 里都没有 `A24_TEST_ACCEPT_ADHOC`。日志 `/tmp/pr3d-release.log` |
 
-os-proc 环境失败：`apple_signed_process_fails_team_requirement_before_identifier`、`malformed_team_parameter_is_rejected_before_any_signature_work`，均在 `tests/macos_identity.rs:24` 遇到 EPERM。
+## 变异（改回去即红，随后已恢复）
 
-没有签名/公证凭据，因此未做真实本方 Developer ID 的安装成功验收；真实 `/usr/bin/true` 拒绝测试已通过。未在 Linux/Windows 主机运行，非 macOS 不调用验签由平台分支测试覆盖。
+每条改完只跑对应测试，确认失败后把源码按原字节写回，再跑同一条确认通过。日志 `/tmp/pr3d-mutations.log`。
 
-上述失败不属于 AGENTS.md 的四项沙箱白名单，完整门禁没有通过，因此未提交、未推送、未开 PR。待非沙箱环境补跑完整门禁后，再按上面的三片建议提交，使用用户指定作者及尾注。
+| 改回去 | 测试 | 红因 |
+| --- | --- | --- |
+| `read_trust_file` 改回 `fs::read` | `trusted_teams::tests::symlink_writable_and_nonregular_trust_files_stay_builtin_only` | 符号链接被跟读。`left: {"ABCDE12345", "HYAP444FN9"}`，`right: {"HYAP444FN9"}`，消息 `a symlink must not be followed`。测试先在这一条失败退出，0666 和目录断言没有跑到。恢复后整条测试通过，那两臂仍在同一测试里 |
+| 无清单改为 `Ok(())` | `signature::macos_tests::legacy_manifest_cannot_skip_host_signature_policy` | `unwrap_err()` 遇到 `Ok(())`，缺清单不再是错误 |
+| `SignatureInvalid` 的公开文案改为 `codesign: {path}` | `integrity::tests::macos_signature_failures_share_signature_rejected` | 断言 `public.starts_with("signature_rejected")` 失败，实际文案是 `codesign: bin/run` |
+| `resolve_target` 去掉 trusted-teams 的 PUT/DELETE | `capabilities::first_party::tests::trusted_team_writes_are_elevatable_and_reads_are_not`（`--bin agent24d`，不在 lib） | PUT `unwrap()` 得到 `Err(NotElevatedOperation)` |
+| `send_elevating` 收到第一次响应后不再 elevate | `capabilities_trust_team_completes_elevation` | 命令失败。`stdout` 为空，`stderr` 为 `error: needs approval`，停在单次 403 |
 
-仍运行的本次 daemon lib 测试进程 PID 为 98690（cargo 95342、mbx 95318）；尝试 `kill -TERM 98690` 返回 Operation not permitted，沙箱内无法清理。需要宿主会话终止该次测试。日志位于 `/tmp/pr3d-daemon.log`，其余详细日志为 `/tmp/pr3d-*.log`。
+## 规模与拆分
 
-
-## 第二轮修复（2026-11-09）
-
-- 补齐三个 trusted-teams OpenAPI 操作、响应及 D6 `{code,message,retryable}` 操作错误体；认证错误沿用公共 401/403 契约。同步 CORE-2 §3 路由表，写操作维持 ModuleAdmin/Elevated，与 OS enable/disable 同级。
-- `serve` 的包扫描实际在 `docked_startup::pre_start` 之后；失败由 `with_discovered` 改名引起。顺序测试更新为 `with_discovered_policy`，同时新增 `os_signature_policy()` 必须晚于 hook 的断言。
-- `os_cli_no_ephemeral`、`os_uninstall_consents`、`uninstall_hot_stop` 的安装准备直接写入/移动到 `.agent24/packages/<name>`。保留安装撤销失败的断言，修复 store 后在 macOS 验证 `signature_invalid` 且无包落盘；无 HOME 的安装负例仍检查撤销提示。
-- **签名错误三种（`signature_invalid` / `notarization_failed` / `untrusted_team`）在 PR-3c 的原因映射里都归入 §4 的 `signature_rejected`。** PR-3d 保留细分错误以供诊断。
-- 本轮回归的反面对照来源为 Opus 沙箱外已报告的失败；新增 D6 断言验证业务错误的三字段结构。未将沙箱失败算作通过。
-- 已离线执行 `pnpm install --frozen-lockfile --offline`。生成客户端保留为未提交改动；连续两次 `pnpm gen:api` 后 SHA-1 文件清单一致，生成无漂移。`git diff --exit-code packages/api-client` 相对 HEAD 非零是本轮新增 API 类型的预期差异，未通过暂存或丢弃生成文件伪造干净状态。
-
-### 第二轮验证结果（默认特性，沙箱内）
-
-| 检查 | 结果 |
-| --- | --- |
-| `cargo test -j 4 -p agent24d` | lib 的 iDoris 用例长时间等待，未完成；已通过执行会话发送 Ctrl-C，退出 130，不宣称全绿 |
-| daemon `route_openapi_gate` + `kernel_routes_and_openapi` | 5 + 1 项通过 |
-| daemon `section_3_rows_match_operation_and_level` | 1/1 通过；§3 固定行数由 93 同步为 96，保留逐行 operation/level 对照 |
-| daemon `serve_hook_precedes` / `trust_team_api` | 各 1 项通过；含 D6 三字段错误断言 |
-| `cargo test -j 4 -p agent24-cli` | 主测试 134 通过、56 失败、6 忽略；逐个检查 56 个 panic 块，均包含 Operation not permitted；后续集成目标未自动执行 |
-| CLI `os_cli_no_ephemeral` / `os_uninstall_consents` | 单独补跑，3/3 与 5/5 通过；无需 `--features test-support` |
-| CLI `uninstall_hot_stop` | 1 通过，2 个既有沙箱白名单用例失败，均为 daemon 启动 EPERM |
-| `cargo test -j 4 -p agent24-os-packages -p agent24-components -p agent24-os-proc` | 在 components 停止：77 通过、5 个 download 监听 EPERM 失败、2 忽略 |
-| 单独补跑 `cargo test -j 4 -p agent24-os-packages -p agent24-os-proc` | packages 96/96、os-proc 单元 8/8 通过；macos_identity 2 通过、2 个 EPERM 失败 |
-| `cargo clippy -j 4 --workspace --all-targets --all-features -- -D warnings` | 最终代码检查通过 |
-| `cargo fmt --all --check` / `git diff --check` | 通过 |
-| `pnpm -w run lint` | 通过 |
-| `pnpm gen:api` | 通过，重复生成哈希一致，新增生成类型保留在工作区 |
-| `pnpm lint:openapi` | 首次 dlx 缓存写入 EPERM；将缓存改到 /tmp 后依赖下载 ENOTFOUND，未完成 |
-
-完整门禁仍需 Opus 在沙箱外复跑，不能把这些非白名单环境失败算作通过。本轮未提交、未推送。日志：`/tmp/pr3d-round2-*.log`。本轮 daemon 执行会话已停止；第一轮文中历史 PID 未重新核验。
-
-提交身份保持 `jhfnetboy <firsttorch66@gmail.com>`，尾注 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`；本轮因完整门禁未通过，所有改动留在工作区，未创建提交。
+相对 `origin/main`，不含锁文件和生成的 `openapi.d.ts`，约 64 个文件，+2239 / −215。超过默认 300 行。按依赖可以拆成：信任存储与 CLI/API（含本轮提权和信任文件 fd）；scan / recheck / scan_one 验签与原因映射；Install 模式与安装清理。本轮按任务要求只做 merge commit 和随后的修复 commit，不在这一轮再拆 PR、不 push。

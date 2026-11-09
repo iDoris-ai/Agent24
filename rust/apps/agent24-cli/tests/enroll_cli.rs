@@ -130,9 +130,13 @@ fn spawn_http_recording(
             }
             assert!(
                 line.starts_with("POST /api/v1/attached ")
-                    || line.starts_with("POST /api/v1/os/agentear/delegation "),
+                    || line.starts_with("POST /api/v1/os/agentear/delegation ")
+                    || line.starts_with("PUT /api/v1/os/trusted-teams/")
+                    || line.starts_with("DELETE /api/v1/os/trusted-teams/"),
                 "{line}"
             );
+            let trust_team = line.starts_with("PUT /api/v1/os/trusted-teams/")
+                || line.starts_with("DELETE /api/v1/os/trusted-teams/");
             posts.lock().unwrap().push(HttpSeen {
                 headers: headers.clone(),
                 body,
@@ -156,7 +160,15 @@ fn spawn_http_recording(
             match mode {
                 HttpMode::CreateDirect => respond(&mut stream, "201 Created", &created),
                 HttpMode::ElevateThenCreate if has_grant => {
-                    respond(&mut stream, "201 Created", &created);
+                    if trust_team {
+                        respond(
+                            &mut stream,
+                            "200 OK",
+                            &json!({"teams":[{"team_id":"ABCDE12345","builtin":false}]}),
+                        );
+                    } else {
+                        respond(&mut stream, "201 Created", &created);
+                    }
                 }
                 HttpMode::AlwaysInvalid if has_grant => respond(
                     &mut stream,
@@ -490,6 +502,76 @@ fn capabilities_add_succeeds_after_elevation_with_a3_shape() {
     assert_eq!(frames[1]["body_sha256"], sha256_hex(&posts[0].body));
     assert!(frames[1]["summary"].as_str().unwrap().chars().count() <= 200);
     let _ = fake.http_port;
+}
+
+fn run_trust_team(home: &Path) -> (bool, String, String) {
+    let out = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24"))
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home)
+        .args(["os", "trust-team", "ABCDE12345"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = out;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("CLI exceeded the 10 second test deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Capabilities mode: the first PUT is `presence_required`, the second carries
+/// the elevation grant. Removing `send_elevating` leaves a single 403 and this
+/// command fails.
+#[test]
+fn capabilities_trust_team_completes_elevation() {
+    let home = tmp_home();
+    let fake = start(
+        HttpMode::ElevateThenCreate,
+        script(pending_then(elevated())),
+        home.path(),
+    );
+    let (ok, stdout, stderr) = run_trust_team(home.path());
+    assert!(ok, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("ABCDE12345"), "{stdout}");
+    assert_no_secret(&stdout, &stderr);
+    assert!(
+        stderr.contains("Waiting for approval in the Agent24 app"),
+        "{stderr}"
+    );
+    let posts = fake.posts.lock().unwrap();
+    assert_eq!(posts.len(), 2);
+    assert!(posts[0].body.is_empty(), "{:?}", posts[0].body);
+    assert_eq!(posts[0].body, posts[1].body);
+    assert!(!posts[0].headers.contains_key("x-agent24-elevation"));
+    assert_eq!(posts[1].headers["x-agent24-elevation"], GRANT);
+    let requests = fake.requests.lock().unwrap();
+    let puts: Vec<_> = requests
+        .iter()
+        .filter(|(line, _)| line.starts_with("PUT /api/v1/os/trusted-teams/ABCDE12345 "))
+        .collect();
+    assert_eq!(puts.len(), 2, "{requests:?}");
+    let frames = fake.frames.lock().unwrap();
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[1]["op"], "elevate");
+    assert_eq!(frames[1]["method"], "PUT");
+    assert_eq!(frames[1]["path"], "/api/v1/os/trusted-teams/ABCDE12345");
+    assert_eq!(frames[1]["body_sha256"], sha256_hex(b""));
 }
 
 #[test]

@@ -1748,6 +1748,9 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     if let OsAction::Delegate { name } = &action {
         return cmd_os_delegate(name).await;
     }
+    if let OsAction::TrustTeam { team_id } | OsAction::UntrustTeam { team_id } = &action {
+        return cmd_os_trusted_team(matches!(action, OsAction::TrustTeam { .. }), team_id).await;
+    }
     if let Some(done) = os_local(&action).await {
         return done;
     }
@@ -1778,25 +1781,14 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
         // Handled before the daemon lookup above; see `os_local`.
         OsAction::Install { .. } | OsAction::Uninstall { .. } => unreachable!(),
         // Handled at the top of this function, before it ever reaches here.
-        OsAction::Attach { .. } | OsAction::Delegate { .. } => unreachable!(),
+        OsAction::Attach { .. }
+        | OsAction::Delegate { .. }
+        | OsAction::TrustTeam { .. }
+        | OsAction::UntrustTeam { .. } => unreachable!(),
         OsAction::TrustedTeams => bearer(
             &ep,
             client().get(format!("{}/api/v1/os/trusted-teams", ep.base)),
         ),
-        OsAction::TrustTeam { team_id } | OsAction::UntrustTeam { team_id } => {
-            if !agent24_os_proc::valid_team_id(team_id) {
-                return Err("Team ID must be 10 uppercase letters or digits".into());
-            }
-            let url = format!("{}/api/v1/os/trusted-teams/{team_id}", ep.base);
-            bearer(
-                &ep,
-                if matches!(action, OsAction::TrustTeam { .. }) {
-                    client().put(url)
-                } else {
-                    client().delete(url)
-                },
-            )
-        }
         OsAction::List => bearer(&ep, client().get(format!("{}/api/v1/os", ep.base))),
         OsAction::Enable { name } | OsAction::Disable { name } => {
             let enabled = matches!(action, OsAction::Enable { .. });
@@ -1806,10 +1798,7 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     };
     let out = match req.timeout(Duration::from_secs(10)).send().await {
         Ok(res) if res.status().is_success() => {
-            if matches!(
-                action,
-                OsAction::TrustedTeams | OsAction::TrustTeam { .. } | OsAction::UntrustTeam { .. }
-            ) {
+            if matches!(action, OsAction::TrustedTeams) {
                 let body: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
                 for team in body["teams"]
                     .as_array()
@@ -2488,6 +2477,69 @@ fn resolve_allow_relax(allow_remote: bool) -> bool {
         return false;
     }
     line.trim() == "yes"
+}
+
+/// `agent24 os trust-team` / `untrust-team`. Capabilities mode answers
+/// `403 presence_required` with one elevation round, the same way
+/// `os delegate` does. The body is empty; the daemon summary is the Team ID.
+async fn cmd_os_trusted_team(trust: bool, team_id: &str) -> Result<(), String> {
+    if !agent24_os_proc::valid_team_id(team_id) {
+        return Err("Team ID must be 10 uppercase letters or digits".into());
+    }
+    let ep = match attach_only_with_enrollment(true).await {
+        Ok(Some(ep)) => ep,
+        Err(err) => return Err(err),
+        Ok(None) => {
+            return Err("daemon not running; start it with `agent24 daemon start`".to_owned());
+        }
+    };
+    let sent = send_elevating(
+        &ep,
+        if trust {
+            reqwest::Method::PUT
+        } else {
+            reqwest::Method::DELETE
+        },
+        &format!("/api/v1/os/trusted-teams/{team_id}"),
+        None,
+        Duration::from_secs(10),
+        false,
+    )
+    .await;
+    let out = match sent {
+        Ok(res) if res.status.is_success() => {
+            let body = res.json_value().await;
+            for team in body["teams"]
+                .as_array()
+                .ok_or("invalid trusted teams response")?
+            {
+                println!(
+                    "{}{}",
+                    team["team_id"].as_str().ok_or("missing Team ID")?,
+                    if team["builtin"] == true {
+                        " (内置，不可移除)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Ok(())
+        }
+        Ok(res) => {
+            let status = res.status;
+            let body = res.json_value().await;
+            Err(if body["error"]["message"].as_str().is_some() {
+                daemon_error_line(&body)
+            } else if let Some(message) = body["message"].as_str() {
+                message.to_owned()
+            } else {
+                format!("daemon returned {status}")
+            })
+        }
+        Err(e) => Err(e.parts().1),
+    };
+    finish(ep).await;
+    out
 }
 
 /// `agent24 os attach …` (A3-2a). Always goes through the daemon — see
