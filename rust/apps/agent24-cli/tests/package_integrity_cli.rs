@@ -5,7 +5,8 @@ use std::{fs, process::Command};
 fn package_integrity_cli_generates_verifies_and_reports_relative_failure() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(dir.path().join("bin")).unwrap();
-    fs::write(dir.path().join("bin/demo"), b"not executable code").unwrap();
+    let current = std::env::current_exe().unwrap();
+    fs::copy(current, dir.path().join("bin/demo")).unwrap();
     fs::write(dir.path().join("domain-os.yml"), "name: demo\nversion: '1.0.0'\nroute_namespace: /api/v1/demo\nevent_module: demo\ndata_dir: ~/.agent24/os/demo/\nkernel_capabilities: [events]\nimpl_kind: out_of_process_provider\nspawn:\n  command: bin/demo\n").unwrap();
     let run = |action: &str| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_agent24"));
