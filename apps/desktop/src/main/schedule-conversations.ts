@@ -34,9 +34,6 @@ const ID = /^[A-Za-z0-9_-]{1,128}$/
 const MAX_NAME = 200
 /** How many schedules' conversations the file keeps: the oldest goes first. */
 const MAX_BINDINGS = 1000
-/** How many handled runs the file keeps, the oldest going first: an hourly
- *  schedule takes over two years to pass it. */
-export const MAX_HANDLED = 20_000
 
 export interface ScheduleConversationsDeps {
   /** Where the file goes (the app's userData). */
@@ -74,9 +71,14 @@ export interface ScheduleConversations {
 type Bindings = Record<string, string>
 interface State {
   bindings: Bindings
-  /** The schedules' runs recorded already, oldest first; null until the
-   *  first catch-up. */
+  /** The schedules' runs recorded already; null until the first catch-up.
+   *  Each catch-up keeps only those the daemon still has, so it never holds
+   *  more than the daemon does (Codex A5 r3 C1). */
   handled: string[] | null
+  /** Runs heard of live before the first catch-up that could not be
+   *  recorded: that catch-up records them rather than take them as handled
+   *  (Codex A5 r3 C2). */
+  retry: string[]
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -84,7 +86,7 @@ const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'obj
 export function createScheduleConversations(deps: ScheduleConversationsDeps): ScheduleConversations {
   const file = path.join(deps.dir, FILE_NAME)
   const read = (): State => {
-    const none: State = { bindings: {}, handled: null }
+    const none: State = { bindings: {}, handled: null, retry: [] }
     try {
       const v = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown
       if (!isObject(v) || v.format !== SCHEDULE_CONVERSATIONS_FORMAT || v.version !== SCHEDULE_CONVERSATIONS_VERSION) return none
@@ -93,8 +95,9 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
       for (const [schedule, conversation] of Object.entries(v.bindings)) {
         if (ID.test(schedule) && typeof conversation === 'string' && CHAT_HISTORY_ID.test(conversation)) bindings[schedule] = conversation
       }
-      const handled = Array.isArray(v.handled) ? v.handled.filter((id): id is string => typeof id === 'string' && ID.test(id)) : null
-      return { bindings, handled }
+      const ids = (list: unknown): string[] | null =>
+        (Array.isArray(list) ? list.filter((id): id is string => typeof id === 'string' && ID.test(id)) : null)
+      return { bindings, handled: ids(v.handled), retry: ids(v.retry) ?? [] }
     } catch {
       return none
     }
@@ -102,10 +105,11 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
   const write = (state: State): void => {
     const entries = Object.entries(state.bindings)
     const bindings = Object.fromEntries(entries.slice(Math.max(0, entries.length - MAX_BINDINGS)))
-    const handled = state.handled && state.handled.slice(Math.max(0, state.handled.length - MAX_HANDLED))
     const temp = `${file}.${randomBytes(6).toString('hex')}.tmp`
     try {
-      fs.writeFileSync(temp, JSON.stringify({ format: SCHEDULE_CONVERSATIONS_FORMAT, version: SCHEDULE_CONVERSATIONS_VERSION, bindings, handled }))
+      fs.writeFileSync(temp, JSON.stringify({
+        format: SCHEDULE_CONVERSATIONS_FORMAT, version: SCHEDULE_CONVERSATIONS_VERSION, bindings, handled: state.handled, retry: state.retry,
+      }))
       fs.renameSync(temp, file)
     } finally {
       fs.rmSync(temp, { force: true })
@@ -118,6 +122,18 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
 
   const recordNow = async (scheduleId: string, runId: string): Promise<ChatHistorySummary | null> => {
     const state = read()
+    // Recorded already (by a catch-up, or heard of twice): its conversation
+    // may have been deleted since, and stays so (Codex A5 r3 C3).
+    if (state.handled?.includes(runId)) return null
+    try {
+      return await recordIn(state, scheduleId, runId)
+    } catch (err) {
+      const now = read()
+      if (now.handled === null && !now.retry.includes(runId)) write({ ...now, retry: [...now.retry, runId] })
+      throw err
+    }
+  }
+  const recordIn = async (state: State, scheduleId: string, runId: string): Promise<ChatHistorySummary | null> => {
     let conversation = state.bindings[scheduleId]
     if (!onFile(conversation)) {
       const name = (await deps.scheduleName(scheduleId).catch(() => null))?.trim().slice(0, MAX_NAME) || scheduleId
@@ -143,13 +159,19 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
       // Oldest first: a schedule's conversation starts with its first run.
       .sort((a, b) => (Date.parse(a.created_at) || 0) - (Date.parse(b.created_at) || 0))
     const state = read()
+    const there = new Set(due.map(r => r.id))
     if (state.handled === null) {
       // The first time: what is there already is from before main recorded
-      // schedules' runs, and stays out.
-      write({ ...state, handled: due.map(r => r.id) })
-      return
+      // schedules' runs, and stays out; but not the runs heard of live since
+      // that could not be recorded.
+      const retry = new Set(state.retry)
+      write({ ...state, handled: due.map(r => r.id).filter(id => !retry.has(id)), retry: [] })
+    } else {
+      // Only what the daemon still has: a run it no longer lists cannot come
+      // back in a catch-up.
+      write({ ...state, handled: state.handled.filter(id => there.has(id)) })
     }
-    const handled = new Set(state.handled)
+    const handled = new Set(read().handled)
     for (const r of due) {
       if (handled.has(r.id)) continue
       try {

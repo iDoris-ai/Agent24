@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createChatHistoryStore, onChatHistoryChange } from './chat-history'
-import { createScheduleConversations, MAX_HANDLED, SCHEDULE_CONVERSATIONS_FORMAT, SCHEDULE_CONVERSATIONS_VERSION } from './schedule-conversations'
+import { createScheduleConversations, SCHEDULE_CONVERSATIONS_FORMAT, SCHEDULE_CONVERSATIONS_VERSION } from './schedule-conversations'
 
 // M4 A5: a schedule's runs go to the schedule's conversation, against the
 // real chat history store.
@@ -196,16 +196,40 @@ describe('schedule conversations (M4 A5)', () => {
       expect(history.get(history.list()[0].id)!.runs.map(r => r.run_id)).toEqual(['run_4'])
     })
 
-    it('keeps the newest handled runs when there are too many', async () => {
-      fs.writeFileSync(path.join(dir, 'schedule-conversations.json'), JSON.stringify({
-        format: SCHEDULE_CONVERSATIONS_FORMAT, version: SCHEDULE_CONVERSATIONS_VERSION, bindings: {},
-        handled: Array.from({ length: MAX_HANDLED }, (_, i) => `run_${i}`),
-      }))
-      await homes().record('sch_1', 'run_new')
-      const handled = file().handled
-      expect(handled).toHaveLength(MAX_HANDLED)
-      expect(handled[0]).toBe('run_1')
-      expect(handled.at(-1)).toBe('run_new')
+    it('keeps as handled only the runs the daemon still has, so none comes back (Codex A5 r3 C1)', async () => {
+      const m = homes()
+      await m.catchUp(async () => [row('run_1', 'sch_1'), row('run_2', 'sch_1')])
+      expect(file().handled).toEqual(['run_1', 'run_2'])
+      // The daemon no longer has run_1.
+      await m.catchUp(async () => [row('run_2', 'sch_1'), row('run_3', 'sch_1')])
+      expect(file().handled).toEqual(['run_2', 'run_3'])
+      // Recorded once, and not again at the next catch-up.
+      const [one] = history.list()
+      expect(history.get(one.id)!.runs.map(r => r.run_id)).toEqual(['run_3'])
+      history.delete(one.id)
+      await m.catchUp(async () => [row('run_2', 'sch_1'), row('run_3', 'sch_1')])
+      expect(history.list()).toHaveLength(0)
+    })
+
+    it('records, at the first catch-up, a run heard of live before it that could not be recorded (Codex A5 r3 C2)', async () => {
+      const m = homes()
+      vi.spyOn(history, 'appendRun').mockImplementationOnce(() => { throw new Error('disk full') })
+      await expect(m.record('sch_1', 'run_live')).rejects.toThrow('disk full')
+      expect(file().retry).toEqual(['run_live'])
+      await m.catchUp(async () => [row('run_old', 'sch_1'), row('run_live', 'sch_1')])
+      expect(file()).toMatchObject({ handled: ['run_old', 'run_live'], retry: [] })
+      const [one] = history.list()
+      expect(history.get(one.id)!.runs.map(r => r.run_id)).toEqual(['run_live'])
+    })
+
+    it('does not bring back a deleted conversation for a run heard of live after a catch-up recorded it (Codex A5 r3 C3)', async () => {
+      const m = homes()
+      await m.catchUp(async () => [])
+      await m.catchUp(async () => [row('run_1', 'sch_1')])
+      history.delete(history.list()[0].id)
+      // Its run.started was queued behind that catch-up.
+      expect(await m.record('sch_1', 'run_1')).toBeNull()
+      expect(history.list()).toHaveLength(0)
     })
   })
 })
