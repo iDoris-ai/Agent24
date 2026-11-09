@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -235,68 +235,95 @@ fn verify_declared(
     Ok(())
 }
 
-fn native_executable<'data, R: object::read::ReadRef<'data>>(data: R, platform: &str) -> bool {
-    use object::{FileKind, Object, ObjectKind};
-    let Ok(kind) = FileKind::parse(data) else {
-        return false;
-    };
-    if !matches!(
-        (platform, kind),
-        ("macos", FileKind::MachO32 | FileKind::MachO64)
-            | ("linux", FileKind::Elf32 | FileKind::Elf64)
-            | ("windows", FileKind::Pe32 | FileKind::Pe64)
-    ) {
-        return false;
-    }
-    let Ok(file) = object::File::parse(data) else {
-        return false;
-    };
-    // object 0.36 tolerates failed Mach-O load-command reads during File::parse.
-    // Explicitly consume its checked iterator so truncated commands are rejected.
-    let commands = match &file {
-        object::File::MachO32(file) => Some(file.macho_load_commands()),
-        object::File::MachO64(file) => Some(file.macho_load_commands()),
-        _ => None,
-    };
-    if let Some(commands) = commands {
-        let valid = commands.and_then(|mut commands| {
-            while commands.next()?.is_some() {}
-            Ok(())
-        });
-        if valid.is_err() {
-            return false;
-        }
-    }
-    if platform == "linux" {
-        // PIE uses ET_DYN too; a nonzero entry excludes ordinary shared libraries.
-        matches!(file.kind(), ObjectKind::Executable | ObjectKind::Dynamic) && file.entry() != 0
-    } else {
-        file.kind() == ObjectKind::Executable
-    }
-}
-
-fn native_macho_slice(cache: &object::read::ReadCache<File>, offset: u64, size: u64) -> bool {
-    use object::read::ReadRef;
-    if offset
-        .checked_add(size)
-        .zip(cache.len().ok())
-        .is_none_or(|(end, len)| end > len)
-    {
-        return false;
-    }
-    // A bounded view avoids copying an entire potentially large arch into memory.
-    native_executable(cache.range(offset, size), "macos")
-}
-
-/// Real fat binaries carry a handful of slices; more is a crafted file.
+const HEADER_WINDOW: usize = 1024 * 1024;
 const MAX_FAT_ARCHES: usize = 32;
 
-/// Parse only the slice for this machine's architecture. Every slice parse reads
-/// its load commands through the shared cache, so walking all slices would let a
-/// file of many overlapping slices multiply memory use; one slice bounds it to a
-/// single read within the file.
+fn native_macho<H: object::read::macho::MachHeader>(data: &[u8]) -> bool {
+    let Ok(header) = H::parse(data, 0) else {
+        return false;
+    };
+    let Ok(endian) = header.endian() else {
+        return false;
+    };
+    if header.filetype(endian) != object::macho::MH_EXECUTE {
+        return false;
+    }
+    // load_commands checks sizeofcmds against this bounded window, even with no commands.
+    let Ok(mut commands) = header.load_commands(endian, data, 0) else {
+        return false;
+    };
+    loop {
+        match commands.next() {
+            Ok(Some(_)) => {}
+            Ok(None) => return true,
+            Err(_) => return false,
+        }
+    }
+}
+
+fn native_elf<H: object::read::elf::FileHeader>(data: &[u8]) -> bool {
+    let Ok(header) = H::parse(data) else {
+        return false;
+    };
+    let Ok(endian) = header.endian() else {
+        return false;
+    };
+    matches!(
+        header.e_type(endian),
+        object::elf::ET_EXEC | object::elf::ET_DYN
+    ) && header.e_entry(endian).into() != 0
+}
+
+fn native_pe<H: object::read::pe::ImageNtHeaders>(data: &[u8]) -> bool {
+    let Ok(dos) = object::pe::ImageDosHeader::parse(data) else {
+        return false;
+    };
+    let Ok((header, _)) = H::parse(data, &mut u64::from(dos.nt_headers_offset())) else {
+        return false;
+    };
+    let flags = header
+        .file_header()
+        .characteristics
+        .get(object::LittleEndian);
+    flags & object::pe::IMAGE_FILE_EXECUTABLE_IMAGE != 0 && flags & object::pe::IMAGE_FILE_DLL == 0
+}
+
+fn native_executable(data: &[u8], platform: &str) -> bool {
+    use object::{Endianness, FileKind};
+    let data = &data[..data.len().min(HEADER_WINDOW)];
+    match (platform, FileKind::parse(data)) {
+        ("macos", Ok(FileKind::MachO32)) => {
+            native_macho::<object::macho::MachHeader32<Endianness>>(data)
+        }
+        ("macos", Ok(FileKind::MachO64)) => {
+            native_macho::<object::macho::MachHeader64<Endianness>>(data)
+        }
+        ("linux", Ok(FileKind::Elf32)) => native_elf::<object::elf::FileHeader32<Endianness>>(data),
+        ("linux", Ok(FileKind::Elf64)) => native_elf::<object::elf::FileHeader64<Endianness>>(data),
+        ("windows", Ok(FileKind::Pe32)) => native_pe::<object::pe::ImageNtHeaders32>(data),
+        ("windows", Ok(FileKind::Pe64)) => native_pe::<object::pe::ImageNtHeaders64>(data),
+        _ => false,
+    }
+}
+
+fn read_header(reader: &mut impl Read, size: u64) -> io::Result<Vec<u8>> {
+    let mut window = vec![0; size.min(HEADER_WINDOW as u64) as usize];
+    let mut filled = 0;
+    while filled < window.len() {
+        match reader.read(&mut window[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    window.truncate(filled);
+    Ok(window)
+}
+
+/// Only the host slice is read; the container and slice each own at most one window.
 fn native_fat_slice<A: object::read::macho::FatArch>(
-    cache: &object::read::ReadCache<File>,
+    reader: &mut (impl Read + Seek),
     arches: &[A],
 ) -> bool {
     let host = if cfg!(target_arch = "aarch64") {
@@ -314,27 +341,42 @@ fn native_fat_slice<A: object::read::macho::FatArch>(
         .find(|arch| arch.architecture() == host)
         .is_some_and(|arch| {
             let (offset, size) = arch.file_range();
-            native_macho_slice(cache, offset, size)
+            if offset
+                .checked_add(size)
+                .zip(reader.seek(SeekFrom::End(0)).ok())
+                .is_none_or(|(end, len)| end > len)
+            {
+                return false;
+            }
+            reader.seek(SeekFrom::Start(offset)).is_ok()
+                && read_header(reader, size).is_ok_and(|window| native_executable(&window, "macos"))
         })
 }
 
-fn check_native_executable(path: &Path, rel_path: &str) -> Result<(), IntegrityError> {
+fn native_reader(reader: &mut (impl Read + Seek), platform: &str) -> bool {
     use object::read::macho::{MachOFatFile32, MachOFatFile64};
+    let Ok(window) = read_header(reader, u64::MAX) else {
+        return false;
+    };
+    match object::FileKind::parse(window.as_slice()) {
+        Ok(object::FileKind::MachOFat32) if platform == "macos" => {
+            MachOFatFile32::parse(window.as_slice())
+                .is_ok_and(|fat| native_fat_slice(reader, fat.arches()))
+        }
+        Ok(object::FileKind::MachOFat64) if platform == "macos" => {
+            MachOFatFile64::parse(window.as_slice())
+                .is_ok_and(|fat| native_fat_slice(reader, fat.arches()))
+        }
+        _ => native_executable(&window, platform),
+    }
+}
+
+fn check_native_executable(path: &Path, rel_path: &str) -> Result<(), IntegrityError> {
     // generate/verify have already rejected symlinks via collect_payload/verify_tree.
-    let file = File::open(path).map_err(|err| IntegrityError::CheckFailed {
+    let mut file = File::open(path).map_err(|err| IntegrityError::CheckFailed {
         detail: format!("{rel_path}: {err}"),
     })?;
-    let cache = object::read::ReadCache::new(file);
-    let native = match object::FileKind::parse(&cache) {
-        Ok(object::FileKind::MachOFat32) if cfg!(target_os = "macos") => {
-            MachOFatFile32::parse(&cache).is_ok_and(|fat| native_fat_slice(&cache, fat.arches()))
-        }
-        Ok(object::FileKind::MachOFat64) if cfg!(target_os = "macos") => {
-            MachOFatFile64::parse(&cache).is_ok_and(|fat| native_fat_slice(&cache, fat.arches()))
-        }
-        _ => native_executable(&cache, std::env::consts::OS),
-    };
-    if !native {
+    if !native_reader(&mut file, std::env::consts::OS) {
         return Err(IntegrityError::NotNativeExecutable {
             path: rel_path.to_owned(),
         });
@@ -1226,20 +1268,105 @@ mod tests {
     }
 
     #[test]
-    fn native_pe_dll_is_rejected_and_large_header_offset_is_accepted() {
-        // A PE32+ header beyond the old 4096-byte read limit.
-        let offset = 8192;
-        let mut pe = vec![0; offset + 264];
-        pe[..2].copy_from_slice(b"MZ");
-        pe[60..64].copy_from_slice(&(offset as u32).to_le_bytes());
-        pe[offset..offset + 4].copy_from_slice(b"PE\0\0");
-        pe[offset + 4..offset + 6].copy_from_slice(&0x8664u16.to_le_bytes());
-        pe[offset + 20..offset + 22].copy_from_slice(&240u16.to_le_bytes());
-        pe[offset + 22..offset + 24].copy_from_slice(&2u16.to_le_bytes());
-        pe[offset + 24..offset + 26].copy_from_slice(&0x20bu16.to_le_bytes());
-        assert!(native_executable(pe.as_slice(), "windows"));
-        pe[offset + 22..offset + 24].copy_from_slice(&0x2002u16.to_le_bytes());
-        assert!(!native_executable(pe.as_slice(), "windows"));
+    fn native_pe_dll_and_header_window_are_checked() {
+        for offset in [8192, HEADER_WINDOW - 128, HEADER_WINDOW + 8] {
+            let mut pe = vec![0; offset + 264];
+            pe[..2].copy_from_slice(b"MZ");
+            pe[60..64].copy_from_slice(&(offset as u32).to_le_bytes());
+            pe[offset..offset + 4].copy_from_slice(b"PE\0\0");
+            pe[offset + 4..offset + 6].copy_from_slice(&0x8664u16.to_le_bytes());
+            pe[offset + 20..offset + 22].copy_from_slice(&240u16.to_le_bytes());
+            pe[offset + 22..offset + 24].copy_from_slice(&2u16.to_le_bytes());
+            pe[offset + 24..offset + 26].copy_from_slice(&0x20bu16.to_le_bytes());
+            assert_eq!(native_executable(&pe, "windows"), offset == 8192);
+            pe[offset + 22..offset + 24].copy_from_slice(&0x2002u16.to_le_bytes());
+            assert!(!native_executable(&pe, "windows"));
+            pe[offset + 22..offset + 24].fill(0);
+            assert!(!native_executable(&pe, "windows"));
+        }
+    }
+
+    fn macho_header(commands: u32, size: u32) -> Vec<u8> {
+        let mut bytes = vec![0; 32];
+        bytes[..4].copy_from_slice(&0xfeedfacfu32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&object::macho::MH_EXECUTE.to_le_bytes());
+        bytes[16..20].copy_from_slice(&commands.to_le_bytes());
+        bytes[20..24].copy_from_slice(&size.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn native_macho_commands_must_fit_window() {
+        let mut bytes = macho_header(0, HEADER_WINDOW as u32);
+        bytes.resize(HEADER_WINDOW + 32, 0);
+        assert!(!native_executable(&bytes, "macos"));
+        bytes[20..24].copy_from_slice(&((HEADER_WINDOW - 32) as u32).to_le_bytes());
+        assert!(native_executable(&bytes, "macos"));
+    }
+
+    #[test]
+    fn native_macho_malformed_command_is_rejected() {
+        let mut bytes = macho_header(1, 8);
+        bytes.extend_from_slice(&[0; 8]);
+        assert!(!native_executable(&bytes, "macos"));
+    }
+
+    #[test]
+    fn native_overlapping_symtabs_read_at_most_two_windows() {
+        struct CountingReader {
+            inner: io::Cursor<Vec<u8>>,
+            read: usize,
+            interrupted: bool,
+        }
+        impl Read for CountingReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let limit = buf.len().min(8191);
+                let n = self.inner.read(&mut buf[..limit])?;
+                self.read += n;
+                Ok(n)
+            }
+        }
+        impl Seek for CountingReader {
+            fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+                self.inner.seek(pos)
+            }
+        }
+        let mut bytes = macho_header(128, 128 * 24);
+        for _ in 0..128 {
+            for field in [
+                object::macho::LC_SYMTAB,
+                24,
+                HEADER_WINDOW as u32,
+                65536,
+                HEADER_WINDOW as u32,
+                1048576,
+            ] {
+                bytes.extend_from_slice(&field.to_le_bytes());
+            }
+        }
+        bytes.resize(4 * HEADER_WINDOW, 0);
+        let host = if cfg!(target_arch = "aarch64") {
+            0x0100_000c
+        } else {
+            0x0100_0007
+        };
+        for data in [bytes.clone(), fat32_with(&[host], &bytes)] {
+            let mut reader = CountingReader {
+                inner: io::Cursor::new(data),
+                read: 0,
+                interrupted: false,
+            };
+            assert!(native_reader(&mut reader, "macos"));
+            assert!(
+                reader.read <= 2 * HEADER_WINDOW,
+                "read {} bytes",
+                reader.read
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1254,7 +1381,6 @@ mod tests {
         rejects_native_bytes(&bytes);
     }
 
-    #[cfg(target_os = "macos")]
     /// A fat32 container whose every slice points at the same embedded binary.
     fn fat32_with(cputypes: &[u32], binary: &[u8]) -> Vec<u8> {
         let mut fat = Vec::new();
