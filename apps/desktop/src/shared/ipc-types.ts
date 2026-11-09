@@ -148,6 +148,10 @@ export const IpcChannels = {
   KnowledgeEntryDraftUpdate: 'knowledge-entry:draft-update',
   KnowledgeEntryDraftRedact: 'knowledge-entry:draft-redact',
   KnowledgeEntryDraftWithdraw: 'knowledge-entry:draft-withdraw',
+  // KB-SOP-01b (#1670): submit for review, read it back, withdraw the submission (the local draft stays).
+  KnowledgeEntrySubmit: 'knowledge-entry:submit',
+  KnowledgeEntrySubmitStatus: 'knowledge-entry:submit-status',
+  KnowledgeEntrySubmitRetract: 'knowledge-entry:submit-retract',
 } as const
 
 /** T1-1/T1-2: the documents module as it is on disk now. A daemon reads
@@ -253,7 +257,49 @@ export interface KnowledgeEntryDraftView extends KnowledgeEntryDraftSummary {
   message_to: number
   created_at: string
   content_sha256: string
+  /** The first restricted-Markdown problem (CONTRACT-OPS-v2 W8.2), judged now; any one blocks submission. */
+  format: KnowledgeEntryFormatProblem | null
+  /** KB-SOP-01b: this draft's submission, if it has been sent. */
+  submission: KnowledgeEntrySubmission
+  /** The knowledge bases the draft can be submitted to (the binding in effect). */
+  knowledge_base_ids: string[]
 }
+
+/** One of `knowledge-entry-markdown.ts`'s problem kinds, and its 1-based line. */
+export interface KnowledgeEntryFormatProblem {
+  kind: string
+  line: number
+}
+
+export type KnowledgeEntryCandidateStatus = 'submitted' | 'approved' | 'returned' | 'withdrawn'
+
+/** What the renderer learns of a submission: never the key, the request body or session_ref. */
+export interface KnowledgeEntrySubmission {
+  /** Sent, outcome not known yet (W1.5). */
+  pending: boolean
+  /** Pending and not to be resent (the binding or the credential changed, too long ago, or the record cannot be read): the user has to check. */
+  stuck: boolean
+  candidate: {
+    status: KnowledgeEntryCandidateStatus
+    target_knowledge_base_id: string
+    return_reason: string | null
+    note: string | null
+    submitted_at: string
+    checked_at: string
+    /** The local draft was edited after it was submitted. */
+    edited: boolean
+  } | null
+}
+
+export type KnowledgeEntrySubmitRefusal =
+  | 'not_found' | 'target_changed' | 'invalid_target' | 'findings' | 'unsupported_format'
+  | 'already_submitted' | 'already_approved' | 'busy' | 'local_storage' | 'knowledge_off' | 'outcome_unknown'
+
+export type KnowledgeEntrySubmitAnswer =
+  | { ok: true; submission: KnowledgeEntrySubmission }
+  | { ok: false; reason: KnowledgeEntrySubmitRefusal; problem?: KnowledgeEntryFormatProblem; submission?: KnowledgeEntrySubmission }
+  /** The server's answer, or a local one standing for it (`not_ready`, `cancelled`). `unknown`: it may have been carried out (W1.5). */
+  | { ok: false; reason: 'server'; code: string; serverReason?: string; unknown: boolean; submission: KnowledgeEntrySubmission }
 
 /** How the model step went; anything but `drafted` gave the empty template. */
 export type KnowledgeEntryModelOutcome = 'drafted' | 'no_model' | 'needs_confirmation' | 'busy' | 'failed' | 'unusable' | 'held_back'
