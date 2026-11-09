@@ -4,8 +4,9 @@
 // that switch (K-B3b) lets this unsigned client enrol and leaves the presence
 // provider alone, so every challenge comes over the presence connection to
 // `ask`. CI's desktop job has neither; the daemon side is covered in
-// rust/apps/agent24d. To do once K-B3b is in: the three summaries
-// (ApprovalDecision, ScheduleManage, Shutdown).
+// rust/apps/agent24d. The dialog text is the daemon's own (K-B3b): checked
+// here for Shutdown and ScheduleManage; an ApprovalDecision needs a pending
+// approval, which only a run can make, so here only its fail-closed side.
 
 import { describe, it, expect, afterEach, vi } from 'vitest'
 import { spawn, type ChildProcess } from 'node:child_process'
@@ -75,13 +76,40 @@ describe.skipIf(!bin || !unsigned || process.platform === 'win32')('a real servi
 
   const deps = { connection: daemonConnection, elevation: daemonElevation }
   const stop = { method: 'POST' as const, path: '/api/v1/idoris/stop' }
+  /** What the presence box shows: the daemon's prefix, then its own text (never main's fallback). */
+  const says = (text: string) => `ai.auraai.agent24 (pid ${process.pid}) wants to: ${text}`
 
-  it('allow: the challenge comes over the presence connection, and the elevated route goes through', async () => {
+  it('allow: the challenge comes over the presence connection with the daemon\'s shutdown text, and shutdown is accepted (202)', async () => {
     const { ask } = await start('allow')
-    const res = await sendElevating(stop, {}, deps)
-    expect(res.status).not.toBe(403)
+    const shutdown = { method: 'POST' as const, path: '/api/v1/shutdown' }
+    const res = await sendElevating(shutdown, {}, deps)
+    expect(res.status).toBe(202)
     expect(ask).toHaveBeenCalledTimes(1)
-    expect(ask.mock.calls[0]![0]).toMatchObject(stop)
+    expect(ask.mock.calls[0]![0]).toMatchObject(shutdown)
+    expect(ask.mock.calls[0]![0].summary).toBe(says('stop the Agent24 background service (running work stops)'))
+  }, 90_000)
+
+  it('schedule create and delete: each asked once, with the daemon\'s text naming the schedule', async () => {
+    const { ask } = await start('allow')
+    const body = { name: 'b3-check', spec: { type: 'every', secs: 3600 }, action: { type: 'agent_run', prompt: 'not shown' } }
+    const created = await sendElevating({ method: 'POST', path: '/api/v1/schedules', body }, {}, deps)
+    expect(created.status).toBe(201)
+    expect(ask).toHaveBeenCalledTimes(1)
+    expect(ask.mock.calls[0]![0].summary).toBe(says('create schedule "b3-check" (every 3600 s; enabled)'))
+    const id = (created.data as { id: string }).id
+    const deleted = await sendElevating({ method: 'DELETE', path: `/api/v1/schedules/${id}` }, {}, deps)
+    expect(deleted.status).toBe(204)
+    expect(ask).toHaveBeenCalledTimes(2)
+    expect(ask.mock.calls[1]![0]).toMatchObject({ method: 'DELETE', path: `/api/v1/schedules/${id}` })
+    expect(ask.mock.calls[1]![0].summary).toBe(says(`delete schedule "b3-check" ("${id}")`))
+  }, 90_000)
+
+  it('an approval decision the daemon has no record of: not asked, refused not_elevated_operation', async () => {
+    const { ask } = await start('allow')
+    const res = await sendElevating({ method: 'POST', path: '/api/v1/approvals/none', body: { type: 'approve' } }, {}, deps)
+    expect(res.status).toBe(403)
+    expect((res.data as { error: { code: string } }).error.code).toBe('not_elevated_operation')
+    expect(ask).not.toHaveBeenCalled()
   }, 90_000)
 
   it('deny: 403 presence_denied, asked once, nothing retried', async () => {
