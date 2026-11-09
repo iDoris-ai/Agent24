@@ -1226,9 +1226,13 @@ mod tests {
     #[test]
     fn native_truncated_executables_are_rejected() {
         let bytes = fs::read(std::env::current_exe().unwrap()).unwrap();
-        for len in [16, 32, 64] {
+        for len in [16, 32] {
             rejects_native_bytes(&bytes[..len]);
         }
+        // A 64-byte prefix is a complete ELF64 header, which is all the Linux
+        // check reads; on macOS the load commands it also requires are cut off.
+        #[cfg(target_os = "macos")]
+        rejects_native_bytes(&bytes[..64]);
     }
 
     #[test]
@@ -1419,6 +1423,9 @@ mod tests {
         rejects_native_bytes(&fat32_with(&many, &bytes));
     }
 
+    // Wraps the current test binary in a Mach-O fat container: only meaningful
+    // where that binary is itself Mach-O.
+    #[cfg(target_os = "macos")]
     #[test]
     fn native_fat_slices_are_parsed() {
         let bytes = fs::read(std::env::current_exe().unwrap()).unwrap();
