@@ -166,6 +166,29 @@ describe('submit (W8.2)', () => {
     expect(() => t.draft({ title: 'x\uD800' })).toThrow()
   })
 
+  it('HS2: a combining mark after an encoded [ or ] is refused at save, never stored as a draft that then vanishes', async () => {
+    const t = setup()
+    for (const body of ['[a](https://e.org/[\u0307x])', '[a](https://e.org/x]\u0307)', '[r]: https://e.org/[\u0323]']) {
+      expect(() => t.draft({ body })).toThrow()
+    }
+    expect(t.drafts.list()).toHaveLength(0)
+    // The same mark elsewhere, or after an encoded parenthesis, is fine: NFC is stable.
+    const ok = t.draft({ body: 'B\u0307 [a](https://e.org/(\u0307x))' })
+    expect(ok.body).toBe('\u1E02 [a](https://e.org/%28\u0307x%29)')
+    expect(ok.body.normalize('NFC')).toBe(ok.body)
+    expect(t.drafts.get(ok.id)?.body).toBe(ok.body)
+    // An edit that would make it unstable is refused and the stored draft is kept.
+    expect(() => t.drafts.update(ok.id, { body: '[a](https://e.org/[\u0307])' })).toThrow()
+    expect(t.drafts.get(ok.id)?.body).toBe(ok.body)
+    expect(t.drafts.list()).toHaveLength(1)
+  })
+
+  it('HS2: NUL and a lone surrogate never become a draft', () => {
+    const t = setup()
+    expect(() => t.draft({ body: 'a\u0000b' })).toThrow()
+    expect(() => t.draft({ title: 'x\uD800' })).toThrow()
+  })
+
   it('HS3: after a restart, the unknown submit goes again with the same key and the same body', async () => {
     const first = setup({ submit: () => 'throw' })
     const d = first.draft()

@@ -105,6 +105,11 @@ function checkedContent(kind: unknown, title: unknown, body: unknown): { kind: E
   // destination are percent-encoded at save time, so the stored body is the
   // body sent and its hash is the one the server computes.
   const canonBody = encodeLinkBrackets(canonicalText(body, false))
+  // A combining mark right after an encoded `[` or `]` composes with the B or D
+  // of `%5B`/`%5D` under NFC (B + U+0307 is U+1E02). Such a body cannot be both
+  // NFC (W8.13) and encoded, and a stored one would fail isCanonical on read and
+  // vanish, so it is refused here, before anything is written.
+  if (canonBody.normalize('NFC') !== canonBody) fail()
   if (canonTitle.length < 1 || canonTitle.length > MAX_ENTRY_TITLE) fail()
   if (Buffer.byteLength(canonBody, 'utf8') > MAX_ENTRY_BODY) fail()
   return { kind, title: canonTitle, body: canonBody }
