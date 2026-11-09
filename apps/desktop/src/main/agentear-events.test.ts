@@ -4,6 +4,7 @@ import {
   parseAgentEarFrame,
   parseModelCallFrame,
   parseRunFrame,
+  parseScheduledRunFrame,
   parseModuleFrame,
   nextBackoffMs,
   AGENTEAR_MODULE_NAME,
@@ -323,5 +324,42 @@ describe('parseRunFrame', () => {
     ['no JSON', 'not json'],
   ])('ignores %s', (_name, raw) => {
     expect(parseRunFrame(raw)).toBeNull()
+  })
+})
+
+// M4 A5: a schedule's run starting, for the schedule's conversation.
+describe('parseScheduledRunFrame', () => {
+  const frame = (type: string, payload: unknown) => JSON.stringify({ v: 1, seq: 7, ts: '2026-11-09T00:00:00Z', type, payload })
+
+  it('passes on the schedule and the run of a run.started a schedule started', () => {
+    expect(parseScheduledRunFrame(frame('run.started', { run_id: 'run_1', session_id: 'sess_1', schedule_id: 'sch_1' })))
+      .toEqual({ schedule_id: 'sch_1', run_id: 'run_1' })
+  })
+
+  it.each([
+    ['a run no schedule started', frame('run.started', { run_id: 'run_1', session_id: 'sess_1', schedule_id: null })],
+    ['another event of a schedule\'s run', frame('run.completed', { run_id: 'run_1', schedule_id: 'sch_1' })],
+    ['schedule.fired (run_now does not send it)', frame('schedule.fired', { run_id: 'run_1', schedule_id: 'sch_1' })],
+    ['no run id', frame('run.started', { schedule_id: 'sch_1' })],
+    ['an empty schedule id', frame('run.started', { run_id: 'run_1', schedule_id: '' })],
+    ['no payload', JSON.stringify({ type: 'run.started' })],
+    ['not JSON', '{'],
+  ])('passes on nothing for %s', (_what, raw) => {
+    expect(parseScheduledRunFrame(raw)).toBeNull()
+  })
+
+  it('routes it to onScheduledRun, besides onRunEvent', () => {
+    const onRunEvent = vi.fn()
+    const onScheduledRun = vi.fn()
+    const bridge = new AgentEarEventBridge(() => {}, undefined, undefined, onRunEvent, onScheduledRun)
+    bridge.start()
+    const socket = (bridge as unknown as { socket: { emit(e: string, d: unknown): void } }).socket
+    socket.emit('message', Buffer.from(frame('run.started', { run_id: 'run_1', schedule_id: 'sch_1' })))
+    socket.emit('message', Buffer.from(frame('run.started', { run_id: 'run_2', schedule_id: null })))
+    expect(onScheduledRun).toHaveBeenCalledTimes(1)
+    expect(onScheduledRun).toHaveBeenCalledWith({ schedule_id: 'sch_1', run_id: 'run_1' })
+    // The window still hears only the type and the run.
+    expect(onRunEvent).toHaveBeenCalledWith({ type: 'run.started', run_id: 'run_1' })
+    bridge.stop()
   })
 })

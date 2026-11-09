@@ -133,6 +133,26 @@ export function parseRunFrame(raw: string): RunEvent | null {
   return { type: msg['type'] as RunEvent['type'], run_id: payload['run_id'] }
 }
 
+/** M4 A5: a schedule's run starting, from one WS text frame: `run.started`
+ *  with the schedule's id (null for a run no schedule started), or null.
+ *  For main's own record of the run (schedule-conversations.ts); nothing of
+ *  it goes to the window. */
+export function parseScheduledRunFrame(raw: string): { schedule_id: string; run_id: string } | null {
+  let msg: unknown
+  try {
+    msg = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (!isPlainObject(msg) || msg['type'] !== 'run.started') return null
+  const payload = msg['payload']
+  if (!isPlainObject(payload)) return null
+  const runId = payload['run_id']
+  const scheduleId = payload['schedule_id']
+  if (typeof runId !== 'string' || runId === '' || typeof scheduleId !== 'string' || scheduleId === '') return null
+  return { schedule_id: scheduleId, run_id: runId }
+}
+
 /** Reconnecting WS client. Kept deliberately dumb: no queueing, no
  *  persistence (design §7.3/Q4 — Agent24 never persists transcript, and
  *  losing in-flight events across a reconnect is acceptable for this P2
@@ -153,6 +173,8 @@ export class AgentEarEventBridge {
     private readonly onModuleEvent?: (event: ModuleEvent) => void,
     // M4 A3: every run's and approval's change, for the history list.
     private readonly onRunEvent?: (event: RunEvent) => void,
+    // M4 A5: a schedule's run starting, for its conversation.
+    private readonly onScheduledRun?: (run: { schedule_id: string; run_id: string }) => void,
   ) {}
 
   start(): void {
@@ -204,6 +226,8 @@ export class AgentEarEventBridge {
       if (moduleEvent !== null) this.onModuleEvent?.(moduleEvent)
       const runEvent = this.onRunEvent ? parseRunFrame(raw) : null
       if (runEvent !== null) this.onRunEvent?.(runEvent)
+      const scheduledRun = this.onScheduledRun ? parseScheduledRunFrame(raw) : null
+      if (scheduledRun !== null) this.onScheduledRun?.(scheduledRun)
     })
     socket.on('close', () => {
       if (this.socket === socket) this.socket = null

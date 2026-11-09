@@ -4,8 +4,10 @@ import { app, BrowserWindow, dialog, Menu, Tray, WebContentsView, nativeImage, n
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { onChatHistoryChange } from './chat-history'
+import { createScheduleConversations, type ScheduleConversations } from './schedule-conversations'
+import { proxyRequest } from './backend-proxy'
 import { registerCliTool } from './ipc/cli-tool'
-import { getMainLocale, initMainLocale, onMainLocaleChange } from './main-i18n'
+import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonConnection, onDaemonReady, setBundledPackaged } from './backend-manager'
@@ -85,7 +87,30 @@ const agentEarBridge = new AgentEarEventBridge(
   },
   // M4 A3: runs' changes, for the history list's filters.
   (event) => { if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.RunEvent, event) },
+  // M4 A5: a schedule's run goes to the schedule's conversation, window or not.
+  (run) => {
+    scheduleConversations().record(run.schedule_id, run.run_id)
+      .catch((err) => console.error('[main] schedule run not recorded', run.schedule_id, run.run_id, err))
+  },
 )
+
+// M4 A5: made on the first schedule's run, once userData is settled.
+let scheduleConversationsStore: ScheduleConversations | null = null
+function scheduleConversations(): ScheduleConversations {
+  scheduleConversationsStore ??= createScheduleConversations({
+    dir: app.getPath('userData'),
+    history: createChatHistoryStore(app.getPath('userData')),
+    scheduleName: async (scheduleId) => {
+      const conn = daemonConnection()
+      if (!conn) return null
+      const res = await proxyRequest(conn, { method: 'GET', path: `/api/v1/schedules/${encodeURIComponent(scheduleId)}` }, { host: '127.0.0.1' })
+      const name = (res.data as { name?: unknown } | null)?.name
+      return res.ok && typeof name === 'string' ? name : null
+    },
+    title: (name) => mt('schedule.conversationTitle', { name }),
+  })
+  return scheduleConversationsStore
+}
 
 // FU-91: was hardcoded to 'http://localhost:5173' — if that port were taken
 // by another project, the window silently loaded whatever else was listening

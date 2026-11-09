@@ -18,7 +18,7 @@ let titleAnswer: (req: Req) => Promise<unknown>
 const titleCalls = () => proxy.mock.calls.map(c => c[0] as Req).filter(isTitle)
 
 let saved: Map<string, ChatHistoryRecord>
-const RANK = { prompt: 0, model: 1, user: 2 } as const
+const RANK = { prompt: 0, model: 1, schedule: 2, user: 3 } as const
 const summary = chatHistorySummary
 /** Behaves as main/chat-history.ts does: a stronger title on file wins. */
 const chatHistory = {

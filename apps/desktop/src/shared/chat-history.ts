@@ -44,10 +44,11 @@ export type ChatHistoryMessage =
   }
 
 /** Where a conversation's title came from, strongest first: the user's
- *  rename, a title the model wrote, or the first prompt cut short. A weaker
- *  title never replaces a stronger one (main/chat-history.ts). */
-export type ChatHistoryTitleSource = 'user' | 'model' | 'prompt'
-export const CHAT_HISTORY_TITLE_SOURCES: readonly ChatHistoryTitleSource[] = ['user', 'model', 'prompt']
+ *  rename, the schedule the conversation belongs to (M4 A5), a title the
+ *  model wrote, or the first prompt cut short. A weaker title never
+ *  replaces a stronger one (main/chat-history.ts). */
+export type ChatHistoryTitleSource = 'user' | 'schedule' | 'model' | 'prompt'
+export const CHAT_HISTORY_TITLE_SOURCES: readonly ChatHistoryTitleSource[] = ['user', 'schedule', 'model', 'prompt']
 
 export interface ChatHistoryRecord {
   format: typeof CHAT_HISTORY_FORMAT
