@@ -8,7 +8,7 @@ import { createChatHistoryStore } from '../../../main/chat-history'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../../shared/chat-history'
 import type { RunEvent } from '../../../shared/ipc-types'
 import { HandOver, TaskCards, elapsed, resetHandOversForTests } from './TaskCard'
-import { TASKS_NOT_STOPPED, clearConversations, deleteConversation, refreshHistory, resetHistoryStore, registerChatPage, saveConversation } from './history'
+import { TASKS_NOT_STOPPED, clearConversations, deleteConversation, refreshHistory, resetHistoryStore, registerChatPage, saveConversation, setActiveConversation, setChatBusy } from './history'
 import { resetRunStatusesForTests } from './run-status'
 import { setLocale } from '../../i18n'
 import ChatPage from '../Chat'
@@ -453,6 +453,22 @@ describe('deleting a conversation stops its tasks still going on (M4 A6, PR-Daem
     await clearing
     expect(starter).toHaveBeenCalledTimes(1)
     expect(store.list()).toEqual([])
+  })
+
+  it.each(['delete', 'clear'])('does not %s the open conversation when a reply starts in it while its tasks are stopped', async (what) => {
+    store.save(record('chat_a', '周报'))
+    store.promoteRun('chat_a', 'run_1')
+    await refreshHistory()
+    setActiveConversation('chat_a')
+    let stop!: () => void
+    proxy.mockImplementation(() => new Promise(resolve => { stop = () => resolve({ ok: true, status: 202, data: {} }) }))
+    const going = what === 'delete' ? deleteConversation('chat_a') : clearConversations()
+    await vi.waitFor(() => expect(stop).toBeTypeOf('function'))
+    setChatBusy(true)
+    stop()
+    await going
+    expect(store.get('chat_a')).not.toBeNull()
+    setChatBusy(false)
   })
 
   it('asks the daemon nothing for a conversation without tasks', async () => {
