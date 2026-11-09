@@ -11,7 +11,7 @@ import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i1
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, resolveRustBinary, setBundledPackaged } from './backend-manager'
-import { bundledDaemonVersion, ServiceUpgrader, serviceUpgradeDeps, upgradeService } from './resident-service'
+import { bundledDaemonVersion, ServiceUpgrader, serviceUpgradeDeps, upgradeService, upgradesFromBundle } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
@@ -68,7 +68,7 @@ setBundledPackaged(app.isPackaged)
 const backendManager = new BackendManager({ isPackaged: app.isPackaged })
 // M5 B5: the service daemon brought up to the agent24d this app ships.
 let bundledVersion: string | null = null
-void bundledDaemonVersion(resolveRustBinary(app.isPackaged)).then((v) => { bundledVersion = v })
+if (upgradesFromBundle(app.isPackaged, process.env)) void bundledDaemonVersion(resolveRustBinary(app.isPackaged)).then((v) => { bundledVersion = v })
 const serviceUpgrader = new ServiceUpgrader({
   bundled: () => bundledVersion,
   running: () => backendManager.serviceDaemonVersion(),
