@@ -4,7 +4,7 @@ import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
-import { bodySha256, enrol, EnrolError, MAX_FRAME_BYTES, ENROL_STEP_MS, SUMMARY_MAX_CHARS } from './daemon-enroll'
+import { bodySha256, enrol, EnrolError, MAX_FRAME_BYTES, ENROL_STEP_MS, SUMMARY_MAX_CHARS, type ElevateRequest, type EnrolSession } from './daemon-enroll'
 
 // A fake daemon on a real Unix socket: `script` runs once per connection with
 // helpers to read the client's frames and write raw lines.
@@ -259,6 +259,9 @@ describe('enrol (M5 B2, protocol v1)', () => {
 
 describe('elevate on the token connection (M5 B3)', () => {
   const GRANT = 'one-shot-grant-value'
+  /** Elevate in a turn, then `use` the grant in the same turn. */
+  const elevateIn = <T>(s: EnrolSession, r: ElevateRequest, use: (grant: string) => Promise<T>): Promise<T> =>
+    s.turn(async (elevate) => use(await elevate(r)))
   const request = { method: 'POST', path: '/api/v1/approvals/apr_1', body: '{"decision":"approve"}', summary: 'Agent24: POST /api/v1/approvals/apr_1' }
 
   /** A daemon that enrols, then answers each `elevate` with `reply(n)` and each renew with a token. */
@@ -288,7 +291,7 @@ describe('elevate on the token connection (M5 B3)', () => {
   it('asks with the method, path, body hash and summary, and runs `use` with the grant', async () => {
     const { session, got } = await daemon(() => granted())
     const used: string[] = []
-    await expect(session.elevate(request, async (g) => { used.push(g); return 'sent' })).resolves.toBe('sent')
+    await expect(elevateIn(session, request, async (g) => { used.push(g); return 'sent' })).resolves.toBe('sent')
     expect(used).toEqual([GRANT])
     expect(got).toEqual([{
       v: 1, op: 'elevate', method: 'POST', path: '/api/v1/approvals/apr_1',
@@ -300,7 +303,7 @@ describe('elevate on the token connection (M5 B3)', () => {
   it('hashes no body as the empty string, and cuts the summary at 200 characters, not UTF-16 units', async () => {
     expect(bodySha256('')).toBe('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
     const { session, got } = await daemon(() => granted())
-    await session.elevate({ ...request, body: '', summary: '😀'.repeat(250) }, async () => null)
+    await elevateIn(session, { ...request, body: '', summary: '😀'.repeat(250) }, async () => null)
     expect(Array.from(String(got[0]?.['summary']))).toHaveLength(SUMMARY_MAX_CHARS)
     expect(got[0]?.['body_sha256']).toBe(bodySha256(''))
   })
@@ -309,7 +312,7 @@ describe('elevate on the token connection (M5 B3)', () => {
     const { session, got } = await daemon(() => granted())
     const order: string[] = []
     let release!: () => void
-    const elevating = session.elevate(request, async () => {
+    const elevating = elevateIn(session, request, async () => {
       order.push('use')
       await new Promise<void>((r) => { release = r })
       order.push('used')
@@ -328,8 +331,8 @@ describe('elevate on the token connection (M5 B3)', () => {
     const { session, got } = await daemon((n) => n === 1
       ? [frame({ op: 'elevation_pending', challenge_id: 'ch1' }), frame({ op: 'error', code: 'presence_denied', message: 'Denied' })]
       : granted('ch2'))
-    expect(await codeOf(session.elevate(request, async () => null))).toBe('presence_denied')
-    await expect(session.elevate(request, async (g) => g)).resolves.toBe(GRANT)
+    expect(await codeOf(elevateIn(session, request, async () => null))).toBe('presence_denied')
+    await expect(elevateIn(session, request, async (g) => g)).resolves.toBe(GRANT)
     await expect(session.renew()).resolves.toMatch(/^renewed-/)
     expect(got.map((f) => f['op'])).toEqual(['elevate', 'elevate', 'renew'])
   })
@@ -345,17 +348,26 @@ describe('elevate on the token connection (M5 B3)', () => {
     const { session } = await daemon(reply)
     let used = false
     const closed = new Promise<EnrolError>((resolve) => session.onClose(resolve))
-    const err = session.elevate(request, async () => { used = true })
+    const err = elevateIn(session, request, async () => { used = true })
     expect(await codeOf(err)).toBe('bad_frame')
     expect((await closed).code).toBe('bad_frame')
     expect(used).toBe(false)
+  })
+
+  it('elevate kept past its turn is refused, and sends nothing', async () => {
+    const { session, got } = await daemon(() => granted())
+    let kept!: (r: ElevateRequest) => Promise<string>
+    await session.turn(async (elevate) => { kept = elevate })
+    expect(await codeOf(kept(request))).toBe('closed')
+    await session.renew()
+    expect(got.map((f) => f['op'])).toEqual(['renew'])
   })
 
   it('on a connection already gone, rejects at once and never runs `use`', async () => {
     const { session } = await daemon(() => granted())
     session.close()
     let used = false
-    expect(await codeOf(session.elevate(request, async () => { used = true }))).toBe('closed')
+    expect(await codeOf(elevateIn(session, request, async () => { used = true }))).toBe('closed')
     expect(used).toBe(false)
   })
 })

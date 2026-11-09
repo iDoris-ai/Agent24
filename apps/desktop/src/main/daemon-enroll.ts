@@ -227,12 +227,13 @@ export interface EnrolSession {
   readonly token: string
   /** Renew on this connection; resolves with the new token. */
   renew(): Promise<string>
-  /** Ask for a one-shot grant for `request` (M5 B3), then run `use` with it
-   * before anything else goes on this connection: the grant is bound to the
-   * current token, so no renew may come between. Waits for the user up to
-   * `ELEVATION_WAIT_MS`. Rejects with an [`EnrolError`]: a daemon `error`
-   * frame (denied, timed out, unavailable) leaves the connection open. */
-  elevate<T>(request: ElevateRequest, use: (grant: string) => Promise<T>): Promise<T>
+  /** A turn on this connection (M5 B3): no renew comes until `fn` has
+   * finished, so the token is the same throughout (the daemon binds both the
+   * request it remembers on a 403 and the grant to it). In it, `elevate`
+   * asks for a one-shot grant for `request`, waiting for the user up to
+   * `ELEVATION_WAIT_MS`; it rejects with an [`EnrolError`], and a daemon
+   * `error` frame (denied, timed out, unavailable) leaves the connection open. */
+  turn<T>(fn: (elevate: (request: ElevateRequest) => Promise<string>) => Promise<T>): Promise<T>
   /** Called once when the connection ends (the daemon went away, a renew failed, close()). */
   onClose(listener: (why: EnrolError) => void): void
   close(): void
@@ -294,39 +295,49 @@ export async function enrol(target: EnrolTarget, connect: Connect = defaultConne
       attempt.then(() => { if (renewing === attempt) renewing = null }, () => { if (renewing === attempt) renewing = null })
       return attempt
     },
-    elevate(request, use) {
+    turn(fn) {
       return exclusive(async () => {
-        conn.send({
-          op: 'elevate',
-          method: request.method,
-          path: request.path,
-          body_sha256: bodySha256(request.body),
-          summary: Array.from(request.summary).slice(0, SUMMARY_MAX_CHARS).join(''),
-        })
-        const deadline = Date.now() + ELEVATION_WAIT_MS
-        let pending: string | null = null
-        for (;;) {
-          // Timing out closes the connection; an `error` frame rejects and leaves it open.
-          const frame = await conn.next(
-            Math.max(0, deadline - Date.now()),
-            new EnrolError('presence_timeout', 'timed out waiting for the confirmation'),
-          )
-          const id = frame['challenge_id']
-          if (frame['op'] === 'elevation_pending') {
-            if (pending !== null) broken('duplicate elevation_pending frame')
-            if (typeof id !== 'string' || id === '') broken('pending frame carries no challenge id')
-            pending = id as string
-            continue
-          }
-          if (frame['op'] !== 'elevated') broken('unexpected frame while waiting for the confirmation')
-          if (pending === null || id !== pending) broken('elevated frame does not match the pending challenge')
-          const grant = frame['grant']
-          if (typeof grant !== 'string' || grant === '') broken('elevated frame carries no grant')
-          return use(grant as string)
+        let inTurn = true
+        try {
+          return await fn((request) => (inTurn ? elevate(request) : Promise.reject(new EnrolError('closed', 'elevate outside its turn'))))
+        } finally {
+          inTurn = false
         }
       })
     },
     onClose: (listener) => conn.onClose(listener),
     close: () => { conn.close() },
+  }
+
+  async function elevate(request: ElevateRequest): Promise<string> {
+    // One exchange: the caller's turn keeps everything else off the connection.
+    conn.send({
+      op: 'elevate',
+      method: request.method,
+      path: request.path,
+      body_sha256: bodySha256(request.body),
+      summary: Array.from(request.summary).slice(0, SUMMARY_MAX_CHARS).join(''),
+    })
+    const deadline = Date.now() + ELEVATION_WAIT_MS
+    let pending: string | null = null
+    for (;;) {
+      // Timing out closes the connection; an `error` frame rejects and leaves it open.
+      const frame = await conn.next(
+        Math.max(0, deadline - Date.now()),
+        new EnrolError('presence_timeout', 'timed out waiting for the confirmation'),
+      )
+      const id = frame['challenge_id']
+      if (frame['op'] === 'elevation_pending') {
+        if (pending !== null) broken('duplicate elevation_pending frame')
+        if (typeof id !== 'string' || id === '') broken('pending frame carries no challenge id')
+        pending = id as string
+        continue
+      }
+      if (frame['op'] !== 'elevated') broken('unexpected frame while waiting for the confirmation')
+      if (pending === null || id !== pending) broken('elevated frame does not match the pending challenge')
+      const grant = frame['grant']
+      if (typeof grant !== 'string' || grant === '') broken('elevated frame carries no grant')
+      return grant as string
+    }
   }
 }

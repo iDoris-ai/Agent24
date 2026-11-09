@@ -115,13 +115,13 @@ export function onDaemonReady(listener: () => void): () => void {
   return () => { daemonReadyListeners.delete(listener) }
 }
 
-/** The enrolment's `elevate`, while the current connection is one with the
- * service daemon (M5 B3): there a daily token gets `403 presence_required` on
- * an elevated route, and the grant is asked for on the token connection.
- * Null otherwise: our own child keeps the host token and asks over HTTP. */
-export function daemonElevation(): EnrolSession['elevate'] | null {
+/** A turn on the enrolment's token connection, while the current connection
+ * is one with the service daemon (M5 B3): there a daily token gets
+ * `403 presence_required` on an elevated route, and the grant is asked for on
+ * that connection. Null otherwise: our own child keeps the host token. */
+export function daemonElevation(): EnrolSession['turn'] | null {
   const session = currentSession
-  return session ? (request, use) => session.elevate(request, use) : null
+  return session ? (fn) => session.turn(fn) : null
 }
 
 /** Auth mode of the current usable connection. Null when nothing can be called. */
