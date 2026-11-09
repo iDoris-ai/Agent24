@@ -115,6 +115,31 @@ describe('capability routing', () => {
       confirm.mockRestore()
     })
 
+    it('asks when navigating back too, by the page showing now (Codex #1688 C2)', () => {
+      dirty = true
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(true).mockReturnValue(false)
+      show()
+      go('documents')
+      expect(at()).toBe('documents')
+      go('home')
+      expect(at()).toBe('documents')
+      expect(confirm).toHaveBeenCalledTimes(2)
+      go('documents')
+      expect(confirm).toHaveBeenCalledTimes(2)
+      confirm.mockRestore()
+    })
+
+    it('asks before Settings is opened anew, which mounts it again (Codex #1688 C1)', () => {
+      dirty = true
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(true).mockReturnValue(false)
+      show()
+      go('settings')
+      expect(at()).toBe('settings')
+      go('settings')
+      expect(confirm).toHaveBeenCalledTimes(2)
+      confirm.mockRestore()
+    })
+
     it('stops asking once the page with changes is gone', () => {
       dirty = true
       const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)

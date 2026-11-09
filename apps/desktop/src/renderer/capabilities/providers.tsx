@@ -36,8 +36,13 @@ export function useLeaveGuard(dirty: boolean | (() => boolean), message?: string
     return () => { guards.delete(guard) }
   }, [guards])
 }
+/** Whether `b` shows the page `a` does, as it is: a page given another key
+ *  (Settings, opened again) is mounted anew, and loses what it had (Codex
+ *  #1688 C1). */
 const samePage = (a: Route, b: Route) =>
-  a.kind === b.kind && (a.kind === 'page' ? a.page === (b as typeof a).page : a.id === (b as typeof a).id)
+  a.kind === b.kind && (a.kind === 'page'
+    ? a.page === (b as typeof a).page && a.key === (b as typeof a).key
+    : a.id === (b as typeof a).id)
 
 export function CapabilitiesProvider({ children }: { children: ReactNode }) {
   const [{ defs, moduleInventory }, setRegistry] = useState<Pick<CapabilitiesApi, 'defs' | 'moduleInventory'>>({ defs: CAPABILITIES })
