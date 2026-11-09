@@ -189,7 +189,7 @@ describe('schedule conversations (M4 A5)', () => {
     it('skips rows that are not schedules\' runs', async () => {
       const m = homes()
       await m.catchUp(async () => [])
-      const rows = [null, 7, [], { id: 'run_1' }, { id: 'run 2', schedule_id: 'sch_1', created_at: '2026-11-09T10:00:00Z' },
+      const rows = [null, 7, [], { id: 'run_1' }, { id: 'run 2', schedule_id: 'sch_bad', created_at: '2026-11-09T10:00:00Z' },
         { id: 'run_3', schedule_id: 'sch 1', created_at: '2026-11-09T10:00:00Z' }, { id: 'run_5', schedule_id: 'sch_1' }, row('run_4', 'sch_1')]
       await m.catchUp(async () => rows)
       expect(history.list()).toHaveLength(1)
