@@ -208,7 +208,8 @@ describe('serviceUpgradeDeps: the real steps on the system (QA #1744)', () => {
   it('started: a new live daemon on record, not the old one, not a dead one', async () => {
     const alive = (pid: number) => pid === 43
     await expect(real({ alive, record: () => ({ pid: 43 }) }).deps.started()).resolves.toBe(true)
-    await expect(real({ alive, record: () => ({ pid: 42 }) }).deps.started()).resolves.toBe(false)
+    // The old pid, alive or not, is never the new daemon.
+    await expect(real({ alive: () => true, record: () => ({ pid: 42 }) }).deps.started()).resolves.toBe(false)
     await expect(real({ alive, record: () => ({ pid: 44 }) }).deps.started()).resolves.toBe(false)
     await expect(real({ alive, record: () => null }).deps.started()).resolves.toBe(false)
   })
