@@ -685,6 +685,8 @@ fn check_resources(inv: &dyn ModelInventory, required: &[String]) -> ResourceSta
 /// module directory on a slow or network filesystem should not stall the runtime.
 async fn prepare_dir(dir: &Path) -> std::result::Result<(), String> {
     let dir = dir.to_path_buf();
+    #[cfg(test)]
+    let prepared = dir.clone();
     tokio::task::spawn_blocking(move || {
         match std::fs::symlink_metadata(&dir) {
             // A symlink at the module's own directory. Windows junctions are
@@ -714,7 +716,49 @@ async fn prepare_dir(dir: &Path) -> std::result::Result<(), String> {
         std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))
     })
     .await
-    .unwrap_or_else(|e| Err(format!("directory preparation task failed: {e}")))
+    .unwrap_or_else(|e| Err(format!("directory preparation task failed: {e}")))?;
+    #[cfg(test)]
+    note_prepared_dir(&prepared);
+    Ok(())
+}
+
+/// A test cancels the shutdown token once `prepare_dir` has succeeded and
+/// before `mount_package` goes on to register a supervisor.
+#[cfg(test)]
+type PrepareHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+
+#[cfg(test)]
+static AFTER_PREPARE_DIR: std::sync::Mutex<Option<PrepareHook>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn note_prepared_dir(dir: &Path) {
+    let hook = AFTER_PREPARE_DIR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook(dir);
+    }
+}
+
+/// A test cancels after the supervisor is registered and before the namespace
+/// route is published. `mark_mounted` is the await in that gap; the hook is
+/// how a test stands in it without depending on the lend.
+#[cfg(test)]
+type PublishHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+#[cfg(test)]
+static BEFORE_ROUTE_PUBLISH: std::sync::Mutex<Option<PublishHook>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn note_before_route_publish(name: &str) {
+    let hook = BEFORE_ROUTE_PUBLISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook(name);
+    }
 }
 
 /// Nest the KERNEL's 503 under `namespace`, for a module that could not be
@@ -854,6 +898,9 @@ pub struct ProcessHost {
     /// earlier ones too — and closed by the shutdown, after which nothing
     /// starts (review of SUP-4, rounds 2 and 3).
     pub supervisors: Arc<Supervisors>,
+    /// Daemon shutdown. `recheck` hashes on this token so a shutdown stops
+    /// the hash and does not spawn the next run.
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 /// The daemon's supervised modules: a list the shutdown closes and takes.
@@ -1962,6 +2009,18 @@ async fn mount_package(
     if host.supervisors.is_closed() {
         return degraded(app, SHUTTING_DOWN.to_owned());
     }
+    // Scan finished and the token fired before `close()` took the list.
+    // Do not prepare a data directory, do not start a supervisor, and do
+    // not publish the proxy route. A 503 namespace would still be a route.
+    if host.shutdown.is_cancelled() {
+        return (
+            app,
+            report(
+                MountOutcome::Degraded(SHUTTING_DOWN.to_owned()),
+                ResourceStatus::NotChecked,
+            ),
+        );
+    }
     let data_dir = manifest.data_dir_under(root);
     if let Err(why) = prepare_dir(&data_dir).await {
         return degraded(app, why);
@@ -2079,9 +2138,27 @@ async fn mount_package(
     // format (`ModuleSpec` already treats `package_dir`/`manifest_digest` as
     // opaque values), so the check itself lives here and travels in as an
     // opaque closure.
-    let package_check: agent24_os_proto::supervisor::PackageCheck = Arc::new(|spec| {
-        agent24_os_packages::discovery::recheck(&spec.package_dir, &spec.manifest_digest).err()
+    // Cancel stops the hash. `Err` — including `cancelled` — is not a
+    // finished check: the supervisor must not spawn. A shutdown is not a
+    // hash mismatch, and a matching stat is not a reason to skip the hash.
+    let shutdown = host.shutdown.clone();
+    let package_check: agent24_os_proto::supervisor::PackageCheck = Arc::new(move |spec| {
+        agent24_os_packages::discovery::recheck(&spec.package_dir, &spec.manifest_digest, &shutdown)
+            .err()
     });
+    // `prepare_dir` and the lends above can outlive the cancel check that
+    // ran before them. A token that fired in that gap must not register a
+    // supervisor or publish the namespace — the same report as that earlier
+    // check. `is_closed` above stays the 503 path; this is the token.
+    if host.shutdown.is_cancelled() {
+        return (
+            app,
+            report(
+                MountOutcome::Degraded(SHUTTING_DOWN.to_owned()),
+                ResourceStatus::NotChecked,
+            ),
+        );
+    }
     // Started and registered in one step, unless the shutdown has closed the
     // list — which it may have while the directory was being prepared.
     let started = host.supervisors.start_with(|| {
@@ -2093,6 +2170,7 @@ async fn mount_package(
             offer,
             host.timings,
             package_check,
+            host.shutdown.clone(),
         )
         .map(|handle| Supervised {
             name: name.clone(),
@@ -2130,6 +2208,21 @@ async fn mount_package(
         partitions
             .mark_mounted(partition, &lease.kv, &agent24_memory::SystemClock)
             .await;
+    }
+    // `mark_mounted` awaits. A cancel in that gap has already registered the
+    // supervisor; do not publish the namespace over it. The supervisor stays
+    // in the list for the shutdown to stop. The report matches the token
+    // check before `prepare_dir`: no route.
+    #[cfg(test)]
+    note_before_route_publish(&name);
+    if host.shutdown.is_cancelled() {
+        return (
+            app,
+            report(
+                MountOutcome::Degraded(SHUTTING_DOWN.to_owned()),
+                ResourceStatus::NotChecked,
+            ),
+        );
     }
     tracing::info!(
         "domain OS {name:?} started from {} and proxied at {namespace} (grants: {granted_names:?})",
@@ -2602,7 +2695,7 @@ while f.readline():
 
     /// The catalogue entries `serve` would make of `packages`.
     fn discovered(packages: &Path) -> Vec<Installed> {
-        agent24_os_packages::discovery::scan(packages)
+        agent24_os_packages::discovery::scan(packages, &tokio_util::sync::CancellationToken::new())
             .found
             .into_iter()
             .map(|d| Installed {
@@ -2640,6 +2733,7 @@ while f.readline():
                 ..agent24_os_proto::supervisor::Timings::default()
             },
             supervisors: Arc::new(Supervisors::default()),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -2744,6 +2838,139 @@ while f.readline():
         );
     }
 
+    /// `prepare_dir` has returned and the earlier cancel check has already
+    /// passed. Cancelling in that hook must not register a supervisor or
+    /// publish the namespace.
+    #[tokio::test]
+    async fn a_cancel_after_prepare_dir_registers_nothing_and_publishes_nothing() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "afterprep");
+        let host = test_host(tmp.path());
+        let shutdown = host.shutdown.clone();
+        *super::AFTER_PREPARE_DIR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::sync::Arc::new(move |dir| {
+                if dir.ends_with("afterprep") {
+                    shutdown.cancel();
+                }
+            }));
+        let _clear = ClearPrepareDir;
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (app, reports, _) = mount_all(
+            &discovered(&packages),
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        match &reports[0].outcome {
+            MountOutcome::Degraded(why) => assert!(why.contains("shutting down"), "{why}"),
+            other => panic!("mounted after prepare_dir: {other:?}"),
+        }
+        assert_eq!(reports[0].resources, ResourceStatus::NotChecked);
+        assert!(
+            root.join("afterprep").is_dir(),
+            "prepare_dir did not finish before the cancel"
+        );
+        assert!(
+            host.supervisors.statuses().is_empty(),
+            "a supervisor was registered"
+        );
+        assert_eq!(
+            get(&app, "/api/v1/afterprep/hi").await.status(),
+            StatusCode::NOT_FOUND,
+            "the package route was published"
+        );
+        assert!(host.supervisors.close().is_empty());
+    }
+
+    /// The supervisor is already in the list. Cancelling before the route is
+    /// published must leave the namespace unpublished. The supervisor stays
+    /// registered; the shutdown still stops it.
+    #[tokio::test]
+    async fn a_cancel_after_registration_does_not_publish_the_route() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "afterreg");
+        let host = test_host(tmp.path());
+        let shutdown = host.shutdown.clone();
+        *super::BEFORE_ROUTE_PUBLISH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::sync::Arc::new(move |name| {
+                if name == "afterreg" {
+                    shutdown.cancel();
+                }
+            }));
+        let _clear = ClearRoutePublish;
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (app, reports, _) = mount_all(
+            &discovered(&packages),
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        match &reports[0].outcome {
+            MountOutcome::Degraded(why) => assert!(why.contains("shutting down"), "{why}"),
+            other => panic!("route published after registration: {other:?}"),
+        }
+        assert_eq!(reports[0].resources, ResourceStatus::NotChecked);
+        assert_eq!(
+            host.supervisors.statuses().len(),
+            1,
+            "the supervisor was not registered, so this did not reach the publish check"
+        );
+        assert_eq!(
+            get(&app, "/api/v1/afterreg/hi").await.status(),
+            StatusCode::NOT_FOUND,
+            "the package route was published"
+        );
+        for s in host.supervisors.close().running {
+            s.handle.stop().await.expect("a clean stop");
+        }
+    }
+
+    struct ClearPrepareDir;
+
+    impl Drop for ClearPrepareDir {
+        fn drop(&mut self) {
+            *super::AFTER_PREPARE_DIR
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+
+    struct ClearRoutePublish;
+
+    impl Drop for ClearRoutePublish {
+        fn drop(&mut self) {
+            *super::BEFORE_ROUTE_PUBLISH
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+
     // ── T7a/ME-3e: out-of-process capability grants + `_a24/events/emit` ──
 
     /// Judgement 9: `Capability::parse` already rejects an unrecognised
@@ -2758,7 +2985,10 @@ while f.readline():
         let tmp = tempfile::tempdir().unwrap();
         let packages = tmp.path().join("packages");
         write_package_with(&packages, "typo", "[events, telepthy]", PACKAGE_MODULE);
-        let scan = agent24_os_packages::discovery::scan(&packages);
+        let scan = agent24_os_packages::discovery::scan(
+            &packages,
+            &tokio_util::sync::CancellationToken::new(),
+        );
         assert!(
             scan.found.is_empty(),
             "a manifest with an unknown capability must not be mountable"
@@ -3187,6 +3417,423 @@ raise SystemExit(3)
         .expect("the unrelated module never ran")
         .unwrap();
 
+        for s in host.supervisors.close().running {
+            s.handle.stop().await.expect("a clean stop");
+        }
+    }
+
+    /// The real `recheck` closure sees the daemon shutdown token. Cancelling
+    /// it during backoff must not spawn again, and the reason is `cancelled`,
+    /// not a hash mismatch. Wiring a fresh `CancellationToken::new()` into
+    /// the closure turns this into a second `Backoff`.
+    #[tokio::test]
+    async fn a_cancelled_recheck_does_not_spawn_again() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_crashing_package(&packages, "crashy");
+        let mut host = test_host(tmp.path());
+        host.timings.backoff_base = std::time::Duration::from_secs(3);
+        let shutdown = host.shutdown.clone();
+        let hub = crate::events::EventsHub::default();
+        let (_, _, _) = mount_all(
+            &discovered(&packages),
+            &tmp.path().join("os"),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+
+        let mut status = host.supervisors.statuses().remove("crashy").unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            status.wait_for(|s| {
+                matches!(
+                    s,
+                    agent24_os_proto::supervisor::Status::Backoff { failures: 1, .. }
+                )
+            }),
+        )
+        .await
+        .expect("the module never crashed into backoff")
+        .unwrap();
+        shutdown.cancel();
+
+        let settled = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            status.wait_for(|s| {
+                matches!(
+                    s,
+                    agent24_os_proto::supervisor::Status::PackageChanged { .. }
+                        | agent24_os_proto::supervisor::Status::Backoff { failures: 2, .. }
+                )
+            }),
+        )
+        .await
+        .expect("never settled")
+        .unwrap()
+        .clone();
+        let agent24_os_proto::supervisor::Status::PackageChanged { reason } = &settled else {
+            panic!("spawned again after the recheck was cancelled: {settled:?}");
+        };
+        assert_eq!(reason, "cancelled");
+        assert!(
+            !reason.contains("hash_mismatch"),
+            "cancel must not look like a bad hash: {reason}"
+        );
+
+        for s in host.supervisors.close().running {
+            s.handle.stop().await.expect("a clean stop");
+        }
+    }
+
+    /// A package whose process appends one line to `executed` in its data
+    /// directory, and which declares one tool so registration is visible.
+    fn write_tooled_package(packages: &Path, name: &str) {
+        let dir = packages.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("domain-os.yml"),
+            format!(
+                "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+                 event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+                 kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+                 spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n\
+                 tools:\n  - operation: list-notes\n    description: lists notes\n    \
+                 input_schema: {{type: object, properties: {{}}}}\n    risk: read\n    \
+                 output_privacy: local_only\n    timeout_ms: 5000\n    inline_wait_ms: 1000\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("mod.py"),
+            "import os\n\
+             open(os.path.join(os.environ['A24_DATA_DIR'], 'executed'), 'a').write('ran\\n')\n",
+        )
+        .unwrap();
+    }
+
+    fn catalogue_from_found(
+        found: Vec<agent24_os_packages::discovery::Discovered>,
+    ) -> Vec<Installed> {
+        found
+            .into_iter()
+            .map(|d| Installed {
+                name: d.manifest.name().to_owned(),
+                version: d.manifest.version().to_owned(),
+                build: Build::Package(Box::new(Package {
+                    manifest: d.manifest,
+                    dir: d.dir,
+                    digest: d.digest,
+                })),
+            })
+            .collect()
+    }
+
+    /// Scan has already accepted the package. Cancelling before the first
+    /// spawn must not register its tool, must not publish its route, and
+    /// must not run it. `supervisors.close()` is not what stops it: the
+    /// token is.
+    #[tokio::test]
+    async fn a_cancel_after_scan_registers_nothing_and_spawns_nothing() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_tooled_package(&packages, "remote");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let scan = agent24_os_packages::discovery::scan(&packages, &shutdown);
+        assert_eq!(scan.found.len(), 1, "refused: {:?}", scan.refused);
+        let catalogue = catalogue_from_found(scan.found);
+
+        let mut live = agent24_domain::tool::ModuleToolRegistry::new();
+        let mut live_ops = std::collections::HashSet::new();
+        crate::server::register_discovered_module_tools(
+            &catalogue,
+            &tokio_util::sync::CancellationToken::new(),
+            &mut live,
+            &mut live_ops,
+        );
+        assert!(
+            live.get("remote.list-notes").is_some(),
+            "the tool was not registered while the token was live"
+        );
+        let (live, _) = crate::server::module_tools_if_live(
+            &tokio_util::sync::CancellationToken::new(),
+            live,
+            live_ops,
+        );
+        assert!(live.get("remote.list-notes").is_some());
+
+        shutdown.cancel();
+        let mut registry = agent24_domain::tool::ModuleToolRegistry::new();
+        let mut ops = std::collections::HashSet::new();
+        crate::server::register_discovered_module_tools(
+            &catalogue,
+            &shutdown,
+            &mut registry,
+            &mut ops,
+        );
+        assert!(
+            registry.is_empty(),
+            "tools were registered after the scan's token was cancelled"
+        );
+        let (published, published_ops) =
+            crate::server::module_tools_if_live(&shutdown, live, std::collections::HashSet::new());
+        assert!(
+            published.is_empty(),
+            "a filled registry was published after cancel"
+        );
+        assert!(published_ops.is_empty());
+
+        let mut host = test_host(tmp.path());
+        host.shutdown = shutdown;
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (app, reports, _) = mount_all(
+            &catalogue,
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        match &reports[0].outcome {
+            MountOutcome::Degraded(why) => assert!(why.contains("shutting down"), "{why}"),
+            other => panic!("mounted after cancel: {other:?}"),
+        }
+        assert!(
+            host.supervisors.statuses().is_empty(),
+            "a supervisor was started"
+        );
+        assert_eq!(
+            get(&app, "/api/v1/remote/hi").await.status(),
+            StatusCode::NOT_FOUND,
+            "the package route was published"
+        );
+        assert!(
+            !root.join("remote").join("executed").exists(),
+            "the package ran"
+        );
+        assert!(host.supervisors.close().is_empty());
+    }
+
+    /// `bin/mod` is a tiny C program compiled with the system `cc`: a native
+    /// executable for this machine (the package must pass the native-format
+    /// check), far under the payload limit (a copy of this debug test binary
+    /// is over 512 MiB on Linux), and not a platform binary macOS would kill
+    /// when copied (a copy of `/bin/sh` is). It appends one marker line per
+    /// run to `$A24_DATA_DIR/executed` and exits 3.
+    fn write_integrity_marker(packages: &Path, name: &str) -> std::path::PathBuf {
+        let dir = packages.join(name);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(
+            dir.join("domain-os.yml"),
+            format!(
+                "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+                 event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+                 kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+                 spawn:\n  command: bin/mod\n"
+            ),
+        )
+        .unwrap();
+        let source = packages.join(format!("{name}-mod.c"));
+        std::fs::write(
+            &source,
+            "#include <stdio.h>\n#include <stdlib.h>\n\
+             int main(void) {\n\
+               const char *d = getenv(\"A24_DATA_DIR\");\n\
+               if (d) { char p[4096]; snprintf(p, sizeof p, \"%s/executed\", d);\n\
+                 FILE *f = fopen(p, \"a\"); if (f) { fputs(\"ran\\n\", f); fclose(f); } }\n\
+               return 3;\n}\n",
+        )
+        .unwrap();
+        let built = std::process::Command::new("cc")
+            .arg("-o")
+            .arg(dir.join("bin").join("mod"))
+            .arg(&source)
+            .status()
+            .expect("these tests need a C compiler (`cc`) to build a native module");
+        assert!(built.success(), "cc failed to build the marker module");
+        std::fs::remove_file(&source).unwrap();
+        agent24_os_packages::package_integrity::generate(&dir, &["bin/mod".to_owned()]).unwrap();
+        dir
+    }
+
+    fn arm_hash_pause(
+        prefix: &std::path::Path,
+    ) -> (
+        agent24_components::integrity::HashProgressGuard,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let once = Arc::new(AtomicBool::new(false));
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let guard = agent24_components::integrity::install_hash_progress_hook(
+            prefix,
+            Arc::new(move || {
+                if once.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let _ = entered_tx.send(());
+                if let Some(rx) = release_rx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = rx.recv();
+                }
+            }),
+        );
+        (guard, entered_rx, release_tx)
+    }
+
+    /// The startup hash is already inside a file when shutdown fires.
+    /// Nothing is discovered and the marker script does not run.
+    #[tokio::test]
+    async fn a_cancel_during_startup_hash_discovers_nothing_and_spawns_nothing() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        let dir = write_integrity_marker(&packages, "remote");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let scan = {
+            let (_guard, entered, release) = arm_hash_pause(&dir);
+            let scan_root = packages.clone();
+            let scan_cancel = cancel.clone();
+            let worker = std::thread::spawn(move || {
+                agent24_os_packages::discovery::scan(&scan_root, &scan_cancel)
+            });
+            tokio::task::spawn_blocking(move || {
+                entered.recv_timeout(std::time::Duration::from_secs(30))
+            })
+            .await
+            .unwrap()
+            .expect("startup hash never paused");
+            cancel.cancel();
+            release.send(()).unwrap();
+            worker.join().unwrap()
+        };
+        assert!(
+            scan.found.is_empty(),
+            "discovered: {:?}",
+            scan.found
+                .iter()
+                .map(|d| d.manifest.name())
+                .collect::<Vec<_>>()
+        );
+        assert!(scan.cancelled.iter().any(|path| path == &dir));
+        assert!(
+            scan.refused
+                .iter()
+                .all(|r| !r.why.contains("hash_mismatch")),
+            "{:?}",
+            scan.refused
+        );
+        let mut host = test_host(tmp.path());
+        host.shutdown = cancel;
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (app, reports, _) = mount_all(
+            &catalogue_from_found(scan.found),
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        assert!(reports.is_empty(), "{reports:?}");
+        assert!(host.supervisors.statuses().is_empty());
+        assert_eq!(
+            get(&app, "/api/v1/remote/hi").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(!root.join("remote").join("executed").exists());
+    }
+
+    /// Recheck is inside the payload hash, not waiting to start, when the
+    /// token fires. The crash loop must not spawn a second time.
+    #[tokio::test]
+    async fn a_cancel_during_recheck_hash_does_not_spawn_again() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_integrity_marker(&packages, "remote");
+        let mut host = test_host(tmp.path());
+        host.timings.backoff_base = std::time::Duration::from_millis(50);
+        let shutdown = host.shutdown.clone();
+        let catalogue = discovered(&packages);
+        let package_dir = packages.join("remote");
+        let (_guard, entered, release) = arm_hash_pause(&package_dir);
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (_, _, _) = mount_all(
+            &catalogue,
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        tokio::task::spawn_blocking(move || {
+            entered.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .unwrap()
+        .expect("recheck never reached the hash");
+        shutdown.cancel();
+        release.send(()).unwrap();
+        let mut status = host.supervisors.statuses().remove("remote").unwrap();
+        let settled = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            status.wait_for(|s| {
+                matches!(
+                    s,
+                    agent24_os_proto::supervisor::Status::PackageChanged { .. }
+                        | agent24_os_proto::supervisor::Status::Backoff { failures: 2, .. }
+                        | agent24_os_proto::supervisor::Status::Running
+                )
+            }),
+        )
+        .await
+        .expect("never settled")
+        .unwrap()
+        .clone();
+        let agent24_os_proto::supervisor::Status::PackageChanged { reason } = &settled else {
+            panic!("spawned again after the hash was cancelled: {settled:?}");
+        };
+        assert_eq!(reason, "cancelled");
+        let marker =
+            std::fs::read_to_string(root.join("remote").join("executed")).unwrap_or_default();
+        assert_eq!(marker.lines().count(), 1, "runs: {marker:?}");
         for s in host.supervisors.close().running {
             s.handle.stop().await.expect("a clean stop");
         }

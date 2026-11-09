@@ -2232,7 +2232,17 @@ pub async fn serve(
     let state_dir = agent24_protocol::state_file::state_dir()
         .ok_or_else(|| std::io::Error::other("HOME not set"))?;
     let packages_root = Arc::new(agent24_os_packages::packages_root(&state_dir, ephemeral));
-    let catalogue = with_discovered(Vec::new(), &packages_root);
+    // Hashing a package is blocking filesystem I/O (up to 512 MiB). The
+    // shutdown token stops it; a cancelled package is left out of the
+    // catalogue, so it is not registered and not spawned.
+    let catalogue = catalogue_from_join(
+        tokio::task::spawn_blocking({
+            let packages_root = StdArc::clone(&packages_root);
+            let cancel = cancel.clone();
+            move || with_discovered(Vec::new(), packages_root.as_ref(), &cancel)
+        })
+        .await,
+    )?;
 
     // M-E/E1b: mount external MCP servers from ~/.agent24/mcp.json and register
     // their tools. Registered with `with()` so they are dispatchable, while
@@ -2242,23 +2252,14 @@ pub async fn serve(
     let mut tools = agent24_tools::ToolRegistry::builtin(workspace.clone());
     let mut module_registry = agent24_domain::tool::ModuleToolRegistry::new();
     let mut module_operations = std::collections::HashSet::new();
-    for entry in &catalogue {
-        if let crate::domain::Build::Package(package) = &entry.build {
-            if let Err(error) =
-                module_registry.register_module(entry.name.as_str(), package.manifest.tools())
-            {
-                tracing::warn!(module = entry.name, %error, "module tools were refused");
-                continue;
-            }
-            module_operations.extend(
-                package
-                    .manifest
-                    .tools()
-                    .iter()
-                    .map(|tool| (entry.name.clone(), tool.operation().to_owned())),
-            );
-        }
-    }
+    register_discovered_module_tools(
+        &catalogue,
+        &cancel,
+        &mut module_registry,
+        &mut module_operations,
+    );
+    (module_registry, module_operations) =
+        module_tools_if_live(&cancel, module_registry, module_operations);
     let module_tool_runtime =
         crate::module_tool_runtime::AgentModuleToolRuntime::new(module_operations);
     let module_tool_runtime_dyn: StdArc<dyn agent24_tools::ModuleToolRuntime> =
@@ -2613,6 +2614,7 @@ pub async fn serve(
     let host = process_host(
         if ephemeral { &os_root } else { &state_dir },
         params.stop_grace,
+        shutdown.token().clone(),
     );
     if let Ok(host) = &host {
         let _ = module_tool_supervisors.set(StdArc::clone(&host.supervisors));
@@ -3649,6 +3651,7 @@ fn fallback_dir_hash(root: &std::path::Path) -> u64 {
 fn process_host(
     root: &std::path::Path,
     stop_grace: Duration,
+    shutdown: CancellationToken,
 ) -> Result<crate::domain::ProcessHost, String> {
     let root = &callback_root(root)?;
     for gone in agent24_os_proto::endpoint::remove_stale(root) {
@@ -3691,6 +3694,7 @@ fn process_host(
             ..agent24_os_proto::supervisor::Timings::default()
         },
         supervisors: StdArc::new(crate::domain::Supervisors::default()),
+        shutdown,
     })
 }
 
@@ -3779,9 +3783,70 @@ async fn stop_supervisors(closed: crate::domain::Closed, drain: Duration) {
 /// `mount_all` claims names first-come-first-served, so a disk package cannot
 /// shadow a compiled-in module by taking its name. The second claimant gets an
 /// explicit refusal rather than silently winning.
+/// A panicked scan is not an empty catalogue. An empty catalogue means no
+/// packages were installed; a join failure means startup did not learn that.
+fn catalogue_from_join<T>(joined: Result<T, tokio::task::JoinError>) -> Result<T, std::io::Error> {
+    joined.map_err(|err| {
+        tracing::error!("discovering domain OS packages failed: {err}");
+        std::io::Error::other(format!("discovering domain OS packages failed: {err}"))
+    })
+}
+
+/// Register package tools unless shutdown has already cancelled the token.
+/// A package the scan accepted is not published after that.
+pub(crate) fn register_discovered_module_tools(
+    catalogue: &[crate::domain::Installed],
+    cancel: &CancellationToken,
+    module_registry: &mut agent24_domain::tool::ModuleToolRegistry,
+    module_operations: &mut std::collections::HashSet<(String, String)>,
+) {
+    if cancel.is_cancelled() {
+        tracing::info!("not registering domain OS tools: shutdown already cancelled");
+        return;
+    }
+    for entry in catalogue {
+        if let crate::domain::Build::Package(package) = &entry.build {
+            if let Err(error) =
+                module_registry.register_module(entry.name.as_str(), package.manifest.tools())
+            {
+                tracing::warn!(module = entry.name, %error, "module tools were refused");
+                continue;
+            }
+            module_operations.extend(
+                package
+                    .manifest
+                    .tools()
+                    .iter()
+                    .map(|tool| (entry.name.clone(), tool.operation().to_owned())),
+            );
+        }
+    }
+}
+
+/// Drop tools filled before the publish point if the token has since fired.
+pub(crate) fn module_tools_if_live(
+    cancel: &CancellationToken,
+    registry: agent24_domain::tool::ModuleToolRegistry,
+    operations: std::collections::HashSet<(String, String)>,
+) -> (
+    agent24_domain::tool::ModuleToolRegistry,
+    std::collections::HashSet<(String, String)>,
+) {
+    if cancel.is_cancelled() {
+        tracing::info!("not publishing domain OS tools: shutdown already cancelled");
+        (
+            agent24_domain::tool::ModuleToolRegistry::new(),
+            std::collections::HashSet::new(),
+        )
+    } else {
+        (registry, operations)
+    }
+}
+
 fn with_discovered(
     mut catalogue: Vec<crate::domain::Installed>,
     packages_root: &std::path::Path,
+    cancel: &CancellationToken,
 ) -> Vec<crate::domain::Installed> {
     // FU-41. Checked HERE, at the one place packages are read, rather than at
     // startup: a check somewhere else can be true when it runs and false when
@@ -3795,7 +3860,13 @@ fn with_discovered(
         tracing::error!("{e}; no disk packages will be loaded this run");
         return catalogue;
     }
-    let scan = agent24_os_packages::discovery::scan(packages_root);
+    let scan = agent24_os_packages::discovery::scan(packages_root, cancel);
+    for dir in &scan.cancelled {
+        tracing::info!(
+            "domain OS package at {} was not loaded: verification cancelled",
+            dir.display()
+        );
+    }
     for r in &scan.refused {
         tracing::warn!(
             "domain OS package at {} was not loaded: {}",
@@ -4041,6 +4112,37 @@ pub(crate) mod tests {
         }
     }
 
+    /// A scan thread that panics is a failed start, not an empty catalogue.
+    /// An empty catalogue is what "no packages installed" looks like.
+    #[tokio::test]
+    async fn a_panicked_package_scan_is_a_startup_error() {
+        let joined = tokio::task::spawn_blocking(|| {
+            panic!("scan blew up");
+        })
+        .await;
+        let err = super::catalogue_from_join(joined).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("discovering domain OS packages failed"),
+            "{msg}"
+        );
+        assert!(msg.contains("panicked"), "{msg}");
+    }
+
+    /// A shutdown during discovery must not put the package on the catalogue.
+    /// Passing `CancellationToken::new()` instead of the caller's token
+    /// discovers `cos72` and turns this red.
+    #[test]
+    fn a_cancelled_discovery_does_not_catalogue_the_package() {
+        let root = tempfile::tempdir().unwrap();
+        pkg(root.path(), "cos72");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let out = super::with_discovered(vec![built_in("sin90")], root.path(), &cancel);
+        let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["sin90"]);
+    }
+
     #[test]
     fn a_package_placed_after_the_build_reaches_the_catalogue() {
         // The scanner having found it is not the same claim as the daemon having
@@ -4049,7 +4151,11 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         pkg(root.path(), "cos72");
 
-        let out = super::with_discovered(vec![built_in("sin90")], root.path());
+        let out = super::with_discovered(
+            vec![built_in("sin90")],
+            root.path(),
+            &CancellationToken::new(),
+        );
         let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["sin90", "cos72"]);
     }
@@ -4069,7 +4175,11 @@ pub(crate) mod tests {
         pkg(root.path(), "cos72");
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
 
-        let out = super::with_discovered(vec![built_in("sin90")], root.path());
+        let out = super::with_discovered(
+            vec![built_in("sin90")],
+            root.path(),
+            &CancellationToken::new(),
+        );
         let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(
             names,
@@ -4082,7 +4192,11 @@ pub(crate) mod tests {
         // unreadable for some other reason, which would make this test pass for
         // a reason that has nothing to do with FU-41.
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let out = super::with_discovered(vec![built_in("sin90")], root.path());
+        let out = super::with_discovered(
+            vec![built_in("sin90")],
+            root.path(),
+            &CancellationToken::new(),
+        );
         let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["sin90", "cos72"]);
     }
@@ -4097,7 +4211,11 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         pkg(root.path(), "sin90");
 
-        let out = super::with_discovered(vec![built_in("sin90")], root.path());
+        let out = super::with_discovered(
+            vec![built_in("sin90")],
+            root.path(),
+            &CancellationToken::new(),
+        );
         assert_eq!(out.len(), 2, "both entries exist; the mounter decides");
         assert_eq!(out[0].version, "9.9.9", "the built-in must come FIRST");
         assert_eq!(out[1].version, "0.1.0");
@@ -4110,6 +4228,7 @@ pub(crate) mod tests {
         let out = super::with_discovered(
             vec![built_in("sin90")],
             std::path::Path::new("/nonexistent/agent24-packages"),
+            &CancellationToken::new(),
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "sin90");
@@ -8836,7 +8955,7 @@ pub fn build_router_with_modules() {
         let fallback = hashed_fallback_path(&alias);
 
         // Exercise the real directory creation and bind, not only the length check.
-        let host = process_host(&alias, Duration::from_secs(1)).unwrap();
+        let host = process_host(&alias, Duration::from_secs(1), CancellationToken::new()).unwrap();
         let listener = host.callback_dir.listen_next().unwrap();
         assert!(listener.path().as_os_str().len() <= agent24_os_proto::endpoint::MAX_SOCKET_PATH);
         drop(listener);

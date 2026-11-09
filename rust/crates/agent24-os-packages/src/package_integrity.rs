@@ -24,7 +24,19 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 ///
 /// Absence is success. Presence runs the full shared check and refuses a
 /// broken package. This is the PR-1 hook; PR-3 replaces it with a required check.
-pub fn verify_if_present(dir: &Path, manifest: &DomainOsManifest) -> Result<(), IntegrityError> {
+///
+/// `cancel` is the caller's shutdown token. A fired token is
+/// [`IntegrityError::Cancelled`]: the hash did not finish, so this is not a
+/// hash mismatch and not a successful check. Every scan still hashes the
+/// whole tree; nothing is skipped because a stat tuple matched.
+pub fn verify_if_present(
+    dir: &Path,
+    manifest: &DomainOsManifest,
+    cancel: &CancellationToken,
+) -> Result<(), IntegrityError> {
+    if cancel.is_cancelled() {
+        return Err(IntegrityError::Cancelled);
+    }
     let Some(declared) = manifest.integrity() else {
         return Ok(());
     };
@@ -37,6 +49,7 @@ pub fn verify_if_present(dir: &Path, manifest: &DomainOsManifest) -> Result<(), 
             files: declared.files().to_vec(),
             executables: declared.executables().to_vec(),
         },
+        cancel,
     )
 }
 
@@ -53,7 +66,9 @@ pub fn verify(root: &Path) -> Result<(), IntegrityError> {
         })?;
     match manifest.integrity() {
         None => Err(IntegrityError::Missing),
-        Some(_) => verify_if_present(root, &manifest),
+        // One-shot CLI. The daemon passes its shutdown token through
+        // `discovery::scan` / `recheck`, not through this entry.
+        Some(_) => verify_if_present(root, &manifest, &CancellationToken::new()),
     }
 }
 
@@ -189,7 +204,11 @@ fn verify_declared(
     dir: &Path,
     spawn_command: Option<&str>,
     section: &IntegritySection,
+    cancel: &CancellationToken,
 ) -> Result<(), IntegrityError> {
+    if cancel.is_cancelled() {
+        return Err(IntegrityError::Cancelled);
+    }
     ensure_real_directory(dir)?;
     integrity::validate_section(section, spawn_command)?;
     let path = dir.join(FILES_JSON_NAME);
@@ -219,20 +238,74 @@ fn verify_declared(
         });
     }
     let bytes = read_bounded(&path, FILES_JSON_NAME, integrity::MAX_FILES_JSON_BYTES)?;
-    let expected = integrity::verify_files_json(&bytes, section)?;
-    integrity::verify_tree(
-        dir,
-        &expected,
-        &section.executables,
-        true,
-        &[DOMAIN_OS_YML, FILES_JSON_NAME],
-        &CancellationToken::new(),
-    )
-    .map_err(integrity::map_tree_error)?;
+    // `verify_files_json` does not take the token. A cancel during that read
+    // still has to beat a hash or manifest error, same as `tree_result`.
+    let files_json = integrity::verify_files_json(&bytes, section);
+    #[cfg(test)]
+    on_files_json_checked();
+    let expected = prefer_cancel(cancel, files_json)?;
+    // A mismatch (or any other tree error) discovered as the token fires is
+    // still an unfinished check. Cancel wins over the mismatch.
+    tree_result(
+        cancel,
+        integrity::verify_tree(
+            dir,
+            &expected,
+            &section.executables,
+            true,
+            &[DOMAIN_OS_YML, FILES_JSON_NAME],
+            cancel,
+        ),
+    )?;
     for executable in &section.executables {
         check_native_executable(&dir.join(executable), executable)?;
     }
     Ok(())
+}
+
+fn tree_result(
+    cancel: &CancellationToken,
+    result: Result<(), integrity::TreeError>,
+) -> Result<(), IntegrityError> {
+    prefer_cancel(cancel, result.map_err(integrity::map_tree_error))
+}
+
+/// Cancel wins over an error already in hand. The check that produced `result`
+/// may not have looked at the token again (`verify_files_json` never does).
+fn prefer_cancel<T>(
+    cancel: &CancellationToken,
+    result: Result<T, IntegrityError>,
+) -> Result<T, IntegrityError> {
+    if cancel.is_cancelled() {
+        return Err(IntegrityError::Cancelled);
+    }
+    result
+}
+
+// Test stand-in for a shutdown that lands while `files.json` is being
+// checked: the hook runs after that check returns and before `prefer_cancel`.
+#[cfg(test)]
+thread_local! {
+    static FILES_JSON_CHECKED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn on_files_json_checked() {
+    let hook = FILES_JSON_CHECKED.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn arm_files_json_checked(hook: impl FnOnce() + 'static) {
+    FILES_JSON_CHECKED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn clear_files_json_checked() {
+    FILES_JSON_CHECKED.with(|slot| *slot.borrow_mut() = None);
 }
 
 const HEADER_WINDOW: usize = 1024 * 1024;
@@ -669,7 +742,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         crate::install::install(staging.path(), &root).unwrap();
-        let scan = crate::discovery::scan(&root);
+        let scan = crate::discovery::scan(&root, &CancellationToken::new());
         assert_eq!(scan.found.len(), 1, "refused: {:?}", scan.refused);
     }
 
@@ -824,7 +897,7 @@ mod tests {
     }
 
     fn scan_why(parent: &Path, name: &str) -> String {
-        let scan = crate::discovery::scan(parent);
+        let scan = crate::discovery::scan(parent, &CancellationToken::new());
         scan.refused
             .iter()
             .find(|refused| refused.dir.ends_with(name))
@@ -1016,7 +1089,7 @@ mod tests {
         write_tree(&new_package, "newmod");
         generate(&new_package, &["bin/newmod".into(), "bin/helper".into()]).unwrap();
 
-        let first = crate::discovery::scan(parent.path());
+        let first = crate::discovery::scan(parent.path(), &CancellationToken::new());
         let old_found = first
             .found
             .iter()
@@ -1035,8 +1108,9 @@ mod tests {
             "old package refused: {:?}",
             first.refused
         );
-        crate::discovery::recheck(&old, &old_found.digest).unwrap();
-        crate::discovery::recheck(&new_package, &new_found.digest).unwrap();
+        crate::discovery::recheck(&old, &old_found.digest, &CancellationToken::new()).unwrap();
+        crate::discovery::recheck(&new_package, &new_found.digest, &CancellationToken::new())
+            .unwrap();
         let old_verify = verify(&old).unwrap_err();
         assert!(
             old_verify
@@ -1053,7 +1127,7 @@ mod tests {
         bytes[0] ^= 0x01;
         fs::write(&binary, bytes).unwrap();
 
-        let second = crate::discovery::scan(parent.path());
+        let second = crate::discovery::scan(parent.path(), &CancellationToken::new());
         assert!(
             second
                 .found
@@ -1074,9 +1148,11 @@ mod tests {
             .why
             .clone();
         assert!(why.contains("hash_mismatch: bin/newmod"), "{why}");
-        let recheck = crate::discovery::recheck(&new_package, &new_found.digest).unwrap_err();
+        let recheck =
+            crate::discovery::recheck(&new_package, &new_found.digest, &CancellationToken::new())
+                .unwrap_err();
         assert!(recheck.contains("hash_mismatch: bin/newmod"), "{recheck}");
-        crate::discovery::recheck(&old, &old_found.digest).unwrap();
+        crate::discovery::recheck(&old, &old_found.digest, &CancellationToken::new()).unwrap();
     }
     #[test]
     fn t3_control_directory_special_file_and_non_utf8_boundaries() {
@@ -1145,6 +1221,57 @@ mod tests {
         );
         assert!(reason(&package).contains("not an ordinary file"));
         assert!(generate(&package, &["bin/cos72".into()]).is_err());
+    }
+
+    /// `files.json` does not match, and the token fires after that check
+    /// returns — before the error is published. The entry `is_cancelled`
+    /// check has already passed. Publishing `verify_files_json`'s error
+    /// directly (`?` without [`prefer_cancel`]) turns this into
+    /// `hash_mismatch: files.json`.
+    #[test]
+    fn a_files_json_mismatch_while_cancelled_is_cancelled() {
+        let (_parent, package) = generated("cos72");
+        let json_path = package.join(FILES_JSON_NAME);
+        let mut permissions = fs::symlink_metadata(&json_path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&json_path, permissions).unwrap();
+        let mut bytes = fs::read(&json_path).unwrap();
+        bytes.push(b'\n');
+        fs::write(&json_path, &bytes).unwrap();
+        let yaml = fs::read_to_string(package.join(DOMAIN_OS_YML)).unwrap();
+        let manifest = DomainOsManifest::from_yaml(&yaml).unwrap();
+        let cancel = CancellationToken::new();
+        let flag = cancel.clone();
+        super::arm_files_json_checked(move || flag.cancel());
+        let _clear = FilesJsonHookGuard;
+        let err = verify_if_present(&package, &manifest, &cancel).unwrap_err();
+        assert!(matches!(err, IntegrityError::Cancelled), "{err}");
+        assert!(!err.to_string().contains("hash_mismatch"), "{err}");
+    }
+
+    struct FilesJsonHookGuard;
+
+    impl Drop for FilesJsonHookGuard {
+        fn drop(&mut self) {
+            super::clear_files_json_checked();
+        }
+    }
+
+    /// The tree walk already decided this was a mismatch. The token fired
+    /// before that error was published, so the caller must see `cancelled`.
+    /// Dropping the cancel arm in [`prefer_cancel`] turns this into
+    /// `hash_mismatch`.
+    #[test]
+    fn a_hash_mismatch_while_cancelled_is_cancelled() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = tree_result(
+            &cancel,
+            Err(integrity::TreeError::HashMismatch("bin/mod".to_owned())),
+        )
+        .unwrap_err();
+        assert!(matches!(err, IntegrityError::Cancelled), "{err}");
+        assert!(!err.to_string().contains("hash_mismatch"), "{err}");
     }
 
     #[test]

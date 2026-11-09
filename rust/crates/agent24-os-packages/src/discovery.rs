@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use agent24_domain::DomainOsManifest;
 use agent24_domain::tool::ModuleToolRegistry;
+use tokio_util::sync::CancellationToken;
 
 /// The file a package must contain to be a package at all.
 pub const MANIFEST_FILE: &str = "domain-os.yml";
@@ -63,10 +64,16 @@ pub struct Refused {
 
 /// The result of one scan. Both halves matter: `found` is what can be mounted,
 /// `refused` is what the operator has to fix, and neither is an error.
+/// `cancelled` is neither: the shutdown token fired before that package's
+/// check finished, so it is not mounted and it is not a damaged package.
 #[derive(Debug, Default)]
 pub struct Scan {
     pub found: Vec<Discovered>,
     pub refused: Vec<Refused>,
+    /// Directories left unverified because `cancel` fired. Not discovered,
+    /// not registered, not spawned. A later scan with a live token may
+    /// still discover them. A stat match is not a reason to skip the hash.
+    pub cancelled: Vec<PathBuf>,
 }
 
 /// Read every package directly under `root`.
@@ -77,7 +84,15 @@ pub struct Scan {
 /// from "empty" that the operator can act on. (Distinguishing those two is the
 /// same rule FU-32 is about: an empty answer and a broken channel must not look
 /// alike.)
-pub fn scan(root: &Path) -> Scan {
+///
+/// `cancel` is the daemon shutdown token. Every live scan still hashes the
+/// whole payload — a matching size or mtime does not prove the bytes — but
+/// a fired token stops this walk. A package whose check did not finish is
+/// listed on [`Scan::cancelled`], not [`Scan::found`] and not
+/// [`Scan::refused`]. Only a check that returns while the token is still
+/// live may be discovered; the caller must not register its tools or spawn
+/// it otherwise.
+pub fn scan(root: &Path, cancel: &CancellationToken) -> Scan {
     let mut out = Scan::default();
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
@@ -163,37 +178,64 @@ pub fn scan(root: &Path) -> Scan {
     // on the same disk.
     dirs.sort();
 
-    for dir in dirs {
-        match read_package(&dir) {
-            Ok(d) => out.found.push(d),
-            Err(why) => out.refused.push(Refused { dir, why }),
+    let mut rest = dirs.into_iter();
+    while let Some(dir) = rest.next() {
+        // Same outcome as `read_package`'s first check, which is what
+        // refuses to parse a manifest. Kept so a fired token does not
+        // enter `read_package` once per remaining directory.
+        if cancel.is_cancelled() {
+            out.cancelled.push(dir);
+            out.cancelled.extend(rest);
+            return out;
+        }
+        match read_package(&dir, cancel) {
+            PackageRead::Found(found) => out.found.push(*found),
+            PackageRead::Refused(why) => out.refused.push(Refused { dir, why }),
+            PackageRead::Cancelled => {
+                out.cancelled.push(dir);
+                out.cancelled.extend(rest);
+                return out;
+            }
         }
     }
     out
 }
 
+/// One directory, after the manifest was read. `Cancelled` is not a refusal:
+/// the package is not damaged, and it must not become [`Discovered`].
+enum PackageRead {
+    Found(Box<Discovered>),
+    Refused(String),
+    Cancelled,
+}
+
 /// Read and validate one package directory.
-fn read_package(dir: &Path) -> std::result::Result<Discovered, String> {
+fn read_package(dir: &Path, cancel: &CancellationToken) -> PackageRead {
+    if cancel.is_cancelled() {
+        return PackageRead::Cancelled;
+    }
     let path = dir.join(MANIFEST_FILE);
 
     // A symlinked manifest is refused rather than followed. The kernel derives a
     // module's data directory from its validated name, and following a link here
     // would let a package point the manifest — the thing that DECIDES that name —
     // at a file outside its own directory.
-    let meta = std::fs::symlink_metadata(&path)
-        .map_err(|e| format!("no readable {MANIFEST_FILE}: {e}"))?;
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) => return PackageRead::Refused(format!("no readable {MANIFEST_FILE}: {e}")),
+    };
     if meta.file_type().is_symlink() {
-        return Err(format!(
+        return PackageRead::Refused(format!(
             "{MANIFEST_FILE} is a symlink; refusing to follow it"
         ));
     }
     if !meta.is_file() {
-        return Err(format!("{MANIFEST_FILE} is not a regular file"));
+        return PackageRead::Refused(format!("{MANIFEST_FILE} is not a regular file"));
     }
     // Bound the read BEFORE it happens. `from_yaml` also checks a size limit, but
     // it checks it on a string that has already been read into memory.
     if meta.len() > DomainOsManifest::MAX_YAML_BYTES as u64 {
-        return Err(format!(
+        return PackageRead::Refused(format!(
             "{MANIFEST_FILE} is {} bytes, over the {} byte limit",
             meta.len(),
             DomainOsManifest::MAX_YAML_BYTES
@@ -204,27 +246,50 @@ fn read_package(dir: &Path) -> std::result::Result<Discovered, String> {
     // "stream did not contain valid UTF-8" and no hint of which file — and a
     // UTF-16 manifest (a real Windows accident, with a FF FE BOM) is exactly that.
     // Decoding here lets each case have its own readable reason.
-    let bytes = std::fs::read(&path).map_err(|e| format!("could not read {MANIFEST_FILE}: {e}"))?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return PackageRead::Refused(format!("could not read {MANIFEST_FILE}: {e}"));
+        }
+    };
     if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
-        return Err(format!(
+        return PackageRead::Refused(format!(
             "{MANIFEST_FILE} is UTF-16 (byte-order mark {:02X} {:02X}); it must be UTF-8",
             bytes[0], bytes[1]
         ));
     }
     let digest = manifest_digest(&bytes);
-    let text =
-        String::from_utf8(bytes).map_err(|e| format!("{MANIFEST_FILE} is not valid UTF-8: {e}"))?;
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => {
+            return PackageRead::Refused(format!("{MANIFEST_FILE} is not valid UTF-8: {e}"));
+        }
+    };
 
-    let manifest = DomainOsManifest::from_yaml(&text).map_err(|e| e.to_string())?;
+    let manifest = match DomainOsManifest::from_yaml(&text) {
+        Ok(manifest) => manifest,
+        Err(e) => return PackageRead::Refused(e.to_string()),
+    };
     // S1-9 PR-1: a package that declares integrity is verified in full before
     // it can become Discovered. A package that does not declare it keeps the
     // previous manifest-only behaviour. PR-3 replaces this with verify_required.
-    crate::package_integrity::verify_if_present(dir, &manifest).map_err(|e| e.to_string())?;
-    Ok(Discovered {
+    // Cancel is not success and not a hash mismatch: the package stays off
+    // `found` so nothing registers its tools or spawns it.
+    match crate::package_integrity::verify_if_present(dir, &manifest, cancel) {
+        Ok(()) => {}
+        Err(agent24_components::integrity::IntegrityError::Cancelled) => {
+            return PackageRead::Cancelled;
+        }
+        Err(e) => return PackageRead::Refused(e.to_string()),
+    }
+    if cancel.is_cancelled() {
+        return PackageRead::Cancelled;
+    }
+    PackageRead::Found(Box::new(Discovered {
         manifest,
         dir: dir.to_owned(),
         digest,
-    })
+    }))
 }
 
 /// Build the host-side module-tool registry from a scan's `found` packages,
@@ -265,7 +330,17 @@ pub fn build_tool_registry(found: &[Discovered]) -> (ModuleToolRegistry, Vec<Ref
 /// Re-read the package and compare the manifest digest frozen at mount time.
 /// Packages declaring integrity also repeat the full payload verification;
 /// legacy packages retain manifest-only checking until PR-3.
-pub fn recheck(dir: &Path, expected: &str) -> Result<(), String> {
+///
+/// `Err` means the caller must not spawn. `Err("cancelled")` is a shutdown,
+/// not a damaged package and not a hash mismatch: the hash did not finish,
+/// so this restart is not a success. The full tree is still hashed whenever
+/// the token is live.
+pub fn recheck(dir: &Path, expected: &str, cancel: &CancellationToken) -> Result<(), String> {
+    // The metadata branches below return before `read_package`, so its
+    // cancel check never runs for a missing, linked, or non-directory path.
+    if cancel.is_cancelled() {
+        return Err("cancelled".to_owned());
+    }
     match std::fs::symlink_metadata(dir) {
         Ok(m) if m.is_symlink() => {
             return Err("the package directory is now a symlink; refusing to follow it".to_owned());
@@ -279,13 +354,14 @@ pub fn recheck(dir: &Path, expected: &str) -> Result<(), String> {
         }
         Err(e) => return Err(format!("could not check the package directory: {e}")),
     }
-    match read_package(dir) {
-        Ok(found) if found.digest == expected => Ok(()),
-        Ok(found) => Err(format!(
+    match read_package(dir, cancel) {
+        PackageRead::Found(found) if found.digest == expected => Ok(()),
+        PackageRead::Found(found) => Err(format!(
             "the manifest changed ({expected} \u{2192} {})",
             found.digest
         )),
-        Err(why) => Err(format!("the package is no longer usable: {why}")),
+        PackageRead::Cancelled => Err("cancelled".to_owned()),
+        PackageRead::Refused(why) => Err(format!("the package is no longer usable: {why}")),
     }
 }
 
@@ -295,6 +371,23 @@ mod tests {
 
     use super::*;
     use std::io::Write;
+
+    /// Live token. Tests of cancellation call [`super::scan`] directly.
+    fn scan(root: &Path) -> Scan {
+        super::scan(root, &CancellationToken::new())
+    }
+
+    fn recheck(dir: &Path, expected: &str) -> Result<(), String> {
+        super::recheck(dir, expected, &CancellationToken::new())
+    }
+
+    fn read_package(dir: &Path) -> Result<Discovered, String> {
+        match super::read_package(dir, &CancellationToken::new()) {
+            PackageRead::Found(found) => Ok(*found),
+            PackageRead::Refused(why) => Err(why),
+            PackageRead::Cancelled => Err("cancelled".to_owned()),
+        }
+    }
 
     /// A manifest for a name this binary has never heard of. That is the point:
     /// `sin90` is compiled in, so discovering it would prove nothing.
@@ -876,5 +969,204 @@ mod tests {
             refused[0].dir.file_name().unwrap().to_string_lossy(),
             "zzz-dup"
         );
+    }
+
+    /// A fired token stops the scan before a broken sibling is recorded as
+    /// damaged, and it does not discover the good package. The same tree
+    /// with a live token still finds one and refuses the other — so this
+    /// stays red if the cancel branch is removed. `recheck` then fails with
+    /// `cancelled`, which is the signal its caller uses to not spawn.
+    #[test]
+    fn a_cancelled_scan_does_not_discover_or_damage_the_package() {
+        let root = tempfile::tempdir().unwrap();
+        install(
+            root.path(),
+            "cos72",
+            &manifest_yaml_with_tool("cos72", "out_of_process_provider", "ping"),
+        );
+        install(root.path(), "broken", "this is not: [valid yaml\n");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let scan = super::scan(root.path(), &cancel);
+        assert!(
+            scan.found.is_empty(),
+            "cancelled package was discovered: {:?}",
+            scan.found
+                .iter()
+                .map(|d| d.manifest.name())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            scan.refused.is_empty(),
+            "cancel was recorded as damage: {:?}",
+            scan.refused
+        );
+        let mut names: Vec<String> = scan
+            .cancelled
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["broken".to_owned(), "cos72".to_owned()]);
+        let (registry, refused) = build_tool_registry(&scan.found);
+        assert_eq!(registry.len(), 0, "a cancelled package registered a tool");
+        assert!(refused.is_empty(), "{refused:?}");
+
+        let live = super::scan(root.path(), &CancellationToken::new());
+        assert_eq!(live.found.len(), 1, "refused: {:?}", live.refused);
+        assert_eq!(live.found[0].manifest.name(), "cos72");
+        assert_eq!(live.refused.len(), 1, "{:?}", live.refused);
+        assert!(
+            live.refused[0].dir.ends_with("broken"),
+            "{:?}",
+            live.refused
+        );
+        assert!(live.cancelled.is_empty());
+
+        let digest = live.found[0].digest.clone();
+        let err = super::recheck(&live.found[0].dir, &digest, &cancel).unwrap_err();
+        assert_eq!(err, "cancelled");
+        assert!(
+            !err.contains("hash_mismatch"),
+            "cancel must not look like a bad hash: {err}"
+        );
+        // The supervisor spawns the next run only when this returns Ok.
+        assert!(super::recheck(&live.found[0].dir, &digest, &cancel).is_err());
+    }
+
+    /// The directory is already gone, and the token is already cancelled.
+    /// That must be `cancelled`, not "no longer exists": the metadata
+    /// branches return before `read_package`'s cancel check. Dropping the
+    /// check at the top of `recheck` turns the first assertion red.
+    #[test]
+    fn recheck_of_a_missing_directory_while_cancelled_is_cancelled() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("gone");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = super::recheck(&missing, "sha256:ab", &cancel).unwrap_err();
+        assert_eq!(err, "cancelled");
+        let live = super::recheck(&missing, "sha256:ab", &CancellationToken::new()).unwrap_err();
+        assert!(
+            live.contains("no longer exists"),
+            "a live token must still report the missing directory: {live}"
+        );
+    }
+
+    /// Executable is a copy of this test binary. There is no native-format
+    /// check on this branch; the copy only has to be a real file the hasher
+    /// walks. `bin/{name}` is also `spawn.command`.
+    fn integrity_package(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(
+            dir.join(MANIFEST_FILE),
+            format!(
+                "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+                 event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+                 kernel_capabilities: [events]\nimpl_kind: out_of_process_provider\n\
+                 spawn:\n  command: bin/{name}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::copy(std::env::current_exe().unwrap(), dir.join("bin").join(name)).unwrap();
+        crate::package_integrity::generate(&dir, &[format!("bin/{name}")]).unwrap();
+        dir
+    }
+
+    /// Pauses inside the first hashed chunk, then returns. Later chunks do
+    /// not wait, so one `release` unblocks the walk.
+    fn arm_hash_pause(
+        prefix: &Path,
+    ) -> (
+        agent24_components::integrity::HashProgressGuard,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let once = Arc::new(AtomicBool::new(false));
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let guard = agent24_components::integrity::install_hash_progress_hook(
+            prefix,
+            Arc::new(move || {
+                if once.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let _ = entered_tx.send(());
+                if let Some(rx) = release_rx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = rx.recv();
+                }
+            }),
+        );
+        (guard, entered_rx, release_tx)
+    }
+
+    /// Cancel after the hasher has read a chunk, not before it starts.
+    /// The package must not become [`Discovered`], and recheck must not
+    /// return `Ok` (that is what lets a supervisor spawn).
+    #[test]
+    fn a_cancel_during_the_hash_is_not_discovered() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = integrity_package(root.path(), "cos72");
+        let live = super::scan(root.path(), &CancellationToken::new());
+        assert_eq!(live.found.len(), 1, "refused: {:?}", live.refused);
+        let digest = live.found[0].digest.clone();
+
+        let cancel = CancellationToken::new();
+        let scan = {
+            let (_guard, entered, release) = arm_hash_pause(&dir);
+            let scan_root = root.path().to_owned();
+            let scan_cancel = cancel.clone();
+            let worker = std::thread::spawn(move || super::scan(&scan_root, &scan_cancel));
+            entered
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the startup scan never reached the hash");
+            cancel.cancel();
+            release.send(()).unwrap();
+            worker.join().unwrap()
+        };
+        assert!(
+            scan.found.is_empty(),
+            "discovered after a mid-hash cancel: {:?}",
+            scan.found
+                .iter()
+                .map(|d| d.manifest.name())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            scan.cancelled.iter().any(|path| path == &dir),
+            "cancelled: {:?}",
+            scan.cancelled
+        );
+        assert!(
+            scan.refused
+                .iter()
+                .all(|r| !r.why.contains("hash_mismatch")),
+            "{:?}",
+            scan.refused
+        );
+
+        let cancel = CancellationToken::new();
+        let (_guard, entered, release) = arm_hash_pause(&dir);
+        let recheck_dir = dir.clone();
+        let recheck_cancel = cancel.clone();
+        let worker =
+            std::thread::spawn(move || super::recheck(&recheck_dir, &digest, &recheck_cancel));
+        entered
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("recheck never reached the hash");
+        cancel.cancel();
+        release.send(()).unwrap();
+        let err = worker.join().unwrap().unwrap_err();
+        assert_eq!(err, "cancelled");
+        assert!(!err.contains("hash_mismatch"), "{err}");
     }
 }

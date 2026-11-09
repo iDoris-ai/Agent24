@@ -732,6 +732,7 @@ fn rescan_disabled_package_on_disk(
     packages_root: &std::path::Path,
     name: &str,
     dir: &std::path::Path,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(), String> {
     if let Err(e) = agent24_os_packages::check_packages_root(packages_root) {
         return Err(format!(
@@ -739,7 +740,7 @@ fn rescan_disabled_package_on_disk(
             packages_root.display()
         ));
     }
-    let scan = agent24_os_packages::discovery::scan(packages_root);
+    let scan = agent24_os_packages::discovery::scan(packages_root, cancel);
     classify_scan(&scan, packages_root, name, dir)
 }
 
@@ -773,6 +774,11 @@ fn classify_scan(
     }
     if let Some(refused) = scan.refused.iter().find(|r| r.dir.as_path() == dir) {
         return Err(refused.why.clone());
+    }
+    // Shutdown stopped the hash. Not "the package vanished", and not a
+    // hash mismatch: enable must not proceed on an unfinished check.
+    if scan.cancelled.iter().any(|path| path.as_path() == dir) {
+        return Err("verification cancelled".to_owned());
     }
     let Some(found) = scan.found.iter().find(|d| d.dir.as_path() == dir) else {
         return Err(format!(
@@ -826,8 +832,9 @@ async fn rescan_disabled_package(
     let packages_root = std::sync::Arc::clone(&state.packages_root);
     let name = name.to_owned();
     let dir = dir.to_owned();
+    let cancel = state.shutdown.token().clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        rescan_disabled_package_on_disk(&packages_root, &name, &dir)
+        rescan_disabled_package_on_disk(&packages_root, &name, &dir, &cancel)
     })
     .await;
     match outcome {
@@ -2803,12 +2810,15 @@ mod tests {
         // branch entirely, so the request instead fell through to "package
         // vanished," previously left this test green because it only checked
         // the status code).
-        let expected_why = agent24_os_packages::discovery::scan(root.path())
-            .refused
-            .into_iter()
-            .find(|r| r.dir == root.path().join("broken"))
-            .expect("the broken manifest must show up as a scan refusal")
-            .why;
+        let expected_why = agent24_os_packages::discovery::scan(
+            root.path(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .refused
+        .into_iter()
+        .find(|r| r.dir == root.path().join("broken"))
+        .expect("the broken manifest must show up as a scan refusal")
+        .why;
 
         let res = t8_patch(&st, "broken", true, Some(path.clone())).await;
         assert_eq!(res.status(), StatusCode::CONFLICT);
@@ -2875,6 +2885,7 @@ mod tests {
                 dir: packages_root.clone(),
                 why: "permission denied".to_owned(),
             }],
+            cancelled: Vec::new(),
         };
         let result = classify_scan(&scan, &packages_root, "pkgmod", &pkg_dir);
         let msg = result.expect_err("a root-level scan.refused entry must block, not allow");
@@ -2886,5 +2897,24 @@ mod tests {
             !msg.contains("no longer there"),
             "must not be misreported as the package's own directory vanishing: {msg}"
         );
+    }
+
+    /// Enable must not proceed on an unfinished hash. A cancelled directory is
+    /// not "gone" and not a hash mismatch: dropping the cancel arm makes this
+    /// look like the package directory disappeared.
+    #[test]
+    fn a_cancelled_rescan_is_not_a_missing_package() {
+        let packages_root = std::path::PathBuf::from("/tmp/t8-cancel-root");
+        let pkg_dir = packages_root.join("pkgmod");
+        let scan = agent24_os_packages::discovery::Scan {
+            found: Vec::new(),
+            refused: Vec::new(),
+            cancelled: vec![pkg_dir.clone()],
+        };
+        let msg = classify_scan(&scan, &packages_root, "pkgmod", &pkg_dir)
+            .expect_err("a cancelled scan must block enable");
+        assert_eq!(msg, "verification cancelled");
+        assert!(!msg.contains("no longer there"), "{msg}");
+        assert!(!msg.contains("hash_mismatch"), "{msg}");
     }
 }
