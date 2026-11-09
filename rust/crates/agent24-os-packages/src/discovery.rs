@@ -270,6 +270,60 @@ pub fn scan(root: &Path, cancel: &CancellationToken) -> Scan {
     out
 }
 
+/// [`scan`] for one package directory, with the same classification of that
+/// entry. `enable` re-verifies only the package it is about to enable: hashing
+/// every installed package while holding the `/os` control lock would make
+/// one small enable wait on all of them, and block every disable and stop
+/// behind it. A missing `dir` yields an empty [`Scan`] (the caller reports
+/// "no longer there"); a symlink or non-directory is refused as [`scan`]
+/// refuses it.
+pub fn scan_one(dir: &Path, cancel: &CancellationToken) -> Scan {
+    let mut out = Scan::default();
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return out,
+        Err(_) => {
+            out.refused.push(Refused {
+                dir: dir.to_owned(),
+                why: "could not determine what this entry is".to_owned(),
+                integrity: Some(IntegrityReason::CheckFailed),
+                declared: None,
+            });
+            return out;
+        }
+        Ok(m) if m.file_type().is_symlink() => {
+            out.refused.push(Refused::plain(
+                dir.to_owned(),
+                "package directory is a symlink; refusing to follow it (copy \
+                 the directory instead)",
+            ));
+            return out;
+        }
+        Ok(m) if !m.is_dir() => {
+            out.refused.push(Refused::plain(
+                dir.to_owned(),
+                "not a directory; a package is a directory containing domain-os.yml",
+            ));
+            return out;
+        }
+        Ok(_) => {}
+    }
+    match read_package(dir, cancel) {
+        PackageRead::Found(found) => out.found.push(*found),
+        PackageRead::Refused {
+            why,
+            integrity,
+            declared,
+        } => out.refused.push(Refused {
+            dir: dir.to_owned(),
+            why,
+            integrity,
+            declared,
+        }),
+        PackageRead::Cancelled => out.cancelled.push(dir.to_owned()),
+    }
+    out
+}
+
 /// One directory, after the manifest was read. `Cancelled` is not a refusal:
 /// the package is not damaged, and it must not become [`Discovered`].
 enum PackageRead {
@@ -1411,5 +1465,27 @@ mod tests {
         assert!(err.message().contains("changed"), "{err}");
         assert!(err.message().contains(&frozen), "{err}");
         assert_ne!(err.integrity(), Some(IntegrityReason::SignatureRejected));
+    }
+
+    /// enable re-verifies one package; a broken sibling must not affect it.
+    #[test]
+    fn scan_one_checks_only_the_named_package() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = install(
+            root.path(),
+            "cos72",
+            &manifest_yaml("cos72", "out_of_process_provider"),
+        );
+        // A broken sibling: a whole-root scan would refuse it.
+        let broken = root.path().join("broken");
+        std::fs::create_dir(&broken).unwrap();
+        std::fs::write(broken.join(MANIFEST_FILE), "not: [valid").unwrap();
+        let cancel = CancellationToken::new();
+        assert!(!scan(root.path()).refused.is_empty());
+        let one = scan_one(&dir, &cancel);
+        assert_eq!(one.found.len(), 1);
+        assert!(one.refused.is_empty(), "{:?}", one.refused);
+        let gone = scan_one(&root.path().join("absent"), &cancel);
+        assert!(gone.found.is_empty() && gone.refused.is_empty() && gone.cancelled.is_empty());
     }
 }

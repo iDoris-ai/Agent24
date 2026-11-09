@@ -767,7 +767,8 @@ fn rescan_disabled_package_on_disk(
             packages_root.display()
         )));
     }
-    let scan = agent24_os_packages::discovery::scan(packages_root, cancel);
+    // Only this package: see `scan_one` for why not the whole root.
+    let scan = agent24_os_packages::discovery::scan_one(dir, cancel);
     classify_scan(&scan, packages_root, name, dir)
 }
 
