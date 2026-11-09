@@ -158,7 +158,10 @@ jobs:
     name: Rust macOS (clippy + test)
     needs: hyphae-darwin-arm64
     runs-on: macos-latest
-    timeout-minutes: 30
+    # Warm runs take 18–23 min. A cold cache (a dev-dependency feature change,
+    # #1754) spent 26 min compiling before the first test, and a cancelled job
+    # saves no cache, so a re-run would hit the same wall.
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
