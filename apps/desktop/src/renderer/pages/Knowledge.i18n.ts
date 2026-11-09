@@ -25,7 +25,7 @@ export const knowledgeViewMessages = defineMessages({
     'citation.untitled': 'Untitled',
     'citation.dismiss': 'Close',
     'confirm.count': '{count} selected',
-    'confirm.accept': 'Add to chat',
+    'confirm.accept': 'Add to conversation',
     'confirm.decline': 'Not now',
   },
   zh: {
@@ -79,7 +79,7 @@ export const knowledgeViewMessages = defineMessages({
     'citation.untitled': 'ไม่มีชื่อ',
     'citation.dismiss': 'ปิด',
     'confirm.count': 'เลือก {count} รายการ',
-    'confirm.accept': 'เพิ่มในแชท',
+    'confirm.accept': 'เพิ่มในบทสนทนา',
     'confirm.decline': 'ยังไม่เพิ่ม',
   },
 })

@@ -21,7 +21,12 @@ import {
   type KnowledgeViewCitation,
   type KnowledgeViewConfirmAsk,
   type KnowledgeDraftEntry,
-  type KnowledgeEntryAdmission,
+  type KnowledgeEntryAdmitAnswer,
+  type KnowledgeEntryDraftCreated,
+  type KnowledgeEntryDraftSaved,
+  type KnowledgeEntryDraftSummary,
+  type KnowledgeEntryDraftView,
+  type KnowledgeEntryKind,
   type KnowledgeViewState,
   type KnowledgeViewTheme,
   type DocumentsImportProgress,
@@ -239,8 +244,21 @@ const api = {
   },
   // KB-SOP-01a (#1669): main checks the conversation, then asks the user itself.
   knowledgeEntry: {
-    admit: (conversationId: string): Promise<KnowledgeEntryAdmission> =>
+    admit: (conversationId: string): Promise<KnowledgeEntryAdmitAnswer> =>
       ipcRenderer.invoke(IpcChannels.KnowledgeEntryAdmit, conversationId),
+    // KB-SOP-01b-2: drafting from the ticket main handed out, and the drafts.
+    createDraft: (ticket: string, range: { from: number; to: number }): Promise<KnowledgeEntryDraftCreated> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeEntryDraftCreate, ticket, range),
+    listDrafts: (): Promise<KnowledgeEntryDraftSummary[]> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeEntryDraftList),
+    getDraft: (id: string): Promise<KnowledgeEntryDraftView | null> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeEntryDraftGet, id),
+    updateDraft: (id: string, patch: { kind: KnowledgeEntryKind; title: string; body: string }): Promise<KnowledgeEntryDraftSaved> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeEntryDraftUpdate, id, patch),
+    redactDraft: (id: string): Promise<KnowledgeEntryDraftSaved> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeEntryDraftRedact, id),
+    withdrawDraft: (id: string): Promise<boolean> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeEntryDraftWithdraw, id),
   },
   // ADR-DOC-01 D5: the Documenting OS, by operation, never by path.
   documents: {
