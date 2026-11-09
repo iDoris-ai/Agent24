@@ -179,7 +179,7 @@ describe('upgradeService', () => {
     upgrader.tick()
     await vi.waitFor(() => expect(upgrader.hint()).toEqual({ kind: 'failed', code: 'kickstart_failed' }))
     setMainLocale('zh')
-    const tray = { status: 'running', external: true, externalPid: 42, foreignPid: null, backendKind: 'rust' } as const
+    const tray = { status: 'running', external: true, enrolled: false, externalPid: 42, foreignPid: null, backendKind: 'rust' } as const
     expect(buildTrayView({ ...tray, upgrade: upgrader.hint() }).tooltip).toContain('后台服务升级未完成（kickstart_failed）')
   })
 
@@ -293,7 +293,7 @@ describe('ServiceUpgrader (PM 11-09: asked once per run, after enrolment)', () =
 })
 
 describe('tray text (three languages)', () => {
-  const tray = { status: 'running', external: true, externalPid: 42, foreignPid: null, backendKind: 'rust' } as const
+  const tray = { status: 'running', external: true, enrolled: false, externalPid: 42, foreignPid: null, backendKind: 'rust' } as const
   it.each([
     ['en', 'restart the background service to finish the upgrade'],
     ['zh', '重启后台服务以完成升级'],

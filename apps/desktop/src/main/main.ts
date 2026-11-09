@@ -741,6 +741,7 @@ function refreshTray(): void {
     status: backendManager.status(),
     detail: backendManager.statusDetail(),
     external: backendManager.isExternalDaemon(),
+    enrolled: backendManager.presenceTarget() !== null,
     externalPid: backendManager.externalDaemonPid() ?? null,
     foreignPid: backendManager.foreignDaemonPid(),
     backendKind: backendManager.backendKind(),
