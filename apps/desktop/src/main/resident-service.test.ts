@@ -149,7 +149,7 @@ describe('upgradeService', () => {
     const { deps } = steps({ kickstart: async () => { throw new Error('launchctl: 113') } })
     const outcome = await upgradeService(deps)
     expect(outcome).toEqual({ ok: false, stage: 'kickstart', code: 'kickstart_failed' })
-    const upgrader = new ServiceUpgrader({ bundled: () => '0.6.1', running: () => '0.6.0', pid: () => 42, run: async () => outcome })
+    const upgrader = new ServiceUpgrader({ bundled: () => '0.6.1', running: () => '0.6.0', installed: () => true, pid: () => 42, run: async () => outcome })
     upgrader.tick()
     await vi.waitFor(() => expect(upgrader.hint()).toEqual({ kind: 'failed', code: 'kickstart_failed' }))
     setMainLocale('zh')
@@ -185,10 +185,10 @@ describe('upgradeService', () => {
 })
 
 describe('ServiceUpgrader (PM 11-09: asked once per run, after enrolment)', () => {
-  function upgrader(o: { bundled?: string | null; running?: string | null; pid?: number | null; outcome?: UpgradeOutcome }) {
+  function upgrader(o: { bundled?: string | null; running?: string | null; pid?: number | null; installed?: boolean; outcome?: UpgradeOutcome }) {
     const run = vi.fn(async () => o.outcome ?? ({ ok: true, copied: true } as const))
     const pick = <K extends 'bundled' | 'running' | 'pid'>(k: K, d: NonNullable<typeof o[K]>) => () => (k in o ? o[k] ?? null : d)
-    const u = new ServiceUpgrader({ bundled: pick('bundled', '0.6.1'), running: pick('running', '0.6.0'), pid: pick('pid', 42), run })
+    const u = new ServiceUpgrader({ bundled: pick('bundled', '0.6.1'), running: pick('running', '0.6.0'), installed: () => o.installed ?? true, pid: pick('pid', 42), run })
     return { u, run }
   }
 
@@ -220,6 +220,12 @@ describe('ServiceUpgrader (PM 11-09: asked once per run, after enrolment)', () =
     u.tick()
     expect(run).not.toHaveBeenCalled()
     expect(u.hint()).toBeNull()
+  })
+
+  it('no LaunchAgent plist: nothing run, since kickstart restarts that job only (Codex B5a C2)', () => {
+    const { u, run } = upgrader({ installed: false })
+    u.tick()
+    expect(run).not.toHaveBeenCalled()
   })
 })
 

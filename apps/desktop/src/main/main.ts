@@ -72,8 +72,8 @@ void bundledDaemonVersion(resolveRustBinary(app.isPackaged)).then((v) => { bundl
 const serviceUpgrader = new ServiceUpgrader({
   bundled: () => bundledVersion,
   running: () => backendManager.serviceDaemonVersion(),
-  // Only the LaunchAgent's daemon: kickstart restarts that job (Codex B5a C2).
-  pid: () => (backendManager.presenceTarget() && launchAgentPlistExists() ? backendManager.externalDaemonPid() ?? null : null),
+  installed: launchAgentPlistExists,
+  pid: () => (backendManager.presenceTarget() ? backendManager.externalDaemonPid() ?? null : null),
   run: async (pid) => {
     const dataDir = tryDataDir()
     if (dataDir === null) return { ok: false, stage: 'copy', code: 'no_data_dir' }
