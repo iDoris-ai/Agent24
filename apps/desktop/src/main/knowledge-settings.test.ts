@@ -33,7 +33,8 @@ describe('KnowledgeController (M3)', () => {
   let host: KnowledgeHost
 
   const transport: HostTransport = async (_conn, method, requestPath, body) => {
-    sent.push({ method, path: requestPath.split('?')[0] ?? '', body })
+    // As sent: the daemon answers 400 to any query on these routes (K-B6).
+    sent.push({ method, path: requestPath, body })
     return { status: 204 }
   }
   const make = () => new KnowledgeController(host, logins, new KnowledgeSettingsStore(dir), { nowSeconds: () => now })

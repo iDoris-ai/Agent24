@@ -33,7 +33,8 @@ function fakeDaemon() {
   let conn: DaemonConnection | null = { port: 1, authHeaders: { Authorization: 'Bearer t1' } }
   let respond: (req: Sent) => { status: number; code?: string } = () => ({ status: 204 })
   const transport: HostTransport = async (connection, method, requestPath, body) => {
-    const route = requestPath.split('?')[0] ?? ''
+    // As sent: the daemon answers 400 to any query on these routes (K-B6).
+    const route = requestPath
     let seq = Number.NaN
     if (body !== undefined) {
       try {
