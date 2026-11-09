@@ -261,3 +261,8 @@ v1 从未实施，所以下面的改动只在文档层；服务端与客户端�
 9. §8 报文带公共字段（W1.4、W8.14）：Provider 发出的请求带 `request_id` 与 `generation`，UI 会话发出的只带 `request_id`；响应回显 `request_id`（Provider 的还回显 `generation`）并带 `authz_version`（W1.2）。v1 没有 schema，这一条只是把 W1.2、W1.4 写进 schema。
 
 v1 文件改名为本文件（`git mv`），引用已同步；`rust/apps/agent24d/src/knowledge_probe.rs:18` 的注释仍写 OPS-v1，按 M3「不碰 agent24d」约束留到下次修改该文件时一并改。
+
+## 变更记录
+
+- r1（2026-11-09，#1668 KB-CT-03③）：v2 规范核心，相对 v1 的语义变更见 §12。影响夹具：新增 `protocol/knowledge/fixtures/ops-v2/`（`schema-cases.json`、`entry-hash.samples.json`）。
+- r2（2026-11-09，#1670）：补作者读取自己候选的 schema。`candidate.propose` 的读取动作（W2.1、W8.3）原先只有条文，现在加入 `candidate.schema.json` 的 `get_request`、`get_response`，W8.3 写明报文。操作类集合与语义都不变，按 §0.3 属于本版修订。影响夹具：`schema-cases.json` 新增 7 条用例，TS 与 Rust 两端的 sha256 一起重钉；`entry-hash.samples.json` 不变。
