@@ -45,6 +45,9 @@ struct RequestSummary {
 pub struct FirstPartyAuthority {
     store: CapabilityStore,
     provider: Mutex<Option<Arc<dyn PresenceProvider>>>,
+    /// K-B3 #1715: service mode's presence queue, handed to the enrolment
+    /// endpoint for `role:"presence"` connections.
+    presence_connection: Mutex<Option<Arc<crate::presence_service::ServicePresence>>>,
     grants: Mutex<HashMap<[u8; 32], Grant>>,
     request_summaries: Mutex<HashMap<String, RequestSummary>>,
     module_surfaces: Mutex<Arc<Vec<super::delegation::ModuleSurface>>>,
@@ -66,6 +69,7 @@ impl FirstPartyAuthority {
             docked: false,
             store,
             provider: Mutex::new(None),
+            presence_connection: Mutex::new(None),
             grants: Mutex::new(HashMap::new()),
             request_summaries: Mutex::new(HashMap::new()),
             module_surfaces: Mutex::new(Arc::new(Vec::new())),
@@ -299,6 +303,14 @@ impl FirstPartyAuthority {
     pub fn set_provider(&self, provider: Option<Arc<dyn PresenceProvider>>) {
         if let Ok(mut slot) = self.provider.lock() {
             *slot = provider;
+        }
+    }
+    pub fn set_presence_connection(
+        &self,
+        presence: Option<Arc<crate::presence_service::ServicePresence>>,
+    ) {
+        if let Ok(mut slot) = self.presence_connection.lock() {
+            *slot = presence;
         }
     }
     fn live_peer(&self, peer: &EnrolledPeer, id: &str) -> Result<(), EnrollErrorCode> {
@@ -668,6 +680,9 @@ impl EnrollAuthority for FirstPartyAuthority {
             secret: Zeroizing::new(secret.bearer()),
             expires_in: GRANT_TTL,
         })
+    }
+    fn presence_connection(&self) -> Option<Arc<crate::presence_service::ServicePresence>> {
+        self.presence_connection.lock().ok()?.clone()
     }
 }
 

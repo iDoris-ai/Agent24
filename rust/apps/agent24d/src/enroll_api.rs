@@ -106,6 +106,12 @@ pub enum EnrollErrorCode {
     PresenceTimeout,
     NotElevatedOperation,
     UnknownRoute,
+    /// K-B3 #1715: a live presence connection is already attached.
+    PresenceConflict,
+    /// K-B3 #1715: an op of the other role (token ops on the presence
+    /// connection, presence ops on a token connection, or `role:"presence"`
+    /// outside service mode).
+    WrongRole,
     Internal,
 }
 
@@ -123,6 +129,8 @@ impl EnrollErrorCode {
             Self::PresenceTimeout => "presence_timeout",
             Self::NotElevatedOperation => "not_elevated_operation",
             Self::UnknownRoute => "unknown_route",
+            Self::PresenceConflict => "presence_conflict",
+            Self::WrongRole => "wrong_role",
             Self::Internal => "internal",
         }
     }
@@ -148,4 +156,11 @@ pub trait EnrollAuthority: Send + Sync {
         pending: tokio::sync::oneshot::Sender<String>,
         cancel: CancellationToken,
     ) -> Result<ElevationGrant, EnrollErrorCode>;
+    /// Service mode only: where a `hello{role:"presence"}` connection
+    /// attaches (K-B3 #1715). `None` refuses that role with `wrong_role`.
+    fn presence_connection(
+        &self,
+    ) -> Option<std::sync::Arc<crate::presence_service::ServicePresence>> {
+        None
+    }
 }

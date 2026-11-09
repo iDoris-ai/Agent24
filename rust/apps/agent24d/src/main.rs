@@ -112,6 +112,7 @@ mod os_routes;
 mod overrides;
 mod peer_runs;
 mod presence_desktop;
+mod presence_service;
 mod routes;
 mod runs;
 mod scheduler_callback;
