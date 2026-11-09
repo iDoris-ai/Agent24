@@ -57,6 +57,10 @@ pub struct Operations {
     pub search: OperationState,
     pub read: OperationState,
     pub ingest: IngestState,
+    /// `candidate.*` and `entry.withdraw` (R8.2, schema r13): absent until the
+    /// server enables the candidate feature (WeKnora#146).
+    #[serde(default, with = "crate::opt", skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<OperationState>,
 }
 
 /// `kb_state.reason` (R8.4).

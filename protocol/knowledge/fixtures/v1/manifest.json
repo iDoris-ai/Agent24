@@ -1,7 +1,7 @@
 {
   "$comment": "Pinned fixture set for docs/knowledge/CONTRACT-READONLY-v1.md. Every file in this directory except this manifest must be listed. sha256 is over the exact file bytes (LF line endings, see .gitattributes); bump version whenever a fixture changes. class: accept = success response, reject = error envelope (partial is accept, §12 #11). request_valid: whether the request matches the v1 request schema (false = the malformed request the error answers; null = no request body; a string request holds a raw body that is not valid JSON). server_handler: false = client-only fixture, kept out of server request-parse / response-encode tests (§12 #18).",
   "contract": "docs/knowledge/CONTRACT-READONLY-v1.md",
-  "contract_revision": "r12",
+  "contract_revision": "r13",
   "protocol_version": 1,
   "fixtures": [
     { "file": "search.ok.json", "version": 4, "class": "accept", "request_valid": true, "server_handler": true,
@@ -78,10 +78,14 @@
       "sha256": "b19c711e3ec6352175746cd563630169f90c56377a58c62f63adc3390e548bcf" },
     { "file": "ready.unscoped.json", "version": 1, "class": "accept", "request_valid": true, "server_handler": true,
       "sha256": "d9bd6ce94ddd71e918e41b0b0382978f76d387d8b853446eb43ca0cbbef15031" },
+    { "file": "ready.candidate.json", "version": 1, "class": "accept", "request_valid": true, "server_handler": true,
+      "sha256": "77ce4eb2a9cbb188f26d8069f994d43878baf26cb2f07cc96444120da1d412f3" },
     { "file": "ready.operation-disabled.json", "version": 1, "class": "accept", "request_valid": true, "server_handler": true,
       "sha256": "1a9b159ab550026c8f2edbe107fbe0c01a722d094feb7e460b44b0876916f3ea" },
     { "file": "capabilities.integration.json", "version": 1, "class": "accept", "request_valid": null, "server_handler": true,
       "sha256": "ca9bc04409868b53906d603c2c060d0cfe1f65bf96cd1ae2722c5556ae3f344f" },
+    { "file": "capabilities.write-operations.json", "version": 1, "class": "accept", "request_valid": null, "server_handler": true,
+      "sha256": "a1fafc043cd91b1d245bae4d36559299c5d110ff019baf6d4ab73bfb3620aadd" },
     { "file": "read.stale-chunk-overwritten.json", "version": 1, "class": "reject", "request_valid": true, "server_handler": true,
       "sha256": "f9ec3f264138dd8cc1fe9aecf00eb23b6ac1a22f56fe54f99e7aa4e193701120" },
     { "file": "read.document-empty.json", "version": 1, "class": "accept", "request_valid": true, "server_handler": true,
