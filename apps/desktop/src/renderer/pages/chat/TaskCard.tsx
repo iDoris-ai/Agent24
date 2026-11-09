@@ -113,13 +113,33 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
   )
 }
 
+/** Hand-overs on their way, and those that failed, by conversation and
+ *  prompt: kept outside the button, so one shown again (after the next turn,
+ *  or back from another conversation) does not start the same prompt twice
+ *  while the first is still on its way (Codex A4 C2). */
+const handing = new Map<string, 'busy' | 'failed'>()
+const handingListeners = new Set<() => void>()
+function setHanding(key: string, state: 'busy' | 'failed' | null): void {
+  if (state === null) handing.delete(key)
+  else handing.set(key, state)
+  for (const l of handingListeners) l()
+}
+const subscribeHanding = (l: () => void) => { handingListeners.add(l); return () => { handingListeners.delete(l) } }
+
+/** For tests. */
+export function resetHandOversForTests(): void {
+  handing.clear()
+}
+
 /** "Hand it to the assistant": the prompt as a run of its own, in a new
  *  session, recorded as a task of the conversation it was asked in. */
 export function HandOver({ conversation, prompt }: { conversation: string; prompt: string }) {
   const t = useT(chatMessages)
-  const [state, setState] = useState<'idle' | 'busy' | 'failed'>('idle')
+  const key = `${conversation}\n${prompt}`
+  const state = useSyncExternalStore(subscribeHanding, () => handing.get(key) ?? 'idle')
   const handOver = async () => {
-    setState('busy')
+    if (handing.get(key) === 'busy') return
+    setHanding(key, 'busy')
     try {
       const session = await createChatSession(window.agent24.backendProxy)
       if (session === null) throw new Error('session_unavailable')
@@ -130,9 +150,9 @@ export function HandOver({ conversation, prompt }: { conversation: string; promp
         await cancelRun(run.id).catch(() => {})
         throw new Error('not_recorded')
       }
-      setState('idle')
+      setHanding(key, null)
     } catch {
-      setState('failed')
+      setHanding(key, 'failed')
     }
   }
   return (

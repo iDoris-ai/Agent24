@@ -7,7 +7,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { createChatHistoryStore } from '../../../main/chat-history'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../../shared/chat-history'
 import type { RunEvent } from '../../../shared/ipc-types'
-import { HandOver, TaskCards, elapsed } from './TaskCard'
+import { HandOver, TaskCards, elapsed, resetHandOversForTests } from './TaskCard'
 import { refreshHistory, resetHistoryStore } from './history'
 import { resetRunStatusesForTests } from './run-status'
 import { setLocale } from '../../i18n'
@@ -69,6 +69,7 @@ beforeEach(() => {
   })
   resetHistoryStore()
   resetRunStatusesForTests()
+  resetHandOversForTests()
 })
 afterEach(() => { vi.restoreAllMocks(); fs.rmSync(dir, { recursive: true, force: true }) })
 
@@ -203,6 +204,31 @@ describe('hand it to the assistant (M4 A4)', () => {
     fireEvent.click(screen.getByRole('button', { name: '交给助理办' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('没能交给助理')
     expect(proxy).toHaveBeenCalledWith({ method: 'POST', path: '/api/v1/runs/run_new/cancel' })
+  })
+})
+
+describe('hand it to the assistant, shown again on its way (Codex A4 C2)', () => {
+  it('does not start the same prompt twice while the first is still on its way', async () => {
+    store.save(record('chat_a', '整理周报'))
+    await refreshHistory()
+    const gate = { open: () => {} }
+    const answer = proxy.getMockImplementation() as (req: unknown) => Promise<unknown>
+    proxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.path === '/api/v1/sessions') await new Promise<void>(resolve => { gate.open = resolve })
+      return answer(req)
+    })
+    const first = render(<HandOver conversation="chat_a" prompt="整理周报" />)
+    fireEvent.click(screen.getByRole('button', { name: '交给助理办' }))
+    // The next turn starts: the button goes, and comes back once it is done.
+    first.unmount()
+    render(<><HandOver conversation="chat_a" prompt="整理周报" /><TaskCards conversation="chat_a" /></>)
+    expect(screen.getByRole('button', { name: '交给助理办' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: '交给助理办' }))
+    await act(async () => { gate.open() })
+    await waitFor(() => expect(card('排队中')).toBeInTheDocument())
+    expect(screen.getByRole('button', { name: '交给助理办' })).toBeEnabled()
+    expect(proxy.mock.calls.filter(([req]) => req.path === '/api/v1/sessions')).toHaveLength(1)
+    expect(proxy.mock.calls.filter(([req]) => req.method === 'POST' && req.path === '/api/v1/runs')).toHaveLength(1)
   })
 })
 

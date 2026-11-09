@@ -389,8 +389,15 @@ export default function ChatPage() {
       } else if (turn.kind === 'ongoing') {
         // M4 A4: the turn stopped waiting, the run goes on as this
         // conversation's task; its card shows how it does.
+        // One that could not be recorded has no card: it is stopped, as
+        // before A4, rather than left running unseen (Codex A4 C1).
+        if (!promotionDue({ status: turn.status, replyEnded: true }) || !(await promoteRun(conversation, turn.runId))) {
+          await proxy({ method: 'POST', path: `/api/v1/runs/${encodeURIComponent(turn.runId)}/cancel` }).catch(() => {})
+          setDelivery(index, { kind: 'notSent' })
+          setMessages(prev => [...prev, { role: 'assistant', content: t('knowledge.failed', { error: 'run_timeout' }) }])
+          return
+        }
         setDelivery(index, { kind: 'sent' })
-        if (promotionDue({ status: turn.status, replyEnded: true })) void promoteRun(conversation, turn.runId)
         // The next turn goes to a new session: this one's run is not done,
         // and a turn beside it would not see its answer (Knowledge's review).
         runSession.current = null
