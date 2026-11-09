@@ -3227,9 +3227,15 @@ mod tests {
         .unwrap();
         match cli.command {
             Command::PackageIntegrity {
-                action: package_integrity::Action::Generate { root, executable },
+                action:
+                    package_integrity::Action::Generate {
+                        root,
+                        executable,
+                        arch,
+                    },
             } => {
                 assert_eq!(root, PathBuf::from("dist/sin90"));
+                assert_eq!(arch, std::env::consts::ARCH);
                 assert_eq!(executable, ["bin/sin90", "bin/helper"]);
             }
             _ => panic!("package-integrity generate was not parsed"),

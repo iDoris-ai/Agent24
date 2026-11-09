@@ -78,6 +78,26 @@ pub fn verify(root: &Path) -> Result<(), IntegrityError> {
 /// Rewriting is atomic per file; a failed YAML publish rolls `files.json` back.
 /// Two successful runs on an unchanged tree produce the same bytes.
 pub fn generate(root: &Path, executables: &[String]) -> Result<(), IntegrityError> {
+    generate_for_arch(root, executables, std::env::consts::ARCH)
+}
+
+/// Generate for a target CPU architecture on the host OS.
+/// Verification and installation always require the host architecture.
+pub fn generate_for_arch(
+    root: &Path,
+    executables: &[String],
+    arch: &str,
+) -> Result<(), IntegrityError> {
+    if !matches!(arch, "aarch64" | "x86_64") {
+        return Err(IntegrityError::ManifestInvalid {
+            detail: "unsupported target architecture (expected aarch64 or x86_64)".to_owned(),
+        });
+    }
+    if !matches!(std::env::consts::OS, "macos" | "linux" | "windows") {
+        return Err(IntegrityError::ManifestInvalid {
+            detail: "unsupported target OS (expected macos, linux or windows)".to_owned(),
+        });
+    }
     ensure_real_directory(root)?;
     if executables.is_empty() {
         return Err(IntegrityError::ManifestInvalid {
@@ -160,7 +180,7 @@ pub fn generate(root: &Path, executables: &[String]) -> Result<(), IntegrityErro
     integrity::validate_section(&section, parsed.spawn().map(|spawn| spawn.command.as_str()))?;
     integrity::verify_files_json(&json, &section)?;
     for executable in executables {
-        check_native_executable(&root.join(executable), executable)?;
+        check_native_executable_for_arch(&root.join(executable), executable, arch)?;
     }
     // Only after the section validates: a refused package (e.g. a bare spawn.command) must
     // leave the staging tree's modes as they were.
@@ -491,6 +511,14 @@ fn native_reader(reader: &mut (impl Read + Seek), platform: &str, arch: &str) ->
 }
 
 fn check_native_executable(path: &Path, rel_path: &str) -> Result<(), IntegrityError> {
+    check_native_executable_for_arch(path, rel_path, std::env::consts::ARCH)
+}
+
+fn check_native_executable_for_arch(
+    path: &Path,
+    rel_path: &str,
+    arch: &str,
+) -> Result<(), IntegrityError> {
     #[cfg(unix)]
     let opened = {
         use rustix::fs::{Mode, OFlags};
@@ -519,7 +547,7 @@ fn check_native_executable(path: &Path, rel_path: &str) -> Result<(), IntegrityE
             detail: format!("{rel_path}: not a regular file"),
         });
     }
-    if !native_reader(&mut file, std::env::consts::OS, std::env::consts::ARCH) {
+    if !native_reader(&mut file, std::env::consts::OS, arch) {
         return Err(IntegrityError::NotNativeExecutable {
             path: rel_path.to_owned(),
         });
@@ -1488,6 +1516,38 @@ mod tests {
                     assert!(!native_executable(&bytes, platform, "unsupported"));
                 }
             }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn generate_for_arch_accepts_x86_64_but_verify_requires_host() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(dir.path(), "cos72");
+        fs::write(
+            dir.path().join("bin/cos72"),
+            macho_with_entry(object::macho::LC_MAIN),
+        )
+        .unwrap();
+        let executables = ["bin/cos72".into()];
+        assert!(matches!(
+            generate(dir.path(), &executables),
+            Err(IntegrityError::NotNativeExecutable { .. })
+        ));
+        generate_for_arch(dir.path(), &executables, "x86_64").unwrap();
+        assert!(matches!(
+            verify(dir.path()),
+            Err(IntegrityError::NotNativeExecutable { .. })
+        ));
+    }
+
+    #[test]
+    fn generate_for_arch_rejects_unknown_arch_before_reading_package() {
+        let dir = tempfile::tempdir().unwrap();
+        for arch in ["unknown", "arm64", "", "X86_64"] {
+            assert!(
+                matches!(generate_for_arch(dir.path(), &[], arch), Err(IntegrityError::ManifestInvalid { detail }) if detail == "unsupported target architecture (expected aarch64 or x86_64)")
+            );
         }
     }
 
