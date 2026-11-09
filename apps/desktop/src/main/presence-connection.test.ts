@@ -133,6 +133,21 @@ describe('presence connection (M5 B3, K-B3 frames)', () => {
     await vi.waitFor(() => expect(pong).toEqual({ v: 1, op: PRESENCE.pong, nonce: 'p1' }))
   })
 
+  it.each([
+    ['a ping without a nonce', { op: PRESENCE.ping }],
+    ['a frame that has no place here (a token)', { op: 'enrolled', token: 'tok', http_port: 1 }],
+  ])('%s ends the connection, unanswered', async (_name, bad) => {
+    const lines: Record<string, unknown>[] = []
+    const { sock, connections } = await fakeDaemon(async (peer, n) => {
+      await handshake(peer)
+      if (n === 1) peer.send(bad)
+      for (;;) lines.push(await peer.line())
+    })
+    connection(sock, async () => 'deny')
+    await vi.waitFor(() => expect(connections()).toBe(2), { timeout: 5_000 })
+    expect(lines).toEqual([])
+  })
+
   it('a cancel closes the open box and nothing is answered', async () => {
     let closed = false
     const lines: Record<string, unknown>[] = []
