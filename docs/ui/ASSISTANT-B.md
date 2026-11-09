@@ -46,16 +46,16 @@
 - 自己的 child（宿主令牌）和 legacy 守护进程没有登记连接，只发一次普通请求，行为和以前一样。
 - `ipc/index.ts` 里经 `proxyToBackend` 的请求（通用代理和各个专用 IPC）都走这条路。main.ts 里直接调用 `proxyRequest` 的几处只读请求（runs、schedules、chat）不涉及 Elevated 路由，没有改。
 
-## 4. 服务模式下的审批确认两次（PM 11-09：先保持）
+## 4. 审批只确认一次（General 11-09）
 
-`POST /api/v1/approvals/{id}` 是 Elevated 路由。所以在服务模式下，批一次审批要确认两次：
+两种模式下，批一次审批都只弹一个框：
 
-1. 审批 IPC（ApprovalDecide）自己的原生确认框。框里显示的是 main 从守护进程读出的审批记录：决定、种类、摘要、run、工具参数。
-2. 用户确认后发出 POST，守护进程回 `403 presence_required`，main 提权，守护进程再弹一次 presence 框。
+- **自己的 child（宿主令牌）**：守护进程不要求 presence。弹的是审批 IPC（ApprovalDecide）自己的原生框，内容是 main 从守护进程读出的审批记录（决定、种类、摘要、run、工具参数）。
+- **服务模式**：`POST /api/v1/approvals/{id}` 是 Elevated 路由。弹的是守护进程的 presence 框，内容是 K-B3b 的 ApprovalDecision 摘要（决定范围、run、工具），grant 60 秒、只能用一次。ApprovalDecide 自己的框跳过：它和 presence 框的信息同源，第二个框只会让用户习惯不看就点。
 
-自己的 child（宿主令牌）不受影响：守护进程不要求 presence，只有第 1 个框。
+判定依据：当前连接是服务守护进程的登记（`daemonElevation()` 不为 null）。presence 连接还没连上时，守护进程回 `presence_unavailable`，审批不会生效，页面收到 403。
 
-开关只有一处：`elevated-request.ts` 的 `SKIP_APPROVAL_CONFIRM_IN_SERVICE_MODE`，默认 `false`。改成 `true` 后，服务模式下不再弹第 1 个框，只留 presence 框；自己的 child 照旧。切换条件：在真守护进程上看到 K-B3b 的 ApprovalDecision 摘要，确认它覆盖了第 1 个框现有的信息（决定范围、run、工具）。
+开关只有一处：`elevated-request.ts` 的 `SKIP_APPROVAL_CONFIRM_IN_SERVICE_MODE`，默认 `true`，也就是默认只确认一次。这个开关只供诊断：改成 `false` 会回到服务模式下两个框。在真守护进程上看过 K-B3b 的摘要后，如果发现缺信息，应补进摘要，而不是回到两个框。
 
 ## 5. 已知局限
 

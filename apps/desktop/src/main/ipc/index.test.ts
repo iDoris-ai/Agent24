@@ -157,7 +157,7 @@ beforeAll(async () => {
     req.on('end', () => {
       if (!(req.method === 'GET' && req.url === '/api/v1/comm/identity') && !(req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/')) && !(req.method === 'GET' && req.url === '/api/v1/os') && !(req.method === 'GET' && req.url === '/api/v1/attached') && !(req.method === 'GET' && req.url === '/api/v1/comm/relay')) seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: Buffer.concat(chunks).toString() })
       res.setHeader('Content-Type', 'application/json')
-      if (presenceGate && req.method === 'POST' && req.url === '/api/v1/schedules') {
+      if (presenceGate && req.method === 'POST' && (req.url === '/api/v1/schedules' || req.url?.startsWith('/api/v1/approvals/'))) {
         const grant = req.headers['x-agent24-elevation']
         elevationHeaders.push(typeof grant === 'string' ? grant : undefined)
         if (grant !== 'grant-1') {
@@ -376,13 +376,30 @@ describe('A1 backendProxy allowlist', () => {
       expect(seen[0]?.url).toBe('/api/v1/approvals/ap_1')
       expect(JSON.parse(seen[0]!.body)).toEqual({ type: 'approve' })
     })
-    it('service mode, switch off (the default): its own box still asks first, then the daemon asks for presence (M5 B3)', async () => {
-      elevation.current = async (_r, use) => use('grant-1')
-      showMessageBox.mockResolvedValue({ response: 1 })
+    it('service mode: one box, the daemon\'s presence box; its own is skipped (M5 B3, General 11-09)', async () => {
+      presenceGate = true
+      const presenceBoxes: string[] = []
+      elevation.current = async (r, use) => { presenceBoxes.push(`${r.method} ${r.path}`); return use('grant-1') }
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(presenceBoxes).toEqual(['POST /api/v1/approvals/ap_1'])
+      expect(res.ok).toBe(true)
+      expect(elevationHeaders).toEqual([undefined, 'grant-1'])
+    })
+    it('service mode, the presence box refused: nothing approved, still no box of its own', async () => {
+      presenceGate = true
+      elevation.current = async () => { throw new Error('denied') }
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(res).toMatchObject({ ok: false, status: 403 })
+      expect(elevationHeaders).toEqual([undefined])
+    })
+    it('our own child: one box, its own, and no presence asked', async () => {
+      showMessageBox.mockResolvedValue({ response: 0 })
       const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })
       expect(showMessageBox).toHaveBeenCalledTimes(1)
-      expect(res.data.error.code).toBe('cancelled')
-      expect(seen).toHaveLength(0)
+      expect(res.ok).toBe(true)
+      expect(elevation.current).toBeNull()
     })
     it('sends nothing when the user cancels', async () => {
       showMessageBox.mockResolvedValue({ response: 1 })

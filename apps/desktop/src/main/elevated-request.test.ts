@@ -97,15 +97,15 @@ describe('sendElevating (M5 B3)', () => {
   })
 })
 
-describe('approvalConfirmShown (PM 11-09: one switch, off by default)', () => {
-  it('is off: every approval keeps its own box, also in service mode', () => {
-    expect(SKIP_APPROVAL_CONFIRM_IN_SERVICE_MODE).toBe(false)
-    expect(approvalConfirmShown(true)).toBe(true)
+describe('approvalConfirmShown (General 11-09: one switch, on by default)', () => {
+  it('is on: service mode drops its own box (the presence box asks), our own child keeps it', () => {
+    expect(SKIP_APPROVAL_CONFIRM_IN_SERVICE_MODE).toBe(true)
+    expect(approvalConfirmShown(true)).toBe(false)
     expect(approvalConfirmShown(false)).toBe(true)
   })
-  it('switched on, only service mode drops it; our own child keeps it', () => {
-    expect(approvalConfirmShown(true, true)).toBe(false)
-    expect(approvalConfirmShown(false, true)).toBe(true)
+  it('switched off, every approval keeps its own box', () => {
+    expect(approvalConfirmShown(true, false)).toBe(true)
+    expect(approvalConfirmShown(false, false)).toBe(true)
   })
 })
 
