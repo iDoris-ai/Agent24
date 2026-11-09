@@ -124,9 +124,11 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
     const state = read()
     // Recorded already (by a catch-up, or heard of twice): its conversation
     // may have been deleted since, and stays so (Codex A5 r3 C3).
-    if (state.handled?.includes(runId)) return null
+    if (state.handled?.includes(runId)) { heard.delete(runId); return null }
     try {
-      return await recordIn(state, scheduleId, runId)
+      const summary = await recordIn(state, scheduleId, runId)
+      heard.delete(runId)
+      return summary
     } catch (err) {
       const now = read()
       if (now.handled === null && !now.retry.includes(runId)) write({ ...now, retry: [...now.retry, runId] })
@@ -164,7 +166,9 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
       // The first time: what is there already is from before main recorded
       // schedules' runs, and stays out; but not the runs heard of live since
       // that could not be recorded.
-      const retry = new Set(state.retry)
+      // Nor those heard of live and not recorded yet: one heard of while
+      // this catch-up waited for the runs waits behind it (PR-Daemon #1704 N1).
+      const retry = new Set([...state.retry, ...heard])
       write({ ...state, handled: due.map(r => r.id).filter(id => !retry.has(id)), retry: [] })
     } else {
       // Only what the daemon still has: a run it no longer lists cannot come
@@ -182,6 +186,9 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
     }
   }
 
+  /** Runs heard of live and not recorded yet, from the moment they are
+   *  heard of, before their turn in the queue. */
+  const heard = new Set<string>()
   let queue: Promise<unknown> = Promise.resolve()
   const enqueue = <T>(job: () => Promise<T>): Promise<T> => {
     const done = queue.then(job)
@@ -191,6 +198,7 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
   return {
     record(scheduleId, runId) {
       if (!ID.test(scheduleId) || !ID.test(runId)) return Promise.reject(new Error('Invalid schedule run'))
+      heard.add(runId)
       return enqueue(() => recordNow(scheduleId, runId))
     },
     catchUp(runs) {

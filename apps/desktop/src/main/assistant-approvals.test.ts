@@ -115,6 +115,22 @@ describe('assistant approvals (M4 A6)', () => {
       expect(list[0]!.tasks.map(t => t.run_id)).toEqual(['run_cli', 'run_cli2'])
     })
 
+    it.each([['the event first', 'live'], ['the catch-up first', 'catchUp']])('gives a run one card, heard of by the event and the catch-up, %s (QA ⑬)', async (_, first) => {
+      const m = approvals()
+      const live = () => m.route('run_cli')
+      const catchUp = () => m.catchUp(pending('run_cli'))
+      if (first === 'live') { await live(); await catchUp() } else { await catchUp(); await live() }
+      const list = history.list()
+      expect(list).toHaveLength(1)
+      expect(list[0]!.tasks.map(t => t.run_id)).toEqual(['run_cli'])
+      expect(ownerOf).toHaveBeenCalledTimes(1)
+    })
+
+    it('gives no card to a run the window asked, waiting for approval when the window opens again: the page is to promote it (QA N6, known limit)', async () => {
+      await approvals().catchUp(pending('run_desk'))
+      expect(history.list()).toHaveLength(0)
+    })
+
     it('routes a run with two pending approvals once', async () => {
       await approvals().catchUp(pending('run_cli', 'run_cli'))
       expect(ownerOf).toHaveBeenCalledTimes(1)

@@ -211,6 +211,29 @@ describe('schedule conversations (M4 A5)', () => {
       expect(history.list()).toHaveLength(0)
     })
 
+    it('records a run heard of live while the first catch-up waits for the runs that list it (PR-Daemon #1704 N1)', async () => {
+      const m = homes()
+      let answer!: (runs: unknown[]) => void
+      const catchUp = m.catchUp(() => new Promise(resolve => { answer = resolve }))
+      await vi.waitFor(() => expect(answer).toBeTypeOf('function'))
+      const live = m.record('sch_1', 'run_new')
+      answer([
+        { id: 'run_old', schedule_id: 'sch_1', created_at: '2026-11-09T00:00:00Z' },
+        { id: 'run_new', schedule_id: 'sch_1', created_at: '2026-11-09T01:00:00Z' },
+      ])
+      await catchUp
+      await live
+      expect(history.list().flatMap(c => c.tasks.map(t => t.run_id))).toEqual(['run_new'])
+    })
+
+    it('takes a run recorded live before the first catch-up as handled there: its deleted conversation stays deleted (PR-Daemon #1704 N1)', async () => {
+      const m = homes()
+      const first = await m.record('sch_1', 'run_1')
+      history.delete(first!.id)
+      await m.catchUp(async () => [{ id: 'run_1', schedule_id: 'sch_1', created_at: '2026-11-09T00:00:00Z' }])
+      expect(history.list()).toHaveLength(0)
+    })
+
     it('records, at the first catch-up, a run heard of live before it that could not be recorded (Codex A5 r3 C2)', async () => {
       const m = homes()
       vi.spyOn(history, 'appendRun').mockImplementationOnce(() => { throw new Error('disk full') })

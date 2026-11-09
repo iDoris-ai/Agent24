@@ -173,6 +173,19 @@ describe('capability routing', () => {
     expect(backendProxy).toHaveBeenCalledWith({ method: 'GET', path: '/api/modules' })
   })
 
+  it('counts on Assistant every pending approval, also of a run no conversation has a card for (QA N6)', async () => {
+    const backendProxy = vi.fn().mockImplementation(({ path }: { path: string }) => Promise.resolve(
+      path === '/api/modules' ? { ok: false, status: 404 } : { ok: true, data: { approvals: [{ id: 'apr_1', run_id: 'run_desk' }, { id: 'apr_2', run_id: 'run_cli' }] } },
+    ))
+    window.agent24 = { backendProxy } as unknown as Window['agent24']
+    const view = render(<CapabilitiesProvider><NavPrefsProvider><RouteView /></NavPrefsProvider></CapabilitiesProvider>)
+    try {
+      await waitFor(() => expect(screen.getByRole('button', { name: /Assistant/ })).toHaveTextContent('2'))
+    } finally {
+      view.unmount()
+    }
+  })
+
   it('refreshes every five seconds, clears settled approval badges and tolerates unavailable manifests', async () => {
     vi.useFakeTimers()
     let pending = true
