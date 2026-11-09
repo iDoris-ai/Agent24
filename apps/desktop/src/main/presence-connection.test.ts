@@ -223,6 +223,73 @@ describe('presence connection (M5 B3, K-B3 frames)', () => {
     expect(asked.length).toBeLessThanOrEqual(1)
   })
 
+  it.each([
+    ['cancelled', async (peer: Peer) => { peer.send(challenge()); peer.send({ op: PRESENCE.cancel, challenge_id: 'ch1' }) }],
+    ['expired, its box still closing', async (peer: Peer) => {
+      peer.send(challenge({ expires_at: Date.now() / 1000 + 0.05 }))
+      await new Promise((r) => setTimeout(r, 120))
+    }],
+  ])('a new challenge right after one %s is asked on the same connection (Codex B3b C2)', async (_name, first) => {
+    let answer: Record<string, unknown> = {}
+    const { sock, connections } = await fakeDaemon(async (peer) => {
+      await handshake(peer)
+      await first(peer)
+      peer.send(challenge({ challenge_id: 'ch2', nonce: 'n-ch2' }))
+      answer = await peer.line()
+      await new Promise(() => {})
+    })
+    connection(sock, async (c, signal) => (c.challenge_id === 'ch2' ? 'allow' : new Promise((resolve) => {
+      // A box that takes a while to go.
+      signal.addEventListener('abort', () => setTimeout(() => resolve('allow'), 300))
+    })))
+    await vi.waitFor(() => expect(answer).toMatchObject({ op: PRESENCE.answer, challenge_id: 'ch2', decision: 'allow' }))
+    expect(connections()).toBe(1)
+  })
+
+  it('a stop during the handshake ends it: no hello, and stop resolves (Codex B3b C3)', async () => {
+    let speak!: () => void
+    const spoken = new Promise<void>((r) => { speak = r })
+    const got: string[] = []
+    const { sock } = await fakeDaemon(async (peer) => {
+      await spoken
+      peer.send({ op: 'challenge', nonce: NONCE })
+      for (;;) got.push(String((await peer.line())['op']))
+    })
+    const pc = new PresenceConnection({ target: () => ({ socketPath: sock, generation: 'gen-1' }), ask: async () => 'deny', log: () => {} })
+    pc.start()
+    await new Promise((r) => setTimeout(r, 30))
+    const stopped = pc.stop()
+    speak()
+    await stopped
+    await new Promise((r) => setTimeout(r, 30))
+    expect(got).toEqual([])
+    expect(pc.ready).toBe(false)
+  })
+
+  it.each([
+    ['not enrolled at all', null],
+    ['enrolled with a new daemon on the same socket', 'gen-2'],
+  ])('once %s, the connection ends and its box closes (Codex B3b C4)', async (_name, then) => {
+    let enrolled = true
+    let closed = false
+    const { sock, connections } = await fakeDaemon(async (peer) => {
+      await handshake(peer)
+      peer.send(challenge())
+      await new Promise(() => {})
+    })
+    const pc = new PresenceConnection({
+      target: () => (enrolled ? { socketPath: sock, generation: 'gen-1' } : then === null ? null : { socketPath: sock, generation: then }),
+      ask: (_c, signal) => new Promise((resolve) => { signal.addEventListener('abort', () => { closed = true; resolve('allow') }) }),
+      log: () => {},
+    })
+    pc.start()
+    cleanups.push(() => pc.stop())
+    await vi.waitFor(() => expect(pc.ready).toBe(true))
+    enrolled = false
+    await vi.waitFor(() => expect(closed).toBe(true), { timeout: 8_000 })
+    expect(connections()).toBe(1)
+  }, 12_000)
+
   it('stays idle with no service daemon to connect to', async () => {
     const pc = new PresenceConnection({ target: () => null, ask: async () => 'deny', sleep: async (_ms, signal) => { await new Promise((r) => setTimeout(r, 5)); void signal } })
     pc.start()

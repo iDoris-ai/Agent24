@@ -1,18 +1,13 @@
 // M5 B3 (#1717): main's presence connection to the daemon the LaunchAgent
-// runs. In service mode main holds no host token, so the daemon cannot ask it
-// for a presence proof over HTTP; it asks over a second enrolment connection
-// instead (K-B3 #1715, R0 A): `hello` with `role: "presence"`, answered by
-// `presence_ready` and no token. On it the daemon sends `presence_challenge`,
-// main shows the native box and answers `presence_answer`; the daemon pings
-// every minute. The token connection (B2) is untouched by any of this.
+// runs. Main holds no host token there, so the daemon asks over a second
+// enrolment connection (K-B3 #1715): `hello` with `role: "presence"` →
+// `presence_ready`, no token; then `presence_challenge` → the native box →
+// `presence_answer`, and a ping every minute. Frames: docs/ui/ASSISTANT-B.md.
 //
 // Only main answers: the box is the only source of a decision, nothing here
 // is reachable from the renderer, and an answer goes only on the connection
-// its challenge came on. Frame and field names are K-B3's (#1715,
-// issuecomment-6732349252), all in `PRESENCE` so a change there is one edit.
-//
-// No credential is involved: the connection carries no token, and nothing
-// from a challenge but its id and code is logged.
+// its challenge came on. No token is involved; nothing from a challenge but
+// its id and code is logged.
 
 import type net from 'node:net'
 import { EnrolError, hello, openEnrolConnection, type EnrolConnection, type Frame } from './daemon-enroll'
@@ -34,7 +29,7 @@ export const PRESENCE = {
 export const PRESENCE_SILENCE_MS = 2 * 60_000 + 10_000
 export const RECONNECT_MIN_MS = 1_000
 export const RECONNECT_MAX_MS = 30_000
-/** How often to look again when there is no service daemon to connect to. */
+/** How often to look again for a service daemon, and whether it is still the one enrolled with. */
 export const IDLE_MS = 5_000
 const MAX_ID = 200
 
@@ -132,8 +127,7 @@ export class PresenceConnection {
         backoff = RECONNECT_MIN_MS
       } catch (error) {
         if (signal.aborted) break
-        // presence_conflict: the daemon still holds an old connection of ours;
-        // it clears a dead one, so trying again shortly gets through.
+        // presence_conflict: the daemon still holds a dead connection of ours; it clears it.
         this.deps.log(`presence connection ended (${error instanceof EnrolError ? error.code : 'internal'})`)
         await this.deps.sleep(backoff, signal)
         backoff = Math.min(backoff * 2, RECONNECT_MAX_MS)
@@ -146,7 +140,13 @@ export class PresenceConnection {
     const { conn, nonce } = await openEnrolConnection(target.socketPath, this.deps.connect)
     const onAbort = (): void => conn.close()
     signal.addEventListener('abort', onAbort)
-    let open: { id: string; abort: AbortController } | null = null
+    if (signal.aborted) conn.close() // a stop() during the handshake (Codex B3b C3)
+    // No longer enrolled with it (tray stop, our own child): end too (C4).
+    const watch = setInterval(() => {
+      const now = this.deps.target()
+      if (now?.socketPath !== target.socketPath || now.generation !== target.generation) conn.close()
+    }, IDLE_MS)
+    let open: { id: string; expiresAt: number; abort: AbortController } | null = null
     try {
       const ready = await hello(conn, nonce, target.generation, { role: PRESENCE.role })
       // Never a token here: an `enrolled` frame is as wrong as any other.
@@ -163,15 +163,19 @@ export class PresenceConnection {
           case PRESENCE.challenge: {
             const challenge = parseSocketChallenge(frame)
             if (!challenge) throw new EnrolError('bad_frame', 'malformed presence challenge')
-            // The daemon sends one at a time; a second while one is open is a fault.
-            if (open) throw new EnrolError('bad_frame', 'a second challenge while one is open')
-            const box = { id: challenge.challenge_id, abort: new AbortController() }
+            // The daemon sends one at a time; a second while one is open is a
+            // fault. One cancelled or expired is closed, its box going (C2).
+            if (open && this.deps.nowMs() < open.expiresAt * 1000) throw new EnrolError('bad_frame', 'a second challenge while one is open')
+            const box = { id: challenge.challenge_id, expiresAt: challenge.expires_at, abort: new AbortController() }
             open = box
             void this.answer(conn, challenge, box.abort.signal).finally(() => { if (open === box) open = null })
             break
           }
           case PRESENCE.cancel: {
-            if (open && frame['challenge_id'] === open.id) open.abort.abort()
+            if (open && frame['challenge_id'] === open.id) {
+              open.abort.abort()
+              open = null
+            }
             break
           }
           case PRESENCE.answered: {
@@ -183,6 +187,7 @@ export class PresenceConnection {
         }
       }
     } finally {
+      clearInterval(watch)
       this.connected = false
       // The daemon settles an unanswered challenge as Unavailable: close its box.
       ;(open as { abort: AbortController } | null)?.abort.abort()
