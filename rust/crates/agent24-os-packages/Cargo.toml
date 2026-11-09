@@ -19,7 +19,7 @@ serde_yaml = "0.9"
 # For `geteuid` — a SAFE wrapper over the syscall. See `effective_uid`: the
 # dependency-free alternative (create a file, ask who owns it) was attacker-
 # influenceable, which is a worse trade than one small crate.
-rustix = { version = "0.38", features = ["process"] }
+rustix = { version = "0.38", features = ["process", "fs"] }
 # The manifest digest a module reports in its handshake (SUP-4).
 sha2 = "0.10"
 tokio-util = "0.7"

@@ -238,13 +238,21 @@ fn verify_declared(
 const HEADER_WINDOW: usize = 1024 * 1024;
 const MAX_FAT_ARCHES: usize = 32;
 
-fn native_macho<H: object::read::macho::MachHeader>(data: &[u8]) -> bool {
+fn native_macho<H: object::read::macho::MachHeader>(data: &[u8], arch: &str) -> bool {
     let Ok(header) = H::parse(data, 0) else {
         return false;
     };
     let Ok(endian) = header.endian() else {
         return false;
     };
+    let machine = match arch {
+        "aarch64" => object::macho::CPU_TYPE_ARM64,
+        "x86_64" => object::macho::CPU_TYPE_X86_64,
+        _ => return false,
+    };
+    if header.cputype(endian) != machine {
+        return false;
+    }
     if header.filetype(endian) != object::macho::MH_EXECUTE {
         return false;
     }
@@ -252,35 +260,57 @@ fn native_macho<H: object::read::macho::MachHeader>(data: &[u8]) -> bool {
     let Ok(mut commands) = header.load_commands(endian, data, 0) else {
         return false;
     };
+    let mut has_entry = false;
     loop {
         match commands.next() {
-            Ok(Some(_)) => {}
-            Ok(None) => return true,
+            Ok(Some(command)) => {
+                has_entry |= matches!(
+                    command.cmd(),
+                    object::macho::LC_MAIN | object::macho::LC_UNIXTHREAD
+                );
+            }
+            Ok(None) => return has_entry,
             Err(_) => return false,
         }
     }
 }
 
-fn native_elf<H: object::read::elf::FileHeader>(data: &[u8]) -> bool {
+fn native_elf<H: object::read::elf::FileHeader>(data: &[u8], arch: &str) -> bool {
     let Ok(header) = H::parse(data) else {
         return false;
     };
     let Ok(endian) = header.endian() else {
         return false;
     };
+    let machine = match arch {
+        "aarch64" => object::elf::EM_AARCH64,
+        "x86_64" => object::elf::EM_X86_64,
+        _ => return false,
+    };
+    if header.e_machine(endian) != machine {
+        return false;
+    }
     matches!(
         header.e_type(endian),
         object::elf::ET_EXEC | object::elf::ET_DYN
     ) && header.e_entry(endian).into() != 0
 }
 
-fn native_pe<H: object::read::pe::ImageNtHeaders>(data: &[u8]) -> bool {
+fn native_pe<H: object::read::pe::ImageNtHeaders>(data: &[u8], arch: &str) -> bool {
     let Ok(dos) = object::pe::ImageDosHeader::parse(data) else {
         return false;
     };
     let Ok((header, _)) = H::parse(data, &mut u64::from(dos.nt_headers_offset())) else {
         return false;
     };
+    let machine = match arch {
+        "aarch64" => object::pe::IMAGE_FILE_MACHINE_ARM64,
+        "x86_64" => object::pe::IMAGE_FILE_MACHINE_AMD64,
+        _ => return false,
+    };
+    if header.file_header().machine.get(object::LittleEndian) != machine {
+        return false;
+    }
     let flags = header
         .file_header()
         .characteristics
@@ -288,20 +318,24 @@ fn native_pe<H: object::read::pe::ImageNtHeaders>(data: &[u8]) -> bool {
     flags & object::pe::IMAGE_FILE_EXECUTABLE_IMAGE != 0 && flags & object::pe::IMAGE_FILE_DLL == 0
 }
 
-fn native_executable(data: &[u8], platform: &str) -> bool {
+fn native_executable(data: &[u8], platform: &str, arch: &str) -> bool {
     use object::{Endianness, FileKind};
     let data = &data[..data.len().min(HEADER_WINDOW)];
     match (platform, FileKind::parse(data)) {
         ("macos", Ok(FileKind::MachO32)) => {
-            native_macho::<object::macho::MachHeader32<Endianness>>(data)
+            native_macho::<object::macho::MachHeader32<Endianness>>(data, arch)
         }
         ("macos", Ok(FileKind::MachO64)) => {
-            native_macho::<object::macho::MachHeader64<Endianness>>(data)
+            native_macho::<object::macho::MachHeader64<Endianness>>(data, arch)
         }
-        ("linux", Ok(FileKind::Elf32)) => native_elf::<object::elf::FileHeader32<Endianness>>(data),
-        ("linux", Ok(FileKind::Elf64)) => native_elf::<object::elf::FileHeader64<Endianness>>(data),
-        ("windows", Ok(FileKind::Pe32)) => native_pe::<object::pe::ImageNtHeaders32>(data),
-        ("windows", Ok(FileKind::Pe64)) => native_pe::<object::pe::ImageNtHeaders64>(data),
+        ("linux", Ok(FileKind::Elf32)) => {
+            native_elf::<object::elf::FileHeader32<Endianness>>(data, arch)
+        }
+        ("linux", Ok(FileKind::Elf64)) => {
+            native_elf::<object::elf::FileHeader64<Endianness>>(data, arch)
+        }
+        ("windows", Ok(FileKind::Pe32)) => native_pe::<object::pe::ImageNtHeaders32>(data, arch),
+        ("windows", Ok(FileKind::Pe64)) => native_pe::<object::pe::ImageNtHeaders64>(data, arch),
         _ => false,
     }
 }
@@ -325,10 +359,11 @@ fn read_header(reader: &mut impl Read, size: u64) -> io::Result<Vec<u8>> {
 fn native_fat_slice<A: object::read::macho::FatArch>(
     reader: &mut (impl Read + Seek),
     arches: &[A],
+    arch: &str,
 ) -> bool {
-    let host = if cfg!(target_arch = "aarch64") {
+    let host = if arch == "aarch64" {
         object::Architecture::Aarch64
-    } else if cfg!(target_arch = "x86_64") {
+    } else if arch == "x86_64" {
         object::Architecture::X86_64
     } else {
         return false;
@@ -339,8 +374,8 @@ fn native_fat_slice<A: object::read::macho::FatArch>(
     arches
         .iter()
         .find(|arch| arch.architecture() == host)
-        .is_some_and(|arch| {
-            let (offset, size) = arch.file_range();
+        .is_some_and(|slice| {
+            let (offset, size) = slice.file_range();
             if offset
                 .checked_add(size)
                 .zip(reader.seek(SeekFrom::End(0)).ok())
@@ -349,11 +384,12 @@ fn native_fat_slice<A: object::read::macho::FatArch>(
                 return false;
             }
             reader.seek(SeekFrom::Start(offset)).is_ok()
-                && read_header(reader, size).is_ok_and(|window| native_executable(&window, "macos"))
+                && read_header(reader, size)
+                    .is_ok_and(|window| native_executable(&window, "macos", arch))
         })
 }
 
-fn native_reader(reader: &mut (impl Read + Seek), platform: &str) -> bool {
+fn native_reader(reader: &mut (impl Read + Seek), platform: &str, arch: &str) -> bool {
     use object::read::macho::{MachOFatFile32, MachOFatFile64};
     let Ok(window) = read_header(reader, u64::MAX) else {
         return false;
@@ -361,22 +397,43 @@ fn native_reader(reader: &mut (impl Read + Seek), platform: &str) -> bool {
     match object::FileKind::parse(window.as_slice()) {
         Ok(object::FileKind::MachOFat32) if platform == "macos" => {
             MachOFatFile32::parse(window.as_slice())
-                .is_ok_and(|fat| native_fat_slice(reader, fat.arches()))
+                .is_ok_and(|fat| native_fat_slice(reader, fat.arches(), arch))
         }
         Ok(object::FileKind::MachOFat64) if platform == "macos" => {
             MachOFatFile64::parse(window.as_slice())
-                .is_ok_and(|fat| native_fat_slice(reader, fat.arches()))
+                .is_ok_and(|fat| native_fat_slice(reader, fat.arches(), arch))
         }
-        _ => native_executable(&window, platform),
+        _ => native_executable(&window, platform, arch),
     }
 }
 
 fn check_native_executable(path: &Path, rel_path: &str) -> Result<(), IntegrityError> {
-    // generate/verify have already rejected symlinks via collect_payload/verify_tree.
-    let mut file = File::open(path).map_err(|err| IntegrityError::CheckFailed {
+    #[cfg(unix)]
+    let opened = {
+        use rustix::fs::{Mode, OFlags};
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(io::Error::from)
+    };
+    // On Windows rustix is unavailable; collect_payload/verify_tree already rejected symlinks.
+    #[cfg(not(unix))]
+    let opened = File::open(path);
+    let mut file = opened.map_err(|err| IntegrityError::CheckFailed {
         detail: format!("{rel_path}: {err}"),
     })?;
-    if !native_reader(&mut file, std::env::consts::OS) {
+    let metadata = file.metadata().map_err(|err| IntegrityError::CheckFailed {
+        detail: format!("{rel_path}: {err}"),
+    })?;
+    if !metadata.is_file() {
+        return Err(IntegrityError::CheckFailed {
+            detail: format!("{rel_path}: not a regular file"),
+        });
+    }
+    if !native_reader(&mut file, std::env::consts::OS, std::env::consts::ARCH) {
         return Err(IntegrityError::NotNativeExecutable {
             path: rel_path.to_owned(),
         });
@@ -1213,6 +1270,178 @@ mod tests {
     }
 
     #[test]
+    fn native_macho_architectures_must_match() {
+        check_architectures("macos");
+    }
+
+    #[test]
+    fn native_elf_architectures_must_match() {
+        check_architectures("linux");
+    }
+
+    #[test]
+    fn native_pe_architectures_must_match() {
+        check_architectures("windows");
+    }
+
+    fn check_architectures(platform_filter: &str) {
+        for (platform, offset, machines) in [
+            (
+                "macos",
+                4,
+                [
+                    object::macho::CPU_TYPE_ARM64,
+                    object::macho::CPU_TYPE_X86_64,
+                ],
+            ),
+            (
+                "linux",
+                18,
+                [
+                    u32::from(object::elf::EM_AARCH64),
+                    u32::from(object::elf::EM_X86_64),
+                ],
+            ),
+            (
+                "windows",
+                68,
+                [
+                    u32::from(object::pe::IMAGE_FILE_MACHINE_ARM64),
+                    u32::from(object::pe::IMAGE_FILE_MACHINE_AMD64),
+                ],
+            ),
+        ] {
+            if platform != platform_filter {
+                continue;
+            }
+            let mut bytes = match platform {
+                "macos" => macho_with_entry(object::macho::LC_MAIN),
+                "linux" => {
+                    let mut bytes = vec![0; 64];
+                    bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+                    bytes[16..18].copy_from_slice(&object::elf::ET_EXEC.to_le_bytes());
+                    bytes[24..32].copy_from_slice(&4096u64.to_le_bytes());
+                    bytes
+                }
+                _ => {
+                    let mut bytes = vec![0; 328];
+                    bytes[..2].copy_from_slice(b"MZ");
+                    bytes[60..64].copy_from_slice(&64u32.to_le_bytes());
+                    bytes[64..68].copy_from_slice(b"PE\0\0");
+                    bytes[84..86].copy_from_slice(&240u16.to_le_bytes());
+                    bytes[86..88]
+                        .copy_from_slice(&object::pe::IMAGE_FILE_EXECUTABLE_IMAGE.to_le_bytes());
+                    bytes[88..90]
+                        .copy_from_slice(&object::pe::IMAGE_NT_OPTIONAL_HDR64_MAGIC.to_le_bytes());
+                    bytes
+                }
+            };
+            for (index, arch) in ["aarch64", "x86_64"].iter().enumerate() {
+                for machine in [machines[index], machines[1 - index], 0] {
+                    let width = if platform == "macos" { 4 } else { 2 };
+                    bytes[offset..offset + width].copy_from_slice(&machine.to_le_bytes()[..width]);
+                    assert_eq!(
+                        native_executable(&bytes, platform, arch),
+                        machine == machines[index],
+                        "{platform} {arch} {machine}"
+                    );
+                    assert!(!native_executable(&bytes, platform, "unsupported"));
+                }
+            }
+        }
+    }
+
+    fn macho_with_entry(command: u32) -> Vec<u8> {
+        let mut bytes = macho_header(1, 24);
+        bytes.extend_from_slice(&command.to_le_bytes());
+        bytes.extend_from_slice(&24u32.to_le_bytes());
+        bytes.extend_from_slice(&[0; 16]);
+        bytes
+    }
+
+    #[test]
+    fn native_macho_requires_entry_command() {
+        assert!(!native_executable(&macho_header(0, 0), "macos", "x86_64"));
+        let mut segment = macho_header(1, 72);
+        segment.extend_from_slice(&object::macho::LC_SEGMENT_64.to_le_bytes());
+        segment.extend_from_slice(&72u32.to_le_bytes());
+        segment.resize(104, 0);
+        assert!(!native_executable(&segment, "macos", "x86_64"));
+        for command in [object::macho::LC_MAIN, object::macho::LC_UNIXTHREAD] {
+            assert!(native_executable(
+                &macho_with_entry(command),
+                "macos",
+                "x86_64"
+            ));
+        }
+    }
+
+    #[test]
+    fn native_fat_rejects_mislabeled_slice() {
+        let bytes = macho_with_entry(object::macho::LC_MAIN);
+        let fat = fat32_with(&[object::macho::CPU_TYPE_ARM64], &bytes);
+        assert!(!native_reader(
+            &mut io::Cursor::new(fat),
+            "macos",
+            "aarch64"
+        ));
+        let fat = fat32_with(&[object::macho::CPU_TYPE_X86_64], &bytes);
+        assert!(native_reader(
+            &mut io::Cursor::new(fat.clone()),
+            "macos",
+            "x86_64"
+        ));
+        assert!(!native_reader(
+            &mut io::Cursor::new(fat),
+            "macos",
+            "unsupported"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_open_rejects_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("executable");
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &path).unwrap();
+        assert!(matches!(
+            check_native_executable(&path, "link"),
+            Err(IntegrityError::CheckFailed { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_open_rejects_fifo_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("executable");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fifo = path.clone();
+        let worker = std::thread::spawn(move || {
+            tx.send(check_native_executable(&fifo, "fifo")).unwrap();
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Unblock a regressed blocking open so the test can fail without hanging.
+        let unblock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        drop(unblock);
+        worker.join().unwrap();
+        assert!(
+            matches!(result.unwrap(), Err(IntegrityError::CheckFailed { detail }) if detail.contains("not a regular file"))
+        );
+    }
+
+    #[test]
     fn native_current_exe_is_accepted() {
         check_native_executable(&std::env::current_exe().unwrap(), "self").unwrap();
     }
@@ -1255,20 +1484,20 @@ mod tests {
         let mut elf = vec![0; 64];
         elf[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
         elf[16..18].copy_from_slice(&2u16.to_le_bytes());
-        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&object::elf::EM_X86_64.to_le_bytes());
         elf[20..24].copy_from_slice(&1u32.to_le_bytes());
         elf[24..32].copy_from_slice(&4096u64.to_le_bytes());
         elf[52..54].copy_from_slice(&64u16.to_le_bytes());
-        assert!(native_executable(elf.as_slice(), "linux"));
+        assert!(native_executable(elf.as_slice(), "linux", "x86_64"));
         elf[16..18].copy_from_slice(&3u16.to_le_bytes());
-        assert!(native_executable(elf.as_slice(), "linux"));
+        assert!(native_executable(elf.as_slice(), "linux", "x86_64"));
         elf[24..32].fill(0);
-        assert!(!native_executable(elf.as_slice(), "linux"));
+        assert!(!native_executable(elf.as_slice(), "linux", "x86_64"));
         elf[24..32].copy_from_slice(&4096u64.to_le_bytes());
         elf[16..18].copy_from_slice(&1u16.to_le_bytes());
-        assert!(!native_executable(elf.as_slice(), "linux"));
+        assert!(!native_executable(elf.as_slice(), "linux", "x86_64"));
         elf[4] = 0;
-        assert!(!native_executable(elf.as_slice(), "linux"));
+        assert!(!native_executable(elf.as_slice(), "linux", "x86_64"));
     }
 
     #[test]
@@ -1278,21 +1507,23 @@ mod tests {
             pe[..2].copy_from_slice(b"MZ");
             pe[60..64].copy_from_slice(&(offset as u32).to_le_bytes());
             pe[offset..offset + 4].copy_from_slice(b"PE\0\0");
-            pe[offset + 4..offset + 6].copy_from_slice(&0x8664u16.to_le_bytes());
+            pe[offset + 4..offset + 6]
+                .copy_from_slice(&object::pe::IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
             pe[offset + 20..offset + 22].copy_from_slice(&240u16.to_le_bytes());
             pe[offset + 22..offset + 24].copy_from_slice(&2u16.to_le_bytes());
             pe[offset + 24..offset + 26].copy_from_slice(&0x20bu16.to_le_bytes());
-            assert_eq!(native_executable(&pe, "windows"), offset == 8192);
+            assert_eq!(native_executable(&pe, "windows", "x86_64"), offset == 8192);
             pe[offset + 22..offset + 24].copy_from_slice(&0x2002u16.to_le_bytes());
-            assert!(!native_executable(&pe, "windows"));
+            assert!(!native_executable(&pe, "windows", "x86_64"));
             pe[offset + 22..offset + 24].fill(0);
-            assert!(!native_executable(&pe, "windows"));
+            assert!(!native_executable(&pe, "windows", "x86_64"));
         }
     }
 
     fn macho_header(commands: u32, size: u32) -> Vec<u8> {
         let mut bytes = vec![0; 32];
         bytes[..4].copy_from_slice(&0xfeedfacfu32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&object::macho::CPU_TYPE_X86_64.to_le_bytes());
         bytes[12..16].copy_from_slice(&object::macho::MH_EXECUTE.to_le_bytes());
         bytes[16..20].copy_from_slice(&commands.to_le_bytes());
         bytes[20..24].copy_from_slice(&size.to_le_bytes());
@@ -1301,18 +1532,20 @@ mod tests {
 
     #[test]
     fn native_macho_commands_must_fit_window() {
-        let mut bytes = macho_header(0, HEADER_WINDOW as u32);
+        let mut bytes = macho_header(1, HEADER_WINDOW as u32);
         bytes.resize(HEADER_WINDOW + 32, 0);
-        assert!(!native_executable(&bytes, "macos"));
+        bytes[32..36].copy_from_slice(&object::macho::LC_MAIN.to_le_bytes());
+        bytes[36..40].copy_from_slice(&24u32.to_le_bytes());
+        assert!(!native_executable(&bytes, "macos", "x86_64"));
         bytes[20..24].copy_from_slice(&((HEADER_WINDOW - 32) as u32).to_le_bytes());
-        assert!(native_executable(&bytes, "macos"));
+        assert!(native_executable(&bytes, "macos", "x86_64"));
     }
 
     #[test]
     fn native_macho_malformed_command_is_rejected() {
         let mut bytes = macho_header(1, 8);
         bytes.extend_from_slice(&[0; 8]);
-        assert!(!native_executable(&bytes, "macos"));
+        assert!(!native_executable(&bytes, "macos", "x86_64"));
     }
 
     #[test]
@@ -1339,7 +1572,7 @@ mod tests {
                 self.inner.seek(pos)
             }
         }
-        let mut bytes = macho_header(128, 128 * 24);
+        let mut bytes = macho_header(129, 129 * 24);
         for _ in 0..128 {
             for field in [
                 object::macho::LC_SYMTAB,
@@ -1352,19 +1585,18 @@ mod tests {
                 bytes.extend_from_slice(&field.to_le_bytes());
             }
         }
+        bytes.extend_from_slice(&object::macho::LC_MAIN.to_le_bytes());
+        bytes.extend_from_slice(&24u32.to_le_bytes());
+        bytes.extend_from_slice(&[0; 16]);
         bytes.resize(4 * HEADER_WINDOW, 0);
-        let host = if cfg!(target_arch = "aarch64") {
-            0x0100_000c
-        } else {
-            0x0100_0007
-        };
+        let host = object::macho::CPU_TYPE_X86_64;
         for data in [bytes.clone(), fat32_with(&[host], &bytes)] {
             let mut reader = CountingReader {
                 inner: io::Cursor::new(data),
                 read: 0,
                 interrupted: false,
             };
-            assert!(native_reader(&mut reader, "macos"));
+            assert!(native_reader(&mut reader, "macos", "x86_64"));
             assert!(
                 reader.read <= 2 * HEADER_WINDOW,
                 "read {} bytes",
@@ -1378,7 +1610,7 @@ mod tests {
     fn native_non_executable_and_foreign_format_are_rejected() {
         let mut bytes = fs::read(std::env::current_exe().unwrap()).unwrap();
         for platform in ["linux", "windows", "unknown"] {
-            assert!(!native_executable(bytes.as_slice(), platform));
+            assert!(!native_executable(bytes.as_slice(), platform, "x86_64"));
         }
         // Change the real Mach-O's filetype to MH_DYLIB.
         bytes[12..16].copy_from_slice(&6u32.to_le_bytes());
@@ -1408,10 +1640,10 @@ mod tests {
         let bytes = fs::read(std::env::current_exe().unwrap()).unwrap();
         let host = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
         // CPU_TYPE_X86_64 and CPU_TYPE_ARM64: whichever this machine is not.
-        let foreign = if host == 0x0100_0007 {
-            0x0100_000c
+        let foreign = if host == object::macho::CPU_TYPE_X86_64 {
+            object::macho::CPU_TYPE_ARM64
         } else {
-            0x0100_0007
+            object::macho::CPU_TYPE_X86_64
         };
         rejects_native_bytes(&fat32_with(&[foreign], &bytes));
         let accepted = fat32_with(&[foreign, host], &bytes);
