@@ -778,8 +778,9 @@ fn knowledge_summary(
 /// unambiguous even if it contains `; ` or other summary punctuation.
 /// Refused rather than dropped or cut: control, format (bidi overrides,
 /// zero-width), line and paragraph separator characters; any whitespace other
-/// than a plain ASCII space; variation selectors; and the invisible filler
-/// letters (U+3164, U+2800, U+115F, U+1160, U+FFA0). A value over
+/// than a plain ASCII space; every `Default_Ignorable_Code_Point` (variation
+/// selectors of both blocks, the Hangul and Mongolian fillers, U+034F, tags,
+/// see [`default_ignorable`]); and U+2800. A value over
 /// `SHOWN_MAX_CHARS` is refused. The length of the *whole* summary is capped
 /// separately (`SUMMARY_MAX_UTF16`, enforced in `elevate`); this function
 /// alone does not stop a long summary from being clipped by the dialog.
@@ -790,16 +791,39 @@ fn shown(value: &str) -> Option<String> {
             get_general_category(c),
             G::Control | G::Format | G::LineSeparator | G::ParagraphSeparator
         ) || (c.is_whitespace() && c != ' ')
-            || matches!(
-                c,
-                '\u{3164}' | '\u{2800}' | '\u{115F}' | '\u{1160}' | '\u{FFA0}' | '\u{FE00}'
-                    ..='\u{FE0F}'
-            )
+            || c == '\u{2800}'
+            || default_ignorable(c)
     };
     if value.chars().count() > SHOWN_MAX_CHARS || value.chars().any(hidden) {
         return None;
     }
     serde_json::to_string(value).ok()
+}
+/// Unicode `Default_Ignorable_Code_Point` (DerivedCoreProperties.txt):
+/// characters a renderer may draw as nothing, so two different ids could
+/// look the same in the dialog. Many are also `Format`, but not all (U+034F,
+/// U+17B4, the variation selectors, the Hangul fillers, unassigned ones).
+fn default_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFF8}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
 }
 pub fn body_digest(body: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -1493,6 +1517,39 @@ mod tests {
             '\u{1160}', '\u{FFA0}', '\t',
         ]) {
             assert_eq!(summary(&format!("a{c}b")), None, "{label}");
+        }
+        // K-B6 (PR-Daemon #1722): every Default_Ignorable_Code_Point, not
+        // only the U+FE00 block; some are not `Format` (U+034F, U+17B4, the
+        // supplementary variation selectors, unassigned U+2065 and U+FFF0).
+        for c in [
+            '\u{034F}',
+            '\u{17B4}',
+            '\u{17B5}',
+            '\u{180B}',
+            '\u{180F}',
+            '\u{2065}',
+            '\u{FFF0}',
+            '\u{FFF8}',
+            '\u{1BCA0}',
+            '\u{1D173}',
+            '\u{E0000}',
+            '\u{E0100}',
+            '\u{E01EF}',
+            '\u{E0FFF}',
+        ] {
+            assert!(default_ignorable(c), "U+{:04X}", c as u32);
+            assert_eq!(summary(&format!("a{c}b")), None, "U+{:04X}", c as u32);
+        }
+        // Visible neighbours of those ranges still show.
+        for c in [
+            '\u{034E}',
+            '\u{17B6}',
+            '\u{1810}',
+            '\u{FFF9}',
+            '\u{E1000}',
+            'é',
+        ] {
+            assert!(!default_ignorable(c), "U+{:04X}", c as u32);
         }
         for (label, daily) in [
             (

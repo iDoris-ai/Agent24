@@ -1482,12 +1482,50 @@ async fn cli_shells_are_not_knowledge_hosts() {
         assert_eq!(run_count(&state).await, 0, "{identifier}");
 
         let body = r#"{"seq":1}"#;
+        // Refused before any approval text is kept: no dialog for a CLI shell.
         let (status, response) =
             send(&router, with_body(Method::PUT, BINDING, &bearer, body)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{identifier} {response}");
         assert!(
-            response.contains("presence_required"),
+            response.contains("host_authority_required"),
             "{identifier} {status} {response}"
         );
+        let (pending, _challenge) = tokio::sync::oneshot::channel();
+        let refused = state
+            .first_party
+            .as_ref()
+            .unwrap()
+            .elevate(
+                &peer,
+                &token.token_id,
+                ElevateRequest {
+                    method: "PUT".into(),
+                    path: BINDING.into(),
+                    body_sha256: body_digest(body.as_bytes()),
+                    client_summary: "ignored".into(),
+                },
+                pending,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            refused.unwrap_err(),
+            EnrollErrorCode::NotElevatedOperation,
+            "{identifier}"
+        );
+        // The handler is the second, independent check: even with a grant
+        // (its approval text put there directly), a CLI shell is no host.
+        state
+            .first_party
+            .as_ref()
+            .unwrap()
+            .remember_knowledge_request(
+                &token.token_id,
+                "PUT",
+                BINDING_TEMPLATE,
+                BINDING,
+                body.as_bytes(),
+            );
         let grant = approve(&state, &peer, &token.token_id, "PUT", BINDING, body).await;
         let (status, response) = send(
             &router,

@@ -1307,6 +1307,12 @@ async fn authorize(
                                 | "/api/v1/host/knowledge/bindings/{binding_id}/credential"
                         )
                     ) {
+                        // The host first, as the handler decides (K-B6): a CLI
+                        // shell is not a Knowledge host, so it never gets an
+                        // approval dialog for a change it could not make.
+                        if !crate::knowledge_host::is_desktop_shell(&authorization.claims) {
+                            return crate::knowledge_host::not_host();
+                        }
                         // A query is never part of these routes, and the grant
                         // gate below refuses one anyway: answer 400 now rather
                         // than ask the user to approve a request that cannot run.

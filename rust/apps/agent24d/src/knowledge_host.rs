@@ -675,19 +675,26 @@ fn host_capability(
         Audience::ProductHost => {
             Some(HostKey::Product(authorization.claims.capability_id).into_key())
         }
-        Audience::FirstPartyShell
-            if authorization
-                .claims
-                .first_party
-                .as_ref()
-                .is_some_and(|claims| {
-                    claims.peer.identity.identifier == DESKTOP_SHELL_IDENTIFIER
-                }) =>
-        {
+        Audience::FirstPartyShell if is_desktop_shell(&authorization.claims) => {
             Some(HostKey::DesktopShell.into_key())
         }
         _ => None,
     }
+}
+
+/// Whether a FirstPartyShell's claims are the desktop's: its peer identifier
+/// is exactly [`DESKTOP_SHELL_IDENTIFIER`]. `server.rs` asks this too, before
+/// it keeps an approval text, so a CLI shell is refused before any dialog.
+pub(crate) fn is_desktop_shell(claims: &crate::capabilities::CapabilityClaims) -> bool {
+    claims
+        .first_party
+        .as_ref()
+        .is_some_and(|first_party| first_party.peer.identity.identifier == DESKTOP_SHELL_IDENTIFIER)
+}
+
+/// The refusal a caller that is not the desktop host gets.
+pub(crate) fn not_host() -> Response {
+    Refused::NotHost.into_response()
 }
 
 /// Opaque, but never a path: an encoded `/` or `\` in the URL must not turn
