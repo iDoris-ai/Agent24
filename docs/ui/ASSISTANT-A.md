@@ -152,7 +152,7 @@ run 的状态怎么来（`renderer/pages/chat/run-status.ts`）：
   - 已知局限（M4 不做，Codex A6 C3）：在停 task 和真正删除之间，main 又往这条对话里追加了 run（例如「助理发起」对话来了新审批），这个 run 不会被停掉，卡片会随对话一起删掉。这段间隔只有几次本机请求那么长。
 - **对话外 run 的审批**（PM 11-09 方案 A，`main/assistant-approvals.ts`）。审批页删掉以后，每个待审批都要在某张卡片上能处理：
   - main 在 `/events` 上听到 `approval.required`，用 `GET /api/v1/runs/{id}` 看这个 run 是谁的：
-    - 带 `schedule_id`、并且 A5 已经把它记进日程的对话：卡片在那里（§7），不用管。A5 先把排在前面的 run 记完再回答（`holds`）。A5 的首次补录算作处理过的、或者没记进去的日程 run，按下面的「其余」处理（Codex A6 C5）。
+    - 带 `schedule_id`、并且 A5 已经把它记进日程的对话：卡片在那里（§7），不用管。A5 先把排在前面的 run 记完再回答（`claim`）。A5 的首次补录算作处理过的、或者没记进去的日程 run，按下面的「其余」处理（Codex A6 C5）。这时 A5 把它记成处理过，以后的补录不再把它记进日程对话，所以不会两处各一张卡（Codex A6 r2 C1）。
     - 它的 session（`GET /api/v1/sessions/{id}`）的 channel 是 `desktop`：是窗口发起的，由页面升格（§3、§4），不用管。
     - 其余的（命令行的 `agent24`、别的 channel、没有 session、session 已经不在）：作为 task 记进一条「助理发起」对话（三语，main-i18n `assistant.conversationTitle`，`title_source = 'assistant'`）。卡片上有确认和拒绝。这条对话第一次用到时用 `create` 新建，之后都记在这里。
   - daemon 说不清（连不上、答复不对）：这个 run 不算处理过，下次补录再分。

@@ -136,7 +136,7 @@ function assistantApprovals(): AssistantApprovals {
       const data = run.data as { schedule_id?: unknown; session_id?: unknown } | null
       if (!run.ok || data === null) throw new Error(`run_unavailable_${run.status}`)
       if (typeof data.schedule_id === 'string' && data.schedule_id !== '') {
-        return (await scheduleConversations().holds(data.schedule_id, runId)) ? 'schedule' : 'other'
+        return (await scheduleConversations().claim(data.schedule_id, runId)) ? 'schedule' : 'other'
       }
       if (typeof data.session_id !== 'string' || data.session_id === '') return 'other'
       const session = await daemonGet(`/api/v1/sessions/${encodeURIComponent(data.session_id)}`)

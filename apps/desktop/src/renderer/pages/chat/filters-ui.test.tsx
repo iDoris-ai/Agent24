@@ -2,6 +2,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { chatMessages } from '../Chat.i18n'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { createChatHistoryStore } from '../../../main/chat-history'
@@ -206,6 +207,14 @@ describe('deleting asks first, naming the tasks it stops (M4 A6)', () => {
     fireEvent.click(within(list()).getByRole('button', { name: '清空' }))
     expect(confirm).toHaveBeenLastCalledWith('删除这台电脑上保存的全部对话？2 个进行中的任务会一并停止。删除后不能恢复。')
     expect(store.list()).toHaveLength(2)
+  })
+
+  it.each([
+    ['en', 'A task could not be stopped, so nothing was deleted. Try again once the assistant is running.'],
+    ['zh', '有任务没能停下，所以什么都没删。请在助理运行时再试一次。'],
+    ['th', 'หยุดงานบางงานไม่ได้ จึงยังไม่ได้ลบอะไร ลองอีกครั้งเมื่อผู้ช่วยทำงานอยู่'],
+  ] as const)('says in %s that nothing was deleted when a task could not be stopped', (locale, text) => {
+    expect(chatMessages[locale]['history.tasksNotStopped']).toBe(text)
   })
 
   it('keeps the conversation and says so when a task of it cannot be stopped (Codex A6 C1)', async () => {

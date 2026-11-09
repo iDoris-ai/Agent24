@@ -46,22 +46,44 @@ describe('schedule conversations (M4 A5)', () => {
     expect(homes().conversationOf('sch_1')).toBe(first!.id)
   })
 
-  describe('holds (M4 A6, Codex A6 C5)', () => {
-    it('tells whether the run is in its schedule\'s conversation, once the runs heard of before are recorded', async () => {
+  describe('claim (M4 A6, Codex A6 C5, r2 C1)', () => {
+    const runs = (...ids: string[]) => async () => ids.map((id, i) => ({ id, schedule_id: 'sch_1', created_at: `2026-11-09T0${i}:00:00Z` }))
+
+    it('says the run is the schedule conversation\'s once the runs heard of before are recorded', async () => {
       const m = homes()
       void m.record('sch_1', 'run_1')
-      expect(await m.holds('sch_1', 'run_1')).toBe(true)
-      expect(await m.holds('sch_1', 'run_2')).toBe(false)
-      expect(await m.holds('sch_2', 'run_1')).toBe(false)
+      expect(await m.claim('sch_1', 'run_1')).toBe(true)
+      expect(await m.claim('sch_2', 'run_1')).toBe(false)
     })
 
-    it('does not hold a run its first catch-up took as handled, nor one in a conversation deleted since', async () => {
+    it('gives the caller a run its first catch-up took as handled, or one in a conversation deleted since', async () => {
       const m = homes()
-      await m.catchUp(async () => [{ id: 'run_old', schedule_id: 'sch_1', created_at: '2026-11-09T00:00:00Z' }])
-      expect(await m.holds('sch_1', 'run_old')).toBe(false)
+      await m.catchUp(runs('run_old'))
+      expect(await m.claim('sch_1', 'run_old')).toBe(false)
       const summary = await m.record('sch_1', 'run_1')
       history.delete(summary!.id)
-      expect(await m.holds('sch_1', 'run_1')).toBe(false)
+      expect(await m.claim('sch_1', 'run_1')).toBe(false)
+    })
+
+    it('does not record later a run it gave the caller, one that could not be recorded before (Codex A6 r2 C1)', async () => {
+      const m = homes()
+      await m.catchUp(runs())
+      const appendRun = vi.spyOn(history, 'appendRun').mockImplementationOnce(() => { throw new Error('disk full') })
+      await expect(m.record('sch_1', 'run_1')).rejects.toThrow('disk full')
+      appendRun.mockRestore()
+      expect(await m.claim('sch_1', 'run_1')).toBe(false)
+      await m.catchUp(runs('run_1'))
+      expect(history.list().flatMap(c => c.tasks)).toEqual([])
+    })
+
+    it('does not record at the first catch-up a run it gave the caller that was to be retried', async () => {
+      const m = homes()
+      const appendRun = vi.spyOn(history, 'appendRun').mockImplementationOnce(() => { throw new Error('disk full') })
+      await expect(m.record('sch_1', 'run_1')).rejects.toThrow('disk full')
+      appendRun.mockRestore()
+      expect(await m.claim('sch_1', 'run_1')).toBe(false)
+      await m.catchUp(runs('run_1'))
+      expect(history.list().flatMap(c => c.tasks)).toEqual([])
     })
   })
 

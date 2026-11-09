@@ -60,11 +60,13 @@ export interface ScheduleConversations {
   record(scheduleId: string, runId: string): Promise<ChatHistorySummary | null>
   /** The schedule's conversation, when it has one on file (A6). */
   conversationOf(scheduleId: string): string | null
-  /** Whether the run is in its schedule's conversation, once the runs
-   *  heard of before are recorded (A6: an approval of a run the first
-   *  catch-up took as handled, or that could not be recorded, has no card
-   *  there; Codex A6 C5). */
-  holds(scheduleId: string, runId: string): Promise<boolean>
+  /** For an approval of the run (A6), once the runs heard of before are
+   *  recorded: true when the run is in its schedule's conversation; else
+   *  false, and the run is the caller's: it is taken as handled here, so no
+   *  later catch-up records it in the schedule's conversation too (an
+   *  approval of a run the first catch-up took as handled, or that could not
+   *  be recorded, has no card there; Codex A6 C5, r2 C1). */
+  claim(scheduleId: string, runId: string): Promise<boolean>
   /** Records the schedules' runs among `runs` (the daemon's
    *  `GET /api/v1/runs`) that were not handled yet, oldest first; one that
    *  fails does not stop the others and is tried again next time. The first
@@ -137,6 +139,8 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
     } catch (err) {
       const now = read()
       if (now.handled === null && !now.retry.includes(runId)) write({ ...now, retry: [...now.retry, runId] })
+      // Once the first catch-up is done, nothing more is asked of `heard`.
+      if (now.handled !== null) heard.delete(runId)
       throw err
     }
   }
@@ -175,6 +179,9 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
       // this catch-up waited for the runs waits behind it (PR-Daemon #1704 N1).
       const retry = new Set([...state.retry, ...heard])
       write({ ...state, handled: due.map(r => r.id).filter(id => !retry.has(id)), retry: [] })
+      // Asked of no more (Codex A6 r2 C3); those of it this catch-up does not
+      // record stay out of `handled`, and are tried at the next.
+      heard.clear()
     } else {
       // Only what the daemon still has: a run it no longer lists cannot come
       // back in a catch-up.
@@ -209,15 +216,23 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
     catchUp(runs) {
       return enqueue(() => catchUpNow(runs))
     },
-    holds(scheduleId, runId) {
+    claim(scheduleId, runId) {
       return enqueue(async () => {
-        const conversation = read().bindings[scheduleId]
+        const state = read()
+        let held = false
         try {
-          const record = deps.history.get(conversation) as { runs?: { run_id?: unknown }[] } | null
-          return record?.runs?.some(run => run.run_id === runId) ?? false
+          const record = deps.history.get(state.bindings[scheduleId]) as { runs?: { run_id?: unknown }[] } | null
+          held = record?.runs?.some(run => run.run_id === runId) ?? false
         } catch {
-          return false
+          held = false
         }
+        if (held) return true
+        // The first catch-up takes it as handled with the rest, once it is
+        // neither to retry nor heard of.
+        heard.delete(runId)
+        const handled = state.handled === null || state.handled.includes(runId) ? state.handled : [...state.handled, runId]
+        write({ ...state, handled, retry: state.retry.filter(id => id !== runId) })
+        return false
       })
     },
     conversationOf(scheduleId) {
