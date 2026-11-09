@@ -3209,6 +3209,7 @@ mod tests {
         let missing = tempfile::tempdir().unwrap();
         let err = package_integrity::run(package_integrity::Action::Verify {
             root: missing.path().to_path_buf(),
+            arch: std::env::consts::ARCH.to_owned(),
         })
         .unwrap_err();
         assert!(err.contains("integrity_manifest_invalid"), "{err}");
