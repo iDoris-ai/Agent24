@@ -5,6 +5,7 @@ import type { BackendStatusDetail } from './backend-manager'
 import { mt } from './main-i18n'
 import { REJECTED_CODES } from './daemon-enroll'
 import type { CliToolStatus } from '../shared/ipc-types'
+import type { UpgradeHint } from './resident-service'
 
 export type TrayStatus = 'running' | 'starting' | 'stopped' | 'error' | 'blocked'
 
@@ -22,6 +23,8 @@ export interface TrayInput {
   detail?: BackendStatusDetail | null
   backendKind: string
   cliTool?: Pick<CliToolStatus, 'state' | 'version'>
+  /** M5 B5: the service daemon is not the bundled version, or its upgrade did not finish. */
+  upgrade?: UpgradeHint
 }
 
 export type TrayAction = 'start' | 'disconnect' | 'restart' | 'stop' | 'show' | 'quit' | 'cli-settings'
@@ -51,6 +54,8 @@ export function buildTrayView(input: TrayInput): TrayView {
   let tooltip = `Agent24 — ${label.replace(/^[●○✕]\s*/, '')} (${input.backendKind})`
   // M5 B6: Knowledge works on the service daemon; its bindings ask for presence.
   if (input.enrolled) tooltip += '\n' + mt('tray.externalKnowledge')
+  const upgrade = input.upgrade
+  if (upgrade) tooltip += '\n' + (upgrade.kind === 'needed' ? mt('tray.serviceUpgrade') : mt('tray.serviceUpgradeFailed', { code: upgrade.code }))
   const summary = protocol
     ? mt('tray.protocolShort', {
       daemonVersion: protocol.daemonVersion ?? mt('tray.protocolUnknown'),

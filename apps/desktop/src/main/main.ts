@@ -10,7 +10,8 @@ import { registerCliTool } from './ipc/cli-tool'
 import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
-import { BackendManager, daemonAuthMode, daemonConnection, onDaemonReady, setBundledPackaged } from './backend-manager'
+import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, resolveRustBinary, setBundledPackaged } from './backend-manager'
+import { bundledDaemonVersion, ServiceUpgrader, serviceUpgradeDeps, upgradeService, upgradesFromBundle } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
@@ -65,6 +66,21 @@ import { CHAT_TIMEOUT_MS, proxyError, proxyRequest } from './backend-proxy'
 const isDev = process.env.NODE_ENV === 'development'
 setBundledPackaged(app.isPackaged)
 const backendManager = new BackendManager({ isPackaged: app.isPackaged })
+// M5 B5: the service daemon brought up to the agent24d this app ships.
+let bundledVersion: string | null = null
+if (upgradesFromBundle(app.isPackaged, process.env)) void bundledDaemonVersion(resolveRustBinary(app.isPackaged)).then((v) => { bundledVersion = v })
+const serviceUpgrader = new ServiceUpgrader({
+  bundled: () => bundledVersion,
+  running: () => backendManager.serviceDaemonVersion(),
+  installed: launchAgentPlistExists,
+  pid: () => (backendManager.presenceTarget() ? backendManager.externalDaemonPid() ?? null : null),
+  run: async (pid) => {
+    const dataDir = tryDataDir()
+    if (dataDir === null) return { ok: false, stage: 'copy', code: 'no_data_dir' }
+    const hold = <T>(work: () => Promise<T>) => backendManager.whileServiceRestarts(work)
+    return upgradeService(serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid, hold }))
+  },
+})
 // A3-4 review M5: the sequenced/capped event log lives here, in main, so it
 // survives the renderer's VoicePanel unmounting when the user switches
 // sidebar pages (design §7.2's intent — a host-side log, not a per-tab one).
@@ -702,6 +718,7 @@ app.whenReady().then(async () => {
   // Poll so the menu-bar title/tooltip and menu track the daemon as it starts,
   // crashes, or is toggled from the menu itself.
   trayTimer = setInterval(() => {
+    serviceUpgrader.tick()
     refreshTray()
     if (++cliCheckTicks % 15 === 0) void cliTool?.refresh()
     // Replays the wanted Knowledge bindings on a restarted daemon and retries
@@ -729,6 +746,7 @@ function refreshTray(): void {
     foreignPid: backendManager.foreignDaemonPid(),
     backendKind: backendManager.backendKind(),
     cliTool: cliTool?.status(),
+    upgrade: serviceUpgrader.hint(),
   })
   if (process.platform === 'darwin') tray.setTitle(view.title)
   tray.setToolTip(view.tooltip)
