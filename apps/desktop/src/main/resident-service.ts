@@ -31,9 +31,8 @@ function semver(v: string | null): [number, number, number, string | null] | nul
   return m ? [Number(m[1]), Number(m[2]), Number(m[3]), m[4] ?? null] : null
 }
 
-/** Only a bundled version newer than the running one: an older app never puts
- * its older daemon over a store a newer one migrated (PR-Daemon B5a B1). An
- * unknown version, or two pre-releases of one version, is never a reason. */
+/** Only a newer bundled version: never an older daemon over a store a newer
+ * one migrated (PR-Daemon B5a B1); an unknown version is never a reason. */
 export function upgradeNeeded(bundled: string | null, running: string | null): boolean {
   const b = semver(bundled)
   const r = semver(running)
@@ -42,8 +41,7 @@ export function upgradeNeeded(bundled: string | null, running: string | null): b
   return b[3] === null && r[3] !== null
 }
 
-/** Only a packaged app with its own agent24d: never a dev build or an
- * `AGENT24D_BIN` override (PR-Daemon B5a N3). */
+/** Never a dev build or an `AGENT24D_BIN` override (PR-Daemon B5a N3). */
 export function upgradesFromBundle(packaged: boolean, env: NodeJS.ProcessEnv): boolean {
   return packaged && !env['AGENT24D_BIN']
 }
@@ -72,8 +70,7 @@ export function copyDaemonIfChanged(src: string, dest: string): 'same' | 'copied
   // Same bytes in a plain file only: a link there is replaced (Codex B5a C1).
   const there = fs.lstatSync(dest, { throwIfNoEntry: false })
   if (there?.isFile() && crypto.createHash('sha256').update(bytes).digest('hex') === sha256(dest)) {
-    // As copy_daemon, which always rewrites: runnable whatever it was (PR-Daemon B5a N2).
-    fs.chmodSync(dest, 0o755)
+    fs.chmodSync(dest, 0o755) // as copy_daemon, which always rewrites (PR-Daemon B5a N2)
     return 'same'
   }
   const temp = path.join(dir, `.agent24d.${process.pid}.tmp`)
