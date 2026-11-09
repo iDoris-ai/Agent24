@@ -1566,6 +1566,18 @@ mod tests {
             verify(dir.path()),
             Err(IntegrityError::NotNativeExecutable { .. })
         ));
+        // The release script's explicit cross-arch self-check accepts it ...
+        verify_for_arch(dir.path(), "x86_64").unwrap();
+        // ... but the daemon's entry (discovery / recheck) has no arch
+        // parameter and keeps refusing a foreign-arch package.
+        let manifest = DomainOsManifest::from_yaml(
+            &fs::read_to_string(dir.path().join(DOMAIN_OS_YML)).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_if_present(dir.path(), &manifest, &CancellationToken::new()),
+            Err(IntegrityError::NotNativeExecutable { .. })
+        ));
     }
 
     #[test]
