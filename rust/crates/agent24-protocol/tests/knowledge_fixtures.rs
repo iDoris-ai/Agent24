@@ -28,7 +28,7 @@ const KNOWLEDGE_FIXTURES: &str = "protocol/knowledge/fixtures/v1";
 /// sha256 of `manifest.json`, which pins every fixture's version and digest.
 /// Changing a fixture means bumping its version, re-pinning its sha256 and
 /// updating this constant together with `MANIFEST_SHA256` in knowledge-v1.test.ts.
-const MANIFEST_SHA256: &str = "d3802ec7d907443396522c1c0b0a81302e2be719a53b66a749a893895f61c89a";
+const MANIFEST_SHA256: &str = "53f445ef9d0f3cce56a93d2321eae4f87b899d7b545f79ada1f8b129736071b0";
 
 /// Cases the contract names (#1012; §11.3, §11.7; §12 #11, #18, #19; r6, r8); never
 /// fewer. The TS test carries the same list.
@@ -59,6 +59,9 @@ const REQUIRED: &[&str] = &[
     "read.expected-revision-partial.json",
     "read.stale-page.json",
     "ready.operation-disabled.json",
+    // r13: the candidate readiness key and the write operation classes (WeKnora#146).
+    "ready.candidate.json",
+    "capabilities.write-operations.json",
     "read.operation-disabled.json",
 ];
 
@@ -194,7 +197,7 @@ fn manifest_pins_every_knowledge_fixture() {
         "改夹具要升 version，并更新清单摘要常量 (MANIFEST_SHA256, Rust and TS)"
     );
     let m: Manifest = load("manifest.json");
-    assert_eq!(m.contract_revision, "r12");
+    assert_eq!(m.contract_revision, "r13");
     assert_eq!(m.protocol_version, 1);
     let listed: BTreeSet<&str> = m.fixtures.iter().map(|e| e.file.as_str()).collect();
     assert_eq!(listed.len(), m.fixtures.len(), "duplicate manifest entry");

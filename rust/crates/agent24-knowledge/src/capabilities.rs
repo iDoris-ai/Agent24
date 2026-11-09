@@ -38,12 +38,22 @@ pub enum CapabilityMode {
     Standalone,
 }
 
-/// `supported_operations[]`.
+/// `supported_operations[]`: the read operations and, once the server enables
+/// them, the write operation classes of R2.7 (R9.2, r13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum SupportedOperation {
+    #[serde(rename = "search")]
     Search,
+    #[serde(rename = "read")]
     Read,
+    #[serde(rename = "candidate.propose")]
+    CandidatePropose,
+    #[serde(rename = "candidate.review")]
+    CandidateReview,
+    #[serde(rename = "candidate.approve")]
+    CandidateApprove,
+    #[serde(rename = "entry.withdraw")]
+    EntryWithdraw,
 }
 
 /// `limits`: server upper bounds that requests are clamped to (R3.3, R4.5).

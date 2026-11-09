@@ -1,0 +1,9 @@
+{ "$comment": "§9, R9.2 (r13): a server that has enabled the write operation classes of R2.7 lists them beside search and read. The capability values (kb_candidate_propose, ...) are a credential's, not names here. Limit values are illustrative.",
+  "op": "system.capabilities",
+  "response": { "status": 200, "body": { "edition": "lite", "capabilities": { "integrations.api": { "supported": true } },
+    "integration": { "agent24_knowledge": {
+      "protocol_versions": [1], "mode": "integration",
+      "supported_operations": ["search", "read", "candidate.propose", "candidate.review", "candidate.approve", "entry.withdraw"],
+      "server_version": "0.8.3-a24.1",
+      "limits": { "max_results": 50, "max_concurrency": 4, "max_deadline_ms": 30000,
+        "max_read_bytes": 262144, "max_page_limit": 100, "max_snippet_bytes": 2048 } } } } } }

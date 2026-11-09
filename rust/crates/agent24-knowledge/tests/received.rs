@@ -101,7 +101,7 @@ fn every_fixture_body_decodes_and_unknown_fields_change_nothing() {
         });
         seen += 1;
     }
-    assert_eq!(seen, 40, "bodies");
+    assert_eq!(seen, 41, "bodies");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
