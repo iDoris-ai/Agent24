@@ -2,6 +2,7 @@ import { capabilitiesMessages } from './capabilities.i18n'
 import { useT } from '../i18n'
 import { useComponentList } from '../components/useComponentList'
 import type { ComponentView } from '../components/componentApi'
+import { packageIntegrityHint } from '../components/packageIntegrity'
 import { idorisMessages } from '../components/idoris/IdorisPanel.i18n'
 import { settingsMessages } from '../pages/Settings.i18n'
 import { communicationMessages } from '../pages/comm/Communication.i18n'
@@ -40,9 +41,13 @@ export function useCapabilityStatus(active: boolean) {
       case 'stopping': return idorisText('state.stopping')
       case 'stopped': return idorisText('state.stopped')
       case 'incompatible': return idorisText('state.incompatible')
-      case 'failed': return component.reason === 'instance_conflict'
-        ? idorisText('state.instance_conflict')
-        : idorisText('state.failed')
+      case 'failed': {
+        const integrity = packageIntegrityHint(component.reason)
+        if (integrity) return integrity
+        return component.reason === 'instance_conflict'
+          ? idorisText('state.instance_conflict')
+          : idorisText('state.failed')
+      }
       default: return cap('status.state', { state: component.state })
     }
   }
@@ -60,6 +65,8 @@ export function useCapabilityStatus(active: boolean) {
       if (component.reason === 'gave_up') return commText('process.gaveUp')
       if (component.reason === 'backoff') return commText('process.backoff')
       if (component.reason === 'starting') return commText('process.starting')
+      const integrity = packageIntegrityHint(component.reason)
+      if (integrity) return integrity
       return commText('component.failed')
     }
     if (component.state === 'installing') return commText('component.installing')
@@ -77,6 +84,10 @@ export function useCapabilityStatus(active: boolean) {
     if (component.state === 'stopped' && component.reason === 'disabled') return voiceText('attachment.disabled')
     if (component.state === 'stopped') return `${voiceText('attachment.detached')} · ${voiceText('attachment.open')}`
     if (component.state === 'starting') return voiceText('attachment.checking')
+    if (component.state === 'failed') {
+      const integrity = packageIntegrityHint(component.reason)
+      if (integrity) return integrity
+    }
     return cap('status.state', { state: component.state })
   }
 
