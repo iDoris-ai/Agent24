@@ -854,6 +854,9 @@ pub struct ProcessHost {
     /// earlier ones too — and closed by the shutdown, after which nothing
     /// starts (review of SUP-4, rounds 2 and 3).
     pub supervisors: Arc<Supervisors>,
+    /// Daemon shutdown. `recheck` hashes on this token so a shutdown stops
+    /// the hash and does not spawn the next run.
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 /// The daemon's supervised modules: a list the shutdown closes and takes.
@@ -2079,8 +2082,13 @@ async fn mount_package(
     // format (`ModuleSpec` already treats `package_dir`/`manifest_digest` as
     // opaque values), so the check itself lives here and travels in as an
     // opaque closure.
-    let package_check: agent24_os_proto::supervisor::PackageCheck = Arc::new(|spec| {
-        agent24_os_packages::discovery::recheck(&spec.package_dir, &spec.manifest_digest).err()
+    // Cancel stops the hash. `Err` — including `cancelled` — is not a
+    // finished check: the supervisor must not spawn. A shutdown is not a
+    // hash mismatch, and a matching stat is not a reason to skip the hash.
+    let shutdown = host.shutdown.clone();
+    let package_check: agent24_os_proto::supervisor::PackageCheck = Arc::new(move |spec| {
+        agent24_os_packages::discovery::recheck(&spec.package_dir, &spec.manifest_digest, &shutdown)
+            .err()
     });
     // Started and registered in one step, unless the shutdown has closed the
     // list — which it may have while the directory was being prepared.
@@ -2602,7 +2610,7 @@ while f.readline():
 
     /// The catalogue entries `serve` would make of `packages`.
     fn discovered(packages: &Path) -> Vec<Installed> {
-        agent24_os_packages::discovery::scan(packages)
+        agent24_os_packages::discovery::scan(packages, &tokio_util::sync::CancellationToken::new())
             .found
             .into_iter()
             .map(|d| Installed {
@@ -2640,6 +2648,7 @@ while f.readline():
                 ..agent24_os_proto::supervisor::Timings::default()
             },
             supervisors: Arc::new(Supervisors::default()),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -2758,7 +2767,10 @@ while f.readline():
         let tmp = tempfile::tempdir().unwrap();
         let packages = tmp.path().join("packages");
         write_package_with(&packages, "typo", "[events, telepthy]", PACKAGE_MODULE);
-        let scan = agent24_os_packages::discovery::scan(&packages);
+        let scan = agent24_os_packages::discovery::scan(
+            &packages,
+            &tokio_util::sync::CancellationToken::new(),
+        );
         assert!(
             scan.found.is_empty(),
             "a manifest with an unknown capability must not be mountable"
@@ -3186,6 +3198,78 @@ raise SystemExit(3)
         .await
         .expect("the unrelated module never ran")
         .unwrap();
+
+        for s in host.supervisors.close().running {
+            s.handle.stop().await.expect("a clean stop");
+        }
+    }
+
+    /// The real `recheck` closure sees the daemon shutdown token. Cancelling
+    /// it during backoff must not spawn again, and the reason is `cancelled`,
+    /// not a hash mismatch. Wiring a fresh `CancellationToken::new()` into
+    /// the closure turns this into a second `Backoff`.
+    #[tokio::test]
+    async fn a_cancelled_recheck_does_not_spawn_again() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_crashing_package(&packages, "crashy");
+        let mut host = test_host(tmp.path());
+        host.timings.backoff_base = std::time::Duration::from_secs(3);
+        let shutdown = host.shutdown.clone();
+        let hub = crate::events::EventsHub::default();
+        let (_, _, _) = mount_all(
+            &discovered(&packages),
+            &tmp.path().join("os"),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+
+        let mut status = host.supervisors.statuses().remove("crashy").unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            status.wait_for(|s| {
+                matches!(
+                    s,
+                    agent24_os_proto::supervisor::Status::Backoff { failures: 1, .. }
+                )
+            }),
+        )
+        .await
+        .expect("the module never crashed into backoff")
+        .unwrap();
+        shutdown.cancel();
+
+        let settled = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            status.wait_for(|s| {
+                matches!(
+                    s,
+                    agent24_os_proto::supervisor::Status::PackageChanged { .. }
+                        | agent24_os_proto::supervisor::Status::Backoff { failures: 2, .. }
+                )
+            }),
+        )
+        .await
+        .expect("never settled")
+        .unwrap()
+        .clone();
+        let agent24_os_proto::supervisor::Status::PackageChanged { reason } = &settled else {
+            panic!("spawned again after the recheck was cancelled: {settled:?}");
+        };
+        assert_eq!(reason, "cancelled");
+        assert!(
+            !reason.contains("hash_mismatch"),
+            "cancel must not look like a bad hash: {reason}"
+        );
 
         for s in host.supervisors.close().running {
             s.handle.stop().await.expect("a clean stop");

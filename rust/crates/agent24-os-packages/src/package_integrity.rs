@@ -24,7 +24,19 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 ///
 /// Absence is success. Presence runs the full shared check and refuses a
 /// broken package. This is the PR-1 hook; PR-3 replaces it with a required check.
-pub fn verify_if_present(dir: &Path, manifest: &DomainOsManifest) -> Result<(), IntegrityError> {
+///
+/// `cancel` is the caller's shutdown token. A fired token is
+/// [`IntegrityError::Cancelled`]: the hash did not finish, so this is not a
+/// hash mismatch and not a successful check. Every scan still hashes the
+/// whole tree; nothing is skipped because a stat tuple matched.
+pub fn verify_if_present(
+    dir: &Path,
+    manifest: &DomainOsManifest,
+    cancel: &CancellationToken,
+) -> Result<(), IntegrityError> {
+    if cancel.is_cancelled() {
+        return Err(IntegrityError::Cancelled);
+    }
     let Some(declared) = manifest.integrity() else {
         return Ok(());
     };
@@ -37,6 +49,7 @@ pub fn verify_if_present(dir: &Path, manifest: &DomainOsManifest) -> Result<(), 
             files: declared.files().to_vec(),
             executables: declared.executables().to_vec(),
         },
+        cancel,
     )
 }
 
@@ -53,7 +66,9 @@ pub fn verify(root: &Path) -> Result<(), IntegrityError> {
         })?;
     match manifest.integrity() {
         None => Err(IntegrityError::Missing),
-        Some(_) => verify_if_present(root, &manifest),
+        // One-shot CLI. The daemon passes its shutdown token through
+        // `discovery::scan` / `recheck`, not through this entry.
+        Some(_) => verify_if_present(root, &manifest, &CancellationToken::new()),
     }
 }
 
@@ -186,7 +201,11 @@ fn verify_declared(
     dir: &Path,
     spawn_command: Option<&str>,
     section: &IntegritySection,
+    cancel: &CancellationToken,
 ) -> Result<(), IntegrityError> {
+    if cancel.is_cancelled() {
+        return Err(IntegrityError::Cancelled);
+    }
     ensure_real_directory(dir)?;
     integrity::validate_section(section, spawn_command)?;
     let path = dir.join(FILES_JSON_NAME);
@@ -223,9 +242,15 @@ fn verify_declared(
         &section.executables,
         true,
         &[DOMAIN_OS_YML, FILES_JSON_NAME],
-        &CancellationToken::new(),
+        cancel,
     )
-    .map_err(integrity::map_tree_error)
+    .map_err(integrity::map_tree_error)?;
+    // The token can fire after the last byte and before we publish success.
+    // A check that is not still live here did not finish.
+    if cancel.is_cancelled() {
+        return Err(IntegrityError::Cancelled);
+    }
+    Ok(())
 }
 
 fn ensure_real_directory(root: &Path) -> Result<(), IntegrityError> {
@@ -438,7 +463,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         crate::install::install(staging.path(), &root).unwrap();
-        let scan = crate::discovery::scan(&root);
+        let scan = crate::discovery::scan(&root, &CancellationToken::new());
         assert_eq!(scan.found.len(), 1, "refused: {:?}", scan.refused);
     }
 
@@ -593,7 +618,7 @@ mod tests {
     }
 
     fn scan_why(parent: &Path, name: &str) -> String {
-        let scan = crate::discovery::scan(parent);
+        let scan = crate::discovery::scan(parent, &CancellationToken::new());
         scan.refused
             .iter()
             .find(|refused| refused.dir.ends_with(name))
@@ -776,7 +801,7 @@ mod tests {
         write_tree(&new_package, "newmod");
         generate(&new_package, &["bin/newmod".into(), "bin/helper".into()]).unwrap();
 
-        let first = crate::discovery::scan(parent.path());
+        let first = crate::discovery::scan(parent.path(), &CancellationToken::new());
         let old_found = first
             .found
             .iter()
@@ -795,8 +820,9 @@ mod tests {
             "old package refused: {:?}",
             first.refused
         );
-        crate::discovery::recheck(&old, &old_found.digest).unwrap();
-        crate::discovery::recheck(&new_package, &new_found.digest).unwrap();
+        crate::discovery::recheck(&old, &old_found.digest, &CancellationToken::new()).unwrap();
+        crate::discovery::recheck(&new_package, &new_found.digest, &CancellationToken::new())
+            .unwrap();
         let old_verify = verify(&old).unwrap_err();
         assert!(
             old_verify
@@ -813,7 +839,7 @@ mod tests {
         bytes[0] ^= 0x01;
         fs::write(&binary, bytes).unwrap();
 
-        let second = crate::discovery::scan(parent.path());
+        let second = crate::discovery::scan(parent.path(), &CancellationToken::new());
         assert!(
             second
                 .found
@@ -834,9 +860,11 @@ mod tests {
             .why
             .clone();
         assert!(why.contains("hash_mismatch: bin/newmod"), "{why}");
-        let recheck = crate::discovery::recheck(&new_package, &new_found.digest).unwrap_err();
+        let recheck =
+            crate::discovery::recheck(&new_package, &new_found.digest, &CancellationToken::new())
+                .unwrap_err();
         assert!(recheck.contains("hash_mismatch: bin/newmod"), "{recheck}");
-        crate::discovery::recheck(&old, &old_found.digest).unwrap();
+        crate::discovery::recheck(&old, &old_found.digest, &CancellationToken::new()).unwrap();
     }
     #[test]
     fn t3_control_directory_special_file_and_non_utf8_boundaries() {

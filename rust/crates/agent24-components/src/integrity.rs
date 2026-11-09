@@ -60,6 +60,10 @@ pub enum IntegrityError {
     CheckFailed {
         detail: String,
     },
+    /// The caller's token fired before the check finished. Not a hash
+    /// mismatch and not a damaged tree: the package must not be discovered
+    /// or spawned.
+    Cancelled,
 }
 
 impl fmt::Display for IntegrityError {
@@ -71,6 +75,7 @@ impl fmt::Display for IntegrityError {
                 write!(f, "integrity_manifest_invalid: {detail}")
             }
             Self::CheckFailed { detail } => write!(f, "integrity_check_failed: {detail}"),
+            Self::Cancelled => f.write_str("cancelled"),
         }
     }
 }
@@ -684,9 +689,10 @@ pub fn map_tree_error(err: TreeError) -> IntegrityError {
         TreeError::Io(err) => IntegrityError::CheckFailed {
             detail: err.to_string(),
         },
-        TreeError::Cancelled => IntegrityError::CheckFailed {
-            detail: "cancelled".to_owned(),
-        },
+        // A shutdown is not a mismatched file. Callers must keep this
+        // distinct from [`IntegrityError::HashMismatch`]: only a finished
+        // check may accept the tree.
+        TreeError::Cancelled => IntegrityError::Cancelled,
     }
 }
 
@@ -695,6 +701,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use std::io::{self, Read};
 
     fn digest(size: u64, fill: u8) -> FileDigest {
         FileDigest {
@@ -834,5 +841,69 @@ mod tests {
             relative_name(root, &path),
             Err(TreeError::Violation(_))
         ));
+    }
+
+    /// Cancels on the second read, then ends. A hasher that only looks at
+    /// the token before the first byte would return `Ok` once this hits EOF.
+    struct CancelMidway<'a> {
+        cancel: &'a CancellationToken,
+        reads: usize,
+    }
+
+    impl Read for CancelMidway<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            if self.reads == 2 {
+                self.cancel.cancel();
+            }
+            if self.reads > 2 {
+                return Ok(0);
+            }
+            buf[0] = self.reads as u8;
+            Ok(1)
+        }
+    }
+
+    /// Mid-hash cancel is `Cancelled`, and that must not be rewritten as a
+    /// hash mismatch. Dropping the in-loop token check, or mapping
+    /// `TreeError::Cancelled` onto `HashMismatch`, turns this red.
+    #[test]
+    fn digest_reader_cancel_mid_hash_is_not_a_hash_mismatch() {
+        let cancel = CancellationToken::new();
+        let err = digest_reader(
+            &mut CancelMidway {
+                cancel: &cancel,
+                reads: 0,
+            },
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(matches!(err, TreeError::Cancelled), "{err:?}");
+        let mapped = map_tree_error(err);
+        assert!(matches!(mapped, IntegrityError::Cancelled), "{mapped}");
+        assert!(!mapped.to_string().contains("hash_mismatch"), "{mapped}");
+    }
+
+    /// The payload really does not match, so a hasher that ignored the token
+    /// would return [`TreeError::HashMismatch`]. Cancel wins instead.
+    #[test]
+    fn verify_tree_cancel_beats_a_real_hash_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("payload"), b"hello").unwrap();
+        let mut expected = BTreeMap::new();
+        expected.insert(
+            "payload".to_owned(),
+            FileDigest {
+                size: 5,
+                sha256: "ab".repeat(32),
+            },
+        );
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = verify_tree(dir.path(), &expected, &[], false, &[], &cancel).unwrap_err();
+        assert!(matches!(err, TreeError::Cancelled), "{err:?}");
+        let mapped = map_tree_error(err);
+        assert!(matches!(mapped, IntegrityError::Cancelled), "{mapped}");
+        assert!(!mapped.to_string().contains("hash_mismatch"), "{mapped}");
     }
 }
