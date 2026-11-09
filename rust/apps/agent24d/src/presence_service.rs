@@ -77,6 +77,17 @@ struct Inner {
     entries: HashMap<String, Entry>,
 }
 
+/// Settle `id` as timed out now and forget it, as the HTTP channel does the
+/// moment it sees a lapsed challenge: nothing can answer it afterwards, even
+/// if the wall clock is set back before `confirm`'s own timer fires.
+fn settle_lapsed(entries: &mut HashMap<String, Entry>, id: &str) {
+    if let Some(mut entry) = entries.remove(id)
+        && let Some(tx) = entry.tx.take()
+    {
+        let _ = tx.send(PresenceOutcome::TimedOut);
+    }
+}
+
 impl Inner {
     /// Settle every challenge as `Unavailable` and forget the connection.
     fn drop_conn(&mut self) {
@@ -225,7 +236,8 @@ impl Attachment {
                 continue;
             };
             if entry.req.expires_at <= now {
-                // Expired while queued: never delivered. `confirm` settles it.
+                // Expired while queued: never delivered, settled now.
+                settle_lapsed(entries, &id);
                 continue;
             }
             conn.delivered = Some(id);
@@ -257,9 +269,15 @@ impl Attachment {
             return false;
         }
         // Past its deadline by the wall clock it was shown with: too late,
-        // even if `confirm`'s timer has not fired yet (as the HTTP channel,
-        // `presence_desktop`). `confirm` settles it as timed out.
+        // even if `confirm`'s timer has not fired yet. Settled as timed out
+        // on the spot and the dialog told to close (as the HTTP channel,
+        // `presence_desktop`), so no later answer can land.
         if entry.req.expires_at <= unix_now() {
+            settle_lapsed(entries, challenge_id);
+            conn.delivered = None;
+            conn.cancels.push_back(challenge_id.to_owned());
+            drop(inner);
+            self.presence.wake.notify_waiters();
             return false;
         }
         conn.delivered = None;
@@ -322,6 +340,15 @@ impl Drop for Pending<'_> {
     }
 }
 
+/// Time left from `now` to the wall-clock second `expires_at` itself, not
+/// whole seconds from now: a truncated count would leave up to a second past
+/// `expires_at`. A clock before the epoch or past the deadline gives zero.
+fn until(expires_at: crate::capabilities::UnixSeconds, now: std::time::SystemTime) -> Duration {
+    (std::time::UNIX_EPOCH + Duration::from_secs(expires_at))
+        .duration_since(now)
+        .unwrap_or(Duration::ZERO)
+}
+
 fn random_nonce() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 16];
@@ -360,11 +387,7 @@ impl PresenceProvider for ServicePresence {
             id: &id,
         };
         self.wake.notify_waiters();
-        // To the wall-clock second itself, not whole seconds from now: a
-        // truncated count would leave up to a second past `expires_at`.
-        let remaining = (std::time::UNIX_EPOCH + Duration::from_secs(expires_at))
-            .duration_since(std::time::SystemTime::now())
-            .unwrap_or(Duration::ZERO);
+        let remaining = until(expires_at, std::time::SystemTime::now());
         tokio::select! {
             outcome = rx => outcome.unwrap_or(PresenceOutcome::Unavailable),
             () = cancel.cancelled() => PresenceOutcome::Unavailable,
@@ -545,6 +568,7 @@ mod tests {
         lapsed.expires_at = unix_now() - 1;
         presence.enqueue_unwatched(lapsed);
         nothing_for_a_moment(&attachment).await;
+        assert_eq!(presence.queued(), 0, "settled, not left behind");
         let next = spawn_confirm(&presence, "c2", 60, CancellationToken::new());
         let (req, nonce) = challenge(&attachment).await;
         assert_eq!(req.challenge_id, "c2");
@@ -561,9 +585,27 @@ mod tests {
         // The wall clock is past `expires_at`; `confirm`'s timer is not.
         presence.set_expires_at("c1", unix_now());
         assert!(!attachment.answer("c1", &nonce, Decision::Allow));
-        assert!(!waiter.is_finished(), "not settled by the refused answer");
-        drop(attachment);
-        assert_eq!(waiter.await.unwrap(), PresenceOutcome::Unavailable);
+        // Settled there and then, and the dialog told to close.
+        assert_eq!(waiter.await.unwrap(), PresenceOutcome::TimedOut);
+        assert!(matches!(
+            event(&attachment).await,
+            Event::Cancel { challenge_id } if challenge_id == "c1"
+        ));
+        // The clock set back afterwards cannot revive it.
+        presence.set_expires_at("c1", unix_now() + 60);
+        assert!(!attachment.answer("c1", &nonce, Decision::Allow));
+        assert_eq!(presence.queued(), 0);
+    }
+
+    #[test]
+    fn the_timer_runs_to_the_deadline_itself_not_whole_seconds() {
+        let at = |secs: f64| std::time::UNIX_EPOCH + Duration::from_secs_f64(secs);
+        // 1000.8 → 1060: 59.2 s, not 60.
+        assert_eq!(until(1060, at(1000.8)), Duration::from_secs_f64(59.2));
+        assert_eq!(until(1060, at(1060.0)), Duration::ZERO);
+        assert_eq!(until(1060, at(1061.5)), Duration::ZERO);
+        let before_epoch = std::time::UNIX_EPOCH - Duration::from_secs(5);
+        assert_eq!(until(10, before_epoch), Duration::from_secs(15));
     }
 
     #[tokio::test]

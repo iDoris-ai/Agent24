@@ -219,9 +219,12 @@ async fn answer(
     next_non_ping(presence).await
 }
 
-/// Next frame that is not a ping (answering it, so the line stays up).
+/// Next frame that is not a ping (answering it, so the line stays up),
+/// failing rather than looping if none comes within 5 s.
 async fn next_non_ping(client: &mut Client) -> serde_json::Value {
+    let by = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
+        assert!(tokio::time::Instant::now() < by, "only pings for 5s");
         let frame = line(client).await;
         if frame["op"] != "presence_ping" {
             return frame;

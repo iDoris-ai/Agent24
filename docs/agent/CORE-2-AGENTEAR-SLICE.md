@@ -115,7 +115,7 @@ pub enum PresenceOutcome { Allowed, Denied, Unavailable, TimedOut }
 - **应答**（桌面→daemon）：
   - 帧：`{"v":1,"op":"presence_answer","challenge_id":"…","nonce":"<回显>","decision":"allow"|"deny"}`。
   - daemon 每条都回 `{"v":1,"op":"presence_answered","challenge_id":"…","accepted":true|false}`。
-  - 以下情况回 `accepted:false`，**连接不断**：未知 id、已结算、还在排队没下发、nonce 不符，以及挂钟已过 `expires_at`（和 3.4 的 HTTP 通道一致；这时 daemon 的计时器即使还没触发，也会按超时结算）。
+  - 以下情况回 `accepted:false`，**连接不断**：未知 id、已结算、还在排队没下发、nonce 不符，以及挂钟已过 `expires_at`。挂钟已过时，daemon 当场把这条挑战结算为超时并发 `presence_cancel`，不等自己的计时器；之后即使挂钟被调回，也不能再应答。这和 3.4 的 HTTP 通道一致。排队中过期的挑战同样当场结算，不会下发。
   - `decision` 取其他值得 `bad_frame`，连接关闭。
   - 每条应答生效前，daemon 都重新核对对端身份（pid 启动时间、代码签名、audit token）。对端 exec 过就得到 `identity_rejected`，连接关闭。
 - **取消**（daemon→桌面）：已下发的挑战在应答前就结算了（发起方的 elevate 连接断开、过期），daemon 发 `{"v":1,"op":"presence_cancel","challenge_id":"…"}`。之后再对它应答，得到 `accepted:false`。
@@ -131,7 +131,7 @@ pub enum PresenceOutcome { Allowed, Denied, Unavailable, TimedOut }
 - **已知局限**：
   - 同 UID 的恶意进程占满 7 条令牌连接时，在场连接连不上，提升请求得到 `presence_unavailable`。这在 ADR-031 的威胁边界之内。
   - 这是桌面替自己作证：能挡住 renderer 和 CLI，挡不住已经被攻破的桌面主进程。强度不如 D7 的 LocalAuthentication helper，是 helper 落地之前的过渡方案。
-  - daemon 读一帧时，同一条连接上不会同时下发挑战或取消。桌面只发了半帧时，挑战最多晚 5 秒（单帧读超时）才下发。这和令牌连接的单帧超时一致。
+  - daemon 读一帧时，同一条连接上不会同时下发挑战或取消。桌面只发了半帧时，挑战要等这一帧收齐才下发。5 秒（单帧读超时）内收不齐，daemon 回 `timeout` 并关闭连接，挑战结算为 `Unavailable`。这和令牌连接的单帧超时一致。
 
 ### 3.5 路由等级
 
