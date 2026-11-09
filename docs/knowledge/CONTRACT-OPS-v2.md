@@ -1,6 +1,6 @@
 # Knowledge 写操作语义契约 v2 · 规范核心（CONTRACT-OPS-v2）
 
-> **状态**：规范核心 v2 r2（r1 2026-11-09，#1668 KB-CT-03③；r2 2026-11-09，#1670 补作者读取候选的 schema）。v1（2026-10-20）从未实施，本文由它升主版本而来，变更清单见 §12。仍**没有实施**：Agent24 没有写操作入口，WeKnora 集成模式只放行 ready、search、read 三条路由。实现另开任务（11-11 后）。条款按 READONLY r8 写成，现行 READONLY 为 r11。
+> **状态**：规范核心 v2 r3（r1 2026-11-09，#1668 KB-CT-03③；r2 2026-11-09，#1670 补作者读取候选的 schema；r3 2026-11-09，补「不含 U+0000」）。v1（2026-10-20）从未实施，本文由它升主版本而来，变更清单见 §12。仍**没有实施**：Agent24 没有写操作入口，WeKnora 集成模式只放行 ready、search、read 三条路由。实现另开任务（11-11 后）。条款按 READONLY r8 写成，现行 READONLY 为 r11。
 > **日期**：v1 2026-10-20；v2 2026-11-09 · **依据**：`docs/knowledge/CONTRACT-READONLY-v1.md` r8（下称 READONLY，规则写作 R*n.m*）；`CONTRACT-STATE-v1.md`（STATE 规范核心 v1（同批），条款写作 S*n.m*）、`CONTRACT-UI-BRIDGE-v1.md`（UI-BRIDGE 规范核心 v1（同批），条款写作 U*n.m*），依赖登记在 §9· **Issue**：#1013 ③（KB-CT-03）、#1668（v2：知识条目段）。
 > 由完整版 `ab/weknora-03c-ops`（#1075 的分支）压缩而来。本文只写对外行为与不变式；实现机制交给代码与测试证明（§11）。
 
@@ -206,10 +206,10 @@
   - 每条字段：principal、`candidate_id`、`content_sha256`、目标 KB、`mode`、`knowledge_id`、基础修订、`kind`、`return_reason`、`author_is_approver`、`provenance.session_ref`、`skill_version`、`redaction_rules_version`；`entry.withdraw` 另记 `source_revision`。
   - 不记 `title`、`body`、`note`。
 - **W8.13** **条目 hash（方案 1）**：
-  - 服务端**不做 Unicode 规范化**，只对收到的确定字节计算；规范形式由客户端在保存草稿时就得到：`title` 不含首尾空白；`kind`、`title`、`body` 都不含 `\r`（含 `\r` 得 `invalid_request`）；三者都必须是合法的 Unicode 标量值序列，不含孤立代理项（JSON 里的 `\uD800` 之类），含孤立代理项的请求在 W1.9 ② 得 `invalid_request`，因为 ECMAScript 会把它转义输出、其他实现可能拒绝解析，两侧算不出同一个 hash。客户端算 hash 前检查（如 `String.prototype.isWellFormed`）。宿主建议在保存草稿时做 NFC 与换行统一，再按存下的文本计算 hash。
+  - 服务端**不做 Unicode 规范化**，只对收到的确定字节计算；规范形式由客户端在保存草稿时就得到：`title` 不含首尾空白；`kind`、`title`、`body` 都不含 `\r`（含 `\r` 得 `invalid_request`）；三者都必须是合法的 Unicode 标量值序列，不含孤立代理项（JSON 里的 `\uD800` 之类），含孤立代理项的请求在 W1.9 ② 得 `invalid_request`，因为 ECMAScript 会把它转义输出、其他实现可能拒绝解析，两侧算不出同一个 hash。**也不含 U+0000**（JSON 里的 `\u0000`）：服务端的存储存不进 NUL，所以请求里**任何**字符串字段含 U+0000，都和孤立代理项一样在 W1.9 ② 得 `invalid_request`，不是可重试的 `unavailable`；schema 不禁 NUL，服务端比 schema 严。客户端算 hash 前把两项一起检查（如 `String.prototype.isWellFormed` 加 `!s.includes('\u0000')`）。宿主建议在保存草稿时做 NFC 与换行统一，再按存下的文本计算 hash。
   - `content_sha256` = 小写 hex 的 SHA-256(UTF-8(`JSON.stringify([1, kind, title, body])`))。数组首位的 `1` 是方案号；序列化与 ECMAScript `JSON.stringify` 相同（不留空白；非 ASCII 字符原样输出 UTF-8，不转义成 `\u`；控制字符按其规则转义）。
   - 固定样例（含中文、emoji、引号、制表符与控制字符）见 `protocol/knowledge/fixtures/ops-v2/entry-hash.samples.json`，Rust 与 TS 两侧各自重算。改方案要升方案号，按 §0.3 属于语义变更。
-- **W8.14** **机器可验证部分**：请求与响应的 schema 在 `protocol/knowledge/ops-v2/`（`candidate.schema.json`、`entry.schema.json`），用例在 `protocol/knowledge/fixtures/ops-v2/schema-cases.json`；`packages/contract-tests/src/knowledge-ops-v2.test.ts`（Ajv）与 `rust/crates/agent24-protocol/tests/knowledge_ops_v2.rs`（jsonschema）对每条用例给出同一结论，并核对 §6 的枚举与 schema 一致。schema 表达不了的规则（`message_range` 的先后、按字节的大小、受限 Markdown 白名单、不含孤立代理项、hash 本身、`revise` 的目标文档属于 `target_knowledge_base_id`）由服务端与实现任务的测试证明。
+- **W8.14** **机器可验证部分**：请求与响应的 schema 在 `protocol/knowledge/ops-v2/`（`candidate.schema.json`、`entry.schema.json`），用例在 `protocol/knowledge/fixtures/ops-v2/schema-cases.json`；`packages/contract-tests/src/knowledge-ops-v2.test.ts`（Ajv）与 `rust/crates/agent24-protocol/tests/knowledge_ops_v2.rs`（jsonschema）对每条用例给出同一结论，并核对 §6 的枚举与 schema 一致。schema 表达不了的规则（`message_range` 的先后、按字节的大小、受限 Markdown 白名单、不含孤立代理项与 U+0000、hash 本身、`revise` 的目标文档属于 `target_knowledge_base_id`）由服务端与实现任务的测试证明。
 
 ## 9. 与 READONLY、STATE、UI-BRIDGE 的接口约定
 
@@ -266,3 +266,4 @@ v1 文件改名为本文件（`git mv`），引用已同步；`rust/apps/agent24
 
 - r1（2026-11-09，#1668 KB-CT-03③）：v2 规范核心，相对 v1 的语义变更见 §12。影响夹具：新增 `protocol/knowledge/fixtures/ops-v2/`（`schema-cases.json`、`entry-hash.samples.json`）。
 - r2（2026-11-09，#1670）：补作者读取自己候选的 schema。`candidate.propose` 的读取动作（W2.1、W8.3）原先只有条文，现在加入 `candidate.schema.json` 的 `get_request`、`get_response`，W8.3 写明报文。操作类集合与语义都不变，按 §0.3 属于本版修订。影响夹具：`schema-cases.json` 新增 7 条用例，TS 与 Rust 两端的 sha256 一起重钉；`entry-hash.samples.json` 不变。
+- r3（2026-11-09，WeKnora #157 PR-Daemon B2）：W8.13 补「不含 U+0000」，适用于请求里任何字符串字段，与孤立代理项同一处理（W1.9 ② `invalid_request`）；W8.14 的「schema 表达不了」清单同步。服务端 WeKnora #157 按此实现。schema 不改（与孤立代理项一致，由服务端测试证明），夹具与 sha256 都不变；`candidate.schema.json` 的 description 仍只写「no lone surrogates」，下次改该 schema 时一并补上。
