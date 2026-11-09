@@ -11,7 +11,8 @@ import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i1
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonConnection, onDaemonReady, setBundledPackaged } from './backend-manager'
-import { PresencePoller, defaultPresenceDeps, showPresenceDialog } from './presence-poller'
+import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
+import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
 import { documentsEvent } from './documents'
 import { cliBinary } from './documents-cli'
@@ -212,6 +213,8 @@ let knowledge: KnowledgeController | null = null
 let knowledgeView: KnowledgeViewHost | null = null
 // CORE-2 AgentEar S3: long-polls the daemon for native confirmation challenges.
 let presencePoller: PresencePoller | null = null
+// M5 B3: the same, over the presence connection, with the daemon the LaunchAgent runs.
+let presenceConnection: PresenceConnection | null = null
 let openDesignComponent: OpenDesignComponentInstaller | null = null
 let openDesignReporter: OpenDesignStatusReporter | null = null
 let stopOpenDesignReady: (() => void) | null = null
@@ -504,14 +507,23 @@ app.whenReady().then(async () => {
   // CORE-2 AgentEar S3: native confirmation for elevated operations. Idle until
   // the daemon runs in capabilities mode (main then holds the ProductHost
   // token); a daemon without the routes answers 404 and is re-checked rarely.
+  const showBox = (opts: Parameters<typeof showPresenceDialog>[1], signal: AbortSignal) => {
+    if (!mainWin || mainWin.isDestroyed()) mainWin = createMainWindow()
+    return showPresenceDialog(mainWin, opts, signal, (parent, options) => dialog.showMessageBox(parent, options))
+  }
   presencePoller = new PresencePoller(defaultPresenceDeps({
-    connection: daemonConnection,
-    showDialog: (opts, signal) => {
-      if (!mainWin || mainWin.isDestroyed()) mainWin = createMainWindow()
-      return showPresenceDialog(mainWin, opts, signal, (parent, options) => dialog.showMessageBox(parent, options))
-    },
+    // Enrolled with the service daemon, main holds no host token to poll as:
+    // the presence connection below asks instead.
+    connection: () => (backendManager.presenceTarget() ? null : daemonConnection()),
+    showDialog: showBox,
   }))
   presencePoller.start()
+  // M5 B3: idle until enrolled with the daemon the LaunchAgent runs.
+  presenceConnection = new PresenceConnection({
+    target: () => backendManager.presenceTarget(),
+    ask: async (challenge, signal) => ((await showBox(presenceDialogOptions(challenge, mt), signal)).response === 0 ? 'allow' : 'deny'),
+  })
+  presenceConnection.start()
   // safeStorage needs the app ready. The logins load once, here, before
   // anything can change them; the reason is logged, never the contents.
   const loginStore = new KnowledgeLoginStore(app.getPath('userData'), safeStorage)
@@ -744,6 +756,7 @@ const shutdown = createCreativeShutdown({
     isQuitting = true
     openDesignComponent?.abort('Agent24 is quitting')
     void presencePoller?.stop()
+    void presenceConnection?.stop()
     try {
       hideCreativeView()
       if (creativeView && !creativeView.webContents.isDestroyed()) {
