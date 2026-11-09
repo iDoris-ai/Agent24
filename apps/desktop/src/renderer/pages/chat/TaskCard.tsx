@@ -148,7 +148,7 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
           <button type="button" className="btn" disabled={busy} onClick={() => setDenying(true)}>{t('task.deny')}</button>
         )}
         {waiting && offers !== null && !offers.approve && !offers.deny && (
-          <span className="task-card-knowledge" role="note">{t('task.decideOnApprovals')}</span>
+          <span className="task-card-knowledge" role="note">{t('task.decideInTui')}</span>
         )}
         {active && (
           <button type="button" className="btn" disabled={busy} onClick={() => void act(() => cancelRun(task.run_id))}>{t('task.stop')}</button>
