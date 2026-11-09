@@ -85,7 +85,9 @@ M5 B1（#1710）起，`agent24 service install` 把守护进程装成**服务模
   - install 先停掉旧服务，再替换复制件，再启动新的。
   - 复制件是按字节写的，不带源文件的扩展属性，包括 quarantine。
 - **升级 app 后**：要再执行一次 `agent24 service install`，复制件才会换成新版本。它是幂等的：重写 plist、替换复制件、收紧 logs 权限，并 `launchctl bootout` + `bootstrap` 重载。由桌面端在启动时自动做，归 M5 B5。
-- **卸载**：`agent24 service uninstall` 同时删掉 plist 和复制件。
+- **停止**：`agent24 daemon stop` 经 launchd 给服务的 job 发 SIGTERM（`launchctl kill`）。守护进程正常退出，退出码是 0；plist 设了 `KeepAlive{SuccessfulExit:false}`，所以 launchd 不会再把它拉起来。桌面端自己起的 capabilities 守护进程，仍由桌面端来停。
+- **卸载**：`agent24 service uninstall` 同时删掉 plist 和复制件。复制件的位置按当前的 `AGENT24_DATA_DIR` 推算，所以安装时设了这个变量，卸载时也要设同一个值。
+- **重装**：install 先停掉旧服务，等它释放数据目录的锁之后才替换复制件；等不到就报错，复制件保持原样。复制件所在的 `bin/` 是 0700，如果它是一个符号链接，install 拒绝。
 - **查看**：`agent24 service status` 显示守护进程的认证模式，以及它的登记端点。
 - **日志权限**：`logs/` 是 0700，日志文件是 0600。
 

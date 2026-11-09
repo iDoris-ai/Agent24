@@ -2998,7 +2998,13 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
         DaemonAction::Stop => match state_file::read_live() {
             Some(state) => {
                 if state.auth_mode.is_capabilities() {
-                    return Err(HOST_AUTHORITY_UNAVAILABLE.to_owned());
+                    // M5 B1: one the service runs is stopped through launchd
+                    // (Codex B1 C6); one a desktop runs is its host's to stop.
+                    if !service::status().2 {
+                        return Err(HOST_AUTHORITY_UNAVAILABLE.to_owned());
+                    }
+                    service::stop_service_daemon()?;
+                    return wait_for_stop(&state).await;
                 }
                 // Authenticated shutdown: the bearer token proves this is OUR
                 // daemon — a reused pid of an unrelated process can never be

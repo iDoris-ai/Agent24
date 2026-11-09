@@ -63,6 +63,22 @@ pub fn copy_daemon(exec: &Path, dest: &Path) -> Result<(), String> {
         .parent()
         .ok_or_else(|| format!("{} has no parent", dest.display()))?;
     std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    // What launchd runs is only the owner's to change: not a link to some
+    // other directory, and owner-only (Codex B1 C1).
+    let meta =
+        std::fs::symlink_metadata(dir).map_err(|e| format!("reading {}: {e}", dir.display()))?;
+    if !meta.is_dir() {
+        return Err(format!(
+            "{} is not a directory (a link is refused)",
+            dir.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("securing {}: {e}", dir.display()))?;
+    }
     let temp = dir.join(format!(".agent24d.{}.tmp", std::process::id()));
     let _ = std::fs::remove_file(&temp);
     let written = (|| {
@@ -75,6 +91,12 @@ pub fn copy_daemon(exec: &Path, dest: &Path) -> Result<(), String> {
         }
         let mut file = options.open(&temp)?;
         file.write_all(&bytes)?;
+        // The mode given at creation is cut by the umask (Codex B1 C5).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+        }
         file.sync_all()?;
         std::fs::rename(&temp, dest)
     })();
@@ -293,6 +315,55 @@ fn bootout_if_loaded() {
     let _ = launchctl(&["bootout", &target]);
 }
 
+/// Whether launchd has the job now.
+fn loaded() -> bool {
+    launchctl(&["print", &format!("gui/{}/{LABEL}", uid())]).is_ok_and(|o| o.status.success())
+}
+
+/// How long `install` waits for the daemon it stopped to let go of its lock:
+/// launchd's own wait before it kills it, and a little more.
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(EXIT_TIMEOUT + 5);
+
+/// Waits until no daemon holds the data dir's singleton lock, for `budget`.
+/// The lock is held while a daemon runs, so its release says the one the
+/// service ran has exited, its file free to be replaced (Codex B1 C2).
+pub fn wait_until_released(dir: &Path, budget: std::time::Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match agent24_protocol::state_file::try_acquire_singleton_in(dir) {
+            Ok(Some(_lock)) => return Ok(()),
+            Ok(None) => {}
+            Err(e) => return Err(format!("checking whether the daemon stopped: {e}")),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the daemon the service ran still holds {} after {}s; its copy is left as it was",
+                dir.display(),
+                budget.as_secs()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// M5 B1: stops the daemon the service runs, as `agent24 daemon stop` does a
+/// legacy one. A SIGTERM to launchd's job, not to a pid: launchd signals only
+/// the process it started, so no other one can be hit. The daemon ends
+/// cleanly on SIGTERM and exits 0, which `KeepAlive{SuccessfulExit:false}`
+/// does not restart. Errs when launchd does not have the job.
+pub fn stop_service_daemon() -> Result<(), String> {
+    let target = format!("gui/{}/{LABEL}", uid());
+    let out = launchctl(&["kill", "SIGTERM", &target])?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "launchctl kill failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
 /// S-04: the logs hold daemon output and a stray secret is one `tracing` line
 /// away, so the directory is owner-only (0700) and each file is created 0600
 /// BEFORE launchd opens it for `StandardOutPath` (launchd would otherwise create
@@ -367,8 +438,13 @@ pub fn install(exec: &Path) -> Result<(PathBuf, PathBuf, Vec<String>), String> {
     let err_log = logs.join("agent24d.err.log");
     // Reinstall must unload the old job first, or launchd keeps running the
     // previous ProgramArguments and the new plist looks like it did nothing.
-    // It also stops the old daemon before its file is replaced.
-    bootout_if_loaded();
+    // It also stops the old daemon, and its file is replaced only once it
+    // has exited.
+    if loaded() {
+        bootout_if_loaded();
+        let data_dir = agent24_protocol::state_file::state_dir().ok_or("HOME not set")?;
+        wait_until_released(&data_dir, STOP_WAIT)?;
+    }
     copy_daemon(exec, &copy)?;
 
     let env = capture_env();
@@ -409,10 +485,7 @@ fn remove_if_there(path: &Path) -> Result<(), String> {
 pub fn status() -> (bool, Option<PathBuf>, bool) {
     let plist = plist_path();
     let installed = plist.as_ref().is_some_and(|p| p.exists());
-    let loaded = launchctl(&["print", &format!("gui/{}/{LABEL}", uid())])
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    (installed, plist, loaded)
+    (installed, plist, loaded())
 }
 
 #[cfg(test)]
@@ -528,6 +601,53 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left, ["agent24d"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_copys_directory_is_the_owners_alone_and_not_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("a24-copy-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        let exec = root.join("agent24d");
+        std::fs::write(&exec, b"daemon").unwrap();
+        copy_daemon(&exec, &root.join("data/bin/agent24d")).unwrap();
+        assert_eq!(
+            std::fs::metadata(root.join("data/bin"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("linked")).unwrap();
+        let err = copy_daemon(&exec, &root.join("linked/agent24d")).unwrap_err();
+        assert!(err.contains("a link is refused"), "{err}");
+        assert!(!root.join("elsewhere/agent24d").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn waits_for_the_daemon_to_let_go_of_the_data_dir_and_says_when_it_does_not() {
+        let root = std::env::temp_dir().join(format!("a24-wait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // A daemon running: it holds the lock.
+        let held = agent24_protocol::state_file::try_acquire_singleton_in(&root)
+            .unwrap()
+            .unwrap();
+        let err = wait_until_released(&root, std::time::Duration::from_millis(300)).unwrap_err();
+        assert!(err.contains("still holds"), "{err}");
+        // It exits a moment later.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        wait_until_released(&root, std::time::Duration::from_secs(5)).unwrap();
+        release.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 
