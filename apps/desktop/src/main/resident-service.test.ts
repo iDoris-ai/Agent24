@@ -4,8 +4,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
-  copyDaemonIfChanged, jobPid, parseDaemonVersion, ServiceUpgrader, serviceDaemonCopyPath, upgradeNeeded, upgradeService,
-  type UpgradeDeps, type UpgradeOutcome,
+  copyDaemonIfChanged, jobPid, parseDaemonVersion, ServiceUpgrader, serviceDaemonCopyPath, serviceUpgradeDeps, upgradeNeeded, upgradeService,
+  type UpgradeDeps, type UpgradeOutcome, type UpgradeSystem,
 } from './resident-service'
 import { buildTrayView } from './tray-menu'
 import { resetMainLocaleForTest, setMainLocale } from './main-i18n'
@@ -181,6 +181,42 @@ describe('upgradeService', () => {
   it('no new daemon on record after kickstart: not ok', async () => {
     const { deps } = steps({ started: async () => false })
     await expect(upgradeService(deps)).resolves.toEqual({ ok: false, stage: 'kickstart', code: 'not_started' })
+  })
+})
+
+describe('serviceUpgradeDeps: the real steps on the system (QA #1744)', () => {
+  function real(over: Partial<UpgradeSystem> = {}) {
+    const sys: UpgradeSystem = {
+      alive: vi.fn(() => false), jobPid: vi.fn(async () => null), record: vi.fn(() => null), exitWaitMs: 300, startWaitMs: 300, ...over,
+    }
+    const { src, dest } = files('old', 'new')
+    const deps = serviceUpgradeDeps({ bin: src, dataDir: path.join(root, 'data'), pid: 42, hold: (w) => w() }, sys)
+    return { sys, deps, src, dest }
+  }
+
+  it('the old pid still alive: not exited, and launchd is never asked in its place', async () => {
+    const { sys, deps } = real({ alive: vi.fn((pid: number) => pid === 42) })
+    await expect(deps.exited()).resolves.toBe(false)
+    expect(sys.jobPid).not.toHaveBeenCalled()
+  })
+
+  it('the old pid gone: exited only when launchd runs no process for the job either', async () => {
+    await expect(real().deps.exited()).resolves.toBe(true)
+    await expect(real({ jobPid: vi.fn(async () => 777) }).deps.exited()).resolves.toBe(false)
+  })
+
+  it('started: a new live daemon on record, not the old one, not a dead one', async () => {
+    const alive = (pid: number) => pid === 43
+    await expect(real({ alive, record: () => ({ pid: 43 }) }).deps.started()).resolves.toBe(true)
+    await expect(real({ alive, record: () => ({ pid: 42 }) }).deps.started()).resolves.toBe(false)
+    await expect(real({ alive, record: () => ({ pid: 44 }) }).deps.started()).resolves.toBe(false)
+    await expect(real({ alive, record: () => null }).deps.started()).resolves.toBe(false)
+  })
+
+  it('copy: the bundled binary onto <data_dir>/bin/agent24d', () => {
+    const { deps, src, dest } = real()
+    expect(deps.copy()).toBe('copied')
+    expect(sha(dest)).toBe(sha(src))
   })
 })
 
