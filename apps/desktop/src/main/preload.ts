@@ -24,6 +24,7 @@ import {
   type KnowledgeEntryAdmitAnswer,
   type KnowledgeEntryDraftCreated,
   type KnowledgeEntryDraftSaved,
+  type KnowledgeEntrySubmitAnswer,
   type KnowledgeEntryDraftSummary,
   type KnowledgeEntryDraftView,
   type KnowledgeEntryKind,
@@ -265,6 +266,12 @@ const api = {
       ipcRenderer.invoke(IpcChannels.KnowledgeEntryDraftRedact, id),
     withdrawDraft: (id: string): Promise<boolean> =>
       ipcRenderer.invoke(IpcChannels.KnowledgeEntryDraftWithdraw, id),
+    submit: (id: string, knowledgeBaseId: string): Promise<KnowledgeEntrySubmitAnswer> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeEntrySubmit, id, knowledgeBaseId),
+    submitStatus: (id: string): Promise<KnowledgeEntrySubmitAnswer> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeEntrySubmitStatus, id),
+    retractSubmission: (id: string): Promise<KnowledgeEntrySubmitAnswer> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeEntrySubmitRetract, id),
   },
   // ADR-DOC-01 D5: the Documenting OS, by operation, never by path.
   documents: {

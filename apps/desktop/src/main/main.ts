@@ -52,13 +52,16 @@ import { KnowledgeUiInstance } from './knowledge-ui-instance'
 import { KNOWLEDGE_UI_ROUTES } from './knowledge-ui-routes'
 // KB-C2-03: the KnowledgeView lives in its own module; the lines that wire it
 // in below are additions only and leave the Creative view's paths untouched.
-import { KnowledgeViewHost, registerKnowledgeViewIpc, resolveKnowledgeViewTarget } from './knowledge-view'
+import { KnowledgeViewHost, registerKnowledgeViewIpc, resolveKnowledgeViewTarget, settingsKnowledgeViewTarget } from './knowledge-view'
 // KB-SOP-01a (#1669): the knowledge entry admission, additions only.
 import { createChatHistoryStore } from './chat-history'
 import { daemonFloorReader } from './knowledge-entry-floor'
 import { registerKnowledgeEntryIpc } from './knowledge-entry-ipc'
 import { knowledgePending } from './knowledge-pending'
 import { createEntryDraftStore } from './knowledge-entry-draft'
+import { createCandidateStore } from './knowledge-candidate-store'
+import { knowledgeEntrySubmission } from './knowledge-entry-submit'
+import { newUlid } from './knowledge-bridge'
 import { entryTarget } from './knowledge-entry-extract'
 import { CHAT_TIMEOUT_MS, proxyError, proxyRequest } from './backend-proxy'
 
@@ -615,6 +618,38 @@ app.whenReady().then(async () => {
     hide: IpcChannels.KnowledgeViewHide,
     reload: IpcChannels.KnowledgeViewReload,
   }, () => knowledgeView)
+  const entryDrafts = createEntryDraftStore(app.getPath('userData'))
+  const entryTargetNow = (): string | null => {
+    if (!knowledge || knowledge.bindingForRun() === null) return null
+    const s = knowledge.status()
+    return entryTarget(s.endpoint, s.knowledgeBaseIds)
+  }
+  // KB-SOP-01b (#1670): the Provider's candidate.propose, with C and the
+  // generation of the binding in effect (the same ones the UI session uses).
+  const entryCandidates = createCandidateStore(app.getPath('userData'))
+  const entrySubmission = knowledgeEntrySubmission({
+    drafts: entryDrafts,
+    candidates: entryCandidates,
+    target: entryTargetNow,
+    knowledgeBaseIds: () => knowledge?.status().knowledgeBaseIds ?? [],
+    provider: () => {
+      if (!knowledge) return null
+      const binding = knowledge.viewBinding()
+      const inputs = binding === null ? null : knowledge.uiSessionInputs(binding)
+      const origin = settingsKnowledgeViewTarget(knowledge.status().endpoint)?.origin
+      if (!inputs || !origin) return null
+      return {
+        generation: inputs.generation,
+        deps: {
+          origin,
+          // Asked again at each request: a key changed meanwhile is not used for the old binding.
+          credential: () => (knowledge?.uiSessionInputs(binding as string)?.credential ?? null),
+          fetch: (url, init) => net.fetch(url, init),
+          newRequestId: () => newUlid(),
+        },
+      }
+    },
+  })
   registerKnowledgeEntryIpc(ipcMain, guard, {
     conversation: (id) => createChatHistoryStore(app.getPath('userData')).get(id),
     reader: daemonFloorReader(),
@@ -630,20 +665,18 @@ app.whenReady().then(async () => {
     bound: () => knowledge?.status().active === true,
   }, {
     // KB-SOP-01b-2: local drafts, drafted by the local model (no session_id: LocalOnly, no memory, no tools).
-    store: createEntryDraftStore(app.getPath('userData')),
+    store: entryDrafts,
     chat: (body) => {
       const conn = daemonConnection()
       if (!conn) return Promise.resolve(proxyError('backend_not_ready', 'Backend daemon is not ready'))
       return proxyRequest(conn, { method: 'POST', path: '/api/v1/chat', body }, { host: '127.0.0.1', timeoutMs: CHAT_TIMEOUT_MS })
     },
-    target: () => {
-      if (!knowledge || knowledge.bindingForRun() === null) return null
-      const s = knowledge.status()
-      return entryTarget(s.endpoint, s.knowledgeBaseIds)
-    },
+    target: entryTargetNow,
     locale: getMainLocale,
     pending: knowledgeWaiting,
-  })
+    knowledgeBaseIds: () => knowledge?.status().knowledgeBaseIds ?? [],
+    submission: (id, draft) => entrySubmission.view(id, draft),
+  }, entrySubmission)
   ipcMain.handle(IpcChannels.CreativeShow, guard((_event, bounds: CreativeViewBounds) => showCreativeView(bounds)))
   ipcMain.handle(IpcChannels.CreativeRestart, guard((_event, bounds: CreativeViewBounds) => restartCreativeView(bounds)))
   ipcMain.handle(IpcChannels.CreativeBounds, guard((_event, bounds: CreativeViewBounds) => {

@@ -44,6 +44,9 @@ function view(over: Partial<KnowledgeEntryDraftView> = {}): KnowledgeEntryDraftV
     message_to: 2,
     created_at: '2026-01-01T00:00:00.000Z',
     content_sha256: 'abc',
+    format: null,
+    submission: { pending: false, stuck: false, candidate: null },
+    knowledge_base_ids: [],
     ...over,
   }
 }
