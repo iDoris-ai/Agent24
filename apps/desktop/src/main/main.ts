@@ -146,6 +146,7 @@ function assistantApprovals(): AssistantApprovals {
       if (!session.ok || typeof channel !== 'string') throw new Error(`session_unavailable_${session.status}`)
       return channel === 'desktop' ? 'desktop' : 'other'
     },
+    settled: (runId, recorded) => scheduleConversations().settle(runId, recorded),
     title: () => mt('assistant.conversationTitle'),
     onCatchUpFailure: (runId, err) => console.error('[main] approval run not caught up', runId, err),
   })

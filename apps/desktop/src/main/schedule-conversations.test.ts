@@ -72,8 +72,43 @@ describe('schedule conversations (M4 A5)', () => {
       await expect(m.record('sch_1', 'run_1')).rejects.toThrow('disk full')
       appendRun.mockRestore()
       expect(await m.claim('sch_1', 'run_1')).toBe(false)
+      await m.settle('run_1', true)
       await m.catchUp(runs('run_1'))
       expect(history.list().flatMap(c => c.tasks)).toEqual([])
+    })
+
+    it('takes back a run its caller could not record: the next catch-up records it (Codex A6 r3 C2)', async () => {
+      const m = homes()
+      await m.catchUp(runs())
+      const appendRun = vi.spyOn(history, 'appendRun').mockImplementationOnce(() => { throw new Error('disk full') })
+      await expect(m.record('sch_1', 'run_1')).rejects.toThrow('disk full')
+      appendRun.mockRestore()
+      expect(await m.claim('sch_1', 'run_1')).toBe(false)
+      await m.settle('run_1', false)
+      await m.catchUp(runs('run_1'))
+      expect(history.list().flatMap(c => c.tasks.map(t => t.run_id))).toEqual(['run_1'])
+    })
+
+    it('takes back, before the first catch-up, a run to be retried, and records it there', async () => {
+      const m = homes()
+      const appendRun = vi.spyOn(history, 'appendRun').mockImplementationOnce(() => { throw new Error('disk full') })
+      await expect(m.record('sch_1', 'run_1')).rejects.toThrow('disk full')
+      appendRun.mockRestore()
+      expect(await m.claim('sch_1', 'run_1')).toBe(false)
+      await m.settle('run_1', false)
+      // main starts again: what is to be retried is on file.
+      await homes().catchUp(runs('run_1'))
+      expect(history.list().flatMap(c => c.tasks.map(t => t.run_id))).toEqual(['run_1'])
+    })
+
+    it('does not record live a run claimed before the first catch-up, nor at it (Codex A6 r3 C1)', async () => {
+      const m = homes()
+      expect(await m.claim('sch_1', 'run_1')).toBe(false)
+      expect(await m.record('sch_1', 'run_1')).toBeNull()
+      await m.catchUp(runs('run_1'))
+      await m.settle('run_1', true)
+      await m.catchUp(runs('run_1'))
+      expect(history.list()).toEqual([])
     })
 
     it('does not record at the first catch-up a run it gave the caller that was to be retried', async () => {

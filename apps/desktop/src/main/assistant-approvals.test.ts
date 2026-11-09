@@ -91,6 +91,23 @@ describe('assistant approvals (M4 A6)', () => {
     expect(history.list()).toHaveLength(1)
   })
 
+  it('tells A5 whether a run it took was recorded, and only of runs it took (Codex A6 r3 C2)', async () => {
+    const settled = vi.fn(async () => {})
+    await approvals({ settled }).route('run_cli')
+    await approvals({ settled }).route('run_sch')
+    await approvals({ settled }).route('run_desk')
+    const broken = { ...history, appendRun: vi.fn(() => { throw new Error('disk full') }) }
+    await expect(approvals({ settled, history: broken }).route('run_cli2')).rejects.toThrow('disk full')
+    expect(settled.mock.calls).toEqual([['run_cli', true], ['run_cli2', false]])
+  })
+
+  it('keeps a recorded run handled even when A5 cannot be told', async () => {
+    const settled = vi.fn(async () => { throw new Error('disk full') })
+    expect(await approvals({ settled }).route('run_cli')).not.toBeNull()
+    expect(await approvals().route('run_cli')).toBeNull()
+    expect(settled.mock.calls).toEqual([['run_cli', true]])
+  })
+
   it('routes two runs at once into one new conversation, one at a time', async () => {
     const m = approvals()
     const [a, b] = await Promise.all([m.route('run_cli'), m.route('run_cli2')])

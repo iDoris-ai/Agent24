@@ -62,6 +62,9 @@ export interface AssistantApprovalsDeps {
   title(): string
   /** Told of a run a catch-up could not route (tried again at the next). */
   onCatchUpFailure?(runId: string, error: unknown): void
+  /** Told whether a run found to be no other conversation's was recorded
+   *  (A5's `settle`: one that was not goes back to its schedule's). */
+  settled?(runId: string, recorded: boolean): Promise<void>
 }
 
 export interface AssistantApprovals {
@@ -126,6 +129,20 @@ export function createAssistantApprovals(deps: AssistantApprovalsDeps): Assistan
       handle(runId)
       return null
     }
+    let summary: ChatHistorySummary | null
+    try {
+      summary = recordIn(runId)
+    } catch (err) {
+      await deps.settled?.(runId, false).catch(() => {})
+      throw err
+    }
+    // In the conversation from here on, whatever fails after.
+    await deps.settled?.(runId, true).catch(() => {})
+    // Handled once it is in the conversation; one that could not be is not.
+    handle(runId)
+    return summary
+  }
+  const recordIn = (runId: string): ChatHistorySummary | null => {
     const state = read()
     let conversation = state.conversation
     if (!onFile(conversation)) {
@@ -143,8 +160,6 @@ export function createAssistantApprovals(deps: AssistantApprovalsDeps): Assistan
       write({ ...read(), conversation })
       summary = deps.history.appendRun(conversation, runId, 'task')
     }
-    // Handled once it is in the conversation; one that could not be is not.
-    handle(runId)
     return summary
   }
 
