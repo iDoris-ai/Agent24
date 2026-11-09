@@ -20,6 +20,7 @@ import {
   protocolVersionOf,
 } from './protocol-compatibility'
 import { joinLiteral, readDaemonState, tryDataDir } from './data-dir'
+import { enrol, EnrolError, RENEW_EVERY_MS, type EnrolSession, type EnrolTarget } from './daemon-enroll'
 
 const HEALTH_INTERVAL_MS = 5_000
 const HEALTH_TIMEOUT_MS = 3_000
@@ -33,7 +34,9 @@ const TAKEOVER_POLL_MS = 200
 
 export type BackendKind = 'node' | 'rust'
 
-export interface BackendStatusDetail {
+export type BackendStatusDetail = ProtocolMismatchDetail | EnrolRefusedDetail
+
+export interface ProtocolMismatchDetail {
   readonly kind: 'protocol_mismatch'
   readonly daemonVersion: number | null
   readonly clientVersion: number
@@ -43,6 +46,17 @@ export interface BackendStatusDetail {
   readonly reason?: string
   /** With `reason`: /health has been silent for a while; the record may be stale, delete daemon.json to recover. */
   readonly hint?: 'delete_daemon_json'
+}
+
+/** M5 B2: the daemon the LaunchAgent runs did not enrol this app. It holds the
+ * singleton lock, so nothing is spawned; the tray says why. */
+export interface EnrolRefusedDetail {
+  readonly kind: 'enrol_refused'
+  /** The daemon's error code (`identity_rejected`, `unsupported_version`, …) or a local one (`timeout`, `endpoint_mismatch`, …). */
+  readonly code: string
+  readonly pid: number
+  /** Never set: kept so the tray's start/restart guard reads one field for both kinds. */
+  readonly hint?: undefined
 }
 
 export interface BackendEndpoint {
@@ -269,6 +283,10 @@ export interface ExternalDaemonState {
   authMode: DaemonAuthMode
   /** Absent when daemon.json was written before version negotiation. */
   protocolVersion?: number
+  /** M5 B2: a capability-mode daemon the LaunchAgent runs advertises its enrolment socket. */
+  enrollEndpoint?: string
+  /** The daemon's generation, echoed in `hello`. */
+  generation?: string
   /** The strict parser refused this record but it still names a pid and port: never reusable,
    * yet a live daemon may hold the singleton lock, so it must not read as "nothing there". */
   rejected?: string
@@ -315,6 +333,10 @@ export function readExternalDaemonState(): ExternalDaemonState | null {
     authMode: state.authMode === 'legacy_single_token' ? 'legacy' : 'capabilities',
   }
   if (state.protocolVersion !== undefined) out.protocolVersion = state.protocolVersion
+  if (state.enrollEndpoint !== undefined) {
+    out.enrollEndpoint = state.enrollEndpoint
+    out.generation = state.generation
+  }
   return out
 }
 
@@ -333,6 +355,8 @@ export interface ExternalDaemonSource {
   /** `POST /api/v1/shutdown` with the record's token, as `agent24 daemon stop`
    * sends it: the HTTP status, or null when nothing answered. */
   requestShutdown(endpoint: BackendEndpoint, token: string): Promise<number | null>
+  /** M5 B2: enrol as this app's first-party shell. Defaults to the real socket client. */
+  enrol?(target: EnrolTarget): Promise<EnrolSession>
   /** Whether a process with this pid still exists. */
   isAlive(pid: number): boolean
 }
@@ -481,6 +505,7 @@ const defaultExternalDaemonSource: ExternalDaemonSource = {
   acceptsToken: daemonAcceptsToken,
   requestShutdown: requestDaemonShutdown,
   isAlive: processAlive,
+  enrol: (target) => enrol(target),
 }
 
 /** How long whileStopped() waits for the daemon to exit: past the CLI's own
@@ -530,6 +555,18 @@ export class BackendManager {
   // Set while a healthy capability-mode daemon of another host serves this
   // data dir (see tryReuseExternal); nothing is spawned until it is gone.
   private foreignPid: number | null = null
+  // M5 B2: the token connection to the daemon the LaunchAgent runs, while
+  // that daemon is the reused external one, and its renew timer.
+  private enrolment: EnrolSession | null = null
+  private renewTimer: NodeJS.Timeout | null = null
+  // Set when that connection ends under a live daemon: the next tick
+  // enrols again rather than waiting out MAX_HEALTH_FAILURES.
+  private reprobe = false
+  // True while an enrolment is under way, or the probe of a re-enrolment
+  // from its start: the service daemon is there, so a tray start/restart
+  // must not spawn over it (Codex B2 C1, r2 C2).
+  private enrolling = false
+  private attaching = false
   // Reentrancy guard for tick(): setInterval doesn't wait for a previous
   // callback to resolve before scheduling the next one, and the failure-
   // threshold branch below now awaits a second health probe (tryReuseExternal)
@@ -597,7 +634,9 @@ export class BackendManager {
    * The version recorded in daemon.json is named in that error; it is not a
    * reason to skip the probe. A healthy capability-mode daemon belongs to
    * another host: its authority never reaches this file, and spawning our own
-   * would only lose the lock, so that is `foreign`. A healthy legacy daemon is
+   * would only lose the lock, so that is `foreign` — unless daemon.json names
+   * its enrolment socket (M5 B2, the LaunchAgent's daemon): then this app
+   * enrols and reuses it, or reports why it could not. A healthy legacy daemon is
    * taken over (T1-0) unless the LaunchAgent manages it or this app runs in
    * legacy mode; then it is reused once its token is proven on that port.
    * `absent` (no record, the probe did not connect, a takeover, or a token the
@@ -634,6 +673,10 @@ export class BackendManager {
       this.foreignPid = null
       return this.refuseExternal(state, health.protocolVersion)
     }
+    if (state.authMode !== 'legacy' && state.enrollEndpoint !== undefined && state.generation !== undefined) {
+      this.foreignPid = null
+      return this.enrolExternal(state, state.enrollEndpoint, state.generation, lifecycle)
+    }
     this.blockedReason = null
     if (state.authMode !== 'legacy') {
       if (this.foreignPid !== state.pid) {
@@ -669,6 +712,95 @@ export class BackendManager {
     return 'reused'
   }
 
+  /** M5 B2: a capability-mode daemon with an enrolment socket is the one the
+   * LaunchAgent runs (`agent24 service install`). Enrol as this app's
+   * first-party shell and use the day-to-day token; never spawn over it. A
+   * refused or failed enrolment parks the manager in `error` with its own
+   * detail: the daemon holds the lock, so it is not `absent`, and it is
+   * reachable, so it is not `foreign`. */
+  private async enrolExternal(
+    state: ExternalDaemonState, socketPath: string, generation: string, lifecycle: number,
+  ): Promise<'reused' | 'incompatible' | 'superseded'> {
+    this.disconnectExternal()
+    let session: EnrolSession
+    this.enrolling = true
+    try {
+      session = await (this.external.enrol ?? enrol)({ socketPath, generation, httpPort: state.port })
+    } catch (error) {
+      if (lifecycle !== this.lifecycle) return 'superseded'
+      return this.refuseEnrolment(state, error instanceof EnrolError ? error.code : 'internal')
+    } finally {
+      this.enrolling = false
+    }
+    if (lifecycle !== this.lifecycle) {
+      session.close()
+      return 'superseded'
+    }
+    this.blockedReason = null
+    this.enrolment = session
+    this.isExternal = true
+    this.externalPid = state.pid
+    this.lastHealthy = true
+    publishConnection({ port: state.port, auth: { kind: 'bearer', token: session.token } }, 'capabilities')
+    this.renewTimer = setInterval(() => { void this.renewEnrolment(session, state.port) }, RENEW_EVERY_MS)
+    session.onClose((why) => {
+      if (this.enrolment !== session) return
+      console.warn(`[backend:${this.kind}] enrolment with the service daemon (pid ${state.pid}) ended (${why.code}); enrolling again`)
+      this.disconnectExternal()
+      this.lastHealthy = false
+      this.reprobe = true
+    })
+    console.log(`[backend:${this.kind}] enrolled as first-party shell with the service daemon (pid ${state.pid}, port ${state.port}) — not spawning our own`)
+    return 'reused'
+  }
+
+  /** Renew on the token connection; the old token is void once the new one
+   * arrives, so it is published at once. A failed renew closes the
+   * connection, and its close handler enrols again. */
+  private async renewEnrolment(session: EnrolSession, port: number): Promise<void> {
+    if (this.enrolment !== session) return
+    try {
+      const token = await session.renew()
+      if (this.enrolment === session) publishConnection({ port, auth: { kind: 'bearer', token } }, 'capabilities')
+    } catch {
+      // onClose has it.
+    }
+  }
+
+  private refuseEnrolment(state: ExternalDaemonState, code: string): 'incompatible' {
+    const already = this.blockedReason?.kind === 'enrol_refused'
+      && this.blockedReason.pid === state.pid && this.blockedReason.code === code
+    this.blockedReason = { kind: 'enrol_refused', code, pid: state.pid }
+    this.isExternal = false
+    this.externalPid = null
+    this.lastHealthy = false
+    publishConnection(null, null)
+    if (!already) {
+      console.warn(`[backend:${this.kind}] the service daemon (pid ${state.pid}, port ${state.port}) did not enrol this app (${code}); not spawning over it`)
+    }
+    return 'incompatible'
+  }
+
+  /** True while the service daemon is being enrolled with, or is to be:
+   * then a tray start/restart only lifts a user stop (M5 B2). */
+  private serviceAttach(): boolean {
+    if (!this.enrolling && !this.attaching && !this.reprobe) return false
+    this.userStopped = false
+    this.failureCount = 0
+    return true
+  }
+
+  /** Close the token connection, if any. */
+  private dropEnrolment(): void {
+    const session = this.enrolment
+    this.enrolment = null
+    if (this.renewTimer) {
+      clearInterval(this.renewTimer)
+      this.renewTimer = null
+    }
+    session?.close()
+  }
+
   /** T1-0: ask a CLI-started legacy daemon to shut down with its own token,
    * then wait (bounded) for its process to exit — it drops daemon.json and its
    * port when shutdown starts, but holds the singleton lock until exit. Every
@@ -695,18 +827,20 @@ export class BackendManager {
 
   /** Live `/health` disagreed. The recorded version is only named in the hint. */
   private refuseExternal(state: ExternalDaemonState, daemonVersion: number | null): 'incompatible' {
-    const detail: BackendStatusDetail = {
+    const detail: ProtocolMismatchDetail = {
       kind: 'protocol_mismatch', daemonVersion, clientVersion: CLIENT_PROTOCOL_VERSION,
       recordedVersion: state.protocolVersion, pid: state.pid,
       ...(state.rejected === undefined ? {} : { reason: state.rejected }),
       ...(state.rejected !== undefined && this.rejectedSilent >= REJECTED_SILENT_LIMIT ? { hint: 'delete_daemon_json' as const } : {}),
     }
-    const already = this.blockedReason?.pid === detail.pid
+    const already = this.blockedReason?.kind === 'protocol_mismatch'
+      && this.blockedReason.pid === detail.pid
       && this.blockedReason.reason === detail.reason
       && this.blockedReason.hint === detail.hint
       && this.blockedReason.daemonVersion === detail.daemonVersion
       && this.blockedReason.recordedVersion === detail.recordedVersion
     this.blockedReason = detail
+    this.dropEnrolment()
     this.isExternal = false
     this.externalPid = null
     this.lastHealthy = false
@@ -762,6 +896,10 @@ export class BackendManager {
       this.held.resume = true
       return
     }
+    // The service daemon is there, enrolling or about to again (M5 B2):
+    // nothing to spawn, and the enrolment in flight must not be superseded.
+    // A stop is undone all the same, so the tick enrols again (Codex B2 r2 C1).
+    if (this.serviceAttach()) return
     this.lifecycle += 1
     // Spawning against an incompatible peer's lock just restarts the failure
     // loop. (A `foreign` peer is different: a manual start is allowed through,
@@ -801,6 +939,7 @@ export class BackendManager {
       this.held.resume = true
       return
     }
+    if (this.serviceAttach()) return
     this.lifecycle += 1
     if (this.blockedReason !== null && this.blockedReason.hint === undefined) return
     this.userStopped = false
@@ -846,12 +985,17 @@ export class BackendManager {
 
   /** Forget a reused external daemon without touching the process itself. */
   private disconnectExternal(): void {
+    this.dropEnrolment()
     this.isExternal = false
     this.externalPid = null
     publishConnection(null, null)
   }
 
   private spawnChild(): void {
+    this.dropEnrolment()
+    // Our own child from here on: its daemon.json is not the service's to
+    // enrol with again (Codex B2 C2).
+    this.reprobe = false
     publishConnection(null, null)
     // Any spawn (initial, respawn-after-failure, or an explicit restart)
     // always produces a desktop-owned child — never external past this point.
@@ -955,6 +1099,20 @@ export class BackendManager {
       if (this.foreignPid !== null) {
         this.lastHealthy = false
         if ((await this.tryReuseExternal()) === 'absent') this.spawnChild()
+        return
+      }
+
+      // M5 B2: the token connection ended under a live service daemon.
+      if (this.reprobe) {
+        this.reprobe = false
+        this.attaching = true
+        let outcome: Awaited<ReturnType<BackendManager['tryReuseExternal']>>
+        try {
+          outcome = await this.tryReuseExternal()
+        } finally {
+          this.attaching = false
+        }
+        if (outcome === 'absent') this.spawnChild()
         return
       }
 
