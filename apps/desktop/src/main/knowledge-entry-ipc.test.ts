@@ -468,6 +468,18 @@ describe('the drafts as the Knowledge page sees them', () => {
     expect(pending.clear).toHaveBeenCalledTimes(1)
   })
 
+  it('M4 A7: a withdraw that fails leaves the draft waiting', async () => {
+    const pending = { set: vi.fn(), clear: vi.fn() }
+    const s = drafting({ pending })
+    const d = await one(s)
+    for (const withdraw of [() => false, () => { throw new Error('io') }]) {
+      const stuck = knowledgeEntryDrafts({ store: { ...s.store, get: s.store.get, withdraw }, chat: vi.fn(), target: () => TARGET, locale: () => 'zh', pending })
+      expect(stuck.withdraw(d.id)).toBe(false)
+    }
+    expect(s.drafts.get(d.id)).not.toBeNull()
+    expect(pending.clear).not.toHaveBeenCalled()
+  })
+
   it('M4 A7: a create that fails writes no pending item', async () => {
     const pending = { set: vi.fn(), clear: vi.fn() }
     const s = drafting({ pending })
