@@ -171,7 +171,8 @@ describe('task cards (M4 A4)', () => {
     await show()
     await waitFor(() => expect(card('已完成')).toHaveTextContent('见'))
     expect(within(card('已完成')).getByRole('note')).toHaveTextContent('doc-7#chk-71')
-    expect(within(card('已完成')).queryByText('经知识库检索回答（agent 模式）')).toBeNull()
+    // No Knowledge record (e.g. Knowledge Off): nothing said about searching.
+    expect(card('已完成').querySelectorAll('.task-card-knowledge')).toHaveLength(1)
   })
 
   it('says a task the daemon does not have is not found', async () => {
