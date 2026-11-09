@@ -92,7 +92,9 @@ pub async fn derive(
         ("POST", "/api/v1/shutdown") => SHUTDOWN_TEXT.to_owned(),
         _ => return None,
     };
-    (text.encode_utf16().count() <= details_budget()).then_some(text)
+    // The length is checked where it is authoritative: `remember` on the
+    // details and `elevate` on the whole dialog string, prefix included.
+    Some(text)
 }
 
 fn details_budget() -> usize {

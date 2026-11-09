@@ -570,19 +570,13 @@ async fn module_approvals_name_the_module_action_and_arguments() {
         )
         .await
         .unwrap();
-    for (body, verb) in [
-        (r#"{"decision":"approved"}"#, "approve"),
-        (r#"{"decision":"denied"}"#, "deny"),
-    ] {
-        let text = d
-            .ask("POST", "/api/v1/module-approvals/mapr_kb3b", body)
-            .await;
-        let text = match text {
-            Ok(text) => text,
-            // Approved once above: a decided approval has nothing to approve.
-            Err(EnrollErrorCode::NotElevatedOperation) if verb == "deny" => break,
-            Err(e) => panic!("{e:?}"),
-        };
+    let path = "/api/v1/module-approvals/mapr_kb3b";
+    let denied = r#"{"decision":"denied"}"#;
+    let approved = r#"{"decision":"approved"}"#;
+    // The deny text first, without sending it; then approve it for real.
+    let deny_text = d.ask_then("POST", path, denied, false).await.unwrap();
+    let approve_text = d.ask("POST", path, approved).await.unwrap();
+    for (verb, text) in [("deny", deny_text), ("approve", approve_text)] {
         assert!(
             text.contains(&format!(
                 "{verb} module approval \"mapr_kb3b\": module \"doc-module\", action \"publish\"; target \"team-wiki\"; arguments: "
@@ -594,6 +588,12 @@ async fn module_approvals_name_the_module_action_and_arguments() {
             "{text}"
         );
     }
+    // Decided: nothing left to approve.
+    let again = d.ask("POST", path, denied).await;
+    assert!(
+        matches!(again, Err(EnrollErrorCode::NotElevatedOperation)),
+        "{again:?}"
+    );
 }
 
 #[tokio::test]
