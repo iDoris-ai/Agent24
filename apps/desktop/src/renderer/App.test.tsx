@@ -55,7 +55,7 @@ describe('App', () => {
 
   it('renders the fixed sidebar and default pins without Workbench', async () => {
     await act(async () => { render(<App />) })
-    expect(screen.getAllByText('助手').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('助理').length).toBeGreaterThan(0)
     expect(screen.queryByText('工作台')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: '能力中心' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '本地模型' })).not.toBeInTheDocument()
@@ -301,7 +301,7 @@ describe('App', () => {
   })
 
   // M1-T14: switching to another page and back used to UNMOUNT ChatPage
-  // (`{page === 'chat' && <ChatPage />}`), which reset its message list and
+  // (`{page === 'assistant' && <ChatPage />}`), which reset its message list and
   // minted a fresh `session_id` — silently starting a new D1 memory session
   // on every round trip through another page. ChatPage must now stay
   // mounted (hidden via `display: none`) so a conversation survives
@@ -334,7 +334,7 @@ describe('App', () => {
     await waitFor(() => {
       expect(screen.getByText('hello there')).not.toBeVisible()
     })
-    fireEvent.click(within(screen.getByRole('navigation', { name: '主导航' })).getByRole('button', { name: '助手' }))
+    fireEvent.click(within(screen.getByRole('navigation', { name: '主导航' })).getByRole('button', { name: '助理' }))
 
     // The message list and session id must be exactly as they were.
     await waitFor(() => {
@@ -368,7 +368,7 @@ describe('App', () => {
     )?.[0].body.session_id
     expect(thirdSessionId).not.toBe(firstSessionId)
     fireEvent.click(screen.getByRole('button', { name: '能力中心' }))
-    fireEvent.click(within(screen.getByRole('navigation', { name: '主导航' })).getByRole('button', { name: '助手' }))
+    fireEvent.click(within(screen.getByRole('navigation', { name: '主导航' })).getByRole('button', { name: '助理' }))
     await waitFor(() => expect(screen.getByText('fresh topic')).toBeVisible())
   })
 })
