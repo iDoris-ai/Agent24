@@ -264,10 +264,20 @@ fn native_macho<H: object::read::macho::MachHeader>(data: &[u8], arch: &str) -> 
     loop {
         match commands.next() {
             Ok(Some(command)) => {
-                has_entry |= matches!(
-                    command.cmd(),
-                    object::macho::LC_MAIN | object::macho::LC_UNIXTHREAD
-                );
+                // `variant` reads the command's body, so an entry command too short
+                // to hold its fields is rejected rather than counted by number alone.
+                let cmd = command.cmd();
+                match command.variant() {
+                    Ok(object::read::macho::LoadCommandVariant::EntryPoint(_)) => has_entry = true,
+                    // A thread command carries at least a flavor and a count after its header.
+                    Ok(object::read::macho::LoadCommandVariant::Thread(_, state))
+                        if cmd == object::macho::LC_UNIXTHREAD && state.len() >= 8 =>
+                    {
+                        has_entry = true;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
             }
             Ok(None) => return has_entry,
             Err(_) => return false,
@@ -420,6 +430,9 @@ fn check_native_executable(path: &Path, rel_path: &str) -> Result<(), IntegrityE
         .map_err(io::Error::from)
     };
     // On Windows rustix is unavailable; collect_payload/verify_tree already rejected symlinks.
+    // Known boundary (v1): a concurrent writer replacing the file with a link between that
+    // check and this open is not caught here — the same class as S1-9 §3's documented
+    // "after recheck, before spawn" window.
     #[cfg(not(unix))]
     let opened = File::open(path);
     let mut file = opened.map_err(|err| IntegrityError::CheckFailed {
@@ -1373,6 +1386,11 @@ mod tests {
                 "macos",
                 "x86_64"
             ));
+            // The same command with only its 8-byte header and no body.
+            let mut empty = macho_header(1, 8);
+            empty.extend_from_slice(&command.to_le_bytes());
+            empty.extend_from_slice(&8u32.to_le_bytes());
+            assert!(!native_executable(&empty, "macos", "x86_64"));
         }
     }
 
