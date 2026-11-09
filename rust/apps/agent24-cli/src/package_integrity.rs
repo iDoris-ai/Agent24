@@ -15,6 +15,9 @@ pub enum Action {
         /// 包内相对路径。可重复。必须包含 spawn.command。
         #[arg(long, required = true)]
         executable: Vec<String>,
+        /// 目标包的 CPU 架构；verify/安装时仍按本机架构检查。
+        #[arg(long, default_value = std::env::consts::ARCH, value_parser = ["aarch64", "x86_64"])]
+        arch: String,
     },
     /// 只读、严格校验。成功不输出；失败输出固定原因和相对路径。
     Verify {
@@ -25,10 +28,12 @@ pub enum Action {
 
 pub fn run(action: Action) -> Result<(), String> {
     match action {
-        Action::Generate { root, executable } => {
-            agent24_os_packages::package_integrity::generate(&root, &executable)
-                .map_err(|err| err.to_string())
-        }
+        Action::Generate {
+            root,
+            executable,
+            arch,
+        } => agent24_os_packages::package_integrity::generate_for_arch(&root, &executable, &arch)
+            .map_err(|err| err.to_string()),
         Action::Verify { root } => {
             agent24_os_packages::package_integrity::verify(&root).map_err(|err| err.to_string())
         }
