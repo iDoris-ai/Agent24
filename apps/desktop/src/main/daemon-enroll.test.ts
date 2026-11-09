@@ -108,6 +108,57 @@ describe('enrol (M5 B2, protocol v1)', () => {
     session.close()
   })
 
+  /** A daemon that enrols, then answers each renew with `answer(n)` (null: no answer). */
+  async function renewing(answer: (n: number) => string | null) {
+    let renews = 0
+    const sock = await fakeDaemon(async (peer) => {
+      peer.write(frame({ op: 'challenge', nonce: NONCE }))
+      await peer.line()
+      peer.write(enrolled())
+      for (;;) {
+        await peer.line()
+        renews += 1
+        const reply = answer(renews)
+        if (reply !== null) peer.write(reply)
+      }
+    })
+    return { session: await enrol({ socketPath: sock, generation: 'g', httpPort: 5555 }), renews: () => renews }
+  }
+
+  it('a renew answered with another port is refused and ends the session (B3a, PR-Daemon #1725)', async () => {
+    const { session } = await renewing(() => enrolled('elsewhere', 6666))
+    expect(await codeOf(session.renew())).toBe('endpoint_mismatch')
+    expect(session.token).toBe(TOKEN)
+    const why = await new Promise<EnrolError>((resolve) => session.onClose(resolve))
+    expect(why.code).toBe('endpoint_mismatch')
+  })
+
+  it('renews asked for at once share one renew frame (B3a)', async () => {
+    const { session, renews } = await renewing((n) => enrolled(`renewed-${n}`))
+    const a = session.renew()
+    const b = session.renew()
+    expect(b).toBe(a)
+    await expect(a).resolves.toBe('renewed-1')
+    await expect(session.renew()).resolves.toBe('renewed-2')
+    expect(renews()).toBe(2)
+    session.close()
+  })
+
+  it('a renew the daemon never answers times out (B3a)', async () => {
+    const { session } = await renewing(() => null)
+    expect(await codeOf(session.renew())).toBe('timeout')
+  }, ENROL_STEP_MS + 5_000)
+
+  it('a renew on a connection already gone fails at once, and the next renew is a fresh try (B3a, PR-Daemon #1725)', async () => {
+    const { session } = await renewing((n) => enrolled(`renewed-${n}`))
+    session.close()
+    const first = session.renew()
+    expect(await codeOf(first)).toBe('closed')
+    const second = session.renew()
+    expect(second).not.toBe(first)
+    expect(await codeOf(second)).toBe('closed')
+  })
+
   it('a renew the daemon refuses closes the connection and says so once', async () => {
     const sock = await fakeDaemon(async (peer) => {
       peer.write(frame({ op: 'challenge', nonce: NONCE }))

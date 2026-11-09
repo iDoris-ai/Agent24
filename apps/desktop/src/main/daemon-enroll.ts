@@ -229,7 +229,8 @@ export async function enrol(target: EnrolTarget, connect: Connect = defaultConne
   return {
     get token() { return current },
     renew() {
-      renewing ??= (async () => {
+      if (renewing) return renewing
+      const attempt = (async () => {
         try {
           conn.send({ op: 'renew' })
           const next = enrolledToken(
@@ -241,11 +242,14 @@ export async function enrol(target: EnrolTarget, connect: Connect = defaultConne
         } catch (error) {
           conn.close(error)
           throw error
-        } finally {
-          renewing = null
         }
       })()
-      return renewing
+      // Cleared once this attempt settles, and only if it is still the one
+      // held: a send that throws at once settles it before it is held
+      // (PR-Daemon #1725).
+      renewing = attempt
+      attempt.then(() => { if (renewing === attempt) renewing = null }, () => { if (renewing === attempt) renewing = null })
+      return attempt
     },
     onClose: (listener) => conn.onClose(listener),
     close: () => { conn.close() },
