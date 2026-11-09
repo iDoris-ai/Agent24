@@ -37,9 +37,10 @@
   - `--work` 解析后的路径必须是可打印 ASCII，否则在创建任何东西之前就拒绝运行。原因是 reap 按 lsof 打出的工作目录认进程，而 lsof 会把其他字节转义（C locale 下连非 ASCII 字符也转义），这样的路径永远匹配不上，残留的 daemon 就会被放过。也不能带空格：reap 按 ps 打出的命令行认模块进程，命令行里的空格分隔参数，`/x/a b/m` 也可能是别人用参数 `b/m` 跑的 `/x/a`。
 - **不留进程**：
   - 宿主 daemon 靠关闭 stdin 来停：父进程租约结束，daemon 自己退出。legacy 方式拉起的发 SIGTERM。15 秒内没有退出就杀掉。
+  - W7 的服务模式 daemon 没有父进程租约，脚本退出后它不会自己停：用 SIGTERM 停；等 ready 行时被打断也当场停掉。下面的兜底同样认 `--enroll-new` 里的 `agent24d serve`。
   - CLI 起的 daemon 用 `agent24 daemon stop` 停。
   - documents 模块由 daemon 拉起，daemon 正常停下时会一并停掉它。兜底：二进制在 `--work` 下面的进程（也就是 `os install` 装进来的模块）在 reap 时一律杀掉。
-  - 兜底：`agent24 daemon start` 等不到 ready 就放弃时，daemon 不会随 CLI 退出，而且可能还没写出状态文件。所以运行开始时先记下已有的 `<--old 或 --new>/agent24d serve` 进程；每条用例结束后，以及脚本退出时，查之后新出现的这类进程，只杀工作目录落在 `--work` 下的。脚本让每个 daemon 和每次 CLI 调用都在各自的数据目录里启动，daemon 和 CLI 都不切换目录，所以这次运行起的 daemon 都在 `--work` 下面。别的运行或用户自己从同一个目录起的 daemon 不碰，读不到工作目录的也不碰，只打一行提示。工作目录在 Linux 上读 `/proc/<pid>/cwd`，在 macOS 上用 `lsof -d cwd`（macOS 的 `ps -E` 读不到别的进程的环境变量）。不按状态文件里的 pid 杀，免得误杀。
+  - 兜底：`agent24 daemon start` 等不到 ready 就放弃时，daemon 不会随 CLI 退出，而且可能还没写出状态文件。所以运行开始时先记下已有的 `<--old、--new 或 --enroll-new>/agent24d serve` 进程；每条用例结束后，以及脚本退出时，查之后新出现的这类进程，只杀工作目录落在 `--work` 下的。脚本让每个 daemon 和每次 CLI 调用都在各自的数据目录里启动，daemon 和 CLI 都不切换目录，所以这次运行起的 daemon 都在 `--work` 下面。别的运行或用户自己从同一个目录起的 daemon 不碰，读不到工作目录的也不碰，只打一行提示。工作目录在 Linux 上读 `/proc/<pid>/cwd`，在 macOS 上用 `lsof -d cwd`（macOS 的 `ps -E` 读不到别的进程的环境变量）。不按状态文件里的 pid 杀，免得误杀。
   - 每个 daemon 都在 `try` 里构造，构造中途出错也会被清理。
 - **泄漏扫描**：W1c 和 W2e 在 daemon 停下之后才扫，停机时写出的内容也在范围内。只读普通文件（socket、FIFO 里没有可泄漏的字节）；读不了的普通文件不算「没找到」，检查直接判 FAIL。
 - **依赖**：python3，只用标准库，以 `-I` 运行；macOS 上还要 `lsof`（系统自带）。

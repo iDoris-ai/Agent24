@@ -124,12 +124,13 @@ def snapshot(top):
 
 
 def daemons():
-    """Pids of `agent24d serve` processes from either bin dir."""
+    """Pids of `agent24d serve` processes from any of the bin dirs (W7's come
+    from --enroll-new)."""
     out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
     found = set()
     for line in out.splitlines():
         pid, _, cmd = line.strip().partition(" ")
-        if any(cmd.startswith(os.path.join(d, "agent24d") + " serve") for d in (OLD, NEW)):
+        if any(cmd.startswith(os.path.join(d, "agent24d") + " serve") for d in (OLD, NEW, ENROLL_NEW)):
             found.add(int(pid))
     return found
 
@@ -348,7 +349,13 @@ class ServiceDaemon:
                 "--auth-mode", "capabilities", "--enroll-endpoint"]
         self.proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                      stderr=self.log, env=env, cwd=data)
-        self.ready = read_line(self.proc, READY_TIMEOUT)
+        # No parent lease here: a service daemon outlives this script, so one
+        # interrupted before the caller holds it is stopped on the spot.
+        try:
+            self.ready = read_line(self.proc, READY_TIMEOUT)
+        except BaseException:
+            self.stop()
+            raise
         r = self.ready if isinstance(self.ready, dict) else {}
         self.port = r.get("port")
         self.generation = r.get("generation")
