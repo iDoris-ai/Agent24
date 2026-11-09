@@ -2346,7 +2346,7 @@ export interface components {
             /** @enum {string} */
             form: "resident" | "sidecar" | "cli" | "attach" | "remote" | "mcp";
             provides: components["schemas"]["ComponentProvide"][];
-            /** @description Short machine-readable cause; host only. For hyphae with state failed this includes signature_rejected, hash_mismatch (see HyphaeRejection), and contract_check_failed (the contract command did not return a readable envelope). State incompatible uses contract_mismatch. State degraded lists the failed probe names (for example relays), never a relay URL. A Hyphae that is simply not installed is state absent with no reason. */
+            /** @description Short machine-readable cause; host only. For hyphae with state failed this includes signature_rejected, hash_mismatch (see HyphaeRejection), and contract_check_failed (the contract command did not return a readable envelope). An OS package that failed its integrity check is state failed (not absent, not incompatible) with one of integrity_manifest_missing, hash_mismatch, integrity_manifest_invalid, signature_rejected, or integrity_check_failed. State incompatible uses contract_mismatch. State degraded lists the failed probe names (for example relays), never a relay URL. A Hyphae that is simply not installed is state absent with no reason. */
             reason?: string;
             /** @description Ports, contract expectation, counters, messages; host only. For Hyphae, detail.health is {consecutive_failures, degraded, checks: {probe: {ok, consecutive_failures}}} and never includes relay URLs. detail.consecutive_failures remains the daemon restart counter, separate from detail.health.consecutive_failures. */
             detail?: {
