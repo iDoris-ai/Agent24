@@ -77,7 +77,7 @@ const draftMessages = defineMessages({
     'submit.format': 'Line {line} uses formatting the knowledge base does not accept (such as HTML, images, footnotes or a link that is not a plain https address). Edit it before submitting.',
     'submit.target': 'Knowledge base',
     'status.pending': 'Sent, but whether it arrived is not known yet. Trying again sends the same submission, never a second one.',
-    'status.stuck': 'Whether this submission arrived cannot be told any more: Knowledge’s connection or key changed, or too much time has passed. Ask the knowledge base’s reviewers before submitting this draft again.',
+    'status.stuck': 'Whether this submission arrived cannot be told any more: Knowledge’s connection or key changed, or too much time has passed. This draft cannot be submitted again. Ask the knowledge base’s reviewers whether they received it; if not, make a new draft and submit that.',
     'status.submitted': 'Submitted for review to {kb}.',
     'status.approved': 'Approved by the reviewers.',
     'status.returned': 'Returned by the reviewers: {reason}.',
@@ -164,7 +164,7 @@ const draftMessages = defineMessages({
     'submit.format': '第 {line} 行用了知识库不接受的格式（例如 HTML、图片、脚注，或不是普通 https 地址的链接），请修改后再提交。',
     'submit.target': '知识库',
     'status.pending': '已发出，但还不知道是否送达。重新提交发出的是同一份提交，不会多出一份。',
-    'status.stuck': '已经无法确认这次提交是否送达：Knowledge 的连接或密钥变了，或者时间过去太久。再次提交这份草稿之前，请先向知识库的审阅人确认。',
+    'status.stuck': '已经无法确认这次提交是否送达：Knowledge 的连接或密钥变了，或者时间过去太久。这份草稿不能再提交了。请向知识库的审阅人确认是否收到；没有收到的话，请新建一份草稿再提交。',
     'status.submitted': '已提交到 {kb} 等待审阅。',
     'status.approved': '审阅已通过。',
     'status.returned': '审阅人已退回：{reason}。',
@@ -251,7 +251,7 @@ const draftMessages = defineMessages({
     'submit.format': 'บรรทัดที่ {line} ใช้รูปแบบที่คลังความรู้ไม่รับ (เช่น HTML รูปภาพ เชิงอรรถ หรือลิงก์ที่ไม่ใช่ที่อยู่ https ธรรมดา) โปรดแก้ไขก่อนส่ง',
     'submit.target': 'คลังความรู้',
     'status.pending': 'ส่งแล้ว แต่ยังไม่รู้ว่าถึงหรือไม่ การส่งอีกครั้งจะส่งรายการเดิม ไม่เกิดรายการที่สอง',
-    'status.stuck': 'บอกไม่ได้แล้วว่าการส่งครั้งนี้ถึงหรือไม่ เพราะการเชื่อมต่อหรือคีย์ของ Knowledge เปลี่ยน หรือเวลาผ่านไปนานเกินไป โปรดสอบถามผู้ตรวจของคลังความรู้ก่อนส่งฉบับร่างนี้อีกครั้ง',
+    'status.stuck': 'บอกไม่ได้แล้วว่าการส่งครั้งนี้ถึงหรือไม่ เพราะการเชื่อมต่อหรือคีย์ของ Knowledge เปลี่ยน หรือเวลาผ่านไปนานเกินไป ฉบับร่างนี้ส่งอีกไม่ได้แล้ว โปรดสอบถามผู้ตรวจของคลังความรู้ว่าได้รับหรือไม่ หากยังไม่ได้รับ โปรดสร้างฉบับร่างใหม่แล้วส่งฉบับนั้น',
     'status.submitted': 'ส่งให้ {kb} ตรวจแล้ว',
     'status.approved': 'ผู้ตรวจอนุมัติแล้ว',
     'status.returned': 'ผู้ตรวจส่งคืน: {reason}',
@@ -825,7 +825,7 @@ function DraftDetail({ id, created }: { id: string; created?: CreatedNote }): JS
         <button className="btn" type="button" disabled={busy || draft.target !== 'same'} onClick={onRetract}>{t('action.retract')}</button>
       )}
       {canSubmit && blocker && <p>{blocker}</p>}
-      {statusLines.map((line) => <p key={line}>{line}</p>)}
+      {statusLines.map((line, index) => <p key={index}>{line}</p>)}
       <button className="btn" type="button" onClick={() => leave(openDraftList)}>{t('action.back')}</button>
       <button className="btn" type="button" onClick={() => leave(closeDrafts)}>{t('action.close')}</button>
     </Shell>

@@ -580,7 +580,8 @@ describe('H2: submitting a draft for review', () => {
     expect(button('重新提交')).toBeDisabled()
 
     await shown(ready({ id: 's', title: '丙', submission: sub({ pending: true, stuck: true }) }))
-    expect(screen.getByText(/^已经无法确认这次提交是否送达/)).toBeTruthy()
+    // PR-Daemon #1763 N1: nothing in the panel can resend it, so the words must not promise that.
+    expect(screen.getByText(/^已经无法确认这次提交是否送达.*这份草稿不能再提交了。.*新建一份草稿再提交。$/)).toBeTruthy()
     expect(button('提交审阅')).toBeNull()
     expect(button('重新提交')).toBeNull()
   })
