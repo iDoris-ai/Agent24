@@ -141,21 +141,41 @@ async function until(check: () => boolean, ms: number): Promise<boolean> {
   return true
 }
 
+/** What the real steps read of the system; tests put their own (QA #1744). */
+export interface UpgradeSystem {
+  alive: (pid: number) => boolean
+  jobPid: () => Promise<number | null>
+  record: () => { pid: number } | null
+  exitWaitMs: number
+  startWaitMs: number
+}
+
+const realSystem = (): UpgradeSystem => ({
+  alive: processAlive,
+  jobPid: () => servicePid(process.getuid!()),
+  record: readExternalDaemonState,
+  exitWaitMs: DAEMON_EXIT_WAIT_MS,
+  startWaitMs: 30_000,
+})
+
 /** The real steps, for the enrolled service daemon `pid`. */
-export function serviceUpgradeDeps(o: { bin: string; dataDir: string; pid: number; hold: UpgradeDeps['hold'] }): UpgradeDeps {
+export function serviceUpgradeDeps(
+  o: { bin: string; dataDir: string; pid: number; hold: UpgradeDeps['hold'] },
+  sys: UpgradeSystem = realSystem(),
+): UpgradeDeps {
   return {
     shutdown: async () => {
       const res = await sendElevating({ method: 'POST', path: '/api/v1/shutdown' }, {}, { connection: daemonConnection, elevation: daemonElevation })
       return { status: res.status, code: (res.data as { error?: { code?: string } } | null)?.error?.code }
     },
     // And launchd has not run it again from that file (an exit not 0; Codex B5a C3).
-    exited: async () => (await until(() => !processAlive(o.pid), DAEMON_EXIT_WAIT_MS)) && (await servicePid(process.getuid!())) === null,
+    exited: async () => (await until(() => !sys.alive(o.pid), sys.exitWaitMs)) && (await sys.jobPid()) === null,
     copy: () => copyDaemonIfChanged(o.bin, serviceDaemonCopyPath(o.dataDir)),
     kickstart: () => kickstartService(process.getuid!()),
     started: () => until(() => {
-      const state = readExternalDaemonState()
-      return state !== null && state.pid !== o.pid && processAlive(state.pid)
-    }, 30_000),
+      const state = sys.record()
+      return state !== null && state.pid !== o.pid && sys.alive(state.pid)
+    }, sys.startWaitMs),
     hold: o.hold,
   }
 }
