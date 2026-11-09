@@ -30,6 +30,7 @@ import {
   type ExternalDaemonState,
 } from './backend-manager'
 import { CLIENT_PROTOCOL_VERSION } from './protocol-compatibility'
+import { EnrolError } from './daemon-enroll'
 
 describe('deriveStatus (F1b tray daemon status)', () => {
   it('a user-initiated stop pins `stopped`, even if a stale endpoint lingers', () => {
@@ -1755,5 +1756,319 @@ describe('capability-mode startup (KB-HOST-01 PR-A2)', () => {
       stop()
       manager.stop()
     }
+  })
+})
+
+describe('BackendManager enrols with the LaunchAgent daemon (M5 B2)', () => {
+  const record: ExternalDaemonState = {
+    port: 5555, token: '', pid: 4242, authMode: 'capabilities', protocolVersion: CLIENT_PROTOCOL_VERSION,
+    enrollEndpoint: '/data/enroll.sock', generation: 'gen-1',
+  }
+  const child = (): ChildProcess => Object.assign(new EventEmitter(), { pid: 111, stdout: null, stderr: null, kill: vi.fn() }) as unknown as ChildProcess
+  let logged: () => string
+  beforeEach(() => {
+    const spies = [vi.spyOn(console, 'log').mockImplementation(() => {}), vi.spyOn(console, 'warn').mockImplementation(() => {})]
+    logged = () => spies.flatMap((spy) => spy.mock.calls.flat()).join('\n')
+  })
+  afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers() })
+
+  /** A session double: `renew` hands out `daily-2`, `daily-3`, …; `end` plays the daemon closing it. */
+  function session(token = 'daily-1') {
+    let n = 1
+    const listeners: Array<(why: EnrolError) => void> = []
+    const s = {
+      token,
+      renew: vi.fn(async () => { n += 1; s.token = `daily-${n}`; return s.token }),
+      onClose: (l: (why: EnrolError) => void) => { listeners.push(l) },
+      close: vi.fn(),
+      end: (code: string) => { for (const l of listeners.splice(0)) l(new EnrolError(code, code)) },
+    }
+    return s
+  }
+  function serviceDaemon(over: Partial<ExternalDaemonSource> = {}): ExternalDaemonSource {
+    return {
+      read: () => record,
+      checkHealth: vi.fn().mockResolvedValue(true),
+      fetchHealth: vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
+      serviceManaged: () => true,
+      acceptsToken: vi.fn().mockResolvedValue(true),
+      requestShutdown: vi.fn().mockResolvedValue(202),
+      isAlive: () => true,
+      ...over,
+    }
+  }
+
+  it('enrols on the advertised socket, uses the daily token, and never spawns', async () => {
+    const s = session()
+    const external = serviceDaemon({ enrol: vi.fn().mockResolvedValue(s) })
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      expect(external.enrol).toHaveBeenCalledWith({ socketPath: '/data/enroll.sock', generation: 'gen-1', httpPort: 5555 })
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(external.requestShutdown).not.toHaveBeenCalled()
+      expect(manager.isExternalDaemon()).toBe(true)
+      expect(manager.status()).toBe('running')
+      expect(daemonConnection()).toEqual({ port: 5555, authHeaders: { Authorization: 'Bearer daily-1' } })
+      expect(daemonAuthMode()).toBe('capabilities')
+      expect(logged()).toContain('enrolled as first-party shell')
+      expect(logged()).not.toContain('daily-1')
+    } finally {
+      manager.stop()
+    }
+    expect(s.close).toHaveBeenCalled()
+    expect(daemonConnection()).toBeNull()
+  })
+
+  it('renews before the daemon idles the connection out, and publishes each new token', async () => {
+    vi.useFakeTimers()
+    const s = session()
+    const manager = new BackendManager({ external: serviceDaemon({ enrol: vi.fn().mockResolvedValue(s) }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    await manager.start()
+    try {
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      expect(s.renew).toHaveBeenCalledTimes(1)
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer daily-2' })
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer daily-3' })
+      expect(logged()).not.toMatch(/daily-\d/)
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a connection that ends under a live daemon is enrolled again on the next tick', async () => {
+    vi.useFakeTimers()
+    const first = session('daily-1')
+    const second = session('again-1')
+    const enrol = vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(second)
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      first.end('daemon_unavailable')
+      expect(daemonConnection()).toBeNull()
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(enrol).toHaveBeenCalledTimes(2)
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer again-1' })
+      expect(spawnProcess).not.toHaveBeenCalled()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it.each([
+    ['identity_rejected', '登记被拒'],
+    ['unsupported_version', '登记被拒'],
+    ['timeout', '登记失败'],
+  ])('an enrolment that fails with %s has its own state: no spawn, not absent, not foreign', async (code) => {
+    vi.useFakeTimers()
+    const enrol = vi.fn().mockRejectedValue(new EnrolError(code, `daemon said ${code}`))
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      expect(manager.status()).toBe('error')
+      expect(manager.statusDetail()).toEqual({ kind: 'enrol_refused', code, pid: 4242 })
+      expect(manager.foreignDaemonPid()).toBeNull()
+      expect(manager.isExternalDaemon()).toBe(false)
+      expect(daemonConnection()).toBeNull()
+      // The tray cannot start one over it either; the next probes retry, logged once.
+      manager.startDaemon()
+      manager.restart()
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(enrol.mock.calls.length).toBeGreaterThan(1)
+      expect(logged().split(`did not enrol this app (${code})`).length - 1).toBe(1)
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a service daemon that dies is let go: its connection is closed before the app spawns its own', async () => {
+    vi.useFakeTimers()
+    let alive = true
+    const s = session()
+    const spawnProcess = vi.fn(child)
+    const checkHealth = vi.fn(async () => alive)
+    const manager = new BackendManager({
+      external: serviceDaemon({ enrol: vi.fn().mockResolvedValue(s), isAlive: () => alive, checkHealth }),
+      spawnProcess, authMode: 'capabilities',
+    })
+    await manager.start()
+    try {
+      alive = false
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      expect(s.close).toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      expect(s.renew).not.toHaveBeenCalled()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('once the refusing daemon is gone, the app spawns its own', async () => {
+    vi.useFakeTimers()
+    let alive = true
+    const enrol = vi.fn().mockRejectedValue(new EnrolError('identity_rejected', 'unsigned'))
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol, isAlive: () => alive }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      alive = false
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      expect(manager.statusDetail()).toBeNull()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a capability record without an enrolment socket stays foreign and is never enrolled', async () => {
+    const enrol = vi.fn()
+    const noSocket: ExternalDaemonState = { ...record }
+    delete noSocket.enrollEndpoint
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ read: () => noSocket, enrol }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      expect(enrol).not.toHaveBeenCalled()
+      expect(manager.foreignDaemonPid()).toBe(4242)
+      expect(manager.status()).toBe('blocked')
+      expect(spawnProcess).not.toHaveBeenCalled()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a tray start or restart while enrolling spawns nothing and lets the enrolment finish (Codex B2 C1)', async () => {
+    const s = session()
+    let finish: (v: unknown) => void = () => {}
+    const enrol = vi.fn(() => new Promise((resolve) => { finish = resolve }))
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol: enrol as ExternalDaemonSource['enrol'] }), spawnProcess, authMode: 'capabilities' })
+    const starting = manager.start()
+    await vi.waitFor(() => expect(enrol).toHaveBeenCalled())
+    try {
+      manager.restart()
+      manager.startDaemon()
+      finish(s)
+      await starting
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(manager.isExternalDaemon()).toBe(true)
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer daily-1' })
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a tray restart between a lost connection and the next enrolment spawns nothing (Codex B2 C1)', async () => {
+    vi.useFakeTimers()
+    const first = session('daily-1')
+    const enrol = vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(session('again-1'))
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      first.end('daemon_unavailable')
+      manager.restart()
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer again-1' })
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('lost, then stopped from the tray, then started: the app enrols again, it is not stuck stopped (Codex B2 r2 C1)', async () => {
+    vi.useFakeTimers()
+    const first = session('daily-1')
+    const enrol = vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(session('again-1'))
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      first.end('daemon_unavailable')
+      manager.stopDaemon()
+      expect(manager.status()).toBe('stopped')
+      manager.startDaemon()
+      expect(manager.status()).not.toBe('stopped')
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer again-1' })
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a tray restart during the probe of a re-enrolment spawns nothing (Codex B2 r2 C2)', async () => {
+    vi.useFakeTimers()
+    const first = session('daily-1')
+    const enrol = vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(session('again-1'))
+    let answer: (v: { ok: boolean; protocolVersion: number }) => void = () => {}
+    const fetchHealth = vi.fn()
+      .mockResolvedValueOnce({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION })
+      .mockImplementationOnce(() => new Promise((resolve) => { answer = resolve }))
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol, fetchHealth }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      first.end('daemon_unavailable')
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(fetchHealth).toHaveBeenCalledTimes(2)
+      manager.restart()
+      manager.startDaemon()
+      answer({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer again-1' })
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a connection lost while the health loop gives up on the daemon does not outlive the spawn (Codex B2 C2)', async () => {
+    vi.useFakeTimers()
+    let alive = true
+    const s = session()
+    let probes = 0
+    const checkHealth = vi.fn(async () => {
+      probes += 1
+      // The third failed probe: the connection ends while it is awaited.
+      if (probes === 3) { alive = false; s.end('daemon_unavailable') }
+      return false
+    })
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({
+      external: serviceDaemon({ enrol: vi.fn().mockResolvedValue(s), checkHealth, isAlive: () => alive }),
+      spawnProcess, authMode: 'capabilities',
+    })
+    await manager.start()
+    try {
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      // Our own child now: the next ticks probe it, they do not go back to the record.
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      expect(manager.foreignDaemonPid()).toBeNull()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('an enrolment that lands after the app quit is closed, not used', async () => {
+    const s = session()
+    let finish: (v: unknown) => void = () => {}
+    const enrol = vi.fn(() => new Promise((resolve) => { finish = resolve }))
+    const manager = new BackendManager({ external: serviceDaemon({ enrol: enrol as ExternalDaemonSource['enrol'] }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    const starting = manager.start()
+    await vi.waitFor(() => expect(enrol).toHaveBeenCalled())
+    manager.stop()
+    finish(s)
+    await starting
+    expect(s.close).toHaveBeenCalled()
+    expect(daemonConnection()).toBeNull()
   })
 })

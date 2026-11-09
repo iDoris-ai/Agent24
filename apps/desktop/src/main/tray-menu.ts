@@ -3,6 +3,7 @@
 
 import type { BackendStatusDetail } from './backend-manager'
 import { mt } from './main-i18n'
+import { REJECTED_CODES } from './daemon-enroll'
 import type { CliToolStatus } from '../shared/ipc-types'
 
 export type TrayStatus = 'running' | 'starting' | 'stopped' | 'error' | 'blocked'
@@ -35,7 +36,11 @@ export function buildTrayView(input: TrayInput, platform: NodeJS.Platform = proc
       { type: 'separator' },
     )
   }
-  const base = mt(`tray.${input.status}`)
+  const detail = input.status === 'error' ? input.detail : null
+  const protocol = detail?.kind === 'protocol_mismatch' ? detail : null
+  // M5 B2: the LaunchAgent's daemon did not enrol this app.
+  const enrol = detail?.kind === 'enrol_refused' ? detail : null
+  const base = enrol ? mt('tray.enrolError') : mt(`tray.${input.status}`)
   // DEP-A5: an external daemon gets a visibly different label so the user can
   // tell it apart before hitting stop.
   const label = input.external
@@ -45,20 +50,25 @@ export function buildTrayView(input: TrayInput, platform: NodeJS.Platform = proc
   // T1-0: on macOS a reused external daemon is one the LaunchAgent manages;
   // Knowledge needs this app's own daemon, so say how to get there.
   if (input.external && platform === 'darwin') tooltip += '\n' + mt('tray.externalKnowledge')
-  const detail = input.status === 'error' ? input.detail : null
-  const summary = detail ? mt('tray.protocolShort', {
-    daemonVersion: detail.daemonVersion ?? mt('tray.protocolUnknown'),
-    clientVersion: detail.clientVersion, pid: detail.pid,
-  }) : null
-  if (detail && summary) {
+  const summary = protocol
+    ? mt('tray.protocolShort', {
+      daemonVersion: protocol.daemonVersion ?? mt('tray.protocolUnknown'),
+      clientVersion: protocol.clientVersion, pid: protocol.pid,
+    })
+    : enrol
+      ? mt(REJECTED_CODES.has(enrol.code) ? 'tray.enrolRejected' : 'tray.enrolFailed', { code: enrol.code, pid: enrol.pid })
+      : null
+  const hint = enrol ? mt('tray.enrolHint') : mt('tray.errorHint')
+  if (protocol && summary) {
     tooltip += '\n' + mt('tray.protocolDetail', {
       summary,
-      recorded: detail.recordedVersion === undefined
+      recorded: protocol.recordedVersion === undefined
         ? mt('tray.protocolUnrecorded')
-        : mt('tray.protocolRecorded', { version: detail.recordedVersion }),
-      hint: mt('tray.errorHint'),
+        : mt('tray.protocolRecorded', { version: protocol.recordedVersion }),
+      hint,
     })
   }
+  if (enrol && summary) tooltip += '\n' + summary + '\n' + hint
   // DEP-A5 #2: stop/restart only ever act on a daemon this app spawned, so the
   // external case is worded "disconnect", never implying a kill. An
   // incompatible daemon is neither reused nor killed: no start/stop at all.
@@ -66,7 +76,7 @@ export function buildTrayView(input: TrayInput, platform: NodeJS.Platform = proc
     input.status === 'error'
       ? [
         ...(summary ? [{ label: summary, enabled: false } satisfies TrayItem] : []),
-        { label: mt('tray.errorHint'), enabled: false },
+        { label: hint, enabled: false },
       ]
       : input.status === 'stopped'
         ? [{ label: mt('tray.start'), action: 'start' }]

@@ -94,3 +94,15 @@ it('tells the user of a reused (LaunchAgent) daemon how to get Knowledge working
   expect(buildTrayView(reused, 'win32').tooltip).not.toContain('service uninstall')
   expect(buildTrayView(input, 'darwin').tooltip).not.toContain('service uninstall')
 })
+
+it('says the service daemon did not enrol this app, why, and offers nothing that would spawn over it (M5 B2)', () => {
+  setMainLocale('zh')
+  const view = buildTrayView({ ...input, status: 'error', detail: { kind: 'enrol_refused', code: 'identity_rejected', pid: 4242 } })
+  expect(view.items).toContainEqual({ label: '✕ daemon：未登记本应用', enabled: false })
+  expect(view.items).toContainEqual({ label: '登记被拒：此构建未签名或版本不符 · pid 4242', enabled: false })
+  expect(view.tooltip).toContain('`agent24 service uninstall`')
+  expect(view.tooltip).not.toContain('协议')
+  expect(view.items.some((i) => 'action' in i && ['start', 'restart', 'stop'].includes(i.action))).toBe(false)
+  const failed = buildTrayView({ ...input, status: 'error', detail: { kind: 'enrol_refused', code: 'timeout', pid: 4242 } })
+  expect(failed.items).toContainEqual({ label: '登记失败（timeout）· pid 4242，正在重试', enabled: false })
+})
