@@ -12,6 +12,7 @@ import type {
   KnowledgeEntryKind,
   KnowledgeEntryModelOutcome,
 } from '../../shared/ipc-types'
+import { useLeaveGuard } from '../capabilities/providers'
 import { defineMessages, useT, type T } from '../i18n'
 
 const draftMessages = defineMessages({
@@ -431,6 +432,8 @@ function DraftDetail({ id, created }: { id: string; created?: CreatedNote }): JS
     leaveGuard = dirty ? () => window.confirm(t('confirm.discard')) : null
     return () => { leaveGuard = null }
   }, [dirty, t])
+  // M4 A7: going to another page asks too, once, with the same words.
+  useLeaveGuard(dirty, t('confirm.discard'))
 
   if (draft === undefined) return <Shell />
   if (draft === null) {
