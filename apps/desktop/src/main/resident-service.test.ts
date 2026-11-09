@@ -394,6 +394,44 @@ describe('CrashLoopDetector (M5 B5 ②)', () => {
     expect(t.d.looping()).toBe(false)
   })
 
+  it('the job loaded again (runs back to 1), then one restart: not looping (Codex on B1 R2 C1)', async () => {
+    const t = detector()
+    t.pid(null)
+    for (const [ms, r] of [[0, 8], [10_000, 1], [20_000, 2]] as const) {
+      t.at(ms)
+      t.runs(r)
+      await t.d.sample()
+      expect(t.d.looping()).toBe(false)
+    }
+    t.at(30_000)
+    t.runs(3)
+    await t.d.sample()
+    expect(t.d.looping()).toBe(true)
+  })
+
+  it('an answer from launchd that comes back after enrolment is dropped (Codex on B1 R2 C2)', async () => {
+    let enrolled = false
+    let now = 0
+    let answer: (r: number) => void = () => {}
+    let runs: number | Promise<number> = new Promise<number>((r) => { answer = r })
+    const d = new CrashLoopDetector({
+      now: () => now, installed: () => true, enrolled: () => enrolled, recordPid: () => null, runs: async () => runs,
+    })
+    const slow = d.sample()
+    enrolled = true
+    now = 4_000
+    await d.sample()
+    answer(1)
+    await slow
+    enrolled = false
+    for (const [ms, r] of [[12_000, 2], [22_000, 3]] as const) {
+      now = ms
+      runs = r
+      await d.sample()
+    }
+    expect(d.looping()).toBe(false)
+  })
+
   it('asks launchd at most every 10 s', async () => {
     const t = detector()
     for (const ms of [0, 4_000, 8_000, 12_000]) {

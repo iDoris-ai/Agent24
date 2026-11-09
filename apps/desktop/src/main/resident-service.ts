@@ -272,6 +272,7 @@ export class CrashLoopDetector {
   private pids: { pid: number; at: number }[] = []
   private runs: { runs: number; at: number }[] = []
   private runsAt = -Infinity
+  private era = 0
 
   constructor(private readonly deps: {
     now: () => number
@@ -286,6 +287,7 @@ export class CrashLoopDetector {
     if (!this.deps.installed() || this.deps.enrolled()) {
       this.pids = []
       this.runs = []
+      this.era++
       return
     }
     const pid = this.deps.recordPid()
@@ -293,8 +295,15 @@ export class CrashLoopDetector {
     this.pids = this.pids.filter((p) => now - p.at < LOOP_WINDOW_MS)
     if (now - this.runsAt >= RUNS_CHECK_MS) {
       this.runsAt = now
+      const era = this.era
       const runs = await this.deps.runs()
-      if (runs !== null) this.runs.push({ runs, at: now })
+      // Enrolled meanwhile: what launchd said then is no longer this run (Codex on B1 R2 C2).
+      if (era !== this.era) return
+      if (runs !== null) {
+        // Fewer than before: the job was loaded again, so count from here (Codex on B1 R2 C1).
+        if (runs < (this.runs.at(-1)?.runs ?? runs)) this.runs = []
+        this.runs.push({ runs, at: now })
+      }
     }
     this.runs = this.runs.filter((r) => now - r.at < LOOP_WINDOW_MS)
   }
