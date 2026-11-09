@@ -122,6 +122,126 @@ describe('schedule conversations (M4 A5)', () => {
     })
   })
 
+  describe('a schedule\'s conversation that fills up (#1719)', () => {
+    /** sch_1's conversation with `n` runs: run_0 … run_{n-1}. */
+    async function filled(n: number) {
+      const first = (await homes().record('sch_1', 'run_0'))!.id
+      for (let i = 1; i < n; i++) history.appendRun(first, `run_${i}`, 'schedule')
+      return first
+    }
+
+    it('N7 starts a new one for the next run; the full one keeps its runs, still the schedule\'s for claim, also after a restart', async () => {
+      const full = await filled(1000)
+      const next = await homes().record('sch_1', 'run_1000')
+      expect(next!.id).not.toBe(full)
+      expect(next).toMatchObject({ title: '日程：每日周报', title_source: 'schedule', tasks: [{ run_id: 'run_1000' }] })
+      expect(history.get(full)!.runs).toHaveLength(1000)
+      const m = homes()
+      expect(m.conversationOf('sch_1')).toBe(next!.id)
+      // A run of either is the schedule's: no second card for it elsewhere.
+      expect(await m.claim('sch_1', 'run_5')).toBe(true)
+      expect(await m.claim('sch_1', 'run_1000')).toBe(true)
+      expect(await m.claim('sch_2', 'run_5')).toBe(false)
+      const cards = (id: string) => history.list().flatMap(c => c.tasks).filter(t => t.run_id === id).length
+      expect(cards('run_5')).toBe(1)
+      expect(cards('run_1000')).toBe(1)
+    })
+
+    it('a run already in a full conversation, but not handled, gets no second card in the new one (Codex #1719 C1)', async () => {
+      const m = homes()
+      await m.catchUp(async () => [])
+      const full = await filled(1000)
+      // run_5's card is on file in the full one; `handled` never got it.
+      expect(JSON.parse(fs.readFileSync(path.join(dir, 'schedule-conversations.json'), 'utf8')).handled).not.toContain('run_5')
+      await m.record('sch_1', 'run_1000')
+      await m.catchUp(async () => [{ id: 'run_5', schedule_id: 'sch_1', created_at: '2026-11-09T10:00:00Z' }])
+      expect(history.list().flatMap(c => c.tasks).filter(t => t.run_id === 'run_5')).toHaveLength(1)
+      expect(history.get(full)!.runs.some(r => r.run_id === 'run_5')).toBe(true)
+      expect(JSON.parse(fs.readFileSync(path.join(dir, 'schedule-conversations.json'), 'utf8')).handled).toContain('run_5')
+    })
+
+    it('N7 a catch-up records past a full conversation as a live record does', async () => {
+      const full = await filled(1000)
+      const m = homes()
+      await m.catchUp(async () => [])
+      await m.catchUp(async () => [{ id: 'run_new', schedule_id: 'sch_1', created_at: '2026-11-09T10:00:00Z' }])
+      const home = m.conversationOf('sch_1')
+      expect(home).not.toBe(full)
+      expect(history.get(home)!.runs.map(r => r.run_id)).toEqual(['run_new'])
+    })
+  })
+
+  describe('claim and settle when something fails (#1719)', () => {
+    const file = () => JSON.parse(fs.readFileSync(path.join(dir, 'schedule-conversations.json'), 'utf8'))
+    const runs = (...ids: string[]) => async () => ids.map(id => ({ id, schedule_id: 'sch_1', created_at: '2026-11-09T10:00:00Z' }))
+
+    it('C1 a run claimed and taken as handled at the first catch-up is A5\'s again once the caller could not record it', async () => {
+      const m = homes()
+      const appendRun = vi.spyOn(history, 'appendRun').mockImplementationOnce(() => { throw new Error('disk full') })
+      await expect(m.record('sch_1', 'run_1')).rejects.toThrow('disk full')
+      appendRun.mockRestore()
+      expect(await m.claim('sch_1', 'run_1')).toBe(false)
+      await m.catchUp(runs('run_1'))
+      expect(file().handled).toEqual(['run_1'])
+      await m.settle('run_1', false)
+      expect(file().handled).toEqual([])
+      await m.catchUp(runs('run_1'))
+      expect(history.list().flatMap(c => c.tasks.map(t => t.run_id))).toEqual(['run_1'])
+    })
+
+    it('C1 a run handled before the claim stays handled whatever the caller does', async () => {
+      const m = homes()
+      await m.catchUp(runs('run_1'))
+      expect(await m.claim('sch_1', 'run_1')).toBe(false)
+      await m.settle('run_1', false)
+      await m.catchUp(runs('run_1'))
+      expect(history.list()).toEqual([])
+    })
+
+    it('a run recorded live before the first catch-up, its conversation deleted since, is not brought back when the caller could not record it (Codex #1719 C2)', async () => {
+      const m = homes()
+      const summary = await m.record('sch_1', 'run_1')
+      history.delete(summary!.id)
+      expect(await m.claim('sch_1', 'run_1')).toBe(false)
+      await m.settle('run_1', false)
+      await m.catchUp(runs('run_1'))
+      expect(history.list()).toEqual([])
+    })
+
+    it('the same, with the first catch-up between the claim and the settle (Codex #1719 r2 C2)', async () => {
+      const m = homes()
+      const summary = await m.record('sch_1', 'run_1')
+      history.delete(summary!.id)
+      expect(await m.claim('sch_1', 'run_1')).toBe(false)
+      await m.catchUp(runs('run_1'))
+      await m.settle('run_1', false)
+      await m.catchUp(runs('run_1'))
+      expect(history.list()).toEqual([])
+    })
+
+    it('a run to retry, claimed after a restart and given back before the first catch-up, is recorded by it', async () => {
+      const appendRun = vi.spyOn(history, 'appendRun').mockImplementationOnce(() => { throw new Error('disk full') })
+      await expect(homes().record('sch_1', 'run_1')).rejects.toThrow('disk full')
+      appendRun.mockRestore()
+      // main starts again: `retry` is on file, what was heard is not.
+      const m = homes()
+      expect(await m.claim('sch_1', 'run_1')).toBe(false)
+      await m.settle('run_1', false)
+      await m.catchUp(runs('run_1'))
+      expect(history.list().flatMap(c => c.tasks.map(t => t.run_id))).toEqual(['run_1'])
+    })
+
+    it('C2 a claim that cannot be written reserves nothing: handled is as it was, and the run is recorded as before', async () => {
+      const m = homes()
+      await m.catchUp(runs())
+      const write = vi.spyOn(fs, 'writeFileSync').mockImplementationOnce(() => { throw new Error('disk full') })
+      await expect(m.claim('sch_1', 'run_1')).rejects.toThrow('disk full')
+      write.mockRestore()
+      expect(file().handled).toEqual([])
+      expect((await m.record('sch_1', 'run_1'))!.tasks.map(t => t.run_id)).toEqual(['run_1'])
+    })
+  })
+
   it('gives each schedule its own conversation', async () => {
     const a = await homes().record('sch_1', 'run_1')
     const b = await homes().record('sch_2', 'run_2')
@@ -244,10 +364,10 @@ describe('schedule conversations (M4 A5)', () => {
       const m = createScheduleConversations({ dir, history, scheduleName, title: name => `日程：${name}`, onCatchUpFailure: failures })
       await m.catchUp(async () => [])
       const append = vi.spyOn(history, 'appendRun')
-      append.mockImplementationOnce(() => { throw new Error('Too many chat history runs') })
+      append.mockImplementationOnce(() => { throw new Error('disk full') })
       const rows = [row('run_1', 'sch_1'), row('run_2', 'sch_2')]
       await m.catchUp(async () => rows)
-      expect(failures).toHaveBeenCalledWith('run_1', expect.objectContaining({ message: 'Too many chat history runs' }))
+      expect(failures).toHaveBeenCalledWith('run_1', expect.objectContaining({ message: 'disk full' }))
       expect(file().handled).toEqual(['run_2'])
       append.mockRestore()
       await m.catchUp(async () => rows)

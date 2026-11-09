@@ -34,6 +34,83 @@ pub fn log_dir() -> Option<PathBuf> {
     agent24_protocol::state_file::state_dir().map(|d| d.join("logs"))
 }
 
+/// M5 B1 (#1710): the daemon the LaunchAgent runs, a copy of the one given to
+/// `install` at `<data_dir>/bin/agent24d`. launchd execs the path in the plist
+/// literally, and the daemon runs its modules from its own path
+/// (agent24d `server.rs`, the module trampoline): a path inside the app bundle
+/// breaks when the app is moved, and changes under a running daemon when it
+/// is upgraded. The copy changes only in `install`, between stopping the old
+/// daemon and starting the new one. Under the data dir, as the Hyphae binary
+/// is, so `AGENT24_DATA_DIR` keeps it apart too.
+pub fn daemon_copy_path() -> Option<PathBuf> {
+    agent24_protocol::state_file::state_dir().map(|d| daemon_copy_path_in(&d))
+}
+
+/// Pure form of [`daemon_copy_path`].
+pub fn daemon_copy_path_in(data_dir: &Path) -> PathBuf {
+    data_dir.join("bin").join("agent24d")
+}
+
+/// Puts a copy of `exec` at `dest`, replacing what is there at once: written
+/// to a new file next to it, made executable, then renamed over. Bytes only:
+/// not `std::fs::copy`, which on macOS carries the source's extended
+/// attributes along, a quarantine flag among them. The code signature is in
+/// the bytes and comes along. Nothing is left behind when it fails.
+pub fn copy_daemon(exec: &Path, dest: &Path) -> Result<(), String> {
+    use std::io::Write;
+    let bytes = std::fs::read(exec).map_err(|e| format!("reading {}: {e}", exec.display()))?;
+    let dir = dest
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", dest.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    // What launchd runs is only the owner's to change: not a link to some
+    // other directory, and owner-only (Codex B1 C1).
+    let meta =
+        std::fs::symlink_metadata(dir).map_err(|e| format!("reading {}: {e}", dir.display()))?;
+    if !meta.is_dir() {
+        return Err(format!(
+            "{} is not a directory (a link is refused)",
+            dir.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("securing {}: {e}", dir.display()))?;
+    }
+    let temp = dir.join(format!(".agent24d.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    let written = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o755);
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(&bytes)?;
+        // The mode given at creation is cut by the umask (Codex B1 C5).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+        }
+        file.sync_all()?;
+        std::fs::rename(&temp, dest)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!(
+            "copying {} to {}: {e}",
+            exec.display(),
+            dest.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Escape text destined for an XML text node. Paths can legitimately contain
 /// `&` or `<` (e.g. a folder named "R&D"), which would otherwise produce a plist
 /// launchd silently refuses to load.
@@ -97,7 +174,9 @@ pub fn render_plist(
         <string>serve</string>
         <string>--port</string>
         <string>0</string>
-        <string>--ready-omit-token</string>
+        <string>--auth-mode</string>
+        <string>capabilities</string>
+        <string>--enroll-endpoint</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -236,6 +315,79 @@ fn bootout_if_loaded() {
     let _ = launchctl(&["bootout", &target]);
 }
 
+/// Whether launchd has the job now.
+fn loaded() -> bool {
+    launchctl(&["print", &format!("gui/{}/{LABEL}", uid())]).is_ok_and(|o| o.status.success())
+}
+
+/// How long `install` waits for the daemon it stopped to exit:
+/// launchd's own wait before it kills it, and a little more.
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(EXIT_TIMEOUT + 5);
+
+/// The pid of the process launchd runs for the job: `launchctl print`'s
+/// `pid = N`. None when the job is not loaded, or is loaded with no process
+/// (between the runs of one that keeps exiting).
+pub fn service_pid() -> Option<u32> {
+    let out = launchctl(&["print", &format!("gui/{}/{LABEL}", uid())]).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    job_pid(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The job's own `pid = N`, one tab in; a nested block's is not it.
+fn job_pid(print: &str) -> Option<u32> {
+    print
+        .lines()
+        .find_map(|l| l.strip_prefix("\tpid = ")?.trim().parse().ok())
+}
+
+/// Whether `pid` is a process: `kill(pid, 0)`. EPERM is one that is not ours.
+fn process_alive(pid: u32) -> bool {
+    use rustix::process::{Pid, test_kill_process};
+    i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .is_some_and(|p| !matches!(test_kill_process(p), Err(rustix::io::Errno::SRCH)))
+}
+
+/// Waits for the daemon the service ran, `pid`, to exit, for `budget`; its
+/// file is replaced only after. It waits for that process, not for the data
+/// dir's lock, which a daemon the desktop runs can hold (Codex B1 R2 C2).
+pub fn wait_until_exited(pid: u32, budget: std::time::Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + budget;
+    while process_alive(pid) {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the daemon the service ran (pid {pid}) is still running after {}s; \
+                 the service is unloaded and its copy left as it was — \
+                 run `agent24 service install` again",
+                budget.as_secs()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Ok(())
+}
+
+/// M5 B1: stops the daemon the service runs, as `agent24 daemon stop` does a
+/// legacy one. A SIGTERM to launchd's job, not to a pid: launchd signals only
+/// the process it started, so no other one can be hit. The daemon ends
+/// cleanly on SIGTERM and exits 0, which `KeepAlive{SuccessfulExit:false}`
+/// does not restart. Errs when launchd does not have the job.
+pub fn stop_service_daemon() -> Result<(), String> {
+    let target = format!("gui/{}/{LABEL}", uid());
+    let out = launchctl(&["kill", "SIGTERM", &target])?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "launchctl kill failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
 /// S-04: the logs hold daemon output and a stray secret is one `tracing` line
 /// away, so the directory is owner-only (0700) and each file is created 0600
 /// BEFORE launchd opens it for `StandardOutPath` (launchd would otherwise create
@@ -265,7 +417,7 @@ fn prepare_log_files(dir: &Path, files: &[&Path]) -> Result<(), String> {
 
 /// Everything `install` puts on disk, idempotently: logs dir 0700 and log files
 /// 0600 (tightening ones an older install left loose), then the plist rewritten
-/// from the current template (so an old install gains `--ready-omit-token`) and
+/// from the current template (so an old install gains service mode, M5 B1) and
 /// kept owner-only because the captured env can include `OMLX_API_KEY`.
 fn write_install_files(
     exec: &Path,
@@ -292,16 +444,10 @@ fn write_install_files(
     Ok(())
 }
 
-/// Whether the installed plist already passes `--ready-omit-token`. An install
-/// made before that flag existed keeps printing the bearer into its log until
-/// `agent24 service install` is run again; `service status` uses this to say so.
-/// A missing/unreadable plist is "not stale" (nothing installed to warn about).
-pub fn plist_has_ready_omit_token(plist: &Path) -> bool {
-    std::fs::read_to_string(plist).is_ok_and(|b| b.contains("<string>--ready-omit-token</string>"))
-}
-
-/// Install (or reinstall) the LaunchAgent and start it.
-pub fn install(exec: &Path) -> Result<(PathBuf, Vec<String>), String> {
+/// Install (or reinstall) the LaunchAgent and start it, running a copy of
+/// `exec` ([`daemon_copy_path`]). Returns the plist, the copy, and the names
+/// of the variables captured into it.
+pub fn install(exec: &Path) -> Result<(PathBuf, PathBuf, Vec<String>), String> {
     if !exec.exists() {
         return Err(format!(
             "agent24d not found at {} — build it (cargo build --release -p agent24d) \
@@ -311,14 +457,22 @@ pub fn install(exec: &Path) -> Result<(PathBuf, Vec<String>), String> {
     }
     let plist = plist_path().ok_or("HOME not set")?;
     let logs = log_dir().ok_or("HOME not set")?;
+    let copy = daemon_copy_path().ok_or("HOME not set")?;
     let out_log = logs.join("agent24d.out.log");
     let err_log = logs.join("agent24d.err.log");
     // Reinstall must unload the old job first, or launchd keeps running the
     // previous ProgramArguments and the new plist looks like it did nothing.
+    // It also stops the old daemon, and its file is replaced only once it
+    // has exited.
+    let running = service_pid();
     bootout_if_loaded();
+    if let Some(pid) = running {
+        wait_until_exited(pid, STOP_WAIT)?;
+    }
+    copy_daemon(exec, &copy)?;
 
     let env = capture_env();
-    write_install_files(exec, &plist, &out_log, &err_log, &env)?;
+    write_install_files(&copy, &plist, &out_log, &err_log, &env)?;
 
     let target = format!("gui/{}", uid());
     let out = launchctl(&["bootstrap", &target, &plist.to_string_lossy()])?;
@@ -333,17 +487,21 @@ pub fn install(exec: &Path) -> Result<(PathBuf, Vec<String>), String> {
             }
         ));
     }
-    Ok((plist, env.into_iter().map(|(k, _)| k).collect()))
+    Ok((plist, copy, env.into_iter().map(|(k, _)| k).collect()))
 }
 
 /// Stop and remove the LaunchAgent. Idempotent.
 pub fn uninstall() -> Result<(), String> {
     bootout_if_loaded();
-    let plist = plist_path().ok_or("HOME not set")?;
-    match std::fs::remove_file(&plist) {
+    remove_if_there(&plist_path().ok_or("HOME not set")?)?;
+    remove_if_there(&daemon_copy_path().ok_or("HOME not set")?)
+}
+
+fn remove_if_there(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("removing {}: {e}", plist.display())),
+        Err(e) => Err(format!("removing {}: {e}", path.display())),
     }
 }
 
@@ -351,10 +509,7 @@ pub fn uninstall() -> Result<(), String> {
 pub fn status() -> (bool, Option<PathBuf>, bool) {
     let plist = plist_path();
     let installed = plist.as_ref().is_some_and(|p| p.exists());
-    let loaded = launchctl(&["print", &format!("gui/{}/{LABEL}", uid())])
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    (installed, plist, loaded)
+    (installed, plist, loaded())
 }
 
 #[cfg(test)]
@@ -397,9 +552,170 @@ mod tests {
     }
 
     #[test]
-    fn plist_tells_the_daemon_not_to_print_its_token_into_the_log() {
-        let p = render_plist(Path::new("/a"), Path::new("/o"), Path::new("/e"), &[]);
-        assert!(p.contains("<string>--ready-omit-token</string>"));
+    fn plist_runs_the_daemon_in_service_mode_and_nothing_else() {
+        // M5 B1 (#1710): a capability daemon with its enrolment endpoint, no
+        // token anywhere (daemon.json, the ready line, the log), no legacy flag.
+        let p = render_plist(
+            Path::new("/a/agent24d"),
+            Path::new("/o"),
+            Path::new("/e"),
+            &[],
+        );
+        let args = p
+            .split("<key>ProgramArguments</key>")
+            .nth(1)
+            .and_then(|rest| rest.split("</array>").next())
+            .unwrap();
+        let args: Vec<&str> = args
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("<string>")?.strip_suffix("</string>"))
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "/a/agent24d",
+                "serve",
+                "--port",
+                "0",
+                "--auth-mode",
+                "capabilities",
+                "--enroll-endpoint"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_copy_lives_in_the_data_dir() {
+        assert_eq!(
+            daemon_copy_path_in(Path::new("/d")),
+            Path::new("/d/bin/agent24d")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copies_the_daemon_executable_and_replaces_an_old_copy_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("a24-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let exec = root.join("agent24d");
+        std::fs::write(&exec, b"new daemon").unwrap();
+        let dest = root.join("data/bin/agent24d");
+
+        copy_daemon(&exec, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new daemon");
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        // An old copy, and a temp file left by an install that died: replaced,
+        // and nothing else stays in the directory.
+        std::fs::write(&dest, b"old daemon, longer than the new one").unwrap();
+        std::fs::write(
+            dest.with_file_name(format!(".agent24d.{}.tmp", std::process::id())),
+            b"x",
+        )
+        .unwrap();
+        copy_daemon(&exec, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new daemon");
+        let left: Vec<_> = std::fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["agent24d"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_copys_directory_is_the_owners_alone_and_not_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("a24-copy-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        let exec = root.join("agent24d");
+        std::fs::write(&exec, b"daemon").unwrap();
+        copy_daemon(&exec, &root.join("data/bin/agent24d")).unwrap();
+        assert_eq!(
+            std::fs::metadata(root.join("data/bin"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("linked")).unwrap();
+        let err = copy_daemon(&exec, &root.join("linked/agent24d")).unwrap_err();
+        assert!(err.contains("a link is refused"), "{err}");
+        assert!(!root.join("elsewhere/agent24d").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_jobs_pid_is_its_own_line_not_a_nested_one() {
+        let print = "gui/501/ai.auraai.agent24 = {\n\tactive count = 1\n\tstate = running\n\
+                     \tendpoints = {\n\t\tpid = 9\n\t}\n\tpid = 4242\n}\n";
+        assert_eq!(job_pid(print), Some(4242));
+        let between_runs = "gui/501/ai.auraai.agent24 = {\n\tstate = not running\n\
+                            \tendpoints = {\n\t\tpid = 9\n\t}\n}\n";
+        assert_eq!(job_pid(between_runs), None);
+    }
+
+    #[test]
+    fn waits_for_the_services_daemon_to_exit_and_says_when_it_does_not() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("0.6")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let err = wait_until_exited(pid, std::time::Duration::from_millis(200)).unwrap_err();
+        assert!(
+            err.contains("still running") && err.contains("unloaded"),
+            "{err}"
+        );
+        // Reaped once it exits, or it lingers as a zombie kill(0) still finds.
+        let reaper = std::thread::spawn(move || child.wait().unwrap());
+        wait_until_exited(pid, std::time::Duration::from_secs(5)).unwrap();
+        reaper.join().unwrap();
+    }
+
+    #[test]
+    fn a_daemon_that_is_not_there_is_not_copied_and_leaves_nothing() {
+        let root = std::env::temp_dir().join(format!("a24-copy-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dest = root.join("bin/agent24d");
+        assert!(copy_daemon(&root.join("nowhere"), &dest).is_err());
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_copy_does_not_carry_the_sources_extended_attributes() {
+        // A quarantine flag on the app's daemon must not follow it to the copy
+        // launchd runs (std::fs::copy would carry it along).
+        let root = std::env::temp_dir().join(format!("a24-copy-xattr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let exec = root.join("agent24d");
+        std::fs::write(&exec, b"daemon").unwrap();
+        let set = std::process::Command::new("xattr")
+            .args(["-w", "com.apple.quarantine", "0081;00000000;Test;"])
+            .arg(&exec)
+            .status()
+            .unwrap();
+        assert!(set.success(), "control: the source carries the attribute");
+        let dest = root.join("bin/agent24d");
+        copy_daemon(&exec, &dest).unwrap();
+        let listed = std::process::Command::new("xattr")
+            .arg(&dest)
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&listed.stdout).contains("com.apple.quarantine"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]
@@ -425,7 +741,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn reinstall_over_an_old_plist_adds_the_flag_and_tightens_the_logs() {
+    fn reinstall_over_an_old_plist_moves_it_to_service_mode_and_tightens_the_logs() {
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("a24-reinstall-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -434,23 +750,35 @@ mod tests {
         std::fs::create_dir_all(&logs).unwrap();
         std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
         let (out, err) = (logs.join("o.log"), logs.join("e.log"));
-        // An install from before this change: no flag, loose permissions.
-        let old = render_plist(Path::new("/old/agent24d"), &out, &err, &[])
-            .replace("        <string>--ready-omit-token</string>\n", "");
+        // An install from before service mode: legacy flags, loose permissions.
+        let old = render_plist(Path::new("/old/agent24d"), &out, &err, &[]).replace(
+            "        <string>--auth-mode</string>\n        <string>capabilities</string>\n        <string>--enroll-endpoint</string>\n",
+            "        <string>--ready-omit-token</string>\n",
+        );
         std::fs::write(&plist, &old).unwrap();
         std::fs::set_permissions(&plist, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::write(&out, "x").unwrap();
         std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let service_mode = |p: &Path| {
+            std::fs::read_to_string(p)
+                .unwrap()
+                .contains("<string>--enroll-endpoint</string>")
+        };
         assert!(
-            !plist_has_ready_omit_token(&plist),
-            "control: old plist lacks the flag"
+            !service_mode(&plist),
+            "control: the old plist is not in service mode"
         );
 
         write_install_files(Path::new("/new/agent24d"), &plist, &out, &err, &[]).unwrap();
 
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert!(plist_has_ready_omit_token(&plist));
+        assert!(service_mode(&plist));
+        assert!(
+            !std::fs::read_to_string(&plist)
+                .unwrap()
+                .contains("--ready-omit-token")
+        );
         assert!(
             std::fs::read_to_string(&plist)
                 .unwrap()
@@ -461,13 +789,6 @@ mod tests {
         assert_eq!(mode(&out), 0o600);
         assert_eq!(mode(&err), 0o600);
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_missing_plist_is_not_reported_as_stale() {
-        assert!(!plist_has_ready_omit_token(Path::new(
-            "/nonexistent/x.plist"
-        )));
     }
 
     #[test]
