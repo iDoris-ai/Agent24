@@ -607,6 +607,20 @@ describe('runs and waiting items (M4 A2)', () => {
     expect(() => store.promoteRun('chat_a', 'run_new')).toThrow('Too many chat history runs')
   })
 
+  it('makes room for a task past the cap by dropping the oldest answer; refuses an answer (PR-Daemon #1696 L1)', () => {
+    const store = createChatHistoryStore(dir)
+    store.save(record('chat_a', at))
+    const runs = Array.from({ length: 1000 }, (_, i) => ({ run_id: `run_${i}`, kind: i === 0 ? 'task' : 'answer', started_at: at }))
+    fs.writeFileSync(path.join(dir, 'chat-history', 'chat_a.json'), JSON.stringify({ ...onDisk('chat_a'), runs }))
+    expect(() => store.appendRun('chat_a', 'run_new_answer', 'answer')).toThrow('Too many chat history runs')
+    store.promoteRun('chat_a', 'run_new')
+    const after = onDisk('chat_a').runs.map((r: { run_id: string }) => r.run_id)
+    expect(after).toHaveLength(1000)
+    expect(after[0]).toBe('run_0')
+    expect(after).not.toContain('run_1')
+    expect(after[999]).toBe('run_new')
+  })
+
   it('refuses a waiting item past the cap, and a bad id to clear', () => {
     const store = createChatHistoryStore(dir)
     store.save(record('chat_a', at))

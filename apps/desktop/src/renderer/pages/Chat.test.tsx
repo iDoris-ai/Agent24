@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import ChatPage from './Chat'
 import { setLocale } from '../i18n'
 import { chatMessages } from './Chat.i18n'
+import { chatHistorySummary } from '../../shared/chat-history'
 
 const mockBackendProxy = vi.fn()
 
@@ -463,6 +464,92 @@ describe('ChatPage promoting a Knowledge run to a task', () => {
     const { promoteRun } = page(['running', 'completed'])
     await waitFor(() => expect(screen.getByText('done')).toBeInTheDocument(), { timeout: 4000 })
     expect(promoteRun).not.toHaveBeenCalled()
+  })
+})
+
+// M4 A4: a Knowledge turn whose run is still going on after the wait is
+// left to go on as the conversation's task, with a card; the next turn starts
+// a new session (Knowledge's review of A4).
+describe('ChatPage with Knowledge when the run outlasts the wait', () => {
+  beforeEach(() => { setLocale('zh') })
+
+  const page = (recorded: boolean) => {
+    // main's summary is left to the page (null), as for a save main did not list
+    let saved: Parameters<typeof chatHistorySummary>[0] | null = null
+    const save = vi.fn(async (record: Parameters<typeof chatHistorySummary>[0]) => { saved = record; return null })
+    const promoteRun = vi.fn(async (_id: string, runId: string) =>
+      (recorded && saved ? chatHistorySummary({ ...saved, runs: [{ run_id: runId, kind: 'task', started_at: saved.created_at }] }) : null))
+    Object.defineProperty(window, 'agent24', {
+      value: {
+        backendProxy: mockBackendProxy,
+        knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true }) },
+        chatHistory: { list: vi.fn().mockResolvedValue([]), save, promoteRun },
+      },
+      writable: true,
+      configurable: true,
+    })
+    const realNow = Date.now.bind(Date)
+    const clock = { skew: 0 }
+    vi.spyOn(Date, 'now').mockImplementation(() => realNow() + clock.skew)
+    let sessions = 0
+    const runs: { session_id: string }[] = []
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { session_id: string } }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: `s${++sessions}` } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') { runs.push(req.body!); return { ok: true, status: 201, data: { id: `r${runs.length}` } } }
+      if (req.path === '/api/v1/runs/r1/cancel') return { ok: true, status: 200, data: {} }
+      if (req.path === '/api/v1/runs/r1') {
+        // The first answer comes, then the wait is over.
+        clock.skew = 11 * 60_000
+        return { ok: true, status: 200, data: { status: 'running', output: null, knowledge: null } }
+      }
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: 'second answer' }, knowledge: null } }
+    })
+    render(<ChatPage />)
+    const send = (text: string) => {
+      const textarea = screen.getByPlaceholderText(/输入消息/)
+      fireEvent.change(textarea, { target: { value: text } })
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    }
+    return { save, promoteRun, runs, clock, send }
+  }
+  afterEach(() => { vi.restoreAllMocks() })
+
+  it('leaves the run going on as a task, says so, and asks the next turn in a new session', async () => {
+    const { save, promoteRun, runs, clock, send } = page(true)
+    send('long job')
+    await waitFor(() => expect(screen.getByText(chatMessages.zh['task.ongoing'])).toBeInTheDocument(), { timeout: 4000 })
+    const conversation = save.mock.calls[0][0].id
+    expect(promoteRun).toHaveBeenCalledWith(conversation, 'r1')
+    expect(mockBackendProxy).not.toHaveBeenCalledWith(expect.objectContaining({ path: '/api/v1/runs/r1/cancel' }))
+    clock.skew = 0
+    send('next')
+    await waitFor(() => expect(screen.getByText('second answer')).toBeInTheDocument(), { timeout: 4000 })
+    expect(runs.map(r => r.session_id)).toEqual(['s1', 's2'])
+    // Each prompt sent can be handed to the assistant as a task of its own.
+    expect(screen.getAllByRole('button', { name: chatMessages.zh['task.handOver'] })).toHaveLength(2)
+  })
+
+  it('stops a run it could not record as a task, rather than leave it running without a card (Codex A4 C1)', async () => {
+    const { promoteRun, send } = page(false)
+    send('long job')
+    await waitFor(() => expect(mockBackendProxy).toHaveBeenCalledWith({ method: 'POST', path: '/api/v1/runs/r1/cancel' }), { timeout: 4000 })
+    expect(promoteRun).toHaveBeenCalled()
+    expect(screen.queryByText(chatMessages.zh['task.ongoing'])).not.toBeInTheDocument()
+    expect(screen.getByText(/run_timeout/)).toBeInTheDocument()
+  })
+
+  it('does not record the run it stopped once main can write again (Codex A4 r2 C1)', async () => {
+    const { promoteRun, clock, send } = page(true)
+    // main cannot write this once: the page tries again after its next save.
+    promoteRun.mockRejectedValueOnce(new Error('disk full'))
+    send('long job')
+    await waitFor(() => expect(screen.getByText(/run_timeout/)).toBeInTheDocument(), { timeout: 4000 })
+    expect(mockBackendProxy).toHaveBeenCalledWith({ method: 'POST', path: '/api/v1/runs/r1/cancel' })
+    // Later saves (the next turn's) promote nothing.
+    clock.skew = 0
+    send('next')
+    await waitFor(() => expect(screen.getByText('second answer')).toBeInTheDocument(), { timeout: 4000 })
+    expect(promoteRun).toHaveBeenCalledTimes(1)
   })
 })
 

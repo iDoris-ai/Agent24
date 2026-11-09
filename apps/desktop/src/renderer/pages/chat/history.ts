@@ -216,6 +216,14 @@ export async function promoteRun(id: string, runId: string): Promise<boolean> {
  *  of it was still on its way. */
 const promoteAfterSave = new Map<string, string[]>()
 
+/** M4 A4: a run whose promotion failed and that was stopped for it is not
+ *  promoted by a later save either (Codex A4 r2 C1). */
+export function forgetPromotion(id: string, runId: string): void {
+  const waiting = (promoteAfterSave.get(id) ?? []).filter(r => r !== runId)
+  if (waiting.length > 0) promoteAfterSave.set(id, waiting)
+  else promoteAfterSave.delete(id)
+}
+
 async function organize(id: string, patch: ChatHistoryOrganize): Promise<boolean> {
   const history = api()
   if (!history) return false

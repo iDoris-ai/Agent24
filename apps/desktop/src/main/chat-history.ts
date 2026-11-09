@@ -344,8 +344,16 @@ export function createChatHistoryStore(dir: string) {
         if (known.kind !== 'answer' || kind === 'answer') return null
         return { ...record, runs: record.runs.map(r => (r.run_id === runId ? { ...r, kind } : r)) }
       }
-      if (record.runs.length >= MAX_RUNS) throw new Error('Too many chat history runs')
-      return { ...record, runs: [...record.runs, { run_id: runId, kind, started_at: new Date().toISOString() }] }
+      let runs = record.runs
+      if (runs.length >= MAX_RUNS) {
+        // Full: the oldest answer makes room (answers are never shown,
+        // tasks are; PR-Daemon #1696 L1). Only tasks and schedules' runs
+        // left, or an answer to add: refused.
+        const oldest = runs.findIndex(r => r.kind === 'answer')
+        if (oldest < 0 || kind === 'answer') throw new Error('Too many chat history runs')
+        runs = runs.filter((_, i) => i !== oldest)
+      }
+      return { ...record, runs: [...runs, { run_id: runId, kind, started_at: new Date().toISOString() }] }
     })
   }
   return {
