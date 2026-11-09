@@ -80,6 +80,21 @@
         "details": { "type": "object", "additionalProperties": false, "properties": { "already": { "const": true } } }
       }
     },
+    "get_request": {
+      "description": "candidate.propose reading the author's own candidate (W2.1, W8.3); same shape as withdraw_request.",
+      "type": "object", "additionalProperties": false, "required": ["request_id", "generation", "candidate_id"],
+      "properties": { "request_id": { "$ref": "#/$defs/request_id" }, "generation": { "$ref": "#/$defs/generation" }, "candidate_id": { "$ref": "#/$defs/id" } }
+    },
+    "get_response": {
+      "description": "The author's own candidate (W8.3); a candidate the caller cannot see is not_found (W1.9 ③(b)).",
+      "type": "object", "additionalProperties": false, "required": ["request_id", "generation", "authz_version", "candidate"],
+      "properties": {
+        "request_id": { "$ref": "#/$defs/request_id" },
+        "generation": { "$ref": "#/$defs/generation" },
+        "authz_version": { "$ref": "#/$defs/authz_version" },
+        "candidate": { "$ref": "#/$defs/view" }
+      }
+    },
     "return_request": {
       "description": "Sent by the embedded page's UI session (W1.6): request_id, no generation.",
       "type": "object", "additionalProperties": false, "required": ["request_id", "candidate_id"],
