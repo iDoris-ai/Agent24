@@ -172,13 +172,15 @@ export class ServiceUpgrader {
   constructor(private readonly deps: {
     bundled: () => string | null
     running: () => string | null
+    /** The LaunchAgent's plist is there: kickstart restarts that job only (Codex B5a C2). */
+    installed: () => boolean
     pid: () => number | null
     run: (pid: number) => Promise<UpgradeOutcome>
   }) {}
 
   tick(): void {
     const pid = this.deps.pid()
-    if (this.tried || pid === null || !upgradeNeeded(this.deps.bundled(), this.deps.running())) return
+    if (this.tried || pid === null || !this.deps.installed() || !upgradeNeeded(this.deps.bundled(), this.deps.running())) return
     this.tried = true
     void this.deps.run(pid).then(
       (o) => { if (!o.ok && o.stage !== 'shutdown') this.failed = o.code },
