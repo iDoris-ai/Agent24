@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
-  copyDaemonIfChanged, jobPid, parseDaemonVersion, ServiceUpgrader, serviceDaemonCopyPath, serviceUpgradeDeps, upgradeNeeded, upgradeService,
+  copyDaemonIfChanged, CrashLoopDetector, jobPid, lastExitCode, LOOP_DOWN_MS, LOOP_WINDOW_MS, parseDaemonVersion, ServiceUpgrader, serviceDaemonCopyPath, serviceRecordPid, serviceUpgradeDeps, upgradeNeeded, upgradeService,
   type UpgradeDeps, type UpgradeOutcome, type UpgradeSystem,
 } from './resident-service'
 import { buildTrayView } from './tray-menu'
@@ -280,5 +280,105 @@ describe('tray text (three languages)', () => {
     expect(buildTrayView(tray).tooltip).not.toContain(restart)
     expect(failed).toContain('not_started')
     expect(failed).toContain('`agent24 service install`')
+  })
+})
+
+describe('CrashLoopDetector (M5 B5 ②)', () => {
+  function detector(o: { installed?: boolean; enrolled?: boolean; exit?: number | null } = {}) {
+    let now = 0
+    let pid: number | null = 100
+    const lastExit = vi.fn(async () => (o.exit === undefined ? 1 : o.exit))
+    const d = new CrashLoopDetector({
+      now: () => now, installed: () => o.installed ?? true, enrolled: () => o.enrolled ?? false, recordPid: () => pid, lastExit,
+    })
+    return { d, lastExit, at: (ms: number) => { now = ms }, pid: (p: number | null) => { pid = p } }
+  }
+
+  it('three daemons on record within a minute: looping', async () => {
+    const t = detector({ exit: null })
+    for (const [ms, p] of [[0, 100], [12_000, 101], [24_000, 102]] as const) {
+      t.at(ms)
+      t.pid(p)
+      await t.d.sample()
+    }
+    expect(t.d.looping()).toBe(true)
+  })
+
+  it('the same three spread over more than a minute: not looping', async () => {
+    const t = detector({ exit: null })
+    for (const [ms, p] of [[0, 100], [40_000, 101], [LOOP_WINDOW_MS + 1_000, 102]] as const) {
+      t.at(ms)
+      t.pid(p)
+      await t.d.sample()
+    }
+    expect(t.d.looping()).toBe(false)
+  })
+
+  it('no enrolment for 30 s and the job last exited not 0: looping; exited 0 or never: not', async () => {
+    for (const [exit, want] of [[78, true], [0, false], [null, false]] as const) {
+      const t = detector({ exit })
+      await t.d.sample()
+      t.at(LOOP_DOWN_MS - 1)
+      await t.d.sample()
+      expect(t.d.looping()).toBe(false)
+      t.at(LOOP_DOWN_MS)
+      await t.d.sample()
+      expect(t.d.looping()).toBe(want)
+    }
+  })
+
+  it('asks launchd at most every 10 s', async () => {
+    const t = detector()
+    for (const ms of [0, 4_000, 8_000, 12_000]) {
+      t.at(ms)
+      await t.d.sample()
+    }
+    expect(t.lastExit).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([
+    ['enrolled with the service daemon', { enrolled: true }],
+    ['no LaunchAgent', { installed: false }],
+  ] as const)('%s: never looping, and what was seen is forgotten', async (_name, o) => {
+    const t = detector(o)
+    for (const [ms, p] of [[0, 100], [5_000, 101], [10_000, 102], [LOOP_DOWN_MS, 103]] as const) {
+      t.at(ms)
+      t.pid(p)
+      await t.d.sample()
+    }
+    expect(t.d.looping()).toBe(false)
+    expect(t.lastExit).not.toHaveBeenCalled()
+  })
+
+  it("only the service's daemon on record counts, never one this app spawned, now or before (Codex B5b C1)", () => {
+    const ours = new Set([8, 9])
+    const spawned = (pid: number) => ours.has(pid)
+    const socket = '/data/enroll.sock'
+    expect(serviceRecordPid({ pid: 7, enrollEndpoint: socket }, spawned)).toBe(7)
+    expect(serviceRecordPid({ pid: 8, enrollEndpoint: socket }, spawned)).toBeNull()
+    expect(serviceRecordPid({ pid: 9, enrollEndpoint: socket }, spawned)).toBeNull()
+    // A legacy daemon (`agent24 daemon start`) names no enrolment socket (Codex B5b R3).
+    expect(serviceRecordPid({ pid: 10 }, spawned)).toBeNull()
+    expect(serviceRecordPid(null, spawned)).toBeNull()
+  })
+
+  it("reads the job's own last exit code, not a nested one", () => {
+    expect(lastExitCode('x = {\n\tstate = not running\n\tlast exit code = 78: EX_CONFIG\n}')).toBe(78)
+    expect(lastExitCode('x = {\n\tlast exit code = (never exited)\n\tsub = {\n\t\tlast exit code = 1\n\t}\n}')).toBeNull()
+    // Ended by a signal: no exit code, still not a clean exit (Codex B5b C2).
+    expect(lastExitCode('x = {\n\tlast exit code = (never exited)\n\tlast terminating signal = Segmentation fault: 11\n}')).toBe(-1)
+  })
+
+  it.each([
+    ['en', 'keeps restarting'],
+    ['zh', '后台服务反复重启，可能是迁移失败'],
+    ['th', 'รีสตาร์ตซ้ำ'],
+  ] as const)('%s: the tray says so and gives the way back', (lang, says) => {
+    setMainLocale(lang)
+    const tray = { status: 'running', external: false, externalPid: null, foreignPid: null, backendKind: 'rust' } as const
+    const tip = buildTrayView({ ...tray, crashLoop: true }).tooltip
+    expect(tip).toContain(says)
+    expect(tip).toContain('`agent24 service uninstall`')
+    expect(buildTrayView(tray).tooltip).not.toContain(says)
   })
 })
