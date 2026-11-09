@@ -30,6 +30,10 @@ const REJECTED_SILENT_LIMIT = 3
 // T1-0: how long a takeover waits for the CLI daemon to exit after `/shutdown`.
 const TAKEOVER_WAIT_MS = 10_000
 const TAKEOVER_POLL_MS = 200
+// M5 B3a: after a failed enrolment, how long until the next try: doubling
+// from one tick up to five minutes (PR-Daemon #1726).
+const ENROL_RETRY_MIN_MS = HEALTH_INTERVAL_MS
+const ENROL_RETRY_MAX_MS = 5 * 60_000
 
 
 export type BackendKind = 'node' | 'rust'
@@ -567,6 +571,11 @@ export class BackendManager {
   // must not spawn over it (Codex B2 C1, r2 C2).
   private enrolling = false
   private attaching = false
+  // M5 B3a: the next enrolment try after a failed one, and the record it
+  // failed against: a new daemon (pid or generation) is tried at once.
+  private enrolRetryAt = 0
+  private enrolRetryMs = 0
+  private refusedBy: { pid: number; generation: string | undefined } | null = null
   // Reentrancy guard for tick(): setInterval doesn't wait for a previous
   // callback to resolve before scheduling the next one, and the failure-
   // threshold branch below now awaits a second health probe (tryReuseExternal)
@@ -737,6 +746,9 @@ export class BackendManager {
       return 'superseded'
     }
     this.blockedReason = null
+    // Enrolled: an earlier failure's backoff does not carry over (Codex B3a C1).
+    this.enrolRetryMs = 0
+    this.refusedBy = null
     this.enrolment = session
     this.isExternal = true
     this.externalPid = state.pid
@@ -770,6 +782,10 @@ export class BackendManager {
   private refuseEnrolment(state: ExternalDaemonState, code: string): 'incompatible' {
     const already = this.blockedReason?.kind === 'enrol_refused'
       && this.blockedReason.pid === state.pid && this.blockedReason.code === code
+    const sameDaemon = this.refusedBy?.pid === state.pid && this.refusedBy.generation === state.generation
+    this.enrolRetryMs = sameDaemon ? Math.min(this.enrolRetryMs * 2, ENROL_RETRY_MAX_MS) : ENROL_RETRY_MIN_MS
+    this.enrolRetryAt = Date.now() + this.enrolRetryMs
+    this.refusedBy = { pid: state.pid, generation: state.generation }
     this.blockedReason = { kind: 'enrol_refused', code, pid: state.pid }
     this.isExternal = false
     this.externalPid = null
@@ -784,10 +800,32 @@ export class BackendManager {
   /** True while the service daemon is being enrolled with, or is to be:
    * then a tray start/restart only lifts a user stop (M5 B2). */
   private serviceAttach(): boolean {
-    if (!this.enrolling && !this.attaching && !this.reprobe) return false
+    if (!this.enrolling && !this.attaching && !this.reprobe) {
+      // Not attaching yet, but no child of ours and the service daemon is on
+      // record and alive: attach to it at the next tick, never spawn over it
+      // (a steady disconnect → start, or a stop that superseded a re-enrolment;
+      // PR-Daemon #1726).
+      if (this.child || this.blockedReason !== null || !this.serviceDaemonOnRecord()) return false
+      this.reprobe = true
+    }
     this.userStopped = false
     this.failureCount = 0
     return true
+  }
+
+  /** daemon.json names a live capability-mode daemon with an enrolment socket. */
+  private serviceDaemonOnRecord(): boolean {
+    const state = this.external.read()
+    return state !== null && state.rejected === undefined && state.authMode !== 'legacy'
+      && state.enrollEndpoint !== undefined && this.external.isAlive(state.pid)
+  }
+
+  /** While a failed enrolment waits out its backoff, against the same live daemon. */
+  private enrolRetryPending(): boolean {
+    if (this.blockedReason?.kind !== 'enrol_refused' || Date.now() >= this.enrolRetryAt) return false
+    const state = this.external.read()
+    return state !== null && this.external.isAlive(state.pid)
+      && state.pid === this.refusedBy?.pid && state.generation === this.refusedBy.generation
   }
 
   /** Close the token connection, if any. */
@@ -1086,6 +1124,8 @@ export class BackendManager {
       // upgrade (or the peer exiting) recovers without reopening the app.
       if (this.blockedReason !== null) {
         this.lastHealthy = false
+        // A refused enrolment is tried again on a backoff, at once for a new daemon.
+        if (this.enrolRetryPending()) return
         const outcome = await this.tryReuseExternal()
         if (outcome === 'absent') {
           this.failureCount = 0
