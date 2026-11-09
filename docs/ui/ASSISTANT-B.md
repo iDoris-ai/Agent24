@@ -46,7 +46,18 @@
 - 自己的 child（宿主令牌）和 legacy 守护进程没有登记连接，只发一次普通请求，行为和以前一样。
 - `ipc/index.ts` 里经 `proxyToBackend` 的请求（通用代理和各个专用 IPC）都走这条路。main.ts 里直接调用 `proxyRequest` 的几处只读请求（runs、schedules、chat）不涉及 Elevated 路由，没有改。
 
-## 4. 已知局限
+## 4. 服务模式下的审批确认两次（PM 11-09：先保持）
+
+`POST /api/v1/approvals/{id}` 是 Elevated 路由。所以在服务模式下，批一次审批要确认两次：
+
+1. 审批 IPC（ApprovalDecide）自己的原生确认框。框里显示的是 main 从守护进程读出的审批记录：决定、种类、摘要、run、工具参数。
+2. 用户确认后发出 POST，守护进程回 `403 presence_required`，main 提权，守护进程再弹一次 presence 框。
+
+自己的 child（宿主令牌）不受影响：守护进程不要求 presence，只有第 1 个框。
+
+开关只有一处：`elevated-request.ts` 的 `SKIP_APPROVAL_CONFIRM_IN_SERVICE_MODE`，默认 `false`。改成 `true` 后，服务模式下不再弹第 1 个框，只留 presence 框；自己的 child 照旧。切换条件：在真守护进程上看到 K-B3b 的 ApprovalDecision 摘要，确认它覆盖了第 1 个框现有的信息（决定范围、run、工具）。
+
+## 5. 已知局限
 
 - 真守护进程上的端到端验证（点确认弹原生框、确认后审批生效），要等 K-B3（含三类操作的摘要）进 main 后再做。在那之前只在假 socket 上测过。
 - `summary` 只是兜底文案（`Agent24: <方法> <路径>`）。守护进程认识的操作（K-B3 的 ApprovalDecision、ScheduleManage、Shutdown，以及 Knowledge 的 bindings）由它自己写摘要。

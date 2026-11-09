@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import type { BackendProxyRequest, BackendProxyResponse } from '../shared/ipc-types'
 import type { ProxyEndpoint } from './backend-proxy'
 import { EnrolError, type ElevateRequest } from './daemon-enroll'
-import { elevationSummary, presenceRequired, sendElevating } from './elevated-request'
+import { approvalConfirmShown, elevationSummary, presenceRequired, SKIP_APPROVAL_CONFIRM_IN_SERVICE_MODE, sendElevating } from './elevated-request'
 
 // M5 B3: the two-step send, against a scripted daemon.
 
@@ -94,6 +94,18 @@ describe('sendElevating (M5 B3)', () => {
   it('the grant is never in the answer the caller sees', async () => {
     const { deps } = setup([PRESENCE_REQUIRED, { ok: false, status: 403, data: { error: { code: 'elevation_invalid', message: 'Elevation grant is invalid' } } }])
     expect(JSON.stringify(await sendElevating(schedule, {}, deps))).not.toContain(GRANT)
+  })
+})
+
+describe('approvalConfirmShown (PM 11-09: one switch, off by default)', () => {
+  it('is off: every approval keeps its own box, also in service mode', () => {
+    expect(SKIP_APPROVAL_CONFIRM_IN_SERVICE_MODE).toBe(false)
+    expect(approvalConfirmShown(true)).toBe(true)
+    expect(approvalConfirmShown(false)).toBe(true)
+  })
+  it('switched on, only service mode drops it; our own child keeps it', () => {
+    expect(approvalConfirmShown(true, true)).toBe(false)
+    expect(approvalConfirmShown(false, true)).toBe(true)
   })
 })
 

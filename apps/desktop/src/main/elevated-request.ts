@@ -17,6 +17,20 @@ import type { BackendProxyRequest, BackendProxyResponse } from '../shared/ipc-ty
 import { proxyError, proxyRequest, type ProxyEndpoint, type ProxyOptions } from './backend-proxy'
 import { ELEVATION_HEADER, EnrolError, type EnrolSession } from './daemon-enroll'
 
+/** The one switch for approvals in service mode (PM 11-09). Today an
+ * approval there is confirmed twice: ApprovalDecide's own box (the daemon's
+ * record of it), then the daemon's presence box, as `POST /approvals/{id}` is
+ * Elevated. Set true once K-B3b's ApprovalDecision summary, seen on a real
+ * daemon, covers what the own box shows (decision, run, tool): then only the
+ * presence box is left. Our own child is never affected (no presence asked). */
+export const SKIP_APPROVAL_CONFIRM_IN_SERVICE_MODE = false
+
+/** Does ApprovalDecide show its own box? Always with our own child; in
+ * service mode (an enrolment to elevate on) unless the switch is on. */
+export function approvalConfirmShown(serviceMode: boolean, skip: boolean = SKIP_APPROVAL_CONFIRM_IN_SERVICE_MODE): boolean {
+  return !(serviceMode && skip)
+}
+
 export interface ElevatingDeps {
   connection: () => ProxyEndpoint | null
   /** The enrolment's elevate, or null when there is none (backend-manager `daemonElevation`). */

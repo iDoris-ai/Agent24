@@ -376,6 +376,14 @@ describe('A1 backendProxy allowlist', () => {
       expect(seen[0]?.url).toBe('/api/v1/approvals/ap_1')
       expect(JSON.parse(seen[0]!.body)).toEqual({ type: 'approve' })
     })
+    it('service mode, switch off (the default): its own box still asks first, then the daemon asks for presence (M5 B3)', async () => {
+      elevation.current = async (_r, use) => use('grant-1')
+      showMessageBox.mockResolvedValue({ response: 1 })
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })
+      expect(showMessageBox).toHaveBeenCalledTimes(1)
+      expect(res.data.error.code).toBe('cancelled')
+      expect(seen).toHaveLength(0)
+    })
     it('sends nothing when the user cancels', async () => {
       showMessageBox.mockResolvedValue({ response: 1 })
       const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })

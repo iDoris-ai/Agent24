@@ -12,7 +12,7 @@ import { createNavPrefsStore } from '../nav-prefs'
 import { createChatHistoryStore } from '../chat-history'
 import { daemonCliEndpoint, daemonConnection, daemonElevation, getBackendEndpoint } from '../backend-manager'
 import { findAllowedRoute, proxyError, timeoutFor, withKnowledgeBinding } from '../backend-proxy'
-import { sendElevating } from '../elevated-request'
+import { approvalConfirmShown, sendElevating } from '../elevated-request'
 import type { KnowledgeController } from '../knowledge-settings'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
 import { backupFileStem, isSafeBackupPassword, isSafeMessage, isSafeName, isValidNpub, normalizeRelayUrl, parseRelayList } from '../comm-validate'
@@ -1149,8 +1149,11 @@ export function registerIpcHandlers(options: {
         typeof d.reason === 'string' && d.reason ? mt('approval.note', { value: clip(d.reason, 200) }) : '',
         mt('approval.warning'),
       ].filter(Boolean).join('\n')
-      const ok = await confirmNative(event, mt('approval.message', { id, decision: decisionLabels[d.type as string] ?? d.type }), detail)
-      if (!ok) return cancelled()
+      // In service mode the daemon's presence box asks again (M5 B3); the switch is in elevated-request.ts.
+      if (approvalConfirmShown(daemonElevation() !== null)) {
+        const ok = await confirmNative(event, mt('approval.message', { id, decision: decisionLabels[d.type as string] ?? d.type }), detail)
+        if (!ok) return cancelled()
+      }
       return proxyToBackend({
         method: 'POST',
         path: `/api/v1/approvals/${id}`,
