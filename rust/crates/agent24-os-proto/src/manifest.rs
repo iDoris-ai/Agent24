@@ -70,6 +70,7 @@ fn parse_baseline(
 
 /// Select exact handshake bytes, comparing published semantics against the compiled baseline.
 /// Only the published document's top-level `integrity` is excluded.
+/// Both YAML values and kernel-parsed business fields must match.
 ///
 /// # Errors
 /// Invalid YAML/mappings or changed semantics; diagnostics never echo untrusted text.
@@ -96,6 +97,20 @@ pub fn select_manifest<'a>(
         }
         return Err(ManifestCheckError::Mismatch {
             keys: keys.join(", "),
+        });
+    }
+    let parse = |bytes, origin| {
+        std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|yaml| agent24_domain::DomainOsManifest::from_yaml(yaml).ok())
+            .ok_or(ManifestCheckError::InvalidYaml { origin })
+    };
+    // Parse original text with the kernel parser; Value equality alone is insufficient.
+    let baseline = parse(embedded, "embedded")?;
+    let disk = parse(published, "on-disk")?;
+    if !baseline.eq_ignoring_integrity(&disk) {
+        return Err(ManifestCheckError::Mismatch {
+            keys: "<typed mismatch>".into(),
         });
     }
     Ok(published)
@@ -222,18 +237,72 @@ mod tests {
 mod selfcheck_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
-    const BASE: &[u8] = b"name: module\nspawn: {command: bin/module}\n";
+    const BASE: &[u8] = b"name: module\nversion: 0.1.0\nroute_namespace: /api/v1/module\nevent_module: module\ndata_dir: ~/.agent24/os/module/\nimpl_kind: out_of_process_provider\nspawn: {command: bin/module}\n";
 
     #[test]
     fn absent_and_reformatted_preserve_bytes() {
         assert_eq!(select_manifest(BASE, None).unwrap(), BASE);
-        let disk =
-            b"# published\nintegrity: {files: {}}\nspawn:\n  command: bin/module\nname: module\n";
-        assert_eq!(select_manifest(BASE, Some(disk)).unwrap(), disk);
+        let disk = format!(
+            "# published\n{}integrity: {{manifest: files.json, sha256: digest, files: [], executables: []}}\n",
+            std::str::from_utf8(BASE).unwrap().replace(
+                "spawn: {command: bin/module}",
+                "spawn:\n  command: bin/module"
+            )
+        );
+        assert_eq!(
+            select_manifest(BASE, Some(disk.as_bytes())).unwrap(),
+            disk.as_bytes()
+        );
+    }
+
+    #[test]
+    fn scalar_spellings_follow_both_value_and_kernel_semantics() {
+        use agent24_domain::DomainOsManifest;
+        for (left, right) in [
+            ("1", "0x1"),
+            ("null", "~"),
+            ("true", "yes"),
+            ("true", "True"),
+            ("1", "\"1\""),
+        ] {
+            let yaml = |arg: &str| {
+                format!(
+                    "name: module\nversion: 0.1.0\nroute_namespace: /api/v1/module\nevent_module: module\ndata_dir: ~/.agent24/os/module/\nimpl_kind: out_of_process_provider\nspawn: {{command: bin/module, args: [{arg}]}}\n"
+                )
+            };
+            let embedded = yaml(left);
+            let disk = yaml(right);
+            let a = DomainOsManifest::from_yaml(&embedded);
+            let b = DomainOsManifest::from_yaml(&disk);
+            let values_equal = parse_baseline(embedded.as_bytes(), "embedded").unwrap()
+                == parse_baseline(disk.as_bytes(), "on-disk").unwrap();
+            let result = select_manifest(embedded.as_bytes(), Some(disk.as_bytes()));
+            let kernel_equal = matches!((&a, &b), (Ok(a), Ok(b)) if a == b);
+            assert_eq!(
+                result.is_ok(),
+                values_equal && kernel_equal,
+                "{left} vs {right}"
+            );
+        }
+    }
+
+    #[test]
+    fn kernel_rejects_invalid_published_integrity_without_echoing_values() {
+        let disk = format!(
+            "{}integrity: {{secret: secret}}\n",
+            std::str::from_utf8(BASE).unwrap()
+        );
+        let error = select_manifest(BASE, Some(disk.as_bytes())).unwrap_err();
+        assert!(matches!(
+            error,
+            ManifestCheckError::InvalidYaml { origin: "on-disk" }
+        ));
+        assert!(!format!("{error:?}").contains("secret"));
     }
 
     #[test]
     fn changes_report_only_known_keys() {
+        const BASE: &[u8] = b"name: module\nspawn: {command: bin/module}\n";
         for (disk, keys) in [
             ("name: secret\nspawn: {command: bin/module}\n", "name"),
             ("name: module\n", "spawn"),

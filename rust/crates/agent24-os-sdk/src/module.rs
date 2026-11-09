@@ -83,6 +83,7 @@ pub struct ModuleBuilder {
     /// `Some` only via `with_env` (test-util): the production path always
     /// reads the real process environment and takes over fd 3 instead.
     env_override: Option<ModuleEnv>,
+    package_dir: Option<std::path::PathBuf>,
 }
 
 impl ModuleBuilder {
@@ -106,6 +107,21 @@ impl ModuleBuilder {
         self
     }
 
+    /// Tests only: read a package manifest through the production self-check.
+    ///
+    /// # Panics
+    /// Must be called after `with_env`, so tests never take over fd 3.
+    #[cfg(feature = "test-util")]
+    #[must_use]
+    pub fn with_package_dir(mut self, dir: std::path::PathBuf) -> Self {
+        assert!(
+            self.env_override.is_some(),
+            "with_package_dir requires with_env"
+        );
+        self.package_dir = Some(dir);
+        self
+    }
+
     /// Production path: take over the inherited listener (fd 3), read the
     /// environment, parse the manifest, dial and run `initialize`. Once per
     /// process — see `agent24_os_proto::module::take_listener`'s doc comment
@@ -118,12 +134,16 @@ impl ModuleBuilder {
             Some(_) => None,
             None => Some(agent24_os_proto::module::take_listener().map_err(SdkError::Listen)?),
         };
-        let kernel_launched = self.env_override.is_none();
+        let kernel_launched = self.env_override.is_none() || self.package_dir.is_some();
         let env = match self.env_override {
             Some(env) => env,
             None => ModuleEnv::from_env().map_err(SdkError::Env)?,
         };
-        let published = published_manifest(kernel_launched, Path::new(PUBLISHED_MANIFEST))?;
+        let path = self
+            .package_dir
+            .unwrap_or_default()
+            .join(PUBLISHED_MANIFEST);
+        let published = published_manifest(kernel_launched, &path)?;
         let bytes = manifest::select_manifest(self.manifest_yaml.as_bytes(), published.as_deref())?;
         let facts = checked_facts(bytes)?;
         let capabilities: Vec<&str> = facts
@@ -187,7 +207,7 @@ impl Module {
     /// reads `domain-os.yml` from cwd (the package directory), requires it to
     /// equal this baseline once its top-level `integrity` is ignored, and
     /// digests its exact bytes; a missing file is an error. Only `with_env`
-    /// (tests, no package) uses the embedded bytes alone. `Cow` also permits
+    /// without `with_package_dir` (tests, no package) uses the embedded bytes alone. `Cow` also permits
     /// runtime-built test manifests.
     #[must_use]
     pub fn builder(manifest_yaml: impl Into<Cow<'static, str>>) -> ModuleBuilder {
@@ -195,6 +215,7 @@ impl Module {
             manifest_yaml: manifest_yaml.into(),
             on_fatal: None,
             env_override: None,
+            package_dir: None,
         }
     }
 
@@ -343,8 +364,88 @@ mod tests {
         TempDir(dir)
     }
 
-    const MANIFEST: &str =
-        "name: minimal\nroute_namespace: /api/v1/minimal\nkernel_capabilities: [events]\n";
+    const MANIFEST: &str = "name: minimal\nversion: 0.1.0\nroute_namespace: /api/v1/minimal\nevent_module: minimal\ndata_dir: ~/.agent24/os/minimal/\nimpl_kind: out_of_process_provider\nspawn: {command: bin/minimal}\nkernel_capabilities: [events]\n";
+
+    #[test]
+    #[should_panic(expected = "with_package_dir requires with_env")]
+    fn package_dir_requires_env_override() {
+        let _ = Module::builder(MANIFEST).with_package_dir(std::path::PathBuf::new());
+    }
+
+    #[tokio::test]
+    async fn connect_digests_exact_package_bytes() {
+        let dir = tempdir();
+        let disk = format!(
+            "# published\n{}integrity: {{manifest: files.json, sha256: digest, files: [], executables: []}}\n",
+            MANIFEST.replace(
+                "spawn: {command: bin/minimal}",
+                "spawn:\n  command: bin/minimal"
+            )
+        );
+        std::fs::write(dir.path().join(PUBLISHED_MANIFEST), &disk).unwrap();
+        let (env, endpoint) = testing::FakeEndpoint::bind(dir.path());
+        let accept =
+            endpoint.accept_initialize(json!({"protocol_version": 1, "offer": {"provides": []}}));
+        let (hook, _) = testing::recording_hook();
+        let connect = Module::builder(MANIFEST)
+            .with_env(env, hook)
+            .with_package_dir(dir.path().to_owned())
+            .connect();
+        let ((params, _peer), result) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                tokio::join!(accept, connect)
+            })
+            .await
+            .unwrap();
+        let _module = result.unwrap();
+        assert_eq!(
+            params["manifest_digest"],
+            manifest::manifest_digest(disk.as_bytes())
+        );
+        assert_ne!(
+            params["manifest_digest"],
+            manifest::manifest_digest(MANIFEST.as_bytes())
+        );
+    }
+
+    async fn rejected_package_never_initializes(disk: Option<String>) {
+        let dir = tempdir();
+        if let Some(disk) = &disk {
+            std::fs::write(dir.path().join(PUBLISHED_MANIFEST), disk).unwrap();
+        }
+        let (env, endpoint) = testing::FakeEndpoint::bind(dir.path());
+        let (hook, _) = testing::recording_hook();
+        let connect = Module::builder(MANIFEST)
+            .with_env(env, hook)
+            .with_package_dir(dir.path().to_owned())
+            .connect();
+        let accept =
+            endpoint.accept_initialize(json!({"protocol_version": 1, "offer": {"provides": []}}));
+        tokio::pin!(accept);
+        let result = tokio::select! {
+            result = connect => result,
+            _ = &mut accept => panic!("rejected package sent initialize"),
+        };
+        match disk {
+            None => assert!(matches!(result, Err(SdkError::ManifestMissing))),
+            Some(_) => assert!(matches!(result, Err(SdkError::ManifestCheck(_)))),
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), accept)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_missing_package_never_initializes() {
+        rejected_package_never_initializes(None).await;
+    }
+
+    #[tokio::test]
+    async fn connect_changed_package_never_initializes() {
+        rejected_package_never_initializes(Some(MANIFEST.replace("0.1.0", "0.2.0"))).await;
+    }
 
     // J-S11: the handshake carries the manifest-derived name/capabilities and
     // the declared protocol range is exactly what this SDK speaks, {1,2} since
