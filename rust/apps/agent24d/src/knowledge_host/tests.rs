@@ -636,7 +636,7 @@ async fn a_malformed_request_changes_nothing() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
         assert!(body.contains("invalid_request"));
     }
-    // Empty, not JSON, a missing or zero sequence, and the old query form.
+    // Empty, not JSON, a missing or zero sequence.
     for payload in [
         "",
         "not-json",
@@ -648,6 +648,23 @@ async fn a_malformed_request_changes_nothing() {
         let req = with_body(Method::PUT, BINDING, &host, payload);
         let (status, body) = send(&router, req).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{payload}");
+        assert!(body.contains("invalid_request"));
+    }
+    // A field the route does not take, on each route that takes only `seq`,
+    // and on the full activation (the credential push has its own test).
+    for (method, path, payload) in [
+        (Method::PUT, BINDING, r#"{"seq":1,"x":1}"#),
+        (
+            Method::PUT,
+            BINDING,
+            r#"{"seq":1,"endpoint":"https://kb.example/api/v1","knowledge_base_ids":["kb-a"],"x":1}"#,
+        ),
+        (Method::DELETE, BINDING, r#"{"seq":1,"x":1}"#),
+        (Method::DELETE, CREDENTIAL, r#"{"seq":1,"x":1}"#),
+    ] {
+        let req = with_body(method.clone(), path, &host, payload);
+        let (status, body) = send(&router, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path} {payload}");
         assert!(body.contains("invalid_request"));
     }
     assert!(registry.is_empty());
