@@ -114,7 +114,7 @@ vi.mock('node:child_process', async (orig) => ({
 
 const endpoint = { port: 0, token: 'daemon-secret' }
 type Elevate = (r: { method: string; path: string; body: string; summary: string }) => Promise<string>
-const elevation: { current: ((fn: (elevate: Elevate) => Promise<unknown>) => Promise<unknown>) | null } = { current: null }
+const elevation: { current: ((fn: (elevate: Elevate, token: string) => Promise<unknown>) => Promise<unknown>) | null } = { current: null }
 vi.mock('../backend-manager', () => ({
   getBackendEndpoint: () => ({ port: endpoint.port }),
   daemonConnection: () => ({ port: endpoint.port, authHeaders: { Authorization: `Bearer ${endpoint.token}` } }),
@@ -342,7 +342,7 @@ describe('A1 backendProxy allowlist', () => {
   it('service mode: an elevated write is confirmed on the enrolment once, then retried with the grant (M5 B3)', async () => {
     presenceGate = true
     const asked: { method: string; path: string; body: string }[] = []
-    elevation.current = (fn) => fn(async (r) => { asked.push({ method: r.method, path: r.path, body: r.body }); return 'grant-1' })
+    elevation.current = (fn) => fn(async (r) => { asked.push({ method: r.method, path: r.path, body: r.body }); return 'grant-1' }, endpoint.token)
     const body = { name: 'daily', cron: '0 9 * * *' }
     const res = await call(IpcChannels.BackendProxy, { method: 'POST', path: '/api/v1/schedules', body })
     expect(res).toMatchObject({ ok: true, status: 200, data: { id: 'sch_1' } })
@@ -380,7 +380,7 @@ describe('A1 backendProxy allowlist', () => {
     it('service mode: one box, the daemon\'s presence box; its own is skipped (M5 B3, General 11-09)', async () => {
       presenceGate = true
       const presenceBoxes: string[] = []
-      elevation.current = (fn) => fn(async (r) => { presenceBoxes.push(`${r.method} ${r.path}`); return 'grant-1' })
+      elevation.current = (fn) => fn(async (r) => { presenceBoxes.push(`${r.method} ${r.path}`); return 'grant-1' }, endpoint.token)
       const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })
       expect(showMessageBox).not.toHaveBeenCalled()
       expect(presenceBoxes).toEqual(['POST /api/v1/approvals/ap_1'])
@@ -389,11 +389,22 @@ describe('A1 backendProxy allowlist', () => {
     })
     it('service mode, the presence box refused: nothing approved, still no box of its own', async () => {
       presenceGate = true
-      elevation.current = (fn) => fn(async () => { throw new Error('denied') })
+      elevation.current = (fn) => fn(async () => { throw new Error('denied') }, endpoint.token)
       const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })
       expect(showMessageBox).not.toHaveBeenCalled()
       expect(res).toMatchObject({ ok: false, status: 403 })
       expect(elevationHeaders).toEqual([undefined, undefined])
+    })
+    it('service mode, then our own child published before the turn: no box, nothing approved (Codex B3b r2 C1)', async () => {
+      presenceGate = true
+      const presenceBoxes: string[] = []
+      // The turn is the old enrolment's; the connection now carries another token.
+      elevation.current = (fn) => fn(async (r) => { presenceBoxes.push(r.path); return 'grant-1' }, 'old-daily-token')
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(presenceBoxes).toEqual([])
+      expect(res).toMatchObject({ ok: false, status: 503 })
+      expect(elevationHeaders).toEqual([undefined])
     })
     it('our own child: one box, its own, and no presence asked', async () => {
       showMessageBox.mockResolvedValue({ response: 0 })

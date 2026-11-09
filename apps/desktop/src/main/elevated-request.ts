@@ -74,12 +74,16 @@ export async function sendElevating(
     return first
   }
   try {
-    return await turn(async (elevate) => {
+    return await turn(async (elevate, token) => {
       // A renew may have come since the first try, and another request of the
       // same template may have been remembered over it: so again, now, with
-      // the token the grant will be bound to (Codex B3b C1).
+      // the token the grant will be bound to (Codex B3b C1). Only on this
+      // enrolment's connection: one published since (our own child's host
+      // token, which no presence check constrains) would just run it (r2 C1).
       const now = deps.connection()
-      if (!now) return proxyError('backend_not_ready', 'Backend daemon is not ready (no announced port or credential)')
+      if (now?.authHeaders['Authorization'] !== `Bearer ${token}`) {
+        return proxyError('backend_not_ready', 'The daemon connection changed; try again')
+      }
       const again = await send(now, req, opts)
       if (!presenceRequired(again)) return again
       const grant = await elevate({ method: req.method, path: req.path, body, summary: elevationSummary(req) })

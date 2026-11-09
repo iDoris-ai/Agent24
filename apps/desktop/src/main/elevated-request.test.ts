@@ -10,7 +10,7 @@ const PRESENCE_REQUIRED: BackendProxyResponse = { ok: false, status: 403, data: 
 const OK: BackendProxyResponse = { ok: true, status: 200, data: { id: 'sch_1' } }
 const GRANT = 'grant-secret-value'
 
-function setup(replies: BackendProxyResponse[], opts: { elevation?: boolean; fail?: unknown } = {}) {
+function setup(replies: BackendProxyResponse[], opts: { elevation?: boolean; fail?: unknown; published?: string } = {}) {
   const sent: { endpoint: ProxyEndpoint; req: BackendProxyRequest }[] = []
   const asked: ElevateRequest[] = []
   let token = 'daily-1'
@@ -18,14 +18,15 @@ function setup(replies: BackendProxyResponse[], opts: { elevation?: boolean; fai
     sent.push({ endpoint, req })
     return replies.shift() ?? OK
   })
-  const turn = async <T>(fn: (elevate: (request: ElevateRequest) => Promise<string>) => Promise<T>): Promise<T> => {
+  const turn = async <T>(fn: (elevate: (request: ElevateRequest) => Promise<string>, token: string) => Promise<T>): Promise<T> => {
     // A renew right before the turn: what follows must carry the token of now.
-    token = 'daily-2'
+    // `published`: another connection was published meanwhile (our own child).
+    token = opts.published ?? 'daily-2'
     return fn(async (request) => {
       asked.push(request)
       if (opts.fail !== undefined) throw opts.fail
       return GRANT
-    })
+    }, 'daily-2')
   }
   const deps = {
     connection: () => ({ port: 4100, authHeaders: { Authorization: `Bearer ${token}` } }),
@@ -62,6 +63,14 @@ describe('sendElevating (M5 B3)', () => {
     await expect(sendElevating(schedule, {}, deps)).resolves.toEqual(OK)
     expect(asked).toEqual([])
     expect(sent).toHaveLength(2)
+  })
+
+  it('another connection published before the turn (our own child): nothing sent on it, nothing elevated (Codex B3b r2 C1)', async () => {
+    const { deps, sent, asked } = setup([PRESENCE_REQUIRED, OK], { published: 'host-token' })
+    const res = await sendElevating(schedule, {}, deps)
+    expect(res).toMatchObject({ ok: false, status: 503, data: { error: { code: 'backend_not_ready' } } })
+    expect(sent).toHaveLength(1)
+    expect(asked).toEqual([])
   })
 
   it('hashes no body as the empty string', async () => {
