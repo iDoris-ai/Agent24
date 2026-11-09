@@ -11,12 +11,15 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -341,8 +344,7 @@ fn run_add(home: &Path) -> (bool, String, String) {
     )
     .unwrap();
     // The enrolment socket lives in `home`; the data dir is `home/.agent24`.
-    let out = Command::new(env!("CARGO_BIN_EXE_agent24"))
-        .env_clear()
+    let out = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .args(["os", "attach", "add", &manifest.to_string_lossy(), "--json"])
@@ -810,8 +812,7 @@ fn capabilities_delegate_elevates_on_enrolled_connection() {
         script(pending_then(elevated())),
         home.path(),
     );
-    let out = Command::new(env!("CARGO_BIN_EXE_agent24"))
-        .env_clear()
+    let out = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home.path())
         .args(["os", "delegate", "agentear"])
@@ -1068,8 +1069,7 @@ fn start_idoris(script: UdsScript, home: &Path) -> IdorisFake {
 /// Run `agent24 idoris <args>`. A spawned daemon would mask the result, so
 /// `AGENT24D_BIN` points nowhere.
 fn run_idoris(home: &Path, args: &[&str], path: &std::ffi::OsStr) -> (bool, String, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agent24"))
-        .env_clear()
+    let mut child = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24"))
         .env("PATH", path)
         .env("HOME", home)
         .env("AGENT24D_BIN", home.join("no-spawned-daemon"))

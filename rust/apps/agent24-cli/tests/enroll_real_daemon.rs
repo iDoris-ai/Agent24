@@ -11,6 +11,9 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -75,8 +78,7 @@ impl Host {
             .unwrap();
         let stderr_path = home.path().join("daemon-stderr.log");
         let stderr = std::fs::File::create(&stderr_path).unwrap();
-        let mut child = Command::new(daemon_binary())
-            .env_clear()
+        let mut child = signature_command::clear_command(daemon_binary())
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", home.path())
             .env("AGENT24_TEST_PRESENCE", decision)
@@ -144,8 +146,7 @@ impl Host {
 
     /// Run the real CLI with `args`, under the same isolation as [`Self::add`].
     fn cli(&self, args: &[&str]) -> Output {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_agent24"))
-            .env_clear()
+        let mut child = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24"))
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self._home.path())
             .env(
@@ -173,8 +174,7 @@ impl Host {
     fn add(&self) -> Output {
         let manifest = self._home.path().join("agentear.yml");
         std::fs::write(&manifest, manifest_text("agentear")).unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_agent24"))
-            .env_clear()
+        let mut child = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24"))
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self._home.path())
             // Discovery failure must not silently start a legacy daemon.

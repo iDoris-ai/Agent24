@@ -1,8 +1,7 @@
 //! `agent24 package-integrity` — generate and verify an OS package file manifest.
 //!
-//! Signature checks are intentionally absent. External CI signs executables
-//! before `generate`. PR-3 is what starts refusing packages that omit the
-//! manifest.
+//! Release self-checks verify hashes and native format. Host checks additionally
+//! enforce the host signature policy after verifying package contents.
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -34,7 +33,29 @@ pub fn verify_if_present(
     manifest: &DomainOsManifest,
     cancel: &CancellationToken,
 ) -> Result<(), IntegrityError> {
-    verify_if_present_for_arch(dir, manifest, cancel, std::env::consts::ARCH)
+    verify_with_policy(
+        dir,
+        manifest,
+        cancel,
+        &crate::signature::Policy::default(),
+        agent24_components::sign::VerifyMode::AtRest,
+    )
+}
+
+pub fn verify_with_policy(
+    dir: &Path,
+    manifest: &DomainOsManifest,
+    cancel: &CancellationToken,
+    policy: &crate::signature::Policy,
+    mode: agent24_components::sign::VerifyMode,
+) -> Result<(), IntegrityError> {
+    verify_contents(
+        dir,
+        manifest,
+        cancel,
+        std::env::consts::ARCH,
+        Some((policy, mode)),
+    )
 }
 
 fn verify_if_present_for_arch(
@@ -43,10 +64,28 @@ fn verify_if_present_for_arch(
     cancel: &CancellationToken,
     arch: &str,
 ) -> Result<(), IntegrityError> {
+    verify_contents(dir, manifest, cancel, arch, None)
+}
+
+fn verify_contents(
+    dir: &Path,
+    manifest: &DomainOsManifest,
+    cancel: &CancellationToken,
+    arch: &str,
+    signature: Option<(
+        &crate::signature::Policy,
+        agent24_components::sign::VerifyMode,
+    )>,
+) -> Result<(), IntegrityError> {
     if cancel.is_cancelled() {
         return Err(IntegrityError::Cancelled);
     }
     let Some(declared) = manifest.integrity() else {
+        // Legacy manifests still need host signature authorization. Omitting
+        // the optional hash manifest must not bypass executable verification.
+        if let (Some((policy, mode)), Some(spawn)) = (signature, manifest.spawn()) {
+            policy.verify(dir, &spawn.command, mode, cancel)?;
+        }
         return Ok(());
     };
     verify_declared(
@@ -60,6 +99,7 @@ fn verify_if_present_for_arch(
         },
         cancel,
         arch,
+        signature,
     )
 }
 
@@ -111,7 +151,7 @@ fn check_target_arch(arch: &str) -> Result<(), IntegrityError> {
 
 /// Generate for a target CPU architecture on the host OS.
 /// Daemon-side verification (discovery and recheck) always requires the host
-/// architecture; `os install` copies the package without checking it.
+/// architecture, including installation.
 pub fn generate_for_arch(
     root: &Path,
     executables: &[String],
@@ -251,6 +291,10 @@ fn verify_declared(
     section: &IntegritySection,
     cancel: &CancellationToken,
     arch: &str,
+    signature: Option<(
+        &crate::signature::Policy,
+        agent24_components::sign::VerifyMode,
+    )>,
 ) -> Result<(), IntegrityError> {
     if cancel.is_cancelled() {
         return Err(IntegrityError::Cancelled);
@@ -304,9 +348,17 @@ fn verify_declared(
         ),
     )?;
     for executable in &section.executables {
-        check_native_executable_for_arch(&dir.join(executable), executable, arch)?;
+        prefer_cancel(
+            cancel,
+            check_native_executable_for_arch(&dir.join(executable), executable, arch),
+        )?;
     }
-    Ok(())
+    if let Some((policy, mode)) = signature {
+        for executable in &section.executables {
+            policy.verify(dir, executable, mode, cancel)?;
+        }
+    }
+    prefer_cancel(cancel, Ok(()))
 }
 
 fn tree_result(
@@ -796,8 +848,8 @@ mod tests {
         let root = packages.path().join("packages");
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        crate::install::install(staging.path(), &root).unwrap();
-        let scan = crate::discovery::scan(&root, &CancellationToken::new());
+        crate::test_support::install(staging.path(), &root).unwrap();
+        let scan = crate::test_support::scan(&root, &CancellationToken::new());
         assert_eq!(scan.found.len(), 1, "refused: {:?}", scan.refused);
     }
 
@@ -952,7 +1004,7 @@ mod tests {
     }
 
     fn scan_why(parent: &Path, name: &str) -> String {
-        let scan = crate::discovery::scan(parent, &CancellationToken::new());
+        let scan = crate::test_support::scan(parent, &CancellationToken::new());
         scan.refused
             .iter()
             .find(|refused| refused.dir.ends_with(name))
@@ -1144,7 +1196,7 @@ mod tests {
         write_tree(&new_package, "newmod");
         generate(&new_package, &["bin/newmod".into(), "bin/helper".into()]).unwrap();
 
-        let first = crate::discovery::scan(parent.path(), &CancellationToken::new());
+        let first = crate::test_support::scan(parent.path(), &CancellationToken::new());
         let old_found = first
             .found
             .iter()
@@ -1163,8 +1215,8 @@ mod tests {
             "old package refused: {:?}",
             first.refused
         );
-        crate::discovery::recheck(&old, &old_found.digest, &CancellationToken::new()).unwrap();
-        crate::discovery::recheck(&new_package, &new_found.digest, &CancellationToken::new())
+        crate::test_support::recheck(&old, &old_found.digest, &CancellationToken::new()).unwrap();
+        crate::test_support::recheck(&new_package, &new_found.digest, &CancellationToken::new())
             .unwrap();
         let old_verify = verify(&old).unwrap_err();
         assert!(
@@ -1182,7 +1234,7 @@ mod tests {
         bytes[0] ^= 0x01;
         fs::write(&binary, bytes).unwrap();
 
-        let second = crate::discovery::scan(parent.path(), &CancellationToken::new());
+        let second = crate::test_support::scan(parent.path(), &CancellationToken::new());
         assert!(
             second
                 .found
@@ -1203,11 +1255,14 @@ mod tests {
             .why
             .clone();
         assert!(why.contains("hash_mismatch: bin/newmod"), "{why}");
-        let recheck =
-            crate::discovery::recheck(&new_package, &new_found.digest, &CancellationToken::new())
-                .unwrap_err();
+        let recheck = crate::test_support::recheck(
+            &new_package,
+            &new_found.digest,
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
         assert!(recheck.contains("hash_mismatch: bin/newmod"), "{recheck}");
-        crate::discovery::recheck(&old, &old_found.digest, &CancellationToken::new()).unwrap();
+        crate::test_support::recheck(&old, &old_found.digest, &CancellationToken::new()).unwrap();
     }
     #[test]
     fn t3_control_directory_special_file_and_non_utf8_boundaries() {

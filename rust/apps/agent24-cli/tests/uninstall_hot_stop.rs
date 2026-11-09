@@ -17,6 +17,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -49,9 +52,8 @@ fn agent24d_bin() -> std::path::PathBuf {
 }
 
 fn cli(home: &Path) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_agent24"));
-    c.env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+    let mut c = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24"));
+    c.env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("AGENT24D_BIN", agent24d_bin());
     c
@@ -299,14 +301,9 @@ impl Drop for Daemon<'_> {
 fn uninstall_hot_stops_a_running_module_and_leaves_no_tombstone() {
     let home = tmp_home();
     let src = write_package(home.path(), "fu61demo", false);
-    let (ok, out) = run(home.path(), &["os", "install", &src.to_string_lossy()]);
-    assert!(ok, "{out}");
+    stage_package(home.path(), &src);
     let survivor_src = write_package(home.path(), "survivor", false);
-    let (ok, out) = run(
-        home.path(),
-        &["os", "install", &survivor_src.to_string_lossy()],
-    );
-    assert!(ok, "{out}");
+    stage_package(home.path(), &survivor_src);
 
     let _daemon = Daemon::start(home.path());
 
@@ -386,8 +383,7 @@ fn uninstall_hot_stops_a_running_module_and_leaves_no_tombstone() {
 fn uninstall_without_a_daemon_removes_files_and_spawns_nothing() {
     let home = tmp_home();
     let src = write_package(home.path(), "fu61demo", false);
-    let (ok, out) = run(home.path(), &["os", "install", &src.to_string_lossy()]);
-    assert!(ok, "{out}");
+    stage_package(home.path(), &src);
 
     let marker = home.path().join("spawned.marker");
     let fake_bin = home.path().join("fake-agent24d.sh");
@@ -440,8 +436,7 @@ fn uninstall_without_a_daemon_removes_files_and_spawns_nothing() {
 fn daemon_stop_waits_for_the_lock_before_reporting_success() {
     let home = tmp_home();
     let src = write_package(home.path(), "fu61demo", true);
-    let (ok, out) = run(home.path(), &["os", "install", &src.to_string_lossy()]);
-    assert!(ok, "{out}");
+    stage_package(home.path(), &src);
     let _daemon = Daemon::start(home.path());
     wait_for_running_pid(home.path(), "fu61demo");
 
@@ -461,4 +456,11 @@ fn daemon_stop_waits_for_the_lock_before_reporting_success() {
     assert!(ok, "daemon start raced the lock right after stop: {out}");
     assert!(out.contains("daemon started"), "{out}");
     let _daemon2 = Daemon::attached(home.path(), &out);
+}
+
+// Installation is fixture setup; these tests exercise stop/uninstall semantics.
+fn stage_package(home: &Path, src: &Path) {
+    let packages = home.join(".agent24/packages");
+    std::fs::create_dir_all(&packages).unwrap();
+    std::fs::rename(src, packages.join(src.file_name().unwrap())).unwrap();
 }

@@ -4,10 +4,14 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+use std::process::Command;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 /// A package module that shakes hands with its own manifest's digest and
@@ -93,9 +97,8 @@ impl Drop for Daemon {
 }
 
 fn daemon(home: &Path, env: &[(&str, &str)], args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agent24d"));
+    let mut command = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"));
     command
-        .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .envs(env.iter().copied())
@@ -318,4 +321,25 @@ fn a_bound_past_ninety_days_stops_the_start() {
     assert!(error.starts_with("A24_MODULE_GRANT_MAX_DAYS"), "{error}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("A24_MODULE_GRANT_MAX_DAYS"), "{stderr}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn discovery_signature_opt_in_is_explicit_in_the_real_daemon() {
+    let home = tempfile::tempdir().unwrap();
+    install(home.path());
+    let refused = start_with(
+        home.path(),
+        &[("A24_TEST_ACCEPT_ADHOC_SIGNATURES", "0")],
+        &[],
+    );
+    let (status, body) = get(&refused, CARD);
+    assert_ne!(status, 200, "{body}");
+    // Refused at discovery: the package is not mounted at all. (The typed
+    // refusal reason on /api/v1/components arrives with S1-9 PR-3c.)
+    let (_, modules) = get(&refused, "/api/v1/os");
+    assert_eq!(modules["modules"], serde_json::json!([]), "{modules}");
+    drop(refused);
+    let accepted = start(home.path());
+    running_card(&accepted);
 }

@@ -513,3 +513,103 @@ fn signing_requirement_is_decided_by_platform_and_mode() {
         Err(InstallError::ManifestViolation(_))
     ));
 }
+
+#[test]
+fn team_reader_rejects_unsigned_adhoc_duplicate_and_malformed_claims() {
+    struct Details(bool, &'static str);
+    impl CommandRunner for Details {
+        fn run(&self, program: &str, args: &[&str]) -> io::Result<CommandOutput> {
+            assert_eq!(program, CODESIGN);
+            assert_eq!(&args[..2], &["-dv", "--verbose=4"]);
+            Ok(CommandOutput {
+                success: self.0,
+                stderr: self.1.into(),
+            })
+        }
+    }
+    for (success, text) in [
+        (false, "TeamIdentifier=HYAP444FN9"),
+        (true, "Signature=adhoc\nTeamIdentifier=not set"),
+        (true, ""),
+        (true, "TeamIdentifier=HYAP444FN9\nTeamIdentifier=ABCDE12345"),
+        (true, "TeamIdentifier=../../oops"),
+    ] {
+        assert!(
+            CodesignWith(Details(success, text))
+                .team_id(Path::new("binary"))
+                .is_err()
+        );
+    }
+    assert_eq!(
+        CodesignWith(Details(true, "TeamIdentifier=HYAP444FN9\n"))
+            .team_id(Path::new("binary"))
+            .unwrap(),
+        "HYAP444FN9"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn adhoc_requires_explicit_metadata_and_valid_seal() {
+    struct Runner {
+        details: &'static str,
+        display_ok: bool,
+        seal_ok: bool,
+    }
+    impl CommandRunner for Runner {
+        fn run(&self, _: &str, args: &[&str]) -> io::Result<CommandOutput> {
+            if args[0] == "-dv" {
+                Ok(CommandOutput {
+                    success: self.display_ok,
+                    stderr: self.details.into(),
+                })
+            } else {
+                assert_eq!(args, ["--verify", "--strict", "/stub"]);
+                Ok(CommandOutput {
+                    success: self.seal_ok,
+                    stderr: String::new(),
+                })
+            }
+        }
+    }
+    for (details, display_ok, seal_ok, expected) in [
+        ("Signature=adhoc\nTeamIdentifier=not set", true, true, true),
+        (
+            "Signature=adhoc\nTeamIdentifier=not set",
+            true,
+            false,
+            false,
+        ),
+        (
+            "Signature=adhoc\nTeamIdentifier=not set",
+            false,
+            true,
+            false,
+        ),
+        ("TeamIdentifier=not set", true, true, false),
+        (
+            "Signature=adhoc\nTeamIdentifier=ABCDE12345",
+            true,
+            true,
+            false,
+        ),
+        (
+            "Signature=adhoc\nTeamIdentifier=not set\nTeamIdentifier=ABCDE12345",
+            true,
+            true,
+            false,
+        ),
+        ("", false, false, false),
+    ] {
+        assert_eq!(
+            CodesignWith(Runner {
+                details,
+                display_ok,
+                seal_ok
+            })
+            .verify_adhoc(Path::new("/stub"))
+            .is_ok(),
+            expected
+        );
+    }
+}

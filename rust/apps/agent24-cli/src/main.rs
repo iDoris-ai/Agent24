@@ -19,6 +19,9 @@ use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(all(feature = "test-support", not(debug_assertions)))]
+compile_error!("test-support must not be enabled in release builds");
+
 mod acp;
 mod comm_groups;
 mod documents;
@@ -271,6 +274,12 @@ enum DecideDeleteAction {
 
 #[derive(Subcommand)]
 enum OsAction {
+    /// Explicitly trust a macOS Developer ID team (daemon required; next verification)
+    TrustTeam { team_id: String },
+    /// Remove an added team; the built-in team cannot be removed (does not stop running modules)
+    UntrustTeam { team_id: String },
+    /// List trusted teams; the built-in team is marked and cannot be removed
+    TrustedTeams,
     /// Show every domain OS the daemon knows about, and what it did with each
     List,
     // `Disable`'s line EXPIRED with SUP-5: the daemon's disable path now drains
@@ -1482,7 +1491,11 @@ async fn install_with_consent(
     // Revoke before `install` creates directories. A busy or docked gate must
     // leave the packages root byte-for-byte unchanged.
     revoke_module_consent(&module, state_dir, online).await?;
-    match agent24_os_packages::install::install(src, packages_root) {
+    #[cfg(test)]
+    let signature = agent24_os_packages::test_support::signature_policy();
+    #[cfg(not(test))]
+    let signature = agent24_os_packages::signature::Policy::default();
+    match agent24_os_packages::install::install_with_policy(src, packages_root, &signature) {
         Ok(dest) => {
             println!("installed {}", dest.display());
             println!(
@@ -1766,6 +1779,24 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
         OsAction::Install { .. } | OsAction::Uninstall { .. } => unreachable!(),
         // Handled at the top of this function, before it ever reaches here.
         OsAction::Attach { .. } | OsAction::Delegate { .. } => unreachable!(),
+        OsAction::TrustedTeams => bearer(
+            &ep,
+            client().get(format!("{}/api/v1/os/trusted-teams", ep.base)),
+        ),
+        OsAction::TrustTeam { team_id } | OsAction::UntrustTeam { team_id } => {
+            if !agent24_os_proc::valid_team_id(team_id) {
+                return Err("Team ID must be 10 uppercase letters or digits".into());
+            }
+            let url = format!("{}/api/v1/os/trusted-teams/{team_id}", ep.base);
+            bearer(
+                &ep,
+                if matches!(action, OsAction::TrustTeam { .. }) {
+                    client().put(url)
+                } else {
+                    client().delete(url)
+                },
+            )
+        }
         OsAction::List => bearer(&ep, client().get(format!("{}/api/v1/os", ep.base))),
         OsAction::Enable { name } | OsAction::Disable { name } => {
             let enabled = matches!(action, OsAction::Enable { .. });
@@ -1775,9 +1806,30 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     };
     let out = match req.timeout(Duration::from_secs(10)).send().await {
         Ok(res) if res.status().is_success() => {
-            let body: agent24_protocol::DomainOsList =
-                res.json().await.map_err(|e| e.to_string())?;
-            print_os(&body);
+            if matches!(
+                action,
+                OsAction::TrustedTeams | OsAction::TrustTeam { .. } | OsAction::UntrustTeam { .. }
+            ) {
+                let body: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+                for team in body["teams"]
+                    .as_array()
+                    .ok_or("invalid trusted teams response")?
+                {
+                    println!(
+                        "{}{}",
+                        team["team_id"].as_str().ok_or("missing Team ID")?,
+                        if team["builtin"] == true {
+                            " (内置，不可移除)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            } else {
+                let body: agent24_protocol::DomainOsList =
+                    res.json().await.map_err(|e| e.to_string())?;
+                print_os(&body);
+            }
             Ok(())
         }
         // Surface the daemon's own message: for a bad name it names the modules
@@ -2768,6 +2820,9 @@ fn offline_hint(path: &str, action: &OsAction) -> String {
         // above are commented unreachable in `cmd_os`'s own match: `Attach`
         // returns from `cmd_os` before this function is ever called.
         OsAction::Attach { .. } | OsAction::Delegate { .. } => unreachable!(),
+        OsAction::TrustedTeams | OsAction::TrustTeam { .. } | OsAction::UntrustTeam { .. } => {
+            "start the daemon to manage trusted teams".to_owned()
+        }
         OsAction::List => format!("read {path} to see what is configured"),
         OsAction::Enable { name } | OsAction::Disable { name } => {
             let key = serde_json::to_string(name).unwrap_or_else(|_| "\"?\"".to_owned());
@@ -3176,6 +3231,33 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn trusted_team_commands_parse_and_help_explains_builtin() {
+        use clap::CommandFactory;
+        for args in [
+            vec!["agent24", "os", "trust-team", "ABCDE12345"],
+            vec!["agent24", "os", "untrust-team", "ABCDE12345"],
+            vec!["agent24", "os", "trusted-teams"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("os")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("built-in team"));
+        let verify = command
+            .find_subcommand_mut("package-integrity")
+            .unwrap()
+            .find_subcommand_mut("verify")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(verify.contains("不验签"));
+    }
 
     #[test]
     fn service_status_says_the_daemons_mode_and_where_it_enrols() {

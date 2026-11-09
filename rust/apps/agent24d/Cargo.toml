@@ -7,6 +7,8 @@ repository.workspace = true
 description = "Agent24 Rust daemon — v1 protocol server (B2: skeleton — health, auth handshake, graceful shutdown)"
 
 [features]
+# Only for native ad-hoc package fixtures in macOS black-box tests. Never ship this feature.
+test-support = ["agent24-os-packages/test-support"]
 # Unsigned binaries and automatic presence are exclusively for integration tests.
 test-enrollment = []
 # `knowledge.db` has no production caller. S2-3 sinks the Knowledge host and

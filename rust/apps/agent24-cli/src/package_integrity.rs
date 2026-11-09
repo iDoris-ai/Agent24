@@ -19,7 +19,7 @@ pub enum Action {
         #[arg(long, default_value = std::env::consts::ARCH, value_parser = ["aarch64", "x86_64"])]
         arch: String,
     },
-    /// 只读、严格校验。成功不输出；失败输出固定原因和相对路径。
+    /// 只读校验哈希与原生格式，不验签（签名由发布流程保证）。成功不输出；失败输出固定原因和相对路径。
     Verify {
         #[arg(long)]
         root: PathBuf,

@@ -733,6 +733,7 @@ fn rescan_disabled_package_on_disk(
     name: &str,
     dir: &std::path::Path,
     cancel: &tokio_util::sync::CancellationToken,
+    signature: &agent24_os_packages::signature::Policy,
 ) -> Result<(), String> {
     if let Err(e) = agent24_os_packages::check_packages_root(packages_root) {
         return Err(format!(
@@ -740,7 +741,7 @@ fn rescan_disabled_package_on_disk(
             packages_root.display()
         ));
     }
-    let scan = agent24_os_packages::discovery::scan(packages_root, cancel);
+    let scan = agent24_os_packages::discovery::scan_with_policy(packages_root, cancel, signature);
     classify_scan(&scan, packages_root, name, dir)
 }
 
@@ -833,8 +834,9 @@ async fn rescan_disabled_package(
     let name = name.to_owned();
     let dir = dir.to_owned();
     let cancel = state.shutdown.token().clone();
+    let signature = state.os_signature.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        rescan_disabled_package_on_disk(&packages_root, &name, &dir, &cancel)
+        rescan_disabled_package_on_disk(&packages_root, &name, &dir, &cancel, &signature)
     })
     .await;
     match outcome {
@@ -1120,6 +1122,66 @@ pub async fn stop_now_os(State(state): State<AppState>, Path(name): Path<String>
         HotStop::Stopping | HotStop::Already | HotStop::NotRunning => {
             Json(serde_json::json!({ "name": name, "stopped": true })).into_response()
         }
+    }
+}
+
+fn trust_error_response(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "code": code, "message": message, "retryable": false
+        })),
+    )
+        .into_response()
+}
+
+pub async fn trusted_teams() -> Response {
+    team_policy_response(None).await
+}
+pub async fn trust_team(Path(team): Path<String>) -> Response {
+    team_policy_response(Some((team, true))).await
+}
+pub async fn untrust_team(Path(team): Path<String>) -> Response {
+    team_policy_response(Some((team, false))).await
+}
+async fn team_policy_response(change: Option<(String, bool)>) -> Response {
+    let Some(path) = agent24_os_packages::trusted_teams::default_path() else {
+        return trust_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "trust_store_unavailable",
+            "state directory unavailable",
+        );
+    };
+    team_policy_response_at(path, change).await
+}
+async fn team_policy_response_at(
+    path: std::path::PathBuf,
+    change: Option<(String, bool)>,
+) -> Response {
+    match tokio::task::spawn_blocking(move || {
+        if let Some((team, trusted)) = change {
+            agent24_os_packages::trusted_teams::update(&path, &team, trusted)?;
+        }
+        let teams: Vec<_> = agent24_os_packages::trusted_teams::load(&path)
+            .into_iter()
+            .map(|team| {
+                let builtin = team == agent24_os_proc::DEVELOPER_ID_TEAM_ID;
+                serde_json::json!({"team_id": team, "builtin": builtin})
+            })
+            .collect();
+        Ok::<_, String>(serde_json::json!({"teams": teams}))
+    })
+    .await
+    {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err(error)) => {
+            trust_error_response(StatusCode::BAD_REQUEST, "trust_team_failed", &error)
+        }
+        Err(_) => trust_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "trust_team_failed",
+            "trust operation failed",
+        ),
     }
 }
 
@@ -2820,7 +2882,7 @@ mod tests {
         // branch entirely, so the request instead fell through to "package
         // vanished," previously left this test green because it only checked
         // the status code).
-        let expected_why = agent24_os_packages::discovery::scan(
+        let expected_why = agent24_os_packages::test_support::scan(
             root.path(),
             &tokio_util::sync::CancellationToken::new(),
         )
@@ -2926,5 +2988,53 @@ mod tests {
         assert_eq!(msg, "verification cancelled");
         assert!(!msg.contains("no longer there"), "{msg}");
         assert!(!msg.contains("hash_mismatch"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    #[tokio::test]
+    async fn trust_team_api_persists_lists_and_protects_builtin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join(agent24_os_packages::trusted_teams::FILE_NAME);
+        let response =
+            team_policy_response_at(path.clone(), Some(("ABCDE12345".into(), true))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["teams"].as_array().unwrap().len(), 2);
+        assert!(
+            body["teams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|team| team["team_id"] == "HYAP444FN9" && team["builtin"] == true)
+        );
+        let refused =
+            team_policy_response_at(path.clone(), Some(("HYAP444FN9".into(), false))).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(refused.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], "trust_team_failed");
+        assert!(body["message"].is_string());
+        assert_eq!(body["retryable"], false);
+        assert_eq!(
+            team_policy_response_at(path.clone(), Some(("ABCDE12345".into(), false)))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            agent24_os_packages::trusted_teams::load(&path),
+            agent24_os_packages::trusted_teams::builtin()
+        );
     }
 }

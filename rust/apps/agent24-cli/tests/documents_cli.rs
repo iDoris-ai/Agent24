@@ -3,18 +3,21 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+use std::process::Command;
+
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
 fn agent24(home: &std::path::Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_agent24"));
-    cmd.env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+    let mut cmd = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24"));
+    cmd.env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home);
     cmd
 }

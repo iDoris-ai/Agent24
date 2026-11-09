@@ -1,5 +1,8 @@
 #![allow(clippy::unwrap_used)]
-use std::{fs, process::Command};
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
+use std::fs;
 
 #[test]
 fn package_integrity_cli_generates_verifies_and_reports_relative_failure() {
@@ -9,7 +12,7 @@ fn package_integrity_cli_generates_verifies_and_reports_relative_failure() {
     fs::copy(current, dir.path().join("bin/demo")).unwrap();
     fs::write(dir.path().join("domain-os.yml"), "name: demo\nversion: '1.0.0'\nroute_namespace: /api/v1/demo\nevent_module: demo\ndata_dir: ~/.agent24/os/demo/\nkernel_capabilities: [events]\nimpl_kind: out_of_process_provider\nspawn:\n  command: bin/demo\n").unwrap();
     let run = |action: &str| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agent24"));
+        let mut cmd = signature_command::command(env!("CARGO_BIN_EXE_agent24"));
         cmd.args(["package-integrity", action, "--root"])
             .arg(dir.path());
         if action == "generate" {
@@ -35,7 +38,7 @@ fn package_integrity_cli_generates_verifies_and_reports_relative_failure() {
         std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
         for suffix in ["", "/", "/."] {
             for action in ["verify", "generate"] {
-                let mut command = Command::new(env!("CARGO_BIN_EXE_agent24"));
+                let mut command = signature_command::command(env!("CARGO_BIN_EXE_agent24"));
                 command
                     .args(["package-integrity", action, "--root"])
                     .arg(format!("{}{suffix}", alias.display()));
@@ -60,7 +63,7 @@ fn package_integrity_cli_generates_verifies_and_reports_relative_failure() {
 
 #[test]
 fn package_integrity_cli_rejects_unknown_arch() {
-    let output = Command::new(env!("CARGO_BIN_EXE_agent24"))
+    let output = signature_command::command(env!("CARGO_BIN_EXE_agent24"))
         .args([
             "package-integrity",
             "generate",
@@ -98,7 +101,7 @@ fn package_integrity_cli_generates_x86_64_but_verifies_host_arch() {
     fs::write(dir.path().join("bin/demo"), macho).unwrap();
     fs::write(dir.path().join("domain-os.yml"), "name: demo\nversion: '1.0.0'\nroute_namespace: /api/v1/demo\nevent_module: demo\ndata_dir: ~/.agent24/os/demo/\nkernel_capabilities: [events]\nimpl_kind: out_of_process_provider\nspawn:\n  command: bin/demo\n").unwrap();
     let run = |action: &str, extra: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_agent24"))
+        signature_command::command(env!("CARGO_BIN_EXE_agent24"))
             .args(["package-integrity", action, "--root"])
             .arg(dir.path())
             .args(extra)

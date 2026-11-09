@@ -64,6 +64,16 @@ pub enum IntegrityError {
     /// mismatch and not a damaged tree: the package must not be discovered
     /// or spawned.
     Cancelled,
+    SignatureInvalid {
+        path: String,
+    },
+    NotarizationFailed {
+        path: String,
+    },
+    UntrustedTeam {
+        path: String,
+        team: String,
+    },
     NotNativeExecutable {
         path: String,
     },
@@ -72,6 +82,18 @@ pub enum IntegrityError {
 impl fmt::Display for IntegrityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SignatureInvalid { path } => write!(
+                f,
+                "signature_invalid: {path} (requires Developer ID and Hardened Runtime)"
+            ),
+            Self::NotarizationFailed { path } => write!(
+                f,
+                "notarization_failed: {path}; Gatekeeper could not confirm notarization; 刚公证的包可能需几分钟，请稍后重试"
+            ),
+            Self::UntrustedTeam { path, team } => write!(
+                f,
+                "untrusted_team: {path}: {team}; 如信任该开发者：agent24 os trust-team {team}"
+            ),
             Self::Missing => f.write_str("integrity_manifest_missing"),
             Self::HashMismatch { path } => write!(f, "hash_mismatch: {path}"),
             Self::ManifestInvalid { detail } => {

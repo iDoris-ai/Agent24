@@ -3,6 +3,9 @@
 //! B2 scope: serve skeleton — `/api/v1/health`, bearer-token handshake via a
 //! ready pipe, dynamic port, CancellationToken-driven graceful shutdown.
 
+#[cfg(all(feature = "test-support", not(debug_assertions)))]
+compile_error!("test-support must not be enabled in release builds");
+
 mod agentear_timings;
 mod approval_callback;
 mod approvals;
