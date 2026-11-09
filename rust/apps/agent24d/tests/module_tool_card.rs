@@ -338,7 +338,17 @@ fn discovery_signature_opt_in_is_explicit_in_the_real_daemon() {
     // Refused at discovery: the package is not mounted at all. (The typed
     // refusal reason on /api/v1/components arrives with S1-9 PR-3c.)
     let (_, modules) = get(&refused, "/api/v1/os");
-    assert_eq!(modules["modules"], serde_json::json!([]), "{modules}");
+    // PR-3c lists an integrity refusal on /os instead of omitting the row.
+    // The detail is the reason code plus the public message; both are
+    // `signature_rejected` for an ad-hoc fixture when the opt-in is off.
+    let rows = modules["modules"].as_array().expect("modules");
+    assert_eq!(rows.len(), 3, "{modules}");
+    for row in rows {
+        assert_eq!(row["state"], "refused", "{row}");
+        let detail = row["detail"].as_str().unwrap_or("");
+        assert!(detail.starts_with("signature_rejected"), "{detail}");
+        assert!(!detail.contains("codesign"), "{detail}");
+    }
     drop(refused);
     let accepted = start(home.path());
     running_card(&accepted);

@@ -126,7 +126,13 @@ impl Policy {
 fn accept_adhoc_signatures() -> bool {
     #[cfg(debug_assertions)]
     {
-        std::env::var_os("A24_TEST_ACCEPT_ADHOC_SIGNATURES").is_some_and(|value| value == "1")
+        match std::env::var_os("A24_TEST_ACCEPT_ADHOC_SIGNATURES") {
+            Some(value) => value == "1",
+            // Crate tests sign fixtures ad-hoc. A debug daemon that links this
+            // library is not `cfg(test)`, so it still refuses them unless the
+            // child process sets the variable. The name stays in this cfg.
+            None => cfg!(test),
+        }
     }
     #[cfg(not(debug_assertions))]
     {
@@ -339,17 +345,22 @@ mod macos_tests {
             verifier: recorder.clone(),
             trust_file: None,
         };
+        let err = crate::package_integrity::verify_with_policy(
+            root.path(),
+            &manifest,
+            &CancellationToken::new(),
+            &policy,
+            VerifyMode::AtRest,
+        )
+        .unwrap_err();
         assert!(
-            crate::package_integrity::verify_with_policy(
-                root.path(),
-                &manifest,
-                &CancellationToken::new(),
-                &policy,
-                VerifyMode::AtRest
-            )
-            .is_err()
+            matches!(err, IntegrityError::Missing),
+            "a missing integrity manifest must not reach the signature policy: {err}"
         );
-        assert_eq!(*recorder.calls.lock().unwrap(), [false]);
+        assert!(
+            recorder.calls.lock().unwrap().is_empty(),
+            "signature policy is not a substitute for the required manifest"
+        );
     }
     #[cfg(debug_assertions)]
     #[test]
@@ -399,9 +410,11 @@ mod macos_tests {
         assert_eq!(scan.found.len(), 1, "{:?}", scan.refused);
         crate::discovery::recheck_with_policy(&package, &scan.found[0].digest, &cancel, &policy)
             .unwrap();
+        let one = crate::discovery::scan_one_with_policy(&package, &cancel, &policy);
+        assert_eq!(one.found.len(), 1, "{:?}", one.refused);
         let installed = temp.path().join("installed");
         crate::install::install_with_policy(&package, &installed, &policy).unwrap();
-        assert_eq!(*recorder.calls.lock().unwrap(), [false, false, true]);
+        assert_eq!(*recorder.calls.lock().unwrap(), [false, false, false, true]);
         recorder.reject.store(true, Ordering::SeqCst);
         let refused = temp.path().join("refused");
         let error = crate::install::install_with_policy(&package, &refused, &policy).unwrap_err();

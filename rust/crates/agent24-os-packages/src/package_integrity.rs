@@ -19,16 +19,15 @@ use tokio_util::sync::CancellationToken;
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Read a package that may or may not declare integrity.
-///
-/// Absence is success. Presence runs the full shared check and refuses a
-/// broken package. This is the PR-1 hook; PR-3 replaces it with a required check.
+/// Full integrity check. A package with no `integrity` section is
+/// [`IntegrityError::Missing`]. There is no optional mode and no
+/// environment or feature switch that turns the check off.
 ///
 /// `cancel` is the caller's shutdown token. A fired token is
 /// [`IntegrityError::Cancelled`]: the hash did not finish, so this is not a
 /// hash mismatch and not a successful check. Every scan still hashes the
 /// whole tree; nothing is skipped because a stat tuple matched.
-pub fn verify_if_present(
+pub fn verify_required(
     dir: &Path,
     manifest: &DomainOsManifest,
     cancel: &CancellationToken,
@@ -58,7 +57,7 @@ pub fn verify_with_policy(
     )
 }
 
-fn verify_if_present_for_arch(
+fn verify_required_for_arch(
     dir: &Path,
     manifest: &DomainOsManifest,
     cancel: &CancellationToken,
@@ -81,12 +80,9 @@ fn verify_contents(
         return Err(IntegrityError::Cancelled);
     }
     let Some(declared) = manifest.integrity() else {
-        // Legacy manifests still need host signature authorization. Omitting
-        // the optional hash manifest must not bypass executable verification.
-        if let (Some((policy, mode)), Some(spawn)) = (signature, manifest.spawn()) {
-            policy.verify(dir, &spawn.command, mode, cancel)?;
-        }
-        return Ok(());
+        // Integrity is required. A package with `spawn.command` and no
+        // manifest is `Missing`; signature policy is not a substitute.
+        return Err(IntegrityError::Missing);
     };
     verify_declared(
         dir,
@@ -111,7 +107,7 @@ pub fn verify(root: &Path) -> Result<(), IntegrityError> {
 /// `package-integrity verify --arch`: the release script's self-check of a
 /// package built for another CPU architecture. Discovery, recheck and
 /// installation never come through here; they always use the host
-/// architecture (`verify_if_present`).
+/// architecture (`verify_required`).
 pub fn verify_for_arch(root: &Path, arch: &str) -> Result<(), IntegrityError> {
     check_target_arch(arch)?;
     ensure_real_directory(root)?;
@@ -123,12 +119,10 @@ pub fn verify_for_arch(root: &Path, arch: &str) -> Result<(), IntegrityError> {
         DomainOsManifest::from_yaml(text).map_err(|err| IntegrityError::ManifestInvalid {
             detail: err.to_string(),
         })?;
-    match manifest.integrity() {
-        None => Err(IntegrityError::Missing),
-        // One-shot CLI. The daemon passes its shutdown token through
-        // `discovery::scan` / `recheck`, not through this entry.
-        Some(_) => verify_if_present_for_arch(root, &manifest, &CancellationToken::new(), arch),
-    }
+    // One-shot CLI. The daemon passes its shutdown token through
+    // `discovery::scan` / `recheck`, not through this entry. Absence is
+    // [`IntegrityError::Missing`] inside `verify_required_for_arch`.
+    verify_required_for_arch(root, &manifest, &CancellationToken::new(), arch)
 }
 
 /// Normalize `root` and write `files.json` plus the `integrity` section.
@@ -303,10 +297,12 @@ fn verify_declared(
     integrity::validate_section(section, spawn_command)?;
     let path = dir.join(FILES_JSON_NAME);
     let metadata = fs::symlink_metadata(&path).map_err(|err| {
+        // §4: a missing `files.json` is the same refusal as a missing
+        // `integrity` section. `ManifestInvalid` would surface as
+        // `integrity_manifest_invalid` and the desktop would ask for a reinstall
+        // instead of an upgrade.
         if err.kind() == io::ErrorKind::NotFound {
-            IntegrityError::ManifestInvalid {
-                detail: format!("missing control file: {FILES_JSON_NAME}"),
-            }
+            IntegrityError::Missing
         } else {
             IntegrityError::CheckFailed {
                 detail: format!("{FILES_JSON_NAME}: {err}"),
@@ -1178,12 +1174,13 @@ mod tests {
         }
     }
 
-    /// T4. Discovery keeps an old package, including one with extra files.
-    /// A package that declares integrity and then changes a payload file is
-    /// refused, and a sibling package is still returned. `verify` on the old
-    /// package stays strict.
+    /// T4, after PR-3 required the manifest. An old package with no integrity
+    /// section is refused as `integrity_manifest_missing`. A sibling that
+    /// declares integrity is still discovered. `verify` on the old package
+    /// stays strict. Restoring the optional "no integrity means success"
+    /// path makes the old package show up in `found` and this test fails.
     #[test]
-    fn t4_old_package_is_readable_and_a_damaged_new_package_is_refused() {
+    fn t4_old_package_is_refused_and_a_damaged_new_package_is_refused() {
         let parent = tempfile::tempdir().unwrap();
         let old = parent.path().join("oldmod");
         fs::create_dir_all(old.join("bin")).unwrap();
@@ -1196,34 +1193,44 @@ mod tests {
         write_tree(&new_package, "newmod");
         generate(&new_package, &["bin/newmod".into(), "bin/helper".into()]).unwrap();
 
-        let first = crate::test_support::scan(parent.path(), &CancellationToken::new());
-        let old_found = first
-            .found
+        let first = crate::discovery::scan(parent.path(), &CancellationToken::new());
+        let old_refused = first
+            .refused
             .iter()
-            .find(|found| found.manifest.name() == "oldmod")
-            .unwrap();
+            .find(|refused| refused.dir.ends_with("oldmod"))
+            .expect("old package was not refused");
+        assert_eq!(
+            old_refused.integrity,
+            Some(agent24_components::integrity::IntegrityReason::ManifestMissing)
+        );
+        assert_eq!(
+            old_refused.declared.as_ref().map(|(name, _)| name.as_str()),
+            Some("oldmod")
+        );
+        assert!(
+            first
+                .found
+                .iter()
+                .all(|found| found.manifest.name() != "oldmod")
+        );
         let new_found = first
             .found
             .iter()
             .find(|found| found.manifest.name() == "newmod")
             .unwrap();
-        assert!(
-            first
-                .found
-                .iter()
-                .any(|found| found.manifest.name() == "oldmod"),
-            "old package refused: {:?}",
-            first.refused
+        let old_recheck =
+            crate::discovery::recheck(&old, "sha256:unused", &CancellationToken::new())
+                .unwrap_err();
+        assert_eq!(
+            old_recheck.integrity(),
+            Some(agent24_components::integrity::IntegrityReason::ManifestMissing)
         );
-        crate::test_support::recheck(&old, &old_found.digest, &CancellationToken::new()).unwrap();
-        crate::test_support::recheck(&new_package, &new_found.digest, &CancellationToken::new())
+        crate::discovery::recheck(&new_package, &new_found.digest, &CancellationToken::new())
             .unwrap();
         let old_verify = verify(&old).unwrap_err();
-        assert!(
-            old_verify
-                .to_string()
-                .contains("integrity_manifest_missing"),
-            "{old_verify}"
+        assert_eq!(
+            old_verify.reason(),
+            Some(agent24_components::integrity::IntegrityReason::ManifestMissing)
         );
 
         let binary = new_package.join("bin/newmod");
@@ -1234,36 +1241,82 @@ mod tests {
         bytes[0] ^= 0x01;
         fs::write(&binary, bytes).unwrap();
 
-        let second = crate::test_support::scan(parent.path(), &CancellationToken::new());
-        assert!(
-            second
-                .found
-                .iter()
-                .any(|found| found.manifest.name() == "oldmod")
-        );
+        let second = crate::discovery::scan(parent.path(), &CancellationToken::new());
+        assert!(second.refused.iter().any(|refused| {
+            refused.dir.ends_with("oldmod")
+                && refused.integrity
+                    == Some(agent24_components::integrity::IntegrityReason::ManifestMissing)
+        }));
         assert!(
             second
                 .found
                 .iter()
                 .all(|found| found.manifest.name() != "newmod")
         );
-        let why = second
+        let damaged = second
             .refused
             .iter()
             .find(|refused| refused.dir.ends_with("newmod"))
-            .unwrap()
-            .why
-            .clone();
-        assert!(why.contains("hash_mismatch: bin/newmod"), "{why}");
-        let recheck = crate::test_support::recheck(
-            &new_package,
-            &new_found.digest,
-            &CancellationToken::new(),
-        )
-        .unwrap_err();
-        assert!(recheck.contains("hash_mismatch: bin/newmod"), "{recheck}");
-        crate::test_support::recheck(&old, &old_found.digest, &CancellationToken::new()).unwrap();
+            .unwrap();
+        assert_eq!(
+            damaged.integrity,
+            Some(agent24_components::integrity::IntegrityReason::HashMismatch)
+        );
+        assert!(
+            damaged.why.contains("hash_mismatch: bin/newmod"),
+            "{}",
+            damaged.why
+        );
+        let recheck =
+            crate::discovery::recheck(&new_package, &new_found.digest, &CancellationToken::new())
+                .unwrap_err();
+        assert_eq!(
+            recheck.integrity(),
+            Some(agent24_components::integrity::IntegrityReason::HashMismatch)
+        );
+        assert!(
+            recheck.message().contains("hash_mismatch: bin/newmod"),
+            "{recheck}"
+        );
+        assert_eq!(
+            crate::discovery::recheck(&old, "sha256:unused", &CancellationToken::new())
+                .unwrap_err()
+                .integrity(),
+            Some(agent24_components::integrity::IntegrityReason::ManifestMissing)
+        );
     }
+
+    /// §4: an `integrity` section whose `files.json` is absent is
+    /// `integrity_manifest_missing`, not `integrity_manifest_invalid`. Mapping
+    /// the missing file to `ManifestInvalid` turns this red.
+    #[test]
+    fn an_integrity_section_without_files_json_is_manifest_missing() {
+        let (parent, package) = generated("cos72");
+        fs::remove_file(package.join(FILES_JSON_NAME)).unwrap();
+        let missing = verify(&package).unwrap_err();
+        assert_eq!(
+            missing.reason(),
+            Some(agent24_components::integrity::IntegrityReason::ManifestMissing)
+        );
+        let scanned = crate::discovery::scan(parent.path(), &CancellationToken::new());
+        let refused = scanned
+            .refused
+            .iter()
+            .find(|refused| refused.dir.ends_with("cos72"))
+            .unwrap();
+        assert_eq!(
+            refused.integrity,
+            Some(agent24_components::integrity::IntegrityReason::ManifestMissing)
+        );
+        let rechecked =
+            crate::discovery::recheck(&package, "sha256:unused", &CancellationToken::new())
+                .unwrap_err();
+        assert_eq!(
+            rechecked.integrity(),
+            Some(agent24_components::integrity::IntegrityReason::ManifestMissing)
+        );
+    }
+
     #[test]
     fn t3_control_directory_special_file_and_non_utf8_boundaries() {
         for name in [DOMAIN_OS_YML, FILES_JSON_NAME, "bin/cos72", "bin"] {
@@ -1354,7 +1407,7 @@ mod tests {
         let flag = cancel.clone();
         super::arm_files_json_checked(move || flag.cancel());
         let _clear = FilesJsonHookGuard;
-        let err = verify_if_present(&package, &manifest, &cancel).unwrap_err();
+        let err = verify_required(&package, &manifest, &cancel).unwrap_err();
         assert!(matches!(err, IntegrityError::Cancelled), "{err}");
         assert!(!err.to_string().contains("hash_mismatch"), "{err}");
     }
@@ -1630,7 +1683,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            verify_if_present(dir.path(), &manifest, &CancellationToken::new()),
+            verify_required(dir.path(), &manifest, &CancellationToken::new()),
             Err(IntegrityError::NotNativeExecutable { .. })
         ));
     }

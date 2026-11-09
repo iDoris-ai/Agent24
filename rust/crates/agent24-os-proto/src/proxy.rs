@@ -77,8 +77,8 @@ use axum::response::{IntoResponse, Response};
 use http_body_util::{BodyExt, Full, Limited};
 
 use agent24_domain::http::{
-    MAX_BODY_BYTES, RESTART_DAEMON_INSTRUCTION, error_response, error_response_with_hint,
-    read_body_or_response,
+    MAX_BODY_BYTES, RESTART_DAEMON_INSTRUCTION, error_response, error_response_d6,
+    error_response_with_hint, read_body_or_response,
 };
 
 use crate::drain::{Abandoned, Current, Generation, RequestRefused};
@@ -1358,15 +1358,24 @@ fn stopping_response(current: &Current) -> Response {
                  {RESTART_DAEMON_INSTRUCTION}"
             ),
         ),
-        Some(Status::PackageChanged { reason }) => error_response_with_hint(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "package_changed",
-            &format!(
-                "the installed package changed or became unusable since this module was \
-                 mounted: {reason}"
+        Some(Status::PackageChanged { reason, code }) => match code {
+            Some(code) => error_response_d6(
+                StatusCode::CONFLICT,
+                &format!("os_package.{code}"),
+                &reason,
+                Some(RESTART_DAEMON_INSTRUCTION),
+                false,
             ),
-            RESTART_DAEMON_INSTRUCTION,
-        ),
+            None => error_response_with_hint(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "package_changed",
+                &format!(
+                    "the installed package changed or became unusable since this module was \
+                     mounted: {reason}"
+                ),
+                RESTART_DAEMON_INSTRUCTION,
+            ),
+        },
         Some(Status::StopFailed { error }) => error_response_with_hint(
             StatusCode::SERVICE_UNAVAILABLE,
             "stop_failed",
@@ -4852,6 +4861,7 @@ mod tests {
     fn package_changed_names_the_reason_and_does_not_copy_control_plane_text() {
         let current = revoked_current_with_status(Status::PackageChanged {
             reason: "manifest digest mismatch".to_owned(),
+            code: None,
         });
         let (status, code, hint) = hint_of(stopping_response(&current));
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -4882,6 +4892,7 @@ mod tests {
     async fn a_proxied_request_to_a_package_changed_module_gets_the_real_response() {
         let current = revoked_current_with_status(Status::PackageChanged {
             reason: "manifest digest mismatch".to_owned(),
+            code: None,
         });
         let proxy = serve(mount(Router::new(), NS, current)).await;
         let got = call(proxy, Method::GET, &format!("{NS}/a"), &[], "").await;
@@ -4996,6 +5007,7 @@ mod tests {
             },
             Status::PackageChanged {
                 reason: "x".to_owned(),
+                code: None,
             },
             Status::StopFailed {
                 error: "x".to_owned(),

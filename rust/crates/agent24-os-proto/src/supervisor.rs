@@ -54,17 +54,45 @@ pub struct ModuleSpec {
     pub trampoline: Trampoline,
 }
 
-/// Re-checks a module's installed package right before restarting it
-/// (FU-61): does `spec.package_dir` still hold a package whose manifest
-/// digests to `spec.manifest_digest`? `None` if yes; `Some(reason)`
-/// (human-readable, goes straight into [`Status::PackageChanged`]) if not.
-/// Synchronous and does blocking filesystem I/O — the caller in `run_loop`
-/// runs it through `spawn_blocking`, not directly on the async task. Built
-/// in `agent24d` (the crate that depends on `agent24-os-packages` and knows
-/// the on-disk package format) and handed in as an opaque `Fn`, so this
-/// crate keeps not knowing what a "package" is beyond the `path` + `digest`
-/// it was handed once at mount time.
-pub type PackageCheck = Arc<dyn Fn(&ModuleSpec) -> Option<String> + Send + Sync>;
+/// Why a package check refused the next process.
+///
+/// `code` is one of the integrity reason codes, copied from the typed
+/// error. It is `None` for shutdown cancellation and for a failure that is
+/// not an integrity refusal. Callers must not parse `message` to recover it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageFailure {
+    pub message: String,
+    pub code: Option<&'static str>,
+}
+
+impl PackageFailure {
+    #[must_use]
+    pub fn cancelled() -> Self {
+        Self {
+            message: "cancelled".to_owned(),
+            code: None,
+        }
+    }
+
+    #[must_use]
+    pub fn message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: None,
+        }
+    }
+}
+
+/// Re-checks a module's installed package before the first spawn and again
+/// right before every restart (FU-61, S1-9): does `spec.package_dir` still
+/// hold a package whose manifest digests to `spec.manifest_digest`?
+/// `None` if yes. Synchronous and does blocking filesystem I/O — the caller
+/// in `run_loop` runs it through `spawn_blocking`, not directly on the async
+/// task. Built in `agent24d` (the crate that depends on `agent24-os-packages`
+/// and knows the on-disk package format) and handed in as an opaque `Fn`, so
+/// this crate keeps not knowing what a "package" is beyond the `path` +
+/// `digest` it was handed once at mount time.
+pub type PackageCheck = Arc<dyn Fn(&ModuleSpec) -> Option<PackageFailure> + Send + Sync>;
 
 /// How long the supervisor waits for things. Production uses [`Timings::default`];
 /// tests shorten them so a crash loop runs in milliseconds.
@@ -139,10 +167,15 @@ pub enum Status {
     /// manifest/digest that no longer matches what is on disk: for a
     /// missing directory that restart could only fail to spawn; for a
     /// changed digest it could only fail the handshake's `manifest_mismatch`
-    /// check. Either way it is not a run that backoff can fix. `reason`:
-    /// what [`PackageCheck`] said. The loop waits for its stop and then
-    /// says `Stopped`, same shape as `GaveUp`.
-    PackageChanged { reason: String },
+    /// check. Either way it is not a run that backoff can fix. `reason` is
+    /// the human text. `code` is the integrity reason when there is one,
+    /// copied from the typed error, never parsed out of `reason`.
+    /// Cancellation uses `code: None` and `reason == "cancelled"`. The loop
+    /// waits for its stop and then says `Stopped`, same shape as `GaveUp`.
+    PackageChanged {
+        reason: String,
+        code: Option<&'static str>,
+    },
     /// Ended on request. Any process it ran is confirmed gone.
     Stopped,
     /// A run's process could not be confirmed gone: its stop failed, and the
@@ -627,15 +660,31 @@ async fn run_loop(
     let mut after = None;
     loop {
         attempt += 1;
-        // The scan already hashed this package. Calling `package_check` here
-        // would hash it again (up to 512 MiB) before the first process exists.
         // The shutdown token is the same predicate `recheck` uses to return
-        // "cancelled", without that second walk. A cancel that arrives while
+        // "cancelled", without a hash. A cancel that arrives while
         // `launch::spawn` is still pending is handled inside `run_once`.
         // The spawn backstop is `run_once`'s shutdown `select`. This check is
         // earlier: `run_once` binds a socket pair before that `select`.
         if attempt == 1 && shutdown.is_cancelled() {
-            end_because_package_changed(&spec, slot, status, record, &mut stop, "cancelled").await;
+            end_because_package_changed(
+                &spec,
+                slot,
+                status,
+                record,
+                &mut stop,
+                PackageFailure::cancelled(),
+            )
+            .await;
+            return;
+        }
+        // S1-9: the scan hash is not a proof of the bytes that will run.
+        // Recheck again before the first process exists, and the restart
+        // path below checks again after backoff. Skipping this call lets a
+        // file changed in the scan → spawn gap run.
+        if attempt == 1
+            && let Some(failure) = check_package(&package_check, &spec).await
+        {
+            end_because_package_changed(&spec, slot, status, record, &mut stop, failure).await;
             return;
         }
         status.send_replace(Status::Starting { attempt, after });
@@ -665,8 +714,15 @@ async fn run_loop(
                 return;
             }
             Ok(Run::Cancelled) => {
-                end_because_package_changed(&spec, slot, status, record, &mut stop, "cancelled")
-                    .await;
+                end_because_package_changed(
+                    &spec,
+                    slot,
+                    status,
+                    record,
+                    &mut stop,
+                    PackageFailure::cancelled(),
+                )
+                .await;
                 return;
             }
             Ok(Run::Ended {
@@ -718,8 +774,8 @@ async fn run_loop(
                 // `RestartPolicy` failure: it skips the decision of
                 // whether to spawn again, it does not produce a new run or
                 // a new `RunFailure`.
-                if let Some(reason) = check_package(&package_check, &spec).await {
-                    end_because_package_changed(&spec, slot, status, record, &mut stop, reason)
+                if let Some(failure) = check_package(&package_check, &spec).await {
+                    end_because_package_changed(&spec, slot, status, record, &mut stop, failure)
                         .await;
                     return;
                 }
@@ -757,13 +813,20 @@ async fn end_because_package_changed(
     status: &watch::Sender<Status>,
     record: &crate::stop_record::StopRecordHandle,
     stop: &mut watch::Receiver<Option<Duration>>,
-    reason: impl Into<String>,
+    failure: PackageFailure,
 ) {
     use crate::stop_record::ProcessAtStop;
-    let reason = reason.into();
-    tracing::error!(module = %spec.name, %reason, "not spawning: package check failed");
+    tracing::error!(
+        module = %spec.name,
+        reason = %failure.message,
+        code = failure.code,
+        "not spawning: package check failed"
+    );
     slot.retire();
-    status.send_replace(Status::PackageChanged { reason });
+    status.send_replace(Status::PackageChanged {
+        reason: failure.message,
+        code: failure.code,
+    });
     stop_requested(stop).await;
     saw_stop(record, stop, ProcessAtStop::None);
     slot.stopped(status);
@@ -776,12 +839,16 @@ async fn end_because_package_changed(
 /// itself. A panicked closure is reported as a package-changed reason
 /// rather than propagated — this check must never bring the supervisor
 /// loop down.
-async fn check_package(check: &PackageCheck, spec: &ModuleSpec) -> Option<String> {
+async fn check_package(check: &PackageCheck, spec: &ModuleSpec) -> Option<PackageFailure> {
     let check = check.clone();
     let spec = spec.clone();
     tokio::task::spawn_blocking(move || check(&spec))
         .await
-        .unwrap_or_else(|e| Some(format!("the package check panicked: {e}")))
+        .unwrap_or_else(|e| {
+            Some(PackageFailure::message(format!(
+                "the package check panicked: {e}"
+            )))
+        })
 }
 
 /// A run's process could not be confirmed gone: its stop failed.
@@ -2633,7 +2700,8 @@ sys.exit(0)
         };
         let package_dir = f.spec.package_dir.clone();
         let package_check: PackageCheck = Arc::new(move |spec| {
-            (!spec.package_dir.exists()).then(|| "the package directory is gone".to_owned())
+            (!spec.package_dir.exists())
+                .then(|| PackageFailure::message("the package directory is gone"))
         });
         let handle = sup_checked(
             f.spec.clone(),
@@ -2684,7 +2752,7 @@ sys.exit(0)
         let package_check: PackageCheck = Arc::new(move |spec| {
             let current = std::fs::read_to_string(spec.package_dir.join("digest.txt")).ok();
             (current.as_deref() != Some("sha256:original"))
-                .then(|| "the manifest changed".to_owned())
+                .then(|| PackageFailure::message("the manifest changed"))
         });
         let current = Current::new(Generation::starting());
         let timings = Timings {
@@ -2754,10 +2822,14 @@ sys.exit(0)
             )
         })
         .await;
-        let Status::PackageChanged { reason } = &status else {
+        let Status::PackageChanged { reason, code } = &status else {
             panic!("spawned on a cancelled shutdown: {status:?}");
         };
         assert_eq!(reason, "cancelled");
+        assert!(
+            code.is_none(),
+            "cancel is not an integrity refusal: {code:?}"
+        );
         assert!(starts(f.data.path()).is_empty(), "the module ran");
         // `run_once` binds this pair before its shutdown `select`. The
         // attempt-1 check is what keeps the bind from happening; the select
@@ -2768,6 +2840,45 @@ sys.exit(0)
             0,
             "a cancelled first attempt bound a socket pair"
         );
+        stop(handle).await;
+    }
+
+    /// T7. The package check fails before any process exists. Removing the
+    /// `attempt == 1` check lets this fixture reach `Running` or write a
+    /// start line.
+    #[tokio::test]
+    async fn t7_a_failing_check_on_the_first_attempt_does_not_spawn() {
+        let f = fixture("normal");
+        let current = Current::new(Generation::starting());
+        let package_check: PackageCheck = Arc::new(|_| {
+            Some(PackageFailure {
+                message: "hash_mismatch: bin/mod".to_owned(),
+                code: Some("hash_mismatch"),
+            })
+        });
+        let handle = sup_checked(
+            f.spec.clone(),
+            f.dir.clone(),
+            current,
+            no_methods(),
+            fast(),
+            package_check,
+        );
+        let mut rx = handle.subscribe();
+        let status = until(&mut rx, "first check settled", |s| {
+            matches!(
+                s,
+                Status::PackageChanged { .. } | Status::Running | Status::Backoff { .. }
+            )
+        })
+        .await;
+        let Status::PackageChanged { reason, code } = &status else {
+            panic!("spawned despite the first check: {status:?}");
+        };
+        assert_eq!(reason, "hash_mismatch: bin/mod");
+        assert_eq!(*code, Some("hash_mismatch"));
+        assert!(starts(f.data.path()).is_empty(), "the module ran");
+        assert_eq!(f.dir.generations_issued(), 0);
         stop(handle).await;
     }
 
@@ -2826,10 +2937,14 @@ sys.exit(0)
             )
         })
         .await;
-        let Status::PackageChanged { reason } = &status else {
+        let Status::PackageChanged { reason, code } = &status else {
             panic!("restarted after shutdown: {status:?}");
         };
         assert_eq!(reason, "cancelled");
+        assert!(
+            code.is_none(),
+            "cancel is not an integrity refusal: {code:?}"
+        );
         assert_eq!(
             spawned.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -2880,10 +2995,14 @@ sys.exit(0)
             )
         })
         .await;
-        let Status::PackageChanged { reason } = &status else {
+        let Status::PackageChanged { reason, code } = &status else {
             panic!("entered the handshake after a cancel during spawn: {status:?}");
         };
         assert_eq!(reason, "cancelled");
+        assert!(
+            code.is_none(),
+            "cancel is not an integrity refusal: {code:?}"
+        );
         assert_ne!(
             current.get().state(),
             crate::drain::DrainState::Running,

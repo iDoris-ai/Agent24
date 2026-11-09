@@ -34,7 +34,9 @@ const ok = (schema: string, doc: unknown) => expect(v[schema](doc), JSON.stringi
 const err = (code: string, details: Record<string, unknown> = { retryable: false }) => ({ error: { code, message: 'm', details } })
 
 describe('import and job routes', () => {
-  const proxy = { '500': 'DocumentsProxyFailure', '502': 'DocumentsProxyFailure', '503': 'DocumentsUnavailable', '504': 'DocumentsProxyFailure' }
+  // 409 os_package.<reason>: the kernel proxy refuses a package that failed its
+  // integrity check (S1-9). A route with its own 409 keeps that one (see `errors`).
+  const proxy = { '409': 'OsPackageConflict', '500': 'DocumentsProxyFailure', '502': 'DocumentsProxyFailure', '503': 'DocumentsUnavailable', '504': 'DocumentsProxyFailure' }
   const routes: Array<[string, string, string, Record<string, string>]> = [
     ['/documents/imports', 'post', 'documentsImport', { '400': 'DocumentsBadRequest', '404': 'DocumentsNotFound', '422': 'DocumentsImportUnprocessable' }],
     ['/documents/jobs/{job_id}', 'get', 'documentsGetJob', { '400': 'DocumentsBadRequest', '404': 'DocumentsNotFound' }],
@@ -47,7 +49,7 @@ describe('import and job routes', () => {
       const op = openapi.paths[path]?.[method]
       expect(op?.operationId, `${method} ${path}`).toBe(operationId)
       expect(op.tags).toEqual(['documents'])
-      for (const [status, response] of Object.entries({ ...errors, ...proxy })) {
+      for (const [status, response] of Object.entries({ ...proxy, ...errors })) {
         expect(op.responses[status]?.$ref, `${path} ${status}`).toBe(`#/components/responses/${response}`)
       }
     }

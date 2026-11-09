@@ -32,6 +32,32 @@ fn workspace_recovery_instant_at(
 // watchdog after all of them — live in `crate::lifecycle` (SHUT-1b). At the
 // defaults `kill -TERM` ends the process within 16.5s, or about 50.6s while a managed iDoris holds the summary open (ADR-038 D5 raised the stop grace to 15s; TASKS B2's 2s now holds only with a lowered grace).
 
+/// Test seam: park the first enable rescan, and record whether the config
+/// write still holds `os_control`.
+#[cfg(test)]
+pub(crate) struct OsEnableProbe {
+    pub park_first_rescan: std::sync::atomic::AtomicBool,
+    pub rescans: std::sync::atomic::AtomicUsize,
+    pub rescan_entered: tokio::sync::Notify,
+    pub release_rescan: tokio::sync::Notify,
+    pub write_saw_lock: std::sync::atomic::AtomicBool,
+    pub writes: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl OsEnableProbe {
+    fn new() -> Self {
+        Self {
+            park_first_rescan: std::sync::atomic::AtomicBool::new(false),
+            rescans: std::sync::atomic::AtomicUsize::new(0),
+            rescan_entered: tokio::sync::Notify::new(),
+            release_rescan: tokio::sync::Notify::new(),
+            write_saw_lock: std::sync::atomic::AtomicBool::new(false),
+            writes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub os_signature: agent24_os_packages::signature::Policy,
@@ -89,6 +115,12 @@ pub struct AppState {
     /// `agent24 os enable` needs a name to act on and a module that only appeared
     /// once it was already on could never be turned on.
     pub os_reports: Arc<Vec<crate::domain::MountReport>>,
+    /// Enable's rescan replaces one module's startup outcome. `os_reports` is
+    /// shared as an immutable snapshot; this map is the live refusal record
+    /// `/components` and the next enable read. A name absent here still uses
+    /// the snapshot.
+    pub os_outcome_overrides:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, crate::domain::MountOutcome>>>,
     /// Namespaces that were actually mounted (including disabled and degraded).
     /// Capability auth uses this when axum did not record a `MatchedPath`
     /// (`nest_service` / fallback nests). Refused mounts are absent. Empty
@@ -129,13 +161,18 @@ pub struct AppState {
     /// How module tool decisions are taken; `None` (the default, and always
     /// on an ephemeral daemon) answers every decision 403.
     pub module_grants: Option<crate::consent_routes::GrantSettings>,
-    /// Held across the config write and the hand-off of a hot disable's stop
-    /// in `PATCH /api/v1/os/{name}` — not across the wait that follows — so
-    /// concurrent toggles are applied in one order (SUP-5). The list a PATCH
-    /// answers with is rendered after, and shows the state then. A module
-    /// tool decision holds it from its checks to its write, and a stop for
-    /// the whole stop, so neither lands inside the other (K1-6a-G §2.1 F7).
+    /// Held across an enable's rescan, refusal-record update, and config
+    /// write (the rescan runs only after the lock is taken), and across a
+    /// disable's config write plus the hand-off of its stop — not across
+    /// the wait that follows — so concurrent toggles run in one order
+    /// (SUP-5, PR-3c). The list a PATCH answers with is rendered after.
+    /// A module tool decision holds it from its checks to its write, and a
+    /// stop for the whole stop (K1-6a-G §2.1 F7).
     pub os_control: Arc<tokio::sync::Mutex<()>>,
+    /// Test seam for "rescan and the config write share one `os_control`
+    /// hold". Production builds do not carry it.
+    #[cfg(test)]
+    pub(crate) os_enable_probe: Arc<OsEnableProbe>,
     /// What `GET /api/v1/shutdown` answers — fixed at start-up (SHUT-1c).
     pub shutdown_report: Arc<agent24_protocol::ShutdownReport>,
     pub runs: Arc<agent24_agent::RunManager>,
@@ -749,6 +786,7 @@ impl AppState {
             // assignment is ordered ahead of router construction rather than left
             // to chance.
             os_reports: Arc::new(Vec::new()),
+            os_outcome_overrides: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             module_namespaces: Arc::new(BTreeSet::new()),
             packages_root,
             // Empty for the same reason and until the same moment as `os_reports`
@@ -759,6 +797,8 @@ impl AppState {
             module_tool_cards: None,
             module_grants: None,
             os_control: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            os_enable_probe: Arc::new(OsEnableProbe::new()),
             shutdown_report: Arc::new(crate::lifecycle::report(
                 &crate::lifecycle::Params::default(),
                 &[],
@@ -776,6 +816,36 @@ impl AppState {
 }
 
 impl AppState {
+    /// The outcome enable and `/components` should show. The override wins
+    /// when a rescan has replaced the startup snapshot.
+    pub(crate) fn os_outcome(
+        &self,
+        name: &str,
+        fallback: &crate::domain::MountOutcome,
+    ) -> crate::domain::MountOutcome {
+        self.os_outcome_overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| fallback.clone())
+    }
+
+    pub(crate) fn set_os_outcome(&self, name: &str, outcome: crate::domain::MountOutcome) {
+        self.os_outcome_overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.to_owned(), outcome);
+    }
+
+    /// Drop a rescan overlay so the startup snapshot shows again.
+    pub(crate) fn clear_os_outcome(&self, name: &str) {
+        self.os_outcome_overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name);
+    }
+
     fn enable_capability_auth(&mut self, store: crate::capabilities::CapabilityStore) {
         self.token = Arc::new(String::new());
         self.auth_mode = AuthMode::Capabilities;
@@ -2245,21 +2315,27 @@ pub async fn serve(
     // Hashing a package is blocking filesystem I/O (up to 512 MiB). The
     // shutdown token stops it; a cancelled package is left out of the
     // catalogue, so it is not registered and not spawned.
-    let catalogue = catalogue_from_join(
+    let discovered = catalogue_from_join(
         tokio::task::spawn_blocking({
             let packages_root = StdArc::clone(&packages_root);
             let cancel = cancel.clone();
             move || {
-                with_discovered_policy(
-                    Vec::new(),
-                    packages_root.as_ref(),
-                    &cancel,
-                    &os_signature_policy(),
-                )
+                let policy = os_signature_policy();
+                let mut pass =
+                    with_discovered_policy(Vec::new(), packages_root.as_ref(), &cancel, &policy);
+                // Same check `mount_package` repeats before routes. Doing it
+                // here is what keeps a package that changed after scan off
+                // the tool registry. The policy is the one the scan just used.
+                let dropped =
+                    crate::domain::retain_rechecked(&mut pass.catalogue, &cancel, &policy);
+                pass.integrity_refusals.extend(dropped);
+                pass
             }
         })
         .await,
     )?;
+    let catalogue = discovered.catalogue;
+    let integrity_refusals = discovered.integrity_refusals;
 
     // M-E/E1b: mount external MCP servers from ~/.agent24/mcp.json and register
     // their tools. Registered with `with()` so they are dispatchable, while
@@ -2932,7 +3008,7 @@ pub async fn serve(
         events: state.events.clone(),
         timings: state.timings.clone(),
     };
-    let (module_routes, reports, partitions) = crate::domain::mount_all(
+    let (module_routes, mut reports, partitions) = crate::domain::mount_all_with_refusals(
         &catalogue,
         &os_root,
         &state.events,
@@ -2941,6 +3017,7 @@ pub async fn serve(
         lease.as_ref(),
         host.as_ref().map_err(String::as_str),
         &state.module_approval_broker,
+        &integrity_refusals,
         crate::domain::CallbackDeps {
             scheduler: state.scheduler.clone(),
             // ME4-4.2.2b2 (design §2.4/§10.1): `router` is the SAME kernel
@@ -2961,6 +3038,9 @@ pub async fn serve(
         },
     )
     .await;
+    let (refusal_rows, package_dirs) =
+        package_dirs_for_startup(&catalogue, &integrity_refusals, &reports);
+    reports.extend(refusal_rows);
 
     // ME4-1.3.1 (design §4.6): right after `mount_all` returns — before the
     // tick loop or the delivery pump ever run — set the two handles they and
@@ -3098,20 +3178,9 @@ pub async fn serve(
             .map(|report| report.namespace.clone())
             .collect(),
     );
-    // T8/ME-3g: same ordering reason as `os_reports` just above — `catalogue`
-    // is still in scope (only borrowed by `mount_all`, never moved), so this is
-    // a cheap O(n) derivation, not a second discovery pass.
-    state.package_dirs = Arc::new(
-        catalogue
-            .iter()
-            .filter_map(|entry| match &entry.build {
-                crate::domain::Build::Package(package) => {
-                    Some((entry.name.clone(), package.dir.clone()))
-                }
-                crate::domain::Build::InProcess(_) => None,
-            })
-            .collect(),
-    );
+    // Includes integrity refusals, keyed by the component name, so enable can
+    // rescan a package that never entered the catalogue.
+    state.package_dirs = Arc::new(package_dirs);
     state.module_status = Arc::new(
         host.as_ref()
             .map(|h| h.supervisors.statuses())
@@ -3872,25 +3941,55 @@ fn os_signature_policy() -> agent24_os_packages::signature::Policy {
     }
 }
 
+struct DiscoveryPass {
+    catalogue: Vec<crate::domain::Installed>,
+    /// Integrity refusals whose directory is a package, not the packages root.
+    /// The root's own unreadability stays a log line: it is not a component.
+    integrity_refusals: Vec<agent24_os_packages::discovery::Refused>,
+}
+
+/// Catalogue directories plus the directory of each integrity refusal, under
+/// the component name [`crate::domain::integrity_refusal_reports`] assigned.
+/// Enable rescans that directory. A mounted name keeps the catalogue path.
+fn package_dirs_for_startup(
+    catalogue: &[crate::domain::Installed],
+    integrity_refusals: &[agent24_os_packages::discovery::Refused],
+    mounted: &[crate::domain::MountReport],
+) -> (
+    Vec<crate::domain::MountReport>,
+    std::collections::HashMap<String, std::path::PathBuf>,
+) {
+    let rows = crate::domain::integrity_refusal_reports(integrity_refusals, mounted);
+    let mut dirs = std::collections::HashMap::new();
+    for entry in catalogue {
+        if let crate::domain::Build::Package(package) = &entry.build {
+            dirs.insert(entry.name.clone(), package.dir.clone());
+        }
+    }
+    for (row, refused) in rows
+        .iter()
+        .zip(integrity_refusals.iter().filter(|r| r.integrity.is_some()))
+    {
+        dirs.entry(row.name.clone())
+            .or_insert_with(|| refused.dir.clone());
+    }
+    (rows, dirs)
+}
+
 #[cfg(test)]
 fn with_discovered(
     catalogue: Vec<crate::domain::Installed>,
     packages_root: &std::path::Path,
     cancel: &CancellationToken,
-) -> Vec<crate::domain::Installed> {
-    with_discovered_policy(
-        catalogue,
-        packages_root,
-        cancel,
-        &agent24_os_packages::test_support::signature_policy(),
-    )
+) -> DiscoveryPass {
+    with_discovered_policy(catalogue, packages_root, cancel, &os_signature_policy())
 }
 fn with_discovered_policy(
     mut catalogue: Vec<crate::domain::Installed>,
     packages_root: &std::path::Path,
     cancel: &CancellationToken,
     signature: &agent24_os_packages::signature::Policy,
-) -> Vec<crate::domain::Installed> {
+) -> DiscoveryPass {
     // FU-41. Checked HERE, at the one place packages are read, rather than at
     // startup: a check somewhere else can be true when it runs and false when
     // the directory is used, and this is the moment of use.
@@ -3901,9 +4000,13 @@ fn with_discovered_policy(
     // somebody else can write decides what this process executes.
     if let Err(e) = agent24_os_packages::ensure_packages_root(packages_root) {
         tracing::error!("{e}; no disk packages will be loaded this run");
-        return catalogue;
+        return DiscoveryPass {
+            catalogue,
+            integrity_refusals: Vec::new(),
+        };
     }
     let scan = agent24_os_packages::discovery::scan_with_policy(packages_root, cancel, signature);
+    let mut integrity_refusals = Vec::new();
     for dir in &scan.cancelled {
         tracing::info!(
             "domain OS package at {} was not loaded: verification cancelled",
@@ -3916,6 +4019,9 @@ fn with_discovered_policy(
             r.dir.display(),
             r.why
         );
+        if r.integrity.is_some() && r.dir.as_path() != packages_root {
+            integrity_refusals.push(r.clone());
+        }
     }
     for d in scan.found {
         let name = d.manifest.name().to_owned();
@@ -3934,12 +4040,46 @@ fn with_discovered_policy(
             })),
         });
     }
-    catalogue
+    DiscoveryPass {
+        catalogue,
+        integrity_refusals,
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    #[test]
+    fn a_refused_documents_package_is_recorded_under_that_name() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("documents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("domain-os.yml"),
+            "name: documents\nversion: \"1.2.3\"\nroute_namespace: /api/v1/documents\n\
+             event_module: documents\ndata_dir: ~/.agent24/os/documents/\n\
+             kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+             spawn:\n  command: bin/documents\n",
+        )
+        .unwrap();
+        let scan = agent24_os_packages::discovery::scan(
+            root.path(),
+            &tokio_util::sync::CancellationToken::new(),
+        );
+        let refusals: Vec<_> = scan
+            .refused
+            .into_iter()
+            .filter(|refused| refused.integrity.is_some() && refused.dir != root.path())
+            .collect();
+        let (rows, dirs) = super::package_dirs_for_startup(&[], &refusals, &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "documents");
+        assert_eq!(
+            dirs.get("documents").map(std::path::PathBuf::as_path),
+            Some(dir.as_path())
+        );
+    }
 
     #[test]
     fn workspace_recovery_clock_preserves_fractional_millis() {
@@ -4183,7 +4323,7 @@ pub(crate) mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let out = super::with_discovered(vec![built_in("sin90")], root.path(), &cancel);
-        let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
+        let names: Vec<&str> = out.catalogue.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["sin90"]);
     }
 
@@ -4200,7 +4340,7 @@ pub(crate) mod tests {
             root.path(),
             &CancellationToken::new(),
         );
-        let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
+        let names: Vec<&str> = out.catalogue.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["sin90", "cos72"]);
     }
 
@@ -4224,7 +4364,7 @@ pub(crate) mod tests {
             root.path(),
             &CancellationToken::new(),
         );
-        let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
+        let names: Vec<&str> = out.catalogue.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(
             names,
             vec!["sin90"],
@@ -4241,7 +4381,7 @@ pub(crate) mod tests {
             root.path(),
             &CancellationToken::new(),
         );
-        let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
+        let names: Vec<&str> = out.catalogue.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["sin90", "cos72"]);
     }
 
@@ -4260,9 +4400,16 @@ pub(crate) mod tests {
             root.path(),
             &CancellationToken::new(),
         );
-        assert_eq!(out.len(), 2, "both entries exist; the mounter decides");
-        assert_eq!(out[0].version, "9.9.9", "the built-in must come FIRST");
-        assert_eq!(out[1].version, "0.1.0");
+        assert_eq!(
+            out.catalogue.len(),
+            2,
+            "both entries exist; the mounter decides"
+        );
+        assert_eq!(
+            out.catalogue[0].version, "9.9.9",
+            "the built-in must come FIRST"
+        );
+        assert_eq!(out.catalogue[1].version, "0.1.0");
     }
 
     #[test]
@@ -4274,8 +4421,8 @@ pub(crate) mod tests {
             std::path::Path::new("/nonexistent/agent24-packages"),
             &CancellationToken::new(),
         );
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].name, "sin90");
+        assert_eq!(out.catalogue.len(), 1);
+        assert_eq!(out.catalogue[0].name, "sin90");
     }
 
     use super::*;
