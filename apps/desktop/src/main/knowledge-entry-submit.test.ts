@@ -213,6 +213,29 @@ describe('submit (W8.2)', () => {
     expect(t.candidates.get(d.id)?.pending).toBeNull()
   })
 
+  it('a record that cannot be read refuses the submit and sends nothing (never read as "none")', async () => {
+    const t = setup()
+    const d = t.draft()
+    fs.mkdirSync(path.join(dir, 'knowledge-candidates'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'knowledge-candidates', `${d.id}.json`), '{')
+    expect(await t.submission.submit(d.id, 'kb-2')).toMatchObject({ ok: false, reason: 'local_storage' })
+    expect(t.fake.calls).toHaveLength(0)
+  })
+
+  it('a second submit of the same draft while one is in flight is busy, and only one write goes out', async () => {
+    let release: () => void = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    const t = setup()
+    const slow = t.fake.deps.fetch
+    t.fake.deps.fetch = async (url, init) => { await gate; return slow(url, init) }
+    const d = t.draft()
+    const first = t.submission.submit(d.id, 'kb-2')
+    expect(await t.submission.submit(d.id, 'kb-2')).toEqual({ ok: false, reason: 'busy' })
+    release()
+    expect(await first).toMatchObject({ ok: true })
+    expect(t.fake.writes()).toHaveLength(1)
+  })
+
   it('a submitted or approved candidate is not submitted again', async () => {
     const t = setup()
     const d = t.draft()
@@ -249,6 +272,16 @@ describe('status and withdrawing the submission (W8.3, W8.8, HS6)', () => {
     expect(t.drafts.get(d.id)).not.toBeNull()
     // Withdrawn: a new submission is allowed again.
     expect(await t.submission.submit(d.id, 'kb-2')).toMatchObject({ ok: true })
+  })
+
+  it('only a submitted candidate can be withdrawn: a returned one is refused locally', async () => {
+    const t = setup({ status: 'returned' })
+    const d = t.draft()
+    await t.submission.submit(d.id, 'kb-2')
+    await t.submission.status(d.id)
+    const before = t.fake.calls.length
+    expect(await t.submission.retract(d.id)).toMatchObject({ ok: false, reason: 'not_found', submission: { candidate: { status: 'returned' } } })
+    expect(t.fake.calls).toHaveLength(before)
   })
 
   it('there is nothing to withdraw before it is submitted', async () => {
