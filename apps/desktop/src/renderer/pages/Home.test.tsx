@@ -10,7 +10,7 @@ describe('HomePage', () => {
   it('narrates the first stage while the backend is online', () => {
     render(<HomePage backendOk={true} {...props} />)
     expect(screen.getByRole('slider')).toHaveAttribute('aria-valuenow', '1')
-    expect(screen.getByText(/A desktop chat starts a run/)).toBeInTheDocument()
+    expect(screen.getByText(/A desktop conversation starts a run/)).toBeInTheDocument()
     expect(screen.getByText('Running :60128')).toBeInTheDocument()
   })
 
@@ -51,7 +51,7 @@ describe('HomePage', () => {
 
   it('keeps the caption quiet for screen readers while autoplaying, and announces manual steps', () => {
     render(<HomePage backendOk={true} {...props} />)
-    const caption = screen.getByText(/A desktop chat starts a run/)
+    const caption = screen.getByText(/A desktop conversation starts a run/)
     expect(caption).toHaveAttribute('aria-live', 'off')
     act(() => { fireEvent.keyDown(screen.getByRole('slider'), { key: 'ArrowRight' }) })
     expect(screen.getByText(/agent24d creates the run/)).toHaveAttribute('aria-live', 'polite')

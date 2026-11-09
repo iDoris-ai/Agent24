@@ -28,7 +28,7 @@ export interface Station {
 }
 
 export const STATIONS: readonly Station[] = [
-  { id: 'entry', n: 1, page: 'chat', box: [0, 5, 2, 2], h: 1.3 },
+  { id: 'entry', n: 1, page: 'assistant', box: [0, 5, 2, 2], h: 1.3 },
   { id: 'scheduler', n: 2, page: 'schedules', box: [0, 1, 1.6, 1.6], h: 1.1 },
   { id: 'comm', n: 3, page: 'communication', box: [0, 9.2, 1.6, 1.6], h: 0.9 },
   { id: 'daemon', n: 4, box: [4, 4.5, 3, 3], h: 1.9 },

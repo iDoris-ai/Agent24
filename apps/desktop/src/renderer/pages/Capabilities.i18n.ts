@@ -53,7 +53,7 @@ export const capabilitiesMessages = defineMessages({
     'group.domainOs': '领域 OS',
     'group.domainOs.blurb': '按需加载的领域能力',
     'group.tools': '工具',
-    'group.tools.blurb': '助手和文档可以使用的小操作',
+    'group.tools.blurb': '助理和文档可以使用的小操作',
     'group.services': '服务',
     'group.services.blurb': 'Agent24 的后台部分',
   },
