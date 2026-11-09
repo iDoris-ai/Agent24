@@ -34,6 +34,10 @@ const ID = /^[A-Za-z0-9_-]{1,128}$/
 const MAX_NAME = 200
 /** How many schedules' conversations the file keeps: the oldest goes first. */
 const MAX_BINDINGS = 1000
+/** How many full conversations of a schedule's are kept as its own (#1719 F-A). */
+const MAX_FORMER = 10
+/** chat-history.ts: a conversation with 1000 runs takes no more schedule runs. */
+const FULL = 'Too many chat history runs'
 
 export interface ScheduleConversationsDeps {
   /** Where the file goes (the app's userData). */
@@ -81,6 +85,9 @@ export interface ScheduleConversations {
 type Bindings = Record<string, string>
 interface State {
   bindings: Bindings
+  /** A schedule's conversations before its current one, which filled up
+   *  (#1719 F-A): their runs are still the schedule's, for `claim`. */
+  former: Record<string, string[]>
   /** The schedules' runs recorded already; null until the first catch-up.
    *  Each catch-up keeps only those the daemon still has, so it never holds
    *  more than the daemon does (Codex A5 r3 C1). */
@@ -96,7 +103,7 @@ const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'obj
 export function createScheduleConversations(deps: ScheduleConversationsDeps): ScheduleConversations {
   const file = path.join(deps.dir, FILE_NAME)
   const read = (): State => {
-    const none: State = { bindings: {}, handled: null, retry: [] }
+    const none: State = { bindings: {}, former: {}, handled: null, retry: [] }
     try {
       const v = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown
       if (!isObject(v) || v.format !== SCHEDULE_CONVERSATIONS_FORMAT || v.version !== SCHEDULE_CONVERSATIONS_VERSION) return none
@@ -107,7 +114,12 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
       }
       const ids = (list: unknown): string[] | null =>
         (Array.isArray(list) ? list.filter((id): id is string => typeof id === 'string' && ID.test(id)) : null)
-      return { bindings, handled: ids(v.handled), retry: ids(v.retry) ?? [] }
+      const former: Record<string, string[]> = {}
+      for (const [schedule, list] of Object.entries(isObject(v.former) ? v.former : {})) {
+        const kept = Array.isArray(list) ? list.filter((c): c is string => typeof c === 'string' && CHAT_HISTORY_ID.test(c)) : []
+        if (schedule in bindings && kept.length > 0) former[schedule] = kept
+      }
+      return { bindings, former, handled: ids(v.handled), retry: ids(v.retry) ?? [] }
     } catch {
       return none
     }
@@ -115,10 +127,13 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
   const write = (state: State): void => {
     const entries = Object.entries(state.bindings)
     const bindings = Object.fromEntries(entries.slice(Math.max(0, entries.length - MAX_BINDINGS)))
+    const former = Object.fromEntries(Object.entries(state.former)
+      .filter(([schedule]) => schedule in bindings)
+      .map(([schedule, list]) => [schedule, list.slice(-MAX_FORMER)]))
     const temp = `${file}.${randomBytes(6).toString('hex')}.tmp`
     try {
       fs.writeFileSync(temp, JSON.stringify({
-        format: SCHEDULE_CONVERSATIONS_FORMAT, version: SCHEDULE_CONVERSATIONS_VERSION, bindings, handled: state.handled, retry: state.retry,
+        format: SCHEDULE_CONVERSATIONS_FORMAT, version: SCHEDULE_CONVERSATIONS_VERSION, bindings, former, handled: state.handled, retry: state.retry,
       }))
       fs.renameSync(temp, file)
     } finally {
@@ -148,17 +163,32 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
       throw err
     }
   }
+  /** A new conversation for the schedule, now its home; `full` is the one it
+   *  replaces because it filled up, kept as the schedule's. */
+  const startConversation = async (scheduleId: string, full: string | null): Promise<string> => {
+    const name = (await deps.scheduleName(scheduleId).catch(() => null))?.trim().slice(0, MAX_NAME) || scheduleId
+    const conversation = deps.history.create({ title: deps.title(name), title_source: 'schedule' }).id
+    const state = read()
+    // Last in the file: the one kept longest when it is full.
+    delete state.bindings[scheduleId]
+    state.bindings[scheduleId] = conversation
+    if (full !== null) state.former[scheduleId] = [...(state.former[scheduleId] ?? []).filter(c => c !== full), full]
+    write(state)
+    return conversation
+  }
   const recordIn = async (state: State, scheduleId: string, runId: string): Promise<ChatHistorySummary | null> => {
     let conversation = state.bindings[scheduleId]
-    if (!onFile(conversation)) {
-      const name = (await deps.scheduleName(scheduleId).catch(() => null))?.trim().slice(0, MAX_NAME) || scheduleId
-      conversation = deps.history.create({ title: deps.title(name), title_source: 'schedule' }).id
-      // Last in the file: the one kept longest when it is full.
-      delete state.bindings[scheduleId]
-      state.bindings[scheduleId] = conversation
-      write(state)
+    if (!onFile(conversation)) conversation = await startConversation(scheduleId, null)
+    let summary: ChatHistorySummary | null
+    try {
+      summary = deps.history.appendRun(conversation, runId, 'schedule')
+    } catch (err) {
+      // Full (1000 runs): a new one takes the schedule's runs from now on.
+      // The full one keeps its runs, still the schedule's (#1719 F-A).
+      if (!(err instanceof Error && err.message === FULL)) throw err
+      conversation = await startConversation(scheduleId, conversation)
+      summary = deps.history.appendRun(conversation, runId, 'schedule')
     }
-    const summary = deps.history.appendRun(conversation, runId, 'schedule')
     // Handled once it is in its conversation; one that could not be is not,
     // and the next catch-up tries it again.
     const after = read()
@@ -205,8 +235,9 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
   /** Runs heard of live and not recorded yet, from the moment they are
    *  heard of, before their turn in the queue. */
   const heard = new Set<string>()
-  /** Runs claimed (A6) and not settled yet, with what the claim changed. */
-  const claimed = new Map<string, { handled: boolean; retry: boolean }>()
+  /** Runs claimed (A6) and not settled yet: whether they were handled
+   *  before the claim, so not A5's to record whatever the caller does. */
+  const claimed = new Map<string, { handledBefore: boolean }>()
   let queue: Promise<unknown> = Promise.resolve()
   const enqueue = <T>(job: () => Promise<T>): Promise<T> => {
     const done = queue.then(job)
@@ -225,21 +256,27 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
     claim(scheduleId, runId) {
       return enqueue(async () => {
         const state = read()
-        let held = false
-        try {
-          const record = deps.history.get(state.bindings[scheduleId]) as { runs?: { run_id?: unknown }[] } | null
-          held = record?.runs?.some(run => run.run_id === runId) ?? false
-        } catch {
-          held = false
-        }
+        // In its schedule's conversation, or one of the full ones before it (#1719 F-A).
+        const homes = [state.bindings[scheduleId], ...(state.former[scheduleId] ?? [])]
+        const held = homes.some((home) => {
+          try {
+            const record = deps.history.get(home) as { runs?: { run_id?: unknown }[] } | null
+            return record?.runs?.some(run => run.run_id === runId) ?? false
+          } catch {
+            return false
+          }
+        })
         if (held) return true
         // The first catch-up takes it as handled with the rest, once it is
         // neither to retry nor heard of; a live record of it is not made
         // (Codex A6 r3 C1). Given back if the caller cannot record it.
-        claimed.set(runId, { handled: state.handled !== null && !state.handled.includes(runId), retry: state.retry.includes(runId) })
-        heard.delete(runId)
-        const handled = state.handled === null || state.handled.includes(runId) ? state.handled : [...state.handled, runId]
+        const handledBefore = state.handled !== null && state.handled.includes(runId)
+        const handled = state.handled === null || handledBefore ? state.handled : [...state.handled, runId]
         write({ ...state, handled, retry: state.retry.filter(id => id !== runId) })
+        // Only once on file: a claim that could not be written leaves nothing
+        // reserved, and the run is A5's as before (#1719 C2).
+        claimed.set(runId, { handledBefore })
+        heard.delete(runId)
         return false
       })
     },
@@ -247,13 +284,17 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
       return enqueue(async () => {
         const was = claimed.get(runId)
         claimed.delete(runId)
-        if (!was || recorded) return
-        // The caller could not record it: it is A5's to record again, as it
-        // was before the claim (Codex A6 r3 C2).
+        if (!was || recorded || was.handledBefore) return
+        // The caller could not record it: it is A5's to record, as now
+        // things stand (Codex A6 r3 C2). Out of `handled`, which the first
+        // catch-up may have put it in while it was claimed (#1719 C1); before
+        // that catch-up, to retry, so that it does not take it as handled.
         const state = read()
-        const handled = was.handled && state.handled !== null ? state.handled.filter(id => id !== runId) : state.handled
-        const retry = was.retry && !state.retry.includes(runId) ? [...state.retry, runId] : state.retry
-        write({ ...state, handled, retry })
+        if (state.handled !== null) {
+          if (state.handled.includes(runId)) write({ ...state, handled: state.handled.filter(id => id !== runId) })
+        } else if (!state.retry.includes(runId)) {
+          write({ ...state, retry: [...state.retry, runId] })
+        }
       })
     },
     conversationOf(scheduleId) {
