@@ -38,7 +38,9 @@
 //! running — not merely when a module is enabled and not running, which would
 //! conflate a pending toggle with a module that is simply unhealthy.
 
-use agent24_domain::http::{RESTART_DAEMON_INSTRUCTION, error_response, error_response_with_hint};
+use agent24_domain::http::{
+    RESTART_DAEMON_INSTRUCTION, error_response, error_response_d6, error_response_with_hint,
+};
 use agent24_protocol::{DomainOsList, DomainOsUpdate, DomainOsView};
 use axum::Json;
 use axum::body::Body;
@@ -46,7 +48,7 @@ use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use crate::domain::{MountOutcome, MountReport, ResourceStatus};
+use crate::domain::{MountOutcome, MountReport, RefusalReason, ResourceStatus};
 use crate::routes::read_body_or_response;
 use crate::server::AppState;
 
@@ -123,12 +125,18 @@ fn view(
             // `os disable`/`enable` cannot bring the supervisor back
             // (`enable` only changes config, it does not create a new
             // supervisor in a running daemon — see the design doc).
-            Status::PackageChanged { reason } => (
+            Status::PackageChanged { reason, code } => (
                 "degraded",
-                Some(format!(
-                    "package changed: {reason} — restart the daemon to pick up the current \
-                     package (`agent24 daemon stop && agent24 daemon start`)"
-                )),
+                Some(match code {
+                    Some(code) => format!(
+                        "package changed ({code}): {reason} — restart the daemon to pick up the \
+                         current package (`agent24 daemon stop && agent24 daemon start`)"
+                    ),
+                    None => format!(
+                        "package changed: {reason} — restart the daemon to pick up the current \
+                         package (`agent24 daemon stop && agent24 daemon start`)"
+                    ),
+                }),
             ),
             Status::StopFailed { error } => ("degraded", Some(error.clone())),
             Status::Stopped => ("degraded", Some("stopped".to_owned())),
@@ -143,6 +151,9 @@ fn view(
         (MountOutcome::Mounted, None) => ("mounted", None),
         (MountOutcome::Disabled, _) => ("disabled", None),
         (MountOutcome::Degraded(why), _) => ("degraded", Some(why.clone())),
+        (MountOutcome::RefusedFor(RefusalReason::PackageIntegrity(reason), why), _) => {
+            ("refused", Some(format!("{}: {why}", reason.code())))
+        }
         (MountOutcome::Refused(why) | MountOutcome::RefusedFor(_, why), _) => {
             ("refused", Some(why.clone()))
         }
@@ -941,6 +952,18 @@ async fn patch_os_at(
             state.os_reports.iter().filter(|r| r.name == name).collect();
         if let [only] = same_name.as_slice() {
             match &only.outcome {
+                MountOutcome::RefusedFor(RefusalReason::PackageIntegrity(reason), why) => {
+                    return error_response_d6(
+                        StatusCode::CONFLICT,
+                        reason.operation_code(),
+                        why,
+                        Some(
+                            "fix the package on disk, then retry enable — this refusal is not \
+                             retried automatically",
+                        ),
+                        false,
+                    );
+                }
                 MountOutcome::Refused(why) | MountOutcome::RefusedFor(_, why) => {
                     return admission_refused_response(why);
                 }
@@ -1128,7 +1151,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use crate::domain::{MountOutcome, MountReport, ResourceStatus};
+    use crate::domain::{MountOutcome, MountReport, RefusalReason, ResourceStatus};
 
     thread_local! {
         /// Incremented on every `last_look` call — see its doc comment.
@@ -1370,6 +1393,7 @@ mod tests {
         let r = report("pkg", MountOutcome::Mounted);
         let changed = Status::PackageChanged {
             reason: "the package directory no longer exists".to_owned(),
+            code: None,
         };
         let v = view(&r, true, true, Some(&changed), None);
         assert_eq!(v.state, "degraded");
@@ -2123,6 +2147,41 @@ mod tests {
             before, after,
             "a blocked enable must not touch os.json at all, not even to leave it \
              unchanged content-wise via a rewrite"
+        );
+    }
+
+    /// T8. An integrity refusal is `os_package.<reason>` and is not retried.
+    /// Dropping the `PackageIntegrity` arm turns the code back into
+    /// `admission_refused` and omits `retryable`.
+    #[tokio::test]
+    async fn t8_integrity_enable_is_os_package_and_not_retryable() {
+        let (mut st, _dir, path) = t8_state().await;
+        st.os_reports = std::sync::Arc::new(vec![report(
+            "oldmod",
+            MountOutcome::RefusedFor(
+                RefusalReason::PackageIntegrity(
+                    agent24_components::integrity::IntegrityReason::ManifestMissing,
+                ),
+                "integrity manifest is missing".to_owned(),
+            ),
+        )]);
+        let before = std::fs::read(&path).unwrap_or_default();
+        let res = t8_patch(&st, "oldmod", true, Some(path.clone())).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let j = body_json(res).await;
+        assert_eq!(j["error"]["code"], "os_package.integrity_manifest_missing");
+        assert_eq!(j["error"]["details"]["retryable"], false);
+        assert!(!j.to_string().contains("/tmp"), "{j}");
+        let after = std::fs::read(&path).unwrap_or_default();
+        assert_eq!(before, after);
+        let listed = view(&st.os_reports[0], true, true, None, None);
+        assert_eq!(listed.state, "refused");
+        assert!(
+            listed
+                .detail
+                .unwrap()
+                .contains("integrity_manifest_missing"),
+            "the /os row must carry the same refusal"
         );
     }
 
@@ -2894,6 +2953,8 @@ mod tests {
             refused: vec![agent24_os_packages::discovery::Refused {
                 dir: packages_root.clone(),
                 why: "permission denied".to_owned(),
+                integrity: Some(agent24_components::integrity::IntegrityReason::CheckFailed),
+                declared: None,
             }],
             cancelled: Vec::new(),
         };

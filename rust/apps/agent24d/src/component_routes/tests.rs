@@ -3432,6 +3432,7 @@ fn documents_d9_states_stay_in_the_resident_subset() {
             MountOutcome::Mounted,
             Some(Supervised::PackageChanged {
                 reason: "digest".into(),
+                code: None,
             }),
             ComponentState::Failed,
             Some("package_changed"),
@@ -4438,5 +4439,155 @@ fn s1_4_components_render_hyphae_lifecycle() {
             json!(reason),
             "{process}"
         );
+    }
+}
+
+fn unsealed_package(root: &std::path::Path, name: &str) {
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("domain-os.yml"),
+        format!(
+            "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+             event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+             kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+             spawn:\n  command: bin/mod\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// T6. A fresh scan refuses an old package that has no integrity section and
+/// keeps a sealed sibling. Restoring the optional "no integrity means pass"
+/// path puts `oldmod` in `found` and this test goes red.
+#[test]
+fn t6_old_package_is_failed_and_a_sealed_sibling_stays_available() {
+    let root = tempfile::tempdir().unwrap();
+    unsealed_package(root.path(), "oldmod");
+    let good = root.path().join("goodmod");
+    std::fs::create_dir_all(&good).unwrap();
+    std::fs::write(
+        good.join("domain-os.yml"),
+        "name: goodmod\nversion: \"0.1.0\"\nroute_namespace: /api/v1/goodmod\n\
+         event_module: goodmod\ndata_dir: ~/.agent24/os/goodmod/\n\
+         kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+         spawn:\n  command: bin/mod\n",
+    )
+    .unwrap();
+    agent24_os_packages::test_support::seal_exit_stub(&good, "bin/mod").unwrap();
+    let scan = agent24_os_packages::discovery::scan(root.path(), &CancellationToken::new());
+    assert_eq!(
+        scan.found
+            .iter()
+            .map(|d| d.manifest.name())
+            .collect::<Vec<_>>(),
+        vec!["goodmod"]
+    );
+    let old = scan.refused.iter().find(|r| r.dir.ends_with("oldmod"));
+    assert!(old.is_some(), "old package was accepted");
+    let old = old.unwrap();
+    assert_eq!(
+        old.integrity,
+        Some(agent24_components::integrity::IntegrityReason::ManifestMissing)
+    );
+    let reports = crate::domain::integrity_refusal_reports(&scan.refused, &[]);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].name, "oldmod");
+    let (state, reason, _) = os_mapped(&reports[0].outcome, None);
+    assert_eq!(state, ComponentState::Failed);
+    assert_eq!(reason, Some("integrity_manifest_missing"));
+    let item = Item::new("oldmod", Form::Resident, state).with(|i| {
+        i.version = Some("0.1.0".to_owned());
+        i.reason = reason.map(str::to_owned);
+        i.provides.clear();
+    });
+    let full = render(std::slice::from_ref(&item), true);
+    assert_eq!(full["components"][0]["state"], "failed");
+    assert_eq!(
+        full["components"][0]["reason"],
+        "integrity_manifest_missing"
+    );
+    let redacted = render(&[item], false);
+    assert!(redacted["components"][0].get("reason").is_none());
+    assert!(redacted["components"][0].get("detail").is_none());
+
+    agent24_os_packages::test_support::seal_exit_stub(&root.path().join("oldmod"), "bin/mod")
+        .unwrap();
+    let again = agent24_os_packages::discovery::scan(root.path(), &CancellationToken::new());
+    assert!(
+        again.refused.iter().all(|r| !r.dir.ends_with("oldmod")),
+        "reinstall left the refusal: {:?}",
+        again.refused
+    );
+    assert!(again.found.iter().any(|d| d.manifest.name() == "oldmod"));
+}
+
+/// A manifest too damaged to trust, or one that forges a builtin name, does
+/// not take that name and does not publish its provides.
+#[test]
+fn t6_a_forged_or_unreadable_name_uses_a_directory_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let forged = root.path().join("sneaky");
+    std::fs::create_dir_all(&forged).unwrap();
+    std::fs::write(
+        forged.join("domain-os.yml"),
+        "name: idoris\nversion: \"9.9.9\"\nroute_namespace: /api/v1/idoris\n\
+         event_module: idoris\ndata_dir: ~/.agent24/os/idoris/\n\
+         kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+         spawn:\n  command: bin/mod\nprovides:\n  - id: model-gateway\n    tools: []\n",
+    )
+    .unwrap();
+    let broken = root.path().join("broken");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(broken.join("domain-os.yml"), "name: [").unwrap();
+    let scan = agent24_os_packages::discovery::scan(root.path(), &CancellationToken::new());
+    let reports = crate::domain::integrity_refusal_reports(&scan.refused, &[]);
+    let names: Vec<&str> = reports.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.iter().all(|n| *n != "idoris"), "{names:?}");
+    assert!(reports.iter().all(|r| r.d9.is_none()));
+    assert!(
+        reports
+            .iter()
+            .all(|r| r.version.is_empty() || r.name != "idoris")
+    );
+    assert!(names.iter().any(|n| n.starts_with("dir-")));
+}
+
+/// T8. Each integrity reason is `failed` for the host and absent from the
+/// redacted row. Dropping `reason`, or copying `detail` into the redacted
+/// view, turns this red.
+#[test]
+fn t8_each_integrity_reason_is_host_only() {
+    use crate::domain::RefusalReason;
+    use agent24_components::integrity::IntegrityReason;
+    for reason in [
+        IntegrityReason::ManifestMissing,
+        IntegrityReason::HashMismatch,
+        IntegrityReason::ManifestInvalid,
+        IntegrityReason::SignatureRejected,
+        IntegrityReason::CheckFailed,
+    ] {
+        let outcome = MountOutcome::RefusedFor(
+            RefusalReason::PackageIntegrity(reason),
+            format!("detail /tmp/secret stderr {}", reason.code()),
+        );
+        let (state, code, message) = os_mapped(&outcome, None);
+        assert_eq!(state, ComponentState::Failed);
+        assert_eq!(code, Some(reason.code()));
+        let item = Item::new("pkg", Form::Resident, state).with(|i| {
+            i.version = Some("1".to_owned());
+            i.reason = code.map(str::to_owned);
+            i.detail = message.map(|text| json!({"message": text}));
+        });
+        let full = render(std::slice::from_ref(&item), true);
+        assert_eq!(full["components"][0]["state"], "failed");
+        assert_eq!(full["components"][0]["reason"], reason.code());
+        assert_ne!(full["components"][0]["state"], "absent");
+        assert_ne!(full["components"][0]["state"], "incompatible");
+        let redacted = render(&[item], false).to_string();
+        assert!(!redacted.contains("reason"), "{redacted}");
+        assert!(!redacted.contains("detail"), "{redacted}");
+        assert!(!redacted.contains("/tmp"), "{redacted}");
+        assert!(!redacted.contains("stderr"), "{redacted}");
     }
 }

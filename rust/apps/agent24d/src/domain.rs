@@ -539,6 +539,10 @@ pub enum RefusalReason {
     ReservedComponentName,
     /// Another module, earlier in the catalogue, already declared the same id.
     DuplicateCapabilityId,
+    /// Scan or pre-spawn recheck refused the package. The code is
+    /// [`agent24_components::integrity::IntegrityReason::code`], copied from
+    /// the typed error, never parsed out of the message.
+    PackageIntegrity(agent24_components::integrity::IntegrityReason),
 }
 
 impl RefusalReason {
@@ -549,8 +553,123 @@ impl RefusalReason {
             Self::ReservedCapabilityId => "reserved_capability_id",
             Self::ReservedComponentName => "reserved_component_name",
             Self::DuplicateCapabilityId => "duplicate_capability_id",
+            Self::PackageIntegrity(reason) => reason.code(),
         }
     }
+}
+
+/// Drop packages whose tree no longer matches the digest discovery froze.
+///
+/// Scan and the first spawn are not the same moment. A package that fails
+/// here is not registered and not mounted. A cancelled recheck drops the
+/// package without an integrity reason: shutdown is not a refusal.
+/// Returns the integrity refusals, in catalogue order.
+pub fn retain_rechecked(
+    catalogue: &mut Vec<Installed>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Vec<agent24_os_packages::discovery::Refused> {
+    let mut dropped = Vec::new();
+    catalogue.retain(|entry| {
+        let Build::Package(package) = &entry.build else {
+            return true;
+        };
+        match agent24_os_packages::discovery::recheck(&package.dir, &package.digest, cancel) {
+            Ok(()) => true,
+            Err(agent24_os_packages::discovery::RecheckError::Cancelled) => false,
+            Err(agent24_os_packages::discovery::RecheckError::Failed { integrity, message }) => {
+                dropped.push(agent24_os_packages::discovery::Refused {
+                    dir: package.dir.clone(),
+                    why: message,
+                    integrity,
+                    declared: Some((entry.name.clone(), entry.version.clone())),
+                });
+                false
+            }
+        }
+    });
+    dropped
+}
+
+fn directory_identity(file_name: &str, taken: &std::collections::BTreeSet<String>) -> String {
+    let mut base: String = file_name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    if base.is_empty() {
+        base = "pkg".to_owned();
+    }
+    // `dir-` plus a numeric suffix must stay inside the module-name limit.
+    base.truncate(48);
+    let mut n = 1u32;
+    loop {
+        let candidate = if n == 1 {
+            format!("dir-{base}")
+        } else {
+            format!("dir-{base}-{n}")
+        };
+        if agent24_domain::is_valid_module_name(&candidate) && !taken.contains(&candidate) {
+            return candidate;
+        }
+        n += 1;
+        if n > 10_000 {
+            return format!("dir-pkg-{n}");
+        }
+    }
+}
+
+/// Component rows for integrity refusals. A declared name is used only when
+/// the manifest parsed and the name is not already a component. Otherwise
+/// the host invents a directory identity, so a forged `name:` cannot cover
+/// a real component. `provides` stays empty: a damaged manifest's capability
+/// list is not usable.
+pub fn integrity_refusal_reports(
+    refusals: &[agent24_os_packages::discovery::Refused],
+    existing: &[MountReport],
+) -> Vec<MountReport> {
+    let mut taken: std::collections::BTreeSet<String> =
+        existing.iter().map(|report| report.name.clone()).collect();
+    for id in crate::component_routes::BUILTIN_COMPONENT_IDS {
+        taken.insert((*id).to_owned());
+    }
+    let mut out = Vec::new();
+    for refused in refusals {
+        let Some(reason) = refused.integrity else {
+            continue;
+        };
+        let (name, version) = match &refused.declared {
+            Some((name, version))
+                if agent24_domain::is_valid_module_name(name)
+                    && component_name_allowed(name)
+                    && !taken.contains(name) =>
+            {
+                (name.clone(), version.clone())
+            }
+            _ => {
+                let file_name = refused
+                    .dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("package");
+                (directory_identity(file_name, &taken), String::new())
+            }
+        };
+        taken.insert(name.clone());
+        out.push(MountReport {
+            name: name.clone(),
+            namespace: agent24_domain::DomainOsManifest::declared_namespace(&name),
+            version,
+            enabled_at_start: None,
+            outcome: MountOutcome::RefusedFor(
+                RefusalReason::PackageIntegrity(reason),
+                refused.why.clone(),
+            ),
+            granted: Vec::new(),
+            resources: ResourceStatus::NotChecked,
+            d9: None,
+        });
+    }
+    out
 }
 
 /// Whether a package may carry the name `name`. Every builtin component name is
@@ -2143,8 +2262,22 @@ async fn mount_package(
     // hash mismatch, and a matching stat is not a reason to skip the hash.
     let shutdown = host.shutdown.clone();
     let package_check: agent24_os_proto::supervisor::PackageCheck = Arc::new(move |spec| {
-        agent24_os_packages::discovery::recheck(&spec.package_dir, &spec.manifest_digest, &shutdown)
-            .err()
+        match agent24_os_packages::discovery::recheck(
+            &spec.package_dir,
+            &spec.manifest_digest,
+            &shutdown,
+        ) {
+            Ok(()) => None,
+            Err(agent24_os_packages::discovery::RecheckError::Cancelled) => {
+                Some(agent24_os_proto::supervisor::PackageFailure::cancelled())
+            }
+            Err(agent24_os_packages::discovery::RecheckError::Failed { integrity, message }) => {
+                Some(agent24_os_proto::supervisor::PackageFailure {
+                    message,
+                    code: integrity.map(agent24_components::integrity::IntegrityReason::code),
+                })
+            }
+        }
     });
     // `prepare_dir` and the lends above can outlive the cancel check that
     // ran before them. A token that fired in that gap must not register a
@@ -2158,6 +2291,49 @@ async fn mount_package(
                 ResourceStatus::NotChecked,
             ),
         );
+    }
+    // First spawn is not covered by the scan hash. Recheck here, before any
+    // route exists. The supervisor repeats the check on attempt 1 (the gap
+    // after this gate) and again before every restart.
+    let checked = {
+        let dir = spec.package_dir.clone();
+        let digest = spec.manifest_digest.clone();
+        let shutdown = host.shutdown.clone();
+        tokio::task::spawn_blocking(move || {
+            agent24_os_packages::discovery::recheck(&dir, &digest, &shutdown)
+        })
+        .await
+    };
+    match checked {
+        Ok(Ok(())) => {}
+        Ok(Err(agent24_os_packages::discovery::RecheckError::Cancelled)) => {
+            return (
+                app,
+                report(
+                    MountOutcome::Degraded(SHUTTING_DOWN.to_owned()),
+                    ResourceStatus::NotChecked,
+                ),
+            );
+        }
+        Ok(Err(agent24_os_packages::discovery::RecheckError::Failed { integrity, message })) => {
+            let outcome = match integrity {
+                Some(reason) => {
+                    MountOutcome::RefusedFor(RefusalReason::PackageIntegrity(reason), message)
+                }
+                None => MountOutcome::Refused(message),
+            };
+            tracing::error!("domain OS {name:?} not mounted: {outcome:?}");
+            return (app, report(outcome, ResourceStatus::NotChecked));
+        }
+        Err(err) => {
+            return (
+                app,
+                report(
+                    MountOutcome::Degraded(format!("the package check panicked: {err}")),
+                    ResourceStatus::NotChecked,
+                ),
+            );
+        }
     }
     // Started and registered in one step, unless the shutdown has closed the
     // list — which it may have while the directory was being prepared.
@@ -3405,10 +3581,15 @@ raise SystemExit(3)
         .expect("never settled")
         .unwrap()
         .clone();
-        let agent24_os_proto::supervisor::Status::PackageChanged { reason } = &status else {
+        let agent24_os_proto::supervisor::Status::PackageChanged { reason, code } = &status else {
             panic!("restarted against the replaced manifest instead of stopping: {status:?}");
         };
         assert!(reason.contains("manifest changed"), "{reason}");
+        assert_eq!(
+            *code,
+            Some("hash_mismatch"),
+            "the restart refusal must carry the typed code, not a parsed sentence: {reason}"
+        );
         // The rendered hint text (naming the one recovery that actually
         // works) is pinned separately, at the unit level, by
         // `os_routes::tests::a_package_changed_module_is_told_to_restart_
@@ -3493,10 +3674,14 @@ raise SystemExit(3)
         .expect("never settled")
         .unwrap()
         .clone();
-        let agent24_os_proto::supervisor::Status::PackageChanged { reason } = &settled else {
+        let agent24_os_proto::supervisor::Status::PackageChanged { reason, code } = &settled else {
             panic!("spawned again after the recheck was cancelled: {settled:?}");
         };
         assert_eq!(reason, "cancelled");
+        assert!(
+            code.is_none(),
+            "cancel is not an integrity refusal: {code:?}"
+        );
         assert!(
             !reason.contains("hash_mismatch"),
             "cancel must not look like a bad hash: {reason}"
@@ -3680,6 +3865,7 @@ raise SystemExit(3)
 
     fn arm_hash_pause(
         prefix: &std::path::Path,
+        pause_at_session: u32,
     ) -> (
         agent24_components::integrity::HashProgressGuard,
         std::sync::mpsc::Receiver<()>,
@@ -3694,6 +3880,9 @@ raise SystemExit(3)
         let guard = agent24_components::integrity::install_hash_progress_hook(
             prefix,
             Arc::new(move || {
+                if agent24_components::integrity::hash_sessions() < pause_at_session {
+                    return;
+                }
                 if once.swap(true, Ordering::SeqCst) {
                     return;
                 }
@@ -3722,7 +3911,7 @@ raise SystemExit(3)
         let dir = write_integrity_marker(&packages, "remote");
         let cancel = tokio_util::sync::CancellationToken::new();
         let scan = {
-            let (_guard, entered, release) = arm_hash_pause(&dir);
+            let (_guard, entered, release) = arm_hash_pause(&dir, 1);
             let scan_root = packages.clone();
             let scan_cancel = cancel.clone();
             let worker = std::thread::spawn(move || {
@@ -3794,7 +3983,11 @@ raise SystemExit(3)
         let shutdown = host.shutdown.clone();
         let catalogue = discovered(&packages);
         let package_dir = packages.join("remote");
-        let (_guard, entered, release) = arm_hash_pause(&package_dir);
+        // Session 1 is the pre-route recheck, session 2 is the supervisor's
+        // attempt-1 recheck, session 3 is the restart recheck. Pausing earlier
+        // cancels the first spawn. Dropping either pre-spawn check or the
+        // restart check means session 3 never starts and this wait times out.
+        let (_guard, entered, release) = arm_hash_pause(&package_dir, 3);
         let hub = crate::events::EventsHub::default();
         let root = tmp.path().join("os");
         let (_, _, _) = mount_all(
@@ -3833,16 +4026,149 @@ raise SystemExit(3)
         .expect("never settled")
         .unwrap()
         .clone();
-        let agent24_os_proto::supervisor::Status::PackageChanged { reason } = &settled else {
+        let agent24_os_proto::supervisor::Status::PackageChanged { reason, code } = &settled else {
             panic!("spawned again after the hash was cancelled: {settled:?}");
         };
         assert_eq!(reason, "cancelled");
+        assert!(
+            code.is_none(),
+            "cancel is not an integrity refusal: {code:?}"
+        );
         let marker =
             std::fs::read_to_string(root.join("remote").join("executed")).unwrap_or_default();
         assert_eq!(marker.lines().count(), 1, "runs: {marker:?}");
         for s in host.supervisors.close().running {
             s.handle.stop().await.expect("a clean stop");
         }
+    }
+
+    /// T7. The scan already accepted the package. A byte changed before the
+    /// pre-spawn recheck must not register a tool, must not publish a route,
+    /// and must not run. Making [`retain_rechecked`] keep every package turns
+    /// the tool assertion red.
+    #[tokio::test]
+    async fn t7_a_file_changed_after_scan_registers_nothing_and_spawns_nothing() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        let dir = write_integrity_marker(&packages, "remote");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let scan = agent24_os_packages::discovery::scan(&packages, &shutdown);
+        assert_eq!(scan.found.len(), 1, "refused: {:?}", scan.refused);
+        let mut catalogue = catalogue_from_found(scan.found);
+        let bin = dir.join("bin/mod");
+        agent24_os_packages::test_support::make_writable(&bin).unwrap();
+        let mut bytes = std::fs::read(&bin).unwrap();
+        bytes.push(0);
+        std::fs::write(&bin, bytes).unwrap();
+
+        let dropped = retain_rechecked(&mut catalogue, &shutdown);
+        assert!(
+            catalogue.is_empty(),
+            "a tampered package stayed on the catalogue"
+        );
+        assert_eq!(
+            dropped[0].integrity,
+            Some(agent24_components::integrity::IntegrityReason::HashMismatch)
+        );
+
+        let mut registry = agent24_domain::tool::ModuleToolRegistry::new();
+        let mut ops = std::collections::HashSet::new();
+        crate::server::register_discovered_module_tools(
+            &catalogue,
+            &tokio_util::sync::CancellationToken::new(),
+            &mut registry,
+            &mut ops,
+        );
+        assert!(
+            registry.is_empty(),
+            "the tampered package registered a tool"
+        );
+
+        let host = test_host(tmp.path());
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (app, reports, _) = mount_all(
+            &catalogue,
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        assert!(
+            reports.iter().all(|r| r.name != "remote"),
+            "the tampered package was mounted: {reports:?}"
+        );
+        assert!(host.supervisors.statuses().is_empty());
+        assert_eq!(
+            get(&app, "/api/v1/remote/hi").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(!root.join("remote").join("executed").exists());
+        assert!(host.supervisors.close().is_empty());
+    }
+
+    /// T7. The catalogue was already filtered. A byte changed before
+    /// `mount_package` publishes routes must still 404 and must not run.
+    /// Deleting the pre-route recheck publishes the namespace (this assertion
+    /// goes red) even when the supervisor's attempt-1 check still blocks the
+    /// process.
+    #[tokio::test]
+    async fn t7_a_file_changed_before_the_route_is_not_mounted() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        let dir = write_integrity_marker(&packages, "remote");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let scan = agent24_os_packages::discovery::scan(&packages, &shutdown);
+        let mut catalogue = catalogue_from_found(scan.found);
+        assert!(retain_rechecked(&mut catalogue, &shutdown).is_empty());
+        let bin = dir.join("bin/mod");
+        agent24_os_packages::test_support::make_writable(&bin).unwrap();
+        let mut bytes = std::fs::read(&bin).unwrap();
+        bytes.push(1);
+        std::fs::write(&bin, bytes).unwrap();
+
+        let host = test_host(tmp.path());
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (app, reports, _) = mount_all(
+            &catalogue,
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        match &reports[0].outcome {
+            MountOutcome::RefusedFor(RefusalReason::PackageIntegrity(reason), _) => {
+                assert_eq!(
+                    *reason,
+                    agent24_components::integrity::IntegrityReason::HashMismatch
+                );
+            }
+            other => panic!("expected an integrity refusal, got {other:?}"),
+        }
+        assert!(host.supervisors.statuses().is_empty());
+        assert_eq!(
+            get(&app, "/api/v1/remote/hi").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(!root.join("remote").join("executed").exists());
+        assert!(host.supervisors.close().is_empty());
     }
 
     /// A host with one package, `remote`, started and Running.

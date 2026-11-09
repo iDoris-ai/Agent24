@@ -191,7 +191,9 @@ fn from_supervised(status: &Supervised) -> (ComponentState, Option<&'static str>
         Supervised::Stopped => (S::Stopped, None),
         Supervised::Backoff { .. } => (S::Failed, Some("restarting")),
         Supervised::GaveUp { .. } => (S::Failed, Some("gave_up")),
-        Supervised::PackageChanged { .. } => (S::Failed, Some("package_changed")),
+        Supervised::PackageChanged { code, .. } => {
+            (S::Failed, Some(code.unwrap_or("package_changed")))
+        }
         Supervised::StopFailed { .. } => (S::Failed, Some("stop_failed")),
         Supervised::Panicked => (S::Failed, Some("panicked")),
         Supervised::Killed => (S::Failed, Some("killed")),
@@ -699,7 +701,13 @@ fn os_module_items(state: &AppState) -> Vec<Item> {
                 }
             });
             Item::new(&report.name, Form::Resident, mapped).with(|i| {
-                i.version = Some(report.version.clone());
+                // An integrity refusal with no trusted version is unknown,
+                // not the empty string.
+                i.version = if report.version.is_empty() {
+                    None
+                } else {
+                    Some(report.version.clone())
+                };
                 i.provides = provides;
                 i.reason = reason.map(str::to_owned);
                 let mut detail = json!({

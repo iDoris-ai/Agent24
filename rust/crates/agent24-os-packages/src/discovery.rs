@@ -24,6 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
+use agent24_components::integrity::{IntegrityError, IntegrityReason};
 use agent24_domain::DomainOsManifest;
 use agent24_domain::tool::ModuleToolRegistry;
 use tokio_util::sync::CancellationToken;
@@ -59,7 +60,64 @@ pub use agent24_os_proto::manifest::manifest_digest;
 #[derive(Debug, Clone)]
 pub struct Refused {
     pub dir: PathBuf,
+    /// Host-safe text. Integrity failures use [`IntegrityError::public_message`],
+    /// which does not carry an absolute path or stderr.
     pub why: String,
+    /// Set from [`IntegrityError::reason`]. `None` for a refusal that is not
+    /// an integrity failure (a symlink directory, install debris). Never
+    /// recovered by parsing `why`.
+    pub integrity: Option<IntegrityReason>,
+    /// Name and version from a manifest that parsed before the integrity
+    /// check. `None` when the manifest is too damaged to be a trusted name:
+    /// the host then invents a directory identity and does not read `name:`
+    /// out of the broken file.
+    pub declared: Option<(String, String)>,
+}
+
+impl Refused {
+    fn plain(dir: PathBuf, why: impl Into<String>) -> Self {
+        Self {
+            dir,
+            why: why.into(),
+            integrity: None,
+            declared: None,
+        }
+    }
+}
+
+/// Why [`recheck`] refused. [`RecheckError::Cancelled`] is a shutdown, not
+/// an [`IntegrityReason`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecheckError {
+    Cancelled,
+    Failed {
+        integrity: Option<IntegrityReason>,
+        message: String,
+    },
+}
+
+impl RecheckError {
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Failed { message, .. } => message,
+        }
+    }
+
+    #[must_use]
+    pub fn integrity(&self) -> Option<IntegrityReason> {
+        match self {
+            Self::Cancelled => None,
+            Self::Failed { integrity, .. } => *integrity,
+        }
+    }
+}
+
+impl std::fmt::Display for RecheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
 }
 
 /// The result of one scan. Both halves matter: `found` is what can be mounted,
@@ -97,10 +155,12 @@ pub fn scan(root: &Path, cancel: &CancellationToken) -> Scan {
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return out,
-        Err(e) => {
+        Err(_) => {
             out.refused.push(Refused {
                 dir: root.to_owned(),
-                why: format!("packages root could not be read: {e}"),
+                why: "packages root could not be read".to_owned(),
+                integrity: Some(IntegrityReason::CheckFailed),
+                declared: None,
             });
             return out;
         }
@@ -138,37 +198,37 @@ pub fn scan(root: &Path, cancel: &CancellationToken) -> Scan {
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.starts_with('.'))
                 {
-                    out.refused.push(Refused {
-                        dir: path,
-                        why: "dot-prefixed directory; not a package (install debris \
-                              looks like this — remove it)"
-                            .to_owned(),
-                    });
+                    out.refused.push(Refused::plain(
+                        path,
+                        "dot-prefixed directory; not a package (install debris \
+                         looks like this — remove it)",
+                    ));
                 } else {
                     dirs.push(path);
                 }
             }
-            Ok(t) if t.is_symlink() => out.refused.push(Refused {
-                dir: path,
+            Ok(t) if t.is_symlink() => out.refused.push(Refused::plain(
+                path,
                 // Refused rather than followed, for the reason the manifest-level
                 // check gives: a package's identity is decided by a file inside it,
                 // and a link lets that file live somewhere the packages root does
                 // not govern. The workaround is a copy, and the message says so
                 // because a developer who linked a work-in-progress module here
                 // needs to know what to do instead.
-                why: "package directory is a symlink; refusing to follow it (copy                       the directory instead)"
-                    .to_owned(),
-            }),
+                "package directory is a symlink; refusing to follow it (copy \
+                 the directory instead)",
+            )),
             // A stray file in the packages root is a mistake worth naming — most
             // often a stray archive or a manifest left at the top level.
-            Ok(_) => out.refused.push(Refused {
+            Ok(_) => out.refused.push(Refused::plain(
+                path,
+                "not a directory; a package is a directory containing domain-os.yml",
+            )),
+            Err(_) => out.refused.push(Refused {
                 dir: path,
-                why: "not a directory; a package is a directory containing                       domain-os.yml"
-                    .to_owned(),
-            }),
-            Err(e) => out.refused.push(Refused {
-                dir: path,
-                why: format!("could not determine what this entry is: {e}"),
+                why: "could not determine what this entry is".to_owned(),
+                integrity: Some(IntegrityReason::CheckFailed),
+                declared: None,
             }),
         }
     }
@@ -190,7 +250,16 @@ pub fn scan(root: &Path, cancel: &CancellationToken) -> Scan {
         }
         match read_package(&dir, cancel) {
             PackageRead::Found(found) => out.found.push(*found),
-            PackageRead::Refused(why) => out.refused.push(Refused { dir, why }),
+            PackageRead::Refused {
+                why,
+                integrity,
+                declared,
+            } => out.refused.push(Refused {
+                dir,
+                why,
+                integrity,
+                declared,
+            }),
             PackageRead::Cancelled => {
                 out.cancelled.push(dir);
                 out.cancelled.extend(rest);
@@ -205,8 +274,20 @@ pub fn scan(root: &Path, cancel: &CancellationToken) -> Scan {
 /// the package is not damaged, and it must not become [`Discovered`].
 enum PackageRead {
     Found(Box<Discovered>),
-    Refused(String),
+    Refused {
+        why: String,
+        integrity: Option<IntegrityReason>,
+        declared: Option<(String, String)>,
+    },
     Cancelled,
+}
+
+fn refused_integrity(err: IntegrityError, declared: Option<(String, String)>) -> PackageRead {
+    PackageRead::Refused {
+        integrity: err.reason(),
+        why: err.public_message(),
+        declared,
+    }
 }
 
 /// Read and validate one package directory.
@@ -222,24 +303,52 @@ fn read_package(dir: &Path, cancel: &CancellationToken) -> PackageRead {
     // at a file outside its own directory.
     let meta = match std::fs::symlink_metadata(&path) {
         Ok(meta) => meta,
-        Err(e) => return PackageRead::Refused(format!("no readable {MANIFEST_FILE}: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return refused_integrity(
+                IntegrityError::ManifestInvalid {
+                    detail: format!("no readable {MANIFEST_FILE}"),
+                },
+                None,
+            );
+        }
+        Err(_) => {
+            return refused_integrity(
+                IntegrityError::CheckFailed {
+                    detail: format!("could not read {MANIFEST_FILE}"),
+                },
+                None,
+            );
+        }
     };
     if meta.file_type().is_symlink() {
-        return PackageRead::Refused(format!(
-            "{MANIFEST_FILE} is a symlink; refusing to follow it"
-        ));
+        return refused_integrity(
+            IntegrityError::ManifestInvalid {
+                detail: format!("{MANIFEST_FILE} is a symlink; refusing to follow it"),
+            },
+            None,
+        );
     }
     if !meta.is_file() {
-        return PackageRead::Refused(format!("{MANIFEST_FILE} is not a regular file"));
+        return refused_integrity(
+            IntegrityError::ManifestInvalid {
+                detail: format!("{MANIFEST_FILE} is not a regular file"),
+            },
+            None,
+        );
     }
     // Bound the read BEFORE it happens. `from_yaml` also checks a size limit, but
     // it checks it on a string that has already been read into memory.
     if meta.len() > DomainOsManifest::MAX_YAML_BYTES as u64 {
-        return PackageRead::Refused(format!(
-            "{MANIFEST_FILE} is {} bytes, over the {} byte limit",
-            meta.len(),
-            DomainOsManifest::MAX_YAML_BYTES
-        ));
+        return refused_integrity(
+            IntegrityError::ManifestInvalid {
+                detail: format!(
+                    "{MANIFEST_FILE} is {} bytes, over the {} byte limit",
+                    meta.len(),
+                    DomainOsManifest::MAX_YAML_BYTES
+                ),
+            },
+            None,
+        );
     }
 
     // Read BYTES, not a string. `read_to_string` would fail on non-UTF-8 with
@@ -248,39 +357,63 @@ fn read_package(dir: &Path, cancel: &CancellationToken) -> PackageRead {
     // Decoding here lets each case have its own readable reason.
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(e) => {
-            return PackageRead::Refused(format!("could not read {MANIFEST_FILE}: {e}"));
+        Err(_) => {
+            return refused_integrity(
+                IntegrityError::CheckFailed {
+                    detail: format!("could not read {MANIFEST_FILE}"),
+                },
+                None,
+            );
         }
     };
     if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
-        return PackageRead::Refused(format!(
-            "{MANIFEST_FILE} is UTF-16 (byte-order mark {:02X} {:02X}); it must be UTF-8",
-            bytes[0], bytes[1]
-        ));
+        return refused_integrity(
+            IntegrityError::ManifestInvalid {
+                detail: format!(
+                    "{MANIFEST_FILE} is UTF-16 (byte-order mark {:02X} {:02X}); it must be UTF-8",
+                    bytes[0], bytes[1]
+                ),
+            },
+            None,
+        );
     }
     let digest = manifest_digest(&bytes);
     let text = match String::from_utf8(bytes) {
         Ok(text) => text,
-        Err(e) => {
-            return PackageRead::Refused(format!("{MANIFEST_FILE} is not valid UTF-8: {e}"));
+        Err(_) => {
+            return refused_integrity(
+                IntegrityError::ManifestInvalid {
+                    detail: format!("{MANIFEST_FILE} is not valid UTF-8"),
+                },
+                None,
+            );
         }
     };
 
     let manifest = match DomainOsManifest::from_yaml(&text) {
         Ok(manifest) => manifest,
-        Err(e) => return PackageRead::Refused(e.to_string()),
+        // A broken manifest is not a trusted name. The directory identity is
+        // chosen by the host from `dir`, not from any `name:` in this text.
+        // The parser's own sentence stays: it names the field, and it does
+        // not carry a filesystem path.
+        Err(e) => {
+            return refused_integrity(
+                IntegrityError::ManifestInvalid {
+                    detail: e.to_string(),
+                },
+                None,
+            );
+        }
     };
-    // S1-9 PR-1: a package that declares integrity is verified in full before
-    // it can become Discovered. A package that does not declare it keeps the
-    // previous manifest-only behaviour. PR-3 replaces this with verify_required.
-    // Cancel is not success and not a hash mismatch: the package stays off
-    // `found` so nothing registers its tools or spawns it.
-    match crate::package_integrity::verify_if_present(dir, &manifest, cancel) {
+    let declared = Some((manifest.name().to_owned(), manifest.version().to_owned()));
+    // Integrity is required. Cancel is not success and not a hash mismatch:
+    // the package stays off `found` so nothing registers its tools or spawns it.
+    match crate::package_integrity::verify_required(dir, &manifest, cancel) {
         Ok(()) => {}
-        Err(agent24_components::integrity::IntegrityError::Cancelled) => {
+        Err(IntegrityError::Cancelled) => {
             return PackageRead::Cancelled;
         }
-        Err(e) => return PackageRead::Refused(e.to_string()),
+        Err(e) => return refused_integrity(e, declared),
     }
     if cancel.is_cancelled() {
         return PackageRead::Cancelled;
@@ -318,50 +451,76 @@ pub fn build_tool_registry(found: &[Discovered]) -> (ModuleToolRegistry, Vec<Ref
     let mut refused = Vec::new();
     for d in found {
         if let Err(why) = registry.register_module(d.manifest.name(), d.manifest.tools()) {
-            refused.push(Refused {
-                dir: d.dir.clone(),
-                why,
-            });
+            refused.push(Refused::plain(d.dir.clone(), why));
         }
     }
     (registry, refused)
 }
 
-/// Re-read the package and compare the manifest digest frozen at mount time.
-/// Packages declaring integrity also repeat the full payload verification;
-/// legacy packages retain manifest-only checking until PR-3.
+/// Re-read the package, repeat the full integrity check, and compare the
+/// manifest digest frozen at mount time.
 ///
-/// `Err` means the caller must not spawn. `Err("cancelled")` is a shutdown,
-/// not a damaged package and not a hash mismatch: the hash did not finish,
-/// so this restart is not a success. The full tree is still hashed whenever
-/// the token is live.
-pub fn recheck(dir: &Path, expected: &str, cancel: &CancellationToken) -> Result<(), String> {
+/// `Err` means the caller must not spawn. [`RecheckError::Cancelled`] is a
+/// shutdown, not a damaged package and not a hash mismatch: the hash did
+/// not finish, so this restart is not a success. The full tree is still
+/// hashed whenever the token is live. A digest that no longer matches the
+/// frozen one is [`IntegrityReason::HashMismatch`] even when the new tree
+/// is internally consistent.
+pub fn recheck(dir: &Path, expected: &str, cancel: &CancellationToken) -> Result<(), RecheckError> {
     // The metadata branches below return before `read_package`, so its
     // cancel check never runs for a missing, linked, or non-directory path.
     if cancel.is_cancelled() {
-        return Err("cancelled".to_owned());
+        return Err(RecheckError::Cancelled);
     }
     match std::fs::symlink_metadata(dir) {
         Ok(m) if m.is_symlink() => {
-            return Err("the package directory is now a symlink; refusing to follow it".to_owned());
+            return Err(failed(
+                Some(IntegrityReason::ManifestInvalid),
+                "the package directory is now a symlink; refusing to follow it",
+            ));
         }
         Ok(m) if !m.is_dir() => {
-            return Err("the package directory is no longer a directory".to_owned());
+            return Err(failed(
+                Some(IntegrityReason::ManifestInvalid),
+                "the package directory is no longer a directory",
+            ));
         }
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err("the package directory no longer exists".to_owned());
+            return Err(failed(
+                Some(IntegrityReason::CheckFailed),
+                "the package directory no longer exists",
+            ));
         }
-        Err(e) => return Err(format!("could not check the package directory: {e}")),
+        Err(_) => {
+            return Err(failed(
+                Some(IntegrityReason::CheckFailed),
+                "could not check the package directory",
+            ));
+        }
     }
     match read_package(dir, cancel) {
         PackageRead::Found(found) if found.digest == expected => Ok(()),
-        PackageRead::Found(found) => Err(format!(
-            "the manifest changed ({expected} \u{2192} {})",
-            found.digest
+        PackageRead::Found(found) => Err(failed(
+            Some(IntegrityReason::HashMismatch),
+            format!(
+                "the manifest changed ({expected} \u{2192} {})",
+                found.digest
+            ),
         )),
-        PackageRead::Cancelled => Err("cancelled".to_owned()),
-        PackageRead::Refused(why) => Err(format!("the package is no longer usable: {why}")),
+        PackageRead::Cancelled => Err(RecheckError::Cancelled),
+        PackageRead::Refused {
+            why,
+            integrity,
+            declared: _,
+        } => Err(failed(integrity, why)),
+    }
+}
+
+fn failed(integrity: Option<IntegrityReason>, message: impl Into<String>) -> RecheckError {
+    RecheckError::Failed {
+        integrity,
+        message: message.into(),
     }
 }
 
@@ -377,14 +536,14 @@ mod tests {
         super::scan(root, &CancellationToken::new())
     }
 
-    fn recheck(dir: &Path, expected: &str) -> Result<(), String> {
+    fn recheck(dir: &Path, expected: &str) -> Result<(), super::RecheckError> {
         super::recheck(dir, expected, &CancellationToken::new())
     }
 
     fn read_package(dir: &Path) -> Result<Discovered, String> {
         match super::read_package(dir, &CancellationToken::new()) {
             PackageRead::Found(found) => Ok(*found),
-            PackageRead::Refused(why) => Err(why),
+            PackageRead::Refused { why, .. } => Err(why),
             PackageRead::Cancelled => Err("cancelled".to_owned()),
         }
     }
@@ -837,12 +996,13 @@ mod tests {
         assert_ne!(old_digest, new_digest);
 
         let err = recheck(&dir, &old_digest).unwrap_err();
-        assert!(err.contains(&old_digest), "{err}");
+        assert_eq!(err.integrity(), Some(IntegrityReason::HashMismatch));
+        assert!(err.message().contains(&old_digest), "{err}");
         assert!(
-            err.contains(&new_digest),
+            err.message().contains(&new_digest),
             "must name what it changed TO, not just what it changed FROM: {err}"
         );
-        assert!(err.contains("changed"), "{err}");
+        assert!(err.message().contains("changed"), "{err}");
     }
 
     #[test]
@@ -857,7 +1017,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         let err = recheck(&dir, &digest).unwrap_err();
-        assert!(err.contains("no longer exists"), "{err}");
+        assert_eq!(err.integrity(), Some(IntegrityReason::CheckFailed));
+        assert!(err.message().contains("no longer exists"), "{err}");
     }
 
     #[test]
@@ -873,7 +1034,8 @@ mod tests {
         std::fs::write(&dir, b"not a directory any more").unwrap();
 
         let err = recheck(&dir, &digest).unwrap_err();
-        assert!(err.contains("no longer a directory"), "{err}");
+        assert_eq!(err.integrity(), Some(IntegrityReason::ManifestInvalid));
+        assert!(err.message().contains("no longer a directory"), "{err}");
     }
 
     #[test]
@@ -909,7 +1071,8 @@ mod tests {
         std::os::unix::fs::symlink(&real, &dir).unwrap();
 
         let err = recheck(&dir, &digest).unwrap_err();
-        assert!(err.contains("symlink"), "{err}");
+        assert_eq!(err.integrity(), Some(IntegrityReason::ManifestInvalid));
+        assert!(err.message().contains("symlink"), "{err}");
     }
 
     // K1-5.1 — `build_tool_registry` (ADR-K1-01 §2.1/§2.2/§5(2)).
@@ -1075,9 +1238,11 @@ mod tests {
 
         let digest = live.found[0].digest.clone();
         let err = super::recheck(&live.found[0].dir, &digest, &cancel).unwrap_err();
-        assert_eq!(err, "cancelled");
+        assert!(matches!(err, super::RecheckError::Cancelled));
+        assert_eq!(err.message(), "cancelled");
+        assert!(err.integrity().is_none());
         assert!(
-            !err.contains("hash_mismatch"),
+            !err.message().contains("hash_mismatch"),
             "cancel must not look like a bad hash: {err}"
         );
         // The supervisor spawns the next run only when this returns Ok.
@@ -1095,10 +1260,10 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let err = super::recheck(&missing, "sha256:ab", &cancel).unwrap_err();
-        assert_eq!(err, "cancelled");
+        assert!(matches!(err, super::RecheckError::Cancelled));
         let live = super::recheck(&missing, "sha256:ab", &CancellationToken::new()).unwrap_err();
         assert!(
-            live.contains("no longer exists"),
+            live.message().contains("no longer exists"),
             "a live token must still report the missing directory: {live}"
         );
     }
@@ -1215,7 +1380,36 @@ mod tests {
         cancel.cancel();
         release.send(()).unwrap();
         let err = worker.join().unwrap().unwrap_err();
-        assert_eq!(err, "cancelled");
-        assert!(!err.contains("hash_mismatch"), "{err}");
+        assert_eq!(err.message(), "cancelled");
+        assert!(err.integrity().is_none());
+        assert!(!err.message().contains("hash_mismatch"), "{err}");
+    }
+
+    /// T9. Rewriting `files.json` and `domain-os.yml` together (a consistent
+    /// new tree) still fails the digest frozen at the first scan. Dropping
+    /// the frozen compare, and accepting any tree that verifies against
+    /// itself, turns this green-to-red. macOS Team ID and notarization are
+    /// PR-3d.
+    #[test]
+    fn t9_a_consistent_rewrite_still_fails_the_frozen_digest() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = install(
+            root.path(),
+            "cos72",
+            &manifest_yaml("cos72", "out_of_process_provider"),
+        );
+        let frozen = read_package(&dir).unwrap().digest;
+        let yml = dir.join(MANIFEST_FILE);
+        crate::test_support::make_writable(&yml).unwrap();
+        let body = std::fs::read_to_string(&yml)
+            .unwrap()
+            .replace("0.1.0", "0.9.0");
+        std::fs::write(&yml, body).unwrap();
+        crate::test_support::seal(&dir, &["bin/cos72"]).unwrap();
+        let err = recheck(&dir, &frozen).unwrap_err();
+        assert_eq!(err.integrity(), Some(IntegrityReason::HashMismatch));
+        assert!(err.message().contains("changed"), "{err}");
+        assert!(err.message().contains(&frozen), "{err}");
+        assert_ne!(err.integrity(), Some(IntegrityReason::SignatureRejected));
     }
 }

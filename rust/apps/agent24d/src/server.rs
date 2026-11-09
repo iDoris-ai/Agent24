@@ -2235,14 +2235,24 @@ pub async fn serve(
     // Hashing a package is blocking filesystem I/O (up to 512 MiB). The
     // shutdown token stops it; a cancelled package is left out of the
     // catalogue, so it is not registered and not spawned.
-    let catalogue = catalogue_from_join(
+    let discovered = catalogue_from_join(
         tokio::task::spawn_blocking({
             let packages_root = StdArc::clone(&packages_root);
             let cancel = cancel.clone();
-            move || with_discovered(Vec::new(), packages_root.as_ref(), &cancel)
+            move || {
+                let mut pass = with_discovered(Vec::new(), packages_root.as_ref(), &cancel);
+                // Same check `mount_package` repeats before routes. Doing it
+                // here is what keeps a package that changed after scan off
+                // the tool registry.
+                let dropped = crate::domain::retain_rechecked(&mut pass.catalogue, &cancel);
+                pass.integrity_refusals.extend(dropped);
+                pass
+            }
         })
         .await,
     )?;
+    let catalogue = discovered.catalogue;
+    let integrity_refusals = discovered.integrity_refusals;
 
     // M-E/E1b: mount external MCP servers from ~/.agent24/mcp.json and register
     // their tools. Registered with `with()` so they are dispatchable, while
@@ -2915,7 +2925,7 @@ pub async fn serve(
         events: state.events.clone(),
         timings: state.timings.clone(),
     };
-    let (module_routes, reports, partitions) = crate::domain::mount_all(
+    let (module_routes, mut reports, partitions) = crate::domain::mount_all(
         &catalogue,
         &os_root,
         &state.events,
@@ -2944,6 +2954,10 @@ pub async fn serve(
         },
     )
     .await;
+    reports.extend(crate::domain::integrity_refusal_reports(
+        &integrity_refusals,
+        &reports,
+    ));
 
     // ME4-1.3.1 (design §4.6): right after `mount_all` returns — before the
     // tick loop or the delivery pump ever run — set the two handles they and
@@ -3843,11 +3857,18 @@ pub(crate) fn module_tools_if_live(
     }
 }
 
+struct DiscoveryPass {
+    catalogue: Vec<crate::domain::Installed>,
+    /// Integrity refusals whose directory is a package, not the packages root.
+    /// The root's own unreadability stays a log line: it is not a component.
+    integrity_refusals: Vec<agent24_os_packages::discovery::Refused>,
+}
+
 fn with_discovered(
     mut catalogue: Vec<crate::domain::Installed>,
     packages_root: &std::path::Path,
     cancel: &CancellationToken,
-) -> Vec<crate::domain::Installed> {
+) -> DiscoveryPass {
     // FU-41. Checked HERE, at the one place packages are read, rather than at
     // startup: a check somewhere else can be true when it runs and false when
     // the directory is used, and this is the moment of use.
@@ -3858,9 +3879,13 @@ fn with_discovered(
     // somebody else can write decides what this process executes.
     if let Err(e) = agent24_os_packages::ensure_packages_root(packages_root) {
         tracing::error!("{e}; no disk packages will be loaded this run");
-        return catalogue;
+        return DiscoveryPass {
+            catalogue,
+            integrity_refusals: Vec::new(),
+        };
     }
     let scan = agent24_os_packages::discovery::scan(packages_root, cancel);
+    let mut integrity_refusals = Vec::new();
     for dir in &scan.cancelled {
         tracing::info!(
             "domain OS package at {} was not loaded: verification cancelled",
@@ -3873,6 +3898,9 @@ fn with_discovered(
             r.dir.display(),
             r.why
         );
+        if r.integrity.is_some() && r.dir.as_path() != packages_root {
+            integrity_refusals.push(r.clone());
+        }
     }
     for d in scan.found {
         let name = d.manifest.name().to_owned();
@@ -3891,7 +3919,10 @@ fn with_discovered(
             })),
         });
     }
-    catalogue
+    DiscoveryPass {
+        catalogue,
+        integrity_refusals,
+    }
 }
 
 #[cfg(test)]
@@ -4140,7 +4171,7 @@ pub(crate) mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let out = super::with_discovered(vec![built_in("sin90")], root.path(), &cancel);
-        let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
+        let names: Vec<&str> = out.catalogue.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["sin90"]);
     }
 
@@ -4157,7 +4188,7 @@ pub(crate) mod tests {
             root.path(),
             &CancellationToken::new(),
         );
-        let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
+        let names: Vec<&str> = out.catalogue.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["sin90", "cos72"]);
     }
 
@@ -4181,7 +4212,7 @@ pub(crate) mod tests {
             root.path(),
             &CancellationToken::new(),
         );
-        let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
+        let names: Vec<&str> = out.catalogue.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(
             names,
             vec!["sin90"],
@@ -4198,7 +4229,7 @@ pub(crate) mod tests {
             root.path(),
             &CancellationToken::new(),
         );
-        let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
+        let names: Vec<&str> = out.catalogue.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["sin90", "cos72"]);
     }
 
@@ -4217,9 +4248,16 @@ pub(crate) mod tests {
             root.path(),
             &CancellationToken::new(),
         );
-        assert_eq!(out.len(), 2, "both entries exist; the mounter decides");
-        assert_eq!(out[0].version, "9.9.9", "the built-in must come FIRST");
-        assert_eq!(out[1].version, "0.1.0");
+        assert_eq!(
+            out.catalogue.len(),
+            2,
+            "both entries exist; the mounter decides"
+        );
+        assert_eq!(
+            out.catalogue[0].version, "9.9.9",
+            "the built-in must come FIRST"
+        );
+        assert_eq!(out.catalogue[1].version, "0.1.0");
     }
 
     #[test]
@@ -4231,8 +4269,8 @@ pub(crate) mod tests {
             std::path::Path::new("/nonexistent/agent24-packages"),
             &CancellationToken::new(),
         );
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].name, "sin90");
+        assert_eq!(out.catalogue.len(), 1);
+        assert_eq!(out.catalogue[0].name, "sin90");
     }
 
     use super::*;
