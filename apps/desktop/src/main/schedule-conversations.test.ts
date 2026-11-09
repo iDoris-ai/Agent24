@@ -208,6 +208,18 @@ describe('schedule conversations (M4 A5)', () => {
       expect(history.list()).toEqual([])
     })
 
+    it('a run to retry, claimed after a restart and given back before the first catch-up, is recorded by it', async () => {
+      const appendRun = vi.spyOn(history, 'appendRun').mockImplementationOnce(() => { throw new Error('disk full') })
+      await expect(homes().record('sch_1', 'run_1')).rejects.toThrow('disk full')
+      appendRun.mockRestore()
+      // main starts again: `retry` is on file, what was heard is not.
+      const m = homes()
+      expect(await m.claim('sch_1', 'run_1')).toBe(false)
+      await m.settle('run_1', false)
+      await m.catchUp(runs('run_1'))
+      expect(history.list().flatMap(c => c.tasks.map(t => t.run_id))).toEqual(['run_1'])
+    })
+
     it('C2 a claim that cannot be written reserves nothing: handled is as it was, and the run is recorded as before', async () => {
       const m = homes()
       await m.catchUp(runs())
