@@ -271,7 +271,7 @@ describe('the identity a pending write goes under (Codex H1 C1, C2, C4, C10)', (
     fail = false
     // Admitted, then the credential is gone before the write goes out.
     const out = await t.submission.submit(d.id, 'kb-2')
-    expect(out).toMatchObject({ ok: false, reason: 'server', code: 'unauthorized' })
+    expect(out).toMatchObject({ ok: false, reason: 'server', code: 'cancelled', unknown: false })
     expect(t.fake.writes()).toHaveLength(1)
     expect(t.candidates.get(d.id)?.pending).toEqual(kept)
   })
@@ -279,7 +279,7 @@ describe('the identity a pending write goes under (Codex H1 C1, C2, C4, C10)', (
   it('a fresh submit that never left this machine leaves nothing pending', async () => {
     const t = setup({ onReady: () => t.fake.setKey(null) })
     const d = t.draft()
-    expect(await t.submission.submit(d.id, 'kb-2')).toMatchObject({ ok: false, code: 'unauthorized', unknown: false })
+    expect(await t.submission.submit(d.id, 'kb-2')).toMatchObject({ ok: false, code: 'cancelled', unknown: false })
     expect(t.fake.writes()).toHaveLength(0)
     expect(t.candidates.get(d.id)?.pending).toBeNull()
   })
@@ -289,6 +289,32 @@ describe('the identity a pending write goes under (Codex H1 C1, C2, C4, C10)', (
     const d = t.draft()
     const out = await t.submission.submit(d.id, 'kb-2')
     expect(out).toMatchObject({ ok: false, reason: 'server', code: 'cancelled', unknown: true, submission: { pending: true, candidate: null } })
+    expect(t.candidates.get(d.id)?.candidate).toBeNull()
+  })
+
+  it('a credential changed during the ready round trip sends no write: a resend keeps its record, a fresh one leaves none', async () => {
+    let fail = true
+    const t = setup({ submit: () => (fail ? 'throw' : undefined as unknown as Response), onReady: () => { if (!fail) t.fake.setKey('C-other-principal') } })
+    const d = t.draft()
+    await t.submission.submit(d.id, 'kb-2')
+    const kept = t.candidates.get(d.id)?.pending
+    fail = false
+    expect(await t.submission.submit(d.id, 'kb-2')).toMatchObject({ ok: false, code: 'cancelled', unknown: false })
+    expect(t.fake.writes()).toHaveLength(1)
+    expect(t.candidates.get(d.id)?.pending).toEqual(kept)
+
+    const f = setup({ onReady: () => f.fake.setKey('C-other-principal') })
+    const e = f.draft()
+    expect(await f.submission.submit(e.id, 'kb-2')).toMatchObject({ ok: false, code: 'cancelled', unknown: false })
+    expect(f.fake.writes()).toHaveLength(0)
+    expect(f.candidates.get(e.id)?.pending).toBeNull()
+  })
+
+  it('an answer that comes back after the binding changed is dropped too (R7.3)', async () => {
+    const t = setup({ submit: () => { t.setTarget('kbt1:other'); return undefined as unknown as Response } })
+    const d = t.draft()
+    expect(await t.submission.submit(d.id, 'kb-2')).toMatchObject({ ok: false, code: 'cancelled', unknown: true })
+    expect(t.candidates.get(d.id)?.pending).not.toBeNull()
     expect(t.candidates.get(d.id)?.candidate).toBeNull()
   })
 
@@ -358,6 +384,22 @@ describe('status and withdrawing the submission (W8.3, W8.8, HS6)', () => {
     const off = setup({ candidate: 'disabled' })
     expect(await off.submission.retract(d.id)).toMatchObject({ ok: false, reason: 'server', code: 'unavailable' })
     expect(off.fake.writes()).toHaveLength(0)
+  })
+
+  it('withdraw creates no work: not_ready still admits it, and a binding changed during ready stops it (Codex H1 r2 C1, C2)', async () => {
+    const t = setup()
+    const d = t.draft()
+    await t.submission.submit(d.id, 'kb-2')
+    const slow = setup({ candidate: 'not_ready' })
+    expect(await slow.submission.retract(d.id)).toMatchObject({ ok: true, submission: { candidate: { status: 'withdrawn' } } })
+    expect(slow.fake.writes().map((c) => c.path)).toEqual(['candidates/withdraw'])
+
+    const u = setup({ onReady: () => u.setTarget('kbt1:other') })
+    const e = u.draft()
+    u.setTarget(BINDING)
+    await t.submission.submit(e.id, 'kb-2')
+    expect(await u.submission.retract(e.id)).toMatchObject({ ok: false, code: 'cancelled' })
+    expect(u.fake.writes()).toHaveLength(0)
   })
 
   it('there is nothing to withdraw before it is submitted', async () => {

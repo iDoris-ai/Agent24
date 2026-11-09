@@ -136,6 +136,9 @@ describe('credentialRef (W1.5)', () => {
     expect(createCandidateStore(dir).credentialRef('C-secret-1')).toBe(a)
     expect(store.credentialRef('C-secret-2')).not.toBe(a)
     expect(store.credentialRef('C-secret-1')).not.toBe(store.sessionRef('C-secret-1'))
+    // Keyed by the local key: another key, another value (not a plain digest).
+    fs.rmSync(path.join(dir, 'knowledge-candidates', '_session_ref.key'))
+    expect(createCandidateStore(dir).credentialRef('C-secret-1')).not.toBe(a)
     store.beginSubmit(DRAFT, 'kbt1:x', a, body())
     const file = fs.readFileSync(path.join(dir, 'knowledge-candidates', `${DRAFT}.json`), 'utf8')
     expect(file).not.toContain('C-secret-1')

@@ -227,9 +227,10 @@ function settle<T>(
  * W1.4 client admission for `candidate.*`: the latest ready answer's
  * `operations.candidate`. `disabled` → local `unavailable/operation_disabled`
  * (not retryable); anything but `ready`, or no answer → local `not_ready`.
- * Neither sends the write.
+ * Neither sends the write. With `requireReady` false (a write that creates
+ * no work: withdraw), `not_ready` admits it too; only `disabled` refuses.
  */
-export async function candidateAdmission(deps: CandidateDeps, generation: number, signal: AbortSignal): Promise<{ ok: true } | CandidateFailure> {
+export async function candidateAdmission(deps: CandidateDeps, generation: number, signal: AbortSignal, requireReady = true): Promise<{ ok: true } | CandidateFailure> {
   const credential = deps.credential()
   if (credential === null) return notSent('unauthorized')
   const requestId = deps.newRequestId()
@@ -248,6 +249,8 @@ export async function candidateAdmission(deps: CandidateDeps, generation: number
   const state = isObj(operations) && isObj(operations.candidate) ? operations.candidate.state : undefined
   if (state === 'ready') return { ok: true }
   if (state === 'disabled') return failure('unavailable', false, 'operation_disabled')
+  // A write that creates no work (withdraw) is refused locally only when disabled.
+  if (!requireReady && state === 'not_ready') return { ok: true }
   return failure('not_ready', false)
 }
 
