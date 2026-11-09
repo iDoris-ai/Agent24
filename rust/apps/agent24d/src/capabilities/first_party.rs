@@ -169,6 +169,42 @@ impl FirstPartyAuthority {
             summary,
         );
     }
+    /// K-B6: derive the presence summary for a Knowledge host change from the
+    /// rejected request's body. A body the handler would refuse, or a binding
+    /// id that cannot be shown, leaves nothing to approve. The summary never
+    /// carries the credential value.
+    pub fn remember_knowledge_request(
+        &self,
+        token_id: &str,
+        method: &str,
+        template: &str,
+        path: &str,
+        bytes: &[u8],
+    ) {
+        let is_credential = match (method, template) {
+            ("PUT" | "DELETE", "/api/v1/host/knowledge/bindings/{binding_id}") => false,
+            ("PUT" | "DELETE", "/api/v1/host/knowledge/bindings/{binding_id}/credential") => true,
+            _ => return,
+        };
+        let Some(parsed) = crate::knowledge_host::parse_change_body(method, is_credential, bytes)
+        else {
+            return;
+        };
+        let Some(summary) = knowledge_summary(path, is_credential, &parsed) else {
+            return;
+        };
+        self.remember(
+            token_id,
+            Target {
+                operation: Operation::KnowledgeHost,
+                method: method.into(),
+                template: template.into(),
+                path: path.into(),
+                body_sha256: body_digest(bytes),
+            },
+            summary,
+        );
+    }
     fn remember(&self, token_id: &str, target: Target, summary: String) {
         // Defence in depth only: this caps `details`, not the dialog string.
         // The authoritative check is in `elevate()`, which measures the full
@@ -206,7 +242,11 @@ impl FirstPartyAuthority {
     fn target_summary(&self, token_id: &str, target: &Target) -> Option<String> {
         if matches!(
             target.template.as_str(),
-            "/api/v1/attached" | "/api/v1/idoris/install" | "/api/v1/idoris/connect"
+            "/api/v1/attached"
+                | "/api/v1/idoris/install"
+                | "/api/v1/idoris/connect"
+                | "/api/v1/host/knowledge/bindings/{binding_id}"
+                | "/api/v1/host/knowledge/bindings/{binding_id}/credential"
         ) {
             return self
                 .request_summaries
@@ -495,6 +535,17 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
                     | ("POST", "/api/v1/idoris/stop")
                     | ("POST", "/api/v1/idoris/operations/{id}/cancel")
                     | ("GET", "/api/v1/idoris/omlx/candidates")
+            ))
+        || (policy.operation == Operation::KnowledgeHost
+            && matches!(
+                (method.as_str(), policy.template),
+                ("PUT", "/api/v1/host/knowledge/bindings/{binding_id}")
+                    | ("DELETE", "/api/v1/host/knowledge/bindings/{binding_id}")
+                    | ("PUT", "/api/v1/host/knowledge/bindings/{binding_id}/credential")
+                    | (
+                        "DELETE",
+                        "/api/v1/host/knowledge/bindings/{binding_id}/credential"
+                    )
             ));
     if policy.level != AssuranceLevel::Elevated || !supported {
         return Err(EnrollErrorCode::NotElevatedOperation);
@@ -632,6 +683,95 @@ const SHOWN_MAX_CHARS: usize = 120;
 /// alone as redundancy.
 const SUMMARY_MAX_UTF16: usize = 500;
 
+/// Binding id from the request path: the last segment, or the one before
+/// `credential` on a credential route. Empty segments from a leading or
+/// trailing slash are not an id.
+fn binding_segment(path: &str, credential_route: bool) -> Option<&str> {
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let index = segments
+        .len()
+        .checked_sub(if credential_route { 2 } else { 1 })?;
+    segments.get(index).copied()
+}
+
+/// The binding id as the handler sees it: the path segment percent-decoded
+/// like axum's `Path`, refused when that is not UTF-8 or the handler would
+/// refuse the id, so `b1` and `%62%31` show the same text.
+fn binding_id_of(path: &str, credential_route: bool) -> Option<String> {
+    let raw = binding_segment(path, credential_route)?;
+    let id = percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .ok()?
+        .into_owned();
+    crate::knowledge_host::valid_binding_id(&id).then_some(id)
+}
+
+fn expires_rfc3339(secs: u64) -> Option<String> {
+    let secs = i64::try_from(secs).ok()?;
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).map(|stamp| stamp.to_rfc3339())
+}
+
+/// The approval text for `parsed`. Every request-supplied string it shows
+/// goes through [`shown`]; `None` leaves nothing to approve. The credential
+/// value is not one of them: the text has neither the value, nor a fragment
+/// of it, nor its length.
+fn knowledge_summary(
+    path: &str,
+    credential_route: bool,
+    parsed: &crate::knowledge_host::ParsedChange,
+) -> Option<String> {
+    use crate::knowledge_host::{Credential, ParsedChange};
+    let id = shown(&binding_id_of(path, credential_route)?)?;
+    match parsed {
+        ParsedChange::Activate {
+            seq,
+            endpoint: None,
+        } => Some(format!(
+            "activate Knowledge binding {id} with no Knowledge service (every call refused); sequence {seq}"
+        )),
+        ParsedChange::Activate {
+            seq,
+            endpoint: Some(endpoint),
+        } => {
+            let base = shown(&endpoint.base_url)?;
+            let bases = endpoint
+                .knowledge_base_ids
+                .iter()
+                .map(|base_id| shown(base_id))
+                .collect::<Option<Vec<_>>>()?
+                .join(", ");
+            Some(format!(
+                "activate Knowledge binding {id} for {base}; knowledge bases: [{bases}]; sequence {seq}"
+            ))
+        }
+        ParsedChange::Deactivate { seq } => {
+            Some(format!("deactivate Knowledge binding {id}; sequence {seq}"))
+        }
+        ParsedChange::PushCredential {
+            seq,
+            credential,
+            expires_at,
+        } => {
+            // The value is never read here: the parser has already limited
+            // it to visible ASCII, and the text names only its kind.
+            let kind = shown(match credential {
+                Credential::Bearer(_) => "bearer",
+                Credential::ApiKey(_) => "api_key",
+            })?;
+            let expires_at = expires_rfc3339(*expires_at)?;
+            Some(format!(
+                "replace the Knowledge credential of binding {id} ({kind}, valid until {expires_at}); sequence {seq}"
+            ))
+        }
+        ParsedChange::RevokeCredential { seq } => Some(format!(
+            "revoke the Knowledge credential of binding {id}; sequence {seq}"
+        )),
+    }
+}
+
 /// A request-supplied string as a presence summary shows it, or `None` when
 /// it cannot be shown faithfully, which leaves nothing to approve. The value
 /// comes back as a double-quoted, escaped JSON string so its boundaries are
@@ -670,7 +810,7 @@ pub fn body_digest(body: &[u8]) -> String {
 }
 
 #[cfg(test)]
-pub(crate) fn test_peer(generation: &str) -> EnrolledPeer {
+pub(crate) fn test_peer_as(generation: &str, identifier: &str) -> EnrolledPeer {
     let pid = std::process::id() as i32;
     let start =
         agent24_os_proc::start_time(pid).unwrap_or(agent24_os_proc::ProcStart { sec: 0, usec: 0 });
@@ -684,13 +824,18 @@ pub(crate) fn test_peer(generation: &str) -> EnrolledPeer {
         },
         identity: VerifiedIdentity {
             kind: IdentityKind::MacosSecCode,
-            identifier: "agent24".into(),
+            identifier: identifier.into(),
             team_id: "HYAP444FN9".into(),
             executable: std::env::current_exe().unwrap_or_default(),
             audit_token: None,
         },
         generation: generation.into(),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_peer(generation: &str) -> EnrolledPeer {
+    test_peer_as(generation, "agent24")
 }
 
 #[cfg(test)]

@@ -47,13 +47,13 @@
 | W1c | 同上 | daemon 停下之后，在数据目录和 daemon 日志里找宿主凭据 | 找不到，凭据只走 ready 管道；不能有读不了的文件 |
 | W2a | run 指名 binding | 宿主 `POST /api/v1/runs`，不带 `knowledge_binding_id` | 202，`input` 里有 `knowledge_binding_id` 这个键（OpenAPI 定为必填），值为 null |
 | W2b | 同上 | 指名一个没激活的 binding | 409 `knowledge_binding_inactive` |
-| W2c | 宿主接口 | `PUT …/bindings/kb-accept?seq=1` 激活，再建 run 指名它，然后 `GET /api/v1/runs/{id}` | 激活 204，建 run 202，读回的 `knowledge_binding_id` 为 `kb-accept` |
-| W2d | 同上 | 再发一次 `seq=1` | 409 `stale_sequence`：先发出、后到达的变更不能覆盖更新的 |
-| W2e | 同上 | `PUT …/credential?seq=2` 推送一个随机凭据，再建 run | 推送 204，建 run 202。从推送起的所有应答（包括 W2f 的两次）里都没有这个凭据；daemon 停下之后，数据目录和日志里也没有；不能有读不了的文件 |
-| W2f | 同上 | `DELETE …/bindings/kb-accept?seq=3` 停用，再指名 | 停用 204，指名 409 `knowledge_binding_inactive` |
+| W2c | 宿主接口 | `PUT …/bindings/kb-accept`，body `{"seq":1}` 激活，再建 run 指名它，然后 `GET /api/v1/runs/{id}` | 激活 204，建 run 202，读回的 `knowledge_binding_id` 为 `kb-accept` |
+| W2d | 同上 | 再发一次 body `{"seq":1}` | 409 `stale_sequence`：先发出、后到达的变更不能覆盖更新的 |
+| W2e | 同上 | `PUT …/credential`，body `{"seq":2,…}` 推送一个随机凭据，再建 run | 推送 204，建 run 202。从推送起的所有应答（包括 W2f 的两次）里都没有这个凭据；daemon 停下之后，数据目录和日志里也没有；不能有读不了的文件 |
+| W2f | 同上 | `DELETE …/bindings/kb-accept`，body `{"seq":3}` 停用，再指名 | 停用 204，指名 409 `knowledge_binding_inactive` |
 | W2r | 反面对照 | 用 main 的 `agent24d` 做 W2c 的激活，并指名一个没激活的 binding 建 run | 激活不是 204（main 没有这个接口），建 run 202（main 不查）。说明 W2b–W2f 的检查是这次加的 |
 | W3a | 非宿主调用方 | 发布 head 的 `agent24 daemon start` 起 daemon，用它的凭据指名 binding 建 run | 403 `host_authority_required` |
-| W3b | 同上 | 用同一个凭据调 `PUT …/bindings/kb-accept?seq=1` | 403 `host_authority_required` |
+| W3b | 同上 | 用同一个凭据调 `PUT …/bindings/kb-accept`，body `{"seq":1}` | 403 `host_authority_required` |
 | W3c | 同上 | 不指名 binding 建 run | 202，普通用法不受影响 |
 | W3r | 反面对照 | main 的 `agent24 daemon start`，指名 binding 建 run | 202（main 不查）。说明 W3a 的拒绝是这次加的 |
 | W4a | CLI 与桌面托管的 daemon | 按 W1 的方式拉起 daemon，在同一个数据目录上跑 `agent24 daemon status` | 退出 0，说出这个 daemon 的 pid，并说 `shutdown report unavailable: host authority unavailable` |

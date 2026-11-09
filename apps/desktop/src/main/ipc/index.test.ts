@@ -1938,7 +1938,7 @@ describe('the generic backend proxy never reaches the presence channel (CORE-2 A
 
 describe('the generic backend proxy never reaches the host interface (KB-HOST-01 PR-B1a)', () => {
   it.each([
-    '/api/v1/host/knowledge/bindings/b1?seq=1',
+    '/api/v1/host/knowledge/bindings/b1',
     '/api/v1/host',
     '/API/v1/Host/knowledge/bindings/b1',
     '/api/v1/./host/knowledge/bindings/b1',
@@ -1948,7 +1948,7 @@ describe('the generic backend proxy never reaches the host interface (KB-HOST-01
     '/api/v1/host%2Fknowledge',
     '/api/v1\\host/knowledge/bindings/b1',
     // Encoded `/` and `..` inside the id: the daemon routes the raw path.
-    '/api/v1/host/knowledge/bindings/..%2F..%2F..%2Fx?seq=1',
+    '/api/v1/host/knowledge/bindings/..%2F..%2F..%2Fx',
   ])('refuses %s without sending it', async (path) => {
     const res = await call(IpcChannels.BackendProxy, { method: 'PUT', path })
     expect(res.status).toBe(403)

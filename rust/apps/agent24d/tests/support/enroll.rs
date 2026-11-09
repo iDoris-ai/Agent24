@@ -19,9 +19,13 @@ impl IdentityVerifier for UnsignedIdentity {
         _pid: i32,
         audit_token: Option<agent24_os_proc::AuditToken>,
     ) -> Result<VerifiedIdentity, EnrollErrorCode> {
+        let identifier = std::env::var("AGENT24_TEST_ENROLL_IDENTIFIER")
+            .ok()
+            .filter(|id| ["ai.auraai.agent24", "agent24", "agent24d"].contains(&id.as_str()))
+            .unwrap_or_else(|| "agent24".to_owned());
         Ok(VerifiedIdentity {
             kind: IdentityKind::MacosSecCode,
-            identifier: "agent24".into(),
+            identifier,
             team_id: "HYAP444FN9".into(),
             executable: std::env::current_exe().map_err(|_| EnrollErrorCode::IdentityRejected)?,
             audit_token,

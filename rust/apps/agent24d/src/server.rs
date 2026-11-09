@@ -1299,6 +1299,36 @@ async fn authorize(
                                 &registrations,
                             );
                         }
+                    } else if matches!(
+                        (method.as_str(), template),
+                        (
+                            "PUT" | "DELETE",
+                            "/api/v1/host/knowledge/bindings/{binding_id}"
+                                | "/api/v1/host/knowledge/bindings/{binding_id}/credential"
+                        )
+                    ) {
+                        let request_path = req.uri().path().to_owned();
+                        let Ok(bytes) = axum::body::to_bytes(
+                            req.into_body(),
+                            agent24_domain::http::MAX_BODY_BYTES,
+                        )
+                        .await
+                        else {
+                            return error_response(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "payload_too_large",
+                                "Request body exceeds limit",
+                            );
+                        };
+                        if let Some(authority) = &state.first_party {
+                            authority.remember_knowledge_request(
+                                &authorization.claims.capability_id,
+                                method.as_str(),
+                                template,
+                                &request_path,
+                                &bytes,
+                            );
+                        }
                     }
                     return (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({"error":{"code":"presence_required","message":"Presence confirmation required","operation":format!("{operation:?}")}}))).into_response();
                 }

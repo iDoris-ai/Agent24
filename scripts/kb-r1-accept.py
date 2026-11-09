@@ -373,7 +373,10 @@ def start_run(port, token, binding=None):
 
 
 def host_change(port, token, method, seq, suffix="", body=None):
-    return call(port, method, f"/api/v1/host/knowledge/bindings/{BINDING}{suffix}?seq={seq}", token, body)
+    payload = {"seq": seq}
+    if body:
+        payload.update(body)
+    return call(port, method, f"/api/v1/host/knowledge/bindings/{BINDING}{suffix}", token, payload)
 
 
 def attach(port, token, name):
