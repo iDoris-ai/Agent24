@@ -42,6 +42,14 @@ describe('HomePage', () => {
     expect(onNavigate).toHaveBeenLastCalledWith('assistant')
   })
 
+  it('opens Settings → Activity for the ledger: the runs page is no more (M4 A6)', () => {
+    const onNavigate = vi.fn()
+    render(<HomePage backendOk={true} {...props} onNavigate={onNavigate} />)
+    fireEvent.click(screen.getByRole('button', { name: /Ledger/ }))
+    fireEvent.click(screen.getByText('Open this page →'))
+    expect(onNavigate).toHaveBeenLastCalledWith('settings/activity')
+  })
+
   it('follows the global language setting', () => {
     render(<HomePage backendOk={true} {...props} />)
     act(() => { setLocale('zh') })

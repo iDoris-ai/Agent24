@@ -2,6 +2,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react'
 import SchedulesPage from './Schedules'
+import { CapabilitiesContext } from '../capabilities/types'
+import { registerChatPage, resetHistoryStore } from './chat/history'
 import { setLocale } from '../i18n'
 
 const SCHEDULE = {
@@ -503,4 +505,27 @@ describe('SchedulesPage fired one-time rows', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
+})
+
+// M4 A6: each schedule's runs go to a conversation of its own (A5); its
+// page opens it.
+describe('a schedule\'s conversation (M4 A6)', () => {
+  beforeEach(() => { setLocale('zh'); resetHistoryStore() })
+
+  it('opens the schedule\'s conversation in the assistant, and offers none for a schedule without one yet', async () => {
+    mount([SCHEDULE, { ...SCHEDULE, id: 'sch_2', name: '月报' }])
+    const ofSchedule = vi.fn(async (id: string) => (id === 'sch_1' ? 'chat_home' : null))
+    ;(window.agent24 as unknown as { chatHistory: unknown }).chatHistory = { ofSchedule, list: vi.fn(async () => []) }
+    const open = vi.fn()
+    const opened = vi.fn()
+    registerChatPage(opened, vi.fn())
+    render(<CapabilitiesContext.Provider value={{ defs: [], open, approvalsWaiting: 0 }}><SchedulesPage /></CapabilitiesContext.Provider>)
+    const button = await screen.findByRole('button', { name: '打开它的对话' })
+    expect(screen.getAllByRole('button', { name: '打开它的对话' })).toHaveLength(1)
+    expect(ofSchedule).toHaveBeenCalledWith('sch_1')
+    expect(ofSchedule).toHaveBeenCalledWith('sch_2')
+    fireEvent.click(button)
+    expect(opened).toHaveBeenCalledWith('chat_home')
+    expect(open).toHaveBeenCalledWith('assistant', 'other')
+  })
 })
