@@ -34,6 +34,61 @@ pub fn log_dir() -> Option<PathBuf> {
     agent24_protocol::state_file::state_dir().map(|d| d.join("logs"))
 }
 
+/// M5 B1 (#1710): the daemon the LaunchAgent runs, a copy of the one given to
+/// `install` at `<data_dir>/bin/agent24d`. launchd execs the path in the plist
+/// literally, and the daemon runs its modules from its own path
+/// (agent24d `server.rs`, the module trampoline): a path inside the app bundle
+/// breaks when the app is moved, and changes under a running daemon when it
+/// is upgraded. The copy changes only in `install`, between stopping the old
+/// daemon and starting the new one. Under the data dir, as the Hyphae binary
+/// is, so `AGENT24_DATA_DIR` keeps it apart too.
+pub fn daemon_copy_path() -> Option<PathBuf> {
+    agent24_protocol::state_file::state_dir().map(|d| daemon_copy_path_in(&d))
+}
+
+/// Pure form of [`daemon_copy_path`].
+pub fn daemon_copy_path_in(data_dir: &Path) -> PathBuf {
+    data_dir.join("bin").join("agent24d")
+}
+
+/// Puts a copy of `exec` at `dest`, replacing what is there at once: written
+/// to a new file next to it, made executable, then renamed over. Bytes only:
+/// not `std::fs::copy`, which on macOS carries the source's extended
+/// attributes along, a quarantine flag among them. The code signature is in
+/// the bytes and comes along. Nothing is left behind when it fails.
+pub fn copy_daemon(exec: &Path, dest: &Path) -> Result<(), String> {
+    use std::io::Write;
+    let bytes = std::fs::read(exec).map_err(|e| format!("reading {}: {e}", exec.display()))?;
+    let dir = dest
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", dest.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    let temp = dir.join(format!(".agent24d.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    let written = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o755);
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, dest)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!(
+            "copying {} to {}: {e}",
+            exec.display(),
+            dest.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Escape text destined for an XML text node. Paths can legitimately contain
 /// `&` or `<` (e.g. a folder named "R&D"), which would otherwise produce a plist
 /// launchd silently refuses to load.
@@ -97,7 +152,9 @@ pub fn render_plist(
         <string>serve</string>
         <string>--port</string>
         <string>0</string>
-        <string>--ready-omit-token</string>
+        <string>--auth-mode</string>
+        <string>capabilities</string>
+        <string>--enroll-endpoint</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -265,7 +322,7 @@ fn prepare_log_files(dir: &Path, files: &[&Path]) -> Result<(), String> {
 
 /// Everything `install` puts on disk, idempotently: logs dir 0700 and log files
 /// 0600 (tightening ones an older install left loose), then the plist rewritten
-/// from the current template (so an old install gains `--ready-omit-token`) and
+/// from the current template (so an old install gains service mode, M5 B1) and
 /// kept owner-only because the captured env can include `OMLX_API_KEY`.
 fn write_install_files(
     exec: &Path,
@@ -292,16 +349,10 @@ fn write_install_files(
     Ok(())
 }
 
-/// Whether the installed plist already passes `--ready-omit-token`. An install
-/// made before that flag existed keeps printing the bearer into its log until
-/// `agent24 service install` is run again; `service status` uses this to say so.
-/// A missing/unreadable plist is "not stale" (nothing installed to warn about).
-pub fn plist_has_ready_omit_token(plist: &Path) -> bool {
-    std::fs::read_to_string(plist).is_ok_and(|b| b.contains("<string>--ready-omit-token</string>"))
-}
-
-/// Install (or reinstall) the LaunchAgent and start it.
-pub fn install(exec: &Path) -> Result<(PathBuf, Vec<String>), String> {
+/// Install (or reinstall) the LaunchAgent and start it, running a copy of
+/// `exec` ([`daemon_copy_path`]). Returns the plist, the copy, and the names
+/// of the variables captured into it.
+pub fn install(exec: &Path) -> Result<(PathBuf, PathBuf, Vec<String>), String> {
     if !exec.exists() {
         return Err(format!(
             "agent24d not found at {} — build it (cargo build --release -p agent24d) \
@@ -311,14 +362,17 @@ pub fn install(exec: &Path) -> Result<(PathBuf, Vec<String>), String> {
     }
     let plist = plist_path().ok_or("HOME not set")?;
     let logs = log_dir().ok_or("HOME not set")?;
+    let copy = daemon_copy_path().ok_or("HOME not set")?;
     let out_log = logs.join("agent24d.out.log");
     let err_log = logs.join("agent24d.err.log");
     // Reinstall must unload the old job first, or launchd keeps running the
     // previous ProgramArguments and the new plist looks like it did nothing.
+    // It also stops the old daemon before its file is replaced.
     bootout_if_loaded();
+    copy_daemon(exec, &copy)?;
 
     let env = capture_env();
-    write_install_files(exec, &plist, &out_log, &err_log, &env)?;
+    write_install_files(&copy, &plist, &out_log, &err_log, &env)?;
 
     let target = format!("gui/{}", uid());
     let out = launchctl(&["bootstrap", &target, &plist.to_string_lossy()])?;
@@ -333,17 +387,21 @@ pub fn install(exec: &Path) -> Result<(PathBuf, Vec<String>), String> {
             }
         ));
     }
-    Ok((plist, env.into_iter().map(|(k, _)| k).collect()))
+    Ok((plist, copy, env.into_iter().map(|(k, _)| k).collect()))
 }
 
 /// Stop and remove the LaunchAgent. Idempotent.
 pub fn uninstall() -> Result<(), String> {
     bootout_if_loaded();
-    let plist = plist_path().ok_or("HOME not set")?;
-    match std::fs::remove_file(&plist) {
+    remove_if_there(&plist_path().ok_or("HOME not set")?)?;
+    remove_if_there(&daemon_copy_path().ok_or("HOME not set")?)
+}
+
+fn remove_if_there(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("removing {}: {e}", plist.display())),
+        Err(e) => Err(format!("removing {}: {e}", path.display())),
     }
 }
 
@@ -397,9 +455,116 @@ mod tests {
     }
 
     #[test]
-    fn plist_tells_the_daemon_not_to_print_its_token_into_the_log() {
-        let p = render_plist(Path::new("/a"), Path::new("/o"), Path::new("/e"), &[]);
-        assert!(p.contains("<string>--ready-omit-token</string>"));
+    fn plist_runs_the_daemon_in_service_mode_and_nothing_else() {
+        // M5 B1 (#1710): a capability daemon with its enrolment endpoint, no
+        // token anywhere (daemon.json, the ready line, the log), no legacy flag.
+        let p = render_plist(
+            Path::new("/a/agent24d"),
+            Path::new("/o"),
+            Path::new("/e"),
+            &[],
+        );
+        let args = p
+            .split("<key>ProgramArguments</key>")
+            .nth(1)
+            .and_then(|rest| rest.split("</array>").next())
+            .unwrap();
+        let args: Vec<&str> = args
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("<string>")?.strip_suffix("</string>"))
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "/a/agent24d",
+                "serve",
+                "--port",
+                "0",
+                "--auth-mode",
+                "capabilities",
+                "--enroll-endpoint"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_copy_lives_in_the_data_dir() {
+        assert_eq!(
+            daemon_copy_path_in(Path::new("/d")),
+            Path::new("/d/bin/agent24d")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copies_the_daemon_executable_and_replaces_an_old_copy_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("a24-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let exec = root.join("agent24d");
+        std::fs::write(&exec, b"new daemon").unwrap();
+        let dest = root.join("data/bin/agent24d");
+
+        copy_daemon(&exec, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new daemon");
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        // An old copy, and a temp file left by an install that died: replaced,
+        // and nothing else stays in the directory.
+        std::fs::write(&dest, b"old daemon, longer than the new one").unwrap();
+        std::fs::write(
+            dest.with_file_name(format!(".agent24d.{}.tmp", std::process::id())),
+            b"x",
+        )
+        .unwrap();
+        copy_daemon(&exec, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new daemon");
+        let left: Vec<_> = std::fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["agent24d"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_daemon_that_is_not_there_is_not_copied_and_leaves_nothing() {
+        let root = std::env::temp_dir().join(format!("a24-copy-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dest = root.join("bin/agent24d");
+        assert!(copy_daemon(&root.join("nowhere"), &dest).is_err());
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_copy_does_not_carry_the_sources_extended_attributes() {
+        // A quarantine flag on the app's daemon must not follow it to the copy
+        // launchd runs (std::fs::copy would carry it along).
+        let root = std::env::temp_dir().join(format!("a24-copy-xattr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let exec = root.join("agent24d");
+        std::fs::write(&exec, b"daemon").unwrap();
+        let set = std::process::Command::new("xattr")
+            .args(["-w", "com.apple.quarantine", "0081;00000000;Test;"])
+            .arg(&exec)
+            .status()
+            .unwrap();
+        assert!(set.success(), "control: the source carries the attribute");
+        let dest = root.join("bin/agent24d");
+        copy_daemon(&exec, &dest).unwrap();
+        let listed = std::process::Command::new("xattr")
+            .arg(&dest)
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&listed.stdout).contains("com.apple.quarantine"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]
@@ -425,7 +590,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn reinstall_over_an_old_plist_adds_the_flag_and_tightens_the_logs() {
+    fn reinstall_over_an_old_plist_moves_it_to_service_mode_and_tightens_the_logs() {
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("a24-reinstall-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -434,23 +599,35 @@ mod tests {
         std::fs::create_dir_all(&logs).unwrap();
         std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
         let (out, err) = (logs.join("o.log"), logs.join("e.log"));
-        // An install from before this change: no flag, loose permissions.
-        let old = render_plist(Path::new("/old/agent24d"), &out, &err, &[])
-            .replace("        <string>--ready-omit-token</string>\n", "");
+        // An install from before service mode: legacy flags, loose permissions.
+        let old = render_plist(Path::new("/old/agent24d"), &out, &err, &[]).replace(
+            "        <string>--auth-mode</string>\n        <string>capabilities</string>\n        <string>--enroll-endpoint</string>\n",
+            "        <string>--ready-omit-token</string>\n",
+        );
         std::fs::write(&plist, &old).unwrap();
         std::fs::set_permissions(&plist, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::write(&out, "x").unwrap();
         std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let service_mode = |p: &Path| {
+            std::fs::read_to_string(p)
+                .unwrap()
+                .contains("<string>--enroll-endpoint</string>")
+        };
         assert!(
-            !plist_has_ready_omit_token(&plist),
-            "control: old plist lacks the flag"
+            !service_mode(&plist),
+            "control: the old plist is not in service mode"
         );
 
         write_install_files(Path::new("/new/agent24d"), &plist, &out, &err, &[]).unwrap();
 
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert!(plist_has_ready_omit_token(&plist));
+        assert!(service_mode(&plist));
+        assert!(
+            !std::fs::read_to_string(&plist)
+                .unwrap()
+                .contains("--ready-omit-token")
+        );
         assert!(
             std::fs::read_to_string(&plist)
                 .unwrap()
@@ -461,13 +638,6 @@ mod tests {
         assert_eq!(mode(&out), 0o600);
         assert_eq!(mode(&err), 0o600);
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_missing_plist_is_not_reported_as_stale() {
-        assert!(!plist_has_ready_omit_token(Path::new(
-            "/nonexistent/x.plist"
-        )));
     }
 
     #[test]

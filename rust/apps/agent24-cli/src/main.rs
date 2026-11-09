@@ -3040,6 +3040,18 @@ async fn cmd_tui() -> Result<(), String> {
     result
 }
 
+/// M5 B1: how the running daemon authenticates, and where it enrols.
+fn service_mode_line(st: &DaemonState) -> String {
+    let mode = match st.auth_mode {
+        state_file::AuthMode::Capabilities => "capabilities",
+        state_file::AuthMode::LegacySingleToken => "legacy_single_token",
+    };
+    match &st.enroll_endpoint {
+        Some(endpoint) => format!("mode:      {mode} (enrolment endpoint {endpoint})"),
+        None => format!("mode:      {mode} (no enrolment endpoint)"),
+    }
+}
+
 fn cmd_service(action: ServiceAction) -> Result<(), String> {
     match action {
         ServiceAction::Install => {
@@ -3052,10 +3064,15 @@ fn cmd_service(action: ServiceAction) -> Result<(), String> {
                     exec.display()
                 )
             })?;
-            let (plist, captured) = service::install(&exec)?;
+            let (plist, copy, captured) = service::install(&exec)?;
             println!("24/7 enabled.");
             println!("  agent:  {}", plist.display());
-            println!("  daemon: {}", exec.display());
+            println!(
+                "  daemon: {} (a copy of {})",
+                copy.display(),
+                exec.display()
+            );
+            println!("  mode:   capabilities, with the enrolment endpoint");
             if let Some(logs) = service::log_dir() {
                 println!("  logs:   {}", logs.display());
             }
@@ -3071,7 +3088,7 @@ fn cmd_service(action: ServiceAction) -> Result<(), String> {
         }
         ServiceAction::Uninstall => {
             service::uninstall()?;
-            println!("24/7 disabled; the LaunchAgent is stopped and removed.");
+            println!("24/7 disabled; the LaunchAgent and its daemon copy are stopped and removed.");
             Ok(())
         }
         ServiceAction::Status => {
@@ -3080,15 +3097,12 @@ fn cmd_service(action: ServiceAction) -> Result<(), String> {
             println!("loaded:    {}", if loaded { "yes" } else { "no" });
             if let Some(p) = plist {
                 println!("plist:     {}", p.display());
-                if installed && !service::plist_has_ready_omit_token(&p) {
-                    println!(
-                        "note:      this LaunchAgent predates --ready-omit-token and still \
-                         logs the daemon bearer token; run `agent24 service install` to update it"
-                    );
-                }
             }
             match state_file::read_live() {
-                Some(st) => println!("daemon:    running (pid {}, port {})", st.pid, st.port),
+                Some(st) => {
+                    println!("daemon:    running (pid {}, port {})", st.pid, st.port);
+                    println!("{}", service_mode_line(&st));
+                }
                 None => println!("daemon:    not running"),
             }
             Ok(())
@@ -3154,6 +3168,33 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn service_status_says_the_daemons_mode_and_where_it_enrols() {
+        // M5 B1 (#1710).
+        let state = |auth_mode, enroll_endpoint: Option<&str>| DaemonState {
+            port: 1,
+            token: String::new(),
+            pid: 2,
+            version: String::new(),
+            generation: String::new(),
+            auth_mode,
+            protocol_version: None,
+            enroll_endpoint: enroll_endpoint.map(str::to_owned),
+            startup_state: None,
+        };
+        assert_eq!(
+            service_mode_line(&state(
+                state_file::AuthMode::Capabilities,
+                Some("/d/enroll.sock")
+            )),
+            "mode:      capabilities (enrolment endpoint /d/enroll.sock)"
+        );
+        assert_eq!(
+            service_mode_line(&state(state_file::AuthMode::LegacySingleToken, None)),
+            "mode:      legacy_single_token (no enrolment endpoint)"
+        );
+    }
 
     #[test]
     fn package_integrity_command_reaches_the_shared_checker() {
