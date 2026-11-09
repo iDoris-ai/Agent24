@@ -11,7 +11,7 @@ import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import { useT } from '../../i18n'
 import { chatMessages } from '../Chat.i18n'
 import { createChatSession } from '../chat-knowledge'
-import { cancelRun, createRun, decideApproval, listPendingApprovals, type Approval } from '../agent/api'
+import { cancelRun, createRun, decideApproval, listPendingApprovals, type Approval, type Decision } from '../agent/api'
 import { grounding } from '../knowledge-grounding'
 import { forgetPromotion, getHistoryState, promoteRun, subscribeHistory } from './history'
 import { askRunAgain, useRunViews, type RunView } from './run-status'
@@ -34,9 +34,25 @@ export function elapsed(ms: number): string {
   return h > 0 ? `${h}:${two(Math.floor((s % 3600) / 60))}:${two(s % 60)}` : `${two(Math.floor(s / 60))}:${two(s % 60)}`
 }
 
-/** The run's pending approval, when it offers `approve`. */
-function approvableOf(list: readonly Approval[], runId: string): Approval | null {
-  return list.find(a => a.run_id === runId && a.available_decisions.includes('approve')) ?? null
+// The reason's line, as on the approvals page it replaces (inline, like there).
+const DENY_FORM = { display: 'flex', gap: 6, alignItems: 'center', flexBasis: '100%' } as const
+const DENY_INPUT = {
+  flex: 1, fontSize: 12, padding: '4px 8px', background: 'var(--surface2)', color: 'var(--text)',
+  border: '1px solid var(--border)', borderRadius: 4,
+} as const
+
+/** What the card can decide of the run's pending approval. */
+interface Offers { approve: boolean; deny: boolean }
+const NO_OFFERS: Offers = { approve: false, deny: false }
+function offersOf(list: readonly Approval[], runId: string): Offers {
+  const approval = list.find(a => a.run_id === runId)
+  return approval
+    ? { approve: approval.available_decisions.includes('approve'), deny: approval.available_decisions.includes('deny') }
+    : NO_OFFERS
+}
+/** The run's pending approval, when it offers this decision. */
+function pendingOf(list: readonly Approval[], runId: string, type: string): Approval | null {
+  return list.find(a => a.run_id === runId && a.available_decisions.includes(type)) ?? null
 }
 
 /** The tasks of the conversation the page shows. */
@@ -79,28 +95,32 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
       askRunAgain(task.run_id)
     }
   }
-  // "Confirm" is `approve` and nothing else: this one request. The daemon's
-  // decisions are an open set (openapi `Decision`); the others grant more
-  // (`approve_for_session`, `approve_for_target`) or end the run (`abort`),
-  // and denying takes a reason: all of them on the approvals page
-  // (Knowledge's review of #1700). Whether the run's approval offers
-  // `approve` is asked once it waits, and again when it is confirmed.
+  // "Confirm" is `approve` and nothing else: this one request. "Deny" is
+  // `deny`, with the reason the user gives here (the model is told it, and
+  // the run goes on; SPEC-002). The daemon's decisions are an open set
+  // (openapi `Decision`); the others grant more (`approve_for_session`,
+  // `approve_for_target`) or end the run (`abort`) and are not offered here
+  // (Knowledge's review of #1700). What the run's approval offers is asked
+  // once it waits, and again when it is decided.
   const waiting = status === 'awaiting_approval'
-  const [approvable, setApprovable] = useState<boolean | null>(null)
+  const [offers, setOffers] = useState<Offers | null>(null)
   useEffect(() => {
-    setApprovable(null)
+    setOffers(null)
     if (!waiting) return
     let live = true
     listPendingApprovals()
-      .then(list => { if (live) setApprovable(approvableOf(list, task.run_id) !== null) })
-      .catch(() => { if (live) setApprovable(false) })
+      .then(list => { if (live) setOffers(offersOf(list, task.run_id)) })
+      .catch(() => { if (live) setOffers(NO_OFFERS) })
     return () => { live = false }
   }, [waiting, task.run_id])
-  const confirm = () => act(async () => {
-    const approval = approvableOf(await listPendingApprovals(), task.run_id)
+  const decide = (decision: Decision) => act(async () => {
+    const approval = pendingOf(await listPendingApprovals(), task.run_id, decision.type)
     if (!approval) throw new Error(t('task.noApproval'))
-    await decideApproval(approval.id, { type: 'approve' })
+    await decideApproval(approval.id, decision)
+    setDenying(false)
   })
+  const [denying, setDenying] = useState(false)
+  const [reason, setReason] = useState('')
   const label = t(labelOf(status))
   // A completed run's answer, with only what its record backs (as replies
   // are, Chat.tsx): the answer may name sources the run never read.
@@ -121,14 +141,27 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
         </div>
       )}
       <span className="task-card-actions">
-        {waiting && approvable === true && (
-          <button type="button" className="btn" disabled={busy} onClick={() => void confirm()}>{t('task.confirm')}</button>
+        {waiting && offers?.approve && !denying && (
+          <button type="button" className="btn" disabled={busy} onClick={() => void decide({ type: 'approve' })}>{t('task.confirm')}</button>
         )}
-        {waiting && approvable === false && <span className="task-card-knowledge" role="note">{t('task.decideOnApprovals')}</span>}
+        {waiting && offers?.deny && !denying && (
+          <button type="button" className="btn" disabled={busy} onClick={() => setDenying(true)}>{t('task.deny')}</button>
+        )}
+        {waiting && offers !== null && !offers.approve && !offers.deny && (
+          <span className="task-card-knowledge" role="note">{t('task.decideInTui')}</span>
+        )}
         {active && (
           <button type="button" className="btn" disabled={busy} onClick={() => void act(() => cancelRun(task.run_id))}>{t('task.stop')}</button>
         )}
       </span>
+      {waiting && denying && (
+        <form style={DENY_FORM} onSubmit={e => { e.preventDefault(); if (reason.trim()) void decide({ type: 'deny', reason: reason.trim() }) }}>
+          <input style={DENY_INPUT} aria-label={t('task.denyReason')} placeholder={t('task.denyReason')} value={reason}
+            onChange={e => setReason(e.target.value)} disabled={busy} autoFocus />
+          <button type="submit" className="btn" disabled={busy || reason.trim() === ''}>{t('task.denySend')}</button>
+          <button type="button" className="btn" disabled={busy} onClick={() => setDenying(false)}>{t('task.denyCancel')}</button>
+        </form>
+      )}
     </div>
   )
 }

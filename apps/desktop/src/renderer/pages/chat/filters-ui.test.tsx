@@ -2,6 +2,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { chatMessages } from '../Chat.i18n'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { createChatHistoryStore } from '../../../main/chat-history'
@@ -179,5 +180,57 @@ describe('the history list\'s four filters (M4 A3)', () => {
     expect(active).toHaveFocus()
     expect(active.tagName).toBe('BUTTON')
     expect(active).toHaveAttribute('aria-pressed', 'false')
+  })
+})
+
+// M4 A6: deleting stops the tasks still going on, and the question says so
+// (PR-Daemon #1700 L2).
+describe('deleting asks first, naming the tasks it stops (M4 A6)', () => {
+  const deleteFromMenu = (title: string) => {
+    fireEvent.click(within(list()).getByRole('button', { name: `对话「${title}」的操作` }))
+    fireEvent.click(within(within(list()).getByRole('menu')).getByRole('menuitem', { name: '删除…' }))
+  }
+
+  it('names the tasks still going on in a conversation to delete', async () => {
+    store.save(record('chat_a', '周报', 4))
+    store.save(record('chat_b', '日报', 3))
+    for (const id of ['run_1', 'run_2', 'run_3']) store.promoteRun('chat_a', id)
+    store.promoteRun('chat_b', 'run_b')
+    runs = { run_1: 'running', run_2: 'awaiting_approval', run_3: 'completed', run_b: 'completed' }
+    await showList()
+    await waitFor(() => expect(filter(/^进行中/)).toHaveTextContent('进行中(1)'))
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    deleteFromMenu('周报')
+    expect(confirm).toHaveBeenLastCalledWith('删除对话「周报」？其中 2 个进行中的任务会一并停止。删除后不能恢复。')
+    deleteFromMenu('日报')
+    expect(confirm).toHaveBeenLastCalledWith('删除对话「日报」？删除后不能恢复。')
+    fireEvent.click(within(list()).getByRole('button', { name: '清空' }))
+    expect(confirm).toHaveBeenLastCalledWith('删除这台电脑上保存的全部对话？2 个进行中的任务会一并停止。删除后不能恢复。')
+    expect(store.list()).toHaveLength(2)
+  })
+
+  it.each([
+    ['en', 'A task could not be stopped, so nothing was deleted. Try again once the assistant is running.'],
+    ['zh', '有任务没能停下，所以什么都没删。请在助理运行时再试一次。'],
+    ['th', 'หยุดงานบางงานไม่ได้ จึงยังไม่ได้ลบอะไร ลองอีกครั้งเมื่อผู้ช่วยทำงานอยู่'],
+  ] as const)('says in %s that nothing was deleted when a task could not be stopped', (locale, text) => {
+    expect(chatMessages[locale]['history.tasksNotStopped']).toBe(text)
+  })
+
+  it('keeps the conversation and says so when a task of it cannot be stopped (Codex A6 C1)', async () => {
+    store.save(record('chat_a', '周报', 4))
+    store.promoteRun('chat_a', 'run_1')
+    runs = { run_1: 'running' }
+    await showList()
+    await waitFor(() => expect(filter(/^进行中/)).toHaveTextContent('进行中(1)'))
+    proxy.mockImplementation(async (req: { path: string }) => (req.path.endsWith('/cancel')
+      ? { ok: false, status: 503, data: null } : { ok: true, status: 200, data: { id: 'run_1', status: 'running' } }))
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const alert = vi.spyOn(window, 'alert').mockImplementation(() => {})
+    deleteFromMenu('周报')
+    await waitFor(() => expect(alert).toHaveBeenCalledWith('有任务没能停下，所以什么都没删。请在助理运行时再试一次。'))
+    fireEvent.click(within(list()).getByRole('button', { name: '清空' }))
+    await waitFor(() => expect(alert).toHaveBeenCalledTimes(2))
+    expect(store.list()).toHaveLength(1)
   })
 })

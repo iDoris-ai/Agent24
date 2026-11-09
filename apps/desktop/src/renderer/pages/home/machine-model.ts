@@ -34,9 +34,9 @@ export const STATIONS: readonly Station[] = [
   { id: 'daemon', n: 4, box: [4, 4.5, 3, 3], h: 1.9 },
   { id: 'memory', n: 5, page: 'memory', box: [4, 0.5, 3, 1.6], h: 2.1 },
   { id: 'models', n: 6, page: 'models', box: [9, 0.8, 2.4, 2], h: 1.6 },
-  { id: 'gate', n: 7, page: 'approvals', box: [9.4, 3.7, 1.6, 0.6], h: 1.2 },
+  { id: 'gate', n: 7, page: 'assistant', box: [9.4, 3.7, 1.6, 0.6], h: 1.2 },
   { id: 'tools', n: 8, page: 'modules-manager', box: [9, 5, 2.4, 2], h: 1.3 },
-  { id: 'store', n: 9, page: 'runs', box: [4, 9, 3, 1.8], h: 0.3 },
+  { id: 'store', n: 9, page: 'settings/activity', box: [4, 9, 3, 1.8], h: 0.3 },
 ]
 
 export const STATION_BY_ID = Object.fromEntries(STATIONS.map((s) => [s.id, s])) as Record<StationId, Station>

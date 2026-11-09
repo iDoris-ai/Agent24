@@ -351,11 +351,45 @@ export function openConversation(id: string): void {
   opener?.(id)
 }
 
-/** Deletes one conversation; deleting the open one starts a new chat. The
- *  open one is not deleted while its reply is in flight: the reply would
- *  save it again. */
+/** M4 A6: a conversation's tasks are stopped before it goes, so none is
+ *  left running with its conversation gone: its card was the only place it
+ *  showed (the runs page is no more; PR-Daemon #1700 L2). Each is cancelled
+ *  as it is: the daemon's cancel is idempotent and valid in any state
+ *  (openapi `cancelRun`), so no status is asked first that could change in
+ *  between (Codex A6 C4). A run the daemon no longer has is not running.
+ *  Resolves false when one could not be cancelled. */
+async function stopTasks(runIds: readonly string[]): Promise<boolean> {
+  const proxy = typeof window === 'undefined' ? undefined : window.agent24?.backendProxy
+  if (!proxy) return false
+  const left = [...new Set(runIds)]
+  let stopped = true
+  const next = async (): Promise<void> => {
+    for (let runId = left.shift(); runId !== undefined; runId = left.shift()) {
+      const res = await proxy({ method: 'POST', path: `/api/v1/runs/${encodeURIComponent(runId)}/cancel` }).catch(() => null)
+      if (!res || (!res.ok && res.status !== 404)) stopped = false
+    }
+  }
+  await Promise.all(Array.from({ length: STOP_AT_ONCE }, next))
+  return stopped
+}
+/** How many cancels go at once. */
+const STOP_AT_ONCE = 4
+/** What a deletion that could not stop a task of it throws: the
+ *  conversation stays, and so do its cards (Codex A6 C1). */
+export const TASKS_NOT_STOPPED = 'tasks_not_stopped'
+
+/** Deletes one conversation, once its tasks are stopped; deleting the open
+ *  one starts a new chat. The open one is not deleted while its reply is in
+ *  flight: the reply would save it again. Throws TASKS_NOT_STOPPED, and
+ *  deletes nothing, when a task could not be stopped. */
 export async function deleteConversation(id: string): Promise<void> {
   if (state.busy && state.activeId === id) return
+  const tasks = state.items.find(item => item.id === id)?.tasks ?? []
+  if (tasks.length > 0) {
+    if (!(await stopTasks(tasks.map(task => task.run_id)))) throw new Error(TASKS_NOT_STOPPED)
+    // A reply sent while the tasks were stopped: kept, as above.
+    if (state.busy && state.activeId === id) return
+  }
   deletedAt.set(id, ++seq)
   promoteAfterSave.delete(id)
   unsaved.delete(id)
@@ -369,10 +403,17 @@ export async function deleteConversation(id: string): Promise<void> {
   await refreshHistory()
 }
 
-/** Deletes every conversation and starts a new chat; not while a reply is
- *  in flight, for the same reason. */
+/** Deletes every conversation, once their tasks are stopped, and starts a
+ *  new chat; not while a reply is in flight, for the same reason. The new
+ *  chat starts only then, so nothing asked in it while the tasks are
+ *  stopped goes with the rest (Codex A6 C2). */
 export async function clearConversations(): Promise<void> {
   if (state.busy) return
+  const tasks = state.items.flatMap(item => item.tasks)
+  if (tasks.length > 0) {
+    if (!(await stopTasks(tasks.map(task => task.run_id)))) throw new Error(TASKS_NOT_STOPPED)
+    if (state.busy) return
+  }
   clearedAt = ++seq
   promoteAfterSave.clear()
   unsaved.clear()

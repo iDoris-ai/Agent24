@@ -65,6 +65,9 @@ const api = {
       ipcRenderer.invoke(IpcChannels.ChatHistoryOrganize, id, patch),
     promoteRun: (id: string, runId: string): Promise<ChatHistorySummary | null> =>
       ipcRenderer.invoke(IpcChannels.ChatHistoryPromoteRun, id, runId),
+    /** M4 A6: the conversation a schedule's runs go to, if it has one yet. */
+    ofSchedule: (scheduleId: string): Promise<string | null> =>
+      ipcRenderer.invoke(IpcChannels.ScheduleConversation, scheduleId),
     onChanged: (cb: (summary: ChatHistorySummary) => void): (() => void) => {
       const listener = (_event: unknown, summary: ChatHistorySummary): void => cb(summary)
       ipcRenderer.on(IpcChannels.ChatHistoryChanged, listener)
