@@ -228,12 +228,14 @@ export interface EnrolSession {
   /** Renew on this connection; resolves with the new token. */
   renew(): Promise<string>
   /** A turn on this connection (M5 B3): no renew comes until `fn` has
-   * finished, so the token is the same throughout (the daemon binds both the
-   * request it remembers on a 403 and the grant to it). In it, `elevate`
+   * finished, so `token` (passed to `fn`) is the one throughout: the daemon
+   * binds both the request it remembers on a 403 and the grant to it, so
+   * whatever `fn` sends must carry it. Refused at once on a connection that
+   * has ended (Codex B3b r2 C1). In it, `elevate`
    * asks for a one-shot grant for `request`, waiting for the user up to
    * `ELEVATION_WAIT_MS`; it rejects with an [`EnrolError`], and a daemon
    * `error` frame (denied, timed out, unavailable) leaves the connection open. */
-  turn<T>(fn: (elevate: (request: ElevateRequest) => Promise<string>) => Promise<T>): Promise<T>
+  turn<T>(fn: (elevate: (request: ElevateRequest) => Promise<string>, token: string) => Promise<T>): Promise<T>
   /** Called once when the connection ends (the daemon went away, a renew failed, close()). */
   onClose(listener: (why: EnrolError) => void): void
   close(): void
@@ -297,9 +299,10 @@ export async function enrol(target: EnrolTarget, connect: Connect = defaultConne
     },
     turn(fn) {
       return exclusive(async () => {
+        if (conn.closed) throw new EnrolError('closed', 'the enrolment connection has ended')
         let inTurn = true
         try {
-          return await fn((request) => (inTurn ? elevate(request) : Promise.reject(new EnrolError('closed', 'elevate outside its turn'))))
+          return await fn((request) => (inTurn ? elevate(request) : Promise.reject(new EnrolError('closed', 'elevate outside its turn'))), current)
         } finally {
           inTurn = false
         }

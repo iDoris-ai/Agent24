@@ -363,6 +363,21 @@ describe('elevate on the token connection (M5 B3)', () => {
     expect(got.map((f) => f['op'])).toEqual(['renew'])
   })
 
+  it('a turn is given the token it is bound to: the current one, renewed or not (Codex B3b r2 C1)', async () => {
+    const { session } = await daemon(() => granted())
+    await expect(session.turn(async (_e, token) => token)).resolves.toBe(TOKEN)
+    const renewed = await session.renew()
+    await expect(session.turn(async (_e, token) => token)).resolves.toBe(renewed)
+  })
+
+  it('a turn on a connection that has ended never runs (Codex B3b r2 C1)', async () => {
+    const { session } = await daemon(() => granted())
+    session.close()
+    let ran = false
+    expect(await codeOf(session.turn(async () => { ran = true }))).toBe('closed')
+    expect(ran).toBe(false)
+  })
+
   it('on a connection already gone, rejects at once and never runs `use`', async () => {
     const { session } = await daemon(() => granted())
     session.close()

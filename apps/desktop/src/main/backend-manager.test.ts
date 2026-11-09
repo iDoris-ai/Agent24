@@ -1782,7 +1782,7 @@ describe('BackendManager enrols with the LaunchAgent daemon (M5 B2)', () => {
       renew: vi.fn(async () => { n += 1; s.token = `daily-${n}`; return s.token }),
       onClose: (l: (why: EnrolError) => void) => { listeners.push(l) },
       close: vi.fn(),
-      turn: vi.fn(async (fn: (elevate: () => Promise<string>) => Promise<unknown>) => fn(async () => `grant-for-${s.token}`)),
+      turn: vi.fn(async (fn: (elevate: () => Promise<string>, token: string) => Promise<unknown>) => fn(async () => `grant-for-${s.token}`, s.token)),
       end: (code: string) => { for (const l of listeners.splice(0)) l(new EnrolError(code, code)) },
     }
     return s
