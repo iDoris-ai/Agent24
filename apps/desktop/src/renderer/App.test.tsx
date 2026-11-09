@@ -55,7 +55,7 @@ describe('App', () => {
 
   it('renders the fixed sidebar and default pins without Workbench', async () => {
     await act(async () => { render(<App />) })
-    expect(screen.getAllByText('助手').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('助理').length).toBeGreaterThan(0)
     expect(screen.queryByText('工作台')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: '能力中心' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '本地模型' })).not.toBeInTheDocument()
@@ -301,7 +301,7 @@ describe('App', () => {
   })
 
   // M1-T14: switching to another page and back used to UNMOUNT ChatPage
-  // (`{page === 'chat' && <ChatPage />}`), which reset its message list and
+  // (`{page === 'assistant' && <ChatPage />}`), which reset its message list and
   // minted a fresh `session_id` — silently starting a new D1 memory session
   // on every round trip through another page. ChatPage must now stay
   // mounted (hidden via `display: none`) so a conversation survives
@@ -334,7 +334,7 @@ describe('App', () => {
     await waitFor(() => {
       expect(screen.getByText('hello there')).not.toBeVisible()
     })
-    fireEvent.click(within(screen.getByRole('navigation', { name: '主导航' })).getByRole('button', { name: '助手' }))
+    fireEvent.click(within(screen.getByRole('navigation', { name: '主导航' })).getByRole('button', { name: '助理' }))
 
     // The message list and session id must be exactly as they were.
     await waitFor(() => {
@@ -368,7 +368,7 @@ describe('App', () => {
     )?.[0].body.session_id
     expect(thirdSessionId).not.toBe(firstSessionId)
     fireEvent.click(screen.getByRole('button', { name: '能力中心' }))
-    fireEvent.click(within(screen.getByRole('navigation', { name: '主导航' })).getByRole('button', { name: '助手' }))
+    fireEvent.click(within(screen.getByRole('navigation', { name: '主导航' })).getByRole('button', { name: '助理' }))
     await waitFor(() => expect(screen.getByText('fresh topic')).toBeVisible())
   })
 })
@@ -395,13 +395,13 @@ describe('App navigation integration', () => {
     // Three of three: the sidebar offers no "+ Pin" row.
     expect(nav().queryByRole('button', { name: '+ Pin a capability' })).toBeNull()
     center()
-    expect(row('Schedules').getByText('Manage recurring and scheduled tasks.')).toBeInTheDocument()
-    expect(row('Schedules').getByRole('button', { name: 'Slots full Schedules' })).toBeDisabled()
+    expect(row('Proactive').getByText('What the assistant does on its own, on schedule; each schedule\'s runs are in its own conversation.')).toBeInTheDocument()
+    expect(row('Proactive').getByRole('button', { name: 'Slots full Proactive' })).toBeDisabled()
     fireEvent.click(row('Create').getByRole('button', { name: 'Pinned Create' }))
-    await waitFor(() => expect(row('Schedules').getByRole('button', { name: 'Pin Schedules' })).toBeEnabled())
+    await waitFor(() => expect(row('Proactive').getByRole('button', { name: 'Pin Proactive' })).toBeEnabled())
     expect(nav().queryByRole('button', { name: 'Create' })).not.toBeInTheDocument()
-    fireEvent.click(row('Schedules').getByRole('button', { name: 'Pin Schedules' }))
-    await waitFor(() => expect(nav().getByRole('button', { name: 'Schedules' })).toBeInTheDocument())
+    fireEvent.click(row('Proactive').getByRole('button', { name: 'Pin Proactive' }))
+    await waitFor(() => expect(nav().getByRole('button', { name: 'Proactive' })).toBeInTheDocument())
     expect(mockSetNavPrefs.mock.calls).toEqual([
       [{ pinned: ['documents', 'design'], slotCount: 3, showOverview: true }],
       [{ pinned: ['documents', 'design', 'schedules'], slotCount: 3, showOverview: true }],
@@ -411,7 +411,7 @@ describe('App navigation integration', () => {
   it('opens Schedules with cmd-K sch Enter without a breadcrumb, and returns from Documents to the center', async () => {
     await act(async () => { render(<App />) })
     await switchTo('sch')
-    expect(screen.getByText('Schedules', { selector: '.page-title' })).toBeInTheDocument()
+    expect(screen.getByText('Proactive', { selector: '.page-title' })).toBeInTheDocument()
     expect(screen.queryByRole('navigation', { name: 'Breadcrumb' })).not.toBeInTheDocument()
     center()
     for (const button of ['Documents', 'Open']) {
@@ -500,9 +500,9 @@ describe('App navigation integration', () => {
         } } : { status: 'ok' },
     }))
     await act(async () => { render(<App />) })
-    expect(nav().getByRole('button', { name: /Capabilities\s*2/ })).toHaveTextContent('2')
+    // M4 A6: approvals are decided in the assistant; their count is on it.
+    expect(nav().getByRole('button', { name: /Assistant\s*2/ })).toHaveTextContent('2')
     center()
-    expect(row('Approvals').getByRole('status', { name: '2 waiting' })).toHaveTextContent('2')
     await waitFor(() => expect(row('Local models').getByText('Installed · not connected')).toBeInTheDocument())
     expect(row('Communication').getByText('Running')).toBeInTheDocument()
   })

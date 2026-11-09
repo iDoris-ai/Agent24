@@ -6,7 +6,7 @@ function capability(id: string, group: CapabilityGroup, page = id, builtin = fal
 }
 
 export const CAPABILITIES: readonly CapabilityDef[] = [
-  capability('assistant', 'office', 'chat', true, true),
+  capability('assistant', 'office', 'assistant', true, true),
   capability('documents', 'office', 'documents', true),
   capability('localModels', 'office', 'models'),
   capability('voice', 'office'),
@@ -19,7 +19,6 @@ export const CAPABILITIES: readonly CapabilityDef[] = [
   capability('tools', 'tools', 'modules-manager'),
   capability('memory', 'services'),
   capability('schedules', 'services'),
-  capability('approvals', 'services'),
   capability('communication', 'services'),
 ]
 

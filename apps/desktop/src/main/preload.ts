@@ -39,6 +39,7 @@ import {
   type CreativeViewResult,
   type LlmStatusResult,
   type ModelCallEnvelope,
+  type RunEvent,
   type OpenDesignComponentStatusResult,
   type OmlxAuthRequiredResult,
   type OmlxDetectResult,
@@ -62,6 +63,16 @@ const api = {
       ipcRenderer.invoke(IpcChannels.ChatHistorySetTitle, id, title, source),
     organize: (id: string, patch: ChatHistoryOrganize): Promise<ChatHistorySummary | null> =>
       ipcRenderer.invoke(IpcChannels.ChatHistoryOrganize, id, patch),
+    promoteRun: (id: string, runId: string): Promise<ChatHistorySummary | null> =>
+      ipcRenderer.invoke(IpcChannels.ChatHistoryPromoteRun, id, runId),
+    /** M4 A6: the conversation a schedule's runs go to, if it has one yet. */
+    ofSchedule: (scheduleId: string): Promise<string | null> =>
+      ipcRenderer.invoke(IpcChannels.ScheduleConversation, scheduleId),
+    onChanged: (cb: (summary: ChatHistorySummary) => void): (() => void) => {
+      const listener = (_event: unknown, summary: ChatHistorySummary): void => cb(summary)
+      ipcRenderer.on(IpcChannels.ChatHistoryChanged, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.ChatHistoryChanged, listener)
+    },
   },
   chatGroups: {
     get: (): Promise<ChatGroupsState> => ipcRenderer.invoke(IpcChannels.ChatGroupsGet),
@@ -177,6 +188,12 @@ const api = {
     ipcRenderer.invoke(IpcChannels.AgentEarSnapshot),
   // ME4-desktop-model-ui: same push/pull pair, for the kernel's `model.call`
   // WS events (main/model-call-log.ts) — mirrors onAgentEarEvent/agentearSnapshot.
+  // M4 A3: runs' and approvals' changes, for the history list's filters.
+  onRunEvent: (cb: (event: RunEvent) => void): (() => void) => {
+    const listener = (_event: unknown, event: RunEvent): void => cb(event)
+    ipcRenderer.on(IpcChannels.RunEvent, listener)
+    return () => ipcRenderer.removeListener(IpcChannels.RunEvent, listener)
+  },
   onModelCallEvent: (cb: (call: ModelCallEnvelope) => void): (() => void) => {
     const listener = (_event: unknown, call: ModelCallEnvelope): void => cb(call)
     ipcRenderer.on(IpcChannels.ModelCallEvent, listener)

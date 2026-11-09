@@ -18,7 +18,7 @@ let titleAnswer: (req: Req) => Promise<unknown>
 const titleCalls = () => proxy.mock.calls.map(c => c[0] as Req).filter(isTitle)
 
 let saved: Map<string, ChatHistoryRecord>
-const RANK = { prompt: 0, model: 1, user: 2 } as const
+const RANK = { prompt: 0, model: 1, schedule: 2, assistant: 2, user: 3 } as const
 const summary = chatHistorySummary
 /** Behaves as main/chat-history.ts does: a stronger title on file wins. */
 const chatHistory = {
@@ -163,7 +163,7 @@ describe('model titles (UI-04 T2)', () => {
 
   it('a conversation opened from the history asks for none; a new chat asks for its own', async () => {
     saved.set('chat_old_1', {
-      format: 'agent24.desktop.chat-history', version: 1, id: 'chat_old_1', title: '旧', title_source: 'prompt', group_id: null, archived_at: null,
+      format: 'agent24.desktop.chat-history', version: 2, id: 'chat_old_1', title: '旧', title_source: 'prompt', group_id: null, archived_at: null, runs: [], pending: [],
       created_at: '2026-11-07T10:00:00.000Z', updated_at: '2026-11-07T10:00:01.000Z',
       messages: [{ role: 'user', content: '旧', at: '2026-11-07T10:00:00.000Z', delivered: true }],
     })

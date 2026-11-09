@@ -13,7 +13,6 @@ import { capabilitiesMessages } from './Capabilities.i18n'
 import { capabilitiesMessages as catalogMessages } from '../capabilities/capabilities.i18n'
 
 /** Row that shows the pending-approval count. Matches the capability id. */
-const APPROVALS_ID = 'approvals'
 
 const GROUP_COPY = {
   office: { title: 'group.office', blurb: 'group.office.blurb' },
@@ -41,7 +40,7 @@ export interface CapabilitiesPageProps {
 }
 
 export default function CapabilitiesPage({ statusFor, onOpenSettings }: CapabilitiesPageProps) {
-  const { defs, open, approvalsWaiting } = useContext(CapabilitiesContext)
+  const { defs, open } = useContext(CapabilitiesContext)
   const { prefs, pinnedCount = prefs.pinned.length, setPrefs } = useContext(NavPrefsContext)
   const t = useT(capabilitiesMessages)
   const c = useT(catalogMessages)
@@ -137,11 +136,6 @@ export default function CapabilitiesPage({ statusFor, onOpenSettings }: Capabili
                           <button type="button" className="cap-name" onClick={() => open(def.id, 'capabilities')}>
                             {name}
                           </button>
-                          {def.id === APPROVALS_ID && approvalsWaiting > 0 && (
-                            <span className="tag cap-count" role="status" aria-label={t('approvals.waiting', { count: approvalsWaiting })}>
-                              {approvalsWaiting}
-                            </span>
-                          )}
                         </div>
                         <p className="cap-desc">{c(def.descKey)}</p>
                       </div>

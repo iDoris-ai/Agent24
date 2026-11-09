@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
-import { useContext } from 'react'
+import { useContext, useState, type ReactNode } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { Sidebar } from './Sidebar'
 import { Breadcrumb } from './Breadcrumb'
-import { CapabilitiesProvider, NavPrefsProvider, useCapabilityRoute } from './providers'
+import { CapabilitiesProvider, NavPrefsProvider, useCapabilityRoute, useLeaveGuard } from './providers'
+import { capabilitiesMessages } from './capabilities.i18n'
 import { CapabilitiesContext, NavPrefsContext, NAV_PREFS_DEFAULT, type NavPrefs, type NavPrefsApi } from './types'
 import { CAPABILITIES } from './registry'
 import CapabilitiesPage from '../pages/Capabilities'
@@ -23,7 +24,7 @@ describe('Sidebar', () => {
       </CapabilitiesContext.Provider>,
     )
     expect(screen.getAllByRole('button').map(b => b.textContent)).toEqual([
-      'Overview4', 'Assistant', 'Voice', 'Documents', '+ Pin a capability', 'Capabilities4', 'Settings',
+      'Overview', 'Assistant4', 'Voice', 'Documents', '+ Pin a capability', 'Capabilities', 'Settings',
     ])
     // The group says what it is, not how full it is (David 11-08).
     expect(screen.getByText('Pinned')).toBeInTheDocument()
@@ -58,6 +59,151 @@ function RouteView() {
 }
 
 describe('capability routing', () => {
+  describe('leave guard (M4 A6, #1688)', () => {
+    let dirty = true
+    function Draft() {
+      useLeaveGuard(() => dirty)
+      return <p>draft</p>
+    }
+    function Pages() {
+      const { route, navigate } = useCapabilityRoute()
+      const { open } = useContext(CapabilitiesContext)
+      const [shown, setShown] = useState(true)
+      return <>
+        {shown && <Draft />}
+        <button onClick={() => navigate('home')}>home</button>
+        <button onClick={() => open('documents', 'switcher')}>documents</button>
+        <button onClick={() => open('settings/general', 'switcher')}>settings</button>
+        <button onClick={() => setShown(false)}>close draft</button>
+        <output aria-label="Route">{route.kind === 'page' ? route.page : route.id}</output>
+      </>
+    }
+    const show = () => {
+      window.agent24 = { backendProxy: vi.fn().mockResolvedValue({ ok: false }) } as unknown as Window['agent24']
+      render(<CapabilitiesProvider><Pages /></CapabilitiesProvider>)
+    }
+    const go = (name: string) => fireEvent.click(screen.getByRole('button', { name }))
+    const at = () => screen.getByLabelText('Route').textContent
+
+    it('asks before going to another page while a page has unsaved changes, and stays when the user says no', () => {
+      dirty = true
+      setLocale('en')
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+      show()
+      go('documents')
+      expect(confirm).toHaveBeenCalledWith('This page has changes that are not saved. Leave it and lose them?')
+      expect(at()).toBe('home')
+      go('settings')
+      expect(at()).toBe('home')
+      confirm.mockReturnValue(true)
+      go('documents')
+      expect(at()).toBe('documents')
+      expect(confirm).toHaveBeenCalledTimes(3)
+      confirm.mockRestore()
+    })
+
+    it('does not ask without unsaved changes, nor for the page showing already', () => {
+      dirty = true
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+      show()
+      go('home')
+      expect(confirm).not.toHaveBeenCalled()
+      dirty = false
+      go('documents')
+      expect(at()).toBe('documents')
+      expect(confirm).not.toHaveBeenCalled()
+      confirm.mockRestore()
+    })
+
+    it('asks when navigating back too, by the page showing now (Codex #1688 C2)', () => {
+      dirty = true
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(true).mockReturnValue(false)
+      show()
+      go('documents')
+      expect(at()).toBe('documents')
+      go('home')
+      expect(at()).toBe('documents')
+      expect(confirm).toHaveBeenCalledTimes(2)
+      go('documents')
+      expect(confirm).toHaveBeenCalledTimes(2)
+      confirm.mockRestore()
+    })
+
+    it('asks before Settings is opened anew, which mounts it again (Codex #1688 C1)', () => {
+      dirty = true
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(true).mockReturnValue(false)
+      show()
+      go('settings')
+      expect(at()).toBe('settings')
+      go('settings')
+      expect(confirm).toHaveBeenCalledTimes(2)
+      confirm.mockRestore()
+    })
+
+    it('stops asking once the page with changes is gone', () => {
+      dirty = true
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+      show()
+      go('close draft')
+      go('documents')
+      expect(at()).toBe('documents')
+      expect(confirm).not.toHaveBeenCalled()
+      confirm.mockRestore()
+    })
+
+    // A test page that keeps its changes in state, as a real one does.
+    function Editor({ asFunction = false, message }: { asFunction?: boolean; message?: string }) {
+      const [changed, setChanged] = useState(false)
+      useLeaveGuard(asFunction ? () => changed : changed, message)
+      const { route } = useCapabilityRoute()
+      const { open } = useContext(CapabilitiesContext)
+      return <>
+        <button onClick={() => setChanged(true)}>edit</button>
+        <button onClick={() => setChanged(false)}>save</button>
+        <output aria-label="Changed">{String(changed)}</output>
+        <button onClick={() => open('documents', 'switcher')}>documents</button>
+        <output aria-label="Route">{route.kind === 'page' ? route.page : route.id}</output>
+      </>
+    }
+    const showEditor = (page: ReactNode) => {
+      window.agent24 = { backendProxy: vi.fn().mockResolvedValue({ ok: false }) } as unknown as Window['agent24']
+      render(<CapabilitiesProvider>{page}</CapabilitiesProvider>)
+    }
+
+    it.each([false, true])('asks by what the page says now (dirty as a function: %s); no keeps the page and its changes, and saving stops the asking', (asFunction) => {
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+      showEditor(<Editor asFunction={asFunction} />)
+      go('edit')
+      go('documents')
+      expect(confirm).toHaveBeenCalledTimes(1)
+      expect(at()).toBe('home')
+      expect(screen.getByLabelText('Changed')).toHaveTextContent('true')
+      go('save')
+      go('documents')
+      expect(confirm).toHaveBeenCalledTimes(1)
+      expect(at()).toBe('documents')
+      confirm.mockRestore()
+    })
+
+    it('asks once however many pages have changes, with the first one\'s own words', () => {
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+      showEditor(<><Editor /><Editor message="Discard this draft?" /></>)
+      for (const edit of screen.getAllByRole('button', { name: 'edit' })) fireEvent.click(edit)
+      fireEvent.click(screen.getAllByRole('button', { name: 'documents' })[0])
+      expect(confirm).toHaveBeenCalledTimes(1)
+      expect(confirm).toHaveBeenCalledWith('Discard this draft?')
+      confirm.mockRestore()
+    })
+
+    it.each([
+      ['en', 'This page has changes that are not saved. Leave it and lose them?'],
+      ['zh', '这一页有没保存的修改。离开的话，这些修改会丢掉。确定离开吗？'],
+      ['th', 'หน้านี้มีการแก้ไขที่ยังไม่ได้บันทึก ออกจากหน้านี้แล้วการแก้ไขจะหายไป ต้องการออกหรือไม่'],
+    ] as const)('asks in %s', (locale, text) => {
+      expect(capabilitiesMessages[locale]['leave.unsaved']).toBe(text)
+    })
+  })
+
   it('routes switcher actions to Settings with the requested initialTab and ignores unknown targets', () => {
     function Actions() {
       const { open } = useContext(CapabilitiesContext)
@@ -165,12 +311,25 @@ describe('capability routing', () => {
     }))
     window.agent24 = { backendProxy } as unknown as Window['agent24']
     render(<CapabilitiesProvider><NavPrefsProvider><RouteView /></NavPrefsProvider></CapabilitiesProvider>)
-    await waitFor(() => expect(screen.getByRole('button', { name: /Capabilities/ })).toHaveTextContent('2'))
+    await waitFor(() => expect(screen.getByRole('button', { name: /Assistant/ })).toHaveTextContent('2'))
     expect(screen.queryByRole('button', { name: 'Hello' })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /Capabilities/ }))
     await waitFor(() => expect(within(screen.getByRole('region', { name: 'Domain OS' })).getByRole('button', { name: 'Hello' })).toBeInTheDocument())
     expect(within(screen.getByRole('navigation', { name: 'Main navigation' })).queryByText('Hello')).not.toBeInTheDocument()
     expect(backendProxy).toHaveBeenCalledWith({ method: 'GET', path: '/api/modules' })
+  })
+
+  it('counts on Assistant every pending approval, also of a run no conversation has a card for (QA N6)', async () => {
+    const backendProxy = vi.fn().mockImplementation(({ path }: { path: string }) => Promise.resolve(
+      path === '/api/modules' ? { ok: false, status: 404 } : { ok: true, data: { approvals: [{ id: 'apr_1', run_id: 'run_desk' }, { id: 'apr_2', run_id: 'run_cli' }] } },
+    ))
+    window.agent24 = { backendProxy } as unknown as Window['agent24']
+    const view = render(<CapabilitiesProvider><NavPrefsProvider><RouteView /></NavPrefsProvider></CapabilitiesProvider>)
+    try {
+      await waitFor(() => expect(screen.getByRole('button', { name: /Assistant/ })).toHaveTextContent('2'))
+    } finally {
+      view.unmount()
+    }
   })
 
   it('refreshes every five seconds, clears settled approval badges and tolerates unavailable manifests', async () => {
@@ -183,10 +342,10 @@ describe('capability routing', () => {
     const view = render(<CapabilitiesProvider><NavPrefsProvider><RouteView /></NavPrefsProvider></CapabilitiesProvider>)
     try {
       await act(async () => {})
-      expect(screen.getByRole('button', { name: /Capabilities/ })).toHaveTextContent('1')
+      expect(screen.getByRole('button', { name: /Assistant/ })).toHaveTextContent('1')
       pending = false
       await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
-      expect(screen.getByRole('button', { name: 'Capabilities' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Assistant' })).toBeInTheDocument()
       expect(backendProxy.mock.calls.filter(([req]) => req.path === '/api/modules')).toHaveLength(2)
       fireEvent.click(screen.getByRole('button', { name: 'Capabilities' }))
       expect(within(screen.getByRole('main')).getByRole('button', { name: 'Documents' })).toBeInTheDocument()
