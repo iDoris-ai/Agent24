@@ -58,7 +58,7 @@ function envelope(call: Call, code: string, reason?: string, extra: Record<strin
 }
 
 describe('candidateAdmission (W1.4, HS1)', () => {
-  const ready = (state: unknown) => deps((call) => json(200, { request_id: call.body.request_id, live: true, operations: { candidate: { state }, search: { state: 'ready' } } }))
+  const ready = (state: unknown) => deps((call) => json(200, { request_id: call.body.request_id, generation: call.body.generation, live: true, operations: { candidate: { state }, search: { state: 'ready' } } }))
 
   it('lets the write through only when operations.candidate is ready', async () => {
     const d = ready('ready')
@@ -76,6 +76,11 @@ describe('candidateAdmission (W1.4, HS1)', () => {
     expect(await candidateAdmission(down.deps, 1, signal())).toMatchObject({ ok: false, code: 'not_ready' })
     const wrongEcho = deps(() => json(200, { request_id: 'someone-else', live: true, operations: { candidate: { state: 'ready' } } }))
     expect(await candidateAdmission(wrongEcho.deps, 1, signal())).toMatchObject({ ok: false, code: 'not_ready' })
+    // R7.2/R7.3 (Codex H1 C8): the generation is echoed and checked too.
+    for (const generation of [undefined, 2, null]) {
+      const wrong = deps((call) => json(200, { request_id: call.body.request_id, generation, live: true, operations: { candidate: { state: 'ready' } } }))
+      expect(await candidateAdmission(wrong.deps, 1, signal())).toMatchObject({ ok: false, code: 'not_ready' })
+    }
   })
 
   it('no key sends nothing', async () => {
@@ -146,7 +151,7 @@ describe('submitCandidate (W8.2)', () => {
 
   it('no key sends nothing', async () => {
     const d = deps(() => json(200, {}), null)
-    expect(await submitCandidate(d.deps, 1, body, signal())).toEqual({ ok: false, code: 'unauthorized', unknown: false })
+    expect(await submitCandidate(d.deps, 1, body, signal())).toEqual({ ok: false, code: 'unauthorized', unknown: false, local: true })
     expect(d.calls).toHaveLength(0)
   })
 
@@ -154,7 +159,7 @@ describe('submitCandidate (W8.2)', () => {
     const c = new AbortController()
     c.abort()
     const d = deps(() => json(200, {}))
-    expect(await submitCandidate(d.deps, 1, body, c.signal)).toEqual({ ok: false, code: 'cancelled', unknown: false })
+    expect(await submitCandidate(d.deps, 1, body, c.signal)).toEqual({ ok: false, code: 'cancelled', unknown: false, local: true })
     expect(d.calls).toHaveLength(0)
   })
 })

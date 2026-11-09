@@ -39,6 +39,8 @@ export interface CandidateFailure {
   reason?: string
   retryAfterMs?: number
   unknown: boolean
+  /** Set when nothing reached the network (no credential, cancelled before sending): no answer from the server. */
+  local?: true
 }
 
 export interface SubmitBody {
@@ -91,6 +93,11 @@ function failure(code: string, unknown: boolean, reason?: string, retryAfterMs?:
   if (reason !== undefined) out.reason = reason
   if (retryAfterMs !== undefined) out.retryAfterMs = retryAfterMs
   return out
+}
+
+/** A failure that never left this machine. */
+function notSent(code: string): CandidateFailure {
+  return { ...failure(code, false), local: true }
 }
 
 function isId(v: unknown): v is string {
@@ -155,7 +162,7 @@ async function post(
   signal: AbortSignal,
   write: boolean,
 ): Promise<{ status: number; json: unknown } | CandidateFailure> {
-  if (signal.aborted) return failure('cancelled', false)
+  if (signal.aborted) return notSent('cancelled')
   const timeout = new AbortController()
   const timer = setTimeout(() => timeout.abort(), CANDIDATE_TIMEOUT_MS)
   const onAbort = (): void => timeout.abort()
@@ -176,7 +183,8 @@ async function post(
       response = await request
     } catch {
       // Once handed to the network a write may have landed (W1.5).
-      const maybe = write && sent
+      if (!sent) return notSent(signal.aborted ? 'cancelled' : 'unavailable')
+      const maybe = write
       if (signal.aborted) return failure('cancelled', maybe)
       if (timeout.signal.aborted) return failure('timeout', maybe)
       return failure('unavailable', maybe)
@@ -223,12 +231,13 @@ function settle<T>(
  */
 export async function candidateAdmission(deps: CandidateDeps, generation: number, signal: AbortSignal): Promise<{ ok: true } | CandidateFailure> {
   const credential = deps.credential()
-  if (credential === null) return failure('unauthorized', false)
+  if (credential === null) return notSent('unauthorized')
   const requestId = deps.newRequestId()
   const posted = await post(deps, credential, 'ready', { protocol_version: 1, request_id: requestId, generation }, signal, false)
   if ('ok' in posted) return posted.code === 'cancelled' ? posted : failure('not_ready', false)
   const json = posted.json
-  if (posted.status !== 200 || !isObj(json) || json.request_id !== requestId || json.live !== true) {
+  // R7.2/R7.3: the ready answer echoes both, like every other.
+  if (posted.status !== 200 || !isObj(json) || json.request_id !== requestId || json.generation !== generation || json.live !== true) {
     if (isObj(json) && isObj(json.error)) {
       const err = readError(json, requestId, generation, false)
       if (err.code === 'unauthorized') return err
@@ -245,7 +254,7 @@ export async function candidateAdmission(deps: CandidateDeps, generation: number
 /** W8.2. `body` is sent exactly as given: the pending-write record holds these bytes (W1.5). */
 export async function submitCandidate(deps: CandidateDeps, generation: number, body: SubmitBody, signal: AbortSignal): Promise<Submitted | CandidateFailure> {
   const credential = deps.credential()
-  if (credential === null) return failure('unauthorized', false)
+  if (credential === null) return notSent('unauthorized')
   const requestId = deps.newRequestId()
   const posted = await post(deps, credential, 'candidates', { request_id: requestId, generation, ...body }, signal, true)
   if ('ok' in posted) return posted
@@ -296,7 +305,7 @@ function parseView(v: unknown, candidateId: string): CandidateView | null {
 /** W8.3: the author reads their own candidate. Not a write; nothing is unknown. */
 export async function getCandidate(deps: CandidateDeps, generation: number, candidateId: string, signal: AbortSignal): Promise<{ ok: true; view: CandidateView } | CandidateFailure> {
   const credential = deps.credential()
-  if (credential === null) return failure('unauthorized', false)
+  if (credential === null) return notSent('unauthorized')
   const requestId = deps.newRequestId()
   const posted = await post(deps, credential, 'candidates/get', { request_id: requestId, generation, candidate_id: candidateId }, signal, false)
   if ('ok' in posted) return posted
@@ -309,7 +318,7 @@ export async function getCandidate(deps: CandidateDeps, generation: number, cand
 /** W8.8: the author withdraws a `submitted` candidate. Naturally idempotent (W3.1): a repeat answers `already`. */
 export async function withdrawCandidate(deps: CandidateDeps, generation: number, candidateId: string, signal: AbortSignal): Promise<{ ok: true; already: boolean } | CandidateFailure> {
   const credential = deps.credential()
-  if (credential === null) return failure('unauthorized', false)
+  if (credential === null) return notSent('unauthorized')
   const requestId = deps.newRequestId()
   const posted = await post(deps, credential, 'candidates/withdraw', { request_id: requestId, generation, candidate_id: candidateId }, signal, true)
   if ('ok' in posted) return posted

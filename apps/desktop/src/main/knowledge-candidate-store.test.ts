@@ -6,6 +6,7 @@ import { createCandidateStore, newIdempotencyKey, RESEND_WINDOW_MS, type Candida
 import type { SubmitBody } from './knowledge-candidates'
 
 const DRAFT = `ked_${'a'.repeat(22)}`
+const CRED = 'c'.repeat(64)
 let dir: string
 
 beforeEach(() => {
@@ -37,7 +38,7 @@ describe('the pending write (W1.5, HS3)', () => {
   it('is on disk, 0600, with the exact body and key, before anything is sent; a second one is refused', () => {
     const store = createCandidateStore(dir)
     const b = body()
-    store.beginSubmit(DRAFT, 'kbt1:x', b)
+    store.beginSubmit(DRAFT, 'kbt1:x', CRED, b)
     const file = path.join(dir, 'knowledge-candidates', `${DRAFT}.json`)
     expect(mode(file)).toBe(0o600)
     expect(mode(path.dirname(file))).toBe(0o700)
@@ -45,32 +46,35 @@ describe('the pending write (W1.5, HS3)', () => {
     const again = createCandidateStore(dir).get(DRAFT)
     expect(again?.pending?.body).toEqual(b)
     expect(again?.pending?.idempotency_key).toBe(b.idempotency_key)
-    expect(() => store.beginSubmit(DRAFT, 'kbt1:x', body())).toThrow()
+    expect(() => store.beginSubmit(DRAFT, 'kbt1:x', CRED, body())).toThrow()
   })
 
   it('a record that cannot be persisted throws, so nothing is sent', () => {
     const store = createCandidateStore(dir)
     fs.writeFileSync(path.join(dir, 'knowledge-candidates'), 'not a directory')
-    expect(() => store.beginSubmit(DRAFT, 'kbt1:x', body())).toThrow()
+    expect(() => store.beginSubmit(DRAFT, 'kbt1:x', CRED, body())).toThrow()
   })
 
-  it('is resent only within the same binding and inside the window', () => {
+  it('is resent only within the same binding, under the same credential, and inside the window', () => {
     let now = new Date('2026-11-09T08:00:00Z')
     const store = createCandidateStore(dir, () => now)
-    const pending = store.beginSubmit(DRAFT, 'kbt1:x', body())
-    expect(store.resendable(pending, 'kbt1:x')).toBe(true)
-    expect(store.resendable(pending, 'kbt1:y')).toBe(false)
+    const pending = store.beginSubmit(DRAFT, 'kbt1:x', CRED, body())
+    expect(store.resendable(pending, 'kbt1:x', CRED)).toBe(true)
+    expect(store.resendable(pending, 'kbt1:y', CRED)).toBe(false)
+    // Another credential (another principal, W3.2), or none: not resent.
+    expect(store.resendable(pending, 'kbt1:x', 'd'.repeat(64))).toBe(false)
+    expect(store.resendable(pending, 'kbt1:x', null)).toBe(false)
     now = new Date(now.getTime() + RESEND_WINDOW_MS)
-    expect(store.resendable(pending, 'kbt1:x')).toBe(false)
+    expect(store.resendable(pending, 'kbt1:x', CRED)).toBe(false)
   })
 
   it('a definite answer clears it and keeps the candidate; a refusal clears it and keeps none', () => {
     const store = createCandidateStore(dir)
-    store.beginSubmit(DRAFT, 'kbt1:x', body())
+    store.beginSubmit(DRAFT, 'kbt1:x', CRED, body())
     store.settleSubmit(DRAFT, state())
     expect(store.get(DRAFT)).toMatchObject({ pending: null, candidate: { candidate_id: 'cand-1', status: 'submitted' } })
     store.updateCandidate(DRAFT, state({ status: 'withdrawn' }))
-    store.beginSubmit(DRAFT, 'kbt1:x', body())
+    store.beginSubmit(DRAFT, 'kbt1:x', CRED, body())
     store.settleSubmit(DRAFT, null)
     // A refused resubmit leaves the earlier candidate as it was.
     expect(store.get(DRAFT)).toMatchObject({ pending: null, candidate: { status: 'withdrawn' } })
@@ -78,7 +82,7 @@ describe('the pending write (W1.5, HS3)', () => {
 
   it('updateCandidate only touches the candidate already recorded', () => {
     const store = createCandidateStore(dir)
-    store.beginSubmit(DRAFT, 'kbt1:x', body())
+    store.beginSubmit(DRAFT, 'kbt1:x', CRED, body())
     store.settleSubmit(DRAFT, state())
     store.updateCandidate(DRAFT, state({ candidate_id: 'cand-2', status: 'approved' }))
     expect(store.get(DRAFT)?.candidate).toMatchObject({ candidate_id: 'cand-1', status: 'submitted' })
@@ -86,7 +90,7 @@ describe('the pending write (W1.5, HS3)', () => {
 
   it('a record that does not parse is an error, never "no submission"', () => {
     const store = createCandidateStore(dir)
-    store.beginSubmit(DRAFT, 'kbt1:x', body())
+    store.beginSubmit(DRAFT, 'kbt1:x', CRED, body())
     const file = path.join(dir, 'knowledge-candidates', `${DRAFT}.json`)
     fs.writeFileSync(file, JSON.stringify({ format: 'agent24-knowledge-candidate', version: 1, draft_id: DRAFT, pending: { junk: true }, candidate: null }))
     expect(() => store.get(DRAFT)).toThrow()
@@ -121,6 +125,20 @@ describe('session_ref (W8.2, HS4)', () => {
     store.sessionRef('chat_abc')
     fs.writeFileSync(path.join(dir, 'knowledge-candidates', '_session_ref.key'), 'short')
     expect(() => store.sessionRef('chat_abc')).toThrow()
+  })
+})
+
+describe('credentialRef (W1.5)', () => {
+  it('is an HMAC under the local key: stable, per credential, never the credential', () => {
+    const store = createCandidateStore(dir)
+    const a = store.credentialRef('C-secret-1')
+    expect(a).toMatch(/^[0-9a-f]{64}$/)
+    expect(createCandidateStore(dir).credentialRef('C-secret-1')).toBe(a)
+    expect(store.credentialRef('C-secret-2')).not.toBe(a)
+    expect(store.credentialRef('C-secret-1')).not.toBe(store.sessionRef('C-secret-1'))
+    store.beginSubmit(DRAFT, 'kbt1:x', a, body())
+    const file = fs.readFileSync(path.join(dir, 'knowledge-candidates', `${DRAFT}.json`), 'utf8')
+    expect(file).not.toContain('C-secret-1')
   })
 })
 
