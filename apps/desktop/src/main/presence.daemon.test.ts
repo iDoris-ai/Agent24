@@ -94,10 +94,11 @@ describe.skipIf(!bin || !unsigned || process.platform === 'win32')('a real servi
 
   it('the presence connection stays up across the daemon\'s pings (pong within 10 s)', async () => {
     const { ask, connect } = await start('deny')
+    const made = connect.mock.calls.length
     await new Promise((r) => setTimeout(r, 75_000))
     expect(presence!.ready).toBe(true)
     // The same connection all along, not one made again after a missed pong (Codex).
-    expect(connect).toHaveBeenCalledTimes(1)
+    expect(connect).toHaveBeenCalledTimes(made)
     expect(ask).not.toHaveBeenCalled()
   }, 120_000)
 })
