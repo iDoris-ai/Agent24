@@ -54,10 +54,20 @@ describe('chat-knowledge', () => {
     expect(await askWithKnowledge('q', 's', { proxy: failed.proxy, sleep: async () => {} }))
       .toEqual({ kind: 'failed', code: 'model_unavailable', message: 'no model' })
 
+    // M4 A4: a run it never saw is not left running unseen.
     let t = 0
-    const slow = proxyWith([{ status: 'running' }])
-    const turn = await askWithKnowledge('q', 's', { proxy: slow.proxy, sleep: async (ms) => { t += ms }, now: () => t * (MAX_WAIT_MS / 3000) })
+    const unseen = proxyWith([])
+    const lost = vi.fn(async (req: Req) => (req.method === 'GET' ? { ok: false, status: 503, data: null } : (unseen.proxy as unknown as (r: Req) => Promise<unknown>)(req)))
+    const turn = await askWithKnowledge('q', 's', { proxy: lost as unknown as Window['agent24']['backendProxy'], sleep: async (ms) => { t += ms }, now: () => t * (MAX_WAIT_MS / 3000) })
     expect(turn).toMatchObject({ kind: 'failed', code: 'run_timeout' })
-    expect(slow.calls.at(-1)).toEqual({ method: 'POST', path: '/api/v1/runs/run_1/cancel' })
+    expect(lost.mock.calls.at(-1)?.[0]).toEqual({ method: 'POST', path: '/api/v1/runs/run_1/cancel' })
+  })
+
+  it.each(['queued', 'running', 'awaiting_approval'])('M4 A4: leaves a run still %s to go on when it stops waiting, as the conversation\'s task', async status => {
+    let t = 0
+    const slow = proxyWith([{ status }])
+    const turn = await askWithKnowledge('q', 's', { proxy: slow.proxy, sleep: async (ms) => { t += ms }, now: () => t * (MAX_WAIT_MS / 3000) })
+    expect(turn).toEqual({ kind: 'ongoing', runId: 'run_1', status })
+    expect(slow.calls.some(c => c.path.endsWith('/cancel'))).toBe(false)
   })
 })

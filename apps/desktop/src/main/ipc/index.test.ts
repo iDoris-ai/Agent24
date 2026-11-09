@@ -1842,16 +1842,16 @@ describe('UI-02 chat history IPC', () => {
   it('saves, lists, reads, deletes and clears through the guarded handlers', async () => {
     fs.rmSync(path.join(settingsDir, 'chat-history'), { recursive: true, force: true })
     const record = {
-      format: 'agent24.desktop.chat-history', version: 1, id: 'chat_ipc_1', title: '你好',
+      format: 'agent24.desktop.chat-history', version: 2, id: 'chat_ipc_1', title: '你好',
+      title_source: 'prompt', group_id: null, archived_at: null, runs: [], pending: [],
       created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z',
       messages: [{ role: 'user', content: '你好', at: '2026-11-08T00:00:00.000Z', delivered: true }],
     }
     expect(await call(IpcChannels.ChatHistoryList)).toEqual([])
-    const summary = { id: 'chat_ipc_1', title: '你好', title_source: 'prompt', group_id: null, archived_at: null, created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z', first_prompt: '你好' }
-    // A record without title_source (written before UI-04) has the prompt's title.
+    const summary = { id: 'chat_ipc_1', title: '你好', title_source: 'prompt', group_id: null, archived_at: null, created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z', first_prompt: '你好', tasks: [], pending: [] }
     expect(await call(IpcChannels.ChatHistorySave, record)).toEqual(summary)
     expect(await call(IpcChannels.ChatHistoryList)).toEqual([summary])
-    expect(await call(IpcChannels.ChatHistoryGet, 'chat_ipc_1')).toEqual({ ...record, title_source: 'prompt', group_id: null, archived_at: null })
+    expect(await call(IpcChannels.ChatHistoryGet, 'chat_ipc_1')).toEqual(record)
     expect(await call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_1', '问候', 'user')).toEqual({ ...summary, title: '问候', title_source: 'user' })
     expect(await call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_1', '模型', 'model')).toEqual({ ...summary, title: '问候', title_source: 'user' })
     await expect(call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_1', '名', 'prompt')).rejects.toThrow('Invalid chat history title source')

@@ -13,6 +13,14 @@ export const IpcChannels = {
   ChatHistorySetTitle: 'chat-history:set-title',
   // UI-06: groups and archiving in the history list.
   ChatHistoryOrganize: 'chat-history:organize',
+  // M4 A2: a run of the conversation becomes a task; main's own changes to
+  // runs and waiting items, pushed to the window.
+  ChatHistoryPromoteRun: 'chat-history:promote-run',
+  ChatHistoryChanged: 'chat-history:changed',
+  // M4 A3: a run's or an approval's change, from the daemon's /events.
+  RunEvent: 'run:event',
+  // M4 A6: the conversation a schedule's runs go to (A5), for its page.
+  ScheduleConversation: 'schedule:conversation',
   ChatGroupsGet: 'chat-groups:get',
   ChatGroupsCreate: 'chat-groups:create',
   ChatGroupsRename: 'chat-groups:rename',
@@ -552,3 +560,12 @@ export interface CliToolStatus {
 export type CliInstallResult =
   | { state: 'installed'; backup: string | null }
   | { state: 'cancelled' | 'failed' | 'move-app' }
+
+/** M4 A3: the daemon events that change what a run is waiting on or where
+ *  it stands (agent24-protocol `EventBody`). */
+export const RUN_EVENT_TYPES = ['run.started', 'run.completed', 'run.failed', 'run.cancelled', 'approval.required', 'approval.resolved'] as const
+/** M4 A3: one of them, as main forwards it: only which run and what happened. */
+export interface RunEvent {
+  type: (typeof RUN_EVENT_TYPES)[number]
+  run_id: string
+}

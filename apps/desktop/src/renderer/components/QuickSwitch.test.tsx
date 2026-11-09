@@ -9,7 +9,7 @@ const defs: CapabilityDef[] = [
   { id: 'my-documents', group: 'office', nameKey: 'My documents', descKey: '', builtin: false, page: 'custom' },
   { id: 'documents', group: 'office', nameKey: 'documents.name', descKey: '', builtin: true, page: 'documents' },
   { id: 'design', group: 'creative', nameKey: 'design.name', descKey: '', builtin: false, page: 'creative' },
-  { id: 'assistant', group: 'office', nameKey: 'assistant.name', descKey: '', builtin: true, fixed: true, page: 'chat' },
+  { id: 'assistant', group: 'office', nameKey: 'assistant.name', descKey: '', builtin: true, fixed: true, page: 'assistant' },
 ]
 
 function setup(capabilities = defs) {

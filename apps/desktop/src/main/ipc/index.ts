@@ -516,6 +516,8 @@ export function registerIpcHandlers(options: {
   guard: IpcGuard
   /** The Knowledge settings, once main has built them. */
   knowledge?: () => KnowledgeController | null
+  /** M4 A6: the conversation a schedule's runs go to (schedule-conversations.ts). */
+  scheduleConversation?: (scheduleId: string) => string | null
   /** T1-1/T1-2: the documents module as it is on disk now. */
   documentsModule?: () => DocumentsModuleStatus
   /** T1-2: uninstall it / install the one the app carries (the app's CLI). */
@@ -660,6 +662,9 @@ export function registerIpcHandlers(options: {
   handle(IpcChannels.ChatHistorySetTitle, (_event, id: unknown, title: unknown, source: unknown) =>
     chatHistory().setTitle(id, title, source))
   handle(IpcChannels.ChatHistoryOrganize, (_event, id: unknown, patch: unknown) => chatHistory().organize(id, patch))
+  handle(IpcChannels.ChatHistoryPromoteRun, (_event, id: unknown, runId: unknown) => chatHistory().promoteRun(id, runId))
+  handle(IpcChannels.ScheduleConversation, (_event, scheduleId: unknown) =>
+    (typeof scheduleId === 'string' ? options.scheduleConversation?.(scheduleId) ?? null : null))
   handle(IpcChannels.ChatGroupsGet, () => chatHistory().groups())
   handle(IpcChannels.ChatGroupsCreate, (_event, name: unknown) => chatHistory().createGroup(name))
   handle(IpcChannels.ChatGroupsRename, (_event, id: unknown, name: unknown) => chatHistory().renameGroup(id, name))

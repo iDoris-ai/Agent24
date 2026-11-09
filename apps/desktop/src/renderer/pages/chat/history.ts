@@ -40,8 +40,22 @@ function set(patch: Partial<HistoryState>): void {
 
 export const getHistoryState = (): HistoryState => state
 export function subscribeHistory(listener: () => void): () => void {
+  listenToMain()
   listeners.add(listener)
   return () => listeners.delete(listener)
+}
+
+/** M4 A2: main's own modules change a conversation's runs and waiting items
+ *  (a schedule's run, a Knowledge confirmation); main tells the window, and
+ *  the list is read again. Such changes are rare, and the read is ordered
+ *  against saves and deletions like any other. */
+let listening = false
+function listenToMain(): void {
+  if (listening) return
+  const onChanged = api()?.onChanged
+  if (!onChanged) return
+  listening = true
+  onChanged(() => { void refreshHistory() })
 }
 
 /** Reads the list again from main. Failures leave the list as it was. A
@@ -123,6 +137,9 @@ export async function saveConversation(record: ChatHistoryRecord): Promise<boole
   // disk: that would cost a full scan per chat turn.
   const summary = written ?? chatHistorySummary(record)
   set({ items: byNewest([summary, ...state.items.filter(item => item.id !== record.id)]) })
+  const waiting = promoteAfterSave.get(record.id)
+  promoteAfterSave.delete(record.id)
+  for (const runId of waiting ?? []) void promoteRun(record.id, runId)
   return true
 }
 
@@ -168,6 +185,43 @@ export async function archiveConversation(id: string): Promise<boolean> {
  *  still exists. */
 export function restoreConversation(id: string): Promise<boolean> {
   return organize(id, { archived: false })
+}
+
+/** M4 A2: a run of a saved conversation becomes a task (`promotionDue`, or
+ *  the user handed it over). False when there was no such conversation, or
+ *  it failed; a conversation deleted meanwhile stays deleted. */
+export async function promoteRun(id: string, runId: string): Promise<boolean> {
+  const history = api()
+  if (!history) return false
+  const mine = ++seq
+  // Asked while a save of it was on its way: main may answer that save (even
+  // its last failed try) before this (Codex A2 r2).
+  const saving = unsaved.has(id)
+  // undefined: main could not be asked or could not read the file; null:
+  // no such conversation on file.
+  const summary = await history.promoteRun(id, runId).catch(() => undefined)
+  if (removedSince(id, mine)) return false
+  if (!summary) {
+    // Not done: tried again once a save of it lands (a run is not seen
+    // waiting on its approval twice). Not on file only matters while a save
+    // of it is on its way (Codex A2 C2); a failure always does.
+    if (summary === undefined || saving || unsaved.has(id)) promoteAfterSave.set(id, [...(promoteAfterSave.get(id) ?? []), runId])
+    return false
+  }
+  publishedAt.set(id, ++seq)
+  set({ items: byNewest([summary, ...state.items.filter(item => item.id !== id)]) })
+  return true
+}
+/** Runs whose promotion found their conversation not on file while a save
+ *  of it was still on its way. */
+const promoteAfterSave = new Map<string, string[]>()
+
+/** M4 A4: a run whose promotion failed and that was stopped for it is not
+ *  promoted by a later save either (Codex A4 r2 C1). */
+export function forgetPromotion(id: string, runId: string): void {
+  const waiting = (promoteAfterSave.get(id) ?? []).filter(r => r !== runId)
+  if (waiting.length > 0) promoteAfterSave.set(id, waiting)
+  else promoteAfterSave.delete(id)
 }
 
 async function organize(id: string, patch: ChatHistoryOrganize): Promise<boolean> {
@@ -297,12 +351,47 @@ export function openConversation(id: string): void {
   opener?.(id)
 }
 
-/** Deletes one conversation; deleting the open one starts a new chat. The
- *  open one is not deleted while its reply is in flight: the reply would
- *  save it again. */
+/** M4 A6: a conversation's tasks are stopped before it goes, so none is
+ *  left running with its conversation gone: its card was the only place it
+ *  showed (the runs page is no more; PR-Daemon #1700 L2). Each is cancelled
+ *  as it is: the daemon's cancel is idempotent and valid in any state
+ *  (openapi `cancelRun`), so no status is asked first that could change in
+ *  between (Codex A6 C4). A run the daemon no longer has is not running.
+ *  Resolves false when one could not be cancelled. */
+async function stopTasks(runIds: readonly string[]): Promise<boolean> {
+  const proxy = typeof window === 'undefined' ? undefined : window.agent24?.backendProxy
+  if (!proxy) return false
+  const left = [...new Set(runIds)]
+  let stopped = true
+  const next = async (): Promise<void> => {
+    for (let runId = left.shift(); runId !== undefined; runId = left.shift()) {
+      const res = await proxy({ method: 'POST', path: `/api/v1/runs/${encodeURIComponent(runId)}/cancel` }).catch(() => null)
+      if (!res || (!res.ok && res.status !== 404)) stopped = false
+    }
+  }
+  await Promise.all(Array.from({ length: STOP_AT_ONCE }, next))
+  return stopped
+}
+/** How many cancels go at once. */
+const STOP_AT_ONCE = 4
+/** What a deletion that could not stop a task of it throws: the
+ *  conversation stays, and so do its cards (Codex A6 C1). */
+export const TASKS_NOT_STOPPED = 'tasks_not_stopped'
+
+/** Deletes one conversation, once its tasks are stopped; deleting the open
+ *  one starts a new chat. The open one is not deleted while its reply is in
+ *  flight: the reply would save it again. Throws TASKS_NOT_STOPPED, and
+ *  deletes nothing, when a task could not be stopped. */
 export async function deleteConversation(id: string): Promise<void> {
   if (state.busy && state.activeId === id) return
+  const tasks = state.items.find(item => item.id === id)?.tasks ?? []
+  if (tasks.length > 0) {
+    if (!(await stopTasks(tasks.map(task => task.run_id)))) throw new Error(TASKS_NOT_STOPPED)
+    // A reply sent while the tasks were stopped: kept, as above.
+    if (state.busy && state.activeId === id) return
+  }
   deletedAt.set(id, ++seq)
+  promoteAfterSave.delete(id)
   unsaved.delete(id)
   // The page leaves the conversation first, synchronously, so nothing sent
   // while the deletion is on its way can land in it and save it again.
@@ -314,11 +403,19 @@ export async function deleteConversation(id: string): Promise<void> {
   await refreshHistory()
 }
 
-/** Deletes every conversation and starts a new chat; not while a reply is
- *  in flight, for the same reason. */
+/** Deletes every conversation, once their tasks are stopped, and starts a
+ *  new chat; not while a reply is in flight, for the same reason. The new
+ *  chat starts only then, so nothing asked in it while the tasks are
+ *  stopped goes with the rest (Codex A6 C2). */
 export async function clearConversations(): Promise<void> {
   if (state.busy) return
+  const tasks = state.items.flatMap(item => item.tasks)
+  if (tasks.length > 0) {
+    if (!(await stopTasks(tasks.map(task => task.run_id)))) throw new Error(TASKS_NOT_STOPPED)
+    if (state.busy) return
+  }
   clearedAt = ++seq
+  promoteAfterSave.clear()
   unsaved.clear()
   starter?.()
   set({ activeId: null })
@@ -333,4 +430,6 @@ export function resetHistoryStore(): void {
   sleep = realSleep
   opener = null
   starter = null
+  listening = false
+  promoteAfterSave.clear()
 }

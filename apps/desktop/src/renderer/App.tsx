@@ -9,10 +9,8 @@ import HomePage from './pages/Home'
 import ModelsPage from './pages/Models'
 import SettingsPage from './pages/Settings'
 import { listOsModules } from './pages/agent/api'
-import RunsPage from './pages/Runs'
 import SchedulesPage from './pages/Schedules'
 import CommunicationPage from './pages/comm/Communication'
-import ApprovalsPage from './pages/Approvals'
 import VoicePanel from './pages/voice/VoicePanel'
 import CreativePage from './pages/Creative'
 import KnowledgePage from './pages/Knowledge'
@@ -188,11 +186,9 @@ function AppShell(): JSX.Element {
 
   const pageTitle = selected ? c(selected.nameKey)
     : page === 'capabilities' ? t('nav.capabilities')
-      : page === 'chat' ? c('assistant.name')
-        : page === 'home' ? t('title.home')
-          : page === 'settings' ? t('title.settings')
-            : page === 'runs' ? t('title.runs') : t('nav.capabilities')
-  const activeId = selected?.id ?? (page === 'chat' ? 'assistant' : page ?? '')
+      : page === 'home' ? t('title.home')
+        : page === 'settings' ? t('title.settings') : t('nav.capabilities')
+  const activeId = selected?.id ?? page ?? ''
 
   return (
     <div className={`app${darkMode ? '' : ' light'}`}>
@@ -230,7 +226,7 @@ function AppShell(): JSX.Element {
       <div className={`main${sidebarOpen ? '' : ' sidebar-hidden'}`}>
         <div className="topbar">
           <span className="topbar-title">{pageTitle}</span>
-          {(page === 'chat' || page === 'home') && (
+          {(page === 'assistant' || page === 'home') && (
             <span className="topbar-sub">{llmLabel}</span>
           )}
           <button
@@ -255,7 +251,7 @@ function AppShell(): JSX.Element {
             memory session on every round trip through another page. */}
         <div
           style={
-            page === 'chat'
+            page === 'assistant'
               ? { display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }
               : { display: 'none' }
           }
@@ -270,15 +266,15 @@ function AppShell(): JSX.Element {
             onNavigate={(target) => {
               const def = defs.find(d => d.page === target || d.id === target)
               if (def) open(def.id, 'other')
+              // M4 A6: the run store's station opens Settings → Activity.
+              else if (target.startsWith('settings/')) open(target, 'other')
               else navigate(target)
             }}
           />
         )}
         {page === 'documents'        && <DocumentsPage />}
-        {page === 'runs'             && <RunsPage />}
         {page === 'schedules'        && <SchedulesPage />}
         {page === 'communication'    && <CommunicationPage />}
-        {page === 'approvals'        && <ApprovalsPage />}
         {page === 'voice'            && <VoicePanel />}
         {page === 'creative'         && <CreativePage />}
         {page === 'knowledgeBase'    && <KnowledgePage />}
@@ -287,7 +283,7 @@ function AppShell(): JSX.Element {
         {page === 'settings'         && <SettingsPage key={route.kind === 'page' ? route.key : undefined} initialTab={route.kind === 'page' ? route.initialTab : undefined} />}
         {page === 'capabilities'     && <CapabilitiesPage statusFor={statusFor} onOpenSettings={() => open('settings/general', 'capabilities', { focus: 'slots' })} />}
         {page === 'modules-manager'  && <ModulesManagerPage />}
-        {selected && !['chat', 'documents', 'schedules', 'communication', 'approvals', 'voice', 'creative', 'knowledgeBase', 'models', 'memory', 'modules-manager'].includes(selected.page)
+        {selected && !['assistant', 'documents', 'schedules', 'communication', 'voice', 'creative', 'knowledgeBase', 'models', 'memory', 'modules-manager'].includes(selected.page)
           && <CapabilityPage capability={selected} />}
       </div>
     </div>

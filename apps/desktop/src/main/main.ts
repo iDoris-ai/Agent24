@@ -3,8 +3,11 @@
 import { app, BrowserWindow, dialog, Menu, Tray, WebContentsView, nativeImage, net, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
+import { onChatHistoryChange } from './chat-history'
+import { createScheduleConversations, type ScheduleConversations } from './schedule-conversations'
+import { createAssistantApprovals, type AssistantApprovals, type RunOwner } from './assistant-approvals'
 import { registerCliTool } from './ipc/cli-tool'
-import { getMainLocale, initMainLocale, onMainLocaleChange } from './main-i18n'
+import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonConnection, onDaemonReady, setBundledPackaged } from './backend-manager'
@@ -82,7 +85,93 @@ const agentEarBridge = new AgentEarEventBridge(
     const doc = documentsEvent(event)
     if (doc && mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.DocumentsEvent, doc)
   },
+  // M4 A3: runs' changes, for the history list's filters.
+  (event) => {
+    if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.RunEvent, event)
+    // M4 A6: an approval of a run no conversation has, to the assistant's.
+    if (event.type === 'approval.required') {
+      assistantApprovals().route(event.run_id)
+        .catch((err) => console.error('[main] approval run not routed', event.run_id, err))
+    }
+  },
+  // M4 A5: a schedule's run goes to the schedule's conversation, window or not.
+  (run) => {
+    scheduleConversations().record(run.schedule_id, run.run_id)
+      .catch((err) => console.error('[main] schedule run not recorded', run.schedule_id, run.run_id, err))
+  },
+  // ...and those started while main was not listening.
+  () => {
+    scheduleConversations().catchUp(async () => {
+      const conn = daemonConnection()
+      if (!conn) throw new Error('backend_not_ready')
+      // The daemon's list has every run, with its input and output, and no
+      // paging: main's own request takes more than the window's 8 MB.
+      const res = await proxyRequest(conn, { method: 'GET', path: '/api/v1/runs' }, { host: '127.0.0.1', maxBytes: RUNS_CATCH_UP_MAX_BYTES })
+      const list = (res.data as { runs?: unknown } | null)?.runs
+      if (!res.ok || !Array.isArray(list)) throw new Error(`runs_unavailable_${res.status}`)
+      return list
+    }).catch((err) => console.error('[main] schedule runs not caught up', err))
+    assistantApprovals().catchUp(async () => {
+      const res = await daemonGet('/api/v1/approvals?status=pending')
+      const list = (res.data as { approvals?: unknown } | null)?.approvals
+      if (!res.ok || !Array.isArray(list)) throw new Error(`approvals_unavailable_${res.status}`)
+      return list
+    }).catch((err) => console.error('[main] pending approvals not caught up', err))
+  },
 )
+
+// M4 A6: made on the first approval, once userData is settled.
+async function daemonGet(apiPath: string) {
+  const conn = daemonConnection()
+  if (!conn) throw new Error('backend_not_ready')
+  return proxyRequest(conn, { method: 'GET', path: apiPath }, { host: '127.0.0.1' })
+}
+let assistantApprovalsStore: AssistantApprovals | null = null
+function assistantApprovals(): AssistantApprovals {
+  assistantApprovalsStore ??= createAssistantApprovals({
+    dir: app.getPath('userData'),
+    history: createChatHistoryStore(app.getPath('userData')),
+    ownerOf: async (runId): Promise<RunOwner> => {
+      const run = await daemonGet(`/api/v1/runs/${encodeURIComponent(runId)}`)
+      const data = run.data as { schedule_id?: unknown; session_id?: unknown } | null
+      if (!run.ok || data === null) throw new Error(`run_unavailable_${run.status}`)
+      if (typeof data.schedule_id === 'string' && data.schedule_id !== '') {
+        return (await scheduleConversations().claim(data.schedule_id, runId)) ? 'schedule' : 'other'
+      }
+      if (typeof data.session_id !== 'string' || data.session_id === '') return 'other'
+      const session = await daemonGet(`/api/v1/sessions/${encodeURIComponent(data.session_id)}`)
+      // A session the daemon no longer has is no window's.
+      if (session.status === 404) return 'other'
+      const channel = (session.data as { channel?: unknown } | null)?.channel
+      if (!session.ok || typeof channel !== 'string') throw new Error(`session_unavailable_${session.status}`)
+      return channel === 'desktop' ? 'desktop' : 'other'
+    },
+    settled: (runId, recorded) => scheduleConversations().settle(runId, recorded),
+    title: () => mt('assistant.conversationTitle'),
+    onCatchUpFailure: (runId, err) => console.error('[main] approval run not caught up', runId, err),
+  })
+  return assistantApprovalsStore
+}
+
+// M4 A5: made on the first schedule's run, once userData is settled.
+const RUNS_CATCH_UP_MAX_BYTES = 64 * 1024 * 1024
+let scheduleConversationsStore: ScheduleConversations | null = null
+function scheduleConversations(): ScheduleConversations {
+  scheduleConversationsStore ??= createScheduleConversations({
+    dir: app.getPath('userData'),
+    history: createChatHistoryStore(app.getPath('userData')),
+    scheduleName: async (scheduleId) => {
+      const conn = daemonConnection()
+      if (!conn) return null
+      const res = await proxyRequest(conn, { method: 'GET', path: `/api/v1/schedules/${encodeURIComponent(scheduleId)}` }, { host: '127.0.0.1' })
+      const name = (res.data as { name?: unknown } | null)?.name
+      return res.ok && typeof name === 'string' ? name : null
+    },
+    title: (name) => mt('schedule.conversationTitle', { name }),
+    onCatchUpFailure: (runId, err) => console.error('[main] schedule run not caught up', runId, err),
+  })
+  return scheduleConversationsStore
+}
 
 // FU-91: was hardcoded to 'http://localhost:5173' — if that port were taken
 // by another project, the window silently loaded whatever else was listening
@@ -448,9 +537,11 @@ app.whenReady().then(async () => {
     })
   })
 
+  onChatHistoryChange(summary => { if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.ChatHistoryChanged, summary) })
   registerIpcHandlers({
     guard,
     knowledge: () => knowledge,
+    scheduleConversation: (scheduleId) => scheduleConversations().conversationOf(scheduleId),
     // T1-1/T1-2: what is on disk now. A daemon reads installed packages only
     // when it starts, so the pages compare this with what it serves (§9 Q2).
     documentsModule: () => ({
