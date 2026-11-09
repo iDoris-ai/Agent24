@@ -122,6 +122,16 @@ export function knowledgeEntrySubmission(deps: KnowledgeEntrySubmitDeps) {
 
   /** Send `pending` (new, or a resend) and record a definite answer. */
   const send = async (id: string, draft: EntryDraft, pending: PendingSubmit, provider: Provider, target: string, resend: boolean, signal: AbortSignal): Promise<SubmissionAnswer> => {
+    // Judged again after the ready round trip, with no await before the
+    // credential is read for the write: same generation, binding and
+    // credential as the record (W1.5), or the write does not go out. A fresh
+    // record is then dropped (nothing was sent); a resend keeps its record.
+    if (!stillCurrent(provider, target) || credentialRef(provider) !== pending.credential_ref) {
+      if (!resend) {
+        try { deps.candidates.settleSubmit(id, null) } catch { /* the record stays; it is resent, not lost */ }
+      }
+      return dropped(id, draft, false)
+    }
     const result = await submitCandidate(provider.deps, provider.generation, pending.body, signal)
     // R7.3 / W1.5: an answer to a generation or binding no longer current is
     // dropped; the write may have landed, so the record stays.
@@ -256,9 +266,11 @@ export function knowledgeEntrySubmission(deps: KnowledgeEntrySubmitDeps) {
       const gate = bound(draft)
       if ('ok' in gate) return gate
       const { provider, target } = gate
-      // W1.4: a write, so the ready key admits it first.
-      const admitted = await candidateAdmission(provider.deps, provider.generation, signal)
+      // W1.4: withdraw creates no work, so only a disabled key refuses it locally.
+      const admitted = await candidateAdmission(provider.deps, provider.generation, signal, false)
       if (!admitted.ok) return serverFailure(draft.id, draft, admitted)
+      // Judged again after the ready round trip.
+      if (!stillCurrent(provider, target)) return dropped(draft.id, draft, false)
       const done = await withdrawCandidate(provider.deps, provider.generation, candidate.candidate_id, signal)
       // W8.8 is idempotent: a dropped answer is read back by status or withdrawn again.
       if (!stillCurrent(provider, target)) return dropped(draft.id, draft, true)

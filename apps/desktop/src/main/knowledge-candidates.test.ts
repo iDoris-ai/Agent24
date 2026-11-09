@@ -76,6 +76,9 @@ describe('candidateAdmission (W1.4, HS1)', () => {
     expect(await candidateAdmission(down.deps, 1, signal())).toMatchObject({ ok: false, code: 'not_ready' })
     const wrongEcho = deps(() => json(200, { request_id: 'someone-else', live: true, operations: { candidate: { state: 'ready' } } }))
     expect(await candidateAdmission(wrongEcho.deps, 1, signal())).toMatchObject({ ok: false, code: 'not_ready' })
+    // The request_id alone, with the right generation (Codex H1 r2 C4).
+    const otherId = deps((call) => json(200, { request_id: 'someone-else', generation: call.body.generation, live: true, operations: { candidate: { state: 'ready' } } }))
+    expect(await candidateAdmission(otherId.deps, 1, signal())).toMatchObject({ ok: false, code: 'not_ready' })
     // R7.2/R7.3 (Codex H1 C8): the generation is echoed and checked too.
     for (const generation of [undefined, 2, null]) {
       const wrong = deps((call) => json(200, { request_id: call.body.request_id, generation, live: true, operations: { candidate: { state: 'ready' } } }))
