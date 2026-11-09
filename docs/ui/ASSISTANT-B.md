@@ -1,6 +1,6 @@
 # 常驻 B 期：桌面端与 LaunchAgent 守护进程的连接（M5 B1–B3）
 
-依据：跟踪 #1708；B1 #1710、B2 #1711、B3 #1717；守护进程侧 K-B3 #1715（presence 帧定稿，issuecomment-6732349252）。
+依据：跟踪 #1708；B2 #1711、B3 #1717；守护进程侧 K-B3 #1715（presence 帧定稿，issuecomment-6732349252）。
 
 `agent24 service install` 之后，守护进程由 LaunchAgent 运行（`<data_dir>/bin/agent24d serve --port 0 --auth-mode capabilities --enroll-endpoint`）。这时桌面端不再自己 spawn 守护进程，也拿不到宿主令牌，改为通过 daemon.json 里的 `enroll_endpoint`（一个 Unix socket）连上去。下面的两条连接都开在这个 socket 上。
 
@@ -44,7 +44,7 @@
 - 带查询串的请求不提权，守护进程会拒绝这种 grant，所以原样返回 403。
 - 只有 main 设置这个头：页面的请求（`BackendProxyRequest`）不带自定义头，grant 也不离开 `sendElevating`。
 - 自己的 child（宿主令牌）和 legacy 守护进程没有登记连接，只发一次普通请求，行为和以前一样。
-- 所有经 `proxyToBackend` 的 main 侧请求（通用代理和各个专用 IPC）都走这条路。
+- `ipc/index.ts` 里经 `proxyToBackend` 的请求（通用代理和各个专用 IPC）都走这条路。main.ts 里直接调用 `proxyRequest` 的几处只读请求（runs、schedules、chat）不涉及 Elevated 路由，没有改。
 
 ## 4. 已知局限
 
