@@ -238,7 +238,12 @@ fn verify_declared(
         });
     }
     let bytes = read_bounded(&path, FILES_JSON_NAME, integrity::MAX_FILES_JSON_BYTES)?;
-    let expected = integrity::verify_files_json(&bytes, section)?;
+    // `verify_files_json` does not take the token. A cancel during that read
+    // still has to beat a hash or manifest error, same as `tree_result`.
+    let files_json = integrity::verify_files_json(&bytes, section);
+    #[cfg(test)]
+    on_files_json_checked();
+    let expected = prefer_cancel(cancel, files_json)?;
     // A mismatch (or any other tree error) discovered as the token fires is
     // still an unfinished check. Cancel wins over the mismatch.
     tree_result(
@@ -262,10 +267,45 @@ fn tree_result(
     cancel: &CancellationToken,
     result: Result<(), integrity::TreeError>,
 ) -> Result<(), IntegrityError> {
+    prefer_cancel(cancel, result.map_err(integrity::map_tree_error))
+}
+
+/// Cancel wins over an error already in hand. The check that produced `result`
+/// may not have looked at the token again (`verify_files_json` never does).
+fn prefer_cancel<T>(
+    cancel: &CancellationToken,
+    result: Result<T, IntegrityError>,
+) -> Result<T, IntegrityError> {
     if cancel.is_cancelled() {
         return Err(IntegrityError::Cancelled);
     }
-    result.map_err(integrity::map_tree_error)
+    result
+}
+
+// Test stand-in for a shutdown that lands while `files.json` is being
+// checked: the hook runs after that check returns and before `prefer_cancel`.
+#[cfg(test)]
+thread_local! {
+    static FILES_JSON_CHECKED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn on_files_json_checked() {
+    let hook = FILES_JSON_CHECKED.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn arm_files_json_checked(hook: impl FnOnce() + 'static) {
+    FILES_JSON_CHECKED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn clear_files_json_checked() {
+    FILES_JSON_CHECKED.with(|slot| *slot.borrow_mut() = None);
 }
 
 const HEADER_WINDOW: usize = 1024 * 1024;
@@ -1183,10 +1223,44 @@ mod tests {
         assert!(generate(&package, &["bin/cos72".into()]).is_err());
     }
 
+    /// `files.json` does not match, and the token fires after that check
+    /// returns — before the error is published. The entry `is_cancelled`
+    /// check has already passed. Publishing `verify_files_json`'s error
+    /// directly (`?` without [`prefer_cancel`]) turns this into
+    /// `hash_mismatch: files.json`.
+    #[test]
+    fn a_files_json_mismatch_while_cancelled_is_cancelled() {
+        let (_parent, package) = generated("cos72");
+        let json_path = package.join(FILES_JSON_NAME);
+        let mut permissions = fs::symlink_metadata(&json_path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&json_path, permissions).unwrap();
+        let mut bytes = fs::read(&json_path).unwrap();
+        bytes.push(b'\n');
+        fs::write(&json_path, &bytes).unwrap();
+        let yaml = fs::read_to_string(package.join(DOMAIN_OS_YML)).unwrap();
+        let manifest = DomainOsManifest::from_yaml(&yaml).unwrap();
+        let cancel = CancellationToken::new();
+        let flag = cancel.clone();
+        super::arm_files_json_checked(move || flag.cancel());
+        let _clear = FilesJsonHookGuard;
+        let err = verify_if_present(&package, &manifest, &cancel).unwrap_err();
+        assert!(matches!(err, IntegrityError::Cancelled), "{err}");
+        assert!(!err.to_string().contains("hash_mismatch"), "{err}");
+    }
+
+    struct FilesJsonHookGuard;
+
+    impl Drop for FilesJsonHookGuard {
+        fn drop(&mut self) {
+            super::clear_files_json_checked();
+        }
+    }
+
     /// The tree walk already decided this was a mismatch. The token fired
     /// before that error was published, so the caller must see `cancelled`.
-    /// Dropping the cancel arm in [`tree_result`]'s error path turns this
-    /// into `hash_mismatch`.
+    /// Dropping the cancel arm in [`prefer_cancel`] turns this into
+    /// `hash_mismatch`.
     #[test]
     fn a_hash_mismatch_while_cancelled_is_cancelled() {
         let cancel = CancellationToken::new();

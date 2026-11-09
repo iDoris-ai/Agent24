@@ -180,8 +180,9 @@ pub fn scan(root: &Path, cancel: &CancellationToken) -> Scan {
 
     let mut rest = dirs.into_iter();
     while let Some(dir) = rest.next() {
-        // Already cancelled: do not open this package or any later one.
-        // Parsing a broken manifest here would record it as damaged.
+        // Same outcome as `read_package`'s first check, which is what
+        // refuses to parse a manifest. Kept so a fired token does not
+        // enter `read_package` once per remaining directory.
         if cancel.is_cancelled() {
             out.cancelled.push(dir);
             out.cancelled.extend(rest);
@@ -335,6 +336,8 @@ pub fn build_tool_registry(found: &[Discovered]) -> (ModuleToolRegistry, Vec<Ref
 /// so this restart is not a success. The full tree is still hashed whenever
 /// the token is live.
 pub fn recheck(dir: &Path, expected: &str, cancel: &CancellationToken) -> Result<(), String> {
+    // The metadata branches below return before `read_package`, so its
+    // cancel check never runs for a missing, linked, or non-directory path.
     if cancel.is_cancelled() {
         return Err("cancelled".to_owned());
     }
@@ -1030,6 +1033,25 @@ mod tests {
         );
         // The supervisor spawns the next run only when this returns Ok.
         assert!(super::recheck(&live.found[0].dir, &digest, &cancel).is_err());
+    }
+
+    /// The directory is already gone, and the token is already cancelled.
+    /// That must be `cancelled`, not "no longer exists": the metadata
+    /// branches return before `read_package`'s cancel check. Dropping the
+    /// check at the top of `recheck` turns the first assertion red.
+    #[test]
+    fn recheck_of_a_missing_directory_while_cancelled_is_cancelled() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("gone");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = super::recheck(&missing, "sha256:ab", &cancel).unwrap_err();
+        assert_eq!(err, "cancelled");
+        let live = super::recheck(&missing, "sha256:ab", &CancellationToken::new()).unwrap_err();
+        assert!(
+            live.contains("no longer exists"),
+            "a live token must still report the missing directory: {live}"
+        );
     }
 
     /// Executable is a copy of this test binary. There is no native-format

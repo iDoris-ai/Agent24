@@ -632,6 +632,8 @@ async fn run_loop(
         // The shutdown token is the same predicate `recheck` uses to return
         // "cancelled", without that second walk. A cancel that arrives while
         // `launch::spawn` is still pending is handled inside `run_once`.
+        // The spawn backstop is `run_once`'s shutdown `select`. This check is
+        // earlier: `run_once` binds a socket pair before that `select`.
         if attempt == 1 && shutdown.is_cancelled() {
             end_because_package_changed(&spec, slot, status, record, &mut stop, "cancelled").await;
             return;
@@ -862,7 +864,8 @@ async fn run_once(
         }
         // `close()` has not run yet, so the stop watch is still empty.
         // Dropping `spawn` here is safe: its only await is before the child
-        // exists.
+        // exists. The check after `spawn` returns only reaps a child that
+        // already exists; a restart has no attempt-1 check above this.
         () = shutdown.cancelled() => {
             return Ok(Run::Cancelled);
         }
@@ -2756,6 +2759,82 @@ sys.exit(0)
         };
         assert_eq!(reason, "cancelled");
         assert!(starts(f.data.path()).is_empty(), "the module ran");
+        // `run_once` binds this pair before its shutdown `select`. The
+        // attempt-1 check is what keeps the bind from happening; the select
+        // only stops the spawn. Dropping the attempt-1 check leaves this at 1
+        // even though no start line was written.
+        assert_eq!(
+            f.dir.generations_issued(),
+            0,
+            "a cancelled first attempt bound a socket pair"
+        );
+        stop(handle).await;
+    }
+
+    /// The first run has already passed the attempt-1 check and is in
+    /// backoff. Shutdown fires before the restart's `select`. `package_check`
+    /// would allow a spawn. The biased shutdown arm must return without
+    /// creating a child. The witness is the hook inside `launch::start`: it
+    /// runs after the child exists and before `spawn` returns, so the
+    /// post-spawn reap cannot hide that spawn. The start file is not that
+    /// witness — `finish` can kill the process before the mock writes it.
+    #[tokio::test]
+    async fn a_cancelled_shutdown_during_backoff_does_not_spawn_the_restart() {
+        let mut f = fixture("early");
+        f.spec.name = "backoff-cancel".to_owned();
+        let spawned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spawned_hook = spawned.clone();
+        let _clear = crate::launch::arm_spawned_for_test(Arc::new(move |name, _pid| {
+            if name == "backoff-cancel" {
+                spawned_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+        let current = Current::new(Generation::starting());
+        let shutdown = CancellationToken::new();
+        let timings = Timings {
+            backoff_base: Duration::from_secs(5),
+            ..fast()
+        };
+        let handle = supervise(
+            f.spec.clone(),
+            f.dir.clone(),
+            current,
+            no_methods(),
+            Offer::none(),
+            timings,
+            no_package_check(),
+            shutdown.clone(),
+        )
+        .expect("the slot is free");
+        let mut rx = handle.subscribe();
+        until(&mut rx, "the first backoff", |s| {
+            matches!(s, Status::Backoff { failures: 1, .. })
+        })
+        .await;
+        assert_eq!(
+            spawned.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the failing run did not spawn"
+        );
+        shutdown.cancel();
+        let status = until(&mut rx, "cancelled restart", |s| {
+            matches!(
+                s,
+                Status::PackageChanged { .. }
+                    | Status::Backoff { failures: 2, .. }
+                    | Status::Running
+            )
+        })
+        .await;
+        let Status::PackageChanged { reason } = &status else {
+            panic!("restarted after shutdown: {status:?}");
+        };
+        assert_eq!(reason, "cancelled");
+        assert_eq!(
+            spawned.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the restart spawned a child"
+        );
         stop(handle).await;
     }
 
@@ -2775,14 +2854,13 @@ sys.exit(0)
         let shutdown = CancellationToken::new();
         let seen: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
         let (flag, seen_hook) = (shutdown.clone(), seen.clone());
-        crate::launch::arm_spawned_for_test(Arc::new(move |name, pid| {
+        let _clear = crate::launch::arm_spawned_for_test(Arc::new(move |name, pid| {
             if name != "spawn-cancel-window" {
                 return;
             }
             *seen_hook.lock().unwrap() = Some(pid);
             flag.cancel();
         }));
-        let _clear = crate::launch::ClearSpawnedHook;
         let handle = supervise(
             f.spec.clone(),
             f.dir.clone(),

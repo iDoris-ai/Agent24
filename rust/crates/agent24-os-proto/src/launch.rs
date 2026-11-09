@@ -631,42 +631,52 @@ fn start(
     Ok(process)
 }
 
-/// One test at a time parks a cancel in [`start`], after the child exists and
-/// before [`spawn`] returns. Other spawns pass a name the hook ignores.
+/// Parks a callback in [`start`], after the child exists and before [`spawn`]
+/// returns. Several tests may arm one at once; each guard removes only its own.
+/// A hook ignores spawns whose name is not the module that test started.
 #[cfg(test)]
 type SpawnedHook = std::sync::Arc<dyn Fn(&str, i32) + Send + Sync>;
 
 #[cfg(test)]
-static SPAWNED_FOR_TEST: std::sync::Mutex<Option<SpawnedHook>> = std::sync::Mutex::new(None);
+static SPAWNED_FOR_TEST: std::sync::Mutex<Vec<(u64, SpawnedHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+static SPAWNED_HOOK_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[cfg(test)]
 fn note_child_spawned(name: &str, pid: i32) {
-    let hook = SPAWNED_FOR_TEST
+    let hooks = SPAWNED_FOR_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    if let Some(hook) = hook {
+    for (_, hook) in hooks {
         hook(name, pid);
     }
 }
 
+/// Arm `hook` until the returned guard drops, including when the test panics.
 #[cfg(test)]
-pub(crate) fn arm_spawned_for_test(hook: SpawnedHook) {
-    *SPAWNED_FOR_TEST
+pub(crate) fn arm_spawned_for_test(hook: SpawnedHook) -> ClearSpawnedHook {
+    let id = SPAWNED_HOOK_IDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    SPAWNED_FOR_TEST
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((id, hook));
+    ClearSpawnedHook(id)
 }
 
-/// Clears [`arm_spawned_for_test`] on drop, including when the test panics.
+/// Removes the hook [`arm_spawned_for_test`] installed.
 #[cfg(test)]
-pub(crate) struct ClearSpawnedHook;
+pub(crate) struct ClearSpawnedHook(u64);
 
 #[cfg(test)]
 impl Drop for ClearSpawnedHook {
     fn drop(&mut self) {
-        *SPAWNED_FOR_TEST
+        SPAWNED_FOR_TEST
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(id, _)| *id != self.0);
     }
 }
 
