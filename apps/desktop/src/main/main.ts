@@ -80,6 +80,8 @@ const agentEarBridge = new AgentEarEventBridge(
     const doc = documentsEvent(event)
     if (doc && mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.DocumentsEvent, doc)
   },
+  // M4 A3: runs' changes, for the history list's filters.
+  (event) => { if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.RunEvent, event) },
 )
 
 // FU-91: was hardcoded to 'http://localhost:5173' — if that port were taken

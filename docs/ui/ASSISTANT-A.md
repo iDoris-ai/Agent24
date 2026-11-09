@@ -64,7 +64,31 @@ A2 已经接上的：Knowledge 那一轮（`pages/chat-knowledge.ts`）。run �
 
 A4 有了进度卡、能把进度显示出来以后，再把超时的处理从「cancel」改为「`promotionDue({ status, replyEnded: true })` 成立就 `promoteRun`，不 cancel」。现在就这样接，会留下一个用户看不见的后台任务。
 
-## 5. 给 Knowledge（A7）
+## 5. 列表的四个筛选（A3）
+
+列表顶部有四个筛选：全部、进行中、待我处理、已完成。规则在 `renderer/pages/chat/filters.ts` 的 `filtersOf`：
+
+- **进行中**：有 task 处在 `queued` 或 `running`。
+- **待我处理**：`pending` 非空，或者有 task 在 `awaiting_approval`。
+- **已完成**：`pending` 为空，并且最近一个 task 已经结束（`completed`、`failed`、`cancelled`）。「最近」按 `started_at` 算；时间相同时，取 runs 里排在后面的那一个。
+- 只看 task 和 schedule 的 run，answer 不算（摘要里本来也没有 answer）。
+- 一条对话可以同时属于好几个筛选。
+- 状态还不知道的 task，只出现在「全部」里，其他筛选都不算它。daemon 查不到的 run 记为 `missing`，也一样只在「全部」里。
+
+run 的状态怎么来（`renderer/pages/chat/run-status.ts`）：
+
+- 列表上出现的每个 task，问一次 `GET /api/v1/runs/{id}`。
+- daemon 的 `/events` 上来了 `run.started`、`run.completed`、`run.failed`、`run.cancelled`、`approval.required`、`approval.resolved`，并且是列表问过的 run，就再问一次。
+- 事件由 main 的 `agentear-events.ts` 转发，IPC 是 `run:event`，只带 `type` 和 `run_id`。
+- 不轮询。
+
+几条约定（PM 11-09 同意）：
+
+- 已归档的对话不算进四个筛选的计数和结果，只在「全部」里出现。
+- 选了「全部」以外的筛选时，列表改成一份扁平列表；搜索词照样生效。回到「全部」，恢复分组视图。
+- 筛选栏只在某条对话有 task 或 pending 时才出现。都没有时，「全部」以外的筛选都是空的。筛选栏消失时，选中的筛选回到「全部」。
+
+## 6. 给 Knowledge（A7）
 
 04b 的待确认、1b-2 的草稿待确认，在 main 里调 `setPending`、`clearPending`，写进它们所在的对话：
 

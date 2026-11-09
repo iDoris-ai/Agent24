@@ -34,6 +34,7 @@ import {
   type CreativeViewResult,
   type LlmStatusResult,
   type ModelCallEnvelope,
+  type RunEvent,
   type OpenDesignComponentStatusResult,
   type OmlxAuthRequiredResult,
   type OmlxDetectResult,
@@ -179,6 +180,12 @@ const api = {
     ipcRenderer.invoke(IpcChannels.AgentEarSnapshot),
   // ME4-desktop-model-ui: same push/pull pair, for the kernel's `model.call`
   // WS events (main/model-call-log.ts) — mirrors onAgentEarEvent/agentearSnapshot.
+  // M4 A3: runs' and approvals' changes, for the history list's filters.
+  onRunEvent: (cb: (event: RunEvent) => void): (() => void) => {
+    const listener = (_event: unknown, event: RunEvent): void => cb(event)
+    ipcRenderer.on(IpcChannels.RunEvent, listener)
+    return () => ipcRenderer.removeListener(IpcChannels.RunEvent, listener)
+  },
   onModelCallEvent: (cb: (call: ModelCallEnvelope) => void): (() => void) => {
     const listener = (_event: unknown, call: ModelCallEnvelope): void => cb(call)
     ipcRenderer.on(IpcChannels.ModelCallEvent, listener)

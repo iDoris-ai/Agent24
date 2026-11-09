@@ -3,6 +3,7 @@ import { daemonConnection } from './backend-manager'
 import {
   parseAgentEarFrame,
   parseModelCallFrame,
+  parseRunFrame,
   parseModuleFrame,
   nextBackoffMs,
   AGENTEAR_MODULE_NAME,
@@ -248,6 +249,18 @@ describe('AgentEarEventBridge — dispatches each frame to its own callback (ME4
     bridge.stop()
   })
 
+  it('routes a run frame to onRunEvent (M4 A3), and nothing else to it', () => {
+    const onRunEvent = vi.fn()
+    const bridge = new AgentEarEventBridge(() => {}, undefined, undefined, onRunEvent)
+    bridge.start()
+    const socket = (bridge as unknown as { socket: FakeWebSocket }).socket
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'approval.required', payload: { id: 'ap_1', run_id: 'run_1' } })))
+    socket.emit('message', Buffer.from(modelCallFrame()))
+    expect(onRunEvent).toHaveBeenCalledTimes(1)
+    expect(onRunEvent).toHaveBeenCalledWith({ type: 'approval.required', run_id: 'run_1' })
+    bridge.stop()
+  })
+
   it('is safe to omit onModelCall entirely (every pre-existing call site)', () => {
     const onEnvelope = vi.fn()
     const bridge = new AgentEarEventBridge(onEnvelope)
@@ -289,5 +302,26 @@ describe('parseModuleFrame: any module\'s event', () => {
     expect(onModuleEvent.mock.calls.map(([e]) => e.module)).toEqual(['documents', AGENTEAR_MODULE_NAME])
     expect(onEnvelope).toHaveBeenCalledTimes(1)
     bridge.stop()
+  })
+})
+
+// M4 A3: runs' and approvals' changes, for the history list's filters.
+describe('parseRunFrame', () => {
+  const frame = (type: string, payload: unknown) => JSON.stringify({ v: 1, seq: 7, ts: '2026-11-09T00:00:00Z', type, payload })
+
+  it.each(['run.started', 'run.completed', 'run.failed', 'run.cancelled', 'approval.required', 'approval.resolved'])('passes on %s with only its type and run', type => {
+    expect(parseRunFrame(frame(type, { run_id: 'run_1', output: { text: 'secret' }, prompt: 'p' }))).toEqual({ type, run_id: 'run_1' })
+  })
+
+  it.each([
+    ['another event', frame('model.delta', { run_id: 'run_1' })],
+    ['a module event', frame('module', { run_id: 'run_1' })],
+    ['no run id', frame('run.completed', {})],
+    ['an empty run id', frame('run.completed', { run_id: '' })],
+    ['a run id that is no string', frame('run.completed', { run_id: 7 })],
+    ['no payload', JSON.stringify({ type: 'run.completed' })],
+    ['no JSON', 'not json'],
+  ])('ignores %s', (_name, raw) => {
+    expect(parseRunFrame(raw)).toBeNull()
   })
 })
