@@ -246,9 +246,13 @@ function lastLine(output: string): string {
   return lines[lines.length - 1] ?? ''
 }
 
+function stagingDir(userDataDir: string): string {
+  return path.join(userDataDir, 'documents-module-staging')
+}
+
 /** Called only after signatures pass. Keep the old installation until generate succeeds. */
 async function installWithIntegrity(bundleDir: string, userDataDir: string, runCli: RunCli, beforeInstall?: () => Promise<void>): Promise<CliResult> {
-  const tmp = path.join(userDataDir, 'documents-module-staging')
+  const tmp = stagingDir(userDataDir)
   fs.mkdirSync(userDataDir, { recursive: true })
   fs.rmSync(tmp, { recursive: true, force: true })
   fs.mkdirSync(tmp, { mode: 0o700 })
@@ -273,6 +277,10 @@ async function installWithIntegrity(bundleDir: string, userDataDir: string, runC
 
 export async function ensureBundledDocumentsModule(deps: BundledModuleDeps): Promise<BundledModuleOutcome> {
   try {
+    // A crash after `os install` but before the cleanup below leaves the staging
+    // copy behind, and the next launch returns `up_to_date` before installing
+    // again; clear it here, on every launch.
+    fs.rmSync(stagingDir(deps.userDataDir), { recursive: true, force: true })
     if (deps.bundleDir === null) return 'no_bundle'
     const bundled = readText(path.join(deps.bundleDir, MANIFEST))
     if (bundled === null) return 'no_bundle'

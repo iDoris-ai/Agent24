@@ -205,7 +205,12 @@ describe('ensureBundledDocumentsModule', () => {
     fs.writeFileSync(path.join(copy, 'files.json'), '{}')
     fs.writeFileSync(path.join(copy, 'domain-os.yml'), "name: documents\nversion: 0.2.0\nintegrity:\n  manifest: files.json\n  sha256: abc\nspawn: {command: bin/agent24-documents}\n")
     const { d, runCli } = deps({ bundleDir: b, packagesRoot: pkgs })
+    // A crash after `os install` left the staging copy; the up-to-date path clears it too.
+    const staging = path.join(d.userDataDir, 'documents-module-staging')
+    fs.mkdirSync(staging, { recursive: true })
+    fs.writeFileSync(path.join(staging, 'stale'), 'crash residue')
     expect(await ensureBundledDocumentsModule(d)).toBe('up_to_date')
+    expect(fs.existsSync(staging)).toBe(false)
     expect(runCli).not.toHaveBeenCalled()
     fs.writeFileSync(path.join(copy, 'bin/agent24-documents-pdfkit'), 'Engine program')
     expect(await ensureBundledDocumentsModule(d)).toBe('upgraded')
