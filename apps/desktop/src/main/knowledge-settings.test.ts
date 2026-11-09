@@ -33,7 +33,8 @@ describe('KnowledgeController (M3)', () => {
   let host: KnowledgeHost
 
   const transport: HostTransport = async (_conn, method, requestPath, body) => {
-    sent.push({ method, path: requestPath.split('?')[0] ?? '', body })
+    // As sent: the daemon answers 400 to any query on these routes (K-B6).
+    sent.push({ method, path: requestPath, body })
     return { status: 204 }
   }
   const make = () => new KnowledgeController(host, logins, new KnowledgeSettingsStore(dir), { nowSeconds: () => now })
@@ -185,12 +186,14 @@ describe('KnowledgeController (M3)', () => {
     await c.configure(GOOD)
     sent = []
     expect(await c.setEnabled(true)).toEqual({ ok: true })
-    expect(sent[0]).toMatchObject({
-      method: 'PUT', path: BINDING,
-      body: JSON.stringify({ endpoint: GOOD.endpoint, knowledge_base_ids: GOOD.knowledgeBaseIds }),
-    })
+    // K-B6: the sequence is in the body, the path has no query.
+    expect(sent[0]).toMatchObject({ method: 'PUT', path: BINDING })
+    const activation = JSON.parse(sent[0]!.body!)
+    expect(activation).toEqual({ seq: expect.any(Number), endpoint: GOOD.endpoint, knowledge_base_ids: GOOD.knowledgeBaseIds })
     expect(sent[1]).toMatchObject({ method: 'PUT', path: `${BINDING}/credential` })
-    expect(JSON.parse(sent[1]!.body!)).toEqual({ kind: 'api_key', value: 'sk-SECRET', expires_at: now + 24 * 3600 })
+    const credential = JSON.parse(sent[1]!.body!)
+    expect(credential).toEqual({ seq: expect.any(Number), kind: 'api_key', value: 'sk-SECRET', expires_at: now + 24 * 3600 })
+    expect(credential.seq).toBeGreaterThan(activation.seq)
     expect(c.bindingForRun()).toBe(KNOWLEDGE_BINDING)
     expect(c.status()).toMatchObject({ enabled: true, active: true, hasKey: true })
     expect(JSON.stringify(c.status())).not.toContain('SECRET')
@@ -360,7 +363,7 @@ describe('KnowledgeController (M3)', () => {
     await c.configure({ endpoint: GOOD.endpoint, knowledgeBaseIds: ['kb-a'] })
     // The key is kept; the new scope is activated with it.
     expect(c.status().hasKey).toBe(true)
-    expect(JSON.parse(sent[0]!.body!)).toEqual({ endpoint: GOOD.endpoint, knowledge_base_ids: ['kb-a'] })
+    expect(JSON.parse(sent[0]!.body!)).toEqual({ seq: expect.any(Number), endpoint: GOOD.endpoint, knowledge_base_ids: ['kb-a'] })
     const file = fs.readFileSync(path.join(dir, 'knowledge-settings.json'), 'utf8')
     expect(file).not.toContain('SECRET')
   })

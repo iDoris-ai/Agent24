@@ -447,8 +447,9 @@ class Daemon:
                        {"Authorization": f"Bearer {self.token}"})
 
     def host(self, method, suffix="", body=None):
+        # K-B6 (#1714): the sequence is in the JSON body, never in the query.
         self.seq += 1
-        return self.call(method, f"/api/v1/host/knowledge/bindings/{BINDING}{suffix}?seq={self.seq}", body)
+        return self.call(method, f"/api/v1/host/knowledge/bindings/{BINDING}{suffix}", {"seq": self.seq, **(body or {})})
 
     def session(self):
         status, session, raw = self.call("POST", "/api/v1/sessions", {"title": "", "channel": "desktop"})

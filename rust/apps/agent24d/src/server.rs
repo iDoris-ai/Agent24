@@ -1299,6 +1299,48 @@ async fn authorize(
                                 &registrations,
                             );
                         }
+                    } else if matches!(
+                        (method.as_str(), template),
+                        (
+                            "PUT" | "DELETE",
+                            "/api/v1/host/knowledge/bindings/{binding_id}"
+                                | "/api/v1/host/knowledge/bindings/{binding_id}/credential"
+                        )
+                    ) {
+                        // The host first, as the handler decides (K-B6): a CLI
+                        // shell is not a Knowledge host, so it never gets an
+                        // approval dialog for a change it could not make.
+                        if !crate::knowledge_host::is_desktop_shell(&authorization.claims) {
+                            return crate::knowledge_host::not_host();
+                        }
+                        // A query is never part of these routes, and the grant
+                        // gate below refuses one anyway: answer 400 now rather
+                        // than ask the user to approve a request that cannot run.
+                        if req.uri().query().is_some() {
+                            return crate::knowledge_host::invalid_request();
+                        }
+                        let request_path = req.uri().path().to_owned();
+                        let Ok(bytes) = axum::body::to_bytes(
+                            req.into_body(),
+                            agent24_domain::http::MAX_BODY_BYTES,
+                        )
+                        .await
+                        else {
+                            return error_response(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "payload_too_large",
+                                "Request body exceeds limit",
+                            );
+                        };
+                        if let Some(authority) = &state.first_party {
+                            authority.remember_knowledge_request(
+                                &authorization.claims.capability_id,
+                                method.as_str(),
+                                template,
+                                &request_path,
+                                &bytes,
+                            );
+                        }
                     }
                     return (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({"error":{"code":"presence_required","message":"Presence confirmation required","operation":format!("{operation:?}")}}))).into_response();
                 }

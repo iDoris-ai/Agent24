@@ -1,12 +1,17 @@
 //! The daemon side of the private Knowledge host interface (KB-HOST-01 PR-B,
-//! #1085 design v2 §2). Only the desktop's ProductHost capability may use it:
-//! it activates and deactivates Knowledge bindings and hands the daemon the
+//! #1085 design v2 §2). Two hosts may use it. The desktop's ProductHost
+//! capability, keyed `product:{capability_id}`. And the desktop
+//! FirstPartyShell whose code-signing identifier is exactly
+//! `ai.auraai.agent24`, keyed `shell:ai.auraai.agent24`. FirstPartyShell is
+//! accepted only here, for the Knowledge host; it is not a ProductHost. The
+//! host activates and deactivates Knowledge bindings and hands the daemon the
 //! short-lived credential C of an active binding, or takes it back. C lives
 //! only in this process's memory; no response and no log line carries it.
 //!
-//! Every record belongs to the ProductHost capability that wrote it (decided
-//! 2026-10-24): a lookup always names the capability it is made for, so a
-//! binding cannot be found by its id alone (design v2 §3).
+//! Every record belongs to the host that wrote it (decided 2026-10-24): a
+//! lookup always names that host key, so a binding cannot be found by its id
+//! alone (design v2 §3). Renewal replaces a shell's capability id and leaves
+//! its code-signing identifier, and therefore its host key, unchanged.
 //!
 //! Each change carries a sequence number from the host, starting at 1, that
 //! must be greater than any it sent before for that binding; the binding and
@@ -26,9 +31,9 @@
 //! A run may name a binding (`RunCreate.knowledge_binding_id`, PR-C): only the
 //! host that activated it can, and the run is pinned to that host and that
 //! activation, its generation. The pin lives in memory, like the records
-//! (decided 2026-10-25): a restarted daemon has a new host capability, so a
-//! pin could not match again wherever it was kept, and a run that names a
-//! binding but has no pin is refused, never bound anew.
+//! (decided 2026-10-25). A restarted daemon has lost both, so a pin could not
+//! match again wherever it was kept, and a run that names a binding but has
+//! no pin is refused, never bound anew.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
@@ -38,8 +43,8 @@ use std::time::Instant;
 use agent24_components::ComponentState;
 use agent24_protocol::state_file::AuthMode;
 use axum::body::Body;
-use axum::extract::rejection::{PathRejection, QueryRejection};
-use axum::extract::{Extension, Path, Query, State};
+use axum::extract::rejection::PathRejection;
+use axum::extract::{Extension, Path, State};
 use axum::http::{Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -631,26 +636,70 @@ impl KnowledgeHostRegistry {
     }
 }
 
-/// The capability id of the ProductHost making this request. Legacy mode has
-/// no such authority (its shared token also reaches every other route), and a
-/// Creative runtime is not the host, so both get `None`.
+/// Code-signing identifier of the desktop app. Exact match only: a CLI
+/// `agent24` or `agent24d` is not this shell.
+pub const DESKTOP_SHELL_IDENTIFIER: &str = "ai.auraai.agent24";
+
+/// Which kind of Knowledge host made the request. The key is prefixed so a
+/// ProductHost capability id cannot collide with the desktop shell key.
+enum HostKey {
+    Product(String),
+    DesktopShell,
+}
+
+impl HostKey {
+    fn into_key(self) -> String {
+        match self {
+            Self::Product(id) => format!("product:{id}"),
+            Self::DesktopShell => format!("shell:{DESKTOP_SHELL_IDENTIFIER}"),
+        }
+    }
+}
+
+/// The host key of this request. Legacy mode has no such authority (its
+/// shared token also reaches every other route), and a Creative runtime is
+/// not a host, so both get `None`. A ProductHost is `product:{capability_id}`.
+/// A desktop FirstPartyShell is `shell:ai.auraai.agent24`, and only when its
+/// peer identifier is exactly [`DESKTOP_SHELL_IDENTIFIER`]. Any other
+/// audience, including a CLI shell, is not a host. FirstPartyShell is accepted
+/// only here; it is not a ProductHost.
 fn host_capability(
     state: &AppState,
     authorization: Option<Extension<Authorization>>,
 ) -> Option<String> {
-    match (state.auth_mode, authorization) {
-        (AuthMode::Capabilities, Some(Extension(authorization)))
-            if authorization.claims.audience == Audience::ProductHost =>
-        {
-            Some(authorization.claims.capability_id)
+    let (AuthMode::Capabilities, Some(Extension(authorization))) = (state.auth_mode, authorization)
+    else {
+        return None;
+    };
+    match authorization.claims.audience {
+        Audience::ProductHost => {
+            Some(HostKey::Product(authorization.claims.capability_id).into_key())
+        }
+        Audience::FirstPartyShell if is_desktop_shell(&authorization.claims) => {
+            Some(HostKey::DesktopShell.into_key())
         }
         _ => None,
     }
 }
 
+/// Whether a FirstPartyShell's claims are the desktop's: its peer identifier
+/// is exactly [`DESKTOP_SHELL_IDENTIFIER`]. `server.rs` asks this too, before
+/// it keeps an approval text, so a CLI shell is refused before any dialog.
+pub(crate) fn is_desktop_shell(claims: &crate::capabilities::CapabilityClaims) -> bool {
+    claims
+        .first_party
+        .as_ref()
+        .is_some_and(|first_party| first_party.peer.identity.identifier == DESKTOP_SHELL_IDENTIFIER)
+}
+
+/// The refusal a caller that is not the desktop host gets.
+pub(crate) fn not_host() -> Response {
+    Refused::NotHost.into_response()
+}
+
 /// Opaque, but never a path: an encoded `/` or `\` in the URL must not turn
 /// into one after routing, and `.` and `..` are no ids either.
-fn valid_binding_id(value: &str) -> bool {
+pub(crate) fn valid_binding_id(value: &str) -> bool {
     !value.is_empty()
         && value != "."
         && value != ".."
@@ -688,17 +737,13 @@ fn change_response(result: Result<(), ChangeError>) -> Response {
 }
 
 /// Says nothing about which part was wrong: a parse error could quote C.
-fn invalid_request() -> Response {
+/// `server.rs` also uses it for a query on a change that has no grant yet.
+pub(crate) fn invalid_request() -> Response {
     error_response(
         StatusCode::BAD_REQUEST,
         "invalid_request",
         "Malformed request",
     )
-}
-
-#[derive(Deserialize)]
-pub struct SeqQuery {
-    seq: u64,
 }
 
 /// Why a request was refused before it reached the registry.
@@ -719,13 +764,13 @@ impl IntoResponse for Refused {
             Self::NotHost => error_response(
                 StatusCode::FORBIDDEN,
                 "host_authority_required",
-                "Only the product host may use this interface",
+                "Only the desktop host may use this interface",
             ),
             Self::Malformed => invalid_request(),
             Self::Inactive => error_response(
                 StatusCode::CONFLICT,
                 "knowledge_binding_inactive",
-                "The product host has no active Knowledge binding by that id",
+                "The desktop host has no active Knowledge binding by that id",
             ),
             Self::SessionRebound => error_response(
                 StatusCode::CONFLICT,
@@ -741,27 +786,26 @@ impl IntoResponse for Refused {
     }
 }
 
-/// The host making the request, the binding and the change's sequence number.
-/// An id that is not UTF-8 gets the same answer as any other malformed one.
-fn host_and_seq(
+/// The host making the request and the binding. An id that is not UTF-8 gets
+/// the same answer as any other malformed one. The host is decided before the
+/// path and the query, and both of those before the body.
+fn host_and_binding(
     state: &AppState,
     authorization: Option<Extension<Authorization>>,
     path: Result<Path<String>, PathRejection>,
-    query: Result<Query<SeqQuery>, QueryRejection>,
-) -> Result<(String, String, u64), Refused> {
+    req: &Request<Body>,
+) -> Result<(String, String), Refused> {
     let host = host_capability(state, authorization).ok_or(Refused::NotHost)?;
-    match (path, query) {
-        (Ok(Path(binding_id)), Ok(Query(SeqQuery { seq })))
-            if seq > 0 && valid_binding_id(&binding_id) =>
-        {
-            Ok((host, binding_id, seq))
+    match path {
+        Ok(Path(binding_id)) if req.uri().query().is_none() && valid_binding_id(&binding_id) => {
+            Ok((host, binding_id))
         }
         _ => Err(Refused::Malformed),
     }
 }
 
 /// Checks a run's `knowledge_binding_id` at creation and returns what to pin
-/// the run to: only the product host may name a binding, only one it has
+/// the run to: only a Knowledge host may name a binding, only one it has
 /// active, and in a session only the activation its earlier runs had.
 pub async fn bind_run(
     state: &AppState,
@@ -802,36 +846,45 @@ pub async fn bind_run(
     Ok(binding)
 }
 
-/// `PUT /api/v1/host/knowledge/bindings/{binding_id}?seq=n` activates the
-/// binding, with `{"endpoint", "knowledge_base_ids"}` for its calls or with
-/// no body (then every call is refused); `DELETE` of the same deactivates it.
+/// `PUT /api/v1/host/knowledge/bindings/{binding_id}` with `{"seq"}` activates
+/// the binding with no endpoint (then every call is refused), or with
+/// `{"seq", "endpoint", "knowledge_base_ids"}` for its calls. `DELETE` of the
+/// same path with `{"seq"}` deactivates it. A query string is refused.
 pub async fn change(
     State(state): State<AppState>,
     authorization: Option<Extension<Authorization>>,
     method: Method,
     path: Result<Path<String>, PathRejection>,
-    query: Result<Query<SeqQuery>, QueryRejection>,
     req: Request<Body>,
 ) -> Response {
-    let (host, binding_id, seq) = match host_and_seq(&state, authorization, path, query) {
+    let (host, binding_id) = match host_and_binding(&state, authorization, path, &req) {
         Ok(found) => found,
         Err(refused) => return refused.into_response(),
     };
-    let registry = &state.knowledge_host;
-    if method != Method::PUT {
-        return change_response(registry.apply(&host, &binding_id, seq, Change::Deactivate));
-    }
     let body = match read_body_or_response(req).await {
         Ok(body) => body,
         Err(refused) => return refused,
     };
-    if body.is_empty() {
-        return change_response(registry.apply(&host, &binding_id, seq, Change::Activate));
-    }
-    let Some(endpoint) = endpoint_of(&body) else {
+    let Some(change) = parse_change_body(method.as_str(), false, &body) else {
         return invalid_request();
     };
-    change_response(registry.activate(&host, &binding_id, seq, endpoint))
+    let registry = &state.knowledge_host;
+    match change {
+        ParsedChange::Activate {
+            seq,
+            endpoint: None,
+        } => change_response(registry.apply(&host, &binding_id, seq, Change::Activate)),
+        ParsedChange::Activate {
+            seq,
+            endpoint: Some(endpoint),
+        } => change_response(registry.activate(&host, &binding_id, seq, endpoint)),
+        ParsedChange::Deactivate { seq } => {
+            change_response(registry.apply(&host, &binding_id, seq, Change::Deactivate))
+        }
+        ParsedChange::PushCredential { .. } | ParsedChange::RevokeCredential { .. } => {
+            invalid_request()
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -859,24 +912,39 @@ fn endpoint_of(body: &[u8]) -> Option<Endpoint> {
     })
 }
 
-/// `DELETE /api/v1/host/knowledge/bindings/{binding_id}/credential?seq=n`
-/// drops C at once. Accepted for a binding this host never activated too, so
-/// it can be sent before the push it overtakes.
-pub async fn revoke_credential(
-    State(state): State<AppState>,
-    authorization: Option<Extension<Authorization>>,
-    path: Result<Path<String>, PathRejection>,
-    query: Result<Query<SeqQuery>, QueryRejection>,
-) -> Response {
-    let (host, binding_id, seq) = match host_and_seq(&state, authorization, path, query) {
-        Ok(found) => found,
-        Err(refused) => return refused.into_response(),
-    };
-    change_response(
-        state
-            .knowledge_host
-            .apply(&host, &binding_id, seq, Change::RevokeCredential),
-    )
+/// One Knowledge host change, parsed the same way the handler applies it and
+/// the presence summary describes it. `seq` is greater than 0.
+pub(crate) enum ParsedChange {
+    /// `endpoint` absent: every call of the binding is refused.
+    Activate {
+        seq: u64,
+        endpoint: Option<Endpoint>,
+    },
+    Deactivate {
+        seq: u64,
+    },
+    PushCredential {
+        seq: u64,
+        credential: Credential,
+        expires_at: UnixSeconds,
+    },
+    RevokeCredential {
+        seq: u64,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SeqBody {
+    seq: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivateFull {
+    seq: u64,
+    endpoint: String,
+    knowledge_base_ids: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -888,22 +956,130 @@ enum CredentialKind {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CredentialBody {
+struct CredentialRequest {
+    seq: u64,
     kind: CredentialKind,
     value: String,
     expires_at: UnixSeconds,
 }
 
-/// `PUT /api/v1/host/knowledge/bindings/{binding_id}/credential?seq=n` with
-/// `{"kind": "bearer"|"api_key", "value", "expires_at"}` pushes or replaces C.
+fn seq_of(seq: u64) -> Option<u64> {
+    (seq > 0).then_some(seq)
+}
+
+/// Body of a Knowledge host change. `method` is `PUT` or `DELETE`.
+/// `is_credential` selects the credential routes. Empty, non-JSON, unknown
+/// fields, a missing or zero `seq`, or a value the handler would refuse all
+/// return `None`. Nothing in the error path quotes the body.
+pub(crate) fn parse_change_body(
+    method: &str,
+    is_credential: bool,
+    bytes: &[u8],
+) -> Option<ParsedChange> {
+    if bytes.is_empty() {
+        return None;
+    }
+    match (method, is_credential) {
+        ("DELETE", false) => {
+            let body: SeqBody = serde_json::from_slice(bytes).ok()?;
+            Some(ParsedChange::Deactivate {
+                seq: seq_of(body.seq)?,
+            })
+        }
+        ("DELETE", true) => {
+            let body: SeqBody = serde_json::from_slice(bytes).ok()?;
+            Some(ParsedChange::RevokeCredential {
+                seq: seq_of(body.seq)?,
+            })
+        }
+        ("PUT", false) => parse_activation(bytes),
+        ("PUT", true) => parse_credential(bytes),
+        _ => None,
+    }
+}
+
+/// `{"seq"}` activates with no endpoint. `{"seq","endpoint","knowledge_base_ids"}`
+/// both extra fields, or neither; one of them is refused. Both go through
+/// [`endpoint_of`].
+fn parse_activation(bytes: &[u8]) -> Option<ParsedChange> {
+    if let Ok(body) = serde_json::from_slice::<ActivateFull>(bytes) {
+        let seq = seq_of(body.seq)?;
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "endpoint": body.endpoint,
+            "knowledge_base_ids": body.knowledge_base_ids,
+        }))
+        .ok()?;
+        return Some(ParsedChange::Activate {
+            seq,
+            endpoint: Some(endpoint_of(&raw)?),
+        });
+    }
+    let body: SeqBody = serde_json::from_slice(bytes).ok()?;
+    Some(ParsedChange::Activate {
+        seq: seq_of(body.seq)?,
+        endpoint: None,
+    })
+}
+
+fn parse_credential(bytes: &[u8]) -> Option<ParsedChange> {
+    let body: CredentialRequest = serde_json::from_slice(bytes).ok()?;
+    let seq = seq_of(body.seq)?;
+    // Visible ASCII only: C goes into a request header as it is.
+    let value_ok = !body.value.is_empty()
+        && body.value.len() <= MAX_CREDENTIAL_BYTES
+        && body.value.bytes().all(|b| b.is_ascii_graphic());
+    if !value_ok || body.expires_at <= unix_now() {
+        return None;
+    }
+    let credential = match body.kind {
+        CredentialKind::Bearer => Credential::Bearer(body.value),
+        CredentialKind::ApiKey => Credential::ApiKey(body.value),
+    };
+    Some(ParsedChange::PushCredential {
+        seq,
+        credential,
+        expires_at: body.expires_at,
+    })
+}
+
+/// `DELETE /api/v1/host/knowledge/bindings/{binding_id}/credential` with
+/// `{"seq"}` drops C at once. Accepted for a binding this host never
+/// activated too, so it can be sent before the push it overtakes.
+pub async fn revoke_credential(
+    State(state): State<AppState>,
+    authorization: Option<Extension<Authorization>>,
+    path: Result<Path<String>, PathRejection>,
+    req: Request<Body>,
+) -> Response {
+    let (host, binding_id) = match host_and_binding(&state, authorization, path, &req) {
+        Ok(found) => found,
+        Err(refused) => return refused.into_response(),
+    };
+    let body = match read_body_or_response(req).await {
+        Ok(body) => body,
+        Err(refused) => return refused,
+    };
+    let Some(ParsedChange::RevokeCredential { seq }) = parse_change_body("DELETE", true, &body)
+    else {
+        return invalid_request();
+    };
+    change_response(
+        state
+            .knowledge_host
+            .apply(&host, &binding_id, seq, Change::RevokeCredential),
+    )
+}
+
+/// `PUT /api/v1/host/knowledge/bindings/{binding_id}/credential` with
+/// `{"seq", "kind": "bearer"|"api_key", "value", "expires_at"}` pushes or
+/// replaces C.
 pub async fn push_credential(
     State(state): State<AppState>,
     authorization: Option<Extension<Authorization>>,
     path: Result<Path<String>, PathRejection>,
-    query: Result<Query<SeqQuery>, QueryRejection>,
     req: Request<Body>,
 ) -> Response {
-    let (host, binding_id, seq) = match host_and_seq(&state, authorization, path, query) {
+    let (host, binding_id) = match host_and_binding(&state, authorization, path, &req) {
         Ok(found) => found,
         Err(refused) => return refused.into_response(),
     };
@@ -912,26 +1088,20 @@ pub async fn push_credential(
         Ok(body) => body,
         Err(refused) => return refused,
     };
-    let Ok(body) = serde_json::from_slice::<CredentialBody>(&body) else {
+    let Some(ParsedChange::PushCredential {
+        seq,
+        credential,
+        expires_at,
+    }) = parse_change_body("PUT", true, &body)
+    else {
         return invalid_request();
-    };
-    // Visible ASCII only: C goes into a request header as it is.
-    let value_ok = !body.value.is_empty()
-        && body.value.len() <= MAX_CREDENTIAL_BYTES
-        && body.value.bytes().all(|b| b.is_ascii_graphic());
-    if !value_ok || body.expires_at <= unix_now() {
-        return invalid_request();
-    }
-    let credential = match body.kind {
-        CredentialKind::Bearer => Credential::Bearer(body.value),
-        CredentialKind::ApiKey => Credential::ApiKey(body.value),
     };
     change_response(state.knowledge_host.push_credential(
         &host,
         &binding_id,
         seq,
         credential,
-        body.expires_at,
+        expires_at,
     ))
 }
 

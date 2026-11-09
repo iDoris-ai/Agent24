@@ -306,12 +306,13 @@ class Daemon:
 
     def bind(self, endpoint, binding=BINDING, key="kb-sec-01b-retrieve-key"):
         """(status of activating, status of pushing the credential) the way desktop main does it."""
+        # K-B6 (#1714): the sequence is in the JSON body, never in the query.
         self.seq += 1
-        s1, _, _ = self.call("PUT", f"/api/v1/host/knowledge/bindings/{binding}?seq={self.seq}",
-                             {"endpoint": endpoint, "knowledge_base_ids": [KB]})
+        s1, _, _ = self.call("PUT", f"/api/v1/host/knowledge/bindings/{binding}",
+                             {"seq": self.seq, "endpoint": endpoint, "knowledge_base_ids": [KB]})
         self.seq += 1
-        s2, _, _ = self.call("PUT", f"/api/v1/host/knowledge/bindings/{binding}/credential?seq={self.seq}",
-                             {"kind": "api_key", "value": key, "expires_at": int(time.time()) + 3600})
+        s2, _, _ = self.call("PUT", f"/api/v1/host/knowledge/bindings/{binding}/credential",
+                             {"seq": self.seq, "kind": "api_key", "value": key, "expires_at": int(time.time()) + 3600})
         return s1, s2
 
     def session(self):

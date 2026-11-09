@@ -33,12 +33,22 @@ function fakeDaemon() {
   let conn: DaemonConnection | null = { port: 1, authHeaders: { Authorization: 'Bearer t1' } }
   let respond: (req: Sent) => { status: number; code?: string } = () => ({ status: 204 })
   const transport: HostTransport = async (connection, method, requestPath, body) => {
-    const [route, query] = requestPath.split('?')
+    // As sent: the daemon answers 400 to any query on these routes (K-B6).
+    const route = requestPath
+    let seq = Number.NaN
+    if (body !== undefined) {
+      try {
+        const parsed = JSON.parse(body) as { seq?: unknown }
+        if (typeof parsed.seq === 'number') seq = parsed.seq
+      } catch {
+        seq = Number.NaN
+      }
+    }
     const req: Sent = {
       token: connection.authHeaders['Authorization'] ?? '',
       method,
-      path: route ?? '',
-      seq: Number(new URLSearchParams(query).get('seq')),
+      path: route,
+      seq,
       body,
     }
     sent.push(req)
@@ -162,7 +172,7 @@ describe('KnowledgeHost (KB-HOST-01 PR-B2b)', () => {
       `DELETE ${B1}/credential`,
       `DELETE ${B1}`,
     ])
-    expect(JSON.parse(daemon.sent[1]!.body!)).toEqual({ kind: 'api_key', value: 'KEY', expires_at: NOW + 60 })
+    expect(JSON.parse(daemon.sent[1]!.body!)).toEqual({ seq: 1_001, kind: 'api_key', value: 'KEY', expires_at: NOW + 60 })
     expect(daemon.sent.every((r) => r.token === 'Bearer t1')).toBe(true)
   })
 
@@ -170,7 +180,7 @@ describe('KnowledgeHost (KB-HOST-01 PR-B2b)', () => {
     const host = makeHost()
     host.start()
     await host.activate('b1', { endpoint: 'https://kb.example/api/v1', knowledgeBaseIds: ['kb-a'] })
-    const body = JSON.stringify({ endpoint: 'https://kb.example/api/v1', knowledge_base_ids: ['kb-a'] })
+    const body = JSON.stringify({ seq: 1_000, endpoint: 'https://kb.example/api/v1', knowledge_base_ids: ['kb-a'] })
     expect(daemon.sent[0]).toMatchObject({ method: 'PUT', path: B1, body })
     expect(host.isActive('b1')).toBe(true)
     // A new daemon has not taken it until the replay lands.
@@ -562,9 +572,9 @@ describe('KnowledgeHost (KB-HOST-01 PR-B2b)', () => {
       host.start()
       expect(await host.activate('b 1')).toEqual({ ok: true })
       expect(await host.pushCredential('b 1', credential('C1'))).toEqual({ ok: false, reason: 'binding_inactive' })
-      expect(seen[0]).toMatchObject({ method: 'PUT', url: '/api/v1/host/knowledge/bindings/b%201?seq=7', auth: 'Bearer HOST', body: '' })
-      expect(seen[1]).toMatchObject({ url: '/api/v1/host/knowledge/bindings/b%201/credential?seq=8', type: 'application/json' })
-      expect(JSON.parse(seen[1]!.body)).toEqual({ kind: 'bearer', value: 'C1', expires_at: NOW + 600 })
+      expect(seen[0]).toMatchObject({ method: 'PUT', url: '/api/v1/host/knowledge/bindings/b%201', auth: 'Bearer HOST', type: 'application/json', body: JSON.stringify({ seq: 7 }) })
+      expect(seen[1]).toMatchObject({ url: '/api/v1/host/knowledge/bindings/b%201/credential', type: 'application/json' })
+      expect(JSON.parse(seen[1]!.body)).toEqual({ seq: 8, kind: 'bearer', value: 'C1', expires_at: NOW + 600 })
     } finally {
       await new Promise((resolve) => server.close(resolve))
     }
