@@ -11,7 +11,7 @@ import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i1
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, readExternalDaemonState, resolveRustBinary, setBundledPackaged } from './backend-manager'
-import { bundledDaemonVersion, CrashLoopDetector, serviceLastExit, serviceRecordPid, ServiceUpgrader, serviceUpgradeDeps, upgradeService, upgradesFromBundle } from './resident-service'
+import { bundledDaemonVersion, CrashLoopDetector, serviceRecordPid, serviceRuns, ServiceUpgrader, serviceUpgradeDeps, upgradeService, upgradesFromBundle } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
@@ -86,7 +86,7 @@ const crashLoop = new CrashLoopDetector({
   installed: () => process.platform === 'darwin' && launchAgentPlistExists(),
   enrolled: () => backendManager.presenceTarget() !== null,
   recordPid: () => serviceRecordPid(readExternalDaemonState(), (pid) => backendManager.spawned(pid)),
-  lastExit: () => serviceLastExit(process.getuid!()),
+  runs: () => serviceRuns(process.getuid!()),
 })
 // A3-4 review M5: the sequenced/capped event log lives here, in main, so it
 // survives the renderer's VoicePanel unmounting when the user switches

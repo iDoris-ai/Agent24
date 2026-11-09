@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
-  copyDaemonIfChanged, CrashLoopDetector, jobPid, lastExitCode, LOOP_DOWN_MS, LOOP_WINDOW_MS, parseDaemonVersion, ServiceUpgrader, serviceDaemonCopyPath, serviceRecordPid, serviceUpgradeDeps, upgradeNeeded, upgradeService, upgradesFromBundle,
+  copyDaemonIfChanged, CrashLoopDetector, jobPid, jobRuns, LOOP_WINDOW_MS, parseDaemonVersion, ServiceUpgrader, serviceDaemonCopyPath, serviceRecordPid, serviceUpgradeDeps, upgradeNeeded, upgradeService, upgradesFromBundle,
   type UpgradeDeps, type UpgradeOutcome, type UpgradeSystem,
 } from './resident-service'
 import { buildTrayView } from './tray-menu'
@@ -312,18 +312,24 @@ describe('tray text (three languages)', () => {
 })
 
 describe('CrashLoopDetector (M5 B5 ②)', () => {
-  function detector(o: { installed?: boolean; enrolled?: boolean; exit?: number | null } = {}) {
+  function detector(o: { installed?: boolean; enrolled?: boolean } = {}) {
     let now = 0
     let pid: number | null = 100
-    const lastExit = vi.fn(async () => (o.exit === undefined ? 1 : o.exit))
+    let runs: number | null = 1
+    const runsFn = vi.fn(async () => runs)
     const d = new CrashLoopDetector({
-      now: () => now, installed: () => o.installed ?? true, enrolled: () => o.enrolled ?? false, recordPid: () => pid, lastExit,
+      now: () => now, installed: () => o.installed ?? true, enrolled: () => o.enrolled ?? false, recordPid: () => pid, runs: runsFn,
     })
-    return { d, lastExit, at: (ms: number) => { now = ms }, pid: (p: number | null) => { pid = p } }
+    return {
+      d, runsFn,
+      at: (ms: number) => { now = ms },
+      pid: (p: number | null) => { pid = p },
+      runs: (r: number | null) => { runs = r },
+    }
   }
 
   it('three daemons on record within a minute: looping', async () => {
-    const t = detector({ exit: null })
+    const t = detector()
     for (const [ms, p] of [[0, 100], [12_000, 101], [24_000, 102]] as const) {
       t.at(ms)
       t.pid(p)
@@ -333,7 +339,7 @@ describe('CrashLoopDetector (M5 B5 ②)', () => {
   })
 
   it('the same three spread over more than a minute: not looping', async () => {
-    const t = detector({ exit: null })
+    const t = detector()
     for (const [ms, p] of [[0, 100], [40_000, 101], [LOOP_WINDOW_MS + 1_000, 102]] as const) {
       t.at(ms)
       t.pid(p)
@@ -342,17 +348,50 @@ describe('CrashLoopDetector (M5 B5 ②)', () => {
     expect(t.d.looping()).toBe(false)
   })
 
-  it('no enrolment for 30 s and the job last exited not 0: looping; exited 0 or never: not', async () => {
-    for (const [exit, want] of [[78, true], [0, false], [null, false]] as const) {
-      const t = detector({ exit })
-      await t.d.sample()
-      t.at(LOOP_DOWN_MS - 1)
-      await t.d.sample()
-      expect(t.d.looping()).toBe(false)
-      t.at(LOOP_DOWN_MS)
+  it('fails before it writes a record, found running at every look, launchd started it twice more: looping (Codex on B1)', async () => {
+    const t = detector()
+    t.pid(null)
+    for (const [ms, r, want] of [[0, 4, false], [10_000, 5, false], [20_000, 6, true]] as const) {
+      t.at(ms)
+      t.runs(r)
       await t.d.sample()
       expect(t.d.looping()).toBe(want)
     }
+  })
+
+  it('one restart (an upgrade), or two more than a minute apart: not looping', async () => {
+    const t = detector()
+    for (const [ms, r] of [[0, 1], [10_000, 2], [20_000, 2], [50_000, 2], [70_000, 3]] as const) {
+      t.at(ms)
+      t.runs(r)
+      await t.d.sample()
+      expect(t.d.looping()).toBe(false)
+    }
+  })
+
+  it('a healthy service daemon, not enrolled for minutes: launchd started it once, not looping (PR-Daemon B5b B1)', async () => {
+    const t = detector()
+    t.pid(947)
+    t.runs(1)
+    for (let ms = 0; ms <= 3 * LOOP_WINDOW_MS; ms += 2_000) {
+      t.at(ms)
+      await t.d.sample()
+    }
+    expect(t.d.looping()).toBe(false)
+  })
+
+  it('launchd cannot be asked: no runs taken, nothing counted', async () => {
+    const t = detector()
+    t.pid(null)
+    t.runs(null)
+    for (const ms of [0, 10_000, 20_000]) {
+      t.at(ms)
+      await t.d.sample()
+    }
+    t.runs(9)
+    t.at(30_000)
+    await t.d.sample()
+    expect(t.d.looping()).toBe(false)
   })
 
   it('asks launchd at most every 10 s', async () => {
@@ -361,7 +400,7 @@ describe('CrashLoopDetector (M5 B5 ②)', () => {
       t.at(ms)
       await t.d.sample()
     }
-    expect(t.lastExit).toHaveBeenCalledTimes(2)
+    expect(t.runsFn).toHaveBeenCalledTimes(2)
   })
 
   it.each([
@@ -369,13 +408,35 @@ describe('CrashLoopDetector (M5 B5 ②)', () => {
     ['no LaunchAgent', { installed: false }],
   ] as const)('%s: never looping, and what was seen is forgotten', async (_name, o) => {
     const t = detector(o)
-    for (const [ms, p] of [[0, 100], [5_000, 101], [10_000, 102], [LOOP_DOWN_MS, 103]] as const) {
+    for (const [ms, p] of [[0, 100], [10_000, 101], [20_000, 102], [30_000, 103]] as const) {
       t.at(ms)
       t.pid(p)
+      t.runs(ms / 1_000)
       await t.d.sample()
     }
     expect(t.d.looping()).toBe(false)
-    expect(t.lastExit).not.toHaveBeenCalled()
+    expect(t.runsFn).not.toHaveBeenCalled()
+  })
+
+  it('what was seen before enrolment is forgotten once enrolled', async () => {
+    let enrolled = false
+    let now = 0
+    let runs = 1
+    const d = new CrashLoopDetector({
+      now: () => now, installed: () => true, enrolled: () => enrolled, recordPid: () => null, runs: async () => runs,
+    })
+    await d.sample()
+    now = 10_000
+    runs = 2
+    await d.sample()
+    enrolled = true
+    now = 15_000
+    await d.sample()
+    enrolled = false
+    now = 20_000
+    runs = 3
+    await d.sample()
+    expect(d.looping()).toBe(false)
   })
 
   it("only the service's daemon on record counts, never one this app spawned, now or before (Codex B5b C1)", () => {
@@ -390,30 +451,12 @@ describe('CrashLoopDetector (M5 B5 ②)', () => {
     expect(serviceRecordPid(null, spawned)).toBeNull()
   })
 
-  it("reads the job's own last exit code, not a nested one", () => {
-    expect(lastExitCode('x = {\n\tstate = not running\n\tlast exit code = 78: EX_CONFIG\n}')).toBe(78)
-    expect(lastExitCode('x = {\n\tlast exit code = (never exited)\n\tsub = {\n\t\tlast exit code = 1\n\t}\n}')).toBeNull()
-    // Ended by a signal: no exit code, still not a clean exit (Codex B5b C2).
-    expect(lastExitCode('x = {\n\tlast exit code = (never exited)\n\tlast terminating signal = Segmentation fault: 11\n}')).toBe(-1)
-  })
-
-  it('a job that runs again keeps its last exit: not counted while it runs (PR-Daemon B5b B1)', () => {
-    expect(lastExitCode('x = {\n\tstate = running\n\tpid = 947\n\tlast exit code = 1\n}')).toBeNull()
-    expect(lastExitCode('x = {\n\tstate = running\n\tpid = 947\n\tlast terminating signal = Terminated: 15\n}')).toBeNull()
-    // A nested block that runs is not the job.
-    expect(lastExitCode('x = {\n\tstate = not running\n\tlast exit code = 1\n\tsub = {\n\t\tstate = running\n\t}\n}')).toBe(1)
-  })
-
-  it('a healthy service daemon, not enrolled for 40 s, with a stale non-zero exit: not looping (PR-Daemon B5b B1)', async () => {
-    let now = 0
-    const print = 'gui/501/ai.auraai.agent24 = {\n\tstate = running\n\tpid = 947\n\tlast terminating signal = Terminated: 15\n}'
-    const d = new CrashLoopDetector({
-      now: () => now, installed: () => true, enrolled: () => false, recordPid: () => 947, lastExit: async () => lastExitCode(print),
-    })
-    await d.sample()
-    now = 40_000
-    await d.sample()
-    expect(d.looping()).toBe(false)
+  it("reads the job's own runs, not a nested one", () => {
+    // As `launchctl print` shows a running job (checked on this machine).
+    expect(jobRuns('gui/501/ai.auraai.agent24 = {\n\tstate = running\n\truns = 1\n\tpid = 54386\n\tlast exit code = (never exited)\n}')).toBe(1)
+    expect(jobRuns('x = {\n\tstate = not running\n\truns = 17\n\tlast exit code = 78: EX_CONFIG\n}')).toBe(17)
+    expect(jobRuns('x = {\n\tstate = running\n\tsub = {\n\t\truns = 4\n\t}\n}')).toBeNull()
+    expect(jobRuns('')).toBeNull()
   })
 
   it.each([

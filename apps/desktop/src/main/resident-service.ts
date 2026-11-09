@@ -237,19 +237,17 @@ export class ServiceUpgrader {
   }
 }
 
-/** `launchctl print`'s own `last exit code = N`; a signal that ended it counts
- * as not 0 (Codex B5b C2); null when it has not exited or says no number, and
- * while the job runs: launchd keeps the last exit after a restart (PR-Daemon B5b B1). */
-export function lastExitCode(print: string): number | null {
-  if (/^\tstate = running$/m.test(print)) return null
-  if (/^\tlast terminating signal = /m.test(print)) return -1
-  const code = /^\tlast exit code = (-?\d+)/m.exec(print)?.[1]
-  return code === undefined ? null : Number(code)
+/** `launchctl print`'s own `runs = N`: how many times launchd has started the
+ * job. A job that runs on keeps it; one that keeps failing pushes it up even
+ * when every look finds it running (PR-Daemon B5b B1; Codex on its first fix). */
+export function jobRuns(print: string): number | null {
+  const runs = /^\truns = (\d+)$/m.exec(print)?.[1]
+  return runs === undefined ? null : Number(runs)
 }
 
-export function serviceLastExit(uid: number): Promise<number | null> {
+export function serviceRuns(uid: number): Promise<number | null> {
   return new Promise((resolve) => {
-    execFile('launchctl', ['print', `gui/${uid}/${SERVICE_LABEL}`], { timeout: 10_000 }, (err, stdout) => resolve(err ? null : lastExitCode(stdout)))
+    execFile('launchctl', ['print', `gui/${uid}/${SERVICE_LABEL}`], { timeout: 10_000 }, (err, stdout) => resolve(err ? null : jobRuns(stdout)))
   })
 }
 
@@ -262,48 +260,48 @@ export function serviceRecordPid(state: { pid: number; enrollEndpoint?: string }
 
 export const LOOP_WINDOW_MS = 60_000
 export const LOOP_PIDS = 3
-export const LOOP_DOWN_MS = 30_000
-const EXIT_CHECK_MS = 10_000
+export const LOOP_RESTARTS = 2
+const RUNS_CHECK_MS = 10_000
 
 /** M5 B5 ②: the LaunchAgent's daemon keeps exiting and launchd keeps starting
- * it (a failed migration today: CORE-5 is off). Either several daemons on
- * record within a minute, or no enrolment for 30 s while launchd says the job
- * last exited not 0. Only while the plist is there and this app is not enrolled. */
+ * it (a failed migration today: CORE-5 is off). Within a minute, either
+ * several daemons on record, or launchd started the job at least twice more
+ * (one that fails before it writes a record). One restart, such as an upgrade,
+ * is not a loop. Only while the plist is there and this app is not enrolled. */
 export class CrashLoopDetector {
   private pids: { pid: number; at: number }[] = []
-  private downSince: number | null = null
-  private exit: number | null = null
-  private exitAt = -Infinity
+  private runs: { runs: number; at: number }[] = []
+  private runsAt = -Infinity
 
   constructor(private readonly deps: {
     now: () => number
     installed: () => boolean
     enrolled: () => boolean
     recordPid: () => number | null
-    lastExit: () => Promise<number | null>
+    runs: () => Promise<number | null>
   }) {}
 
   async sample(): Promise<void> {
     const now = this.deps.now()
     if (!this.deps.installed() || this.deps.enrolled()) {
       this.pids = []
-      this.downSince = null
-      this.exit = null
+      this.runs = []
       return
     }
     const pid = this.deps.recordPid()
     if (pid !== null && this.pids.at(-1)?.pid !== pid) this.pids.push({ pid, at: now })
     this.pids = this.pids.filter((p) => now - p.at < LOOP_WINDOW_MS)
-    this.downSince ??= now
-    if (now - this.exitAt >= EXIT_CHECK_MS) {
-      this.exitAt = now
-      this.exit = await this.deps.lastExit()
+    if (now - this.runsAt >= RUNS_CHECK_MS) {
+      this.runsAt = now
+      const runs = await this.deps.runs()
+      if (runs !== null) this.runs.push({ runs, at: now })
     }
+    this.runs = this.runs.filter((r) => now - r.at < LOOP_WINDOW_MS)
   }
 
   looping(): boolean {
-    if (this.downSince === null) return false
     if (new Set(this.pids.map((p) => p.pid)).size >= LOOP_PIDS) return true
-    return this.deps.now() - this.downSince >= LOOP_DOWN_MS && this.exit !== null && this.exit !== 0
+    const seen = this.runs.map((r) => r.runs)
+    return Math.max(...seen) - Math.min(...seen) >= LOOP_RESTARTS
   }
 }
