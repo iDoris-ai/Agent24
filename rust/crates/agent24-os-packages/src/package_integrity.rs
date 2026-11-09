@@ -110,7 +110,8 @@ fn check_target_arch(arch: &str) -> Result<(), IntegrityError> {
 }
 
 /// Generate for a target CPU architecture on the host OS.
-/// Verification and installation always require the host architecture.
+/// Daemon-side verification (discovery and recheck) always requires the host
+/// architecture; `os install` copies the package without checking it.
 pub fn generate_for_arch(
     root: &Path,
     executables: &[String],

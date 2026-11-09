@@ -15,7 +15,7 @@ pub enum Action {
         /// 包内相对路径。可重复。必须包含 spawn.command。
         #[arg(long, required = true)]
         executable: Vec<String>,
-        /// 目标包的 CPU 架构；verify/安装时仍按本机架构检查。
+        /// 目标包的 CPU 架构；daemon 扫描与 recheck 仍按本机架构检查。
         #[arg(long, default_value = std::env::consts::ARCH, value_parser = ["aarch64", "x86_64"])]
         arch: String,
     },
