@@ -226,11 +226,15 @@ export function knowledgeEntryDrafts(deps: KnowledgeEntryDraftDeps) {
   }
 
   const saved = (run: () => EntryDraft): KnowledgeEntryDraftSaved => {
+    let draft: EntryDraft
     try {
-      return { ok: true, draft: view(run()) }
+      draft = run()
     } catch {
       return { ok: false, reason: 'invalid' }
     }
+    // M4 A7: the waiting item shows the title as it now is (an edit, or one-click redaction).
+    deps.pending?.set(draft.source.conversation_id, draft.id, draft.title)
+    return { ok: true, draft: view(draft) }
   }
 
   const changeable = (id: unknown): EntryDraft | 'not_found' | 'not_saved' => {
