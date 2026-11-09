@@ -10,6 +10,7 @@
 import { describe, it, expect, afterEach, vi } from 'vitest'
 import { spawn, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
+import net from 'node:net'
 import path from 'node:path'
 import { BackendManager, daemonConnection, daemonElevation } from './backend-manager'
 import { PresenceConnection, type PresenceDecision, type SocketChallenge } from './presence-connection'
@@ -26,22 +27,29 @@ describe.skipIf(!bin || !unsigned || process.platform === 'win32')('a real servi
   let dir = ''
 
   afterEach(async () => {
-    await presence?.stop()
-    presence = null
-    manager?.stop()
-    manager = null
-    if (daemon && daemon.exitCode === null) {
-      const exited = new Promise((resolve) => daemon!.once('exit', resolve))
-      daemon.kill('SIGTERM')
-      await exited
+    try {
+      await presence?.stop()
+      manager?.stop()
+      const child = daemon
+      // Already gone, by an exit or a signal (Codex: then 'exit' has fired).
+      if (child && child.exitCode === null && child.signalCode === null) {
+        const exited = new Promise((resolve) => child.once('exit', resolve))
+        child.kill('SIGTERM')
+        const late = setTimeout(() => child.kill('SIGKILL'), 20_000)
+        await exited
+        clearTimeout(late)
+      }
+    } finally {
+      presence = null
+      manager = null
+      daemon = null
+      for (const [key, value] of [['HOME', saved.home], ['AGENT24_DATA_DIR', saved.dataDir], ['AGENT24_BACKEND', saved.backend]] as const) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      if (dir) fs.rmSync(dir, { recursive: true, force: true })
     }
-    daemon = null
-    for (const [key, value] of [['HOME', saved.home], ['AGENT24_DATA_DIR', saved.dataDir], ['AGENT24_BACKEND', saved.backend]] as const) {
-      if (value === undefined) delete process.env[key]
-      else process.env[key] = value
-    }
-    if (dir) fs.rmSync(dir, { recursive: true, force: true })
-  })
+  }, 30_000)
 
   async function start(answer: PresenceDecision) {
     // Short: the enrolment sockets must fit macOS's 103-byte limit.
@@ -58,10 +66,11 @@ describe.skipIf(!bin || !unsigned || process.platform === 'win32')('a real servi
     await manager.start()
     expect(manager.status()).toBe('running')
     const ask = vi.fn(async (_c: SocketChallenge, _s: AbortSignal) => answer)
-    presence = new PresenceConnection({ target: () => manager!.presenceTarget(), ask })
+    const connect = vi.fn((socketPath: string) => net.createConnection(socketPath))
+    presence = new PresenceConnection({ target: () => manager!.presenceTarget(), ask, connect })
     presence.start()
     await vi.waitFor(() => expect(presence!.ready).toBe(true), { timeout: 10_000 })
-    return { ask }
+    return { ask, connect }
   }
 
   const deps = { connection: daemonConnection, elevation: daemonElevation }
@@ -84,9 +93,11 @@ describe.skipIf(!bin || !unsigned || process.platform === 'win32')('a real servi
   }, 90_000)
 
   it('the presence connection stays up across the daemon\'s pings (pong within 10 s)', async () => {
-    const { ask } = await start('deny')
+    const { ask, connect } = await start('deny')
     await new Promise((r) => setTimeout(r, 75_000))
     expect(presence!.ready).toBe(true)
+    // The same connection all along, not one made again after a missed pong (Codex).
+    expect(connect).toHaveBeenCalledTimes(1)
     expect(ask).not.toHaveBeenCalled()
   }, 120_000)
 })
