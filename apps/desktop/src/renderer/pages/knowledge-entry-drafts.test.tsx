@@ -657,6 +657,21 @@ describe('H2: submitting a draft for review', () => {
     [{ code: 'internal', unknown: true }, { zh: '没有收到明确答复，提交可能送达也可能没有。重新提交是安全的，发出的是同一份提交。', en: 'No clear answer came back, so the submission may or may not have arrived. Trying again is safe: it sends the same submission.', th: 'ไม่ได้รับคำตอบที่ชัดเจน การส่งอาจถึงหรือไม่ถึงก็ได้ การส่งอีกครั้งปลอดภัย เพราะจะส่งรายการเดิม' }],
   ]
   const submitLabel = { zh: '提交审阅', en: 'Submit for review', th: 'ส่งให้ตรวจ' } as const
+  const failed = kinds[3][1]
+  // QA H2 Medium: the write reasons get their own advice, each only under the code WeKnora sends it with.
+  const reasons: Array<[Record<string, unknown>, Record<'zh' | 'en' | 'th', string>]> = [
+    [{ code: 'forbidden', serverReason: 'quota_exceeded' }, { zh: '你待审的条目已满，等审阅人处理一些之后再提交。', en: 'Too many of your entries are waiting for review. Submit again once the reviewers have dealt with some.', th: 'รายการของคุณที่รอตรวจเต็มแล้ว โปรดส่งอีกครั้งหลังผู้ตรวจจัดการไปบางส่วน' }],
+    [{ code: 'forbidden', serverReason: 'empty_scope' }, { zh: '这个密钥没有可以提交的知识库范围，请检查 Knowledge 设置。', en: 'This key has no knowledge base it may submit to. Check Knowledge’s settings.', th: 'คีย์นี้ไม่มีคลังความรู้ที่ส่งได้ โปรดตรวจการตั้งค่า Knowledge' }],
+    [{ code: 'invalid_request', serverReason: 'unsupported_format' }, { zh: '知识库不接受正文里的部分格式（例如 HTML、图片、脚注，或不是普通 https 地址的链接），请修改后再提交。', en: 'The knowledge base does not accept some formatting in the body (such as HTML, images, footnotes or a link that is not a plain https address). Edit it before submitting.', th: 'คลังความรู้ไม่รับรูปแบบบางอย่างในเนื้อหา (เช่น HTML รูปภาพ เชิงอรรถ หรือลิงก์ที่ไม่ใช่ที่อยู่ https ธรรมดา) โปรดแก้ไขก่อนส่ง' }],
+    [{ code: 'invalid_request', serverReason: 'too_large' }, { zh: '正文超过知识库接受的长度（64 KiB），请删减后再提交。', en: 'The body is longer than the knowledge base accepts (64 KiB). Shorten it before submitting.', th: 'เนื้อหายาวเกินกว่าที่คลังความรู้รับ (64 KiB) โปรดตัดให้สั้นลงก่อนส่ง' }],
+    // Main's own "answer too long to read" is not the body: a plain failure.
+    [{ code: 'internal', serverReason: 'too_large' }, failed],
+    // Under another code a reason is not taken: forbidden stays a permission problem.
+    [{ code: 'forbidden', serverReason: 'too_large' }, kinds[0][1]],
+    [{ code: 'invalid_request', serverReason: 'quota_exceeded' }, kinds[2][1]],
+    // An unknown outcome is said first, whatever reason came with it.
+    [{ code: 'forbidden', serverReason: 'quota_exceeded', unknown: true }, kinds[4][1]],
+  ]
 
   for (const locale of ['zh', 'en', 'th'] as const) {
     it(`tells the five kinds of server answer apart in ${locale}, echoing nothing of the answer`, async () => {
@@ -674,6 +689,28 @@ describe('H2: submitting a draft for review', () => {
         unmount()
         act(() => closeDrafts())
       }
+    })
+  }
+
+  for (const locale of ['zh', 'en', 'th'] as const) {
+    it(`gives quota, empty scope, format and size their own words in ${locale}, by code and reason together`, async () => {
+      setLocale(locale)
+      const { unmount } = render(<KnowledgeEntryDraftsPanel />)
+      getDraft.mockResolvedValue(ready())
+      act(() => openDraft('d1'))
+      const go = await screen.findByRole('button', { name: submitLabel[locale] })
+      for (const [answer, words] of reasons) {
+        submit.mockResolvedValueOnce({ ok: false, reason: 'server', unknown: false, ...answer, submission: sub() })
+        fireEvent.click(go)
+        await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(words[locale]))
+        expect(document.body.textContent).not.toContain(String(answer.serverReason))
+      }
+      // A reason that is not a string fails the check: a plain failure, nothing applied.
+      submit.mockResolvedValueOnce({ ok: false, reason: 'server', code: 'forbidden', unknown: false, serverReason: 7, submission: sub({ candidate: candidate({ status: 'approved' }) }) })
+      fireEvent.click(go)
+      await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(failed[locale]))
+      expect(screen.getByRole('button', { name: submitLabel[locale] })).toBeTruthy()
+      unmount()
     })
   }
 

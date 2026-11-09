@@ -98,6 +98,10 @@ const draftMessages = defineMessages({
     'error.rejected': 'The knowledge base did not accept this request. Check the draft status, then try again.',
     'error.failed': 'Something went wrong talking to the knowledge base. Nothing was changed; try again in a moment.',
     'error.unknown': 'No clear answer came back, so the submission may or may not have arrived. Trying again is safe: it sends the same submission.',
+    'error.quota': 'Too many of your entries are waiting for review. Submit again once the reviewers have dealt with some.',
+    'error.empty_scope': 'This key has no knowledge base it may submit to. Check Knowledge’s settings.',
+    'error.format': 'The knowledge base does not accept some formatting in the body (such as HTML, images, footnotes or a link that is not a plain https address). Edit it before submitting.',
+    'error.too_large': 'The body is longer than the knowledge base accepts (64 KiB). Shorten it before submitting.',
     'error.busy': 'This draft is already being submitted.',
     'error.local_storage': 'This computer could not read or write the submission record, so nothing was sent to the knowledge base. Try again in a moment.',
     'error.local_record': 'The knowledge base handled the request, but this computer could not record the result. Do it again in a moment to catch up: nothing is submitted or withdrawn twice.',
@@ -181,6 +185,10 @@ const draftMessages = defineMessages({
     'error.rejected': '知识库没有接受这次请求。请先查看草稿状态，再重试。',
     'error.failed': '和知识库通信时出错，没有做任何改动，请稍后再试。',
     'error.unknown': '没有收到明确答复，提交可能送达也可能没有。重新提交是安全的，发出的是同一份提交。',
+    'error.quota': '你待审的条目已满，等审阅人处理一些之后再提交。',
+    'error.empty_scope': '这个密钥没有可以提交的知识库范围，请检查 Knowledge 设置。',
+    'error.format': '知识库不接受正文里的部分格式（例如 HTML、图片、脚注，或不是普通 https 地址的链接），请修改后再提交。',
+    'error.too_large': '正文超过知识库接受的长度（64 KiB），请删减后再提交。',
     'error.busy': '这份草稿正在提交中。',
     'error.local_storage': '本机没能读写提交记录，这次没有发给知识库。请稍后再试。',
     'error.local_record': '知识库已经处理了这次请求，但本机没能记下结果。稍后再操作一次就能补上，不会重复提交或重复撤回。',
@@ -264,6 +272,10 @@ const draftMessages = defineMessages({
     'error.rejected': 'คลังความรู้ไม่รับคำขอนี้ โปรดดูสถานะฉบับร่างก่อนแล้วลองใหม่',
     'error.failed': 'เกิดข้อผิดพลาดระหว่างติดต่อคลังความรู้ ไม่มีอะไรเปลี่ยนแปลง โปรดลองอีกครั้งในอีกสักครู่',
     'error.unknown': 'ไม่ได้รับคำตอบที่ชัดเจน การส่งอาจถึงหรือไม่ถึงก็ได้ การส่งอีกครั้งปลอดภัย เพราะจะส่งรายการเดิม',
+    'error.quota': 'รายการของคุณที่รอตรวจเต็มแล้ว โปรดส่งอีกครั้งหลังผู้ตรวจจัดการไปบางส่วน',
+    'error.empty_scope': 'คีย์นี้ไม่มีคลังความรู้ที่ส่งได้ โปรดตรวจการตั้งค่า Knowledge',
+    'error.format': 'คลังความรู้ไม่รับรูปแบบบางอย่างในเนื้อหา (เช่น HTML รูปภาพ เชิงอรรถ หรือลิงก์ที่ไม่ใช่ที่อยู่ https ธรรมดา) โปรดแก้ไขก่อนส่ง',
+    'error.too_large': 'เนื้อหายาวเกินกว่าที่คลังความรู้รับ (64 KiB) โปรดตัดให้สั้นลงก่อนส่ง',
     'error.busy': 'ฉบับร่างนี้กำลังถูกส่งอยู่',
     'error.local_storage': 'เครื่องนี้อ่านหรือเขียนบันทึกการส่งไม่ได้ ครั้งนี้จึงไม่ได้ส่งไปที่คลังความรู้ โปรดลองอีกครั้งในอีกสักครู่',
     'error.local_record': 'คลังความรู้ดำเนินการคำขอแล้ว แต่เครื่องนี้บันทึกผลไม่ได้ ทำอีกครั้งในอีกสักครู่เพื่อให้ตรงกัน จะไม่ส่งหรือถอนซ้ำ',
@@ -414,10 +426,13 @@ const REFUSALS: ReadonlySet<string> = new Set<KnowledgeEntrySubmitRefusal>([
 
 function isSubmitAnswer(value: unknown): value is KnowledgeEntrySubmitAnswer {
   if (typeof value !== 'object' || value === null) return false
-  const v = value as { ok?: unknown; reason?: unknown; submission?: unknown; code?: unknown; unknown?: unknown; problem?: unknown }
+  const v = value as { ok?: unknown; reason?: unknown; submission?: unknown; code?: unknown; unknown?: unknown; serverReason?: unknown; problem?: unknown }
   if (v.ok === true) return isSubmission(v.submission)
   if (v.ok !== false || typeof v.reason !== 'string') return false
-  if (v.reason === 'server') return typeof v.code === 'string' && typeof v.unknown === 'boolean' && isSubmission(v.submission)
+  if (v.reason === 'server') {
+    return typeof v.code === 'string' && typeof v.unknown === 'boolean' && isSubmission(v.submission)
+      && (v.serverReason === undefined || typeof v.serverReason === 'string')
+  }
   if (!REFUSALS.has(v.reason)) return false
   if (v.problem !== undefined) {
     const problem = v.problem as { kind?: unknown; line?: unknown } | null
@@ -428,12 +443,18 @@ function isSubmitAnswer(value: unknown): value is KnowledgeEntrySubmitAnswer {
 }
 
 /**
- * HS5: the five kinds of server answer the user is told apart. The words are
- * this file's own; nothing from the answer (and never the body or the key)
- * is shown.
+ * HS5: the five kinds of server answer the user is told apart, and the write
+ * reasons with their own advice. The words are this file's own; nothing from
+ * the answer (and never the body or the key) is shown. A reason counts only
+ * under the code WeKnora sends it with (CONTRACT-OPS-v2 §6): a `too_large`
+ * under `internal` is main's own "answer too long to read", not the body.
  */
-function serverError(t: Copy, code: string, unknown: boolean): string {
+function serverError(t: Copy, code: string, unknown: boolean, reason: string | undefined): string {
   if (unknown) return t('error.unknown')
+  if (code === 'forbidden' && reason === 'quota_exceeded') return t('error.quota')
+  if (code === 'forbidden' && reason === 'empty_scope') return t('error.empty_scope')
+  if (code === 'invalid_request' && reason === 'unsupported_format') return t('error.format')
+  if (code === 'invalid_request' && reason === 'too_large') return t('error.too_large')
   if (code === 'unauthorized' || code === 'forbidden') return t('error.permission')
   if (code === 'unavailable' || code === 'not_ready') return t('error.unavailable')
   if (code === 'invalid_request' || code === 'stale' || code === 'not_found' || code === 'conflict') return t('error.rejected')
@@ -442,7 +463,7 @@ function serverError(t: Copy, code: string, unknown: boolean): string {
 
 function refusal(t: Copy, answer: Exclude<KnowledgeEntrySubmitAnswer, { ok: true }>): string {
   switch (answer.reason) {
-    case 'server': return serverError(t, answer.code, answer.unknown)
+    case 'server': return serverError(t, answer.code, answer.unknown, answer.serverReason)
     case 'busy': return t('error.busy')
     // In H1b a local_storage answer carries the submission exactly when the
     // server had already acted and only recording the result failed; without
