@@ -324,26 +324,50 @@ fn loaded() -> bool {
 /// launchd's own wait before it kills it, and a little more.
 const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(EXIT_TIMEOUT + 5);
 
-/// Waits until no daemon holds the data dir's singleton lock, for `budget`.
-/// The lock is held while a daemon runs, so its release says the one the
-/// service ran has exited, its file free to be replaced (Codex B1 C2).
-pub fn wait_until_released(dir: &Path, budget: std::time::Duration) -> Result<(), String> {
+/// The pid of the process launchd runs for the job: `launchctl print`'s
+/// `pid = N`. None when the job is not loaded, or is loaded with no process
+/// (between the runs of one that keeps exiting).
+pub fn service_pid() -> Option<u32> {
+    let out = launchctl(&["print", &format!("gui/{}/{LABEL}", uid())]).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    job_pid(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The job's own `pid = N`, one tab in; a nested block's is not it.
+fn job_pid(print: &str) -> Option<u32> {
+    print
+        .lines()
+        .find_map(|l| l.strip_prefix("\tpid = ")?.trim().parse().ok())
+}
+
+/// Whether `pid` is a process: `kill(pid, 0)`. EPERM is one that is not ours.
+fn process_alive(pid: u32) -> bool {
+    use rustix::process::{Pid, test_kill_process};
+    i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .is_some_and(|p| !matches!(test_kill_process(p), Err(rustix::io::Errno::SRCH)))
+}
+
+/// Waits for the daemon the service ran, `pid`, to exit, for `budget`; its
+/// file is replaced only after. It waits for that process, not for the data
+/// dir's lock, which a daemon the desktop runs can hold (Codex B1 R2 C2).
+pub fn wait_until_exited(pid: u32, budget: std::time::Duration) -> Result<(), String> {
     let deadline = std::time::Instant::now() + budget;
-    loop {
-        match agent24_protocol::state_file::try_acquire_singleton_in(dir) {
-            Ok(Some(_lock)) => return Ok(()),
-            Ok(None) => {}
-            Err(e) => return Err(format!("checking whether the daemon stopped: {e}")),
-        }
+    while process_alive(pid) {
         if std::time::Instant::now() >= deadline {
             return Err(format!(
-                "the daemon the service ran still holds {} after {}s; its copy is left as it was",
-                dir.display(),
+                "the daemon the service ran (pid {pid}) is still running after {}s; \
+                 the service is unloaded and its copy left as it was — \
+                 run `agent24 service install` again",
                 budget.as_secs()
             ));
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+    Ok(())
 }
 
 /// M5 B1: stops the daemon the service runs, as `agent24 daemon stop` does a
@@ -440,10 +464,10 @@ pub fn install(exec: &Path) -> Result<(PathBuf, PathBuf, Vec<String>), String> {
     // previous ProgramArguments and the new plist looks like it did nothing.
     // It also stops the old daemon, and its file is replaced only once it
     // has exited.
-    if loaded() {
-        bootout_if_loaded();
-        let data_dir = agent24_protocol::state_file::state_dir().ok_or("HOME not set")?;
-        wait_until_released(&data_dir, STOP_WAIT)?;
+    let running = service_pid();
+    bootout_if_loaded();
+    if let Some(pid) = running {
+        wait_until_exited(pid, STOP_WAIT)?;
     }
     copy_daemon(exec, &copy)?;
 
@@ -631,24 +655,31 @@ mod tests {
     }
 
     #[test]
-    fn waits_for_the_daemon_to_let_go_of_the_data_dir_and_says_when_it_does_not() {
-        let root = std::env::temp_dir().join(format!("a24-wait-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        // A daemon running: it holds the lock.
-        let held = agent24_protocol::state_file::try_acquire_singleton_in(&root)
-            .unwrap()
+    fn the_jobs_pid_is_its_own_line_not_a_nested_one() {
+        let print = "gui/501/ai.auraai.agent24 = {\n\tactive count = 1\n\tstate = running\n\
+                     \tendpoints = {\n\t\tpid = 9\n\t}\n\tpid = 4242\n}\n";
+        assert_eq!(job_pid(print), Some(4242));
+        let between_runs = "gui/501/ai.auraai.agent24 = {\n\tstate = not running\n\
+                            \tendpoints = {\n\t\tpid = 9\n\t}\n}\n";
+        assert_eq!(job_pid(between_runs), None);
+    }
+
+    #[test]
+    fn waits_for_the_services_daemon_to_exit_and_says_when_it_does_not() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("0.6")
+            .spawn()
             .unwrap();
-        let err = wait_until_released(&root, std::time::Duration::from_millis(300)).unwrap_err();
-        assert!(err.contains("still holds"), "{err}");
-        // It exits a moment later.
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            drop(held);
-        });
-        wait_until_released(&root, std::time::Duration::from_secs(5)).unwrap();
-        release.join().unwrap();
-        let _ = std::fs::remove_dir_all(&root);
+        let pid = child.id();
+        let err = wait_until_exited(pid, std::time::Duration::from_millis(200)).unwrap_err();
+        assert!(
+            err.contains("still running") && err.contains("unloaded"),
+            "{err}"
+        );
+        // Reaped once it exits, or it lingers as a zombie kill(0) still finds.
+        let reaper = std::thread::spawn(move || child.wait().unwrap());
+        wait_until_exited(pid, std::time::Duration::from_secs(5)).unwrap();
+        reaper.join().unwrap();
     }
 
     #[test]

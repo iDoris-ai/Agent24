@@ -2998,9 +2998,11 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
         DaemonAction::Stop => match state_file::read_live() {
             Some(state) => {
                 if state.auth_mode.is_capabilities() {
-                    // M5 B1: one the service runs is stopped through launchd
-                    // (Codex B1 C6); one a desktop runs is its host's to stop.
-                    if !service::status().2 {
+                    // M5 B1: the one the service runs — launchd's process
+                    // for the job is daemon.json's — is stopped through
+                    // launchd (Codex B1 C6, R2 C1); any other, such as one a
+                    // desktop runs, is its host's to stop.
+                    if service::service_pid() != Some(state.pid) {
                         return Err(HOST_AUTHORITY_UNAVAILABLE.to_owned());
                     }
                     service::stop_service_daemon()?;
